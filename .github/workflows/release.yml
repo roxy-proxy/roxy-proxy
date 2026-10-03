@@ -4,10 +4,12 @@ name: Release
 # release binaries and publishes a GitHub release with them, SHA256SUMS and
 # build provenance. See RELEASING.md.
 #
-# workflow_dispatch, and pull requests that change the release build, are
-# dry runs: they build, check and upload every artifact but publish nothing.
+# workflow_dispatch, and pull requests that change this workflow, are dry
+# runs: they build, check and upload every artifact but publish nothing.
+# Dockerfile changes are covered by the image workflow, which builds the
+# same stages (and fills the cache a tag build then hits).
 #
-# The Linux binaries are static musl builds from the Dockerfile's build
+# The Linux binaries are static musl builds from the Dockerfile's compile
 # stage (the same build as the container image), each on a native runner.
 
 on:
@@ -17,8 +19,6 @@ on:
   pull_request:
     paths:
       - .github/workflows/release.yml
-      - Dockerfile
-      - .dockerignore
 
 permissions:
   contents: read
@@ -80,9 +80,9 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      # The image workflow's cache for the same platform: the build stage is
+      # The image workflow's cache for the same platform: the compile stage is
       # identical, so this is usually a cache hit.
-      - name: Build (Dockerfile build stage)
+      - name: Build (Dockerfile compile stage)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .

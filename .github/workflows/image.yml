@@ -89,9 +89,10 @@ jobs:
           test "$status" = healthy
           size=$(docker image inspect roxy:test --format '{{.Size}}')
           echo "image size: $size bytes"
-          # Most of the binary is wasmtime + cranelift (the addon host,
-          # ~7 MB); the rest of roxy is ~13 MB.
-          test "$size" -lt 30000000
+          # About a third of it is wasmtime + cranelift (the addon host).
+          # Measured: ~27 MB arm64, ~33 MB amd64. This catches regressions,
+          # not a target.
+          test "$size" -lt 40000000
 
       - name: Scan (Trivy, HIGH/CRITICAL)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -101,6 +102,28 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
+
+      # The README's docker compose quickstart, end to end, on the image just
+      # built (no second build): roxy and the sandboxed agent start, and
+      # examples/compose/demo.sh checks that allowed traffic gets through,
+      # denied traffic is refused, and the agent has no route around roxy.
+      - name: Quickstart demo
+        if: matrix.arch == 'amd64'
+        working-directory: examples/compose
+        env:
+          ROXY_IMAGE: roxy:test
+        run: |
+          docker compose up -d --wait --no-build
+          ./demo.sh
+
+      - name: Quickstart logs
+        if: always() && matrix.arch == 'amd64'
+        working-directory: examples/compose
+        env:
+          ROXY_IMAGE: roxy:test
+        run: |
+          docker compose logs --no-color
+          docker compose down -v
 
       - name: Log in to GHCR
         if: env.PUBLISH == 'true'
