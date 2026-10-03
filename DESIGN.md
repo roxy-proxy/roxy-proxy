@@ -38,6 +38,12 @@ before or during the relevant milestone; each has a proposed default.
    so one roxy can front many sandboxes later.
 8. **Auditable.** Structured JSONL flow log with the matched rule and decision
    for every request. Optional body capture.
+9. **Streams, not messages.** A flow is a request head, a request body
+   stream, a response head and a response body stream. Every stage of the
+   pipeline, including addons, operates on those streams. Bodies are
+   buffered only when a specific rule or addon declares it needs body
+   content, and then only up to a cap. Nothing else in roxy ever holds a
+   whole body.
 
 ### Non-goals (for now)
 
@@ -128,6 +134,16 @@ the CA. Any default that would trip a conforming client is a bug.
 Dependencies point downward: `roxy` → `roxy-proxy` → {`roxy-http`, `roxy-tls`,
 `roxy-rules`, `roxy-wasm`}. `roxy-http` and `roxy-rules` have no network I/O and
 are fully unit/fuzz-testable.
+
+### Pipeline as stream stages
+
+Every box in the diagram is a `Stage`: it receives `(head, body stream)` and
+yields `(head', body stream')`. Rules are a stage that mostly rewrites the
+head and passes the body through untouched; a body-inspecting rule inserts a
+bounded buffering stage in front of itself. Addons are stages. The upstream
+connector is the terminal stage that turns a request stream into a response
+stream, and the response flows back through the stages in reverse. This is
+what lets addons sit anywhere in the path without changing anything else.
 
 ### Key runtime types
 
@@ -614,10 +630,11 @@ Type checking at compile time: `host under 443` is a config error, as is a
 regex that fails to compile, a CIDR with a bad mask, or a `metric.foo` with no
 such metric. `in` accepts a list of the operand's type, or a CIDR for ips.
 
-**Body access.** `body.text` and `response.body.text` force roxy to buffer the
-body (up to `limits.max_inspect_body_bytes`, default 1 MiB; larger bodies make
-the predicate false *and* log `body_too_large_to_inspect`) for flows whose
-other predicates match. The compiler determines per-rule whether the body is
+**Body access.** `body.text` and `response.body.text` are the only things in
+roxy that buffer. They force the rules stage to collect the body (up to
+`limits.max_inspect_body_bytes`, default 1 MiB; larger bodies make the
+predicate false *and* log `body_too_large_to_inspect`) for flows whose other
+predicates match, evaluate, then replay the bytes downstream as a stream. The compiler determines per-rule whether the body is
 needed; rules without body predicates never buffer and stream end-to-end.
 
 ### 6.3 Actions
@@ -924,142 +941,154 @@ Sinks implement `trait FlowSink { fn emit(&self, event: &FlowEvent); }`:
 
 ## 11. WASM addons
 
-### 11.1 Model
+### 11.1 Model: addons are streaming middleware
 
-Addons are WebAssembly **components** (not core modules) implementing the
-`roxy:addon` world. roxy hosts them with `wasmtime`. Each addon is
-instantiated once per worker thread (component instances are not `Send`), so
-addon state is per-thread; shared state goes through the host `state` API.
+An addon is a WebAssembly **component** that implements roxy's `handler`
+interface, which is deliberately shaped like `wasi:http/incoming-handler`:
+the addon receives a request as a **head plus a body stream**, and it calls
+`chain.next(request)` to hand a (possibly different) request stream down the
+rest of the pipeline and receive the response as a head plus a body stream.
+It then returns a response stream of its own. Nothing is buffered unless the
+addon itself chooses to read a stream to completion.
 
-Addons are **in the path** of every flow. Each addon declares a `stage` per
-hook:
+```
+agent ──▶ [canonicalise] ──▶ addon A ──▶ addon B ──▶ [rules] ──▶ [connector] ──▶ origin
+                               │  next()    │  next()
+                               └────────────┴── each addon wraps the rest of the chain
+```
 
-| stage | when it runs | typical use |
-|---|---|---|
-| `before_rules` (default) | on every canonical request, before the rule chain | reshape traffic: rewrite, redirect to another upstream, call a helper service and substitute its output, deny early |
-| `in_chain` | when a rule's `call: <addon>` action is evaluated | precise ordering relative to specific rules |
-| `after_rules` | only on requests the rules allowed | enrichment, logging, last-mile mutation |
+With this shape the patterns from the brief fall out naturally:
 
-Response hooks mirror this (`before_rules` sees every upstream response
-before response-phase rules; `after_rules` sees only those the rules let
-through).
+- **Pass-through / observe:** `next(req)` and return its response unchanged.
+- **Rewrite in flight:** wrap the request body stream in a transform (e.g.
+  redact tokens chunk by chunk), call `next` with the wrapped stream.
+- **Redirect:** change the authority on the request head before `next`.
+- **Transform via a helper service:** open a side request with
+  `wasi:http/outgoing-handler` (the standard WASI HTTP client, so ordinary
+  HTTP libraries in Rust, Python, JS and Go work), pipe the incoming body
+  stream into it, and pipe *its* response body into `next` as the new
+  request body. Three streams, zero buffering.
+- **Deny or synthesise:** return a response without calling `next`.
+
+**Stages.** Each addon declares `stage: before_rules | after_rules`
+(default `before_rules`), or is invoked at a precise point by a rule's
+`call: <addon>` action (`in_chain`). Within a stage, addons are ordered as
+listed in config. `before_rules` addons see every canonical request;
+`after_rules` ones see only requests the rules allowed.
 
 **Invariant: the rule chain always evaluates the final outgoing request.**
-Whatever an addon produces is re-validated by the canonical model (a header
-with CRLF, a path that climbs above root, an invalid host → the flow is
-denied with reason `addon_invalid_mutation`) and then evaluated by the rules
-exactly as if the agent had sent it. An addon can reshape traffic; it cannot
-bypass policy. The YAML rules remain the floor, auditable without reading
-WASM.
+Whatever request an addon passes to `next` is re-validated by the canonical
+model (invalid header, path climbing above root, bad host → flow denied,
+reason `addon_invalid_mutation`) and then evaluated by the rules exactly as
+if the agent had sent it. For `after_rules` addons the rules run again on
+the mutated request. An addon can reshape traffic; it cannot bypass policy.
+The YAML rules remain the floor, auditable without reading WASM.
 
-**Sub-requests.** With the `http` capability an addon may call
-`fetch(request) -> response` from inside a hook (e.g. send the body to a
-redaction service and forward what comes back). Each sub-request is itself a
-flow: canonicalised, run through the connect/request/response rule chains
+**Side requests** made through `wasi:http/outgoing-handler` are themselves
+flows: canonicalised, run through the connect/request/response rule chains
 with `client.user = "addon:<name>"` and tag `addon-subrequest`, subject to
 the address denylists (§7.1) and all limits, and logged like any other flow.
-A sub-request that the rules deny returns a `403` to the addon, which decides
-what to do. Sub-request depth is capped at 1 (an addon cannot trigger an
-addon). The hook's own deadline (§11.3) includes time spent in `fetch`, so
-this capability comes with a larger default timeout (`addons.fetch_timeout`,
-5 s).
+A denied side request surfaces to the addon as a `403` response. Depth is
+capped at 1: side requests do not pass through addons again.
+
+**Body-dependent rules and addons.** If a rule needs `body.text`, the rules
+stage buffers the body it receives (after any `before_rules` addons) up to
+`limits.max_inspect_body_bytes`, evaluates, then replays the buffered bytes
+downstream as a stream. An addon that wants the whole body simply reads its
+input stream to the end; the host enforces the same cap on how much any one
+addon may hold (`addons.max_buffered_body_bytes`, default 1 MiB; exceeding it
+traps the addon and denies the flow).
 
 ### 11.2 WIT sketch
+
+roxy reuses the WASI 0.2 HTTP types (`wasi:http/types`: `incoming-request`,
+`outgoing-request`, `incoming-body`, `outgoing-body`, `input-stream`,
+`output-stream`, `future-incoming-response`) rather than inventing its own
+body model, so existing WASI HTTP tooling and language SDKs apply.
 
 ```wit
 package roxy:addon@0.1.0;
 
-interface types {
-  record header { name: string, value: list<u8> }
-  record request {
-    flow-id: string, method: string, scheme: string, host: string, port: u16,
-    path: string, query: option<string>, headers: list<header>,
-    body: option<list<u8>>,          // present up to the configured cap
-    body-truncated: bool,
-    client-ip: string, client-user: option<string>, tags: list<string>,
-  }
-  record response { flow-id: string, status: u16, headers: list<header>,
-                    body: option<list<u8>>, body-truncated: bool }
-  record ws-message { flow-id: string, direction: direction, opcode: u8, payload: list<u8> }
-  enum direction { client-to-server, server-to-client }
-
-  variant request-decision {
-    continue,                          // unchanged
-    modify(request-patch),             // set/remove headers, path, query, redirect target
-    deny(deny-info),
-    respond(synthetic-response),       // synthetic response without upstream (later milestone)
-  }
-  record request-patch { set-headers: list<header>, remove-headers: list<string>,
-                         method: option<string>, path: option<string>, query: option<string>,
-                         body: option<list<u8>>,          // replaces the body (bounded)
-                         redirect: option<tuple<string, u16>> }
-  record deny-info { status: u16, message: string }
-  record synthetic-response { status: u16, headers: list<header>, body: list<u8> }
-  variant response-decision { continue, modify(response-patch), deny(deny-info) }
-  variant ws-decision { continue, drop, close(u16) }
+interface chain {
+  use wasi:http/types@0.2.0.{outgoing-request, future-incoming-response, error-code};
+  /// Pass a request down the rest of roxy's pipeline (remaining addons, rules,
+  /// connector). The response streams back. Exactly one call per handled
+  /// request; a second call traps.
+  next: func(req: outgoing-request) -> result<future-incoming-response, error-code>;
 }
 
-interface host {
-  use types.{header};
+interface flow {
+  record flow-info { flow-id: string, conn-id: string, client-ip: string,
+                     client-user: option<string>, listener: string,
+                     tls-sni: option<string>, tags: list<string> }
+  current: func() -> flow-info;
+  add-tag: func(tag: string);
   log: func(level: u8, msg: string);
   state-get: func(key: string) -> option<string>;
   state-set: func(key: string, value: string, ttl-ms: option<u64>);
   metric-get: func(id: string, key: list<string>) -> option<u64>;
-  secret-get: func(name: string) -> option<string>;   // only if capability granted
-  fetch: func(req: sub-request) -> result<sub-response, fetch-error>;  // `http` capability; see §11.1
+  secret-get: func(name: string) -> option<string>;   // `secrets` capability
   config: func() -> string;                            // addon's JSON config blob
 }
 
 world addon {
-  import host;
-  use types.{request, response, ws-message, request-decision, response-decision, ws-decision};
+  include wasi:cli/imports@0.2.0;                      // clocks, random, streams; no fs, no sockets
+  import wasi:http/outgoing-handler@0.2.0;             // side requests (`http` capability)
+  import chain;
+  import flow;
+  export wasi:http/incoming-handler@0.2.0;             // handle(request, response-outparam)
   export init: func() -> result<_, string>;
-  export on-request: func(req: request) -> request-decision;
-  export on-response: func(res: response) -> response-decision;
-  export on-ws-message: func(msg: ws-message) -> ws-decision;
 }
 ```
 
-Bodies are passed as bounded byte buffers in MVP (`addons.max_body_bytes`,
-default 1 MiB; larger bodies arrive truncated with `body-truncated: true`, and
-an addon that needs the full body should deny). Streaming body resources are
-a later extension of the world.
+The host implements `incoming-handler` dispatch, `chain.next` (continue the
+pipeline), and `outgoing-handler` (policy-checked side request) with
+`wasmtime-wasi-http`. The `wasi:cli` imports are the minimal set: no
+filesystem, no sockets, no environment.
 
 ### 11.3 Safety
 
 - **Capabilities** declared in config (`capabilities: [state, log, secrets, http]`);
-  host functions not granted trap → the flow is denied and `addon_error` logged.
-- **Fuel** per hook call (`addons.fuel_per_call`) and **epoch deadline**
-  (`addons.timeout`, default 50 ms) — exceeding either denies the flow.
-- **Memory** cap per instance (`addons.max_memory`, default 64 MiB).
-- Any trap or malformed decision (e.g. header with CRLF) → deny.
-- Addons never see raw bytes from the wire, only the canonical model.
-- No WASI sockets or filesystem imports in MVP; addons are pure functions over
-  the flow plus the host API.
+  an import not granted traps → the flow is denied and `addon_error` logged.
+  `http` enables `outgoing-handler`; without it the import returns an error
+  code immediately.
+- **Deadlines are per I/O step, not per request**, because a streaming
+  addon legitimately lives as long as the flow. `addons.step_timeout`
+  (default 50 ms of *CPU* between host calls, enforced with wasmtime epoch
+  interruption) and the ordinary flow idle timeouts bound wall-clock time.
+  **Fuel** is metered per step as well.
+- **Memory** cap per instance (`addons.max_memory`, default 64 MiB) and the
+  buffered-body cap above.
+- Any trap, a `next` request that fails canonical validation, or a response
+  head that is invalid → deny the flow (or, if the response head was already
+  sent to the client, close the connection) and log `addon_error`.
+- Addons never see raw wire bytes, only canonical heads and body streams.
+- One instance per worker thread per addon (component instances are not
+  `Send`); per-flow state lives in the handler's locals, shared state goes
+  through `flow.state-*`.
 
 ### 11.4 Authoring
 
-`roxy-addon` (Rust) wraps the generated bindings:
+For Rust, `roxy-addon` wraps the generated bindings in a small middleware
+trait so the common cases are a few lines:
 
 ```rust
 use roxy_addon::prelude::*;
 
-struct PiiScan;
-impl Addon for PiiScan {
-    fn on_request(&mut self, req: Request) -> RequestDecision {
-        if let Some(body) = req.body_utf8() {
-            if looks_like_ssn(body) { return RequestDecision::deny(403, "PII in request"); }
-        }
-        RequestDecision::Continue
+struct RedactTokens;
+impl Middleware for RedactTokens {
+    fn handle(&mut self, req: Request, next: Next) -> Response {
+        // Wrap the body stream; chunks are redacted as they flow, nothing is buffered.
+        let req = req.map_body(|body| body.transform(redact_chunk));
+        next.run(req)
     }
 }
-roxy_addon::export!(PiiScan);
+roxy_addon::export!(RedactTokens);
 ```
 
-Python authors use `componentize-py` against the same WIT. An `examples/addons/`
-directory ships one Rust and one Python addon plus a `Makefile` to build them.
-
----
+Python authors use `componentize-py` against the same world; JS via `jco`.
+`examples/addons/` ships a Rust pass-through, a Rust streaming redactor, and
+a Python addon that calls a helper service through `wasi:http`.
 
 ## 12. Resource limits and self-protection
 
@@ -1162,7 +1191,7 @@ be built by separate agents in parallel because `roxy-http`, `roxy-tls` and
 |---|---|---|
 | 1 | Transparent-mode upstream target (§4.2) | `resolve`; decide when transparent mode is built |
 | 2 | Rule evaluation: first terminal action wins, chain exhausted → deny (§6.1) | as stated |
-| 3 | Addons run in-path at a configurable stage; rules always evaluate the final request (§11.1) | as stated |
+| 3 | Addons are streaming middleware (wasi:http shaped) with `chain.next`; rules always evaluate the final request (§11.1) | as stated |
 | 4 | Deny response body includes rule id and flow id (§5.7) | yes, informative 403 by default |
 | 5 | Size units 1024-based (§6.2) | yes |
 | 6 | Licence and crate name on crates.io | MIT OR Apache-2.0; `roxy` availability to be checked |
