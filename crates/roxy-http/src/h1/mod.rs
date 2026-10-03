@@ -83,8 +83,9 @@ pub enum Incoming {
     /// `Host` (port 80 default), `scheme` is `http`.
     OriginFormOnProxyPort(CanonicalRequest),
     /// `CONNECT host:port` on the proxy port. Answer with
-    /// [`ServerConn::accept_connect`], [`ServerConn::respond`] (non-2xx, e.g.
-    /// 407) or [`ServerConn::respond_error_and_close`].
+    /// [`ServerConn::accept_connect`], [`ServerConn::respond`] (non-2xx),
+    /// [`ServerConn::respond_proxy_auth_required`] (407 with a challenge) or
+    /// [`ServerConn::respond_error_and_close`].
     Connect {
         /// Target authority.
         authority: Authority,
@@ -295,9 +296,13 @@ enum OutFraming {
     CloseDelimited,
 }
 
+/// Serialises a response head. `extra` carries fields that [`Headers`]
+/// refuses (reserved names) and that roxy itself generates from validated
+/// values; it is never fed from a message.
 fn response_head(
     status: StatusCode,
     headers: &Headers,
+    extra: &[(&str, &str)],
     framing: OutFraming,
     close: bool,
     upgrade: Option<&str>,
@@ -315,6 +320,12 @@ fn response_head(
     }
     for (n, v) in headers {
         out.extend_from_slice(n.as_str().as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    for (n, v) in extra {
+        out.extend_from_slice(n.as_bytes());
         out.extend_from_slice(b": ");
         out.extend_from_slice(v.as_bytes());
         out.extend_from_slice(b"\r\n");
@@ -718,7 +729,14 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     /// continuing to pump the request body concurrently. Afterwards the
     /// connection is either ready for [`ServerConn::next_request`] or closed
     /// (client `Connection: close`, HTTP/1.0, un-drained body, unanswered
-    /// `Expect`).
+    /// `Expect`, or `res.meta.close`).
+    ///
+    /// `res.meta.close == true` makes roxy end the connection after this
+    /// response: the head carries `connection: close`, a request body the
+    /// consumer already dropped is abandoned rather than drained, and after
+    /// the body the write side is half-closed with the same lingering close
+    /// as [`ServerConn::respond_error_and_close`]. Bytes the client sent after
+    /// this request (pipelining) are discarded, never parsed as a request.
     ///
     /// 1xx responses are not accepted here (see
     /// [`ServerConn::send_100_continue`] and [`ServerConn::respond_upgrade`]),
@@ -750,12 +768,25 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
             }
             self.r.abandoned = true;
         }
+        if res.meta.close
+            && let Some(feed) = self.r.feed.as_mut()
+            && feed.sender.as_ref().is_none_or(BodySender::is_closed)
+        {
+            // Closing anyway: do not spend up to DRAIN_LIMIT reading a body
+            // nobody wants. A body the consumer still holds keeps flowing.
+            if let Some(tx) = feed.sender.take() {
+                tx.abort(BodyError::Incomplete);
+            }
+            self.r.feed = None;
+            self.r.abandoned = true;
+        }
         let framing = Self::out_framing(&res, &ex);
         let close = ex.close
+            || res.meta.close
             || ex.version == Version::H1_0
             || self.r.abandoned
             || framing == OutFraming::CloseDelimited;
-        let head = response_head(res.status, &res.headers, framing, close, None);
+        let head = response_head(res.status, &res.headers, &[], framing, close, None);
         let idle = self.limits.body_idle_timeout;
 
         let result = {
@@ -794,14 +825,17 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         Ok(())
     }
 
-    /// Half-closes the write side and, if request bytes were left unread,
-    /// lingers briefly discarding input so the client sees the response.
+    /// Half-closes the write side and, if request bytes were left unread
+    /// (an abandoned body, or pipelined bytes already buffered), lingers
+    /// briefly discarding input so the client sees the response rather than
+    /// a reset.
     async fn shutdown(&mut self) {
         let idle = self.limits.body_idle_timeout;
         let _ = flush_timed(&mut self.w, idle).await;
         let _ = timeout(idle, self.w.shutdown()).await;
-        if self.r.abandoned || self.r.feed.is_some() {
+        if self.r.abandoned || self.r.feed.is_some() || !self.r.buf.is_empty() {
             self.r.feed = None;
+            self.r.buf.clear();
             let deadline = Instant::now() + LINGER;
             let mut discarded = 0;
             let mut scratch = vec![0u8; READ_CHUNK];
@@ -822,6 +856,62 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         status: StatusCode,
         reason: &Reason,
     ) -> Result<(), WriteError> {
+        let body = format!(
+            "{{\"error\":\"rejected by roxy\",\"reason\":\"{}\"}}",
+            reason.as_str()
+        );
+        let mut headers = Headers::new();
+        let _ = headers.insert("content-type", "application/json");
+        self.close_with(status, &headers, &[], Bytes::from(body))
+            .await
+    }
+
+    /// Answers the pending request or CONNECT with `407 Proxy Authentication
+    /// Required`, a `proxy-authenticate: Basic realm="<realm>"` challenge,
+    /// `connection: close` and `body` (sent with `content-length`; the caller
+    /// supplies any `content-type` semantics by choosing the body), then
+    /// closes like [`ServerConn::respond_error_and_close`] (an unread request
+    /// body is abandoned; half-close, then lingering close).
+    ///
+    /// `realm` must be printable ASCII (`0x20..=0x7e`) without `"` or `\`,
+    /// so it can be sent as a quoted-string without escaping. Otherwise this
+    /// returns [`WriteError::State`] and the connection is dropped without a
+    /// response.
+    pub async fn respond_proxy_auth_required(
+        mut self,
+        realm: &str,
+        body: Bytes,
+    ) -> Result<(), WriteError> {
+        if !matches!(self.state, State::AwaitingResponse | State::AwaitingConnect) {
+            return Err(WriteError::State("no request awaiting a response"));
+        }
+        if !realm
+            .bytes()
+            .all(|b| (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\')
+        {
+            return Err(WriteError::State(
+                "proxy auth realm must be printable ASCII without '\"' or '\\'",
+            ));
+        }
+        let challenge = format!("Basic realm=\"{realm}\"");
+        self.close_with(
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            &Headers::new(),
+            &[("proxy-authenticate", &challenge)],
+            body,
+        )
+        .await
+    }
+
+    /// Writes a `connection: close` response with a fixed body, abandoning
+    /// any unread request body, then shuts down and closes.
+    async fn close_with(
+        &mut self,
+        status: StatusCode,
+        headers: &Headers,
+        extra: &[(&str, &str)],
+        body: Bytes,
+    ) -> Result<(), WriteError> {
         if self.state == State::Closed {
             return Ok(());
         }
@@ -831,14 +921,14 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
             }
             self.r.abandoned = true;
         }
-        let body = format!(
-            "{{\"error\":\"rejected by roxy\",\"reason\":\"{}\"}}",
-            reason.as_str()
-        );
-        let mut headers = Headers::new();
-        let _ = headers.insert("content-type", "application/json");
-        let framing = OutFraming::Length(body.len() as u64);
-        let head = response_head(status, &headers, framing, true, None);
+        let len = body.len() as u64;
+        // A HEAD response describes the body but never carries it.
+        let framing = if self.exchange.as_ref().is_some_and(|e| e.is_head) {
+            OutFraming::Head(Some(len))
+        } else {
+            OutFraming::Length(len)
+        };
+        let head = response_head(status, headers, extra, framing, true, None);
         let idle = self.limits.body_idle_timeout;
         let r = write_message(&mut self.w, head, Body::from_bytes(body), framing, idle).await;
         self.shutdown().await;
@@ -889,6 +979,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         let head = response_head(
             res.status,
             &res.headers,
+            &[],
             OutFraming::Empty,
             false,
             Some(&upgrade),

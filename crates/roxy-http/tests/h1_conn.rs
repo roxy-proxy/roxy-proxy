@@ -202,6 +202,301 @@ async fn connection_close_header_on_close() {
     assert_eq!(rest, Vec::<u8>::new());
 }
 
+fn closing(mut res: CanonicalResponse) -> CanonicalResponse {
+    res.meta.close = true;
+    res
+}
+
+#[tokio::test]
+async fn meta_close_closes_after_body_and_skips_pipelined() {
+    let (mut client, mut c) = conn();
+    client
+        .write_all(b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\nGET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    let req = expect_request(&mut c).await;
+    assert_eq!(req.path.as_str(), "/a");
+    let server = tokio::spawn(async move {
+        c.respond(closing(ok(Body::from_bytes("bye"))))
+            .await
+            .unwrap();
+        assert!(c.is_closed());
+        // The pipelined /b is never parsed.
+        assert!(c.next_request().await.unwrap().is_none());
+    });
+    let (head, body) = read_response(&mut client, false).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(head.contains("\r\nconnection: close\r\n"), "{head}");
+    assert_eq!(body, b"bye");
+    // EOF after the body: no response to /b.
+    let mut rest = Vec::new();
+    client.read_to_end(&mut rest).await.unwrap();
+    assert_eq!(rest, Vec::<u8>::new());
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn meta_close_chunked_body_then_eof() {
+    let (mut client, mut c) = conn();
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    let _ = expect_request(&mut c).await;
+    let (mut tx, body) = Body::channel(1 << 20, None);
+    let server = tokio::spawn(async move {
+        c.respond(closing(ok(body))).await.unwrap();
+        assert!(c.next_request().await.unwrap().is_none());
+    });
+    tx.send_data(Bytes::from_static(b"abc")).await.unwrap();
+    tx.finish().await.unwrap();
+    let (head, body) = read_response(&mut client, false).await;
+    assert!(head.contains("transfer-encoding: chunked"), "{head}");
+    assert!(head.contains("\r\nconnection: close\r\n"), "{head}");
+    assert_eq!(body, b"abc");
+    let mut rest = Vec::new();
+    client.read_to_end(&mut rest).await.unwrap();
+    assert!(rest.is_empty(), "EOF after the body: {rest:?}");
+    drop(client);
+    server.await.unwrap();
+}
+
+/// A deny with `meta.close` does not wait for (or drain) a request body the
+/// consumer dropped: the client that never sends its body still gets the
+/// response promptly.
+#[tokio::test(start_paused = true)]
+async fn meta_close_abandons_dropped_body() {
+    let (mut client, mut c) = conn();
+    client
+        .write_all(
+            b"POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1000000\r\n\r\npartial",
+        )
+        .await
+        .unwrap();
+    let req = expect_request(&mut c).await;
+    drop(req);
+    let start = tokio::time::Instant::now();
+    let server = tokio::spawn(async move {
+        c.respond(closing(CanonicalResponse::new(StatusCode::FORBIDDEN)))
+            .await
+            .unwrap();
+        assert!(c.is_closed());
+    });
+    let (head, _) = read_response(&mut client, false).await;
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    assert!(head.contains("\r\nconnection: close\r\n"), "{head}");
+    let mut rest = Vec::new();
+    client.read_to_end(&mut rest).await.unwrap();
+    assert!(rest.is_empty(), "EOF after the body: {rest:?}");
+    // The client keeps its side open: the server lingers at most ~1 s.
+    server.await.unwrap();
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+/// Without `meta.close` the same 403 keeps the connection alive (draining
+/// the dropped body), so `meta.close` is what closes it.
+#[tokio::test]
+async fn without_meta_close_connection_stays_open() {
+    let (mut client, mut c) = conn();
+    client
+        .write_all(b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\nGET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    let _ = expect_request(&mut c).await;
+    c.respond(CanonicalResponse::new(StatusCode::FORBIDDEN))
+        .await
+        .unwrap();
+    let (head, _) = read_response(&mut client, false).await;
+    assert!(!head.contains("connection"), "{head}");
+    assert_eq!(expect_request(&mut c).await.path.as_str(), "/b");
+}
+
+fn proxy_conn() -> (DuplexStream, ServerConn<DuplexStream>) {
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let c = ServerConn::new(
+        server,
+        Role::ProxyPort,
+        Arc::new(Limits::default()),
+        Arc::new(HttpFlags::default()),
+    );
+    (client, c)
+}
+
+#[tokio::test]
+async fn proxy_auth_required_on_connect() {
+    let (mut client, mut c) = proxy_conn();
+    client
+        .write_all(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n\x16\x03\x01early-client-hello")
+        .await
+        .unwrap();
+    let Ok(Some(Incoming::Connect { .. })) = c.next_request().await else {
+        panic!()
+    };
+    let server = tokio::spawn(async move {
+        c.respond_proxy_auth_required("roxy proxy", Bytes::from_static(b"auth needed"))
+            .await
+            .unwrap();
+    });
+    let (head, body) = read_response(&mut client, false).await;
+    assert!(
+        head.starts_with("HTTP/1.1 407 Proxy Authentication Required\r\n"),
+        "{head}"
+    );
+    assert!(
+        head.contains("\r\nproxy-authenticate: Basic realm=\"roxy proxy\"\r\n"),
+        "{head}"
+    );
+    assert!(head.contains("\r\ncontent-length: 11\r\n"), "{head}");
+    assert!(head.contains("\r\nconnection: close\r\n"), "{head}");
+    assert_eq!(body, b"auth needed");
+    let mut rest = Vec::new();
+    client.read_to_end(&mut rest).await.unwrap();
+    assert!(rest.is_empty(), "EOF after the response: {rest:?}");
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn proxy_auth_required_on_request_abandons_body() {
+    let (mut client, mut c) = proxy_conn();
+    client
+        .write_all(b"POST http://example.com/ HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhelloGET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    let Ok(Some(Incoming::Request(req))) = c.next_request().await else {
+        panic!()
+    };
+    let server = tokio::spawn(async move {
+        c.respond_proxy_auth_required("r", Bytes::new())
+            .await
+            .unwrap();
+    });
+    let (head, body) = read_response(&mut client, false).await;
+    assert!(head.starts_with("HTTP/1.1 407"), "{head}");
+    assert!(head.contains("\r\ncontent-length: 0\r\n"), "{head}");
+    assert!(body.is_empty(), "{body:?}");
+    let mut rest = Vec::new();
+    client.read_to_end(&mut rest).await.unwrap();
+    assert!(rest.is_empty(), "the pipelined request is not served");
+    drop(client);
+    server.await.unwrap();
+    // The request body was abandoned, never a clean end.
+    assert!(req.body.collect_up_to(100).await.is_err());
+}
+
+#[tokio::test]
+async fn proxy_auth_required_on_head_sends_no_body() {
+    let (mut client, mut c) = proxy_conn();
+    client
+        .write_all(b"HEAD http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    let Ok(Some(Incoming::Request(_))) = c.next_request().await else {
+        panic!()
+    };
+    let server = tokio::spawn(async move {
+        c.respond_proxy_auth_required("r", Bytes::from_static(b"body"))
+            .await
+            .unwrap();
+    });
+    let (head, _) = read_response(&mut client, true).await;
+    assert!(head.contains("\r\ncontent-length: 4\r\n"), "{head}");
+    let mut rest = Vec::new();
+    client.read_to_end(&mut rest).await.unwrap();
+    assert!(rest.is_empty(), "no body bytes after a HEAD response");
+    drop(client);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn proxy_auth_realm_is_validated() {
+    for bad in [
+        "a\"b",
+        "a\\b",
+        "tab\there",
+        "nl\r\nx: y",
+        "caf\u{e9}",
+        "\x7f",
+    ] {
+        let (mut client, mut c) = proxy_conn();
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let Ok(Some(Incoming::Connect { .. })) = c.next_request().await else {
+            panic!()
+        };
+        assert!(
+            matches!(
+                c.respond_proxy_auth_required(bad, Bytes::new()).await,
+                Err(WriteError::State(_))
+            ),
+            "{bad:?}"
+        );
+        // Nothing was written; the connection is gone.
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty(), "{bad:?}");
+    }
+    // No pending request: refused.
+    let (_client, c) = proxy_conn();
+    assert!(matches!(
+        c.respond_proxy_auth_required("r", Bytes::new()).await,
+        Err(WriteError::State(_))
+    ));
+}
+
+/// `collect_prefix` on a real chunked request: inspect the first bytes,
+/// then forward prefix + remainder intact.
+#[tokio::test]
+async fn collect_prefix_on_chunked_request() {
+    let (mut client, mut c) = conn();
+    client
+        .write_all(b"POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n")
+        .await
+        .unwrap();
+    let mut req = expect_request(&mut c).await;
+    let body = std::mem::take(&mut req.body);
+    let (prefix, all) = c
+        .drive(async move {
+            let (prefix, rest) = body.collect_prefix(7).await.unwrap();
+            let rest = rest.unwrap().collect_up_to(1 << 20).await.unwrap();
+            (prefix, rest)
+        })
+        .await
+        .unwrap();
+    assert_eq!(prefix, "hello w");
+    assert_eq!(all, "orld");
+    c.respond(ok(Body::empty())).await.unwrap();
+    let (head, _) = read_response(&mut client, false).await;
+    assert!(head.starts_with("HTTP/1.1 200"));
+}
+
+#[tokio::test]
+async fn collect_prefix_on_length_request() {
+    let (mut client, mut c) = conn();
+    client
+        .write_all(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\n\r\nabcd")
+        .await
+        .unwrap();
+    let mut req = expect_request(&mut c).await;
+    let body = std::mem::take(&mut req.body);
+    let (prefix, rest) = c
+        .drive(async move { body.collect_prefix(16).await.unwrap() })
+        .await
+        .unwrap();
+    assert_eq!(prefix, "abcd");
+    assert!(rest.is_none());
+    c.respond(ok(Body::empty())).await.unwrap();
+    let (head, _) = read_response(&mut client, false).await;
+    assert!(head.starts_with("HTTP/1.1 200"));
+}
+
 #[tokio::test]
 async fn body_streams_before_it_is_complete() {
     let (mut client, mut c) = conn();
@@ -568,6 +863,9 @@ fn futures_are_send() {
     assert_send(&f);
     let (_client, c) = conn();
     let f = c.accept_connect();
+    assert_send(&f);
+    let (_client, c) = conn();
+    let f = c.respond_proxy_auth_required("r", Bytes::new());
     assert_send(&f);
     let (_client, c) = conn();
     let f = c.respond_upgrade(CanonicalResponse::new(StatusCode::SWITCHING_PROTOCOLS));
