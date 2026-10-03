@@ -3,7 +3,9 @@
 //! Responsibilities: the rule-related config types ([`config`]), the
 //! expression DSL (lexer, [`parser`], type-checker, compiler), the rule
 //! chains per phase with typed actions, and the immutable [`Policy`]
-//! snapshot that the proxy swaps atomically on reload.
+//! snapshot that the proxy swaps atomically on reload. It also provides the
+//! in-process store behind `metric.<id>`: [`MetricStore`], exposed to the
+//! proxy as [`MetricSource`].
 //!
 //! This crate performs no network I/O and does not depend on the HTTP model:
 //! the proxy exposes a flow through the [`FlowView`] trait.
@@ -98,6 +100,7 @@ pub mod config;
 mod diag;
 mod eval;
 mod lexer;
+mod metrics;
 pub mod parser;
 mod policy;
 mod types;
@@ -113,6 +116,7 @@ pub use eval::{
     AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Effect, EvalContext,
     FAIL_CLOSED_MESSAGE, FAIL_CLOSED_STATUS, FailClosedReason, Outcome,
 };
+pub use metrics::{Clock, MetricError, MetricSnapshot, MetricSource, MetricStore, Sample};
 pub use parser::parse;
 pub use policy::{MetricDef, Policy, PolicyInput};
 pub use types::{Field, Type};

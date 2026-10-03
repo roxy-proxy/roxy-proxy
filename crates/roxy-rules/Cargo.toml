@@ -8,11 +8,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+dashmap = "6.2.1"
 globset = { version = "0.4.20", default-features = false }
 humantime-serde.workspace = true
 ipnet.workspace = true
+parking_lot = "0.12.5"
 regex.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 criterion = { version = "0.7.0", default-features = false }
