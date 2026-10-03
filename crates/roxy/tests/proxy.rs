@@ -1103,7 +1103,7 @@ async fn rules_can_use_address_lists() {
         rules: r#"
   - id: dst-listed
     phase: connect
-    when: dst.ip in @loopback
+    when: dst.ip != null and dst.ip in @loopback
     then: { deny: { status: 451 } }
   - id: client-listed
     when: client.ip in @clients and host == "alias.test"

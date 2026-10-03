@@ -278,6 +278,7 @@ impl Parser {
             Tok::Str(s) => Lit::Str(s),
             Tok::Int(n, unit) => Lit::Int(n, unit),
             Tok::True => Lit::Bool(true),
+            Tok::Null => Lit::Null,
             Tok::False => Lit::Bool(false),
             Tok::Ip(ip) => Lit::Ip(ip),
             Tok::Cidr(net) => Lit::Cidr(net),

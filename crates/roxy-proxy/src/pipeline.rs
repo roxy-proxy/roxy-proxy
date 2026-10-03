@@ -685,7 +685,7 @@ fn fail_closed_code(reason: &FailClosedReason, metric: Option<&MetricSourceError
         FailClosedReason::SecretInvalid(_) => "secret_invalid",
         FailClosedReason::BodyTooLargeToInspect(_) => "body_too_large_to_inspect",
         FailClosedReason::BodyUnavailable(_) => "body_unavailable",
-        FailClosedReason::BodySizeUnknown(_) => "body_size_unknown",
+        FailClosedReason::MissingValue(_) => "missing_value",
     }
 }
 

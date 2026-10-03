@@ -218,24 +218,60 @@ fn units() {
 }
 
 #[test]
-fn absent_values_are_never_equal_or_unequal() {
+fn null_is_a_value_for_equality_and_membership() {
     check(&[
+        ("client.user == null", true),
+        ("client.user != null", false),
+        ("host != null", true),
         ("client.user == \"x\"", false),
-        ("client.user != \"x\"", false),
-        ("not client.user == \"x\"", true),
-        ("not (client.user != \"x\")", true),
+        ("client.user != \"x\"", true),
         ("client.user in [\"x\"]", false),
-        ("client.user not in [\"x\"]", false),
-        ("client.user starts_with \"\"", false),
-        ("client.user like \"*\"", false),
-        ("client.user matches \".*\"", false),
-        ("header[\"x-missing\"] != \"a\"", false),
+        ("client.user not in [\"x\"]", true),
+        ("header[\"x-missing\"] != \"a\"", true),
+        ("header[\"x-missing\"] == null", true),
         ("query[\"nope\"] == \"\"", false),
-        ("state[\"nope\"] == \"\"", false),
-        ("tls.alpn != \"h2\"", false),
+        ("state[\"nope\"] == null", true),
+        ("tls.alpn != \"h2\"", true),
+        // Guarding with `!= null` short-circuits before the operator that
+        // cannot answer for null.
+        (
+            "client.user != null and client.user starts_with \"a\"",
+            false,
+        ),
     ]);
-    // Missing metrics, address lists and bodies are not absent: they fail
-    // closed (see `unavailable_inputs_fail_closed`, `bodies_fail_closed`).
+}
+
+/// Every other operator on a missing value fails the flow closed and names
+/// the field.
+#[test]
+fn null_with_other_operators_fails_closed() {
+    let ctx = EvalContext::empty();
+    for (expr, field) in [
+        ("client.user starts_with \"\"", "client.user"),
+        ("client.user like \"*\"", "client.user"),
+        ("client.user matches \".*\"", "client.user"),
+        (
+            "header[\"x-missing\"] contains \"a\"",
+            "header[\"x-missing\"]",
+        ),
+        ("client.ip in 10.0.0.0/8", "client.ip"),
+        ("body.size > 10mb", "body.size"),
+    ] {
+        let p = compile(
+            "",
+            &format!(
+                "- {{ id: r, when: '{}', then: deny }}\n- {{ id: ok, then: allow }}",
+                expr.replace('\'', "''")
+            ),
+        );
+        let out = p.evaluate(Phase::Request, &MapView::new(), &ctx);
+        assert_eq!(out.terminal_rule, "_fail_closed", "{expr}");
+        assert_eq!(
+            out.fail_closed_reason,
+            Some(FailClosedReason::MissingValue(field.into())),
+            "{expr}"
+        );
+    }
 }
 
 #[test]
@@ -930,39 +966,53 @@ fn hostile_regex_is_rejected_at_compile_time() {
     assert!(err[0].contains("too large"), "{err:?}");
 }
 
-/// A size rule cannot be dodged with a chunked upload: an unknown length is
-/// an unavailable input, not an absent value.
+/// `x != null and x > N` works as expected: a missing size skips the rule,
+/// a present one is compared. Unguarded, a missing size fails closed.
 #[test]
-fn unknown_body_size_fails_closed() {
+fn guarded_size_rule() {
     let ctx = EvalContext::empty();
     let p = compile(
         "",
-        "- { id: big, when: 'method == POST and body.size > 10mb', then: deny }\n\
+        "- { id: big, when: 'body.size != null and body.size > 10mb', then: deny }\n\
          - { id: ok, then: allow }",
     );
-    let post = || MapView::new().with_str(Field::Method, "POST");
+    let sized = |n: i64| MapView::new().with_int(Field::BodySize, n);
     assert_eq!(
-        p.evaluate(
-            Phase::Request,
-            &post().with_int(Field::BodySize, 20 << 20),
-            &ctx
-        )
-        .terminal_rule,
+        p.evaluate(Phase::Request, &sized(20 << 20), &ctx)
+            .terminal_rule,
         "big"
     );
     assert_eq!(
-        p.evaluate(Phase::Request, &post().with_int(Field::BodySize, 0), &ctx)
+        p.evaluate(Phase::Request, &sized(10), &ctx).terminal_rule,
+        "ok"
+    );
+    assert_eq!(
+        p.evaluate(Phase::Request, &MapView::new(), &ctx)
             .terminal_rule,
         "ok"
     );
-    // Chunked: no BodySize set.
-    let out = p.evaluate(Phase::Request, &post(), &ctx);
-    assert_eq!(out.terminal_rule, "_fail_closed");
-    assert_eq!(
-        out.fail_closed_reason,
-        Some(FailClosedReason::BodySizeUnknown("body.size".into()))
+
+    let unguarded = compile(
+        "",
+        "- { id: big, when: 'body.size > 10mb', then: deny }\n- { id: ok, then: allow }",
     );
-    // A GET never reaches the size predicate, so it is unaffected.
-    let get = MapView::new().with_str(Field::Method, "GET");
-    assert_eq!(p.evaluate(Phase::Request, &get, &ctx).terminal_rule, "ok");
+    let out = unguarded.evaluate(Phase::Request, &MapView::new(), &ctx);
+    assert_eq!(out.terminal_rule, "_fail_closed");
+}
+
+#[test]
+fn null_literal_misuse_is_a_compile_error() {
+    for bad in [
+        "body.size > null",
+        "client.user contains null",
+        "client.user in [null]",
+        "null == null",
+        "\"a\" == null",
+        "null",
+    ] {
+        assert!(
+            try_compile("", &format!("- {{ id: r, when: '{bad}', then: deny }}")).is_err(),
+            "should reject: {bad}"
+        );
+    }
 }

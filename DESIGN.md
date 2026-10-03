@@ -585,9 +585,9 @@ or an address-list lookup and the store reports it unavailable (overloaded,
 table full, list failed to load), the outcome is an immediate
 `Deny { 503, "policy input unavailable" }` with `terminal_rule = "_fail_closed"`
 and a `policy_input_unavailable` flow event. The same applies to a missing
-secret at evaluation time. Only `state["k"]` treats a missing key as a normal
-absent value, because unset is a legitimate state. Nothing in the engine may
-turn "I could not check" into "the predicate is false".
+secret at evaluation time. Nothing in the engine may turn "I could not
+check" into "the predicate is false". (A field that is simply not present,
+like an unsent header, is `null`; see §6.2.)
 
 **A deny closes the connection.** Deny responses carry `connection: close`
 (h1) or are followed by `GOAWAY` (h2) once written. Well-behaved clients
@@ -618,7 +618,7 @@ OP          := "==" | "!=" | "<" | "<=" | ">" | ">="
              | "like"        ; glob, full-match ( * ? )
              | "matches"     ; regex, full-match (anchor explicitly with .* if needed)
              | "under"       ; host == X or host ends_with "." + X
-literal     := string | number [unit] | bool | list | cidr | bare_ident
+literal     := string | number [unit] | bool | list | cidr | bare_ident | "null"
 list        := "[" literal ("," literal)* "]"
 unit        := kb | mb | gb | ms | s | m | h          ; 1024-based sizes
 bare_ident  := [A-Z][A-Z_]*                          ; HTTP method names only
@@ -650,6 +650,30 @@ Type checking at compile time: `host under 443` is a config error, as is a
 regex that fails to compile, a CIDR with a bad mask, or a `metric.foo` with no
 such metric. `in` accepts a list of the operand's type, or a CIDR for ips.
 
+**Missing values (`null`).** A value that is not present is `null`: an
+unsent header or query parameter, an unset state key, `client.user` without
+proxy auth, `tls.sni` from a client that sent none, `dst.ip` for a hostname
+target, `body.size` for a body of undeclared length. One rule covers all of
+them:
+
+> `null` is equal only to `null`, so `==`, `!=`, `in` and `not in` treat it
+> as an ordinary value. Any other operator applied to `null` is an error,
+> and an error fails the flow closed.
+
+| expression, with `x` missing | result |
+|---|---|
+| `x == null` | true |
+| `x != null` | false |
+| `x == "a"`, `x in [...]` | false |
+| `x != "a"`, `x not in [...]` | true |
+| `x > 10`, `x contains "a"`, `x matches "..."`, `x under "..."`, `x in 10.0.0.0/8`, `x in @list` | fails closed: `_fail_closed`, reason `missing_value`, naming the field |
+
+Because `and` short-circuits, a guard makes a rule apply only when the value
+is present: `body.size != null and body.size > 10mb` skips bodies without a
+declared length and compares the rest. Unguarded, `body.size > 10mb` cannot
+answer for such a body and fails it closed. `null` may only appear as
+`x == null` or `x != null`; anywhere else is a compile error.
+
 **Body access.** `body.text` and `response.body.text` are the only things in
 roxy that buffer. They force the rules stage to collect the body (up to
 `limits.max_inspect_body_bytes`, default 1 MiB) for flows whose other
@@ -658,16 +682,15 @@ body larger than the cap **fails closed**: the flow is denied with
 `_fail_closed` and reason `body_too_large_to_inspect`, because "could not
 check" must never become "the predicate is false" (§6.1). Operators who need
 to inspect larger bodies raise the cap; operators who do not need body
-predicates on large uploads scope the rule with `body.size < 1mb and ...`,
-which short-circuits before the body is touched.
+predicates on large uploads scope the rule with
+`body.size != null and body.size < 1mb and ...`, which short-circuits before
+the body is touched.
 
 `body.size` and `response.body.size` are the declared length (0 for an empty
-body). A chunked body has no declared length, so reaching `body.size` for
-one **fails closed** (`body_size_unknown`) instead of reading as absent;
-otherwise `body.size > 10mb → deny` could be dodged by sending the upload
-chunked. The hard cap for every request, chunked or not, is
-`limits.max_request_body_bytes`, enforced while streaming. The compiler determines per-rule whether the body is
-needed; rules without body predicates never buffer and stream end-to-end.
+body, `null` for a chunked one). The hard cap for every request, declared or
+not, is `limits.max_request_body_bytes`, enforced while streaming. The
+compiler determines per-rule whether the body is needed; rules without body
+predicates never buffer and stream end-to-end.
 
 ### 6.3 Actions
 
@@ -826,7 +849,7 @@ upstream:
   the whole flow is denied (an attacker-controlled name must not get a second
   roll of the dice).
 - **In the DSL:** `@name` is an address-list literal usable wherever a CIDR
-  is: `client.ip in @internal`, `dst.ip not in @blocked`. Referencing an
+  is: `client.ip in @internal`, `dst.ip != null and dst.ip in @blocked`. Referencing an
   undefined list is a compile error. This lets the same lists gate client
   identity in gateway mode or be combined with other predicates in rules,
   while `upstream.deny_lists` stays the unconditional floor.

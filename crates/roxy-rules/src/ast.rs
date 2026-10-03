@@ -117,6 +117,8 @@ pub enum Lit {
     AddressList(String),
     /// Bare uppercase identifier: an HTTP method.
     Method(String),
+    /// `null`: compared with `==` / `!=` to test whether a value is present.
+    Null,
 }
 
 impl Lit {
@@ -313,6 +315,7 @@ impl fmt::Display for Lit {
             Lit::Cidr(net) => write!(f, "{net}"),
             Lit::AddressList(n) => write!(f, "@{n}"),
             Lit::Method(m) => f.write_str(m),
+            Lit::Null => f.write_str("null"),
         }
     }
 }
@@ -394,6 +397,7 @@ fn sexpr_lit(l: &Lit) -> String {
         Lit::Ip(ip) => format!("ip:{ip}"),
         Lit::Cidr(net) => format!("cidr:{net}"),
         Lit::AddressList(n) => format!("list:@{n}"),
+        Lit::Null => "null".into(),
         Lit::Method(m) => format!("method:{m}"),
     }
 }

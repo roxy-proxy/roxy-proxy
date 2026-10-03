@@ -12,7 +12,7 @@ use regex::Regex;
 use crate::compile::{Const, OrdOp, Pred, ROperand, StrOp};
 use crate::config::{CaptureTarget, LogLevel, Phase, Scheme};
 use crate::diag::RuleId;
-use crate::types::{Access, Field};
+use crate::types::Access;
 use crate::view::{BodyText, FlowView, Value};
 
 /// Per-evaluation inputs that are not part of the flow.
@@ -151,10 +151,10 @@ pub enum FailClosedReason {
     /// A body predicate was reached but the body was not buffered or could
     /// not be read. Carries the field name.
     BodyUnavailable(String),
-    /// `body.size` / `response.body.size` was reached but the length is not
-    /// known (chunked and not buffered). Treating it as absent would let a
-    /// chunked upload slip past a size rule. Carries the field name.
-    BodySizeUnknown(String),
+    /// An operator other than `==` / `!=` / `in` / `not in` was applied to a
+    /// missing (`null`) value, which has no answer (§6.2). Carries the field
+    /// as written, e.g. `body.size`.
+    MissingValue(String),
 }
 
 impl fmt::Display for FailClosedReason {
@@ -168,7 +168,12 @@ impl fmt::Display for FailClosedReason {
                 write!(f, "`{field}`: body too large to inspect")
             }
             Self::BodyUnavailable(field) => write!(f, "`{field}`: body unavailable"),
-            Self::BodySizeUnknown(field) => write!(f, "`{field}`: length unknown"),
+            Self::MissingValue(field) => {
+                write!(
+                    f,
+                    "`{field}` is null; guard the rule with `{field} != null and ...`"
+                )
+            }
         }
     }
 }
@@ -453,7 +458,8 @@ pub(crate) enum Unavailable<'a> {
     /// Field name (`body.text` / `response.body.text`).
     BodyTooLarge(&'static str),
     Body(&'static str),
-    BodySize(&'static str),
+    /// A missing value reached an operator that cannot answer for `null`.
+    Missing(&'a Access),
 }
 
 impl Unavailable<'_> {
@@ -463,7 +469,7 @@ impl Unavailable<'_> {
             Unavailable::List(n) => FailClosedReason::AddressListUnavailable(n.to_owned()),
             Unavailable::BodyTooLarge(f) => FailClosedReason::BodyTooLargeToInspect(f.to_owned()),
             Unavailable::Body(f) => FailClosedReason::BodyUnavailable(f.to_owned()),
-            Unavailable::BodySize(f) => FailClosedReason::BodySizeUnknown(f.to_owned()),
+            Unavailable::Missing(a) => FailClosedReason::MissingValue(a.display_name()),
         }
     }
 }
@@ -477,20 +483,7 @@ fn get<'a>(op: &'a ROperand, s: &Scope<'a>) -> Value<'a> {
             Const::Ip(ip) => Value::Ip(*ip),
         },
         ROperand::Get(access) => match access {
-            Access::Scalar(f) => {
-                let v = s.view.field(*f);
-                // An unknown body length is an unavailable input, not an
-                // absent value: fail closed (§6.1). An empty body is 0.
-                let size_field = match f {
-                    Field::BodySize => Some("body.size"),
-                    Field::ResponseBodySize => Some("response.body.size"),
-                    _ => None,
-                };
-                if let (Some(name), Value::Absent) = (size_field, &v) {
-                    s.fail(Unavailable::BodySize(name));
-                }
-                v
-            }
+            Access::Scalar(f) => s.view.field(*f),
             Access::Header(n) => opt(s.view.header(n)),
             Access::HeaderAll(n) => list(s.view.header_all(n)),
             Access::RespHeader(n) => opt(s.view.response_header(n)),
@@ -593,9 +586,12 @@ fn any_str(v: &Value<'_>, f: impl Fn(&str) -> bool) -> bool {
     }
 }
 
-/// `Some(result)` if both sides are present and comparable, else `None`.
+/// Equality with `null` (`Value::Absent`) as an ordinary value: it equals
+/// only `null`. `None` only for incomparable types (ruled out at compile time).
 fn eq(a: &Value<'_>, b: &Value<'_>, ci: bool) -> Option<bool> {
     match (a, b) {
+        (Value::Absent, Value::Absent) => Some(true),
+        (Value::Absent, _) | (_, Value::Absent) => Some(false),
         (Value::Str(x), Value::Str(y)) => Some(str_eq(x, y, ci)),
         (Value::List(xs), Value::Str(y)) | (Value::Str(y), Value::List(xs)) => {
             Some(xs.iter().any(|x| str_eq(x, y, ci)))
@@ -613,6 +609,7 @@ impl Pred {
     /// unavailable input is recorded in the scope (see [`Scope::failed`]); the
     /// returned bool is then meaningless and the caller must fail closed.
     /// Recording instead of returning `Result` keeps the hot path cheap.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn eval<'a>(&'a self, s: &Scope<'a>) -> bool {
         match self {
             Pred::Const(b) => *b,
@@ -640,48 +637,72 @@ impl Pred {
                 ci,
                 negate,
             } => eq(&get(lhs, s), &get(rhs, s), *ci).is_some_and(|r| r != *negate),
-            Pred::Ord { lhs, rhs, op } => match (get(lhs, s), get(rhs, s)) {
-                (Value::Int(a), Value::Int(b)) => match op {
-                    OrdOp::Lt => a < b,
-                    OrdOp::Le => a <= b,
-                    OrdOp::Gt => a > b,
-                    OrdOp::Ge => a >= b,
-                },
-                _ => false,
-            },
+            Pred::Ord { lhs, rhs, op } => {
+                let (a, b) = (get(lhs, s), get(rhs, s));
+                if missing(lhs, &a, s) | missing(rhs, &b, s) {
+                    return false;
+                }
+                match (a, b) {
+                    (Value::Int(a), Value::Int(b)) => match op {
+                        OrdOp::Lt => a < b,
+                        OrdOp::Le => a <= b,
+                        OrdOp::Gt => a > b,
+                        OrdOp::Ge => a >= b,
+                    },
+                    _ => false,
+                }
+            }
             Pred::Str { lhs, rhs, op, ci } => {
-                let rv = get(rhs, s);
+                let (hay, rv) = (get(lhs, s), get(rhs, s));
+                if missing(lhs, &hay, s) | missing(rhs, &rv, s) {
+                    return false;
+                }
                 let Value::Str(needle) = &rv else {
                     return false;
                 };
-                any_str(&get(lhs, s), |h| str_test(h, needle, *op, *ci))
+                any_str(&hay, |h| str_test(h, needle, *op, *ci))
             }
-            Pred::Glob { lhs, glob } => any_str(&get(lhs, s), |v| glob.is_match(v)),
-            Pred::Regex { lhs, re } => any_str(&get(lhs, s), |v| re.is_match(v)),
+            Pred::Glob { lhs, glob } => {
+                let v = get(lhs, s);
+                !missing(lhs, &v, s) && any_str(&v, |x| glob.is_match(x))
+            }
+            Pred::Regex { lhs, re } => {
+                let v = get(lhs, s);
+                !missing(lhs, &v, s) && any_str(&v, |x| re.is_match(x))
+            }
             Pred::Under { lhs, suffix } => match get(lhs, s) {
                 Value::Str(h) => under(&h, suffix),
-                _ => false,
+                v => {
+                    missing(lhs, &v, s);
+                    false
+                }
             },
+            // `in` / `not in` a literal list: `null` is an ordinary value
+            // that is in no list.
             Pred::InStr {
                 lhs,
                 set,
                 ci,
                 negate,
-            } => {
-                let v = get(lhs, s);
-                matches!(v, Value::Str(_) | Value::List(_))
-                    && any_str(&v, |x| set.iter().any(|m| str_eq(x, m, *ci))) != *negate
-            }
+            } => match get(lhs, s) {
+                Value::Absent => *negate,
+                v => any_str(&v, |x| set.iter().any(|m| str_eq(x, m, *ci))) != *negate,
+            },
             Pred::InInt { lhs, set, negate } => match get(lhs, s) {
                 Value::Int(n) => set.contains(&n) != *negate,
+                Value::Absent => *negate,
                 _ => false,
             },
+            // CIDR and address-list membership need an address.
             Pred::InNet { lhs, nets, negate } => match get(lhs, s) {
                 Value::Ip(ip) => {
                     let ip = ip.to_canonical();
                     nets.iter().any(|n| n.contains(&ip)) != *negate
                 }
-                _ => false,
+                v => {
+                    missing(lhs, &v, s);
+                    false
+                }
             },
             Pred::InList { lhs, list, negate } => match get(lhs, s) {
                 Value::Ip(ip) => {
@@ -692,12 +713,27 @@ impl Pred {
                         false
                     }
                 }
-                // No ip to check (e.g. `dst.ip` before resolution) is an
-                // absent value, not an unavailable list.
-                _ => false,
+                v => {
+                    missing(lhs, &v, s);
+                    false
+                }
             },
+            Pred::IsNull { op, negate } => matches!(get(op, s), Value::Absent) != *negate,
         }
     }
+}
+
+/// If `v` is `null` (missing), record that the predicate cannot be answered
+/// (the flow fails closed) and return true. Used by every operator except
+/// `==`, `!=`, `in` and `not in`, for which `null` is an ordinary value.
+fn missing<'a>(op: &'a ROperand, v: &Value<'_>, s: &Scope<'a>) -> bool {
+    if !matches!(v, Value::Absent) {
+        return false;
+    }
+    if let ROperand::Get(access) = op {
+        s.fail(Unavailable::Missing(access));
+    }
+    true
 }
 
 #[cfg(test)]

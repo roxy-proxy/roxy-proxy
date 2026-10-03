@@ -28,6 +28,8 @@ pub(crate) enum Tok {
     ListRef(String),
     True,
     False,
+    /// `null`: the value of anything not present (§6.2).
+    Null,
     And,
     Or,
     Not,
@@ -71,6 +73,7 @@ impl Tok {
     fn symbol(&self) -> &'static str {
         match self {
             Tok::True => "true",
+            Tok::Null => "null",
             Tok::False => "false",
             Tok::And => "and",
             Tok::Or => "or",
@@ -311,6 +314,7 @@ impl Lexer<'_> {
         }
         match w {
             "true" => Tok::True,
+            "null" => Tok::Null,
             "false" => Tok::False,
             "and" => Tok::And,
             "or" => Tok::Or,

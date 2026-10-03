@@ -142,6 +142,11 @@ pub(crate) enum Pred {
         list: Arc<str>,
         negate: bool,
     },
+    /// `x == null` (or `x != null` with `negate`): is the value missing?
+    IsNull {
+        op: ROperand,
+        negate: bool,
+    },
 }
 
 fn list_misuse(span: Span, name: &str) -> ExprError {
@@ -156,6 +161,69 @@ fn reject_list(t: &Typed<'_>) -> Result<(), ExprError> {
     fn walk(l: &LitNode) -> Result<(), ExprError> {
         match &l.lit {
             Lit::AddressList(n) => Err(list_misuse(l.span, n)),
+            Lit::List(items) => items.iter().try_for_each(walk),
+            _ => Ok(()),
+        }
+    }
+    match t {
+        Typed::Lit(l) => walk(l),
+        Typed::Field(..) => Ok(()),
+    }
+}
+
+fn is_null(t: &Typed<'_>) -> bool {
+    matches!(t, Typed::Lit(LitNode { lit: Lit::Null, .. }))
+}
+
+/// `x == null` / `x != null` (either side). `None` if neither side is
+/// `null`; an error for any other use of `null`.
+fn null_comparison(
+    l: &Typed<'_>,
+    op: Op,
+    r: &Typed<'_>,
+    span: Span,
+) -> Result<Option<Pred>, ExprError> {
+    let (field, other) = match (is_null(l), is_null(r)) {
+        (false, false) => return Ok(None),
+        (true, true) => {
+            return Err(ExprError::new(
+                span,
+                "comparing `null` with `null` is always the same answer; remove it",
+            ));
+        }
+        (true, false) => (r, l),
+        (false, true) => (l, r),
+    };
+    if !matches!(op, Op::Eq | Op::Ne) {
+        return Err(ExprError::new(
+            other.span(),
+            "`null` can only be used with `==` or `!=` (e.g. `x != null and x > 10`)",
+        ));
+    }
+    match field {
+        Typed::Field(a, _) => Ok(Some(Pred::IsNull {
+            op: ROperand::Get(a.clone()),
+            negate: op == Op::Ne,
+        })),
+        Typed::Lit(lit) => Err(ExprError::new(
+            lit.span,
+            format!(
+                "{} is never null; compare a field with `null`",
+                describe_lit(&lit.lit)
+            ),
+        )),
+    }
+}
+
+/// Reject `null` anywhere other than `x == null` / `x != null`, including
+/// inside a list literal.
+fn reject_null(t: &Typed<'_>) -> Result<(), ExprError> {
+    fn walk(l: &LitNode) -> Result<(), ExprError> {
+        match &l.lit {
+            Lit::Null => Err(ExprError::new(
+                l.span,
+                "`null` can only be used with `==` or `!=` (e.g. `x != null and x > 10`)",
+            )),
             Lit::List(items) => items.iter().try_for_each(walk),
             _ => Ok(()),
         }
@@ -261,7 +329,7 @@ impl Typed<'_> {
                 Lit::Int(..) => Some(Type::Int),
                 Lit::Bool(_) => Some(Type::Bool),
                 Lit::Ip(_) => Some(Type::Ip),
-                Lit::List(_) | Lit::Cidr(_) | Lit::AddressList(_) => None,
+                Lit::List(_) | Lit::Cidr(_) | Lit::AddressList(_) | Lit::Null => None,
             },
         }
     }
@@ -294,6 +362,7 @@ fn describe_lit(l: &Lit) -> String {
         Lit::Cidr(_) => format!("the CIDR {l}"),
         Lit::AddressList(_) => format!("the address list {l}"),
         Lit::Method(_) => format!("the method {l}"),
+        Lit::Null => "null".into(),
     }
 }
 
@@ -400,6 +469,11 @@ impl Compiler<'_, '_> {
         if !(rhs_is_list_ref && matches!(op, Op::In | Op::NotIn)) {
             reject_list(&r)?;
         }
+        if let Some(p) = null_comparison(&l, op, &r, span)? {
+            return Ok(p);
+        }
+        reject_null(&l)?;
+        reject_null(&r)?;
         let field_desc = |t: &Typed<'_>, o: &Operand| t.describe(Some(o));
         match op {
             Op::Eq | Op::Ne => {
@@ -748,7 +822,7 @@ fn lower(t: Typed<'_>) -> ROperand {
             Lit::Bool(b) => Const::Bool(*b),
             Lit::Ip(ip) => Const::Ip(ip.to_canonical()),
             // Rejected by the type checks before lowering.
-            Lit::List(_) | Lit::Cidr(_) | Lit::AddressList(_) => Const::Bool(false),
+            Lit::List(_) | Lit::Cidr(_) | Lit::AddressList(_) | Lit::Null => Const::Bool(false),
         }),
     }
 }

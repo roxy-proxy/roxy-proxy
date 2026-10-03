@@ -253,6 +253,24 @@ pub(crate) enum Access {
 }
 
 impl Access {
+    /// The field as written in a rule, for messages: `body.size`,
+    /// `header["x"]`.
+    pub(crate) fn display_name(&self) -> String {
+        match self {
+            Self::Scalar(f) => f.to_string(),
+            Self::Header(n) => format!("header[{n:?}]"),
+            Self::HeaderAll(n) => format!("header.all[{n:?}]"),
+            Self::RespHeader(n) => format!("response.header[{n:?}]"),
+            Self::RespHeaderAll(n) => format!("response.header.all[{n:?}]"),
+            Self::Query(k) => format!("query[{k:?}]"),
+            Self::State(k) => format!("state[{k:?}]"),
+            Self::Tag(t) => format!("tag[{t:?}]"),
+            Self::Metric(m) => format!("metric.{m}"),
+            Self::BodyText => "body.text".into(),
+            Self::RespBodyText => "response.body.text".into(),
+        }
+    }
+
     pub(crate) fn ty(&self) -> Type {
         match self {
             Self::Scalar(f) => f.ty(),

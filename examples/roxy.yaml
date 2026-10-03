@@ -92,14 +92,11 @@ rules:
     when: metric.egress_bytes > 500mb
     then: { deny: { status: 429, message: "hourly egress budget exhausted" } }
 
-  # Upload size. `limits.max_request_body_bytes` is the hard cap for every
-  # request (it also stops chunked uploads mid-stream). A per-host cap is a
-  # rule above the allow rule it restricts, since the first terminal action
-  # wins. A chunked upload has no declared length, so `body.size` is unknown
-  # and the flow fails closed (`body_size_unknown`) rather than slipping
-  # past the rule.
+  # Declared upload size. `body.size` is null when the client did not
+  # declare a length (chunked), so the guard makes the rule skip those;
+  # `limits.max_request_body_bytes` caps every body while it streams.
   - id: no-big-uploads
-    when: host == "api.openai.com" and method == POST and body.size > 10mb
+    when: host == "api.openai.com" and body.size != null and body.size > 10mb
     then: { deny: { status: 413, message: "upload too large" } }
 
   - id: openai
