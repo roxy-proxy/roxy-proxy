@@ -176,8 +176,9 @@ pub enum TlsVersion {
 // ----- http -----------------------------------------------------------------
 
 /// Strictness knobs for client-side HTTP parsing (§5.3). All default to the
-/// strict setting.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// strict setting (`enable_h2` defaults to true: it is a capability, and the
+/// h2 path is as strict as h1).
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Http {
@@ -187,9 +188,22 @@ pub struct Http {
     pub allow_plain_in_connect: bool,
     pub allow_obs_text: bool,
     pub allow_body_on_get: bool,
-    /// Offer `h2` in client-facing ALPN. Defaults to false until the h2
-    /// server path lands (M3, §5.1a).
+    /// Offer `h2` in client-facing ALPN (§5.1a). Default true.
     pub enable_h2: bool,
+}
+
+impl Default for Http {
+    fn default() -> Self {
+        Self {
+            allow_http10: false,
+            allow_trailers: false,
+            allow_chunk_extensions: false,
+            allow_plain_in_connect: false,
+            allow_obs_text: false,
+            allow_body_on_get: false,
+            enable_h2: true,
+        }
+    }
 }
 
 // ----- limits ---------------------------------------------------------------
