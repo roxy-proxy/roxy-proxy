@@ -574,9 +574,25 @@ actions (`set_header`, `tag`, `log`, `call`, …) take effect and evaluation
 continues to the next rule. When the chain is exhausted with no terminal
 action, the request is **denied** (`default-deny`, rule id `_default`).
 The default differs by phase: `request` → deny; `connect` → allow-to-inspect
-(§4.3); `response` and `ws` → allow, because those chains exist to tighten an
-already-allowed flow and an empty response chain must not block every
-response. `terminal_rule` is `_default` in every case.
+(§4.3); `response` → allow, because the request was already allowed and the
+upstream is trusted (§2), so an empty response chain must not block every
+response; `ws` → **deny**, because inspected messages are workload-originated
+and opting into inspection means writing the allow rules. `terminal_rule` is
+`_default` in every case.
+
+**Unavailable inputs fail closed.** If evaluating a rule needs a metric value
+or an address-list lookup and the store reports it unavailable (overloaded,
+table full, list failed to load), the outcome is an immediate
+`Deny { 503, "policy input unavailable" }` with `terminal_rule = "_fail_closed"`
+and a `policy_input_unavailable` flow event. The same applies to a missing
+secret at evaluation time. Only `state["k"]` treats a missing key as a normal
+absent value, because unset is a legitimate state. Nothing in the engine may
+turn "I could not check" into "the predicate is false".
+
+**A deny closes the connection.** Deny responses carry `connection: close`
+(h1) or are followed by `GOAWAY` (h2) once written. Well-behaved clients
+reconnect cheaply; a probing client loses its warm connection on every
+attempt and cannot pipeline past a refusal.
 
 Each rule has a `phase` (`connect`, `request` (default), `response`, `ws`). The
 compiler rejects a rule that references a field unavailable in its phase.
@@ -703,11 +719,14 @@ metrics:
 
 Implementation: `DashMap<KeyTuple, SlidingWindow>` with fixed-bucket sliding
 windows (window / 60 buckets, so a 1-minute window has 1-second resolution).
-`unique` uses a HyperLogLog. Total keys across all metrics bounded by
-`limits.max_metric_keys` with LRU eviction, so an attacker varying a key cannot
-grow memory without bound. Metric values are incremented *after* a flow's
-decision in that phase, and read *before*, so a rule `metric.x >= 30` denies
-the 31st request.
+`unique` uses a HyperLogLog. Total keys across all metrics are bounded by
+`limits.max_metric_keys`. **When the table is full, a flow that would need a
+new key is denied** (`_fail_closed`, event `metric_table_full`) rather than
+evicting an existing key: eviction would let an attacker reset their own
+counter by varying the key. Keys are reclaimed only when their window has
+fully expired. Metric values are incremented *after* a flow's decision in
+that phase (denied flows count too, so probing is not free), and read
+*before*, so a rule `metric.x >= 30` denies the 31st request.
 
 `state` is a bounded TTL key/value map shared by rules and addons (`set_state`
 action, `state.get/set` host calls). Both metrics and state live behind a
@@ -1114,6 +1133,27 @@ Python authors use `componentize-py` against the same world; JS via `jco`.
 a Python addon that calls a helper service through `wasi:http`.
 
 ## 12. Resource limits and self-protection
+
+**Fail-closed audit.** Security and containment take priority over
+availability (availability should still be very high given roxy's light
+footprint, but when the two conflict, containment wins). Every limit below
+resolves in the closed direction, and the proxy pipeline has no code path
+where an error on the request path results in forwarding: an `Err` anywhere
+between accept and upstream connect produces a deny response or a closed
+socket, never a pass-through. Specifically:
+
+| condition | result |
+|---|---|
+| parse or canonicalisation error | close connection (400 if a response can still be written) |
+| rule denies | deny response, then close |
+| policy input unavailable (metric store, address list, secret) | deny `503`, `_fail_closed` |
+| metric key table full | deny, `metric_table_full` |
+| body or header limit exceeded mid-stream | close both sides |
+| upstream connect/TLS/DNS failure | `502`, flow logged |
+| addon trap, timeout, or invalid mutation | deny, `addon_error` |
+| config reload fails | keep the old policy; never run without one |
+| per-client or global connection cap | refuse new connections |
+| flow log sink cannot write | log a warning, continue (the only soft failure: losing audit lines is preferable to losing containment, and metrics expose it) |
 
 - Per-client-IP connection cap; global connection cap; accept backpressure.
 - All reads bounded (head size, body size, ClientHello size, WS message size).
