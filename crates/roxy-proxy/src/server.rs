@@ -101,6 +101,8 @@ pub(crate) struct Shared {
     pub minter: Arc<LeafMinter>,
     upstream_tls: Arc<ClientConfig>,
     pub require_sni_match: bool,
+    /// Offer ALPN `h2` in terminated tunnels.
+    pub enable_h2: bool,
     pub connection_events: bool,
     pub pipeline: Pipeline,
     caps: Arc<ConnCaps>,
@@ -241,9 +243,6 @@ impl Server {
     /// Binds every listener (and the CA server) and starts serving.
     pub async fn start(cfg: RuntimeConfig) -> Result<Server, StartError> {
         roxy_tls::install_crypto_provider();
-        if cfg.enable_h2 {
-            tracing::warn!("client-side h2 not in this build; offering http/1.1 only");
-        }
         let upstream_tls = roxy_tls::client_config(&cfg.upstream_tls)
             .map_err(|e| StartError(format!("upstream TLS configuration: {e}")))?;
         let snap = build_snapshot(cfg.policy, &upstream_tls).map_err(StartError)?;
@@ -256,6 +255,7 @@ impl Server {
             minter: cfg.minter,
             upstream_tls,
             require_sni_match: cfg.require_sni_match,
+            enable_h2: cfg.enable_h2,
             connection_events: cfg.connection_events,
             pipeline: Pipeline::builtin(),
             caps: Arc::new(ConnCaps {

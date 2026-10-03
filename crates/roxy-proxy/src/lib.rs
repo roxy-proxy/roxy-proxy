@@ -12,8 +12,10 @@
 //!   TLS termination, tunnels, `roxy.internal`, proxy auth).
 //! - `pipeline`: request/response stages, the `Verdict` the driver consumes
 //!   exhaustively, rule evaluation and effects.
-//! - `exchange`: one request/response exchange, upstream errors, the
-//!   WebSocket relay.
+//! - `exchange`: the transport-agnostic exchange core (`process`: request
+//!   stages → upstream → response stages → `Outcome`), the h1 adapter,
+//!   upstream errors, the WebSocket relay.
+//! - `h2conn`: the client-side HTTP/2 front end (ALPN `h2` in a tunnel).
 //! - [`upstream`]: resolver, address floor, connector and pooled client.
 //! - [`addr`]: the private-range / CIDR address floor.
 //! - [`addrlist`]: compiled address lists (`upstream.deny_lists`, `@list`).
@@ -39,6 +41,7 @@ pub mod config;
 mod conn;
 mod exchange;
 pub mod flowlog;
+mod h2conn;
 pub mod io;
 pub mod listener;
 mod pipeline;

@@ -15,7 +15,8 @@ use http::{HeaderValue, Version as HttpVersion};
 use crate::chars::trim_ows;
 use crate::model::{
     Authority, Body, CanonicalRequest, CanonicalResponse, Headers, HttpFlags, Limits, Method,
-    ParseError, Reason, RequestMeta, Scheme, TargetForm, Version, reject, status_forbids_body,
+    ParseError, Reason, RequestMeta, Scheme, TargetForm, Version, is_reserved, reject,
+    status_forbids_body,
 };
 use crate::url;
 
@@ -27,6 +28,22 @@ const CONNECTION_SPECIFIC: &[&str] = &[
     "proxy-connection",
     "transfer-encoding",
     "upgrade",
+];
+
+/// Trailer fields never accepted even with `http.allow_trailers` (mirrors
+/// the h1 chunked decoder; RFC 9110 §6.5.1). `content-*` and reserved
+/// fields are refused too.
+const FORBIDDEN_TRAILERS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "content-type",
+    "content-encoding",
+    "content-range",
+    "expect",
+    "range",
+    "max-forwards",
+    "cache-control",
 ];
 
 /// Per-field overhead counted by HPACK's header list size (RFC 9113 §6.5.2).
@@ -176,7 +193,13 @@ pub fn from_h2_parts(
     } else {
         limits.max_request_body_bytes
     };
-    let known = if bodiless { Some(0) } else { content_length };
+    // END_STREAM on the HEADERS frame: the body is known to be empty (the
+    // `h2` crate already refused a non-zero `content-length` with it).
+    let known = if bodiless || http_body::Body::is_end_stream(&body) {
+        Some(0)
+    } else {
+        content_length
+    };
     let body = Body::wrap_with_length(body, cap, known);
     meta.expect_continue = expect && known != Some(0);
 
@@ -190,6 +213,41 @@ pub fn from_h2_parts(
         body,
         meta,
     })
+}
+
+/// Validates an h2 request trailer section. Only call this when
+/// `http.allow_trailers` is set (otherwise any trailer section is a
+/// rejection). Applies the same field rules as the h1 chunked decoder:
+/// framing, routing, authentication and content metadata are refused, and
+/// values go through the header validator.
+pub fn validate_h2_trailers(
+    trailers: &http::HeaderMap,
+    limits: &Limits,
+    flags: &HttpFlags,
+) -> Result<http::HeaderMap, ParseError> {
+    if trailers.len() > limits.max_headers {
+        return reject(Reason::TooManyHeaders, "too many trailer fields");
+    }
+    for name in trailers.keys() {
+        let n = name.as_str();
+        if is_reserved(n)
+            || CONNECTION_SPECIFIC.contains(&n)
+            || FORBIDDEN_TRAILERS.contains(&n)
+            || n.starts_with("content-")
+        {
+            return reject(Reason::Trailers, format!("{n} not allowed in trailers"));
+        }
+    }
+    let raw: Vec<(&[u8], &[u8])> = trailers
+        .iter()
+        .map(|(n, v)| (n.as_str().as_bytes(), v.as_bytes()))
+        .collect();
+    let checked = Headers::try_from_raw(raw.iter().copied(), limits, flags)?;
+    let mut out = http::HeaderMap::new();
+    for (n, v) in &checked {
+        out.append(n.clone(), v.clone());
+    }
+    Ok(out)
 }
 
 /// Response head for an h2 stream (the caller streams `res.body` as DATA
@@ -471,6 +529,34 @@ mod tests {
         .unwrap();
         assert_eq!(r.body.known_length(), Some(3));
         assert!(r.body.collect_up_to(100).await.is_err());
+    }
+
+    #[test]
+    fn trailers_validated() {
+        let mut t = http::HeaderMap::new();
+        t.insert("grpc-status", HeaderValue::from_static("0"));
+        let ok = validate_h2_trailers(&t, &Limits::default(), &HttpFlags::default()).unwrap();
+        assert_eq!(ok.get("grpc-status").unwrap(), "0");
+        for bad in [
+            "authorization",
+            "content-length",
+            "content-md5",
+            "host",
+            "connection",
+        ] {
+            let mut t = http::HeaderMap::new();
+            t.insert(
+                http::HeaderName::from_static(bad),
+                HeaderValue::from_static("x"),
+            );
+            assert_eq!(
+                validate_h2_trailers(&t, &Limits::default(), &HttpFlags::default())
+                    .unwrap_err()
+                    .reason,
+                Reason::Trailers,
+                "{bad}"
+            );
+        }
     }
 
     #[test]
