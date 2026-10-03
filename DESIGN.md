@@ -984,7 +984,7 @@ the request is the last to see the response.
                  request ↓                                   ↑ response
  fixed   ┌─ connect gate (connect-phase rules, CONNECT/SNI) ─────────────┐
  fixed   ├─ quarantine gate (§11.3 terminate)                            │
- config  ├─ layer: sentinel        (wasm | remote, enforce | observe)    │
+ config  ├─ layer: sentinel        (wasm | service, enforce | observe)    │
  config  ├─ layer: redactor                                              │
  config  ├─ layer: rules           (built-in: request ↓ / response ↑)    │
  config  ├─ layer: egress-shaper   (may not change the destination)      │
@@ -1027,7 +1027,7 @@ The earlier `stage: before_rules | after_rules` setting and the rule action
 reserved word in the rule grammar and is rejected by the compiler.
 
 **Layer kinds.** A layer is either a **wasm** component running in-process
-(§11.4) or a **remote** service that roxy calls over HTTP (§11.6). Both
+(§11.4) or a **service layer**: an external service that roxy streams the traffic through (§11.6). Both
 implement the same contract and get the same host services.
 
 **Modes.**
@@ -1074,7 +1074,7 @@ Typical patterns:
   body bytes to another service as they arrive, which may mutate them and
   streams the result back, then pass that on down; do the same with the
   response head and body on the way back up. This is a first-class use case
-  and is exactly what a streaming remote layer is (§11.6); a wasm layer can
+  and is exactly what a service layer is (§11.6); a wasm layer can
   do the same by piping into a named endpoint.
 - **Deny or synthesise:** return a response without calling `next`.
 
@@ -1088,7 +1088,7 @@ layers: [sentinel, rules]
 
 addons:
   - name: sentinel
-    kind: wasm                        # wasm | remote
+    kind: wasm                        # wasm | service
     path: /etc/roxy/addons/sentinel.wasm
     mode: enforce                     # enforce | observe
     capabilities: [state, record, endpoints, terminate]
@@ -1251,9 +1251,9 @@ ratchet the sentinel design warns about.
 - No filesystem, sockets or environment inside the sandbox; all I/O is
   `next`, `endpoints` and `flow`.
 
-### 11.6 Remote layers (external services)
+### 11.6 Service layers (external services)
 
-A `kind: remote` layer is an external service in the stack. Its primary use
+A `kind: service` layer is an external service in the stack. Its primary use
 is to **stream** the exchange through a service that may mutate it: the
 request head and body go to the service as they arrive, and the service
 streams the (possibly changed) request back, which roxy passes down; on the
@@ -1264,7 +1264,7 @@ other out-of-process logic, with no WASM toolchain.
 ```yaml
 addons:
   - name: transformer
-    kind: remote
+    kind: service
     endpoint: transformer-svc           # a named endpoint, as in §11.3
     directions: [request, response]     # which streams go through the service
     mode: enforce                       # enforce | observe
@@ -1329,7 +1329,7 @@ be built on roxy without roxy knowing anything about model APIs.
 | recursion guard for monitor inference | endpoint calls bypass the layer stack |
 | never hang the request | `max_exchange_time`, immediate deny responses |
 | fail open or closed when the processor is down | closed in enforce mode; observe mode for monitors whose failure must not block |
-| sidecar deployment | `kind: remote` layer, streaming `message/http` (§11.6) |
+| sidecar deployment | `kind: service` layer, streaming `message/http` (§11.6) |
 | embedded CPython in WASM | `kind: wasm` with raised memory/time budgets and instance recycling |
 | observe-only default for uncalibrated scores | `mode: observe` (tee) |
 
@@ -1361,7 +1361,7 @@ Other languages:
   sentinel whose cost is dominated by model inference anyway; give it the
   raised budgets above.
 - **Python with native dependencies**, or anything else out of process,
-  runs as a remote layer (§11.6).
+  runs as a service layer (§11.6).
 
 `examples/addons/` ships a Rust pass-through, a Rust streaming redactor, a
 Rust layer that withholds `tool_use` blocks in a streamed response until a
