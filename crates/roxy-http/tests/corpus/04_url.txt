@@ -1,0 +1,150 @@
+# URL normalisation in request targets (DESIGN.md §5.4).
+
+=== fragment_in_target
+expect: error fragment_in_target
+---
+GET http://example.com/a#frag HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== fragment_in_tunnel
+role: tunnel https example.com:443
+expect: error fragment_in_target
+---
+GET /a?b#c HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== encoded_dotdot_climb
+expect: error path_climbs_above_root
+---
+GET http://example.com/%2e%2e/etc/passwd HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== encoded_dotdot_climb_tunnel
+role: tunnel https example.com:443
+expect: error path_climbs_above_root
+---
+GET /%2e%2e/ HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== mixed_encoded_dotdot
+role: tunnel https example.com:443
+expect: error path_climbs_above_root
+---
+GET /a/.%2E/%2e./x HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== literal_climb
+role: tunnel https example.com:443
+expect: error path_climbs_above_root
+---
+GET /a/../../b HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== dot_segments_resolved
+role: tunnel https example.com:443
+expect: request GET https://example.com:443/a/c/
+---
+GET /a/b/../%2E/c/. HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== encoded_slash_preserved
+role: tunnel https example.com:443
+expect: request GET https://example.com:443/a%2F..%2Fb
+---
+GET /a%2f..%2fb HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== unreserved_decoded_hex_uppercased
+role: tunnel https example.com:443
+expect: request GET https://example.com:443/~user/A%20b?x=%2F%7E
+---
+GET /%7euser/%41%20b?x=%2f%7E HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== query_hex_uppercased_only
+role: tunnel https example.com:443
+expect: request GET https://example.com:443/?a=%2F&b=%7E&c=x+y
+---
+GET /?a=%2f&b=%7e&c=x+y HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== bad_percent_path
+role: tunnel https example.com:443
+expect: error bad_percent_encoding
+---
+GET /a%zzb HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== truncated_percent_path
+role: tunnel https example.com:443
+expect: error bad_percent_encoding
+---
+GET /a%2 HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== bad_percent_query
+role: tunnel https example.com:443
+expect: error bad_percent_encoding
+---
+GET /a?x=%G1 HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== backslash_in_path
+role: tunnel https example.com:443
+expect: error invalid_path
+---
+GET /a\\..\\b HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== quote_in_path
+role: tunnel https example.com:443
+expect: error invalid_path
+---
+GET /a"b HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== brace_in_query
+role: tunnel https example.com:443
+expect: error invalid_query
+---
+GET /a?x={} HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== brackets_in_query_ok
+role: tunnel https example.com:443
+expect: request GET https://example.com:443/a?x[]=1
+---
+GET /a?x[]=1 HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== empty_query_dropped
+role: tunnel https example.com:443
+expect: request GET https://example.com:443/a
+---
+GET /a? HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== absolute_no_path
+expect: request GET http://example.com:80/
+---
+GET http://example.com HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n

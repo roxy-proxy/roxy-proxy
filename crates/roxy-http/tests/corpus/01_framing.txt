@@ -1,0 +1,428 @@
+# Content-Length / Transfer-Encoding framing (DESIGN.md §5.3).
+# Physical newlines are ignored; \r\n is written explicitly.
+
+=== cl_te_classic
+# CL.TE: front-end uses CL, back-end uses TE.
+expect: error cl_and_te
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 6\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+0\r\n
+\r\n
+G
+
+=== te_cl_classic
+expect: error cl_and_te
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+Content-Length: 3\r\n
+\r\n
+8\r\n
+SMUGGLED\r\n
+0\r\n
+\r\n
+
+=== te_cl_with_bad_te
+# Precedence: CL+TE wins over TE validity.
+expect: error cl_and_te
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: xchunked\r\n
+Content-Length: 3\r\n
+\r\n
+abc
+
+=== te_trailing_comma
+expect: error bad_transfer_encoding
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked, \r\n
+\r\n
+
+=== te_xchunked
+expect: error bad_transfer_encoding
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: xchunked\r\n
+\r\n
+
+=== te_chunked_identity
+expect: error bad_transfer_encoding
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked, identity\r\n
+\r\n
+
+=== te_identity_chunked
+expect: error bad_transfer_encoding
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: identity, chunked\r\n
+\r\n
+
+=== te_gzip_chunked
+expect: error bad_transfer_encoding
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: gzip, chunked\r\n
+\r\n
+
+=== te_two_headers
+expect: error bad_transfer_encoding
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+
+=== te_two_headers_identity
+expect: error bad_transfer_encoding
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+Transfer-Encoding: identity\r\n
+\r\n
+
+=== te_with_parameter
+expect: error bad_transfer_encoding
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked;q=1\r\n
+\r\n
+
+=== te_quoted
+expect: error bad_transfer_encoding
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: "chunked"\r\n
+\r\n
+
+=== te_space_before_colon
+expect: error whitespace_before_colon
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding : chunked\r\n
+\r\n
+
+=== te_tab_before_colon
+expect: error whitespace_before_colon
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding\t: chunked\r\n
+\r\n
+
+=== te_tab_separator_ok
+# OWS (here HTAB) after the colon is legal and stripped.
+expect: request POST http://example.com:80/ body=hello
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding:\tchunked\r\n
+\r\n
+5\r\nhello\r\n0\r\n\r\n
+
+=== te_trailing_ows_ok
+expect: request POST http://example.com:80/ body=hello
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked \t\r\n
+\r\n
+5\r\nhello\r\n0\r\n\r\n
+
+=== te_uppercase_ok
+expect: request POST http://example.com:80/ body=hi
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: CHUNKED\r\n
+\r\n
+2\r\nhi\r\n0\r\n\r\n
+
+=== te_vertical_tab
+expect: error invalid_header_value
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding:\x0bchunked\r\n
+\r\n
+
+=== te_obs_fold
+expect: error obs_fold
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding:\r\n
+ chunked\r\n
+\r\n
+
+=== te_on_http10
+flags: allow_http10
+expect: error bad_transfer_encoding
+---
+POST http://example.com/ HTTP/1.0\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+
+=== cl_duplicate_equal
+expect: error duplicate_content_length
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 5\r\n
+Content-Length: 5\r\n
+\r\n
+hello
+
+=== cl_duplicate_unequal
+expect: error duplicate_content_length
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 5\r\n
+Content-Length: 6\r\n
+\r\n
+hello!
+
+=== cl_list_value
+expect: error bad_content_length
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 5, 5\r\n
+\r\n
+hello
+
+=== cl_plus_sign
+expect: error bad_content_length
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: +5\r\n
+\r\n
+hello
+
+=== cl_minus_sign
+expect: error bad_content_length
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: -1\r\n
+\r\n
+
+=== cl_inner_space
+expect: error bad_content_length
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 1 0\r\n
+\r\n
+
+=== cl_hex
+expect: error bad_content_length
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 0x5\r\n
+\r\n
+
+=== cl_empty
+expect: error bad_content_length
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length:\r\n
+\r\n
+
+=== cl_twenty_digits
+expect: error bad_content_length
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 00000000000000000005\r\n
+\r\n
+hello
+
+=== cl_absurd_leading_zeros
+expect: error bad_content_length
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: \{200:0}5\r\n
+\r\n
+hello
+
+=== cl_huge_does_not_allocate
+# 19 digits parses, then exceeds the body cap; nothing is pre-allocated.
+expect: error body_too_large
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 9999999999999999999\r\n
+\r\n
+
+=== cl_some_leading_zeros_ok
+expect: request POST http://example.com:80/ body=hello
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 0005\r\n
+\r\n
+hello
+
+=== cl_surrounding_ows_ok
+expect: request POST http://example.com:80/ body=hello
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: \t 5 \r\n
+\r\n
+hello
+
+=== cl_truncated_body
+expect: body-error unexpected_eof
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 10\r\n
+\r\n
+hello
+
+=== body_on_get_cl
+expect: error body_on_bodiless_method
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 5\r\n
+\r\n
+hello
+
+=== body_on_get_chunked
+expect: error body_on_bodiless_method
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+0\r\n\r\n
+
+=== body_on_head
+expect: error body_on_bodiless_method
+---
+HEAD http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 1\r\n
+\r\n
+x
+
+=== body_on_delete
+expect: error body_on_bodiless_method
+---
+DELETE http://example.com/x HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 2\r\n
+\r\n
+{}
+
+=== body_on_options
+expect: error body_on_bodiless_method
+---
+OPTIONS http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 2\r\n
+\r\n
+{}
+
+=== body_on_trace
+expect: error body_on_bodiless_method
+---
+TRACE http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 2\r\n
+\r\n
+{}
+
+=== body_on_connect
+expect: error body_on_bodiless_method
+---
+CONNECT example.com:443 HTTP/1.1\r\n
+Host: example.com:443\r\n
+Content-Length: 2\r\n
+\r\n
+{}
+
+=== get_with_zero_cl_ok
+expect: request GET http://example.com:80/
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 0\r\n
+\r\n
+
+=== body_on_get_allowed_by_flag
+flags: allow_body_on_get
+expect: request GET http://example.com:80/ body=hello
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 5\r\n
+\r\n
+hello
+
+=== extension_method_body_ok
+expect: request PROPFIND http://example.com:80/dav body=<x/>
+---
+PROPFIND http://example.com/dav HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 4\r\n
+\r\n
+<x/>
+
+=== expect_102_processing
+expect: error bad_expect
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 5\r\n
+Expect: 102-processing\r\n
+\r\n
+hello
+
+=== expect_two_values
+expect: error bad_expect
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 5\r\n
+Expect: 100-continue\r\n
+Expect: 100-continue\r\n
+\r\n
+hello
+
+=== expect_100_continue_ok_and_consumed
+expect: request POST http://example.com:80/ body=hello nohdr:expect
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 5\r\n
+Expect: 100-Continue\r\n
+\r\n
+hello
