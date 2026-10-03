@@ -1,0 +1,63 @@
+---
+source: crates/roxy-rules/tests/parser.rs
+expression: out
+---
+""
+  1:1: expected a field or a value, found end of expression
+  | 
+  | ^
+
+"host =="
+  1:8: expected a field or a value, found end of expression
+  | host ==
+  |        ^
+
+"host == \"unterminated"
+  1:9: unterminated string
+  | host == "unterminated
+  |         ^^^^^^^^^^^^^
+
+"host = \"a\""
+  1:6: unexpected `=`; use `==`
+  | host = "a"
+  |      ^
+
+"(host == \"a\""
+  1:13: expected `)`, found end of expression
+  | (host == "a"
+  |             ^
+
+"host == \"a\" == \"b\""
+  1:13: unexpected `==` after expression; comparisons cannot be chained, combine them with `and`/`or`
+  | host == "a" == "b"
+  |             ^^
+
+"method in [GET HEAD]"
+  1:16: expected `,` or `]` in list, found `HEAD`
+  | method in [GET HEAD]
+  |                ^^^^
+
+"client.ip in [10.0.0.0/33]"
+  1:15: invalid CIDR `10.0.0.0/33`: prefix length must be at most /32
+  | client.ip in [10.0.0.0/33]
+  |               ^^^^^^^^^^^
+
+"path matches \"\\d+\""
+  1:15: unknown escape `\d`; only `\"` and `\\` are allowed (write `\\d` for a literal backslash, e.g. in a regex)
+  | path matches "\d+"
+  |               ^^
+
+"port == 5parsecs"
+  1:10: unknown unit `parsecs`; expected kb, mb, gb (1024-based sizes) or ms, s, m, h (durations, in milliseconds)
+  | port == 5parsecs
+  |          ^^^^^^^
+
+"a not b"
+  1:3: unexpected `not` after an operand; did you mean `not in`?
+  | a not b
+  |   ^^^
+
+"x\n  and y ==\n  and z"
+  3:3: expected a field or a value, found `and`
+  |   and z
+  |   ^^^
