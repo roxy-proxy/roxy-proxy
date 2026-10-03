@@ -622,8 +622,14 @@ impl http_body::Body for H2Body {
         if this.finished {
             return Poll::Ready(None);
         }
-        if !this.data_done {
+        while !this.data_done {
             match this.rx.poll_data(cx) {
+                // An empty DATA frame (typically the one carrying
+                // END_STREAM) has nothing to forward. Passing it on would
+                // make the upstream h2 client send an empty non-final DATA
+                // frame, which h2 servers count as a flood and answer with
+                // GOAWAY(ENHANCE_YOUR_CALM) after about a hundred.
+                Poll::Ready(Some(Ok(d))) if d.is_empty() => {}
                 Poll::Ready(Some(Ok(d))) => {
                     // Release as the data moves on: the window refills only
                     // as fast as the consumer (the upstream) takes it.
