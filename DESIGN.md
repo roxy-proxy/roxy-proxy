@@ -1043,13 +1043,15 @@ implement the same contract and get the same host services.
   scoring monitor, which the sentinel design recommends as the proxy
   default.
 
-**Multiple `next` calls.** A layer may call `next` more than once per
-exchange, up to `max_next_calls` (default 1). Each call is a full pass
-through every layer below it, including the rules and the address floor.
-This is what a sentinel needs for *reject as replay*: when it rejects a
-`tool_use` block, it appends the rejected call and a synthetic result to the
-conversation, regenerates through `next`, and returns the new response. The
-bound is the sentinel design's `MAX_CONSECUTIVE_REJECTIONS`.
+**One exchange, one `next`.** A layer calls `next` at most once per
+exchange. The stack carries the client's traffic and nothing else: a layer
+never originates requests through the layers below it. Retrying,
+regenerating or replaying is the client's (scaffold's) responsibility; a
+layer that rejects something answers with a response the client can act on.
+A layer that needs to talk to anything else makes an **independent call to a
+named endpoint** (§11.3), in the manner of Envoy Lua's `httpCall`: it goes
+straight to the connector, never through other layers or the rules, and is
+governed by the endpoint's own configuration. A second `next` call traps.
 
 **Full bidirectional access, low level.** A layer owns everything at its
 position in both directions. It may read, rewrite, split, delay, inject into,
@@ -1085,7 +1087,6 @@ addons:
     kind: wasm                        # wasm | remote
     path: /etc/roxy/addons/sentinel.wasm
     mode: enforce                     # enforce | observe
-    max_next_calls: 4                 # bound on regenerate-after-reject
     capabilities: [state, record, endpoints, terminate]
     endpoints:                        # named, not URLs (§11.3)
       monitor-model:
@@ -1179,8 +1180,8 @@ package roxy:addon@0.1.0;
 
 interface chain {
   use wasi:http/types@0.2.0.{outgoing-request, future-incoming-response, error-code};
-  /// Pass a request through every layer below this one. May be called up to
-  /// `max_next_calls` times per exchange; each call is a full pass.
+  /// Pass this exchange's request to the layers below. At most once per
+  /// exchange; a second call traps. Independent requests use `endpoints`.
   next: func(req: outgoing-request) -> result<future-incoming-response, error-code>;
 }
 
@@ -1268,8 +1269,6 @@ Protocol, one HTTP POST per phase to the endpoint, JSON envelope plus body:
   `{respond: {status, headers, body}}` | `{deny: {status, message}}` |
   `{terminate: {scope, reason}}`.
 - **response phase** → the same set, applied to the response.
-- `regenerate` lets a remote layer ask roxy to send a modified request
-  through `next` again (counted against `max_next_calls`).
 
 The envelope carries the flow id, principal and tags, so the sidecar can key
 its state. A streaming variant (chunk frames over HTTP/2) can follow; v1 is
@@ -1289,13 +1288,13 @@ be built on roxy without roxy knowing anything about model APIs.
 | `BeforeToolCall` (tool_use in response) | the response stream; can withhold tool_use blocks while forwarding text |
 | `AfterToolCall` (tool_result in next request) | next request's stream (lossy by nature, as the design notes) |
 | `continue` / `modify` | pass through / rewrite the stream |
-| `reject` as replay, bounded | multiple `next` calls, `max_next_calls` |
+| `reject` | rewrite the response so the scaffold sees the rejection (e.g. a synthetic tool result or refusal); the scaffold regenerates. roxy never replays |
 | error response | return a synthetic response |
 | `terminate` | `flow.terminate` → quarantine gate, optional `terminate_endpoint` |
 | `escalate` | the sentinel's own composition; roxy sees only the final action |
 | `audit` / `Recorder` | `flow.record(..., audit: true)` into the flow log and `audit_endpoint` |
 | `host.generate` with another model | named endpoint for the monitor model |
-| `host.generate` as the agent's own model | `next` with a constructed request |
+| `host.generate` as the agent's own model | a named endpoint pointing at the same model API (an independent call, not via the stack) |
 | `host.fetch` with named endpoints | `endpoints.call` — same design, credentials attached by roxy |
 | `host.get` / `put` keyed store | `flow.state-*`, JSON values, TTL, no eviction |
 | trustworthy principal key | `flow.current().principal` from proxy auth / client IP |
