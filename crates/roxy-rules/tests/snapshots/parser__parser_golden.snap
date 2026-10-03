@@ -74,9 +74,9 @@ not not tls.sni ends_with ".internal"
   sexpr:  (not (not (ends_with field:tls.sni str:".internal")))
   pretty: not not (tls.sni ends_with ".internal")
 
-dst.port in [443, 8443] # trailing comment
-  sexpr:  (in field:dst.port [int:443 int:8443])
-  pretty: dst.port in [443, 8443]
+port in [443, 8443] # trailing comment
+  sexpr:  (in field:port [int:443 int:8443])
+  pretty: port in [443, 8443]
 
 body.size < 1mb and body.text contains "\"secret\\"
   sexpr:  (and (< field:body.size int:1048576) (contains field:body.text str:"\"secret\\"))
@@ -96,6 +96,6 @@ client.ip in @internal
   sexpr:  (in field:client.ip list:@internal)
   pretty: client.ip in @internal
 
-dst.ip not in @blocked-v6 or client.ip in [10.0.0.0/8]
-  sexpr:  (or (not in field:dst.ip list:@blocked-v6) (in field:client.ip [cidr:10.0.0.0/8]))
-  pretty: dst.ip not in @blocked-v6 or client.ip in [10.0.0.0/8]
+client.ip not in @blocked-v6 or client.ip in [10.0.0.0/8]
+  sexpr:  (or (not in field:client.ip list:@blocked-v6) (in field:client.ip [cidr:10.0.0.0/8]))
+  pretty: client.ip not in @blocked-v6 or client.ip in [10.0.0.0/8]

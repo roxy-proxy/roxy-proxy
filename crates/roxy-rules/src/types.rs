@@ -121,9 +121,12 @@ impl Reads {
     pub const WATCHED_FIELDS: Reads = Reads(0b1_1111);
     /// Both byte-metric bits.
     pub const METRICS: Reads = Reads(0b110_0000);
+    /// Everything: every watched field and both byte metrics.
+    pub const ALL: Reads = Reads(0b111_1111);
     /// Values known before the response head is sent to the client.
     pub const BEFORE_RESPONSE_SENT: Reads = Reads(0b1010);
 
+    #[must_use]
     pub const fn union(self, other: Reads) -> Reads {
         Reads(self.0 | other.0)
     }
@@ -554,15 +557,9 @@ mod tests {
         assert!(Field::BodySize.is_head());
         assert_eq!(Field::BodyBytes.reads(), Reads::BODY_BYTES);
         assert_eq!(Field::ResponseStatus.reads(), Reads::RESPONSE_HEAD);
-        assert_eq!(
-            Field::ResponseBodyBytes.reads(),
-            Reads::RESPONSE_BODY_BYTES
-        );
+        assert_eq!(Field::ResponseBodyBytes.reads(), Reads::RESPONSE_BODY_BYTES);
         assert_eq!(Field::WsText.reads(), Reads::WS);
-        assert_eq!(
-            Access::RespBodyText.reads(),
-            Reads::RESPONSE_BODY_TEXT
-        );
+        assert_eq!(Access::RespBodyText.reads(), Reads::RESPONSE_BODY_TEXT);
         assert!(Access::BodyText.reads().is_empty());
         let r = Reads::BODY_BYTES | Reads::METRIC_REQUEST_BYTES;
         assert!(r.intersects(Reads::METRICS));
@@ -576,7 +573,11 @@ mod tests {
         assert!(res("github").unwrap_err().contains("double-quoted"));
         assert!(res("metric.x").unwrap_err().contains("undefined metric"));
         assert!(res("header").unwrap_err().contains("needs a name"));
-        assert!(res("host[\"x\"]").unwrap_err().contains("cannot be indexed"));
+        assert!(
+            res("host[\"x\"]")
+                .unwrap_err()
+                .contains("cannot be indexed")
+        );
         assert!(
             res("header[\"a b\"]")
                 .unwrap_err()

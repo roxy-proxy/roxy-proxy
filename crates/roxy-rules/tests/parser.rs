@@ -29,12 +29,12 @@ fn parser_golden() {
         "ws.size <= 16kb and ws.opcode == 1",
         "a == 1 or b == 2 or c == 3 and d == 4",
         "not not tls.sni ends_with \".internal\"",
-        "dst.port in [443, 8443] # trailing comment",
+        "port in [443, 8443] # trailing comment",
         "body.size < 1mb and body.text contains \"\\\"secret\\\\\"",
         "listener.name == \"proxy\"\n  and (scheme == \"https\"\n       or port == 80)",
         "response.header[\"content-type\"] starts_with \"text/\"",
         "client.ip in @internal",
-        "dst.ip not in @blocked-v6 or client.ip in [10.0.0.0/8]",
+        "client.ip not in @blocked-v6 or client.ip in [10.0.0.0/8]",
     ];
     let mut out = String::new();
     for src in cases {

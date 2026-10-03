@@ -70,12 +70,12 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: a, when: 'host == \"api.github.com', then: allow }",
     ),
     (
-        "phase violation",
+        "allow in a watching rule",
         "",
         "- { id: a, when: 'response.status >= 500', then: allow }",
     ),
     (
-        "connect-only field in request phase",
+        "connect-time fields are gone",
         "",
         "- { id: a, when: 'dst.port == 22', then: deny }",
     ),
@@ -95,9 +95,9 @@ const CASES: &[(&str, &str, &str)] = &[
         "- id: a\n  then:\n    - set_header: { authorization: \"Bearer ${secret:openai}\", x-k: \"${secret:missing}\" }\n    - allow\n",
     ),
     (
-        "secret outside request phase",
+        "secret in a watching rule",
         "",
-        "- { id: a, phase: response, then: { set_header: { x-k: \"${secret:gh}\" } } }",
+        "- { id: a, when: 'response.status == 500', then: { set_header: { x-k: \"${secret:gh}\" } } }",
     ),
     (
         "secret outside set_header",
@@ -107,7 +107,7 @@ const CASES: &[(&str, &str, &str)] = &[
     (
         "passthrough without a transparent listener",
         "",
-        "- { id: a, phase: connect, then: passthrough }",
+        "- { id: a, then: passthrough }",
     ),
     (
         "multi-key action map",
@@ -125,9 +125,19 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: a, then: { sethead: { x: y } } }",
     ),
     (
-        "action not allowed in phase",
+        "request mutation in a watching rule",
         "",
-        "- { id: a, phase: response, then: { rewrite_path: { match: \"/a\", to: \"/b\" } } }",
+        "- { id: a, when: 'body.bytes > 1mb', then: { rewrite_path: { match: \"/a\", to: \"/b\" } } }",
+    ),
+    (
+        "request header change in a watching rule",
+        "",
+        "- { id: a, when: 'body.bytes > 1mb', then: { set_header: { x-a: b } } }",
+    ),
+    (
+        "response header change that could fire after the head is sent",
+        "",
+        "- { id: a, when: 'response.status == 200 and response.body.bytes > 1mb', then: { remove_header: [x-a] } }",
     ),
     (
         "reserved header and bad value",
@@ -140,7 +150,7 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: a, then: [{ call: nope }, { deny: { status: 200 } }] }",
     ),
     (
-        "ws rules without inspect",
+        "phase key removed",
         "",
         "- { id: w, phase: ws, when: 'ws.size > 1mb', then: deny }",
     ),
@@ -172,11 +182,11 @@ const CASES: &[(&str, &str, &str)] = &[
     (
         "undefined address list",
         "",
-        "- { id: a, phase: connect, when: 'dst.ip not in @nope', then: deny }",
+        "- { id: a, when: 'client.ip not in @nope', then: deny }",
     ),
     (
         "bad metrics",
-        "- { id: bad-id, count: requests, key: [client.nope], window: 0s }\n- { id: r, count: response_bytes, where: 'dst.port == 1' }\n- { id: u, count: unique(nope) }",
+        "- { id: bad-id, count: requests, key: [client.nope], window: 0s }\n- { id: r, count: response_bytes, where: 'dst.port == 1' }\n- { id: u, count: unique(nope) }\n- { id: w, count: errors, where: 'response.status >= 500', key: [body.bytes] }\n- { id: v, count: unique(response.status) }",
         "[]",
     ),
 ];
@@ -205,7 +215,7 @@ proptest! {
     fn compile_never_panics(toks in prop::collection::vec(prop::sample::select(vec![
         "host", "path", "port", "client.ip", "header[\"a\"]", "header.all[\"a\"]",
         "metric.writes", "metric.nope", "tag[\"t\"]", "state[\"s\"]", "body.text",
-        "response.status", "dst.port", "\"x\"", "\"(\"", "\"*\"", "5", "1kb", "GET",
+        "response.status", "body.bytes", "response.body.bytes", "\"x\"", "\"(\"", "\"*\"", "5", "1kb", "GET",
         "true", "10.0.0.0/8", "::1", "[1, 2]", "[\"a\"]", "[GET]", "[10.0.0.0/8, ::1]", "@internal", "@nope", "[@internal]",
         "==", "!=", "<", ">=", "in", "not in", "starts_with", "contains", "like",
         "matches", "under", "and", "or", "not", "(", ")",

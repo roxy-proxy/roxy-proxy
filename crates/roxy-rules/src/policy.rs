@@ -217,16 +217,18 @@ impl Policy {
         if !c.d.is_empty() {
             return Err(c.d);
         }
-        let head = (0..rules.len()).filter(|&i| rules[i].kind.at_head()).collect();
+        let head = (0..rules.len())
+            .filter(|&i| rules[i].kind.at_head())
+            .collect();
         let watching: Box<[usize]> = (0..rules.len())
             .filter(|&i| rules[i].kind.watches())
             .collect();
         let watch_triggers = watching
             .iter()
             .fold(Reads::NONE, |acc, &i| acc | rules[i].triggers);
-        let byte_metrics = metrics.iter().fold(Reads::NONE, |acc, m| {
-            acc | metric_reads(&m.count)
-        });
+        let byte_metrics = metrics
+            .iter()
+            .fold(Reads::NONE, |acc, m| acc | metric_reads(&m.count));
         Ok(Policy {
             rules,
             head,
@@ -317,8 +319,8 @@ impl Policy {
             }
         }
         let (decision, terminal_rule) = match (deny, allow) {
-            (Some((i, d)), _) => (d.clone(), self.rules[i].id.clone()),
-            (None, Some((i, d))) => (d.clone(), self.rules[i].id.clone()),
+            // Deny wins; otherwise the first matching allow.
+            (Some((i, d)), _) | (None, Some((i, d))) => (d.clone(), self.rules[i].id.clone()),
             (None, None) => (
                 match self.default {
                     DefaultDecision::Deny => Decision::default_deny(),
@@ -405,8 +407,7 @@ impl Policy {
         let mut out: Option<WatchOutcome> = None;
         for (k, &i) in self.watching.iter().enumerate() {
             let rule = &self.rules[i];
-            if st.fired[k] || !rule.triggers.intersects(changed) || !rule.fields.is_subset(known)
-            {
+            if st.fired[k] || !rule.triggers.intersects(changed) || !rule.fields.is_subset(known) {
                 continue;
             }
             let pending: &[Effect] = out.as_ref().map_or(&[], |o| &o.effects);
@@ -598,12 +599,7 @@ impl PolicyCompiler<'_, '_> {
             .push(Diagnostic::new(path, msg).with_rule(rule.cloned()));
     }
 
-    fn expr(
-        &mut self,
-        rule: Option<&RuleId>,
-        path: String,
-        src: &str,
-    ) -> Option<(Pred, Needs)> {
+    fn expr(&mut self, rule: Option<&RuleId>, path: String, src: &str) -> Option<(Pred, Needs)> {
         let input = self.input;
         let metric = |id: &str| {
             input
@@ -633,6 +629,7 @@ impl PolicyCompiler<'_, '_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn metrics(&mut self) -> Vec<MetricDef> {
         let mut out = Vec::new();
         let mut ids: HashMap<&str, usize> = HashMap::new();
@@ -1122,8 +1119,7 @@ impl PolicyCompiler<'_, '_> {
         if !rest.is_empty() {
             parts.push(Part::Lit(rest.to_owned()));
         }
-        if parts.iter().any(|p| matches!(p, Part::Secret(_))) && rcx.kind == RuleKind::Watching
-        {
+        if parts.iter().any(|p| matches!(p, Part::Secret(_))) && rcx.kind == RuleKind::Watching {
             self.push(
                 rule,
                 apath,

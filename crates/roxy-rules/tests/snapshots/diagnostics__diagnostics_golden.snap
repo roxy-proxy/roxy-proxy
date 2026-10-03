@@ -62,13 +62,11 @@ rules[0].when:1:9: unterminated string  [rule a]
     | host == "api.github.com
     |         ^^^^^^^^^^^^^^^
 
-== phase violation
-rules[0].when:1:1: `response.status` is not available in the request phase (available in: response)  [rule a]
-    | response.status >= 500
-    | ^^^^^^^^^^^^^^^
+== allow in a watching rule
+rules[0].then[0]: `allow` is only possible in rules decided at the request head; this rule reads `response.status`, which is known only after the request was forwarded (DESIGN.md §6.1). Write the allow as a head rule and this rule as a `deny`  [rule a]
 
-== connect-only field in request phase
-rules[0].when:1:1: `dst.port` is not available in the request phase (available in: connect)  [rule a]
+== connect-time fields are gone
+rules[0].when:1:1: unknown field `dst.port`  [rule a]
     | dst.port == 22
     | ^^^^^^^^
 
@@ -85,8 +83,8 @@ rules[0].when:3:17: `like` needs a quoted glob pattern on the right, found the n
 == unknown secret
 rules[0].then[0]: reference to undefined secret "missing" (define it under `secrets`)  [rule a]
 
-== secret outside request phase
-rules[0].then[0]: secret references are only allowed in request-phase rules (this rule is `response`)  [rule a]
+== secret in a watching rule
+rules[0].then[0]: secret references are only allowed in rules decided at the request head (they set request headers); this rule watches `response.status`  [rule a]
 
 == secret outside set_header
 rules[0].then[0]: secret references are only allowed in `set_header` values, not in `log`  [rule a]
@@ -103,8 +101,14 @@ rules[0].then[1]: `tag` follows the terminal action `allow` and would never run;
 == unknown action
 parse: .[0].then: unknown action `sethead`; expected one of `allow`, `deny`, `passthrough`, `set_header`, `remove_header`, `rewrite_path`, `set_query`, `remove_query`, `redirect`, `tag`, `log`, `set_state`, `capture`, `call` at line 1 column 18
 
-== action not allowed in phase
-rules[0].then[0]: `rewrite_path` is not allowed in the response phase (allowed in: request)  [rule a]
+== request mutation in a watching rule
+rules[0].then[0]: `rewrite_path` changes the request, which is already on its way; this rule reads `body.bytes`, which is known only after the request was forwarded (DESIGN.md §6.1)  [rule a]
+
+== request header change in a watching rule
+rules[0].then[0]: `set_header` in this rule would change the request, which is already on its way; this rule reads `body.bytes`, which is known only after the request was forwarded (DESIGN.md §6.1). (In a rule that reads response values it changes the response.)  [rule a]
+
+== response header change that could fire after the head is sent
+rules[0].then[0]: `remove_header` changes the response head, so every value the rule reads must be known before the response head is sent; this rule also reads response.body.bytes, which can change after that  [rule a]
 
 == reserved header and bad value
 rules[0].then[0]: header `host` is managed by roxy and cannot be changed by rules (use `redirect: { ..., rewrite_host: true }`)  [rule a]
@@ -114,8 +118,8 @@ rules[0].then[1]: set_header x-a: value "café" is not a valid header value (vis
 rules[0].then[0]: `call` names undefined addon "nope"  [rule a]
 rules[0].then[1]: deny status 200 must be a 4xx or 5xx code  [rule a]
 
-== ws rules without inspect
-rules[0].phase: `ws`-phase rules can never run: no request rule enables message inspection with `allow: { upgrade: websocket, inspect: true }` (DESIGN.md §8.2)  [rule w]
+== phase key removed
+parse: rule "w": `phase` was removed: rules no longer have phases; each rule runs when the values it reads are known (head rules at the request head; rules that read body.bytes, response.* or ws.* watch the rest of the exchange; see DESIGN.md §6.1). Delete the `phase` key
 
 == duplicate and reserved ids
 rules[1].id: duplicate rule id "a" (first defined at rules[0])  [rule a]
@@ -143,15 +147,18 @@ rules[0].when:1:1: address list @internal can only be used with `in`/`not in` on
     | ^^^^^^^^^
 
 == undefined address list
-rules[0].when:1:15: reference to undefined address list `@nope` (define it under `address_lists`)  [rule a]
-    | dst.ip not in @nope
-    |               ^^^^^
+rules[0].when:1:18: reference to undefined address list `@nope` (define it under `address_lists`)  [rule a]
+    | client.ip not in @nope
+    |                  ^^^^^
 
 == bad metrics
 metrics[0].id: invalid metric id "bad-id": must match [A-Za-z_][A-Za-z0-9_]* so it can be used as metric.<id>
 metrics[0].window: window must be greater than zero
 metrics[0].key[0]: unknown key field `client.nope`; metric fields must be scalar fields such as client.ip, client.user, host
-metrics[1].where:1:1: `dst.port` is not available in the response phase (available in: connect)
+metrics[1].where:1:1: unknown field `dst.port`
     | dst.port == 1
     | ^^^^^^^^
 metrics[2].count: unknown unique() field `nope`; metric fields must be scalar fields such as client.ip, client.user, host
+metrics[3].key[0]: `body.bytes` is known only after forwarding; metric key fields must be head fields (DESIGN.md §6.4)
+metrics[3].where: a metric's `where` may only read head fields, because whether an exchange counts is decided at the request head; it reads `response.status` (DESIGN.md §6.4)
+metrics[4].count: `response.status` is known only after forwarding; metric unique() fields must be head fields (DESIGN.md §6.4)

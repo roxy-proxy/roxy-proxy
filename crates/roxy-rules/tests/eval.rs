@@ -5,10 +5,10 @@ mod common;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use common::{METRICS, compile, try_compile};
+use common::{METRICS, compile, try_compile, try_compile_with};
 use roxy_rules::{
-    AllowOpts, CaptureTarget, Decision, Effect, EvalContext, FailClosedReason, Field, LogLevel,
-    MapView, Phase, Scheme, Value,
+    AllowOpts, CaptureTarget, Decision, DefaultDecision, Effect, EvalContext, FailClosedReason,
+    Field, LogLevel, MapView, Policy, Reads, RuleKind, Scheme, Value, WatchOutcome,
 };
 
 fn ip(s: &str) -> Value<'static> {
@@ -42,19 +42,33 @@ fn flow() -> MapView {
         .with_body("{\"token\": \"hunter2\"}")
 }
 
-/// Does `expr` match `view` in `phase`?
-fn eval_in(phase: Phase, expr: &str, view: &MapView) -> bool {
+/// One watching evaluation with every watched value known and changed.
+fn watch(p: &Policy, view: &MapView, ctx: &EvalContext<'_>) -> Option<WatchOutcome> {
+    let mut st = p.watch_state(ctx.initial_tags);
+    p.evaluate_watching(Reads::ALL, Reads::ALL, &mut st, view, ctx)
+}
+
+/// Does `expr` match `view`? A deny rule reading it is evaluated at the
+/// head, or, if it reads watched values, as a watching rule with every
+/// watched value known.
+fn eval_in(expr: &str, view: &MapView) -> bool {
     let rules = format!(
-        "- id: r\n  phase: {phase}\n  when: '{}'\n  then: deny\n",
+        "- id: r\n  when: '{}'\n  then: deny\n",
         expr.replace('\'', "''")
     );
     let p = compile(METRICS, &rules);
-    let out = p.evaluate(phase, view, &EvalContext::empty());
-    out.decision.is_deny() && out.terminal_rule == "r"
+    let ctx = EvalContext::empty();
+    if p.rule_info()[0].kind == RuleKind::Watching {
+        watch(&p, view, &ctx)
+            .is_some_and(|o| o.stops() && o.terminal_rule.is_some_and(|r| r == "r"))
+    } else {
+        let out = p.evaluate_head(view, &ctx);
+        out.decision.is_deny() && out.terminal_rule == "r"
+    }
 }
 
 fn eval(expr: &str) -> bool {
-    eval_in(Phase::Request, expr, &flow())
+    eval_in(expr, &flow())
 }
 
 #[track_caller]
@@ -126,11 +140,10 @@ fn like_and_matches() {
     ]);
     // Only `*` and `?` are special in `like`.
     let v = MapView::new().with_str(Field::Path, "/a[1]{x}\\");
-    assert!(eval_in(Phase::Request, "path like \"/a[1]{x}\\\\\"", &v));
-    assert!(!eval_in(Phase::Request, "path like \"/a[12]{x}\\\\\"", &v));
+    assert!(eval_in("path like \"/a[1]{x}\\\\\"", &v));
+    assert!(!eval_in("path like \"/a[12]{x}\\\\\"", &v));
     // Alternation cannot escape the implicit anchors.
     assert!(!eval_in(
-        Phase::Request,
         "path matches \"x|/a.*\" and path matches \"zzz|/a\"",
         &v
     ));
@@ -148,14 +161,9 @@ fn under_operator() {
         ("github.com.evil.org", false),
         ("com", false),
     ] {
-        assert_eq!(
-            eval_in(Phase::Request, "host under \"github.com\"", &host(h)),
-            want,
-            "{h}"
-        );
+        assert_eq!(eval_in("host under \"github.com\"", &host(h)), want, "{h}");
     }
     assert!(eval_in(
-        Phase::Request,
         "host under \"GitHub.COM.\"",
         &host("API.github.com")
     ));
@@ -179,9 +187,9 @@ fn membership_and_cidrs() {
         ("client.ip not in [fd00::/8, 172.16.0.0/12]", true),
     ]);
     let v6 = MapView::new().with(Field::ClientIp, ip("fd12::1"));
-    assert!(eval_in(Phase::Request, "client.ip in [fd00::/8]", &v6));
+    assert!(eval_in("client.ip in [fd00::/8]", &v6));
     let mapped = MapView::new().with(Field::ClientIp, ip("::ffff:10.9.9.9"));
-    assert!(eval_in(Phase::Request, "client.ip in 10.0.0.0/8", &mapped));
+    assert!(eval_in("client.ip in 10.0.0.0/8", &mapped));
 }
 
 #[test]
@@ -264,7 +272,7 @@ fn null_with_other_operators_fails_closed() {
                 expr.replace('\'', "''")
             ),
         );
-        let out = p.evaluate(Phase::Request, &MapView::new(), &ctx);
+        let out = p.evaluate_head(&MapView::new(), &ctx);
         assert_eq!(out.terminal_rule, "_fail_closed", "{expr}");
         assert_eq!(
             out.fail_closed_reason,
@@ -275,7 +283,7 @@ fn null_with_other_operators_fails_closed() {
 }
 
 #[test]
-fn response_phase_fields() {
+fn response_fields() {
     let v = flow()
         .with_int(Field::ResponseStatus, 503)
         .with_response_header("Content-Type", "text/html; charset=utf-8")
@@ -297,7 +305,7 @@ fn response_phase_fields() {
             true,
         ),
     ] {
-        assert_eq!(eval_in(Phase::Response, expr, &v), want, "{expr}");
+        assert_eq!(eval_in(expr, &v), want, "{expr}");
     }
 }
 
@@ -329,9 +337,9 @@ const CHAIN: &str = r#"
 "#;
 
 #[test]
-fn first_terminal_wins_with_effects_in_order() {
+fn deny_wins_and_a_refusal_keeps_only_log_and_state() {
     let p = compile("", CHAIN);
-    let out = p.evaluate(Phase::Request, &flow(), &EvalContext::empty());
+    let out = p.evaluate_head(&flow(), &EvalContext::empty());
     assert_eq!(
         out.decision,
         Decision::Deny {
@@ -342,7 +350,25 @@ fn first_terminal_wins_with_effects_in_order() {
     );
     assert_eq!(out.terminal_rule, "writes");
     let matched: Vec<&str> = out.matched.iter().map(roxy_rules::RuleId::as_str).collect();
-    assert_eq!(matched, ["tag-github", "header", "writes"]);
+    // Every head rule is evaluated; the deny wins although allows follow.
+    assert_eq!(
+        matched,
+        ["tag-github", "header", "writes", "reads", "never"]
+    );
+    // Refused: header changes are dropped, the log remains.
+    assert_eq!(
+        out.effects,
+        vec![Effect::Log {
+            level: LogLevel::Info,
+            message: "github".into()
+        }]
+    );
+    assert_eq!(out.tags, ["github"]);
+
+    let get = flow().with_str(Field::Method, "GET");
+    let out = p.evaluate_head(&get, &EvalContext::empty());
+    assert_eq!(out.decision, Decision::Allow(AllowOpts::default()));
+    assert_eq!(out.terminal_rule, "reads");
     assert_eq!(
         out.effects,
         vec![
@@ -357,12 +383,6 @@ fn first_terminal_wins_with_effects_in_order() {
             Effect::RemoveHeader("x-debug".into()),
         ]
     );
-    assert_eq!(out.tags, ["github"]);
-
-    let get = flow().with_str(Field::Method, "GET");
-    let out = p.evaluate(Phase::Request, &get, &EvalContext::empty());
-    assert_eq!(out.decision, Decision::Allow(AllowOpts::default()));
-    assert_eq!(out.terminal_rule, "reads");
 }
 
 #[test]
@@ -372,11 +392,11 @@ fn default_decisions() {
         .with_str(Field::Host, "example.com")
         .with_str(Field::Method, "GET");
     // `never` has no `when` and matches everything.
-    let out = p.evaluate(Phase::Request, &other, &EvalContext::empty());
+    let out = p.evaluate_head(&other, &EvalContext::empty());
     assert_eq!(out.terminal_rule, "never");
 
     let p = compile("", "- { id: only, when: 'host == \"x\"', then: allow }");
-    let out = p.evaluate(Phase::Request, &other, &EvalContext::empty());
+    let out = p.evaluate_head(&other, &EvalContext::empty());
     assert_eq!(
         out.decision,
         Decision::Deny {
@@ -390,24 +410,103 @@ fn default_decisions() {
     assert_eq!(out.fail_closed_reason, None);
     assert_eq!(out.matched, Vec::<roxy_rules::RuleId>::new());
 
-    // An empty policy denies requests (closing) and ws messages (dropping,
-    // not closing), and allows connect/response.
+    // An empty policy denies (closing) under `default: deny`, and allows
+    // under `default: allow`, granting no allow options.
     let empty = compile("", "[]");
-    let deny = |close| Decision::Deny {
-        status: 403,
-        message: "blocked by roxy".into(),
-        close,
+    let out = empty.evaluate_head(&other, &EvalContext::empty());
+    assert_eq!(out.decision, Decision::default_deny());
+    assert_eq!(out.terminal_rule, "_default");
+    let open = try_compile_with("", "[]", DefaultDecision::Allow).unwrap();
+    let out = open.evaluate_head(&other, &EvalContext::empty());
+    assert_eq!(out.decision, Decision::Allow(AllowOpts::default()));
+    assert_eq!(out.terminal_rule, "_default");
+    assert_eq!(open.default_decision(), DefaultDecision::Allow);
+}
+
+/// Under `default: allow`, a deny still wins and the implicit allow grants
+/// no options (no upgrade, no private destinations), even when a matching
+/// rule only has effects.
+#[test]
+fn default_allow_grants_no_options() {
+    let p = try_compile_with(
+        "",
+        r#"
+- id: tagger
+  when: host == "a.example"
+  then: [tag: t, { set_header: { x-a: "1" } }]
+- id: ws
+  when: host == "ws.example"
+  then: { allow: { upgrade: websocket, private_ok: true } }
+- id: no-b
+  when: host == "b.example"
+  then: deny
+"#,
+        DefaultDecision::Allow,
+    )
+    .unwrap();
+    let ctx = EvalContext::empty();
+    let host = |h: &str| MapView::new().with_str(Field::Host, h);
+    let out = p.evaluate_head(&host("a.example"), &ctx);
+    assert_eq!(out.decision, Decision::Allow(AllowOpts::default()));
+    assert_eq!(out.terminal_rule, "_default");
+    assert_eq!(out.matched, ["tagger"].map(roxy_rules::RuleId::new));
+    assert_eq!(
+        out.effects.len(),
+        1,
+        "effects of matching rules still apply"
+    );
+    let out = p.evaluate_head(&host("ws.example"), &ctx);
+    assert_eq!(
+        out.decision,
+        Decision::Allow(AllowOpts {
+            upgrade_websocket: true,
+            private_ok: true
+        })
+    );
+    assert_eq!(out.terminal_rule, "ws");
+    let out = p.evaluate_head(&host("b.example"), &ctx);
+    assert!(out.decision.is_deny());
+    assert_eq!(out.terminal_rule, "no-b");
+}
+
+/// Deny wins regardless of order; the first matching deny is the terminal
+/// rule; only the first matching allow's options apply.
+#[test]
+fn deny_wins_and_first_allow_options() {
+    let p = compile(
+        "",
+        r#"
+- id: plain
+  when: host under "example.com"
+  then: allow
+- id: ws
+  when: host under "example.com"
+  then: { allow: { upgrade: websocket } }
+- id: deny-a
+  when: path == "/a"
+  then: { deny: { status: 451 } }
+- id: deny-a2
+  when: path starts_with "/a"
+  then: deny
+"#,
+    );
+    let ctx = EvalContext::empty();
+    let v = |path: &str| {
+        MapView::new()
+            .with_str(Field::Host, "www.example.com")
+            .with_str(Field::Path, path)
     };
-    for (phase, want) in [
-        (Phase::Request, deny(true)),
-        (Phase::Ws, deny(false)),
-        (Phase::Connect, Decision::Allow(AllowOpts::default())),
-        (Phase::Response, Decision::Allow(AllowOpts::default())),
-    ] {
-        let out = empty.evaluate(phase, &other, &EvalContext::empty());
-        assert_eq!(out.decision, want, "{phase}");
-        assert_eq!(out.terminal_rule, "_default");
-    }
+    let out = p.evaluate_head(&v("/a"), &ctx);
+    assert!(matches!(out.decision, Decision::Deny { status: 451, .. }));
+    assert_eq!(out.terminal_rule, "deny-a");
+    let matched: Vec<&str> = out.matched.iter().map(roxy_rules::RuleId::as_str).collect();
+    assert_eq!(matched, ["plain", "ws", "deny-a", "deny-a2"]);
+    let out = p.evaluate_head(&v("/b"), &ctx);
+    assert_eq!(out.decision, Decision::Allow(AllowOpts::default()));
+    assert_eq!(
+        out.terminal_rule, "plain",
+        "the first allow; options not merged"
+    );
 }
 
 #[test]
@@ -421,43 +520,38 @@ fn deny_close_defaults_and_opt_out() {
 - id: bare
   when: path == "/bare"
   then: deny
-- id: req-inspect
-  then: { allow: { upgrade: websocket, inspect: true } }
-- id: ws-drop
-  phase: ws
-  when: ws.size > 10
-  then: deny
-- id: ws-close
-  phase: ws
-  when: ws.size > 5
-  then: { deny: { close: true } }
-- id: ws-ok
-  phase: ws
+- id: ok
   then: allow
 - id: resp
-  phase: response
   when: response.status == 500
   then: deny
+- id: resp-keep
+  when: response.status == 501
+  then: { deny: { close: false } }
 "#,
     );
     let ctx = EvalContext::empty();
-    let close_of = |phase, v: &MapView| match p.evaluate(phase, v, &ctx).decision {
+    let close_of = |v: &MapView| match p.evaluate_head(v, &ctx).decision {
         Decision::Deny { close, .. } => Some(close),
         _ => None,
     };
     let path = |s: &str| MapView::new().with_str(Field::Path, s);
-    assert_eq!(close_of(Phase::Request, &path("/keep")), Some(false));
-    assert_eq!(close_of(Phase::Request, &path("/bare")), Some(true));
-    let ws = |n| MapView::new().with_int(Field::WsSize, n);
-    assert_eq!(
-        close_of(Phase::Ws, &ws(11)),
-        Some(false),
-        "drop the message"
-    );
-    assert_eq!(close_of(Phase::Ws, &ws(6)), Some(true), "close the socket");
-    assert_eq!(close_of(Phase::Ws, &ws(1)), None);
-    let resp = MapView::new().with_int(Field::ResponseStatus, 500);
-    assert_eq!(close_of(Phase::Response, &resp), Some(true));
+    assert_eq!(close_of(&path("/keep")), Some(false));
+    assert_eq!(close_of(&path("/bare")), Some(true));
+    assert_eq!(close_of(&path("/other")), None);
+    let watch_close = |status| match watch(
+        &p,
+        &MapView::new().with_int(Field::ResponseStatus, status),
+        &ctx,
+    )
+    .and_then(|o| o.stop)
+    {
+        Some(Decision::Deny { close, .. }) => Some(close),
+        _ => None,
+    };
+    assert_eq!(watch_close(500), Some(true));
+    assert_eq!(watch_close(501), Some(false));
+    assert_eq!(watch_close(200), None);
 }
 
 fn fail_closed(reason: FailClosedReason) -> impl Fn(&roxy_rules::Outcome) {
@@ -483,26 +577,15 @@ fn bodies_fail_closed() {
         "- { id: b, when: 'body.text contains \"secret\"', then: deny }\n- { id: ok, then: allow }",
     );
     let body = |s: &str| MapView::new().with_int(Field::BodySize, 10).with_body(s);
-    assert_eq!(
-        p.evaluate(Phase::Request, &body("a secret"), &ctx)
-            .terminal_rule,
-        "b"
-    );
-    assert_eq!(
-        p.evaluate(Phase::Request, &body(""), &ctx).terminal_rule,
-        "ok"
-    );
+    assert_eq!(p.evaluate_head(&body("a secret"), &ctx).terminal_rule, "b");
+    assert_eq!(p.evaluate_head(&body(""), &ctx).terminal_rule, "ok");
     let too_large = body("x").with_body_too_large(false);
-    fail_closed(FailClosedReason::BodyTooLargeToInspect("body.text".into()))(&p.evaluate(
-        Phase::Request,
-        &too_large,
-        &ctx,
-    ));
-    fail_closed(FailClosedReason::BodyUnavailable("body.text".into()))(&p.evaluate(
-        Phase::Request,
-        &MapView::new(),
-        &ctx,
-    ));
+    fail_closed(FailClosedReason::BodyTooLargeToInspect("body.text".into()))(
+        &p.evaluate_head(&too_large, &ctx),
+    );
+    fail_closed(FailClosedReason::BodyUnavailable("body.text".into()))(
+        &p.evaluate_head(&MapView::new(), &ctx),
+    );
 
     // Scoping by size first means a large upload is never inspected.
     let p = compile(
@@ -513,17 +596,23 @@ fn bodies_fail_closed() {
     let big = MapView::new()
         .with_int(Field::BodySize, 5 << 20)
         .with_body_too_large(false);
-    assert_eq!(p.evaluate(Phase::Request, &big, &ctx).terminal_rule, "ok");
+    assert_eq!(p.evaluate_head(&big, &ctx).terminal_rule, "ok");
 
     // Response bodies too.
     let p = compile(
         "",
-        "- { id: r, phase: response, when: 'response.body.text contains \"x\"', then: deny }",
+        "- { id: r, when: 'response.body.text contains \"x\"', then: deny }",
     );
     let v = MapView::new().with_body_too_large(true);
-    fail_closed(FailClosedReason::BodyTooLargeToInspect(
-        "response.body.text".into(),
-    ))(&p.evaluate(Phase::Response, &v, &ctx));
+    let out = watch(&p, &v, &ctx).expect("stops");
+    assert_eq!(out.stop, Some(Decision::fail_closed()));
+    assert_eq!(out.terminal_rule.unwrap(), "_fail_closed");
+    assert_eq!(
+        out.fail_closed_reason,
+        Some(FailClosedReason::BodyTooLargeToInspect(
+            "response.body.text".into()
+        ))
+    );
 }
 
 #[test]
@@ -551,21 +640,21 @@ fn unavailable_inputs_fail_closed() {
     };
 
     // The metric is reached but unavailable: fail closed, not "false".
-    let out = p.evaluate(Phase::Request, &base(), &ctx);
+    let out = p.evaluate_head(&base(), &ctx);
     fail_closed(FailClosedReason::MetricUnavailable("writes".into()))(&out);
     assert_eq!(out.matched, ["first"].map(roxy_rules::RuleId::new));
     assert_eq!(out.tags, ["seen"]);
 
     // Short-circuit: a different host never needs the metric.
     let other = base().with_str(Field::Host, "example.com");
-    let out = p.evaluate(Phase::Request, &other, &ctx);
+    let out = p.evaluate_head(&other, &ctx);
     fail_closed(FailClosedReason::AddressListUnavailable("internal".into()))(&out);
 
     // With the metric (0 for a fresh series) and the list available, fine.
     let ok = base()
         .with_metric("writes", 0)
         .with_address_list("internal", vec!["10.0.0.0/8".parse().unwrap()]);
-    let out = p.evaluate(Phase::Request, &ok, &ctx);
+    let out = p.evaluate_head(&ok, &ctx);
     assert_eq!(out.terminal_rule, "rest");
     assert_eq!(out.fail_closed_reason, None);
 
@@ -574,13 +663,13 @@ fn unavailable_inputs_fail_closed() {
         METRICS,
         "- { id: n, when: 'not (metric.writes > 5)', then: allow }",
     );
-    let out = p.evaluate(Phase::Request, &MapView::new(), &ctx);
+    let out = p.evaluate_head(&MapView::new(), &ctx);
     fail_closed(FailClosedReason::MetricUnavailable("writes".into()))(&out);
     let p = compile(
         "",
         "- { id: n, when: 'client.ip not in @blocked', then: allow }",
     );
-    let out = p.evaluate(Phase::Request, &base(), &ctx);
+    let out = p.evaluate_head(&base(), &ctx);
     fail_closed(FailClosedReason::AddressListUnavailable("blocked".into()))(&out);
 
     // Metric filters report the same condition to the proxy.
@@ -598,45 +687,61 @@ fn unavailable_inputs_fail_closed() {
         "",
         "- { id: s, when: 'state[\"k\"] == \"v\"', then: allow }",
     );
-    let out = p.evaluate(Phase::Request, &MapView::new(), &ctx);
+    let out = p.evaluate_head(&MapView::new(), &ctx);
     assert_eq!(out.terminal_rule, "_default");
     assert_eq!(out.fail_closed_reason, None);
 }
 
 #[test]
-fn phases_have_separate_chains() {
+fn head_and_watching_rules_share_one_list() {
     let p = compile(
-        "",
+        METRICS,
         r"
-- id: c
-  phase: connect
-  when: dst.port != 443
-  then: deny
 - id: r
-  phase: response
   when: response.status == 418
   then: { deny: { status: 502 } }
 - id: req
   then: allow
+- id: budget
+  when: metric.egress > 1mb
+  then: deny
+- id: count
+  when: metric.writes > 1000
+  then: deny
 ",
     );
-    let conn = MapView::new().with_int(Field::DstPort, 22);
+    let kinds: Vec<RuleKind> = p.rule_info().iter().map(|r| r.kind).collect();
     assert_eq!(
-        p.evaluate(Phase::Connect, &conn, &EvalContext::empty())
-            .terminal_rule,
-        "c"
+        kinds,
+        [
+            RuleKind::Watching,
+            RuleKind::Head,
+            RuleKind::HeadAndWatching,
+            RuleKind::Head
+        ]
     );
-    assert_eq!(
-        p.evaluate(Phase::Request, &conn, &EvalContext::empty())
-            .terminal_rule,
-        "req"
+    let info = p.rule_info();
+    assert_eq!(info[0].watches, ["response.status"]);
+    assert_eq!(info[2].watches, ["metric.egress (request_bytes)"]);
+    assert_eq!(info[2].triggers, Reads::METRIC_REQUEST_BYTES);
+    assert!(
+        info[3].watches.is_empty(),
+        "a requests metric does not watch"
     );
-    let res = MapView::new().with_int(Field::ResponseStatus, 418);
-    let out = p.evaluate(Phase::Response, &res, &EvalContext::empty());
-    assert_eq!(out.terminal_rule, "r");
-    assert!(matches!(out.decision, Decision::Deny { status: 502, .. }));
-    assert_eq!(p.rule_count(Phase::Connect), 1);
-    assert_eq!(p.rule_ids().count(), 3);
+
+    // At the head the response rule is skipped, not false.
+    let v = MapView::new()
+        .with_metric("egress", 0)
+        .with_metric("writes", 0);
+    let out = p.evaluate_head(&v, &EvalContext::empty());
+    assert_eq!(out.terminal_rule, "req");
+    // After forwarding, the response rule stops the exchange.
+    let res = v.with_int(Field::ResponseStatus, 418);
+    let out = watch(&p, &res, &EvalContext::empty()).unwrap();
+    assert_eq!(out.terminal_rule.unwrap(), "r");
+    assert!(matches!(out.stop, Some(Decision::Deny { status: 502, .. })));
+    assert_eq!(p.rule_ids().count(), 4);
+    assert_eq!(p.rule_count(), 4);
 }
 
 #[test]
@@ -656,7 +761,7 @@ fn tags_chain_and_initial_tags() {
 "#,
     );
     let v = MapView::new();
-    let out = p.evaluate(Phase::Request, &v, &EvalContext::empty());
+    let out = p.evaluate_head(&v, &EvalContext::empty());
     assert!(out.decision.is_deny(), "no from-addon tag");
     assert_eq!(out.tags, ["seen"]);
 
@@ -665,7 +770,7 @@ fn tags_chain_and_initial_tags() {
         initial_tags: &initial,
         ..EvalContext::empty()
     };
-    let out = p.evaluate(Phase::Request, &v, &ctx);
+    let out = p.evaluate_head(&v, &ctx);
     assert_eq!(out.terminal_rule, "c");
     assert_eq!(out.tags, ["from-addon", "seen", "both"]);
 
@@ -675,7 +780,7 @@ fn tags_chain_and_initial_tags() {
         initial_tags: &initial,
         ..EvalContext::empty()
     };
-    let out = p.evaluate(Phase::Request, &v, &ctx);
+    let out = p.evaluate_head(&v, &ctx);
     assert_eq!(out.matched, Vec::<roxy_rules::RuleId>::new());
     assert_eq!(out.tags, ["seen"]);
 }
@@ -693,7 +798,7 @@ fn set_state_is_visible_later_in_the_chain() {
 "#,
     );
     // The view says lockdown; the earlier set_state wins within the chain.
-    let out = p.evaluate(Phase::Request, &flow(), &EvalContext::empty());
+    let out = p.evaluate_head(&flow(), &EvalContext::empty());
     assert_eq!(out.terminal_rule, "t");
     assert_eq!(
         out.effects,
@@ -729,7 +834,7 @@ fn secrets_are_substituted() {
         secrets: &lookup,
         initial_tags: &[],
     };
-    let out = p.evaluate(Phase::Request, &openai(), &ctx);
+    let out = p.evaluate_head(&openai(), &ctx);
     assert!(out.decision.is_allow());
     assert_eq!(
         out.effects,
@@ -754,11 +859,11 @@ fn missing_secret_fails_closed() {
         secrets: &only_openai,
         initial_tags: &[],
     };
-    let out = p.evaluate(Phase::Request, &openai(), &ctx);
+    let out = p.evaluate_head(&openai(), &ctx);
     fail_closed(FailClosedReason::SecretMissing("gh".into()))(&out);
     assert_eq!(out.matched, ["openai"].map(roxy_rules::RuleId::new));
-    // The first header (resolved) was emitted; the failing one was not.
-    assert_eq!(out.effects.len(), 1);
+    // Failing closed refuses the request: no header effects survive.
+    assert_eq!(out.effects, []);
     assert!(!format!("{out:?}").contains("ghp_"), "no secret values");
 
     // A secret that is not a valid header value also fails closed.
@@ -767,7 +872,7 @@ fn missing_secret_fails_closed() {
         secrets: &crlf,
         initial_tags: &[],
     };
-    let out = p.evaluate(Phase::Request, &openai(), &ctx);
+    let out = p.evaluate_head(&openai(), &ctx);
     fail_closed(FailClosedReason::SecretInvalid("openai".into()))(&out);
     assert!(
         out.effects
@@ -796,12 +901,11 @@ fn every_effect_kind() {
     - allow: { upgrade: websocket, private_ok: true }
 "#,
     );
-    let out = p.evaluate(Phase::Request, &MapView::new(), &EvalContext::empty());
+    let out = p.evaluate_head(&MapView::new(), &EvalContext::empty());
     assert_eq!(
         out.decision,
         Decision::Allow(AllowOpts {
             upgrade_websocket: true,
-            inspect_ws: false,
             private_ok: true
         })
     );
@@ -863,7 +967,7 @@ fn body_buffering_flags() {
     assert!(p.needs_request_body() && !p.needs_response_body());
     let p = compile(
         "",
-        "- { id: a, phase: response, when: 'response.body.text contains \"x\"', then: allow }",
+        "- { id: a, when: 'response.body.text contains \"x\"', then: deny }",
     );
     assert!(!p.needs_request_body() && p.needs_response_body());
 }
@@ -873,7 +977,7 @@ fn metric_defs_compile() {
     let p = compile(
         "- { id: w, count: requests, where: 'method == POST', key: [client.ip, host], window: 1m }\n\
          - { id: u, count: unique(host) }\n\
-         - { id: e, count: errors, where: 'response.status >= 500' }",
+         - { id: e, count: errors, where: 'host == \"x\"' }",
         "[]",
     );
     let defs = p.metric_defs();
@@ -881,7 +985,7 @@ fn metric_defs_compile() {
     assert_eq!(defs[0].key, [Field::ClientIp, Field::Host]);
     assert_eq!(defs[0].window, Some(Duration::from_secs(60)));
     assert_eq!(defs[1].unique, Some(Field::Host));
-    assert_eq!(defs[2].phase, Phase::Response);
+    assert_eq!(defs[2].count, roxy_rules::MetricCount::Errors);
     assert_eq!(defs[0].matches(&flow()), Ok(true));
     assert_eq!(
         defs[0].matches(&flow().with_str(Field::Method, "GET")),
@@ -903,57 +1007,20 @@ fn address_lists() {
             .with_address_list("blocked", nets(&["203.0.113.7/32"]))
     };
     let client = |s: &str| with_lists(MapView::new().with(Field::ClientIp, ip(s)));
+    assert!(eval_in("client.ip in @internal", &client("10.1.2.3")));
+    assert!(eval_in("client.ip in @internal", &client("fd00::1")));
     assert!(eval_in(
-        Phase::Request,
-        "client.ip in @internal",
-        &client("10.1.2.3")
-    ));
-    assert!(eval_in(
-        Phase::Request,
-        "client.ip in @internal",
-        &client("fd00::1")
-    ));
-    assert!(eval_in(
-        Phase::Request,
         "client.ip in @internal",
         &client("::ffff:10.0.0.1")
     ));
-    assert!(!eval_in(
-        Phase::Request,
-        "client.ip in @internal",
-        &client("192.0.2.1")
-    ));
-    assert!(eval_in(
-        Phase::Request,
-        "client.ip not in @internal",
-        &client("192.0.2.1")
-    ));
-    assert!(!eval_in(
-        Phase::Request,
-        "client.ip not in @internal",
-        &client("10.0.0.1")
-    ));
-
-    let dst = |s: &str| with_lists(MapView::new().with(Field::DstIp, ip(s)));
-    assert!(eval_in(
-        Phase::Connect,
-        "dst.ip in @blocked",
-        &dst("203.0.113.7")
-    ));
-    assert!(eval_in(
-        Phase::Connect,
-        "dst.ip not in @blocked",
-        &dst("203.0.113.8")
-    ));
+    assert!(!eval_in("client.ip in @internal", &client("192.0.2.1")));
+    assert!(eval_in("client.ip not in @internal", &client("192.0.2.1")));
+    assert!(!eval_in("client.ip not in @internal", &client("10.0.0.1")));
 
     // A list the view cannot answer for fails closed (see
     // `unavailable_inputs_fail_closed`); an absent ip is just absent.
     let no_ip = with_lists(MapView::new());
-    assert!(!eval_in(
-        Phase::Request,
-        "client.ip not in @internal",
-        &no_ip
-    ));
+    assert!(!eval_in("client.ip not in @internal", &no_ip));
 }
 
 #[test]
@@ -977,26 +1044,15 @@ fn guarded_size_rule() {
          - { id: ok, then: allow }",
     );
     let sized = |n: i64| MapView::new().with_int(Field::BodySize, n);
-    assert_eq!(
-        p.evaluate(Phase::Request, &sized(20 << 20), &ctx)
-            .terminal_rule,
-        "big"
-    );
-    assert_eq!(
-        p.evaluate(Phase::Request, &sized(10), &ctx).terminal_rule,
-        "ok"
-    );
-    assert_eq!(
-        p.evaluate(Phase::Request, &MapView::new(), &ctx)
-            .terminal_rule,
-        "ok"
-    );
+    assert_eq!(p.evaluate_head(&sized(20 << 20), &ctx).terminal_rule, "big");
+    assert_eq!(p.evaluate_head(&sized(10), &ctx).terminal_rule, "ok");
+    assert_eq!(p.evaluate_head(&MapView::new(), &ctx).terminal_rule, "ok");
 
     let unguarded = compile(
         "",
         "- { id: big, when: 'body.size > 10mb', then: deny }\n- { id: ok, then: allow }",
     );
-    let out = unguarded.evaluate(Phase::Request, &MapView::new(), &ctx);
+    let out = unguarded.evaluate_head(&MapView::new(), &ctx);
     assert_eq!(out.terminal_rule, "_fail_closed");
 }
 

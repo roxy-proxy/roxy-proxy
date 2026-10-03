@@ -11,8 +11,8 @@ use common::compile;
 use proptest::prelude::*;
 use roxy_rules::{
     CarryOverReport, Clock, DEFAULT_MAX_METRIC_BYTES, EvalContext, FailClosedReason, Field,
-    MapView, MetricError, MetricLimits, MetricSnapshot, MetricSource, MetricStore, Phase,
-    SERIES_OVERHEAD, SPARSE_CHUNK, Sample, Value,
+    MapView, MetricError, MetricLimits, MetricSnapshot, MetricSource, MetricStore, SERIES_OVERHEAD,
+    SPARSE_CHUNK, Sample, Value,
 };
 
 /// A manually advanced clock.
@@ -51,7 +51,9 @@ fn client(n: u8) -> MapView {
     )
 }
 
+/// A head sample: counts `requests` and `unique`.
 const REQ: Sample = Sample {
+    head: true,
     request_bytes: 0,
     response_bytes: 0,
     denied: false,
@@ -59,7 +61,7 @@ const REQ: Sample = Sample {
 };
 
 fn rec(s: &MetricStore, v: &MapView) {
-    s.record(Phase::Request, v, &REQ).unwrap();
+    s.record(v, &REQ).unwrap();
 }
 
 #[test]
@@ -68,7 +70,7 @@ fn is_send_sync_and_object_safe() {
     assert_send_sync::<MetricStore>();
     let c = TestClock::new();
     let s: Arc<dyn MetricSource> = Arc::new(store_with("- { id: r, count: requests }", 10, &c));
-    s.record(Phase::Request, &MapView::new(), &REQ).unwrap();
+    s.record(&MapView::new(), &REQ).unwrap();
     assert_eq!(s.get("r", &MapView::new()), Ok(1));
 }
 
@@ -86,46 +88,44 @@ fn count_kinds() {
         &c,
     );
     let v = MapView::new().with_str(Field::Path, "/a");
-    let sample = Sample {
-        request_bytes: 100,
-        response_bytes: 1000,
-        denied: true,
-        error: true,
-    };
-    // Request phase: requests, request_bytes, denied, unique.
-    s.record(Phase::Request, &v, &sample).unwrap();
+    let none = Sample::default();
+    // Head samples: requests, unique (and denied, if the head denied).
     s.record(
-        Phase::Request,
         &v,
         &Sample {
-            request_bytes: 5,
+            denied: true,
             ..REQ
         },
     )
     .unwrap();
+    s.record(&MapView::new().with_str(Field::Path, "/b"), &REQ)
+        .unwrap();
+    // Streamed bytes: counted as they arrive, never as requests.
+    for (rq, rs) in [(100, 0), (5, 0), (0, 1000), (0, 1)] {
+        s.record(
+            &v,
+            &Sample {
+                request_bytes: rq,
+                response_bytes: rs,
+                ..none
+            },
+        )
+        .unwrap();
+    }
+    // The end sample: errors.
     s.record(
-        Phase::Request,
-        &MapView::new().with_str(Field::Path, "/b"),
-        &REQ,
-    )
-    .unwrap();
-    // Response phase: response_bytes, errors.
-    s.record(Phase::Response, &v, &sample).unwrap();
-    s.record(
-        Phase::Response,
         &v,
         &Sample {
-            response_bytes: 1,
-            ..REQ
+            error: true,
+            ..none
         },
     )
     .unwrap();
-    // Other phases count nothing.
-    s.record(Phase::Connect, &v, &sample).unwrap();
-    s.record(Phase::Ws, &v, &sample).unwrap();
+    // A sample with nothing in it counts nothing.
+    s.record(&v, &none).unwrap();
 
     let g = |id| s.get(id, &v).unwrap();
-    assert_eq!(g("req"), 3);
+    assert_eq!(g("req"), 2);
     assert_eq!(g("rqb"), 105);
     assert_eq!(g("rsb"), 1001);
     assert_eq!(g("err"), 1);
@@ -256,7 +256,7 @@ fn zero_increments_do_not_admit() {
     let c = TestClock::new();
     let s = store_with("- { id: e, count: errors, key: [client.ip] }", 1, &c);
     for n in 0..5 {
-        s.record(Phase::Response, &client(n), &REQ).unwrap();
+        s.record(&client(n), &REQ).unwrap();
     }
     assert_eq!(s.key_count(), 0);
 }
@@ -269,7 +269,7 @@ fn table_full_refuses_new_keys_only() {
         rec(&s, &client(n));
     }
     assert_eq!(s.key_count(), 3);
-    let err = s.record(Phase::Request, &client(4), &REQ);
+    let err = s.record(&client(4), &REQ);
     assert_eq!(err, Err(MetricError::TableFull { metric: "r".into() }));
     assert_eq!(err.unwrap_err().to_string(), "metric table full (metric r)");
     assert_eq!(s.key_count(), 3);
@@ -292,7 +292,7 @@ fn max_keys_is_shared_across_metrics_and_all_metrics_still_record() {
     assert_eq!(s.key_count(), 2);
     // a needs a new key: refused, but b (existing global series) still counts.
     assert!(matches!(
-        s.record(Phase::Request, &client(2), &REQ),
+        s.record(&client(2), &REQ),
         Err(MetricError::TableFull { .. })
     ));
     assert_eq!(s.get("b", &MapView::new()), Ok(2));
@@ -310,7 +310,7 @@ fn reclaim_frees_expired_windowed_keys() {
     rec(&s, &client(1));
     rec(&s, &client(2));
     assert_eq!(s.key_count(), 3);
-    assert!(s.record(Phase::Request, &client(3), &REQ).is_err());
+    assert!(s.record(&client(3), &REQ).is_err());
     // Not yet fully expired (window + current bucket).
     c.advance(Duration::from_millis(1_000));
     assert_eq!(s.reclaim(), 0);
@@ -352,7 +352,7 @@ fn key_unavailable() {
         field: Field::ClientUser,
     };
     assert_eq!(s.get("u", &MapView::new()), Err(want.clone()));
-    assert_eq!(s.record(Phase::Request, &MapView::new(), &REQ), Err(want));
+    assert_eq!(s.record(&MapView::new(), &REQ), Err(want));
     assert_eq!(s.key_count(), 0);
     let with_user = MapView::new().with_str(Field::ClientUser, "alice");
     rec(&s, &with_user);
@@ -376,7 +376,7 @@ fn filter_failure_propagates() {
         FailClosedReason::BodyUnavailable("body.text".into())
     );
     assert_eq!(
-        s.record(Phase::Request, &v, &REQ),
+        s.record(&v, &REQ),
         Err(MetricError::FilterFailed {
             metric: "f".into(),
             reason,
@@ -405,7 +405,6 @@ fn carry_over_keeps_identical_definitions() {
     );
     for _ in 0..5 {
         old.record(
-            Phase::Request,
             &client(1),
             &Sample {
                 request_bytes: 1,
@@ -515,7 +514,7 @@ fn budget_exhausted_at_the_expected_point() {
     let r_bytes = s.byte_count() - 2 * per;
     assert!(r_bytes < per);
     // Third unique key: fits only if its bytes fit alongside `r`.
-    let third = s.record(Phase::Request, &path(3, 0), &REQ);
+    let third = s.record(&path(3, 0), &REQ);
     if 3 * per + r_bytes <= max {
         third.unwrap();
     } else {
@@ -528,7 +527,7 @@ fn budget_exhausted_at_the_expected_point() {
     assert!(used <= max);
     // A new key that does not fit is refused and admits nothing.
     let keys = s.key_count();
-    let err = s.record(Phase::Request, &path(4, 0), &REQ);
+    let err = s.record(&path(4, 0), &REQ);
     assert_eq!(
         err,
         Err(MetricError::BudgetExhausted { metric: "u".into() })
@@ -554,7 +553,7 @@ fn budget_exhausted_at_the_expected_point() {
     // ...and the next distinct value needs a chunk that is not there.
     if used + chunk > max {
         assert_eq!(
-            s.record(Phase::Request, &path(1, SPARSE_CHUNK), &REQ),
+            s.record(&path(1, SPARSE_CHUNK), &REQ),
             Err(MetricError::BudgetExhausted { metric: "u".into() })
         );
         assert_eq!(
@@ -579,7 +578,7 @@ fn many_keys_many_values_never_exceed_budget() {
         for n in 0..=255u8 {
             for _ in 0..40 {
                 i += 1;
-                match s.record(Phase::Request, &path(n, i), &REQ) {
+                match s.record(&path(n, i), &REQ) {
                     Ok(()) => {}
                     Err(MetricError::BudgetExhausted { .. }) => refused += 1,
                     Err(e) => panic!("{e}"),
@@ -606,7 +605,7 @@ fn concurrent_growth_never_exceeds_budget() {
             scope.spawn(move || {
                 for i in 0..20_000usize {
                     let n = u8::try_from((i + t * 7) % 251).unwrap();
-                    let _ = s.record(Phase::Request, &path(n, i * 8 + t), &REQ);
+                    let _ = s.record(&path(n, i * 8 + t), &REQ);
                     assert!(s.byte_count() <= max);
                 }
             });
@@ -636,7 +635,7 @@ fn reclaim_and_rotation_free_budget() {
     rec(&s, &path(2, 0));
     assert_eq!(s.byte_count(), 2 * per);
     assert!(matches!(
-        s.record(Phase::Request, &path(3, 0), &REQ),
+        s.record(&path(3, 0), &REQ),
         Err(MetricError::BudgetExhausted { .. })
     ));
     // Once both windows have fully expired, reclaim returns their bytes.
@@ -681,7 +680,7 @@ fn reclaim_on_exhausted_budget_for_existing_key() {
         rec(&s, &path(2, i));
     }
     // Key 2 needs a second chunk; key 1 holds the rest of the budget.
-    assert!(s.record(Phase::Request, &path(2, 99), &REQ).is_err());
+    assert!(s.record(&path(2, 99), &REQ).is_err());
     // Key 1 expires; key 2 stays live by recording.
     c.advance(Duration::from_millis(1_100));
     rec(&s, &path(2, 0));
@@ -750,10 +749,9 @@ fn read_before_record_denies_the_31st() {
         let base = client(1);
         let x = s.get("x", &base).unwrap();
         let flow = base.clone().with_metric("x", x);
-        let out = p.evaluate(Phase::Request, &flow, &EvalContext::empty());
+        let out = p.evaluate_head(&flow, &EvalContext::empty());
         let denied = !out.decision.is_allow();
-        s.record(Phase::Request, &base, &Sample { denied, ..REQ })
-            .unwrap();
+        s.record(&base, &Sample { denied, ..REQ }).unwrap();
         outcomes.push((x, denied, out.terminal_rule.to_string()));
     }
     for (i, (x, denied, rule)) in outcomes.iter().enumerate() {
@@ -781,7 +779,6 @@ async fn concurrent_records_are_exact() {
             for i in 0..10_000u32 {
                 let n = u8::try_from((i + t) % 100).unwrap();
                 s.record(
-                    Phase::Request,
                     &client(n),
                     &Sample {
                         request_bytes: 2,
@@ -814,7 +811,7 @@ fn concurrent_admission_never_exceeds_max_keys() {
             let s = &s;
             scope.spawn(move || {
                 for n in 0..100u8 {
-                    let _ = s.record(Phase::Request, &client(n.wrapping_add(t)), &REQ);
+                    let _ = s.record(&client(n.wrapping_add(t)), &REQ);
                 }
             });
         }
@@ -855,7 +852,7 @@ proptest! {
         for op in ops {
             match op {
                 Op::Record(k) => {
-                    s.record(Phase::Request, &port(k), &REQ).unwrap();
+                    s.record(&port(k), &REQ).unwrap();
                     events.push((now, k));
                 }
                 Op::Advance(ms) => {

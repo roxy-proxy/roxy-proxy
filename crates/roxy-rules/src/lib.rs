@@ -163,8 +163,8 @@ mod view;
 pub use compile::{REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
 pub use config::{
     Action, AllowArgs, CaptureTarget, DefaultDecision, DenyArgs, Expr, LogArgs, LogLevel,
-    MetricConfig, MetricCount, PHASE_REMOVED,
-    RedirectArgs, RewritePathArgs, RuleConfig, Scheme, SetStateArgs, Then, Upgrade,
+    MetricConfig, MetricCount, PHASE_REMOVED, RedirectArgs, RewritePathArgs, RuleConfig, Scheme,
+    SetStateArgs, Then, Upgrade,
 };
 pub use diag::{Diagnostic, RuleId, Span};
 pub use eval::{

@@ -3,7 +3,7 @@
 //! Semantics fixed here (documented in the crate docs):
 //!
 //! * Strings compare byte-exact, except operands involving `host`,
-//!   `dst.host`, `tls.sni`, `method` and `scheme`, which compare ASCII
+//!   `tls.sni`, `method` and `scheme`, which compare ASCII
 //!   case-insensitively (header names are lower-cased at compile time).
 //! * Compiling also records what an expression *reads* beyond the request
 //!   head ([`Needs::reads`]), which decides whether its rule is a head rule

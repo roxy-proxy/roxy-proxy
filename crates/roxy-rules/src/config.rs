@@ -733,11 +733,10 @@ mod tests {
 
     #[test]
     fn phase_key_is_rejected_with_a_pointer() {
-        let err = serde_yaml_ng::from_str::<Vec<RuleConfig>>(
-            "- { id: r, phase: response, then: deny }",
-        )
-        .unwrap_err()
-        .to_string();
+        let err =
+            serde_yaml_ng::from_str::<Vec<RuleConfig>>("- { id: r, phase: response, then: deny }")
+                .unwrap_err()
+                .to_string();
         assert!(err.contains("`phase` was removed"), "{err}");
         assert!(err.contains("§6.1"), "{err}");
         let ok: Vec<RuleConfig> =

@@ -66,7 +66,7 @@
 //!   transient buffer a `get` on a `unique` metric builds (at most
 //!   61 × 256 × 8 + 4096 bytes ≈ 129 KiB per concurrent call, freed on
 //!   return).
-//! * **Keys.** Values of `host`, `dst.host`, `tls.sni`, `method` and
+//! * **Keys.** Values of `host`, `tls.sni`, `method` and
 //!   `scheme` are ASCII-lower-cased before keying or hashing, because the
 //!   rule language compares them case-insensitively: otherwise `GET` and
 //!   `get` would be two series and an attacker could split a counter.
@@ -83,7 +83,7 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use parking_lot::Mutex;
 
-use crate::config::{MetricCount, Phase};
+use crate::config::MetricCount;
 use crate::eval::FailClosedReason;
 use crate::policy::MetricDef;
 use crate::types::Field;
@@ -211,18 +211,32 @@ impl Budget {
 /// [`FlowView::metric`] and the post-decision `record` call).
 pub trait MetricSource: Send + Sync {
     fn get(&self, id: &str, view: &dyn FlowView) -> Result<i64, MetricError>;
-    fn record(&self, phase: Phase, view: &dyn FlowView, sample: &Sample)
-    -> Result<(), MetricError>;
+    fn record(&self, view: &dyn FlowView, sample: &Sample) -> Result<(), MetricError>;
 }
 
-/// What one flow contributed in a phase.
+/// What one exchange contributed since its last [`MetricStore::record`]
+/// (§6.4). An exchange records several samples over its life:
+///
+/// * one with `head` set, right after the forwarding decision: it counts
+///   `requests` and `unique(..)` (and `denied` if the head decision
+///   denied);
+/// * one per streamed chunk, carrying that chunk's `request_bytes` or
+///   `response_bytes`, so a byte metric grows while the exchange streams;
+/// * one at the end with `error` (and `denied`, if a watching rule stopped
+///   the exchange).
+///
+/// A sample whose contribution to a metric is zero does not touch it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Sample {
+    /// This is the exchange's head sample: count `requests` and
+    /// `unique(..)`. Exactly one sample per exchange sets it.
+    pub head: bool,
     pub request_bytes: u64,
     pub response_bytes: u64,
-    /// The flow was denied in this phase.
+    /// The exchange was denied (at the head, or stopped by a watching
+    /// rule). Set on at most one sample per exchange.
     pub denied: bool,
-    /// The flow ended in an error (upstream failure, 5xx from roxy).
+    /// The exchange ended in an error (upstream failure, 5xx from roxy).
     pub error: bool,
 }
 
@@ -287,7 +301,7 @@ type Key = Box<[KeyPart]>;
 fn case_insensitive(f: Field) -> bool {
     matches!(
         f,
-        Field::Host | Field::DstHost | Field::TlsSni | Field::Method | Field::Scheme
+        Field::Host | Field::TlsSni | Field::Method | Field::Scheme
     )
 }
 
@@ -786,7 +800,6 @@ struct Fingerprint {
     unique: Option<Field>,
     key: Vec<Field>,
     window: Option<Duration>,
-    phase: Phase,
 }
 
 struct Metric {
@@ -797,6 +810,19 @@ struct Metric {
 }
 
 impl Metric {
+    /// Whether `sample` contributes to this metric at all. Checked before
+    /// the `where` filter and the key, so a per-chunk byte sample costs
+    /// nothing for metrics that do not count bytes.
+    fn counts(&self, sample: &Sample) -> bool {
+        match self.def.count {
+            MetricCount::Requests | MetricCount::Unique(_) => sample.head,
+            MetricCount::RequestBytes => sample.request_bytes > 0,
+            MetricCount::ResponseBytes => sample.response_bytes > 0,
+            MetricCount::Errors => sample.error,
+            MetricCount::Denied => sample.denied,
+        }
+    }
+
     fn key(&self, view: &dyn FlowView) -> Result<Key, MetricError> {
         self.def
             .key
@@ -870,7 +896,6 @@ impl MetricStore {
                     unique: d.unique,
                     key: d.key.clone(),
                     window: d.window,
-                    phase: d.phase,
                 },
                 geom: d.window.map(Geometry::new),
                 series: DashMap::new(),
@@ -919,7 +944,7 @@ impl MetricStore {
             .map_or(0, |s| s.lock().value(m.geom, now)))
     }
 
-    /// Record one flow for every metric whose `phase` is `phase` and whose
+    /// Record one [`Sample`] for every metric whose
     /// `where` filter matches `view`. Admits new keys. All matching metrics
     /// are attempted; the first error is returned: `TableFull` if a key
     /// would be new and the table is full, `BudgetExhausted` if the series
@@ -927,15 +952,10 @@ impl MetricStore {
     /// series is left unchanged), `FilterFailed` if a filter hit an
     /// unavailable input, `KeyUnavailable` if a key (or the `unique` field)
     /// is absent. Any `Err` means the caller must deny the flow.
-    pub fn record(
-        &self,
-        phase: Phase,
-        view: &dyn FlowView,
-        sample: &Sample,
-    ) -> Result<(), MetricError> {
+    pub fn record(&self, view: &dyn FlowView, sample: &Sample) -> Result<(), MetricError> {
         let now = self.now();
         let mut first_err = None;
-        for m in self.metrics.iter().filter(|m| m.def.phase == phase) {
+        for m in self.metrics.iter().filter(|m| m.counts(sample)) {
             if let Err(e) = self.record_one(m, view, sample, now) {
                 first_err.get_or_insert(e);
             }
@@ -965,7 +985,7 @@ impl MetricStore {
         }
         let key = m.key(view)?;
         let delta = match &m.def.count {
-            MetricCount::Requests => Delta::Add(1),
+            MetricCount::Requests => Delta::Add(u64::from(sample.head)),
             MetricCount::RequestBytes => Delta::Add(sample.request_bytes),
             MetricCount::ResponseBytes => Delta::Add(sample.response_bytes),
             MetricCount::Errors => Delta::Add(u64::from(sample.error)),
@@ -1096,8 +1116,8 @@ impl MetricStore {
     }
 
     /// Reload retention (§6.5): copy series from `previous` for metric ids
-    /// whose definition has the same `count`, `unique`, `key`, `window` and
-    /// `phase`; every other metric starts empty. Carried series are kept even
+    /// whose definition has the same `count`, `unique`, `key` and `window`;
+    /// every other metric starts empty. Carried series are kept even
     /// beyond this store's `max_keys` (new keys are then refused until
     /// enough expire), but *not* beyond its byte budget: a series whose
     /// charge does not fit is skipped and counted in
@@ -1182,13 +1202,8 @@ impl MetricSource for MetricStore {
         MetricStore::get(self, id, view)
     }
 
-    fn record(
-        &self,
-        phase: Phase,
-        view: &dyn FlowView,
-        sample: &Sample,
-    ) -> Result<(), MetricError> {
-        MetricStore::record(self, phase, view, sample)
+    fn record(&self, view: &dyn FlowView, sample: &Sample) -> Result<(), MetricError> {
+        MetricStore::record(self, view, sample)
     }
 }
 
