@@ -573,6 +573,10 @@ Rules are evaluated **top to bottom, first terminal action wins**. A rule's
 actions (`set_header`, `tag`, `log`, `call`, …) take effect and evaluation
 continues to the next rule. When the chain is exhausted with no terminal
 action, the request is **denied** (`default-deny`, rule id `_default`).
+The default differs by phase: `request` → deny; `connect` → allow-to-inspect
+(§4.3); `response` and `ws` → allow, because those chains exist to tighten an
+already-allowed flow and an empty response chain must not block every
+response. `terminal_rule` is `_default` in every case.
 
 Each rule has a `phase` (`connect`, `request` (default), `response`, `ws`). The
 compiler rejects a rule that references a field unavailable in its phase.
