@@ -89,7 +89,7 @@ fn minimal_example_uses_defaults() {
     assert_eq!(cfg.rules[0].phase, Phase::Request);
     assert_eq!(
         cfg.rules[0].then.0,
-        vec![serde_yaml_ng::Value::from("allow")]
+        vec![Action::Allow(roxy_rules::AllowArgs::default())]
     );
 }
 
@@ -302,4 +302,25 @@ fn duplicate_bind_diagnosed() {
 #[test]
 fn version_is_required() {
     assert!(Config::from_yaml("listeners: []\n").is_err());
+}
+
+#[test]
+fn action_parse_errors_name_action_and_rule() {
+    let yaml = format!(
+        "{BASE}rules:\n  - id: first\n    then: allow\n  - id: second\n    then:\n      \
+         - tag: x\n      - deny: {{ stauts: 4 }}\n"
+    );
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = describe_parse_error(&yaml, &err);
+    assert!(
+        msg.starts_with("rules[1].then[1].deny: unknown field `stauts`"),
+        "{msg}"
+    );
+    assert!(msg.ends_with("(rule \"second\")"), "{msg}");
+
+    let yaml = format!("{BASE}rules: [{{ id: m, then: {{ deny: {{}}, allow: {{}} }} }}]\n");
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = describe_parse_error(&yaml, &err);
+    assert!(msg.contains("exactly one key"), "{msg}");
+    assert!(msg.ends_with("(rule \"m\")"), "{msg}");
 }

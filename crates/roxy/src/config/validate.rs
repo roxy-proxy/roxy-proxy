@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::LazyLock;
 
 use regex::Regex;
-use serde_yaml_ng::Value;
+use roxy_rules::config::Action;
 
 use super::{CONFIG_VERSION, Config, ListenerMode, Phase, UpstreamVerify};
 
@@ -273,8 +273,7 @@ impl Config {
             }
             for (j, action) in rule.then.0.iter().enumerate() {
                 let apath = format!("{path}.then[{j}]");
-                let mut strings = Vec::new();
-                collect_strings(action, &mut strings);
+                let strings = action_strings(action);
                 let mut seen = BTreeSet::new();
                 for s in strings {
                     for cap in SECRET_REF.captures_iter(s) {
@@ -299,8 +298,8 @@ impl Config {
                         }
                     }
                 }
-                if let Some(addon) = called_addon(action)
-                    && !self.addons.iter().any(|a| a.name == addon)
+                if let Action::Call(addon) = action
+                    && !self.addons.iter().any(|a| &a.name == addon)
                 {
                     d.push(Diagnostic::new(
                         apath,
@@ -325,23 +324,22 @@ impl Config {
     }
 }
 
-/// Every string (map keys included) inside a YAML value.
-fn collect_strings<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
-    match v {
-        Value::String(s) => out.push(s),
-        Value::Sequence(items) => items.iter().for_each(|i| collect_strings(i, out)),
-        Value::Mapping(map) => {
-            for (k, v) in map {
-                collect_strings(k, out);
-                collect_strings(v, out);
-            }
+/// Every string argument (map keys included) of an action.
+fn action_strings(action: &Action) -> Vec<&str> {
+    match action {
+        Action::SetHeader(pairs) | Action::SetQuery(pairs) => pairs
+            .iter()
+            .flat_map(|(k, v)| [k.as_str(), v.as_str()])
+            .collect(),
+        Action::RemoveHeader(names) | Action::RemoveQuery(names) => {
+            names.iter().map(String::as_str).collect()
         }
-        Value::Tagged(t) => collect_strings(&t.value, out),
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        Action::Deny(d) => d.message.as_deref().into_iter().collect(),
+        Action::RewritePath(r) => vec![&r.pattern, &r.to],
+        Action::Redirect(r) => vec![&r.host],
+        Action::Tag(s) | Action::Call(s) => vec![s],
+        Action::Log(l) => vec![&l.message],
+        Action::SetState(s) => vec![&s.key, &s.value],
+        Action::Allow(_) | Action::Passthrough | Action::Capture(_) => Vec::new(),
     }
-}
-
-/// The addon named by a `call: <name>` action, if this is one.
-fn called_addon(action: &Value) -> Option<&str> {
-    action.as_mapping()?.get("call")?.as_str()
 }

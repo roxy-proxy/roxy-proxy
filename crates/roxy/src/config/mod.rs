@@ -3,7 +3,8 @@
 //! Parsing is strict: every struct denies unknown fields, so a typo is an
 //! error rather than a silently ignored setting. [`Config::validate`] adds the
 //! cross-reference checks serde cannot express. Secrets are *not* resolved
-//! here; see [`crate::secrets`].
+//! here; see [`crate::secrets`]. Rule and metric types (and their compiler)
+//! live in `roxy-rules` and are re-exported here.
 
 mod units;
 mod validate;
@@ -18,7 +19,10 @@ use bytesize::ByteSize;
 use ipnet::IpNet;
 use serde::Deserialize;
 
-pub use units::{Actions, Expr, MetricCount, Resolver};
+pub use roxy_rules::config::{
+    Action, Expr, MetricConfig as Metric, MetricCount, Phase, RuleConfig as Rule, Then,
+};
+pub use units::Resolver;
 pub use validate::Diagnostic;
 
 /// The only supported config `version`.
@@ -313,59 +317,6 @@ impl TryFrom<RawSecretSource> for SecretSource {
     }
 }
 
-// ----- metrics --------------------------------------------------------------
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Metric {
-    pub id: String,
-    pub count: MetricCount,
-    /// Filter expression; absent = every flow.
-    #[serde(default, rename = "where")]
-    pub where_: Option<Expr>,
-    /// Series key fields; empty = one global series.
-    #[serde(default)]
-    pub key: Vec<String>,
-    /// Sliding window; absent = cumulative since start.
-    #[serde(default, with = "humantime_serde")]
-    pub window: Option<Duration>,
-}
-
-// ----- rules ----------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Phase {
-    Connect,
-    #[default]
-    Request,
-    Response,
-    Ws,
-}
-
-impl Phase {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Connect => "connect",
-            Self::Request => "request",
-            Self::Response => "response",
-            Self::Ws => "ws",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Rule {
-    pub id: String,
-    #[serde(default)]
-    pub phase: Phase,
-    /// Match expression; absent = always matches.
-    #[serde(default)]
-    pub when: Option<Expr>,
-    pub then: Actions,
-}
-
 // ----- addons ---------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -430,7 +381,28 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        Self::from_yaml(&text).with_context(|| format!("parsing {}", path.display()))
+        Self::from_yaml(&text)
+            .map_err(|e| anyhow::anyhow!(describe_parse_error(&text, &e)))
+            .with_context(|| format!("parsing {}", path.display()))
+    }
+}
+
+/// Render a structural parse error. Errors inside `rules[N]` get the rule's
+/// id appended (`... (rule "github-reads")`), since the deserialiser only
+/// knows the YAML path.
+pub fn describe_parse_error(text: &str, err: &serde_yaml_ng::Error) -> String {
+    let msg = err.to_string();
+    let index = msg
+        .strip_prefix("rules[")
+        .and_then(|rest| rest.split_once(']'))
+        .and_then(|(n, _)| n.parse::<usize>().ok());
+    let id = index.and_then(|i| {
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(text).ok()?;
+        Some(doc.get("rules")?.get(i)?.get("id")?.as_str()?.to_owned())
+    });
+    match id {
+        Some(id) => format!("{msg} (rule {id:?})"),
+        None => msg,
     }
 }
 

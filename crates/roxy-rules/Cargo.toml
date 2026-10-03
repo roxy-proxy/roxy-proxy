@@ -1,10 +1,24 @@
 [package]
 name = "roxy-rules"
+description = "Expression DSL, rule compiler and policy evaluator for roxy"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[dependencies]
+globset = { version = "0.4.20", default-features = false }
+humantime-serde.workspace = true
+ipnet.workspace = true
+regex.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.7.0", default-features = false }
+insta = "1.49.0"
+proptest = "1.11.0"
+serde_yaml_ng.workspace = true
 
 [lints]
 workspace = true

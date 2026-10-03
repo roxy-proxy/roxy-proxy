@@ -183,7 +183,7 @@ fn check(path: &Path) -> ExitCode {
         Err(e) => {
             // serde_yaml_ng prefixes errors with the YAML path when it has one
             // (`rules[0]: unknown field ...`), giving `<file>:<yaml path>: <msg>`.
-            let msg = e.to_string();
+            let msg = roxy::config::describe_parse_error(&text, &e);
             let has_path = msg
                 .split_once(": ")
                 .is_some_and(|(p, _)| !p.is_empty() && !p.contains(' '));

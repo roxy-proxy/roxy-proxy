@@ -23,6 +23,7 @@ humantime-serde.workspace = true
 ipnet.workspace = true
 regex.workspace = true
 roxy-proxy.workspace = true
+roxy-rules.workspace = true
 roxy-tls.workspace = true
 serde.workspace = true
 serde_yaml_ng.workspace = true
