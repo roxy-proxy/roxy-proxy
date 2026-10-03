@@ -1,7 +1,8 @@
-//! WebSocket handshake checks for the relay tier (docs/websockets.md#relay).
-//!
-//! No frame codec here (inspect tier, M3). After a validated `101` the proxy
-//! splices bytes in both directions.
+//! WebSocket handshake checks (docs/websockets.md#relay) and, in [`frame`],
+//! the frame codec used when rules read messages
+//! (docs/websockets.md#message-rules).
+
+pub mod frame;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;

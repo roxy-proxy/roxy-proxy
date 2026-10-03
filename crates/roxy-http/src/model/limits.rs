@@ -22,6 +22,9 @@ pub struct Limits {
     pub max_response_body_bytes: u64,
     /// Cap for bodies buffered for inspection (`Body::collect_up_to`).
     pub max_inspect_body_bytes: u64,
+    /// Cap for a reassembled WebSocket message when rules read messages
+    /// (`ws::frame::Decoder`).
+    pub max_ws_message_bytes: u64,
     /// Deadline for receiving a complete request head once it has started
     /// (and for the first request on a connection, from accept).
     pub header_timeout: Duration,
@@ -47,6 +50,7 @@ impl Default for Limits {
             max_request_body_bytes: GIB,
             max_response_body_bytes: GIB,
             max_inspect_body_bytes: MIB,
+            max_ws_message_bytes: 16 * MIB,
             header_timeout: Duration::from_secs(10),
             body_idle_timeout: Duration::from_secs(30),
             response_header_timeout: Duration::from_secs(60),
