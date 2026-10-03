@@ -1,5 +1,5 @@
-//! Evaluation: predicate plans against a [`FlowView`], and the outcome of
-//! running a rule chain.
+//! Evaluation: predicate plans against a [`FlowView`], and the outcomes of
+//! the head decision and of watching evaluation.
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -10,7 +10,7 @@ use std::time::Duration;
 use regex::Regex;
 
 use crate::compile::{Const, OrdOp, Pred, ROperand, StrOp};
-use crate::config::{CaptureTarget, LogLevel, Phase, Scheme};
+use crate::config::{CaptureTarget, LogLevel, Scheme};
 use crate::diag::RuleId;
 use crate::types::Access;
 use crate::view::{BodyText, FlowView, Value};
@@ -21,8 +21,7 @@ pub struct EvalContext<'a> {
     /// Resolves `${secret:name}` in `set_header` values. Returning `None`
     /// makes the flow fail closed (see [`crate::Policy::evaluate`]).
     pub secrets: &'a dyn Fn(&str) -> Option<String>,
-    /// Tags already set on the flow (by an earlier phase or an addon);
-    /// visible as `tag["x"]`.
+    /// Tags already set on the flow (by an addon); visible as `tag["x"]`.
     pub initial_tags: &'a [String],
 }
 
@@ -49,33 +48,32 @@ impl fmt::Debug for EvalContext<'_> {
 }
 
 /// Options of an `allow` decision.
+/// Only the first matching allow rule's options apply (§6.1); the implicit
+/// allow of `default: allow` grants none.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct AllowOpts {
     /// `allow: { upgrade: websocket }`: honour a WebSocket Upgrade.
     pub upgrade_websocket: bool,
-    /// `inspect: true`: route messages through the `ws` phase (§8.2).
-    pub inspect_ws: bool,
     /// `private_ok: true`: permit private upstream addresses (§7).
     pub private_ok: bool,
 }
 
-/// Final decision of a phase.
+/// A decision: the head decision, or a watching rule stopping the exchange.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Allow(AllowOpts),
-    /// `close`: in `connect`, `request` and `response` the proxy closes the
-    /// client connection after writing the deny response (h1
-    /// `connection: close`, h2 `GOAWAY`; §6.1). It defaults to `true` there
-    /// and `deny: { close: false }` opts out per rule. In the `ws` phase a
-    /// deny without `close` drops the message and `close: true` closes the
-    /// socket; the default there is `false`.
+    /// `close`: after writing the deny response the proxy closes the client
+    /// connection (h1 `connection: close`, h2 `GOAWAY`; §6.1). Defaults to
+    /// `true`; `deny: { close: false }` opts out per rule. A deny that stops
+    /// an exchange whose response is already streaming always closes the
+    /// connection (h1) or resets the stream (h2).
     Deny {
         status: u16,
         message: String,
         close: bool,
     },
-    /// Connect phase on transparent listeners only (deferred).
+    /// Reserved for transparent listeners (deferred); rejected by the
+    /// compiler and never forwards.
     Passthrough,
 }
 
@@ -92,28 +90,12 @@ impl Decision {
         matches!(self, Self::Deny { .. })
     }
 
-    /// Whether a deny closes the connection when the rule does not say:
-    /// `true` everywhere except the `ws` phase, where it drops the message.
-    pub fn default_close(phase: Phase) -> bool {
-        phase != Phase::Ws
-    }
-
-    /// Decision when a phase's chain is exhausted without a terminal action
-    /// (§6.1):
-    ///
-    /// * `request`: deny 403, closing the connection.
-    /// * `connect`: allow-to-inspect (§4.3): the request phase is the gate.
-    /// * `response`: allow; the request was allowed and upstreams are trusted.
-    /// * `ws`: deny 403 without close, i.e. drop the message. Opting into
-    ///   inspection means writing the allow rules.
-    pub fn default_for(phase: Phase) -> Self {
-        match phase {
-            Phase::Request | Phase::Ws => Self::Deny {
-                status: DEFAULT_DENY_STATUS,
-                message: DEFAULT_DENY_MESSAGE.into(),
-                close: Self::default_close(phase),
-            },
-            Phase::Connect | Phase::Response => Self::Allow(AllowOpts::default()),
+    /// The `default: deny` decision: 403, closing the connection.
+    pub fn default_deny() -> Self {
+        Self::Deny {
+            status: DEFAULT_DENY_STATUS,
+            message: DEFAULT_DENY_MESSAGE.into(),
+            close: true,
         }
     }
 
@@ -155,6 +137,10 @@ pub enum FailClosedReason {
     /// missing (`null`) value, which has no answer (§6.2). Carries the field
     /// as written, e.g. `body.size`.
     MissingValue(String),
+    /// A watching rule reached an action that cannot run after forwarding
+    /// (prevented by the compiler; fail closed if ever reached). Carries
+    /// the rule id.
+    Unsupported(String),
 }
 
 impl fmt::Display for FailClosedReason {
@@ -168,6 +154,7 @@ impl fmt::Display for FailClosedReason {
                 write!(f, "`{field}`: body too large to inspect")
             }
             Self::BodyUnavailable(field) => write!(f, "`{field}`: body unavailable"),
+            Self::Unsupported(rule) => write!(f, "rule {rule:?}: action not possible here"),
             Self::MissingValue(field) => {
                 write!(
                     f,
@@ -186,9 +173,6 @@ impl fmt::Display for Decision {
                 let mut opts = Vec::new();
                 if o.upgrade_websocket {
                     opts.push("upgrade: websocket");
-                }
-                if o.inspect_ws {
-                    opts.push("inspect: true");
                 }
                 if o.private_ok {
                     opts.push("private_ok: true");
@@ -215,7 +199,7 @@ impl fmt::Display for Decision {
 }
 
 /// A non-terminal action's effect, for the proxy to apply (mutations) or
-/// perform (log, state, capture, addon call), in chain order.
+/// perform (log, state, capture, addon call), in list order.
 #[derive(Debug, Clone)]
 pub enum Effect {
     /// Lower-case name; value already secret-substituted and validated as a
@@ -394,30 +378,60 @@ fn anchored_source(re: &Regex) -> &str {
         .unwrap_or(s)
 }
 
-/// Result of evaluating one phase's chain.
+/// Result of the head decision ([`crate::Policy::evaluate_head`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Outcome {
     pub decision: Decision,
-    /// Every rule whose `when` matched, in order (including the terminal one).
+    /// Every head rule whose `when` matched, in list order.
     pub matched: Vec<RuleId>,
-    /// The rule that decided; `_default` when the chain was exhausted;
-    /// `_fail_closed` when a policy input was unavailable.
+    /// The rule that decided: the first matching deny, else the first
+    /// matching allow; `_default` when none matched; `_fail_closed` when a
+    /// policy input was unavailable.
     pub terminal_rule: RuleId,
     /// Set exactly when `terminal_rule` is `_fail_closed`.
     pub fail_closed_reason: Option<FailClosedReason>,
-    /// Effects of non-terminal actions of matched rules, in order.
+    /// Effects of non-terminal actions of matched rules, in list order.
+    /// When the decision is not an allow, only `log` and `set_state`
+    /// remain.
     pub effects: Vec<Effect>,
     /// `initial_tags` plus tags set by matched rules, without duplicates.
     pub tags: Vec<String>,
 }
 
+/// Result of a watching evaluation ([`crate::Policy::evaluate_watching`])
+/// in which at least one rule matched or an input failed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WatchOutcome {
+    /// `Some(Deny)` = stop the exchange: a matching watching deny, or
+    /// [`Decision::fail_closed`]. `None` = continue (effects only).
+    pub stop: Option<Decision>,
+    /// The rule that stopped it (`_fail_closed` for an input failure).
+    pub terminal_rule: Option<RuleId>,
+    /// Set when the stop is a fail-closed one.
+    pub fail_closed_reason: Option<FailClosedReason>,
+    /// Watching rules that matched now, in list order.
+    pub matched: Vec<RuleId>,
+    /// Their non-terminal effects, in list order (only `log` and
+    /// `set_state` when stopping). Header effects apply to the response.
+    pub effects: Vec<Effect>,
+    /// Tags newly set.
+    pub tags: Vec<String>,
+}
+
+impl WatchOutcome {
+    /// Whether the exchange must stop.
+    pub fn stops(&self) -> bool {
+        self.stop.is_some()
+    }
+}
+
 // ----- predicate evaluation -------------------------------------------------
 
-/// What a predicate can see: the flow plus the chain's running state.
+/// What a predicate can see: the flow plus the evaluation's running state.
 pub(crate) struct Scope<'a> {
     pub view: &'a dyn FlowView,
     pub tags: &'a [String],
-    /// Effects so far; `state["k"]` sees earlier `set_state` in the chain.
+    /// Effects so far; `state["k"]` sees earlier `set_state` effects.
     pub effects: &'a [Effect],
     /// First unavailable input met during evaluation, if any.
     pub failed: Cell<Option<Unavailable<'a>>>,

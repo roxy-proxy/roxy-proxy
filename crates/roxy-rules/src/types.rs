@@ -1,9 +1,10 @@
-//! Field catalogue, static types and phase availability (§6.2 table).
+//! Field catalogue, static types, and which values are *head* values
+//! (known when the forwarding decision is made) or *watched* values (known
+//! later) (§6.2 table).
 
 use std::fmt::{self, Write as _};
 
 use crate::ast::FieldRef;
-use crate::config::Phase;
 use crate::diag::ExprError;
 
 /// Static type of an operand.
@@ -34,7 +35,7 @@ impl fmt::Display for Type {
 /// `query["k"]`, `state["k"]`, …), `metric.<id>`, `tag["t"]` and the body
 /// texts have their own `FlowView` methods.
 ///
-/// Normalisation contract for implementors: `Host`, `DstHost` and `TlsSni`
+/// Normalisation contract for implementors: `Host` and `TlsSni`
 /// are lower-case without a trailing dot; `Method` is the request method as
 /// sent (comparisons against `method`, `scheme` and the host fields are
 /// ASCII case-insensitive anyway); everything else is compared byte-exact.
@@ -50,12 +51,6 @@ pub enum Field {
     ListenerName,
     /// `listener.mode` (string: `explicit`)
     ListenerMode,
-    /// `dst.host` (string; connect phase)
-    DstHost,
-    /// `dst.port` (int; connect phase)
-    DstPort,
-    /// `dst.ip` (ip; connect phase; absent until resolved)
-    DstIp,
     /// `tls.sni` (string)
     TlsSni,
     /// `tls.alpn` (string)
@@ -76,12 +71,17 @@ pub enum Field {
     Url,
     /// `query.raw` (string)
     QueryRaw,
-    /// `body.size` (int)
+    /// `body.size` (int: declared length; `null` if undeclared)
     BodySize,
-    /// `response.status` (int)
+    /// `body.bytes` (int: request body bytes so far; watched)
+    BodyBytes,
+    /// `response.status` (int; watched)
     ResponseStatus,
-    /// `response.body.size` (int)
+    /// `response.body.size` (int: declared length, `null` if undeclared;
+    /// watched)
     ResponseBodySize,
+    /// `response.body.bytes` (int: response body bytes so far; watched)
+    ResponseBodyBytes,
     /// `ws.direction` (string: `c2s` / `s2c`)
     WsDirection,
     /// `ws.opcode` (int)
@@ -92,51 +92,98 @@ pub enum Field {
     WsText,
 }
 
-/// Bit set of phases.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Phases(u8);
+/// A set of values that become known (or change) after the forwarding
+/// decision (§6.1, §6.2): what a rule reads beyond the request head, and
+/// what an event during an exchange changed. A bit mask, so the per-chunk
+/// test "does any watching rule care about this?" is one `and`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Reads(u16);
 
-impl Phases {
-    const fn of(phases: &[Phase]) -> Self {
-        let mut bits = 0;
-        let mut i = 0;
-        while i < phases.len() {
-            bits |= 1 << phases[i] as u8;
-            i += 1;
-        }
-        Self(bits)
+impl Reads {
+    pub const NONE: Reads = Reads(0);
+    /// `body.bytes`.
+    pub const BODY_BYTES: Reads = Reads(1);
+    /// `response.status`, `response.header[...]`, `response.body.size`.
+    pub const RESPONSE_HEAD: Reads = Reads(1 << 1);
+    /// `response.body.bytes`.
+    pub const RESPONSE_BODY_BYTES: Reads = Reads(1 << 2);
+    /// `response.body.text` (buffered before the response head is sent).
+    pub const RESPONSE_BODY_TEXT: Reads = Reads(1 << 3);
+    /// `ws.*` (per WebSocket message; the codec is not in this build).
+    pub const WS: Reads = Reads(1 << 4);
+    /// A metric counting `request_bytes`, which this exchange adds to as
+    /// the request body (or WebSocket client bytes) stream.
+    pub const METRIC_REQUEST_BYTES: Reads = Reads(1 << 5);
+    /// A metric counting `response_bytes`.
+    pub const METRIC_RESPONSE_BYTES: Reads = Reads(1 << 6);
+
+    /// Every watched *field* (not metrics).
+    pub const WATCHED_FIELDS: Reads = Reads(0b1_1111);
+    /// Both byte-metric bits.
+    pub const METRICS: Reads = Reads(0b110_0000);
+    /// Values known before the response head is sent to the client.
+    pub const BEFORE_RESPONSE_SENT: Reads = Reads(0b1010);
+
+    pub const fn union(self, other: Reads) -> Reads {
+        Reads(self.0 | other.0)
     }
-    const ALL: Phases = Phases::of(&Phase::ALL);
-    const CONNECT: Phases = Phases::of(&[Phase::Connect]);
-    const HTTP: Phases = Phases::of(&[Phase::Request, Phase::Response, Phase::Ws]);
-    const MESSAGE: Phases = Phases::of(&[Phase::Request, Phase::Response]);
-    const RESPONSE: Phases = Phases::of(&[Phase::Response]);
-    const WS: Phases = Phases::of(&[Phase::Ws]);
 
-    pub(crate) fn contains(self, p: Phase) -> bool {
-        self.0 & (1 << p as u8) != 0
+    pub const fn intersects(self, other: Reads) -> bool {
+        self.0 & other.0 != 0
     }
 
-    pub(crate) fn names(self) -> String {
-        Phase::ALL
-            .iter()
-            .filter(|p| self.contains(**p))
-            .map(|p| p.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
+    /// Every bit of `self` is in `other`.
+    pub const fn is_subset(self, other: Reads) -> bool {
+        self.0 & !other.0 == 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    #[must_use]
+    pub const fn minus(self, other: Reads) -> Reads {
+        Reads(self.0 & !other.0)
+    }
+
+    /// Names of the set bits, for messages and `roxy check`.
+    pub fn names(self) -> Vec<&'static str> {
+        [
+            (Self::BODY_BYTES, "body.bytes"),
+            (Self::RESPONSE_HEAD, "response head"),
+            (Self::RESPONSE_BODY_BYTES, "response.body.bytes"),
+            (Self::RESPONSE_BODY_TEXT, "response.body.text"),
+            (Self::WS, "ws.*"),
+            (Self::METRIC_REQUEST_BYTES, "request_bytes metric"),
+            (Self::METRIC_RESPONSE_BYTES, "response_bytes metric"),
+        ]
+        .into_iter()
+        .filter(|(b, _)| self.intersects(*b))
+        .map(|(_, n)| n)
+        .collect()
+    }
+}
+
+impl std::ops::BitOr for Reads {
+    type Output = Reads;
+    fn bitor(self, rhs: Reads) -> Reads {
+        self.union(rhs)
+    }
+}
+
+impl std::ops::BitOrAssign for Reads {
+    fn bitor_assign(&mut self, rhs: Reads) {
+        *self = self.union(rhs);
     }
 }
 
 impl Field {
-    pub const ALL: [Field; 25] = [
+    pub const ALL: [Field; 24] = [
         Self::ClientIp,
         Self::ClientPort,
         Self::ClientUser,
         Self::ListenerName,
         Self::ListenerMode,
-        Self::DstHost,
-        Self::DstPort,
-        Self::DstIp,
         Self::TlsSni,
         Self::TlsAlpn,
         Self::TlsVersion,
@@ -148,8 +195,10 @@ impl Field {
         Self::Url,
         Self::QueryRaw,
         Self::BodySize,
+        Self::BodyBytes,
         Self::ResponseStatus,
         Self::ResponseBodySize,
+        Self::ResponseBodyBytes,
         Self::WsDirection,
         Self::WsOpcode,
         Self::WsSize,
@@ -164,9 +213,6 @@ impl Field {
             Self::ClientUser => "client.user",
             Self::ListenerName => "listener.name",
             Self::ListenerMode => "listener.mode",
-            Self::DstHost => "dst.host",
-            Self::DstPort => "dst.port",
-            Self::DstIp => "dst.ip",
             Self::TlsSni => "tls.sni",
             Self::TlsAlpn => "tls.alpn",
             Self::TlsVersion => "tls.version",
@@ -178,8 +224,10 @@ impl Field {
             Self::Url => "url",
             Self::QueryRaw => "query.raw",
             Self::BodySize => "body.size",
+            Self::BodyBytes => "body.bytes",
             Self::ResponseStatus => "response.status",
             Self::ResponseBodySize => "response.body.size",
+            Self::ResponseBodyBytes => "response.body.bytes",
             Self::WsDirection => "ws.direction",
             Self::WsOpcode => "ws.opcode",
             Self::WsSize => "ws.size",
@@ -193,13 +241,14 @@ impl Field {
 
     pub fn ty(self) -> Type {
         match self {
-            Self::ClientIp | Self::DstIp => Type::Ip,
+            Self::ClientIp => Type::Ip,
             Self::ClientPort
-            | Self::DstPort
             | Self::Port
             | Self::BodySize
+            | Self::BodyBytes
             | Self::ResponseStatus
             | Self::ResponseBodySize
+            | Self::ResponseBodyBytes
             | Self::WsOpcode
             | Self::WsSize => Type::Int,
             _ => Type::Str,
@@ -210,22 +259,24 @@ impl Field {
     pub fn case_insensitive(self) -> bool {
         matches!(
             self,
-            Self::Host | Self::DstHost | Self::TlsSni | Self::Method | Self::Scheme
+            Self::Host | Self::TlsSni | Self::Method | Self::Scheme
         )
     }
 
-    pub(crate) fn phases(self) -> Phases {
+    /// The watched values this field reads; empty for a head field.
+    pub fn reads(self) -> Reads {
         match self {
-            Self::DstHost | Self::DstPort | Self::DstIp => Phases::CONNECT,
-            Self::Method | Self::Scheme | Self::Host | Self::Port | Self::Path | Self::Url => {
-                Phases::HTTP
-            }
-            Self::QueryRaw => Phases::HTTP,
-            Self::BodySize => Phases::MESSAGE,
-            Self::ResponseStatus | Self::ResponseBodySize => Phases::RESPONSE,
-            Self::WsDirection | Self::WsOpcode | Self::WsSize | Self::WsText => Phases::WS,
-            _ => Phases::ALL,
+            Self::BodyBytes => Reads::BODY_BYTES,
+            Self::ResponseStatus | Self::ResponseBodySize => Reads::RESPONSE_HEAD,
+            Self::ResponseBodyBytes => Reads::RESPONSE_BODY_BYTES,
+            Self::WsDirection | Self::WsOpcode | Self::WsSize | Self::WsText => Reads::WS,
+            _ => Reads::NONE,
         }
+    }
+
+    /// Whether the field is known when the forwarding decision is made.
+    pub fn is_head(self) -> bool {
+        self.reads().is_empty()
     }
 }
 
@@ -285,13 +336,21 @@ impl Access {
         matches!(self, Self::Scalar(f) if f.case_insensitive())
     }
 
-    fn phases(&self) -> Phases {
+    /// Watched values read by this access. Metrics are classified by the
+    /// policy compiler (it knows what each metric counts), so they read
+    /// [`Reads::NONE`] here.
+    pub(crate) fn reads(&self) -> Reads {
         match self {
-            Self::Scalar(f) => f.phases(),
-            Self::Header(_) | Self::HeaderAll(_) | Self::BodyText => Phases::MESSAGE,
-            Self::RespHeader(_) | Self::RespHeaderAll(_) | Self::RespBodyText => Phases::RESPONSE,
-            Self::Query(_) => Phases::HTTP,
-            Self::State(_) | Self::Tag(_) | Self::Metric(_) => Phases::ALL,
+            Self::Scalar(f) => f.reads(),
+            Self::RespHeader(_) | Self::RespHeaderAll(_) => Reads::RESPONSE_HEAD,
+            Self::RespBodyText => Reads::RESPONSE_BODY_TEXT,
+            Self::Header(_)
+            | Self::HeaderAll(_)
+            | Self::BodyText
+            | Self::Query(_)
+            | Self::State(_)
+            | Self::Tag(_)
+            | Self::Metric(_) => Reads::NONE,
         }
     }
 }
@@ -337,12 +396,10 @@ pub(crate) fn is_token(s: &str) -> bool {
         })
 }
 
-/// Resolve a syntactic field reference, checking it exists, is indexed
-/// correctly, and is available in `phase`. `metric_exists` decides
-/// `metric.<id>` references.
+/// Resolve a syntactic field reference, checking it exists and is indexed
+/// correctly. `metric_exists` decides `metric.<id>` references.
 pub(crate) fn resolve(
     f: &FieldRef,
-    phase: Phase,
     metric_exists: &dyn Fn(&str) -> bool,
 ) -> Result<Access, ExprError> {
     let dotted = f.dotted();
@@ -422,16 +479,6 @@ pub(crate) fn resolve(
             Access::Scalar(field)
         }
     };
-    let phases = access.phases();
-    if !phases.contains(phase) {
-        return Err(ExprError::new(
-            f.span,
-            format!(
-                "`{f}` is not available in the {phase} phase (available in: {})",
-                phases.names()
-            ),
-        ));
-    }
     Ok(access)
 }
 
@@ -468,12 +515,12 @@ mod tests {
     use super::*;
     use crate::parser::parse_inner;
 
-    fn res(src: &str, phase: Phase) -> Result<Access, String> {
+    fn res(src: &str) -> Result<Access, String> {
         let node = parse_inner(src).unwrap();
         let crate::ast::Expr::Pred(crate::ast::Operand::Field(f)) = node.expr else {
             panic!("{src}")
         };
-        resolve(&f, phase, &|id| id == "m").map_err(|e| e.message)
+        resolve(&f, &|id| id == "m").map_err(|e| e.message)
     }
 
     #[test]
@@ -485,52 +532,58 @@ mod tests {
 
     #[test]
     fn resolution() {
-        let r = Phase::Request;
-        assert_eq!(res("host", r), Ok(Access::Scalar(Field::Host)));
+        assert_eq!(res("host"), Ok(Access::Scalar(Field::Host)));
         assert_eq!(
-            res("header[\"User-Agent\"]", r),
+            res("header[\"User-Agent\"]"),
             Ok(Access::Header("user-agent".into()))
         );
+        assert_eq!(res("header.all[\"x\"]"), Ok(Access::HeaderAll("x".into())));
+        assert_eq!(res("metric.m"), Ok(Access::Metric("m".into())));
+        assert_eq!(res("tag[\"t\"]"), Ok(Access::Tag("t".into())));
         assert_eq!(
-            res("header.all[\"x\"]", r),
-            Ok(Access::HeaderAll("x".into()))
-        );
-        assert_eq!(res("metric.m", r), Ok(Access::Metric("m".into())));
-        assert_eq!(res("tag[\"t\"]", Phase::Ws), Ok(Access::Tag("t".into())));
-        assert_eq!(
-            res("response.header[\"x\"]", Phase::Response),
+            res("response.header[\"x\"]"),
             Ok(Access::RespHeader("x".into()))
         );
-        assert_eq!(res("body.text", r), Ok(Access::BodyText));
+        assert_eq!(res("body.text"), Ok(Access::BodyText));
+        assert_eq!(res("body.bytes"), Ok(Access::Scalar(Field::BodyBytes)));
+    }
+
+    #[test]
+    fn head_and_watched() {
+        assert!(Field::Host.is_head());
+        assert!(Field::BodySize.is_head());
+        assert_eq!(Field::BodyBytes.reads(), Reads::BODY_BYTES);
+        assert_eq!(Field::ResponseStatus.reads(), Reads::RESPONSE_HEAD);
+        assert_eq!(
+            Field::ResponseBodyBytes.reads(),
+            Reads::RESPONSE_BODY_BYTES
+        );
+        assert_eq!(Field::WsText.reads(), Reads::WS);
+        assert_eq!(
+            Access::RespBodyText.reads(),
+            Reads::RESPONSE_BODY_TEXT
+        );
+        assert!(Access::BodyText.reads().is_empty());
+        let r = Reads::BODY_BYTES | Reads::METRIC_REQUEST_BYTES;
+        assert!(r.intersects(Reads::METRICS));
+        assert!(Reads::BODY_BYTES.is_subset(r));
+        assert_eq!(r.names(), ["body.bytes", "request_bytes metric"]);
     }
 
     #[test]
     fn resolution_errors() {
-        let r = Phase::Request;
-        assert!(res("hots", r).unwrap_err().contains("did you mean `host`"));
-        assert!(res("github", r).unwrap_err().contains("double-quoted"));
-        assert!(res("metric.x", r).unwrap_err().contains("undefined metric"));
-        assert!(res("header", r).unwrap_err().contains("needs a name"));
+        assert!(res("hots").unwrap_err().contains("did you mean `host`"));
+        assert!(res("github").unwrap_err().contains("double-quoted"));
+        assert!(res("metric.x").unwrap_err().contains("undefined metric"));
+        assert!(res("header").unwrap_err().contains("needs a name"));
+        assert!(res("host[\"x\"]").unwrap_err().contains("cannot be indexed"));
         assert!(
-            res("host[\"x\"]", r)
-                .unwrap_err()
-                .contains("cannot be indexed")
-        );
-        assert!(
-            res("header[\"a b\"]", r)
+            res("header[\"a b\"]")
                 .unwrap_err()
                 .contains("invalid header name")
         );
-        let e = res("response.status", r).unwrap_err();
-        assert_eq!(
-            e,
-            "`response.status` is not available in the request phase (available in: response)"
-        );
-        assert!(res("dst.host", r).unwrap_err().contains("connect"));
-        assert!(
-            res("host", Phase::Connect)
-                .unwrap_err()
-                .contains("connect phase")
-        );
+        // Connect-time fields are gone (they return with transparent mode).
+        assert!(res("dst.host").unwrap_err().contains("unknown field"));
+        assert!(res("dst.ip").unwrap_err().contains("unknown field"));
     }
 }

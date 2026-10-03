@@ -5,6 +5,9 @@
 //! * Strings compare byte-exact, except operands involving `host`,
 //!   `dst.host`, `tls.sni`, `method` and `scheme`, which compare ASCII
 //!   case-insensitively (header names are lower-cased at compile time).
+//! * Compiling also records what an expression *reads* beyond the request
+//!   head ([`Needs::reads`]), which decides whether its rule is a head rule
+//!   or a watching rule (§6.1).
 //! * `like` is a full-match glob where only `*` (any run, including `/`)
 //!   and `?` (one character) are special; it compiles to a `globset`
 //!   matcher.
@@ -24,9 +27,8 @@ use ipnet::IpNet;
 use regex::{Regex, RegexBuilder};
 
 use crate::ast::{Expr, Lit, LitNode, Node, Op, Operand};
-use crate::config::Phase;
 use crate::diag::{ExprError, Span};
-use crate::types::{Access, Field, Type, resolve};
+use crate::types::{Access, Field, Reads, Type, resolve};
 
 /// Compiled-program size limit for one regex (bytes). A hostile or careless
 /// pattern such as `\w{1000}{1000}` fails to compile instead of using
@@ -38,16 +40,24 @@ const REGEX_NEST_LIMIT: u32 = 64;
 
 /// Compilation environment for one expression.
 pub(crate) struct Env<'a> {
-    pub phase: Phase,
-    pub metric_exists: &'a dyn Fn(&str) -> bool,
+    /// `Some(reads)` for a defined metric: the watched bits a read of it
+    /// carries ([`Reads::METRIC_REQUEST_BYTES`] / `..._RESPONSE_BYTES` for
+    /// byte metrics, empty otherwise). `None` = undefined.
+    pub metric: &'a dyn Fn(&str) -> Option<Reads>,
     pub list_exists: &'a dyn Fn(&str) -> bool,
 }
 
-/// Body buffering required by an expression.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// What an expression needs beyond its plan: body buffering, and the
+/// values it reads that are not known at the request head.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Needs {
     pub request_body: bool,
     pub response_body: bool,
+    /// Watched fields and byte metrics read.
+    pub reads: Reads,
+    /// The watched values read, as written (`body.bytes`,
+    /// `metric.egress (request_bytes)`), in order of first appearance.
+    pub watched: Vec<String>,
 }
 
 /// A compile-time constant operand.
@@ -411,11 +421,30 @@ impl Compiler<'_, '_> {
         match o {
             Operand::Lit(l) => Ok(Typed::Lit(l)),
             Operand::Field(f) => {
-                let access = resolve(f, self.env.phase, self.env.metric_exists)?;
+                let metric = self.env.metric;
+                let access = resolve(f, &|id| metric(id).is_some())?;
                 match access {
                     Access::BodyText => self.needs.request_body = true,
                     Access::RespBodyText => self.needs.response_body = true,
                     _ => {}
+                }
+                let (reads, name) = match &access {
+                    Access::Metric(id) => {
+                        let r = metric(id).unwrap_or_default();
+                        let what = if r == Reads::METRIC_REQUEST_BYTES {
+                            "request_bytes"
+                        } else {
+                            "response_bytes"
+                        };
+                        (r, format!("metric.{id} ({what})"))
+                    }
+                    a => (a.reads(), a.display_name()),
+                };
+                if !reads.is_empty() {
+                    self.needs.reads |= reads;
+                    if !self.needs.watched.contains(&name) {
+                        self.needs.watched.push(name);
+                    }
                 }
                 Ok(Typed::Field(access, f.span))
             }

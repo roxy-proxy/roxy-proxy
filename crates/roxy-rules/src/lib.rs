@@ -1,12 +1,12 @@
 //! Rule engine for roxy (`DESIGN.md` §6).
 //!
 //! Responsibilities: the rule-related config types ([`config`]), the
-//! expression DSL (lexer, [`parser`], type-checker, compiler), the rule
-//! chains per phase with typed actions, and the immutable [`Policy`]
-//! snapshot that the proxy swaps atomically on reload. It also provides the
-//! in-process stores behind `metric.<id>` and `state["k"]`: [`MetricStore`]
-//! and [`StateStore`], exposed to the proxy as [`MetricSource`] and
-//! [`StateSource`].
+//! expression DSL (lexer, [`parser`], type-checker, compiler), the one
+//! ordered rule list with its head/watching classification and typed
+//! actions, and the immutable [`Policy`] snapshot that the proxy swaps
+//! atomically on reload. It also provides the in-process stores behind
+//! `metric.<id>` and `state["k"]`: [`MetricStore`] and [`StateStore`],
+//! exposed to the proxy as [`MetricSource`] and [`StateSource`].
 //!
 //! This crate performs no network I/O and does not depend on the HTTP model:
 //! the proxy exposes a flow through the [`FlowView`] trait.
@@ -15,55 +15,105 @@
 //!
 //! ```
 //! use std::collections::HashSet;
-//! use roxy_rules::{EvalContext, Field, MapView, Phase, Policy, PolicyInput, RuleConfig};
+//! use roxy_rules::{
+//!     DefaultDecision, EvalContext, Field, MapView, Policy, PolicyInput, Reads, RuleConfig,
+//! };
 //!
 //! let rules: Vec<RuleConfig> = serde_yaml_ng::from_str(r#"
 //! - id: github-reads
 //!   when: host under "github.com" and method in [GET, HEAD]
 //!   then: allow
+//! - id: upload-cap
+//!   when: body.bytes > 10mb
+//!   then: { deny: { status: 413 } }
 //! "#).unwrap();
 //! let none = HashSet::new();
 //! let policy = Policy::compile(&PolicyInput {
 //!     rules: &rules, metrics: &[], secret_names: &none, addon_names: &none, address_lists: &none,
-//!     transparent_listeners: false,
+//!     transparent_listeners: false, default: DefaultDecision::Deny,
 //! }).unwrap();
 //! let flow = MapView::new()
 //!     .with_str(Field::Host, "api.github.com")
 //!     .with_str(Field::Method, "GET");
-//! let out = policy.evaluate(Phase::Request, &flow, &EvalContext::empty());
+//! // The head decision: `upload-cap` reads `body.bytes`, so it is skipped.
+//! let out = policy.evaluate_head(&flow, &EvalContext::empty());
 //! assert!(out.decision.is_allow());
 //! assert_eq!(out.terminal_rule, "github-reads");
+//! // After forwarding: re-check the watching rules as body bytes arrive.
+//! let mut st = policy.watch_state(&out.tags);
+//! let flow = flow.with_int(Field::BodyBytes, 11 << 20);
+//! let w = policy
+//!     .evaluate_watching(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &flow, &EvalContext::empty())
+//!     .unwrap();
+//! assert!(w.stops());
 //! ```
 //!
 //! # Semantics
 //!
-//! * **Chains.** Rules run top to bottom per phase; non-terminal actions
-//!   take effect and evaluation continues; the first terminal action
-//!   (`allow`, `deny`, `passthrough`) decides. An exhausted chain yields
-//!   [`Decision::default_for`] the phase: deny 403 in `request` and `ws`
-//!   (in `ws` that drops the message), allow in `connect` (§4.3) and
-//!   `response`; `terminal_rule` is `_default`.
-//! * **Denies close.** Outside `ws`, a deny closes the client connection
-//!   after the response unless the rule says `deny: { close: false }`. In
-//!   `ws`, `close: true` closes the socket; the default drops the message.
+//! * **One list, two kinds of rule** (§6.1). Compiling records what each
+//!   rule's `when` reads. A rule that reads only *head* values (known when
+//!   the request head arrives) is a **head rule**. A rule that reads a
+//!   *watched* field (`body.bytes`, `response.*`, `ws.*`) is a **watching
+//!   rule**. A `deny` rule that reads a byte metric (`count: request_bytes`
+//!   or `response_bytes`) and no watched field is both
+//!   ([`RuleKind::HeadAndWatching`]): it takes part in the head decision and
+//!   is re-checked as this exchange adds bytes to that metric. Metrics that
+//!   count `requests`, `denied`, `errors` or `unique(..)` do not change
+//!   while an exchange streams, so reading them does not make a rule watch.
+//! * **The head decision** ([`Policy::evaluate_head`]) evaluates every head
+//!   rule top to bottom (watching rules are skipped, not false). A matching
+//!   deny anywhere wins (`terminal_rule` = the first matching deny); else a
+//!   matching allow (the first one; only its `upgrade`/`private_ok` options
+//!   apply); else `default:` (`deny` unless configured `allow`; the
+//!   implicit allow grants no options), `terminal_rule = "_default"`. Tags
+//!   set by a matching rule are visible to the rules below it. If allowed,
+//!   every matching rule's effects apply in list order (a later
+//!   `set_header` of the same name wins); if denied, only `log`, `tag` and
+//!   `set_state` remain.
+//! * **Watching** ([`Policy::evaluate_watching`]): after forwarding, the
+//!   proxy reports each change (`changed`, a [`Reads`] mask) and what is
+//!   known so far. Rules whose triggers intersect the change and whose
+//!   watched fields are all known are checked top to bottom; the first
+//!   matching deny stops the exchange. Non-terminal effects of a watching
+//!   rule apply once, the first time it matches. Each rule's reads are a
+//!   bit mask, so an event no rule watches costs one `and`, and an
+//!   evaluation in which nothing matches allocates nothing.
+//! * **Legal actions** (§6.3). Head rules may use every action; their
+//!   `set_header`/`remove_header` change the request. A watching rule
+//!   cannot `allow`, `rewrite_path`, `set_query`, `remove_query`,
+//!   `redirect` or use `${secret:..}` (the request is already on its way):
+//!   compile errors. **In a watching rule, `set_header` and
+//!   `remove_header` change the response**: they are legal only when the
+//!   rule reads response values and everything that can re-check it is
+//!   known before the response head is sent (`response.status`,
+//!   `response.header[..]`, `response.body.size`, `response.body.text`); a
+//!   watching rule that does not read the response would change the
+//!   request, and one that also reads `body.bytes`, `response.body.bytes`
+//!   or a byte metric could match after the head was sent. Both are
+//!   compile errors. There is no explicit target key: the rule's reads
+//!   decide it.
+//! * **Denies close.** A deny closes the client connection after the
+//!   response unless the rule says `deny: { close: false }`.
 //! * **Unavailable inputs fail closed.** If evaluation reaches a metric the
 //!   view reports unavailable ([`FlowView::metric`] → `None`), an address
 //!   list it cannot answer for, a body predicate whose body is too large to
-//!   inspect or not available ([`BodyText`]), or a `set_header` secret that
-//!   is missing or not a valid header value, evaluation stops: [`Decision::fail_closed`]
-//!   (503, close), `terminal_rule = "_fail_closed"`, and
-//!   [`Outcome::fail_closed_reason`] says why. This is never "predicate
-//!   false". `and`/`or` short-circuit, so only inputs actually reached count:
-//!   write `body.size < 1mb and body.text contains "x"` to keep large
-//!   uploads out of body inspection instead of failing them closed.
-//! * **Absent values.** A field the flow does not have (`client.user`
-//!   without proxy auth, an unset header or state key) is
-//!   [`Value::Absent`]. *Every* comparison involving an absent operand is
-//!   false, including `!=` and `not in`; `not (x == "a")` is true.
+//!   inspect or not available ([`BodyText`]), a missing value under an
+//!   operator that cannot answer for `null`, or a `set_header` secret that
+//!   is missing or not a valid header value: at the head, the result is
+//!   [`Decision::fail_closed`] (503, close), `terminal_rule =
+//!   "_fail_closed"` and [`Outcome::fail_closed_reason`] says why, whatever
+//!   else matched; in a watching evaluation the same stops the exchange.
+//!   This is never "predicate false". `and`/`or` short-circuit, so only
+//!   inputs actually reached count.
+//! * **Missing values (`null`).** A field the flow does not have
+//!   (`client.user` without proxy auth, an unset header or state key,
+//!   `body.size` of a chunked body) is [`Value::Absent`]. It equals only
+//!   `null` under `==`, `!=`, `in` and `not in`; any other operator on it
+//!   fails closed with [`FailClosedReason::MissingValue`].
 //! * **Case.** String comparisons are byte-exact, except operands involving
-//!   `host`, `dst.host`, `tls.sni`, `method` and `scheme`, which compare
-//!   ASCII case-insensitively (also for `like`/`matches`/`in`). Header names
-//!   in `header["X-Y"]` are lower-cased at compile time.
+//!   `host`, `tls.sni`, `method` and `scheme`, which compare ASCII
+//!   case-insensitively (also for `like`/`matches`/`in`). Header names in
+//!   `header["X-Y"]` are lower-cased at compile time.
 //! * **Operators.** `like` is a full-match glob (`*` any run including `/`,
 //!   `?` one char, nothing else special). `matches` is a full-match regex
 //!   (`^(?:…)$`) compiled with [`REGEX_SIZE_LIMIT`]. `under "x"` is
@@ -85,14 +135,16 @@
 //!   valid against `method`.
 //! * **Tags and state.** `tag["t"]` is true if `t` is in
 //!   [`EvalContext::initial_tags`] or a `tag` action of an earlier matching
-//!   rule in the same chain set it. `state["k"]` sees `set_state` effects
-//!   earlier in the chain, then [`FlowView::state`]. `metric.<id>` is
+//!   rule set it. `state["k"]` sees `set_state` effects of earlier matching
+//!   rules, then [`FlowView::state`]. `metric.<id>` is
 //!   [`FlowView::metric`], which must return `Some(0)` for a series with no
 //!   data yet; `None` means unavailable.
-//! * **Secrets.** `${secret:name}` is only allowed in request-phase
-//!   `set_header` values and must name a defined secret. A secret missing at
-//!   evaluation time (or not a valid header value) fails closed (see above).
-
+//! * **Metrics** (§6.4). A metric's `where`, `key` and `unique(..)` may
+//!   only read head fields, so whether an exchange counts, and its series,
+//!   are fixed at the head.
+//! * **Secrets.** `${secret:name}` is only allowed in `set_header` values
+//!   of rules decided at the head and must name a defined secret. A secret
+//!   missing at evaluation time (or not a valid header value) fails closed.
 #![forbid(unsafe_code)]
 
 pub mod ast;
@@ -110,20 +162,21 @@ mod view;
 
 pub use compile::{REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
 pub use config::{
-    Action, AllowArgs, CaptureTarget, DenyArgs, Expr, LogArgs, LogLevel, MetricConfig, MetricCount,
-    Phase, RedirectArgs, RewritePathArgs, RuleConfig, Scheme, SetStateArgs, Then, Upgrade,
+    Action, AllowArgs, CaptureTarget, DefaultDecision, DenyArgs, Expr, LogArgs, LogLevel,
+    MetricConfig, MetricCount, PHASE_REMOVED,
+    RedirectArgs, RewritePathArgs, RuleConfig, Scheme, SetStateArgs, Then, Upgrade,
 };
 pub use diag::{Diagnostic, RuleId, Span};
 pub use eval::{
     AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Effect, EvalContext,
-    FAIL_CLOSED_MESSAGE, FAIL_CLOSED_STATUS, FailClosedReason, Outcome,
+    FAIL_CLOSED_MESSAGE, FAIL_CLOSED_STATUS, FailClosedReason, Outcome, WatchOutcome,
 };
 pub use metrics::{
     CarryOverReport, Clock, DEFAULT_MAX_METRIC_BYTES, DEFAULT_MAX_METRIC_KEYS, MetricError,
     MetricLimits, MetricSnapshot, MetricSource, MetricStore, SERIES_OVERHEAD, SPARSE_CHUNK, Sample,
 };
 pub use parser::parse;
-pub use policy::{MetricDef, Policy, PolicyInput};
+pub use policy::{MetricDef, Policy, PolicyInput, RuleInfo, RuleKind, WatchState};
 pub use state::{StateFull, StateSource, StateStore};
-pub use types::{Field, Type};
+pub use types::{Field, Reads, Type};
 pub use view::{BodyText, FlowView, MapView, Value};

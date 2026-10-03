@@ -17,9 +17,10 @@ pub enum Value<'a> {
     Bool(bool),
     Ip(IpAddr),
     List(Vec<Cow<'a, str>>),
-    /// Not known for this flow (no proxy auth, body not buffered, …). Every
-    /// comparison with an absent operand is false — including `!=` and
-    /// `not in`. `not (x == "a")` is true when `x` is absent.
+    /// `null`: not present for this flow (no proxy auth, unsent header,
+    /// undeclared body length, …). Equal only to `null` under `==`, `!=`,
+    /// `in`, `not in`; any other operator on it fails the flow closed
+    /// (§6.2).
     Absent,
 }
 
@@ -69,7 +70,7 @@ pub trait FlowView {
     fn header(&self, name: &str) -> Option<Cow<'_, str>>;
     /// Every value of a request header, in order.
     fn header_all(&self, name: &str) -> Vec<Cow<'_, str>>;
-    /// First value of a response header (response phase).
+    /// First value of a response header (once the response head is known).
     fn response_header(&self, name: &str) -> Option<Cow<'_, str>>;
     /// Every value of a response header.
     fn response_header_all(&self, name: &str) -> Vec<Cow<'_, str>>;

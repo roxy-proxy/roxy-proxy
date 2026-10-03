@@ -1,4 +1,5 @@
-//! The compiled, immutable [`Policy`] and the rule-chain evaluator.
+//! The compiled, immutable [`Policy`]: rule classification (head vs
+//! watching), the head decision, and watching evaluation (§6.1).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -8,14 +9,14 @@ use regex::Regex;
 
 use crate::compile::{Env, Needs, Pred, build_shared_regex, compile};
 use crate::config::{
-    Action, AllowArgs, DenyArgs, MetricConfig, MetricCount, Phase, RuleConfig, Upgrade,
+    Action, DefaultDecision, DenyArgs, MetricConfig, MetricCount, RuleConfig, Upgrade,
 };
 use crate::diag::{Diagnostic, RuleId};
 use crate::eval::{
     AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Effect, EvalContext,
-    FailClosedReason, Outcome, Scope,
+    FailClosedReason, Outcome, Scope, WatchOutcome,
 };
-use crate::types::{Field, is_token};
+use crate::types::{Field, Reads, is_token};
 use crate::view::FlowView;
 
 /// Everything [`Policy::compile`] needs from the config.
@@ -33,10 +34,14 @@ pub struct PolicyInput<'a> {
     /// Whether any transparent listener exists. Always false in M1, which
     /// makes `passthrough` a compile error.
     pub transparent_listeners: bool,
+    /// The top-level `default:` (deny unless the config says `allow`).
+    pub default: DefaultDecision,
 }
 
-/// A compiled metric definition (§6.4). Counting is the proxy's job (M2);
-/// this carries the shape and the compiled `where` filter.
+/// A compiled metric definition (§6.4). Counting is the proxy's job; this
+/// carries the shape and the compiled `where` filter, which reads head
+/// fields only, so whether an exchange counts (and its series key) is
+/// fixed at the request head.
 #[derive(Debug, Clone)]
 pub struct MetricDef {
     pub id: String,
@@ -46,8 +51,6 @@ pub struct MetricDef {
     /// Series key fields; empty = one global series.
     pub key: Vec<Field>,
     pub window: Option<Duration>,
-    /// Phase in which the counted thing is known and `where` is evaluated.
-    pub phase: Phase,
     filter: Option<Pred>,
 }
 
@@ -77,33 +80,80 @@ enum CAction {
     Terminal(Decision),
 }
 
+/// When a rule runs (§6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleKind {
+    /// Reads only head values: decided at the request head.
+    Head,
+    /// Reads a watched field (`body.bytes`, `response.*`, `ws.*`): skipped
+    /// at the head, checked after forwarding when what it reads is known.
+    Watching,
+    /// A `deny` rule that reads a byte metric (`request_bytes` /
+    /// `response_bytes`) and no watched field: takes part in the head
+    /// decision like a head rule, and is re-checked as this exchange adds
+    /// bytes to the metric.
+    HeadAndWatching,
+}
+
+impl RuleKind {
+    /// Whether the rule takes part in the head decision.
+    pub fn at_head(self) -> bool {
+        matches!(self, Self::Head | Self::HeadAndWatching)
+    }
+
+    /// Whether the rule is re-checked after forwarding.
+    pub fn watches(self) -> bool {
+        matches!(self, Self::Watching | Self::HeadAndWatching)
+    }
+}
+
+/// How one rule was classified, for `roxy check` and `roxy rule test`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleInfo {
+    pub id: RuleId,
+    pub kind: RuleKind,
+    /// What makes it watch: the watched fields and byte metrics it reads,
+    /// as written (`body.bytes`, `metric.egress (request_bytes)`). Empty
+    /// for a head rule.
+    pub watches: Vec<String>,
+    /// Events that re-check it (empty for a head rule).
+    pub triggers: Reads,
+}
+
 #[derive(Debug, Clone)]
 struct CompiledRule {
     id: RuleId,
     when: Option<Pred>,
     actions: Box<[CAction]>,
+    kind: RuleKind,
+    /// Watched fields read: the rule is decidable once all are known.
+    fields: Reads,
+    /// Changes that re-check the rule (fields plus byte metrics).
+    triggers: Reads,
+    watches: Vec<String>,
 }
 
-/// A compiled policy: one rule chain per phase plus metric definitions.
-/// Immutable; the proxy shares it behind `Arc` and swaps it on reload.
+/// A compiled policy: one ordered rule list, classified, plus metric
+/// definitions. Immutable; the proxy shares it behind `Arc` and swaps it on
+/// reload.
 #[derive(Debug, Clone)]
 pub struct Policy {
-    chains: [Vec<CompiledRule>; 4],
+    rules: Vec<CompiledRule>,
+    /// Indices of rules taking part in the head decision, in list order.
+    head: Box<[usize]>,
+    /// Indices of watching rules, in list order.
+    watching: Box<[usize]>,
+    /// Union of the watching rules' triggers: an event outside it costs one
+    /// mask test.
+    watch_triggers: Reads,
+    /// Union of the byte-metric bits of the defined metrics.
+    byte_metrics: Reads,
     metrics: Vec<MetricDef>,
-    ids: Vec<RuleId>,
     needs_request_body: bool,
     needs_response_body: bool,
+    default: DefaultDecision,
     default_id: RuleId,
     fail_closed_id: RuleId,
-}
-
-fn phase_index(p: Phase) -> usize {
-    match p {
-        Phase::Connect => 0,
-        Phase::Request => 1,
-        Phase::Response => 2,
-        Phase::Ws => 3,
-    }
 }
 
 const SECRET_OPEN: &str = "${secret:";
@@ -129,6 +179,31 @@ pub(crate) fn is_header_value(s: &str) -> bool {
     s.bytes().all(|b| b == b'\t' || (b' '..=b'~').contains(&b))
 }
 
+/// Per-exchange state of the watching rules: which ones have fired (their
+/// non-terminal effects apply once) and the tags set so far. Create with
+/// [`Policy::watch_state`] after the head decision.
+#[derive(Debug, Clone, Default)]
+pub struct WatchState {
+    fired: Vec<bool>,
+    /// Tags visible to watching rules: the head's, plus those set by
+    /// watching rules that fired.
+    pub tags: Vec<String>,
+    stopped: bool,
+}
+
+impl WatchState {
+    /// Whether a watching evaluation has stopped the exchange. Every later
+    /// evaluation returns `None`.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+}
+
+/// Keep only the effects that still apply when the exchange is refused.
+fn refused_effects(effects: &mut Vec<Effect>) {
+    effects.retain(|e| matches!(e, Effect::Log { .. } | Effect::SetState { .. }));
+}
+
 impl Policy {
     /// Compile rules and metrics. Returns every problem found.
     pub fn compile(input: &PolicyInput<'_>) -> Result<Policy, Vec<Diagnostic>> {
@@ -138,66 +213,81 @@ impl Policy {
             needs: Needs::default(),
         };
         let metrics = c.metrics();
-        let (chains, ids) = c.rules();
+        let rules = c.rules();
         if !c.d.is_empty() {
             return Err(c.d);
         }
+        let head = (0..rules.len()).filter(|&i| rules[i].kind.at_head()).collect();
+        let watching: Box<[usize]> = (0..rules.len())
+            .filter(|&i| rules[i].kind.watches())
+            .collect();
+        let watch_triggers = watching
+            .iter()
+            .fold(Reads::NONE, |acc, &i| acc | rules[i].triggers);
+        let byte_metrics = metrics.iter().fold(Reads::NONE, |acc, m| {
+            acc | metric_reads(&m.count)
+        });
         Ok(Policy {
-            chains,
+            rules,
+            head,
+            watching,
+            watch_triggers,
+            byte_metrics,
             metrics,
-            ids,
             needs_request_body: c.needs.request_body,
             needs_response_body: c.needs.response_body,
+            default: input.default,
             default_id: RuleId::new(RuleId::DEFAULT),
             fail_closed_id: RuleId::new(RuleId::FAIL_CLOSED),
         })
     }
 
-    /// Evaluate `phase`'s chain against a flow.
+    /// The head decision (§6.1): the forwarding decision at the request
+    /// head.
     ///
-    /// Rules run top to bottom; a rule whose `when` matches (absent `when`
-    /// always matches) runs its actions in order. The first terminal action
-    /// decides. If the chain is exhausted the result is
-    /// [`Decision::default_for`] the phase with `terminal_rule = "_default"`.
+    /// Every rule that takes part in it ([`RuleKind::at_head`]) is
+    /// evaluated, top to bottom; rules that read a watched value are
+    /// skipped (not false). The decision does not depend on order:
     ///
-    /// Fail closed (§6.1): if evaluation reaches a metric the view reports
-    /// unavailable (`FlowView::metric` → `None`), an address list it cannot
-    /// answer for (`in_address_list` → `None`), a `set_header` secret that
-    /// cannot be resolved, or a resolved secret that is not a valid header
-    /// value, evaluation stops with [`Decision::fail_closed`] (503, close),
-    /// `terminal_rule = "_fail_closed"`, `fail_closed_reason` set, and
-    /// `matched`/`effects`/`tags` as evaluated so far. `and`/`or`
-    /// short-circuit, so only inputs actually reached are needed.
+    /// * if any matching rule denies, the request is denied
+    ///   (`terminal_rule` = the first matching deny in list order);
+    /// * else if any matching rule allows, it is allowed (`terminal_rule` =
+    ///   the first matching allow, whose options — `upgrade`, `private_ok`
+    ///   — are the only ones granted; options are never merged);
+    /// * else the `default:` applies (`_default`; an implicit allow grants
+    ///   no options).
+    ///
+    /// Tags set by a matching rule are visible to the rules below it, and
+    /// `state["k"]` sees earlier `set_state` effects. Effects of every
+    /// matching rule are returned in list order when the request is
+    /// allowed; when it is denied only `log` and `set_state` remain (tags
+    /// are in [`Outcome::tags`]).
+    ///
+    /// Fail closed (§6.1): if evaluating *any* head rule reaches a metric
+    /// the view reports unavailable, an address list it cannot answer for,
+    /// a missing value under an operator that cannot answer for `null`, an
+    /// uninspectable body, or a `set_header` secret that cannot be resolved,
+    /// the result is [`Decision::fail_closed`] (503, close) with
+    /// `terminal_rule = "_fail_closed"`, whatever else matched.
     ///
     /// Allocation: nothing is allocated for rules that do not match, except
-    /// what the view itself returns (e.g. `header.all`). Matching rules clone
-    /// their id (a refcount) and their effects.
-    pub fn evaluate(&self, phase: Phase, view: &dyn FlowView, ctx: &EvalContext<'_>) -> Outcome {
+    /// what the view itself returns (e.g. `header.all`).
+    pub fn evaluate_head(&self, view: &dyn FlowView, ctx: &EvalContext<'_>) -> Outcome {
         let mut tags: Vec<String> = ctx.initial_tags.to_vec();
         let mut effects: Vec<Effect> = Vec::new();
         let mut matched: Vec<RuleId> = Vec::new();
-        let fail = |reason: FailClosedReason,
-                    matched: Vec<RuleId>,
-                    effects: Vec<Effect>,
-                    tags: Vec<String>| Outcome {
-            decision: Decision::fail_closed(),
-            matched,
-            terminal_rule: self.fail_closed_id.clone(),
-            fail_closed_reason: Some(reason),
-            effects,
-            tags,
-        };
-        for rule in &self.chains[phase_index(phase)] {
+        let mut deny: Option<(usize, &Decision)> = None;
+        let mut allow: Option<(usize, &Decision)> = None;
+        for &i in &self.head {
+            let rule = &self.rules[i];
             let hit = match &rule.when {
                 None => Ok(true),
                 Some(p) => Scope::new(view, &tags, &effects).check(p),
             };
-            let hit = match hit {
-                Ok(hit) => hit,
-                Err(reason) => return fail(reason, matched, effects, tags),
-            };
-            if !hit {
-                continue;
+            match hit {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(reason) => return self.fail(reason, matched, effects, tags),
             }
             matched.push(rule.id.clone());
             for action in &rule.actions {
@@ -213,29 +303,196 @@ impl Policy {
                             name: name.clone(),
                             value,
                         }),
-                        Err(reason) => return fail(reason, matched, effects, tags),
+                        Err(reason) => return self.fail(reason, matched, effects, tags),
                     },
+                    CAction::Terminal(d @ Decision::Allow(_)) => {
+                        allow.get_or_insert((i, d));
+                    }
+                    // `passthrough` is rejected by the compiler; were it
+                    // ever reached it must not forward: it ranks with deny.
                     CAction::Terminal(d) => {
-                        return Outcome {
-                            decision: d.clone(),
-                            matched,
-                            terminal_rule: rule.id.clone(),
-                            fail_closed_reason: None,
-                            effects,
-                            tags,
-                        };
+                        deny.get_or_insert((i, d));
                     }
                 }
             }
         }
+        let (decision, terminal_rule) = match (deny, allow) {
+            (Some((i, d)), _) => (d.clone(), self.rules[i].id.clone()),
+            (None, Some((i, d))) => (d.clone(), self.rules[i].id.clone()),
+            (None, None) => (
+                match self.default {
+                    DefaultDecision::Deny => Decision::default_deny(),
+                    DefaultDecision::Allow => Decision::Allow(AllowOpts::default()),
+                },
+                self.default_id.clone(),
+            ),
+        };
+        if !decision.is_allow() {
+            refused_effects(&mut effects);
+        }
         Outcome {
-            decision: Decision::default_for(phase),
+            decision,
             matched,
-            terminal_rule: self.default_id.clone(),
+            terminal_rule,
             fail_closed_reason: None,
             effects,
             tags,
         }
+    }
+
+    fn fail(
+        &self,
+        reason: FailClosedReason,
+        matched: Vec<RuleId>,
+        mut effects: Vec<Effect>,
+        tags: Vec<String>,
+    ) -> Outcome {
+        refused_effects(&mut effects);
+        Outcome {
+            decision: Decision::fail_closed(),
+            matched,
+            terminal_rule: self.fail_closed_id.clone(),
+            fail_closed_reason: Some(reason),
+            effects,
+            tags,
+        }
+    }
+
+    /// Per-exchange watching state, starting from the tags the head
+    /// decision produced.
+    pub fn watch_state(&self, head_tags: &[String]) -> WatchState {
+        WatchState {
+            fired: vec![false; self.watching.len()],
+            tags: head_tags.to_vec(),
+            stopped: false,
+        }
+    }
+
+    /// Whether an event changing `changed` can re-check any watching rule.
+    /// One mask test; callers use it to skip per-chunk work entirely.
+    pub fn watches(&self, changed: Reads) -> bool {
+        self.watch_triggers.intersects(changed)
+    }
+
+    /// Re-check the watching rules after a value changed (§6.1).
+    ///
+    /// `changed` is what just became known or changed (e.g.
+    /// [`Reads::BODY_BYTES`] for a request body chunk, plus
+    /// [`Reads::METRIC_REQUEST_BYTES`] if this exchange's bytes were just
+    /// added to such a metric); `known` is every watched field known so far
+    /// (a rule is only checked once everything it reads is known). Rules
+    /// whose triggers intersect `changed` are checked top to bottom; the
+    /// first matching deny stops the exchange. A watching rule's
+    /// non-terminal effects apply once, the first time it matches; it is not
+    /// checked again after that.
+    ///
+    /// Returns `None` when nothing matched (no allocation in that case:
+    /// the steady-state per-chunk path). `Some` with `stop` set means the
+    /// exchange must stop: a matching deny, or any fail-closed input (an
+    /// error never lets the exchange continue). After a stop every call
+    /// returns `None`.
+    pub fn evaluate_watching(
+        &self,
+        changed: Reads,
+        known: Reads,
+        st: &mut WatchState,
+        view: &dyn FlowView,
+        ctx: &EvalContext<'_>,
+    ) -> Option<WatchOutcome> {
+        if st.stopped || !self.watch_triggers.intersects(changed) {
+            return None;
+        }
+        let mut out: Option<WatchOutcome> = None;
+        for (k, &i) in self.watching.iter().enumerate() {
+            let rule = &self.rules[i];
+            if st.fired[k] || !rule.triggers.intersects(changed) || !rule.fields.is_subset(known)
+            {
+                continue;
+            }
+            let pending: &[Effect] = out.as_ref().map_or(&[], |o| &o.effects);
+            let hit = match &rule.when {
+                None => Ok(true),
+                Some(p) => Scope::new(view, &st.tags, pending).check(p),
+            };
+            let o = out.get_or_insert_with(WatchOutcome::default);
+            match hit {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(reason) => {
+                    return Some(self.watch_stop(st, o, None, Some(reason)));
+                }
+            }
+            st.fired[k] = true;
+            o.matched.push(rule.id.clone());
+            for action in &rule.actions {
+                match action {
+                    CAction::Effect(e) => o.effects.push(e.clone()),
+                    CAction::Tag(t) => {
+                        if !st.tags.contains(t) {
+                            st.tags.push(t.clone());
+                            o.tags.push(t.clone());
+                        }
+                    }
+                    CAction::SetHeader { name, parts } => match render(parts, ctx) {
+                        Ok(value) => o.effects.push(Effect::SetHeader {
+                            name: name.clone(),
+                            value,
+                        }),
+                        Err(reason) => {
+                            return Some(self.watch_stop(st, o, None, Some(reason)));
+                        }
+                    },
+                    CAction::Terminal(Decision::Deny {
+                        status,
+                        message,
+                        close,
+                    }) => {
+                        let d = Decision::Deny {
+                            status: *status,
+                            message: message.clone(),
+                            close: *close,
+                        };
+                        return Some(self.watch_stop(st, o, Some((rule.id.clone(), d)), None));
+                    }
+                    // `allow` cannot appear in a watching rule (compile
+                    // error) and `passthrough` is rejected; never continue
+                    // on either: fail closed.
+                    CAction::Terminal(_) => {
+                        return Some(self.watch_stop(
+                            st,
+                            o,
+                            None,
+                            Some(FailClosedReason::Unsupported(rule.id.to_string())),
+                        ));
+                    }
+                }
+            }
+        }
+        out.filter(|o| !o.matched.is_empty())
+    }
+
+    fn watch_stop(
+        &self,
+        st: &mut WatchState,
+        o: &mut WatchOutcome,
+        deny: Option<(RuleId, Decision)>,
+        reason: Option<FailClosedReason>,
+    ) -> WatchOutcome {
+        st.stopped = true;
+        let mut o = std::mem::take(o);
+        refused_effects(&mut o.effects);
+        match (deny, reason) {
+            (Some((id, d)), _) => {
+                o.stop = Some(d);
+                o.terminal_rule = Some(id);
+            }
+            (None, reason) => {
+                o.stop = Some(Decision::fail_closed());
+                o.terminal_rule = Some(self.fail_closed_id.clone());
+                o.fail_closed_reason = reason;
+            }
+        }
+        o
     }
 
     /// Whether any rule or metric filter reads `body.text`.
@@ -248,18 +505,58 @@ impl Policy {
         self.needs_response_body
     }
 
+    /// The byte-metric bits ([`Reads::METRIC_REQUEST_BYTES`],
+    /// [`Reads::METRIC_RESPONSE_BYTES`]) of the defined metrics: whether
+    /// bytes must be recorded as they stream.
+    pub fn byte_metrics(&self) -> Reads {
+        self.byte_metrics
+    }
+
+    /// Whether any rule reads `ws.*` (the message codec is not in this
+    /// build, so `roxy run` refuses such a policy).
+    pub fn reads_ws(&self) -> bool {
+        self.rules.iter().any(|r| r.fields.intersects(Reads::WS))
+    }
+
     /// Rule ids in config order.
     pub fn rule_ids(&self) -> impl Iterator<Item = &RuleId> {
-        self.ids.iter()
+        self.rules.iter().map(|r| &r.id)
+    }
+
+    /// Every rule's classification, in config order.
+    pub fn rule_info(&self) -> Vec<RuleInfo> {
+        self.rules
+            .iter()
+            .map(|r| RuleInfo {
+                id: r.id.clone(),
+                kind: r.kind,
+                watches: r.watches.clone(),
+                triggers: r.triggers,
+            })
+            .collect()
     }
 
     pub fn metric_defs(&self) -> &[MetricDef] {
         &self.metrics
     }
 
-    /// Number of rules in `phase`'s chain.
-    pub fn rule_count(&self, phase: Phase) -> usize {
-        self.chains[phase_index(phase)].len()
+    /// The `default:` decision.
+    pub fn default_decision(&self) -> DefaultDecision {
+        self.default
+    }
+
+    /// Number of rules.
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+}
+
+/// The watched bits a read of a metric counting `count` carries.
+fn metric_reads(count: &MetricCount) -> Reads {
+    match count {
+        MetricCount::RequestBytes => Reads::METRIC_REQUEST_BYTES,
+        MetricCount::ResponseBytes => Reads::METRIC_RESPONSE_BYTES,
+        _ => Reads::NONE,
     }
 }
 
@@ -306,15 +603,19 @@ impl PolicyCompiler<'_, '_> {
         rule: Option<&RuleId>,
         path: String,
         src: &str,
-        phase: Phase,
-    ) -> Option<Pred> {
+    ) -> Option<(Pred, Needs)> {
         let input = self.input;
-        let exists = |id: &str| input.metrics.iter().any(|m| m.id == id);
+        let metric = |id: &str| {
+            input
+                .metrics
+                .iter()
+                .find(|m| m.id == id)
+                .map(|m| metric_reads(&m.count))
+        };
         let result = compile(
             src,
             &Env {
-                phase,
-                metric_exists: &exists,
+                metric: &metric,
                 list_exists: &|name: &str| input.address_lists.contains(name),
             },
         );
@@ -322,7 +623,7 @@ impl PolicyCompiler<'_, '_> {
             Ok((pred, needs)) => {
                 self.needs.request_body |= needs.request_body;
                 self.needs.response_body |= needs.response_body;
-                Some(pred)
+                Some((pred, needs))
             }
             Err(e) => {
                 self.d
@@ -366,17 +667,16 @@ impl PolicyCompiler<'_, '_> {
                     "window must be greater than zero",
                 );
             }
-            let phase = m.count.phase();
             let field = |this: &mut Self, name: &str, at: String, what: &str| -> Option<Field> {
                 match Field::from_name(name) {
-                    Some(f) if f.phases().contains(phase) => Some(f),
+                    Some(f) if f.is_head() => Some(f),
                     Some(f) => {
                         this.push(
                             None,
                             at,
                             format!(
-                                "`{f}` is not available in the {phase} phase, where this \
-                                 metric is counted"
+                                "`{f}` is known only after forwarding; metric {what} fields must \
+                                 be head fields (DESIGN.md §6.4)"
                             ),
                         );
                         None
@@ -404,29 +704,44 @@ impl PolicyCompiler<'_, '_> {
                 MetricCount::Unique(f) => field(self, f, format!("{path}.count"), "unique()"),
                 _ => None,
             };
-            let filter = m
-                .where_
-                .as_ref()
-                .and_then(|w| self.expr(None, format!("{path}.where"), w.as_str(), phase));
+            let filter = m.where_.as_ref().and_then(|w| {
+                let at = format!("{path}.where");
+                let (pred, needs) = self.expr(None, at.clone(), w.as_str())?;
+                if needs.reads.intersects(Reads::WATCHED_FIELDS) {
+                    self.push(
+                        None,
+                        at,
+                        format!(
+                            "a metric's `where` may only read head fields, because whether an \
+                             exchange counts is decided at the request head; it reads {} \
+                             (DESIGN.md §6.4)",
+                            needs
+                                .watched
+                                .iter()
+                                .map(|n| format!("`{n}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    );
+                    return None;
+                }
+                Some(pred)
+            });
             out.push(MetricDef {
                 id: m.id.clone(),
                 count: m.count.clone(),
                 unique,
                 key,
                 window: m.window,
-                phase,
                 filter,
             });
         }
         out
     }
 
-    fn rules(&mut self) -> ([Vec<CompiledRule>; 4], Vec<RuleId>) {
-        let mut chains: [Vec<CompiledRule>; 4] = Default::default();
-        let mut ids = Vec::new();
+    fn rules(&mut self) -> Vec<CompiledRule> {
+        let mut out = Vec::new();
         let mut seen: HashMap<&str, usize> = HashMap::new();
-        let mut inspect_enabled = false;
-        let mut first_ws_rule: Option<(usize, RuleId)> = None;
         let input = self.input;
         for (i, rule) in input.rules.iter().enumerate() {
             let path = format!("rules[{i}]");
@@ -457,43 +772,50 @@ impl PolicyCompiler<'_, '_> {
                     ),
                 );
             }
-            let when = rule.when.as_ref().and_then(|w| {
-                self.expr(Some(&rid), format!("{path}.when"), w.as_str(), rule.phase)
-            });
-            let actions = self.actions(rule, &rid, &path);
-            if rule.phase == Phase::Request
-                && rule
-                    .then
-                    .0
-                    .iter()
-                    .any(|a| matches!(a, Action::Allow(AllowArgs { inspect: true, .. })))
-            {
-                inspect_enabled = true;
-            }
-            if rule.phase == Phase::Ws && first_ws_rule.is_none() {
-                first_ws_rule = Some((i, rid.clone()));
-            }
-            chains[phase_index(rule.phase)].push(CompiledRule {
-                id: rid.clone(),
+            let (when, needs) = match &rule.when {
+                Some(w) => match self.expr(Some(&rid), format!("{path}.when"), w.as_str()) {
+                    Some((p, n)) => (Some(p), n),
+                    None => (None, Needs::default()),
+                },
+                None => (None, Needs::default()),
+            };
+            let fields = needs.reads.minus(Reads::METRICS);
+            let metrics = needs.reads.minus(Reads::WATCHED_FIELDS);
+            let denies = rule.then.0.iter().any(|a| matches!(a, Action::Deny(_)));
+            let (kind, triggers, watches) = if !fields.is_empty() {
+                (RuleKind::Watching, needs.reads, needs.watched)
+            } else if denies && !metrics.is_empty() {
+                (RuleKind::HeadAndWatching, metrics, needs.watched)
+            } else {
+                (RuleKind::Head, Reads::NONE, Vec::new())
+            };
+            let rcx = RuleCx {
+                kind,
+                fields,
+                triggers,
+                watches: &watches,
+            };
+            let actions = self.actions(rule, &rid, &path, &rcx);
+            out.push(CompiledRule {
+                id: rid,
                 when,
                 actions: actions.into(),
+                kind,
+                fields,
+                triggers,
+                watches,
             });
-            ids.push(rid);
         }
-        if let Some((i, rid)) = first_ws_rule
-            && !inspect_enabled
-        {
-            self.push(
-                Some(&rid),
-                format!("rules[{i}].phase"),
-                "`ws`-phase rules can never run: no request rule enables message inspection \
-                 with `allow: { upgrade: websocket, inspect: true }` (DESIGN.md §8.2)",
-            );
-        }
-        (chains, ids)
+        out
     }
 
-    fn actions(&mut self, rule: &RuleConfig, rid: &RuleId, path: &str) -> Vec<CAction> {
+    fn actions(
+        &mut self,
+        rule: &RuleConfig,
+        rid: &RuleId,
+        path: &str,
+        rcx: &RuleCx<'_>,
+    ) -> Vec<CAction> {
         let actions = &rule.then.0;
         let mut out = Vec::with_capacity(actions.len());
         for (j, action) in actions.iter().enumerate() {
@@ -511,7 +833,7 @@ impl PolicyCompiler<'_, '_> {
                     ),
                 );
             }
-            if let Some(a) = self.action(rule.phase, action, rid, &apath) {
+            if let Some(a) = self.action(rcx, action, rid, &apath) {
                 out.extend(a);
             }
         }
@@ -522,25 +844,15 @@ impl PolicyCompiler<'_, '_> {
     #[allow(clippy::too_many_lines)]
     fn action(
         &mut self,
-        phase: Phase,
+        rcx: &RuleCx<'_>,
         action: &Action,
         rid: &RuleId,
         apath: &str,
     ) -> Option<Vec<CAction>> {
         let errors_before = self.d.len();
         let rule = Some(rid);
-        let allowed = allowed_phases(action);
-        if !allowed.contains(&phase) {
-            let names: Vec<&str> = allowed.iter().map(|p| p.as_str()).collect();
-            self.push(
-                rule,
-                apath,
-                format!(
-                    "`{}` is not allowed in the {phase} phase (allowed in: {})",
-                    action.name(),
-                    names.join(", ")
-                ),
-            );
+        if let Some(msg) = rcx.illegal(action) {
+            self.push(rule, apath, msg);
         }
         for s in non_header_strings(action) {
             if s.contains(SECRET_OPEN) {
@@ -560,22 +872,8 @@ impl PolicyCompiler<'_, '_> {
             Action::Allow(a) => {
                 let opts = AllowOpts {
                     upgrade_websocket: a.upgrade == Some(Upgrade::Websocket),
-                    inspect_ws: a.inspect,
                     private_ok: a.private_ok,
                 };
-                if opts != AllowOpts::default() && phase != Phase::Request {
-                    self.push(
-                        rule,
-                        apath,
-                        format!(
-                            "`allow` options (upgrade, inspect, private_ok) only apply in the \
-                             request phase (this rule is `{phase}`)"
-                        ),
-                    );
-                }
-                if a.inspect && a.upgrade.is_none() {
-                    self.push(rule, apath, "`inspect: true` requires `upgrade: websocket`");
-                }
                 vec![CAction::Terminal(Decision::Allow(opts))]
             }
             Action::Deny(DenyArgs {
@@ -596,7 +894,7 @@ impl PolicyCompiler<'_, '_> {
                     message: message
                         .clone()
                         .unwrap_or_else(|| DEFAULT_DENY_MESSAGE.into()),
-                    close: close.unwrap_or_else(|| Decision::default_close(phase)),
+                    close: close.unwrap_or(true),
                 })]
             }
             Action::Passthrough => {
@@ -616,7 +914,7 @@ impl PolicyCompiler<'_, '_> {
                     let Some(name) = self.header_name(rule, apath, name) else {
                         continue;
                     };
-                    if let Some(parts) = self.template(phase, rule, apath, &name, value) {
+                    if let Some(parts) = self.template(rcx, rule, apath, &name, value) {
                         v.push(match parts.as_slice() {
                             [] => CAction::Effect(Effect::SetHeader {
                                 name,
@@ -769,7 +1067,7 @@ impl PolicyCompiler<'_, '_> {
     /// Parse `${secret:name}` references out of a `set_header` value.
     fn template(
         &mut self,
-        phase: Phase,
+        rcx: &RuleCx<'_>,
         rule: Option<&RuleId>,
         apath: &str,
         header: &str,
@@ -824,13 +1122,15 @@ impl PolicyCompiler<'_, '_> {
         if !rest.is_empty() {
             parts.push(Part::Lit(rest.to_owned()));
         }
-        if parts.iter().any(|p| matches!(p, Part::Secret(_))) && phase != Phase::Request {
+        if parts.iter().any(|p| matches!(p, Part::Secret(_))) && rcx.kind == RuleKind::Watching
+        {
             self.push(
                 rule,
                 apath,
                 format!(
-                    "secret references are only allowed in request-phase rules (this rule is \
-                     `{phase}`)"
+                    "secret references are only allowed in rules decided at the request head \
+                     (they set request headers); this rule watches {}",
+                    rcx.watched()
                 ),
             );
             ok = false;
@@ -855,22 +1155,91 @@ impl PolicyCompiler<'_, '_> {
     }
 }
 
-/// Phases in which an action is valid (§6.3).
-fn allowed_phases(a: &Action) -> &'static [Phase] {
-    use Phase::{Connect, Request, Response, Ws};
-    match a {
-        Action::Allow(_)
-        | Action::Deny(_)
-        | Action::Tag(_)
-        | Action::Log(_)
-        | Action::SetState(_) => &Phase::ALL,
-        Action::Passthrough => &[Connect],
-        Action::SetHeader(_) | Action::RemoveHeader(_) | Action::Capture(_) => &[Request, Response],
-        Action::RewritePath(_)
-        | Action::SetQuery(_)
-        | Action::RemoveQuery(_)
-        | Action::Redirect(_) => &[Request],
-        Action::Call(_) => &[Request, Response, Ws],
+/// What the action-legality checks need to know about a rule (§6.3).
+struct RuleCx<'a> {
+    kind: RuleKind,
+    /// Watched fields the rule reads.
+    fields: Reads,
+    triggers: Reads,
+    watches: &'a [String],
+}
+
+impl RuleCx<'_> {
+    fn watched(&self) -> String {
+        self.watches
+            .iter()
+            .map(|n| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Why `a` is not allowed in this rule, if it is not.
+    ///
+    /// Head rules (including deny rules that also watch a byte metric) may
+    /// use every action; their header changes apply to the request. A rule
+    /// that reads a watched field runs after the request is on its way: it
+    /// cannot allow or change the request. Its `set_header` /
+    /// `remove_header` apply to the *response*, which is only possible when
+    /// everything that can re-check the rule is known before the response
+    /// head is sent (`response.status`, `response.header[..]`,
+    /// `response.body.size`, `response.body.text`).
+    fn illegal(&self, a: &Action) -> Option<String> {
+        if self.kind != RuleKind::Watching {
+            return None;
+        }
+        let why = || {
+            format!(
+                "this rule reads {}, which is known only after the request was forwarded \
+                 (DESIGN.md §6.1)",
+                self.watched()
+            )
+        };
+        match a {
+            Action::Allow(_) => Some(format!(
+                "`allow` is only possible in rules decided at the request head; {}. Write the \
+                 allow as a head rule and this rule as a `deny`",
+                why()
+            )),
+            Action::RewritePath(_)
+            | Action::SetQuery(_)
+            | Action::RemoveQuery(_)
+            | Action::Redirect(_) => Some(format!(
+                "`{}` changes the request, which is already on its way; {}",
+                a.name(),
+                why()
+            )),
+            Action::SetHeader(_) | Action::RemoveHeader(_) => {
+                if !self.fields.intersects(Reads::BEFORE_RESPONSE_SENT) {
+                    Some(format!(
+                        "`{}` in this rule would change the request, which is already on its \
+                         way; {}. (In a rule that reads response values it changes the \
+                         response.)",
+                        a.name(),
+                        why()
+                    ))
+                } else if !self.triggers.is_subset(Reads::BEFORE_RESPONSE_SENT) {
+                    Some(format!(
+                        "`{}` changes the response head, so every value the rule reads must be \
+                         known before the response head is sent; this rule also reads {}, which \
+                         can change after that",
+                        a.name(),
+                        self.triggers
+                            .minus(Reads::BEFORE_RESPONSE_SENT)
+                            .names()
+                            .join(", ")
+                    ))
+                } else {
+                    None
+                }
+            }
+            Action::Deny(_)
+            | Action::Passthrough
+            | Action::Tag(_)
+            | Action::Log(_)
+            | Action::SetState(_)
+            | Action::Capture(_)
+            | Action::Call(_) => None,
+        }
     }
 }
 

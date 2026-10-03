@@ -13,38 +13,31 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
-// ----- phases ---------------------------------------------------------------
+// ----- default decision ---------------------------------------------------
 
-/// Evaluation phase of a rule (§6.1). Each phase has its own rule chain.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
+/// What the request head gets when no head rule decides (§6.1): the
+/// top-level `default:` key.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Phase {
-    /// CONNECT / pre-TLS (§4.3).
-    Connect,
-    /// The request head (and optionally body). The default.
+pub enum DefaultDecision {
+    /// Deny 403 with `terminal_rule = "_default"`. The default.
     #[default]
-    Request,
-    /// The upstream response.
-    Response,
-    /// One WebSocket message on an inspected upgrade (§8.2).
-    Ws,
+    Deny,
+    /// Allow with `terminal_rule = "_default"`, granting no allow options
+    /// (no WebSocket upgrade, no private destinations).
+    Allow,
 }
 
-impl Phase {
-    /// Every phase, in pipeline order.
-    pub const ALL: [Phase; 4] = [Self::Connect, Self::Request, Self::Response, Self::Ws];
-
+impl DefaultDecision {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Connect => "connect",
-            Self::Request => "request",
-            Self::Response => "response",
-            Self::Ws => "ws",
+            Self::Deny => "deny",
+            Self::Allow => "allow",
         }
     }
 }
 
-impl fmt::Display for Phase {
+impl fmt::Display for DefaultDecision {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -91,18 +84,47 @@ impl<'de> Deserialize<'de> for Expr {
 
 // ----- rules ----------------------------------------------------------------
 
-/// One entry of `rules:`.
+/// One entry of `rules:`. Rules form one ordered list; when a rule runs
+/// follows from what it reads (§6.1), so there is no `phase` key.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawRule")]
 pub struct RuleConfig {
     pub id: String,
-    #[serde(default)]
-    pub phase: Phase,
     /// Match expression; absent = always matches.
-    #[serde(default)]
     pub when: Option<Expr>,
     /// Required: one action or a list of actions.
     pub then: Then,
+}
+
+/// Message for a rule that still sets the removed `phase` key.
+pub const PHASE_REMOVED: &str = "`phase` was removed: rules no longer have phases; each rule runs \
+     when the values it reads are known (head rules at the request head; rules that read \
+     body.bytes, response.* or ws.* watch the rest of the exchange; see DESIGN.md §6.1). Delete \
+     the `phase` key";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRule {
+    id: String,
+    #[serde(default)]
+    phase: Option<de::IgnoredAny>,
+    #[serde(default)]
+    when: Option<Expr>,
+    then: Then,
+}
+
+impl TryFrom<RawRule> for RuleConfig {
+    type Error = String;
+    fn try_from(r: RawRule) -> Result<Self, String> {
+        if r.phase.is_some() {
+            return Err(format!("rule {:?}: {PHASE_REMOVED}", r.id));
+        }
+        Ok(Self {
+            id: r.id,
+            when: r.when,
+            then: r.then,
+        })
+    }
 }
 
 /// A rule's `then`: one action or a list, normalised to a non-empty list.
@@ -112,11 +134,12 @@ pub struct Then(pub Vec<Action>);
 /// One action (§6.3). A closed enum, deliberately.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    /// Terminal. Bare `allow` or `allow: { upgrade, inspect, private_ok }`.
+    /// Terminal. Bare `allow` or `allow: { upgrade, private_ok }`.
     Allow(AllowArgs),
     /// Terminal. Bare `deny` or `deny: { status, message, close }`.
     Deny(DenyArgs),
-    /// Terminal; connect phase on transparent listeners only (deferred).
+    /// Terminal; reserved for transparent listeners (deferred), rejected by
+    /// the compiler.
     Passthrough,
     /// `set_header: { name: value, ... }`, in YAML order.
     SetHeader(Vec<(String, String)>),
@@ -181,7 +204,7 @@ impl Action {
         }
     }
 
-    /// Whether this action ends evaluation of the chain.
+    /// Whether this action is terminal (decides the rule's outcome).
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Allow(_) | Self::Deny(_) | Self::Passthrough)
     }
@@ -194,9 +217,6 @@ pub struct AllowArgs {
     /// Permit an Upgrade (§8). Only `websocket` exists.
     #[serde(default)]
     pub upgrade: Option<Upgrade>,
-    /// Route WebSocket messages through the `ws` phase (§8.2).
-    #[serde(default)]
-    pub inspect: bool,
     /// Permit private / loopback upstream addresses for this flow (§7).
     #[serde(default)]
     pub private_ok: bool,
@@ -219,9 +239,9 @@ pub struct DenyArgs {
     /// Response message; default `blocked by roxy`.
     #[serde(default)]
     pub message: Option<String>,
-    /// Close the connection after the deny (connect, request, response;
-    /// default `true`) or close the socket instead of dropping the message
-    /// (ws; default `false`). Absent = the phase default.
+    /// Close the connection after the deny response (default `true`). A
+    /// deny that stops an exchange whose response has started always closes
+    /// the connection (h1) or resets the stream (h2).
     #[serde(default)]
     pub close: Option<bool>,
 }
@@ -547,13 +567,10 @@ pub enum MetricCount {
 }
 
 impl MetricCount {
-    /// The phase in which the counted thing is known, and so the phase the
-    /// metric's `where` filter is type-checked against.
-    pub fn phase(&self) -> Phase {
-        match self {
-            Self::Requests | Self::RequestBytes | Self::Denied | Self::Unique(_) => Phase::Request,
-            Self::ResponseBytes | Self::Errors => Phase::Response,
-        }
+    /// Whether this metric grows as bytes stream (and so is *watched* by deny
+    /// rules that read it, §6.4).
+    pub fn counts_bytes(&self) -> bool {
+        matches!(self, Self::RequestBytes | Self::ResponseBytes)
     }
 }
 
@@ -619,7 +636,7 @@ mod tests {
     fn every_map_action_parses() {
         let actions = then(
             r#"
-- allow: { upgrade: websocket, inspect: true, private_ok: true }
+- allow: { upgrade: websocket, private_ok: true }
 - deny: { status: 451, message: "no", close: true }
 - set_header: { authorization: "Bearer ${secret:x}", x-b: "2" }
 - remove_header: [x-debug, x-other]
@@ -702,6 +719,7 @@ mod tests {
             ("{ capture: everything }", "then.capture"),
             ("{ passthrough: 1 }", "takes no argument"),
             ("{ allow: { upgrade: h2c } }", "then.allow"),
+            ("{ allow: { inspect: true } }", "then.allow"),
             (
                 "[allow, { log: { level: loud, message: x } }]",
                 "then[1].log",
@@ -714,10 +732,30 @@ mod tests {
     }
 
     #[test]
+    fn phase_key_is_rejected_with_a_pointer() {
+        let err = serde_yaml_ng::from_str::<Vec<RuleConfig>>(
+            "- { id: r, phase: response, then: deny }",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`phase` was removed"), "{err}");
+        assert!(err.contains("§6.1"), "{err}");
+        let ok: Vec<RuleConfig> =
+            serde_yaml_ng::from_str("- { id: r, when: 'body.bytes > 1', then: deny }").unwrap();
+        assert_eq!(ok[0].id, "r");
+        let unknown =
+            serde_yaml_ng::from_str::<Vec<RuleConfig>>("- { id: r, bogus: 1, then: deny }")
+                .unwrap_err()
+                .to_string();
+        assert!(unknown.contains("bogus"), "{unknown}");
+    }
+
+    #[test]
     fn metric_count() {
         let c: MetricCount = serde_yaml_ng::from_str("unique(host)").unwrap();
         assert_eq!(c, MetricCount::Unique("host".into()));
         assert!(serde_yaml_ng::from_str::<MetricCount>("unique()").is_err());
-        assert_eq!(MetricCount::ResponseBytes.phase(), Phase::Response);
+        assert!(MetricCount::ResponseBytes.counts_bytes());
+        assert!(!MetricCount::Requests.counts_bytes());
     }
 }
