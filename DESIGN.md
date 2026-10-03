@@ -1070,8 +1070,12 @@ Typical patterns:
   they arrive, but hold back `tool_use` blocks until the layer has judged
   them. Envoy's buffered/streamed processing modes cannot express this; a
   streaming layer can.
-- **Transform via a helper:** pipe the body into a named endpoint (§11.3)
-  and pipe its response into `next`.
+- **Stream through an external transformer:** send the request head and
+  body bytes to another service as they arrive, which may mutate them and
+  streams the result back, then pass that on down; do the same with the
+  response head and body on the way back up. This is a first-class use case
+  and is exactly what a streaming remote layer is (§11.6); a wasm layer can
+  do the same by piping into a named endpoint.
 - **Deny or synthesise:** return a response without calling `next`.
 
 roxy stays protocol-agnostic. It knows HTTP, not model APIs: parsing
@@ -1247,34 +1251,58 @@ ratchet the sentinel design warns about.
 - No filesystem, sockets or environment inside the sandbox; all I/O is
   `next`, `endpoints` and `flow`.
 
-### 11.6 Remote layers (sidecar)
+### 11.6 Remote layers (external services)
 
-The sentinel design's quickest deployment is a Python service beside the
-proxy, the role Envoy's `ext_proc` plays. A `kind: remote` layer gives roxy
-that shape natively, with no WASM toolchain:
+A `kind: remote` layer is an external service in the stack. Its primary use
+is to **stream** the exchange through a service that may mutate it: the
+request head and body go to the service as they arrive, and the service
+streams the (possibly changed) request back, which roxy passes down; on the
+way back up the same happens with the response. This also covers the
+sentinel design's sidecar deployment, Python with any dependencies, and any
+other out-of-process logic, with no WASM toolchain.
 
 ```yaml
 addons:
-  - name: sentinel
+  - name: transformer
     kind: remote
-    endpoint: sentinel-sidecar          # a named endpoint, as in §11.3
-    phases: [request, response]
-    buffer: true                        # v1: whole bodies, up to max_buffered_body_bytes
-    mode: enforce
+    endpoint: transformer-svc           # a named endpoint, as in §11.3
+    directions: [request, response]     # which streams go through the service
+    mode: enforce                       # enforce | observe
+    limits:
+      max_exchange_time: 60s
+      first_byte_timeout: 2s            # service must start answering this fast
 ```
 
-Protocol, one HTTP POST per phase to the endpoint, JSON envelope plus body:
+**Wire format: `message/http`.** For each direction roxy opens one call to
+the endpoint over HTTP/2 (so both sides can stream at once) with
+`content-type: message/http`. The request body roxy sends is the canonical
+HTTP/1.1 message in transit, head then body bytes, written as they arrive.
+The service answers `200` with `content-type: message/http` and streams back
+the message it wants forwarded, again head first and body as it goes. It may
+pass bytes through untouched, rewrite them, or emit something different.
 
-- **request phase** → `{continue}` | `{modify: {head?, body?}}` |
-  `{respond: {status, headers, body}}` | `{deny: {status, message}}` |
-  `{terminate: {scope, reason}}`.
-- **response phase** → the same set, applied to the response.
+- **Everything the service returns is re-parsed by roxy's strict codec**
+  (§5), so a service cannot introduce smuggling or framing ambiguity, and
+  its output is then subject to the same limits and, for layers above
+  `rules`, the rules.
+- **Head first.** roxy forwards nothing downstream until the service has
+  returned a complete head, bounded by `first_byte_timeout`. Body bytes then
+  flow with backpressure in both directions.
+- **Decisions without a message.** Instead of a `message/http` reply, the
+  service may answer with `content-type: application/roxy-decision+json`:
+  `{deny: {status, message}}`, `{respond: {status, headers, body}}`, or
+  `{terminate: {scope, reason}}`. For a response-direction call, `deny` and
+  `respond` replace the response the client gets.
+- **Metadata** (flow id, principal, tags, direction) travels in
+  `roxy-flow-*` request headers on the call, so the service can key state.
+- **Failure is closed** in enforce mode: a non-`200`, an unparseable
+  message, a timeout, or a dropped stream denies the flow (or closes it if
+  the response head is already out). In observe mode the service gets a copy
+  and its failures are logged only.
 
-The envelope carries the flow id, principal and tags, so the sidecar can key
-its state. A streaming variant (chunk frames over HTTP/2) can follow; v1 is
-buffered, which is what the sentinel design's monitors assume. The sidecar
-runs with whatever Python dependencies it likes; roxy still enforces the
-endpoint timeout, the budgets, and fail-closed behaviour in enforce mode.
+The call goes straight to the connector like any endpoint call, so it never
+passes through other layers or the rules. A service that only needs to
+inspect, not mutate, can buffer on its side; roxy never buffers for it.
 
 ### 11.7 Sentinel substrate: mapping
 
@@ -1301,7 +1329,7 @@ be built on roxy without roxy knowing anything about model APIs.
 | recursion guard for monitor inference | endpoint calls bypass the layer stack |
 | never hang the request | `max_exchange_time`, immediate deny responses |
 | fail open or closed when the processor is down | closed in enforce mode; observe mode for monitors whose failure must not block |
-| sidecar deployment | `kind: remote` layer (§11.6) |
+| sidecar deployment | `kind: remote` layer, streaming `message/http` (§11.6) |
 | embedded CPython in WASM | `kind: wasm` with raised memory/time budgets and instance recycling |
 | observe-only default for uncalibrated scores | `mode: observe` (tee) |
 
@@ -1332,8 +1360,8 @@ Other languages:
   milliseconds to instantiate, pure-Python dependencies only. Viable for a
   sentinel whose cost is dominated by model inference anyway; give it the
   raised budgets above.
-- **Python with native dependencies** runs as a remote layer (§11.6) or
-  behind a named endpoint called from a thin Rust layer.
+- **Python with native dependencies**, or anything else out of process,
+  runs as a remote layer (§11.6).
 
 `examples/addons/` ships a Rust pass-through, a Rust streaming redactor, a
 Rust layer that withholds `tool_use` blocks in a streamed response until a
