@@ -1,12 +1,11 @@
 //! The [`LayerHost`] each layer of an exchange talks to (§11.3).
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use roxy_wasm::{
     EndpointError, FlowInfo, HostError, LayerHost, LayerRequest, LayerResponse, LogLevel,
-    Principal, TerminateScope, async_trait,
+    Principal, async_trait,
 };
 
 use super::{AddonSpec, StackFlow, endpoint};
@@ -106,60 +105,6 @@ impl LayerHost for StackHost {
             tokio::spawn(async move { endpoint::notify(&st, &addon, &name, body).await });
         }
         Ok(())
-    }
-
-    async fn terminate(
-        &self,
-        scope: TerminateScope,
-        reason: String,
-        ttl_ms: Option<u64>,
-    ) -> Result<bool, HostError> {
-        if self.observer.is_some() {
-            tracing::info!(layer = self.addon().name, flow = %self.st.flow, reason, "observe-mode layer asked to terminate; ignored");
-            return Ok(false);
-        }
-        let addon = self.addon().clone();
-        let principal = self.st.principal_key();
-        let ttl = ttl_ms.map(Duration::from_millis);
-        let took = match scope {
-            TerminateScope::Connection => {
-                self.st.close.store(true, Ordering::Relaxed);
-                true
-            }
-            TerminateScope::Principal => self.st.shared.quarantine.add(&principal, ttl, &reason),
-        };
-        if scope == TerminateScope::Connection {
-            tracing::info!(layer = addon.name, flow = %self.st.flow, reason, "layer closes the connection");
-            self.st.add_tag(format!("terminated:{}", addon.name));
-        } else {
-            let ttl = ttl.unwrap_or(super::store::MAX_QUARANTINE);
-            self.st.shared.sink.emit(&FlowEvent::Quarantined {
-                ts: chrono::Utc::now(),
-                flow: self.st.flow.to_string(),
-                conn: self.st.client.id.to_string(),
-                layer: addon.name.clone(),
-                principal: principal.clone(),
-                reason: reason.clone(),
-                ttl_ms: u64::try_from(ttl.min(super::store::MAX_QUARANTINE).as_millis())
-                    .unwrap_or(u64::MAX),
-                took_effect: took,
-            });
-        }
-        if took
-            && scope == TerminateScope::Principal
-            && let Some(name) = addon.terminate_endpoint.clone()
-        {
-            let st = self.st.clone();
-            let body = serde_json::json!({
-                "principal": principal,
-                "reason": reason,
-                "ttl_ms": ttl_ms,
-                "flow": st.flow.to_string(),
-                "layer": addon.name,
-            });
-            tokio::spawn(async move { endpoint::notify(&st, &addon, &name, body).await });
-        }
-        Ok(took)
     }
 
     async fn state_get(&self, key: String) -> Result<Option<String>, HostError> {

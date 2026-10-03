@@ -40,7 +40,6 @@ fn capabilities(caps: &[Capability]) -> Capabilities {
             Capability::Endpoints => Some(WasmCap::Endpoints),
             Capability::State => Some(WasmCap::State),
             Capability::Record => Some(WasmCap::Record),
-            Capability::Terminate => Some(WasmCap::Terminate),
             Capability::Metrics => Some(WasmCap::Metrics),
             Capability::Log => Some(WasmCap::Log),
             // Refused by validation.
@@ -191,7 +190,6 @@ impl AddonLoader {
                 endpoints: endpoints(a)?,
                 state: state_limits(a),
                 audit_endpoint: a.audit_endpoint.clone(),
-                terminate_endpoint: a.terminate_endpoint.clone(),
             }));
         }
         let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);

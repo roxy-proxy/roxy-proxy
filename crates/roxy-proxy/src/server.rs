@@ -108,8 +108,6 @@ pub(crate) struct Shared {
     pub enable_h2: bool,
     pub connection_events: bool,
     pub pipeline: Pipeline,
-    /// Principals an addon quarantined (§11.3); survives reloads.
-    pub quarantine: crate::addons::store::Quarantine,
     /// Each addon's keyed store, by addon name; survives reloads.
     pub layer_state: crate::addons::store::LayerStates,
     caps: Arc<ConnCaps>,
@@ -272,7 +270,6 @@ impl Server {
             enable_h2: cfg.enable_h2,
             connection_events: cfg.connection_events,
             pipeline: Pipeline::builtin(),
-            quarantine: crate::addons::store::Quarantine::default(),
             layer_state: crate::addons::store::LayerStates::default(),
             caps: Arc::new(ConnCaps {
                 max: cfg.max_connections.max(1),

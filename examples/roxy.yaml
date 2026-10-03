@@ -164,7 +164,7 @@ addons:
     path: /etc/roxy/addons/redact.wasm
     mode: enforce                # enforce (failures fail closed) | observe (tee, log only)
     config: { needles: ["sk-live-"], replacement: "[redacted]" }
-    capabilities: [log]          # endpoints, state, record, terminate, metrics, log
+    capabilities: [log]          # endpoints, state, record, metrics, log
     limits:                      # each optional
       max_memory: 64mb
       max_buffered_body_bytes: 1mb   # default: limits.max_inspect_body_bytes

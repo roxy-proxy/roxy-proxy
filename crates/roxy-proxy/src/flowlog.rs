@@ -223,18 +223,6 @@ pub enum FlowEvent {
         duration_ms: u64,
         error: Option<String>,
     },
-    /// An addon quarantined the flow's principal (§11.3 `terminate`).
-    Quarantined {
-        #[serde(serialize_with = "ser_ts")]
-        ts: DateTime<Utc>,
-        flow: String,
-        conn: String,
-        layer: String,
-        principal: String,
-        reason: String,
-        ttl_ms: u64,
-        took_effect: bool,
-    },
     /// An observe-mode addon fell behind; its copy of the stream was cut
     /// (the real traffic was not delayed).
     ObserverLagged {

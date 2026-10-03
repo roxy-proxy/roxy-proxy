@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::bindings::roxy::addon::flow as raw;
 
-pub use raw::{FlowInfo, LogLevel, Principal, Scope};
+pub use raw::{FlowInfo, LogLevel, Principal};
 
 fn ttl_ms(ttl: Option<Duration>) -> Option<u64> {
     ttl.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -48,12 +48,6 @@ pub fn log(level: LogLevel, msg: &str) {
 /// if the log is behind; records are never dropped.
 pub fn record(kind: &str, json: &str, audit: bool) {
     raw::record(kind, json, audit);
-}
-
-/// Closes the connection or quarantines the principal (capability
-/// `terminate`). Returns whether it took effect.
-pub fn terminate(scope: Scope, reason: &str, ttl: Option<Duration>) -> bool {
-    raw::terminate(scope, reason, ttl_ms(ttl))
 }
 
 /// Reads a JSON value from the layer's keyed store (capability `state`).

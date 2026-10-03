@@ -45,15 +45,6 @@ pub struct FlowInfo {
     pub tags: Vec<String>,
 }
 
-/// What `flow.terminate` ends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerminateScope {
-    /// The client connection this flow arrived on.
-    Connection,
-    /// The principal: quarantined until the TTL expires.
-    Principal,
-}
-
 /// `flow.log` levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
@@ -149,15 +140,6 @@ pub trait LayerHost: Send + Sync + 'static {
     /// `json` is what the guest passed; the host validates it. Must not
     /// drop the record: wait if the log is behind, or fail.
     async fn record(&self, kind: String, json: String, audit: bool) -> Result<(), HostError>;
-
-    /// Terminate out of band (capability `terminate`). Returns whether it
-    /// took effect.
-    async fn terminate(
-        &self,
-        scope: TerminateScope,
-        reason: String,
-        ttl_ms: Option<u64>,
-    ) -> Result<bool, HostError>;
 
     /// Read the layer's keyed store (capability `state`).
     async fn state_get(&self, key: String) -> Result<Option<String>, HostError>;

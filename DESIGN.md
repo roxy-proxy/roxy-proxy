@@ -1059,7 +1059,7 @@ that decided (`_default`, `_fail_closed`, `_address_policy` for built-in
 decisions) and `reason` a stable code when it failed closed.
 
 Event types: `connect`, `request`, `response_error`, `ws_message` (sampled or
-denied only, configurable), `parse_error`, `upstream_error`, `layer_error`, `layer_record`, `endpoint_call`, `quarantined`,
+denied only, configurable), `parse_error`, `upstream_error`, `layer_error`, `layer_record`, `endpoint_call`,
 `config_reloaded`, `config_reload_failed`, `passthrough`.
 
 **Redaction:** every injected secret value is registered with a `Redactor`
@@ -1185,7 +1185,6 @@ the request is the last to see the response.
 ```
                  request ↓                                   ↑ response
  fixed   ┌─ CONNECT gate (proxy auth, SNI must match) ───────────────────┐
- fixed   ├─ quarantine gate (§11.3 terminate)                            │
  config  ├─ addon: sentinel        (wasm | service, enforce | observe)    │
  config  ├─ addon: redactor                                              │
  fixed   ├─ rules                  (request ↓ / response ↑)              │
@@ -1280,7 +1279,7 @@ Anthropic or OpenAI payloads into conversation steps is the layer's job.
 **In the proxy.** Both fronts (h1 and h2) share one exchange core, and
 the stack sits in it.
 
-- **Order.** The quarantine gate runs, then the addons, outermost first.
+- **Order.** The addons run outermost first.
   The front drives the client's request body into the first layer. The
   last layer's `next` runs the ordinary core on what it passed on: request
   stages (the rules), the upstream, then response stages.
@@ -1322,9 +1321,8 @@ addons:                               # above the rules, in this order
     kind: wasm                        # wasm | service
     path: /etc/roxy/addons/sentinel.wasm
     mode: enforce                     # enforce | observe
-    capabilities: [state, record, endpoints, terminate]   # also: metrics, log
+    capabilities: [state, record, endpoints]   # also: metrics, log
     audit_endpoint: audit-sink        # also gets record(.., audit: true) (one of `endpoints`)
-    terminate_endpoint: orchestrator  # notified when the layer quarantines a principal
     endpoints:                        # named, not URLs (§11.3)
       monitor-model:
         url: https://api.anthropic.com/v1/messages
@@ -1401,25 +1399,12 @@ that is not granted fails immediately.
   `audit: true` also POSTs it to the layer's `audit_endpoint`. This is the sentinel `Recorder`: observations,
   decisions, failures and escalations land in the same JSONL stream as
   roxy's own events.
-- **`terminate` (out-of-band).** `flow.terminate(scope, reason, ttl)` with
-  scope `connection` or `principal`.
-  - `connection` closes the client connection after this exchange (h1).
-  - `principal` adds the client's identity (`user:<proxy-auth user>`, else
-    `ip:<client IP>`) to the quarantine set, so the fixed quarantine gate
-    denies every later request from it with rule `_quarantined`. It also
-    emits a `quarantined` event and POSTs to the layer's
-    `terminate_endpoint`, if one is set (an orchestrator that can stop the
-    agent).
-  - A quarantine lasts its TTL, capped and defaulting at 24 hours. It is
-    cleared only by expiry or a restart: a reload keeps it, and no addon
-    can lift it. There is no operator command yet. Clearing it on a
-    reachable endpoint would hand an agent a way to clear its own
-    quarantine, so that waits for an admin interface separate from the
-    proxy port.
-  - Returns whether it took effect. In observe mode it is ignored and
-    returns false. This
-  answers the sentinel design's "what owns the lifecycle a proxy's terminate
-  reaches": roxy does, locally, and can also tell whoever owns the agent.
+- **No `terminate` yet.** An out-of-band "stop this client" (close the
+  connection, quarantine the principal) was removed pending a design
+  (issue #28): process-local state does not survive a restart, there is no
+  safe way to clear it, and the client's lifecycle belongs to whatever runs
+  it. Meanwhile a layer denies the exchange and reports through `record`
+  or an endpoint.
 - **`metrics` (read-only)** of the `metrics:` definitions: `metric-get(id,
   [])` returns the metric for this flow's own key (the key fields of the
   metric definition, evaluated on the client's request). Explicit key
@@ -1461,14 +1446,12 @@ interface flow {
                      listener: string, tls-sni: option<string> }
   record flow-info { flow-id: string, conn-id: string, principal: principal,
                      tags: list<string> }
-  enum scope { connection, principal }
   enum log-level { trace, debug, info, warn, error }
   current: func() -> flow-info;                       // always available
   add-tag: func(tag: string);                         // always available
   config: func() -> string;                           // always available; JSON
   log: func(level: log-level, msg: string);           // capability `log`
   %record: func(kind: string, json: string, audit: bool);                 // `record`
-  terminate: func(scope: scope, reason: string, ttl-ms: option<u64>) -> bool;  // `terminate`
   state-get: func(key: string) -> option<string>;                         // `state`
   state-put: func(key: string, json: string, ttl-ms: option<u64>) -> result<_, string>;
   metric-get: func(id: string, key: list<string>) -> option<s64>;         // `metrics`
@@ -1536,7 +1519,7 @@ world tunnel-layer {
 
 **Host interface.** The proxy implements `roxy_wasm::LayerHost`, one value
 per exchange (`next`, `endpoint_call`, `flow_info`, `add_tag`, `log`,
-`record`, `terminate`, `state_get` / `state_put`, `metric_get`; all async
+`record`, `state_get` / `state_put`, `metric_get`; all async
 except the cheap ones). Requests and responses crossing it are
 `http::Request` / `http::Response` over `roxy_http::Body`, so both
 directions stream. roxy-wasm checks capabilities before calling the host and
@@ -1648,8 +1631,7 @@ pass bytes through untouched, rewrite them, or emit something different.
   flow with backpressure in both directions.
 - **Decisions without a message.** Instead of a `message/http` reply, the
   service may answer with `content-type: application/roxy-decision+json`:
-  `{deny: {status, message}}`, `{respond: {status, headers, body}}`, or
-  `{terminate: {scope, reason}}`. For a response-direction call, `deny` and
+  `{deny: {status, message}}` or `{respond: {status, headers, body}}`. For a response-direction call, `deny` and
   `respond` replace the response the client gets.
 - **Metadata** (flow id, principal, tags, direction) travels in
   `roxy-flow-*` request headers on the call, so the service can key state.
@@ -1676,7 +1658,7 @@ be built on roxy without roxy knowing anything about model APIs.
 | `continue` / `modify` | pass through / rewrite the stream |
 | `reject` | rewrite the response so the scaffold sees the rejection (e.g. a synthetic tool result or refusal); the scaffold regenerates. roxy never replays |
 | error response | return a synthetic response |
-| `terminate` | `flow.terminate` → quarantine gate, optional `terminate_endpoint` |
+| `terminate` | not yet: removed pending a design (issue #28). A layer can deny, and report through `record` or an endpoint to whatever owns the agent |
 | `escalate` | the sentinel's own composition; roxy sees only the final action |
 | `audit` / `Recorder` | `flow.record(..., audit: true)` into the flow log and `audit_endpoint` |
 | `host.generate` with another model | named endpoint for the monitor model |

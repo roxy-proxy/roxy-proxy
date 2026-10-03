@@ -338,7 +338,7 @@ async fn capabilities_gate_host_services() {
     let rt = runtime();
     // Each gated call, the capability it needs, and what it returns once
     // granted.
-    let cases: [(&str, Capability, &str, &str); 7] = [
+    let cases: [(&str, Capability, &str, &str); 6] = [
         (
             "log",
             Capability::Log,
@@ -350,12 +350,6 @@ async fn capabilities_gate_host_services() {
             Capability::Record,
             "ok",
             "record verdict {\"score\":0.9} true",
-        ),
-        (
-            "terminate",
-            Capability::Terminate,
-            "true",
-            "terminate Principal bad actor Some(1000)",
         ),
         (
             "state",

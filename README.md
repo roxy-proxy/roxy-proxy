@@ -119,8 +119,7 @@ sits above the rules in every exchange and owns both streams. An addon can:
 - deny, or answer directly;
 - call named endpoints (a classifier, a model, an internal API) with
   credentials roxy attaches and the addon never sees;
-- keep per-principal state, record structured audit events, and
-  quarantine a client.
+- keep per-principal state and record structured audit events.
 
 Addons stack in the order configured, and run in one of two modes:
 `enforce` (in the path) or `observe` (gets a copy, cannot affect traffic).
@@ -131,7 +130,7 @@ sit below every addon, next to the network:
 sequenceDiagram
     autonumber
     participant C as client
-    participant G as gates<br/>(CONNECT, quarantine)
+    participant G as CONNECT gate
     participant A as addons<br/>(in config order)
     participant R as rules
     participant U as upstream
@@ -452,7 +451,7 @@ Usable in explicit proxy mode. Built and tested:
 - A hardened container image (`ghcr.io/roxy-proxy/roxy`, see "Container image").
 - WASM addons (§11): the layer stack in front of the rules, in enforce or
   observe mode, with named endpoints, keyed state, audit records,
-  quarantine, CPU/memory/time budgets, and WebSocket tunnels. Write them
+  CPU/memory/time budgets, and WebSocket tunnels. Write them
   with the [`roxy-addon`](crates/roxy-addon) SDK.
 
 Deferred, with designs in DESIGN.md:

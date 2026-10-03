@@ -4,8 +4,6 @@
 
 mod support;
 
-use std::time::Duration;
-
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::Value;
 use support::{Harness, Opts, SECRET, h2_get};
@@ -306,34 +304,6 @@ async fn endpoints_respect_the_address_floor() {
     let calls = h.wait_events("endpoint_call", 1).await;
     assert_eq!(calls[0]["status"], Value::Null);
     assert_eq!(calls[0]["error"], "endpoint address denied");
-    h.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn terminate_quarantines_the_principal() {
-    let h = start("capabilities: [terminate]", ALLOW_UPSTREAM).await;
-    let res = h
-        .client()
-        .post(h.https_url("/x"))
-        .header("x-test", "caps")
-        .header("x-cap", "terminate")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.text().await.unwrap(), "true");
-    let q = h.wait_events("quarantined", 1).await;
-    assert_eq!(q[0]["layer"], "t");
-    assert_eq!(q[0]["principal"], "ip:127.0.0.1");
-
-    // Every later request from the principal is denied by the gate, before
-    // any layer runs...
-    let res = h.client().get(h.https_url("/after")).send().await.unwrap();
-    assert_eq!(res.status(), 403);
-    assert_eq!(res.headers()["x-roxy-rule"], "_quarantined");
-    // ...until the TTL (1s in the test layer) expires.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    let res = h.client().get(h.https_url("/after")).send().await.unwrap();
-    assert_eq!(res.status(), 200);
     h.stop().await;
 }
 

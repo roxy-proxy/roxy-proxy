@@ -1,7 +1,7 @@
 //! The addon layer stack (DESIGN.md §11.1).
 //!
 //! ```text
-//!   front ─▶ quarantine gate ─▶ addon 0 ─▶ … ─▶ addon n-1 ─▶ core (rules ↓ / ↑, address floor, connector)
+//!   front ─▶ addon 0 ─▶ … ─▶ addon n-1 ─▶ core (rules ↓ / ↑, address floor, connector)
 //! ```
 //!
 //! The front (h1 codec or h2 stream) drives the client's request body into
@@ -59,8 +59,6 @@ pub struct AddonSpec {
     pub state: StateLimits,
     /// Endpoint that also receives `record(.., audit: true)` events.
     pub audit_endpoint: Option<String>,
-    /// Endpoint notified when the addon quarantines a principal.
-    pub terminate_endpoint: Option<String>,
 }
 
 impl std::fmt::Debug for AddonSpec {
@@ -163,11 +161,6 @@ impl StackFlow {
         }
     }
 
-    /// The key the quarantine set uses for this flow's client.
-    pub(crate) fn principal_key(&self) -> String {
-        principal_key(&self.client)
-    }
-
     fn fail(&self, layer: &str, err: LayerError) {
         let mut f = self.failure.lock().unwrap_or_else(PoisonError::into_inner);
         if f.is_none() {
@@ -252,15 +245,6 @@ impl StackFlow {
     }
 }
 
-/// The key the quarantine set uses: the proxy-auth user if there is one,
-/// else the client IP.
-pub(crate) fn principal_key(c: &ClientConn) -> String {
-    match &c.user {
-        Some(u) => format!("user:{u}"),
-        None => format!("ip:{}", crate::addr::canonical(c.peer.ip())),
-    }
-}
-
 /// A stable code for a layer failure, for the flow log.
 fn error_kind(e: &LayerError) -> String {
     match e {
@@ -308,17 +292,6 @@ fn layer_refusal(layer: &str) -> Refusal {
         close: true,
         reason: Some("layer_error".to_owned()),
     }
-}
-
-/// The quarantine gate (§11.1): runs before any addon sees bytes.
-pub(crate) fn quarantine_gate(cx: &FlowCx) -> Option<Refusal> {
-    let key = principal_key(&cx.facts.client);
-    let reason = cx.shared.quarantine.check(&key)?;
-    tracing::debug!(flow = %cx.flow, principal = key, reason, "quarantined principal");
-    Some(Refusal {
-        reason: Some("quarantined".to_owned()),
-        ..Refusal::deny(403, "quarantined", "_quarantined", true)
-    })
 }
 
 /// Runs the exchange through the addon stack.

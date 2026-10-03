@@ -182,10 +182,6 @@ fn call_capability(req: &IncomingRequest) -> String {
             flow::record("verdict", "{\"score\":0.9}", true);
             "ok".to_owned()
         }
-        "terminate" => format!(
-            "{}",
-            flow::terminate(flow::Scope::Principal, "bad actor", Some(1000))
-        ),
         "state" => {
             let put = flow::state_put("k", "{\"n\":1}", None);
             let got = flow::state_get("k");

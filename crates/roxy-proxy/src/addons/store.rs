@@ -1,64 +1,11 @@
-//! Process-wide addon state that outlives a reload: the quarantine set
-//! (§11.3 `terminate`) and each addon's keyed store (§11.3 `state`).
+//! Process-wide addon state that outlives a reload: each addon's keyed
+//! store (§11.3 `state`).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::StateLimits;
-
-/// Principals an addon quarantined. The quarantine gate denies their
-/// requests with rule `_quarantined` until the entry expires. Entries are
-/// cleared only by their TTL (or a restart): an addon cannot lift one, and
-/// a reload does not.
-#[derive(Debug, Default)]
-pub(crate) struct Quarantine {
-    entries: Mutex<HashMap<String, (Instant, String)>>,
-}
-
-/// Longest quarantine an addon may set, and the one it gets without a TTL.
-pub(crate) const MAX_QUARANTINE: Duration = Duration::from_hours(24);
-/// Most quarantined principals at once. Past this, `terminate` reports
-/// that it did not take effect.
-const MAX_QUARANTINED: usize = 100_000;
-
-impl Quarantine {
-    /// Quarantines `principal` for `ttl` (capped at a day). Returns whether
-    /// it took effect.
-    pub(crate) fn add(&self, principal: &str, ttl: Option<Duration>, reason: &str) -> bool {
-        let ttl = ttl.unwrap_or(MAX_QUARANTINE).min(MAX_QUARANTINE);
-        let now = Instant::now();
-        let mut g = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        if g.len() >= MAX_QUARANTINED && !g.contains_key(principal) {
-            g.retain(|_, (until, _)| *until > now);
-            if g.len() >= MAX_QUARANTINED {
-                return false;
-            }
-        }
-        let until = now + ttl;
-        let e = g
-            .entry(principal.to_owned())
-            .or_insert((until, reason.to_owned()));
-        if e.0 < until {
-            *e = (until, reason.to_owned());
-        }
-        true
-    }
-
-    /// The reason `principal` is quarantined, if it is.
-    pub(crate) fn check(&self, principal: &str) -> Option<String> {
-        let now = Instant::now();
-        let mut g = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        match g.get(principal) {
-            Some((until, reason)) if *until > now => Some(reason.clone()),
-            Some(_) => {
-                g.remove(principal);
-                None
-            }
-            None => None,
-        }
-    }
-}
 
 /// One addon's keyed store: JSON values with a TTL, an entry cap and a
 /// value cap. Nothing is evicted early: a write when full fails.
@@ -123,18 +70,6 @@ impl LayerStates {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn quarantine_expires_and_extends() {
-        let q = Quarantine::default();
-        assert!(q.check("ip:1").is_none());
-        assert!(q.add("ip:1", Some(Duration::from_millis(30)), "bad"));
-        assert_eq!(q.check("ip:1").as_deref(), Some("bad"));
-        // A shorter TTL does not shorten it.
-        assert!(q.add("ip:1", Some(Duration::from_millis(1)), "again"));
-        std::thread::sleep(Duration::from_millis(40));
-        assert!(q.check("ip:1").is_none());
-    }
 
     #[test]
     fn state_caps_without_eviction() {

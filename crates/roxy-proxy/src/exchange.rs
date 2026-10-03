@@ -210,10 +210,6 @@ pub(crate) async fn process<F: Front>(
     // Audit backpressure (§10.1): an exchange starts only while the flow
     // log keeps up.
     crate::flowlog::sink_ready(&*cx.shared.sink).await;
-    // The fixed quarantine gate runs before any addon sees bytes (§11.1).
-    if let Some(refusal) = crate::addons::quarantine_gate(cx) {
-        return Outcome::Refuse(refusal);
-    }
     if cx.snap.addons.is_empty() {
         core(front, cx, req).await
     } else {

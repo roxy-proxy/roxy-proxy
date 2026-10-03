@@ -90,7 +90,6 @@ logic of a layer can be unit-tested natively.
   config:
   - `record` writes structured audit events to the flow log;
   - `state_get` and `state_put` read and write a keyed store with TTLs;
-  - `terminate` closes the connection or quarantines the principal;
   - `metric_get` reads a metric;
   - `log` writes to roxy's operational log.
 - **Named endpoints.** [`call_endpoint`] calls an endpoint configured in

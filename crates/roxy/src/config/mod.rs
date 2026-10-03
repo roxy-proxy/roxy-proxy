@@ -448,8 +448,6 @@ pub enum Capability {
     State,
     /// Structured events in the flow log (and the audit endpoint).
     Record,
-    /// Close the connection or quarantine the principal.
-    Terminate,
     /// Read-only metrics.
     Metrics,
     /// roxy's operational log.
@@ -608,10 +606,6 @@ pub struct Addon {
     /// true)` events.
     #[serde(default)]
     pub audit_endpoint: Option<String>,
-    /// An endpoint (of this addon) notified when the addon quarantines a
-    /// principal.
-    #[serde(default)]
-    pub terminate_endpoint: Option<String>,
 }
 
 fn both_directions() -> Vec<Direction> {

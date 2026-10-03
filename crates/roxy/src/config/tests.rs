@@ -478,6 +478,17 @@ fn addon_on_error_has_no_pass() {
     assert_eq!(a.limits.fuel_per_step, Some(5));
     assert_eq!(a.limits.max_memory, None);
     assert_eq!(c.limits.max_address_list_bytes, ByteSize::b(256 << 20));
+
+    // Removed pending a design (issue #28): refused, not ignored.
+    for bad in ["capabilities: [terminate]", "terminate_endpoint: x"] {
+        assert!(
+            Config::from_yaml(&format!(
+                "{BASE}addons: [{{ name: a, path: /a.wasm, {bad} }}]\n"
+            ))
+            .is_err(),
+            "{bad}"
+        );
+    }
 }
 
 #[test]

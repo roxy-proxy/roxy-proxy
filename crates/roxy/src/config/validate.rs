@@ -247,18 +247,13 @@ impl Config {
             for (name, e) in &a.endpoints {
                 self.validate_endpoint(&format!("{path}.endpoints.{name}"), name, e, d);
             }
-            for (key, value) in [
-                ("audit_endpoint", &a.audit_endpoint),
-                ("terminate_endpoint", &a.terminate_endpoint),
-            ] {
-                if let Some(n) = value
-                    && !a.endpoints.contains_key(n)
-                {
-                    d.push(Diagnostic::new(
-                        format!("{path}.{key}"),
-                        format!("{n:?} is not one of this addon's `endpoints`"),
-                    ));
-                }
+            if let Some(n) = &a.audit_endpoint
+                && !a.endpoints.contains_key(n)
+            {
+                d.push(Diagnostic::new(
+                    format!("{path}.audit_endpoint"),
+                    format!("{n:?} is not one of this addon's `endpoints`"),
+                ));
             }
         }
     }
