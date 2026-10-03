@@ -89,7 +89,9 @@ jobs:
           test "$status" = healthy
           size=$(docker image inspect roxy:test --format '{{.Size}}')
           echo "image size: $size bytes"
-          test "$size" -lt 20000000
+          # Most of the binary is wasmtime + cranelift (the addon host,
+          # ~7 MB); the rest of roxy is ~13 MB.
+          test "$size" -lt 30000000
 
       - name: Scan (Trivy, HIGH/CRITICAL)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
