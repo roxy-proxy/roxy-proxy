@@ -984,12 +984,30 @@ if the agent had sent it. For `after_rules` addons the rules run again on
 the mutated request. An addon can reshape traffic; it cannot bypass policy.
 The YAML rules remain the floor, auditable without reading WASM.
 
-**Side requests** made through `wasi:http/outgoing-handler` are themselves
-flows: canonicalised, run through the connect/request/response rule chains
-with `client.user = "addon:<name>"` and tag `addon-subrequest`, subject to
-the address denylists (§7.1) and all limits, and logged like any other flow.
-A denied side request surfaces to the addon as a `403` response. Depth is
-capped at 1: side requests do not pass through addons again.
+**Side requests** made through `wasi:http/outgoing-handler` are
+proxy-initiated, not workload traffic, so they do **not** go through the
+workload rule chain. They are governed by the addon's own declaration in
+config:
+
+```yaml
+addons:
+  - name: redact
+    path: /etc/roxy/addons/redact.wasm
+    capabilities: [http, log]
+    http:
+      allow: ["redactor.internal:8443", "*.vault.example.com:443"]  # host[:port] globs; required when `http` is granted
+      private_ok: true          # helper services usually live on private ranges; default false
+      timeout: 5s
+```
+
+A side request to a destination not in `http.allow` fails inside the addon
+with an error code; an empty or missing `allow` with the `http` capability is
+a config error (fail closed). The built-in private-range deny applies unless
+`private_ok` is set. The connector's other machinery is shared: roxy does the
+DNS, verifies upstream TLS, applies size and time limits, and emits a flow
+event with `client.user = "addon:<name>"` and tag `addon-side-request` so the
+traffic is visible in the same log. Side requests never pass through addons
+or rules themselves, so depth is naturally 1.
 
 **Body-dependent rules and addons.** If a rule needs `body.text`, the rules
 stage buffers the body it receives (after any `before_rules` addons) up to
@@ -1050,8 +1068,9 @@ filesystem, no sockets, no environment.
 
 - **Capabilities** declared in config (`capabilities: [state, log, secrets, http]`);
   an import not granted traps → the flow is denied and `addon_error` logged.
-  `http` enables `outgoing-handler`; without it the import returns an error
-  code immediately.
+  `http` enables `outgoing-handler`, scoped to the addon's `http.allow`
+  destinations; without the capability the import returns an error code
+  immediately.
 - **Deadlines are per I/O step, not per request**, because a streaming
   addon legitimately lives as long as the flow. `addons.step_timeout`
   (default 50 ms of *CPU* between host calls, enforced with wasmtime epoch
@@ -1191,7 +1210,7 @@ be built by separate agents in parallel because `roxy-http`, `roxy-tls` and
 |---|---|---|
 | 1 | Transparent-mode upstream target (§4.2) | `resolve`; decide when transparent mode is built |
 | 2 | Rule evaluation: first terminal action wins, chain exhausted → deny (§6.1) | as stated |
-| 3 | Addons are streaming middleware (wasi:http shaped) with `chain.next`; rules always evaluate the final request (§11.1) | as stated |
+| 3 | Addons are streaming middleware (wasi:http shaped) with `chain.next`; rules always evaluate the final request; addon side requests are governed by the addon's own `http.allow`, not the workload rules (§11.1) | as stated |
 | 4 | Deny response body includes rule id and flow id (§5.7) | yes, informative 403 by default |
 | 5 | Size units 1024-based (§6.2) | yes |
 | 6 | Licence and crate name on crates.io | MIT OR Apache-2.0; `roxy` availability to be checked |
