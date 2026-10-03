@@ -168,7 +168,7 @@ Client speaks HTTP/1.1 to roxy on the proxy port.
     (`tls.require_sni_match`, default true; no-SNI uses the CONNECT host).
     Terminate TLS with a leaf cert for that host. Inner protocol must be
     HTTP/1.1 or HTTP/2 (ALPN) → request phase.
-  - Looks like plaintext HTTP and `proxy.allow_plain_in_connect` is true →
+  - Looks like plaintext HTTP and `http.allow_plain_in_connect` is true →
     parse as HTTP.
   - Anything else → **close**. No raw TCP through CONNECT, ever.
 - **Proxy-Authorization** (Basic) optional. When configured, unauthenticated
@@ -254,17 +254,17 @@ HTTP/2 **is** supported in the design on both sides; it is sequenced, not
 excluded.
 
 - **Client side** (agent → roxy, inside the TLS tunnel): negotiated by ALPN.
-  Until the h2 server path lands (M3), roxy offers only `http/1.1` in ALPN and
+  Until the h2 server path lands (M1 unit E, see §15), roxy offers only `http/1.1` in ALPN and
   every mainstream client (curl, Python httpx/requests/aiohttp, Node fetch,
   Go net/http, Rust reqwest) silently uses HTTP/1.1. No breakage, only loss
-  of multiplexing. Once M3 lands, `http.enable_h2` defaults to true.
+  of multiplexing. Once it lands, `http.enable_h2` defaults to true.
 - **Upstream side** (roxy → origin): hyper client with ALPN `h2, http/1.1`
   from M1. The canonical model is version-agnostic, so the same request is
   serialised as h1 or h2 depending on what the origin negotiates.
 - **gRPC and other h2-only protocols** need h2 end-to-end *and* trailers.
-  They work once M3 is in and `http.allow_trailers` is enabled for the flow.
-  If gRPC egress is needed for the MVP, pull the h2 client-side work into M1;
-  it is additive and does not touch the h1 codec.
+  They work once client-side h2 is in and `http.allow_trailers` is enabled
+  for the flow. Client-side h2 was pulled into M1 (unit E) for this reason; it
+  is additive and does not touch the h1 codec.
 
 ### 5.2 CanonicalRequest
 
@@ -368,8 +368,10 @@ forwarded, so the upstream sees exactly what the rules matched.
 
 ### 5.5 Serialisation to upstream
 
-Always HTTP/1.1 in MVP (h2 upstream later; the canonical model is
-version-agnostic).
+HTTP/1.1 or HTTP/2 to the origin, whichever hyper negotiates via ALPN
+(`h2, http/1.1`). The canonical model is version-agnostic; the h2 mapping is
+the obvious one (pseudo-headers from the canonical fields, `host` header
+dropped in favour of `:authority`). The HTTP/1.1 wire form:
 
 - Request line: `METHOD <origin-form path[?query]> HTTP/1.1\r\n`.
 - `host: <authority>` first, then headers in canonical order (lowercase
@@ -463,7 +465,7 @@ http:
   allow_trailers: false
   allow_chunk_extensions: false
   allow_plain_in_connect: false
-  enable_h2: true
+  enable_h2: false             # client-side h2; default false until M1 unit E lands, then true
 
 limits:
   max_header_bytes: 64kb
@@ -472,8 +474,14 @@ limits:
   max_request_body_bytes: 1gb
   max_response_body_bytes: 1gb
   max_inspect_body_bytes: 1mb   # only buffered when a rule/addon needs body content
+  max_ws_message_bytes: 16mb    # inspect tier only
+  max_capture_body_bytes: 16mb
   header_timeout: 10s
   body_idle_timeout: 30s
+  response_header_timeout: 60s
+  idle_timeout: 300s            # client keep-alive idle
+  h2_max_concurrent_streams: 100
+  h2_max_header_list_bytes: 64kb
   max_connections_per_client: 256
   max_metric_keys: 100000
 
@@ -527,7 +535,7 @@ rules:
     when: host == "ws.example.com" and header["upgrade"] == "websocket"
     then: { allow: { upgrade: websocket } }
 
-  - id: no-big-uploads
+  - id: log-upstream-5xx
     phase: response
     when: response.status >= 500
     then: { log: { level: warn, message: "upstream 5xx" } }
@@ -539,6 +547,9 @@ addons:
     config: { threshold: 0.8 }
     capabilities: [state, log]
 ```
+
+Relative paths in the config (`ca_dir`, secret files, addon paths, log and
+capture paths) resolve against the process working directory.
 
 Rules are evaluated **top to bottom, first terminal action wins**. A rule's
 `then` is a list of actions (or a single action shorthand). Non-terminal
@@ -634,6 +645,24 @@ Non-terminal (evaluation continues):
 
 Actions are a small closed enum, deliberately. Anything richer is an addon.
 
+**`then` grammar.** `then` is one action or a list of actions. An action is
+either a bare word (`allow`, `deny`, `passthrough`) or a single-key map whose
+key is the action name and whose value is that action's argument:
+
+```yaml
+then: allow                                  # bare word
+then: { deny: { status: 451, message: "no" } }   # single-key map
+then:                                        # list, evaluated in order
+  - set_header: { authorization: "Bearer ${secret:openai}" }
+  - remove_header: [x-debug]
+  - tag: billing
+  - allow: { upgrade: websocket }
+```
+
+A map with more than one key, an unknown action name, an argument of the
+wrong shape, or a terminal action followed by further actions in the same
+list is a compile error. `then` is required on every rule.
+
 ### 6.4 Stateful metrics and state
 
 A metric is `(what to count, filter, key, window)`. Rules compare it with an
@@ -697,7 +726,7 @@ network I/O. Essential for operators and for golden tests.
   with `allow: { private_ok: true }`.
 - **TLS to upstream:** rustls with bundled `webpki-roots` plus
   `tls.upstream.extra_roots`. Verification is always on. SNI is the canonical
-  host. ALPN `http/1.1` (h2 upstream later). Minimum TLS 1.2.
+  host. ALPN `h2, http/1.1`. Minimum TLS 1.2.
 - **Pool:** hyper client pool keyed by `(scheme, host, port, resolved ip)`.
   `redirect` actions change the key.
 - **Timeouts:** connect, TLS handshake, response header, body idle.
@@ -1032,9 +1061,9 @@ be built by separate agents in parallel because `roxy-http`, `roxy-tls` and
 | # | deliverable | parallelisable units |
 |---|---|---|
 | M0 | Workspace, CI, config schema + `roxy check`, CA generation + `roxy ca export`, tracing + FlowSink skeleton | — |
-| M1 | **Usable MVP in explicit mode.** Strict h1 codec + canonical model + normaliser (`roxy-http`); leaf minting + rustls configs + ClientHello sniffer (`roxy-tls`); DSL + stateless rules + actions `allow/deny/set_header/remove_header/tag/log` (`roxy-rules`); then `roxy-proxy` wiring: CONNECT → MITM → request phase → hyper upstream (h1/h2 by ALPN) → response phase → JSONL log. WebSocket relay tier. Secrets + `${secret:}` injection. Default deny. Smuggling corpus passing. | A: `roxy-http`, B: `roxy-tls`, C: `roxy-rules`, then D: `roxy-proxy` |
+| M1 | **Usable MVP in explicit mode.** Strict h1 codec + canonical model + normaliser (`roxy-http`); leaf minting + rustls configs + ClientHello sniffer (`roxy-tls`); DSL + stateless rules + actions `allow/deny/set_header/remove_header/tag/log` (`roxy-rules`); then `roxy-proxy` wiring: CONNECT → MITM → request phase → hyper upstream (h1/h2 by ALPN) → response phase → JSONL log. WebSocket relay tier. Secrets + `${secret:}` injection. Default deny. Smuggling corpus passing. Then E: client-side HTTP/2 via `h2` with the shared validator. | A: `roxy-http`, B: `roxy-tls`, C: `roxy-rules`, then D: `roxy-proxy`, then E: h2 |
 | M2 | Metrics + state store, response-phase rules, `redirect`, `rewrite_path`, query actions, hot reload, `roxy rule test`, SSRF policy, proxy auth, `roxy.internal` CA endpoint | metrics (A) ∥ reload+CLI (B) ∥ connector policy (C) |
-| M3 | HTTP/2 client-side via `h2` with the shared validator; WebSocket inspect tier (frame codec, `ws` phase) | h2 (A) ∥ ws (B) |
+| M3 | WebSocket inspect tier (frame codec, `ws` phase); RFC 8441 WebSocket-over-h2 if wanted | — |
 | M4 | WASM host (`roxy-wasm`), WIT package, `roxy-addon` SDK, example Rust + Python addons, capability/fuel/timeout enforcement | host (A) ∥ SDK+examples (B) |
 | M5 | Hardening: fuzz CI, limits audit, body capture, Prometheus endpoint, file log rotation | independent items |
 | Later | Transparent mode (§4.2): `TransparentListener` with REDIRECT + `SO_ORIGINAL_DST`, classification, rule-gated passthrough, nftables docs, netns integration test; TPROXY | — |
@@ -1052,7 +1081,7 @@ be built by separate agents in parallel because `roxy-http`, `roxy-tls` and
 | 5 | Size units 1024-based (§6.2) | yes |
 | 6 | Licence and crate name on crates.io | MIT OR Apache-2.0; `roxy` availability to be checked |
 | 7 | Connect-phase default when no rule matches: allow-to-inspect (§4.3) | as stated |
-| 8 | Pull h2 client-side into M1 if gRPC egress is an MVP requirement (§5.1a) | stays in M3 unless gRPC is needed |
+| 8 | Client-side h2 in M1 (§5.1a) | agreed: M1 unit E |
 
 Resolved since the first draft: upstreams are trusted, so the upstream codec
 is plain hyper (§2, §5.6); WebSockets default to a byte relay with inspection
