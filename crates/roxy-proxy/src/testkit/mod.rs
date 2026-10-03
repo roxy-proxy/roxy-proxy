@@ -128,7 +128,7 @@ impl AddonDef {
         Arc::new(AddonSpec {
             name: self.name,
             observe: self.observe,
-            layer,
+            kind: crate::addons::AddonImpl::Wasm(layer),
             endpoints: HashMap::new(),
             state: StateLimits::default(),
             audit_endpoint: None,
