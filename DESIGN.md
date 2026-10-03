@@ -1365,7 +1365,7 @@ Other languages:
 
 `examples/addons/` ships a Rust pass-through, a Rust streaming redactor, a
 Rust layer that withholds `tool_use` blocks in a streamed response until a
-named endpoint clears them, and a minimal Python remote layer.
+named endpoint clears them, and a minimal Python service layer.
 
 ## 12. Resource limits and self-protection
 
