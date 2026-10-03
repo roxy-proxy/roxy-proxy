@@ -3,6 +3,7 @@
 use std::fmt;
 use std::future::poll_fn;
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -32,12 +33,16 @@ enum Inner {
         done: bool,
     },
     Boxed {
-        body: Pin<Box<dyn http_body::Body<Data = Bytes, Error = BodyError> + Send + 'static>>,
+        /// The mutex is never locked (only `get_mut`); it exists to make
+        /// `Body: Sync` without requiring the wrapped body to be `Sync`.
+        body: Mutex<BoxedBody>,
         done: bool,
     },
 }
 
-/// A request or response body: `'static + Send`, implements
+type BoxedBody = Pin<Box<dyn http_body::Body<Data = Bytes, Error = BodyError> + Send + 'static>>;
+
+/// A request or response body: `'static + Send + Sync`, implements
 /// [`http_body::Body`] so it can be handed straight to hyper.
 ///
 /// A body that ends before it is complete (producer dropped, cap exceeded,
@@ -137,12 +142,12 @@ impl Body {
         }
         Self {
             inner: Inner::Boxed {
-                body: Box::pin(Capped {
+                body: Mutex::new(Box::pin(Capped {
                     inner: Box::pin(body),
                     seen: 0,
                     max: max_bytes,
                     known: known_length,
-                }),
+                })),
                 done: false,
             },
             known_length,
@@ -220,6 +225,10 @@ impl http_body::Body for Body {
                 if *done {
                     return Poll::Ready(None);
                 }
+                let body = match body.get_mut() {
+                    Ok(b) => b,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
                 let r = body.as_mut().poll_frame(cx);
                 if matches!(r, Poll::Ready(None | Some(Err(_)))) {
                     *done = true;
@@ -447,6 +456,15 @@ mod tests {
             out.push(f.map(|f| f.into_data().unwrap_or_default()));
         }
         out
+    }
+
+    #[test]
+    fn body_is_send_sync_static() {
+        fn assert_bounds<T: Send + Sync + 'static>() {}
+        assert_bounds::<Body>();
+        assert_bounds::<BodySender>();
+        assert_bounds::<crate::CanonicalRequest>();
+        assert_bounds::<crate::CanonicalResponse>();
     }
 
     #[tokio::test]

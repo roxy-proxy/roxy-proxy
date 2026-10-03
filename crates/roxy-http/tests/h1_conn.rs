@@ -546,3 +546,30 @@ async fn misuse_is_reported() {
         Reason::InvalidState
     );
 }
+
+/// The connection futures must be `Send` so `roxy-proxy` can spawn them.
+#[test]
+fn futures_are_send() {
+    fn assert_send<T: Send>(_: &T) {}
+    let (_client, mut c) = conn();
+    let f = c.next_request();
+    assert_send(&f);
+    drop(f);
+    let f = c.respond(CanonicalResponse::new(StatusCode::OK));
+    assert_send(&f);
+    drop(f);
+    let f = c.drive(async {});
+    assert_send(&f);
+    drop(f);
+    let f = c.send_100_continue();
+    assert_send(&f);
+    drop(f);
+    let f = c.respond_error_and_close(StatusCode::BAD_REQUEST, &Reason::BareLf);
+    assert_send(&f);
+    let (_client, c) = conn();
+    let f = c.accept_connect();
+    assert_send(&f);
+    let (_client, c) = conn();
+    let f = c.respond_upgrade(CanonicalResponse::new(StatusCode::SWITCHING_PROTOCOLS));
+    assert_send(&f);
+}
