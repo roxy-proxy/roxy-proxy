@@ -54,6 +54,8 @@ pub mod listener;
 mod pipeline;
 pub mod server;
 pub mod sources;
+#[cfg(test)]
+mod testkit;
 pub mod upstream;
 mod view;
 mod watch;

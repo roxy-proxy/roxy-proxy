@@ -251,6 +251,13 @@ impl std::fmt::Debug for Server {
 }
 
 impl Server {
+    /// The state every connection task shares (the test harness serves
+    /// connections on it directly).
+    #[cfg(test)]
+    pub(crate) fn shared(&self) -> &Arc<Shared> {
+        &self.shared
+    }
+
     /// Binds every listener (and the CA server) and starts serving.
     pub async fn start(cfg: RuntimeConfig) -> Result<Server, StartError> {
         roxy_tls::install_crypto_provider();
