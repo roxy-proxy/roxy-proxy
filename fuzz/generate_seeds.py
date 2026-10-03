@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Regenerates the seed corpora in fuzz/seeds/<target>/ from the project's
-own test vectors. Run from the repository root:
+"""Generates the seed corpora in fuzz/seeds/<target>/ (git-ignored) from
+the project's own test vectors, so the seeds never go stale. Run before
+fuzzing; the Fuzz workflow does. From anywhere:
 
-    python3 fuzz/seeds/generate.py
+    python3 fuzz/generate_seeds.py
 
 Sources:
 - h1_request, h1_chunked: the smuggling corpus, crates/roxy-http/tests/corpus
@@ -21,7 +22,7 @@ import pathlib
 import re
 import ssl
 
-ROOT = pathlib.Path(__file__).resolve().parents[2]
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 OUT = ROOT / "fuzz" / "seeds"
 
 
@@ -119,7 +120,7 @@ def when_expressions():
 
 def main():
     for target in ("h1_request", "h1_chunked", "url", "client_hello", "rule_compile", "h2map", "rule_eval"):
-        for old in (OUT / target).glob("*"):
+        for old in (OUT / target).glob("*") if (OUT / target).is_dir() else []:
             old.unlink()
     n = 0
     for name, cfg, data in corpus_cases():

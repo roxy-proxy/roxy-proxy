@@ -9,13 +9,14 @@ to run.
 rustup toolchain install nightly --profile minimal
 cargo install cargo-fuzz --locked
 
+python3 fuzz/generate_seeds.py   # writes fuzz/seeds/<target>/
 cd fuzz
 cargo +nightly fuzz list
 cargo +nightly fuzz run h1_request corpus/h1_request seeds/h1_request -- -max_total_time=300
 ```
 
-The first directory is the working corpus, which grows as the fuzzer runs
-and is git-ignored. `seeds/<target>` holds the checked-in seeds.
+The first directory is the working corpus, which grows as the fuzzer runs.
+`seeds/<target>` holds the generated seeds. Both are git-ignored.
 
 | target | code | invariants beyond "never panics" |
 |---|---|---|
@@ -36,8 +37,8 @@ and run it. It finds a counterexample within a few hundred executions.
 
 ## Seeds
 
-`python3 fuzz/seeds/generate.py` (from the repository root) regenerates
-`seeds/` from the project's own vectors:
+`python3 fuzz/generate_seeds.py` generates `seeds/` from the project's own
+vectors, so the seeds are never stale and nothing derived is checked in:
 
 - **`h1_request`, `h1_chunked`:** the 168-case smuggling corpus in
   `crates/roxy-http/tests/corpus`, with each case's role and flags in the

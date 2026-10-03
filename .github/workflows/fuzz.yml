@@ -5,7 +5,7 @@ name: Fuzz
 # - Nightly (schedule): every target for 5 minutes, continuing from the
 #   corpus the previous runs grew (kept in the Actions cache).
 # - Pull requests that touch a fuzzed parser or fuzz/: every target for
-#   60 seconds, from the checked-in seeds plus the cached corpus.
+#   60 seconds, from the generated seeds plus the cached corpus.
 # - workflow_dispatch: every target for a chosen number of seconds.
 #
 # A crash, failed assertion, leak or slow input fails the job and uploads
@@ -93,6 +93,11 @@ jobs:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      # Seeds are derived from the repo's own vectors (smuggling corpus,
+      # example rules, ...), so they are generated here, not checked in.
+      - name: Generate seeds
+        run: python3 fuzz/generate_seeds.py
 
       - name: Fuzz
         run: |

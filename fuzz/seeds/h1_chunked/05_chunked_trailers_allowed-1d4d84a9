@@ -1,8 +1,0 @@
-5
-hello
-0
-X-Checksum: 1
-
-GET http://example.com/next HTTP/1.1
-Host: example.com
-

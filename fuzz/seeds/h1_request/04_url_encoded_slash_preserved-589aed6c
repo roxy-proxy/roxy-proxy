@@ -1,3 +1,0 @@
-@GET /a%2f..%2fb HTTP/1.1
-Host: example.com
-

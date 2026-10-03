@@ -1,1 +1,0 @@
-|\n    host under \"github.com\"\n      and method in [GET, HEAD]\n      and path like 5\n  then: allow\n",

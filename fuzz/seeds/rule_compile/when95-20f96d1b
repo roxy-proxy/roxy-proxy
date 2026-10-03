@@ -1,1 +1,0 @@
-'response.status == 200 and response.body.bytes > 1mb', then: { remove_header: [x-a] } }",

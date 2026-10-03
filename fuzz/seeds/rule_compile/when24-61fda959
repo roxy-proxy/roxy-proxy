@@ -1,1 +1,0 @@
-tag["big-upload"] and response.body.bytes > 1mb

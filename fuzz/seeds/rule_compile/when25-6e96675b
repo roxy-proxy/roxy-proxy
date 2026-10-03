@@ -1,1 +1,0 @@
-'response.body.size > 1mb', then: deny }",

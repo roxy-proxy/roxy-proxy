@@ -1,1 +1,0 @@
-'body.text contains \"secret\"', then: deny }\n- { id: ok, then: allow }",
