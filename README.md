@@ -1,7 +1,6 @@
 # roxy
 
-roxy is a TLS-inspecting HTTP firewall for containing the network traffic of
-(potentially adversarial) AI agents. It runs as an explicit `HTTP_PROXY`,
+roxy is a TLS-inspecting HTTP firewall. It runs as an explicit `HTTP_PROXY`,
 terminates TLS with leaf certificates minted by its own CA, parses every
 request into a strict canonical model, and re-serialises it in one
 unambiguous wire form, so smuggling and header-injection tricks never reach
@@ -24,7 +23,7 @@ only way to the internet is through roxy:
 ```
             sandbox (internal: no route out)          egress
  ┌───────┐  HTTPS_PROXY=http://roxy:3128  ┌──────┐            ┌──────────┐
- │ agent │ ─────────────────────────────▶ │ roxy │ ─────────▶ │ internet │
+ │ agent │ ────────────────────────────▶ │ roxy │ ─────────▶ │ internet │
  └───────┘                                └──────┘            └──────────┘
      ✗  no other route: direct connections and DNS lookups fail
 ```
