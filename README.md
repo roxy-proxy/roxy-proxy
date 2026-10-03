@@ -32,6 +32,8 @@ Usable in explicit proxy mode. Built and tested:
 - Address denylists, and a private-range floor on the IP actually dialled.
 - WebSocket relay, proxy authentication, and a CA download endpoint.
 - Hot reload, `roxy check`, and the `roxy rule test` dry run.
+- Traffic capture: heads and bodies as forwarded, per rule or for all
+  traffic, written with the same never-drop backpressure as the flow log.
 - A hardened container image (`ghcr.io/roxy-proxy/roxy`, below).
 
 Deferred, with designs in DESIGN.md:
@@ -40,7 +42,7 @@ Deferred, with designs in DESIGN.md:
   addons.
 - Transparent mode (§4.2).
 - WebSocket message rules (§8.2). Byte budgets already apply to WebSockets.
-- Body capture and a Prometheus endpoint.
+- A Prometheus endpoint.
 
 ## Quickstart
 
@@ -91,6 +93,7 @@ docker run -d --name roxy \
 | `/etc/roxy/roxy.yaml` | config; the default is [`examples/docker/roxy.yaml`](examples/docker/roxy.yaml). Mount your own read-only. |
 | `/var/lib/roxy/ca` | volume: the CA key and certificate, generated on first start. **Keep it**: a new CA means every client must re-trust it. Owned by 65532, mode 0700. |
 | `/var/log/roxy` | volume, for a config that sets `log.flow.path` (for example `/var/log/roxy/flow.jsonl`). The default config logs flows to stdout (`docker logs`). |
+| `capture_dir` | traffic capture (§10.2) is off by default. If you set `capture_dir`, mount a volume there (for example `-v roxy-capture:/var/lib/roxy/capture`); the root filesystem is read-only. |
 
 Ports: `3128` is the proxy listener and `3130` is `ca_server`
 (`/roxy-ca.pem`, `/healthz`). Keep `3130` off networks the agent should not
@@ -260,6 +263,27 @@ log:
 ```
 
 `SIGHUP` also reopens the file, for external `logrotate`.
+
+### Capturing traffic
+
+roxy can tee the heads and bodies of exchanges to `<capture_dir>/capture.rxc`
+exactly as forwarded. It captures exchanges a rule selects with
+`capture: request | response | both`, or all traffic with
+`log.capture.all: true`. Capture uses the same writer as the flow log: it
+rotates, and it holds traffic back rather than drop data. Bodies are
+captured unredacted. The format is in DESIGN.md §10.2.
+
+```yaml
+capture_dir: /var/lib/roxy/capture
+log:
+  capture:
+    all: true
+    max_file_bytes: 1gb
+    max_files: 20
+    compress: true
+limits:
+  max_capture_body_bytes: 16mb    # per direction per exchange; beyond it, `truncated`
+```
 
 ## Development
 

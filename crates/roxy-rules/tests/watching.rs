@@ -308,6 +308,10 @@ fn watching_rules_cannot_allow_or_change_the_request() {
             "known before the response head is sent",
         ),
         (
+            "{ id: a, when: 'body.bytes > 1', then: { capture: both } }",
+            "`capture` is decided at the request head",
+        ),
+        (
             "{ id: a, when: 'response.status == 1', then: { set_header: { x: \"${secret:gh}\" } } }",
             "secret references are only allowed in rules decided at the request head",
         ),

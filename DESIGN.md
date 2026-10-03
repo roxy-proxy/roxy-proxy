@@ -127,7 +127,7 @@ the CA. Any default that would trip a conforming client is a bug.
 | `roxy-rules` | Expression DSL (lexer, parser, type-checker, compiler), rule set, evaluation model, actions, metrics/state store, hot-reload-safe `Policy` snapshot. |
 | `roxy-wasm` | wasmtime component host, WIT world, addon lifecycle, fuel/memory limits, host-call implementations. |
 | `roxy-proxy` | Listeners, connection state machine, flow pipeline, upstream connector (DNS, SSRF policy, pool), WebSocket relay, flow log emission. |
-| `roxy-log` | Buffered single-writer log destinations (§10.1): one writer thread, batching, backpressure, size rotation, compression. Knows bytes, not events; used by the flow log and later by body capture (§10.2). |
+| `roxy-log` | Buffered single-writer log destinations (§10.1): one writer thread, batching, backpressure, size rotation, compression. Knows bytes, not events; used by the flow log and body capture (§10.2). |
 | `roxy` | Binary: CLI (`run`, `check`, `ca export`, `rule test`), config loading, reload watcher, wiring. |
 | `roxy-addon` | SDK for Rust addon authors: generated WIT bindings + ergonomic wrappers. Published independently. |
 | `wit/` | The `roxy:addon` WIT package. Language-agnostic contract for addons. |
@@ -769,7 +769,7 @@ Non-terminal (evaluation continues):
 | `tag: name` | all | sets `tag["name"]` for later rules, addons and the log |
 | `log: { level, message }` | all | emits an extra log event |
 | `set_state: { key, value, ttl }` | all | writes to the state store (visible as `state["key"]`) |
-| `capture: request | response | both` | request, response | writes bodies to the capture dir (§10) |
+| `capture: request | response | both` | head rules | tees the exchange's heads and bodies, as forwarded, to the capture log (§10.2) |
 | `call: addon_name` | — | reserved; rejected by the compiler. Addons always run above the rules, in listed order (§11.1) |
 
 Actions are a small closed enum, deliberately. Anything richer is an addon.
@@ -1101,12 +1101,60 @@ path is built for many cores and heavy traffic, and it never drops:
 
 ### 10.2 Body capture
 
-`capture` action writes `<capture_dir>/<flow id>.req.body` /
-`.res.body` plus a `.meta.json` with the canonical head. Captured bytes go through the buffered writer
-above (one writer, batching, backpressure), keyed by flow id so they join
-the JSONL events. Capped by
-`limits.max_capture_body_bytes`. Off unless a rule asks for it. Secrets are
-*not* redacted inside bodies (document loudly).
+Captured traffic is one append-only stream, `<capture_dir>/capture.rxc`,
+written through the buffered writer above (one writer for all flows,
+batching, rotation, and backpressure: capture is never dropped; a slow
+disk slows traffic).
+
+**What is captured.** Exchanges a head rule's `capture: request | response
+| both` selects, or every forwarded exchange with `log.capture.all: true`.
+Capture is decided at the request head (a `capture` in a watching rule is
+a compile error) and covers the exchange from its first byte. What is
+captured is what was forwarded: the taps sit in the watcher's body adapters
+(§6.1) and the WebSocket relay pumps, after the watching rules allowed a
+chunk and before it is handed on.
+
+**Format.** Records: one JSON header line, `len` payload bytes, `\n`.
+
+```text
+{"flow":"01J9…","dir":"request","kind":"head","seq":0,"len":187}
+{"method":"POST","url":"https://api.example.com/v1/x","headers":[["content-type","application/json"]]}
+{"flow":"01J9…","dir":"request","kind":"data","seq":1,"len":5}
+hello
+{"flow":"01J9…","dir":"request","kind":"end","seq":2,"len":0,"bytes":5}
+```
+
+- `flow` joins the records to the JSONL flow log.
+- `dir` is `request` (client to upstream) or `response`; the WebSocket
+  relay uses the same names for its two directions.
+- `kind` is one of:
+  - `head`: the canonical head as JSON, as forwarded;
+  - `data`: forwarded bytes;
+  - `truncated`: `limits.max_capture_body_bytes` was reached for this
+    direction, and nothing more of it is captured; carries `cap`;
+  - `end`: carries the total forwarded `bytes`, and `aborted: true` if
+    the direction did not complete.
+- `seq` counts records per flow and direction.
+
+**Secrets.** Injected secret values are redacted in captured head values,
+since the agent never saw them. Bodies are captured as forwarded and are
+**not** redacted.
+
+**Config.** `capture_dir` must be set when roxy starts; capture settings
+are restart-required:
+
+```yaml
+capture_dir: /var/lib/roxy/capture
+log:
+  capture:
+    all: false            # true: tee every forwarded exchange
+    high_water: 64mb      # unwritten capture at which traffic is held
+    max_file_bytes: 1gb   # rotate capture.rxc; absent = never
+    max_files: 20
+    compress: true
+limits:
+  max_capture_body_bytes: 16mb   # per direction per exchange
+```
 
 ### 10.3 Operational logging and metrics
 

@@ -49,6 +49,8 @@ pub struct RuntimeConfig {
     /// `log.flow.connection_events`.
     pub connection_events: bool,
     pub sink: Arc<dyn FlowSink>,
+    /// Body capture / traffic tee (§10.2); `None` = capture disabled.
+    pub capture: Option<Arc<crate::capture::CaptureLog>>,
     pub metrics: Arc<dyn MetricSource>,
     pub state: Arc<dyn StateSource>,
     /// The initial reloadable part.

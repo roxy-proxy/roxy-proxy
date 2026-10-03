@@ -42,6 +42,7 @@ pub mod addrlist;
 pub mod auth;
 mod body;
 mod ca_server;
+pub mod capture;
 pub mod config;
 mod conn;
 mod exchange;
@@ -59,6 +60,7 @@ mod watch;
 pub use addrlist::{AddressList, AddressLists, ListError};
 pub use auth::UserDb;
 pub use ca_server::PEM_CONTENT_TYPE;
+pub use capture::{CAPTURE_FILE, CaptureLog, CaptureOptions};
 pub use config::{ListenerSpec, PolicyUpdate, RuntimeConfig};
 pub use conn::INTERNAL_HOST;
 pub use flowlog::{

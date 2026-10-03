@@ -95,6 +95,7 @@ impl ConnCaps {
 pub(crate) struct Shared {
     snapshot: ArcSwap<Snapshot>,
     pub sink: Arc<dyn FlowSink>,
+    pub capture: Option<Arc<crate::capture::CaptureLog>>,
     pub metrics: Arc<dyn MetricSource>,
     pub state: Arc<dyn StateSource>,
     pub ca: Arc<Ca>,
@@ -228,6 +229,11 @@ impl ServerHandle {
     pub fn sink(&self) -> Arc<dyn FlowSink> {
         self.shared.sink.clone()
     }
+
+    /// The capture log, if capture is enabled.
+    pub fn capture(&self) -> Option<Arc<crate::capture::CaptureLog>> {
+        self.shared.capture.clone()
+    }
 }
 
 impl std::fmt::Debug for Server {
@@ -249,6 +255,7 @@ impl Server {
         let shared = Arc::new(Shared {
             snapshot: ArcSwap::from_pointee(snap),
             sink: cfg.sink,
+            capture: cfg.capture,
             metrics: cfg.metrics,
             state: cfg.state,
             ca: cfg.ca,
