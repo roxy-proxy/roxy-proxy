@@ -17,6 +17,10 @@
 # natively on each platform's runner.
 FROM rust:1.99-alpine3.22@sha256:d0486f70555afb827c0cafecb4052d6139e1bc7b3f7170c79307884c6af32e90 AS build
 RUN apk add --no-cache musl-dev
+# cargo-auditable embeds the crate dependency list in the binary, so image
+# scanners (Trivy) and the SBOM see the Rust dependencies, not just the base.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo install --locked cargo-auditable@0.7.7
 WORKDIR /src
 COPY . .
 # Symbols are stripped here rather than in Cargo.toml so local release
@@ -25,7 +29,7 @@ COPY . .
 ENV CARGO_PROFILE_RELEASE_STRIP=symbols
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p roxy \
+    cargo auditable build --release --locked -p roxy \
     && cp target/release/roxy /roxy
 # Fail the build if the binary is not fully static.
 RUN if ldd /roxy 2>&1 | grep -q '=>'; then ldd /roxy; exit 1; fi
