@@ -13,12 +13,14 @@
 //! - [`model`]: `CanonicalRequest`, `CanonicalResponse`, `Headers`, `Body`,
 //!   `Limits`, `HttpFlags`, `ParseError` / `Reason`.
 //! - [`url`]: the URL normaliser (docs/http.md#url-normalisation).
+//! - [`coding`]: bounded content-coding decoders (docs/http.md#content-codings).
 //! - [`h1`]: client-facing HTTP/1.1 server codec (`ServerConn`).
 //! - [`h2map`]: h2 request parts ↔ canonical model.
 //! - [`upstream`]: canonical ↔ hyper client types.
 //! - [`ws`]: WebSocket upgrade handshake validation (relay tier).
 
 mod chars;
+pub mod coding;
 pub mod h1;
 pub mod h2map;
 pub mod layer;
