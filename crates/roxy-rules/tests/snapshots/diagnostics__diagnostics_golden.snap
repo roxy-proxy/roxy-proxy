@@ -1,0 +1,156 @@
+---
+source: crates/roxy-rules/tests/diagnostics.rs
+expression: out
+---
+== unknown field
+rules[0].when:1:1: unknown field `hots`; did you mean `host`?  [rule a]
+    | hots == "x"
+    | ^^^^
+
+== type mismatch
+rules[0].when:1:1: type mismatch: cannot compare `port` (int) with the string "443"  [rule a]
+    | port == "443"
+    | ^^^^^^^^^^^^^
+
+== under needs a domain
+rules[0].when:1:12: `under` needs a quoted domain on the right, found the number 443  [rule a]
+    | host under 443
+    |            ^^^
+
+== ordering on strings
+rules[0].when:1:1: `<` compares numbers, but this is `path` (string)  [rule a]
+    | path < 5
+    | ^^^^
+
+== wrong list element type
+rules[0].when:1:14: type mismatch: `port` is an int, so the list must contain numbers, but this is the string "443"  [rule a]
+    | port in [80, "443"]
+    |              ^^^^^
+
+== method literal outside method
+rules[0].when:1:9: bare identifier `GET` is only valid as an HTTP method compared with `method`; quote it if you meant the string "GET"  [rule a]
+    | path == GET
+    |         ^^^
+
+== bare string field as condition
+rules[0].when:1:1: `host` is a string, not a condition; compare it with a value, e.g. `host == ...`  [rule a]
+    | host and method == GET
+    | ^^^^
+
+== not-equal on a list
+rules[0].when:1:1: `!=` on a list (`header.all[...]`) is ambiguous; write `not (... == ...)` instead  [rule a]
+    | header.all["accept"] != "x"
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+== bad regex
+rules[0].when:1:14: invalid regex: unclosed group  [rule a]
+    | path matches "(unclosed"
+    |              ^^^^^^^^^^^
+
+== bad CIDR mask
+rules[0].when:1:15: invalid CIDR `10.0.0.0/33`: prefix length must be at most /32  [rule a]
+    | client.ip in [10.0.0.0/33]
+    |               ^^^^^^^^^^^
+
+== CIDR with host bits
+rules[0].when:1:14: invalid CIDR `192.168.1.1/16`: host bits are set; did you mean `192.168.0.0/16`?  [rule a]
+    | client.ip in 192.168.1.1/16
+    |              ^^^^^^^^^^^^^^
+
+== unterminated string
+rules[0].when:1:9: unterminated string  [rule a]
+    | host == "api.github.com
+    |         ^^^^^^^^^^^^^^^
+
+== phase violation
+rules[0].when:1:1: `response.status` is not available in the request phase (available in: response)  [rule a]
+    | response.status >= 500
+    | ^^^^^^^^^^^^^^^
+
+== connect-only field in request phase
+rules[0].when:1:1: `dst.port` is not available in the request phase (available in: connect)  [rule a]
+    | dst.port == 22
+    | ^^^^^^^^
+
+== unknown metric
+rules[0].when:1:23: reference to undefined metric `metric.nope` (define it under `metrics`)  [rule a]
+    | metric.writes > 3 and metric.nope > 1
+    |                       ^^^^^^^^^^^
+
+== multi-line expression
+rules[0].when:3:17: `like` needs a quoted glob pattern on the right, found the number 5  [rule a]
+    |   and path like 5
+    |                 ^
+
+== unknown secret
+rules[0].then[0]: reference to undefined secret "missing" (define it under `secrets`)  [rule a]
+
+== secret outside request phase
+rules[0].then[0]: secret references are only allowed in request-phase rules (this rule is `response`)  [rule a]
+
+== secret outside set_header
+rules[0].then[0]: secret references are only allowed in `set_header` values, not in `log`  [rule a]
+
+== passthrough without a transparent listener
+rules[0].then[0]: `passthrough` requires a transparent listener, which is not supported yet (DESIGN.md §4.2)  [rule a]
+
+== multi-key action map
+parse: .[0].then: an action is a map with exactly one key, but this one has `set_header` and `allow`; write each action as its own list item at line 1 column 18
+
+== terminal action followed by another
+rules[0].then[1]: `tag` follows the terminal action `allow` and would never run; move it before `allow`  [rule a]
+
+== unknown action
+parse: .[0].then: unknown action `sethead`; expected one of `allow`, `deny`, `passthrough`, `set_header`, `remove_header`, `rewrite_path`, `set_query`, `remove_query`, `redirect`, `tag`, `log`, `set_state`, `capture`, `call` at line 1 column 18
+
+== action not allowed in phase
+rules[0].then[0]: `rewrite_path` is not allowed in the response phase (allowed in: request)  [rule a]
+
+== reserved header and bad value
+rules[0].then[0]: header `host` is managed by roxy and cannot be changed by rules (use `redirect: { ..., rewrite_host: true }`)  [rule a]
+rules[0].then[1]: set_header x-a: value "café" is not a valid header value (visible ASCII, space and tab only)  [rule a]
+
+== bad deny status and undefined addon
+rules[0].then[0]: `call` names undefined addon "nope"  [rule a]
+rules[0].then[1]: deny status 200 must be a 4xx or 5xx code  [rule a]
+
+== ws rules without inspect
+rules[0].phase: `ws`-phase rules can never run: no request rule enables message inspection with `allow: { upgrade: websocket, inspect: true }` (DESIGN.md §8.2)  [rule w]
+
+== duplicate and reserved ids
+rules[1].id: duplicate rule id "a" (first defined at rules[0])  [rule a]
+rules[2].id: rule id "_default": ids starting with `_` are reserved (e.g. `_default`)  [rule _default]
+
+== address list on a non-ip field
+rules[0].when:1:9: address list @internal can only be used with `in`/`not in` on an ip field  [rule a]
+    | host in @internal
+    |         ^^^^^^^^^
+
+== address list with ==
+rules[0].when:1:1: address list @internal can only be used with `in`/`not in` on an ip field  [rule a]
+    | @internal == 1
+    | ^^^^^^^^^
+
+== address list inside a list literal
+rules[0].when:1:27: address list @internal can only be used with `in`/`not in` on an ip field  [rule a]
+    | client.ip in [10.0.0.0/8, @internal]
+    |                           ^^^^^^^^^
+
+== address list as a condition
+rules[0].when:1:1: address list @internal can only be used with `in`/`not in` on an ip field  [rule a]
+    | @internal
+    | ^^^^^^^^^
+
+== undefined address list
+rules[0].when:1:15: reference to undefined address list `@nope` (define it under `address_lists`)  [rule a]
+    | dst.ip not in @nope
+    |               ^^^^^
+
+== bad metrics
+metrics[0].id: invalid metric id "bad-id": must match [A-Za-z_][A-Za-z0-9_]* so it can be used as metric.<id>
+metrics[0].window: window must be greater than zero
+metrics[0].key[0]: unknown key field `client.nope`; metric fields must be scalar fields such as client.ip, client.user, host
+metrics[1].where:1:1: `dst.port` is not available in the response phase (available in: connect)
+    | dst.port == 1
+    | ^^^^^^^^
+metrics[2].count: unknown unique() field `nope`; metric fields must be scalar fields such as client.ip, client.user, host

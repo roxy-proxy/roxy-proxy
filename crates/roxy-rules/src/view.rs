@@ -4,6 +4,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
+use ipnet::IpNet;
+
 use crate::types::Field;
 
 /// A runtime value. Borrowed wherever the view can lend its own storage, so
@@ -68,6 +70,11 @@ pub trait FlowView {
     fn body_text(&self) -> Option<Cow<'_, str>>;
     /// The buffered response body as text.
     fn response_body_text(&self) -> Option<Cow<'_, str>>;
+    /// Whether `ip` is in the named address list (`ip in @list`, §7.1).
+    /// `None` = list unavailable (not loaded), which makes the predicate
+    /// false, like an absent value. `ip` is canonical (IPv4-mapped IPv6
+    /// addresses arrive as IPv4).
+    fn in_address_list(&self, list: &str, ip: IpAddr) -> Option<bool>;
 }
 
 /// A simple map-backed [`FlowView`] for tests, benchmarks and `roxy rule
@@ -83,6 +90,8 @@ pub struct MapView {
     pub state: HashMap<String, String>,
     pub body: Option<String>,
     pub response_body: Option<String>,
+    /// Address lists for `in @name`, scanned linearly.
+    pub address_lists: HashMap<String, Vec<IpNet>>,
 }
 
 impl MapView {
@@ -135,6 +144,13 @@ impl MapView {
     #[must_use]
     pub fn with_state(mut self, key: &str, value: &str) -> Self {
         self.state.insert(key.to_owned(), value.to_owned());
+        self
+    }
+
+    /// Define address list `name`.
+    #[must_use]
+    pub fn with_address_list(mut self, name: &str, nets: Vec<IpNet>) -> Self {
+        self.address_lists.insert(name.to_owned(), nets);
         self
     }
 
@@ -196,5 +212,10 @@ impl FlowView for MapView {
     }
     fn response_body_text(&self) -> Option<Cow<'_, str>> {
         self.response_body.as_deref().map(Cow::Borrowed)
+    }
+    fn in_address_list(&self, list: &str, ip: IpAddr) -> Option<bool> {
+        self.address_lists
+            .get(list)
+            .map(|nets| nets.iter().any(|n| n.contains(&ip)))
     }
 }

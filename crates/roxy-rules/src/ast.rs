@@ -112,6 +112,9 @@ pub enum Lit {
     List(Vec<LitNode>),
     Ip(IpAddr),
     Cidr(IpNet),
+    /// `@name`: a named address list, only valid after `in` / `not in`
+    /// with an ip operand (§7.1).
+    AddressList(String),
     /// Bare uppercase identifier: an HTTP method.
     Method(String),
 }
@@ -308,6 +311,7 @@ impl fmt::Display for Lit {
             }
             Lit::Ip(ip) => write!(f, "{ip}"),
             Lit::Cidr(net) => write!(f, "{net}"),
+            Lit::AddressList(n) => write!(f, "@{n}"),
             Lit::Method(m) => f.write_str(m),
         }
     }
@@ -389,6 +393,7 @@ fn sexpr_lit(l: &Lit) -> String {
         ),
         Lit::Ip(ip) => format!("ip:{ip}"),
         Lit::Cidr(net) => format!("cidr:{net}"),
+        Lit::AddressList(n) => format!("list:@{n}"),
         Lit::Method(m) => format!("method:{m}"),
     }
 }

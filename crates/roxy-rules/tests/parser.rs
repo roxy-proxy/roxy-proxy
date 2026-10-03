@@ -21,7 +21,7 @@ fn parser_golden() {
         r#"header["Upgrade"] == "websocket""#,
         r#"header.all["accept"] contains "json""#,
         r#"not (client.ip in [10.0.0.0/8, fd00::/8]) or client.user == "ci""#,
-        r#"client.ip not in [192.168.0.0/16, 127.0.0.1, ::1]"#,
+        "client.ip not in [192.168.0.0/16, 127.0.0.1, ::1]",
         r#"path like "/repos/*/issues" and query["page"] != "1""#,
         r#"url matches "https://[a-z]+\\.example\\.com/.*""#,
         r#"tag["billing"] and not tag["internal"]"#,
@@ -33,6 +33,8 @@ fn parser_golden() {
         "body.size < 1mb and body.text contains \"\\\"secret\\\\\"",
         "listener.name == \"proxy\"\n  and (scheme == \"https\"\n       or port == 80)",
         "response.header[\"content-type\"] starts_with \"text/\"",
+        "client.ip in @internal",
+        "dst.ip not in @blocked-v6 or client.ip in [10.0.0.0/8]",
     ];
     let mut out = String::new();
     for src in cases {
@@ -145,6 +147,7 @@ fn scalar_lit() -> impl Strategy<Value = Lit> {
         (any::<Ipv6Addr>(), 0u8..=128)
             .prop_map(|(ip, p)| Lit::Cidr(IpNet::new(IpAddr::V6(ip), p).unwrap().trunc())),
         "[A-Z][A-Z_]{0,6}".prop_map(Lit::Method),
+        "[a-z_][a-z0-9_-]{0,6}".prop_map(Lit::AddressList),
     ]
 }
 
@@ -235,7 +238,7 @@ proptest! {
     fn never_panics_tokens(toks in prop::collection::vec(prop::sample::select(vec![
         "host", "header", "[", "]", "\"x\"", "(", ")", "==", "!=", "<", "in", "not", "and",
         "or", "10.0.0.0/8", "fd00::/8", "5mb", "GET", ",", ".", "all", "true", "under",
-        "matches", "#c\n", "\"", "::", "1.2", "/",
+        "matches", "#c\n", "\"", "::", "1.2", "/", "@internal", "@", "@-",
     ]), 0..20)) {
         let src = toks.join(" ");
         let _ = roxy_rules::parse(&src);

@@ -24,6 +24,8 @@ pub(crate) enum Tok {
     Int(i64, Option<Unit>),
     Ip(IpAddr),
     Cidr(IpNet),
+    /// `@name`: a named address list (§7.1).
+    ListRef(String),
     True,
     False,
     And,
@@ -60,6 +62,7 @@ impl Tok {
             Tok::Int(..) => "a number".into(),
             Tok::Ip(_) => "an IP address".into(),
             Tok::Cidr(_) => "a CIDR".into(),
+            Tok::ListRef(n) => format!("`@{n}`"),
             Tok::Eof => "end of expression".into(),
             other => format!("`{}`", other.symbol()),
         }
@@ -150,6 +153,7 @@ impl Lexer<'_> {
                 b',' => self.single(Tok::Comma),
                 b'.' => self.single(Tok::Dot),
                 b'"' => self.string()?,
+                b'@' => self.list_ref()?,
                 b'=' | b'!' | b'<' | b'>' | b'&' | b'|' => self.operator()?,
                 b':' => self.ipv6()?,
                 b'0'..=b'9' if self.looks_like_ipv6() => self.ipv6()?,
@@ -194,6 +198,7 @@ impl Lexer<'_> {
         }
     }
 
+    #[allow(clippy::unused_self)] // method form reads better at call sites
     fn err<T>(&self, start: usize, end: usize, msg: impl Into<String>) -> Result<T, ExprError> {
         Err(ExprError::new(Span::new(start, end), msg))
     }
@@ -266,6 +271,32 @@ impl Lexer<'_> {
                 }
             }
         }
+    }
+
+    /// `@name` with name `[A-Za-z_][A-Za-z0-9_-]*`.
+    fn list_ref(&mut self) -> Result<Tok, ExprError> {
+        let start = self.pos;
+        self.pos += 1;
+        if !self
+            .bytes
+            .get(self.pos)
+            .copied()
+            .is_some_and(is_ident_start)
+        {
+            return self.err(
+                start,
+                self.pos,
+                "expected an address list name after `@`, e.g. @internal",
+            );
+        }
+        while self
+            .bytes
+            .get(self.pos)
+            .is_some_and(|&b| is_ident_char(b) || b == b'-')
+        {
+            self.pos += 1;
+        }
+        Ok(Tok::ListRef(self.src[start + 1..self.pos].to_owned()))
     }
 
     fn word(&mut self) -> Tok {
@@ -582,13 +613,30 @@ mod tests {
     }
 
     #[test]
+    fn list_refs() {
+        assert_eq!(
+            toks("client.ip in @internal-v4_2"),
+            vec![
+                Tok::Ident("client".into()),
+                Tok::Dot,
+                Tok::Ident("ip".into()),
+                Tok::In,
+                Tok::ListRef("internal-v4_2".into()),
+                Tok::Eof
+            ]
+        );
+        assert!(err("x in @").contains("address list name"));
+        assert!(err("x in @1x").contains("address list name"));
+    }
+
+    #[test]
     fn string_errors() {
         assert_eq!(err("\"abc"), "unterminated string");
         assert_eq!(err("\"abc\ndef\""), "unterminated string");
         assert!(err(r#""\d+""#).contains("unknown escape `\\d`"));
         assert!(err("a = b").contains("use `==`"));
         assert!(err("a && b").contains("use `and`"));
-        assert!(err("a @ b").contains("unexpected character '@'"));
+        assert!(err("a $ b").contains("unexpected character '$'"));
     }
 
     #[test]

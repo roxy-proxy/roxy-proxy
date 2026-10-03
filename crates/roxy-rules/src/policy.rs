@@ -1,0 +1,902 @@
+//! The compiled, immutable [`Policy`] and the rule-chain evaluator.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+
+use regex::Regex;
+
+use crate::compile::{Env, Needs, Pred, build_shared_regex, compile};
+use crate::config::{
+    Action, AllowArgs, DenyArgs, LogLevel, MetricConfig, MetricCount, Phase, RuleConfig, Upgrade,
+};
+use crate::diag::{Diagnostic, RuleId};
+use crate::eval::{
+    AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Effect, EvalContext, Outcome,
+    Scope,
+};
+use crate::types::{Field, is_token};
+use crate::view::FlowView;
+
+/// Everything [`Policy::compile`] needs from the config.
+#[derive(Debug, Clone, Copy)]
+pub struct PolicyInput<'a> {
+    pub rules: &'a [RuleConfig],
+    pub metrics: &'a [MetricConfig],
+    /// Names defined under `secrets:` (values are not needed to compile).
+    pub secret_names: &'a HashSet<String>,
+    /// Names defined under `addons:`.
+    pub addon_names: &'a HashSet<String>,
+    /// Names defined under `address_lists:` (for `ip in @name`; the data
+    /// stays with the proxy).
+    pub address_lists: &'a HashSet<String>,
+    /// Whether any transparent listener exists. Always false in M1, which
+    /// makes `passthrough` a compile error.
+    pub transparent_listeners: bool,
+}
+
+/// A compiled metric definition (§6.4). Counting is the proxy's job (M2);
+/// this carries the shape and the compiled `where` filter.
+#[derive(Debug, Clone)]
+pub struct MetricDef {
+    pub id: String,
+    pub count: MetricCount,
+    /// For `unique(<field>)`: the field whose distinct values are counted.
+    pub unique: Option<Field>,
+    /// Series key fields; empty = one global series.
+    pub key: Vec<Field>,
+    pub window: Option<Duration>,
+    /// Phase in which the counted thing is known and `where` is evaluated.
+    pub phase: Phase,
+    filter: Option<Pred>,
+}
+
+impl MetricDef {
+    /// Whether a flow passes this metric's `where` filter (absent = always).
+    pub fn matches(&self, view: &dyn FlowView) -> bool {
+        self.filter.as_ref().is_none_or(|p| {
+            p.eval(&Scope {
+                view,
+                tags: &[],
+                effects: &[],
+            })
+        })
+    }
+}
+
+/// A `set_header` value: literal text and `${secret:name}` references.
+#[derive(Debug, Clone)]
+enum Part {
+    Lit(String),
+    Secret(String),
+}
+
+#[derive(Debug, Clone)]
+enum CAction {
+    Effect(Effect),
+    SetHeader { name: String, parts: Vec<Part> },
+    Tag(String),
+    Terminal(Decision),
+}
+
+#[derive(Debug, Clone)]
+struct CompiledRule {
+    id: RuleId,
+    when: Option<Pred>,
+    actions: Box<[CAction]>,
+}
+
+/// A compiled policy: one rule chain per phase plus metric definitions.
+/// Immutable; the proxy shares it behind `Arc` and swaps it on reload.
+#[derive(Debug, Clone)]
+pub struct Policy {
+    chains: [Vec<CompiledRule>; 4],
+    metrics: Vec<MetricDef>,
+    ids: Vec<RuleId>,
+    needs_request_body: bool,
+    needs_response_body: bool,
+    default_id: RuleId,
+}
+
+fn phase_index(p: Phase) -> usize {
+    match p {
+        Phase::Connect => 0,
+        Phase::Request => 1,
+        Phase::Response => 2,
+        Phase::Ws => 3,
+    }
+}
+
+const SECRET_OPEN: &str = "${secret:";
+
+/// Headers rules may not set or remove: framing and hop-by-hop headers are
+/// owned by roxy's canonicaliser (§5.3, §5.5), and `host` changes go
+/// through `redirect: { rewrite_host: true }`.
+const RESERVED_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "upgrade",
+];
+
+/// Valid header value bytes (§5.3): visible ASCII, SP, HTAB.
+pub(crate) fn is_header_value(s: &str) -> bool {
+    s.bytes().all(|b| b == b'\t' || (b' '..=b'~').contains(&b))
+}
+
+impl Policy {
+    /// Compile rules and metrics. Returns every problem found.
+    pub fn compile(input: &PolicyInput<'_>) -> Result<Policy, Vec<Diagnostic>> {
+        let mut c = PolicyCompiler {
+            input,
+            d: Vec::new(),
+            needs: Needs::default(),
+        };
+        let metrics = c.metrics();
+        let (chains, ids) = c.rules();
+        if !c.d.is_empty() {
+            return Err(c.d);
+        }
+        Ok(Policy {
+            chains,
+            metrics,
+            ids,
+            needs_request_body: c.needs.request_body,
+            needs_response_body: c.needs.response_body,
+            default_id: RuleId::new(RuleId::DEFAULT),
+        })
+    }
+
+    /// Evaluate `phase`'s chain against a flow.
+    ///
+    /// Rules run top to bottom; a rule whose `when` matches (absent `when`
+    /// always matches) runs its actions in order. The first terminal action
+    /// decides. If the chain is exhausted the result is
+    /// [`Decision::default_for`] the phase with `terminal_rule = "_default"`.
+    ///
+    /// Fail closed: if a `set_header` secret cannot be resolved, or its
+    /// substituted value is not a valid header value, evaluation stops with
+    /// `Deny { status: 500 }` attributed to that rule, plus an `error` log
+    /// effect naming the secret (never its value).
+    ///
+    /// Allocation: nothing is allocated for rules that do not match, except
+    /// what the view itself returns (e.g. `header.all`). Matching rules clone
+    /// their id (a refcount) and their effects.
+    pub fn evaluate(&self, phase: Phase, view: &dyn FlowView, ctx: &EvalContext<'_>) -> Outcome {
+        let mut tags: Vec<String> = ctx.initial_tags.to_vec();
+        let mut effects: Vec<Effect> = Vec::new();
+        let mut matched: Vec<RuleId> = Vec::new();
+        for rule in &self.chains[phase_index(phase)] {
+            let hit = rule.when.as_ref().is_none_or(|p| {
+                p.eval(&Scope {
+                    view,
+                    tags: &tags,
+                    effects: &effects,
+                })
+            });
+            if !hit {
+                continue;
+            }
+            matched.push(rule.id.clone());
+            for action in &rule.actions {
+                match action {
+                    CAction::Effect(e) => effects.push(e.clone()),
+                    CAction::Tag(t) => {
+                        if !tags.contains(t) {
+                            tags.push(t.clone());
+                        }
+                    }
+                    CAction::SetHeader { name, parts } => match render(parts, ctx) {
+                        Ok(value) => effects.push(Effect::SetHeader {
+                            name: name.clone(),
+                            value,
+                        }),
+                        Err(problem) => {
+                            effects.push(Effect::Log {
+                                level: LogLevel::Error,
+                                message: format!(
+                                    "rule {}: set_header {name}: {problem}; denying (fail closed)",
+                                    rule.id
+                                ),
+                            });
+                            return Outcome {
+                                decision: Decision::deny(500, "secret unavailable"),
+                                matched,
+                                terminal_rule: rule.id.clone(),
+                                effects,
+                                tags,
+                            };
+                        }
+                    },
+                    CAction::Terminal(d) => {
+                        return Outcome {
+                            decision: d.clone(),
+                            matched,
+                            terminal_rule: rule.id.clone(),
+                            effects,
+                            tags,
+                        };
+                    }
+                }
+            }
+        }
+        Outcome {
+            decision: Decision::default_for(phase),
+            matched,
+            terminal_rule: self.default_id.clone(),
+            effects,
+            tags,
+        }
+    }
+
+    /// Whether any rule or metric filter reads `body.text`.
+    pub fn needs_request_body(&self) -> bool {
+        self.needs_request_body
+    }
+
+    /// Whether any rule reads `response.body.text`.
+    pub fn needs_response_body(&self) -> bool {
+        self.needs_response_body
+    }
+
+    /// Rule ids in config order.
+    pub fn rule_ids(&self) -> impl Iterator<Item = &RuleId> {
+        self.ids.iter()
+    }
+
+    pub fn metric_defs(&self) -> &[MetricDef] {
+        &self.metrics
+    }
+
+    /// Number of rules in `phase`'s chain.
+    pub fn rule_count(&self, phase: Phase) -> usize {
+        self.chains[phase_index(phase)].len()
+    }
+}
+
+/// Substitute secrets into a `set_header` value and validate the result.
+fn render(parts: &[Part], ctx: &EvalContext<'_>) -> Result<String, String> {
+    let mut out = String::new();
+    for part in parts {
+        match part {
+            Part::Lit(s) => out.push_str(s),
+            Part::Secret(name) => {
+                let value =
+                    (ctx.secrets)(name).ok_or_else(|| format!("secret {name:?} is unavailable"))?;
+                if !is_header_value(&value) {
+                    return Err(format!(
+                        "secret {name:?} is not a valid header value (control or non-ASCII \
+                         characters)"
+                    ));
+                }
+                out.push_str(&value);
+            }
+        }
+    }
+    Ok(out)
+}
+
+struct PolicyCompiler<'i, 'a> {
+    input: &'i PolicyInput<'a>,
+    d: Vec<Diagnostic>,
+    needs: Needs,
+}
+
+fn is_ident(s: &str) -> bool {
+    let mut b = s.bytes();
+    b.next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+        && b.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+}
+
+impl PolicyCompiler<'_, '_> {
+    fn push(&mut self, rule: Option<&RuleId>, path: impl Into<String>, msg: impl Into<String>) {
+        self.d
+            .push(Diagnostic::new(path, msg).with_rule(rule.cloned()));
+    }
+
+    fn expr(
+        &mut self,
+        rule: Option<&RuleId>,
+        path: String,
+        src: &str,
+        phase: Phase,
+    ) -> Option<Pred> {
+        let input = self.input;
+        let exists = |id: &str| input.metrics.iter().any(|m| m.id == id);
+        let result = compile(
+            src,
+            &Env {
+                phase,
+                metric_exists: &exists,
+                list_exists: &|name: &str| input.address_lists.contains(name),
+            },
+        );
+        match result {
+            Ok((pred, needs)) => {
+                self.needs.request_body |= needs.request_body;
+                self.needs.response_body |= needs.response_body;
+                Some(pred)
+            }
+            Err(e) => {
+                self.d
+                    .push(Diagnostic::from_expr(path, src, e).with_rule(rule.cloned()));
+                None
+            }
+        }
+    }
+
+    fn metrics(&mut self) -> Vec<MetricDef> {
+        let mut out = Vec::new();
+        let mut ids: HashMap<&str, usize> = HashMap::new();
+        let input = self.input;
+        for (i, m) in input.metrics.iter().enumerate() {
+            let path = format!("metrics[{i}]");
+            if !is_ident(&m.id) {
+                self.push(
+                    None,
+                    format!("{path}.id"),
+                    format!(
+                        "invalid metric id {:?}: must match [A-Za-z_][A-Za-z0-9_]* so it can be \
+                         used as metric.<id>",
+                        m.id
+                    ),
+                );
+            }
+            if let Some(first) = ids.insert(m.id.as_str(), i) {
+                self.push(
+                    None,
+                    format!("{path}.id"),
+                    format!(
+                        "duplicate metric id {:?} (first defined at metrics[{first}])",
+                        m.id
+                    ),
+                );
+            }
+            if m.window.is_some_and(|w| w.is_zero()) {
+                self.push(
+                    None,
+                    format!("{path}.window"),
+                    "window must be greater than zero",
+                );
+            }
+            let phase = m.count.phase();
+            let field = |this: &mut Self, name: &str, at: String, what: &str| -> Option<Field> {
+                match Field::from_name(name) {
+                    Some(f) if f.phases().contains(phase) => Some(f),
+                    Some(f) => {
+                        this.push(
+                            None,
+                            at,
+                            format!(
+                                "`{f}` is not available in the {phase} phase, where this \
+                                 metric is counted"
+                            ),
+                        );
+                        None
+                    }
+                    None => {
+                        this.push(
+                            None,
+                            at,
+                            format!(
+                                "unknown {what} field `{name}`; metric fields must be scalar fields \
+                                 such as client.ip, client.user, host"
+                            ),
+                        );
+                        None
+                    }
+                }
+            };
+            let key: Vec<Field> = m
+                .key
+                .iter()
+                .enumerate()
+                .filter_map(|(j, k)| field(self, k, format!("{path}.key[{j}]"), "key"))
+                .collect();
+            let unique = match &m.count {
+                MetricCount::Unique(f) => field(self, f, format!("{path}.count"), "unique()"),
+                _ => None,
+            };
+            let filter = m
+                .where_
+                .as_ref()
+                .and_then(|w| self.expr(None, format!("{path}.where"), w.as_str(), phase));
+            out.push(MetricDef {
+                id: m.id.clone(),
+                count: m.count.clone(),
+                unique,
+                key,
+                window: m.window,
+                phase,
+                filter,
+            });
+        }
+        out
+    }
+
+    fn rules(&mut self) -> ([Vec<CompiledRule>; 4], Vec<RuleId>) {
+        let mut chains: [Vec<CompiledRule>; 4] = Default::default();
+        let mut ids = Vec::new();
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        let mut inspect_enabled = false;
+        let mut first_ws_rule: Option<(usize, RuleId)> = None;
+        let input = self.input;
+        for (i, rule) in input.rules.iter().enumerate() {
+            let path = format!("rules[{i}]");
+            let rid = RuleId::new(&rule.id);
+            if rule.id.trim().is_empty() {
+                self.push(
+                    Some(&rid),
+                    format!("{path}.id"),
+                    "rule id must not be empty",
+                );
+            } else if rule.id.starts_with('_') {
+                self.push(
+                    Some(&rid),
+                    format!("{path}.id"),
+                    format!(
+                        "rule id {:?}: ids starting with `_` are reserved (e.g. `_default`)",
+                        rule.id
+                    ),
+                );
+            }
+            if let Some(first) = seen.insert(rule.id.as_str(), i) {
+                self.push(
+                    Some(&rid),
+                    format!("{path}.id"),
+                    format!(
+                        "duplicate rule id {:?} (first defined at rules[{first}])",
+                        rule.id
+                    ),
+                );
+            }
+            let when = rule.when.as_ref().and_then(|w| {
+                self.expr(Some(&rid), format!("{path}.when"), w.as_str(), rule.phase)
+            });
+            let actions = self.actions(rule, &rid, &path);
+            if rule.phase == Phase::Request
+                && rule
+                    .then
+                    .0
+                    .iter()
+                    .any(|a| matches!(a, Action::Allow(AllowArgs { inspect: true, .. })))
+            {
+                inspect_enabled = true;
+            }
+            if rule.phase == Phase::Ws && first_ws_rule.is_none() {
+                first_ws_rule = Some((i, rid.clone()));
+            }
+            chains[phase_index(rule.phase)].push(CompiledRule {
+                id: rid.clone(),
+                when,
+                actions: actions.into(),
+            });
+            ids.push(rid);
+        }
+        if let Some((i, rid)) = first_ws_rule
+            && !inspect_enabled
+        {
+            self.push(
+                Some(&rid),
+                format!("rules[{i}].phase"),
+                "`ws`-phase rules can never run: no request rule enables message inspection \
+                 with `allow: { upgrade: websocket, inspect: true }` (DESIGN.md §8.2)",
+            );
+        }
+        (chains, ids)
+    }
+
+    fn actions(&mut self, rule: &RuleConfig, rid: &RuleId, path: &str) -> Vec<CAction> {
+        let actions = &rule.then.0;
+        let mut out = Vec::with_capacity(actions.len());
+        for (j, action) in actions.iter().enumerate() {
+            let apath = format!("{path}.then[{j}]");
+            if j > 0 && actions[j - 1].is_terminal() {
+                self.push(
+                    Some(rid),
+                    apath.clone(),
+                    format!(
+                        "`{}` follows the terminal action `{}` and would never run; move it \
+                         before `{}`",
+                        action.name(),
+                        actions[j - 1].name(),
+                        actions[j - 1].name()
+                    ),
+                );
+            }
+            if let Some(a) = self.action(rule.phase, action, rid, &apath) {
+                out.extend(a);
+            }
+        }
+        out
+    }
+
+    /// Check one action; `None` if it has errors (already reported).
+    #[allow(clippy::too_many_lines)]
+    fn action(
+        &mut self,
+        phase: Phase,
+        action: &Action,
+        rid: &RuleId,
+        apath: &str,
+    ) -> Option<Vec<CAction>> {
+        let errors_before = self.d.len();
+        let rule = Some(rid);
+        let allowed = allowed_phases(action);
+        if !allowed.contains(&phase) {
+            let names: Vec<&str> = allowed.iter().map(|p| p.as_str()).collect();
+            self.push(
+                rule,
+                apath,
+                format!(
+                    "`{}` is not allowed in the {phase} phase (allowed in: {})",
+                    action.name(),
+                    names.join(", ")
+                ),
+            );
+        }
+        for s in non_header_strings(action) {
+            if s.contains(SECRET_OPEN) {
+                self.push(
+                    rule,
+                    apath,
+                    format!(
+                        "secret references are only allowed in `set_header` values, not in \
+                         `{}`",
+                        action.name()
+                    ),
+                );
+                break;
+            }
+        }
+        let out = match action {
+            Action::Allow(a) => {
+                let opts = AllowOpts {
+                    upgrade_websocket: a.upgrade == Some(Upgrade::Websocket),
+                    inspect_ws: a.inspect,
+                    private_ok: a.private_ok,
+                };
+                if opts != AllowOpts::default() && phase != Phase::Request {
+                    self.push(
+                        rule,
+                        apath,
+                        format!(
+                            "`allow` options (upgrade, inspect, private_ok) only apply in the \
+                             request phase (this rule is `{phase}`)"
+                        ),
+                    );
+                }
+                if a.inspect && a.upgrade.is_none() {
+                    self.push(rule, apath, "`inspect: true` requires `upgrade: websocket`");
+                }
+                vec![CAction::Terminal(Decision::Allow(opts))]
+            }
+            Action::Deny(DenyArgs {
+                status,
+                message,
+                close,
+            }) => {
+                let status = status.unwrap_or(DEFAULT_DENY_STATUS);
+                if !(400..=599).contains(&status) {
+                    self.push(
+                        rule,
+                        apath,
+                        format!("deny status {status} must be a 4xx or 5xx code"),
+                    );
+                }
+                if *close && phase != Phase::Ws {
+                    self.push(
+                        rule,
+                        apath,
+                        "`deny: { close: true }` only applies in the ws phase",
+                    );
+                }
+                vec![CAction::Terminal(Decision::Deny {
+                    status,
+                    message: message
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_DENY_MESSAGE.into()),
+                    close: *close,
+                })]
+            }
+            Action::Passthrough => {
+                if !self.input.transparent_listeners {
+                    self.push(
+                        rule,
+                        apath,
+                        "`passthrough` requires a transparent listener, which is not supported \
+                         yet (DESIGN.md §4.2)",
+                    );
+                }
+                vec![CAction::Terminal(Decision::Passthrough)]
+            }
+            Action::SetHeader(pairs) => {
+                let mut v = Vec::with_capacity(pairs.len());
+                for (name, value) in pairs {
+                    let Some(name) = self.header_name(rule, apath, name) else {
+                        continue;
+                    };
+                    if let Some(parts) = self.template(phase, rule, apath, &name, value) {
+                        v.push(match parts.as_slice() {
+                            [] => CAction::Effect(Effect::SetHeader {
+                                name,
+                                value: String::new(),
+                            }),
+                            [Part::Lit(s)] => CAction::Effect(Effect::SetHeader {
+                                name,
+                                value: s.clone(),
+                            }),
+                            _ => CAction::SetHeader { name, parts },
+                        });
+                    }
+                }
+                v
+            }
+            Action::RemoveHeader(names) => names
+                .iter()
+                .filter_map(|n| self.header_name(rule, apath, n))
+                .map(|n| CAction::Effect(Effect::RemoveHeader(n)))
+                .collect(),
+            Action::RewritePath(r) => {
+                let regex = match build_shared_regex(&r.pattern) {
+                    Ok(re) => Some(re),
+                    Err(e) => {
+                        self.push(rule, apath, format!("rewrite_path `match`: {e}"));
+                        None
+                    }
+                };
+                if !r.to.starts_with('/') {
+                    self.push(rule, apath, "rewrite_path `to` must start with `/`");
+                }
+                regex.map_or_else(Vec::new, |regex: Arc<Regex>| {
+                    vec![CAction::Effect(Effect::RewritePath {
+                        regex,
+                        to: r.to.clone(),
+                    })]
+                })
+            }
+            Action::SetQuery(pairs) => {
+                if pairs.iter().any(|(k, _)| k.is_empty()) {
+                    self.push(rule, apath, "query keys must not be empty");
+                }
+                pairs
+                    .iter()
+                    .map(|(k, v)| {
+                        CAction::Effect(Effect::SetQuery {
+                            key: k.clone(),
+                            value: v.clone(),
+                        })
+                    })
+                    .collect()
+            }
+            Action::RemoveQuery(keys) => {
+                if keys.iter().any(String::is_empty) {
+                    self.push(rule, apath, "query keys must not be empty");
+                }
+                keys.iter()
+                    .map(|k| CAction::Effect(Effect::RemoveQuery(k.clone())))
+                    .collect()
+            }
+            Action::Redirect(r) => {
+                let host = r.host.strip_suffix('.').unwrap_or(&r.host);
+                let valid = !host.is_empty()
+                    && host
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b':'));
+                if !valid {
+                    self.push(
+                        rule,
+                        apath,
+                        format!("redirect host {:?} is not a valid host name or IP", r.host),
+                    );
+                }
+                if r.port == 0 {
+                    self.push(rule, apath, "redirect port must not be 0");
+                }
+                vec![CAction::Effect(Effect::Redirect {
+                    host: host.to_ascii_lowercase(),
+                    port: r.port,
+                    scheme: r.scheme,
+                    rewrite_host: r.rewrite_host,
+                })]
+            }
+            Action::Tag(t) => {
+                if t.is_empty() || t.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                    self.push(
+                        rule,
+                        apath,
+                        format!("tag name {t:?} must be non-empty without whitespace"),
+                    );
+                }
+                vec![CAction::Tag(t.clone())]
+            }
+            Action::Log(l) => vec![CAction::Effect(Effect::Log {
+                level: l.level,
+                message: l.message.clone(),
+            })],
+            Action::SetState(s) => {
+                if s.key.is_empty() {
+                    self.push(rule, apath, "set_state key must not be empty");
+                }
+                if s.ttl.is_some_and(|t| t.is_zero()) {
+                    self.push(rule, apath, "set_state ttl must be greater than zero");
+                }
+                vec![CAction::Effect(Effect::SetState {
+                    key: s.key.clone(),
+                    value: s.value.clone(),
+                    ttl: s.ttl,
+                })]
+            }
+            Action::Capture(t) => vec![CAction::Effect(Effect::Capture(*t))],
+            Action::Call(name) => {
+                if !self.input.addon_names.contains(name) {
+                    self.push(
+                        rule,
+                        apath,
+                        format!("`call` names undefined addon {name:?}"),
+                    );
+                }
+                vec![CAction::Effect(Effect::CallAddon(name.clone()))]
+            }
+        };
+        (self.d.len() == errors_before).then_some(out)
+    }
+
+    fn header_name(&mut self, rule: Option<&RuleId>, apath: &str, name: &str) -> Option<String> {
+        if !is_token(name) {
+            self.push(rule, apath, format!("invalid header name {name:?}"));
+            return None;
+        }
+        let lower = name.to_ascii_lowercase();
+        if RESERVED_HEADERS.contains(&lower.as_str()) {
+            self.push(
+                rule,
+                apath,
+                format!(
+                    "header `{lower}` is managed by roxy and cannot be changed by rules{}",
+                    if lower == "host" {
+                        " (use `redirect: { ..., rewrite_host: true }`)"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+            return None;
+        }
+        Some(lower)
+    }
+
+    /// Parse `${secret:name}` references out of a `set_header` value.
+    fn template(
+        &mut self,
+        phase: Phase,
+        rule: Option<&RuleId>,
+        apath: &str,
+        header: &str,
+        value: &str,
+    ) -> Option<Vec<Part>> {
+        let mut parts = Vec::new();
+        let mut rest = value;
+        let mut ok = true;
+        while let Some(i) = rest.find("${") {
+            if i > 0 {
+                parts.push(Part::Lit(rest[..i].to_owned()));
+            }
+            let after = &rest[i..];
+            let Some(body) = after.strip_prefix(SECRET_OPEN) else {
+                self.push(
+                    rule,
+                    apath,
+                    format!(
+                        "set_header {header}: unknown interpolation in {value:?}; only \
+                         `${{secret:name}}` is supported"
+                    ),
+                );
+                return None;
+            };
+            let Some(end) = body.find('}') else {
+                self.push(
+                    rule,
+                    apath,
+                    format!("set_header {header}: unterminated `${{secret:` in {value:?}"),
+                );
+                return None;
+            };
+            let name = &body[..end];
+            if name.is_empty() {
+                self.push(
+                    rule,
+                    apath,
+                    format!("set_header {header}: empty secret name"),
+                );
+                ok = false;
+            } else if !self.input.secret_names.contains(name) {
+                self.push(
+                    rule,
+                    apath,
+                    format!("reference to undefined secret {name:?} (define it under `secrets`)"),
+                );
+                ok = false;
+            }
+            parts.push(Part::Secret(name.to_owned()));
+            rest = &body[end + 1..];
+        }
+        if !rest.is_empty() {
+            parts.push(Part::Lit(rest.to_owned()));
+        }
+        if parts.iter().any(|p| matches!(p, Part::Secret(_))) && phase != Phase::Request {
+            self.push(
+                rule,
+                apath,
+                format!(
+                    "secret references are only allowed in request-phase rules (this rule is \
+                     `{phase}`)"
+                ),
+            );
+            ok = false;
+        }
+        for p in &parts {
+            if let Part::Lit(s) = p
+                && !is_header_value(s)
+            {
+                self.push(
+                    rule,
+                    apath,
+                    format!(
+                        "set_header {header}: value {value:?} is not a valid header value \
+                         (visible ASCII, space and tab only)"
+                    ),
+                );
+                ok = false;
+                break;
+            }
+        }
+        ok.then_some(parts)
+    }
+}
+
+/// Phases in which an action is valid (§6.3).
+fn allowed_phases(a: &Action) -> &'static [Phase] {
+    use Phase::{Connect, Request, Response, Ws};
+    match a {
+        Action::Allow(_)
+        | Action::Deny(_)
+        | Action::Tag(_)
+        | Action::Log(_)
+        | Action::SetState(_) => &Phase::ALL,
+        Action::Passthrough => &[Connect],
+        Action::SetHeader(_) | Action::RemoveHeader(_) | Action::Capture(_) => &[Request, Response],
+        Action::RewritePath(_)
+        | Action::SetQuery(_)
+        | Action::RemoveQuery(_)
+        | Action::Redirect(_) => &[Request],
+        Action::Call(_) => &[Request, Response, Ws],
+    }
+}
+
+/// Strings of an action other than `set_header` values, which must not
+/// contain secret references.
+fn non_header_strings(a: &Action) -> Vec<&str> {
+    match a {
+        Action::SetHeader(pairs) => pairs.iter().map(|(k, _)| k.as_str()).collect(),
+        Action::SetQuery(pairs) => pairs
+            .iter()
+            .flat_map(|(k, v)| [k.as_str(), v.as_str()])
+            .collect(),
+        Action::RemoveHeader(v) | Action::RemoveQuery(v) => v.iter().map(String::as_str).collect(),
+        Action::Deny(d) => d.message.as_deref().into_iter().collect(),
+        Action::RewritePath(r) => vec![&r.pattern, &r.to],
+        Action::Redirect(r) => vec![&r.host],
+        Action::Tag(s) | Action::Call(s) => vec![s],
+        Action::Log(l) => vec![&l.message],
+        Action::SetState(s) => vec![&s.key, &s.value],
+        Action::Allow(_) | Action::Passthrough | Action::Capture(_) => Vec::new(),
+    }
+}

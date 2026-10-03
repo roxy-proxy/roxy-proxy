@@ -1,6 +1,6 @@
 //! Field catalogue, static types and phase availability (§6.2 table).
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 use crate::ast::FieldRef;
 use crate::config::Phase;
@@ -424,7 +424,7 @@ fn unknown_field(f: &FieldRef, dotted: &str) -> ExprError {
         .filter(|(d, _)| *d <= 2);
     let mut msg = format!("unknown field `{dotted}`");
     if let Some((_, name)) = best {
-        msg.push_str(&format!("; did you mean `{name}`?"));
+        let _ = write!(msg, "; did you mean `{name}`?");
     } else if f.path.len() == 1 && f.index.is_none() {
         msg.push_str("; strings must be double-quoted");
     }

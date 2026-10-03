@@ -91,3 +91,11 @@ listener.name == "proxy"
 response.header["content-type"] starts_with "text/"
   sexpr:  (starts_with field:response.header["content-type"] str:"text/")
   pretty: response.header["content-type"] starts_with "text/"
+
+client.ip in @internal
+  sexpr:  (in field:client.ip list:@internal)
+  pretty: client.ip in @internal
+
+dst.ip not in @blocked-v6 or client.ip in [10.0.0.0/8]
+  sexpr:  (or (not in field:dst.ip list:@blocked-v6) (in field:client.ip [cidr:10.0.0.0/8]))
+  pretty: dst.ip not in @blocked-v6 or client.ip in [10.0.0.0/8]

@@ -40,6 +40,7 @@ const REGEX_NEST_LIMIT: u32 = 64;
 pub(crate) struct Env<'a> {
     pub phase: Phase,
     pub metric_exists: &'a dyn Fn(&str) -> bool,
+    pub list_exists: &'a dyn Fn(&str) -> bool,
 }
 
 /// Body buffering required by an expression.
@@ -134,6 +135,35 @@ pub(crate) enum Pred {
         nets: Box<[IpNet]>,
         negate: bool,
     },
+    /// `ip in @list`: membership is answered by the view
+    /// ([`crate::FlowView::in_address_list`]); the engine holds only the name.
+    InList {
+        lhs: ROperand,
+        list: Arc<str>,
+        negate: bool,
+    },
+}
+
+fn list_misuse(span: Span, name: &str) -> ExprError {
+    ExprError::new(
+        span,
+        format!("address list @{name} can only be used with `in`/`not in` on an ip field"),
+    )
+}
+
+/// Reject `@list` anywhere except directly on the right of `in`/`not in`.
+fn reject_list(t: &Typed<'_>) -> Result<(), ExprError> {
+    fn walk(l: &LitNode) -> Result<(), ExprError> {
+        match &l.lit {
+            Lit::AddressList(n) => Err(list_misuse(l.span, n)),
+            Lit::List(items) => items.iter().try_for_each(walk),
+            _ => Ok(()),
+        }
+    }
+    match t {
+        Typed::Lit(l) => walk(l),
+        Typed::Field(..) => Ok(()),
+    }
 }
 
 /// Parse and compile one expression.
@@ -231,7 +261,7 @@ impl Typed<'_> {
                 Lit::Int(..) => Some(Type::Int),
                 Lit::Bool(_) => Some(Type::Bool),
                 Lit::Ip(_) => Some(Type::Ip),
-                Lit::List(_) | Lit::Cidr(_) => None,
+                Lit::List(_) | Lit::Cidr(_) | Lit::AddressList(_) => None,
             },
         }
     }
@@ -262,6 +292,7 @@ fn describe_lit(l: &Lit) -> String {
         Lit::List(_) => format!("the list {l}"),
         Lit::Ip(_) => format!("the IP address {l}"),
         Lit::Cidr(_) => format!("the CIDR {l}"),
+        Lit::AddressList(_) => format!("the address list {l}"),
         Lit::Method(_) => format!("the method {l}"),
     }
 }
@@ -324,6 +355,7 @@ impl Compiler<'_, '_> {
 
     fn predicate(&mut self, o: &Operand) -> Result<Pred, ExprError> {
         let t = self.operand(o)?;
+        reject_list(&t)?;
         match t {
             Typed::Lit(LitNode {
                 lit: Lit::Bool(b), ..
@@ -345,6 +377,7 @@ impl Compiler<'_, '_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn comparison(
         &mut self,
         lo: &Operand,
@@ -356,6 +389,17 @@ impl Compiler<'_, '_> {
         let r = self.operand(ro)?;
         check_method_literal(&l, &r)?;
         check_method_literal(&r, &l)?;
+        reject_list(&l)?;
+        let rhs_is_list_ref = matches!(
+            r,
+            Typed::Lit(LitNode {
+                lit: Lit::AddressList(_),
+                ..
+            })
+        );
+        if !(rhs_is_list_ref && matches!(op, Op::In | Op::NotIn)) {
+            reject_list(&r)?;
+        }
         let field_desc = |t: &Typed<'_>, o: &Operand| t.describe(Some(o));
         match op {
             Op::Eq | Op::Ne => {
@@ -440,25 +484,24 @@ impl Compiler<'_, '_> {
             }
             Op::Like | Op::Matches | Op::Under => {
                 string_lhs(&l, lo, op)?;
-                let pattern = match &r {
-                    Typed::Lit(LitNode {
-                        lit: Lit::Str(s), ..
-                    }) => s.as_str(),
-                    _ => {
-                        let what = match op {
-                            Op::Like => "a quoted glob pattern",
-                            Op::Matches => "a quoted regex",
-                            _ => "a quoted domain",
-                        };
-                        return Err(ExprError::new(
-                            r.span(),
-                            format!(
-                                "`{}` needs {what} on the right, found {}",
-                                op.as_str(),
-                                field_desc(&r, ro)
-                            ),
-                        ));
-                    }
+                let Typed::Lit(LitNode {
+                    lit: Lit::Str(pattern),
+                    ..
+                }) = &r
+                else {
+                    let what = match op {
+                        Op::Like => "a quoted glob pattern",
+                        Op::Matches => "a quoted regex",
+                        _ => "a quoted domain",
+                    };
+                    return Err(ExprError::new(
+                        r.span(),
+                        format!(
+                            "`{}` needs {what} on the right, found {}",
+                            op.as_str(),
+                            field_desc(&r, ro)
+                        ),
+                    ));
                 };
                 let ci = l.ci();
                 let rspan = r.span();
@@ -488,6 +531,7 @@ impl Compiler<'_, '_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn membership(
         &mut self,
         l: Typed<'_>,
@@ -506,6 +550,25 @@ impl Compiler<'_, '_> {
                 ),
             ));
         };
+        if let Lit::AddressList(name) = &rl.lit {
+            if l.ty() != Some(Type::Ip) {
+                return Err(list_misuse(rl.span, name));
+            }
+            if !(self.env.list_exists)(name) {
+                return Err(ExprError::new(
+                    rl.span,
+                    format!(
+                        "reference to undefined address list `@{name}` (define it under \
+                         `address_lists`)"
+                    ),
+                ));
+            }
+            return Ok(Pred::InList {
+                lhs: lower(l),
+                list: Arc::from(name.as_str()),
+                negate,
+            });
+        }
         let items: &[LitNode] = match &rl.lit {
             Lit::List(items) => items,
             Lit::Cidr(_) => std::slice::from_ref(*rl),
@@ -685,7 +748,7 @@ fn lower(t: Typed<'_>) -> ROperand {
             Lit::Bool(b) => Const::Bool(*b),
             Lit::Ip(ip) => Const::Ip(ip.to_canonical()),
             // Rejected by the type checks before lowering.
-            Lit::List(_) | Lit::Cidr(_) => Const::Bool(false),
+            Lit::List(_) | Lit::Cidr(_) | Lit::AddressList(_) => Const::Bool(false),
         }),
     }
 }

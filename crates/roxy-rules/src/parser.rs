@@ -281,6 +281,7 @@ impl Parser {
             Tok::False => Lit::Bool(false),
             Tok::Ip(ip) => Lit::Ip(ip),
             Tok::Cidr(net) => Lit::Cidr(net),
+            Tok::ListRef(n) => Lit::AddressList(n),
             Tok::Upper(m) => Lit::Method(m),
             Tok::LBracket => return self.list(t.span),
             other => {
