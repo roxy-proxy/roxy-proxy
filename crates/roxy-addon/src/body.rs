@@ -9,7 +9,9 @@
 use std::fmt;
 
 use crate::bindings::wasi::http::types::{IncomingBody, IncomingRequest, IncomingResponse};
+use crate::bindings::wasi::io::poll::{Pollable, poll};
 use crate::bindings::wasi::io::streams::{InputStream, StreamError};
+use crate::pump::{RequestPump, Wait};
 
 /// Largest chunk read from the host at once.
 pub(crate) const READ_CHUNK: u64 = 64 * 1024;
@@ -73,22 +75,26 @@ pub(crate) struct Incoming {
     stream: Option<InputStream>,
     body: Option<IncomingBody>,
     parent: Option<Parent>,
+    /// For a response: the rest of its request's body, written while this
+    /// body is read (see [`crate::pump`]).
+    pump: Option<Box<RequestPump>>,
 }
 
 impl Incoming {
-    pub(crate) fn new(body: IncomingBody, parent: Parent) -> Self {
+    pub(crate) fn new(body: IncomingBody, parent: Parent, pump: Option<RequestPump>) -> Self {
         let stream = body.stream().ok();
         Self {
             stream,
             body: Some(body),
             parent: Some(parent),
+            pump: pump.filter(|p| !p.is_done()).map(Box::new),
         }
     }
 
     fn next_chunk(&mut self) -> Option<Result<Vec<u8>, BodyError>> {
-        let stream = self.stream.as_ref()?;
         loop {
-            match stream.blocking_read(READ_CHUNK) {
+            let stream = self.stream.as_ref()?;
+            match stream.read(READ_CHUNK) {
                 Ok(chunk) if chunk.is_empty() => {}
                 Ok(chunk) => return Some(Ok(chunk)),
                 Err(StreamError::Closed) => {
@@ -101,13 +107,46 @@ impl Incoming {
                     return Some(Err(BodyError::Stream(msg)));
                 }
             }
+            // Nothing to read yet: wait for data, pumping the request body
+            // meanwhile.
+            let readable = stream.subscribe();
+            match self.pump.as_deref().map(RequestPump::wait) {
+                None | Some(Wait::Done) => {
+                    self.pump = None;
+                    readable.block();
+                }
+                Some(Wait::Ready) => {
+                    drop(readable);
+                    self.pump.as_mut().expect("pump").advance();
+                }
+                Some(Wait::On(writable)) => {
+                    let ready = poll(&[&readable, &writable]);
+                    drop((readable, writable));
+                    if ready.contains(&1) {
+                        self.pump.as_mut().expect("pump").advance();
+                    }
+                }
+            }
         }
     }
 
     fn close(&mut self) {
+        if let Some(mut pump) = self.pump.take() {
+            pump.drain();
+        }
         self.stream = None;
         self.body = None;
         self.parent = None;
+    }
+
+    fn pollable(&self) -> Option<Pollable> {
+        // With a pump attached, reading also drives the request body, which
+        // one pollable cannot express: report "ready" and let `next_chunk`
+        // poll both.
+        if self.pump.is_some() {
+            return None;
+        }
+        self.stream.as_ref().map(InputStream::subscribe)
     }
 }
 
@@ -197,9 +236,19 @@ impl Body {
         }
     }
 
-    pub(crate) fn incoming(body: IncomingBody, parent: Parent) -> Self {
+    pub(crate) fn incoming(body: IncomingBody, parent: Parent, pump: Option<RequestPump>) -> Self {
         Self {
-            inner: Inner::Incoming(Incoming::new(body, parent)),
+            inner: Inner::Incoming(Incoming::new(body, parent, pump)),
+        }
+    }
+
+    /// Ready when the next chunk can be pulled without waiting on the host;
+    /// `None` when that is always so (in-memory bodies).
+    pub(crate) fn pollable(&self) -> Option<Pollable> {
+        match &self.inner {
+            Inner::Incoming(i) => i.pollable(),
+            Inner::Piped { source, .. } => source.pollable(),
+            Inner::Empty | Inner::Bytes(_) | Inner::Chunks(_) => None,
         }
     }
 

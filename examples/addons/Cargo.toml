@@ -2,7 +2,7 @@
 # addons build for wasm32-wasip2. See each example's README.
 [workspace]
 resolver = "3"
-members = ["sentinel"]
+members = ["redact"]
 
 [workspace.package]
 version = "0.0.0"

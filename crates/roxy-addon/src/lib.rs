@@ -39,6 +39,7 @@ pub mod bindings;
 mod body;
 pub mod flow;
 mod message;
+mod pump;
 
 use std::any::Any;
 use std::cell::RefCell;

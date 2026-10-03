@@ -64,12 +64,13 @@ flow.
 - **Service layers** stream the exchange through an external HTTP service,
   for logic that is easier to run out of process (DESIGN.md §11.6).
 
-[`examples/addons/sentinel`](examples/addons/sentinel) is a small
-inspect-sentinel. It blocks LLM tool calls by policy in Anthropic and
-OpenAI traffic: it rewrites denied calls into refusals the agent can act
-on, withholds streamed `tool_use` blocks until it has judged them, records
-each decision, and quarantines repeat offenders. One clearly marked
-function is where a regex check becomes a model call.
+The flagship integration is
+[inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel):
+its monitors and control protocols (continue, modify, reject, escalate,
+terminate) running at the network boundary, where the agent cannot bypass
+them. It comes first as a Python sidecar on a service layer. A compiled
+(CPython-in-WASM) build will follow once inspect_sentinel supports one.
+See [`examples/addons`](examples/addons).
 
 ## Status
 
@@ -95,7 +96,7 @@ Usable in explicit proxy mode. Built and tested:
 Deferred, with designs in DESIGN.md:
 
 - Running addons in the proxy (§11). The WASM host (`roxy-wasm`), the
-  `roxy-addon` SDK and the sentinel example are built and tested, but
+  `roxy-addon` SDK and its example are built and tested, but
   `roxy run` still refuses a config that defines addons until the layer
   stack is wired into the proxy. Service layers come after that.
 - Transparent mode (§4.2).

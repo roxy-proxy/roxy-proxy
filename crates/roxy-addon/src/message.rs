@@ -8,7 +8,9 @@ use crate::bindings::wasi::http::types::{
     ErrorCode, Fields, FutureIncomingResponse, IncomingRequest, IncomingResponse,
     Method as WMethod, OutgoingBody, OutgoingRequest, OutgoingResponse, ResponseOutparam, Scheme,
 };
+use crate::bindings::wasi::io::poll::poll;
 use crate::body::{Body, Parent};
+use crate::pump::{RequestPump, Wait};
 
 /// Header names the SDK never forwards: hop-by-hop fields the host's WASI
 /// HTTP implementation refuses, and `content-length`, which roxy derives
@@ -163,7 +165,7 @@ impl Request {
         let path_with_query = req.path_with_query().unwrap_or_else(|| "/".to_owned());
         let headers = Headers::from_fields(&req.headers());
         let body = match req.consume() {
-            Ok(body) => Body::incoming(body, Parent::Request(req)),
+            Ok(body) => Body::incoming(body, Parent::Request(req), None),
             Err(()) => Body::empty(),
         };
         Self {
@@ -251,12 +253,15 @@ impl Response {
         self
     }
 
-    fn from_incoming(resp: IncomingResponse) -> Self {
+    fn from_incoming(resp: IncomingResponse, pump: RequestPump) -> Self {
         let status = resp.status();
         let headers = Headers::from_fields(&resp.headers());
-        let body = match resp.consume() {
-            Ok(body) => Body::incoming(body, Parent::Response(resp)),
-            Err(()) => Body::empty(),
+        let body = if let Ok(body) = resp.consume() {
+            Body::incoming(body, Parent::Response(resp), Some(pump))
+        } else {
+            let mut pump = pump;
+            pump.drain();
+            Body::empty()
         };
         Self {
             status,
@@ -307,7 +312,8 @@ impl Next {
 }
 
 /// Sends a request through `call` (`chain::next` or an endpoint) and
-/// returns the response.
+/// returns the response once its head arrives. The request body is written
+/// while waiting, and the rest of it while the response body is read.
 pub(crate) fn send(
     req: Request,
     call: impl FnOnce(OutgoingRequest) -> Result<FutureIncomingResponse, ErrorCode>,
@@ -315,14 +321,29 @@ pub(crate) fn send(
     let (out, body) = req.into_outgoing();
     let out_body = out.body().expect("request body already taken");
     let future = call(out).map_err(Error)?;
-    write_body(out_body, body);
-    future.subscribe().block();
-    let resp = future
-        .get()
-        .expect("response is ready")
-        .expect("response taken once")
-        .map_err(Error)?;
-    Ok(Response::from_incoming(resp))
+    let mut pump = RequestPump::new(out_body, body);
+    let resp = loop {
+        if let Some(result) = future.get() {
+            break result.expect("response taken once").map_err(Error)?;
+        }
+        let head = future.subscribe();
+        match pump.wait() {
+            Wait::Done => head.block(),
+            Wait::Ready => {
+                drop(head);
+                pump.advance();
+            }
+            Wait::On(writable) => {
+                let ready = poll(&[&head, &writable]);
+                drop((head, writable));
+                if ready.contains(&1) {
+                    pump.advance();
+                }
+            }
+        }
+    };
+    drop(future);
+    Ok(Response::from_incoming(resp, pump))
 }
 
 /// Calls the endpoint configured under `name` (capability `endpoints`).
@@ -332,32 +353,10 @@ pub fn call_endpoint(name: &str, req: Request) -> Result<Response, Error> {
     send(req, |out| endpoints::call(name, out))
 }
 
-/// Writes `body` to `out` and finishes it.
-///
-/// If the reader goes away (the layer below answered without reading the
-/// whole body), stops quietly: nobody is left to receive the rest. If the
-/// *source* fails, panics: the body must not be finished as if it were
-/// complete, and roxy fails the exchange closed when a layer traps.
+/// Writes `body` to `out` and finishes it (the response to the client).
 fn write_body(out: OutgoingBody, body: Body) {
-    let mut reader_gone = false;
-    {
-        let stream = out.write().expect("body stream already taken");
-        'chunks: for chunk in body {
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => panic!("body source failed: {e}"),
-            };
-            for piece in chunk.chunks(4096) {
-                if stream.blocking_write_and_flush(piece).is_err() {
-                    reader_gone = true;
-                    break 'chunks;
-                }
-            }
-        }
-    }
-    if !reader_gone {
-        let _ = OutgoingBody::finish(out, None);
-    }
+    let mut pump = RequestPump::new(out, body);
+    pump.drain();
 }
 
 /// Sends `resp` to the client through `out`.

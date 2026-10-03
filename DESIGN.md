@@ -1647,8 +1647,11 @@ end, which is how a layer withholds part of a stream) and
 `read_to_end(cap)`.
 
 `Next` is consumed by `run`, so the type system enforces "one `next` per
-exchange" as well as the host. `next.run` writes the request body before
-reading the response, chunk by chunk.
+exchange" as well as the host. `next.run` returns once the response head arrives,
+and the request body is written meanwhile: the rest of it is pumped while
+the layer reads the response body. So a layer below that answers before
+reading the whole request (an echo, an early error) cannot deadlock against
+the host's small body buffers.
 
 `flow::*` and `call_endpoint` wrap the host services. A panic traps, and the
 host fails the exchange closed, which is how a layer gives up. The crate
@@ -1667,13 +1670,11 @@ Other languages:
 - **Python with native dependencies**, or anything else out of process,
   runs as a service layer (§11.6).
 
-`examples/addons/sentinel` is a Rust inspect-sentinel. It strips denied
-tools from requests, rewrites denied tool calls in responses into
-refusals, withholds `tool_use` blocks in streamed Anthropic responses until
-they are judged, records every decision, and quarantines repeat offenders.
-Its decision is one function (`judge`), with the switch to a monitor model
-through a named endpoint shown next to it. A minimal service layer follows
-with §11.6.
+`examples/addons/` has a Rust streaming redactor (`redact`) built on
+`roxy-addon`. The inspect_sentinel integration is a Python sidecar on a
+service layer (§11.6), with a slot reserved for a compiled build once
+inspect_sentinel has an embedded mode (it needs `inspect_core`, and asyncio
+on WASI is unresolved).
 
 ## 12. Resource limits and self-protection
 

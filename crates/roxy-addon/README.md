@@ -106,8 +106,9 @@ Tunnels (`roxy:addon/tunnel`) are not wrapped yet; use the raw
 
 ## Example
 
-[`examples/addons/sentinel`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/addons/sentinel)
-is an inspect-sentinel that blocks LLM tool calls by policy.
+[`examples/addons/redact`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/addons/redact)
+redacts literal strings from both bodies as they stream, holding back
+only the bytes a needle could straddle.
 
 ## License
 
