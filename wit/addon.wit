@@ -1,0 +1,159 @@
+/// roxy addon layers (DESIGN.md §11).
+///
+/// A layer is a component that sits in an exchange's layer stack above the
+/// rules. It receives each request through `wasi:http/incoming-handler`,
+/// may pass a request down the stack once with `chain.next`, and answers
+/// through the `response-outparam` it was given. Heads and bodies use the
+/// WASI 0.2 HTTP types; bodies are streams in both directions.
+///
+/// Everything a layer can do outside its own streams is in `endpoints` and
+/// `flow`, and each of those calls is a capability granted per layer in
+/// roxy's config. A call the layer was not granted traps; the import is
+/// always linked, so one binary runs under different grants.
+package roxy:addon@0.1.0;
+
+/// The layers below this one.
+interface chain {
+  use wasi:http/types@0.2.12.{outgoing-request, future-incoming-response, error-code};
+
+  /// Pass this exchange's request to the layers below (and, through the
+  /// rules, to the network). Callable at most once per exchange: a second
+  /// call traps. The request is validated by roxy's canonical model as if a
+  /// client had sent it; an invalid head fails the exchange closed.
+  ///
+  /// The request body is streamed: write it to the request's
+  /// `outgoing-body` after calling `next` (or before; the stream applies
+  /// backpressure either way) and `finish` it. The response arrives through
+  /// the returned future, and its body is streamed too.
+  next: func(req: outgoing-request) -> result<future-incoming-response, error-code>;
+}
+
+/// Named outbound calls (capability `endpoints`).
+interface endpoints {
+  use wasi:http/types@0.2.12.{outgoing-request, future-incoming-response, error-code};
+
+  /// Call the endpoint configured under `name`. The request's scheme and
+  /// authority are ignored; its path and query are appended to the
+  /// endpoint's URL. roxy attaches the endpoint's credentials, applies its
+  /// timeout and retry policy and the address floor. The call goes straight
+  /// to the connector: it never passes through other layers or the rules.
+  /// An unknown name returns `error-code.destination-not-found`.
+  call: func(name: string, req: outgoing-request) -> result<future-incoming-response, error-code>;
+}
+
+/// The current flow, and roxy's host services.
+interface flow {
+  /// The client as roxy established it. These are the safe keys for
+  /// per-principal state.
+  record principal {
+    /// Client IP address.
+    client-ip: string,
+    /// User from proxy authentication, if any.
+    client-user: option<string>,
+    /// Name of the listener the client connected to.
+    listener: string,
+    /// SNI of the client's TLS connection (intercepted CONNECT), if any.
+    tls-sni: option<string>,
+  }
+
+  record flow-info {
+    /// The flow id, as in the flow log.
+    flow-id: string,
+    /// The client connection id, as in the flow log.
+    conn-id: string,
+    principal: principal,
+    /// Tags added to this flow so far.
+    tags: list<string>,
+  }
+
+  enum scope {
+    /// Close the client connection this flow arrived on.
+    connection,
+    /// Quarantine the principal: the fixed quarantine gate denies every
+    /// later request from it until the TTL expires or an operator clears it.
+    principal,
+  }
+
+  enum log-level { trace, debug, info, warn, error }
+
+  /// The current flow. Always available.
+  current: func() -> flow-info;
+  /// Add a tag to the flow's log record. Always available.
+  add-tag: func(tag: string);
+  /// The layer's `config:` value as a JSON document. Always available.
+  config: func() -> string;
+
+  /// Write to roxy's operational log (capability `log`).
+  log: func(level: log-level, msg: string);
+  /// Write a structured event to the flow log (capability `record`). `json`
+  /// must be a JSON value. `audit` also sends it to the audit endpoint.
+  /// Records are never dropped: if the log is behind, this call waits.
+  %record: func(kind: string, json: string, audit: bool);
+  /// Terminate out of band (capability `terminate`). Returns whether it
+  /// took effect. `ttl-ms` bounds a principal quarantine.
+  terminate: func(scope: scope, reason: string, ttl-ms: option<u64>) -> bool;
+  /// Read a JSON value from the layer's keyed store (capability `state`).
+  /// A miss is `none`.
+  state-get: func(key: string) -> option<string>;
+  /// Write a JSON value to the layer's keyed store (capability `state`).
+  /// Fails with a message when the store is full or the value too large;
+  /// nothing is evicted.
+  state-put: func(key: string, json: string, ttl-ms: option<u64>) -> result<_, string>;
+  /// Read a metric (capability `metrics`): the metric's `id` and the values
+  /// of its key fields, in order. `none` when the key has no entry.
+  metric-get: func(id: string, key: list<string>) -> option<s64>;
+}
+
+/// Raw byte streams after a protocol upgrade (`101 Switching Protocols`).
+/// Optional: roxy detects at load time whether a layer exports it.
+interface tunnel {
+  use wasi:io/streams@0.2.12.{input-stream, output-stream};
+
+  /// Relay an upgraded connection. Return when both directions are done;
+  /// dropping a stream closes that direction.
+  on-tunnel: func(from-client: input-stream, to-upstream: output-stream,
+                  from-upstream: input-stream, to-client: output-stream);
+}
+
+/// Instance start-up.
+interface init {
+  /// Called once per instance, before its first exchange. An error fails
+  /// the load (at config load) or the exchange (on a later instantiation).
+  init: func() -> result<_, string>;
+}
+
+/// The world a layer targets.
+///
+/// Imports are the clocks, randomness, streams and stdio subset of
+/// `wasi:cli/imports`: no filesystem, sockets or environment. (roxy also
+/// links the rest of WASI 0.2 inertly, with an empty environment, no
+/// preopened directories and every socket address denied, so components
+/// built by stock toolchains, whose standard library imports more than it
+/// uses, still load.)
+world layer {
+  import wasi:clocks/monotonic-clock@0.2.12;
+  import wasi:clocks/wall-clock@0.2.12;
+  import wasi:random/random@0.2.12;
+  import wasi:random/insecure@0.2.12;
+  import wasi:random/insecure-seed@0.2.12;
+  import wasi:io/error@0.2.12;
+  import wasi:io/poll@0.2.12;
+  import wasi:io/streams@0.2.12;
+  import wasi:cli/stdout@0.2.12;
+  import wasi:cli/stderr@0.2.12;
+  import wasi:cli/stdin@0.2.12;
+  import wasi:http/types@0.2.12;
+
+  import chain;
+  import endpoints;
+  import flow;
+
+  export wasi:http/incoming-handler@0.2.12;
+  export init;
+}
+
+/// A layer that also relays upgraded connections.
+world tunnel-layer {
+  include layer;
+  export tunnel;
+}
