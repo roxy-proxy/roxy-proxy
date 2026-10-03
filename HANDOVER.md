@@ -26,15 +26,84 @@ Usable explicit-proxy firewall, all of M1 and the agreed parts of M2:
 
 ## In flight: the new rule model (not merged)
 
-A build agent was implementing the new model on branch
-`worktree-agent-a83c098c259da14a7`. Its worktree is
-`.claude/worktrees/agent-a83c098c259da14a7`. At handover it had **no commits**:
+A build agent started the new model and stopped at roughly 25%. Its work is
+one WIP commit, `99d2ff6`, pushed to **`origin/wip/rule-model`** (also the
+local branch `worktree-agent-a83c098c259da14a7`, worktree
+`.claude/worktrees/agent-a83c098c259da14a7`). It changes only
+`crates/roxy-rules/src/*` and **does not compile yet**: nothing has been
+built or tested.
 
-- **Engine:** uncommitted changes in `crates/roxy-rules/src/{compile,config,policy,types}.rs`.
-- **Proxy and CLI:** not started.
+**Drafted in the WIP:**
 
-If that agent did not finish, either continue from its worktree or start
-again from the spec below.
+- **Config.** `Phase` is removed. The new `default:` key and
+  `DefaultDecision` are added, and a `phase` key is rejected with a pointer
+  to the design.
+- **Fields.** The `dst.*` fields are removed and `body.bytes` /
+  `response.body.bytes` are added. A `Reads` bitmask classifies what each
+  rule reads.
+- **Precedence.** `Policy::evaluate_head` has deny-wins precedence, the
+  first matching explicit allow's options, and an implicit allow that grants
+  no options.
+- **Watching.** `Policy::evaluate_watching` handles change triggers. Each
+  rule's effects apply once, and any error or deny stops the exchange.
+- **Compile errors.** Added for: `allow` in a watching rule; request
+  mutation or `${secret:}` in a watching rule; a response `set_header` that
+  could fire after the response head is sent; and metric `where`, `key` or
+  `unique()` reading non-head fields.
+
+**Still to do:**
+
+1. **Finish roxy-rules.**
+   - `metrics.rs`: drop `Phase`. `Sample` gains `head`; requests and
+     `unique` count at the head, bytes count incrementally, errors at the
+     end.
+   - Leftover `Phase` references in `eval.rs`; `MapView` needs the new
+     fields.
+   - All tests, snapshots and benches, plus the new engine tests listed in
+     the spec.
+2. **roxy-proxy (not started).**
+   - Remove `ConnectGate`, `dst` facts and `Phase` from sources.
+   - Add a per-exchange watcher: a counting body adapter that evaluates
+     **before yielding each chunk**, and a cancellation token selected
+     against the upstream future.
+   - Response head and response body checks, with response header effects
+     applied before the head is written.
+   - Stop behaviour:
+     - h1: break the connection mid-body (no terminating chunk);
+     - h2: `RST_STREAM(CANCEL)`, plus GOAWAY if `close`;
+     - WebSocket relay: evaluate before each write, and close both sides.
+   - A `stage` field in the flow log.
+3. **CLI.**
+   - Wire `default:` into `PolicyInput`.
+   - `run` refuses `ws.*` rules.
+   - `rule test` drops `--phase` and gains `--response-status`,
+     `--body-bytes` and `--response-body-bytes`.
+   - `check` prints the rule classification.
+   - Update the CLI and config tests.
+4. **End-to-end tests.**
+   - Port the connect-phase tests, the address-list test (use `client.ip`)
+     and the response-5xx test.
+   - Add tests for: upload cap over h1 and h2; response byte cap over h1
+     and h2; byte budget; WebSocket budget; `run` refusing `ws.*`;
+     `rule test` output.
+5. **Examples.**
+6. **Finish.** fmt, clippy, the full test suite twice, benchmark numbers,
+   then split into logical commits.
+
+**Decision taken in the WIP, worth confirming with the user:** only
+`request_bytes` / `response_bytes` metrics make a deny rule watch. A deny
+reading `requests`, `denied`, `errors` or `unique` stays a head rule:
+re-checking it after this exchange's own +1 would deny the 30th request of a
+`>= 30` limit instead of the 31st. This matches DESIGN.md §6.4.
+
+**DESIGN.md updates the agent proposed:**
+
+- §6.1: state the narrowed watching rule above.
+- §6.3: `set_header` / `remove_header` in a watching rule target the
+  response, and are legal only when everything that can re-check the rule is
+  known before the response head is sent.
+- §6.4: metric `key` and `unique()` fields must be head fields.
+- §3: "Key runtime types" still shows per-phase chains.
 
 **Spec.** DESIGN.md §6.1 to §6.4, §4.3 and §8 on main. In short:
 
