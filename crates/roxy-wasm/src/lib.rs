@@ -9,12 +9,17 @@
 mod bindings;
 mod config;
 mod error;
+mod exchange;
 mod host;
+mod runtime;
+mod state;
 
 pub use async_trait::async_trait;
 pub use config::{Capabilities, Capability, LayerConfig, LayerLimits};
 pub use error::{Budget, LayerError, LoadError};
+pub use exchange::LayerOutcome;
 pub use host::{
     EndpointError, FlowInfo, HostError, LayerHost, LayerRequest, LayerResponse, LogLevel,
     Principal, TerminateScope,
 };
+pub use runtime::{Layer, WasmRuntime};

@@ -1,0 +1,629 @@
+//! The engine, loaded layers, their instance pools and the exchange
+//! driver.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::time::{Instant, timeout_at};
+use wasmtime::component::{Component, InstancePre, Linker, Resource};
+use wasmtime::{CallHook, Config, Engine, Store, StoreContextMut, Trap};
+use wasmtime_wasi::p2::pipe::{AsyncReadStream, AsyncWriteStream};
+use wasmtime_wasi::p2::{DynInputStream, DynOutputStream};
+use wasmtime_wasi_http::WasiHttpView;
+use wasmtime_wasi_http::p2::bindings::http::types::Scheme as WasiScheme;
+
+use crate::bindings::exports::roxy::addon::{init, tunnel};
+use crate::bindings::exports::wasi::http::incoming_handler;
+use crate::bindings::roxy::addon::{chain, endpoints, flow};
+use crate::config::LayerConfig;
+use crate::error::{Budget, LayerError, LoadError};
+use crate::exchange::{CancelGuard, Dir, ExchangeShared, FromGuest, IntoGuest};
+use crate::host::{LayerHost, LayerRequest, LayerResponse};
+use crate::state::{ExchangeCtx, LayerShared, StoreState};
+
+/// Epoch tick: the resolution of `step_cpu`.
+const EPOCH_TICK: Duration = Duration::from_millis(1);
+/// A running guest yields to the async runtime after this much fuel, so a
+/// busy layer cannot hog a worker thread and its wall clock stays
+/// enforceable.
+const FUEL_YIELD_INTERVAL: u64 = 1_000_000;
+/// Bytes a tunnel output stream accepts before it applies backpressure.
+const TUNNEL_WRITE_BUDGET: usize = 64 * 1024;
+
+struct Ticker {
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Ticker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The wasm engine shared by every layer: compilation settings and the
+/// epoch ticker behind `step_cpu`. Cheap to clone.
+#[derive(Clone)]
+pub struct WasmRuntime {
+    engine: Engine,
+    _ticker: Arc<Ticker>,
+}
+
+impl std::fmt::Debug for WasmRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WasmRuntime").finish_non_exhaustive()
+    }
+}
+
+impl WasmRuntime {
+    /// Creates the engine and starts its epoch ticker thread (stopped when
+    /// the last clone is dropped).
+    pub fn new() -> Result<Self, LoadError> {
+        let mut config = Config::new();
+        config
+            .wasm_component_model(true)
+            .consume_fuel(true)
+            .epoch_interruption(true);
+        let engine = Engine::new(&config).map_err(|e| LoadError::Engine(e.to_string()))?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticker_engine = engine.clone();
+        let ticker_stop = stop.clone();
+        thread::Builder::new()
+            .name("roxy-wasm-epoch".to_owned())
+            .spawn(move || {
+                while !ticker_stop.load(Ordering::Relaxed) {
+                    thread::sleep(EPOCH_TICK);
+                    ticker_engine.increment_epoch();
+                }
+            })
+            .map_err(|e| LoadError::Engine(format!("epoch ticker: {e}")))?;
+        Ok(Self {
+            engine,
+            _ticker: Arc::new(Ticker { stop }),
+        })
+    }
+
+    fn linker(&self) -> Result<Linker<StoreState>, String> {
+        type Me = wasmtime::component::HasSelf<StoreState>;
+        let mut linker = Linker::new(&self.engine);
+        // All of WASI 0.2 except the outbound HTTP client, inert (see
+        // `StoreState::new`), so stock toolchain output links.
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| e.to_string())?;
+        let options = wasmtime_wasi_http::p2::bindings::LinkOptions::default();
+        wasmtime_wasi_http::p2::bindings::http::types::add_to_linker::<
+            _,
+            wasmtime_wasi_http::WasiHttp,
+        >(&mut linker, &options.into(), StoreState::http)
+        .map_err(|e| e.to_string())?;
+        // Every roxy:addon import is linked whatever the grants; a call
+        // without its capability traps (DESIGN.md §11.3).
+        chain::add_to_linker::<_, Me>(&mut linker, |s| s).map_err(|e| e.to_string())?;
+        endpoints::add_to_linker::<_, Me>(&mut linker, |s| s).map_err(|e| e.to_string())?;
+        flow::add_to_linker::<_, Me>(&mut linker, |s| s).map_err(|e| e.to_string())?;
+        Ok(linker)
+    }
+}
+
+/// One live instance of a layer.
+struct Instance {
+    store: Store<StoreState>,
+    handler: incoming_handler::Guest,
+    tunnel: Option<tunnel::Guest>,
+    exchanges: u64,
+}
+
+struct LayerInner {
+    runtime: WasmRuntime,
+    shared: Arc<LayerShared>,
+    pre: InstancePre<StoreState>,
+    handler: incoming_handler::GuestIndices,
+    init: init::GuestIndices,
+    tunnel: Option<tunnel::GuestIndices>,
+    idle: Mutex<Vec<Instance>>,
+    slots: Arc<Semaphore>,
+}
+
+/// A compiled layer with its instance pool. Cheap to clone; clones share
+/// the pool.
+#[derive(Clone)]
+pub struct Layer {
+    inner: Arc<LayerInner>,
+}
+
+impl std::fmt::Debug for Layer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Layer")
+            .field("name", &self.inner.shared.config.name)
+            .field("tunnel", &self.inner.tunnel.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Maps a guest failure to the error it reports. A failure already
+/// recorded for the exchange (a budget or host failure that made the guest
+/// trap) takes precedence.
+fn classify(err: &wasmtime::Error) -> LayerError {
+    if let Some(e) = err.downcast_ref::<LayerError>() {
+        return e.clone();
+    }
+    match err.downcast_ref::<Trap>() {
+        Some(Trap::OutOfFuel) => LayerError::BudgetExceeded(Budget::Fuel),
+        Some(Trap::Interrupt) => LayerError::BudgetExceeded(Budget::StepCpu),
+        _ => LayerError::Trap(format!("{err:#}")),
+    }
+}
+
+/// Gives the guest a fresh `fuel_per_step` and `step_cpu` whenever control
+/// enters wasm (a call into the guest, or a host call returning to it), so
+/// both bound the guest's work *between* host calls.
+fn reset_step(mut ctx: StoreContextMut<'_, StoreState>, hook: CallHook) -> wasmtime::Result<()> {
+    if hook.exiting_host() {
+        let fuel = ctx.data().layer.config.limits.fuel_per_step;
+        let ticks = ctx.data().layer.step_ticks;
+        ctx.set_fuel(fuel)?;
+        ctx.set_epoch_deadline(ticks);
+    }
+    Ok(())
+}
+
+impl Layer {
+    /// Compiles `wasm` (a component) and starts one instance, running its
+    /// `init`, so a bad layer fails the config load rather than the first
+    /// exchange. Compilation runs on the blocking thread pool.
+    pub async fn load(
+        runtime: &WasmRuntime,
+        wasm: Vec<u8>,
+        config: LayerConfig,
+    ) -> Result<Layer, LoadError> {
+        let layer = config.name.clone();
+        let limits = &config.limits;
+        if limits.max_instances == 0 {
+            return Err(LoadError::Limits {
+                layer,
+                message: "max_instances must be at least 1".to_owned(),
+            });
+        }
+        if limits.step_cpu.is_zero() || limits.max_exchange_time.is_zero() {
+            return Err(LoadError::Limits {
+                layer,
+                message: "step_cpu and max_exchange_time must be positive".to_owned(),
+            });
+        }
+        let step_ticks =
+            u64::try_from(limits.step_cpu.as_micros().div_ceil(EPOCH_TICK.as_micros()))
+                .unwrap_or(u64::MAX)
+                .max(1);
+
+        let engine = runtime.engine.clone();
+        let component = tokio::task::spawn_blocking(move || Component::new(&engine, &wasm))
+            .await
+            .map_err(|e| LoadError::Compile {
+                layer: layer.clone(),
+                message: e.to_string(),
+            })?
+            .map_err(|e| LoadError::Compile {
+                layer: layer.clone(),
+                message: format!("{e:#}"),
+            })?;
+
+        let linker = runtime.linker().map_err(LoadError::Engine)?;
+        let pre = linker
+            .instantiate_pre(&component)
+            .map_err(|e| LoadError::Link {
+                layer: layer.clone(),
+                message: format!("{e:#}"),
+            })?;
+        let missing = |e: wasmtime::Error| LoadError::MissingExport {
+            layer: layer.clone(),
+            message: format!("{e:#}"),
+        };
+        let handler = incoming_handler::GuestIndices::new(&pre).map_err(missing)?;
+        let init = init::GuestIndices::new(&pre).map_err(missing)?;
+        let tunnel = tunnel::GuestIndices::new(&pre).ok();
+
+        let max_instances = config.limits.max_instances;
+        let inner = Arc::new(LayerInner {
+            runtime: runtime.clone(),
+            shared: Arc::new(LayerShared { config, step_ticks }),
+            pre,
+            handler,
+            init,
+            tunnel,
+            idle: Mutex::new(Vec::new()),
+            slots: Arc::new(Semaphore::new(max_instances)),
+        });
+        let layer = Layer { inner };
+        let deadline = Instant::now() + layer.inner.shared.config.limits.max_exchange_time;
+        let first = layer
+            .instantiate(deadline)
+            .await
+            .map_err(|source| LoadError::Start {
+                layer: layer.name().to_owned(),
+                source,
+            })?;
+        layer.inner.idle.lock().expect("pool lock").push(first);
+        Ok(layer)
+    }
+
+    /// The layer's name.
+    pub fn name(&self) -> &str {
+        &self.inner.shared.config.name
+    }
+
+    /// Whether the layer exports `roxy:addon/tunnel`.
+    pub fn has_tunnel(&self) -> bool {
+        self.inner.tunnel.is_some()
+    }
+
+    /// Instances currently idle in the pool.
+    pub fn idle_instances(&self) -> usize {
+        self.inner.idle.lock().expect("pool lock").len()
+    }
+
+    async fn instantiate(&self, deadline: Instant) -> Result<Instance, LayerError> {
+        let inner = &self.inner;
+        let mut store = Store::new(&inner.runtime.engine, StoreState::new(inner.shared.clone()));
+        store.limiter(|s| &mut s.limiter);
+        store.call_hook(reset_step);
+        store.epoch_deadline_trap();
+        store
+            .fuel_async_yield_interval(Some(FUEL_YIELD_INTERVAL))
+            .map_err(|e| LayerError::Instantiate(e.to_string()))?;
+        store
+            .set_fuel(inner.shared.config.limits.fuel_per_step)
+            .map_err(|e| LayerError::Instantiate(e.to_string()))?;
+        store.set_epoch_deadline(inner.shared.step_ticks);
+
+        let start =
+            async {
+                let instance = inner.pre.instantiate_async(&mut store).await.map_err(|e| {
+                    match classify(&e) {
+                        LayerError::Trap(msg) => LayerError::Instantiate(msg),
+                        other => other,
+                    }
+                })?;
+                let handler = inner
+                    .handler
+                    .load(&mut store, &instance)
+                    .map_err(|e| LayerError::Instantiate(format!("{e:#}")))?;
+                let tunnel = match &inner.tunnel {
+                    Some(t) => Some(
+                        t.load(&mut store, &instance)
+                            .map_err(|e| LayerError::Instantiate(format!("{e:#}")))?,
+                    ),
+                    None => None,
+                };
+                let init = inner
+                    .init
+                    .load(&mut store, &instance)
+                    .map_err(|e| LayerError::Instantiate(format!("{e:#}")))?;
+                init.call_init(&mut store)
+                    .await
+                    .map_err(|e| classify(&e))?
+                    .map_err(LayerError::Init)?;
+                Ok::<_, LayerError>((handler, tunnel))
+            };
+        let (handler, tunnel) = timeout_at(deadline, start)
+            .await
+            .map_err(|_| LayerError::BudgetExceeded(Budget::ExchangeTime))??;
+        Ok(Instance {
+            store,
+            handler,
+            tunnel,
+            exchanges: 0,
+        })
+    }
+
+    /// Takes an idle instance or starts a new one, once a slot is free.
+    async fn checkout(
+        &self,
+        deadline: Instant,
+    ) -> Result<(Instance, OwnedSemaphorePermit), LayerError> {
+        let permit = timeout_at(deadline, self.inner.slots.clone().acquire_owned())
+            .await
+            .map_err(|_| LayerError::BudgetExceeded(Budget::ExchangeTime))?
+            .map_err(|_| LayerError::Cancelled)?;
+        let idle = self.inner.idle.lock().expect("pool lock").pop();
+        let instance = match idle {
+            Some(i) => i,
+            None => self.instantiate(deadline).await?,
+        };
+        Ok((instance, permit))
+    }
+
+    /// Returns a healthy instance to the pool, unless it is due for
+    /// recycling.
+    fn checkin(&self, mut instance: Instance) {
+        instance.store.data_mut().exchange = None;
+        instance.exchanges += 1;
+        let limits = &self.inner.shared.config.limits;
+        let memory = instance.store.data().limiter.total_memory;
+        if instance.exchanges >= limits.recycle_after_exchanges
+            || memory > limits.recycle_above_memory
+        {
+            tracing::debug!(
+                layer = self.name(),
+                exchanges = instance.exchanges,
+                memory,
+                "recycling layer instance"
+            );
+            return;
+        }
+        self.inner.idle.lock().expect("pool lock").push(instance);
+    }
+
+    /// Runs one exchange through the layer.
+    ///
+    /// `req` must have an absolute URI. Returns the layer's response once
+    /// its head is set; the body streams from the guest, which keeps
+    /// running until its handler returns. If the layer fails after the
+    /// head (trap, budget, host failure), the body ends with
+    /// [`roxy_http::BodyError::Stopped`] and the [`crate::LayerOutcome`]
+    /// in the response's extensions reports why. Any `Err` here must be
+    /// turned into a deny (DESIGN.md §11.1 invariant 3).
+    ///
+    /// Dropping the future, or the response body before it ends, cancels
+    /// the exchange and discards the instance.
+    pub async fn handle(
+        &self,
+        host: Arc<dyn LayerHost>,
+        req: LayerRequest,
+    ) -> Result<LayerResponse, LayerError> {
+        let limits = &self.inner.shared.config.limits;
+        let deadline = Instant::now() + limits.max_exchange_time;
+
+        let scheme = req
+            .uri()
+            .scheme()
+            .cloned()
+            .ok_or_else(|| LayerError::InvalidRequest("request URI has no scheme".into()))?;
+        let authority = req
+            .uri()
+            .authority()
+            .map(ToString::to_string)
+            .ok_or_else(|| LayerError::InvalidRequest("request URI has no authority".into()))?;
+        let wasi_scheme = match scheme.as_str() {
+            "http" => WasiScheme::Http,
+            "https" => WasiScheme::Https,
+            other => WasiScheme::Other(other.to_owned()),
+        };
+
+        let (mut instance, permit) = self.checkout(deadline).await?;
+        let shared = ExchangeShared::new(limits.max_buffered_body_bytes);
+        let (tx, rx) = oneshot::channel();
+        let (req_res, out_res) = {
+            let data = instance.store.data_mut();
+            data.exchange = Some(ExchangeCtx {
+                host,
+                shared: shared.clone(),
+                next_allowed: true,
+                next_called: false,
+                scheme,
+                authority,
+            });
+            let req = req.map(|b| IntoGuest::new(b, Dir::Request, Some(shared.clone())));
+            let mut http = data.http();
+            let req_res = http
+                .new_incoming_request(wasi_scheme, req)
+                .map_err(|e| LayerError::InvalidRequest(format!("{e:#}")))?;
+            let out_res = http
+                .new_response_outparam(tx)
+                .map_err(|e| LayerError::Instantiate(format!("{e:#}")))?;
+            (req_res, out_res)
+        };
+
+        let run = ExchangeRun {
+            layer: self.clone(),
+            shared: shared.clone(),
+            instance: Some(instance),
+            _permit: permit,
+        };
+        let driver = tokio::spawn(run.drive(deadline, req_res, out_res));
+        let cancel = Arc::new(CancelGuard {
+            abort: driver.abort_handle(),
+            shared: shared.clone(),
+        });
+
+        let settled = shared.wait_settled();
+        tokio::select! {
+            biased;
+            resp = rx => match resp {
+                Ok(Ok(resp)) => {
+                    let outcome = shared.outcome();
+                    let mut resp = resp.map(|b| FromGuest::response(b, shared.clone(), cancel));
+                    resp.extensions_mut().insert(outcome);
+                    Ok(resp)
+                }
+                Ok(Err(code)) => {
+                    let err = LayerError::ErrorResponse(format!("{code:?}"));
+                    shared.fail(err.clone());
+                    Err(err)
+                }
+                // The outparam was dropped: the handler returned without a
+                // response, or the instance was torn down.
+                Err(_) => Err(shared
+                    .wait_settled()
+                    .await
+                    .err()
+                    .unwrap_or(LayerError::NoResponse)),
+            },
+            outcome = settled => Err(outcome.err().unwrap_or(LayerError::NoResponse)),
+        }
+    }
+
+    /// Relays an upgraded connection through the layer's `tunnel` export.
+    ///
+    /// Step budgets, memory and the instance pool apply; the exchange wall
+    /// clock does not (a tunnel lives as long as the connection, bounded by
+    /// the relay's own idle timeouts; drop the future to stop it).
+    pub async fn tunnel<CR, UW, UR, CW>(
+        &self,
+        host: Arc<dyn LayerHost>,
+        from_client: CR,
+        to_upstream: UW,
+        from_upstream: UR,
+        to_client: CW,
+    ) -> Result<(), LayerError>
+    where
+        CR: AsyncRead + Send + Unpin + 'static,
+        UW: AsyncWrite + Send + Unpin + 'static,
+        UR: AsyncRead + Send + Unpin + 'static,
+        CW: AsyncWrite + Send + Unpin + 'static,
+    {
+        if !self.has_tunnel() {
+            return Err(LayerError::NoTunnel);
+        }
+        let deadline = Instant::now() + self.inner.shared.config.limits.max_exchange_time;
+        let (mut instance, permit) = self.checkout(deadline).await?;
+        let shared = ExchangeShared::new(self.inner.shared.config.limits.max_buffered_body_bytes);
+        let streams = {
+            let data = instance.store.data_mut();
+            data.exchange = Some(ExchangeCtx {
+                host,
+                shared: shared.clone(),
+                next_allowed: false,
+                next_called: false,
+                scheme: http::uri::Scheme::HTTP,
+                authority: String::new(),
+            });
+            let t = &mut data.table;
+            let input = |t: &mut wasmtime::component::ResourceTable, r| {
+                t.push(Box::new(AsyncReadStream::new(r)) as DynInputStream)
+            };
+            let output = |t: &mut wasmtime::component::ResourceTable, w| {
+                t.push(Box::new(AsyncWriteStream::new(TUNNEL_WRITE_BUDGET, w)) as DynOutputStream)
+            };
+            (|| {
+                Ok::<_, wasmtime::component::ResourceTableError>((
+                    input(
+                        t,
+                        Box::new(from_client) as Box<dyn AsyncRead + Send + Unpin>,
+                    )?,
+                    output(
+                        t,
+                        Box::new(to_upstream) as Box<dyn AsyncWrite + Send + Unpin>,
+                    )?,
+                    input(
+                        t,
+                        Box::new(from_upstream) as Box<dyn AsyncRead + Send + Unpin>,
+                    )?,
+                    output(t, Box::new(to_client) as Box<dyn AsyncWrite + Send + Unpin>)?,
+                ))
+            })()
+            .map_err(|e| LayerError::Instantiate(e.to_string()))?
+        };
+        let mut run = ExchangeRun {
+            layer: self.clone(),
+            shared: shared.clone(),
+            instance: Some(instance),
+            _permit: permit,
+        };
+        run.drive_tunnel(streams).await
+    }
+}
+
+/// An exchange in progress. Dropping it before it finished (the task was
+/// aborted) records [`LayerError::Cancelled`] *before* the instance is
+/// dropped, so no guest body can end cleanly.
+struct ExchangeRun {
+    layer: Layer,
+    shared: Arc<ExchangeShared>,
+    instance: Option<Instance>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for ExchangeRun {
+    fn drop(&mut self) {
+        if self.instance.is_some() {
+            self.shared.fail(LayerError::Cancelled);
+            self.shared.settle();
+            self.instance = None;
+        }
+    }
+}
+
+impl ExchangeRun {
+    /// Settles the exchange: a failure (recorded first) discards the
+    /// instance; success returns it to the pool.
+    fn finish(&mut self, result: Result<(), LayerError>) {
+        let mut instance = self.instance.take().expect("instance present");
+        let result = result.and_then(|()| {
+            // Anything the guest still holds when its handler returns was
+            // never finished (an unfinished body would otherwise end
+            // cleanly when the store is reused or dropped).
+            if instance.store.data().table.is_empty() {
+                Ok(())
+            } else {
+                Err(LayerError::InvalidResponse(
+                    "handler returned while still holding resources (an unfinished body?)"
+                        .to_owned(),
+                ))
+            }
+        });
+        if let Err(e) = result {
+            tracing::debug!(layer = self.layer.name(), error = %e, "layer exchange failed");
+            self.shared.fail(e);
+        }
+        let failed = self.shared.failure().is_some();
+        self.shared.settle();
+        if failed {
+            drop(instance);
+        } else {
+            instance.store.data_mut().exchange = None;
+            self.layer.checkin(instance);
+        }
+    }
+
+    async fn drive(
+        mut self,
+        deadline: Instant,
+        req: Resource<wasmtime_wasi_http::p2::types::HostIncomingRequest>,
+        out: Resource<wasmtime_wasi_http::p2::types::HostResponseOutparam>,
+    ) {
+        let failure = self.shared.wait_failure();
+        let instance = self.instance.as_mut().expect("instance present");
+        let call = instance.handler.call_handle(&mut instance.store, req, out);
+        let result = tokio::select! {
+            biased;
+            err = failure => Err(err),
+            r = timeout_at(deadline, call) => match r {
+                Err(_) => Err(LayerError::BudgetExceeded(Budget::ExchangeTime)),
+                Ok(Err(e)) => Err(classify(&e)),
+                Ok(Ok(())) => Ok(()),
+            },
+        };
+        self.finish(result);
+    }
+
+    async fn drive_tunnel(
+        &mut self,
+        (from_client, to_upstream, from_upstream, to_client): (
+            Resource<DynInputStream>,
+            Resource<DynOutputStream>,
+            Resource<DynInputStream>,
+            Resource<DynOutputStream>,
+        ),
+    ) -> Result<(), LayerError> {
+        let failure = self.shared.wait_failure();
+        let instance = self.instance.as_mut().expect("instance present");
+        let guest = instance.tunnel.clone().ok_or(LayerError::NoTunnel)?;
+        let call = guest.call_on_tunnel(
+            &mut instance.store,
+            from_client,
+            to_upstream,
+            from_upstream,
+            to_client,
+        );
+        let result = tokio::select! {
+            biased;
+            err = failure => Err(err),
+            r = call => r.map_err(|e| classify(&e)),
+        };
+        self.finish(result);
+        self.shared.failure().map_or(Ok(()), Err)
+    }
+}
