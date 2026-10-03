@@ -70,13 +70,14 @@ impl Upstream {
                 changed.await;
             }
         };
-        match tokio::time::timeout(Duration::from_secs(10), wait).await {
-            Ok(s) => s,
-            Err(_) => panic!(
-                "upstream: wanted {n} finished requests, have {:#?}",
-                self.seen()
-            ),
-        }
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "upstream: wanted {n} finished requests, have {:#?}",
+                    self.seen()
+                )
+            })
     }
 
     /// The connector's dial: an in-memory connection served by this
@@ -162,28 +163,9 @@ impl Upstream {
         self.changed.notify_waiters();
 
         if let Some(key) = req.headers().get("sec-websocket-key").cloned() {
-            let on = hyper::upgrade::on(&mut req);
             lock(&entry).complete = Some(true);
             self.changed.notify_waiters();
-            tokio::spawn(async move {
-                if let Ok(up) = on.await {
-                    let mut up = TokioIo::new(up);
-                    let mut buf = vec![0u8; 16 * 1024];
-                    while let Ok(n) = up.read(&mut buf).await {
-                        if n == 0 || up.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            });
-            let accept = roxy_http::ws::compute_accept(&String::from_utf8_lossy(key.as_bytes()));
-            return http::Response::builder()
-                .status(101)
-                .header("connection", "upgrade")
-                .header("upgrade", "websocket")
-                .header("sec-websocket-accept", accept)
-                .body(Full::default())
-                .unwrap();
+            return upgrade_and_echo(&mut req, &key);
         }
 
         let host = req
@@ -253,4 +235,31 @@ impl Upstream {
             .body(Full::new(Bytes::from(json.to_string())))
             .unwrap()
     }
+}
+
+/// Answers a WebSocket upgrade with `101` and echoes the upgraded bytes.
+fn upgrade_and_echo(
+    req: &mut http::Request<Incoming>,
+    key: &http::HeaderValue,
+) -> http::Response<Full<Bytes>> {
+    let on = hyper::upgrade::on(req);
+    tokio::spawn(async move {
+        if let Ok(up) = on.await {
+            let mut up = TokioIo::new(up);
+            let mut buf = vec![0u8; 16 * 1024];
+            while let Ok(n) = up.read(&mut buf).await {
+                if n == 0 || up.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let accept = roxy_http::ws::compute_accept(&String::from_utf8_lossy(key.as_bytes()));
+    http::Response::builder()
+        .status(101)
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-accept", accept)
+        .body(Full::default())
+        .unwrap()
 }

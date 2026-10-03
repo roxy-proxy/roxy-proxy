@@ -1,6 +1,7 @@
 //! A test layer that exports `tunnel`: it relays both directions of an
-//! upgraded connection, tagging the flow `tunnel`, and (with config
-//! `{"upper": true}`) upper-casing client → upstream bytes.
+//! upgraded connection, tagging the flow `tunnel` (and `tunnel:<name>` with
+//! config `{"name": ...}`), and (with config `{"upper": true}`)
+//! upper-casing client → upstream bytes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,6 +21,14 @@ use wasi::http::types::{
 use wasi::io::streams::{InputStream, OutputStream, StreamError};
 
 struct Layer;
+
+/// The `name` from this layer's config, if any (`{"name": "a"}`).
+fn name() -> Option<String> {
+    let config = roxy::addon::flow::config();
+    let start = config.find("\"name\":\"")? + "\"name\":\"".len();
+    let len = config[start..].find('"')?;
+    Some(config[start..start + len].to_owned())
+}
 
 fn write_all(out: &OutputStream, mut bytes: &[u8]) {
     while !bytes.is_empty() {
@@ -96,6 +105,9 @@ impl Tunnel for Layer {
         to_client: OutputStream,
     ) {
         roxy::addon::flow::add_tag("tunnel");
+        if let Some(name) = name() {
+            roxy::addon::flow::add_tag(&format!("tunnel:{name}"));
+        }
         let upper = UPPER.load(Ordering::Relaxed);
         // Relay both directions as bytes arrive. Each side is dropped when
         // its input closes, which closes the matching output.

@@ -58,16 +58,14 @@ pub struct UpstreamSettings {
     pub(crate) dial: Option<TestDial>,
 }
 
+/// What a [`TestDial`] returns.
+#[cfg(test)]
+pub(crate) type TestDialFuture = Pin<Box<dyn Future<Output = std::io::Result<BoxIo>> + Send>>;
+
 /// A substitute for `TcpStream::connect` in tests.
 #[cfg(test)]
 #[derive(Clone)]
-pub(crate) struct TestDial(
-    pub(crate)  Arc<
-        dyn Fn(SocketAddr) -> Pin<Box<dyn Future<Output = std::io::Result<BoxIo>> + Send>>
-            + Send
-            + Sync,
-    >,
-);
+pub(crate) struct TestDial(pub(crate) Arc<dyn Fn(SocketAddr) -> TestDialFuture + Send + Sync>);
 
 #[cfg(test)]
 impl std::fmt::Debug for TestDial {

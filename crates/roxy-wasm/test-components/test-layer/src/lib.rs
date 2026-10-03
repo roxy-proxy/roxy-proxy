@@ -214,6 +214,72 @@ fn pass(req: IncomingRequest, out: ResponseOutparam, buffer_first: bool) {
     answer_with(await_response(fut), out, upper);
 }
 
+/// Like `pass`, but full duplex: it streams the request body into `next`
+/// while watching for the response, so a response from below (an inner
+/// layer or the upstream answering early) is relayed at once, abandoning
+/// the rest of the request body.
+fn relay(req: IncomingRequest, out: ResponseOutparam) {
+    let next_req = forward_head(&req);
+    let next_body = next_req.body().expect("body");
+    let in_body = req.consume().expect("consume");
+    let fut = chain::next(next_req).expect("next");
+    let mut early = None;
+    {
+        let input = in_body.stream().expect("stream");
+        let output = next_body.write().expect("write");
+        let mut pending: Vec<u8> = Vec::new();
+        let mut input_open = true;
+        loop {
+            if let Some(r) = fut.get() {
+                early = Some(r);
+                break;
+            }
+            if pending.is_empty() && !input_open {
+                break;
+            }
+            let mut pollables = vec![fut.subscribe()];
+            if pending.is_empty() {
+                pollables.push(input.subscribe());
+            } else {
+                pollables.push(output.subscribe());
+            }
+            let refs: Vec<_> = pollables.iter().collect();
+            wasi::io::poll::poll(&refs);
+            drop(refs);
+            drop(pollables);
+            if pending.is_empty() {
+                match input.read(64 * 1024) {
+                    Ok(chunk) => pending = chunk,
+                    Err(StreamError::Closed) => input_open = false,
+                    // The request body broke (the client or an outer layer
+                    // gave up): abandon the exchange.
+                    Err(_) => return,
+                }
+            } else {
+                let n = output.check_write().expect("check_write") as usize;
+                if n > 0 {
+                    let k = n.min(pending.len());
+                    output.write(&pending[..k]).expect("write");
+                    pending.drain(..k);
+                }
+            }
+        }
+    }
+    let resp = if let Some(r) = early {
+        // Answered before the body was all sent: abandon the rest.
+        drop(next_body);
+        drop(in_body);
+        drop(req);
+        r.expect("once").expect("response")
+    } else {
+        OutgoingBody::finish(next_body, None).expect("finish");
+        drop(in_body);
+        drop(req);
+        await_response(fut)
+    };
+    answer_with(resp, out, false);
+}
+
 fn call_capability(req: &IncomingRequest) -> String {
     match header(req, "x-cap").as_deref().unwrap_or("") {
         "current" => {
@@ -281,6 +347,7 @@ impl Handler for Layer {
         let test = test_for(&req);
         match test.as_str() {
             "pass" => pass(req, out, false),
+            "relay" => relay(req, out),
             "buffer" => pass(req, out, true),
             "deny" => respond(out, 403, b"denied by layer"),
             "answer" => {

@@ -720,13 +720,14 @@ impl MemorySink {
                 emitted.await;
             }
         };
-        match tokio::time::timeout(timeout, wait).await {
-            Ok(found) => found,
-            Err(_) => panic!(
-                "wanted {n} `{kind}` events within {timeout:?}; logged: {:#?}",
-                self.events()
-            ),
-        }
+        tokio::time::timeout(timeout, wait)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "wanted {n} `{kind}` events within {timeout:?}; logged: {:#?}",
+                    self.events()
+                )
+            })
     }
 }
 

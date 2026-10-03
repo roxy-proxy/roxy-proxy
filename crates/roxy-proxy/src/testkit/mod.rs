@@ -18,6 +18,12 @@
 
 #![allow(dead_code)]
 
+#[cfg(test)]
+mod addon_tests;
+#[cfg(test)]
+mod core_tests;
+#[cfg(test)]
+mod early_tests;
 mod upstream;
 
 use std::collections::HashMap;
@@ -330,6 +336,32 @@ impl Kit {
         }
     }
 
+    /// A WebSocket upgrade to `http://up.test<path>` on the proxy port.
+    /// Returns the response status and, after a `101`, the upgraded
+    /// stream.
+    pub(crate) async fn websocket(
+        &self,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> (u16, Option<TokioIo<hyper::upgrade::Upgraded>>) {
+        let mut c = self.h1().await;
+        let mut hs = vec![
+            ("connection", "upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ];
+        hs.extend_from_slice(headers);
+        let req = c.request("GET", path, &hs).body(Body::empty()).unwrap();
+        let res = c.send(req).await.unwrap();
+        let status = res.status().as_u16();
+        if status != 101 {
+            return (status, None);
+        }
+        let up = hyper::upgrade::on(res).await.unwrap();
+        (status, Some(TokioIo::new(up)))
+    }
+
     /// Waits until `n` events of `kind` were logged; returns them.
     pub(crate) async fn events(&self, kind: &str, n: usize) -> Vec<serde_json::Value> {
         self.sink.wait_for(kind, n, Duration::from_secs(10)).await
@@ -389,24 +421,37 @@ impl Client {
         }
     }
 
-    /// A request for `path` with `headers`, shaped for this client: an
-    /// absolute `http://up.test` URI on the proxy port, origin form plus
-    /// `host` in an h1 tunnel, an absolute `https` URI over h2.
+    /// A request for `path` on `up.test` with `headers`; see
+    /// [`Client::request_to`].
     pub(crate) fn request(
         &self,
         method: &str,
         path: &str,
         headers: &[(&str, &str)],
     ) -> http::request::Builder {
+        self.request_to("up.test", method, path, headers)
+    }
+
+    /// A request shaped for this client: an absolute `http://<host>` URI
+    /// plus `host` on the proxy port, origin form plus `host` in an h1
+    /// tunnel, an absolute `https` URI over h2. In a tunnel `host` is the
+    /// tunnel's.
+    pub(crate) fn request_to(
+        &self,
+        host: &str,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> http::request::Builder {
         let mut b = http::Request::builder().method(method);
         b = match self {
-            Self::H1 { tunnel: None, .. } => b
-                .uri(format!("http://up.test{path}"))
-                .header("host", "up.test"),
+            Self::H1 { tunnel: None, .. } => {
+                b.uri(format!("http://{host}{path}")).header("host", host)
+            }
             Self::H1 {
-                tunnel: Some(host), ..
-            } => b.uri(path).header("host", host.as_str()),
-            Self::H2 { host, .. } => b.uri(format!("https://{host}{path}")),
+                tunnel: Some(t), ..
+            } => b.uri(path).header("host", t.as_str()),
+            Self::H2 { host: t, .. } => b.uri(format!("https://{t}{path}")),
         };
         for (n, v) in headers {
             b = b.header(*n, *v);
@@ -427,6 +472,30 @@ impl Client {
             Self::H2 { send, .. } => {
                 send.ready().await?;
                 send.send_request(req).await
+            }
+        }
+    }
+
+    /// Starts `req` on its own task, so the test can keep feeding its body
+    /// while waiting for the answer. On h2 the connection stays usable
+    /// through `self`.
+    pub(crate) fn start(
+        &mut self,
+        req: http::Request<Body>,
+    ) -> tokio::task::JoinHandle<Result<Answer, hyper::Error>> {
+        match self {
+            Self::H1 { send, .. } => {
+                // The caller has not sent anything else on this connection,
+                // so it is ready.
+                let fut = send.send_request(req);
+                tokio::spawn(async move { Ok(Answer::read(fut.await?).await) })
+            }
+            Self::H2 { send, .. } => {
+                let mut send = send.clone();
+                tokio::spawn(async move {
+                    send.ready().await?;
+                    Ok(Answer::read(send.send_request(req).await?).await)
+                })
             }
         }
     }
