@@ -652,9 +652,14 @@ such metric. `in` accepts a list of the operand's type, or a CIDR for ips.
 
 **Body access.** `body.text` and `response.body.text` are the only things in
 roxy that buffer. They force the rules stage to collect the body (up to
-`limits.max_inspect_body_bytes`, default 1 MiB; larger bodies make the
-predicate false *and* log `body_too_large_to_inspect`) for flows whose other
-predicates match, evaluate, then replay the bytes downstream as a stream. The compiler determines per-rule whether the body is
+`limits.max_inspect_body_bytes`, default 1 MiB) for flows whose other
+predicates match, evaluate, then replay the bytes downstream as a stream. A
+body larger than the cap **fails closed**: the flow is denied with
+`_fail_closed` and reason `body_too_large_to_inspect`, because "could not
+check" must never become "the predicate is false" (§6.1). Operators who need
+to inspect larger bodies raise the cap; operators who do not need body
+predicates on large uploads scope the rule with `body.size < 1mb and ...`,
+which short-circuits before the body is touched. The compiler determines per-rule whether the body is
 needed; rules without body predicates never buffer and stream end-to-end.
 
 ### 6.3 Actions
