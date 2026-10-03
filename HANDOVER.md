@@ -171,8 +171,8 @@ availability; audit the code, don't trust the report):
 
 **After merging:**
 
-- Commit the README rewrite. It is **uncommitted in the main checkout** and
-  already describes the new model. Check it against what was built.
+- The README rewrite for the new model is commit `8724d76` on
+  `wip/rule-model`. It merges with the code; check it against what was built.
 - Apply the DESIGN.md changes the agent reports.
 - Push.
 
