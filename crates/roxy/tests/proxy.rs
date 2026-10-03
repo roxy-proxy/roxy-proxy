@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use roxy_proxy::{MetricSource, MetricSourceError, Sample};
-use roxy_rules::{FlowView, Phase};
+use roxy_rules::FlowView;
 
 use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -867,12 +867,7 @@ impl MetricSource for StubMetrics {
         }
     }
 
-    fn record(
-        &self,
-        _phase: Phase,
-        _view: &dyn FlowView,
-        _sample: &Sample,
-    ) -> Result<(), MetricSourceError> {
+    fn record(&self, _view: &dyn FlowView, _sample: &Sample) -> Result<(), MetricSourceError> {
         self.recorded.fetch_add(1, Ordering::Relaxed);
         if self.mode.load(Ordering::Relaxed) == 3 {
             return Err(MetricSourceError::TableFull("hits".into()));

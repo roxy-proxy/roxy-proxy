@@ -55,6 +55,13 @@ pub fn unsupported(config: &Config, caps: Capabilities) -> Vec<String> {
     if !config.addons.is_empty() {
         out.push("WASM addons are not in this build (`addons`)".into());
     }
+    if config.compile_policy().is_ok_and(|p| p.reads_ws()) {
+        out.push(
+            "WebSocket message rules (`ws.*`) are not in this build (DESIGN.md §8.2); byte \
+             budgets on WebSockets work through `request_bytes` / `response_bytes` metrics"
+                .into(),
+        );
+    }
     out
 }
 

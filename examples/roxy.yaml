@@ -83,11 +83,18 @@ metrics:
     key: [client.ip]
     window: 1h
 
+# What a request gets when no rule decides it: deny (the default) or allow.
+# Any matching deny wins over any matching allow, wherever it sits in the
+# list (DESIGN.md §6.1); rule order only orders effects.
+default: deny
+
 rules:
   - id: no-writes-burst
     when: metric.github_writes >= 30 and host under "api.github.com"
     then: deny
 
+  # `egress_bytes` counts request_bytes, which grow as uploads stream, so
+  # this deny also watches: it stops the upload that crosses the budget.
   - id: egress-budget
     when: metric.egress_bytes > 500mb
     then: { deny: { status: 429, message: "hourly egress budget exhausted" } }
@@ -97,6 +104,13 @@ rules:
   # `limits.max_request_body_bytes` caps every body while it streams.
   - id: no-big-uploads
     when: host == "api.openai.com" and body.size != null and body.size > 10mb
+    then: { deny: { status: 413, message: "upload too large" } }
+
+  # The streaming cap: `body.bytes` is known only as the body streams, so
+  # this rule watches the upload and stops it at the chunk that crosses
+  # 10mb, whether or not a length was declared.
+  - id: upload-cap
+    when: host == "api.openai.com" and body.bytes > 10mb
     then: { deny: { status: 413, message: "upload too large" } }
 
   - id: openai
@@ -117,8 +131,8 @@ rules:
     when: host == "ws.example.com" and header["upgrade"] == "websocket"
     then: { allow: { upgrade: websocket } }
 
+  # Reads a response value, so it watches; it only adds an effect.
   - id: log-upstream-5xx
-    phase: response
     when: response.status >= 500
     then: { log: { level: warn, message: "upstream 5xx" } }
 

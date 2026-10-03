@@ -42,8 +42,7 @@ use ulid::Ulid;
 
 use crate::body::{Collected, body_text, collect_prefix};
 use crate::flowlog::{
-    ClientInfo, DecisionKind, DstInfo, FlowEvent, RequestInfo, ResponseInfo, Stage, Timing,
-    TlsInfo,
+    ClientInfo, DecisionKind, DstInfo, FlowEvent, RequestInfo, ResponseInfo, Stage, Timing, TlsInfo,
 };
 use crate::io::ConnIo;
 use crate::listener::ClientConn;
@@ -491,7 +490,8 @@ impl FlowCx {
     }
 
     /// Emits the flow's `request` event.
-    pub(crate) fn emit_request_event(&self) {
+    pub(crate) fn emit_request_event(&mut self) {
+        self.absorb_watch();
         let r = self.facts.request.as_ref();
         let req = RequestInfo {
             method: r.map(|r| r.method.clone()).unwrap_or_default(),
@@ -706,7 +706,10 @@ impl Events<'_> {
     }
 }
 
-pub(crate) fn fail_closed_code(reason: &FailClosedReason, metric: Option<&MetricSourceError>) -> &'static str {
+pub(crate) fn fail_closed_code(
+    reason: &FailClosedReason,
+    metric: Option<&MetricSourceError>,
+) -> &'static str {
     match reason {
         FailClosedReason::MetricUnavailable(_) => {
             metric.map_or("metric_unavailable", MetricSourceError::code)

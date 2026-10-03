@@ -145,7 +145,6 @@ async fn proxy_port_loop(
                     handle,
                     client.with_user(user),
                     authority,
-                    framing,
                     shared,
                 ))
                 .await;
@@ -205,16 +204,7 @@ async fn proxy_port_loop(
                         return;
                     }
                 };
-                match exchange::run(
-                    conn,
-                    &handle,
-                    req,
-                    client.with_user(user),
-                    None,
-                    &shared,
-                    true,
-                )
-                .await
+                match exchange::run(conn, &handle, req, client.with_user(user), None, &shared).await
                 {
                     Some(c) => conn = c,
                     None => return,
@@ -235,11 +225,9 @@ async fn handle_connect(
     handle: ConnIo,
     client: ClientConn,
     authority: Authority,
-    framing: ClientFraming,
     shared: Arc<Shared>,
 ) {
-    // Connect phase (§4.3). A flow context carries the evaluation and log
-    // helpers; there is no request yet.
+    // A flow context carries the log helpers; there is no request yet.
     let snap = shared.snapshot();
     let placeholder = CanonicalRequest {
         method: Method::Connect,
@@ -260,15 +248,11 @@ async fn handle_connect(
         client.clone(),
         None,
         &placeholder,
-        false,
     );
     cx.facts.request = None;
-    if let Some(refusal) = cx.connect_phase(&authority) {
-        cx.emit_connect_event(&authority, true);
-        let res = refusal.response(&cx.flow);
-        respond(conn, &handle, res, true, framing, b"").await;
-        return;
-    }
+    // No connect-time rules (§4.3): a CONNECT that passed proxy auth is
+    // accepted for inspection; every decision is made on the requests
+    // inside the tunnel.
     cx.emit_connect_event(&authority, false);
     let limits = snap.limits.clone();
     let flags = snap.flags.clone();
@@ -438,16 +422,7 @@ async fn tunnel_loop(
                 return;
             }
             Ok(Some(Incoming::Request(req))) => {
-                match exchange::run(
-                    conn,
-                    &handle,
-                    req,
-                    client.clone(),
-                    tls.clone(),
-                    &shared,
-                    false,
-                )
-                .await
+                match exchange::run(conn, &handle, req, client.clone(), tls.clone(), &shared).await
                 {
                     Some(c) => conn = c,
                     None => return,

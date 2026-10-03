@@ -21,7 +21,7 @@ use ipnet::IpNet;
 use serde::Deserialize;
 
 pub use roxy_rules::config::{
-    Action, Expr, MetricConfig as Metric, MetricCount, Phase, RuleConfig as Rule, Then,
+    Action, DefaultDecision, Expr, MetricConfig as Metric, MetricCount, RuleConfig as Rule, Then,
 };
 pub use units::Resolver;
 pub use validate::Diagnostic;
@@ -55,6 +55,10 @@ pub struct Config {
     pub address_lists: Vec<AddressList>,
     #[serde(default)]
     pub metrics: Vec<Metric>,
+    /// What a request gets when no rule decides it (§6.1): `deny` (the
+    /// default) or `allow`.
+    #[serde(default)]
+    pub default: DefaultDecision,
     #[serde(default)]
     pub rules: Vec<Rule>,
     #[serde(default)]

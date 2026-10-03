@@ -244,7 +244,6 @@ async fn serve_stream(
         ccx.client.clone(),
         Some(ccx.tls.clone()),
         &req,
-        false,
     );
     let mut front = H2Front {
         respond,
@@ -259,7 +258,7 @@ async fn serve_stream(
         allow_trailers: flags.allow_trailers,
     };
     match outcome {
-        Outcome::Respond(res) => send_upstream_response(&mut respond, cx, res, &out).await,
+        Outcome::Respond(res) => send_upstream_response(&mut respond, cx, res, &out, &ccx).await,
         Outcome::Refuse(refusal) => {
             let res = refusal_response(&mut cx, &refusal);
             if let Err(e) = write_response(&mut respond, res, &out).await {
@@ -271,7 +270,7 @@ async fn serve_stream(
             if refusal.kind == RefusalKind::Deny && refusal.close {
                 ccx.closing.cancel();
             }
-            finish_refusal(&cx, &refusal);
+            finish_refusal(&mut cx, &refusal);
         }
         Outcome::Close(e) => {
             ccx.shared
@@ -300,13 +299,22 @@ async fn send_upstream_response(
     mut cx: FlowCx,
     mut res: CanonicalResponse,
     out: &Out<'_>,
+    ccx: &ConnCx,
 ) {
     let (body, counter) = counted(std::mem::take(&mut res.body));
     res.body = body;
     cx.record.response_status = Some(res.status.as_u16());
     cx.record.response_headers_bytes = res.headers.wire_len() as u64;
     let r = write_response(respond, res, out).await;
-    if let Err(e) = &r {
+    // §6.1: a watching stop mid-body resets the stream (`CANCEL`, sent by
+    // `write_response`), and a closing deny also ends the connection
+    // (`GOAWAY`).
+    let stop = cx.watch.as_ref().and_then(|w| w.stopped());
+    if let Some(stop) = &stop {
+        if stop.refusal.close {
+            ccx.closing.cancel();
+        }
+    } else if let Err(e) = &r {
         cx.shared.sink.emit(&FlowEvent::ResponseError {
             ts: chrono::Utc::now(),
             flow: cx.flow.to_string(),
@@ -316,7 +324,7 @@ async fn send_upstream_response(
         });
     }
     cx.record.response_bytes = counter.load(Ordering::Relaxed);
-    cx.record_final_sample(r.is_err());
+    cx.record_final_sample(r.is_err() && stop.is_none());
     cx.emit_request_event();
 }
 
@@ -346,18 +354,47 @@ async fn write_response(
         .send_response(head, false)
         .map_err(|e| e.to_string())?;
     let r = stream_body(&mut send, &mut body, out).await;
-    if let Err(e) = &r {
-        tracing::debug!(error = %e, "h2 response body failed; resetting the stream");
-        send.send_reset(h2::Reason::INTERNAL_ERROR);
+    match &r {
+        Err(BodyFailure::Stopped) => {
+            tracing::debug!("h2 response stopped by policy; resetting the stream");
+            send.send_reset(h2::Reason::CANCEL);
+        }
+        Err(BodyFailure::Other(e)) => {
+            tracing::debug!(error = %e, "h2 response body failed; resetting the stream");
+            send.send_reset(h2::Reason::INTERNAL_ERROR);
+        }
+        Ok(()) => {}
     }
-    r
+    r.map_err(|e| e.to_string())
+}
+
+/// Why a response body could not be streamed.
+enum BodyFailure {
+    /// A watching rule stopped the exchange (§6.1).
+    Stopped,
+    Other(String),
+}
+
+impl From<String> for BodyFailure {
+    fn from(s: String) -> Self {
+        Self::Other(s)
+    }
+}
+
+impl std::fmt::Display for BodyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stopped => f.write_str("stopped by policy"),
+            Self::Other(s) => f.write_str(s),
+        }
+    }
 }
 
 async fn stream_body(
     send: &mut SendStream<Bytes>,
     body: &mut Body,
     out: &Out<'_>,
-) -> Result<(), String> {
+) -> Result<(), BodyFailure> {
     loop {
         let frame = timeout(
             out.idle,
@@ -371,7 +408,8 @@ async fn stream_body(
                     .map_err(|e| e.to_string())?;
                 return Ok(());
             }
-            Some(Err(e)) => return Err(e.to_string()),
+            Some(Err(BodyError::Stopped)) => return Err(BodyFailure::Stopped),
+            Some(Err(e)) => return Err(e.to_string().into()),
             Some(Ok(f)) => f,
         };
         match frame.into_data() {
@@ -382,8 +420,8 @@ async fn stream_body(
                         .await
                         .map_err(|_| "client flow-control window stalled".to_owned())?;
                     let n = match cap {
-                        None => return Err("stream closed by the client".to_owned()),
-                        Some(Err(e)) => return Err(e.to_string()),
+                        None => return Err("stream closed by the client".to_owned().into()),
+                        Some(Err(e)) => return Err(e.to_string().into()),
                         Some(Ok(n)) => n.min(data.len()),
                     };
                     if n == 0 {

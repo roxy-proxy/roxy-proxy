@@ -45,9 +45,26 @@ fn full_example_parses_and_validates() {
     assert_eq!(cfg.metrics[0].window, Some(Duration::from_secs(60)));
     assert_eq!(cfg.metrics[1].where_, Some(Expr("true".into())));
     assert_eq!(cfg.metrics[1].window, Some(Duration::from_secs(3600)));
-    assert_eq!(cfg.rules.len(), 8);
-    assert_eq!(cfg.rules[3].then.0.len(), 2);
-    assert_eq!(cfg.rules[7].phase, Phase::Response);
+    assert_eq!(cfg.rules.len(), 9);
+    assert_eq!(cfg.rules[4].then.0.len(), 2);
+    assert_eq!(cfg.default, DefaultDecision::Deny);
+    let policy = cfg.compile_policy().unwrap();
+    let kinds: Vec<_> = policy.rule_info().into_iter().map(|r| r.kind).collect();
+    use roxy_rules::RuleKind::{Head, HeadAndWatching, Watching};
+    assert_eq!(
+        kinds,
+        [
+            Head,
+            HeadAndWatching,
+            Head,
+            Watching,
+            Head,
+            Head,
+            Head,
+            Head,
+            Watching
+        ]
+    );
     assert_eq!(cfg.addons[0].kind, AddonKind::Wasm);
     assert_eq!(cfg.addons[0].mode, AddonMode::Enforce);
     assert_eq!(
@@ -95,7 +112,7 @@ fn minimal_example_uses_defaults() {
     assert_eq!(cfg.upstream.dns.cache_ttl_cap, Duration::from_secs(60));
     assert!(cfg.log.flow.path.is_none());
     assert!(!cfg.log.flow.connection_events);
-    assert_eq!(cfg.rules[0].phase, Phase::Request);
+    assert_eq!(cfg.default, DefaultDecision::Deny);
     assert_eq!(
         cfg.rules[0].then.0,
         vec![Action::Allow(roxy_rules::AllowArgs::default())]
@@ -171,7 +188,8 @@ fn unknown_fields_rejected_everywhere() {
 #[test]
 fn unknown_enum_values_rejected() {
     for bad in [
-        "rules: [{ id: r, phase: postflight, then: allow }]",
+        "rules: [{ id: r, phase: request, then: allow }]",
+        "default: maybe",
         "tls: { upstream: { verify: lax } }",
         "tls: { upstream: { min_version: \"1.1\" } }",
         "metrics: [{ id: m, count: bananas }]",
@@ -255,13 +273,26 @@ fn undefined_secret_reference_diagnosed() {
 }
 
 #[test]
-fn secret_outside_request_phase_diagnosed() {
+fn secret_in_watching_rule_diagnosed() {
     let d = diagnostics(&format!(
-        "{BASE}secrets: {{ s: {{ env: S }} }}\nrules:\n  - id: a\n    phase: response\n    \
+        "{BASE}secrets: {{ s: {{ env: S }} }}\nrules:\n  - id: a\n    \
+         when: response.status == 200\n    \
          then: {{ set_header: {{ x: \"${{secret:s}}\" }} }}\n"
     ));
     assert_eq!(d.len(), 1, "{d:?}");
-    assert!(d[0].message.contains("request-phase"));
+    assert!(
+        d[0].message.contains("decided at the request head"),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn default_allow_parses() {
+    let cfg = parse(&format!("{BASE}default: allow\n"));
+    cfg.validate().unwrap();
+    assert_eq!(cfg.default, DefaultDecision::Allow);
+    let p = cfg.compile_policy().unwrap();
+    assert_eq!(p.default_decision(), DefaultDecision::Allow);
 }
 
 #[test]

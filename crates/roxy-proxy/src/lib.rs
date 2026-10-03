@@ -61,8 +61,8 @@ pub use config::{ListenerSpec, PolicyUpdate, RuntimeConfig};
 pub use conn::INTERNAL_HOST;
 pub use flowlog::{
     ClientInfo, DEFAULT_REDACTED_HEADERS, DecisionKind, DstInfo, FileSink, FlowEvent, FlowSink,
-    MemorySink, MultiSink, REDACTED, Redactor, RequestInfo, ResponseInfo, Stage, StdoutSink, Timing,
-    TlsInfo, WriterSink,
+    MemorySink, MultiSink, REDACTED, Redactor, RequestInfo, ResponseInfo, Stage, StdoutSink,
+    Timing, TlsInfo, WriterSink,
 };
 pub use listener::{ClientConn, ExplicitListener, Listener, ListenerInfo, ListenerMode};
 pub use server::{Server, ServerHandle, StartError};

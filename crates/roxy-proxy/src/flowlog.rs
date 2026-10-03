@@ -680,6 +680,7 @@ mod tests {
             },
             terminal_rule: Some("github-writes".into()),
             reason: None,
+            stage: Some(Stage::Head),
         }
     }
 
@@ -696,6 +697,7 @@ mod tests {
         assert_eq!(v["decision"], "allow");
         assert_eq!(v["timing"]["upstream_ttfb_ms"], 350);
         assert_eq!(v["terminal_rule"], "github-writes");
+        assert_eq!(v["stage"], "head");
         assert!(v.get("reason").is_none());
     }
 

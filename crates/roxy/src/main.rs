@@ -15,7 +15,6 @@ use tracing_subscriber::EnvFilter;
 
 use roxy::config::Config;
 use roxy::ruletest;
-use roxy_rules::Phase;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -100,9 +99,6 @@ enum RuleCommand {
 struct RuleTestArgs {
     #[command(flatten)]
     config: ConfigArg,
-    /// Phase whose chain to evaluate.
-    #[arg(long, value_enum, default_value = "request")]
-    phase: PhaseArg,
     /// `client.ip`.
     #[arg(long, default_value = "127.0.0.1")]
     client_ip: std::net::IpAddr,
@@ -115,9 +111,17 @@ struct RuleTestArgs {
     /// Request body text (`body.text`, `body.size`).
     #[arg(long)]
     body: Option<String>,
-    /// `response.status` (response phase).
+    /// `body.bytes`: request body bytes streamed so far. Runs the watching
+    /// rules that read it.
     #[arg(long)]
-    status: Option<u16>,
+    body_bytes: Option<u64>,
+    /// `response.status`. Runs the watching rules that read the response
+    /// head (`response.status`, `response.header[..]`).
+    #[arg(long)]
+    response_status: Option<u16>,
+    /// `response.body.bytes`: response body bytes sent so far.
+    #[arg(long)]
+    response_body_bytes: Option<u64>,
     /// Response header `name: value` (repeatable).
     #[arg(short = 'R', long = "response-header")]
     response_headers: Vec<String>,
@@ -135,23 +139,6 @@ struct RuleTestArgs {
     /// `METHOD URL`, as two arguments or one (`'POST https://host/path'`).
     #[arg(required = true, num_args = 1..=2, value_names = ["METHOD", "URL"])]
     request: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum PhaseArg {
-    Connect,
-    Request,
-    Response,
-}
-
-impl From<PhaseArg> for Phase {
-    fn from(p: PhaseArg) -> Self {
-        match p {
-            PhaseArg::Connect => Phase::Connect,
-            PhaseArg::Request => Phase::Request,
-            PhaseArg::Response => Phase::Response,
-        }
-    }
 }
 
 fn main() -> ExitCode {
@@ -202,7 +189,9 @@ fn rule_test(args: &RuleTestArgs) -> anyhow::Result<ExitCode> {
     req.client_ip = args.client_ip;
     req.user.clone_from(&args.user);
     req.body.clone_from(&args.body);
-    req.status = args.status;
+    req.body_bytes = args.body_bytes;
+    req.response_status = args.response_status;
+    req.response_body_bytes = args.response_body_bytes;
     req.tags.clone_from(&args.tags);
     let err = |e: String| anyhow::anyhow!(e);
     req.headers = args
@@ -234,11 +223,11 @@ fn rule_test(args: &RuleTestArgs) -> anyhow::Result<ExitCode> {
     for w in warnings {
         eprintln!("roxy rule test: warning: {w}");
     }
-    let phase = Phase::from(args.phase);
-    let mut out = ruletest::run(&policy, phase, &view, &req.tags);
-    let address = ruletest::address_check(&config, &view, &out);
+    let mut run = ruletest::run(&policy, &view, &req.tags, ruletest::known(&req));
+    let address = ruletest::address_check(&config, &view, &run.head);
     if matches!(address, Some(Err(_))) {
-        ruletest::apply_address_denial(&mut out);
+        ruletest::apply_address_denial(&mut run.head);
+        run.watching = None;
     }
     // Secrets are never resolved here, so the redactor has none registered;
     // effect text still goes through it so a future change cannot leak.
@@ -246,9 +235,9 @@ fn rule_test(args: &RuleTestArgs) -> anyhow::Result<ExitCode> {
     let note = ruletest::metric_note(&ruletest::metric_values(&config, &req));
     print!(
         "{}",
-        ruletest::report(phase, note.as_deref(), address.as_ref(), &out, &redactor)
+        ruletest::report(&policy, note.as_deref(), address.as_ref(), &run, &redactor)
     );
-    Ok(ExitCode::from(ruletest::exit_code(&out.decision)))
+    Ok(ExitCode::from(ruletest::exit_code(run.decision())))
 }
 
 /// `<file>:<diagnostic>` plus the indented snippet for expression errors.
@@ -355,6 +344,11 @@ fn check(path: &Path) -> ExitCode {
                 config.secrets.len(),
                 config.addons.len(),
             );
+            if let Ok(policy) = config.compile_policy()
+                && policy.rule_count() > 0
+            {
+                print!("rules:\n{}", roxy::ruletest::classification(&policy));
+            }
             ExitCode::SUCCESS
         }
         Err(diags) => {

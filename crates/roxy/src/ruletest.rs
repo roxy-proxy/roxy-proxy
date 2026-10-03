@@ -10,8 +10,8 @@ use roxy_proxy::Redactor;
 use roxy_proxy::addr::AddressDenied;
 use roxy_proxy::addrlist::AddressLists;
 use roxy_rules::{
-    BodyText, Decision, EvalContext, Field, FlowView, MapView, Outcome, Phase, Policy, RuleId,
-    Value,
+    BodyText, Decision, EvalContext, Field, FlowView, MapView, Outcome, Policy, Reads, RuleId,
+    RuleKind, Value, WatchOutcome,
 };
 
 use crate::config::Config;
@@ -72,8 +72,12 @@ pub struct TestRequest {
     pub body: Option<String>,
     pub client_ip: IpAddr,
     pub user: Option<String>,
-    /// Response phase only.
-    pub status: Option<u16>,
+    /// `body.bytes`: request body bytes streamed so far (watching rules).
+    pub body_bytes: Option<u64>,
+    /// `response.status`; with it, rules reading the response head run.
+    pub response_status: Option<u16>,
+    /// `response.body.bytes` (watching rules).
+    pub response_body_bytes: Option<u64>,
     pub response_headers: Vec<(String, String)>,
     /// `--metric id=N` (`Some(N)`) or `--metric id=unavailable` (`None`).
     /// Defined metrics not listed here evaluate as 0, a fresh series.
@@ -158,7 +162,9 @@ impl TestRequest {
             body: None,
             client_ip: IpAddr::from([127, 0, 0, 1]),
             user: None,
-            status: None,
+            body_bytes: None,
+            response_status: None,
+            response_body_bytes: None,
             response_headers: Vec::new(),
             metrics: Vec::new(),
             state: Vec::new(),
@@ -304,8 +310,6 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(DryRunView, Vec
                 .map_or("proxy", |l| l.name.as_str()),
         )
         .with_str(Field::ListenerMode, "explicit")
-        .with_str(Field::DstHost, &url.host)
-        .with_int(Field::DstPort, i64::from(url.port))
         .with_str(Field::Method, &req.method)
         .with_str(Field::Scheme, &url.scheme)
         .with_str(Field::Host, &url.host)
@@ -318,9 +322,6 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(DryRunView, Vec
                 .as_ref()
                 .map_or(0, |b| i64::try_from(b.len()).unwrap_or(i64::MAX)),
         );
-    if let Some(ip) = host_ip {
-        v = v.with(Field::DstIp, Value::Ip(ip));
-    }
     if url.scheme == "https" && host_ip.is_none() {
         v = v.with_str(Field::TlsSni, &url.host);
     }
@@ -345,8 +346,15 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(DryRunView, Vec
     v = v
         .with_body(req.body.as_deref().unwrap_or(""))
         .with_response_body("");
-    if let Some(status) = req.status {
+    let int = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+    if let Some(n) = req.body_bytes {
+        v = v.with_int(Field::BodyBytes, int(n));
+    }
+    if let Some(status) = req.response_status {
         v = v.with_int(Field::ResponseStatus, i64::from(status));
+    }
+    if let Some(n) = req.response_body_bytes {
+        v = v.with_int(Field::ResponseBodyBytes, int(n));
     }
     for (n, val) in &req.response_headers {
         v = v.with_response_header(n, val);
@@ -388,9 +396,10 @@ pub fn address_check(
     let Decision::Allow(opts) = &out.decision else {
         return None;
     };
-    let Value::Ip(ip) = view.map.field(Field::DstIp) else {
+    let Value::Str(host) = view.map.field(Field::Host) else {
         return None;
     };
+    let ip = host.parse::<IpAddr>().ok()?;
     let mut policy = roxy_proxy::UpstreamSettings::from(config).address_policy;
     policy.deny_lists = config
         .upstream
@@ -421,24 +430,97 @@ pub fn apply_address_denial(out: &mut Outcome) {
     out.terminal_rule = RuleId::new("_address_policy");
 }
 
-/// Evaluate `req` in `phase`. Secrets are not resolved: each
-/// `${secret:name}` becomes the placeholder `[secret:name]`.
-pub fn run(policy: &Policy, phase: Phase, view: &DryRunView, tags: &[String]) -> Outcome {
+/// The watched values a dry run supplies, from the command line: which
+/// watching rules can run.
+pub fn known(req: &TestRequest) -> Reads {
+    let mut k = Reads::NONE;
+    if req.body_bytes.is_some() {
+        k |= Reads::BODY_BYTES;
+    }
+    if req.response_status.is_some() {
+        // The dry run has no response body: `response.body.text` is "".
+        k |= Reads::RESPONSE_HEAD | Reads::RESPONSE_BODY_TEXT;
+    }
+    if req.response_body_bytes.is_some() {
+        k |= Reads::RESPONSE_BODY_BYTES;
+    }
+    k
+}
+
+/// What a dry run decided.
+#[derive(Debug, Clone)]
+pub struct DryRun {
+    /// The head decision.
+    pub head: Outcome,
+    /// The watching rules, re-checked once with the supplied watched values
+    /// (and the given metric values), when the head allowed.
+    pub watching: Option<WatchOutcome>,
+}
+
+impl DryRun {
+    /// The final decision: a watching stop overrides the head's allow.
+    pub fn decision(&self) -> &Decision {
+        self.watching
+            .as_ref()
+            .and_then(|w| w.stop.as_ref())
+            .unwrap_or(&self.head.decision)
+    }
+
+    pub fn terminal_rule(&self) -> &RuleId {
+        self.watching
+            .as_ref()
+            .and_then(|w| w.terminal_rule.as_ref())
+            .unwrap_or(&self.head.terminal_rule)
+    }
+}
+
+/// Evaluate `req`: the head decision, then, if allowed, the watching rules
+/// whose values are `known` (plus deny rules on byte metrics, at the given
+/// metric values). Secrets are not resolved: each `${secret:name}` becomes
+/// the placeholder `[secret:name]`.
+pub fn run(policy: &Policy, view: &DryRunView, tags: &[String], known: Reads) -> DryRun {
     let placeholder = |name: &str| Some(format!("[secret:{name}]"));
     let ctx = EvalContext {
         secrets: &placeholder,
         initial_tags: tags,
     };
-    policy.evaluate(phase, view, &ctx)
+    let head = policy.evaluate_head(view, &ctx);
+    let watching = head.decision.is_allow().then(|| {
+        let mut st = policy.watch_state(&head.tags);
+        let changed = known | Reads::METRICS;
+        policy
+            .evaluate_watching(changed, known, &mut st, view, &ctx)
+            .unwrap_or_default()
+    });
+    DryRun { head, watching }
+}
+
+/// Every rule, whether it is decided at the request head or watches, and
+/// what it watches (§6.1). Shared by `roxy check` and `roxy rule test`.
+pub fn classification(policy: &Policy) -> String {
+    let info = policy.rule_info();
+    let width = info.iter().map(|r| r.id.as_str().len()).max().unwrap_or(0);
+    let mut s = String::new();
+    for r in &info {
+        let kind = match r.kind {
+            RuleKind::Head => "head".to_owned(),
+            RuleKind::Watching => format!("watching: {}", r.watches.join(", ")),
+            RuleKind::HeadAndWatching => {
+                format!("head, then watching: {}", r.watches.join(", "))
+            }
+        };
+        let _ = writeln!(s, "  {:width$}  {kind}", r.id.as_str());
+    }
+    s
 }
 
 /// Human-readable report. Effect text passes through `redactor`.
 /// `address` is the result of [`address_check`], when it ran.
 pub fn report(
-    phase: Phase,
+    policy: &Policy,
     metrics: Option<&str>,
     address: Option<&Result<IpAddr, AddressDenied>>,
-    out: &Outcome,
+    run: &DryRun,
     redactor: &Redactor,
 ) -> String {
     let mut s = String::new();
@@ -449,23 +531,27 @@ pub fn report(
             items.join(", ")
         }
     };
-    let _ = writeln!(s, "phase:    {phase}");
+    let _ = write!(s, "rules:\n{}", classification(policy));
     if let Some(m) = metrics {
         let _ = writeln!(s, "metrics:  {m}");
     }
+    let out = &run.head;
     let _ = writeln!(
         s,
         "matched:  {}",
         list(out.matched.iter().map(ToString::to_string).collect())
     );
-    if out.effects.is_empty() {
-        let _ = writeln!(s, "effects:  (none)");
-    } else {
-        let _ = writeln!(s, "effects:");
-        for e in &out.effects {
-            let _ = writeln!(s, "  - {}", redactor.redact_str(&e.to_string()));
+    let effects = |s: &mut String, effects: &[roxy_rules::Effect]| {
+        if effects.is_empty() {
+            let _ = writeln!(s, "effects:  (none)");
+        } else {
+            let _ = writeln!(s, "effects:");
+            for e in effects {
+                let _ = writeln!(s, "  - {}", redactor.redact_str(&e.to_string()));
+            }
         }
-    }
+    };
+    effects(&mut s, &out.effects);
     let _ = writeln!(s, "tags:     {}", list(out.tags.clone()));
     match address {
         Some(Ok(ip)) => {
@@ -484,9 +570,33 @@ pub fn report(
         }
         None => {}
     }
-    let _ = writeln!(s, "decision: {}", out.decision);
-    let _ = writeln!(s, "rule:     {}", out.terminal_rule);
-    if let Some(reason) = &out.fail_closed_reason {
+    if let Some(w) = &run.watching {
+        let _ = writeln!(s, "watching:");
+        let _ = writeln!(
+            s,
+            "  matched:  {}",
+            list(w.matched.iter().map(ToString::to_string).collect())
+        );
+        for e in &w.effects {
+            let _ = writeln!(s, "  - {}", redactor.redact_str(&e.to_string()));
+        }
+        match (&w.stop, &w.terminal_rule) {
+            (Some(d), Some(r)) => {
+                let _ = writeln!(s, "  stops:    {d} (rule {r})");
+            }
+            _ => {
+                let _ = writeln!(s, "  stops:    no");
+            }
+        }
+    }
+    let _ = writeln!(s, "decision: {}", run.decision());
+    let _ = writeln!(s, "rule:     {}", run.terminal_rule());
+    let reason = run
+        .watching
+        .as_ref()
+        .and_then(|w| w.fail_closed_reason.as_ref())
+        .or(out.fail_closed_reason.as_ref());
+    if let Some(reason) = reason {
         let _ = writeln!(s, "reason:   {reason} (fail closed)");
     }
     s

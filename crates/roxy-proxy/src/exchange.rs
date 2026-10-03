@@ -27,6 +27,7 @@ use crate::pipeline::{
 use crate::server::Shared;
 use crate::upstream::{ConnectError, classify, describe};
 use crate::view::host_text;
+use crate::watch::{Dir, Watch, watched};
 
 /// The client connection after an exchange: `None` once it is closed.
 pub(crate) type Next = Option<ServerConn<ConnIo>>;
@@ -96,12 +97,11 @@ pub(crate) fn refusal_response(cx: &mut FlowCx, refusal: &Refusal) -> CanonicalR
 }
 
 /// Final accounting for a refusal whose response has been written.
-pub(crate) fn finish_refusal(cx: &FlowCx, refusal: &Refusal) {
-    // After an allowed request (upstream failure, response-phase deny) the
-    // response-phase sample is still due; request-phase denies were
-    // recorded at their decision.
+pub(crate) fn finish_refusal(cx: &mut FlowCx, refusal: &Refusal) {
+    // After a forwarded request (upstream failure, a watching stop) the
+    // final sample is still due; head denies were recorded at the head.
     let upstream_error = refusal.kind == RefusalKind::UpstreamError;
-    if upstream_error || cx.facts.response.is_some() {
+    if cx.watch.is_some() {
         cx.record_final_sample(upstream_error);
     }
     cx.emit_request_event();
@@ -117,7 +117,7 @@ pub(crate) async fn refuse(
 ) -> Next {
     let res = refusal_response(&mut cx, &refusal);
     let next = respond(conn, handle, res, refusal.close, framing, b"").await;
-    finish_refusal(&cx, &refusal);
+    finish_refusal(&mut cx, &refusal);
     next
 }
 
@@ -226,13 +226,12 @@ pub(crate) async fn run(
     client: ClientConn,
     tls: Option<crate::flowlog::TlsInfo>,
     shared: &Arc<Shared>,
-    on_proxy_port: bool,
 ) -> Next {
     let snap = shared.snapshot();
     let framing = ClientFraming {
         close: req.meta.close,
     };
-    let mut cx = FlowCx::new(shared.clone(), snap, client, tls, &req, on_proxy_port);
+    let mut cx = FlowCx::new(shared.clone(), snap, client, tls, &req);
     match process(&mut conn, &mut cx, req).await {
         Outcome::Respond(res) => send_response(conn, cx, res).await,
         Outcome::Refuse(refusal) => refuse(conn, handle, cx, refusal, framing).await,
@@ -305,8 +304,18 @@ enum Upstreamed {
     },
 }
 
+/// The stop of a watching rule, as the outcome of an exchange whose
+/// response has not started (§6.1: answered with an error response).
+fn stopped_outcome(watch: &Watch) -> Option<Outcome> {
+    watch.stopped().map(|s| Outcome::Refuse(s.refusal))
+}
+
 #[allow(clippy::too_many_lines)] // one linear flow; splitting it obscures the order
 async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalRequest) -> Outcome {
+    // From here on the request is on its way: watching rules re-check the
+    // exchange as values arrive (§6.1).
+    let watch = Watch::new(cx);
+    cx.watch = Some(watch.clone());
     let host = host_text(&req.authority.host);
     let port = req.authority.port;
     let private_ok = cx.opts.private_ok;
@@ -400,7 +409,10 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
             Ok(Ok(res)) => Upstreamed::Response(res),
         }
     } else {
-        let (body, req_counter) = counted(std::mem::take(&mut req.body));
+        // Watched first: a chunk that makes a deny match is never counted
+        // as forwarded nor handed to the upstream.
+        let body = watched(std::mem::take(&mut req.body), watch.clone(), Dir::Request);
+        let (body, req_counter) = counted(body);
         req.body = body;
         let mut http_req = match to_upstream_request(req, UriForm::Absolute) {
             Ok(r) => r,
@@ -409,15 +421,30 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
             }
         };
         set_host_override(cx, &mut http_req);
-        let fut = tokio::time::timeout(
+        let upstream = tokio::time::timeout(
             limits.response_header_timeout,
             upstream_client.client(private_ok).request(http_req),
         );
+        // A stop (from a request body chunk) abandons the upstream request
+        // at once instead of waiting for its response.
+        let stopped = watch.cancelled();
+        let fut = async move {
+            tokio::select! {
+                biased;
+                () = stopped => None,
+                r = upstream => Some(r),
+            }
+        };
         let driven = front.drive(fut).await;
         cx.record.request_bytes = req_counter.load(Ordering::Relaxed);
+        if let Some(o) = stopped_outcome(&watch) {
+            return o;
+        }
         match driven {
             Err(e) => return Outcome::Close(e),
-            Ok(Err(_elapsed)) => {
+            // Unreachable: a cancelled watch returned above. Fail closed.
+            Ok(None) => return Outcome::Refuse(Refusal::fail_closed("watch_stopped")),
+            Ok(Some(Err(_elapsed))) => {
                 return Outcome::Refuse(upstream_refusal(
                     cx,
                     &ConnectError::Timeout("upstream response headers"),
@@ -425,13 +452,13 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
                     port,
                 ));
             }
-            Ok(Ok(Err(e))) => {
+            Ok(Some(Ok(Err(e)))) => {
                 return Outcome::Refuse(match classify(&e) {
                     Some(ce) => upstream_refusal(cx, &ce, &host, port),
                     None => protocol_refusal(cx, &host, port, describe(&e)),
                 });
             }
-            Ok(Ok(Ok(res))) => Upstreamed::Response(res),
+            Ok(Some(Ok(Ok(res)))) => Upstreamed::Response(res),
         }
     };
     cx.record.ttfb_ms = Some(u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX));
@@ -447,9 +474,13 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
     let shared = cx.shared.clone();
     let verdict = run_response_stages(&shared.pipeline, cx, res, front).await;
     match verdict {
-        ResponseVerdict::Continue(res) => match upgrade {
+        ResponseVerdict::Continue(mut res) => match upgrade {
             Some((on, key)) => Outcome::Upgrade { res, on, key },
-            None => Outcome::Respond(res),
+            None => {
+                let body = std::mem::take(&mut res.body);
+                res.body = watched(body, watch, Dir::Response);
+                Outcome::Respond(res)
+            }
         },
         ResponseVerdict::Deny(r) => Outcome::Refuse(r),
         ResponseVerdict::Close(e) => Outcome::Close(e),
@@ -474,8 +505,12 @@ async fn send_response(
     cx.record.response_status = Some(res.status.as_u16());
     cx.record.response_headers_bytes = res.headers.wire_len() as u64;
     let r = conn.respond(res).await;
-    let failed = r.is_err();
+    // A watching stop mid-body ends the body with an error: the codec stops
+    // before any terminating chunk and the connection is dropped (§6.1).
+    let stopped = cx.watch.as_ref().is_some_and(|w| w.stopped().is_some());
+    let failed = r.is_err() && !stopped;
     let next = match r {
+        Err(_) if stopped => None,
         Err(e) => {
             cx.shared.sink.emit(&FlowEvent::ResponseError {
                 ts: chrono::Utc::now(),
@@ -546,7 +581,18 @@ async fn splice_websocket(
         }
         c2s_extra = leftover.len() as u64;
     }
-    let (c2s, s2c) = splice(client_io, upstream, idle).await;
+    let Some(watch) = cx.watch.clone() else {
+        cx.emit_request_event();
+        return None;
+    };
+    if c2s_extra > 0 && watch.on_ws_chunk(Dir::Request, c2s_extra).is_err() {
+        // Already written upstream (it arrived with the upgrade request);
+        // stop here.
+        cx.record_final_sample(false);
+        cx.emit_request_event();
+        return None;
+    }
+    let (c2s, s2c) = splice(client_io, upstream, idle, &watch).await;
     cx.shared.sink.emit(&FlowEvent::WsClose {
         ts: chrono::Utc::now(),
         flow: cx.flow.to_string(),
@@ -567,6 +613,8 @@ async fn pump<R, W>(
     n: Arc<std::sync::atomic::AtomicU64>,
     last: Arc<std::sync::atomic::AtomicU64>,
     base: Instant,
+    watch: &Watch,
+    dir: Dir,
 ) where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -577,6 +625,11 @@ async fn pump<R, W>(
             Ok(0) | Err(_) => break,
             Ok(k) => k,
         };
+        // Checked before the write: bytes that make a deny match are never
+        // relayed (§6.1).
+        if watch.on_ws_chunk(dir, k as u64).is_err() {
+            break;
+        }
         if w.write_all(&buf[..k]).await.is_err() {
             break;
         }
@@ -590,9 +643,12 @@ async fn pump<R, W>(
     let _ = w.shutdown().await;
 }
 
-/// Copies bytes both ways until either side closes or nothing moves for
-/// `idle`. Returns (client→server, server→client) byte counts.
-async fn splice(client: impl Io, upstream: impl Io, idle: Duration) -> (u64, u64) {
+/// Copies bytes both ways until either side closes, nothing moves for
+/// `idle`, or a watching rule stops the exchange (then both sides are
+/// dropped, i.e. closed: the relay is byte-level, so a close frame could
+/// land inside a half-written frame). Returns (client→server,
+/// server→client) byte counts.
+async fn splice(client: impl Io, upstream: impl Io, idle: Duration, watch: &Watch) -> (u64, u64) {
     use std::sync::atomic::AtomicU64;
     let base = Instant::now();
     let last = Arc::new(AtomicU64::new(0));
@@ -600,8 +656,16 @@ async fn splice(client: impl Io, upstream: impl Io, idle: Duration) -> (u64, u64
     let s2c = Arc::new(AtomicU64::new(0));
     let (cr, cw) = tokio::io::split(client);
     let (ur, uw) = tokio::io::split(upstream);
-    let a = pump(cr, uw, c2s.clone(), last.clone(), base);
-    let b = pump(ur, cw, s2c.clone(), last.clone(), base);
+    let a = pump(cr, uw, c2s.clone(), last.clone(), base, watch, Dir::Request);
+    let b = pump(
+        ur,
+        cw,
+        s2c.clone(),
+        last.clone(),
+        base,
+        watch,
+        Dir::Response,
+    );
     let watchdog = async {
         loop {
             tokio::time::sleep(idle / 4 + Duration::from_millis(1)).await;
@@ -618,6 +682,9 @@ async fn splice(client: impl Io, upstream: impl Io, idle: Duration) -> (u64, u64
     tokio::select! {
         () = async { tokio::join!(a, b); } => {}
         () = watchdog => {}
+        () = watch.cancelled() => {
+            tracing::debug!("websocket relay stopped by policy");
+        }
     }
     (c2s.load(Ordering::Relaxed), s2c.load(Ordering::Relaxed))
 }

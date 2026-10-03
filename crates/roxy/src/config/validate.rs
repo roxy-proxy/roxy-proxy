@@ -61,6 +61,7 @@ impl Config {
                 .listeners
                 .iter()
                 .any(|l| l.mode == ListenerMode::Transparent),
+            default: self.default,
         })
     }
 

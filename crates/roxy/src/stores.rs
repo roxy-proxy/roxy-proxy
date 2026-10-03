@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use roxy_proxy::{MetricSource, MetricSourceError, Sample, StateFull, StateSource};
-use roxy_rules::{FlowView, MetricError, MetricStore, Phase, Policy, StateStore};
+use roxy_rules::{FlowView, MetricError, MetricStore, Policy, StateStore};
 
 /// Default TTL for `set_state` entries written without an explicit `ttl`.
 pub const STATE_DEFAULT_TTL: Duration = Duration::from_secs(3600);
@@ -91,19 +91,15 @@ impl MetricSource for ReloadableMetrics {
         self.inner.load().get(id, view).map_err(map_err)
     }
 
-    fn record(
-        &self,
-        phase: Phase,
-        view: &dyn FlowView,
-        sample: &Sample,
-    ) -> Result<(), MetricSourceError> {
+    fn record(&self, view: &dyn FlowView, sample: &Sample) -> Result<(), MetricSourceError> {
         let s = roxy_rules::Sample {
+            head: sample.head,
             request_bytes: sample.request_bytes,
             response_bytes: sample.response_bytes,
             denied: sample.denied,
             error: sample.error,
         };
-        self.inner.load().record(phase, view, &s).map_err(map_err)
+        self.inner.load().record(view, &s).map_err(map_err)
     }
 }
 

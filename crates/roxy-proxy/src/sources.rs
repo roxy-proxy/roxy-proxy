@@ -131,11 +131,7 @@ mod tests {
             UnavailableMetrics.get("x", &v),
             Err(MetricSourceError::Unknown(_))
         ));
-        assert!(
-            UnavailableMetrics
-                .record(&v, &Sample::default())
-                .is_ok()
-        );
+        assert!(UnavailableMetrics.record(&v, &Sample::default()).is_ok());
         assert_eq!(UnavailableState.get("k"), None);
         assert_eq!(UnavailableState.set("k", "v", None), Err(StateFull));
         assert_eq!(
