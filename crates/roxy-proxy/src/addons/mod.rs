@@ -41,7 +41,7 @@ use crate::body::{Collected, collect_prefix};
 use crate::exchange::{Front, Outcome, refusal_response};
 use crate::flowlog::{DecisionKind, FlowEvent, FlowSink, TlsInfo};
 use crate::listener::ClientConn;
-use crate::pipeline::{BodyIo, FlowCx, Refusal, RefusalKind, StageFuture};
+use crate::pipeline::{BodyIo, CollectFuture, FlowCx, Refusal, RefusalKind};
 use crate::server::{Shared, Snapshot};
 use crate::view::FlowFacts;
 
@@ -468,7 +468,7 @@ impl BodyIo for Detached {
         &'a mut self,
         body: &'a mut Body,
         cap: u64,
-    ) -> StageFuture<'a, Result<Collected, roxy_http::ParseError>> {
+    ) -> CollectFuture<'a, Result<Collected, roxy_http::ParseError>> {
         Box::pin(async move { Ok(collect_prefix(body, cap).await) })
     }
 }

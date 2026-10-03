@@ -51,7 +51,7 @@ use crate::exchange::{
 use crate::flowlog::{FlowEvent, TlsInfo};
 use crate::io::Io;
 use crate::listener::ClientConn;
-use crate::pipeline::{BodyIo, FlowCx, RefusalKind, StageFuture, body_failure};
+use crate::pipeline::{BodyIo, CollectFuture, FlowCx, RefusalKind, body_failure};
 use crate::server::Shared;
 
 /// How long in-flight streams may continue after the connection started
@@ -508,7 +508,7 @@ impl BodyIo for H2Front {
         &'a mut self,
         body: &'a mut Body,
         cap: u64,
-    ) -> StageFuture<'a, Result<Collected, ParseError>> {
+    ) -> CollectFuture<'a, Result<Collected, ParseError>> {
         Box::pin(async move {
             self.continue_once()?;
             let c = collect_prefix(body, cap).await;

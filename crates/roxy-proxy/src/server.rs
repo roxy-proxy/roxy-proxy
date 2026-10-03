@@ -21,7 +21,7 @@ use crate::auth::UserDb;
 use crate::config::{PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowEvent, FlowSink, Redactor};
 use crate::listener::{ClientConn, ExplicitListener, Listener, ListenerMode};
-use crate::pipeline::{Pipeline, client_info};
+use crate::pipeline::client_info;
 use crate::sources::{MetricSource, StateSource};
 use crate::upstream::Upstream;
 
@@ -110,7 +110,6 @@ pub(crate) struct Shared {
     /// `log.flow.ws_message_every`: log every Nth checked WebSocket message
     /// (0: only denied ones).
     pub ws_message_every: u64,
-    pub pipeline: Pipeline,
     /// Each addon's keyed store, by addon name; survives reloads.
     pub layer_state: crate::addons::store::LayerStates,
     caps: Arc<ConnCaps>,
@@ -280,7 +279,6 @@ impl Server {
             enable_h2: cfg.enable_h2,
             connection_events: cfg.connection_events,
             ws_message_every: cfg.ws_message_every,
-            pipeline: Pipeline::builtin(),
             layer_state: crate::addons::store::LayerStates::default(),
             caps: Arc::new(ConnCaps {
                 max: cfg.max_connections.max(1),
