@@ -170,12 +170,21 @@ async fn session(path: &str, mut ws: Ws) {
         "/no-protocol" => {}
         // Forwards the request head and part of a body, then goes away.
         "/drop" => {
-            let Got::Ctl(head) = recv(&mut ws).await else {
+            let Got::Ctl(mut head) = recv(&mut ws).await else {
                 return;
             };
+            // Undeclared length, so only the lost connection is wrong.
+            head["headers"] = json!([]);
             ws.send(ctl(&head)).await.unwrap();
             ws.send(Message::binary(b"partial".to_vec())).await.unwrap();
             tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        // Declares a length, then sends more than that.
+        "/too-long" => {
+            let (mut head, _) = whole(&mut ws).await;
+            head["headers"] = json!([["content-length", "3"]]);
+            send_whole(&mut ws, head, b"too long".to_vec(), "request_end").await;
+            let _ = recv(&mut ws).await;
         }
         // Passes the request on, then cuts the response short.
         "/drop-response" => {
@@ -442,6 +451,21 @@ async fn a_dropped_connection_fails_closed() {
     );
     let ev = h.wait_events("layer_error", 1).await;
     assert_eq!(ev[0]["kind"], "service:closed", "{}", ev[0]);
+    h.stop().await;
+
+    // More bytes than the service declared: cut, as a protocol violation.
+    let (h, _) = start("/too-long", "", ALLOW_UPSTREAM).await;
+    let res = h
+        .client()
+        .post(h.https_url("/x"))
+        .body("hello")
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_server_error(), "{}", res.status());
+    assert!(h.upstream.seen().iter().all(|s| !s.body_ok));
+    let ev = h.wait_events("layer_error", 1).await;
+    assert_eq!(ev[0]["kind"], "service:protocol", "{}", ev[0]);
     h.stop().await;
 
     // After the response head: the client's body is cut.

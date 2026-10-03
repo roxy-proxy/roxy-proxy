@@ -169,6 +169,24 @@ fn header_map(pairs: &[(String, String)]) -> Result<HeaderMap, ServiceError> {
     Ok(h)
 }
 
+/// The `content-length` the service declared, if any: one field of
+/// digits. The body is held to it as it streams.
+fn declared_length(h: &HeaderMap) -> Result<Option<u64>, ServiceError> {
+    let mut values = h.get_all(http::header::CONTENT_LENGTH).iter();
+    let Some(v) = values.next() else {
+        return Ok(None);
+    };
+    let n = v
+        .to_str()
+        .ok()
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|s| s.parse().ok());
+    match (n, values.next()) {
+        (Some(n), None) => Ok(Some(n)),
+        _ => Err(ServiceError::Protocol("invalid content-length".into())),
+    }
+}
+
 fn text(m: &Out) -> Message {
     // `Out` always serializes.
     Message::text(serde_json::to_string(m).unwrap_or_default())
@@ -204,18 +222,29 @@ impl From<ServiceError> for Fail {
     }
 }
 
-fn request_head(parts: &http::request::Parts) -> Out {
+/// The head's fields, plus `content-length` when the body's length is
+/// known (and not zero), so a service that passes the head on keeps it.
+/// roxy checks it against the body the service sends back.
+fn head_fields(h: &HeaderMap, body: &Body) -> Vec<(String, String)> {
+    let mut out = pairs(h);
+    if let Some(n) = body.known_length().filter(|n| *n > 0) {
+        out.push(("content-length".to_owned(), n.to_string()));
+    }
+    out
+}
+
+fn request_head(parts: &http::request::Parts, body: &Body) -> Out {
     Out::Request {
         method: parts.method.to_string(),
         url: parts.uri.to_string(),
-        headers: pairs(&parts.headers),
+        headers: head_fields(&parts.headers, body),
     }
 }
 
-fn response_head(parts: &http::response::Parts) -> Out {
+fn response_head(parts: &http::response::Parts, body: &Body) -> Out {
     Out::Response {
         status: parts.status.as_u16(),
-        headers: pairs(&parts.headers),
+        headers: head_fields(&parts.headers, body),
     }
 }
 
@@ -245,13 +274,14 @@ async fn run(
         stream,
         first: Some(first_tx),
         second: Some(second_tx),
+        _open: writer.clone(),
     };
     let reader = tokio::spawn(reader.run(end));
 
     let (parts, body) = req.into_parts();
     tokio::spawn(pump(
         writer.clone(),
-        request_head(&parts),
+        request_head(&parts, &body),
         body,
         Out::RequestEnd,
     ));
@@ -275,7 +305,12 @@ async fn run(
     }
     let sent = TokioInstant::now();
     let (parts, body) = res.into_parts();
-    tokio::spawn(pump(writer, response_head(&parts), body, Out::ResponseEnd));
+    tokio::spawn(pump(
+        writer,
+        response_head(&parts, &body),
+        body,
+        Out::ResponseEnd,
+    ));
     let res = tokio::time::timeout_at(sent + svc.first_byte_timeout, second_rx)
         .await
         .map_err(|_| ServiceError::Timeout("first_byte_timeout"))?
@@ -327,10 +362,16 @@ pub(super) async fn observe(
         .map_err(|_| ServiceError::Timeout("max_exchange_time"))?
     });
     let (parts, body) = req.into_parts();
-    pump(writer.clone(), request_head(&parts), body, Out::RequestEnd).await;
+    pump(
+        writer.clone(),
+        request_head(&parts, &body),
+        body,
+        Out::RequestEnd,
+    )
+    .await;
     if let Ok(res) = next.response().await {
         let (parts, body) = res.into_parts();
-        pump(writer, response_head(&parts), body, Out::ResponseEnd).await;
+        pump(writer, response_head(&parts, &body), body, Out::ResponseEnd).await;
     } else {
         drop(writer);
     }
@@ -503,6 +544,9 @@ struct Reader {
     stream: SplitStream<Ws>,
     first: Option<oneshot::Sender<Result<First, ServiceError>>>,
     second: Option<oneshot::Sender<Result<LayerResponse, ServiceError>>>,
+    /// Keeps roxy's side of the socket open until the service's last
+    /// message is read: a close frame would stop the service sending.
+    _open: Writer,
 }
 
 /// A body being fed from the socket.
@@ -567,11 +611,14 @@ impl Reader {
                     let Some(f) = feeding.as_mut() else {
                         return Err(ServiceError::Protocol("body bytes before a head".into()));
                     };
-                    if let Some(tx) = f.tx.as_mut()
-                        && tx.send_data(b).await.is_err()
-                    {
-                        // The consumer went away: nothing failed here.
-                        f.tx = None;
+                    if let Some(tx) = f.tx.as_mut() {
+                        match tx.send_data(b).await {
+                            Ok(()) => {}
+                            // The consumer went away: nothing failed here.
+                            Err(BodyError::Closed | BodyError::Stopped) => f.tx = None,
+                            // More than declared, or than the limit.
+                            Err(e) => return Err(ServiceError::Protocol(e.to_string())),
+                        }
                     }
                 }
                 Message::Text(t) => {
@@ -595,12 +642,14 @@ impl Reader {
             In::RequestEnd | In::ResponseEnd => {
                 let request = matches!(m, In::RequestEnd);
                 match feeding.take() {
-                    Some(f) if f.request == request => {
-                        if let Some(tx) = f.tx {
-                            let _ = tx.finish().await;
-                        }
-                        Ok(())
-                    }
+                    Some(f) if f.request == request => match f.tx {
+                        Some(tx) => match tx.finish().await {
+                            Ok(()) | Err(BodyError::Closed | BodyError::Stopped) => Ok(()),
+                            // Shorter than declared.
+                            Err(e) => Err(ServiceError::Protocol(e.to_string())),
+                        },
+                        None => Ok(()),
+                    },
                     _ if request => Err(unexpected("request_end")),
                     _ => Err(unexpected("response_end")),
                 }
@@ -622,7 +671,8 @@ impl Reader {
                     .parse()
                     .map_err(|_| ServiceError::Protocol(format!("invalid url {url:?}")))?;
                 let headers = header_map(&headers)?;
-                let (body_tx, body) = Body::channel(limits.max_request_body_bytes, None);
+                let (body_tx, body) =
+                    Body::channel(limits.max_request_body_bytes, declared_length(&headers)?);
                 let mut r = http::Request::new(body);
                 *r.method_mut() = method;
                 *r.uri_mut() = uri;
@@ -645,7 +695,8 @@ impl Reader {
                 let status = http::StatusCode::from_u16(status)
                     .map_err(|e| ServiceError::Protocol(e.to_string()))?;
                 let headers = header_map(&headers)?;
-                let (body_tx, body) = Body::channel(limits.max_response_body_bytes, None);
+                let (body_tx, body) =
+                    Body::channel(limits.max_response_body_bytes, declared_length(&headers)?);
                 let mut r = http::Response::new(body);
                 *r.status_mut() = status;
                 *r.headers_mut() = headers;
