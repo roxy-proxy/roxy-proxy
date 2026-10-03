@@ -755,14 +755,14 @@ impl Stage for Zstd {
                 };
                 Ok((n, 0))
             }
+            ZState::Skip(0) => {
+                // Not a pause for input: a frame may follow at once.
+                self.state = ZState::FrameStart;
+                self.step(input, out)
+            }
             ZState::Skip(left) => {
                 let n = usize::try_from(left).unwrap_or(usize::MAX).min(input.len());
-                let left = left - n as u64;
-                if left == 0 {
-                    self.state = ZState::FrameStart;
-                } else {
-                    self.state = ZState::Skip(left);
-                }
+                self.state = ZState::Skip(left - n as u64);
                 Ok((n, 0))
             }
             ZState::Blocks { checksum } => {
@@ -1095,6 +1095,30 @@ mod tests {
         assert_eq!(
             decode_chunked(&[Coding::Zstd], &enc, 1, 2).unwrap(),
             b"one two"
+        );
+    }
+
+    #[test]
+    fn an_empty_skippable_frame_does_not_end_the_body() {
+        let mut enc = 0x184d_2a50u32.to_le_bytes().to_vec();
+        enc.extend_from_slice(&0u32.to_le_bytes());
+        enc.extend(zstd(b"after"));
+        assert_eq!(decode(&[Coding::Zstd], &enc, 100).unwrap(), b"after");
+        assert_eq!(
+            decode_chunked(&[Coding::Zstd], &enc, 1, 1).unwrap(),
+            b"after"
+        );
+    }
+
+    #[test]
+    fn zstd_checksums_are_checked() {
+        let mut enc = zstd(&sample());
+        assert_ne!(enc[4] & 0x04, 0, "the encoder writes a checksum");
+        let n = enc.len();
+        enc[n - 1] ^= 1;
+        assert_eq!(
+            invalid(decode(&[Coding::Zstd], &enc, u64::MAX)),
+            "checksum mismatch"
         );
     }
 

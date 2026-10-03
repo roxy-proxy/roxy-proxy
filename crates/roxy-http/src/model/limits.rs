@@ -57,8 +57,8 @@ impl Default for Limits {
     }
 }
 
-/// Mirrors the `http.*` config block. Every flag defaults to the strict
-/// setting.
+/// Mirrors the `http.*` config block. Every strictness flag defaults to the
+/// strict setting; `decode_for_addons` defaults to true.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct HttpFlags {
