@@ -11,7 +11,10 @@
 //! - `conn`: the explicit-mode state machine (proxy port, CONNECT, sniff,
 //!   TLS termination, tunnels, `roxy.internal`, proxy auth).
 //! - `pipeline`: request/response stages, the `Verdict` the driver consumes
-//!   exhaustively, rule evaluation and effects.
+//!   exhaustively, the head decision and its effects.
+//! - `watch`: the per-exchange watcher: watching rules re-checked as body
+//!   bytes stream, at the response head and in the WebSocket relay, and
+//!   byte metrics recorded as they stream.
 //! - `exchange`: the transport-agnostic exchange core (`process`: request
 //!   stages → upstream → response stages → `Outcome`), the h1 adapter,
 //!   upstream errors, the WebSocket relay.
@@ -49,6 +52,7 @@ pub mod server;
 pub mod sources;
 pub mod upstream;
 mod view;
+mod watch;
 
 pub use addrlist::{AddressList, AddressLists, ListError};
 pub use auth::UserDb;
@@ -57,7 +61,7 @@ pub use config::{ListenerSpec, PolicyUpdate, RuntimeConfig};
 pub use conn::INTERNAL_HOST;
 pub use flowlog::{
     ClientInfo, DEFAULT_REDACTED_HEADERS, DecisionKind, DstInfo, FileSink, FlowEvent, FlowSink,
-    MemorySink, MultiSink, REDACTED, Redactor, RequestInfo, ResponseInfo, StdoutSink, Timing,
+    MemorySink, MultiSink, REDACTED, Redactor, RequestInfo, ResponseInfo, Stage, StdoutSink, Timing,
     TlsInfo, WriterSink,
 };
 pub use listener::{ClientConn, ExplicitListener, Listener, ListenerInfo, ListenerMode};

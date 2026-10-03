@@ -1,9 +1,9 @@
 //! The flow as the rule engine sees it ([`FlowView`]).
 //!
 //! [`FlowFacts`] is an owned summary of the flow (the request head is
-//! cloned, never the body), so the same view can be used for the request
-//! decision, the response decision, metric recording after the body has
-//! streamed, and the flow log.
+//! cloned, never the body), so the same view can be used for the head
+//! decision, watching rules (with the byte counts so far), metric
+//! recording, and the flow log.
 //!
 //! Field contract (`roxy_rules::Field`): hosts lower-case without a
 //! trailing dot (IPv6 without brackets); `header["host"]` is the canonical
@@ -46,13 +46,6 @@ impl Inspected {
     }
 }
 
-/// Connect-phase destination.
-#[derive(Debug, Clone)]
-pub(crate) struct DstFacts {
-    pub host: Host,
-    pub port: u16,
-}
-
 /// The request head.
 #[derive(Debug, Clone)]
 pub(crate) struct RequestFacts {
@@ -83,9 +76,14 @@ pub(crate) struct ResponseFacts {
 pub(crate) struct FlowFacts {
     pub client: ClientConn,
     pub tls: Option<TlsInfo>,
-    pub dst: Option<DstFacts>,
     pub request: Option<RequestFacts>,
     pub response: Option<ResponseFacts>,
+    /// `body.bytes`: request body bytes forwarded so far; `None` before
+    /// forwarding (a head rule never reads it).
+    pub request_body_bytes: Option<u64>,
+    /// `response.body.bytes`: response body bytes sent so far; `None`
+    /// before the response head.
+    pub response_body_bytes: Option<u64>,
 }
 
 /// Lower-case host text without brackets.
@@ -94,14 +92,6 @@ pub(crate) fn host_text(h: &Host) -> String {
         Host::Dns(n) => n.clone(),
         Host::Ipv4(ip) => ip.to_string(),
         Host::Ipv6(ip) => ip.to_string(),
-    }
-}
-
-fn host_ip(h: &Host) -> Option<IpAddr> {
-    match h {
-        Host::Dns(_) => None,
-        Host::Ipv4(ip) => Some(IpAddr::V4(*ip)),
-        Host::Ipv6(ip) => Some(IpAddr::V6(*ip)),
     }
 }
 
@@ -205,19 +195,6 @@ impl FlowView for ProxyView<'_> {
             Field::ClientUser => s(fa.client.user.as_ref()),
             Field::ListenerName => Value::Str(Cow::Borrowed(&fa.client.listener.name)),
             Field::ListenerMode => Value::Str(Cow::Borrowed(fa.client.listener.mode.as_str())),
-            Field::DstHost => fa
-                .dst
-                .as_ref()
-                .map_or(Value::Absent, |d| Value::str(host_text(&d.host))),
-            Field::DstPort => fa
-                .dst
-                .as_ref()
-                .map_or(Value::Absent, |d| Value::Int(i64::from(d.port))),
-            Field::DstIp => fa
-                .dst
-                .as_ref()
-                .and_then(|d| host_ip(&d.host))
-                .map_or(Value::Absent, Value::Ip),
             Field::TlsSni => s(tls.and_then(|t| t.sni.as_ref())),
             Field::TlsAlpn => s(tls.and_then(|t| t.alpn.as_ref())),
             Field::TlsVersion => s(tls.and_then(|t| t.version.as_ref())),
@@ -235,6 +212,8 @@ impl FlowView for ProxyView<'_> {
             Field::BodySize => req.and_then(|r| r.body_size).map_or(Value::Absent, int),
             Field::ResponseStatus => res.map_or(Value::Absent, |r| Value::Int(i64::from(r.status))),
             Field::ResponseBodySize => res.and_then(|r| r.body_size).map_or(Value::Absent, int),
+            Field::BodyBytes => fa.request_body_bytes.map_or(Value::Absent, int),
+            Field::ResponseBodyBytes => fa.response_body_bytes.map_or(Value::Absent, int),
             // WebSocket inspect tier (M3): not available in this build.
             Field::WsDirection | Field::WsOpcode | Field::WsSize | Field::WsText => Value::Absent,
         }

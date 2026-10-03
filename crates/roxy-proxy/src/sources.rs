@@ -9,23 +9,30 @@
 
 use std::time::Duration;
 
-use roxy_rules::{FlowView, Phase};
+use roxy_rules::FlowView;
 
-/// What one flow contributed in one phase, reported to
-/// [`MetricSource::record`].
+/// What one exchange contributed since its last sample, reported to
+/// [`MetricSource::record`] (§6.4). An exchange reports:
 ///
-/// Invariant: summing `request_bytes` over every sample of a flow gives the
-/// exact number of request-body bytes roxy accepted for that flow (and the
-/// same for `response_bytes`). The request-phase sample carries the declared
-/// (`content-length`) or buffered length; a body of unknown length reports
-/// what actually streamed in the response-phase sample instead.
+/// * one `head` sample right after the forwarding decision (counts
+///   `requests` and `unique`, and `denied` if the head denied);
+/// * one sample per forwarded body chunk (`request_bytes` or
+///   `response_bytes`), so byte metrics grow while the exchange streams;
+/// * one final sample (`error`, and `denied` if a watching rule stopped
+///   the exchange).
+///
+/// Invariant: summing `request_bytes` over every sample of an exchange
+/// gives the request-body bytes roxy accepted for forwarding (the same for
+/// `response_bytes`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Sample {
-    /// Request-body bytes not reported by an earlier sample of this flow.
+    /// The exchange's head sample.
+    pub head: bool,
+    /// Request-body bytes not reported by an earlier sample.
     pub request_bytes: u64,
-    /// Response-body bytes sent to the client.
+    /// Response-body bytes not reported by an earlier sample.
     pub response_bytes: u64,
-    /// The phase decision was a deny (including fail-closed denies).
+    /// The exchange was denied (at the head, or stopped by a watching rule).
     pub denied: bool,
     /// The upstream exchange failed (connect, TLS, DNS, timeout, protocol).
     pub error: bool,
@@ -63,14 +70,9 @@ pub trait MetricSource: Send + Sync {
     /// `Ok(value)` for the metric as seen by this flow (0 for a fresh key).
     /// `Err` → the flow fails closed.
     fn get(&self, id: &str, view: &dyn FlowView) -> Result<i64, MetricSourceError>;
-    /// Called after each phase decision so denied flows count too.
-    /// `Err(TableFull)` → the flow fails closed.
-    fn record(
-        &self,
-        phase: Phase,
-        view: &dyn FlowView,
-        sample: &Sample,
-    ) -> Result<(), MetricSourceError>;
+    /// Called after the head decision (so denied flows count too), per
+    /// streamed chunk and at the end. `Err` → the exchange fails closed.
+    fn record(&self, view: &dyn FlowView, sample: &Sample) -> Result<(), MetricSourceError>;
 }
 
 /// The state store is full; the `set_state` that hit it denies its flow.
@@ -98,12 +100,7 @@ impl MetricSource for UnavailableMetrics {
         )))
     }
 
-    fn record(
-        &self,
-        _phase: Phase,
-        _view: &dyn FlowView,
-        _sample: &Sample,
-    ) -> Result<(), MetricSourceError> {
+    fn record(&self, _view: &dyn FlowView, _sample: &Sample) -> Result<(), MetricSourceError> {
         Ok(())
     }
 }
@@ -136,7 +133,7 @@ mod tests {
         ));
         assert!(
             UnavailableMetrics
-                .record(Phase::Request, &v, &Sample::default())
+                .record(&v, &Sample::default())
                 .is_ok()
         );
         assert_eq!(UnavailableState.get("k"), None);

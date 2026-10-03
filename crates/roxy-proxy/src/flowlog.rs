@@ -1,6 +1,6 @@
 //! Structured flow log (`DESIGN.md` §10.1).
 //!
-//! Every phase of the pipeline emits [`FlowEvent`]s to a [`FlowSink`]. Events
+//! Every stage of the pipeline emits [`FlowEvent`]s to a [`FlowSink`]. Events
 //! serialise to one JSON object per line, tagged by an `event` field. Sinks
 //! never panic and never propagate write failures into the data path: a
 //! failed write is reported as a `tracing` warning and the event is dropped.
@@ -67,8 +67,10 @@ pub enum FlowEvent {
         path: PathBuf,
         diagnostics: Vec<String>,
     },
-    /// Connect-phase decision (CONNECT in explicit mode). Only emitted when
-    /// `log.flow.connection_events` is enabled or the connect was denied.
+    /// A CONNECT (explicit mode). There are no connect-time rules (§4.3):
+    /// a CONNECT is accepted for inspection unless proxy auth or the SNI
+    /// check refuses it. Only emitted when `log.flow.connection_events` is
+    /// enabled or the connect was refused.
     Connect {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,
@@ -105,6 +107,11 @@ pub enum FlowEvent {
         /// `effect_invalid`, `upstream_timeout`, …).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// Where the terminal decision was made: `head` for the forwarding
+        /// decision, or the stage at which a watching rule stopped the
+        /// exchange (§6.1). Absent when no decision was reached.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stage: Option<Stage>,
     },
     /// The response failed after the request was allowed (e.g. body limit hit
     /// mid-stream).
@@ -208,7 +215,7 @@ pub enum FlowEvent {
         ts: DateTime<Utc>,
         flow: String,
         conn: String,
-        phase: String,
+        stage: Stage,
         reason: String,
     },
     /// A metric key could not be created because the table is full (§6.4).
@@ -217,7 +224,7 @@ pub enum FlowEvent {
         ts: DateTime<Utc>,
         flow: String,
         conn: String,
-        phase: String,
+        stage: Stage,
         detail: String,
     },
     /// A request asked for an Upgrade the matching rule did not grant; it
@@ -235,7 +242,7 @@ pub enum FlowEvent {
         ts: DateTime<Utc>,
         flow: String,
         conn: String,
-        phase: String,
+        stage: Stage,
         level: String,
         message: String,
     },
@@ -259,7 +266,7 @@ pub struct ClientInfo {
     pub user: Option<String>,
 }
 
-/// The connect-phase destination.
+/// A CONNECT destination.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DstInfo {
     pub host: String,
@@ -302,6 +309,36 @@ pub struct Timing {
     pub total_ms: u64,
     pub upstream_connect_ms: Option<u64>,
     pub upstream_ttfb_ms: Option<u64>,
+}
+
+/// Where in an exchange a decision was made (§6.1): the forwarding
+/// decision at the request head, or the point at which a watching rule
+/// stopped the exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    /// The forwarding decision at the request head.
+    Head,
+    /// While the request body streamed upstream.
+    RequestBody,
+    /// When the response head arrived, before it was sent to the client.
+    ResponseHead,
+    /// While the response body streamed to the client.
+    ResponseBody,
+    /// While a WebSocket relay was open.
+    Websocket,
+}
+
+impl Stage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Head => "head",
+            Self::RequestBody => "request_body",
+            Self::ResponseHead => "response_head",
+            Self::ResponseBody => "response_body",
+            Self::Websocket => "websocket",
+        }
+    }
 }
 
 /// Final decision recorded in the log.

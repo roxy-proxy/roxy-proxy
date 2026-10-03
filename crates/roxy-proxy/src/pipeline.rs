@@ -4,10 +4,10 @@
 //! the request head plus its (still streaming) body and returning a
 //! [`Verdict`]. The upstream connector is the terminal stage (in
 //! [`crate::exchange`]); its response passes through the
-//! [`ResponseStage`]s. Built-in stages: the connect gate (plain-HTTP
-//! requests on the proxy port), the bounded body buffer (only when a rule
-//! reads `body.text`), and the rule chain with its effects. Addons will be
-//! more stages.
+//! [`ResponseStage`]s. Built-in stages: the bounded body buffer (only when
+//! a rule reads `body.text` / `response.body.text`), the head decision with
+//! its effects, and the response-head check of the watching rules
+//! ([`crate::watch`]). Addons will be more stages.
 //!
 //! # Fail closed by construction
 //!
@@ -36,21 +36,21 @@ use roxy_http::{
 };
 use roxy_rules::{
     AllowOpts, Decision, Effect, EvalContext, FAIL_CLOSED_MESSAGE, FAIL_CLOSED_STATUS,
-    FailClosedReason, LogLevel, Outcome, Phase,
+    FailClosedReason, LogLevel, Outcome,
 };
 use ulid::Ulid;
 
 use crate::body::{Collected, body_text, collect_prefix};
 use crate::flowlog::{
-    ClientInfo, DecisionKind, DstInfo, FlowEvent, RequestInfo, ResponseInfo, Timing, TlsInfo,
+    ClientInfo, DecisionKind, DstInfo, FlowEvent, RequestInfo, ResponseInfo, Stage, Timing,
+    TlsInfo,
 };
 use crate::io::ConnIo;
 use crate::listener::ClientConn;
 use crate::server::{Shared, Snapshot};
 use crate::sources::{MetricSourceError, Sample};
-use crate::view::{
-    DstFacts, FlowFacts, Inspected, ProxyView, RequestFacts, ResponseFacts, host_text,
-};
+use crate::view::{FlowFacts, Inspected, ProxyView, RequestFacts, ResponseFacts, host_text};
+use crate::watch::Watch;
 
 /// Boxed future returned by stages.
 pub(crate) type StageFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -237,11 +237,7 @@ impl Pipeline {
     /// The built-in pipeline.
     pub(crate) fn builtin() -> Self {
         Self {
-            request: vec![
-                Box::new(ConnectGate),
-                Box::new(InspectRequestBody),
-                Box::new(RequestRules),
-            ],
+            request: vec![Box::new(InspectRequestBody), Box::new(RequestRules)],
             response: vec![Box::new(InspectResponseBody), Box::new(ResponseRules)],
         }
     }
@@ -305,8 +301,8 @@ pub(crate) struct FlowRecord {
     pub response_status: Option<u16>,
     pub response_headers_bytes: u64,
     pub ttfb_ms: Option<u64>,
-    /// Request bytes already reported in the request-phase sample.
-    pub sampled_request_bytes: Option<u64>,
+    /// Where the terminal decision was made.
+    pub stage: Option<Stage>,
 }
 
 /// Per-flow state shared by the stages.
@@ -318,8 +314,8 @@ pub(crate) struct FlowCx {
     pub opts: AllowOpts,
     pub record: FlowRecord,
     pub started: Instant,
-    /// Plain-HTTP request on the proxy port (not inside a tunnel).
-    pub on_proxy_port: bool,
+    /// The watching rules of this exchange, once it is forwarded.
+    pub watch: Option<Arc<Watch>>,
     /// `Host` to send upstream after a `redirect` without `rewrite_host`.
     pub host_override: Option<String>,
 }
@@ -372,7 +368,6 @@ impl FlowCx {
         client: ClientConn,
         tls: Option<TlsInfo>,
         req: &CanonicalRequest,
-        on_proxy_port: bool,
     ) -> Self {
         Self {
             shared,
@@ -381,14 +376,15 @@ impl FlowCx {
             facts: FlowFacts {
                 client,
                 tls,
-                dst: None,
                 request: Some(request_facts(req)),
                 response: None,
+                request_body_bytes: None,
+                response_body_bytes: None,
             },
             opts: AllowOpts::default(),
             record: FlowRecord::default(),
             started: Instant::now(),
-            on_proxy_port,
+            watch: None,
             host_override: None,
         }
     }
@@ -416,9 +412,20 @@ impl FlowCx {
         }
     }
 
-    /// Evaluates `phase` and records the metric sample. Returns the outcome
-    /// plus a refusal when the decision (or recording) must deny.
-    fn evaluate(&mut self, phase: Phase, sample_bytes: (u64, u64)) -> (Outcome, Option<Refusal>) {
+    /// The event helpers for this flow.
+    pub(crate) fn events(&self) -> Events<'_> {
+        Events {
+            shared: &self.shared,
+            snap: &self.snap,
+            flow: self.flow,
+            conn: self.conn_id(),
+        }
+    }
+
+    /// The head decision (§6.1), and the exchange's head metric sample.
+    /// Returns the outcome plus a refusal when the decision (or recording)
+    /// must deny.
+    fn evaluate_head(&mut self) -> (Outcome, Option<Refusal>) {
         let snap = self.snap.clone();
         let shared = self.shared.clone();
         let secrets = |name: &str| snap.secrets.get(name).cloned();
@@ -433,21 +440,22 @@ impl FlowCx {
             &*shared.state,
             &snap.address_lists,
         );
-        let out = snap.policy.evaluate(phase, &view, &ctx);
+        let out = snap.policy.evaluate_head(&view, &ctx);
         let metric_err = view.take_metric_error();
         let sample = Sample {
-            request_bytes: sample_bytes.0,
-            response_bytes: sample_bytes.1,
+            head: true,
             denied: !out.decision.is_allow(),
-            error: false,
+            ..Sample::default()
         };
-        let record_err = shared.metrics.record(phase, &view, &sample).err();
+        let record_err = shared.metrics.record(&view, &sample).err();
         drop(view);
         self.note_outcome(&out);
+        self.record.stage = Some(Stage::Head);
         let mut refusal = None;
         if let Some(reason) = &out.fail_closed_reason {
             let code = fail_closed_code(reason, metric_err.as_ref());
-            self.emit_input_unavailable(phase, code, reason, metric_err.as_ref());
+            self.events()
+                .input_unavailable(Stage::Head, code, reason, metric_err.as_ref());
             refusal = Some(Refusal::fail_closed(code));
         } else {
             match &out.decision {
@@ -472,104 +480,14 @@ impl FlowCx {
         if refusal.is_none()
             && let Some(e) = record_err
         {
-            self.emit_metric_error(phase, &e);
+            self.events().metric_error(Stage::Head, &e);
             refusal = Some(Refusal::fail_closed(e.code()));
         }
-        // The flow's terminal rule is the request decision, unless another
-        // phase refused it.
-        if let Some(r) = &refusal {
-            self.record.terminal_rule.clone_from(&r.rule);
-        } else if phase == Phase::Request {
-            self.record.terminal_rule = Some(out.terminal_rule.to_string());
-        }
+        self.record.terminal_rule = match &refusal {
+            Some(r) => r.rule.clone(),
+            None => Some(out.terminal_rule.to_string()),
+        };
         (out, refusal)
-    }
-
-    fn emit_input_unavailable(
-        &self,
-        phase: Phase,
-        code: &str,
-        reason: &FailClosedReason,
-        metric_err: Option<&MetricSourceError>,
-    ) {
-        let ts = chrono::Utc::now();
-        if let Some(e @ MetricSourceError::TableFull(_)) = metric_err {
-            self.shared.sink.emit(&FlowEvent::MetricTableFull {
-                ts,
-                flow: self.flow.to_string(),
-                conn: self.conn_id(),
-                phase: phase.as_str().to_owned(),
-                detail: e.to_string(),
-            });
-        }
-        tracing::warn!(flow = %self.flow, phase = phase.as_str(), code, %reason, "policy input unavailable; failing closed");
-        self.shared.sink.emit(&FlowEvent::PolicyInputUnavailable {
-            ts,
-            flow: self.flow.to_string(),
-            conn: self.conn_id(),
-            phase: phase.as_str().to_owned(),
-            reason: format!(
-                "{code}: {}",
-                self.snap.redactor.redact_str(&reason.to_string())
-            ),
-        });
-    }
-
-    fn emit_metric_error(&self, phase: Phase, e: &MetricSourceError) {
-        tracing::warn!(flow = %self.flow, phase = phase.as_str(), error = %e, "metric recording failed; failing closed");
-        let ts = chrono::Utc::now();
-        if matches!(e, MetricSourceError::TableFull(_)) {
-            self.shared.sink.emit(&FlowEvent::MetricTableFull {
-                ts,
-                flow: self.flow.to_string(),
-                conn: self.conn_id(),
-                phase: phase.as_str().to_owned(),
-                detail: e.to_string(),
-            });
-        } else {
-            self.shared.sink.emit(&FlowEvent::PolicyInputUnavailable {
-                ts,
-                flow: self.flow.to_string(),
-                conn: self.conn_id(),
-                phase: phase.as_str().to_owned(),
-                reason: format!("{}: {e}", e.code()),
-            });
-        }
-    }
-
-    fn emit_rule_log(&self, phase: Phase, level: LogLevel, message: &str) {
-        let message = self.snap.redactor.redact_str(message).into_owned();
-        match level {
-            LogLevel::Trace => tracing::trace!(flow = %self.flow, %message, "rule log"),
-            LogLevel::Debug => tracing::debug!(flow = %self.flow, %message, "rule log"),
-            LogLevel::Info => tracing::info!(flow = %self.flow, %message, "rule log"),
-            LogLevel::Warn => tracing::warn!(flow = %self.flow, %message, "rule log"),
-            LogLevel::Error => tracing::error!(flow = %self.flow, %message, "rule log"),
-        }
-        self.shared.sink.emit(&FlowEvent::Log {
-            ts: chrono::Utc::now(),
-            flow: self.flow.to_string(),
-            conn: self.conn_id(),
-            phase: phase.as_str().to_owned(),
-            level: level.as_str().to_owned(),
-            message,
-        });
-    }
-
-    /// Runs the connect phase for `authority` (CONNECT, plain-HTTP requests
-    /// on the proxy port, and `redirect` targets).
-    pub(crate) fn connect_phase(&mut self, authority: &Authority) -> Option<Refusal> {
-        let kept_request = self.facts.request.take();
-        let kept_response = self.facts.response.take();
-        self.facts.dst = Some(DstFacts {
-            host: authority.host.clone(),
-            port: authority.port,
-        });
-        let (_out, refusal) = self.evaluate(Phase::Connect, (0, 0));
-        self.facts.dst = None;
-        self.facts.request = kept_request;
-        self.facts.response = kept_response;
-        refusal
     }
 
     /// Emits the flow's `request` event.
@@ -620,10 +538,12 @@ impl FlowCx {
             },
             terminal_rule: self.record.terminal_rule.clone(),
             reason: self.record.reason.clone(),
+            stage: self.record.stage,
         });
     }
 
-    /// Emits a `connect` event for a connect-phase decision.
+    /// Emits a `connect` event for a CONNECT (refused, or accepted for
+    /// inspection).
     pub(crate) fn emit_connect_event(&self, authority: &Authority, denied: bool) {
         if !denied && !self.shared.connection_events {
             return;
@@ -648,34 +568,145 @@ impl FlowCx {
         });
     }
 
-    /// Records the response-phase metric sample once the body has streamed.
+    /// Records the exchange's final metric sample (errors, and `denied` if
+    /// a watching rule stopped it). Bytes were recorded as they streamed.
     pub(crate) fn record_final_sample(&self, error: bool) {
-        let request_bytes = match self.record.sampled_request_bytes {
-            Some(_) => 0,
-            None => self.record.request_bytes,
-        };
+        let stopped = self.watch.as_ref().is_some_and(|w| w.stopped().is_some());
         let sample = Sample {
-            request_bytes,
-            response_bytes: self.record.response_bytes,
-            denied: matches!(self.record.decision, Some(DecisionKind::Deny)),
+            denied: stopped,
             error,
+            ..Sample::default()
         };
+        if sample == Sample::default() {
+            return;
+        }
         let view = ProxyView::new(
             &self.facts,
             &*self.shared.metrics,
             &*self.shared.state,
             &self.snap.address_lists,
         );
-        if let Err(e) = self.shared.metrics.record(Phase::Response, &view, &sample) {
+        if let Err(e) = self.shared.metrics.record(&view, &sample) {
             // The response has already been sent; the next flow that needs
             // the missing key fails closed at its decision.
             drop(view);
-            self.emit_metric_error(Phase::Response, &e);
+            let stage = self.record.stage.unwrap_or(Stage::ResponseBody);
+            self.events().metric_error(stage, &e);
+        }
+    }
+
+    /// Folds the watcher's outcome (watching rules that matched, tags,
+    /// response mutations, a stop) into the flow record. Call once the
+    /// exchange is over, before logging it.
+    pub(crate) fn absorb_watch(&mut self) {
+        let Some(w) = self.watch.clone() else {
+            return;
+        };
+        let summary = w.summary();
+        for r in summary.rules {
+            if !self.record.rules.contains(&r) {
+                self.record.rules.push(r);
+            }
+        }
+        for t in summary.tags {
+            if !self.record.tags.contains(&t) {
+                self.record.tags.push(t);
+            }
+        }
+        self.record.mutations.extend(summary.mutations);
+        if let Some(stop) = summary.stop {
+            self.record.decision = Some(DecisionKind::Deny);
+            self.record.terminal_rule.clone_from(&stop.refusal.rule);
+            if stop.refusal.reason.is_some() {
+                self.record.reason.clone_from(&stop.refusal.reason);
+            }
+            self.record.stage = Some(stop.stage);
         }
     }
 }
 
-fn fail_closed_code(reason: &FailClosedReason, metric: Option<&MetricSourceError>) -> &'static str {
+/// Event helpers shared by the head decision and the watcher.
+pub(crate) struct Events<'a> {
+    pub shared: &'a Shared,
+    pub snap: &'a Snapshot,
+    pub flow: Ulid,
+    pub conn: String,
+}
+
+impl Events<'_> {
+    pub(crate) fn input_unavailable(
+        &self,
+        stage: Stage,
+        code: &str,
+        reason: &FailClosedReason,
+        metric_err: Option<&MetricSourceError>,
+    ) {
+        let ts = chrono::Utc::now();
+        if let Some(e @ MetricSourceError::TableFull(_)) = metric_err {
+            self.shared.sink.emit(&FlowEvent::MetricTableFull {
+                ts,
+                flow: self.flow.to_string(),
+                conn: self.conn.clone(),
+                stage,
+                detail: e.to_string(),
+            });
+        }
+        tracing::warn!(flow = %self.flow, stage = stage.as_str(), code, %reason, "policy input unavailable; failing closed");
+        self.shared.sink.emit(&FlowEvent::PolicyInputUnavailable {
+            ts,
+            flow: self.flow.to_string(),
+            conn: self.conn.clone(),
+            stage,
+            reason: format!(
+                "{code}: {}",
+                self.snap.redactor.redact_str(&reason.to_string())
+            ),
+        });
+    }
+
+    pub(crate) fn metric_error(&self, stage: Stage, e: &MetricSourceError) {
+        tracing::warn!(flow = %self.flow, stage = stage.as_str(), error = %e, "metric recording failed; failing closed");
+        let ts = chrono::Utc::now();
+        if matches!(e, MetricSourceError::TableFull(_)) {
+            self.shared.sink.emit(&FlowEvent::MetricTableFull {
+                ts,
+                flow: self.flow.to_string(),
+                conn: self.conn.clone(),
+                stage,
+                detail: e.to_string(),
+            });
+        } else {
+            self.shared.sink.emit(&FlowEvent::PolicyInputUnavailable {
+                ts,
+                flow: self.flow.to_string(),
+                conn: self.conn.clone(),
+                stage,
+                reason: format!("{}: {e}", e.code()),
+            });
+        }
+    }
+
+    pub(crate) fn rule_log(&self, stage: Stage, level: LogLevel, message: &str) {
+        let message = self.snap.redactor.redact_str(message).into_owned();
+        match level {
+            LogLevel::Trace => tracing::trace!(flow = %self.flow, %message, "rule log"),
+            LogLevel::Debug => tracing::debug!(flow = %self.flow, %message, "rule log"),
+            LogLevel::Info => tracing::info!(flow = %self.flow, %message, "rule log"),
+            LogLevel::Warn => tracing::warn!(flow = %self.flow, %message, "rule log"),
+            LogLevel::Error => tracing::error!(flow = %self.flow, %message, "rule log"),
+        }
+        self.shared.sink.emit(&FlowEvent::Log {
+            ts: chrono::Utc::now(),
+            flow: self.flow.to_string(),
+            conn: self.conn.clone(),
+            stage,
+            level: level.as_str().to_owned(),
+            message,
+        });
+    }
+}
+
+pub(crate) fn fail_closed_code(reason: &FailClosedReason, metric: Option<&MetricSourceError>) -> &'static str {
     match reason {
         FailClosedReason::MetricUnavailable(_) => {
             metric.map_or("metric_unavailable", MetricSourceError::code)
@@ -686,6 +717,7 @@ fn fail_closed_code(reason: &FailClosedReason, metric: Option<&MetricSourceError
         FailClosedReason::BodyTooLargeToInspect(_) => "body_too_large_to_inspect",
         FailClosedReason::BodyUnavailable(_) => "body_unavailable",
         FailClosedReason::MissingValue(_) => "missing_value",
+        FailClosedReason::Unsupported(_) => "unsupported_effect",
     }
 }
 
@@ -702,34 +734,6 @@ pub(crate) fn body_failure(e: &BodyError) -> ParseError {
 // ---------------------------------------------------------------------------
 // Built-in request stages
 // ---------------------------------------------------------------------------
-
-/// Plain-HTTP requests on the proxy port never had a CONNECT, so the
-/// connect-phase rules run here against the request's authority, giving
-/// `dst.*` rules the same reach for `http://` as for `https://`.
-struct ConnectGate;
-
-impl RequestStage for ConnectGate {
-    fn name(&self) -> &'static str {
-        "connect_gate"
-    }
-
-    fn on_request<'a>(
-        &'a self,
-        cx: &'a mut FlowCx,
-        req: CanonicalRequest,
-        _io: &'a mut dyn BodyIo,
-    ) -> StageFuture<'a, Verdict> {
-        Box::pin(async move {
-            if !cx.on_proxy_port {
-                return Verdict::Continue(req);
-            }
-            match cx.connect_phase(&req.authority) {
-                None => Verdict::Continue(req),
-                Some(r) => Verdict::Deny(r),
-            }
-        })
-    }
-}
 
 /// Bounded buffering in front of body-inspecting rules (§6.2).
 struct InspectRequestBody;
@@ -769,7 +773,7 @@ impl RequestStage for InspectRequestBody {
     }
 }
 
-/// The request rule chain and its effects.
+/// The head decision (§6.1) and its effects.
 struct RequestRules;
 
 impl RequestStage for RequestRules {
@@ -784,9 +788,7 @@ impl RequestStage for RequestRules {
         _io: &'a mut dyn BodyIo,
     ) -> StageFuture<'a, Verdict> {
         Box::pin(async move {
-            let declared = cx.facts.request.as_ref().and_then(|r| r.body_size);
-            cx.record.sampled_request_bytes = declared;
-            let (out, refusal) = cx.evaluate(Phase::Request, (declared.unwrap_or(0), 0));
+            let (out, refusal) = cx.evaluate_head();
             if let Some(r) = refusal {
                 return Verdict::Deny(r);
             }
@@ -798,8 +800,8 @@ impl RequestStage for RequestRules {
                     return Verdict::Deny(r);
                 }
             }
-            // Later stages, the response phase and the log see the request
-            // as it will be forwarded.
+            // Later stages, watching rules and the log see the request as it
+            // will be forwarded.
             let body = cx
                 .facts
                 .request
@@ -877,7 +879,8 @@ fn rules_scheme(s: roxy_rules::Scheme) -> Scheme {
     }
 }
 
-/// Applies one request-phase effect (§6.3). Any failure denies the flow.
+/// Applies one effect of the head decision (§6.3). Any failure denies the
+/// flow.
 fn apply_request_effect(
     cx: &mut FlowCx,
     req: &mut CanonicalRequest,
@@ -929,15 +932,13 @@ fn apply_request_effect(
             if let Some(s) = scheme {
                 req.scheme = rules_scheme(s);
             }
+            // §6.3: the address floor and deny lists check the new target's
+            // addresses when the upstream connects.
             cx.record
                 .mutations
                 .push(format!("redirect:{}://{}", req.scheme, req.authority));
-            // §6.3: the new target goes through the connect phase again.
-            if let Some(r) = cx.connect_phase(&req.authority) {
-                return Err(r);
-            }
         }
-        Effect::Log { level, message } => cx.emit_rule_log(Phase::Request, level, &message),
+        Effect::Log { level, message } => cx.events().rule_log(Stage::Head, level, &message),
         Effect::SetState { key, value, ttl } => {
             cx.shared
                 .state
@@ -1007,7 +1008,9 @@ impl ResponseStage for InspectResponseBody {
     }
 }
 
-/// The response rule chain and its effects.
+/// The watching rules at the response head (§6.1): they may stop the
+/// exchange (answered with an error response, since nothing has been sent
+/// yet) or change the response head.
 struct ResponseRules;
 
 impl ResponseStage for ResponseRules {
@@ -1022,100 +1025,16 @@ impl ResponseStage for ResponseRules {
         _io: &'a mut dyn BodyIo,
     ) -> StageFuture<'a, ResponseVerdict> {
         Box::pin(async move {
-            // The response sample is recorded once the body has streamed
-            // (`FlowCx::record_final_sample`); evaluation here only reads.
-            let (out, refusal) = cx.evaluate_response();
-            if let Some(r) = refusal {
-                return ResponseVerdict::Deny(r);
+            // Every forwarded exchange has a watcher and response facts;
+            // never continue without them.
+            let (Some(watch), Some(facts)) = (cx.watch.clone(), cx.facts.response.clone()) else {
+                return ResponseVerdict::Deny(Refusal::fail_closed("watch_missing"));
+            };
+            match watch.on_response_head(facts, &mut res) {
+                Ok(()) => ResponseVerdict::Continue(res),
+                Err(stop) => ResponseVerdict::Deny(stop.refusal),
             }
-            for effect in out.effects {
-                let kind = effect.kind();
-                match effect {
-                    Effect::SetHeader { name, value } => {
-                        if let Err(e) = res.headers.insert(&name, &value) {
-                            return ResponseVerdict::Deny(invalid(kind, &e));
-                        }
-                        cx.record
-                            .mutations
-                            .push(format!("response.set_header:{name}"));
-                    }
-                    Effect::RemoveHeader(name) => {
-                        res.headers.remove(&name);
-                        cx.record
-                            .mutations
-                            .push(format!("response.remove_header:{name}"));
-                    }
-                    Effect::Log { level, message } => {
-                        cx.emit_rule_log(Phase::Response, level, &message);
-                    }
-                    Effect::SetState { key, value, ttl } => {
-                        if cx.shared.state.set(&key, &value, ttl).is_err() {
-                            return ResponseVerdict::Deny(Refusal::fail_closed(
-                                "state_unavailable",
-                            ));
-                        }
-                    }
-                    Effect::RewritePath { .. }
-                    | Effect::SetQuery { .. }
-                    | Effect::RemoveQuery(_)
-                    | Effect::Redirect { .. }
-                    | Effect::Capture(_)
-                    | Effect::CallAddon(_) => {
-                        return ResponseVerdict::Deny(Refusal::fail_closed("unsupported_effect"));
-                    }
-                }
-            }
-            ResponseVerdict::Continue(res)
         })
-    }
-}
-
-impl FlowCx {
-    /// Response-phase evaluation without recording a sample (recorded after
-    /// the body streamed, with real byte counts).
-    fn evaluate_response(&mut self) -> (Outcome, Option<Refusal>) {
-        let snap = self.snap.clone();
-        let shared = self.shared.clone();
-        let secrets = |name: &str| snap.secrets.get(name).cloned();
-        let tags = self.record.tags.clone();
-        let ctx = EvalContext {
-            secrets: &secrets,
-            initial_tags: &tags,
-        };
-        let view = ProxyView::new(
-            &self.facts,
-            &*shared.metrics,
-            &*shared.state,
-            &snap.address_lists,
-        );
-        let out = snap.policy.evaluate(Phase::Response, &view, &ctx);
-        let metric_err = view.take_metric_error();
-        drop(view);
-        self.note_outcome(&out);
-        let refusal = if let Some(reason) = &out.fail_closed_reason {
-            let code = fail_closed_code(reason, metric_err.as_ref());
-            self.emit_input_unavailable(Phase::Response, code, reason, metric_err.as_ref());
-            Some(Refusal::fail_closed(code))
-        } else {
-            match &out.decision {
-                Decision::Deny {
-                    status,
-                    message,
-                    close,
-                } => Some(Refusal::deny(
-                    *status,
-                    message,
-                    out.terminal_rule.as_str(),
-                    *close,
-                )),
-                Decision::Passthrough => Some(Refusal::fail_closed("passthrough_unsupported")),
-                Decision::Allow(_) => None,
-            }
-        };
-        if let Some(r) = &refusal {
-            self.record.terminal_rule.clone_from(&r.rule);
-        }
-        (out, refusal)
     }
 }
 
