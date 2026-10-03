@@ -39,7 +39,7 @@ produces a `request` event:
 | `parse_error` | the client sent something roxy refused to parse; `reason` is a stable code |
 | `upstream_error`, `upstream_denied` | [upstream](upstream.md#errors) failures and address-floor hits |
 | `policy_input_unavailable`, `metric_table_full` | a flow failed closed for want of an input |
-| `upgrade_stripped` | a plain `allow` stripped an upgrade |
+| `upgrade_stripped` | an upgrade was not allowed, so the request went upstream as plain HTTP ([WebSockets](websockets.md)) |
 | `ws_open`, `ws_close` | a relayed WebSocket, with byte counts |
 | `log` | a rule's `log` action |
 | `layer_error`, `layer_record`, `endpoint_call`, `observer_lagged` | [addons](addons.md) |

@@ -1,9 +1,16 @@
 # WebSockets
 
 An upgrade is honoured only when the rule that allows the request says
-`allow: { upgrade: websocket }`. A plain `allow` strips `Upgrade` and
-`Connection: upgrade` and forwards an ordinary request, emitting an
-`upgrade_stripped` event: the upgrade fails closed.
+`allow: { upgrade: websocket }`.
+
+A plain `allow` permits the request but not the upgrade. roxy drops
+`Upgrade` and `Connection: upgrade`, as any intermediary may (they are
+hop-by-hop headers), forwards the request as plain HTTP and emits an
+`upgrade_stripped` event. The client gets whatever the upstream answers to
+that request, typically a `200`, `400` or `426` rather than a `101`, and its
+WebSocket library reports a failed handshake. No rule grants a long-lived
+byte stream by accident. Upgrades to anything other than `websocket` (for
+example `h2c`) are always stripped this way.
 
 ## Relay
 
