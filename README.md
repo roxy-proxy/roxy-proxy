@@ -32,6 +32,7 @@ Usable in explicit proxy mode. Built and tested:
 - Address denylists, and a private-range floor on the IP actually dialled.
 - WebSocket relay, proxy authentication, and a CA download endpoint.
 - Hot reload, `roxy check`, and the `roxy rule test` dry run.
+- A hardened container image (`ghcr.io/roxy-proxy/roxy`, below).
 
 Deferred, with designs in DESIGN.md:
 
@@ -59,6 +60,61 @@ regenerates it.
 `examples/roxy.yaml` is the full example. It shows metrics, secrets,
 address lists, upload limits and the addon config shape. It passes `check`,
 but `run` refuses it because addons are not in this build.
+
+## Container image
+
+`ghcr.io/roxy-proxy/roxy` is built from the `Dockerfile` for `linux/amd64`
+and `linux/arm64`. Tags: `edge` (every push to `main`), and `vX.Y.Z`,
+`X.Y` and `latest` for releases.
+
+- A static musl binary on `gcr.io/distroless/static-debian12:nonroot`,
+  about 15 MB unpacked. There is no shell and no package manager.
+- Runs as UID/GID `65532` and works with a read-only root filesystem.
+- Upstream TLS trusts the embedded Mozilla roots (`webpki-roots`) plus
+  `tls.upstream.extra_roots`, so the image ships no CA bundle.
+- Published images carry an SBOM and SLSA provenance and are signed with
+  cosign (keyless). Every build is scanned with Trivy.
+
+Run it with the hardening flags:
+
+```sh
+docker run -d --name roxy \
+  --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+  -v roxy-ca:/var/lib/roxy/ca \
+  -v ./roxy.yaml:/etc/roxy/roxy.yaml:ro \
+  -p 3128:3128 -p 3130:3130 \
+  ghcr.io/roxy-proxy/roxy:edge
+```
+
+| path | what |
+|---|---|
+| `/etc/roxy/roxy.yaml` | config; the default is [`examples/docker/roxy.yaml`](examples/docker/roxy.yaml). Mount your own read-only. |
+| `/var/lib/roxy/ca` | volume: the CA key and certificate, generated on first start. **Keep it**: a new CA means every client must re-trust it. Owned by 65532, mode 0700. |
+| `/var/log/roxy` | volume, for a config that sets `log.flow.path` (for example `/var/log/roxy/flow.jsonl`). The default config logs flows to stdout (`docker logs`). |
+
+Ports: `3128` is the proxy listener and `3130` is `ca_server`
+(`/roxy-ca.pem`, `/healthz`). Keep `3130` off networks the agent should not
+reach if you do not want it to fetch the CA itself.
+
+The image's `HEALTHCHECK` runs `roxy health`, a small built-in HTTP probe
+(there is no curl), against `http://127.0.0.1:3130/healthz`. A config that
+moves or removes `ca_server` needs `--health-cmd` or `--no-healthcheck`.
+Other subcommands run the same way:
+
+```sh
+docker run --rm -v ./roxy.yaml:/etc/roxy/roxy.yaml:ro ghcr.io/roxy-proxy/roxy:edge \
+  check --config /etc/roxy/roxy.yaml
+docker run --rm -v roxy-ca:/var/lib/roxy/ca ghcr.io/roxy-proxy/roxy:edge \
+  ca export --config /etc/roxy/roxy.yaml > roxy-ca.pem
+```
+
+Verify a published image's signature:
+
+```sh
+cosign verify ghcr.io/roxy-proxy/roxy:edge \
+  --certificate-identity-regexp '^https://github.com/roxy-proxy/roxy-proxy/\.github/workflows/image\.yml@' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
 
 ## Pointing an agent at roxy
 
