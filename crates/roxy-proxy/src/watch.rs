@@ -519,6 +519,14 @@ impl http_body::Body for Watched {
                 }
                 Poll::Pending
             }
+            // Nothing to forward: an empty, non-final DATA frame is what an
+            // h2 peer counts as a flood (GOAWAY ENHANCE_YOUR_CALM).
+            Poll::Ready(Some(Ok(frame)))
+                if frame.data_ref().is_some_and(Bytes::is_empty) && !self.inner.is_end_stream() =>
+            {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(d) = frame.data_ref()
                     && !d.is_empty()

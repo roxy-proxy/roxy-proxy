@@ -222,21 +222,9 @@ async fn redirect_changes_target_and_checks_the_new_address() {
     h.stop().await;
 }
 
-/// The upstream echo answers only after reading the whole body, and
-/// `response_header_timeout` currently runs while the request body is
-/// still being sent, so the harness's 2s default can 504 a 32 MiB debug-build
-/// upload on a slow runner. These tests check streaming integrity, not that
-/// timeout.
-const BIG_UPLOAD_LIMITS: &str = "response_header_timeout: 60s";
-
 #[tokio::test(flavor = "multi_thread")]
 async fn large_uploads_stream_intact() {
-    let h = Harness::start_with(Opts {
-        rules: ALLOW_UPSTREAM,
-        limits: BIG_UPLOAD_LIMITS,
-        ..Opts::default()
-    })
-    .await;
+    let h = Harness::start(ALLOW_UPSTREAM).await;
     let c = h.client();
     // 32 MiB with content-length.
     let data: Vec<u8> = (0..32 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
@@ -1358,12 +1346,7 @@ async fn h2_deny_without_close_keeps_serving() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn h2_large_upload_streams_intact() {
-    let h = Harness::start_with(Opts {
-        rules: ALLOW_UPSTREAM,
-        limits: BIG_UPLOAD_LIMITS,
-        ..Opts::default()
-    })
-    .await;
+    let h = Harness::start(ALLOW_UPSTREAM).await;
     let data: Vec<u8> = (0..32 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     let want = fnv(&data);
     let res = h
@@ -2127,5 +2110,60 @@ async fn a_stalled_capture_log_holds_traffic() {
         .recv_timeout(Duration::from_secs(20))
         .expect("the whole upload was captured");
     assert!(seen > 1 << 20);
+    h.stop().await;
+}
+
+/// An h2 client ends a streamed body with an empty `END_STREAM` DATA frame.
+/// roxy must not pass that on as an empty non-final DATA frame: h2 servers
+/// count those as a flood and GOAWAY the pooled upstream connection after
+/// about a hundred (#25).
+#[tokio::test(flavor = "multi_thread")]
+async fn many_streamed_h2_uploads_share_one_upstream_connection() {
+    let h = Harness::start(ALLOW_UPSTREAM).await;
+    let c = h.client();
+    for i in 0..150 {
+        let chunks: Vec<Result<Bytes, std::io::Error>> =
+            (0..4).map(|_| Ok(Bytes::from(vec![7u8; 1024]))).collect();
+        let res = c
+            .post(h.https_url("/streamed"))
+            .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                chunks,
+            )))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.version(), reqwest::Version::HTTP_2);
+        assert_eq!(res.status(), 200, "request {i}");
+        assert_eq!(json(&res.bytes().await.unwrap())["body_len"], 4096);
+    }
+    h.stop().await;
+}
+
+/// `response_header_timeout` starts once the request body has been sent:
+/// an upload that takes longer than it to send is not cut short (#25).
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_upload_outlasts_the_response_header_timeout() {
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        limits: "response_header_timeout: 1s",
+        ..Opts::default()
+    })
+    .await;
+    let stream = futures_util::stream::unfold(0u8, |i| async move {
+        if i == 6 {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        Some((Ok::<_, std::io::Error>(Bytes::from(vec![i; 1000])), i + 1))
+    });
+    let res = h
+        .client()
+        .post(h.https_url("/trickle"))
+        .body(reqwest::Body::wrap_stream(stream))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(json(&res.bytes().await.unwrap())["body_len"], 6000);
     h.stop().await;
 }
