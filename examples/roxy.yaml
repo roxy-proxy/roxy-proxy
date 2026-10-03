@@ -43,6 +43,9 @@ limits:
   max_inspect_body_bytes: 1mb   # only buffered when a rule/addon needs body content
   header_timeout: 10s
   body_idle_timeout: 30s
+  response_header_timeout: 60s
+  idle_timeout: 300s            # client keep-alive idle; also the WebSocket relay idle timeout
+  max_connections: 10000
   max_connections_per_client: 256
   max_metric_keys: 100000
 

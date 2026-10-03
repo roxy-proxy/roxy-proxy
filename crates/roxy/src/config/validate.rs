@@ -38,6 +38,7 @@ impl Config {
         self.validate_secrets(&mut d);
         self.validate_address_lists(&mut d);
         self.validate_addons(&mut d);
+        self.validate_upstream(&mut d);
 
         if let Err(policy) = self.compile_policy() {
             d.extend(policy);
@@ -91,7 +92,10 @@ impl Config {
                     ),
                 ));
             }
-            if let Some(first) = binds.insert(l.bind, path.clone()) {
+            // Port 0 asks the OS for a free port, so it never conflicts.
+            if l.bind.port() != 0
+                && let Some(first) = binds.insert(l.bind, path.clone())
+            {
                 d.push(Diagnostic::new(
                     format!("{path}.bind"),
                     format!("bind address {} is already used by {first}", l.bind),
@@ -119,6 +123,7 @@ impl Config {
             }
         }
         if let Some(ca) = &self.ca_server
+            && ca.bind.port() != 0
             && let Some(first) = binds.get(&ca.bind)
         {
             d.push(Diagnostic::new(
@@ -257,6 +262,35 @@ impl Config {
                     format!("undefined address list {name:?} (define it under `address_lists`)"),
                 ));
             }
+        }
+    }
+}
+
+impl Config {
+    fn validate_upstream(&self, d: &mut Vec<Diagnostic>) {
+        for name in self.upstream.dns.static_hosts.keys() {
+            let norm = name.trim_end_matches('.').to_ascii_lowercase();
+            if !matches!(
+                roxy_http::url::parse_host(norm.as_bytes()),
+                Ok(roxy_http::Host::Dns(_))
+            ) {
+                d.push(Diagnostic::new(
+                    format!("upstream.dns.static_hosts.{name}"),
+                    "must be a DNS host name (A-labels)",
+                ));
+            }
+        }
+        if self.limits.max_connections == 0 {
+            d.push(Diagnostic::new(
+                "limits.max_connections",
+                "must be at least 1",
+            ));
+        }
+        if self.limits.max_connections_per_client == 0 {
+            d.push(Diagnostic::new(
+                "limits.max_connections_per_client",
+                "must be at least 1",
+            ));
         }
     }
 }

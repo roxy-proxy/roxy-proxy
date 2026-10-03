@@ -9,13 +9,12 @@ use std::process::ExitCode;
 
 use anyhow::{Context as _, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use roxy_proxy::{FileSink, FlowEvent, FlowSink, Redactor, StdoutSink};
+use roxy_proxy::Redactor;
 use roxy_tls::{Ca, CaError};
 use tracing_subscriber::EnvFilter;
 
 use roxy::config::Config;
 use roxy::ruletest;
-use roxy::secrets::Secrets;
 use roxy_rules::Phase;
 
 #[derive(Debug, Parser)]
@@ -381,74 +380,63 @@ fn ca_export(path: &Path, der: bool) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn build_sink(config: &Config) -> anyhow::Result<Box<dyn FlowSink>> {
-    Ok(match &config.log.flow.path {
-        Some(path) => Box::new(
-            FileSink::open(path).with_context(|| format!("opening flow log {}", path.display()))?,
-        ),
-        None => Box::new(StdoutSink::new()),
-    })
-}
-
 fn run(path: &Path) -> anyhow::Result<ExitCode> {
-    let config = load_valid(path)?;
-    let secrets = Secrets::resolve(&config.secrets)?;
-
-    let mut redactor = Redactor::new();
-    for value in secrets.values() {
-        redactor.add_secret(value.expose());
-    }
-    for header in &config.log.redact_headers {
-        redactor.add_header(header);
-    }
-
-    let sink = build_sink(&config)?;
-
-    let ca_dir = &config.tls.ca_dir;
-    let ca = match Ca::load(ca_dir) {
-        Ok(ca) => ca,
-        Err(CaError::NotFound(_)) => {
-            let ca = Ca::generate(ca_dir)?;
-            tracing::info!(dir = %ca_dir.display(), "generated new roxy CA");
-            ca
-        }
-        Err(e) => return Err(e.into()),
-    };
-
-    sink.emit(&FlowEvent::ConfigLoaded {
-        ts: chrono::Utc::now(),
-        path: path.to_path_buf(),
-        listeners: config.listeners.iter().map(|l| l.name.clone()).collect(),
-        rules: config.rules.len(),
-        metrics: config.metrics.len(),
-        addons: config.addons.len(),
-    });
-
-    let listeners: Vec<String> = config
-        .listeners
-        .iter()
-        .map(|l| format!("{}={}", l.name, l.bind))
-        .collect();
-    let ca_server = config
-        .ca_server
-        .as_ref()
-        .map_or_else(|| "disabled".to_owned(), |c| c.bind.to_string());
-    tracing::info!(
-        listeners = listeners.join(","),
-        ca_server,
-        ca_cert = %ca.cert_path().display(),
-        secrets = secrets.len(),
-        "roxy starting"
-    );
-
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting tokio runtime")?;
     runtime.block_on(async {
-        // M1: bind listeners and start the pipeline here.
-        tokio::signal::ctrl_c().await.context("waiting for ctrl-c")
+        let running = roxy::run::start(
+            path,
+            roxy::run::StartOptions {
+                watch: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let listeners: Vec<String> = running
+            .server
+            .local_addrs()
+            .iter()
+            .map(|(n, a)| format!("{n}={a}"))
+            .collect();
+        tracing::info!(
+            listeners = listeners.join(","),
+            ca_server = ?running.server.ca_server_addr(),
+            "roxy running"
+        );
+        wait_for_shutdown(&running).await?;
+        tracing::info!("roxy shutting down");
+        running.shutdown(SHUTDOWN_GRACE).await;
+        anyhow::Ok(())
     })?;
-    tracing::info!("roxy shutting down");
     Ok(ExitCode::SUCCESS)
+}
+
+/// In-flight exchanges get this long to finish at shutdown.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Waits for ctrl-c or SIGTERM; reloads on SIGHUP meanwhile.
+async fn wait_for_shutdown(running: &roxy::run::Running) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+        let mut hup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
+        loop {
+            tokio::select! {
+                r = tokio::signal::ctrl_c() => return r.context("waiting for ctrl-c"),
+                _ = term.recv() => return Ok(()),
+                _ = hup.recv() => {
+                    tracing::info!("SIGHUP: reloading config");
+                    running.reloader.reload_async().await;
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = running;
+        tokio::signal::ctrl_c().await.context("waiting for ctrl-c")
+    }
 }
