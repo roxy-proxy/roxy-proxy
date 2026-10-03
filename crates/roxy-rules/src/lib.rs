@@ -37,10 +37,21 @@
 //! * **Chains.** Rules run top to bottom per phase; non-terminal actions
 //!   take effect and evaluation continues; the first terminal action
 //!   (`allow`, `deny`, `passthrough`) decides. An exhausted chain yields
-//!   [`Decision::default_for`] the phase: deny 403 in `request`, allow in
-//!   `connect` (§4.3), `response` and `ws`; `terminal_rule` is `_default`.
+//!   [`Decision::default_for`] the phase: deny 403 in `request` and `ws`
+//!   (in `ws` that drops the message), allow in `connect` (§4.3) and
+//!   `response`; `terminal_rule` is `_default`.
+//! * **Denies close.** Outside `ws`, a deny closes the client connection
+//!   after the response unless the rule says `deny: { close: false }`. In
+//!   `ws`, `close: true` closes the socket; the default drops the message.
+//! * **Unavailable inputs fail closed.** If evaluation reaches a metric the
+//!   view reports unavailable ([`FlowView::metric`] → `None`), an address
+//!   list it cannot answer for, or a `set_header` secret that is missing or
+//!   not a valid header value, evaluation stops: [`Decision::fail_closed`]
+//!   (503, close), `terminal_rule = "_fail_closed"`, and
+//!   [`Outcome::fail_closed_reason`] says why. This is never "predicate
+//!   false". `and`/`or` short-circuit, so only inputs actually reached count.
 //! * **Absent values.** A field the flow does not have (`client.user`
-//!   without proxy auth, an unset header, an unavailable metric) is
+//!   without proxy auth, an unset header or state key) is
 //!   [`Value::Absent`]. *Every* comparison involving an absent operand is
 //!   false, including `!=` and `not in`; `not (x == "a")` is true.
 //! * **Case.** String comparisons are byte-exact, except operands involving
@@ -57,8 +68,8 @@
 //! * **Address lists.** `ip in @name` / `ip not in @name` (§7.1) checks a
 //!   named list defined under `address_lists:` (see
 //!   [`PolicyInput::address_lists`]). The engine holds only the name and asks
-//!   [`FlowView::in_address_list`]; `None` (list unavailable) makes the
-//!   predicate false. `@name` anywhere else is a compile error.
+//!   [`FlowView::in_address_list`]; `None` (list unavailable) fails closed.
+//!   `@name` anywhere else is a compile error.
 //! * **Lists.** `header.all["x"]` satisfies `==`, `in`, `starts_with`,
 //!   `ends_with`, `contains`, `like`, `matches` if any value does; `!=` and
 //!   `not in` on it are compile errors.
@@ -70,10 +81,11 @@
 //!   [`EvalContext::initial_tags`] or a `tag` action of an earlier matching
 //!   rule in the same chain set it. `state["k"]` sees `set_state` effects
 //!   earlier in the chain, then [`FlowView::state`]. `metric.<id>` is
-//!   [`FlowView::metric`].
+//!   [`FlowView::metric`], which must return `Some(0)` for a series with no
+//!   data yet; `None` means unavailable.
 //! * **Secrets.** `${secret:name}` is only allowed in request-phase
 //!   `set_header` values and must name a defined secret. A secret missing at
-//!   evaluation time (or not a valid header value) fails closed: `Deny 500`.
+//!   evaluation time (or not a valid header value) fails closed (see above).
 
 #![forbid(unsafe_code)]
 
@@ -95,7 +107,8 @@ pub use config::{
 };
 pub use diag::{Diagnostic, RuleId, Span};
 pub use eval::{
-    AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Effect, EvalContext, Outcome,
+    AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Effect, EvalContext,
+    FAIL_CLOSED_MESSAGE, FAIL_CLOSED_STATUS, FailClosedReason, Outcome,
 };
 pub use parser::parse;
 pub use policy::{MetricDef, Policy, PolicyInput};

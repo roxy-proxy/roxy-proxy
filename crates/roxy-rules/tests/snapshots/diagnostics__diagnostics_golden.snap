@@ -119,7 +119,8 @@ rules[0].phase: `ws`-phase rules can never run: no request rule enables message 
 
 == duplicate and reserved ids
 rules[1].id: duplicate rule id "a" (first defined at rules[0])  [rule a]
-rules[2].id: rule id "_default": ids starting with `_` are reserved (e.g. `_default`)  [rule _default]
+rules[2].id: rule id "_default": ids starting with `_` are reserved (`_default`, `_fail_closed`)  [rule _default]
+rules[3].id: rule id "_fail_closed": ids starting with `_` are reserved (`_default`, `_fail_closed`)  [rule _fail_closed]
 
 == address list on a non-ip field
 rules[0].when:1:9: address list @internal can only be used with `in`/`not in` on an ip field  [rule a]

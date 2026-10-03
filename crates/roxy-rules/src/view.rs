@@ -45,8 +45,8 @@ impl Value<'_> {
 /// Read-only access to one flow, implemented by the proxy.
 ///
 /// Header names passed in are lower-case. Methods return `None` / `Absent` /
-/// an empty vector for anything unknown; the evaluator treats all of those
-/// as "not available", which makes the predicate false.
+/// an empty vector for anything unknown, which the evaluator treats as absent
+/// (predicate false) — except `metric` and `in_address_list`, see below.
 pub trait FlowView {
     /// A scalar field. Normalisation contract: see [`Field`].
     fn field(&self, f: Field) -> Value<'_>;
@@ -60,8 +60,8 @@ pub trait FlowView {
     fn response_header_all(&self, name: &str) -> Vec<Cow<'_, str>>;
     /// First value of a query parameter.
     fn query(&self, key: &str) -> Option<Cow<'_, str>>;
-    /// Current value of metric `id` for this flow's series key. `None` when
-    /// not available (metrics are wired in M2).
+    /// Current value of metric `id` for this flow's series key; `Some(0)` for a
+    /// series with no data yet. `None` = unavailable, which fails the flow closed.
     fn metric(&self, id: &str) -> Option<i64>;
     /// A state-store entry.
     fn state(&self, key: &str) -> Option<Cow<'_, str>>;
@@ -71,8 +71,8 @@ pub trait FlowView {
     /// The buffered response body as text.
     fn response_body_text(&self) -> Option<Cow<'_, str>>;
     /// Whether `ip` is in the named address list (`ip in @list`, §7.1).
-    /// `None` = list unavailable (not loaded), which makes the predicate
-    /// false, like an absent value. `ip` is canonical (IPv4-mapped IPv6
+    /// `None` = list unavailable (not loaded), which fails the flow closed
+    /// (503, `_fail_closed`). `ip` is canonical (IPv4-mapped IPv6
     /// addresses arrive as IPv4).
     fn in_address_list(&self, list: &str, ip: IpAddr) -> Option<bool>;
 }

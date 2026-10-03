@@ -128,6 +128,10 @@ struct RuleTestArgs {
     /// State entry `key=value` for `state["key"]` (repeatable).
     #[arg(long = "state")]
     state: Vec<String>,
+    /// Treat every metric not given with --metric as a fresh series (0).
+    /// Without it, a rule that reads an unset metric fails closed.
+    #[arg(long)]
+    fresh_metrics: bool,
     /// Initial tag (repeatable).
     #[arg(long = "tag")]
     tags: Vec<String>,
@@ -203,6 +207,7 @@ fn rule_test(args: &RuleTestArgs) -> anyhow::Result<ExitCode> {
     req.body.clone_from(&args.body);
     req.status = args.status;
     req.tags.clone_from(&args.tags);
+    req.fresh_metrics = args.fresh_metrics;
     let err = |e: String| anyhow::anyhow!(e);
     req.headers = args
         .headers

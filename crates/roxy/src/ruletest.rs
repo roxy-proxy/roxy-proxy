@@ -26,6 +26,9 @@ pub struct TestRequest {
     pub metrics: Vec<(String, i64)>,
     pub state: Vec<(String, String)>,
     pub tags: Vec<String>,
+    /// Give every metric not set in `metrics` the value 0 (a fresh series).
+    /// Otherwise an unset metric is unavailable and the flow fails closed.
+    pub fresh_metrics: bool,
 }
 
 impl TestRequest {
@@ -43,6 +46,7 @@ impl TestRequest {
             metrics: Vec::new(),
             state: Vec::new(),
             tags: Vec::new(),
+            fresh_metrics: false,
         }
     }
 }
@@ -228,6 +232,11 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(MapView, Vec<St
     for (n, val) in &req.response_headers {
         v = v.with_response_header(n, val);
     }
+    if req.fresh_metrics {
+        for m in &config.metrics {
+            v = v.with_metric(&m.id, 0);
+        }
+    }
     for (id, n) in &req.metrics {
         v = v.with_metric(id, *n);
     }
@@ -304,6 +313,9 @@ pub fn report(phase: Phase, out: &Outcome, redactor: &Redactor) -> String {
     let _ = writeln!(s, "tags:     {}", list(out.tags.clone()));
     let _ = writeln!(s, "decision: {}", out.decision);
     let _ = writeln!(s, "rule:     {}", out.terminal_rule);
+    if let Some(reason) = &out.fail_closed_reason {
+        let _ = writeln!(s, "reason:   {reason} (fail closed)");
+    }
     s
 }
 

@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use common::{METRICS, compile, try_compile};
 use roxy_rules::{
-    AllowOpts, CaptureTarget, Decision, Effect, EvalContext, Field, LogLevel, MapView, Phase,
-    Scheme, Value,
+    AllowOpts, CaptureTarget, Decision, Effect, EvalContext, FailClosedReason, Field, LogLevel,
+    MapView, Phase, Scheme, Value,
 };
 
 fn ip(s: &str) -> Value<'static> {
@@ -234,10 +234,9 @@ fn absent_values_are_never_equal_or_unequal() {
         ("state[\"nope\"] == \"\"", false),
         ("tls.alpn != \"h2\"", false),
     ]);
-    // Metrics without a value (not wired, or unknown series) are absent.
+    // An unbuffered body is absent. (A missing *metric* is not absent: it
+    // fails closed, see `unavailable_inputs_fail_closed`.)
     let v = MapView::new();
-    assert!(!eval_in(Phase::Request, "metric.writes >= 0", &v));
-    assert!(!eval_in(Phase::Request, "metric.writes < 1", &v));
     assert!(!eval_in(Phase::Request, "body.text contains \"\"", &v));
 }
 
@@ -304,7 +303,7 @@ fn first_terminal_wins_with_effects_in_order() {
         Decision::Deny {
             status: 429,
             message: "slow down".into(),
-            close: false
+            close: true
         }
     );
     assert_eq!(out.terminal_rule, "writes");
@@ -349,26 +348,174 @@ fn default_decisions() {
         Decision::Deny {
             status: 403,
             message: "blocked by roxy".into(),
-            close: false
+            close: true
         }
     );
     assert_eq!(out.terminal_rule, "_default");
     assert!(out.terminal_rule.is_default());
+    assert_eq!(out.fail_closed_reason, None);
     assert_eq!(out.matched, Vec::<roxy_rules::RuleId>::new());
 
-    // An empty policy denies every request but allows connect/response.
+    // An empty policy denies requests (closing) and ws messages (dropping,
+    // not closing), and allows connect/response.
     let empty = compile("", "[]");
-    assert!(
-        empty
-            .evaluate(Phase::Request, &other, &EvalContext::empty())
-            .decision
-            .is_deny()
-    );
-    for phase in [Phase::Connect, Phase::Response, Phase::Ws] {
+    let deny = |close| Decision::Deny {
+        status: 403,
+        message: "blocked by roxy".into(),
+        close,
+    };
+    for (phase, want) in [
+        (Phase::Request, deny(true)),
+        (Phase::Ws, deny(false)),
+        (Phase::Connect, Decision::Allow(AllowOpts::default())),
+        (Phase::Response, Decision::Allow(AllowOpts::default())),
+    ] {
         let out = empty.evaluate(phase, &other, &EvalContext::empty());
-        assert!(out.decision.is_allow(), "{phase}");
+        assert_eq!(out.decision, want, "{phase}");
         assert_eq!(out.terminal_rule, "_default");
     }
+}
+
+#[test]
+fn deny_close_defaults_and_opt_out() {
+    let p = compile(
+        "",
+        r#"
+- id: keep
+  when: path == "/keep"
+  then: { deny: { status: 451, close: false } }
+- id: bare
+  when: path == "/bare"
+  then: deny
+- id: req-inspect
+  then: { allow: { upgrade: websocket, inspect: true } }
+- id: ws-drop
+  phase: ws
+  when: ws.size > 10
+  then: deny
+- id: ws-close
+  phase: ws
+  when: ws.size > 5
+  then: { deny: { close: true } }
+- id: ws-ok
+  phase: ws
+  then: allow
+- id: resp
+  phase: response
+  when: response.status == 500
+  then: deny
+"#,
+    );
+    let ctx = EvalContext::empty();
+    let close_of = |phase, v: &MapView| match p.evaluate(phase, v, &ctx).decision {
+        Decision::Deny { close, .. } => Some(close),
+        _ => None,
+    };
+    let path = |s: &str| MapView::new().with_str(Field::Path, s);
+    assert_eq!(close_of(Phase::Request, &path("/keep")), Some(false));
+    assert_eq!(close_of(Phase::Request, &path("/bare")), Some(true));
+    let ws = |n| MapView::new().with_int(Field::WsSize, n);
+    assert_eq!(
+        close_of(Phase::Ws, &ws(11)),
+        Some(false),
+        "drop the message"
+    );
+    assert_eq!(close_of(Phase::Ws, &ws(6)), Some(true), "close the socket");
+    assert_eq!(close_of(Phase::Ws, &ws(1)), None);
+    let resp = MapView::new().with_int(Field::ResponseStatus, 500);
+    assert_eq!(close_of(Phase::Response, &resp), Some(true));
+}
+
+fn fail_closed(reason: FailClosedReason) -> impl Fn(&roxy_rules::Outcome) {
+    move |out| {
+        assert_eq!(
+            out.decision,
+            Decision::Deny {
+                status: 503,
+                message: "policy input unavailable".into(),
+                close: true
+            }
+        );
+        assert_eq!(out.terminal_rule, "_fail_closed");
+        assert_eq!(out.fail_closed_reason.as_ref(), Some(&reason));
+    }
+}
+
+#[test]
+fn unavailable_inputs_fail_closed() {
+    let p = compile(
+        METRICS,
+        r#"
+- id: first
+  then: { tag: seen }
+- id: burst
+  when: host == "api.github.com" and metric.writes >= 30
+  then: deny
+- id: internal
+  when: client.ip in @internal
+  then: allow
+- id: rest
+  then: allow
+"#,
+    );
+    let ctx = EvalContext::empty();
+    let base = || {
+        MapView::new()
+            .with_str(Field::Host, "api.github.com")
+            .with(Field::ClientIp, ip("192.0.2.1"))
+    };
+
+    // The metric is reached but unavailable: fail closed, not "false".
+    let out = p.evaluate(Phase::Request, &base(), &ctx);
+    fail_closed(FailClosedReason::MetricUnavailable("writes".into()))(&out);
+    assert_eq!(out.matched, ["first"].map(roxy_rules::RuleId::new));
+    assert_eq!(out.tags, ["seen"]);
+
+    // Short-circuit: a different host never needs the metric.
+    let other = base().with_str(Field::Host, "example.com");
+    let out = p.evaluate(Phase::Request, &other, &ctx);
+    fail_closed(FailClosedReason::AddressListUnavailable("internal".into()))(&out);
+
+    // With the metric (0 for a fresh series) and the list available, fine.
+    let ok = base()
+        .with_metric("writes", 0)
+        .with_address_list("internal", vec!["10.0.0.0/8".parse().unwrap()]);
+    let out = p.evaluate(Phase::Request, &ok, &ctx);
+    assert_eq!(out.terminal_rule, "rest");
+    assert_eq!(out.fail_closed_reason, None);
+
+    // Negation does not turn "could not check" into true either.
+    let p = compile(
+        METRICS,
+        "- { id: n, when: 'not (metric.writes > 5)', then: allow }",
+    );
+    let out = p.evaluate(Phase::Request, &MapView::new(), &ctx);
+    fail_closed(FailClosedReason::MetricUnavailable("writes".into()))(&out);
+    let p = compile(
+        "",
+        "- { id: n, when: 'client.ip not in @blocked', then: allow }",
+    );
+    let out = p.evaluate(Phase::Request, &base(), &ctx);
+    fail_closed(FailClosedReason::AddressListUnavailable("blocked".into()))(&out);
+
+    // Metric filters report the same condition to the proxy.
+    let p = compile(
+        "- { id: w, count: requests }\n- { id: f, count: requests, where: 'metric.w > 1' }",
+        "[]",
+    );
+    assert_eq!(
+        p.metric_defs()[1].matches(&MapView::new()),
+        Err(FailClosedReason::MetricUnavailable("w".into()))
+    );
+
+    // An unset state key is legitimately absent, not a failure.
+    let p = compile(
+        "",
+        "- { id: s, when: 'state[\"k\"] == \"v\"', then: allow }",
+    );
+    let out = p.evaluate(Phase::Request, &MapView::new(), &ctx);
+    assert_eq!(out.terminal_rule, "_default");
+    assert_eq!(out.fail_closed_reason, None);
 }
 
 #[test]
@@ -523,24 +670,11 @@ fn missing_secret_fails_closed() {
         initial_tags: &[],
     };
     let out = p.evaluate(Phase::Request, &openai(), &ctx);
-    assert_eq!(
-        out.decision,
-        Decision::Deny {
-            status: 500,
-            message: "secret unavailable".into(),
-            close: false
-        }
-    );
-    assert_eq!(out.terminal_rule, "openai");
-    let Some(Effect::Log { level, message }) = out.effects.last() else {
-        panic!("{:?}", out.effects)
-    };
-    assert_eq!(*level, LogLevel::Error);
-    assert!(message.contains("\"gh\""), "{message}");
-    assert!(
-        !message.contains("sk-123"),
-        "secret values are never logged"
-    );
+    fail_closed(FailClosedReason::SecretMissing("gh".into()))(&out);
+    assert_eq!(out.matched, ["openai"].map(roxy_rules::RuleId::new));
+    // The first header (resolved) was emitted; the failing one was not.
+    assert_eq!(out.effects.len(), 1);
+    assert!(!format!("{out:?}").contains("ghp_"), "no secret values");
 
     // A secret that is not a valid header value also fails closed.
     let crlf = |_: &str| Some("a\r\nx-injected: 1".to_owned());
@@ -549,7 +683,7 @@ fn missing_secret_fails_closed() {
         initial_tags: &[],
     };
     let out = p.evaluate(Phase::Request, &openai(), &ctx);
-    assert!(matches!(out.decision, Decision::Deny { status: 500, .. }));
+    fail_closed(FailClosedReason::SecretInvalid("openai".into()))(&out);
     assert!(
         out.effects
             .iter()
@@ -663,9 +797,16 @@ fn metric_defs_compile() {
     assert_eq!(defs[0].window, Some(Duration::from_secs(60)));
     assert_eq!(defs[1].unique, Some(Field::Host));
     assert_eq!(defs[2].phase, Phase::Response);
-    assert!(defs[0].matches(&flow()));
-    assert!(!defs[0].matches(&flow().with_str(Field::Method, "GET")));
-    assert!(defs[1].matches(&MapView::new()), "no filter = always");
+    assert_eq!(defs[0].matches(&flow()), Ok(true));
+    assert_eq!(
+        defs[0].matches(&flow().with_str(Field::Method, "GET")),
+        Ok(false)
+    );
+    assert_eq!(
+        defs[1].matches(&MapView::new()),
+        Ok(true),
+        "no filter = always"
+    );
 }
 
 #[test]
@@ -720,18 +861,8 @@ fn address_lists() {
         &dst("203.0.113.8")
     ));
 
-    // A list the view cannot answer for, or an absent ip: false either way.
-    let unloaded = MapView::new().with(Field::ClientIp, ip("10.0.0.1"));
-    assert!(!eval_in(
-        Phase::Request,
-        "client.ip in @internal",
-        &unloaded
-    ));
-    assert!(!eval_in(
-        Phase::Request,
-        "client.ip not in @internal",
-        &unloaded
-    ));
+    // A list the view cannot answer for fails closed (see
+    // `unavailable_inputs_fail_closed`); an absent ip is just absent.
     let no_ip = with_lists(MapView::new());
     assert!(!eval_in(
         Phase::Request,

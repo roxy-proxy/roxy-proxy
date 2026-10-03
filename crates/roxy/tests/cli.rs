@@ -183,7 +183,7 @@ fn rule_test(args: &[&str]) -> Output {
 
 #[test]
 fn rule_test_allows_github_reads() {
-    let out = rule_test(&["GET", "https://api.github.com/repos/a/b"]);
+    let out = rule_test(&["--fresh-metrics", "GET", "https://api.github.com/repos/a/b"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let stdout = text(&out.stdout);
     assert!(stdout.contains("matched:  github-reads"), "{stdout}");
@@ -193,7 +193,7 @@ fn rule_test_allows_github_reads() {
 
 #[test]
 fn rule_test_denies_by_default_and_by_rule() {
-    let out = rule_test(&["DELETE https://example.com/x"]);
+    let out = rule_test(&["--fresh-metrics", "DELETE https://example.com/x"]);
     assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
     let stdout = text(&out.stdout);
     assert!(
@@ -205,6 +205,8 @@ fn rule_test_denies_by_default_and_by_rule() {
     let out = rule_test(&[
         "--metric",
         "egress_bytes=600000000",
+        "--metric",
+        "github_writes=0",
         "-H",
         "content-type: application/json",
         "POST",
@@ -221,7 +223,11 @@ fn rule_test_denies_by_default_and_by_rule() {
 
 #[test]
 fn rule_test_shows_secret_placeholders() {
-    let out = rule_test(&["POST", "https://api.openai.com/v1/chat/completions"]);
+    let out = rule_test(&[
+        "--fresh-metrics",
+        "POST",
+        "https://api.openai.com/v1/chat/completions",
+    ]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let stdout = text(&out.stdout);
     assert!(
@@ -248,4 +254,20 @@ fn rule_test_response_phase_and_bad_input() {
     let out = rule_test(&["GET", "not-a-url"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(text(&out.stderr).contains("not an absolute URL"));
+}
+
+#[test]
+fn rule_test_unset_metric_fails_closed() {
+    let out = rule_test(&["GET", "https://api.github.com/repos/a/b"]);
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("decision: deny 503 \"policy input unavailable\" (close)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("rule:     _fail_closed"), "{stdout}");
+    assert!(
+        stdout.contains("reason:   metric `github_writes` unavailable (fail closed)"),
+        "{stdout}"
+    );
 }
