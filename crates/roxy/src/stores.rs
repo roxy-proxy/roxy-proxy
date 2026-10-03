@@ -44,7 +44,15 @@ impl ReloadableMetrics {
     /// result once the policy swap has succeeded; drop it otherwise.
     pub fn prepare(&self, policy: &Policy, max_keys: usize) -> MetricStore {
         let next = MetricStore::new(policy.metric_defs(), max_keys);
-        next.carry_over(&self.inner.load());
+        let report = next.carry_over(&self.inner.load());
+        if report.skipped_budget > 0 {
+            tracing::warn!(
+                carried = report.carried,
+                skipped = report.skipped_budget,
+                max_bytes = next.max_bytes(),
+                "metric series not carried over on reload: byte budget exhausted"
+            );
+        }
         next
     }
 
@@ -62,7 +70,11 @@ impl ReloadableMetrics {
 fn map_err(e: MetricError) -> MetricSourceError {
     match e {
         MetricError::Unknown(id) => MetricSourceError::Unknown(format!("unknown metric {id}")),
-        MetricError::TableFull { metric } => MetricSourceError::TableFull(metric),
+        // Out of bytes is the same condition as out of keys: deny, never
+        // evict (§6.4, §12).
+        MetricError::TableFull { metric } | MetricError::BudgetExhausted { metric } => {
+            MetricSourceError::TableFull(metric)
+        }
         MetricError::KeyUnavailable { metric, field } => {
             MetricSourceError::KeyUnavailable(format!("{metric}: key field {field:?}"))
         }

@@ -118,7 +118,10 @@ pub use eval::{
     AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Effect, EvalContext,
     FAIL_CLOSED_MESSAGE, FAIL_CLOSED_STATUS, FailClosedReason, Outcome,
 };
-pub use metrics::{Clock, MetricError, MetricSnapshot, MetricSource, MetricStore, Sample};
+pub use metrics::{
+    CarryOverReport, Clock, DEFAULT_MAX_METRIC_BYTES, DEFAULT_MAX_METRIC_KEYS, MetricError,
+    MetricLimits, MetricSnapshot, MetricSource, MetricStore, SERIES_OVERHEAD, SPARSE_CHUNK, Sample,
+};
 pub use parser::parse;
 pub use policy::{MetricDef, Policy, PolicyInput};
 pub use state::{StateFull, StateSource, StateStore};
