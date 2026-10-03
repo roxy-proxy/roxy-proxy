@@ -25,6 +25,7 @@ roxy-log = { path = "crates/roxy-log", version = "0.1.0" }
 roxy-proxy = { path = "crates/roxy-proxy", version = "0.1.0" }
 roxy-rules = { path = "crates/roxy-rules", version = "0.1.0" }
 roxy-tls = { path = "crates/roxy-tls", version = "0.1.0" }
+roxy-wasm = { path = "crates/roxy-wasm", version = "0.1.0" }
 
 # External crates
 anyhow = "1.0.104"

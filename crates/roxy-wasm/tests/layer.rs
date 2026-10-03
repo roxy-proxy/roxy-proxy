@@ -338,7 +338,7 @@ async fn capabilities_gate_host_services() {
     let rt = runtime();
     // Each gated call, the capability it needs, and what it returns once
     // granted.
-    let cases: [(&str, Capability, &str, &str); 7] = [
+    let cases: [(&str, Capability, &str, &str); 6] = [
         (
             "log",
             Capability::Log,
@@ -350,12 +350,6 @@ async fn capabilities_gate_host_services() {
             Capability::Record,
             "ok",
             "record verdict {\"score\":0.9} true",
-        ),
-        (
-            "terminate",
-            Capability::Terminate,
-            "true",
-            "terminate Principal bad actor Some(1000)",
         ),
         (
             "state",
@@ -709,15 +703,15 @@ async fn tunnel_is_detected_and_relays() {
         LayerError::NoTunnel
     );
 
-    let layer = Layer::load(&rt, TUNNEL_LAYER.to_vec(), config())
-        .await
-        .unwrap();
+    let mut cfg = config();
+    cfg.config_json = r#"{"upper": true}"#.into();
+    let layer = Layer::load(&rt, TUNNEL_LAYER.to_vec(), cfg).await.unwrap();
     assert!(layer.has_tunnel());
-    // The tunnel layer also handles plain exchanges.
+    // The tunnel layer passes plain exchanges through.
     let (_, body) = exchange(&layer, Mock::echo(), request("x", Body::empty()))
         .await
         .unwrap();
-    assert_eq!(body, "tunnel layer");
+    assert_eq!(body, "");
 
     // client <-> [layer] <-> upstream
     let (client, client_side) = tokio::io::duplex(1024);

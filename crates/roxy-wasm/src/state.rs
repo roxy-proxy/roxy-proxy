@@ -21,7 +21,7 @@ use crate::bindings::roxy::addon::{chain, endpoints, flow};
 use crate::config::{Capability, LayerConfig};
 use crate::error::{Budget, LayerError};
 use crate::exchange::{Dir, ExchangeShared, FromGuest, IntoGuest};
-use crate::host::{EndpointError, LayerHost, LogLevel, TerminateScope};
+use crate::host::{EndpointError, LayerHost, LogLevel};
 
 /// Most resources (requests, bodies, streams, fields) a guest may hold at
 /// once. Each costs host memory outside the guest's `max_memory`.
@@ -433,23 +433,6 @@ impl flow::Host for StoreState {
         self.require(Capability::Record, "flow.record")?;
         let host = self.host("flow.record")?;
         host.record(kind, json, audit)
-            .await
-            .map_err(|e| self.host_failed(e))
-    }
-
-    async fn terminate(
-        &mut self,
-        scope: flow::Scope,
-        reason: String,
-        ttl_ms: Option<u64>,
-    ) -> wasmtime::Result<bool> {
-        self.require(Capability::Terminate, "flow.terminate")?;
-        let host = self.host("flow.terminate")?;
-        let scope = match scope {
-            flow::Scope::Connection => TerminateScope::Connection,
-            flow::Scope::Principal => TerminateScope::Principal,
-        };
-        host.terminate(scope, reason, ttl_ms)
             .await
             .map_err(|e| self.host_failed(e))
     }

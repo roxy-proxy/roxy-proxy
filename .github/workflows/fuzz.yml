@@ -40,23 +40,10 @@ env:
   CARGO_FUZZ_VERSION: 0.13.2
 
 jobs:
-  fuzz:
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - h1_request
-          - h1_chunked
-          - h2map
-          - url
-          - client_hello
-          - rule_compile
-          - rule_eval
+  # Every target is compiled once here; the matrix below only runs them.
+  build:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    env:
-      TARGET: ${{ matrix.target }}
-      SECONDS_PER_TARGET: ${{ github.event_name == 'schedule' && '300' || github.event_name == 'workflow_dispatch' && inputs.seconds || '60' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -85,6 +72,51 @@ jobs:
             cargo install cargo-fuzz --locked --version "$CARGO_FUZZ_VERSION" --force
           fi
 
+      - name: Build every target
+        run: |
+          cd fuzz
+          cargo +nightly fuzz build
+          mkdir -p ../fuzz-bin
+          for t in $(cargo +nightly fuzz list); do
+            cp "target/x86_64-unknown-linux-gnu/release/$t" ../fuzz-bin/
+          done
+          ls -l ../fuzz-bin
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-bin
+          path: fuzz-bin/
+          retention-days: 1
+          if-no-files-found: error
+
+  fuzz:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - h1_request
+          - h1_chunked
+          - h2map
+          - url
+          - client_hello
+          - rule_compile
+          - rule_eval
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      TARGET: ${{ matrix.target }}
+      SECONDS_PER_TARGET: ${{ github.event_name == 'schedule' && '300' || github.event_name == 'workflow_dispatch' && inputs.seconds || '60' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fuzz-bin
+          path: fuzz-bin
+
       # The corpus each run grows, restored from the newest earlier run and
       # saved under a fresh key (cache entries are immutable).
       - name: Restore the corpus
@@ -99,16 +131,24 @@ jobs:
       - name: Generate seeds
         run: python3 fuzz/generate_seeds.py
 
+      # The libFuzzer binary directly, with the arguments `cargo fuzz run`
+      # passes (reproducers land in fuzz/artifacts/<target>/).
       - name: Fuzz
         run: |
-          mkdir -p "fuzz/corpus/$TARGET"
-          cd fuzz
-          cargo +nightly fuzz run "$TARGET" "corpus/$TARGET" "seeds/$TARGET" -- \
+          chmod +x "fuzz-bin/$TARGET"
+          mkdir -p "fuzz/corpus/$TARGET" "fuzz/artifacts/$TARGET"
+          "fuzz-bin/$TARGET" -artifact_prefix="fuzz/artifacts/$TARGET/" \
+            "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" \
             -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=2048 -timeout=10 -print_final_stats=1
 
+      # What `cargo fuzz cmin` does: merge the corpus into a fresh directory.
       - name: Minimise the corpus
         if: github.event_name == 'schedule'
-        run: cd fuzz && cargo +nightly fuzz cmin "$TARGET" "corpus/$TARGET"
+        run: |
+          mkdir -p "fuzz/cmin/$TARGET"
+          "fuzz-bin/$TARGET" -merge=1 "fuzz/cmin/$TARGET" "fuzz/corpus/$TARGET"
+          rm -rf "fuzz/corpus/$TARGET"
+          mv "fuzz/cmin/$TARGET" "fuzz/corpus/$TARGET"
 
       - name: Upload the reproducer
         if: failure()

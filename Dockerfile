@@ -11,25 +11,39 @@
 # Base images are pinned by digest (multi-arch index digests); bump them
 # deliberately.
 
-# ---- build -------------------------------------------------------------------
+# ---- toolchain ---------------------------------------------------------------
 # rust:1.99-alpine3.22. Alpine's native target is *-unknown-linux-musl, which
 # links statically by default, so the same Dockerfile builds amd64 and arm64
 # natively on each platform's runner.
-FROM rust:1.99-alpine3.22@sha256:d0486f70555afb827c0cafecb4052d6139e1bc7b3f7170c79307884c6af32e90 AS build
+FROM rust:1.99-alpine3.22@sha256:d0486f70555afb827c0cafecb4052d6139e1bc7b3f7170c79307884c6af32e90 AS toolchain
 RUN apk add --no-cache musl-dev
 # cargo-auditable embeds the crate dependency list in the binary, so image
 # scanners (Trivy) and the SBOM see the Rust dependencies, not just the base.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo install --locked cargo-auditable@0.7.7
+# cargo-chef splits the dependency build into its own layer (below).
+RUN cargo install --locked cargo-auditable@0.7.7 cargo-chef@0.1.78
 WORKDIR /src
+
+# ---- plan --------------------------------------------------------------------
+# The dependency recipe: Cargo.toml/Cargo.lock skeletons only, so it changes
+# only when dependencies do.
+FROM toolchain AS plan
 COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---- compile -----------------------------------------------------------------
+FROM toolchain AS compile
 # Symbols are stripped here rather than in Cargo.toml so local release
-# builds keep them. The registry and target caches stay in BuildKit cache
-# mounts, so the binary is copied out of the cache before the step ends.
+# builds keep them. Set before the dependency build: it is part of the
+# release profile, so a change would rebuild every dependency.
 ENV CARGO_PROFILE_RELEASE_STRIP=symbols
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
-    cargo auditable build --release --locked -p roxy \
+# Dependencies only, in an ordinary layer (not a cache mount) so the CI
+# layer cache (type=gha, mode=max) keeps it: a source-only change reuses it
+# and compiles just the workspace crates. cargo-auditable wraps only
+# workspace crates, so plain cargo builds the same dependency artifacts.
+COPY --from=plan /src/recipe.json recipe.json
+RUN cargo chef cook --release --locked -p roxy --recipe-path recipe.json
+COPY . .
+RUN cargo auditable build --release --locked -p roxy \
     && cp target/release/roxy /roxy
 # Fail the build if the binary is not fully static.
 RUN if ldd /roxy 2>&1 | grep -q '=>'; then ldd /roxy; exit 1; fi
@@ -46,7 +60,7 @@ RUN install -D -m 0444 examples/docker/roxy.yaml /out/etc/roxy/roxy.yaml \
 # Only the binary, for the release tarballs (.github/workflows/release.yml):
 #   docker buildx build --target artifact --output type=local,dest=out .
 FROM scratch AS artifact
-COPY --from=build /roxy /roxy
+COPY --from=compile /roxy /roxy
 
 # ---- runtime -----------------------------------------------------------------
 # distroless/static-debian12:nonroot: /etc/passwd with nonroot (65532),
@@ -57,14 +71,14 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c
 ARG VERSION=dev
 ARG REVISION=unknown
 LABEL org.opencontainers.image.title="roxy" \
-      org.opencontainers.image.description="TLS-inspecting HTTP firewall for AI agent traffic" \
+      org.opencontainers.image.description="Extensible TLS-inspecting HTTP proxy and egress firewall" \
       org.opencontainers.image.source="https://github.com/roxy-proxy/roxy-proxy" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}"
 
-COPY --from=build --chown=0:0 --chmod=0555 /roxy /roxy
-COPY --from=build /out/ /
+COPY --from=compile --chown=0:0 --chmod=0555 /roxy /roxy
+COPY --from=compile /out/ /
 
 USER 65532:65532
 # CA key and certificate (generated on first start; keep them across

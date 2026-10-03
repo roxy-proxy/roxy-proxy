@@ -1,7 +1,10 @@
 name: CI
 
+# Pull requests run on their own event; branch pushes would only repeat
+# them, so pushes run on main alone.
 on:
   push:
+    branches: [main]
   pull_request:
 
 env:
@@ -26,6 +29,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -34,6 +39,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace
 
   deny:
@@ -59,6 +66,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: |
             . -> target
             crates/roxy-wasm/test-components -> target

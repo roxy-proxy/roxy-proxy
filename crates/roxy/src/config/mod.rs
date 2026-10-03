@@ -437,12 +437,65 @@ impl TryFrom<RawAddressList> for AddressList {
 
 // ----- addons ---------------------------------------------------------------
 
+/// A host service an addon may use (§11.3). Each gates imports that are
+/// always linked: calling one without its capability fails the flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
+    /// Named outbound calls (`endpoints:`).
+    Endpoints,
+    /// The addon's keyed store.
     State,
+    /// Structured events in the flow log (and the audit endpoint).
+    Record,
+    /// Read-only metrics.
+    Metrics,
+    /// roxy's operational log.
     Log,
+    /// Parsed for compatibility and refused: endpoints attach credentials,
+    /// so an addon never needs to see a secret.
     Secrets,
+}
+
+/// A named outbound endpoint (§11.3). The addon names it; roxy resolves the
+/// URL, attaches the headers, applies the timeout and retries, and enforces
+/// the address floor and deny lists. Endpoint calls never pass through the
+/// layer stack or the rules.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Endpoint {
+    /// `http(s)://host[:port][/base/path]`; the request's path and query are
+    /// appended.
+    pub url: String,
+    /// Headers roxy attaches (values may use `${secret:name}`). They replace
+    /// any the addon set.
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// Per attempt, until the response head (default 30s).
+    #[serde(default, with = "humantime_serde")]
+    pub timeout: Option<Duration>,
+    /// Extra attempts after a connection failure or a 502/503/504 (default 0).
+    #[serde(default)]
+    pub retries: u32,
+    /// Allow private, loopback and link-local addresses (default false).
+    #[serde(default)]
+    pub private_ok: bool,
+}
+
+/// An addon's keyed store (§11.3). Nothing is evicted: a write when full
+/// fails and the addon decides.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AddonState {
+    /// Most live entries (default 100 000).
+    #[serde(deserialize_with = "units::opt_count")]
+    pub max_entries: Option<u64>,
+    /// Largest value (default 64 KiB).
+    #[serde(deserialize_with = "units::opt_size")]
+    pub max_value_bytes: Option<ByteSize>,
+    /// TTL for writes that give none (default 6h).
+    #[serde(with = "humantime_serde")]
+    pub default_ttl: Option<Duration>,
 }
 
 /// How an addon is implemented (§11.1).
@@ -502,6 +555,15 @@ pub struct AddonLimits {
     /// A service addon must return a complete head within this time.
     #[serde(with = "humantime_serde")]
     pub first_byte_timeout: Option<Duration>,
+    /// Replace a WASM instance after this many exchanges (default 10 000).
+    #[serde(deserialize_with = "units::opt_count")]
+    pub recycle_after_exchanges: Option<u64>,
+    /// Replace a WASM instance whose memory passed this (default 48 MiB).
+    #[serde(deserialize_with = "units::opt_size")]
+    pub recycle_above_memory: Option<ByteSize>,
+    /// Most instances alive at once, i.e. concurrent exchanges (default 64).
+    #[serde(deserialize_with = "units::opt_count")]
+    pub max_instances: Option<u64>,
 }
 
 /// One `addons:` entry (§11.1). There is no hook list: an addon has one
@@ -534,6 +596,16 @@ pub struct Addon {
     pub capabilities: Vec<Capability>,
     #[serde(default)]
     pub limits: AddonLimits,
+    /// Named endpoints this addon may call (§11.3).
+    #[serde(default)]
+    pub endpoints: std::collections::BTreeMap<String, Endpoint>,
+    /// The addon's keyed store.
+    #[serde(default)]
+    pub state: AddonState,
+    /// An endpoint (of this addon) that also receives `record(.., audit:
+    /// true)` events.
+    #[serde(default)]
+    pub audit_endpoint: Option<String>,
 }
 
 fn both_directions() -> Vec<Direction> {

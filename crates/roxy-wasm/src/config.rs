@@ -17,8 +17,6 @@ pub enum Capability {
     State,
     /// `flow.record`: structured events in the flow log.
     Record,
-    /// `flow.terminate`: close the connection or quarantine the principal.
-    Terminate,
     /// `flow.metric-get`: read-only metrics.
     Metrics,
     /// `flow.log`: roxy's operational log.
@@ -27,11 +25,10 @@ pub enum Capability {
 
 impl Capability {
     /// Every capability.
-    pub const ALL: [Capability; 6] = [
+    pub const ALL: [Capability; 5] = [
         Capability::Endpoints,
         Capability::State,
         Capability::Record,
-        Capability::Terminate,
         Capability::Metrics,
         Capability::Log,
     ];
@@ -42,7 +39,6 @@ impl Capability {
             Capability::Endpoints => "endpoints",
             Capability::State => "state",
             Capability::Record => "record",
-            Capability::Terminate => "terminate",
             Capability::Metrics => "metrics",
             Capability::Log => "log",
         }

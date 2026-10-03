@@ -11,7 +11,7 @@ use http_body_util::BodyExt;
 use roxy_http::{Body, BodyError};
 use roxy_wasm::{
     EndpointError, FlowInfo, HostError, Layer, LayerConfig, LayerError, LayerHost, LayerOutcome,
-    LayerRequest, LayerResponse, LogLevel, Principal, TerminateScope, WasmRuntime, async_trait,
+    LayerRequest, LayerResponse, LogLevel, Principal, WasmRuntime, async_trait,
 };
 use tokio::sync::oneshot;
 
@@ -140,16 +140,6 @@ impl LayerHost for Mock {
     async fn record(&self, kind: String, json: String, audit: bool) -> Result<(), HostError> {
         self.call(format!("record {kind} {json} {audit}"));
         Ok(())
-    }
-
-    async fn terminate(
-        &self,
-        scope: TerminateScope,
-        reason: String,
-        ttl_ms: Option<u64>,
-    ) -> Result<bool, HostError> {
-        self.call(format!("terminate {scope:?} {reason} {ttl_ms:?}"));
-        Ok(true)
     }
 
     async fn state_get(&self, key: String) -> Result<Option<String>, HostError> {

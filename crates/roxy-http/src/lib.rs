@@ -21,6 +21,7 @@
 mod chars;
 pub mod h1;
 pub mod h2map;
+pub mod layer;
 pub mod model;
 pub mod upstream;
 pub mod url;

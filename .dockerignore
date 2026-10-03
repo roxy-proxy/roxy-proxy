@@ -3,6 +3,7 @@
 !Cargo.toml
 !Cargo.lock
 !crates/
+!wit/
 !examples/docker/roxy.yaml
 # rust-toolchain.toml is left out on purpose: inside the build image it would
 # make rustup download "stable" instead of using the pinned image's toolchain.

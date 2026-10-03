@@ -19,7 +19,6 @@ pub use config::{Capabilities, Capability, LayerConfig, LayerLimits};
 pub use error::{Budget, LayerError, LoadError};
 pub use exchange::LayerOutcome;
 pub use host::{
-    EndpointError, FlowInfo, HostError, LayerHost, LayerRequest, LayerResponse, LogLevel,
-    Principal, TerminateScope,
+    EndpointError, FlowInfo, HostError, LayerHost, LayerRequest, LayerResponse, LogLevel, Principal,
 };
 pub use runtime::{Layer, WasmRuntime};
