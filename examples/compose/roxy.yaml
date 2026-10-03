@@ -1,0 +1,40 @@
+# Policy for the compose quickstart. Validate with:
+#   docker run --rm -v ./roxy.yaml:/etc/roxy/roxy.yaml:ro ghcr.io/roxy-proxy/roxy:edge \
+#     check --config /etc/roxy/roxy.yaml
+version: 1
+
+listeners:
+  - name: proxy
+    bind: 0.0.0.0:3128
+
+ca_server:
+  bind: 0.0.0.0:3130          # /roxy-ca.pem (the agent fetches it) and /healthz
+
+tls:
+  ca_dir: /var/lib/roxy/ca
+
+log:
+  flow:
+    connection_events: false  # flow log to stdout: `docker compose logs roxy`
+
+# Anything no rule allows is denied. A matching deny always beats an allow.
+default: deny
+
+rules:
+  - id: example-reads
+    when: host == "example.com" and method in [GET, HEAD]
+    then: allow
+
+  - id: echo-service
+    when: host == "postman-echo.com" and path starts_with "/"
+    then: allow
+
+  # A watching rule: it reads body.bytes, so it checks the upload as it
+  # streams and stops it at the chunk that crosses 1 MiB.
+  - id: upload-cap
+    when: body.bytes > 1mb
+    then: { deny: { status: 413, message: "upload too large" } }
+
+  - id: no-admin-paths
+    when: path starts_with "/admin"
+    then: deny
