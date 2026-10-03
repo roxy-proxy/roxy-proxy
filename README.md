@@ -1,25 +1,38 @@
 # roxy
 
-roxy is a TLS-inspecting HTTP firewall for containing the network traffic of
-(potentially adversarial) AI agents. It runs as an explicit `HTTP_PROXY`,
-terminates TLS with leaf certificates minted by its own CA, parses every
-request into a strict canonical model, and re-serialises it in one
-unambiguous wire form, so smuggling and header-injection tricks never reach
-the upstream. It fails closed: anything it cannot parse, verify or classify
-is dropped, the default is to deny anything no rule allows, and a policy
-input it cannot read (a metric, a list, a body) denies rather than allows.
+roxy is a strict, programmable HTTP firewall and egress proxy. Clients use
+it as an explicit `HTTP_PROXY`. It terminates TLS with leaf certificates
+minted by its own CA, parses every request into a strict canonical model,
+and re-serialises it in one unambiguous wire form, so smuggling and
+header-injection tricks never reach the upstream. Every exchange then runs
+through a pipeline you control:
 
-Policy is a YAML file with a small, statically typed rule language, stateful
-metrics for rate and budget limits, address denylists, and secret injection
-so the agent only ever holds placeholders. Every decision lands in a
-structured JSONL flow log with the rule that made it, and traffic can be
-captured to disk. See [DESIGN.md](DESIGN.md) for the design, threat model
-and roadmap.
+- **Rules:** a YAML policy with a small, statically typed rule language.
+  Deny always wins, there is an explicit default, and rules can keep
+  watching an exchange as its bodies stream. Stateful metrics give rate and
+  byte budgets, address lists give deny lists, and secret injection means
+  clients only ever hold placeholders.
+- **Addons:** plugin layers above the rules that own both streams: WASM
+  components run in-process, or external services the traffic streams
+  through. They can rewrite, withhold, score, answer or block traffic,
+  call out to other services, and keep state. Whatever they let through is
+  still judged by the rules.
+- **Audit:** a structured JSONL flow log with the rule or addon behind
+  every decision, and optional capture of traffic to disk.
+
+It fails closed. Anything it cannot parse, verify or classify is dropped,
+the default denies anything no rule allows, and a failing input or addon
+denies rather than allows. That makes it a good fit wherever outbound HTTP
+needs a hard boundary: untrusted or semi-trusted workloads such as AI
+agents, CI jobs, sandboxes and third-party code; an egress gateway for a
+fleet; or a place to plug in inspection, redaction and policy without
+touching the clients. See [DESIGN.md](DESIGN.md) for the design, threat
+model and roadmap.
 
 ## Quickstart
 
-[`examples/compose`](examples/compose) runs an "agent" container (curl) whose
-only way to the internet is through roxy:
+[`examples/compose`](examples/compose) runs a client container (curl, the
+`agent` service) whose only way to the internet is through roxy:
 
 ```
             sandbox (internal: no route out)          egress
@@ -32,14 +45,14 @@ only way to the internet is through roxy:
 ```sh
 cd examples/compose
 docker compose up -d --wait     # ghcr.io/roxy-proxy/roxy:edge; add --build to build this checkout
-./demo.sh                       # what the agent can and cannot do
+./demo.sh                       # what the client can and cannot do
 docker compose logs roxy        # roxy's flow log: one JSON line per decision
 docker compose down -v
 ```
 
-`demo.sh` runs these from inside the agent:
+`demo.sh` runs these from inside the client:
 
-| from the agent | result |
+| from the client | result |
 |---|---|
 | `curl https://example.com/` | `200`: rule `example-reads` allows it |
 | `curl https://www.wikipedia.org/` | `403` from roxy: no rule allows it (`_default`) |
@@ -49,9 +62,9 @@ docker compose down -v
 | `curl --noproxy '*' https://1.1.1.1/` | fails: no route |
 
 **Containment comes from the network, not from the proxy settings.** roxy
-is an explicit proxy, not a transparent gateway. The agent's
+is an explicit proxy, not a transparent gateway. The client's
 `HTTPS_PROXY` only tells well-behaved clients where roxy is. What contains
-the agent is that it sits only on an `internal: true` Docker network, which
+the client is that it sits only on an `internal: true` Docker network, which
 has no route out and no outside DNS, and that roxy is the only container on
 both that network and one with a route out. A client that ignores the proxy
 variables, or a library that opens its own sockets, gets nowhere.
@@ -66,10 +79,10 @@ the running one stays (see `docker compose logs roxy`). Restart instead
 ## Why an explicit HTTP proxy
 
 roxy is deliberately an explicit `HTTP_PROXY`, not a transparent TCP
-gateway. That is a defensive choice: the interface it exposes to the agent
+gateway. That is a defensive choice: the interface it exposes to clients
 is as narrow as it can be while still being useful.
 
-- **One protocol, parsed strictly.** The agent can speak HTTP/1.1 or HTTP/2
+- **One protocol, parsed strictly.** A client can speak HTTP/1.1 or HTTP/2
   to roxy, and nothing else. `CONNECT` only opens a tunnel that roxy
   intercepts as TLS (or, if allowed, plain HTTP). Raw TCP never passes
   through. A TCP gateway forwards every protocol, so it either relays bytes
@@ -82,56 +95,62 @@ is as narrow as it can be while still being useful.
   original-destination address to spoof or race.
 - **Nothing is implicit.** A client that bypasses the proxy should reach
   nothing. Every other egress path is closed by the network
-  ([see below](#containing-your-own-agent)); roxy does not rely on the client
+  ([see below](#containing-a-workload)); roxy does not rely on the client
   choosing to use the proxy. Everything that does reach roxy is decided
   by a rule, and anything it cannot classify is dropped.
 
-The narrower the interface, the fewer ways an adversarial agent has to
+The narrower the interface, the fewer ways an adversarial client has to
 make roxy misread what it is sending. Transparent mode is designed
 (DESIGN.md §4.2), but it is deferred and will feed the same pipeline.
 
 ## Extending roxy
 
-roxy knows HTTP, not model APIs. Logic that needs to understand the
-traffic belongs in an **addon**: a layer that sits above the rules in each
-exchange and owns both streams. An addon can read, rewrite, withhold or
-replace request and response bodies chunk by chunk; deny or answer
-directly; call named endpoints (for example a monitor model) with
-credentials roxy attaches and the layer never sees; and record audit
-events or quarantine a principal (DESIGN.md §11).
+roxy itself knows HTTP, not any particular application or API. Logic that
+needs to understand the traffic goes in an **addon**: a plugin layer that
+sits above the rules in every exchange and owns both streams. An addon can:
 
-Addons can never weaken containment. Whatever an addon sends on is
-re-validated and judged by the rules as if the agent had sent it, every
+- read, rewrite, withhold or replace request and response bodies, chunk by
+  chunk as they stream;
+- deny, or answer directly;
+- call named endpoints (a classifier, a model, an internal API) with
+  credentials roxy attaches and the addon never sees;
+- keep per-principal state, record structured audit events, and
+  quarantine a client.
+
+Addons stack in the order configured, and run in one of two modes:
+`enforce` (in the path) or `observe` (gets a copy, cannot affect traffic).
+
+Addons cannot weaken the boundary. Whatever an addon sends on is
+re-validated and judged by the rules as if the client had sent it. Every
 addon runs under CPU, memory and time budgets, and any failure denies the
-flow.
+flow (DESIGN.md §11).
 
-- **WASM components** run in-process, sandboxed, with no filesystem,
+- **WASM components** run in-process and sandboxed, with no filesystem,
   sockets or environment. Write them in Rust with the
   [`roxy-addon`](crates/roxy-addon) SDK, or in any language that targets
   the WebAssembly component model, against [`wit/addon.wit`](wit/addon.wit).
 - **Service layers** stream the exchange through an external HTTP service,
-  for logic that is easier to run out of process (DESIGN.md §11.6).
+  for logic in any language that is easier to run out of process (DESIGN.md
+  §11.6).
 
-The flagship integration is
-[inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel):
-its monitors and control protocols (continue, modify, reject, escalate,
-terminate) running at the network boundary, where the agent cannot bypass
-them. It comes first as a Python sidecar on a service layer. A compiled
-(CPython-in-WASM) build will follow once inspect_sentinel supports one.
-See [`examples/addons`](examples/addons).
+For example, [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel)
+monitors and control protocols can run at the boundary to supervise AI
+agents, where the agent cannot bypass them. That comes as a Python sidecar
+on a service layer first, and as a compiled component once inspect_sentinel
+supports one. See [`examples/addons`](examples/addons).
 
-## Containing your own agent
+## Containing a workload
 
 The same recipe applies outside Docker Compose:
 
-1. **Take away the agent's route out.** Put it in a network namespace,
+1. **Take away the workload's route out.** Put it in a network namespace,
    VM or container network whose only reachable host is roxy: block
    everything else, including direct TCP, UDP and DNS, at the network layer.
-   roxy resolves DNS itself, so the agent needs none.
-2. **Give roxy a route out**, and the agent a route to roxy's proxy port
+   roxy resolves DNS itself, so the workload needs none.
+2. **Give roxy a route out**, and the workload a route to roxy's proxy port
    (3128 in the examples). Keep the CA endpoint (3130) reachable from the
-   agent only if the agent should fetch the CA itself.
-3. **Point the agent at roxy and make it trust roxy's CA.** Get the CA
+   workload only if it should fetch the CA itself.
+3. **Point the workload at roxy and make it trust roxy's CA.** Get the CA
    certificate in one of three ways:
 
    ```sh
@@ -140,7 +159,7 @@ The same recipe applies outside Docker Compose:
    curl -s -x http://<proxy> http://roxy.internal/roxy-ca.pem > roxy-ca.pem   # through the proxy
    ```
 
-   Then, in the agent's environment:
+   Then, in the workload's environment:
 
    ```sh
    export HTTP_PROXY=http://<proxy> HTTPS_PROXY=http://<proxy>
@@ -187,7 +206,7 @@ docker run -d --name roxy \
 | `capture_dir` | traffic capture (§10.2) is off by default. If you set `capture_dir`, mount a volume there (for example `-v roxy-capture:/var/lib/roxy/capture`); the root filesystem is read-only. |
 
 Ports: `3128` is the proxy listener and `3130` is `ca_server`
-(`/roxy-ca.pem`, `/healthz`). Keep `3130` off networks the agent should not
+(`/roxy-ca.pem`, `/healthz`). Keep `3130` off networks the workload should not
 reach if you do not want it to fetch the CA itself.
 
 The image's `HEALTHCHECK` runs `roxy health`, a small built-in HTTP probe
@@ -255,7 +274,7 @@ rules:
   - id: openai
     when: host == "api.openai.com" and path starts_with "/v1/" and method == POST
     then:
-      - set_header: { authorization: "Bearer ${secret:openai}" }   # agent never sees the key
+      - set_header: { authorization: "Bearer ${secret:openai}" }   # the client never sees the key
       - allow
 
   - id: no-writes-burst                    # restricts the allows above

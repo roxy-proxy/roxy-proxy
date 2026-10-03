@@ -155,17 +155,27 @@ log:
 capture_dir: /var/lib/roxy/capture
 
 # Addons sit above the rules, in the order listed: the first sees each
-# request first and each response last. Not in this build; `roxy run`
-# refuses a config with addons.
+# request first and each response last (DESIGN.md §11). Whatever an addon
+# passes on is still judged by the rules.
 addons:
-  - name: pii-scan
-    kind: wasm                   # wasm | service
-    path: /etc/roxy/addons/pii_scan.wasm
+  - name: redact
+    kind: wasm                   # wasm | service (service: not in this build yet)
+    # Built from examples/addons/redact (examples/addons/build.sh).
+    path: /etc/roxy/addons/redact.wasm
     mode: enforce                # enforce (failures fail closed) | observe (tee, log only)
-    config: { threshold: 0.8 }
-    capabilities: [state, log]
-    limits:                      # each optional; defaults to the global setting
+    config: { needles: ["sk-live-"], replacement: "[redacted]" }
+    capabilities: [log]          # endpoints, state, record, terminate, metrics, log
+    limits:                      # each optional
       max_memory: 64mb
-      max_buffered_body_bytes: 1mb
+      max_buffered_body_bytes: 1mb   # default: limits.max_inspect_body_bytes
       step_cpu: 50ms
       fuel_per_step: 100_000_000
+      max_exchange_time: 60s
+      max_instances: 64
+    # endpoints:                 # named outbound calls; the addon never sees these headers
+    #   classifier:
+    #     url: https://classifier.internal:8443/v1/score
+    #     headers: { authorization: "Bearer ${secret:classifier}" }
+    #     timeout: 2s
+    #     retries: 1
+    #     private_ok: true

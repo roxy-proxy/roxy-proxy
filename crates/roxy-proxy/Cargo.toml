@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+roxy-wasm.workspace = true
 arc-swap = "1.9.2"
 base64 = "0.23.1"
 bcrypt = "0.19.3"

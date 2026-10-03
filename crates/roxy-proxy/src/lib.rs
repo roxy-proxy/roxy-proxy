@@ -37,6 +37,7 @@
 //! around both by adding header lines after the status line and closing the
 //! stream itself after the codec is dropped.
 
+pub mod addons;
 pub mod addr;
 pub mod addrlist;
 pub mod auth;

@@ -39,6 +39,8 @@ pub(crate) struct Snapshot {
     /// Address lists for `ip in @name` (and, resolved into the upstream's
     /// address policy, `upstream.deny_lists`).
     pub address_lists: Arc<AddressLists>,
+    /// The addon stack, outermost first.
+    pub addons: Arc<[Arc<crate::addons::AddonSpec>]>,
 }
 
 /// Per-client and global connection counting (§12).
@@ -106,6 +108,10 @@ pub(crate) struct Shared {
     pub enable_h2: bool,
     pub connection_events: bool,
     pub pipeline: Pipeline,
+    /// Principals an addon quarantined (§11.3); survives reloads.
+    pub quarantine: crate::addons::store::Quarantine,
+    /// Each addon's keyed store, by addon name; survives reloads.
+    pub layer_state: crate::addons::store::LayerStates,
     caps: Arc<ConnCaps>,
     /// Stop accepting; idle connections end.
     pub stop: CancellationToken,
@@ -188,6 +194,7 @@ fn build_snapshot(u: PolicyUpdate, tls: &Arc<ClientConfig>) -> Result<Snapshot, 
         flags: Arc::new(u.flags),
         upstream: Arc::new(upstream),
         address_lists: u.address_lists,
+        addons: u.addons.into(),
     })
 }
 
@@ -265,6 +272,8 @@ impl Server {
             enable_h2: cfg.enable_h2,
             connection_events: cfg.connection_events,
             pipeline: Pipeline::builtin(),
+            quarantine: crate::addons::store::Quarantine::default(),
+            layer_state: crate::addons::store::LayerStates::default(),
             caps: Arc::new(ConnCaps {
                 max: cfg.max_connections.max(1),
                 max_per_client: cfg.max_connections_per_client.max(1),

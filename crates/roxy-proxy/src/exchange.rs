@@ -206,10 +206,29 @@ pub(crate) async fn process<F: Front>(
     cx: &mut FlowCx,
     req: CanonicalRequest,
 ) -> Outcome {
-    let shared = cx.shared.clone();
     // Audit backpressure (§10.1): an exchange starts only while the flow
     // log keeps up.
-    crate::flowlog::sink_ready(&*shared.sink).await;
+    crate::flowlog::sink_ready(&*cx.shared.sink).await;
+    // The fixed quarantine gate runs before any addon sees bytes (§11.1).
+    if let Some(refusal) = crate::addons::quarantine_gate(cx) {
+        return Outcome::Refuse(refusal);
+    }
+    if cx.snap.addons.is_empty() {
+        core(front, cx, req).await
+    } else {
+        crate::addons::run(front, cx, req).await
+    }
+}
+
+/// The exchange below the addons: request stages (the rules) → upstream →
+/// response stages. Reached directly when no addon is configured, and from
+/// the last layer's `next` otherwise.
+pub(crate) async fn core<F: Front>(
+    front: &mut F,
+    cx: &mut FlowCx,
+    req: CanonicalRequest,
+) -> Outcome {
+    let shared = cx.shared.clone();
     let verdict = run_request_stages(&shared.pipeline, cx, req, front).await;
     // Exhaustive, no wildcard: only `Continue` reaches the upstream.
     match verdict {

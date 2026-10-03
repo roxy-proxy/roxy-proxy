@@ -58,8 +58,12 @@ pub fn unsupported(config: &Config, caps: Capabilities) -> Vec<String> {
     if !caps.state_store && actions().any(|a| matches!(a, Action::SetState(_))) {
         out.push("`set_state` needs a state store, which is not in this build".into());
     }
-    if !config.addons.is_empty() {
-        out.push("WASM addons are not in this build (`addons`)".into());
+    if config
+        .addons
+        .iter()
+        .any(|a| a.kind == crate::config::AddonKind::Service)
+    {
+        out.push("service addons (`kind: service`) are not in this build yet".into());
     }
     if config.compile_policy().is_ok_and(|p| p.reads_ws()) {
         out.push(
@@ -131,6 +135,8 @@ pub fn policy_update(config: &Config) -> anyhow::Result<PolicyUpdate> {
         upstream: config.into(),
         address_lists: Arc::new(address_lists),
         deny_lists: config.upstream.deny_lists.clone(),
+        // Loaded separately (async): see `AddonLoader`.
+        addons: Vec::new(),
     })
 }
 
@@ -221,6 +227,8 @@ pub struct Reloader {
     /// The file watcher, told about the current address list files on
     /// every reload attempt.
     watch: OnceLock<Arc<Watch>>,
+    /// Compiles addons, keeping unchanged ones across reloads.
+    addons: Arc<crate::addons::AddonLoader>,
 }
 
 impl std::fmt::Debug for Reloader {
@@ -295,7 +303,11 @@ impl Reloader {
             if !bad.is_empty() {
                 return Err(bad);
             }
-            let update = policy_update(&config).map_err(|e| vec![format!("{e:#}")])?;
+            let mut update = policy_update(&config).map_err(|e| vec![format!("{e:#}")])?;
+            update.addons = self
+                .addons
+                .load_blocking(&config)
+                .map_err(|e| vec![format!("{e:#}")])?;
             Ok((config, update))
         };
         let result = attempt().and_then(|(config, update)| {
@@ -502,7 +514,9 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
     if !bad.is_empty() {
         return Err(anyhow!("cannot run this config: {}", bad.join("; ")));
     }
-    let update = policy_update(&config)?;
+    let mut update = policy_update(&config)?;
+    let addon_loader = Arc::new(crate::addons::AddonLoader::default());
+    update.addons = addon_loader.load(&config).await?;
     let (metric_source, builtin_metrics): (
         Arc<dyn MetricSource>,
         Option<Arc<crate::stores::ReloadableMetrics>>,
@@ -566,6 +580,7 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
         last: Mutex::new(config.clone()),
         metrics: builtin_metrics,
         watch: OnceLock::new(),
+        addons: addon_loader,
     });
     let watcher = if opts.watch {
         Some(spawn_watcher(path, &config, reloader.clone())?)

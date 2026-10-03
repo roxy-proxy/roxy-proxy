@@ -77,6 +77,10 @@ pub struct PolicyUpdate {
     /// floor in the connector. A name missing from `address_lists` fails
     /// the snapshot build (startup error / failed reload).
     pub deny_lists: Vec<String>,
+    /// The addon stack, outermost first (§11.1). Swapped with the rest of
+    /// the policy: new exchanges use the new stack, in-flight ones finish
+    /// on theirs.
+    pub addons: Vec<Arc<crate::addons::AddonSpec>>,
 }
 
 impl std::fmt::Debug for PolicyUpdate {

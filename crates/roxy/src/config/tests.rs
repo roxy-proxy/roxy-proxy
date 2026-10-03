@@ -77,10 +77,7 @@ fn full_example_parses_and_validates() {
     );
     assert_eq!(cfg.address_lists.len(), 1);
     assert_eq!(cfg.upstream.deny_lists, ["cloud-metadata"]);
-    assert_eq!(
-        cfg.addons[0].capabilities,
-        vec![Capability::State, Capability::Log]
-    );
+    assert_eq!(cfg.addons[0].capabilities, vec![Capability::Log]);
 }
 
 #[test]

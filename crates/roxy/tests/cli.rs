@@ -141,15 +141,32 @@ fn ca_init_and_export() {
 }
 
 #[test]
-fn run_refuses_features_not_in_this_build() {
-    // The full example defines metrics and addons; `check` accepts it but
-    // `run` must refuse with one clear line instead of failing every flow.
-    let out = roxy(&["run", "--config", example("roxy.yaml").to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(1));
-    let err = text(&out.stderr);
-    assert!(err.contains("WASM addons are not in this build"), "{err}");
-    assert!(!err.contains("metric store"), "{err}");
-    assert_eq!(err.trim().lines().count(), 1, "{err}");
+fn run_fails_closed_on_a_bad_addon() {
+    // An addon that cannot be loaded refuses startup with one clear line;
+    // roxy never starts without a configured layer.
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca");
+    for (addon, expect) in [
+        (dir.path().join("missing.wasm"), "addon a: reading"),
+        (dir.path().join("roxy.yaml"), "layer `a`: compile failed"),
+    ] {
+        let cfg = dir.path().join("roxy.yaml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:0 }}]\n\
+                 tls: {{ ca_dir: {:?} }}\naddons: [{{ name: a, path: {:?} }}]\n",
+                ca.to_str().unwrap(),
+                addon.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let out = roxy(&["run", "--config", cfg.to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(1));
+        let err = text(&out.stderr);
+        assert!(err.contains(expect), "{err}");
+        assert!(!err.contains("not in this build"), "{err}");
+    }
 }
 
 #[test]

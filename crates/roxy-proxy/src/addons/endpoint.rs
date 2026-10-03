@@ -1,0 +1,277 @@
+//! Named endpoints (§11.3): outbound calls an addon makes by name.
+//!
+//! roxy resolves the name to a URL, attaches the endpoint's headers
+//! (credentials from secrets, never visible to the addon), applies the
+//! timeout and retries, and enforces the address floor and deny lists. The
+//! call goes straight to the connector: it never passes through the layer
+//! stack or the rules.
+
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use http::header::{CONTENT_LENGTH, HOST};
+use http::{HeaderName, HeaderValue, Uri};
+use roxy_http::upstream::from_upstream_response;
+use roxy_http::{Authority, Body, Scheme};
+use roxy_wasm::{EndpointError, LayerRequest, LayerResponse};
+
+use super::{AddonSpec, EndpointSpec, StackFlow};
+use crate::flowlog::FlowEvent;
+use crate::upstream::{ConnectError, classify};
+
+/// Largest request body an endpoint call carries (it is buffered so a retry
+/// can resend it).
+const MAX_ENDPOINT_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Request fields the addon may not set on an endpoint call: hop-by-hop and
+/// framing fields roxy owns.
+const DROPPED: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
+];
+
+/// `${secret:name}` expanded from the policy snapshot's secrets.
+fn expand(value: &str, secrets: &std::collections::HashMap<String, String>) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(i) = rest.find("${secret:") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + "${secret:".len()..];
+        let end = after.find('}')?;
+        out.push_str(secrets.get(&after[..end])?);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// The URL for a call: the endpoint's URL with the request's path and query
+/// appended.
+fn target(spec: &EndpointSpec, req: &Uri) -> Result<Uri, String> {
+    let base = spec.url.path().trim_end_matches('/');
+    let pq = req.path_and_query().map_or("/", |p| p.as_str());
+    let pq = if pq == "/" && !base.is_empty() {
+        ""
+    } else {
+        pq
+    };
+    let pq = if base.is_empty() && pq.is_empty() {
+        "/"
+    } else {
+        pq
+    };
+    let authority = spec.url.authority().map_or("", |a| a.as_str());
+    let scheme = spec.url.scheme_str().unwrap_or("https");
+    format!("{scheme}://{authority}{base}{pq}")
+        .parse()
+        .map_err(|e| format!("endpoint URL: {e}"))
+}
+
+fn authority_of(uri: &Uri) -> Result<(Scheme, Authority), String> {
+    let scheme = match uri.scheme_str() {
+        Some("http") => Scheme::Http,
+        _ => Scheme::Https,
+    };
+    let raw = uri.authority().map_or("", |a| a.as_str());
+    let authority = roxy_http::url::parse_authority(raw.as_bytes(), scheme.default_port())
+        .map_err(|e| e.to_string())?;
+    Ok((scheme, authority))
+}
+
+/// Calls endpoint `name` of `addon` for the flow `st`.
+pub(crate) async fn call(
+    st: &StackFlow,
+    addon: &AddonSpec,
+    name: &str,
+    req: LayerRequest,
+) -> Result<LayerResponse, EndpointError> {
+    let Some(spec) = addon.endpoints.get(name) else {
+        return Err(EndpointError::NotFound);
+    };
+    let started = Instant::now();
+    let method = req.method().clone();
+    let path = req
+        .uri()
+        .path_and_query()
+        .map_or_else(|| "/".to_owned(), |p| p.as_str().to_owned());
+    let result = attempt_all(st, spec, req).await;
+    let (status, attempts, error) = match &result {
+        Ok((r, n)) => (Some(r.status().as_u16()), *n, None),
+        Err((e, n)) => (None, *n, Some(e.to_string())),
+    };
+    st.shared.sink.emit(&FlowEvent::EndpointCall {
+        ts: chrono::Utc::now(),
+        flow: st.flow.to_string(),
+        conn: st.client.id.to_string(),
+        layer: addon.name.clone(),
+        endpoint: name.to_owned(),
+        method: method.to_string(),
+        path: st.snap.redactor.redact_str(&path).into_owned(),
+        status,
+        attempts,
+        duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        error,
+    });
+    result.map(|(r, _)| r).map_err(|(e, _)| e)
+}
+
+async fn attempt_all(
+    st: &StackFlow,
+    spec: &EndpointSpec,
+    req: LayerRequest,
+) -> Result<(LayerResponse, u32), (EndpointError, u32)> {
+    let fail = |e: String| (EndpointError::Failed(e), 0);
+    let uri = target(spec, req.uri()).map_err(fail)?;
+    let (scheme, authority) = authority_of(&uri).map_err(fail)?;
+    let (parts, body) = req.into_parts();
+    let body = body
+        .collect_up_to(MAX_ENDPOINT_REQUEST_BYTES)
+        .await
+        .map_err(|e| fail(format!("request body: {e}")))?;
+
+    let mut headers = http::HeaderMap::new();
+    for (n, v) in &parts.headers {
+        if !DROPPED.contains(&n.as_str()) && !spec.headers.iter().any(|(h, _)| h == n) {
+            headers.append(n.clone(), v.clone());
+        }
+    }
+    for (n, v) in &spec.headers {
+        let v = expand(v, &st.snap.secrets)
+            .ok_or_else(|| fail(format!("endpoint header {n}: secret not loaded")))?;
+        let v = HeaderValue::from_str(&v).map_err(|_| fail(format!("endpoint header {n}")))?;
+        headers.insert(n.clone(), v);
+    }
+    let host = HeaderValue::from_str(&authority.to_host_header(scheme))
+        .map_err(|_| fail("endpoint host".into()))?;
+    headers.insert(HOST, host);
+    if !body.is_empty() || parts.method != http::Method::GET {
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
+    }
+
+    let upstream = st.snap.upstream.clone();
+    if let Err(e) = upstream.preflight(&authority, spec.private_ok).await {
+        return Err((connect_error(&e), 1));
+    }
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let last = attempt > spec.retries;
+        let mut r = http::Request::new(Body::from_bytes(Bytes::clone(&body)));
+        *r.method_mut() = parts.method.clone();
+        *r.uri_mut() = uri.clone();
+        *r.headers_mut() = headers.clone();
+        let sent =
+            tokio::time::timeout(spec.timeout, upstream.client(spec.private_ok).request(r)).await;
+        let err = match sent {
+            Ok(Ok(res)) => {
+                let retryable = matches!(res.status().as_u16(), 502..=504);
+                if retryable && !last {
+                    EndpointError::Failed(format!("status {}", res.status()))
+                } else {
+                    let res = from_upstream_response(res, &st.snap.limits);
+                    return Ok((roxy_http::layer::to_layer_response(res), attempt));
+                }
+            }
+            Ok(Err(e)) => match classify(&e) {
+                Some(ce @ ConnectError::Denied(_)) => return Err((connect_error(&ce), attempt)),
+                Some(ce) => connect_error(&ce),
+                None => EndpointError::Failed(crate::upstream::describe(&e)),
+            },
+            Err(_) => EndpointError::Timeout,
+        };
+        if last {
+            return Err((err, attempt));
+        }
+        let backoff = Duration::from_millis(100) * 2u32.saturating_pow(attempt - 1);
+        tokio::time::sleep(backoff.min(Duration::from_secs(2))).await;
+    }
+}
+
+fn connect_error(e: &ConnectError) -> EndpointError {
+    match e {
+        ConnectError::Denied(_) => EndpointError::Denied,
+        ConnectError::Timeout(_) => EndpointError::Timeout,
+        other => EndpointError::Failed(other.to_string()),
+    }
+}
+
+/// POSTs `json` to endpoint `name` of `addon` (audit and terminate
+/// notifications). Failures are logged.
+pub(crate) async fn notify(st: &StackFlow, addon: &AddonSpec, name: &str, json: serde_json::Value) {
+    let mut req = http::Request::new(Body::from_bytes(json.to_string()));
+    *req.method_mut() = http::Method::POST;
+    *req.uri_mut() = Uri::from_static("/");
+    req.headers_mut().insert(
+        HeaderName::from_static("content-type"),
+        HeaderValue::from_static("application/json"),
+    );
+    match call(st, addon, name, req).await {
+        Ok(res) if res.status().is_success() => {}
+        Ok(res) => {
+            tracing::warn!(layer = addon.name, endpoint = name, status = %res.status(), "notification refused");
+        }
+        Err(e) => {
+            tracing::warn!(layer = addon.name, endpoint = name, error = %e, "notification failed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(url: &str) -> EndpointSpec {
+        EndpointSpec {
+            url: url.parse().unwrap(),
+            headers: Vec::new(),
+            timeout: Duration::from_secs(1),
+            retries: 0,
+            private_ok: false,
+        }
+    }
+
+    #[test]
+    fn joins_paths() {
+        let t = |base: &str, req: &str| {
+            target(&spec(base), &req.parse().unwrap())
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            t("https://api.example.com/v1/messages", "/"),
+            "https://api.example.com/v1/messages"
+        );
+        assert_eq!(
+            t("https://api.example.com/v1/", "/score?q=1"),
+            "https://api.example.com/v1/score?q=1"
+        );
+        assert_eq!(
+            t("https://api.example.com", "/"),
+            "https://api.example.com/"
+        );
+        assert_eq!(
+            t("http://ti.internal:8443", "/x"),
+            "http://ti.internal:8443/x"
+        );
+    }
+
+    #[test]
+    fn expands_secrets() {
+        let mut s = std::collections::HashMap::new();
+        s.insert("k".to_owned(), "sk-1".to_owned());
+        assert_eq!(
+            expand("Bearer ${secret:k}", &s).as_deref(),
+            Some("Bearer sk-1")
+        );
+        assert_eq!(expand("${secret:missing}", &s), None);
+        assert_eq!(expand("plain", &s).as_deref(), Some("plain"));
+    }
+}

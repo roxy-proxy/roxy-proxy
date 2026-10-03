@@ -227,6 +227,87 @@ impl Config {
                     "`directions` must name at least one of request, response",
                 ));
             }
+            if let Some(i) = a
+                .capabilities
+                .iter()
+                .position(|c| *c == super::Capability::Secrets)
+            {
+                d.push(Diagnostic::new(
+                    format!("{path}.capabilities[{i}]"),
+                    "the `secrets` capability is not provided: put credentials on an \
+                     endpoint's `headers`, which roxy attaches without the addon seeing them",
+                ));
+            }
+            if a.limits.max_instances == Some(0) {
+                d.push(Diagnostic::new(
+                    format!("{path}.limits.max_instances"),
+                    "must be at least 1",
+                ));
+            }
+            for (name, e) in &a.endpoints {
+                self.validate_endpoint(&format!("{path}.endpoints.{name}"), name, e, d);
+            }
+            for (key, value) in [
+                ("audit_endpoint", &a.audit_endpoint),
+                ("terminate_endpoint", &a.terminate_endpoint),
+            ] {
+                if let Some(n) = value
+                    && !a.endpoints.contains_key(n)
+                {
+                    d.push(Diagnostic::new(
+                        format!("{path}.{key}"),
+                        format!("{n:?} is not one of this addon's `endpoints`"),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn validate_endpoint(
+        &self,
+        path: &str,
+        name: &str,
+        e: &super::Endpoint,
+        d: &mut Vec<Diagnostic>,
+    ) {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        {
+            d.push(Diagnostic::new(
+                path.to_owned(),
+                "endpoint names use letters, digits, `-`, `_` and `.`",
+            ));
+        }
+        match e.url.parse::<http::Uri>() {
+            Ok(u)
+                if matches!(u.scheme_str(), Some("http" | "https"))
+                    && u.authority().is_some()
+                    && u.query().is_none() => {}
+            _ => d.push(Diagnostic::new(
+                format!("{path}.url"),
+                format!(
+                    "{:?} must be an http(s) URL with a host and no query",
+                    e.url
+                ),
+            )),
+        }
+        for (h, v) in &e.headers {
+            if http::HeaderName::from_bytes(h.as_bytes()).is_err() {
+                d.push(Diagnostic::new(
+                    format!("{path}.headers.{h}"),
+                    "invalid header name",
+                ));
+            }
+            for secret in secret_refs(v) {
+                if !self.secrets.contains_key(secret) {
+                    d.push(Diagnostic::new(
+                        format!("{path}.headers.{h}"),
+                        format!("unknown secret {secret:?}"),
+                    ));
+                }
+            }
         }
     }
 
@@ -413,4 +494,17 @@ fn is_list_name(s: &str) -> bool {
     b.next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
         && b.all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+}
+
+/// The names in `${secret:name}` references.
+pub(crate) fn secret_refs(v: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = v;
+    while let Some(i) = rest.find("${secret:") {
+        let after = &rest[i + "${secret:".len()..];
+        let Some(end) = after.find('}') else { break };
+        out.push(&after[..end]);
+        rest = &after[end + 1..];
+    }
+    out
 }

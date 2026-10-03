@@ -178,13 +178,72 @@ pub enum FlowEvent {
         reason: String,
         message: String,
     },
-    /// An addon trapped, timed out, or returned a malformed decision (§11.3).
-    AddonError {
+    /// An addon layer failed (§11.1 invariant 3): a trap, an exceeded
+    /// budget, a missing capability, an invalid request or response. In
+    /// enforce mode the flow was denied (or its body cut); in observe mode
+    /// nothing else happened.
+    LayerError {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,
         flow: String,
-        addon: String,
+        conn: String,
+        layer: String,
+        /// `enforce` or `observe`.
+        mode: String,
+        /// `trap`, `budget:<limit>`, `capability:<name>`, `invalid_request`,
+        /// ...
+        kind: String,
         message: String,
+    },
+    /// A structured event an addon recorded (`flow.record`, §11.3).
+    LayerRecord {
+        #[serde(serialize_with = "ser_ts")]
+        ts: DateTime<Utc>,
+        flow: String,
+        conn: String,
+        layer: String,
+        kind: String,
+        /// The addon's JSON, with secrets redacted.
+        data: serde_json::Value,
+        /// Also sent to the addon's `audit_endpoint`.
+        audit: bool,
+    },
+    /// An addon called a named endpoint (§11.3).
+    EndpointCall {
+        #[serde(serialize_with = "ser_ts")]
+        ts: DateTime<Utc>,
+        flow: String,
+        conn: String,
+        layer: String,
+        endpoint: String,
+        method: String,
+        path: String,
+        status: Option<u16>,
+        attempts: u32,
+        duration_ms: u64,
+        error: Option<String>,
+    },
+    /// An addon quarantined the flow's principal (§11.3 `terminate`).
+    Quarantined {
+        #[serde(serialize_with = "ser_ts")]
+        ts: DateTime<Utc>,
+        flow: String,
+        conn: String,
+        layer: String,
+        principal: String,
+        reason: String,
+        ttl_ms: u64,
+        took_effect: bool,
+    },
+    /// An observe-mode addon fell behind; its copy of the stream was cut
+    /// (the real traffic was not delayed).
+    ObserverLagged {
+        #[serde(serialize_with = "ser_ts")]
+        ts: DateTime<Utc>,
+        flow: String,
+        layer: String,
+        /// `request` or `response`.
+        direction: String,
     },
     /// The upstream address policy refused every connection for the flow
     /// (§7, §7.1): a resolved address is private or on a deny list.
