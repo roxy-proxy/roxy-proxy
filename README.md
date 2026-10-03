@@ -450,13 +450,15 @@ Usable in explicit proxy mode. Built and tested:
 - Traffic capture: heads and bodies as forwarded, per rule or for all
   traffic, written with the same never-drop backpressure as the flow log.
 - A hardened container image (`ghcr.io/roxy-proxy/roxy`, see "Container image").
+- WASM addons (§11): the layer stack in front of the rules, in enforce or
+  observe mode, with named endpoints, keyed state, audit records,
+  quarantine, CPU/memory/time budgets, and WebSocket tunnels. Write them
+  with the [`roxy-addon`](crates/roxy-addon) SDK.
 
 Deferred, with designs in DESIGN.md:
 
-- Running addons in the proxy (§11). The WASM host (`roxy-wasm`), the
-  `roxy-addon` SDK and its example are built and tested, but
-  `roxy run` still refuses a config that defines addons until the layer
-  stack is wired into the proxy. Service layers come after that.
+- Service layers (`kind: service`, §11.6). `roxy run` refuses them for
+  now.
 - Transparent mode (§4.2).
 - WebSocket message rules (§8.2). Byte budgets already apply to WebSockets.
 - A Prometheus endpoint.
