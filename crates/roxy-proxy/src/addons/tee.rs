@@ -162,17 +162,37 @@ pub(crate) async fn observe(
     let real_req = http::Request::from_parts(parts, real_body);
 
     let (tx, rx) = oneshot::channel();
+    let next = ObserverNext {
+        rx: Mutex::new(Some(rx)),
+    };
+    let observer_st = st.clone();
+    let observer_addon = addon.clone();
+    let layer = match &addon.kind {
+        super::AddonImpl::Wasm(l) => l.clone(),
+        super::AddonImpl::Service(svc) => {
+            let svc = svc.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    super::service::observe(&observer_st, index, &svc, copy_req, &next).await
+                {
+                    super::emit_stack_error(
+                        &observer_st,
+                        &observer_addon.name,
+                        &super::StackError::Service(e),
+                        true,
+                    );
+                }
+            });
+            return forward(st, index, &addon.name, real_req, tx).await;
+        }
+    };
     let host = Arc::new(super::host::StackHost {
         st: st.clone(),
         index,
-        observer: Some(ObserverNext {
-            rx: Mutex::new(Some(rx)),
-        }),
+        observer: Some(next),
     });
-    let observer_st = st.clone();
-    let observer_addon = addon.clone();
     tokio::spawn(async move {
-        let result = match observer_addon.layer.handle(host, copy_req).await {
+        let result = match layer.handle(host, copy_req).await {
             Ok(resp) => {
                 // Whatever it answers is discarded, but read to the end so
                 // the layer's own failures surface.
@@ -190,11 +210,23 @@ pub(crate) async fn observe(
         }
     });
 
+    forward(st, index, &addon.name, real_req, tx).await
+}
+
+/// The real exchange below observer `index`; the observer gets a copy of
+/// the response through `tx`.
+async fn forward(
+    st: Arc<StackFlow>,
+    index: usize,
+    name: &str,
+    real_req: LayerRequest,
+    tx: oneshot::Sender<Result<LayerResponse, HostError>>,
+) -> Result<LayerResponse, HostError> {
     let real = super::below(st.clone(), index, real_req).await;
     match real {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
-            let (real_body, copy_body) = tee(body, lag(&st, &addon.name, "response"));
+            let (real_body, copy_body) = tee(body, lag(&st, name, "response"));
             let mut copy = http::Response::new(copy_body);
             *copy.status_mut() = parts.status;
             *copy.headers_mut() = parts.headers.clone();

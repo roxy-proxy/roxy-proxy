@@ -205,21 +205,14 @@ impl Config {
                             "`endpoint` is for `kind: service` addons",
                         ));
                     }
-                }
-                super::AddonKind::Service => {
-                    if a.endpoint.is_none() {
+                    if a.limits.first_byte_timeout.is_some() {
                         d.push(Diagnostic::new(
-                            format!("{path}.endpoint"),
-                            "a `kind: service` addon needs `endpoint`",
-                        ));
-                    }
-                    if a.path.is_some() {
-                        d.push(Diagnostic::new(
-                            format!("{path}.path"),
-                            "`path` is for `kind: wasm` addons",
+                            format!("{path}.limits.first_byte_timeout"),
+                            "`first_byte_timeout` is for `kind: service` addons",
                         ));
                     }
                 }
+                super::AddonKind::Service => Self::validate_service(&path, a, d),
             }
             if a.directions.is_empty() {
                 d.push(Diagnostic::new(
@@ -254,6 +247,71 @@ impl Config {
                     format!("{path}.audit_endpoint"),
                     format!("{n:?} is not one of this addon's `endpoints`"),
                 ));
+            }
+        }
+    }
+
+    /// What only makes sense for, or is refused on, a `kind: service`
+    /// addon (§11.6): it streams through one of its own endpoints, and gets
+    /// no host services and no WASM limits.
+    fn validate_service(path: &str, a: &super::Addon, d: &mut Vec<Diagnostic>) {
+        match &a.endpoint {
+            None => d.push(Diagnostic::new(
+                format!("{path}.endpoint"),
+                "a `kind: service` addon needs `endpoint`",
+            )),
+            Some(n) if !a.endpoints.contains_key(n) => d.push(Diagnostic::new(
+                format!("{path}.endpoint"),
+                format!("{n:?} is not one of this addon's `endpoints`"),
+            )),
+            Some(_) => {}
+        }
+        let mut refuse = |field: &str, why: &str| {
+            d.push(Diagnostic::new(format!("{path}.{field}"), why.to_owned()));
+        };
+        if a.path.is_some() {
+            refuse("path", "`path` is for `kind: wasm` addons");
+        }
+        if !a.capabilities.is_empty() {
+            refuse(
+                "capabilities",
+                "a service layer gets no host services: it calls what it needs itself",
+            );
+        }
+        if !a.config.is_null() {
+            refuse(
+                "config",
+                "`config` is passed to WASM addons; configure the service itself",
+            );
+        }
+        if a.audit_endpoint.is_some() {
+            refuse(
+                "audit_endpoint",
+                "`audit_endpoint` is for `kind: wasm` addons",
+            );
+        }
+        let l = &a.limits;
+        for (field, set) in [
+            ("max_memory", l.max_memory.is_some()),
+            (
+                "max_buffered_body_bytes",
+                l.max_buffered_body_bytes.is_some(),
+            ),
+            ("step_cpu", l.step_cpu.is_some()),
+            ("fuel_per_step", l.fuel_per_step.is_some()),
+            (
+                "recycle_after_exchanges",
+                l.recycle_after_exchanges.is_some(),
+            ),
+            ("recycle_above_memory", l.recycle_above_memory.is_some()),
+            ("max_instances", l.max_instances.is_some()),
+        ] {
+            if set {
+                refuse(
+                    &format!("limits.{field}"),
+                    "a WASM limit; a service layer takes `first_byte_timeout` and \
+                     `max_exchange_time`",
+                );
             }
         }
     }

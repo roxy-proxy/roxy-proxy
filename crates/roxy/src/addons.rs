@@ -11,15 +11,37 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use roxy_proxy::addons::{AddonSpec, EndpointSpec, StateLimits};
+use roxy_proxy::addons::{AddonImpl, AddonSpec, EndpointSpec, ServiceSpec, StateLimits};
 use roxy_wasm::{
     Capabilities, Capability as WasmCap, Layer, LayerConfig, LayerLimits, WasmRuntime,
 };
 
-use crate::config::{Addon, AddonKind, AddonMode, Capability, Config};
+use crate::config::{Addon, AddonKind, AddonMode, Capability, Config, Direction};
 
 /// Endpoint timeout when none is configured.
 const DEFAULT_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
+/// A service layer's `first_byte_timeout` when none is configured.
+const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn service(a: &Addon) -> anyhow::Result<ServiceSpec> {
+    let endpoint = a
+        .endpoint
+        .clone()
+        .ok_or_else(|| anyhow!("addon {}: no `endpoint`", a.name))?;
+    Ok(ServiceSpec {
+        endpoint,
+        request: a.directions.contains(&Direction::Request),
+        response: a.directions.contains(&Direction::Response),
+        first_byte_timeout: a
+            .limits
+            .first_byte_timeout
+            .unwrap_or(DEFAULT_FIRST_BYTE_TIMEOUT),
+        max_exchange_time: a
+            .limits
+            .max_exchange_time
+            .unwrap_or(LayerLimits::default().max_exchange_time),
+    })
+}
 
 /// Compiles and caches addon layers.
 #[derive(Default)]
@@ -141,52 +163,15 @@ impl AddonLoader {
         let mut out = Vec::with_capacity(config.addons.len());
         let mut keep = Vec::new();
         for a in &config.addons {
-            if a.kind != AddonKind::Wasm {
-                return Err(anyhow!(
-                    "addon {}: `kind: service` is not in this build",
-                    a.name
-                ));
-            }
-            let path = a
-                .path
-                .as_ref()
-                .ok_or_else(|| anyhow!("addon {}: no `path`", a.name))?;
-            let bytes = std::fs::read(path)
-                .with_context(|| format!("addon {}: reading {}", a.name, path.display()))?;
-            let lc = layer_config(config, a)?;
-            let key = {
-                let mut h = DefaultHasher::new();
-                bytes.hash(&mut h);
-                format!("{lc:?}").hash(&mut h);
-                h.finish()
-            };
-            let cached = self
-                .cache
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(&a.name)
-                .filter(|(k, _)| *k == key)
-                .map(|(_, l)| l.clone());
-            let layer = if let Some(l) = cached {
-                l
+            let kind = if a.kind == AddonKind::Service {
+                AddonImpl::Service(service(a)?)
             } else {
-                let rt = if let Some(rt) = self.runtime.get() {
-                    rt.clone()
-                } else {
-                    let rt = WasmRuntime::new().map_err(|e| anyhow!("{e}"))?;
-                    self.runtime.get_or_init(|| rt).clone()
-                };
-                let layer = Layer::load(&rt, bytes, lc)
-                    .await
-                    .map_err(|e| anyhow!("{e}"))?;
-                tracing::info!(addon = a.name, tunnel = layer.has_tunnel(), "addon loaded");
-                layer
+                AddonImpl::Wasm(self.wasm(config, a, &mut keep).await?)
             };
-            keep.push((a.name.clone(), key, layer.clone()));
             out.push(Arc::new(AddonSpec {
                 name: a.name.clone(),
                 observe: a.mode == AddonMode::Observe,
-                layer,
+                kind,
                 endpoints: endpoints(a)?,
                 state: state_limits(a),
                 audit_endpoint: a.audit_endpoint.clone(),
@@ -198,6 +183,52 @@ impl AddonLoader {
             cache.insert(name, (key, layer));
         }
         Ok(out)
+    }
+
+    /// Compiles (or reuses) a WASM addon's layer.
+    async fn wasm(
+        &self,
+        config: &Config,
+        a: &Addon,
+        keep: &mut Vec<(String, u64, Layer)>,
+    ) -> anyhow::Result<Layer> {
+        let path = a
+            .path
+            .as_ref()
+            .ok_or_else(|| anyhow!("addon {}: no `path`", a.name))?;
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("addon {}: reading {}", a.name, path.display()))?;
+        let lc = layer_config(config, a)?;
+        let key = {
+            let mut h = DefaultHasher::new();
+            bytes.hash(&mut h);
+            format!("{lc:?}").hash(&mut h);
+            h.finish()
+        };
+        let cached = self
+            .cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&a.name)
+            .filter(|(k, _)| *k == key)
+            .map(|(_, l)| l.clone());
+        let layer = if let Some(l) = cached {
+            l
+        } else {
+            let rt = if let Some(rt) = self.runtime.get() {
+                rt.clone()
+            } else {
+                let rt = WasmRuntime::new().map_err(|e| anyhow!("{e}"))?;
+                self.runtime.get_or_init(|| rt).clone()
+            };
+            let layer = Layer::load(&rt, bytes, lc)
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+            tracing::info!(addon = a.name, tunnel = layer.has_tunnel(), "addon loaded");
+            layer
+        };
+        keep.push((a.name.clone(), key, layer.clone()));
+        Ok(layer)
     }
 
     /// [`AddonLoader::load`] from a blocking thread (config reload).

@@ -542,3 +542,30 @@ fn flow_log_settings_validated() {
         );
     }
 }
+
+#[test]
+fn service_addons_validate() {
+    let ok = format!(
+        "{BASE}addons:\n  - name: s\n    kind: service\n    endpoint: svc\n    \
+         directions: [request]\n    limits: {{ first_byte_timeout: 2s, max_exchange_time: 1m }}\n    \
+         endpoints:\n      svc: {{ url: \"http://127.0.0.1:9000/layer\", private_ok: true }}\n"
+    );
+    parse(&ok).validate().unwrap();
+
+    let d = diagnostics(&format!(
+        "{BASE}addons:\n  - name: s\n    kind: service\n    endpoint: nope\n    \
+         capabilities: [log]\n    config: {{ a: 1 }}\n    limits: {{ step_cpu: 1s }}\n    \
+         endpoints:\n      svc: {{ url: \"http://127.0.0.1:9000/\" }}\n  \
+         - name: w\n    path: /w.wasm\n    limits: {{ first_byte_timeout: 1s }}\n"
+    ));
+    let paths: Vec<&str> = d.iter().map(|d| d.path.as_str()).collect();
+    for p in [
+        "addons[0].endpoint",
+        "addons[0].capabilities",
+        "addons[0].config",
+        "addons[0].limits.step_cpu",
+        "addons[1].limits.first_byte_timeout",
+    ] {
+        assert!(paths.contains(&p), "{p} not in {paths:?}");
+    }
+}
