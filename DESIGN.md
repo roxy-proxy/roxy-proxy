@@ -127,6 +127,7 @@ the CA. Any default that would trip a conforming client is a bug.
 | `roxy-rules` | Expression DSL (lexer, parser, type-checker, compiler), rule set, evaluation model, actions, metrics/state store, hot-reload-safe `Policy` snapshot. |
 | `roxy-wasm` | wasmtime component host, WIT world, addon lifecycle, fuel/memory limits, host-call implementations. |
 | `roxy-proxy` | Listeners, connection state machine, flow pipeline, upstream connector (DNS, SSRF policy, pool), WebSocket relay, flow log emission. |
+| `roxy-log` | Buffered single-writer log destinations (§10.1): one writer thread, batching, backpressure, size rotation, compression. Knows bytes, not events; used by the flow log and body capture (§10.2). |
 | `roxy` | Binary: CLI (`run`, `check`, `ca export`, `rule test`), config loading, reload watcher, wiring. |
 | `roxy-addon` | SDK for Rust addon authors: generated WIT bindings + ergonomic wrappers. Published independently. |
 | `wit/` | The `roxy:addon` WIT package. Language-agnostic contract for addons. |
@@ -507,6 +508,7 @@ limits:
   h2_max_header_list_bytes: 64kb
   max_connections_per_client: 256
   max_metric_keys: 100000
+  max_metric_bytes: 256mb
 
 upstream:
   dns:
@@ -767,7 +769,7 @@ Non-terminal (evaluation continues):
 | `tag: name` | all | sets `tag["name"]` for later rules, addons and the log |
 | `log: { level, message }` | all | emits an extra log event |
 | `set_state: { key, value, ttl }` | all | writes to the state store (visible as `state["key"]`) |
-| `capture: request | response | both` | request, response | writes bodies to the capture dir (§10) |
+| `capture: request | response | both` | head rules | tees the exchange's heads and bodies, as forwarded, to the capture log (§10.2) |
 | `call: addon_name` | — | reserved; rejected by the compiler. Addons always run above the rules, in listed order (§11.1) |
 
 Actions are a small closed enum, deliberately. Anything richer is an addon.
@@ -808,7 +810,13 @@ metrics:
 Implementation: `DashMap<KeyTuple, SlidingWindow>` with fixed-bucket sliding
 windows (window / 60 buckets, so a 1-minute window has 1-second resolution).
 `unique` uses a HyperLogLog. Total keys across all metrics are bounded by
-`limits.max_metric_keys`. **When the table is full, a flow that would need a
+`limits.max_metric_keys`, and their approximate memory by
+`limits.max_metric_bytes` (default 256 MiB, at most 64 GiB; each series is
+charged for its key, buckets and a fixed overhead). Running out of bytes is
+treated exactly like running out of keys. On reload the new limits apply at
+once: series whose definition is unchanged are carried over only while they
+fit the new byte budget, and the rest are dropped with a warning. **When the
+table is full, a flow that would need a
 new key is denied** (`_fail_closed`, event `metric_table_full`) rather than
 evicting an existing key: eviction would let an attacker reset their own
 counter by varying the key. Keys are reclaimed only when their window has
@@ -1053,11 +1061,11 @@ that scrubs it from any logged string. Header values for `authorization`,
 in full (`log.redact_headers` to extend). Query strings are logged with
 values redacted by default.
 
-Sinks implement `trait FlowSink { fn emit(&self, event: &FlowEvent); }`:
-`Stdout`, `File` (with size rotation), later `UnixSocket` (live stream),
-`Otlp`.
+Sinks implement `trait FlowSink` (`emit`, plus `poll_ready` for
+backpressure, `flush` and `reopen`): `Stdout`, `File` (with size rotation),
+later `UnixSocket` (live stream), `Otlp`.
 
-**Writing** (`roxy-proxy::logwriter`).
+**Writing** (the `roxy-log` crate).
 Logging is a first-class product feature and an audit trail, so the write
 path is built for many cores and heavy traffic, and it never drops:
 
@@ -1079,6 +1087,13 @@ path is built for many cores and heavy traffic, and it never drops:
   bounded by what in-flight exchanges emit between two checks. A sink
   that fails (disk full, I/O error) stops traffic the same way; it is
   reported, never silently skipped.
+- **Rotation** (`log.flow.max_file_bytes`, `max_files`, `compress`)
+  happens in the writer thread at a batch boundary, so a record never
+  spans two files. The file is renamed to `<path>.<UTC timestamp>-<seq>`
+  (names sort in rotation order), a new one is opened, the oldest beyond
+  `max_files` are deleted and rotated files are optionally gzipped in the
+  background. A failed rotation is a failed write: traffic is held and it
+  is retried. `SIGHUP` reopens the file for external rotation.
 - **Shared with capture.** Body capture (§10.2) and any future "tee all
   traffic" mode use the same writer machinery and the same backpressure,
   fed from the body adapters that already see every forwarded chunk
@@ -1086,12 +1101,60 @@ path is built for many cores and heavy traffic, and it never drops:
 
 ### 10.2 Body capture
 
-`capture` action writes `<capture_dir>/<flow id>.req.body` /
-`.res.body` plus a `.meta.json` with the canonical head. Captured bytes go through the buffered writer
-above (one writer, batching, backpressure), keyed by flow id so they join
-the JSONL events. Capped by
-`limits.max_capture_body_bytes`. Off unless a rule asks for it. Secrets are
-*not* redacted inside bodies (document loudly).
+Captured traffic is one append-only stream, `<capture_dir>/capture.rxc`,
+written through the buffered writer above (one writer for all flows,
+batching, rotation, and backpressure: capture is never dropped; a slow
+disk slows traffic).
+
+**What is captured.** Exchanges a head rule's `capture: request | response
+| both` selects, or every forwarded exchange with `log.capture.all: true`.
+Capture is decided at the request head (a `capture` in a watching rule is
+a compile error) and covers the exchange from its first byte. What is
+captured is what was forwarded: the taps sit in the watcher's body adapters
+(§6.1) and the WebSocket relay pumps, after the watching rules allowed a
+chunk and before it is handed on.
+
+**Format.** Records: one JSON header line, `len` payload bytes, `\n`.
+
+```text
+{"flow":"01J9…","dir":"request","kind":"head","seq":0,"len":187}
+{"method":"POST","url":"https://api.example.com/v1/x","headers":[["content-type","application/json"]]}
+{"flow":"01J9…","dir":"request","kind":"data","seq":1,"len":5}
+hello
+{"flow":"01J9…","dir":"request","kind":"end","seq":2,"len":0,"bytes":5}
+```
+
+- `flow` joins the records to the JSONL flow log.
+- `dir` is `request` (client to upstream) or `response`; the WebSocket
+  relay uses the same names for its two directions.
+- `kind` is one of:
+  - `head`: the canonical head as JSON, as forwarded;
+  - `data`: forwarded bytes;
+  - `truncated`: `limits.max_capture_body_bytes` was reached for this
+    direction, and nothing more of it is captured; carries `cap`;
+  - `end`: carries the total forwarded `bytes`, and `aborted: true` if
+    the direction did not complete.
+- `seq` counts records per flow and direction.
+
+**Secrets.** Injected secret values are redacted in captured head values,
+since the agent never saw them. Bodies are captured as forwarded and are
+**not** redacted.
+
+**Config.** `capture_dir` must be set when roxy starts; capture settings
+are restart-required:
+
+```yaml
+capture_dir: /var/lib/roxy/capture
+log:
+  capture:
+    all: false            # true: tee every forwarded exchange
+    high_water: 64mb      # unwritten capture at which traffic is held
+    max_file_bytes: 1gb   # rotate capture.rxc; absent = never
+    max_files: 20
+    compress: true
+limits:
+  max_capture_body_bytes: 16mb   # per direction per exchange
+```
 
 ### 10.3 Operational logging and metrics
 
@@ -1605,7 +1668,7 @@ socket, never a pass-through. Specifically:
 | parse or canonicalisation error | close connection (400 if a response can still be written) |
 | rule denies | deny response, then close |
 | policy input unavailable (metric store, address list, secret) | deny `503`, `_fail_closed` |
-| metric key table full | deny, `metric_table_full` |
+| metric key table full or byte budget exhausted | deny, `metric_table_full` |
 | body or header limit exceeded mid-stream | close both sides |
 | upstream connect/TLS/DNS failure | `502`, flow logged |
 | layer trap, budget exceeded, or invalid mutation (enforce mode) | deny, `layer_error`; observe-mode layers log only |
@@ -1616,7 +1679,8 @@ socket, never a pass-through. Specifically:
 - Per-client-IP connection cap; global connection cap; accept backpressure.
 - All reads bounded (head size, body size, ClientHello size, WS message size).
 - Timeouts at every stage; idle keep-alive timeout for client connections.
-- Metric/state key cardinality caps with **no eviction**: a full table denies flows needing a new key (§6.4).
+- Metric/state key cardinality caps, plus a metric byte budget
+  (`limits.max_metric_bytes`), with **no eviction**: a full table denies flows needing a new key (§6.4).
 - Leaf cert cache bounded.
 - No allocation proportional to attacker-controlled numbers before validation
   (e.g. `content-length: 10^18` does not pre-allocate).

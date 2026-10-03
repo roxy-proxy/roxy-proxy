@@ -27,10 +27,13 @@ Usable in explicit proxy mode. Built and tested:
   response stream (byte limits, response checks, byte budgets).
 - Header, path, query and redirect actions, and secret injection.
 - Stateful metrics and a state store. Neither ever evicts: a full table
-  denies.
+  denies. Their sizes are set in `limits` (`max_metric_keys`,
+  `max_metric_bytes`, `max_state_entries`).
 - Address denylists, and a private-range floor on the IP actually dialled.
 - WebSocket relay, proxy authentication, and a CA download endpoint.
 - Hot reload, `roxy check`, and the `roxy rule test` dry run.
+- Traffic capture: heads and bodies as forwarded, per rule or for all
+  traffic, written with the same never-drop backpressure as the flow log.
 
 Deferred, with designs in DESIGN.md:
 
@@ -38,7 +41,7 @@ Deferred, with designs in DESIGN.md:
   addons.
 - Transparent mode (§4.2).
 - WebSocket message rules (§8.2). Byte budgets already apply to WebSockets.
-- Body capture and a Prometheus endpoint.
+- A Prometheus endpoint.
 
 ## Quickstart
 
@@ -187,6 +190,44 @@ Secrets and sensitive headers are redacted. Other events include
 `policy_input_unavailable`, `config_reloaded`, `config_reload_failed`,
 `ws_open` and `ws_close`.
 
+The flow log is an audit trail, so roxy never drops a record. One writer
+thread per destination batches writes. If the log falls behind (more than
+`high_water` unwritten) or the disk fails, roxy holds traffic back until it
+catches up rather than losing records. Files can rotate by size:
+
+```yaml
+log:
+  flow:
+    path: /var/log/roxy/flow.jsonl
+    high_water: 8mb          # unwritten log at which traffic is held (default 8mb)
+    max_file_bytes: 100mb    # rotate to flow.jsonl.<UTC timestamp>-<seq>
+    max_files: 10            # keep the newest 10 rotated files
+    compress: true           # gzip rotated files
+```
+
+`SIGHUP` also reopens the file, for external `logrotate`.
+
+### Capturing traffic
+
+roxy can tee the heads and bodies of exchanges to `<capture_dir>/capture.rxc`
+exactly as forwarded. It captures exchanges a rule selects with
+`capture: request | response | both`, or all traffic with
+`log.capture.all: true`. Capture uses the same writer as the flow log: it
+rotates, and it holds traffic back rather than drop data. Bodies are
+captured unredacted. The format is in DESIGN.md §10.2.
+
+```yaml
+capture_dir: /var/lib/roxy/capture
+log:
+  capture:
+    all: true
+    max_file_bytes: 1gb
+    max_files: 20
+    compress: true
+limits:
+  max_capture_body_bytes: 16mb    # per direction per exchange; beyond it, `truncated`
+```
+
 ## Development
 
 ```sh
@@ -199,6 +240,7 @@ cargo test --workspace            # unit, corpus, property and end-to-end tests
 |---|---|
 | `crates/roxy` | binary: CLI, config, secrets, address-list loading, reload, store wiring |
 | `crates/roxy-proxy` | listeners, pipeline, upstream connector, address floor, flow log |
+| `crates/roxy-log` | buffered single-writer log destinations: batching, backpressure, rotation |
 | `crates/roxy-tls` | CA, leaf minting, rustls configs, ClientHello sniffing |
 | `crates/roxy-http` | canonical HTTP model, strict h1 codec, h2 mapping, URL normalisation |
 | `crates/roxy-rules` | rule DSL, policy evaluation, metric and state stores |

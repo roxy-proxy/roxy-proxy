@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context as _, anyhow};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use roxy_proxy::{
-    FileSink, FlowEvent, FlowSink, ListenerSpec, MetricSource, PolicyUpdate, Redactor,
+    CaptureLog, FileSink, FlowEvent, FlowSink, ListenerSpec, MetricSource, PolicyUpdate, Redactor,
     RuntimeConfig, Server, ServerHandle, StateSource, StdoutSink, UserDb,
 };
 use roxy_tls::{Ca, CaError, LeafMinter};
@@ -29,6 +29,8 @@ pub struct Capabilities {
     pub metric_store: bool,
     /// A real [`StateSource`] is plugged in.
     pub state_store: bool,
+    /// A capture log was opened at startup (`capture_dir` was set then).
+    pub capture: bool,
 }
 
 /// Features the config uses that this build cannot run. `roxy check`
@@ -43,8 +45,12 @@ pub fn unsupported(config: &Config, caps: Capabilities) -> Vec<String> {
         ));
     }
     let actions = || config.rules.iter().flat_map(|r| r.then.0.iter());
-    if actions().any(|a| matches!(a, Action::Capture(_))) {
-        out.push("the `capture` action is not in this build".into());
+    if config.uses_capture() && !caps.capture {
+        out.push(
+            "capture needs `capture_dir` set when roxy starts (the capture log is opened at \
+             startup; restart to enable it)"
+                .into(),
+        );
     }
     if actions().any(|a| matches!(a, Action::Call(_))) {
         out.push("the `call` action (addons) is not in this build".into());
@@ -144,12 +150,50 @@ pub fn load_ca(config: &Config) -> anyhow::Result<Ca> {
 
 /// The flow sink configured by `log.flow`.
 pub fn build_sink(config: &Config) -> anyhow::Result<Arc<dyn FlowSink>> {
-    Ok(match &config.log.flow.path {
-        Some(path) => Arc::new(
-            FileSink::open(path).with_context(|| format!("opening flow log {}", path.display()))?,
-        ),
-        None => Arc::new(StdoutSink::new().context("starting the flow log writer")?),
+    let f = &config.log.flow;
+    let opts = roxy_proxy::logging::WriterOptions {
+        high_water: usize::try_from(f.high_water.as_u64()).unwrap_or(usize::MAX),
+        ..roxy_proxy::logging::WriterOptions::default()
+    };
+    Ok(match &f.path {
+        Some(path) => {
+            let rotate = roxy_proxy::logging::RotateOptions {
+                max_file_bytes: f.max_file_bytes.map(|b| b.as_u64()),
+                max_files: f.max_files,
+                compress: f.compress,
+            };
+            Arc::new(
+                FileSink::open_with(path, opts, rotate)
+                    .with_context(|| format!("opening flow log {}", path.display()))?,
+            )
+        }
+        None => Arc::new(StdoutSink::with_options(opts).context("starting the flow log writer")?),
     })
+}
+
+/// The capture log under `capture_dir`, if set (§10.2).
+pub fn build_capture(config: &Config) -> anyhow::Result<Option<Arc<CaptureLog>>> {
+    let Some(dir) = &config.capture_dir else {
+        return Ok(None);
+    };
+    let c = &config.log.capture;
+    let opts = roxy_proxy::CaptureOptions {
+        max_body_bytes: config.limits.max_capture_body_bytes.as_u64(),
+        all: c.all,
+        writer: roxy_proxy::logging::WriterOptions {
+            high_water: usize::try_from(c.high_water.as_u64()).unwrap_or(usize::MAX),
+            ..roxy_proxy::logging::WriterOptions::default()
+        },
+        rotate: roxy_proxy::logging::RotateOptions {
+            max_file_bytes: c.max_file_bytes.map(|b| b.as_u64()),
+            max_files: c.max_files,
+            compress: c.compress,
+        },
+    };
+    let log = CaptureLog::open(dir, opts)
+        .with_context(|| format!("opening the capture log in {}", dir.display()))?;
+    tracing::info!(path = %log.path().display(), all = c.all, "capturing traffic");
+    Ok(Some(Arc::new(log)))
 }
 
 /// Optional overrides for [`start`].
@@ -219,6 +263,12 @@ fn restart_required(old: &Config, new: &Config) -> Vec<&'static str> {
     if d(&old.log.flow, &new.log.flow) {
         out.push("log.flow");
     }
+    if d(&old.capture_dir, &new.capture_dir)
+        || d(&old.log.capture, &new.log.capture)
+        || old.limits.max_capture_body_bytes != new.limits.max_capture_body_bytes
+    {
+        out.push("capture_dir / log.capture / limits.max_capture_body_bytes");
+    }
     out
 }
 
@@ -252,7 +302,7 @@ impl Reloader {
             let next_metrics = self
                 .metrics
                 .as_ref()
-                .map(|m| m.prepare(&update.policy, config.limits.max_metric_keys));
+                .map(|m| m.prepare(&update.policy, config.limits.metric_limits()));
             self.handle.reload(update).map_err(|e| vec![e])?;
             if let (Some(m), Some(next)) = (&self.metrics, next_metrics) {
                 m.install(next);
@@ -409,10 +459,30 @@ impl std::fmt::Debug for Running {
 }
 
 impl Running {
+    /// Reopens file log destinations (after external rotation; `SIGHUP`).
+    pub fn reopen_logs(&self) {
+        let h = self.server.handle();
+        h.sink().reopen();
+        if let Some(c) = h.capture() {
+            c.reopen();
+        }
+    }
+
     /// Graceful shutdown (§12): stop accepting, drain for up to `grace`.
     pub async fn shutdown(self, grace: Duration) {
         drop(self.watcher);
+        let sink = self.server.handle().sink();
+        let capture = self.server.handle().capture();
         self.server.shutdown(grace).await;
+        // Everything logged and captured so far reaches its destination
+        // before exit.
+        let _ = tokio::task::spawn_blocking(move || {
+            sink.flush();
+            if let Some(c) = capture {
+                c.flush();
+            }
+        })
+        .await;
     }
 }
 
@@ -426,6 +496,7 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
     let caps = Capabilities {
         metric_store: true,
         state_store: true,
+        capture: config.capture_dir.is_some(),
     };
     let bad = unsupported(&config, caps);
     if !bad.is_empty() {
@@ -440,7 +511,7 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
     } else {
         let b = Arc::new(crate::stores::ReloadableMetrics::new(
             &update.policy,
-            config.limits.max_metric_keys,
+            config.limits.metric_limits(),
         ));
         (b.clone(), Some(b))
     };
@@ -478,6 +549,7 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
         max_connections_per_client: config.limits.max_connections_per_client,
         connection_events: config.log.flow.connection_events,
         sink,
+        capture: build_capture(&config)?,
         metrics: metric_source,
         state: opts.state.unwrap_or_else(|| {
             Arc::new(crate::stores::BuiltinState::new(
@@ -515,6 +587,47 @@ mod tests {
         Config::from_yaml(yaml).unwrap()
     }
 
+    /// `log.flow` rotation settings reach the file sink: emitting past
+    /// `max_file_bytes` rotates, and nothing is lost.
+    #[test]
+    fn flow_log_rotates_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flow.jsonl");
+        let c = cfg(&format!(
+            "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:3128 }}]\nlog:\n  flow:\n    \
+             path: {}\n    max_file_bytes: 4kb\n    max_files: 100\n",
+            path.display()
+        ));
+        c.validate().unwrap();
+        let sink = build_sink(&c).unwrap();
+        for i in 0..200 {
+            sink.emit(&FlowEvent::ConfigLoaded {
+                ts: chrono::Utc::now(),
+                path: format!("/etc/roxy/{i}.yaml").into(),
+                listeners: vec!["p".into()],
+                rules: i,
+                metrics: 0,
+                addons: 0,
+            });
+            if i % 20 == 0 {
+                sink.flush();
+            }
+        }
+        sink.flush();
+        let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(files.len() > 2, "rotated: {files:?}");
+        let lines: usize = files
+            .into_iter()
+            .map(|e| {
+                std::fs::read_to_string(e.unwrap().path())
+                    .unwrap()
+                    .lines()
+                    .count()
+            })
+            .sum();
+        assert_eq!(lines, 200);
+    }
+
     #[test]
     fn plain_policies_are_supported() {
         let c = cfg("version: 1\nrules:\n  - id: a\n    when: host == \"x\"\n    then: allow\n");
@@ -539,7 +652,7 @@ rules:
       - allow
 ");
         let bad = unsupported(&c, Capabilities::default()).join("\n");
-        for needle in ["no metric store", "`capture`", "`call`", "`set_state`"] {
+        for needle in ["no metric store", "capture_dir", "`call`", "`set_state`"] {
             assert!(bad.contains(needle), "{needle}: {bad}");
         }
         let with_stores = unsupported(
@@ -547,11 +660,13 @@ rules:
             Capabilities {
                 metric_store: true,
                 state_store: true,
+                capture: true,
             },
         )
         .join("\n");
         assert!(!with_stores.contains("metric store"));
         assert!(!with_stores.contains("set_state"));
+        assert!(!with_stores.contains("capture"));
     }
 
     #[test]

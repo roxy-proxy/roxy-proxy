@@ -14,8 +14,8 @@ use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::Value;
 use support::{
-    H2_HEADERS, H2_RST_STREAM, Harness, LogGate, Opts, SECRET, fnv, h2_get, h2_raw_request, raw,
-    read_head, read_response, read_to_eof,
+    H2_HEADERS, H2_RST_STREAM, Harness, LogGate, Opts, SECRET, capture_body, capture_of, fnv,
+    h2_get, h2_raw_request, raw, read_head, read_response, read_to_eof,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -222,9 +222,21 @@ async fn redirect_changes_target_and_checks_the_new_address() {
     h.stop().await;
 }
 
+/// The upstream echo answers only after reading the whole body, and
+/// `response_header_timeout` currently runs while the request body is
+/// still being sent, so the harness's 2s default can 504 a 32 MiB debug-build
+/// upload on a slow runner. These tests check streaming integrity, not that
+/// timeout.
+const BIG_UPLOAD_LIMITS: &str = "response_header_timeout: 60s";
+
 #[tokio::test(flavor = "multi_thread")]
 async fn large_uploads_stream_intact() {
-    let h = Harness::start(ALLOW_UPSTREAM).await;
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        limits: BIG_UPLOAD_LIMITS,
+        ..Opts::default()
+    })
+    .await;
     let c = h.client();
     // 32 MiB with content-length.
     let data: Vec<u8> = (0..32 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
@@ -1051,6 +1063,40 @@ async fn full_metric_table_denies_new_keys() {
     h.stop().await;
 }
 
+/// `limits.max_metric_bytes` is enforced like the key cap: with a budget
+/// too small for even one series, the first flow that needs a new key is
+/// denied (`_fail_closed`, `metric_table_full`), never served by evicting
+/// (§6.4, §12).
+#[tokio::test(flavor = "multi_thread")]
+async fn tiny_metric_byte_budget_denies_new_keys() {
+    let h = Harness::start_with(Opts {
+        rules: r#"
+  - id: guarded
+    when: host == "upstream.test" and metric.by_path < 1000
+    then: { allow: { private_ok: true } }
+"#,
+        extra: r#"metrics:
+  - id: by_path
+    count: requests
+    where: host == "upstream.test"
+    key: [path]
+    window: 1h
+"#,
+        limits: "max_metric_bytes: 1",
+        ..Opts::default()
+    })
+    .await;
+    let c = h.client();
+    let res = c.get(h.http_url("/a")).send().await.unwrap();
+    assert_eq!(res.status(), 503, "no series fits a 1-byte budget");
+    assert_eq!(res.headers()["x-roxy-rule"], "_fail_closed");
+    let ev = h.wait_events("request", 1).await;
+    assert_eq!(ev[0]["reason"], "metric_table_full", "{ev:#?}");
+    h.wait_events("metric_table_full", 1).await;
+    assert!(h.upstream.seen().is_empty());
+    h.stop().await;
+}
+
 // ----- address lists (§7.1) --------------------------------------------------
 
 /// `upstream.deny_lists` is a hard floor: a hit denies with `403
@@ -1312,7 +1358,12 @@ async fn h2_deny_without_close_keeps_serving() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn h2_large_upload_streams_intact() {
-    let h = Harness::start(ALLOW_UPSTREAM).await;
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        limits: BIG_UPLOAD_LIMITS,
+        ..Opts::default()
+    })
+    .await;
     let data: Vec<u8> = (0..32 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     let want = fnv(&data);
     let res = h
@@ -1809,5 +1860,272 @@ async fn a_stalled_flow_log_holds_traffic() {
         .expect("traffic resumes once the log catches up")
         .unwrap();
     assert_eq!(status, 200);
+    h.stop().await;
+}
+
+// ----- capture (§10.2) -------------------------------------------------------
+
+fn flow_of(ev: &[Value], path: &str) -> String {
+    ev.iter()
+        .find(|e| e["req"]["path"] == path)
+        .unwrap_or_else(|| panic!("no request event for {path}"))["flow"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// `log.capture.all` tees every forwarded exchange: heads as forwarded and
+/// bodies byte for byte, over h1 with a chunked upload.
+#[tokio::test(flavor = "multi_thread")]
+async fn capture_all_records_exactly_what_was_forwarded_h1() {
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        capture: Some("all: true"),
+        ..Opts::default()
+    })
+    .await;
+    let chunks: Vec<Result<Bytes, std::io::Error>> = (0..20u8)
+        .map(|i| Ok(Bytes::from(vec![i; 16 * 1024])))
+        .collect();
+    let sent: Vec<u8> = (0..20u8).flat_map(|i| vec![i; 16 * 1024]).collect();
+    let res = h
+        .client()
+        .post(h.http_url("/upload?x=1"))
+        .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+            chunks,
+        )))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let got = res.bytes().await.unwrap();
+    let ev = h.wait_events("request", 1).await;
+    let flow = flow_of(&ev, "/upload");
+    let records = h.captured();
+    let req = capture_of(&records, &flow, "request");
+    assert_eq!(req[0].0["kind"], "head");
+    let head: Value = serde_json::from_slice(&req[0].1).unwrap();
+    assert_eq!(head["method"], "POST");
+    assert!(
+        head["url"].as_str().unwrap().ends_with("/upload?x=1"),
+        "{head}"
+    );
+    assert_eq!(fnv(&capture_body(&req)), fnv(&sent));
+    let end = req.last().unwrap();
+    assert_eq!(end.0["kind"], "end");
+    assert_eq!(end.0["bytes"], sent.len());
+    assert!(end.0.get("aborted").is_none(), "{}", end.0);
+    let res_recs = capture_of(&records, &flow, "response");
+    let head: Value = serde_json::from_slice(&res_recs[0].1).unwrap();
+    assert_eq!(head["status"], 200);
+    assert_eq!(capture_body(&res_recs), got.to_vec());
+    assert_eq!(res_recs.last().unwrap().0["kind"], "end");
+    // Sequence numbers count up per direction.
+    let seqs: Vec<u64> = req
+        .iter()
+        .map(|(h, _)| h["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<_>>());
+    h.stop().await;
+}
+
+/// The `capture` action selects exchanges (and directions) at the head;
+/// over h2.
+#[tokio::test(flavor = "multi_thread")]
+async fn capture_action_selects_exchanges_h2() {
+    let h = Harness::start_with(Opts {
+        rules: r#"
+  - id: upstream
+    when: host == "upstream.test"
+    then: { allow: { private_ok: true } }
+  - id: capture-uploads
+    when: path starts_with "/cap"
+    then: { capture: request }
+"#,
+        capture: Some(""),
+        ..Opts::default()
+    })
+    .await;
+    let (send, _conn) = h.h2_client().await;
+    let body = vec![b'q'; 50_000];
+    let req = http::Request::post(h.https_url("/cap/one"))
+        .body(())
+        .unwrap();
+    let mut ready = send.clone().ready().await.unwrap();
+    let (resp, mut stream) = ready.send_request(req, false).unwrap();
+    stream.reserve_capacity(body.len());
+    stream.send_data(Bytes::from(body.clone()), true).unwrap();
+    let res = tokio::time::timeout(Duration::from_secs(10), resp)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let (parts, _) = h2_get(&send, &h.https_url("/other"), &[]).await.unwrap();
+    assert_eq!(parts.status, 200);
+    let ev = h.wait_events("request", 2).await;
+    let cap = flow_of(&ev, "/cap/one");
+    let other = flow_of(&ev, "/other");
+    let records = h.captured();
+    let req = capture_of(&records, &cap, "request");
+    assert_eq!(capture_body(&req), body);
+    assert!(
+        capture_of(&records, &cap, "response").is_empty(),
+        "request only"
+    );
+    assert!(
+        records.iter().all(|(h, _)| h["flow"] != other),
+        "not selected"
+    );
+    h.stop().await;
+}
+
+/// Past `limits.max_capture_body_bytes` capture records `truncated` and the
+/// end still carries the full forwarded byte count; forwarding is unaffected.
+#[tokio::test(flavor = "multi_thread")]
+async fn capture_cap_truncates_explicitly() {
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        capture: Some("all: true"),
+        limits: "max_capture_body_bytes: 1kb",
+        ..Opts::default()
+    })
+    .await;
+    let res = h
+        .client()
+        .post(h.http_url("/capped"))
+        .body(vec![b'z'; 10_000])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(json(&res.bytes().await.unwrap())["body_len"], 10_000);
+    let ev = h.wait_events("request", 1).await;
+    let records = h.captured();
+    let req = capture_of(&records, &flow_of(&ev, "/capped"), "request");
+    assert_eq!(capture_body(&req).len(), 1024);
+    let kinds: Vec<&str> = req
+        .iter()
+        .map(|(h, _)| h["kind"].as_str().unwrap())
+        .collect();
+    assert!(kinds.contains(&"truncated"), "{kinds:?}");
+    assert_eq!(req.last().unwrap().0["bytes"], 10_000);
+    h.stop().await;
+}
+
+/// The WebSocket relay is captured in both directions, byte for byte.
+#[tokio::test(flavor = "multi_thread")]
+async fn capture_websocket_relay() {
+    let h = Harness::start_with(Opts {
+        rules: r#"
+  - id: ws
+    when: host == "ws.test"
+    then: [{ capture: both }, { allow: { upgrade: websocket, private_ok: true } }]
+"#,
+        capture: Some(""),
+        ..Opts::default()
+    })
+    .await;
+    let port = h.upstream.ws.port();
+    let tls = h
+        .tls_tunnel(&format!("ws.test:{port}"), "ws.test")
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::client_async(format!("wss://ws.test:{port}/echo"), tls)
+        .await
+        .unwrap();
+    ws.send(Message::text("captured hello")).await.unwrap();
+    let back = ws.next().await.unwrap().unwrap();
+    assert_eq!(back.into_text().unwrap().as_str(), "captured hello");
+    ws.close(None).await.unwrap();
+    drop(ws);
+    let close = h.wait_events("ws_close", 1).await;
+    let ev = h.wait_events("request", 1).await;
+    let flow = ev[0]["flow"].as_str().unwrap().to_owned();
+    let records = h.captured();
+    let c2s = capture_of(&records, &flow, "request");
+    let s2c = capture_of(&records, &flow, "response");
+    assert_eq!(
+        capture_body(&c2s).len() as u64,
+        close[0]["bytes_c2s"].as_u64().unwrap()
+    );
+    assert_eq!(
+        capture_body(&s2c).len() as u64,
+        close[0]["bytes_s2c"].as_u64().unwrap()
+    );
+    // The server-to-client frame is unmasked: the text is visible.
+    let down = String::from_utf8_lossy(&capture_body(&s2c)).into_owned();
+    assert!(down.contains("captured hello"), "{down:?}");
+    h.stop().await;
+}
+
+/// A capture destination that cannot keep up holds traffic back instead of
+/// dropping captured bytes: `capture.rxc` is a FIFO whose reader does not
+/// read until the test lets it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_capture_log_holds_traffic() {
+    use std::io::Read;
+    let fifo_dir = tempfile::tempdir().unwrap();
+    let fifo = fifo_dir.path().join("capture.rxc");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success(), "mkfifo");
+    // The reader opens the FIFO (pairing with roxy's writer), then waits
+    // for the go signal before draining it.
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel::<usize>();
+    std::thread::spawn(move || {
+        let mut f = std::fs::File::open(&fifo).unwrap();
+        go_rx.recv().unwrap();
+        let mut buf = vec![0u8; 1 << 16];
+        let mut total = 0usize;
+        let mut reported = false;
+        // Report once the whole upload has come through, then keep
+        // draining until the writer closes (at shutdown).
+        loop {
+            match f.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => total += n,
+            }
+            if !reported && total > 1 << 20 {
+                reported = true;
+                let _ = seen_tx.send(total);
+            }
+        }
+    });
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        capture: Some("all: true\nhigh_water: 64kb"),
+        capture_dir: Some(fifo_dir.path()),
+        ..Opts::default()
+    })
+    .await;
+    // 1 MiB: far more than the pipe buffer plus the high-water mark.
+    let c = h.client();
+    let url = h.http_url("/held");
+    let req = tokio::spawn(async move {
+        c.post(url)
+            .body(vec![b'p'; 1 << 20])
+            .send()
+            .await
+            .map(|r| r.status())
+    });
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(
+        !req.is_finished(),
+        "traffic moved while capture was stalled"
+    );
+    go_tx.send(()).unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(20), req)
+        .await
+        .expect("traffic resumes once capture catches up")
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, 200);
+    let seen = seen_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the whole upload was captured");
+    assert!(seen > 1 << 20);
     h.stop().await;
 }

@@ -249,6 +249,11 @@ pub struct Limits {
     #[serde(deserialize_with = "units::size")]
     pub h2_max_header_list_bytes: ByteSize,
     pub max_metric_keys: usize,
+    /// Approximate byte budget across all metric series (§6.4). A flow that
+    /// would take the store past it is denied like a full key table; nothing
+    /// is evicted.
+    #[serde(deserialize_with = "units::size")]
+    pub max_metric_bytes: ByteSize,
     /// Cap on live `set_state` entries; a new key when full denies the flow
     /// that tried (§6.4, no eviction).
     pub max_state_entries: usize,
@@ -282,8 +287,22 @@ impl Default for Limits {
             h2_max_concurrent_streams: 100,
             h2_max_header_list_bytes: ByteSize::b(64 * KIB),
             max_metric_keys: 100_000,
+            max_metric_bytes: ByteSize::b(roxy_rules::DEFAULT_MAX_METRIC_BYTES as u64),
             max_state_entries: 100_000,
             max_address_list_bytes: ByteSize::b(256 * MIB),
+        }
+    }
+}
+
+impl Limits {
+    /// The metric store's bounds. `max_metric_bytes` is validated to fit a
+    /// `usize`; should an unvalidated value not fit, it saturates (the
+    /// budget is a cap, so this can only be reached by a value that is
+    /// already past the validated ceiling).
+    pub fn metric_limits(&self) -> roxy_rules::MetricLimits {
+        roxy_rules::MetricLimits {
+            max_keys: self.max_metric_keys,
+            max_bytes: usize::try_from(self.max_metric_bytes.as_u64()).unwrap_or(usize::MAX),
         }
     }
 }
@@ -527,18 +546,89 @@ fn both_directions() -> Vec<Direction> {
 #[serde(deny_unknown_fields, default)]
 pub struct Log {
     pub flow: FlowLog,
+    /// Body capture / traffic tee (§10.2), written under `capture_dir`.
+    pub capture: CaptureLog,
     /// Extra header names whose values are never logged, on top of the
     /// built-in list.
     pub redact_headers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct FlowLog {
     /// JSONL output file; absent = stdout.
     pub path: Option<PathBuf>,
     /// Also log connection-level (`connect`) events.
     pub connection_events: bool,
+    /// Unwritten log bytes at which traffic is held back (§10.1).
+    #[serde(deserialize_with = "units::size")]
+    pub high_water: ByteSize,
+    /// Rotate `path` once it reaches this size; absent = never rotate.
+    #[serde(deserialize_with = "units::opt_size")]
+    pub max_file_bytes: Option<ByteSize>,
+    /// Keep at most this many rotated files; absent = keep all.
+    pub max_files: Option<usize>,
+    /// Gzip rotated files.
+    pub compress: bool,
+}
+
+impl Default for FlowLog {
+    fn default() -> Self {
+        Self {
+            path: None,
+            connection_events: false,
+            high_water: ByteSize::b(roxy_proxy::logging::DEFAULT_HIGH_WATER as u64),
+            max_file_bytes: None,
+            max_files: None,
+            compress: false,
+        }
+    }
+}
+
+/// `log.capture`: how captured traffic is written (§10.2). Which exchanges
+/// are captured: those a rule's `capture` action selects, or every
+/// forwarded exchange with `all: true`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CaptureLog {
+    /// Capture every forwarded exchange, both directions.
+    pub all: bool,
+    /// Unwritten capture bytes at which traffic is held back.
+    #[serde(deserialize_with = "units::size")]
+    pub high_water: ByteSize,
+    /// Rotate `capture.rxc` once it reaches this size; absent = never.
+    #[serde(deserialize_with = "units::opt_size")]
+    pub max_file_bytes: Option<ByteSize>,
+    /// Keep at most this many rotated files; absent = keep all.
+    pub max_files: Option<usize>,
+    /// Gzip rotated files.
+    pub compress: bool,
+}
+
+impl Default for CaptureLog {
+    fn default() -> Self {
+        Self {
+            all: false,
+            // Captured bodies are bulkier than events: a larger backlog
+            // before traffic is held.
+            high_water: ByteSize::b(64 << 20),
+            max_file_bytes: None,
+            max_files: None,
+            compress: false,
+        }
+    }
+}
+
+impl Config {
+    /// Whether anything captures: a `capture` action or `log.capture.all`.
+    pub fn uses_capture(&self) -> bool {
+        self.log.capture.all
+            || self
+                .rules
+                .iter()
+                .flat_map(|r| r.then.0.iter())
+                .any(|a| matches!(a, Action::Capture(_)))
+    }
 }
 
 // ----- loading --------------------------------------------------------------

@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use roxy_proxy::{MetricSource, MetricSourceError, Sample, StateFull, StateSource};
-use roxy_rules::{FlowView, MetricError, MetricStore, Policy, StateStore};
+use roxy_rules::{FlowView, MetricError, MetricLimits, MetricStore, Policy, StateStore};
 
 /// Default TTL for `set_state` entries written without an explicit `ttl`.
 pub const STATE_DEFAULT_TTL: Duration = Duration::from_secs(3600);
@@ -32,18 +32,23 @@ pub struct ReloadableMetrics {
 }
 
 impl ReloadableMetrics {
-    /// A store for `policy`'s metric definitions, capped at `max_keys`.
-    pub fn new(policy: &Policy, max_keys: usize) -> Self {
+    /// A store for `policy`'s metric definitions, bounded by `limits`
+    /// (`limits.max_metric_keys` and `limits.max_metric_bytes`).
+    pub fn new(policy: &Policy, limits: MetricLimits) -> Self {
         Self {
-            inner: ArcSwap::from_pointee(MetricStore::new(policy.metric_defs(), max_keys)),
+            inner: ArcSwap::from_pointee(MetricStore::with_limits(policy.metric_defs(), limits)),
         }
     }
 
     /// Builds the store for a new policy and copies over every series whose
     /// definition is unchanged. Call [`ReloadableMetrics::install`] with the
     /// result once the policy swap has succeeded; drop it otherwise.
-    pub fn prepare(&self, policy: &Policy, max_keys: usize) -> MetricStore {
-        let next = MetricStore::new(policy.metric_defs(), max_keys);
+    ///
+    /// `limits` are the new config's: a smaller budget than the old store's
+    /// is respected, and series that no longer fit are dropped (and logged)
+    /// rather than carried past it.
+    pub fn prepare(&self, policy: &Policy, limits: MetricLimits) -> MetricStore {
+        let next = MetricStore::with_limits(policy.metric_defs(), limits);
         let report = next.carry_over(&self.inner.load());
         if report.skipped_budget > 0 {
             tracing::warn!(
@@ -120,5 +125,84 @@ impl StateSource for BuiltinState {
 
     fn set(&self, key: &str, value: &str, ttl: Option<Duration>) -> Result<(), StateFull> {
         self.0.set(key, value, ttl).map_err(|_| StateFull)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use roxy_rules::{Field, MapView};
+
+    use super::*;
+    use crate::config::Config;
+
+    const CONFIG: &str = "version: 1\nmetrics:\n  \
+        - { id: by_path, count: requests, key: [path], window: 1h }\n";
+
+    fn policy() -> Policy {
+        let config = Config::from_yaml(CONFIG).unwrap();
+        crate::run::policy_update(&config).unwrap().policy
+    }
+
+    fn limits(max_bytes: usize) -> MetricLimits {
+        MetricLimits {
+            max_keys: 1000,
+            max_bytes,
+        }
+    }
+
+    fn record(m: &ReloadableMetrics, path: &str) -> Result<(), MetricSourceError> {
+        let sample = Sample {
+            head: true,
+            ..Sample::default()
+        };
+        m.record(&MapView::new().with_str(Field::Path, path), &sample)
+    }
+
+    /// A reload that shrinks `limits.max_metric_bytes` carries over only the
+    /// series that fit the new budget, and the new store then refuses new
+    /// keys instead of evicting (§6.4).
+    #[test]
+    fn reload_respects_a_smaller_byte_budget() {
+        let policy = policy();
+        let m = ReloadableMetrics::new(&policy, limits(roxy_rules::DEFAULT_MAX_METRIC_BYTES));
+        record(&m, "/a").unwrap();
+        let per_series = m.inner.load().byte_count();
+        assert!(per_series > 0);
+        for p in ["/b", "/c", "/d"] {
+            record(&m, p).unwrap();
+        }
+        assert_eq!(m.key_count(), 4);
+
+        let budget = 2 * per_series + per_series / 2;
+        let next = m.prepare(&policy, limits(budget));
+        assert_eq!(next.max_bytes(), budget);
+        assert_eq!(next.key_count(), 2, "only two series fit the new budget");
+        assert!(next.byte_count() <= budget);
+        m.install(next);
+
+        let view = |p: &str| MapView::new().with_str(Field::Path, p);
+        let carried = ["/a", "/b", "/c", "/d"]
+            .iter()
+            .filter(|p| m.get("by_path", &view(p)) == Ok(1))
+            .count();
+        assert_eq!(carried, 2);
+        assert!(matches!(
+            record(&m, "/e"),
+            Err(MetricSourceError::TableFull(id)) if id == "by_path"
+        ));
+        assert_eq!(m.key_count(), 2);
+    }
+
+    /// Growing the budget on reload carries everything over.
+    #[test]
+    fn reload_with_a_larger_byte_budget_carries_everything() {
+        let policy = policy();
+        let m = ReloadableMetrics::new(&policy, limits(1 << 20));
+        for p in ["/a", "/b", "/c"] {
+            record(&m, p).unwrap();
+        }
+        let next = m.prepare(&policy, limits(2 << 20));
+        assert_eq!(next.key_count(), 3);
+        assert_eq!(next.max_bytes(), 2 << 20);
     }
 }

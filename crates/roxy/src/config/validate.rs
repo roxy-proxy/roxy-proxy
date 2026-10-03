@@ -36,6 +36,7 @@ impl Config {
         self.validate_address_lists(&mut d);
         self.validate_addons(&mut d);
         self.validate_upstream(&mut d);
+        self.validate_log(&mut d);
 
         if let Err(policy) = self.compile_policy() {
             d.extend(policy);
@@ -319,8 +320,93 @@ impl Config {
                 "must be at least 1",
             ));
         }
+        let metric_bytes = self.limits.max_metric_bytes.as_u64();
+        if metric_bytes == 0 {
+            d.push(Diagnostic::new(
+                "limits.max_metric_bytes",
+                "must be at least 1 byte",
+            ));
+        } else if metric_bytes > MAX_METRIC_BYTES_CEILING || usize::try_from(metric_bytes).is_err()
+        {
+            d.push(Diagnostic::new(
+                "limits.max_metric_bytes",
+                "must be at most 64gb",
+            ));
+        }
     }
 }
+
+impl Config {
+    fn validate_log(&self, d: &mut Vec<Diagnostic>) {
+        let f = &self.log.flow;
+        if f.high_water.as_u64() < 64 * 1024 {
+            d.push(Diagnostic::new(
+                "log.flow.high_water",
+                "must be at least 64kb (traffic is held back whenever this much log is unwritten)",
+            ));
+        }
+        let rotating = f.max_file_bytes.is_some() || f.max_files.is_some() || f.compress;
+        if rotating && f.path.is_none() {
+            d.push(Diagnostic::new(
+                "log.flow",
+                "max_file_bytes, max_files and compress need `path` (stdout cannot rotate)",
+            ));
+        }
+        if f.max_file_bytes.is_none() && (f.max_files.is_some() || f.compress) {
+            d.push(Diagnostic::new(
+                "log.flow.max_file_bytes",
+                "max_files and compress apply to rotated files; set max_file_bytes to rotate",
+            ));
+        }
+        if f.max_file_bytes.is_some_and(|b| b.as_u64() < 4096) {
+            d.push(Diagnostic::new(
+                "log.flow.max_file_bytes",
+                "must be at least 4kb",
+            ));
+        }
+        if f.max_files == Some(0) {
+            d.push(Diagnostic::new(
+                "log.flow.max_files",
+                "must be at least 1 (omit it to keep every rotated file)",
+            ));
+        }
+        let c = &self.log.capture;
+        if self.uses_capture() && self.capture_dir.is_none() {
+            d.push(Diagnostic::new(
+                "capture_dir",
+                "capture (a `capture` action or log.capture.all) needs `capture_dir`",
+            ));
+        }
+        if c.high_water.as_u64() < 64 * 1024 {
+            d.push(Diagnostic::new(
+                "log.capture.high_water",
+                "must be at least 64kb",
+            ));
+        }
+        if c.max_file_bytes.is_none() && (c.max_files.is_some() || c.compress) {
+            d.push(Diagnostic::new(
+                "log.capture.max_file_bytes",
+                "max_files and compress apply to rotated files; set max_file_bytes to rotate",
+            ));
+        }
+        if c.max_file_bytes.is_some_and(|b| b.as_u64() < 4096) {
+            d.push(Diagnostic::new(
+                "log.capture.max_file_bytes",
+                "must be at least 4kb",
+            ));
+        }
+        if c.max_files == Some(0) {
+            d.push(Diagnostic::new(
+                "log.capture.max_files",
+                "must be at least 1 (omit it to keep every rotated file)",
+            ));
+        }
+    }
+}
+
+/// Upper bound on `limits.max_metric_bytes`: well past any sensible
+/// budget, so a unit typo (`256gb` for `256mb`) is caught at load.
+const MAX_METRIC_BYTES_CEILING: u64 = 64 << 30;
 
 fn is_list_name(s: &str) -> bool {
     let mut b = s.bytes();

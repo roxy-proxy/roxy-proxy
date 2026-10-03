@@ -324,7 +324,8 @@ pub async fn start_upstream(ca: &TestCa) -> Upstream {
 pub struct Opts<'a> {
     /// The `rules:` list (YAML, indented by two spaces per item).
     pub rules: &'a str,
-    /// Extra lines under `limits:`.
+    /// Extra lines under `limits:`. A `response_header_timeout` here
+    /// replaces the harness default (2s).
     pub limits: &'a str,
     /// Extra lines under `http:`.
     pub http: &'a str,
@@ -338,6 +339,11 @@ pub struct Opts<'a> {
     pub metrics: Option<Arc<dyn roxy_proxy::MetricSource>>,
     /// Hold the flow sink "behind" (not ready) while the gate is closed.
     pub log_gate: Option<Arc<LogGate>>,
+    /// Lines under `log.capture:`; when set, `capture_dir` is
+    /// `<tempdir>/capture`.
+    pub capture: Option<&'a str>,
+    /// Use this `capture_dir` instead of `<tempdir>/capture`.
+    pub capture_dir: Option<&'a Path>,
 }
 
 /// Makes the test flow sink report backpressure on demand.
@@ -452,8 +458,7 @@ http:
   allow_plain_in_connect: false
 {http}limits:
   header_timeout: 5s
-  response_header_timeout: 2s
-  max_inspect_body_bytes: 1kb
+{response_header_timeout}  max_inspect_body_bytes: 1kb
 {limits}upstream:
   connect_timeout: 2s
 {upstream}  dns:
@@ -469,13 +474,26 @@ secrets:
 log:
   flow:
     connection_events: true
-{extra}rules:
+{capture}{extra}rules:
 {rules}"#,
             dir = dir.display(),
             http = indent(opts.http, 2),
             limits = indent(opts.limits, 2),
+            response_header_timeout = if opts.limits.contains("response_header_timeout") {
+                ""
+            } else {
+                "  response_header_timeout: 2s\n"
+            },
             upstream = indent(opts.upstream, 2),
             extra = opts.extra,
+            capture = opts.capture.map_or_else(String::new, |c| format!(
+                "  capture:\n{}capture_dir: {}\n",
+                indent(if c.trim().is_empty() { "all: false" } else { c }, 4),
+                opts.capture_dir.map_or_else(
+                    || format!("{}/capture", dir.display()),
+                    |d| d.display().to_string()
+                )
+            )),
             rules = if rules.trim().is_empty() {
                 "  []\n".to_owned()
             } else {
@@ -530,6 +548,21 @@ log:
             upstream,
             test_ca,
         }
+    }
+
+    /// Every capture record so far, `(header, payload)`, after flushing
+    /// the capture log.
+    pub fn captured(&self) -> Vec<(Value, Vec<u8>)> {
+        let log = self
+            .running
+            .as_ref()
+            .unwrap()
+            .server
+            .handle()
+            .capture()
+            .expect("capture enabled");
+        assert!(log.flush());
+        parse_capture(&std::fs::read(log.path()).unwrap())
     }
 
     pub fn https_url(&self, path: &str) -> String {
@@ -818,4 +851,39 @@ pub async fn h2_raw_request(h: &Harness, fields: &[(&str, &str)]) -> Vec<(u8, u8
         }
     }
     frames
+}
+
+/// Parses a capture stream (`capture.rxc`) into `(header, payload)` records.
+pub fn parse_capture(bytes: &[u8]) -> Vec<(Value, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let nl = rest.iter().position(|&b| b == b'\n').expect("header line");
+        let head: Value = serde_json::from_slice(&rest[..nl]).unwrap();
+        let len = usize::try_from(head["len"].as_u64().unwrap()).unwrap();
+        let payload = rest[nl + 1..nl + 1 + len].to_vec();
+        assert_eq!(rest[nl + 1 + len], b'\n', "record terminator");
+        rest = &rest[nl + 2 + len..];
+        out.push((head, payload));
+    }
+    out
+}
+
+/// The records of one flow and direction, in order.
+pub fn capture_of<'a>(
+    recs: &'a [(Value, Vec<u8>)],
+    flow: &str,
+    dir: &str,
+) -> Vec<&'a (Value, Vec<u8>)> {
+    recs.iter()
+        .filter(|(h, _)| h["flow"] == flow && h["dir"] == dir)
+        .collect()
+}
+
+/// Concatenated `data` payloads.
+pub fn capture_body(recs: &[&(Value, Vec<u8>)]) -> Vec<u8> {
+    recs.iter()
+        .filter(|(h, _)| h["kind"] == "data")
+        .flat_map(|(_, p)| p.iter().copied())
+        .collect()
 }
