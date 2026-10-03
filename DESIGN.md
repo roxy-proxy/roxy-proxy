@@ -1269,8 +1269,7 @@ Typical patterns:
   body bytes to another service as they arrive, which may mutate them and
   streams the result back, then pass that on down; do the same with the
   response head and body on the way back up. This is a first-class use case
-  and is exactly what a service layer is (§11.6); a wasm layer can
-  do the same by piping into a named endpoint.
+  and is exactly what a service layer is (§11.6).
 - **Deny or synthesise:** return a response without calling `next`.
 
 roxy stays protocol-agnostic. It knows HTTP, not model APIs: parsing
@@ -1594,55 +1593,84 @@ any way is discarded, never reused.
 
 ### 11.6 Service layers (external services)
 
-A `kind: service` layer is an external service in the stack. Its primary use
-is to **stream** the exchange through a service that may mutate it: the
-request head and body go to the service as they arrive, and the service
-streams the (possibly changed) request back, which roxy passes down; on the
-way back up the same happens with the response. This also covers the
-sentinel design's sidecar deployment, Python with any dependencies, and any
-other out-of-process logic, with no WASM toolchain.
+A `kind: service` layer is an external service in the network path, at its
+position in the stack exactly as a WASM layer is. The request streams into
+it as it arrives; it streams back the request to forward, which roxy passes
+down the stack; the response from below streams into it, and it streams back
+the response the client gets. It may pass bytes through untouched, rewrite
+them, hold them back, answer itself, or deny. This is the sentinel design's
+sidecar deployment: Python with any dependencies, or any other
+out-of-process logic, with no WASM toolchain.
 
 ```yaml
 addons:
-  - name: transformer
+  - name: sentinel
     kind: service
-    endpoint: transformer-svc           # a named endpoint, as in §11.3
-    directions: [request, response]     # which streams go through the service
+    endpoint: sidecar                   # one of this addon's endpoints (§11.3)
     mode: enforce                       # enforce | observe
+    endpoints:
+      sidecar: { url: "http://127.0.0.1:9000/layer", private_ok: true }
     limits:
-      max_exchange_time: 60s
-      first_byte_timeout: 2s            # service must start answering this fast
+      first_byte_timeout: 2s            # until each of the service's heads
+      max_exchange_time: 60s            # the whole session
 ```
 
-**Wire format: `message/http`.** For each direction roxy opens one call to
-the endpoint over HTTP/2 (so both sides can stream at once) with
-`content-type: message/http`. The request body roxy sends is the canonical
-HTTP/1.1 message in transit, head then body bytes, written as they arrive.
-The service answers `200` with `content-type: message/http` and streams back
-the message it wants forwarded, again head first and body as it goes. It may
-pass bytes through untouched, rewrite them, or emit something different.
+**Transport: one WebSocket per exchange**, subprotocol `roxy.layer.v1`, to
+the endpoint's URL (`http` → `ws`, `https` → `wss`). It is dialled through
+the connector, so the address floor and deny lists apply, and it never
+passes through other layers or the rules. The handshake carries the
+endpoint's `headers` (credentials from secrets) and the flow metadata as
+`roxy-flow-*` fields: `id`, `conn`, `layer`, `mode` (`enforce` or
+`observe`), `client-ip`, `client-user`, `listener`, `sni`, `tags`. A service
+that does not accept the subprotocol fails the handshake. Each session is
+recorded as an `endpoint_call` event.
 
-- **Everything the service returns is re-parsed by roxy's strict codec**
-  (§5), so a service cannot introduce smuggling or framing ambiguity, and
-  its output is then subject to the same limits and, for layers above
-  `rules`, the rules.
-- **Head first.** roxy forwards nothing downstream until the service has
-  returned a complete head, bounded by `first_byte_timeout`. Body bytes then
-  flow with backpressure in both directions.
-- **Decisions without a message.** Instead of a `message/http` reply, the
-  service may answer with `content-type: application/roxy-decision+json`:
-  `{deny: {status, message}}` or `{respond: {status, headers, body}}`. For a response-direction call, `deny` and
-  `respond` replace the response the client gets.
-- **Metadata** (flow id, principal, tags, direction) travels in
-  `roxy-flow-*` request headers on the call, so the service can key state.
-- **Failure is closed** in enforce mode: a non-`200`, an unparseable
-  message, a timeout, or a dropped stream denies the flow (or closes it if
-  the response head is already out). In observe mode the service gets a copy
-  and its failures are logged only.
+**Messages.** Text frames are JSON control messages; binary frames are body
+bytes of the message whose head came last.
 
-The call goes straight to the connector like any endpoint call, so it never
-passes through other layers or the rules. A service that only needs to
-inspect, not mutate, can buffer on its side; roxy never buffers for it.
+```text
+roxy → service   {"type":"request","method":…,"url":…,"headers":[[n,v],…]}  bytes…  {"type":"request_end"}
+service → roxy   one of:
+                   {"type":"request",…}  bytes…  {"type":"request_end"}     forward this request (`next`)
+                   {"type":"response","status":…,"headers":[…]}  bytes…  {"type":"response_end"}
+                                                                          answer instead; nothing is forwarded
+                   {"type":"deny","status":403,"message":"…"}             refuse (status 4xx/5xx, both optional)
+then, if it forwarded:
+roxy → service   {"type":"response","status":…,"headers":[…]}  bytes…  {"type":"response_end"}
+service → roxy   {"type":"response",…}  bytes…  {"type":"response_end"}   the client's response
+                 or {"type":"deny",…}
+```
+
+`url` is absolute and `headers` are end-to-end fields as a WASM layer sees
+them (no hop-by-hop or framing fields). Both directions stream at once: the
+service may start forwarding the request before the client's body has
+ended, and the socket gives backpressure both ways.
+
+- **What the service forwards gets the same checks as a WASM layer's
+  `next`**: re-validated as strictly as a client request (absolute URI,
+  `host` matching, no hop-by-hop or framing fields, the workload's limits),
+  then judged by the rules. Its response is handled as a WASM layer's.
+- **Deadlines.** `first_byte_timeout` (default 30s) bounds the connection
+  and each of the service's heads (its first answer, and its response after
+  roxy sent the upstream's head). `max_exchange_time` bounds the whole
+  session.
+- **Failure is closed** in enforce mode: a failed connection or handshake,
+  a protocol violation (bad JSON, a message out of order, bytes before a
+  head, an invalid head), a missed deadline, or a lost socket deny the
+  exchange (`503`, `layer:<name>`) before the response head and cut the body
+  after it. A body cut short never reaches the upstream or the client as
+  complete. `layer_error.kind` is `service:connect`, `service:protocol`,
+  `service:timeout` or `service:closed`.
+- **Observe mode**: the service gets the same messages for copies of both
+  streams, and whatever it sends back is read and ignored. It cannot change
+  or delay traffic; its failures are logged only.
+- **WebSocket upgrades.** The service sees the upgrade request; a `101`
+  passes straight back, and the WebSocket's bytes do not go through it.
+
+One connection per exchange keeps the protocol simple and a service
+stateless per socket; a local handshake costs little next to what a
+sentinel does. Multiplexing exchanges over long-lived connections (with
+stream ids) can come later if that cost shows.
 
 ### 11.7 Sentinel substrate: mapping
 
@@ -1669,7 +1697,7 @@ be built on roxy without roxy knowing anything about model APIs.
 | recursion guard for monitor inference | endpoint calls bypass the layer stack |
 | never hang the request | `max_exchange_time`, immediate deny responses |
 | fail open or closed when the processor is down | closed in enforce mode; observe mode for monitors whose failure must not block |
-| sidecar deployment | `kind: service` layer, streaming `message/http` (§11.6) |
+| sidecar deployment | `kind: service` layer, one WebSocket per exchange in the network path (§11.6) |
 | embedded CPython in WASM | `kind: wasm` with raised memory/time budgets and instance recycling |
 | observe-only default for uncalibrated scores | `mode: observe` (tee) |
 
