@@ -137,7 +137,8 @@ impl Upstream {
     ///
     /// * `/early`: `200 early` at once, without reading the body;
     /// * `/status/<n>`: reads the body, answers `<n>`;
-    /// * a WebSocket upgrade: `101`, then echoes bytes;
+    /// * a WebSocket upgrade: `101`, then echoes bytes; with
+    ///   `x-echo: once`, echoes the first read and closes;
     /// * anything else: reads the body, answers `200` with JSON
     ///   `{method, path, host, body_len, via}`.
     async fn answer(
@@ -165,7 +166,8 @@ impl Upstream {
         if let Some(key) = req.headers().get("sec-websocket-key").cloned() {
             lock(&entry).complete = Some(true);
             self.changed.notify_waiters();
-            return upgrade_and_echo(&mut req, &key);
+            let once = req.headers().get("x-echo").is_some_and(|v| v == "once");
+            return upgrade_and_echo(&mut req, &key, once);
         }
 
         let host = req
@@ -237,10 +239,12 @@ impl Upstream {
     }
 }
 
-/// Answers a WebSocket upgrade with `101` and echoes the upgraded bytes.
+/// Answers a WebSocket upgrade with `101` and echoes the upgraded bytes,
+/// closing after the first read when `once`.
 fn upgrade_and_echo(
     req: &mut http::Request<Incoming>,
     key: &http::HeaderValue,
+    once: bool,
 ) -> http::Response<Full<Bytes>> {
     let on = hyper::upgrade::on(req);
     tokio::spawn(async move {
@@ -248,7 +252,7 @@ fn upgrade_and_echo(
             let mut up = TokioIo::new(up);
             let mut buf = vec![0u8; 16 * 1024];
             while let Ok(n) = up.read(&mut buf).await {
-                if n == 0 || up.write_all(&buf[..n]).await.is_err() {
+                if n == 0 || up.write_all(&buf[..n]).await.is_err() || once {
                     break;
                 }
             }
