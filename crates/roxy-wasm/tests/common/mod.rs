@@ -30,6 +30,10 @@ pub enum NextMode {
     /// Read the whole request body (kept in `seen_body`), then answer
     /// with this status, content type and body.
     Canned(u16, &'static str, Vec<u8>),
+    /// Like `Canned`, but the body is read by a task of its own, as an
+    /// upstream connection does: it goes on reading after the `next` call
+    /// is dropped. How the body ended goes to `upload`.
+    Upload,
 }
 
 pub struct Mock {
@@ -41,6 +45,10 @@ pub struct Mock {
     pub seen: Mutex<Option<http::request::Parts>>,
     /// The body of the last request passed to `next` (`Canned` mode).
     pub seen_body: Mutex<Option<Bytes>>,
+    /// Notified as `next` is called.
+    pub entered: tokio::sync::Notify,
+    /// How the request body passed to `next` ended (`Upload` mode).
+    pub upload: tokio::sync::watch::Sender<Option<Result<Bytes, BodyError>>>,
     /// The layer's keyed store.
     pub state: Mutex<HashMap<String, String>>,
 }
@@ -53,12 +61,21 @@ impl Mock {
             calls: Mutex::new(Vec::new()),
             seen: Mutex::new(None),
             seen_body: Mutex::new(None),
+            entered: tokio::sync::Notify::new(),
+            upload: tokio::sync::watch::Sender::new(None),
             state: Mutex::new(HashMap::new()),
         })
     }
 
     pub fn echo() -> Arc<Self> {
         Self::new(NextMode::Echo)
+    }
+
+    /// Waits for the request body passed to `next` to end (`Upload` mode).
+    pub async fn upload_ended(&self) -> Result<Bytes, BodyError> {
+        let mut rx = self.upload.subscribe();
+        let ended = rx.wait_for(Option::is_some).await.unwrap();
+        ended.clone().unwrap()
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -74,6 +91,7 @@ impl Mock {
 impl LayerHost for Mock {
     async fn next(&self, req: LayerRequest) -> Result<LayerResponse, HostError> {
         self.next_calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_one();
         let (parts, body) = req.into_parts();
         *self.seen.lock().unwrap() = Some(parts.clone());
         match &self.mode {
@@ -98,6 +116,20 @@ impl LayerHost for Mock {
                     .header("content-type", *content_type)
                     .body(Body::from_bytes(canned.clone()))
                     .unwrap())
+            }
+            NextMode::Upload => {
+                let (done_tx, done) = oneshot::channel();
+                let upload = self.upload.clone();
+                tokio::spawn(async move {
+                    let got = collect(body).await;
+                    let ok = got.is_ok();
+                    upload.send_replace(Some(got));
+                    let _ = done_tx.send(ok);
+                });
+                match done.await {
+                    Ok(true) => Ok(Response::new(Body::from_bytes("from upstream"))),
+                    _ => Err(HostError::new("upload cut")),
+                }
             }
         }
     }
