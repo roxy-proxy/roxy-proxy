@@ -189,6 +189,42 @@ impl Config {
                     ),
                 ));
             }
+            match a.kind {
+                super::AddonKind::Wasm => {
+                    if a.path.is_none() {
+                        d.push(Diagnostic::new(
+                            format!("{path}.path"),
+                            "a `kind: wasm` addon needs `path`",
+                        ));
+                    }
+                    if a.endpoint.is_some() {
+                        d.push(Diagnostic::new(
+                            format!("{path}.endpoint"),
+                            "`endpoint` is for `kind: service` addons",
+                        ));
+                    }
+                }
+                super::AddonKind::Service => {
+                    if a.endpoint.is_none() {
+                        d.push(Diagnostic::new(
+                            format!("{path}.endpoint"),
+                            "a `kind: service` addon needs `endpoint`",
+                        ));
+                    }
+                    if a.path.is_some() {
+                        d.push(Diagnostic::new(
+                            format!("{path}.path"),
+                            "`path` is for `kind: wasm` addons",
+                        ));
+                    }
+                }
+            }
+            if a.directions.is_empty() {
+                d.push(Diagnostic::new(
+                    format!("{path}.directions"),
+                    "`directions` must name at least one of request, response",
+                ));
+            }
         }
     }
 

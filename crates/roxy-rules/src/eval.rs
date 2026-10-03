@@ -12,7 +12,7 @@ use regex::Regex;
 use crate::compile::{Const, OrdOp, Pred, ROperand, StrOp};
 use crate::config::{CaptureTarget, LogLevel, Phase, Scheme};
 use crate::diag::RuleId;
-use crate::types::Access;
+use crate::types::{Access, Field};
 use crate::view::{BodyText, FlowView, Value};
 
 /// Per-evaluation inputs that are not part of the flow.
@@ -151,6 +151,10 @@ pub enum FailClosedReason {
     /// A body predicate was reached but the body was not buffered or could
     /// not be read. Carries the field name.
     BodyUnavailable(String),
+    /// `body.size` / `response.body.size` was reached but the length is not
+    /// known (chunked and not buffered). Treating it as absent would let a
+    /// chunked upload slip past a size rule. Carries the field name.
+    BodySizeUnknown(String),
 }
 
 impl fmt::Display for FailClosedReason {
@@ -164,6 +168,7 @@ impl fmt::Display for FailClosedReason {
                 write!(f, "`{field}`: body too large to inspect")
             }
             Self::BodyUnavailable(field) => write!(f, "`{field}`: body unavailable"),
+            Self::BodySizeUnknown(field) => write!(f, "`{field}`: length unknown"),
         }
     }
 }
@@ -448,6 +453,7 @@ pub(crate) enum Unavailable<'a> {
     /// Field name (`body.text` / `response.body.text`).
     BodyTooLarge(&'static str),
     Body(&'static str),
+    BodySize(&'static str),
 }
 
 impl Unavailable<'_> {
@@ -457,6 +463,7 @@ impl Unavailable<'_> {
             Unavailable::List(n) => FailClosedReason::AddressListUnavailable(n.to_owned()),
             Unavailable::BodyTooLarge(f) => FailClosedReason::BodyTooLargeToInspect(f.to_owned()),
             Unavailable::Body(f) => FailClosedReason::BodyUnavailable(f.to_owned()),
+            Unavailable::BodySize(f) => FailClosedReason::BodySizeUnknown(f.to_owned()),
         }
     }
 }
@@ -470,7 +477,20 @@ fn get<'a>(op: &'a ROperand, s: &Scope<'a>) -> Value<'a> {
             Const::Ip(ip) => Value::Ip(*ip),
         },
         ROperand::Get(access) => match access {
-            Access::Scalar(f) => s.view.field(*f),
+            Access::Scalar(f) => {
+                let v = s.view.field(*f);
+                // An unknown body length is an unavailable input, not an
+                // absent value: fail closed (§6.1). An empty body is 0.
+                let size_field = match f {
+                    Field::BodySize => Some("body.size"),
+                    Field::ResponseBodySize => Some("response.body.size"),
+                    _ => None,
+                };
+                if let (Some(name), Value::Absent) = (size_field, &v) {
+                    s.fail(Unavailable::BodySize(name));
+                }
+                v
+            }
             Access::Header(n) => opt(s.view.header(n)),
             Access::HeaderAll(n) => list(s.view.header_all(n)),
             Access::RespHeader(n) => opt(s.view.response_header(n)),

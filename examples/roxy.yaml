@@ -92,6 +92,16 @@ rules:
     when: metric.egress_bytes > 500mb
     then: { deny: { status: 429, message: "hourly egress budget exhausted" } }
 
+  # Upload size. `limits.max_request_body_bytes` is the hard cap for every
+  # request (it also stops chunked uploads mid-stream). A per-host cap is a
+  # rule above the allow rule it restricts, since the first terminal action
+  # wins. A chunked upload has no declared length, so `body.size` is unknown
+  # and the flow fails closed (`body_size_unknown`) rather than slipping
+  # past the rule.
+  - id: no-big-uploads
+    when: host == "api.openai.com" and method == POST and body.size > 10mb
+    then: { deny: { status: 413, message: "upload too large" } }
+
   - id: openai
     when: host == "api.openai.com" and path starts_with "/v1/" and method == POST
     then:
@@ -110,15 +120,19 @@ rules:
     when: host == "ws.example.com" and header["upgrade"] == "websocket"
     then: { allow: { upgrade: websocket } }
 
-  - id: no-big-uploads
+  - id: log-upstream-5xx
     phase: response
     when: response.status >= 500
     then: { log: { level: warn, message: "upstream 5xx" } }
 
+# Addons sit above the rules, in the order listed: the first sees each
+# request first and each response last. Not in this build; `roxy run`
+# refuses a config with addons.
 addons:
   - name: pii-scan
+    kind: wasm                   # wasm | service
     path: /etc/roxy/addons/pii_scan.wasm
-    stage: before_rules          # before_rules | in_chain | after_rules
+    mode: enforce                # enforce (failures fail closed) | observe (tee, log only)
     config: { threshold: 0.8 }
     capabilities: [state, log]
     limits:                      # each optional; defaults to the global setting
@@ -126,4 +140,3 @@ addons:
       max_buffered_body_bytes: 1mb
       step_cpu: 50ms
       fuel_per_step: 100_000_000
-    on_error: deny               # deny (default) | close. There is no "pass".

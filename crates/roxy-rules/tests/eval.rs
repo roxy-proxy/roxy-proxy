@@ -929,3 +929,40 @@ fn hostile_regex_is_rejected_at_compile_time() {
     .unwrap_err();
     assert!(err[0].contains("too large"), "{err:?}");
 }
+
+/// A size rule cannot be dodged with a chunked upload: an unknown length is
+/// an unavailable input, not an absent value.
+#[test]
+fn unknown_body_size_fails_closed() {
+    let ctx = EvalContext::empty();
+    let p = compile(
+        "",
+        "- { id: big, when: 'method == POST and body.size > 10mb', then: deny }\n\
+         - { id: ok, then: allow }",
+    );
+    let post = || MapView::new().with_str(Field::Method, "POST");
+    assert_eq!(
+        p.evaluate(
+            Phase::Request,
+            &post().with_int(Field::BodySize, 20 << 20),
+            &ctx
+        )
+        .terminal_rule,
+        "big"
+    );
+    assert_eq!(
+        p.evaluate(Phase::Request, &post().with_int(Field::BodySize, 0), &ctx)
+            .terminal_rule,
+        "ok"
+    );
+    // Chunked: no BodySize set.
+    let out = p.evaluate(Phase::Request, &post(), &ctx);
+    assert_eq!(out.terminal_rule, "_fail_closed");
+    assert_eq!(
+        out.fail_closed_reason,
+        Some(FailClosedReason::BodySizeUnknown("body.size".into()))
+    );
+    // A GET never reaches the size predicate, so it is unaffected.
+    let get = MapView::new().with_str(Field::Method, "GET");
+    assert_eq!(p.evaluate(Phase::Request, &get, &ctx).terminal_rule, "ok");
+}

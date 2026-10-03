@@ -556,9 +556,7 @@ rules:
     when: response.status >= 500
     then: { log: { level: warn, message: "upstream 5xx" } }
 
-layers: [pii-scan, rules]       # order of the layer stack (§11.1)
-
-addons:
+addons:                          # above the rules, in this order (§11.1)
   - name: pii-scan
     kind: wasm
     path: /etc/roxy/addons/pii_scan.wasm
@@ -661,7 +659,14 @@ body larger than the cap **fails closed**: the flow is denied with
 check" must never become "the predicate is false" (§6.1). Operators who need
 to inspect larger bodies raise the cap; operators who do not need body
 predicates on large uploads scope the rule with `body.size < 1mb and ...`,
-which short-circuits before the body is touched. The compiler determines per-rule whether the body is
+which short-circuits before the body is touched.
+
+`body.size` and `response.body.size` are the declared length (0 for an empty
+body). A chunked body has no declared length, so reaching `body.size` for
+one **fails closed** (`body_size_unknown`) instead of reading as absent;
+otherwise `body.size > 10mb → deny` could be dodged by sending the upload
+chunked. The hard cap for every request, chunked or not, is
+`limits.max_request_body_bytes`, enforced while streaming. The compiler determines per-rule whether the body is
 needed; rules without body predicates never buffer and stream end-to-end.
 
 ### 6.3 Actions
@@ -687,7 +692,7 @@ Non-terminal (evaluation continues):
 | `log: { level, message }` | all | emits an extra log event |
 | `set_state: { key, value, ttl }` | all | writes to the state store (visible as `state["key"]`) |
 | `capture: request | response | both` | request, response | writes bodies to the capture dir (§10) |
-| `call: addon_name` | — | reserved; rejected by the compiler. Layer order in `layers` replaces it (§11.1) |
+| `call: addon_name` | — | reserved; rejected by the compiler. Addons always run above the rules, in listed order (§11.1) |
 
 Actions are a small closed enum, deliberately. Anything richer is an addon.
 
@@ -800,10 +805,17 @@ upstream:
   deny_lists: [blocked, cloud-metadata]  # hard floor, checked on every connect
 ```
 
-- **Representation:** each list compiles into a binary prefix trie (one for
-  v4, one for v6) so a lookup costs at most 32 or 128 node visits regardless
-  of list size. A million entries is tens of MiB and loads in well under a
-  second. IPv4-mapped IPv6 addresses are normalised to v4 before lookup.
+- **Representation:** each list compiles into a sorted table of disjoint
+  CIDR blocks per family, looked up by binary search: 8 bytes per v4 entry,
+  32 per v6, no allocation per lookup. A million v4 plus 100k v6 entries is
+  about 11 MiB, parses in about 170 ms, and looks up in 25–90 ns.
+- **Two matching modes.** The deny floor (`upstream.deny_lists`) is broad: it
+  matches the address as given, its IPv4-mapped form, and the IPv4 address a
+  NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`) address would reach, because
+  matching more is the safe direction for a deny. Rule membership
+  (`ip in @list`) is exact, with only the IPv4-mapped equivalence, because a
+  rule might *allow* on membership: `client.ip in @internal → allow` must not
+  treat a 6to4 address that embeds an internal IPv4 address as internal.
   Overlapping and duplicate entries are merged; a malformed line is a config
   error naming the file and line.
 - **Enforcement:** `upstream.deny_lists` is applied in the connector after DNS
@@ -984,36 +996,30 @@ the request is the last to see the response.
                  request ↓                                   ↑ response
  fixed   ┌─ connect gate (connect-phase rules, CONNECT/SNI) ─────────────┐
  fixed   ├─ quarantine gate (§11.3 terminate)                            │
- config  ├─ layer: sentinel        (wasm | service, enforce | observe)    │
- config  ├─ layer: redactor                                              │
- config  ├─ layer: rules           (built-in: request ↓ / response ↑)    │
- config  ├─ layer: egress-shaper   (may not change the destination)      │
+ config  ├─ addon: sentinel        (wasm | service, enforce | observe)    │
+ config  ├─ addon: redactor                                              │
+ fixed   ├─ rules                  (request ↓ / response ↑)              │
  fixed   ├─ address floor + deny lists (on the IP actually dialled)      │
  fixed   └─ connector ──▶ origin ────────────────────────────────────────┘
 ```
 
-Configuration is one ordered list that must contain the built-in `rules`
-layer exactly once:
+**Addons always sit above the rules**, in the order they are listed under
+`addons:`. The first addon sees each request first and each response last.
+Nothing configurable runs between the rules and the network, so what the
+rules judged is what leaves; there is no "after the rules" position.
 
-```yaml
-layers: [sentinel, redactor, rules, egress-shaper]
-```
-
-`layers` defaults to `[rules]`. Everything marked *fixed* is not
-configurable. The connect gate runs before any layer sees bytes. The address
-floor and deny lists (§7, §7.1) are the innermost layer because the IP is
-only known after DNS resolution, so they always check the IP that is dialled,
-whatever any layer above did.
+Everything marked *fixed* is not configurable. The connect gate runs before
+any addon sees bytes. The address floor and deny lists (§7, §7.1) are the
+innermost layer because the IP is only known after DNS resolution, so they
+always check the IP that is dialled.
 
 **Invariants.**
 
-1. **The rules evaluate every request that leaves for the network.** A layer
-   above `rules` can reshape traffic freely; its output is re-validated by
-   the canonical model and then judged by the rules exactly as if the agent
-   had sent it. A layer below `rules` may mutate headers, path, query and
-   body but **may not change the destination** (authority or scheme); doing
-   so denies the flow with `layer_invalid_mutation`, so the rules' decision
-   about where traffic goes stays authoritative.
+1. **The rules evaluate every request that leaves for the network.** An
+   addon can reshape traffic freely; its output is re-validated by the
+   canonical model and then judged by the rules exactly as if the agent had
+   sent it. On the way back, the response rules see the upstream's response
+   before any addon does.
 2. **Every layer is held to the workload's limits.** Whatever a layer passes
    on is treated as if a client sent it: header limits, body caps, idle
    timeouts.
@@ -1022,9 +1028,9 @@ whatever any layer above did.
    head is already out). There is no `on_error: pass`; see observe mode for
    the one safe way to run a layer whose failures do not matter.
 
-The earlier `stage: before_rules | after_rules` setting and the rule action
-`call: <addon>` are replaced by position in `layers`. `call:` stays a
-reserved word in the rule grammar and is rejected by the compiler.
+There is no stage setting and no rule action that invokes an addon: either
+would make it ambiguous what the rules enforced. `call:` stays a reserved
+word in the rule grammar and is rejected by the compiler.
 
 **Layer kinds.** A layer is either a **wasm** component running in-process
 (§11.4) or a **service layer**: an external service that roxy streams the traffic through (§11.6). Both
@@ -1084,9 +1090,7 @@ Anthropic or OpenAI payloads into conversation steps is the layer's job.
 ### 11.2 Configuration
 
 ```yaml
-layers: [sentinel, rules]
-
-addons:
+addons:                               # above the rules, in this order
   - name: sentinel
     kind: wasm                        # wasm | service
     path: /etc/roxy/addons/sentinel.wasm
@@ -1489,7 +1493,7 @@ be built by separate agents in parallel because `roxy-http`, `roxy-tls` and
 |---|---|---|
 | 1 | Transparent-mode upstream target (§4.2) | `resolve`; decide when transparent mode is built |
 | 2 | Rule evaluation: first terminal action wins, chain exhausted → deny (§6.1) | as stated |
-| 3 | Addons are layers in an ordered stack around the built-in `rules` layer; rules evaluate every request that leaves; layers below `rules` cannot change the destination; outbound calls go to named endpoints (§11) | as stated |
+| 3 | Addons are layers above the rules, in listed order; rules evaluate every request that leaves; addons' own calls go to named endpoints (§11) | as stated |
 | 4 | Deny response body includes rule id and flow id (§5.7) | yes, informative 403 by default |
 | 5 | Size units 1024-based (§6.2) | yes |
 | 6 | Licence and crate name on crates.io | MIT OR Apache-2.0; `roxy` availability to be checked |

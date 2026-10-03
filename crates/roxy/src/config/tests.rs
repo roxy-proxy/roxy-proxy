@@ -45,11 +45,11 @@ fn full_example_parses_and_validates() {
     assert_eq!(cfg.metrics[0].window, Some(Duration::from_secs(60)));
     assert_eq!(cfg.metrics[1].where_, Some(Expr("true".into())));
     assert_eq!(cfg.metrics[1].window, Some(Duration::from_secs(3600)));
-    assert_eq!(cfg.rules.len(), 7);
-    assert_eq!(cfg.rules[2].then.0.len(), 2);
-    assert_eq!(cfg.rules[6].phase, Phase::Response);
-    assert_eq!(cfg.addons[0].stage, AddonStage::BeforeRules);
-    assert_eq!(cfg.addons[0].on_error, OnError::Deny);
+    assert_eq!(cfg.rules.len(), 8);
+    assert_eq!(cfg.rules[3].then.0.len(), 2);
+    assert_eq!(cfg.rules[7].phase, Phase::Response);
+    assert_eq!(cfg.addons[0].kind, AddonKind::Wasm);
+    assert_eq!(cfg.addons[0].mode, AddonMode::Enforce);
     assert_eq!(
         cfg.addons[0].limits.max_memory,
         Some(ByteSize::b(64 * 1024 * 1024))
@@ -175,9 +175,10 @@ fn unknown_enum_values_rejected() {
         "tls: { upstream: { verify: lax } }",
         "tls: { upstream: { min_version: \"1.1\" } }",
         "metrics: [{ id: m, count: bananas }]",
-        "addons: [{ name: a, path: /a.wasm, stage: whenever }]",
+        "addons: [{ name: a, path: /a.wasm, stage: before_rules }]",
+        "addons: [{ name: a, path: /a.wasm, mode: passthrough }]",
         "addons: [{ name: a, path: /a.wasm, capabilities: [network] }]",
-        "addons: [{ name: a, path: /a.wasm, on_error: ignore }]",
+        "addons: [{ name: a, path: /a.wasm, on_error: deny }]",
     ] {
         assert!(
             Config::from_yaml(&format!("{BASE}{bad}\n")).is_err(),
@@ -412,19 +413,12 @@ fn address_lists_parse_and_validate() {
 
 #[test]
 fn addon_on_error_has_no_pass() {
-    let e = Config::from_yaml(&format!(
-        "{BASE}addons: [{{ name: a, path: /a.wasm, on_error: pass }}]\n"
-    ))
-    .unwrap_err()
-    .to_string();
-    assert!(e.contains("deliberately no `pass`"), "{e}");
     let c = parse(&format!(
-        "{BASE}addons: [{{ name: a, path: /a.wasm, on_error: close, stage: after_rules, \
+        "{BASE}addons: [{{ name: a, path: /a.wasm, mode: observe, \
          limits: {{ max_buffered_body_bytes: 2mb, fuel_per_step: 5 }} }}]\n"
     ));
     let a = &c.addons[0];
-    assert_eq!(a.on_error, OnError::Close);
-    assert_eq!(a.stage, AddonStage::AfterRules);
+    assert_eq!(a.mode, AddonMode::Observe);
     assert_eq!(a.limits.max_buffered_body_bytes, Some(ByteSize::b(2 << 20)));
     assert_eq!(a.limits.fuel_per_step, Some(5));
     assert_eq!(a.limits.max_memory, None);

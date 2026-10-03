@@ -265,9 +265,30 @@ impl AddressList {
         }
     }
 
-    /// Whether `ip` is listed ([`AddressList::lookup`]).
+    /// Whether `ip` is listed ([`AddressList::lookup`]). Broad: also matches
+    /// the IPv4 address a NAT64 or 6to4 address translates to. Use this for
+    /// **deny** decisions (the upstream address floor), where matching more
+    /// forms is the safe direction.
     pub fn contains(&self, ip: IpAddr) -> bool {
         self.lookup(ip).is_some()
+    }
+
+    /// Exact membership for the rule DSL (`ip in @list`). The only
+    /// equivalence applied is IPv4-mapped IPv6 (`::ffff:a.b.c.d`), which is
+    /// the same address. NAT64, 6to4 and IPv4-compatible forms are distinct
+    /// addresses and are matched only if listed as such: a rule like
+    /// `client.ip in @internal` → `allow` must not treat an attacker's 6to4
+    /// address that embeds an internal IPv4 address as internal.
+    pub fn contains_exact(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => self.lookup_v4(v4).is_some(),
+            IpAddr::V6(v6) => {
+                self.lookup_v6(v6).is_some()
+                    || v6
+                        .to_ipv4_mapped()
+                        .is_some_and(|v4| self.lookup_v4(v4).is_some())
+            }
+        }
     }
 
     /// Every entry, IPv4 first, in address order.
@@ -289,6 +310,23 @@ mod tests {
 
     fn net(s: &str) -> IpNet {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn exact_membership_ignores_translated_forms() {
+        let l = AddressList::parse("internal", "10.0.0.0/8\n").unwrap();
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(l.contains_exact(ip("10.1.2.3")));
+        assert!(
+            l.contains_exact(ip("::ffff:10.1.2.3")),
+            "mapped is the same address"
+        );
+        // 6to4 and NAT64 embedding 10.1.2.3 are different addresses.
+        assert!(!l.contains_exact(ip("2002:a01:203::1")));
+        assert!(!l.contains_exact(ip("64:ff9b::a01:203")));
+        // ...but the deny-floor lookup still catches them.
+        assert!(l.contains(ip("2002:a01:203::1")));
+        assert!(l.contains(ip("64:ff9b::a01:203")));
     }
 
     #[test]

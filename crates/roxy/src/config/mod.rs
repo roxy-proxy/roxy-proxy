@@ -408,17 +408,37 @@ pub enum Capability {
     Secrets,
 }
 
-/// Where an addon runs (§11.1).
+/// How an addon is implemented (§11.1).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AddonStage {
-    /// Sees every canonical request, before the rules.
+pub enum AddonKind {
+    /// A WebAssembly component run in-process (§11.4). Needs `path`.
     #[default]
-    BeforeRules,
-    /// Invoked only by a rule's `call: <addon>`.
-    InChain,
-    /// Sees only requests the rules allowed.
-    AfterRules,
+    Wasm,
+    /// An external service the traffic is streamed through as
+    /// `message/http` (§11.6). Needs `endpoint`.
+    Service,
+}
+
+/// Whether an addon's output takes effect (§11.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddonMode {
+    /// In the path; failures fail the flow closed. There is deliberately no
+    /// way to let traffic through a failing enforcing addon.
+    #[default]
+    Enforce,
+    /// Gets a copy (tee) of the streams; cannot change or delay traffic, so
+    /// its failures are logged only.
+    Observe,
+}
+
+/// Which streams a service addon sees (§11.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    Request,
+    Response,
 }
 
 /// Per-addon resource limits (§11.1, §11.3). Each defaults to the global
@@ -439,45 +459,37 @@ pub struct AddonLimits {
     /// Fuel per I/O step (default 100 000 000).
     #[serde(deserialize_with = "units::opt_count")]
     pub fuel_per_step: Option<u64>,
-}
-
-/// What a failing addon (trap, timeout, cap exceeded, invalid mutation)
-/// does to its flow. There is deliberately no `pass` (§11.1): an attacker
-/// must not be able to switch inspection off by making the addon fail.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "String")]
-pub enum OnError {
-    /// Deny the flow (`addon_error`).
-    #[default]
-    Deny,
-    /// Close the connection.
-    Close,
-}
-
-impl TryFrom<String> for OnError {
-    type Error = String;
-    fn try_from(s: String) -> Result<Self, String> {
-        match s.as_str() {
-            "deny" => Ok(Self::Deny),
-            "close" => Ok(Self::Close),
-            other => Err(format!(
-                "unknown on_error {other:?}: expected `deny` or `close` (there is deliberately \
-                 no `pass`: a failing addon always fails its flow closed)"
-            )),
-        }
-    }
+    /// Wall-clock budget per exchange, including endpoint calls.
+    #[serde(with = "humantime_serde")]
+    pub max_exchange_time: Option<Duration>,
+    /// A service addon must return a complete head within this time.
+    #[serde(with = "humantime_serde")]
+    pub first_byte_timeout: Option<Duration>,
 }
 
 /// One `addons:` entry (§11.1). There is no hook list: an addon has one
 /// entry point (`handle`) and an optional `tunnel` export discovered at
 /// load time.
+///
+/// Addons always sit above the built-in rules, in the order listed: the
+/// first addon sees the request first and the response last (§11.1).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Addon {
     pub name: String,
-    pub path: PathBuf,
     #[serde(default)]
-    pub stage: AddonStage,
+    pub kind: AddonKind,
+    /// The component file (`kind: wasm`).
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// The named endpoint to stream through (`kind: service`).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Streams a service addon sees (default both).
+    #[serde(default = "both_directions")]
+    pub directions: Vec<Direction>,
+    #[serde(default)]
+    pub mode: AddonMode,
     /// Opaque config passed to the addon as JSON.
     #[serde(default)]
     pub config: serde_yaml_ng::Value,
@@ -485,8 +497,10 @@ pub struct Addon {
     pub capabilities: Vec<Capability>,
     #[serde(default)]
     pub limits: AddonLimits,
-    #[serde(default)]
-    pub on_error: OnError,
+}
+
+fn both_directions() -> Vec<Direction> {
+    vec![Direction::Request, Direction::Response]
 }
 
 // ----- log ------------------------------------------------------------------

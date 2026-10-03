@@ -58,7 +58,7 @@ impl FlowView for DryRunView {
         self.map.response_body_text()
     }
     fn in_address_list(&self, list: &str, ip: IpAddr) -> Option<bool> {
-        self.lists.get(list).map(|l| l.contains(ip))
+        self.lists.get(list).map(|l| l.contains_exact(ip))
     }
 }
 

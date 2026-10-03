@@ -328,6 +328,8 @@ impl FlowView for ProxyView<'_> {
         // The compiler only accepts names defined under `address_lists`, and
         // every defined list is loaded into the snapshot or the snapshot is
         // refused; `None` (fail closed) is the "cannot happen" answer.
-        self.lists.get(list).map(|l| l.contains(ip))
+        // Exact membership: see `AddressList::contains_exact` for why the
+        // broad deny-floor matching is wrong for rules that allow.
+        self.lists.get(list).map(|l| l.contains_exact(ip))
     }
 }
