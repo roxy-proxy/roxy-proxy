@@ -77,3 +77,10 @@ path = "fuzz_targets/rule_eval.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "content_coding"
+path = "fuzz_targets/content_coding.rs"
+test = false
+doc = false
+bench = false
