@@ -3,14 +3,20 @@
 //!
 //! # Pooling and the address floor
 //!
-//! The floor runs inside the connector, i.e. for every new connection. A
-//! pooled connection is keyed by scheme + authority only and is reused
-//! without re-resolving; a connection to an address that becomes denied by a
-//! later config is therefore reused until the pool is rebuilt. The pool is
-//! rebuilt on every reload ([`Upstream`] lives in the policy snapshot), so
-//! this window ends at the next reload. Flows with `private_ok` use a
-//! separate pool, so a connection opened for a `private_ok` flow is never
-//! reused by a flow without it.
+//! The floor (private ranges, `deny_cidrs`, `upstream.deny_lists`) runs
+//! inside the connector on the addresses it is about to dial, after DNS and
+//! immediately before `connect`, so the address checked is the address
+//! dialled and DNS rebinding between check and connect is impossible. The
+//! exchange also runs it as a preflight before any request bytes move.
+//!
+//! A pooled connection is keyed by scheme + authority only and is reused
+//! without re-resolving. The pool lives in [`Upstream`], which lives in the
+//! policy snapshot and is rebuilt on every reload, so a reload that changes
+//! the address policy or any address list starts with an empty pool: a
+//! pooled connection to a newly denied address is never reused (and the
+//! preflight would refuse the flow first anyway). Flows with `private_ok`
+//! use a separate pool, so a connection opened for a `private_ok` flow is
+//! never reused by a flow without it.
 
 mod dns;
 
@@ -263,6 +269,11 @@ impl tower_service::Service<Uri> for Connector {
         Poll::Ready(Ok(()))
     }
 
+    // Entry point for every pooled upstream connection. Addon side requests
+    // (`wasi:http/outgoing-handler`, §11.1) must also be dialled through
+    // this connector (or `ConnectorInner::connect`) when they land, so that
+    // `upstream.deny_lists` and the private-range floor apply to them too:
+    // nothing opts out of a deny list.
     fn call(&mut self, uri: Uri) -> Self::Future {
         let inner = self.inner.clone();
         Box::pin(async move {
@@ -409,4 +420,103 @@ pub(crate) fn describe(err: &hyper_util::client::legacy::Error) -> String {
         src = e.source();
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::*;
+    use crate::addrlist::AddressList;
+
+    /// A keep-alive HTTP/1.1 server answering `200` to everything; counts
+    /// accepted connections.
+    async fn tiny_server() -> (u16, Arc<AtomicUsize>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let n = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                n.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let mut seen = Vec::new();
+                    while let Ok(k) = s.read(&mut buf).await {
+                        if k == 0 {
+                            return;
+                        }
+                        seen.extend_from_slice(&buf[..k]);
+                        while let Some(i) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                            seen.drain(..i + 4);
+                            if s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (port, accepted)
+    }
+
+    fn settings(lists: Vec<Arc<AddressList>>) -> UpstreamSettings {
+        let mut s = UpstreamSettings::default();
+        s.dns.servers = Some(vec!["127.0.0.1:9".parse().unwrap()]);
+        s.dns
+            .static_hosts
+            .insert("listed.test".into(), vec!["127.0.0.1".parse().unwrap()]);
+        s.address_policy.deny_lists = lists;
+        s
+    }
+
+    fn get(port: u16) -> http::Request<Body> {
+        http::Request::get(format!("http://listed.test:{port}/"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// The deny list is enforced by the connector itself (not only the
+    /// preflight), and a rebuilt `Upstream` (what a reload does) does not
+    /// reuse the old pool's connection to a newly listed address.
+    #[tokio::test]
+    async fn connector_enforces_deny_lists_and_reload_drops_the_pool() {
+        roxy_tls::install_crypto_provider();
+        let tls = roxy_tls::client_config(&roxy_tls::UpstreamTlsOptions::default()).unwrap();
+        let (port, accepted) = tiny_server().await;
+
+        let before = Upstream::new(&settings(Vec::new()), &tls).unwrap();
+        for _ in 0..2 {
+            let res = before.client(true).request(get(port)).await.unwrap();
+            assert_eq!(res.status(), 200);
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "second request pooled");
+
+        let list = Arc::new(AddressList::parse("blocked", "127.0.0.1\n").unwrap());
+        let after = Upstream::new(&settings(vec![list]), &tls).unwrap();
+        let authority = Authority::new(Host::Dns("listed.test".into()), port);
+        let Err(ConnectError::Denied(d)) = after.preflight(&authority, true).await else {
+            panic!("preflight must deny");
+        };
+        assert_eq!(d.list.as_deref(), Some("blocked"));
+        // Straight through the pooled client, bypassing the preflight.
+        let err = after.client(true).request(get(port)).await.unwrap_err();
+        let Some(ConnectError::Denied(d)) = classify(&err) else {
+            panic!("connector must deny: {err:?}");
+        };
+        assert_eq!(d.reason, "list:blocked");
+        assert_eq!(d.matched_cidr, Some("127.0.0.1/32".parse().unwrap()));
+        assert_eq!(d.ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+        // And the WebSocket path.
+        assert!(matches!(
+            after.connect_h1(Scheme::Http, &authority, true).await,
+            Err(ConnectError::Denied(_))
+        ));
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "nothing was dialled");
+    }
 }

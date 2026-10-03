@@ -3,9 +3,9 @@
 //! watcher and `SIGHUP`), and [`start`] for the binary and the integration
 //! tests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
@@ -14,7 +14,6 @@ use roxy_proxy::{
     FileSink, FlowEvent, FlowSink, ListenerSpec, MetricSource, PolicyUpdate, Redactor,
     RuntimeConfig, Server, ServerHandle, StateSource, StdoutSink, UserDb,
 };
-use roxy_rules::ast::{Expr as Ast, Lit, Node, Operand};
 use roxy_tls::{Ca, CaError, LeafMinter};
 
 use crate::config::{Action, Config};
@@ -32,33 +31,6 @@ pub struct Capabilities {
     pub state_store: bool,
 }
 
-fn node_uses_list(n: &Node) -> bool {
-    fn operand(o: &Operand) -> bool {
-        match o {
-            Operand::Lit(l) => lit(&l.lit),
-            Operand::Field(_) => false,
-        }
-    }
-    fn lit(l: &Lit) -> bool {
-        match l {
-            Lit::AddressList(_) => true,
-            Lit::List(items) => items.iter().any(|i| lit(&i.lit)),
-            _ => false,
-        }
-    }
-    match &n.expr {
-        Ast::Or(a, b) | Ast::And(a, b) => node_uses_list(a) || node_uses_list(b),
-        Ast::Not(a) => node_uses_list(a),
-        Ast::Cmp { lhs, rhs, .. } => operand(lhs) || operand(rhs),
-        Ast::Pred(o) => operand(o),
-    }
-}
-
-fn expr_uses_list(e: Option<&crate::config::Expr>) -> bool {
-    e.and_then(|e| roxy_rules::parse(e.as_str()).ok())
-        .is_some_and(|n| node_uses_list(&n))
-}
-
 /// Features the config uses that this build cannot run. `roxy check`
 /// accepts them; `roxy run` refuses to start (and a reload is rejected)
 /// rather than run with every affected flow failing closed.
@@ -69,16 +41,6 @@ pub fn unsupported(config: &Config, caps: Capabilities) -> Vec<String> {
             "this build has no metric store yet ({} metric(s) defined under `metrics`)",
             config.metrics.len()
         ));
-    }
-    let list_refs = config.rules.iter().any(|r| expr_uses_list(r.when.as_ref()))
-        || config
-            .metrics
-            .iter()
-            .any(|m| expr_uses_list(m.where_.as_ref()));
-    if list_refs || !config.upstream.deny_lists.is_empty() {
-        out.push(
-            "address lists not in this build (`@list` references or `upstream.deny_lists`)".into(),
-        );
     }
     let actions = || config.rules.iter().flat_map(|r| r.then.0.iter());
     if actions().any(|a| matches!(a, Action::Capture(_))) {
@@ -108,7 +70,8 @@ pub fn load_checked(path: &Path) -> Result<Config, Vec<String>> {
     Ok(config)
 }
 
-/// Everything a reload may change, resolved (secrets, users files).
+/// Everything a reload may change, resolved (secrets, users files, address
+/// lists). Any address list that fails to load fails the whole update.
 pub fn policy_update(config: &Config) -> anyhow::Result<PolicyUpdate> {
     let policy = config.compile_policy().map_err(|diags| {
         anyhow!(
@@ -135,6 +98,11 @@ pub fn policy_update(config: &Config) -> anyhow::Result<PolicyUpdate> {
             users.insert(l.name.clone(), Arc::new(db));
         }
     }
+    let address_lists = crate::lists::load_all(config)
+        .map_err(|errs| anyhow!("address lists failed to load: {}", errs.join("; ")))?;
+    for (name, list) in &address_lists {
+        tracing::info!(list = %name, entries = list.len(), "address list loaded");
+    }
     let secret_map = config
         .secrets
         .keys()
@@ -148,6 +116,8 @@ pub fn policy_update(config: &Config) -> anyhow::Result<PolicyUpdate> {
         limits: config.into(),
         flags: config.into(),
         upstream: config.into(),
+        address_lists: Arc::new(address_lists),
+        deny_lists: config.upstream.deny_lists.clone(),
     })
 }
 
@@ -197,6 +167,9 @@ pub struct Reloader {
     /// The built-in metric store, rebuilt (with carry-over) on each reload.
     /// `None` when the caller supplied its own `MetricSource`.
     metrics: Option<Arc<crate::stores::ReloadableMetrics>>,
+    /// The file watcher, told about the current address list files on
+    /// every reload attempt.
+    watch: OnceLock<Arc<Watch>>,
 }
 
 impl std::fmt::Debug for Reloader {
@@ -249,7 +222,18 @@ impl Reloader {
     pub fn reload(&self) -> bool {
         let sink = self.handle.sink();
         let attempt = || -> Result<(Config, PolicyUpdate), Vec<String>> {
-            let config = load_checked(&self.path)?;
+            let config = Config::load(&self.path).map_err(|e| vec![format!("{e:#}")])?;
+            // Track the list files even if this attempt fails, so fixing (or
+            // creating) a broken list file triggers the next reload.
+            if let Some(w) = self.watch.get() {
+                w.track(&self.path, &crate::lists::files(&config));
+            }
+            config.validate().map_err(|diags| {
+                diags
+                    .iter()
+                    .map(|d| format!("{}:{d}", self.path.display()))
+                    .collect::<Vec<_>>()
+            })?;
             let bad = unsupported(&config, self.caps);
             if !bad.is_empty() {
                 return Err(bad);
@@ -307,33 +291,91 @@ impl Reloader {
     }
 }
 
-/// Watches the config file's directory (editors replace files rather than
-/// writing them in place) and reloads after a short debounce.
-fn spawn_watcher(path: &Path, reloader: Arc<Reloader>) -> anyhow::Result<RecommendedWatcher> {
+/// Watches the config file and every address list file. Directories are
+/// watched (editors replace files rather than writing them in place) and
+/// events are filtered to the tracked files.
+struct Watch {
+    watcher: Mutex<RecommendedWatcher>,
+    /// Absolute paths of the tracked files.
+    targets: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Directories already watched.
+    dirs: Mutex<HashSet<PathBuf>>,
+}
+
+fn absolute(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+impl Watch {
+    /// Tracks exactly `config` plus `lists` from now on.
+    fn track(&self, config: &Path, lists: &[PathBuf]) {
+        let targets: HashSet<PathBuf> = std::iter::once(config)
+            .chain(lists.iter().map(PathBuf::as_path))
+            .map(absolute)
+            .collect();
+        {
+            let mut dirs = self.dirs.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut watcher = self.watcher.lock().unwrap_or_else(PoisonError::into_inner);
+            for t in &targets {
+                let dir = t
+                    .parent()
+                    .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+                if dirs.contains(&dir) {
+                    continue;
+                }
+                match watcher.watch(&dir, RecursiveMode::NonRecursive) {
+                    Ok(()) => {
+                        dirs.insert(dir);
+                    }
+                    Err(e) => {
+                        tracing::warn!(dir = %dir.display(), error = %e, "cannot watch directory; changes there need SIGHUP");
+                    }
+                }
+            }
+        }
+        *self.targets.lock().unwrap_or_else(PoisonError::into_inner) = targets;
+    }
+}
+
+/// Starts the watcher and reloads after a short debounce when any tracked
+/// file changes.
+fn spawn_watcher(
+    path: &Path,
+    config: &Config,
+    reloader: Arc<Reloader>,
+) -> anyhow::Result<Arc<Watch>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(16);
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow!("config path has no file name"))?
-        .to_owned();
-    let dir = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+    let targets: Arc<Mutex<HashSet<PathBuf>>> = Arc::default();
+    let t = targets.clone();
+    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(ev) = res
             && !matches!(ev.kind, EventKind::Access(_))
-            && ev
-                .paths
-                .iter()
-                .any(|p| p.file_name() == Some(file_name.as_os_str()))
         {
-            let _ = tx.try_send(());
+            let targets = t.lock().unwrap_or_else(PoisonError::into_inner);
+            if ev.paths.iter().any(|p| targets.contains(p)) {
+                let _ = tx.try_send(());
+            }
         }
     })
     .context("starting the config file watcher")?;
-    watcher
-        .watch(&dir, RecursiveMode::NonRecursive)
-        .with_context(|| format!("watching {}", dir.display()))?;
+    let watch = Arc::new(Watch {
+        watcher: Mutex::new(watcher),
+        targets,
+        dirs: Mutex::new(HashSet::new()),
+    });
+    let config_dir = absolute(path)
+        .parent()
+        .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+    watch.track(path, &crate::lists::files(config));
+    if !watch
+        .dirs
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&config_dir)
+    {
+        return Err(anyhow!("watching {}", config_dir.display()));
+    }
+    let _ = reloader.watch.set(watch.clone());
     tokio::spawn(async move {
         while rx.recv().await.is_some() {
             tokio::time::sleep(RELOAD_DEBOUNCE).await;
@@ -341,14 +383,14 @@ fn spawn_watcher(path: &Path, reloader: Arc<Reloader>) -> anyhow::Result<Recomme
             reloader.reload_async().await;
         }
     });
-    Ok(watcher)
+    Ok(watch)
 }
 
 /// A started server plus its reload machinery.
 pub struct Running {
     pub server: Server,
     pub reloader: Arc<Reloader>,
-    watcher: Option<RecommendedWatcher>,
+    watcher: Option<Arc<Watch>>,
 }
 
 impl std::fmt::Debug for Running {
@@ -442,11 +484,12 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
         path: path.to_path_buf(),
         handle: server.handle(),
         caps,
-        last: Mutex::new(config),
+        last: Mutex::new(config.clone()),
         metrics: builtin_metrics,
+        watch: OnceLock::new(),
     });
     let watcher = if opts.watch {
-        Some(spawn_watcher(path, reloader.clone())?)
+        Some(spawn_watcher(path, &config, reloader.clone())?)
     } else {
         None
     };
@@ -480,12 +523,7 @@ mod tests {
 version: 1
 metrics:
   - { id: m, count: requests }
-address_lists:
-  - { name: bad, inline: [10.0.0.0/8] }
 rules:
-  - id: lists
-    when: client.ip in @bad
-    then: deny
   - id: effects
     then:
       - capture: request
@@ -494,13 +532,7 @@ rules:
       - allow
 ");
         let bad = unsupported(&c, Capabilities::default()).join("\n");
-        for needle in [
-            "no metric store",
-            "address lists",
-            "`capture`",
-            "`call`",
-            "`set_state`",
-        ] {
+        for needle in ["no metric store", "`capture`", "`call`", "`set_state`"] {
             assert!(bad.contains(needle), "{needle}: {bad}");
         }
         let with_stores = unsupported(
@@ -513,14 +545,17 @@ rules:
         .join("\n");
         assert!(!with_stores.contains("metric store"));
         assert!(!with_stores.contains("set_state"));
-        assert!(with_stores.contains("address lists"));
     }
 
     #[test]
-    fn deny_lists_are_refused() {
+    fn address_lists_are_supported() {
         let c = cfg(
-            "version: 1\naddress_lists: [{ name: b, inline: [1.2.3.4] }]\nupstream: { deny_lists: [b] }\n",
+            "version: 1\naddress_lists: [{ name: b, inline: [1.2.3.4] }]\nupstream: { deny_lists: [b] }\n\
+             rules: [{ id: r, when: 'client.ip in @b', then: deny }]\n",
         );
-        assert_eq!(unsupported(&c, Capabilities::default()).len(), 1);
+        assert_eq!(
+            unsupported(&c, Capabilities::default()),
+            Vec::<String>::new()
+        );
     }
 }

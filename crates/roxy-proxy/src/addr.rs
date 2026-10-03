@@ -3,8 +3,11 @@
 //! cannot reach private destinations.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 use ipnet::IpNet;
+
+use crate::addrlist::AddressList;
 
 /// Address-policy settings (`upstream.*`).
 #[derive(Debug, Clone)]
@@ -14,9 +17,12 @@ pub struct AddressPolicy {
     pub deny_private_ranges: bool,
     /// Never valid destinations; nothing opts out.
     pub deny_cidrs: Vec<IpNet>,
-    /// Exceptions to the private-range floor (not to `deny_cidrs`), for
-    /// internal services every flow may reach.
+    /// Exceptions to the private-range floor (not to `deny_cidrs` or
+    /// `deny_lists`), for internal services every flow may reach.
     pub allow_cidrs: Vec<IpNet>,
+    /// `upstream.deny_lists`, resolved (§7.1). Never valid destinations;
+    /// neither `private_ok` nor `allow_cidrs` opts out.
+    pub deny_lists: Vec<Arc<AddressList>>,
 }
 
 impl Default for AddressPolicy {
@@ -25,6 +31,7 @@ impl Default for AddressPolicy {
             deny_private_ranges: true,
             deny_cidrs: Vec::new(),
             allow_cidrs: Vec::new(),
+            deny_lists: Vec::new(),
         }
     }
 }
@@ -34,10 +41,12 @@ impl Default for AddressPolicy {
 pub struct AddressDenied {
     /// The (canonical) address.
     pub ip: IpAddr,
-    /// `private_range:<class>` or `deny_cidrs`.
+    /// `private_range:<class>`, `deny_cidrs` or `list:<name>`.
     pub reason: String,
-    /// The configured CIDR that matched, for `deny_cidrs`.
+    /// The configured CIDR that matched, for `deny_cidrs` and lists.
     pub matched_cidr: Option<IpNet>,
+    /// The address list that matched.
+    pub list: Option<String>,
 }
 
 /// IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible addresses become
@@ -59,7 +68,7 @@ pub fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
-fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
+pub(crate) fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
     let [o1, o2] = hi.to_be_bytes();
     let [o3, o4] = lo.to_be_bytes();
     Ipv4Addr::new(o1, o2, o3, o4)
@@ -118,15 +127,19 @@ pub fn private_class(ip: IpAddr) -> Option<&'static str> {
 }
 
 impl AddressPolicy {
-    /// Checks one candidate address. `private_ok` comes from the flow's
-    /// `allow: { private_ok: true }`; it never overrides `deny_cidrs`.
+    /// Checks one candidate address: `deny_cidrs`, then the private-range
+    /// floor, then every deny list. `private_ok` comes from the flow's
+    /// `allow: { private_ok: true }`; it never overrides `deny_cidrs` or a
+    /// deny list.
     pub fn check(&self, ip: IpAddr, private_ok: bool) -> Result<(), AddressDenied> {
+        let given = ip;
         let ip = canonical(ip);
         if let Some(net) = self.deny_cidrs.iter().find(|n| n.contains(&ip)) {
             return Err(AddressDenied {
                 ip,
                 reason: "deny_cidrs".into(),
                 matched_cidr: Some(*net),
+                list: None,
             });
         }
         if self.deny_private_ranges
@@ -138,7 +151,20 @@ impl AddressPolicy {
                 ip,
                 reason: format!("private_range:{class}"),
                 matched_cidr: None,
+                list: None,
             });
+        }
+        // The list lookup sees the address as given: it checks the v6 form
+        // as well as every IPv4 form (mapped, compatible, NAT64, 6to4).
+        for list in &self.deny_lists {
+            if let Some(net) = list.lookup(given) {
+                return Err(AddressDenied {
+                    ip,
+                    reason: format!("list:{}", list.name()),
+                    matched_cidr: Some(net),
+                    list: Some(list.name().to_owned()),
+                });
+            }
         }
         Ok(())
     }
@@ -197,6 +223,7 @@ mod tests {
             deny_private_ranges: true,
             deny_cidrs: vec!["1.2.3.0/24".parse().unwrap()],
             allow_cidrs: vec!["10.9.9.9/32".parse().unwrap()],
+            deny_lists: Vec::new(),
         };
         assert!(p.check(ip("127.0.0.1"), false).is_err());
         assert!(p.check(ip("127.0.0.1"), true).is_ok());
@@ -210,5 +237,53 @@ mod tests {
             p.check_all(&[ip("8.8.8.8"), ip("192.168.0.1")], false)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn deny_lists_are_a_hard_floor() {
+        let list =
+            AddressList::parse("blocked", "127.0.0.0/8\n203.0.113.0/24\n10.9.9.9\n").unwrap();
+        let p = AddressPolicy {
+            deny_private_ranges: true,
+            deny_cidrs: Vec::new(),
+            allow_cidrs: vec!["10.9.9.9/32".parse().unwrap()],
+            deny_lists: vec![Arc::new(list)],
+        };
+        // `private_ok` does not bypass a list.
+        let d = p.check(ip("127.0.0.1"), true).unwrap_err();
+        assert_eq!(d.reason, "list:blocked");
+        assert_eq!(d.list.as_deref(), Some("blocked"));
+        assert_eq!(d.matched_cidr, Some("127.0.0.0/8".parse().unwrap()));
+        // Neither does `allow_cidrs`.
+        assert_eq!(
+            p.check(ip("10.9.9.9"), true).unwrap_err().reason,
+            "list:blocked"
+        );
+        // Without private_ok the private floor answers first.
+        assert_eq!(
+            p.check(ip("127.0.0.1"), false).unwrap_err().reason,
+            "private_range:loopback"
+        );
+        // Public address, v6 spellings of it.
+        for a in [
+            "203.0.113.7",
+            "::ffff:203.0.113.7",
+            "64:ff9b::cb00:7107",
+            "2002:cb00:7107::1",
+        ] {
+            let d = p.check(ip(a), true).unwrap_err();
+            assert_eq!(d.list.as_deref(), Some("blocked"), "{a}");
+            assert_eq!(
+                d.matched_cidr,
+                Some("203.0.113.0/24".parse().unwrap()),
+                "{a}"
+            );
+        }
+        // Any listed candidate denies the whole set.
+        let d = p
+            .check_all(&[ip("8.8.8.8"), ip("203.0.113.1")], true)
+            .unwrap_err();
+        assert_eq!(d.ip, ip("203.0.113.1"));
+        assert!(p.check_all(&[ip("8.8.8.8"), ip("1.1.1.1")], true).is_ok());
     }
 }

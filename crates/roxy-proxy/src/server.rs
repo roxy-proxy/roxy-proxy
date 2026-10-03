@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::addr::canonical;
+use crate::addrlist::AddressLists;
 use crate::auth::UserDb;
 use crate::config::{PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowEvent, FlowSink, Redactor};
@@ -35,6 +36,9 @@ pub(crate) struct Snapshot {
     pub flags: Arc<HttpFlags>,
     /// Rebuilt on every reload, which also flushes the upstream pools.
     pub upstream: Arc<Upstream>,
+    /// Address lists for `ip in @name` (and, resolved into the upstream's
+    /// address policy, `upstream.deny_lists`).
+    pub address_lists: Arc<AddressLists>,
 }
 
 /// Per-client and global connection counting (§12).
@@ -161,7 +165,17 @@ impl Shared {
 }
 
 fn build_snapshot(u: PolicyUpdate, tls: &Arc<ClientConfig>) -> Result<Snapshot, String> {
-    let upstream = Upstream::new(&u.upstream, tls)?;
+    let mut settings = u.upstream;
+    for name in &u.deny_lists {
+        // Fail closed: a deny list that is not loaded refuses the snapshot
+        // (startup error, or the reload fails and the old lists stay).
+        let list = u
+            .address_lists
+            .get(name)
+            .ok_or_else(|| format!("upstream.deny_lists: address list {name:?} is not loaded"))?;
+        settings.address_policy.deny_lists.push(list.clone());
+    }
+    let upstream = Upstream::new(&settings, tls)?;
     Ok(Snapshot {
         policy: u.policy,
         secrets: u.secrets,
@@ -170,6 +184,7 @@ fn build_snapshot(u: PolicyUpdate, tls: &Arc<ClientConfig>) -> Result<Snapshot, 
         limits: Arc::new(u.limits),
         flags: Arc::new(u.flags),
         upstream: Arc::new(upstream),
+        address_lists: u.address_lists,
     })
 }
 

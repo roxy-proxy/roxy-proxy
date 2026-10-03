@@ -3,6 +3,7 @@
 //! and later wiring code can use it directly.
 
 pub mod config;
+pub mod lists;
 pub mod ruletest;
 pub mod run;
 pub mod secrets;

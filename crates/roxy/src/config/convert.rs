@@ -67,6 +67,9 @@ impl From<&Config> for UpstreamSettings {
                 deny_private_ranges: u.deny_private_ranges,
                 deny_cidrs: u.deny_cidrs.clone(),
                 allow_cidrs: u.allow_cidrs.clone(),
+                // Resolved from `upstream.deny_lists` when the snapshot is
+                // built (`PolicyUpdate::deny_lists`).
+                deny_lists: Vec::new(),
             },
             connect_timeout: u.connect_timeout,
             ..UpstreamSettings::default()

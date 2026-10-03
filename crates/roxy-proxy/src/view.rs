@@ -19,6 +19,7 @@ use std::sync::{Mutex, PoisonError};
 use roxy_http::{Headers, Host, Query, Scheme};
 use roxy_rules::{BodyText, Field, FlowView, Value};
 
+use crate::addrlist::AddressLists;
 use crate::flowlog::TlsInfo;
 use crate::listener::ClientConn;
 use crate::sources::{MetricSource, MetricSourceError, StateSource};
@@ -161,6 +162,8 @@ pub(crate) struct ProxyView<'a> {
     pub facts: &'a FlowFacts,
     metrics: &'a dyn MetricSource,
     state: &'a dyn StateSource,
+    /// The snapshot's address lists, for `ip in @name`.
+    lists: &'a AddressLists,
     /// The first metric error met during evaluation, so a fail-closed
     /// outcome can say *why* (`metric_table_full` vs unavailable).
     metric_error: Mutex<Option<MetricSourceError>>,
@@ -171,11 +174,13 @@ impl<'a> ProxyView<'a> {
         facts: &'a FlowFacts,
         metrics: &'a dyn MetricSource,
         state: &'a dyn StateSource,
+        lists: &'a AddressLists,
     ) -> Self {
         Self {
             facts,
             metrics,
             state,
+            lists,
             metric_error: Mutex::new(None),
         }
     }
@@ -319,9 +324,10 @@ impl FlowView for ProxyView<'_> {
             .map_or(BodyText::Unavailable, |r| r.body.as_body_text())
     }
 
-    fn in_address_list(&self, _list: &str, _ip: IpAddr) -> Option<bool> {
-        // Address lists arrive in M2; `roxy run` refuses policies that use
-        // them, and an unanswerable lookup fails closed in the engine.
-        None
+    fn in_address_list(&self, list: &str, ip: IpAddr) -> Option<bool> {
+        // The compiler only accepts names defined under `address_lists`, and
+        // every defined list is loaded into the snapshot or the snapshot is
+        // refused; `None` (fail closed) is the "cannot happen" answer.
+        self.lists.get(list).map(|l| l.contains(ip))
     }
 }

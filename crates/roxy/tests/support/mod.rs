@@ -332,6 +332,8 @@ pub struct Opts<'a> {
     pub users: Option<String>,
     /// Top-level YAML appended before `rules:` (e.g. `metrics:`).
     pub extra: &'a str,
+    /// Extra lines under `upstream:` (e.g. `deny_lists: [x]`).
+    pub upstream: &'a str,
     /// A metric store to plug in.
     pub metrics: Option<Arc<dyn roxy_proxy::MetricSource>>,
 }
@@ -408,7 +410,7 @@ http:
   max_inspect_body_bytes: 1kb
 {limits}upstream:
   connect_timeout: 2s
-  dns:
+{upstream}  dns:
     resolver: ["127.0.0.1:9"]
     static_hosts:
       upstream.test: 127.0.0.1
@@ -426,6 +428,7 @@ log:
             dir = dir.display(),
             http = indent(opts.http, 2),
             limits = indent(opts.limits, 2),
+            upstream = indent(opts.upstream, 2),
             extra = opts.extra,
             rules = if rules.trim().is_empty() {
                 "  []\n".to_owned()

@@ -235,14 +235,18 @@ fn rule_test(args: &RuleTestArgs) -> anyhow::Result<ExitCode> {
         eprintln!("roxy rule test: warning: {w}");
     }
     let phase = Phase::from(args.phase);
-    let out = ruletest::run(&policy, phase, &view, &req.tags);
+    let mut out = ruletest::run(&policy, phase, &view, &req.tags);
+    let address = ruletest::address_check(&config, &view, &out);
+    if matches!(address, Some(Err(_))) {
+        ruletest::apply_address_denial(&mut out);
+    }
     // Secrets are never resolved here, so the redactor has none registered;
     // effect text still goes through it so a future change cannot leak.
     let redactor = Redactor::new();
     let note = ruletest::metric_note(&ruletest::metric_values(&config, &req));
     print!(
         "{}",
-        ruletest::report(phase, note.as_deref(), &out, &redactor)
+        ruletest::report(phase, note.as_deref(), address.as_ref(), &out, &redactor)
     );
     Ok(ExitCode::from(ruletest::exit_code(&out.decision)))
 }
@@ -325,6 +329,23 @@ fn check(path: &Path) -> ExitCode {
     };
     match config.validate() {
         Ok(()) => {
+            // Load every address list fully: a bad line is reported as
+            // `<file>:<line>: ...`, exactly as startup would fail.
+            let lists = match roxy::lists::load_all(&config) {
+                Ok(l) => l,
+                Err(errs) => {
+                    for e in &errs {
+                        eprintln!("{e}");
+                    }
+                    eprintln!("{}: {} problem(s) found", path.display(), errs.len());
+                    return ExitCode::FAILURE;
+                }
+            };
+            for spec in &config.address_lists {
+                if let Some(l) = lists.get(&spec.name) {
+                    println!("address list {}: {} entries", spec.name, l.len());
+                }
+            }
             println!(
                 "{}: OK ({} listener(s), {} rule(s), {} metric(s), {} secret(s), {} addon(s))",
                 path.display(),

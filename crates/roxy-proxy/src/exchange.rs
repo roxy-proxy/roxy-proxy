@@ -169,10 +169,10 @@ fn upstream_refusal(cx: &FlowCx, e: &ConnectError, host: &str, port: u16) -> Ref
             port,
             resolved_ip: Some(d.ip),
             reason: d.reason.clone(),
-            list: None,
+            list: d.list.clone(),
             matched_cidr: d.matched_cidr.map(|c| c.to_string()),
         });
-        tracing::info!(flow = %cx.flow, host, ip = %d.ip, reason = %d.reason, "upstream address denied");
+        tracing::info!(flow = %cx.flow, host, ip = %d.ip, reason = %d.reason, list = ?d.list, "upstream address denied");
         return Refusal::address_policy("address_policy");
     }
     let reason = e.reason();

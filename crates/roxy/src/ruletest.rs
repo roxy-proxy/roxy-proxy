@@ -1,14 +1,66 @@
 //! `roxy rule test` (DESIGN.md §6.6): evaluate a synthetic flow against the
 //! compiled policy without any network I/O.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::net::IpAddr;
+use std::sync::Arc;
 
-use ipnet::IpNet;
 use roxy_proxy::Redactor;
-use roxy_rules::{Decision, EvalContext, Field, MapView, Outcome, Phase, Policy, Value};
+use roxy_proxy::addr::AddressDenied;
+use roxy_proxy::addrlist::AddressLists;
+use roxy_rules::{
+    BodyText, Decision, EvalContext, Field, FlowView, MapView, Outcome, Phase, Policy, RuleId,
+    Value,
+};
 
-use crate::config::{AddressListSource, Config};
+use crate::config::Config;
+
+/// The dry-run flow: a [`MapView`] whose address lists are the same
+/// compiled [`roxy_proxy::AddressList`]s `roxy run` uses.
+#[derive(Debug, Clone, Default)]
+pub struct DryRunView {
+    pub map: MapView,
+    /// Loaded lists; a list missing here (failed to load) answers `None`,
+    /// which fails the flow closed, as it would at run time.
+    pub lists: AddressLists,
+}
+
+impl FlowView for DryRunView {
+    fn field(&self, f: Field) -> Value<'_> {
+        self.map.field(f)
+    }
+    fn header(&self, name: &str) -> Option<Cow<'_, str>> {
+        self.map.header(name)
+    }
+    fn header_all(&self, name: &str) -> Vec<Cow<'_, str>> {
+        self.map.header_all(name)
+    }
+    fn response_header(&self, name: &str) -> Option<Cow<'_, str>> {
+        self.map.response_header(name)
+    }
+    fn response_header_all(&self, name: &str) -> Vec<Cow<'_, str>> {
+        self.map.response_header_all(name)
+    }
+    fn query(&self, key: &str) -> Option<Cow<'_, str>> {
+        self.map.query(key)
+    }
+    fn metric(&self, id: &str) -> Option<i64> {
+        self.map.metric(id)
+    }
+    fn state(&self, key: &str) -> Option<Cow<'_, str>> {
+        self.map.state(key)
+    }
+    fn body_text(&self) -> BodyText<'_> {
+        self.map.body_text()
+    }
+    fn response_body_text(&self) -> BodyText<'_> {
+        self.map.response_body_text()
+    }
+    fn in_address_list(&self, list: &str, ip: IpAddr) -> Option<bool> {
+        self.lists.get(list).map(|l| l.contains(ip))
+    }
+}
 
 /// A dry-run request described on the command line.
 #[derive(Debug, Clone)]
@@ -234,10 +286,11 @@ pub fn parse_pair(s: &str) -> Result<(String, String), String> {
         .ok_or_else(|| format!("{s:?} must look like `key=value`"))
 }
 
-/// Build the flow the rules see. Address lists are backed by the config's
-/// inline entries and readable files (unreadable files stay unloaded, which
-/// makes `in @list` false, as at run time); warnings are returned.
-pub fn build_view(config: &Config, req: &TestRequest) -> Result<(MapView, Vec<String>), String> {
+/// Build the flow the rules see. Address lists are loaded exactly as at run
+/// time; if any fails to load, a warning is returned and every list stays
+/// unloaded, so `in @list` fails closed (at run time the config would not
+/// start at all).
+pub fn build_view(config: &Config, req: &TestRequest) -> Result<(DryRunView, Vec<String>), String> {
     let url = parse_url(&req.url)?;
     let mut warnings = Vec::new();
     let host_ip = url.host.parse::<IpAddr>().ok();
@@ -310,41 +363,67 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(MapView, Vec<St
     for (k, val) in &req.state {
         v = v.with_state(k, val);
     }
-    for list in &config.address_lists {
-        let entries: Vec<String> = match &list.source {
-            AddressListSource::Inline(e) => e.clone(),
-            AddressListSource::File(path) => match std::fs::read_to_string(path) {
-                Ok(text) => text
-                    .lines()
-                    .map(|l| l.split('#').next().unwrap_or("").trim().to_owned())
-                    .filter(|l| !l.is_empty())
-                    .collect(),
-                Err(e) => {
-                    warnings.push(format!(
-                        "address list @{}: cannot read {}: {e}; treating it as unavailable",
-                        list.name,
-                        path.display()
-                    ));
-                    continue;
-                }
-            },
-        };
-        let nets: Vec<IpNet> = entries
-            .iter()
-            .filter_map(|e| {
-                e.parse::<IpNet>()
-                    .ok()
-                    .or_else(|| e.parse::<IpAddr>().ok().map(IpNet::from))
-            })
-            .collect();
-        v = v.with_address_list(&list.name, nets);
+    let lists = match crate::lists::load_all(config) {
+        Ok(l) => l,
+        Err(errs) => {
+            for e in errs {
+                warnings.push(format!("{e}; treating address lists as unavailable"));
+            }
+            AddressLists::new()
+        }
+    };
+    Ok((DryRunView { map: v, lists }, warnings))
+}
+
+/// The upstream address floor (§7, §7.1) for an IP-literal URL, as the
+/// connector would apply it: private ranges (unless `private_ok`),
+/// `deny_cidrs` and every `upstream.deny_lists` list. `None` when the host
+/// is a name (it is not resolved in a dry run) or the decision is not an
+/// allow.
+pub fn address_check(
+    config: &Config,
+    view: &DryRunView,
+    out: &Outcome,
+) -> Option<Result<IpAddr, AddressDenied>> {
+    let Decision::Allow(opts) = &out.decision else {
+        return None;
+    };
+    let Value::Ip(ip) = view.map.field(Field::DstIp) else {
+        return None;
+    };
+    let mut policy = roxy_proxy::UpstreamSettings::from(config).address_policy;
+    policy.deny_lists = config
+        .upstream
+        .deny_lists
+        .iter()
+        .map(|n| view.lists.get(n).cloned())
+        .collect::<Option<Vec<Arc<_>>>>()
+        .unwrap_or_default();
+    if policy.deny_lists.len() != config.upstream.deny_lists.len() {
+        // A deny list failed to load: `roxy run` would refuse the config.
+        return Some(Err(AddressDenied {
+            ip,
+            reason: "deny list unavailable".into(),
+            matched_cidr: None,
+            list: None,
+        }));
     }
-    Ok((v, warnings))
+    Some(policy.check(ip, opts.private_ok).map(|()| ip))
+}
+
+/// Applies an address-policy denial to the outcome: `403 _address_policy`.
+pub fn apply_address_denial(out: &mut Outcome) {
+    out.decision = Decision::Deny {
+        status: 403,
+        message: roxy_rules::DEFAULT_DENY_MESSAGE.to_owned(),
+        close: true,
+    };
+    out.terminal_rule = RuleId::new("_address_policy");
 }
 
 /// Evaluate `req` in `phase`. Secrets are not resolved: each
 /// `${secret:name}` becomes the placeholder `[secret:name]`.
-pub fn run(policy: &Policy, phase: Phase, view: &MapView, tags: &[String]) -> Outcome {
+pub fn run(policy: &Policy, phase: Phase, view: &DryRunView, tags: &[String]) -> Outcome {
     let placeholder = |name: &str| Some(format!("[secret:{name}]"));
     let ctx = EvalContext {
         secrets: &placeholder,
@@ -354,7 +433,14 @@ pub fn run(policy: &Policy, phase: Phase, view: &MapView, tags: &[String]) -> Ou
 }
 
 /// Human-readable report. Effect text passes through `redactor`.
-pub fn report(phase: Phase, metrics: Option<&str>, out: &Outcome, redactor: &Redactor) -> String {
+/// `address` is the result of [`address_check`], when it ran.
+pub fn report(
+    phase: Phase,
+    metrics: Option<&str>,
+    address: Option<&Result<IpAddr, AddressDenied>>,
+    out: &Outcome,
+    redactor: &Redactor,
+) -> String {
     let mut s = String::new();
     let list = |items: Vec<String>| {
         if items.is_empty() {
@@ -381,6 +467,23 @@ pub fn report(phase: Phase, metrics: Option<&str>, out: &Outcome, redactor: &Red
         }
     }
     let _ = writeln!(s, "tags:     {}", list(out.tags.clone()));
+    match address {
+        Some(Ok(ip)) => {
+            let _ = writeln!(s, "address:  {ip} allowed by the upstream address policy");
+        }
+        Some(Err(d)) => {
+            let _ = write!(
+                s,
+                "address:  {} denied by the upstream address policy ({}",
+                d.ip, d.reason
+            );
+            if let Some(net) = d.matched_cidr {
+                let _ = write!(s, ", matched {net}");
+            }
+            let _ = writeln!(s, ")");
+        }
+        None => {}
+    }
     let _ = writeln!(s, "decision: {}", out.decision);
     let _ = writeln!(s, "rule:     {}", out.terminal_rule);
     if let Some(reason) = &out.fail_closed_reason {

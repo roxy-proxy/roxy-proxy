@@ -63,6 +63,54 @@ pub fn size<'de, D: Deserializer<'de>>(d: D) -> Result<ByteSize, D::Error> {
     d.deserialize_any(V)
 }
 
+/// `deserialize_with` for optional [`ByteSize`] fields (use with
+/// `#[serde(default)]`).
+pub fn opt_size<'de, D: Deserializer<'de>>(d: D) -> Result<Option<ByteSize>, D::Error> {
+    size(d).map(Some)
+}
+
+// ----- counts ---------------------------------------------------------------
+
+/// Parse a count such as `100000` or `100_000_000` (underscores as digit
+/// separators, as in the documented examples).
+pub fn parse_count(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    if t.is_empty()
+        || t.starts_with('_')
+        || t.ends_with('_')
+        || !t.bytes().all(|b| b.is_ascii_digit() || b == b'_')
+    {
+        return Err(format!(
+            "invalid count {s:?}: expected digits, e.g. 100_000_000"
+        ));
+    }
+    t.replace('_', "")
+        .parse()
+        .map_err(|_| format!("invalid count {s:?}: too large"))
+}
+
+/// `deserialize_with` for optional counts: an integer or a string with `_`
+/// separators (use with `#[serde(default)]`).
+pub fn opt_count<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    struct V;
+    impl Visitor<'_> for V {
+        type Value = u64;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a non-negative integer such as 100_000_000")
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u64, E> {
+            Ok(v)
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<u64, E> {
+            u64::try_from(v).map_err(|_| E::custom("count must not be negative"))
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<u64, E> {
+            parse_count(v).map_err(E::custom)
+        }
+    }
+    d.deserialize_any(V).map(Some)
+}
+
 // ----- resolver -------------------------------------------------------------
 
 /// `upstream.dns.resolver`: `system` or a list of nameserver socket addresses.
@@ -118,6 +166,23 @@ mod tests {
         assert_eq!(parse_size("1mb"), Ok(1024 * 1024));
         assert_eq!(parse_size("1gb"), Ok(1024 * 1024 * 1024));
         assert_eq!(parse_size("2TB"), Ok(2 << 40));
+    }
+
+    #[test]
+    fn counts() {
+        assert_eq!(parse_count("100_000_000"), Ok(100_000_000));
+        assert_eq!(parse_count("42"), Ok(42));
+        for bad in [
+            "",
+            "_1",
+            "1_",
+            "1e6",
+            "-1",
+            "1.0",
+            "99999999999999999999999",
+        ] {
+            assert!(parse_count(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

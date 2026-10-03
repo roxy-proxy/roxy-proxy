@@ -48,13 +48,24 @@ limits:
   max_connections: 10000
   max_connections_per_client: 256
   max_metric_keys: 100000
+  max_address_list_bytes: 256mb   # largest address list file roxy will load
 
 upstream:
   dns:
     resolver: system           # system | [ "1.1.1.1:53", ... ]
     cache_ttl_cap: 60s
   deny_private_ranges: true    # loopback, link-local, RFC1918, ULA, multicast, unspecified
+  deny_lists: [cloud-metadata] # hard floor checked on every connect; private_ok does not bypass it
   connect_timeout: 10s
+
+# Named CIDR lists (§7.1): usable as `ip in @name` in rules and as
+# `upstream.deny_lists`. File lists hold one CIDR or address per line with
+# `#` comments, and are reloaded when the file changes.
+address_lists:
+  - name: cloud-metadata
+    inline: [169.254.169.254/32, "fd00:ec2::254/128", 100.100.100.200/32]
+  # - name: blocked
+  #   file: /etc/roxy/lists/blocked.txt
 
 secrets:
   openai: { env: OPENAI_API_KEY }
@@ -107,6 +118,12 @@ rules:
 addons:
   - name: pii-scan
     path: /etc/roxy/addons/pii_scan.wasm
-    hooks: [request, response]
+    stage: before_rules          # before_rules | in_chain | after_rules
     config: { threshold: 0.8 }
     capabilities: [state, log]
+    limits:                      # each optional; defaults to the global setting
+      max_memory: 64mb
+      max_buffered_body_bytes: 1mb
+      step_cpu: 50ms
+      fuel_per_step: 100_000_000
+    on_error: deny               # deny (default) | close. There is no "pass".

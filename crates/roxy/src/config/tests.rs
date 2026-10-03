@@ -48,10 +48,19 @@ fn full_example_parses_and_validates() {
     assert_eq!(cfg.rules.len(), 7);
     assert_eq!(cfg.rules[2].then.0.len(), 2);
     assert_eq!(cfg.rules[6].phase, Phase::Response);
+    assert_eq!(cfg.addons[0].stage, AddonStage::BeforeRules);
+    assert_eq!(cfg.addons[0].on_error, OnError::Deny);
     assert_eq!(
-        cfg.addons[0].hooks,
-        vec![AddonHook::Request, AddonHook::Response]
+        cfg.addons[0].limits.max_memory,
+        Some(ByteSize::b(64 * 1024 * 1024))
     );
+    assert_eq!(cfg.addons[0].limits.fuel_per_step, Some(100_000_000));
+    assert_eq!(
+        cfg.addons[0].limits.step_cpu,
+        Some(Duration::from_millis(50))
+    );
+    assert_eq!(cfg.address_lists.len(), 1);
+    assert_eq!(cfg.upstream.deny_lists, ["cloud-metadata"]);
     assert_eq!(
         cfg.addons[0].capabilities,
         vec![Capability::State, Capability::Log]
@@ -145,7 +154,9 @@ fn unknown_fields_rejected_everywhere() {
         "secrets: { a: { vault: X } }",
         "metrics: [{ id: m, count: requests, every: 1m }]",
         "rules: [{ id: r, then: allow, when_not: true }]",
-        "addons: [{ name: a, path: /a.wasm, hooks: [request], fuel: 1 }]",
+        "addons: [{ name: a, path: /a.wasm, fuel: 1 }]",
+        "addons: [{ name: a, path: /a.wasm, hooks: [request] }]",
+        "addons: [{ name: a, path: /a.wasm, limits: { max_cpu: 1s } }]",
         "log: { flow: { file: /x } }",
     ] {
         let yaml = if bad.starts_with("listeners") {
@@ -164,8 +175,9 @@ fn unknown_enum_values_rejected() {
         "tls: { upstream: { verify: lax } }",
         "tls: { upstream: { min_version: \"1.1\" } }",
         "metrics: [{ id: m, count: bananas }]",
-        "addons: [{ name: a, path: /a.wasm, hooks: [connect] }]",
-        "addons: [{ name: a, path: /a.wasm, hooks: [request], capabilities: [network] }]",
+        "addons: [{ name: a, path: /a.wasm, stage: whenever }]",
+        "addons: [{ name: a, path: /a.wasm, capabilities: [network] }]",
+        "addons: [{ name: a, path: /a.wasm, on_error: ignore }]",
     ] {
         assert!(
             Config::from_yaml(&format!("{BASE}{bad}\n")).is_err(),
@@ -273,7 +285,7 @@ fn misc_diagnostics() {
         "version: 2\nlisteners: []\nca_server: { bind: 127.0.0.1:1 }\n\
          tls: { upstream: { verify: strict+extra_roots } }\n\
          metrics: [{ id: bad-id, count: requests }]\n\
-         addons: [{ name: x, path: /x.wasm, hooks: [] }]\n\
+         addons: [{ name: x, path: /x.wasm }, { name: x, path: /y.wasm }]\n\
          rules:\n  - { id: _default, then: allow }\n  - { id: c, then: { call: nope } }\n",
     );
     let paths: Vec<&str> = d.iter().map(|d| d.path.as_str()).collect();
@@ -283,7 +295,7 @@ fn misc_diagnostics() {
             "version",
             "listeners",
             "tls.upstream.verify",
-            "addons[0].hooks",
+            "addons[1].name",
             "metrics[0].id",
             "rules[0].id",
             "rules[1].then[0]",
@@ -363,7 +375,7 @@ fn address_lists_parse_and_validate() {
     assert_eq!(cfg.upstream.deny_lists, ["blocked-v4"]);
 
     let d = diagnostics(&format!(
-        "{BASE}address_lists:\n  - {{ name: bad name, inline: [10.0.0.0/33, nope] }}\n  \
+        "{BASE}address_lists:\n  - {{ name: bad name, inline: [10.0.0.0/33, nope, 10.0.0.1/8] }}\n  \
          - {{ name: x, file: /surely/not/here.txt }}\n  - {{ name: x, inline: [] }}\n\
          upstream: {{ deny_lists: [missing] }}\n\
          rules:\n  - {{ id: a, when: 'client.ip in @undefined', then: allow }}\n"
@@ -375,6 +387,7 @@ fn address_lists_parse_and_validate() {
             "address_lists[0].name",
             "address_lists[0].inline[0]",
             "address_lists[0].inline[1]",
+            "address_lists[0].inline[2]",
             "address_lists[1].file",
             "address_lists[2].name",
             "address_lists[2].inline",
@@ -382,7 +395,8 @@ fn address_lists_parse_and_validate() {
             "rules[0].when",
         ]
     );
-    assert!(d[7].message.contains("@undefined"), "{}", d[7]);
+    assert!(d[3].message.contains("host bits set"), "{}", d[3]);
+    assert!(d[8].message.contains("@undefined"), "{}", d[8]);
 
     for bad in [
         "address_lists: [{ name: a }]",
@@ -394,4 +408,25 @@ fn address_lists_parse_and_validate() {
             "{bad}"
         );
     }
+}
+
+#[test]
+fn addon_on_error_has_no_pass() {
+    let e = Config::from_yaml(&format!(
+        "{BASE}addons: [{{ name: a, path: /a.wasm, on_error: pass }}]\n"
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("deliberately no `pass`"), "{e}");
+    let c = parse(&format!(
+        "{BASE}addons: [{{ name: a, path: /a.wasm, on_error: close, stage: after_rules, \
+         limits: {{ max_buffered_body_bytes: 2mb, fuel_per_step: 5 }} }}]\n"
+    ));
+    let a = &c.addons[0];
+    assert_eq!(a.on_error, OnError::Close);
+    assert_eq!(a.stage, AddonStage::AfterRules);
+    assert_eq!(a.limits.max_buffered_body_bytes, Some(ByteSize::b(2 << 20)));
+    assert_eq!(a.limits.fuel_per_step, Some(5));
+    assert_eq!(a.limits.max_memory, None);
+    assert_eq!(c.limits.max_address_list_bytes, ByteSize::b(256 << 20));
 }

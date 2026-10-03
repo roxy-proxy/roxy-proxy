@@ -296,3 +296,100 @@ fn rule_test_unavailable_metric_fails_closed() {
     assert_eq!(out.status.code(), Some(1));
     assert!(text(&out.stderr).contains("not an integer or `unavailable`"));
 }
+
+/// A config with a file list and an inline list, both deny lists.
+fn list_config(dir: &Path, list_text: &str) -> PathBuf {
+    let list = dir.join("blocked.txt");
+    std::fs::write(&list, list_text).unwrap();
+    let cfg = dir.join("roxy.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:0 }}]\n\
+             tls: {{ ca_dir: {:?} }}\n\
+             address_lists:\n  - {{ name: blocked, file: {:?} }}\n  \
+             - {{ name: meta, inline: [169.254.169.254, \"fd00:ec2::254/128\"] }}\n\
+             upstream: {{ deny_lists: [blocked, meta] }}\n\
+             rules:\n  - {{ id: any, when: 'port == 80', then: {{ allow: {{ private_ok: true }} }} }}\n",
+            dir.join("ca").to_str().unwrap(),
+            list.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    cfg
+}
+
+#[test]
+fn check_prints_address_list_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = list_config(
+        dir.path(),
+        "# feed\n203.0.113.0/24\n203.0.113.9\n\n198.51.100.0/24\n2001:db8::/32\n",
+    );
+    let out = roxy(&["check", "--config", cfg.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("address list blocked: 3 entries"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("address list meta: 2 entries"), "{stdout}");
+    assert!(stdout.contains(": OK"), "{stdout}");
+}
+
+#[test]
+fn check_and_run_fail_on_a_bad_list_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = list_config(dir.path(), "203.0.113.0/24\n# ok\nnot-an-address\n");
+    let list = dir.path().join("blocked.txt");
+    let out = roxy(&["check", "--config", cfg.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains(&format!(
+            "{}:3: address list blocked: \"not-an-address\" is not an IP address or CIDR",
+            list.display()
+        )),
+        "{err}"
+    );
+    // Startup is fatal, before the CA is generated.
+    let out = roxy(&["run", "--config", cfg.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains(&format!("{}:3:", list.display())), "{err}");
+    assert!(!dir.path().join("ca").exists());
+}
+
+#[test]
+fn rule_test_shows_address_policy_hits_for_ip_literals() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = list_config(dir.path(), "203.0.113.0/24\n");
+    let cfg = cfg.to_str().unwrap();
+    let rt = |url: &str| roxy(&["rule", "test", "--config", cfg, "GET", url]);
+
+    let out = rt("http://203.0.113.7/x");
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains(
+            "address:  203.0.113.7 denied by the upstream address policy (list:blocked, matched 203.0.113.0/24)"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("rule:     _address_policy"), "{stdout}");
+    assert!(stdout.contains("decision: deny 403"), "{stdout}");
+
+    // IPv4-mapped spelling and the inline list.
+    let out = rt("http://[::ffff:169.254.169.254]/latest/meta-data");
+    assert_eq!(out.status.code(), Some(3));
+    assert!(text(&out.stdout).contains("(list:meta, matched 169.254.169.254/32)"));
+
+    let out = rt("http://198.51.100.1/");
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+    assert!(text(&out.stdout).contains("address:  198.51.100.1 allowed"));
+
+    // Names are not resolved in a dry run.
+    let out = rt("http://example.com/");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(!text(&out.stdout).contains("address:"));
+}
