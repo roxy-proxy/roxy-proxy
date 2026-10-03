@@ -24,9 +24,9 @@
 //! - [`addrlist`]: compiled address lists (`upstream.deny_lists`, `@list`).
 //! - [`auth`]: `Proxy-Authorization: Basic` against bcrypt users files.
 //! - [`sources`]: the metric and state store traits.
-//! - [`flowlog`]: flow events, sinks and redaction.
-//! - [`logwriter`]: the buffered single-writer destination with
-//!   backpressure behind the file and stdout sinks.
+//! - [`flowlog`]: flow events, sinks and redaction. The file and stdout
+//!   sinks write through `roxy-log` (one writer thread, batching,
+//!   backpressure, rotation).
 //! - [`io`]: stream adapters.
 //!
 //! # Requested `roxy-http` changes (worked around here)
@@ -49,7 +49,6 @@ pub mod flowlog;
 mod h2conn;
 pub mod io;
 pub mod listener;
-pub mod logwriter;
 mod pipeline;
 pub mod server;
 pub mod sources;
@@ -74,3 +73,11 @@ pub use sources::{
     UnavailableState,
 };
 pub use upstream::{ConnectError, DnsSettings, UpstreamSettings};
+
+/// The `roxy-log` writer types behind the file and stdout sinks.
+pub mod logging {
+    pub use roxy_log::{
+        DEFAULT_HIGH_WATER, Destination, LogWriter, RotateOptions, RotatingFile, Stream,
+        WriterOptions,
+    };
+}

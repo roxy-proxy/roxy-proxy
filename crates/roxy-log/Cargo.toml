@@ -1,0 +1,19 @@
+[package]
+name = "roxy-log"
+description = "Buffered single-writer log destinations with backpressure and rotation for roxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono.workspace = true
+flate2 = "1.1.5"
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
