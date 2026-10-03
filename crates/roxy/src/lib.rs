@@ -3,4 +3,5 @@
 //! and later wiring code can use it directly.
 
 pub mod config;
+pub mod ruletest;
 pub mod secrets;

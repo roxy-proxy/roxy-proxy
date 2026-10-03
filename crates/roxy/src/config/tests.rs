@@ -89,7 +89,7 @@ fn minimal_example_uses_defaults() {
     assert_eq!(cfg.rules[0].phase, Phase::Request);
     assert_eq!(
         cfg.rules[0].then.0,
-        vec![serde_yaml_ng::Value::from("allow")]
+        vec![Action::Allow(roxy_rules::AllowArgs::default())]
     );
 }
 
@@ -283,8 +283,8 @@ fn misc_diagnostics() {
             "version",
             "listeners",
             "tls.upstream.verify",
-            "metrics[0].id",
             "addons[0].hooks",
+            "metrics[0].id",
             "rules[0].id",
             "rules[1].then[0]",
         ]
@@ -302,4 +302,96 @@ fn duplicate_bind_diagnosed() {
 #[test]
 fn version_is_required() {
     assert!(Config::from_yaml("listeners: []\n").is_err());
+}
+
+#[test]
+fn action_parse_errors_name_action_and_rule() {
+    let yaml = format!(
+        "{BASE}rules:\n  - id: first\n    then: allow\n  - id: second\n    then:\n      \
+         - tag: x\n      - deny: {{ stauts: 4 }}\n"
+    );
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = describe_parse_error(&yaml, &err);
+    assert!(
+        msg.starts_with("rules[1].then[1].deny: unknown field `stauts`"),
+        "{msg}"
+    );
+    assert!(msg.ends_with("(rule \"second\")"), "{msg}");
+
+    let yaml = format!("{BASE}rules: [{{ id: m, then: {{ deny: {{}}, allow: {{}} }} }}]\n");
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = describe_parse_error(&yaml, &err);
+    assert!(msg.contains("exactly one key"), "{msg}");
+    assert!(msg.ends_with("(rule \"m\")"), "{msg}");
+}
+
+#[test]
+fn expression_type_error_has_position() {
+    let d = diagnostics(&format!(
+        "{BASE}rules:\n  - id: a\n    when: host == \"x\" and port == \"443\"\n    then: allow\n"
+    ));
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].path, "rules[0].when");
+    assert_eq!((d[0].line, d[0].col), (1, 17));
+    assert_eq!(
+        d[0].rule.as_ref().map(roxy_rules::RuleId::as_str),
+        Some("a")
+    );
+    assert!(
+        d[0].to_string()
+            .starts_with("rules[0].when:1:17: type mismatch"),
+        "{}",
+        d[0]
+    );
+    assert!(d[0].snippet.as_ref().unwrap().contains("^^^"));
+}
+
+#[test]
+fn address_lists_parse_and_validate() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("blocked.txt");
+    std::fs::write(&file, "203.0.113.0/24\n").unwrap();
+    let cfg = parse(&format!(
+        "{BASE}address_lists:\n  - {{ name: internal, inline: [10.0.0.0/8, \"::1\", 192.168.1.1] }}\n  \
+         - {{ name: blocked-v4, file: {:?} }}\nupstream: {{ deny_lists: [blocked-v4] }}\n\
+         rules:\n  - {{ id: a, when: 'client.ip in @internal', then: allow }}\n",
+        file.to_str().unwrap()
+    ));
+    cfg.validate().unwrap();
+    assert_eq!(cfg.address_lists.len(), 2);
+    assert_eq!(cfg.address_lists[1].source, AddressListSource::File(file));
+    assert_eq!(cfg.upstream.deny_lists, ["blocked-v4"]);
+
+    let d = diagnostics(&format!(
+        "{BASE}address_lists:\n  - {{ name: bad name, inline: [10.0.0.0/33, nope] }}\n  \
+         - {{ name: x, file: /surely/not/here.txt }}\n  - {{ name: x, inline: [] }}\n\
+         upstream: {{ deny_lists: [missing] }}\n\
+         rules:\n  - {{ id: a, when: 'client.ip in @undefined', then: allow }}\n"
+    ));
+    let paths: Vec<&str> = d.iter().map(|d| d.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "address_lists[0].name",
+            "address_lists[0].inline[0]",
+            "address_lists[0].inline[1]",
+            "address_lists[1].file",
+            "address_lists[2].name",
+            "address_lists[2].inline",
+            "upstream.deny_lists[0]",
+            "rules[0].when",
+        ]
+    );
+    assert!(d[7].message.contains("@undefined"), "{}", d[7]);
+
+    for bad in [
+        "address_lists: [{ name: a }]",
+        "address_lists: [{ name: a, file: /x, inline: [] }]",
+        "address_lists: [{ name: a, inline: [], colour: red }]",
+    ] {
+        assert!(
+            Config::from_yaml(&format!("{BASE}{bad}\n")).is_err(),
+            "{bad}"
+        );
+    }
 }

@@ -1,4 +1,4 @@
-//! End-to-end tests of the `roxy` CLI (M0 commands).
+//! End-to-end tests of the `roxy` CLI.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -50,7 +50,7 @@ fn check_reports_diagnostics() {
         "{err}"
     );
     assert!(
-        err.contains(&format!("{prefix}.when: reference to undefined metric")),
+        err.contains(&format!("{prefix}.when:1:1: reference to undefined metric")),
         "{err}"
     );
 }
@@ -148,8 +148,104 @@ fn run_fails_on_missing_secret() {
 }
 
 #[test]
-fn rule_test_is_a_stub() {
-    let out = roxy(&["rule", "test", "GET https://example.com/", "-H", "a: b"]);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(text(&out.stderr).contains("not implemented in M0"));
+fn check_catches_expression_type_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir.path().join("bad.yaml");
+    std::fs::write(
+        &bad,
+        "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:3128 }]\nrules:\n  \
+         - { id: ports, when: 'host under 443', then: allow }\n",
+    )
+    .unwrap();
+    let out = roxy(&["check", "--config", bad.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains(&format!(
+            "{}:rules[0].when:1:12: `under` needs a quoted domain on the right, found the number 443",
+            bad.display()
+        )),
+        "{err}"
+    );
+    assert!(
+        err.contains("    | host under 443\n    |            ^^^"),
+        "{err}"
+    );
+    assert!(err.contains("1 problem(s) found"), "{err}");
+}
+
+fn rule_test(args: &[&str]) -> Output {
+    let cfg = example("roxy.yaml");
+    let mut all = vec!["rule", "test", "--config", cfg.to_str().unwrap()];
+    all.extend_from_slice(args);
+    roxy(&all)
+}
+
+#[test]
+fn rule_test_allows_github_reads() {
+    let out = rule_test(&["GET", "https://api.github.com/repos/a/b"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains("matched:  github-reads"), "{stdout}");
+    assert!(stdout.contains("decision: allow\n"), "{stdout}");
+    assert!(stdout.contains("rule:     github-reads"), "{stdout}");
+}
+
+#[test]
+fn rule_test_denies_by_default_and_by_rule() {
+    let out = rule_test(&["DELETE https://example.com/x"]);
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("decision: deny 403 \"blocked by roxy\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("rule:     _default"), "{stdout}");
+
+    let out = rule_test(&[
+        "--metric",
+        "egress_bytes=600000000",
+        "-H",
+        "content-type: application/json",
+        "POST",
+        "https://api.github.com/repos/x/y/issues",
+    ]);
+    assert_eq!(out.status.code(), Some(3));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("decision: deny 429 \"hourly egress budget exhausted\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("rule:     egress-budget"), "{stdout}");
+}
+
+#[test]
+fn rule_test_shows_secret_placeholders() {
+    let out = rule_test(&["POST", "https://api.openai.com/v1/chat/completions"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("  - set_header authorization: Bearer [secret:openai]"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn rule_test_response_phase_and_bad_input() {
+    let out = rule_test(&[
+        "--phase",
+        "response",
+        "--status",
+        "503",
+        "GET",
+        "https://api.github.com/",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains("log warn: upstream 5xx"), "{stdout}");
+    assert!(stdout.contains("rule:     _default"), "{stdout}");
+
+    let out = rule_test(&["GET", "not-a-url"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("not an absolute URL"));
 }

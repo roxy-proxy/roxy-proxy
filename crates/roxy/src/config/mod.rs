@@ -3,7 +3,8 @@
 //! Parsing is strict: every struct denies unknown fields, so a typo is an
 //! error rather than a silently ignored setting. [`Config::validate`] adds the
 //! cross-reference checks serde cannot express. Secrets are *not* resolved
-//! here; see [`crate::secrets`].
+//! here; see [`crate::secrets`]. Rule and metric types (and their compiler)
+//! live in `roxy-rules` and are re-exported here.
 
 mod units;
 mod validate;
@@ -18,7 +19,10 @@ use bytesize::ByteSize;
 use ipnet::IpNet;
 use serde::Deserialize;
 
-pub use units::{Actions, Expr, MetricCount, Resolver};
+pub use roxy_rules::config::{
+    Action, Expr, MetricConfig as Metric, MetricCount, Phase, RuleConfig as Rule, Then,
+};
+pub use units::Resolver;
 pub use validate::Diagnostic;
 
 /// The only supported config `version`.
@@ -45,6 +49,9 @@ pub struct Config {
     pub upstream: Upstream,
     #[serde(default)]
     pub secrets: BTreeMap<String, SecretSource>,
+    /// Named IP address lists, referenced as `@name` in rules (§7.1).
+    #[serde(default)]
+    pub address_lists: Vec<AddressList>,
     #[serde(default)]
     pub metrics: Vec<Metric>,
     #[serde(default)]
@@ -249,6 +256,9 @@ pub struct Upstream {
     pub deny_private_ranges: bool,
     pub deny_cidrs: Vec<IpNet>,
     pub allow_cidrs: Vec<IpNet>,
+    /// Names of `address_lists` whose addresses are never valid upstream
+    /// destinations (§7.1), checked like `deny_cidrs`.
+    pub deny_lists: Vec<String>,
     #[serde(with = "humantime_serde")]
     pub connect_timeout: Duration,
 }
@@ -260,6 +270,7 @@ impl Default for Upstream {
             deny_private_ranges: true,
             deny_cidrs: Vec::new(),
             allow_cidrs: Vec::new(),
+            deny_lists: Vec::new(),
             connect_timeout: Duration::from_secs(10),
         }
     }
@@ -313,57 +324,47 @@ impl TryFrom<RawSecretSource> for SecretSource {
     }
 }
 
-// ----- metrics --------------------------------------------------------------
+// ----- address lists ----------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+/// One entry of `address_lists:` (§7.1): a named set of IPs / CIDRs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "RawAddressList")]
+pub struct AddressList {
+    pub name: String,
+    pub source: AddressListSource,
+}
+
+/// Where an address list's entries come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddressListSource {
+    /// `file: PATH`: one entry per line (loaded at run time, M2).
+    File(PathBuf),
+    /// `inline: [cidr-or-ip, ...]`, kept as text so `check` can report each
+    /// bad entry by index.
+    Inline(Vec<String>),
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Metric {
-    pub id: String,
-    pub count: MetricCount,
-    /// Filter expression; absent = every flow.
-    #[serde(default, rename = "where")]
-    pub where_: Option<Expr>,
-    /// Series key fields; empty = one global series.
-    #[serde(default)]
-    pub key: Vec<String>,
-    /// Sliding window; absent = cumulative since start.
-    #[serde(default, with = "humantime_serde")]
-    pub window: Option<Duration>,
+struct RawAddressList {
+    name: String,
+    file: Option<PathBuf>,
+    inline: Option<Vec<String>>,
 }
 
-// ----- rules ----------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Phase {
-    Connect,
-    #[default]
-    Request,
-    Response,
-    Ws,
-}
-
-impl Phase {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Connect => "connect",
-            Self::Request => "request",
-            Self::Response => "response",
-            Self::Ws => "ws",
-        }
+impl TryFrom<RawAddressList> for AddressList {
+    type Error = &'static str;
+    fn try_from(raw: RawAddressList) -> Result<Self, Self::Error> {
+        let source = match (raw.file, raw.inline) {
+            (Some(f), None) => AddressListSource::File(f),
+            (None, Some(v)) => AddressListSource::Inline(v),
+            _ => return Err("an address list must have exactly one of `file` or `inline`"),
+        };
+        Ok(Self {
+            name: raw.name,
+            source,
+        })
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Rule {
-    pub id: String,
-    #[serde(default)]
-    pub phase: Phase,
-    /// Match expression; absent = always matches.
-    #[serde(default)]
-    pub when: Option<Expr>,
-    pub then: Actions,
 }
 
 // ----- addons ---------------------------------------------------------------
@@ -430,7 +431,28 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        Self::from_yaml(&text).with_context(|| format!("parsing {}", path.display()))
+        Self::from_yaml(&text)
+            .map_err(|e| anyhow::anyhow!(describe_parse_error(&text, &e)))
+            .with_context(|| format!("parsing {}", path.display()))
+    }
+}
+
+/// Render a structural parse error. Errors inside `rules[N]` get the rule's
+/// id appended (`... (rule "github-reads")`), since the deserialiser only
+/// knows the YAML path.
+pub fn describe_parse_error(text: &str, err: &serde_yaml_ng::Error) -> String {
+    let msg = err.to_string();
+    let index = msg
+        .strip_prefix("rules[")
+        .and_then(|rest| rest.split_once(']'))
+        .and_then(|(n, _)| n.parse::<usize>().ok());
+    let id = index.and_then(|i| {
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(text).ok()?;
+        Some(doc.get("rules")?.get(i)?.get("id")?.as_str()?.to_owned())
+    });
+    match id {
+        Some(id) => format!("{msg} (rule {id:?})"),
+        None => msg,
     }
 }
 

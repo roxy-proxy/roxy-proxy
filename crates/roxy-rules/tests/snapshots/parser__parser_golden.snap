@@ -1,0 +1,101 @@
+---
+source: crates/roxy-rules/tests/parser.rs
+expression: out
+---
+host == "api.openai.com" and path starts_with "/v1/" and method == POST
+  sexpr:  (and (and (== field:host str:"api.openai.com") (starts_with field:path str:"/v1/")) (== field:method method:POST))
+  pretty: host == "api.openai.com" and path starts_with "/v1/" and method == POST
+
+host under "github.com" and method in [GET, HEAD]
+  sexpr:  (and (under field:host str:"github.com") (in field:method [method:GET method:HEAD]))
+  pretty: host under "github.com" and method in [GET, HEAD]
+
+host in ["pypi.org", "files.pythonhosted.org"] and method == GET
+  sexpr:  (and (in field:host [str:"pypi.org" str:"files.pythonhosted.org"]) (== field:method method:GET))
+  pretty: host in ["pypi.org", "files.pythonhosted.org"] and method == GET
+
+metric.github_writes >= 30 and host under "api.github.com"
+  sexpr:  (and (>= field:metric.github_writes int:30) (under field:host str:"api.github.com"))
+  pretty: metric.github_writes >= 30 and host under "api.github.com"
+
+metric.egress_bytes > 500mb
+  sexpr:  (> field:metric.egress_bytes int:524288000)
+  pretty: metric.egress_bytes > 500mb
+
+response.status >= 500
+  sexpr:  (>= field:response.status int:500)
+  pretty: response.status >= 500
+
+true
+  sexpr:  (pred bool:true)
+  pretty: true
+
+header["Upgrade"] == "websocket"
+  sexpr:  (== field:header["Upgrade"] str:"websocket")
+  pretty: header["Upgrade"] == "websocket"
+
+header.all["accept"] contains "json"
+  sexpr:  (contains field:header.all["accept"] str:"json")
+  pretty: header.all["accept"] contains "json"
+
+not (client.ip in [10.0.0.0/8, fd00::/8]) or client.user == "ci"
+  sexpr:  (or (not (in field:client.ip [cidr:10.0.0.0/8 cidr:fd00::/8])) (== field:client.user str:"ci"))
+  pretty: not (client.ip in [10.0.0.0/8, fd00::/8]) or client.user == "ci"
+
+client.ip not in [192.168.0.0/16, 127.0.0.1, ::1]
+  sexpr:  (not in field:client.ip [cidr:192.168.0.0/16 ip:127.0.0.1 ip:::1])
+  pretty: client.ip not in [192.168.0.0/16, 127.0.0.1, ::1]
+
+path like "/repos/*/issues" and query["page"] != "1"
+  sexpr:  (and (like field:path str:"/repos/*/issues") (!= field:query["page"] str:"1"))
+  pretty: path like "/repos/*/issues" and query["page"] != "1"
+
+url matches "https://[a-z]+\\.example\\.com/.*"
+  sexpr:  (matches field:url str:"https://[a-z]+\\.example\\.com/.*")
+  pretty: url matches "https://[a-z]+\\.example\\.com/.*"
+
+tag["billing"] and not tag["internal"]
+  sexpr:  (and (pred field:tag["billing"]) (not (pred field:tag["internal"])))
+  pretty: tag["billing"] and not tag["internal"]
+
+state["mode"] == "lockdown"
+  sexpr:  (== field:state["mode"] str:"lockdown")
+  pretty: state["mode"] == "lockdown"
+
+ws.size <= 16kb and ws.opcode == 1
+  sexpr:  (and (<= field:ws.size int:16384) (== field:ws.opcode int:1))
+  pretty: ws.size <= 16kb and ws.opcode == 1
+
+a == 1 or b == 2 or c == 3 and d == 4
+  sexpr:  (or (or (== field:a int:1) (== field:b int:2)) (and (== field:c int:3) (== field:d int:4)))
+  pretty: a == 1 or b == 2 or c == 3 and d == 4
+
+not not tls.sni ends_with ".internal"
+  sexpr:  (not (not (ends_with field:tls.sni str:".internal")))
+  pretty: not not (tls.sni ends_with ".internal")
+
+dst.port in [443, 8443] # trailing comment
+  sexpr:  (in field:dst.port [int:443 int:8443])
+  pretty: dst.port in [443, 8443]
+
+body.size < 1mb and body.text contains "\"secret\\"
+  sexpr:  (and (< field:body.size int:1048576) (contains field:body.text str:"\"secret\\"))
+  pretty: body.size < 1mb and body.text contains "\"secret\\"
+
+listener.name == "proxy"
+  and (scheme == "https"
+       or port == 80)
+  sexpr:  (and (== field:listener.name str:"proxy") (or (== field:scheme str:"https") (== field:port int:80)))
+  pretty: listener.name == "proxy" and (scheme == "https" or port == 80)
+
+response.header["content-type"] starts_with "text/"
+  sexpr:  (starts_with field:response.header["content-type"] str:"text/")
+  pretty: response.header["content-type"] starts_with "text/"
+
+client.ip in @internal
+  sexpr:  (in field:client.ip list:@internal)
+  pretty: client.ip in @internal
+
+dst.ip not in @blocked-v6 or client.ip in [10.0.0.0/8]
+  sexpr:  (or (not in field:dst.ip list:@blocked-v6) (in field:client.ip [cidr:10.0.0.0/8]))
+  pretty: dst.ip not in @blocked-v6 or client.ip in [10.0.0.0/8]
