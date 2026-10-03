@@ -116,9 +116,9 @@ impl CaptureLog {
     fn record(&self, flow: &str, dir: Dir, kind: &str, seq: u64, extra: &str, payload: &[u8]) {
         let mut buf = Vec::with_capacity(payload.len() + 128);
         let mut head = String::with_capacity(128);
-        let _ = write!(
+        let _ = writeln!(
             head,
-            "{{\"flow\":\"{flow}\",\"dir\":\"{}\",\"kind\":\"{kind}\",\"seq\":{seq},\"len\":{}{extra}}}\n",
+            "{{\"flow\":\"{flow}\",\"dir\":\"{}\",\"kind\":\"{kind}\",\"seq\":{seq},\"len\":{}{extra}}}",
             dir.as_str(),
             payload.len()
         );

@@ -322,7 +322,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
     cx.watch = Some(watch.clone());
     // Capture (§10.2): what is forwarded from here on is teed to the
     // capture log, heads included.
-    let (mut req_tap, res_tap) = taps(cx);
+    let (mut up_tap, down_tap) = taps(cx);
     let host = host_text(&req.authority.host);
     let port = req.authority.port;
     let private_ok = cx.opts.private_ok;
@@ -418,14 +418,14 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
     } else {
         // Watched first: a chunk that makes a deny match is never counted
         // as forwarded nor handed to the upstream.
-        if let Some(t) = req_tap.as_mut() {
+        if let Some(t) = up_tap.as_mut() {
             t.request_head(&req, &cx.snap.redactor);
         }
         let body = watched(
             std::mem::take(&mut req.body),
             watch.clone(),
             Dir::Request,
-            req_tap.take(),
+            up_tap.take(),
         );
         let (body, req_counter) = counted(body);
         req.body = body;
@@ -490,17 +490,17 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
     let verdict = run_response_stages(&shared.pipeline, cx, res, front).await;
     match verdict {
         ResponseVerdict::Continue(mut res) => {
-            let mut res_tap = res_tap;
-            if let Some(t) = res_tap.as_mut() {
+            let mut down_tap = down_tap;
+            if let Some(t) = down_tap.as_mut() {
                 t.response_head(&res, &cx.snap.redactor);
             }
             if let Some((on, key)) = upgrade {
                 // The relay takes the taps after the `101`.
-                cx.taps = (req_tap, res_tap);
+                cx.taps = (up_tap, down_tap);
                 return Outcome::Upgrade { res, on, key };
             }
             let body = std::mem::take(&mut res.body);
-            res.body = watched(body, watch, Dir::Response, res_tap);
+            res.body = watched(body, watch, Dir::Response, down_tap);
             Outcome::Respond(res)
         }
         ResponseVerdict::Deny(r) => Outcome::Refuse(r),
@@ -598,7 +598,7 @@ async fn splice_websocket(
         cx.emit_request_event();
         return None;
     };
-    let (mut req_tap, res_tap) = std::mem::take(&mut cx.taps);
+    let (mut up_tap, down_tap) = std::mem::take(&mut cx.taps);
     let c2s_extra = leftover.len() as u64;
     if !leftover.is_empty() {
         // Bytes that arrived with the upgrade request: checked before they
@@ -608,7 +608,7 @@ async fn splice_websocket(
             cx.emit_request_event();
             return None;
         }
-        if let Some(t) = req_tap.as_mut() {
+        if let Some(t) = up_tap.as_mut() {
             t.data(&leftover);
         }
         if upstream.write_all(&leftover).await.is_err() {
@@ -616,7 +616,7 @@ async fn splice_websocket(
             return None;
         }
     }
-    let (c2s, s2c) = splice(client_io, upstream, idle, &watch, (req_tap, res_tap)).await;
+    let (c2s, s2c) = splice(client_io, upstream, idle, &watch, (up_tap, down_tap)).await;
     cx.shared.sink.emit(&FlowEvent::WsClose {
         ts: chrono::Utc::now(),
         flow: cx.flow.to_string(),
@@ -711,7 +711,7 @@ async fn splice(
     let s2c = Arc::new(AtomicU64::new(0));
     let (cr, cw) = tokio::io::split(client);
     let (ur, uw) = tokio::io::split(upstream);
-    let (req_tap, res_tap) = taps;
+    let (up_tap, down_tap) = taps;
     let a = pump(
         cr,
         uw,
@@ -721,7 +721,7 @@ async fn splice(
         Relay {
             watch,
             dir: Dir::Request,
-            tap: req_tap,
+            tap: up_tap,
         },
     );
     let b = pump(
@@ -733,7 +733,7 @@ async fn splice(
         Relay {
             watch,
             dir: Dir::Response,
-            tap: res_tap,
+            tap: down_tap,
         },
     );
     let watchdog = async {
