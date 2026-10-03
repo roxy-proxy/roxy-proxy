@@ -1,0 +1,38 @@
+[package]
+name = "roxy"
+description = "A TLS-inspecting HTTP firewall for containing AI agent traffic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "roxy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+bytesize.workspace = true
+clap.workspace = true
+humantime-serde.workspace = true
+ipnet.workspace = true
+regex.workspace = true
+roxy-proxy.workspace = true
+roxy-tls.workspace = true
+serde.workspace = true
+serde_yaml_ng.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

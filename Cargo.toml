@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/roxy",
     "crates/roxy-http",
     "crates/roxy-proxy",
     "crates/roxy-rules",

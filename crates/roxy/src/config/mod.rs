@@ -1,0 +1,438 @@
+//! roxy's YAML configuration (`DESIGN.md` §6.1).
+//!
+//! Parsing is strict: every struct denies unknown fields, so a typo is an
+//! error rather than a silently ignored setting. [`Config::validate`] adds the
+//! cross-reference checks serde cannot express. Secrets are *not* resolved
+//! here; see [`crate::secrets`].
+
+mod units;
+mod validate;
+
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::Context as _;
+use bytesize::ByteSize;
+use ipnet::IpNet;
+use serde::Deserialize;
+
+pub use units::{Actions, Expr, MetricCount, Resolver};
+pub use validate::Diagnostic;
+
+/// The only supported config `version`.
+pub const CONFIG_VERSION: u32 = 1;
+
+/// Root of the configuration file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// Schema version; must be [`CONFIG_VERSION`].
+    pub version: u32,
+    #[serde(default)]
+    pub listeners: Vec<Listener>,
+    /// Plain-HTTP endpoint serving the CA cert and health checks. Absent = off.
+    #[serde(default)]
+    pub ca_server: Option<CaServer>,
+    #[serde(default)]
+    pub tls: Tls,
+    #[serde(default)]
+    pub http: Http,
+    #[serde(default)]
+    pub limits: Limits,
+    #[serde(default)]
+    pub upstream: Upstream,
+    #[serde(default)]
+    pub secrets: BTreeMap<String, SecretSource>,
+    #[serde(default)]
+    pub metrics: Vec<Metric>,
+    #[serde(default)]
+    pub rules: Vec<Rule>,
+    #[serde(default)]
+    pub addons: Vec<Addon>,
+    #[serde(default)]
+    pub log: Log,
+    /// Directory for `capture` action output (§10.2). Absent = capture disabled.
+    #[serde(default)]
+    pub capture_dir: Option<PathBuf>,
+}
+
+// ----- listeners ------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Listener {
+    pub name: String,
+    #[serde(default)]
+    pub mode: ListenerMode,
+    pub bind: SocketAddr,
+    #[serde(default)]
+    pub auth: Option<ListenerAuth>,
+    /// Transparent listeners only (deferred, §4.2).
+    #[serde(default)]
+    pub allow_passthrough: Option<bool>,
+    /// Transparent listeners only (deferred, §4.2).
+    #[serde(default)]
+    pub upstream_target: Option<UpstreamTarget>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenerMode {
+    #[default]
+    Explicit,
+    /// Parsed so the config shape is stable, but rejected by validation
+    /// until transparent mode is built (§4.2).
+    Transparent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamTarget {
+    Resolve,
+    OriginalDst,
+    RequireMatch,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenerAuth {
+    pub basic: BasicAuth,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BasicAuth {
+    pub users_file: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaServer {
+    pub bind: SocketAddr,
+}
+
+// ----- tls ------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Tls {
+    /// Where `roxy-ca.pem` / `roxy-ca.key` live; generated if absent.
+    pub ca_dir: PathBuf,
+    pub require_sni_match: bool,
+    /// Leaf certificate LRU size (§9).
+    pub leaf_cache_size: usize,
+    pub upstream: TlsUpstream,
+}
+
+impl Default for Tls {
+    fn default() -> Self {
+        Self {
+            ca_dir: PathBuf::from("/var/lib/roxy/ca"),
+            require_sni_match: true,
+            leaf_cache_size: 10_000,
+            upstream: TlsUpstream::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TlsUpstream {
+    pub verify: UpstreamVerify,
+    pub extra_roots: Vec<PathBuf>,
+    pub min_version: TlsVersion,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum UpstreamVerify {
+    /// Bundled webpki roots only.
+    #[default]
+    #[serde(rename = "strict")]
+    Strict,
+    /// Bundled webpki roots plus `extra_roots`.
+    #[serde(rename = "strict+extra_roots")]
+    StrictExtraRoots,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum TlsVersion {
+    #[default]
+    #[serde(rename = "1.2")]
+    Tls12,
+    #[serde(rename = "1.3")]
+    Tls13,
+}
+
+// ----- http -----------------------------------------------------------------
+
+/// Strictness knobs for client-side HTTP parsing (§5.3). All default to the
+/// strict setting.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct Http {
+    pub allow_http10: bool,
+    pub allow_trailers: bool,
+    pub allow_chunk_extensions: bool,
+    pub allow_plain_in_connect: bool,
+    pub allow_obs_text: bool,
+    pub allow_body_on_get: bool,
+    /// Offer `h2` in client-facing ALPN. Defaults to false until the h2
+    /// server path lands (M3, §5.1a).
+    pub enable_h2: bool,
+}
+
+// ----- limits ---------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Limits {
+    #[serde(deserialize_with = "units::size")]
+    pub max_header_bytes: ByteSize,
+    #[serde(deserialize_with = "units::size")]
+    pub max_url_bytes: ByteSize,
+    pub max_headers: usize,
+    #[serde(deserialize_with = "units::size")]
+    pub max_request_body_bytes: ByteSize,
+    #[serde(deserialize_with = "units::size")]
+    pub max_response_body_bytes: ByteSize,
+    #[serde(deserialize_with = "units::size")]
+    pub max_inspect_body_bytes: ByteSize,
+    #[serde(deserialize_with = "units::size")]
+    pub max_ws_message_bytes: ByteSize,
+    #[serde(deserialize_with = "units::size")]
+    pub max_capture_body_bytes: ByteSize,
+    #[serde(with = "humantime_serde")]
+    pub header_timeout: Duration,
+    #[serde(with = "humantime_serde")]
+    pub body_idle_timeout: Duration,
+    #[serde(with = "humantime_serde")]
+    pub response_header_timeout: Duration,
+    pub max_connections_per_client: usize,
+    pub max_metric_keys: usize,
+}
+
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * KIB;
+const GIB: u64 = 1024 * MIB;
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_header_bytes: ByteSize::b(64 * KIB),
+            max_url_bytes: ByteSize::b(8 * KIB),
+            max_headers: 100,
+            max_request_body_bytes: ByteSize::b(GIB),
+            max_response_body_bytes: ByteSize::b(GIB),
+            max_inspect_body_bytes: ByteSize::b(MIB),
+            max_ws_message_bytes: ByteSize::b(16 * MIB),
+            max_capture_body_bytes: ByteSize::b(16 * MIB),
+            header_timeout: Duration::from_secs(10),
+            body_idle_timeout: Duration::from_secs(30),
+            response_header_timeout: Duration::from_secs(60),
+            max_connections_per_client: 256,
+            max_metric_keys: 100_000,
+        }
+    }
+}
+
+// ----- upstream -------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Upstream {
+    pub dns: Dns,
+    /// Deny loopback, link-local, RFC 1918, ULA, multicast and unspecified
+    /// destinations after resolution (§7).
+    pub deny_private_ranges: bool,
+    pub deny_cidrs: Vec<IpNet>,
+    pub allow_cidrs: Vec<IpNet>,
+    #[serde(with = "humantime_serde")]
+    pub connect_timeout: Duration,
+}
+
+impl Default for Upstream {
+    fn default() -> Self {
+        Self {
+            dns: Dns::default(),
+            deny_private_ranges: true,
+            deny_cidrs: Vec::new(),
+            allow_cidrs: Vec::new(),
+            connect_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Dns {
+    pub resolver: Resolver,
+    #[serde(with = "humantime_serde")]
+    pub cache_ttl_cap: Duration,
+}
+
+impl Default for Dns {
+    fn default() -> Self {
+        Self {
+            resolver: Resolver::System,
+            cache_ttl_cap: Duration::from_secs(60),
+        }
+    }
+}
+
+// ----- secrets --------------------------------------------------------------
+
+/// Where a secret's value comes from. Resolved only at `run`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "RawSecretSource")]
+pub enum SecretSource {
+    /// `{ env: NAME }`
+    Env(String),
+    /// `{ file: /path }`; one trailing newline is stripped.
+    File(PathBuf),
+}
+
+/// YAML shape of [`SecretSource`]: a map with exactly one of `env` / `file`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSecretSource {
+    env: Option<String>,
+    file: Option<PathBuf>,
+}
+
+impl TryFrom<RawSecretSource> for SecretSource {
+    type Error = &'static str;
+    fn try_from(raw: RawSecretSource) -> Result<Self, Self::Error> {
+        match (raw.env, raw.file) {
+            (Some(env), None) => Ok(Self::Env(env)),
+            (None, Some(file)) => Ok(Self::File(file)),
+            _ => Err("a secret must have exactly one of `env` or `file`"),
+        }
+    }
+}
+
+// ----- metrics --------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Metric {
+    pub id: String,
+    pub count: MetricCount,
+    /// Filter expression; absent = every flow.
+    #[serde(default, rename = "where")]
+    pub where_: Option<Expr>,
+    /// Series key fields; empty = one global series.
+    #[serde(default)]
+    pub key: Vec<String>,
+    /// Sliding window; absent = cumulative since start.
+    #[serde(default, with = "humantime_serde")]
+    pub window: Option<Duration>,
+}
+
+// ----- rules ----------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    Connect,
+    #[default]
+    Request,
+    Response,
+    Ws,
+}
+
+impl Phase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Request => "request",
+            Self::Response => "response",
+            Self::Ws => "ws",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rule {
+    pub id: String,
+    #[serde(default)]
+    pub phase: Phase,
+    /// Match expression; absent = always matches.
+    #[serde(default)]
+    pub when: Option<Expr>,
+    pub then: Actions,
+}
+
+// ----- addons ---------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddonHook {
+    Request,
+    Response,
+    Ws,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    State,
+    Log,
+    Secrets,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Addon {
+    pub name: String,
+    pub path: PathBuf,
+    pub hooks: Vec<AddonHook>,
+    /// Opaque config passed to the addon as JSON.
+    #[serde(default)]
+    pub config: serde_yaml_ng::Value,
+    #[serde(default)]
+    pub capabilities: Vec<Capability>,
+}
+
+// ----- log ------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Log {
+    pub flow: FlowLog,
+    /// Extra header names whose values are never logged, on top of the
+    /// built-in list.
+    pub redact_headers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FlowLog {
+    /// JSONL output file; absent = stdout.
+    pub path: Option<PathBuf>,
+    /// Also log connection-level (`connect`) events.
+    pub connection_events: bool,
+}
+
+// ----- loading --------------------------------------------------------------
+
+impl Config {
+    /// Parse a config from YAML text. Structural errors only; call
+    /// [`Config::validate`] afterwards.
+    pub fn from_yaml(text: &str) -> Result<Self, serde_yaml_ng::Error> {
+        serde_yaml_ng::from_str(text)
+    }
+
+    /// Read and parse a config file.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        Self::from_yaml(&text).with_context(|| format!("parsing {}", path.display()))
+    }
+}
+
+#[cfg(test)]
+mod tests;

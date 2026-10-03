@@ -1,0 +1,109 @@
+# Full roxy configuration example (DESIGN.md §6.1).
+# Validate with: roxy check --config examples/roxy.yaml
+
+version: 1
+
+listeners:
+  - name: proxy
+    mode: explicit
+    bind: 0.0.0.0:3128
+    auth:                      # optional; makes client.user available
+      basic: { users_file: /etc/roxy/users }
+  # Deferred (§4.2). Shape reserved so configs do not change when it lands:
+  # - name: tproxy
+  #   mode: transparent
+  #   bind: 0.0.0.0:3129
+  #   allow_passthrough: false
+  #   upstream_target: resolve   # resolve | original_dst | require_match
+
+ca_server:
+  bind: 0.0.0.0:3130           # plain HTTP, serves /roxy-ca.pem and /healthz
+
+tls:
+  ca_dir: /var/lib/roxy/ca     # generated if absent
+  require_sni_match: true
+  upstream:
+    verify: strict             # strict | strict+extra_roots
+    extra_roots: []
+    min_version: "1.2"
+
+http:
+  allow_http10: false
+  allow_trailers: false
+  allow_chunk_extensions: false
+  allow_plain_in_connect: false
+  enable_h2: true
+
+limits:
+  max_header_bytes: 64kb
+  max_url_bytes: 8kb
+  max_headers: 100
+  max_request_body_bytes: 1gb
+  max_response_body_bytes: 1gb
+  max_inspect_body_bytes: 1mb   # only buffered when a rule/addon needs body content
+  header_timeout: 10s
+  body_idle_timeout: 30s
+  max_connections_per_client: 256
+  max_metric_keys: 100000
+
+upstream:
+  dns:
+    resolver: system           # system | [ "1.1.1.1:53", ... ]
+    cache_ttl_cap: 60s
+  deny_private_ranges: true    # loopback, link-local, RFC1918, ULA, multicast, unspecified
+  connect_timeout: 10s
+
+secrets:
+  openai: { env: OPENAI_API_KEY }
+  gh:     { file: /run/secrets/github_token }
+
+metrics:
+  - id: github_writes
+    count: requests
+    where: host under "api.github.com" and method in [POST, PUT, PATCH, DELETE]
+    key: [client.ip]
+    window: 1m
+  - id: egress_bytes
+    count: request_bytes
+    where: true
+    key: [client.ip]
+    window: 1h
+
+rules:
+  - id: no-writes-burst
+    when: metric.github_writes >= 30 and host under "api.github.com"
+    then: deny
+
+  - id: egress-budget
+    when: metric.egress_bytes > 500mb
+    then: { deny: { status: 429, message: "hourly egress budget exhausted" } }
+
+  - id: openai
+    when: host == "api.openai.com" and path starts_with "/v1/" and method == POST
+    then:
+      - set_header: { authorization: "Bearer ${secret:openai}" }
+      - allow
+
+  - id: github-reads
+    when: host under "github.com" and method in [GET, HEAD]
+    then: allow
+
+  - id: pypi
+    when: host in ["pypi.org", "files.pythonhosted.org"] and method == GET
+    then: allow
+
+  - id: ws-example
+    when: host == "ws.example.com" and header["upgrade"] == "websocket"
+    then: { allow: { upgrade: websocket } }
+
+  - id: no-big-uploads
+    phase: response
+    when: response.status >= 500
+    then: { log: { level: warn, message: "upstream 5xx" } }
+
+addons:
+  - name: pii-scan
+    path: /etc/roxy/addons/pii_scan.wasm
+    hooks: [request, response]
+    config: { threshold: 0.8 }
+    capabilities: [state, log]
