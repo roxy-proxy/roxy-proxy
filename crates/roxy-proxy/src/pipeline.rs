@@ -1,24 +1,23 @@
-//! The flow pipeline as stream stages (docs/architecture.md).
+//! The exchange core's fixed steps (docs/architecture.md#exchange).
 //!
-//! A request passes through the [`RequestStage`]s in order, each receiving
-//! the request head plus its (still streaming) body and returning a
-//! [`Verdict`]. The upstream connector is the terminal stage (in
-//! [`crate::exchange`]); its response passes through the
-//! [`ResponseStage`]s. Built-in stages: the bounded body buffer (only when
-//! a rule reads `body.text` / `response.body.text`), the head decision with
-//! its effects, and the response-head check of the watching rules
-//! ([`crate::watch`]). Addons will be more stages.
+//! On the way out, [`request_steps`] buffers the request body (only when a
+//! rule reads `body.text`) and then makes the head decision with its
+//! effects. On the way back, [`response_steps`] buffers the response body
+//! (only for `response.body.text`) and then checks the watching rules at the
+//! response head ([`crate::watch`]). The upstream exchange between the two
+//! is in [`crate::exchange`]. Extension happens above all of this, in the
+//! addon stack ([`crate::addons`]), not here.
 //!
 //! # Fail closed by construction
 //!
-//! Stages cannot forward anything themselves: they return a [`Verdict`],
-//! and the only variant that leads toward the upstream is
-//! [`Verdict::Continue`]. Every error a stage meets (body failure,
+//! No step can forward anything itself: each returns a [`Verdict`] (or
+//! [`ResponseVerdict`]), and the only variant that leads toward the upstream
+//! is [`Verdict::Continue`]. Every error a step meets (body failure,
 //! unavailable policy input, invalid mutation, denied redirect target,
 //! state store full, unsupported effect) is mapped to [`Verdict::Deny`] or
-//! [`Verdict::Close`]. The driver ([`run_request_stages`] and
-//! `exchange::run`) matches the verdict exhaustively with no wildcard arm, so
-//! a new variant cannot silently fall through to forwarding.
+//! [`Verdict::Close`]. The steps and their caller (`exchange::core`) match
+//! verdicts exhaustively with no wildcard arm, so a new variant cannot
+//! silently fall through to forwarding.
 
 use std::fmt::Write as _;
 use std::future::Future;
@@ -52,8 +51,8 @@ use crate::sources::{MetricSourceError, Sample};
 use crate::view::{FlowFacts, Inspected, ProxyView, RequestFacts, ResponseFacts, host_text};
 use crate::watch::Watch;
 
-/// Boxed future returned by stages.
-pub(crate) type StageFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+/// The boxed future of [`BodyIo::collect`].
+pub(crate) type CollectFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Rule id used for denies by the upstream address floor.
 pub(crate) const ADDRESS_POLICY_RULE: &str = "_address_policy";
@@ -162,9 +161,9 @@ impl Refusal {
     }
 }
 
-/// Outcome of the request stages. Consumed exhaustively by the exchange
+/// Outcome of the request steps. Consumed exhaustively by the exchange
 /// driver: only `Continue` reaches the upstream.
-#[allow(clippy::large_enum_variant)] // moved once per stage, never stored
+#[allow(clippy::large_enum_variant)] // moved once per step, never stored
 pub(crate) enum Verdict {
     /// Proceed with this (possibly mutated) request.
     Continue(CanonicalRequest),
@@ -174,7 +173,7 @@ pub(crate) enum Verdict {
     Close(ParseError),
 }
 
-/// Outcome of the response stages.
+/// Outcome of the response steps.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ResponseVerdict {
     /// Send this (possibly mutated) response.
@@ -185,14 +184,14 @@ pub(crate) enum ResponseVerdict {
     Close(ParseError),
 }
 
-/// Body access a stage needs from the client connection: buffering while
+/// Body access a step needs from the client connection: buffering while
 /// the codec keeps pumping the client's request body.
 pub(crate) trait BodyIo: Send {
     fn collect<'a>(
         &'a mut self,
         body: &'a mut Body,
         cap: u64,
-    ) -> StageFuture<'a, Result<Collected, ParseError>>;
+    ) -> CollectFuture<'a, Result<Collected, ParseError>>;
 }
 
 impl BodyIo for ServerConn<ConnIo> {
@@ -200,87 +199,37 @@ impl BodyIo for ServerConn<ConnIo> {
         &'a mut self,
         body: &'a mut Body,
         cap: u64,
-    ) -> StageFuture<'a, Result<Collected, ParseError>> {
+    ) -> CollectFuture<'a, Result<Collected, ParseError>> {
         Box::pin(self.drive(collect_prefix(body, cap)))
     }
 }
 
-/// A stage on the request path.
-pub(crate) trait RequestStage: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn on_request<'a>(
-        &'a self,
-        cx: &'a mut FlowCx,
-        req: CanonicalRequest,
-        io: &'a mut dyn BodyIo,
-    ) -> StageFuture<'a, Verdict>;
-}
-
-/// A stage on the response path.
-pub(crate) trait ResponseStage: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn on_response<'a>(
-        &'a self,
-        cx: &'a mut FlowCx,
-        res: CanonicalResponse,
-        io: &'a mut dyn BodyIo,
-    ) -> StageFuture<'a, ResponseVerdict>;
-}
-
-/// The ordered stages.
-pub(crate) struct Pipeline {
-    pub request: Vec<Box<dyn RequestStage>>,
-    pub response: Vec<Box<dyn ResponseStage>>,
-}
-
-impl Pipeline {
-    /// The built-in pipeline.
-    pub(crate) fn builtin() -> Self {
-        Self {
-            request: vec![Box::new(InspectRequestBody), Box::new(RequestRules)],
-            response: vec![Box::new(InspectResponseBody), Box::new(ResponseRules)],
-        }
-    }
-}
-
-/// Runs the request stages in order.
-pub(crate) async fn run_request_stages(
-    p: &Pipeline,
+/// The request side: inspect the body if a rule needs it, then the head
+/// decision and its effects.
+pub(crate) async fn request_steps(
     cx: &mut FlowCx,
-    mut req: CanonicalRequest,
+    req: CanonicalRequest,
     io: &mut dyn BodyIo,
 ) -> Verdict {
-    for stage in &p.request {
-        match stage.on_request(cx, req, io).await {
-            Verdict::Continue(r) => req = r,
-            Verdict::Deny(d) => {
-                tracing::debug!(stage = stage.name(), "request denied");
-                return Verdict::Deny(d);
-            }
-            Verdict::Close(e) => return Verdict::Close(e),
-        }
+    match inspect_request_body(cx, req, io).await {
+        Verdict::Continue(req) => request_rules(cx, req),
+        Verdict::Deny(d) => Verdict::Deny(d),
+        Verdict::Close(e) => Verdict::Close(e),
     }
-    Verdict::Continue(req)
 }
 
-/// Runs the response stages in order.
-pub(crate) async fn run_response_stages(
-    p: &Pipeline,
+/// The response side: inspect the body if a rule needs it, then the
+/// watching rules at the response head.
+pub(crate) async fn response_steps(
     cx: &mut FlowCx,
-    mut res: CanonicalResponse,
+    res: CanonicalResponse,
     io: &mut dyn BodyIo,
 ) -> ResponseVerdict {
-    for stage in &p.response {
-        match stage.on_response(cx, res, io).await {
-            ResponseVerdict::Continue(r) => res = r,
-            ResponseVerdict::Deny(d) => {
-                tracing::debug!(stage = stage.name(), "response denied");
-                return ResponseVerdict::Deny(d);
-            }
-            ResponseVerdict::Close(e) => return ResponseVerdict::Close(e),
-        }
+    match inspect_response_body(cx, res, io).await {
+        ResponseVerdict::Continue(res) => response_rules(cx, res),
+        ResponseVerdict::Deny(d) => ResponseVerdict::Deny(d),
+        ResponseVerdict::Close(e) => ResponseVerdict::Close(e),
     }
-    ResponseVerdict::Continue(res)
 }
 
 // ---------------------------------------------------------------------------
@@ -307,7 +256,7 @@ pub(crate) struct FlowRecord {
     pub addons: Vec<String>,
 }
 
-/// Per-flow state shared by the stages.
+/// Per-flow state shared by the steps.
 pub(crate) struct FlowCx {
     pub shared: Arc<Shared>,
     pub snap: Arc<Snapshot>,
@@ -754,90 +703,64 @@ pub(crate) fn body_failure(e: &BodyError) -> ParseError {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in request stages
+// Request steps
 // ---------------------------------------------------------------------------
 
 /// Bounded buffering in front of body-inspecting rules (docs/rules.md#body-access).
-struct InspectRequestBody;
-
-impl RequestStage for InspectRequestBody {
-    fn name(&self) -> &'static str {
-        "inspect_request_body"
+async fn inspect_request_body(
+    cx: &mut FlowCx,
+    mut req: CanonicalRequest,
+    io: &mut dyn BodyIo,
+) -> Verdict {
+    if !cx.snap.policy.needs_request_body() {
+        return Verdict::Continue(req);
     }
-
-    fn on_request<'a>(
-        &'a self,
-        cx: &'a mut FlowCx,
-        mut req: CanonicalRequest,
-        io: &'a mut dyn BodyIo,
-    ) -> StageFuture<'a, Verdict> {
-        Box::pin(async move {
-            if !cx.snap.policy.needs_request_body() {
-                return Verdict::Continue(req);
-            }
-            let cap = cx.snap.limits.max_inspect_body_bytes;
-            let inspected = match io.collect(&mut req.body, cap).await {
-                Err(e) => return Verdict::Close(e),
-                Ok(Collected::Failed(e)) => return Verdict::Close(body_failure(&e)),
-                Ok(Collected::Complete(b)) => {
-                    if let Some(f) = cx.facts.request.as_mut() {
-                        f.body_size = Some(b.len() as u64);
-                    }
-                    Inspected::Text(body_text(&b))
-                }
-                Ok(Collected::TooLarge) => Inspected::TooLarge,
-            };
+    let cap = cx.snap.limits.max_inspect_body_bytes;
+    let inspected = match io.collect(&mut req.body, cap).await {
+        Err(e) => return Verdict::Close(e),
+        Ok(Collected::Failed(e)) => return Verdict::Close(body_failure(&e)),
+        Ok(Collected::Complete(b)) => {
             if let Some(f) = cx.facts.request.as_mut() {
-                f.body = inspected;
+                f.body_size = Some(b.len() as u64);
             }
-            Verdict::Continue(req)
-        })
+            Inspected::Text(body_text(&b))
+        }
+        Ok(Collected::TooLarge) => Inspected::TooLarge,
+    };
+    if let Some(f) = cx.facts.request.as_mut() {
+        f.body = inspected;
     }
+    Verdict::Continue(req)
 }
 
 /// The head decision (docs/rules.md#evaluation) and its effects.
-struct RequestRules;
-
-impl RequestStage for RequestRules {
-    fn name(&self) -> &'static str {
-        "request_rules"
+fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
+    let (out, refusal) = cx.evaluate_head();
+    if let Some(r) = refusal {
+        return Verdict::Deny(r);
     }
-
-    fn on_request<'a>(
-        &'a self,
-        cx: &'a mut FlowCx,
-        mut req: CanonicalRequest,
-        _io: &'a mut dyn BodyIo,
-    ) -> StageFuture<'a, Verdict> {
-        Box::pin(async move {
-            let (out, refusal) = cx.evaluate_head();
-            if let Some(r) = refusal {
-                return Verdict::Deny(r);
-            }
-            if let Decision::Allow(opts) = out.decision {
-                cx.opts = opts;
-            }
-            for effect in out.effects {
-                if let Err(r) = apply_request_effect(cx, &mut req, effect) {
-                    return Verdict::Deny(r);
-                }
-            }
-            // Later stages, watching rules and the log see the request as it
-            // will be forwarded.
-            let body = cx
-                .facts
-                .request
-                .as_ref()
-                .map(|r| (r.body.clone(), r.body_size));
-            let mut facts = request_facts(&req);
-            if let Some((inspected, size)) = body {
-                facts.body = inspected;
-                facts.body_size = size;
-            }
-            cx.facts.request = Some(facts);
-            Verdict::Continue(req)
-        })
+    if let Decision::Allow(opts) = out.decision {
+        cx.opts = opts;
     }
+    for effect in out.effects {
+        if let Err(r) = apply_request_effect(cx, &mut req, effect) {
+            return Verdict::Deny(r);
+        }
+    }
+    // The watching rules and the log see the request as it
+    // will be forwarded.
+    let body = cx
+        .facts
+        .request
+        .as_ref()
+        .map(|r| (r.body.clone(), r.body_size));
+    let mut facts = request_facts(&req);
+    if let Some((inspected, size)) = body {
+        facts.body = inspected;
+        facts.body_size = size;
+    }
+    cx.facts.request = Some(facts);
+    Verdict::Continue(req)
 }
 
 fn invalid(what: &str, e: &dyn std::fmt::Display) -> Refusal {
@@ -987,86 +910,60 @@ fn apply_request_effect(
 }
 
 // ---------------------------------------------------------------------------
-// Built-in response stages
+// Response steps
 // ---------------------------------------------------------------------------
 
 /// Bounded buffering of the response body for `response.body.text`.
-struct InspectResponseBody;
-
-impl ResponseStage for InspectResponseBody {
-    fn name(&self) -> &'static str {
-        "inspect_response_body"
+async fn inspect_response_body(
+    cx: &mut FlowCx,
+    mut res: CanonicalResponse,
+    io: &mut dyn BodyIo,
+) -> ResponseVerdict {
+    cx.facts.response = Some(ResponseFacts {
+        status: res.status.as_u16(),
+        headers: res.headers.clone(),
+        body_size: res.body.known_length(),
+        body: Inspected::NotBuffered,
+    });
+    if !cx.snap.policy.needs_response_body() {
+        return ResponseVerdict::Continue(res);
     }
-
-    fn on_response<'a>(
-        &'a self,
-        cx: &'a mut FlowCx,
-        mut res: CanonicalResponse,
-        io: &'a mut dyn BodyIo,
-    ) -> StageFuture<'a, ResponseVerdict> {
-        Box::pin(async move {
-            cx.facts.response = Some(ResponseFacts {
-                status: res.status.as_u16(),
-                headers: res.headers.clone(),
-                body_size: res.body.known_length(),
-                body: Inspected::NotBuffered,
-            });
-            if !cx.snap.policy.needs_response_body() {
-                return ResponseVerdict::Continue(res);
-            }
-            let cap = cx.snap.limits.max_inspect_body_bytes;
-            let inspected = match io.collect(&mut res.body, cap).await {
-                Err(e) => return ResponseVerdict::Close(e),
-                Ok(Collected::Failed(e)) => {
-                    return ResponseVerdict::Deny(Refusal::upstream(
-                        502,
-                        "upstream_body_failed",
-                        &format!("upstream response body failed: {e}"),
-                    ));
-                }
-                Ok(Collected::Complete(b)) => {
-                    if let Some(f) = cx.facts.response.as_mut() {
-                        f.body_size = Some(b.len() as u64);
-                    }
-                    Inspected::Text(body_text(&b))
-                }
-                Ok(Collected::TooLarge) => Inspected::TooLarge,
-            };
+    let cap = cx.snap.limits.max_inspect_body_bytes;
+    let inspected = match io.collect(&mut res.body, cap).await {
+        Err(e) => return ResponseVerdict::Close(e),
+        Ok(Collected::Failed(e)) => {
+            return ResponseVerdict::Deny(Refusal::upstream(
+                502,
+                "upstream_body_failed",
+                &format!("upstream response body failed: {e}"),
+            ));
+        }
+        Ok(Collected::Complete(b)) => {
             if let Some(f) = cx.facts.response.as_mut() {
-                f.body = inspected;
+                f.body_size = Some(b.len() as u64);
             }
-            ResponseVerdict::Continue(res)
-        })
+            Inspected::Text(body_text(&b))
+        }
+        Ok(Collected::TooLarge) => Inspected::TooLarge,
+    };
+    if let Some(f) = cx.facts.response.as_mut() {
+        f.body = inspected;
     }
+    ResponseVerdict::Continue(res)
 }
 
 /// The watching rules at the response head (docs/rules.md#evaluation): they may stop the
 /// exchange (answered with an error response, since nothing has been sent
 /// yet) or change the response head.
-struct ResponseRules;
-
-impl ResponseStage for ResponseRules {
-    fn name(&self) -> &'static str {
-        "response_rules"
-    }
-
-    fn on_response<'a>(
-        &'a self,
-        cx: &'a mut FlowCx,
-        mut res: CanonicalResponse,
-        _io: &'a mut dyn BodyIo,
-    ) -> StageFuture<'a, ResponseVerdict> {
-        Box::pin(async move {
-            // Every forwarded exchange has a watcher and response facts;
-            // never continue without them.
-            let (Some(watch), Some(facts)) = (cx.watch.clone(), cx.facts.response.clone()) else {
-                return ResponseVerdict::Deny(Refusal::fail_closed("watch_missing"));
-            };
-            match watch.on_response_head(facts, &mut res) {
-                Ok(()) => ResponseVerdict::Continue(res),
-                Err(stop) => ResponseVerdict::Deny(stop.refusal),
-            }
-        })
+fn response_rules(cx: &mut FlowCx, mut res: CanonicalResponse) -> ResponseVerdict {
+    // Every forwarded exchange has a watcher and response facts;
+    // never continue without them.
+    let (Some(watch), Some(facts)) = (cx.watch.clone(), cx.facts.response.clone()) else {
+        return ResponseVerdict::Deny(Refusal::fail_closed("watch_missing"));
+    };
+    match watch.on_response_head(facts, &mut res) {
+        Ok(()) => ResponseVerdict::Continue(res),
+        Err(stop) => ResponseVerdict::Deny(stop.refusal),
     }
 }
 
