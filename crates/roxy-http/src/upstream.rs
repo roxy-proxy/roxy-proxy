@@ -133,7 +133,9 @@ where
     let meta = ResponseMeta {
         declared_length: single_content_length(&parts.headers),
         upgrade,
-        close: conn.iter().any(|t| t == "close"),
+        // The upstream's `connection: close` concerns roxy's upstream
+        // connection only; it must not close the client's.
+        close: false,
     };
     CanonicalResponse {
         status: parts.status,

@@ -134,8 +134,12 @@ pub struct ResponseMeta {
     /// Lower-cased `Upgrade` value of a `101` response when `Connection`
     /// nominated `upgrade`.
     pub upgrade: Option<String>,
-    /// The upstream asked to close (informational; the client connection's
-    /// keep-alive is managed independently).
+    /// Close the client connection after this response
+    /// ([`crate::h1::ServerConn::respond`] writes `connection: close`, then
+    /// half-closes with a lingering close). Set by roxy for responses it
+    /// generates (e.g. denials); never derived from the upstream's
+    /// `Connection` field, because the upstream connection is managed
+    /// independently of the client's keep-alive.
     pub close: bool,
 }
 
