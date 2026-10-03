@@ -42,6 +42,12 @@ RUN install -D -m 0444 examples/docker/roxy.yaml /out/etc/roxy/roxy.yaml \
     && install -d -m 0755 -o 65532 -g 65532 /out/var/lib/roxy /out/var/log/roxy \
     && install -d -m 0700 -o 65532 -g 65532 /out/var/lib/roxy/ca /out/var/lib/roxy/capture
 
+# ---- artifact ----------------------------------------------------------------
+# Only the binary, for the release tarballs (.github/workflows/release.yml):
+#   docker buildx build --target artifact --output type=local,dest=out .
+FROM scratch AS artifact
+COPY --from=build /roxy /roxy
+
 # ---- runtime -----------------------------------------------------------------
 # distroless/static-debian12:nonroot: /etc/passwd with nonroot (65532),
 # tzdata and nothing else (~2 MB). roxy needs no system CA bundle: upstream
