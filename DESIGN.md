@@ -998,6 +998,53 @@ With this shape the patterns from the brief fall out naturally:
   request body. Three streams, zero buffering.
 - **Deny or synthesise:** return a response without calling `next`.
 
+**Full bidirectional access, low level.** An addon owns everything that
+passes through its position in the chain, in both directions: the request
+head and body stream on the way in, and the response head and body stream on
+the way back. It may read, rewrite, split, delay, inject into, or replace any
+of them, chunk by chunk. For upgraded connections (WebSocket relay tier) the
+addon gets the two raw byte streams after the `101` (`on-tunnel` hook:
+`client-to-upstream` and `upstream-to-client` as `input-stream` /
+`output-stream` pairs) and may pass bytes through, transform them, or close
+either side. Nothing is buffered by roxy on an addon's behalf; an addon that
+wants a whole message reads its stream to the end itself, subject to its
+buffer cap.
+
+**Default limits apply to addons exactly as to clients.** Whatever an addon
+emits towards the next layer is treated as if a client sent it: re-validated
+by the canonical model, subject to `limits.max_request_body_bytes` /
+`max_response_body_bytes`, the header limits, and the body idle timeouts. An
+addon cannot use its position to exceed a limit the workload is held to.
+Per-addon resource limits default to the global ones and can only be
+tightened per addon, except where an addon genuinely needs more (see
+below).
+
+**Primary use case: an inspection sentinel compiled to WASM** (e.g. a
+classifier that scans outbound bodies for secrets or prompt-injection
+payloads, or inbound responses for instructions aimed at the agent). Such an
+addon typically reads the stream, buffers up to its cap, decides, then
+either forwards the bytes unchanged, forwards a redacted version, or returns
+a deny. Because it may need more memory or CPU than a simple rewriter, these
+per-addon overrides exist and are logged at startup:
+
+```yaml
+addons:
+  - name: sentinel
+    path: /etc/roxy/addons/sentinel.wasm
+    stage: before_rules
+    hooks: [request, response, tunnel]
+    limits:                       # defaults shown; each may be raised explicitly
+      max_memory: 64mb
+      max_buffered_body_bytes: 1mb   # defaults to limits.max_inspect_body_bytes
+      step_cpu: 50ms
+      fuel_per_step: 100_000_000
+    on_error: deny                # deny (default) | close. Never "pass".
+```
+
+There is deliberately no `on_error: pass`: a sentinel that crashes, times
+out, or exceeds its cap fails the flow closed, so an attacker cannot disable
+inspection by feeding the sentinel input that makes it trap.
+
 **Stages.** Each addon declares `stage: before_rules | after_rules`
 (default `before_rules`), or is invoked at a precise point by a rule's
 `call: <addon>` action (`in_chain`). Within a stage, addons are ordered as
@@ -1077,12 +1124,21 @@ interface flow {
   config: func() -> string;                            // addon's JSON config blob
 }
 
+interface tunnel {
+  use wasi:io/streams@0.2.0.{input-stream, output-stream};
+  /// Called once per upgraded connection after the 101. The addon pumps
+  /// bytes between the pairs (or transforms/closes them) and returns when done.
+  on-tunnel: func(from-client: input-stream, to-upstream: output-stream,
+                  from-upstream: input-stream, to-client: output-stream);
+}
+
 world addon {
   include wasi:cli/imports@0.2.0;                      // clocks, random, streams; no fs, no sockets
   import wasi:http/outgoing-handler@0.2.0;             // side requests (`http` capability)
   import chain;
   import flow;
   export wasi:http/incoming-handler@0.2.0;             // handle(request, response-outparam)
+  export tunnel;                                       // optional: only if `tunnel` is in hooks
   export init: func() -> result<_, string>;
 }
 ```
@@ -1163,7 +1219,7 @@ socket, never a pass-through. Specifically:
 - Per-client-IP connection cap; global connection cap; accept backpressure.
 - All reads bounded (head size, body size, ClientHello size, WS message size).
 - Timeouts at every stage; idle keep-alive timeout for client connections.
-- Metric/state key cardinality caps with LRU.
+- Metric/state key cardinality caps with **no eviction**: a full table denies flows needing a new key (§6.4).
 - Leaf cert cache bounded.
 - No allocation proportional to attacker-controlled numbers before validation
   (e.g. `content-length: 10^18` does not pre-allocate).
