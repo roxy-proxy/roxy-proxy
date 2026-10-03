@@ -532,13 +532,36 @@ pub struct Log {
     pub redact_headers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct FlowLog {
     /// JSONL output file; absent = stdout.
     pub path: Option<PathBuf>,
     /// Also log connection-level (`connect`) events.
     pub connection_events: bool,
+    /// Unwritten log bytes at which traffic is held back (§10.1).
+    #[serde(deserialize_with = "units::size")]
+    pub high_water: ByteSize,
+    /// Rotate `path` once it reaches this size; absent = never rotate.
+    #[serde(deserialize_with = "units::opt_size")]
+    pub max_file_bytes: Option<ByteSize>,
+    /// Keep at most this many rotated files; absent = keep all.
+    pub max_files: Option<usize>,
+    /// Gzip rotated files.
+    pub compress: bool,
+}
+
+impl Default for FlowLog {
+    fn default() -> Self {
+        Self {
+            path: None,
+            connection_events: false,
+            high_water: ByteSize::b(roxy_proxy::logging::DEFAULT_HIGH_WATER as u64),
+            max_file_bytes: None,
+            max_files: None,
+            compress: false,
+        }
+    }
 }
 
 // ----- loading --------------------------------------------------------------

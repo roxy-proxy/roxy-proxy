@@ -454,3 +454,55 @@ fn addon_on_error_has_no_pass() {
     assert_eq!(a.limits.max_memory, None);
     assert_eq!(c.limits.max_address_list_bytes, ByteSize::b(256 << 20));
 }
+
+#[test]
+fn flow_log_defaults_and_rotation_settings() {
+    let cfg = parse(BASE);
+    let f = &cfg.log.flow;
+    assert_eq!(f.high_water.as_u64(), 8 << 20);
+    assert_eq!(
+        (f.max_file_bytes, f.max_files, f.compress),
+        (None, None, false)
+    );
+
+    let cfg = parse(&format!(
+        "{BASE}log:\n  flow:\n    path: /var/log/roxy/flow.jsonl\n    high_water: 16mb\n    \
+         max_file_bytes: 100mb\n    max_files: 7\n    compress: true\n"
+    ));
+    cfg.validate().unwrap();
+    let f = &cfg.log.flow;
+    assert_eq!(f.high_water.as_u64(), 16 << 20);
+    assert_eq!(f.max_file_bytes.map(|b| b.as_u64()), Some(100 << 20));
+    assert_eq!(f.max_files, Some(7));
+    assert!(f.compress);
+}
+
+#[test]
+fn flow_log_settings_validated() {
+    for (yaml, path, needle) in [
+        ("high_water: 1kb", "log.flow.high_water", "at least 64kb"),
+        ("max_file_bytes: 1mb", "log.flow", "need `path`"),
+        (
+            "path: /x.jsonl\n    max_files: 3",
+            "log.flow.max_file_bytes",
+            "set max_file_bytes",
+        ),
+        (
+            "path: /x.jsonl\n    max_file_bytes: 1kb",
+            "log.flow.max_file_bytes",
+            "at least 4kb",
+        ),
+        (
+            "path: /x.jsonl\n    max_file_bytes: 1mb\n    max_files: 0",
+            "log.flow.max_files",
+            "at least 1",
+        ),
+    ] {
+        let d = diagnostics(&format!("{BASE}log:\n  flow:\n    {yaml}\n"));
+        assert!(
+            d.iter()
+                .any(|d| d.path == path && d.message.contains(needle)),
+            "{yaml}: {d:?}"
+        );
+    }
+}

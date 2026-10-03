@@ -10,14 +10,13 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 
-use crate::logwriter::{LogWriter, WriterOptions};
+use roxy_log::{LogWriter, RotateOptions, RotatingFile, Stream, WriterOptions};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Serialize, Serializer};
@@ -390,6 +389,10 @@ pub trait FlowSink: Send + Sync {
     /// Blocks until every event emitted so far is written (bounded by the
     /// sink's own timeout). Default: nothing to flush.
     fn flush(&self) {}
+
+    /// Reopens file destinations after external rotation (`SIGHUP`).
+    /// Default: nothing to reopen.
+    fn reopen(&self) {}
 }
 
 /// Waits until `sink` accepts more work ([`FlowSink::poll_ready`]).
@@ -454,15 +457,20 @@ pub struct BufferedSink {
 }
 
 impl BufferedSink {
-    /// Starts the writer thread for `out`.
-    pub fn spawn<W: Write + Send + 'static>(
+    /// Starts the writer thread for `dest`.
+    pub fn spawn<D: roxy_log::Destination>(
         name: &'static str,
-        out: W,
+        dest: D,
         opts: WriterOptions,
     ) -> io::Result<Self> {
         Ok(Self {
-            writer: LogWriter::spawn(name, out, opts)?,
+            writer: LogWriter::spawn(name, dest, opts)?,
         })
+    }
+
+    /// Whether the log is currently holding traffic back.
+    pub fn is_holding(&self) -> bool {
+        self.writer.is_holding()
     }
 
     /// Bytes emitted but not yet written.
@@ -485,6 +493,10 @@ impl FlowSink for BufferedSink {
     fn flush(&self) {
         self.writer.flush();
     }
+
+    fn reopen(&self) {
+        self.writer.reopen();
+    }
 }
 
 /// Writes JSON lines to the process's stdout, buffered (§10.1).
@@ -493,7 +505,11 @@ pub struct StdoutSink(BufferedSink);
 
 impl StdoutSink {
     pub fn new() -> io::Result<Self> {
-        BufferedSink::spawn("stdout", io::stdout(), WriterOptions::default()).map(Self)
+        Self::with_options(WriterOptions::default())
+    }
+
+    pub fn with_options(opts: WriterOptions) -> io::Result<Self> {
+        BufferedSink::spawn("stdout", Stream(io::stdout()), opts).map(Self)
     }
 }
 
@@ -511,7 +527,8 @@ impl FlowSink for StdoutSink {
     }
 }
 
-/// Appends JSON lines to a file, buffered (§10.1).
+/// Appends JSON lines to a file, buffered, with optional size-based
+/// rotation (§10.1).
 #[derive(Debug)]
 pub struct FileSink {
     path: PathBuf,
@@ -521,15 +538,15 @@ pub struct FileSink {
 impl FileSink {
     /// Open `path` for appending, creating it if needed.
     pub fn open(path: &Path) -> io::Result<Self> {
-        Self::open_with(path, WriterOptions::default())
+        Self::open_with(path, WriterOptions::default(), RotateOptions::default())
     }
 
-    /// [`FileSink::open`] with explicit writer tuning.
-    pub fn open_with(path: &Path, opts: WriterOptions) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+    /// [`FileSink::open`] with explicit writer tuning and rotation.
+    pub fn open_with(path: &Path, opts: WriterOptions, rotate: RotateOptions) -> io::Result<Self> {
+        let dest = RotatingFile::open(path, rotate)?;
         Ok(Self {
             path: path.to_path_buf(),
-            inner: BufferedSink::spawn("file", file, opts)?,
+            inner: BufferedSink::spawn("file", dest, opts)?,
         })
     }
 
@@ -549,6 +566,10 @@ impl FlowSink for FileSink {
 
     fn flush(&self) {
         self.inner.flush();
+    }
+
+    fn reopen(&self) {
+        self.inner.reopen();
     }
 }
 
@@ -599,6 +620,12 @@ impl FlowSink for MultiSink {
     fn flush(&self) {
         for sink in &self.sinks {
             sink.flush();
+        }
+    }
+
+    fn reopen(&self) {
+        for sink in &self.sinks {
+            sink.reopen();
         }
     }
 }

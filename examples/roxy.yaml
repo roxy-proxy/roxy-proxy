@@ -136,6 +136,16 @@ rules:
     when: response.status >= 500
     then: { log: { level: warn, message: "upstream 5xx" } }
 
+log:
+  flow:
+    path: /var/log/roxy/flow.jsonl   # absent = stdout
+    connection_events: false
+    high_water: 8mb                  # unwritten log at which traffic is held back
+    max_file_bytes: 100mb            # rotate by size; absent = never
+    max_files: 10                    # rotated files kept; absent = all
+    compress: true                   # gzip rotated files
+  redact_headers: [x-internal-token]
+
 # Addons sit above the rules, in the order listed: the first sees each
 # request first and each response last. Not in this build; `roxy run`
 # refuses a config with addons.
