@@ -14,8 +14,8 @@ use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::Value;
 use support::{
-    H2_HEADERS, H2_RST_STREAM, Harness, Opts, SECRET, fnv, h2_get, h2_raw_request, raw, read_head,
-    read_response, read_to_eof,
+    H2_HEADERS, H2_RST_STREAM, Harness, LogGate, Opts, SECRET, fnv, h2_get, h2_raw_request, raw,
+    read_head, read_response, read_to_eof,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -1768,5 +1768,46 @@ async fn websocket_byte_budget_closes_the_relay() {
     assert_eq!(ev[0]["terminal_rule"], "ws-budget");
     let close = h.wait_events("ws_close", 1).await;
     assert!(close[0]["bytes_s2c"].as_u64().unwrap() <= 50 * 1024 + 64);
+    h.stop().await;
+}
+
+// ----- audit backpressure (§10.1) --------------------------------------------
+
+/// A flow log that cannot keep up holds traffic back instead of dropping
+/// records: new exchanges and streaming bodies wait until it is ready.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_flow_log_holds_traffic() {
+    let gate = Arc::new(LogGate::default());
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        log_gate: Some(gate.clone()),
+        ..Opts::default()
+    })
+    .await;
+    let c = h.client();
+    assert_eq!(
+        c.get(h.http_url("/before")).send().await.unwrap().status(),
+        200
+    );
+    gate.set_closed(true);
+    let url = h.http_url("/held");
+    let req = tokio::spawn({
+        let c = c.clone();
+        async move { c.get(url).send().await.unwrap().status() }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!req.is_finished(), "traffic moved while the log was behind");
+    assert!(
+        h.upstream
+            .seen()
+            .iter()
+            .all(|s| s.path_and_query != "/held")
+    );
+    gate.set_closed(false);
+    let status = tokio::time::timeout(Duration::from_secs(10), req)
+        .await
+        .expect("traffic resumes once the log catches up")
+        .unwrap();
+    assert_eq!(status, 200);
     h.stop().await;
 }

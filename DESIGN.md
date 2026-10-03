@@ -1057,7 +1057,7 @@ Sinks implement `trait FlowSink { fn emit(&self, event: &FlowEvent); }`:
 `Stdout`, `File` (with size rotation), later `UnixSocket` (live stream),
 `Otlp`.
 
-**Writing (planned; today each emitter writes and flushes under a lock).**
+**Writing** (`roxy-proxy::logwriter`).
 Logging is a first-class product feature and an audit trail, so the write
 path is built for many cores and heavy traffic, and it never drops:
 
@@ -1065,13 +1065,18 @@ path is built for many cores and heavy traffic, and it never drops:
   the event on their own thread and enqueue the bytes on a bounded
   multi-producer queue; they never touch the file or contend on its lock.
 - **Batching.** The writer drains everything queued and issues one large
-  write, flushing on a size or time threshold (e.g. 64 KiB / 50 ms), on
-  rotation and at shutdown. Throughput scales with disk bandwidth rather
-  than event rate.
-- **Backpressure, never loss.** When the queue is full, emitting waits.
-  The wait is on the exchange's own task, so it propagates to the network:
-  roxy stops reading from the client and the upstream until the audit
-  record is accepted, slowing traffic rather than losing records. A sink
+  write: under load each write carries everything queued since the last,
+  at low load each line goes out as it arrives. Throughput scales with
+  disk bandwidth rather than event rate. Dropping the sink writes what is
+  left.
+- **Backpressure, never loss.** Emitting never blocks and never drops.
+  Instead, once unwritten bytes pass a high-water mark (8 MiB) the sink
+  reports not-ready (`FlowSink::poll_ready`), and every traffic producer
+  waits on it: the start of each exchange, each forwarded body chunk, each
+  WebSocket read. So the wait propagates to the network: roxy stops
+  reading from the client and the upstream until the log catches up,
+  slowing traffic rather than losing records. Overshoot past the mark is
+  bounded by what in-flight exchanges emit between two checks. A sink
   that fails (disk full, I/O error) stops traffic the same way; it is
   reported, never silently skipped.
 - **Shared with capture.** Body capture (§10.2) and any future "tee all

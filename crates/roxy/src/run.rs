@@ -148,7 +148,7 @@ pub fn build_sink(config: &Config) -> anyhow::Result<Arc<dyn FlowSink>> {
         Some(path) => Arc::new(
             FileSink::open(path).with_context(|| format!("opening flow log {}", path.display()))?,
         ),
-        None => Arc::new(StdoutSink::new()),
+        None => Arc::new(StdoutSink::new().context("starting the flow log writer")?),
     })
 }
 

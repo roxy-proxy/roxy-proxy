@@ -31,7 +31,14 @@
 //!
 //! Whether a chunk needs anything is decided once per exchange from the
 //! policy's masks. When no rule watches a direction and no metric counts
-//! its bytes, a chunk costs one atomic load (the stop flag) and no lock.
+//! its bytes, a chunk costs two atomic loads (the stop flag and the flow
+//! log's readiness) and no lock.
+//!
+//! # Audit backpressure
+//!
+//! The body adapter also waits for the flow log ([`FlowSink::poll_ready`],
+//! §10.1) before moving each chunk, so a log that cannot keep up slows the
+//! traffic instead of dropping records.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -45,7 +52,7 @@ use roxy_rules::{Decision, Effect, EvalContext, Reads, WatchState};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use ulid::Ulid;
 
-use crate::flowlog::Stage;
+use crate::flowlog::{FlowSink, Stage};
 use crate::pipeline::{Events, FlowCx, Refusal, fail_closed_code};
 use crate::server::{Shared, Snapshot};
 use crate::sources::Sample;
@@ -152,6 +159,11 @@ impl Watch {
             return None;
         }
         self.lock().stopped.clone()
+    }
+
+    /// The flow sink, for audit backpressure (§10.1).
+    pub(crate) fn sink(&self) -> Arc<dyn FlowSink> {
+        self.lock().shared.sink.clone()
     }
 
     /// Resolves once the exchange is stopped.
@@ -435,12 +447,14 @@ impl Inner {
 pub(crate) fn watched(body: Body, watch: Arc<Watch>, dir: Dir) -> Body {
     let known = body.known_length();
     let cancelled = Box::pin(watch.cancelled());
+    let sink = watch.sink();
     Body::wrap_native(
         Watched {
             inner: body,
             watch,
             dir,
             cancelled,
+            sink,
             done: false,
         },
         u64::MAX,
@@ -453,6 +467,9 @@ struct Watched {
     watch: Arc<Watch>,
     dir: Dir,
     cancelled: Pin<Box<WaitForCancellationFutureOwned>>,
+    /// Audit backpressure (§10.1): no chunk moves while the flow log is
+    /// behind.
+    sink: Arc<dyn FlowSink>,
     done: bool,
 }
 
@@ -470,6 +487,13 @@ impl http_body::Body for Watched {
         if self.watch.stop.is_cancelled() {
             self.done = true;
             return Poll::Ready(Some(Err(BodyError::Stopped)));
+        }
+        if self.sink.poll_ready(cx).is_pending() {
+            if self.cancelled.as_mut().poll(cx).is_ready() {
+                self.done = true;
+                return Poll::Ready(Some(Err(BodyError::Stopped)));
+            }
+            return Poll::Pending;
         }
         match Pin::new(&mut self.inner).poll_frame(cx) {
             Poll::Pending => {

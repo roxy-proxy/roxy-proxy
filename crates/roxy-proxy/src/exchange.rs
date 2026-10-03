@@ -206,6 +206,9 @@ pub(crate) async fn process<F: Front>(
     req: CanonicalRequest,
 ) -> Outcome {
     let shared = cx.shared.clone();
+    // Audit backpressure (§10.1): an exchange starts only while the flow
+    // log keeps up.
+    crate::flowlog::sink_ready(&*shared.sink).await;
     let verdict = run_request_stages(&shared.pipeline, cx, req, front).await;
     // Exhaustive, no wildcard: only `Continue` reaches the upstream.
     match verdict {
@@ -620,7 +623,10 @@ async fn pump<R, W>(
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut buf = vec![0u8; 16 * 1024];
+    let sink = watch.sink();
     loop {
+        // Audit backpressure (§10.1): relay only while the log keeps up.
+        crate::flowlog::sink_ready(&*sink).await;
         let k = match r.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(k) => k,

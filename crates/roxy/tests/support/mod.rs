@@ -336,6 +336,52 @@ pub struct Opts<'a> {
     pub upstream: &'a str,
     /// A metric store to plug in.
     pub metrics: Option<Arc<dyn roxy_proxy::MetricSource>>,
+    /// Hold the flow sink "behind" (not ready) while the gate is closed.
+    pub log_gate: Option<Arc<LogGate>>,
+}
+
+/// Makes the test flow sink report backpressure on demand.
+#[derive(Default)]
+pub struct LogGate {
+    closed: std::sync::atomic::AtomicBool,
+    waiters: std::sync::Mutex<Vec<std::task::Waker>>,
+}
+
+impl LogGate {
+    pub fn set_closed(&self, closed: bool) {
+        self.closed
+            .store(closed, std::sync::atomic::Ordering::SeqCst);
+        if !closed {
+            for w in std::mem::take(&mut *self.waiters.lock().unwrap()) {
+                w.wake();
+            }
+        }
+    }
+}
+
+/// A [`MemorySink`] whose readiness follows a [`LogGate`].
+struct GatedSink {
+    inner: Arc<MemorySink>,
+    gate: Option<Arc<LogGate>>,
+}
+
+impl roxy_proxy::FlowSink for GatedSink {
+    fn emit(&self, event: &roxy_proxy::FlowEvent) {
+        self.inner.emit(event);
+    }
+
+    fn poll_ready(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        let Some(g) = &self.gate else {
+            return std::task::Poll::Ready(());
+        };
+        let mut waiters = g.waiters.lock().unwrap();
+        if g.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            waiters.push(cx.waker().clone());
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    }
 }
 
 pub struct Harness {
@@ -455,10 +501,14 @@ log:
         )
         .unwrap();
         let sink = Arc::new(MemorySink::new());
+        let gated = Arc::new(GatedSink {
+            inner: sink.clone(),
+            gate: opts.log_gate.clone(),
+        });
         let running = roxy::run::start(
             &config_path,
             StartOptions {
-                sink: Some(sink.clone()),
+                sink: Some(gated),
                 metrics: opts.metrics.clone(),
                 watch: true,
                 ..StartOptions::default()

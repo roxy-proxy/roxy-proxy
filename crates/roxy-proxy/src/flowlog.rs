@@ -10,11 +10,14 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll};
+
+use crate::logwriter::{LogWriter, WriterOptions};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Serialize, Serializer};
@@ -370,10 +373,28 @@ fn ser_ts<S: Serializer>(ts: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
 // Sinks
 // ---------------------------------------------------------------------------
 
-/// Destination for flow events. Implementations must not panic and must not
-/// block for long; failures are logged via `tracing` and swallowed.
+/// Destination for flow events. `emit` must not panic and must not block on
+/// I/O. A sink that writes somewhere slow buffers and exerts backpressure
+/// through [`FlowSink::poll_ready`] instead of dropping events (§10.1).
 pub trait FlowSink: Send + Sync {
     fn emit(&self, event: &FlowEvent);
+
+    /// `Pending` while the sink is behind (or failing); traffic producers
+    /// wait on it before doing more work, so the backlog cannot grow
+    /// without bound and audit records are never dropped. Default: always
+    /// ready.
+    fn poll_ready(&self, _cx: &mut Context<'_>) -> Poll<()> {
+        Poll::Ready(())
+    }
+
+    /// Blocks until every event emitted so far is written (bounded by the
+    /// sink's own timeout). Default: nothing to flush.
+    fn flush(&self) {}
+}
+
+/// Waits until `sink` accepts more work ([`FlowSink::poll_ready`]).
+pub async fn sink_ready(sink: &dyn FlowSink) {
+    std::future::poll_fn(|cx| sink.poll_ready(cx)).await;
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -425,40 +446,90 @@ impl<W: Write + Send> FlowSink for WriterSink<W> {
     }
 }
 
-/// Writes JSON lines to the process's stdout.
-#[derive(Debug, Default)]
-pub struct StdoutSink;
+/// JSON lines through a [`LogWriter`]: one writer thread, batched writes,
+/// backpressure (§10.1).
+#[derive(Debug)]
+pub struct BufferedSink {
+    writer: LogWriter,
+}
+
+impl BufferedSink {
+    /// Starts the writer thread for `out`.
+    pub fn spawn<W: Write + Send + 'static>(
+        name: &'static str,
+        out: W,
+        opts: WriterOptions,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            writer: LogWriter::spawn(name, out, opts)?,
+        })
+    }
+
+    /// Bytes emitted but not yet written.
+    pub fn pending(&self) -> usize {
+        self.writer.pending()
+    }
+}
+
+impl FlowSink for BufferedSink {
+    fn emit(&self, event: &FlowEvent) {
+        if let Some(line) = encode(event) {
+            self.writer.append(&line);
+        }
+    }
+
+    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.writer.poll_ready(cx)
+    }
+
+    fn flush(&self) {
+        self.writer.flush();
+    }
+}
+
+/// Writes JSON lines to the process's stdout, buffered (§10.1).
+#[derive(Debug)]
+pub struct StdoutSink(BufferedSink);
 
 impl StdoutSink {
-    pub fn new() -> Self {
-        Self
+    pub fn new() -> io::Result<Self> {
+        BufferedSink::spawn("stdout", io::stdout(), WriterOptions::default()).map(Self)
     }
 }
 
 impl FlowSink for StdoutSink {
     fn emit(&self, event: &FlowEvent) {
-        let Some(line) = encode(event) else { return };
-        // `Stdout::lock` serialises with other writers, so lines never interleave.
-        let mut out = io::stdout().lock();
-        if let Err(error) = out.write_all(&line).and_then(|()| out.flush()) {
-            tracing::warn!(sink = "stdout", %error, "flow log: write failed; event dropped");
-        }
+        self.0.emit(event);
+    }
+
+    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.0.poll_ready(cx)
+    }
+
+    fn flush(&self) {
+        self.0.flush();
     }
 }
 
-/// Appends JSON lines to a file, flushing after every line.
+/// Appends JSON lines to a file, buffered (§10.1).
+#[derive(Debug)]
 pub struct FileSink {
     path: PathBuf,
-    inner: WriterSink<BufWriter<File>>,
+    inner: BufferedSink,
 }
 
 impl FileSink {
     /// Open `path` for appending, creating it if needed.
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_with(path, WriterOptions::default())
+    }
+
+    /// [`FileSink::open`] with explicit writer tuning.
+    pub fn open_with(path: &Path, opts: WriterOptions) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             path: path.to_path_buf(),
-            inner: WriterSink::new("file", BufWriter::new(file)),
+            inner: BufferedSink::spawn("file", file, opts)?,
         })
     }
 
@@ -470,6 +541,14 @@ impl FileSink {
 impl FlowSink for FileSink {
     fn emit(&self, event: &FlowEvent) {
         self.inner.emit(event);
+    }
+
+    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn flush(&self) {
+        self.inner.flush();
     }
 }
 
@@ -501,6 +580,25 @@ impl FlowSink for MultiSink {
     fn emit(&self, event: &FlowEvent) {
         for sink in &self.sinks {
             sink.emit(event);
+        }
+    }
+
+    /// Ready only when every sink is.
+    fn poll_ready(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut ready = true;
+        for sink in &self.sinks {
+            ready &= sink.poll_ready(cx).is_ready();
+        }
+        if ready {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn flush(&self) {
+        for sink in &self.sinks {
+            sink.flush();
         }
     }
 }
