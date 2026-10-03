@@ -181,13 +181,9 @@ async fn rewrite_path_and_query_effects() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn redirect_changes_target_and_reruns_connect_phase() {
+async fn redirect_changes_target_and_checks_the_new_address() {
     let h = Harness::start(
         r#"
-  - id: no-blocked
-    phase: connect
-    when: dst.host == "blocked.test"
-    then: deny
   - id: alias-rewrite
     when: host == "alias.test"
     then:
@@ -198,11 +194,11 @@ async fn redirect_changes_target_and_reruns_connect_phase() {
     then:
       - redirect: { host: upstream.test, port: {HTTP} }
       - allow: { private_ok: true }
-  - id: alias-blocked
+  - id: alias-private
     when: host == "evil.test"
     then:
-      - redirect: { host: blocked.test, port: {HTTP} }
-      - allow: { private_ok: true }
+      - redirect: { host: upstream.test, port: {HTTP} }
+      - allow
 "#,
     )
     .await;
@@ -217,9 +213,11 @@ async fn redirect_changes_target_and_reruns_connect_phase() {
     let res = c.get("http://keep.test:1234/b").send().await.unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(json(&res.bytes().await.unwrap())["host"], "keep.test:1234");
+    // The redirect target's address goes through the address floor: a
+    // private address without `private_ok` is refused.
     let res = c.get("http://evil.test:1234/c").send().await.unwrap();
     assert_eq!(res.status(), 403);
-    assert_eq!(res.headers()["x-roxy-rule"], "no-blocked");
+    assert_eq!(res.headers()["x-roxy-rule"], "_address_policy");
     assert_eq!(h.upstream.seen().len(), 2);
     h.stop().await;
 }
@@ -353,27 +351,31 @@ async fn keep_alive_and_pipelining() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn connect_phase_deny() {
-    let h = Harness::start(
-        r#"
-  - id: no-blocked
-    phase: connect
-    when: dst.host == "blocked.test"
+/// There are no connect-time rules (§4.3): a CONNECT is accepted for
+/// inspection and the request inside it is decided.
+async fn connect_is_accepted_and_the_request_inside_decided() {
+    let h = Harness::start(&format!(
+        r#"{ALLOW_UPSTREAM}
+  - id: no-admin
+    when: host == "upstream.test" and path starts_with "/admin"
     then: deny
-"#,
-    )
+"#
+    ))
     .await;
-    let (out, eof) = raw(
-        h.proxy,
-        b"CONNECT blocked.test:443 HTTP/1.1\r\nHost: blocked.test:443\r\n\r\n",
-    )
-    .await;
-    assert!(eof);
-    assert!(out.starts_with("HTTP/1.1 403"), "{out}");
-    assert!(out.contains("x-roxy-rule: no-blocked"), "{out}");
-    let ev = h.wait_events("connect", 1).await;
-    assert_eq!(ev[0]["decision"], "deny");
-    assert_eq!(ev[0]["dst"]["host"], "blocked.test");
+    let port = h.upstream.https.port();
+    let mut s = h.connect_tunnel(&format!("upstream.test:{port}")).await;
+    s.shutdown().await.ok();
+    let res = h
+        .client()
+        .get(h.https_url("/admin/x"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403);
+    assert_eq!(res.headers()["x-roxy-rule"], "no-admin");
+    let ev = h.wait_events("request", 1).await;
+    assert_eq!(ev[0]["stage"], "head");
+    assert_eq!(ev[0]["terminal_rule"], "no-admin");
     h.stop().await;
 }
 
@@ -585,7 +587,6 @@ async fn response_rule_replaces_upstream_5xx() {
     let h = Harness::start(&format!(
         r#"{ALLOW_UPSTREAM}
   - id: hide-5xx
-    phase: response
     when: response.status >= 500
     then: {{ deny: {{ status: 502, message: "upstream failure hidden" }} }}
 "#
@@ -602,6 +603,10 @@ async fn response_rule_replaces_upstream_5xx() {
     let body = res.bytes().await.unwrap();
     assert!(!String::from_utf8_lossy(&body).contains("exploded"));
     assert_eq!(json(&body)["error"], "upstream failure hidden");
+    let ev = h.wait_events("request", 1).await;
+    assert_eq!(ev[0]["decision"], "deny");
+    assert_eq!(ev[0]["stage"], "response_head");
+    assert_eq!(ev[0]["terminal_rule"], "hide-5xx");
     h.stop().await;
 }
 
@@ -1100,14 +1105,13 @@ async fn deny_list_is_a_floor_private_ok_does_not_bypass() {
     h.stop().await;
 }
 
-/// `dst.ip in @list` and `client.ip in @list` in rules use the loaded lists.
+/// `client.ip in @list` and `not in @list` in rules use the loaded lists.
 #[tokio::test(flavor = "multi_thread")]
 async fn rules_can_use_address_lists() {
     let h = Harness::start_with(Opts {
         rules: r#"
-  - id: dst-listed
-    phase: connect
-    when: dst.ip != null and dst.ip in @loopback
+  - id: loopback-listed
+    when: client.ip in @loopback and path == "/listed"
     then: { deny: { status: 451 } }
   - id: client-listed
     when: client.ip in @clients and host == "alias.test"
@@ -1126,13 +1130,9 @@ async fn rules_can_use_address_lists() {
     .await;
     let port = h.upstream.http.port();
     let c = h.client();
-    let res = c
-        .get(format!("http://127.0.0.1:{port}/"))
-        .send()
-        .await
-        .unwrap();
+    let res = c.get(h.http_url("/listed")).send().await.unwrap();
     assert_eq!(res.status(), 451);
-    assert_eq!(res.headers()["x-roxy-rule"], "dst-listed");
+    assert_eq!(res.headers()["x-roxy-rule"], "loopback-listed");
     let res = c
         .get(format!("http://alias.test:{port}/"))
         .send()
@@ -1487,5 +1487,286 @@ async fn h1_only_client_works_with_h2_enabled() {
     }
     let ev = h.wait_events("request", 2).await;
     assert!(ev.iter().all(|e| e["tls"]["alpn"] == "http/1.1"), "{ev:#?}");
+    h.stop().await;
+}
+
+// ----- watching rules (§6.1) -------------------------------------------------
+
+const UPLOAD_CAP: &str = r#"
+  - id: upstream
+    when: host == "upstream.test"
+    then: { allow: { private_ok: true } }
+  - id: upload-cap
+    when: body.bytes > 100kb
+    then: { deny: { status: 413, message: "upload too large" } }
+"#;
+
+/// A chunked upload, `n` chunks of 16 KiB.
+fn chunked_upload(n: usize) -> reqwest::Body {
+    let chunks: Vec<Result<Bytes, std::io::Error>> = (0..n)
+        .map(|_| Ok(Bytes::from(vec![b'u'; 16 * 1024])))
+        .collect();
+    reqwest::Body::wrap_stream(futures_util::stream::iter(chunks))
+}
+
+/// The streaming upload cap stops an h1 upload at the chunk that crosses
+/// it: the client gets the deny, the upstream never gets more than the cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_cap_stops_h1_upload_mid_stream() {
+    let h = Harness::start(UPLOAD_CAP).await;
+    let c = h.client();
+    // Under the cap: forwarded intact.
+    let res = c
+        .post(h.http_url("/small"))
+        .body(chunked_upload(4))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(json(&res.bytes().await.unwrap())["body_len"], 64 * 1024);
+    // Over: stopped. reqwest may see the 413 or a reset (the server stops
+    // reading the body); either way nothing past the cap is forwarded.
+    let res = c
+        .post(h.http_url("/big"))
+        .body(chunked_upload(64))
+        .send()
+        .await;
+    if let Ok(res) = res {
+        assert_eq!(res.status(), 413);
+        assert_eq!(res.headers()["x-roxy-rule"], "upload-cap");
+    }
+    let ev = h.wait_events("request", 2).await;
+    let stopped = ev
+        .iter()
+        .find(|e| e["req"]["path"] == "/big")
+        .expect("request event");
+    assert_eq!(stopped["decision"], "deny");
+    assert_eq!(stopped["stage"], "request_body");
+    assert_eq!(stopped["terminal_rule"], "upload-cap");
+    assert!(
+        stopped["rules"]
+            .as_array()
+            .unwrap()
+            .contains(&"upload-cap".into())
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let seen = h.upstream.seen();
+    assert!(
+        seen.iter().all(|s| s.body_len <= 100 * 1024),
+        "the upstream got more than the cap: {seen:#?}"
+    );
+    h.stop().await;
+}
+
+/// The same cap over h2: the stream gets the deny response (the response
+/// has not started), and the upstream never sees more than the cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_cap_stops_h2_upload_mid_stream() {
+    let h = Harness::start(UPLOAD_CAP).await;
+    let (send, _conn) = h.h2_client().await;
+    let req = http::Request::post(h.https_url("/h2big")).body(()).unwrap();
+    let mut ready = send.clone().ready().await.unwrap();
+    let (resp, mut stream) = ready.send_request(req, false).unwrap();
+    let pump = tokio::spawn(async move {
+        for _ in 0..64 {
+            stream.reserve_capacity(16 * 1024);
+            if stream
+                .send_data(Bytes::from(vec![b'u'; 16 * 1024]), false)
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let _ = stream.send_data(Bytes::new(), true);
+    });
+    let r = tokio::time::timeout(Duration::from_secs(10), resp)
+        .await
+        .unwrap();
+    let res = r.expect("a deny response on the stream");
+    assert_eq!(res.status(), 413);
+    assert_eq!(res.headers()["x-roxy-rule"], "upload-cap");
+    pump.abort();
+    let ev = h.wait_events("request", 1).await;
+    assert_eq!(ev[0]["stage"], "request_body");
+    assert_eq!(ev[0]["terminal_rule"], "upload-cap");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let seen = h.upstream.seen();
+    assert!(seen.iter().all(|s| s.body_len <= 100 * 1024), "{seen:#?}");
+    h.stop().await;
+}
+
+const RESPONSE_CAP: &str = r#"
+  - id: upstream
+    when: host == "upstream.test"
+    then: { allow: { private_ok: true } }
+  - id: download-cap
+    when: response.body.bytes > 1mb
+    then: deny
+"#;
+
+/// A response that crosses the byte cap after its head was sent is cut:
+/// h1 breaks the connection without completing the body.
+#[tokio::test(flavor = "multi_thread")]
+async fn response_byte_cap_cuts_h1_response() {
+    let h = Harness::start(RESPONSE_CAP).await;
+    let c = h.client();
+    // Under the cap: complete.
+    let res = c.get(h.https_url("/big?n=500000")).send().await.unwrap();
+    assert_eq!(res.bytes().await.unwrap().len(), 500_000);
+    // Over: the head (200) went out; the body is cut short.
+    let res = c.get(h.https_url("/big?n=4000000")).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    let body = res.bytes().await;
+    assert!(body.is_err(), "the body must not complete");
+    let ev = h.wait_events("request", 2).await;
+    let cut = ev
+        .iter()
+        .find(|e| e["req"]["path"] == "/big")
+        .filter(|e| e["decision"] == "deny")
+        .or_else(|| ev.iter().find(|e| e["decision"] == "deny"))
+        .expect("a deny event");
+    assert_eq!(cut["stage"], "response_body");
+    assert_eq!(cut["terminal_rule"], "download-cap");
+    assert!(cut["res"]["body_bytes"].as_u64().unwrap() <= 1024 * 1024);
+    h.stop().await;
+}
+
+/// Over h2 the stream is reset with `CANCEL`, then (the deny closes) the
+/// connection ends with `GOAWAY`.
+#[tokio::test(flavor = "multi_thread")]
+async fn response_byte_cap_resets_h2_stream() {
+    let h = Harness::start(RESPONSE_CAP).await;
+    let (send, conn) = h.h2_client().await;
+    let err = h2_get(&send, &h.https_url("/big?n=4000000"), &[])
+        .await
+        .expect_err("the stream must be reset");
+    assert_eq!(err.reason(), Some(h2::Reason::CANCEL), "{err}");
+    let ended = tokio::time::timeout(Duration::from_secs(15), conn).await;
+    assert!(
+        ended.is_ok(),
+        "the connection must close after a closing deny"
+    );
+    let ev = h.wait_events("request", 1).await;
+    assert_eq!(ev[0]["stage"], "response_body");
+    assert_eq!(ev[0]["terminal_rule"], "download-cap");
+    h.stop().await;
+}
+
+/// A byte budget (`request_bytes` metric) stops the upload that crosses
+/// it, while it streams, and later requests are denied at the head.
+#[tokio::test(flavor = "multi_thread")]
+async fn byte_budget_stops_the_crossing_upload() {
+    let h = Harness::start_with(Opts {
+        rules: r#"
+  - id: upstream
+    when: host == "upstream.test"
+    then: { allow: { private_ok: true } }
+  - id: budget
+    when: metric.up > 100kb
+    then: { deny: { status: 429, message: "upload budget exhausted" } }
+"#,
+        extra: "metrics:\n  - { id: up, count: request_bytes, key: [client.ip] }\n",
+        ..Opts::default()
+    })
+    .await;
+    let c = h.client();
+    let res = c
+        .post(h.http_url("/one"))
+        .body(chunked_upload(4))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "64 KiB fits the budget");
+    // 64 KiB more crosses 100 KiB part-way through.
+    let res = c
+        .post(h.http_url("/two"))
+        .body(chunked_upload(4))
+        .send()
+        .await;
+    if let Ok(res) = res {
+        assert_eq!(res.status(), 429);
+    }
+    // Over budget now: denied at the head.
+    let res = c.get(h.http_url("/three")).send().await.unwrap();
+    assert_eq!(res.status(), 429);
+    assert_eq!(res.headers()["x-roxy-rule"], "budget");
+    let ev = h.wait_events("request", 3).await;
+    let stage = |path: &str| {
+        ev.iter()
+            .find(|e| e["req"]["path"] == path)
+            .map(|e| (e["decision"].clone(), e["stage"].clone()))
+            .unwrap()
+    };
+    assert_eq!(stage("/one"), ("allow".into(), "head".into()));
+    assert_eq!(stage("/two"), ("deny".into(), "request_body".into()));
+    assert_eq!(stage("/three"), ("deny".into(), "head".into()));
+    let seen = h.upstream.seen();
+    let total: u64 = seen.iter().map(|s| s.body_len).sum();
+    assert!(
+        total <= 100 * 1024,
+        "forwarded {total} bytes past the budget"
+    );
+    h.stop().await;
+}
+
+/// A byte budget applies to the WebSocket relay: the relay closes before
+/// writing the bytes that cross it.
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_byte_budget_closes_the_relay() {
+    let h = Harness::start_with(Opts {
+        rules: r#"
+  - id: ws
+    when: host == "ws.test"
+    then: { allow: { upgrade: websocket, private_ok: true } }
+  - id: ws-budget
+    when: metric.ws_down > 50kb
+    then: deny
+"#,
+        extra: "metrics:\n  - { id: ws_down, count: response_bytes, where: 'host == \"ws.test\"' }\n",
+        ..Opts::default()
+    })
+    .await;
+    let port = h.upstream.ws.port();
+    let tls = h
+        .tls_tunnel(&format!("ws.test:{port}"), "ws.test")
+        .await
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::client_async(format!("wss://ws.test:{port}/echo"), tls)
+        .await
+        .unwrap();
+    ws.send(Message::text("small")).await.unwrap();
+    assert_eq!(
+        ws.next()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap()
+            .as_str(),
+        "small"
+    );
+    // The echo of 100 KB crosses the 50 KiB budget: the relay closes.
+    ws.send(Message::binary(vec![7u8; 100_000])).await.unwrap();
+    let mut got = 0usize;
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("the relay did not close");
+        match next {
+            Some(Ok(m)) => got += m.into_data().len(),
+            Some(Err(_)) | None => break,
+        }
+    }
+    assert!(
+        got < 100_000,
+        "the over-budget echo was relayed ({got} bytes)"
+    );
+    let ev = h.wait_events("request", 1).await;
+    assert_eq!(ev[0]["decision"], "deny");
+    assert_eq!(ev[0]["stage"], "websocket");
+    assert_eq!(ev[0]["terminal_rule"], "ws-budget");
+    let close = h.wait_events("ws_close", 1).await;
+    assert!(close[0]["bytes_s2c"].as_u64().unwrap() <= 50 * 1024 + 64);
     h.stop().await;
 }

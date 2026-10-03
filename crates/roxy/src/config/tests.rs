@@ -49,20 +49,19 @@ fn full_example_parses_and_validates() {
     assert_eq!(cfg.rules[4].then.0.len(), 2);
     assert_eq!(cfg.default, DefaultDecision::Deny);
     let policy = cfg.compile_policy().unwrap();
-    let kinds: Vec<_> = policy.rule_info().into_iter().map(|r| r.kind).collect();
-    use roxy_rules::RuleKind::{Head, HeadAndWatching, Watching};
+    let kinds: Vec<&str> = policy
+        .rule_info()
+        .into_iter()
+        .map(|r| match r.kind {
+            roxy_rules::RuleKind::Head => "head",
+            roxy_rules::RuleKind::Watching => "watching",
+            roxy_rules::RuleKind::HeadAndWatching => "both",
+        })
+        .collect();
     assert_eq!(
         kinds,
         [
-            Head,
-            HeadAndWatching,
-            Head,
-            Watching,
-            Head,
-            Head,
-            Head,
-            Head,
-            Watching
+            "head", "both", "head", "watching", "head", "head", "head", "head", "watching"
         ]
     );
     assert_eq!(cfg.addons[0].kind, AddonKind::Wasm);

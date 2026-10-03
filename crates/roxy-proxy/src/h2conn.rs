@@ -209,7 +209,7 @@ async fn serve_stream(
         // END_STREAM on HEADERS: no body (and a known length of 0).
         Body::empty()
     } else {
-        Body::wrap_with_length(
+        Body::wrap_native(
             H2Body::new(recv, &snap.limits, &snap.flags, fail.clone()),
             u64::MAX,
             None,
@@ -227,8 +227,8 @@ async fn serve_stream(
     // so the exchange can tell a broken client body from an upstream
     // failure.
     let known = req.body.known_length();
-    req.body = Body::wrap_with_length(
-        Watched {
+    req.body = Body::wrap_native(
+        Observed {
             inner: std::mem::take(&mut req.body),
             fail: fail.clone(),
         },
@@ -672,12 +672,12 @@ impl http_body::Body for H2Body {
 }
 
 /// Records the first error of the (capped, length-checked) request body.
-struct Watched {
+struct Observed {
     inner: Body,
     fail: Arc<BodyFail>,
 }
 
-impl http_body::Body for Watched {
+impl http_body::Body for Observed {
     type Data = Bytes;
     type Error = BodyError;
 

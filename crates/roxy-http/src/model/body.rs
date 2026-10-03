@@ -146,6 +146,32 @@ impl Body {
         B::Data: Send,
         B::Error: fmt::Display,
     {
+        Self::capped(body, max_bytes, known_length, |e: B::Error| {
+            BodyError::Upstream(e.to_string())
+        })
+    }
+
+    /// Like [`Body::wrap_with_length`] for an adapter over a [`Body`]: its
+    /// [`BodyError`]s pass through unchanged (so a [`BodyError::Stopped`]
+    /// stays recognisable), instead of becoming [`BodyError::Upstream`].
+    pub fn wrap_native<B>(body: B, max_bytes: u64, known_length: Option<u64>) -> Self
+    where
+        B: http_body::Body<Error = BodyError> + Send + 'static,
+        B::Data: Send,
+    {
+        Self::capped(body, max_bytes, known_length, |e: BodyError| e)
+    }
+
+    fn capped<B>(
+        body: B,
+        max_bytes: u64,
+        known_length: Option<u64>,
+        map_err: fn(B::Error) -> BodyError,
+    ) -> Self
+    where
+        B: http_body::Body + Send + 'static,
+        B::Data: Send,
+    {
         if known_length == Some(0) && body.is_end_stream() {
             return Self::empty();
         }
@@ -156,6 +182,7 @@ impl Body {
                     seen: 0,
                     max: max_bytes,
                     known: known_length,
+                    map_err,
                 })),
                 done: false,
             },
@@ -351,12 +378,12 @@ struct Capped<B: http_body::Body> {
     seen: u64,
     max: u64,
     known: Option<u64>,
+    map_err: fn(B::Error) -> BodyError,
 }
 
 impl<B> http_body::Body for Capped<B>
 where
     B: http_body::Body,
-    B::Error: fmt::Display,
 {
     type Data = Bytes;
     type Error = BodyError;
@@ -374,7 +401,7 @@ where
                 }
                 Poll::Ready(None)
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(BodyError::Upstream(e.to_string())))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err((this.map_err)(e)))),
             Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                 Ok(mut d) => {
                     let bytes = d.copy_to_bytes(d.remaining());

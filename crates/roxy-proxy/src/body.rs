@@ -48,7 +48,7 @@ impl http_body::Body for Counted {
 pub(crate) fn counted(body: Body) -> (Body, Arc<AtomicU64>) {
     let counter = Arc::new(AtomicU64::new(0));
     let known = body.known_length();
-    let body = Body::wrap_with_length(
+    let body = Body::wrap_native(
         Counted {
             inner: body,
             counter: counter.clone(),
@@ -119,7 +119,7 @@ pub(crate) async fn collect_prefix(body: &mut Body, cap: u64) -> Collected {
                 return Collected::Complete(b);
             }
             Some(Err(e)) => {
-                *body = Body::wrap(ErrorBody(Some(e.clone())), u64::MAX);
+                *body = Body::wrap_native(ErrorBody(Some(e.clone())), u64::MAX, None);
                 return Collected::Failed(e);
             }
             Some(Ok(f)) => {
@@ -129,7 +129,7 @@ pub(crate) async fn collect_prefix(body: &mut Body, cap: u64) -> Collected {
                     buf.extend_from_slice(&d);
                     if buf.len() as u64 > cap {
                         let rest = std::mem::take(body);
-                        *body = Body::wrap_with_length(
+                        *body = Body::wrap_native(
                             Chain {
                                 prefix: Some(buf.freeze()),
                                 rest,

@@ -435,7 +435,7 @@ impl Inner {
 pub(crate) fn watched(body: Body, watch: Arc<Watch>, dir: Dir) -> Body {
     let known = body.known_length();
     let cancelled = Box::pin(watch.cancelled());
-    Body::wrap_with_length(
+    Body::wrap_native(
         Watched {
             inner: body,
             watch,
@@ -490,7 +490,7 @@ impl http_body::Body for Watched {
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            other => other,
+            other @ Poll::Ready(_) => other,
         }
     }
 

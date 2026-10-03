@@ -160,9 +160,19 @@ enum Decision { Allow { mutations: Vec<Mutation> }, Deny { status, body },
                 Passthrough /* transparent mode only, deferred */ }
 
 // roxy-rules
-struct Policy { connect: RuleChain, request: RuleChain, response: RuleChain,
-                ws: RuleChain, metrics: MetricDefs, addons: AddonOrder }
+struct Policy { rules: Vec<CompiledRule>,   // one ordered list (§6.1)
+                head: Vec<RuleIdx>,         // rules taking part in the head decision
+                watching: Vec<RuleIdx>,     // rules re-checked after forwarding
+                watch_triggers: Reads,      // union of what the watching rules read
+                default: DefaultDecision, metrics: MetricDefs }
+// Each CompiledRule carries its kind (head | watching | head-and-watching)
+// and a `Reads` bit mask of the watched values it reads, so "does any rule
+// care about this body chunk?" is one mask test.
 // Swapped atomically on reload: Arc<ArcSwap<Policy>>.
+
+// roxy-proxy, per forwarded exchange
+struct Watch { stop: CancellationToken, state: Mutex<WatchState /* fired
+               rules, tags, byte counts, known values, the stop */> }
 ```
 
 ---
@@ -586,8 +596,12 @@ phases; when a rule runs follows from what it reads.
 2. **After that, rules watch.** For the rest of the exchange, two kinds of
    rule are re-checked whenever a value they read becomes known or changes:
    rules that read a value known only after forwarding (the *watched*
-   fields in §6.2), and `deny` rules that read a metric this exchange adds
-   to. If a deny matches, roxy stops the exchange: an error response if the
+   fields in §6.2), and `deny` rules that read a byte metric
+   (`count: request_bytes` or `response_bytes`), which this exchange adds
+   to as bytes stream. A deny reading a `requests`, `denied`, `errors` or
+   `unique` metric is decided at the head only: re-checking it after this
+   exchange's own count would deny the 30th request of a `>= 30` limit
+   instead of the 31st (§6.4). If a deny matches, roxy stops the exchange: an error response if the
    response has not started, otherwise the connection (or HTTP/2 stream, or
    WebSocket) is closed. Nothing can override a deny at any point.
 3. **Only rules decided at the request head can `allow`.** A rule that reads
@@ -738,14 +752,14 @@ Terminal:
 | action | where | effect |
 |---|---|---|
 | `allow` | head rules only | forward. `allow: { upgrade: websocket }` also permits the upgrade (§8). |
-| `deny` | all rules | `deny: { status: 403, message: "…" }`. At the head: refuse. Watching: stop the exchange (error response if the response has not started, else close). On a WebSocket: close with `1008`. |
-| `passthrough` | connect-time rules (transparent mode, deferred) | relay bytes to `dst.ip:dst.port` uninspected. Logged. Compiler rejects it until a transparent listener exists. |
+| `deny` | all rules | `deny: { status: 403, message: "…" }`. At the head: refuse. Watching: stop the exchange (error response if the response has not started; otherwise h1 breaks the connection without completing the body, h2 resets the stream with `CANCEL` and sends `GOAWAY` if the deny closes). On the byte-level WebSocket relay (§8.1): close both sides (a close frame could land inside a half-relayed frame); with message rules (§8.2): close with `1008`. |
+| `passthrough` | connect-time rules (transparent mode, deferred) | relay bytes to the original destination uninspected. Logged. Compiler rejects it until a transparent listener exists. |
 
 Non-terminal (evaluation continues):
 
 | action | where | effect |
 |---|---|---|
-| `set_header: { name: value }` | request: head rules; response: rules that read response values | set/replace. Values may reference `${secret:name}` (request headers only). Validated as header values; invalid → flow denied. |
+| `set_header: { name: value }` | request: head rules; response: rules that read response values | set/replace. Values may reference `${secret:name}` (request headers, so head rules only). Validated as header values; invalid → flow denied. In a watching rule the target is the response, and every value the rule reads must be known before the response head is sent (`response.status`, `response.header[..]`, `response.body.size`, `response.body.text`); a rule that also reads `body.bytes`, `response.body.bytes` or a byte metric could match after the head went out, so that is a compile error, as is `set_header` in a watching rule that reads no response value. |
 | `remove_header: [names]` | request, response | |
 | `rewrite_path: { match: regex, to: replacement }` | request | `$1` groups; result re-normalised per §5.4 |
 | `set_query: {k: v}` / `remove_query: [k]` | request | |
@@ -787,7 +801,7 @@ metrics:
   - id: <string>
     count: requests | request_bytes | response_bytes | errors | denied | unique(<field>)
     where: <expr>                 # head fields only; decides whether this exchange counts
-    key: [<field>, ...]           # optional; omitted = one global series
+    key: [<field>, ...]           # optional, head fields only; omitted = one global series
     window: <duration>            # optional; omitted = cumulative since start
 ```
 
@@ -803,6 +817,11 @@ forwarding decision (denied flows count too, so probing is not free), and
 read before it, so a rule `metric.x >= 30` denies the 31st request.
 `request_bytes` and `response_bytes` are added as bytes stream, so a deny
 rule reading them watches and can stop the exchange that crosses the limit.
+A chunk is counted before it is checked, and is not forwarded if the check
+stops the exchange, so a budget may be overcounted by at most one chunk
+(the fail-closed direction). `errors` are counted when the exchange ends.
+`where`, `key` and the field of `unique(<field>)` must be head fields, so
+whether an exchange counts, and its series, are fixed at the request head.
 
 `state` is a bounded TTL key/value map shared by rules and addons (`set_state`
 action, `state.get/set` host calls). Both metrics and state live behind a
@@ -1014,8 +1033,15 @@ produces at least one `request` event; connection-level events are optional
  "res":{"status":201,"headers_bytes":1420,"body_bytes":5120},
  "decision":"allow","rules":["openai-key","github-writes"],"tags":["billing"],
  "mutations":["set_header:authorization"],"addons":["pii-scan"],
- "timing":{"total_ms":412,"upstream_connect_ms":38,"upstream_ttfb_ms":350}}
+ "timing":{"total_ms":412,"upstream_connect_ms":38,"upstream_ttfb_ms":350},
+ "terminal_rule":"github-writes","stage":"head"}
 ```
+
+`stage` says where the terminal decision was made: `head` (the forwarding
+decision), or where a watching rule stopped the exchange: `request_body`,
+`response_head`, `response_body`, `websocket`. `terminal_rule` is the rule
+that decided (`_default`, `_fail_closed`, `_address_policy` for built-in
+decisions) and `reason` a stable code when it failed closed.
 
 Event types: `connect`, `request`, `response_error`, `ws_message` (sampled or
 denied only, configurable), `parse_error`, `upstream_error`, `layer_error`, `layer_record`, `endpoint_call`, `quarantined`,
@@ -1031,10 +1057,34 @@ Sinks implement `trait FlowSink { fn emit(&self, event: &FlowEvent); }`:
 `Stdout`, `File` (with size rotation), later `UnixSocket` (live stream),
 `Otlp`.
 
+**Writing (planned; today each emitter writes and flushes under a lock).**
+Logging is a first-class product feature and an audit trail, so the write
+path is built for many cores and heavy traffic, and it never drops:
+
+- **One writer per sink.** A single task owns each file. Emitters serialise
+  the event on their own thread and enqueue the bytes on a bounded
+  multi-producer queue; they never touch the file or contend on its lock.
+- **Batching.** The writer drains everything queued and issues one large
+  write, flushing on a size or time threshold (e.g. 64 KiB / 50 ms), on
+  rotation and at shutdown. Throughput scales with disk bandwidth rather
+  than event rate.
+- **Backpressure, never loss.** When the queue is full, emitting waits.
+  The wait is on the exchange's own task, so it propagates to the network:
+  roxy stops reading from the client and the upstream until the audit
+  record is accepted, slowing traffic rather than losing records. A sink
+  that fails (disk full, I/O error) stops traffic the same way; it is
+  reported, never silently skipped.
+- **Shared with capture.** Body capture (§10.2) and any future "tee all
+  traffic" mode use the same writer machinery and the same backpressure,
+  fed from the body adapters that already see every forwarded chunk
+  (the watcher's, §6.1), so what is captured is exactly what was relayed.
+
 ### 10.2 Body capture
 
 `capture` action writes `<capture_dir>/<flow id>.req.body` /
-`.res.body` plus a `.meta.json` with the canonical head. Capped by
+`.res.body` plus a `.meta.json` with the canonical head. Captured bytes go through the buffered writer
+above (one writer, batching, backpressure), keyed by flow id so they join
+the JSONL events. Capped by
 `limits.max_capture_body_bytes`. Off unless a rule asks for it. Secrets are
 *not* redacted inside bodies (document loudly).
 

@@ -174,11 +174,14 @@ One JSON object per line, to stdout or `log.flow.path`. Each request has a
 ```json
 {"event":"request","flow":"01M4…","client":{"ip":"10.0.0.7"},"tls":{"sni":"example.com","alpn":"http/1.1"},
  "req":{"method":"GET","host":"example.com","path":"/","body_bytes":0},"res":{"status":200,"body_bytes":577},
- "decision":"allow","rules":["example"],"terminal_rule":"example","timing":{"total_ms":50}}
+ "decision":"allow","rules":["example"],"terminal_rule":"example","stage":"head","timing":{"total_ms":50}}
 ```
 
 Denies carry `terminal_rule` (`_default`, `_fail_closed`,
 `_address_policy`, or a rule id) and a `reason` when they fail closed.
+`stage` says where the decision was made: `head`, or where a watching rule
+stopped the exchange (`request_body`, `response_head`, `response_body`,
+`websocket`).
 Secrets and sensitive headers are redacted. Other events include
 `parse_error`, `upstream_error`, `upstream_denied`,
 `policy_input_unavailable`, `config_reloaded`, `config_reload_failed`,

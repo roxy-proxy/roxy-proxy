@@ -29,6 +29,21 @@ fn check_examples_pass() {
         assert!(out.status.success(), "{name}: {}", text(&out.stderr));
         assert!(text(&out.stdout).contains(": OK"));
     }
+    // `check` says which rules are decided at the head and which watch.
+    let out = roxy(&["check", "--config", example("roxy.yaml").to_str().unwrap()]);
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains("\nrules:\n"), "{stdout}");
+    assert!(stdout.contains("  github-reads      head\n"), "{stdout}");
+    assert!(
+        stdout.contains("  upload-cap        watching: body.bytes\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "  egress-budget     head, then watching: metric.egress_bytes (request_bytes)\n"
+        ),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -249,19 +264,54 @@ fn rule_test_shows_secret_placeholders() {
 }
 
 #[test]
-fn rule_test_response_phase_and_bad_input() {
-    let out = rule_test(&[
-        "--phase",
-        "response",
-        "--status",
-        "503",
-        "GET",
-        "https://api.github.com/",
-    ]);
+fn rule_test_watching_rules_and_bad_input() {
+    // A response value runs the rules that read it; this one only logs.
+    let out = rule_test(&["--response-status", "503", "GET", "https://api.github.com/"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let stdout = text(&out.stdout);
-    assert!(stdout.contains("log warn: upstream 5xx"), "{stdout}");
-    assert!(stdout.contains("rule:     _default"), "{stdout}");
+    assert!(
+        stdout.contains("  log-upstream-5xx  watching: response.status\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "watching:\n  matched:  log-upstream-5xx\n  - log warn: upstream 5xx\n  stops:    no\n"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("decision: allow\n"), "{stdout}");
+    assert!(stdout.contains("rule:     github-reads"), "{stdout}");
+
+    // Body bytes so far: the streaming upload cap stops the exchange.
+    let out = rule_test(&[
+        "--body-bytes",
+        "20000000",
+        "POST",
+        "https://api.openai.com/v1/files",
+    ]);
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("  stops:    deny 413 \"upload too large\" (close) (rule upload-cap)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("decision: deny 413 \"upload too large\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("rule:     upload-cap"), "{stdout}");
+    // Under the cap: allowed by the head rule.
+    let out = rule_test(&[
+        "--body-bytes",
+        "1000",
+        "POST",
+        "https://api.openai.com/v1/files",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
+
+    // `--phase` is gone.
+    let out = rule_test(&["--phase", "response", "GET", "https://x/"]);
+    assert_eq!(out.status.code(), Some(2));
 
     let out = rule_test(&["GET", "not-a-url"]);
     assert_eq!(out.status.code(), Some(1));

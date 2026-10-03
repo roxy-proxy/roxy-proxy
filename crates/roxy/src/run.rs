@@ -555,6 +555,18 @@ rules:
     }
 
     #[test]
+    fn websocket_message_rules_are_refused() {
+        let c = cfg(
+            "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:3128 }]\nrules:\n  - id: w\n    \
+             when: ws.size > 1mb\n    then: deny\n",
+        );
+        let bad = unsupported(&c, Capabilities::default()).join("\n");
+        assert!(bad.contains("`ws.*`"), "{bad}");
+        // `roxy check` still accepts it.
+        c.validate().unwrap();
+    }
+
+    #[test]
     fn address_lists_are_supported() {
         let c = cfg(
             "version: 1\naddress_lists: [{ name: b, inline: [1.2.3.4] }]\nupstream: { deny_lists: [b] }\n\

@@ -474,14 +474,14 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
     let shared = cx.shared.clone();
     let verdict = run_response_stages(&shared.pipeline, cx, res, front).await;
     match verdict {
-        ResponseVerdict::Continue(mut res) => match upgrade {
-            Some((on, key)) => Outcome::Upgrade { res, on, key },
-            None => {
-                let body = std::mem::take(&mut res.body);
-                res.body = watched(body, watch, Dir::Response);
-                Outcome::Respond(res)
+        ResponseVerdict::Continue(mut res) => {
+            if let Some((on, key)) = upgrade {
+                return Outcome::Upgrade { res, on, key };
             }
-        },
+            let body = std::mem::take(&mut res.body);
+            res.body = watched(body, watch, Dir::Response);
+            Outcome::Respond(res)
+        }
         ResponseVerdict::Deny(r) => Outcome::Refuse(r),
         ResponseVerdict::Close(e) => Outcome::Close(e),
     }
