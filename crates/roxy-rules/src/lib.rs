@@ -4,8 +4,9 @@
 //! expression DSL (lexer, [`parser`], type-checker, compiler), the rule
 //! chains per phase with typed actions, and the immutable [`Policy`]
 //! snapshot that the proxy swaps atomically on reload. It also provides the
-//! in-process store behind `metric.<id>`: [`MetricStore`], exposed to the
-//! proxy as [`MetricSource`].
+//! in-process stores behind `metric.<id>` and `state["k"]`: [`MetricStore`]
+//! and [`StateStore`], exposed to the proxy as [`MetricSource`] and
+//! [`StateSource`].
 //!
 //! This crate performs no network I/O and does not depend on the HTTP model:
 //! the proxy exposes a flow through the [`FlowView`] trait.
@@ -103,6 +104,7 @@ mod lexer;
 mod metrics;
 pub mod parser;
 mod policy;
+mod state;
 mod types;
 mod view;
 
@@ -119,5 +121,6 @@ pub use eval::{
 pub use metrics::{Clock, MetricError, MetricSnapshot, MetricSource, MetricStore, Sample};
 pub use parser::parse;
 pub use policy::{MetricDef, Policy, PolicyInput};
+pub use state::{StateFull, StateSource, StateStore};
 pub use types::{Field, Type};
 pub use view::{BodyText, FlowView, MapView, Value};
