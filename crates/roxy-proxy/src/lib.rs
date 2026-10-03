@@ -2,12 +2,62 @@
 //! machine, the flow pipeline, the upstream connector (DNS, SSRF policy,
 //! pool), the WebSocket relay and flow-log emission.
 //!
-//! M0 ships only the flow log ([`flowlog`]); the pipeline arrives in M1.
+//! # Module map
+//!
+//! - [`server`]: [`Server`] (`start`, `local_addrs`, `reload`, `shutdown`),
+//!   connection caps, the atomically swapped policy snapshot.
+//! - [`listener`]: the [`Listener`] trait (§4.2 hook) and
+//!   [`ExplicitListener`]; [`ClientConn`].
+//! - `conn`: the explicit-mode state machine (proxy port, CONNECT, sniff,
+//!   TLS termination, tunnels, `roxy.internal`, proxy auth).
+//! - `pipeline`: request/response stages, the `Verdict` the driver consumes
+//!   exhaustively, rule evaluation and effects.
+//! - `exchange`: one request/response exchange, upstream errors, the
+//!   WebSocket relay.
+//! - [`upstream`]: resolver, address floor, connector and pooled client.
+//! - [`addr`]: the private-range / CIDR address floor.
+//! - [`auth`]: `Proxy-Authorization: Basic` against bcrypt users files.
+//! - [`sources`]: the metric and state store traits.
+//! - [`flowlog`]: flow events, sinks and redaction.
+//! - [`io`]: stream adapters.
+//!
+//! # Requested `roxy-http` changes (worked around here)
+//!
+//! `ServerConn::respond` cannot force `connection: close` on a response the
+//! client did not ask to close, and `proxy-authenticate` is a reserved
+//! header, so a `407` cannot carry its challenge. [`io::ConnIo`] works
+//! around both by adding header lines after the status line and closing the
+//! stream itself after the codec is dropped.
 
+pub mod addr;
+pub mod auth;
+mod body;
+mod ca_server;
+pub mod config;
+mod conn;
+mod exchange;
 pub mod flowlog;
+pub mod io;
+pub mod listener;
+mod pipeline;
+pub mod server;
+pub mod sources;
+pub mod upstream;
+mod view;
 
+pub use auth::UserDb;
+pub use ca_server::PEM_CONTENT_TYPE;
+pub use config::{ListenerSpec, PolicyUpdate, RuntimeConfig};
+pub use conn::INTERNAL_HOST;
 pub use flowlog::{
     ClientInfo, DEFAULT_REDACTED_HEADERS, DecisionKind, DstInfo, FileSink, FlowEvent, FlowSink,
     MemorySink, MultiSink, REDACTED, Redactor, RequestInfo, ResponseInfo, StdoutSink, Timing,
     TlsInfo, WriterSink,
 };
+pub use listener::{ClientConn, ExplicitListener, Listener, ListenerInfo, ListenerMode};
+pub use server::{Server, ServerHandle, StartError};
+pub use sources::{
+    MetricSource, MetricSourceError, Sample, StateFull, StateSource, UnavailableMetrics,
+    UnavailableState,
+};
+pub use upstream::{ConnectError, DnsSettings, UpstreamSettings};

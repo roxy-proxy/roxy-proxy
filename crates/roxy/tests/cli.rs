@@ -126,6 +126,17 @@ fn ca_init_and_export() {
 }
 
 #[test]
+fn run_refuses_features_not_in_this_build() {
+    // The full example defines metrics and addons; `check` accepts it but
+    // `run` must refuse with one clear line instead of failing every flow.
+    let out = roxy(&["run", "--config", example("roxy.yaml").to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains("this build has no metric store yet"), "{err}");
+    assert_eq!(err.trim().lines().count(), 1, "{err}");
+}
+
+#[test]
 fn run_fails_on_missing_secret() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("roxy.yaml");

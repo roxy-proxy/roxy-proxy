@@ -6,11 +6,12 @@
 //! here; see [`crate::secrets`]. Rule and metric types (and their compiler)
 //! live in `roxy-rules` and are re-exported here.
 
+mod convert;
 mod units;
 mod validate;
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -217,7 +218,18 @@ pub struct Limits {
     pub body_idle_timeout: Duration,
     #[serde(with = "humantime_serde")]
     pub response_header_timeout: Duration,
+    /// Keep-alive idle time between requests on a client connection; also
+    /// the idle timeout of a relayed WebSocket.
+    #[serde(with = "humantime_serde")]
+    pub idle_timeout: Duration,
+    /// Global cap on concurrent client connections (§12).
+    pub max_connections: usize,
     pub max_connections_per_client: usize,
+    /// Client-side h2 (when it lands): concurrent streams per connection.
+    pub h2_max_concurrent_streams: u32,
+    /// Client-side h2: header list size cap per stream.
+    #[serde(deserialize_with = "units::size")]
+    pub h2_max_header_list_bytes: ByteSize,
     pub max_metric_keys: usize,
 }
 
@@ -239,7 +251,11 @@ impl Default for Limits {
             header_timeout: Duration::from_secs(10),
             body_idle_timeout: Duration::from_secs(30),
             response_header_timeout: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(300),
+            max_connections: 10_000,
             max_connections_per_client: 256,
+            h2_max_concurrent_streams: 100,
+            h2_max_header_list_bytes: ByteSize::b(64 * KIB),
             max_metric_keys: 100_000,
         }
     }
@@ -282,6 +298,10 @@ pub struct Dns {
     pub resolver: Resolver,
     #[serde(with = "humantime_serde")]
     pub cache_ttl_cap: Duration,
+    /// Fixed answers (`name: ip`) consulted before DNS. Intended for tests
+    /// and air-gapped deployments; the answers are still subject to the
+    /// address floor (`deny_private_ranges`, `deny_cidrs`).
+    pub static_hosts: BTreeMap<String, IpAddr>,
 }
 
 impl Default for Dns {
@@ -289,6 +309,7 @@ impl Default for Dns {
         Self {
             resolver: Resolver::System,
             cache_ttl_cap: Duration::from_secs(60),
+            static_hosts: BTreeMap::new(),
         }
     }
 }
