@@ -137,6 +137,8 @@ impl Upstream {
     ///
     /// * `/early`: `200 early` at once, without reading the body;
     /// * `/status/<n>`: reads the body, answers `<n>`;
+    /// * `/echo`: reads the body, answers `200` with the same bytes, and
+    ///   with `content-encoding` set to the request's `x-echo-encoding`;
     /// * a WebSocket upgrade: `101`, then echoes bytes;
     /// * anything else: reads the body, answers `200` with JSON
     ///   `{method, path, host, body_len, via}`.
@@ -178,7 +180,9 @@ impl Upstream {
             .get("x-via")
             .map(|h| String::from_utf8_lossy(h.as_bytes()).into_owned());
         let method = req.method().to_string();
+        let echo_encoding = req.headers().get("x-echo-encoding").cloned();
         let body = req.into_body();
+        let mine = entry.clone();
         let me = self.clone();
         let read = async move {
             let mut body = body;
@@ -217,6 +221,14 @@ impl Upstream {
                 .body(Full::default())
                 .unwrap();
         };
+        if path == "/echo" {
+            let body = Bytes::from(lock(&mine).body.clone());
+            let mut res = http::Response::builder();
+            if let Some(v) = echo_encoding {
+                res = res.header("content-encoding", v);
+            }
+            return res.body(Full::new(body)).unwrap();
+        }
         if let Some(code) = path.strip_prefix("/status/") {
             return http::Response::builder()
                 .status(code.parse::<u16>().unwrap())

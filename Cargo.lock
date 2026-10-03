@@ -2599,6 +2599,7 @@ dependencies = [
  "bytes",
  "chrono",
  "criterion",
+ "flate2",
  "futures-util",
  "h2",
  "hickory-resolver",

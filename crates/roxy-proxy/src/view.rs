@@ -16,6 +16,7 @@ use std::borrow::Cow;
 use std::net::IpAddr;
 use std::sync::{Mutex, PoisonError};
 
+use roxy_http::coding::{self, DecodeError};
 use roxy_http::{Headers, Host, Query, Scheme};
 use roxy_rules::{BodyText, Field, FlowView, Value};
 
@@ -30,18 +31,49 @@ pub(crate) enum Inspected {
     /// No rule needs the body; it streams untouched.
     #[default]
     NotBuffered,
-    /// Buffered (lossy UTF-8).
+    /// Buffered and decoded (lossy UTF-8).
     Text(String),
-    /// Larger than `limits.max_inspect_body_bytes`.
+    /// Larger than `limits.max_inspect_body_bytes`, as sent or decoded.
     TooLarge,
+    /// `content-encoding` names a coding roxy cannot decode.
+    UnsupportedEncoding(String),
+    /// The body could not be decoded.
+    Undecodable(String),
 }
 
 impl Inspected {
+    /// A buffered body, decoded by its `content-encoding` for the rules
+    /// (docs/rules.md#body-access). The decoded text may be at most `cap`
+    /// bytes, like the body as sent.
+    pub(crate) fn decode(headers: &Headers, body: &[u8], cap: u64) -> Self {
+        let codings = match coding::content_codings(headers) {
+            Ok(c) => c,
+            Err(e) => return Self::from_error(e),
+        };
+        if codings.is_empty() {
+            return Self::Text(String::from_utf8_lossy(body).into_owned());
+        }
+        match coding::decode(&codings, body, cap) {
+            Ok(d) => Self::Text(String::from_utf8_lossy(&d).into_owned()),
+            Err(e) => Self::from_error(e),
+        }
+    }
+
+    fn from_error(e: DecodeError) -> Self {
+        match e {
+            DecodeError::Unsupported(c) => Self::UnsupportedEncoding(c),
+            DecodeError::TooLarge { .. } => Self::TooLarge,
+            e @ DecodeError::Invalid { .. } => Self::Undecodable(e.to_string()),
+        }
+    }
+
     fn as_body_text(&self) -> BodyText<'_> {
         match self {
             Self::NotBuffered => BodyText::Unavailable,
             Self::Text(t) => BodyText::Available(Cow::Borrowed(t)),
             Self::TooLarge => BodyText::TooLarge,
+            Self::UnsupportedEncoding(c) => BodyText::UnsupportedEncoding(c),
+            Self::Undecodable(d) => BodyText::Undecodable(d),
         }
     }
 }

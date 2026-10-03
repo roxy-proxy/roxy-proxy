@@ -21,6 +21,8 @@
 #[cfg(test)]
 mod addon_tests;
 #[cfg(test)]
+mod coding_tests;
+#[cfg(test)]
 mod core_tests;
 #[cfg(test)]
 mod early_tests;

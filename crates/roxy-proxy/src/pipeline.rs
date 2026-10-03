@@ -39,7 +39,7 @@ use roxy_rules::{
 };
 use ulid::Ulid;
 
-use crate::body::{Collected, body_text, collect_prefix};
+use crate::body::{Collected, collect_prefix};
 use crate::capture::Tap;
 use crate::flowlog::{
     ClientInfo, DecisionKind, DstInfo, FlowEvent, RequestInfo, ResponseInfo, Stage, Timing, TlsInfo,
@@ -687,6 +687,8 @@ pub(crate) fn fail_closed_code(
         FailClosedReason::SecretInvalid(_) => "secret_invalid",
         FailClosedReason::BodyTooLargeToInspect(_) => "body_too_large_to_inspect",
         FailClosedReason::BodyUnavailable(_) => "body_unavailable",
+        FailClosedReason::UnsupportedContentEncoding { .. } => "unsupported_content_encoding",
+        FailClosedReason::BodyDecodeFailed { .. } => "body_decode_failed",
         FailClosedReason::MissingValue(_) => "missing_value",
         FailClosedReason::Unsupported(_) => "unsupported_effect",
     }
@@ -723,7 +725,7 @@ async fn inspect_request_body(
             if let Some(f) = cx.facts.request.as_mut() {
                 f.body_size = Some(b.len() as u64);
             }
-            Inspected::Text(body_text(&b))
+            Inspected::decode(&req.headers, &b, cap)
         }
         Ok(Collected::TooLarge) => Inspected::TooLarge,
     };
@@ -942,7 +944,7 @@ async fn inspect_response_body(
             if let Some(f) = cx.facts.response.as_mut() {
                 f.body_size = Some(b.len() as u64);
             }
-            Inspected::Text(body_text(&b))
+            Inspected::decode(&res.headers, &b, cap)
         }
         Ok(Collected::TooLarge) => Inspected::TooLarge,
     };
