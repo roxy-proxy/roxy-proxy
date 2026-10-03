@@ -97,6 +97,14 @@ pub enum FlowEvent {
         mutations: Vec<String>,
         addons: Vec<String>,
         timing: Timing,
+        /// The rule that decided (`_default`, `_fail_closed`,
+        /// `_address_policy`, … for built-in decisions).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_rule: Option<String>,
+        /// Stable reason code for a deny or failure (`body_too_large_to_inspect`,
+        /// `effect_invalid`, `upstream_timeout`, …).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// The response failed after the request was allowed (e.g. body limit hit
     /// mid-stream).
@@ -114,6 +122,8 @@ pub enum FlowEvent {
         ts: DateTime<Utc>,
         flow: String,
         conn: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
     },
     /// A relayed WebSocket closed (§8.1).
     WsClose {
@@ -165,6 +175,68 @@ pub enum FlowEvent {
         ts: DateTime<Utc>,
         flow: String,
         addon: String,
+        message: String,
+    },
+    /// The upstream address policy refused every connection for the flow
+    /// (§7, §7.1): a resolved address is private or on a deny list.
+    UpstreamDenied {
+        #[serde(serialize_with = "ser_ts")]
+        ts: DateTime<Utc>,
+        flow: String,
+        conn: String,
+        host: String,
+        port: u16,
+        resolved_ip: Option<IpAddr>,
+        /// `private_range:<class>`, `deny_cidrs` or `list:<name>`.
+        reason: String,
+        list: Option<String>,
+        matched_cidr: Option<String>,
+    },
+    /// A new connection was accepted and immediately closed (§12 caps).
+    ConnectionRefused {
+        #[serde(serialize_with = "ser_ts")]
+        ts: DateTime<Utc>,
+        listener: String,
+        client: ClientInfo,
+        /// `max_connections` or `max_connections_per_client`.
+        reason: String,
+    },
+    /// A policy input (metric, address list, secret, body) was unavailable
+    /// and the flow failed closed (§6.1).
+    PolicyInputUnavailable {
+        #[serde(serialize_with = "ser_ts")]
+        ts: DateTime<Utc>,
+        flow: String,
+        conn: String,
+        phase: String,
+        reason: String,
+    },
+    /// A metric key could not be created because the table is full (§6.4).
+    MetricTableFull {
+        #[serde(serialize_with = "ser_ts")]
+        ts: DateTime<Utc>,
+        flow: String,
+        conn: String,
+        phase: String,
+        detail: String,
+    },
+    /// A request asked for an Upgrade the matching rule did not grant; it
+    /// was forwarded as a plain request (§8).
+    UpgradeStripped {
+        #[serde(serialize_with = "ser_ts")]
+        ts: DateTime<Utc>,
+        flow: String,
+        conn: String,
+        upgrade: String,
+    },
+    /// A rule's `log` action.
+    Log {
+        #[serde(serialize_with = "ser_ts")]
+        ts: DateTime<Utc>,
+        flow: String,
+        conn: String,
+        phase: String,
+        level: String,
         message: String,
     },
     /// Bytes relayed uninspected (transparent mode only; deferred).
@@ -569,6 +641,8 @@ mod tests {
                 upstream_connect_ms: Some(38),
                 upstream_ttfb_ms: Some(350),
             },
+            terminal_rule: Some("github-writes".into()),
+            reason: None,
         }
     }
 
@@ -584,6 +658,8 @@ mod tests {
         assert_eq!(v["res"]["status"], 201);
         assert_eq!(v["decision"], "allow");
         assert_eq!(v["timing"]["upstream_ttfb_ms"], 350);
+        assert_eq!(v["terminal_rule"], "github-writes");
+        assert!(v.get("reason").is_none());
     }
 
     #[test]

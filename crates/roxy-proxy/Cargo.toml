@@ -8,10 +8,31 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+arc-swap = "1.9.2"
+base64 = "0.23.1"
+bcrypt = "0.19.3"
+bytes = "1.12.1"
 chrono.workspace = true
+hickory-resolver = { version = "0.26.3", features = ["tokio", "system-config"] }
+http = "1.5.0"
+http-body = "1.1.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.11.1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "tokio", "http1", "http2"] }
+ipnet.workspace = true
+roxy-http.workspace = true
+roxy-rules.workspace = true
+roxy-tls.workspace = true
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "tls12", "std", "logging"] }
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "macros"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+tower-service = "0.3.3"
 tracing.workspace = true
+ulid = "3.0.0"
 
 [dev-dependencies]
 tempfile.workspace = true
