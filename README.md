@@ -63,6 +63,63 @@ To contain something real, replace the `agent` service with your workload
 the running one stays (see `docker compose logs roxy`). Restart instead
 (`docker compose restart roxy`) for listener, TLS or capture settings.
 
+## Why an explicit HTTP proxy
+
+roxy is deliberately an explicit `HTTP_PROXY`, not a transparent TCP
+gateway. That is a defensive choice: the interface it exposes to the agent
+is as narrow as it can be while still being useful.
+
+- **One protocol, parsed strictly.** The agent can speak HTTP/1.1 or HTTP/2
+  to roxy, and nothing else. `CONNECT` only opens a tunnel that roxy
+  intercepts as TLS (or, if allowed, plain HTTP). Raw TCP never passes
+  through. A TCP gateway forwards every protocol, so it either relays bytes
+  it cannot judge or has to understand all of them.
+- **Destinations are names, not addresses.** Each request names its
+  destination in a form roxy parses itself: the absolute URI, the
+  `CONNECT` authority, and an SNI that must match it. The rules judge that
+  name. roxy resolves it, and then checks the private-range floor and the
+  deny lists against the IP it actually dials. There is no
+  original-destination address to spoof or race.
+- **Nothing is implicit.** A client that bypasses the proxy should reach
+  nothing. Every other egress path is closed by the network
+  ([see below](#containing-your-own-agent)); roxy does not rely on the client
+  choosing to use the proxy. Everything that does reach roxy is decided
+  by a rule, and anything it cannot classify is dropped.
+
+The narrower the interface, the fewer ways an adversarial agent has to
+make roxy misread what it is sending. Transparent mode is designed
+(DESIGN.md §4.2), but it is deferred and will feed the same pipeline.
+
+## Extending roxy
+
+roxy knows HTTP, not model APIs. Logic that needs to understand the
+traffic belongs in an **addon**: a layer that sits above the rules in each
+exchange and owns both streams. An addon can read, rewrite, withhold or
+replace request and response bodies chunk by chunk; deny or answer
+directly; call named endpoints (for example a monitor model) with
+credentials roxy attaches and the layer never sees; and record audit
+events or quarantine a principal (DESIGN.md §11).
+
+Addons can never weaken containment. Whatever an addon sends on is
+re-validated and judged by the rules as if the agent had sent it, every
+addon runs under CPU, memory and time budgets, and any failure denies the
+flow.
+
+- **WASM components** run in-process, sandboxed, with no filesystem,
+  sockets or environment. Write them in Rust with the
+  [`roxy-addon`](crates/roxy-addon) SDK, or in any language that targets
+  the WebAssembly component model, against [`wit/addon.wit`](wit/addon.wit).
+- **Service layers** stream the exchange through an external HTTP service,
+  for logic that is easier to run out of process (DESIGN.md §11.6).
+
+The flagship integration is
+[inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel):
+its monitors and control protocols (continue, modify, reject, escalate,
+terminate) running at the network boundary, where the agent cannot bypass
+them. It comes first as a Python sidecar on a service layer. A compiled
+(CPython-in-WASM) build will follow once inspect_sentinel supports one.
+See [`examples/addons`](examples/addons).
+
 ## Containing your own agent
 
 The same recipe applies outside Docker Compose:
@@ -336,8 +393,10 @@ Usable in explicit proxy mode. Built and tested:
 
 Deferred, with designs in DESIGN.md:
 
-- WASM and service addons (§11). `roxy run` refuses a config that defines
-  addons.
+- Running addons in the proxy (§11). The WASM host (`roxy-wasm`), the
+  `roxy-addon` SDK and its example are built and tested, but
+  `roxy run` still refuses a config that defines addons until the layer
+  stack is wired into the proxy. Service layers come after that.
 - Transparent mode (§4.2).
 - WebSocket message rules (§8.2). Byte budgets already apply to WebSockets.
 - A Prometheus endpoint.

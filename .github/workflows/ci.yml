@@ -43,3 +43,37 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories bans licenses sources
+
+  # The wasm components (roxy-wasm's test components and the example
+  # addons) live in their own workspaces and are checked in prebuilt, so the
+  # jobs above need no wasm target. This job rebuilds them from source and
+  # runs the tests that load them against the fresh builds, so the
+  # checked-in binaries cannot silently drift from their sources.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            crates/roxy-wasm/test-components -> target
+            examples/addons -> target
+      - name: Format and lint the example addons
+        working-directory: examples/addons
+        run: |
+          cargo fmt --all --check
+          cargo clippy --all-targets -- -D warnings
+      - name: Unit-test the example addons natively
+        working-directory: examples/addons
+        run: cargo test
+      - name: Rebuild the components
+        run: |
+          crates/roxy-wasm/test-components/build.sh
+          examples/addons/build.sh
+      - name: Run the host tests against the fresh builds
+        run: cargo test -p roxy-wasm

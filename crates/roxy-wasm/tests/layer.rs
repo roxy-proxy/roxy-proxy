@@ -2,211 +2,24 @@
 //! `test-components/`, rebuilt by `test-components/build.sh`) and a mock
 //! `LayerHost`.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{Method, Request, Response, StatusCode};
+use http::{Method, Response, StatusCode};
 use http_body_util::BodyExt;
 use roxy_http::{Body, BodyError, BodySender};
 use roxy_wasm::{
-    Budget, Capabilities, Capability, EndpointError, FlowInfo, HostError, Layer, LayerConfig,
-    LayerError, LayerHost, LayerOutcome, LayerRequest, LayerResponse, LoadError, LogLevel,
-    Principal, TerminateScope, WasmRuntime, async_trait,
+    Budget, Capabilities, Capability, HostError, Layer, LayerError, LayerOutcome, LoadError,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
-const TEST_LAYER: &[u8] = include_bytes!("fixtures/test_layer.wasm");
+mod common;
+use common::*;
+
 const TUNNEL_LAYER: &[u8] = include_bytes!("fixtures/tunnel_layer.wasm");
-
-/// What the mock does when the layer calls `next`.
-enum NextMode {
-    /// Answer 200 with the request body streamed back as the response
-    /// body.
-    Echo,
-    /// Hand the request to the test and answer with the response the test
-    /// provided.
-    Capture(Mutex<Option<(oneshot::Sender<LayerRequest>, LayerResponse)>>),
-    /// Fail closed.
-    Fail,
-}
-
-struct Mock {
-    mode: NextMode,
-    next_calls: AtomicUsize,
-    /// Host-service calls, in order.
-    calls: Mutex<Vec<String>>,
-    /// The head of the last request passed to `next`.
-    seen: Mutex<Option<http::request::Parts>>,
-}
-
-impl Mock {
-    fn new(mode: NextMode) -> Arc<Self> {
-        Arc::new(Self {
-            mode,
-            next_calls: AtomicUsize::new(0),
-            calls: Mutex::new(Vec::new()),
-            seen: Mutex::new(None),
-        })
-    }
-
-    fn echo() -> Arc<Self> {
-        Self::new(NextMode::Echo)
-    }
-
-    fn calls(&self) -> Vec<String> {
-        self.calls.lock().unwrap().clone()
-    }
-
-    fn call(&self, c: String) {
-        self.calls.lock().unwrap().push(c);
-    }
-}
-
-#[async_trait]
-impl LayerHost for Mock {
-    async fn next(&self, req: LayerRequest) -> Result<LayerResponse, HostError> {
-        self.next_calls.fetch_add(1, Ordering::SeqCst);
-        let (parts, body) = req.into_parts();
-        *self.seen.lock().unwrap() = Some(parts.clone());
-        match &self.mode {
-            NextMode::Echo => Ok(Response::builder()
-                .status(200)
-                .header("x-upstream", "yes")
-                .body(body)
-                .unwrap()),
-            NextMode::Capture(slot) => {
-                let (tx, resp) = slot.lock().unwrap().take().expect("one next");
-                let _ = tx.send(Request::from_parts(parts, body));
-                Ok(resp)
-            }
-            NextMode::Fail => Err(HostError::new("metric store unavailable")),
-        }
-    }
-
-    async fn endpoint_call(
-        &self,
-        name: &str,
-        req: LayerRequest,
-    ) -> Result<LayerResponse, EndpointError> {
-        self.call(format!("endpoint {name} {}", req.uri()));
-        if name == "monitor" {
-            Ok(Response::new(Body::from_bytes("score=0.1")))
-        } else {
-            Err(EndpointError::NotFound)
-        }
-    }
-
-    fn flow_info(&self) -> FlowInfo {
-        FlowInfo {
-            flow_id: "flow-1".into(),
-            conn_id: "conn-1".into(),
-            principal: Principal {
-                client_ip: "10.0.0.1".into(),
-                client_user: None,
-                listener: "main".into(),
-                tls_sni: None,
-            },
-            tags: vec![],
-        }
-    }
-
-    fn add_tag(&self, tag: String) {
-        self.call(format!("tag {tag}"));
-    }
-
-    fn log(&self, level: LogLevel, msg: &str) {
-        self.call(format!("log {level:?} {msg}"));
-    }
-
-    async fn record(&self, kind: String, json: String, audit: bool) -> Result<(), HostError> {
-        self.call(format!("record {kind} {json} {audit}"));
-        Ok(())
-    }
-
-    async fn terminate(
-        &self,
-        scope: TerminateScope,
-        reason: String,
-        ttl_ms: Option<u64>,
-    ) -> Result<bool, HostError> {
-        self.call(format!("terminate {scope:?} {reason} {ttl_ms:?}"));
-        Ok(true)
-    }
-
-    async fn state_get(&self, key: String) -> Result<Option<String>, HostError> {
-        self.call(format!("state_get {key}"));
-        Ok(Some("{\"n\":1}".into()))
-    }
-
-    async fn state_put(
-        &self,
-        key: String,
-        json: String,
-        ttl_ms: Option<u64>,
-    ) -> Result<Result<(), String>, HostError> {
-        self.call(format!("state_put {key} {json} {ttl_ms:?}"));
-        Ok(Ok(()))
-    }
-
-    async fn metric_get(&self, id: String, key: Vec<String>) -> Result<Option<i64>, HostError> {
-        self.call(format!("metric_get {id} {key:?}"));
-        Ok(Some(7))
-    }
-}
-
-fn runtime() -> WasmRuntime {
-    WasmRuntime::new().expect("runtime")
-}
-
-fn config() -> LayerConfig {
-    LayerConfig::new("test")
-}
-
-async fn load(rt: &WasmRuntime, cfg: LayerConfig) -> Layer {
-    Layer::load(rt, TEST_LAYER.to_vec(), cfg)
-        .await
-        .expect("load")
-}
-
-fn request(test: &str, body: Body) -> LayerRequest {
-    Request::builder()
-        .method(Method::POST)
-        .uri("https://api.example.com:443/v1/messages?x=1")
-        .header("x-test", test)
-        .header("content-type", "text/plain")
-        .body(body)
-        .unwrap()
-}
-
-async fn collect(body: Body) -> Result<Bytes, BodyError> {
-    body.collect()
-        .await
-        .map(http_body_util::Collected::to_bytes)
-}
-
-/// Runs a whole exchange, collecting the response body.
-async fn exchange(
-    layer: &Layer,
-    host: Arc<Mock>,
-    req: LayerRequest,
-) -> Result<(StatusCode, Bytes), LayerError> {
-    let resp = layer.handle(host, req).await?;
-    let status = resp.status();
-    let outcome = resp.extensions().get::<LayerOutcome>().cloned().unwrap();
-    match collect(resp.into_body()).await {
-        Ok(b) => {
-            outcome.wait().await?;
-            Ok((status, b))
-        }
-        Err(_) => Err(outcome
-            .wait()
-            .await
-            .expect_err("body failed, so must the outcome")),
-    }
-}
 
 #[tokio::test]
 async fn passes_through_and_transforms() {
