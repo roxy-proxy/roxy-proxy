@@ -23,12 +23,77 @@ pub struct TestRequest {
     /// Response phase only.
     pub status: Option<u16>,
     pub response_headers: Vec<(String, String)>,
-    pub metrics: Vec<(String, i64)>,
+    /// `--metric id=N` (`Some(N)`) or `--metric id=unavailable` (`None`).
+    /// Defined metrics not listed here evaluate as 0, a fresh series.
+    pub metrics: Vec<(String, Option<i64>)>,
     pub state: Vec<(String, String)>,
     pub tags: Vec<String>,
-    /// Give every metric not set in `metrics` the value 0 (a fresh series).
-    /// Otherwise an unset metric is unavailable and the flow fails closed.
-    pub fresh_metrics: bool,
+}
+
+/// How a metric is presented to the rules in a dry run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricValue {
+    /// Given with `--metric id=N`.
+    Given(i64),
+    /// Not given: a fresh series, 0.
+    Default,
+    /// `--metric id=unavailable`: the view returns `None`, exercising the
+    /// engine's fail-closed path.
+    Unavailable,
+}
+
+/// The value of every defined metric, plus any extra ones given on the
+/// command line, in config order.
+pub fn metric_values(config: &Config, req: &TestRequest) -> Vec<(String, MetricValue)> {
+    let given = |id: &str| {
+        req.metrics
+            .iter()
+            .rev()
+            .find(|(k, _)| k == id)
+            .map(|(_, v)| v.map_or(MetricValue::Unavailable, MetricValue::Given))
+    };
+    let mut out: Vec<(String, MetricValue)> = config
+        .metrics
+        .iter()
+        .map(|m| (m.id.clone(), given(&m.id).unwrap_or(MetricValue::Default)))
+        .collect();
+    for (id, _) in &req.metrics {
+        if !out.iter().any(|(k, _)| k == id) {
+            out.push((id.clone(), given(id).unwrap_or(MetricValue::Default)));
+        }
+    }
+    out
+}
+
+/// `github_writes=0 (default), egress_bytes=12, x=unavailable`, or `None`
+/// when there are no metrics.
+pub fn metric_note(values: &[(String, MetricValue)]) -> Option<String> {
+    if values.is_empty() {
+        return None;
+    }
+    Some(
+        values
+            .iter()
+            .map(|(id, v)| match v {
+                MetricValue::Given(n) => format!("{id}={n}"),
+                MetricValue::Default => format!("{id}=0 (default)"),
+                MetricValue::Unavailable => format!("{id}=unavailable"),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+/// Parse a `--metric` argument: `id=N` or `id=unavailable`.
+pub fn parse_metric(s: &str) -> Result<(String, Option<i64>), String> {
+    let (k, v) = parse_pair(s)?;
+    if v == "unavailable" {
+        return Ok((k, None));
+    }
+    let n = v
+        .parse::<i64>()
+        .map_err(|_| format!("metric {k:?}: {v:?} is not an integer or `unavailable`"))?;
+    Ok((k, Some(n)))
 }
 
 impl TestRequest {
@@ -46,7 +111,6 @@ impl TestRequest {
             metrics: Vec::new(),
             state: Vec::new(),
             tags: Vec::new(),
-            fresh_metrics: false,
         }
     }
 }
@@ -223,22 +287,25 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(MapView, Vec<St
     for (n, val) in &req.headers {
         v = v.with_header(n, val);
     }
-    if let Some(body) = &req.body {
-        v = v.with_body(body);
-    }
+    // No --body means an empty (and therefore inspectable) body; the dry run
+    // has no response body, so `response.body.text` is empty too.
+    v = v
+        .with_body(req.body.as_deref().unwrap_or(""))
+        .with_response_body("");
     if let Some(status) = req.status {
         v = v.with_int(Field::ResponseStatus, i64::from(status));
     }
     for (n, val) in &req.response_headers {
         v = v.with_response_header(n, val);
     }
-    if req.fresh_metrics {
-        for m in &config.metrics {
-            v = v.with_metric(&m.id, 0);
+    // Unavailable metrics are simply not inserted: MapView then returns
+    // `None`, which the engine treats as fail-closed.
+    for (id, value) in metric_values(config, req) {
+        match value {
+            MetricValue::Given(n) => v = v.with_metric(&id, n),
+            MetricValue::Default => v = v.with_metric(&id, 0),
+            MetricValue::Unavailable => {}
         }
-    }
-    for (id, n) in &req.metrics {
-        v = v.with_metric(id, *n);
     }
     for (k, val) in &req.state {
         v = v.with_state(k, val);
@@ -287,7 +354,7 @@ pub fn run(policy: &Policy, phase: Phase, view: &MapView, tags: &[String]) -> Ou
 }
 
 /// Human-readable report. Effect text passes through `redactor`.
-pub fn report(phase: Phase, out: &Outcome, redactor: &Redactor) -> String {
+pub fn report(phase: Phase, metrics: Option<&str>, out: &Outcome, redactor: &Redactor) -> String {
     let mut s = String::new();
     let list = |items: Vec<String>| {
         if items.is_empty() {
@@ -297,6 +364,9 @@ pub fn report(phase: Phase, out: &Outcome, redactor: &Redactor) -> String {
         }
     };
     let _ = writeln!(s, "phase:    {phase}");
+    if let Some(m) = metrics {
+        let _ = writeln!(s, "metrics:  {m}");
+    }
     let _ = writeln!(
         s,
         "matched:  {}",

@@ -42,6 +42,21 @@ impl Value<'_> {
     }
 }
 
+/// A body as seen by `body.text` / `response.body.text`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyText<'a> {
+    /// The buffered body as text. Bodies that are not valid UTF-8 should be
+    /// passed lossily decoded rather than withheld.
+    Available(Cow<'a, str>),
+    /// Larger than `limits.max_inspect_body_bytes`: cannot be checked, so
+    /// the flow fails closed. Scope large uploads out first with
+    /// `body.size < 1mb and body.text contains ...` (`and` short-circuits,
+    /// so the body is never inspected when the size test is false).
+    TooLarge,
+    /// Not buffered or could not be read (e.g. decompression failed).
+    Unavailable,
+}
+
 /// Read-only access to one flow, implemented by the proxy.
 ///
 /// Header names passed in are lower-case. Methods return `None` / `Absent` /
@@ -65,11 +80,12 @@ pub trait FlowView {
     fn metric(&self, id: &str) -> Option<i64>;
     /// A state-store entry.
     fn state(&self, key: &str) -> Option<Cow<'_, str>>;
-    /// The buffered request body as text; `None` if not buffered, too large
-    /// or not UTF-8.
-    fn body_text(&self) -> Option<Cow<'_, str>>;
-    /// The buffered response body as text.
-    fn response_body_text(&self) -> Option<Cow<'_, str>>;
+    /// The buffered request body as text (§6.2). Only called when a rule
+    /// reaches a `body.text` predicate. `TooLarge` and `Unavailable` both
+    /// fail the flow closed; an empty body is `Available("")`.
+    fn body_text(&self) -> BodyText<'_>;
+    /// The buffered response body as text; same contract.
+    fn response_body_text(&self) -> BodyText<'_>;
     /// Whether `ip` is in the named address list (`ip in @list`, §7.1).
     /// `None` = list unavailable (not loaded), which fails the flow closed
     /// (503, `_fail_closed`). `ip` is canonical (IPv4-mapped IPv6
@@ -88,8 +104,12 @@ pub struct MapView {
     pub query: Vec<(String, String)>,
     pub metrics: HashMap<String, i64>,
     pub state: HashMap<String, String>,
+    /// `None` = not buffered (`BodyText::Unavailable`).
     pub body: Option<String>,
     pub response_body: Option<String>,
+    /// Report the body as larger than the inspect cap.
+    pub body_too_large: bool,
+    pub response_body_too_large: bool,
     /// Address lists for `in @name`, scanned linearly.
     pub address_lists: HashMap<String, Vec<IpNet>>,
 }
@@ -165,6 +185,26 @@ impl MapView {
         self.response_body = Some(body.to_owned());
         self
     }
+
+    /// Report the request (or, with `response`, the response) body as over
+    /// the inspect cap.
+    #[must_use]
+    pub fn with_body_too_large(mut self, response: bool) -> Self {
+        if response {
+            self.response_body_too_large = true;
+        } else {
+            self.body_too_large = true;
+        }
+        self
+    }
+}
+
+fn body(text: Option<&str>, too_large: bool) -> BodyText<'_> {
+    match (too_large, text) {
+        (true, _) => BodyText::TooLarge,
+        (false, Some(t)) => BodyText::Available(Cow::Borrowed(t)),
+        (false, None) => BodyText::Unavailable,
+    }
 }
 
 fn first<'a>(pairs: &'a [(String, String)], name: &str) -> Option<Cow<'a, str>> {
@@ -207,11 +247,11 @@ impl FlowView for MapView {
     fn state(&self, key: &str) -> Option<Cow<'_, str>> {
         self.state.get(key).map(|v| Cow::Borrowed(v.as_str()))
     }
-    fn body_text(&self) -> Option<Cow<'_, str>> {
-        self.body.as_deref().map(Cow::Borrowed)
+    fn body_text(&self) -> BodyText<'_> {
+        body(self.body.as_deref(), self.body_too_large)
     }
-    fn response_body_text(&self) -> Option<Cow<'_, str>> {
-        self.response_body.as_deref().map(Cow::Borrowed)
+    fn response_body_text(&self) -> BodyText<'_> {
+        body(self.response_body.as_deref(), self.response_body_too_large)
     }
     fn in_address_list(&self, list: &str, ip: IpAddr) -> Option<bool> {
         self.address_lists

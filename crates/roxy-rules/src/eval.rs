@@ -13,7 +13,7 @@ use crate::compile::{Const, OrdOp, Pred, ROperand, StrOp};
 use crate::config::{CaptureTarget, LogLevel, Phase, Scheme};
 use crate::diag::RuleId;
 use crate::types::Access;
-use crate::view::{FlowView, Value};
+use crate::view::{BodyText, FlowView, Value};
 
 /// Per-evaluation inputs that are not part of the flow.
 #[derive(Clone, Copy)]
@@ -145,6 +145,12 @@ pub enum FailClosedReason {
     /// A resolved secret is not a valid header value (CR, LF, control or
     /// non-ASCII characters).
     SecretInvalid(String),
+    /// A body predicate was reached but the body exceeds
+    /// `limits.max_inspect_body_bytes` (§6.2). Carries the field name.
+    BodyTooLargeToInspect(String),
+    /// A body predicate was reached but the body was not buffered or could
+    /// not be read. Carries the field name.
+    BodyUnavailable(String),
 }
 
 impl fmt::Display for FailClosedReason {
@@ -154,6 +160,10 @@ impl fmt::Display for FailClosedReason {
             Self::AddressListUnavailable(n) => write!(f, "address list @{n} unavailable"),
             Self::SecretMissing(n) => write!(f, "secret {n:?} missing"),
             Self::SecretInvalid(n) => write!(f, "secret {n:?} is not a valid header value"),
+            Self::BodyTooLargeToInspect(field) => {
+                write!(f, "`{field}`: body too large to inspect")
+            }
+            Self::BodyUnavailable(field) => write!(f, "`{field}`: body unavailable"),
         }
     }
 }
@@ -435,6 +445,9 @@ impl<'a> Scope<'a> {
 pub(crate) enum Unavailable<'a> {
     Metric(&'a str),
     List(&'a str),
+    /// Field name (`body.text` / `response.body.text`).
+    BodyTooLarge(&'static str),
+    Body(&'static str),
 }
 
 impl Unavailable<'_> {
@@ -442,6 +455,8 @@ impl Unavailable<'_> {
         match self {
             Unavailable::Metric(id) => FailClosedReason::MetricUnavailable(id.to_owned()),
             Unavailable::List(n) => FailClosedReason::AddressListUnavailable(n.to_owned()),
+            Unavailable::BodyTooLarge(f) => FailClosedReason::BodyTooLargeToInspect(f.to_owned()),
+            Unavailable::Body(f) => FailClosedReason::BodyUnavailable(f.to_owned()),
         }
     }
 }
@@ -480,9 +495,24 @@ fn get<'a>(op: &'a ROperand, s: &Scope<'a>) -> Value<'a> {
                 },
                 Value::Int,
             ),
-            Access::BodyText => opt(s.view.body_text()),
-            Access::RespBodyText => opt(s.view.response_body_text()),
+            Access::BodyText => body(s, s.view.body_text(), "body.text"),
+            Access::RespBodyText => body(s, s.view.response_body_text(), "response.body.text"),
         },
+    }
+}
+
+/// A body that cannot be inspected fails closed rather than reading as absent.
+fn body<'a>(s: &Scope<'a>, b: BodyText<'a>, field: &'static str) -> Value<'a> {
+    match b {
+        BodyText::Available(t) => Value::Str(t),
+        BodyText::TooLarge => {
+            s.fail(Unavailable::BodyTooLarge(field));
+            Value::Absent
+        }
+        BodyText::Unavailable => {
+            s.fail(Unavailable::Body(field));
+            Value::Absent
+        }
     }
 }
 

@@ -45,11 +45,14 @@
 //!   `ws`, `close: true` closes the socket; the default drops the message.
 //! * **Unavailable inputs fail closed.** If evaluation reaches a metric the
 //!   view reports unavailable ([`FlowView::metric`] → `None`), an address
-//!   list it cannot answer for, or a `set_header` secret that is missing or
-//!   not a valid header value, evaluation stops: [`Decision::fail_closed`]
+//!   list it cannot answer for, a body predicate whose body is too large to
+//!   inspect or not available ([`BodyText`]), or a `set_header` secret that
+//!   is missing or not a valid header value, evaluation stops: [`Decision::fail_closed`]
 //!   (503, close), `terminal_rule = "_fail_closed"`, and
 //!   [`Outcome::fail_closed_reason`] says why. This is never "predicate
-//!   false". `and`/`or` short-circuit, so only inputs actually reached count.
+//!   false". `and`/`or` short-circuit, so only inputs actually reached count:
+//!   write `body.size < 1mb and body.text contains "x"` to keep large
+//!   uploads out of body inspection instead of failing them closed.
 //! * **Absent values.** A field the flow does not have (`client.user`
 //!   without proxy auth, an unset header or state key) is
 //!   [`Value::Absent`]. *Every* comparison involving an absent operand is
@@ -113,4 +116,4 @@ pub use eval::{
 pub use parser::parse;
 pub use policy::{MetricDef, Policy, PolicyInput};
 pub use types::{Field, Type};
-pub use view::{FlowView, MapView, Value};
+pub use view::{BodyText, FlowView, MapView, Value};

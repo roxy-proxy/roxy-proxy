@@ -234,10 +234,8 @@ fn absent_values_are_never_equal_or_unequal() {
         ("state[\"nope\"] == \"\"", false),
         ("tls.alpn != \"h2\"", false),
     ]);
-    // An unbuffered body is absent. (A missing *metric* is not absent: it
-    // fails closed, see `unavailable_inputs_fail_closed`.)
-    let v = MapView::new();
-    assert!(!eval_in(Phase::Request, "body.text contains \"\"", &v));
+    // Missing metrics, address lists and bodies are not absent: they fail
+    // closed (see `unavailable_inputs_fail_closed`, `bodies_fail_closed`).
 }
 
 #[test]
@@ -439,6 +437,57 @@ fn fail_closed(reason: FailClosedReason) -> impl Fn(&roxy_rules::Outcome) {
         assert_eq!(out.terminal_rule, "_fail_closed");
         assert_eq!(out.fail_closed_reason.as_ref(), Some(&reason));
     }
+}
+
+#[test]
+fn bodies_fail_closed() {
+    let ctx = EvalContext::empty();
+    let p = compile(
+        "",
+        "- { id: b, when: 'body.text contains \"secret\"', then: deny }\n- { id: ok, then: allow }",
+    );
+    let body = |s: &str| MapView::new().with_int(Field::BodySize, 10).with_body(s);
+    assert_eq!(
+        p.evaluate(Phase::Request, &body("a secret"), &ctx)
+            .terminal_rule,
+        "b"
+    );
+    assert_eq!(
+        p.evaluate(Phase::Request, &body(""), &ctx).terminal_rule,
+        "ok"
+    );
+    let too_large = body("x").with_body_too_large(false);
+    fail_closed(FailClosedReason::BodyTooLargeToInspect("body.text".into()))(&p.evaluate(
+        Phase::Request,
+        &too_large,
+        &ctx,
+    ));
+    fail_closed(FailClosedReason::BodyUnavailable("body.text".into()))(&p.evaluate(
+        Phase::Request,
+        &MapView::new(),
+        &ctx,
+    ));
+
+    // Scoping by size first means a large upload is never inspected.
+    let p = compile(
+        "",
+        "- { id: b, when: 'body.size < 1mb and body.text contains \"secret\"', then: deny }\n\
+         - { id: ok, then: allow }",
+    );
+    let big = MapView::new()
+        .with_int(Field::BodySize, 5 << 20)
+        .with_body_too_large(false);
+    assert_eq!(p.evaluate(Phase::Request, &big, &ctx).terminal_rule, "ok");
+
+    // Response bodies too.
+    let p = compile(
+        "",
+        "- { id: r, phase: response, when: 'response.body.text contains \"x\"', then: deny }",
+    );
+    let v = MapView::new().with_body_too_large(true);
+    fail_closed(FailClosedReason::BodyTooLargeToInspect(
+        "response.body.text".into(),
+    ))(&p.evaluate(Phase::Response, &v, &ctx));
 }
 
 #[test]
