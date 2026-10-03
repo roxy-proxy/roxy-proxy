@@ -1,5 +1,10 @@
 //! A test layer for roxy-wasm. Its behaviour for an exchange is chosen by
 //! the request's `x-test` header (default `pass`); see `handle`.
+//!
+//! A layer configured with a name (`{"name": "a"}`) reads `x-test-a` in
+//! preference to `x-test`, so each layer of a stack can be told what to do,
+//! and when it passes an exchange on it tags the flow `via:a` and appends
+//! `a` to the forwarded request's `x-via` header.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -29,6 +34,42 @@ fn header(req: &IncomingRequest, name: &str) -> Option<String> {
         .get(name)
         .first()
         .map(|v| String::from_utf8_lossy(v).into_owned())
+}
+
+/// The `name` from this layer's config, if any (`{"name": "a"}`).
+fn name() -> Option<String> {
+    let config = flow::config();
+    let start = config.find("\"name\":\"")? + "\"name\":\"".len();
+    let len = config[start..].find('"')?;
+    Some(config[start..start + len].to_owned())
+}
+
+/// The behaviour for this exchange: `x-test-<name>`, else `x-test`.
+fn test_for(req: &IncomingRequest) -> String {
+    name()
+        .and_then(|n| header(req, &format!("x-test-{n}")))
+        .or_else(|| header(req, "x-test"))
+        .unwrap_or_else(|| "pass".to_owned())
+}
+
+/// `x-read-bytes` (default 1): how much body to read before answering.
+fn read_bytes(req: &IncomingRequest) -> u64 {
+    header(req, "x-read-bytes")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
+/// Reads at least `n` bytes of `input` (or to its end).
+fn read_at_least(input: &InputStream, n: u64) -> Vec<u8> {
+    let mut got = Vec::new();
+    while (got.len() as u64) < n {
+        match input.blocking_read(64 * 1024) {
+            Ok(chunk) => got.extend_from_slice(&chunk),
+            Err(StreamError::Closed) => break,
+            Err(e) => panic!("read failed: {e:?}"),
+        }
+    }
+    got
 }
 
 fn write_all(out: &OutputStream, mut bytes: &[u8]) {
@@ -83,9 +124,22 @@ fn respond(out: ResponseOutparam, status: u16, body: &[u8]) {
     OutgoingBody::finish(resp_body, None).expect("finish");
 }
 
-/// A copy of the incoming request, ready for `next`.
+/// A copy of the incoming request, ready for `next`. A named layer appends
+/// its name to `x-via` and tags the flow `via:<name>`.
 fn forward_head(req: &IncomingRequest) -> OutgoingRequest {
-    let headers = Fields::from_list(&req.headers().entries()).expect("headers");
+    let mut entries = req.headers().entries();
+    if let Some(n) = name() {
+        flow::add_tag(&format!("via:{n}"));
+        let via = match entries.iter().position(|(k, _)| k == "x-via") {
+            Some(i) => {
+                let (_, v) = entries.remove(i);
+                format!("{},{n}", String::from_utf8_lossy(&v))
+            }
+            None => n,
+        };
+        entries.push(("x-via".to_owned(), via.into_bytes()));
+    }
+    let headers = Fields::from_list(&entries).expect("headers");
     let out = OutgoingRequest::new(headers);
     out.set_method(&req.method()).expect("method");
     out.set_scheme(req.scheme().as_ref()).expect("scheme");
@@ -160,6 +214,72 @@ fn pass(req: IncomingRequest, out: ResponseOutparam, buffer_first: bool) {
     answer_with(await_response(fut), out, upper);
 }
 
+/// Like `pass`, but full duplex: it streams the request body into `next`
+/// while watching for the response, so a response from below (an inner
+/// layer or the upstream answering early) is relayed at once, abandoning
+/// the rest of the request body.
+fn relay(req: IncomingRequest, out: ResponseOutparam) {
+    let next_req = forward_head(&req);
+    let next_body = next_req.body().expect("body");
+    let in_body = req.consume().expect("consume");
+    let fut = chain::next(next_req).expect("next");
+    let mut early = None;
+    {
+        let input = in_body.stream().expect("stream");
+        let output = next_body.write().expect("write");
+        let mut pending: Vec<u8> = Vec::new();
+        let mut input_open = true;
+        loop {
+            if let Some(r) = fut.get() {
+                early = Some(r);
+                break;
+            }
+            if pending.is_empty() && !input_open {
+                break;
+            }
+            let mut pollables = vec![fut.subscribe()];
+            if pending.is_empty() {
+                pollables.push(input.subscribe());
+            } else {
+                pollables.push(output.subscribe());
+            }
+            let refs: Vec<_> = pollables.iter().collect();
+            wasi::io::poll::poll(&refs);
+            drop(refs);
+            drop(pollables);
+            if pending.is_empty() {
+                match input.read(64 * 1024) {
+                    Ok(chunk) => pending = chunk,
+                    Err(StreamError::Closed) => input_open = false,
+                    // The request body broke (the client or an outer layer
+                    // gave up): abandon the exchange.
+                    Err(_) => return,
+                }
+            } else {
+                let n = output.check_write().expect("check_write") as usize;
+                if n > 0 {
+                    let k = n.min(pending.len());
+                    output.write(&pending[..k]).expect("write");
+                    pending.drain(..k);
+                }
+            }
+        }
+    }
+    let resp = if let Some(r) = early {
+        // Answered before the body was all sent: abandon the rest.
+        drop(next_body);
+        drop(in_body);
+        drop(req);
+        r.expect("once").expect("response")
+    } else {
+        OutgoingBody::finish(next_body, None).expect("finish");
+        drop(in_body);
+        drop(req);
+        await_response(fut)
+    };
+    answer_with(resp, out, false);
+}
+
 fn call_capability(req: &IncomingRequest) -> String {
     match header(req, "x-cap").as_deref().unwrap_or("") {
         "current" => {
@@ -224,11 +344,57 @@ fn call_capability(req: &IncomingRequest) -> String {
 impl Handler for Layer {
     fn handle(req: IncomingRequest, out: ResponseOutparam) {
         let n = EXCHANGES.fetch_add(1, Ordering::Relaxed) + 1;
-        let test = header(&req, "x-test").unwrap_or_else(|| "pass".to_owned());
+        let test = test_for(&req);
         match test.as_str() {
             "pass" => pass(req, out, false),
+            "relay" => relay(req, out),
             "buffer" => pass(req, out, true),
             "deny" => respond(out, 403, b"denied by layer"),
+            "answer" => {
+                let who = name().unwrap_or_default();
+                respond(out, 200, format!("answered by {who}").as_bytes());
+            }
+            "read-then-answer" => {
+                // Answer after `x-read-bytes` of the body, without `next`.
+                let n = read_bytes(&req);
+                let body = req.consume().expect("consume");
+                let got = {
+                    let input = body.stream().expect("stream");
+                    read_at_least(&input, n)
+                };
+                let who = name().unwrap_or_default();
+                respond(
+                    out,
+                    200,
+                    format!("answered by {who} after {} bytes", got.len()).as_bytes(),
+                );
+                drop(body);
+            }
+            "next-then-answer" => {
+                // Pass the request on, stream `x-read-bytes` of its body
+                // into `next`, then abandon it and answer locally.
+                let n = read_bytes(&req);
+                let next_req = forward_head(&req);
+                let next_body = next_req.body().expect("body");
+                let in_body = req.consume().expect("consume");
+                let fut = chain::next(next_req).expect("next");
+                let sent = {
+                    let input = in_body.stream().expect("stream");
+                    let output = next_body.write().expect("write");
+                    let got = read_at_least(&input, n);
+                    write_all(&output, &got);
+                    got.len()
+                };
+                drop(fut);
+                drop(next_body);
+                let who = name().unwrap_or_default();
+                respond(
+                    out,
+                    200,
+                    format!("answered by {who} after forwarding {sent} bytes").as_bytes(),
+                );
+                drop(in_body);
+            }
             "count" => respond(out, 200, n.to_string().as_bytes()),
             "caps" => {
                 let body = call_capability(&req);

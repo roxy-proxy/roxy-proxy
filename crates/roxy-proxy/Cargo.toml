@@ -40,6 +40,7 @@ tracing.workspace = true
 ulid = "3.0.0"
 
 [dev-dependencies]
+serde_yaml_ng.workspace = true
 criterion = { version = "0.7.0", default-features = false }
 proptest = "1.11.0"
 tempfile.workspace = true

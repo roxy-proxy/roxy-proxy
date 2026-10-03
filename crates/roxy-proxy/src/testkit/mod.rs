@@ -1,0 +1,589 @@
+//! In-process test harness: a whole roxy [`Server`] with no bound
+//! listeners, client connections over in-memory duplexes, and a scripted
+//! upstream reached through the connector's test dial (after real DNS
+//! overrides, the real address floor and real upstream TLS).
+//!
+//! ```text
+//!   test client ──duplex──▶ conn::serve_explicit ─▶ … ─▶ Connector ──TestDial──▶ scripted upstream
+//! ```
+//!
+//! * Names: `up.test` resolves to a public test address, `private.test` to a
+//!   private one (denied by the floor unless `private_ok`), `down.test` to
+//!   an address that refuses connections.
+//! * The upstream answers by path (see [`upstream_answer`]) and records what
+//!   reached it ([`Seen`]): the head, the body bytes, and whether the body
+//!   completed or was cut.
+//! * Flow events go to a [`MemorySink`]; [`MemorySink::wait_for`] waits on
+//!   emits instead of polling.
+
+#![allow(dead_code)]
+
+#[cfg(test)]
+mod addon_tests;
+#[cfg(test)]
+mod core_tests;
+#[cfg(test)]
+mod early_tests;
+mod upstream;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use http_body_util::BodyExt as _;
+use hyper::body::Incoming;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use roxy_http::{Body, BodySender, HttpFlags, Limits};
+use roxy_rules::{DefaultDecision, Policy, PolicyInput, RuleConfig};
+use roxy_tls::{Ca, LeafMinter, UpstreamTlsOptions};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use ulid::Ulid;
+
+#[allow(unused_imports)]
+pub(crate) use upstream::{Seen, Upstream};
+
+use crate::Server;
+use crate::addons::{AddonSpec, StateLimits};
+use crate::config::{PolicyUpdate, RuntimeConfig};
+use crate::flowlog::{MemorySink, Redactor};
+use crate::listener::{ClientConn, ListenerInfo, ListenerMode};
+use crate::sources::{UnavailableMetrics, UnavailableState};
+use crate::upstream::{TestDial, UpstreamSettings};
+
+/// The scripted upstream's public address (`up.test`).
+pub(crate) const UP_IP: &str = "93.184.215.14";
+/// A private address (`private.test`): the floor denies it without
+/// `private_ok`.
+pub(crate) const PRIVATE_IP: &str = "10.0.0.5";
+/// An address whose dial is refused (`down.test`).
+pub(crate) const DOWN_IP: &str = "93.184.215.99";
+
+/// Allows everything to `up.test`.
+pub(crate) const ALLOW_UP: &str = r#"
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+
+/// The roxy-wasm test layer (`crates/roxy-wasm/test-components`).
+pub(crate) const TEST_LAYER: &[u8] =
+    include_bytes!("../../../roxy-wasm/tests/fixtures/test_layer.wasm");
+/// The roxy-wasm tunnel layer.
+pub(crate) const TUNNEL_LAYER: &[u8] =
+    include_bytes!("../../../roxy-wasm/tests/fixtures/tunnel_layer.wasm");
+
+/// One addon of the stack under test.
+#[derive(Clone)]
+pub(crate) struct AddonDef {
+    pub name: String,
+    pub wasm: &'static [u8],
+    pub observe: bool,
+    pub caps: Vec<roxy_wasm::Capability>,
+    pub config: serde_json::Value,
+    pub limits: roxy_wasm::LayerLimits,
+}
+
+impl AddonDef {
+    /// The test layer, named `name` (it reads `x-test-<name>` first).
+    pub(crate) fn test_layer(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            wasm: TEST_LAYER,
+            observe: false,
+            caps: Vec::new(),
+            config: serde_json::json!({ "name": name }),
+            limits: roxy_wasm::LayerLimits::default(),
+        }
+    }
+
+    /// The tunnel layer, named `name`.
+    pub(crate) fn tunnel_layer(name: &str, upper: bool) -> Self {
+        Self {
+            wasm: TUNNEL_LAYER,
+            config: serde_json::json!({ "name": name, "upper": upper }),
+            ..Self::test_layer(name)
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn observe(mut self) -> Self {
+        self.observe = true;
+        self
+    }
+
+    async fn load(self, rt: &roxy_wasm::WasmRuntime) -> Arc<AddonSpec> {
+        let layer = roxy_wasm::Layer::load(
+            rt,
+            self.wasm.to_vec(),
+            roxy_wasm::LayerConfig {
+                name: self.name.clone(),
+                capabilities: self.caps.into_iter().collect(),
+                limits: self.limits,
+                config_json: self.config.to_string(),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("loading addon {}: {e}", self.name));
+        Arc::new(AddonSpec {
+            name: self.name,
+            observe: self.observe,
+            kind: crate::addons::AddonImpl::Wasm(layer),
+            endpoints: HashMap::new(),
+            state: StateLimits::default(),
+            audit_endpoint: None,
+        })
+    }
+}
+
+/// Builds a [`Kit`].
+pub(crate) struct KitBuilder {
+    rules: String,
+    addons: Vec<AddonDef>,
+    limits: Limits,
+}
+
+impl KitBuilder {
+    #[must_use]
+    pub(crate) fn rules(mut self, yaml: &str) -> Self {
+        yaml.clone_into(&mut self.rules);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn addon(mut self, a: AddonDef) -> Self {
+        self.addons.push(a);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn limits(mut self, f: impl FnOnce(&mut Limits)) -> Self {
+        f(&mut self.limits);
+        self
+    }
+
+    pub(crate) async fn start(self) -> Kit {
+        roxy_tls::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Arc::new(Ca::generate(dir.path()).unwrap());
+        let minter = Arc::new(LeafMinter::new(ca.clone(), 64).unwrap());
+        let sink = Arc::new(MemorySink::new());
+        let upstream = Upstream::new(minter.clone());
+
+        let rules: Vec<RuleConfig> = serde_yaml_ng::from_str(&self.rules).unwrap();
+        let none = std::collections::HashSet::new();
+        let addon_names = self.addons.iter().map(|a| a.name.clone()).collect();
+        let policy = Policy::compile(&PolicyInput {
+            rules: &rules,
+            metrics: &[],
+            secret_names: &none,
+            addon_names: &addon_names,
+            address_lists: &none,
+            transparent_listeners: false,
+            default: DefaultDecision::Deny,
+        })
+        .unwrap_or_else(|d| panic!("rules: {d:?}"));
+
+        let rt = roxy_wasm::WasmRuntime::new().unwrap();
+        let mut addons = Vec::new();
+        for a in self.addons {
+            addons.push(a.load(&rt).await);
+        }
+
+        let mut settings = UpstreamSettings::default();
+        // Never consult real DNS: unknown names fail.
+        settings.dns.servers = Some(vec!["127.0.0.1:9".parse().unwrap()]);
+        for (name, ip) in [
+            ("up.test", UP_IP),
+            ("private.test", PRIVATE_IP),
+            ("down.test", DOWN_IP),
+        ] {
+            settings
+                .dns
+                .static_hosts
+                .insert(name.to_owned(), vec![ip.parse().unwrap()]);
+        }
+        settings.connect_timeout = Duration::from_secs(5);
+        let up = upstream.clone();
+        settings.dial = Some(TestDial(Arc::new(move |addr| {
+            let up = up.clone();
+            Box::pin(async move { up.dial(addr) })
+        })));
+
+        let server = Server::start(RuntimeConfig {
+            listeners: Vec::new(),
+            ca_server: None,
+            ca: ca.clone(),
+            minter,
+            require_sni_match: true,
+            enable_h2: true,
+            upstream_tls: UpstreamTlsOptions {
+                extra_roots_pem: vec![dir.path().join(roxy_tls::CA_CERT_FILE)],
+                ..UpstreamTlsOptions::default()
+            },
+            max_connections: 1024,
+            max_connections_per_client: 1024,
+            connection_events: false,
+            sink: sink.clone(),
+            capture: None,
+            metrics: Arc::new(UnavailableMetrics),
+            state: Arc::new(UnavailableState),
+            policy: PolicyUpdate {
+                policy,
+                secrets: HashMap::new(),
+                redactor: Redactor::new(),
+                users: HashMap::new(),
+                limits: self.limits,
+                flags: HttpFlags::default(),
+                upstream: settings,
+                address_lists: Arc::new(HashMap::new()),
+                deny_lists: Vec::new(),
+                addons,
+            },
+        })
+        .await
+        .unwrap();
+        Kit {
+            server,
+            sink,
+            upstream,
+            ca_file: dir.path().join(roxy_tls::CA_CERT_FILE),
+            _dir: dir,
+        }
+    }
+}
+
+/// A running roxy with its scripted upstream and flow log.
+pub(crate) struct Kit {
+    pub server: Server,
+    pub sink: Arc<MemorySink>,
+    pub upstream: Arc<Upstream>,
+    ca_file: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl Kit {
+    pub(crate) fn builder() -> KitBuilder {
+        KitBuilder {
+            rules: ALLOW_UP.to_owned(),
+            addons: Vec::new(),
+            limits: Limits::default(),
+        }
+    }
+
+    /// A raw client connection to the proxy port.
+    pub(crate) fn connect(&self) -> tokio::io::DuplexStream {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let conn = ClientConn {
+            id: Ulid::generate(),
+            listener: Arc::new(ListenerInfo {
+                name: "main".to_owned(),
+                mode: ListenerMode::Explicit,
+                auth_required: false,
+            }),
+            peer: "192.0.2.7:40000".parse().unwrap(),
+            user: None,
+            original_dst: None,
+        };
+        tokio::spawn(crate::conn::serve_explicit(
+            Box::new(server),
+            conn,
+            self.server.shared().clone(),
+        ));
+        client
+    }
+
+    /// An HTTP/1.1 client on the proxy port (absolute-form requests).
+    pub(crate) async fn h1(&self) -> Client {
+        Client::h1(self.connect(), None).await
+    }
+
+    /// `CONNECT host:443`, TLS with roxy's leaf, then HTTP/2 (`h2`) or
+    /// HTTP/1.1 inside.
+    pub(crate) async fn tunnel(&self, host: &str, h2: bool) -> Client {
+        let mut io = self.connect();
+        io.write_all(format!("CONNECT {host}:443 HTTP/1.1\r\nhost: {host}:443\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut b = [0u8; 1];
+            assert_eq!(io.read(&mut b).await.unwrap(), 1, "CONNECT: EOF");
+            head.push(b[0]);
+        }
+        let head = String::from_utf8_lossy(&head);
+        assert!(head.starts_with("HTTP/1.1 200"), "CONNECT: {head}");
+        let mut cfg = (*roxy_tls::client_config(&UpstreamTlsOptions {
+            extra_roots_pem: vec![self.ca_file.clone()],
+            ..UpstreamTlsOptions::default()
+        })
+        .unwrap())
+        .clone();
+        cfg.alpn_protocols = vec![if h2 {
+            b"h2".to_vec()
+        } else {
+            b"http/1.1".to_vec()
+        }];
+        let name = roxy_tls::server_name_for_host(host).unwrap();
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+            .connect(name, io)
+            .await
+            .unwrap();
+        if h2 {
+            Client::h2(tls, host).await
+        } else {
+            Client::h1(tls, Some(host)).await
+        }
+    }
+
+    /// A WebSocket upgrade to `http://up.test<path>` on the proxy port.
+    /// Returns the response status and, after a `101`, the upgraded
+    /// stream.
+    pub(crate) async fn websocket(
+        &self,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> (u16, Option<TokioIo<hyper::upgrade::Upgraded>>) {
+        let mut c = self.h1().await;
+        let mut hs = vec![
+            ("connection", "upgrade"),
+            ("upgrade", "websocket"),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ];
+        hs.extend_from_slice(headers);
+        let req = c.request("GET", path, &hs).body(Body::empty()).unwrap();
+        let res = c.send(req).await.unwrap();
+        let status = res.status().as_u16();
+        if status != 101 {
+            return (status, None);
+        }
+        let up = hyper::upgrade::on(res).await.unwrap();
+        (status, Some(TokioIo::new(up)))
+    }
+
+    /// Waits until `n` events of `kind` were logged; returns them.
+    pub(crate) async fn events(&self, kind: &str, n: usize) -> Vec<serde_json::Value> {
+        self.sink.wait_for(kind, n, Duration::from_secs(10)).await
+    }
+
+    /// The flow's single `request` event.
+    pub(crate) async fn request_event(&self) -> serde_json::Value {
+        self.events("request", 1).await.remove(0)
+    }
+}
+
+/// A client over HTTP/1.1 or HTTP/2.
+pub(crate) enum Client {
+    /// `tunnel`: the CONNECT host (origin-form requests), or `None` on the
+    /// proxy port (absolute-form requests to `up.test`).
+    H1 {
+        send: hyper::client::conn::http1::SendRequest<Body>,
+        tunnel: Option<String>,
+    },
+    H2 {
+        send: hyper::client::conn::http2::SendRequest<Body>,
+        host: String,
+    },
+}
+
+impl Client {
+    async fn h1<IO>(io: IO, tunnel: Option<&str>) -> Self
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let (send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.with_upgrades().await;
+        });
+        Self::H1 {
+            send,
+            tunnel: tunnel.map(str::to_owned),
+        }
+    }
+
+    async fn h2<IO>(io: IO, host: &str) -> Self
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let (send, conn) =
+            hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io))
+                .await
+                .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        Self::H2 {
+            send,
+            host: host.to_owned(),
+        }
+    }
+
+    /// A request for `path` on `up.test` with `headers`; see
+    /// [`Client::request_to`].
+    pub(crate) fn request(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> http::request::Builder {
+        self.request_to("up.test", method, path, headers)
+    }
+
+    /// A request shaped for this client: an absolute `http://<host>` URI
+    /// plus `host` on the proxy port, origin form plus `host` in an h1
+    /// tunnel, an absolute `https` URI over h2. In a tunnel `host` is the
+    /// tunnel's.
+    pub(crate) fn request_to(
+        &self,
+        host: &str,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> http::request::Builder {
+        let mut b = http::Request::builder().method(method);
+        b = match self {
+            Self::H1 { tunnel: None, .. } => {
+                b.uri(format!("http://{host}{path}")).header("host", host)
+            }
+            Self::H1 {
+                tunnel: Some(t), ..
+            } => b.uri(path).header("host", t.as_str()),
+            Self::H2 { host: t, .. } => b.uri(format!("https://{t}{path}")),
+        };
+        for (n, v) in headers {
+            b = b.header(*n, *v);
+        }
+        b
+    }
+
+    /// Sends `req`.
+    pub(crate) async fn send(
+        &mut self,
+        req: http::Request<Body>,
+    ) -> Result<http::Response<Incoming>, hyper::Error> {
+        match self {
+            Self::H1 { send, .. } => {
+                send.ready().await?;
+                send.send_request(req).await
+            }
+            Self::H2 { send, .. } => {
+                send.ready().await?;
+                send.send_request(req).await
+            }
+        }
+    }
+
+    /// Starts `req` on its own task, so the test can keep feeding its body
+    /// while waiting for the answer. On h2 the connection stays usable
+    /// through `self`.
+    pub(crate) fn start(
+        &mut self,
+        req: http::Request<Body>,
+    ) -> tokio::task::JoinHandle<Result<Answer, hyper::Error>> {
+        match self {
+            Self::H1 { send, .. } => {
+                // The caller has not sent anything else on this connection,
+                // so it is ready.
+                let fut = send.send_request(req);
+                tokio::spawn(async move { Ok(Answer::read(fut.await?).await) })
+            }
+            Self::H2 { send, .. } => {
+                let mut send = send.clone();
+                tokio::spawn(async move {
+                    send.ready().await?;
+                    Ok(Answer::read(send.send_request(req).await?).await)
+                })
+            }
+        }
+    }
+
+    /// Sends a request with a fixed body and collects the answer.
+    pub(crate) async fn call(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &'static [u8],
+    ) -> Answer {
+        let req = self
+            .request(method, path, headers)
+            .body(Body::from_bytes(Bytes::from_static(body)))
+            .unwrap();
+        let res = self.send(req).await.expect("response");
+        Answer::read(res).await
+    }
+}
+
+/// A collected response.
+#[derive(Debug)]
+pub(crate) struct Answer {
+    pub status: u16,
+    pub headers: http::HeaderMap,
+    /// `Err` if the body was cut.
+    pub body: Result<Bytes, String>,
+}
+
+impl Answer {
+    pub(crate) async fn read(res: http::Response<Incoming>) -> Self {
+        let (parts, body) = res.into_parts();
+        let body = body
+            .collect()
+            .await
+            .map(http_body_util::Collected::to_bytes)
+            .map_err(|e| e.to_string());
+        Self {
+            status: parts.status.as_u16(),
+            headers: parts.headers,
+            body,
+        }
+    }
+
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8_lossy(self.body.as_ref().expect("complete body")).into_owned()
+    }
+
+    pub(crate) fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(self.body.as_ref().expect("complete body")).expect("JSON body")
+    }
+}
+
+/// A request body the test feeds chunk by chunk.
+pub(crate) fn streaming_body() -> (BodySender, Body) {
+    Body::channel(u64::MAX, None)
+}
+
+#[cfg(test)]
+mod smoke {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_request_reaches_the_scripted_upstream() {
+        let kit = Kit::builder().start().await;
+        let mut c = kit.h1().await;
+        let a = c.call("POST", "/hello", &[], b"abc").await;
+        assert_eq!(a.status, 200, "{a:?}");
+        assert_eq!(a.json()["path"], "/hello");
+        assert_eq!(a.json()["body_len"], 3);
+        let seen = kit.upstream.wait_seen(1).await;
+        assert_eq!(seen[0].body, b"abc");
+        assert_eq!(seen[0].complete, Some(true));
+        let ev = kit.request_event().await;
+        assert_eq!(ev["decision"], "allow", "{ev:#}");
+    }
+
+    #[tokio::test]
+    async fn tunnels_carry_h1_and_h2() {
+        let kit = Kit::builder().start().await;
+        for h2 in [false, true] {
+            let mut c = kit.tunnel("up.test", h2).await;
+            let a = c.call("GET", "/t", &[], b"").await;
+            assert_eq!(a.status, 200, "h2={h2} {a:?}");
+            assert_eq!(a.json()["path"], "/t");
+        }
+        let seen = kit.upstream.wait_seen(2).await;
+        assert!(seen.iter().all(|s| s.addr.port() == 443));
+    }
+}

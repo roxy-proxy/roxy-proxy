@@ -681,6 +681,7 @@ impl FlowSink for MultiSink {
 #[derive(Debug, Default)]
 pub struct MemorySink {
     events: Mutex<Vec<serde_json::Value>>,
+    emitted: tokio::sync::Notify,
 }
 
 impl MemorySink {
@@ -692,12 +693,51 @@ impl MemorySink {
     pub fn events(&self) -> Vec<serde_json::Value> {
         lock(&self.events).clone()
     }
+
+    /// Waits until at least `n` events of `kind` (the `event` field) were
+    /// emitted, and returns all of that kind. Panics after `timeout`,
+    /// listing what was logged.
+    pub async fn wait_for(
+        &self,
+        kind: &str,
+        n: usize,
+        timeout: std::time::Duration,
+    ) -> Vec<serde_json::Value> {
+        let of_kind = || -> Vec<serde_json::Value> {
+            lock(&self.events)
+                .iter()
+                .filter(|e| e["event"] == kind)
+                .cloned()
+                .collect()
+        };
+        let wait = async {
+            loop {
+                let emitted = self.emitted.notified();
+                let found = of_kind();
+                if found.len() >= n {
+                    return found;
+                }
+                emitted.await;
+            }
+        };
+        tokio::time::timeout(timeout, wait)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "wanted {n} `{kind}` events within {timeout:?}; logged: {:#?}",
+                    self.events()
+                )
+            })
+    }
 }
 
 impl FlowSink for MemorySink {
     fn emit(&self, event: &FlowEvent) {
         match serde_json::to_value(event) {
-            Ok(v) => lock(&self.events).push(v),
+            Ok(v) => {
+                lock(&self.events).push(v);
+                self.emitted.notify_waiters();
+            }
             Err(error) => tracing::warn!(%error, "flow log: failed to serialise event"),
         }
     }
