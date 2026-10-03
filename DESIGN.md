@@ -98,23 +98,23 @@ the CA. Any default that would trip a conforming client is a bug.
                        ┌────────────────────────────────────────────────────────┐
   agent ──TCP──▶       │ Listener (explicit | transparent)                      │
                        │   ▼                                                    │
-                       │ ConnectPhase  ── connect rules (client.*, dst.*, sni)  │
+                       │ CONNECT ── proxy auth, SNI must match CONNECT host     │
                        │   ▼                                                    │
                        │ TLS terminate (rustls, leaf minted by roxy CA)         │
                        │   ▼  ALPN → h1 | h2                                    │
                        │ Strict parse → CanonicalRequest                        │
                        │   ▼                                                    │
-                       │ RequestPhase ── rules + metrics + addons → Decision    │
+                       │ addons ─▶ rules at request head → forward or deny      │
                        │   ▼  allow(+mutations)                                 │
                        │ Upstream connector (own DNS, SSRF policy, rustls)      │
                        │   ▼  hyper client, HTTP/1.1                             │
                        │ Strict parse → CanonicalResponse                       │
                        │   ▼                                                    │
-                       │ ResponsePhase ── rules + addons → Decision             │
+                       │ watching deny rules (body bytes, response, metrics)    │
                        │   ▼                                                    │
                        │ Re-serialise to client (h1 | h2)                       │
                        │                                                        │
-                       │ FlowLog (JSONL) ◀── every phase emits events           │
+                       │ FlowLog (JSONL) ◀── every stage emits events           │
                        └────────────────────────────────────────────────────────┘
 ```
 
@@ -124,7 +124,7 @@ the CA. Any default that would trip a conforming client is a bug.
 |---|---|
 | `roxy-http` | Canonical request/response model, strict HTTP/1.1 codec, h2 ↔ canonical mapping, URL normalisation, body framing with caps, WebSocket frame codec. No I/O policy. |
 | `roxy-tls` | CA generation/persistence, leaf cert minting + cache, rustls server/client config builders, ClientHello sniffing (SNI, ALPN). |
-| `roxy-rules` | Expression DSL (lexer, parser, type-checker, compiler), rule set, phases, actions, metrics/state store, hot-reload-safe `Policy` snapshot. |
+| `roxy-rules` | Expression DSL (lexer, parser, type-checker, compiler), rule set, evaluation model, actions, metrics/state store, hot-reload-safe `Policy` snapshot. |
 | `roxy-wasm` | wasmtime component host, WIT world, addon lifecycle, fuel/memory limits, host-call implementations. |
 | `roxy-proxy` | Listeners, connection state machine, flow pipeline, upstream connector (DNS, SSRF policy, pool), WebSocket relay, flow log emission. |
 | `roxy` | Binary: CLI (`run`, `check`, `ca export`, `rule test`), config loading, reload watcher, wiring. |
@@ -157,7 +157,7 @@ struct Flow { id, conn: Arc<ClientConn>, tls: Option<TlsInfo>,
               tags: Vec<String>, matched: Vec<RuleId>, decision: Decision }
 
 enum Decision { Allow { mutations: Vec<Mutation> }, Deny { status, body },
-                Passthrough /* connect phase, transparent only */ }
+                Passthrough /* transparent mode only, deferred */ }
 
 // roxy-rules
 struct Policy { connect: RuleChain, request: RuleChain, response: RuleChain,
@@ -178,12 +178,12 @@ Client speaks HTTP/1.1 to roxy on the proxy port.
 
 - **Absolute-form requests** (`GET http://host/path HTTP/1.1`): plain HTTP.
   Parsed, canonicalised, evaluated. `Host` header must equal the URI authority.
-- **CONNECT host:port**: evaluated in the *connect phase*. If allowed, roxy
-  replies `200 Connection Established` and then **peeks the first bytes**:
+- **CONNECT host:port**: roxy replies `200 Connection Established` (after
+  proxy auth, if configured) and then **peeks the first bytes**:
   - TLS ClientHello → extract SNI and ALPN. SNI must equal the CONNECT host
     (`tls.require_sni_match`, default true; no-SNI uses the CONNECT host).
     Terminate TLS with a leaf cert for that host. Inner protocol must be
-    HTTP/1.1 or HTTP/2 (ALPN) → request phase.
+    HTTP/1.1 or HTTP/2 (ALPN); each request is decided by the rules.
   - Looks like plaintext HTTP and `http.allow_plain_in_connect` is true →
     parse as HTTP.
   - Anything else → **close**. No raw TCP through CONNECT, ever.
@@ -201,8 +201,7 @@ Not in the initial build. Kept here so the hooks it needs are designed in now:
 - `Listener` is a trait with one implementation (`ExplicitListener`) in M1;
   `TransparentListener` is added later and hands the same
   `(stream, ClientConn)` to the shared pipeline.
-- Connect-phase fields `dst.host`, `dst.port`, `dst.ip` exist from M1 (filled
-  from the CONNECT authority in proxy mode).
+- Connect-time rules and `dst.*` fields return with this mode (§6.1).
 - `listener.mode` is a rule field from M1 with the single value `explicit`.
 - The `passthrough` action is reserved in the action enum and rejected by the
   compiler with "requires a transparent listener" until the listener exists.
@@ -215,7 +214,7 @@ On accept, roxy peeks the first bytes and classifies:
 
 | first bytes | default | rule-gated alternative |
 |---|---|---|
-| TLS ClientHello | MITM, require HTTP inside | `passthrough` (connect phase, requires `transparent.allow_passthrough: true`) |
+| TLS ClientHello | MITM, require HTTP inside | `passthrough` (connect-time rule, requires `transparent.allow_passthrough: true`) |
 | Plaintext HTTP request line | parse as HTTP | — |
 | anything else | close | `passthrough` to `dst.ip:dst.port` if a connect rule says so |
 
@@ -233,15 +232,13 @@ Deployment notes that must ship with the docs: roxy's own uid must be exempt
 from the REDIRECT rule; DNS (udp/53) and all other UDP should be blocked at the
 firewall; IPv6 must be redirected too or blocked.
 
-### 4.3 Connect-phase semantics
+### 4.3 CONNECT
 
-Connect rules see `client.*`, `listener.*`, `dst.host`, `dst.port`, `dst.ip`,
-`tls.sni`, `tls.alpn`. Terminal actions: `allow` (proceed to decrypt and
-inspect), `deny`, `passthrough`.
-
-If no connect rule matches, the default is **allow-to-inspect**, not deny,
-because the request phase is the real gate and "allow" here only means "we will
-decrypt and look". `passthrough` is never a default.
+A CONNECT is accepted for inspection whenever the listener's auth (if any)
+passes: there are no connect-time rules (§6.1). The tunnel's first bytes
+must be a TLS ClientHello whose SNI matches the CONNECT host (or plaintext
+HTTP when `http.allow_plain_in_connect`), otherwise the connection is
+closed. Every allow/deny decision is made on the requests inside.
 
 ---
 
@@ -332,7 +329,7 @@ Headers:
   CONNECT, TRACE) with a non-zero body → reject (`http.allow_body_on_get`,
   default false).
 - `Expect`: only `100-continue` accepted; roxy itself sends `100 Continue`
-  after the request phase allows the request. Anything else → `417`.
+  after the rules allow the request. Anything else → `417`.
 - Hop-by-hop headers (`Connection` and everything it names, `Keep-Alive`,
   `Proxy-Connection`, `Proxy-Authorization`, `TE`, `Trailer`,
   `Transfer-Encoding`, `Upgrade`) are consumed by roxy and never forwarded.
@@ -440,8 +437,8 @@ content-length: ...
 ```
 
 Status and body are overridable per rule (`deny: { status: 451, message: "..." }`).
-Connect-phase denies reply `403` to the CONNECT. Transparent-mode denies before
-TLS is established can only close the socket.
+A refused CONNECT (failed proxy auth) gets `407`. Transparent-mode refusals
+before TLS is established can only close the socket.
 
 ---
 
@@ -551,8 +548,7 @@ rules:
     when: host == "ws.example.com" and header["upgrade"] == "websocket"
     then: { allow: { upgrade: websocket } }
 
-  - id: log-upstream-5xx
-    phase: response
+  - id: log-upstream-5xx            # reads a response value, so it watches
     when: response.status >= 500
     then: { log: { level: warn, message: "upstream 5xx" } }
 
@@ -568,17 +564,45 @@ addons:                          # above the rules, in this order (§11.1)
 Relative paths in the config (`ca_dir`, secret files, addon paths, log and
 capture paths) resolve against the process working directory.
 
-Rules are evaluated **top to bottom, first terminal action wins**. A rule's
-`then` is a list of actions (or a single action shorthand). Non-terminal
-actions (`set_header`, `tag`, `log`, `call`, …) take effect and evaluation
-continues to the next rule. When the chain is exhausted with no terminal
-action, the request is **denied** (`default-deny`, rule id `_default`).
-The default differs by phase: `request` → deny; `connect` → allow-to-inspect
-(§4.3); `response` → allow, because the request was already allowed and the
-upstream is trusted (§2), so an empty response chain must not block every
-response; `ws` → **deny**, because inspected messages are workload-originated
-and opting into inspection means writing the allow rules. `terminal_rule` is
-`_default` in every case.
+#### How rules are evaluated
+
+An exchange is a set of values that become known over time: the request
+head, request body bytes as they stream, the response head, response body
+bytes, WebSocket messages, and metric values that this exchange adds to.
+Rules are **one ordered list** of conditions over those values. There are no
+phases; when a rule runs follows from what it reads.
+
+1. **The forwarding decision is made at the request head.** roxy goes through
+   the rules top to bottom, considering those whose values are known at that
+   point. The first terminal action (`allow` or `deny`) wins. If none
+   matches, the request is **denied** (rule id `_default`). A rule that reads
+   a value not yet known is skipped here, not treated as false.
+2. **After that, rules watch.** For the rest of the exchange, two kinds of
+   rule are re-checked whenever a value they read becomes known or changes:
+   rules that read a value known only after forwarding (the *watched*
+   fields in §6.2), and `deny` rules that read a metric this exchange adds
+   to. If a deny matches, roxy stops the exchange: an error response if the
+   response has not started, otherwise the connection (or HTTP/2 stream, or
+   WebSocket) is closed. When several rules become decidable at the same
+   moment, they are checked top to bottom and the first deny wins.
+3. **Only rules decided at the request head can `allow`.** A rule that reads
+   a value known only after forwarding (the table in §6.2) cannot allow, and
+   cannot change the request (`set_header` on the request, `rewrite_path`,
+   `redirect`, ...): both are compile errors, because the request is already
+   on its way. It can deny, and it can add effects that still make sense:
+   `log`, `tag`, `set_state`, and header changes on a response that has not
+   yet been sent to the client.
+4. **Non-terminal effects of a watching rule apply once**, the first time it
+   matches.
+5. **Order matters only among rules decided at the same moment.** A deny
+   rule on `body.bytes` listed above a head-time `allow` still stops the
+   upload when the bytes cross its limit.
+
+A rule's `then` is a list of actions (or a single action). Non-terminal
+actions (`set_header`, `tag`, `log`, ...) take effect and evaluation
+continues; the first terminal action ends it. `roxy check` and
+`roxy rule test` report, for each rule, whether it is decided at the request
+head or watches later values.
 
 **Unavailable inputs fail closed.** If evaluating a rule needs a metric value
 or an address-list lookup and the store reports it unavailable (overloaded,
@@ -594,8 +618,11 @@ like an unsent header, is `null`; see §6.2.)
 reconnect cheaply; a probing client loses its warm connection on every
 attempt and cannot pipeline past a refusal.
 
-Each rule has a `phase` (`connect`, `request` (default), `response`, `ws`). The
-compiler rejects a rule that references a field unavailable in its phase.
+There is no `phase` key; a config that sets one is rejected with a pointer
+to this section. There are no connect-time rules: a CONNECT is always
+accepted for inspection (subject to the listener's auth and the SNI check),
+and every decision is made on the request inside it. Connect-time rules
+return with transparent mode, where `passthrough` needs them (§4.2).
 
 ### 6.2 Expression DSL
 
@@ -627,24 +654,28 @@ bare_ident  := [A-Z][A-Z_]*                          ; HTTP method names only
 Strings are double-quoted with `\"` and `\\` escapes. Comments `# ...` are
 allowed inside multi-line YAML block scalars.
 
-Fields by phase (type in brackets):
+Fields. *Head* fields are known when the forwarding decision is made;
+*watched* fields become known later, so rules that read them watch (§6.1).
 
-| field | type | connect | request | response | ws |
-|---|---|---|---|---|---|
-| `client.ip`, `client.port`, `client.user` | ip, int, string | ✓ | ✓ | ✓ | ✓ |
-| `listener.name`, `listener.mode` | string | ✓ | ✓ | ✓ | ✓ |
-| `dst.host`, `dst.port`, `dst.ip` | string, int, ip | ✓ | | | |
-| `tls.sni`, `tls.alpn`, `tls.version` | string | ✓ | ✓ | ✓ | ✓ |
-| `method`, `scheme`, `host`, `port`, `path`, `url` | string/int | | ✓ | ✓ | ✓ |
-| `query["k"]`, `query.raw` | string | | ✓ | ✓ | ✓ |
-| `header["name"]` | string (first value; `header.all["name"]` → list) | | ✓ | ✓ | |
-| `body.size`, `body.text` (rule-gated buffering, see below) | int, string | | ✓ | ✓ | |
-| `response.status`, `response.header["name"]`, `response.body.*` | | | | ✓ | |
-| `ws.direction` (`c2s`/`s2c`), `ws.opcode`, `ws.size`, `ws.text` | | | | | ✓ |
-| `metric.<id>` | int | ✓ | ✓ | ✓ | ✓ |
-| `@<list>` (literal, not a field) | address list, usable on the right of `in` / `not in` with any ip-typed field | ✓ | ✓ | ✓ | ✓ |
-| `state["key"]` | string (set by `set_state`) | ✓ | ✓ | ✓ | ✓ |
-| `tag["name"]` | bool (set by `tag` earlier in the chain) | ✓ | ✓ | ✓ | ✓ |
+| field | type | known |
+|---|---|---|
+| `client.ip`, `client.port`, `client.user` | ip, int, string | head |
+| `listener.name`, `listener.mode` | string | head |
+| `tls.sni`, `tls.alpn`, `tls.version` | string | head |
+| `method`, `scheme`, `host`, `port`, `path`, `url` | string / int | head |
+| `query["k"]`, `query.raw` | string | head |
+| `header["name"]`, `header.all["name"]` | string, list | head |
+| `body.size` | int: declared length, `null` if undeclared (chunked) | head |
+| `body.text` | string; roxy buffers the body (up to the cap) before forwarding | head |
+| `metric.<id>` | int | head, and watched as this exchange adds to it |
+| `state["key"]`, `tag["name"]` | string, bool | head |
+| `body.bytes` | int: request body bytes so far | watched |
+| `response.status`, `response.header["name"]`, `response.header.all["name"]` | int, string, list | watched |
+| `response.body.size` | int: declared length, `null` if undeclared | watched |
+| `response.body.text` | string; roxy buffers the response body before sending it on | watched |
+| `response.body.bytes` | int: response body bytes so far | watched |
+| `ws.direction` (`c2s`/`s2c`), `ws.opcode`, `ws.size`, `ws.text` | string, string, int, string; per message | watched |
+| `@<list>` (literal, not a field) | address list, on the right of `in` / `not in` with an ip field | — |
 
 Type checking at compile time: `host under 443` is a config error, as is a
 regex that fails to compile, a CIDR with a bad mask, or a `metric.foo` with no
@@ -652,9 +683,8 @@ such metric. `in` accepts a list of the operand's type, or a CIDR for ips.
 
 **Missing values (`null`).** A value that is not present is `null`: an
 unsent header or query parameter, an unset state key, `client.user` without
-proxy auth, `tls.sni` from a client that sent none, `dst.ip` for a hostname
-target, `body.size` for a body of undeclared length. One rule covers all of
-them:
+proxy auth, `tls.sni` from a client that sent none, `body.size` for a body
+of undeclared length. One rule covers all of them:
 
 > `null` is equal only to `null`, so `==`, `!=`, `in` and `not in` treat it
 > as an ordinary value. Any other operator applied to `null` is an error,
@@ -696,21 +726,21 @@ predicates never buffer and stream end-to-end.
 
 Terminal:
 
-| action | phases | effect |
+| action | where | effect |
 |---|---|---|
-| `allow` | all | proceed. `allow: { upgrade: websocket }` additionally permits the Upgrade as a byte relay (§8.1); `allow: { upgrade: websocket, inspect: true }` routes messages through the `ws` phase (§8.2). |
-| `deny` | all | `deny: { status: 403, message: "…" }`. In `ws` phase drops the message; `deny: { close: true }` closes the socket. |
-| `passthrough` | connect (transparent only, deferred) | relay bytes to `dst.ip:dst.port` uninspected. Logged. Compiler rejects it until a transparent listener exists. |
+| `allow` | head rules only | forward. `allow: { upgrade: websocket }` also permits the upgrade (§8). |
+| `deny` | all rules | `deny: { status: 403, message: "…" }`. At the head: refuse. Watching: stop the exchange (error response if the response has not started, else close). On a WebSocket: close with `1008`. |
+| `passthrough` | connect-time rules (transparent mode, deferred) | relay bytes to `dst.ip:dst.port` uninspected. Logged. Compiler rejects it until a transparent listener exists. |
 
 Non-terminal (evaluation continues):
 
-| action | phases | effect |
+| action | where | effect |
 |---|---|---|
-| `set_header: { name: value }` | request, response | set/replace. Values may reference `${secret:name}` (request phase only). Validated as header values; invalid → flow denied. |
+| `set_header: { name: value }` | request: head rules; response: rules that read response values | set/replace. Values may reference `${secret:name}` (request headers only). Validated as header values; invalid → flow denied. |
 | `remove_header: [names]` | request, response | |
 | `rewrite_path: { match: regex, to: replacement }` | request | `$1` groups; result re-normalised per §5.4 |
 | `set_query: {k: v}` / `remove_query: [k]` | request | |
-| `redirect: { host, port, scheme? }` | request | change the upstream target. Re-runs the connect-phase policy against the new target. `Host` header is unchanged unless `rewrite_host: true`. |
+| `redirect: { host, port, scheme? }` | head rules | change the upstream target; the address floor and deny lists check the new target's IPs. `Host` header is unchanged unless `rewrite_host: true`. |
 | `tag: name` | all | sets `tag["name"]` for later rules, addons and the log |
 | `log: { level, message }` | all | emits an extra log event |
 | `set_state: { key, value, ttl }` | all | writes to the state store (visible as `state["key"]`) |
@@ -747,7 +777,7 @@ operator, threshold, action" model with the metric defined once and reused.
 metrics:
   - id: <string>
     count: requests | request_bytes | response_bytes | errors | denied | unique(<field>)
-    where: <expr>                 # evaluated in the phase where the counted thing is known
+    where: <expr>                 # head fields only; decides whether this exchange counts
     key: [<field>, ...]           # optional; omitted = one global series
     window: <duration>            # optional; omitted = cumulative since start
 ```
@@ -759,9 +789,11 @@ windows (window / 60 buckets, so a 1-minute window has 1-second resolution).
 new key is denied** (`_fail_closed`, event `metric_table_full`) rather than
 evicting an existing key: eviction would let an attacker reset their own
 counter by varying the key. Keys are reclaimed only when their window has
-fully expired. Metric values are incremented *after* a flow's decision in
-that phase (denied flows count too, so probing is not free), and read
-*before*, so a rule `metric.x >= 30` denies the 31st request.
+fully expired. `requests` and `denied` are incremented after the
+forwarding decision (denied flows count too, so probing is not free), and
+read before it, so a rule `metric.x >= 30` denies the 31st request.
+`request_bytes` and `response_bytes` are added as bytes stream, so a deny
+rule reading them watches and can stop the exchange that crosses the limit.
 
 `state` is a bounded TTL key/value map shared by rules and addons (`set_state`
 action, `state.get/set` host calls). Both metrics and state live behind a
@@ -849,7 +881,7 @@ upstream:
   the whole flow is denied (an attacker-controlled name must not get a second
   roll of the dice).
 - **In the DSL:** `@name` is an address-list literal usable wherever a CIDR
-  is: `client.ip in @internal`, `dst.ip != null and dst.ip in @blocked`. Referencing an
+  is: `client.ip in @internal`, `client.ip not in @blocked`. Referencing an
   undefined list is a compile error. This lets the same lists gate client
   identity in gateway mode or be combined with other predicates in rules,
   while `upstream.deny_lists` stays the unconditional floor.
@@ -869,35 +901,39 @@ upstream:
 
 ## 8. WebSockets
 
-An Upgrade is only honoured when a request-phase rule terminates with
+An Upgrade is only honoured when the rule that allows the request says
 `allow: { upgrade: websocket }`. Plain `allow` strips `Upgrade`/`Connection:
 upgrade` and forwards an ordinary request (fail closed on the upgrade).
 
-Two tiers, chosen per rule. The default is the one that is invisible to a
-well-behaved client.
+### 8.1 Relay
 
-### 8.1 Relay tier (default, M1)
+`allow: { upgrade: websocket }` at the request head. roxy forwards the upgrade
+request to the upstream (after the usual header canonicalisation;
+`Sec-WebSocket-*` headers and the client's extension offer pass through
+untouched), checks that the upstream answered `101` with a correct
+`Sec-WebSocket-Accept`, relays the `101` to the client, and then **splices
+bytes in both directions** until either side closes. No frame parsing, no
+re-masking, no reassembly. `permessage-deflate` and subprotocols work exactly
+as negotiated end to end. Relayed bytes count towards `request_bytes` and
+`response_bytes` as they flow, so a byte-budget rule closes a WebSocket
+mid-stream. The flow log gets one `ws_open` and one `ws_close` event with
+byte counts.
 
-`allow: { upgrade: websocket }`. roxy forwards the upgrade request to the
-upstream (after the usual header canonicalisation; `Sec-WebSocket-*` headers
-and the client's extension offer pass through untouched), checks that the
-upstream answered `101` with a correct `Sec-WebSocket-Accept`, relays the
-`101` to the client, and then **splices bytes in both directions** until
-either side closes. No frame parsing, no re-masking, no reassembly.
-`permessage-deflate` and subprotocols work exactly as negotiated end to end.
-The only limits are the connection idle timeout and the per-client connection
-cap. The flow log gets one `ws_open` and one `ws_close` event with byte counts.
+### 8.2 Message rules (not in this build)
 
-This is a plain TCP pipe inside an already-authorised, already-decrypted
-flow, so it costs nothing in M1 and is what most operators should use.
+After the `101`, messages are values that keep arriving: each brings
+`ws.direction`, `ws.opcode`, `ws.size` and `ws.text`. Rules that read them
+watch (§6.1) and are checked on every message. **`deny` closes the
+WebSocket** with close code `1008` (policy violation) to both sides; there is
+no per-message drop in the rule language, because silently dropping a
+message corrupts most applications' protocol state (per-message editing is
+for addons, via the `tunnel` export, §11). An allowlist is written as a deny
+of everything else, e.g. `when: ws.opcode != "text"` → `deny`.
 
-### 8.2 Inspect tier (M3)
-
-`allow: { upgrade: websocket, inspect: true }`. Needed only when there are
-`ws`-phase rules or addons that must see message content. roxy removes
-extensions from the offer (compressed frames cannot be inspected), validates
-the `101` (no extensions, subprotocol ⊆ offered), and relays through a frame
-codec:
+Message parsing is inferred: if any rule reads `ws.*` fields, WebSockets are
+relayed through a frame codec (and compression extensions are stripped from
+the offer, so messages stay readable); otherwise bytes are relayed
+untouched. The codec:
 
 - RSV bits must be zero; unknown opcodes → close `1002`.
 - Client→server frames must be masked; server→client must not be.
@@ -908,11 +944,8 @@ codec:
 - Text frames must be valid UTF-8 → else close `1007`.
 - Re-masking with roxy's own random mask on the way to the server.
 
-The `ws` phase runs per message with `ws.direction`, `ws.opcode`, `ws.size`,
-`ws.text`. Actions: `allow`, `deny` (drop the message or close), `tag`,
-`log`, `call`. Addons get `on-ws-message`. The compiler emits a config error
-if a `ws`-phase rule or a `ws` addon hook exists but no rule enables
-`inspect: true`, since it could never fire.
+Until the codec is built, `roxy run` refuses a policy whose rules read
+`ws.*` (`roxy check` accepts it).
 
 HTTP/2 clients: `CONNECT :protocol=websocket` (RFC 8441) is not supported
 initially; clients fall back to HTTP/1.1 for the WebSocket connection, which
@@ -1017,7 +1050,7 @@ the request is the last to see the response.
 
 ```
                  request ↓                                   ↑ response
- fixed   ┌─ connect gate (connect-phase rules, CONNECT/SNI) ─────────────┐
+ fixed   ┌─ CONNECT gate (proxy auth, SNI must match) ───────────────────┐
  fixed   ├─ quarantine gate (§11.3 terminate)                            │
  config  ├─ addon: sentinel        (wasm | service, enforce | observe)    │
  config  ├─ addon: redactor                                              │
@@ -1503,7 +1536,7 @@ be built by separate agents in parallel because `roxy-http`, `roxy-tls` and
 | M0 | Workspace, CI, config schema + `roxy check`, CA generation + `roxy ca export`, tracing + FlowSink skeleton | — |
 | M1 | **Usable MVP in explicit mode.** Strict h1 codec + canonical model + normaliser (`roxy-http`); leaf minting + rustls configs + ClientHello sniffer (`roxy-tls`); DSL + stateless rules + actions `allow/deny/set_header/remove_header/tag/log` (`roxy-rules`); then `roxy-proxy` wiring: CONNECT → MITM → request phase → hyper upstream (h1/h2 by ALPN) → response phase → JSONL log. WebSocket relay tier. Secrets + `${secret:}` injection. Default deny. Smuggling corpus passing. Then E: client-side HTTP/2 via `h2` with the shared validator. | A: `roxy-http`, B: `roxy-tls`, C: `roxy-rules`, then D: `roxy-proxy`, then E: h2 |
 | M2 | Metrics + state store, response-phase rules, `redirect`, `rewrite_path`, query actions, hot reload, `roxy rule test`, address policy + denylists (§7.1) with `@list` DSL literals, proxy auth, `roxy.internal` CA endpoint | metrics (A) ∥ reload+CLI (B) ∥ connector policy + lists (C) |
-| M3 | WebSocket inspect tier (frame codec, `ws` phase); RFC 8441 WebSocket-over-h2 if wanted | — |
+| M3 | WebSocket message rules (frame codec, §8.2); RFC 8441 WebSocket-over-h2 if wanted | — |
 | M4 | WASM host (`roxy-wasm`), WIT package, `roxy-addon` SDK, example Rust + Python addons, capability/fuel/timeout enforcement | host (A) ∥ SDK+examples (B) |
 | M5 | Hardening: fuzz CI, limits audit, body capture, Prometheus endpoint, file log rotation | independent items |
 | Later | Transparent mode (§4.2): `TransparentListener` with REDIRECT + `SO_ORIGINAL_DST`, classification, rule-gated passthrough, nftables docs, netns integration test; TPROXY | — |
@@ -1520,7 +1553,7 @@ be built by separate agents in parallel because `roxy-http`, `roxy-tls` and
 | 4 | Deny response body includes rule id and flow id (§5.7) | yes, informative 403 by default |
 | 5 | Size units 1024-based (§6.2) | yes |
 | 6 | Licence and crate name on crates.io | MIT OR Apache-2.0; `roxy` availability to be checked |
-| 7 | Connect-phase default when no rule matches: allow-to-inspect (§4.3) | as stated |
+| 7 | No connect-time rules in explicit mode; one rule list, decided at the request head, deny rules watch later values (§6.1) | as stated |
 | 8 | Client-side h2 in M1 (§5.1a) | agreed: M1 unit E |
 
 Resolved since the first draft: upstreams are trusted, so the upstream codec
@@ -1533,7 +1566,7 @@ opt-in (§8); transparent mode is deferred with hooks reserved (§4.2).
 
 - **Flow**: one request/response exchange (or one WebSocket session) within a
   client connection. Has a ULID.
-- **Phase**: `connect`, `request`, `response`, `ws`. Each has its own rule chain.
+- **Head rule / watching rule**: a rule decided at the request head (can allow or deny) versus one that reads values known only later (can only deny or add effects) (§6.1).
 - **Canonical**: roxy's validated, normalised, version-agnostic HTTP model.
 - **Policy**: a compiled, immutable snapshot of config (rules, metrics,
   addons) swapped atomically on reload.
