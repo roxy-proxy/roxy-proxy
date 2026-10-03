@@ -5,3 +5,5 @@
 .DS_Store
 /crates/roxy-wasm/test-components/target
 /examples/addons/target
+__pycache__/
+.venv/
