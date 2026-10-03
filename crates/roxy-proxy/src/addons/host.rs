@@ -1,4 +1,4 @@
-//! The [`LayerHost`] each layer of an exchange talks to (§11.3).
+//! The [`LayerHost`] each layer of an exchange talks to (docs/addons.md#host-services).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +17,7 @@ pub(crate) struct StackHost {
     pub(crate) st: Arc<StackFlow>,
     pub(crate) index: usize,
     /// Observe mode: effects other than records are not taken, and `next`
-    /// returns the copy of the real response (§11.1).
+    /// returns the copy of the real response (docs/addons.md#layer-stack).
     pub(crate) observer: Option<super::tee::ObserverNext>,
 }
 

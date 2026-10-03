@@ -1,4 +1,4 @@
-//! Address lists (DESIGN.md §7.1): build 1M random IPv4 CIDRs + 100k IPv6
+//! Address lists (docs/upstream.md#address-lists): build 1M random IPv4 CIDRs + 100k IPv6
 //! CIDRs, report the table size, and time lookups (hit and miss, v4 and v6,
 //! and an IPv4-mapped v6 address that needs normalising).
 

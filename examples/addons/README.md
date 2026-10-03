@@ -1,7 +1,7 @@
 # Example roxy addons
 
 Addons are layers that sit above roxy's rules in each exchange
-(DESIGN.md §11). Whatever an addon passes on is still judged by the rules,
+([docs/addons.md](../../docs/addons.md)). Whatever an addon passes on is still judged by the rules,
 and any failure denies the flow.
 
 | example | kind | what it shows |
@@ -9,7 +9,6 @@ and any failure denies the flow.
 | [`redact`](redact) | wasm (Rust, [`roxy-addon`](../../crates/roxy-addon)) | Rewriting both bodies chunk by chunk as they stream, holding back only the bytes a match could straddle. |
 | [`service`](service) | service (Python) | `roxy_layer.py`, the service side of `roxy.layer.v1`, and a streaming pass-through layer. |
 | [`service/sentinel`](service/sentinel) | service (Python sidecar) | [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) monitors and protocols judging model API traffic at the network boundary. The sidecar implements its `Host` and `Recorder`. |
-| `inspect-sentinel-wasm` (future) | wasm (CPython component) | The same sentinel compiled into a component, once inspect_sentinel has an embedded build. The host side is ready: raise `max_memory` and `max_exchange_time` for an embedded interpreter. |
 
 ## Building
 

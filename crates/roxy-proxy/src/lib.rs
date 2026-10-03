@@ -1,4 +1,4 @@
-//! roxy's proxy engine (`DESIGN.md` §3): listeners, the connection state
+//! roxy's proxy engine (docs/architecture.md): listeners, the connection state
 //! machine, the flow pipeline, the upstream connector (DNS, SSRF policy,
 //! pool), the WebSocket relay and flow-log emission.
 //!
@@ -6,7 +6,7 @@
 //!
 //! - [`server`]: [`Server`] (`start`, `local_addrs`, `reload`, `shutdown`),
 //!   connection caps, the atomically swapped policy snapshot.
-//! - [`listener`]: the [`Listener`] trait (§4.2 hook) and
+//! - [`listener`]: the [`Listener`] trait (the hook for transparent mode, issue #15) and
 //!   [`ExplicitListener`]; [`ClientConn`].
 //! - `conn`: the explicit-mode state machine (proxy port, CONNECT, sniff,
 //!   TLS termination, tunnels, `roxy.internal`, proxy auth).

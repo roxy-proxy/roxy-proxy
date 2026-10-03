@@ -1,4 +1,4 @@
-//! The flow pipeline as stream stages (`DESIGN.md` §3).
+//! The flow pipeline as stream stages (docs/architecture.md).
 //!
 //! A request passes through the [`RequestStage`]s in order, each receiving
 //! the request head plus its (still streaming) body and returning a
@@ -133,7 +133,7 @@ impl Refusal {
         }
     }
 
-    /// The §5.7 response.
+    /// The deny response (docs/http.md#deny-responses).
     pub(crate) fn response(&self, flow: &Ulid) -> CanonicalResponse {
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::FORBIDDEN);
         let body = match (&self.rule, self.kind) {
@@ -303,7 +303,7 @@ pub(crate) struct FlowRecord {
     pub ttfb_ms: Option<u64>,
     /// Where the terminal decision was made.
     pub stage: Option<Stage>,
-    /// The addons the exchange went through (§11.1).
+    /// The addons the exchange went through (docs/addons.md#layer-stack).
     pub addons: Vec<String>,
 }
 
@@ -318,7 +318,7 @@ pub(crate) struct FlowCx {
     pub started: Instant,
     /// The watching rules of this exchange, once it is forwarded.
     pub watch: Option<Arc<Watch>>,
-    /// Capture this exchange's request / response (§10.2): set by a
+    /// Capture this exchange's request / response (docs/flow-log.md#capture): set by a
     /// `capture` effect at the head, or for every exchange with
     /// `log.capture.all`.
     pub capture: (bool, bool),
@@ -360,7 +360,7 @@ fn ms(d: std::time::Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Query for the log: keys kept, values redacted (§10.1).
+/// Query for the log: keys kept, values redacted (docs/flow-log.md#redaction).
 fn redact_query(q: &Query) -> String {
     q.as_str()
         .split('&')
@@ -437,7 +437,7 @@ impl FlowCx {
         }
     }
 
-    /// The head decision (§6.1), and the exchange's head metric sample.
+    /// The head decision (docs/rules.md#evaluation), and the exchange's head metric sample.
     /// Returns the outcome plus a refusal when the decision (or recording)
     /// must deny.
     fn evaluate_head(&mut self) -> (Outcome, Option<Refusal>) {
@@ -757,7 +757,7 @@ pub(crate) fn body_failure(e: &BodyError) -> ParseError {
 // Built-in request stages
 // ---------------------------------------------------------------------------
 
-/// Bounded buffering in front of body-inspecting rules (§6.2).
+/// Bounded buffering in front of body-inspecting rules (docs/rules.md#body-access).
 struct InspectRequestBody;
 
 impl RequestStage for InspectRequestBody {
@@ -795,7 +795,7 @@ impl RequestStage for InspectRequestBody {
     }
 }
 
-/// The head decision (§6.1) and its effects.
+/// The head decision (docs/rules.md#evaluation) and its effects.
 struct RequestRules;
 
 impl RequestStage for RequestRules {
@@ -845,7 +845,7 @@ fn invalid(what: &str, e: &dyn std::fmt::Display) -> Refusal {
     Refusal::fail_closed("effect_invalid")
 }
 
-/// Sets or removes `key` in a query, rebuilding it through the §5.4
+/// Sets or removes `key` in a query, rebuilding it through the docs/http.md#url-normalisation
 /// normaliser. Other pairs keep their raw form and order.
 fn edit_query(
     q: Option<&Query>,
@@ -901,7 +901,7 @@ fn rules_scheme(s: roxy_rules::Scheme) -> Scheme {
     }
 }
 
-/// Applies one effect of the head decision (§6.3). Any failure denies the
+/// Applies one effect of the head decision (docs/rules.md#actions). Any failure denies the
 /// flow.
 fn apply_request_effect(
     cx: &mut FlowCx,
@@ -954,7 +954,7 @@ fn apply_request_effect(
             if let Some(s) = scheme {
                 req.scheme = rules_scheme(s);
             }
-            // §6.3: the address floor and deny lists check the new target's
+            // docs/rules.md#actions: the address floor and deny lists check the new target's
             // addresses when the upstream connects.
             cx.record
                 .mutations
@@ -1040,7 +1040,7 @@ impl ResponseStage for InspectResponseBody {
     }
 }
 
-/// The watching rules at the response head (§6.1): they may stop the
+/// The watching rules at the response head (docs/rules.md#evaluation): they may stop the
 /// exchange (answered with an error response, since nothing has been sent
 /// yet) or change the response head.
 struct ResponseRules;

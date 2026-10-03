@@ -1,7 +1,7 @@
 """inspect_sentinel at the network boundary: a roxy service layer.
 
-Every exchange streams through this sidecar (roxy.layer.v1, DESIGN.md
-§11.6). For a model API call (Anthropic Messages or OpenAI Chat
+Every exchange streams through this sidecar (roxy.layer.v1,
+docs/addons.md#service-layers). For a model API call (Anthropic Messages or OpenAI Chat
 Completions) it forwards the request, reads the model's response, turns
 each tool call in it into an inspect_sentinel `BeforeToolCall` step, and
 runs the configured sentinel on it before the agent sees the response:

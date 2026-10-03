@@ -1,4 +1,4 @@
-# Content-Length / Transfer-Encoding framing (DESIGN.md §5.3).
+# Content-Length / Transfer-Encoding framing (docs/http.md#rejection-rules).
 # Physical newlines are ignored; \r\n is written explicitly.
 
 === cl_te_classic

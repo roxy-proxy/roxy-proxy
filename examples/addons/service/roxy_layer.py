@@ -1,4 +1,4 @@
-"""The service side of roxy's service layers (`roxy.layer.v1`, DESIGN.md §11.6).
+"""The service side of roxy's service layers (`roxy.layer.v1`, docs/addons.md#service-layers).
 
 roxy opens one WebSocket per exchange. Text frames are JSON control
 messages and binary frames are body bytes of the message whose head came

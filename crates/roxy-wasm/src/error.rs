@@ -1,5 +1,5 @@
-//! Errors. Every [`LayerError`] fails the exchange closed (DESIGN.md §11.1
-//! invariant 3, §12): the caller denies the flow, or closes the connection
+//! Errors. Every [`LayerError`] fails the exchange closed (docs/addons.md#invariants,
+//! invariant 3, docs/limits.md): the caller denies the flow, or closes the connection
 //! if the response head is already out. Nothing here is ever a "pass".
 
 use std::fmt;
@@ -42,7 +42,7 @@ impl fmt::Display for Budget {
 }
 
 /// Why a layer failed an exchange. Every variant fails the exchange closed
-/// (`layer_error`, DESIGN.md §12).
+/// (`layer_error`, docs/limits.md).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum LayerError {
@@ -110,7 +110,7 @@ impl LayerError {
 }
 
 /// Why a layer could not be loaded. A layer that fails to load fails the
-/// config load; roxy keeps its old policy (DESIGN.md §12).
+/// config load; roxy keeps its old policy (docs/limits.md).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LoadError {

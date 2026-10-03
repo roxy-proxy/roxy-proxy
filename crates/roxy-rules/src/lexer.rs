@@ -1,4 +1,4 @@
-//! Hand-written lexer for the expression DSL (§6.2).
+//! Hand-written lexer for the expression DSL (docs/rules.md#expressions).
 //!
 //! Produces the whole token vector up front; the first error aborts.
 
@@ -24,11 +24,11 @@ pub(crate) enum Tok {
     Int(i64, Option<Unit>),
     Ip(IpAddr),
     Cidr(IpNet),
-    /// `@name`: a named address list (§7.1).
+    /// `@name`: a named address list (docs/upstream.md#address-lists).
     ListRef(String),
     True,
     False,
-    /// `null`: the value of anything not present (§6.2).
+    /// `null`: the value of anything not present (docs/rules.md#missing-values-null).
     Null,
     And,
     Or,

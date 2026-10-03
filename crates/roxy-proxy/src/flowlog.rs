@@ -1,4 +1,4 @@
-//! Structured flow log (`DESIGN.md` §10.1).
+//! Structured flow log (docs/flow-log.md).
 //!
 //! Every stage of the pipeline emits [`FlowEvent`]s to a [`FlowSink`]. Events
 //! serialise to one JSON object per line, tagged by an `event` field. Sinks
@@ -24,7 +24,7 @@ use serde::{Serialize, Serializer};
 /// Replacement text for redacted values.
 pub const REDACTED: &str = "[REDACTED]";
 
-/// Header names whose values are never logged (§10.1). `log.redact_headers`
+/// Header names whose values are never logged (docs/flow-log.md#redaction). `log.redact_headers`
 /// extends this set.
 pub const DEFAULT_REDACTED_HEADERS: &[&str] = &[
     "authorization",
@@ -69,7 +69,7 @@ pub enum FlowEvent {
         path: PathBuf,
         diagnostics: Vec<String>,
     },
-    /// A CONNECT (explicit mode). There are no connect-time rules (§4.3):
+    /// A CONNECT (explicit mode). There are no connect-time rules (docs/http.md#connect):
     /// a CONNECT is accepted for inspection unless proxy auth or the SNI
     /// check refuses it. Only emitted when `log.flow.connection_events` is
     /// enabled or the connect was refused.
@@ -111,7 +111,7 @@ pub enum FlowEvent {
         reason: Option<String>,
         /// Where the terminal decision was made: `head` for the forwarding
         /// decision, or the stage at which a watching rule stopped the
-        /// exchange (§6.1). Absent when no decision was reached.
+        /// exchange (docs/rules.md#evaluation). Absent when no decision was reached.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stage: Option<Stage>,
     },
@@ -125,7 +125,7 @@ pub enum FlowEvent {
         reason: String,
         message: String,
     },
-    /// A WebSocket upgrade was relayed (§8.1).
+    /// A WebSocket upgrade was relayed (docs/websockets.md#relay).
     WsOpen {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,
@@ -134,7 +134,7 @@ pub enum FlowEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<String>,
     },
-    /// A relayed WebSocket closed (§8.1).
+    /// A relayed WebSocket closed (docs/websockets.md#relay).
     WsClose {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,
@@ -143,7 +143,7 @@ pub enum FlowEvent {
         bytes_c2s: u64,
         bytes_s2c: u64,
     },
-    /// An inspected WebSocket message (sampled or denied only, §8.2).
+    /// An inspected WebSocket message (sampled or denied only, issue #14).
     WsMessage {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,
@@ -155,7 +155,7 @@ pub enum FlowEvent {
         decision: DecisionKind,
         rules: Vec<String>,
     },
-    /// The client sent something roxy refused to parse (§5.3). `reason` is a
+    /// The client sent something roxy refused to parse (docs/http.md#rejection-rules). `reason` is a
     /// stable code suitable for alerting.
     ParseError {
         #[serde(serialize_with = "ser_ts")]
@@ -167,7 +167,7 @@ pub enum FlowEvent {
         reason: String,
         detail: Option<String>,
     },
-    /// Connecting to or talking to the upstream failed (§7).
+    /// Connecting to or talking to the upstream failed (docs/upstream.md#errors).
     UpstreamError {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,
@@ -178,7 +178,7 @@ pub enum FlowEvent {
         reason: String,
         message: String,
     },
-    /// An addon layer failed (§11.1 invariant 3): a trap, an exceeded
+    /// An addon layer failed (docs/addons.md#invariants, invariant 3): a trap, an exceeded
     /// budget, a missing capability, an invalid request or response. In
     /// enforce mode the flow was denied (or its body cut); in observe mode
     /// nothing else happened.
@@ -195,7 +195,7 @@ pub enum FlowEvent {
         kind: String,
         message: String,
     },
-    /// A structured event an addon recorded (`flow.record`, §11.3).
+    /// A structured event an addon recorded (`flow.record`, docs/addons.md#record).
     LayerRecord {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,
@@ -208,7 +208,7 @@ pub enum FlowEvent {
         /// Also sent to the addon's `audit_endpoint`.
         audit: bool,
     },
-    /// An addon called a named endpoint (§11.3).
+    /// An addon called a named endpoint (docs/addons.md#endpoints).
     EndpointCall {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,
@@ -234,7 +234,7 @@ pub enum FlowEvent {
         direction: String,
     },
     /// The upstream address policy refused every connection for the flow
-    /// (§7, §7.1): a resolved address is private or on a deny list.
+    /// (docs/upstream.md#address-floor): a resolved address is private or on a deny list.
     UpstreamDenied {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,
@@ -248,7 +248,7 @@ pub enum FlowEvent {
         list: Option<String>,
         matched_cidr: Option<String>,
     },
-    /// A new connection was accepted and immediately closed (§12 caps).
+    /// A new connection was accepted and immediately closed (docs/limits.md#connections).
     ConnectionRefused {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,
@@ -258,7 +258,7 @@ pub enum FlowEvent {
         reason: String,
     },
     /// A policy input (metric, address list, secret, body) was unavailable
-    /// and the flow failed closed (§6.1).
+    /// and the flow failed closed (docs/rules.md#evaluation).
     PolicyInputUnavailable {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,
@@ -267,7 +267,7 @@ pub enum FlowEvent {
         stage: Stage,
         reason: String,
     },
-    /// A metric key could not be created because the table is full (§6.4).
+    /// A metric key could not be created because the table is full (docs/rules.md#metrics).
     MetricTableFull {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,
@@ -277,7 +277,7 @@ pub enum FlowEvent {
         detail: String,
     },
     /// A request asked for an Upgrade the matching rule did not grant; it
-    /// was forwarded as a plain request (§8).
+    /// was forwarded as a plain request (docs/websockets.md).
     UpgradeStripped {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,
@@ -360,7 +360,7 @@ pub struct Timing {
     pub upstream_ttfb_ms: Option<u64>,
 }
 
-/// Where in an exchange a decision was made (§6.1): the forwarding
+/// Where in an exchange a decision was made (docs/rules.md#evaluation): the forwarding
 /// decision at the request head, or the point at which a watching rule
 /// stopped the exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -421,7 +421,7 @@ fn ser_ts<S: Serializer>(ts: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
 
 /// Destination for flow events. `emit` must not panic and must not block on
 /// I/O. A sink that writes somewhere slow buffers and exerts backpressure
-/// through [`FlowSink::poll_ready`] instead of dropping events (§10.1).
+/// through [`FlowSink::poll_ready`] instead of dropping events (docs/flow-log.md#writing).
 pub trait FlowSink: Send + Sync {
     fn emit(&self, event: &FlowEvent);
 
@@ -497,7 +497,7 @@ impl<W: Write + Send> FlowSink for WriterSink<W> {
 }
 
 /// JSON lines through a [`LogWriter`]: one writer thread, batched writes,
-/// backpressure (§10.1).
+/// backpressure (docs/flow-log.md#writing).
 #[derive(Debug)]
 pub struct BufferedSink {
     writer: LogWriter,
@@ -546,7 +546,7 @@ impl FlowSink for BufferedSink {
     }
 }
 
-/// Writes JSON lines to the process's stdout, buffered (§10.1).
+/// Writes JSON lines to the process's stdout, buffered (docs/flow-log.md).
 #[derive(Debug)]
 pub struct StdoutSink(BufferedSink);
 
@@ -575,7 +575,7 @@ impl FlowSink for StdoutSink {
 }
 
 /// Appends JSON lines to a file, buffered, with optional size-based
-/// rotation (§10.1).
+/// rotation (docs/flow-log.md#writing).
 #[derive(Debug)]
 pub struct FileSink {
     path: PathBuf,

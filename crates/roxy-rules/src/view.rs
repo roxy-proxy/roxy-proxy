@@ -20,7 +20,7 @@ pub enum Value<'a> {
     /// `null`: not present for this flow (no proxy auth, unsent header,
     /// undeclared body length, …). Equal only to `null` under `==`, `!=`,
     /// `in`, `not in`; any other operator on it fails the flow closed
-    /// (§6.2).
+    /// (docs/rules.md#missing-values-null).
     Absent,
 }
 
@@ -81,13 +81,13 @@ pub trait FlowView {
     fn metric(&self, id: &str) -> Option<i64>;
     /// A state-store entry.
     fn state(&self, key: &str) -> Option<Cow<'_, str>>;
-    /// The buffered request body as text (§6.2). Only called when a rule
+    /// The buffered request body as text (docs/rules.md#body-access). Only called when a rule
     /// reaches a `body.text` predicate. `TooLarge` and `Unavailable` both
     /// fail the flow closed; an empty body is `Available("")`.
     fn body_text(&self) -> BodyText<'_>;
     /// The buffered response body as text; same contract.
     fn response_body_text(&self) -> BodyText<'_>;
-    /// Whether `ip` is in the named address list (`ip in @list`, §7.1).
+    /// Whether `ip` is in the named address list (`ip in @list`, docs/upstream.md#address-lists).
     /// `None` = list unavailable (not loaded), which fails the flow closed
     /// (503, `_fail_closed`). `ip` is canonical (IPv4-mapped IPv6
     /// addresses arrive as IPv4).

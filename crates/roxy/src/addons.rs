@@ -1,4 +1,4 @@
-//! Loading `addons:` (DESIGN.md §11.2) into ready-to-run layers.
+//! Loading `addons:` (docs/addons.md#configuration) into ready-to-run layers.
 //!
 //! WASM components are compiled once per config load and cached across
 //! reloads while their file and settings are unchanged, so an unrelated

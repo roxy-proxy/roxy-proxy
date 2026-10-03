@@ -1,4 +1,4 @@
-//! Client-side HTTP/2 inside a TLS tunnel (`DESIGN.md` §5.1a, §5.3).
+//! Client-side HTTP/2 inside a TLS tunnel (docs/http.md#http2, docs/http.md#rejection-rules).
 //!
 //! When the client negotiates ALPN `h2`, the tunnel is served by the `h2`
 //! crate's server instead of the h1 codec. Each stream is mapped with
@@ -16,7 +16,7 @@
 //!   request is dropped mid-body, so a truncated body is never presented
 //!   as complete.
 //! - A deny writes roxy's deny response on that stream. When the decision
-//!   closes (the default, §6.1), the connection then sends `GOAWAY`, refuses
+//!   closes (the default, docs/rules.md#evaluation), the connection then sends `GOAWAY`, refuses
 //!   every stream it has not started (`REFUSED_STREAM`), lets in-flight
 //!   streams finish for at most [`CLOSE_GRACE`], and closes.
 //! - Connection-level protocol errors close the connection (the `h2` crate
@@ -264,7 +264,7 @@ async fn serve_stream(
             if let Err(e) = write_response(&mut respond, res, &out).await {
                 tracing::debug!(error = %e, "writing h2 refusal failed");
             }
-            // §6.1: a deny closes the connection (GOAWAY once written).
+            // docs/rules.md#evaluation: a deny closes the connection (GOAWAY once written).
             // Upstream failures are not decisions about the client and
             // leave the other streams alone.
             if refusal.kind == RefusalKind::Deny && refusal.close {
@@ -306,7 +306,7 @@ async fn send_upstream_response(
     cx.record.response_status = Some(res.status.as_u16());
     cx.record.response_headers_bytes = res.headers.wire_len() as u64;
     let r = write_response(respond, res, out).await;
-    // §6.1: a watching stop mid-body resets the stream (`CANCEL`, sent by
+    // docs/rules.md#evaluation: a watching stop mid-body resets the stream (`CANCEL`, sent by
     // `write_response`), and a closing deny also ends the connection
     // (`GOAWAY`).
     let stop = cx.watch.as_ref().and_then(|w| w.stopped());
@@ -370,7 +370,7 @@ async fn write_response(
 
 /// Why a response body could not be streamed.
 enum BodyFailure {
-    /// A watching rule stopped the exchange (§6.1).
+    /// A watching rule stopped the exchange (docs/rules.md#evaluation).
     Stopped,
     Other(String),
 }

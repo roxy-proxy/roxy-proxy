@@ -7,7 +7,7 @@ workflows:
 - **`release.yml`** builds the binaries, checks them and publishes a GitHub
   release with generated notes.
 - **`image.yml`** publishes `ghcr.io/roxy-proxy/roxy:vX.Y.Z`, `:X.Y` and
-  `:latest` (README, "Container image").
+  `:latest` (docs/deployment.md, "Container image").
 
 ## Steps
 

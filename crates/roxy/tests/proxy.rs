@@ -351,7 +351,7 @@ async fn keep_alive_and_pipelining() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-/// There are no connect-time rules (§4.3): a CONNECT is accepted for
+/// There are no connect-time rules (docs/http.md#connect): a CONNECT is accepted for
 /// inspection and the request inside it is decided.
 async fn connect_is_accepted_and_the_request_inside_decided() {
     let h = Harness::start(&format!(
@@ -979,7 +979,7 @@ const HITS_METRIC: &str = r#"metrics:
 "#;
 
 /// The built-in metric store enforces a rate limit end to end, and an
-/// unrelated config edit (hot reload) does not reset the counter (§6.5).
+/// unrelated config edit (hot reload) does not reset the counter (docs/rules.md#reload).
 #[tokio::test(flavor = "multi_thread")]
 async fn builtin_metric_store_rate_limits_and_survives_reload() {
     let h = Harness::start_with(Opts {
@@ -1017,7 +1017,7 @@ async fn builtin_metric_store_rate_limits_and_survives_reload() {
 }
 
 /// A full metric key table denies flows that need a new key instead of
-/// evicting existing ones (§6.4).
+/// evicting existing ones (docs/rules.md#metrics).
 #[tokio::test(flavor = "multi_thread")]
 async fn full_metric_table_denies_new_keys() {
     let h = Harness::start_with(Opts {
@@ -1054,7 +1054,7 @@ async fn full_metric_table_denies_new_keys() {
 /// `limits.max_metric_bytes` is enforced like the key cap: with a budget
 /// too small for even one series, the first flow that needs a new key is
 /// denied (`_fail_closed`, `metric_table_full`), never served by evicting
-/// (§6.4, §12).
+/// (docs/rules.md#metrics, docs/limits.md).
 #[tokio::test(flavor = "multi_thread")]
 async fn tiny_metric_byte_budget_denies_new_keys() {
     let h = Harness::start_with(Opts {
@@ -1085,7 +1085,7 @@ async fn tiny_metric_byte_budget_denies_new_keys() {
     h.stop().await;
 }
 
-// ----- address lists (§7.1) --------------------------------------------------
+// ----- address lists (docs/upstream.md#address-lists) ----------------------
 
 /// `upstream.deny_lists` is a hard floor: a hit denies with `403
 /// _address_policy` and an `upstream_denied` event naming the list, and
@@ -1243,7 +1243,7 @@ async fn deny_list_file_reload_flips_allow_to_deny_and_keeps_old_lists_on_failur
 }
 
 // ---------------------------------------------------------------------------
-// Client-side HTTP/2 (§5.1a, §5.3)
+// Client-side HTTP/2 (docs/http.md#http2, docs/http.md#rejection-rules)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1524,7 +1524,7 @@ async fn h1_only_client_works_with_h2_enabled() {
     h.stop().await;
 }
 
-// ----- watching rules (§6.1) -------------------------------------------------
+// ----- watching rules (docs/rules.md#evaluation) ---------------------------
 
 const UPLOAD_CAP: &str = r#"
   - id: upstream
@@ -1805,7 +1805,7 @@ async fn websocket_byte_budget_closes_the_relay() {
     h.stop().await;
 }
 
-// ----- audit backpressure (§10.1) --------------------------------------------
+// ----- audit backpressure (docs/flow-log.md#writing) -----------------------
 
 /// A flow log that cannot keep up holds traffic back instead of dropping
 /// records: new exchanges and streaming bodies wait until it is ready.
@@ -1846,7 +1846,7 @@ async fn a_stalled_flow_log_holds_traffic() {
     h.stop().await;
 }
 
-// ----- capture (§10.2) -------------------------------------------------------
+// ----- capture (docs/flow-log.md#capture) ----------------------------------
 
 fn flow_of(ev: &[Value], path: &str) -> String {
     ev.iter()

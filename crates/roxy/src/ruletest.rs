@@ -1,4 +1,4 @@
-//! `roxy rule test` (DESIGN.md §6.6): evaluate a synthetic flow against the
+//! `roxy rule test` (docs/rules.md#dry-run): evaluate a synthetic flow against the
 //! compiled policy without any network I/O.
 
 use std::borrow::Cow;
@@ -383,7 +383,7 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(DryRunView, Vec
     Ok((DryRunView { map: v, lists }, warnings))
 }
 
-/// The upstream address floor (§7, §7.1) for an IP-literal URL, as the
+/// The upstream address floor (docs/upstream.md#address-floor) for an IP-literal URL, as the
 /// connector would apply it: private ranges (unless `private_ok`),
 /// `deny_cidrs` and every `upstream.deny_lists` list. `None` when the host
 /// is a name (it is not resolved in a dry run) or the decision is not an
@@ -496,7 +496,7 @@ pub fn run(policy: &Policy, view: &DryRunView, tags: &[String], known: Reads) ->
 }
 
 /// Every rule, whether it is decided at the request head or watches, and
-/// what it watches (§6.1). Shared by `roxy check` and `roxy rule test`.
+/// what it watches (docs/rules.md#evaluation). Shared by `roxy check` and `roxy rule test`.
 pub fn classification(policy: &Policy) -> String {
     let info = policy.rule_info();
     let width = info.iter().map(|r| r.id.as_str().len()).max().unwrap_or(0);

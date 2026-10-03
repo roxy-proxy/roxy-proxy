@@ -1,4 +1,4 @@
-//! `MetricStore` behaviour (DESIGN.md §6.4, §6.5).
+//! `MetricStore` behaviour (docs/rules.md#metrics, docs/rules.md#reload).
 
 mod common;
 
@@ -733,7 +733,7 @@ fn unique_exact_small_and_accurate_large() {
     assert!((e - 10_000).abs() <= 650, "estimate {e}");
 }
 
-/// §6.4: values are read before the decision and recorded after it, so a
+/// docs/rules.md#metrics: values are read before the decision and recorded after it, so a
 /// rule `metric.x >= 30` denies the 31st request; denied flows count too.
 #[test]
 fn read_before_record_denies_the_31st() {

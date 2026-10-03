@@ -1,6 +1,6 @@
-//! Listeners and client connections (`DESIGN.md` §4).
+//! Listeners and client connections (docs/http.md#explicit-proxy).
 //!
-//! [`Listener`] is the hook transparent mode (§4.2) will implement: it
+//! [`Listener`] is the hook transparent mode (issue #15) will implement: it
 //! accepts a TCP stream and describes it as a [`ClientConn`]; the server
 //! then hands both to the pipeline for the listener's [`ListenerMode`].
 //! Only [`ExplicitListener`] exists in this build.

@@ -1,4 +1,4 @@
-//! URL normalisation (`DESIGN.md` §5.4).
+//! URL normalisation (docs/http.md#url-normalisation).
 //!
 //! The output of these functions is used both for rule matching and for what
 //! is forwarded, so the upstream sees exactly what the rules matched.
@@ -173,7 +173,7 @@ fn canonicalize_encodings(
     Ok(out)
 }
 
-/// Normalises a request path per §5.4 steps 1-5.
+/// Normalises a request path per docs/http.md#url-normalisation steps 1-5.
 pub fn normalize_path(raw: &[u8]) -> Result<Path, ParseError> {
     if raw.is_empty() {
         return Ok(Path::root());
@@ -226,11 +226,11 @@ fn remove_dot_segments(path: &str) -> Result<String, ParseError> {
     Ok(s)
 }
 
-/// Validates a query (without the leading `?`) per §5.4 step 6.
+/// Validates a query (without the leading `?`) per docs/http.md#url-normalisation step 6.
 ///
 /// Allowed literals are `pchar`, `/`, `?`, plus `[` and `]`: Python
 /// `requests` (and others) send brackets unencoded in queries, and rejecting
-/// them would trip well-behaved clients (§2). They are forwarded untouched.
+/// them would trip well-behaved clients (docs/principles.md#well-behaved-clients-work-unhindered). They are forwarded untouched.
 pub fn normalize_query(raw: &[u8]) -> Result<Query, ParseError> {
     canonicalize_encodings(
         raw,
@@ -308,7 +308,7 @@ fn strip_prefix_ci<'a>(s: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
         .then(|| &s[prefix.len()..])
 }
 
-/// Parses `host[:port]` (§5.4 step 8). `default_port` is used when the port
+/// Parses `host[:port]` (docs/http.md#url-normalisation step 8). `default_port` is used when the port
 /// is omitted; pass `None` to require an explicit port (CONNECT targets).
 pub fn parse_authority_opt(raw: &[u8], default_port: Option<u16>) -> Result<Authority, ParseError> {
     if raw.is_empty() {

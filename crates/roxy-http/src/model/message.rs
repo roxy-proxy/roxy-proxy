@@ -28,7 +28,7 @@ impl Version {
     }
 }
 
-/// The request-target form the client used (§4.1, RFC 9112 §3.2).
+/// The request-target form the client used (docs/http.md#explicit-proxy, RFC 9112 §3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetForm {
     /// `/path?query` (tunnel) — also reported for origin-form on the proxy
@@ -83,7 +83,7 @@ impl RequestMeta {
     }
 }
 
-/// A validated, normalised, version-agnostic request (§5.2).
+/// A validated, normalised, version-agnostic request (docs/http.md#canonical-request).
 #[derive(Debug)]
 pub struct CanonicalRequest {
     /// Method.
@@ -143,7 +143,7 @@ pub struct ResponseMeta {
     pub close: bool,
 }
 
-/// A response to be sent to the client (§5.6).
+/// A response to be sent to the client (docs/http.md#responses).
 #[derive(Debug)]
 pub struct CanonicalResponse {
     /// Status code; the reason phrase is regenerated from it.

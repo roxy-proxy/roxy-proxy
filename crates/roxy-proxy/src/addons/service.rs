@@ -1,4 +1,4 @@
-//! Service layers (§11.6): an external service in the network path.
+//! Service layers (docs/addons.md#service-layers): an external service in the network path.
 //!
 //! Each exchange opens one WebSocket to the layer's named endpoint
 //! (subprotocol `roxy.layer.v1`). roxy streams the request into it as it
@@ -53,7 +53,7 @@ pub const SUBPROTOCOL: &str = "roxy.layer.v1";
 /// Largest control message or body frame accepted from a service.
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
-/// A `kind: service` layer (§11.6).
+/// A `kind: service` layer (docs/addons.md#service-layers).
 #[derive(Debug, Clone)]
 pub struct ServiceSpec {
     /// The addon's endpoint the exchange streams through.

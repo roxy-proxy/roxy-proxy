@@ -5,7 +5,7 @@ use std::fmt;
 
 use http::StatusCode;
 
-/// Stable rejection reason. Every rejection in `DESIGN.md` §5.3 maps to
+/// Stable rejection reason. Every rejection in docs/http.md#rejection-rules maps to
 /// exactly one variant; [`Reason::as_str`] is the stable snake-case code used
 /// in `parse_error` flow events and alerting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

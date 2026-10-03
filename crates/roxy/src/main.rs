@@ -1,6 +1,6 @@
 //! roxy: a TLS-inspecting HTTP firewall for containing AI agent traffic.
 //!
-//! See `DESIGN.md` at the repository root. This binary owns the CLI, config
+//! See `docs/` at the repository root. This binary owns the CLI, config
 //! loading and wiring; the engine lives in the library crates.
 
 use std::io::{IsTerminal as _, Read as _, Write as _};
@@ -105,7 +105,7 @@ enum CaCommand {
 
 #[derive(Debug, Subcommand)]
 enum RuleCommand {
-    /// Dry-run a request against the rules (DESIGN.md §6.6). Prints matched
+    /// Dry-run a request against the rules (docs/rules.md#dry-run). Prints matched
     /// rules, effects and the decision; exits 0 for allow, 3 for deny.
     /// Secrets are not resolved (`[secret:name]` placeholders).
     Test(Box<RuleTestArgs>),

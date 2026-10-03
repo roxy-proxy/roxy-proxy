@@ -1,4 +1,4 @@
-//! Semantic validation that serde cannot express (§6.5).
+//! Semantic validation that serde cannot express (docs/rules.md#reload).
 //!
 //! Rules and metrics are compiled by [`roxy_rules::Policy::compile`]; its
 //! diagnostics (with line/column within an expression) are merged with the
@@ -45,7 +45,7 @@ impl Config {
         if d.is_empty() { Ok(()) } else { Err(d) }
     }
 
-    /// Compile the rules and metrics (§6.5). `validate` calls this; the run
+    /// Compile the rules and metrics (docs/rules.md#reload). `validate` calls this; the run
     /// path and `roxy rule test` use the result.
     pub fn compile_policy(&self) -> Result<Policy, Vec<Diagnostic>> {
         let secret_names: HashSet<String> = self.secrets.keys().cloned().collect();
@@ -117,7 +117,7 @@ impl Config {
                 }
                 ListenerMode::Transparent => d.push(Diagnostic::new(
                     format!("{path}.mode"),
-                    "transparent mode is deferred and not yet supported (DESIGN.md §4.2); use `explicit`",
+                    "transparent mode is deferred and not yet supported (issue #15); use `explicit`",
                 )),
             }
         }
@@ -246,7 +246,7 @@ impl Config {
     }
 
     /// What only makes sense for, or is refused on, a `kind: service`
-    /// addon (§11.6): it streams through one of its own endpoints, and gets
+    /// addon (docs/addons.md#service-layers): it streams through one of its own endpoints, and gets
     /// no host services and no WASM limits.
     fn validate_service(path: &str, a: &super::Addon, d: &mut Vec<Diagnostic>) {
         match &a.endpoint {

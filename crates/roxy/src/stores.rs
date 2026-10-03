@@ -1,5 +1,5 @@
 //! Adapters from the `roxy-rules` metric and state stores to the proxy's
-//! [`MetricSource`] / [`StateSource`] traits (`DESIGN.md` §6.4, §6.5).
+//! [`MetricSource`] / [`StateSource`] traits (docs/rules.md#metrics, docs/rules.md#reload).
 //!
 //! The metric store is built from the compiled policy's metric definitions,
 //! so it is rebuilt on every successful reload. Series whose definition is
@@ -76,7 +76,7 @@ fn map_err(e: MetricError) -> MetricSourceError {
     match e {
         MetricError::Unknown(id) => MetricSourceError::Unknown(format!("unknown metric {id}")),
         // Out of bytes is the same condition as out of keys: deny, never
-        // evict (§6.4, §12).
+        // evict (docs/rules.md#metrics, docs/limits.md).
         MetricError::TableFull { metric } | MetricError::BudgetExhausted { metric } => {
             MetricSourceError::TableFull(metric)
         }
@@ -160,7 +160,7 @@ mod tests {
 
     /// A reload that shrinks `limits.max_metric_bytes` carries over only the
     /// series that fit the new budget, and the new store then refuses new
-    /// keys instead of evicting (§6.4).
+    /// keys instead of evicting (docs/rules.md#metrics).
     #[test]
     fn reload_respects_a_smaller_byte_budget() {
         let policy = policy();

@@ -1,10 +1,10 @@
-//! Per-layer configuration: capabilities and budgets (DESIGN.md §11.2,
-//! §11.3, §11.5).
+//! Per-layer configuration: capabilities and budgets (docs/addons.md#configuration,
+//! docs/addons.md#host-services, docs/addons.md#safety).
 
 use std::fmt;
 use std::time::Duration;
 
-/// A host service a layer may be granted (DESIGN.md §11.3).
+/// A host service a layer may be granted (docs/addons.md#host-services).
 ///
 /// Every capability's import is always linked, so one binary loads under
 /// any set of grants; calling an import whose capability was not granted
@@ -103,15 +103,15 @@ impl FromIterator<Capability> for Capabilities {
 
 const MIB: u64 = 1024 * 1024;
 
-/// Budgets for one layer (DESIGN.md §11.2, §11.5). Exceeding any of them
+/// Budgets for one layer (docs/addons.md#configuration, docs/addons.md#safety). Exceeding any of them
 /// fails the exchange closed with [`crate::LayerError::BudgetExceeded`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayerLimits {
     /// Linear memory per instance, summed over the instance's memories.
     pub max_memory: u64,
     /// Bytes a layer may hold per direction: what it has read from a body
-    /// stream minus what it has passed on in that direction (DESIGN.md
-    /// §11.5).
+    /// stream minus what it has passed on in that direction
+    /// (docs/addons.md#safety).
     pub max_buffered_body_bytes: u64,
     /// Wall time the guest may run between host calls (epoch
     /// interruption).

@@ -1,4 +1,4 @@
-//! WebSocket handshake checks for the relay tier (`DESIGN.md` §8.1).
+//! WebSocket handshake checks for the relay tier (docs/websockets.md#relay).
 //!
 //! No frame codec here (inspect tier, M3). After a validated `101` the proxy
 //! splices bytes in both directions.

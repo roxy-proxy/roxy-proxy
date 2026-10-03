@@ -7,7 +7,7 @@
 //!   case-insensitively (header names are lower-cased at compile time).
 //! * Compiling also records what an expression *reads* beyond the request
 //!   head ([`Needs::reads`]), which decides whether its rule is a head rule
-//!   or a watching rule (§6.1).
+//!   or a watching rule (docs/rules.md#evaluation).
 //! * `like` is a full-match glob where only `*` (any run, including `/`)
 //!   and `?` (one character) are special; it compiles to a `globset`
 //!   matcher.

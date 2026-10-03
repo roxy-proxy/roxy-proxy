@@ -43,7 +43,7 @@ pub(crate) struct Snapshot {
     pub addons: Arc<[Arc<crate::addons::AddonSpec>]>,
 }
 
-/// Per-client and global connection counting (§12).
+/// Per-client and global connection counting (docs/limits.md#connections).
 struct ConnCaps {
     max: usize,
     max_per_client: usize,

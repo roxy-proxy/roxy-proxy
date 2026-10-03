@@ -1,4 +1,4 @@
-//! The bounded TTL key/value state store (`DESIGN.md` §6.4): `state["k"]`
+//! The bounded TTL key/value state store (docs/rules.md#state): `state["k"]`
 //! in rules, the `set_state` action and the addon `state.get/set` calls.
 //!
 //! Bounded by `max_entries` with **no eviction**: overwriting an existing key
