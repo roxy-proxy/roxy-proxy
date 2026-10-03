@@ -24,7 +24,7 @@ fn text(bytes: &[u8]) -> String {
 
 #[test]
 fn check_examples_pass() {
-    for name in ["roxy.yaml", "minimal.yaml"] {
+    for name in ["roxy.yaml", "minimal.yaml", "docker/roxy.yaml"] {
         let out = roxy(&["check", "--config", example(name).to_str().unwrap()]);
         assert!(out.status.success(), "{name}: {}", text(&out.stderr));
         assert!(text(&out.stdout).contains(": OK"));
