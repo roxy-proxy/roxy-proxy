@@ -412,7 +412,10 @@ impl Running {
     /// Graceful shutdown (§12): stop accepting, drain for up to `grace`.
     pub async fn shutdown(self, grace: Duration) {
         drop(self.watcher);
+        let sink = self.server.handle().sink();
         self.server.shutdown(grace).await;
+        // Everything logged so far reaches its destination before exit.
+        let _ = tokio::task::spawn_blocking(move || sink.flush()).await;
     }
 }
 

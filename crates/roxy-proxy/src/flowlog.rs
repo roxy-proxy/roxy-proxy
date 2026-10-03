@@ -829,6 +829,8 @@ mod tests {
         let sink = FileSink::open(&path).unwrap();
         sink.emit(&sample_request());
         sink.emit(&sample_request());
+        // Writes are asynchronous (one writer thread); flush first.
+        sink.flush();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.ends_with('\n'));
         let lines: Vec<&str> = contents.lines().collect();
