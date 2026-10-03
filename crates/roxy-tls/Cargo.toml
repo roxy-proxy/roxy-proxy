@@ -1,0 +1,23 @@
+[package]
+name = "roxy-tls"
+description = "CA management and TLS configuration for roxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pem.workspace = true
+rcgen.workspace = true
+ring.workspace = true
+rustls-pki-types.workspace = true
+thiserror.workspace = true
+time.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
