@@ -1,0 +1,1 @@
+host == "api.openai.com" and body.bytes > 10mb

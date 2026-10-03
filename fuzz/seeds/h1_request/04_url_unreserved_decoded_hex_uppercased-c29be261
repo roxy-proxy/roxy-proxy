@@ -1,0 +1,3 @@
+@GET /%7euser/%41%20b?x=%2f%7E HTTP/1.1
+Host: example.com
+

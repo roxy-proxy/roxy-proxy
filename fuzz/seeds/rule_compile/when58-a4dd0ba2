@@ -1,0 +1,1 @@
+host == "api.github.com" and metric.writes >= 30

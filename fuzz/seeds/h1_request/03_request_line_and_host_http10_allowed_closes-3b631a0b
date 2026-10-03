@@ -1,0 +1,4 @@
+GET http://example.com/ HTTP/1.0
+
+GET http://example.com/again HTTP/1.0
+

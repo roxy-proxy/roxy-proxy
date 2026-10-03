@@ -1,0 +1,114 @@
+name: Fuzz
+
+# Runs the cargo-fuzz targets in fuzz/ (see fuzz/README.md).
+#
+# - Nightly (schedule): every target for 5 minutes, continuing from the
+#   corpus the previous runs grew (kept in the Actions cache).
+# - Pull requests that touch a fuzzed parser or fuzz/: every target for
+#   60 seconds, from the checked-in seeds plus the cached corpus.
+# - workflow_dispatch: every target for a chosen number of seconds.
+#
+# A crash, failed assertion, leak or slow input fails the job and uploads
+# the reproducer as an artifact: download it, then
+#   cargo +nightly fuzz run <target> <file>
+# Fix it and add the input as a regression test in the crate it points at.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  pull_request:
+    paths:
+      - fuzz/**
+      - crates/roxy-http/src/**
+      - crates/roxy-tls/src/sniff.rs
+      - crates/roxy-rules/src/**
+      - .github/workflows/fuzz.yml
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "600"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_FUZZ_VERSION: 0.13.2
+
+jobs:
+  fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - h1_request
+          - h1_chunked
+          - h2map
+          - url
+          - client_hello
+          - rule_compile
+          - rule_eval
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      TARGET: ${{ matrix.target }}
+      SECONDS_PER_TARGET: ${{ github.event_name == 'schedule' && '300' || github.event_name == 'workflow_dispatch' && inputs.seconds || '60' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Nightly only here: libFuzzer needs -Zsanitizer. The rest of CI is
+      # stable, and fuzz/ is its own workspace.
+      - name: Install nightly
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustc +nightly --version
+
+      - name: Cache cargo-fuzz and the fuzz build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/cargo-fuzz
+            ~/.cargo/registry
+            fuzz/target
+          key: fuzz-build-${{ env.CARGO_FUZZ_VERSION }}-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml') }}
+          restore-keys: fuzz-build-${{ env.CARGO_FUZZ_VERSION }}-
+
+      - name: Install cargo-fuzz
+        run: |
+          if ! cargo fuzz --version 2>/dev/null | grep -q "$CARGO_FUZZ_VERSION"; then
+            cargo install cargo-fuzz --locked --version "$CARGO_FUZZ_VERSION" --force
+          fi
+
+      # The corpus each run grows, restored from the newest earlier run and
+      # saved under a fresh key (cache entries are immutable).
+      - name: Restore the corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz
+        run: |
+          mkdir -p "fuzz/corpus/$TARGET"
+          cd fuzz
+          cargo +nightly fuzz run "$TARGET" "corpus/$TARGET" "seeds/$TARGET" -- \
+            -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=2048 -timeout=10 -print_final_stats=1
+
+      - name: Minimise the corpus
+        if: github.event_name == 'schedule'
+        run: cd fuzz && cargo +nightly fuzz cmin "$TARGET" "corpus/$TARGET"
+
+      - name: Upload the reproducer
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

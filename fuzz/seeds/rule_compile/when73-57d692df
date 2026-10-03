@@ -1,0 +1,1 @@
+'body.size != null and body.size > 10mb', then: deny }

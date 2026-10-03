@@ -1,0 +1,1 @@
+'body.size < 1mb and body.text contains \"secret\"', then: deny }

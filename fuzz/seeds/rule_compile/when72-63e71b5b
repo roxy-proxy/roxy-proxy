@@ -1,0 +1,1 @@
+'path matches \"(\\\\w{100}){100}\"', then: allow }",

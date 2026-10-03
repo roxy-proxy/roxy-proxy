@@ -1,0 +1,1 @@
+host in ["pypi.org", "files.pythonhosted.org"] and method == GET

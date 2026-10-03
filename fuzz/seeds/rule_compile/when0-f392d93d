@@ -1,0 +1,1 @@
+host == "example.com" and method in [GET, HEAD]

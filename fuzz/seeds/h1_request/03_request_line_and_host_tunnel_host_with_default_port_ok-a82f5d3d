@@ -1,0 +1,3 @@
+@GET / HTTP/1.1
+Host: API.example.com:443
+

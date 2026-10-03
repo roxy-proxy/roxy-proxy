@@ -1741,9 +1741,21 @@ only) allows them.
    duplicate CL, obs-fold, bare LF, `%2e%2e` path climbs, Host/authority
    mismatches, h2 pseudo-header abuse, CRLF in header values. Every case has
    an expected reason code. This corpus is the acceptance test for §5.
-2. **Fuzz targets**: h1 request head, h1 chunked body, URL normaliser, DSL
-   parser, WS frame codec, ClientHello sniffer. Run in CI for a fixed budget;
-   nightly for longer.
+2. **Fuzz targets** (`fuzz/`, cargo-fuzz; see `fuzz/README.md`):
+   - h1 request head, where the canonical form is a fixed point of parse →
+     serialise → parse;
+   - h1 chunked body;
+   - h2 → canonical mapping;
+   - URL normaliser (idempotent, no dot segments survive);
+   - ClientHello sniffer (verdicts never change as more bytes arrive);
+   - DSL lexer, parser and compiler;
+   - policy evaluation, where making an input unavailable either changes
+     nothing or fails closed, and never yields a different decision.
+
+   Seeded from the smuggling corpus. `.github/workflows/fuzz.yml` runs every
+   target nightly (5 minutes each, growing a cached corpus) and for 60
+   seconds on PRs that touch a parser. The WS frame codec gets a target when
+   it lands (§8.2).
 3. **Property tests**: `normalise(normalise(p)) == normalise(p)`; serialise →
    parse round-trips to an equal canonical model.
 4. **DSL golden tests** (`insta`): expression → AST → compiled plan; config →

@@ -1,0 +1,1 @@
+'response.status == 200 and response.body.text contains \"x\"', then: { remove_header: [x-a] } }",
