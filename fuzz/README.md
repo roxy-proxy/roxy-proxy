@@ -23,6 +23,7 @@ The first directory is the working corpus, which grows as the fuzzer runs.
 | `h1_request` | `roxy-http` `h1::scan_head` / `parse_head` | Scanning is resumable. The canonical form is a fixed point: parse, serialise (`src/lib.rs`), parse and serialise again give the same bytes. |
 | `h1_chunked` | `h1::ChunkedDecoder` | The result does not depend on how input is split into reads, and the output is never longer than the input. |
 | `h2map` | `h2map::from_h2_parts` | An accepted request has the tunnel's authority and a normalised path, and no reserved (hop-by-hop, framing, routing) header. |
+| `ws_frame` | `roxy-http` `ws::frame::Decoder` | The result does not depend on how input is split into reads. No message is over its limit. Re-encoding the messages as roxy relays them and decoding again gives the same messages, without error. |
 | `url` | `url::*` | Path, query, origin-form, absolute-form and authority normalisation are idempotent. A normalised path starts with `/` and has no `.` or `..` segment, `%2E`-encoded or not. |
 | `client_hello` | `roxy-tls` `sniff` | Reading more never changes a verdict: over an input's prefixes, `NeedMore` until one constant answer. |
 | `rule_compile` | `roxy-rules` lexer, parser, type-checker, compiler | A policy that compiles evaluates without panicking, and a fail-closed outcome is never an allow. |
@@ -47,6 +48,8 @@ vectors, so the seeds are never stale and nothing derived is checked in:
 - **`client_hello`:** real ClientHellos from Python's `ssl`.
 - **`rule_compile`:** every `when:` expression in `examples/` and
   `crates/roxy-rules`.
+- **`ws_frame`:** the RFC 6455 example frames and a fragmented, masked
+  message with a ping in the middle.
 
 ## CI
 

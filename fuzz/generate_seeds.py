@@ -14,7 +14,9 @@ Sources:
   without SNI / ALPN, TLS 1.2 and 1.3);
 - rule_compile: every `when:` expression in examples/ and crates/roxy-rules;
 - h2map, rule_eval: structured inputs, seeded with a few byte patterns
-  (libFuzzer finds the structure quickly).
+  (libFuzzer finds the structure quickly);
+- ws_frame: the RFC 6455 example frames and a fragmented, masked message
+  with a ping in the middle.
 """
 
 import hashlib
@@ -118,8 +120,38 @@ def when_expressions():
                 yield expr
 
 
+def ws_frame(fin, opcode, payload, mask=None):
+    b = bytes([(0x80 if fin else 0) | opcode])
+    m = 0x80 if mask else 0
+    n = len(payload)
+    if n < 126:
+        b += bytes([m | n])
+    elif n < 1 << 16:
+        b += bytes([m | 126]) + n.to_bytes(2, "big")
+    else:
+        b += bytes([m | 127]) + n.to_bytes(8, "big")
+    if mask:
+        b += mask + bytes(p ^ mask[i % 4] for i, p in enumerate(payload))
+    else:
+        b += payload
+    return b
+
+
+def ws_frames():
+    """(name, config byte, frames): bit 0 of the config byte set = server
+    frames; bits 4-5 = 3 picks the largest message limit."""
+    key = b"\x37\xfa\x21\x3d"
+    yield "hello_server", 0x31, ws_frame(True, 1, b"Hello")
+    yield "hello_client", 0x30, ws_frame(True, 1, b"Hello", key)
+    yield "fragmented_ping", 0x32, (ws_frame(False, 1, b"Hel", key) + ws_frame(True, 9, b"p", key)
+                                    + ws_frame(True, 0, b"lo", key))
+    yield "binary_256", 0x31, ws_frame(True, 2, bytes(range(256)))
+    yield "close", 0x31, ws_frame(True, 8, b"\x03\xe8bye")
+
+
 def main():
-    for target in ("h1_request", "h1_chunked", "url", "client_hello", "rule_compile", "h2map", "rule_eval"):
+    for target in ("h1_request", "h1_chunked", "url", "client_hello", "rule_compile", "h2map", "rule_eval",
+                   "ws_frame"):
         for old in (OUT / target).glob("*") if (OUT / target).is_dir() else []:
             old.unlink()
     n = 0
@@ -143,6 +175,8 @@ def main():
     for i, pat in enumerate([b"", b"\x00" * 64, b"\x01" * 64, bytes(range(256))]):
         write("h2map", f"pattern{i}", pat)
         write("rule_eval", f"pattern{i}", pat)
+    for name, cfg, frames in ws_frames():
+        write("ws_frame", name, bytes([cfg]) + frames)
     print(f"{n} corpus cases")
 
 
