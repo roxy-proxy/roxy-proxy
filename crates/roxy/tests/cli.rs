@@ -24,7 +24,7 @@ fn text(bytes: &[u8]) -> String {
 
 #[test]
 fn check_examples_pass() {
-    for name in ["roxy.yaml", "minimal.yaml"] {
+    for name in ["roxy.yaml", "minimal.yaml", "docker/roxy.yaml"] {
         let out = roxy(&["check", "--config", example(name).to_str().unwrap()]);
         assert!(out.status.success(), "{name}: {}", text(&out.stderr));
         assert!(text(&out.stdout).contains(": OK"));
@@ -442,4 +442,146 @@ fn rule_test_shows_address_policy_hits_for_ip_literals() {
     let out = rt("http://example.com/");
     assert_eq!(out.status.code(), Some(0));
     assert!(!text(&out.stdout).contains("address:"));
+}
+
+// ----- health -----------------------------------------------------------------
+
+/// A one-shot HTTP server answering `response`; yields the request it read.
+fn stub_http(response: &'static str) -> (String, std::thread::JoinHandle<String>) {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut req = Vec::new();
+        let mut buf = [0u8; 512];
+        while !req.ends_with(b"\r\n\r\n") {
+            let n = s.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            req.extend_from_slice(&buf[..n]);
+        }
+        s.write_all(response.as_bytes()).unwrap();
+        String::from_utf8(req).unwrap()
+    });
+    (format!("http://{addr}/healthz"), handle)
+}
+
+#[test]
+fn health_ok_on_200() {
+    let (url, server) = stub_http("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+    let out = roxy(&["health", "--url", &url]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "ok\n");
+    let req = server.join().unwrap();
+    assert!(req.starts_with("GET /healthz HTTP/1.1\r\n"), "{req}");
+    let host = url
+        .trim_start_matches("http://")
+        .trim_end_matches("/healthz");
+    assert!(req.contains(&format!("\r\nHost: {host}\r\n")), "{req}");
+}
+
+/// The probe does not wait for the server to close the connection.
+#[test]
+fn health_ok_without_waiting_for_close() {
+    use std::io::Write as _;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        s.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
+        // Hold the connection open past the probe's timeout.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        drop(s);
+    });
+    let t = std::time::Instant::now();
+    let out = roxy(&["health", "--timeout", "2", "--url", &url]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(t.elapsed() < std::time::Duration::from_secs(2));
+    server.join().unwrap();
+}
+
+#[test]
+fn health_fails_on_other_status_and_garbage() {
+    for response in [
+        "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n",
+        "HTTP/1.1 2000 OK\r\n\r\n",
+        "SSH-2.0-OpenSSH\r\n",
+        "",
+    ] {
+        let (url, server) = stub_http(response);
+        let out = roxy(&["health", "--url", &url]);
+        assert_eq!(out.status.code(), Some(1), "{response:?}");
+        assert!(out.stdout.is_empty(), "{response:?}");
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn health_fails_when_refused_or_misused() {
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let refused = format!("http://{closed}/healthz");
+    for url in [
+        refused.as_str(),
+        "https://127.0.0.1:3130/healthz",
+        "http:///healthz",
+    ] {
+        let out = roxy(&["health", "--url", url]);
+        assert_eq!(out.status.code(), Some(1), "{url}");
+        assert!(text(&out.stderr).contains("roxy: error:"), "{url}");
+    }
+}
+
+/// End to end: `roxy health` against a running roxy's `ca_server`.
+#[test]
+fn health_probes_a_running_roxy() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = || {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    };
+    let (proxy, ca) = (free(), free());
+    let cfg = dir.path().join("roxy.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "version: 1\nlisteners: [{{ name: p, bind: \"{proxy}\" }}]\n\
+             ca_server: {{ bind: \"{ca}\" }}\ntls: {{ ca_dir: {:?} }}\n",
+            dir.path().join("ca").to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_roxy"))
+        .args([
+            "--log-level",
+            "warn",
+            "run",
+            "--config",
+            cfg.to_str().unwrap(),
+        ])
+        .env_remove("RUST_LOG")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let url = format!("http://{ca}/healthz");
+    let mut healthy = false;
+    for _ in 0..100 {
+        if roxy(&["health", "--url", &url]).status.success() {
+            healthy = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(healthy, "roxy never reported healthy at {url}");
+    let out = roxy(&["health", "--url", &url]);
+    assert_eq!(out.status.code(), Some(1), "a stopped roxy is unhealthy");
 }

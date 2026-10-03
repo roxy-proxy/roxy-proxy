@@ -1589,7 +1589,11 @@ socket, never a pass-through. Specifically:
   CA download and (later) metrics live on a separate `ca_server` bind so they
   can be firewalled differently.
 - roxy runs as an unprivileged user; transparent mode needs `CAP_NET_ADMIN`
-  only for the firewall rules, which are set up outside roxy.
+  only for the firewall rules, which are set up outside roxy. The container
+  image runs as UID 65532 on distroless/static (no shell), with a read-only
+  root filesystem, no capabilities and `no-new-privileges`; the CA directory
+  is its only required writable path. Its `HEALTHCHECK` uses `roxy health`
+  against the `ca_server` `/healthz` (README, "Container image").
 - `panic = "abort"` is **not** used; panics in a connection task are caught
   and close that connection only. Fuzzing targets ensure the parsers do not
   panic at all.

@@ -3,9 +3,11 @@
 //! See `DESIGN.md` at the repository root. This binary owns the CLI, config
 //! loading and wiring; the engine lives in the library crates.
 
-use std::io::{IsTerminal as _, Write as _};
+use std::io::{IsTerminal as _, Read as _, Write as _};
+use std::net::{TcpStream, ToSocketAddrs as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -62,6 +64,20 @@ enum Command {
         #[command(subcommand)]
         command: RuleCommand,
     },
+    /// Probe a health endpoint (`ca_server`'s `/healthz`) for container
+    /// health checks, where there is no shell or curl. Exits 0 on a `200`
+    /// response and 1 on anything else.
+    Health(HealthArgs),
+}
+
+#[derive(Debug, Args)]
+struct HealthArgs {
+    /// Plain `http://` URL to GET.
+    #[arg(long, default_value = "http://127.0.0.1:3130/healthz")]
+    url: String,
+    /// Connect, write and read timeout, in seconds.
+    #[arg(long, default_value_t = 3)]
+    timeout: u64,
 }
 
 #[derive(Debug, Subcommand)]
@@ -169,6 +185,85 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Rule {
             command: RuleCommand::Test(args),
         } => rule_test(&args),
+        Command::Health(args) => health(&args.url, Duration::from_secs(args.timeout.max(1))),
+    }
+}
+
+/// `GET url` over HTTP/1.1 with std only. Success is a `200` status line;
+/// anything else (refused, timeout, other status, garbage) is unhealthy.
+fn health(url: &str, timeout: Duration) -> anyhow::Result<ExitCode> {
+    let rest = url
+        .strip_prefix("http://")
+        .with_context(|| format!("--url must be a plain http:// URL, got {url:?}"))?;
+    let (authority, path) = rest.find('/').map_or((rest, "/"), |i| rest.split_at(i));
+    if authority.is_empty() {
+        bail!("--url has no host: {url:?}");
+    }
+    // `host` or `[v6]` without a port gets the HTTP default.
+    let has_port = if authority.starts_with('[') {
+        authority.contains("]:")
+    } else {
+        authority.contains(':')
+    };
+    let target = if has_port {
+        authority.to_owned()
+    } else {
+        format!("{authority}:80")
+    };
+    let addrs: Vec<_> = target
+        .to_socket_addrs()
+        .with_context(|| format!("resolving {target}"))?
+        .collect();
+    let mut last = None;
+    let mut stream = None;
+    for addr in &addrs {
+        match TcpStream::connect_timeout(addr, timeout) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    let mut stream = match (stream, last) {
+        (Some(s), _) => s,
+        (None, Some(e)) => return Err(e).with_context(|| format!("connecting to {target}")),
+        (None, None) => bail!("{target} resolved to no addresses"),
+    };
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: roxy-health\r\n\
+         Connection: close\r\n\r\n"
+    )
+    .context("sending the request")?;
+    // Only the status line matters: read until its end (at most 1 KiB).
+    let mut head = Vec::new();
+    let mut buf = [0u8; 256];
+    while !head.contains(&b'\n') && head.len() < 1024 {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+            Err(e) if head.is_empty() => {
+                return Err(e).context("reading the response");
+            }
+            Err(_) => break,
+        }
+    }
+    let head = String::from_utf8_lossy(&head);
+    let status = head.lines().next().unwrap_or_default();
+    let mut parts = status.split(' ');
+    let healthy = matches!(
+        (parts.next(), parts.next()),
+        (Some("HTTP/1.1" | "HTTP/1.0"), Some("200"))
+    );
+    if healthy {
+        println!("ok");
+        Ok(ExitCode::SUCCESS)
+    } else {
+        eprintln!("roxy: unhealthy: {url}: {status:?}");
+        Ok(ExitCode::FAILURE)
     }
 }
 

@@ -1,0 +1,26 @@
+# roxy configuration for the container image (/etc/roxy/roxy.yaml).
+# Mount your own over it, e.g. -v ./roxy.yaml:/etc/roxy/roxy.yaml:ro.
+# Validate with: docker run --rm -v ./roxy.yaml:/etc/roxy/roxy.yaml:ro \
+#   ghcr.io/roxy-proxy/roxy check --config /etc/roxy/roxy.yaml
+version: 1
+
+listeners:
+  - name: proxy
+    bind: 0.0.0.0:3128
+
+ca_server:
+  bind: 0.0.0.0:3130         # plain HTTP: /roxy-ca.pem and /healthz (the HEALTHCHECK)
+
+tls:
+  ca_dir: /var/lib/roxy/ca   # a volume; the CA is generated on first start
+
+log:
+  flow:
+    connection_events: false # flow log to stdout (no path), for `docker logs`
+
+# Anything not allowed by a rule is denied. Replace this with your policy.
+default: deny
+rules:
+  - id: example
+    when: host == "example.com" and method in [GET, HEAD]
+    then: allow

@@ -1,0 +1,9 @@
+# Only what the build needs goes into the context.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+!examples/docker/roxy.yaml
+# rust-toolchain.toml is left out on purpose: inside the build image it would
+# make rustup download "stable" instead of using the pinned image's toolchain.
+**/target/
