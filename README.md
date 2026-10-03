@@ -34,12 +34,17 @@ model and roadmap.
 [`examples/compose`](examples/compose) runs a client container (curl, the
 `agent` service) whose only way to the internet is through roxy:
 
-```
-            sandbox (internal: no route out)          egress
- ┌───────┐  HTTPS_PROXY=http://roxy:3128  ┌──────┐            ┌──────────┐
- │ agent │ ─────────────────────────────▶ │ roxy │ ─────────▶ │ internet │
- └───────┘                                └──────┘            └──────────┘
-     ✗  no other route: direct connections and DNS lookups fail
+```mermaid
+flowchart LR
+    subgraph sandbox["sandbox network (internal: true, no route out)"]
+        agent["agent (curl)"]
+    end
+    subgraph egress["egress network"]
+        internet(("internet"))
+    end
+    agent -- "HTTPS_PROXY=http://roxy:3128" --> roxy["roxy"]
+    roxy --> internet
+    agent -. "✗ direct connections and DNS lookups fail" .-> internet
 ```
 
 ```sh
@@ -119,6 +124,42 @@ sits above the rules in every exchange and owns both streams. An addon can:
 
 Addons stack in the order configured, and run in one of two modes:
 `enforce` (in the path) or `observe` (gets a copy, cannot affect traffic).
+The first addon sees each request first and each response last; the rules
+sit below every addon, next to the network:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as client
+    participant G as gates<br/>(CONNECT, quarantine)
+    participant A as addons<br/>(in config order)
+    participant R as rules
+    participant U as upstream
+    C->>G: request head
+    G->>A: head + body stream
+    Note over A: may rewrite, withhold, answer,<br/>call endpoints, record
+    A->>R: the request it passes on<br/>(re-validated like a client request)
+    Note over R: head rules decide, then the<br/>address floor on the dialled IP
+    R->>U: head
+    loop request body, chunk by chunk
+        C->>A: chunk
+        A->>R: chunk (possibly transformed)
+        Note over R: watching rules check<br/>before forwarding
+        R->>U: chunk
+    end
+    U->>R: response head
+    Note over R: response rules see it first
+    R->>A: head + body stream
+    loop response body, chunk by chunk
+        U->>R: chunk
+        R->>A: chunk
+        A->>C: chunk (possibly transformed or withheld)
+    end
+```
+
+Nothing is buffered unless a rule or an addon asks to read a body, and then
+only up to its cap. An addon that fails denies the flow, or cuts the body
+if the response has started.
 
 Addons cannot weaken the boundary. Whatever an addon sends on is
 re-validated and judged by the rules as if the client had sent it. Every
