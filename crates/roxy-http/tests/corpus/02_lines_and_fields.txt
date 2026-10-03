@@ -1,0 +1,203 @@
+# Line structure, header names and values (DESIGN.md §5.3).
+
+=== bare_lf_line_endings
+expect: error bare_lf
+---
+GET http://example.com/ HTTP/1.1\n
+Host: example.com\n
+\n
+
+=== bare_lf_after_request_line
+expect: error bare_lf
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\n
+\r\n
+
+=== bare_lf_final
+expect: error bare_lf
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+\n
+
+=== bare_cr_in_value
+expect: error bare_cr
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+X-A: a\rb\r\n
+\r\n
+
+=== bare_cr_line_ending
+expect: error bare_cr
+---
+GET http://example.com/ HTTP/1.1\r
+Host: example.com\r\n
+\r\n
+
+=== crlf_injection_value
+# A CRLF inside what the client thinks is one value just ends the line;
+# the injected line must itself be a valid field. Here it is not.
+expect: error invalid_header_name
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+X-A: a\r\n
+GET /admin HTTP/1.1\r\n
+\r\n
+
+=== nul_in_value
+expect: error invalid_header_value
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+X-A: a\0b\r\n
+\r\n
+
+=== del_in_value
+expect: error invalid_header_value
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+X-A: a\x7fb\r\n
+\r\n
+
+=== esc_in_value
+expect: error invalid_header_value
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+X-A: \x1b[31m\r\n
+\r\n
+
+=== non_ascii_value
+expect: error non_ascii
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+X-A: caf\xc3\xa9\r\n
+\r\n
+
+=== non_ascii_value_allowed
+flags: allow_obs_text
+expect: request GET http://example.com:80/
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+X-A: caf\xc3\xa9\r\n
+\r\n
+
+=== non_ascii_header_name
+expect: error non_ascii
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+X-Caf\xc3\xa9: 1\r\n
+\r\n
+
+=== invalid_header_name_chars
+expect: error invalid_header_name
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+X(A): 1\r\n
+\r\n
+
+=== header_without_colon
+expect: error invalid_header_name
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+NoColonHere\r\n
+\r\n
+
+=== empty_header_name
+expect: error invalid_header_name
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+: value\r\n
+\r\n
+
+=== whitespace_before_colon
+expect: error whitespace_before_colon
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host : example.com\r\n
+\r\n
+
+=== obs_fold_space
+expect: error obs_fold
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+X-A: a\r\n
+ b\r\n
+\r\n
+
+=== obs_fold_tab
+expect: error obs_fold
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+X-A: a\r\n
+\tb\r\n
+\r\n
+
+=== space_before_first_header
+expect: error obs_fold
+---
+GET http://example.com/ HTTP/1.1\r\n
+ Host: example.com\r\n
+\r\n
+
+=== values_trimmed_names_lowercased
+expect: request GET http://example.com:80/ hdr:x-mixed-case=v\s\sv
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+X-Mixed-CASE:   v  v \t\r\n
+\r\n
+
+=== hop_by_hop_stripped
+expect: request GET http://example.com:80/ nohdr:connection nohdr:keep-alive nohdr:x-private nohdr:te nohdr:upgrade nohdr:proxy-authorization nohdr:proxy-connection nohdr:trailer hdr:accept=*/*
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Connection: keep-alive, X-Private\r\n
+Keep-Alive: timeout=5\r\n
+X-Private: secret\r\n
+TE: trailers\r\n
+Trailer: x\r\n
+Upgrade: h2c\r\n
+Proxy-Authorization: Basic eDp5\r\n
+Proxy-Connection: keep-alive\r\n
+Accept: */*\r\n
+\r\n
+
+=== bad_connection_token
+expect: error bad_connection_header
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Connection: close; x\r\n
+\r\n
+
+=== leading_empty_lines_ignored
+expect: request GET http://example.com:80/
+---
+\r\n\r\n
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== truncated_head
+expect: error unexpected_eof
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+
+=== clean_eof
+expect: eof
+---

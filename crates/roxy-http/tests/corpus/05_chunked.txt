@@ -1,0 +1,202 @@
+# Chunked body decoding (DESIGN.md §5.3 Body).
+
+=== chunked_ok
+expect: request POST http://example.com:80/ body=hello\sworld
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+5\r\nhello\r\n
+6\r\n\sworld\r\n
+0\r\n
+\r\n
+
+=== chunk_size_0x
+expect: body-error bad_chunk_size
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+0x5\r\nhello\r\n0\r\n\r\n
+
+=== chunk_size_plus
+expect: body-error bad_chunk_size
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
++5\r\nhello\r\n0\r\n\r\n
+
+=== chunk_size_minus
+expect: body-error bad_chunk_size
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+-5\r\nhello\r\n0\r\n\r\n
+
+=== chunk_size_17_digits
+expect: body-error bad_chunk_size
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+00000000000000005\r\nhello\r\n0\r\n\r\n
+
+=== chunk_size_overflow
+expect: body-error bad_chunk_size
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+1FFFFFFFFFFFFFFFF\r\n
+
+=== chunk_size_space
+expect: body-error bad_chunk_size
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+5\s\r\nhello\r\n0\r\n\r\n
+
+=== chunk_size_empty
+expect: body-error bad_chunk_size
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+\r\nhello\r\n0\r\n\r\n
+
+=== chunk_extension
+expect: body-error chunk_extension
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+5;name=value\r\nhello\r\n0\r\n\r\n
+
+=== chunk_extension_on_last_chunk
+expect: body-error chunk_extension
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+5\r\nhello\r\n0;x\r\n\r\n
+
+=== chunk_extension_allowed
+flags: allow_chunk_extensions
+expect: request POST http://example.com:80/ body=hello
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+5;name=value\r\nhello\r\n0\r\n\r\n
+
+=== trailers_rejected
+expect: body-error trailers
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+5\r\nhello\r\n0\r\nX-Checksum: 1\r\n\r\n
+
+=== trailers_smuggle_content_length
+flags: allow_trailers
+expect: body-error trailers
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+5\r\nhello\r\n0\r\nContent-Length: 50\r\n\r\n
+
+=== trailers_allowed
+flags: allow_trailers
+expect: request POST http://example.com:80/ body=hello
+expect: request GET http://example.com:80/next
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+5\r\nhello\r\n0\r\nX-Checksum: 1\r\n\r\n
+GET http://example.com/next HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== missing_crlf_after_data
+expect: body-error bad_chunk_framing
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+5\r\nhelloXX0\r\n\r\n
+
+=== bare_lf_after_data
+expect: body-error bad_chunk_framing
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+5\r\nhello\n0\r\n\r\n
+
+=== bare_lf_in_size_line
+expect: body-error bare_lf
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+5\nhello\r\n0\r\n\r\n
+
+=== bare_lf_final
+expect: body-error bare_lf
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+5\r\nhello\r\n0\r\n\n
+
+=== missing_final_crlf
+expect: body-error unexpected_eof
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+5\r\nhello\r\n0\r\n
+
+=== chunked_body_over_cap
+limits: max_request_body_bytes=8
+expect: body-error body_too_large
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n
+
+=== cl_body_over_cap
+limits: max_request_body_bytes=8
+expect: error body_too_large
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 10\r\n
+\r\n
+helloworld

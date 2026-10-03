@@ -196,13 +196,17 @@ impl ChunkedDecoder {
         if lf == 0 || buf[lf - 1] != b'\r' {
             return reject(Reason::BareLf, "bare LF in chunk-size line");
         }
+        // Same bound as the partial-line check above: line without CRLF <= max.
+        if lf > max + 1 {
+            return reject(Reason::BadChunkSize, "chunk-size line too long");
+        }
         if digits == 0 {
             return reject(Reason::BadChunkSize, "empty chunk size");
         }
         let ext = &line[digits..lf - 1];
         if !ext.is_empty() {
             // allow_ext is true here; extensions are validated and discarded.
-            if ext.len() > MAX_EXT_LINE || !ext.iter().all(|&b| is_field_value_byte(b, false)) {
+            if !ext.iter().all(|&b| is_field_value_byte(b, false)) {
                 return reject(Reason::ChunkExtension, "malformed chunk extension");
             }
         }
@@ -237,6 +241,9 @@ impl ChunkedDecoder {
             }
             return Ok(None);
         };
+        if end > self.max_trailer_bytes {
+            return reject(Reason::HeadTooLarge, "trailer section too large");
+        }
         let section = buf.split_to(end);
         let body = &section[..end - 4];
         let mut map = HeaderMap::new();

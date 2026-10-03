@@ -1,0 +1,153 @@
+# Size limits, pipelining, keep-alive and Connection: close.
+
+=== too_many_headers
+limits: max_headers=3
+expect: error too_many_headers
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+A: 1\r\n
+B: 2\r\n
+C: 3\r\n
+\r\n
+
+=== header_count_at_limit_ok
+limits: max_headers=3
+expect: request GET http://example.com:80/
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+A: 1\r\n
+B: 2\r\n
+\r\n
+
+=== head_too_large
+limits: max_header_bytes=256
+expect: error head_too_large
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+X-Big: \{300:a}\r\n
+\r\n
+
+=== head_too_large_unterminated
+# Never terminated: rejected as soon as the buffer exceeds the cap.
+limits: max_header_bytes=256
+expect: error head_too_large
+---
+GET http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+X-Big: \{1000:a}
+
+=== url_too_long
+expect: error url_too_long
+---
+GET http://example.com/\{9000:a} HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== url_too_long_unterminated
+expect: error url_too_long
+---
+GET http://example.com/\{20000:a}
+
+=== url_at_limit_ok
+limits: max_url_bytes=64
+expect: request GET http://example.com:80/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+---
+GET http://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== pipelined_second_request_preserved
+expect: request POST http://example.com:80/one body=hello
+expect: request GET http://example.com:80/two
+expect: eof
+---
+POST http://example.com/one HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 5\r\n
+\r\n
+hello
+GET http://example.com/two HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== pipelined_after_chunked
+expect: request POST http://example.com:80/one body=abc
+expect: request GET http://example.com:80/two
+---
+POST http://example.com/one HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+3\r\nabc\r\n0\r\n\r\n
+GET http://example.com/two HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== smuggled_request_in_body_stays_body
+# The "inner" request is body bytes of the outer one, never a request.
+expect: request POST http://example.com:80/ body=GET\s/admin\sHTTP/1.1\r\n\r\n
+expect: eof
+---
+POST http://example.com/ HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 23\r\n
+\r\n
+GET /admin HTTP/1.1\r\n\r\n
+
+=== keep_alive_three_requests
+role: tunnel https example.com:443
+expect: request GET https://example.com:443/1
+expect: request POST https://example.com:443/2 body=xy
+expect: request GET https://example.com:443/3
+expect: eof
+---
+GET /1 HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+POST /2 HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 2\r\n
+\r\n
+xy
+GET /3 HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== connection_close_honoured
+# Bytes after a Connection: close request are never parsed.
+expect: request GET http://example.com:80/1
+expect: eof
+---
+GET http://example.com/1 HTTP/1.1\r\n
+Host: example.com\r\n
+Connection: close\r\n
+\r\n
+GET http://example.com/2 HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== connection_close_case_insensitive
+expect: request GET http://example.com:80/1
+expect: eof
+---
+GET http://example.com/1 HTTP/1.1\r\n
+Host: example.com\r\n
+Connection: Keep-Alive, CLOSE\r\n
+\r\n
+garbage that is never parsed
+
+=== bad_second_request_after_good
+expect: request GET http://example.com:80/1
+expect: error cl_and_te
+---
+GET http://example.com/1 HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+POST http://example.com/2 HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 1\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
