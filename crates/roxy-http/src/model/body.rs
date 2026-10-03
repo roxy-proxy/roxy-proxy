@@ -119,7 +119,22 @@ impl Body {
         B::Data: Send,
         B::Error: fmt::Display,
     {
-        let known_length = body.size_hint().exact();
+        let known = body.size_hint().exact();
+        Self::wrap_with_length(body, max_bytes, known)
+    }
+
+    /// Like [`Body::wrap`] with an explicitly declared length (e.g. from a
+    /// `content-length` field). Any mismatch between the declared length and
+    /// the bytes that flow ends the body with [`BodyError::LengthMismatch`].
+    pub fn wrap_with_length<B>(body: B, max_bytes: u64, known_length: Option<u64>) -> Self
+    where
+        B: http_body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: fmt::Display,
+    {
+        if known_length == Some(0) && body.is_end_stream() {
+            return Self::empty();
+        }
         Self {
             inner: Inner::Boxed {
                 body: Box::pin(Capped {
