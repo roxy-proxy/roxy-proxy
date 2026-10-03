@@ -1228,12 +1228,17 @@ impl RuleCx<'_> {
                     None
                 }
             }
+            Action::Capture(_) => Some(format!(
+                "`capture` is decided at the request head, so the whole exchange is captured \
+                 from its first byte; {}. Capture in a head rule (e.g. the allow that \
+                 forwards this traffic)",
+                why()
+            )),
             Action::Deny(_)
             | Action::Passthrough
             | Action::Tag(_)
             | Action::Log(_)
             | Action::SetState(_)
-            | Action::Capture(_)
             | Action::Call(_) => None,
         }
     }

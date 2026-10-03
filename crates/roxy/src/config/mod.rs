@@ -527,6 +527,8 @@ fn both_directions() -> Vec<Direction> {
 #[serde(deny_unknown_fields, default)]
 pub struct Log {
     pub flow: FlowLog,
+    /// Body capture / traffic tee (§10.2), written under `capture_dir`.
+    pub capture: CaptureLog,
     /// Extra header names whose values are never logged, on top of the
     /// built-in list.
     pub redact_headers: Vec<String>,
@@ -561,6 +563,52 @@ impl Default for FlowLog {
             max_files: None,
             compress: false,
         }
+    }
+}
+
+/// `log.capture`: how captured traffic is written (§10.2). Which exchanges
+/// are captured: those a rule's `capture` action selects, or every
+/// forwarded exchange with `all: true`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CaptureLog {
+    /// Capture every forwarded exchange, both directions.
+    pub all: bool,
+    /// Unwritten capture bytes at which traffic is held back.
+    #[serde(deserialize_with = "units::size")]
+    pub high_water: ByteSize,
+    /// Rotate `capture.rxc` once it reaches this size; absent = never.
+    #[serde(deserialize_with = "units::opt_size")]
+    pub max_file_bytes: Option<ByteSize>,
+    /// Keep at most this many rotated files; absent = keep all.
+    pub max_files: Option<usize>,
+    /// Gzip rotated files.
+    pub compress: bool,
+}
+
+impl Default for CaptureLog {
+    fn default() -> Self {
+        Self {
+            all: false,
+            // Captured bodies are bulkier than events: a larger backlog
+            // before traffic is held.
+            high_water: ByteSize::b(64 << 20),
+            max_file_bytes: None,
+            max_files: None,
+            compress: false,
+        }
+    }
+}
+
+impl Config {
+    /// Whether anything captures: a `capture` action or `log.capture.all`.
+    pub fn uses_capture(&self) -> bool {
+        self.log.capture.all
+            || self
+                .rules
+                .iter()
+                .flat_map(|r| r.then.0.iter())
+                .any(|a| matches!(a, Action::Capture(_)))
     }
 }
 
