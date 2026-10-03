@@ -182,6 +182,8 @@ async fn handle(req: Request<Incoming>, st: Arc<UpState>) -> Result<Response<Box
     }
     Ok(match path.as_str() {
         "/status/500" => full(StatusCode::INTERNAL_SERVER_ERROR, "upstream exploded"),
+        // Answers without echoing anything back (endpoint tests).
+        p if p.starts_with("/no-echo") => full(StatusCode::OK, "scored"),
         "/big" => {
             let size: usize = parts
                 .uri
