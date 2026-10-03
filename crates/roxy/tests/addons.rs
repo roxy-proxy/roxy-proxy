@@ -6,10 +6,13 @@ mod support;
 
 use std::time::Duration;
 
+use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::Value;
 use support::{Harness, Opts, SECRET, h2_get};
+use tokio_tungstenite::tungstenite::Message;
 
 const TEST_LAYER: &[u8] = include_bytes!("../../roxy-wasm/tests/fixtures/test_layer.wasm");
+const TUNNEL_LAYER: &[u8] = include_bytes!("../../roxy-wasm/tests/fixtures/tunnel_layer.wasm");
 
 const ALLOW_UPSTREAM: &str = r#"
   - id: upstream
@@ -20,8 +23,12 @@ const ALLOW_UPSTREAM: &str = r#"
 /// Writes the test layer into a temp dir and returns the `addons:` YAML for
 /// one addon named `t` with `extra` lines (indented 4) under it.
 fn addon_yaml(dir: &std::path::Path, extra: &str) -> String {
-    let path = dir.join("test_layer.wasm");
-    std::fs::write(&path, TEST_LAYER).unwrap();
+    addon_yaml_for(dir, TEST_LAYER, extra)
+}
+
+fn addon_yaml_for(dir: &std::path::Path, wasm: &[u8], extra: &str) -> String {
+    let path = dir.join("layer.wasm");
+    std::fs::write(&path, wasm).unwrap();
     let mut out = format!("addons:\n  - name: t\n    path: {}\n", path.display());
     for l in extra.lines() {
         out.push_str("    ");
@@ -34,8 +41,12 @@ fn addon_yaml(dir: &std::path::Path, extra: &str) -> String {
 /// Starts roxy with the test layer (`addon` lines under the addon) and
 /// `rules`.
 async fn start(addon: &str, rules: &str) -> Harness {
+    start_layer(TEST_LAYER, addon, rules).await
+}
+
+async fn start_layer(wasm: &[u8], addon: &str, rules: &str) -> Harness {
     let tmp = tempfile::tempdir().unwrap();
-    let extra = addon_yaml(tmp.path(), addon);
+    let extra = addon_yaml_for(tmp.path(), wasm, addon);
     let h = Harness::start_with(Opts {
         rules,
         extra: &extra,
@@ -380,5 +391,90 @@ async fn layers_run_for_h2_clients() {
     let (parts, body) = h2_get(&send, &h.https_url("/via-h2"), &[]).await.unwrap();
     assert_eq!(parts.status, 200);
     assert_eq!(json(&body)["path"], "/via-h2");
+    h.stop().await;
+}
+
+const ALLOW_WS: &str = r#"
+  - id: ws
+    when: host == "ws.test"
+    then: { allow: { upgrade: websocket, private_ok: true } }
+"#;
+
+async fn ws_echo(h: &Harness) {
+    let port = h.upstream.ws.port();
+    let tls = h
+        .tls_tunnel(&format!("ws.test:{port}"), "ws.test")
+        .await
+        .unwrap();
+    let (mut ws, resp) = tokio_tungstenite::client_async(format!("wss://ws.test:{port}/echo"), tls)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 101);
+    ws.send(Message::text("hello through the stack"))
+        .await
+        .unwrap();
+    let back = ws.next().await.unwrap().unwrap();
+    assert_eq!(
+        back.into_text().unwrap().as_str(),
+        "hello through the stack"
+    );
+    ws.send(Message::binary(vec![7u8; 100_000])).await.unwrap();
+    let back = ws.next().await.unwrap().unwrap();
+    assert_eq!(back.into_data().len(), 100_000);
+    ws.close(None).await.unwrap();
+}
+
+/// A layer without `tunnel` sees (and could refuse) the upgrade request,
+/// then is out of the byte path.
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_through_a_plain_layer() {
+    let h = start("", ALLOW_WS).await;
+    ws_echo(&h).await;
+    let close = h.wait_events("ws_close", 1).await;
+    assert!(close[0]["bytes_c2s"].as_u64().unwrap() > 100_000);
+    let ev = h.wait_events("request", 1).await;
+    assert_eq!(ev[0]["addons"], serde_json::json!(["t"]));
+    assert_eq!(ev[0]["terminal_rule"], "ws");
+    h.stop().await;
+}
+
+/// A layer that exports `tunnel` gets the raw streams after the `101`; the
+/// rules' relay still sees every byte that leaves.
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_through_a_tunnel_layer() {
+    let h = start_layer(TUNNEL_LAYER, "", ALLOW_WS).await;
+    ws_echo(&h).await;
+    let close = h.wait_events("ws_close", 1).await;
+    assert!(close[0]["bytes_c2s"].as_u64().unwrap() > 100_000);
+    assert!(close[0]["bytes_s2c"].as_u64().unwrap() > 100_000);
+    let ev = h.wait_events("request", 1).await;
+    assert!(
+        ev[0]["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "tunnel"),
+        "{ev:#?}"
+    );
+    h.stop().await;
+}
+
+/// A layer can refuse the upgrade itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_layer_can_refuse_an_upgrade() {
+    let h = start("", ALLOW_WS).await;
+    let port = h.upstream.ws.port();
+    let tls = h
+        .tls_tunnel(&format!("ws.test:{port}"), "ws.test")
+        .await
+        .unwrap();
+    let req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+        format!("wss://ws.test:{port}/echo"),
+    )
+    .unwrap();
+    let mut req = req;
+    req.headers_mut().insert("x-test", "deny".parse().unwrap());
+    let err = tokio_tungstenite::client_async(req, tls).await.unwrap_err();
+    assert!(err.to_string().contains("403"), "{err}");
     h.stop().await;
 }

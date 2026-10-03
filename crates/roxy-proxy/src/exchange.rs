@@ -611,6 +611,12 @@ async fn splice_websocket(
         conn: cx.conn_id(),
         host,
     });
+    // Layers that export `tunnel` sit between the client and the relay;
+    // the bytes that came with the upgrade request go through them.
+    let (client_io, leftover): (crate::io::BoxIo, Vec<u8>) = match &cx.stack {
+        Some(st) => crate::addons::chain_tunnels(st, Box::new(client_io), leftover.to_vec()),
+        None => (Box::new(client_io), leftover.to_vec()),
+    };
     let mut upstream = TokioIo::new(upgraded);
     let idle = cx.snap.limits.idle_timeout;
     let Some(watch) = cx.watch.clone() else {

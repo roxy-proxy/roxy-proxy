@@ -366,6 +366,9 @@ pub(crate) async fn run<F: Front>(
     }
     if res.status == http::StatusCode::SWITCHING_PROTOCOLS {
         if let Some((on, key)) = st.take_upgrade() {
+            // A layer cannot express `upgrade: websocket` (hop-by-hop); the
+            // core relayed a real upgrade, so restore it.
+            res.meta.upgrade = Some("websocket".to_owned());
             return Outcome::Upgrade { res, on, key };
         }
         let layer = st.snap.addons[0].name.clone();
@@ -527,4 +530,62 @@ impl HttpBody for Gated {
 fn gated(body: Body, sink: Arc<dyn FlowSink>) -> Body {
     let known = body.known_length();
     Body::wrap_native(Gated { inner: body, sink }, u64::MAX, known)
+}
+
+/// Inserts the stack's `tunnel` layers (outermost first) between the client
+/// and the WebSocket relay (§11.1): each gets the raw byte streams of the
+/// upgraded connection. The rules' relay stays the hop next to the
+/// upstream, so byte budgets still see what leaves. `leftover` (bytes that
+/// arrived with the upgrade request) goes through the layers too, and the
+/// returned leftover is then empty. Without a `tunnel` layer, returns its
+/// inputs.
+type ReadSide = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+type WriteSide = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
+
+pub(crate) fn chain_tunnels(
+    st: &Arc<StackFlow>,
+    client: crate::io::BoxIo,
+    leftover: Vec<u8>,
+) -> (crate::io::BoxIo, Vec<u8>) {
+    use tokio::io::AsyncReadExt;
+    let tunnels: Vec<usize> = st
+        .snap
+        .addons
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| !a.observe && a.layer.has_tunnel())
+        .map(|(i, _)| i)
+        .collect();
+    if tunnels.is_empty() {
+        return (client, leftover);
+    }
+    let (cr, cw) = tokio::io::split(client);
+    let mut side_r: ReadSide = Box::new(std::io::Cursor::new(leftover).chain(cr));
+    let mut side_w: WriteSide = Box::new(cw);
+    for index in tunnels {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let (ar, aw) = tokio::io::split(a);
+        let addon = st.snap.addons[index].clone();
+        let host = Arc::new(host::StackHost {
+            st: st.clone(),
+            index,
+            observer: None,
+        });
+        let from_client = std::mem::replace(&mut side_r, Box::new(tokio::io::empty()));
+        let to_client = std::mem::replace(&mut side_w, Box::new(tokio::io::sink()));
+        let st2 = st.clone();
+        tokio::spawn(async move {
+            if let Err(e) = addon
+                .layer
+                .tunnel(host, from_client, aw, ar, to_client)
+                .await
+            {
+                emit_layer_error(&st2, &addon.name, &e, false);
+            }
+        });
+        let (br, bw) = tokio::io::split(b);
+        side_r = Box::new(br);
+        side_w = Box::new(bw);
+    }
+    (Box::new(tokio::io::join(side_r, side_w)), Vec::new())
 }

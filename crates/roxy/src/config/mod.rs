@@ -482,10 +482,6 @@ pub struct Endpoint {
     /// Allow private, loopback and link-local addresses (default false).
     #[serde(default)]
     pub private_ok: bool,
-    /// Log request and response bodies in `endpoint_call` events (default
-    /// false).
-    #[serde(default)]
-    pub record_bodies: bool,
 }
 
 /// An addon's keyed store (§11.3). Nothing is evicted: a write when full

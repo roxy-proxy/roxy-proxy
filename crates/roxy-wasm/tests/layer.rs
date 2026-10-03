@@ -709,15 +709,15 @@ async fn tunnel_is_detected_and_relays() {
         LayerError::NoTunnel
     );
 
-    let layer = Layer::load(&rt, TUNNEL_LAYER.to_vec(), config())
-        .await
-        .unwrap();
+    let mut cfg = config();
+    cfg.config_json = r#"{"upper": true}"#.into();
+    let layer = Layer::load(&rt, TUNNEL_LAYER.to_vec(), cfg).await.unwrap();
     assert!(layer.has_tunnel());
-    // The tunnel layer also handles plain exchanges.
+    // The tunnel layer passes plain exchanges through.
     let (_, body) = exchange(&layer, Mock::echo(), request("x", Body::empty()))
         .await
         .unwrap();
-    assert_eq!(body, "tunnel layer");
+    assert_eq!(body, "");
 
     // client <-> [layer] <-> upstream
     let (client, client_side) = tokio::io::duplex(1024);
