@@ -556,12 +556,15 @@ rules:
     when: response.status >= 500
     then: { log: { level: warn, message: "upstream 5xx" } }
 
+layers: [pii-scan, rules]       # order of the layer stack (§11.1)
+
 addons:
   - name: pii-scan
+    kind: wasm
     path: /etc/roxy/addons/pii_scan.wasm
-    stage: before_rules          # before_rules | in_chain | after_rules
+    mode: enforce
     config: { threshold: 0.8 }
-    capabilities: [state, log]
+    capabilities: [state, record]
 ```
 
 Relative paths in the config (`ca_dir`, secret files, addon paths, log and
@@ -684,7 +687,7 @@ Non-terminal (evaluation continues):
 | `log: { level, message }` | all | emits an extra log event |
 | `set_state: { key, value, ttl }` | all | writes to the state store (visible as `state["key"]`) |
 | `capture: request | response | both` | request, response | writes bodies to the capture dir (§10) |
-| `call: addon_name` | request, response, ws | runs that addon's hook now; its decision may deny or mutate |
+| `call: addon_name` | — | reserved; rejected by the compiler. Layer order in `layers` replaces it (§11.1) |
 
 Actions are a small closed enum, deliberately. Anything richer is an addon.
 
@@ -938,7 +941,7 @@ produces at least one `request` event; connection-level events are optional
 ```
 
 Event types: `connect`, `request`, `response_error`, `ws_message` (sampled or
-denied only, configurable), `parse_error`, `upstream_error`, `addon_error`,
+denied only, configurable), `parse_error`, `upstream_error`, `layer_error`, `layer_record`, `endpoint_call`, `quarantined`,
 `config_reloaded`, `config_reload_failed`, `passthrough`.
 
 **Redaction:** every injected secret value is registered with a `Redactor`
@@ -966,229 +969,354 @@ Sinks implement `trait FlowSink { fn emit(&self, event: &FlowEvent); }`:
 
 ---
 
-## 11. WASM addons
+## 11. Layers and addons
 
-### 11.1 Model: addons are streaming middleware
+### 11.1 The layer stack
 
-An addon is a WebAssembly **component** that implements roxy's `handler`
-interface, which is deliberately shaped like `wasi:http/incoming-handler`:
-the addon receives a request as a **head plus a body stream**, and it calls
-`chain.next(request)` to hand a (possibly different) request stream down the
-rest of the pipeline and receive the response as a head plus a body stream.
-It then returns a response stream of its own. Nothing is buffered unless the
-addon itself chooses to read a stream to completion.
+An exchange passes through an ordered stack of **layers**. Each layer wraps
+everything below it: it receives the request (head plus body stream), may
+pass a request down with `next`, receives the response stream from below,
+and returns a response stream upward. The request travels down the stack and
+the response travels back up it in reverse order, so the first layer to see
+the request is the last to see the response.
 
 ```
-agent ──▶ [canonicalise] ──▶ addon A ──▶ addon B ──▶ [rules] ──▶ [connector] ──▶ origin
-                               │  next()    │  next()
-                               └────────────┴── each addon wraps the rest of the chain
+                 request ↓                                   ↑ response
+ fixed   ┌─ connect gate (connect-phase rules, CONNECT/SNI) ─────────────┐
+ fixed   ├─ quarantine gate (§11.3 terminate)                            │
+ config  ├─ layer: sentinel        (wasm | remote, enforce | observe)    │
+ config  ├─ layer: redactor                                              │
+ config  ├─ layer: rules           (built-in: request ↓ / response ↑)    │
+ config  ├─ layer: egress-shaper   (may not change the destination)      │
+ fixed   ├─ address floor + deny lists (on the IP actually dialled)      │
+ fixed   └─ connector ──▶ origin ────────────────────────────────────────┘
 ```
 
-With this shape the patterns from the brief fall out naturally:
+Configuration is one ordered list that must contain the built-in `rules`
+layer exactly once:
 
-- **Pass-through / observe:** `next(req)` and return its response unchanged.
-- **Rewrite in flight:** wrap the request body stream in a transform (e.g.
-  redact tokens chunk by chunk), call `next` with the wrapped stream.
-- **Redirect:** change the authority on the request head before `next`.
-- **Transform via a helper service:** open a side request with
-  `wasi:http/outgoing-handler` (the standard WASI HTTP client, so ordinary
-  HTTP libraries in Rust, Python, JS and Go work), pipe the incoming body
-  stream into it, and pipe *its* response body into `next` as the new
-  request body. Three streams, zero buffering.
+```yaml
+layers: [sentinel, redactor, rules, egress-shaper]
+```
+
+`layers` defaults to `[rules]`. Everything marked *fixed* is not
+configurable. The connect gate runs before any layer sees bytes. The address
+floor and deny lists (§7, §7.1) are the innermost layer because the IP is
+only known after DNS resolution, so they always check the IP that is dialled,
+whatever any layer above did.
+
+**Invariants.**
+
+1. **The rules evaluate every request that leaves for the network.** A layer
+   above `rules` can reshape traffic freely; its output is re-validated by
+   the canonical model and then judged by the rules exactly as if the agent
+   had sent it. A layer below `rules` may mutate headers, path, query and
+   body but **may not change the destination** (authority or scheme); doing
+   so denies the flow with `layer_invalid_mutation`, so the rules' decision
+   about where traffic goes stays authoritative.
+2. **Every layer is held to the workload's limits.** Whatever a layer passes
+   on is treated as if a client sent it: header limits, body caps, idle
+   timeouts.
+3. **Failure is closed.** A layer that traps, exceeds a budget, or returns an
+   invalid head denies the flow (or closes the connection if the response
+   head is already out). There is no `on_error: pass`; see observe mode for
+   the one safe way to run a layer whose failures do not matter.
+
+The earlier `stage: before_rules | after_rules` setting and the rule action
+`call: <addon>` are replaced by position in `layers`. `call:` stays a
+reserved word in the rule grammar and is rejected by the compiler.
+
+**Layer kinds.** A layer is either a **wasm** component running in-process
+(§11.4) or a **remote** service that roxy calls over HTTP (§11.6). Both
+implement the same contract and get the same host services.
+
+**Modes.**
+
+- `mode: enforce` (default). The layer is in the path and its decisions take
+  effect.
+- `mode: observe`. roxy **tees** both streams to the layer and discards
+  anything it returns other than records (§11.3). The layer cannot change or
+  delay traffic, so its failures cannot weaken containment: a trap or
+  timeout is logged, not fatal, and if the layer falls behind roxy drops its
+  copy (logging `observer_lagged`) rather than stall the flow. The tee buffer
+  is bounded per flow. This is the right way to deploy an uncalibrated
+  scoring monitor, which the sentinel design recommends as the proxy
+  default.
+
+**Multiple `next` calls.** A layer may call `next` more than once per
+exchange, up to `max_next_calls` (default 1). Each call is a full pass
+through every layer below it, including the rules and the address floor.
+This is what a sentinel needs for *reject as replay*: when it rejects a
+`tool_use` block, it appends the rejected call and a synthetic result to the
+conversation, regenerates through `next`, and returns the new response. The
+bound is the sentinel design's `MAX_CONSECUTIVE_REJECTIONS`.
+
+**Full bidirectional access, low level.** A layer owns everything at its
+position in both directions. It may read, rewrite, split, delay, inject into,
+or replace any stream, chunk by chunk. roxy buffers nothing on a layer's
+behalf; a layer that wants a whole body reads its stream to the end, up to
+its `max_buffered_body_bytes`. For upgraded connections (the WebSocket relay
+tier) a layer that exports `tunnel` gets the two raw byte streams after the
+`101`. A layer without `tunnel` is not in that path, but the upgrade
+*request* still passes through it, so it can refuse the upgrade.
+
+Typical patterns:
+
+- **Observe:** `next(req)`, return its response unchanged (or use observe mode).
+- **Rewrite in flight:** wrap a body stream in a transform, chunk by chunk.
+- **Withhold until cleared:** forward a streamed response's text events as
+  they arrive, but hold back `tool_use` blocks until the layer has judged
+  them. Envoy's buffered/streamed processing modes cannot express this; a
+  streaming layer can.
+- **Transform via a helper:** pipe the body into a named endpoint (§11.3)
+  and pipe its response into `next`.
 - **Deny or synthesise:** return a response without calling `next`.
 
-**Full bidirectional access, low level.** An addon owns everything that
-passes through its position in the chain, in both directions: the request
-head and body stream on the way in, and the response head and body stream on
-the way back. It may read, rewrite, split, delay, inject into, or replace any
-of them, chunk by chunk. For upgraded connections (WebSocket relay tier) the
-addon gets the two raw byte streams after the `101` (`on-tunnel` hook:
-`client-to-upstream` and `upstream-to-client` as `input-stream` /
-`output-stream` pairs) and may pass bytes through, transform them, or close
-either side. Nothing is buffered by roxy on an addon's behalf; an addon that
-wants a whole message reads its stream to the end itself, subject to its
-buffer cap.
+roxy stays protocol-agnostic. It knows HTTP, not model APIs: parsing
+Anthropic or OpenAI payloads into conversation steps is the layer's job.
 
-**Default limits apply to addons exactly as to clients.** Whatever an addon
-emits towards the next layer is treated as if a client sent it: re-validated
-by the canonical model, subject to `limits.max_request_body_bytes` /
-`max_response_body_bytes`, the header limits, and the body idle timeouts. An
-addon cannot use its position to exceed a limit the workload is held to.
-Per-addon resource limits default to the global ones and can only be
-tightened per addon, except where an addon genuinely needs more (see
-below).
-
-**Primary use case: an inspection sentinel compiled to WASM** (e.g. a
-classifier that scans outbound bodies for secrets or prompt-injection
-payloads, or inbound responses for instructions aimed at the agent). Such an
-addon typically reads the stream, buffers up to its cap, decides, then
-either forwards the bytes unchanged, forwards a redacted version, or returns
-a deny. Because it may need more memory or CPU than a simple rewriter, these
-per-addon overrides exist and are logged at startup:
+### 11.2 Configuration
 
 ```yaml
+layers: [sentinel, rules]
+
 addons:
   - name: sentinel
+    kind: wasm                        # wasm | remote
     path: /etc/roxy/addons/sentinel.wasm
-    stage: before_rules
-    limits:                       # defaults shown; each may be raised explicitly
+    mode: enforce                     # enforce | observe
+    max_next_calls: 4                 # bound on regenerate-after-reject
+    capabilities: [state, record, endpoints, terminate]
+    endpoints:                        # named, not URLs (§11.3)
+      monitor-model:
+        url: https://api.anthropic.com/v1/messages
+        headers: { x-api-key: "${secret:monitor_key}" }   # attached by roxy, never seen by the layer
+        timeout: 10s
+        retries: 2
+      threat-intel:
+        url: https://ti.internal:8443/score
+        private_ok: true
+        timeout: 500ms
+    state:
+      max_entries: 100000
+      max_value_bytes: 64kb
+      default_ttl: 6h
+    limits:                           # defaults shown; raising one is logged at startup
       max_memory: 64mb
-      max_buffered_body_bytes: 1mb   # defaults to limits.max_inspect_body_bytes
-      step_cpu: 50ms
+      max_buffered_body_bytes: 1mb    # defaults to limits.max_inspect_body_bytes
+      step_cpu: 50ms                  # CPU between host calls
+      max_exchange_time: 60s          # wall clock per exchange, including endpoint calls
       fuel_per_step: 100_000_000
-    on_error: deny                # deny (default) | close. Never "pass".
+      recycle_after_exchanges: 10000  # replace the instance (bounds linear-memory ratchet)
+      recycle_above_memory: 48mb
+    config: { reject_at: 0.8 }        # opaque JSON handed to the layer
 ```
 
-There is deliberately no `on_error: pass`: a sentinel that crashes, times
-out, or exceeds its cap fails the flow closed, so an attacker cannot disable
-inspection by feeding the sentinel input that makes it trap.
+An LLM-API sentinel will normally raise `max_buffered_body_bytes` (requests
+resend the whole conversation and reach several MiB), `max_memory` (an
+embedded CPython needs roughly 128–256 MiB), and `max_exchange_time` (judging
+with a model takes 0.2–2 s).
 
-**No hook list.** There is one entry point, `handle`, which sees the whole
-exchange: the request stream comes in, the addon calls `next`, the response
-stream comes back, the addon returns a response stream. "Request hook" and
-"response hook" are just the code before and after `next`. The only optional
-export is `tunnel`; roxy inspects the component's exports at load time, and
-an addon without `tunnel` simply is not in the path of upgraded byte streams
-(the WebSocket upgrade *request* still passes through its `handle`, so it can
-refuse the upgrade).
+### 11.3 Host services
 
-**Stages.** Each addon declares `stage: before_rules | after_rules`
-(default `before_rules`), or is invoked at a precise point by a rule's
-`call: <addon>` action (`in_chain`). Within a stage, addons are ordered as
-listed in config. `before_rules` addons see every canonical request;
-`after_rules` ones see only requests the rules allowed.
+Everything a layer can do to the world outside its streams is enumerable
+from this list, and each item is a capability granted in config. An import
+that is not granted fails immediately.
 
-**Invariant: the rule chain always evaluates the final outgoing request.**
-Whatever request an addon passes to `next` is re-validated by the canonical
-model (invalid header, path climbing above root, bad host → flow denied,
-reason `addon_invalid_mutation`) and then evaluated by the rules exactly as
-if the agent had sent it. For `after_rules` addons the rules run again on
-the mutated request. An addon can reshape traffic; it cannot bypass policy.
-The YAML rules remain the floor, auditable without reading WASM.
+- **`endpoints` (named outbound calls).** A layer calls an endpoint by
+  *name*; roxy resolves the name to a URL, attaches credentials from
+  secrets, applies the timeout and retry policy, and enforces the address
+  floor and deny lists. The layer cannot express a destination, so text
+  injected into the traffic it inspects cannot steer it to an
+  attacker-chosen host, and credentials never enter the layer. Calls are
+  JSON-or-bytes over HTTP with streaming bodies. A deliberate `"*"` endpoint
+  that accepts a URL can be configured but is not the default shape.
+  Endpoint calls never pass through the layer stack, so a monitor's own
+  model call cannot recurse through the sentinel. Each call emits an
+  `endpoint_call` flow event (status, bytes, timing; bodies only with
+  `record_bodies: true`, for replay).
+- **`state` (keyed store).** A JSON-value store namespaced per layer, with
+  per-entry TTL, a value size cap and an entry cap. A miss returns `none`,
+  which the layer treats as "no history" (the sentinel design's degrade-to-
+  pure-function rule). A write when full returns an error and the layer
+  decides; nothing is evicted. Backed by `StateSource`, so a shared backend
+  can replace it for multi-replica gateways.
+- **Trusted identity.** `flow.current()` gives the principal as roxy
+  established it: `client.user` from proxy auth, `client.ip`, listener, TLS
+  SNI. These are the safe keys for per-principal state. A per-conversation
+  key is the layer's job (the sentinel design fingerprints the stable head of
+  the conversation), and a layer should strip any client-supplied session
+  header rather than trust it.
+- **`record` (structured events).** `flow.record(kind, json, audit: bool)`
+  writes a structured, redacted event to the flow log with the flow id, the
+  layer name and a timestamp. `audit: true` also sends it to the configured
+  `audit_endpoint`. This is the sentinel `Recorder`: observations,
+  decisions, failures and escalations land in the same JSONL stream as
+  roxy's own events.
+- **`terminate` (out-of-band).** `flow.terminate(scope, reason, ttl)` with
+  scope `connection` or `principal`. `principal` adds the client's identity
+  to the quarantine set, so the fixed quarantine gate denies every later
+  request from it with rule `_quarantined` until the TTL expires or an
+  operator clears it, and optionally notifies a `terminate_endpoint` (an
+  orchestrator that can stop the agent). Returns whether it took effect. This
+  answers the sentinel design's "what owns the lifecycle a proxy's terminate
+  reaches": roxy does, locally, and can also tell whoever owns the agent.
+- **`metrics` (read-only)** of the `metrics:` definitions, and `log`.
+- **`secrets`** is still a capability but discouraged; endpoints attach
+  credentials without exposing them.
 
-**Side requests** made through `wasi:http/outgoing-handler` are
-proxy-initiated, not workload traffic, so they do **not** go through the
-workload rule chain. They are governed by the addon's own declaration in
-config:
+Never hang a request. A layer that waits past `max_exchange_time` is
+stopped and the flow denied or closed. Denial is an immediate response, so a
+client sees a refusal rather than a stall that would trigger retries.
 
-```yaml
-addons:
-  - name: redact
-    path: /etc/roxy/addons/redact.wasm
-    capabilities: [http, log]
-    http:
-      allow: ["redactor.internal:8443", "*.vault.example.com:443"]  # host[:port] globs; required when `http` is granted
-      private_ok: true          # helper services usually live on private ranges; default false
-      timeout: 5s
-```
+### 11.4 WASM layers: WIT sketch
 
-A side request to a destination not in `http.allow` fails inside the addon
-with an error code; an empty or missing `allow` with the `http` capability is
-a config error (fail closed). The built-in private-range deny applies unless
-`private_ok` is set. The connector's other machinery is shared: roxy does the
-DNS, verifies upstream TLS, applies size and time limits, and emits a flow
-event with `client.user = "addon:<name>"` and tag `addon-side-request` so the
-traffic is visible in the same log. Side requests never pass through addons
-or rules themselves, so depth is naturally 1.
-
-**Body-dependent rules and addons.** If a rule needs `body.text`, the rules
-stage buffers the body it receives (after any `before_rules` addons) up to
-`limits.max_inspect_body_bytes`, evaluates, then replays the buffered bytes
-downstream as a stream. An addon that wants the whole body simply reads its
-input stream to the end; the host enforces the same cap on how much any one
-addon may hold (`addons.max_buffered_body_bytes`, default 1 MiB; exceeding it
-traps the addon and denies the flow).
-
-### 11.2 WIT sketch
-
-roxy reuses the WASI 0.2 HTTP types (`wasi:http/types`: `incoming-request`,
-`outgoing-request`, `incoming-body`, `outgoing-body`, `input-stream`,
-`output-stream`, `future-incoming-response`) rather than inventing its own
-body model, so existing WASI HTTP tooling and language SDKs apply.
+roxy reuses the WASI 0.2 HTTP types for heads and bodies so existing
+tooling applies.
 
 ```wit
 package roxy:addon@0.1.0;
 
 interface chain {
   use wasi:http/types@0.2.0.{outgoing-request, future-incoming-response, error-code};
-  /// Pass a request down the rest of roxy's pipeline (remaining addons, rules,
-  /// connector). The response streams back. Exactly one call per handled
-  /// request; a second call traps.
+  /// Pass a request through every layer below this one. May be called up to
+  /// `max_next_calls` times per exchange; each call is a full pass.
   next: func(req: outgoing-request) -> result<future-incoming-response, error-code>;
 }
 
+interface endpoints {
+  use wasi:http/types@0.2.0.{outgoing-request, future-incoming-response, error-code};
+  /// Call a configured endpoint by name. The request's authority is ignored;
+  /// path and query are appended to the endpoint's URL.
+  call: func(name: string, req: outgoing-request) -> result<future-incoming-response, error-code>;
+}
+
 interface flow {
-  record flow-info { flow-id: string, conn-id: string, client-ip: string,
-                     client-user: option<string>, listener: string,
-                     tls-sni: option<string>, tags: list<string> }
+  record principal { client-ip: string, client-user: option<string>,
+                     listener: string, tls-sni: option<string> }
+  record flow-info { flow-id: string, conn-id: string, principal: principal,
+                     tags: list<string> }
+  enum scope { connection, principal }
   current: func() -> flow-info;
   add-tag: func(tag: string);
   log: func(level: u8, msg: string);
-  state-get: func(key: string) -> option<string>;
-  state-set: func(key: string, value: string, ttl-ms: option<u64>);
-  metric-get: func(id: string, key: list<string>) -> option<u64>;
-  secret-get: func(name: string) -> option<string>;   // `secrets` capability
-  config: func() -> string;                            // addon's JSON config blob
+  record: func(kind: string, json: string, audit: bool);
+  terminate: func(scope: scope, reason: string, ttl-ms: option<u64>) -> bool;
+  state-get: func(key: string) -> option<string>;                         // JSON
+  state-put: func(key: string, json: string, ttl-ms: option<u64>) -> result<_, string>;
+  metric-get: func(id: string, key: list<string>) -> option<s64>;
+  config: func() -> string;
 }
 
 interface tunnel {
   use wasi:io/streams@0.2.0.{input-stream, output-stream};
-  /// Called once per upgraded connection after the 101. The addon pumps
-  /// bytes between the pairs (or transforms/closes them) and returns when done.
   on-tunnel: func(from-client: input-stream, to-upstream: output-stream,
                   from-upstream: input-stream, to-client: output-stream);
 }
 
-world addon {
-  include wasi:cli/imports@0.2.0;                      // clocks, random, streams; no fs, no sockets
-  import wasi:http/outgoing-handler@0.2.0;             // side requests (`http` capability)
+world layer {
+  include wasi:cli/imports@0.2.0;        // clocks, random, streams; no fs, no sockets, no env
   import chain;
+  import endpoints;
   import flow;
-  export wasi:http/incoming-handler@0.2.0;             // handle(request, response-outparam)
-  export tunnel;                                       // optional; roxy detects whether it is exported
+  export wasi:http/incoming-handler@0.2.0;
+  export tunnel;                         // optional; detected at load time
   export init: func() -> result<_, string>;
 }
 ```
 
-The host implements `incoming-handler` dispatch, `chain.next` (continue the
-pipeline), and `outgoing-handler` (policy-checked side request) with
-`wasmtime-wasi-http`. The `wasi:cli` imports are the minimal set: no
-filesystem, no sockets, no environment.
+Instances: one per worker thread per layer by default. A guest with its own
+async runtime (for example CPython's asyncio over `wasi:io/poll`) can serve
+several in-flight exchanges per instance; whether that works for CPython is
+the sentinel design's open prototype question, and the host does not depend
+on the answer. Instances are recycled after `recycle_after_exchanges` or when
+their linear memory passes `recycle_above_memory`, which bounds the memory
+ratchet the sentinel design warns about.
 
-### 11.3 Safety
+### 11.5 Safety
 
-- **Capabilities** declared in config (`capabilities: [state, log, secrets, http]`);
-  an import not granted traps → the flow is denied and `addon_error` logged.
-  `http` enables `outgoing-handler`, scoped to the addon's `http.allow`
-  destinations; without the capability the import returns an error code
-  immediately.
-- **Deadlines are per I/O step, not per request**, because a streaming
-  addon legitimately lives as long as the flow. `addons.step_timeout`
-  (default 50 ms of *CPU* between host calls, enforced with wasmtime epoch
-  interruption) and the ordinary flow idle timeouts bound wall-clock time.
-  **Fuel** is metered per step as well.
-- **Memory** cap per instance (`addons.max_memory`, default 64 MiB) and the
-  buffered-body cap above.
-- Any trap, a `next` request that fails canonical validation, or a response
-  head that is invalid → deny the flow (or, if the response head was already
-  sent to the client, close the connection) and log `addon_error`.
-- Addons never see raw wire bytes, only canonical heads and body streams.
-- One instance per worker thread per addon (component instances are not
-  `Send`); per-flow state lives in the handler's locals, shared state goes
-  through `flow.state-*`.
+- **Capabilities** declared per layer; anything not granted fails at the
+  call.
+- **CPU per step** (epoch interruption plus fuel), **wall clock per
+  exchange**, **memory per instance**, **buffered bytes per layer**. Each
+  exceeded budget fails the flow closed in enforce mode and is logged.
+- Any trap, an invalid head, or a `next` request that fails canonical
+  validation denies the flow (or closes it if the response head is out).
+- Layers see canonical heads and body streams, never raw wire bytes.
+- No filesystem, sockets or environment inside the sandbox; all I/O is
+  `next`, `endpoints` and `flow`.
 
-### 11.4 Authoring
+### 11.6 Remote layers (sidecar)
 
-For Rust, `roxy-addon` wraps the generated bindings in a small middleware
-trait so the common cases are a few lines:
+The sentinel design's quickest deployment is a Python service beside the
+proxy, the role Envoy's `ext_proc` plays. A `kind: remote` layer gives roxy
+that shape natively, with no WASM toolchain:
+
+```yaml
+addons:
+  - name: sentinel
+    kind: remote
+    endpoint: sentinel-sidecar          # a named endpoint, as in §11.3
+    phases: [request, response]
+    buffer: true                        # v1: whole bodies, up to max_buffered_body_bytes
+    mode: enforce
+```
+
+Protocol, one HTTP POST per phase to the endpoint, JSON envelope plus body:
+
+- **request phase** → `{continue}` | `{modify: {head?, body?}}` |
+  `{respond: {status, headers, body}}` | `{deny: {status, message}}` |
+  `{terminate: {scope, reason}}`.
+- **response phase** → the same set, applied to the response.
+- `regenerate` lets a remote layer ask roxy to send a modified request
+  through `next` again (counted against `max_next_calls`).
+
+The envelope carries the flow id, principal and tags, so the sidecar can key
+its state. A streaming variant (chunk frames over HTTP/2) can follow; v1 is
+buffered, which is what the sentinel design's monitors assume. The sidecar
+runs with whatever Python dependencies it likes; roxy still enforces the
+endpoint timeout, the budgets, and fail-closed behaviour in enforce mode.
+
+### 11.7 Sentinel substrate: mapping
+
+How the inspect_sentinel proxy deployment maps onto roxy, so a sentinel can
+be built on roxy without roxy knowing anything about model APIs.
+
+| sentinel need | roxy provides |
+|---|---|
+| `BeforeGenerate` (request body) | request stream at the layer's position |
+| `AfterGenerate` (response body) | response stream on the way back up |
+| `BeforeToolCall` (tool_use in response) | the response stream; can withhold tool_use blocks while forwarding text |
+| `AfterToolCall` (tool_result in next request) | next request's stream (lossy by nature, as the design notes) |
+| `continue` / `modify` | pass through / rewrite the stream |
+| `reject` as replay, bounded | multiple `next` calls, `max_next_calls` |
+| error response | return a synthetic response |
+| `terminate` | `flow.terminate` → quarantine gate, optional `terminate_endpoint` |
+| `escalate` | the sentinel's own composition; roxy sees only the final action |
+| `audit` / `Recorder` | `flow.record(..., audit: true)` into the flow log and `audit_endpoint` |
+| `host.generate` with another model | named endpoint for the monitor model |
+| `host.generate` as the agent's own model | `next` with a constructed request |
+| `host.fetch` with named endpoints | `endpoints.call` — same design, credentials attached by roxy |
+| `host.get` / `put` keyed store | `flow.state-*`, JSON values, TTL, no eviction |
+| trustworthy principal key | `flow.current().principal` from proxy auth / client IP |
+| recursion guard for monitor inference | endpoint calls bypass the layer stack |
+| never hang the request | `max_exchange_time`, immediate deny responses |
+| fail open or closed when the processor is down | closed in enforce mode; observe mode for monitors whose failure must not block |
+| sidecar deployment | `kind: remote` layer (§11.6) |
+| embedded CPython in WASM | `kind: wasm` with raised memory/time budgets and instance recycling |
+| observe-only default for uncalibrated scores | `mode: observe` (tee) |
+
+### 11.8 Authoring
+
+Rust is first class: small components, fast instantiation, real streaming.
+`roxy-addon` wraps the bindings in a middleware trait:
 
 ```rust
 use roxy_addon::prelude::*;
 
 struct RedactTokens;
-impl Middleware for RedactTokens {
+impl Layer for RedactTokens {
     fn handle(&mut self, req: Request, next: Next) -> Response {
-        // Wrap the body stream; chunks are redacted as they flow, nothing is buffered.
         let req = req.map_body(|body| body.transform(redact_chunk));
         next.run(req)
     }
@@ -1196,30 +1324,21 @@ impl Middleware for RedactTokens {
 roxy_addon::export!(RedactTokens);
 ```
 
-**Other languages.** Anything that builds a WASI 0.2 component against this
-WIT works. Realistically:
+Other languages:
 
-- **Rust**: first class. Small components (hundreds of KiB), fast
-  instantiation, real streaming. The `roxy-addon` SDK targets Rust. Use it
-  for anything on the hot path, including sentinels.
-- **Go** (TinyGo / Go 1.24+ wasip2) and **JS** (`jco componentize`): work,
-  with larger binaries and higher per-call cost.
-- **Python** via `componentize-py`: it compiles your code *together with a
-  CPython interpreter* into one component. That makes the component tens of
-  MiB, needs `max_memory` raised to roughly 128–256 MiB, costs milliseconds
-  per instantiation, and runs Python at interpreter speed inside WASM. Only
-  pure-Python dependencies work (no numpy, no native wheels). It is fine for
-  prototyping and low-volume policy, not for a per-request sentinel on
-  busy traffic. Python support is "should work, not tested in CI" until
-  someone needs it.
-- **Python that needs native libraries** (ML models, numpy) should run
-  **out of process** as a helper service, called from a thin Rust addon via
-  the `http` capability with streaming bodies (§11.1 side requests). That
-  keeps the heavy code outside the sandbox while roxy still enforces limits
-  and fail-closed behaviour on the call.
+- **Go** (wasip2) and **JS** (`jco componentize`) work, with larger binaries
+  and higher per-call cost.
+- **Python in WASM** (`componentize-py`, or the sentinel project's embedded
+  CPython) bundles an interpreter: tens of MiB, 128–256 MiB of memory,
+  milliseconds to instantiate, pure-Python dependencies only. Viable for a
+  sentinel whose cost is dominated by model inference anyway; give it the
+  raised budgets above.
+- **Python with native dependencies** runs as a remote layer (§11.6) or
+  behind a named endpoint called from a thin Rust layer.
 
-`examples/addons/` ships a Rust pass-through, a Rust streaming redactor, and
-a Rust addon that streams bodies to a helper service through `wasi:http`.
+`examples/addons/` ships a Rust pass-through, a Rust streaming redactor, a
+Rust layer that withholds `tool_use` blocks in a streamed response until a
+named endpoint clears them, and a minimal Python remote layer.
 
 ## 12. Resource limits and self-protection
 
@@ -1239,7 +1358,7 @@ socket, never a pass-through. Specifically:
 | metric key table full | deny, `metric_table_full` |
 | body or header limit exceeded mid-stream | close both sides |
 | upstream connect/TLS/DNS failure | `502`, flow logged |
-| addon trap, timeout, or invalid mutation | deny, `addon_error` |
+| layer trap, budget exceeded, or invalid mutation (enforce mode) | deny, `layer_error`; observe-mode layers log only |
 | config reload fails | keep the old policy; never run without one |
 | per-client or global connection cap | refuse new connections |
 | flow log sink cannot write | log a warning, continue (the only soft failure: losing audit lines is preferable to losing containment, and metrics expose it) |
@@ -1343,7 +1462,7 @@ be built by separate agents in parallel because `roxy-http`, `roxy-tls` and
 |---|---|---|
 | 1 | Transparent-mode upstream target (§4.2) | `resolve`; decide when transparent mode is built |
 | 2 | Rule evaluation: first terminal action wins, chain exhausted → deny (§6.1) | as stated |
-| 3 | Addons are streaming middleware (wasi:http shaped) with `chain.next`; rules always evaluate the final request; addon side requests are governed by the addon's own `http.allow`, not the workload rules (§11.1) | as stated |
+| 3 | Addons are layers in an ordered stack around the built-in `rules` layer; rules evaluate every request that leaves; layers below `rules` cannot change the destination; outbound calls go to named endpoints (§11) | as stated |
 | 4 | Deny response body includes rule id and flow id (§5.7) | yes, informative 403 by default |
 | 5 | Size units 1024-based (§6.2) | yes |
 | 6 | Licence and crate name on crates.io | MIT OR Apache-2.0; `roxy` availability to be checked |
