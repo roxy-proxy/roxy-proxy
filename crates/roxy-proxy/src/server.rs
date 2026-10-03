@@ -391,7 +391,10 @@ async fn accept_loop(listener: Arc<dyn Listener>, shared: Arc<Shared>) {
                 let s = shared.clone();
                 match client.listener.mode {
                     ListenerMode::Explicit => {
-                        shared.spawn_conn(slot, crate::conn::serve_explicit(stream, client, s));
+                        shared.spawn_conn(
+                            slot,
+                            crate::conn::serve_explicit(Box::new(stream), client, s),
+                        );
                     }
                 }
             }

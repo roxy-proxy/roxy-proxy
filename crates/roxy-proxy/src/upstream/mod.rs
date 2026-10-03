@@ -37,6 +37,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+use crate::io::BoxIo;
+
 pub(crate) use dns::Dns;
 pub use dns::DnsSettings;
 
@@ -50,6 +52,28 @@ pub struct UpstreamSettings {
     pub connect_timeout: Duration,
     /// Idle pooled connections are closed after this long.
     pub pool_idle_timeout: Duration,
+    /// Replaces the TCP dial (after DNS and the address floor, before TLS),
+    /// so tests can hand the connector an in-memory upstream.
+    #[cfg(test)]
+    pub(crate) dial: Option<TestDial>,
+}
+
+/// A substitute for `TcpStream::connect` in tests.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestDial(
+    pub(crate)  Arc<
+        dyn Fn(SocketAddr) -> Pin<Box<dyn Future<Output = std::io::Result<BoxIo>> + Send>>
+            + Send
+            + Sync,
+    >,
+);
+
+#[cfg(test)]
+impl std::fmt::Debug for TestDial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestDial")
+    }
 }
 
 impl Default for UpstreamSettings {
@@ -59,6 +83,8 @@ impl Default for UpstreamSettings {
             address_policy: AddressPolicy::default(),
             connect_timeout: Duration::from_secs(10),
             pool_idle_timeout: Duration::from_secs(90),
+            #[cfg(test)]
+            dial: None,
         }
     }
 }
@@ -95,8 +121,8 @@ impl ConnectError {
 
 /// Plain TCP or TLS to the upstream.
 pub(crate) enum MaybeTls {
-    Plain(TcpStream),
-    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+    Plain(BoxIo),
+    Tls(Box<tokio_rustls::client::TlsStream<BoxIo>>),
 }
 
 impl AsyncRead for MaybeTls {
@@ -182,6 +208,8 @@ struct ConnectorInner {
     connect_timeout: Duration,
     tls: Arc<ClientConfig>,
     private_ok: bool,
+    #[cfg(test)]
+    dial: Option<TestDial>,
 }
 
 /// `Service<Uri>` performing resolve → floor → connect → TLS.
@@ -207,6 +235,17 @@ fn tls_name(host: &Host) -> String {
 }
 
 impl ConnectorInner {
+    /// Opens the byte stream to an address that already passed the floor.
+    async fn dial(&self, addr: SocketAddr) -> std::io::Result<BoxIo> {
+        #[cfg(test)]
+        if let Some(d) = &self.dial {
+            return (d.0)(addr).await;
+        }
+        let tcp = TcpStream::connect(addr).await?;
+        let _ = tcp.set_nodelay(true);
+        Ok(Box::new(tcp))
+    }
+
     async fn resolve_checked(&self, host: &Host) -> Result<Vec<IpAddr>, ConnectError> {
         let ips = self.dns.resolve(host).await?;
         self.policy
@@ -226,11 +265,8 @@ impl ConnectorInner {
         let mut last = ConnectError::Connect("no addresses".into());
         let mut tcp = None;
         for ip in ips {
-            match tokio::time::timeout(
-                self.connect_timeout,
-                TcpStream::connect(SocketAddr::new(ip, port)),
-            )
-            .await
+            match tokio::time::timeout(self.connect_timeout, self.dial(SocketAddr::new(ip, port)))
+                .await
             {
                 Ok(Ok(s)) => {
                     tcp = Some(s);
@@ -241,7 +277,6 @@ impl ConnectorInner {
             }
         }
         let tcp = tcp.ok_or(last)?;
-        let _ = tcp.set_nodelay(true);
         match scheme {
             Scheme::Http => Ok(MaybeTls::Plain(tcp)),
             Scheme::Https => {
@@ -327,6 +362,8 @@ impl Upstream {
                 connect_timeout: s.connect_timeout,
                 tls: tls.clone(),
                 private_ok,
+                #[cfg(test)]
+                dial: s.dial.clone(),
             }),
         };
         let strict_conn = mk(false);

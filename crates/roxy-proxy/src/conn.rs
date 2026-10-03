@@ -12,13 +12,12 @@ use roxy_http::{
 };
 use roxy_tls::{MAX_HELLO_BYTES, Sniff, looks_like_http, sniff};
 use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 
 use crate::auth::{AuthCache, authenticate};
 use crate::exchange::{self, ClientFraming, respond};
 use crate::flowlog::TlsInfo;
-use crate::io::{ConnIo, Rewind};
+use crate::io::{BoxIo, ConnIo, Rewind};
 use crate::listener::ClientConn;
 use crate::pipeline::FlowCx;
 use crate::server::Shared;
@@ -30,9 +29,9 @@ pub const INTERNAL_HOST: &str = "roxy.internal";
 /// `407` header lines (the codec treats `proxy-authenticate` as reserved).
 const PROXY_AUTHENTICATE: &[u8] = b"proxy-authenticate: Basic realm=\"roxy\"\r\n";
 
-pub(crate) async fn serve_explicit(stream: TcpStream, client: ClientConn, shared: Arc<Shared>) {
+pub(crate) async fn serve_explicit(stream: BoxIo, client: ClientConn, shared: Arc<Shared>) {
     let snap = shared.snapshot();
-    let handle = ConnIo::new(Box::new(stream));
+    let handle = ConnIo::new(stream);
     let conn = ServerConn::new(
         handle.clone(),
         Role::ProxyPort,
