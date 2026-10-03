@@ -547,7 +547,7 @@ fn flow_log_settings_validated() {
 fn service_addons_validate() {
     let ok = format!(
         "{BASE}addons:\n  - name: s\n    kind: service\n    endpoint: svc\n    \
-         directions: [request]\n    limits: {{ first_byte_timeout: 2s, max_exchange_time: 1m }}\n    \
+         limits: {{ first_byte_timeout: 2s, max_exchange_time: 1m }}\n    \
          endpoints:\n      svc: {{ url: \"http://127.0.0.1:9000/layer\", private_ok: true }}\n"
     );
     parse(&ok).validate().unwrap();

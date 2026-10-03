@@ -52,10 +52,7 @@ use tokio::io::{
 use tokio::time::{Instant, timeout, timeout_at};
 
 pub use chunked::{ChunkedDecoder, Decoded};
-pub use head::{
-    Framing, Head, HeadScan, RequestHead, ResponseHead, Role, parse_head, parse_response_head,
-    scan_head,
-};
+pub use head::{Framing, Head, HeadScan, RequestHead, Role, parse_head, scan_head};
 
 use crate::model::{
     Authority, Body, BodyError, BodySender, CanonicalRequest, CanonicalResponse, Headers,

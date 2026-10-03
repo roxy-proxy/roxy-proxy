@@ -214,12 +214,6 @@ impl Config {
                 }
                 super::AddonKind::Service => Self::validate_service(&path, a, d),
             }
-            if a.directions.is_empty() {
-                d.push(Diagnostic::new(
-                    format!("{path}.directions"),
-                    "`directions` must name at least one of request, response",
-                ));
-            }
             if let Some(i) = a
                 .capabilities
                 .iter()

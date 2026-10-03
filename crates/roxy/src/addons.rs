@@ -16,7 +16,7 @@ use roxy_wasm::{
     Capabilities, Capability as WasmCap, Layer, LayerConfig, LayerLimits, WasmRuntime,
 };
 
-use crate::config::{Addon, AddonKind, AddonMode, Capability, Config, Direction};
+use crate::config::{Addon, AddonKind, AddonMode, Capability, Config};
 
 /// Endpoint timeout when none is configured.
 const DEFAULT_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -30,8 +30,6 @@ fn service(a: &Addon) -> anyhow::Result<ServiceSpec> {
         .ok_or_else(|| anyhow!("addon {}: no `endpoint`", a.name))?;
     Ok(ServiceSpec {
         endpoint,
-        request: a.directions.contains(&Direction::Request),
-        response: a.directions.contains(&Direction::Response),
         first_byte_timeout: a
             .limits
             .first_byte_timeout

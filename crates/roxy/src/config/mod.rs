@@ -523,14 +523,6 @@ pub enum AddonMode {
     Observe,
 }
 
-/// Which streams a service addon sees (§11.6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Direction {
-    Request,
-    Response,
-}
-
 /// Per-addon resource limits (§11.1, §11.3). Each defaults to the global
 /// setting when absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -581,12 +573,9 @@ pub struct Addon {
     /// The component file (`kind: wasm`).
     #[serde(default)]
     pub path: Option<PathBuf>,
-    /// The named endpoint to stream through (`kind: service`).
+    /// The named endpoint the exchange streams through (`kind: service`).
     #[serde(default)]
     pub endpoint: Option<String>,
-    /// Streams a service addon sees (default both).
-    #[serde(default = "both_directions")]
-    pub directions: Vec<Direction>,
     #[serde(default)]
     pub mode: AddonMode,
     /// Opaque config passed to the addon as JSON.
@@ -606,10 +595,6 @@ pub struct Addon {
     /// true)` events.
     #[serde(default)]
     pub audit_endpoint: Option<String>,
-}
-
-fn both_directions() -> Vec<Direction> {
-    vec![Direction::Request, Direction::Response]
 }
 
 // ----- log ------------------------------------------------------------------
