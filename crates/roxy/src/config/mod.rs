@@ -234,6 +234,10 @@ pub struct Limits {
     /// Cap on live `set_state` entries; a new key when full denies the flow
     /// that tried (§6.4, no eviction).
     pub max_state_entries: usize,
+    /// Largest address list file roxy will load (§7.1); a bigger file is a
+    /// load error (startup fails / the reload fails).
+    #[serde(deserialize_with = "units::size")]
+    pub max_address_list_bytes: ByteSize,
 }
 
 const KIB: u64 = 1024;
@@ -261,6 +265,7 @@ impl Default for Limits {
             h2_max_header_list_bytes: ByteSize::b(64 * KIB),
             max_metric_keys: 100_000,
             max_state_entries: 100_000,
+            max_address_list_bytes: ByteSize::b(256 * MIB),
         }
     }
 }
@@ -362,7 +367,8 @@ pub struct AddressList {
 /// Where an address list's entries come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddressListSource {
-    /// `file: PATH`: one entry per line (loaded at run time, M2).
+    /// `file: PATH`: one entry per line, `#` comments (loaded by `check`, at
+    /// startup and on every reload; the file is watched).
     File(PathBuf),
     /// `inline: [cidr-or-ip, ...]`, kept as text so `check` can report each
     /// bad entry by index.

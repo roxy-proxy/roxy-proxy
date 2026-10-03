@@ -16,6 +16,7 @@
 //!   WebSocket relay.
 //! - [`upstream`]: resolver, address floor, connector and pooled client.
 //! - [`addr`]: the private-range / CIDR address floor.
+//! - [`addrlist`]: compiled address lists (`upstream.deny_lists`, `@list`).
 //! - [`auth`]: `Proxy-Authorization: Basic` against bcrypt users files.
 //! - [`sources`]: the metric and state store traits.
 //! - [`flowlog`]: flow events, sinks and redaction.
@@ -30,6 +31,7 @@
 //! stream itself after the codec is dropped.
 
 pub mod addr;
+pub mod addrlist;
 pub mod auth;
 mod body;
 mod ca_server;
@@ -45,6 +47,7 @@ pub mod sources;
 pub mod upstream;
 mod view;
 
+pub use addrlist::{AddressList, AddressLists, ListError};
 pub use auth::UserDb;
 pub use ca_server::PEM_CONTENT_TYPE;
 pub use config::{ListenerSpec, PolicyUpdate, RuntimeConfig};

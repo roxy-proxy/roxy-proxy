@@ -4,11 +4,8 @@
 //! diagnostics (with line/column within an expression) are merged with the
 //! checks here.
 
-use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
-
-use ipnet::IpNet;
 use roxy_rules::{Policy, PolicyInput};
+use std::collections::{HashMap, HashSet};
 
 use super::{AddressListSource, CONFIG_VERSION, Config, ListenerMode, UpstreamVerify};
 
@@ -202,8 +199,8 @@ impl Config {
     }
 
     /// Names unique and usable as `@name`; inline entries parse; files exist
-    /// (contents are loaded at run time, M2). `upstream.deny_lists` must
-    /// name defined lists.
+    /// (their contents are parsed by `roxy check`, at startup and on reload,
+    /// see [`crate::lists`]). `upstream.deny_lists` must name defined lists.
     fn validate_address_lists(&self, d: &mut Vec<Diagnostic>) {
         let mut names: HashMap<&str, usize> = HashMap::new();
         for (i, list) in self.address_lists.iter().enumerate() {
@@ -236,11 +233,10 @@ impl Config {
                         ));
                     }
                     for (j, e) in entries.iter().enumerate() {
-                        let e = e.trim();
-                        if e.parse::<IpNet>().is_err() && e.parse::<IpAddr>().is_err() {
+                        if let Err(reason) = roxy_proxy::addrlist::parse_entry(e) {
                             d.push(Diagnostic::new(
                                 format!("{path}.inline[{j}]"),
-                                format!("{e:?} is not an IP address or CIDR"),
+                                format!("{:?} {reason}", e.trim()),
                             ));
                         }
                     }

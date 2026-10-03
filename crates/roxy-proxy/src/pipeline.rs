@@ -427,7 +427,12 @@ impl FlowCx {
             secrets: &secrets,
             initial_tags: &tags,
         };
-        let view = ProxyView::new(&self.facts, &*shared.metrics, &*shared.state);
+        let view = ProxyView::new(
+            &self.facts,
+            &*shared.metrics,
+            &*shared.state,
+            &snap.address_lists,
+        );
         let out = snap.policy.evaluate(phase, &view, &ctx);
         let metric_err = view.take_metric_error();
         let sample = Sample {
@@ -655,7 +660,12 @@ impl FlowCx {
             denied: matches!(self.record.decision, Some(DecisionKind::Deny)),
             error,
         };
-        let view = ProxyView::new(&self.facts, &*self.shared.metrics, &*self.shared.state);
+        let view = ProxyView::new(
+            &self.facts,
+            &*self.shared.metrics,
+            &*self.shared.state,
+            &self.snap.address_lists,
+        );
         if let Err(e) = self.shared.metrics.record(Phase::Response, &view, &sample) {
             // The response has already been sent; the next flow that needs
             // the missing key fails closed at its decision.
@@ -1071,7 +1081,12 @@ impl FlowCx {
             secrets: &secrets,
             initial_tags: &tags,
         };
-        let view = ProxyView::new(&self.facts, &*shared.metrics, &*shared.state);
+        let view = ProxyView::new(
+            &self.facts,
+            &*shared.metrics,
+            &*shared.state,
+            &snap.address_lists,
+        );
         let out = snap.policy.evaluate(Phase::Response, &view, &ctx);
         let metric_err = view.take_metric_error();
         drop(view);

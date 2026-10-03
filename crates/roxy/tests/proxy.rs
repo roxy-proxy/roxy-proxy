@@ -1034,3 +1034,165 @@ async fn full_metric_table_denies_new_keys() {
     );
     h.stop().await;
 }
+
+// ----- address lists (§7.1) --------------------------------------------------
+
+/// `upstream.deny_lists` is a hard floor: a hit denies with `403
+/// _address_policy` and an `upstream_denied` event naming the list, and
+/// `private_ok` does not bypass it, for names, IP literals (also written
+/// as IPv4-mapped IPv6) and CONNECT-tunnelled HTTPS alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn deny_list_is_a_floor_private_ok_does_not_bypass() {
+    let h = Harness::start_with(Opts {
+        rules: r"
+  - id: everything-private-ok
+    when: port in [{HTTP}, {HTTPS}]
+    then: { allow: { private_ok: true } }
+",
+        extra: "address_lists:\n  - { name: blocked, inline: [192.0.2.0/24, 127.0.0.1] }\n",
+        upstream: "deny_lists: [blocked]",
+        ..Opts::default()
+    })
+    .await;
+    let port = h.upstream.http.port();
+    let c = h.client();
+    let urls = [
+        h.http_url("/a"),
+        format!("http://127.0.0.1:{port}/b"),
+        format!("http://[::ffff:127.0.0.1]:{port}/c"),
+        h.https_url("/d"),
+    ];
+    for url in &urls {
+        let res = c.get(url).send().await.unwrap();
+        assert_eq!(res.status(), 403, "{url}");
+        assert_eq!(res.headers()["x-roxy-rule"], "_address_policy", "{url}");
+    }
+    let ev = h.wait_events("upstream_denied", urls.len()).await;
+    for (e, host) in ev.iter().zip([
+        "upstream.test",
+        "127.0.0.1",
+        "::ffff:127.0.0.1",
+        "upstream.test",
+    ]) {
+        assert_eq!(e["list"], "blocked", "{e}");
+        assert_eq!(e["reason"], "list:blocked", "{e}");
+        assert_eq!(e["matched_cidr"], "127.0.0.1/32", "{e}");
+        assert_eq!(e["resolved_ip"], "127.0.0.1", "{e}");
+        assert_eq!(e["host"], host, "{e}");
+    }
+    let req = h.wait_events("request", urls.len()).await;
+    assert!(
+        req.iter().all(|e| e["terminal_rule"] == "_address_policy"),
+        "{req:#?}"
+    );
+    assert!(h.upstream.seen().is_empty(), "nothing reached the upstream");
+    h.stop().await;
+}
+
+/// `dst.ip in @list` and `client.ip in @list` in rules use the loaded lists.
+#[tokio::test(flavor = "multi_thread")]
+async fn rules_can_use_address_lists() {
+    let h = Harness::start_with(Opts {
+        rules: r#"
+  - id: dst-listed
+    phase: connect
+    when: dst.ip in @loopback
+    then: { deny: { status: 451 } }
+  - id: client-listed
+    when: client.ip in @clients and host == "alias.test"
+    then: { deny: { status: 429 } }
+  - id: client-not-listed
+    when: client.ip not in @clients
+    then: deny
+  - id: upstream
+    when: host in ["upstream.test", "alias.test"]
+    then: { allow: { private_ok: true } }
+"#,
+        extra: "address_lists:\n  - { name: loopback, inline: [127.0.0.0/8] }\n  \
+                - { name: clients, inline: [\"::ffff:127.0.0.1\"] }\n",
+        ..Opts::default()
+    })
+    .await;
+    let port = h.upstream.http.port();
+    let c = h.client();
+    let res = c
+        .get(format!("http://127.0.0.1:{port}/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 451);
+    assert_eq!(res.headers()["x-roxy-rule"], "dst-listed");
+    let res = c
+        .get(format!("http://alias.test:{port}/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 429);
+    assert_eq!(res.headers()["x-roxy-rule"], "client-listed");
+    let res = c.get(h.http_url("/ok")).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(h.events("policy_input_unavailable"), Vec::<Value>::new());
+    h.stop().await;
+}
+
+/// Editing a deny-list file reloads it: a pooled upstream connection that
+/// served the previous request is not reused once the address is listed.
+/// A malformed list file fails the reload and the old lists stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn deny_list_file_reload_flips_allow_to_deny_and_keeps_old_lists_on_failure() {
+    let lists = tempfile::tempdir().unwrap();
+    let file = lists.path().join("blocked.txt");
+    std::fs::write(&file, "# nothing local yet\n192.0.2.0/24\n").unwrap();
+    let extra = format!(
+        "address_lists:\n  - {{ name: blocked, file: {} }}\n",
+        file.display()
+    );
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        extra: &extra,
+        upstream: "deny_lists: [blocked]",
+        ..Opts::default()
+    })
+    .await;
+    let c = h.client();
+    let url = h.http_url("/pooled");
+    for _ in 0..3 {
+        assert_eq!(c.get(&url).send().await.unwrap().status(), 200);
+    }
+    let served = h.upstream.seen().len();
+
+    std::fs::write(&file, "192.0.2.0/24\n127.0.0.0/8 # now listed\n").unwrap();
+    h.wait_events("config_reloaded", 1).await;
+    let res = c.get(&url).send().await.unwrap();
+    assert_eq!(res.status(), 403);
+    assert_eq!(res.headers()["x-roxy-rule"], "_address_policy");
+    let ev = h.wait_events("upstream_denied", 1).await;
+    assert_eq!(ev[0]["list"], "blocked");
+    assert_eq!(ev[0]["matched_cidr"], "127.0.0.0/8");
+    assert_eq!(
+        h.upstream.seen().len(),
+        served,
+        "the pooled connection was not used"
+    );
+
+    std::fs::write(&file, "127.0.0.0/8\n10.0.0.1/8\n").unwrap();
+    let failed = h.wait_events("config_reload_failed", 1).await;
+    let diags = failed[0]["diagnostics"].to_string();
+    assert!(
+        diags.contains(&format!("{}:2:", file.display())) && diags.contains("host bits"),
+        "{diags}"
+    );
+    let res = c.get(&url).send().await.unwrap();
+    assert_eq!(
+        res.status(),
+        403,
+        "the old list stays after a failed reload"
+    );
+    assert_eq!(res.headers()["x-roxy-rule"], "_address_policy");
+
+    // An emptied list (a valid file) allows again.
+    std::fs::write(&file, "# cleared\n").unwrap();
+    h.wait_events("config_reloaded", 2).await;
+    assert_eq!(c.get(&url).send().await.unwrap().status(), 200);
+    h.stop().await;
+}

@@ -52,6 +52,8 @@ fn full_example_parses_and_validates() {
         cfg.addons[0].hooks,
         vec![AddonHook::Request, AddonHook::Response]
     );
+    assert_eq!(cfg.address_lists.len(), 1);
+    assert_eq!(cfg.upstream.deny_lists, ["cloud-metadata"]);
     assert_eq!(
         cfg.addons[0].capabilities,
         vec![Capability::State, Capability::Log]
@@ -363,7 +365,7 @@ fn address_lists_parse_and_validate() {
     assert_eq!(cfg.upstream.deny_lists, ["blocked-v4"]);
 
     let d = diagnostics(&format!(
-        "{BASE}address_lists:\n  - {{ name: bad name, inline: [10.0.0.0/33, nope] }}\n  \
+        "{BASE}address_lists:\n  - {{ name: bad name, inline: [10.0.0.0/33, nope, 10.0.0.1/8] }}\n  \
          - {{ name: x, file: /surely/not/here.txt }}\n  - {{ name: x, inline: [] }}\n\
          upstream: {{ deny_lists: [missing] }}\n\
          rules:\n  - {{ id: a, when: 'client.ip in @undefined', then: allow }}\n"
@@ -375,6 +377,7 @@ fn address_lists_parse_and_validate() {
             "address_lists[0].name",
             "address_lists[0].inline[0]",
             "address_lists[0].inline[1]",
+            "address_lists[0].inline[2]",
             "address_lists[1].file",
             "address_lists[2].name",
             "address_lists[2].inline",
@@ -382,7 +385,8 @@ fn address_lists_parse_and_validate() {
             "rules[0].when",
         ]
     );
-    assert!(d[7].message.contains("@undefined"), "{}", d[7]);
+    assert!(d[3].message.contains("host bits set"), "{}", d[3]);
+    assert!(d[8].message.contains("@undefined"), "{}", d[8]);
 
     for bad in [
         "address_lists: [{ name: a }]",
@@ -394,4 +398,10 @@ fn address_lists_parse_and_validate() {
             "{bad}"
         );
     }
+}
+
+#[test]
+fn address_list_size_limit_default() {
+    let c = parse(BASE);
+    assert_eq!(c.limits.max_address_list_bytes, ByteSize::b(256 << 20));
 }

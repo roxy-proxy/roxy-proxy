@@ -13,6 +13,7 @@ use roxy_http::{HttpFlags, Limits};
 use roxy_rules::Policy;
 use roxy_tls::{Ca, LeafMinter, UpstreamTlsOptions};
 
+use crate::addrlist::AddressLists;
 use crate::auth::UserDb;
 use crate::flowlog::{FlowSink, Redactor};
 use crate::sources::{MetricSource, StateSource};
@@ -66,6 +67,14 @@ pub struct PolicyUpdate {
     pub limits: Limits,
     pub flags: HttpFlags,
     pub upstream: UpstreamSettings,
+    /// Every `address_lists:` entry, loaded and compiled. A list that failed
+    /// to load must never be represented here as empty: loading errors fail
+    /// startup or the whole reload.
+    pub address_lists: Arc<AddressLists>,
+    /// `upstream.deny_lists`: names in `address_lists` applied as a hard
+    /// floor in the connector. A name missing from `address_lists` fails
+    /// the snapshot build (startup error / failed reload).
+    pub deny_lists: Vec<String>,
 }
 
 impl std::fmt::Debug for PolicyUpdate {
@@ -76,6 +85,8 @@ impl std::fmt::Debug for PolicyUpdate {
             .field("limits", &self.limits)
             .field("flags", &self.flags)
             .field("upstream", &self.upstream)
+            .field("address_lists", &self.address_lists.len())
+            .field("deny_lists", &self.deny_lists)
             .finish_non_exhaustive()
     }
 }
