@@ -891,6 +891,9 @@ async fn unavailable_metrics_fail_closed() {
     let c = h.client();
     let res = c.get(h.http_url("/m")).send().await.unwrap();
     assert_eq!(res.status(), 200);
+    // The allowed request's event is emitted after its body has streamed;
+    // wait for it so later events cannot be reordered ahead of it.
+    h.wait_events("request", 1).await;
     for (mode, reason) in [
         (1u8, "metric_unavailable"),
         (2, "metric_table_full"),
@@ -901,7 +904,11 @@ async fn unavailable_metrics_fail_closed() {
         assert_eq!(res.status(), 503, "mode {mode}");
         assert_eq!(res.headers()["x-roxy-rule"], "_fail_closed");
         let ev = h.wait_events("request", 1 + usize::from(mode)).await;
-        assert_eq!(ev[usize::from(mode)]["reason"], reason, "mode {mode}");
+        let n = ev.iter().filter(|e| e["reason"] == reason).count();
+        assert!(
+            n >= 1,
+            "mode {mode}: no request event with reason {reason}: {ev:#?}"
+        );
     }
     assert_eq!(h.events("metric_table_full").len(), 2);
     assert_eq!(h.events("policy_input_unavailable").len(), 2);
