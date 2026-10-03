@@ -132,6 +132,11 @@ jobs:
       VERSION: ${{ needs.version.outputs.version }}
       TARGET: aarch64-apple-darwin
       CARGO_PROFILE_RELEASE_STRIP: symbols
+      # The toolchain of the Dockerfile's build image (rust:1.99-alpine), so
+      # every release binary comes from the same compiler. It overrides
+      # rust-toolchain.toml's "stable", which on a runner can be an older
+      # preinstalled toolchain.
+      RUSTUP_TOOLCHAIN: 1.99.0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -140,6 +145,8 @@ jobs:
       # Same as the Linux build: cargo-auditable records the dependency list.
       - name: Build
         run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustc --version
           cargo install --locked cargo-auditable@0.7.7
           cargo auditable build --release --locked -p roxy --target "$TARGET"
 
