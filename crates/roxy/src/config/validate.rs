@@ -319,8 +319,25 @@ impl Config {
                 "must be at least 1",
             ));
         }
+        let metric_bytes = self.limits.max_metric_bytes.as_u64();
+        if metric_bytes == 0 {
+            d.push(Diagnostic::new(
+                "limits.max_metric_bytes",
+                "must be at least 1 byte",
+            ));
+        } else if metric_bytes > MAX_METRIC_BYTES_CEILING || usize::try_from(metric_bytes).is_err()
+        {
+            d.push(Diagnostic::new(
+                "limits.max_metric_bytes",
+                "must be at most 64gb",
+            ));
+        }
     }
 }
+
+/// Upper bound on `limits.max_metric_bytes`: well past any sensible
+/// budget, so a unit typo (`256gb` for `256mb`) is caught at load.
+const MAX_METRIC_BYTES_CEILING: u64 = 64 << 30;
 
 fn is_list_name(s: &str) -> bool {
     let mut b = s.bytes();

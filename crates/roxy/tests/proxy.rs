@@ -1051,6 +1051,40 @@ async fn full_metric_table_denies_new_keys() {
     h.stop().await;
 }
 
+/// `limits.max_metric_bytes` is enforced like the key cap: with a budget
+/// too small for even one series, the first flow that needs a new key is
+/// denied (`_fail_closed`, `metric_table_full`), never served by evicting
+/// (§6.4, §12).
+#[tokio::test(flavor = "multi_thread")]
+async fn tiny_metric_byte_budget_denies_new_keys() {
+    let h = Harness::start_with(Opts {
+        rules: r#"
+  - id: guarded
+    when: host == "upstream.test" and metric.by_path < 1000
+    then: { allow: { private_ok: true } }
+"#,
+        extra: r#"metrics:
+  - id: by_path
+    count: requests
+    where: host == "upstream.test"
+    key: [path]
+    window: 1h
+"#,
+        limits: "max_metric_bytes: 1",
+        ..Opts::default()
+    })
+    .await;
+    let c = h.client();
+    let res = c.get(h.http_url("/a")).send().await.unwrap();
+    assert_eq!(res.status(), 503, "no series fits a 1-byte budget");
+    assert_eq!(res.headers()["x-roxy-rule"], "_fail_closed");
+    let ev = h.wait_events("request", 1).await;
+    assert_eq!(ev[0]["reason"], "metric_table_full", "{ev:#?}");
+    h.wait_events("metric_table_full", 1).await;
+    assert!(h.upstream.seen().is_empty());
+    h.stop().await;
+}
+
 // ----- address lists (§7.1) --------------------------------------------------
 
 /// `upstream.deny_lists` is a hard floor: a hit denies with `403
