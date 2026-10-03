@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/roxy-http",
+    "crates/roxy-rules",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tomcatling/roxy-proxy"
+
+[workspace.dependencies]
+# Internal crates
+roxy-http = { path = "crates/roxy-http", version = "0.1.0" }
+roxy-proxy = { path = "crates/roxy-proxy", version = "0.1.0" }
+roxy-rules = { path = "crates/roxy-rules", version = "0.1.0" }
+roxy-tls = { path = "crates/roxy-tls", version = "0.1.0" }
+
+# External crates
+anyhow = "1.0.104"
+bytesize = "2.7.0"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std", "serde"] }
+clap = { version = "4.6.7", features = ["derive"] }
+humantime-serde = "1.1.1"
+pem = "4"
+ipnet = { version = "2", features = ["serde"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring", "x509-parser"] }
+regex = "1.13.1"
+ring = "0.17"
+rustls-pki-types = "1.15.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_yaml_ng = "0.10.0"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+time = "0.3.55"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+x509-parser = "0.18"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
