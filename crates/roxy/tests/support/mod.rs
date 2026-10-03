@@ -324,7 +324,8 @@ pub async fn start_upstream(ca: &TestCa) -> Upstream {
 pub struct Opts<'a> {
     /// The `rules:` list (YAML, indented by two spaces per item).
     pub rules: &'a str,
-    /// Extra lines under `limits:`.
+    /// Extra lines under `limits:`. A `response_header_timeout` here
+    /// replaces the harness default (2s).
     pub limits: &'a str,
     /// Extra lines under `http:`.
     pub http: &'a str,
@@ -457,8 +458,7 @@ http:
   allow_plain_in_connect: false
 {http}limits:
   header_timeout: 5s
-  response_header_timeout: 2s
-  max_inspect_body_bytes: 1kb
+{response_header_timeout}  max_inspect_body_bytes: 1kb
 {limits}upstream:
   connect_timeout: 2s
 {upstream}  dns:
@@ -479,6 +479,11 @@ log:
             dir = dir.display(),
             http = indent(opts.http, 2),
             limits = indent(opts.limits, 2),
+            response_header_timeout = if opts.limits.contains("response_header_timeout") {
+                ""
+            } else {
+                "  response_header_timeout: 2s\n"
+            },
             upstream = indent(opts.upstream, 2),
             extra = opts.extra,
             capture = opts.capture.map_or_else(String::new, |c| format!(

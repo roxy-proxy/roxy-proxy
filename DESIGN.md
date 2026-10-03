@@ -508,6 +508,7 @@ limits:
   h2_max_header_list_bytes: 64kb
   max_connections_per_client: 256
   max_metric_keys: 100000
+  max_metric_bytes: 256mb
 
 upstream:
   dns:
@@ -809,7 +810,13 @@ metrics:
 Implementation: `DashMap<KeyTuple, SlidingWindow>` with fixed-bucket sliding
 windows (window / 60 buckets, so a 1-minute window has 1-second resolution).
 `unique` uses a HyperLogLog. Total keys across all metrics are bounded by
-`limits.max_metric_keys`. **When the table is full, a flow that would need a
+`limits.max_metric_keys`, and their approximate memory by
+`limits.max_metric_bytes` (default 256 MiB, at most 64 GiB; each series is
+charged for its key, buckets and a fixed overhead). Running out of bytes is
+treated exactly like running out of keys. On reload the new limits apply at
+once: series whose definition is unchanged are carried over only while they
+fit the new byte budget, and the rest are dropped with a warning. **When the
+table is full, a flow that would need a
 new key is denied** (`_fail_closed`, event `metric_table_full`) rather than
 evicting an existing key: eviction would let an attacker reset their own
 counter by varying the key. Keys are reclaimed only when their window has
@@ -1562,7 +1569,7 @@ socket, never a pass-through. Specifically:
 | parse or canonicalisation error | close connection (400 if a response can still be written) |
 | rule denies | deny response, then close |
 | policy input unavailable (metric store, address list, secret) | deny `503`, `_fail_closed` |
-| metric key table full | deny, `metric_table_full` |
+| metric key table full or byte budget exhausted | deny, `metric_table_full` |
 | body or header limit exceeded mid-stream | close both sides |
 | upstream connect/TLS/DNS failure | `502`, flow logged |
 | layer trap, budget exceeded, or invalid mutation (enforce mode) | deny, `layer_error`; observe-mode layers log only |
@@ -1573,7 +1580,8 @@ socket, never a pass-through. Specifically:
 - Per-client-IP connection cap; global connection cap; accept backpressure.
 - All reads bounded (head size, body size, ClientHello size, WS message size).
 - Timeouts at every stage; idle keep-alive timeout for client connections.
-- Metric/state key cardinality caps with **no eviction**: a full table denies flows needing a new key (§6.4).
+- Metric/state key cardinality caps, plus a metric byte budget
+  (`limits.max_metric_bytes`), with **no eviction**: a full table denies flows needing a new key (§6.4).
 - Leaf cert cache bounded.
 - No allocation proportional to attacker-controlled numbers before validation
   (e.g. `content-length: 10^18` does not pre-allocate).

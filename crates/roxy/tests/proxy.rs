@@ -222,9 +222,21 @@ async fn redirect_changes_target_and_checks_the_new_address() {
     h.stop().await;
 }
 
+/// The upstream echo answers only after reading the whole body, and
+/// `response_header_timeout` currently runs while the request body is
+/// still being sent, so the harness's 2s default can 504 a 32 MiB debug-build
+/// upload on a slow runner. These tests check streaming integrity, not that
+/// timeout.
+const BIG_UPLOAD_LIMITS: &str = "response_header_timeout: 60s";
+
 #[tokio::test(flavor = "multi_thread")]
 async fn large_uploads_stream_intact() {
-    let h = Harness::start(ALLOW_UPSTREAM).await;
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        limits: BIG_UPLOAD_LIMITS,
+        ..Opts::default()
+    })
+    .await;
     let c = h.client();
     // 32 MiB with content-length.
     let data: Vec<u8> = (0..32 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
@@ -1051,6 +1063,40 @@ async fn full_metric_table_denies_new_keys() {
     h.stop().await;
 }
 
+/// `limits.max_metric_bytes` is enforced like the key cap: with a budget
+/// too small for even one series, the first flow that needs a new key is
+/// denied (`_fail_closed`, `metric_table_full`), never served by evicting
+/// (§6.4, §12).
+#[tokio::test(flavor = "multi_thread")]
+async fn tiny_metric_byte_budget_denies_new_keys() {
+    let h = Harness::start_with(Opts {
+        rules: r#"
+  - id: guarded
+    when: host == "upstream.test" and metric.by_path < 1000
+    then: { allow: { private_ok: true } }
+"#,
+        extra: r#"metrics:
+  - id: by_path
+    count: requests
+    where: host == "upstream.test"
+    key: [path]
+    window: 1h
+"#,
+        limits: "max_metric_bytes: 1",
+        ..Opts::default()
+    })
+    .await;
+    let c = h.client();
+    let res = c.get(h.http_url("/a")).send().await.unwrap();
+    assert_eq!(res.status(), 503, "no series fits a 1-byte budget");
+    assert_eq!(res.headers()["x-roxy-rule"], "_fail_closed");
+    let ev = h.wait_events("request", 1).await;
+    assert_eq!(ev[0]["reason"], "metric_table_full", "{ev:#?}");
+    h.wait_events("metric_table_full", 1).await;
+    assert!(h.upstream.seen().is_empty());
+    h.stop().await;
+}
+
 // ----- address lists (§7.1) --------------------------------------------------
 
 /// `upstream.deny_lists` is a hard floor: a hit denies with `403
@@ -1312,7 +1358,12 @@ async fn h2_deny_without_close_keeps_serving() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn h2_large_upload_streams_intact() {
-    let h = Harness::start(ALLOW_UPSTREAM).await;
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        limits: BIG_UPLOAD_LIMITS,
+        ..Opts::default()
+    })
+    .await;
     let data: Vec<u8> = (0..32 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     let want = fnv(&data);
     let res = h

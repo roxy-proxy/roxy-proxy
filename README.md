@@ -27,7 +27,8 @@ Usable in explicit proxy mode. Built and tested:
   response stream (byte limits, response checks, byte budgets).
 - Header, path, query and redirect actions, and secret injection.
 - Stateful metrics and a state store. Neither ever evicts: a full table
-  denies.
+  denies. Their sizes are set in `limits` (`max_metric_keys`,
+  `max_metric_bytes`, `max_state_entries`).
 - Address denylists, and a private-range floor on the IP actually dialled.
 - WebSocket relay, proxy authentication, and a CA download endpoint.
 - Hot reload, `roxy check`, and the `roxy rule test` dry run.

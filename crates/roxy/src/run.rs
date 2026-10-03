@@ -302,7 +302,7 @@ impl Reloader {
             let next_metrics = self
                 .metrics
                 .as_ref()
-                .map(|m| m.prepare(&update.policy, config.limits.max_metric_keys));
+                .map(|m| m.prepare(&update.policy, config.limits.metric_limits()));
             self.handle.reload(update).map_err(|e| vec![e])?;
             if let (Some(m), Some(next)) = (&self.metrics, next_metrics) {
                 m.install(next);
@@ -511,7 +511,7 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
     } else {
         let b = Arc::new(crate::stores::ReloadableMetrics::new(
             &update.policy,
-            config.limits.max_metric_keys,
+            config.limits.metric_limits(),
         ));
         (b.clone(), Some(b))
     };
