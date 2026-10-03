@@ -33,8 +33,6 @@ const MAX_TABLE_ELEMENTS: usize = 100_000;
 #[derive(Debug)]
 pub(crate) struct LayerShared {
     pub(crate) config: LayerConfig,
-    /// `step_cpu` in epoch ticks.
-    pub(crate) step_ticks: u64,
 }
 
 /// The exchange an instance is running.
@@ -124,6 +122,12 @@ pub(crate) struct StoreState {
     pub(crate) layer: Arc<LayerShared>,
     pub(crate) limiter: Limiter,
     pub(crate) exchange: Option<ExchangeCtx>,
+    /// When control last entered wasm other than from an epoch check
+    /// (`step_cpu` is measured from here).
+    pub(crate) step_started: std::time::Instant,
+    /// Set by the epoch callback: the host call in progress is wasmtime's
+    /// epoch check, not a step boundary.
+    pub(crate) in_epoch_check: bool,
 }
 
 impl StoreState {
@@ -150,6 +154,8 @@ impl StoreState {
                 total_memory: 0,
             },
             exchange: None,
+            step_started: std::time::Instant::now(),
+            in_epoch_check: false,
         }
     }
 

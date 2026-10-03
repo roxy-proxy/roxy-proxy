@@ -3,3 +3,4 @@
 *.pem
 *.key
 .DS_Store
+/crates/roxy-wasm/test-components/target

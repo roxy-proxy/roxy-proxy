@@ -25,12 +25,10 @@ use crate::exchange::{CancelGuard, Dir, ExchangeShared, FromGuest, IntoGuest};
 use crate::host::{LayerHost, LayerRequest, LayerResponse};
 use crate::state::{ExchangeCtx, LayerShared, StoreState};
 
-/// Epoch tick: the resolution of `step_cpu`.
+/// Epoch tick: the resolution of `step_cpu`. A running guest also yields
+/// to the async runtime once per tick, so a busy layer cannot hog a worker
+/// thread and its wall clock stays enforceable.
 const EPOCH_TICK: Duration = Duration::from_millis(1);
-/// A running guest yields to the async runtime after this much fuel, so a
-/// busy layer cannot hog a worker thread and its wall clock stays
-/// enforceable.
-const FUEL_YIELD_INTERVAL: u64 = 1_000_000;
 /// Bytes a tunnel output stream accepts before it applies backpressure.
 const TUNNEL_WRITE_BUDGET: usize = 64 * 1024;
 
@@ -157,17 +155,41 @@ fn classify(err: &wasmtime::Error) -> LayerError {
     }
 }
 
-/// Gives the guest a fresh `fuel_per_step` and `step_cpu` whenever control
-/// enters wasm (a call into the guest, or a host call returning to it), so
-/// both bound the guest's work *between* host calls.
-fn reset_step(mut ctx: StoreContextMut<'_, StoreState>, hook: CallHook) -> wasmtime::Result<()> {
+/// Starts a new step (fresh `fuel_per_step`, `step_cpu` measured from now)
+/// whenever control enters wasm: a call into the guest, or a host call
+/// returning to it. Both budgets therefore bound the guest's work *between*
+/// host calls.
+///
+/// wasmtime runs this hook around its own fuel and epoch checks too. The
+/// fuel check only reaches the host when fuel is exhausted, and then traps
+/// whatever this does; the epoch check is recognised by the flag the epoch
+/// callback sets, and is not a step boundary.
+fn step_hook(mut ctx: StoreContextMut<'_, StoreState>, hook: CallHook) -> wasmtime::Result<()> {
     if hook.exiting_host() {
+        if std::mem::take(&mut ctx.data_mut().in_epoch_check) {
+            return Ok(());
+        }
         let fuel = ctx.data().layer.config.limits.fuel_per_step;
-        let ticks = ctx.data().layer.step_ticks;
         ctx.set_fuel(fuel)?;
-        ctx.set_epoch_deadline(ticks);
+        ctx.set_epoch_deadline(1);
+        ctx.data_mut().step_started = std::time::Instant::now();
     }
     Ok(())
+}
+
+/// Runs once per epoch tick while the guest runs: traps once the step has
+/// run longer than `step_cpu`, otherwise yields to the async runtime.
+fn epoch_check(
+    mut ctx: StoreContextMut<'_, StoreState>,
+) -> wasmtime::Result<wasmtime::UpdateDeadline> {
+    let data = ctx.data_mut();
+    data.in_epoch_check = true;
+    if data.step_started.elapsed() >= data.layer.config.limits.step_cpu {
+        return Err(wasmtime::Error::new(LayerError::BudgetExceeded(
+            Budget::StepCpu,
+        )));
+    }
+    Ok(wasmtime::UpdateDeadline::Yield(1))
 }
 
 impl Layer {
@@ -193,10 +215,6 @@ impl Layer {
                 message: "step_cpu and max_exchange_time must be positive".to_owned(),
             });
         }
-        let step_ticks =
-            u64::try_from(limits.step_cpu.as_micros().div_ceil(EPOCH_TICK.as_micros()))
-                .unwrap_or(u64::MAX)
-                .max(1);
 
         let engine = runtime.engine.clone();
         let component = tokio::task::spawn_blocking(move || Component::new(&engine, &wasm))
@@ -228,7 +246,7 @@ impl Layer {
         let max_instances = config.limits.max_instances;
         let inner = Arc::new(LayerInner {
             runtime: runtime.clone(),
-            shared: Arc::new(LayerShared { config, step_ticks }),
+            shared: Arc::new(LayerShared { config }),
             pre,
             handler,
             init,
@@ -268,15 +286,12 @@ impl Layer {
         let inner = &self.inner;
         let mut store = Store::new(&inner.runtime.engine, StoreState::new(inner.shared.clone()));
         store.limiter(|s| &mut s.limiter);
-        store.call_hook(reset_step);
-        store.epoch_deadline_trap();
-        store
-            .fuel_async_yield_interval(Some(FUEL_YIELD_INTERVAL))
-            .map_err(|e| LayerError::Instantiate(e.to_string()))?;
+        store.call_hook(step_hook);
+        store.epoch_deadline_callback(epoch_check);
         store
             .set_fuel(inner.shared.config.limits.fuel_per_step)
             .map_err(|e| LayerError::Instantiate(e.to_string()))?;
-        store.set_epoch_deadline(inner.shared.step_ticks);
+        store.set_epoch_deadline(1);
 
         let start =
             async {
