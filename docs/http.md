@@ -242,6 +242,10 @@ received.
   not memory. The decoded size counts against the same cap as the body as
   sent.
 
+With addons, roxy also decodes bodies at the edge of the stack, so layers
+see them decoded ([addons](addons.md#content-codings)). This is the one case
+where roxy forwards a body decoded.
+
 `http.strip_accept_encoding` (default false) removes `accept-encoding` from
 every request as roxy reads it, so origins answer uncompressed. The addons,
 the rules and the flow log all see the request without it. This trades

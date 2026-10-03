@@ -325,6 +325,10 @@ pub enum BodyError {
     /// evaluation failed closed). The body is cut where it stood.
     #[error("stopped by policy")]
     Stopped,
+    /// The body could not be decoded by its `content-encoding`
+    /// ([`crate::coding::decode_body`]).
+    #[error("body could not be decoded: {0}")]
+    Undecodable(String),
 }
 
 /// Error while writing to (or driving) a client connection. After any of

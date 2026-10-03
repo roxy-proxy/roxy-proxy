@@ -12,12 +12,17 @@
 //! bytes roxy inspected.
 
 use std::io::Read as _;
+use std::pin::Pin;
+use std::task::{Context, Poll, ready};
 
 use brotli_decompressor::{BrotliDecompressStream, BrotliResult, BrotliState, StandardAlloc};
+use bytes::Bytes;
 use flate2::{Crc, Decompress, FlushDecompress, Status};
+use http::HeaderMap;
+use http_body::Frame;
 use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
 
-use crate::Headers;
+use crate::{Body, BodyError, Headers};
 
 /// More codings than this in one `content-encoding` is refused rather than
 /// decoded: each one is another decoder (and window) to allocate.
@@ -34,6 +39,9 @@ const GZIP_MAX_HEADER: usize = 128 << 10;
 
 /// Size of the buffer between stacked codings.
 const STAGE_CHUNK: usize = 32 << 10;
+
+/// Largest data frame a decoded body yields.
+const FRAME_CHUNK: usize = 64 << 10;
 
 /// A content coding roxy can decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +141,92 @@ pub fn decode(codings: &[Coding], input: &[u8], limit: u64) -> Result<Vec<u8>, D
             return Ok(out);
         }
         out.extend_from_slice(&buf[..n]);
+    }
+}
+
+/// `body`, encoded with `codings`, as a decoded stream of unknown length.
+///
+/// Output is produced as the consumer reads it, at most 64 KiB per frame,
+/// so a decompression bomb is paced by the reader like any other body.
+/// More than `limit` decoded bytes fails the body with
+/// [`BodyError::TooLarge`]; data that does not decode fails it with
+/// [`BodyError::Undecodable`]. Trailers follow the decoded data.
+pub fn decode_body(body: Body, codings: &[Coding], limit: u64) -> Body {
+    Body::wrap_native(
+        DecodedBody {
+            inner: body,
+            dec: Decoder::new(codings, limit),
+            buf: vec![0u8; FRAME_CHUNK].into_boxed_slice(),
+            inner_done: false,
+            trailers: None,
+            done: false,
+        },
+        u64::MAX,
+        None,
+    )
+}
+
+struct DecodedBody {
+    inner: Body,
+    dec: Decoder,
+    buf: Box<[u8]>,
+    inner_done: bool,
+    trailers: Option<HeaderMap>,
+    done: bool,
+}
+
+impl http_body::Body for DecodedBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        let this = &mut *self;
+        loop {
+            if this.done {
+                return Poll::Ready(None);
+            }
+            match this.dec.read(&mut this.buf) {
+                Ok(0) => {}
+                Ok(n) => {
+                    return Poll::Ready(Some(Ok(Frame::data(Bytes::copy_from_slice(
+                        &this.buf[..n],
+                    )))));
+                }
+                Err(e) => {
+                    this.done = true;
+                    let e = match e {
+                        DecodeError::TooLarge { limit } => BodyError::TooLarge { limit },
+                        e => BodyError::Undecodable(e.to_string()),
+                    };
+                    return Poll::Ready(Some(Err(e)));
+                }
+            }
+            if this.inner_done {
+                this.done = true;
+                return Poll::Ready(this.trailers.take().map(|t| Ok(Frame::trailers(t))));
+            }
+            match ready!(Pin::new(&mut this.inner).poll_frame(cx)) {
+                Some(Ok(f)) => match f.into_data() {
+                    Ok(d) => this.dec.feed(&d),
+                    Err(f) => this.trailers = f.into_trailers().ok(),
+                },
+                Some(Err(e)) => {
+                    this.done = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                None => {
+                    this.inner_done = true;
+                    this.dec.finish();
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done
     }
 }
 
@@ -1016,6 +1110,54 @@ mod tests {
         // The same frame with an 8 MiB window decodes to nothing.
         f[5] = 13 << 3;
         assert_eq!(decode(&[Coding::Zstd], &f, 100).unwrap(), b"");
+    }
+
+    /// Drains `body`: its data frames, then `Err` if it failed.
+    async fn drain(mut body: Body) -> (Vec<Vec<u8>>, Result<(), BodyError>) {
+        use http_body_util::BodyExt as _;
+        let mut frames = Vec::new();
+        while let Some(f) = body.frame().await {
+            match f {
+                Ok(f) => {
+                    if let Ok(d) = f.into_data() {
+                        frames.push(d.to_vec());
+                    }
+                }
+                Err(e) => return (frames, Err(e)),
+            }
+        }
+        (frames, Ok(()))
+    }
+
+    #[tokio::test]
+    async fn a_decoded_body_streams_in_bounded_frames() {
+        let body = vec![b'x'; 1 << 20];
+        let enc = gzip(&body);
+        let (mut tx, inner) = Body::channel(u64::MAX, None);
+        tokio::spawn(async move {
+            for piece in enc.chunks(100) {
+                tx.ready().await.unwrap();
+                tx.try_push(Bytes::copy_from_slice(piece)).unwrap();
+            }
+            tx.ready().await.unwrap();
+            tx.try_finish().unwrap();
+        });
+        let (frames, end) = drain(decode_body(inner, &[Coding::Gzip], u64::MAX)).await;
+        end.unwrap();
+        assert!(frames.iter().all(|f| f.len() <= FRAME_CHUNK));
+        assert_eq!(frames.concat(), body);
+    }
+
+    #[tokio::test]
+    async fn a_decoded_body_fails_rather_than_ending_short() {
+        let mut enc = gzip(b"payload");
+        enc.truncate(enc.len() - 1);
+        let (_, end) = drain(decode_body(Body::from_bytes(enc), &[Coding::Gzip], 100)).await;
+        assert!(matches!(end, Err(BodyError::Undecodable(_))), "{end:?}");
+
+        let enc = gzip(&vec![0u8; 1 << 20]);
+        let (_, end) = drain(decode_body(Body::from_bytes(enc), &[Coding::Gzip], 1000)).await;
+        assert_eq!(end, Err(BodyError::TooLarge { limit: 1000 }));
     }
 
     #[test]

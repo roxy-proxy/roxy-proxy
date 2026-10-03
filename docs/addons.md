@@ -81,6 +81,32 @@ For WebSockets, a layer that exports `tunnel` gets the two raw byte streams
 after the `101`. A layer without `tunnel` is not in that path, but the
 upgrade request still passes through it, so it can refuse the upgrade.
 
+### Content codings
+
+Layers see bodies decoded, so none needs its own decompressors. roxy
+decodes at the edge of the stack: the client's request body before the
+first layer, and the response before it reaches the innermost layer. It
+removes `content-encoding` as it does, and the body's length becomes
+unknown.
+
+- So with addons, the client gets an uncompressed response and the upstream
+  an uncompressed request body. The origin's response to roxy stays
+  compressed. Nothing re-encodes; a layer that wants a compressed body
+  encodes it itself.
+- The codings and their strictness are those the rules use
+  ([HTTP](http.md#content-codings)). Data that does not decode, or a
+  decoded body over `limits.max_request_body_bytes` or
+  `limits.max_response_body_bytes`, cuts the exchange like any failed body.
+- A body in a coding roxy does not know passes through as it is, with its
+  `content-encoding`, for a layer to judge. So does a `206` or any response
+  with `content-range`: part of an encoded body cannot be decoded on its
+  own.
+- The rules below the stack read the response before any layer, and decode
+  it for themselves ([rules](rules.md#body-access)).
+
+`http.decode_for_addons: false` turns this off: layers then see the bytes
+as sent, with their `content-encoding`.
+
 ### Modes
 
 - `mode: enforce` (default): the layer is in the path and its decisions

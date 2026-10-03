@@ -137,8 +137,9 @@ impl Upstream {
     ///
     /// * `/early`: `200 early` at once, without reading the body;
     /// * `/status/<n>`: reads the body, answers `<n>`;
-    /// * `/echo`: reads the body, answers `200` with the same bytes, and
-    ///   with `content-encoding` set to the request's `x-echo-encoding`;
+    /// * `/echo`: reads the body, answers with the same bytes, with
+    ///   `content-encoding` set to the request's `x-echo-encoding` and the
+    ///   status to its `x-echo-status` (default `200`);
     /// * a WebSocket upgrade: `101`, then echoes bytes;
     /// * anything else: reads the body, answers `200` with JSON
     ///   `{method, path, host, body_len, via}`.
@@ -181,6 +182,7 @@ impl Upstream {
             .map(|h| String::from_utf8_lossy(h.as_bytes()).into_owned());
         let method = req.method().to_string();
         let echo_encoding = req.headers().get("x-echo-encoding").cloned();
+        let echo_status = req.headers().get("x-echo-status").cloned();
         let body = req.into_body();
         let mine = entry.clone();
         let me = self.clone();
@@ -222,12 +224,8 @@ impl Upstream {
                 .unwrap();
         };
         if path == "/echo" {
-            let body = Bytes::from(lock(&mine).body.clone());
-            let mut res = http::Response::builder();
-            if let Some(v) = echo_encoding {
-                res = res.header("content-encoding", v);
-            }
-            return res.body(Full::new(body)).unwrap();
+            let body = lock(&mine).body.clone();
+            return echo(echo_status.as_ref(), echo_encoding, body);
         }
         if let Some(code) = path.strip_prefix("/status/") {
             return http::Response::builder()
@@ -247,6 +245,22 @@ impl Upstream {
             .body(Full::new(Bytes::from(json.to_string())))
             .unwrap()
     }
+}
+
+/// The `/echo` answer: `body`, with the requested status and coding.
+fn echo(
+    status: Option<&http::HeaderValue>,
+    encoding: Option<http::HeaderValue>,
+    body: Vec<u8>,
+) -> http::Response<Full<Bytes>> {
+    let mut res = http::Response::builder();
+    if let Some(s) = status {
+        res = res.status(s.to_str().unwrap().parse::<u16>().unwrap());
+    }
+    if let Some(v) = encoding {
+        res = res.header("content-encoding", v);
+    }
+    res.body(Full::new(Bytes::from(body))).unwrap()
 }
 
 /// Answers a WebSocket upgrade with `101` and echoes the upgraded bytes.

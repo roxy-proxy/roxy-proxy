@@ -181,7 +181,7 @@ pub enum TlsVersion {
 
 /// Strictness knobs for client-side HTTP parsing (docs/http.md#rejection-rules). All default to the
 /// strict setting (`enable_h2` defaults to true: it is a capability, and the
-/// h2 path is as strict as h1).
+/// h2 path is as strict as h1), plus how roxy handles content codings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 #[allow(clippy::struct_excessive_bools)]
@@ -196,6 +196,9 @@ pub struct Http {
     pub enable_h2: bool,
     /// Remove `accept-encoding` from requests (docs/http.md#content-codings).
     pub strip_accept_encoding: bool,
+    /// Decode bodies for the addons (docs/addons.md#content-codings).
+    /// Default true.
+    pub decode_for_addons: bool,
 }
 
 impl Default for Http {
@@ -209,6 +212,7 @@ impl Default for Http {
             allow_body_on_get: false,
             enable_h2: true,
             strip_accept_encoding: false,
+            decode_for_addons: true,
         }
     }
 }

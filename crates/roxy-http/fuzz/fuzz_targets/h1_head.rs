@@ -19,6 +19,7 @@ fuzz_target!(|data: &[u8]| {
         allow_body_on_get: cfg & 16 != 0,
         allow_plain_in_connect: false,
         strip_accept_encoding: false,
+        decode_for_addons: true,
     };
     let limits = Limits {
         max_header_bytes: 4096,

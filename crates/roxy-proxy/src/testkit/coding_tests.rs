@@ -7,7 +7,7 @@ use std::io::Write as _;
 use bytes::Bytes;
 use roxy_http::Body;
 
-use super::{Answer, Client, Kit};
+use super::{AddonDef, Answer, Client, Kit};
 
 const RULES: &str = r#"
 - id: no-secret-out
@@ -216,4 +216,97 @@ async fn strip_accept_encoding_removes_it_before_the_rules() {
     )
     .await;
     assert_eq!(a.status, 403, "{a:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Addons (docs/addons.md#content-codings)
+// ---------------------------------------------------------------------------
+
+/// No body rules, so what reaches the client is the layer's doing.
+async fn with_layer(decode: bool) -> Kit {
+    Kit::builder()
+        .addon(AddonDef::test_layer("a"))
+        .flags(|f| f.decode_for_addons = decode)
+        .start()
+        .await
+}
+
+#[tokio::test]
+async fn a_layer_sees_the_request_body_decoded() {
+    let kit = with_layer(true).await;
+    // The layer upper-cases what it reads, so the upstream gets "HELLO"
+    // only if the layer was given the decoded text.
+    let headers = [("content-encoding", "gzip"), ("x-upper", "1")];
+    let a = post(&mut kit.h1().await, "/x", &headers, gzip(b"hello")).await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].body, b"HELLO");
+    assert!(!seen[0].headers.contains_key("content-encoding"));
+}
+
+#[tokio::test]
+async fn a_layer_sees_the_response_body_decoded() {
+    let kit = with_layer(true).await;
+    for h2 in [false, true] {
+        let mut c = if h2 {
+            kit.tunnel("up.test", true).await
+        } else {
+            kit.h1().await
+        };
+        let headers = [("x-echo-encoding", "gzip"), ("x-upper", "1")];
+        // An identity request body, which the upstream echoes as gzip.
+        let a = post(&mut c, "/echo", &headers, gzip(b"hello")).await;
+        assert_eq!(a.status, 200, "h2 {h2}: {a:?}");
+        assert!(!a.headers.contains_key("content-encoding"), "{a:?}");
+        // Upper-cased by the layer after decoding.
+        assert_eq!(a.text(), "HELLO");
+    }
+}
+
+#[tokio::test]
+async fn decode_for_addons_off_leaves_bodies_encoded() {
+    let kit = with_layer(false).await;
+    let enc = gzip(b"hello");
+    let a = post(
+        &mut kit.h1().await,
+        "/x",
+        &[("content-encoding", "gzip")],
+        enc.clone(),
+    )
+    .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].body, enc);
+    assert_eq!(seen[0].headers["content-encoding"], "gzip");
+
+    let a = echo(&kit, false, "gzip", enc.clone()).await;
+    assert_eq!(a.headers["content-encoding"], "gzip");
+    assert_eq!(a.body.as_deref().unwrap(), enc.as_slice());
+}
+
+#[tokio::test]
+async fn a_layer_gets_unknown_codings_and_ranges_as_they_are() {
+    let kit = with_layer(true).await;
+    let a = echo(&kit, false, "compress", b"opaque".to_vec()).await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.headers["content-encoding"], "compress");
+    assert_eq!(a.text(), "opaque");
+
+    // Part of a gzip body is not decodable on its own.
+    let part = gzip(b"hello")[..5].to_vec();
+    let headers = [("x-echo-encoding", "gzip"), ("x-echo-status", "206")];
+    let a = post(&mut kit.h1().await, "/echo", &headers, part.clone()).await;
+    assert_eq!(a.status, 206, "{a:?}");
+    assert_eq!(a.headers["content-encoding"], "gzip");
+    assert_eq!(a.body.as_deref().unwrap(), part.as_slice());
+}
+
+#[tokio::test]
+async fn a_corrupt_body_is_cut_on_its_way_to_a_layer() {
+    let kit = with_layer(true).await;
+    let mut enc = gzip(b"hello");
+    let n = enc.len();
+    enc[n - 8] ^= 1;
+    let a = echo(&kit, false, "gzip", enc).await;
+    assert!(a.body.is_err(), "{a:?}");
 }
