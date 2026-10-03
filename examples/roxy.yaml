@@ -145,7 +145,14 @@ log:
     max_file_bytes: 100mb            # rotate by size; absent = never
     max_files: 10                    # rotated files kept; absent = all
     compress: true                   # gzip rotated files
+  capture:                         # traffic capture (§10.2), under capture_dir
+    all: false                     # true: tee every forwarded exchange
+    max_file_bytes: 1gb
+    max_files: 20
+    compress: true
   redact_headers: [x-internal-token]
+
+capture_dir: /var/lib/roxy/capture
 
 # Addons sit above the rules, in the order listed: the first sees each
 # request first and each response last. Not in this build; `roxy run`

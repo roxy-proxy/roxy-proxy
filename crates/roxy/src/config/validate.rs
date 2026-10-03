@@ -370,6 +370,37 @@ impl Config {
                 "must be at least 1 (omit it to keep every rotated file)",
             ));
         }
+        let c = &self.log.capture;
+        if self.uses_capture() && self.capture_dir.is_none() {
+            d.push(Diagnostic::new(
+                "capture_dir",
+                "capture (a `capture` action or log.capture.all) needs `capture_dir`",
+            ));
+        }
+        if c.high_water.as_u64() < 64 * 1024 {
+            d.push(Diagnostic::new(
+                "log.capture.high_water",
+                "must be at least 64kb",
+            ));
+        }
+        if c.max_file_bytes.is_none() && (c.max_files.is_some() || c.compress) {
+            d.push(Diagnostic::new(
+                "log.capture.max_file_bytes",
+                "max_files and compress apply to rotated files; set max_file_bytes to rotate",
+            ));
+        }
+        if c.max_file_bytes.is_some_and(|b| b.as_u64() < 4096) {
+            d.push(Diagnostic::new(
+                "log.capture.max_file_bytes",
+                "must be at least 4kb",
+            ));
+        }
+        if c.max_files == Some(0) {
+            d.push(Diagnostic::new(
+                "log.capture.max_files",
+                "must be at least 1 (omit it to keep every rotated file)",
+            ));
+        }
     }
 }
 

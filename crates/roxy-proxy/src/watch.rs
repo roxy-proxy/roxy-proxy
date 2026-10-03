@@ -52,6 +52,7 @@ use roxy_rules::{Decision, Effect, EvalContext, Reads, WatchState};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use ulid::Ulid;
 
+use crate::capture::Tap;
 use crate::flowlog::{FlowSink, Stage};
 use crate::pipeline::{Events, FlowCx, Refusal, fail_closed_code};
 use crate::server::{Shared, Snapshot};
@@ -444,7 +445,7 @@ impl Inner {
 /// Wraps a body so each data frame passes [`Watch::on_body_chunk`] before
 /// it is yielded. Framing (known length) is preserved; a stop ends the body
 /// with [`BodyError::Stopped`] and the frame that caused it is dropped.
-pub(crate) fn watched(body: Body, watch: Arc<Watch>, dir: Dir) -> Body {
+pub(crate) fn watched(body: Body, watch: Arc<Watch>, dir: Dir, tap: Option<Tap>) -> Body {
     let known = body.known_length();
     let cancelled = Box::pin(watch.cancelled());
     let sink = watch.sink();
@@ -455,6 +456,7 @@ pub(crate) fn watched(body: Body, watch: Arc<Watch>, dir: Dir) -> Body {
             dir,
             cancelled,
             sink,
+            tap,
             done: false,
         },
         u64::MAX,
@@ -470,7 +472,19 @@ struct Watched {
     /// Audit backpressure (§10.1): no chunk moves while the flow log is
     /// behind.
     sink: Arc<dyn FlowSink>,
+    /// Capture (§10.2): records each chunk as it is forwarded.
+    tap: Option<Tap>,
     done: bool,
+}
+
+impl Watched {
+    /// Ends the body with [`BodyError::Stopped`]; the capture tap (if any)
+    /// records an aborted end.
+    fn stop(&mut self) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        self.done = true;
+        self.tap = None;
+        Poll::Ready(Some(Err(BodyError::Stopped)))
+    }
 }
 
 impl http_body::Body for Watched {
@@ -485,13 +499,15 @@ impl http_body::Body for Watched {
             return Poll::Ready(None);
         }
         if self.watch.stop.is_cancelled() {
-            self.done = true;
-            return Poll::Ready(Some(Err(BodyError::Stopped)));
+            return self.stop();
         }
-        if self.sink.poll_ready(cx).is_pending() {
+        let capture_behind = self
+            .tap
+            .as_ref()
+            .is_some_and(|t| t.log().poll_ready(cx).is_pending());
+        if self.sink.poll_ready(cx).is_pending() || capture_behind {
             if self.cancelled.as_mut().poll(cx).is_ready() {
-                self.done = true;
-                return Poll::Ready(Some(Err(BodyError::Stopped)));
+                return self.stop();
             }
             return Poll::Pending;
         }
@@ -499,22 +515,41 @@ impl http_body::Body for Watched {
             Poll::Pending => {
                 // Wake up if the exchange is stopped while waiting.
                 if self.cancelled.as_mut().poll(cx).is_ready() {
-                    self.done = true;
-                    return Poll::Ready(Some(Err(BodyError::Stopped)));
+                    return self.stop();
                 }
                 Poll::Pending
             }
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(d) = frame.data_ref()
                     && !d.is_empty()
-                    && self.watch.on_body_chunk(self.dir, d.len() as u64).is_err()
                 {
-                    self.done = true;
-                    return Poll::Ready(Some(Err(BodyError::Stopped)));
+                    if self.watch.on_body_chunk(self.dir, d.len() as u64).is_err() {
+                        return self.stop();
+                    }
+                    if let Some(t) = self.tap.as_mut() {
+                        t.data(d);
+                    }
+                }
+                // The consumer may not poll again once the body says it
+                // has ended, so record the end now.
+                if self.inner.is_end_stream()
+                    && let Some(mut t) = self.tap.take()
+                {
+                    t.end(false);
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            other @ Poll::Ready(_) => other,
+            Poll::Ready(None) => {
+                if let Some(mut t) = self.tap.take() {
+                    t.end(false);
+                }
+                Poll::Ready(None)
+            }
+            // A failed body: the tap records an aborted end when dropped.
+            other @ Poll::Ready(Some(Err(_))) => {
+                self.tap = None;
+                other
+            }
         }
     }
 
