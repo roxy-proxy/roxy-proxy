@@ -21,7 +21,7 @@ use crate::auth::UserDb;
 use crate::config::{PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowEvent, FlowSink, Redactor};
 use crate::listener::{ClientConn, ExplicitListener, Listener, ListenerMode};
-use crate::pipeline::{Pipeline, client_info};
+use crate::pipeline::client_info;
 use crate::sources::{MetricSource, StateSource};
 use crate::upstream::Upstream;
 
@@ -107,7 +107,6 @@ pub(crate) struct Shared {
     /// Offer ALPN `h2` in terminated tunnels.
     pub enable_h2: bool,
     pub connection_events: bool,
-    pub pipeline: Pipeline,
     /// Each addon's keyed store, by addon name; survives reloads.
     pub layer_state: crate::addons::store::LayerStates,
     caps: Arc<ConnCaps>,
@@ -276,7 +275,6 @@ impl Server {
             require_sni_match: cfg.require_sni_match,
             enable_h2: cfg.enable_h2,
             connection_events: cfg.connection_events,
-            pipeline: Pipeline::builtin(),
             layer_state: crate::addons::store::LayerStates::default(),
             caps: Arc::new(ConnCaps {
                 max: cfg.max_connections.max(1),

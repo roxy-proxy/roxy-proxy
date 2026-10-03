@@ -1,5 +1,5 @@
 //! roxy's proxy engine (docs/architecture.md): listeners, the connection state
-//! machine, the flow pipeline, the upstream connector (DNS, SSRF policy,
+//! machine, the exchange core, the upstream connector (DNS, SSRF policy,
 //! pool), the WebSocket relay and flow-log emission.
 //!
 //! # Module map
@@ -10,13 +10,14 @@
 //!   [`ExplicitListener`]; [`ClientConn`].
 //! - `conn`: the explicit-mode state machine (proxy port, CONNECT, sniff,
 //!   TLS termination, tunnels, `roxy.internal`, proxy auth).
-//! - `pipeline`: request/response stages, the `Verdict` the driver consumes
-//!   exhaustively, the head decision and its effects.
+//! - `pipeline`: the core's fixed request and response steps, the
+//!   `Verdict` they return (consumed exhaustively), the head decision and
+//!   its effects, the per-flow context.
 //! - `watch`: the per-exchange watcher: watching rules re-checked as body
 //!   bytes stream, at the response head and in the WebSocket relay, and
 //!   byte metrics recorded as they stream.
 //! - `exchange`: the transport-agnostic exchange core (`process`: request
-//!   stages → upstream → response stages → `Outcome`), the h1 adapter,
+//!   steps → upstream → response steps → `Outcome`), the h1 adapter,
 //!   upstream errors, the WebSocket relay.
 //! - `h2conn`: the client-side HTTP/2 front end (ALPN `h2` in a tunnel).
 //! - [`upstream`]: resolver, address floor, connector and pooled client.

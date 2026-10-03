@@ -1,5 +1,5 @@
-//! One request/response exchange: request stages → upstream → response
-//! stages → client, plus the WebSocket relay (docs/websockets.md#relay).
+//! One request/response exchange: request steps → upstream → response
+//! steps → client, plus the WebSocket relay (docs/websockets.md#relay).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,8 +23,7 @@ use crate::flowlog::{DecisionKind, FlowEvent};
 use crate::io::{ConnIo, Io};
 use crate::listener::ClientConn;
 use crate::pipeline::{
-    BodyIo, FlowCx, Refusal, RefusalKind, ResponseVerdict, Verdict, run_request_stages,
-    run_response_stages,
+    BodyIo, FlowCx, Refusal, RefusalKind, ResponseVerdict, Verdict, request_steps, response_steps,
 };
 use crate::server::Shared;
 use crate::upstream::{ConnectError, classify, describe};
@@ -150,7 +149,7 @@ pub(crate) async fn close_on_parse_error(
 }
 
 /// The client side of an exchange, as the transport-agnostic core sees it:
-/// body access for inspecting stages ([`BodyIo`]) plus a way to wait for
+/// body access for the inspecting steps ([`BodyIo`]) plus a way to wait for
 /// the upstream while the client's request body keeps flowing.
 pub(crate) trait Front: BodyIo {
     /// Runs `fut` (the upstream request) while the client's request body
@@ -185,7 +184,7 @@ impl Front for ServerConn<ConnIo> {
 /// upstream exchange has already happened (or was refused) by the time an
 /// outcome exists.
 pub(crate) enum Outcome {
-    /// Send this response (from the upstream, after the response stages).
+    /// Send this response (from the upstream, after the response steps).
     Respond(CanonicalResponse),
     /// Answer locally (deny, fail-closed, upstream error).
     Refuse(Refusal),
@@ -199,8 +198,8 @@ pub(crate) enum Outcome {
     },
 }
 
-/// The transport-agnostic exchange: request stages → upstream → response
-/// stages. `cx` carries the flow record; the caller writes the outcome and
+/// The transport-agnostic exchange: request steps → upstream → response
+/// steps. `cx` carries the flow record; the caller writes the outcome and
 /// emits the flow's `request` event.
 pub(crate) async fn process<F: Front>(
     front: &mut F,
@@ -217,16 +216,15 @@ pub(crate) async fn process<F: Front>(
     }
 }
 
-/// The exchange below the addons: request stages (the rules) → upstream →
-/// response stages. Reached directly when no addon is configured, and from
+/// The exchange below the addons: the request steps (the rules) → upstream →
+/// the response steps. Reached directly when no addon is configured, and from
 /// the last layer's `next` otherwise.
 pub(crate) async fn core<F: Front>(
     front: &mut F,
     cx: &mut FlowCx,
     req: CanonicalRequest,
 ) -> Outcome {
-    let shared = cx.shared.clone();
-    let verdict = run_request_stages(&shared.pipeline, cx, req, front).await;
+    let verdict = request_steps(cx, req, front).await;
     // Exhaustive, no wildcard: only `Continue` reaches the upstream.
     match verdict {
         Verdict::Continue(req) => {
@@ -540,8 +538,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
         }
     };
     let res = from_upstream_response(res, &limits);
-    let shared = cx.shared.clone();
-    let verdict = run_response_stages(&shared.pipeline, cx, res, front).await;
+    let verdict = response_steps(cx, res, front).await;
     match verdict {
         ResponseVerdict::Continue(mut res) => {
             let mut down_tap = down_tap;
