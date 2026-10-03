@@ -1,5 +1,5 @@
-//! Serde types for the rule-related parts of the config (`DESIGN.md` §6.1,
-//! §6.3, §6.4).
+//! Serde types for the rule-related parts of the config (docs/rules.md#config-file,
+//! docs/rules.md#actions, docs/rules.md#metrics).
 //!
 //! These are the *uncompiled* shapes. [`crate::Policy::compile`] turns them
 //! into an evaluable policy and reports every semantic problem as a
@@ -15,7 +15,7 @@ use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
 // ----- default decision ---------------------------------------------------
 
-/// What the request head gets when no head rule decides (§6.1): the
+/// What the request head gets when no head rule decides (docs/rules.md#evaluation): the
 /// top-level `default:` key.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,7 +45,7 @@ impl fmt::Display for DefaultDecision {
 
 // ----- expressions ----------------------------------------------------------
 
-/// An uncompiled DSL expression (§6.2).
+/// An uncompiled DSL expression (docs/rules.md#expressions).
 ///
 /// YAML turns `where: true` into a boolean, so booleans are accepted and
 /// stored as their literal text (a bool literal is a valid expression).
@@ -85,7 +85,7 @@ impl<'de> Deserialize<'de> for Expr {
 // ----- rules ----------------------------------------------------------------
 
 /// One entry of `rules:`. Rules form one ordered list; when a rule runs
-/// follows from what it reads (§6.1), so there is no `phase` key.
+/// follows from what it reads (docs/rules.md#evaluation), so there is no `phase` key.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(try_from = "RawRule")]
 pub struct RuleConfig {
@@ -99,7 +99,7 @@ pub struct RuleConfig {
 /// Message for a rule that still sets the removed `phase` key.
 pub const PHASE_REMOVED: &str = "`phase` was removed: rules no longer have phases; each rule runs \
      when the values it reads are known (head rules at the request head; rules that read \
-     body.bytes, response.* or ws.* watch the rest of the exchange; see DESIGN.md §6.1). Delete \
+     body.bytes, response.* or ws.* watch the rest of the exchange; see docs/rules.md#evaluation). Delete \
      the `phase` key";
 
 #[derive(Deserialize)]
@@ -131,7 +131,7 @@ impl TryFrom<RawRule> for RuleConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Then(pub Vec<Action>);
 
-/// One action (§6.3). A closed enum, deliberately.
+/// One action (docs/rules.md#actions). A closed enum, deliberately.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// Terminal. Bare `allow` or `allow: { upgrade, private_ok }`.
@@ -214,10 +214,10 @@ impl Action {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AllowArgs {
-    /// Permit an Upgrade (§8). Only `websocket` exists.
+    /// Permit an Upgrade (docs/websockets.md). Only `websocket` exists.
     #[serde(default)]
     pub upgrade: Option<Upgrade>,
-    /// Permit private / loopback upstream addresses for this flow (§7).
+    /// Permit private / loopback upstream addresses for this flow (docs/upstream.md#address-floor).
     #[serde(default)]
     pub private_ok: bool,
 }
@@ -332,7 +332,7 @@ pub struct SetStateArgs {
     pub ttl: Option<Duration>,
 }
 
-/// What `capture` writes (§10.2).
+/// What `capture` writes (docs/flow-log.md#capture).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureTarget {
@@ -537,7 +537,7 @@ impl<'de> Deserialize<'de> for StringList {
 
 // ----- metrics --------------------------------------------------------------
 
-/// One entry of `metrics:` (§6.4).
+/// One entry of `metrics:` (docs/rules.md#metrics).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricConfig {
@@ -554,7 +554,7 @@ pub struct MetricConfig {
     pub window: Option<Duration>,
 }
 
-/// What a metric counts (§6.4).
+/// What a metric counts (docs/rules.md#metrics).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetricCount {
     Requests,
@@ -568,7 +568,7 @@ pub enum MetricCount {
 
 impl MetricCount {
     /// Whether this metric grows as bytes stream (and so is *watched* by deny
-    /// rules that read it, §6.4).
+    /// rules that read it, docs/rules.md#metrics).
     pub fn counts_bytes(&self) -> bool {
         matches!(self, Self::RequestBytes | Self::ResponseBytes)
     }
@@ -738,7 +738,7 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(err.contains("`phase` was removed"), "{err}");
-        assert!(err.contains("§6.1"), "{err}");
+        assert!(err.contains("docs/rules.md#evaluation"), "{err}");
         let ok: Vec<RuleConfig> =
             serde_yaml_ng::from_str("- { id: r, when: 'body.bytes > 1', then: deny }").unwrap();
         assert_eq!(ok[0].id, "r");

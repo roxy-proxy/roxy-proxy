@@ -98,7 +98,7 @@ impl WasmRuntime {
         >(&mut linker, &options.into(), StoreState::http)
         .map_err(|e| e.to_string())?;
         // Every roxy:addon import is linked whatever the grants; a call
-        // without its capability traps (DESIGN.md §11.3).
+        // without its capability traps (docs/addons.md#host-services).
         chain::add_to_linker::<_, Me>(&mut linker, |s| s).map_err(|e| e.to_string())?;
         endpoints::add_to_linker::<_, Me>(&mut linker, |s| s).map_err(|e| e.to_string())?;
         flow::add_to_linker::<_, Me>(&mut linker, |s| s).map_err(|e| e.to_string())?;
@@ -379,7 +379,7 @@ impl Layer {
     /// head (trap, budget, host failure), the body ends with
     /// [`roxy_http::BodyError::Stopped`] and the [`crate::LayerOutcome`]
     /// in the response's extensions reports why. Any `Err` here must be
-    /// turned into a deny (DESIGN.md §11.1 invariant 3).
+    /// turned into a deny (docs/addons.md#invariants, invariant 3).
     ///
     /// Dropping the future, or the response body before it ends, cancels
     /// the exchange and discards the instance.

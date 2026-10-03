@@ -1,4 +1,4 @@
-//! Client-facing HTTP/1.1 server codec (`DESIGN.md` §5.3, §5.5, §5.6).
+//! Client-facing HTTP/1.1 server codec (docs/http.md#rejection-rules, docs/http.md#upstream-serialisation, docs/http.md#responses).
 //!
 //! # Body streaming design
 //!
@@ -77,8 +77,8 @@ pub enum Incoming {
     /// A request in the form legal for the role (absolute-form on the proxy
     /// port, origin-form in a tunnel).
     Request(CanonicalRequest),
-    /// Origin-form on the proxy port. §4.1: the proxy must reject this unless
-    /// the host is `roxy.internal`. Kept as a separate variant so it cannot be
+    /// Origin-form on the proxy port. The proxy must reject this unless
+    /// the host is `roxy.internal` (docs/http.md#explicit-proxy). Kept as a separate variant so it cannot be
     /// treated as an ordinary request by accident. `authority` comes from
     /// `Host` (port 80 default), `scheme` is `http`.
     OriginFormOnProxyPort(CanonicalRequest),
@@ -725,7 +725,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         }
     }
 
-    /// Writes the response to the current request (§5.5/§5.6 wire form),
+    /// Writes the response to the current request (the wire form in docs/http.md#upstream-serialisation and docs/http.md#responses),
     /// continuing to pump the request body concurrently. Afterwards the
     /// connection is either ready for [`ServerConn::next_request`] or closed
     /// (client `Connection: close`, HTTP/1.0, un-drained body, unanswered

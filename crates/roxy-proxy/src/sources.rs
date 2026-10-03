@@ -1,5 +1,5 @@
 //! Policy inputs that live outside the proxy: metric values and the state
-//! store (`DESIGN.md` §6.4).
+//! store (docs/rules.md#metrics).
 //!
 //! The pipeline codes against these two traits; the real stores (sliding
 //! windows, bounded TTL map) plug in behind them. Until they exist,
@@ -12,7 +12,7 @@ use std::time::Duration;
 use roxy_rules::FlowView;
 
 /// What one exchange contributed since its last sample, reported to
-/// [`MetricSource::record`] (§6.4). An exchange reports:
+/// [`MetricSource::record`] (docs/rules.md#metrics). An exchange reports:
 ///
 /// * one `head` sample right after the forwarding decision (counts
 ///   `requests` and `unique`, and `denied` if the head denied);
@@ -45,7 +45,7 @@ pub enum MetricSourceError {
     /// The store cannot answer (not configured, overloaded, unknown metric).
     #[error("metric store unavailable: {0}")]
     Unknown(String),
-    /// A new series key was needed but the key table is full (§6.4: no
+    /// A new series key was needed but the key table is full (docs/rules.md#metrics: no
     /// eviction; the flow is denied with `metric_table_full`).
     #[error("metric key table full: {0}")]
     TableFull(String),

@@ -1,4 +1,4 @@
-//! Smuggling / strictness corpus runner (`DESIGN.md` §14.1).
+//! Smuggling / strictness corpus runner (docs/development.md#testing).
 //!
 //! Every file in `tests/corpus/*.txt` holds cases of the form:
 //!

@@ -1,9 +1,9 @@
 # roxy-http fuzz targets
 
 `cargo-fuzz` targets for the parsers that see attacker-controlled bytes
-(`DESIGN.md` §14.2). This directory is its own Cargo workspace and is **not**
-a member of the main workspace, because `cargo fuzz` needs a nightly
-toolchain.
+([docs/development.md](../../../docs/development.md#fuzzing)). This
+directory is its own Cargo workspace and is **not** a member of the main
+workspace, because `cargo fuzz` needs a nightly toolchain.
 
 | target | what it checks |
 |---|---|

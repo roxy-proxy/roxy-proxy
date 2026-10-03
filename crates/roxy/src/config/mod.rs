@@ -1,4 +1,4 @@
-//! roxy's YAML configuration (`DESIGN.md` §6.1).
+//! roxy's YAML configuration (docs/rules.md#config-file).
 //!
 //! Parsing is strict: every struct denies unknown fields, so a typo is an
 //! error rather than a silently ignored setting. [`Config::validate`] adds the
@@ -50,12 +50,12 @@ pub struct Config {
     pub upstream: Upstream,
     #[serde(default)]
     pub secrets: BTreeMap<String, SecretSource>,
-    /// Named IP address lists, referenced as `@name` in rules (§7.1).
+    /// Named IP address lists, referenced as `@name` in rules (docs/upstream.md#address-lists).
     #[serde(default)]
     pub address_lists: Vec<AddressList>,
     #[serde(default)]
     pub metrics: Vec<Metric>,
-    /// What a request gets when no rule decides it (§6.1): `deny` (the
+    /// What a request gets when no rule decides it (docs/rules.md#evaluation): `deny` (the
     /// default) or `allow`.
     #[serde(default)]
     pub default: DefaultDecision,
@@ -65,7 +65,7 @@ pub struct Config {
     pub addons: Vec<Addon>,
     #[serde(default)]
     pub log: Log,
-    /// Directory for `capture` action output (§10.2). Absent = capture disabled.
+    /// Directory for `capture` action output (docs/flow-log.md#capture). Absent = capture disabled.
     #[serde(default)]
     pub capture_dir: Option<PathBuf>,
 }
@@ -81,10 +81,10 @@ pub struct Listener {
     pub bind: SocketAddr,
     #[serde(default)]
     pub auth: Option<ListenerAuth>,
-    /// Transparent listeners only (deferred, §4.2).
+    /// Transparent listeners only (deferred, issue #15).
     #[serde(default)]
     pub allow_passthrough: Option<bool>,
-    /// Transparent listeners only (deferred, §4.2).
+    /// Transparent listeners only (deferred, issue #15).
     #[serde(default)]
     pub upstream_target: Option<UpstreamTarget>,
 }
@@ -95,7 +95,7 @@ pub enum ListenerMode {
     #[default]
     Explicit,
     /// Parsed so the config shape is stable, but rejected by validation
-    /// until transparent mode is built (§4.2).
+    /// until transparent mode is built (issue #15).
     Transparent,
 }
 
@@ -133,7 +133,7 @@ pub struct Tls {
     /// Where `roxy-ca.pem` / `roxy-ca.key` live; generated if absent.
     pub ca_dir: PathBuf,
     pub require_sni_match: bool,
-    /// Leaf certificate LRU size (§9).
+    /// Leaf certificate LRU size (docs/tls.md#leaf-certificates).
     pub leaf_cache_size: usize,
     pub upstream: TlsUpstream,
 }
@@ -179,7 +179,7 @@ pub enum TlsVersion {
 
 // ----- http -----------------------------------------------------------------
 
-/// Strictness knobs for client-side HTTP parsing (§5.3). All default to the
+/// Strictness knobs for client-side HTTP parsing (docs/http.md#rejection-rules). All default to the
 /// strict setting (`enable_h2` defaults to true: it is a capability, and the
 /// h2 path is as strict as h1).
 #[derive(Debug, Clone, Deserialize)]
@@ -192,7 +192,7 @@ pub struct Http {
     pub allow_plain_in_connect: bool,
     pub allow_obs_text: bool,
     pub allow_body_on_get: bool,
-    /// Offer `h2` in client-facing ALPN (§5.1a). Default true.
+    /// Offer `h2` in client-facing ALPN (docs/http.md#http2). Default true.
     pub enable_h2: bool,
 }
 
@@ -240,7 +240,7 @@ pub struct Limits {
     /// the idle timeout of a relayed WebSocket.
     #[serde(with = "humantime_serde")]
     pub idle_timeout: Duration,
-    /// Global cap on concurrent client connections (§12).
+    /// Global cap on concurrent client connections (docs/limits.md#connections).
     pub max_connections: usize,
     pub max_connections_per_client: usize,
     /// Client-side h2 (when it lands): concurrent streams per connection.
@@ -249,15 +249,15 @@ pub struct Limits {
     #[serde(deserialize_with = "units::size")]
     pub h2_max_header_list_bytes: ByteSize,
     pub max_metric_keys: usize,
-    /// Approximate byte budget across all metric series (§6.4). A flow that
+    /// Approximate byte budget across all metric series (docs/rules.md#metrics). A flow that
     /// would take the store past it is denied like a full key table; nothing
     /// is evicted.
     #[serde(deserialize_with = "units::size")]
     pub max_metric_bytes: ByteSize,
     /// Cap on live `set_state` entries; a new key when full denies the flow
-    /// that tried (§6.4, no eviction).
+    /// that tried (docs/rules.md#state, no eviction).
     pub max_state_entries: usize,
-    /// Largest address list file roxy will load (§7.1); a bigger file is a
+    /// Largest address list file roxy will load (docs/upstream.md#address-lists); a bigger file is a
     /// load error (startup fails / the reload fails).
     #[serde(deserialize_with = "units::size")]
     pub max_address_list_bytes: ByteSize,
@@ -314,12 +314,12 @@ impl Limits {
 pub struct Upstream {
     pub dns: Dns,
     /// Deny loopback, link-local, RFC 1918, ULA, multicast and unspecified
-    /// destinations after resolution (§7).
+    /// destinations after resolution (docs/upstream.md#address-floor).
     pub deny_private_ranges: bool,
     pub deny_cidrs: Vec<IpNet>,
     pub allow_cidrs: Vec<IpNet>,
     /// Names of `address_lists` whose addresses are never valid upstream
-    /// destinations (§7.1), checked like `deny_cidrs`.
+    /// destinations (docs/upstream.md#address-lists), checked like `deny_cidrs`.
     pub deny_lists: Vec<String>,
     #[serde(with = "humantime_serde")]
     pub connect_timeout: Duration,
@@ -393,7 +393,7 @@ impl TryFrom<RawSecretSource> for SecretSource {
 
 // ----- address lists ----------------------------------------------------------
 
-/// One entry of `address_lists:` (§7.1): a named set of IPs / CIDRs.
+/// One entry of `address_lists:` (docs/upstream.md#address-lists): a named set of IPs / CIDRs.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "RawAddressList")]
 pub struct AddressList {
@@ -437,7 +437,7 @@ impl TryFrom<RawAddressList> for AddressList {
 
 // ----- addons ---------------------------------------------------------------
 
-/// A host service an addon may use (§11.3). Each gates imports that are
+/// A host service an addon may use (docs/addons.md#host-services). Each gates imports that are
 /// always linked: calling one without its capability fails the flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -457,7 +457,7 @@ pub enum Capability {
     Secrets,
 }
 
-/// A named outbound endpoint (§11.3). The addon names it; roxy resolves the
+/// A named outbound endpoint (docs/addons.md#endpoints). The addon names it; roxy resolves the
 /// URL, attaches the headers, applies the timeout and retries, and enforces
 /// the address floor and deny lists. Endpoint calls never pass through the
 /// layer stack or the rules.
@@ -482,7 +482,7 @@ pub struct Endpoint {
     pub private_ok: bool,
 }
 
-/// An addon's keyed store (§11.3). Nothing is evicted: a write when full
+/// An addon's keyed store (docs/addons.md#state). Nothing is evicted: a write when full
 /// fails and the addon decides.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -498,19 +498,19 @@ pub struct AddonState {
     pub default_ttl: Option<Duration>,
 }
 
-/// How an addon is implemented (§11.1).
+/// How an addon is implemented (docs/addons.md#layer-stack).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AddonKind {
-    /// A WebAssembly component run in-process (§11.4). Needs `path`.
+    /// A WebAssembly component run in-process (docs/addons.md#wit-package). Needs `path`.
     #[default]
     Wasm,
     /// An external service the traffic is streamed through as
-    /// `message/http` (§11.6). Needs `endpoint`.
+    /// `message/http` (issue #8). Needs `endpoint`.
     Service,
 }
 
-/// Whether an addon's output takes effect (§11.1).
+/// Whether an addon's output takes effect (docs/addons.md#modes).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AddonMode {
@@ -523,7 +523,7 @@ pub enum AddonMode {
     Observe,
 }
 
-/// Which streams a service addon sees (§11.6).
+/// Which streams a service addon sees (issue #8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
@@ -531,7 +531,7 @@ pub enum Direction {
     Response,
 }
 
-/// Per-addon resource limits (§11.1, §11.3). Each defaults to the global
+/// Per-addon resource limits (docs/addons.md#layer-stack, docs/addons.md#host-services). Each defaults to the global
 /// setting when absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -566,12 +566,12 @@ pub struct AddonLimits {
     pub max_instances: Option<u64>,
 }
 
-/// One `addons:` entry (§11.1). There is no hook list: an addon has one
+/// One `addons:` entry (docs/addons.md#layer-stack). There is no hook list: an addon has one
 /// entry point (`handle`) and an optional `tunnel` export discovered at
 /// load time.
 ///
 /// Addons always sit above the built-in rules, in the order listed: the
-/// first addon sees the request first and the response last (§11.1).
+/// first addon sees the request first and the response last (docs/addons.md#layer-stack).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Addon {
@@ -596,7 +596,7 @@ pub struct Addon {
     pub capabilities: Vec<Capability>,
     #[serde(default)]
     pub limits: AddonLimits,
-    /// Named endpoints this addon may call (§11.3).
+    /// Named endpoints this addon may call (docs/addons.md#endpoints).
     #[serde(default)]
     pub endpoints: std::collections::BTreeMap<String, Endpoint>,
     /// The addon's keyed store.
@@ -618,7 +618,7 @@ fn both_directions() -> Vec<Direction> {
 #[serde(deny_unknown_fields, default)]
 pub struct Log {
     pub flow: FlowLog,
-    /// Body capture / traffic tee (§10.2), written under `capture_dir`.
+    /// Body capture / traffic tee (docs/flow-log.md#capture), written under `capture_dir`.
     pub capture: CaptureLog,
     /// Extra header names whose values are never logged, on top of the
     /// built-in list.
@@ -632,7 +632,7 @@ pub struct FlowLog {
     pub path: Option<PathBuf>,
     /// Also log connection-level (`connect`) events.
     pub connection_events: bool,
-    /// Unwritten log bytes at which traffic is held back (§10.1).
+    /// Unwritten log bytes at which traffic is held back (docs/flow-log.md#writing).
     #[serde(deserialize_with = "units::size")]
     pub high_water: ByteSize,
     /// Rotate `path` once it reaches this size; absent = never rotate.
@@ -657,7 +657,7 @@ impl Default for FlowLog {
     }
 }
 
-/// `log.capture`: how captured traffic is written (§10.2). Which exchanges
+/// `log.capture`: how captured traffic is written (docs/flow-log.md#capture). Which exchanges
 /// are captured: those a rule's `capture` action selects, or every
 /// forwarded exchange with `all: true`.
 #[derive(Debug, Clone, Deserialize)]

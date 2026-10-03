@@ -1,5 +1,5 @@
 //! One request/response exchange: request stages → upstream → response
-//! stages → client, plus the WebSocket relay (§8.1).
+//! stages → client, plus the WebSocket relay (docs/websockets.md#relay).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,7 +42,7 @@ pub(crate) struct ClientFraming {
 }
 
 /// Writes `res`. With `close`, the response carries `connection: close`
-/// (§6.1 "a deny closes the connection") and the connection is shut down
+/// (docs/http.md#deny-responses) and the connection is shut down
 /// gracefully afterwards. `extra` are additional raw header lines.
 pub(crate) async fn respond(
     mut conn: ServerConn<ConnIo>,
@@ -207,7 +207,7 @@ pub(crate) async fn process<F: Front>(
     cx: &mut FlowCx,
     req: CanonicalRequest,
 ) -> Outcome {
-    // Audit backpressure (§10.1): an exchange starts only while the flow
+    // Audit backpressure (docs/flow-log.md#writing): an exchange starts only while the flow
     // log keeps up.
     crate::flowlog::sink_ready(&*cx.shared.sink).await;
     if cx.snap.addons.is_empty() {
@@ -325,7 +325,7 @@ enum Upstreamed {
 }
 
 /// The stop of a watching rule, as the outcome of an exchange whose
-/// response has not started (§6.1: answered with an error response).
+/// response has not started (docs/rules.md#evaluation: answered with an error response).
 fn stopped_outcome(watch: &Watch) -> Option<Outcome> {
     watch.stopped().map(|s| Outcome::Refuse(s.refusal))
 }
@@ -369,10 +369,10 @@ async fn response_head<F: Future>(
 #[allow(clippy::too_many_lines)] // one linear flow; splitting it obscures the order
 async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalRequest) -> Outcome {
     // From here on the request is on its way: watching rules re-check the
-    // exchange as values arrive (§6.1).
+    // exchange as values arrive (docs/rules.md#evaluation).
     let watch = Watch::new(cx);
     cx.watch = Some(watch.clone());
-    // Capture (§10.2): what is forwarded from here on is teed to the
+    // Capture (docs/flow-log.md#capture): what is forwarded from here on is teed to the
     // capture log, heads included.
     let (mut up_tap, down_tap) = taps(cx);
     let host = host_text(&req.authority.host);
@@ -387,7 +387,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
     if let Some(u) = &req.meta.upgrade
         && !relay_ws
     {
-        // §8: plain `allow` strips the upgrade (the codec already removed
+        // docs/websockets.md: plain `allow` strips the upgrade (the codec already removed
         // the hop-by-hop headers) and forwards an ordinary request.
         cx.shared.sink.emit(&FlowEvent::UpgradeStripped {
             ts: chrono::Utc::now(),
@@ -581,7 +581,7 @@ async fn send_response(
     cx.record.response_headers_bytes = res.headers.wire_len() as u64;
     let r = conn.respond(res).await;
     // A watching stop mid-body ends the body with an error: the codec stops
-    // before any terminating chunk and the connection is dropped (§6.1).
+    // before any terminating chunk and the connection is dropped (docs/rules.md#evaluation).
     let stopped = cx.watch.as_ref().is_some_and(|w| w.stopped().is_some());
     let failed = r.is_err() && !stopped;
     let next = match r {
@@ -662,7 +662,7 @@ async fn splice_websocket(
     let c2s_extra = leftover.len() as u64;
     if !leftover.is_empty() {
         // Bytes that arrived with the upgrade request: checked before they
-        // are written, like every other relayed chunk (§6.1).
+        // are written, like every other relayed chunk (docs/rules.md#evaluation).
         if watch.on_ws_chunk(Dir::Request, c2s_extra).is_err() {
             cx.record_final_sample(false);
             cx.emit_request_event();
@@ -714,7 +714,7 @@ async fn pump<R, W>(
     let sink = watch.sink();
     let mut completed = false;
     loop {
-        // Audit backpressure (§10.1, §10.2): relay only while the flow log
+        // Audit backpressure (docs/flow-log.md#writing, docs/flow-log.md#capture): relay only while the flow log
         // and the capture log keep up.
         crate::flowlog::sink_ready(&*sink).await;
         if let Some(t) = &relay.tap {
@@ -729,7 +729,7 @@ async fn pump<R, W>(
             Ok(k) => k,
         };
         // Checked before the write: bytes that make a deny match are never
-        // relayed (§6.1).
+        // relayed (docs/rules.md#evaluation).
         if watch.on_ws_chunk(relay.dir, k as u64).is_err() {
             break;
         }

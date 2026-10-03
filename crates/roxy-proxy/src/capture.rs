@@ -1,4 +1,4 @@
-//! Body capture and traffic teeing (`DESIGN.md` §10.2).
+//! Body capture and traffic teeing (docs/flow-log.md#capture).
 //!
 //! Captured traffic is one append-only stream, `<capture_dir>/capture.rxc`,
 //! written through a [`LogWriter`] (one writer thread, batching, rotation,

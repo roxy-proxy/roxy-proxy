@@ -1,4 +1,4 @@
-//! The addon layer stack (DESIGN.md §11.1).
+//! The addon layer stack (docs/addons.md#layer-stack).
 //!
 //! ```text
 //!   front ─▶ addon 0 ─▶ … ─▶ addon n-1 ─▶ core (rules ↓ / ↑, address floor, connector)
@@ -44,7 +44,7 @@ use crate::view::FlowFacts;
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-/// One configured addon, ready to run (§11.2).
+/// One configured addon, ready to run (docs/addons.md#configuration).
 pub struct AddonSpec {
     /// `addons[].name`.
     pub name: String,
@@ -70,7 +70,7 @@ impl std::fmt::Debug for AddonSpec {
     }
 }
 
-/// A named endpoint (§11.3).
+/// A named endpoint (docs/addons.md#endpoints).
 #[derive(Debug, Clone)]
 pub struct EndpointSpec {
     /// Base URL; the request's path and query are appended.
@@ -85,7 +85,7 @@ pub struct EndpointSpec {
     pub private_ok: bool,
 }
 
-/// An addon's keyed store limits (§11.3).
+/// An addon's keyed store limits (docs/addons.md#state).
 #[derive(Debug, Clone)]
 pub struct StateLimits {
     pub max_entries: usize,
@@ -473,7 +473,7 @@ async fn core(
 }
 
 /// A layer's response body to the client, sent only while the flow log
-/// keeps up (§10.1 audit backpressure).
+/// keeps up (audit backpressure, docs/flow-log.md#writing).
 struct Gated {
     inner: Body,
     sink: Arc<dyn FlowSink>,
@@ -506,7 +506,7 @@ fn gated(body: Body, sink: Arc<dyn FlowSink>) -> Body {
 }
 
 /// Inserts the stack's `tunnel` layers (outermost first) between the client
-/// and the WebSocket relay (§11.1): each gets the raw byte streams of the
+/// and the WebSocket relay (docs/addons.md#layer-stack): each gets the raw byte streams of the
 /// upgraded connection. The rules' relay stays the hop next to the
 /// upstream, so byte budgets still see what leaves. `leftover` (bytes that
 /// arrived with the upgrade request) goes through the layers too, and the

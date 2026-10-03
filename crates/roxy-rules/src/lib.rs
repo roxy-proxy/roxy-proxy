@@ -1,4 +1,4 @@
-//! Rule engine for roxy (`DESIGN.md` §6).
+//! Rule engine for roxy (docs/rules.md).
 //!
 //! Responsibilities: the rule-related config types ([`config`]), the
 //! expression DSL (lexer, [`parser`], type-checker, compiler), the one
@@ -50,7 +50,7 @@
 //!
 //! # Semantics
 //!
-//! * **One list, two kinds of rule** (§6.1). Compiling records what each
+//! * **One list, two kinds of rule** (docs/rules.md#evaluation). Compiling records what each
 //!   rule's `when` reads. A rule that reads only *head* values (known when
 //!   the request head arrives) is a **head rule**. A rule that reads a
 //!   *watched* field (`body.bytes`, `response.*`, `ws.*`) is a **watching
@@ -78,7 +78,7 @@
 //!   rule apply once, the first time it matches. Each rule's reads are a
 //!   bit mask, so an event no rule watches costs one `and`, and an
 //!   evaluation in which nothing matches allocates nothing.
-//! * **Legal actions** (§6.3). Head rules may use every action; their
+//! * **Legal actions** (docs/rules.md#actions). Head rules may use every action; their
 //!   `set_header`/`remove_header` change the request. A watching rule
 //!   cannot `allow`, `rewrite_path`, `set_query`, `remove_query`,
 //!   `redirect` or use `${secret:..}` (the request is already on its way):
@@ -121,7 +121,7 @@
 //!   trailing dot. `in` takes a literal list of the left operand's type, or
 //!   CIDRs / IP addresses for ips (IPv4-mapped IPv6 addresses match IPv4
 //!   CIDRs). Ordering operators take ints only.
-//! * **Address lists.** `ip in @name` / `ip not in @name` (§7.1) checks a
+//! * **Address lists.** `ip in @name` / `ip not in @name` (docs/upstream.md#address-lists) checks a
 //!   named list defined under `address_lists:` (see
 //!   [`PolicyInput::address_lists`]). The engine holds only the name and asks
 //!   [`FlowView::in_address_list`]; `None` (list unavailable) fails closed.
@@ -139,7 +139,7 @@
 //!   rules, then [`FlowView::state`]. `metric.<id>` is
 //!   [`FlowView::metric`], which must return `Some(0)` for a series with no
 //!   data yet; `None` means unavailable.
-//! * **Metrics** (§6.4). A metric's `where`, `key` and `unique(..)` may
+//! * **Metrics** (docs/rules.md#metrics). A metric's `where`, `key` and `unique(..)` may
 //!   only read head fields, so whether an exchange counts, and its series,
 //!   are fixed at the head.
 //! * **Secrets.** `${secret:name}` is only allowed in `set_header` values

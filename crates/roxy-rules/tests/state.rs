@@ -1,4 +1,4 @@
-//! `StateStore` behaviour (DESIGN.md §6.4).
+//! `StateStore` behaviour (docs/rules.md#state).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -1,4 +1,4 @@
-//! The WASM layer host for roxy addons (DESIGN.md §11.1–§11.5).
+//! The WASM layer host for roxy addons (docs/addons.md).
 //!
 //! Loads `roxy:addon` components (`wit/addon.wit`), runs them under strict
 //! budgets, and drives one exchange at a time through a layer against a

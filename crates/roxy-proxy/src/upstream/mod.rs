@@ -1,4 +1,4 @@
-//! The upstream connector (`DESIGN.md` §7): resolve → address floor →
+//! The upstream connector (docs/upstream.md): resolve → address floor →
 //! connect → TLS, behind hyper-util's pooled client.
 //!
 //! # Pooling and the address floor
@@ -81,7 +81,7 @@ pub enum ConnectError {
 }
 
 impl ConnectError {
-    /// Stable flow-log reason code (§7).
+    /// Stable flow-log reason code (docs/upstream.md#errors).
     pub fn reason(&self) -> &'static str {
         match self {
             Self::Dns(_) => "dns_failed",
@@ -269,11 +269,11 @@ impl tower_service::Service<Uri> for Connector {
         Poll::Ready(Ok(()))
     }
 
-    // Entry point for every pooled upstream connection. Addon side requests
-    // (`wasi:http/outgoing-handler`, §11.1) must also be dialled through
-    // this connector (or `ConnectorInner::connect`) when they land, so that
-    // `upstream.deny_lists` and the private-range floor apply to them too:
-    // nothing opts out of a deny list.
+    // Entry point for every pooled upstream connection. Anything else that
+    // dials out (addon endpoint calls, docs/addons.md#endpoints) must also
+    // pass the address floor (`Upstream::preflight` or this connector), so
+    // that `upstream.deny_lists` and the private-range floor apply to it
+    // too: nothing opts out of a deny list.
     fn call(&mut self, uri: Uri) -> Self::Future {
         let inner = self.inner.clone();
         Box::pin(async move {

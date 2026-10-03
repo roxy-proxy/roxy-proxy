@@ -98,7 +98,7 @@ logic of a layer can be unit-tested natively.
 
 A layer handles one exchange at a time per instance. roxy runs several
 instances, recycles them, and holds each to CPU, memory and wall-clock
-budgets (DESIGN.md §11.5).
+budgets ([docs/addons.md](https://github.com/roxy-proxy/roxy-proxy/blob/main/docs/addons.md#safety)).
 
 Tunnels (`roxy:addon/tunnel`) are not wrapped yet; use the raw
 [`bindings`] for those.

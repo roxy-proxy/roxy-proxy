@@ -1,4 +1,4 @@
-//! Rule ids, source spans and compile diagnostics (§6.5).
+//! Rule ids, source spans and compile diagnostics (docs/rules.md#reload).
 
 use std::borrow::Borrow;
 use std::fmt;

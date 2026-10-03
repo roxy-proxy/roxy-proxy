@@ -133,7 +133,7 @@ pub(crate) enum Collected {
     Failed(BodyError),
 }
 
-/// Buffers up to `cap` bytes of `body` for inspection (§6.2), replacing
+/// Buffers up to `cap` bytes of `body` for inspection (docs/rules.md#body-access), replacing
 /// `*body` with a stream that yields exactly the same bytes downstream.
 /// Never pre-allocates from a declared length.
 pub(crate) async fn collect_prefix(body: &mut Body, cap: u64) -> Collected {

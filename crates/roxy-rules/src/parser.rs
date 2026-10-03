@@ -1,4 +1,4 @@
-//! Pratt parser for the expression DSL (§6.2).
+//! Pratt parser for the expression DSL (docs/rules.md#expressions).
 //!
 //! ```text
 //! expr        := or

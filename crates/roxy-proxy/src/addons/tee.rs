@@ -1,4 +1,4 @@
-//! Observe mode (§11.1): a layer gets a copy of both streams and can
+//! Observe mode (docs/addons.md#modes): a layer gets a copy of both streams and can
 //! neither change nor delay the real ones.
 //!
 //! The copy is a bounded channel fed as the real body is forwarded. If the

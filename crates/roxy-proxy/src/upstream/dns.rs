@@ -1,4 +1,4 @@
-//! roxy's own name resolution (`DESIGN.md` §7). The agent's DNS is
+//! roxy's own name resolution (docs/upstream.md). The agent's DNS is
 //! irrelevant in proxy mode.
 
 use std::collections::HashMap;

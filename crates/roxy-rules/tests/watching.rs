@@ -1,4 +1,4 @@
-//! Watching evaluation (DESIGN.md §6.1): rules re-checked after forwarding.
+//! Watching evaluation (docs/rules.md#evaluation): rules re-checked after forwarding.
 
 mod common;
 

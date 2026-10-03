@@ -1,4 +1,4 @@
-//! Canonical model ↔ hyper client types (`DESIGN.md` §5.5, §5.6).
+//! Canonical model ↔ hyper client types (docs/http.md#upstream-serialisation, docs/http.md#responses).
 //!
 //! hyper serialises what these functions produce. The guarantees:
 //! - `host` is the first header and equals the canonical authority (default

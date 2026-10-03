@@ -1,4 +1,4 @@
-//! Loading `address_lists:` (`DESIGN.md` §7.1) for `roxy check`, startup,
+//! Loading `address_lists:` (docs/upstream.md#address-lists) for `roxy check`, startup,
 //! every reload and `roxy rule test`.
 //!
 //! Fail closed: any list that cannot be read or parsed is an error for the

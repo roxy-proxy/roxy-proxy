@@ -182,7 +182,7 @@ async fn absolute_form_for_pooled_clients() {
 
 /// Client bytes → `ServerConn` → canonical → hyper → upstream bytes, then the
 /// upstream bytes parsed again yield the same canonical request
-/// (serialise → parse round trip, DESIGN.md §14.3).
+/// (serialise → parse round trip, docs/development.md#testing).
 #[tokio::test]
 async fn end_to_end_reserialisation_round_trip() {
     let role = Role::Tunnel {

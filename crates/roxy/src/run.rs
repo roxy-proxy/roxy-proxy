@@ -67,7 +67,7 @@ pub fn unsupported(config: &Config, caps: Capabilities) -> Vec<String> {
     }
     if config.compile_policy().is_ok_and(|p| p.reads_ws()) {
         out.push(
-            "WebSocket message rules (`ws.*`) are not in this build (DESIGN.md §8.2); byte \
+            "WebSocket message rules (`ws.*`) are not in this build (issue #14); byte \
              budgets on WebSockets work through `request_bytes` / `response_bytes` metrics"
                 .into(),
         );
@@ -177,7 +177,7 @@ pub fn build_sink(config: &Config) -> anyhow::Result<Arc<dyn FlowSink>> {
     })
 }
 
-/// The capture log under `capture_dir`, if set (§10.2).
+/// The capture log under `capture_dir`, if set (docs/flow-log.md#capture).
 pub fn build_capture(config: &Config) -> anyhow::Result<Option<Arc<CaptureLog>>> {
     let Some(dir) = &config.capture_dir else {
         return Ok(None);
@@ -215,7 +215,7 @@ pub struct StartOptions {
     pub watch: bool,
 }
 
-/// Reloads the config from disk into a running server (§6.5).
+/// Reloads the config from disk into a running server (docs/rules.md#reload).
 pub struct Reloader {
     path: PathBuf,
     handle: ServerHandle,
@@ -480,7 +480,7 @@ impl Running {
         }
     }
 
-    /// Graceful shutdown (§12): stop accepting, drain for up to `grace`.
+    /// Graceful shutdown (docs/limits.md): stop accepting, drain for up to `grace`.
     pub async fn shutdown(self, grace: Duration) {
         drop(self.watcher);
         let sink = self.server.handle().sink();

@@ -1,4 +1,4 @@
-/// roxy addon layers (DESIGN.md §11).
+/// roxy addon layers (docs/addons.md).
 ///
 /// A layer is a component that sits in an exchange's layer stack above the
 /// rules. It receives each request through `wasi:http/incoming-handler`,

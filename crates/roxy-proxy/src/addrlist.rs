@@ -1,4 +1,4 @@
-//! Address lists (`DESIGN.md` §7.1): large, named sets of CIDR ranges used
+//! Address lists (docs/upstream.md#address-lists): large, named sets of CIDR ranges used
 //! as an unconditional upstream denylist (`upstream.deny_lists`) and as
 //! `ip in @name` literals in rules.
 //!
@@ -9,7 +9,7 @@
 //! search per address form (at most ~20 probes for a million entries) and
 //! never allocates.
 //!
-//! This is used instead of the binary prefix trie sketched in §7.1 because
+//! This is used instead of a binary prefix trie because
 //! it gives the same guarantees with a fraction of the memory: 8 bytes per
 //! IPv4 block and 32 per IPv6 block in two flat `Vec`s, against tens of bytes
 //! per *node* (and up to 32/128 nodes per entry) for a pointer trie. Building
