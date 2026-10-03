@@ -159,7 +159,7 @@ capture_dir: /var/lib/roxy/capture
 # passes on is still judged by the rules.
 addons:
   - name: redact
-    kind: wasm                   # wasm | service (service: not in this build yet)
+    kind: wasm                   # wasm | service
     # Built from examples/addons/redact (examples/addons/build.sh).
     path: /etc/roxy/addons/redact.wasm
     mode: enforce                # enforce (failures fail closed) | observe (tee, log only)
@@ -179,3 +179,12 @@ addons:
     #     timeout: 2s
     #     retries: 1
     #     private_ok: true
+  # An external service in the network path (docs/addons.md#service-layers): each
+  # exchange streams through it over a WebSocket (roxy.layer.v1).
+  # - name: sentinel
+  #   kind: service
+  #   endpoint: sidecar
+  #   mode: observe
+  #   endpoints:
+  #     sidecar: { url: "http://127.0.0.1:9000/layer", private_ok: true }
+  #   limits: { first_byte_timeout: 2s, max_exchange_time: 120s }

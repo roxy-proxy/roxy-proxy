@@ -7,6 +7,8 @@ and any failure denies the flow.
 | example | kind | what it shows |
 |---|---|---|
 | [`redact`](redact) | wasm (Rust, [`roxy-addon`](../../crates/roxy-addon)) | Rewriting both bodies chunk by chunk as they stream, holding back only the bytes a match could straddle. |
+| [`service`](service) | service (Python) | `roxy_layer.py`, the service side of `roxy.layer.v1`, and a streaming pass-through layer. |
+| [`service/sentinel`](service/sentinel) | service (Python sidecar) | [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) monitors and protocols judging model API traffic at the network boundary. The sidecar implements its `Host` and `Recorder`. |
 
 ## Building
 

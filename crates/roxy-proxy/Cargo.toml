@@ -14,6 +14,7 @@ base64 = "0.23.1"
 bcrypt = "0.19.3"
 bytes = "1.12.1"
 chrono.workspace = true
+futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink"] }
 hickory-resolver = { version = "0.26.3", features = ["tokio", "system-config"] }
 h2 = "0.4.19"
 http = "1.5.0"
@@ -32,6 +33,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt", "macros"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
 tower-service = "0.3.3"
 tracing.workspace = true

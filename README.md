@@ -133,8 +133,8 @@ The full language is in [docs/rules.md](docs/rules.md).
 ## Extending roxy
 
 roxy knows HTTP, not any particular application or API. Logic that needs to
-understand the traffic goes in an **addon**: a WebAssembly component that
-sits above the rules in every exchange and owns both streams. An addon can
+understand the traffic goes in an **addon**: a plugin layer that sits
+above the rules in every exchange and owns both streams. An addon can
 rewrite, withhold or replace bodies chunk by chunk as they stream; deny or
 answer directly; call named endpoints (a classifier, a model, an internal
 API) with credentials roxy attaches and the addon never sees; and keep
@@ -160,11 +160,20 @@ sequenceDiagram
 
 Addons cannot weaken the boundary: whatever an addon sends on is
 re-validated and judged by the rules as if the client had sent it, every
-addon runs sandboxed under CPU, memory and time budgets, and any failure
-denies the flow. Write them in Rust with the
-[`roxy-addon`](crates/roxy-addon) SDK, or in any language that targets the
-WebAssembly component model, against [`wit/addon.wit`](wit/addon.wit). See
-[docs/addons.md](docs/addons.md) and [`examples/addons`](examples/addons).
+addon runs under budgets, and any failure denies the flow.
+
+- **WASM components** run in-process and sandboxed, with no filesystem,
+  sockets or environment. Write them in Rust with the
+  [`roxy-addon`](crates/roxy-addon) SDK, or in any language that targets
+  the WebAssembly component model, against [`wit/addon.wit`](wit/addon.wit).
+- **Service layers** put an external service in the network path: each
+  exchange streams through it over a WebSocket, request and response, and
+  it can change, hold back, answer or refuse either. For logic in any
+  language that is easier to run out of process, such as an
+  [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel)
+  sidecar supervising an AI agent at the boundary.
+
+See [docs/addons.md](docs/addons.md) and [`examples/addons`](examples/addons).
 
 ## Documentation
 

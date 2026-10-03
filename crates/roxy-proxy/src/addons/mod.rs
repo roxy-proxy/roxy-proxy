@@ -14,8 +14,11 @@
 
 mod endpoint;
 mod host;
+pub mod service;
 pub(crate) mod store;
 mod tee;
+
+pub use service::{ServiceError, ServiceSpec};
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -51,14 +54,55 @@ pub struct AddonSpec {
     /// `mode: observe`: gets copies of both streams, cannot change or delay
     /// traffic, failures are logged only.
     pub observe: bool,
-    /// The compiled WASM layer and its instance pool.
-    pub layer: roxy_wasm::Layer,
+    /// What runs the layer.
+    pub kind: AddonImpl,
     /// Named endpoints, by name.
     pub endpoints: HashMap<String, EndpointSpec>,
     /// The addon's keyed store.
     pub state: StateLimits,
     /// Endpoint that also receives `record(.., audit: true)` events.
     pub audit_endpoint: Option<String>,
+}
+
+/// What runs a layer.
+#[derive(Clone)]
+pub enum AddonImpl {
+    /// A compiled WASM component and its instance pool (docs/addons.md#instances).
+    Wasm(roxy_wasm::Layer),
+    /// An external service the exchange streams through (docs/addons.md#service-layers).
+    Service(ServiceSpec),
+}
+
+impl AddonSpec {
+    /// The WASM layer, if this addon is one.
+    pub(crate) fn wasm(&self) -> Option<&roxy_wasm::Layer> {
+        match &self.kind {
+            AddonImpl::Wasm(l) => Some(l),
+            AddonImpl::Service(_) => None,
+        }
+    }
+}
+
+/// Why a layer failed.
+#[derive(Debug, Clone)]
+pub(crate) enum StackError {
+    Layer(LayerError),
+    Service(ServiceError),
+}
+
+impl From<LayerError> for StackError {
+    fn from(e: LayerError) -> Self {
+        StackError::Layer(e)
+    }
+}
+
+impl std::fmt::Display for StackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StackError::Layer(e) => e.fmt(f),
+            StackError::Service(e) => e.fmt(f),
+        }
+    }
 }
 
 impl std::fmt::Debug for AddonSpec {
@@ -119,7 +163,9 @@ pub(crate) struct StackFlow {
     /// The core's flow context, once the last layer called `next`.
     inner: Mutex<Option<FlowCx>>,
     /// The first layer failure (it decides the outcome and attribution).
-    failure: Mutex<Option<(String, LayerError)>>,
+    failure: Mutex<Option<(String, StackError)>>,
+    /// The enforce-mode failure has been logged.
+    reported: AtomicBool,
     /// A layer asked to close the client connection.
     pub(crate) close: AtomicBool,
     /// The upgraded upstream connection, when the core relayed a `101`.
@@ -141,6 +187,7 @@ impl StackFlow {
             tags: Mutex::new(Vec::new()),
             inner: Mutex::new(None),
             failure: Mutex::new(None),
+            reported: AtomicBool::new(false),
             close: AtomicBool::new(false),
             upgrade: Mutex::new(None),
             depth: AtomicUsize::new(0),
@@ -161,14 +208,14 @@ impl StackFlow {
         }
     }
 
-    fn fail(&self, layer: &str, err: LayerError) {
+    fn fail(&self, layer: &str, err: impl Into<StackError>) {
         let mut f = self.failure.lock().unwrap_or_else(PoisonError::into_inner);
         if f.is_none() {
-            *f = Some((layer.to_owned(), err));
+            *f = Some((layer.to_owned(), err.into()));
         }
     }
 
-    fn failure(&self) -> Option<(String, LayerError)> {
+    fn failure(&self) -> Option<(String, StackError)> {
         self.failure
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -246,7 +293,11 @@ impl StackFlow {
 }
 
 /// A stable code for a layer failure, for the flow log.
-fn error_kind(e: &LayerError) -> String {
+fn error_kind(e: &StackError) -> String {
+    let e = match e {
+        StackError::Layer(e) => e,
+        StackError::Service(e) => return e.kind().to_owned(),
+    };
     match e {
         LayerError::Trap(_) => "trap".into(),
         LayerError::BudgetExceeded(b) => format!("budget:{b}"),
@@ -266,8 +317,17 @@ fn error_kind(e: &LayerError) -> String {
 }
 
 pub(crate) fn emit_layer_error(st: &StackFlow, layer: &str, e: &LayerError, observe: bool) {
-    if matches!(e, LayerError::Cancelled) {
+    emit_stack_error(st, layer, &StackError::Layer(e.clone()), observe);
+}
+
+/// Logs a layer failure: once per exchange in enforce mode (the first
+/// failure decides the outcome), every time in observe mode.
+pub(crate) fn emit_stack_error(st: &StackFlow, layer: &str, e: &StackError, observe: bool) {
+    if matches!(e, StackError::Layer(LayerError::Cancelled)) {
         // The client went away; nothing failed.
+        return;
+    }
+    if !observe && st.reported.swap(true, Ordering::Relaxed) {
         return;
     }
     tracing::info!(flow = %st.flow, layer, error = %e, observe, "layer failed");
@@ -308,10 +368,13 @@ pub(crate) async fn run<F: Front>(
     let resp = match driven {
         Err(e) => return Outcome::Close(e),
         Ok(Err(_)) => {
-            let (layer, err) = st
-                .failure()
-                .unwrap_or_else(|| (st.snap.addons[0].name.clone(), LayerError::NoResponse));
-            emit_layer_error(&st, &layer, &err, false);
+            let (layer, err) = st.failure().unwrap_or_else(|| {
+                (
+                    st.snap.addons[0].name.clone(),
+                    LayerError::NoResponse.into(),
+                )
+            });
+            emit_stack_error(&st, &layer, &err, false);
             return Outcome::Refuse(layer_refusal(&layer));
         }
         Ok(Ok(r)) => r,
@@ -324,8 +387,8 @@ pub(crate) async fn run<F: Front>(
             if let Err(e) = outcome.wait().await {
                 let (layer, err) = st2
                     .failure()
-                    .unwrap_or_else(|| (st2.snap.addons[0].name.clone(), e));
-                emit_layer_error(&st2, &layer, &err, false);
+                    .unwrap_or_else(|| (st2.snap.addons[0].name.clone(), e.into()));
+                emit_stack_error(&st2, &layer, &err, false);
             }
         });
     }
@@ -364,12 +427,16 @@ pub(crate) fn enter(
         if addon.observe {
             return tee::observe(st, index, req).await;
         }
+        let layer = match &addon.kind {
+            AddonImpl::Wasm(l) => l,
+            AddonImpl::Service(svc) => return service::handle(st, index, svc, req).await,
+        };
         let h = Arc::new(host::StackHost {
             st: st.clone(),
             index,
             observer: None,
         });
-        match addon.layer.handle(h, req).await {
+        match layer.handle(h, req).await {
             Ok(r) => Ok(r),
             Err(e) => {
                 st.fail(&addon.name, e);
@@ -526,7 +593,7 @@ pub(crate) fn chain_tunnels(
         .addons
         .iter()
         .enumerate()
-        .filter(|(_, a)| !a.observe && a.layer.has_tunnel())
+        .filter(|(_, a)| !a.observe && a.wasm().is_some_and(roxy_wasm::Layer::has_tunnel))
         .map(|(i, _)| i)
         .collect();
     if tunnels.is_empty() {
@@ -539,6 +606,9 @@ pub(crate) fn chain_tunnels(
         let (a, b) = tokio::io::duplex(64 * 1024);
         let (ar, aw) = tokio::io::split(a);
         let addon = st.snap.addons[index].clone();
+        let Some(layer) = addon.wasm().cloned() else {
+            continue;
+        };
         let host = Arc::new(host::StackHost {
             st: st.clone(),
             index,
@@ -548,11 +618,7 @@ pub(crate) fn chain_tunnels(
         let to_client = std::mem::replace(&mut side_w, Box::new(tokio::io::sink()));
         let st2 = st.clone();
         tokio::spawn(async move {
-            if let Err(e) = addon
-                .layer
-                .tunnel(host, from_client, aw, ar, to_client)
-                .await
-            {
+            if let Err(e) = layer.tunnel(host, from_client, aw, ar, to_client).await {
                 emit_layer_error(&st2, &addon.name, &e, false);
             }
         });

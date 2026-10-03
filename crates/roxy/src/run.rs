@@ -58,13 +58,6 @@ pub fn unsupported(config: &Config, caps: Capabilities) -> Vec<String> {
     if !caps.state_store && actions().any(|a| matches!(a, Action::SetState(_))) {
         out.push("`set_state` needs a state store, which is not in this build".into());
     }
-    if config
-        .addons
-        .iter()
-        .any(|a| a.kind == crate::config::AddonKind::Service)
-    {
-        out.push("service addons (`kind: service`) are not in this build yet".into());
-    }
     if config.compile_policy().is_ok_and(|p| p.reads_ws()) {
         out.push(
             "WebSocket message rules (`ws.*`) are not in this build (issue #14); byte \

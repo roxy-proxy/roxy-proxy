@@ -61,7 +61,7 @@ directly.
 | crate | responsibility |
 |---|---|
 | `roxy` | The binary: CLI (`run`, `check`, `ca`, `rule test`, `health`), config loading and validation, secrets, address-list loading, reload, store wiring. |
-| `roxy-proxy` | Listeners, the connection state machine, the exchange core, the addon stack, the watcher, the upstream connector and address floor, the WebSocket relay, flow-log events and capture. |
+| `roxy-proxy` | Listeners, the connection state machine, the exchange core, the addon stack (including service layers), the watcher, the upstream connector and address floor, the WebSocket relay, flow-log events and capture. |
 | `roxy-http` | The canonical request/response model, the strict HTTP/1.1 codec, the h2 ↔ canonical mapping, URL normalisation, body framing with caps, the WebSocket handshake checks. No I/O policy. |
 | `roxy-tls` | CA generation and persistence, leaf minting and cache, rustls configs, ClientHello sniffing. |
 | `roxy-rules` | The expression DSL (lexer, parser, type checker, compiler), policy evaluation, actions, the metric and state stores. |

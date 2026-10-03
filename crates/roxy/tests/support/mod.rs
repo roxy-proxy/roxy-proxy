@@ -103,6 +103,8 @@ pub struct Seen {
     pub headers: Vec<(String, String)>,
     pub version: http::Version,
     pub body_len: u64,
+    /// The body ended cleanly (not cut or failed).
+    pub body_ok: bool,
 }
 
 impl Seen {
@@ -176,6 +178,7 @@ async fn handle(req: Request<Incoming>, st: Arc<UpState>) -> Result<Response<Box
         headers: headers.clone(),
         version: parts.version,
         body_len: n,
+        body_ok,
     });
     if !body_ok {
         return Ok(full(StatusCode::BAD_REQUEST, "body error"));

@@ -505,8 +505,8 @@ pub enum AddonKind {
     /// A WebAssembly component run in-process (docs/addons.md#wit-package). Needs `path`.
     #[default]
     Wasm,
-    /// An external service the traffic is streamed through as
-    /// `message/http` (issue #8). Needs `endpoint`.
+    /// An external service the exchange streams through over a WebSocket
+    /// (docs/addons.md#service-layers). Needs `endpoint`.
     Service,
 }
 
@@ -523,15 +523,7 @@ pub enum AddonMode {
     Observe,
 }
 
-/// Which streams a service addon sees (issue #8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Direction {
-    Request,
-    Response,
-}
-
-/// Per-addon resource limits (docs/addons.md#layer-stack, docs/addons.md#host-services). Each defaults to the global
+/// Per-addon resource limits (docs/addons.md#configuration). Each defaults to the global
 /// setting when absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -581,12 +573,9 @@ pub struct Addon {
     /// The component file (`kind: wasm`).
     #[serde(default)]
     pub path: Option<PathBuf>,
-    /// The named endpoint to stream through (`kind: service`).
+    /// The named endpoint the exchange streams through (`kind: service`).
     #[serde(default)]
     pub endpoint: Option<String>,
-    /// Streams a service addon sees (default both).
-    #[serde(default = "both_directions")]
-    pub directions: Vec<Direction>,
     #[serde(default)]
     pub mode: AddonMode,
     /// Opaque config passed to the addon as JSON.
@@ -606,10 +595,6 @@ pub struct Addon {
     /// true)` events.
     #[serde(default)]
     pub audit_endpoint: Option<String>,
-}
-
-fn both_directions() -> Vec<Direction> {
-    vec![Direction::Request, Direction::Response]
 }
 
 // ----- log ------------------------------------------------------------------

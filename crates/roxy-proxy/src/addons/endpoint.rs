@@ -39,7 +39,10 @@ const DROPPED: &[&str] = &[
 ];
 
 /// `${secret:name}` expanded from the policy snapshot's secrets.
-fn expand(value: &str, secrets: &std::collections::HashMap<String, String>) -> Option<String> {
+pub(super) fn expand(
+    value: &str,
+    secrets: &std::collections::HashMap<String, String>,
+) -> Option<String> {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(i) = rest.find("${secret:") {
@@ -75,7 +78,7 @@ fn target(spec: &EndpointSpec, req: &Uri) -> Result<Uri, String> {
         .map_err(|e| format!("endpoint URL: {e}"))
 }
 
-fn authority_of(uri: &Uri) -> Result<(Scheme, Authority), String> {
+pub(super) fn authority_of(uri: &Uri) -> Result<(Scheme, Authority), String> {
     let scheme = match uri.scheme_str() {
         Some("http") => Scheme::Http,
         _ => Scheme::Https,
