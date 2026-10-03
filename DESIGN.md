@@ -1622,13 +1622,16 @@ be built on roxy without roxy knowing anything about model APIs.
 ### 11.8 Authoring
 
 Rust is first class: small components, fast instantiation, real streaming.
-`roxy-addon` wraps the bindings in a middleware trait:
+`roxy-addon` (`crates/roxy-addon`) wraps the bindings in a middleware trait:
 
 ```rust
 use roxy_addon::prelude::*;
 
 struct RedactTokens;
 impl Layer for RedactTokens {
+    fn init(_config: &str) -> Result<Self, String> {   // `config:` as JSON
+        Ok(RedactTokens)
+    }
     fn handle(&mut self, req: Request, next: Next) -> Response {
         let req = req.map_body(|body| body.transform(redact_chunk));
         next.run(req)
@@ -1636,6 +1639,21 @@ impl Layer for RedactTokens {
 }
 roxy_addon::export!(RedactTokens);
 ```
+
+`Body` is a pull-based sequence of chunks, read from the host only as the
+layer consumes it. Its methods are `transform` (per chunk), `pipe` (a
+stateful `ChunkTransform` that may hold bytes back and flush them at the
+end, which is how a layer withholds part of a stream) and
+`read_to_end(cap)`.
+
+`Next` is consumed by `run`, so the type system enforces "one `next` per
+exchange" as well as the host. `next.run` writes the request body before
+reading the response, chunk by chunk.
+
+`flow::*` and `call_endpoint` wrap the host services. A panic traps, and the
+host fails the exchange closed, which is how a layer gives up. The crate
+carries a copy of `wit/` so it can be published; a test keeps the copy in
+sync. Tunnels are not wrapped yet.
 
 Other languages:
 
@@ -1649,9 +1667,13 @@ Other languages:
 - **Python with native dependencies**, or anything else out of process,
   runs as a service layer (§11.6).
 
-`examples/addons/` ships a Rust pass-through, a Rust streaming redactor, a
-Rust layer that withholds `tool_use` blocks in a streamed response until a
-named endpoint clears them, and a minimal Python service layer.
+`examples/addons/sentinel` is a Rust inspect-sentinel. It strips denied
+tools from requests, rewrites denied tool calls in responses into
+refusals, withholds `tool_use` blocks in streamed Anthropic responses until
+they are judged, records every decision, and quarantines repeat offenders.
+Its decision is one function (`judge`), with the switch to a monitor model
+through a named endpoint shown next to it. A minimal service layer follows
+with §11.6.
 
 ## 12. Resource limits and self-protection
 

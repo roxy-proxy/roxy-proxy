@@ -99,7 +99,10 @@ impl Sentinel {
             .get_str("content-encoding")
             .is_some_and(|e| !e.eq_ignore_ascii_case("identity"))
         {
-            return Err(refuse(415, "sentinel: compressed request bodies cannot be inspected"));
+            return Err(refuse(
+                415,
+                "sentinel: compressed request bodies cannot be inspected",
+            ));
         }
         // Ask for an uncompressed response, so it can be inspected.
         req.headers.set("accept-encoding", "identity");
@@ -219,7 +222,8 @@ impl Sentinel {
         let Ok(mut json) = serde_json::from_slice::<Value>(&raw) else {
             return unchanged(raw);
         };
-        let denied = tools::rewrite_response(api, &mut json, |call| self.deny(api, "response", call));
+        let denied =
+            tools::rewrite_response(api, &mut json, |call| self.deny(api, "response", call));
         if denied.is_empty() {
             unchanged(raw)
         } else {
@@ -253,7 +257,8 @@ fn count_violation(limit: u64, ttl: Duration) {
     if count >= limit {
         let reason = format!("{count} blocked tool calls");
         let took = flow::terminate(Scope::Principal, &reason, Some(ttl));
-        let event = json!({"principal": flow::principal_key(), "violations": count, "quarantined": took});
+        let event =
+            json!({"principal": flow::principal_key(), "violations": count, "quarantined": took});
         flow::record("sentinel_terminate", &event.to_string(), true);
     }
 }

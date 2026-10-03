@@ -177,7 +177,10 @@ mod tests {
     #[test]
     fn denies_by_name_and_arguments() {
         let p = policy();
-        assert!(matches!(judge(&p, &call("bash", "{}")), Verdict::Deny { .. }));
+        assert!(matches!(
+            judge(&p, &call("bash", "{}")),
+            Verdict::Deny { .. }
+        ));
         assert!(matches!(
             judge(&p, &call("run", r#"{"cmd":"rm -rf /"}"#)),
             Verdict::Deny { .. }
@@ -187,7 +190,10 @@ mod tests {
             Verdict::Deny { .. }
         ));
         assert_eq!(judge(&p, &call("bash_history", "{}")), Verdict::Allow);
-        assert_eq!(judge(&p, &call("get_weather", r#"{"city":"Paris"}"#)), Verdict::Allow);
+        assert_eq!(
+            judge(&p, &call("get_weather", r#"{"city":"Paris"}"#)),
+            Verdict::Allow
+        );
     }
 
     #[test]

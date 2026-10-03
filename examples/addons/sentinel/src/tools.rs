@@ -203,7 +203,8 @@ pub fn rewrite_response(
                     };
                     match deny(&call) {
                         Some(reason) => {
-                            *block = json!({"type": "text", "text": refusal_text(&call.name, &reason)});
+                            *block =
+                                json!({"type": "text", "text": refusal_text(&call.name, &reason)});
                             denied.push(Denied { call, reason });
                         }
                         None => remaining += 1,
@@ -305,9 +306,18 @@ mod tests {
 
     #[test]
     fn detects_apis() {
-        assert_eq!(Api::detect("POST", "/v1/messages"), Some(Api::AnthropicMessages));
-        assert_eq!(Api::detect("POST", "/openai/v1/chat/completions"), Some(Api::OpenAiChat));
-        assert_eq!(Api::detect("POST", "/v1/responses"), Some(Api::OpenAiResponses));
+        assert_eq!(
+            Api::detect("POST", "/v1/messages"),
+            Some(Api::AnthropicMessages)
+        );
+        assert_eq!(
+            Api::detect("POST", "/openai/v1/chat/completions"),
+            Some(Api::OpenAiChat)
+        );
+        assert_eq!(
+            Api::detect("POST", "/v1/responses"),
+            Some(Api::OpenAiResponses)
+        );
         assert_eq!(Api::detect("GET", "/v1/messages"), None);
         assert_eq!(Api::detect("POST", "/v1/models"), None);
     }
@@ -323,16 +333,25 @@ mod tests {
         ]});
         assert_eq!(
             history_calls(Api::AnthropicMessages, &anthropic),
-            vec![ToolCall { name: "bash".into(), arguments: r#"{"cmd":"ls"}"#.into() }]
+            vec![ToolCall {
+                name: "bash".into(),
+                arguments: r#"{"cmd":"ls"}"#.into()
+            }]
         );
         let chat = json!({"messages": [{"role": "assistant", "tool_calls": [
             {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}},
         ]}]});
-        assert_eq!(history_calls(Api::OpenAiChat, &chat)[0].arguments, r#"{"cmd":"ls"}"#);
+        assert_eq!(
+            history_calls(Api::OpenAiChat, &chat)[0].arguments,
+            r#"{"cmd":"ls"}"#
+        );
         let responses = json!({"input": [
             {"type": "function_call", "name": "bash", "arguments": "{}", "call_id": "c"},
         ]});
-        assert_eq!(history_calls(Api::OpenAiResponses, &responses)[0].name, "bash");
+        assert_eq!(
+            history_calls(Api::OpenAiResponses, &responses)[0].name,
+            "bash"
+        );
     }
 
     #[test]
@@ -362,7 +381,12 @@ mod tests {
         let denied = rewrite_response(Api::AnthropicMessages, &mut body, deny_bash);
         assert_eq!(denied.len(), 1);
         assert_eq!(body["content"][1]["type"], "text");
-        assert!(body["content"][1]["text"].as_str().unwrap().contains("blocked"));
+        assert!(
+            body["content"][1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("blocked")
+        );
         assert_eq!(body["stop_reason"], "end_turn");
     }
 
@@ -374,16 +398,27 @@ mod tests {
             ]},
             "finish_reason": "tool_calls",
         }]});
-        assert_eq!(rewrite_response(Api::OpenAiChat, &mut chat, deny_bash).len(), 1);
+        assert_eq!(
+            rewrite_response(Api::OpenAiChat, &mut chat, deny_bash).len(),
+            1
+        );
         let choice = &chat["choices"][0];
         assert!(choice["message"].get("tool_calls").is_none());
-        assert!(choice["message"]["content"].as_str().unwrap().contains("bash"));
+        assert!(
+            choice["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("bash")
+        );
         assert_eq!(choice["finish_reason"], "stop");
 
         let mut resp = json!({"output": [
             {"type": "function_call", "name": "bash", "arguments": "{}", "call_id": "c"},
         ]});
-        assert_eq!(rewrite_response(Api::OpenAiResponses, &mut resp, deny_bash).len(), 1);
+        assert_eq!(
+            rewrite_response(Api::OpenAiResponses, &mut resp, deny_bash).len(),
+            1
+        );
         assert_eq!(resp["output"][0]["type"], "message");
     }
 

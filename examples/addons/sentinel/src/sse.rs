@@ -213,21 +213,48 @@ mod tests {
 
     fn stream(tool: &str, args: &str) -> String {
         [
-            ev("message_start", &json!({"type": "message_start", "message": {"id": "m"}})),
-            ev("content_block_start", &json!({"type": "content_block_start", "index": 0,
-                "content_block": {"type": "text", "text": ""}})),
-            ev("content_block_delta", &json!({"type": "content_block_delta", "index": 0,
-                "delta": {"type": "text_delta", "text": "Running it."}})),
-            ev("content_block_stop", &json!({"type": "content_block_stop", "index": 0})),
-            ev("content_block_start", &json!({"type": "content_block_start", "index": 1,
-                "content_block": {"type": "tool_use", "id": "t1", "name": tool, "input": {}}})),
-            ev("content_block_delta", &json!({"type": "content_block_delta", "index": 1,
-                "delta": {"type": "input_json_delta", "partial_json": &args[..args.len() / 2]}})),
-            ev("content_block_delta", &json!({"type": "content_block_delta", "index": 1,
-                "delta": {"type": "input_json_delta", "partial_json": &args[args.len() / 2..]}})),
-            ev("content_block_stop", &json!({"type": "content_block_stop", "index": 1})),
-            ev("message_delta", &json!({"type": "message_delta",
-                "delta": {"stop_reason": "tool_use"}})),
+            ev(
+                "message_start",
+                &json!({"type": "message_start", "message": {"id": "m"}}),
+            ),
+            ev(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}}),
+            ),
+            ev(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "Running it."}}),
+            ),
+            ev(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 0}),
+            ),
+            ev(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "tool_use", "id": "t1", "name": tool, "input": {}}}),
+            ),
+            ev(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": &args[..args.len() / 2]}}),
+            ),
+            ev(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": &args[args.len() / 2..]}}),
+            ),
+            ev(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 1}),
+            ),
+            ev(
+                "message_delta",
+                &json!({"type": "message_delta",
+                "delta": {"stop_reason": "tool_use"}}),
+            ),
             ev("message_stop", &json!({"type": "message_stop"})),
         ]
         .concat()
@@ -270,14 +297,19 @@ mod tests {
         assert!(out.contains("Running it."));
         assert_eq!(
             seen.borrow().as_slice(),
-            &[ToolCall { name: "bash".into(), arguments: r#"{"cmd":"rm -rf /"}"#.into() }]
+            &[ToolCall {
+                name: "bash".into(),
+                arguments: r#"{"cmd":"rm -rf /"}"#.into()
+            }]
         );
     }
 
     #[test]
     fn unfinished_tool_use_is_dropped() {
         let input = stream("bash", "{}");
-        let cut = input.find("content_block_stop\ndata: {\"index\":1").unwrap_or(input.len() - 60);
+        let cut = input
+            .find("content_block_stop\ndata: {\"index\":1")
+            .unwrap_or(input.len() - 60);
         let out = run(&input[..cut], 5, Box::new(|_| None));
         assert!(!out.contains("tool_use"), "{out}");
     }
