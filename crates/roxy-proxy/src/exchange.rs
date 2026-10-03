@@ -204,11 +204,19 @@ pub(crate) enum Outcome {
 pub(crate) async fn process<F: Front>(
     front: &mut F,
     cx: &mut FlowCx,
-    req: CanonicalRequest,
+    mut req: CanonicalRequest,
 ) -> Outcome {
     // Audit backpressure (docs/flow-log.md#writing): an exchange starts only while the flow
     // log keeps up.
     crate::flowlog::sink_ready(&*cx.shared.sink).await;
+    if cx.snap.flags.strip_accept_encoding {
+        // Before the layers and the rules, so all of them, and the flow
+        // log, see the request as it will leave (docs/http.md#content-codings).
+        req.headers.remove("accept-encoding");
+        if let Some(f) = cx.facts.request.as_mut() {
+            f.headers.remove("accept-encoding");
+        }
+    }
     if cx.snap.addons.is_empty() {
         core(front, cx, req).await
     } else {

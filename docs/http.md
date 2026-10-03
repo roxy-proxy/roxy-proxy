@@ -242,6 +242,11 @@ received.
   not memory. The decoded size counts against the same cap as the body as
   sent.
 
+`http.strip_accept_encoding` (default false) removes `accept-encoding` from
+every request as roxy reads it, so origins answer uncompressed. The addons,
+the rules and the flow log all see the request without it. This trades
+bandwidth from the origin for no decoding at all.
+
 ## Deny responses
 
 When roxy denies a request it answers itself:

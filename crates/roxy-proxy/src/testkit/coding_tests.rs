@@ -175,3 +175,45 @@ async fn identity_and_no_coding_read_as_before() {
     let a = post(&mut c, "/x", &[], b"the SECRET".to_vec()).await;
     assert_eq!(a.status, 403, "{a:?}");
 }
+
+#[tokio::test]
+async fn strip_accept_encoding_removes_it_before_the_rules() {
+    const RULES: &str = r#"
+- id: wants-compression
+  when: header["accept-encoding"] != null
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+    let strip = Kit::builder()
+        .rules(RULES)
+        .flags(|f| f.strip_accept_encoding = true)
+        .start()
+        .await;
+    for h2 in [false, true] {
+        let mut c = if h2 {
+            strip.tunnel("up.test", true).await
+        } else {
+            strip.h1().await
+        };
+        let a = post(&mut c, "/x", &[("accept-encoding", "gzip, br")], Vec::new()).await;
+        assert_eq!(a.status, 200, "h2 {h2}: {a:?}");
+    }
+    let seen = strip.upstream.wait_seen(2).await;
+    assert!(
+        seen.iter()
+            .all(|s| !s.headers.contains_key("accept-encoding"))
+    );
+
+    // Off by default.
+    let keep = Kit::builder().rules(RULES).start().await;
+    let a = post(
+        &mut keep.h1().await,
+        "/x",
+        &[("accept-encoding", "gzip")],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(a.status, 403, "{a:?}");
+}

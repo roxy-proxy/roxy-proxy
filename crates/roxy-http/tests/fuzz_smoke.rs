@@ -109,6 +109,7 @@ proptest! {
             allow_obs_text: cfg & 8 != 0,
             allow_body_on_get: cfg & 16 != 0,
             allow_plain_in_connect: false,
+            strip_accept_encoding: false,
         };
         let limits = Limits { max_header_bytes: 512, max_url_bytes: 128, max_headers: 8, ..Limits::default() };
         let role = if cfg & 32 != 0 {

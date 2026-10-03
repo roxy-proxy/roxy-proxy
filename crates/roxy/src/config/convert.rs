@@ -42,6 +42,7 @@ impl From<&Config> for HttpFlags {
             allow_obs_text: h.allow_obs_text,
             allow_body_on_get: h.allow_body_on_get,
             allow_plain_in_connect: h.allow_plain_in_connect,
+            strip_accept_encoding: h.strip_accept_encoding,
         }
     }
 }

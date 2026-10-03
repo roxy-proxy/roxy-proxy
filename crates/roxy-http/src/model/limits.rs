@@ -75,4 +75,7 @@ pub struct HttpFlags {
     /// Accept plaintext HTTP inside a CONNECT tunnel (used by the proxy's
     /// tunnel classifier, not by this crate).
     pub allow_plain_in_connect: bool,
+    /// Remove `accept-encoding` from requests, so origins answer
+    /// uncompressed (used by the proxy, not by this crate).
+    pub strip_accept_encoding: bool,
 }
