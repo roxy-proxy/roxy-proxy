@@ -461,6 +461,34 @@ fn rule_test_shows_address_policy_hits_for_ip_literals() {
     assert!(!text(&out.stdout).contains("address:"));
 }
 
+#[test]
+fn rule_test_checks_a_websocket_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("roxy.yaml");
+    std::fs::write(
+        &cfg,
+        "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:0 }]\nrules:\n  \
+         - { id: ws, when: 'host == \"ws.test\"', then: { allow: { upgrade: websocket } } }\n  \
+         - { id: no-binary, when: 'ws.direction == \"s2c\" and ws.opcode == 2', then: deny }\n",
+    )
+    .unwrap();
+    let cfg = cfg.to_str().unwrap();
+    let rt = |extra: &[&str]| {
+        let mut args = vec!["rule", "test", "--config", cfg];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["GET", "https://ws.test/"]);
+        roxy(&args)
+    };
+    let out = rt(&["--ws-text", "hi", "--ws-direction", "s2c"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let out = rt(&["--ws-size", "10", "--ws-direction", "s2c"]);
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("rule:     no-binary"));
+    let out = rt(&["--ws-opcode", "3"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).contains("--ws-opcode 3"));
+}
+
 // ----- health -----------------------------------------------------------------
 
 /// A one-shot HTTP server answering `response`; yields the request it read.
