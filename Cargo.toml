@@ -8,6 +8,7 @@ members = [
     "crates/roxy-rules",
     "crates/roxy-tls",
     "crates/roxy-wasm",
+    "crates/roxy-addon",
 ]
 
 [workspace.package]

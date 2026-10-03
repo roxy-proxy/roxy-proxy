@@ -1,0 +1,74 @@
+//! The current flow and roxy's host services (DESIGN.md §11.3).
+//!
+//! Each function names the capability it needs. Calling one the layer was
+//! not granted in roxy's config traps, failing the exchange closed.
+
+use std::time::Duration;
+
+use crate::bindings::roxy::addon::flow as raw;
+
+pub use raw::{FlowInfo, LogLevel, Principal, Scope};
+
+fn ttl_ms(ttl: Option<Duration>) -> Option<u64> {
+    ttl.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// The current flow: ids, the principal roxy established, and tags.
+pub fn current() -> FlowInfo {
+    raw::current()
+}
+
+/// A stable key for per-principal state: the authenticated user if there
+/// is one, else the client IP.
+pub fn principal_key() -> String {
+    let p = current().principal;
+    match p.client_user {
+        Some(u) => format!("user:{u}"),
+        None => format!("ip:{}", p.client_ip),
+    }
+}
+
+/// Adds a tag to the flow's log record.
+pub fn add_tag(tag: &str) {
+    raw::add_tag(tag);
+}
+
+/// The layer's `config:` value as a JSON document (`"null"` when unset).
+pub fn config() -> String {
+    raw::config()
+}
+
+/// Writes to roxy's operational log (capability `log`).
+pub fn log(level: LogLevel, msg: &str) {
+    raw::log(level, msg);
+}
+
+/// Writes a structured event to the flow log (capability `record`). `json`
+/// must be a JSON value. `audit` also sends it to the audit endpoint. Waits
+/// if the log is behind; records are never dropped.
+pub fn record(kind: &str, json: &str, audit: bool) {
+    raw::record(kind, json, audit);
+}
+
+/// Closes the connection or quarantines the principal (capability
+/// `terminate`). Returns whether it took effect.
+pub fn terminate(scope: Scope, reason: &str, ttl: Option<Duration>) -> bool {
+    raw::terminate(scope, reason, ttl_ms(ttl))
+}
+
+/// Reads a JSON value from the layer's keyed store (capability `state`).
+/// `None` means no history: treat it as a fresh start.
+pub fn state_get(key: &str) -> Option<String> {
+    raw::state_get(key)
+}
+
+/// Writes a JSON value to the layer's keyed store (capability `state`).
+/// Fails when the store is full or the value too large; nothing is evicted.
+pub fn state_put(key: &str, json: &str, ttl: Option<Duration>) -> Result<(), String> {
+    raw::state_put(key, json, ttl_ms(ttl))
+}
+
+/// Reads a metric (capability `metrics`) by id and key-field values.
+pub fn metric_get(id: &str, key: &[String]) -> Option<i64> {
+    raw::metric_get(id, key)
+}

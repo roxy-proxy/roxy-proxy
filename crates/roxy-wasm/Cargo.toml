@@ -30,6 +30,7 @@ wasmtime-wasi = { version = "49.0.2", default-features = false, features = ["p2"
 wasmtime-wasi-http = { version = "49.0.2", default-features = false, features = ["p2"] }
 
 [dev-dependencies]
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-util"] }
 
 # The workspace lints, except that `unsafe_code` is `deny` rather than
