@@ -402,31 +402,91 @@ impl TryFrom<RawAddressList> for AddressList {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AddonHook {
-    Request,
-    Response,
-    Ws,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum Capability {
     State,
     Log,
     Secrets,
 }
 
+/// Where an addon runs (§11.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddonStage {
+    /// Sees every canonical request, before the rules.
+    #[default]
+    BeforeRules,
+    /// Invoked only by a rule's `call: <addon>`.
+    InChain,
+    /// Sees only requests the rules allowed.
+    AfterRules,
+}
+
+/// Per-addon resource limits (§11.1, §11.3). Each defaults to the global
+/// setting when absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AddonLimits {
+    /// Linear memory cap per instance (default 64 MiB).
+    #[serde(deserialize_with = "units::opt_size")]
+    pub max_memory: Option<ByteSize>,
+    /// Most body bytes the addon may hold (default
+    /// `limits.max_inspect_body_bytes`).
+    #[serde(deserialize_with = "units::opt_size")]
+    pub max_buffered_body_bytes: Option<ByteSize>,
+    /// CPU time between host calls (default 50 ms).
+    #[serde(with = "humantime_serde")]
+    pub step_cpu: Option<Duration>,
+    /// Fuel per I/O step (default 100 000 000).
+    #[serde(deserialize_with = "units::opt_count")]
+    pub fuel_per_step: Option<u64>,
+}
+
+/// What a failing addon (trap, timeout, cap exceeded, invalid mutation)
+/// does to its flow. There is deliberately no `pass` (§11.1): an attacker
+/// must not be able to switch inspection off by making the addon fail.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub enum OnError {
+    /// Deny the flow (`addon_error`).
+    #[default]
+    Deny,
+    /// Close the connection.
+    Close,
+}
+
+impl TryFrom<String> for OnError {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, String> {
+        match s.as_str() {
+            "deny" => Ok(Self::Deny),
+            "close" => Ok(Self::Close),
+            other => Err(format!(
+                "unknown on_error {other:?}: expected `deny` or `close` (there is deliberately \
+                 no `pass`: a failing addon always fails its flow closed)"
+            )),
+        }
+    }
+}
+
+/// One `addons:` entry (§11.1). There is no hook list: an addon has one
+/// entry point (`handle`) and an optional `tunnel` export discovered at
+/// load time.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Addon {
     pub name: String,
     pub path: PathBuf,
-    pub hooks: Vec<AddonHook>,
+    #[serde(default)]
+    pub stage: AddonStage,
     /// Opaque config passed to the addon as JSON.
     #[serde(default)]
     pub config: serde_yaml_ng::Value,
     #[serde(default)]
     pub capabilities: Vec<Capability>,
+    #[serde(default)]
+    pub limits: AddonLimits,
+    #[serde(default)]
+    pub on_error: OnError,
 }
 
 // ----- log ------------------------------------------------------------------

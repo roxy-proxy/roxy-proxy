@@ -118,6 +118,12 @@ rules:
 addons:
   - name: pii-scan
     path: /etc/roxy/addons/pii_scan.wasm
-    hooks: [request, response]
+    stage: before_rules          # before_rules | in_chain | after_rules
     config: { threshold: 0.8 }
     capabilities: [state, log]
+    limits:                      # each optional; defaults to the global setting
+      max_memory: 64mb
+      max_buffered_body_bytes: 1mb
+      step_cpu: 50ms
+      fuel_per_step: 100_000_000
+    on_error: deny               # deny (default) | close. There is no "pass".

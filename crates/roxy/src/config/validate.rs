@@ -189,12 +189,6 @@ impl Config {
                     ),
                 ));
             }
-            if a.hooks.is_empty() {
-                d.push(Diagnostic::new(
-                    format!("{path}.hooks"),
-                    "at least one hook is required",
-                ));
-            }
         }
     }
 
