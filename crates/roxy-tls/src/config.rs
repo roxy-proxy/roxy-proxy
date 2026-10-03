@@ -1,0 +1,439 @@
+//! rustls configurations for both sides of the proxy (ring provider only).
+//!
+//! # Per-connection SNI default
+//!
+//! rustls hands a `ResolvesServerCert` only the `ClientHello`, so a shared
+//! config cannot know the CONNECT host when the client omits SNI. Rather than
+//! smuggling a hint through a shared `Mutex`, [`server_config_for`] builds a
+//! tiny per-connection `ServerConfig`: a handful of `Arc` clones and one small
+//! allocation (no crypto, no key parsing; the provider and the leaf cache are
+//! shared), with session storage and tickets disabled so nothing heavyweight is
+//! allocated per connection. Resumption is therefore off, which is the right
+//! trade-off for an inspecting proxy whose clients are short-lived agents.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+
+use rustls::crypto::CryptoProvider;
+use rustls::server::{ClientHello, NoServerSessionStorage, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
+use rustls::{ClientConfig, RootCertStore, ServerConfig, SupportedProtocolVersion};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, ServerName};
+
+use crate::leaf::{LeafError, LeafMinter, parse_host};
+
+/// Errors building TLS configurations.
+#[derive(Debug, thiserror::Error)]
+pub enum TlsError {
+    /// Could not read a root certificate file.
+    #[error("{}: {source}", path.display())]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// A root certificate file is malformed.
+    #[error("invalid PEM in {}: {reason}", path.display())]
+    InvalidPem { path: PathBuf, reason: String },
+    /// A root certificate file contains no certificates.
+    #[error("no certificates found in {}", .0.display())]
+    NoCertificates(PathBuf),
+    /// A certificate in a root file was rejected as a trust anchor.
+    #[error("unusable root certificate in {}: {reason}", path.display())]
+    InvalidRoot { path: PathBuf, reason: String },
+    /// Not a usable host name or IP address.
+    #[error("invalid host name: {0}")]
+    InvalidName(#[from] LeafError),
+    /// rustls rejected the configuration.
+    #[error("rustls: {0}")]
+    Rustls(#[from] rustls::Error),
+}
+
+/// Minimum TLS version for upstream connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MinTlsVersion {
+    /// Allow TLS 1.2 and 1.3 (default).
+    #[default]
+    Tls12,
+    /// Allow TLS 1.3 only.
+    Tls13,
+}
+
+impl MinTlsVersion {
+    fn versions(self) -> &'static [&'static SupportedProtocolVersion] {
+        match self {
+            Self::Tls12 => rustls::ALL_VERSIONS,
+            Self::Tls13 => TLS13_ONLY,
+        }
+    }
+}
+
+/// Options for the upstream (roxy to origin) TLS client.
+///
+/// Verification is always strict; there is deliberately no insecure mode.
+#[derive(Debug, Clone, Default)]
+pub struct UpstreamTlsOptions {
+    /// PEM files with additional trusted roots (on top of `webpki-roots`).
+    pub extra_roots_pem: Vec<PathBuf>,
+    /// Minimum protocol version.
+    pub min_version: MinTlsVersion,
+}
+
+static TLS13_ONLY: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
+
+fn provider() -> Arc<CryptoProvider> {
+    static PROVIDER: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
+    Arc::clone(PROVIDER.get_or_init(|| Arc::new(rustls::crypto::ring::default_provider())))
+}
+
+/// Install the ring provider as the process-wide default. Idempotent; safe to
+/// call from many threads and when another default is already installed.
+pub fn install_crypto_provider() {
+    if CryptoProvider::get_default().is_none() {
+        // Losing a race to another installer is fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
+/// Parse a host (DNS name, IPv4, or IPv6 with or without brackets) into a
+/// canonical [`ServerName`]. Rejects wildcards, trailing dots, names over 253
+/// bytes and anything that is not a valid DNS name.
+pub fn server_name_for_host(host: &str) -> Result<ServerName<'static>, TlsError> {
+    Ok(parse_host(host)?)
+}
+
+#[derive(Debug)]
+struct Resolver {
+    minter: Arc<LeafMinter>,
+    default_name: ServerName<'static>,
+}
+
+impl ResolvesServerCert for Resolver {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let name = match hello.server_name() {
+            // An SNI that is present but invalid fails the handshake rather
+            // than silently falling back.
+            Some(sni) => parse_host(sni).ok()?,
+            None => self.default_name.clone(),
+        };
+        self.minter.certified_key(&name).ok()
+    }
+}
+
+/// Build the client-facing config for one accepted connection.
+///
+/// The certificate is chosen by SNI, or `default_name` (normally the CONNECT
+/// host) when the client sends no SNI. ALPN is `h2, http/1.1` if `enable_h2`
+/// else `http/1.1`; TLS 1.2 and 1.3; no client authentication.
+///
+/// Cheap enough to call per connection (see the module docs). Minting on a
+/// cache miss happens inside the handshake; warm the cache first with
+/// `LeafMinter::certified_key` on the blocking pool for the default name.
+pub fn server_config_for(
+    minter: Arc<LeafMinter>,
+    default_name: ServerName<'static>,
+    enable_h2: bool,
+) -> Arc<ServerConfig> {
+    let resolver = Arc::new(Resolver {
+        minter,
+        default_name,
+    });
+    let mut cfg = ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(rustls::ALL_VERSIONS)
+        .expect("ring provider supports TLS 1.2 and 1.3")
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    cfg.alpn_protocols = if enable_h2 {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        vec![b"http/1.1".to_vec()]
+    };
+    cfg.session_storage = Arc::new(NoServerSessionStorage {});
+    cfg.send_tls13_tickets = 0;
+    Arc::new(cfg)
+}
+
+/// Build the upstream TLS client config: `webpki-roots` plus `extra_roots_pem`,
+/// strict verification, SNI on, ALPN `h2, http/1.1`.
+pub fn client_config(opts: &UpstreamTlsOptions) -> Result<Arc<ClientConfig>, TlsError> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for path in &opts.extra_roots_pem {
+        add_pem_roots(&mut roots, path)?;
+    }
+    let mut cfg = ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(opts.min_version.versions())?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    cfg.enable_sni = true;
+    Ok(Arc::new(cfg))
+}
+
+fn add_pem_roots(roots: &mut RootCertStore, path: &Path) -> Result<(), TlsError> {
+    let pem = std::fs::read(path).map_err(|source| TlsError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut n = 0usize;
+    for cert in CertificateDer::pem_slice_iter(&pem) {
+        let cert = cert.map_err(|e| TlsError::InvalidPem {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+        roots.add(cert).map_err(|e| TlsError::InvalidRoot {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+        n += 1;
+    }
+    if n == 0 {
+        return Err(TlsError::NoCertificates(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ca::Ca;
+    use rustls::{ClientConnection, ServerConnection};
+
+    fn minter() -> (Arc<Ca>, Arc<LeafMinter>) {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Arc::new(Ca::generate(dir.path()).unwrap());
+        let m = Arc::new(LeafMinter::new(Arc::clone(&ca), 16).unwrap());
+        (ca, m)
+    }
+
+    fn write_ca(ca: &Ca) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ca.pem");
+        std::fs::write(&p, ca.cert_pem()).unwrap();
+        (dir, p)
+    }
+
+    /// Client trusting only the roxy CA (no webpki bundle).
+    fn ca_only_client(ca: &Ca, sni: bool, min: MinTlsVersion) -> Arc<ClientConfig> {
+        let (_dir, path) = write_ca(ca);
+        let mut roots = RootCertStore::empty();
+        add_pem_roots(&mut roots, &path).unwrap();
+        let mut cfg = ClientConfig::builder_with_provider(provider())
+            .with_protocol_versions(min.versions())
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        cfg.enable_sni = sni;
+        Arc::new(cfg)
+    }
+
+    fn pump(
+        from: &mut dyn FnMut(&mut Vec<u8>),
+        to: &mut dyn FnMut(&[u8]) -> Result<(), rustls::Error>,
+    ) -> Result<bool, rustls::Error> {
+        let mut buf = Vec::new();
+        from(&mut buf);
+        if buf.is_empty() {
+            return Ok(false);
+        }
+        to(&buf)?;
+        Ok(true)
+    }
+
+    /// Drive an in-memory handshake to completion.
+    fn handshake(
+        client: &mut ClientConnection,
+        server: &mut ServerConnection,
+    ) -> Result<(), rustls::Error> {
+        while client.is_handshaking() || server.is_handshaking() {
+            let a = pump(
+                &mut |b| {
+                    while client.wants_write() {
+                        client.write_tls(b).unwrap();
+                    }
+                },
+                &mut |mut rd| {
+                    while !rd.is_empty() {
+                        server.read_tls(&mut rd).unwrap();
+                        server.process_new_packets()?;
+                    }
+                    Ok(())
+                },
+            )?;
+            let b = pump(
+                &mut |b| {
+                    while server.wants_write() {
+                        server.write_tls(b).unwrap();
+                    }
+                },
+                &mut |mut rd| {
+                    while !rd.is_empty() {
+                        client.read_tls(&mut rd).unwrap();
+                        client.process_new_packets()?;
+                    }
+                    Ok(())
+                },
+            )?;
+            assert!(a || b, "handshake stalled");
+        }
+        Ok(())
+    }
+
+    fn name(s: &str) -> ServerName<'static> {
+        server_name_for_host(s).unwrap()
+    }
+
+    #[test]
+    fn full_handshake_and_alpn() {
+        install_crypto_provider();
+        install_crypto_provider();
+        let (ca, m) = minter();
+        let client = ca_only_client(&ca, true, MinTlsVersion::Tls12);
+        for (h2, want) in [(true, &b"h2"[..]), (false, &b"http/1.1"[..])] {
+            let scfg = server_config_for(Arc::clone(&m), name("fallback.test"), h2);
+            let mut c = ClientConnection::new(Arc::clone(&client), name("example.com")).unwrap();
+            let mut s = ServerConnection::new(scfg).unwrap();
+            handshake(&mut c, &mut s).unwrap();
+            assert_eq!(c.alpn_protocol(), Some(want));
+            assert_eq!(s.alpn_protocol(), Some(want));
+            assert_eq!(s.server_name(), Some("example.com"));
+        }
+    }
+
+    #[test]
+    fn sniless_uses_default_name() {
+        let (ca, m) = minter();
+        // Client sends no SNI but expects example.com.
+        let client = ca_only_client(&ca, false, MinTlsVersion::Tls12);
+        let mut c = ClientConnection::new(Arc::clone(&client), name("example.com")).unwrap();
+        let mut s =
+            ServerConnection::new(server_config_for(Arc::clone(&m), name("example.com"), true))
+                .unwrap();
+        handshake(&mut c, &mut s).unwrap();
+        assert_eq!(s.server_name(), None);
+
+        // Wrong default: the client must reject the certificate.
+        let mut c = ClientConnection::new(client, name("example.com")).unwrap();
+        let mut s =
+            ServerConnection::new(server_config_for(Arc::clone(&m), name("wrong.test"), true))
+                .unwrap();
+        assert!(handshake(&mut c, &mut s).is_err());
+
+        // IP target: no SNI is sent at all, IP SAN is used.
+        let client = ca_only_client(&ca, true, MinTlsVersion::Tls13);
+        let mut c = ClientConnection::new(client, name("127.0.0.1")).unwrap();
+        let mut s = ServerConnection::new(server_config_for(m, name("127.0.0.1"), false)).unwrap();
+        handshake(&mut c, &mut s).unwrap();
+        assert_eq!(s.server_name(), None);
+    }
+
+    #[test]
+    fn untrusted_without_ca() {
+        let (_ca, m) = minter();
+        let client = client_config(&UpstreamTlsOptions::default()).unwrap();
+        let mut c = ClientConnection::new(client, name("example.com")).unwrap();
+        let mut s = ServerConnection::new(server_config_for(m, name("example.com"), true)).unwrap();
+        assert!(handshake(&mut c, &mut s).is_err());
+    }
+
+    #[test]
+    fn client_config_extra_root_and_alpn() {
+        let (ca, m) = minter();
+        let (_t, pem) = write_ca(&ca);
+        let cfg = client_config(&UpstreamTlsOptions {
+            extra_roots_pem: vec![pem],
+            min_version: MinTlsVersion::Tls12,
+        })
+        .unwrap();
+        assert!(cfg.enable_sni);
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        let mut c = ClientConnection::new(cfg, name("example.com")).unwrap();
+        let mut s = ServerConnection::new(server_config_for(m, name("example.com"), true)).unwrap();
+        handshake(&mut c, &mut s).unwrap();
+    }
+
+    #[test]
+    fn client_config_rejects_bad_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = |p: PathBuf| UpstreamTlsOptions {
+            extra_roots_pem: vec![p],
+            min_version: MinTlsVersion::Tls12,
+        };
+        let bad = dir.path().join("bad.pem");
+        std::fs::write(
+            &bad,
+            "-----BEGIN CERTIFICATE-----\n!!!notbase64!!!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        assert!(client_config(&opts(bad)).is_err());
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, "just text\n").unwrap();
+        assert!(matches!(
+            client_config(&opts(empty)),
+            Err(TlsError::NoCertificates(_))
+        ));
+        let junk_der = dir.path().join("junk.pem");
+        std::fs::write(
+            &junk_der,
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        assert!(client_config(&opts(junk_der)).is_err());
+        assert!(matches!(
+            client_config(&opts(dir.path().join("missing.pem"))),
+            Err(TlsError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn min_version_respected() {
+        let (ca, m) = minter();
+        let (_t, pem) = write_ca(&ca);
+        // Server restricted to TLS 1.2.
+        let mut scfg = ServerConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(Resolver {
+                minter: m,
+                default_name: name("example.com"),
+            }));
+        scfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let scfg = Arc::new(scfg);
+
+        let mk = |min| {
+            client_config(&UpstreamTlsOptions {
+                extra_roots_pem: vec![pem.clone()],
+                min_version: min,
+            })
+            .unwrap()
+        };
+        let mut c = ClientConnection::new(mk(MinTlsVersion::Tls12), name("example.com")).unwrap();
+        let mut s = ServerConnection::new(Arc::clone(&scfg)).unwrap();
+        handshake(&mut c, &mut s).unwrap();
+        assert_eq!(c.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_2));
+
+        let mut c = ClientConnection::new(mk(MinTlsVersion::Tls13), name("example.com")).unwrap();
+        let mut s = ServerConnection::new(scfg).unwrap();
+        assert!(handshake(&mut c, &mut s).is_err());
+    }
+
+    #[test]
+    fn host_parsing() {
+        assert!(matches!(
+            server_name_for_host("Example.COM").unwrap(),
+            ServerName::DnsName(d) if d.as_ref() == "example.com"
+        ));
+        assert!(matches!(
+            server_name_for_host("[::1]").unwrap(),
+            ServerName::IpAddress(_)
+        ));
+        assert!(server_name_for_host("*.example.com").is_err());
+        assert!(server_name_for_host("").is_err());
+    }
+}

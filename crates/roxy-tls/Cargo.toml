@@ -8,15 +8,19 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+lru = "0.18.5"
 pem.workspace = true
 rcgen.workspace = true
 ring.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std", "logging"] }
 rustls-pki-types.workspace = true
 thiserror.workspace = true
 time.workspace = true
+webpki-roots = "1.0.9"
 x509-parser.workspace = true
 
 [dev-dependencies]
+proptest = "1.11.0"
 tempfile.workspace = true
 
 [lints]

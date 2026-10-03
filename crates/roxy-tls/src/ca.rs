@@ -272,7 +272,7 @@ fn ca_params() -> Result<CertificateParams, CaError> {
 }
 
 /// A random, positive, 128-bit serial number.
-fn random_serial() -> Result<SerialNumber, CaError> {
+pub(crate) fn random_serial() -> Result<SerialNumber, CaError> {
     let mut bytes = [0u8; 16];
     SystemRandom::new()
         .fill(&mut bytes)
