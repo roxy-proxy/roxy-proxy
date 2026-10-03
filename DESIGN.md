@@ -559,7 +559,6 @@ rules:
 addons:
   - name: pii-scan
     path: /etc/roxy/addons/pii_scan.wasm
-    hooks: [request, response]
     stage: before_rules          # before_rules | in_chain | after_rules
     config: { threshold: 0.8 }
     capabilities: [state, log]
@@ -1032,7 +1031,6 @@ addons:
   - name: sentinel
     path: /etc/roxy/addons/sentinel.wasm
     stage: before_rules
-    hooks: [request, response, tunnel]
     limits:                       # defaults shown; each may be raised explicitly
       max_memory: 64mb
       max_buffered_body_bytes: 1mb   # defaults to limits.max_inspect_body_bytes
@@ -1044,6 +1042,15 @@ addons:
 There is deliberately no `on_error: pass`: a sentinel that crashes, times
 out, or exceeds its cap fails the flow closed, so an attacker cannot disable
 inspection by feeding the sentinel input that makes it trap.
+
+**No hook list.** There is one entry point, `handle`, which sees the whole
+exchange: the request stream comes in, the addon calls `next`, the response
+stream comes back, the addon returns a response stream. "Request hook" and
+"response hook" are just the code before and after `next`. The only optional
+export is `tunnel`; roxy inspects the component's exports at load time, and
+an addon without `tunnel` simply is not in the path of upgraded byte streams
+(the WebSocket upgrade *request* still passes through its `handle`, so it can
+refuse the upgrade).
 
 **Stages.** Each addon declares `stage: before_rules | after_rules`
 (default `before_rules`), or is invoked at a precise point by a rule's
@@ -1138,7 +1145,7 @@ world addon {
   import chain;
   import flow;
   export wasi:http/incoming-handler@0.2.0;             // handle(request, response-outparam)
-  export tunnel;                                       // optional: only if `tunnel` is in hooks
+  export tunnel;                                       // optional; roxy detects whether it is exported
   export init: func() -> result<_, string>;
 }
 ```
@@ -1189,9 +1196,30 @@ impl Middleware for RedactTokens {
 roxy_addon::export!(RedactTokens);
 ```
 
-Python authors use `componentize-py` against the same world; JS via `jco`.
+**Other languages.** Anything that builds a WASI 0.2 component against this
+WIT works. Realistically:
+
+- **Rust**: first class. Small components (hundreds of KiB), fast
+  instantiation, real streaming. The `roxy-addon` SDK targets Rust. Use it
+  for anything on the hot path, including sentinels.
+- **Go** (TinyGo / Go 1.24+ wasip2) and **JS** (`jco componentize`): work,
+  with larger binaries and higher per-call cost.
+- **Python** via `componentize-py`: it compiles your code *together with a
+  CPython interpreter* into one component. That makes the component tens of
+  MiB, needs `max_memory` raised to roughly 128–256 MiB, costs milliseconds
+  per instantiation, and runs Python at interpreter speed inside WASM. Only
+  pure-Python dependencies work (no numpy, no native wheels). It is fine for
+  prototyping and low-volume policy, not for a per-request sentinel on
+  busy traffic. Python support is "should work, not tested in CI" until
+  someone needs it.
+- **Python that needs native libraries** (ML models, numpy) should run
+  **out of process** as a helper service, called from a thin Rust addon via
+  the `http` capability with streaming bodies (§11.1 side requests). That
+  keeps the heavy code outside the sandbox while roxy still enforces limits
+  and fail-closed behaviour on the call.
+
 `examples/addons/` ships a Rust pass-through, a Rust streaming redactor, and
-a Python addon that calls a helper service through `wasi:http`.
+a Rust addon that streams bodies to a helper service through `wasi:http`.
 
 ## 12. Resource limits and self-protection
 
