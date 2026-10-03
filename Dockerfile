@@ -34,11 +34,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Fail the build if the binary is not fully static.
 RUN if ldd /roxy 2>&1 | grep -q '=>'; then ldd /roxy; exit 1; fi
 # The runtime filesystem, staged here because the runtime image has no
-# shell: a root-owned, read-only config, and the two directories roxy
-# writes, owned by the runtime user.
+# shell: a root-owned, read-only config, and the directories roxy writes,
+# owned by the runtime user. /var/lib/roxy/capture is not a VOLUME (capture
+# is off by default); it exists so a volume mounted there inherits the
+# ownership.
 RUN install -D -m 0444 examples/docker/roxy.yaml /out/etc/roxy/roxy.yaml \
     && install -d -m 0755 -o 65532 -g 65532 /out/var/lib/roxy /out/var/log/roxy \
-    && install -d -m 0700 -o 65532 -g 65532 /out/var/lib/roxy/ca
+    && install -d -m 0700 -o 65532 -g 65532 /out/var/lib/roxy/ca /out/var/lib/roxy/capture
 
 # ---- runtime -----------------------------------------------------------------
 # distroless/static-debian12:nonroot: /etc/passwd with nonroot (65532),
