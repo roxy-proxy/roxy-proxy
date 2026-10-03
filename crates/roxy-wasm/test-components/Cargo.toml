@@ -1,0 +1,22 @@
+# Test components for roxy-wasm. A separate workspace (not a member of the
+# root one): it builds for wasm32-wasip2 only. `build.sh` builds it and
+# copies the components to `../tests/fixtures/`, which are checked in.
+[workspace]
+resolver = "3"
+members = ["test-layer", "tunnel-layer"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+wit-bindgen = { version = "0.57.1", default-features = false, features = ["macros", "realloc", "std"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

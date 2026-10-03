@@ -1361,25 +1361,26 @@ Never hang a request. A layer that waits past `max_exchange_time` is
 stopped and the flow denied or closed. Denial is an immediate response, so a
 client sees a refusal rather than a stall that would trigger retries.
 
-### 11.4 WASM layers: WIT sketch
+### 11.4 WASM layers: the `roxy:addon` WIT package
 
-roxy reuses the WASI 0.2 HTTP types for heads and bodies so existing
-tooling applies.
+The package lives in `wit/addon.wit`. It reuses the WASI 0.2 HTTP types for
+heads and bodies, so existing tooling applies. The WASI WIT is vendored at
+0.2.12 under `wit/deps/`, and a guest built against any 0.2.x links. The
+host is the `roxy-wasm` crate.
 
 ```wit
 package roxy:addon@0.1.0;
 
 interface chain {
-  use wasi:http/types@0.2.0.{outgoing-request, future-incoming-response, error-code};
-  /// Pass this exchange's request to the layers below. At most once per
-  /// exchange; a second call traps. Independent requests use `endpoints`.
+  use wasi:http/types@0.2.12.{outgoing-request, future-incoming-response, error-code};
+  /// At most once per exchange; a second call traps.
   next: func(req: outgoing-request) -> result<future-incoming-response, error-code>;
 }
 
 interface endpoints {
-  use wasi:http/types@0.2.0.{outgoing-request, future-incoming-response, error-code};
-  /// Call a configured endpoint by name. The request's authority is ignored;
-  /// path and query are appended to the endpoint's URL.
+  use wasi:http/types@0.2.12.{outgoing-request, future-incoming-response, error-code};
+  /// Scheme and authority are ignored; path and query are appended to the
+  /// endpoint's URL. An unknown name is `error-code.destination-not-found`.
   call: func(name: string, req: outgoing-request) -> result<future-incoming-response, error-code>;
 }
 
@@ -1389,53 +1390,151 @@ interface flow {
   record flow-info { flow-id: string, conn-id: string, principal: principal,
                      tags: list<string> }
   enum scope { connection, principal }
-  current: func() -> flow-info;
-  add-tag: func(tag: string);
-  log: func(level: u8, msg: string);
-  record: func(kind: string, json: string, audit: bool);
-  terminate: func(scope: scope, reason: string, ttl-ms: option<u64>) -> bool;
-  state-get: func(key: string) -> option<string>;                         // JSON
+  enum log-level { trace, debug, info, warn, error }
+  current: func() -> flow-info;                       // always available
+  add-tag: func(tag: string);                         // always available
+  config: func() -> string;                           // always available; JSON
+  log: func(level: log-level, msg: string);           // capability `log`
+  %record: func(kind: string, json: string, audit: bool);                 // `record`
+  terminate: func(scope: scope, reason: string, ttl-ms: option<u64>) -> bool;  // `terminate`
+  state-get: func(key: string) -> option<string>;                         // `state`
   state-put: func(key: string, json: string, ttl-ms: option<u64>) -> result<_, string>;
-  metric-get: func(id: string, key: list<string>) -> option<s64>;
-  config: func() -> string;
+  metric-get: func(id: string, key: list<string>) -> option<s64>;         // `metrics`
 }
 
 interface tunnel {
-  use wasi:io/streams@0.2.0.{input-stream, output-stream};
+  use wasi:io/streams@0.2.12.{input-stream, output-stream};
   on-tunnel: func(from-client: input-stream, to-upstream: output-stream,
                   from-upstream: input-stream, to-client: output-stream);
 }
 
+interface init {
+  init: func() -> result<_, string>;
+}
+
 world layer {
-  include wasi:cli/imports@0.2.0;        // clocks, random, streams; no fs, no sockets, no env
-  import chain;
-  import endpoints;
-  import flow;
-  export wasi:http/incoming-handler@0.2.0;
-  export tunnel;                         // optional; detected at load time
-  export init: func() -> result<_, string>;
+  import wasi:clocks/monotonic-clock@0.2.12;  import wasi:clocks/wall-clock@0.2.12;
+  import wasi:random/random@0.2.12;  import wasi:random/insecure@0.2.12;
+  import wasi:random/insecure-seed@0.2.12;
+  import wasi:io/error@0.2.12;  import wasi:io/poll@0.2.12;  import wasi:io/streams@0.2.12;
+  import wasi:cli/stdout@0.2.12;  import wasi:cli/stderr@0.2.12;  import wasi:cli/stdin@0.2.12;
+  import wasi:http/types@0.2.12;
+  import chain;  import endpoints;  import flow;
+  export wasi:http/incoming-handler@0.2.12;
+  export init;
+}
+
+world tunnel-layer {
+  include layer;
+  export tunnel;
 }
 ```
 
-Instances: one per worker thread per layer by default. A guest with its own
-async runtime (for example CPython's asyncio over `wasi:io/poll`) can serve
-several in-flight exchanges per instance; whether that works for CPython is
-the sentinel design's open prototype question, and the host does not depend
-on the answer. Instances are recycled after `recycle_after_exchanges` or when
-their linear memory passes `recycle_above_memory`, which bounds the memory
-ratchet the sentinel design warns about.
+**Changes from the earlier sketch.**
+
+- `init` is an interface rather than a bare world function. Every export is
+  then an interface, which is what the host looks up.
+- `tunnel` lives in a second world, `tunnel-layer`, because the component
+  model has no optional exports. Both worlds load the same way, and the host
+  detects at load time whether `roxy:addon/tunnel` is exported
+  (`Layer::has_tunnel`).
+- `flow.log` takes a `log-level` enum instead of a `u8`. `record` is spelled
+  `%record`, because `record` is a WIT keyword; bindings still call it
+  `record`.
+- The world names the imports it promises: clocks, random, io, stdio and
+  `wasi:http/types`. The `wasi:cli/imports` sketch included filesystem,
+  sockets and environment. The host still links the rest of WASI 0.2
+  *inertly*: an empty environment and no arguments, no preopened
+  directories, stdio closed, TCP, UDP and name lookup off, and every socket
+  address denied. Stock toolchains whose standard library imports more than
+  it uses still load, and still reach nothing.
+- `wasi:http/outgoing-handler` is never provided, so a component that
+  imports it fails to link. Outbound calls go through `endpoints`.
+- `chain.next` fills in a request's scheme and authority from the exchange
+  when the guest leaves them unset. A request with an unsupported scheme or
+  an unusable URI fails the exchange (`InvalidRequest`). Everything else
+  about the head is validated by the proxy's canonical model, as for any
+  client.
+- The capability for each `flow` function is fixed as annotated above.
+  `current`, `add-tag` and `config` need none; `secrets` is not part of
+  0.1.0, because endpoints attach credentials. During `init` there is no
+  exchange: `config` works, `log` goes to roxy's own log (the capability
+  still applies), and every other `flow`, `chain` or `endpoints` call traps
+  (`OutsideExchange`).
+
+**Host interface.** The proxy implements `roxy_wasm::LayerHost`, one value
+per exchange (`next`, `endpoint_call`, `flow_info`, `add_tag`, `log`,
+`record`, `terminate`, `state_get` / `state_put`, `metric_get`; all async
+except the cheap ones). Requests and responses crossing it are
+`http::Request` / `http::Response` over `roxy_http::Body`, so both
+directions stream. roxy-wasm checks capabilities before calling the host and
+calls `next` at most once. A host `Err` traps the guest and fails the
+exchange (`LayerError::Host`). `EndpointError` and `state_put`'s inner
+`Err` are returned to the guest, which decides what to do.
+
+**Instances.** `Layer::load` compiles a component once per config load, on
+the blocking pool. It links it, then starts one instance and runs its
+`init`, so a broken layer fails the load. Each exchange checks an instance
+out of the layer's pool for its whole duration, because the guest's handler
+occupies the store until it returns. `limits.max_instances` (default 64)
+caps how many instances live at once, and therefore how many exchanges the
+layer runs concurrently. An exchange that finds no free instance waits
+within its `max_exchange_time`. A guest with its own async runtime (for
+example CPython's asyncio over `wasi:io/poll`) still serves one exchange per
+instance; multiplexing exchanges in one instance is left for later.
+Instances are recycled after `recycle_after_exchanges`, or when an exchange
+leaves their linear memory above `recycle_above_memory`. That bounds the
+memory ratchet the sentinel design warns about. An instance that failed in
+any way is discarded, never reused.
 
 ### 11.5 Safety
 
-- **Capabilities** declared per layer; anything not granted fails at the
-  call.
-- **CPU per step** (epoch interruption plus fuel), **wall clock per
-  exchange**, **memory per instance**, **buffered bytes per layer**. Each
-  exceeded budget fails the flow closed in enforce mode and is logged.
-- Any trap, an invalid head, or a `next` request that fails canonical
-  validation denies the flow (or closes it if the response head is out).
+- **Capabilities** are declared per layer. Every import is linked whatever
+  the grants, so one binary runs under any of them. Calling an import whose
+  capability was not granted traps (`CapabilityDenied`) and fails the
+  exchange.
+- **CPU per step.** A *step* is the guest's run between host calls: every
+  call into the guest, and every host call returning to it, starts a new
+  one. Each step gets `fuel_per_step` fuel and may run for `step_cpu` of
+  wall time. The time limit is checked by the epoch-interruption callback on
+  a 1 ms engine-wide tick, and that callback also yields to the async
+  runtime each tick, so a spinning guest neither stalls a worker thread nor
+  escapes its wall clock. (wasmtime also runs the call hook around its own
+  fuel and epoch checks; those are recognised and do not count as step
+  boundaries.)
+- **Wall clock per exchange.** `max_exchange_time` runs from the call to
+  `Layer::handle` until the guest's handler returns. It covers waiting for
+  an instance, `next`, endpoint calls and streaming both bodies, so a
+  streamed response longer than the limit is cut. Tunnels have no exchange
+  clock: they live as long as the relay's own idle timeouts allow.
+- **Memory per instance.** A `ResourceLimiter` caps linear memory, summed
+  over the instance's memories, at `max_memory`. It also caps table growth
+  and the host resource table (4096 live resources). Growing past a cap
+  traps with `BudgetExceeded(Memory)`.
+- **Buffered bytes per layer.** `max_buffered_body_bytes` bounds, per
+  direction, the bytes the guest has read from that direction's body minus
+  the bytes it has passed on in that direction. That is the request body it
+  read against the request body it gave `next`, and the response body from
+  `next` against the response body it answered with. A streaming layer stays
+  near zero. A layer that reads a whole body first is held to the budget.
+- **Every failure is closed.** A trap, an exceeded budget, a second `next`,
+  a missing capability, a host failure, a request to `next` that cannot be
+  built, an error or missing response, a handler that returns while still
+  holding resources (for example an unfinished body), or a cancelled
+  exchange is a `LayerError`. The caller turns every one into a deny, or
+  closes the connection if the response head is already out.
+- **No clean end for a failed body.** wasmtime-wasi-http ends a guest body
+  cleanly when its sender is dropped, which also happens when a failed store
+  is dropped. roxy-wasm therefore records the failure before it drops an
+  instance. Body adapters check it, and a guest body never ends cleanly once
+  the exchange has failed: it ends with `BodyError::Stopped`. A response
+  body also holds its end until the handler returns, so a trap after the
+  last byte still cuts it. The `LayerOutcome` in the response's extensions
+  says why. A guest that deliberately drops a request body without
+  `finish` while still running ends that body cleanly. That is the layer's
+  output, and the rules judge it like any other.
 - Layers see canonical heads and body streams, never raw wire bytes.
-- No filesystem, sockets or environment inside the sandbox; all I/O is
+- No filesystem, sockets or environment inside the sandbox. All I/O is
   `next`, `endpoints` and `flow`.
 
 ### 11.6 Service layers (external services)
@@ -1589,7 +1688,11 @@ socket, never a pass-through. Specifically:
   CA download and (later) metrics live on a separate `ca_server` bind so they
   can be firewalled differently.
 - roxy runs as an unprivileged user; transparent mode needs `CAP_NET_ADMIN`
-  only for the firewall rules, which are set up outside roxy.
+  only for the firewall rules, which are set up outside roxy. The container
+  image runs as UID 65532 on distroless/static (no shell), with a read-only
+  root filesystem, no capabilities and `no-new-privileges`; the CA directory
+  is its only required writable path. Its `HEALTHCHECK` uses `roxy health`
+  against the `ca_server` `/healthz` (README, "Container image").
 - `panic = "abort"` is **not** used; panics in a connection task are caught
   and close that connection only. Fuzzing targets ensure the parsers do not
   panic at all.
@@ -1608,7 +1711,7 @@ socket, never a pass-through. Specifically:
 | TLS | `rustls` 0.23, `tokio-rustls`, `webpki-roots` | no OpenSSL anywhere |
 | certs | `rcgen` | CA + leaves |
 | DNS | `hickory-resolver` | |
-| WASM | `wasmtime` (component-model, `wit-bindgen`) | |
+| WASM | `wasmtime`, `wasmtime-wasi`, `wasmtime-wasi-http` (component model, WASI 0.2; no default outbound HTTP client) | guests: `wit-bindgen` |
 | WebSocket | relay tier: `sha1`/`base64` for the handshake check only, then `tokio::io::copy_bidirectional`. Inspect tier (M3): own frame codec in `roxy-http` (~400 lines) | `tungstenite` considered for the inspect tier but its leniency knobs are insufficient |
 | config | `serde`, `serde_yaml_ng` (or another maintained serde-yaml fork), `humantime-serde`, `bytesize` | |
 | DSL | hand-written lexer + Pratt parser | tiny grammar, best diagnostics, no deps |
@@ -1624,7 +1727,10 @@ socket, never a pass-through. Specifically:
 Build: `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` static
 binaries; `cargo deny` for licence/advisory checks; `clippy -D warnings`;
 `#![forbid(unsafe_code)]` in every crate except where `SO_ORIGINAL_DST` needs
-a `libc` call (isolated in one module of `roxy-proxy`).
+a `libc` call (isolated in one module of `roxy-proxy`), and `roxy-wasm`, which
+denies rather than forbids it: the bindings `wasmtime::component::bindgen!`
+generates contain `unsafe` blocks, so its `bindings` module (generated code
+only) allows them.
 
 ---
 
