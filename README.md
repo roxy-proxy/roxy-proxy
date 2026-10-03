@@ -12,8 +12,56 @@ input it cannot read (a metric, a list, a body) denies rather than allows.
 Policy is a YAML file with a small, statically typed rule language, stateful
 metrics for rate and budget limits, address denylists, and secret injection
 so the agent only ever holds placeholders. Every decision lands in a
-structured JSONL flow log with the rule that made it. See
-[DESIGN.md](DESIGN.md) for the design, threat model and roadmap.
+structured JSONL flow log with the rule that made it, and traffic can be
+captured to disk. See [DESIGN.md](DESIGN.md) for the design, threat model
+and roadmap.
+
+## Quickstart
+
+[`examples/compose`](examples/compose) runs an "agent" container (curl) whose
+only way to the internet is through roxy:
+
+```
+            sandbox (internal: no route out)          egress
+ ┌───────┐  HTTPS_PROXY=http://roxy:3128  ┌──────┐            ┌──────────┐
+ │ agent │ ─────────────────────────────▶ │ roxy │ ─────────▶ │ internet │
+ └───────┘                                └──────┘            └──────────┘
+     ✗  no other route: direct connections and DNS lookups fail
+```
+
+```sh
+cd examples/compose
+docker compose up -d --wait     # ghcr.io/roxy-proxy/roxy:edge; add --build to build this checkout
+./demo.sh                       # what the agent can and cannot do
+docker compose logs roxy        # roxy's flow log: one JSON line per decision
+docker compose down -v
+```
+
+`demo.sh` runs these from inside the agent:
+
+| from the agent | result |
+|---|---|
+| `curl https://example.com/` | `200`: rule `example-reads` allows it |
+| `curl https://www.wikipedia.org/` | `403` from roxy: no rule allows it (`_default`) |
+| `curl https://example.com/admin/` | `403` from roxy: rule `no-admin-paths` denies it, whatever allows the host |
+| a 2 MB `POST` to `postman-echo.com` | `413`: the watching rule `upload-cap` stops it mid-upload |
+| `curl --noproxy '*' https://example.com/` | fails: the name does not even resolve |
+| `curl --noproxy '*' https://1.1.1.1/` | fails: no route |
+
+**Containment comes from the network, not from the proxy settings.** roxy
+is an explicit proxy, not a transparent gateway. The agent's
+`HTTPS_PROXY` only tells well-behaved clients where roxy is. What contains
+the agent is that it sits only on an `internal: true` Docker network, which
+has no route out and no outside DNS, and that roxy is the only container on
+both that network and one with a route out. A client that ignores the proxy
+variables, or a library that opens its own sockets, gets nowhere.
+
+To contain something real, replace the `agent` service with your workload
+(keeping `networks: [sandbox]` and its environment) and edit
+[`roxy.yaml`](examples/compose/roxy.yaml). After editing the policy,
+`docker compose kill -s HUP roxy` reloads it: a bad policy is rejected and
+the running one stays (see `docker compose logs roxy`). Restart instead
+(`docker compose restart roxy`) for listener, TLS or capture settings.
 
 ## Why an explicit HTTP proxy
 
@@ -34,9 +82,9 @@ is as narrow as it can be while still being useful.
   original-destination address to spoof or race.
 - **Nothing is implicit.** A client that bypasses the proxy should reach
   nothing. Every other egress path is closed by the network
-  ([below](#pointing-an-agent-at-roxy)); roxy does not rely on the client
-  choosing to use the proxy. Everything that does reach roxy is decided by a rule, and
-  anything it cannot classify is dropped.
+  ([see below](#containing-your-own-agent)); roxy does not rely on the client
+  choosing to use the proxy. Everything that does reach roxy is decided
+  by a rule, and anything it cannot classify is dropped.
 
 The narrower the interface, the fewer ways an adversarial agent has to
 make roxy misread what it is sending. Transparent mode is designed
@@ -72,55 +120,39 @@ them. It comes first as a Python sidecar on a service layer. A compiled
 (CPython-in-WASM) build will follow once inspect_sentinel supports one.
 See [`examples/addons`](examples/addons).
 
-## Status
+## Containing your own agent
 
-Usable in explicit proxy mode. Built and tested:
+The same recipe applies outside Docker Compose:
 
-- HTTP/1.1 and HTTPS via `CONNECT`, with TLS interception and strict
-  parsing (a 168-case smuggling corpus). HTTP/2 from the client inside
-  the tunnel, negotiated by ALPN; any client falls back to HTTP/1.1.
-- Firewall-style rules: allows plus denies that always win, a configurable
-  default, and rules that keep watching an exchange as its body and
-  response stream (byte limits, response checks, byte budgets).
-- Header, path, query and redirect actions, and secret injection.
-- Stateful metrics and a state store. Neither ever evicts: a full table
-  denies. Their sizes are set in `limits` (`max_metric_keys`,
-  `max_metric_bytes`, `max_state_entries`).
-- Address denylists, and a private-range floor on the IP actually dialled.
-- WebSocket relay, proxy authentication, and a CA download endpoint.
-- Hot reload, `roxy check`, and the `roxy rule test` dry run.
-- Traffic capture: heads and bodies as forwarded, per rule or for all
-  traffic, written with the same never-drop backpressure as the flow log.
-- A hardened container image (`ghcr.io/roxy-proxy/roxy`, below).
+1. **Take away the agent's route out.** Put it in a network namespace,
+   VM or container network whose only reachable host is roxy: block
+   everything else, including direct TCP, UDP and DNS, at the network layer.
+   roxy resolves DNS itself, so the agent needs none.
+2. **Give roxy a route out**, and the agent a route to roxy's proxy port
+   (3128 in the examples). Keep the CA endpoint (3130) reachable from the
+   agent only if the agent should fetch the CA itself.
+3. **Point the agent at roxy and make it trust roxy's CA.** Get the CA
+   certificate in one of three ways:
 
-Deferred, with designs in DESIGN.md:
+   ```sh
+   roxy ca export --config roxy.yaml > roxy-ca.pem                            # at image build time
+   curl -s http://<ca_server.bind>/roxy-ca.pem > roxy-ca.pem                  # from the CA server
+   curl -s -x http://<proxy> http://roxy.internal/roxy-ca.pem > roxy-ca.pem   # through the proxy
+   ```
 
-- Running addons in the proxy (§11). The WASM host (`roxy-wasm`), the
-  `roxy-addon` SDK and its example are built and tested, but
-  `roxy run` still refuses a config that defines addons until the layer
-  stack is wired into the proxy. Service layers come after that.
-- Transparent mode (§4.2).
-- WebSocket message rules (§8.2). Byte budgets already apply to WebSockets.
-- A Prometheus endpoint.
+   Then, in the agent's environment:
 
-## Quickstart
+   ```sh
+   export HTTP_PROXY=http://<proxy> HTTPS_PROXY=http://<proxy>
+   export http_proxy=$HTTP_PROXY https_proxy=$HTTPS_PROXY   # curl reads only the lower-case http_proxy
+   export SSL_CERT_FILE=/path/roxy-ca.pem         # OpenSSL-based tools, Python ssl, Go
+   export REQUESTS_CA_BUNDLE=/path/roxy-ca.pem    # Python requests
+   export NODE_EXTRA_CA_CERTS=/path/roxy-ca.pem   # Node
+   export CURL_CA_BUNDLE=/path/roxy-ca.pem        # curl
+   ```
 
-```sh
-cargo build --release
-B=./target/release/roxy
-
-$B check --config examples/minimal.yaml      # validate; exits 1 with file:path diagnostics
-$B run   --config examples/minimal.yaml      # starts the proxy; edits to the file hot-reload
-```
-
-`examples/minimal.yaml` allows `GET`/`HEAD` to `example.com` and denies
-everything else. Set `tls.ca_dir` to a writable directory first. The CA is
-generated there on first start and reused after that; roxy never silently
-regenerates it.
-
-`examples/roxy.yaml` is the full example. It shows metrics, secrets,
-address lists, upload limits and the addon config shape. It passes `check`,
-but `run` refuses it because addons are not in this build.
+   Adding the certificate to the system trust store also works. Do not put
+   external hosts in `NO_PROXY`.
 
 ## Container image
 
@@ -177,31 +209,6 @@ cosign verify ghcr.io/roxy-proxy/roxy:edge \
   --certificate-identity-regexp '^https://github.com/roxy-proxy/roxy-proxy/\.github/workflows/image\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
-
-## Pointing an agent at roxy
-
-The agent needs the proxy address and must trust roxy's CA. Get the CA
-certificate in one of three ways:
-
-```sh
-roxy ca export --config roxy.yaml > roxy-ca.pem                     # at image build time
-curl -s http://<ca_server.bind>/roxy-ca.pem > roxy-ca.pem           # from the CA server
-curl -s -x http://<proxy> http://roxy.internal/roxy-ca.pem > roxy-ca.pem   # through the proxy
-```
-
-Then, in the agent's environment:
-
-```sh
-export HTTP_PROXY=http://<proxy> HTTPS_PROXY=http://<proxy>
-export SSL_CERT_FILE=/path/roxy-ca.pem         # OpenSSL-based tools, Python ssl, Go
-export REQUESTS_CA_BUNDLE=/path/roxy-ca.pem    # Python requests
-export NODE_EXTRA_CA_CERTS=/path/roxy-ca.pem   # Node
-export CURL_CA_BUNDLE=/path/roxy-ca.pem        # curl
-```
-
-Adding the certificate to the system trust store also works. For
-containment, block every other egress path from the sandbox at the host
-firewall, including direct TCP, UDP and DNS. roxy resolves DNS itself.
 
 ## Writing rules
 
@@ -344,6 +351,56 @@ limits:
   max_capture_body_bytes: 16mb    # per direction per exchange; beyond it, `truncated`
 ```
 
+## Running without Docker
+
+```sh
+cargo build --release
+B=./target/release/roxy
+
+$B check --config examples/minimal.yaml      # validate; exits 1 with file:path diagnostics
+$B run   --config examples/minimal.yaml      # starts the proxy; edits to the file hot-reload
+```
+
+`examples/minimal.yaml` allows `GET`/`HEAD` to `example.com` and denies
+everything else. Set `tls.ca_dir` to a writable directory first. The CA is
+generated there on first start and reused after that; roxy never silently
+regenerates it.
+
+`examples/roxy.yaml` is the full example. It shows metrics, secrets,
+address lists, upload limits, capture and the addon config shape. It passes
+`check`, but `run` refuses it because addons are not in this build.
+
+## Status
+
+Usable in explicit proxy mode. Built and tested:
+
+- HTTP/1.1 and HTTPS via `CONNECT`, with TLS interception and strict
+  parsing (a 168-case smuggling corpus). HTTP/2 from the client inside
+  the tunnel, negotiated by ALPN; any client falls back to HTTP/1.1.
+- Firewall-style rules: allows plus denies that always win, a configurable
+  default, and rules that keep watching an exchange as its body and
+  response stream (byte limits, response checks, byte budgets).
+- Header, path, query and redirect actions, and secret injection.
+- Stateful metrics and a state store. Neither ever evicts: a full table
+  denies. Their sizes are set in `limits` (`max_metric_keys`,
+  `max_metric_bytes`, `max_state_entries`).
+- Address denylists, and a private-range floor on the IP actually dialled.
+- WebSocket relay, proxy authentication, and a CA download endpoint.
+- Hot reload, `roxy check`, and the `roxy rule test` dry run.
+- Traffic capture: heads and bodies as forwarded, per rule or for all
+  traffic, written with the same never-drop backpressure as the flow log.
+- A hardened container image (`ghcr.io/roxy-proxy/roxy`, see "Container image").
+
+Deferred, with designs in DESIGN.md:
+
+- Running addons in the proxy (§11). The WASM host (`roxy-wasm`), the
+  `roxy-addon` SDK and its example are built and tested, but
+  `roxy run` still refuses a config that defines addons until the layer
+  stack is wired into the proxy. Service layers come after that.
+- Transparent mode (§4.2).
+- WebSocket message rules (§8.2). Byte budgets already apply to WebSockets.
+- A Prometheus endpoint.
+
 ## Development
 
 ```sh
@@ -360,6 +417,8 @@ cargo test --workspace            # unit, corpus, property and end-to-end tests
 | `crates/roxy-tls` | CA, leaf minting, rustls configs, ClientHello sniffing |
 | `crates/roxy-http` | canonical HTTP model, strict h1 codec, h2 mapping, URL normalisation |
 | `crates/roxy-rules` | rule DSL, policy evaluation, metric and state stores |
+
+Releases are cut by pushing a `vX.Y.Z` tag; see [RELEASING.md](RELEASING.md).
 
 ## License
 
