@@ -36,6 +36,7 @@ impl Config {
         self.validate_address_lists(&mut d);
         self.validate_addons(&mut d);
         self.validate_upstream(&mut d);
+        self.validate_log(&mut d);
 
         if let Err(policy) = self.compile_policy() {
             d.extend(policy);
@@ -330,6 +331,43 @@ impl Config {
             d.push(Diagnostic::new(
                 "limits.max_metric_bytes",
                 "must be at most 64gb",
+            ));
+        }
+    }
+}
+
+impl Config {
+    fn validate_log(&self, d: &mut Vec<Diagnostic>) {
+        let f = &self.log.flow;
+        if f.high_water.as_u64() < 64 * 1024 {
+            d.push(Diagnostic::new(
+                "log.flow.high_water",
+                "must be at least 64kb (traffic is held back whenever this much log is unwritten)",
+            ));
+        }
+        let rotating = f.max_file_bytes.is_some() || f.max_files.is_some() || f.compress;
+        if rotating && f.path.is_none() {
+            d.push(Diagnostic::new(
+                "log.flow",
+                "max_file_bytes, max_files and compress need `path` (stdout cannot rotate)",
+            ));
+        }
+        if f.max_file_bytes.is_none() && (f.max_files.is_some() || f.compress) {
+            d.push(Diagnostic::new(
+                "log.flow.max_file_bytes",
+                "max_files and compress apply to rotated files; set max_file_bytes to rotate",
+            ));
+        }
+        if f.max_file_bytes.is_some_and(|b| b.as_u64() < 4096) {
+            d.push(Diagnostic::new(
+                "log.flow.max_file_bytes",
+                "must be at least 4kb",
+            ));
+        }
+        if f.max_files == Some(0) {
+            d.push(Diagnostic::new(
+                "log.flow.max_files",
+                "must be at least 1 (omit it to keep every rotated file)",
             ));
         }
     }

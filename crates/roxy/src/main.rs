@@ -431,7 +431,8 @@ fn run(path: &Path) -> anyhow::Result<ExitCode> {
 /// In-flight exchanges get this long to finish at shutdown.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Waits for ctrl-c or SIGTERM; reloads on SIGHUP meanwhile.
+/// Waits for ctrl-c or SIGTERM; on SIGHUP meanwhile, reopens the flow log
+/// file (for external log rotation) and reloads the config.
 async fn wait_for_shutdown(running: &roxy::run::Running) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
@@ -443,7 +444,8 @@ async fn wait_for_shutdown(running: &roxy::run::Running) -> anyhow::Result<()> {
                 r = tokio::signal::ctrl_c() => return r.context("waiting for ctrl-c"),
                 _ = term.recv() => return Ok(()),
                 _ = hup.recv() => {
-                    tracing::info!("SIGHUP: reloading config");
+                    tracing::info!("SIGHUP: reopening logs and reloading config");
+                    running.reopen_logs();
                     running.reloader.reload_async().await;
                 }
             }

@@ -127,6 +127,7 @@ the CA. Any default that would trip a conforming client is a bug.
 | `roxy-rules` | Expression DSL (lexer, parser, type-checker, compiler), rule set, evaluation model, actions, metrics/state store, hot-reload-safe `Policy` snapshot. |
 | `roxy-wasm` | wasmtime component host, WIT world, addon lifecycle, fuel/memory limits, host-call implementations. |
 | `roxy-proxy` | Listeners, connection state machine, flow pipeline, upstream connector (DNS, SSRF policy, pool), WebSocket relay, flow log emission. |
+| `roxy-log` | Buffered single-writer log destinations (§10.1): one writer thread, batching, backpressure, size rotation, compression. Knows bytes, not events; used by the flow log and later by body capture (§10.2). |
 | `roxy` | Binary: CLI (`run`, `check`, `ca export`, `rule test`), config loading, reload watcher, wiring. |
 | `roxy-addon` | SDK for Rust addon authors: generated WIT bindings + ergonomic wrappers. Published independently. |
 | `wit/` | The `roxy:addon` WIT package. Language-agnostic contract for addons. |
@@ -1060,11 +1061,11 @@ that scrubs it from any logged string. Header values for `authorization`,
 in full (`log.redact_headers` to extend). Query strings are logged with
 values redacted by default.
 
-Sinks implement `trait FlowSink { fn emit(&self, event: &FlowEvent); }`:
-`Stdout`, `File` (with size rotation), later `UnixSocket` (live stream),
-`Otlp`.
+Sinks implement `trait FlowSink` (`emit`, plus `poll_ready` for
+backpressure, `flush` and `reopen`): `Stdout`, `File` (with size rotation),
+later `UnixSocket` (live stream), `Otlp`.
 
-**Writing** (`roxy-proxy::logwriter`).
+**Writing** (the `roxy-log` crate).
 Logging is a first-class product feature and an audit trail, so the write
 path is built for many cores and heavy traffic, and it never drops:
 
@@ -1086,6 +1087,13 @@ path is built for many cores and heavy traffic, and it never drops:
   bounded by what in-flight exchanges emit between two checks. A sink
   that fails (disk full, I/O error) stops traffic the same way; it is
   reported, never silently skipped.
+- **Rotation** (`log.flow.max_file_bytes`, `max_files`, `compress`)
+  happens in the writer thread at a batch boundary, so a record never
+  spans two files. The file is renamed to `<path>.<UTC timestamp>-<seq>`
+  (names sort in rotation order), a new one is opened, the oldest beyond
+  `max_files` are deleted and rotated files are optionally gzipped in the
+  background. A failed rotation is a failed write: traffic is held and it
+  is retried. `SIGHUP` reopens the file for external rotation.
 - **Shared with capture.** Body capture (§10.2) and any future "tee all
   traffic" mode use the same writer machinery and the same backpressure,
   fed from the body adapters that already see every forwarded chunk

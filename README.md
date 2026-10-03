@@ -188,6 +188,23 @@ Secrets and sensitive headers are redacted. Other events include
 `policy_input_unavailable`, `config_reloaded`, `config_reload_failed`,
 `ws_open` and `ws_close`.
 
+The flow log is an audit trail, so roxy never drops a record. One writer
+thread per destination batches writes. If the log falls behind (more than
+`high_water` unwritten) or the disk fails, roxy holds traffic back until it
+catches up rather than losing records. Files can rotate by size:
+
+```yaml
+log:
+  flow:
+    path: /var/log/roxy/flow.jsonl
+    high_water: 8mb          # unwritten log at which traffic is held (default 8mb)
+    max_file_bytes: 100mb    # rotate to flow.jsonl.<UTC timestamp>-<seq>
+    max_files: 10            # keep the newest 10 rotated files
+    compress: true           # gzip rotated files
+```
+
+`SIGHUP` also reopens the file, for external `logrotate`.
+
 ## Development
 
 ```sh
@@ -200,6 +217,7 @@ cargo test --workspace            # unit, corpus, property and end-to-end tests
 |---|---|
 | `crates/roxy` | binary: CLI, config, secrets, address-list loading, reload, store wiring |
 | `crates/roxy-proxy` | listeners, pipeline, upstream connector, address floor, flow log |
+| `crates/roxy-log` | buffered single-writer log destinations: batching, backpressure, rotation |
 | `crates/roxy-tls` | CA, leaf minting, rustls configs, ClientHello sniffing |
 | `crates/roxy-http` | canonical HTTP model, strict h1 codec, h2 mapping, URL normalisation |
 | `crates/roxy-rules` | rule DSL, policy evaluation, metric and state stores |

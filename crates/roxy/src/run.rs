@@ -144,11 +144,24 @@ pub fn load_ca(config: &Config) -> anyhow::Result<Ca> {
 
 /// The flow sink configured by `log.flow`.
 pub fn build_sink(config: &Config) -> anyhow::Result<Arc<dyn FlowSink>> {
-    Ok(match &config.log.flow.path {
-        Some(path) => Arc::new(
-            FileSink::open(path).with_context(|| format!("opening flow log {}", path.display()))?,
-        ),
-        None => Arc::new(StdoutSink::new().context("starting the flow log writer")?),
+    let f = &config.log.flow;
+    let opts = roxy_proxy::logging::WriterOptions {
+        high_water: usize::try_from(f.high_water.as_u64()).unwrap_or(usize::MAX),
+        ..roxy_proxy::logging::WriterOptions::default()
+    };
+    Ok(match &f.path {
+        Some(path) => {
+            let rotate = roxy_proxy::logging::RotateOptions {
+                max_file_bytes: f.max_file_bytes.map(|b| b.as_u64()),
+                max_files: f.max_files,
+                compress: f.compress,
+            };
+            Arc::new(
+                FileSink::open_with(path, opts, rotate)
+                    .with_context(|| format!("opening flow log {}", path.display()))?,
+            )
+        }
+        None => Arc::new(StdoutSink::with_options(opts).context("starting the flow log writer")?),
     })
 }
 
@@ -409,6 +422,11 @@ impl std::fmt::Debug for Running {
 }
 
 impl Running {
+    /// Reopens file log destinations (after external rotation; `SIGHUP`).
+    pub fn reopen_logs(&self) {
+        self.server.handle().sink().reopen();
+    }
+
     /// Graceful shutdown (§12): stop accepting, drain for up to `grace`.
     pub async fn shutdown(self, grace: Duration) {
         drop(self.watcher);
@@ -516,6 +534,47 @@ mod tests {
 
     fn cfg(yaml: &str) -> Config {
         Config::from_yaml(yaml).unwrap()
+    }
+
+    /// `log.flow` rotation settings reach the file sink: emitting past
+    /// `max_file_bytes` rotates, and nothing is lost.
+    #[test]
+    fn flow_log_rotates_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flow.jsonl");
+        let c = cfg(&format!(
+            "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:3128 }}]\nlog:\n  flow:\n    \
+             path: {}\n    max_file_bytes: 4kb\n    max_files: 100\n",
+            path.display()
+        ));
+        c.validate().unwrap();
+        let sink = build_sink(&c).unwrap();
+        for i in 0..200 {
+            sink.emit(&FlowEvent::ConfigLoaded {
+                ts: chrono::Utc::now(),
+                path: format!("/etc/roxy/{i}.yaml").into(),
+                listeners: vec!["p".into()],
+                rules: i,
+                metrics: 0,
+                addons: 0,
+            });
+            if i % 20 == 0 {
+                sink.flush();
+            }
+        }
+        sink.flush();
+        let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(files.len() > 2, "rotated: {files:?}");
+        let lines: usize = files
+            .into_iter()
+            .map(|e| {
+                std::fs::read_to_string(e.unwrap().path())
+                    .unwrap()
+                    .lines()
+                    .count()
+            })
+            .sum();
+        assert_eq!(lines, 200);
     }
 
     #[test]
