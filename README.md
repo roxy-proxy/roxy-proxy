@@ -6,8 +6,8 @@ terminates TLS with leaf certificates minted by its own CA, parses every
 request into a strict canonical model, and re-serialises it in one
 unambiguous wire form, so smuggling and header-injection tricks never reach
 the upstream. It fails closed: anything it cannot parse, verify or classify
-is dropped, an empty rule set denies everything, and a policy input it
-cannot read (a metric, a list, a body) denies rather than allows.
+is dropped, the default is to deny anything no rule allows, and a policy
+input it cannot read (a metric, a list, a body) denies rather than allows.
 
 Policy is a YAML file with a small, statically typed rule language, stateful
 metrics for rate and budget limits, address denylists, and secret injection
@@ -22,7 +22,9 @@ Usable in explicit proxy mode. Built and tested:
 - HTTP/1.1 and HTTPS via `CONNECT`, with TLS interception and strict
   parsing (a 168-case smuggling corpus). HTTP/2 from the client inside
   the tunnel, negotiated by ALPN; any client falls back to HTTP/1.1.
-- Rules in four phases: connect, request, response and WebSocket.
+- Firewall-style rules: allows plus denies that always win, a configurable
+  default, and rules that keep watching an exchange as its body and
+  response stream (byte limits, response checks, byte budgets).
 - Header, path, query and redirect actions, and secret injection.
 - Stateful metrics and a state store. Neither ever evicts: a full table
   denies.
@@ -35,7 +37,7 @@ Deferred, with designs in DESIGN.md:
 - WASM and service addons (§11). `roxy run` refuses a config that defines
   addons.
 - Transparent mode (§4.2).
-- WebSocket message inspection (§8.2).
+- WebSocket message rules (§8.2). Byte budgets already apply to WebSockets.
 - Body capture and a Prometheus endpoint.
 
 ## Quickstart
@@ -54,7 +56,7 @@ generated there on first start and reused after that; roxy never silently
 regenerates it.
 
 `examples/roxy.yaml` is the full example. It shows metrics, secrets,
-address lists, a size limit and the addon config shape. It passes `check`,
+address lists, upload limits and the addon config shape. It passes `check`,
 but `run` refuses it because addons are not in this build.
 
 ## Pointing an agent at roxy
@@ -84,10 +86,27 @@ firewall, including direct TCP, UDP and DNS. roxy resolves DNS itself.
 
 ## Writing rules
 
-Rules run top to bottom. The first terminal action (`allow`, `deny`) wins,
-and a request no rule allows is denied.
+A policy is a list of allows plus denies that restrict them. Precedence, from
+highest:
+
+1. **Any matching `deny`.** A deny always wins, wherever it sits in the list.
+2. **Any matching `allow`.**
+3. **The default**: `default: deny` (the default) or `default: allow`.
+
+Rule order does not change the decision. It only orders effects, such as
+header changes, and makes tags set by one rule visible to the rules below it.
+
+**When a rule runs** follows from what it reads. Most rules read the request
+head (host, method, path, headers, metrics) and are decided before anything
+is forwarded. A rule that reads something that only arrives later, such as
+`body.bytes` as an upload streams, `response.status`, or the response body,
+keeps watching the exchange and stops it the moment it matches. Watching
+rules can only deny, since the request is already on its way. `roxy check`
+says which kind each rule is.
 
 ```yaml
+default: deny
+
 metrics:
   - id: github_writes
     count: requests
@@ -103,9 +122,9 @@ upstream:
   deny_lists: [blocked]                   # hard floor on every connect
 
 rules:
-  - id: no-writes-burst
-    when: metric.github_writes >= 30
-    then: { deny: { status: 429 } }
+  - id: github-reads
+    when: host under "github.com" and method in [GET, HEAD]
+    then: allow
 
   - id: openai
     when: host == "api.openai.com" and path starts_with "/v1/" and method == POST
@@ -113,9 +132,23 @@ rules:
       - set_header: { authorization: "Bearer ${secret:openai}" }   # agent never sees the key
       - allow
 
-  - id: github-reads
-    when: host under "github.com" and method in [GET, HEAD]
-    then: allow
+  - id: no-writes-burst                    # restricts the allows above
+    when: metric.github_writes >= 30
+    then: { deny: { status: 429 } }
+
+  - id: upload-cap                         # watches the body as it streams
+    when: host == "api.openai.com" and body.bytes > 10mb
+    then: { deny: { status: 413 } }
+```
+
+**Missing values are `null`.** An unsent header, `client.user` without proxy
+auth, and `body.size` for a chunked body are all `null`. `==`, `!=`, `in` and
+`not in` treat `null` as an ordinary value. Any other operator on `null`
+denies the request and names the field. Guard with `x != null and ...` when a
+value may be absent:
+
+```yaml
+when: body.size != null and body.size > 10mb
 ```
 
 Try a rule without sending traffic:
@@ -125,13 +158,13 @@ roxy rule test --config roxy.yaml GET https://api.github.com/repos/a/b
 roxy rule test --config roxy.yaml --metric github_writes=30 POST https://api.github.com/repos/a/b/issues
 ```
 
-The dry run exits 0 on allow and 3 on deny, and prints the matched rules,
-effects and decision. Metrics you do not pass default to 0. Passing
+The dry run exits 0 on allow and 3 on deny. It prints the matching rules, the
+effects and the decision. Metrics you do not pass default to 0, and
 `--metric id=unavailable` exercises the fail-closed path.
 
-The full language is in DESIGN.md §6. It covers operators (`== in under
-like matches starts_with`...), fields by phase, units (`10mb`, `1m`), CIDRs,
-`@list` membership, and every action.
+The full language is in DESIGN.md §6. That covers operators (`== in under like
+matches starts_with`...), every field and when it is known, units (`10mb`,
+`1m`), CIDRs, `@list` membership, and every action.
 
 ## Flow log
 
