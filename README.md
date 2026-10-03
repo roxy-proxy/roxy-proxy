@@ -359,6 +359,8 @@ cargo test --workspace            # unit, corpus, property and end-to-end tests
 | `crates/roxy-http` | canonical HTTP model, strict h1 codec, h2 mapping, URL normalisation |
 | `crates/roxy-rules` | rule DSL, policy evaluation, metric and state stores |
 
+Releases are cut by pushing a `vX.Y.Z` tag; see [RELEASING.md](RELEASING.md).
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or

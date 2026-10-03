@@ -1,0 +1,227 @@
+name: Release
+
+# Pushing a tag vX.Y.Z (equal to workspace.package.version) builds the
+# release binaries and publishes a GitHub release with them, SHA256SUMS and
+# build provenance. See RELEASING.md.
+#
+# workflow_dispatch, and pull requests that change the release build, are
+# dry runs: they build, check and upload every artifact but publish nothing.
+#
+# The Linux binaries are static musl builds from the Dockerfile's build
+# stage (the same build as the container image), each on a native runner.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Dockerfile
+      - .dockerignore
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          echo "workspace version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ]; then
+            if [ "$TAG" != "v$version" ]; then
+              echo "::error::tag $TAG does not match workspace.package.version $version (expected v$version)"
+              exit 1
+            fi
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dry run: nothing will be published"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  linux:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The image workflow's cache for the same platform: the build stage is
+      # identical, so this is usually a cache hit.
+      - name: Build (Dockerfile build stage)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: artifact
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=local,dest=out
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+
+      - name: Check the binary
+        run: |
+          file out/roxy
+          # Static (static-pie keeps ASLR): no program interpreter and no
+          # shared-library dependencies.
+          if readelf -l out/roxy | grep -q INTERP; then
+            echo "::error::out/roxy has a program interpreter (dynamically linked)"
+            exit 1
+          fi
+          if readelf -d out/roxy | grep -q NEEDED; then
+            echo "::error::out/roxy needs shared libraries"
+            readelf -d out/roxy | grep NEEDED
+            exit 1
+          fi
+          ldd out/roxy || true
+          got=$(out/roxy --version)
+          echo "$got"
+          test "$got" = "roxy $VERSION"
+
+      - name: Package
+        run: |
+          name="roxy-$VERSION-$TARGET"
+          mkdir -p "dist/$name"
+          install -m 0755 out/roxy "dist/$name/roxy"
+          cp LICENSE-MIT LICENSE-APACHE README.md "dist/$name/"
+          tar -C dist --owner=0 --group=0 --numeric-owner -czf "dist/$name.tar.gz" "$name"
+          tar -tzvf "dist/$name.tar.gz"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: roxy-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  macos:
+    needs: version
+    runs-on: macos-15
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TARGET: aarch64-apple-darwin
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+      # The toolchain of the Dockerfile's build image (rust:1.99-alpine), so
+      # every release binary comes from the same compiler. It overrides
+      # rust-toolchain.toml's "stable", which on a runner can be an older
+      # preinstalled toolchain.
+      RUSTUP_TOOLCHAIN: 1.99.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Same as the Linux build: cargo-auditable records the dependency list.
+      - name: Build
+        run: |
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustc --version
+          cargo install --locked cargo-auditable@0.7.7
+          cargo auditable build --release --locked -p roxy --target "$TARGET"
+
+      - name: Check the binary
+        run: |
+          file "target/$TARGET/release/roxy"
+          otool -L "target/$TARGET/release/roxy"
+          got=$("target/$TARGET/release/roxy" --version)
+          echo "$got"
+          test "$got" = "roxy $VERSION"
+
+      - name: Package
+        run: |
+          name="roxy-$VERSION-$TARGET"
+          mkdir -p "dist/$name"
+          install -m 0755 "target/$TARGET/release/roxy" "dist/$name/roxy"
+          cp LICENSE-MIT LICENSE-APACHE README.md "dist/$name/"
+          tar -C dist --uid 0 --gid 0 --uname root --gname root -czf "dist/$name.tar.gz" "$name"
+          tar -tzvf "dist/$name.tar.gz"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: roxy-aarch64-apple-darwin
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # Collects every tarball and writes SHA256SUMS. Runs on dry runs too, so
+  # the full release set can be inspected before tagging.
+  assemble:
+    needs: [linux, macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          pattern: roxy-*
+          merge-multiple: true
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 3
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [version, assemble]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the release
+      id-token: write # sign the provenance
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+          path: dist
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          prerelease=()
+          case "$VERSION" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --verify-tag --generate-notes --title "roxy $VERSION" "${prerelease[@]}"
