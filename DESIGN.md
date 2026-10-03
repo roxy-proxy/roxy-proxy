@@ -544,6 +544,7 @@ addons:
   - name: pii-scan
     path: /etc/roxy/addons/pii_scan.wasm
     hooks: [request, response]
+    stage: before_rules          # before_rules | in_chain | after_rules
     config: { threshold: 0.8 }
     capabilities: [state, log]
 ```
@@ -605,6 +606,7 @@ Fields by phase (type in brackets):
 | `response.status`, `response.header["name"]`, `response.body.*` | | | | ✓ | |
 | `ws.direction` (`c2s`/`s2c`), `ws.opcode`, `ws.size`, `ws.text` | | | | | ✓ |
 | `metric.<id>` | int | ✓ | ✓ | ✓ | ✓ |
+| `@<list>` (literal, not a field) | address list, usable on the right of `in` / `not in` with any ip-typed field | ✓ | ✓ | ✓ | ✓ |
 | `state["key"]` | string (set by `set_state`) | ✓ | ✓ | ✓ | ✓ |
 | `tag["name"]` | bool (set by `tag` earlier in the chain) | ✓ | ✓ | ✓ | ✓ |
 
@@ -719,16 +721,63 @@ network I/O. Essential for operators and for golden tests.
 - **DNS:** roxy resolves with `hickory-resolver` (system config or explicit
   servers). Results cached with TTL capped by `upstream.dns.cache_ttl_cap`.
   The agent's own DNS is irrelevant in proxy mode.
-- **SSRF policy:** after resolution, every candidate IP is checked against the
-  deny set (`deny_private_ranges`, plus `upstream.deny_cidrs`,
-  `upstream.allow_cidrs`). This check is on the resolved IP, not the name, so
-  rebinding does not help. A rule can opt a flow into private destinations
-  with `allow: { private_ok: true }`.
+- **Address policy (hard floor, §7.1):** after resolution, every candidate IP
+  is checked against the built-in private-range set and every configured
+  address denylist. This check is on the resolved IP, not the name, so
+  rebinding does not help; IP-literal hosts go through the same check. A rule
+  can opt a flow into private destinations with `allow: { private_ok: true }`;
+  nothing can opt out of a denylist.
 - **TLS to upstream:** rustls with bundled `webpki-roots` plus
   `tls.upstream.extra_roots`. Verification is always on. SNI is the canonical
   host. ALPN `h2, http/1.1`. Minimum TLS 1.2.
 - **Pool:** hyper client pool keyed by `(scheme, host, port, resolved ip)`.
-  `redirect` actions change the key.
+  `redirect` actions change the key. The pool is flushed when an address list
+  or the address policy changes on reload, so a pooled connection to a newly
+  denied IP is never reused.
+
+### 7.1 Address denylists (M2)
+
+An MVP requirement: operators must be able to feed roxy large lists of CIDR
+ranges (threat-intel feeds, cloud metadata ranges, whole countries) that it
+will refuse to connect to, with the same visibility as any other decision.
+
+```yaml
+address_lists:
+  - name: blocked
+    file: /etc/roxy/lists/blocked.txt    # one IPv4/IPv6 CIDR or address per line; `#` comments; blank lines ok
+  - name: cloud-metadata
+    inline: [169.254.169.254/32, "fd00:ec2::254/128", 100.100.100.200/32]
+
+upstream:
+  deny_private_ranges: true
+  deny_lists: [blocked, cloud-metadata]  # hard floor, checked on every connect
+```
+
+- **Representation:** each list compiles into a binary prefix trie (one for
+  v4, one for v6) so a lookup costs at most 32 or 128 node visits regardless
+  of list size. A million entries is tens of MiB and loads in well under a
+  second. IPv4-mapped IPv6 addresses are normalised to v4 before lookup.
+  Overlapping and duplicate entries are merged; a malformed line is a config
+  error naming the file and line.
+- **Enforcement:** `upstream.deny_lists` is applied in the connector after DNS
+  resolution and before every connect, independent of the rule chain. A hit
+  denies the flow with `403`, rule id `_address_policy`, and emits an
+  `upstream_denied` flow event with `list`, `matched_cidr`, `resolved_ip`,
+  and `host`. If *some* resolved addresses are denied and others are not,
+  the whole flow is denied (an attacker-controlled name must not get a second
+  roll of the dice).
+- **In the DSL:** `@name` is an address-list literal usable wherever a CIDR
+  is: `client.ip in @internal`, `dst.ip not in @blocked`. Referencing an
+  undefined list is a compile error. This lets the same lists gate client
+  identity in gateway mode or be combined with other predicates in rules,
+  while `upstream.deny_lists` stays the unconditional floor.
+- **Reload:** list files are watched alongside the config; a changed file is
+  recompiled and swapped atomically with the policy, and the upstream pool is
+  flushed. Metrics `roxy_address_list_entries{list}` and
+  `roxy_address_denied_total{list}` are exposed when the Prometheus endpoint
+  lands.
+- **`roxy check`** reports entry counts per list and
+  `roxy rule test` shows an address-policy hit for an IP-literal URL.
 - **Timeouts:** connect, TLS handshake, response header, body idle.
 - Upstream failures map to `502` (connect/TLS), `504` (timeout), `502` with
   reason `upstream_protocol_error` for canonicalisation failures. Each is a
@@ -882,10 +931,38 @@ Addons are WebAssembly **components** (not core modules) implementing the
 instantiated once per worker thread (component instances are not `Send`), so
 addon state is per-thread; shared state goes through the host `state` API.
 
-Addons run **after** the rule chain and only on flows the rules allowed (or
-when a rule explicitly `call`s them). They can **tighten** (deny, strip,
-rewrite, redirect) but cannot allow something the rules denied. This keeps
-the YAML rules as the floor of the policy, auditable without reading WASM.
+Addons are **in the path** of every flow. Each addon declares a `stage` per
+hook:
+
+| stage | when it runs | typical use |
+|---|---|---|
+| `before_rules` (default) | on every canonical request, before the rule chain | reshape traffic: rewrite, redirect to another upstream, call a helper service and substitute its output, deny early |
+| `in_chain` | when a rule's `call: <addon>` action is evaluated | precise ordering relative to specific rules |
+| `after_rules` | only on requests the rules allowed | enrichment, logging, last-mile mutation |
+
+Response hooks mirror this (`before_rules` sees every upstream response
+before response-phase rules; `after_rules` sees only those the rules let
+through).
+
+**Invariant: the rule chain always evaluates the final outgoing request.**
+Whatever an addon produces is re-validated by the canonical model (a header
+with CRLF, a path that climbs above root, an invalid host → the flow is
+denied with reason `addon_invalid_mutation`) and then evaluated by the rules
+exactly as if the agent had sent it. An addon can reshape traffic; it cannot
+bypass policy. The YAML rules remain the floor, auditable without reading
+WASM.
+
+**Sub-requests.** With the `http` capability an addon may call
+`fetch(request) -> response` from inside a hook (e.g. send the body to a
+redaction service and forward what comes back). Each sub-request is itself a
+flow: canonicalised, run through the connect/request/response rule chains
+with `client.user = "addon:<name>"` and tag `addon-subrequest`, subject to
+the address denylists (§7.1) and all limits, and logged like any other flow.
+A sub-request that the rules deny returns a `403` to the addon, which decides
+what to do. Sub-request depth is capped at 1 (an addon cannot trigger an
+addon). The hook's own deadline (§11.3) includes time spent in `fetch`, so
+this capability comes with a larger default timeout (`addons.fetch_timeout`,
+5 s).
 
 ### 11.2 WIT sketch
 
@@ -913,7 +990,8 @@ interface types {
     respond(synthetic-response),       // synthetic response without upstream (later milestone)
   }
   record request-patch { set-headers: list<header>, remove-headers: list<string>,
-                         path: option<string>, query: option<string>,
+                         method: option<string>, path: option<string>, query: option<string>,
+                         body: option<list<u8>>,          // replaces the body (bounded)
                          redirect: option<tuple<string, u16>> }
   record deny-info { status: u16, message: string }
   record synthetic-response { status: u16, headers: list<header>, body: list<u8> }
@@ -928,6 +1006,7 @@ interface host {
   state-set: func(key: string, value: string, ttl-ms: option<u64>);
   metric-get: func(id: string, key: list<string>) -> option<u64>;
   secret-get: func(name: string) -> option<string>;   // only if capability granted
+  fetch: func(req: sub-request) -> result<sub-response, fetch-error>;  // `http` capability; see §11.1
   config: func() -> string;                            // addon's JSON config blob
 }
 
@@ -948,7 +1027,7 @@ a later extension of the world.
 
 ### 11.3 Safety
 
-- **Capabilities** declared in config (`capabilities: [state, log, secrets]`);
+- **Capabilities** declared in config (`capabilities: [state, log, secrets, http]`);
   host functions not granted trap → the flow is denied and `addon_error` logged.
 - **Fuel** per hook call (`addons.fuel_per_call`) and **epoch deadline**
   (`addons.timeout`, default 50 ms) — exceeding either denies the flow.
@@ -1069,7 +1148,7 @@ be built by separate agents in parallel because `roxy-http`, `roxy-tls` and
 |---|---|---|
 | M0 | Workspace, CI, config schema + `roxy check`, CA generation + `roxy ca export`, tracing + FlowSink skeleton | — |
 | M1 | **Usable MVP in explicit mode.** Strict h1 codec + canonical model + normaliser (`roxy-http`); leaf minting + rustls configs + ClientHello sniffer (`roxy-tls`); DSL + stateless rules + actions `allow/deny/set_header/remove_header/tag/log` (`roxy-rules`); then `roxy-proxy` wiring: CONNECT → MITM → request phase → hyper upstream (h1/h2 by ALPN) → response phase → JSONL log. WebSocket relay tier. Secrets + `${secret:}` injection. Default deny. Smuggling corpus passing. Then E: client-side HTTP/2 via `h2` with the shared validator. | A: `roxy-http`, B: `roxy-tls`, C: `roxy-rules`, then D: `roxy-proxy`, then E: h2 |
-| M2 | Metrics + state store, response-phase rules, `redirect`, `rewrite_path`, query actions, hot reload, `roxy rule test`, SSRF policy, proxy auth, `roxy.internal` CA endpoint | metrics (A) ∥ reload+CLI (B) ∥ connector policy (C) |
+| M2 | Metrics + state store, response-phase rules, `redirect`, `rewrite_path`, query actions, hot reload, `roxy rule test`, address policy + denylists (§7.1) with `@list` DSL literals, proxy auth, `roxy.internal` CA endpoint | metrics (A) ∥ reload+CLI (B) ∥ connector policy + lists (C) |
 | M3 | WebSocket inspect tier (frame codec, `ws` phase); RFC 8441 WebSocket-over-h2 if wanted | — |
 | M4 | WASM host (`roxy-wasm`), WIT package, `roxy-addon` SDK, example Rust + Python addons, capability/fuel/timeout enforcement | host (A) ∥ SDK+examples (B) |
 | M5 | Hardening: fuzz CI, limits audit, body capture, Prometheus endpoint, file log rotation | independent items |
@@ -1083,7 +1162,7 @@ be built by separate agents in parallel because `roxy-http`, `roxy-tls` and
 |---|---|---|
 | 1 | Transparent-mode upstream target (§4.2) | `resolve`; decide when transparent mode is built |
 | 2 | Rule evaluation: first terminal action wins, chain exhausted → deny (§6.1) | as stated |
-| 3 | Addons can only tighten, never loosen (§11.1) | as stated |
+| 3 | Addons run in-path at a configurable stage; rules always evaluate the final request (§11.1) | as stated |
 | 4 | Deny response body includes rule id and flow id (§5.7) | yes, informative 403 by default |
 | 5 | Size units 1024-based (§6.2) | yes |
 | 6 | Licence and crate name on crates.io | MIT OR Apache-2.0; `roxy` availability to be checked |
