@@ -359,6 +359,9 @@ cargo test --workspace            # unit, corpus, property and end-to-end tests
 | `crates/roxy-http` | canonical HTTP model, strict h1 codec, h2 mapping, URL normalisation |
 | `crates/roxy-rules` | rule DSL, policy evaluation, metric and state stores |
 
+Fuzz targets for the parsers and the rule engine live in `fuzz/` (nightly,
+cargo-fuzz; see [fuzz/README.md](fuzz/README.md)).
+
 Releases are cut by pushing a `vX.Y.Z` tag; see [RELEASING.md](RELEASING.md).
 
 ## License

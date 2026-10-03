@@ -1,0 +1,79 @@
+# Fuzz targets (cargo-fuzz / libFuzzer). Needs a nightly toolchain:
+#   cargo +nightly fuzz run h1_request
+# Its own workspace, so the main workspace (stable CI, cargo deny) never
+# sees libfuzzer-sys or nightly-only flags. See README.md.
+[package]
+name = "roxy-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+arbitrary = { version = "1.4", features = ["derive"] }
+bytes = "1.12.1"
+http = "1.5.0"
+ipnet = "2"
+libfuzzer-sys = "0.4"
+roxy-http = { path = "../crates/roxy-http" }
+roxy-rules = { path = "../crates/roxy-rules" }
+roxy-tls = { path = "../crates/roxy-tls" }
+serde_json = "1.0.151"
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "h1_request"
+path = "fuzz_targets/h1_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h1_chunked"
+path = "fuzz_targets/h1_chunked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2map"
+path = "fuzz_targets/h2map.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "url"
+path = "fuzz_targets/url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_hello"
+path = "fuzz_targets/client_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rule_compile"
+path = "fuzz_targets/rule_compile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rule_eval"
+path = "fuzz_targets/rule_eval.rs"
+test = false
+doc = false
+bench = false
