@@ -169,9 +169,10 @@ flow (DESIGN.md §11).
   sockets or environment. Write them in Rust with the
   [`roxy-addon`](crates/roxy-addon) SDK, or in any language that targets
   the WebAssembly component model, against [`wit/addon.wit`](wit/addon.wit).
-- **Service layers** stream the exchange through an external HTTP service,
-  for logic in any language that is easier to run out of process (DESIGN.md
-  §11.6).
+- **Service layers** put an external service in the network path: each
+  exchange streams through it over a WebSocket, request and response, and
+  it can change, hold back, answer or refuse either. For logic in any
+  language that is easier to run out of process (DESIGN.md §11.6).
 
 For example, [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel)
 monitors and control protocols can run at the boundary to supervise AI
@@ -453,11 +454,11 @@ Usable in explicit proxy mode. Built and tested:
   observe mode, with named endpoints, keyed state, audit records,
   CPU/memory/time budgets, and WebSocket tunnels. Write them
   with the [`roxy-addon`](crates/roxy-addon) SDK.
+- Service layers (§11.6): an external service in the network path, one
+  WebSocket per exchange (`roxy.layer.v1`), in enforce or observe mode.
 
 Deferred, with designs in DESIGN.md:
 
-- Service layers (`kind: service`, §11.6). `roxy run` refuses them for
-  now.
 - Transparent mode (§4.2).
 - WebSocket message rules (§8.2). Byte budgets already apply to WebSockets.
 - A Prometheus endpoint.
