@@ -107,6 +107,9 @@ pub(crate) struct Shared {
     /// Offer ALPN `h2` in terminated tunnels.
     pub enable_h2: bool,
     pub connection_events: bool,
+    /// `log.flow.ws_message_every`: log every Nth checked WebSocket message
+    /// (0: only denied ones).
+    pub ws_message_every: u64,
     pub pipeline: Pipeline,
     /// Each addon's keyed store, by addon name; survives reloads.
     pub layer_state: crate::addons::store::LayerStates,
@@ -276,6 +279,7 @@ impl Server {
             require_sni_match: cfg.require_sni_match,
             enable_h2: cfg.enable_h2,
             connection_events: cfg.connection_events,
+            ws_message_every: cfg.ws_message_every,
             pipeline: Pipeline::builtin(),
             layer_state: crate::addons::store::LayerStates::default(),
             caps: Arc::new(ConnCaps {

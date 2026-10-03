@@ -112,6 +112,18 @@ pub fn validate_upgrade_response(res: &CanonicalResponse, key: &WsKey) -> Result
     Ok(())
 }
 
+/// For a WebSocket whose messages are checked, where no extension was
+/// offered: the `101` must not accept one (RFC 6455 §9.1).
+pub fn validate_no_extensions(res: &CanonicalResponse) -> Result<(), ParseError> {
+    if res.headers.get("sec-websocket-extensions").is_some() {
+        return reject(
+            Reason::WsBadHandshake,
+            "101 accepts an extension that was not offered",
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +204,12 @@ mod tests {
         let mut res2 = CanonicalResponse::new(StatusCode::OK);
         res2.meta.upgrade = Some("websocket".into());
         assert!(validate_upgrade_response(&res2, &key).is_err());
+
+        validate_no_extensions(&res).unwrap();
+        res.headers
+            .insert("sec-websocket-extensions", "permessage-deflate")
+            .unwrap();
+        assert!(validate_no_extensions(&res).is_err());
 
         let mut res3 = CanonicalResponse::new(StatusCode::SWITCHING_PROTOCOLS);
         res3.headers

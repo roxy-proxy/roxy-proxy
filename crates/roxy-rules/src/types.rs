@@ -109,7 +109,7 @@ impl Reads {
     pub const RESPONSE_BODY_BYTES: Reads = Reads(1 << 2);
     /// `response.body.text` (buffered before the response head is sent).
     pub const RESPONSE_BODY_TEXT: Reads = Reads(1 << 3);
-    /// `ws.*` (per WebSocket message; the codec is not in this build).
+    /// `ws.*` (per WebSocket message).
     pub const WS: Reads = Reads(1 << 4);
     /// A metric counting `request_bytes`, which this exchange adds to as
     /// the request body (or WebSocket client bytes) stream.

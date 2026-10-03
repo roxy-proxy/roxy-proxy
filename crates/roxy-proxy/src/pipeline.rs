@@ -392,6 +392,7 @@ impl FlowCx {
                 response: None,
                 request_body_bytes: None,
                 response_body_bytes: None,
+                ws: None,
             },
             opts: AllowOpts::default(),
             record: FlowRecord::default(),

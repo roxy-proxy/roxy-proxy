@@ -48,6 +48,8 @@ pub struct RuntimeConfig {
     pub max_connections_per_client: usize,
     /// `log.flow.connection_events`.
     pub connection_events: bool,
+    /// `log.flow.ws_message_every`.
+    pub ws_message_every: u64,
     pub sink: Arc<dyn FlowSink>,
     /// Body capture / traffic tee (docs/flow-log.md#capture); `None` = capture disabled.
     pub capture: Option<Arc<crate::capture::CaptureLog>>,

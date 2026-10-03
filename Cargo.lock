@@ -2569,6 +2569,7 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "proptest",
+ "ring",
  "roxy-http",
  "roxy-log",
  "roxy-rules",

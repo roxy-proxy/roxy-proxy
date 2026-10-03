@@ -1805,6 +1805,289 @@ async fn websocket_byte_budget_closes_the_relay() {
     h.stop().await;
 }
 
+// ----- WebSocket message rules (docs/websockets.md#message-rules) ---------
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
+
+const WS_ALLOW: &str = r#"
+  - id: ws
+    when: host == "ws.test"
+    then: { allow: { upgrade: websocket, private_ok: true } }
+"#;
+
+/// Opens `wss://ws.test/echo` through roxy, offering `extensions` if given.
+async fn open_ws(h: &Harness, extensions: Option<&str>) -> Ws {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    let port = h.upstream.ws.port();
+    let tls = h
+        .tls_tunnel(&format!("ws.test:{port}"), "ws.test")
+        .await
+        .unwrap();
+    let mut req = format!("wss://ws.test:{port}/echo")
+        .into_client_request()
+        .unwrap();
+    if let Some(e) = extensions {
+        req.headers_mut()
+            .insert("sec-websocket-extensions", e.parse().unwrap());
+    }
+    let (ws, resp) = tokio_tungstenite::client_async(req, tls).await.unwrap();
+    assert_eq!(resp.status(), 101);
+    ws
+}
+
+/// Reads until the close frame roxy sends; returns its code. Data messages
+/// before it are returned too.
+async fn read_to_close(ws: &mut Ws) -> (Vec<Message>, Option<u16>) {
+    let mut got = Vec::new();
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("the WebSocket did not close");
+        match next {
+            Some(Ok(Message::Close(c))) => return (got, c.map(|c| u16::from(c.code))),
+            Some(Ok(m)) => got.push(m),
+            Some(Err(_)) | None => return (got, None),
+        }
+    }
+}
+
+async fn echo(ws: &mut Ws, m: Message) -> Message {
+    ws.send(m).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), ws.next())
+        .await
+        .expect("no echo")
+        .unwrap()
+        .unwrap()
+}
+
+/// A text rule denies one message: it never reaches the upstream, both
+/// sides get a 1008 close, and the flow log names the rule.
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_text_rule_denies_a_message() {
+    let rules = format!(
+        r#"{WS_ALLOW}
+  - id: no-secrets
+    when: ws.direction == "c2s" and ws.opcode == 1 and ws.text contains "secret"
+    then: deny
+"#
+    );
+    let h = Harness::start(&rules).await;
+    let mut ws = open_ws(&h, None).await;
+    let back = echo(&mut ws, Message::text("hello")).await;
+    assert_eq!(back.into_text().unwrap().as_str(), "hello");
+    // Binary messages have no `ws.text`: the rule does not match them.
+    let back = echo(&mut ws, Message::binary(b"secret".to_vec())).await;
+    assert_eq!(back.into_data().as_ref(), b"secret");
+    ws.send(Message::text("the secret is 42")).await.unwrap();
+    let (got, code) = read_to_close(&mut ws).await;
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(code, Some(1008));
+    let msg = h.wait_events("ws_message", 1).await;
+    assert_eq!(msg[0]["decision"], "deny");
+    assert_eq!(msg[0]["direction"], "c2s");
+    assert_eq!(msg[0]["opcode"], 1);
+    assert_eq!(msg[0]["size"], 16);
+    assert_eq!(msg[0]["rules"][0], "no-secrets");
+    let close = h.wait_events("ws_close", 1).await;
+    assert_eq!(close[0]["close_code"], 1008);
+    let ev = h.wait_events("request", 1).await;
+    assert_eq!(ev[0]["decision"], "deny");
+    assert_eq!(ev[0]["stage"], "websocket");
+    assert_eq!(ev[0]["terminal_rule"], "no-secrets");
+    assert_eq!(
+        h.upstream.ws_received(),
+        vec![b"hello".to_vec(), b"secret".to_vec()]
+    );
+    h.stop().await;
+}
+
+/// Opcode and size rules, here on what the upstream sends back.
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_opcode_and_size_rules() {
+    let rules = format!(
+        r#"{WS_ALLOW}
+  - id: no-binary-down
+    when: ws.direction == "s2c" and ws.opcode == 2
+    then: deny
+  - id: small-up
+    when: ws.direction == "c2s" and ws.size > 1kb
+    then: deny
+"#
+    );
+    let h = Harness::start(&rules).await;
+    let mut ws = open_ws(&h, None).await;
+    let back = echo(&mut ws, Message::text("x".repeat(1024))).await;
+    assert_eq!(back.into_text().unwrap().len(), 1024);
+    // The upstream gets the binary message; its echo is denied.
+    ws.send(Message::binary(vec![1, 2, 3])).await.unwrap();
+    let (got, code) = read_to_close(&mut ws).await;
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(code, Some(1008));
+    assert_eq!(h.upstream.ws_received().len(), 2);
+    let msg = h.wait_events("ws_message", 1).await;
+    assert_eq!(msg[0]["direction"], "s2c");
+    assert_eq!(msg[0]["rules"][0], "no-binary-down");
+
+    let mut ws = open_ws(&h, None).await;
+    ws.send(Message::text("x".repeat(1025))).await.unwrap();
+    let (_, code) = read_to_close(&mut ws).await;
+    assert_eq!(code, Some(1008));
+    assert_eq!(h.upstream.ws_received().len(), 2);
+    h.stop().await;
+}
+
+/// A fragmented message is checked whole, and re-sent as one frame.
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_fragmented_message_is_checked_whole() {
+    use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+    let rules = format!(
+        r#"{WS_ALLOW}
+  - id: no-hello-world
+    when: ws.text == "hello world"
+    then: deny
+"#
+    );
+    let h = Harness::start(&rules).await;
+    let mut ws = open_ws(&h, None).await;
+    let frag = |data: &str, op, fin| Message::Frame(Frame::message(data.to_owned(), op, fin));
+    ws.feed(frag("hello", OpCode::Data(Data::Text), false))
+        .await
+        .unwrap();
+    ws.feed(frag(" there", OpCode::Data(Data::Continue), true))
+        .await
+        .unwrap();
+    ws.flush().await.unwrap();
+    let back = ws.next().await.unwrap().unwrap();
+    assert_eq!(back.into_text().unwrap().as_str(), "hello there");
+    ws.feed(frag("hello", OpCode::Data(Data::Text), false))
+        .await
+        .unwrap();
+    ws.feed(frag(" ", OpCode::Data(Data::Continue), false))
+        .await
+        .unwrap();
+    ws.feed(frag("world", OpCode::Data(Data::Continue), true))
+        .await
+        .unwrap();
+    ws.flush().await.unwrap();
+    let (got, code) = read_to_close(&mut ws).await;
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(code, Some(1008));
+    assert_eq!(h.upstream.ws_received(), vec![b"hello there".to_vec()]);
+    h.stop().await;
+}
+
+/// A message over `limits.max_ws_message_bytes` closes both sides with
+/// 1009; invalid UTF-8 in a text message with 1007.
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_protocol_limits() {
+    use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
+    let rules = format!(
+        r"{WS_ALLOW}
+  - id: no-binary
+    when: ws.opcode == 2
+    then: deny
+"
+    );
+    let h = Harness::start_with(Opts {
+        rules: &rules,
+        limits: "max_ws_message_bytes: 1kb\n",
+        ..Opts::default()
+    })
+    .await;
+    let mut ws = open_ws(&h, None).await;
+    let back = echo(&mut ws, Message::text("y".repeat(1024))).await;
+    assert_eq!(back.into_text().unwrap().len(), 1024);
+    ws.send(Message::text("y".repeat(1025))).await.unwrap();
+    let (_, code) = read_to_close(&mut ws).await;
+    assert_eq!(code, Some(1009));
+    let close = h.wait_events("ws_close", 1).await;
+    assert_eq!(close[0]["close_code"], 1009);
+    assert_eq!(close[0]["close_reason"], "message too big");
+
+    let mut ws = open_ws(&h, None).await;
+    let bad = Frame::message(vec![0xc3, 0x28], OpCode::Data(Data::Text), true);
+    ws.send(Message::Frame(bad)).await.unwrap();
+    let (_, code) = read_to_close(&mut ws).await;
+    assert_eq!(code, Some(1007));
+    assert_eq!(h.upstream.ws_received().len(), 1);
+    h.stop().await;
+}
+
+/// Extensions are stripped from the offer only when rules read messages.
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_extensions_are_stripped_only_for_message_rules() {
+    let h = Harness::start(WS_ALLOW).await;
+    let mut ws = open_ws(&h, Some("permessage-deflate")).await;
+    let back = echo(&mut ws, Message::text("plain relay")).await;
+    assert_eq!(back.into_text().unwrap().as_str(), "plain relay");
+    let up = h.upstream.ws_upgrades();
+    assert!(
+        up[0]
+            .iter()
+            .any(|(n, v)| n == "sec-websocket-extensions" && v == "permessage-deflate"),
+        "{up:?}"
+    );
+    h.stop().await;
+
+    let rules = format!(
+        r"{WS_ALLOW}
+  - id: no-binary
+    when: ws.opcode == 2
+    then: deny
+"
+    );
+    let h = Harness::start(&rules).await;
+    let mut ws = open_ws(&h, Some("permessage-deflate")).await;
+    let back = echo(&mut ws, Message::text("parsed relay")).await;
+    assert_eq!(back.into_text().unwrap().as_str(), "parsed relay");
+    let up = h.upstream.ws_upgrades();
+    assert!(
+        !up[0].iter().any(|(n, _)| n == "sec-websocket-extensions"),
+        "{up:?}"
+    );
+    h.stop().await;
+}
+
+/// `log.flow.ws_message_every` samples allowed messages; a clean close
+/// handshake passes through the message relay.
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_messages_are_sampled_and_close_cleanly() {
+    let rules = format!(
+        r"{WS_ALLOW}
+  - id: no-binary
+    when: ws.opcode == 2
+    then: deny
+"
+    );
+    let h = Harness::start_with(Opts {
+        rules: &rules,
+        flow_log: "ws_message_every: 2\n",
+        ..Opts::default()
+    })
+    .await;
+    let mut ws = open_ws(&h, None).await;
+    for i in 0..3 {
+        let back = echo(&mut ws, Message::text(format!("m{i}"))).await;
+        assert_eq!(back.into_text().unwrap().as_str(), format!("m{i}"));
+    }
+    ws.close(None).await.unwrap();
+    let (_, code) = read_to_close(&mut ws).await;
+    assert_eq!(code, None, "the upstream's close carries no code");
+    let close = h.wait_events("ws_close", 1).await;
+    assert!(close[0].get("close_code").is_none(), "{close:?}");
+    // Messages 1, 3 and 5 of: m0 up, m0 down, m1 up, m1 down, m2 up, m2
+    // down, close up, close down.
+    let msgs = h.events("ws_message");
+    assert!(msgs.len() >= 3, "{msgs:?}");
+    assert!(msgs.iter().all(|m| m["decision"] == "allow"));
+    assert_eq!(msgs[0]["direction"], "c2s");
+    let ev = h.wait_events("request", 1).await;
+    assert_eq!(ev[0]["decision"], "allow");
+    h.stop().await;
+}
+
 // ----- audit backpressure (docs/flow-log.md#writing) -----------------------
 
 /// A flow log that cannot keep up holds traffic back instead of dropping
