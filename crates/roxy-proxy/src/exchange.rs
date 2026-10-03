@@ -21,7 +21,8 @@ use crate::flowlog::{DecisionKind, FlowEvent};
 use crate::io::{ConnIo, Io};
 use crate::listener::ClientConn;
 use crate::pipeline::{
-    FlowCx, Refusal, RefusalKind, ResponseVerdict, Verdict, run_request_stages, run_response_stages,
+    BodyIo, FlowCx, Refusal, RefusalKind, ResponseVerdict, Verdict, run_request_stages,
+    run_response_stages,
 };
 use crate::server::Shared;
 use crate::upstream::{ConnectError, classify, describe};
@@ -68,14 +69,9 @@ pub(crate) async fn respond(
     Some(conn)
 }
 
-/// Answers a flow locally and logs it.
-pub(crate) async fn refuse(
-    conn: ServerConn<ConnIo>,
-    handle: &ConnIo,
-    mut cx: FlowCx,
-    refusal: Refusal,
-    framing: ClientFraming,
-) -> Next {
+/// Records a local refusal on the flow and builds its response. Pair with
+/// [`finish_refusal`] once the response has been written.
+pub(crate) fn refusal_response(cx: &mut FlowCx, refusal: &Refusal) -> CanonicalResponse {
     match refusal.kind {
         RefusalKind::Deny => {
             cx.record.decision = Some(DecisionKind::Deny);
@@ -96,7 +92,11 @@ pub(crate) async fn refuse(
     cx.record.response_status = Some(refusal.status);
     cx.record.response_headers_bytes = res.headers.wire_len() as u64;
     cx.record.response_bytes = res.body.known_length().unwrap_or(0);
-    let next = respond(conn, handle, res, refusal.close, framing, b"").await;
+    res
+}
+
+/// Final accounting for a refusal whose response has been written.
+pub(crate) fn finish_refusal(cx: &FlowCx, refusal: &Refusal) {
     // After an allowed request (upstream failure, response-phase deny) the
     // response-phase sample is still due; request-phase denies were
     // recorded at their decision.
@@ -105,7 +105,29 @@ pub(crate) async fn refuse(
         cx.record_final_sample(upstream_error);
     }
     cx.emit_request_event();
+}
+
+/// Answers a flow locally and logs it.
+pub(crate) async fn refuse(
+    conn: ServerConn<ConnIo>,
+    handle: &ConnIo,
+    mut cx: FlowCx,
+    refusal: Refusal,
+    framing: ClientFraming,
+) -> Next {
+    let res = refusal_response(&mut cx, &refusal);
+    let next = respond(conn, handle, res, refusal.close, framing, b"").await;
+    finish_refusal(&cx, &refusal);
     next
+}
+
+/// Records a client-side failure (`status` is what the client was told, if
+/// anything) on the flow and emits its `request` event.
+pub(crate) fn record_client_failure(cx: &mut FlowCx, e: &ParseError, status: Option<u16>) {
+    cx.record.decision.get_or_insert(DecisionKind::Deny);
+    cx.record.reason = Some(e.reason.as_str().to_owned());
+    cx.record.response_status = status;
+    cx.emit_request_event();
 }
 
 /// The client body broke: answer with the parse error's status and close.
@@ -121,14 +143,82 @@ pub(crate) async fn close_on_parse_error(
         .respond_error_and_close(e.reason.suggested_status(), &e.reason)
         .await;
     if let Some(cx) = cx.as_mut() {
-        cx.record.decision.get_or_insert(DecisionKind::Deny);
-        cx.record.reason = Some(e.reason.as_str().to_owned());
-        cx.record.response_status = Some(e.reason.suggested_status().as_u16());
-        cx.emit_request_event();
+        record_client_failure(cx, e, Some(e.reason.suggested_status().as_u16()));
     }
 }
 
-/// Runs one exchange.
+/// The client side of an exchange, as the transport-agnostic core sees it:
+/// body access for inspecting stages ([`BodyIo`]) plus a way to wait for
+/// the upstream while the client's request body keeps flowing.
+pub(crate) trait Front: BodyIo {
+    /// Runs `fut` (the upstream request) while the client's request body
+    /// keeps flowing into it, answering `100 Continue` first if the client
+    /// waits for it. `Err` means the client side broke (body invalid, too
+    /// large, stalled, client gone): `fut` is dropped and the flow must not
+    /// be answered as if it had been forwarded.
+    fn drive<F>(
+        &mut self,
+        fut: F,
+    ) -> impl std::future::Future<Output = Result<F::Output, ParseError>> + Send
+    where
+        F: std::future::Future + Send,
+        F::Output: Send;
+}
+
+impl Front for ServerConn<ConnIo> {
+    fn drive<F>(
+        &mut self,
+        fut: F,
+    ) -> impl std::future::Future<Output = Result<F::Output, ParseError>> + Send
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
+        ServerConn::drive(self, fut)
+    }
+}
+
+/// What the transport-agnostic core decided. Each front end (h1 codec, h2
+/// stream) turns this into wire actions. Nothing here forwards: the
+/// upstream exchange has already happened (or was refused) by the time an
+/// outcome exists.
+pub(crate) enum Outcome {
+    /// Send this response (from the upstream, after the response stages).
+    Respond(CanonicalResponse),
+    /// Answer locally (deny, fail-closed, upstream error).
+    Refuse(Refusal),
+    /// The client side broke: close (h1) or reset the stream (h2).
+    Close(ParseError),
+    /// An allowed WebSocket upgrade got its `101` (h1 only).
+    Upgrade {
+        res: CanonicalResponse,
+        on: hyper::upgrade::OnUpgrade,
+        key: WsKey,
+    },
+}
+
+/// The transport-agnostic exchange: request stages → upstream → response
+/// stages. `cx` carries the flow record; the caller writes the outcome and
+/// emits the flow's `request` event.
+pub(crate) async fn process<F: Front>(
+    front: &mut F,
+    cx: &mut FlowCx,
+    req: CanonicalRequest,
+) -> Outcome {
+    let shared = cx.shared.clone();
+    let verdict = run_request_stages(&shared.pipeline, cx, req, front).await;
+    // Exhaustive, no wildcard: only `Continue` reaches the upstream.
+    match verdict {
+        Verdict::Continue(req) => {
+            cx.record.decision = Some(DecisionKind::Allow);
+            forward(front, cx, req).await
+        }
+        Verdict::Deny(refusal) => Outcome::Refuse(refusal),
+        Verdict::Close(e) => Outcome::Close(e),
+    }
+}
+
+/// Runs one exchange on the h1 codec.
 pub(crate) async fn run(
     mut conn: ServerConn<ConnIo>,
     handle: &ConnIo,
@@ -143,18 +233,16 @@ pub(crate) async fn run(
         close: req.meta.close,
     };
     let mut cx = FlowCx::new(shared.clone(), snap, client, tls, &req, on_proxy_port);
-    let verdict = run_request_stages(&shared.pipeline, &mut cx, req, &mut conn).await;
-    // Exhaustive, no wildcard: only `Continue` reaches the upstream.
-    match verdict {
-        Verdict::Continue(req) => {
-            cx.record.decision = Some(DecisionKind::Allow);
-            forward(conn, handle, cx, req, framing).await
-        }
-        Verdict::Deny(refusal) => refuse(conn, handle, cx, refusal, framing).await,
-        Verdict::Close(e) => {
+    match process(&mut conn, &mut cx, req).await {
+        Outcome::Respond(res) => send_response(conn, cx, res).await,
+        Outcome::Refuse(refusal) => refuse(conn, handle, cx, refusal, framing).await,
+        Outcome::Close(e) => {
             let client = cx.facts.client.clone();
             close_on_parse_error(conn, Some(cx), &client, shared, &e).await;
             None
+        }
+        Outcome::Upgrade { res, on, key } => {
+            splice_websocket(conn, handle, cx, res, on, &key, framing).await
         }
     }
 }
@@ -218,13 +306,7 @@ enum Upstreamed {
 }
 
 #[allow(clippy::too_many_lines)] // one linear flow; splitting it obscures the order
-async fn forward(
-    mut conn: ServerConn<ConnIo>,
-    handle: &ConnIo,
-    mut cx: FlowCx,
-    mut req: CanonicalRequest,
-    framing: ClientFraming,
-) -> Next {
+async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalRequest) -> Outcome {
     let host = host_text(&req.authority.host);
     let port = req.authority.port;
     let private_ok = cx.opts.private_ok;
@@ -249,8 +331,7 @@ async fn forward(
     }
     let upstream_client = cx.snap.upstream.clone();
     if let Err(e) = upstream_client.preflight(&req.authority, private_ok).await {
-        let r = upstream_refusal(&cx, &e, &host, port);
-        return refuse(conn, handle, cx, r, framing).await;
+        return Outcome::Refuse(upstream_refusal(cx, &e, &host, port));
     }
     let limits = cx.snap.limits.clone();
     let t0 = Instant::now();
@@ -259,11 +340,10 @@ async fn forward(
         let key = match validate_upgrade_request(&req) {
             Ok(k) => k,
             Err(e) => {
-                let r = Refusal {
+                return Outcome::Refuse(Refusal {
                     reason: Some(e.reason.as_str().to_owned()),
                     ..Refusal::deny(400, "invalid websocket upgrade", "_websocket", true)
-                };
-                return refuse(conn, handle, cx, r, framing).await;
+                });
             }
         };
         let scheme = req.scheme;
@@ -271,11 +351,10 @@ async fn forward(
         let mut http_req = match to_upstream_upgrade_request(req, UriForm::Origin) {
             Ok(r) => r,
             Err(e) => {
-                let r = protocol_refusal(&cx, &host, port, e.to_string());
-                return refuse(conn, handle, cx, r, framing).await;
+                return Outcome::Refuse(protocol_refusal(cx, &host, port, e.to_string()));
             }
         };
-        set_host_override(&cx, &mut http_req);
+        set_host_override(cx, &mut http_req);
         let attempt = async {
             let io = upstream_client
                 .connect_h1(scheme, &authority, private_ok)
@@ -297,21 +376,23 @@ async fn forward(
         };
         match tokio::time::timeout(limits.response_header_timeout, attempt).await {
             Err(_) => {
-                let r = upstream_refusal(
-                    &cx,
+                return Outcome::Refuse(upstream_refusal(
+                    cx,
                     &ConnectError::Timeout("upstream response headers"),
                     &host,
                     port,
-                );
-                return refuse(conn, handle, cx, r, framing).await;
+                ));
             }
             Ok(Err(Some(e))) => {
-                let r = upstream_refusal(&cx, &e, &host, port);
-                return refuse(conn, handle, cx, r, framing).await;
+                return Outcome::Refuse(upstream_refusal(cx, &e, &host, port));
             }
             Ok(Err(None)) => {
-                let r = protocol_refusal(&cx, &host, port, "upgrade request failed".into());
-                return refuse(conn, handle, cx, r, framing).await;
+                return Outcome::Refuse(protocol_refusal(
+                    cx,
+                    &host,
+                    port,
+                    "upgrade request failed".into(),
+                ));
             }
             Ok(Ok(res)) if res.status() == http::StatusCode::SWITCHING_PROTOCOLS => {
                 Upstreamed::Upgrade { res, key }
@@ -324,39 +405,31 @@ async fn forward(
         let mut http_req = match to_upstream_request(req, UriForm::Absolute) {
             Ok(r) => r,
             Err(e) => {
-                let r = protocol_refusal(&cx, &host, port, e.to_string());
-                return refuse(conn, handle, cx, r, framing).await;
+                return Outcome::Refuse(protocol_refusal(cx, &host, port, e.to_string()));
             }
         };
-        set_host_override(&cx, &mut http_req);
+        set_host_override(cx, &mut http_req);
         let fut = tokio::time::timeout(
             limits.response_header_timeout,
             upstream_client.client(private_ok).request(http_req),
         );
-        let driven = conn.drive(fut).await;
+        let driven = front.drive(fut).await;
         cx.record.request_bytes = req_counter.load(Ordering::Relaxed);
         match driven {
-            Err(e) => {
-                let client = cx.facts.client.clone();
-                let shared = cx.shared.clone();
-                close_on_parse_error(conn, Some(cx), &client, &shared, &e).await;
-                return None;
-            }
+            Err(e) => return Outcome::Close(e),
             Ok(Err(_elapsed)) => {
-                let r = upstream_refusal(
-                    &cx,
+                return Outcome::Refuse(upstream_refusal(
+                    cx,
                     &ConnectError::Timeout("upstream response headers"),
                     &host,
                     port,
-                );
-                return refuse(conn, handle, cx, r, framing).await;
+                ));
             }
             Ok(Ok(Err(e))) => {
-                let r = match classify(&e) {
-                    Some(ce) => upstream_refusal(&cx, &ce, &host, port),
-                    None => protocol_refusal(&cx, &host, port, describe(&e)),
-                };
-                return refuse(conn, handle, cx, r, framing).await;
+                return Outcome::Refuse(match classify(&e) {
+                    Some(ce) => upstream_refusal(cx, &ce, &host, port),
+                    None => protocol_refusal(cx, &host, port, describe(&e)),
+                });
             }
             Ok(Ok(Ok(res))) => Upstreamed::Response(res),
         }
@@ -372,19 +445,14 @@ async fn forward(
     };
     let res = from_upstream_response(res, &limits);
     let shared = cx.shared.clone();
-    let verdict = run_response_stages(&shared.pipeline, &mut cx, res, &mut conn).await;
+    let verdict = run_response_stages(&shared.pipeline, cx, res, front).await;
     match verdict {
         ResponseVerdict::Continue(res) => match upgrade {
-            Some((on, key)) => splice_websocket(conn, handle, cx, res, on, &key, framing).await,
-            None => send_response(conn, cx, res).await,
+            Some((on, key)) => Outcome::Upgrade { res, on, key },
+            None => Outcome::Respond(res),
         },
-        ResponseVerdict::Deny(r) => refuse(conn, handle, cx, r, framing).await,
-        ResponseVerdict::Close(e) => {
-            let client = cx.facts.client.clone();
-            let shared = cx.shared.clone();
-            close_on_parse_error(conn, Some(cx), &client, &shared, &e).await;
-            None
-        }
+        ResponseVerdict::Deny(r) => Outcome::Refuse(r),
+        ResponseVerdict::Close(e) => Outcome::Close(e),
     }
 }
 
