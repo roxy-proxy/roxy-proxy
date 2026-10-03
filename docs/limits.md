@@ -1,0 +1,83 @@
+# Resource limits
+
+Containment takes priority over availability. Every limit resolves in the
+closed direction, and there is no code path where an error on the request
+path leads to forwarding: an error anywhere between accept and the upstream
+connect produces a deny response or a closed socket.
+
+## Fail-closed outcomes
+
+| condition | result |
+|---|---|
+| parse or canonicalisation error | close the connection (`400` if a response can still be written), `parse_error` |
+| a rule denies | deny response, then close |
+| policy input unavailable (metric store, address list, secret) | `503`, `_fail_closed` |
+| metric key table full or byte budget exhausted | deny, `metric_table_full` |
+| body too large to inspect | deny, `_fail_closed`, `body_too_large_to_inspect` |
+| body or header limit exceeded mid-stream | close both sides |
+| upstream DNS, connect or TLS failure | `502`, `upstream_error` |
+| address floor | `403`, `_address_policy` |
+| addon trap, budget exceeded or invalid output (enforce mode) | deny, `layer_error`; observe-mode addons only log |
+| config reload fails | keep the old policy |
+| connection cap | refuse the new connection |
+| flow log or capture behind, or its disk failing | hold traffic until it catches up; never drop records |
+
+## Limits
+
+All under `limits:`; defaults shown. Sizes are 1024-based.
+
+```yaml
+limits:
+  # client requests (HTTP)
+  max_header_bytes: 64kb
+  max_url_bytes: 8kb
+  max_headers: 100
+  max_request_body_bytes: 1gb
+  header_timeout: 10s
+  body_idle_timeout: 30s
+  idle_timeout: 300s              # keep-alive idle; also a relayed WebSocket's idle timeout
+  h2_max_concurrent_streams: 100
+  h2_max_header_list_bytes: 64kb
+
+  # responses
+  max_response_body_bytes: 1gb
+  response_header_timeout: 60s    # from when the request body has been sent
+
+  # buffering
+  max_inspect_body_bytes: 1mb     # body.text / response.body.text, and addons' default
+  max_capture_body_bytes: 16mb    # per direction per exchange
+
+  # connections
+  max_connections: 10000
+  max_connections_per_client: 256
+
+  # policy state
+  max_metric_keys: 100000
+  max_metric_bytes: 256mb         # at most 64gb
+  max_state_entries: 100000
+  max_address_list_bytes: 256mb
+```
+
+Addons have their own budgets ([addons](addons.md#configuration)).
+`max_ws_message_bytes` is accepted and currently has no effect.
+
+## Connections
+
+- A connection over `max_connections` or `max_connections_per_client` (per
+  client IP) is accepted and closed at once, with a `connection_refused`
+  event.
+- Every read is bounded (head size, body size, ClientHello size), and every
+  stage has a timeout.
+- Nothing is allocated in proportion to an attacker-supplied number before
+  it is validated (`content-length: 10^18` does not pre-allocate).
+- Bounded policy tables (metrics, state, addon state) never evict
+  to make room: a flow that needs a new entry in a full table is denied
+  ([never evict](principles.md#never-evict)).
+- The proxy port serves only proxy semantics and `roxy.internal`. Health
+  and CA download live on the separate `ca_server` listener, so they can be
+  firewalled differently.
+- A panic in a connection task closes that connection only. The parsers are
+  fuzzed so they do not panic at all.
+- On `SIGTERM` or Ctrl-C roxy stops accepting, drains exchanges in flight
+  for up to 10 seconds, and flushes the flow log and capture before
+  exiting.
