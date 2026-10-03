@@ -222,9 +222,21 @@ async fn redirect_changes_target_and_checks_the_new_address() {
     h.stop().await;
 }
 
+/// The upstream echo answers only after reading the whole body, and
+/// `response_header_timeout` currently runs while the request body is
+/// still being sent, so the harness's 2s default can 504 a 32 MiB debug-build
+/// upload on a slow runner. These tests check streaming integrity, not that
+/// timeout.
+const BIG_UPLOAD_LIMITS: &str = "response_header_timeout: 60s";
+
 #[tokio::test(flavor = "multi_thread")]
 async fn large_uploads_stream_intact() {
-    let h = Harness::start(ALLOW_UPSTREAM).await;
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        limits: BIG_UPLOAD_LIMITS,
+        ..Opts::default()
+    })
+    .await;
     let c = h.client();
     // 32 MiB with content-length.
     let data: Vec<u8> = (0..32 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
@@ -1346,7 +1358,12 @@ async fn h2_deny_without_close_keeps_serving() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn h2_large_upload_streams_intact() {
-    let h = Harness::start(ALLOW_UPSTREAM).await;
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        limits: BIG_UPLOAD_LIMITS,
+        ..Opts::default()
+    })
+    .await;
     let data: Vec<u8> = (0..32 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     let want = fnv(&data);
     let res = h
