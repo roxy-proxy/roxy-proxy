@@ -10,11 +10,22 @@ use std::task::{Context, Poll};
 use bytes::{Bytes, BytesMut};
 use http_body::{Frame, SizeHint};
 use roxy_http::{Body, BodyError};
+use tokio_util::sync::CancellationToken;
 
 /// Counts data bytes as they pass through.
 struct Counted {
     inner: Body,
     counter: Arc<AtomicU64>,
+    /// Cancelled once the body has ended, failed or been dropped.
+    ended: Option<CancellationToken>,
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        if let Some(t) = &self.ended {
+            t.cancel();
+        }
+    }
 }
 
 impl http_body::Body for Counted {
@@ -26,10 +37,18 @@ impl http_body::Body for Counted {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         let r = Pin::new(&mut self.inner).poll_frame(cx);
-        if let Poll::Ready(Some(Ok(f))) = &r
-            && let Some(d) = f.data_ref()
-        {
-            self.counter.fetch_add(d.len() as u64, Ordering::Relaxed);
+        match &r {
+            Poll::Ready(Some(Ok(f))) => {
+                if let Some(d) = f.data_ref() {
+                    self.counter.fetch_add(d.len() as u64, Ordering::Relaxed);
+                }
+            }
+            Poll::Ready(None | Some(Err(_))) => {
+                if let Some(t) = &self.ended {
+                    t.cancel();
+                }
+            }
+            Poll::Pending => {}
         }
         r
     }
@@ -46,12 +65,26 @@ impl http_body::Body for Counted {
 /// Wraps `body` so the returned counter tracks the data bytes that have
 /// flowed through it. Framing (known length) is preserved.
 pub(crate) fn counted(body: Body) -> (Body, Arc<AtomicU64>) {
+    wrap_counted(body, None)
+}
+
+/// [`counted`], plus a token cancelled once the body is done with: it
+/// ended, failed, or its consumer dropped it (an HTTP client drops a
+/// request body once it has been sent, or never polls an empty one).
+pub(crate) fn counted_until_sent(body: Body) -> (Body, Arc<AtomicU64>, CancellationToken) {
+    let ended = CancellationToken::new();
+    let (body, counter) = wrap_counted(body, Some(ended.clone()));
+    (body, counter, ended)
+}
+
+fn wrap_counted(body: Body, ended: Option<CancellationToken>) -> (Body, Arc<AtomicU64>) {
     let counter = Arc::new(AtomicU64::new(0));
     let known = body.known_length();
     let body = Body::wrap_native(
         Counted {
             inner: body,
             counter: counter.clone(),
+            ended,
         },
         u64::MAX,
         known,
@@ -177,6 +210,18 @@ mod tests {
             }
         }
         Ok(out)
+    }
+
+    #[tokio::test]
+    async fn until_sent_fires_at_the_end_or_on_drop() {
+        let (b, c, sent) = counted_until_sent(Body::from_bytes("hello"));
+        assert!(!sent.is_cancelled());
+        assert_eq!(drain(b).await.unwrap(), b"hello");
+        assert!(sent.is_cancelled());
+        assert_eq!(c.load(Ordering::Relaxed), 5);
+        let (b, _, sent) = counted_until_sent(Body::from_bytes("never polled"));
+        drop(b);
+        assert!(sent.is_cancelled());
     }
 
     #[tokio::test]

@@ -427,6 +427,13 @@ builds a `CanonicalResponse` from it with minimal processing:
 - `limits.max_response_body_bytes` (default 1 GiB) and
   `limits.response_header_timeout` protect roxy's memory and connection slots.
   Bodies are never buffered unless a rule or addon asks for body content.
+- `limits.response_header_timeout` (60 s) runs from the moment the request
+  body has been sent upstream, so a long upload is not cut short by it.
+  While the body is still being sent, the exchange fails (`504`) only if the
+  upstream stops taking it for twice `limits.body_idle_timeout`.
+- Empty non-final DATA frames are never forwarded (an h2 client's empty
+  `END_STREAM` frame is not passed on as data): h2 servers treat them as a
+  flood and GOAWAY the connection.
 - Redirect responses (`3xx` with `location`) are forwarded; the agent's
   follow-up request is a new flow evaluated on its own. roxy does not follow
   redirects.

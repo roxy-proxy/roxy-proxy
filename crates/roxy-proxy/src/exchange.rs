@@ -2,7 +2,7 @@
 //! stages → client, plus the WebSocket relay (§8.1).
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use http::HeaderValue;
@@ -13,10 +13,11 @@ use roxy_http::upstream::{
     UriForm, from_upstream_response, to_upstream_request, to_upstream_upgrade_request,
 };
 use roxy_http::ws::{WsKey, validate_upgrade_request, validate_upgrade_response};
-use roxy_http::{Body, CanonicalRequest, CanonicalResponse, ParseError};
+use roxy_http::{Body, CanonicalRequest, CanonicalResponse, Limits, ParseError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
-use crate::body::counted;
+use crate::body::{counted, counted_until_sent};
 use crate::capture::{self, Tap};
 use crate::flowlog::{DecisionKind, FlowEvent};
 use crate::io::{ConnIo, Io};
@@ -333,6 +334,42 @@ fn stopped_outcome(watch: &Watch) -> Option<Outcome> {
     watch.stopped().map(|s| Outcome::Refuse(s.refusal))
 }
 
+/// Waits for the upstream's response head.
+///
+/// `response_header_timeout` runs from the moment the request body has been
+/// sent (`sent`), so a large upload on a slow link is not cut short by it.
+/// While the body is still being sent, the wait fails only if the upstream
+/// stops taking it: no body progress for twice `body_idle_timeout` (the
+/// client side's own idle timeout, `body_idle_timeout`, catches a client
+/// that stops sending first).
+async fn response_head<F: Future>(
+    fut: F,
+    sent: CancellationToken,
+    progress: Arc<AtomicU64>,
+    limits: &Limits,
+) -> Result<F::Output, &'static str> {
+    let mut fut = std::pin::pin!(fut);
+    let stall = limits.body_idle_timeout.saturating_mul(2);
+    let mut seen = progress.load(Ordering::Relaxed);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut fut => return Ok(out),
+            () = sent.cancelled() => break,
+            () = tokio::time::sleep(stall) => {
+                let now = progress.load(Ordering::Relaxed);
+                if now == seen {
+                    return Err("upstream stopped reading the request body");
+                }
+                seen = now;
+            }
+        }
+    }
+    tokio::time::timeout(limits.response_header_timeout, fut)
+        .await
+        .map_err(|_| "upstream response headers")
+}
+
 #[allow(clippy::too_many_lines)] // one linear flow; splitting it obscures the order
 async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalRequest) -> Outcome {
     // From here on the request is on its way: watching rules re-check the
@@ -446,7 +483,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
             Dir::Request,
             up_tap.take(),
         );
-        let (body, req_counter) = counted(body);
+        let (body, req_counter, sent) = counted_until_sent(body);
         req.body = body;
         let mut http_req = match to_upstream_request(req, UriForm::Absolute) {
             Ok(r) => r,
@@ -455,9 +492,11 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
             }
         };
         set_host_override(cx, &mut http_req);
-        let upstream = tokio::time::timeout(
-            limits.response_header_timeout,
+        let upstream = response_head(
             upstream_client.client(private_ok).request(http_req),
+            sent,
+            req_counter.clone(),
+            &limits,
         );
         // A stop (from a request body chunk) abandons the upstream request
         // at once instead of waiting for its response.
@@ -478,10 +517,10 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
             Err(e) => return Outcome::Close(e),
             // Unreachable: a cancelled watch returned above. Fail closed.
             Ok(None) => return Outcome::Refuse(Refusal::fail_closed("watch_stopped")),
-            Ok(Some(Err(_elapsed))) => {
+            Ok(Some(Err(what))) => {
                 return Outcome::Refuse(upstream_refusal(
                     cx,
-                    &ConnectError::Timeout("upstream response headers"),
+                    &ConnectError::Timeout(what),
                     &host,
                     port,
                 ));
