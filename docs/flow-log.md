@@ -40,7 +40,8 @@ produces a `request` event:
 | `upstream_error`, `upstream_denied` | [upstream](upstream.md#errors) failures and address-floor hits |
 | `policy_input_unavailable`, `metric_table_full` | a flow failed closed for want of an input |
 | `upgrade_stripped` | an upgrade was not allowed, so the request went upstream as plain HTTP ([WebSockets](websockets.md)) |
-| `ws_open`, `ws_close` | a relayed WebSocket, with byte counts |
+| `ws_open`, `ws_close` | a relayed WebSocket, with byte counts; `ws_close` has `close_code` and `close_reason` when roxy ended it |
+| `ws_message` | a WebSocket message a rule denied, or one sampled by `log.flow.ws_message_every` ([WebSockets](websockets.md#message-rules)) |
 | `log` | a rule's `log` action |
 | `layer_error`, `layer_record`, `endpoint_call`, `observer_lagged` | [addons](addons.md) |
 | `connect` | a CONNECT, when `log.flow.connection_events` is on or it was refused |
@@ -85,6 +86,7 @@ log:
   flow:
     path: /var/log/roxy/flow.jsonl  # absent = stdout
     connection_events: false
+    ws_message_every: 0             # also log every Nth WebSocket message; 0 = denied only
     high_water: 8mb                 # at least 64kb
     max_file_bytes: 100mb           # absent = never rotate
     max_files: 10                   # absent = keep all

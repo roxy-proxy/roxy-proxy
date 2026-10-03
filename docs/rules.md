@@ -165,11 +165,12 @@ fields become known later, so rules that read them watch.
 | `response.body.size` | int: declared length, `null` if undeclared | watched |
 | `response.body.text` | string: the buffered response body | watched |
 | `response.body.bytes` | int: response body bytes so far | watched |
+| `ws.direction`, `ws.opcode`, `ws.size`, `ws.text` | string, int, int, string: the WebSocket message being checked | watched, per message ([WebSockets](websockets.md#message-rules)) |
 
 `path` is the normalised path ([HTTP](http.md#url-normalisation)), so a
-rule matches exactly what is forwarded. `ws.*` fields parse, but `roxy run`
-refuses a policy that reads them: WebSocket message rules are not built
-(issue #14).
+rule matches exactly what is forwarded. A policy with any rule that reads
+`ws.*` makes roxy decode and check every WebSocket message, and strips
+WebSocket extensions so messages stay readable.
 
 ### Missing values (`null`)
 
@@ -230,7 +231,7 @@ Terminal:
 | action | where | effect |
 |---|---|---|
 | `allow` | head rules | Forward. `allow: { upgrade: websocket }` also permits a WebSocket upgrade; `private_ok: true` lets this flow reach private addresses ([address floor](upstream.md#address-floor)). |
-| `deny` | all rules | `deny: { status, message, close }`. Status defaults to 403 and must be 4xx or 5xx. At the head: refuse ([deny responses](http.md#deny-responses)); the connection is closed afterwards unless `close: false`. Watching: stop the exchange, as in [evaluation](#evaluation). On a WebSocket: close both sides. |
+| `deny` | all rules | `deny: { status, message, close }`. Status defaults to 403 and must be 4xx or 5xx. At the head: refuse ([deny responses](http.md#deny-responses)); the connection is closed afterwards unless `close: false`. Watching: stop the exchange, as in [evaluation](#evaluation). On a WebSocket: close both sides (with a `1008` close frame when rules read messages, [WebSockets](websockets.md#message-rules)). |
 
 Non-terminal:
 
@@ -325,5 +326,7 @@ allow and 3 on deny. Metrics you do not pass are 0, and
 `--metric id=unavailable` exercises the fail-closed path. Flags set the
 client, headers and body, and `--body-bytes`, `--response-status`,
 `--response-header` and `--response-body-bytes` run the watching rules
-that read them. An IP-literal URL also shows an address-floor hit. See
+that read them. `--ws-text`, `--ws-opcode`, `--ws-size` and
+`--ws-direction` describe one WebSocket message and run the rules that
+read `ws.*`. An IP-literal URL also shows an address-floor hit. See
 `roxy rule test --help`.
