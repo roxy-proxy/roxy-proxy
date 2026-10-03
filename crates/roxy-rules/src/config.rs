@@ -219,9 +219,11 @@ pub struct DenyArgs {
     /// Response message; default `blocked by roxy`.
     #[serde(default)]
     pub message: Option<String>,
-    /// `ws` phase only: close the socket instead of dropping the message.
+    /// Close the connection after the deny (connect, request, response;
+    /// default `true`) or close the socket instead of dropping the message
+    /// (ws; default `false`). Absent = the phase default.
     #[serde(default)]
-    pub close: bool,
+    pub close: Option<bool>,
 }
 
 /// Arguments of `rewrite_path`.

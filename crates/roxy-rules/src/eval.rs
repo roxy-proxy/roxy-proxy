@@ -2,6 +2,7 @@
 //! running a rule chain.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +13,7 @@ use crate::compile::{Const, OrdOp, Pred, ROperand, StrOp};
 use crate::config::{CaptureTarget, LogLevel, Phase, Scheme};
 use crate::diag::RuleId;
 use crate::types::Access;
-use crate::view::{FlowView, Value};
+use crate::view::{BodyText, FlowView, Value};
 
 /// Per-evaluation inputs that are not part of the flow.
 #[derive(Clone, Copy)]
@@ -63,7 +64,12 @@ pub struct AllowOpts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Allow(AllowOpts),
-    /// `close` is only ever set in the `ws` phase (`deny: { close: true }`).
+    /// `close`: in `connect`, `request` and `response` the proxy closes the
+    /// client connection after writing the deny response (h1
+    /// `connection: close`, h2 `GOAWAY`; §6.1). It defaults to `true` there
+    /// and `deny: { close: false }` opts out per rule. In the `ws` phase a
+    /// deny without `close` drops the message and `close: true` closes the
+    /// socket; the default there is `false`.
     Deny {
         status: u16,
         message: String,
@@ -86,24 +92,78 @@ impl Decision {
         matches!(self, Self::Deny { .. })
     }
 
-    pub(crate) fn deny(status: u16, message: impl Into<String>) -> Self {
-        Self::Deny {
-            status,
-            message: message.into(),
-            close: false,
+    /// Whether a deny closes the connection when the rule does not say:
+    /// `true` everywhere except the `ws` phase, where it drops the message.
+    pub fn default_close(phase: Phase) -> bool {
+        phase != Phase::Ws
+    }
+
+    /// Decision when a phase's chain is exhausted without a terminal action
+    /// (§6.1):
+    ///
+    /// * `request`: deny 403, closing the connection.
+    /// * `connect`: allow-to-inspect (§4.3): the request phase is the gate.
+    /// * `response`: allow; the request was allowed and upstreams are trusted.
+    /// * `ws`: deny 403 without close, i.e. drop the message. Opting into
+    ///   inspection means writing the allow rules.
+    pub fn default_for(phase: Phase) -> Self {
+        match phase {
+            Phase::Request | Phase::Ws => Self::Deny {
+                status: DEFAULT_DENY_STATUS,
+                message: DEFAULT_DENY_MESSAGE.into(),
+                close: Self::default_close(phase),
+            },
+            Phase::Connect | Phase::Response => Self::Allow(AllowOpts::default()),
         }
     }
 
-    /// Decision when a phase's chain is exhausted without a terminal action.
-    ///
-    /// * `request`: deny 403 (`default-deny`, §6.1).
-    /// * `connect`: allow-to-inspect (§4.3): the request phase is the gate.
-    /// * `response`, `ws`: allow. The flow was already authorised by a
-    ///   request rule; these chains only tighten (log, tag, deny on match).
-    pub fn default_for(phase: Phase) -> Self {
-        match phase {
-            Phase::Request => Self::deny(DEFAULT_DENY_STATUS, DEFAULT_DENY_MESSAGE),
-            Phase::Connect | Phase::Response | Phase::Ws => Self::Allow(AllowOpts::default()),
+    /// The decision for a fail-closed outcome: 503, closing the connection.
+    pub fn fail_closed() -> Self {
+        Self::Deny {
+            status: FAIL_CLOSED_STATUS,
+            message: FAIL_CLOSED_MESSAGE.into(),
+            close: true,
+        }
+    }
+}
+
+/// Status and message when a policy input is unavailable (§6.1).
+pub const FAIL_CLOSED_STATUS: u16 = 503;
+pub const FAIL_CLOSED_MESSAGE: &str = "policy input unavailable";
+
+/// Why an evaluation failed closed (`terminal_rule = "_fail_closed"`), for
+/// the proxy's `policy_input_unavailable` flow event. Carries names only,
+/// never secret values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailClosedReason {
+    /// `FlowView::metric(id)` returned `None`.
+    MetricUnavailable(String),
+    /// `FlowView::in_address_list(name, ip)` returned `None`.
+    AddressListUnavailable(String),
+    /// A `set_header` secret could not be resolved.
+    SecretMissing(String),
+    /// A resolved secret is not a valid header value (CR, LF, control or
+    /// non-ASCII characters).
+    SecretInvalid(String),
+    /// A body predicate was reached but the body exceeds
+    /// `limits.max_inspect_body_bytes` (§6.2). Carries the field name.
+    BodyTooLargeToInspect(String),
+    /// A body predicate was reached but the body was not buffered or could
+    /// not be read. Carries the field name.
+    BodyUnavailable(String),
+}
+
+impl fmt::Display for FailClosedReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MetricUnavailable(id) => write!(f, "metric `{id}` unavailable"),
+            Self::AddressListUnavailable(n) => write!(f, "address list @{n} unavailable"),
+            Self::SecretMissing(n) => write!(f, "secret {n:?} missing"),
+            Self::SecretInvalid(n) => write!(f, "secret {n:?} is not a valid header value"),
+            Self::BodyTooLargeToInspect(field) => {
+                write!(f, "`{field}`: body too large to inspect")
+            }
+            Self::BodyUnavailable(field) => write!(f, "`{field}`: body unavailable"),
         }
     }
 }
@@ -330,8 +390,11 @@ pub struct Outcome {
     pub decision: Decision,
     /// Every rule whose `when` matched, in order (including the terminal one).
     pub matched: Vec<RuleId>,
-    /// The rule that decided, or `_default` when the chain was exhausted.
+    /// The rule that decided; `_default` when the chain was exhausted;
+    /// `_fail_closed` when a policy input was unavailable.
     pub terminal_rule: RuleId,
+    /// Set exactly when `terminal_rule` is `_fail_closed`.
+    pub fail_closed_reason: Option<FailClosedReason>,
     /// Effects of non-terminal actions of matched rules, in order.
     pub effects: Vec<Effect>,
     /// `initial_tags` plus tags set by matched rules, without duplicates.
@@ -346,6 +409,56 @@ pub(crate) struct Scope<'a> {
     pub tags: &'a [String],
     /// Effects so far; `state["k"]` sees earlier `set_state` in the chain.
     pub effects: &'a [Effect],
+    /// First unavailable input met during evaluation, if any.
+    pub failed: Cell<Option<Unavailable<'a>>>,
+}
+
+impl<'a> Scope<'a> {
+    pub(crate) fn new(view: &'a dyn FlowView, tags: &'a [String], effects: &'a [Effect]) -> Self {
+        Self {
+            view,
+            tags,
+            effects,
+            failed: Cell::new(None),
+        }
+    }
+
+    fn fail(&self, what: Unavailable<'a>) {
+        if self.failed.get().is_none() {
+            self.failed.set(Some(what));
+        }
+    }
+
+    /// Evaluate `p`; `Err` if it needed an unavailable input.
+    pub(crate) fn check(&self, p: &'a Pred) -> Result<bool, FailClosedReason> {
+        let r = p.eval(self);
+        match self.failed.get() {
+            Some(what) => Err(what.reason()),
+            None => Ok(r),
+        }
+    }
+}
+
+/// A policy input the view could not provide. Evaluation stops and the flow
+/// fails closed; this is never treated as an absent value (§6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unavailable<'a> {
+    Metric(&'a str),
+    List(&'a str),
+    /// Field name (`body.text` / `response.body.text`).
+    BodyTooLarge(&'static str),
+    Body(&'static str),
+}
+
+impl Unavailable<'_> {
+    pub(crate) fn reason(self) -> FailClosedReason {
+        match self {
+            Unavailable::Metric(id) => FailClosedReason::MetricUnavailable(id.to_owned()),
+            Unavailable::List(n) => FailClosedReason::AddressListUnavailable(n.to_owned()),
+            Unavailable::BodyTooLarge(f) => FailClosedReason::BodyTooLargeToInspect(f.to_owned()),
+            Unavailable::Body(f) => FailClosedReason::BodyUnavailable(f.to_owned()),
+        }
+    }
 }
 
 fn get<'a>(op: &'a ROperand, s: &Scope<'a>) -> Value<'a> {
@@ -370,14 +483,36 @@ fn get<'a>(op: &'a ROperand, s: &Scope<'a>) -> Value<'a> {
                 });
                 match pending {
                     Some(v) => Value::Str(Cow::Borrowed(v)),
+                    // An unset key is a legitimate state: absent, not unavailable.
                     None => opt(s.view.state(k)),
                 }
             }
             Access::Tag(t) => Value::Bool(s.tags.iter().any(|x| **x == **t)),
-            Access::Metric(id) => s.view.metric(id).map_or(Value::Absent, Value::Int),
-            Access::BodyText => opt(s.view.body_text()),
-            Access::RespBodyText => opt(s.view.response_body_text()),
+            Access::Metric(id) => s.view.metric(id).map_or_else(
+                || {
+                    s.fail(Unavailable::Metric(id));
+                    Value::Absent
+                },
+                Value::Int,
+            ),
+            Access::BodyText => body(s, s.view.body_text(), "body.text"),
+            Access::RespBodyText => body(s, s.view.response_body_text(), "response.body.text"),
         },
+    }
+}
+
+/// A body that cannot be inspected fails closed rather than reading as absent.
+fn body<'a>(s: &Scope<'a>, b: BodyText<'a>, field: &'static str) -> Value<'a> {
+    match b {
+        BodyText::Available(t) => Value::Str(t),
+        BodyText::TooLarge => {
+            s.fail(Unavailable::BodyTooLarge(field));
+            Value::Absent
+        }
+        BodyText::Unavailable => {
+            s.fail(Unavailable::Body(field));
+            Value::Absent
+        }
     }
 }
 
@@ -453,11 +588,30 @@ fn eq(a: &Value<'_>, b: &Value<'_>, ci: bool) -> Option<bool> {
 }
 
 impl Pred {
-    pub(crate) fn eval(&self, s: &Scope<'_>) -> bool {
+    /// Evaluate with short-circuiting `and`/`or`: an input is only "needed"
+    /// (and can only fail closed) if evaluation actually reaches it. An
+    /// unavailable input is recorded in the scope (see [`Scope::failed`]); the
+    /// returned bool is then meaningless and the caller must fail closed.
+    /// Recording instead of returning `Result` keeps the hot path cheap.
+    pub(crate) fn eval<'a>(&'a self, s: &Scope<'a>) -> bool {
         match self {
             Pred::Const(b) => *b,
-            Pred::All(ps) => ps.iter().all(|p| p.eval(s)),
-            Pred::Any(ps) => ps.iter().any(|p| p.eval(s)),
+            Pred::All(ps) => {
+                for p in ps {
+                    if !p.eval(s) {
+                        return false;
+                    }
+                }
+                true
+            }
+            Pred::Any(ps) => {
+                for p in ps {
+                    if p.eval(s) {
+                        return true;
+                    }
+                }
+                false
+            }
             Pred::Not(p) => !p.eval(s),
             Pred::Truthy(o) => matches!(get(o, s), Value::Bool(true)),
             Pred::Eq {
@@ -510,10 +664,16 @@ impl Pred {
                 _ => false,
             },
             Pred::InList { lhs, list, negate } => match get(lhs, s) {
-                Value::Ip(ip) => s
-                    .view
-                    .in_address_list(list, ip.to_canonical())
-                    .is_some_and(|hit| hit != *negate),
+                Value::Ip(ip) => {
+                    if let Some(hit) = s.view.in_address_list(list, ip.to_canonical()) {
+                        hit != *negate
+                    } else {
+                        s.fail(Unavailable::List(list));
+                        false
+                    }
+                }
+                // No ip to check (e.g. `dst.ip` before resolution) is an
+                // absent value, not an unavailable list.
                 _ => false,
             },
         }

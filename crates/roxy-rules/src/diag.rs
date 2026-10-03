@@ -55,6 +55,9 @@ pub struct RuleId(Arc<str>);
 impl RuleId {
     /// The id reported when a chain is exhausted without a terminal action.
     pub const DEFAULT: &'static str = "_default";
+    /// The id reported when evaluation failed closed because a policy input
+    /// (metric, address list, secret) was unavailable.
+    pub const FAIL_CLOSED: &'static str = "_fail_closed";
 
     pub fn new(id: &str) -> Self {
         Self(Arc::from(id))

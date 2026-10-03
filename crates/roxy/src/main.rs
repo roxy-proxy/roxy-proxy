@@ -122,7 +122,9 @@ struct RuleTestArgs {
     /// Response header `name: value` (repeatable).
     #[arg(short = 'R', long = "response-header")]
     response_headers: Vec<String>,
-    /// Metric value `id=N` for `metric.<id>` (repeatable).
+    /// Metric value `id=N` for `metric.<id>` (repeatable). Metrics not given
+    /// are 0 (a fresh series); `id=unavailable` makes the view report the
+    /// metric unavailable, exercising the fail-closed path.
     #[arg(long = "metric")]
     metrics: Vec<String>,
     /// State entry `key=value` for `state["key"]` (repeatable).
@@ -225,13 +227,7 @@ fn rule_test(args: &RuleTestArgs) -> anyhow::Result<ExitCode> {
     req.metrics = args
         .metrics
         .iter()
-        .map(|s| {
-            let (k, v) = ruletest::parse_pair(s)?;
-            let n = v
-                .parse::<i64>()
-                .map_err(|_| format!("metric {k:?}: {v:?} is not an integer"))?;
-            Ok((k, n))
-        })
+        .map(|s| ruletest::parse_metric(s))
         .collect::<Result<_, String>>()
         .map_err(err)?;
 
@@ -244,7 +240,11 @@ fn rule_test(args: &RuleTestArgs) -> anyhow::Result<ExitCode> {
     // Secrets are never resolved here, so the redactor has none registered;
     // effect text still goes through it so a future change cannot leak.
     let redactor = Redactor::new();
-    print!("{}", ruletest::report(phase, &out, &redactor));
+    let note = ruletest::metric_note(&ruletest::metric_values(&config, &req));
+    print!(
+        "{}",
+        ruletest::report(phase, note.as_deref(), &out, &redactor)
+    );
     Ok(ExitCode::from(ruletest::exit_code(&out.decision)))
 }
 

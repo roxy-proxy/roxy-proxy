@@ -147,7 +147,7 @@ const CASES: &[(&str, &str, &str)] = &[
     (
         "duplicate and reserved ids",
         "",
-        "- { id: a, then: allow }\n- { id: a, then: deny }\n- { id: _default, then: deny }",
+        "- { id: a, then: allow }\n- { id: a, then: deny }\n- { id: _default, then: deny }\n- { id: _fail_closed, then: deny }",
     ),
     (
         "address list on a non-ip field",

@@ -8,12 +8,12 @@ use regex::Regex;
 
 use crate::compile::{Env, Needs, Pred, build_shared_regex, compile};
 use crate::config::{
-    Action, AllowArgs, DenyArgs, LogLevel, MetricConfig, MetricCount, Phase, RuleConfig, Upgrade,
+    Action, AllowArgs, DenyArgs, MetricConfig, MetricCount, Phase, RuleConfig, Upgrade,
 };
 use crate::diag::{Diagnostic, RuleId};
 use crate::eval::{
-    AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Effect, EvalContext, Outcome,
-    Scope,
+    AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Effect, EvalContext,
+    FailClosedReason, Outcome, Scope,
 };
 use crate::types::{Field, is_token};
 use crate::view::FlowView;
@@ -53,14 +53,12 @@ pub struct MetricDef {
 
 impl MetricDef {
     /// Whether a flow passes this metric's `where` filter (absent = always).
-    pub fn matches(&self, view: &dyn FlowView) -> bool {
-        self.filter.as_ref().is_none_or(|p| {
-            p.eval(&Scope {
-                view,
-                tags: &[],
-                effects: &[],
-            })
-        })
+    /// `Err` if the filter needs an unavailable input; the proxy must then
+    /// fail the flow closed rather than skip counting it.
+    pub fn matches(&self, view: &dyn FlowView) -> Result<bool, FailClosedReason> {
+        self.filter
+            .as_ref()
+            .map_or(Ok(true), |p| Scope::new(view, &[], &[]).check(p))
     }
 }
 
@@ -96,6 +94,7 @@ pub struct Policy {
     needs_request_body: bool,
     needs_response_body: bool,
     default_id: RuleId,
+    fail_closed_id: RuleId,
 }
 
 fn phase_index(p: Phase) -> usize {
@@ -150,6 +149,7 @@ impl Policy {
             needs_request_body: c.needs.request_body,
             needs_response_body: c.needs.response_body,
             default_id: RuleId::new(RuleId::DEFAULT),
+            fail_closed_id: RuleId::new(RuleId::FAIL_CLOSED),
         })
     }
 
@@ -160,10 +160,14 @@ impl Policy {
     /// decides. If the chain is exhausted the result is
     /// [`Decision::default_for`] the phase with `terminal_rule = "_default"`.
     ///
-    /// Fail closed: if a `set_header` secret cannot be resolved, or its
-    /// substituted value is not a valid header value, evaluation stops with
-    /// `Deny { status: 500 }` attributed to that rule, plus an `error` log
-    /// effect naming the secret (never its value).
+    /// Fail closed (§6.1): if evaluation reaches a metric the view reports
+    /// unavailable (`FlowView::metric` → `None`), an address list it cannot
+    /// answer for (`in_address_list` → `None`), a `set_header` secret that
+    /// cannot be resolved, or a resolved secret that is not a valid header
+    /// value, evaluation stops with [`Decision::fail_closed`] (503, close),
+    /// `terminal_rule = "_fail_closed"`, `fail_closed_reason` set, and
+    /// `matched`/`effects`/`tags` as evaluated so far. `and`/`or`
+    /// short-circuit, so only inputs actually reached are needed.
     ///
     /// Allocation: nothing is allocated for rules that do not match, except
     /// what the view itself returns (e.g. `header.all`). Matching rules clone
@@ -172,14 +176,26 @@ impl Policy {
         let mut tags: Vec<String> = ctx.initial_tags.to_vec();
         let mut effects: Vec<Effect> = Vec::new();
         let mut matched: Vec<RuleId> = Vec::new();
+        let fail = |reason: FailClosedReason,
+                    matched: Vec<RuleId>,
+                    effects: Vec<Effect>,
+                    tags: Vec<String>| Outcome {
+            decision: Decision::fail_closed(),
+            matched,
+            terminal_rule: self.fail_closed_id.clone(),
+            fail_closed_reason: Some(reason),
+            effects,
+            tags,
+        };
         for rule in &self.chains[phase_index(phase)] {
-            let hit = rule.when.as_ref().is_none_or(|p| {
-                p.eval(&Scope {
-                    view,
-                    tags: &tags,
-                    effects: &effects,
-                })
-            });
+            let hit = match &rule.when {
+                None => Ok(true),
+                Some(p) => Scope::new(view, &tags, &effects).check(p),
+            };
+            let hit = match hit {
+                Ok(hit) => hit,
+                Err(reason) => return fail(reason, matched, effects, tags),
+            };
             if !hit {
                 continue;
             }
@@ -197,28 +213,14 @@ impl Policy {
                             name: name.clone(),
                             value,
                         }),
-                        Err(problem) => {
-                            effects.push(Effect::Log {
-                                level: LogLevel::Error,
-                                message: format!(
-                                    "rule {}: set_header {name}: {problem}; denying (fail closed)",
-                                    rule.id
-                                ),
-                            });
-                            return Outcome {
-                                decision: Decision::deny(500, "secret unavailable"),
-                                matched,
-                                terminal_rule: rule.id.clone(),
-                                effects,
-                                tags,
-                            };
-                        }
+                        Err(reason) => return fail(reason, matched, effects, tags),
                     },
                     CAction::Terminal(d) => {
                         return Outcome {
                             decision: d.clone(),
                             matched,
                             terminal_rule: rule.id.clone(),
+                            fail_closed_reason: None,
                             effects,
                             tags,
                         };
@@ -230,6 +232,7 @@ impl Policy {
             decision: Decision::default_for(phase),
             matched,
             terminal_rule: self.default_id.clone(),
+            fail_closed_reason: None,
             effects,
             tags,
         }
@@ -261,19 +264,16 @@ impl Policy {
 }
 
 /// Substitute secrets into a `set_header` value and validate the result.
-fn render(parts: &[Part], ctx: &EvalContext<'_>) -> Result<String, String> {
+fn render(parts: &[Part], ctx: &EvalContext<'_>) -> Result<String, FailClosedReason> {
     let mut out = String::new();
     for part in parts {
         match part {
             Part::Lit(s) => out.push_str(s),
             Part::Secret(name) => {
-                let value =
-                    (ctx.secrets)(name).ok_or_else(|| format!("secret {name:?} is unavailable"))?;
+                let value = (ctx.secrets)(name)
+                    .ok_or_else(|| FailClosedReason::SecretMissing(name.clone()))?;
                 if !is_header_value(&value) {
-                    return Err(format!(
-                        "secret {name:?} is not a valid header value (control or non-ASCII \
-                         characters)"
-                    ));
+                    return Err(FailClosedReason::SecretInvalid(name.clone()));
                 }
                 out.push_str(&value);
             }
@@ -442,7 +442,7 @@ impl PolicyCompiler<'_, '_> {
                     Some(&rid),
                     format!("{path}.id"),
                     format!(
-                        "rule id {:?}: ids starting with `_` are reserved (e.g. `_default`)",
+                        "rule id {:?}: ids starting with `_` are reserved (`_default`, `_fail_closed`)",
                         rule.id
                     ),
                 );
@@ -591,19 +591,12 @@ impl PolicyCompiler<'_, '_> {
                         format!("deny status {status} must be a 4xx or 5xx code"),
                     );
                 }
-                if *close && phase != Phase::Ws {
-                    self.push(
-                        rule,
-                        apath,
-                        "`deny: { close: true }` only applies in the ws phase",
-                    );
-                }
                 vec![CAction::Terminal(Decision::Deny {
                     status,
                     message: message
                         .clone()
                         .unwrap_or_else(|| DEFAULT_DENY_MESSAGE.into()),
-                    close: *close,
+                    close: close.unwrap_or_else(|| Decision::default_close(phase)),
                 })]
             }
             Action::Passthrough => {
