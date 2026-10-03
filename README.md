@@ -20,7 +20,8 @@ structured JSONL flow log with the rule that made it. See
 Usable in explicit proxy mode. Built and tested:
 
 - HTTP/1.1 and HTTPS via `CONNECT`, with TLS interception and strict
-  parsing (a 168-case smuggling corpus).
+  parsing (a 168-case smuggling corpus). HTTP/2 from the client inside
+  the tunnel, negotiated by ALPN; any client falls back to HTTP/1.1.
 - Rules in four phases: connect, request, response and WebSocket.
 - Header, path, query and redirect actions, and secret injection.
 - Stateful metrics and a state store. Neither ever evicts: a full table
@@ -36,8 +37,6 @@ Deferred, with designs in DESIGN.md:
 - Transparent mode (§4.2).
 - WebSocket message inspection (§8.2).
 - Body capture and a Prometheus endpoint.
-
-Client-side HTTP/2 is in progress.
 
 ## Quickstart
 
