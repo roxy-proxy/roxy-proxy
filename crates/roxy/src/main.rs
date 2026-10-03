@@ -14,7 +14,9 @@ use roxy_tls::{Ca, CaError};
 use tracing_subscriber::EnvFilter;
 
 use roxy::config::Config;
+use roxy::ruletest;
 use roxy::secrets::Secrets;
+use roxy_rules::Phase;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -89,14 +91,66 @@ enum CaCommand {
 
 #[derive(Debug, Subcommand)]
 enum RuleCommand {
-    /// Dry-run a request against the rules (DESIGN.md §6.6). Not in M0.
-    Test {
-        #[arg(long, short = 'c')]
-        config: Option<PathBuf>,
-        /// Request line and options, e.g. `'POST https://host/path' -H 'k: v'`.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
+    /// Dry-run a request against the rules (DESIGN.md §6.6). Prints matched
+    /// rules, effects and the decision; exits 0 for allow, 3 for deny.
+    /// Secrets are not resolved (`[secret:name]` placeholders).
+    Test(Box<RuleTestArgs>),
+}
+
+#[derive(Debug, Args)]
+struct RuleTestArgs {
+    #[command(flatten)]
+    config: ConfigArg,
+    /// Phase whose chain to evaluate.
+    #[arg(long, value_enum, default_value = "request")]
+    phase: PhaseArg,
+    /// `client.ip`.
+    #[arg(long, default_value = "127.0.0.1")]
+    client_ip: std::net::IpAddr,
+    /// `client.user` (proxy-auth user).
+    #[arg(long)]
+    user: Option<String>,
+    /// Request header `name: value` (repeatable).
+    #[arg(short = 'H', long = "header")]
+    headers: Vec<String>,
+    /// Request body text (`body.text`, `body.size`).
+    #[arg(long)]
+    body: Option<String>,
+    /// `response.status` (response phase).
+    #[arg(long)]
+    status: Option<u16>,
+    /// Response header `name: value` (repeatable).
+    #[arg(short = 'R', long = "response-header")]
+    response_headers: Vec<String>,
+    /// Metric value `id=N` for `metric.<id>` (repeatable).
+    #[arg(long = "metric")]
+    metrics: Vec<String>,
+    /// State entry `key=value` for `state["key"]` (repeatable).
+    #[arg(long = "state")]
+    state: Vec<String>,
+    /// Initial tag (repeatable).
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+    /// `METHOD URL`, as two arguments or one (`'POST https://host/path'`).
+    #[arg(required = true, num_args = 1..=2, value_names = ["METHOD", "URL"])]
+    request: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PhaseArg {
+    Connect,
+    Request,
+    Response,
+}
+
+impl From<PhaseArg> for Phase {
+    fn from(p: PhaseArg) -> Self {
+        match p {
+            PhaseArg::Connect => Phase::Connect,
+            PhaseArg::Request => Phase::Request,
+            PhaseArg::Response => Phase::Response,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -125,10 +179,81 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
             command: CaCommand::Export { config, der, .. },
         } => ca_export(&config.config, der),
         Command::Rule {
-            command: RuleCommand::Test { .. },
-        } => {
-            eprintln!("roxy rule test: not implemented in M0");
-            Ok(ExitCode::from(2))
+            command: RuleCommand::Test(args),
+        } => rule_test(&args),
+    }
+}
+
+fn rule_test(args: &RuleTestArgs) -> anyhow::Result<ExitCode> {
+    let config = load_valid(&args.config.config)?;
+    let policy = config
+        .compile_policy()
+        .map_err(|_| anyhow::anyhow!("policy failed to compile"))?;
+    let (method, url) = match args.request.as_slice() {
+        [one] => one
+            .split_once(char::is_whitespace)
+            .map(|(m, u)| (m.to_owned(), u.trim().to_owned()))
+            .with_context(|| format!("expected `METHOD URL`, got {one:?}"))?,
+        [m, u] => (m.clone(), u.clone()),
+        _ => bail!("expected `METHOD URL`"),
+    };
+    let mut req = ruletest::TestRequest::new(&method, &url);
+    req.client_ip = args.client_ip;
+    req.user.clone_from(&args.user);
+    req.body.clone_from(&args.body);
+    req.status = args.status;
+    req.tags.clone_from(&args.tags);
+    let err = |e: String| anyhow::anyhow!(e);
+    req.headers = args
+        .headers
+        .iter()
+        .map(|h| ruletest::parse_header(h))
+        .collect::<Result<_, _>>()
+        .map_err(err)?;
+    req.response_headers = args
+        .response_headers
+        .iter()
+        .map(|h| ruletest::parse_header(h))
+        .collect::<Result<_, _>>()
+        .map_err(err)?;
+    req.state = args
+        .state
+        .iter()
+        .map(|s| ruletest::parse_pair(s))
+        .collect::<Result<_, _>>()
+        .map_err(err)?;
+    req.metrics = args
+        .metrics
+        .iter()
+        .map(|s| {
+            let (k, v) = ruletest::parse_pair(s)?;
+            let n = v
+                .parse::<i64>()
+                .map_err(|_| format!("metric {k:?}: {v:?} is not an integer"))?;
+            Ok((k, n))
+        })
+        .collect::<Result<_, String>>()
+        .map_err(err)?;
+
+    let (view, warnings) = ruletest::build_view(&config, &req).map_err(err)?;
+    for w in warnings {
+        eprintln!("roxy rule test: warning: {w}");
+    }
+    let phase = Phase::from(args.phase);
+    let out = ruletest::run(&policy, phase, &view, &req.tags);
+    // Secrets are never resolved here, so the redactor has none registered;
+    // effect text still goes through it so a future change cannot leak.
+    let redactor = Redactor::new();
+    print!("{}", ruletest::report(phase, &out, &redactor));
+    Ok(ExitCode::from(ruletest::exit_code(&out.decision)))
+}
+
+/// `<file>:<diagnostic>` plus the indented snippet for expression errors.
+fn print_diagnostic(path: &Path, d: &roxy::config::Diagnostic) {
+    eprintln!("{}:{d}", path.display());
+    if let Some(snippet) = &d.snippet {
+        for line in snippet.lines() {
+            eprintln!("    | {line}");
         }
     }
 }
@@ -163,7 +288,14 @@ fn load_valid(path: &Path) -> anyhow::Result<Config> {
     if let Err(diags) = config.validate() {
         let lines: Vec<String> = diags
             .iter()
-            .map(|d| format!("{}:{d}", path.display()))
+            .map(|d| {
+                let mut line = format!("{}:{d}", path.display());
+                for s in d.snippet.iter().flat_map(|s| s.lines()) {
+                    line.push_str("\n    | ");
+                    line.push_str(s);
+                }
+                line
+            })
             .collect();
         bail!("invalid config:\n{}", lines.join("\n"));
     }
@@ -207,7 +339,7 @@ fn check(path: &Path) -> ExitCode {
         }
         Err(diags) => {
             for d in &diags {
-                eprintln!("{}:{d}", path.display());
+                print_diagnostic(path, d);
             }
             eprintln!("{}: {} problem(s) found", path.display(), diags.len());
             ExitCode::FAILURE

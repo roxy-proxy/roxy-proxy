@@ -49,6 +49,9 @@ pub struct Config {
     pub upstream: Upstream,
     #[serde(default)]
     pub secrets: BTreeMap<String, SecretSource>,
+    /// Named IP address lists, referenced as `@name` in rules (§7.1).
+    #[serde(default)]
+    pub address_lists: Vec<AddressList>,
     #[serde(default)]
     pub metrics: Vec<Metric>,
     #[serde(default)]
@@ -253,6 +256,9 @@ pub struct Upstream {
     pub deny_private_ranges: bool,
     pub deny_cidrs: Vec<IpNet>,
     pub allow_cidrs: Vec<IpNet>,
+    /// Names of `address_lists` whose addresses are never valid upstream
+    /// destinations (§7.1), checked like `deny_cidrs`.
+    pub deny_lists: Vec<String>,
     #[serde(with = "humantime_serde")]
     pub connect_timeout: Duration,
 }
@@ -264,6 +270,7 @@ impl Default for Upstream {
             deny_private_ranges: true,
             deny_cidrs: Vec::new(),
             allow_cidrs: Vec::new(),
+            deny_lists: Vec::new(),
             connect_timeout: Duration::from_secs(10),
         }
     }
@@ -314,6 +321,49 @@ impl TryFrom<RawSecretSource> for SecretSource {
             (None, Some(file)) => Ok(Self::File(file)),
             _ => Err("a secret must have exactly one of `env` or `file`"),
         }
+    }
+}
+
+// ----- address lists ----------------------------------------------------------
+
+/// One entry of `address_lists:` (§7.1): a named set of IPs / CIDRs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "RawAddressList")]
+pub struct AddressList {
+    pub name: String,
+    pub source: AddressListSource,
+}
+
+/// Where an address list's entries come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddressListSource {
+    /// `file: PATH`: one entry per line (loaded at run time, M2).
+    File(PathBuf),
+    /// `inline: [cidr-or-ip, ...]`, kept as text so `check` can report each
+    /// bad entry by index.
+    Inline(Vec<String>),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAddressList {
+    name: String,
+    file: Option<PathBuf>,
+    inline: Option<Vec<String>>,
+}
+
+impl TryFrom<RawAddressList> for AddressList {
+    type Error = &'static str;
+    fn try_from(raw: RawAddressList) -> Result<Self, Self::Error> {
+        let source = match (raw.file, raw.inline) {
+            (Some(f), None) => AddressListSource::File(f),
+            (None, Some(v)) => AddressListSource::Inline(v),
+            _ => return Err("an address list must have exactly one of `file` or `inline`"),
+        };
+        Ok(Self {
+            name: raw.name,
+            source,
+        })
     }
 }
 

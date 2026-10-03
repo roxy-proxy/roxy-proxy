@@ -1,53 +1,25 @@
 //! Semantic validation that serde cannot express (§6.5).
+//!
+//! Rules and metrics are compiled by [`roxy_rules::Policy::compile`]; its
+//! diagnostics (with line/column within an expression) are merged with the
+//! checks here.
 
-use std::collections::{BTreeSet, HashMap};
-use std::fmt;
-use std::sync::LazyLock;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 
-use regex::Regex;
-use roxy_rules::config::Action;
+use ipnet::IpNet;
+use roxy_rules::{Policy, PolicyInput};
 
-use super::{CONFIG_VERSION, Config, ListenerMode, Phase, UpstreamVerify};
+use super::{AddressListSource, CONFIG_VERSION, Config, ListenerMode, UpstreamVerify};
 
 /// One problem found in a config, located by a YAML path such as
-/// `rules[2].when`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Diagnostic {
-    pub path: String,
-    pub message: String,
-}
-
-impl Diagnostic {
-    fn new(path: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            path: path.into(),
-            message: message.into(),
-        }
-    }
-}
-
-impl fmt::Display for Diagnostic {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.path, self.message)
-    }
-}
-
-/// `metric.<id>` references in expressions. M0 uses a plain scan; the M1
-/// compiler resolves references properly (and ignores string literals).
-static METRIC_REF: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\bmetric\.([A-Za-z0-9_\-]+)").expect("valid regex"));
-
-/// `${secret:name}` references in action values.
-static SECRET_REF: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\$\{secret:([^}]*)\}").expect("valid regex"));
-
-/// Identifiers usable as `metric.<id>` in the DSL.
-static IDENT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid regex"));
+/// `rules[2].when`. Displays as `path: message`, or `path:line:col: message`
+/// for expression errors (see [`roxy_rules::Diagnostic`]).
+pub use roxy_rules::Diagnostic;
 
 impl Config {
-    /// Check cross-references and constraints. Returns every problem found,
-    /// not just the first.
+    /// Check cross-references and constraints and compile the policy.
+    /// Returns every problem found, not just the first.
     pub fn validate(&self) -> Result<(), Vec<Diagnostic>> {
         let mut d = Vec::new();
 
@@ -64,15 +36,34 @@ impl Config {
         self.validate_listeners(&mut d);
         self.validate_tls(&mut d);
         self.validate_secrets(&mut d);
-        self.validate_metrics(&mut d);
+        self.validate_address_lists(&mut d);
         self.validate_addons(&mut d);
-        self.validate_rules(&mut d);
 
-        // M1: Policy::compile — compile `when`/`where` expressions and typed
-        // actions with roxy-rules here and append its diagnostics (with
-        // line/column within the expression).
+        if let Err(policy) = self.compile_policy() {
+            d.extend(policy);
+        }
 
         if d.is_empty() { Ok(()) } else { Err(d) }
+    }
+
+    /// Compile the rules and metrics (§6.5). `validate` calls this; the run
+    /// path and `roxy rule test` use the result.
+    pub fn compile_policy(&self) -> Result<Policy, Vec<Diagnostic>> {
+        let secret_names: HashSet<String> = self.secrets.keys().cloned().collect();
+        let addon_names: HashSet<String> = self.addons.iter().map(|a| a.name.clone()).collect();
+        let address_lists: HashSet<String> =
+            self.address_lists.iter().map(|l| l.name.clone()).collect();
+        Policy::compile(&PolicyInput {
+            rules: &self.rules,
+            metrics: &self.metrics,
+            secret_names: &secret_names,
+            addon_names: &addon_names,
+            address_lists: &address_lists,
+            transparent_listeners: self
+                .listeners
+                .iter()
+                .any(|l| l.mode == ListenerMode::Transparent),
+        })
     }
 
     fn validate_listeners(&self, d: &mut Vec<Diagnostic>) {
@@ -178,42 +169,6 @@ impl Config {
         }
     }
 
-    fn validate_metrics(&self, d: &mut Vec<Diagnostic>) {
-        let mut ids: HashMap<&str, usize> = HashMap::new();
-        for (i, m) in self.metrics.iter().enumerate() {
-            let path = format!("metrics[{i}]");
-            if !IDENT.is_match(&m.id) {
-                d.push(Diagnostic::new(
-                    format!("{path}.id"),
-                    format!(
-                        "invalid metric id {:?}: must match [A-Za-z_][A-Za-z0-9_]* so it can be used as metric.<id>",
-                        m.id
-                    ),
-                ));
-            }
-            if let Some(first) = ids.insert(m.id.as_str(), i) {
-                d.push(Diagnostic::new(
-                    format!("{path}.id"),
-                    format!(
-                        "duplicate metric id {:?} (first defined at metrics[{first}])",
-                        m.id
-                    ),
-                ));
-            }
-            if m.window.is_some_and(|w| w.is_zero()) {
-                d.push(Diagnostic::new(
-                    format!("{path}.window"),
-                    "window must be greater than zero",
-                ));
-            }
-        }
-        for (i, m) in self.metrics.iter().enumerate() {
-            if let Some(expr) = &m.where_ {
-                self.check_metric_refs(expr.as_str(), &format!("metrics[{i}].where"), d);
-            }
-        }
-    }
-
     fn validate_addons(&self, d: &mut Vec<Diagnostic>) {
         let mut names: HashMap<&str, usize> = HashMap::new();
         for (i, a) in self.addons.iter().enumerate() {
@@ -241,105 +196,74 @@ impl Config {
         }
     }
 
-    fn validate_rules(&self, d: &mut Vec<Diagnostic>) {
-        let mut ids: HashMap<&str, usize> = HashMap::new();
-        for (i, rule) in self.rules.iter().enumerate() {
-            let path = format!("rules[{i}]");
-            if rule.id.trim().is_empty() {
+    /// Names unique and usable as `@name`; inline entries parse; files exist
+    /// (contents are loaded at run time, M2). `upstream.deny_lists` must
+    /// name defined lists.
+    fn validate_address_lists(&self, d: &mut Vec<Diagnostic>) {
+        let mut names: HashMap<&str, usize> = HashMap::new();
+        for (i, list) in self.address_lists.iter().enumerate() {
+            let path = format!("address_lists[{i}]");
+            if !is_list_name(&list.name) {
                 d.push(Diagnostic::new(
-                    format!("{path}.id"),
-                    "rule id must not be empty",
-                ));
-            } else if rule.id.starts_with('_') {
-                d.push(Diagnostic::new(
-                    format!("{path}.id"),
+                    format!("{path}.name"),
                     format!(
-                        "rule id {:?}: ids starting with `_` are reserved (e.g. `_default`)",
-                        rule.id
+                        "invalid address list name {:?}: must match [A-Za-z_][A-Za-z0-9_-]* so \
+                         it can be used as @name",
+                        list.name
                     ),
                 ));
             }
-            if let Some(first) = ids.insert(rule.id.as_str(), i) {
+            if let Some(first) = names.insert(list.name.as_str(), i) {
                 d.push(Diagnostic::new(
-                    format!("{path}.id"),
+                    format!("{path}.name"),
                     format!(
-                        "duplicate rule id {:?} (first defined at rules[{first}])",
-                        rule.id
+                        "duplicate address list name {:?} (first defined at address_lists[{first}])",
+                        list.name
                     ),
                 ));
             }
-            if let Some(expr) = &rule.when {
-                self.check_metric_refs(expr.as_str(), &format!("{path}.when"), d);
-            }
-            for (j, action) in rule.then.0.iter().enumerate() {
-                let apath = format!("{path}.then[{j}]");
-                let strings = action_strings(action);
-                let mut seen = BTreeSet::new();
-                for s in strings {
-                    for cap in SECRET_REF.captures_iter(s) {
-                        let name = &cap[1];
-                        if !seen.insert(name.to_owned()) {
-                            continue;
-                        }
-                        if !self.secrets.contains_key(name) {
+            match &list.source {
+                AddressListSource::Inline(entries) => {
+                    if entries.is_empty() {
+                        d.push(Diagnostic::new(
+                            format!("{path}.inline"),
+                            "inline address list must not be empty",
+                        ));
+                    }
+                    for (j, e) in entries.iter().enumerate() {
+                        let e = e.trim();
+                        if e.parse::<IpNet>().is_err() && e.parse::<IpAddr>().is_err() {
                             d.push(Diagnostic::new(
-                                apath.clone(),
-                                format!("reference to undefined secret {name:?} (define it under `secrets`)"),
-                            ));
-                        }
-                        if rule.phase != Phase::Request {
-                            d.push(Diagnostic::new(
-                                apath.clone(),
-                                format!(
-                                    "secret references are only allowed in request-phase rules (this rule is `{}`)",
-                                    rule.phase.as_str()
-                                ),
+                                format!("{path}.inline[{j}]"),
+                                format!("{e:?} is not an IP address or CIDR"),
                             ));
                         }
                     }
                 }
-                if let Action::Call(addon) = action
-                    && !self.addons.iter().any(|a| &a.name == addon)
-                {
-                    d.push(Diagnostic::new(
-                        apath,
-                        format!("`call` names undefined addon {addon:?}"),
-                    ));
+                AddressListSource::File(file) => {
+                    if !file.exists() {
+                        d.push(Diagnostic::new(
+                            format!("{path}.file"),
+                            format!("{} does not exist", file.display()),
+                        ));
+                    }
                 }
             }
         }
-    }
-
-    fn check_metric_refs(&self, expr: &str, path: &str, d: &mut Vec<Diagnostic>) {
-        let mut seen = BTreeSet::new();
-        for cap in METRIC_REF.captures_iter(expr) {
-            let id = &cap[1];
-            if seen.insert(id.to_owned()) && !self.metrics.iter().any(|m| m.id == id) {
+        for (i, name) in self.upstream.deny_lists.iter().enumerate() {
+            if !names.contains_key(name.as_str()) {
                 d.push(Diagnostic::new(
-                    path,
-                    format!("reference to undefined metric `metric.{id}`"),
+                    format!("upstream.deny_lists[{i}]"),
+                    format!("undefined address list {name:?} (define it under `address_lists`)"),
                 ));
             }
         }
     }
 }
 
-/// Every string argument (map keys included) of an action.
-fn action_strings(action: &Action) -> Vec<&str> {
-    match action {
-        Action::SetHeader(pairs) | Action::SetQuery(pairs) => pairs
-            .iter()
-            .flat_map(|(k, v)| [k.as_str(), v.as_str()])
-            .collect(),
-        Action::RemoveHeader(names) | Action::RemoveQuery(names) => {
-            names.iter().map(String::as_str).collect()
-        }
-        Action::Deny(d) => d.message.as_deref().into_iter().collect(),
-        Action::RewritePath(r) => vec![&r.pattern, &r.to],
-        Action::Redirect(r) => vec![&r.host],
-        Action::Tag(s) | Action::Call(s) => vec![s],
-        Action::Log(l) => vec![&l.message],
-        Action::SetState(s) => vec![&s.key, &s.value],
-        Action::Allow(_) | Action::Passthrough | Action::Capture(_) => Vec::new(),
-    }
+fn is_list_name(s: &str) -> bool {
+    let mut b = s.bytes();
+    b.next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+        && b.all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }
