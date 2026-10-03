@@ -19,6 +19,7 @@
 //! - [`ws`]: WebSocket upgrade handshake validation (relay tier).
 
 mod chars;
+pub mod h1;
 pub mod model;
 pub mod url;
 

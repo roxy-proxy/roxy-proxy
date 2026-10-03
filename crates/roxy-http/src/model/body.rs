@@ -375,25 +375,43 @@ impl BodySender {
         self.try_push(data)
     }
 
-    /// Sends a trailers frame (only when the protocol layer allows trailers).
-    pub async fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), BodyError> {
-        self.ready().await?;
+    /// Pushes a trailers frame (only when the protocol layer allows
+    /// trailers). Call [`BodySender::ready`] first.
+    pub fn try_push_trailers(&mut self, trailers: HeaderMap) -> Result<(), BodyError> {
+        if self.failed {
+            return Err(BodyError::Closed);
+        }
         self.tx
             .try_send(Msg::Trailers(trailers))
             .map_err(|_| BodyError::Closed)
     }
 
-    /// Completes the body. Fails (and errors the body) if fewer bytes than
-    /// the declared length were sent.
-    pub async fn finish(mut self) -> Result<(), BodyError> {
+    /// Sends a trailers frame, waiting for capacity.
+    pub async fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), BodyError> {
+        self.ready().await?;
+        self.try_push_trailers(trailers)
+    }
+
+    /// Completes the body without waiting. Fails (and errors the body) if
+    /// fewer bytes than the declared length were sent. Call
+    /// [`BodySender::ready`] first.
+    pub fn try_finish(mut self) -> Result<(), BodyError> {
         if self.failed {
             return Err(BodyError::Closed);
         }
         if self.known_length.is_some_and(|k| k != self.sent) {
             return Err(self.fail(BodyError::LengthMismatch));
         }
-        self.ready().await?;
         self.tx.try_send(Msg::End).map_err(|_| BodyError::Closed)
+    }
+
+    /// Completes the body, waiting for capacity.
+    pub async fn finish(mut self) -> Result<(), BodyError> {
+        if self.known_length.is_some_and(|k| k != self.sent) {
+            return Err(self.fail(BodyError::LengthMismatch));
+        }
+        self.ready().await?;
+        self.try_finish()
     }
 
     /// Ends the body with an error (best effort; if undeliverable the body

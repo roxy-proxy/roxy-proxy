@@ -13,6 +13,7 @@ pub use body::{Body, BodySender, CHANNEL_DEPTH};
 pub(crate) use error::reject;
 pub use error::{BodyError, ParseError, Reason, WriteError};
 pub use headers::{Headers, RESERVED, is_reserved};
+pub(crate) use headers::{connection_tokens, validate_value};
 pub use limits::{HttpFlags, Limits};
 pub use message::{
     CanonicalRequest, CanonicalResponse, RequestMeta, ResponseMeta, TargetForm, Version,
