@@ -803,7 +803,12 @@ every mainstream library does automatically.
   (`tls.leaf_cache_size`, default 10 000). Minting is sync and ~1 ms, done on
   the blocking pool.
 - **Client-facing rustls:** `ResolvesServerCert` picks/mints by SNI. ALPN
-  offers `h2` (if `http.enable_h2`) and `http/1.1`. TLS 1.2 + 1.3.
+  offers `h2` (if `http.enable_h2`) and `http/1.1`. TLS 1.2 + 1.3. A cheap
+  per-connection `ServerConfig` carries the CONNECT host as the fallback name
+  for SNI-less clients; an SNI that is present but invalid fails the handshake
+  rather than silently using the fallback. Session resumption is off (no
+  session storage, no TLS 1.3 tickets): agent clients are short-lived and
+  resumption state is one more thing to bound.
 - **Distribution:** the CA cert (never the key) is served at
   `http://<ca_server.bind>/roxy-ca.pem` and, in explicit mode, at
   `http://roxy.internal/roxy-ca.pem` through the proxy itself (the mitm.it
@@ -811,7 +816,9 @@ every mainstream library does automatically.
   export [--der|--pem]` prints it for injection at image build time.
 - **ClientHello sniffing:** a small parser that reads just enough of the first
   TLS record to extract SNI and ALPN, with a hard cap on bytes read (16 KiB) and
-  a timeout. Used after CONNECT in proxy mode to get SNI/ALPN and to confirm
+  a timeout. A ClientHello split across several TLS records, or a malformed or
+  hostile `server_name` (non-ASCII, NUL, duplicate extension), is classified as
+  not-TLS and the connection is closed; no real client does either. Used after CONNECT in proxy mode to get SNI/ALPN and to confirm
   the tunnel carries TLS; reused by transparent mode later for MITM vs
   passthrough vs close.
 
