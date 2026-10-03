@@ -6,6 +6,7 @@ members = [
     "crates/roxy-proxy",
     "crates/roxy-rules",
     "crates/roxy-tls",
+    "crates/roxy-wasm",
 ]
 
 [workspace.package]
