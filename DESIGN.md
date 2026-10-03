@@ -509,6 +509,8 @@ secrets:
   openai: { env: OPENAI_API_KEY }
   gh:     { file: /run/secrets/github_token }
 
+default: deny                  # deny (default) | allow: what happens when no rule matches
+
 metrics:
   - id: github_writes
     count: requests
@@ -572,19 +574,22 @@ bytes, WebSocket messages, and metric values that this exchange adds to.
 Rules are **one ordered list** of conditions over those values. There are no
 phases; when a rule runs follows from what it reads.
 
-1. **The forwarding decision is made at the request head.** roxy goes through
-   the rules top to bottom, considering those whose values are known at that
-   point. The first terminal action (`allow` or `deny`) wins. If none
-   matches, the request is **denied** (rule id `_default`). A rule that reads
-   a value not yet known is skipped here, not treated as false.
+1. **The forwarding decision is made at the request head, and deny wins.**
+   roxy evaluates every rule whose values are known at that point. If any
+   matching rule denies, the request is denied. Otherwise, if any matching
+   rule allows, it is allowed. Otherwise the default applies:
+   `default: deny` (the default) denies and `default: allow` allows, both
+   with rule id `_default`. Rule order does not affect the decision, so the
+   usual shape is a set of allowed hosts plus denies that restrict them,
+   anywhere in the list. A rule that reads a value not yet known is skipped
+   here, not treated as false.
 2. **After that, rules watch.** For the rest of the exchange, two kinds of
    rule are re-checked whenever a value they read becomes known or changes:
    rules that read a value known only after forwarding (the *watched*
    fields in §6.2), and `deny` rules that read a metric this exchange adds
    to. If a deny matches, roxy stops the exchange: an error response if the
    response has not started, otherwise the connection (or HTTP/2 stream, or
-   WebSocket) is closed. When several rules become decidable at the same
-   moment, they are checked top to bottom and the first deny wins.
+   WebSocket) is closed. Nothing can override a deny at any point.
 3. **Only rules decided at the request head can `allow`.** A rule that reads
    a value known only after forwarding (the table in §6.2) cannot allow, and
    cannot change the request (`set_header` on the request, `rewrite_path`,
@@ -594,13 +599,17 @@ phases; when a rule runs follows from what it reads.
    yet been sent to the client.
 4. **Non-terminal effects of a watching rule apply once**, the first time it
    matches.
-5. **Order matters only among rules decided at the same moment.** A deny
-   rule on `body.bytes` listed above a head-time `allow` still stops the
-   upload when the bytes cross its limit.
+5. **Order matters for effects, not decisions.** Rules are evaluated top to
+   bottom, so a `tag` set by a matching rule is visible to rules below it.
+   If the request is allowed, the non-terminal effects of every matching rule
+   apply in list order; if two set the same header, the later one wins.
+   Allow options (`upgrade`, `private_ok`) come from the first matching
+   allow rule only. The flow log names the first matching deny (or allow)
+   as `terminal_rule`.
 
-A rule's `then` is a list of actions (or a single action). Non-terminal
-actions (`set_header`, `tag`, `log`, ...) take effect and evaluation
-continues; the first terminal action ends it. `roxy check` and
+A rule's `then` is a list of actions (or a single action): any number of
+non-terminal actions (`set_header`, `tag`, `log`, ...) and at most one
+terminal action (`allow` or `deny`), last. `roxy check` and
 `roxy rule test` report, for each rule, whether it is decided at the request
 head or watches later values.
 
@@ -1548,7 +1557,7 @@ be built by separate agents in parallel because `roxy-http`, `roxy-tls` and
 | # | question | proposed default |
 |---|---|---|
 | 1 | Transparent-mode upstream target (§4.2) | `resolve`; decide when transparent mode is built |
-| 2 | Rule evaluation: first terminal action wins, chain exhausted → deny (§6.1) | as stated |
+| 2 | Rule precedence: any matching deny wins, then any matching allow, then `default` (deny unless set to allow) (§6.1) | as stated |
 | 3 | Addons are layers above the rules, in listed order; rules evaluate every request that leaves; addons' own calls go to named endpoints (§11) | as stated |
 | 4 | Deny response body includes rule id and flow id (§5.7) | yes, informative 403 by default |
 | 5 | Size units 1024-based (§6.2) | yes |
