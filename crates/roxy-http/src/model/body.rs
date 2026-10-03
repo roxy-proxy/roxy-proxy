@@ -38,6 +38,14 @@ enum Inner {
         body: Mutex<BoxedBody>,
         done: bool,
     },
+    /// `first` (a frame already read from `rest`), then `rest`. Boxed so
+    /// `Body` (held by many connection futures) stays small.
+    Prefixed(Box<Prefixed>),
+}
+
+struct Prefixed {
+    first: Option<Frame<Bytes>>,
+    rest: Body,
 }
 
 type BoxedBody = Pin<Box<dyn http_body::Body<Data = Bytes, Error = BodyError> + Send + 'static>>;
@@ -60,6 +68,7 @@ impl fmt::Debug for Body {
             Inner::Full(_) => "full",
             Inner::Channel { .. } => "channel",
             Inner::Boxed { .. } => "boxed",
+            Inner::Prefixed(_) => "prefixed",
         };
         f.debug_struct("Body")
             .field("kind", &kind)
@@ -187,6 +196,84 @@ impl Body {
     }
 }
 
+impl Body {
+    /// Buffers at most the first `max` bytes of the body, for inspection,
+    /// without losing the rest. Returns `(prefix, remainder)`:
+    ///
+    /// * `remainder == None`: the body ended cleanly and `prefix` is all of
+    ///   it (`prefix.len() <= max`).
+    /// * `remainder == Some(rest)`: `prefix` holds exactly `max` bytes (fewer
+    ///   only if trailers followed the data) and `rest` yields everything
+    ///   after them — the rest of the data, any trailers, and any error the
+    ///   stream ends with — so `prefix` followed by `rest` is the original
+    ///   stream. `rest` keeps the original's caps and length checks, and its
+    ///   [`Body::known_length`] is the original's minus `prefix.len()`.
+    ///
+    /// An error before `max` bytes (or before the end of a shorter body) is
+    /// returned as `Err` and the body is consumed. Allocates at most `max`
+    /// bytes plus one frame. To decide whether a body is longer than `max`
+    /// when the length is unknown, this waits for the frame after the
+    /// first `max` bytes (or the end of the stream).
+    pub async fn collect_prefix(mut self, max: u64) -> Result<(Bytes, Option<Body>), BodyError> {
+        let cap = usize::try_from(max).unwrap_or(usize::MAX);
+        let mut buf = BytesMut::with_capacity(
+            cap.min(usize::try_from(self.known_length.unwrap_or(0)).unwrap_or(usize::MAX))
+                .min(64 * 1024),
+        );
+        loop {
+            let frame = poll_fn(|cx| http_body::Body::poll_frame(Pin::new(&mut self), cx)).await;
+            let frame = match frame {
+                None => return Ok((buf.freeze(), None)),
+                Some(Err(e)) => return Err(e),
+                Some(Ok(f)) => f,
+            };
+            let mut data = match frame.into_data() {
+                Ok(d) if d.is_empty() => continue,
+                Ok(d) => d,
+                Err(trailers) => {
+                    // Trailers end the data: hand them back as the rest.
+                    let len = buf.len() as u64;
+                    return Ok((buf.freeze(), Some(self.prefixed(Some(trailers), len))));
+                }
+            };
+            let room = cap - buf.len();
+            if data.len() < room {
+                buf.extend_from_slice(&data);
+                continue;
+            }
+            if data.len() == room {
+                // Exactly `max` bytes so far: the body is longer only if
+                // anything else follows. Peek one more frame.
+                buf.extend_from_slice(&data);
+                let len = buf.len() as u64;
+                let next = poll_fn(|cx| http_body::Body::poll_frame(Pin::new(&mut self), cx)).await;
+                return match next {
+                    None => Ok((buf.freeze(), None)),
+                    Some(Err(e)) => Err(e),
+                    Some(Ok(f)) => Ok((buf.freeze(), Some(self.prefixed(Some(f), len)))),
+                };
+            }
+            let tail = data.split_off(room);
+            buf.extend_from_slice(&data);
+            let len = buf.len() as u64;
+            return Ok((
+                buf.freeze(),
+                Some(self.prefixed(Some(Frame::data(tail)), len)),
+            ));
+        }
+    }
+
+    /// `first` then the rest of `self`, which has already yielded `taken`
+    /// data bytes.
+    fn prefixed(self, first: Option<Frame<Bytes>>, taken: u64) -> Body {
+        let known_length = self.known_length.map(|k| k.saturating_sub(taken));
+        Body {
+            inner: Inner::Prefixed(Box::new(Prefixed { first, rest: self })),
+            known_length,
+        }
+    }
+}
+
 impl http_body::Body for Body {
     type Data = Bytes;
     type Error = BodyError;
@@ -221,6 +308,10 @@ impl http_body::Body for Body {
                 };
                 Poll::Ready(out)
             }
+            Inner::Prefixed(p) => match p.first.take() {
+                Some(f) => Poll::Ready(Some(Ok(f))),
+                None => Pin::new(&mut p.rest).poll_frame(cx),
+            },
             Inner::Boxed { body, done } => {
                 if *done {
                     return Poll::Ready(None);
@@ -243,6 +334,7 @@ impl http_body::Body for Body {
             Inner::Empty | Inner::Full(None) => true,
             Inner::Full(Some(_)) => false,
             Inner::Channel { done, .. } | Inner::Boxed { done, .. } => *done,
+            Inner::Prefixed(p) => p.first.is_none() && p.rest.is_end_stream(),
         }
     }
 
@@ -544,6 +636,140 @@ mod tests {
             Body::wrap(inner, 5).collect_up_to(5).await.unwrap(),
             "hello"
         );
+    }
+
+    async fn prefix_of(body: Body, max: u64) -> (Bytes, Option<Vec<Result<Bytes, BodyError>>>) {
+        let (p, rest) = body.collect_prefix(max).await.unwrap();
+        let rest = match rest {
+            Some(r) => Some(frames(r).await),
+            None => None,
+        };
+        (p, rest)
+    }
+
+    fn chunked(parts: &'static [&'static [u8]], known: Option<u64>) -> Body {
+        let (mut tx, body) = Body::channel(1 << 20, known);
+        tokio::spawn(async move {
+            for p in parts {
+                tx.send_data(Bytes::from_static(p)).await.unwrap();
+            }
+            tx.finish().await.unwrap();
+        });
+        body
+    }
+
+    #[tokio::test]
+    async fn collect_prefix_known_length() {
+        // Shorter than max: the whole body, no remainder.
+        assert_eq!(
+            prefix_of(Body::from_bytes("hello"), 10).await,
+            (Bytes::from_static(b"hello"), None)
+        );
+        // Exactly max: no remainder.
+        assert_eq!(
+            prefix_of(Body::from_bytes("hello"), 5).await,
+            (Bytes::from_static(b"hello"), None)
+        );
+        assert_eq!(prefix_of(Body::empty(), 0).await, (Bytes::new(), None));
+        // Longer: split inside the frame; the rest keeps the length.
+        let (p, rest) = Body::from_bytes("hello world")
+            .collect_prefix(4)
+            .await
+            .unwrap();
+        assert_eq!(p, "hell");
+        let rest = rest.unwrap();
+        assert_eq!(rest.known_length(), Some(7));
+        assert_eq!(rest.size_hint().exact(), Some(7));
+        assert_eq!(rest.collect_up_to(100).await.unwrap(), "o world");
+        // max 0: everything is remainder.
+        let (p, rest) = Body::from_bytes("abc").collect_prefix(0).await.unwrap();
+        assert!(p.is_empty());
+        assert_eq!(rest.unwrap().collect_up_to(3).await.unwrap(), "abc");
+        // Channel with a declared length, split across frames.
+        let (p, rest) = chunked(&[b"ab", b"cd", b"ef"], Some(6))
+            .collect_prefix(3)
+            .await
+            .unwrap();
+        assert_eq!(p, "abc");
+        let rest = rest.unwrap();
+        assert_eq!(rest.known_length(), Some(3));
+        assert_eq!(rest.collect_up_to(3).await.unwrap(), "def");
+    }
+
+    #[tokio::test]
+    async fn collect_prefix_unknown_length() {
+        assert_eq!(
+            prefix_of(chunked(&[b"ab", b"cd"], None), 10).await,
+            (Bytes::from_static(b"abcd"), None)
+        );
+        // Ends exactly at max: the peek sees the clean end.
+        assert_eq!(
+            prefix_of(chunked(&[b"ab", b"cd"], None), 4).await,
+            (Bytes::from_static(b"abcd"), None)
+        );
+        // Frame boundary at max with more to come: the next frame is the rest.
+        let (p, rest) = prefix_of(chunked(&[b"ab", b"cd", b"ef"], None), 4).await;
+        assert_eq!(p, "abcd");
+        assert_eq!(rest.unwrap(), vec![Ok(Bytes::from_static(b"ef"))]);
+        // Split mid-frame.
+        let (p, rest) = prefix_of(chunked(&[b"abc", b"def", b"g"], None), 4).await;
+        assert_eq!(p, "abcd");
+        assert_eq!(
+            rest.unwrap(),
+            vec![Ok(Bytes::from_static(b"ef")), Ok(Bytes::from_static(b"g"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_prefix_errors_and_trailers() {
+        // An error inside the prefix is returned.
+        let (mut tx, body) = Body::channel(100, None);
+        tx.send_data(Bytes::from_static(b"ab")).await.unwrap();
+        drop(tx);
+        assert_eq!(
+            body.collect_prefix(10).await.unwrap_err(),
+            BodyError::Incomplete
+        );
+        // An error after the prefix stays in the remainder: never a clean end.
+        let (mut tx, body) = Body::channel(100, None);
+        tx.send_data(Bytes::from_static(b"abcdef")).await.unwrap();
+        drop(tx);
+        let (p, rest) = prefix_of(body, 2).await;
+        assert_eq!(p, "ab");
+        assert_eq!(
+            rest.unwrap(),
+            vec![Ok(Bytes::from_static(b"cdef")), Err(BodyError::Incomplete)]
+        );
+        // The body's own cap still applies.
+        let capped = Body::wrap(
+            http_body_util::Full::new(Bytes::from_static(b"0123456789")),
+            5,
+        );
+        assert_eq!(
+            capped.collect_prefix(2).await.unwrap_err(),
+            BodyError::TooLarge { limit: 5 }
+        );
+        // Trailers after the data come back as the remainder.
+        let (mut tx, body) = Body::channel(100, None);
+        tx.send_data(Bytes::from_static(b"ab")).await.unwrap();
+        let mut t = HeaderMap::new();
+        t.insert("x-t", http::HeaderValue::from_static("1"));
+        tx.send_trailers(t).await.unwrap();
+        tx.finish().await.unwrap();
+        let (p, rest) = body.collect_prefix(10).await.unwrap();
+        assert_eq!(p, "ab");
+        let mut rest = rest.unwrap();
+        let f = poll_fn(|cx| Pin::new(&mut rest).poll_frame(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.into_trailers().unwrap()["x-t"], "1");
+        assert!(
+            poll_fn(|cx| Pin::new(&mut rest).poll_frame(cx))
+                .await
+                .is_none()
+        );
+        assert!(rest.is_end_stream());
     }
 
     #[tokio::test]
