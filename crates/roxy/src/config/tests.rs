@@ -106,6 +106,8 @@ fn minimal_example_uses_defaults() {
     assert_eq!(l.body_idle_timeout, Duration::from_secs(30));
     assert_eq!(l.max_connections_per_client, 256);
     assert_eq!(l.max_metric_keys, 100_000);
+    assert_eq!(l.max_metric_bytes.as_u64(), 256 << 20);
+    assert_eq!(l.metric_limits(), roxy_rules::MetricLimits::default());
     assert!(cfg.upstream.deny_private_ranges);
     assert_eq!(cfg.upstream.connect_timeout, Duration::from_secs(10));
     assert_eq!(cfg.upstream.dns.cache_ttl_cap, Duration::from_secs(60));
@@ -226,6 +228,32 @@ fn metric_count_unique() {
     assert_eq!(cfg.metrics[0].count, MetricCount::Unique("host".into()));
     assert!(cfg.metrics[0].window.is_none());
     assert_eq!(cfg.metrics[0].key, Vec::<String>::new());
+}
+
+#[test]
+fn max_metric_bytes_parses_with_units() {
+    let cfg = parse(&format!(
+        "{BASE}limits:\n  max_metric_keys: 10\n  max_metric_bytes: 4 MiB\n"
+    ));
+    cfg.validate().unwrap();
+    assert_eq!(
+        cfg.limits.metric_limits(),
+        roxy_rules::MetricLimits {
+            max_keys: 10,
+            max_bytes: 4 << 20,
+        }
+    );
+    let cfg = parse(&format!("{BASE}limits:\n  max_metric_bytes: 64gb\n"));
+    cfg.validate().unwrap();
+}
+
+#[test]
+fn max_metric_bytes_out_of_range_diagnosed() {
+    for bad in ["0", "65gb", "1tb"] {
+        let d = diagnostics(&format!("{BASE}limits:\n  max_metric_bytes: {bad}\n"));
+        assert_eq!(d.len(), 1, "{bad}: {d:?}");
+        assert_eq!(d[0].path, "limits.max_metric_bytes", "{bad}");
+    }
 }
 
 #[test]

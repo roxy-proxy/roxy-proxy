@@ -249,6 +249,11 @@ pub struct Limits {
     #[serde(deserialize_with = "units::size")]
     pub h2_max_header_list_bytes: ByteSize,
     pub max_metric_keys: usize,
+    /// Approximate byte budget across all metric series (§6.4). A flow that
+    /// would take the store past it is denied like a full key table; nothing
+    /// is evicted.
+    #[serde(deserialize_with = "units::size")]
+    pub max_metric_bytes: ByteSize,
     /// Cap on live `set_state` entries; a new key when full denies the flow
     /// that tried (§6.4, no eviction).
     pub max_state_entries: usize,
@@ -282,8 +287,22 @@ impl Default for Limits {
             h2_max_concurrent_streams: 100,
             h2_max_header_list_bytes: ByteSize::b(64 * KIB),
             max_metric_keys: 100_000,
+            max_metric_bytes: ByteSize::b(roxy_rules::DEFAULT_MAX_METRIC_BYTES as u64),
             max_state_entries: 100_000,
             max_address_list_bytes: ByteSize::b(256 * MIB),
+        }
+    }
+}
+
+impl Limits {
+    /// The metric store's bounds. `max_metric_bytes` is validated to fit a
+    /// `usize`; should an unvalidated value not fit, it saturates (the
+    /// budget is a cap, so this can only be reached by a value that is
+    /// already past the validated ceiling).
+    pub fn metric_limits(&self) -> roxy_rules::MetricLimits {
+        roxy_rules::MetricLimits {
+            max_keys: self.max_metric_keys,
+            max_bytes: usize::try_from(self.max_metric_bytes.as_u64()).unwrap_or(usize::MAX),
         }
     }
 }

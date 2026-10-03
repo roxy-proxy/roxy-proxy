@@ -48,6 +48,7 @@ limits:
   max_connections: 10000
   max_connections_per_client: 256
   max_metric_keys: 100000
+  max_metric_bytes: 256mb         # metric store byte budget; full = deny new keys, never evict
   max_address_list_bytes: 256mb   # largest address list file roxy will load
 
 upstream:
