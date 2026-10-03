@@ -132,7 +132,8 @@ fn run_refuses_features_not_in_this_build() {
     let out = roxy(&["run", "--config", example("roxy.yaml").to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(1));
     let err = text(&out.stderr);
-    assert!(err.contains("this build has no metric store yet"), "{err}");
+    assert!(err.contains("WASM addons are not in this build"), "{err}");
+    assert!(!err.contains("metric store"), "{err}");
     assert_eq!(err.trim().lines().count(), 1, "{err}");
 }
 

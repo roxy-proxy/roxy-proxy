@@ -231,6 +231,9 @@ pub struct Limits {
     #[serde(deserialize_with = "units::size")]
     pub h2_max_header_list_bytes: ByteSize,
     pub max_metric_keys: usize,
+    /// Cap on live `set_state` entries; a new key when full denies the flow
+    /// that tried (§6.4, no eviction).
+    pub max_state_entries: usize,
 }
 
 const KIB: u64 = 1024;
@@ -257,6 +260,7 @@ impl Default for Limits {
             h2_max_concurrent_streams: 100,
             h2_max_header_list_bytes: ByteSize::b(64 * KIB),
             max_metric_keys: 100_000,
+            max_state_entries: 100_000,
         }
     }
 }

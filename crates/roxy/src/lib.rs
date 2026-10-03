@@ -6,3 +6,4 @@ pub mod config;
 pub mod ruletest;
 pub mod run;
 pub mod secrets;
+pub mod stores;

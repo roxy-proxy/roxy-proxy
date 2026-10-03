@@ -12,8 +12,7 @@ use anyhow::{Context as _, anyhow};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use roxy_proxy::{
     FileSink, FlowEvent, FlowSink, ListenerSpec, MetricSource, PolicyUpdate, Redactor,
-    RuntimeConfig, Server, ServerHandle, StateSource, StdoutSink, UnavailableMetrics,
-    UnavailableState, UserDb,
+    RuntimeConfig, Server, ServerHandle, StateSource, StdoutSink, UserDb,
 };
 use roxy_rules::ast::{Expr as Ast, Lit, Node, Operand};
 use roxy_tls::{Ca, CaError, LeafMinter};
@@ -195,6 +194,9 @@ pub struct Reloader {
     handle: ServerHandle,
     caps: Capabilities,
     last: Mutex<Config>,
+    /// The built-in metric store, rebuilt (with carry-over) on each reload.
+    /// `None` when the caller supplied its own `MetricSource`.
+    metrics: Option<Arc<crate::stores::ReloadableMetrics>>,
 }
 
 impl std::fmt::Debug for Reloader {
@@ -256,7 +258,14 @@ impl Reloader {
             Ok((config, update))
         };
         let result = attempt().and_then(|(config, update)| {
+            let next_metrics = self
+                .metrics
+                .as_ref()
+                .map(|m| m.prepare(&update.policy, config.limits.max_metric_keys));
             self.handle.reload(update).map_err(|e| vec![e])?;
+            if let (Some(m), Some(next)) = (&self.metrics, next_metrics) {
+                m.install(next);
+            }
             Ok(config)
         });
         match result {
@@ -363,15 +372,29 @@ impl Running {
 pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
     roxy_tls::install_crypto_provider();
     let config = load_checked(path).map_err(|d| anyhow!("invalid config:\n{}", d.join("\n")))?;
+    // The built-in stores are always available; callers (tests) may still
+    // inject their own.
     let caps = Capabilities {
-        metric_store: opts.metrics.is_some(),
-        state_store: opts.state.is_some(),
+        metric_store: true,
+        state_store: true,
     };
     let bad = unsupported(&config, caps);
     if !bad.is_empty() {
         return Err(anyhow!("cannot run this config: {}", bad.join("; ")));
     }
     let update = policy_update(&config)?;
+    let (metric_source, builtin_metrics): (
+        Arc<dyn MetricSource>,
+        Option<Arc<crate::stores::ReloadableMetrics>>,
+    ) = if let Some(m) = opts.metrics {
+        (m, None)
+    } else {
+        let b = Arc::new(crate::stores::ReloadableMetrics::new(
+            &update.policy,
+            config.limits.max_metric_keys,
+        ));
+        (b.clone(), Some(b))
+    };
     let ca = Arc::new(load_ca(&config)?);
     let minter = Arc::new(LeafMinter::new(ca.clone(), config.tls.leaf_cache_size)?);
     let sink = match opts.sink {
@@ -406,8 +429,12 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
         max_connections_per_client: config.limits.max_connections_per_client,
         connection_events: config.log.flow.connection_events,
         sink,
-        metrics: opts.metrics.unwrap_or_else(|| Arc::new(UnavailableMetrics)),
-        state: opts.state.unwrap_or_else(|| Arc::new(UnavailableState)),
+        metrics: metric_source,
+        state: opts.state.unwrap_or_else(|| {
+            Arc::new(crate::stores::BuiltinState::new(
+                config.limits.max_state_entries,
+            ))
+        }),
         policy: update,
     };
     let server = Server::start(rt).await?;
@@ -416,6 +443,7 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
         handle: server.handle(),
         caps,
         last: Mutex::new(config),
+        metrics: builtin_metrics,
     });
     let watcher = if opts.watch {
         Some(spawn_watcher(path, reloader.clone())?)

@@ -944,3 +944,93 @@ async fn request_body_cap_closes_mid_stream() {
     assert!(h.upstream.seen().iter().all(|s| s.body_len <= 1024));
     h.stop().await;
 }
+
+const RATE_LIMITED: &str = r#"
+  - id: burst
+    when: host == "upstream.test" and metric.hits >= 3
+    then: { deny: { status: 429, close: false } }
+  - id: upstream
+    when: host == "upstream.test"
+    then: { allow: { private_ok: true } }
+"#;
+
+const HITS_METRIC: &str = r#"metrics:
+  - id: hits
+    count: requests
+    where: host == "upstream.test"
+    key: [client.ip]
+    window: 1h
+"#;
+
+/// The built-in metric store enforces a rate limit end to end, and an
+/// unrelated config edit (hot reload) does not reset the counter (§6.5).
+#[tokio::test(flavor = "multi_thread")]
+async fn builtin_metric_store_rate_limits_and_survives_reload() {
+    let h = Harness::start_with(Opts {
+        rules: RATE_LIMITED,
+        extra: HITS_METRIC,
+        ..Opts::default()
+    })
+    .await;
+    let c = h.client();
+    let url = h.http_url("/m");
+    for i in 0..3 {
+        assert_eq!(
+            c.get(&url).send().await.unwrap().status(),
+            200,
+            "request {i}"
+        );
+    }
+    let res = c.get(&url).send().await.unwrap();
+    assert_eq!(res.status(), 429, "the 4th request is over the limit");
+    assert_eq!(res.headers()["x-roxy-rule"], "burst");
+
+    // Reload with an extra, unrelated rule; the `hits` definition is unchanged.
+    let edited = h.render(&Opts {
+        rules: &format!(
+            "{RATE_LIMITED}  - id: unrelated\n    when: host == \"nowhere.test\"\n    then: deny\n"
+        ),
+        extra: HITS_METRIC,
+        ..Opts::default()
+    });
+    std::fs::write(&h.config_path, edited).unwrap();
+    h.wait_events("config_reloaded", 1).await;
+    let res = c.get(&url).send().await.unwrap();
+    assert_eq!(res.status(), 429, "the counter survived the reload");
+    h.stop().await;
+}
+
+/// A full metric key table denies flows that need a new key instead of
+/// evicting existing ones (§6.4).
+#[tokio::test(flavor = "multi_thread")]
+async fn full_metric_table_denies_new_keys() {
+    let h = Harness::start_with(Opts {
+        rules: r#"
+  - id: guarded
+    when: host == "upstream.test" and metric.by_path < 1000
+    then: { allow: { private_ok: true } }
+"#,
+        extra: r#"metrics:
+  - id: by_path
+    count: requests
+    where: host == "upstream.test"
+    key: [path]
+    window: 1h
+"#,
+        limits: "max_metric_keys: 2",
+        ..Opts::default()
+    })
+    .await;
+    let c = h.client();
+    assert_eq!(c.get(h.http_url("/a")).send().await.unwrap().status(), 200);
+    assert_eq!(c.get(h.http_url("/b")).send().await.unwrap().status(), 200);
+    let res = c.get(h.http_url("/c")).send().await.unwrap();
+    assert_eq!(res.status(), 503, "a third key does not fit");
+    assert_eq!(res.headers()["x-roxy-rule"], "_fail_closed");
+    assert_eq!(
+        c.get(h.http_url("/a")).send().await.unwrap().status(),
+        200,
+        "existing keys keep working"
+    );
+    h.stop().await;
+}
