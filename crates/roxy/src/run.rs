@@ -499,6 +499,7 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
         max_connections_per_client: config.limits.max_connections_per_client,
         connection_events: config.log.flow.connection_events,
         sink,
+        capture: None,
         metrics: metric_source,
         state: opts.state.unwrap_or_else(|| {
             Arc::new(crate::stores::BuiltinState::new(

@@ -17,6 +17,7 @@ use roxy_http::{Body, CanonicalRequest, CanonicalResponse, ParseError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::body::counted;
+use crate::capture::{self, Tap};
 use crate::flowlog::{DecisionKind, FlowEvent};
 use crate::io::{ConnIo, Io};
 use crate::listener::ClientConn;
@@ -319,6 +320,9 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
     // exchange as values arrive (§6.1).
     let watch = Watch::new(cx);
     cx.watch = Some(watch.clone());
+    // Capture (§10.2): what is forwarded from here on is teed to the
+    // capture log, heads included.
+    let (mut req_tap, res_tap) = taps(cx);
     let host = host_text(&req.authority.host);
     let port = req.authority.port;
     let private_ok = cx.opts.private_ok;
@@ -414,7 +418,15 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
     } else {
         // Watched first: a chunk that makes a deny match is never counted
         // as forwarded nor handed to the upstream.
-        let body = watched(std::mem::take(&mut req.body), watch.clone(), Dir::Request);
+        if let Some(t) = req_tap.as_mut() {
+            t.request_head(&req, &cx.snap.redactor);
+        }
+        let body = watched(
+            std::mem::take(&mut req.body),
+            watch.clone(),
+            Dir::Request,
+            req_tap.take(),
+        );
         let (body, req_counter) = counted(body);
         req.body = body;
         let mut http_req = match to_upstream_request(req, UriForm::Absolute) {
@@ -478,11 +490,17 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
     let verdict = run_response_stages(&shared.pipeline, cx, res, front).await;
     match verdict {
         ResponseVerdict::Continue(mut res) => {
+            let mut res_tap = res_tap;
+            if let Some(t) = res_tap.as_mut() {
+                t.response_head(&res, &cx.snap.redactor);
+            }
             if let Some((on, key)) = upgrade {
+                // The relay takes the taps after the `101`.
+                cx.taps = (req_tap, res_tap);
                 return Outcome::Upgrade { res, on, key };
             }
             let body = std::mem::take(&mut res.body);
-            res.body = watched(body, watch, Dir::Response);
+            res.body = watched(body, watch, Dir::Response, res_tap);
             Outcome::Respond(res)
         }
         ResponseVerdict::Deny(r) => Outcome::Refuse(r),
@@ -576,26 +594,29 @@ async fn splice_websocket(
     });
     let mut upstream = TokioIo::new(upgraded);
     let idle = cx.snap.limits.idle_timeout;
-    let mut c2s_extra = 0u64;
-    if !leftover.is_empty() {
-        if upstream.write_all(&leftover).await.is_err() {
-            cx.emit_request_event();
-            return None;
-        }
-        c2s_extra = leftover.len() as u64;
-    }
     let Some(watch) = cx.watch.clone() else {
         cx.emit_request_event();
         return None;
     };
-    if c2s_extra > 0 && watch.on_ws_chunk(Dir::Request, c2s_extra).is_err() {
-        // Already written upstream (it arrived with the upgrade request);
-        // stop here.
-        cx.record_final_sample(false);
-        cx.emit_request_event();
-        return None;
+    let (mut req_tap, res_tap) = std::mem::take(&mut cx.taps);
+    let c2s_extra = leftover.len() as u64;
+    if !leftover.is_empty() {
+        // Bytes that arrived with the upgrade request: checked before they
+        // are written, like every other relayed chunk (§6.1).
+        if watch.on_ws_chunk(Dir::Request, c2s_extra).is_err() {
+            cx.record_final_sample(false);
+            cx.emit_request_event();
+            return None;
+        }
+        if let Some(t) = req_tap.as_mut() {
+            t.data(&leftover);
+        }
+        if upstream.write_all(&leftover).await.is_err() {
+            cx.emit_request_event();
+            return None;
+        }
     }
-    let (c2s, s2c) = splice(client_io, upstream, idle, &watch).await;
+    let (c2s, s2c) = splice(client_io, upstream, idle, &watch, (req_tap, res_tap)).await;
     cx.shared.sink.emit(&FlowEvent::WsClose {
         ts: chrono::Utc::now(),
         flow: cx.flow.to_string(),
@@ -610,31 +631,50 @@ async fn splice_websocket(
     None
 }
 
+/// One direction of the WebSocket relay: what checks and records each chunk.
+struct Relay<'a> {
+    watch: &'a Watch,
+    dir: Dir,
+    tap: Option<Tap>,
+}
+
 async fn pump<R, W>(
     mut r: R,
     mut w: W,
     n: Arc<std::sync::atomic::AtomicU64>,
     last: Arc<std::sync::atomic::AtomicU64>,
     base: Instant,
-    watch: &Watch,
-    dir: Dir,
+    mut relay: Relay<'_>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut buf = vec![0u8; 16 * 1024];
+    let watch = relay.watch;
     let sink = watch.sink();
+    let mut completed = false;
     loop {
-        // Audit backpressure (§10.1): relay only while the log keeps up.
+        // Audit backpressure (§10.1, §10.2): relay only while the flow log
+        // and the capture log keep up.
         crate::flowlog::sink_ready(&*sink).await;
+        if let Some(t) = &relay.tap {
+            std::future::poll_fn(|cx| t.log().poll_ready(cx)).await;
+        }
         let k = match r.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) => {
+                completed = true;
+                break;
+            }
+            Err(_) => break,
             Ok(k) => k,
         };
         // Checked before the write: bytes that make a deny match are never
         // relayed (§6.1).
-        if watch.on_ws_chunk(dir, k as u64).is_err() {
+        if watch.on_ws_chunk(relay.dir, k as u64).is_err() {
             break;
+        }
+        if let Some(t) = relay.tap.as_mut() {
+            t.data(&buf[..k]);
         }
         if w.write_all(&buf[..k]).await.is_err() {
             break;
@@ -646,6 +686,9 @@ async fn pump<R, W>(
             Ordering::Relaxed,
         );
     }
+    if let Some(t) = relay.tap.as_mut() {
+        t.end(!completed);
+    }
     let _ = w.shutdown().await;
 }
 
@@ -654,7 +697,13 @@ async fn pump<R, W>(
 /// dropped, i.e. closed: the relay is byte-level, so a close frame could
 /// land inside a half-written frame). Returns (client→server,
 /// server→client) byte counts.
-async fn splice(client: impl Io, upstream: impl Io, idle: Duration, watch: &Watch) -> (u64, u64) {
+async fn splice(
+    client: impl Io,
+    upstream: impl Io,
+    idle: Duration,
+    watch: &Watch,
+    taps: (Option<Tap>, Option<Tap>),
+) -> (u64, u64) {
     use std::sync::atomic::AtomicU64;
     let base = Instant::now();
     let last = Arc::new(AtomicU64::new(0));
@@ -662,15 +711,30 @@ async fn splice(client: impl Io, upstream: impl Io, idle: Duration, watch: &Watc
     let s2c = Arc::new(AtomicU64::new(0));
     let (cr, cw) = tokio::io::split(client);
     let (ur, uw) = tokio::io::split(upstream);
-    let a = pump(cr, uw, c2s.clone(), last.clone(), base, watch, Dir::Request);
+    let (req_tap, res_tap) = taps;
+    let a = pump(
+        cr,
+        uw,
+        c2s.clone(),
+        last.clone(),
+        base,
+        Relay {
+            watch,
+            dir: Dir::Request,
+            tap: req_tap,
+        },
+    );
     let b = pump(
         ur,
         cw,
         s2c.clone(),
         last.clone(),
         base,
-        watch,
-        Dir::Response,
+        Relay {
+            watch,
+            dir: Dir::Response,
+            tap: res_tap,
+        },
     );
     let watchdog = async {
         loop {
@@ -693,4 +757,19 @@ async fn splice(client: impl Io, upstream: impl Io, idle: Duration, watch: &Watc
         }
     }
     (c2s.load(Ordering::Relaxed), s2c.load(Ordering::Relaxed))
+}
+
+/// Capture taps for an exchange about to be forwarded: per direction, when
+/// a `capture` effect selected it or the capture log takes everything.
+fn taps(cx: &FlowCx) -> (Option<Tap>, Option<Tap>) {
+    let Some(log) = &cx.shared.capture else {
+        return (None, None);
+    };
+    let all = log.captures_all();
+    let flow = cx.flow.to_string();
+    let tap = |on: bool, dir| (on || all).then(|| Tap::new(log.clone(), &flow, dir));
+    (
+        tap(cx.capture.0, capture::Dir::Request),
+        tap(cx.capture.1, capture::Dir::Response),
+    )
 }

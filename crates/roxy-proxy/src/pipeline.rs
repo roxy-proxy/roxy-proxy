@@ -35,12 +35,13 @@ use roxy_http::{
     Scheme,
 };
 use roxy_rules::{
-    AllowOpts, Decision, Effect, EvalContext, FAIL_CLOSED_MESSAGE, FAIL_CLOSED_STATUS,
-    FailClosedReason, LogLevel, Outcome,
+    AllowOpts, CaptureTarget, Decision, Effect, EvalContext, FAIL_CLOSED_MESSAGE,
+    FAIL_CLOSED_STATUS, FailClosedReason, LogLevel, Outcome,
 };
 use ulid::Ulid;
 
 use crate::body::{Collected, body_text, collect_prefix};
+use crate::capture::Tap;
 use crate::flowlog::{
     ClientInfo, DecisionKind, DstInfo, FlowEvent, RequestInfo, ResponseInfo, Stage, Timing, TlsInfo,
 };
@@ -315,6 +316,13 @@ pub(crate) struct FlowCx {
     pub started: Instant,
     /// The watching rules of this exchange, once it is forwarded.
     pub watch: Option<Arc<Watch>>,
+    /// Capture this exchange's request / response (§10.2): set by a
+    /// `capture` effect at the head, or for every exchange with
+    /// `log.capture.all`.
+    pub capture: (bool, bool),
+    /// Capture taps not yet handed to a body adapter (the WebSocket relay
+    /// takes them after the `101`).
+    pub taps: (Option<Tap>, Option<Tap>),
     /// `Host` to send upstream after a `redirect` without `rewrite_host`.
     pub host_override: Option<String>,
 }
@@ -384,6 +392,8 @@ impl FlowCx {
             record: FlowRecord::default(),
             started: Instant::now(),
             watch: None,
+            capture: (false, false),
+            taps: (None, None),
             host_override: None,
         }
     }
@@ -948,9 +958,19 @@ fn apply_request_effect(
                 .set(&key, &value, ttl)
                 .map_err(|_| Refusal::fail_closed("state_unavailable"))?;
         }
-        // Capture and addon calls are not in this build; `roxy run`
-        // refuses policies that use them. Deny defensively.
-        Effect::Capture(_) | Effect::CallAddon(_) => {
+        Effect::Capture(target) => {
+            // `roxy run` refuses `capture` without a capture log; deny
+            // defensively if one is somehow missing.
+            if cx.shared.capture.is_none() {
+                return Err(Refusal::fail_closed("capture_unavailable"));
+            }
+            let (req, res) = &mut cx.capture;
+            *req |= matches!(target, CaptureTarget::Request | CaptureTarget::Both);
+            *res |= matches!(target, CaptureTarget::Response | CaptureTarget::Both);
+        }
+        // Addon calls are not in this build; `roxy run` refuses policies
+        // that use them. Deny defensively.
+        Effect::CallAddon(_) => {
             return Err(Refusal::fail_closed("unsupported_effect"));
         }
     }
