@@ -13,7 +13,10 @@ use roxy_rules::{FlowView, Phase};
 use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::Value;
-use support::{Harness, Opts, SECRET, fnv, raw, read_head, read_response, read_to_eof};
+use support::{
+    H2_HEADERS, H2_RST_STREAM, Harness, Opts, SECRET, fnv, h2_get, h2_raw_request, raw, read_head,
+    read_response, read_to_eof,
+};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -564,8 +567,14 @@ async fn body_inspection_denies_and_fails_closed_when_too_large() {
         .unwrap();
     assert_eq!(res.status(), 503);
     assert_eq!(res.headers()["x-roxy-rule"], "_fail_closed");
+    // Streams of one h2 connection log independently: find the event by
+    // its outcome rather than by position.
     let ev = h.wait_events("request", 3).await;
-    assert_eq!(ev[2]["reason"], "body_too_large_to_inspect");
+    let failed = ev
+        .iter()
+        .find(|e| e["res"]["status"] == 503)
+        .unwrap_or_else(|| panic!("{ev:#?}"));
+    assert_eq!(failed["reason"], "body_too_large_to_inspect");
     assert_eq!(h.events("policy_input_unavailable").len(), 1);
     assert_eq!(h.upstream.seen().len(), 1);
     h.stop().await;
@@ -1201,5 +1210,287 @@ async fn deny_list_file_reload_flips_allow_to_deny_and_keeps_old_lists_on_failur
     std::fs::write(&file, "# cleared\n").unwrap();
     h.wait_events("config_reloaded", 2).await;
     assert_eq!(c.get(&url).send().await.unwrap().status(), 200);
+    h.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Client-side HTTP/2 (§5.1a, §5.3)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn h2_allow_get_end_to_end() {
+    let h = Harness::start(ALLOW_UPSTREAM).await;
+    let res = h
+        .client()
+        .get(h.https_url("/hello?x=1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.version(), reqwest::Version::HTTP_2);
+    assert_eq!(res.status(), 200);
+    let v = json(&res.bytes().await.unwrap());
+    assert_eq!(v["path"], "/hello?x=1");
+    assert_eq!(v["method"], "GET");
+    let ev = h.wait_events("request", 1).await;
+    let e = &ev[0];
+    assert_eq!(e["decision"], "allow");
+    assert_eq!(e["terminal_rule"], "upstream");
+    assert_eq!(e["tls"]["alpn"], "h2");
+    assert_eq!(e["tls"]["sni"], "upstream.test");
+    assert_eq!(e["res"]["status"], 200);
+    assert!(e["res"]["body_bytes"].as_u64().unwrap() > 0);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn h2_multiplexes_concurrent_streams_on_one_connection() {
+    let h = Harness::start(ALLOW_UPSTREAM).await;
+    let (send, _conn) = h.h2_client().await;
+    let urls: Vec<String> = (0..5).map(|i| h.https_url(&format!("/m/{i}"))).collect();
+    let results = futures_util::future::join_all(urls.iter().map(|u| h2_get(&send, u, &[]))).await;
+    for (i, r) in results.into_iter().enumerate() {
+        let (parts, body) = r.unwrap();
+        assert_eq!(parts.status, 200);
+        assert_eq!(json(&body)["path"], format!("/m/{i}"));
+    }
+    let ev = h.wait_events("request", 5).await;
+    assert_eq!(ev.len(), 5);
+    let conn = &ev[0]["conn"];
+    assert!(ev.iter().all(|e| &e["conn"] == conn), "{ev:#?}");
+    assert!(ev.iter().all(|e| e["tls"]["alpn"] == "h2"));
+    assert_eq!(h.events("connect").len(), 1);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn h2_default_deny_answers_on_the_stream_then_goaway() {
+    let h = Harness::start("").await;
+    // reqwest over h2: the deny is an ordinary response.
+    let res = h.client().get(h.https_url("/x")).send().await.unwrap();
+    assert_eq!(res.version(), reqwest::Version::HTTP_2);
+    assert_eq!(res.status(), 403);
+    assert_eq!(res.headers()["x-roxy-rule"], "_default");
+    assert_eq!(json(&res.bytes().await.unwrap())["rule"], "_default");
+
+    // Raw h2: after the deny the connection sends GOAWAY and ends; a new
+    // stream on it is refused.
+    let (send, conn) = h.h2_client().await;
+    let (parts, body) = h2_get(&send, &h.https_url("/y"), &[]).await.unwrap();
+    assert_eq!(parts.status, 403);
+    assert_eq!(parts.headers["content-type"], "application/json");
+    let v = json(&body);
+    assert_eq!(v["rule"], "_default");
+    assert_eq!(v["error"], "blocked by roxy");
+    let ended = tokio::time::timeout(Duration::from_secs(5), conn).await;
+    assert!(ended.is_ok(), "the connection must close after a deny");
+    let again = h2_get(&send, &h.https_url("/z"), &[]).await;
+    assert!(again.is_err(), "a new stream after GOAWAY must fail");
+    let ev = h.wait_events("request", 2).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(h.events("request").len(), 2, "{ev:#?}");
+    assert!(h.upstream.seen().is_empty());
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn h2_deny_without_close_keeps_serving() {
+    let h = Harness::start(&format!(
+        r#"
+  - id: soft
+    when: path == "/soft"
+    then: {{ deny: {{ status: 451, message: "not here", close: false }} }}
+{ALLOW_UPSTREAM}"#
+    ))
+    .await;
+    let (send, conn) = h.h2_client().await;
+    let (parts, body) = h2_get(&send, &h.https_url("/soft"), &[]).await.unwrap();
+    assert_eq!(parts.status, 451);
+    assert_eq!(json(&body)["error"], "not here");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!conn.is_finished());
+    let (parts, body) = h2_get(&send, &h.https_url("/after"), &[]).await.unwrap();
+    assert_eq!(parts.status, 200);
+    assert_eq!(json(&body)["path"], "/after");
+    assert_eq!(h.events("connect").len(), 1);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn h2_large_upload_streams_intact() {
+    let h = Harness::start(ALLOW_UPSTREAM).await;
+    let data: Vec<u8> = (0..32 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let want = fnv(&data);
+    let res = h
+        .client()
+        .post(h.https_url("/upload"))
+        .body(data)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.version(), reqwest::Version::HTTP_2);
+    assert_eq!(res.status(), 200);
+    let v = json(&res.bytes().await.unwrap());
+    assert_eq!(v["body_len"], 32 * 1024 * 1024);
+    assert_eq!(v["body_hash"], want);
+    let ev = h.wait_events("request", 1).await;
+    assert_eq!(ev[0]["req"]["body_bytes"], 32 * 1024 * 1024);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn h2_request_body_cap_resets_the_stream() {
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        limits: "max_request_body_bytes: 1kb",
+        ..Opts::default()
+    })
+    .await;
+    let (send, _conn) = h.h2_client().await;
+
+    // Streamed (no content-length): reset once the cap is crossed.
+    let req = http::Request::post(h.https_url("/cap")).body(()).unwrap();
+    let mut ready = send.clone().ready().await.unwrap();
+    let (resp, mut stream) = ready.send_request(req, false).unwrap();
+    for _ in 0..4 {
+        let _ = stream.send_data(Bytes::from(vec![b'z'; 1024]), false);
+    }
+    let _ = stream.send_data(Bytes::new(), true);
+    let r = tokio::time::timeout(Duration::from_secs(10), resp)
+        .await
+        .unwrap();
+    let e = r.expect_err("the stream must be reset");
+    assert_eq!(e.reason(), Some(h2::Reason::PROTOCOL_ERROR), "{e}");
+    let ev = h.wait_events("parse_error", 1).await;
+    assert_eq!(ev[0]["reason"], "body_too_large");
+
+    // Declared too large: reset before anything is forwarded.
+    let req = http::Request::post(h.https_url("/cap2"))
+        .header("content-length", "4096")
+        .body(())
+        .unwrap();
+    let mut ready = send.clone().ready().await.unwrap();
+    let (resp, _stream) = ready.send_request(req, false).unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(10), resp)
+        .await
+        .unwrap();
+    assert_eq!(
+        r.expect_err("reset").reason(),
+        Some(h2::Reason::PROTOCOL_ERROR)
+    );
+    let ev = h.wait_events("parse_error", 2).await;
+    assert_eq!(ev[1]["reason"], "body_too_large");
+    // The upstream never saw a complete body, and never saw /cap2.
+    let seen = h.upstream.seen();
+    assert!(seen.iter().all(|s| s.body_len <= 1024), "{seen:#?}");
+    assert!(seen.iter().all(|s| s.path_and_query != "/cap2"));
+
+    // The connection is still usable.
+    let (parts, _) = h2_get(&send, &h.https_url("/ok"), &[]).await.unwrap();
+    assert_eq!(parts.status, 200);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn h2_malformed_streams_are_reset() {
+    let h = Harness::start(ALLOW_UPSTREAM).await;
+    let authority = format!("upstream.test:{}", h.upstream.https.port());
+
+    // A connection-specific field: RST_STREAM(PROTOCOL_ERROR). The `h2`
+    // crate rejects it before roxy's mapper sees the stream.
+    let frames = h2_raw_request(
+        &h,
+        &[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", &authority),
+            (":path", "/conn"),
+            ("connection", "keep-alive"),
+        ],
+    )
+    .await;
+    let rst = frames
+        .iter()
+        .find(|f| f.0 == H2_RST_STREAM && f.2 == 1)
+        .unwrap_or_else(|| panic!("no RST_STREAM: {frames:?}"));
+    assert_eq!(rst.3, 1u32.to_be_bytes(), "PROTOCOL_ERROR");
+    assert!(!frames.iter().any(|f| f.0 == H2_HEADERS && f.2 == 1));
+
+    // `:authority` other than the tunnel host: roxy's mapper resets it and
+    // logs a parse error.
+    let frames = h2_raw_request(
+        &h,
+        &[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":authority", "evil.test"),
+            (":path", "/evil"),
+        ],
+    )
+    .await;
+    let rst = frames
+        .iter()
+        .find(|f| f.0 == H2_RST_STREAM && f.2 == 1)
+        .unwrap_or_else(|| panic!("no RST_STREAM: {frames:?}"));
+    assert_eq!(rst.3, 1u32.to_be_bytes(), "PROTOCOL_ERROR");
+    let ev = h.wait_events("parse_error", 1).await;
+    assert_eq!(ev[0]["reason"], "authority_mismatch");
+
+    // Same through the h2 client, plus a mismatching `host`; the
+    // connection keeps serving well-formed streams.
+    let (send, _conn) = h.h2_client().await;
+    let e = h2_get(&send, "https://evil.test/x", &[]).await.unwrap_err();
+    assert_eq!(e.reason(), Some(h2::Reason::PROTOCOL_ERROR));
+    let e = h2_get(&send, &h.https_url("/x"), &[("host", "evil.test")])
+        .await
+        .unwrap_err();
+    assert_eq!(e.reason(), Some(h2::Reason::PROTOCOL_ERROR));
+    let ev = h.wait_events("parse_error", 3).await;
+    assert_eq!(ev[1]["reason"], "authority_mismatch");
+    assert_eq!(ev[2]["reason"], "host_mismatch");
+    let (parts, _) = h2_get(&send, &h.https_url("/fine"), &[]).await.unwrap();
+    assert_eq!(parts.status, 200);
+
+    // Nothing malformed reached the upstream.
+    let seen = h.upstream.seen();
+    assert_eq!(seen.len(), 1, "{seen:#?}");
+    assert_eq!(seen[0].path_and_query, "/fine");
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn h2_disabled_offers_http11_only() {
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        http: "enable_h2: false",
+        ..Opts::default()
+    })
+    .await;
+    let authority = format!("upstream.test:{}", h.upstream.https.port());
+    let tls = h
+        .tls_tunnel_alpn(&authority, "upstream.test", &[b"h2", b"http/1.1"])
+        .await
+        .unwrap();
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+    drop(tls);
+    let res = h.client().get(h.https_url("/h1")).send().await.unwrap();
+    assert_eq!(res.version(), reqwest::Version::HTTP_11);
+    assert_eq!(res.status(), 200);
+    let ev = h.wait_events("request", 1).await;
+    assert_eq!(ev[0]["tls"]["alpn"], "http/1.1");
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn h1_only_client_works_with_h2_enabled() {
+    let h = Harness::start(ALLOW_UPSTREAM).await;
+    let c = h.client_builder().http1_only().build().unwrap();
+    for p in ["/a", "/b"] {
+        let res = c.get(h.https_url(p)).send().await.unwrap();
+        assert_eq!(res.version(), reqwest::Version::HTTP_11);
+        assert_eq!(res.status(), 200);
+        assert_eq!(json(&res.bytes().await.unwrap())["path"], p);
+    }
+    let ev = h.wait_events("request", 2).await;
+    assert!(ev.iter().all(|e| e["tls"]["alpn"] == "http/1.1"), "{ev:#?}");
     h.stop().await;
 }

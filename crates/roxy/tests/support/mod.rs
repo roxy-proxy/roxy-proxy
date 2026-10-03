@@ -550,6 +550,16 @@ log:
         authority: &str,
         sni: &str,
     ) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        self.tls_tunnel_alpn(authority, sni, &[b"http/1.1"]).await
+    }
+
+    /// CONNECT + TLS offering `alpn`.
+    pub async fn tls_tunnel_alpn(
+        &self,
+        authority: &str,
+        sni: &str,
+        alpn: &[&[u8]],
+    ) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let s = self.connect_tunnel(authority).await;
         let mut roots = rustls::RootCertStore::empty();
         for c in rustls_pemfile_certs(&self.roxy_ca_pem) {
@@ -560,10 +570,28 @@ log:
             .unwrap()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
         TlsConnector::from(Arc::new(cfg))
             .connect(ServerName::try_from(sni.to_owned()).unwrap(), s)
             .await
+    }
+
+    /// A raw `h2` client over CONNECT + TLS (ALPN `h2`) to the HTTPS
+    /// upstream. The connection task is returned so tests can watch it end.
+    pub async fn h2_client(
+        &self,
+    ) -> (
+        h2::client::SendRequest<Bytes>,
+        tokio::task::JoinHandle<Result<(), h2::Error>>,
+    ) {
+        let authority = format!("upstream.test:{}", self.upstream.https.port());
+        let tls = self
+            .tls_tunnel_alpn(&authority, "upstream.test", &[b"h2"])
+            .await
+            .unwrap();
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+        let (send, conn) = h2::client::handshake(tls).await.unwrap();
+        (send, tokio::spawn(conn))
     }
 
     pub async fn stop(mut self) {
@@ -638,4 +666,106 @@ pub async fn raw(proxy: SocketAddr, bytes: &[u8]) -> (String, bool) {
     s.write_all(bytes).await.unwrap();
     let (out, eof) = read_to_eof(&mut s).await;
     (String::from_utf8_lossy(&out).into_owned(), eof)
+}
+
+/// Sends one h2 request (no body) and returns the response head and body,
+/// or the stream / connection error.
+pub async fn h2_get(
+    send: &h2::client::SendRequest<Bytes>,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> Result<(http::response::Parts, Bytes), h2::Error> {
+    let mut b = http::Request::builder().method("GET").uri(uri);
+    for (n, v) in headers {
+        b = b.header(*n, *v);
+    }
+    let req = b.body(()).unwrap();
+    let mut ready = send.clone().ready().await?;
+    let (resp, _) = ready.send_request(req, true)?;
+    let resp = tokio::time::timeout(Duration::from_secs(10), resp)
+        .await
+        .expect("timed out waiting for an h2 response")?;
+    let (parts, mut body) = resp.into_parts();
+    let mut out = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk?;
+        let _ = body.flow_control().release_capacity(chunk.len());
+        out.extend_from_slice(&chunk);
+    }
+    Ok((parts, Bytes::from(out)))
+}
+
+/// A minimal HPACK encoder: every field as a literal without indexing, no
+/// Huffman (so tests can send what the `h2` client refuses to).
+fn hpack_literal(out: &mut Vec<u8>, name: &str, value: &str) {
+    fn len(out: &mut Vec<u8>, n: usize) {
+        assert!(n < 127, "the test HPACK encoder only does short strings");
+        out.push(u8::try_from(n).unwrap());
+    }
+    out.push(0x00);
+    len(out, name.len());
+    out.extend_from_slice(name.as_bytes());
+    len(out, value.len());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn h2_frame(out: &mut Vec<u8>, kind: u8, flags: u8, stream: u32, payload: &[u8]) {
+    let n = u32::try_from(payload.len()).unwrap();
+    out.extend_from_slice(&n.to_be_bytes()[1..]);
+    out.push(kind);
+    out.push(flags);
+    out.extend_from_slice(&stream.to_be_bytes());
+    out.extend_from_slice(payload);
+}
+
+/// h2 frame type codes used by the tests.
+pub const H2_HEADERS: u8 = 0x1;
+pub const H2_RST_STREAM: u8 = 0x3;
+pub const H2_SETTINGS: u8 = 0x4;
+pub const H2_GOAWAY: u8 = 0x7;
+
+/// Opens an h2 tunnel and sends stream 1 with exactly `fields`
+/// (pseudo-headers included, in order) and `END_STREAM`, frame by frame.
+/// Returns the frames `(type, flags, stream id, payload)` received until
+/// stream 1 is reset or answered, or the connection ends.
+pub async fn h2_raw_request(h: &Harness, fields: &[(&str, &str)]) -> Vec<(u8, u8, u32, Vec<u8>)> {
+    let authority = format!("upstream.test:{}", h.upstream.https.port());
+    let mut tls = h
+        .tls_tunnel_alpn(&authority, "upstream.test", &[b"h2"])
+        .await
+        .unwrap();
+    let mut out = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    h2_frame(&mut out, H2_SETTINGS, 0, 0, &[]);
+    let mut block = Vec::new();
+    for (n, v) in fields {
+        hpack_literal(&mut block, n, v);
+    }
+    // END_HEADERS | END_STREAM
+    h2_frame(&mut out, H2_HEADERS, 0x4 | 0x1, 1, &block);
+    tls.write_all(&out).await.unwrap();
+    let mut frames = Vec::new();
+    loop {
+        let mut head = [0u8; 9];
+        let read = tokio::time::timeout(Duration::from_secs(10), tls.read_exact(&mut head)).await;
+        let Ok(Ok(_)) = read else { break };
+        let len = (usize::from(head[0]) << 16) | (usize::from(head[1]) << 8) | usize::from(head[2]);
+        let mut payload = vec![0u8; len];
+        if tls.read_exact(&mut payload).await.is_err() {
+            break;
+        }
+        let (kind, flags) = (head[3], head[4]);
+        let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff;
+        if kind == H2_SETTINGS && flags & 0x1 == 0 {
+            let mut ack = Vec::new();
+            h2_frame(&mut ack, H2_SETTINGS, 0x1, 0, &[]);
+            tls.write_all(&ack).await.unwrap();
+        }
+        let done =
+            (stream == 1 && (kind == H2_RST_STREAM || kind == H2_HEADERS)) || kind == H2_GOAWAY;
+        frames.push((kind, flags, stream, payload));
+        if done {
+            break;
+        }
+    }
+    frames
 }

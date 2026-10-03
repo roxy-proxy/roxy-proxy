@@ -368,7 +368,7 @@ async fn terminate_tls(
         shared.emit_parse_reason(&client, None, "leaf_mint_failed", Some(&host));
         return;
     }
-    let cfg = roxy_tls::server_config_for(shared.minter.clone(), name, false);
+    let cfg = roxy_tls::server_config_for(shared.minter.clone(), name, shared.enable_h2);
     let limits = shared.snapshot().limits.clone();
     let accept = TlsAcceptor::from(cfg).accept(Rewind::new(io, hello));
     let tls = match tokio::time::timeout(limits.header_timeout, accept).await {
@@ -399,6 +399,11 @@ async fn terminate_tls(
             }),
         }
     };
+    if info.alpn.as_deref() == Some("h2") {
+        // Only offered with `http.enable_h2`.
+        crate::h2conn::serve(tls, client, authority, info, shared).await;
+        return;
+    }
     let snap = shared.snapshot();
     let handle = ConnIo::new(Box::new(tls));
     let conn = ServerConn::new(

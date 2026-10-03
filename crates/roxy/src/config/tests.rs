@@ -77,7 +77,7 @@ fn minimal_example_uses_defaults() {
     assert_eq!(cfg.tls.leaf_cache_size, 10_000);
     assert_eq!(cfg.tls.upstream.verify, UpstreamVerify::Strict);
     assert!(!cfg.http.allow_http10);
-    assert!(!cfg.http.enable_h2);
+    assert!(cfg.http.enable_h2);
     let l = &cfg.limits;
     assert_eq!(l.max_header_bytes.as_u64(), 64 * 1024);
     assert_eq!(l.max_url_bytes.as_u64(), 8 * 1024);

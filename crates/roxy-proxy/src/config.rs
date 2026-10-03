@@ -37,8 +37,8 @@ pub struct RuntimeConfig {
     pub minter: Arc<LeafMinter>,
     /// `tls.require_sni_match`.
     pub require_sni_match: bool,
-    /// `http.enable_h2`. Client-side h2 is not in this build: when set, a
-    /// warning is logged and only `http/1.1` is offered.
+    /// `http.enable_h2`: offer ALPN `h2` (then `http/1.1`) in terminated
+    /// tunnels; otherwise only `http/1.1`.
     pub enable_h2: bool,
     /// `tls.upstream.*`.
     pub upstream_tls: UpstreamTlsOptions,
