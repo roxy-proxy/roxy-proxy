@@ -507,7 +507,7 @@ pub fn address_check(
 /// Applies an address-policy denial to the outcome: `403 _address_policy`.
 pub fn apply_address_denial(out: &mut Outcome) {
     out.decision = Decision::Deny {
-        status: 403,
+        status: roxy_rules::DEFAULT_DENY_STATUS,
         message: roxy_rules::DEFAULT_DENY_MESSAGE.to_owned(),
         close: true,
     };

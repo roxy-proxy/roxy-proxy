@@ -14,8 +14,8 @@ use crate::config::{
 };
 use crate::diag::{Diagnostic, RuleId};
 use crate::eval::{
-    AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Effect, EvalContext,
-    FailClosedReason, Outcome, Scope, WatchOutcome,
+    AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, DenyStatus, Effect,
+    EvalContext, FailClosedReason, Outcome, Scope, WatchOutcome,
 };
 use crate::types::{Field, Reads, is_token};
 use crate::view::FlowView;
@@ -990,14 +990,18 @@ impl PolicyCompiler<'_, '_> {
                 message,
                 close,
             }) => {
-                let status = status.unwrap_or(DEFAULT_DENY_STATUS);
-                if !(400..=599).contains(&status) {
-                    self.push(
-                        rule,
-                        apath,
-                        format!("deny status {status} must be a 4xx or 5xx code"),
-                    );
-                }
+                let status = match status.map(|s| (s, DenyStatus::new(s))) {
+                    None => DEFAULT_DENY_STATUS,
+                    Some((_, Some(s))) => s,
+                    Some((s, None)) => {
+                        self.push(
+                            rule,
+                            apath,
+                            format!("deny status {s} must be a 4xx or 5xx code"),
+                        );
+                        return None;
+                    }
+                };
                 vec![CAction::Terminal(Decision::Deny {
                     status,
                     message: message

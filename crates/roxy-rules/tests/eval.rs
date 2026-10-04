@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use common::{METRICS, compile, try_compile, try_compile_with};
 use roxy_rules::{
-    AllowOpts, CaptureTarget, Decision, DefaultDecision, Effect, EvalContext, FailClosedReason,
-    Field, LogLevel, MapView, Policy, Reads, RuleKind, Scheme, Value, WatchOutcome,
+    AllowOpts, CaptureTarget, Decision, DefaultDecision, DenyStatus, Effect, EvalContext,
+    FailClosedReason, Field, LogLevel, MapView, Policy, Reads, RuleKind, Scheme, Value,
+    WatchOutcome,
 };
 
 fn ip(s: &str) -> Value<'static> {
@@ -343,7 +344,7 @@ fn deny_wins_and_a_refusal_keeps_only_log_and_state() {
     assert_eq!(
         out.decision,
         Decision::Deny {
-            status: 429,
+            status: DenyStatus::new(429).unwrap(),
             message: "slow down".into(),
             close: true
         }
@@ -400,7 +401,7 @@ fn default_decisions() {
     assert_eq!(
         out.decision,
         Decision::Deny {
-            status: 403,
+            status: DenyStatus::new(403).unwrap(),
             message: "blocked by roxy".into(),
             close: true
         }
@@ -497,7 +498,7 @@ fn deny_wins_and_first_allow_options() {
             .with_str(Field::Path, path)
     };
     let out = p.evaluate_head(&v("/a"), &ctx);
-    assert!(matches!(out.decision, Decision::Deny { status: 451, .. }));
+    assert!(matches!(out.decision, Decision::Deny { status, .. } if status == 451));
     assert_eq!(out.terminal_rule, "deny-a");
     let matched: Vec<&str> = out.matched.iter().map(roxy_rules::RuleId::as_str).collect();
     assert_eq!(matched, ["plain", "ws", "deny-a", "deny-a2"]);
@@ -559,7 +560,7 @@ fn fail_closed(reason: FailClosedReason) -> impl Fn(&roxy_rules::Outcome) {
         assert_eq!(
             out.decision,
             Decision::Deny {
-                status: 503,
+                status: DenyStatus::new(503).unwrap(),
                 message: "policy input unavailable".into(),
                 close: true
             }
@@ -739,7 +740,7 @@ fn head_and_watching_rules_share_one_list() {
     let res = v.with_int(Field::ResponseStatus, 418);
     let out = watch(&p, &res, &EvalContext::empty()).unwrap();
     assert_eq!(out.terminal_rule.unwrap(), "r");
-    assert!(matches!(out.stop, Some(Decision::Deny { status: 502, .. })));
+    assert!(matches!(out.stop, Some(Decision::Deny { status, .. }) if status == 502));
     assert_eq!(p.rule_ids().count(), 4);
     assert_eq!(p.rule_count(), 4);
 }

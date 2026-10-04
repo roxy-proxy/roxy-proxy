@@ -99,7 +99,7 @@ pub(crate) struct RequestFacts {
 /// The response head.
 #[derive(Debug, Clone)]
 pub(crate) struct ResponseFacts {
-    pub status: u16,
+    pub status: http::StatusCode,
     pub headers: Headers,
     pub body_size: Option<u64>,
     pub body: Inspected,
@@ -260,7 +260,9 @@ impl FlowView for ProxyView<'_> {
                 .and_then(|r| r.query.as_ref())
                 .map_or(Value::Absent, |q| Value::Str(Cow::Borrowed(q.as_str()))),
             Field::BodySize => req.and_then(|r| r.body_size).map_or(Value::Absent, int),
-            Field::ResponseStatus => res.map_or(Value::Absent, |r| Value::Int(i64::from(r.status))),
+            Field::ResponseStatus => {
+                res.map_or(Value::Absent, |r| Value::Int(i64::from(r.status.as_u16())))
+            }
             Field::ResponseBodySize => res.and_then(|r| r.body_size).map_or(Value::Absent, int),
             Field::BodyBytes => fa.request_body_bytes.map_or(Value::Absent, int),
             Field::ResponseBodyBytes => fa.response_body_bytes.map_or(Value::Absent, int),

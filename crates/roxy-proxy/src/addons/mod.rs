@@ -28,7 +28,7 @@ use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::HeaderName;
+use http::{HeaderName, StatusCode};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use roxy_http::layer::{from_layer_request, to_layer_request, to_layer_response};
 use roxy_http::upstream::from_upstream_response;
@@ -539,7 +539,7 @@ pub(crate) fn emit_stack_error(st: &StackFlow, layer: &str, e: &StackError, obse
 fn layer_refusal(layer: &str) -> Refusal {
     Refusal {
         kind: RefusalKind::Deny,
-        status: 503,
+        status: StatusCode::SERVICE_UNAVAILABLE,
         message: "request blocked: an addon failed".to_owned(),
         rule: Some(Decider::Layer(layer.to_owned())),
         close: true,

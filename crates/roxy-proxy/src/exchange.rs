@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use http::HeaderValue;
 use http::header::HOST;
+use http::{HeaderValue, StatusCode};
 use hyper_util::rt::TokioIo;
 use roxy_http::h1::ServerConn;
 use roxy_http::upstream::{
@@ -98,7 +98,7 @@ pub(crate) fn refusal_response(cx: &mut FlowCx, refusal: &Refusal) -> CanonicalR
         cx.record.reason.clone_from(&refusal.reason);
     }
     let res = refusal.response(&cx.flow);
-    cx.record.response_status = Some(refusal.status);
+    cx.record.response_status = Some(refusal.status.as_u16());
     cx.record.response_headers_bytes = res.headers.wire_len() as u64;
     cx.record.response_bytes = res.body.known_length().unwrap_or(0);
     res
@@ -315,9 +315,9 @@ fn upstream_refusal(cx: &FlowCx, e: &ConnectError, host: &str, port: u16) -> Ref
     });
     tracing::info!(flow = %cx.flow, host, reason, error = %e, "upstream error");
     let status = if matches!(e, ConnectError::Timeout(_)) {
-        504
+        StatusCode::GATEWAY_TIMEOUT
     } else {
-        502
+        StatusCode::BAD_GATEWAY
     };
     Refusal::upstream(status, reason, "upstream unavailable")
 }
@@ -332,7 +332,11 @@ fn protocol_refusal(cx: &FlowCx, host: &str, port: u16, message: String) -> Refu
         reason: "protocol_error".to_owned(),
         message,
     });
-    Refusal::upstream(502, "protocol_error", "upstream protocol error")
+    Refusal::upstream(
+        StatusCode::BAD_GATEWAY,
+        "protocol_error",
+        "upstream protocol error",
+    )
 }
 
 /// What the upstream step produced.
@@ -437,7 +441,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
                 return Outcome::Refuse(Refusal {
                     reason: Some(e.reason.as_str().to_owned()),
                     ..Refusal::deny(
-                        400,
+                        StatusCode::BAD_REQUEST,
                         "invalid websocket upgrade",
                         RuleId::new("_websocket"),
                         true,

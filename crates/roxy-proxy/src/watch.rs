@@ -56,7 +56,7 @@ use ulid::Ulid;
 
 use crate::capture::Tap;
 use crate::flowlog::{DecisionKind, FlowEvent, FlowSink, Stage};
-use crate::pipeline::{Events, FlowCx, Refusal, fail_closed_code, rule_names};
+use crate::pipeline::{Events, FlowCx, Refusal, fail_closed_code, rule_names, status_code};
 use crate::server::{Shared, Snapshot};
 use crate::sources::Sample;
 use crate::view::{FlowFacts, ProxyView, ResponseFacts, WsFacts};
@@ -502,7 +502,7 @@ impl Inner {
                             .clone()
                             .unwrap_or_else(|| RuleId::new(RuleId::FAIL_CLOSED));
                         tracing::info!(flow = %self.flow, %rule, stage = stage.as_str(), "watching rule stopped the exchange");
-                        Refusal::deny(status, &message, rule, close)
+                        Refusal::deny(status_code(status), &message, rule, close)
                     }
                     Decision::Allow(_) | Decision::Passthrough => {
                         Refusal::fail_closed("unsupported_effect")

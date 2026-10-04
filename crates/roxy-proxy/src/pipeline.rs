@@ -34,7 +34,7 @@ use roxy_http::{
     Scheme,
 };
 use roxy_rules::{
-    AllowOpts, CaptureTarget, Decision, Effect, EvalContext, FAIL_CLOSED_MESSAGE,
+    AllowOpts, CaptureTarget, Decision, DenyStatus, Effect, EvalContext, FAIL_CLOSED_MESSAGE,
     FAIL_CLOSED_STATUS, FailClosedReason, LogLevel, Outcome, RuleId,
 };
 use ulid::Ulid;
@@ -84,6 +84,11 @@ impl fmt::Display for Decider {
     }
 }
 
+/// A deny status as an HTTP status code.
+pub(crate) fn status_code(s: DenyStatus) -> StatusCode {
+    StatusCode::from_u16(s.get()).expect("4xx and 5xx are valid status codes")
+}
+
 /// Rule ids as the flow log writes them.
 pub(crate) fn rule_names(rules: &[RuleId]) -> Vec<String> {
     rules.iter().map(ToString::to_string).collect()
@@ -93,7 +98,7 @@ pub(crate) fn rule_names(rules: &[RuleId]) -> Vec<String> {
 #[derive(Debug, Clone)]
 pub(crate) struct Refusal {
     pub kind: RefusalKind,
-    pub status: u16,
+    pub status: StatusCode,
     pub message: String,
     /// For `x-roxy-rule` and the JSON body (denies only).
     pub rule: Option<Decider>,
@@ -104,7 +109,7 @@ pub(crate) struct Refusal {
 }
 
 impl Refusal {
-    pub(crate) fn deny(status: u16, message: &str, rule: RuleId, close: bool) -> Self {
+    pub(crate) fn deny(status: StatusCode, message: &str, rule: RuleId, close: bool) -> Self {
         Self {
             kind: RefusalKind::Deny,
             status,
@@ -120,7 +125,7 @@ impl Refusal {
         Self {
             reason: Some(reason.to_owned()),
             ..Self::deny(
-                FAIL_CLOSED_STATUS,
+                status_code(FAIL_CLOSED_STATUS),
                 FAIL_CLOSED_MESSAGE,
                 RuleId::new(RuleId::FAIL_CLOSED),
                 true,
@@ -133,7 +138,7 @@ impl Refusal {
         Self {
             reason: Some(reason.to_owned()),
             ..Self::deny(
-                403,
+                StatusCode::FORBIDDEN,
                 roxy_rules::DEFAULT_DENY_MESSAGE,
                 RuleId::new(ADDRESS_POLICY_RULE),
                 true,
@@ -142,7 +147,7 @@ impl Refusal {
     }
 
     /// 502/504 for an upstream failure; always closes.
-    pub(crate) fn upstream(status: u16, reason: &str, message: &str) -> Self {
+    pub(crate) fn upstream(status: StatusCode, reason: &str, message: &str) -> Self {
         Self {
             kind: RefusalKind::UpstreamError,
             status,
@@ -155,7 +160,7 @@ impl Refusal {
 
     /// The deny response.
     pub(crate) fn response(&self, flow: &Ulid) -> CanonicalResponse {
-        let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::FORBIDDEN);
+        let status = self.status;
         let body = match (&self.rule, self.kind) {
             (Some(rule), RefusalKind::Deny) => serde_json::json!({
                 "error": self.message,
@@ -457,7 +462,7 @@ impl FlowCx {
                     close,
                 } => {
                     refusal = Some(Refusal::deny(
-                        *status,
+                        status_code(*status),
                         message,
                         out.terminal_rule.clone(),
                         *close,
@@ -978,7 +983,7 @@ async fn inspect_response_body(
     io: &mut dyn BodyIo,
 ) -> ResponseVerdict {
     cx.facts.response = Some(ResponseFacts {
-        status: res.status.as_u16(),
+        status: res.status,
         headers: res.headers.clone(),
         body_size: res.body.known_length(),
         body: Inspected::NotBuffered,
@@ -991,7 +996,7 @@ async fn inspect_response_body(
         Err(e) => return ResponseVerdict::Close(e),
         Ok(Collected::Failed(e)) => {
             return ResponseVerdict::Deny(Refusal::upstream(
-                502,
+                StatusCode::BAD_GATEWAY,
                 "upstream_body_failed",
                 &format!("upstream response body failed: {e}"),
             ));
@@ -1046,7 +1051,12 @@ mod tests {
     #[test]
     fn refusal_body_shape() {
         let flow = Ulid::generate();
-        let r = Refusal::deny(403, "blocked by roxy", RuleId::new(RuleId::DEFAULT), true);
+        let r = Refusal::deny(
+            StatusCode::FORBIDDEN,
+            "blocked by roxy",
+            RuleId::new(RuleId::DEFAULT),
+            true,
+        );
         let res = r.response(&flow);
         assert_eq!(res.status, StatusCode::FORBIDDEN);
         assert_eq!(res.headers.get("x-roxy-rule"), Some("_default"));
