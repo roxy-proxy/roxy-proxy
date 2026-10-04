@@ -339,10 +339,15 @@ impl Kit {
     /// `CONNECT host:443`, TLS with roxy's leaf, then HTTP/2 (`h2`) or
     /// HTTP/1.1 inside.
     pub(crate) async fn tunnel(&self, host: &str, h2: bool) -> Client {
+        let io = self.connect_tunnel(host, 443).await;
+        self.tls_client(io, host, h2).await
+    }
+
+    /// `CONNECT host:port`, answered `200`; the raw tunnel.
+    pub(crate) async fn connect_tunnel(&self, host: &str, port: u16) -> tokio::io::DuplexStream {
         let mut io = self.connect();
-        io.write_all(format!("CONNECT {host}:443 HTTP/1.1\r\nhost: {host}:443\r\n\r\n").as_bytes())
-            .await
-            .unwrap();
+        let connect = format!("CONNECT {host}:{port} HTTP/1.1\r\nhost: {host}:{port}\r\n\r\n");
+        io.write_all(connect.as_bytes()).await.unwrap();
         let mut head = Vec::new();
         while !head.ends_with(b"\r\n\r\n") {
             let mut b = [0u8; 1];
@@ -351,7 +356,7 @@ impl Kit {
         }
         let head = String::from_utf8_lossy(&head);
         assert!(head.starts_with("HTTP/1.1 200"), "CONNECT: {head}");
-        self.tls_client(io, host, h2).await
+        io
     }
 
     /// A direct listener on port 443: TLS with SNI `host` and roxy's leaf,
