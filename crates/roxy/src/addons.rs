@@ -20,6 +20,10 @@ use crate::config::{Addon, AddonKind, AddonMode, Capability, Config};
 
 /// Endpoint timeout when none is configured.
 const DEFAULT_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
+/// A service layer's connections to its endpoint when not configured.
+const DEFAULT_SERVICE_CONNECTIONS: u64 = 4;
+/// Streams on one service connection when not configured.
+const DEFAULT_SERVICE_STREAMS: u64 = 100;
 
 fn service(a: &Addon) -> anyhow::Result<ServiceSpec> {
     let endpoint = a
@@ -32,6 +36,12 @@ fn service(a: &Addon) -> anyhow::Result<ServiceSpec> {
             .limits
             .first_byte_timeout
             .unwrap_or(LayerLimits::default().first_byte_timeout),
+        max_connections: usize_of(
+            a.limits
+                .max_connections
+                .unwrap_or(DEFAULT_SERVICE_CONNECTIONS),
+        ),
+        max_streams: usize_of(a.limits.max_streams.unwrap_or(DEFAULT_SERVICE_STREAMS)),
     })
 }
 
@@ -210,7 +220,7 @@ impl AddonLoader {
             let layer = Layer::load(&rt, bytes, lc)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
-            tracing::info!(addon = a.name, tunnel = layer.has_tunnel(), "addon loaded");
+            tracing::info!(addon = a.name, "addon loaded");
             layer
         };
         keep.push((a.name.clone(), key, layer.clone()));

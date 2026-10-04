@@ -73,9 +73,6 @@ pub(crate) const ALLOW_UP: &str = r#"
 /// The roxy-wasm test layer (`crates/roxy-wasm/test-components`).
 pub(crate) const TEST_LAYER: &[u8] =
     include_bytes!("../../../roxy-wasm/tests/fixtures/test_layer.wasm");
-/// The roxy-wasm tunnel layer.
-pub(crate) const TUNNEL_LAYER: &[u8] =
-    include_bytes!("../../../roxy-wasm/tests/fixtures/tunnel_layer.wasm");
 
 /// One addon of the stack under test.
 #[derive(Clone)]
@@ -102,15 +99,6 @@ impl AddonDef {
             limits: roxy_wasm::LayerLimits::default(),
             when: None,
             sample: None,
-        }
-    }
-
-    /// The tunnel layer, named `name`.
-    pub(crate) fn tunnel_layer(name: &str, upper: bool) -> Self {
-        Self {
-            wasm: TUNNEL_LAYER,
-            config: serde_json::json!({ "name": name, "upper": upper }),
-            ..Self::test_layer(name)
         }
     }
 

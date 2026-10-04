@@ -45,9 +45,9 @@ Either way:
 - The flow log gets one `ws_open` and one `ws_close` event, with byte
   counts. When roxy ended the WebSocket with a close frame, `ws_close` has
   `close_code` and `close_reason`.
-- Addons that export `tunnel` are chained between the client and the relay
-  ([addons](/addons/overview)), so message rules see what the layers
-  pass on.
+- Addon layers carry the WebSocket in their bodies, between the client
+  and the relay ([addons](/addons/overview#websockets)), so message rules
+  see what the layers pass on.
 
 ## Extensions
 
@@ -59,7 +59,7 @@ a `101` that accepts an extension anyway. Every WebSocket server must work
 without extensions, so this costs only compression. roxy does this when:
 
 - a rule reads `ws.*` ([message rules](#message-rules)); or
-- a `tunnel` layer runs on the upgrade request (its `when` matched) and
+- an addon layer runs on the upgrade request (its `when` matched) and
   `http.decode_for_addons` is on (the default), so the layer gets readable
   messages
   ([addons](/addons/overview#content-codings)).
@@ -105,8 +105,8 @@ deny every ping.
 
 A matching deny closes both sides with `1008` (policy violation). There is
 no way to drop or edit a single message from a rule: dropping one silently
-corrupts most protocols. Per-message editing is for addons, through
-`tunnel`. A watching rule's `log`, `tag` and `set_state` effects apply once
+corrupts most protocols. Per-message editing is for addons, which
+carry the WebSocket in their bodies. A watching rule's `log`, `tag` and `set_state` effects apply once
 per WebSocket, the first time it matches.
 
 ### Parsing

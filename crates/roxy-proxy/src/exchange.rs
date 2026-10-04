@@ -434,8 +434,8 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
                 });
             }
         };
-        if crate::addons::ws_without_extensions(&cx.snap, cx.tunnel_ran) {
-            // Messages are read, by the rules or by `tunnel` layers, so no
+        if crate::addons::ws_without_extensions(&cx.snap, cx.layer_ran) {
+            // Messages are read, by the rules or by addon layers, so no
             // extension (permessage-deflate above all) may be negotiated.
             req.headers.remove("sec-websocket-extensions");
         }
@@ -653,7 +653,7 @@ async fn splice_websocket(
 ) -> Next {
     let parse = cx.snap.policy.reads_ws();
     let checked = validate_upgrade_response(&res, key).and_then(|()| {
-        if crate::addons::ws_without_extensions(&cx.snap, cx.tunnel_ran) {
+        if crate::addons::ws_without_extensions(&cx.snap, cx.layer_ran) {
             validate_no_extensions(&res)
         } else {
             Ok(())
@@ -686,10 +686,16 @@ async fn splice_websocket(
         conn: cx.conn_id(),
         host,
     });
-    // Layers that export `tunnel` sit between the client and the relay;
-    // the bytes that came with the upgrade request go through them.
+    // Through an addon stack, the layers sit between the client and the
+    // relay, carrying the WebSocket as the bodies of its exchange; the bytes
+    // that came with the upgrade request go through them first.
     let (client_io, leftover): (crate::io::BoxIo, Vec<u8>) = match &cx.stack {
-        Some(st) => crate::addons::chain_tunnels(st, Box::new(client_io), leftover.to_vec()),
+        Some(st) => {
+            match crate::addons::splice_client(st, Box::new(client_io), leftover.to_vec()) {
+                Ok(bottom) => (bottom, Vec::new()),
+                Err(client_io) => (client_io, leftover.to_vec()),
+            }
+        }
         None => (Box::new(client_io), leftover.to_vec()),
     };
     let mut upstream = TokioIo::new(upgraded);

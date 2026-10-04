@@ -6,17 +6,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, timeout_at};
 use wasmtime::component::{Component, InstancePre, Linker, Resource};
 use wasmtime::{Config, Engine, Store, StoreContextMut};
-use wasmtime_wasi::p2::pipe::{AsyncReadStream, AsyncWriteStream};
-use wasmtime_wasi::p2::{DynInputStream, DynOutputStream};
 use wasmtime_wasi_http::WasiHttpView;
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme as WasiScheme;
 
-use crate::bindings::exports::roxy::addon::{init, tunnel};
+use crate::bindings::exports::roxy::addon::init;
 use crate::bindings::exports::wasi::http::incoming_handler;
 use crate::bindings::roxy::addon::{chain, endpoints, flow};
 use crate::config::LayerConfig;
@@ -29,8 +26,6 @@ use crate::state::{ExchangeCtx, LayerShared, StoreState};
 /// so a busy layer cannot hog a worker thread, and cancelling its exchange
 /// takes effect within a tick.
 const EPOCH_TICK: Duration = Duration::from_millis(1);
-/// Bytes a tunnel output stream accepts before it applies backpressure.
-const TUNNEL_WRITE_BUDGET: usize = 64 * 1024;
 
 struct Ticker {
     stop: Arc<AtomicBool>,
@@ -107,7 +102,6 @@ impl WasmRuntime {
 struct Instance {
     store: Store<StoreState>,
     handler: incoming_handler::Guest,
-    tunnel: Option<tunnel::Guest>,
     exchanges: u64,
 }
 
@@ -117,7 +111,6 @@ struct LayerInner {
     pre: InstancePre<StoreState>,
     handler: incoming_handler::GuestIndices,
     init: init::GuestIndices,
-    tunnel: Option<tunnel::GuestIndices>,
     idle: Mutex<Vec<Instance>>,
     slots: Arc<Semaphore>,
 }
@@ -141,7 +134,6 @@ impl std::fmt::Debug for Layer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Layer")
             .field("name", &self.inner.shared.config.name)
-            .field("tunnel", &self.inner.tunnel.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -212,7 +204,6 @@ impl Layer {
         };
         let handler = incoming_handler::GuestIndices::new(&pre).map_err(missing)?;
         let init = init::GuestIndices::new(&pre).map_err(missing)?;
-        let tunnel = tunnel::GuestIndices::new(&pre).ok();
 
         let max_instances = config.limits.max_instances;
         let inner = Arc::new(LayerInner {
@@ -221,7 +212,6 @@ impl Layer {
             pre,
             handler,
             init,
-            tunnel,
             idle: Mutex::new(Vec::new()),
             slots: Arc::new(Semaphore::new(max_instances)),
         });
@@ -241,11 +231,6 @@ impl Layer {
     /// The layer's name.
     pub fn name(&self) -> &str {
         &self.inner.shared.config.name
-    }
-
-    /// Whether the layer exports `roxy:addon/tunnel`.
-    pub fn has_tunnel(&self) -> bool {
-        self.inner.tunnel.is_some()
     }
 
     /// Instances currently idle in the pool.
@@ -272,13 +257,6 @@ impl Layer {
                     .handler
                     .load(&mut store, &instance)
                     .map_err(|e| LayerError::Instantiate(format!("{e:#}")))?;
-                let tunnel = match &inner.tunnel {
-                    Some(t) => Some(
-                        t.load(&mut store, &instance)
-                            .map_err(|e| LayerError::Instantiate(format!("{e:#}")))?,
-                    ),
-                    None => None,
-                };
                 let init = inner
                     .init
                     .load(&mut store, &instance)
@@ -287,15 +265,14 @@ impl Layer {
                     .await
                     .map_err(|e| classify(&e))?
                     .map_err(LayerError::Init)?;
-                Ok::<_, LayerError>((handler, tunnel))
+                Ok::<_, LayerError>(handler)
             };
-        let (handler, tunnel) = timeout_at(deadline, start)
+        let handler = timeout_at(deadline, start)
             .await
             .map_err(|_| LayerError::BudgetExceeded(Budget::FirstByte))??;
         Ok(Instance {
             store,
             handler,
-            tunnel,
             exchanges: 0,
         })
     }
@@ -387,7 +364,6 @@ impl Layer {
             data.exchange = Some(ExchangeCtx {
                 host,
                 shared: shared.clone(),
-                next_allowed: true,
                 next_called: false,
                 scheme,
                 authority,
@@ -448,75 +424,6 @@ impl Layer {
                 Err(err)
             }
         }
-    }
-
-    /// Relays an upgraded connection through the layer's `tunnel` export.
-    ///
-    /// Memory and the instance pool apply. A tunnel lives as long as the
-    /// connection, bounded by the relay's own idle timeouts; drop the
-    /// future to stop it.
-    pub async fn tunnel<CR, UW, UR, CW>(
-        &self,
-        host: Arc<dyn LayerHost>,
-        from_client: CR,
-        to_upstream: UW,
-        from_upstream: UR,
-        to_client: CW,
-    ) -> Result<(), LayerError>
-    where
-        CR: AsyncRead + Send + Unpin + 'static,
-        UW: AsyncWrite + Send + Unpin + 'static,
-        UR: AsyncRead + Send + Unpin + 'static,
-        CW: AsyncWrite + Send + Unpin + 'static,
-    {
-        if !self.has_tunnel() {
-            return Err(LayerError::NoTunnel);
-        }
-        let (mut instance, permit, _) = self.checkout().await?;
-        let shared = ExchangeShared::new();
-        let streams = {
-            let data = instance.store.data_mut();
-            data.exchange = Some(ExchangeCtx {
-                host,
-                shared: shared.clone(),
-                next_allowed: false,
-                next_called: false,
-                scheme: http::uri::Scheme::HTTP,
-                authority: String::new(),
-            });
-            let t = &mut data.table;
-            let input = |t: &mut wasmtime::component::ResourceTable, r| {
-                t.push(Box::new(AsyncReadStream::new(r)) as DynInputStream)
-            };
-            let output = |t: &mut wasmtime::component::ResourceTable, w| {
-                t.push(Box::new(AsyncWriteStream::new(TUNNEL_WRITE_BUDGET, w)) as DynOutputStream)
-            };
-            (|| {
-                Ok::<_, wasmtime::component::ResourceTableError>((
-                    input(
-                        t,
-                        Box::new(from_client) as Box<dyn AsyncRead + Send + Unpin>,
-                    )?,
-                    output(
-                        t,
-                        Box::new(to_upstream) as Box<dyn AsyncWrite + Send + Unpin>,
-                    )?,
-                    input(
-                        t,
-                        Box::new(from_upstream) as Box<dyn AsyncRead + Send + Unpin>,
-                    )?,
-                    output(t, Box::new(to_client) as Box<dyn AsyncWrite + Send + Unpin>)?,
-                ))
-            })()
-            .map_err(|e| LayerError::Instantiate(e.to_string()))?
-        };
-        let mut run = ExchangeRun {
-            layer: self.clone(),
-            shared: shared.clone(),
-            instance: Some(instance),
-            _permit: permit,
-        };
-        run.drive_tunnel(streams).await
     }
 }
 
@@ -586,33 +493,5 @@ impl ExchangeRun {
             r = call => r.map_err(|e| classify(&e)),
         };
         self.finish(result);
-    }
-
-    async fn drive_tunnel(
-        &mut self,
-        (from_client, to_upstream, from_upstream, to_client): (
-            Resource<DynInputStream>,
-            Resource<DynOutputStream>,
-            Resource<DynInputStream>,
-            Resource<DynOutputStream>,
-        ),
-    ) -> Result<(), LayerError> {
-        let failure = self.shared.wait_failure();
-        let instance = self.instance.as_mut().expect("instance present");
-        let guest = instance.tunnel.clone().ok_or(LayerError::NoTunnel)?;
-        let call = guest.call_on_tunnel(
-            &mut instance.store,
-            from_client,
-            to_upstream,
-            from_upstream,
-            to_client,
-        );
-        let result = tokio::select! {
-            biased;
-            err = failure => Err(err),
-            r = call => r.map_err(|e| classify(&e)),
-        };
-        self.finish(result);
-        self.shared.failure().map_or(Ok(()), Err)
     }
 }

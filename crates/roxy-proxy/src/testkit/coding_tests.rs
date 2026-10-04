@@ -312,7 +312,7 @@ async fn a_corrupt_body_is_cut_on_its_way_to_a_layer() {
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket extensions with `tunnel` layers
+// WebSocket extensions with layers in the byte path
 // ---------------------------------------------------------------------------
 
 const WS_RULES: &str = r#"
@@ -321,10 +321,10 @@ const WS_RULES: &str = r#"
   then: { allow: { upgrade: websocket } }
 "#;
 
-async fn with_tunnel(decode: bool) -> Kit {
+async fn with_ws_layer(decode: bool) -> Kit {
     Kit::builder()
         .rules(WS_RULES)
-        .addon(AddonDef::tunnel_layer("t", false))
+        .addon(AddonDef::test_layer("t"))
         .flags(|f| f.decode_for_addons = decode)
         .start()
         .await
@@ -333,8 +333,8 @@ async fn with_tunnel(decode: bool) -> Kit {
 const DEFLATE: (&str, &str) = ("sec-websocket-extensions", "permessage-deflate");
 
 #[tokio::test]
-async fn a_tunnel_layer_gets_websockets_without_extensions() {
-    let kit = with_tunnel(true).await;
+async fn a_layer_gets_websockets_without_extensions() {
+    let kit = with_ws_layer(true).await;
     let (status, _io) = kit.websocket("/ws", &[DEFLATE]).await;
     assert_eq!(status, 101);
     let seen = kit.upstream.wait_seen(1).await;
@@ -342,8 +342,8 @@ async fn a_tunnel_layer_gets_websockets_without_extensions() {
 }
 
 #[tokio::test]
-async fn a_tunnel_layer_refuses_an_extension_the_upstream_forces() {
-    let kit = with_tunnel(true).await;
+async fn a_layer_refuses_an_extension_the_upstream_forces() {
+    let kit = with_ws_layer(true).await;
     let (status, _) = kit
         .websocket("/ws", &[DEFLATE, ("x-accept-extension", "1")])
         .await;
@@ -351,8 +351,8 @@ async fn a_tunnel_layer_refuses_an_extension_the_upstream_forces() {
 }
 
 #[tokio::test]
-async fn decode_for_addons_off_lets_tunnel_layers_negotiate_extensions() {
-    let kit = with_tunnel(false).await;
+async fn decode_for_addons_off_lets_layers_negotiate_extensions() {
+    let kit = with_ws_layer(false).await;
     let (status, _io) = kit
         .websocket("/ws", &[DEFLATE, ("x-accept-extension", "1")])
         .await;
@@ -365,7 +365,7 @@ async fn decode_for_addons_off_lets_tunnel_layers_negotiate_extensions() {
 }
 
 #[tokio::test]
-async fn without_a_tunnel_layer_extensions_pass_through() {
+async fn without_a_layer_extensions_pass_through() {
     let kit = Kit::builder().rules(WS_RULES).start().await;
     let (status, _io) = kit.websocket("/ws", &[DEFLATE]).await;
     assert_eq!(status, 101);
@@ -424,13 +424,13 @@ async fn the_first_layer_that_runs_gets_bodies_decoded() {
     assert_eq!(a.text(), "HELLO");
 }
 
-/// A `tunnel` layer its `when` skips is not in the WebSocket, so the
-/// WebSocket keeps its extensions.
+/// A layer its `when` skips is not in the WebSocket, so the WebSocket
+/// keeps its extensions.
 #[tokio::test]
-async fn a_skipped_tunnel_layer_leaves_extensions_alone() {
+async fn a_skipped_layer_leaves_extensions_alone() {
     let kit = Kit::builder()
         .rules(WS_RULES)
-        .addon(AddonDef::tunnel_layer("t", false).when(r#"path != "/ws""#))
+        .addon(AddonDef::test_layer("t").when(r#"path != "/ws""#))
         .start()
         .await;
     let (status, _io) = kit
