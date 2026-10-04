@@ -28,8 +28,11 @@ Configuration (environment):
     SENTINEL_TASK            the deployed agent's name, for `context.task`
     SENTINEL_ON_REJECT       deny (default): the agent gets a 403 carrying the
                              decision's message; explain: an Anthropic response
-                             is replaced by an assistant message saying what was
-                             blocked, so the agent's turn ends normally
+                              is replaced by an assistant message saying what was
+                             blocked, so the agent's turn ends normally. A
+                             streamed response starts at once (head,
+                             message_start, then pings) while it is judged,
+                             so the agent's first-byte deadline is met
 
 Known gaps, as inspect_sentinel's deployment design describes them: a
 proxy sees `AfterToolCall` only in the next request (not projected here);
@@ -49,8 +52,9 @@ import json
 import logging
 import os
 import sys
+import time
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from inspect_ai.model import (
@@ -77,6 +81,11 @@ from roxy_layer import Exchange, Request, Response, serve  # noqa: E402
 log = logging.getLogger("sentinel-sidecar")
 
 MAX_CONVERSATIONS = 10_000
+
+# While a streamed response is held for judging (explain mode), a ping
+# this often keeps the client's idle watchdogs from giving up on it.
+PING_EVERY = 10.0
+PING = b'event: ping\ndata: {"type": "ping"}\n\n'
 
 
 # ----- the host side of inspect_sentinel --------------------------------------
@@ -280,12 +289,13 @@ def explanation(response: dict[str, Any], message: str) -> dict[str, Any]:
     }
 
 
-def anthropic_to_sse(message: dict[str, Any]) -> bytes:
-    """The event stream for a whole Anthropic `Message` (text blocks only)."""
-    start = {**message, "content": [], "stop_reason": None, "stop_sequence": None}
-    events: list[tuple[str, dict[str, Any]]] = [
-        ("message_start", {"type": "message_start", "message": start})
-    ]
+def anthropic_to_sse(message: dict[str, Any], *, start: bool = True) -> bytes:
+    """The event stream for a whole Anthropic `Message` (text blocks only),
+    without its `message_start` event if that was already sent."""
+    events: list[tuple[str, dict[str, Any]]] = []
+    if start:
+        head = {**message, "content": [], "stop_reason": None, "stop_sequence": None}
+        events.append(("message_start", {"type": "message_start", "message": head}))
     for i, block in enumerate(message["content"]):
         events += [
             (
@@ -350,6 +360,11 @@ class Sidecar:
             return
         body = await ex.read_body()
         res = await ex.forward(ex.request, body)
+        streamed = (res.header("content-type") or "").startswith("text/event-stream")
+        if self.explain and api == "anthropic" and streamed and res.status == 200 and not ex.observing:
+            head = [(n, v) for n, v in res.headers if n.lower() != "content-length"]
+            await ex.respond(Response(res.status, head), self.judged_stream(ex, api, body, res))
+            return
         raw = await ex.read_response_body()
         if res.status != 200 or ex.observing:
             await ex.respond(res, raw)
@@ -362,11 +377,54 @@ class Sidecar:
         elif isinstance(verdict, bytes):
             await ex.respond(with_length(res, len(verdict)), verdict)
         elif self.explain and verdict.call and verdict.call.api == "anthropic":
-            message = explanation(verdict.call.response, verdict.message)
-            out = anthropic_to_sse(message) if verdict.call.streamed else json.dumps(message).encode()
+            out = json.dumps(explanation(verdict.call.response, verdict.message)).encode()
             await ex.respond(with_length(res, len(out)), out)
         else:
             await ex.deny(403, verdict.message)
+
+    async def judged_stream(
+        self, ex: Exchange, api: str, body: bytes, res: Response
+    ) -> AsyncIterator[bytes]:
+        """A streamed Anthropic response, judged before the agent sees any
+        content: its `message_start` passes at once, pings follow while the
+        rest is held, then the rest or, if refused, the explanation."""
+        chunks: list[bytes] = []
+
+        async def read() -> None:
+            async for chunk in ex.response_body():
+                chunks.append(chunk)
+
+        reader = asyncio.create_task(read())
+        sent = 0
+        last = time.monotonic()
+        while True:
+            done, _ = await asyncio.wait({reader}, timeout=0.5)
+            if not sent:
+                raw = b"".join(chunks)
+                end = raw.find(b"\n\n")
+                if end != -1:
+                    if b"message_start" in raw[:end]:
+                        sent = end + 2
+                        yield raw[:sent]
+                    else:
+                        sent = -1  # not the shape we know: hold everything
+            if done:
+                break
+            if sent > 0 and time.monotonic() - last >= PING_EVERY:
+                last = time.monotonic()
+                yield PING
+        reader.result()
+        raw = b"".join(chunks)
+        sent = max(sent, 0)
+        verdict = await self.judge(ex, api, body, res, raw)
+        if verdict is None or isinstance(verdict, bytes):
+            # Streamed responses are never modified (see judge).
+            yield raw[sent:]
+        elif verdict.call:
+            yield anthropic_to_sse(explanation(verdict.call.response, verdict.message), start=not sent)
+        else:
+            error = {"type": "error", "error": {"type": "api_error", "message": verdict.message}}
+            yield f"event: error\ndata: {json.dumps(error)}\n\n".encode()
 
     async def judge(
         self, ex: Exchange, api: str, body: bytes, res: Response, raw: bytes

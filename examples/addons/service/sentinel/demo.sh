@@ -70,5 +70,8 @@ check "explain: curl tool call"        "do evil"    ""               200 '"stop_
 check "explain: curl, streamed"        "do evil"    ',"stream":true' 200 'not allowed here'
 check "explain: no tool_use left"      "do evil"    ',"stream":true' 200 'message_stop'
 ! grep -q tool_use "$work/out" || { echo "explain left a tool_use in the stream"; exit 1; }
+check "explain: slow evil, streamed"   "slow evil"  ',"stream":true' 200 'event: ping'
+[ "$(grep -c '^event: message_start' "$work/out")" = 1 ] || { echo "message_start sent twice"; exit 1; }
+check "explain: slow benign, streamed" "slow ls"    ',"stream":true' 200 '"tool_use"'
 echo "sentinel records:"
 cut -c1-160 "$work/sentinel.jsonl"

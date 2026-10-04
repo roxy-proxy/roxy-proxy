@@ -78,7 +78,9 @@ From inspect_sentinel's deployment design, and true here:
 - `reject` is an error the agent's SDK raises, or with `explain` the end
   of the agent's turn, not the append-and-regenerate replay an eval does.
 - A streamed response is held until judged, which costs time to first
-  token. OpenAI streaming is refused rather than passed unjudged.
+  token. With `explain`, its head and `message_start` go to the agent at
+  once and pings follow while it is judged, so the agent's first-byte and
+  idle deadlines are met; its content still arrives in one burst. OpenAI streaming is refused rather than passed unjudged.
 - `terminate` cannot end the agent from here; it refuses the response.
 
 A compiled build of the same sentinels, running inside roxy as a WASM
