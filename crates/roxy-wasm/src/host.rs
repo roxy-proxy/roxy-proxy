@@ -101,9 +101,9 @@ pub enum EndpointError {
 ///
 /// roxy-wasm enforces capabilities before calling any of these (a method
 /// whose capability was not granted is never called), calls
-/// [`LayerHost::next`] at most once per exchange, and bounds every call by
-/// the exchange's wall clock (`max_exchange_time`), dropping the future
-/// when it expires.
+/// [`LayerHost::next`] at most once per exchange, and drops a call's
+/// future when the exchange fails or is cancelled. Calls have no deadline
+/// of their own here: time below the layer is not the layer's.
 #[async_trait::async_trait]
 pub trait LayerHost: Send + Sync + 'static {
     /// Pass the request to the layers below this one. Called at most once

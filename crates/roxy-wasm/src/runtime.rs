@@ -10,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, timeout_at};
 use wasmtime::component::{Component, InstancePre, Linker, Resource};
-use wasmtime::{CallHook, Config, Engine, Store, StoreContextMut, Trap};
+use wasmtime::{Config, Engine, Store, StoreContextMut};
 use wasmtime_wasi::p2::pipe::{AsyncReadStream, AsyncWriteStream};
 use wasmtime_wasi::p2::{DynInputStream, DynOutputStream};
 use wasmtime_wasi_http::WasiHttpView;
@@ -25,9 +25,9 @@ use crate::exchange::{CancelGuard, Dir, ExchangeShared, FromGuest, IntoGuest};
 use crate::host::{LayerHost, LayerRequest, LayerResponse};
 use crate::state::{ExchangeCtx, LayerShared, StoreState};
 
-/// Epoch tick: the resolution of `step_cpu`. A running guest also yields
-/// to the async runtime once per tick, so a busy layer cannot hog a worker
-/// thread and its wall clock stays enforceable.
+/// Epoch tick: a running guest yields to the async runtime once per tick,
+/// so a busy layer cannot hog a worker thread, and cancelling its exchange
+/// takes effect within a tick.
 const EPOCH_TICK: Duration = Duration::from_millis(1);
 /// Bytes a tunnel output stream accepts before it applies backpressure.
 const TUNNEL_WRITE_BUDGET: usize = 64 * 1024;
@@ -43,7 +43,7 @@ impl Drop for Ticker {
 }
 
 /// The wasm engine shared by every layer: compilation settings and the
-/// epoch ticker behind `step_cpu`. Cheap to clone.
+/// epoch ticker that makes guests yield. Cheap to clone.
 #[derive(Clone)]
 pub struct WasmRuntime {
     engine: Engine,
@@ -61,10 +61,7 @@ impl WasmRuntime {
     /// the last clone is dropped).
     pub fn new() -> Result<Self, LoadError> {
         let mut config = Config::new();
-        config
-            .wasm_component_model(true)
-            .consume_fuel(true)
-            .epoch_interruption(true);
+        config.wasm_component_model(true).epoch_interruption(true);
         let engine = Engine::new(&config).map_err(|e| LoadError::Engine(e.to_string()))?;
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -150,53 +147,19 @@ impl std::fmt::Debug for Layer {
 }
 
 /// Maps a guest failure to the error it reports. A failure already
-/// recorded for the exchange (a budget or host failure that made the guest
+/// recorded for the exchange (a limit or host failure that made the guest
 /// trap) takes precedence.
 fn classify(err: &wasmtime::Error) -> LayerError {
-    if let Some(e) = err.downcast_ref::<LayerError>() {
-        return e.clone();
-    }
-    match err.downcast_ref::<Trap>() {
-        Some(Trap::OutOfFuel) => LayerError::BudgetExceeded(Budget::Fuel),
-        Some(Trap::Interrupt) => LayerError::BudgetExceeded(Budget::StepCpu),
-        _ => LayerError::Trap(format!("{err:#}")),
+    match err.downcast_ref::<LayerError>() {
+        Some(e) => e.clone(),
+        None => LayerError::Trap(format!("{err:#}")),
     }
 }
 
-/// Starts a new step (fresh `fuel_per_step`, `step_cpu` measured from now)
-/// whenever control enters wasm: a call into the guest, or a host call
-/// returning to it. Both budgets therefore bound the guest's work *between*
-/// host calls.
-///
-/// wasmtime runs this hook around its own fuel and epoch checks too. The
-/// fuel check only reaches the host when fuel is exhausted, and then traps
-/// whatever this does; the epoch check is recognised by the flag the epoch
-/// callback sets, and is not a step boundary.
-fn step_hook(mut ctx: StoreContextMut<'_, StoreState>, hook: CallHook) -> wasmtime::Result<()> {
-    if hook.exiting_host() {
-        if std::mem::take(&mut ctx.data_mut().in_epoch_check) {
-            return Ok(());
-        }
-        let fuel = ctx.data().layer.config.limits.fuel_per_step;
-        ctx.set_fuel(fuel)?;
-        ctx.set_epoch_deadline(1);
-        ctx.data_mut().step_started = std::time::Instant::now();
-    }
-    Ok(())
-}
-
-/// Runs once per epoch tick while the guest runs: traps once the step has
-/// run longer than `step_cpu`, otherwise yields to the async runtime.
-fn epoch_check(
-    mut ctx: StoreContextMut<'_, StoreState>,
-) -> wasmtime::Result<wasmtime::UpdateDeadline> {
-    let data = ctx.data_mut();
-    data.in_epoch_check = true;
-    if data.step_started.elapsed() >= data.layer.config.limits.step_cpu {
-        return Err(wasmtime::Error::new(LayerError::BudgetExceeded(
-            Budget::StepCpu,
-        )));
-    }
+/// Runs once per epoch tick while the guest runs: yields to the async
+/// runtime. Not a limit: a guest may compute for as long as it likes.
+#[allow(clippy::unnecessary_wraps)] // the callback's signature
+fn epoch_yield(_: StoreContextMut<'_, StoreState>) -> wasmtime::Result<wasmtime::UpdateDeadline> {
     Ok(wasmtime::UpdateDeadline::Yield(1))
 }
 
@@ -217,10 +180,10 @@ impl Layer {
                 message: "max_instances must be at least 1".to_owned(),
             });
         }
-        if limits.step_cpu.is_zero() || limits.max_exchange_time.is_zero() {
+        if limits.first_byte_timeout.is_zero() {
             return Err(LoadError::Limits {
                 layer,
-                message: "step_cpu and max_exchange_time must be positive".to_owned(),
+                message: "first_byte_timeout must be positive".to_owned(),
             });
         }
 
@@ -263,7 +226,7 @@ impl Layer {
             slots: Arc::new(Semaphore::new(max_instances)),
         });
         let layer = Layer { inner };
-        let deadline = Instant::now() + layer.inner.shared.config.limits.max_exchange_time;
+        let deadline = Instant::now() + layer.inner.shared.config.limits.first_byte_timeout;
         let first = layer
             .instantiate(deadline)
             .await
@@ -294,11 +257,7 @@ impl Layer {
         let inner = &self.inner;
         let mut store = Store::new(&inner.runtime.engine, StoreState::new(inner.shared.clone()));
         store.limiter(|s| &mut s.limiter);
-        store.call_hook(step_hook);
-        store.epoch_deadline_callback(epoch_check);
-        store
-            .set_fuel(inner.shared.config.limits.fuel_per_step)
-            .map_err(|e| LayerError::Instantiate(e.to_string()))?;
+        store.epoch_deadline_callback(epoch_yield);
         store.set_epoch_deadline(1);
 
         let start =
@@ -332,7 +291,7 @@ impl Layer {
             };
         let (handler, tunnel) = timeout_at(deadline, start)
             .await
-            .map_err(|_| LayerError::BudgetExceeded(Budget::ExchangeTime))??;
+            .map_err(|_| LayerError::BudgetExceeded(Budget::FirstByte))??;
         Ok(Instance {
             store,
             handler,
@@ -342,20 +301,26 @@ impl Layer {
     }
 
     /// Takes an idle instance or starts a new one, once a slot is free.
-    async fn checkout(
-        &self,
-        deadline: Instant,
-    ) -> Result<(Instance, OwnedSemaphorePermit), LayerError> {
-        let permit = timeout_at(deadline, self.inner.slots.clone().acquire_owned())
+    /// Waiting for a slot has no deadline; starting an instance must finish
+    /// within `first_byte_timeout`, and counts towards it. Returns when the
+    /// head clock started.
+    async fn checkout(&self) -> Result<(Instance, OwnedSemaphorePermit, Instant), LayerError> {
+        let permit = self
+            .inner
+            .slots
+            .clone()
+            .acquire_owned()
             .await
-            .map_err(|_| LayerError::BudgetExceeded(Budget::ExchangeTime))?
             .map_err(|_| LayerError::Cancelled)?;
+        let started = Instant::now();
         let idle = self.inner.idle().pop();
-        let instance = match idle {
-            Some(i) => i,
-            None => self.instantiate(deadline).await?,
+        let instance = if let Some(i) = idle {
+            i
+        } else {
+            let limit = self.inner.shared.config.limits.first_byte_timeout;
+            self.instantiate(started + limit).await?
         };
-        Ok((instance, permit))
+        Ok((instance, permit, started))
     }
 
     /// Returns a healthy instance to the pool, unless it is due for
@@ -397,7 +362,6 @@ impl Layer {
         req: LayerRequest,
     ) -> Result<LayerResponse, LayerError> {
         let limits = &self.inner.shared.config.limits;
-        let deadline = Instant::now() + limits.max_exchange_time;
 
         let scheme = req
             .uri()
@@ -415,8 +379,8 @@ impl Layer {
             other => WasiScheme::Other(other.to_owned()),
         };
 
-        let (mut instance, permit) = self.checkout(deadline).await?;
-        let shared = ExchangeShared::new(limits.max_buffered_body_bytes);
+        let (mut instance, permit, started) = self.checkout().await?;
+        let shared = ExchangeShared::new();
         let (tx, rx) = oneshot::channel();
         let (req_res, out_res) = {
             let data = instance.store.data_mut();
@@ -428,7 +392,7 @@ impl Layer {
                 scheme,
                 authority,
             });
-            let req = req.map(|b| IntoGuest::new(b, Dir::Request, Some(shared.clone())));
+            let req = req.map(|b| IntoGuest::new(b, Dir::Request));
             let mut http = data.http();
             let req_res = http
                 .new_incoming_request(wasi_scheme, req)
@@ -445,13 +409,15 @@ impl Layer {
             instance: Some(instance),
             _permit: permit,
         };
-        let driver = tokio::spawn(run.drive(deadline, req_res, out_res));
+        let driver = tokio::spawn(run.drive(req_res, out_res));
         let cancel = Arc::new(CancelGuard {
             abort: driver.abort_handle(),
             shared: shared.clone(),
         });
 
         let settled = shared.wait_settled();
+        let head_clock =
+            shared.head_clock(limits.first_byte_timeout.saturating_sub(started.elapsed()));
         tokio::select! {
             biased;
             resp = rx => match resp {
@@ -475,14 +441,20 @@ impl Layer {
                     .unwrap_or(LayerError::NoResponse)),
             },
             outcome = settled => Err(outcome.err().unwrap_or(LayerError::NoResponse)),
+            () = head_clock => {
+                let err = LayerError::BudgetExceeded(Budget::FirstByte);
+                // The driver sees the failure and tears the instance down.
+                shared.fail(err.clone());
+                Err(err)
+            }
         }
     }
 
     /// Relays an upgraded connection through the layer's `tunnel` export.
     ///
-    /// Step budgets, memory and the instance pool apply; the exchange wall
-    /// clock does not (a tunnel lives as long as the connection, bounded by
-    /// the relay's own idle timeouts; drop the future to stop it).
+    /// Memory and the instance pool apply. A tunnel lives as long as the
+    /// connection, bounded by the relay's own idle timeouts; drop the
+    /// future to stop it.
     pub async fn tunnel<CR, UW, UR, CW>(
         &self,
         host: Arc<dyn LayerHost>,
@@ -500,9 +472,8 @@ impl Layer {
         if !self.has_tunnel() {
             return Err(LayerError::NoTunnel);
         }
-        let deadline = Instant::now() + self.inner.shared.config.limits.max_exchange_time;
-        let (mut instance, permit) = self.checkout(deadline).await?;
-        let shared = ExchangeShared::new(self.inner.shared.config.limits.max_buffered_body_bytes);
+        let (mut instance, permit, _) = self.checkout().await?;
+        let shared = ExchangeShared::new();
         let streams = {
             let data = instance.store.data_mut();
             data.exchange = Some(ExchangeCtx {
@@ -603,7 +574,6 @@ impl ExchangeRun {
 
     async fn drive(
         mut self,
-        deadline: Instant,
         req: Resource<wasmtime_wasi_http::p2::types::HostIncomingRequest>,
         out: Resource<wasmtime_wasi_http::p2::types::HostResponseOutparam>,
     ) {
@@ -613,11 +583,7 @@ impl ExchangeRun {
         let result = tokio::select! {
             biased;
             err = failure => Err(err),
-            r = timeout_at(deadline, call) => match r {
-                Err(_) => Err(LayerError::BudgetExceeded(Budget::ExchangeTime)),
-                Ok(Err(e)) => Err(classify(&e)),
-                Ok(Ok(())) => Ok(()),
-            },
+            r = call => r.map_err(|e| classify(&e)),
         };
         self.finish(result);
     }
