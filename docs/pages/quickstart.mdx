@@ -3,6 +3,8 @@ title: "Quickstart"
 description: "Run Claude Code through roxy and an inspect_sentinel sidecar that blocks tool calls matching a denylist."
 ---
 
+import inspectView from "../assets/quickstart-inspect-view.png";
+
 # Quickstart
 
 Run Claude Code through roxy, with an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar that judges every tool call before Claude Code sees it. By the end, Claude Code works as usual, except that tool calls matching a denylist are blocked, and every request it makes is in roxy's flow log. The setup is [`examples/quickstart`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/quickstart) in the roxy repo.
@@ -27,7 +29,7 @@ cd roxy-proxy/examples/quickstart
 docker compose up -d --wait
 ```
 
-The first run builds the sentinel image, which takes a minute or two. Two containers start:
+The first run builds the sentinel image, which takes a minute or two. Three containers start:
 
 - **roxy**: the proxy on `127.0.0.1:3128`. It generates its CA on first start and serves the certificate on `127.0.0.1:3130`.
 - **sentinel**: the inspect_sentinel sidecar, on a network with no route out. Every exchange streams through it. It runs a denylist over tool calls.
@@ -71,6 +73,8 @@ Claude Code never ran the command. Its turn ends, and you can carry on. Tool cal
 ### Watch it in Inspect View
 
 Open [http://127.0.0.1:7575](http://127.0.0.1:7575). Each Claude Code conversation is a sample. Its transcript shows every model call, the tool calls the model asked for, and the sentinel's verdict under each one: `Continued`, or `Rejected` with the reason. Reload the page to see new calls.
+
+<img src={inspectView} alt="Inspect View: Claude Code's curl tool call, and the sentinel's rejection under it" />
 
 ### Read roxy's flow log
 

@@ -1,9 +1,9 @@
 // Checks every link to a docs page, from the pages themselves and from the
 // rest of the repository: the page must exist, and so must the heading an
-// anchor names. Run from docs/: `npm run check-links`.
+// anchor names. A link to a static file must name a file in public/. Run from docs/: `npm run check-links`.
 
 import { execFileSync } from "node:child_process";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import GithubSlugger from "github-slugger";
@@ -38,6 +38,11 @@ for (const file of walk(pagesDir).filter((f) => /\.mdx?$/.test(f))) {
 const errors = [];
 function check(source, link) {
   const [path, anchor] = link.split("#");
+  // A path with an extension is a static file from public/, not a page.
+  if (/\.[a-z0-9]+$/i.test(path)) {
+    if (!existsSync(join(docs, "public", path))) errors.push(`${source}: ${link}: no such file in public/`);
+    return;
+  }
   const route = path.replace(/\/$/, "") || "/";
   const set = anchors.get(route);
   if (!set) errors.push(`${source}: ${link}: no such page`);
