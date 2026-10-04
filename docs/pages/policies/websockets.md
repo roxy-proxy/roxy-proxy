@@ -59,8 +59,9 @@ a `101` that accepts an extension anyway. Every WebSocket server must work
 without extensions, so this costs only compression. roxy does this when:
 
 - a rule reads `ws.*` ([message rules](#message-rules)); or
-- the addon stack has a `tunnel` layer and `http.decode_for_addons` is on
-  (the default), so the layer gets readable messages
+- a `tunnel` layer runs on the upgrade request (its `when` matched) and
+  `http.decode_for_addons` is on (the default), so the layer gets readable
+  messages
   ([addons](/addons/overview#content-codings)).
 
 Otherwise the client's offer and the upstream's answer pass through
