@@ -67,7 +67,7 @@ pub use dns_server::DnsServerSpec;
 pub use flowlog::{
     BufferedSink, ClientInfo, DEFAULT_REDACTED_HEADERS, DecisionKind, DstInfo, FileSink, FlowEvent,
     FlowSink, MemorySink, MultiSink, REDACTED, Redactor, RequestInfo, ResponseInfo, Stage,
-    StdoutSink, Timing, TlsInfo, WriterSink,
+    StdoutSink, Timing, TlsInfo,
 };
 pub use listener::{ClientConn, Listener, ListenerInfo, ListenerMode, TcpProxyListener};
 pub use server::{Server, ServerHandle, StartError};

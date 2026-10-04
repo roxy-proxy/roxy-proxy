@@ -35,7 +35,6 @@ impl fmt::Display for Budget {
 /// Why a layer failed an exchange. Every variant fails the exchange closed
 /// (`layer_error`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum LayerError {
     /// The guest trapped (including `unreachable`, a Rust panic, stack
     /// exhaustion, or `exit`).

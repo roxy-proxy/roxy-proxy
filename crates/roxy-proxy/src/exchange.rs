@@ -148,7 +148,7 @@ where
         finish_refusal(cx, r);
     } else {
         // A client that stopped reading is not an upstream failure.
-        cx.record_final_sample(false);
+        cx.record_final_sample();
         cx.emit_request_event();
     }
     Sent { failed, close }
@@ -783,7 +783,7 @@ async fn splice_websocket(
         // Bytes that arrived with the upgrade request: checked before they
         // are written, like every other relayed chunk.
         if watch.on_ws_chunk(Dir::Request, c2s_extra).is_err() {
-            cx.record_final_sample(false);
+            cx.record_final_sample();
             cx.emit_request_event();
             return None;
         }
@@ -818,7 +818,7 @@ fn finish_websocket(cx: &mut FlowCx, r: Relayed) {
     });
     cx.record.request_bytes = r.c2s;
     cx.record.response_bytes = r.s2c;
-    cx.record_final_sample(false);
+    cx.record_final_sample();
     cx.emit_request_event();
 }
 

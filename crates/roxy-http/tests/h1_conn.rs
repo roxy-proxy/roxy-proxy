@@ -338,9 +338,13 @@ async fn proxy_auth_required_on_connect() {
         panic!()
     };
     let server = tokio::spawn(async move {
-        c.respond_proxy_auth_required("roxy proxy", Bytes::from_static(b"auth needed"))
-            .await
-            .unwrap();
+        c.respond_proxy_auth_required(
+            "roxy proxy",
+            "text/plain",
+            Bytes::from_static(b"auth needed"),
+        )
+        .await
+        .unwrap();
     });
     let (head, body) = read_response(&mut client, false).await;
     assert!(
@@ -372,7 +376,7 @@ async fn proxy_auth_required_on_request_abandons_body() {
         panic!()
     };
     let server = tokio::spawn(async move {
-        c.respond_proxy_auth_required("r", Bytes::new())
+        c.respond_proxy_auth_required("r", "text/plain", Bytes::new())
             .await
             .unwrap();
     });
@@ -400,7 +404,7 @@ async fn proxy_auth_required_on_head_sends_no_body() {
         panic!()
     };
     let server = tokio::spawn(async move {
-        c.respond_proxy_auth_required("r", Bytes::from_static(b"body"))
+        c.respond_proxy_auth_required("r", "text/plain", Bytes::from_static(b"body"))
             .await
             .unwrap();
     });
@@ -433,7 +437,8 @@ async fn proxy_auth_realm_is_validated() {
         };
         assert!(
             matches!(
-                c.respond_proxy_auth_required(bad, Bytes::new()).await,
+                c.respond_proxy_auth_required(bad, "text/plain", Bytes::new())
+                    .await,
                 Err(WriteError::State(_))
             ),
             "{bad:?}"
@@ -446,7 +451,8 @@ async fn proxy_auth_realm_is_validated() {
     // No pending request: refused.
     let (_client, c) = proxy_conn();
     assert!(matches!(
-        c.respond_proxy_auth_required("r", Bytes::new()).await,
+        c.respond_proxy_auth_required("r", "text/plain", Bytes::new())
+            .await,
         Err(WriteError::State(_))
     ));
 }
@@ -924,7 +930,7 @@ fn futures_are_send() {
     let f = c.accept_connect();
     assert_send(&f);
     let (_client, c) = conn();
-    let f = c.respond_proxy_auth_required("r", Bytes::new());
+    let f = c.respond_proxy_auth_required("r", "text/plain", Bytes::new());
     assert_send(&f);
     let (_client, c) = conn();
     let f = c.respond_upgrade(CanonicalResponse::new(StatusCode::SWITCHING_PROTOCOLS));

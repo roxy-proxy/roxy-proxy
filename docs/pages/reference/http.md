@@ -316,5 +316,8 @@ carries a `reason` instead of `rule`.
 The status and message can be set per rule
 (`deny: { status: 451, message: "..." }`). After a deny the connection is
 closed (`connection: close` on HTTP/1.1, `GOAWAY` on HTTP/2), so a probing
-client loses its warm connection on every attempt. A refused proxy
-authentication gets `407`.
+client loses its warm connection on every attempt, and roxy does not read
+the rest of a request body it has refused: the response goes out at once
+and the connection closes behind it. A refused proxy authentication gets
+`407` with a `proxy-authenticate: Basic` challenge and the same JSON body
+shape.

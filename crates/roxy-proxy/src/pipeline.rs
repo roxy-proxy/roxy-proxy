@@ -632,10 +632,10 @@ impl FlowCx {
 
     /// Records the final metric sample of an exchange whose response was
     /// sent (or failed to reach the client, which is not an upstream
-    /// error): `denied` if a watching rule stopped it. `error` says the
-    /// upstream exchange failed. Bytes were recorded as they streamed.
-    pub(crate) fn record_final_sample(&self, error: bool) {
-        self.final_sample(self.stopped(), error);
+    /// error): `denied` if a watching rule stopped it. Bytes were recorded
+    /// as they streamed.
+    pub(crate) fn record_final_sample(&self) {
+        self.final_sample(self.stopped(), false);
     }
 
     /// Records the final metric sample of an exchange refused after the

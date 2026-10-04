@@ -40,14 +40,11 @@ use roxy_http::{Body, BodyError, BodySender, CanonicalRequest, RequestMeta};
 use roxy_wasm::{HostError, LayerError, LayerOutcome, LayerRequest, LayerResponse};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use ulid::Ulid;
 
 use crate::body::{Collected, collect_prefix};
 use crate::exchange::{Front, Outcome, refusal_response};
-use crate::flowlog::{DecisionKind, FlowEvent, FlowSink, TlsInfo};
-use crate::listener::ClientConn;
-use crate::pipeline::{BodyIo, CollectFuture, FlowCx, Refusal, RefusalKind};
-use crate::server::{Shared, Snapshot};
+use crate::flowlog::{DecisionKind, FlowEvent, FlowSink};
+use crate::pipeline::{BodyIo, CollectFuture, FlowCx, FlowMeta, Refusal, RefusalKind};
 use crate::view::FlowFacts;
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -282,11 +279,8 @@ impl Drop for Lease {
 /// It holds the flow's [`FlowCx`] while the layers run, lends it to the
 /// core, and hands it back to the front afterwards.
 pub(crate) struct StackFlow {
-    pub(crate) shared: Arc<Shared>,
-    pub(crate) snap: Arc<Snapshot>,
-    pub(crate) flow: Ulid,
-    pub(crate) client: ClientConn,
-    pub(crate) tls: Option<TlsInfo>,
+    /// What identifies the flow, shared with its [`FlowCx`].
+    pub(crate) meta: Arc<FlowMeta>,
     /// The flow's facts as of the latest request to leave the stack (the
     /// client's until then), for `metric-get`: the same keys the core's
     /// samples use.
@@ -322,14 +316,18 @@ pub(crate) struct StackFlow {
     ws: Mutex<Option<ws::WsPlumbing>>,
 }
 
+impl std::ops::Deref for StackFlow {
+    type Target = FlowMeta;
+
+    fn deref(&self) -> &FlowMeta {
+        &self.meta
+    }
+}
+
 impl StackFlow {
     fn new(cx: &FlowCx, req: &CanonicalRequest) -> Self {
         Self {
-            shared: cx.shared.clone(),
-            snap: cx.snap.clone(),
-            flow: cx.flow,
-            client: cx.facts.client.clone(),
-            tls: cx.facts.tls.clone(),
+            meta: cx.meta.clone(),
             facts: Mutex::new(cx.facts.clone()),
             client_meta: req.meta.clone(),
             tags: Mutex::new(Vec::new()),
@@ -521,8 +519,6 @@ fn error_kind(e: &StackError) -> String {
         LayerError::Init(_) => "init".into(),
         LayerError::Instantiate(_) => "instantiate".into(),
         LayerError::Cancelled => "cancelled".into(),
-        // `LayerError` is `#[non_exhaustive]`.
-        _ => "other".into(),
     }
 }
 
@@ -820,8 +816,8 @@ async fn core(
             if refusal.close {
                 st.close.store(true, Ordering::Relaxed);
             }
-            if refusal.kind == RefusalKind::UpstreamError && cx.watch.is_some() {
-                cx.record_final_sample(true);
+            if cx.watch.is_some() {
+                cx.record_refusal_sample(&refusal);
             }
             Ok(to_layer_response(refusal_response(cx, &refusal)))
         }
@@ -884,7 +880,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// proxy port.
 #[cfg(test)]
 pub(crate) fn test_flow(kit: &crate::testkit::Kit) -> (Arc<StackFlow>, FlowCx) {
-    use crate::listener::{ListenerInfo, ListenerMode};
+    use crate::listener::{ClientConn, ListenerInfo, ListenerMode};
+    use ulid::Ulid;
     let shared = kit.server.shared().clone();
     let snap = shared.snapshot();
     let req = http::Request::get("http://up.test/")

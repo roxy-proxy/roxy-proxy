@@ -108,7 +108,10 @@ async fn check_auth(
 /// Answers the pending request or CONNECT with `407` and closes.
 async fn require_auth(conn: ServerConn<ClientIo>) {
     let body = Bytes::from_static(AUTH_REQUIRED_BODY);
-    if let Err(e) = conn.respond_proxy_auth_required(AUTH_REALM, body).await {
+    if let Err(e) = conn
+        .respond_proxy_auth_required(AUTH_REALM, "application/json", body)
+        .await
+    {
         tracing::debug!(error = %e, "writing 407 failed");
     }
 }

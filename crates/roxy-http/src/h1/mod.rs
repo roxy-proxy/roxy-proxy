@@ -883,9 +883,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
 
     /// Answers the pending request or CONNECT with `407 Proxy Authentication
     /// Required`, a `proxy-authenticate: Basic realm="<realm>"` challenge,
-    /// `connection: close` and `body` (sent with `content-length`; the caller
-    /// supplies any `content-type` semantics by choosing the body), then
-    /// closes like [`ServerConn::respond_error_and_close`] (an unread request
+    /// `connection: close` and `body` (sent with `content-length` and
+    /// `content-type: <content_type>`), then closes like [`ServerConn::respond_error_and_close`] (an unread request
     /// body is abandoned; half-close, then lingering close).
     ///
     /// `realm` must be printable ASCII (`0x20..=0x7e`) without `"` or `\`,
@@ -895,6 +894,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     pub async fn respond_proxy_auth_required(
         mut self,
         realm: &str,
+        content_type: &str,
         body: Bytes,
     ) -> Result<(), WriteError> {
         if !matches!(self.state, State::AwaitingResponse | State::AwaitingConnect) {
@@ -912,7 +912,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         self.close_with(
             StatusCode::PROXY_AUTHENTICATION_REQUIRED,
             &Headers::new(),
-            &[("proxy-authenticate", &challenge)],
+            &[
+                ("proxy-authenticate", &challenge),
+                ("content-type", content_type),
+            ],
             body,
         )
         .await

@@ -12,7 +12,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -480,41 +480,6 @@ fn encode(event: &FlowEvent) -> Option<Vec<u8>> {
     }
 }
 
-/// Writes JSON lines to any [`Write`]r, flushing after every line, and
-/// drops an event whose write fails. For tests and tools; an audit log is a
-/// [`BufferedSink`].
-pub struct WriterSink<W: Write + Send> {
-    name: &'static str,
-    writer: Mutex<W>,
-}
-
-impl<W: Write + Send> WriterSink<W> {
-    /// `name` identifies the sink in warnings.
-    pub fn new(name: &'static str, writer: W) -> Self {
-        Self {
-            name,
-            writer: Mutex::new(writer),
-        }
-    }
-
-    /// Consume the sink and return the writer.
-    pub fn into_inner(self) -> W {
-        self.writer
-            .into_inner()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-impl<W: Write + Send> FlowSink for WriterSink<W> {
-    fn emit(&self, event: &FlowEvent) {
-        let Some(line) = encode(event) else { return };
-        let mut w = lock(&self.writer);
-        if let Err(error) = w.write_all(&line).and_then(|()| w.flush()) {
-            tracing::warn!(sink = self.name, %error, "flow log: write failed; event dropped");
-        }
-    }
-}
-
 /// JSON lines through a [`LogWriter`]: one writer thread, batched writes,
 /// backpressure.
 #[derive(Debug)]
@@ -860,6 +825,42 @@ impl Redactor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    /// Writes JSON lines to any [`Write`]r, flushing after every line, and
+    /// drops an event whose write fails. For tests and tools; an audit log is a
+    /// [`BufferedSink`].
+    pub struct WriterSink<W: Write + Send> {
+        name: &'static str,
+        writer: Mutex<W>,
+    }
+
+    impl<W: Write + Send> WriterSink<W> {
+        /// `name` identifies the sink in warnings.
+        pub fn new(name: &'static str, writer: W) -> Self {
+            Self {
+                name,
+                writer: Mutex::new(writer),
+            }
+        }
+
+        /// Consume the sink and return the writer.
+        pub fn into_inner(self) -> W {
+            self.writer
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+
+    impl<W: Write + Send> FlowSink for WriterSink<W> {
+        fn emit(&self, event: &FlowEvent) {
+            let Some(line) = encode(event) else { return };
+            let mut w = lock(&self.writer);
+            if let Err(error) = w.write_all(&line).and_then(|()| w.flush()) {
+                tracing::warn!(sink = self.name, %error, "flow log: write failed; event dropped");
+            }
+        }
+    }
     use std::sync::Arc;
 
     fn ts() -> DateTime<Utc> {
