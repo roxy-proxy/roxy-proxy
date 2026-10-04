@@ -72,10 +72,9 @@ fn full_config_parses_and_validates() {
         cfg.addons[0].limits.max_memory,
         Some(ByteSize::b(64 * 1024 * 1024))
     );
-    assert_eq!(cfg.addons[0].limits.fuel_per_step, Some(100_000_000));
     assert_eq!(
-        cfg.addons[0].limits.step_cpu,
-        Some(Duration::from_millis(50))
+        cfg.addons[0].limits.first_byte_timeout,
+        Some(Duration::from_secs(30))
     );
     assert_eq!(cfg.address_lists.len(), 1);
     assert_eq!(cfg.upstream.deny_lists, ["cloud-metadata"]);
@@ -174,6 +173,11 @@ fn unknown_fields_rejected_everywhere() {
         "addons: [{ name: a, path: /a.wasm, fuel: 1 }]",
         "addons: [{ name: a, path: /a.wasm, hooks: [request] }]",
         "addons: [{ name: a, path: /a.wasm, limits: { max_cpu: 1s } }]",
+        // Removed: a slow addon is slow, not failed.
+        "addons: [{ name: a, path: /a.wasm, limits: { max_exchange_time: 1s } }]",
+        "addons: [{ name: a, path: /a.wasm, limits: { step_cpu: 1s } }]",
+        "addons: [{ name: a, path: /a.wasm, limits: { fuel_per_step: 1 } }]",
+        "addons: [{ name: a, path: /a.wasm, limits: { max_buffered_body_bytes: 1mb } }]",
         "log: { flow: { file: /x } }",
     ] {
         let yaml = if bad.starts_with("listeners") {
@@ -551,13 +555,13 @@ fn address_lists_parse_and_validate() {
 fn addon_on_error_has_no_pass() {
     let c = parse(&format!(
         "{BASE}addons: [{{ name: a, path: /a.wasm, mode: observe, \
-         limits: {{ max_buffered_body_bytes: 2mb, fuel_per_step: 5 }} }}]\n"
+         limits: {{ max_memory: 2mb, max_instances: 5 }} }}]\n"
     ));
     let a = &c.addons[0];
     assert_eq!(a.mode, AddonMode::Observe);
-    assert_eq!(a.limits.max_buffered_body_bytes, Some(ByteSize::b(2 << 20)));
-    assert_eq!(a.limits.fuel_per_step, Some(5));
-    assert_eq!(a.limits.max_memory, None);
+    assert_eq!(a.limits.max_memory, Some(ByteSize::b(2 << 20)));
+    assert_eq!(a.limits.max_instances, Some(5));
+    assert_eq!(a.limits.first_byte_timeout, None);
     assert_eq!(c.limits.max_address_list_bytes, ByteSize::b(256 << 20));
 
     // Removed pending a design (issue #28): refused, not ignored.
@@ -628,14 +632,14 @@ fn flow_log_settings_validated() {
 fn service_addons_validate() {
     let ok = format!(
         "{BASE}addons:\n  - name: s\n    kind: service\n    endpoint: svc\n    \
-         limits: {{ first_byte_timeout: 2s, max_exchange_time: 1m }}\n    \
+         limits: {{ first_byte_timeout: 2s }}\n    \
          endpoints:\n      svc: {{ url: \"http://127.0.0.1:9000/layer\", private_ok: true }}\n"
     );
     parse(&ok).validate().unwrap();
 
     let d = diagnostics(&format!(
         "{BASE}addons:\n  - name: s\n    kind: service\n    endpoint: nope\n    \
-         capabilities: [log]\n    config: {{ a: 1 }}\n    limits: {{ step_cpu: 1s }}\n    \
+         capabilities: [log]\n    config: {{ a: 1 }}\n    limits: {{ max_memory: 1mb }}\n    \
          endpoints:\n      svc: {{ url: \"http://127.0.0.1:9000/\" }}\n  \
          - name: w\n    path: /w.wasm\n    limits: {{ first_byte_timeout: 1s }}\n"
     ));
@@ -644,11 +648,15 @@ fn service_addons_validate() {
         "addons[0].endpoint",
         "addons[0].capabilities",
         "addons[0].config",
-        "addons[0].limits.step_cpu",
-        "addons[1].limits.first_byte_timeout",
+        "addons[0].limits.max_memory",
     ] {
         assert!(paths.contains(&p), "{p} not in {paths:?}");
     }
+    // Every addon has a head deadline.
+    assert!(
+        !paths.contains(&"addons[1].limits.first_byte_timeout"),
+        "{paths:?}"
+    );
 }
 
 #[test]

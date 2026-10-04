@@ -18,12 +18,10 @@ addons:
       sidecar: { url: "http://127.0.0.1:9000/layer", private_ok: true }
     limits:
       first_byte_timeout: 2s            # until each of the service's heads (default 30s)
-      max_exchange_time: 60s            # the whole session
 ```
 
 `path`, `capabilities`, `config`, `audit_endpoint` and the WASM limits are
-refused on a service layer, and `first_byte_timeout` is refused on a WASM
-layer.
+refused on a service layer.
 
 **Transport: one WebSocket per exchange**, subprotocol `roxy.layer.v1`, to
 the endpoint's URL (`http` → `ws`, `https` → `wss`). It is dialled through
@@ -64,7 +62,8 @@ ways.
   rules. Its response is handled as a WASM layer's.
 - **Deadlines.** `first_byte_timeout` bounds the connection and each of the
   service's heads (its first answer, and its response after roxy sent the
-  upstream's head). `max_exchange_time` bounds the whole session.
+  upstream's head). The session has no overall clock: bodies stream for as
+  long as they take.
 - **Failure is closed** in enforce mode: a failed connection or handshake,
   a protocol violation (bad JSON, a message out of order, bytes before a
   head, an invalid head, a broken length), a missed deadline, or a lost

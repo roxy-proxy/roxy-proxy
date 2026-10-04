@@ -76,8 +76,8 @@ A component is compiled and linked once per config load, on the blocking
 pool, then one instance is started and its `init` run, so a broken layer
 fails the load. Each exchange checks an instance out of the layer's pool for
 its whole duration. `max_instances` caps the live instances, and so the
-layer's concurrent exchanges; an exchange that finds none free waits within
-its `max_exchange_time`. Instances are replaced after
+layer's concurrent exchanges; an exchange that finds none free waits until
+one is. Instances are replaced after
 `recycle_after_exchanges`, or when an exchange leaves their linear memory
 above `recycle_above_memory`, which bounds linear-memory growth. An instance
 that failed in any way is discarded, never reused.
