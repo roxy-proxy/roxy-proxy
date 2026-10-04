@@ -68,10 +68,40 @@ pub fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
-pub(crate) fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
+fn embedded_v4(hi: u16, lo: u16) -> Ipv4Addr {
     let [o1, o2] = hi.to_be_bytes();
     let [o3, o4] = lo.to_be_bytes();
     Ipv4Addr::new(o1, o2, o3, o4)
+}
+
+/// The IPv4 address a translating gateway would reach for `v6`: NAT64
+/// with the well-known prefix (`64:ff9b::/96`) or the local-use prefix
+/// (`64:ff9b:1::/48`, taking the last 32 bits as a `/96` deployment does),
+/// or 6to4 (`2002::/16`).
+fn translated_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let seg = v6.segments();
+    if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] || seg[..3] == [0x64, 0xff9b, 1] {
+        return Some(embedded_v4(seg[6], seg[7]));
+    }
+    if seg[0] == 0x2002 {
+        return Some(embedded_v4(seg[1], seg[2]));
+    }
+    None
+}
+
+/// Every form of `ip` a connection to it may reach: the address as given,
+/// its [`canonical`] IPv4 form, and the IPv4 address a NAT64 or 6to4
+/// gateway translates it to. Deny decisions match any of them, since
+/// matching more is the safe direction for a deny. Allow decisions must
+/// not: an attacker's 6to4 address embedding an allowed IPv4 address is
+/// not that address.
+pub fn reachable_forms(ip: IpAddr) -> impl Iterator<Item = IpAddr> {
+    let canon = Some(canonical(ip)).filter(|c| *c != ip);
+    let translated = match ip {
+        IpAddr::V6(v6) => translated_v4(v6).map(IpAddr::V4),
+        IpAddr::V4(_) => None,
+    };
+    std::iter::once(ip).chain(canon).chain(translated)
 }
 
 fn v4_class(ip: Ipv4Addr) -> Option<&'static str> {
@@ -99,14 +129,6 @@ fn v6_class(ip: Ipv6Addr) -> Option<&'static str> {
     if ip.is_loopback() {
         return Some("loopback");
     }
-    // NAT64 (64:ff9b::/96) and 6to4 (2002::/16) embed an IPv4 address that a
-    // gateway would reach: classify that.
-    if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-        return v4_class(embedded_v4(seg[6], seg[7]));
-    }
-    if seg[0] == 0x2002 {
-        return v4_class(embedded_v4(seg[1], seg[2]));
-    }
     Some(match seg[0] {
         x if x & 0xfe00 == 0xfc00 => "unique_local",
         x if x & 0xffc0 == 0xfe80 => "link_local",
@@ -118,12 +140,14 @@ fn v6_class(ip: Ipv6Addr) -> Option<&'static str> {
     })
 }
 
-/// The built-in private/special class of `ip`, if any.
+/// The built-in private/special class of `ip`, if any: of the first of
+/// its [`reachable_forms`] that has one, so a NAT64 or 6to4 address is
+/// classed by the IPv4 address a gateway would reach.
 pub fn private_class(ip: IpAddr) -> Option<&'static str> {
-    match canonical(ip) {
+    reachable_forms(ip).find_map(|form| match form {
         IpAddr::V4(v4) => v4_class(v4),
         IpAddr::V6(v6) => v6_class(v6),
-    }
+    })
 }
 
 impl AddressPolicy {
@@ -132,38 +156,31 @@ impl AddressPolicy {
     /// `allow: { private_ok: true }`; it never overrides `deny_cidrs` or a
     /// deny list.
     pub fn check(&self, ip: IpAddr, private_ok: bool) -> Result<(), AddressDenied> {
-        let given = ip;
-        let ip = canonical(ip);
-        if let Some(net) = self.deny_cidrs.iter().find(|n| n.contains(&ip)) {
-            return Err(AddressDenied {
-                ip,
-                reason: "deny_cidrs".into(),
-                matched_cidr: Some(*net),
-                list: None,
-            });
+        let denied = |reason: String, matched_cidr, list| AddressDenied {
+            ip: canonical(ip),
+            reason,
+            matched_cidr,
+            list,
+        };
+        // Denies match every form the address may reach.
+        if let Some(net) =
+            reachable_forms(ip).find_map(|form| self.deny_cidrs.iter().find(|n| n.contains(&form)))
+        {
+            return Err(denied("deny_cidrs".into(), Some(*net), None));
         }
+        // The exemption matches the address itself only (and its IPv4 form,
+        // the same address): a translated form of it is a different address.
         if self.deny_private_ranges
             && !private_ok
             && let Some(class) = private_class(ip)
-            && !self.allow_cidrs.iter().any(|n| n.contains(&ip))
+            && !self.allow_cidrs.iter().any(|n| n.contains(&canonical(ip)))
         {
-            return Err(AddressDenied {
-                ip,
-                reason: format!("private_range:{class}"),
-                matched_cidr: None,
-                list: None,
-            });
+            return Err(denied(format!("private_range:{class}"), None, None));
         }
-        // The list lookup sees the address as given: it checks the v6 form
-        // as well as every IPv4 form (mapped, compatible, NAT64, 6to4).
         for list in &self.deny_lists {
-            if let Some(net) = list.lookup(given) {
-                return Err(AddressDenied {
-                    ip,
-                    reason: format!("list:{}", list.name()),
-                    matched_cidr: Some(net),
-                    list: Some(list.name().to_owned()),
-                });
+            if let Some(net) = list.lookup(ip) {
+                let name = list.name().to_owned();
+                return Err(denied(format!("list:{name}"), Some(net), Some(name)));
             }
         }
         Ok(())
@@ -209,10 +226,20 @@ mod tests {
             ("::127.0.0.1", "loopback"),
             ("64:ff9b::7f00:1", "loopback"),
             ("2002:c0a8:0101::1", "private"),
+            ("64:ff9b:1::a00:1", "private"),
+            ("64:ff9b:1:ab:cd:ef:7f00:1", "loopback"),
         ] {
             assert_eq!(private_class(ip(a)), Some(c), "{a}");
         }
-        for a in ["1.1.1.1", "8.8.8.8", "2606:4700::1111", "172.32.0.1"] {
+        for a in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "2606:4700::1111",
+            "172.32.0.1",
+            "64:ff9b::808:808",
+            "64:ff9b:1::808:808",
+            "2002:808:808::1",
+        ] {
             assert_eq!(private_class(ip(a)), None, "{a}");
         }
     }
@@ -237,6 +264,43 @@ mod tests {
             p.check_all(&[ip("8.8.8.8"), ip("192.168.0.1")], false)
                 .is_err()
         );
+    }
+
+    /// `deny_cidrs` match every form an address may reach, like deny lists;
+    /// `allow_cidrs` exempt the address itself only.
+    #[test]
+    fn deny_cidrs_match_translated_forms_and_allow_cidrs_do_not() {
+        let p = AddressPolicy {
+            deny_private_ranges: true,
+            deny_cidrs: vec!["203.0.113.0/24".parse().unwrap()],
+            allow_cidrs: vec!["10.9.9.9/32".parse().unwrap()],
+            deny_lists: Vec::new(),
+        };
+        for a in [
+            "203.0.113.7",
+            "::ffff:203.0.113.7",
+            "::203.0.113.7",
+            "64:ff9b::cb00:7107",
+            "64:ff9b:1::cb00:7107",
+            "2002:cb00:7107::1",
+        ] {
+            let d = p.check(ip(a), true).unwrap_err();
+            assert_eq!(d.reason, "deny_cidrs", "{a}");
+            assert_eq!(
+                d.matched_cidr,
+                Some("203.0.113.0/24".parse().unwrap()),
+                "{a}"
+            );
+        }
+        assert!(p.check(ip("10.9.9.9"), false).is_ok());
+        assert!(p.check(ip("::ffff:10.9.9.9"), false).is_ok());
+        for a in ["64:ff9b::a09:909", "2002:a09:909::1"] {
+            assert_eq!(
+                p.check(ip(a), false).unwrap_err().reason,
+                "private_range:private",
+                "{a}"
+            );
+        }
     }
 
     #[test]

@@ -37,6 +37,15 @@ this order:
    denied, except addresses in `allow_cidrs` and flows whose allow rule says
    `private_ok: true`.
 
+Denies match every form of an address that a connection to it may reach:
+the address as given, its IPv4-mapped and IPv4-compatible forms, and the
+IPv4 address a NAT64 or 6to4 gateway would translate it to (`64:ff9b::/96`,
+the local-use `64:ff9b:1::/48` with the IPv4 address in the last 32 bits,
+and `2002::/16`). So `deny_cidrs: [203.0.113.0/24]` also denies
+`64:ff9b::cb00:7107`, and a NAT64 address that embeds a private IPv4
+address is a private address. `allow_cidrs` is an exemption and matches
+narrowly: the address itself and its IPv4-mapped form only.
+
 The check is on the resolved IP, not the name, so DNS rebinding does not
 help, and IP-literal hosts go through the same check. If any resolved
 address is denied, the whole flow is denied: an attacker-controlled name
@@ -67,10 +76,9 @@ address_lists:
   Nested and duplicate entries are merged; a malformed line is an error
   naming the file and line. A file larger than
   `limits.max_address_list_bytes` (256 MiB) is a load error.
-- **Two matching modes.** The deny floor matches broadly: the address as
-  given, its IPv4-mapped and IPv4-compatible forms, and the IPv4 address a
-  NAT64 (`64:ff9b::/96`) or 6to4 (`2002::/16`) address would reach, because
-  matching more is the safe direction for a deny. Rule membership
+- **Two matching modes.** The deny floor matches broadly, every form
+  [above](#address-floor), because matching more is the safe direction for
+  a deny. Rule membership
   (`ip in @list`) is exact, with only the IPv4-mapped equivalence, because a
   rule might *allow* on membership: `client.ip in @internal` must not treat
   a 6to4 address embedding an internal IPv4 address as internal.
