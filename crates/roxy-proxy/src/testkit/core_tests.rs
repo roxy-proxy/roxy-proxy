@@ -117,7 +117,39 @@ async fn a_client_gone_mid_upload_is_logged(h2: bool) {
     let _ = pending.await;
     let ev = kit.request_event().await;
     assert_eq!(ev["decision"], "allow", "{ev:#}");
-    assert!(ev["reason"].is_string(), "{ev:#}");
+    let reason = if h2 { "client_gone" } else { "unexpected_eof" };
+    assert_eq!(ev["reason"], reason, "{ev:#}");
+}
+
+/// An h2 client cancelling its stream (`RST_STREAM`) is not a protocol
+/// error: the flow is logged as `client_gone`, nothing is reset back, and
+/// the connection carries on.
+#[tokio::test]
+async fn h2_a_cancelled_stream_is_logged_as_client_gone() {
+    let kit = kit().await;
+    let mut c = kit.tunnel("up.test", true).await;
+    let (mut tx, body) = streaming_body();
+    let req = c.request("POST", "/upload", &[]).body(body).unwrap();
+    let pending = c.start(req);
+    tx.send_data(Bytes::from(vec![b'x'; 1024])).await.unwrap();
+    kit.wait_arrived(1).await;
+    // Dropping the response future cancels the stream.
+    pending.abort();
+    drop(tx);
+    let ev = kit.request_event().await;
+    assert_eq!(ev["reason"], "client_gone", "{ev:#}");
+    assert_eq!(ev["decision"], "allow", "{ev:#}");
+    assert!(ev["res"].is_null(), "{ev:#}");
+    let b = c.call("GET", "/next", &[], b"").await;
+    assert_eq!(b.status, 200, "{b:?}");
+    assert!(
+        kit.sink
+            .events()
+            .iter()
+            .all(|e| e["event"] != "parse_error"),
+        "{:#?}",
+        kit.sink.events()
+    );
 }
 
 #[tokio::test]

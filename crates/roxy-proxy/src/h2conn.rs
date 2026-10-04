@@ -12,9 +12,11 @@
 //!   fields, `:authority` other than the tunnel host, ...) is reset with
 //!   `PROTOCOL_ERROR` and logged as a `parse_error`; nothing is forwarded.
 //! - A request body that breaks (cap, length mismatch, idle timeout,
-//!   disallowed trailers, client reset) resets the stream; the upstream
-//!   request is dropped mid-body, so a truncated body is never presented
-//!   as complete.
+//!   disallowed trailers) resets the stream; the upstream request is
+//!   dropped mid-body, so a truncated body is never presented as complete.
+//! - A client that resets its stream or drops the connection gets nothing
+//!   back (there is nobody to answer); the upstream request is dropped the
+//!   same way and the flow is logged with reason `client_gone`.
 //! - A deny writes roxy's deny response on that stream. When the decision
 //!   closes (the default), the connection then sends `GOAWAY`, refuses
 //!   every stream it has not started (`REFUSED_STREAM`), lets in-flight
@@ -26,7 +28,7 @@
 
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
@@ -46,7 +48,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::body::{Collected, collect_prefix, counted};
 use crate::exchange::{
-    Front, Outcome, finish_refusal, process, record_client_failure, refusal_response,
+    Front, Outcome, finish_refusal, process, record_client_failure, record_client_gone,
+    refusal_response,
 };
 use crate::flowlog::{FlowEvent, TlsInfo};
 use crate::io::Io;
@@ -262,7 +265,9 @@ async fn serve_stream(
         expect_continue: req.meta.expect_continue,
     };
     let (mut cx, outcome) = process(&mut front, cx, req).await;
-    let H2Front { mut respond, .. } = front;
+    let H2Front {
+        mut respond, fail, ..
+    } = front;
     let out = Out {
         method: &method,
         idle: limits.body_idle_timeout,
@@ -283,6 +288,8 @@ async fn serve_stream(
             }
             finish_refusal(&mut cx, &refusal);
         }
+        // The client went away: nothing to answer, nothing to reset.
+        Outcome::Close(_) if fail.gone() => record_client_gone(&mut cx),
         Outcome::Close(e) => {
             ccx.shared
                 .emit_parse_error(&ccx.client, Some(cx.flow.to_string()), &e);
@@ -467,12 +474,16 @@ async fn stream_body(
 // The h2 front end of the exchange core
 // ---------------------------------------------------------------------------
 
-/// The first client-side body failure of a stream, recorded by the body
-/// adapters so the exchange can stop waiting on the upstream at once.
+/// The first client-side failure of a stream, recorded by the body
+/// adapters and the front so the exchange can stop waiting on the upstream
+/// at once.
 #[derive(Default)]
 struct BodyFail {
     error: Mutex<Option<ParseError>>,
     signal: CancellationToken,
+    /// The client reset the stream or dropped the connection, as opposed
+    /// to sending something roxy refused.
+    gone: AtomicBool,
 }
 
 impl BodyFail {
@@ -483,6 +494,23 @@ impl BodyFail {
         }
         drop(g);
         self.signal.cancel();
+    }
+
+    /// The stream failed on the client's side: a reset, or the connection
+    /// ending. Anything else the `h2` crate reports here is a protocol
+    /// error it already answered on the connection.
+    fn stream_failed(&self, e: &h2::Error) {
+        if e.is_reset() || e.is_io() || e.is_go_away() {
+            self.gone.store(true, Ordering::Relaxed);
+        }
+        self.set(ParseError::new(
+            Reason::UnexpectedEof,
+            format!("h2 stream: {e}"),
+        ));
+    }
+
+    fn gone(&self) -> bool {
+        self.gone.load(Ordering::Relaxed)
     }
 
     fn get(&self) -> Option<ParseError> {
@@ -552,6 +580,7 @@ impl Front for H2Front {
                     Ok(reason) => format!("client reset the stream ({reason})"),
                     Err(e) => format!("h2 connection failed: {e}"),
                 };
+                fail.gone.store(true, Ordering::Relaxed);
                 return Err(ParseError::new(Reason::UnexpectedEof, why));
             }
             out = fut => Some(out),
@@ -657,8 +686,9 @@ impl http_body::Body for H2Body {
                     return Poll::Ready(Some(Ok(Frame::data(d))));
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    let pe = ParseError::new(Reason::UnexpectedEof, format!("h2 stream: {e}"));
-                    return this.failed(pe, BodyError::Incomplete);
+                    this.fail.stream_failed(&e);
+                    this.finished = true;
+                    return Poll::Ready(Some(Err(BodyError::Incomplete)));
                 }
                 Poll::Ready(None) => this.data_done = true,
                 Poll::Pending => return this.pending(cx),
@@ -683,8 +713,9 @@ impl http_body::Body for H2Body {
                 }
             }
             Poll::Ready(Err(e)) => {
-                let pe = ParseError::new(Reason::UnexpectedEof, format!("h2 stream: {e}"));
-                this.failed(pe, BodyError::Incomplete)
+                this.fail.stream_failed(&e);
+                this.finished = true;
+                Poll::Ready(Some(Err(BodyError::Incomplete)))
             }
             Poll::Pending => this.pending(cx),
         }

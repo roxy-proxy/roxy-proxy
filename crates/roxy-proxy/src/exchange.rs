@@ -102,6 +102,16 @@ pub(crate) fn record_client_failure(cx: &mut FlowCx, e: &ParseError, status: Opt
     cx.emit_request_event();
 }
 
+/// The client went away mid-exchange (reset its stream, dropped the
+/// connection): nothing is written; the flow is logged with reason
+/// `client_gone`.
+pub(crate) fn record_client_gone(cx: &mut FlowCx) {
+    cx.record.decision.get_or_insert(DecisionKind::Deny);
+    cx.record.reason = Some("client_gone".to_owned());
+    cx.record.response_status = None;
+    cx.emit_request_event();
+}
+
 /// The client body broke: answer with the parse error's status and close.
 pub(crate) async fn close_on_parse_error(
     conn: ServerConn<ClientIo>,
