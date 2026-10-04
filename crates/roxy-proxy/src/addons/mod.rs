@@ -33,7 +33,7 @@ use http_body::{Body as HttpBody, Frame, SizeHint};
 use roxy_http::layer::{from_layer_request, to_layer_request, to_layer_response};
 use roxy_http::upstream::from_upstream_response;
 use roxy_http::ws::WsKey;
-use roxy_http::{Body, BodyError, BodySender, CanonicalRequest, Headers, coding};
+use roxy_http::{Body, BodyError, BodySender, CanonicalRequest, Headers, RequestMeta, coding};
 use roxy_wasm::{HostError, LayerError, LayerOutcome, LayerRequest, LayerResponse};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -288,9 +288,10 @@ pub(crate) struct StackFlow {
     /// client's until then), for `metric-get`: the same keys the core's
     /// samples use.
     facts: Mutex<FlowFacts>,
-    /// The client asked to upgrade (WebSocket); carried to the core, since
-    /// a layer cannot express hop-by-hop fields.
-    upgrade_req: Option<String>,
+    /// The client's request as the fronts described it, which what a
+    /// layer passes on inherits: a layer cannot express the protocol
+    /// version, the target form or an upgrade.
+    client_meta: RequestMeta,
     tags: Mutex<Vec<String>>,
     /// The flow context, while it is not with the front or the core.
     cx: Mutex<Option<FlowCx>>,
@@ -333,7 +334,7 @@ impl StackFlow {
             client: cx.facts.client.clone(),
             tls: cx.facts.tls.clone(),
             facts: Mutex::new(cx.facts.clone()),
-            upgrade_req: req.meta.upgrade.clone(),
+            client_meta: req.meta.clone(),
             tags: Mutex::new(Vec::new()),
             cx: Mutex::new(None),
             returned: Notify::new(),
@@ -730,7 +731,7 @@ fn selects(
     };
     let snap = &st.snap;
     let (req, stream) = split_upgrade_stream(st, req);
-    let mut creq = match from_layer_request(req, &snap.limits, &snap.flags) {
+    let creq = match from_layer_request(req, st.client_meta.clone(), &snap.limits, &snap.flags) {
         Ok(r) => r,
         Err(e) => {
             // Layer 0 gets the client's request, already canonical.
@@ -739,7 +740,6 @@ fn selects(
             return Err(LayerError::InvalidRequest(e.to_string()).into());
         }
     };
-    creq.meta.upgrade.clone_from(&st.upgrade_req);
     let mut facts = st.facts();
     facts.request = Some(crate::pipeline::request_facts(&creq));
     let view = ProxyView::new(
@@ -846,14 +846,13 @@ async fn core(
     let snap = st.snap.clone();
     let layer = snap.addons[index].name.clone();
     let (req, stream) = split_upgrade_stream(&st, req);
-    let mut creq = match from_layer_request(req, &snap.limits, &snap.flags) {
+    let creq = match from_layer_request(req, st.client_meta.clone(), &snap.limits, &snap.flags) {
         Ok(r) => r,
         Err(e) => {
             st.fail(&layer, LayerError::InvalidRequest(e.to_string()));
             return Err(HostError::new(format!("invalid request: {e}")));
         }
     };
-    creq.meta.upgrade.clone_from(&st.upgrade_req);
     let Some(mut lease) = st.lease() else {
         st.fail(&layer, LayerError::NextCalledTwice);
         return Err(HostError::new("the flow already reached the core"));
@@ -1020,7 +1019,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// For an upgrade request, takes its body (the stream after the `101`)
 /// out, so the head is validated as the bodiless request it is.
 fn split_upgrade_stream(st: &StackFlow, mut req: LayerRequest) -> (LayerRequest, Option<Body>) {
-    if st.upgrade_req.is_none() {
+    if st.client_meta.upgrade.is_none() {
         return (req, None);
     }
     let stream = std::mem::take(req.body_mut());
@@ -1103,7 +1102,8 @@ pub(crate) fn test_flow(kit: &crate::testkit::Kit) -> (Arc<StackFlow>, FlowCx) {
     let req = http::Request::get("http://up.test/")
         .body(Body::empty())
         .unwrap();
-    let creq = from_layer_request(req, &snap.limits, &snap.flags).unwrap();
+    let meta = RequestMeta::new(roxy_http::Version::H1_1, roxy_http::TargetForm::Absolute);
+    let creq = from_layer_request(req, meta, &snap.limits, &snap.flags).unwrap();
     let client = ClientConn {
         id: Ulid::generate(),
         listener: Arc::new(ListenerInfo {
