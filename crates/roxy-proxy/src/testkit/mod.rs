@@ -48,7 +48,7 @@ use ulid::Ulid;
 pub(crate) use upstream::{Seen, Upstream};
 
 use crate::Server;
-use crate::addons::{AddonSpec, StateLimits};
+use crate::addons::{AddonMode, AddonSpec, StateLimits};
 use crate::config::{PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{MemorySink, Redactor};
 use crate::listener::{ClientConn, ListenerInfo, ListenerMode};
@@ -79,7 +79,7 @@ pub(crate) const TEST_LAYER: &[u8] =
 pub(crate) struct AddonDef {
     pub name: String,
     pub wasm: &'static [u8],
-    pub observe: bool,
+    pub mode: AddonMode,
     pub caps: Vec<roxy_wasm::Capability>,
     pub config: serde_json::Value,
     pub limits: roxy_wasm::LayerLimits,
@@ -93,7 +93,7 @@ impl AddonDef {
         Self {
             name: name.to_owned(),
             wasm: TEST_LAYER,
-            observe: false,
+            mode: AddonMode::Enforce,
             caps: Vec::new(),
             config: serde_json::json!({ "name": name }),
             limits: roxy_wasm::LayerLimits::default(),
@@ -104,7 +104,7 @@ impl AddonDef {
 
     #[must_use]
     pub(crate) fn observe(mut self) -> Self {
-        self.observe = true;
+        self.mode = AddonMode::Observe;
         self
     }
 
@@ -141,7 +141,7 @@ impl AddonDef {
         .unwrap_or_else(|e| panic!("loading addon {}: {e}", self.name));
         Arc::new(AddonSpec {
             name: self.name,
-            observe: self.observe,
+            mode: self.mode,
             kind: crate::addons::AddonImpl::Wasm(layer),
             endpoints: HashMap::new(),
             state: StateLimits::default(),

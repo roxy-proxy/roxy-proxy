@@ -36,7 +36,7 @@ use roxy_wasm::{HostError, LayerRequest, LayerResponse};
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant as TokioInstant;
 
-use super::{StackError, StackFlow};
+use super::{AddonMode, StackError, StackFlow};
 
 pub(crate) use mux::Pools;
 pub use mux::SUBPROTOCOL;
@@ -292,7 +292,7 @@ async fn run(
     let start = TokioInstant::now();
     let (stream, answers) = tokio::time::timeout_at(
         start + svc.first_byte_timeout,
-        mux::open(st, index, svc, false),
+        mux::open(st, index, svc, AddonMode::Enforce),
     )
     .await
     .map_err(|_| ServiceError::Timeout("first_byte_timeout"))??;
@@ -372,7 +372,7 @@ pub(super) async fn observe(
     let start = TokioInstant::now();
     let opened = tokio::time::timeout_at(
         start + svc.first_byte_timeout,
-        mux::open(st, index, svc, true),
+        mux::open(st, index, svc, AddonMode::Observe),
     )
     .await
     .unwrap_or(Err(ServiceError::Timeout("first_byte_timeout")));

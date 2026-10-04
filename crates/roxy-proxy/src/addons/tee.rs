@@ -182,7 +182,7 @@ pub(crate) async fn observe(
                         &observer_st,
                         &observer_addon.name,
                         &super::StackError::Service(e),
-                        true,
+                        super::AddonMode::Observe,
                     );
                 }
             });
@@ -209,7 +209,12 @@ pub(crate) async fn observe(
             Err(e) => Err(e),
         };
         if let Err(e) = result {
-            super::emit_layer_error(&observer_st, &observer_addon.name, &e, true);
+            super::emit_layer_error(
+                &observer_st,
+                &observer_addon.name,
+                &e,
+                super::AddonMode::Observe,
+            );
         }
     });
 

@@ -170,7 +170,10 @@ impl AddonLoader {
             };
             out.push(Arc::new(AddonSpec {
                 name: a.name.clone(),
-                observe: a.mode == AddonMode::Observe,
+                mode: match a.mode {
+                    AddonMode::Enforce => roxy_proxy::addons::AddonMode::Enforce,
+                    AddonMode::Observe => roxy_proxy::addons::AddonMode::Observe,
+                },
                 kind,
                 endpoints: endpoints(a)?,
                 state: state_limits(a),

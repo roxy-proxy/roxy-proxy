@@ -33,7 +33,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_util::sync::CancellationToken;
 
-use super::super::{StackError, StackFlow, endpoint};
+use super::super::{AddonMode, StackError, StackFlow, endpoint};
 use super::{First, In, Out, ServiceError, ServiceSpec};
 use crate::addr::PrivateAddrs;
 use crate::flowlog::FlowEvent;
@@ -261,7 +261,7 @@ pub(super) struct Stream {
     link: Arc<Link>,
     st: Arc<StackFlow>,
     index: usize,
-    observe: bool,
+    mode: AddonMode,
     state: Mutex<StreamState>,
     /// What roxy may still send: granted by the service.
     credit: Mutex<u64>,
@@ -359,7 +359,7 @@ impl Stream {
         if let Some(f) = feeding {
             f.inbox.abort(&e);
         }
-        if self.observe {
+        if self.mode == AddonMode::Observe {
             *lock(&self.observe_error) = Some(e);
         } else if let Some(tx) = first {
             let _ = tx.send(Err(e));
@@ -371,7 +371,7 @@ impl Stream {
             let name = self.name();
             let err = StackError::Service(e);
             self.st.fail(&name, err.clone());
-            super::super::emit_stack_error(&self.st, &name, &err, false);
+            super::super::emit_stack_error(&self.st, &name, &err, AddonMode::Enforce);
         }
     }
 
@@ -507,7 +507,7 @@ impl Stream {
             return;
         }
         let n = b.len() as u64;
-        if self.observe {
+        if self.mode == AddonMode::Observe {
             // Ignored, and credited straight back so the service never
             // stalls on what it sends (and stops reading the copies).
             self.link
@@ -562,7 +562,7 @@ impl Stream {
                 return self.fail(ServiceError::Closed(why), false);
             }
             // An observer's answers are ignored.
-            _ if self.observe => return,
+            _ if self.mode == AddonMode::Observe => return,
             _ => {}
         }
         let mut s = lock(&self.state);
@@ -742,7 +742,7 @@ pub(super) async fn open(
     st: &Arc<StackFlow>,
     index: usize,
     svc: &ServiceSpec,
-    observe: bool,
+    mode: AddonMode,
 ) -> Result<(Arc<Stream>, Option<Answers>), ServiceError> {
     let addon = &st.snap.addons[index];
     let spec = addon
@@ -782,7 +782,7 @@ pub(super) async fn open(
 
     let (first_tx, first_rx) = oneshot::channel();
     let (second_tx, second_rx) = oneshot::channel();
-    let (answers, state) = if observe {
+    let (answers, state) = if mode == AddonMode::Observe {
         (None, StreamState::default())
     } else {
         (
@@ -809,7 +809,7 @@ pub(super) async fn open(
             link: link.clone(),
             st: st.clone(),
             index,
-            observe,
+            mode,
             state: Mutex::new(state),
             credit: Mutex::new(WINDOW),
             more_credit: Notify::new(),
@@ -821,7 +821,7 @@ pub(super) async fn open(
         s.open.insert(id, stream.clone());
         stream
     };
-    if !stream.send(&open_message(st, &addon.name, observe)).await {
+    if !stream.send(&open_message(st, &addon.name, mode)).await {
         stream.reset("the connection closed");
         return Err(ServiceError::Closed("the connection closed".into()));
     }
@@ -830,12 +830,12 @@ pub(super) async fn open(
 
 /// The `open` message: who the client is and where the exchange is, so
 /// the service can key its state on (flow, layer).
-fn open_message(st: &StackFlow, layer: &str, observe: bool) -> Out {
+fn open_message(st: &StackFlow, layer: &str, mode: AddonMode) -> Out {
     Out::Open {
         flow: st.flow.to_string(),
         conn: st.client.id.to_string(),
         layer: layer.to_owned(),
-        mode: if observe { "observe" } else { "enforce" },
+        mode: mode.as_str(),
         client_ip: st.client.peer.ip().to_string(),
         client_user: st.client.user.clone(),
         listener: st.client.listener.name.clone(),

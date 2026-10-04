@@ -50,13 +50,33 @@ use crate::view::{FlowFacts, ProxyView};
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
+/// How an addon runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddonMode {
+    /// In the path; failures fail the flow closed.
+    Enforce,
+    /// Gets copies of both streams, cannot change or delay traffic,
+    /// failures are logged only.
+    Observe,
+}
+
+impl AddonMode {
+    /// `enforce` or `observe`, as the flow log and the service protocol
+    /// write it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AddonMode::Enforce => "enforce",
+            AddonMode::Observe => "observe",
+        }
+    }
+}
+
 /// One configured addon, ready to run.
 pub struct AddonSpec {
     /// `addons[].name`.
     pub name: String,
-    /// `mode: observe`: gets copies of both streams, cannot change or delay
-    /// traffic, failures are logged only.
-    pub observe: bool,
+    /// `mode`.
+    pub mode: AddonMode,
     /// What runs the layer.
     pub kind: AddonImpl,
     /// Named endpoints, by name.
@@ -117,7 +137,7 @@ impl std::fmt::Debug for AddonSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AddonSpec")
             .field("name", &self.name)
-            .field("observe", &self.observe)
+            .field("mode", &self.mode)
             .finish_non_exhaustive()
     }
 }
@@ -520,27 +540,27 @@ fn error_kind(e: &StackError) -> String {
     }
 }
 
-pub(crate) fn emit_layer_error(st: &StackFlow, layer: &str, e: &LayerError, observe: bool) {
-    emit_stack_error(st, layer, &StackError::Layer(e.clone()), observe);
+pub(crate) fn emit_layer_error(st: &StackFlow, layer: &str, e: &LayerError, mode: AddonMode) {
+    emit_stack_error(st, layer, &StackError::Layer(e.clone()), mode);
 }
 
 /// Logs a layer failure: once per exchange in enforce mode (the first
 /// failure decides the outcome), every time in observe mode.
-pub(crate) fn emit_stack_error(st: &StackFlow, layer: &str, e: &StackError, observe: bool) {
+pub(crate) fn emit_stack_error(st: &StackFlow, layer: &str, e: &StackError, mode: AddonMode) {
     if matches!(e, StackError::Layer(LayerError::Cancelled)) {
         // The client went away; nothing failed.
         return;
     }
-    if !observe && st.reported.swap(true, Ordering::Relaxed) {
+    if mode == AddonMode::Enforce && st.reported.swap(true, Ordering::Relaxed) {
         return;
     }
-    tracing::info!(flow = %st.flow, layer, error = %e, observe, "layer failed");
+    tracing::info!(flow = %st.flow, layer, error = %e, mode = mode.as_str(), "layer failed");
     st.shared.sink.emit(&FlowEvent::LayerError {
         ts: chrono::Utc::now(),
         flow: st.flow.to_string(),
         conn: st.client.id.to_string(),
         layer: layer.to_owned(),
-        mode: if observe { "observe" } else { "enforce" }.to_owned(),
+        mode: mode.as_str().to_owned(),
         kind: error_kind(e),
         message: st.snap.redactor.redact_str(&e.to_string()).into_owned(),
     });
@@ -599,7 +619,7 @@ fn stack_outcome(
                     LayerError::NoResponse.into(),
                 )
             });
-            emit_stack_error(st, &layer, &err, false);
+            emit_stack_error(st, &layer, &err, AddonMode::Enforce);
             return Outcome::Refuse(layer_refusal(&layer));
         }
         Ok(Ok(r)) => r,
@@ -617,7 +637,7 @@ fn stack_outcome(
                 let (layer, err) = st2
                     .post_head_failure()
                     .unwrap_or_else(|| (st2.snap.addons[0].name.clone(), e.into()));
-                emit_stack_error(&st2, &layer, &err, false);
+                emit_stack_error(&st2, &layer, &err, AddonMode::Enforce);
             }
         });
     }
@@ -641,7 +661,7 @@ fn stack_outcome(
         }
         let layer = st.snap.addons[0].name.clone();
         let err = LayerError::InvalidResponse("101 without an upgraded upstream".into());
-        emit_layer_error(st, &layer, &err, false);
+        emit_layer_error(st, &layer, &err, AddonMode::Enforce);
         return Outcome::Refuse(layer_refusal(&layer));
     }
     Outcome::Respond(res)
@@ -672,7 +692,7 @@ pub(crate) fn enter(
         if st.snap.flags.decode_for_addons && !st.request_decoded.swap(true, Ordering::SeqCst) {
             decode_layer_request(&mut req, st.snap.limits.max_request_body_bytes);
         }
-        if addon.observe {
+        if addon.mode == AddonMode::Observe {
             return tee::observe(st, index, req).await;
         }
         let layer = match &addon.kind {
@@ -749,11 +769,11 @@ fn selects(
                 code: crate::pipeline::fail_closed_code(&reason, metric_err.as_ref()),
                 reason: reason.to_string(),
             };
-            if !addon.observe {
+            if addon.mode == AddonMode::Enforce {
                 return Err(err);
             }
             // An observer cannot affect traffic, so neither can its `when`.
-            emit_stack_error(st, &addon.name, &err, true);
+            emit_stack_error(st, &addon.name, &err, AddonMode::Observe);
             Ok((false, join_upgrade_stream(to_layer_request(creq), stream)))
         }
     }
