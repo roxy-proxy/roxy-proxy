@@ -102,25 +102,19 @@ impl FromIterator<Capability> for Capabilities {
 
 const MIB: u64 = 1024 * 1024;
 
-/// Budgets for one layer. Exceeding any of them
-/// fails the exchange closed with [`crate::LayerError::BudgetExceeded`].
+/// Limits for one layer. They protect roxy and catch a layer that is
+/// broken; they do not police how fast a layer is. A slow layer makes its
+/// exchanges slow, and a client that gives up cancels them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayerLimits {
     /// Linear memory per instance, summed over the instance's memories.
+    /// Exceeding it fails the exchange closed.
     pub max_memory: u64,
-    /// Bytes a layer may hold per direction: what it has read from a body
-    /// stream minus what it has passed on in that direction.
-    pub max_buffered_body_bytes: u64,
-    /// Wall time the guest may run between host calls (epoch
-    /// interruption).
-    pub step_cpu: Duration,
-    /// Wall clock per exchange, from the start of [`crate::Layer::handle`]
-    /// until the guest's handler returns, including waiting for an
-    /// instance, endpoint calls and streaming both bodies.
-    pub max_exchange_time: Duration,
-    /// Fuel (roughly, wasm instructions) the guest may use between host
-    /// calls.
-    pub fuel_per_step: u64,
+    /// How long the layer may take to set its response head, once it has
+    /// an instance: starting one, and the layer's own work, count; the time
+    /// `next` spends below the layer does not. Exceeding it fails the
+    /// exchange closed. Bodies have no clock.
+    pub first_byte_timeout: Duration,
     /// Replace an instance after it has served this many exchanges.
     pub recycle_after_exchanges: u64,
     /// Replace an instance after an exchange that left its linear memory
@@ -128,8 +122,8 @@ pub struct LayerLimits {
     pub recycle_above_memory: u64,
     /// Instances of this layer alive at once, which is also the number of
     /// exchanges it runs concurrently (each exchange holds an instance
-    /// until it ends). An exchange that finds none free waits, within its
-    /// `max_exchange_time`.
+    /// until it ends). With `max_memory`, it bounds the layer's memory. An
+    /// exchange that finds none free waits for one, without a deadline.
     pub max_instances: usize,
 }
 
@@ -137,13 +131,10 @@ impl Default for LayerLimits {
     fn default() -> Self {
         Self {
             max_memory: 64 * MIB,
-            max_buffered_body_bytes: MIB,
-            step_cpu: Duration::from_millis(50),
-            max_exchange_time: Duration::from_secs(60),
-            fuel_per_step: 100_000_000,
+            first_byte_timeout: Duration::from_secs(30),
             recycle_after_exchanges: 10_000,
             recycle_above_memory: 48 * MIB,
-            max_instances: 64,
+            max_instances: 1024,
         }
     }
 }

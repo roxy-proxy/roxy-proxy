@@ -122,12 +122,6 @@ pub(crate) struct StoreState {
     pub(crate) layer: Arc<LayerShared>,
     pub(crate) limiter: Limiter,
     pub(crate) exchange: Option<ExchangeCtx>,
-    /// When control last entered wasm other than from an epoch check
-    /// (`step_cpu` is measured from here).
-    pub(crate) step_started: std::time::Instant,
-    /// Set by the epoch callback: the host call in progress is wasmtime's
-    /// epoch check, not a step boundary.
-    pub(crate) in_epoch_check: bool,
 }
 
 impl StoreState {
@@ -154,8 +148,6 @@ impl StoreState {
                 total_memory: 0,
             },
             exchange: None,
-            step_started: std::time::Instant::now(),
-            in_epoch_check: false,
         }
     }
 
@@ -257,14 +249,30 @@ impl RequestTarget {
     }
 }
 
+/// Pauses the exchange's head clock while `next` runs below the layer,
+/// until it returns or the guest abandons it.
+struct Below(Arc<ExchangeShared>);
+
+impl Below {
+    fn enter(shared: Arc<ExchangeShared>) -> Self {
+        shared.set_below(true);
+        Self(shared)
+    }
+}
+
+impl Drop for Below {
+    fn drop(&mut self) {
+        self.0.set_below(false);
+    }
+}
+
 fn response_into_guest(
     resp: http::Response<roxy_http::Body>,
-    meter: Option<Arc<ExchangeShared>>,
 ) -> (
     http::Response<HyperIncomingBody>,
     wasmtime_wasi::runtime::AbortOnDropJoinHandle<()>,
 ) {
-    let resp = resp.map(|b| IntoGuest::new(b, Dir::Response, meter).boxed_unsync());
+    let resp = resp.map(|b| IntoGuest::new(b, Dir::Response).boxed_unsync());
     (resp, wasmtime_wasi::runtime::spawn(async {}))
 }
 
@@ -320,12 +328,14 @@ impl chain::Host for StoreState {
         };
 
         let fut = wasmtime_wasi::runtime::spawn(async move {
+            let below = Below::enter(shared.clone());
             let resp = host.next(request).await;
+            drop(below);
             if shared.check_next().is_err() {
                 return Err(WasiError::InternalError(Some("next failed".to_owned())));
             }
             match resp {
-                Ok(resp) => Ok(response_into_guest(resp, Some(shared))),
+                Ok(resp) => Ok(response_into_guest(resp)),
                 Err(e) => {
                     shared.fail(LayerError::Host(e));
                     Err(WasiError::InternalError(Some("next failed".to_owned())))
@@ -368,7 +378,7 @@ impl endpoints::Host for StoreState {
 
         let fut = wasmtime_wasi::runtime::spawn(async move {
             match host.endpoint_call(&name, request).await {
-                Ok(resp) => Ok(response_into_guest(resp, None)),
+                Ok(resp) => Ok(response_into_guest(resp)),
                 Err(EndpointError::NotFound) => Err(WasiError::DestinationNotFound),
                 Err(EndpointError::Denied) => Err(WasiError::DestinationIpProhibited),
                 Err(EndpointError::Timeout) => Err(WasiError::ConnectionTimeout),

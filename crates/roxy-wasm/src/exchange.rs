@@ -11,8 +11,6 @@
 //!   always records the failure before it drops the store. A response body
 //!   additionally holds its end until the guest's handler has returned, so
 //!   a trap after the last byte still fails it.
-//! * A body going *into* the guest counts bytes against
-//!   `max_buffered_body_bytes`.
 //! * The request body passed to `next` that the guest leaves unfinished is
 //!   always cut. It fails the exchange only if the guest is still waiting on
 //!   `next`'s response: a guest that dropped the response future (or already
@@ -21,18 +19,19 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use roxy_http::{Body, BodyError};
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
+use tokio::time::Instant;
 use wasmtime_wasi_http::Error as WasiError;
 
-use crate::error::{Budget, LayerError};
+use crate::error::LayerError;
 
 /// Which way a body flows through the layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,32 +50,57 @@ struct Status {
     done: bool,
 }
 
-/// Bytes read into the guest and passed on, in one direction.
-#[derive(Debug, Default)]
-struct Meter {
-    read: AtomicU64,
-    emitted: AtomicU64,
-}
-
 /// State shared by the exchange driver, the host-call implementations and
 /// the body adapters.
 #[derive(Debug)]
 pub(crate) struct ExchangeShared {
     status: watch::Sender<Status>,
-    meters: [Meter; 2],
-    max_buffered: u64,
+    /// `next` is running below the layer: the head clock is paused.
+    below: watch::Sender<bool>,
     /// Why the request body passed to `next` was cut, if it was.
     next_cut: OnceLock<String>,
 }
 
 impl ExchangeShared {
-    pub(crate) fn new(max_buffered: u64) -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             status: watch::Sender::new(Status::default()),
-            meters: [Meter::default(), Meter::default()],
-            max_buffered,
+            below: watch::Sender::new(false),
             next_cut: OnceLock::new(),
         })
+    }
+
+    /// `next` started (`true`) or returned its response head (`false`).
+    pub(crate) fn set_below(&self, below: bool) {
+        self.below.send_replace(below);
+    }
+
+    /// Resolves once the layer has run for `limit` of its own time: the
+    /// clock stops while `next` is below it. Drop it once the layer's
+    /// response head is set.
+    pub(crate) fn head_clock(&self, limit: Duration) -> impl Future<Output = ()> + Send + 'static {
+        let mut below = self.below.subscribe();
+        async move {
+            let mut left = limit;
+            loop {
+                // The sender lives as long as the exchange; gone, nothing
+                // is left to time.
+                if below.wait_for(|b| !*b).await.is_err() {
+                    return std::future::pending().await;
+                }
+                let started = Instant::now();
+                let went_below = async { below.wait_for(|b| *b).await.is_ok() };
+                tokio::select! {
+                    () = tokio::time::sleep(left) => return,
+                    ok = went_below => {
+                        if !ok {
+                            return std::future::pending().await;
+                        }
+                        left = left.saturating_sub(started.elapsed());
+                    }
+                }
+            }
+        }
     }
 
     /// The request body passed to `next` was cut. The forwarded body never
@@ -163,28 +187,6 @@ impl ExchangeShared {
     pub(crate) fn outcome(&self) -> LayerOutcome {
         LayerOutcome(self.status.subscribe())
     }
-
-    fn meter(&self, dir: Dir) -> &Meter {
-        &self.meters[dir as usize]
-    }
-
-    /// The guest read `n` bytes of a `dir` body. Fails the exchange when it
-    /// now holds more than `max_buffered_body_bytes` in that direction.
-    fn on_read(&self, dir: Dir, n: u64) -> Result<(), ()> {
-        let m = self.meter(dir);
-        let read = m.read.fetch_add(n, Ordering::SeqCst) + n;
-        let emitted = m.emitted.load(Ordering::SeqCst);
-        if read.saturating_sub(emitted) > self.max_buffered {
-            self.fail(LayerError::BudgetExceeded(Budget::BufferedBody));
-            return Err(());
-        }
-        Ok(())
-    }
-
-    /// The guest's `dir` output was consumed downstream (`n` bytes).
-    fn on_emit(&self, dir: Dir, n: u64) {
-        self.meter(dir).emitted.fetch_add(n, Ordering::SeqCst);
-    }
 }
 
 /// The outcome of an exchange, for logging after the response head has
@@ -245,18 +247,14 @@ fn to_wasi_error(err: &BodyError, dir: Dir) -> WasiError {
 /// response `next` returned, an endpoint response).
 pub(crate) struct IntoGuest {
     inner: Body,
-    /// `Some` for the exchange's own streams, which count against the
-    /// buffered-bytes budget; `None` for endpoint responses.
-    meter: Option<(Arc<ExchangeShared>, Dir)>,
     dir: Dir,
     failed: bool,
 }
 
 impl IntoGuest {
-    pub(crate) fn new(inner: Body, dir: Dir, meter: Option<Arc<ExchangeShared>>) -> Self {
+    pub(crate) fn new(inner: Body, dir: Dir) -> Self {
         Self {
             inner,
-            meter: meter.map(|m| (m, dir)),
             dir,
             failed: false,
         }
@@ -276,18 +274,7 @@ impl HttpBody for IntoGuest {
         }
         let this = &mut *self;
         match ready!(Pin::new(&mut this.inner).poll_frame(cx)) {
-            Some(Ok(frame)) => {
-                if let (Some(data), Some((shared, dir))) = (frame.data_ref(), &this.meter)
-                    && shared.on_read(*dir, data.len() as u64).is_err()
-                {
-                    this.failed = true;
-                    return Poll::Ready(Some(Err(match dir {
-                        Dir::Request => WasiError::HttpRequestBodySize(None),
-                        Dir::Response => WasiError::HttpResponseBodySize(None),
-                    })));
-                }
-                Poll::Ready(Some(Ok(frame)))
-            }
+            Some(Ok(frame)) => Poll::Ready(Some(Ok(frame))),
             Some(Err(e)) => {
                 this.failed = true;
                 Poll::Ready(Some(Err(to_wasi_error(&e, this.dir))))
@@ -313,8 +300,9 @@ type Settled = Pin<Box<dyn Future<Output = Result<(), LayerError>> + Send>>;
 pub(crate) struct FromGuest {
     inner: GuestBody,
     shared: Arc<ExchangeShared>,
-    /// Count consumed bytes against this direction's buffered budget.
-    meter: Option<Dir>,
+    /// The exchange's own request or response; `None` for an endpoint
+    /// request. Decides how a broken stream is reported.
+    dir: Option<Dir>,
     /// The request body passed to `next`: an inner error is a cut, settled
     /// by [`ExchangeShared::check_next`], not a failure here.
     next: bool,
@@ -357,7 +345,7 @@ impl FromGuest {
     fn build(
         inner: GuestBody,
         shared: Arc<ExchangeShared>,
-        meter: Option<Dir>,
+        dir: Option<Dir>,
         next: bool,
         hold_end: bool,
         cancel: Option<Arc<CancelGuard>>,
@@ -366,7 +354,7 @@ impl FromGuest {
         let body = FromGuest {
             inner,
             shared,
-            meter,
+            dir,
             next,
             hold_end,
             settled: Some(settled),
@@ -401,18 +389,13 @@ impl HttpBody for FromGuest {
         }
         if !this.inner_done {
             match Pin::new(&mut this.inner).poll_frame(cx) {
-                Poll::Ready(Some(Ok(frame))) => {
-                    if let (Some(data), Some(dir)) = (frame.data_ref(), this.meter) {
-                        this.shared.on_emit(dir, data.len() as u64);
-                    }
-                    return Poll::Ready(Some(Ok(frame)));
-                }
+                Poll::Ready(Some(Ok(frame))) => return Poll::Ready(Some(Ok(frame))),
                 Poll::Ready(Some(Err(e))) => {
                     let msg = format!("body stream failed: {e}");
                     if this.next {
                         this.shared.cut_next(msg);
                     } else {
-                        this.shared.fail(match this.meter {
+                        this.shared.fail(match this.dir {
                             Some(Dir::Response) => LayerError::InvalidResponse(msg),
                             _ => LayerError::InvalidRequest(msg),
                         });
@@ -470,39 +453,42 @@ mod tests {
 
     #[tokio::test]
     async fn first_failure_wins_and_settle_freezes() {
-        let s = ExchangeShared::new(10);
+        let s = ExchangeShared::new();
         s.fail(LayerError::NoResponse);
         s.fail(LayerError::Cancelled);
         assert_eq!(s.failure(), Some(LayerError::NoResponse));
         assert_eq!(s.wait_settled().await, Err(LayerError::NoResponse));
 
-        let s = ExchangeShared::new(10);
+        let s = ExchangeShared::new();
         s.settle();
         s.fail(LayerError::Cancelled);
         assert_eq!(s.failure(), None);
         assert_eq!(s.outcome().wait().await, Ok(()));
     }
 
-    #[test]
-    fn meter_counts_held_bytes() {
-        let s = ExchangeShared::new(10);
-        assert!(s.on_read(Dir::Request, 8).is_ok());
-        s.on_emit(Dir::Request, 8);
-        assert!(s.on_read(Dir::Request, 10).is_ok());
-        // The response direction is separate.
-        assert!(s.on_read(Dir::Response, 10).is_ok());
-        assert!(s.on_read(Dir::Request, 1).is_err());
-        assert_eq!(
-            s.failure(),
-            Some(LayerError::BudgetExceeded(Budget::BufferedBody))
-        );
+    #[tokio::test(start_paused = true)]
+    async fn the_head_clock_stops_while_next_is_below() {
+        let s = ExchangeShared::new();
+        let clock = s.head_clock(Duration::from_secs(10));
+        tokio::pin!(clock);
+        let start = Instant::now();
+        let s2 = s.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            s2.set_below(true);
+            tokio::time::sleep(Duration::from_secs(100)).await;
+            s2.set_below(false);
+        });
+        clock.await;
+        // 4s before `next`, 100s below (not counted), then the last 6s.
+        assert_eq!(start.elapsed().as_secs(), 110);
     }
 
     #[tokio::test]
-    async fn into_guest_fails_over_budget() {
-        let s = ExchangeShared::new(4);
-        let body = IntoGuest::new(Body::from_bytes("too long"), Dir::Request, Some(s.clone()));
+    async fn into_guest_passes_errors_on() {
+        let (tx, body) = Body::channel(u64::MAX, None);
+        tx.abort(BodyError::Incomplete);
+        let body = IntoGuest::new(body, Dir::Request);
         assert!(body.collect().await.is_err());
-        assert!(s.failure().is_some());
     }
 }
