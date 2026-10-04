@@ -587,7 +587,7 @@ pub(crate) fn chain_tunnels(
     client: crate::io::BoxIo,
     leftover: Vec<u8>,
 ) -> (crate::io::BoxIo, Vec<u8>) {
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let tunnels: Vec<usize> = st
         .snap
         .addons
@@ -599,12 +599,24 @@ pub(crate) fn chain_tunnels(
     if tunnels.is_empty() {
         return (client, leftover);
     }
-    let (cr, cw) = tokio::io::split(client);
+    let (cr, mut cw) = tokio::io::split(client);
     let mut side_r: ReadSide = Box::new(std::io::Cursor::new(leftover).chain(cr));
-    let mut side_w: WriteSide = Box::new(cw);
+    // The outermost layer writes to the client through a pipe too: when it
+    // drops its writer, the copy ends and shuts the client's side down, so
+    // the client sees the close. Dropping a half of the client would not.
+    let (to_client, mut from_layers) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if tokio::io::copy(&mut from_layers, &mut cw).await.is_ok() {
+            let _ = cw.shutdown().await;
+        }
+    });
+    let mut side_w: WriteSide = Box::new(to_client);
     for index in tunnels {
-        let (a, b) = tokio::io::duplex(64 * 1024);
-        let (ar, aw) = tokio::io::split(a);
+        // One pipe per direction, each end held whole: when a side drops
+        // its writer, the reader on the far end sees EOF. Halves of one
+        // split duplex would not, as the other half keeps it open (#36).
+        let (up_w, up_r) = tokio::io::duplex(64 * 1024);
+        let (down_w, down_r) = tokio::io::duplex(64 * 1024);
         let addon = st.snap.addons[index].clone();
         let Some(layer) = addon.wasm().cloned() else {
             continue;
@@ -618,13 +630,15 @@ pub(crate) fn chain_tunnels(
         let to_client = std::mem::replace(&mut side_w, Box::new(tokio::io::sink()));
         let st2 = st.clone();
         tokio::spawn(async move {
-            if let Err(e) = layer.tunnel(host, from_client, aw, ar, to_client).await {
+            if let Err(e) = layer
+                .tunnel(host, from_client, up_w, down_r, to_client)
+                .await
+            {
                 emit_layer_error(&st2, &addon.name, &e, false);
             }
         });
-        let (br, bw) = tokio::io::split(b);
-        side_r = Box::new(br);
-        side_w = Box::new(bw);
+        side_r = Box::new(up_r);
+        side_w = Box::new(down_w);
     }
     (Box::new(tokio::io::join(side_r, side_w)), Vec::new())
 }
