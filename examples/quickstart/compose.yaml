@@ -39,6 +39,7 @@ services:
   sentinel:
     image: roxy-quickstart-sentinel
     build: ./sentinel
+    pull_policy: build               # built here, never pulled
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
@@ -54,6 +55,8 @@ services:
   # model calls and tool calls, and the sentinel's verdict on each.
   inspect-view:
     image: roxy-quickstart-sentinel
+    build: ./sentinel                # the sentinel's image; built once, cached
+    pull_policy: build
     # Unauthenticated, so published on the host's loopback only.
     command:
       - inspect

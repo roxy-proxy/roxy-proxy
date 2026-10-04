@@ -1,0 +1,192 @@
+# A configuration that uses every section, for the config and CLI tests.
+
+version: 1
+
+listeners:
+  - name: proxy
+    mode: explicit
+    bind: 0.0.0.0:3128
+    auth:                      # optional; makes client.user available
+      basic: { users_file: /etc/roxy/users }
+  # Deferred (issue #15). Shape reserved so configs do not change when it lands:
+  # - name: tproxy
+  #   mode: transparent
+  #   bind: 0.0.0.0:3129
+  #   allow_passthrough: false
+  #   upstream_target: resolve   # resolve | original_dst | require_match
+
+ca_server:
+  bind: 0.0.0.0:3130           # plain HTTP, serves /roxy-ca.pem and /healthz
+
+tls:
+  ca_dir: /var/lib/roxy/ca     # generated if absent
+  # ca_cert: /etc/roxy/ca/tls.crt  # use a provided CA instead (set both)
+  # ca_key: /etc/roxy/ca/tls.key
+  require_sni_match: true
+  upstream:
+    verify: strict             # strict | strict+extra_roots
+    extra_roots: []
+    min_version: "1.2"
+
+http:
+  allow_http10: false
+  allow_trailers: false
+  allow_chunk_extensions: false
+  allow_plain_in_connect: false
+  enable_h2: true             # client-side HTTP/2 via ALPN h2 (default true; false = http/1.1 only)
+  strip_accept_encoding: false  # remove accept-encoding so origins answer uncompressed
+  decode_for_addons: true     # addons see decoded bodies, without content-encoding
+
+limits:
+  max_header_bytes: 64kb
+  max_url_bytes: 8kb
+  max_headers: 100
+  max_request_body_bytes: 1gb
+  max_response_body_bytes: 1gb
+  max_inspect_body_bytes: 1mb   # only buffered when a rule/addon needs body content
+  header_timeout: 10s
+  body_idle_timeout: 30s
+  response_header_timeout: 60s
+  idle_timeout: 300s            # client keep-alive idle; also the WebSocket relay idle timeout
+  max_connections: 10000
+  max_connections_per_client: 256
+  max_metric_keys: 100000
+  max_metric_bytes: 256mb         # metric store byte budget; full = deny new keys, never evict
+  max_address_list_bytes: 256mb   # largest address list file roxy will load
+
+upstream:
+  dns:
+    resolver: system           # system | [ "1.1.1.1:53", ... ]
+    cache_ttl_cap: 60s
+  deny_private_ranges: true    # loopback, link-local, RFC1918, ULA, multicast, unspecified
+  deny_lists: [cloud-metadata] # hard floor checked on every connect; private_ok does not bypass it
+  connect_timeout: 10s
+
+# Named CIDR lists: usable as `ip in @name` in rules and as
+# `upstream.deny_lists`. File lists hold one CIDR or address per line with
+# `#` comments, and are reloaded when the file changes.
+address_lists:
+  - name: cloud-metadata
+    inline: [169.254.169.254/32, "fd00:ec2::254/128", 100.100.100.200/32]
+  # - name: blocked
+  #   file: /etc/roxy/lists/blocked.txt
+
+secrets:
+  openai: { env: OPENAI_API_KEY }
+  gh:     { file: /run/secrets/github_token }
+
+metrics:
+  - id: github_writes
+    count: requests
+    where: host under "api.github.com" and method in [POST, PUT, PATCH, DELETE]
+    key: [client.ip]
+    window: 1m
+  - id: egress_bytes
+    count: request_bytes
+    where: true
+    key: [client.ip]
+    window: 1h
+
+# What a request gets when no rule decides it: deny (the default) or allow.
+# Any matching deny wins over any matching allow, wherever it sits in the
+# list; rule order only orders effects.
+default: deny
+
+rules:
+  - id: no-writes-burst
+    when: metric.github_writes >= 30 and host under "api.github.com"
+    then: deny
+
+  # `egress_bytes` counts request_bytes, which grow as uploads stream, so
+  # this deny also watches: it stops the upload that crosses the budget.
+  - id: egress-budget
+    when: metric.egress_bytes > 500mb
+    then: { deny: { status: 429, message: "hourly egress budget exhausted" } }
+
+  # Declared upload size. `body.size` is null when the client did not
+  # declare a length (chunked), so the guard makes the rule skip those;
+  # `limits.max_request_body_bytes` caps every body while it streams.
+  - id: no-big-uploads
+    when: host == "api.openai.com" and body.size != null and body.size > 10mb
+    then: { deny: { status: 413, message: "upload too large" } }
+
+  # The streaming cap: `body.bytes` is known only as the body streams, so
+  # this rule watches the upload and stops it at the chunk that crosses
+  # 10mb, whether or not a length was declared.
+  - id: upload-cap
+    when: host == "api.openai.com" and body.bytes > 10mb
+    then: { deny: { status: 413, message: "upload too large" } }
+
+  - id: openai
+    when: host == "api.openai.com" and path starts_with "/v1/" and method == POST
+    then:
+      - set_header: { authorization: "Bearer ${secret:openai}" }
+      - allow
+
+  - id: github-reads
+    when: host under "github.com" and method in [GET, HEAD]
+    then: allow
+
+  - id: pypi
+    when: host in ["pypi.org", "files.pythonhosted.org"] and method == GET
+    then: allow
+
+  - id: ws-example
+    when: host == "ws.example.com" and header["upgrade"] == "websocket"
+    then: { allow: { upgrade: websocket } }
+
+  # Reads a response value, so it watches; it only adds an effect.
+  - id: log-upstream-5xx
+    when: response.status >= 500
+    then: { log: { level: warn, message: "upstream 5xx" } }
+
+log:
+  flow:
+    path: /var/log/roxy/flow.jsonl   # absent = stdout
+    connection_events: false
+    high_water: 8mb                  # unwritten log at which traffic is held back
+    max_file_bytes: 100mb            # rotate by size; absent = never
+    max_files: 10                    # rotated files kept; absent = all
+    compress: true                   # gzip rotated files
+  capture:                         # traffic capture, under capture_dir
+    all: false                     # true: tee every forwarded exchange
+    max_file_bytes: 1gb
+    max_files: 20
+    compress: true
+  redact_headers: [x-internal-token]
+
+capture_dir: /var/lib/roxy/capture
+
+# Addons sit above the rules, in the order listed: the first sees each
+# request first and each response last. Whatever an addon
+# passes on is still judged by the rules.
+addons:
+  - name: redact
+    kind: wasm                   # wasm | service
+    path: /etc/roxy/addons/redact.wasm
+    mode: enforce                # enforce (failures fail closed) | observe (tee, log only)
+    config: { needles: ["sk-live-"], replacement: "[redacted]" }
+    capabilities: [log]          # endpoints, state, record, metrics, log
+    limits:                      # each optional
+      max_memory: 64mb
+      max_buffered_body_bytes: 1mb   # default: limits.max_inspect_body_bytes
+      step_cpu: 50ms
+      fuel_per_step: 100_000_000
+      max_exchange_time: 60s
+      max_instances: 64
+    # endpoints:                 # named outbound calls; the addon never sees these headers
+    #   classifier:
+    #     url: https://classifier.internal:8443/v1/score
+    #     headers: { authorization: "Bearer ${secret:classifier}" }
+    #     timeout: 2s
+    #     retries: 1
+    #     private_ok: true
+  # An external service in the network path: each
+  # exchange streams through it over a WebSocket (roxy.layer.v1).
+  # - name: sentinel
+  #   kind: service
+  #   endpoint: sidecar
+  #   mode: observe
+  #   endpoints:
+  #     sidecar: { url: "http://127.0.0.1:9000/layer", private_ok: true }
+  #   limits: { first_byte_timeout: 2s, max_exchange_time: 120s }
