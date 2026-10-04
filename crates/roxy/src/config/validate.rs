@@ -4,20 +4,25 @@
 //! diagnostics (with line/column within an expression) are merged with the
 //! checks here.
 
-use roxy_rules::{Condition, Policy, PolicyInput};
+use roxy_rules::{Condition, Diagnostic, Policy, PolicyInput};
 use std::collections::{HashMap, HashSet};
 
 use super::{AddressListSource, CONFIG_VERSION, Config, ListenerMode, UpstreamVerify};
 
-/// One problem found in a config, located by a YAML path such as
-/// `rules[2].when`. Displays as `path: message`, or `path:line:col: message`
-/// for expression errors (see [`roxy_rules::Diagnostic`]).
-pub use roxy_rules::Diagnostic;
+/// What compiling a valid config produces. Built once by
+/// [`Config::validate`] and handed on, so the run path, `roxy check` and
+/// `roxy rule test` never compile the same policy twice.
+#[derive(Debug)]
+pub struct Compiled {
+    pub policy: Policy,
+    /// Each addon's compiled `when`, `None` where it has none.
+    pub addon_conditions: Vec<Option<Condition>>,
+}
 
 impl Config {
     /// Check cross-references and constraints and compile the policy.
     /// Returns every problem found, not just the first.
-    pub fn validate(&self) -> Result<(), Vec<Diagnostic>> {
+    pub fn validate(&self) -> Result<Compiled, Vec<Diagnostic>> {
         let mut d = Vec::new();
 
         if self.version != CONFIG_VERSION {
@@ -36,28 +41,28 @@ impl Config {
         self.validate_secrets(&mut d);
         self.validate_address_lists(&mut d);
         self.validate_addons(&mut d);
+        self.validate_limits(&mut d);
         self.validate_upstream(&mut d);
         self.validate_log(&mut d);
 
-        if let Err(policy) = self.compile_policy() {
-            d.extend(policy);
+        let policy = self.with_policy_input(Policy::compile);
+        let conditions = self.compile_addon_conditions();
+        match (policy, conditions) {
+            (Ok(policy), Ok(addon_conditions)) if d.is_empty() => Ok(Compiled {
+                policy,
+                addon_conditions,
+            }),
+            (policy, conditions) => {
+                d.extend(policy.err().into_iter().flatten());
+                d.extend(conditions.err().into_iter().flatten());
+                Err(d)
+            }
         }
-        if let Err(conditions) = self.compile_addon_conditions() {
-            d.extend(conditions);
-        }
-
-        if d.is_empty() { Ok(()) } else { Err(d) }
-    }
-
-    /// Compile the rules and metrics. `validate` calls this; the run
-    /// path and `roxy rule test` use the result.
-    pub fn compile_policy(&self) -> Result<Policy, Vec<Diagnostic>> {
-        self.with_policy_input(Policy::compile)
     }
 
     /// Compile each addon's `when` (`None` where it has none), against the
     /// same metrics and address lists as the rules.
-    pub fn compile_addon_conditions(&self) -> Result<Vec<Option<Condition>>, Vec<Diagnostic>> {
+    fn compile_addon_conditions(&self) -> Result<Vec<Option<Condition>>, Vec<Diagnostic>> {
         self.with_policy_input(|input| {
             let mut out = Vec::with_capacity(self.addons.len());
             let mut d = Vec::new();
@@ -236,12 +241,18 @@ impl Config {
             }
             match a.kind {
                 super::AddonKind::Wasm => {
-                    if a.path.is_none() {
-                        d.push(Diagnostic::new(
+                    match &a.path {
+                        None => d.push(Diagnostic::new(
                             format!("{path}.path"),
                             "a `kind: wasm` addon needs `path`",
-                        ));
+                        )),
+                        Some(file) if !file.exists() => d.push(Diagnostic::new(
+                            format!("{path}.path"),
+                            format!("{} does not exist", file.display()),
+                        )),
+                        Some(_) => {}
                     }
+                    validate_wasm_limits(&path, &a.limits, d);
                     if a.endpoint.is_some() {
                         d.push(Diagnostic::new(
                             format!("{path}.endpoint"),
@@ -262,17 +273,6 @@ impl Config {
                 }
                 super::AddonKind::Service => Self::validate_service(&path, a, d),
             }
-            if let Some(i) = a
-                .capabilities
-                .iter()
-                .position(|c| *c == super::Capability::Secrets)
-            {
-                d.push(Diagnostic::new(
-                    format!("{path}.capabilities[{i}]"),
-                    "the `secrets` capability is not provided: put credentials on an \
-                     endpoint's `headers`, which roxy attaches without the addon seeing them",
-                ));
-            }
             if let Some(s) = a.sample {
                 if !(s > 0.0 && s <= 1.0) {
                     d.push(Diagnostic::new(
@@ -288,10 +288,10 @@ impl Config {
                     ));
                 }
             }
-            if a.limits.max_instances == Some(0) {
+            if a.limits.first_byte_timeout.is_some_and(|t| t.is_zero()) {
                 d.push(Diagnostic::new(
-                    format!("{path}.limits.max_instances"),
-                    "must be at least 1",
+                    format!("{path}.limits.first_byte_timeout"),
+                    "must be positive",
                 ));
             }
             for (name, e) in &a.endpoints {
@@ -405,6 +405,12 @@ impl Config {
                 ),
             )),
         }
+        if e.timeout.is_some_and(|t| t.is_zero()) {
+            d.push(Diagnostic::new(
+                format!("{path}.timeout"),
+                "must be positive",
+            ));
+        }
         for (h, v) in &e.headers {
             if http::HeaderName::from_bytes(h.as_bytes()).is_err() {
                 d.push(Diagnostic::new(
@@ -501,26 +507,53 @@ impl Config {
                 ));
             }
         }
-        if self.limits.max_connections == 0 {
+    }
+
+    /// Every `limits.*` count or size has a floor: at zero it would refuse
+    /// every conforming request (no headers, no URL), hold no connections,
+    /// or fail every metric and state rule closed.
+    fn validate_limits(&self, d: &mut Vec<Diagnostic>) {
+        let l = &self.limits;
+        let floors: [(&str, u64, u64); 10] = [
+            ("max_headers", l.max_headers as u64, 1),
+            ("max_header_bytes", l.max_header_bytes.as_u64(), 1),
+            ("max_url_bytes", l.max_url_bytes.as_u64(), 1),
+            ("max_connections", l.max_connections as u64, 1),
+            (
+                "max_connections_per_client",
+                l.max_connections_per_client as u64,
+                1,
+            ),
+            (
+                "h2_max_concurrent_streams",
+                u64::from(l.h2_max_concurrent_streams),
+                1,
+            ),
+            (
+                "h2_max_header_list_bytes",
+                l.h2_max_header_list_bytes.as_u64(),
+                1,
+            ),
+            ("max_metric_keys", l.max_metric_keys as u64, 1),
+            ("max_metric_bytes", l.max_metric_bytes.as_u64(), 1),
+            ("max_state_entries", l.max_state_entries as u64, 1),
+        ];
+        for (field, value, floor) in floors {
+            if value < floor {
+                d.push(Diagnostic::new(
+                    format!("limits.{field}"),
+                    format!("must be at least {floor}"),
+                ));
+            }
+        }
+        if l.max_address_list_bytes.as_u64() == 0 {
             d.push(Diagnostic::new(
-                "limits.max_connections",
-                "must be at least 1",
+                "limits.max_address_list_bytes",
+                "must be at least 1 (no address list file could load)",
             ));
         }
-        if self.limits.max_connections_per_client == 0 {
-            d.push(Diagnostic::new(
-                "limits.max_connections_per_client",
-                "must be at least 1",
-            ));
-        }
-        let metric_bytes = self.limits.max_metric_bytes.as_u64();
-        if metric_bytes == 0 {
-            d.push(Diagnostic::new(
-                "limits.max_metric_bytes",
-                "must be at least 1 byte",
-            ));
-        } else if metric_bytes > MAX_METRIC_BYTES_CEILING || usize::try_from(metric_bytes).is_err()
-        {
+        let metric_bytes = l.max_metric_bytes.as_u64();
+        if metric_bytes > MAX_METRIC_BYTES_CEILING || usize::try_from(metric_bytes).is_err() {
             d.push(Diagnostic::new(
                 "limits.max_metric_bytes",
                 "must be at most 64gb",
@@ -568,6 +601,14 @@ impl Config {
             d.push(Diagnostic::new(
                 "capture_dir",
                 "capture (a `capture` action or log.capture.all) needs `capture_dir`",
+            ));
+        }
+        // Without a directory nothing is captured, so these would sit
+        // unused; a reader of the config would still take them as active.
+        if self.capture_dir.is_none() && *c != super::CaptureLog::default() && !c.all {
+            d.push(Diagnostic::new(
+                "log.capture",
+                "log.capture settings need `capture_dir` (without it nothing is captured)",
             ));
         }
         if c.high_water.as_u64() < 64 * 1024 {
@@ -619,6 +660,45 @@ pub(crate) fn secret_refs(v: &str) -> Vec<&str> {
         rest = &after[end + 1..];
     }
     out
+}
+
+/// The WASM limits `roxy run` would refuse or that would never act: a
+/// zero cap, and a recycle threshold the memory cap stops an instance
+/// from ever reaching.
+fn validate_wasm_limits(path: &str, l: &super::AddonLimits, d: &mut Vec<Diagnostic>) {
+    if l.max_instances == Some(0) {
+        d.push(Diagnostic::new(
+            format!("{path}.limits.max_instances"),
+            "must be at least 1",
+        ));
+    }
+    for (field, v) in [
+        ("max_memory", l.max_memory),
+        ("recycle_above_memory", l.recycle_above_memory),
+    ] {
+        if v.is_some_and(|b| b.as_u64() == 0) {
+            d.push(Diagnostic::new(
+                format!("{path}.limits.{field}"),
+                "must be at least 1 byte",
+            ));
+        }
+    }
+    let max_memory = l
+        .max_memory
+        .map_or(roxy_wasm::LayerLimits::default().max_memory, |b| b.as_u64());
+    if let Some(recycle) = l.recycle_above_memory
+        && recycle.as_u64() > max_memory
+        && max_memory > 0
+    {
+        d.push(Diagnostic::new(
+            format!("{path}.limits.recycle_above_memory"),
+            format!(
+                "must not exceed max_memory ({}): an instance fails its exchange at \
+                 max_memory, so it would never be recycled",
+                bytesize::ByteSize::b(max_memory)
+            ),
+        ));
+    }
 }
 
 /// The checks that depend on a listener's mode.

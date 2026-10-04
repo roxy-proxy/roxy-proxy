@@ -243,7 +243,7 @@ pub fn ws_message(
 
 /// The parts of an absolute URL that rules see.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParsedUrl {
+pub(crate) struct ParsedUrl {
     pub scheme: String,
     /// Lower-case, trailing dot removed, IPv6 without brackets.
     pub host: String,
@@ -254,7 +254,7 @@ pub struct ParsedUrl {
 
 impl ParsedUrl {
     /// `scheme://host[:port]/path[?query]`, port shown only if non-default.
-    pub fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         let host = if self.host.contains(':') {
             format!("[{}]", self.host)
         } else {
@@ -285,7 +285,7 @@ impl ParsedUrl {
 
 /// Parse an absolute `http`/`https` URL. Deliberately small: roxy-http owns
 /// real normalisation; this only splits the parts.
-pub fn parse_url(url: &str) -> Result<ParsedUrl, String> {
+pub(crate) fn parse_url(url: &str) -> Result<ParsedUrl, String> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| format!("{url:?} is not an absolute URL (expected http(s)://host/...)"))?;
@@ -549,7 +549,7 @@ impl DryRun {
             .unwrap_or(&self.head.decision)
     }
 
-    pub fn terminal_rule(&self) -> &RuleId {
+    pub(crate) fn terminal_rule(&self) -> &RuleId {
         self.watching
             .as_ref()
             .and_then(|w| w.terminal_rule.as_ref())
@@ -770,7 +770,7 @@ mod tests {
              - { id: no-secrets, when: 'ws.opcode == 1 and ws.text contains \"secret\"', then: deny }\n",
         )
         .unwrap();
-        let policy = config.compile_policy().unwrap();
+        let policy = config.validate().unwrap().policy;
         let dry = |ws| {
             let mut req = TestRequest::new("GET", "https://ws.test/");
             req.ws = ws;
@@ -793,7 +793,7 @@ mod tests {
              - { id: direct, when: 'listener.mode == \"direct\" and listener.name == \"d\"', then: allow }\n",
         )
         .unwrap();
-        let policy = config.compile_policy().unwrap();
+        let policy = config.validate().unwrap().policy;
         let req = TestRequest::new("GET", "https://example.com/");
         let (view, _) = build_view(&config, &req).unwrap();
         let r = run(&policy, &view, &[], known(&req));

@@ -291,7 +291,7 @@ async fn start_endpoint(private_ok: bool) -> Harness {
         ..Opts::default()
     });
     std::fs::write(&h.config_path, cfg).unwrap();
-    assert!(h.running.as_ref().unwrap().reloader.reload_async().await);
+    assert!(h.running.as_ref().unwrap().reloader.reload().await);
     std::mem::forget(tmp);
     h
 }

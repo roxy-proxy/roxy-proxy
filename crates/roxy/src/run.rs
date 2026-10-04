@@ -15,39 +15,36 @@ use roxy_proxy::{
     MetricSource, PolicyUpdate, Redactor, RuntimeConfig, Server, ServerHandle, StateSource,
     StdoutSink, UserDb,
 };
-use roxy_tls::{Ca, CaError, LeafMinter};
+use roxy_rules::Policy;
+use roxy_tls::{Ca, LeafMinter};
 
-use crate::config::{Config, ListenerMode};
+use crate::addons::{AddonLoader, PreparedAddons};
+use crate::config::{Compiled, Config, ListenerMode};
 use crate::secrets::Secrets;
+use crate::stores::ReloadableMetrics;
 
 /// Debounce for config file events.
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// Loads and validates a config; diagnostics as `path:diagnostic` lines.
-pub fn load_checked(path: &Path) -> Result<Config, Vec<String>> {
+pub fn load_checked(path: &Path) -> Result<(Config, Compiled), Vec<String>> {
     let config = Config::load(path).map_err(|e| vec![format!("{e:#}")])?;
+    let compiled = validate_at(&config, path)?;
+    Ok((config, compiled))
+}
+
+fn validate_at(config: &Config, path: &Path) -> Result<Compiled, Vec<String>> {
     config.validate().map_err(|diags| {
         diags
             .iter()
             .map(|d| format!("{}:{d}", path.display()))
-            .collect::<Vec<_>>()
-    })?;
-    Ok(config)
+            .collect()
+    })
 }
 
 /// Everything a reload may change, resolved (secrets, users files, address
 /// lists). Any address list that fails to load fails the whole update.
-pub fn policy_update(config: &Config) -> anyhow::Result<PolicyUpdate> {
-    let policy = config.compile_policy().map_err(|diags| {
-        anyhow!(
-            "policy failed to compile: {}",
-            diags
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("; ")
-        )
-    })?;
+pub fn policy_update(config: &Config, policy: Policy) -> anyhow::Result<PolicyUpdate> {
     let secrets = Secrets::resolve(&config.secrets)?;
     let mut redactor = Redactor::new();
     for value in secrets.values() {
@@ -95,15 +92,12 @@ pub fn load_ca(config: &Config) -> anyhow::Result<Ca> {
         return Ok(Ca::load_provided(cert, key)?);
     }
     let dir = &config.tls.ca_dir;
-    match Ca::load(dir) {
-        Ok(ca) => Ok(ca),
-        Err(CaError::NotFound(_)) => {
-            let ca = Ca::generate(dir)?;
-            tracing::info!(dir = %dir.display(), "generated new roxy CA");
-            Ok(ca)
-        }
-        Err(e) => Err(e.into()),
+    let existed = Ca::load(dir).is_ok();
+    let ca = Ca::load_or_generate(dir)?;
+    if !existed {
+        tracing::info!(dir = %dir.display(), "generated new roxy CA");
     }
+    Ok(ca)
 }
 
 /// The flow sink configured by `log.flow`.
@@ -171,15 +165,17 @@ pub struct StartOptions {
 pub struct Reloader {
     path: PathBuf,
     handle: ServerHandle,
-    last: Mutex<Config>,
+    /// The running config. Held for the whole of a reload, so reloads
+    /// (watcher and `SIGHUP`) never interleave.
+    last: tokio::sync::Mutex<Config>,
     /// The built-in metric store, rebuilt (with carry-over) on each reload.
     /// `None` when the caller supplied its own `MetricSource`.
-    metrics: Option<Arc<crate::stores::ReloadableMetrics>>,
-    /// The file watcher, told about the current address list files on
+    metrics: Option<Arc<ReloadableMetrics>>,
+    /// The file watcher, told about the current list and addon files on
     /// every reload attempt.
     watch: OnceLock<Arc<Watch>>,
     /// Compiles addons, keeping unchanged ones across reloads.
-    addons: Arc<crate::addons::AddonLoader>,
+    addons: Arc<AddonLoader>,
 }
 
 impl std::fmt::Debug for Reloader {
@@ -258,49 +254,24 @@ fn keep_restart_only(running: &Config, new: &mut Config) -> Vec<&'static str> {
     changed
 }
 
+/// What a reload has ready before anything is swapped.
+struct Staged {
+    config: Config,
+    update: PolicyUpdate,
+    addons: PreparedAddons,
+    /// Restart-only settings the file changed; the running values are kept.
+    restart: Vec<&'static str>,
+}
+
 impl Reloader {
     /// Loads, validates, compiles and swaps. On any failure the running
-    /// snapshot stays and `config_reload_failed` is emitted. Blocking (file
-    /// reads, bcrypt-free but synchronous); call from a blocking context.
-    pub fn reload(&self) -> bool {
+    /// snapshot stays and `config_reload_failed` is emitted.
+    pub async fn reload(self: &Arc<Self>) -> bool {
         let sink = self.handle.sink();
-        // Held throughout, so reloads (watcher and SIGHUP) never interleave.
-        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut restart = Vec::new();
-        let mut attempt = || -> Result<(Config, PolicyUpdate), Vec<String>> {
-            let mut config = Config::load(&self.path).map_err(|e| vec![format!("{e:#}")])?;
-            // Track the list files even if this attempt fails, so fixing (or
-            // creating) a broken list file triggers the next reload.
-            if let Some(w) = self.watch.get() {
-                w.track(&self.path, &crate::lists::files(&config));
-            }
-            restart = keep_restart_only(&last, &mut config);
-            config.validate().map_err(|diags| {
-                diags
-                    .iter()
-                    .map(|d| format!("{}:{d}", self.path.display()))
-                    .collect::<Vec<_>>()
-            })?;
-            let mut update = policy_update(&config).map_err(|e| vec![format!("{e:#}")])?;
-            update.addons = self
-                .addons
-                .load_blocking(&config)
-                .map_err(|e| vec![format!("{e:#}")])?;
-            Ok((config, update))
-        };
-        let result = attempt().and_then(|(config, update)| {
-            let next_metrics = self
-                .metrics
-                .as_ref()
-                .map(|m| m.prepare(&update.policy, config.limits.metric_limits()));
-            self.handle.reload(update).map_err(|e| vec![e])?;
-            if let (Some(m), Some(next)) = (&self.metrics, next_metrics) {
-                m.install(next);
-            }
-            Ok(config)
-        });
+        let mut last = self.last.lock().await;
+        let result = self.stage(&last).await.and_then(|s| self.swap(s));
         match result {
-            Ok(config) => {
+            Ok((config, restart)) => {
                 for field in restart {
                     tracing::warn!(
                         field,
@@ -328,44 +299,157 @@ impl Reloader {
         }
     }
 
-    /// [`Reloader::reload`] on the blocking pool.
-    pub async fn reload_async(self: &Arc<Self>) -> bool {
+    /// Everything before the swap: the file reads and compilation on the
+    /// blocking pool, then the addons.
+    async fn stage(self: &Arc<Self>, running: &Config) -> Result<Staged, Vec<String>> {
         let r = self.clone();
-        tokio::task::spawn_blocking(move || r.reload())
+        let running = running.clone();
+        let (config, compiled, restart) = tokio::task::spawn_blocking(move || r.load(&running))
             .await
-            .unwrap_or(false)
+            .map_err(|e| vec![format!("reload: {e}")])??;
+        let mut update =
+            policy_update(&config, compiled.policy).map_err(|e| vec![format!("{e:#}")])?;
+        let addons = self
+            .addons
+            .prepare(&config, compiled.addon_conditions)
+            .await
+            .map_err(|e| vec![format!("{e:#}")])?;
+        update.addons = addons.specs();
+        Ok(Staged {
+            config,
+            update,
+            addons,
+            restart,
+        })
+    }
+
+    fn load(&self, running: &Config) -> Result<(Config, Compiled, Vec<&'static str>), Vec<String>> {
+        let mut config = Config::load(&self.path).map_err(|e| vec![format!("{e:#}")])?;
+        // Track the files even if this attempt fails, so fixing (or
+        // creating) a broken one triggers the next reload.
+        if let Some(w) = self.watch.get() {
+            w.track(&self.path, &watched_files(&config));
+        }
+        let restart = keep_restart_only(running, &mut config);
+        let compiled = validate_at(&config, &self.path)?;
+        Ok((config, compiled, restart))
+    }
+
+    /// The swap. The metric store is rebuilt around it: before the policy
+    /// swap when the new policy keeps every running metric, so no flow on
+    /// either side meets a metric its store does not know; otherwise right
+    /// after, where only flows still finishing under the old policy can.
+    /// The addon cache follows a successful swap.
+    fn swap(&self, staged: Staged) -> Result<(Config, Vec<&'static str>), Vec<String>> {
+        let Staged {
+            config,
+            update,
+            addons,
+            restart,
+        } = staged;
+        let limits = config.limits.metric_limits();
+        let policy = update.policy.clone();
+        let early = self
+            .metrics
+            .as_ref()
+            .filter(|m| m.keeps_every_metric(&policy));
+        if let Some(m) = early {
+            m.install(&policy, limits);
+        }
+        self.handle.reload(update).map_err(|e| vec![e])?;
+        if early.is_none()
+            && let Some(m) = &self.metrics
+        {
+            m.install(&policy, limits);
+        }
+        self.addons.install(addons);
+        Ok((config, restart))
     }
 }
 
-/// Watches the config file and every address list file. Directories are
-/// watched (editors replace files rather than writing them in place) and
-/// events are filtered to the tracked files.
+/// Every file the config names that a reload reads: address lists and
+/// WASM addons.
+fn watched_files(config: &Config) -> Vec<PathBuf> {
+    let mut files = crate::lists::files(config);
+    files.extend(crate::addons::files(config));
+    files
+}
+
+/// Watches the config file, the address-list files and the addon files.
+/// Directories are watched (editors replace files rather than writing
+/// them in place) and events are filtered to the tracked files.
 struct Watch {
     watcher: Mutex<RecommendedWatcher>,
-    /// Absolute paths of the tracked files.
-    targets: Arc<Mutex<HashSet<PathBuf>>>,
+    targets: Arc<Mutex<Targets>>,
     /// Directories already watched.
     dirs: Mutex<HashSet<PathBuf>>,
+}
+
+/// The tracked files by absolute path, each with the path it currently
+/// resolves to through symlinks.
+#[derive(Default)]
+struct Targets {
+    files: HashMap<PathBuf, Option<PathBuf>>,
+}
+
+impl Targets {
+    fn new(files: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            files: files
+                .into_iter()
+                .map(|f| (absolute(&f), resolve(&f)))
+                .collect(),
+        }
+    }
+
+    /// Whether an event for `paths` touches a tracked file: by its own
+    /// path, by the path it resolves to, or by changing what it resolves
+    /// to (a symlink swapped underneath it, as Kubernetes does for a
+    /// mounted `ConfigMap`).
+    fn hit(&mut self, paths: &[PathBuf]) -> bool {
+        let mut hit = false;
+        for (file, resolved) in &mut self.files {
+            let now = resolve(file);
+            if now != *resolved || paths.iter().any(|p| p == file || Some(p) == now.as_ref()) {
+                *resolved = now;
+                hit = true;
+            }
+        }
+        hit
+    }
+
+    /// The directories whose events matter: each file's, and the one its
+    /// resolved path is in.
+    fn dirs(&self) -> HashSet<PathBuf> {
+        self.files
+            .iter()
+            .flat_map(|(f, r)| std::iter::once(f).chain(r.as_ref()))
+            .map(|p| {
+                p.parent()
+                    .map_or_else(|| PathBuf::from("/"), Path::to_path_buf)
+            })
+            .collect()
+    }
 }
 
 fn absolute(p: &Path) -> PathBuf {
     std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// Where `p` is right now, symlinks followed; `None` while it is missing.
+fn resolve(p: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(p).ok()
+}
+
 impl Watch {
-    /// Tracks exactly `config` plus `lists` from now on.
-    fn track(&self, config: &Path, lists: &[PathBuf]) {
-        let targets: HashSet<PathBuf> = std::iter::once(config)
-            .chain(lists.iter().map(PathBuf::as_path))
-            .map(absolute)
-            .collect();
+    /// Tracks exactly `config` plus `files` from now on.
+    fn track(&self, config: &Path, files: &[PathBuf]) {
+        let targets =
+            Targets::new(std::iter::once(config.to_path_buf()).chain(files.iter().cloned()));
         {
             let mut dirs = self.dirs.lock().unwrap_or_else(PoisonError::into_inner);
             let mut watcher = self.watcher.lock().unwrap_or_else(PoisonError::into_inner);
-            for t in &targets {
-                let dir = t
-                    .parent()
-                    .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+            for dir in targets.dirs() {
                 if dirs.contains(&dir) {
                     continue;
                 }
@@ -391,16 +475,16 @@ fn spawn_watcher(
     reloader: Arc<Reloader>,
 ) -> anyhow::Result<Arc<Watch>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(16);
-    let targets: Arc<Mutex<HashSet<PathBuf>>> = Arc::default();
+    let targets: Arc<Mutex<Targets>> = Arc::default();
     let t = targets.clone();
     let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(ev) = res
             && !matches!(ev.kind, EventKind::Access(_))
+            && t.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .hit(&ev.paths)
         {
-            let targets = t.lock().unwrap_or_else(PoisonError::into_inner);
-            if ev.paths.iter().any(|p| targets.contains(p)) {
-                let _ = tx.try_send(());
-            }
+            let _ = tx.try_send(());
         }
     })
     .context("starting the config file watcher")?;
@@ -412,7 +496,7 @@ fn spawn_watcher(
     let config_dir = absolute(path)
         .parent()
         .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
-    watch.track(path, &crate::lists::files(config));
+    watch.track(path, &watched_files(config));
     if !watch
         .dirs
         .lock()
@@ -426,7 +510,7 @@ fn spawn_watcher(
         while rx.recv().await.is_some() {
             tokio::time::sleep(RELOAD_DEBOUNCE).await;
             while rx.try_recv().is_ok() {}
-            reloader.reload_async().await;
+            reloader.reload().await;
         }
     });
     Ok(watch)
@@ -479,22 +563,23 @@ impl Running {
 /// the server.
 pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
     roxy_tls::install_crypto_provider();
-    let config = load_checked(path).map_err(|d| anyhow!("invalid config:\n{}", d.join("\n")))?;
-    let mut update = policy_update(&config)?;
-    let addon_loader = Arc::new(crate::addons::AddonLoader::default());
-    update.addons = addon_loader.load(&config).await?;
-    let (metric_source, builtin_metrics): (
-        Arc<dyn MetricSource>,
-        Option<Arc<crate::stores::ReloadableMetrics>>,
-    ) = if let Some(m) = opts.metrics {
-        (m, None)
-    } else {
-        let b = Arc::new(crate::stores::ReloadableMetrics::new(
-            &update.policy,
-            config.limits.metric_limits(),
-        ));
-        (b.clone(), Some(b))
-    };
+    let (config, compiled) =
+        load_checked(path).map_err(|d| anyhow!("invalid config:\n{}", d.join("\n")))?;
+    let mut update = policy_update(&config, compiled.policy)?;
+    let addon_loader = Arc::new(AddonLoader::default());
+    update.addons = addon_loader
+        .load(&config, compiled.addon_conditions)
+        .await?;
+    let (metric_source, builtin_metrics): (Arc<dyn MetricSource>, Option<Arc<ReloadableMetrics>>) =
+        if let Some(m) = opts.metrics {
+            (m, None)
+        } else {
+            let b = Arc::new(ReloadableMetrics::new(
+                &update.policy,
+                config.limits.metric_limits(),
+            ));
+            (b.clone(), Some(b))
+        };
     let ca = Arc::new(load_ca(&config)?);
     let minter = Arc::new(LeafMinter::new(ca.clone(), config.tls.leaf_cache_size)?);
     let sink = match opts.sink {
@@ -539,7 +624,7 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
     let reloader = Arc::new(Reloader {
         path: path.to_path_buf(),
         handle: server.handle(),
-        last: Mutex::new(config.clone()),
+        last: tokio::sync::Mutex::new(config.clone()),
         metrics: builtin_metrics,
         watch: OnceLock::new(),
         addons: addon_loader,
@@ -673,6 +758,41 @@ mod tests {
             restart(
                 base,
                 "version: 1\nlimits: { max_header_bytes: 8kb }\nlog: { redact_headers: [x-a] }\n"
+            ),
+            Vec::<&str>::new()
+        );
+    }
+
+    /// Every setting the server reads once, at start, is kept on reload;
+    /// a change to any of them is named.
+    #[test]
+    fn startup_only_settings_need_a_restart() {
+        let base = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:443 }]\n";
+        for (yaml, field) in [
+            ("tls: { require_sni_match: false }", "tls"),
+            ("tls: { leaf_cache_size: 5 }", "tls"),
+            ("tls: { upstream: { min_version: \"1.3\" } }", "tls"),
+            ("ca_server: { bind: 127.0.0.1:3130 }", "ca_server"),
+            ("http: { enable_h2: false }", "http.enable_h2"),
+            ("limits: { max_connections: 5 }", "limits.max_connections"),
+            (
+                "limits: { max_connections_per_client: 5 }",
+                "limits.max_connections_per_client",
+            ),
+            (
+                "limits: { max_capture_body_bytes: 1mb }",
+                "limits.max_capture_body_bytes",
+            ),
+            ("log: { capture: { all: true } }", "log.capture"),
+            ("log: { capture: { max_file_bytes: 1mb } }", "log.capture"),
+        ] {
+            assert_eq!(restart(base, &format!("{base}{yaml}\n")), [field], "{yaml}");
+        }
+        // The rest of `http` and `limits` reload.
+        assert_eq!(
+            restart(
+                base,
+                &format!("{base}http: {{ allow_http10: true }}\nlimits: {{ max_headers: 5 }}\n")
             ),
             Vec::<&str>::new()
         );

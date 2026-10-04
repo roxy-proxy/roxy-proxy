@@ -1135,7 +1135,7 @@ async fn a_rotated_secret_reaches_new_streams_and_old_connections_drain() {
     st.until("the held stream", |s| s.opens().len() == 1).await;
 
     std::fs::write(h.dir.path().join("token"), "rotated-token-value").unwrap();
-    assert!(h.running.as_ref().unwrap().reloader.reload_async().await);
+    assert!(h.running.as_ref().unwrap().reloader.reload().await);
 
     let res = c.get(h.https_url("/after")).send().await.unwrap();
     assert_eq!(res.status(), 200);
@@ -1161,7 +1161,7 @@ async fn a_rotated_secret_reaches_new_streams_and_old_connections_drain() {
     assert_eq!(st.connections().len(), 2);
 
     // An idle connection closes as soon as a reload retires it.
-    assert!(h.running.as_ref().unwrap().reloader.reload_async().await);
+    assert!(h.running.as_ref().unwrap().reloader.reload().await);
     st.until("the idle connection to close", |s| {
         s.closed.lock().unwrap().contains(&1)
     })

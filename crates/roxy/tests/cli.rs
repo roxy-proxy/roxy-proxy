@@ -206,7 +206,7 @@ fn run_fails_closed_on_a_bad_addon() {
     let dir = tempfile::tempdir().unwrap();
     let ca = dir.path().join("ca");
     for (addon, expect) in [
-        (dir.path().join("missing.wasm"), "addon a: reading"),
+        (dir.path().join("missing.wasm"), "addons[0].path: "),
         (dir.path().join("roxy.yaml"), "layer `a`: compile failed"),
     ] {
         let cfg = dir.path().join("roxy.yaml");

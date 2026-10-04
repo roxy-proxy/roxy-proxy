@@ -137,6 +137,10 @@ limits:
   max_capture_body_bytes: 16mb       # per direction per exchange
 ```
 
+Every `log.capture` setting needs `capture_dir`: without it nothing is
+captured, and `roxy check` reports the settings rather than leave them
+looking active.
+
 ### Capture format
 
 A sequence of records, each one JSON header line, then `len` payload bytes,

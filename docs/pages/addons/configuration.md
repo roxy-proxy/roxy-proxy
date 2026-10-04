@@ -30,7 +30,7 @@ addons:                               # above the rules, in this order
       max_memory: 64mb                # per instance; what the layer holds of a body lives here
       first_byte_timeout: 30s         # the layer's own time to its response head
       recycle_after_exchanges: 10000
-      recycle_above_memory: 48mb
+      recycle_above_memory: 48mb      # default: three quarters of max_memory
       max_instances: 1024             # concurrent exchanges; waiting for one has no deadline
     config: { reject_at: 0.8 }        # opaque, handed to the layer as JSON
 ```
@@ -41,6 +41,11 @@ raise `max_memory` (requests resend the whole conversation, and an embedded
 interpreter needs 128–256 MiB) and `first_byte_timeout` if it calls a model
 before answering. Bodies have no clock, so a long generation streams
 through whatever its length.
+
+`roxy check` refuses what `roxy run` would refuse, or what could never act:
+a zero limit or endpoint `timeout`, a `recycle_above_memory` above
+`max_memory` (an instance fails its exchange at `max_memory`, so it would
+never be recycled), and a `path` that does not exist.
 
 `kind: service` addons take a different set of keys
 ([service layers](/addons/service-layers)).

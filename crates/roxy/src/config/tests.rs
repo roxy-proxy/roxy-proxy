@@ -17,6 +17,16 @@ fn diagnostics(yaml: &str) -> Vec<Diagnostic> {
 
 const BASE: &str = "version: 1\nlisteners: [{ name: proxy, bind: 127.0.0.1:3128 }]\n";
 
+/// A file to name as an addon's `path`, which validation stats. Keep the
+/// directory alive for as long as the config is validated.
+fn wasm_file() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a.wasm");
+    std::fs::write(&file, b"").unwrap();
+    let path = file.to_str().unwrap().to_owned();
+    (dir, path)
+}
+
 #[test]
 fn full_config_parses_and_validates() {
     let cfg = parse(&fixture("full.yaml"));
@@ -50,7 +60,7 @@ fn full_config_parses_and_validates() {
     assert_eq!(cfg.rules.len(), 9);
     assert_eq!(cfg.rules[4].then.0.len(), 2);
     assert_eq!(cfg.default, DefaultDecision::Deny);
-    let policy = cfg.compile_policy().unwrap();
+    let policy = cfg.validate().unwrap().policy;
     let kinds: Vec<&str> = policy
         .rule_info()
         .into_iter()
@@ -173,7 +183,6 @@ fn unknown_fields_rejected_everywhere() {
         "addons: [{ name: a, path: /a.wasm, fuel: 1 }]",
         "addons: [{ name: a, path: /a.wasm, hooks: [request] }]",
         "addons: [{ name: a, path: /a.wasm, limits: { max_cpu: 1s } }]",
-        // Removed: a slow addon is slow, not failed.
         "addons: [{ name: a, path: /a.wasm, limits: { max_exchange_time: 1s } }]",
         "addons: [{ name: a, path: /a.wasm, limits: { step_cpu: 1s } }]",
         "addons: [{ name: a, path: /a.wasm, limits: { fuel_per_step: 1 } }]",
@@ -207,6 +216,17 @@ fn unknown_enum_values_rejected() {
             "should reject: {bad}"
         );
     }
+    // `secrets` is refused with the reason, not as a typo.
+    let err = Config::from_yaml(&format!(
+        "{BASE}addons: [{{ name: a, path: /a.wasm, capabilities: [log, secrets] }}]\n"
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("addons[0].capabilities"), "{err}");
+    assert!(
+        err.contains("`secrets` capability is not provided"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -257,6 +277,36 @@ fn max_metric_bytes_out_of_range_diagnosed() {
         assert_eq!(d.len(), 1, "{bad}: {d:?}");
         assert_eq!(d[0].path, "limits.max_metric_bytes", "{bad}");
     }
+}
+
+/// A zero limit is a config error, not a way to switch something off: it
+/// would refuse every request, hold no connection or fail every metric
+/// and state rule closed.
+#[test]
+fn zero_limits_diagnosed() {
+    for field in [
+        "max_headers",
+        "max_header_bytes",
+        "max_url_bytes",
+        "max_connections",
+        "max_connections_per_client",
+        "h2_max_concurrent_streams",
+        "h2_max_header_list_bytes",
+        "max_metric_keys",
+        "max_metric_bytes",
+        "max_state_entries",
+        "max_address_list_bytes",
+    ] {
+        let d = diagnostics(&format!("{BASE}limits: {{ {field}: 0 }}\n"));
+        assert_eq!(d.len(), 1, "{field}: {d:?}");
+        assert_eq!(d[0].path, format!("limits.{field}"));
+        assert!(d[0].message.starts_with("must be at least 1"), "{}", d[0]);
+    }
+    parse(&format!(
+        "{BASE}limits: {{ max_headers: 1, max_header_bytes: 1 }}\n"
+    ))
+    .validate()
+    .unwrap();
 }
 
 #[test]
@@ -319,9 +369,8 @@ fn secret_in_watching_rule_diagnosed() {
 #[test]
 fn default_allow_parses() {
     let cfg = parse(&format!("{BASE}default: allow\n"));
-    cfg.validate().unwrap();
+    let p = cfg.validate().unwrap().policy;
     assert_eq!(cfg.default, DefaultDecision::Allow);
-    let p = cfg.compile_policy().unwrap();
     assert_eq!(p.default_decision(), DefaultDecision::Allow);
 }
 
@@ -422,13 +471,14 @@ fn direct_and_dns_diagnostics() {
 
 #[test]
 fn misc_diagnostics() {
-    let d = diagnostics(
-        "version: 2\nlisteners: []\nca_server: { bind: 127.0.0.1:1 }\n\
-         tls: { upstream: { verify: strict+extra_roots } }\n\
-         metrics: [{ id: bad-id, count: requests }]\n\
-         addons: [{ name: x, path: /x.wasm }, { name: x, path: /y.wasm }]\n\
-         rules:\n  - { id: _default, then: allow }\n  - { id: c, then: { call: nope } }\n",
-    );
+    let (_dir, wasm) = wasm_file();
+    let d = diagnostics(&format!(
+        "version: 2\nlisteners: []\nca_server: {{ bind: 127.0.0.1:1 }}\n\
+         tls: {{ upstream: {{ verify: strict+extra_roots }} }}\n\
+         metrics: [{{ id: bad-id, count: requests }}]\n\
+         addons: [{{ name: x, path: {wasm} }}, {{ name: x, path: {wasm} }}]\n\
+         rules:\n  - {{ id: _default, then: allow }}\n  - {{ id: c, then: {{ call: nope }} }}\n",
+    ));
     let paths: Vec<&str> = d.iter().map(|d| d.path.as_str()).collect();
     assert_eq!(
         paths,
@@ -551,8 +601,10 @@ fn address_lists_parse_and_validate() {
     }
 }
 
+/// Addon limits parse with units and are absent (not defaulted) when
+/// unset; there is no `terminate` capability or endpoint to grant.
 #[test]
-fn addon_on_error_has_no_pass() {
+fn addon_limits_parse_and_terminate_is_unknown() {
     let c = parse(&format!(
         "{BASE}addons: [{{ name: a, path: /a.wasm, mode: observe, \
          limits: {{ max_memory: 2mb, max_instances: 5 }} }}]\n"
@@ -564,7 +616,6 @@ fn addon_on_error_has_no_pass() {
     assert_eq!(a.limits.first_byte_timeout, None);
     assert_eq!(c.limits.max_address_list_bytes, ByteSize::b(256 << 20));
 
-    // Removed pending a design (issue #28): refused, not ignored.
     for bad in ["capabilities: [terminate]", "terminate_endpoint: x"] {
         assert!(
             Config::from_yaml(&format!(
@@ -628,8 +679,37 @@ fn flow_log_settings_validated() {
     }
 }
 
+/// `log.capture` configures how captures are written; without
+/// `capture_dir` nothing is captured, so any setting there is a mistake.
+#[test]
+fn capture_settings_without_a_capture_dir_diagnosed() {
+    for yaml in [
+        "high_water: 128mb",
+        "max_file_bytes: 1mb",
+        "max_file_bytes: 1mb\n    max_files: 3",
+        "max_file_bytes: 1mb\n    compress: true",
+    ] {
+        let d = diagnostics(&format!("{BASE}log:\n  capture:\n    {yaml}\n"));
+        assert_eq!(d.len(), 1, "{yaml}: {d:?}");
+        assert_eq!(d[0].path, "log.capture");
+        assert!(d[0].message.contains("need `capture_dir`"), "{}", d[0]);
+    }
+    // `all: true` is reported against `capture_dir`, once.
+    let d = diagnostics(&format!(
+        "{BASE}log:\n  capture:\n    all: true\n    max_file_bytes: 1mb\n"
+    ));
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].path, "capture_dir");
+    parse(&format!(
+        "{BASE}capture_dir: /tmp/c\nlog:\n  capture:\n    max_file_bytes: 1mb\n    compress: true\n"
+    ))
+    .validate()
+    .unwrap();
+}
+
 #[test]
 fn service_addons_validate() {
+    let (_dir, wasm) = wasm_file();
     let ok = format!(
         "{BASE}addons:\n  - name: s\n    kind: service\n    endpoint: svc\n    \
          limits: {{ first_byte_timeout: 2s, max_connections: 2, max_streams: 50 }}\n    \
@@ -640,9 +720,9 @@ fn service_addons_validate() {
     let d = diagnostics(&format!(
         "{BASE}addons:\n  - name: s\n    kind: service\n    endpoint: nope\n    \
          capabilities: [log]\n    config: {{ a: 1 }}\n    \
-         limits: {{ max_memory: 1mb, max_streams: 0 }}\n    \
+         limits: {{ max_memory: 1mb, max_streams: 0, first_byte_timeout: 0s }}\n    \
          endpoints:\n      svc: {{ url: \"http://127.0.0.1:9000/\" }}\n  \
-         - name: w\n    path: /w.wasm\n    limits: {{ first_byte_timeout: 1s, max_connections: 2 }}\n"
+         - name: w\n    path: {wasm}\n    limits: {{ first_byte_timeout: 0s, max_connections: 2 }}\n"
     ));
     let paths: Vec<&str> = d.iter().map(|d| d.path.as_str()).collect();
     for p in [
@@ -651,33 +731,102 @@ fn service_addons_validate() {
         "addons[0].config",
         "addons[0].limits.max_memory",
         "addons[0].limits.max_streams",
+        "addons[0].limits.first_byte_timeout",
         "addons[1].limits.max_connections",
+        "addons[1].limits.first_byte_timeout",
     ] {
         assert!(paths.contains(&p), "{p} not in {paths:?}");
     }
-    // Every addon has a head deadline.
-    assert!(
-        !paths.contains(&"addons[1].limits.first_byte_timeout"),
-        "{paths:?}"
-    );
+}
+
+/// `roxy check` refuses what `roxy run` would refuse at load, or what
+/// would fail every exchange: no limit may be zero, and an instance must
+/// be able to reach `recycle_above_memory` under `max_memory`.
+#[test]
+fn addon_limits_check_matches_run() {
+    let (_dir, wasm) = wasm_file();
+    for (bad, path, says) in [
+        (
+            "limits: { first_byte_timeout: 0s }",
+            "addons[0].limits.first_byte_timeout",
+            "positive",
+        ),
+        (
+            "limits: { max_memory: 0 }",
+            "addons[0].limits.max_memory",
+            "at least 1 byte",
+        ),
+        (
+            "limits: { recycle_above_memory: 0 }",
+            "addons[0].limits.recycle_above_memory",
+            "at least 1 byte",
+        ),
+        (
+            "limits: { max_memory: 16mb, recycle_above_memory: 17mb }",
+            "addons[0].limits.recycle_above_memory",
+            "must not exceed max_memory (16.0 MiB)",
+        ),
+        (
+            "limits: { recycle_above_memory: 65mb }",
+            "addons[0].limits.recycle_above_memory",
+            "must not exceed max_memory (64.0 MiB)",
+        ),
+        (
+            "limits: { max_instances: 0 }",
+            "addons[0].limits.max_instances",
+            "at least 1",
+        ),
+        (
+            "endpoints: { e: { url: \"https://x.test/\", timeout: 0s } }",
+            "addons[0].endpoints.e.timeout",
+            "positive",
+        ),
+    ] {
+        let d = diagnostics(&format!(
+            "{BASE}addons: [{{ name: a, path: {wasm}, {bad} }}]\n"
+        ));
+        assert_eq!(d.len(), 1, "{bad}: {d:?}");
+        assert_eq!(d[0].path, path, "{bad}");
+        assert!(d[0].message.contains(says), "{bad}: {}", d[0]);
+    }
+    // `recycle_above_memory` may equal `max_memory`; lowering `max_memory`
+    // alone is fine, since the unset threshold follows it.
+    for ok in [
+        "limits: { max_memory: 256mb, recycle_above_memory: 256mb }",
+        "limits: { max_memory: 16mb }",
+    ] {
+        parse(&format!(
+            "{BASE}addons: [{{ name: a, path: {wasm}, {ok} }}]\n"
+        ))
+        .validate()
+        .unwrap_or_else(|d| panic!("{ok}: {d:?}"));
+    }
+
+    let d = diagnostics(&format!(
+        "{BASE}addons: [{{ name: a, path: {wasm}.missing }}]\n"
+    ));
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].path, "addons[0].path");
+    assert!(d[0].message.ends_with("does not exist"), "{}", d[0]);
 }
 
 #[test]
 fn addon_when_and_sample() {
+    let (_dir, wasm) = wasm_file();
     let cfg = parse(&format!(
         "{BASE}metrics: [{{ id: calls, count: requests }}]\n\
          addons:\n  \
-         - {{ name: a, path: /a.wasm, when: 'host == \"x.test\" and metric.calls < 10' }}\n  \
-         - {{ name: b, path: /b.wasm, mode: observe, when: 'method == POST', sample: 0.25 }}\n"
+         - {{ name: a, path: {wasm}, when: 'host == \"x.test\" and metric.calls < 10' }}\n  \
+         - {{ name: b, path: {wasm}, mode: observe, when: 'method == POST', sample: 0.25 }}\n"
     ));
-    cfg.validate().unwrap();
+    let conditions = cfg.validate().unwrap().addon_conditions;
     assert_eq!(cfg.addons[1].sample, Some(0.25));
-    let conditions = cfg.compile_addon_conditions().unwrap();
     assert!(conditions.iter().all(Option::is_some));
 }
 
 #[test]
 fn addon_when_and_sample_diagnosed() {
+    let (_dir, wasm) = wasm_file();
     for (bad, path, says) in [
         (
             "when: 'response.status == 200'",
@@ -704,7 +853,7 @@ fn addon_when_and_sample_diagnosed() {
         ("sample: 0.5", "addons[0].sample", "mode: observe"),
     ] {
         let d = diagnostics(&format!(
-            "{BASE}addons: [{{ name: a, path: /a.wasm, {bad} }}]\n"
+            "{BASE}addons: [{{ name: a, path: {wasm}, {bad} }}]\n"
         ));
         assert_eq!(d.len(), 1, "{bad}: {d:?}");
         assert_eq!(d[0].path, path, "{bad}");
