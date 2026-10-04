@@ -432,6 +432,28 @@ async fn a_when_that_cannot_be_evaluated_fails_closed() {
     assert!(kit.upstream.seen().is_empty());
 }
 
+/// An observer's `when` failing is logged, like any observer failure, and
+/// the observer gets no copy; the flow goes on.
+#[tokio::test]
+async fn an_observer_whose_when_cannot_be_evaluated_is_skipped() {
+    let kit = stack(&[
+        AddonDef::test_layer("o")
+            .observe()
+            .when(r#"header["x-missing"] starts_with "v""#),
+        AddonDef::test_layer("b"),
+    ])
+    .await;
+    let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["via"], "b");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["layer"], "o", "{errs:#?}");
+    assert_eq!(errs[0]["mode"], "observe");
+    assert_eq!(errs[0]["kind"], "when:missing_value");
+    let ev = kit.request_event().await;
+    assert_eq!(strs(&ev["addons"]), ["b"], "{ev:#}");
+}
+
 #[tokio::test]
 async fn sample_copies_a_share_of_matching_exchanges() {
     let kit = stack(&[

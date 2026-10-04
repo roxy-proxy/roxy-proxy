@@ -65,7 +65,8 @@ service session.
 - A `when` that reaches an unavailable input (a metric, an address list, a
   missing value under an operator that cannot answer for `null`) fails the
   flow closed like a layer failure (`503`, `layer_error` with `kind:
-  when:<code>`). It never skips the layer.
+  when:<code>`). It never skips the layer. On an observe layer the failure
+  is logged like any observer failure, and the layer gets no copy.
 - A `tunnel` layer that `when` skipped is not in that WebSocket's byte path.
 
 `sample`, for `mode: observe` only, is the share of matching exchanges the

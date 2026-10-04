@@ -716,10 +716,18 @@ fn selects(
             m && sampled(st.flow, index, addon.sample),
             to_layer_request(creq),
         )),
-        Err(reason) => Err(StackError::Condition {
-            code: crate::pipeline::fail_closed_code(&reason, metric_err.as_ref()),
-            reason: reason.to_string(),
-        }),
+        Err(reason) => {
+            let err = StackError::Condition {
+                code: crate::pipeline::fail_closed_code(&reason, metric_err.as_ref()),
+                reason: reason.to_string(),
+            };
+            if !addon.observe {
+                return Err(err);
+            }
+            // An observer cannot affect traffic, so neither can its `when`.
+            emit_stack_error(st, &addon.name, &err, true);
+            Ok((false, to_layer_request(creq)))
+        }
     }
 }
 
