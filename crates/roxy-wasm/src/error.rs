@@ -85,9 +85,6 @@ pub enum LayerError {
     /// response body was dropped before the layer finished).
     #[error("exchange cancelled")]
     Cancelled,
-    /// The layer does not export `roxy:addon/tunnel`.
-    #[error("layer does not export `tunnel`")]
-    NoTunnel,
 }
 
 impl LayerError {

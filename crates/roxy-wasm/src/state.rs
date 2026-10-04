@@ -39,8 +39,6 @@ pub(crate) struct LayerShared {
 pub(crate) struct ExchangeCtx {
     pub(crate) host: Arc<dyn LayerHost>,
     pub(crate) shared: Arc<ExchangeShared>,
-    /// `false` for tunnels, which have no `next`.
-    pub(crate) next_allowed: bool,
     pub(crate) next_called: bool,
     /// The exchange's scheme and authority, the defaults for a request the
     /// guest builds without them.
@@ -287,11 +285,6 @@ impl chain::Host for StoreState {
             .exchange
             .as_mut()
             .ok_or_else(|| wasmtime::Error::new(LayerError::OutsideExchange("chain.next")))?;
-        if !ex.next_allowed {
-            return Err(wasmtime::Error::new(LayerError::OutsideExchange(
-                "chain.next",
-            )));
-        }
         if ex.next_called {
             return Err(wasmtime::Error::new(LayerError::NextCalledTwice));
         }

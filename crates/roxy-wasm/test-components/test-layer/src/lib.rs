@@ -197,21 +197,128 @@ fn pass(req: IncomingRequest, out: ResponseOutparam, buffer_first: bool) {
     });
 
     let fut = chain::next(next_req).expect("next");
+    let Some(all) = buffered else {
+        duplex(req, in_body, next_body, fut, out, upper);
+        return;
+    };
     {
         let output = next_body.write().expect("write");
-        match buffered {
-            Some(all) => write_all(&output, &all),
-            None => {
-                let input = in_body.stream().expect("stream");
-                pump(&input, &output, upper);
-            }
-        }
+        write_all(&output, &all);
     }
     OutgoingBody::finish(next_body, None).expect("finish");
     drop(in_body);
     drop(req);
 
     answer_with(await_response(fut), out, upper);
+}
+
+/// Streams both bodies at once: the request body into `next` and the
+/// response from below back out, each chunk as it comes, neither waiting
+/// for the other to end. A WebSocket's request body only ends when the
+/// client closes, while its response streams all along.
+fn duplex(
+    req: IncomingRequest,
+    in_body: IncomingBody,
+    next_body: OutgoingBody,
+    fut: wasi::http::types::FutureIncomingResponse,
+    out: ResponseOutparam,
+    upper: bool,
+) {
+    let up = |mut c: Vec<u8>| {
+        if upper {
+            c.make_ascii_uppercase();
+        }
+        c
+    };
+    let req_in = in_body.stream().expect("stream");
+    let mut req_out = Some(next_body.write().expect("write"));
+    let mut next_body = Some(next_body);
+    let mut req_open = true;
+    let mut out = Some(out);
+    // The response from below, once it has arrived, and our own.
+    let mut resp: Option<(IncomingResponse, IncomingBody, OutgoingBody)> = None;
+    let mut resp_streams: Option<(InputStream, OutputStream)> = None;
+    loop {
+        if req_open {
+            match req_in.read(64 * 1024) {
+                Ok(c) if !c.is_empty() => {
+                    write_all(req_out.as_ref().expect("open"), &up(c));
+                }
+                Ok(_) => {}
+                // A broken body is never passed on as if it had ended:
+                // trapping fails the exchange closed.
+                Err(StreamError::LastOperationFailed(e)) => {
+                    panic!("request body failed: {}", e.to_debug_string())
+                }
+                Err(StreamError::Closed) => {
+                    // The client's body ended: end the one below, so a
+                    // peer waiting for it (an echo) can end its response.
+                    req_open = false;
+                    drop(req_out.take());
+                    if let Some(b) = next_body.take() {
+                        let _ = OutgoingBody::finish(b, None);
+                    }
+                }
+            }
+        }
+        if resp.is_none()
+            && let Some(r) = fut.get()
+        {
+            let below = r.expect("once").expect("response");
+            let headers = Fields::from_list(&below.headers().entries()).expect("headers");
+            let mine = OutgoingResponse::new(headers);
+            mine.set_status_code(below.status()).expect("status");
+            let mine_body = mine.body().expect("body");
+            ResponseOutparam::set(out.take().expect("one answer"), Ok(mine));
+            let body = below.consume().expect("consume");
+            let input = body.stream().expect("stream");
+            let output = mine_body.write().expect("write");
+            resp_streams = Some((input, output));
+            resp = Some((below, body, mine_body));
+        }
+        let mut resp_open = resp.is_none();
+        if let Some((input, output)) = &resp_streams {
+            match input.read(64 * 1024) {
+                Ok(c) => {
+                    resp_open = true;
+                    if !c.is_empty() {
+                        write_all(output, &up(c));
+                    }
+                }
+                Err(StreamError::LastOperationFailed(e)) => {
+                    panic!("response body failed: {}", e.to_debug_string())
+                }
+                Err(StreamError::Closed) => {}
+            }
+        }
+        if !resp_open && resp_streams.is_some() {
+            // The response from below ended: end ours.
+            drop(resp_streams.take());
+            let (below, body, mine_body) = resp.take().expect("response");
+            drop(body);
+            drop(below);
+            OutgoingBody::finish(mine_body, None).expect("finish");
+            break;
+        }
+        let mut wait = Vec::new();
+        if req_open {
+            wait.push(req_in.subscribe());
+        }
+        match &resp_streams {
+            Some((input, _)) => wait.push(input.subscribe()),
+            None => wait.push(fut.subscribe()),
+        }
+        let refs: Vec<&wasi::io::poll::Pollable> = wait.iter().collect();
+        wasi::io::poll::poll(&refs);
+    }
+    // Close the request direction too, however far it got.
+    drop(req_out);
+    drop(req_in);
+    if let Some(b) = next_body {
+        let _ = OutgoingBody::finish(b, None);
+    }
+    drop(in_body);
+    drop(req);
 }
 
 /// Like `pass`, but full duplex: it streams the request body into `next`

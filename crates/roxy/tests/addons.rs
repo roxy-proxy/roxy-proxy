@@ -10,7 +10,6 @@ use support::{Harness, Opts, SECRET, h2_get};
 use tokio_tungstenite::tungstenite::Message;
 
 const TEST_LAYER: &[u8] = include_bytes!("../../roxy-wasm/tests/fixtures/test_layer.wasm");
-const TUNNEL_LAYER: &[u8] = include_bytes!("../../roxy-wasm/tests/fixtures/tunnel_layer.wasm");
 
 const ALLOW_UPSTREAM: &str = r#"
   - id: upstream
@@ -479,38 +478,19 @@ async fn websocket_through_a_layer_is_captured() {
     h.stop().await;
 }
 
-/// A layer without `tunnel` sees (and could refuse) the upgrade request,
-/// then is out of the byte path.
+/// A WebSocket is a long-lived exchange: the layer carries it in its
+/// bodies, both ways, and the rules' relay still sees every byte that
+/// leaves.
 #[tokio::test(flavor = "multi_thread")]
-async fn websocket_through_a_plain_layer() {
+async fn websocket_through_a_layer() {
     let h = start("", ALLOW_WS).await;
-    ws_echo(&h).await;
-    let close = h.wait_events("ws_close", 1).await;
-    assert!(close[0]["bytes_c2s"].as_u64().unwrap() > 100_000);
-    let ev = h.wait_events("request", 1).await;
-    assert_eq!(ev[0]["addons"], serde_json::json!(["t"]));
-    assert_eq!(ev[0]["terminal_rule"], "ws");
-    h.stop().await;
-}
-
-/// A layer that exports `tunnel` gets the raw streams after the `101`; the
-/// rules' relay still sees every byte that leaves.
-#[tokio::test(flavor = "multi_thread")]
-async fn websocket_through_a_tunnel_layer() {
-    let h = start_layer(TUNNEL_LAYER, "", ALLOW_WS).await;
     ws_echo(&h).await;
     let close = h.wait_events("ws_close", 1).await;
     assert!(close[0]["bytes_c2s"].as_u64().unwrap() > 100_000);
     assert!(close[0]["bytes_s2c"].as_u64().unwrap() > 100_000);
     let ev = h.wait_events("request", 1).await;
-    assert!(
-        ev[0]["tags"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t == "tunnel"),
-        "{ev:#?}"
-    );
+    assert_eq!(ev[0]["addons"], serde_json::json!(["t"]));
+    assert_eq!(ev[0]["terminal_rule"], "ws");
     h.stop().await;
 }
 
