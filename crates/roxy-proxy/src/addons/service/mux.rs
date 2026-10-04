@@ -1082,10 +1082,8 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::addons::AddonImpl;
     use crate::addons::service::testing;
-    use crate::addons::{AddonImpl, StackFlow};
-    use crate::listener::{ClientConn, ListenerInfo, ListenerMode};
-    use crate::pipeline::FlowCx;
     use crate::testkit::ALLOW_UP;
 
     /// A link whose connection has failed, with nothing behind it.
@@ -1148,25 +1146,8 @@ mod tests {
             })],
         )
         .await;
-        let shared = kit.server.shared().clone();
-        let snap = shared.snapshot();
-        let req = http::Request::get("http://up.test/")
-            .body(Body::empty())
-            .unwrap();
-        let creq = roxy_http::layer::from_layer_request(req, &snap.limits, &snap.flags).unwrap();
-        let client = ClientConn {
-            id: ulid::Ulid::generate(),
-            listener: Arc::new(ListenerInfo {
-                name: "main".to_owned(),
-                mode: ListenerMode::Explicit,
-                auth_required: false,
-            }),
-            peer: "192.0.2.7:40000".parse().unwrap(),
-            user: None,
-            original_dst: None,
-        };
-        let cx = FlowCx::new(shared, snap.clone(), client, None, &creq);
-        let st = Arc::new(StackFlow::new(&cx, &creq));
+        let (st, _cx) = crate::addons::test_flow(&kit);
+        let snap = st.snap.clone();
         let AddonImpl::Service(svc) = &snap.addons[0].kind else {
             panic!("a service layer");
         };

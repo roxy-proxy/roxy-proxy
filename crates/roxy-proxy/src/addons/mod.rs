@@ -301,6 +301,9 @@ pub(crate) struct StackFlow {
     layers: Box<[LayerSlot]>,
     /// The first layer failure (it decides the outcome and attribution).
     failure: Mutex<Option<(String, StackError)>>,
+    /// The request body failed in the core, as a client's would (framing,
+    /// a cut): no layer's doing, so no layer is blamed for it.
+    client_fault: Mutex<Option<roxy_http::ParseError>>,
     /// The enforce-mode failure has been logged.
     reported: AtomicBool,
     /// A layer asked to close the client connection.
@@ -342,6 +345,7 @@ impl StackFlow {
                 .map(|_| LayerSlot::default())
                 .collect(),
             failure: Mutex::new(None),
+            client_fault: Mutex::new(None),
             reported: AtomicBool::new(false),
             close: AtomicBool::new(false),
             upgrade: Mutex::new(None),
@@ -433,6 +437,10 @@ impl StackFlow {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    fn take_client_fault(&self) -> Option<roxy_http::ParseError> {
+        lock(&self.client_fault).take()
     }
 
     /// The layer failure behind a body cut after the head: the innermost
@@ -591,13 +599,18 @@ fn stack_outcome(
 ) -> Outcome {
     let resp = match driven {
         Err(e) => return Outcome::Close(e),
+        // A layer's failure explains the exchange first; a request body
+        // that failed in the core with no layer at fault closes the
+        // connection as it would without a stack.
         Ok(Err(_)) => {
-            let (layer, err) = st.failure().unwrap_or_else(|| {
-                (
+            let (layer, err) = match (st.failure(), st.take_client_fault()) {
+                (Some(f), _) => f,
+                (None, Some(e)) => return Outcome::Close(e),
+                (None, None) => (
                     st.snap.addons[0].name.clone(),
                     LayerError::NoResponse.into(),
-                )
-            });
+                ),
+            };
             emit_stack_error(st, &layer, &err, false);
             return Outcome::Refuse(layer_refusal(&layer));
         }
@@ -888,11 +901,9 @@ async fn core(
             Ok(to_layer_response(refusal_response(cx, &refusal)))
         }
         Outcome::Close(e) => {
-            st.fail(
-                &layer,
-                LayerError::InvalidRequest(format!("request body: {e}")),
-            );
-            Err(HostError::new(format!("request body failed: {e}")))
+            let msg = format!("request body failed: {e}");
+            *lock(&st.client_fault) = Some(e);
+            Err(HostError::new(msg))
         }
         Outcome::Upgrade {
             mut res,
@@ -1081,10 +1092,67 @@ async fn reader_into(first: Vec<u8>, mut r: impl tokio::io::AsyncRead + Unpin, m
     }
 }
 
+/// A flow through `kit`'s current snapshot, for tests that drive the
+/// stack's parts directly: a `GET http://up.test/` from a client on the
+/// proxy port.
+#[cfg(test)]
+pub(crate) fn test_flow(kit: &crate::testkit::Kit) -> (Arc<StackFlow>, FlowCx) {
+    use crate::listener::{ListenerInfo, ListenerMode};
+    let shared = kit.server.shared().clone();
+    let snap = shared.snapshot();
+    let req = http::Request::get("http://up.test/")
+        .body(Body::empty())
+        .unwrap();
+    let creq = from_layer_request(req, &snap.limits, &snap.flags).unwrap();
+    let client = ClientConn {
+        id: Ulid::generate(),
+        listener: Arc::new(ListenerInfo {
+            name: "main".to_owned(),
+            mode: ListenerMode::Explicit,
+            auth_required: false,
+        }),
+        peer: "192.0.2.7:40000".parse().unwrap(),
+        user: None,
+        original_dst: None,
+    };
+    let cx = FlowCx::new(shared, snap, client, None, &creq);
+    let st = Arc::new(StackFlow::new(&cx, &creq));
+    (st, cx)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::sampled;
-    use ulid::Ulid;
+    use super::*;
+    use crate::testkit::{AddonDef, Kit};
+
+    /// A request body that failed in the core closes the connection as a
+    /// client's fault, unless a layer's own failure explains the exchange.
+    #[tokio::test]
+    async fn a_body_failure_in_the_core_is_the_clients_unless_a_layer_failed() {
+        let kit = Kit::builder()
+            .addon(AddonDef::test_layer("a"))
+            .start()
+            .await;
+        let (st, mut cx) = test_flow(&kit);
+        let fault = || roxy_http::ParseError::new(roxy_http::Reason::BadChunkSize, "zz");
+        let failed = || Ok(Err(HostError::new("request body failed")));
+
+        *lock(&st.client_fault) = Some(fault());
+        let out = stack_outcome(&st, &mut cx, failed());
+        assert!(
+            matches!(&out, Outcome::Close(e) if e.reason == roxy_http::Reason::BadChunkSize),
+            "closes as a parse error"
+        );
+        assert!(st.failure().is_none(), "no layer is blamed");
+
+        *lock(&st.client_fault) = Some(fault());
+        st.fail("a", LayerError::Trap("boom".into()));
+        let out = stack_outcome(&st, &mut cx, failed());
+        assert!(
+            matches!(&out, Outcome::Refuse(r) if r.rule.as_deref() == Some("layer:a")),
+            "the layer's failure comes first"
+        );
+    }
 
     #[test]
     fn sampling_is_deterministic_and_proportional() {
