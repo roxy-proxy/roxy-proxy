@@ -44,7 +44,7 @@ fields become known later, so rules that read them watch.
 | field | type | known |
 |---|---|---|
 | `client.ip`, `client.port`, `client.user` | ip, int, string | head |
-| `listener.name`, `listener.mode` | string | head |
+| `listener.name`, `listener.mode` (`explicit` or `direct`) | string | head |
 | `tls.sni`, `tls.alpn`, `tls.version` | string | head |
 | `method`, `scheme`, `host`, `port`, `path`, `url` | string / int | head |
 | `query["k"]`, `query.raw` | string | head |

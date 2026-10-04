@@ -11,7 +11,7 @@ mod units;
 mod validate;
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -40,6 +40,10 @@ pub struct Config {
     /// Plain-HTTP endpoint serving the CA cert and health checks. Absent = off.
     #[serde(default)]
     pub ca_server: Option<CaServer>,
+    /// The DNS listener that steers clients to the direct listeners.
+    /// Absent = off.
+    #[serde(default)]
+    pub dns: Option<DnsListener>,
     #[serde(default)]
     pub tls: Tls,
     #[serde(default)]
@@ -81,6 +85,10 @@ pub struct Listener {
     pub bind: SocketAddr,
     #[serde(default)]
     pub auth: Option<ListenerAuth>,
+    /// Direct listeners only: the port clients connect to, when something
+    /// in between remaps it. Defaults to the bind port.
+    #[serde(default)]
+    pub target_port: Option<u16>,
     /// Transparent listeners only (deferred, issue #15).
     #[serde(default)]
     pub allow_passthrough: Option<bool>,
@@ -94,6 +102,8 @@ pub struct Listener {
 pub enum ListenerMode {
     #[default]
     Explicit,
+    /// Connections addressed to the origin, steered here by DNS.
+    Direct,
     /// Parsed so the config shape is stable, but rejected by validation
     /// until transparent mode is built (issue #15).
     Transparent,
@@ -123,6 +133,39 @@ pub struct BasicAuth {
 #[serde(deny_unknown_fields)]
 pub struct CaServer {
     pub bind: SocketAddr,
+}
+
+// ----- dns ------------------------------------------------------------------
+
+/// `dns:`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnsListener {
+    /// Served over UDP and TCP.
+    pub bind: SocketAddr,
+    /// What every name resolves to: roxy's own address. Every name, so
+    /// every connection comes to roxy; roxy resolves the real address
+    /// itself, after the rules allow the request.
+    pub answer: DnsAnswer,
+    /// TTL of every answer.
+    #[serde(default = "default_dns_ttl", with = "humantime_serde")]
+    pub ttl: Duration,
+}
+
+/// `dns.answer`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnsAnswer {
+    /// The `A` answer.
+    #[serde(default)]
+    pub ipv4: Option<Ipv4Addr>,
+    /// The `AAAA` answer; without it, `AAAA` queries get no addresses.
+    #[serde(default)]
+    pub ipv6: Option<Ipv6Addr>,
+}
+
+fn default_dns_ttl() -> Duration {
+    Duration::from_secs(60)
 }
 
 // ----- tls ------------------------------------------------------------------
@@ -648,6 +691,8 @@ pub struct FlowLog {
     pub path: Option<PathBuf>,
     /// Also log connection-level (`connect`) events.
     pub connection_events: bool,
+    /// Log every query the DNS listener answers (`dns_query`).
+    pub dns_events: bool,
     /// Log every Nth checked WebSocket message as a `ws_message` event; 0
     /// logs only denied ones.
     pub ws_message_every: u64,
@@ -668,6 +713,7 @@ impl Default for FlowLog {
         Self {
             path: None,
             connection_events: false,
+            dns_events: false,
             ws_message_every: 0,
             high_water: ByteSize::b(roxy_proxy::logging::DEFAULT_HIGH_WATER as u64),
             max_file_bytes: None,

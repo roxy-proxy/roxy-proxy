@@ -5,7 +5,7 @@
 //! ```text
 //! === case_name
 //! # comment
-//! role: proxy | tunnel <http|https> <host:port>
+//! role: proxy | tunnel <http|https> <host:port> | direct <port>
 //! flags: allow_http10 allow_trailers ...
 //! limits: max_headers=5 max_header_bytes=300 ...
 //! expect: request <METHOD> <url> [body=<escaped>] [hdr:<name>=<value>] [nohdr:<name>]
@@ -141,6 +141,9 @@ fn parse_cases(file: &str, text: &str) -> Vec<Case> {
                                 scheme,
                             }
                         }
+                        ["direct", port] => Role::Direct {
+                            port: port.parse().unwrap(),
+                        },
                         _ => panic!("bad role {v}"),
                     }
                 }

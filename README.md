@@ -1,7 +1,8 @@
 # roxy
 
 roxy is a strict, programmable HTTP firewall and egress proxy. Clients use
-it as an explicit `HTTP_PROXY`. It terminates TLS with leaf certificates
+it as an explicit `HTTP_PROXY`, or, with no proxy settings at all, reach it
+through its own DNS ([DNS steering](https://roxy-proxy.github.io/roxy-proxy/deploy/dns-steering)). It terminates TLS with leaf certificates
 minted by its own CA, parses every request into a strict canonical model,
 and re-serialises it in one unambiguous wire form, so smuggling and
 header-injection tricks never reach the upstream. Every exchange then runs
@@ -189,7 +190,8 @@ The documentation site is at
 - [Addons](https://roxy-proxy.github.io/roxy-proxy/addons/overview): the layer stack, service layers, writing
   addons
 - [Deploy](https://roxy-proxy.github.io/roxy-proxy/deploy/overview) and [operate](https://roxy-proxy.github.io/roxy-proxy/operate/operations):
-  containing a workload, the container image, the CA, the flow log
+  containing a workload, DNS steering for clients without proxy settings,
+  the container image, the CA, the flow log
 - [Reference](https://roxy-proxy.github.io/roxy-proxy/reference/configuration): configuration, the rule
   language, HTTP, upstream, TLS, limits, architecture, development
 

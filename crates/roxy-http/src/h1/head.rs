@@ -26,6 +26,14 @@ pub enum Role {
         /// `https` after TLS termination, `http` for plaintext tunnels.
         scheme: Scheme,
     },
+    /// A plaintext connection the client addressed to the origin itself (a
+    /// `direct` listener): origin-form only,
+    /// `Host` names the authority, and its port must be `port`, the port the
+    /// client connected to.
+    Direct {
+        /// The listener's `target_port`.
+        port: u16,
+    },
 }
 
 /// How the request body is framed on the wire.
@@ -404,7 +412,10 @@ pub fn parse_head(
     // Request target vs role.
     if method == Method::Connect {
         if *role != Role::ProxyPort {
-            return reject(Reason::TargetFormMismatch, "CONNECT inside a tunnel");
+            return reject(
+                Reason::TargetFormMismatch,
+                "CONNECT is only accepted on the proxy port",
+            );
         }
         if target.starts_with(b"/") || target.contains(&b'/') {
             return reject(
@@ -468,6 +479,27 @@ pub fn parse_head(
                 Reason::TargetFormMismatch,
                 "only origin-form is accepted inside a tunnel",
             );
+        }
+        (Role::Direct { .. }, false) => {
+            return reject(
+                Reason::TargetFormMismatch,
+                "only origin-form is accepted on a direct listener",
+            );
+        }
+        (Role::Direct { port }, true) => {
+            let Some(h) = host else {
+                return reject(Reason::MissingHost, "no host field");
+            };
+            let authority = url::parse_authority(h, Scheme::Http.default_port())?;
+            if authority.port != *port {
+                return reject(
+                    Reason::HostMismatch,
+                    "host port does not match the listener's port",
+                );
+            }
+            let (path, query) = url::parse_origin_form(target)?;
+            meta.target_form = TargetForm::Origin;
+            (Scheme::Http, authority, path, query)
         }
         (Role::Tunnel { authority, scheme }, true) => {
             let Some(h) = host else {

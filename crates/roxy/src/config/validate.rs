@@ -31,6 +31,7 @@ impl Config {
         }
 
         self.validate_listeners(&mut d);
+        self.validate_dns(&mut d);
         self.validate_tls(&mut d);
         self.validate_secrets(&mut d);
         self.validate_address_lists(&mut d);
@@ -100,26 +101,7 @@ impl Config {
                     format!("bind address {} is already used by {first}", l.bind),
                 ));
             }
-            match l.mode {
-                ListenerMode::Explicit => {
-                    if l.allow_passthrough.is_some() {
-                        d.push(Diagnostic::new(
-                            format!("{path}.allow_passthrough"),
-                            "only valid on transparent listeners",
-                        ));
-                    }
-                    if l.upstream_target.is_some() {
-                        d.push(Diagnostic::new(
-                            format!("{path}.upstream_target"),
-                            "only valid on transparent listeners",
-                        ));
-                    }
-                }
-                ListenerMode::Transparent => d.push(Diagnostic::new(
-                    format!("{path}.mode"),
-                    "transparent mode is deferred and not yet supported (issue #15); use `explicit`",
-                )),
-            }
+            validate_listener_mode(l, &path, d);
         }
         if let Some(ca) = &self.ca_server
             && ca.bind.port() != 0
@@ -129,6 +111,31 @@ impl Config {
                 "ca_server.bind",
                 format!("bind address {} is already used by {first}", ca.bind),
             ));
+        }
+        // The DNS listener's TCP side shares the TCP port space.
+        if let Some(dns) = &self.dns
+            && dns.bind.port() != 0
+            && let Some(first) = binds.get(&dns.bind)
+        {
+            d.push(Diagnostic::new(
+                "dns.bind",
+                format!("bind address {} is already used by {first}", dns.bind),
+            ));
+        }
+    }
+
+    fn validate_dns(&self, d: &mut Vec<Diagnostic>) {
+        let Some(dns) = &self.dns else {
+            return;
+        };
+        if dns.answer.ipv4.is_none() && dns.answer.ipv6.is_none() {
+            d.push(Diagnostic::new(
+                "dns.answer",
+                "set ipv4, ipv6 or both: roxy's address as the clients reach it",
+            ));
+        }
+        if dns.ttl.as_secs() > u64::from(u32::MAX) {
+            d.push(Diagnostic::new("dns.ttl", "must fit in 32 bits of seconds"));
         }
     }
 
@@ -565,4 +572,49 @@ pub(crate) fn secret_refs(v: &str) -> Vec<&str> {
         rest = &after[end + 1..];
     }
     out
+}
+
+/// The checks that depend on a listener's mode.
+fn validate_listener_mode(l: &super::Listener, path: &str, d: &mut Vec<Diagnostic>) {
+    if l.mode != ListenerMode::Direct && l.target_port.is_some() {
+        d.push(Diagnostic::new(
+            format!("{path}.target_port"),
+            "only valid on direct listeners",
+        ));
+    }
+    if l.mode != ListenerMode::Transparent {
+        for (field, set) in [
+            ("allow_passthrough", l.allow_passthrough.is_some()),
+            ("upstream_target", l.upstream_target.is_some()),
+        ] {
+            if set {
+                d.push(Diagnostic::new(
+                    format!("{path}.{field}"),
+                    "only valid on transparent listeners",
+                ));
+            }
+        }
+    }
+    match l.mode {
+        ListenerMode::Explicit => {}
+        ListenerMode::Direct => {
+            if l.auth.is_some() {
+                d.push(Diagnostic::new(
+                    format!("{path}.auth"),
+                    "not valid on direct listeners: their clients do not know they \
+                     are talking to a proxy, so they send no Proxy-Authorization",
+                ));
+            }
+            if l.target_port == Some(0) {
+                d.push(Diagnostic::new(
+                    format!("{path}.target_port"),
+                    "must not be 0",
+                ));
+            }
+        }
+        ListenerMode::Transparent => d.push(Diagnostic::new(
+            format!("{path}.mode"),
+            "transparent mode is deferred and not yet supported (issue #15); use `explicit` or `direct`",
+        )),
+    }
 }

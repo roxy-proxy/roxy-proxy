@@ -46,6 +46,7 @@ produces a `request` event:
 | `log` | a rule's `log` action |
 | `layer_error`, `layer_record`, `endpoint_call`, `observer_lagged` | [addons](/addons/overview) |
 | `connect` | a CONNECT, when `log.flow.connection_events` is on or it was refused |
+| `dns_query` | a query the [DNS listener](/deploy/dns-steering) answered, when `log.flow.dns_events` is on: `transport`, `client`, `name`, `qtype`, `rcode` and the `answers` |
 | `connection_refused` | a connection cap was hit ([limits](/reference/limits#connections)) |
 | `config_loaded`, `config_reloaded`, `config_reload_failed` | startup and [reload](/operate/operations#reload) |
 
@@ -87,6 +88,7 @@ log:
   flow:
     path: /var/log/roxy/flow.jsonl  # absent = stdout
     connection_events: false
+    dns_events: false               # log every DNS listener answer
     ws_message_every: 0             # also log every Nth WebSocket message; 0 = denied only
     high_water: 8mb                 # at least 64kb
     max_file_bytes: 100mb           # absent = never rotate

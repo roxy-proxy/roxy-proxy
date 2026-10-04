@@ -5,7 +5,7 @@ description: "roxy is a strict, programmable HTTP firewall and egress proxy for 
 
 # Overview
 
-roxy is an HTTP firewall and egress proxy for workloads you don't fully trust. Clients use it as an explicit `HTTP_PROXY`. It decides what each request may reach, holds the credentials the workload needs so the workload never sees them, and logs every decision as a line of JSON.
+roxy is an HTTP firewall and egress proxy for workloads you don't fully trust. Clients use it as an explicit `HTTP_PROXY`, or reach it through its own DNS if they ignore proxy settings ([DNS steering](/deploy/dns-steering)). It decides what each request may reach, holds the credentials the workload needs so the workload never sees them, and logs every decision as a line of JSON.
 
 It is strict by design. roxy terminates TLS with certificates from its own CA, parses each request into one canonical form, and sends that form upstream. Ambiguous input is rejected, not guessed at. Request smuggling and header injection don't reach the upstream, and what the rules matched is exactly what is forwarded.
 
@@ -62,7 +62,7 @@ The full language is in [rules](/reference/rule-language).
 
 ## What roxy is not
 
-roxy is an explicit proxy, not a transparent gateway. It decides what passes through it, and it can't stop traffic that never reaches it. To contain a workload, the network has to give it no route out except through roxy. The [quickstart](/quickstart) does this with Docker networks, and [deployment](/deploy/overview) gives the recipe for other setups.
+roxy is not a transparent gateway. It decides what passes through it, and it can't stop traffic that never reaches it. To contain a workload, the network has to give it no route out except through roxy. The [quickstart](/quickstart) does this with Docker networks, and [deployment](/deploy/overview) gives the recipe for other setups.
 
 roxy speaks HTTP/1.1, HTTP/2 and WebSockets to clients. Raw TCP doesn't pass. The [principles](/principles) page sets out the threat model: what roxy prevents and what it doesn't try to prevent.
 

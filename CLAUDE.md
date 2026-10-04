@@ -18,7 +18,11 @@ Notes for agents (and people) working in this repository.
    "done when" list is met, CI is green, and the description says what
    changed and anything moved, dropped or left for later. Then switch the PR
    from draft to ready.
-4. **Follow-up work gets an issue.** If you find something out of scope, open
+4. **Stay with it once it is queued.** The repo merges through a merge
+   queue. A maintainer turns on "merge when ready" when they are happy with
+   the PR; don't turn it on yourself. From then until it merges, fix any CI
+   failure that appears, on the PR or in the queue, and push the fix.
+5. **Follow-up work gets an issue.** If you find something out of scope, open
    an issue for it (or note it on an existing one) instead of widening the PR.
 
 One issue, one branch, one PR. If an issue turns out too big for one PR, say
@@ -46,8 +50,9 @@ the PR (`fuzz/README.md`).
 - Rust workspace, stable toolchain, edition 2024. `unsafe` is forbidden and
   clippy runs at `pedantic`.
 - Crates live in `crates/`: `roxy` (the binary), `roxy-http`, `roxy-proxy`,
-  `roxy-rules`, `roxy-tls`, `roxy-log`, `roxy-wasm` (the addon host) and
-  `roxy-addon` (the addon SDK).
+  `roxy-rules`, `roxy-tls`, `roxy-dns` (the DNS listener's codec),
+  `roxy-log`, `roxy-wasm` (the addon host) and `roxy-addon` (the addon
+  SDK).
 - roxy is a security boundary. The design principles (fail closed, deny
   always wins, canonical re-serialisation, ...) are not negotiable for
   convenience: if a change weakens one, raise it on the issue first.

@@ -25,7 +25,21 @@ pub struct ListenerSpec {
     pub name: String,
     pub bind: SocketAddr,
     /// Require `Proxy-Authorization` (users: [`PolicyUpdate::users`]).
+    /// Explicit listeners only.
     pub auth_required: bool,
+    pub kind: ListenerKind,
+}
+
+/// What a listener serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerKind {
+    /// The explicit proxy.
+    Explicit,
+    /// Connections addressed to the origin.
+    Direct {
+        /// The port clients connect to; `None` = the bound port.
+        target_port: Option<u16>,
+    },
 }
 
 /// Fixed server configuration.
@@ -33,6 +47,8 @@ pub struct RuntimeConfig {
     pub listeners: Vec<ListenerSpec>,
     /// Plain-HTTP CA download + health endpoint.
     pub ca_server: Option<SocketAddr>,
+    /// The DNS listener (`dns:`).
+    pub dns: Option<crate::dns_server::DnsServerSpec>,
     pub ca: Arc<Ca>,
     pub minter: Arc<LeafMinter>,
     /// `tls.require_sni_match`.

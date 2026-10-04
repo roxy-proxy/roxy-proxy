@@ -55,7 +55,7 @@ stops roxy rather than failing every handshake later.
 
 ## CA distribution
 
-The CA certificate, never the key, is available three ways. For a
+The CA certificate, never the key, is available four ways. For a
 provided CA this is the signing CA alone, without intermediates. Clients
 that already trust your organisation's root need nothing from roxy.
 
@@ -63,7 +63,10 @@ that already trust your organisation's root need nothing from roxy.
 roxy ca export --config roxy.yaml > roxy-ca.pem                   # at image build time (--der for DER)
 curl -s http://<ca_server.bind>/roxy-ca.pem > roxy-ca.pem         # from the CA server
 curl -s -x http://<proxy> http://roxy.internal/roxy-ca.pem        # through the proxy itself
+curl -s http://roxy.internal/roxy-ca.pem                          # with roxy as the DNS server
 ```
+
+The last needs a [direct listener](/reference/http#direct-listeners) on port 80.
 
 The `ca_server` listener is separate from the proxy port so it can be
 firewalled differently. It also serves `/healthz` for container health

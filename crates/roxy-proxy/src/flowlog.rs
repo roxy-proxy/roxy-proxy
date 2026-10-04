@@ -301,6 +301,22 @@ pub enum FlowEvent {
         level: String,
         message: String,
     },
+    /// A query the DNS listener answered, when `log.flow.dns_events` is on.
+    DnsQuery {
+        #[serde(serialize_with = "ser_ts")]
+        ts: DateTime<Utc>,
+        /// `udp` or `tcp`.
+        transport: &'static str,
+        client: ClientInfo,
+        /// The name asked for; absent when the query could not be read.
+        name: Option<String>,
+        /// `A`, `AAAA`, or the type number.
+        qtype: Option<String>,
+        /// `noerror`, `formerr`, `notimp` or `refused`.
+        rcode: &'static str,
+        /// The addresses in the answer.
+        answers: Vec<IpAddr>,
+    },
     /// Bytes relayed uninspected (transparent mode only; deferred).
     Passthrough {
         #[serde(serialize_with = "ser_ts")]
