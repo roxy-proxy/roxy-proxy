@@ -171,8 +171,11 @@ async fn attempt_all(
         *r.method_mut() = parts.method.clone();
         *r.uri_mut() = uri.clone();
         *r.headers_mut() = headers.clone();
-        let sent =
-            tokio::time::timeout(spec.timeout, upstream.client(spec.private_ok).request(r)).await;
+        let sent = tokio::time::timeout(
+            spec.timeout,
+            upstream.client(spec.private_ok, false).request(r),
+        )
+        .await;
         let err = match sent {
             Ok(Ok(res)) => {
                 let retryable = matches!(res.status().as_u16(), 502..=504);
