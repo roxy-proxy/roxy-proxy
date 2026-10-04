@@ -424,6 +424,40 @@ mod tests {
     }
 
     #[test]
+    fn provided_sub_ca_chains_to_root() {
+        use crate::ca::tests::{ca_named, make_ca, write_provided};
+        let dir = tempfile::tempdir().unwrap();
+        let (root_pem, root_key) = make_ca(&ca_named("Org Root"), None);
+        let root = rcgen::Issuer::from_ca_cert_pem(&root_pem, root_key).unwrap();
+        let (mid_pem, mid_key) = make_ca(&ca_named("Org Mid"), Some(&root));
+        let mid = rcgen::Issuer::from_ca_cert_pem(&mid_pem, mid_key).unwrap();
+        let (sub_pem, sub_key) = make_ca(&ca_named("roxy sub-CA"), Some(&mid));
+        let root_file = dir.path().join("root.pem");
+        std::fs::write(&root_file, &root_pem).unwrap();
+        let client = || {
+            client_config(&UpstreamTlsOptions {
+                extra_roots_pem: vec![root_file.clone()],
+                min_version: MinTlsVersion::Tls12,
+            })
+            .unwrap()
+        };
+        let handshake_with = |bundle: &str| {
+            let (cert, key) = write_provided(dir.path(), bundle, &sub_key);
+            let ca = Arc::new(Ca::load_provided(&cert, &key).unwrap());
+            let m = Arc::new(LeafMinter::new(ca, 4).unwrap());
+            let mut c = ClientConnection::new(client(), name("example.com")).unwrap();
+            let mut s =
+                ServerConnection::new(server_config_for(m, name("example.com"), true)).unwrap();
+            handshake(&mut c, &mut s).map(|()| c.peer_certificates().unwrap().len())
+        };
+
+        // A client trusting only the root builds the chain from what roxy sends.
+        assert_eq!(handshake_with(&(sub_pem.clone() + &mid_pem)).unwrap(), 3);
+        // Without the intermediate it cannot.
+        assert!(handshake_with(&sub_pem).is_err());
+    }
+
+    #[test]
     fn host_parsing() {
         assert!(matches!(
             server_name_for_host("Example.COM").unwrap(),

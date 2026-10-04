@@ -112,7 +112,7 @@ impl LeafMinter {
 
     /// Get (minting if needed) the certified key for `name`.
     ///
-    /// The chain is `[leaf, CA]`. Names are validated and canonicalised
+    /// The chain is `[leaf, CA, intermediates...]`. Names are validated and canonicalised
     /// (lower-cased); invalid names, names over 253 bytes and wildcards are
     /// rejected. This blocks for ~1 ms on a cache miss; see the module docs.
     pub fn certified_key(&self, name: &ServerName<'_>) -> Result<Arc<CertifiedKey>, LeafError> {
@@ -168,8 +168,11 @@ impl LeafMinter {
         params.not_after = now + LEAF_VALIDITY;
         let not_after = params.not_after;
         let cert = params.signed_by(&self.leaf_key, self.ca.issuer())?;
-        let chain: Vec<CertificateDer<'static>> =
-            vec![cert.der().clone(), self.ca.certificate().clone()];
+        let chain: Vec<CertificateDer<'static>> = [cert.der(), self.ca.certificate()]
+            .into_iter()
+            .chain(self.ca.chain())
+            .cloned()
+            .collect();
         Ok((
             CertifiedKey::new(chain, Arc::clone(&self.signing_key)),
             not_after,
