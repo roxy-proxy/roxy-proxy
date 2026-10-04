@@ -1,4 +1,4 @@
-//! End-to-end tests of the addon layer stack (docs/addons.md): `roxy run`
+//! End-to-end tests of the addon layer stack: `roxy run`
 //! with roxy-wasm's test layer (`crates/roxy-wasm/test-components`) in
 //! front of the rules.
 

@@ -106,7 +106,7 @@ enum CaCommand {
 
 #[derive(Debug, Subcommand)]
 enum RuleCommand {
-    /// Dry-run a request against the rules (docs/rules.md#dry-run). Prints matched
+    /// Dry-run a request against the rules. Prints matched
     /// rules, effects and the decision; exits 0 for allow, 3 for deny.
     /// Secrets are not resolved (`[secret:name]` placeholders).
     Test(Box<RuleTestArgs>),

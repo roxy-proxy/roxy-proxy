@@ -1,4 +1,4 @@
-# Chunked body decoding (docs/http.md#body).
+# Chunked body decoding.
 
 === chunked_ok
 expect: request POST http://example.com:80/ body=hello\sworld

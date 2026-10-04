@@ -43,8 +43,8 @@ pub(crate) enum Inspected {
 }
 
 impl Inspected {
-    /// A buffered body, decoded by its `content-encoding` for the rules
-    /// (docs/rules.md#body-access). The decoded text may be at most `cap`
+    /// A buffered body, decoded by its `content-encoding` for the rules.
+    /// The decoded text may be at most `cap`
     /// bytes, like the body as sent.
     pub(crate) fn decode(headers: &Headers, body: &[u8], cap: u64) -> Self {
         let codings = match coding::content_codings(headers) {
@@ -104,7 +104,7 @@ pub(crate) struct ResponseFacts {
     pub body: Inspected,
 }
 
-/// The WebSocket message being checked (docs/websockets.md#message-rules).
+/// The WebSocket message being checked.
 #[derive(Debug, Clone)]
 pub(crate) struct WsFacts {
     /// `c2s` or `s2c`.

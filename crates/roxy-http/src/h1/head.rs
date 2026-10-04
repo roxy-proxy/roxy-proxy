@@ -1,5 +1,5 @@
 //! Request-head parsing: raw pre-checks, `httparse` tokenisation, and the
-//! docs/http.md#rejection-rules semantic validation. Pure functions over bytes (fuzz target).
+//! semantic validation of the rejection rules. Pure functions over bytes (fuzz target).
 
 use http::HeaderValue;
 
@@ -27,7 +27,7 @@ pub enum Role {
         scheme: Scheme,
     },
     /// A plaintext connection the client addressed to the origin itself (a
-    /// `direct` listener, docs/http.md#direct-listeners): origin-form only,
+    /// `direct` listener): origin-form only,
     /// `Host` names the authority, and its port must be `port`, the port the
     /// client connected to.
     Direct {
@@ -261,7 +261,7 @@ fn parse_content_length(v: &[u8]) -> Result<u64, ParseError> {
 }
 
 /// Parses and validates a complete head (as delimited by [`scan_head`]).
-#[allow(clippy::too_many_lines)] // one linear pass over docs/http.md#rejection-rules; splitting obscures the order of checks
+#[allow(clippy::too_many_lines)] // one linear pass over the rejection rules; splitting obscures the order of checks
 pub fn parse_head(
     head: &[u8],
     role: &Role,
@@ -328,7 +328,7 @@ pub fn parse_head(
     let upgrades = all("upgrade");
     let proxy_auth = all("proxy-authorization");
 
-    // Framing (docs/http.md#rejection-rules Content-Length / Transfer-Encoding).
+    // Framing: Content-Length / Transfer-Encoding.
     if !cls.is_empty() && !tes.is_empty() {
         return reject(Reason::ClAndTe, "both content-length and transfer-encoding");
     }

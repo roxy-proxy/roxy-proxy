@@ -29,7 +29,7 @@ produces a `request` event:
   `response_head`, `response_body`, `websocket`.
 - When an addon changed the request, `rules`, `decision` and
   `terminal_rule` describe the request that left, and `req` still describes
-  what the client sent ([addons](addons.md#in-the-proxy)).
+  what the client sent ([addons](/addons/overview#in-the-proxy)).
 
 ### Events
 
@@ -38,17 +38,17 @@ produces a `request` event:
 | `request` | every exchange |
 | `response_error` | the response failed after the request was allowed (for example, a body limit mid-stream) |
 | `parse_error` | the client sent something roxy refused to parse; `reason` is a stable code |
-| `upstream_error`, `upstream_denied` | [upstream](upstream.md#errors) failures and address-floor hits |
+| `upstream_error`, `upstream_denied` | [upstream](/reference/upstream#errors) failures and address-floor hits |
 | `policy_input_unavailable`, `metric_table_full` | a flow failed closed for want of an input |
-| `upgrade_stripped` | an upgrade was not allowed, so the request went upstream as plain HTTP ([WebSockets](websockets.md)) |
+| `upgrade_stripped` | an upgrade was not allowed, so the request went upstream as plain HTTP ([WebSockets](/policies/websockets)) |
 | `ws_open`, `ws_close` | a relayed WebSocket, with byte counts; `ws_close` has `close_code` and `close_reason` when roxy ended it |
-| `ws_message` | a WebSocket message a rule denied, or one sampled by `log.flow.ws_message_every` ([WebSockets](websockets.md#message-rules)) |
+| `ws_message` | a WebSocket message a rule denied, or one sampled by `log.flow.ws_message_every` ([WebSockets](/policies/websockets#message-rules)) |
 | `log` | a rule's `log` action |
-| `layer_error`, `layer_record`, `endpoint_call`, `observer_lagged` | [addons](addons.md) |
+| `layer_error`, `layer_record`, `endpoint_call`, `observer_lagged` | [addons](/addons/overview) |
 | `connect` | a CONNECT, when `log.flow.connection_events` is on or it was refused |
-| `dns_query` | a query the [DNS listener](dns.md) answered, when `log.flow.dns_events` is on: `transport`, `client`, `name`, `qtype`, `rcode` and the `answers` |
-| `connection_refused` | a connection cap was hit ([limits](limits.md#connections)) |
-| `config_loaded`, `config_reloaded`, `config_reload_failed` | startup and [reload](rules.md#reload) |
+| `dns_query` | a query the [DNS listener](/deploy/dns-steering) answered, when `log.flow.dns_events` is on: `transport`, `client`, `name`, `qtype`, `rcode` and the `answers` |
+| `connection_refused` | a connection cap was hit ([limits](/reference/limits#connections)) |
+| `config_loaded`, `config_reloaded`, `config_reload_failed` | startup and [reload](/operate/operations#reload) |
 
 ### Redaction
 

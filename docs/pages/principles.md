@@ -35,7 +35,7 @@ itself), compromise of an upstream the rules already allow, or compromise of
 the host running roxy.
 
 Containment comes from the network: the workload must have no route out
-except through roxy ([deployment](deployment.md#containing-a-workload)).
+except through roxy ([deployment](/deploy/overview)).
 roxy decides what passes through it; it cannot stop traffic that never
 reaches it.
 
@@ -47,7 +47,7 @@ failed reload keeps the running policy. An addon that fails denies the flow.
 A policy input that is unavailable (a full metric table, a list that failed
 to load, a missing secret, a body too large to inspect) denies the flow
 rather than making a predicate false. Nothing in roxy turns "could not
-check" into "allowed". [Resource limits](limits.md) lists every case.
+check" into "allowed". [Resource limits](/reference/limits) lists every case.
 
 ## Canonical re-serialisation
 
@@ -58,12 +58,12 @@ byte-for-byte. Ambiguous input (both `Content-Length` and
 climb above the root, ...) is rejected rather than resolved. What the rules
 match is exactly what is forwarded. This removes request smuggling,
 header injection and path confusion as classes of attack
-([HTTP](http.md)).
+([HTTP](/reference/http)).
 
 After a WebSocket upgrade the connection carries only that WebSocket, so
 there is no later request to smuggle into. roxy splices its bytes unless a
 rule reads messages; then every message is decoded strictly and re-encoded
-in one form ([WebSockets](websockets.md#message-rules)).
+in one form ([WebSockets](/policies/websockets#message-rules)).
 
 ## Deny always wins
 
@@ -72,7 +72,7 @@ deny wins over any matching allow, wherever it sits in the list, and
 nothing can override a deny at any later point in an exchange. Rule order
 orders effects, never decisions. So adding a deny can only narrow what
 passes, and a reviewer can read each deny on its own
-([rules](rules.md#evaluation)).
+([rules](/policies/overview)).
 
 ## Never evict
 
@@ -80,14 +80,14 @@ Bounded tables (metric series, rule state, addon state) never evict to make
 room. A flow that needs a new entry in a full table is denied instead.
 Eviction would let a client reset its own counter by churning keys, so a
 limit could be escaped by exceeding another one
-([rules](rules.md#metrics)).
+([rules](/policies/rate-limits#metrics)).
 
 ## Audit backpressure
 
 The flow log and traffic capture are an audit trail, and they never drop a
 record. When a log falls behind or its disk fails, roxy holds traffic back
 until it catches up: the wait propagates to the network, slowing clients
-rather than losing records ([flow log](flow-log.md#writing)).
+rather than losing records ([flow log](/operate/flow-log#writing)).
 
 ## The rules judge everything that leaves
 
@@ -96,7 +96,7 @@ above the rules and can reshape traffic freely, but what they pass on is
 re-validated as strictly as a client request and then judged by the rules as
 if the client had sent it. Nothing configurable runs between the rules and
 the network, and the address floor checks the IP actually dialled
-([addons](addons.md#layer-stack)).
+([addons](/addons/overview)).
 
 ## Streams, not messages
 

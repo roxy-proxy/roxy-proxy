@@ -1,7 +1,7 @@
 # Example roxy addons
 
 Addons are layers that sit above roxy's rules in each exchange
-([docs/addons.md](../../docs/addons.md)). Whatever an addon passes on is still judged by the rules,
+([addons](https://roxy-proxy.github.io/roxy-proxy/addons/overview)). Whatever an addon passes on is still judged by the rules,
 and any failure denies the flow.
 
 | example | kind | what it shows |

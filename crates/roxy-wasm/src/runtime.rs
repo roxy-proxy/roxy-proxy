@@ -2,7 +2,7 @@
 //! driver.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -98,7 +98,7 @@ impl WasmRuntime {
         >(&mut linker, &options.into(), StoreState::http)
         .map_err(|e| e.to_string())?;
         // Every roxy:addon import is linked whatever the grants; a call
-        // without its capability traps (docs/addons.md#host-services).
+        // without its capability traps.
         chain::add_to_linker::<_, Me>(&mut linker, |s| s).map_err(|e| e.to_string())?;
         endpoints::add_to_linker::<_, Me>(&mut linker, |s| s).map_err(|e| e.to_string())?;
         flow::add_to_linker::<_, Me>(&mut linker, |s| s).map_err(|e| e.to_string())?;
@@ -123,6 +123,14 @@ struct LayerInner {
     tunnel: Option<tunnel::GuestIndices>,
     idle: Mutex<Vec<Instance>>,
     slots: Arc<Semaphore>,
+}
+
+impl LayerInner {
+    /// The idle instances. Only `Vec` push and pop happen under the lock,
+    /// so a poisoned lock still holds a consistent pool.
+    fn idle(&self) -> MutexGuard<'_, Vec<Instance>> {
+        self.idle.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// A compiled layer with its instance pool. Cheap to clone; clones share
@@ -263,7 +271,7 @@ impl Layer {
                 layer: layer.name().to_owned(),
                 source,
             })?;
-        layer.inner.idle.lock().expect("pool lock").push(first);
+        layer.inner.idle().push(first);
         Ok(layer)
     }
 
@@ -279,7 +287,7 @@ impl Layer {
 
     /// Instances currently idle in the pool.
     pub fn idle_instances(&self) -> usize {
-        self.inner.idle.lock().expect("pool lock").len()
+        self.inner.idle().len()
     }
 
     async fn instantiate(&self, deadline: Instant) -> Result<Instance, LayerError> {
@@ -342,7 +350,7 @@ impl Layer {
             .await
             .map_err(|_| LayerError::BudgetExceeded(Budget::ExchangeTime))?
             .map_err(|_| LayerError::Cancelled)?;
-        let idle = self.inner.idle.lock().expect("pool lock").pop();
+        let idle = self.inner.idle().pop();
         let instance = match idle {
             Some(i) => i,
             None => self.instantiate(deadline).await?,
@@ -368,7 +376,7 @@ impl Layer {
             );
             return;
         }
-        self.inner.idle.lock().expect("pool lock").push(instance);
+        self.inner.idle().push(instance);
     }
 
     /// Runs one exchange through the layer.
@@ -379,7 +387,7 @@ impl Layer {
     /// head (trap, budget, host failure), the body ends with
     /// [`roxy_http::BodyError::Stopped`] and the [`crate::LayerOutcome`]
     /// in the response's extensions reports why. Any `Err` here must be
-    /// turned into a deny (docs/addons.md#invariants, invariant 3).
+    /// turned into a deny (invariant 3).
     ///
     /// Dropping the future, or the response body before it ends, cancels
     /// the exchange and discards the instance.

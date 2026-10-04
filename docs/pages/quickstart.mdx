@@ -1,0 +1,149 @@
+---
+title: "Quickstart"
+description: "Run roxy with Docker Compose in front of a client that has no other route out."
+---
+
+# Quickstart
+
+Run roxy in front of a client container whose only way to the internet is through roxy. By the end you have a running proxy that allows one host, denies everything else, stops an oversized upload mid-stream and logs each decision. The setup is [`examples/compose`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/compose) in the roxy repo.
+
+## Prerequisites
+
+- Docker with Docker Compose
+- Git
+
+::::steps
+### Clone the repo
+
+```sh
+git clone https://github.com/roxy-proxy/roxy-proxy.git
+cd roxy-proxy/examples/compose
+```
+
+### Start roxy and the client
+
+```sh
+docker compose up -d --wait
+```
+
+This pulls `ghcr.io/roxy-proxy/roxy:edge` and starts two containers:
+
+- **roxy**: the proxy, listening on port 3128. It generates its CA on first start and serves the certificate on port 3130.
+- **agent**: a curl container that fetches roxy's CA, trusts it, and has `HTTPS_PROXY` pointed at roxy.
+
+To build roxy from your checkout instead, add `--build`.
+
+### Run the demo
+
+```sh
+./demo.sh
+```
+
+`demo.sh` runs these requests from inside the client:
+
+| from the client | result |
+|---|---|
+| `curl https://example.com/` | `200`: rule `example-reads` allows it |
+| `curl https://www.wikipedia.org/` | `403` from roxy: no rule allows it (`_default`) |
+| `curl https://example.com/admin/` | `403` from roxy: rule `no-admin-paths` denies it, whatever allows the host |
+| a 2 MB `POST` to `postman-echo.com` | `413`: the watching rule `upload-cap` stops it mid-upload |
+| `curl --noproxy '*' https://example.com/` | fails: the name does not even resolve |
+| `curl --noproxy '*' https://1.1.1.1/` | fails: no route |
+
+### Read the flow log
+
+```sh
+docker compose logs roxy
+```
+
+Each exchange is one JSON line. The deny for `/admin/` names the rule that decided it:
+
+```json
+{"event":"request","req":{"method":"GET","host":"example.com","port":443,"path":"/admin/"},
+ "decision":"deny","terminal_rule":"no-admin-paths","stage":"head"}
+```
+
+The full event has more fields: client, TLS, timing, tags and the rules that matched. See [flow log](/operate/flow-log).
+
+### Clean up
+
+```sh
+docker compose down -v
+```
+
+::::
+
+## What just happened
+
+### The network does the containment
+
+roxy is an explicit proxy. The client's `HTTPS_PROXY` only tells well-behaved tools where roxy is. The containment is in the Compose networks:
+
+```yaml
+services:
+  roxy:
+    networks: [sandbox, egress]
+  agent:
+    networks: [sandbox]              # no route out except through roxy
+
+networks:
+  sandbox:
+    internal: true                   # no route out: the containment
+  egress: {}
+```
+
+The client sits only on `sandbox`, an `internal: true` network with no route out and no outside DNS. roxy is the only container on both `sandbox` and `egress`. A client that ignores the proxy variables, or a library that opens its own sockets, gets nowhere. That's why the last two rows of the table fail.
+
+### The policy
+
+The policy is [`roxy.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/compose/roxy.yaml):
+
+```yaml
+version: 1
+
+listeners:
+  - name: proxy
+    bind: 0.0.0.0:3128
+
+ca_server:
+  bind: 0.0.0.0:3130          # /roxy-ca.pem (the agent fetches it) and /healthz
+
+tls:
+  ca_dir: /var/lib/roxy/ca
+
+# Anything no rule allows is denied. A matching deny always beats an allow.
+default: deny
+
+rules:
+  - id: example-reads
+    when: host == "example.com" and method in [GET, HEAD]
+    then: allow
+
+  - id: echo-service
+    when: host == "postman-echo.com" and path starts_with "/"
+    then: allow
+
+  # A watching rule: it reads body.bytes, so it checks the upload as it
+  # streams and stops it at the chunk that crosses 1 MiB.
+  - id: upload-cap
+    when: body.bytes > 1mb
+    then: { deny: { status: 413, message: "upload too large" } }
+
+  - id: no-admin-paths
+    when: path starts_with "/admin"
+    then: deny
+```
+
+Rule order doesn't change the decision. Any matching deny wins, then any matching allow, then the default. So `no-admin-paths` denies `example.com/admin/` even though `example-reads` allows the host.
+
+Most rules read only the request head and are decided before anything is forwarded. `upload-cap` reads `body.bytes`, which is only known as the body streams. roxy keeps checking it and stops the upload at the chunk that crosses the limit. See [evaluation](/policies/overview#evaluation).
+
+### TLS
+
+roxy terminates TLS for every `CONNECT` with a leaf certificate from its own CA. The client fetches the CA from `http://roxy:3130/roxy-ca.pem` at startup and trusts it through `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS`. The CA lives in the `roxy-ca` volume, so it survives restarts. See [TLS and the CA](/operate/ca-certificates).
+
+## Next steps
+
+- **Contain your own workload.** Replace the `agent` service with it, keeping `networks: [sandbox]` and its environment, then edit `roxy.yaml`.
+- **Reload the policy.** `docker compose kill -s HUP roxy` reloads it. A bad policy is rejected and the running one stays. Listener, TLS and capture settings need `docker compose restart roxy`.
+- **Run it elsewhere.** [Deployment](/deploy/overview) has the same recipe outside Compose.

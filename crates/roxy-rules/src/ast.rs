@@ -113,7 +113,7 @@ pub enum Lit {
     Ip(IpAddr),
     Cidr(IpNet),
     /// `@name`: a named address list, only valid after `in` / `not in`
-    /// with an ip operand (docs/upstream.md#address-lists).
+    /// with an ip operand.
     AddressList(String),
     /// Bare uppercase identifier: an HTTP method.
     Method(String),

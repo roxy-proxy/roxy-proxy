@@ -48,13 +48,13 @@ impl fmt::Debug for EvalContext<'_> {
 }
 
 /// Options of an `allow` decision.
-/// Only the first matching allow rule's options apply (docs/rules.md#evaluation); the implicit
+/// Only the first matching allow rule's options apply; the implicit
 /// allow of `default: allow` grants none.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AllowOpts {
     /// `allow: { upgrade: websocket }`: honour a WebSocket Upgrade.
     pub upgrade_websocket: bool,
-    /// `private_ok: true`: permit private upstream addresses (docs/upstream.md#address-floor).
+    /// `private_ok: true`: permit private upstream addresses.
     pub private_ok: bool,
 }
 
@@ -63,7 +63,7 @@ pub struct AllowOpts {
 pub enum Decision {
     Allow(AllowOpts),
     /// `close`: after writing the deny response the proxy closes the client
-    /// connection (h1 `connection: close`, h2 `GOAWAY`; docs/rules.md#evaluation). Defaults to
+    /// connection (h1 `connection: close`, h2 `GOAWAY`). Defaults to
     /// `true`; `deny: { close: false }` opts out per rule. A deny that stops
     /// an exchange whose response is already streaming always closes the
     /// connection (h1) or resets the stream (h2).
@@ -77,7 +77,7 @@ pub enum Decision {
     Passthrough,
 }
 
-/// Default deny status and message (docs/http.md#deny-responses, docs/rules.md#evaluation).
+/// Default deny status and message.
 pub const DEFAULT_DENY_STATUS: u16 = 403;
 pub const DEFAULT_DENY_MESSAGE: &str = "blocked by roxy";
 
@@ -109,7 +109,7 @@ impl Decision {
     }
 }
 
-/// Status and message when a policy input is unavailable (docs/rules.md#evaluation).
+/// Status and message when a policy input is unavailable.
 pub const FAIL_CLOSED_STATUS: u16 = 503;
 pub const FAIL_CLOSED_MESSAGE: &str = "policy input unavailable";
 
@@ -128,21 +128,20 @@ pub enum FailClosedReason {
     /// non-ASCII characters).
     SecretInvalid(String),
     /// A body predicate was reached but the body exceeds
-    /// `limits.max_inspect_body_bytes` (docs/rules.md#body-access). Carries the field name.
+    /// `limits.max_inspect_body_bytes`. Carries the field name.
     BodyTooLargeToInspect(String),
     /// A body predicate was reached but the body was not buffered or could
     /// not be read. Carries the field name.
     BodyUnavailable(String),
     /// A body predicate was reached but the body's `content-encoding` names
-    /// a coding that cannot be decoded (docs/rules.md#body-access).
+    /// a coding that cannot be decoded.
     UnsupportedContentEncoding {
         /// The field name.
         field: String,
         /// The coding.
         coding: String,
     },
-    /// A body predicate was reached but the body could not be decoded
-    /// (docs/rules.md#body-access).
+    /// A body predicate was reached but the body could not be decoded.
     BodyDecodeFailed {
         /// The field name.
         field: String,
@@ -150,7 +149,7 @@ pub enum FailClosedReason {
         detail: String,
     },
     /// An operator other than `==` / `!=` / `in` / `not in` was applied to a
-    /// missing (`null`) value, which has no answer (docs/rules.md#missing-values-null). Carries the field
+    /// missing (`null`) value, which has no answer. Carries the field
     /// as written, e.g. `body.size`.
     MissingValue(String),
     /// A watching rule reached an action that cannot run after forwarding
@@ -233,7 +232,7 @@ pub enum Effect {
     /// Lower-case name.
     RemoveHeader(String),
     /// Replace the whole path with `to` (expanding `$1`, `${name}`) if the
-    /// anchored `regex` matches; the result must be re-normalised (docs/http.md#url-normalisation).
+    /// anchored `regex` matches; the result must be re-normalised.
     RewritePath {
         regex: Arc<Regex>,
         to: String,
@@ -483,7 +482,7 @@ impl<'a> Scope<'a> {
 }
 
 /// A policy input the view could not provide. Evaluation stops and the flow
-/// fails closed; this is never treated as an absent value (docs/rules.md#evaluation).
+/// fails closed; this is never treated as an absent value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Unavailable<'a> {
     Metric(&'a str),

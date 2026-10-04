@@ -129,7 +129,7 @@ pub fn build_sink(config: &Config) -> anyhow::Result<Arc<dyn FlowSink>> {
     })
 }
 
-/// The capture log under `capture_dir`, if set (docs/flow-log.md#capture).
+/// The capture log under `capture_dir`, if set.
 pub fn build_capture(config: &Config) -> anyhow::Result<Option<Arc<CaptureLog>>> {
     let Some(dir) = &config.capture_dir else {
         return Ok(None);
@@ -167,7 +167,7 @@ pub struct StartOptions {
     pub watch: bool,
 }
 
-/// Reloads the config from disk into a running server (docs/rules.md#reload).
+/// Reloads the config from disk into a running server.
 pub struct Reloader {
     path: PathBuf,
     handle: ServerHandle,
@@ -457,7 +457,7 @@ impl Running {
         }
     }
 
-    /// Graceful shutdown (docs/limits.md): stop accepting, drain for up to `grace`.
+    /// Graceful shutdown: stop accepting, drain for up to `grace`.
     pub async fn shutdown(self, grace: Duration) {
         drop(self.watcher);
         let sink = self.server.handle().sink();

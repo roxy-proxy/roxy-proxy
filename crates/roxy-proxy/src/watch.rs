@@ -1,6 +1,6 @@
-//! The per-exchange watcher (docs/rules.md#evaluation): after the forwarding
+//! The per-exchange watcher: after the forwarding
 //! decision, watching rules are re-checked as values become known or
-//! change, and byte metrics grow as bytes stream (docs/rules.md#metrics).
+//! change, and byte metrics grow as bytes stream.
 //!
 //! # Where it runs
 //!
@@ -16,8 +16,7 @@
 //!   the connection without a terminating chunk and the h2 front end
 //!   resets the stream.
 //! - **WebSocket relay.** [`Watch::on_ws_chunk`] before each write, and
-//!   [`Watch::on_ws_message`] before each message when rules read `ws.*`
-//!   (docs/websockets.md#message-rules).
+//!   [`Watch::on_ws_message`] before each message when rules read `ws.*`.
 //!
 //! # Fail closed
 //!
@@ -38,8 +37,8 @@
 //!
 //! # Audit backpressure
 //!
-//! The body adapter also waits for the flow log ([`FlowSink::poll_ready`],
-//! docs/flow-log.md#writing) before moving each chunk, so a log that cannot keep up slows the
+//! The body adapter also waits for the flow log ([`FlowSink::poll_ready`])
+//! before moving each chunk, so a log that cannot keep up slows the
 //! traffic instead of dropping records.
 
 use std::future::Future;
@@ -168,7 +167,7 @@ impl Watch {
         self.lock().stopped.clone()
     }
 
-    /// The flow sink, for audit backpressure (docs/flow-log.md#writing).
+    /// The flow sink, for audit backpressure.
     pub(crate) fn sink(&self) -> Arc<dyn FlowSink> {
         self.lock().shared.sink.clone()
     }
@@ -202,7 +201,7 @@ impl Watch {
         }
     }
 
-    /// The response head arrived (docs/rules.md#evaluation): rules reading response values are
+    /// The response head arrived: rules reading response values are
     /// checked before the head is written. `Err` means answer with the
     /// stop's refusal instead; header effects are applied to `res`.
     pub(crate) fn on_response_head(
@@ -275,8 +274,8 @@ impl Watch {
         self.publish(&g)
     }
 
-    /// One whole WebSocket message is about to be relayed
-    /// (docs/websockets.md#message-rules): the rules reading `ws.*` are
+    /// One whole WebSocket message is about to be relayed:
+    /// the rules reading `ws.*` are
     /// checked with it. The message is handed back; `Err` means it must not
     /// be relayed.
     pub(crate) fn on_ws_message(
@@ -527,10 +526,10 @@ struct Watched {
     watch: Arc<Watch>,
     dir: Dir,
     cancelled: Pin<Box<WaitForCancellationFutureOwned>>,
-    /// Audit backpressure (docs/flow-log.md#writing): no chunk moves while the flow log is
+    /// Audit backpressure: no chunk moves while the flow log is
     /// behind.
     sink: Arc<dyn FlowSink>,
-    /// Capture (docs/flow-log.md#capture): records each chunk as it is forwarded.
+    /// Capture: records each chunk as it is forwarded.
     tap: Option<Tap>,
     done: bool,
 }

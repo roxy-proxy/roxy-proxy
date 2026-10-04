@@ -1,4 +1,4 @@
-//! The current flow and roxy's host services (docs/addons.md#host-services).
+//! The current flow and roxy's host services.
 //!
 //! Each function names the capability it needs. Calling one the layer was
 //! not granted in roxy's config traps, failing the exchange closed.
