@@ -8,7 +8,7 @@
 //! clients have already been given.
 //!
 //! An operator can instead provide their own CA as a certificate file and a
-//! key file anywhere on disk ([`Ca::load_provided`], docs/tls.md#provided-ca).
+//! key file anywhere on disk ([`Ca::load_provided`]).
 //! A provided CA is never generated or replaced, and the certificate file may
 //! carry intermediates after the CA, which are sent in every handshake.
 

@@ -1,4 +1,4 @@
-# Request line, version, target form vs role, Host (docs/http.md#explicit-proxy, docs/http.md#rejection-rules).
+# Request line, version, target form vs role, Host.
 
 === http10_rejected
 expect: error unsupported_version

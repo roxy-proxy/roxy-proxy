@@ -1,4 +1,4 @@
-//! Direct listeners (docs/http.md#direct-listeners): the client connects as
+//! Direct listeners: the client connects as
 //! if to the origin, and roxy takes the target from the SNI or `Host`.
 
 use std::sync::Arc;

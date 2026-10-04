@@ -1,4 +1,4 @@
-//! Body rules on encoded bodies (docs/rules.md#body-access): the rules see
+//! Body rules on encoded bodies: the rules see
 //! the decoded text, the bytes forwarded are the bytes received, and a body
 //! that cannot be decoded fails closed.
 
@@ -219,7 +219,7 @@ async fn strip_accept_encoding_removes_it_before_the_rules() {
 }
 
 // ---------------------------------------------------------------------------
-// Addons (docs/addons.md#content-codings)
+// Addons
 // ---------------------------------------------------------------------------
 
 /// No body rules, so what reaches the client is the layer's doing.
@@ -312,7 +312,7 @@ async fn a_corrupt_body_is_cut_on_its_way_to_a_layer() {
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket extensions with `tunnel` layers (docs/websockets.md#extensions)
+// WebSocket extensions with `tunnel` layers
 // ---------------------------------------------------------------------------
 
 const WS_RULES: &str = r#"

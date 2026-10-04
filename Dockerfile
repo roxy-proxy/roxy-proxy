@@ -2,7 +2,7 @@
 #
 # Hardened roxy image: a static musl binary on distroless/static (no shell,
 # no package manager), running as UID 65532 and compatible with a read-only
-# root filesystem. See docs/deployment.md, "Container image".
+# root filesystem.
 #
 #   docker build -t roxy .
 #   docker run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges \

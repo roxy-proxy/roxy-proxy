@@ -1,4 +1,4 @@
-//! The addon layer stack (docs/addons.md#layer-stack).
+//! The addon layer stack.
 //!
 //! ```text
 //!   front ─▶ addon 0 ─▶ … ─▶ addon n-1 ─▶ core (rules ↓ / ↑, address floor, connector)
@@ -47,7 +47,7 @@ use crate::view::FlowFacts;
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-/// One configured addon, ready to run (docs/addons.md#configuration).
+/// One configured addon, ready to run.
 pub struct AddonSpec {
     /// `addons[].name`.
     pub name: String,
@@ -67,9 +67,9 @@ pub struct AddonSpec {
 /// What runs a layer.
 #[derive(Clone)]
 pub enum AddonImpl {
-    /// A compiled WASM component and its instance pool (docs/addons.md#instances).
+    /// A compiled WASM component and its instance pool.
     Wasm(roxy_wasm::Layer),
-    /// An external service the exchange streams through (docs/addons.md#service-layers).
+    /// An external service the exchange streams through.
     Service(ServiceSpec),
 }
 
@@ -114,7 +114,7 @@ impl std::fmt::Debug for AddonSpec {
     }
 }
 
-/// A named endpoint (docs/addons.md#endpoints).
+/// A named endpoint.
 #[derive(Debug, Clone)]
 pub struct EndpointSpec {
     /// Base URL; the request's path and query are appended.
@@ -129,7 +129,7 @@ pub struct EndpointSpec {
     pub private_ok: bool,
 }
 
-/// An addon's keyed store limits (docs/addons.md#state).
+/// An addon's keyed store limits.
 #[derive(Debug, Clone)]
 pub struct StateLimits {
     pub max_entries: usize,
@@ -553,8 +553,8 @@ async fn core(
     resp
 }
 
-/// Decodes a body by its `content-encoding` for the layers
-/// (docs/addons.md#content-codings), and drops the header. A coding roxy
+/// Decodes a body by its `content-encoding` for the layers,
+/// and drops the header. A coding roxy
 /// cannot decode is left as it is, header and all, for a layer to judge.
 fn decode_for_layers(headers: &mut Headers, body: &mut Body, limit: u64) {
     let Ok(codings) = coding::content_codings(headers) else {
@@ -568,7 +568,7 @@ fn decode_for_layers(headers: &mut Headers, body: &mut Body, limit: u64) {
 }
 
 /// A layer's response body to the client, sent only while the flow log
-/// keeps up (audit backpressure, docs/flow-log.md#writing).
+/// keeps up (audit backpressure).
 struct Gated {
     inner: Body,
     sink: Arc<dyn FlowSink>,
@@ -612,14 +612,14 @@ fn tunnel_layers(addons: &[Arc<AddonSpec>]) -> Vec<usize> {
 
 /// Whether a WebSocket must be relayed with no extension negotiated, so
 /// every message stays readable: message rules check them, or `tunnel`
-/// layers get them decoded (docs/websockets.md#extensions).
+/// layers get them decoded.
 pub(crate) fn ws_without_extensions(snap: &Snapshot) -> bool {
     snap.policy.reads_ws()
         || (snap.flags.decode_for_addons && !tunnel_layers(&snap.addons).is_empty())
 }
 
 /// Inserts the stack's `tunnel` layers (outermost first) between the client
-/// and the WebSocket relay (docs/addons.md#layer-stack): each gets the raw byte streams of the
+/// and the WebSocket relay: each gets the raw byte streams of the
 /// upgraded connection. The rules' relay stays the hop next to the
 /// upstream, so byte budgets still see what leaves. `leftover` (bytes that
 /// arrived with the upgrade request) goes through the layers too, and the

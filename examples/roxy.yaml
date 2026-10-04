@@ -1,4 +1,4 @@
-# Full roxy configuration example (docs/rules.md#config-file).
+# Full roxy configuration example.
 # Validate with: roxy check --config examples/roxy.yaml
 
 version: 1
@@ -63,7 +63,7 @@ upstream:
   deny_lists: [cloud-metadata] # hard floor checked on every connect; private_ok does not bypass it
   connect_timeout: 10s
 
-# Named CIDR lists (docs/upstream.md#address-lists): usable as `ip in @name` in rules and as
+# Named CIDR lists: usable as `ip in @name` in rules and as
 # `upstream.deny_lists`. File lists hold one CIDR or address per line with
 # `#` comments, and are reloaded when the file changes.
 address_lists:
@@ -90,7 +90,7 @@ metrics:
 
 # What a request gets when no rule decides it: deny (the default) or allow.
 # Any matching deny wins over any matching allow, wherever it sits in the
-# list (docs/rules.md#evaluation); rule order only orders effects.
+# list; rule order only orders effects.
 default: deny
 
 rules:
@@ -149,7 +149,7 @@ log:
     max_file_bytes: 100mb            # rotate by size; absent = never
     max_files: 10                    # rotated files kept; absent = all
     compress: true                   # gzip rotated files
-  capture:                         # traffic capture (docs/flow-log.md#capture), under capture_dir
+  capture:                         # traffic capture, under capture_dir
     all: false                     # true: tee every forwarded exchange
     max_file_bytes: 1gb
     max_files: 20
@@ -159,7 +159,7 @@ log:
 capture_dir: /var/lib/roxy/capture
 
 # Addons sit above the rules, in the order listed: the first sees each
-# request first and each response last (docs/addons.md). Whatever an addon
+# request first and each response last. Whatever an addon
 # passes on is still judged by the rules.
 addons:
   - name: redact
@@ -183,7 +183,7 @@ addons:
     #     timeout: 2s
     #     retries: 1
     #     private_ok: true
-  # An external service in the network path (docs/addons.md#service-layers): each
+  # An external service in the network path: each
   # exchange streams through it over a WebSocket (roxy.layer.v1).
   # - name: sentinel
   #   kind: service

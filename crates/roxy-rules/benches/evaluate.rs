@@ -1,4 +1,4 @@
-//! Rule evaluation for a 100-rule policy (docs/development.md#testing: target < 5 µs).
+//! Rule evaluation for a 100-rule policy (target < 5 µs).
 
 use std::collections::HashSet;
 use std::fmt::Write as _;

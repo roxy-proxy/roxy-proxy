@@ -1,4 +1,4 @@
-# Line structure, header names and values (docs/http.md#rejection-rules).
+# Line structure, header names and values.
 
 === bare_lf_line_endings
 expect: error bare_lf
