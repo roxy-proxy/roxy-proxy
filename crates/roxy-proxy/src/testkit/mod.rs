@@ -62,6 +62,8 @@ pub(crate) const UP_IP: &str = "93.184.215.14";
 pub(crate) const PRIVATE_IP: &str = "10.0.0.5";
 /// An address whose dial is refused (`down.test`).
 pub(crate) const DOWN_IP: &str = "93.184.215.99";
+/// An address that accepts and reads but never answers (`stall.test`).
+pub(crate) const STALL_IP: &str = "93.184.215.77";
 
 /// Allows everything to `up.test`.
 pub(crate) const ALLOW_UP: &str = r#"
@@ -261,6 +263,7 @@ impl KitBuilder {
         }
 
         let settings = upstream_settings(&upstream);
+        let (limits, flags) = (self.limits.clone(), self.flags.clone());
         let capture = self
             .capture_all
             .then(|| Arc::new(capture_all_log(&dir.path().join("capture"))));
@@ -291,7 +294,7 @@ impl KitBuilder {
                 users: HashMap::new(),
                 limits: self.limits,
                 flags: self.flags,
-                upstream: settings,
+                upstream: settings.clone(),
                 address_lists: Arc::new(HashMap::new()),
                 deny_lists: Vec::new(),
                 addons,
@@ -305,6 +308,9 @@ impl KitBuilder {
             upstream,
             capture,
             ca_file: dir.path().join(roxy_tls::CA_CERT_FILE),
+            limits,
+            flags,
+            settings,
             _dir: dir,
         }
     }
@@ -318,6 +324,9 @@ pub(crate) struct Kit {
     /// The capture log, with [`KitBuilder::capture_all`].
     pub capture: Option<Arc<crate::capture::CaptureLog>>,
     ca_file: std::path::PathBuf,
+    limits: Limits,
+    flags: HttpFlags,
+    settings: UpstreamSettings,
     _dir: tempfile::TempDir,
 }
 
@@ -495,6 +504,36 @@ impl Kit {
     /// The flow's single `request` event.
     pub(crate) async fn request_event(&self) -> serde_json::Value {
         self.events("request", 1).await.remove(0)
+    }
+
+    /// Swaps in a new policy with these rules (no metrics, no addons); the
+    /// limits, flags and upstream settings stay.
+    pub(crate) fn reload(&self, rules: &str) {
+        let rules: Vec<RuleConfig> = serde_yaml_ng::from_str(rules).unwrap();
+        let none = std::collections::HashSet::new();
+        let input = PolicyInput {
+            rules: &rules,
+            metrics: &[],
+            secret_names: &none,
+            address_lists: &none,
+            transparent_listeners: false,
+            default: DefaultDecision::Deny,
+        };
+        let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
+        self.server
+            .reload(PolicyUpdate {
+                policy,
+                secrets: HashMap::new(),
+                redactor: Redactor::new(),
+                users: HashMap::new(),
+                limits: self.limits.clone(),
+                flags: self.flags.clone(),
+                upstream: self.settings.clone(),
+                address_lists: Arc::new(HashMap::new()),
+                deny_lists: Vec::new(),
+                addons: Vec::new(),
+            })
+            .unwrap();
     }
 
     /// Everything captured so far, as `(header, payload)` records.
@@ -726,6 +765,7 @@ fn upstream_settings(upstream: &Arc<Upstream>) -> UpstreamSettings {
         ("up.test", UP_IP),
         ("private.test", PRIVATE_IP),
         ("down.test", DOWN_IP),
+        ("stall.test", STALL_IP),
     ] {
         settings
             .dns
@@ -736,9 +776,24 @@ fn upstream_settings(upstream: &Arc<Upstream>) -> UpstreamSettings {
     let up = upstream.clone();
     settings.dial = Some(TestDial(Arc::new(move |addr| {
         let up = up.clone();
-        Box::pin(async move { up.dial(addr) })
+        Box::pin(async move {
+            if addr.ip().to_string() == STALL_IP {
+                return Ok(stalled());
+            }
+            up.dial(addr)
+        })
     })));
     settings
+}
+
+/// A connection whose peer reads everything and never writes.
+fn stalled() -> crate::io::BoxIo {
+    let (mut ours, theirs) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        while matches!(ours.read(&mut buf).await, Ok(n) if n > 0) {}
+    });
+    Box::new(theirs)
 }
 
 /// A capture log in `dir` that takes every forwarded exchange.

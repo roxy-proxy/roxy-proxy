@@ -25,6 +25,9 @@ const RULES: &str = r#"
 - id: private-strict
   when: host == "private.test"
   then: allow
+- id: stall
+  when: host == "stall.test"
+  then: allow
 "#;
 
 async fn kit() -> Kit {
@@ -72,10 +75,13 @@ async fn a_deny_rule_wins_at_the_head() {
     assert!(kit.upstream.seen().is_empty());
 }
 
-#[tokio::test]
-async fn a_watching_rule_stops_an_upload_mid_body() {
+async fn a_watching_rule_stops_an_upload_mid_body(h2: bool) {
     let kit = kit().await;
-    let mut c = kit.h1().await;
+    let mut c = if h2 {
+        kit.tunnel("up.test", true).await
+    } else {
+        kit.h1().await
+    };
     let (mut tx, body) = streaming_body();
     let req = c.request("POST", "/upload", &[]).body(body).unwrap();
     let feed = tokio::spawn(async move {
@@ -95,6 +101,178 @@ async fn a_watching_rule_stops_an_upload_mid_body() {
     let ev = kit.request_event().await;
     assert_eq!(ev["decision"], "deny", "{ev:#}");
     assert_eq!(ev["terminal_rule"], "upload-cap");
+    assert_eq!(ev["stage"], "request_body");
+}
+
+#[tokio::test]
+async fn h1_a_watching_rule_stops_an_upload_mid_body() {
+    a_watching_rule_stops_an_upload_mid_body(false).await;
+}
+
+#[tokio::test]
+async fn h2_a_watching_rule_stops_an_upload_mid_body() {
+    a_watching_rule_stops_an_upload_mid_body(true).await;
+}
+
+/// A watching rule stopping the response mid-body cuts it: the h1 body
+/// ends without its terminating chunk and the connection closes, the h2
+/// stream is reset. Either way the client cannot take it for complete.
+async fn a_watching_rule_stops_a_response_mid_body(h2: bool) {
+    let kit = Kit::builder()
+        .rules(
+            r#"
+- id: download-cap
+  when: host == "up.test" and response.body.bytes > 10kb
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#,
+        )
+        .start()
+        .await;
+    let mut c = if h2 {
+        kit.tunnel("up.test", true).await
+    } else {
+        kit.h1().await
+    };
+    let req = c
+        .request("POST", "/echo", &[])
+        .body(roxy_http::Body::from_bytes(Bytes::from(vec![
+            b'x';
+            64 * 1024
+        ])))
+        .unwrap();
+    match c.send(req).await {
+        Ok(res) => {
+            let a = Answer::read(res).await;
+            assert_eq!(a.status, 200, "{a:?}");
+            assert!(a.body.is_err(), "the body is cut: {a:?}");
+        }
+        // The reset may reach an h2 client with the head still unread.
+        Err(e) => assert!(h2, "{e}"),
+    }
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "deny", "{ev:#}");
+    assert_eq!(ev["terminal_rule"], "download-cap");
+    assert_eq!(ev["stage"], "response_body");
+    assert!(
+        ev["res"]["body_bytes"].as_u64().unwrap() < 64 * 1024,
+        "{ev:#}"
+    );
+}
+
+#[tokio::test]
+async fn h1_a_watching_rule_stops_a_response_mid_body() {
+    a_watching_rule_stops_a_response_mid_body(false).await;
+}
+
+#[tokio::test]
+async fn h2_a_watching_rule_stops_a_response_mid_body() {
+    a_watching_rule_stops_a_response_mid_body(true).await;
+}
+
+/// An upstream that takes the request but never answers is a `504` once
+/// `response_header_timeout` passes.
+#[tokio::test]
+async fn an_upstream_that_never_answers_is_a_504() {
+    let kit = Kit::builder()
+        .rules(RULES)
+        .limits(|l| l.response_header_timeout = std::time::Duration::from_millis(300))
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let req = c
+        .request_to("stall.test", "GET", "/", &[])
+        .body(roxy_http::Body::empty())
+        .unwrap();
+    let a = Answer::read(c.send(req).await.unwrap()).await;
+    assert_eq!(a.status, 504, "{a:?}");
+    assert_eq!(a.json()["reason"], "timeout");
+    let err = kit.events("upstream_error", 1).await;
+    assert_eq!(err[0]["reason"], "timeout", "{err:#?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "allow", "{ev:#}");
+    assert_eq!(ev["reason"], "timeout", "{ev:#}");
+}
+
+/// A client that stops sending its body is cut off after
+/// `body_idle_timeout`: the connection closes (h1) or the stream is reset
+/// (h2), with a `parse_error`.
+async fn a_stalled_upload_is_cut_off(h2: bool) {
+    let kit = Kit::builder()
+        .rules(RULES)
+        .limits(|l| l.body_idle_timeout = std::time::Duration::from_millis(300))
+        .start()
+        .await;
+    let mut c = if h2 {
+        kit.tunnel("up.test", true).await
+    } else {
+        kit.h1().await
+    };
+    let (mut tx, body) = streaming_body();
+    let req = c.request("POST", "/upload", &[]).body(body).unwrap();
+    let pending = c.start(req);
+    tx.send_data(Bytes::from_static(b"the start"))
+        .await
+        .unwrap();
+    let a = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
+        .await
+        .expect("the stall is cut off")
+        .unwrap();
+    // h1 gets a 408 before the close; an h2 stream is reset.
+    if let Ok(a) = &a {
+        assert_eq!(a.status, 408, "{a:?}");
+    }
+    drop(tx);
+    let errs = kit.events("parse_error", 1).await;
+    assert_eq!(errs[0]["reason"], "body_timeout", "{errs:#?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["reason"], "body_timeout", "{ev:#}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].complete, Some(false), "{:?}", seen[0]);
+}
+
+#[tokio::test]
+async fn h1_a_stalled_upload_is_cut_off() {
+    a_stalled_upload_is_cut_off(false).await;
+}
+
+#[tokio::test]
+async fn h2_a_stalled_upload_is_cut_off() {
+    a_stalled_upload_is_cut_off(true).await;
+}
+
+/// An exchange finishes under the policy it started with; the next one
+/// runs under the reloaded policy.
+#[tokio::test]
+async fn a_reload_mid_exchange_does_not_change_its_policy() {
+    let kit = kit().await;
+    let mut c = kit.h1().await;
+    let (mut tx, body) = streaming_body();
+    let req = c.request("POST", "/upload", &[]).body(body).unwrap();
+    let pending = c.start(req);
+    tx.send_data(Bytes::from_static(b"first half"))
+        .await
+        .unwrap();
+    kit.wait_arrived(1).await;
+    kit.reload(
+        r#"
+- id: nothing
+  when: host == "up.test"
+  then: deny
+"#,
+    );
+    tx.send_data(Bytes::from_static(b" second half"))
+        .await
+        .unwrap();
+    tx.finish().await.unwrap();
+    let a = pending.await.unwrap().unwrap();
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["body_len"], 22);
+    let b = c.call("GET", "/next", &[], b"").await;
+    assert_eq!(b.status, 403, "{b:?}");
+    assert_eq!(b.json()["rule"], "nothing");
 }
 
 /// A client that vanishes mid-upload still gets its exchange logged, on
