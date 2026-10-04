@@ -76,7 +76,7 @@ pub struct Config {
 
 // ----- listeners ------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
     pub name: String,
@@ -117,19 +117,19 @@ pub enum UpstreamTarget {
     RequireMatch,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ListenerAuth {
     pub basic: BasicAuth,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BasicAuth {
     pub users_file: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaServer {
     pub bind: SocketAddr,
@@ -170,7 +170,7 @@ fn default_dns_ttl() -> Duration {
 
 // ----- tls ------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Tls {
     /// Where `roxy-ca.pem` / `roxy-ca.key` live; generated if absent.
@@ -216,7 +216,7 @@ impl Default for Tls {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct TlsUpstream {
     pub verify: UpstreamVerify,
@@ -684,7 +684,7 @@ pub struct Log {
     pub redact_headers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct FlowLog {
     /// JSONL output file; absent = stdout.
@@ -726,7 +726,7 @@ impl Default for FlowLog {
 /// `log.capture`: how captured traffic is written. Which exchanges
 /// are captured: those a rule's `capture` action selects, or every
 /// forwarded exchange with `all: true`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CaptureLog {
     /// Capture every forwarded exchange, both directions.
