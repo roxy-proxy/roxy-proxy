@@ -302,7 +302,7 @@ impl chain::Host for StoreState {
                 .build()
                 .map_err(|e| format!("invalid URI: {e}"))?;
             let body = match body {
-                Some(b) => FromGuest::request(b, shared.clone(), true),
+                Some(b) => FromGuest::next_request(b, shared.clone()),
                 None => roxy_http::Body::empty(),
             };
             builder
@@ -320,7 +320,11 @@ impl chain::Host for StoreState {
         };
 
         let fut = wasmtime_wasi::runtime::spawn(async move {
-            match host.next(request).await {
+            let resp = host.next(request).await;
+            if shared.check_next().is_err() {
+                return Err(WasiError::InternalError(Some("next failed".to_owned())));
+            }
+            match resp {
                 Ok(resp) => Ok(response_into_guest(resp, Some(shared))),
                 Err(e) => {
                     shared.fail(LayerError::Host(e));
@@ -350,7 +354,7 @@ impl endpoints::Host for StoreState {
         let req = self.table.delete(req)?;
         let built = take_request(req).and_then(|(builder, body, target)| {
             let body = match body {
-                Some(b) => FromGuest::request(b, shared.clone(), false),
+                Some(b) => FromGuest::endpoint_request(b, shared.clone()),
                 None => roxy_http::Body::empty(),
             };
             builder

@@ -395,6 +395,28 @@ impl Handler for Layer {
                 );
                 drop(in_body);
             }
+            "cut-then-await" => {
+                // Stream `x-read-bytes` of the body into `next`, leave it
+                // unfinished while still waiting on the response, then
+                // answer whatever `next` gives back.
+                let n = read_bytes(&req);
+                let next_req = forward_head(&req);
+                let next_body = next_req.body().expect("body");
+                let in_body = req.consume().expect("consume");
+                let fut = chain::next(next_req).expect("next");
+                {
+                    let input = in_body.stream().expect("stream");
+                    let output = next_body.write().expect("write");
+                    write_all(&output, &read_at_least(&input, n));
+                }
+                drop(next_body);
+                fut.subscribe().block();
+                match fut.get().expect("ready").expect("once") {
+                    Ok(resp) => answer_with(resp, out, false),
+                    Err(_) => respond(out, 200, b"answered after next failed"),
+                }
+                drop(in_body);
+            }
             "count" => respond(out, 200, n.to_string().as_bytes()),
             "caps" => {
                 let body = call_capability(&req);
