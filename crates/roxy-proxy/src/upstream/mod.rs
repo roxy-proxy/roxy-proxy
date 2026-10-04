@@ -204,7 +204,6 @@ struct ConnectorInner {
     dns: Arc<Dns>,
     policy: AddressPolicy,
     connect_timeout: Duration,
-    tls: Arc<ClientConfig>,
     private_ok: bool,
     #[cfg(test)]
     dial: Option<TestDial>,
@@ -214,6 +213,9 @@ struct ConnectorInner {
 #[derive(Clone)]
 pub(crate) struct Connector {
     inner: Arc<ConnectorInner>,
+    /// What TLS offers, ALPN included: `h2` and `http/1.1`, or `http/1.1`
+    /// only for the HTTP/1.1 pool.
+    tls: Arc<ClientConfig>,
 }
 
 fn host_of(uri: &Uri) -> Result<Host, ConnectError> {
@@ -309,6 +311,7 @@ impl tower_service::Service<Uri> for Connector {
     // too: nothing opts out of a deny list.
     fn call(&mut self, uri: Uri) -> Self::Future {
         let inner = self.inner.clone();
+        let tls = self.tls.clone();
         Box::pin(async move {
             let scheme = match uri.scheme_str() {
                 Some("https") => Scheme::Https,
@@ -317,7 +320,6 @@ impl tower_service::Service<Uri> for Connector {
             };
             let host = host_of(&uri)?;
             let port = uri.port_u16().unwrap_or(scheme.default_port());
-            let tls = inner.tls.clone();
             let io = inner.connect(scheme, &host, port, &tls).await?;
             let h2 = match &io {
                 MaybeTls::Tls(t) => t.get_ref().1.alpn_protocol() == Some(b"h2".as_slice()),
@@ -334,14 +336,22 @@ impl tower_service::Service<Uri> for Connector {
 /// The pooled HTTP client type.
 pub(crate) type HttpClient = Client<Connector, Body>;
 
+/// The pooled clients that share one address-floor setting (`private_ok`
+/// or not), so a connection opened for a `private_ok` flow is never reused
+/// by a flow without it.
+struct Pools {
+    inner: Arc<ConnectorInner>,
+    /// ALPN `h2` or `http/1.1`, as the upstream chooses.
+    any: HttpClient,
+    /// ALPN `http/1.1` only.
+    http1: HttpClient,
+    http1_tls: Arc<ClientConfig>,
+}
+
 /// Everything needed to talk to upstreams under one policy snapshot.
 pub(crate) struct Upstream {
-    strict: HttpClient,
-    private: HttpClient,
-    strict_conn: Connector,
-    private_conn: Connector,
-    /// ALPN `http/1.1` only, for WebSocket upgrades.
-    h1_tls: Arc<ClientConfig>,
+    strict: Pools,
+    private: Pools,
 }
 
 impl std::fmt::Debug for Upstream {
@@ -353,51 +363,55 @@ impl std::fmt::Debug for Upstream {
 impl Upstream {
     pub(crate) fn new(s: &UpstreamSettings, tls: &Arc<ClientConfig>) -> Result<Self, String> {
         let dns = Arc::new(Dns::new(&s.dns)?);
-        let mk = |private_ok| Connector {
-            inner: Arc::new(ConnectorInner {
+        let mut http1 = (**tls).clone();
+        http1.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let http1_tls = Arc::new(http1);
+        let pools = |private_ok| {
+            let inner = Arc::new(ConnectorInner {
                 dns: dns.clone(),
                 policy: s.address_policy.clone(),
                 connect_timeout: s.connect_timeout,
-                tls: tls.clone(),
                 private_ok,
                 #[cfg(test)]
                 dial: s.dial.clone(),
-            }),
+            });
+            let client = |tls: &Arc<ClientConfig>| {
+                Client::builder(TokioExecutor::new())
+                    .pool_timer(TokioTimer::new())
+                    .pool_idle_timeout(s.pool_idle_timeout)
+                    .build(Connector {
+                        inner: inner.clone(),
+                        tls: tls.clone(),
+                    })
+            };
+            Pools {
+                any: client(tls),
+                http1: client(&http1_tls),
+                http1_tls: http1_tls.clone(),
+                inner,
+            }
         };
-        let strict_conn = mk(false);
-        let private_conn = mk(true);
-        let build = |c: &Connector| {
-            Client::builder(TokioExecutor::new())
-                .pool_timer(TokioTimer::new())
-                .pool_idle_timeout(s.pool_idle_timeout)
-                .build(c.clone())
-        };
-        let mut h1 = (**tls).clone();
-        h1.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Self {
-            strict: build(&strict_conn),
-            private: build(&private_conn),
-            strict_conn,
-            private_conn,
-            h1_tls: Arc::new(h1),
+            strict: pools(false),
+            private: pools(true),
         })
     }
 
-    fn connector(&self, private_ok: bool) -> &Connector {
-        if private_ok {
-            &self.private_conn
-        } else {
-            &self.strict_conn
-        }
-    }
-
-    /// The pooled client for a flow.
-    pub(crate) fn client(&self, private_ok: bool) -> &HttpClient {
+    fn pools(&self, private_ok: bool) -> &Pools {
         if private_ok {
             &self.private
         } else {
             &self.strict
         }
+    }
+
+    /// The pooled client for a flow. `http1_only` keeps the exchange on
+    /// HTTP/1.1, where the connection target and `Host` may differ (a
+    /// `redirect` that keeps `Host`); over h2, `:authority` and `host` must
+    /// agree.
+    pub(crate) fn client(&self, private_ok: bool, http1_only: bool) -> &HttpClient {
+        let pools = self.pools(private_ok);
+        if http1_only { &pools.http1 } else { &pools.any }
     }
 
     /// Resolve and apply the address floor before any request bytes move, so
@@ -409,7 +423,7 @@ impl Upstream {
         authority: &Authority,
         private_ok: bool,
     ) -> Result<(), ConnectError> {
-        self.connector(private_ok)
+        self.pools(private_ok)
             .inner
             .resolve_checked(&authority.host)
             .await
@@ -423,9 +437,10 @@ impl Upstream {
         authority: &Authority,
         private_ok: bool,
     ) -> Result<MaybeTls, ConnectError> {
-        self.connector(private_ok)
+        let pools = self.pools(private_ok);
+        pools
             .inner
-            .connect(scheme, &authority.host, authority.port, &self.h1_tls)
+            .connect(scheme, &authority.host, authority.port, &pools.http1_tls)
             .await
     }
 }
@@ -527,7 +542,7 @@ mod tests {
 
         let before = Upstream::new(&settings(Vec::new()), &tls).unwrap();
         for _ in 0..2 {
-            let res = before.client(true).request(get(port)).await.unwrap();
+            let res = before.client(true, false).request(get(port)).await.unwrap();
             assert_eq!(res.status(), 200);
         }
         assert_eq!(accepted.load(Ordering::SeqCst), 1, "second request pooled");
@@ -540,7 +555,11 @@ mod tests {
         };
         assert_eq!(d.list.as_deref(), Some("blocked"));
         // Straight through the pooled client, bypassing the preflight.
-        let err = after.client(true).request(get(port)).await.unwrap_err();
+        let err = after
+            .client(true, false)
+            .request(get(port))
+            .await
+            .unwrap_err();
         let Some(ConnectError::Denied(d)) = classify(&err) else {
             panic!("connector must deny: {err:?}");
         };

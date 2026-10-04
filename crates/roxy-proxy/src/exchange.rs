@@ -504,7 +504,9 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
         };
         set_host_override(cx, &mut http_req);
         let upstream = response_head(
-            upstream_client.client(private_ok).request(http_req),
+            upstream_client
+                .client(private_ok, cx.host_override.is_some())
+                .request(http_req),
             sent,
             req_counter.clone(),
             &limits,

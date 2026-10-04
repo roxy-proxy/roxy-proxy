@@ -159,3 +159,41 @@ async fn h2_clients_get_the_same_decisions() {
     let rules: Vec<_> = reqs.iter().map(|r| r["terminal_rule"].clone()).collect();
     assert_eq!(rules, ["up", "no-admin"], "{reqs:#?}");
 }
+
+/// A `redirect` that keeps the client's `Host` goes upstream over
+/// HTTP/1.1, even to an h2-capable upstream: over h2, `:authority` would
+/// name the new target while `host` named the old one (RFC 9113 §8.3.1).
+/// A redirect that rewrites `Host` may use h2.
+#[tokio::test]
+async fn a_redirect_keeping_host_goes_over_http1() {
+    let kit = Kit::builder()
+        .rules(
+            r#"
+- id: keep-host
+  when: host == "alias.test"
+  then: [{ redirect: { host: up.test, port: 443, scheme: https } }, allow]
+- id: rewrite-host
+  when: host == "other.test"
+  then: [{ redirect: { host: up.test, port: 443, scheme: https, rewrite_host: true } }, allow]
+"#,
+        )
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let req = c
+        .request_to("alias.test", "GET", "/kept", &[])
+        .body(roxy_http::Body::empty())
+        .unwrap();
+    assert_eq!(Answer::read(c.send(req).await.unwrap()).await.status, 200);
+    let req = c
+        .request_to("other.test", "GET", "/rewritten", &[])
+        .body(roxy_http::Body::empty())
+        .unwrap();
+    assert_eq!(Answer::read(c.send(req).await.unwrap()).await.status, 200);
+    let seen = kit.upstream.wait_seen(2).await;
+    let kept = seen.iter().find(|s| s.path == "/kept").unwrap();
+    assert_eq!(kept.version, http::Version::HTTP_11);
+    assert_eq!(kept.headers["host"], "alias.test");
+    let rewritten = seen.iter().find(|s| s.path == "/rewritten").unwrap();
+    assert_eq!(rewritten.version, http::Version::HTTP_2);
+}
