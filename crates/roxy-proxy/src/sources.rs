@@ -1,11 +1,11 @@
 //! Policy inputs that live outside the proxy: metric values and the state
 //! store.
 //!
-//! The pipeline codes against these two traits; the real stores (sliding
-//! windows, bounded TTL map) plug in behind them. Until they exist,
-//! [`UnavailableMetrics`] and [`UnavailableState`] stand in, and `roxy run`
-//! refuses policies that would need them (metrics, `set_state`) instead of
-//! failing every request closed.
+//! The pipeline codes against these two traits. `roxy run` plugs the rules
+//! crate's stores in behind them (sliding windows, a bounded TTL map). A
+//! deployment without a store uses [`UnavailableMetrics`] and
+//! [`UnavailableState`], whose every read and write fails, so a rule that
+//! needs one fails closed.
 
 use std::time::Duration;
 

@@ -56,24 +56,23 @@ pub(super) fn expand(
     Some(out)
 }
 
-/// The URL for a call: the endpoint's URL with the request's path and query
-/// appended.
+/// The URL for a call: the endpoint's URL with the request's path appended
+/// (a bare `/` adds nothing), and both URLs' queries, the endpoint's first.
 fn target(spec: &EndpointSpec, req: &Uri) -> Result<Uri, String> {
     let base = spec.url.path().trim_end_matches('/');
-    let pq = req.path_and_query().map_or("/", |p| p.as_str());
-    let pq = if pq == "/" && !base.is_empty() {
-        ""
-    } else {
-        pq
+    let path = match req.path() {
+        "/" | "" if !base.is_empty() => base.to_owned(),
+        "" => "/".to_owned(),
+        p => format!("{base}{p}"),
     };
-    let pq = if base.is_empty() && pq.is_empty() {
-        "/"
-    } else {
-        pq
+    let query = match (spec.url.query(), req.query()) {
+        (None, None) => String::new(),
+        (Some(q), None) | (None, Some(q)) => format!("?{q}"),
+        (Some(a), Some(b)) => format!("?{a}&{b}"),
     };
     let authority = spec.url.authority().map_or("", |a| a.as_str());
     let scheme = spec.url.scheme_str().unwrap_or("https");
-    format!("{scheme}://{authority}{base}{pq}")
+    format!("{scheme}://{authority}{path}{query}")
         .parse()
         .map_err(|e| format!("endpoint URL: {e}"))
 }
@@ -265,6 +264,15 @@ mod tests {
         assert_eq!(
             t("http://ti.internal:8443", "/x"),
             "http://ti.internal:8443/x"
+        );
+        // The endpoint's own query is kept, ahead of the request's.
+        assert_eq!(
+            t("https://api.example.com/v1?key=k", "/score?q=1"),
+            "https://api.example.com/v1/score?key=k&q=1"
+        );
+        assert_eq!(
+            t("https://api.example.com/v1?key=k", "/"),
+            "https://api.example.com/v1?key=k"
         );
     }
 

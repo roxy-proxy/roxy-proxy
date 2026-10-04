@@ -317,16 +317,6 @@ pub enum FlowEvent {
         /// The addresses in the answer.
         answers: Vec<IpAddr>,
     },
-    /// Bytes relayed uninspected (transparent mode only; deferred).
-    Passthrough {
-        #[serde(serialize_with = "ser_ts")]
-        ts: DateTime<Utc>,
-        conn: String,
-        listener: String,
-        client: ClientInfo,
-        dst: DstInfo,
-        rules: Vec<String>,
-    },
 }
 
 /// The client side of a connection.
