@@ -5,7 +5,8 @@
 //! observer does not keep up, its copy is cut (the observer sees a body
 //! error) and an `observer_lagged` event is logged; the real traffic never
 //! waits. This is deliberately lossy: the observer is not the audit log,
-//! which keeps its own backpressure.
+//! which keeps its own backpressure. An observer that drops its copy is
+//! not lagging: the rest is simply not copied.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -68,10 +69,15 @@ struct Tee {
 }
 
 impl Tee {
+    /// The copy could not take a frame: the observer fell behind, or let
+    /// go of its copy. Only the first is worth a word.
     fn cut(&mut self) {
         if let Some(c) = self.copy.take() {
+            let gone = c.is_closed();
             c.abort(BodyError::Stopped);
-            self.lag.report();
+            if !gone {
+                self.lag.report();
+            }
         }
     }
 }
@@ -100,10 +106,11 @@ impl HttpBody for Tee {
                 }
             }
             None => {
-                if let Some(c) = this.copy.take()
-                    && c.try_finish().is_err()
-                {
-                    self.lag.report();
+                if let Some(c) = this.copy.take() {
+                    let gone = c.is_closed();
+                    if c.try_finish().is_err() && !gone {
+                        this.lag.report();
+                    }
                 }
             }
         }

@@ -486,6 +486,42 @@ async fn a_layer_its_when_skips_stays_out_of_the_websocket() {
     assert!(strs(&ev["addons"]).is_empty(), "{ev:#}");
 }
 
+/// An observer that answers without reading its copy is not lagging: the
+/// copy is dropped and the exchange is not reported.
+#[tokio::test]
+async fn an_observer_that_drops_its_copy_is_not_lagging() {
+    let kit = stack(&[
+        AddonDef::test_layer("o").observe(),
+        AddonDef::test_layer("b"),
+    ])
+    .await;
+    let mut c = kit.h1().await;
+    let (mut tx, body) = super::streaming_body();
+    let req = c
+        .request("POST", "/x", &[("x-test-o", "answer")])
+        .body(body)
+        .unwrap();
+    let answer = c.start(req);
+    // The observer has answered (and dropped its copy) long before the
+    // body arrives.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    tx.send_data(bytes::Bytes::from_static(b"late"))
+        .await
+        .unwrap();
+    tx.finish().await.unwrap();
+    let a = answer.await.unwrap().unwrap();
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["body_len"], 4);
+    kit.request_event().await;
+    let lagged: Vec<_> = kit
+        .sink
+        .events()
+        .into_iter()
+        .filter(|e| e["event"] == "observer_lagged")
+        .collect();
+    assert!(lagged.is_empty(), "{lagged:#?}");
+}
+
 /// Service layers: the in-test service (`testkit::upstream::service`)
 /// behind a `kind: service` addon.
 mod service {
@@ -534,5 +570,32 @@ mod service {
             kit.sink.events()
         );
         assert!(kit.upstream.service().resets().is_empty());
+    }
+
+    /// An observer that holds its copy without reading it is lagging: the
+    /// copy is cut and reported, and the real body goes through whole.
+    #[tokio::test]
+    async fn a_slow_observer_is_cut_and_reported_while_the_body_goes_through() {
+        // The service never reads (and so never grants credit): the copy
+        // stalls once the stream's window is spent.
+        let kit = kit(RULES, vec![addon("o", "stall", true, |_| {})]).await;
+        let mut c = kit.h1().await;
+        let (mut tx, body) = streaming_body();
+        let req = c.request("POST", "/x", &[]).body(body).unwrap();
+        let answer = c.start(req);
+        let chunk = Bytes::from(vec![b'x'; 16 * 1024]);
+        let chunks = 40;
+        for _ in 0..chunks {
+            tx.send_data(chunk.clone()).await.unwrap();
+        }
+        tx.finish().await.unwrap();
+        let a: Answer = answer.await.unwrap().unwrap();
+        assert_eq!(a.status, 200, "{a:?}");
+        assert_eq!(a.json()["body_len"], chunks * chunk.len());
+        let seen = kit.upstream.wait_seen(1).await;
+        assert_eq!(seen[0].complete, Some(true));
+        let lagged = kit.events("observer_lagged", 1).await;
+        assert_eq!(lagged[0]["layer"], "o", "{lagged:#?}");
+        assert_eq!(lagged[0]["direction"], "request");
     }
 }
