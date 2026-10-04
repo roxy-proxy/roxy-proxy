@@ -30,10 +30,18 @@ first and the response last.
 ```
 
 **Addons always sit above the rules**, in the order listed under `addons:`.
+A layer with a `when` runs only on the exchanges it matches, and the rest
+pass it by ([choosing exchanges](/addons/configuration#choosing-exchanges)).
 Nothing configurable runs between the rules and the network, so what the
 rules judged is what leaves. There is no setting or rule action that
 places an addon anywhere else: either would make it ambiguous what the rules
 enforced.
+
+The stack is a pipeline. Every layer runs at once, as its own task, so on
+a long stream each one works on a different chunk at the same time. But
+each chunk passes through the layers in order, and each layer sees what the
+layer above passed on. Observe layers are the exception: they get copies,
+so they run beside the stream rather than in it.
 
 ## Invariants
 
@@ -48,7 +56,8 @@ enforced.
 3. **Failure is closed.** A layer that traps, exceeds a budget or returns an
    invalid head denies the flow, or cuts the exchange if the response head
    is already out. There is no "on error, pass"; observe mode is the one
-   safe way to run a layer whose failures must not matter.
+   safe way to run a layer whose failures must not matter. `sample` gives
+  it a share of the matching exchanges rather than all of them.
 
 ## One exchange, one `next`
 
@@ -135,6 +144,8 @@ sits in it.
   `content-length` checked against the body, hop-by-hop and framing fields
   refused, and the workload's limits applied. `chain.next` fills in the
   scheme and authority from the exchange when the layer leaves them unset.
+- The flow log's `addons` lists the layers that ran on the exchange, in
+  stack order; a layer its `when` or `sample` skipped is not in it.
 - The flow log's `rules`, `decision` and `terminal_rule` describe the
   request that left; `req` still describes what the client sent. Metric
   keys, for the rules' samples and for `metric-get`, come from the request

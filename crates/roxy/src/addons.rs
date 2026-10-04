@@ -147,7 +147,11 @@ impl AddonLoader {
     pub async fn load(&self, config: &Config) -> anyhow::Result<Vec<Arc<AddonSpec>>> {
         let mut out = Vec::with_capacity(config.addons.len());
         let mut keep = Vec::new();
-        for a in &config.addons {
+        let conditions = config.compile_addon_conditions().map_err(|d| {
+            let msgs: Vec<String> = d.iter().map(ToString::to_string).collect();
+            anyhow!("{}", msgs.join("; "))
+        })?;
+        for (a, when) in config.addons.iter().zip(conditions) {
             let kind = if a.kind == AddonKind::Service {
                 AddonImpl::Service(service(a)?)
             } else {
@@ -160,6 +164,8 @@ impl AddonLoader {
                 endpoints: endpoints(a)?,
                 state: state_limits(a),
                 audit_endpoint: a.audit_endpoint.clone(),
+                when,
+                sample: a.sample,
             }));
         }
         let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
