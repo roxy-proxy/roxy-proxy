@@ -218,7 +218,6 @@ async fn echo(
 }
 
 #[tokio::test]
-#[ignore = "#36: a flow through tunnel layers never ends after the client closes"]
 async fn tunnel_layers_chain_in_the_byte_path() {
     let kit = stack(&[
         AddonDef::tunnel_layer("t1", false),
@@ -235,6 +234,36 @@ async fn tunnel_layers_chain_in_the_byte_path() {
     let ev = kit.request_event().await;
     let tags = strs(&ev["tags"]);
     for t in ["tunnel:t1", "tunnel:t2", "via:plain"] {
+        assert!(tags.iter().any(|x| x == t), "{t} in {tags:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_close_from_the_upstream_ends_a_flow_through_tunnel_layers() {
+    let kit = stack(&[
+        AddonDef::tunnel_layer("t1", false),
+        AddonDef::tunnel_layer("t2", true),
+    ])
+    .await;
+    let (status, io) = kit.websocket("/ws", &[("x-echo", "once")]).await;
+    assert_eq!(status, 101);
+    let mut io = io.unwrap();
+    assert_eq!(echo(&mut io, b"hello").await, b"HELLO");
+    // The upstream has closed: the client sees EOF through both layers,
+    // without closing first.
+    let mut rest = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        io.read_to_end(&mut rest),
+    )
+    .await
+    .expect("EOF in time")
+    .unwrap();
+    assert!(rest.is_empty(), "{rest:?}");
+    drop(io);
+    let ev = kit.request_event().await;
+    let tags = strs(&ev["tags"]);
+    for t in ["tunnel:t1", "tunnel:t2"] {
         assert!(tags.iter().any(|x| x == t), "{t} in {tags:?}");
     }
 }
