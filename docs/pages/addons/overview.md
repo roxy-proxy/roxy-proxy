@@ -84,9 +84,27 @@ Typical patterns:
   them.
 - **Deny or answer:** return a response without calling `next`.
 
-For WebSockets, a layer that exports `tunnel` gets the two raw byte streams
-after the `101`. A layer without `tunnel` is not in that path, but the
-upgrade request still passes through it, so it can refuse the upgrade.
+## WebSockets
+
+A WebSocket is an exchange like any other, only long-lived. A layer gets
+the upgrade request in `handle` and passes it on with `next`; the response
+from below is the `101`. After it, the request body carries the client's
+bytes and the response body the upstream's, for as long as the WebSocket
+is open. A layer reads, rewrites or holds back either direction as it
+would any body, refuses the upgrade by answering without `next`, and is
+left out of the WebSocket entirely when its `when` skips the upgrade
+request.
+
+- The bodies carry raw WebSocket frames. Frames from the client are
+  masked, so their payload reads as sent only from the upstream's side.
+- A layer must stream both bodies at once: the request body ends only
+  when the client closes, while the response streams all along. The
+  `roxy-addon` SDK does this.
+- A transform that holds bytes back until more arrive (to match across
+  chunks, say) stalls an interactive protocol: the peer waits for the
+  held bytes.
+- No clock runs on the bodies ([safety](/addons/safety)): a WebSocket
+  lives as long as the relay's idle timeout allows.
 
 ## Content codings
 
@@ -112,10 +130,9 @@ flow no layer runs on (every `when` skipped it) is not decoded at all.
 - The rules below the stack read the response before any layer, and decode
   it for themselves ([rules](/policies/body-rules)).
 
-- A `tunnel` layer gets WebSocket messages it can read: no extension
-  (`permessage-deflate` above all) is negotiated on a WebSocket that passes
-  through one ([WebSockets](/policies/websockets#extensions)). A `tunnel`
-  layer its `when` skipped is not in the WebSocket, so it changes nothing.
+- A layer gets WebSocket messages it can read: no extension
+  (`permessage-deflate` above all) is negotiated on a WebSocket a layer
+  runs on ([WebSockets](/policies/websockets#extensions)).
 
 `http.decode_for_addons: false` turns this off: layers then see the bytes
 as sent, with their `content-encoding`, and WebSockets negotiate whatever
@@ -169,9 +186,10 @@ sits in it.
   `layer_error` follows.
 - A layer's response body to the client waits for the flow log like every
   forwarded body ([audit backpressure](/operate/flow-log#writing)).
-- WebSocket `tunnel` layers are chained between the client and the relay,
-  outermost first. The relay stays the hop next to the upstream, so byte
-  budgets and [message rules](/policies/websockets#message-rules) see what leaves.
+- A WebSocket runs through the layers that ran on its upgrade request,
+  outermost first, in their bodies. The relay stays the hop next to the
+  upstream, so byte budgets and
+  [message rules](/policies/websockets#message-rules) see what leaves.
 - Layers compile at config load and are cached across reloads while their
   file and settings are unchanged, so their instance pools stay warm. A
   reload swaps the stack for new exchanges; exchanges in flight finish on

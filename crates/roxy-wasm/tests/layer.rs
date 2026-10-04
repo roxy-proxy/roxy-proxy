@@ -13,13 +13,10 @@ use roxy_http::{Body, BodyError, BodySender};
 use roxy_wasm::{
     Budget, Capabilities, Capability, HostError, Layer, LayerError, LayerOutcome, LoadError,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 mod common;
 use common::*;
-
-const TUNNEL_LAYER: &[u8] = include_bytes!("fixtures/tunnel_layer.wasm");
 
 #[tokio::test]
 async fn passes_through_and_transforms() {
@@ -655,7 +652,11 @@ async fn dropping_the_exchange_cancels_it() {
             .unwrap(),
         "partial"
     );
+    // Dropping the exchange: the call if it is still running, and the
+    // response it returned if it is not (a layer that streams both bodies
+    // answers as soon as `next` does).
     task.abort();
+    drop(task);
     let _ = done_rx.recv().await;
     // The upstream request body is cut, not ended cleanly.
     assert_eq!(
@@ -741,69 +742,31 @@ async fn bad_components_fail_to_load() {
     assert!(matches!(err, LoadError::Limits { .. }), "{err:?}");
 }
 
+/// Both bodies stream at once: each chunk of a request body that has not
+/// ended comes back (through an echo below the layer) before the next is
+/// sent. A WebSocket through a layer is exactly this.
 #[tokio::test]
-async fn tunnel_is_detected_and_relays() {
+async fn both_bodies_stream_at_once() {
     let rt = runtime();
-    let plain = load(&rt, config()).await;
-    assert!(!plain.has_tunnel());
-    let (a, _b) = tokio::io::duplex(64);
-    let (c, _d) = tokio::io::duplex(64);
-    let (ar, aw) = tokio::io::split(a);
-    let (cr, cw) = tokio::io::split(c);
-    assert_eq!(
-        plain
-            .tunnel(Mock::echo(), ar, aw, cr, cw)
-            .await
-            .unwrap_err(),
-        LayerError::NoTunnel
-    );
-
-    let mut cfg = config();
-    cfg.config_json = r#"{"upper": true}"#.into();
-    let layer = Layer::load(&rt, TUNNEL_LAYER.to_vec(), cfg).await.unwrap();
-    assert!(layer.has_tunnel());
-    // The tunnel layer passes plain exchanges through.
-    let (_, body) = exchange(&layer, Mock::echo(), request("x", Body::empty()))
-        .await
-        .unwrap();
-    assert_eq!(body, "");
-
-    // client <-> [layer] <-> upstream
-    let (client, client_side) = tokio::io::duplex(1024);
-    let (upstream, upstream_side) = tokio::io::duplex(1024);
-    let (from_client, to_client) = tokio::io::split(client_side);
-    let (from_upstream, to_upstream) = tokio::io::split(upstream_side);
-    let relay = tokio::spawn({
-        let layer = layer.clone();
-        async move {
-            layer
-                .tunnel(
-                    Mock::echo(),
-                    from_client,
-                    to_upstream,
-                    from_upstream,
-                    to_client,
-                )
+    let layer = load(&rt, config()).await;
+    let (mut client_tx, client_body) = Body::channel(u64::MAX, None);
+    let mut req = request("pass", client_body);
+    req.headers_mut().insert("x-upper", "1".parse().unwrap());
+    let resp = layer.handle(Mock::echo(), req).await.unwrap();
+    let mut body = resp.into_body();
+    for msg in ["ping", "pong", "done"] {
+        client_tx.send_data(Bytes::from(msg)).await.unwrap();
+        let mut got = Vec::new();
+        while got.len() < msg.len() {
+            let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
                 .await
+                .expect("each chunk comes back before the request body ends")
+                .unwrap()
+                .unwrap();
+            got.extend_from_slice(frame.data_ref().unwrap());
         }
-    });
-    let (mut client_r, mut client_w) = tokio::io::split(client);
-    let (mut up_r, mut up_w) = tokio::io::split(upstream);
-
-    client_w.write_all(b"ping").await.unwrap();
-    let mut buf = [0u8; 4];
-    up_r.read_exact(&mut buf).await.unwrap();
-    assert_eq!(&buf, b"PING");
-    up_w.write_all(b"pong").await.unwrap();
-    client_r.read_exact(&mut buf).await.unwrap();
-    assert_eq!(&buf, b"pong");
-
-    client_w.shutdown().await.unwrap();
-    up_w.shutdown().await.unwrap();
-    relay.await.unwrap().unwrap();
-    // Both directions closed through the layer.
-    let mut rest = Vec::new();
-    up_r.read_to_end(&mut rest).await.unwrap();
-    client_r.read_to_end(&mut rest).await.unwrap();
-    assert_eq!(rest, b"");
+        assert_eq!(got, msg.to_ascii_uppercase().as_bytes());
+    }
+    client_tx.finish().await.unwrap();
+    assert!(body.frame().await.is_none());
 }

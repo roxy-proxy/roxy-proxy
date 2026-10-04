@@ -6,7 +6,7 @@
 
 wasmtime::component::bindgen!({
     path: "../../wit",
-    world: "roxy:addon/tunnel-layer",
+    world: "roxy:addon/layer",
     imports: { default: async | trappable },
     exports: { default: async },
     require_store_data_send: true,

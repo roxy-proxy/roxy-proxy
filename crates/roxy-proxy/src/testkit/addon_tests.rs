@@ -274,35 +274,33 @@ async fn echo(
     got
 }
 
+/// A WebSocket is an exchange like any other: every layer carries it in
+/// its bodies, the client's bytes in the request and the upstream's in the
+/// response. The test layer upper-cases what it relays (`x-upper`).
 #[tokio::test]
-async fn tunnel_layers_chain_in_the_byte_path() {
-    let kit = stack(&[
-        AddonDef::tunnel_layer("t1", false),
-        AddonDef::test_layer("plain"),
-        AddonDef::tunnel_layer("t2", true),
-    ])
-    .await;
-    let (status, io) = kit.websocket("/ws", &[]).await;
+async fn layers_carry_a_websocket_in_their_bodies() {
+    let kit = stack(&named(&["a", "b", "c"])).await;
+    let (status, io) = kit.websocket("/ws", &[("x-upper", "1")]).await;
     assert_eq!(status, 101);
     let mut io = io.unwrap();
-    // t2 upper-cases client → upstream bytes; the upstream echoes them.
+    // Upper-cased on the way up and down; the upstream echoes it.
     assert_eq!(echo(&mut io, b"hello").await, b"HELLO");
+    assert_eq!(echo(&mut io, b"again").await, b"AGAIN");
     drop(io);
     let ev = kit.request_event().await;
+    assert_eq!(strs(&ev["addons"]), ["a", "b", "c"], "{ev:#}");
     let tags = strs(&ev["tags"]);
-    for t in ["tunnel:t1", "tunnel:t2", "via:plain"] {
+    for t in ["via:a", "via:b", "via:c"] {
         assert!(tags.iter().any(|x| x == t), "{t} in {tags:?}");
     }
 }
 
 #[tokio::test]
-async fn a_close_from_the_upstream_ends_a_flow_through_tunnel_layers() {
-    let kit = stack(&[
-        AddonDef::tunnel_layer("t1", false),
-        AddonDef::tunnel_layer("t2", true),
-    ])
-    .await;
-    let (status, io) = kit.websocket("/ws", &[("x-echo", "once")]).await;
+async fn a_close_from_the_upstream_ends_a_websocket_through_layers() {
+    let kit = stack(&named(&["a", "b"])).await;
+    let (status, io) = kit
+        .websocket("/ws", &[("x-echo", "once"), ("x-upper", "1")])
+        .await;
     assert_eq!(status, 101);
     let mut io = io.unwrap();
     assert_eq!(echo(&mut io, b"hello").await, b"HELLO");
@@ -319,19 +317,12 @@ async fn a_close_from_the_upstream_ends_a_flow_through_tunnel_layers() {
     assert!(rest.is_empty(), "{rest:?}");
     drop(io);
     let ev = kit.request_event().await;
-    let tags = strs(&ev["tags"]);
-    for t in ["tunnel:t1", "tunnel:t2"] {
-        assert!(tags.iter().any(|x| x == t), "{t} in {tags:?}");
-    }
+    assert_eq!(strs(&ev["addons"]), ["a", "b"], "{ev:#}");
 }
 
 #[tokio::test]
-async fn a_plain_layer_can_refuse_an_upgrade() {
-    let kit = stack(&[
-        AddonDef::tunnel_layer("t1", false),
-        AddonDef::test_layer("plain"),
-    ])
-    .await;
+async fn a_layer_can_refuse_an_upgrade() {
+    let kit = stack(&named(&["a", "plain"])).await;
     let (status, io) = kit.websocket("/ws", &[("x-test-plain", "deny")]).await;
     assert_eq!(status, 403);
     assert!(io.is_none());
@@ -483,20 +474,14 @@ async fn sample_copies_a_share_of_matching_exchanges() {
 }
 
 #[tokio::test]
-async fn a_tunnel_layer_its_when_skips_stays_out_of_the_websocket() {
-    let kit = stack(&[
-        AddonDef::tunnel_layer("t1", true).when(r#"path != "/ws""#),
-        AddonDef::tunnel_layer("t2", false),
-    ])
-    .await;
-    let (status, io) = kit.websocket("/ws", &[]).await;
+async fn a_layer_its_when_skips_stays_out_of_the_websocket() {
+    let kit = stack(&[AddonDef::test_layer("a").when(r#"path != "/ws""#)]).await;
+    let (status, io) = kit.websocket("/ws", &[("x-upper", "1")]).await;
     assert_eq!(status, 101);
     let mut io = io.unwrap();
-    // t1 would upper-case; it is not in the byte path.
+    // `a` would upper-case; it is not in the byte path.
     assert_eq!(echo(&mut io, b"hello").await, b"hello");
     drop(io);
     let ev = kit.request_event().await;
-    let tags = strs(&ev["tags"]);
-    assert!(!tags.iter().any(|x| x == "tunnel:t1"), "{tags:?}");
-    assert!(tags.iter().any(|x| x == "tunnel:t2"), "{tags:?}");
+    assert!(strs(&ev["addons"]).is_empty(), "{ev:#}");
 }

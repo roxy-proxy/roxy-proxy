@@ -93,17 +93,6 @@ interface flow {
   metric-get: func(id: string, key: list<string>) -> option<s64>;
 }
 
-/// Raw byte streams after a protocol upgrade (`101 Switching Protocols`).
-/// Optional: roxy detects at load time whether a layer exports it.
-interface tunnel {
-  use wasi:io/streams@0.2.12.{input-stream, output-stream};
-
-  /// Relay an upgraded connection. Return when both directions are done;
-  /// dropping a stream closes that direction.
-  on-tunnel: func(from-client: input-stream, to-upstream: output-stream,
-                  from-upstream: input-stream, to-client: output-stream);
-}
-
 /// Instance start-up.
 interface init {
   /// Called once per instance, before its first exchange. An error fails
@@ -141,8 +130,3 @@ world layer {
   export init;
 }
 
-/// A layer that also relays upgraded connections.
-world tunnel-layer {
-  include layer;
-  export tunnel;
-}

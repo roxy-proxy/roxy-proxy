@@ -210,7 +210,7 @@ impl AddonLoader {
             let layer = Layer::load(&rt, bytes, lc)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
-            tracing::info!(addon = a.name, tunnel = layer.has_tunnel(), "addon loaded");
+            tracing::info!(addon = a.name, "addon loaded");
             layer
         };
         keep.push((a.name.clone(), key, layer.clone()));
