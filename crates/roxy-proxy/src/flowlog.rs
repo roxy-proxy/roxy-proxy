@@ -2,8 +2,10 @@
 //!
 //! Every stage of the pipeline emits [`FlowEvent`]s to a [`FlowSink`]. Events
 //! serialise to one JSON object per line, tagged by an `event` field. Sinks
-//! never panic and never propagate write failures into the data path: a
-//! failed write is reported as a `tracing` warning and the event is dropped.
+//! never panic and never block the data path on I/O: the log's own sink,
+//! [`BufferedSink`], queues lines for a writer thread and, while the queue
+//! is full or the writer is failing, holds traffic back through
+//! [`FlowSink::poll_ready`] rather than dropping an event.
 //!
 //! Strings that may contain secrets must pass through a [`Redactor`] before
 //! they are put into an event.
@@ -478,7 +480,9 @@ fn encode(event: &FlowEvent) -> Option<Vec<u8>> {
     }
 }
 
-/// Writes JSON lines to any [`Write`]r, flushing after every line.
+/// Writes JSON lines to any [`Write`]r, flushing after every line, and
+/// drops an event whose write fails. For tests and tools; an audit log is a
+/// [`BufferedSink`].
 pub struct WriterSink<W: Write + Send> {
     name: &'static str,
     writer: Mutex<W>,
