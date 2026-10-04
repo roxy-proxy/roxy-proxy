@@ -168,16 +168,16 @@ async fn a_trap_denies() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn budgets_are_enforced() {
+async fn limits_are_enforced() {
     let h = start(
-        "limits: { step_cpu: 20ms, fuel_per_step: 100_000_000_000, max_memory: 16mb, max_exchange_time: 2s }",
+        "limits: { max_memory: 16mb, first_byte_timeout: 500ms }",
         ALLOW_UPSTREAM,
     )
     .await;
     for (test, kind) in [
-        ("loop", "budget:step_cpu"),
+        ("loop", "budget:first_byte_timeout"),
         ("memory", "budget:max_memory"),
-        ("host-loop", "budget:max_exchange_time"),
+        ("host-loop", "budget:first_byte_timeout"),
     ] {
         let res = send(&h, test, "/x", "").await;
         assert_eq!(res.status(), 503, "{test}");
@@ -209,7 +209,11 @@ async fn a_failure_after_the_head_cuts_the_body() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn observe_mode_cannot_block() {
-    let h = start("mode: observe\nlimits: { step_cpu: 20ms }", ALLOW_UPSTREAM).await;
+    let h = start(
+        "mode: observe\nlimits: { first_byte_timeout: 200ms }",
+        ALLOW_UPSTREAM,
+    )
+    .await;
     for test in ["trap", "deny", "loop", "rewrite"] {
         let res = send(&h, test, "/observed", "payload").await;
         assert_eq!(res.status(), 200, "{test}");

@@ -314,12 +314,11 @@ impl Layer {
             .map_err(|_| LayerError::Cancelled)?;
         let started = Instant::now();
         let idle = self.inner.idle().pop();
-        let instance = match idle {
-            Some(i) => i,
-            None => {
-                let limit = self.inner.shared.config.limits.first_byte_timeout;
-                self.instantiate(started + limit).await?
-            }
+        let instance = if let Some(i) = idle {
+            i
+        } else {
+            let limit = self.inner.shared.config.limits.first_byte_timeout;
+            self.instantiate(started + limit).await?
         };
         Ok((instance, permit, started))
     }

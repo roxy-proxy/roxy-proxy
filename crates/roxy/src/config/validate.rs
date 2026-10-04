@@ -221,12 +221,6 @@ impl Config {
                             "`endpoint` is for `kind: service` addons",
                         ));
                     }
-                    if a.limits.first_byte_timeout.is_some() {
-                        d.push(Diagnostic::new(
-                            format!("{path}.limits.first_byte_timeout"),
-                            "`first_byte_timeout` is for `kind: service` addons",
-                        ));
-                    }
                 }
                 super::AddonKind::Service => Self::validate_service(&path, a, d),
             }
@@ -303,12 +297,6 @@ impl Config {
         let l = &a.limits;
         for (field, set) in [
             ("max_memory", l.max_memory.is_some()),
-            (
-                "max_buffered_body_bytes",
-                l.max_buffered_body_bytes.is_some(),
-            ),
-            ("step_cpu", l.step_cpu.is_some()),
-            ("fuel_per_step", l.fuel_per_step.is_some()),
             (
                 "recycle_after_exchanges",
                 l.recycle_after_exchanges.is_some(),

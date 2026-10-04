@@ -597,28 +597,17 @@ pub enum AddonMode {
     Observe,
 }
 
-/// Per-addon resource limits. Each defaults to the global
-/// setting when absent.
+/// Per-addon limits. They protect roxy and catch a broken addon; they
+/// don't police how fast it is. Each has a default when absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AddonLimits {
     /// Linear memory cap per instance (default 64 MiB).
     #[serde(deserialize_with = "units::opt_size")]
     pub max_memory: Option<ByteSize>,
-    /// Most body bytes the addon may hold (default
-    /// `limits.max_inspect_body_bytes`).
-    #[serde(deserialize_with = "units::opt_size")]
-    pub max_buffered_body_bytes: Option<ByteSize>,
-    /// CPU time between host calls (default 50 ms).
-    #[serde(with = "humantime_serde")]
-    pub step_cpu: Option<Duration>,
-    /// Fuel per I/O step (default 100 000 000).
-    #[serde(deserialize_with = "units::opt_count")]
-    pub fuel_per_step: Option<u64>,
-    /// Wall-clock budget per exchange, including endpoint calls.
-    #[serde(with = "humantime_serde")]
-    pub max_exchange_time: Option<Duration>,
-    /// A service addon must return a complete head within this time.
+    /// The addon must produce each response head (a service: each head)
+    /// within this much of its own time; time below it doesn't count
+    /// (default 30s).
     #[serde(with = "humantime_serde")]
     pub first_byte_timeout: Option<Duration>,
     /// Replace a WASM instance after this many exchanges (default 10 000).
@@ -627,7 +616,7 @@ pub struct AddonLimits {
     /// Replace a WASM instance whose memory passed this (default 48 MiB).
     #[serde(deserialize_with = "units::opt_size")]
     pub recycle_above_memory: Option<ByteSize>,
-    /// Most instances alive at once, i.e. concurrent exchanges (default 64).
+    /// Most instances alive at once, i.e. concurrent exchanges (default 1024).
     #[serde(deserialize_with = "units::opt_count")]
     pub max_instances: Option<u64>,
 }
