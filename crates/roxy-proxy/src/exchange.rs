@@ -219,7 +219,11 @@ pub(crate) async fn process<F: Front>(
         // log, see the request as it will leave.
         req.headers.remove("accept-encoding");
         let facts = &mut cx.facts;
-        for f in facts.client_request.iter_mut().chain(facts.request.iter_mut()) {
+        for f in facts
+            .client_request
+            .iter_mut()
+            .chain(facts.request.iter_mut())
+        {
             f.headers.remove("accept-encoding");
         }
     }

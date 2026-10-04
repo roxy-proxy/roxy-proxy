@@ -499,6 +499,23 @@ impl Handler for Layer {
                 drop(req);
                 answer_with(await_response(fut), out, false);
             }
+            "elsewhere-then-metric" => {
+                // Send the request (bodiless) to `x-to`'s host, wait for the
+                // response, then answer with this flow's `requests` metric
+                // as `metric-get` sees it.
+                let r = forward_head(&req);
+                let to = header(&req, "x-to").expect("x-to");
+                r.set_authority(Some(&to)).expect("authority");
+                let b = r.body().expect("body");
+                let fut = chain::next(r).expect("next");
+                OutgoingBody::finish(b, None).expect("finish");
+                drop(req);
+                let resp = await_response(fut);
+                drop(read_all(resp.consume().expect("consume")));
+                drop(resp);
+                let got = flow::metric_get("by_host", &[]);
+                respond(out, 200, format!("{got:?}").as_bytes());
+            }
             "invalid-next" => {
                 let r = forward_head(&req);
                 // wasi-http validates most of the head in its setters;

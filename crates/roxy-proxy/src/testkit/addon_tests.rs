@@ -111,6 +111,65 @@ async fn a_failure_is_attributed_to_the_layer_that_failed() {
     }
 }
 
+/// The outermost layer answering itself is `answered` and named; nothing
+/// below it runs.
+#[tokio::test]
+async fn an_outer_layer_answering_is_answered() {
+    let kit = stack(&named(&["a", "b"])).await;
+    let a = kit
+        .h1()
+        .await
+        .call("GET", "/x", &[("x-test-a", "deny")], b"")
+        .await;
+    assert_eq!(a.status, 403, "{a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "answered", "{ev:#}");
+    assert_eq!(ev["terminal_rule"], "layer:a");
+    assert!(ev["reason"].is_null(), "{ev:#}");
+    assert!(kit.upstream.seen().is_empty());
+}
+
+/// Metric keys come from the request that left the stack, for the core's
+/// samples and for `metric-get` alike: a layer that sends the request to
+/// another host reads the count keyed on that host.
+#[tokio::test]
+async fn metric_keys_follow_the_request_that_left() {
+    let kit = Kit::builder()
+        .rules(
+            r#"
+- id: both
+  when: host == "up.test" or host == "private.test"
+  then: { allow: { private_ok: true } }
+"#,
+        )
+        .metric_defs("- { id: by_host, count: requests, key: [host], window: 1h }")
+        .addon(AddonDef {
+            caps: vec![roxy_wasm::Capability::Metrics],
+            ..AddonDef::test_layer("a")
+        })
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let headers = [
+        ("x-test-a", "elsewhere-then-metric"),
+        ("x-to", "private.test"),
+    ];
+    let first = c.call("GET", "/m", &headers, b"").await;
+    assert_eq!(first.status, 200, "{first:?}");
+    assert_eq!(
+        first.text(),
+        "Some(1)",
+        "keyed on private.test, not up.test"
+    );
+    let second = c.call("GET", "/m", &headers, b"").await;
+    assert_eq!(second.text(), "Some(2)");
+    let seen = kit.upstream.wait_seen(2).await;
+    assert!(
+        seen.iter().all(|s| s.headers["host"] == "private.test"),
+        "{seen:?}"
+    );
+}
+
 #[tokio::test]
 async fn an_inner_layer_failing_after_the_head_cuts_the_body() {
     let kit = stack(&named(&["a", "b"])).await;

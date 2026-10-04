@@ -395,6 +395,44 @@ async fn ws_echo(h: &Harness) {
     ws.close(None).await.unwrap();
 }
 
+/// A WebSocket relayed through a layer is captured like any other: both
+/// heads, then the relayed bytes both ways.
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_through_a_layer_is_captured() {
+    let tmp = tempfile::tempdir().unwrap();
+    let extra = addon_yaml(tmp.path(), "");
+    let h = Harness::start_with(Opts {
+        rules: r#"
+  - id: ws
+    when: host == "ws.test"
+    then: [{ capture: both }, { allow: { upgrade: websocket, private_ok: true } }]
+"#,
+        extra: &extra,
+        capture: Some(""),
+        ..Opts::default()
+    })
+    .await;
+    ws_echo(&h).await;
+    let close = h.wait_events("ws_close", 1).await;
+    let ev = h.wait_events("request", 1).await;
+    let flow = ev[0]["flow"].as_str().unwrap().to_owned();
+    let records = h.captured();
+    for (dir, bytes) in [("request", "bytes_c2s"), ("response", "bytes_s2c")] {
+        let recs = support::capture_of(&records, &flow, dir);
+        assert_eq!(
+            recs.first().map(|(r, _)| &r["kind"]),
+            Some(&"head".into()),
+            "{dir}"
+        );
+        assert_eq!(
+            support::capture_body(&recs).len() as u64,
+            close[0][bytes].as_u64().unwrap(),
+            "{dir}"
+        );
+    }
+    h.stop().await;
+}
+
 /// A layer without `tunnel` sees (and could refuse) the upgrade request,
 /// then is out of the byte path.
 #[tokio::test(flavor = "multi_thread")]

@@ -259,7 +259,9 @@ impl Drop for Lease {
         };
         if !self.done && cx.record.decision.is_some() {
             // The rules had decided and the request was on its way.
-            cx.record.reason.get_or_insert_with(|| "upstream_aborted".to_owned());
+            cx.record
+                .reason
+                .get_or_insert_with(|| "upstream_aborted".to_owned());
         }
         *self.st.cx.lock().unwrap_or_else(PoisonError::into_inner) = Some(cx);
         self.st.returned.notify_one();
@@ -314,7 +316,12 @@ impl StackFlow {
             cx: Mutex::new(None),
             returned: Notify::new(),
             abandon: CancellationToken::new(),
-            layers: cx.snap.addons.iter().map(|_| LayerSlot::default()).collect(),
+            layers: cx
+                .snap
+                .addons
+                .iter()
+                .map(|_| LayerSlot::default())
+                .collect(),
             failure: Mutex::new(None),
             reported: AtomicBool::new(false),
             close: AtomicBool::new(false),
@@ -359,7 +366,12 @@ impl StackFlow {
     /// stopped, and its record comes back with it.
     async fn reclaim(&self) -> FlowCx {
         loop {
-            if let Some(cx) = self.cx.lock().unwrap_or_else(PoisonError::into_inner).take() {
+            if let Some(cx) = self
+                .cx
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
                 return cx;
             }
             self.abandon.cancel();
@@ -707,7 +719,9 @@ async fn core(
     };
     let Some(outcome) = outcome else {
         // The lease records the abandonment as it goes back.
-        return Err(HostError::new("the layer answered without the upstream's response"));
+        return Err(HostError::new(
+            "the layer answered without the upstream's response",
+        ));
     };
     lease.done = true;
     let cx = lease.cx();
