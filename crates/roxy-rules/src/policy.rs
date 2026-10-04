@@ -2,6 +2,7 @@
 //! watching), the head decision, and watching evaluation.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1084,27 +1085,29 @@ impl PolicyCompiler<'_, '_> {
                     .collect()
             }
             Action::Redirect(r) => {
-                let host = r.host.strip_suffix('.').unwrap_or(&r.host);
-                let valid = !host.is_empty()
-                    && host
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b':'));
-                if !valid {
+                // The same grammar as a request target's host, so the proxy
+                // never meets a redirect host it can't parse.
+                let host = roxy_http::url::parse_host(r.host.as_bytes());
+                if let Err(e) = &host {
                     self.push(
                         rule,
                         apath,
-                        format!("redirect host {:?} is not a valid host name or IP", r.host),
+                        format!("redirect host {:?} is not a valid host: {e}", r.host),
                     );
                 }
-                if r.port == 0 {
+                let port = NonZeroU16::new(r.port);
+                if port.is_none() {
                     self.push(rule, apath, "redirect port must not be 0");
                 }
-                vec![CAction::Effect(Effect::Redirect {
-                    host: host.to_ascii_lowercase(),
-                    port: r.port,
-                    scheme: r.scheme,
-                    rewrite_host: r.rewrite_host,
-                })]
+                match (host, port) {
+                    (Ok(host), Some(port)) => vec![CAction::Effect(Effect::Redirect {
+                        host,
+                        port,
+                        scheme: r.scheme,
+                        rewrite_host: r.rewrite_host,
+                    })],
+                    _ => Vec::new(),
+                }
             }
             Action::Tag(t) => {
                 if t.is_empty() || t.chars().any(|c| c.is_whitespace() || c.is_control()) {

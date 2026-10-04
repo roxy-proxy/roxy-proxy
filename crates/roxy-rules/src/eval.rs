@@ -4,10 +4,12 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::fmt;
+use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
 
 use regex::Regex;
+use roxy_http::Host;
 
 use crate::compile::{Const, OrdOp, Pred, ROperand, StrOp};
 use crate::config::{CaptureTarget, LogLevel, Scheme};
@@ -243,8 +245,8 @@ pub enum Effect {
     },
     RemoveQuery(String),
     Redirect {
-        host: String,
-        port: u16,
+        host: Host,
+        port: NonZeroU16,
         /// `None` keeps the request's scheme.
         scheme: Option<Scheme>,
         rewrite_host: bool,

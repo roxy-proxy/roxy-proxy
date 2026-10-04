@@ -964,8 +964,8 @@ fn every_effect_kind() {
     assert_eq!(
         out.effects[5],
         Effect::Redirect {
-            host: "mirror.example.org".into(),
-            port: 8443,
+            host: roxy_http::Host::Dns("mirror.example.org".into()),
+            port: std::num::NonZeroU16::new(8443).unwrap(),
             scheme: Some(Scheme::Https),
             rewrite_host: true
         }
@@ -1094,4 +1094,34 @@ fn null_literal_misuse_is_a_compile_error() {
             "should reject: {bad}"
         );
     }
+}
+
+/// A `redirect` host is held to the request-target host grammar when the
+/// policy compiles, so the proxy never meets one it can't parse.
+#[test]
+fn redirect_host_is_checked_at_compile_time() {
+    for bad in ["127.1", "0x7f000001", "::1", "[::1", "a b", ""] {
+        assert!(
+            try_compile(
+                "",
+                &format!("- {{ id: r, then: {{ redirect: {{ host: '{bad}', port: 80 }} }} }}")
+            )
+            .is_err(),
+            "should reject: {bad:?}"
+        );
+    }
+    for good in ["10.0.0.1", "[::1]", "Mirror.Example.org."] {
+        assert!(
+            try_compile(
+                "",
+                &format!("- {{ id: r, then: {{ redirect: {{ host: '{good}', port: 80 }} }} }}")
+            )
+            .is_ok(),
+            "should accept: {good:?}"
+        );
+    }
+    assert!(
+        try_compile("", "- { id: r, then: { redirect: { host: a, port: 0 } } }").is_err(),
+        "port 0"
+    );
 }

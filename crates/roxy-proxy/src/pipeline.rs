@@ -28,7 +28,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use http::StatusCode;
 use roxy_http::h1::ServerConn;
-use roxy_http::url::{normalize_path, normalize_query, parse_host};
+use roxy_http::url::{normalize_path, normalize_query};
 use roxy_http::{
     Authority, Body, BodyError, CanonicalRequest, CanonicalResponse, ParseError, Query, Reason,
     Scheme,
@@ -902,13 +902,12 @@ fn apply_request_effect(
             scheme,
             rewrite_host,
         } => {
-            let new_host = parse_host(host.as_bytes()).map_err(|e| invalid(kind, &e))?;
             if rewrite_host {
                 cx.host_override = None;
             } else if cx.host_override.is_none() {
                 cx.host_override = Some(req.authority.to_host_header(req.scheme));
             }
-            req.authority = Authority::new(new_host, port);
+            req.authority = Authority::new(host, port.get());
             if let Some(s) = scheme {
                 req.scheme = rules_scheme(s);
             }
