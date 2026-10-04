@@ -58,6 +58,8 @@ pub(crate) struct Needs {
     /// The watched values read, as written (`body.bytes`,
     /// `metric.egress (request_bytes)`), in order of first appearance.
     pub watched: Vec<String>,
+    /// The tags read (`tag["x"]`), in order of first appearance.
+    pub tags: Vec<Box<str>>,
 }
 
 /// A compile-time constant operand.
@@ -423,9 +425,12 @@ impl Compiler<'_, '_> {
             Operand::Field(f) => {
                 let metric = self.env.metric;
                 let access = resolve(f, &|id| metric(id).is_some())?;
-                match access {
+                match &access {
                     Access::BodyText => self.needs.request_body = true,
                     Access::RespBodyText => self.needs.response_body = true,
+                    Access::Tag(t) if !self.needs.tags.contains(t) => {
+                        self.needs.tags.push(t.clone());
+                    }
                     _ => {}
                 }
                 let (reads, name) = match &access {

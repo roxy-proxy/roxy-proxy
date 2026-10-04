@@ -110,6 +110,16 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: a, then: passthrough }",
     ),
     (
+        "tag read above the rule that sets it",
+        "",
+        "- { id: read, when: 'tag[\"risky\"]', then: deny }\n- { id: mark, when: 'path starts_with \"/admin\"', then: [{ tag: risky }] }",
+    ),
+    (
+        "tag read at the head but set by a watching rule",
+        "",
+        "- { id: big, when: 'body.bytes > 10', then: [{ tag: big }] }\n- { id: read, when: 'tag[\"big\"]', then: deny }",
+    ),
+    (
         "multi-key action map",
         "",
         "- { id: a, then: { set_header: { x: y }, allow: {} } }",

@@ -56,7 +56,11 @@ runs follows from what it reads.
 4. **A watching rule's non-terminal effects apply once**, the first time it
    matches.
 5. **Order matters for effects, not decisions.** Rules are evaluated top to
-   bottom, so a `tag` set by one rule is visible to the rules below it. If
+   bottom, so a `tag` set by one rule is visible to the rules below it. A
+   rule that reads a tag must come after every rule that sets it (a head
+   rule above it, or, for a watching rule, any head rule); otherwise the
+   config is rejected, since moving a rule would change what it sees. A
+   rule may read its own tag, and a tag no rule sets (from an addon). If
    the request is allowed, the effects of every matching rule apply in list
    order; if two set the same header, the later wins. If it is denied, or a
    change to it fails (which denies it with `_fail_closed`), the `log` and
