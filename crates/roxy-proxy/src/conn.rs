@@ -1,17 +1,19 @@
-//! The explicit-proxy connection state machine (docs/http.md#explicit-proxy):
-//! proxy-port requests, CONNECT → sniff → TLS termination or plaintext
-//! tunnel, and the request loop inside a tunnel.
+//! The connection state machines: the explicit proxy
+//! (docs/http.md#explicit-proxy: proxy-port requests, CONNECT → sniff → TLS
+//! termination or plaintext tunnel), direct listeners
+//! (docs/http.md#direct-listeners: sniff → TLS termination by SNI, or
+//! plaintext by `Host`), and the request loop inside a tunnel.
 
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::StatusCode;
 use roxy_http::h1::{Incoming, Role, ServerConn};
 use roxy_http::{
     Authority, Body, CanonicalRequest, CanonicalResponse, Host, Method, Reason, Scheme,
 };
 use roxy_tls::{MAX_HELLO_BYTES, Sniff, looks_like_http, sniff};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_rustls::TlsAcceptor;
 
 use crate::auth::{AuthCache, authenticate};
@@ -257,39 +259,15 @@ async fn handle_connect(
     let flags = snap.flags.clone();
     drop(snap);
 
-    let Ok((io, mut buf)) = conn.accept_connect().await else {
+    let Ok((io, buf)) = conn.accept_connect().await else {
         return;
     };
     drop(handle);
 
     // Classify the first bytes (docs/http.md#explicit-proxy): TLS, plaintext HTTP, or close.
-    let classified = tokio::time::timeout(limits.header_timeout, async {
-        let mut io = io;
-        loop {
-            if !buf.is_empty() {
-                match sniff(&buf) {
-                    Sniff::NeedMore => {}
-                    other => return (io, Some(other)),
-                }
-            }
-            if buf.len() >= MAX_HELLO_BYTES + 5 {
-                return (io, Some(Sniff::NotTls));
-            }
-            buf.reserve(4096);
-            match io.read_buf(&mut buf).await {
-                Ok(0) | Err(_) => return (io, None),
-                Ok(_) => {}
-            }
-        }
-    })
-    .await;
-    let (io, sniffed) = match classified {
-        Ok((io, Some(s))) => (io, s),
-        Ok((_, None)) => return,
-        Err(_) => {
-            shared.emit_parse_reason(&client, None, "tunnel_timeout", None);
-            return;
-        }
+    let Some((io, buf, sniffed)) = classify(io, buf, limits.header_timeout, &client, &shared).await
+    else {
+        return;
     };
     match sniffed {
         Sniff::Tls(hello) => {
@@ -327,6 +305,135 @@ async fn handle_connect(
             } else {
                 shared.emit_parse_reason(&client, None, "non_http_in_connect", None);
             }
+        }
+    }
+}
+
+/// Reads until the first bytes are classified as TLS or not. `None` when
+/// the client went away or took longer than `timeout` (logged).
+async fn classify<IO: AsyncRead + Unpin>(
+    mut io: IO,
+    mut buf: BytesMut,
+    timeout: std::time::Duration,
+    client: &ClientConn,
+    shared: &Shared,
+) -> Option<(IO, BytesMut, Sniff)> {
+    let sniffed = tokio::time::timeout(timeout, async {
+        loop {
+            if !buf.is_empty() {
+                match sniff(&buf) {
+                    Sniff::NeedMore => {}
+                    other => return Some(other),
+                }
+            }
+            if buf.len() >= MAX_HELLO_BYTES + 5 {
+                return Some(Sniff::NotTls);
+            }
+            buf.reserve(4096);
+            match io.read_buf(&mut buf).await {
+                Ok(0) | Err(_) => return None,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    match sniffed {
+        Ok(Some(s)) => Some((io, buf, s)),
+        Ok(None) => None,
+        Err(_) => {
+            shared.emit_parse_reason(client, None, "tunnel_timeout", None);
+            None
+        }
+    }
+}
+
+/// Reads until `buf` holds a whole request method and the space after it,
+/// or plainly cannot (a byte that is not an upper-case letter, 16 bytes,
+/// EOF, `timeout`), so [`looks_like_http`] does not refuse a request line
+/// that arrived in pieces.
+async fn read_method<IO: AsyncRead + Unpin>(
+    mut io: IO,
+    mut buf: BytesMut,
+    timeout: std::time::Duration,
+) -> (IO, BytesMut) {
+    let pending = |b: &[u8]| b.len() < 16 && b.iter().all(u8::is_ascii_uppercase);
+    let _ = tokio::time::timeout(timeout, async {
+        while pending(&buf) {
+            match io.read_buf(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    (io, buf)
+}
+
+/// A direct listener's connection (docs/http.md#direct-listeners): the
+/// client believes it is talking to the origin on `port`. TLS is
+/// terminated for the SNI, plaintext is parsed with `Host` as the
+/// authority, anything else is closed.
+pub(crate) async fn serve_direct(
+    stream: BoxIo,
+    client: ClientConn,
+    port: u16,
+    shared: Arc<Shared>,
+) {
+    let snap = shared.snapshot();
+    let limits = snap.limits.clone();
+    drop(snap);
+    let Some((io, buf, sniffed)) = classify(
+        stream,
+        BytesMut::new(),
+        limits.header_timeout,
+        &client,
+        &shared,
+    )
+    .await
+    else {
+        return;
+    };
+    match sniffed {
+        Sniff::Tls(hello) => {
+            let Some(sni) = hello.sni else {
+                shared.emit_parse_reason(&client, None, "no_sni", None);
+                return;
+            };
+            // The SNI names the host; the port is the one the client
+            // connected to.
+            let authority = match roxy_http::url::parse_authority(sni.as_bytes(), port) {
+                Ok(a) if a.port == port => a,
+                _ => {
+                    shared.emit_parse_reason(&client, None, "bad_sni", Some(&sni));
+                    return;
+                }
+            };
+            Box::pin(terminate_tls(
+                ConnIo::new(io),
+                buf.freeze(),
+                client,
+                authority,
+                shared,
+            ))
+            .await;
+        }
+        Sniff::NotTls | Sniff::NeedMore => {
+            let (io, buf) = read_method(io, buf, limits.header_timeout).await;
+            if !looks_like_http(&buf) {
+                shared.emit_parse_reason(&client, None, "non_http_on_direct", None);
+                return;
+            }
+            let snap = shared.snapshot();
+            let handle = ConnIo::new(io);
+            let conn = ServerConn::with_buffered(
+                handle.clone(),
+                buf,
+                Role::Direct { port },
+                snap.limits.clone(),
+                snap.flags.clone(),
+            );
+            drop(snap);
+            tunnel_loop(conn, handle, client, None, shared).await;
         }
     }
 }
@@ -419,6 +526,21 @@ async fn tunnel_loop(
             Err(e) => {
                 exchange::close_on_parse_error(conn, None, &client, &shared, &e).await;
                 return;
+            }
+            Ok(Some(Incoming::Request(req)))
+                if is_internal(&req) && matches!(conn.role(), Role::Direct { .. }) =>
+            {
+                // A direct listener is reached through roxy's DNS, which
+                // steers `roxy.internal` here too (docs/tls.md#ca-distribution).
+                let framing = ClientFraming {
+                    close: req.meta.close,
+                };
+                let res = internal_response(&req, &shared);
+                drop(req);
+                match respond(conn, &handle, res, false, framing, b"").await {
+                    Some(c) => conn = c,
+                    None => return,
+                }
             }
             Ok(Some(Incoming::Request(req))) => {
                 match exchange::run(conn, &handle, req, client.clone(), tls.clone(), &shared).await

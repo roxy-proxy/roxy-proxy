@@ -50,8 +50,9 @@ the PR (`fuzz/README.md`).
 - Rust workspace, stable toolchain, edition 2024. `unsafe` is forbidden and
   clippy runs at `pedantic`.
 - Crates live in `crates/`: `roxy` (the binary), `roxy-http`, `roxy-proxy`,
-  `roxy-rules`, `roxy-tls`, `roxy-log`, `roxy-wasm` (the addon host) and
-  `roxy-addon` (the addon SDK).
+  `roxy-rules`, `roxy-tls`, `roxy-dns` (the DNS listener's codec),
+  `roxy-log`, `roxy-wasm` (the addon host) and `roxy-addon` (the addon
+  SDK).
 - roxy is a security boundary. The design principles (fail closed, deny
   always wins, canonical re-serialisation, ...) are not negotiable for
   convenience: if a change weakens one, raise it on the issue first.

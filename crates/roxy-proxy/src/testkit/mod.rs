@@ -25,6 +25,8 @@ mod coding_tests;
 #[cfg(test)]
 mod core_tests;
 #[cfg(test)]
+mod direct_tests;
+#[cfg(test)]
 mod early_tests;
 mod upstream;
 
@@ -222,6 +224,7 @@ impl KitBuilder {
         let server = Server::start(RuntimeConfig {
             listeners: Vec::new(),
             ca_server: None,
+            dns: None,
             ca: ca.clone(),
             minter,
             require_sni_match: true,
@@ -282,6 +285,30 @@ impl Kit {
         }
     }
 
+    /// A raw client connection to a direct listener whose clients connect
+    /// to `port`.
+    pub(crate) fn connect_direct(&self, port: u16) -> tokio::io::DuplexStream {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let conn = ClientConn {
+            id: Ulid::generate(),
+            listener: Arc::new(ListenerInfo {
+                name: "direct".to_owned(),
+                mode: ListenerMode::Direct { port },
+                auth_required: false,
+            }),
+            peer: "192.0.2.7:40000".parse().unwrap(),
+            user: None,
+            original_dst: None,
+        };
+        tokio::spawn(crate::conn::serve_direct(
+            Box::new(server),
+            conn,
+            port,
+            self.server.shared().clone(),
+        ));
+        client
+    }
+
     /// A raw client connection to the proxy port.
     pub(crate) fn connect(&self) -> tokio::io::DuplexStream {
         let (client, server) = tokio::io::duplex(64 * 1024);
@@ -324,12 +351,36 @@ impl Kit {
         }
         let head = String::from_utf8_lossy(&head);
         assert!(head.starts_with("HTTP/1.1 200"), "CONNECT: {head}");
-        let mut cfg = (*roxy_tls::client_config(&UpstreamTlsOptions {
+        self.tls_client(io, host, h2).await
+    }
+
+    /// A direct listener on port 443: TLS with SNI `host` and roxy's leaf,
+    /// then HTTP/2 (`h2`) or HTTP/1.1 inside.
+    pub(crate) async fn direct_tls(&self, host: &str, h2: bool) -> Client {
+        self.tls_client(self.connect_direct(443), host, h2).await
+    }
+
+    /// A plaintext HTTP/1.1 client on a direct listener on port 80, sending
+    /// `host` as `Host`.
+    pub(crate) async fn direct_plain(&self, host: &str) -> Client {
+        Client::h1(self.connect_direct(80), Some(host)).await
+    }
+
+    /// Roxy's CA as a client trust store.
+    pub(crate) fn client_tls(&self) -> rustls::ClientConfig {
+        (*roxy_tls::client_config(&UpstreamTlsOptions {
             extra_roots_pem: vec![self.ca_file.clone()],
             ..UpstreamTlsOptions::default()
         })
         .unwrap())
-        .clone();
+        .clone()
+    }
+
+    async fn tls_client<IO>(&self, io: IO, host: &str, h2: bool) -> Client
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let mut cfg = self.client_tls();
         cfg.alpn_protocols = vec![if h2 {
             b"h2".to_vec()
         } else {

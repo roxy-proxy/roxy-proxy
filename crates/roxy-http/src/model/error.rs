@@ -20,7 +20,7 @@ pub enum Reason {
     /// that is not authority-form, empty, ...).
     BadRequestTarget,
     /// Request-target form does not match the context: absolute-form inside a
-    /// tunnel, CONNECT inside a tunnel, origin-form CONNECT, ...
+    /// tunnel, CONNECT off the proxy port, origin-form CONNECT, ...
     TargetFormMismatch,
     /// Version is not `HTTP/1.1` (or `HTTP/1.0` when allowed).
     UnsupportedVersion,

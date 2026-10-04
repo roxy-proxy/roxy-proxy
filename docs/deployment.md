@@ -49,6 +49,68 @@ as it can be while still being useful:
   because the network allows nothing else, and everything that does reach
   roxy is decided by a rule.
 
+### DNS steering
+
+For workloads that ignore proxy settings, roxy can be the workload's DNS
+server and accept connections addressed to the origins themselves
+([DNS steering](dns.md)). The containment recipe is the same: the network
+is what holds the workload, and roxy is its only way out. The steps
+change:
+
+1. **Give roxy a fixed address on the workload's network**, and point the
+   workload's resolver at it (Docker `dns:`, Kubernetes `dnsConfig`, or
+   `/etc/resolv.conf`).
+2. **Run direct listeners on the ports the workload uses** (usually 443 and
+   80) and the DNS listener on 53, with `dns.answer` set to roxy's address
+   on that network.
+3. **Keep roxy's own resolver separate.** `upstream.dns` must reach a real
+   resolver, never roxy's DNS listener; otherwise every name resolves to
+   roxy.
+4. **Make the workload trust roxy's CA** ([CA distribution](tls.md#ca-distribution)).
+   No proxy variables are needed. `http://roxy.internal/roxy-ca.pem` works
+   from inside, because roxy's DNS sends that name to the direct listener
+   on port 80.
+
+With Docker Compose:
+
+```yaml
+services:
+  roxy:
+    image: ghcr.io/roxy-proxy/roxy:edge
+    volumes: [./roxy.yaml:/etc/roxy/roxy.yaml:ro, roxy-ca:/var/lib/roxy/ca]
+    networks:
+      sandbox: { ipv4_address: 172.30.0.2 }
+      egress: {}
+  agent:
+    image: curlimages/curl
+    dns: [172.30.0.2]
+    networks: [sandbox]
+networks:
+  sandbox:
+    internal: true
+    # Other containers get addresses from ip_range, so roxy's is never taken.
+    ipam: { config: [{ subnet: 172.30.0.0/24, ip_range: 172.30.0.128/25 }] }
+  egress: {}
+volumes:
+  roxy-ca: {}
+```
+
+```yaml
+# roxy.yaml, in part
+listeners:
+  - { name: https, mode: direct, bind: 0.0.0.0:443 }
+  - { name: http,  mode: direct, bind: 0.0.0.0:80 }
+dns:
+  bind: 0.0.0.0:53
+  answer: { ipv4: 172.30.0.2 }
+```
+
+Docker lets unprivileged processes bind low ports inside a container
+(`net.ipv4.ip_unprivileged_port_start=0`), so the image binds 53, 80 and
+443 as UID 65532 with no capabilities. Elsewhere, bind high ports and
+redirect to them, setting each direct listener's `target_port` to the port
+clients connect to.
+
 ## Container image
 
 `ghcr.io/roxy-proxy/roxy` is built from the `Dockerfile` for `linux/amd64`
@@ -121,8 +183,8 @@ release carries prebuilt binaries (static musl builds for Linux).
 
 - **Reload:** edit the config, list files or addon files, or send
   `SIGHUP`. A bad config is rejected and the running one stays
-  ([reload](rules.md#reload)). Listener, TLS and capture settings need a
-  restart.
+  ([reload](rules.md#reload)). Listener, `dns`, TLS and capture settings
+  need a restart.
 - **Logs:** the flow log goes to stdout or `log.flow.path`; roxy's own logs
   go to stderr (`--log-format json|pretty`, `--log-level` or `RUST_LOG`).
   `SIGHUP` also reopens log files.

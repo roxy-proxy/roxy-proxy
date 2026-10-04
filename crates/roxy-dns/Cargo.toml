@@ -1,0 +1,16 @@
+[package]
+name = "roxy-dns"
+description = "The DNS wire codec behind roxy's DNS listener"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1.11.0"
+
+[lints]
+workspace = true

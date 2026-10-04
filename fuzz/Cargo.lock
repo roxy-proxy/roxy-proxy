@@ -710,6 +710,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxy-dns"
+version = "0.1.0"
+
+[[package]]
 name = "roxy-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -718,6 +722,7 @@ dependencies = [
  "http",
  "ipnet",
  "libfuzzer-sys",
+ "roxy-dns",
  "roxy-http",
  "roxy-rules",
  "roxy-tls",

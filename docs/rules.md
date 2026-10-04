@@ -151,7 +151,7 @@ fields become known later, so rules that read them watch.
 | field | type | known |
 |---|---|---|
 | `client.ip`, `client.port`, `client.user` | ip, int, string | head |
-| `listener.name`, `listener.mode` | string | head |
+| `listener.name`, `listener.mode` (`explicit` or `direct`) | string | head |
 | `tls.sni`, `tls.alpn`, `tls.version` | string | head |
 | `method`, `scheme`, `host`, `port`, `path`, `url` | string / int | head |
 | `query["k"]`, `query.raw` | string | head |
@@ -319,7 +319,7 @@ started with, and the next request on any connection uses the new one. On
 failure the old policy stays, a `config_reload_failed` event carries the
 diagnostics, and nothing is partially applied.
 
-Listener, TLS and capture settings need a restart.
+Listener, `dns`, TLS and capture settings need a restart.
 
 ## Dry run
 
@@ -336,5 +336,6 @@ client, headers and body, and `--body-bytes`, `--response-status`,
 `--response-header` and `--response-body-bytes` run the watching rules
 that read them. `--ws-text`, `--ws-opcode`, `--ws-size` and
 `--ws-direction` describe one WebSocket message and run the rules that
-read `ws.*`. An IP-literal URL also shows an address-floor hit. See
-`roxy rule test --help`.
+read `ws.*`. The request arrives on the config's first listener, which
+sets `listener.name` and `listener.mode`. An IP-literal URL also shows an
+address-floor hit. See `roxy rule test --help`.
