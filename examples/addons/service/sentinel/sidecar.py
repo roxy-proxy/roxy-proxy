@@ -8,8 +8,8 @@ runs the configured sentinel on it before the agent sees the response:
 
     continue   the response goes to the agent unchanged
     modify     the tool call's arguments are replaced (JSON responses)
-    reject     the agent gets a 403 carrying the decision's message
-    terminate  the agent gets a 403; the sidecar cannot end the agent itself
+    reject     the agent does not get the response (see SENTINEL_ON_REJECT)
+    terminate  as reject; the sidecar cannot end the agent itself
     escalate   unresolved at the root: treated as reject (fail closed)
 
 Everything else (and every non-200 answer) passes through untouched.
@@ -26,12 +26,17 @@ Configuration (environment):
     SENTINEL_MONITOR_MODEL   the model `context.host.generate` uses (e.g. anthropic/claude-haiku-4-5)
     SENTINEL_LISTEN          host:port to listen on (default 127.0.0.1:9000)
     SENTINEL_TASK            the deployed agent's name, for `context.task`
+    SENTINEL_ON_REJECT       deny (default): the agent gets a 403 carrying the
+                             decision's message; explain: an Anthropic response
+                             is replaced by an assistant message saying what was
+                             blocked, so the agent's turn ends normally
 
 Known gaps, as inspect_sentinel's deployment design describes them: a
 proxy sees `AfterToolCall` only in the next request (not projected here);
-`reject` here is an error the agent's SDK raises, not the
-append-and-regenerate replay an eval does; and streamed responses are held
-until judged, which costs time to first token.
+`reject` here is an error the agent's SDK raises (or, with `explain`, the
+end of the agent's turn), not the append-and-regenerate replay an eval does;
+and streamed responses are held until judged, which costs time to first
+token.
 """
 
 from __future__ import annotations
@@ -262,6 +267,59 @@ class Call:
                         tc["function"]["arguments"] = json.dumps(replacement.arguments)
 
 
+def explanation(response: dict[str, Any], message: str) -> dict[str, Any]:
+    """An Anthropic `Message` that keeps the model's text, drops its tool
+    calls and thinking, and says what was blocked. Its `end_turn` hands the
+    turn back to the person, as an ordinary answer would."""
+    text = [b for b in response.get("content", []) if b.get("type") == "text"]
+    return {
+        **response,
+        "content": [*text, {"type": "text", "text": message}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+    }
+
+
+def anthropic_to_sse(message: dict[str, Any]) -> bytes:
+    """The event stream for a whole Anthropic `Message` (text blocks only)."""
+    start = {**message, "content": [], "stop_reason": None, "stop_sequence": None}
+    events: list[tuple[str, dict[str, Any]]] = [
+        ("message_start", {"type": "message_start", "message": start})
+    ]
+    for i, block in enumerate(message["content"]):
+        events += [
+            (
+                "content_block_start",
+                {"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}},
+            ),
+            (
+                "content_block_delta",
+                {"type": "content_block_delta", "index": i, "delta": {"type": "text_delta", "text": block["text"]}},
+            ),
+            ("content_block_stop", {"type": "content_block_stop", "index": i}),
+        ]
+    events += [
+        (
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": message["stop_reason"], "stop_sequence": None},
+                "usage": {"output_tokens": message.get("usage", {}).get("output_tokens", 0)},
+            },
+        ),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+    return "".join(f"event: {e}\ndata: {json.dumps(d)}\n\n" for e, d in events).encode()
+
+
+@dataclasses.dataclass
+class Refusal:
+    """The agent does not get this response."""
+
+    message: str
+    call: Call | None = None
+
+
 def classify(req: Request) -> str | None:
     path = req.url.split("?", 1)[0]
     if path.endswith("/v1/messages"):
@@ -275,7 +333,10 @@ def classify(req: Request) -> str | None:
 
 
 class Sidecar:
-    def __init__(self, sentinel: Any) -> None:
+    def __init__(self, sentinel: Any, on_reject: str = "deny") -> None:
+        if on_reject not in ("deny", "explain"):
+            raise ValueError(f"SENTINEL_ON_REJECT must be deny or explain, not {on_reject!r}")
+        self.explain = on_reject == "explain"
         self.root = resolve_sentinel(sentinel)
         self.host = SidecarHost()
         self.stores = Stores()
@@ -299,35 +360,44 @@ class Sidecar:
         if verdict is None:
             await ex.respond(res, raw)
         elif isinstance(verdict, bytes):
-            headers = [(n, v) for n, v in res.headers if n.lower() != "content-length"]
-            headers.append(("content-length", str(len(verdict))))
-            await ex.respond(Response(res.status, headers), verdict)
+            await ex.respond(with_length(res, len(verdict)), verdict)
+        elif self.explain and verdict.call and verdict.call.api == "anthropic":
+            message = explanation(verdict.call.response, verdict.message)
+            out = anthropic_to_sse(message) if verdict.call.streamed else json.dumps(message).encode()
+            await ex.respond(with_length(res, len(out)), out)
         else:
-            await ex.deny(403, verdict)
+            await ex.deny(403, verdict.message)
 
     async def judge(
         self, ex: Exchange, api: str, body: bytes, res: Response, raw: bytes
-    ) -> None | bytes | str:
+    ) -> None | bytes | Refusal:
         """None to pass the response on, new bytes for a modified response,
-        or the message for a refusal."""
+        or a refusal."""
         streamed = (res.header("content-type") or "").startswith("text/event-stream")
         try:
             request = json.loads(body)
             if streamed and api == "anthropic":
                 response = anthropic_from_sse(raw)
             elif streamed:
-                return "the sentinel cannot read this streamed response (use stream: false)"
+                return Refusal("the sentinel cannot read this streamed response (use stream: false)")
             else:
                 response = json.loads(raw)
         except (ValueError, KeyError, IndexError) as e:
             log.warning("unreadable %s exchange: %s", api, e)
-            return "the sentinel could not read this model exchange"
+            return Refusal("the sentinel could not read this model exchange")
         call = Call(api, request, response, streamed)
         output = await call.output()
         tool_calls = output.message.tool_calls or []
         if not tool_calls:
             return None
-        input = await call.input()
+        try:
+            input = await call.input()
+        except Exception as e:  # noqa: BLE001
+            # The history is context for the sentinel, not the thing it
+            # judges: a conversation the converter cannot read still gets
+            # its tool calls judged, with no history.
+            log.warning("unreadable %s conversation history: %s", api, e)
+            input = []
         conversation = call.conversation()
         first_user = next((m for m in input if m.role == "user"), None)
         context = Context(
@@ -367,8 +437,16 @@ class Sidecar:
             # reject, terminate, an unresolved escalate, or a modify that
             # cannot be applied: the agent does not get this response.
             log.info("%s on %s: %s", action, tc.function, decision and decision.explanation)
-            return (decision and decision.message) or f"tool call {tc.function} refused ({action})"
+            return Refusal(
+                (decision and decision.message) or f"tool call {tc.function} refused ({action})",
+                call,
+            )
         return json.dumps(call.response).encode() if modified else None
+
+
+def with_length(res: Response, length: int) -> Response:
+    headers = [(n, v) for n, v in res.headers if n.lower() != "content-length"]
+    return Response(res.status, [*headers, ("content-length", str(length))])
 
 
 def load_sentinel(spec: str) -> Any:
@@ -379,7 +457,10 @@ def load_sentinel(spec: str) -> Any:
 
 
 async def main() -> None:
-    sidecar = Sidecar(load_sentinel(os.environ.get("SENTINEL", "policies:no_network")))
+    sidecar = Sidecar(
+        load_sentinel(os.environ.get("SENTINEL", "policies:no_network")),
+        os.environ.get("SENTINEL_ON_REJECT", "deny"),
+    )
     host, _, port = os.environ.get("SENTINEL_LISTEN", "127.0.0.1:9000").rpartition(":")
     async with serve(sidecar.handle, host, int(port)) as server:
         log.info("sentinel sidecar listening on %s:%s", host, port)
