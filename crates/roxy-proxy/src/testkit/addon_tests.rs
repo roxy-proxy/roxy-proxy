@@ -337,3 +337,166 @@ async fn a_plain_layer_can_refuse_an_upgrade() {
     assert!(io.is_none());
     assert!(kit.upstream.seen().is_empty());
 }
+
+#[tokio::test]
+async fn a_layer_runs_only_where_its_when_matches() {
+    let kit = stack(&[
+        AddonDef::test_layer("a").when(r#"path starts_with "/a/""#),
+        AddonDef::test_layer("b"),
+    ])
+    .await;
+    let mut c = kit.h1().await;
+    let a = c.call("POST", "/x", &[], b"body").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["via"], "b");
+    assert_eq!(a.json()["body_len"], 4);
+    let a = c.call("POST", "/a/x", &[], b"body").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["via"], "a,b");
+    let reqs = kit.events("request", 2).await;
+    // `addons` names the layers that ran.
+    assert_eq!(strs(&reqs[0]["addons"]), ["b"], "{reqs:#?}");
+    assert_eq!(strs(&reqs[1]["addons"]), ["a", "b"], "{reqs:#?}");
+}
+
+#[tokio::test]
+async fn a_skipped_layer_passes_an_inner_answer_through() {
+    let kit = stack(&[
+        AddonDef::test_layer("a").when("false"),
+        AddonDef::test_layer("b"),
+    ])
+    .await;
+    let a = kit
+        .h1()
+        .await
+        .call("GET", "/x", &[("x-test-b", "answer")], b"")
+        .await;
+    assert_eq!(a.text(), "answered by b");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "layer:b", "{ev:#}");
+    assert_eq!(ev["decision"], "answered");
+    assert_eq!(strs(&ev["addons"]), ["b"]);
+}
+
+/// A `when` sees the request as it reaches the layer: what the layer
+/// above passed on, not what the client sent.
+#[tokio::test]
+async fn when_sees_the_request_the_layer_above_passed_on() {
+    let kit = stack(&[
+        AddonDef::test_layer("a"),
+        AddonDef::test_layer("b").when(r#"path == "/rewritten""#),
+        AddonDef::test_layer("c").when(r#"path == "/x""#),
+    ])
+    .await;
+    let a = kit
+        .h1()
+        .await
+        .call("POST", "/x", &[("x-test-a", "rewrite")], b"orig")
+        .await;
+    // The rules deny the rewritten path; what matters is who ran.
+    assert_eq!(a.status, 403, "{a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(strs(&ev["addons"]), ["a", "b"], "{ev:#}");
+}
+
+#[tokio::test]
+async fn when_sees_tags_set_by_layers_above() {
+    let kit = stack(&[
+        AddonDef::test_layer("a"),
+        AddonDef::test_layer("b").when(r#"tag["via:a"]"#),
+        AddonDef::test_layer("c").when(r#"tag["via:nobody"]"#),
+    ])
+    .await;
+    let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["via"], "a,b");
+}
+
+/// An input `when` cannot evaluate fails the flow closed; the layer is
+/// never skipped on an error.
+#[tokio::test]
+async fn a_when_that_cannot_be_evaluated_fails_closed() {
+    let kit = stack(&[
+        AddonDef::test_layer("a"),
+        AddonDef::test_layer("b").when(r#"header["x-missing"] starts_with "v""#),
+    ])
+    .await;
+    let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+    assert_eq!(a.status, 503, "{a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "layer:b", "{ev:#}");
+    assert_eq!(ev["reason"], "layer_error");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["layer"], "b", "{errs:#?}");
+    assert_eq!(errs[0]["kind"], "when:missing_value");
+    assert!(kit.upstream.seen().is_empty());
+}
+
+/// An observer's `when` failing is logged, like any observer failure, and
+/// the observer gets no copy; the flow goes on.
+#[tokio::test]
+async fn an_observer_whose_when_cannot_be_evaluated_is_skipped() {
+    let kit = stack(&[
+        AddonDef::test_layer("o")
+            .observe()
+            .when(r#"header["x-missing"] starts_with "v""#),
+        AddonDef::test_layer("b"),
+    ])
+    .await;
+    let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["via"], "b");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["layer"], "o", "{errs:#?}");
+    assert_eq!(errs[0]["mode"], "observe");
+    assert_eq!(errs[0]["kind"], "when:missing_value");
+    let ev = kit.request_event().await;
+    assert_eq!(strs(&ev["addons"]), ["b"], "{ev:#}");
+}
+
+#[tokio::test]
+async fn sample_copies_a_share_of_matching_exchanges() {
+    let kit = stack(&[
+        AddonDef::test_layer("o")
+            .observe()
+            .when(r#"path == "/s""#)
+            .sample(0.5),
+        AddonDef::test_layer("b"),
+    ])
+    .await;
+    let mut c = kit.h1().await;
+    let n = 120;
+    for _ in 0..n {
+        let a = c.call("GET", "/s", &[], b"").await;
+        assert_eq!(a.status, 200, "{a:?}");
+    }
+    let a = c.call("GET", "/other", &[], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let reqs = kit.events("request", n + 1).await;
+    let observed = reqs[..n]
+        .iter()
+        .filter(|r| strs(&r["addons"]).contains(&"o".to_owned()))
+        .count();
+    // Binomial(120, 0.5): outside 30..=90 is roughly a 1e-8 event.
+    assert!((30..=90).contains(&observed), "{observed} of {n}");
+    assert_eq!(strs(&reqs[n]["addons"]), ["b"]);
+}
+
+#[tokio::test]
+async fn a_tunnel_layer_its_when_skips_stays_out_of_the_websocket() {
+    let kit = stack(&[
+        AddonDef::tunnel_layer("t1", true).when(r#"path != "/ws""#),
+        AddonDef::tunnel_layer("t2", false),
+    ])
+    .await;
+    let (status, io) = kit.websocket("/ws", &[]).await;
+    assert_eq!(status, 101);
+    let mut io = io.unwrap();
+    // t1 would upper-case; it is not in the byte path.
+    assert_eq!(echo(&mut io, b"hello").await, b"hello");
+    drop(io);
+    let ev = kit.request_event().await;
+    let tags = strs(&ev["tags"]);
+    assert!(!tags.iter().any(|x| x == "tunnel:t1"), "{tags:?}");
+    assert!(tags.iter().any(|x| x == "tunnel:t2"), "{tags:?}");
+}

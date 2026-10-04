@@ -10,6 +10,7 @@ addons:                               # above the rules, in this order
     kind: wasm
     path: /etc/roxy/addons/sentinel.wasm
     mode: enforce                     # enforce | observe
+    when: host == "api.anthropic.com" and path starts_with "/v1/messages"   # default: every exchange
     capabilities: [state, record, endpoints]   # also: metrics, log
     audit_endpoint: audit-sink        # also receives record(.., audit: true)
     endpoints:                        # named, not URLs
@@ -43,4 +44,43 @@ interpreter needs 128–256 MiB) and `max_exchange_time` (calling a model
 takes seconds).
 
 `kind: service` addons take a different set of keys
-([service layers](#service-layers)).
+([service layers](/addons/service-layers)).
+
+## Choosing exchanges
+
+`when` is a condition in the [rule language](/reference/rule-language) over
+head fields. A layer runs only on the exchanges it matches. The rest go
+straight to the layer below, as if the layer had passed both directions on
+unchanged. A skipped layer costs nothing: no instance, no body pumping, no
+service session.
+
+- `when` sees the request as it reaches the layer: what the layer above
+  passed on, re-validated like any request a layer passes on. A layer above
+  can therefore steer a request into or out of a lower layer's `when`.
+- It may read head fields, headers, the query, `state[..]`, `metric.<id>`
+  and address lists. `body.*`, `response.*` and `ws.*` are config errors:
+  a layer owns the body, so nothing reads it first.
+- `tag["x"]` sees tags set by layers above. The rules run below the stack,
+  so their tags are not visible here.
+- A `when` that reaches an unavailable input (a metric, an address list, a
+  missing value under an operator that cannot answer for `null`) fails the
+  flow closed like a layer failure (`503`, `layer_error` with `kind:
+  when:<code>`). It never skips the layer. On an observe layer the failure
+  is logged like any observer failure, and the layer gets no copy.
+- A `tunnel` layer that `when` skipped is not in that WebSocket's byte path.
+
+`sample`, for `mode: observe` only, is the share of matching exchanges the
+layer gets a copy of, in (0, 1]. It is drawn from the flow id, so it is the
+same for a flow however often you ask. An enforcing layer can't be sampled:
+skipping it at random would let traffic past it.
+
+```yaml
+addons:
+  - name: shadow-monitor
+    path: /etc/roxy/addons/monitor.wasm
+    mode: observe
+    when: method == POST
+    sample: 0.1                       # one matching exchange in ten
+```
+
+The flow log's `addons` lists the layers that ran on the exchange.

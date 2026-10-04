@@ -650,3 +650,53 @@ fn service_addons_validate() {
         assert!(paths.contains(&p), "{p} not in {paths:?}");
     }
 }
+
+#[test]
+fn addon_when_and_sample() {
+    let cfg = parse(&format!(
+        "{BASE}metrics: [{{ id: calls, count: requests }}]\n\
+         addons:\n  \
+         - {{ name: a, path: /a.wasm, when: 'host == \"x.test\" and metric.calls < 10' }}\n  \
+         - {{ name: b, path: /b.wasm, mode: observe, when: 'method == POST', sample: 0.25 }}\n"
+    ));
+    cfg.validate().unwrap();
+    assert_eq!(cfg.addons[1].sample, Some(0.25));
+    let conditions = cfg.compile_addon_conditions().unwrap();
+    assert!(conditions.iter().all(Option::is_some));
+}
+
+#[test]
+fn addon_when_and_sample_diagnosed() {
+    for (bad, path, says) in [
+        (
+            "when: 'response.status == 200'",
+            "addons[0].when",
+            "head fields",
+        ),
+        (
+            "when: 'body.text contains \"x\"'",
+            "addons[0].when",
+            "body.text",
+        ),
+        ("when: 'metric.nope > 1'", "addons[0].when", "nope"),
+        ("when: 'host =='", "addons[0].when", ""),
+        (
+            "mode: observe, sample: 0",
+            "addons[0].sample",
+            "greater than 0",
+        ),
+        (
+            "mode: observe, sample: 1.5",
+            "addons[0].sample",
+            "at most 1",
+        ),
+        ("sample: 0.5", "addons[0].sample", "mode: observe"),
+    ] {
+        let d = diagnostics(&format!(
+            "{BASE}addons: [{{ name: a, path: /a.wasm, {bad} }}]\n"
+        ));
+        assert_eq!(d.len(), 1, "{bad}: {d:?}");
+        assert_eq!(d[0].path, path, "{bad}");
+        assert!(d[0].to_string().contains(says), "{bad}: {}", d[0]);
+    }
+}

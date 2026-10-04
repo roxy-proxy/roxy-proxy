@@ -27,6 +27,9 @@ produces a `request` event:
 - `stage` says where the decision was made: `head` for the forwarding
   decision, or where a watching rule stopped the exchange: `request_body`,
   `response_head`, `response_body`, `websocket`.
+- `addons` lists the addon layers that ran on the exchange, outermost
+  first. A layer skipped by its `when` or `sample` is not in it
+  ([choosing exchanges](/addons/configuration#choosing-exchanges)).
 - `decision` is `allow` or `deny`, or `answered` when an addon layer
   answered itself ([addons](/addons/overview#in-the-proxy)).
 - When an addon changed the request, `rules`, `decision` and
