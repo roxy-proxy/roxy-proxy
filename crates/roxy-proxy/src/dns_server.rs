@@ -11,7 +11,7 @@ use roxy_dns::{Parsed, TYPE_A, TYPE_AAAA};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-use crate::flowlog::{ClientInfo, FlowEvent};
+use crate::flowlog::{ClientInfo, FlowEvent, sink_ready};
 use crate::server::Shared;
 
 /// Largest query read. Queries roxy accepts are far smaller (one name of at
@@ -122,7 +122,17 @@ pub(crate) async fn serve_udp(sock: UdpSocket, spec: Arc<DnsServerSpec>, shared:
     let mut buf = vec![0u8; MAX_QUERY + 1];
     loop {
         let received = tokio::select! {
-            r = sock.recv_from(&mut buf) => r,
+            r = async {
+                let r = sock.recv_from(&mut buf).await;
+                // Audit backpressure: a query is answered (and logged) only
+                // while the flow log keeps up. Meanwhile later queries wait
+                // in the socket's buffer, and the kernel drops what does not
+                // fit, rather than roxy buffering their events.
+                if spec.log_queries {
+                    sink_ready(&*shared.sink).await;
+                }
+                r
+            } => r,
             () = shared.stop.cancelled() => return,
         };
         let Ok((n, peer)) = received else {
@@ -192,6 +202,13 @@ async fn tcp_conn(
             },
             () = shared.stop.cancelled() => return,
         };
+        // Audit backpressure, as for UDP.
+        if spec.log_queries {
+            tokio::select! {
+                () = sink_ready(&*shared.sink) => {}
+                () = shared.stop.cancelled() => return,
+            }
+        }
         let Some(reply) = spec.reply(&buf[..len]) else {
             return;
         };

@@ -6,7 +6,9 @@ mod support;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use support::{Harness, Opts, read_response};
+use std::sync::Arc;
+
+use support::{Harness, LogGate, Opts, read_response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
@@ -17,11 +19,16 @@ const RULES: &str = r#"
 "#;
 
 async fn start() -> Harness {
+    start_gated(None).await
+}
+
+async fn start_gated(log_gate: Option<Arc<LogGate>>) -> Harness {
     Harness::start_with(Opts {
         rules: RULES,
         listeners: "  - { name: direct, mode: direct, bind: 127.0.0.1:0, target_port: {HTTPS} }\n",
         extra: "dns:\n  bind: 127.0.0.1:0\n  answer: { ipv4: 127.0.0.1 }\n  ttl: 30s\n",
         flow_log: "dns_events: true",
+        log_gate,
         ..Opts::default()
     })
     .await
@@ -141,5 +148,32 @@ async fn a_client_without_proxy_settings_is_steered_through_roxy() {
     // The same request through the explicit proxy matches no rule.
     let res = h.client().get(h.https_url("/hello")).send().await.unwrap();
     assert_eq!(res.status(), 403);
+    h.stop().await;
+}
+
+/// With `dns_events`, a flow log that cannot keep up holds DNS answers
+/// back, like any traffic, instead of buffering query events without
+/// bound; they resume once it catches up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_flow_log_holds_dns_answers() {
+    let gate = Arc::new(LogGate::default());
+    let h = start_gated(Some(gate.clone())).await;
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    gate.set_closed(true);
+    let q = query(9, "example.com", 1);
+    udp.send_to(&q, dns_addr(&h)).await.unwrap();
+    let mut buf = [0u8; 512];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), udp.recv(&mut buf))
+            .await
+            .is_err(),
+        "no answer while the log is held"
+    );
+    gate.set_closed(false);
+    let n = tokio::time::timeout(Duration::from_secs(5), udp.recv(&mut buf))
+        .await
+        .expect("the answer once the log catches up")
+        .unwrap();
+    assert_eq!(a_records(&q, &buf[..n]), vec![Ipv4Addr::LOCALHOST]);
     h.stop().await;
 }

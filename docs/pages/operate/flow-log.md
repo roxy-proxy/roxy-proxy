@@ -69,8 +69,10 @@ is built to scale with cores and traffic (the `roxy-log` crate):
   each line goes out as it arrives.
 - **Backpressure, never loss.** Emitting never blocks and never drops.
   Once unwritten bytes pass `log.flow.high_water` (8 MiB) the log reports
-  not ready, and every traffic producer waits for it: the start of each
-  exchange, each forwarded body chunk, each WebSocket read. roxy stops
+  not ready, and every traffic producer waits for it: each new client
+  connection, the start of each exchange and each HTTP/2 stream, each
+  forwarded body chunk, each WebSocket read, and, with `dns_events`, each
+  DNS answer. roxy stops
   reading from clients and upstreams until the log catches up, slowing
   traffic rather than losing records. A destination that fails (disk full,
   I/O error) holds traffic the same way, and is reported.

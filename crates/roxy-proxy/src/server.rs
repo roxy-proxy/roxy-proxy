@@ -428,7 +428,14 @@ async fn start_dns(
 async fn accept_loop(listener: Arc<dyn Listener>, shared: Arc<Shared>) {
     loop {
         let accepted = tokio::select! {
-            r = listener.accept() => r,
+            r = async {
+                // Audit backpressure: while the flow log is behind, new
+                // connections wait in the kernel's backlog, so the events
+                // they would emit (a refusal, a parse error) are never
+                // buffered without bound.
+                crate::flowlog::sink_ready(&*shared.sink).await;
+                listener.accept().await
+            } => r,
             () = shared.stop.cancelled() => return,
         };
         let (stream, client) = match accepted {
