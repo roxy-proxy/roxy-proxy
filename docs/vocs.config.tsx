@@ -6,7 +6,7 @@ const accentHover = "#115e59";
 
 export default defineConfig({
   title: "roxy",
-  description: "A strict, programmable HTTP firewall and egress proxy.",
+  description: "A TLS-intercepting HTTP proxy built for streaming.",
   rootDir: ".",
   aiCta: false,
   // GitHub Pages serves the site from /roxy-proxy/. Local dev overrides it.

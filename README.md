@@ -1,18 +1,26 @@
 # roxy
 
-roxy is a strict, programmable HTTP firewall and egress proxy for workloads
-you don't fully trust: AI agents, CI jobs, sandboxes and third-party code.
+roxy is a TLS-intercepting HTTP proxy built for streaming. Each exchange
+flows through the addons that match it, which can rewrite, answer or block it
+mid-stream, and a strict policy layer underneath decides what actually
+leaves. It is meant for
+workloads you don't fully trust: AI agents, CI jobs, sandboxes and
+third-party code.
 
-- **Strict.** roxy terminates TLS with its own CA, parses every request into
-  one canonical form and forwards exactly that, so smuggling and header
-  injection never reach the upstream.
+- **Intercepting.** roxy terminates TLS with certificates from its own CA,
+  parses every request into one canonical form and forwards exactly that, so
+  smuggling and header injection never reach the upstream.
+- **Streaming.** Bodies flow through chunk by chunk, in both directions.
+  Nothing is buffered unless a layer or a rule asks to read a whole body or
+  message. A server-sent event stream or a WebSocket is one long exchange,
+  and a slow addon slows it down rather than cutting it off.
+- **Addons.** WASM components or external services, each run on the requests
+  its `when:` condition matches. They can rewrite, withhold, answer or block,
+  and the rules judge whatever they pass on.
 - **Rules.** A YAML policy in a small, typed rule language. Deny always wins,
   anything no rule allows is denied, and rules can keep watching bodies as
   they stream. Metrics give rate limits and byte budgets, and secret
   injection means clients only hold placeholders.
-- **Addons.** WASM components or external services that every exchange
-  streams through. They can rewrite, withhold, answer or block, and the
-  rules judge whatever they pass on.
 - **Audit.** A JSONL flow log with the rule or addon behind every decision.
   It never drops a record: backpressure holds traffic until the log catches
   up.

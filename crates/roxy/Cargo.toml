@@ -1,6 +1,6 @@
 [package]
 name = "roxy"
-description = "A TLS-inspecting HTTP firewall for containing AI agent traffic"
+description = "A TLS-intercepting HTTP proxy built for streaming, with programmable addons and a fail-closed policy layer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

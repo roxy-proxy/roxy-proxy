@@ -1,4 +1,4 @@
-//! roxy: a TLS-inspecting HTTP firewall for containing AI agent traffic.
+//! roxy: a TLS-intercepting HTTP proxy built for streaming.
 //!
 //! See `docs/` at the repository root. This binary owns the CLI, config
 //! loading and wiring; the engine lives in the library crates.
@@ -22,7 +22,7 @@ use roxy::ruletest;
 #[command(
     name = "roxy",
     version,
-    about = "TLS-inspecting HTTP firewall for AI agent traffic"
+    about = "TLS-intercepting HTTP proxy built for streaming"
 )]
 struct Cli {
     /// Operational log format (default: pretty on a TTY, json otherwise).
