@@ -2335,6 +2335,22 @@ async fn capture_websocket_relay() {
     let records = h.captured();
     let c2s = capture_of(&records, &flow, "request");
     let s2c = capture_of(&records, &flow, "response");
+    // Both heads are captured: the upgrade request as it left, and the 101.
+    let kinds = |recs: &[&(Value, Vec<u8>)]| {
+        recs.iter()
+            .map(|(h, _)| h["kind"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        kinds(&c2s).first().map(String::as_str),
+        Some("head"),
+        "{c2s:?}"
+    );
+    assert_eq!(
+        kinds(&s2c).first().map(String::as_str),
+        Some("head"),
+        "{s2c:?}"
+    );
     assert_eq!(
         capture_body(&c2s).len() as u64,
         close[0]["bytes_c2s"].as_u64().unwrap()
