@@ -280,7 +280,7 @@ pub(crate) fn compile(src: &str, env: &Env<'_>) -> Result<(Pred, Needs), ExprErr
 }
 
 /// Build a full-match regex with resource limits.
-pub(crate) fn build_regex(pattern: &str, case_insensitive: bool) -> Result<Regex, String> {
+fn anchored_regex(pattern: &str, case_insensitive: bool) -> Result<Regex, regex::Error> {
     let build = |p: &str| {
         RegexBuilder::new(p)
             .size_limit(REGEX_SIZE_LIMIT)
@@ -292,8 +292,21 @@ pub(crate) fn build_regex(pattern: &str, case_insensitive: bool) -> Result<Regex
     // Compile the pattern on its own first: a valid pattern has balanced
     // groups, so wrapping it cannot change its meaning (`a)|(b` must not
     // escape the anchors).
-    build(pattern).map_err(|e| regex_error(&e))?;
-    build(&format!("^(?:{pattern})$")).map_err(|e| regex_error(&e))
+    build(pattern)?;
+    build(&format!("^(?:{pattern})$"))
+}
+
+/// The regex behind `matches`, written at `span`.
+fn build_regex(span: Span, pattern: &str, case_insensitive: bool) -> Result<Regex, ExprError> {
+    anchored_regex(pattern, case_insensitive).map_err(|e| ExprError::new(span, regex_error(&e)))
+}
+
+/// Shared compiled regex, for `rewrite_path`, whose pattern is a YAML
+/// string without a span.
+pub(crate) fn build_shared_regex(pattern: &str) -> Result<Arc<Regex>, String> {
+    anchored_regex(pattern, false)
+        .map(Arc::new)
+        .map_err(|e| regex_error(&e))
 }
 
 fn regex_error(e: &regex::Error) -> String {
@@ -316,7 +329,7 @@ fn regex_error(e: &regex::Error) -> String {
 }
 
 /// Build a full-match glob in which only `*` and `?` are special.
-pub(crate) fn build_glob(pattern: &str, case_insensitive: bool) -> Result<GlobMatcher, String> {
+fn build_glob(span: Span, pattern: &str, case_insensitive: bool) -> Result<GlobMatcher, ExprError> {
     let mut glob = String::with_capacity(pattern.len() + 8);
     let mut prev_star = false;
     let mut buf = [0u8; 4];
@@ -336,7 +349,7 @@ pub(crate) fn build_glob(pattern: &str, case_insensitive: bool) -> Result<GlobMa
         .case_insensitive(case_insensitive)
         .build()
         .map(|g| g.compile_matcher())
-        .map_err(|e| format!("invalid pattern: {e}"))
+        .map_err(|e| ExprError::new(span, format!("invalid pattern: {e}")))
 }
 
 /// An operand after field resolution, before lowering.
@@ -498,7 +511,6 @@ impl Compiler<'_, '_> {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn comparison(
         &mut self,
         lo: &Operand,
@@ -526,138 +538,17 @@ impl Compiler<'_, '_> {
         }
         reject_null(&l)?;
         reject_null(&r)?;
-        let field_desc = |t: &Typed<'_>, o: &Operand| t.describe(Some(o));
         match op {
-            Op::Eq | Op::Ne => {
-                let (lt, rt) = (scalar(&l, op)?, scalar(&r, op)?);
-                let list = lt == Type::StrList || rt == Type::StrList;
-                if list && op == Op::Ne {
-                    return Err(ExprError::new(
-                        span,
-                        "`!=` on a list (`header.all[...]`) is ambiguous; write \
-                         `not (... == ...)` instead",
-                    ));
-                }
-                let compatible = lt == rt
-                    || (lt == Type::StrList && rt == Type::Str)
-                    || (lt == Type::Str && rt == Type::StrList);
-                if !compatible || (lt == Type::StrList && rt == Type::StrList) {
-                    return Err(ExprError::new(
-                        span,
-                        format!(
-                            "type mismatch: cannot compare {} with {}",
-                            field_desc(&l, lo),
-                            field_desc(&r, ro)
-                        ),
-                    ));
-                }
-                Ok(Pred::Eq {
-                    ci: l.ci() || r.ci(),
-                    lhs: lower(l),
-                    rhs: lower(r),
-                    negate: op == Op::Ne,
-                })
-            }
-            Op::Lt | Op::Le | Op::Gt | Op::Ge => {
-                for (t, o) in [(&l, lo), (&r, ro)] {
-                    if t.ty() != Some(Type::Int) {
-                        return Err(ExprError::new(
-                            t.span(),
-                            format!(
-                                "`{}` compares numbers, but this is {}",
-                                op.as_str(),
-                                field_desc(t, o)
-                            ),
-                        ));
-                    }
-                }
-                let op = match op {
-                    Op::Lt => OrdOp::Lt,
-                    Op::Le => OrdOp::Le,
-                    Op::Gt => OrdOp::Gt,
-                    _ => OrdOp::Ge,
-                };
-                Ok(Pred::Ord {
-                    lhs: lower(l),
-                    rhs: lower(r),
-                    op,
-                })
-            }
+            Op::Eq | Op::Ne => equality(l, lo, op, r, ro, span),
+            Op::Lt | Op::Le | Op::Gt | Op::Ge => ordering(l, lo, op, r, ro),
             Op::In | Op::NotIn => self.membership(l, lo, op, &r, span),
-            Op::StartsWith | Op::EndsWith | Op::Contains => {
-                string_lhs(&l, lo, op)?;
-                if r.ty() != Some(Type::Str) {
-                    return Err(ExprError::new(
-                        r.span(),
-                        format!(
-                            "`{}` needs a string on the right, found {}",
-                            op.as_str(),
-                            field_desc(&r, ro)
-                        ),
-                    ));
-                }
-                let sop = match op {
-                    Op::StartsWith => StrOp::StartsWith,
-                    Op::EndsWith => StrOp::EndsWith,
-                    _ => StrOp::Contains,
-                };
-                Ok(Pred::Str {
-                    ci: l.ci() || r.ci(),
-                    lhs: lower(l),
-                    rhs: lower(r),
-                    op: sop,
-                })
-            }
-            Op::Like | Op::Matches | Op::Under => {
-                string_lhs(&l, lo, op)?;
-                let Typed::Lit(LitNode {
-                    lit: Lit::Str(pattern),
-                    ..
-                }) = &r
-                else {
-                    let what = match op {
-                        Op::Like => "a quoted glob pattern",
-                        Op::Matches => "a quoted regex",
-                        _ => "a quoted domain",
-                    };
-                    return Err(ExprError::new(
-                        r.span(),
-                        format!(
-                            "`{}` needs {what} on the right, found {}",
-                            op.as_str(),
-                            field_desc(&r, ro)
-                        ),
-                    ));
-                };
-                let ci = l.ci();
-                let rspan = r.span();
-                match op {
-                    Op::Like => Ok(Pred::Glob {
-                        glob: build_glob(pattern, ci).map_err(|m| ExprError::new(rspan, m))?,
-                        lhs: lower(l),
-                    }),
-                    Op::Matches => Ok(Pred::Regex {
-                        re: build_regex(pattern, ci).map_err(|m| ExprError::new(rspan, m))?,
-                        lhs: lower(l),
-                    }),
-                    _ => {
-                        if l.ty() == Some(Type::StrList) {
-                            return Err(ExprError::new(
-                                l.span(),
-                                "`under` needs a single host name on the left, not a list",
-                            ));
-                        }
-                        Ok(Pred::Under {
-                            suffix: under_suffix(pattern).map_err(|m| ExprError::new(rspan, m))?,
-                            lhs: lower(l),
-                        })
-                    }
-                }
-            }
+            Op::StartsWith | Op::EndsWith | Op::Contains => string_op(l, lo, op, r, ro),
+            Op::Like | Op::Matches | Op::Under => pattern(l, lo, op, &r, ro),
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// `in` / `not in`: an address list, or a literal list (or CIDR) of
+    /// the left operand's type.
     fn membership(
         &mut self,
         l: Typed<'_>,
@@ -709,78 +600,89 @@ impl Compiler<'_, '_> {
                 ));
             }
         };
-        let lt = scalar(&l, op)?;
-        let mismatch = |item: &LitNode, want: &str| {
-            ExprError::new(
-                item.span,
-                format!(
-                    "type mismatch: {} is {}, so the list must contain {want}, but this is {}",
-                    format_args!("`{lo}`"),
-                    article(lt),
-                    describe_lit(&item.lit)
-                ),
-            )
-        };
-        match lt {
-            Type::Ip => {
-                let mut nets = Vec::with_capacity(items.len());
-                for item in items {
-                    nets.push(match item.lit {
-                        Lit::Cidr(n) => canonical_net(n),
-                        Lit::Ip(ip) => IpNet::from(ip.to_canonical()),
-                        _ => return Err(mismatch(item, "IP addresses or CIDRs")),
-                    });
-                }
-                Ok(Pred::InNet {
-                    lhs: lower(l),
-                    nets: nets.into(),
-                    negate,
+        literal_set(l, lo, op, items, span)
+    }
+}
+
+/// A literal list (or CIDR) of the left operand's type.
+fn literal_set(
+    l: Typed<'_>,
+    lo: &Operand,
+    op: Op,
+    items: &[LitNode],
+    span: Span,
+) -> Result<Pred, ExprError> {
+    let negate = op == Op::NotIn;
+    let lt = scalar(&l, op)?;
+    let mismatch = |item: &LitNode, want: &str| {
+        ExprError::new(
+            item.span,
+            format!(
+                "type mismatch: `{lo}` is {}, so the list must contain {want}, but this is {}",
+                article(lt),
+                describe_lit(&item.lit)
+            ),
+        )
+    };
+    match lt {
+        Type::Ip => {
+            let nets = items
+                .iter()
+                .map(|item| match item.lit {
+                    Lit::Cidr(n) => Ok(canonical_net(n)),
+                    Lit::Ip(ip) => Ok(IpNet::from(ip.to_canonical())),
+                    _ => Err(mismatch(item, "IP addresses or CIDRs")),
                 })
-            }
-            Type::Str | Type::StrList => {
-                if lt == Type::StrList && negate {
-                    return Err(ExprError::new(
-                        span,
-                        "`not in` on a list (`header.all[...]`) is ambiguous; write \
-                         `not (... in [...])` instead",
-                    ));
-                }
-                let method = l.is_method_field();
-                let mut set = Vec::with_capacity(items.len());
-                for item in items {
-                    set.push(match &item.lit {
-                        Lit::Str(s) => s.as_str().into(),
-                        Lit::Method(m) if method => m.as_str().into(),
-                        Lit::Method(m) => return Err(method_literal_error(item.span, m)),
-                        _ => return Err(mismatch(item, "strings")),
-                    });
-                }
-                Ok(Pred::InStr {
-                    ci: l.ci(),
-                    lhs: lower(l),
-                    set: set.into(),
-                    negate,
-                })
-            }
-            Type::Int => {
-                let mut set = Vec::with_capacity(items.len());
-                for item in items {
-                    set.push(match item.lit {
-                        Lit::Int(n, u) => Lit::int_value(n, u),
-                        _ => return Err(mismatch(item, "numbers")),
-                    });
-                }
-                Ok(Pred::InInt {
-                    lhs: lower(l),
-                    set: set.into(),
-                    negate,
-                })
-            }
-            Type::Bool => Err(ExprError::new(
-                l.span(),
-                format!("`{}` does not apply to booleans; use `==`", op.as_str()),
-            )),
+                .collect::<Result<_, _>>()?;
+            Ok(Pred::InNet {
+                lhs: lower(l),
+                nets,
+                negate,
+            })
         }
+        Type::Str | Type::StrList => {
+            if lt == Type::StrList && negate {
+                return Err(ExprError::new(
+                    span,
+                    "`not in` on a list (`header.all[...]`) is ambiguous; write \
+                     `not (... in [...])` instead",
+                ));
+            }
+            let method = l.is_method_field();
+            let set = items
+                .iter()
+                .map(|item| match &item.lit {
+                    Lit::Str(s) => Ok(s.as_str().into()),
+                    Lit::Method(m) if method => Ok(m.as_str().into()),
+                    Lit::Method(m) => Err(method_literal_error(item.span, m)),
+                    _ => Err(mismatch(item, "strings")),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Pred::InStr {
+                ci: l.ci(),
+                lhs: lower(l),
+                set,
+                negate,
+            })
+        }
+        Type::Int => {
+            let set = items
+                .iter()
+                .map(|item| match item.lit {
+                    Lit::Int(n, u) => Ok(Lit::int_value(n, u)),
+                    _ => Err(mismatch(item, "numbers")),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok(Pred::InInt {
+                lhs: lower(l),
+                set,
+                negate,
+            })
+        }
+        Type::Bool => Err(ExprError::new(
+            l.span(),
+            format!("`{}` does not apply to booleans; use `==`", op.as_str()),
+        )),
     }
 }
 
@@ -793,6 +695,162 @@ fn canonical_net(net: IpNet) -> IpNet {
     match (net.addr().to_canonical(), net.prefix_len().checked_sub(96)) {
         (IpAddr::V4(v4), Some(prefix)) => Ipv4Net::new(v4, prefix).map_or(net, IpNet::V4),
         _ => net,
+    }
+}
+
+/// `==` / `!=`.
+fn equality(
+    l: Typed<'_>,
+    lo: &Operand,
+    op: Op,
+    r: Typed<'_>,
+    ro: &Operand,
+    span: Span,
+) -> Result<Pred, ExprError> {
+    let (lt, rt) = (scalar(&l, op)?, scalar(&r, op)?);
+    let list = lt == Type::StrList || rt == Type::StrList;
+    if list && op == Op::Ne {
+        return Err(ExprError::new(
+            span,
+            "`!=` on a list (`header.all[...]`) is ambiguous; write `not (... == ...)` instead",
+        ));
+    }
+    let compatible = lt == rt
+        || (lt == Type::StrList && rt == Type::Str)
+        || (lt == Type::Str && rt == Type::StrList);
+    if !compatible || (lt == Type::StrList && rt == Type::StrList) {
+        return Err(ExprError::new(
+            span,
+            format!(
+                "type mismatch: cannot compare {} with {}",
+                l.describe(Some(lo)),
+                r.describe(Some(ro))
+            ),
+        ));
+    }
+    Ok(Pred::Eq {
+        ci: l.ci() || r.ci(),
+        lhs: lower(l),
+        rhs: lower(r),
+        negate: op == Op::Ne,
+    })
+}
+
+/// `<`, `<=`, `>`, `>=`: ints only.
+fn ordering(
+    l: Typed<'_>,
+    lo: &Operand,
+    op: Op,
+    r: Typed<'_>,
+    ro: &Operand,
+) -> Result<Pred, ExprError> {
+    for (t, o) in [(&l, lo), (&r, ro)] {
+        if t.ty() != Some(Type::Int) {
+            return Err(ExprError::new(
+                t.span(),
+                format!(
+                    "`{}` compares numbers, but this is {}",
+                    op.as_str(),
+                    t.describe(Some(o))
+                ),
+            ));
+        }
+    }
+    let op = match op {
+        Op::Lt => OrdOp::Lt,
+        Op::Le => OrdOp::Le,
+        Op::Gt => OrdOp::Gt,
+        _ => OrdOp::Ge,
+    };
+    Ok(Pred::Ord {
+        lhs: lower(l),
+        rhs: lower(r),
+        op,
+    })
+}
+
+/// `starts_with`, `ends_with`, `contains`.
+fn string_op(
+    l: Typed<'_>,
+    lo: &Operand,
+    op: Op,
+    r: Typed<'_>,
+    ro: &Operand,
+) -> Result<Pred, ExprError> {
+    string_lhs(&l, lo, op)?;
+    if r.ty() != Some(Type::Str) {
+        return Err(ExprError::new(
+            r.span(),
+            format!(
+                "`{}` needs a string on the right, found {}",
+                op.as_str(),
+                r.describe(Some(ro))
+            ),
+        ));
+    }
+    let sop = match op {
+        Op::StartsWith => StrOp::StartsWith,
+        Op::EndsWith => StrOp::EndsWith,
+        _ => StrOp::Contains,
+    };
+    Ok(Pred::Str {
+        ci: l.ci() || r.ci(),
+        lhs: lower(l),
+        rhs: lower(r),
+        op: sop,
+    })
+}
+
+/// `like`, `matches`, `under`: a string field against a quoted literal.
+fn pattern(
+    l: Typed<'_>,
+    lo: &Operand,
+    op: Op,
+    r: &Typed<'_>,
+    ro: &Operand,
+) -> Result<Pred, ExprError> {
+    string_lhs(&l, lo, op)?;
+    let Typed::Lit(LitNode {
+        lit: Lit::Str(pattern),
+        span: rspan,
+    }) = r
+    else {
+        let what = match op {
+            Op::Like => "a quoted glob pattern",
+            Op::Matches => "a quoted regex",
+            _ => "a quoted domain",
+        };
+        return Err(ExprError::new(
+            r.span(),
+            format!(
+                "`{}` needs {what} on the right, found {}",
+                op.as_str(),
+                r.describe(Some(ro))
+            ),
+        ));
+    };
+    let ci = l.ci();
+    match op {
+        Op::Like => Ok(Pred::Glob {
+            glob: build_glob(*rspan, pattern, ci)?,
+            lhs: lower(l),
+        }),
+        Op::Matches => Ok(Pred::Regex {
+            re: build_regex(*rspan, pattern, ci)?,
+            lhs: lower(l),
+        }),
+        _ => {
+            if l.ty() == Some(Type::StrList) {
+                return Err(ExprError::new(
+                    l.span(),
+                    "`under` needs a single host name on the left, not a list",
+                ));
+            }
+            Ok(Pred::Under {
+                suffix: under_suffix(*rspan, pattern)?,
+                lhs: lower(l),
+            })
+        }
     }
 }
 
@@ -863,15 +921,19 @@ fn check_method_literal(this: &Typed<'_>, other: &Typed<'_>) -> Result<(), ExprE
     Ok(())
 }
 
-fn under_suffix(domain: &str) -> Result<Box<str>, String> {
+/// The suffix `under` tests, from the domain written at `span`.
+fn under_suffix(span: Span, domain: &str) -> Result<Box<str>, ExprError> {
     let d = domain.strip_suffix('.').unwrap_or(domain);
     if d.is_empty() {
-        return Err("`under` needs a non-empty domain".into());
+        return Err(ExprError::new(span, "`under` needs a non-empty domain"));
     }
     if d.starts_with('.') {
-        return Err(format!(
-            "write the domain without a leading dot: `under {:?}`",
-            d.trim_start_matches('.')
+        return Err(ExprError::new(
+            span,
+            format!(
+                "write the domain without a leading dot: `under {:?}`",
+                d.trim_start_matches('.')
+            ),
         ));
     }
     Ok(d.to_ascii_lowercase().into())
@@ -889,9 +951,4 @@ fn lower(t: Typed<'_>) -> ROperand {
             Lit::List(_) | Lit::Cidr(_) | Lit::AddressList(_) | Lit::Null => Const::Bool(false),
         }),
     }
-}
-
-/// Shared compiled regex, for `rewrite_path`.
-pub(crate) fn build_shared_regex(pattern: &str) -> Result<Arc<Regex>, String> {
-    build_regex(pattern, false).map(Arc::new)
 }

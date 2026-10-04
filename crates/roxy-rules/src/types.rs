@@ -50,7 +50,7 @@ pub enum Field {
     ClientUser,
     /// `listener.name` (string)
     ListenerName,
-    /// `listener.mode` (string: `explicit`)
+    /// `listener.mode` (string: `explicit` / `direct`)
     ListenerMode,
     /// `tls.sni` (string)
     TlsSni,

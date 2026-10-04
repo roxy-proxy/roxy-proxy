@@ -1,7 +1,7 @@
 //! Rule engine for roxy.
 //!
 //! Responsibilities: the rule-related config types ([`config`]), the
-//! expression DSL (lexer, [`parser`], type-checker, compiler), the one
+//! expression DSL (lexer, parser, type-checker, compiler), the one
 //! ordered rule list with its head/watching classification and typed
 //! actions, and the immutable [`Policy`] snapshot that the proxy swaps
 //! atomically on reload. It also provides the in-process stores behind
@@ -148,6 +148,10 @@
 //!   missing at evaluation time (or not a valid header value) fails closed.
 #![forbid(unsafe_code)]
 
+/// The expression syntax tree: the return type of [`parse`], which exists
+/// for the fuzz targets. Rules are compiled from source text through
+/// [`Policy::compile`]; nothing else needs the tree.
+#[doc(hidden)]
 pub mod ast;
 mod compile;
 pub mod config;
@@ -155,7 +159,7 @@ mod diag;
 mod eval;
 mod lexer;
 mod metrics;
-pub mod parser;
+mod parser;
 mod policy;
 mod state;
 mod types;
@@ -174,8 +178,9 @@ pub use eval::{
 };
 pub use metrics::{
     CarryOverReport, Clock, DEFAULT_MAX_METRIC_BYTES, DEFAULT_MAX_METRIC_KEYS, MetricError,
-    MetricLimits, MetricSnapshot, MetricSource, MetricStore, SERIES_OVERHEAD, SPARSE_CHUNK, Sample,
+    MetricLimits, MetricSnapshot, MetricSource, MetricStore, Sample,
 };
+#[doc(hidden)]
 pub use parser::parse;
 pub use policy::{Condition, MetricDef, Policy, PolicyInput, RuleInfo, RuleKind, WatchState};
 pub use state::{StateFull, StateSource, StateStore};
