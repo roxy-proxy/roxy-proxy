@@ -83,8 +83,7 @@ async fn a_layer_answering_stops_the_stack_below_it() {
     assert_eq!(a.text(), "answered by b");
     let ev = kit.request_event().await;
     assert_eq!(ev["terminal_rule"], "layer:b", "{ev:#}");
-    // Today a layer's own answer is logged as a deny (#31 adds `answered`).
-    assert_eq!(ev["decision"], "deny");
+    assert_eq!(ev["decision"], "answered");
     assert_eq!(strs(&ev["tags"]), ["via:a"]);
     assert!(kit.upstream.seen().is_empty());
 }
@@ -126,7 +125,6 @@ async fn an_inner_layer_failing_after_the_head_cuts_the_body() {
 }
 
 #[tokio::test]
-#[ignore = "#31: an inner layer's failure after the head is logged against the outer layer"]
 async fn an_inner_layer_failing_after_the_head_is_the_one_blamed() {
     let kit = stack(&named(&["a", "b"])).await;
     let a = kit

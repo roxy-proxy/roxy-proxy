@@ -251,6 +251,7 @@ async fn handle_connect(
         &placeholder,
     );
     cx.facts.request = None;
+    cx.facts.client_request = None;
     // No connect-time rules: a CONNECT that passed proxy auth is
     // accepted for inspection; every decision is made on the requests
     // inside the tunnel.

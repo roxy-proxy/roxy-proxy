@@ -117,6 +117,11 @@ pub(crate) struct WsFacts {
 pub(crate) struct FlowFacts {
     pub client: ClientConn,
     pub tls: Option<TlsInfo>,
+    /// What the client sent: the flow log's `req`.
+    pub client_request: Option<RequestFacts>,
+    /// The request the rules judge: what left the addon stack (the client's
+    /// request when there is none), then, after the head decision, as it is
+    /// forwarded. Metric keys come from it.
     pub request: Option<RequestFacts>,
     pub response: Option<ResponseFacts>,
     /// `body.bytes`: request body bytes forwarded so far; `None` before

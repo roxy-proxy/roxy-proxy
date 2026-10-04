@@ -276,8 +276,10 @@ pub(crate) struct FlowCx {
     pub taps: (Option<Tap>, Option<Tap>),
     /// `Host` to send upstream after a `redirect` without `rewrite_host`.
     pub host_override: Option<String>,
-    /// The addon stack this exchange went through, folded into the record
-    /// when it is logged.
+    /// Request body bytes forwarded so far, once the request is on its way.
+    pub request_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// The addon stack this exchange went through (set once the stack has
+    /// handed the flow back), folded into the record when it is logged.
     pub stack: Option<Arc<crate::addons::StackFlow>>,
 }
 
@@ -337,6 +339,7 @@ impl FlowCx {
             facts: FlowFacts {
                 client,
                 tls,
+                client_request: Some(request_facts(req)),
                 request: Some(request_facts(req)),
                 response: None,
                 request_body_bytes: None,
@@ -350,6 +353,7 @@ impl FlowCx {
             capture: (false, false),
             taps: (None, None),
             host_override: None,
+            request_counter: None,
             stack: None,
         }
     }
@@ -458,10 +462,13 @@ impl FlowCx {
     /// Emits the flow's `request` event.
     pub(crate) fn emit_request_event(&mut self) {
         if let Some(st) = self.stack.take() {
-            st.merge_into(self);
+            st.fold_into(self);
         }
         self.absorb_watch();
-        let r = self.facts.request.as_ref();
+        if let Some(c) = &self.request_counter {
+            self.record.request_bytes = c.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        let r = self.facts.client_request.as_ref();
         let req = RequestInfo {
             method: r.map(|r| r.method.clone()).unwrap_or_default(),
             host: r.map(|r| host_text(&r.host)).unwrap_or_default(),

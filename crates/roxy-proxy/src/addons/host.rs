@@ -137,8 +137,9 @@ impl LayerHost for StackHost {
             ));
         }
         let shared = &self.st.shared;
+        let facts = self.st.facts();
         let view = ProxyView::new(
-            &self.st.facts,
+            &facts,
             &*shared.metrics,
             &*shared.state,
             &self.st.snap.address_lists,

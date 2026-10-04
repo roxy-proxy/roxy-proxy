@@ -419,6 +419,9 @@ pub enum DecisionKind {
     Allow,
     Deny,
     Passthrough,
+    /// An addon layer answered: its request never reached the upstream,
+    /// or it abandoned the forwarded request.
+    Answered,
 }
 
 impl FlowEvent {

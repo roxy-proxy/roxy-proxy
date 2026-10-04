@@ -366,7 +366,8 @@ async fn a_deny_is_honoured() {
     assert_eq!(res.text().await.unwrap(), "the service said no\n");
     assert!(h.upstream.seen().is_empty());
     let ev = h.wait_events("request", 1).await;
-    assert_eq!(ev[0]["decision"], "deny");
+    // The service answered; its status says it was a refusal.
+    assert_eq!(ev[0]["decision"], "answered");
     assert_eq!(ev[0]["terminal_rule"], "layer:s");
     assert!(
         ev[0]["tags"].as_array().unwrap().contains(&"s:deny".into()),

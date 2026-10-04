@@ -144,7 +144,8 @@ async fn a_layer_can_answer_without_the_upstream() {
     assert_eq!(res.text().await.unwrap(), "denied by layer");
     assert!(h.upstream.seen().is_empty());
     let ev = h.wait_events("request", 1).await;
-    assert_eq!(ev[0]["decision"], "deny");
+    // A layer's own answer, whatever its status.
+    assert_eq!(ev[0]["decision"], "answered");
     assert_eq!(ev[0]["terminal_rule"], "layer:t");
     h.stop().await;
 }
