@@ -91,13 +91,14 @@ upgrade request still passes through it, so it can refuse the upgrade.
 ## Content codings
 
 Layers see bodies decoded, so none needs its own decompressors. roxy
-decodes at the edge of the stack: the client's request body before the
-first layer, and the response before it reaches the innermost layer. It
-removes `content-encoding` as it does, and the body's length becomes
-unknown.
+decodes on the way into the stack, for a flow some layer runs on: the
+client's request body as the first layer that runs gets it, and the
+response before it reaches the innermost layer. It removes
+`content-encoding` as it does, and the body's length becomes unknown. A
+flow no layer runs on (every `when` skipped it) is not decoded at all.
 
-- So with addons, the client gets an uncompressed response and the upstream
-  an uncompressed request body. The origin's response to roxy stays
+- So on a flow a layer runs on, the client gets an uncompressed response
+  and the upstream an uncompressed request body. The origin's response to roxy stays
   compressed. Nothing re-encodes; a layer that wants a compressed body
   encodes it itself.
 - The codings and their strictness are those the rules use
@@ -113,7 +114,8 @@ unknown.
 
 - A `tunnel` layer gets WebSocket messages it can read: no extension
   (`permessage-deflate` above all) is negotiated on a WebSocket that passes
-  through one ([WebSockets](/policies/websockets#extensions)).
+  through one ([WebSockets](/policies/websockets#extensions)). A `tunnel`
+  layer its `when` skipped is not in the WebSocket, so it changes nothing.
 
 `http.decode_for_addons: false` turns this off: layers then see the bytes
 as sent, with their `content-encoding`, and WebSockets negotiate whatever
