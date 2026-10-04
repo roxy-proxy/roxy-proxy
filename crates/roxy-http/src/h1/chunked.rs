@@ -398,6 +398,41 @@ mod tests {
     }
 
     #[test]
+    fn trailer_section_limits() {
+        let f = HttpFlags {
+            allow_trailers: true,
+            ..HttpFlags::default()
+        };
+        let small = Limits {
+            max_header_bytes: 32,
+            ..Limits::default()
+        };
+        let mut d = ChunkedDecoder::new(&small, &f);
+        let mut buf =
+            BytesMut::from(&b"0\r\nX-Long: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n"[..]);
+        assert_eq!(d.decode(&mut buf).unwrap_err().reason, Reason::HeadTooLarge);
+        // The cap applies before the section is complete, so an endless
+        // trailer cannot be buffered.
+        let mut d = ChunkedDecoder::new(&small, &f);
+        let mut buf = BytesMut::from(&b"0\r\nX-Long: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"[..]);
+        assert_eq!(d.decode(&mut buf).unwrap_err().reason, Reason::HeadTooLarge);
+
+        let few = Limits {
+            max_headers: 1,
+            ..Limits::default()
+        };
+        let mut d = ChunkedDecoder::new(&few, &f);
+        let mut buf = BytesMut::from(&b"0\r\nX-A: 1\r\nX-B: 2\r\n\r\n"[..]);
+        assert_eq!(
+            d.decode(&mut buf).unwrap_err().reason,
+            Reason::TooManyHeaders
+        );
+        let mut d = ChunkedDecoder::new(&few, &f);
+        let mut buf = BytesMut::from(&b"0\r\nX-A: 1\r\n\r\n"[..]);
+        assert!(matches!(d.decode(&mut buf).unwrap(), Decoded::Trailers(_)));
+    }
+
+    #[test]
     fn body_cap() {
         let l = Limits {
             max_request_body_bytes: 8,

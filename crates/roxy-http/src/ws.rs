@@ -188,6 +188,24 @@ mod tests {
     }
 
     #[test]
+    fn request_must_have_no_body() {
+        let mut r = upgrade_req(&[KEY, V13]);
+        r.body = Body::from_bytes("x");
+        assert_eq!(
+            validate_upgrade_request(&r).unwrap_err().reason,
+            Reason::WsBadHandshake
+        );
+        // Unknown length (chunked) is a body too, even if it turns out empty.
+        let mut r = upgrade_req(&[KEY, V13]);
+        let (_tx, body) = Body::channel(1 << 20, None);
+        r.body = body;
+        assert_eq!(
+            validate_upgrade_request(&r).unwrap_err().reason,
+            Reason::WsBadHandshake
+        );
+    }
+
+    #[test]
     fn response_validation() {
         let key = validate_upgrade_request(&upgrade_req(&[KEY, V13])).unwrap();
         let mut res = CanonicalResponse::new(StatusCode::SWITCHING_PROTOCOLS);
