@@ -141,6 +141,55 @@ fn ca_init_and_export() {
 }
 
 #[test]
+fn provided_ca_is_exported_and_never_generated() {
+    let dir = tempfile::tempdir().unwrap();
+    let write_cfg = |name: &str, tls: &str| {
+        let p = dir.path().join(name);
+        std::fs::write(
+            &p,
+            format!("version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:3128 }}]\ntls: {tls}\n"),
+        )
+        .unwrap();
+        p.to_str().unwrap().to_owned()
+    };
+
+    // Mint a CA to stand in for one the operator brings.
+    let gen_dir = dir.path().join("gen");
+    let gen_cfg = write_cfg("gen.yaml", &format!("{{ ca_dir: {gen_dir:?} }}"));
+    assert!(roxy(&["ca", "init", "--config", &gen_cfg]).status.success());
+    let cert = dir.path().join("tls.crt");
+    let key = dir.path().join("tls.key");
+    std::fs::rename(gen_dir.join("roxy-ca.pem"), &cert).unwrap();
+    std::fs::rename(gen_dir.join("roxy-ca.key"), &key).unwrap();
+
+    let unused_dir = dir.path().join("unused");
+    let cfg = write_cfg(
+        "roxy.yaml",
+        &format!("{{ ca_dir: {unused_dir:?}, ca_cert: {cert:?}, ca_key: {key:?} }}"),
+    );
+    let out = roxy(&["ca", "export", "--config", &cfg]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), std::fs::read_to_string(&cert).unwrap());
+
+    for args in [&["ca", "init"][..], &["ca", "init", "--force"]] {
+        let out = roxy(&[args, &["--config", &cfg]].concat());
+        assert_eq!(out.status.code(), Some(1));
+        assert!(
+            text(&out.stderr).contains("tls.ca_cert is set"),
+            "{}",
+            text(&out.stderr)
+        );
+    }
+    assert!(!unused_dir.exists(), "nothing may be generated in ca_dir");
+
+    // A missing provided file fails; it is never replaced by a new CA.
+    std::fs::remove_file(&key).unwrap();
+    let out = roxy(&["ca", "export", "--config", &cfg]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!key.exists());
+}
+
+#[test]
 fn run_fails_closed_on_a_bad_addon() {
     // An addon that cannot be loaded refuses startup with one clear line;
     // roxy never starts without a configured layer.

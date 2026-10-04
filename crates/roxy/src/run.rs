@@ -126,8 +126,12 @@ pub fn policy_update(config: &Config) -> anyhow::Result<PolicyUpdate> {
     })
 }
 
-/// Loads the CA from `tls.ca_dir`, generating it on first start.
+/// Loads the provided CA (`tls.ca_cert` / `tls.ca_key`), or else the CA in
+/// `tls.ca_dir`, generating it there on first start.
 pub fn load_ca(config: &Config) -> anyhow::Result<Ca> {
+    if let Some((cert, key)) = config.tls.provided_ca()? {
+        return Ok(Ca::load_provided(cert, key)?);
+    }
     let dir = &config.tls.ca_dir;
     match Ca::load(dir) {
         Ok(ca) => Ok(ca),
@@ -587,6 +591,26 @@ mod tests {
 
     fn cfg(yaml: &str) -> Config {
         Config::from_yaml(yaml).unwrap()
+    }
+
+    /// `run` uses a provided CA as is: a missing file is fatal, never a
+    /// reason to fall back to `ca_dir`.
+    #[test]
+    fn load_ca_uses_the_provided_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        let generated = Ca::generate(&dir.path().join("gen")).unwrap();
+        let unused = dir.path().join("unused");
+        let c = cfg(&format!(
+            "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:3128 }}]\n\
+             tls: {{ ca_dir: {unused:?}, ca_cert: {:?}, ca_key: {:?} }}\n",
+            generated.cert_path(),
+            dir.path().join("gen").join(roxy_tls::CA_KEY_FILE),
+        ));
+        assert_eq!(load_ca(&c).unwrap().cert_der(), generated.cert_der());
+
+        std::fs::remove_dir_all(dir.path().join("gen")).unwrap();
+        assert!(load_ca(&c).is_err());
+        assert!(!unused.exists());
     }
 
     /// `log.flow` rotation settings reach the file sink: emitting past

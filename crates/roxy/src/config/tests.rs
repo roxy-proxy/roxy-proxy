@@ -338,6 +338,32 @@ fn transparent_listener_is_deferred() {
 }
 
 #[test]
+fn provided_ca_needs_cert_and_key() {
+    let base = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:3128 }]\n";
+    let d = diagnostics(&format!("{base}tls: {{ ca_cert: /c.pem }}\n"));
+    assert_eq!(d.len(), 1);
+    assert_eq!(d[0].path, "tls.ca_key");
+    let d = diagnostics(&format!("{base}tls: {{ ca_key: /c.key }}\n"));
+    assert_eq!(d.len(), 1);
+    assert_eq!(d[0].path, "tls.ca_cert");
+    assert!(
+        parse(&format!("{base}tls: {{ ca_key: /c.key }}\n"))
+            .tls
+            .provided_ca()
+            .is_err()
+    );
+
+    let cfg = parse(&format!(
+        "{base}tls: {{ ca_cert: /c.pem, ca_key: /c.key }}\n"
+    ));
+    cfg.validate().unwrap();
+    assert_eq!(
+        cfg.tls.provided_ca().unwrap(),
+        Some((Path::new("/c.pem"), Path::new("/c.key")))
+    );
+}
+
+#[test]
 fn misc_diagnostics() {
     let d = diagnostics(
         "version: 2\nlisteners: []\nca_server: { bind: 127.0.0.1:1 }\n\

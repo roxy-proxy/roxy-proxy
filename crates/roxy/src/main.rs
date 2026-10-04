@@ -82,7 +82,8 @@ struct HealthArgs {
 
 #[derive(Debug, Subcommand)]
 enum CaCommand {
-    /// Generate the CA in `tls.ca_dir`. Fails if one already exists.
+    /// Generate the CA in `tls.ca_dir`. Fails if one already exists or a
+    /// provided CA (`tls.ca_cert`) is configured.
     Init {
         #[command(flatten)]
         config: ConfigArg,
@@ -481,6 +482,12 @@ fn ca_init(path: &Path, force: bool) -> anyhow::Result<ExitCode> {
     // CA commands need only `tls.ca_dir`, so a structurally valid config is
     // enough; rule problems should not block CA management.
     let config = Config::load(path)?;
+    if let Some((cert, _)) = config.tls.provided_ca()? {
+        anyhow::bail!(
+            "tls.ca_cert is set ({}): roxy uses that CA and never generates one",
+            cert.display()
+        );
+    }
     let dir = &config.tls.ca_dir;
     let ca = if force {
         Ca::generate_force(dir)
@@ -500,7 +507,10 @@ fn ca_init(path: &Path, force: bool) -> anyhow::Result<ExitCode> {
 
 fn ca_export(path: &Path, der: bool) -> anyhow::Result<ExitCode> {
     let config = Config::load(path)?;
-    let ca = Ca::load(&config.tls.ca_dir)?;
+    let ca = match config.tls.provided_ca()? {
+        Some((cert, key)) => Ca::load_provided(cert, key)?,
+        None => Ca::load(&config.tls.ca_dir)?,
+    };
     let mut out = std::io::stdout().lock();
     if der {
         out.write_all(&ca.cert_der())?;
