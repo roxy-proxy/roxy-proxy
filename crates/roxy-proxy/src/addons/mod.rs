@@ -169,7 +169,7 @@ pub(crate) struct StackFlow {
     /// A layer asked to close the client connection.
     pub(crate) close: AtomicBool,
     /// The upgraded upstream connection, when the core relayed a `101`.
-    upgrade: Mutex<Option<(hyper::upgrade::OnUpgrade, WsKey)>>,
+    upgrade: Mutex<Option<(hyper::upgrade::Upgraded, WsKey)>>,
     /// One more than the deepest layer entered.
     depth: AtomicUsize,
 }
@@ -222,7 +222,7 @@ impl StackFlow {
             .clone()
     }
 
-    fn take_upgrade(&self) -> Option<(hyper::upgrade::OnUpgrade, WsKey)> {
+    fn take_upgrade(&self) -> Option<(hyper::upgrade::Upgraded, WsKey)> {
         self.upgrade
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -405,11 +405,11 @@ pub(crate) async fn run<F: Front>(
         cx.watch = Some(w);
     }
     if res.status == http::StatusCode::SWITCHING_PROTOCOLS {
-        if let Some((on, key)) = st.take_upgrade() {
+        if let Some((upstream, key)) = st.take_upgrade() {
             // A layer cannot express `upgrade: websocket` (hop-by-hop); the
             // core relayed a real upgrade, so restore it.
             res.meta.upgrade = Some("websocket".to_owned());
-            return Outcome::Upgrade { res, on, key };
+            return Outcome::Upgrade { res, upstream, key };
         }
         let layer = st.snap.addons[0].name.clone();
         let err = LayerError::InvalidResponse("101 without an upgraded upstream".into());
@@ -544,8 +544,8 @@ async fn core(
             );
             Err(HostError::new(format!("request body failed: {e}")))
         }
-        Outcome::Upgrade { res, on, key } => {
-            *st.upgrade.lock().unwrap_or_else(PoisonError::into_inner) = Some((on, key));
+        Outcome::Upgrade { res, upstream, key } => {
+            *st.upgrade.lock().unwrap_or_else(PoisonError::into_inner) = Some((upstream, key));
             Ok(to_layer_response(res))
         }
     };
