@@ -628,16 +628,18 @@ fn flow_log_settings_validated() {
 fn service_addons_validate() {
     let ok = format!(
         "{BASE}addons:\n  - name: s\n    kind: service\n    endpoint: svc\n    \
-         limits: {{ first_byte_timeout: 2s, max_exchange_time: 1m }}\n    \
+         limits: {{ first_byte_timeout: 2s, max_exchange_time: 1m, max_connections: 2, \
+         max_streams: 50 }}\n    \
          endpoints:\n      svc: {{ url: \"http://127.0.0.1:9000/layer\", private_ok: true }}\n"
     );
     parse(&ok).validate().unwrap();
 
     let d = diagnostics(&format!(
         "{BASE}addons:\n  - name: s\n    kind: service\n    endpoint: nope\n    \
-         capabilities: [log]\n    config: {{ a: 1 }}\n    limits: {{ step_cpu: 1s }}\n    \
+         capabilities: [log]\n    config: {{ a: 1 }}\n    \
+         limits: {{ step_cpu: 1s, max_streams: 0 }}\n    \
          endpoints:\n      svc: {{ url: \"http://127.0.0.1:9000/\" }}\n  \
-         - name: w\n    path: /w.wasm\n    limits: {{ first_byte_timeout: 1s }}\n"
+         - name: w\n    path: /w.wasm\n    limits: {{ first_byte_timeout: 1s, max_connections: 2 }}\n"
     ));
     let paths: Vec<&str> = d.iter().map(|d| d.path.as_str()).collect();
     for p in [
@@ -645,7 +647,9 @@ fn service_addons_validate() {
         "addons[0].capabilities",
         "addons[0].config",
         "addons[0].limits.step_cpu",
+        "addons[0].limits.max_streams",
         "addons[1].limits.first_byte_timeout",
+        "addons[1].limits.max_connections",
     ] {
         assert!(paths.contains(&p), "{p} not in {paths:?}");
     }

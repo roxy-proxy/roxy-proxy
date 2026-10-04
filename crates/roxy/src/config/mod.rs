@@ -621,6 +621,12 @@ pub struct AddonLimits {
     /// A service addon must return a complete head within this time.
     #[serde(with = "humantime_serde")]
     pub first_byte_timeout: Option<Duration>,
+    /// A service addon's connections to its endpoint (default 4).
+    #[serde(deserialize_with = "units::opt_count")]
+    pub max_connections: Option<u64>,
+    /// Streams (exchanges) on one service connection (default 100).
+    #[serde(deserialize_with = "units::opt_count")]
+    pub max_streams: Option<u64>,
     /// Replace a WASM instance after this many exchanges (default 10 000).
     #[serde(deserialize_with = "units::opt_count")]
     pub recycle_after_exchanges: Option<u64>,

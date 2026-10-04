@@ -248,11 +248,17 @@ impl Config {
                             "`endpoint` is for `kind: service` addons",
                         ));
                     }
-                    if a.limits.first_byte_timeout.is_some() {
-                        d.push(Diagnostic::new(
-                            format!("{path}.limits.first_byte_timeout"),
-                            "`first_byte_timeout` is for `kind: service` addons",
-                        ));
+                    for (field, set) in [
+                        ("first_byte_timeout", a.limits.first_byte_timeout.is_some()),
+                        ("max_connections", a.limits.max_connections.is_some()),
+                        ("max_streams", a.limits.max_streams.is_some()),
+                    ] {
+                        if set {
+                            d.push(Diagnostic::new(
+                                format!("{path}.limits.{field}"),
+                                format!("`{field}` is for `kind: service` addons"),
+                            ));
+                        }
                     }
                 }
                 super::AddonKind::Service => Self::validate_service(&path, a, d),
@@ -361,9 +367,17 @@ impl Config {
             if set {
                 refuse(
                     &format!("limits.{field}"),
-                    "a WASM limit; a service layer takes `first_byte_timeout` and \
-                     `max_exchange_time`",
+                    "a WASM limit; a service layer takes `first_byte_timeout`, \
+                     `max_exchange_time`, `max_connections` and `max_streams`",
                 );
+            }
+        }
+        for (field, n) in [
+            ("max_connections", l.max_connections),
+            ("max_streams", l.max_streams),
+        ] {
+            if n == Some(0) {
+                refuse(&format!("limits.{field}"), "must be at least 1");
             }
         }
     }

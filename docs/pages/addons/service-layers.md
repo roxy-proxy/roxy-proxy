@@ -23,8 +23,7 @@ addons:
 
 `path`, `capabilities`, `config`, `audit_endpoint` and the WASM limits are
 refused on a service layer, and `first_byte_timeout`, `max_connections` and
-`max_streams` are refused on a WASM
-layer.
+`max_streams` are refused on a WASM layer.
 
 ## Transport
 
