@@ -86,6 +86,8 @@ pub(crate) struct AddonDef {
     pub caps: Vec<roxy_wasm::Capability>,
     pub config: serde_json::Value,
     pub limits: roxy_wasm::LayerLimits,
+    pub when: Option<String>,
+    pub sample: Option<f64>,
 }
 
 impl AddonDef {
@@ -98,6 +100,8 @@ impl AddonDef {
             caps: Vec::new(),
             config: serde_json::json!({ "name": name }),
             limits: roxy_wasm::LayerLimits::default(),
+            when: None,
+            sample: None,
         }
     }
 
@@ -116,7 +120,25 @@ impl AddonDef {
         self
     }
 
-    async fn load(self, rt: &roxy_wasm::WasmRuntime) -> Arc<AddonSpec> {
+    /// Runs only on requests `when` matches.
+    #[must_use]
+    pub(crate) fn when(mut self, when: &str) -> Self {
+        self.when = Some(when.to_owned());
+        self
+    }
+
+    /// Gets a copy of this share of exchanges (observe mode).
+    #[must_use]
+    pub(crate) fn sample(mut self, p: f64) -> Self {
+        self.sample = Some(p);
+        self
+    }
+
+    async fn load(self, rt: &roxy_wasm::WasmRuntime, input: &PolicyInput<'_>) -> Arc<AddonSpec> {
+        let when = self.when.as_deref().map(|w| {
+            roxy_rules::Condition::compile(input, &format!("{}.when", self.name), w)
+                .unwrap_or_else(|d| panic!("when: {d:?}"))
+        });
         let layer = roxy_wasm::Layer::load(
             rt,
             self.wasm.to_vec(),
@@ -136,8 +158,8 @@ impl AddonDef {
             endpoints: HashMap::new(),
             state: StateLimits::default(),
             audit_endpoint: None,
-            when: None,
-            sample: None,
+            when,
+            sample: self.sample,
         })
     }
 }
@@ -216,15 +238,15 @@ impl KitBuilder {
             serde_yaml_ng::from_str(&self.metric_defs).unwrap()
         };
         let none = std::collections::HashSet::new();
-        let policy = Policy::compile(&PolicyInput {
+        let input = PolicyInput {
             rules: &rules,
             metrics: &metric_defs,
             secret_names: &none,
             address_lists: &none,
             transparent_listeners: false,
             default: DefaultDecision::Deny,
-        })
-        .unwrap_or_else(|d| panic!("rules: {d:?}"));
+        };
+        let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
 
         let metrics: Arc<dyn MetricSource> = if metric_defs.is_empty() {
             self.metrics
@@ -238,7 +260,7 @@ impl KitBuilder {
         let rt = roxy_wasm::WasmRuntime::new().unwrap();
         let mut addons = Vec::new();
         for a in self.addons {
-            addons.push(a.load(&rt).await);
+            addons.push(a.load(&rt, &input).await);
         }
 
         let mut settings = UpstreamSettings::default();

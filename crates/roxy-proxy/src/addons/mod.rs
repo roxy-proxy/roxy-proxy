@@ -995,3 +995,30 @@ pub(crate) fn chain_tunnels(
     }
     (Box::new(tokio::io::join(side_r, side_w)), Vec::new())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::sampled;
+    use ulid::Ulid;
+
+    #[test]
+    fn sampling_is_deterministic_and_proportional() {
+        let flows: Vec<Ulid> = (0..10_000).map(|_| Ulid::generate()).collect();
+        assert!(flows.iter().all(|&f| sampled(f, 0, None)));
+        assert!(flows.iter().all(|&f| sampled(f, 3, Some(1.0))));
+        for p in [0.01, 0.25, 0.9] {
+            let hits = flows.iter().filter(|&&f| sampled(f, 0, Some(p))).count();
+            #[allow(clippy::cast_precision_loss)]
+            let share = hits as f64 / flows.len() as f64;
+            assert!((share - p).abs() < 0.03, "p {p}: {share}");
+        }
+        let f = flows[0];
+        assert_eq!(sampled(f, 1, Some(0.5)), sampled(f, 1, Some(0.5)));
+        // Two layers draw independently.
+        let both = flows
+            .iter()
+            .filter(|&&f| sampled(f, 0, Some(0.5)) && sampled(f, 1, Some(0.5)))
+            .count();
+        assert!((2000..3000).contains(&both), "{both}");
+    }
+}
