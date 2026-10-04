@@ -33,7 +33,7 @@ use http_body::{Body as HttpBody, Frame, SizeHint};
 use roxy_http::layer::{from_layer_request, to_layer_request, to_layer_response};
 use roxy_http::upstream::from_upstream_response;
 use roxy_http::ws::WsKey;
-use roxy_http::{Body, BodyError, CanonicalRequest};
+use roxy_http::{Body, BodyError, CanonicalRequest, Headers, coding};
 use roxy_wasm::{HostError, LayerError, LayerOutcome, LayerRequest, LayerResponse};
 use ulid::Ulid;
 
@@ -358,8 +358,12 @@ fn layer_refusal(layer: &str) -> Refusal {
 pub(crate) async fn run<F: Front>(
     front: &mut F,
     cx: &mut FlowCx,
-    req: CanonicalRequest,
+    mut req: CanonicalRequest,
 ) -> Outcome {
+    if cx.snap.flags.decode_for_addons {
+        let limit = cx.snap.limits.max_request_body_bytes;
+        decode_for_layers(&mut req.headers, &mut req.body, limit);
+    }
     let st = Arc::new(StackFlow::new(cx, &req));
     cx.stack = Some(st.clone());
     let driven = front
@@ -513,7 +517,17 @@ async fn core(
     icx.flow = st.flow;
     let outcome = crate::exchange::core(&mut Detached, &mut icx, creq).await;
     let resp = match outcome {
-        Outcome::Respond(res) => Ok(to_layer_response(res)),
+        Outcome::Respond(mut res) => {
+            // A range of an encoded body is not decodable on its own.
+            if snap.flags.decode_for_addons
+                && res.status != http::StatusCode::PARTIAL_CONTENT
+                && !res.headers.contains("content-range")
+            {
+                let limit = snap.limits.max_response_body_bytes;
+                decode_for_layers(&mut res.headers, &mut res.body, limit);
+            }
+            Ok(to_layer_response(res))
+        }
         Outcome::Refuse(refusal) => {
             if refusal.close {
                 st.close.store(true, Ordering::Relaxed);
@@ -537,6 +551,20 @@ async fn core(
     };
     *st.inner.lock().unwrap_or_else(PoisonError::into_inner) = Some(icx);
     resp
+}
+
+/// Decodes a body by its `content-encoding` for the layers
+/// (docs/addons.md#content-codings), and drops the header. A coding roxy
+/// cannot decode is left as it is, header and all, for a layer to judge.
+fn decode_for_layers(headers: &mut Headers, body: &mut Body, limit: u64) {
+    let Ok(codings) = coding::content_codings(headers) else {
+        return;
+    };
+    if codings.is_empty() {
+        return;
+    }
+    headers.remove("content-encoding");
+    *body = coding::decode_body(std::mem::take(body), &codings, limit);
 }
 
 /// A layer's response body to the client, sent only while the flow log
@@ -572,6 +600,24 @@ fn gated(body: Body, sink: Arc<dyn FlowSink>) -> Body {
     Body::wrap_native(Gated { inner: body, sink }, u64::MAX, known)
 }
 
+/// The indexes of the stack's `tunnel` layers, outermost first.
+fn tunnel_layers(addons: &[Arc<AddonSpec>]) -> Vec<usize> {
+    addons
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| !a.observe && a.wasm().is_some_and(roxy_wasm::Layer::has_tunnel))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Whether a WebSocket must be relayed with no extension negotiated, so
+/// every message stays readable: message rules check them, or `tunnel`
+/// layers get them decoded (docs/websockets.md#extensions).
+pub(crate) fn ws_without_extensions(snap: &Snapshot) -> bool {
+    snap.policy.reads_ws()
+        || (snap.flags.decode_for_addons && !tunnel_layers(&snap.addons).is_empty())
+}
+
 /// Inserts the stack's `tunnel` layers (outermost first) between the client
 /// and the WebSocket relay (docs/addons.md#layer-stack): each gets the raw byte streams of the
 /// upgraded connection. The rules' relay stays the hop next to the
@@ -588,14 +634,7 @@ pub(crate) fn chain_tunnels(
     leftover: Vec<u8>,
 ) -> (crate::io::BoxIo, Vec<u8>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let tunnels: Vec<usize> = st
-        .snap
-        .addons
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| !a.observe && a.wasm().is_some_and(roxy_wasm::Layer::has_tunnel))
-        .map(|(i, _)| i)
-        .collect();
+    let tunnels = tunnel_layers(&st.snap.addons);
     if tunnels.is_empty() {
         return (client, leftover);
     }

@@ -30,6 +30,8 @@ fn full_example_parses_and_validates() {
     assert_eq!(cfg.ca_server.as_ref().unwrap().bind.port(), 3130);
     assert_eq!(cfg.tls.upstream.min_version, TlsVersion::Tls12);
     assert!(cfg.http.enable_h2);
+    assert!(!cfg.http.strip_accept_encoding);
+    assert!(cfg.http.decode_for_addons);
     assert_eq!(cfg.limits.max_inspect_body_bytes.as_u64(), 1024 * 1024);
     assert_eq!(cfg.upstream.dns.resolver, Resolver::System);
     assert_eq!(

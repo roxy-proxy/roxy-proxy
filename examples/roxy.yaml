@@ -33,6 +33,8 @@ http:
   allow_chunk_extensions: false
   allow_plain_in_connect: false
   enable_h2: true             # client-side HTTP/2 via ALPN h2 (default true; false = http/1.1 only)
+  strip_accept_encoding: false  # remove accept-encoding so origins answer uncompressed
+  decode_for_addons: true     # addons see decoded bodies, without content-encoding
 
 limits:
   max_header_bytes: 64kb

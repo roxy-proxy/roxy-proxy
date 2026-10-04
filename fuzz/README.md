@@ -27,6 +27,7 @@ The first directory is the working corpus, which grows as the fuzzer runs.
 | `url` | `url::*` | Path, query, origin-form, absolute-form and authority normalisation are idempotent. A normalised path starts with `/` and has no `.` or `..` segment, `%2E`-encoded or not. |
 | `client_hello` | `roxy-tls` `sniff` | Reading more never changes a verdict: over an input's prefixes, `NeedMore` until one constant answer. |
 | `rule_compile` | `roxy-rules` lexer, parser, type-checker, compiler | A policy that compiles evaluates without panicking, and a fail-closed outcome is never an allow. |
+| `content_coding` | `roxy-http` `coding::Decoder` (gzip, deflate, br, zstd, stacked) | The result does not depend on how input is fed or output read, and the decoded-size limit holds exactly: a body of `n` decoded bytes is refused under a limit of `n - 1`. |
 | `rule_eval` | `Policy::evaluate_head` on generated policies | **Unavailable inputs only ever fail closed.** Making one input unavailable (a metric, the body text, the address list) leaves the outcome exactly as it was, or turns it into the fail-closed deny, never into a different decision. |
 
 The input format is in each target's doc comment. For the HTTP targets the
@@ -48,6 +49,9 @@ vectors, so the seeds are never stale and nothing derived is checked in:
 - **`client_hello`:** real ClientHellos from Python's `ssl`.
 - **`rule_compile`:** every `when:` expression in `examples/` and
   `crates/roxy-rules`.
+- **`content_coding`:** a small stream in each coding (gzip and zlib from
+  Python's standard library, br and zstd as fixed bytes), a stacked pair,
+  and gzip with every optional header field.
 - **`ws_frame`:** the RFC 6455 example frames and a fragmented, masked
   message with a ping in the middle.
 

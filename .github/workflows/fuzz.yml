@@ -103,6 +103,7 @@ jobs:
           - client_hello
           - rule_compile
           - rule_eval
+          - content_coding
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:

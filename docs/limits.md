@@ -13,7 +13,8 @@ connect produces a deny response or a closed socket.
 | a rule denies | deny response, then close |
 | policy input unavailable (metric store, address list, secret) | `503`, `_fail_closed` |
 | metric key table full or byte budget exhausted | deny, `metric_table_full` |
-| body too large to inspect | deny, `_fail_closed`, `body_too_large_to_inspect` |
+| body too large to inspect, as sent or decoded | deny, `_fail_closed`, `body_too_large_to_inspect` |
+| body to inspect cannot be decoded | deny, `_fail_closed`, `body_decode_failed` or `unsupported_content_encoding` |
 | body or header limit exceeded mid-stream | close both sides |
 | upstream DNS, connect or TLS failure | `502`, `upstream_error` |
 | address floor | `403`, `_address_policy` |

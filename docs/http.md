@@ -216,9 +216,40 @@ resource limits. hyper parses the response and roxy builds a
   taking it for twice `limits.body_idle_timeout`.
 - Redirects are forwarded, not followed. The client's next request is a new
   exchange, judged on its own.
-- Compressed bodies pass through untouched. roxy does not decompress for
-  inspection: `body.text` and `response.body.text` are a lossy UTF-8 view of
-  the bytes as sent.
+- Encoded bodies pass through untouched ([below](#content-codings)).
+
+## Content codings
+
+roxy decodes `content-encoding` to inspect a body, never to forward it:
+`body.text` and `response.body.text` see the decoded text
+([rules](rules.md#body-access)), and the bytes forwarded are the bytes
+received.
+
+| coding | format |
+|---|---|
+| `gzip`, `x-gzip` | RFC 1952; several members in a row are one body |
+| `deflate` | the zlib format (RFC 1950), as RFC 9110 defines it; raw deflate is refused |
+| `br` | RFC 7932 |
+| `zstd` | RFC 8878, with a window of at most 8 MiB (RFC 9659) |
+
+- Codings listed together are undone in reverse order. `identity` is
+  ignored. At most 4 codings are decoded; more is refused.
+- An empty body is empty whatever its coding.
+- Decoding is strict. Truncated data, a bad checksum, or any bytes after
+  the end of the stream make the body undecodable, so nothing the rules did
+  not see can follow what they did.
+- The decoders work in bounded steps: a highly compressed body costs time,
+  not memory. The decoded size counts against the same cap as the body as
+  sent.
+
+With addons, roxy also decodes bodies at the edge of the stack, so layers
+see them decoded ([addons](addons.md#content-codings)). This is the one case
+where roxy forwards a body decoded.
+
+`http.strip_accept_encoding` (default false) removes `accept-encoding` from
+every request as roxy reads it, so origins answer uncompressed. The addons,
+the rules and the flow log all see the request without it. This trades
+bandwidth from the origin for no decoding at all.
 
 ## Deny responses
 

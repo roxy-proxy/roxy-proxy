@@ -54,7 +54,13 @@ pub enum BodyText<'a> {
     /// `body.size < 1mb and body.text contains ...` (`and` short-circuits,
     /// so the body is never inspected when the size test is false).
     TooLarge,
-    /// Not buffered or could not be read (e.g. decompression failed).
+    /// Its `content-encoding` names a coding the host cannot decode.
+    /// Carries the coding.
+    UnsupportedEncoding(&'a str),
+    /// Its `content-encoding` could not be decoded (corrupt or truncated
+    /// data). Carries what was wrong.
+    Undecodable(&'a str),
+    /// Not buffered or could not be read.
     Unavailable,
 }
 
@@ -82,8 +88,9 @@ pub trait FlowView {
     /// A state-store entry.
     fn state(&self, key: &str) -> Option<Cow<'_, str>>;
     /// The buffered request body as text (docs/rules.md#body-access). Only called when a rule
-    /// reaches a `body.text` predicate. `TooLarge` and `Unavailable` both
-    /// fail the flow closed; an empty body is `Available("")`.
+    /// reaches a `body.text` predicate. A body with a `content-encoding` is
+    /// given decoded. Anything but `Available` fails the flow closed; an
+    /// empty body is `Available("")`.
     fn body_text(&self) -> BodyText<'_>;
     /// The buffered response body as text; same contract.
     fn response_body_text(&self) -> BodyText<'_>;

@@ -21,6 +21,8 @@
 #[cfg(test)]
 mod addon_tests;
 #[cfg(test)]
+mod coding_tests;
+#[cfg(test)]
 mod core_tests;
 #[cfg(test)]
 mod early_tests;
@@ -141,6 +143,7 @@ pub(crate) struct KitBuilder {
     rules: String,
     addons: Vec<AddonDef>,
     limits: Limits,
+    flags: HttpFlags,
 }
 
 impl KitBuilder {
@@ -159,6 +162,12 @@ impl KitBuilder {
     #[must_use]
     pub(crate) fn limits(mut self, f: impl FnOnce(&mut Limits)) -> Self {
         f(&mut self.limits);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn flags(mut self, f: impl FnOnce(&mut HttpFlags)) -> Self {
+        f(&mut self.flags);
         self
     }
 
@@ -235,7 +244,7 @@ impl KitBuilder {
                 redactor: Redactor::new(),
                 users: HashMap::new(),
                 limits: self.limits,
-                flags: HttpFlags::default(),
+                flags: self.flags,
                 upstream: settings,
                 address_lists: Arc::new(HashMap::new()),
                 deny_lists: Vec::new(),
@@ -269,6 +278,7 @@ impl Kit {
             rules: ALLOW_UP.to_owned(),
             addons: Vec::new(),
             limits: Limits::default(),
+            flags: HttpFlags::default(),
         }
     }
 

@@ -193,11 +193,6 @@ impl http_body::Body for ErrorBody {
     }
 }
 
-/// Lossy UTF-8 view of an inspected body.
-pub(crate) fn body_text(b: &Bytes) -> String {
-    String::from_utf8_lossy(b).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
