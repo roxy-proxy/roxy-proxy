@@ -18,7 +18,9 @@ through a pipeline you control:
   call out to other services, and keep state. Whatever they let through is
   still judged by the rules.
 - **Audit:** a structured JSONL flow log with the rule or addon behind
-  every decision, and optional capture of traffic to disk.
+  every decision, and optional capture of traffic to disk. Neither drops a
+  record: when a log falls behind or its disk fails, backpressure holds
+  traffic until it catches up, so every exchange is logged.
 
 It fails closed. Anything it cannot parse, verify or classify is dropped,
 the default denies anything no rule allows, and a failing input or addon
