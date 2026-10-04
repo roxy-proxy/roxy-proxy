@@ -32,7 +32,8 @@ roxy_addon::export!(RedactTokens);
   body buffers.
 - `flow::*` and `call_endpoint` wrap the host services. A panic traps, and
   the host fails the exchange closed.
-- The SDK does not wrap `tunnel`; use the raw bindings.
+- WebSockets need nothing extra: the request and response bodies carry
+  them ([WebSockets](/addons/overview#websockets)).
 - The crate carries a copy of `wit/` so it can be published; a test keeps
   the copy in sync.
 
@@ -57,9 +58,6 @@ the WASI 0.2 HTTP types for heads and bodies, vendored at 0.2.12 under
   `init` (called once per instance, with the config available through
   `flow.config`). It imports `chain` (`next`), `endpoints`, `flow`, and the
   WASI clocks, random, io, stdio and `wasi:http/types`.
-- **World `tunnel-layer`** adds the `tunnel` export. The component model has
-  no optional exports, so the host detects at load time which world a
-  component implements.
 - The host also links the rest of WASI 0.2 inertly: an empty environment, no
   arguments, no preopened directories, stdio closed, TCP, UDP and name
   lookup off, every socket address denied. Stock toolchains whose standard
