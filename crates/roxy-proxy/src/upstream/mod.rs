@@ -110,7 +110,8 @@ impl ConnectError {
         match self {
             Self::Dns(_) => "dns_failed",
             Self::Denied(_) => "address_denied",
-            Self::Connect(_) | Self::Target(_) => "connect_failed",
+            Self::Connect(_) => "connect_failed",
+            Self::Target(_) => "invalid_target",
             Self::Tls(_) => "tls_failed",
             Self::Timeout(_) => "timeout",
         }
@@ -254,6 +255,25 @@ impl ConnectorInner {
         Ok(ips)
     }
 
+    /// Dials the addresses in turn, within one `connect_timeout` for all
+    /// of them: each gets an equal share of what is left, so an address
+    /// that drops packets does not spend the whole budget before the next
+    /// is tried.
+    async fn dial_any(&self, ips: &[IpAddr], port: u16) -> Result<BoxIo, ConnectError> {
+        let deadline = tokio::time::Instant::now() + self.connect_timeout;
+        let mut last = ConnectError::Connect("no addresses".into());
+        for (i, ip) in ips.iter().enumerate() {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let share = left / u32::try_from(ips.len() - i).unwrap_or(u32::MAX);
+            match tokio::time::timeout(share, self.dial(SocketAddr::new(*ip, port))).await {
+                Ok(Ok(s)) => return Ok(s),
+                Ok(Err(e)) => last = ConnectError::Connect(format!("{ip}:{port}: {e}")),
+                Err(_) => last = ConnectError::Timeout("upstream connect"),
+            }
+        }
+        Err(last)
+    }
+
     async fn connect(
         &self,
         scheme: Scheme,
@@ -261,22 +281,8 @@ impl ConnectorInner {
         port: u16,
         tls: &Arc<ClientConfig>,
     ) -> Result<MaybeTls, ConnectError> {
-        let ips = self.resolve_checked(host).await?;
-        let mut last = ConnectError::Connect("no addresses".into());
-        let mut tcp = None;
-        for ip in ips {
-            match tokio::time::timeout(self.connect_timeout, self.dial(SocketAddr::new(ip, port)))
-                .await
-            {
-                Ok(Ok(s)) => {
-                    tcp = Some(s);
-                    break;
-                }
-                Ok(Err(e)) => last = ConnectError::Connect(format!("{ip}:{port}: {e}")),
-                Err(_) => last = ConnectError::Timeout("upstream connect"),
-            }
-        }
-        let tcp = tcp.ok_or(last)?;
+        let ips = interleave_families(self.resolve_checked(host).await?);
+        let tcp = self.dial_any(&ips, port).await?;
         match scheme {
             Scheme::Http => Ok(MaybeTls::Plain(tcp)),
             Scheme::Https => {
@@ -291,6 +297,27 @@ impl ConnectorInner {
                 .map_err(|e| ConnectError::Tls(e.to_string()))?;
                 Ok(MaybeTls::Tls(Box::new(tls)))
             }
+        }
+    }
+}
+
+/// The addresses with their families alternating, starting with the
+/// resolver's first, so one unreachable family costs at most every other
+/// attempt.
+fn interleave_families(ips: Vec<IpAddr>) -> Vec<IpAddr> {
+    let Some(first) = ips.first().copied() else {
+        return ips;
+    };
+    let (same, other): (Vec<_>, Vec<_>) = ips
+        .into_iter()
+        .partition(|ip| ip.is_ipv4() == first.is_ipv4());
+    let mut same = same.into_iter();
+    let mut other = other.into_iter();
+    let mut out = Vec::new();
+    loop {
+        match (same.next(), other.next()) {
+            (None, None) => return out,
+            (a, b) => out.extend(a.into_iter().chain(b)),
         }
     }
 }
@@ -474,12 +501,34 @@ pub(crate) fn describe(err: &hyper_util::client::legacy::Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
     use crate::addrlist::AddressList;
+
+    /// Answers `200` to every HTTP/1.1 request on `s`, keeping it open.
+    async fn answer_ok<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(mut s: S) {
+        let mut buf = vec![0u8; 4096];
+        let mut seen = Vec::new();
+        while let Ok(k) = s.read(&mut buf).await {
+            if k == 0 {
+                return;
+            }
+            seen.extend_from_slice(&buf[..k]);
+            while let Some(i) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                seen.drain(..i + 4);
+                if s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
 
     /// A keep-alive HTTP/1.1 server answering `200` to everything; counts
     /// accepted connections.
@@ -489,30 +538,91 @@ mod tests {
         let accepted = Arc::new(AtomicUsize::new(0));
         let n = accepted.clone();
         tokio::spawn(async move {
-            while let Ok((mut s, _)) = l.accept().await {
+            while let Ok((s, _)) = l.accept().await {
                 n.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let mut seen = Vec::new();
-                    while let Ok(k) = s.read(&mut buf).await {
-                        if k == 0 {
-                            return;
-                        }
-                        seen.extend_from_slice(&buf[..k]);
-                        while let Some(i) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
-                            seen.drain(..i + 4);
-                            if s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                    }
-                });
+                tokio::spawn(answer_ok(s));
             }
         });
         (port, accepted)
+    }
+
+    /// Settings whose dial records each address and hands it to `connect`.
+    fn dialing(
+        hosts: &[(&str, &[&str])],
+        connect: impl Fn(SocketAddr) -> TestDialFuture + Send + Sync + 'static,
+    ) -> (UpstreamSettings, Arc<Mutex<Vec<SocketAddr>>>) {
+        let mut s = UpstreamSettings::default();
+        s.dns.servers = Some(vec!["127.0.0.1:9".parse().unwrap()]);
+        for (name, ips) in hosts {
+            s.dns.static_hosts.insert(
+                (*name).to_owned(),
+                ips.iter().map(|ip| ip.parse().unwrap()).collect(),
+            );
+        }
+        let dialled = Arc::new(Mutex::new(Vec::new()));
+        let seen = dialled.clone();
+        s.dial = Some(TestDial(Arc::new(move |addr| {
+            seen.lock().unwrap().push(addr);
+            connect(addr)
+        })));
+        (s, dialled)
+    }
+
+    fn tls() -> Arc<ClientConfig> {
+        roxy_tls::install_crypto_provider();
+        roxy_tls::client_config(&roxy_tls::UpstreamTlsOptions::default()).unwrap()
+    }
+
+    /// A name with several addresses that drop packets fails within one
+    /// `connect_timeout`, not one per address; the families are tried
+    /// alternately, the resolver's first family first.
+    #[tokio::test]
+    async fn unroutable_addresses_share_one_connect_timeout() {
+        let ips = ["93.184.216.1", "93.184.216.2", "2606:4700::1"];
+        let (mut s, dialled) =
+            dialing(&[("many.test", &ips)], |_| Box::pin(std::future::pending()));
+        s.connect_timeout = Duration::from_millis(300);
+        let up = Upstream::new(&s, &tls()).unwrap();
+        let authority = Authority::new(Host::Dns("many.test".into()), 80);
+        let started = std::time::Instant::now();
+        let Err(err) = up.connect_h1(Scheme::Http, &authority, false).await else {
+            panic!("nothing answers");
+        };
+        assert!(matches!(err, ConnectError::Timeout(_)), "{err:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "{:?}",
+            started.elapsed()
+        );
+        let order: Vec<String> = dialled
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|a| a.ip().to_string())
+            .collect();
+        assert_eq!(order, ["93.184.216.1", "2606:4700::1", "93.184.216.2"]);
+    }
+
+    /// IPv6 targets, as a literal `Host` and from `static_hosts`, pass the
+    /// floor and are dialled as given.
+    #[tokio::test]
+    async fn ipv6_targets_are_dialled() {
+        let ip = "2606:4700::1111";
+        let (s, dialled) = dialing(&[("v6.test", &[ip])], |_| {
+            let (ours, theirs) = tokio::io::duplex(16 * 1024);
+            tokio::spawn(answer_ok(ours));
+            Box::pin(async move { Ok(Box::new(theirs) as BoxIo) })
+        });
+        let up = Upstream::new(&s, &tls()).unwrap();
+        for host in [format!("[{ip}]"), "v6.test".to_owned()] {
+            let req = http::Request::get(format!("http://{host}:8080/"))
+                .body(Body::empty())
+                .unwrap();
+            let res = up.client(false, false).request(req).await.unwrap();
+            assert_eq!(res.status(), 200, "{host}");
+        }
+        let expected: SocketAddr = format!("[{ip}]:8080").parse().unwrap();
+        assert_eq!(*dialled.lock().unwrap(), [expected, expected]);
     }
 
     fn settings(lists: Vec<Arc<AddressList>>) -> UpstreamSettings {

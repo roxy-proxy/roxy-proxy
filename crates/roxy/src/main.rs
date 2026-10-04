@@ -15,7 +15,7 @@ use roxy_proxy::Redactor;
 use roxy_tls::{Ca, CaError};
 use tracing_subscriber::EnvFilter;
 
-use roxy::config::Config;
+use roxy::config::{Compiled, Config};
 use roxy::ruletest;
 
 #[derive(Debug, Parser)]
@@ -283,10 +283,8 @@ fn health(url: &str, timeout: Duration) -> anyhow::Result<ExitCode> {
 }
 
 fn rule_test(args: &RuleTestArgs) -> anyhow::Result<ExitCode> {
-    let config = load_valid(&args.config.config)?;
-    let policy = config
-        .compile_policy()
-        .map_err(|_| anyhow::anyhow!("policy failed to compile"))?;
+    let (config, compiled) = load_valid(&args.config.config)?;
+    let policy = compiled.policy;
     let (method, url) = match args.request.as_slice() {
         [one] => one
             .split_once(char::is_whitespace)
@@ -392,23 +390,25 @@ fn init_tracing(format: Option<LogFormat>, level: &str) -> anyhow::Result<()> {
 }
 
 /// Load and fully validate a config, turning diagnostics into one error.
-fn load_valid(path: &Path) -> anyhow::Result<Config> {
+fn load_valid(path: &Path) -> anyhow::Result<(Config, Compiled)> {
     let config = Config::load(path)?;
-    if let Err(diags) = config.validate() {
-        let lines: Vec<String> = diags
-            .iter()
-            .map(|d| {
-                let mut line = format!("{}:{d}", path.display());
-                for s in d.snippet.iter().flat_map(|s| s.lines()) {
-                    line.push_str("\n    | ");
-                    line.push_str(s);
-                }
-                line
-            })
-            .collect();
-        bail!("invalid config:\n{}", lines.join("\n"));
+    match config.validate() {
+        Ok(compiled) => Ok((config, compiled)),
+        Err(diags) => {
+            let lines: Vec<String> = diags
+                .iter()
+                .map(|d| {
+                    let mut line = format!("{}:{d}", path.display());
+                    for s in d.snippet.iter().flat_map(|s| s.lines()) {
+                        line.push_str("\n    | ");
+                        line.push_str(s);
+                    }
+                    line
+                })
+                .collect();
+            bail!("invalid config:\n{}", lines.join("\n"));
+        }
     }
-    Ok(config)
 }
 
 fn check(path: &Path) -> ExitCode {
@@ -434,7 +434,7 @@ fn check(path: &Path) -> ExitCode {
         }
     };
     match config.validate() {
-        Ok(()) => {
+        Ok(compiled) => {
             // Load every address list fully: a bad line is reported as
             // `<file>:<line>: ...`, exactly as startup would fail.
             let lists = match roxy::lists::load_all(&config) {
@@ -461,10 +461,11 @@ fn check(path: &Path) -> ExitCode {
                 config.secrets.len(),
                 config.addons.len(),
             );
-            if let Ok(policy) = config.compile_policy()
-                && policy.rule_count() > 0
-            {
-                print!("rules:\n{}", roxy::ruletest::classification(&policy));
+            if compiled.policy.rule_count() > 0 {
+                print!(
+                    "rules:\n{}",
+                    roxy::ruletest::classification(&compiled.policy)
+                );
             }
             ExitCode::SUCCESS
         }
@@ -572,7 +573,7 @@ async fn wait_for_shutdown(running: &roxy::run::Running) -> anyhow::Result<()> {
                 _ = hup.recv() => {
                     tracing::info!("SIGHUP: reopening logs and reloading config");
                     running.reopen_logs();
-                    running.reloader.reload_async().await;
+                    running.reloader.reload().await;
                 }
             }
         }

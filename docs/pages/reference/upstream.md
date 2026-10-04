@@ -15,7 +15,7 @@ upstream:
   deny_cidrs: []               # never valid destinations
   allow_cidrs: []              # exceptions to the private-range floor only
   deny_lists: [blocked]        # names from address_lists
-  connect_timeout: 10s
+  connect_timeout: 10s         # TCP connect, over all of a name's addresses together
 ```
 
 ## DNS
@@ -25,6 +25,12 @@ or explicit servers. Results are cached for their TTL, capped by
 `dns.cache_ttl_cap`. The workload's own DNS is irrelevant; block its DNS at
 the network layer. `static_hosts` answers fixed names before DNS (for tests
 and air-gapped deployments), and its answers still pass the address floor.
+
+A name with several addresses is dialled one address at a time, IPv4 and
+IPv6 alternating from the resolver's first, within one `connect_timeout`
+for all of them: each attempt gets an equal share of the time left, so an
+address that drops packets does not take the whole budget from the ones
+after it. The TLS handshake has its own `connect_timeout`.
 
 ## Upstream TLS
 
@@ -48,5 +54,6 @@ tls:
 |---|---|---|
 | address floor | `403`, `_address_policy` | `upstream_denied` |
 | DNS, connect, TLS | `502` | `upstream_error`, reason `dns_failed`, `connect_failed` or `tls_failed` |
+| a target roxy cannot dial (no host, an unknown scheme) | `502` | `upstream_error`, reason `invalid_target` |
 | timeout | `504` | `upstream_error`, reason `timeout` |
 | a response roxy cannot canonicalise | `502` | `upstream_error`, reason `protocol_error` |

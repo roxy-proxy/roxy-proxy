@@ -93,10 +93,21 @@ rules[0].then[0]: secret references are only allowed in `set_header` values, not
 rules[0].then[0]: `passthrough` requires a transparent listener, which is not supported yet (issue #15)  [rule a]
 
 == tag read above the rule that sets it
-rules[0].when: reads `tag["risky"]`, which is set too late to be seen here, by rules[1] ("mark"), below this rule; a rule sees only the tags set before it is checked, so the order of the rules would decide  [rule read]
+rules[0].when: reads `tag["risky"]`, which is set too late to be seen here, by rules[1] ("mark"), below this rule; a rule sees only the tags set before it is checked  [rule read]
 
 == tag read at the head but set by a watching rule
-rules[1].when: reads `tag["big"]`, which is set too late to be seen here, by rules[0] ("big"), a watching rule that runs only after the head decision; a rule sees only the tags set before it is checked, so the order of the rules would decide  [rule read]
+rules[1].when: reads `tag["big"]`, which is set too late to be seen here, by rules[0] ("big"), a watching rule, which fires when the values it reads arrive rather than in list order; a rule sees only the tags set before it is checked  [rule read]
+
+== tag read by a watching rule but set by a watching rule above it
+rules[1].when: reads `tag["big"]`, which is set too late to be seen here, by rules[0] ("big"), a watching rule, which fires when the values it reads arrive rather than in list order; a rule sees only the tags set before it is checked  [rule cap]
+
+== rewrite_path group references
+rules[0].then[0]: rewrite_path `to`: `$3` refers to a group `match` does not have (1 unnamed group; named: rest)  [rule a]
+rules[0].then[0]: rewrite_path `to`: `$nope` refers to a group `match` does not have (1 unnamed group; named: rest)  [rule a]
+rules[0].then[0]: rewrite_path `to`: `$1a` refers to a group `match` does not have; a reference runs to the end of the word, write `${1}a`  [rule a]
+
+== metric where reads a tag
+metrics[0].where: a metric's `where` cannot read tags: tags are set by rules and addons on each flow, and whether a flow counts is decided without them; it reads `tag["billing"]`
 
 == multi-key action map
 parse: .[0].then: an action is a map with exactly one key, but this one has `set_header` and `allow`; write each action as its own list item at line 1 column 18

@@ -21,13 +21,6 @@ pub enum Version {
     H2,
 }
 
-impl Version {
-    /// Whether this is an HTTP/1.x version.
-    pub fn is_h1(self) -> bool {
-        matches!(self, Version::H1_0 | Version::H1_1)
-    }
-}
-
 /// The request-target form the client used (RFC 9112 §3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetForm {
@@ -63,7 +56,9 @@ pub struct RequestMeta {
     /// `Proxy-Authorization` value (hop-by-hop, never forwarded), for the
     /// proxy's own authentication.
     pub proxy_authorization: Option<HeaderValue>,
-    /// The client asked to close the connection after this exchange.
+    /// The connection closes after this exchange: the client asked
+    /// (`Connection: close`), or it is HTTP/1.0, which roxy never keeps
+    /// alive.
     pub close: bool,
 }
 

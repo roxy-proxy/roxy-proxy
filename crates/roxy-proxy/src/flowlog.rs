@@ -2,15 +2,17 @@
 //!
 //! Every stage of the pipeline emits [`FlowEvent`]s to a [`FlowSink`]. Events
 //! serialise to one JSON object per line, tagged by an `event` field. Sinks
-//! never panic and never propagate write failures into the data path: a
-//! failed write is reported as a `tracing` warning and the event is dropped.
+//! never panic and never block the data path on I/O: the log's own sink,
+//! [`BufferedSink`], queues lines for a writer thread and, while the queue
+//! is full or the writer is failing, holds traffic back through
+//! [`FlowSink::poll_ready`] rather than dropping an event.
 //!
 //! Strings that may contain secrets must pass through a [`Redactor`] before
 //! they are put into an event.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -317,16 +319,6 @@ pub enum FlowEvent {
         /// The addresses in the answer.
         answers: Vec<IpAddr>,
     },
-    /// Bytes relayed uninspected (transparent mode only; deferred).
-    Passthrough {
-        #[serde(serialize_with = "ser_ts")]
-        ts: DateTime<Utc>,
-        conn: String,
-        listener: String,
-        client: ClientInfo,
-        dst: DstInfo,
-        rules: Vec<String>,
-    },
 }
 
 /// The client side of a connection.
@@ -484,39 +476,6 @@ fn encode(event: &FlowEvent) -> Option<Vec<u8>> {
         Err(error) => {
             tracing::warn!(%error, "flow log: failed to serialise event");
             None
-        }
-    }
-}
-
-/// Writes JSON lines to any [`Write`]r, flushing after every line.
-pub struct WriterSink<W: Write + Send> {
-    name: &'static str,
-    writer: Mutex<W>,
-}
-
-impl<W: Write + Send> WriterSink<W> {
-    /// `name` identifies the sink in warnings.
-    pub fn new(name: &'static str, writer: W) -> Self {
-        Self {
-            name,
-            writer: Mutex::new(writer),
-        }
-    }
-
-    /// Consume the sink and return the writer.
-    pub fn into_inner(self) -> W {
-        self.writer
-            .into_inner()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-impl<W: Write + Send> FlowSink for WriterSink<W> {
-    fn emit(&self, event: &FlowEvent) {
-        let Some(line) = encode(event) else { return };
-        let mut w = lock(&self.writer);
-        if let Err(error) = w.write_all(&line).and_then(|()| w.flush()) {
-            tracing::warn!(sink = self.name, %error, "flow log: write failed; event dropped");
         }
     }
 }
@@ -866,6 +825,42 @@ impl Redactor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    /// Writes JSON lines to any [`Write`]r, flushing after every line, and
+    /// drops an event whose write fails. For tests and tools; an audit log is a
+    /// [`BufferedSink`].
+    pub struct WriterSink<W: Write + Send> {
+        name: &'static str,
+        writer: Mutex<W>,
+    }
+
+    impl<W: Write + Send> WriterSink<W> {
+        /// `name` identifies the sink in warnings.
+        pub fn new(name: &'static str, writer: W) -> Self {
+            Self {
+                name,
+                writer: Mutex::new(writer),
+            }
+        }
+
+        /// Consume the sink and return the writer.
+        pub fn into_inner(self) -> W {
+            self.writer
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+
+    impl<W: Write + Send> FlowSink for WriterSink<W> {
+        fn emit(&self, event: &FlowEvent) {
+            let Some(line) = encode(event) else { return };
+            let mut w = lock(&self.writer);
+            if let Err(error) = w.write_all(&line).and_then(|()| w.flush()) {
+                tracing::warn!(sink = self.name, %error, "flow log: write failed; event dropped");
+            }
+        }
+    }
     use std::sync::Arc;
 
     fn ts() -> DateTime<Utc> {

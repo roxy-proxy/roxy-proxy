@@ -74,14 +74,6 @@ impl Method {
         }
     }
 
-    /// Safe methods per RFC 9110 §9.2.1.
-    pub fn is_safe(&self) -> bool {
-        matches!(
-            self,
-            Method::Get | Method::Head | Method::Options | Method::Trace
-        )
-    }
-
     /// Whether a request body is permitted. POST/PUT/PATCH and extension
     /// methods always; GET/HEAD/DELETE/OPTIONS/TRACE only when
     /// `allow_body_on_get`. CONNECT never carries a body.
@@ -107,10 +99,8 @@ impl Method {
             Method::Options => http::Method::OPTIONS,
             Method::Trace => http::Method::TRACE,
             Method::Patch => http::Method::PATCH,
-            // Validated as a token, which http::Method accepts.
-            Method::Extension(s) => {
-                http::Method::from_bytes(s.as_bytes()).unwrap_or(http::Method::GET)
-            }
+            Method::Extension(s) => http::Method::from_bytes(s.as_bytes())
+                .expect("an extension method is a validated token, which http::Method accepts"),
         }
     }
 
@@ -167,8 +157,6 @@ mod tests {
         assert!(!Method::Get.allows_body(false));
         assert!(Method::Get.allows_body(true));
         assert!(!Method::Connect.allows_body(true));
-        assert!(Method::Get.is_safe());
-        assert!(!Method::Post.is_safe());
     }
 
     #[test]

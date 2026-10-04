@@ -3,8 +3,10 @@
 One YAML file, `version: 1`. Parsing is strict: an unknown key anywhere is
 an error, not a silently ignored setting. Relative paths (`ca_dir`, `ca_cert`, `ca_key`, secret
 files, list files, addon paths, log and capture paths) resolve against the
-process's working directory. Each section is described on the page the
-table names.
+process's working directory. No `limits` count or size may be zero: a zero
+limit is not "off" but "refuse every request" (or, for the policy tables,
+"fail every metric and state rule closed"), so `roxy check` refuses it.
+Each section is described on the page the table names.
 
 | key | page |
 |---|---|

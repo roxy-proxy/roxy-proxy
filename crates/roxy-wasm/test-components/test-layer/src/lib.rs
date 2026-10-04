@@ -72,12 +72,23 @@ fn read_at_least(input: &InputStream, n: u64) -> Vec<u8> {
     got
 }
 
-fn write_all(out: &OutputStream, mut bytes: &[u8]) {
+fn write_all(out: &OutputStream, bytes: &[u8]) {
+    assert!(try_write_all(out, bytes), "write: the reader is gone");
+}
+
+/// Writes `bytes`, or returns `false` once the reader has closed the
+/// stream. The host drops a request body it has refused, and that is the
+/// layer's only signal to stop sending.
+fn try_write_all(out: &OutputStream, mut bytes: &[u8]) -> bool {
     while !bytes.is_empty() {
         let n = bytes.len().min(4096);
-        out.blocking_write_and_flush(&bytes[..n]).expect("write");
-        bytes = &bytes[n..];
+        match out.blocking_write_and_flush(&bytes[..n]) {
+            Ok(()) => bytes = &bytes[n..],
+            Err(StreamError::Closed) => return false,
+            Err(e) => panic!("write failed: {e:?}"),
+        }
     }
+    true
 }
 
 /// Copies `input` to `out`, chunk by chunk, transforming each chunk.
@@ -242,7 +253,13 @@ fn duplex(
         if req_open {
             match req_in.read(64 * 1024) {
                 Ok(c) if !c.is_empty() => {
-                    write_all(req_out.as_ref().expect("open"), &up(c));
+                    if !try_write_all(req_out.as_ref().expect("open"), &up(c)) {
+                        // The layer below is done with the request body
+                        // (a refused request); stop relaying it.
+                        req_open = false;
+                        drop(req_out.take());
+                        drop(next_body.take());
+                    }
                 }
                 Ok(_) => {}
                 // A broken body is never passed on as if it had ended:

@@ -52,12 +52,10 @@ use roxy_http::ws::frame::Message;
 use roxy_http::{Body, BodyError, CanonicalResponse};
 use roxy_rules::{Decision, Effect, EvalContext, Reads, WatchState};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
-use ulid::Ulid;
 
 use crate::capture::Tap;
 use crate::flowlog::{DecisionKind, FlowEvent, FlowSink, Stage};
-use crate::pipeline::{Events, FlowCx, Refusal, fail_closed_code};
-use crate::server::{Shared, Snapshot};
+use crate::pipeline::{FlowCx, FlowMeta, Refusal, fail_closed_code};
 use crate::sources::Sample;
 use crate::view::{FlowFacts, ProxyView, ResponseFacts, WsFacts};
 
@@ -90,6 +88,7 @@ pub(crate) enum Dir {
 /// body adapter (polled by the upstream connection), the response path and
 /// the exchange driver.
 pub(crate) struct Watch {
+    meta: Arc<FlowMeta>,
     stop: CancellationToken,
     /// Request chunks need evaluation or metric recording.
     request_chunks: bool,
@@ -99,10 +98,7 @@ pub(crate) struct Watch {
 }
 
 struct Inner {
-    shared: Arc<Shared>,
-    snap: Arc<Snapshot>,
-    flow: Ulid,
-    conn: String,
+    meta: Arc<FlowMeta>,
     facts: FlowFacts,
     st: WatchState,
     /// Watched fields known so far.
@@ -136,14 +132,12 @@ impl Watch {
         let mut facts = cx.facts.clone();
         facts.request_body_bytes = Some(0);
         Arc::new(Self {
+            meta: cx.meta.clone(),
             stop: CancellationToken::new(),
             request_chunks,
             response_chunks,
             inner: Mutex::new(Inner {
-                shared: cx.shared.clone(),
-                snap: cx.snap.clone(),
-                flow: cx.flow,
-                conn: cx.conn_id(),
+                meta: cx.meta.clone(),
                 facts,
                 st: policy.watch_state(&cx.record.tags),
                 known: Reads::BODY_BYTES,
@@ -169,7 +163,7 @@ impl Watch {
 
     /// The flow sink, for audit backpressure.
     pub(crate) fn sink(&self) -> Arc<dyn FlowSink> {
-        self.lock().shared.sink.clone()
+        self.meta.shared.sink.clone()
     }
 
     /// Resolves once the exchange is stopped.
@@ -239,7 +233,7 @@ impl Watch {
             match applied {
                 Ok(m) => g.mutations.push(m),
                 Err(err) => {
-                    tracing::warn!(flow = %g.flow, error = %err, "response header effect invalid; stopping");
+                    tracing::warn!(flow = %g.meta.flow, error = %err, "response header effect invalid; stopping");
                     g.stop_with(Refusal::fail_closed("effect_invalid"), Stage::ResponseHead);
                 }
             }
@@ -305,17 +299,17 @@ impl Watch {
             unreachable!("set above")
         };
         g.ws_messages += 1;
-        let every = g.shared.ws_message_every;
+        let every = g.meta.shared.ws_message_every;
         let sampled = every > 0 && (g.ws_messages - 1).is_multiple_of(every);
         if g.stopped.is_some() || sampled {
             let (decision, rules) = match &g.stopped {
                 Some(s) => (DecisionKind::Deny, s.refusal.rule.iter().cloned().collect()),
                 None => (DecisionKind::Allow, g.rules[before..].to_vec()),
             };
-            g.shared.sink.emit(&FlowEvent::WsMessage {
+            g.meta.shared.sink.emit(&FlowEvent::WsMessage {
                 ts: chrono::Utc::now(),
-                flow: g.flow.to_string(),
-                conn: g.conn.clone(),
+                flow: g.meta.flow.to_string(),
+                conn: g.meta.conn_id(),
                 direction: direction.to_owned(),
                 opcode: message.opcode.as_u8(),
                 size: message.len() as u64,
@@ -354,15 +348,6 @@ impl Watch {
 }
 
 impl Inner {
-    fn events(&self) -> Events<'_> {
-        Events {
-            shared: &self.shared,
-            snap: &self.snap,
-            flow: self.flow,
-            conn: self.conn.clone(),
-        }
-    }
-
     fn stop_with(&mut self, refusal: Refusal, stage: Stage) {
         if self.stopped.is_none() {
             self.stopped = Some(Stopped { refusal, stage });
@@ -388,17 +373,18 @@ impl Inner {
                 },
             ),
         };
-        if n > 0 && self.snap.policy.byte_metrics().intersects(bit) {
+        let FlowMeta { shared, snap, .. } = &*self.meta;
+        if n > 0 && snap.policy.byte_metrics().intersects(bit) {
             let view = ProxyView::new(
                 &self.facts,
-                &*self.shared.metrics,
-                &*self.shared.state,
-                &self.snap.address_lists,
+                &*shared.metrics,
+                &*shared.state,
+                &snap.address_lists,
             );
-            let r = self.shared.metrics.record(&view, &sample);
+            let r = shared.metrics.record(&view, &sample);
             drop(view);
             if let Err(e) = r {
-                self.events().metric_error(stage, &e);
+                self.meta.metric_error(stage, &e);
                 self.stop_with(Refusal::fail_closed(e.code()), stage);
                 return;
             }
@@ -416,11 +402,11 @@ impl Inner {
     /// and `set_state` effects, records a stop, and returns the header
     /// effects for the caller to apply to the response.
     fn evaluate(&mut self, changed: Reads, stage: Stage) -> Vec<Effect> {
-        let snap = self.snap.clone();
+        let meta = self.meta.clone();
+        let FlowMeta { shared, snap, .. } = &*meta;
         if !snap.policy.watches(changed) {
             return Vec::new();
         }
-        let shared = self.shared.clone();
         let secrets = |name: &str| snap.secrets.get(name).cloned();
         let ctx = EvalContext {
             secrets: &secrets,
@@ -449,7 +435,7 @@ impl Inner {
         let mut headers = Vec::new();
         for e in o.effects {
             match e {
-                Effect::Log { level, message } => self.events().rule_log(stage, level, &message),
+                Effect::Log { level, message } => meta.rule_log(stage, level, &message),
                 Effect::SetState { key, value, ttl } => {
                     if shared.state.set(&key, &value, ttl).is_err() {
                         self.stop_with(Refusal::fail_closed("state_unavailable"), stage);
@@ -468,8 +454,7 @@ impl Inner {
         if let Some(decision) = o.stop {
             let refusal = if let Some(reason) = &o.fail_closed_reason {
                 let code = fail_closed_code(reason, metric_err.as_ref());
-                self.events()
-                    .input_unavailable(stage, code, reason, metric_err.as_ref());
+                meta.input_unavailable(stage, code, reason, metric_err.as_ref());
                 Refusal::fail_closed(code)
             } else {
                 match decision {
@@ -482,7 +467,7 @@ impl Inner {
                             .terminal_rule
                             .as_ref()
                             .map_or_else(|| "_fail_closed".to_owned(), ToString::to_string);
-                        tracing::info!(flow = %self.flow, rule, stage = stage.as_str(), "watching rule stopped the exchange");
+                        tracing::info!(flow = %meta.flow, rule, stage = stage.as_str(), "watching rule stopped the exchange");
                         Refusal::deny(status, &message, &rule, close)
                     }
                     Decision::Allow(_) | Decision::Passthrough => {

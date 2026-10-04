@@ -15,8 +15,8 @@ use http::{HeaderValue, Version as HttpVersion};
 use crate::chars::trim_ows;
 use crate::model::{
     Authority, Body, CanonicalRequest, CanonicalResponse, Headers, HttpFlags, Limits, Method,
-    ParseError, Reason, RequestMeta, Scheme, TargetForm, Version, is_reserved, reject,
-    status_forbids_body,
+    ParseError, Reason, RequestMeta, Scheme, TargetForm, Version, is_forbidden_trailer,
+    parse_content_length, plan_body, reject, status_forbids_body,
 };
 use crate::url;
 
@@ -30,24 +30,68 @@ const CONNECTION_SPECIFIC: &[&str] = &[
     "upgrade",
 ];
 
-/// Trailer fields never accepted even with `http.allow_trailers` (mirrors
-/// the h1 chunked decoder; RFC 9110 §6.5.1). `content-*` and reserved
-/// fields are refused too.
-const FORBIDDEN_TRAILERS: &[&str] = &[
-    "authorization",
-    "cookie",
-    "set-cookie",
-    "content-type",
-    "content-encoding",
-    "content-range",
-    "expect",
-    "range",
-    "max-forwards",
-    "cache-control",
-];
-
 /// Per-field overhead counted by HPACK's header list size (RFC 9113 §6.5.2).
 const FIELD_OVERHEAD: usize = 32;
+
+/// The target from the pseudo-headers (as mapped into the URI by the h2
+/// crate): `:scheme` must be `https`, `:authority` must be the expected one
+/// and `:path` goes through the URL normaliser under the h1 length cap.
+fn target_from_uri(
+    uri: &http::Uri,
+    expected_authority: &Authority,
+    limits: &Limits,
+) -> Result<(Authority, url::Path, Option<url::Query>), ParseError> {
+    match uri.scheme_str() {
+        None => return reject(Reason::H2BadPseudoHeader, "missing :scheme"),
+        Some("https") => {}
+        Some(other) => return reject(Reason::H2BadScheme, format!(":scheme {other}")),
+    }
+    let Some(auth) = uri.authority() else {
+        return reject(Reason::H2BadPseudoHeader, "missing :authority");
+    };
+    let authority = url::parse_authority(auth.as_str().as_bytes(), Scheme::Https.default_port())?;
+    if authority != *expected_authority {
+        return reject(
+            Reason::AuthorityMismatch,
+            format!(":authority {authority} != {expected_authority}"),
+        );
+    }
+    let Some(pq) = uri.path_and_query() else {
+        return reject(Reason::H2BadPseudoHeader, "missing :path");
+    };
+    let pq = pq.as_str();
+    if pq == "*" {
+        return reject(Reason::BadRequestTarget, "asterisk-form is not supported");
+    }
+    if pq.is_empty() {
+        return reject(Reason::H2BadPseudoHeader, "empty :path");
+    }
+    if pq.len() > limits.max_url_bytes {
+        return reject(Reason::UrlTooLong, format!(":path is {} bytes", pq.len()));
+    }
+    let (path, query) = url::parse_origin_form(pq.as_bytes())?;
+    Ok((authority, path, query))
+}
+
+/// The HPACK header list size (RFC 9113 §6.5.2), checked against
+/// `limits.h2_max_header_list_bytes`, with the field count checked against
+/// `limits.max_headers`.
+fn header_list_size(headers: &http::HeaderMap, limits: &Limits) -> Result<usize, ParseError> {
+    let list_size: usize = headers
+        .iter()
+        .map(|(n, v)| n.as_str().len() + v.len() + FIELD_OVERHEAD)
+        .sum();
+    if list_size > limits.h2_max_header_list_bytes {
+        return reject(
+            Reason::HeadTooLarge,
+            format!("header list is {list_size} bytes"),
+        );
+    }
+    if headers.len() > limits.max_headers {
+        return reject(Reason::TooManyHeaders, "too many header fields");
+    }
+    Ok(list_size)
+}
 
 /// Builds a canonical request from h2 request parts.
 ///
@@ -55,7 +99,7 @@ const FIELD_OVERHEAD: usize = 32;
 /// that `limits.max_request_body_bytes` and the declared `content-length` are
 /// enforced as frames flow, and so that GET/HEAD/... carry no data unless
 /// `http.allow_body_on_get`.
-#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)] // signature takes ownership by contract
+#[allow(clippy::needless_pass_by_value)] // signature takes ownership by contract
 pub fn from_h2_parts(
     parts: http::request::Parts,
     body: Body,
@@ -74,49 +118,9 @@ pub fn from_h2_parts(
     }
     let method = Method::from_http(&parts.method)?;
 
-    // Pseudo-headers (as mapped into the URI by the h2 crate).
-    match parts.uri.scheme_str() {
-        None => return reject(Reason::H2BadPseudoHeader, "missing :scheme"),
-        Some("https") => {}
-        Some(other) => return reject(Reason::H2BadScheme, format!(":scheme {other}")),
-    }
-    let Some(auth) = parts.uri.authority() else {
-        return reject(Reason::H2BadPseudoHeader, "missing :authority");
-    };
-    let authority = url::parse_authority(auth.as_str().as_bytes(), Scheme::Https.default_port())?;
-    if authority != *expected_authority {
-        return reject(
-            Reason::AuthorityMismatch,
-            format!(":authority {authority} != {expected_authority}"),
-        );
-    }
-    let Some(pq) = parts.uri.path_and_query() else {
-        return reject(Reason::H2BadPseudoHeader, "missing :path");
-    };
-    let pq = pq.as_str();
-    if pq == "*" {
-        return reject(Reason::BadRequestTarget, "asterisk-form is not supported");
-    }
-    if pq.is_empty() {
-        return reject(Reason::H2BadPseudoHeader, "empty :path");
-    }
-    let (path, query) = url::parse_origin_form(pq.as_bytes())?;
+    let (authority, path, query) = target_from_uri(&parts.uri, expected_authority, limits)?;
 
-    // Regular headers.
-    let list_size: usize = parts
-        .headers
-        .iter()
-        .map(|(n, v)| n.as_str().len() + v.len() + FIELD_OVERHEAD)
-        .sum();
-    if list_size > limits.h2_max_header_list_bytes {
-        return reject(
-            Reason::HeadTooLarge,
-            format!("header list is {list_size} bytes"),
-        );
-    }
-    if parts.headers.len() > limits.max_headers {
-        return reject(Reason::TooManyHeaders, "too many header fields");
-    }
+    let list_size = header_list_size(&parts.headers, limits)?;
     let mut meta = RequestMeta::new(Version::H2, TargetForm::H2);
     meta.head_bytes = list_size;
     let mut content_length: Option<u64> = None;
@@ -150,13 +154,7 @@ pub fn from_h2_parts(
                 if content_length.is_some() {
                     return reject(Reason::DuplicateContentLength, "multiple content-length");
                 }
-                if v.is_empty() || v.len() > 19 || !v.iter().all(u8::is_ascii_digit) {
-                    return reject(Reason::BadContentLength, "invalid content-length");
-                }
-                content_length = Some(
-                    v.iter()
-                        .fold(0u64, |acc, &d| acc * 10 + u64::from(d - b'0')),
-                );
+                content_length = Some(parse_content_length(v)?);
             }
             "expect" => {
                 if expect || !v.eq_ignore_ascii_case(b"100-continue") {
@@ -165,6 +163,12 @@ pub fn from_h2_parts(
                 expect = true;
             }
             "proxy-authorization" => {
+                if meta.proxy_authorization.is_some() {
+                    return reject(
+                        Reason::MultipleProxyAuthorization,
+                        "multiple proxy-authorization fields",
+                    );
+                }
                 meta.proxy_authorization = HeaderValue::from_bytes(v).ok();
             }
             "cookie" => cookies.push(v),
@@ -179,29 +183,17 @@ pub fn from_h2_parts(
     }
     let headers = Headers::try_from_raw(rest.iter().copied(), limits, flags)?;
 
-    let bodiless = !method.allows_body(flags.allow_body_on_get);
-    if bodiless && content_length.is_some_and(|n| n > 0) {
-        return reject(Reason::BodyOnBodiless, format!("body on {method} request"));
-    }
-    if let Some(n) = content_length
-        && n > limits.max_request_body_bytes
-    {
-        return reject(Reason::BodyTooLarge, format!("content-length {n}"));
-    }
-    let cap = if bodiless {
-        0
-    } else {
-        limits.max_request_body_bytes
-    };
     // END_STREAM on the HEADERS frame: the body is known to be empty (the
     // `h2` crate already refused a non-zero `content-length` with it).
-    let known = if bodiless || http_body::Body::is_end_stream(&body) {
-        Some(0)
-    } else {
-        content_length
-    };
-    let body = Body::wrap_with_length(body, cap, known);
-    meta.expect_continue = expect && known != Some(0);
+    let plan = plan_body(
+        &method,
+        content_length,
+        http_body::Body::is_end_stream(&body),
+        limits,
+        flags,
+    )?;
+    let body = Body::wrap_with_length(body, plan.cap, plan.known);
+    meta.expect_continue = expect && plan.known != Some(0);
 
     Ok(CanonicalRequest {
         method,
@@ -230,11 +222,7 @@ pub fn validate_h2_trailers(
     }
     for name in trailers.keys() {
         let n = name.as_str();
-        if is_reserved(n)
-            || CONNECTION_SPECIFIC.contains(&n)
-            || FORBIDDEN_TRAILERS.contains(&n)
-            || n.starts_with("content-")
-        {
+        if is_forbidden_trailer(n) {
             return reject(Reason::Trailers, format!("{n} not allowed in trailers"));
         }
     }
@@ -242,12 +230,8 @@ pub fn validate_h2_trailers(
         .iter()
         .map(|(n, v)| (n.as_str().as_bytes(), v.as_bytes()))
         .collect();
-    let checked = Headers::try_from_raw(raw.iter().copied(), limits, flags)?;
-    let mut out = http::HeaderMap::new();
-    for (n, v) in &checked {
-        out.append(n.clone(), v.clone());
-    }
-    Ok(out)
+    let checked = Headers::try_from_raw(raw, limits, flags)?;
+    Ok(checked.to_header_map())
 }
 
 /// Response head for an h2 stream (the caller streams `res.body` as DATA
@@ -403,6 +387,21 @@ mod tests {
     }
 
     #[test]
+    fn proxy_authorization_must_be_single() {
+        assert_eq!(
+            map(req(
+                "https://api.example.com/",
+                &[
+                    ("proxy-authorization", "Basic eA=="),
+                    ("proxy-authorization", "Basic eQ==")
+                ]
+            ))
+            .unwrap_err(),
+            Reason::MultipleProxyAuthorization
+        );
+    }
+
+    #[test]
     fn scheme_must_be_https() {
         assert_eq!(
             map(req("http://api.example.com/", &[])).unwrap_err(),
@@ -470,6 +469,38 @@ mod tests {
         p.headers
             .append("x-obs", HeaderValue::from_bytes(b"caf\xe9").unwrap());
         assert_eq!(map(p).unwrap_err(), Reason::NonAscii);
+    }
+
+    #[test]
+    fn path_length_cap() {
+        let limits = Limits {
+            max_url_bytes: 16,
+            ..Limits::default()
+        };
+        let long = format!("https://api.example.com/{}", "a".repeat(16));
+        assert_eq!(
+            from_h2_parts(
+                req(&long, &[]),
+                Body::empty(),
+                &auth(),
+                &limits,
+                &HttpFlags::default()
+            )
+            .unwrap_err()
+            .reason,
+            Reason::UrlTooLong
+        );
+        let fits = format!("https://api.example.com/{}", "a".repeat(15));
+        assert!(
+            from_h2_parts(
+                req(&fits, &[]),
+                Body::empty(),
+                &auth(),
+                &limits,
+                &HttpFlags::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]

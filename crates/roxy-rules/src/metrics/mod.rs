@@ -66,10 +66,17 @@
 //!   transient buffer a `get` on a `unique` metric builds (at most
 //!   61 × 256 × 8 + 4096 bytes ≈ 129 KiB per concurrent call, freed on
 //!   return).
-//! * **Keys.** Values of `host`, `tls.sni`, `method` and
-//!   `scheme` are ASCII-lower-cased before keying or hashing, because the
-//!   rule language compares them case-insensitively: otherwise `GET` and
-//!   `get` would be two series and an attacker could split a counter.
+//! * **Keys.** Values of `host`, `tls.sni` and `scheme` are
+//!   ASCII-lower-cased before keying or hashing, because the rule language
+//!   compares them case-insensitively: otherwise `Example.com` and
+//!   `example.com` would be two series and an attacker could split a
+//!   counter. `method` is keyed as sent, as the rule language compares it.
+
+mod budget;
+#[cfg(test)]
+mod budget_tests;
+mod hll;
+mod window;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -77,25 +84,27 @@ use std::hash::{BuildHasher, RandomState};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use parking_lot::Mutex;
 
+use self::budget::{Budget, Refused};
+use self::hll::{Hll, cardinality};
+use self::window::{Geometry, Window};
 use crate::config::MetricCount;
 use crate::eval::FailClosedReason;
 use crate::policy::MetricDef;
 use crate::types::Field;
 use crate::view::{FlowView, Value};
 
+#[cfg(test)]
+use self::hll::SPARSE_CHUNK;
+
 /// A monotonic time source; injectable for tests.
 pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
-/// Buckets per window.
-const BUCKETS: u64 = 60;
-/// Smallest bucket width.
-const MIN_BUCKET_NS: u64 = 1_000_000;
 /// `record` runs a reclaim pass every this many calls.
 const RECLAIM_EVERY: u64 = 4096;
 /// When the table is full, a new key may trigger a reclaim pass at most
@@ -107,18 +116,10 @@ const FULL_RECLAIM_INTERVAL_NS: i64 = 100_000_000;
 pub const DEFAULT_MAX_METRIC_BYTES: usize = 256 << 20;
 /// Default [`MetricLimits::max_keys`] (matches `limits.max_metric_keys`).
 pub const DEFAULT_MAX_METRIC_KEYS: usize = 100_000;
-/// Bytes charged for one hash in a `unique` bucket's exact set.
-const HASH_BYTES: usize = size_of::<u64>();
-/// Bytes charged for a dense `unique` bucket.
-const DENSE_BYTES: usize = HLL_M;
-/// A `unique` bucket's exact set grows its capacity by this many entries at
-/// a time, so its charge is exact (capacity × 8) without reallocating on
-/// every insert.
-pub const SPARSE_CHUNK: usize = 32;
 /// Fixed bytes charged per series on top of its key and buckets: the
 /// table slot (doubled for hash-table growth slack), the mutex and the
 /// series header.
-pub const SERIES_OVERHEAD: usize = 2 * (size_of::<Key>() + size_of::<Mutex<Series>>()) + 16;
+pub(crate) const SERIES_OVERHEAD: usize = 2 * (size_of::<Key>() + size_of::<Mutex<Series>>()) + 16;
 
 /// Bounds on a [`MetricStore`]'s size. Both are hard: a flow that would
 /// take the store past either is denied, never served by evicting data.
@@ -149,62 +150,6 @@ pub struct CarryOverReport {
     /// byte budget. Their history is lost (the new store starts them at 0
     /// if they are recorded again), so a non-zero count should be logged.
     pub skipped_budget: usize,
-}
-
-/// The byte budget: charged bytes and their ceiling.
-#[derive(Debug)]
-struct Budget {
-    used: AtomicUsize,
-    max: usize,
-}
-
-/// A growth was refused by the byte budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Refused;
-
-impl Budget {
-    fn new(max: usize) -> Self {
-        Self {
-            used: AtomicUsize::new(0),
-            max,
-        }
-    }
-
-    /// Charge `n` bytes unless that would exceed the ceiling. A CAS loop,
-    /// so concurrent takers can never overshoot together.
-    fn take(&self, n: usize) -> Result<(), Refused> {
-        if n == 0 {
-            return Ok(());
-        }
-        self.used
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |u| {
-                u.checked_add(n).filter(|&t| t <= self.max)
-            })
-            .map(|_| ())
-            .map_err(|_| Refused)
-    }
-
-    fn give(&self, n: usize) {
-        if n > 0 {
-            self.used.fetch_sub(n, Ordering::AcqRel);
-        }
-    }
-
-    /// `reserved` bytes were taken for an allocation that turned out to be
-    /// `actual` bytes: return the difference. (`Vec::reserve_exact` gives
-    /// exactly what it is asked for, so `actual > reserved` does not occur
-    /// with std; it is charged anyway so the books stay consistent.)
-    fn settle(&self, reserved: usize, actual: usize) {
-        if actual > reserved {
-            self.used.fetch_add(actual - reserved, Ordering::AcqRel);
-        } else {
-            self.give(reserved - actual);
-        }
-    }
-
-    fn used(&self) -> usize {
-        self.used.load(Ordering::Acquire)
-    }
 }
 
 /// The proxy-facing interface to a metric store (the adapter behind
@@ -297,17 +242,9 @@ impl fmt::Display for KeyPart {
 
 type Key = Box<[KeyPart]>;
 
-/// Fields the rule language compares ASCII case-insensitively.
-fn case_insensitive(f: Field) -> bool {
-    matches!(
-        f,
-        Field::Host | Field::TlsSni | Field::Method | Field::Scheme
-    )
-}
-
 fn key_part(metric: &str, view: &dyn FlowView, f: Field) -> Result<KeyPart, MetricError> {
     let fold = |s: &str| -> Box<str> {
-        if case_insensitive(f) {
+        if f.case_insensitive() {
             s.to_ascii_lowercase().into()
         } else {
             s.into()
@@ -333,348 +270,6 @@ fn key_part(metric: &str, view: &dyn FlowView, f: Field) -> Result<KeyPart, Metr
 fn unique_hasher() -> &'static RandomState {
     static H: OnceLock<RandomState> = OnceLock::new();
     H.get_or_init(RandomState::new)
-}
-
-// ----- HyperLogLog ----------------------------------------------------------
-
-const HLL_P: u32 = 12;
-const HLL_M: usize = 1 << HLL_P;
-const HLL_Q: u32 = 64 - HLL_P;
-/// Distinct hashes kept exactly before a bucket switches to registers.
-const SPARSE_MAX: usize = 256;
-
-type Registers = [u8; HLL_M];
-
-/// A `HyperLogLog` sketch over pre-hashed 64-bit values: an exact sorted
-/// hash set while small, dense registers after [`SPARSE_MAX`] values.
-#[derive(Debug, Clone)]
-enum Hll {
-    Sparse(Vec<u64>),
-    Dense(Box<Registers>),
-}
-
-impl Default for Hll {
-    fn default() -> Self {
-        Self::Sparse(Vec::new())
-    }
-}
-
-fn set_register(regs: &mut Registers, h: u64) {
-    let idx = usize::try_from(h >> HLL_Q).unwrap_or(0);
-    let w = h & ((1 << HLL_Q) - 1);
-    let rho = if w == 0 {
-        HLL_Q + 1
-    } else {
-        w.leading_zeros() - HLL_P + 1
-    };
-    let rho = u8::try_from(rho).unwrap_or(u8::MAX);
-    if regs[idx] < rho {
-        regs[idx] = rho;
-    }
-}
-
-/// Bytes charged to / released from the budget by one change.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Change {
-    added: usize,
-    freed: usize,
-}
-
-impl Hll {
-    /// Bytes this sketch is charged.
-    fn heap_bytes(&self) -> usize {
-        match self {
-            Self::Sparse(v) => v.capacity() * HASH_BYTES,
-            Self::Dense(_) => DENSE_BYTES,
-        }
-    }
-
-    /// Insert `h`, charging any growth to `budget` first. On `Err` the
-    /// sketch is unchanged. The returned change has already been applied
-    /// to `budget`.
-    fn insert(&mut self, h: u64, budget: &Budget) -> Result<Change, Refused> {
-        match self {
-            Self::Sparse(v) => match v.binary_search(&h) {
-                Ok(_) => Ok(Change::default()),
-                Err(i) if v.len() < SPARSE_MAX => {
-                    let mut change = Change::default();
-                    if v.len() == v.capacity() {
-                        let want = SPARSE_CHUNK.min(SPARSE_MAX - v.len());
-                        budget.take(want * HASH_BYTES)?;
-                        let before = v.capacity();
-                        v.reserve_exact(want);
-                        change.added = (v.capacity() - before) * HASH_BYTES;
-                        budget.settle(want * HASH_BYTES, change.added);
-                    }
-                    v.insert(i, h);
-                    Ok(change)
-                }
-                Err(_) => {
-                    let freed = v.capacity() * HASH_BYTES;
-                    budget.take(DENSE_BYTES.saturating_sub(freed))?;
-                    budget.give(freed.saturating_sub(DENSE_BYTES));
-                    let mut regs = Box::new([0u8; HLL_M]);
-                    for &x in v.iter() {
-                        set_register(&mut regs, x);
-                    }
-                    set_register(&mut regs, h);
-                    *self = Self::Dense(regs);
-                    Ok(Change {
-                        added: DENSE_BYTES,
-                        freed,
-                    })
-                }
-            },
-            Self::Dense(regs) => {
-                set_register(regs, h);
-                Ok(Change::default())
-            }
-        }
-    }
-}
-
-/// Cardinality of the union of `sketches`: exact if all are sparse,
-/// otherwise the `HyperLogLog` estimate of the merged registers.
-fn cardinality<'a>(sketches: impl Iterator<Item = &'a Hll>) -> u64 {
-    let mut exact: Vec<u64> = Vec::new();
-    let mut dense: Option<Box<Registers>> = None;
-    for s in sketches {
-        match s {
-            Hll::Sparse(v) => exact.extend_from_slice(v),
-            Hll::Dense(r) => {
-                let acc = dense.get_or_insert_with(|| Box::new([0u8; HLL_M]));
-                for (a, b) in acc.iter_mut().zip(r.iter()) {
-                    *a = (*a).max(*b);
-                }
-            }
-        }
-    }
-    match dense {
-        None => {
-            exact.sort_unstable();
-            exact.dedup();
-            exact.len() as u64
-        }
-        Some(mut regs) => {
-            for h in exact {
-                set_register(&mut regs, h);
-            }
-            round_estimate(estimate(&regs))
-        }
-    }
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "a finite, non-negative estimate far below u64::MAX"
-)]
-fn round_estimate(e: f64) -> u64 {
-    if e.is_finite() && e > 0.0 {
-        e.round() as u64
-    } else {
-        0
-    }
-}
-
-/// Ertl's improved raw estimator ("New cardinality estimation algorithms
-/// for `HyperLogLog` sketches", 2017): unbiased over the whole range without
-/// empirical correction tables.
-fn estimate(regs: &Registers) -> f64 {
-    let q = HLL_Q as usize;
-    let mut hist = [0u32; HLL_Q as usize + 2];
-    for &r in regs {
-        hist[usize::from(r).min(q + 1)] += 1;
-    }
-    let m = f64::from(1u32 << HLL_P);
-    let mut z = m * tau(1.0 - f64::from(hist[q + 1]) / m);
-    for k in (1..=q).rev() {
-        z = f64::midpoint(z, f64::from(hist[k]));
-    }
-    z += m * sigma(f64::from(hist[0]) / m);
-    let alpha_inf = 0.5 / std::f64::consts::LN_2;
-    alpha_inf * m * m / z
-}
-
-#[allow(
-    clippy::float_cmp,
-    reason = "fixed-point iteration ends when z stops changing"
-)]
-fn sigma(mut x: f64) -> f64 {
-    if x == 1.0 {
-        return f64::INFINITY;
-    }
-    let mut y = 1.0;
-    let mut z = x;
-    loop {
-        x *= x;
-        let prev = z;
-        z += x * y;
-        y += y;
-        if z == prev {
-            return z;
-        }
-    }
-}
-
-#[allow(
-    clippy::float_cmp,
-    reason = "fixed-point iteration ends when z stops changing"
-)]
-fn tau(mut x: f64) -> f64 {
-    if x == 0.0 || x == 1.0 {
-        return 0.0;
-    }
-    let mut y = 1.0;
-    let mut z = 1.0 - x;
-    loop {
-        x = x.sqrt();
-        let prev = z;
-        y *= 0.5;
-        z -= (1.0 - x).powi(2) * y;
-        if z == prev {
-            return z / 3.0;
-        }
-    }
-}
-
-// ----- windows --------------------------------------------------------------
-
-/// Bucket layout of a windowed metric. Times are signed nanoseconds since
-/// the store's origin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Geometry {
-    width: i64,
-    /// Buckets covering the window; `n + 1` are kept (plus the partial one).
-    n: i64,
-}
-
-impl Geometry {
-    fn new(window: Duration) -> Self {
-        let d = u64::try_from(window.as_nanos())
-            .unwrap_or(u64::MAX)
-            .clamp(1, i64::MAX.unsigned_abs());
-        let width = d.div_ceil(BUCKETS).max(MIN_BUCKET_NS);
-        let n = d.div_ceil(width).max(1);
-        Self {
-            width: i64::try_from(width).unwrap_or(i64::MAX),
-            n: i64::try_from(n).unwrap_or(1),
-        }
-    }
-
-    fn bucket(self, t: i64) -> i64 {
-        t.div_euclid(self.width)
-    }
-}
-
-trait Slot: Default + Clone {
-    /// Reset; returns the heap bytes released (as charged).
-    fn clear(&mut self) -> usize;
-    /// Heap bytes charged for this slot beyond its inline size.
-    fn heap_bytes(&self) -> usize;
-}
-
-impl Slot for u64 {
-    fn clear(&mut self) -> usize {
-        *self = 0;
-        0
-    }
-
-    fn heap_bytes(&self) -> usize {
-        0
-    }
-}
-
-impl Slot for Hll {
-    fn clear(&mut self) -> usize {
-        let freed = Hll::heap_bytes(self);
-        *self = Self::default();
-        freed
-    }
-
-    fn heap_bytes(&self) -> usize {
-        Hll::heap_bytes(self)
-    }
-}
-
-/// A ring of buckets. `head` is the bucket number of the newest slot;
-/// cumulative metrics use one slot and ignore `head`.
-#[derive(Debug, Clone)]
-struct Window<T> {
-    head: i64,
-    slots: Box<[T]>,
-}
-
-fn ring_index(bucket: i64, len: usize) -> usize {
-    let len_i = i64::try_from(len).unwrap_or(i64::MAX);
-    usize::try_from(bucket.rem_euclid(len_i)).unwrap_or(0)
-}
-
-impl<T: Slot> Window<T> {
-    fn new(geom: Option<Geometry>, now: i64) -> Self {
-        let (len, head) = match geom {
-            Some(g) => (usize::try_from(g.n + 1).unwrap_or(1), g.bucket(now)),
-            None => (1, 0),
-        };
-        Self {
-            head,
-            slots: vec![T::default(); len].into_boxed_slice(),
-        }
-    }
-
-    /// The slot for an event at `now`, rotating out expired buckets. An
-    /// event "before" `head` (clock skew across a reload) goes into the head
-    /// bucket, which only makes it live longer. Also returns the bytes
-    /// released by the rotation.
-    fn current(&mut self, geom: Option<Geometry>, now: i64) -> (&mut T, usize) {
-        let len = self.slots.len();
-        let Some(g) = geom else {
-            return (&mut self.slots[0], 0);
-        };
-        let b = g.bucket(now);
-        let mut freed = 0;
-        if b > self.head {
-            let steps = (b - self.head).min(g.n + 1);
-            for k in 1..=steps {
-                freed += self.slots[ring_index(self.head + k, len)].clear();
-            }
-            self.head = b;
-        }
-        (&mut self.slots[ring_index(self.head, len)], freed)
-    }
-
-    /// Bytes charged for the bucket array and every bucket's contents.
-    fn bytes(&self) -> usize {
-        size_of_val::<[T]>(&self.slots) + self.slots.iter().map(T::heap_bytes).sum::<usize>()
-    }
-
-    /// Buckets still inside the window at `now`.
-    fn live(&self, geom: Option<Geometry>, now: i64) -> impl Iterator<Item = &T> {
-        let len = self.slots.len();
-        let oldest = geom.map_or(i64::MIN, |g| g.bucket(now) - g.n);
-        let head = self.head;
-        (0..len).filter_map(move |k| {
-            let b = head - i64::try_from(k).unwrap_or(0);
-            (b >= oldest).then(|| &self.slots[ring_index(b, len)])
-        })
-    }
-
-    /// Every bucket has left the window (never true for cumulative).
-    fn expired(&self, geom: Option<Geometry>, now: i64) -> bool {
-        geom.is_some_and(|g| self.head < g.bucket(now) - g.n)
-    }
-
-    /// Move to a store whose clock origin is `shift` ns earlier (event at
-    /// old time `t` is at new time `t + shift`). Rounds to the later bucket.
-    fn shift(&mut self, geom: Option<Geometry>, shift: i64) {
-        if let Some(g) = geom {
-            let whole = shift.div_euclid(g.width) + i64::from(shift.rem_euclid(g.width) != 0);
-            self.head = self.head.saturating_add(whole);
-            // Keep bucket b in ring slot b mod len.
-            let len = self.slots.len();
-            self.slots.rotate_right(ring_index(whole, len));
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -792,19 +387,9 @@ impl Series {
 
 // ----- the store ------------------------------------------------------------
 
-/// The parts of a [`MetricDef`] that determine what its series mean. Two
-/// definitions with equal fingerprints can share series across a reload.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Fingerprint {
-    count: MetricCount,
-    unique: Option<Field>,
-    key: Vec<Field>,
-    window: Option<Duration>,
-}
-
+/// One metric's definition and its series table.
 struct Metric {
     def: MetricDef,
-    fingerprint: Fingerprint,
     geom: Option<Geometry>,
     series: DashMap<Key, Mutex<Series>>,
 }
@@ -891,12 +476,6 @@ impl MetricStore {
             .iter()
             .map(|d| Metric {
                 def: d.clone(),
-                fingerprint: Fingerprint {
-                    count: d.count.clone(),
-                    unique: d.unique,
-                    key: d.key.clone(),
-                    window: d.window,
-                },
                 geom: d.window.map(Geometry::new),
                 series: DashMap::new(),
             })
@@ -1136,7 +715,7 @@ impl MetricStore {
                 continue;
             };
             let pm = &previous.metrics[pi];
-            if pm.fingerprint != m.fingerprint {
+            if pm.def.fingerprint() != m.def.fingerprint() {
                 continue;
             }
             for entry in &pm.series {
@@ -1212,132 +791,5 @@ fn signed_nanos(a: Instant, b: Instant) -> i64 {
     match a.checked_duration_since(b) {
         Some(d) => i64::try_from(d.as_nanos()).unwrap_or(i64::MAX),
         None => i64::try_from(b.duration_since(a).as_nanos()).map_or(i64::MIN, |n| -n),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A fixed, well-mixed hash (splitmix64) so accuracy tests are
-    /// deterministic.
-    fn mix(mut x: u64) -> u64 {
-        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        x ^ (x >> 31)
-    }
-
-    fn ins(h: &mut Hll, x: u64) {
-        static UNLIMITED: OnceLock<Budget> = OnceLock::new();
-        h.insert(x, UNLIMITED.get_or_init(|| Budget::new(usize::MAX)))
-            .unwrap();
-    }
-
-    #[test]
-    fn hll_charges_match_capacity() {
-        let b = Budget::new(usize::MAX);
-        let mut h = Hll::default();
-        let mut charged = 0usize;
-        for i in 0..1_000 {
-            let c = h.insert(mix(i), &b).unwrap();
-            charged = charged + c.added - c.freed;
-            assert_eq!(charged, h.heap_bytes(), "i={i}");
-            assert_eq!(b.used(), charged);
-            if let Hll::Sparse(v) = &h {
-                assert!(v.capacity() <= SPARSE_MAX);
-            }
-        }
-        assert_eq!(charged, DENSE_BYTES);
-        assert_eq!(Slot::clear(&mut h), DENSE_BYTES);
-    }
-
-    #[test]
-    fn hll_refused_growth_leaves_sketch_unchanged() {
-        // Room for exactly one chunk.
-        let b = Budget::new(SPARSE_CHUNK * HASH_BYTES);
-        let mut h = Hll::default();
-        for i in 0..SPARSE_CHUNK as u64 {
-            h.insert(mix(i), &b).unwrap();
-        }
-        assert_eq!(h.insert(mix(9_999), &b), Err(Refused));
-        assert_eq!(cardinality(std::iter::once(&h)), SPARSE_CHUNK as u64);
-        // Values already present need no growth.
-        assert!(h.insert(mix(0), &b).is_ok());
-        assert_eq!(b.used(), SPARSE_CHUNK * HASH_BYTES);
-    }
-
-    fn count(n: u64) -> u64 {
-        let mut h = Hll::default();
-        for i in 0..n {
-            ins(&mut h, mix(i));
-            ins(&mut h, mix(i)); // duplicates do not count
-        }
-        cardinality(std::iter::once(&h))
-    }
-
-    #[test]
-    #[allow(clippy::cast_precision_loss, reason = "test arithmetic")]
-    fn hll_accuracy() {
-        for n in 0..=SPARSE_MAX as u64 {
-            assert_eq!(count(n), n, "exact below the sparse threshold");
-        }
-        for n in [257, 1_000, 3_000, 10_000, 30_000, 100_000, 1_000_000] {
-            let e = count(n) as f64;
-            let err = (e - n as f64).abs() / n as f64;
-            assert!(err < 0.05, "n={n} estimate={e} err={err}");
-        }
-    }
-
-    #[test]
-    fn hll_merge_is_union() {
-        let mut a = Hll::default();
-        let mut b = Hll::default();
-        for i in 0..5_000 {
-            ins(&mut a, mix(i));
-        }
-        for i in 2_500..7_500 {
-            ins(&mut b, mix(i));
-        }
-        let small = {
-            let mut s = Hll::default();
-            ins(&mut s, mix(1));
-            ins(&mut s, mix(100_000));
-            s
-        };
-        #[allow(clippy::cast_precision_loss, reason = "test arithmetic")]
-        let e = cardinality([&a, &b, &small].into_iter()) as f64;
-        assert!((e - 7_501.0).abs() / 7_501.0 < 0.05, "{e}");
-        // Sparse-only unions are exact.
-        let mut c = Hll::default();
-        ins(&mut c, mix(1));
-        ins(&mut c, mix(2));
-        assert_eq!(cardinality([&small, &c].into_iter()), 3);
-    }
-
-    #[test]
-    fn geometry() {
-        let g = Geometry::new(Duration::from_secs(60));
-        assert_eq!((g.width, g.n), (1_000_000_000, 60));
-        let g = Geometry::new(Duration::from_millis(10));
-        assert_eq!((g.width, g.n), (1_000_000, 10));
-        let g = Geometry::new(Duration::from_nanos(1));
-        assert_eq!((g.width, g.n), (1_000_000, 1));
-    }
-
-    #[test]
-    fn window_shift_rounds_later() {
-        let g = Some(Geometry::new(Duration::from_secs(60)));
-        let mut w: Window<u64> = Window::new(g, 0);
-        *w.current(g, 0).0 += 1;
-        w.shift(g, -1); // within the bucket: rounds to the later one
-        assert_eq!(w.head, 0);
-        w.shift(g, -1_500_000_000);
-        assert_eq!(w.head, -1);
-        assert_eq!(w.live(g, -1).copied().sum::<u64>(), 1);
-        assert_eq!(w.slots[ring_index(-1, w.slots.len())], 1);
-        w.shift(g, 1);
-        assert_eq!(w.head, 0);
-        assert_eq!(w.slots[0], 1);
     }
 }

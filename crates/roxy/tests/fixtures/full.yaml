@@ -163,7 +163,7 @@ capture_dir: /var/lib/roxy/capture
 addons:
   - name: redact
     kind: wasm                   # wasm | service
-    path: /etc/roxy/addons/redact.wasm
+    path: ../roxy-wasm/tests/fixtures/redact.wasm   # relative to the crate, where the tests run
     mode: enforce                # enforce (failures fail closed) | observe (tee, log only)
     config: { needles: ["sk-live-"], replacement: "[redacted]" }
     capabilities: [log]          # endpoints, state, record, metrics, log

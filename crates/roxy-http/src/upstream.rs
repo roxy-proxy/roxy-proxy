@@ -15,9 +15,10 @@ use std::fmt;
 use http::header::{CONNECTION, CONTENT_LENGTH, HOST, UPGRADE};
 use http::{HeaderMap, HeaderValue, Uri};
 
+use crate::chars::trim_ows;
 use crate::model::{
     Body, CanonicalRequest, CanonicalResponse, Headers, Limits, ParseError, Reason, ResponseMeta,
-    connection_tokens,
+    parse_content_length,
 };
 
 /// How the request URI is written into the `http::Request`.
@@ -93,11 +94,7 @@ fn single_content_length(map: &HeaderMap) -> Option<u64> {
     if it.next().is_some() {
         return None;
     }
-    let v = v.to_str().ok()?.trim();
-    if v.is_empty() || v.len() > 19 || !v.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    v.parse().ok()
+    parse_content_length(trim_ows(v.as_bytes())).ok()
 }
 
 /// Adapts an upstream response. Hop-by-hop headers (and those nominated by
@@ -111,15 +108,7 @@ where
     B::Error: fmt::Display,
 {
     let (parts, body) = res.into_parts();
-    let headers = Headers::from_header_map_lenient(&parts.headers);
-    let conn = connection_tokens(
-        parts
-            .headers
-            .get_all(CONNECTION)
-            .iter()
-            .map(HeaderValue::as_bytes),
-    )
-    .unwrap_or_default();
+    let (headers, conn) = Headers::from_header_map_lenient_with_connection(&parts.headers);
     let upgrade = (parts.status == http::StatusCode::SWITCHING_PROTOCOLS
         && conn.iter().any(|t| t == "upgrade"))
     .then(|| {

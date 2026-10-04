@@ -140,7 +140,8 @@ The strictness knobs live under `http:` and all default to strict.
 - The request-target form must fit the context: absolute-form on the proxy
   port, origin-form inside a tunnel, authority-form only for CONNECT.
 - The version must be exactly `HTTP/1.1`. `HTTP/1.0` needs
-  `http.allow_http10`; `HTTP/0.9` is never accepted.
+  `http.allow_http10`, and an HTTP/1.0 connection is closed after its
+  response whatever `Connection` says; `HTTP/0.9` is never accepted.
 - Lines end in CRLF. A bare LF or bare CR anywhere in the head is rejected.
 - The head is at most `limits.max_header_bytes` (64 KiB) and the URL at
   most `limits.max_url_bytes` (8 KiB).
@@ -154,6 +155,7 @@ The strictness knobs live under `http:` and all default to strict.
 - At most `limits.max_headers` (100) fields.
 - Exactly one `Host`, matching the URI authority (absolute-form) or the
   SNI / CONNECT host (in a tunnel).
+- At most one `Proxy-Authorization`.
 - At most one `Content-Length`, digits only, at most 19 digits. A
   duplicate is rejected even when the values are equal.
 - `Transfer-Encoding`, if present, is exactly `chunked`: one field, one
@@ -176,8 +178,12 @@ The strictness knobs live under `http:` and all default to strict.
 - The body is at most `limits.max_request_body_bytes` (1 GiB), enforced
   while streaming: exceeding it closes the connection mid-stream. The
   default is generous so large uploads work.
-- The head must arrive within `limits.header_timeout` (10 s), and the body
-  may not stall for longer than `limits.body_idle_timeout` (30 s).
+- The head must arrive within `limits.header_timeout` (10 s) of its first
+  byte, whether that byte opened the connection or was pipelined behind
+  the previous request. The body may not stall for longer than
+  `limits.body_idle_timeout` (30 s).
+- A client that closes its connection while roxy is still waiting for the
+  response ends the exchange, body or no body.
 
 ### HTTP/2 requests
 
@@ -186,8 +192,9 @@ The strictness knobs live under `http:` and all default to strict.
 - Connection-specific headers (`connection`, `keep-alive`,
   `transfer-encoding`, `upgrade`, `proxy-connection`) reset the stream
   (RFC 9113 §8.2.2). `te` is accepted only as `trailers`.
-- `:path` goes through the same normaliser as HTTP/1.1. `:authority` must
-  equal the SNI, and a `host` header, if present, must equal `:authority`.
+- `:path` goes through the same normaliser and `limits.max_url_bytes` cap
+  as HTTP/1.1. `:authority` must equal the SNI, and a `host` header, if
+  present, must equal `:authority`.
 - Streams per connection and header bytes per stream are capped by
   `limits.h2_max_concurrent_streams` and `limits.h2_max_header_list_bytes`.
   CONTINUATION-flood and rapid-reset defences come from the `h2` crate.
@@ -309,5 +316,8 @@ carries a `reason` instead of `rule`.
 The status and message can be set per rule
 (`deny: { status: 451, message: "..." }`). After a deny the connection is
 closed (`connection: close` on HTTP/1.1, `GOAWAY` on HTTP/2), so a probing
-client loses its warm connection on every attempt. A refused proxy
-authentication gets `407`.
+client loses its warm connection on every attempt, and roxy does not read
+the rest of a request body it has refused: the response goes out at once
+and the connection closes behind it. A refused proxy authentication gets
+`407` with a `proxy-authenticate: Basic` challenge and the same JSON body
+shape.

@@ -42,55 +42,126 @@ pub struct Headers {
     entries: Vec<(HeaderName, HeaderValue)>,
 }
 
-fn validate_name(name: &[u8]) -> Result<HeaderName, ParseError> {
-    if !is_token(name) {
-        if name.iter().any(|&b| b >= 0x80) {
-            return reject(Reason::NonAscii, "non-ASCII header name");
-        }
-        return reject(
-            Reason::InvalidHeaderName,
-            format!("invalid header name {:?}", String::from_utf8_lossy(name)),
-        );
+/// Trailer fields never accepted even with `http.allow_trailers`: fields
+/// that frame, route or authenticate the message, or describe the content a
+/// recipient has already started processing (RFC 9110 §6.5.1), plus every
+/// [`RESERVED`] name.
+const FORBIDDEN_TRAILERS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "expect",
+    "range",
+    "max-forwards",
+    "cache-control",
+];
+
+/// Whether `name` (lower-case) may not appear in a trailer section.
+pub fn is_forbidden_trailer(name: &str) -> bool {
+    is_reserved(name) || FORBIDDEN_TRAILERS.contains(&name) || name.starts_with("content-")
+}
+
+fn check_name(name: &[u8]) -> Result<(), ParseError> {
+    if is_token(name) {
+        return Ok(());
     }
+    if name.iter().any(|&b| b >= 0x80) {
+        return reject(Reason::NonAscii, "non-ASCII header name");
+    }
+    reject(
+        Reason::InvalidHeaderName,
+        format!("invalid header name {:?}", String::from_utf8_lossy(name)),
+    )
+}
+
+fn check_value(value: &[u8], allow_obs_text: bool) -> Result<(), ParseError> {
+    let Some(&b) = value
+        .iter()
+        .find(|&&b| !is_field_value_byte(b, allow_obs_text))
+    else {
+        return Ok(());
+    };
+    if b >= 0x80 {
+        return reject(Reason::NonAscii, "non-ASCII header value");
+    }
+    reject(
+        Reason::InvalidHeaderValue,
+        format!("byte 0x{b:02x} in header value"),
+    )
+}
+
+fn validate_name(name: &[u8]) -> Result<HeaderName, ParseError> {
+    check_name(name)?;
     HeaderName::from_bytes(&name.to_ascii_lowercase())
         .map_err(|_| ParseError::new(Reason::InvalidHeaderName, "invalid header name"))
 }
 
-pub(crate) fn validate_value(
-    value: &[u8],
-    allow_obs_text: bool,
-) -> Result<HeaderValue, ParseError> {
+fn validate_value(value: &[u8], allow_obs_text: bool) -> Result<HeaderValue, ParseError> {
     let v = trim_ows(value);
-    if let Some(&b) = v.iter().find(|&&b| !is_field_value_byte(b, allow_obs_text)) {
-        if b >= 0x80 {
-            return reject(Reason::NonAscii, "non-ASCII header value");
-        }
-        return reject(
-            Reason::InvalidHeaderValue,
-            format!("byte 0x{b:02x} in header value"),
-        );
-    }
+    check_value(v, allow_obs_text)?;
     HeaderValue::from_bytes(v)
         .map_err(|_| ParseError::new(Reason::InvalidHeaderValue, "invalid header value"))
 }
 
-/// Parses `Connection` values into lower-case tokens.
+/// Splits one h1 field line (without its CRLF) into a validated name and an
+/// OWS-trimmed value, applying the field rules in the order a client sees
+/// them: no obs-fold, a colon, a non-empty token name with no whitespace
+/// before the colon, and value bytes within the allowed set.
+pub(crate) fn parse_field_line(
+    line: &[u8],
+    allow_obs_text: bool,
+) -> Result<(&[u8], &[u8]), ParseError> {
+    if matches!(line.first(), Some(b' ' | b'\t')) {
+        return reject(Reason::ObsFold, "obsolete line folding");
+    }
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        return reject(Reason::InvalidHeaderName, "header line without colon");
+    };
+    let name = &line[..colon];
+    if name.is_empty() {
+        return reject(Reason::InvalidHeaderName, "empty header name");
+    }
+    if matches!(name.last(), Some(b' ' | b'\t')) {
+        return reject(Reason::WhitespaceBeforeColon, "whitespace before colon");
+    }
+    check_name(name)?;
+    let value = trim_ows(&line[colon + 1..]);
+    check_value(value, allow_obs_text)?;
+    Ok((name, value))
+}
+
+/// Parses client `Connection` values into lower-case tokens; any element
+/// that is not a token rejects the request.
 pub(crate) fn connection_tokens<'a>(
     values: impl IntoIterator<Item = &'a [u8]>,
 ) -> Result<Vec<String>, ParseError> {
-    let mut out = Vec::new();
-    for v in values {
-        for t in split_list(v) {
-            if !is_token(t) {
-                return reject(
+    values
+        .into_iter()
+        .flat_map(split_list)
+        .map(|t| {
+            if is_token(t) {
+                Ok(String::from_utf8_lossy(t).to_ascii_lowercase())
+            } else {
+                reject(
                     Reason::BadConnectionHeader,
                     "connection option is not a token",
-                );
+                )
             }
-            out.push(String::from_utf8_lossy(t).to_ascii_lowercase());
-        }
-    }
-    Ok(out)
+        })
+        .collect()
+}
+
+/// Parses upstream `Connection` values into lower-case tokens, skipping
+/// elements that are not tokens. Upstreams are trusted but not held to the
+/// client's strictness, and one sloppy element must not switch off the
+/// stripping of the fields the valid ones nominate.
+fn connection_tokens_lenient<'a>(values: impl IntoIterator<Item = &'a [u8]>) -> Vec<String> {
+    values
+        .into_iter()
+        .flat_map(split_list)
+        .filter(|t| is_token(t))
+        .map(|t| String::from_utf8_lossy(t).to_ascii_lowercase())
+        .collect()
 }
 
 impl Headers {
@@ -140,22 +211,33 @@ impl Headers {
     /// Reserved and `Connection`-nominated fields are dropped. Iteration
     /// order follows `HeaderMap` (grouped by name).
     pub fn from_header_map_lenient(map: &HeaderMap) -> Self {
-        let nominated = connection_tokens(
+        Self::from_header_map_lenient_with_connection(map).0
+    }
+
+    /// As [`Headers::from_header_map_lenient`], also returning the
+    /// lower-case options the `Connection` fields nominated (elements that
+    /// are not tokens are ignored), for callers that act on them, such as
+    /// `101` detection.
+    pub fn from_header_map_lenient_with_connection(map: &HeaderMap) -> (Self, Vec<String>) {
+        let nominated = connection_tokens_lenient(
             map.get_all(http::header::CONNECTION)
                 .iter()
                 .map(HeaderValue::as_bytes),
-        )
-        .unwrap_or_default();
+        );
         let entries = map
             .iter()
             .filter(|(n, _)| !is_reserved(n.as_str()) && !nominated.iter().any(|t| t == n.as_str()))
             .map(|(n, v)| (n.clone(), v.clone()))
             .collect();
-        Self { entries }
+        (Self { entries }, nominated)
     }
 
     /// First value of `name` as a string (`None` if absent or if the value
     /// contains obs-text; use [`Headers::get_raw`] for bytes).
+    ///
+    /// Absent and unreadable look the same here. A caller that must not
+    /// treat an unreadable value as "not set" (anything that decides how a
+    /// body is read, say) uses [`Headers::get_raw`].
     pub fn get(&self, name: &str) -> Option<&str> {
         self.get_raw(name).and_then(|v| v.to_str().ok())
     }
@@ -168,7 +250,9 @@ impl Headers {
             .map(|(_, v)| v)
     }
 
-    /// All values of `name` that are valid strings, in order.
+    /// All values of `name` that are valid strings, in order. Values with
+    /// obs-text are skipped, not reported: a caller that needs to know
+    /// about them uses [`Headers::get_all_raw`].
     pub fn get_all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         self.get_all_raw(name).filter_map(|v| v.to_str().ok())
     }
@@ -341,6 +425,50 @@ mod tests {
     }
 
     #[test]
+    fn field_line_rules() {
+        assert_eq!(
+            parse_field_line(b"X-A:  1 \t", false).unwrap(),
+            (&b"X-A"[..], &b"1"[..])
+        );
+        for (line, r) in [
+            (&b" x: 1"[..], Reason::ObsFold),
+            (b"\tx: 1", Reason::ObsFold),
+            (b"no colon", Reason::InvalidHeaderName),
+            (b": 1", Reason::InvalidHeaderName),
+            (b"x : 1", Reason::WhitespaceBeforeColon),
+            (b"x(y): 1", Reason::InvalidHeaderName),
+            (b"caf\xc3\xa9: 1", Reason::NonAscii),
+            (b"x: a\x00b", Reason::InvalidHeaderValue),
+            (b"x: caf\xc3\xa9", Reason::NonAscii),
+        ] {
+            assert_eq!(
+                parse_field_line(line, false).unwrap_err().reason,
+                r,
+                "{:?}",
+                String::from_utf8_lossy(line)
+            );
+        }
+        assert!(parse_field_line(b"x: caf\xc3\xa9", true).is_ok());
+    }
+
+    #[test]
+    fn forbidden_trailers() {
+        for n in [
+            "content-length",
+            "content-md5",
+            "host",
+            "connection",
+            "transfer-encoding",
+            "authorization",
+            "set-cookie",
+        ] {
+            assert!(is_forbidden_trailer(n), "{n}");
+        }
+        assert!(!is_forbidden_trailer("grpc-status"));
+        assert!(!is_forbidden_trailer("x-checksum"));
+    }
+
+    #[test]
     fn count_limit() {
         let l = Limits {
             max_headers: 2,
@@ -400,5 +528,20 @@ mod tests {
         let h = Headers::from_header_map_lenient(&m);
         assert_eq!(h.len(), 2);
         assert_eq!(h.get_all("set-cookie").count(), 2);
+    }
+
+    #[test]
+    fn lenient_map_keeps_valid_connection_tokens_beside_a_malformed_one() {
+        let mut m = HeaderMap::new();
+        m.append(
+            "connection",
+            HeaderValue::from_static("x-hop, Upgrade, (bad)"),
+        );
+        m.append("x-hop", HeaderValue::from_static("1"));
+        m.append("x-keep", HeaderValue::from_static("1"));
+        let (h, nominated) = Headers::from_header_map_lenient_with_connection(&m);
+        assert_eq!(nominated, ["x-hop", "upgrade"]);
+        assert!(!h.contains("x-hop"));
+        assert!(h.contains("x-keep"));
     }
 }
