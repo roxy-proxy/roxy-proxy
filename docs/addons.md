@@ -200,6 +200,15 @@ layer, with per-entry TTL, a value size cap and an entry cap. A miss returns
 `none`. A write when full returns an error and the layer decides; nothing is
 evicted.
 
+Each layer's store is separate, so a full or busy store in one layer does
+not slow another. Expired entries read as absent straight away. When a new
+key meets a full store, expired entries are purged at most every 100 ms.
+
+The store survives a reload. A reload that changes `state.max_entries` or
+`state.default_ttl` applies to the live store: stored entries keep their
+expiry, and a lower cap evicts nothing but refuses new keys until enough
+entries expire.
+
 ### Identity
 
 `flow.current()` gives the flow id, connection id, tags, and the principal
