@@ -40,7 +40,7 @@ impl Default for AddressPolicy {
 /// `allow: { private_ok: true }`, or an addon endpoint's `private_ok`. An
 /// enum, not a `bool`, so it can't be swapped with another flag at a call
 /// site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PrivateAddrs {
     Deny,
     Allow,

@@ -41,6 +41,10 @@ pub(crate) struct Snapshot {
     pub address_lists: Arc<AddressLists>,
     /// The addon stack, outermost first.
     pub addons: Arc<[Arc<crate::addons::AddonSpec>]>,
+    /// Service layers' connection pools. A reload starts empty ones, so
+    /// new exchanges dial under the new policy and secrets, and retires
+    /// the old ones, whose connections close as their exchanges end.
+    pub services: crate::addons::service::Pools,
 }
 
 /// Per-client and global connection counting.
@@ -195,6 +199,7 @@ fn build_snapshot(u: PolicyUpdate, tls: &Arc<ClientConfig>) -> Result<Snapshot, 
         upstream: Arc::new(upstream),
         address_lists: u.address_lists,
         addons: u.addons.into(),
+        services: crate::addons::service::Pools::default(),
     })
 }
 
@@ -232,7 +237,8 @@ impl ServerHandle {
         self.shared
             .layer_state
             .configure(snap.addons.iter().map(|a| (a.name.as_str(), &a.state)));
-        self.shared.snapshot.store(Arc::new(snap));
+        let old = self.shared.snapshot.swap(Arc::new(snap));
+        old.services.retire();
         Ok(())
     }
 
