@@ -175,17 +175,41 @@ fn default_dns_ttl() -> Duration {
 #[serde(deny_unknown_fields, default)]
 pub struct Tls {
     /// Where `roxy-ca.pem` / `roxy-ca.key` live; generated if absent.
+    /// Unused when `ca_cert` and `ca_key` are set.
     pub ca_dir: PathBuf,
+    /// A provided CA certificate (then any intermediates), PEM. Set together
+    /// with `ca_key`; never generated (docs/tls.md#provided-ca).
+    pub ca_cert: Option<PathBuf>,
+    /// The provided CA's PKCS#8 PEM key.
+    pub ca_key: Option<PathBuf>,
     pub require_sni_match: bool,
     /// Leaf certificate LRU size (docs/tls.md#leaf-certificates).
     pub leaf_cache_size: usize,
     pub upstream: TlsUpstream,
 }
 
+impl Tls {
+    /// The provided CA's certificate and key paths, if both are set.
+    ///
+    /// Exactly one being set is an error rather than a fallback to
+    /// `ca_dir`: that would quietly serve a different CA than the operator
+    /// configured. `Config::validate` reports it too; this guards the CA
+    /// commands, which skip validation.
+    pub fn provided_ca(&self) -> anyhow::Result<Option<(&Path, &Path)>> {
+        match (&self.ca_cert, &self.ca_key) {
+            (Some(cert), Some(key)) => Ok(Some((cert, key))),
+            (None, None) => Ok(None),
+            _ => anyhow::bail!("tls.ca_cert and tls.ca_key must be set together"),
+        }
+    }
+}
+
 impl Default for Tls {
     fn default() -> Self {
         Self {
             ca_dir: PathBuf::from("/var/lib/roxy/ca"),
+            ca_cert: None,
+            ca_key: None,
             require_sni_match: true,
             leaf_cache_size: 10_000,
             upstream: TlsUpstream::default(),

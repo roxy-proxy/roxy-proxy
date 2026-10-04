@@ -6,7 +6,7 @@ way. The engine lives in `roxy-rules`.
 ## Config file
 
 One YAML file, `version: 1`. Parsing is strict: an unknown key anywhere is
-an error, not a silently ignored setting. Relative paths (`ca_dir`, secret
+an error, not a silently ignored setting. Relative paths (`ca_dir`, `ca_cert`, `ca_key`, secret
 files, list files, addon paths, log and capture paths) resolve against the
 process's working directory. [`examples/roxy.yaml`](../examples/roxy.yaml)
 shows every section.

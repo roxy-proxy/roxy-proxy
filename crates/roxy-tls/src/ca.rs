@@ -6,6 +6,11 @@
 //! reloaded: a missing or corrupt half of the pair is a hard error, never a
 //! silent regeneration, because regenerating would invalidate the trust that
 //! clients have already been given.
+//!
+//! An operator can instead provide their own CA as a certificate file and a
+//! key file anywhere on disk ([`Ca::load_provided`], docs/tls.md#provided-ca).
+//! A provided CA is never generated or replaced, and the certificate file may
+//! carry intermediates after the CA, which are sent in every handshake.
 
 use std::fmt;
 use std::fs;
@@ -60,6 +65,13 @@ pub enum CaError {
         #[source]
         source: io::Error,
     },
+    /// The certificate is outside its validity period.
+    #[error("CA certificate {} is not valid now (valid {not_before} to {not_after})", path.display())]
+    NotCurrent {
+        path: PathBuf,
+        not_before: String,
+        not_after: String,
+    },
     /// The certificate file is not a usable CA certificate.
     #[error("invalid CA certificate {}: {reason}", path.display())]
     InvalidCert { path: PathBuf, reason: String },
@@ -80,8 +92,10 @@ pub enum CaError {
 /// roxy's certificate authority: certificate, private key and an rcgen
 /// [`Issuer`] ready to sign leaf certificates.
 pub struct Ca {
-    dir: PathBuf,
+    cert_path: PathBuf,
     cert_der: CertificateDer<'static>,
+    /// Certificates sent after the CA in handshakes (intermediates).
+    chain: Vec<CertificateDer<'static>>,
     key_der: PrivateKeyDer<'static>,
     issuer: Issuer<'static, KeyPair>,
 }
@@ -89,8 +103,9 @@ pub struct Ca {
 impl fmt::Debug for Ca {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Ca")
-            .field("dir", &self.dir)
+            .field("cert_path", &self.cert_path)
             .field("cert_der_len", &self.cert_der.len())
+            .field("chain_len", &self.chain.len())
             .finish_non_exhaustive()
     }
 }
@@ -133,36 +148,58 @@ impl Ca {
             (true, true) => {}
         }
 
-        let cert_pem = read(&cert_path)?;
-        let key_pem = read(&key_path)?;
+        Self::load_files(cert_path, &key_path)
+    }
 
-        let cert_der =
-            CertificateDer::from_pem_slice(&cert_pem).map_err(|e| CaError::InvalidCert {
-                path: cert_path.clone(),
-                reason: e.to_string(),
-            })?;
+    /// Load a CA the operator provided: `cert_path` holds the CA certificate
+    /// (PEM), optionally followed by its intermediates in order up to (not
+    /// including) the root; `key_path` holds the CA's PKCS#8 PEM key.
+    ///
+    /// Nothing is ever generated: a missing file is [`CaError::Io`].
+    pub fn load_provided(cert_path: &Path, key_path: &Path) -> Result<Self, CaError> {
+        Self::load_files(cert_path.to_path_buf(), key_path)
+    }
+
+    fn load_files(cert_path: PathBuf, key_path: &Path) -> Result<Self, CaError> {
+        let cert_pem = read(&cert_path)?;
+        let key_pem = read(key_path)?;
+
+        let invalid_cert = |reason: String| CaError::InvalidCert {
+            path: cert_path.clone(),
+            reason,
+        };
+        let mut certs = CertificateDer::pem_slice_iter(&cert_pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| invalid_cert(e.to_string()))?
+            .into_iter();
+        let cert_der = certs
+            .next()
+            .ok_or_else(|| invalid_cert("no PEM certificate found".into()))?;
+        let chain: Vec<_> = certs.collect();
+
         let key_der =
             PrivatePkcs8KeyDer::from_pem_slice(&key_pem).map_err(|e| CaError::InvalidKey {
-                path: key_path.clone(),
-                reason: format!("expected a PKCS#8 PEM private key: {e}"),
+                path: key_path.to_path_buf(),
+                reason: format!(
+                    "expected a PKCS#8 PEM private key (\"BEGIN PRIVATE KEY\"; convert with \
+                     `openssl pkcs8 -topk8 -nocrypt`): {e}"
+                ),
             })?;
         let key_der = PrivateKeyDer::Pkcs8(key_der);
         let key_pair = KeyPair::try_from(&key_der).map_err(|e| CaError::InvalidKey {
-            path: key_path.clone(),
+            path: key_path.to_path_buf(),
             reason: e.to_string(),
         })?;
 
-        check_ca_cert(&cert_der, &cert_path, &key_path, &key_pair)?;
+        check_ca_cert(&cert_der, &chain, &cert_path, key_path, &key_pair)?;
 
-        let issuer =
-            Issuer::from_ca_cert_der(&cert_der, key_pair).map_err(|e| CaError::InvalidCert {
-                path: cert_path.clone(),
-                reason: e.to_string(),
-            })?;
+        let issuer = Issuer::from_ca_cert_der(&cert_der, key_pair)
+            .map_err(|e| invalid_cert(e.to_string()))?;
 
         Ok(Self {
-            dir: dir.to_path_buf(),
+            cert_path,
             cert_der,
+            chain,
             key_der,
             issuer,
         })
@@ -193,8 +230,9 @@ impl Ca {
         write_new(&cert_path, cert.pem().as_bytes(), 0o644)?;
 
         Ok(Self {
-            dir: dir.to_path_buf(),
+            cert_path,
             cert_der,
+            chain: Vec::new(),
             key_der,
             issuer: Issuer::new(params, key_pair),
         })
@@ -216,14 +254,9 @@ impl Ca {
         Self::generate(dir)
     }
 
-    /// Directory the CA was loaded from or written to.
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
     /// Path of the CA certificate file.
-    pub fn cert_path(&self) -> PathBuf {
-        self.dir.join(CA_CERT_FILE)
+    pub fn cert_path(&self) -> &Path {
+        &self.cert_path
     }
 
     /// The CA certificate, PEM-encoded.
@@ -242,6 +275,12 @@ impl Ca {
     /// The CA certificate as a rustls certificate, e.g. for building chains.
     pub fn certificate(&self) -> &CertificateDer<'static> {
         &self.cert_der
+    }
+
+    /// Intermediates sent after the CA certificate in every handshake. Empty
+    /// unless a provided CA's certificate file carries them.
+    pub fn chain(&self) -> &[CertificateDer<'static>] {
+        &self.chain
     }
 
     /// The CA private key. Never serve or log this.
@@ -283,9 +322,12 @@ pub(crate) fn random_serial() -> Result<SerialNumber, CaError> {
     Ok(SerialNumber::from_slice(&bytes))
 }
 
-/// Verify that `cert_der` is a CA certificate whose public key belongs to `key`.
+/// Verify that `cert_der` is a currently valid CA certificate that may sign
+/// certificates, whose public key belongs to `key`, and that `chain` (if any)
+/// runs upwards from it in order.
 fn check_ca_cert(
     cert_der: &CertificateDer<'_>,
+    chain: &[CertificateDer<'_>],
     cert_path: &Path,
     key_path: &Path,
     key: &KeyPair,
@@ -294,11 +336,7 @@ fn check_ca_cert(
         path: cert_path.to_path_buf(),
         reason,
     };
-    let (rest, x509) =
-        x509_parser::parse_x509_certificate(cert_der).map_err(|e| invalid(e.to_string()))?;
-    if !rest.is_empty() {
-        return Err(invalid("trailing data after certificate".into()));
-    }
+    let x509 = parse_cert(cert_der).map_err(invalid)?;
     let is_ca = x509
         .basic_constraints()
         .map_err(|e| invalid(e.to_string()))?
@@ -308,13 +346,54 @@ fn check_ca_cert(
             "certificate is not a CA (basicConstraints CA:FALSE or absent)".into(),
         ));
     }
+    // Clients reject leaves from a CA whose key usage forbids signing them,
+    // so refuse to start rather than fail every handshake.
+    let may_sign = x509
+        .key_usage()
+        .map_err(|e| invalid(e.to_string()))?
+        .is_none_or(|ku| ku.value.key_cert_sign());
+    if !may_sign {
+        return Err(invalid("key usage does not include keyCertSign".into()));
+    }
+    let validity = x509.validity();
+    if !validity.is_valid() {
+        return Err(CaError::NotCurrent {
+            path: cert_path.to_path_buf(),
+            not_before: validity.not_before.to_string(),
+            not_after: validity.not_after.to_string(),
+        });
+    }
     if x509.public_key().subject_public_key.data.as_ref() != key.public_key_raw() {
         return Err(CaError::KeyMismatch {
             cert: cert_path.to_path_buf(),
             key: key_path.to_path_buf(),
         });
     }
+    // Each certificate must be issued by the next: a misordered or unrelated
+    // bundle would be served as a chain no client can build.
+    let mut below = x509;
+    for (i, der) in chain.iter().enumerate() {
+        let above = parse_cert(der).map_err(invalid)?;
+        if below.issuer() != above.subject() {
+            return Err(invalid(format!(
+                "certificate {} (subject {}) is not the issuer of the one before it (issuer {})",
+                i + 2,
+                above.subject(),
+                below.issuer()
+            )));
+        }
+        below = above;
+    }
     Ok(())
+}
+
+fn parse_cert(der: &[u8]) -> Result<x509_parser::certificate::X509Certificate<'_>, String> {
+    let (rest, x509) = x509_parser::parse_x509_certificate(der).map_err(|e| e.to_string())?;
+    if rest.is_empty() {
+        Ok(x509)
+    } else {
+        Err("trailing data after certificate".into())
+    }
 }
 
 fn exists(path: &Path) -> Result<bool, CaError> {
@@ -364,7 +443,7 @@ fn write_new(path: &Path, contents: &[u8], #[allow(unused)] mode: u32) -> Result
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn tmp() -> tempfile::TempDir {
@@ -532,6 +611,173 @@ mod tests {
         fs::write(tmp.path().join(CA_CERT_FILE), "garbage").unwrap();
         assert!(matches!(
             Ca::load(tmp.path()),
+            Err(CaError::InvalidCert { .. })
+        ));
+    }
+
+    /// A CA's PEM certificate and PKCS#8 PEM key, built from `params`,
+    /// self-signed or signed by `parent`.
+    pub(crate) fn make_ca(
+        params: &CertificateParams,
+        parent: Option<&Issuer<'_, KeyPair>>,
+    ) -> (String, KeyPair) {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = match parent {
+            Some(p) => params.signed_by(&key, p).unwrap(),
+            None => params.self_signed(&key).unwrap(),
+        };
+        (cert.pem(), key)
+    }
+
+    pub(crate) fn ca_named(cn: &str) -> CertificateParams {
+        let mut params = ca_params().unwrap();
+        params.distinguished_name = DistinguishedName::new();
+        params.distinguished_name.push(DnType::CommonName, cn);
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+    }
+
+    /// Writes `cert` and `key` to `ca.crt` / `ca.key` in `dir`.
+    pub(crate) fn write_provided(dir: &Path, cert: &str, key: &KeyPair) -> (PathBuf, PathBuf) {
+        let (c, k) = (dir.join("ca.crt"), dir.join("ca.key"));
+        fs::write(&c, cert).unwrap();
+        fs::write(&k, key.serialize_pem()).unwrap();
+        (c, k)
+    }
+
+    #[test]
+    fn provided_ca_loads_with_its_chain() {
+        let tmp = tmp();
+        let (root_pem, root_key) = make_ca(&ca_named("Org Root"), None);
+        let root = Issuer::from_ca_cert_pem(&root_pem, root_key).unwrap();
+        let (mid_pem, mid_key) = make_ca(&ca_named("Org Mid"), Some(&root));
+        let mid = Issuer::from_ca_cert_pem(&mid_pem, mid_key).unwrap();
+        let (sub_pem, sub_key) = make_ca(&ca_named("roxy sub-CA"), Some(&mid));
+
+        let (cert, key) = write_provided(tmp.path(), &(sub_pem.clone() + &mid_pem), &sub_key);
+        let ca = Ca::load_provided(&cert, &key).unwrap();
+        assert_eq!(ca.cert_pem(), sub_pem);
+        assert_eq!(ca.cert_path(), cert);
+        assert_eq!(ca.chain().len(), 1);
+        assert_eq!(
+            ca.chain()[0].as_ref(),
+            CertificateDer::from_pem_slice(mid_pem.as_bytes())
+                .unwrap()
+                .as_ref()
+        );
+        // Nothing is written next to a provided CA.
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 2);
+
+        // Without intermediates the chain is empty.
+        let (cert, key) = write_provided(tmp.path(), &sub_pem, &sub_key);
+        assert_eq!(Ca::load_provided(&cert, &key).unwrap().chain(), &[]);
+    }
+
+    #[test]
+    fn provided_ca_is_never_generated() {
+        let tmp = tmp();
+        let err =
+            Ca::load_provided(&tmp.path().join("ca.crt"), &tmp.path().join("ca.key")).unwrap_err();
+        assert!(matches!(err, CaError::Io { .. }), "{err}");
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn provided_chain_out_of_order_is_an_error() {
+        let tmp = tmp();
+        let (root_pem, root_key) = make_ca(&ca_named("Org Root"), None);
+        let root = Issuer::from_ca_cert_pem(&root_pem, root_key).unwrap();
+        let (mid_pem, mid_key) = make_ca(&ca_named("Org Mid"), Some(&root));
+        let mid = Issuer::from_ca_cert_pem(&mid_pem, mid_key).unwrap();
+        let (sub_pem, sub_key) = make_ca(&ca_named("roxy sub-CA"), Some(&mid));
+        let (other_pem, _) = make_ca(&ca_named("Unrelated"), None);
+
+        for bundle in [
+            sub_pem.clone() + &root_pem + &mid_pem,
+            sub_pem.clone() + &other_pem,
+        ] {
+            let (cert, key) = write_provided(tmp.path(), &bundle, &sub_key);
+            let err = Ca::load_provided(&cert, &key).unwrap_err();
+            assert!(
+                matches!(&err, CaError::InvalidCert { reason, .. } if reason.contains("issuer")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn provided_cert_must_be_a_current_signing_ca() {
+        let tmp = tmp();
+
+        let mut leaf = ca_named("not a CA");
+        leaf.is_ca = IsCa::NoCa;
+        let (pem, key) = make_ca(&leaf, None);
+        let (cert, key_path) = write_provided(tmp.path(), &pem, &key);
+        let err = Ca::load_provided(&cert, &key_path).unwrap_err();
+        assert!(
+            matches!(&err, CaError::InvalidCert { reason, .. } if reason.contains("not a CA")),
+            "{err}"
+        );
+
+        let mut no_sign = ca_named("no keyCertSign");
+        no_sign.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let (pem, key) = make_ca(&no_sign, None);
+        let (cert, key_path) = write_provided(tmp.path(), &pem, &key);
+        let err = Ca::load_provided(&cert, &key_path).unwrap_err();
+        assert!(
+            matches!(&err, CaError::InvalidCert { reason, .. } if reason.contains("keyCertSign")),
+            "{err}"
+        );
+
+        let now = time::OffsetDateTime::now_utc();
+        for (from, to) in [
+            (
+                now - time::Duration::days(20),
+                now - time::Duration::days(10),
+            ),
+            (
+                now + time::Duration::days(10),
+                now + time::Duration::days(20),
+            ),
+        ] {
+            let mut params = ca_named("not current");
+            params.not_before = from;
+            params.not_after = to;
+            let (pem, key) = make_ca(&params, None);
+            let (cert, key_path) = write_provided(tmp.path(), &pem, &key);
+            let err = Ca::load_provided(&cert, &key_path).unwrap_err();
+            assert!(matches!(err, CaError::NotCurrent { .. }), "{err}");
+        }
+    }
+
+    #[test]
+    fn provided_key_must_be_pkcs8_and_match() {
+        let tmp = tmp();
+        let (pem, key) = make_ca(&ca_named("roxy"), None);
+        let (cert, key_path) = write_provided(tmp.path(), &pem, &key);
+
+        // A SEC1 ("EC PRIVATE KEY") key is refused with a pointer to convert it.
+        fs::write(
+            &key_path,
+            "-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let err = Ca::load_provided(&cert, &key_path).unwrap_err();
+        assert!(
+            matches!(&err, CaError::InvalidKey { reason, .. } if reason.contains("openssl pkcs8")),
+            "{err}"
+        );
+
+        let (_, other) = make_ca(&ca_named("other"), None);
+        fs::write(&key_path, other.serialize_pem()).unwrap();
+        assert!(matches!(
+            Ca::load_provided(&cert, &key_path),
+            Err(CaError::KeyMismatch { .. })
+        ));
+
+        fs::write(&cert, "no certificate here\n").unwrap();
+        assert!(matches!(
+            Ca::load_provided(&cert, &key_path),
             Err(CaError::InvalidCert { .. })
         ));
     }
