@@ -7,30 +7,21 @@ use std::fmt;
 use crate::config::Capability;
 use crate::host::HostError;
 
-/// A budget from [`crate::LayerLimits`].
+/// A limit from [`crate::LayerLimits`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Budget {
-    /// `fuel_per_step`: too many instructions between host calls.
-    Fuel,
-    /// `step_cpu`: too long between host calls (epoch interruption).
-    StepCpu,
-    /// `max_exchange_time`: the exchange took too long.
-    ExchangeTime,
     /// `max_memory`: linear memory would grow past the cap.
     Memory,
-    /// `max_buffered_body_bytes`: the layer held too many body bytes.
-    BufferedBody,
+    /// `first_byte_timeout`: no response head in time.
+    FirstByte,
 }
 
 impl Budget {
     /// The config key of the limit.
     pub fn name(self) -> &'static str {
         match self {
-            Budget::Fuel => "fuel_per_step",
-            Budget::StepCpu => "step_cpu",
-            Budget::ExchangeTime => "max_exchange_time",
             Budget::Memory => "max_memory",
-            Budget::BufferedBody => "max_buffered_body_bytes",
+            Budget::FirstByte => "first_byte_timeout",
         }
     }
 }
@@ -94,9 +85,6 @@ pub enum LayerError {
     /// response body was dropped before the layer finished).
     #[error("exchange cancelled")]
     Cancelled,
-    /// The layer does not export `roxy:addon/tunnel`.
-    #[error("layer does not export `tunnel`")]
-    NoTunnel,
 }
 
 impl LayerError {

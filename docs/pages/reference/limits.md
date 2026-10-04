@@ -61,7 +61,7 @@ limits:
   max_address_list_bytes: 256mb
 ```
 
-Addons have their own budgets ([addons](/addons/configuration)).
+Addons have their own limits ([addon safety](/addons/safety)).
 `max_ws_message_bytes` applies only when rules read WebSocket messages
 ([WebSockets](/policies/websockets#message-rules)); a message over it closes both
 sides with `1009`.

@@ -3,7 +3,7 @@
 # copies the components to `../tests/fixtures/`, which are checked in.
 [workspace]
 resolver = "3"
-members = ["redact", "test-layer", "tunnel-layer"]
+members = ["redact", "test-layer"]
 
 [workspace.package]
 version = "0.0.0"

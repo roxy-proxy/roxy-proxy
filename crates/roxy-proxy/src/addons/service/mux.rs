@@ -27,7 +27,6 @@ use roxy_http::{Body, BodyError, BodySender, Scheme};
 use roxy_wasm::LayerResponse;
 use serde::Serialize;
 use tokio::sync::{Notify, OnceCell, mpsc, oneshot};
-use tokio::time::Instant as TokioInstant;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -375,8 +374,8 @@ impl Stream {
         }
     }
 
-    /// roxy gives up on the stream (the client went away, a deadline, an
-    /// upgrade): the service is told, and anyone still waiting on an
+    /// roxy gives up on the stream (the client went away, a missed
+    /// `first_byte_timeout`, an upgrade): the service is told, and anyone still waiting on an
     /// answer gets `why`, without it being logged as the service's fault.
     pub(super) fn reset(&self, why: &str) {
         if !self.end() {
@@ -408,19 +407,6 @@ impl Stream {
     pub(super) fn finish(&self) -> Result<(), ServiceError> {
         self.end();
         lock(&self.observe_error).take().map_or(Ok(()), Err)
-    }
-
-    /// Ends the stream at `end` (`max_exchange_time`).
-    pub(super) fn deadline(self: &Arc<Self>, end: TokioInstant) {
-        let s = self.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                () = tokio::time::sleep_until(end) => {
-                    s.fail(ServiceError::Timeout("max_exchange_time"), true);
-                }
-                () = s.ended.cancelled() => {}
-            }
-        });
     }
 
     /// Sends a control message in stream order. False once the stream or

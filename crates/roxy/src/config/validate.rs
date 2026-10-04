@@ -249,7 +249,6 @@ impl Config {
                         ));
                     }
                     for (field, set) in [
-                        ("first_byte_timeout", a.limits.first_byte_timeout.is_some()),
                         ("max_connections", a.limits.max_connections.is_some()),
                         ("max_streams", a.limits.max_streams.is_some()),
                     ] {
@@ -352,12 +351,6 @@ impl Config {
         for (field, set) in [
             ("max_memory", l.max_memory.is_some()),
             (
-                "max_buffered_body_bytes",
-                l.max_buffered_body_bytes.is_some(),
-            ),
-            ("step_cpu", l.step_cpu.is_some()),
-            ("fuel_per_step", l.fuel_per_step.is_some()),
-            (
                 "recycle_after_exchanges",
                 l.recycle_after_exchanges.is_some(),
             ),
@@ -368,7 +361,7 @@ impl Config {
                 refuse(
                     &format!("limits.{field}"),
                     "a WASM limit; a service layer takes `first_byte_timeout`, \
-                     `max_exchange_time`, `max_connections` and `max_streams`",
+                     `max_connections` and `max_streams`",
                 );
             }
         }

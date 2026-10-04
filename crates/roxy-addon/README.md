@@ -82,8 +82,8 @@ logic of a layer can be unit-tested natively.
   - `pipe` runs it through a stateful [`ChunkTransform`] that can hold
     bytes back, for example to withhold part of a stream until it has been
     judged.
-  - `read_to_end(cap)` buffers it, up to a cap. roxy also enforces the
-    layer's `max_buffered_body_bytes`.
+  - `read_to_end(cap)` buffers it, up to a cap. The layer's `max_memory`
+    bounds it too.
 - **Answer directly.** Return a [`Response`] without calling `next`:
   `Response::json(403, ...)`, `Response::text(...)`.
 - **Host services** in [`flow`], each behind a capability granted in roxy's
@@ -97,11 +97,12 @@ logic of a layer can be unit-tested natively.
   them, and the call bypasses the layer stack.
 
 A layer handles one exchange at a time per instance. roxy runs several
-instances, recycles them, and holds each to CPU, memory and wall-clock
-budgets ([addon safety](https://roxy-proxy.github.io/roxy-proxy/addons/safety)).
+instances, recycles them, and holds each to a memory cap and a deadline to
+its response head ([addon safety](https://roxy-proxy.github.io/roxy-proxy/addons/safety)).
 
-Tunnels (`roxy:addon/tunnel`) are not wrapped yet; use the raw
-[`bindings`] for those.
+A WebSocket reaches a layer as an ordinary exchange: after the `101`, the
+request body carries the client's bytes and the response body the
+upstream's. `Next::run` streams both at once.
 
 ## Example
 

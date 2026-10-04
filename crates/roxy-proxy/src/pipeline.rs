@@ -281,6 +281,9 @@ pub(crate) struct FlowCx {
     /// The addon stack this exchange went through (set once the stack has
     /// handed the flow back), folded into the record when it is logged.
     pub stack: Option<Arc<crate::addons::StackFlow>>,
+    /// An addon layer ran on this request: on an upgrade, it is in the
+    /// WebSocket's byte path.
+    pub layer_ran: bool,
 }
 
 pub(crate) fn request_facts(req: &CanonicalRequest) -> RequestFacts {
@@ -355,6 +358,7 @@ impl FlowCx {
             host_override: None,
             request_counter: None,
             stack: None,
+            layer_ran: false,
         }
     }
 

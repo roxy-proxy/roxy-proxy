@@ -27,21 +27,20 @@ addons:                               # above the rules, in this order
       max_value_bytes: 64kb
       default_ttl: 6h
     limits:                           # defaults shown
-      max_memory: 64mb
-      max_buffered_body_bytes: 1mb    # default limits.max_inspect_body_bytes
-      step_cpu: 50ms                  # CPU between host calls
-      fuel_per_step: 100_000_000
-      max_exchange_time: 60s          # wall clock per exchange, including endpoint calls
+      max_memory: 64mb                # per instance; what the layer holds of a body lives here
+      first_byte_timeout: 30s         # the layer's own time to its response head
       recycle_after_exchanges: 10000
       recycle_above_memory: 48mb
-      max_instances: 64               # concurrent exchanges
+      max_instances: 1024             # concurrent exchanges; waiting for one has no deadline
     config: { reject_at: 0.8 }        # opaque, handed to the layer as JSON
 ```
 
-A layer that judges LLM traffic will usually raise `max_buffered_body_bytes`
-(requests resend the whole conversation), `max_memory` (an embedded
-interpreter needs 128–256 MiB) and `max_exchange_time` (calling a model
-takes seconds).
+These limits catch a broken layer; they don't police a slow one
+([safety](/addons/safety)). A layer that judges LLM traffic will usually
+raise `max_memory` (requests resend the whole conversation, and an embedded
+interpreter needs 128–256 MiB) and `first_byte_timeout` if it calls a model
+before answering. Bodies have no clock, so a long generation streams
+through whatever its length.
 
 `kind: service` addons take a different set of keys
 ([service layers](/addons/service-layers)).
@@ -67,7 +66,8 @@ service session.
   flow closed like a layer failure (`503`, `layer_error` with `kind:
   when:<code>`). It never skips the layer. On an observe layer the failure
   is logged like any observer failure, and the layer gets no copy.
-- A `tunnel` layer that `when` skipped is not in that WebSocket's byte path.
+- A layer that `when` skipped on a WebSocket's upgrade request is not in
+  that WebSocket's byte path.
 
 `sample`, for `mode: observe` only, is the share of matching exchanges the
 layer gets a copy of, in (0, 1]. It is drawn from the flow id, so it is the

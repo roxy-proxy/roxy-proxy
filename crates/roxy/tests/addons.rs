@@ -10,7 +10,6 @@ use support::{Harness, Opts, SECRET, h2_get};
 use tokio_tungstenite::tungstenite::Message;
 
 const TEST_LAYER: &[u8] = include_bytes!("../../roxy-wasm/tests/fixtures/test_layer.wasm");
-const TUNNEL_LAYER: &[u8] = include_bytes!("../../roxy-wasm/tests/fixtures/tunnel_layer.wasm");
 
 const ALLOW_UPSTREAM: &str = r#"
   - id: upstream
@@ -168,22 +167,64 @@ async fn a_trap_denies() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn budgets_are_enforced() {
+async fn limits_are_enforced() {
     let h = start(
-        "limits: { step_cpu: 20ms, fuel_per_step: 100_000_000_000, max_memory: 16mb, max_exchange_time: 2s }",
+        "limits: { max_memory: 16mb, first_byte_timeout: 500ms }",
         ALLOW_UPSTREAM,
     )
     .await;
     for (test, kind) in [
-        ("loop", "budget:step_cpu"),
+        ("loop", "budget:first_byte_timeout"),
         ("memory", "budget:max_memory"),
-        ("host-loop", "budget:max_exchange_time"),
+        ("host-loop", "budget:first_byte_timeout"),
     ] {
         let res = send(&h, test, "/x", "").await;
         assert_eq!(res.status(), 503, "{test}");
         let errs = h.wait_events("layer_error", 1).await;
         assert!(errs.iter().any(|e| e["kind"] == kind), "{test}: {errs:#?}");
     }
+    h.stop().await;
+}
+
+/// Bodies have no clock: a response that streams for several times the
+/// head deadline goes through a layer whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_stream_goes_through_whole() {
+    let h = start("limits: { first_byte_timeout: 300ms }", ALLOW_UPSTREAM).await;
+    let res = h
+        .client()
+        .get(h.https_url("/drip?n=6&ms=250"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body = res.text().await.unwrap();
+    assert_eq!(body, "chunk0;chunk1;chunk2;chunk3;chunk4;chunk5;");
+    h.stop().await;
+}
+
+/// A client that gives up frees the layer's instance: with one instance,
+/// the next exchange gets it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_giving_up_frees_the_instance() {
+    let h = start("limits: { max_instances: 1 }", ALLOW_UPSTREAM).await;
+    let mut res = h
+        .client()
+        .get(h.https_url("/drip?n=1000&ms=100"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(res.chunk().await.unwrap().is_some());
+    drop(res);
+    let next = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        h.client().get(h.https_url("/after")).send(),
+    )
+    .await
+    .expect("the instance was freed")
+    .unwrap();
+    assert_eq!(next.status(), 200);
     h.stop().await;
 }
 
@@ -209,7 +250,11 @@ async fn a_failure_after_the_head_cuts_the_body() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn observe_mode_cannot_block() {
-    let h = start("mode: observe\nlimits: { step_cpu: 20ms }", ALLOW_UPSTREAM).await;
+    let h = start(
+        "mode: observe\nlimits: { first_byte_timeout: 200ms }",
+        ALLOW_UPSTREAM,
+    )
+    .await;
     for test in ["trap", "deny", "loop", "rewrite"] {
         let res = send(&h, test, "/observed", "payload").await;
         assert_eq!(res.status(), 200, "{test}");
@@ -433,38 +478,19 @@ async fn websocket_through_a_layer_is_captured() {
     h.stop().await;
 }
 
-/// A layer without `tunnel` sees (and could refuse) the upgrade request,
-/// then is out of the byte path.
+/// A WebSocket is a long-lived exchange: the layer carries it in its
+/// bodies, both ways, and the rules' relay still sees every byte that
+/// leaves.
 #[tokio::test(flavor = "multi_thread")]
-async fn websocket_through_a_plain_layer() {
+async fn websocket_through_a_layer() {
     let h = start("", ALLOW_WS).await;
-    ws_echo(&h).await;
-    let close = h.wait_events("ws_close", 1).await;
-    assert!(close[0]["bytes_c2s"].as_u64().unwrap() > 100_000);
-    let ev = h.wait_events("request", 1).await;
-    assert_eq!(ev[0]["addons"], serde_json::json!(["t"]));
-    assert_eq!(ev[0]["terminal_rule"], "ws");
-    h.stop().await;
-}
-
-/// A layer that exports `tunnel` gets the raw streams after the `101`; the
-/// rules' relay still sees every byte that leaves.
-#[tokio::test(flavor = "multi_thread")]
-async fn websocket_through_a_tunnel_layer() {
-    let h = start_layer(TUNNEL_LAYER, "", ALLOW_WS).await;
     ws_echo(&h).await;
     let close = h.wait_events("ws_close", 1).await;
     assert!(close[0]["bytes_c2s"].as_u64().unwrap() > 100_000);
     assert!(close[0]["bytes_s2c"].as_u64().unwrap() > 100_000);
     let ev = h.wait_events("request", 1).await;
-    assert!(
-        ev[0]["tags"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t == "tunnel"),
-        "{ev:#?}"
-    );
+    assert_eq!(ev[0]["addons"], serde_json::json!(["t"]));
+    assert_eq!(ev[0]["terminal_rule"], "ws");
     h.stop().await;
 }
 

@@ -46,11 +46,10 @@ pub use mux::SUBPROTOCOL;
 pub struct ServiceSpec {
     /// The addon's endpoint the exchange streams through.
     pub endpoint: String,
-    /// From connecting, and again from sending the response head, until
-    /// the service's next head (or decision).
+    /// From asking for a stream, and again from sending the response
+    /// head, until the service's next head (or decision). Bodies have no
+    /// clock.
     pub first_byte_timeout: Duration,
-    /// The whole stream, from asking for it to the end of the last body.
-    pub max_exchange_time: Duration,
     /// Connections to the endpoint, at most.
     pub max_connections: usize,
     /// Streams on one connection, at most.
@@ -301,9 +300,8 @@ async fn run(
         return Err(ServiceError::Closed("no answers on an enforce stream".into()).into());
     };
     // Until the service has answered, an exchange that ends here (the
-    // client went away, a deadline, a failure below) resets the stream.
+    // client went away, a missed head, a failure below) resets the stream.
     let guard = Guard(Some(stream.clone()));
-    stream.deadline(start + svc.max_exchange_time);
 
     let (parts, body) = req.into_parts();
     let s = stream.clone();
@@ -389,7 +387,6 @@ pub(super) async fn observe(
             return Err(e);
         }
     };
-    stream.deadline(start + svc.max_exchange_time);
     let (parts, body) = req.into_parts();
     let sent = stream
         .pump(request_head(&parts, &body), body, Out::RequestEnd)
