@@ -13,6 +13,8 @@ COPY sentinel/requirements.txt sentinel/
 RUN pip install --no-cache-dir -r sentinel/requirements.txt
 COPY roxy_layer.py ./
 COPY sentinel/ sentinel/
+# SENTINEL_LOG_DIR, when set; a volume mounted here inherits the ownership.
+RUN mkdir /logs && chown 65532:65532 /logs
 
 USER 65532:65532
 ENV HOME=/tmp PYTHONUNBUFFERED=1 SENTINEL_LISTEN=0.0.0.0:9000

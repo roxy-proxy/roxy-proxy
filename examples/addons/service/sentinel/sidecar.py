@@ -26,6 +26,8 @@ Configuration (environment):
     SENTINEL_MONITOR_MODEL   the model `context.host.generate` uses (e.g. anthropic/claude-haiku-4-5)
     SENTINEL_LISTEN          host:port to listen on (default 127.0.0.1:9000)
     SENTINEL_TASK            the deployed agent's name, for `context.task`
+    SENTINEL_LOG_DIR         if set, also write an Inspect eval log there for
+                             `inspect view` (see inspect_log.py)
     SENTINEL_ON_REJECT       deny (default): the agent gets a 403 carrying the
                              decision's message; explain: an Anthropic response
                               is replaced by an assistant message saying what was
@@ -77,6 +79,8 @@ from inspect_sentinel._integration import HostContext, resolve_sentinel, run_sen
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from roxy_layer import Exchange, Request, Response, serve  # noqa: E402
+
+from inspect_log import InspectLog, InspectRecorder, Recorders  # noqa: E402
 
 log = logging.getLogger("sentinel-sidecar")
 
@@ -348,6 +352,10 @@ class Sidecar:
             raise ValueError(f"SENTINEL_ON_REJECT must be deny or explain, not {on_reject!r}")
         self.explain = on_reject == "explain"
         self.root = resolve_sentinel(sentinel)
+        log_dir = os.environ.get("SENTINEL_LOG_DIR")
+        self.inspect_log = (
+            InspectLog(log_dir, os.environ.get("SENTINEL_TASK", "roxy")) if log_dir else None
+        )
         self.host = SidecarHost()
         self.stores = Stores()
 
@@ -446,7 +454,7 @@ class Sidecar:
         call = Call(api, request, response, streamed)
         output = await call.output()
         tool_calls = output.message.tool_calls or []
-        if not tool_calls:
+        if not tool_calls and self.inspect_log is None:
             return None
         try:
             input = await call.input()
@@ -457,6 +465,12 @@ class Sidecar:
             log.warning("unreadable %s conversation history: %s", api, e)
             input = []
         conversation = call.conversation()
+        flow = ex.flow.get("roxy-flow-id")
+        if self.inspect_log is not None:
+            model = f"{api}/{call.response.get('model', 'unknown')}"
+            self.inspect_log.model_call(conversation, flow, model, input, output)
+        if not tool_calls:
+            return None
         first_user = next((m for m in input if m.role == "user"), None)
         context = Context(
             task=os.environ.get("SENTINEL_TASK", "roxy"),
@@ -471,7 +485,11 @@ class Sidecar:
         )
         host_context = HostContext(
             context=context,
-            recorder=JsonlRecorder(ex.flow.get("roxy-flow-id")),
+            recorder=(
+                Recorders(JsonlRecorder(flow), InspectRecorder(self.inspect_log))
+                if self.inspect_log is not None
+                else JsonlRecorder(flow)
+            ),
             store=self.stores.get(conversation),
         )
         modified = False
@@ -520,6 +538,9 @@ async def main() -> None:
         os.environ.get("SENTINEL_ON_REJECT", "deny"),
     )
     host, _, port = os.environ.get("SENTINEL_LISTEN", "127.0.0.1:9000").rpartition(":")
+    if sidecar.inspect_log is not None:
+        writer = asyncio.create_task(sidecar.inspect_log.run())  # noqa: F841 (held for its lifetime)
+        log.info("writing an Inspect log to %s", sidecar.inspect_log.path)
     async with serve(sidecar.handle, host, int(port)) as server:
         log.info("sentinel sidecar listening on %s:%s", host, port)
         await server.serve_forever()

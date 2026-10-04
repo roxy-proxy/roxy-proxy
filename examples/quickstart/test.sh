@@ -73,7 +73,17 @@ else
     ok "a direct request from the sidecar network fails"
 fi
 
-echo "Both keep a record:"
+echo "Both keep a record, and the viewer shows the sentinel's:"
+sleep 3   # the sentinel writes its Inspect log every 2s
+s=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:7575/)
+[ "$s" = 200 ] && ok "inspect view is up on 127.0.0.1:7575" || bad "inspect view answered $s"
+events=$(compose exec -T inspect-view python -c "
+from inspect_ai.log import list_eval_logs, read_eval_log
+log = read_eval_log(list_eval_logs('/logs')[0])
+print(sum(e.event == 'sentinel' and e.action == 'reject' for s in log.samples for e in s.events))
+" 2>&1)
+[ "$events" -ge 2 ] 2>/dev/null && ok "the Inspect log has the rejections ($events)" \
+    || bad "the Inspect log has no rejections: $events"
 compose logs --no-log-prefix roxy | grep -q '"terminal_rule":"_default"' \
     && ok "roxy's flow log has the deny" || bad "the deny is not in roxy's flow log"
 compose logs --no-log-prefix sentinel | grep -q '"event": "sentinel_report"' \
