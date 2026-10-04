@@ -7,9 +7,12 @@
 //! - [`server`]: [`Server`] (`start`, `local_addrs`, `reload`, `shutdown`),
 //!   connection caps, the atomically swapped policy snapshot.
 //! - [`listener`]: the [`Listener`] trait (the hook for transparent mode, issue #15) and
-//!   [`ExplicitListener`]; [`ClientConn`].
-//! - `conn`: the explicit-mode state machine (proxy port, CONNECT, sniff,
-//!   TLS termination, tunnels, `roxy.internal`, proxy auth).
+//!   [`TcpProxyListener`] (explicit and direct); [`ClientConn`].
+//! - `conn`: the connection state machines (proxy port, CONNECT, direct
+//!   listeners, sniff, TLS termination, tunnels, `roxy.internal`, proxy
+//!   auth).
+//! - `dns_server`: the DNS listener (UDP and TCP) that steers clients to
+//!   the direct listeners.
 //! - `pipeline`: the core's fixed request and response steps, the
 //!   `Verdict` they return (consumed exhaustively), the head decision and
 //!   its effects, the per-flow context.
@@ -47,6 +50,7 @@ mod ca_server;
 pub mod capture;
 pub mod config;
 mod conn;
+mod dns_server;
 mod exchange;
 pub mod flowlog;
 mod h2conn;
@@ -65,14 +69,15 @@ pub use addrlist::{AddressList, AddressLists, ListError};
 pub use auth::UserDb;
 pub use ca_server::PEM_CONTENT_TYPE;
 pub use capture::{CAPTURE_FILE, CaptureLog, CaptureOptions};
-pub use config::{ListenerSpec, PolicyUpdate, RuntimeConfig};
+pub use config::{ListenerKind, ListenerSpec, PolicyUpdate, RuntimeConfig};
 pub use conn::INTERNAL_HOST;
+pub use dns_server::DnsServerSpec;
 pub use flowlog::{
     BufferedSink, ClientInfo, DEFAULT_REDACTED_HEADERS, DecisionKind, DstInfo, FileSink, FlowEvent,
     FlowSink, MemorySink, MultiSink, REDACTED, Redactor, RequestInfo, ResponseInfo, Stage,
     StdoutSink, Timing, TlsInfo, WriterSink,
 };
-pub use listener::{ClientConn, ExplicitListener, Listener, ListenerInfo, ListenerMode};
+pub use listener::{ClientConn, Listener, ListenerInfo, ListenerMode, TcpProxyListener};
 pub use server::{Server, ServerHandle, StartError};
 pub use sources::{
     MetricSource, MetricSourceError, Sample, StateFull, StateSource, UnavailableMetrics,

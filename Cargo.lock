@@ -2577,6 +2577,7 @@ dependencies = [
  "ipnet",
  "proptest",
  "ring",
+ "roxy-dns",
  "roxy-http",
  "roxy-log",
  "roxy-rules",

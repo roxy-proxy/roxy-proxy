@@ -1,9 +1,10 @@
-//! Listeners and client connections (docs/http.md#explicit-proxy).
+//! Listeners and client connections (docs/http.md#explicit-proxy,
+//! docs/http.md#direct-listeners).
 //!
-//! [`Listener`] is the hook transparent mode (issue #15) will implement: it
-//! accepts a TCP stream and describes it as a [`ClientConn`]; the server
-//! then hands both to the pipeline for the listener's [`ListenerMode`].
-//! Only [`ExplicitListener`] exists in this build.
+//! A [`Listener`] accepts a TCP stream and describes it as a
+//! [`ClientConn`]; the server then hands both to the pipeline for the
+//! listener's [`ListenerMode`]. Transparent mode (issue #15) would be one
+//! more implementation.
 
 use std::future::Future;
 use std::io;
@@ -19,6 +20,13 @@ use ulid::Ulid;
 pub enum ListenerMode {
     /// `HTTP_PROXY` mode: absolute-form requests and CONNECT.
     Explicit,
+    /// Clients connect as if to the origin (DNS steering): the target comes
+    /// from the TLS SNI or the `Host` header.
+    Direct {
+        /// The port clients believe they are connecting to, which becomes
+        /// the target's port.
+        port: u16,
+    },
 }
 
 impl ListenerMode {
@@ -26,6 +34,7 @@ impl ListenerMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Explicit => "explicit",
+            Self::Direct { .. } => "direct",
         }
     }
 }
@@ -55,7 +64,7 @@ pub struct ClientConn {
     /// port each request authenticates on its own; inside a CONNECT tunnel
     /// the CONNECT's user applies.
     pub user: Option<String>,
-    /// Original destination (transparent mode only; always `None` here).
+    /// Original destination (transparent mode only; always `None` today).
     pub original_dst: Option<SocketAddr>,
 }
 
@@ -84,15 +93,15 @@ pub trait Listener: Send + Sync {
     fn accept(&self) -> AcceptFuture<'_>;
 }
 
-/// The explicit-proxy listener.
+/// A plain TCP listener: explicit or direct, by its [`ListenerMode`].
 #[derive(Debug)]
-pub struct ExplicitListener {
+pub struct TcpProxyListener {
     info: Arc<ListenerInfo>,
     tcp: TcpListener,
 }
 
-impl ExplicitListener {
-    /// Binds `addr`.
+impl TcpProxyListener {
+    /// Binds an explicit-proxy listener on `addr`.
     pub async fn bind(name: &str, addr: SocketAddr, auth_required: bool) -> io::Result<Self> {
         let tcp = TcpListener::bind(addr).await?;
         Ok(Self {
@@ -104,9 +113,31 @@ impl ExplicitListener {
             tcp,
         })
     }
+
+    /// Binds a direct listener on `addr`. `target_port` defaults to the
+    /// bound port.
+    pub async fn bind_direct(
+        name: &str,
+        addr: SocketAddr,
+        target_port: Option<u16>,
+    ) -> io::Result<Self> {
+        let tcp = TcpListener::bind(addr).await?;
+        let port = match target_port {
+            Some(p) => p,
+            None => tcp.local_addr()?.port(),
+        };
+        Ok(Self {
+            info: Arc::new(ListenerInfo {
+                name: name.to_owned(),
+                mode: ListenerMode::Direct { port },
+                auth_required: false,
+            }),
+            tcp,
+        })
+    }
 }
 
-impl Listener for ExplicitListener {
+impl Listener for TcpProxyListener {
     fn info(&self) -> &Arc<ListenerInfo> {
         &self.info
     }

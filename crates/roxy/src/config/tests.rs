@@ -336,6 +336,61 @@ fn transparent_listener_is_deferred() {
 }
 
 #[test]
+fn direct_listeners_and_dns_parse() {
+    let cfg = parse(
+        "version: 1\nlisteners:\n  - { name: https, mode: direct, bind: 0.0.0.0:8443, target_port: 443 }\n  \
+         - { name: http, mode: direct, bind: 0.0.0.0:80 }\n\
+         dns:\n  bind: 0.0.0.0:53\n  answer: { ipv4: 10.16.0.2, ipv6: \"fd00:16::2\" }\n  ttl: 5m\n  \
+         records:\n    db.sandbox.internal: [10.16.0.9]\n\
+         log: { flow: { dns_events: true } }\n",
+    );
+    cfg.validate().unwrap();
+    assert_eq!(cfg.listeners[0].mode, ListenerMode::Direct);
+    assert_eq!(cfg.listeners[0].target_port, Some(443));
+    assert_eq!(cfg.listeners[1].target_port, None);
+    let dns = cfg.dns.as_ref().unwrap();
+    assert_eq!(dns.answer.ipv4, Some(Ipv4Addr::new(10, 16, 0, 2)));
+    assert_eq!(dns.ttl, Duration::from_secs(300));
+    assert_eq!(
+        dns.records["db.sandbox.internal"],
+        vec![IpAddr::from([10, 16, 0, 9])]
+    );
+    assert!(cfg.log.flow.dns_events);
+    // The TTL defaults to a minute.
+    let cfg = parse(&format!(
+        "{BASE}dns: {{ bind: 127.0.0.1:53, answer: {{ ipv6: \"::1\" }} }}\n"
+    ));
+    cfg.validate().unwrap();
+    assert_eq!(cfg.dns.unwrap().ttl, Duration::from_secs(60));
+}
+
+#[test]
+fn direct_and_dns_diagnostics() {
+    let d = diagnostics(
+        "version: 1\nlisteners:\n  - { name: d, mode: direct, bind: 127.0.0.1:1, target_port: 0, \
+         auth: { basic: { users_file: /u } }, upstream_target: resolve }\n  \
+         - { name: e, bind: 127.0.0.1:2, target_port: 80 }\n\
+         dns:\n  bind: 127.0.0.1:2\n  answer: {}\n  records:\n    \"bad name\": [10.0.0.1]\n    \
+         empty.test: []\n    many.test: [10.0.0.1, 10.0.0.2, 10.0.0.3, 10.0.0.4, 10.0.0.5, 10.0.0.6, 10.0.0.7, 10.0.0.8, 10.0.0.9]\n",
+    );
+    let paths: Vec<&str> = d.iter().map(|d| d.path.as_str()).collect();
+    for want in [
+        "listeners[0].target_port",
+        "listeners[0].auth",
+        "listeners[0].upstream_target",
+        "listeners[1].target_port",
+        "dns.bind",
+        "dns.answer",
+        "dns.records.bad name",
+        "dns.records.empty.test",
+        "dns.records.many.test",
+    ] {
+        assert!(paths.contains(&want), "{want} missing from {d:?}");
+    }
+    assert_eq!(d.len(), 9, "{d:?}");
+}
+
+#[test]
 fn misc_diagnostics() {
     let d = diagnostics(
         "version: 2\nlisteners: []\nca_server: { bind: 127.0.0.1:1 }\n\

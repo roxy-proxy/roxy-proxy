@@ -11,12 +11,13 @@ use std::time::Duration;
 use anyhow::{Context as _, anyhow};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use roxy_proxy::{
-    CaptureLog, FileSink, FlowEvent, FlowSink, ListenerSpec, MetricSource, PolicyUpdate, Redactor,
-    RuntimeConfig, Server, ServerHandle, StateSource, StdoutSink, UserDb,
+    CaptureLog, DnsServerSpec, FileSink, FlowEvent, FlowSink, ListenerKind, ListenerSpec,
+    MetricSource, PolicyUpdate, Redactor, RuntimeConfig, Server, ServerHandle, StateSource,
+    StdoutSink, UserDb,
 };
 use roxy_tls::{Ca, CaError, LeafMinter};
 
-use crate::config::{Action, Config};
+use crate::config::{Action, Config, ListenerMode};
 use crate::secrets::Secrets;
 
 /// Debounce for config file events.
@@ -225,23 +226,61 @@ impl std::fmt::Debug for Reloader {
     }
 }
 
+fn listener_specs(config: &Config) -> Vec<ListenerSpec> {
+    config
+        .listeners
+        .iter()
+        .map(|l| ListenerSpec {
+            name: l.name.clone(),
+            bind: l.bind,
+            auth_required: l.auth.is_some(),
+            kind: match l.mode {
+                ListenerMode::Direct => ListenerKind::Direct {
+                    target_port: l.target_port,
+                },
+                // Validation refuses transparent listeners.
+                ListenerMode::Explicit | ListenerMode::Transparent => ListenerKind::Explicit,
+            },
+        })
+        .collect()
+}
+
+fn dns_spec(dns: &crate::config::DnsListener, log_queries: bool) -> DnsServerSpec {
+    DnsServerSpec {
+        bind: dns.bind,
+        ipv4: dns.answer.ipv4,
+        ipv6: dns.answer.ipv6,
+        // Validation caps it at u32::MAX.
+        ttl: u32::try_from(dns.ttl.as_secs()).unwrap_or(u32::MAX),
+        records: dns
+            .records
+            .iter()
+            .map(|(name, ips)| (name.trim_end_matches('.').to_ascii_lowercase(), ips.clone()))
+            .collect(),
+        log_queries,
+    }
+}
+
 fn restart_required(old: &Config, new: &Config) -> Vec<&'static str> {
     let mut out = Vec::new();
     let d = |a: &dyn std::fmt::Debug, b: &dyn std::fmt::Debug| format!("{a:?}") != format!("{b:?}");
     if d(
         &old.listeners
             .iter()
-            .map(|l| (&l.name, l.bind, l.auth.is_some()))
+            .map(|l| (&l.name, l.bind, l.auth.is_some(), l.mode, l.target_port))
             .collect::<Vec<_>>(),
         &new.listeners
             .iter()
-            .map(|l| (&l.name, l.bind, l.auth.is_some()))
+            .map(|l| (&l.name, l.bind, l.auth.is_some(), l.mode, l.target_port))
             .collect::<Vec<_>>(),
     ) {
         out.push("listeners");
     }
     if d(&old.ca_server, &new.ca_server) {
         out.push("ca_server");
+    }
+    if old.dns != new.dns {
+        out.push("dns");
     }
     if d(&old.tls, &new.tls) {
         out.push("tls");
@@ -530,16 +569,12 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
         addons: config.addons.len(),
     });
     let rt = RuntimeConfig {
-        listeners: config
-            .listeners
-            .iter()
-            .map(|l| ListenerSpec {
-                name: l.name.clone(),
-                bind: l.bind,
-                auth_required: l.auth.is_some(),
-            })
-            .collect(),
+        listeners: listener_specs(&config),
         ca_server: config.ca_server.as_ref().map(|c| c.bind),
+        dns: config
+            .dns
+            .as_ref()
+            .map(|d| dns_spec(d, config.log.flow.dns_events)),
         ca,
         minter,
         require_sni_match: config.tls.require_sni_match,
