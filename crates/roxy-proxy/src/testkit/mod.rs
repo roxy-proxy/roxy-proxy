@@ -52,7 +52,7 @@ use crate::addons::{AddonSpec, StateLimits};
 use crate::config::{PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{MemorySink, Redactor};
 use crate::listener::{ClientConn, ListenerInfo, ListenerMode};
-use crate::sources::{UnavailableMetrics, UnavailableState};
+use crate::sources::{MetricSource, StateSource, UnavailableMetrics, UnavailableState};
 use crate::upstream::{TestDial, UpstreamSettings};
 
 /// The scripted upstream's public address (`up.test`).
@@ -146,6 +146,8 @@ pub(crate) struct KitBuilder {
     addons: Vec<AddonDef>,
     limits: Limits,
     flags: HttpFlags,
+    metrics: Arc<dyn MetricSource>,
+    state: Arc<dyn StateSource>,
 }
 
 impl KitBuilder {
@@ -170,6 +172,20 @@ impl KitBuilder {
     #[must_use]
     pub(crate) fn flags(mut self, f: impl FnOnce(&mut HttpFlags)) -> Self {
         f(&mut self.flags);
+        self
+    }
+
+    /// The metric store (default: none, every read unavailable).
+    #[must_use]
+    pub(crate) fn metrics(mut self, m: Arc<dyn MetricSource>) -> Self {
+        self.metrics = m;
+        self
+    }
+
+    /// The state store (default: none, every write fails).
+    #[must_use]
+    pub(crate) fn state(mut self, s: Arc<dyn StateSource>) -> Self {
+        self.state = s;
         self
     }
 
@@ -237,8 +253,8 @@ impl KitBuilder {
             ws_message_every: 0,
             sink: sink.clone(),
             capture: None,
-            metrics: Arc::new(UnavailableMetrics),
-            state: Arc::new(UnavailableState),
+            metrics: self.metrics,
+            state: self.state,
             policy: PolicyUpdate {
                 policy,
                 secrets: HashMap::new(),
@@ -280,6 +296,8 @@ impl Kit {
             addons: Vec::new(),
             limits: Limits::default(),
             flags: HttpFlags::default(),
+            metrics: Arc::new(UnavailableMetrics),
+            state: Arc::new(UnavailableState),
         }
     }
 

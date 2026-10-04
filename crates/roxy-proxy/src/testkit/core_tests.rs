@@ -185,3 +185,107 @@ async fn plaintext_in_connect_in_pieces_is_still_http() {
     assert!(out.starts_with("HTTP/1.1 200"), "{out}");
     assert_eq!(kit.upstream.wait_seen(1).await[0].addr.port(), 80);
 }
+
+/// Records every metric sample and keeps state in memory.
+#[derive(Default)]
+struct Recording {
+    samples: std::sync::Mutex<Vec<crate::sources::Sample>>,
+    state: std::sync::Mutex<std::collections::HashMap<String, String>>,
+}
+
+impl crate::sources::MetricSource for Recording {
+    fn get(
+        &self,
+        _id: &str,
+        _view: &dyn roxy_rules::FlowView,
+    ) -> Result<i64, crate::sources::MetricSourceError> {
+        Ok(0)
+    }
+
+    fn record(
+        &self,
+        _view: &dyn roxy_rules::FlowView,
+        sample: &crate::sources::Sample,
+    ) -> Result<(), crate::sources::MetricSourceError> {
+        self.samples.lock().unwrap().push(*sample);
+        Ok(())
+    }
+}
+
+impl crate::sources::StateSource for Recording {
+    fn get(&self, key: &str) -> Option<String> {
+        self.state.lock().unwrap().get(key).cloned()
+    }
+
+    fn set(
+        &self,
+        key: &str,
+        value: &str,
+        _ttl: Option<std::time::Duration>,
+    ) -> Result<(), crate::sources::StateFull> {
+        self.state
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), value.to_owned());
+        Ok(())
+    }
+}
+
+async fn recording_kit(rules: &str) -> (Kit, std::sync::Arc<Recording>) {
+    let rec = std::sync::Arc::new(Recording::default());
+    let kit = Kit::builder()
+        .rules(rules)
+        .metrics(rec.clone())
+        .state(rec.clone())
+        .start()
+        .await;
+    (kit, rec)
+}
+
+/// A refused head decision still applies the `log` and `set_state` of the
+/// rules that matched, and counts as denied.
+#[tokio::test]
+async fn a_head_deny_still_logs_and_writes_state() {
+    let (kit, rec) = recording_kit(
+        r#"
+- id: no-admin
+  when: path starts_with "/admin"
+  then: [{ log: { level: warn, message: admin blocked } }, { set_state: { key: seen, value: "1" } }, deny]
+- id: up
+  when: host == "up.test"
+  then: allow
+"#,
+    )
+    .await;
+    let a = kit.h1().await.call("GET", "/admin", &[], b"").await;
+    assert_eq!(a.status, 403, "{a:?}");
+    let log = kit.events("log", 1).await;
+    assert_eq!(log[0]["message"], "admin blocked", "{log:#?}");
+    assert_eq!(
+        rec.state.lock().unwrap().get("seen").map(String::as_str),
+        Some("1")
+    );
+    let samples = rec.samples.lock().unwrap().clone();
+    assert!(samples[0].head && samples[0].denied, "{samples:?}");
+}
+
+/// An allowed request whose change fails is refused, and its head sample
+/// counts it as denied, not allowed.
+#[tokio::test]
+async fn a_failing_effect_counts_as_denied() {
+    let (kit, rec) = recording_kit(
+        r#"
+- id: up
+  when: host == "up.test"
+  then: [{ rewrite_path: { match: "/(.*)", to: "/../$1" } }, allow]
+"#,
+    )
+    .await;
+    let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+    assert_eq!(a.status, 503, "{a:?}");
+    assert_eq!(a.json()["rule"], "_fail_closed");
+    assert!(kit.upstream.seen().is_empty());
+    let samples = rec.samples.lock().unwrap().clone();
+    assert_eq!(samples.len(), 1, "{samples:?}");
+    assert!(samples[0].head && samples[0].denied, "{samples:?}");
+}

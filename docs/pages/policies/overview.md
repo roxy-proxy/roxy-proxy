@@ -58,7 +58,10 @@ runs follows from what it reads.
 5. **Order matters for effects, not decisions.** Rules are evaluated top to
    bottom, so a `tag` set by one rule is visible to the rules below it. If
    the request is allowed, the effects of every matching rule apply in list
-   order; if two set the same header, the later wins. Allow options
+   order; if two set the same header, the later wins. If it is denied, or a
+   change to it fails (which denies it with `_fail_closed`), the `log` and
+   `set_state` effects of the matching rules still apply, and the request's
+   metric samples count it as denied. Allow options
    (`upgrade`, `private_ok`) come from the first matching allow only. The
    flow log names the first matching deny (or allow) as `terminal_rule`.
 
