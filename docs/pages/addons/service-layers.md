@@ -160,9 +160,9 @@ that stream. Control messages are not counted.
   (`observer_lagged`). Waiting for credit is falling behind, so a service
   that wants whole copies of large bodies grants extra credit as an observe
   stream opens (`roxy_layer.py` grants 16 MiB). Body bytes the service
-  sends on an observe stream are discarded and never credited back: it
-  may send at most the stream's window of them, and more is a protocol
-  violation, as on any stream.
+  sends on an observe stream are discarded, and credited back in steps of
+  64 KiB as they are, so the service never waits on its own answers;
+  sending past its credit is a protocol violation, as on any stream.
 - **WebSocket upgrades.** The service sees the upgrade request; a `101`
   passes straight back, roxy resets the stream, and the WebSocket's bytes
   do not go through it.

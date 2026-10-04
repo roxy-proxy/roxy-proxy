@@ -47,6 +47,11 @@ pub(super) const WINDOW: u64 = 256 * 1024;
 /// Largest control message or body frame accepted from a service.
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
+/// Bytes discarded from an observe stream before they are credited back
+/// in one message, so the credit queue holds a few messages per stream
+/// however small the service's frames.
+const OBSERVE_GRANT: u64 = WINDOW / 4;
+
 /// Largest body frame roxy sends, so streams share the socket fairly.
 const MAX_BODY_FRAME: usize = 64 * 1024;
 
@@ -280,6 +285,8 @@ struct StreamState {
     feeding: Option<Feeding>,
     /// Body bytes received and not yet credited back.
     unacked: u64,
+    /// Observe mode: bytes discarded since the last credit went back.
+    discarded: u64,
     /// What roxy may still send: granted by the service.
     credit: u64,
     /// Why an observe stream failed, for its driver to log.
@@ -518,9 +525,10 @@ impl Stream {
     }
 
     /// Body bytes from the service. They count against the stream's
-    /// window in either mode; an observe stream's are discarded and never
-    /// credited back, so a service cannot queue credit without bound by
-    /// writing to a stream nobody reads.
+    /// window in either mode. An observe stream's are discarded and
+    /// credited back as they go, in steps: the service never waits on
+    /// what it sends, and since it may only send what roxy has credited,
+    /// the credit waiting for a stalled socket stays within the window.
     fn bytes(self: &Arc<Self>, b: &[u8]) {
         if b.is_empty() {
             return;
@@ -543,10 +551,16 @@ impl Stream {
             );
         }
         s.unacked += n;
-        drop(s);
         let Some(inbox) = inbox else {
-            return;
+            s.discarded += n;
+            if s.discarded < OBSERVE_GRANT {
+                return;
+            }
+            let granted = std::mem::take(&mut s.discarded);
+            drop(s);
+            return self.grant(granted);
         };
+        drop(s);
         let mut q = lock(&inbox.q);
         if q.dropped {
             drop(q);

@@ -5,8 +5,11 @@
 //! * `/svc/pass`: a conforming pass-through: every head, body byte and
 //!   end roxy sends comes straight back on the same stream, within the
 //!   credit roxy grants;
-//! * `/svc/flood`: sends [`FLOOD_BYTES`] of body on each stream as it
-//!   opens, with no head and without waiting for credit;
+//! * `/svc/talk`: sends [`TALK_BYTES`] of body on each stream as it
+//!   opens, with no head, within the credit roxy grants, and logs the
+//!   stream once all of it has gone;
+//! * `/svc/flood`: sends one body frame of [`FLOOD_BYTES`] on each stream
+//!   as it opens, with no head and without waiting for credit;
 //! * `/svc/stall`: completes the handshake and never reads.
 //!
 //! Every connection credits roxy back for the bytes it receives.
@@ -30,14 +33,19 @@ use crate::addons::service::SUBPROTOCOL;
 /// Each stream's starting credit, each way.
 const WINDOW: u64 = 256 * 1024;
 
-/// What `/svc/flood` sends on each stream: more than the window.
+/// What `/svc/flood` sends on each stream in one frame: more than the
+/// window.
 pub(crate) const FLOOD_BYTES: usize = 300 * 1024;
+
+/// What `/svc/talk` sends on each stream, on credit: several windows.
+pub(crate) const TALK_BYTES: usize = 4 * 256 * 1024;
 
 /// What the service saw, across connections.
 #[derive(Default)]
 pub(crate) struct ServiceLog {
     opens: Mutex<Vec<Value>>,
     resets: Mutex<Vec<(u32, String)>>,
+    talked: Mutex<Vec<u32>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -53,6 +61,18 @@ impl ServiceLog {
     /// Every reset roxy sent: (stream id, message).
     pub(crate) fn resets(&self) -> Vec<(u32, String)> {
         lock(&self.resets).clone()
+    }
+
+    /// Waits until `n` `/svc/talk` streams got all their bytes out.
+    pub(crate) async fn until_talked(&self, n: usize) {
+        let wait = async {
+            while lock(&self.talked).len() < n {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+            .await
+            .expect("the service gets its bytes out");
     }
 }
 
@@ -104,8 +124,27 @@ struct Sess {
     queue: VecDeque<Queued>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Pass,
+    Talk,
+    Flood,
+}
+
+impl Mode {
+    fn of(path: &str) -> Self {
+        if path.ends_with("/pass") {
+            Self::Pass
+        } else if path.ends_with("/talk") {
+            Self::Talk
+        } else {
+            Self::Flood
+        }
+    }
+}
+
 struct Conn {
-    pass: bool,
+    mode: Mode,
     tx: mpsc::UnboundedSender<Message>,
     streams: HashMap<u32, Sess>,
     log: Arc<ServiceLog>,
@@ -143,10 +182,15 @@ impl Conn {
                         queue: VecDeque::new(),
                     },
                 );
-                if !self.pass {
-                    for chunk in vec![0x5au8; FLOOD_BYTES].chunks(64 * 1024) {
-                        self.send(binary(id, chunk));
+                match self.mode {
+                    Mode::Pass => {}
+                    Mode::Talk => {
+                        let s = self.streams.get_mut(&id).expect("just opened");
+                        s.queue
+                            .push_back(Queued::Bytes(Bytes::from(vec![0x5au8; TALK_BYTES])));
+                        self.flush(id);
                     }
+                    Mode::Flood => self.send(binary(id, &vec![0x5au8; FLOOD_BYTES])),
                 }
             }
             "credit" => {
@@ -161,7 +205,7 @@ impl Conn {
                 lock(&self.log.resets).push((id, msg));
                 self.streams.remove(&id);
             }
-            _ if self.pass => {
+            _ if self.mode == Mode::Pass => {
                 v.as_object_mut().map(|o| o.remove("stream"));
                 if let Some(s) = self.streams.get_mut(&id) {
                     s.queue.push_back(Queued::Ctl(v));
@@ -177,7 +221,7 @@ impl Conn {
             return;
         }
         self.send(text(id, json!({"type": "credit", "bytes": data.len()})));
-        if self.pass
+        if self.mode == Mode::Pass
             && let Some(s) = self.streams.get_mut(&id)
         {
             s.queue
@@ -196,7 +240,10 @@ impl Conn {
             match q {
                 Queued::Ctl(v) => out.push(text(id, v)),
                 Queued::Bytes(mut b) => {
+                    // Frames of at most 32 KiB, so credit comes back in
+                    // steps smaller than roxy's.
                     let n = usize::try_from(s.credit).map_or(b.len(), |c| c.min(b.len()));
+                    let n = n.min(32 * 1024);
                     if n == 0 {
                         s.queue.push_front(Queued::Bytes(b));
                         break;
@@ -206,10 +253,12 @@ impl Conn {
                     out.push(binary(id, &part));
                     if !b.is_empty() {
                         s.queue.push_front(Queued::Bytes(b));
-                        break;
                     }
                 }
             }
+        }
+        if s.queue.is_empty() && self.mode == Mode::Talk {
+            lock(&self.log.talked).push(id);
         }
         for m in out {
             self.send(m);
@@ -236,7 +285,7 @@ where
         }
     });
     let mut conn = Conn {
-        pass: path.ends_with("/pass"),
+        mode: Mode::of(path),
         tx,
         streams: HashMap::new(),
         log,

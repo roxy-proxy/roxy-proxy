@@ -572,9 +572,34 @@ mod service {
         assert_eq!(kit.upstream.service().resets(), []);
     }
 
-    /// What a service sends on an observe stream is discarded, never
-    /// credited, and bounded by the window like any body: past it the
-    /// stream fails, and the exchange goes on.
+    /// What a service sends on an observe stream is discarded and credited
+    /// back as it goes, so a service that keeps to its credit can send
+    /// several windows' worth while the stream is open.
+    #[tokio::test]
+    async fn an_observe_stream_credits_back_what_it_discards() {
+        let kit = kit(RULES, vec![addon("o", "talk", true, |_| {})]).await;
+        let mut c = kit.h1().await;
+        let (mut tx, body) = streaming_body();
+        let req = c.request("POST", "/x", &[]).body(body).unwrap();
+        let answer = c.start(req);
+        kit.upstream.service().until_talked(1).await;
+        tx.send_data(Bytes::from_static(b"body")).await.unwrap();
+        tx.finish().await.unwrap();
+        let a: Answer = answer.await.unwrap().unwrap();
+        assert_eq!(a.status, 200, "{a:?}");
+        kit.request_event().await;
+        assert!(
+            kit.sink
+                .events()
+                .iter()
+                .all(|e| e["event"] != "layer_error"),
+            "{:#?}",
+            kit.sink.events()
+        );
+    }
+
+    /// Body bytes on an observe stream are bounded by the window like any
+    /// body: a frame past it fails the stream, and the exchange goes on.
     #[tokio::test]
     async fn an_observe_stream_flooded_past_its_window_fails_on_its_own() {
         let kit = kit(RULES, vec![addon("o", "flood", true, |_| {})]).await;
