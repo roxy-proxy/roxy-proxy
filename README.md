@@ -1,11 +1,10 @@
 # roxy
 
-roxy is a TLS-intercepting HTTP proxy built for streaming. Each exchange
-flows through the addons that match it, which can rewrite, answer or block it
-mid-stream, and a strict policy layer underneath decides what actually
-leaves. It is meant for
-workloads you don't fully trust: AI agents, CI jobs, sandboxes and
-third-party code.
+roxy is a programmable, TLS-intercepting HTTP proxy built for streaming.
+Each exchange flows through the addons that match it, which can rewrite,
+answer or block it mid-stream, and a strict policy layer underneath decides
+what actually leaves. It is meant for workloads you don't fully trust: AI
+agents, CI jobs, sandboxes and third-party code.
 
 - **Intercepting.** roxy terminates TLS with certificates from its own CA,
   parses every request into one canonical form and forwards exactly that, so

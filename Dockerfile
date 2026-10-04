@@ -71,7 +71,7 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c
 ARG VERSION=dev
 ARG REVISION=unknown
 LABEL org.opencontainers.image.title="roxy" \
-      org.opencontainers.image.description="TLS-intercepting HTTP proxy built for streaming" \
+      org.opencontainers.image.description="Programmable, TLS-intercepting HTTP proxy built for streaming" \
       org.opencontainers.image.source="https://github.com/roxy-proxy/roxy-proxy" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0" \
       org.opencontainers.image.version="${VERSION}" \
