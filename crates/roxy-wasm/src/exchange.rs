@@ -13,11 +13,16 @@
 //!   a trap after the last byte still fails it.
 //! * A body going *into* the guest counts bytes against
 //!   `max_buffered_body_bytes`.
+//! * The request body passed to `next` that the guest leaves unfinished is
+//!   always cut. It fails the exchange only if the guest is still waiting on
+//!   `next`'s response: a guest that dropped the response future (or already
+//!   has the response) has abandoned the forwarded request, and may answer
+//!   itself. See [`ExchangeShared::cut_next`].
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
@@ -60,6 +65,8 @@ pub(crate) struct ExchangeShared {
     status: watch::Sender<Status>,
     meters: [Meter; 2],
     max_buffered: u64,
+    /// Why the request body passed to `next` was cut, if it was.
+    next_cut: OnceLock<String>,
 }
 
 impl ExchangeShared {
@@ -68,7 +75,32 @@ impl ExchangeShared {
             status: watch::Sender::new(Status::default()),
             meters: [Meter::default(), Meter::default()],
             max_buffered,
+            next_cut: OnceLock::new(),
         })
+    }
+
+    /// The request body passed to `next` was cut. The forwarded body never
+    /// ends cleanly either way; whether the layer failed is decided when
+    /// `next` resolves ([`Self::check_next`]). A guest that dropped the
+    /// response future never sees it resolve: its task is aborted, so the
+    /// cut is an abandonment and the layer's own answer stands.
+    pub(crate) fn cut_next(&self, msg: String) {
+        let _ = self.next_cut.set(msg);
+    }
+
+    /// Called as `next` resolves, before the guest can see its result.
+    /// A cut before this point happened while the guest was still waiting
+    /// on the response: the layer failed. A cut after it (the guest has the
+    /// response, or abandoned it) is not a failure.
+    pub(crate) fn check_next(&self) -> Result<(), LayerError> {
+        match self.next_cut.get() {
+            Some(msg) => {
+                let err = LayerError::InvalidRequest(msg.clone());
+                self.fail(err.clone());
+                Err(err)
+            }
+            None => Ok(()),
+        }
     }
 
     /// Records a failure. The first one wins; failures after the exchange
@@ -283,6 +315,9 @@ pub(crate) struct FromGuest {
     shared: Arc<ExchangeShared>,
     /// Count consumed bytes against this direction's buffered budget.
     meter: Option<Dir>,
+    /// The request body passed to `next`: an inner error is a cut, settled
+    /// by [`ExchangeShared::check_next`], not a failure here.
+    next: bool,
     /// Hold the end of the body until the exchange settles.
     hold_end: bool,
     settled: Option<Settled>,
@@ -293,9 +328,14 @@ pub(crate) struct FromGuest {
 }
 
 impl FromGuest {
-    /// The request body the guest passed to `next` (or an endpoint).
-    pub(crate) fn request(inner: GuestBody, shared: Arc<ExchangeShared>, meter: bool) -> Body {
-        Self::build(inner, shared, meter.then_some(Dir::Request), false, None)
+    /// The request body the guest passed to `next`.
+    pub(crate) fn next_request(inner: GuestBody, shared: Arc<ExchangeShared>) -> Body {
+        Self::build(inner, shared, Some(Dir::Request), true, false, None)
+    }
+
+    /// The request body the guest passed to an endpoint.
+    pub(crate) fn endpoint_request(inner: GuestBody, shared: Arc<ExchangeShared>) -> Body {
+        Self::build(inner, shared, None, false, false, None)
     }
 
     /// The response body the guest answered with.
@@ -304,13 +344,21 @@ impl FromGuest {
         shared: Arc<ExchangeShared>,
         cancel: Arc<CancelGuard>,
     ) -> Body {
-        Self::build(inner, shared, Some(Dir::Response), true, Some(cancel))
+        Self::build(
+            inner,
+            shared,
+            Some(Dir::Response),
+            false,
+            true,
+            Some(cancel),
+        )
     }
 
     fn build(
         inner: GuestBody,
         shared: Arc<ExchangeShared>,
         meter: Option<Dir>,
+        next: bool,
         hold_end: bool,
         cancel: Option<Arc<CancelGuard>>,
     ) -> Body {
@@ -319,6 +367,7 @@ impl FromGuest {
             inner,
             shared,
             meter,
+            next,
             hold_end,
             settled: Some(settled),
             settled_ok: false,
@@ -360,10 +409,14 @@ impl HttpBody for FromGuest {
                 }
                 Poll::Ready(Some(Err(e))) => {
                     let msg = format!("body stream failed: {e}");
-                    this.shared.fail(match this.meter {
-                        Some(Dir::Response) => LayerError::InvalidResponse(msg),
-                        _ => LayerError::InvalidRequest(msg),
-                    });
+                    if this.next {
+                        this.shared.cut_next(msg);
+                    } else {
+                        this.shared.fail(match this.meter {
+                            Some(Dir::Response) => LayerError::InvalidResponse(msg),
+                            _ => LayerError::InvalidRequest(msg),
+                        });
+                    }
                     return this.fail_frame();
                 }
                 Poll::Ready(None) => {

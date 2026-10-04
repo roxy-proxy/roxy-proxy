@@ -326,6 +326,55 @@ async fn invalid_next_request_fails_closed() {
     assert_eq!(host.next_calls.load(Ordering::SeqCst), 0);
 }
 
+/// A request body passed to `next` and left unfinished while the guest is
+/// still waiting on the response fails the exchange, whatever the guest
+/// answers next.
+#[tokio::test]
+async fn unfinished_next_body_while_awaiting_fails_closed() {
+    let rt = runtime();
+    let layer = load(&rt, config()).await;
+    let host = Mock::new(NextMode::Upload);
+    let err = exchange(
+        &layer,
+        host.clone(),
+        request("cut-then-await", Body::from_bytes("partial")),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, LayerError::InvalidRequest(_)), "{err:?}");
+    assert_eq!(host.next_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(host.upload_ended().await, Err(BodyError::Stopped));
+}
+
+/// A guest that drops `next`'s response future, then the unfinished body,
+/// has abandoned the forwarded request: its own answer stands, and the
+/// forwarded body is cut. The host goes on reading that body after the
+/// guest dropped the future, as an upstream connection does; whether it
+/// sees the cut before the guest's answer goes out is a race, so this runs
+/// a few times.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unfinished_next_body_after_dropping_the_future_is_not_a_failure() {
+    let rt = runtime();
+    let layer = load(&rt, config()).await;
+    for _ in 0..50 {
+        let host = Mock::new(NextMode::Upload);
+        let (mut client_tx, client_body) = Body::channel(u64::MAX, None);
+        let handle = tokio::spawn({
+            let layer = layer.clone();
+            let host = host.clone();
+            async move { exchange(&layer, host, request("next-then-answer", client_body)).await }
+        });
+        // The guest waits for this before it abandons `next`, so the host
+        // has the request by then.
+        host.entered.notified().await;
+        client_tx.send_data(Bytes::from("partial")).await.unwrap();
+        let (status, body) = handle.await.unwrap().unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "answered by  after forwarding 7 bytes");
+        assert_eq!(host.upload_ended().await, Err(BodyError::Stopped));
+    }
+}
+
 async fn cap_test(layer: &Layer, host: Arc<Mock>, cap: &str) -> Result<String, LayerError> {
     let mut req = request("caps", Body::empty());
     req.headers_mut().insert("x-cap", cap.parse().unwrap());

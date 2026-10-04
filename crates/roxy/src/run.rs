@@ -58,13 +58,6 @@ pub fn unsupported(config: &Config, caps: Capabilities) -> Vec<String> {
     if !caps.state_store && actions().any(|a| matches!(a, Action::SetState(_))) {
         out.push("`set_state` needs a state store, which is not in this build".into());
     }
-    if config.compile_policy().is_ok_and(|p| p.reads_ws()) {
-        out.push(
-            "WebSocket message rules (`ws.*`) are not in this build (issue #14); byte \
-             budgets on WebSockets work through `request_bytes` / `response_bytes` metrics"
-                .into(),
-        );
-    }
     out
 }
 
@@ -555,6 +548,7 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
         max_connections: config.limits.max_connections,
         max_connections_per_client: config.limits.max_connections_per_client,
         connection_events: config.log.flow.connection_events,
+        ws_message_every: config.log.flow.ws_message_every,
         sink,
         capture: build_capture(&config)?,
         metrics: metric_source,
@@ -678,15 +672,16 @@ rules:
     }
 
     #[test]
-    fn websocket_message_rules_are_refused() {
+    fn websocket_message_rules_are_supported() {
         let c = cfg(
             "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:3128 }]\nrules:\n  - id: w\n    \
              when: ws.size > 1mb\n    then: deny\n",
         );
-        let bad = unsupported(&c, Capabilities::default()).join("\n");
-        assert!(bad.contains("`ws.*`"), "{bad}");
-        // `roxy check` still accepts it.
         c.validate().unwrap();
+        assert_eq!(
+            unsupported(&c, Capabilities::default()),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

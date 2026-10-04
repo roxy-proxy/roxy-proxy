@@ -22,6 +22,7 @@ http-body = "1.1.0"
 http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1.21", features = ["client-legacy", "tokio", "http1", "http2"] }
+ring.workspace = true
 ipnet.workspace = true
 roxy-http.workspace = true
 roxy-log.workspace = true

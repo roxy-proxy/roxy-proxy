@@ -121,6 +121,11 @@ pub struct UpState {
     pub seen: Mutex<Vec<Seen>>,
     /// Signalled when `/stream-probe` receives its first body bytes.
     pub probe: Notify,
+    /// Upgrade request headers the WebSocket server saw, one list per
+    /// connection.
+    pub ws_upgrades: Mutex<Vec<Vec<(String, String)>>>,
+    /// Data messages the WebSocket server received.
+    pub ws_received: Mutex<Vec<Vec<u8>>>,
 }
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
@@ -242,6 +247,14 @@ impl Upstream {
     pub fn seen(&self) -> Vec<Seen> {
         self.state.seen.lock().unwrap().clone()
     }
+
+    pub fn ws_upgrades(&self) -> Vec<Vec<(String, String)>> {
+        self.state.ws_upgrades.lock().unwrap().clone()
+    }
+
+    pub fn ws_received(&self) -> Vec<Vec<u8>> {
+        self.state.ws_received.lock().unwrap().clone()
+    }
 }
 
 async fn serve_http<IO>(io: IO, st: Arc<UpState>)
@@ -296,17 +309,30 @@ pub async fn start_upstream(ca: &TestCa) -> Upstream {
         }
     });
     let acceptor = TlsAcceptor::from(ca.ws_server.clone());
+    let s = st.clone();
     tokio::spawn(async move {
         loop {
             let Ok((tcp, _)) = ws.accept().await else {
                 return;
             };
             let acceptor = acceptor.clone();
+            let s = s.clone();
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(tcp).await else {
                     return;
                 };
-                let Ok(mut ws) = tokio_tungstenite::accept_async(tls).await else {
+                #[allow(clippy::result_large_err)] // tungstenite's callback type
+                let record = |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                              res| {
+                    let headers = req
+                        .headers()
+                        .iter()
+                        .map(|(n, v)| (n.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
+                        .collect();
+                    s.ws_upgrades.lock().unwrap().push(headers);
+                    Ok(res)
+                };
+                let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(tls, record).await else {
                     return;
                 };
                 while let Some(Ok(msg)) = ws.next().await {
@@ -314,8 +340,14 @@ pub async fn start_upstream(ca: &TestCa) -> Upstream {
                         let _ = ws.close(None).await;
                         break;
                     }
-                    if (msg.is_text() || msg.is_binary()) && ws.send(msg).await.is_err() {
-                        break;
+                    if msg.is_text() || msg.is_binary() {
+                        s.ws_received
+                            .lock()
+                            .unwrap()
+                            .push(msg.clone().into_data().to_vec());
+                        if ws.send(msg).await.is_err() {
+                            break;
+                        }
                     }
                 }
             });
@@ -340,6 +372,8 @@ pub struct Opts<'a> {
     pub extra: &'a str,
     /// Extra lines under `upstream:` (e.g. `deny_lists: [x]`).
     pub upstream: &'a str,
+    /// Extra lines under `log.flow:`.
+    pub flow_log: &'a str,
     /// A metric store to plug in.
     pub metrics: Option<Arc<dyn roxy_proxy::MetricSource>>,
     /// Hold the flow sink "behind" (not ready) while the gate is closed.
@@ -479,7 +513,7 @@ secrets:
 log:
   flow:
     connection_events: true
-{capture}{extra}rules:
+{flow_log}{capture}{extra}rules:
 {rules}"#,
             dir = dir.display(),
             http = indent(opts.http, 2),
@@ -490,6 +524,7 @@ log:
                 "  response_header_timeout: 2s\n"
             },
             upstream = indent(opts.upstream, 2),
+            flow_log = indent(opts.flow_log, 4),
             extra = opts.extra,
             capture = opts.capture.map_or_else(String::new, |c| format!(
                 "  capture:\n{}capture_dir: {}\n",

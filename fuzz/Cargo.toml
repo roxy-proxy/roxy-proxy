@@ -51,6 +51,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "ws_frame"
+path = "fuzz_targets/ws_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "url"
 path = "fuzz_targets/url.rs"
 test = false

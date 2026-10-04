@@ -513,8 +513,8 @@ impl Policy {
         self.byte_metrics
     }
 
-    /// Whether any rule reads `ws.*` (the message codec is not in this
-    /// build, so `roxy run` refuses such a policy).
+    /// Whether any rule reads `ws.*`: the proxy then decodes and checks
+    /// every WebSocket message (docs/websockets.md#message-rules).
     pub fn reads_ws(&self) -> bool {
         self.rules.iter().any(|r| r.fields.intersects(Reads::WS))
     }

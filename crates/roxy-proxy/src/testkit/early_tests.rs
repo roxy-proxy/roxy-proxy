@@ -96,7 +96,6 @@ async fn h2_the_upstream_answering_mid_upload_reaches_the_client() {
 }
 
 #[tokio::test]
-#[ignore = "#38: the relaying layer abandoning `next` can fail it after the head, cutting the answer"]
 async fn the_upstream_answering_mid_upload_reaches_the_client_through_a_relaying_layer() {
     upstream_answers_early(&["a"], false).await;
 }
@@ -170,7 +169,6 @@ async fn an_inner_layer_answers_before_next_mid_upload_through_the_outer_one() {
 // ---- a layer answering after `next` ---------------------------------------------
 
 #[tokio::test]
-#[ignore = "#38: the layer abandoning `next` races with its own answer and can fail closed (503)"]
 async fn h1_a_layer_answers_after_next_mid_upload() {
     let kit = stack(&["a"]).await;
     let mut c = kit.h1().await;
@@ -195,7 +193,6 @@ async fn h1_a_layer_answers_after_next_mid_upload() {
 }
 
 #[tokio::test]
-#[ignore = "#38: the layer abandoning `next` races with its own answer and can fail closed (503)"]
 async fn h2_a_layer_answers_after_next_mid_upload() {
     let kit = stack(&["a"]).await;
     let mut c = kit.tunnel("up.test", true).await;

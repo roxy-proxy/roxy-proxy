@@ -141,6 +141,20 @@ struct RuleTestArgs {
     /// Response header `name: value` (repeatable).
     #[arg(short = 'R', long = "response-header")]
     response_headers: Vec<String>,
+    /// `ws.text`: a WebSocket text message. Any `--ws-*` flag runs the
+    /// watching rules that read `ws.*`.
+    #[arg(long)]
+    ws_text: Option<String>,
+    /// `ws.opcode`: 1 text (the default with `--ws-text`), 2 binary (the
+    /// default otherwise), 8 close, 9 ping, 10 pong.
+    #[arg(long)]
+    ws_opcode: Option<u8>,
+    /// `ws.size` of a message that is not text (default 0).
+    #[arg(long)]
+    ws_size: Option<u64>,
+    /// `ws.direction`: `c2s` (default) or `s2c`.
+    #[arg(long)]
+    ws_direction: Option<String>,
     /// Metric value `id=N` for `metric.<id>` (repeatable). Metrics not given
     /// are 0 (a fresh series); `id=unavailable` makes the view report the
     /// metric unavailable, exercising the fail-closed path.
@@ -289,6 +303,13 @@ fn rule_test(args: &RuleTestArgs) -> anyhow::Result<ExitCode> {
     req.response_body_bytes = args.response_body_bytes;
     req.tags.clone_from(&args.tags);
     let err = |e: String| anyhow::anyhow!(e);
+    req.ws = ruletest::ws_message(
+        args.ws_direction.as_deref(),
+        args.ws_opcode,
+        args.ws_text.as_deref(),
+        args.ws_size,
+    )
+    .map_err(err)?;
     req.headers = args
         .headers
         .iter()

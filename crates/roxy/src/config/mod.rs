@@ -624,6 +624,9 @@ pub struct FlowLog {
     pub path: Option<PathBuf>,
     /// Also log connection-level (`connect`) events.
     pub connection_events: bool,
+    /// Log every Nth checked WebSocket message as a `ws_message` event; 0
+    /// logs only denied ones (docs/websockets.md#message-rules).
+    pub ws_message_every: u64,
     /// Unwritten log bytes at which traffic is held back (docs/flow-log.md#writing).
     #[serde(deserialize_with = "units::size")]
     pub high_water: ByteSize,
@@ -641,6 +644,7 @@ impl Default for FlowLog {
         Self {
             path: None,
             connection_events: false,
+            ws_message_every: 0,
             high_water: ByteSize::b(roxy_proxy::logging::DEFAULT_HIGH_WATER as u64),
             max_file_bytes: None,
             max_files: None,

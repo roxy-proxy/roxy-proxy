@@ -147,7 +147,7 @@ sits in it.
   forwarded body ([audit backpressure](flow-log.md#writing)).
 - WebSocket `tunnel` layers are chained between the client and the relay,
   outermost first. The relay stays the hop next to the upstream, so byte
-  budgets see what leaves.
+  budgets and [message rules](websockets.md#message-rules) see what leaves.
 - Layers compile at config load and are cached across reloads while their
   file and settings are unchanged, so their instance pools stay warm. A
   reload swaps the stack for new exchanges; exchanges in flight finish on
@@ -316,9 +316,13 @@ that failed in any way is discarded, never reused.
 - **No clean end for a failed body.** A guest body never ends cleanly once
   its exchange has failed: it ends with an error, and a response body holds
   its end until the handler returns, so a trap after the last byte still
-  cuts it. (A guest that deliberately drops a request body while still
-  running ends it cleanly; that is the layer's output, and the rules judge
-  it.)
+  cuts it.
+- **An abandoned request is cut, not failed.** A request body passed to
+  `next` that the guest drops without `finish` never ends cleanly either:
+  the upstream sees it cut. If the guest is still waiting on `next`'s
+  response, the layer has failed (`invalid_request`). If it has dropped the
+  response future, or already has the response, it has abandoned the
+  forwarded request and may answer itself; its answer stands.
 - Layers see canonical heads and body streams, never raw wire bytes, and
   have no filesystem, sockets or environment. All their I/O is `next`,
   `endpoints` and `flow`.

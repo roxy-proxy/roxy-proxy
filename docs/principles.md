@@ -60,6 +60,11 @@ match is exactly what is forwarded. This removes request smuggling,
 header injection and path confusion as classes of attack
 ([HTTP](http.md)).
 
+After a WebSocket upgrade the connection carries only that WebSocket, so
+there is no later request to smuggle into. roxy splices its bytes unless a
+rule reads messages; then every message is decoded strictly and re-encoded
+in one form ([WebSockets](websockets.md#message-rules)).
+
 ## Deny always wins
 
 A rule set is a list of allows and denies that restrict them. Any matching

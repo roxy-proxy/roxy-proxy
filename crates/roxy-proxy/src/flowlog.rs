@@ -142,8 +142,15 @@ pub enum FlowEvent {
         conn: String,
         bytes_c2s: u64,
         bytes_s2c: u64,
+        /// The close code roxy sent both sides when it ended the WebSocket
+        /// (docs/websockets.md#message-rules).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        close_code: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        close_reason: Option<String>,
     },
-    /// An inspected WebSocket message (sampled or denied only, issue #14).
+    /// A checked WebSocket message: denied, or sampled with
+    /// `log.flow.ws_message_every` (docs/websockets.md#message-rules).
     WsMessage {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,

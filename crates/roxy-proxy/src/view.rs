@@ -17,6 +17,7 @@ use std::net::IpAddr;
 use std::sync::{Mutex, PoisonError};
 
 use roxy_http::coding::{self, DecodeError};
+use roxy_http::ws::frame::Message;
 use roxy_http::{Headers, Host, Query, Scheme};
 use roxy_rules::{BodyText, Field, FlowView, Value};
 
@@ -103,6 +104,14 @@ pub(crate) struct ResponseFacts {
     pub body: Inspected,
 }
 
+/// The WebSocket message being checked (docs/websockets.md#message-rules).
+#[derive(Debug, Clone)]
+pub(crate) struct WsFacts {
+    /// `c2s` or `s2c`.
+    pub direction: &'static str,
+    pub message: Message,
+}
+
 /// Everything a rule can see about a flow.
 #[derive(Debug, Clone)]
 pub(crate) struct FlowFacts {
@@ -116,6 +125,8 @@ pub(crate) struct FlowFacts {
     /// `response.body.bytes`: response body bytes sent so far; `None`
     /// before the response head.
     pub response_body_bytes: Option<u64>,
+    /// `ws.*`: set only while a WebSocket message is being checked.
+    pub ws: Option<WsFacts>,
 }
 
 /// Lower-case host text without brackets.
@@ -246,8 +257,22 @@ impl FlowView for ProxyView<'_> {
             Field::ResponseBodySize => res.and_then(|r| r.body_size).map_or(Value::Absent, int),
             Field::BodyBytes => fa.request_body_bytes.map_or(Value::Absent, int),
             Field::ResponseBodyBytes => fa.response_body_bytes.map_or(Value::Absent, int),
-            // WebSocket inspect tier (M3): not available in this build.
-            Field::WsDirection | Field::WsOpcode | Field::WsSize | Field::WsText => Value::Absent,
+            Field::WsDirection => fa
+                .ws
+                .as_ref()
+                .map_or(Value::Absent, |w| Value::Str(Cow::Borrowed(w.direction))),
+            Field::WsOpcode => fa.ws.as_ref().map_or(Value::Absent, |w| {
+                Value::Int(i64::from(w.message.opcode.as_u8()))
+            }),
+            Field::WsSize => fa
+                .ws
+                .as_ref()
+                .map_or(Value::Absent, |w| int(w.message.len() as u64)),
+            Field::WsText => fa
+                .ws
+                .as_ref()
+                .and_then(|w| w.message.text())
+                .map_or(Value::Absent, |t| Value::Str(Cow::Borrowed(t))),
         }
     }
 
