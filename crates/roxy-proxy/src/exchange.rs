@@ -423,10 +423,27 @@ enum Upstreamed {
     },
 }
 
+/// Why the upstream leg produced no response.
+enum Failed {
+    /// Answer locally.
+    Refuse(Refusal),
+    /// The client side broke.
+    Close(ParseError),
+}
+
+impl From<Failed> for Outcome {
+    fn from(f: Failed) -> Self {
+        match f {
+            Failed::Refuse(r) => Self::Refuse(r),
+            Failed::Close(e) => Self::Close(e),
+        }
+    }
+}
+
 /// The stop of a watching rule, as the outcome of an exchange whose
 /// response has not started (answered with an error response).
-fn stopped_outcome(watch: &Watch) -> Option<Outcome> {
-    watch.stopped().map(|s| Outcome::Refuse(s.refusal))
+fn stopped_outcome(watch: &Watch) -> Option<Failed> {
+    watch.stopped().map(|s| Failed::Refuse(s.refusal))
 }
 
 /// Waits for the upstream's response head.
@@ -465,18 +482,14 @@ async fn response_head<F: Future>(
         .map_err(|_| "upstream response headers")
 }
 
-#[allow(clippy::too_many_lines)] // one linear flow; splitting it obscures the order
+/// The forwarded exchange: the upstream leg (a plain request, or a
+/// WebSocket upgrade), then the response steps. From here on the request
+/// is on its way: watching rules re-check the exchange as values arrive,
+/// and what is forwarded is teed to the capture log, heads included.
 async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalRequest) -> Outcome {
-    // From here on the request is on its way: watching rules re-check the
-    // exchange as values arrive.
     let watch = Watch::new(cx);
     cx.watch = Some(watch.clone());
-    // Capture: what is forwarded from here on is teed to the
-    // capture log, heads included.
     let (mut up_tap, down_tap) = taps(cx);
-    let host = host_text(&req.authority.host);
-    let port = req.authority.port;
-    let private_ok = cx.opts.private_ok;
     let wants_ws = req
         .meta
         .upgrade
@@ -496,169 +509,32 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
         });
         req.meta.upgrade = None;
     }
-    let upstream_client = cx.snap.upstream.clone();
-    if let Err(e) = upstream_client.preflight(&req.authority, private_ok).await {
+    if let Err(e) = cx
+        .snap
+        .upstream
+        .preflight(&req.authority, cx.opts.private_ok)
+        .await
+    {
+        let (host, port) = (host_text(&req.authority.host), req.authority.port);
         return Outcome::Refuse(upstream_refusal(cx, &e, &host, port));
     }
-    let limits = cx.snap.limits.clone();
     let t0 = Instant::now();
-
     let upstreamed = if relay_ws {
-        let key = match validate_upgrade_request(&req) {
-            Ok(k) => k,
-            Err(e) => {
-                return Outcome::Refuse(Refusal {
-                    reason: Some(e.reason.as_str().to_owned()),
-                    ..Refusal::deny(400, "invalid websocket upgrade", "_websocket", true)
-                });
-            }
-        };
-        if crate::addons::ws_without_extensions(&cx.snap, cx.layer_ran) {
-            // Messages are read, by the rules or by addon layers, so no
-            // extension (permessage-deflate above all) may be negotiated.
-            req.headers.remove("sec-websocket-extensions");
-        }
-        // The upgrade request is captured as it leaves, like any other.
-        if let Some(t) = up_tap.as_mut() {
-            t.request_head(&req, &cx.snap.redactor);
-        }
-        let scheme = req.scheme;
-        let authority = req.authority.clone();
-        let mut http_req = match to_upstream_upgrade_request(req, UriForm::Origin) {
-            Ok(r) => r,
-            Err(e) => {
-                return Outcome::Refuse(protocol_refusal(cx, &host, port, e.to_string()));
-            }
-        };
-        set_host_override(cx, &mut http_req);
-        let attempt = async {
-            let io = upstream_client
-                .connect_h1(scheme, &authority, private_ok)
-                .await
-                .map_err(Some)?;
-            let (mut sender, connection) =
-                hyper::client::conn::http1::handshake::<_, Body>(TokioIo::new(io))
-                    .await
-                    .map_err(|e| Some(ConnectError::Connect(format!("upstream handshake: {e}"))))?;
-            tokio::spawn(async move {
-                if let Err(e) = connection.with_upgrades().await {
-                    tracing::debug!(error = %e, "upstream websocket connection ended");
-                }
-            });
-            let mut res = sender.send_request(http_req).await.map_err(|e| {
-                tracing::debug!(error = %e, "websocket upgrade request failed");
-                None
-            })?;
-            if res.status() != http::StatusCode::SWITCHING_PROTOCOLS {
-                return Ok((res, None));
-            }
-            // The upgraded connection is taken within the same wait, so the
-            // client is only sent a `101` once roxy holds the upstream side.
-            let upgraded = hyper::upgrade::on(&mut res).await.map_err(|e| {
-                tracing::debug!(error = %e, "upstream upgrade did not complete");
-                None
-            })?;
-            Ok((res, Some(upgraded)))
-        };
-        match tokio::time::timeout(limits.response_header_timeout, attempt).await {
-            Err(_) => {
-                return Outcome::Refuse(upstream_refusal(
-                    cx,
-                    &ConnectError::Timeout("upstream response headers"),
-                    &host,
-                    port,
-                ));
-            }
-            Ok(Err(Some(e))) => {
-                return Outcome::Refuse(upstream_refusal(cx, &e, &host, port));
-            }
-            Ok(Err(None)) => {
-                return Outcome::Refuse(protocol_refusal(
-                    cx,
-                    &host,
-                    port,
-                    "upgrade request failed".into(),
-                ));
-            }
-            Ok(Ok((res, Some(upstream)))) => Upstreamed::Upgrade { res, upstream, key },
-            Ok(Ok((res, None))) => Upstreamed::Response(res),
-        }
+        upgrade_upstream(cx, req, up_tap.as_mut()).await
     } else {
-        // Watched first: a chunk that makes a deny match is never counted
-        // as forwarded nor handed to the upstream.
-        if let Some(t) = up_tap.as_mut() {
-            t.request_head(&req, &cx.snap.redactor);
-        }
-        let body = watched(
-            std::mem::take(&mut req.body),
-            watch.clone(),
-            Dir::Request,
-            up_tap.take(),
-        );
-        let (body, req_counter, sent) = counted_until_sent(body);
-        // Read when the flow is logged, so bytes sent before an abandoned
-        // forward, or after the response head, all count.
-        cx.request_counter = Some(req_counter.clone());
-        req.body = body;
-        let mut http_req = match to_upstream_request(req, UriForm::Absolute) {
-            Ok(r) => r,
-            Err(e) => {
-                return Outcome::Refuse(protocol_refusal(cx, &host, port, e.to_string()));
-            }
-        };
-        set_host_override(cx, &mut http_req);
-        let upstream = response_head(
-            upstream_client
-                .client(private_ok, cx.host_override.is_some())
-                .request(http_req),
-            sent,
-            req_counter.clone(),
-            &limits,
-        );
-        // A stop (from a request body chunk) abandons the upstream request
-        // at once instead of waiting for its response.
-        let stopped = watch.cancelled();
-        let fut = async move {
-            tokio::select! {
-                biased;
-                () = stopped => None,
-                r = upstream => Some(r),
-            }
-        };
-        let driven = front.drive(fut).await;
-        if let Some(o) = stopped_outcome(&watch) {
-            return o;
-        }
-        match driven {
-            Err(e) => return Outcome::Close(e),
-            // Unreachable: a cancelled watch returned above. Fail closed.
-            Ok(None) => return Outcome::Refuse(Refusal::fail_closed("watch_stopped")),
-            Ok(Some(Err(what))) => {
-                return Outcome::Refuse(upstream_refusal(
-                    cx,
-                    &ConnectError::Timeout(what),
-                    &host,
-                    port,
-                ));
-            }
-            Ok(Some(Ok(Err(e)))) => {
-                return Outcome::Refuse(match classify(&e) {
-                    Some(ce) => upstream_refusal(cx, &ce, &host, port),
-                    None => protocol_refusal(cx, &host, port, describe(&e)),
-                });
-            }
-            Ok(Some(Ok(Ok(res)))) => Upstreamed::Response(res),
-        }
+        plain_upstream(front, cx, req, &watch, up_tap.take()).await
+    };
+    let upstreamed = match upstreamed {
+        Ok(u) => u,
+        Err(failed) => return failed.into(),
     };
     cx.record.ttfb_ms = Some(u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX));
-
     let (res, upgrade) = match upstreamed {
         Upstreamed::Response(res) => (res, None),
         Upstreamed::Upgrade { res, upstream, key } => (res, Some((upstream, key))),
     };
-    let res = from_upstream_response(res, &limits);
-    let verdict = response_steps(cx, res, front).await;
-    match verdict {
+    let res = from_upstream_response(res, &cx.snap.limits);
+    match response_steps(cx, res, front).await {
         ResponseVerdict::Continue(mut res) => {
             let mut down_tap = down_tap;
             if let Some(t) = down_tap.as_mut() {
@@ -675,6 +551,154 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
         }
         ResponseVerdict::Deny(r) => Outcome::Refuse(r),
         ResponseVerdict::Close(e) => Outcome::Close(e),
+    }
+}
+
+/// The upstream leg of an allowed WebSocket upgrade: an HTTP/1.1
+/// connection of its own, the whole handshake under
+/// `response_header_timeout`. The upgraded connection is taken within the
+/// same wait, so the client is only sent a `101` once roxy holds the
+/// upstream side.
+async fn upgrade_upstream(
+    cx: &mut FlowCx,
+    mut req: CanonicalRequest,
+    up_tap: Option<&mut Tap>,
+) -> Result<Upstreamed, Failed> {
+    let (host, port) = (host_text(&req.authority.host), req.authority.port);
+    let key = validate_upgrade_request(&req).map_err(|e| {
+        Failed::Refuse(Refusal {
+            reason: Some(e.reason.as_str().to_owned()),
+            ..Refusal::deny(400, "invalid websocket upgrade", "_websocket", true)
+        })
+    })?;
+    if crate::addons::ws_without_extensions(&cx.snap, cx.layer_ran) {
+        // Messages are read, by the rules or by addon layers, so no
+        // extension (permessage-deflate above all) may be negotiated.
+        req.headers.remove("sec-websocket-extensions");
+    }
+    // The upgrade request is captured as it leaves, like any other.
+    if let Some(t) = up_tap {
+        t.request_head(&req, &cx.snap.redactor);
+    }
+    let scheme = req.scheme;
+    let authority = req.authority.clone();
+    let mut http_req = to_upstream_upgrade_request(req, UriForm::Origin)
+        .map_err(|e| Failed::Refuse(protocol_refusal(cx, &host, port, e.to_string())))?;
+    set_host_override(cx, &mut http_req);
+    let upstream_client = cx.snap.upstream.clone();
+    let private_ok = cx.opts.private_ok;
+    let attempt = async {
+        let io = upstream_client
+            .connect_h1(scheme, &authority, private_ok)
+            .await
+            .map_err(Some)?;
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake::<_, Body>(TokioIo::new(io))
+                .await
+                .map_err(|e| Some(ConnectError::Connect(format!("upstream handshake: {e}"))))?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.with_upgrades().await {
+                tracing::debug!(error = %e, "upstream websocket connection ended");
+            }
+        });
+        let mut res = sender.send_request(http_req).await.map_err(|e| {
+            tracing::debug!(error = %e, "websocket upgrade request failed");
+            None
+        })?;
+        if res.status() != http::StatusCode::SWITCHING_PROTOCOLS {
+            return Ok((res, None));
+        }
+        let upgraded = hyper::upgrade::on(&mut res).await.map_err(|e| {
+            tracing::debug!(error = %e, "upstream upgrade did not complete");
+            None
+        })?;
+        Ok((res, Some(upgraded)))
+    };
+    let timeout = cx.snap.limits.response_header_timeout;
+    match tokio::time::timeout(timeout, attempt).await {
+        Err(_) => {
+            let e = ConnectError::Timeout("upstream response headers");
+            Err(Failed::Refuse(upstream_refusal(cx, &e, &host, port)))
+        }
+        Ok(Err(Some(e))) => Err(Failed::Refuse(upstream_refusal(cx, &e, &host, port))),
+        Ok(Err(None)) => Err(Failed::Refuse(protocol_refusal(
+            cx,
+            &host,
+            port,
+            "upgrade request failed".into(),
+        ))),
+        Ok(Ok((res, Some(upstream)))) => Ok(Upstreamed::Upgrade { res, upstream, key }),
+        Ok(Ok((res, None))) => Ok(Upstreamed::Response(res)),
+    }
+}
+
+/// The upstream leg of an ordinary request through the pooled client,
+/// the request body watched and captured as it streams.
+async fn plain_upstream<F: Front>(
+    front: &mut F,
+    cx: &mut FlowCx,
+    mut req: CanonicalRequest,
+    watch: &Arc<Watch>,
+    up_tap: Option<Tap>,
+) -> Result<Upstreamed, Failed> {
+    let (host, port) = (host_text(&req.authority.host), req.authority.port);
+    // Watched first: a chunk that makes a deny match is never counted
+    // as forwarded nor handed to the upstream.
+    let mut up_tap = up_tap;
+    if let Some(t) = up_tap.as_mut() {
+        t.request_head(&req, &cx.snap.redactor);
+    }
+    let body = watched(
+        std::mem::take(&mut req.body),
+        watch.clone(),
+        Dir::Request,
+        up_tap,
+    );
+    let (body, req_counter, sent) = counted_until_sent(body);
+    // Read when the flow is logged, so bytes sent before an abandoned
+    // forward, or after the response head, all count.
+    cx.request_counter = Some(req_counter.clone());
+    req.body = body;
+    let mut http_req = to_upstream_request(req, UriForm::Absolute)
+        .map_err(|e| Failed::Refuse(protocol_refusal(cx, &host, port, e.to_string())))?;
+    set_host_override(cx, &mut http_req);
+    let limits = cx.snap.limits.clone();
+    let upstream = response_head(
+        cx.snap
+            .upstream
+            .client(cx.opts.private_ok, cx.host_override.is_some())
+            .request(http_req),
+        sent,
+        req_counter,
+        &limits,
+    );
+    // A stop (from a request body chunk) abandons the upstream request
+    // at once instead of waiting for its response.
+    let stopped = watch.cancelled();
+    let fut = async move {
+        tokio::select! {
+            biased;
+            () = stopped => None,
+            r = upstream => Some(r),
+        }
+    };
+    let driven = front.drive(fut).await;
+    if let Some(o) = stopped_outcome(watch) {
+        return Err(o);
+    }
+    match driven {
+        Err(e) => Err(Failed::Close(e)),
+        // Unreachable: a cancelled watch returned above. Fail closed.
+        Ok(None) => Err(Failed::Refuse(Refusal::fail_closed("watch_stopped"))),
+        Ok(Some(Err(what))) => {
+            let e = ConnectError::Timeout(what);
+            Err(Failed::Refuse(upstream_refusal(cx, &e, &host, port)))
+        }
+        Ok(Some(Ok(Err(e)))) => Err(Failed::Refuse(match classify(&e) {
+            Some(ce) => upstream_refusal(cx, &ce, &host, port),
+            None => protocol_refusal(cx, &host, port, describe(&e)),
+        })),
+        Ok(Some(Ok(Ok(res)))) => Ok(Upstreamed::Response(res)),
     }
 }
 
