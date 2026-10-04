@@ -63,7 +63,9 @@ pub struct RequestMeta {
     /// `Proxy-Authorization` value (hop-by-hop, never forwarded), for the
     /// proxy's own authentication.
     pub proxy_authorization: Option<HeaderValue>,
-    /// The client asked to close the connection after this exchange.
+    /// The connection closes after this exchange: the client asked
+    /// (`Connection: close`), or it is HTTP/1.0, which roxy never keeps
+    /// alive.
     pub close: bool,
 }
 

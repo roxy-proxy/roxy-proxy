@@ -100,6 +100,9 @@ pub fn from_h2_parts(
     if pq.is_empty() {
         return reject(Reason::H2BadPseudoHeader, "empty :path");
     }
+    if pq.len() > limits.max_url_bytes {
+        return reject(Reason::UrlTooLong, format!(":path is {} bytes", pq.len()));
+    }
     let (path, query) = url::parse_origin_form(pq.as_bytes())?;
 
     // Regular headers.
@@ -165,6 +168,12 @@ pub fn from_h2_parts(
                 expect = true;
             }
             "proxy-authorization" => {
+                if meta.proxy_authorization.is_some() {
+                    return reject(
+                        Reason::MultipleProxyAuthorization,
+                        "multiple proxy-authorization fields",
+                    );
+                }
                 meta.proxy_authorization = HeaderValue::from_bytes(v).ok();
             }
             "cookie" => cookies.push(v),
@@ -403,6 +412,21 @@ mod tests {
     }
 
     #[test]
+    fn proxy_authorization_must_be_single() {
+        assert_eq!(
+            map(req(
+                "https://api.example.com/",
+                &[
+                    ("proxy-authorization", "Basic eA=="),
+                    ("proxy-authorization", "Basic eQ==")
+                ]
+            ))
+            .unwrap_err(),
+            Reason::MultipleProxyAuthorization
+        );
+    }
+
+    #[test]
     fn scheme_must_be_https() {
         assert_eq!(
             map(req("http://api.example.com/", &[])).unwrap_err(),
@@ -470,6 +494,38 @@ mod tests {
         p.headers
             .append("x-obs", HeaderValue::from_bytes(b"caf\xe9").unwrap());
         assert_eq!(map(p).unwrap_err(), Reason::NonAscii);
+    }
+
+    #[test]
+    fn path_length_cap() {
+        let limits = Limits {
+            max_url_bytes: 16,
+            ..Limits::default()
+        };
+        let long = format!("https://api.example.com/{}", "a".repeat(16));
+        assert_eq!(
+            from_h2_parts(
+                req(&long, &[]),
+                Body::empty(),
+                &auth(),
+                &limits,
+                &HttpFlags::default()
+            )
+            .unwrap_err()
+            .reason,
+            Reason::UrlTooLong
+        );
+        let fits = format!("https://api.example.com/{}", "a".repeat(15));
+        assert!(
+            from_h2_parts(
+                req(&fits, &[]),
+                Body::empty(),
+                &auth(),
+                &limits,
+                &HttpFlags::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]

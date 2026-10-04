@@ -17,7 +17,6 @@ use http::{HeaderMap, HeaderValue, Uri};
 
 use crate::model::{
     Body, CanonicalRequest, CanonicalResponse, Headers, Limits, ParseError, Reason, ResponseMeta,
-    connection_tokens,
 };
 
 /// How the request URI is written into the `http::Request`.
@@ -111,15 +110,7 @@ where
     B::Error: fmt::Display,
 {
     let (parts, body) = res.into_parts();
-    let headers = Headers::from_header_map_lenient(&parts.headers);
-    let conn = connection_tokens(
-        parts
-            .headers
-            .get_all(CONNECTION)
-            .iter()
-            .map(HeaderValue::as_bytes),
-    )
-    .unwrap_or_default();
+    let (headers, conn) = Headers::from_header_map_lenient_with_connection(&parts.headers);
     let upgrade = (parts.status == http::StatusCode::SWITCHING_PROTOCOLS
         && conn.iter().any(|t| t == "upgrade"))
     .then(|| {

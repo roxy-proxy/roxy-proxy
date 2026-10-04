@@ -178,6 +178,25 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
         r.map_err(|e| self.fail(e))
     }
 
+    /// [`ReadSide::pump`] while a body is being read; otherwise watches the
+    /// idle socket so a client that closes while its response is pending is
+    /// reported rather than waited for. Bytes that arrive instead (pipelined
+    /// requests) stay buffered and end the watch. Cancel-safe.
+    async fn pump_or_watch(&mut self) -> Result<(), ParseError> {
+        if self.feed.is_some() {
+            return self.pump().await;
+        }
+        self.buf.reserve(READ_CHUNK);
+        match self.rd.read_buf(&mut self.buf).await {
+            Ok(0) => Err(ParseError::new(
+                Reason::UnexpectedEof,
+                "client closed while awaiting the response",
+            )),
+            Ok(_) => Ok(()),
+            Err(e) => Err(io_err(&e)),
+        }
+    }
+
     async fn pump_inner(&mut self) -> Result<(), ParseError> {
         let idle = self.limits.body_idle_timeout;
         loop {
@@ -505,7 +524,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     /// keep-alive idle timeout.
     async fn read_head(&mut self) -> Result<Option<BytesMut>, ParseError> {
         let limits = self.limits.clone();
-        let mut deadline = (self.served == 0).then(|| Instant::now() + limits.header_timeout);
+        // The head has started once anything is buffered (pipelined bytes
+        // count), so the header deadline applies from the outset.
+        let started = self.served == 0 || !self.r.buf.is_empty();
+        let mut deadline = started.then(|| Instant::now() + limits.header_timeout);
         let mut scan_from = 0;
         loop {
             // RFC 9112 §2.2: ignore empty lines before the request line.
@@ -687,8 +709,9 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     /// it (driving the body means the request was allowed).
     ///
     /// Returns `Err` if the request body is invalid, too large, stalls or
-    /// the client goes away; `fut` is dropped in that case and the connection
-    /// must be closed.
+    /// the client goes away (including a client that closes while waiting
+    /// for the response to a bodiless request); `fut` is dropped in that
+    /// case and the connection must be closed.
     pub async fn drive<F: Future>(&mut self, fut: F) -> Result<F::Output, ParseError> {
         if self.r.feed.is_some() {
             self.send_100_continue()
@@ -696,15 +719,13 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
                 .map_err(|e| ParseError::new(Reason::Io, e.to_string()))?;
         }
         let mut fut = std::pin::pin!(fut);
-        if self.r.feed.is_some() {
-            tokio::select! {
-                biased;
-                out = &mut fut => return Ok(out),
-                r = self.r.pump() => {
-                    if let Err(e) = r {
-                        self.state = State::Broken;
-                        return Err(e);
-                    }
+        tokio::select! {
+            biased;
+            out = &mut fut => return Ok(out),
+            r = self.r.pump_or_watch() => {
+                if let Err(e) = r {
+                    self.state = State::Broken;
+                    return Err(e);
                 }
             }
         }
@@ -781,11 +802,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
             self.r.abandoned = true;
         }
         let framing = Self::out_framing(&res, &ex);
-        let close = ex.close
-            || res.meta.close
-            || ex.version == Version::H1_0
-            || self.r.abandoned
-            || framing == OutFraming::CloseDelimited;
+        let close =
+            ex.close || res.meta.close || self.r.abandoned || framing == OutFraming::CloseDelimited;
         let head = response_head(res.status, &res.headers, &[], framing, close, None);
         let idle = self.limits.body_idle_timeout;
 

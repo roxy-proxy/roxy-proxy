@@ -107,10 +107,8 @@ impl Method {
             Method::Options => http::Method::OPTIONS,
             Method::Trace => http::Method::TRACE,
             Method::Patch => http::Method::PATCH,
-            // Validated as a token, which http::Method accepts.
-            Method::Extension(s) => {
-                http::Method::from_bytes(s.as_bytes()).unwrap_or(http::Method::GET)
-            }
+            Method::Extension(s) => http::Method::from_bytes(s.as_bytes())
+                .expect("an extension method is a validated token, which http::Method accepts"),
         }
     }
 

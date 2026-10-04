@@ -392,8 +392,9 @@ pub fn parse_head(
     let mut meta = RequestMeta::new(version, TargetForm::Origin);
     meta.head_bytes = head.len();
     meta.expect_continue = expect_continue;
-    meta.close = conn.iter().any(|t| t == "close")
-        || (version == Version::H1_0 && !conn.iter().any(|t| t == "keep-alive"));
+    // roxy never keeps an HTTP/1.0 connection alive, whatever `Connection`
+    // says, so the flag is simply true for every 1.0 request.
+    meta.close = version == Version::H1_0 || conn.iter().any(|t| t == "close");
     if conn.iter().any(|t| t == "upgrade") && !upgrades.is_empty() {
         let joined: Vec<String> = upgrades
             .iter()
@@ -401,6 +402,12 @@ pub fn parse_head(
             .map(|u| String::from_utf8_lossy(u).to_ascii_lowercase())
             .collect();
         meta.upgrade = Some(joined.join(", "));
+    }
+    if proxy_auth.len() > 1 {
+        return reject(
+            Reason::MultipleProxyAuthorization,
+            "multiple proxy-authorization fields",
+        );
     }
     if let Some(pa) = proxy_auth.first() {
         meta.proxy_authorization = HeaderValue::from_bytes(pa).ok();
@@ -600,5 +607,34 @@ mod tests {
             parse("CONNECT http://example.com/ HTTP/1.1\r\n\r\n").unwrap_err(),
             Reason::BadRequestTarget
         );
+    }
+
+    #[test]
+    fn proxy_authorization_must_be_single() {
+        assert_eq!(
+            parse(
+                "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic eA==\r\nProxy-Authorization: Basic eQ==\r\n\r\n"
+            )
+            .unwrap_err(),
+            Reason::MultipleProxyAuthorization
+        );
+    }
+
+    #[test]
+    fn http10_always_closes() {
+        let flags = HttpFlags {
+            allow_http10: true,
+            ..HttpFlags::default()
+        };
+        let Head::Request(h) = parse_head(
+            b"GET http://example.com/ HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
+            &Role::ProxyPort,
+            &Limits::default(),
+            &flags,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert!(h.meta.close);
     }
 }
