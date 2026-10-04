@@ -1,0 +1,44 @@
+# The quickstart policy: Claude Code may reach Anthropic's API and sign-in
+# hosts, nothing else, and every model response goes through the sentinel
+# sidecar first. Validate with:
+#   docker run --rm -v ./roxy.yaml:/etc/roxy/roxy.yaml:ro ghcr.io/roxy-proxy/roxy:edge \
+#     check --config /etc/roxy/roxy.yaml
+version: 1
+
+listeners:
+  - name: proxy
+    bind: 0.0.0.0:3128
+
+ca_server:
+  bind: 0.0.0.0:3130          # /roxy-ca.pem and /healthz
+
+tls:
+  ca_dir: /var/lib/roxy/ca
+
+log:
+  flow:
+    connection_events: false  # flow log to stdout: `docker compose logs roxy`
+
+# Above the rules: every exchange streams through the sentinel, which judges
+# each tool call in a model response before Claude Code sees it.
+addons:
+  - name: sentinel
+    kind: service
+    endpoint: sidecar
+    endpoints:
+      sidecar: { url: "http://sentinel:9000/", private_ok: true }
+    limits:
+      first_byte_timeout: 120s  # a held (non-streamed) response arrives whole
+      max_exchange_time: 15m    # a long generation
+
+# Anything no rule allows is denied. A matching deny always beats an allow.
+default: deny
+
+rules:
+  - id: claude-api
+    when: host == "api.anthropic.com"
+    then: allow
+
+  - id: claude-sign-in
+    when: host in ["claude.ai", "claude.com", "platform.claude.com"]
+    then: allow

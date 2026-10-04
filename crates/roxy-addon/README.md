@@ -105,7 +105,8 @@ Tunnels (`roxy:addon/tunnel`) are not wrapped yet; use the raw
 
 ## Example
 
-[`examples/addons/redact`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/addons/redact)
+roxy-wasm's test component
+[`redact`](https://github.com/roxy-proxy/roxy-proxy/tree/main/crates/roxy-wasm/test-components/redact)
 redacts literal strings from both bodies as they stream, holding back
 only the bytes a needle could straddle.
 

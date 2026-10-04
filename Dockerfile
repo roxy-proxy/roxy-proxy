@@ -52,7 +52,7 @@ RUN if ldd /roxy 2>&1 | grep -q '=>'; then ldd /roxy; exit 1; fi
 # owned by the runtime user. /var/lib/roxy/capture is not a VOLUME (capture
 # is off by default); it exists so a volume mounted there inherits the
 # ownership.
-RUN install -D -m 0444 examples/docker/roxy.yaml /out/etc/roxy/roxy.yaml \
+RUN install -D -m 0444 docker/roxy.yaml /out/etc/roxy/roxy.yaml \
     && install -d -m 0755 -o 65532 -g 65532 /out/var/lib/roxy /out/var/log/roxy \
     && install -d -m 0700 -o 65532 -g 65532 /out/var/lib/roxy/ca /out/var/lib/roxy/capture
 

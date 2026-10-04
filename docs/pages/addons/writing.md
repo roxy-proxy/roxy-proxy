@@ -43,8 +43,9 @@ tens of MiB, 128–256 MiB of memory, pure-Python dependencies only; give it
 raised budgets. Python with native dependencies, or anything else out of
 process, is a [service layer](#service-layers).
 
-[`examples/addons`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/addons) has a streaming redactor built on
-`roxy-addon`, and the service-layer examples.
+roxy-wasm's test component
+[`redact`](https://github.com/roxy-proxy/roxy-proxy/tree/main/crates/roxy-wasm/test-components/redact) is a streaming
+redactor built on `roxy-addon`.
 
 ## WIT package
 

@@ -81,7 +81,7 @@ roxy rule test --config roxy.yaml --metric github_writes=30 POST https://api.git
 
 ## Containing the agent
 
-roxy only decides what passes through it. The agent needs no route out except through roxy: no direct TCP, no UDP, no DNS. roxy resolves names itself, so the agent needs no resolver. The [quickstart](/quickstart) does this with an `internal: true` Docker network. [Deployment](/deploy/overview) has the recipe for other setups.
+roxy only decides what passes through it. The agent needs no route out except through roxy: no direct TCP, no UDP, no DNS. roxy resolves names itself, so the agent needs no resolver. [Containing a workload](/deploy/overview) has the recipe, including a Docker Compose layout with an `internal: true` network.
 
 Point the agent at roxy and make it trust roxy's CA:
 
@@ -113,4 +113,4 @@ addons:
       sidecar: { url: "http://127.0.0.1:9000/layer", private_ok: true }
 ```
 
-[inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) runs as a service layer like this to supervise an agent at the boundary. Whatever an addon passes on, the rules judge again, so an addon can't widen the policy.
+[inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) runs as a service layer like this to supervise an agent at the boundary; the [quickstart](/quickstart) sets one up in front of Claude Code. Whatever an addon passes on, the rules judge again, so an addon can't widen the policy.

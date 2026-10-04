@@ -72,7 +72,7 @@ roxy rule test --config roxy.yaml --metric artifact_bytes=3000000000 --body-byte
 
 ## Containing the job
 
-The job needs no route out except through roxy. Run it in a container on a network with no route out (`internal: true` in Docker, or a network policy that only reaches roxy), with roxy on that network and one with a route out. The [quickstart](/quickstart) shows the layout. Then set the proxy variables and trust roxy's CA in the job:
+The job needs no route out except through roxy. Run it in a container on a network with no route out (`internal: true` in Docker, or a network policy that only reaches roxy), with roxy on that network and one with a route out. [Containing a workload](/deploy/overview) shows the layout. Then set the proxy variables and trust roxy's CA in the job:
 
 ```sh
 export HTTP_PROXY=http://roxy:3128 HTTPS_PROXY=http://roxy:3128

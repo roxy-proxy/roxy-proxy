@@ -80,6 +80,6 @@ ways.
   passes straight back, and the WebSocket's bytes do not go through it.
 
 One connection per exchange keeps the protocol simple and a service
-stateless per socket. [`examples/addons/service`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/addons/service)
-has `roxy_layer.py`, the service side of the protocol for asyncio, a
-pass-through layer, and an inspect_sentinel sidecar.
+stateless per socket. The [quickstart](/quickstart)'s sidecar is a service
+layer in Python: [`roxy_layer.py`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/sentinel/roxy_layer.py)
+is the service side of the protocol for asyncio.

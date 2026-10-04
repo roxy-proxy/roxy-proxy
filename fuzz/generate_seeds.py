@@ -12,7 +12,8 @@ Sources:
 - url: request targets from that corpus plus a few path / query shapes;
 - client_hello: real ClientHellos from Python's ssl module (with and
   without SNI / ALPN, TLS 1.2 and 1.3);
-- rule_compile: every `when:` expression in examples/ and crates/roxy-rules;
+- rule_compile: every `when:` expression in examples/, the roxy config test
+  fixtures and crates/roxy-rules;
 - h2map, rule_eval: structured inputs, seeded with a few byte patterns
   (libFuzzer finds the structure quickly);
 - content_coding: a small stream in each coding, a stacked pair, and gzip
@@ -117,8 +118,10 @@ def client_hellos():
 
 
 def when_expressions():
-    files = list((ROOT / "examples").rglob("*.yaml")) + list(
-        (ROOT / "crates/roxy-rules").rglob("*.rs")
+    files = (
+        list((ROOT / "examples").rglob("*.yaml"))
+        + list((ROOT / "crates/roxy/tests/fixtures").rglob("*.yaml"))
+        + list((ROOT / "crates/roxy-rules").rglob("*.rs"))
     )
     seen = set()
     for f in files:

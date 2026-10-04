@@ -12,9 +12,9 @@ fn roxy(args: &[&str]) -> Output {
         .expect("run roxy")
 }
 
-fn example(name: &str) -> PathBuf {
+fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples")
+        .join("tests/fixtures")
         .join(name)
 }
 
@@ -23,14 +23,21 @@ fn text(bytes: &[u8]) -> String {
 }
 
 #[test]
-fn check_examples_pass() {
-    for name in ["roxy.yaml", "minimal.yaml", "docker/roxy.yaml"] {
-        let out = roxy(&["check", "--config", example(name).to_str().unwrap()]);
-        assert!(out.status.success(), "{name}: {}", text(&out.stderr));
+fn check_configs_pass() {
+    // The test configs, and the image's default config.
+    let image_default = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docker/roxy.yaml");
+    for path in [fixture("full.yaml"), fixture("minimal.yaml"), image_default] {
+        let out = roxy(&["check", "--config", path.to_str().unwrap()]);
+        assert!(
+            out.status.success(),
+            "{}: {}",
+            path.display(),
+            text(&out.stderr)
+        );
         assert!(text(&out.stdout).contains(": OK"));
     }
     // `check` says which rules are decided at the head and which watch.
-    let out = roxy(&["check", "--config", example("roxy.yaml").to_str().unwrap()]);
+    let out = roxy(&["check", "--config", fixture("full.yaml").to_str().unwrap()]);
     let stdout = text(&out.stdout);
     assert!(stdout.contains("\nrules:\n"), "{stdout}");
     assert!(stdout.contains("  github-reads      head\n"), "{stdout}");
@@ -270,7 +277,7 @@ fn check_catches_expression_type_errors() {
 }
 
 fn rule_test(args: &[&str]) -> Output {
-    let cfg = example("roxy.yaml");
+    let cfg = fixture("full.yaml");
     let mut all = vec!["rule", "test", "--config", cfg.to_str().unwrap()];
     all.extend_from_slice(args);
     roxy(&all)

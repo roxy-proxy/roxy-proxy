@@ -1,0 +1,97 @@
+# roxy quickstart: Claude Code behind roxy and an inspect_sentinel sidecar.
+#
+#   docker compose up -d --wait            # roxy on 127.0.0.1:3128, its CA on :3130
+#   curl -fsS http://127.0.0.1:3130/roxy-ca.pem -o roxy-ca.pem
+#   HTTPS_PROXY=http://127.0.0.1:3128 NODE_EXTRA_CA_CERTS=$PWD/roxy-ca.pem \
+#     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 claude
+#
+# Watch the conversations and the sentinel's decisions at http://127.0.0.1:7575.
+#
+# Claude Code honours the proxy variables, but nothing on your machine makes
+# it: this shows what roxy and the sentinel decide, not containment. To
+# contain a workload, give it no route out except through roxy (see the
+# docs: Deploy > Containing a workload).
+#
+# To build roxy from this checkout instead of pulling it, add --build.
+name: roxy-quickstart
+
+services:
+  roxy:
+    image: ${ROXY_IMAGE:-ghcr.io/roxy-proxy/roxy:edge}
+    build:
+      context: ../..
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ./roxy.yaml:/etc/roxy/roxy.yaml:ro
+      - roxy-ca:/var/lib/roxy/ca     # keep the CA across restarts
+    ports:
+      - "127.0.0.1:3128:3128"        # the proxy
+      - "127.0.0.1:3130:3130"        # the CA certificate
+    networks: [sidecar, egress]
+    depends_on:
+      sentinel:
+        condition: service_healthy
+
+  # The sentinel sidecar (./sentinel): a regex denylist over tool calls.
+  # It needs no route out, so it has none.
+  sentinel:
+    image: roxy-quickstart-sentinel
+    build: ./sentinel
+    pull_policy: build               # built here, never pulled
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: [/tmp]
+    environment:
+      SENTINEL: policies:deny_regex
+      SENTINEL_DENY:                   # your regex, from the shell; unset = the default
+    volumes:
+      - sentinel-logs:/logs
+    networks: [sidecar]
+
+  # Inspect's log viewer over the sentinel's log: each conversation, its
+  # model calls and tool calls, and the sentinel's verdict on each.
+  inspect-view:
+    image: roxy-quickstart-sentinel
+    build: ./sentinel                # the sentinel's image; built once, cached
+    pull_policy: build
+    # Unauthenticated, so published on the host's loopback only.
+    command:
+      - inspect
+      - view
+      - --log-dir=/logs
+      - --host=0.0.0.0
+      - --port=7575
+      - --unsafe-allow-unauthenticated
+      - --trusted-origin=http://127.0.0.1:7575
+      - --trusted-origin=http://localhost:7575
+      - --trusted-host=127.0.0.1:7575
+      - --trusted-host=localhost:7575
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: [/tmp]
+    volumes:
+      - sentinel-logs:/logs:ro
+    ports:
+      - "127.0.0.1:7575:7575"
+    networks: [viewer]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7575/', timeout=2)"]
+      interval: 2s
+      retries: 30
+    depends_on:
+      sentinel:
+        condition: service_healthy
+
+networks:
+  sidecar:
+    internal: true                   # roxy and the sentinel only; no route out
+  egress: {}
+  viewer: {}
+
+volumes:
+  roxy-ca: {}
+  sentinel-logs: {}

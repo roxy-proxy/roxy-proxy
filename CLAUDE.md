@@ -39,10 +39,9 @@ cargo test --workspace
 ```
 
 CI also builds with `RUSTFLAGS=-D warnings`, so a warning fails the build.
-Changes to the wasm components (`crates/roxy-wasm/test-components`,
-`examples/addons`, `wit/`) also need the checks in CI's `wasm` job; the
-built components are checked in, so rebuild them with the `build.sh` scripts
-and commit the result. Changes to a fuzzed parser run the fuzz workflow on
+Changes to the wasm test components (`crates/roxy-wasm/test-components`,
+`wit/`) also need the checks in CI's `wasm` job; the built components are
+checked in, so rebuild them with `build.sh` and commit the result. Changes to a fuzzed parser run the fuzz workflow on
 the PR (`fuzz/README.md`).
 
 ## Code
@@ -63,8 +62,8 @@ the PR (`fuzz/README.md`).
 
 ## Docs
 
-- `README.md` is the overview and quickstart; `docs/` is the reference for
-  current behaviour. Code comments don't link to docs pages: the docs move,
+- `README.md` is a short overview that points at the docs site; `docs/` is
+  the site, and the reference for current behaviour. Code comments don't link to docs pages: the docs move,
   and a comment should stand on its own.
 - Docs describe what roxy does now. No roadmap, "planned" or "deferred"
   prose: unbuilt work lives in issues.

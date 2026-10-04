@@ -1,5 +1,4 @@
-# Full roxy configuration example.
-# Validate with: roxy check --config examples/roxy.yaml
+# A configuration that uses every section, for the config and CLI tests.
 
 version: 1
 
@@ -164,7 +163,6 @@ capture_dir: /var/lib/roxy/capture
 addons:
   - name: redact
     kind: wasm                   # wasm | service
-    # Built from examples/addons/redact (examples/addons/build.sh).
     path: /etc/roxy/addons/redact.wasm
     mode: enforce                # enforce (failures fail closed) | observe (tee, log only)
     config: { needles: ["sk-live-"], replacement: "[redacted]" }

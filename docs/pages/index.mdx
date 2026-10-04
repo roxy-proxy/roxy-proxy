@@ -17,7 +17,7 @@ It fails closed. If roxy can't parse, verify or classify something, it denies it
 
 ## Try it
 
-If you want a demo, run the [quickstart](/quickstart). It's a Docker Compose setup with a client whose only route out is through roxy. It shows an allow, a default deny, a deny rule and a streaming upload cap, in about a minute.
+If you want a demo, run the [quickstart](/quickstart). It puts Claude Code behind roxy and an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar that blocks tool calls matching a denylist, in about five minutes.
 
 If you want to deploy it, read [deployment](/deploy/overview). It covers containing a workload, the hardened container image and running without Docker.
 
@@ -62,7 +62,7 @@ The full language is in [rules](/reference/rule-language).
 
 ## What roxy is not
 
-roxy is not a transparent gateway. It decides what passes through it, and it can't stop traffic that never reaches it. To contain a workload, the network has to give it no route out except through roxy. The [quickstart](/quickstart) does this with Docker networks, and [deployment](/deploy/overview) gives the recipe for other setups.
+roxy is not a transparent gateway. It decides what passes through it, and it can't stop traffic that never reaches it. To contain a workload, the network has to give it no route out except through roxy. [Containing a workload](/deploy/overview) gives the recipe.
 
 roxy speaks HTTP/1.1, HTTP/2 and WebSockets to clients. Raw TCP doesn't pass. The [principles](/principles) page sets out the threat model: what roxy prevents and what it doesn't try to prevent.
 

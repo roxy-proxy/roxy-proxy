@@ -1,8 +1,8 @@
 use super::*;
 
-fn example(name: &str) -> String {
+fn fixture(name: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples")
+        .join("tests/fixtures")
         .join(name);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
@@ -18,8 +18,8 @@ fn diagnostics(yaml: &str) -> Vec<Diagnostic> {
 const BASE: &str = "version: 1\nlisteners: [{ name: proxy, bind: 127.0.0.1:3128 }]\n";
 
 #[test]
-fn full_example_parses_and_validates() {
-    let cfg = parse(&example("roxy.yaml"));
+fn full_config_parses_and_validates() {
+    let cfg = parse(&fixture("full.yaml"));
     cfg.validate().unwrap();
     assert_eq!(cfg.listeners.len(), 1);
     assert_eq!(cfg.listeners[0].mode, ListenerMode::Explicit);
@@ -83,8 +83,8 @@ fn full_example_parses_and_validates() {
 }
 
 #[test]
-fn minimal_example_uses_defaults() {
-    let cfg = parse(&example("minimal.yaml"));
+fn minimal_config_uses_defaults() {
+    let cfg = parse(&fixture("minimal.yaml"));
     cfg.validate().unwrap();
     assert!(cfg.ca_server.is_none());
     assert_eq!(cfg.tls.ca_dir, PathBuf::from("/var/lib/roxy/ca"));

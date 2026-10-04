@@ -53,11 +53,11 @@ jobs:
         with:
           command: check advisories bans licenses sources
 
-  # The wasm components (roxy-wasm's test components and the example
-  # addons) live in their own workspaces and are checked in prebuilt, so the
-  # jobs above need no wasm target. This job rebuilds them from source and
-  # runs the tests that load them against the fresh builds, so the
-  # checked-in binaries cannot silently drift from their sources.
+  # roxy-wasm's test components live in their own workspace and are checked
+  # in prebuilt, so the jobs above need no wasm target. This job rebuilds
+  # them from source and runs the tests that load them against the fresh
+  # builds, so the checked-in binaries cannot silently drift from their
+  # sources.
   wasm:
     runs-on: ubuntu-latest
     steps:
@@ -72,18 +72,13 @@ jobs:
           workspaces: |
             . -> target
             crates/roxy-wasm/test-components -> target
-            examples/addons -> target
-      - name: Format and lint the example addons
-        working-directory: examples/addons
+      - name: Format the test components, lint and unit-test the SDK-built one
+        working-directory: crates/roxy-wasm/test-components
         run: |
           cargo fmt --all --check
-          cargo clippy --all-targets -- -D warnings
-      - name: Unit-test the example addons natively
-        working-directory: examples/addons
-        run: cargo test
+          cargo clippy -p redact --all-targets -- -D warnings
+          cargo test -p redact
       - name: Rebuild the components
-        run: |
-          crates/roxy-wasm/test-components/build.sh
-          examples/addons/build.sh
+        run: crates/roxy-wasm/test-components/build.sh
       - name: Run the host tests against the fresh builds
         run: cargo test -p roxy-wasm

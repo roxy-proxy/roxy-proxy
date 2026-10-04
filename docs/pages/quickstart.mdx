@@ -1,69 +1,88 @@
 ---
 title: "Quickstart"
-description: "Run roxy with Docker Compose in front of a client that has no other route out."
+description: "Run Claude Code through roxy and an inspect_sentinel sidecar that blocks tool calls matching a denylist."
 ---
+
+import inspectView from "../assets/quickstart-inspect-view.png";
 
 # Quickstart
 
-Run roxy in front of a client container whose only way to the internet is through roxy. By the end you have a running proxy that allows one host, denies everything else, stops an oversized upload mid-stream and logs each decision. The setup is [`examples/compose`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/compose) in the roxy repo.
+Run Claude Code through roxy, with an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar that judges every tool call before Claude Code sees it. By the end, Claude Code works as usual, except that tool calls matching a denylist are blocked, and every request it makes is in roxy's flow log. The setup is [`examples/quickstart`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/quickstart) in the roxy repo.
 
 ## Prerequisites
 
 - Docker with Docker Compose
 - Git
+- [Claude Code](https://code.claude.com/docs/en/overview), signed in or with `ANTHROPIC_API_KEY` set
 
 ::::steps
 ### Clone the repo
 
 ```sh
 git clone https://github.com/roxy-proxy/roxy-proxy.git
-cd roxy-proxy/examples/compose
+cd roxy-proxy/examples/quickstart
 ```
 
-### Start roxy and the client
+### Start roxy and the sentinel
 
 ```sh
 docker compose up -d --wait
 ```
 
-This pulls `ghcr.io/roxy-proxy/roxy:edge` and starts two containers:
+The first run builds the sentinel image, which takes a minute or two. Three containers start:
 
-- **roxy**: the proxy, listening on port 3128. It generates its CA on first start and serves the certificate on port 3130.
-- **agent**: a curl container that fetches roxy's CA, trusts it, and has `HTTPS_PROXY` pointed at roxy.
+- **roxy**: the proxy on `127.0.0.1:3128`. It generates its CA on first start and serves the certificate on `127.0.0.1:3130`.
+- **sentinel**: the inspect_sentinel sidecar, on a network with no route out. Every exchange streams through it. It runs a denylist over tool calls.
+- **inspect-view**: Inspect's log viewer on `127.0.0.1:7575`, showing each conversation and the sentinel's verdict on every tool call.
 
-To build roxy from your checkout instead, add `--build`.
+### Trust roxy's CA
 
-### Run the demo
+roxy terminates TLS with certificates from its own CA, so Claude Code has to trust that CA:
 
 ```sh
-./demo.sh
+curl -fsS http://127.0.0.1:3130/roxy-ca.pem -o roxy-ca.pem
 ```
 
-`demo.sh` runs these requests from inside the client:
+### Run Claude Code through roxy
 
-| from the client | result |
-|---|---|
-| `curl https://example.com/` | `200`: rule `example-reads` allows it |
-| `curl https://www.wikipedia.org/` | `403` from roxy: no rule allows it (`_default`) |
-| `curl https://example.com/admin/` | `403` from roxy: rule `no-admin-paths` denies it, whatever allows the host |
-| a 2 MB `POST` to `postman-echo.com` | `413`: the watching rule `upload-cap` stops it mid-upload |
-| `curl --noproxy '*' https://example.com/` | fails: the name does not even resolve |
-| `curl --noproxy '*' https://1.1.1.1/` | fails: no route |
+```sh
+HTTPS_PROXY=http://127.0.0.1:3128 \
+NODE_EXTRA_CA_CERTS=$PWD/roxy-ca.pem \
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+claude
+```
 
-### Read the flow log
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` turns off telemetry and error reporting, whose hosts the policy doesn't allow.
+
+### Ask for something the denylist blocks
+
+Ask Claude to fetch a page with curl:
+
+```
+> Use curl to fetch https://example.com
+```
+
+The model answers with a Bash tool call that runs `curl`. The sentinel sees it before Claude Code does, takes the tool call out, and puts a note in its place:
+
+```
+roxy's sentinel blocked a Bash tool call (denylist match: 'curl').
+```
+
+Claude Code never ran the command. Its turn ends, and you can carry on. Tool calls that don't match work as usual.
+
+### Watch it in Inspect View
+
+Open [http://127.0.0.1:7575](http://127.0.0.1:7575). Each Claude Code conversation is a sample. Its transcript shows every model call, the tool calls the model asked for, and the sentinel's verdict under each one: `Continued`, or `Rejected` with the reason. Reload the page to see new calls.
+
+<img src={inspectView} alt="Inspect View: Claude Code's curl tool call, and the sentinel's rejection under it" />
+
+### Read roxy's flow log
 
 ```sh
 docker compose logs roxy
 ```
 
-Each exchange is one JSON line. The deny for `/admin/` names the rule that decided it:
-
-```json
-{"event":"request","req":{"method":"GET","host":"example.com","port":443,"path":"/admin/"},
- "decision":"deny","terminal_rule":"no-admin-paths","stage":"head"}
-```
-
-The full event has more fields: client, TLS, timing, tags and the rules that matched. See [flow log](/operate/flow-log).
+roxy's flow log has a line for every request Claude Code made, model calls or not, with the rule and the addons each one went through. Each sample in Inspect View lists the flow ids of its model calls (Metadata tab), so the two join. To keep whole requests and responses too, turn on [capture](/operate/flow-log#capture).
 
 ### Clean up
 
@@ -75,75 +94,57 @@ docker compose down -v
 
 ## What just happened
 
-### The network does the containment
+### Two layers
 
-roxy is an explicit proxy. The client's `HTTPS_PROXY` only tells well-behaved tools where roxy is. The containment is in the Compose networks:
+roxy decides by **host**. The policy allows Anthropic's API and sign-in hosts and denies everything else. That covers everything Claude Code sends through the proxy, not only its model calls: the commands it runs (a `curl` that got past the sentinel, `git`, `npm`) and WebFetch get a `403` from roxy for any other host.
 
-```yaml
-services:
-  roxy:
-    networks: [sandbox, egress]
-  agent:
-    networks: [sandbox]              # no route out except through roxy
-
-networks:
-  sandbox:
-    internal: true                   # no route out: the containment
-  egress: {}
-```
-
-The client sits only on `sandbox`, an `internal: true` network with no route out and no outside DNS. roxy is the only container on both `sandbox` and `egress`. A client that ignores the proxy variables, or a library that opens its own sockets, gets nowhere. That's why the last two rows of the table fail.
-
-### The policy
-
-The policy is [`roxy.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/compose/roxy.yaml):
+The sentinel decides by **content**. It is a [service layer](/addons/service-layers): an addon that every exchange streams through, above the rules. It judges only model calls (`POST …/v1/messages`, or `…/chat/completions`), and passes every other request through untouched for the rules to decide. For each model response, it turns every tool call into an inspect_sentinel `BeforeToolCall` step and runs the configured sentinel on it. Whatever it passes on, roxy's rules judge again.
 
 ```yaml
-version: 1
+addons:
+  - name: sentinel
+    kind: service
+    endpoint: sidecar
+    endpoints:
+      sidecar: { url: "http://sentinel:9000/", private_ok: true }
+    limits:
+      first_byte_timeout: 120s  # a held (non-streamed) response arrives whole
+      max_exchange_time: 15m    # a long generation
 
-listeners:
-  - name: proxy
-    bind: 0.0.0.0:3128
-
-ca_server:
-  bind: 0.0.0.0:3130          # /roxy-ca.pem (the agent fetches it) and /healthz
-
-tls:
-  ca_dir: /var/lib/roxy/ca
-
-# Anything no rule allows is denied. A matching deny always beats an allow.
 default: deny
 
 rules:
-  - id: example-reads
-    when: host == "example.com" and method in [GET, HEAD]
+  - id: claude-api
+    when: host == "api.anthropic.com"
     then: allow
 
-  - id: echo-service
-    when: host == "postman-echo.com" and path starts_with "/"
+  - id: claude-sign-in
+    when: host in ["claude.ai", "claude.com", "platform.claude.com"]
     then: allow
-
-  # A watching rule: it reads body.bytes, so it checks the upload as it
-  # streams and stops it at the chunk that crosses 1 MiB.
-  - id: upload-cap
-    when: body.bytes > 1mb
-    then: { deny: { status: 413, message: "upload too large" } }
-
-  - id: no-admin-paths
-    when: path starts_with "/admin"
-    then: deny
 ```
 
-Rule order doesn't change the decision. Any matching deny wins, then any matching allow, then the default. So `no-admin-paths` denies `example.com/admin/` even though `example-reads` allows the host.
+The full policy is [`roxy.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/roxy.yaml).
 
-Most rules read only the request head and are decided before anything is forwarded. `upload-cap` reads `body.bytes`, which is only known as the body streams. roxy keeps checking it and stops the upload at the chunk that crosses the limit. See [evaluation](/policies/overview#evaluation).
+### The denylist
 
-### TLS
+The sentinel runs `deny_regex` from [`policies.py`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/sentinel/policies.py). It searches `<tool name> <arguments as JSON>` for a regular expression. The default catches `curl`, `wget`, `nc`, `ssh`, `scp`, `rsync` and `rm -rf`. Set your own with `SENTINEL_DENY`:
 
-roxy terminates TLS for every `CONNECT` with a leaf certificate from its own CA. The client fetches the CA from `http://roxy:3130/roxy-ca.pem` at startup and trusts it through `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS`. The CA lives in the `roxy-ca` volume, so it survives restarts. See [TLS and the CA](/operate/ca-certificates).
+```sh
+SENTINEL_DENY='\bgit\s+push\b|\bnpm\s+publish\b' docker compose up -d --wait
+```
+
+Any inspect_sentinel monitor or protocol works in its place, including ones that ask a model: set `SENTINEL` to its `module:attribute`, and for one that asks a model, `SENTINEL_MONITOR_MODEL` and a route out (add the `sentinel` service to the `egress` network). The sidecar is in [`sentinel/`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/quickstart/sentinel).
+
+### What a blocked call looks like
+
+A response with a blocked tool call reaches Claude Code as an ordinary assistant message that ends the turn, not as an API error. The sentinel holds each streamed response until it has judged it. It sends the start of the response and keep-alive pings at once, so Claude Code doesn't time out, and the content arrives in one burst rather than token by token.
+
+### This is not containment
+
+Claude Code follows `HTTPS_PROXY` because it chooses to. The commands it runs inherit the variable, but any process can ignore it. This quickstart shows what roxy and the sentinel decide, not a boundary. To contain an agent, run it where its only route out is roxy: see [containing a workload](/deploy/overview).
 
 ## Next steps
 
-- **Contain your own workload.** Replace the `agent` service with it, keeping `networks: [sandbox]` and its environment, then edit `roxy.yaml`.
-- **Reload the policy.** `docker compose kill -s HUP roxy` reloads it. A bad policy is rejected and the running one stays. Listener, TLS and capture settings need `docker compose restart roxy`.
-- **Run it elsewhere.** [Deployment](/deploy/overview) has the same recipe outside Compose.
+- **Contain the agent.** [Containing a workload](/deploy/overview) has the network recipe and a Compose layout.
+- **Hold the API key in roxy.** With [secrets](/policies/secrets), roxy sets `x-api-key` on the way out, and the agent only holds a placeholder.
+- **Write your own policy.** [AI agents](/use-cases/ai-agents) has a fuller starting policy, and [how policies work](/policies/overview) explains how rules are evaluated.

@@ -1,7 +1,0 @@
-# The sidecar: inspect_sentinel (which installs its inspect_ai branch), the
-# SDKs inspect_ai's wire-format converters use, and websockets for roxy's
-# service-layer protocol.
-inspect_sentinel @ git+https://github.com/meridianlabs-ai/inspect_sentinel
-anthropic
-openai
-websockets>=14

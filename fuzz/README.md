@@ -48,7 +48,8 @@ vectors, so the seeds are never stale and nothing derived is checked in:
   config byte.
 - **`url`:** request targets from that corpus.
 - **`client_hello`:** real ClientHellos from Python's `ssl`.
-- **`rule_compile`:** every `when:` expression in `examples/` and
+- **`rule_compile`:** every `when:` expression in `examples/`, the roxy
+  config test fixtures (`crates/roxy/tests/fixtures`) and
   `crates/roxy-rules`.
 - **`content_coding`:** a small stream in each coding (gzip and zlib from
   Python's standard library, br and zstd as fixed bytes), a stacked pair,

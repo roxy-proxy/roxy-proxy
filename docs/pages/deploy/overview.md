@@ -3,8 +3,7 @@
 roxy is an explicit proxy, not a transparent gateway. A client's
 `HTTPS_PROXY` only tells well-behaved clients where roxy is. What contains
 a workload is the network: it must have no route out except through roxy.
-[`examples/compose`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/compose) does this with Docker networks;
-the same recipe applies anywhere:
+The same recipe applies anywhere:
 
 1. **Take away the workload's route out.** Put it in a network namespace,
    VM or container network whose only reachable host is roxy. Block
@@ -27,6 +26,40 @@ the same recipe applies anywhere:
 
    Adding the certificate to the system trust store also works. Do not put
    external hosts in `NO_PROXY`.
+
+With Docker Compose, the workload sits only on an `internal: true` network,
+which has no route out and no outside DNS, and roxy is the only container on
+both that network and one with a route out:
+
+```yaml
+services:
+  roxy:
+    image: ghcr.io/roxy-proxy/roxy:edge
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes: [./roxy.yaml:/etc/roxy/roxy.yaml:ro, roxy-ca:/var/lib/roxy/ca]
+    networks: [sandbox, egress]
+  agent:
+    image: your-workload
+    networks: [sandbox]              # no route out except through roxy
+    environment:
+      HTTPS_PROXY: http://roxy:3128
+      https_proxy: http://roxy:3128
+      NO_PROXY: roxy                 # roxy's CA endpoint, reached directly
+      no_proxy: roxy
+networks:
+  sandbox:
+    internal: true                   # no route out: the containment
+  egress: {}
+volumes:
+  roxy-ca: {}
+```
+
+The workload fetches the CA from `http://roxy:3130/roxy-ca.pem` (with
+`ca_server.bind: 0.0.0.0:3130`). A client that ignores the proxy variables,
+or a library that opens its own sockets, gets nowhere: direct connections
+and DNS lookups fail.
 
 ## Why an explicit proxy
 
