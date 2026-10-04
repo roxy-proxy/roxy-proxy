@@ -25,7 +25,7 @@ docker run -d --name roxy \
 
 | path | what |
 |---|---|
-| `/etc/roxy/roxy.yaml` | The config. The default is [`examples/docker/roxy.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/docker/roxy.yaml); mount your own read-only. |
+| `/etc/roxy/roxy.yaml` | The config. The default is [`docker/roxy.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/docker/roxy.yaml); mount your own read-only. |
 | `/var/lib/roxy/ca` | Volume: the CA key and certificate, generated on first start. **Keep it**: a new CA means every client must re-trust it. Owned by 65532, mode 0700. |
 | `/var/log/roxy` | Volume, for a config that sets `log.flow.path` (for example `/var/log/roxy/flow.jsonl`). The default config logs flows to stdout. |
 | `capture_dir` | [Capture](/operate/flow-log#capture) is off by default. If you set `capture_dir`, mount a volume there; the root filesystem is read-only. |

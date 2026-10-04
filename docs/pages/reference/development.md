@@ -7,9 +7,9 @@ cargo test --workspace            # unit, corpus, property and end-to-end tests
 ```
 
 CI (`.github/workflows/ci.yml`) runs these with `RUSTFLAGS=-D warnings`,
-plus `cargo deny` and a `wasm` job. The wasm components
-(`crates/roxy-wasm/test-components`, `examples/addons`) are their own
-workspaces and are checked in prebuilt, so the main jobs need no wasm
+plus `cargo deny` and a `wasm` job. The wasm test components
+(`crates/roxy-wasm/test-components`) are their own
+workspace and are checked in prebuilt, so the main jobs need no wasm
 target; the `wasm` job rebuilds them from source and runs the tests that
 load them, so the binaries cannot drift from their sources. After changing
 one, rebuild it with its `build.sh` and commit the result.

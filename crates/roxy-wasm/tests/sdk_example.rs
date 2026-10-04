@@ -1,5 +1,6 @@
-//! The `roxy-addon` SDK's example layer (`examples/addons/redact`, rebuilt by
-//! `examples/addons/build.sh`) under the real host with a mock `LayerHost`.
+//! A layer built with the `roxy-addon` SDK (`test-components/redact`, rebuilt by
+//! `test-components/build.sh`) under the real host with a mock `LayerHost`: the SDK
+//! and the host agree on the WIT contract.
 
 use bytes::Bytes;
 use http::Request;
@@ -10,7 +11,7 @@ use roxy_wasm::{Layer, LayerConfig, WasmRuntime};
 mod common;
 use common::{Mock, collect};
 
-const REDACT: &[u8] = include_bytes!("../../../examples/addons/redact/redact.wasm");
+const REDACT: &[u8] = include_bytes!("fixtures/redact.wasm");
 
 async fn redact() -> Layer {
     let rt = WasmRuntime::new().unwrap();

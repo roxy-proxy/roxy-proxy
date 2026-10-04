@@ -12,6 +12,10 @@ Small `roxy:addon` components used by `crates/roxy-wasm/tests/`.
   a stack can be driven separately.
 - `tunnel-layer` (world `tunnel-layer`): relays an upgraded connection
   (tagging the flow `tunnel`, and `tunnel:<name>` when named).
+- `redact`: built with the `roxy-addon` SDK rather than raw bindings, so a
+  test (`tests/sdk_example.rs`) checks the SDK and the host agree. It
+  redacts configured strings from both bodies as they stream, holding back
+  only the bytes a match could straddle.
 
 ## Why prebuilt fixtures
 

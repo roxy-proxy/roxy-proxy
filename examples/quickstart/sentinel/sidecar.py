@@ -1,47 +1,36 @@
 """inspect_sentinel at the network boundary: a roxy service layer.
 
-Every exchange streams through this sidecar (roxy.layer.v1).
-For a model API call (Anthropic Messages or OpenAI Chat
-Completions) it forwards the request, reads the model's response, turns
-each tool call in it into an inspect_sentinel `BeforeToolCall` step, and
-runs the configured sentinel on it before the agent sees the response:
+Every exchange streams through this sidecar (roxy.layer.v1). For an
+Anthropic Messages call (`POST .../v1/messages`) it forwards the request,
+reads the model's response, turns each tool call in it into an
+inspect_sentinel `BeforeToolCall` step, and runs the configured sentinel on
+it before the agent sees the response:
 
     continue   the response goes to the agent unchanged
-    modify     the tool call's arguments are replaced (JSON responses)
-    reject     the agent does not get the response (see SENTINEL_ON_REJECT)
+    modify     the tool call's arguments are replaced (non-streamed responses)
+    reject     the response is replaced by an assistant message that keeps
+               the model's text, drops its tool calls and says what was
+               blocked, so the agent's turn ends normally
     terminate  as reject; the sidecar cannot end the agent itself
     escalate   unresolved at the root: treated as reject (fail closed)
 
-Everything else (and every non-200 answer) passes through untouched.
+Everything else (other requests, and every non-200 answer) passes through
+untouched, for roxy's rules to decide. A streamed response starts at once
+(its head and `message_start`, then pings) while the rest is held and
+judged, so the agent's first-byte and idle deadlines are met.
 
-The sidecar implements inspect_sentinel's host side: a `Host` whose
-`generate` calls the monitor model directly (not through roxy), a
-`Recorder` that writes every report as a JSON line on stdout, and a store
-per conversation, keyed by a fingerprint of the conversation's stable head
-(system prompt and first user turn) so an agent cannot rotate it.
+Each conversation, its model calls and the sentinel's reports are written
+as an Inspect eval log for `inspect view` (inspect_log.py).
 
 Configuration (environment):
 
-    SENTINEL                 module:attribute of the sentinel (default policies:no_network)
-    SENTINEL_MONITOR_MODEL   the model `context.host.generate` uses (e.g. anthropic/claude-haiku-4-5)
+    SENTINEL                 module:attribute of the sentinel (default policies:deny_regex)
+    SENTINEL_DENY            the regex deny_regex uses (see policies.py)
+    SENTINEL_MONITOR_MODEL   the model `context.host.generate` uses, for sentinels
+                             that ask one (e.g. anthropic/claude-haiku-4-5)
     SENTINEL_LISTEN          host:port to listen on (default 127.0.0.1:9000)
-    SENTINEL_TASK            the deployed agent's name, for `context.task`
-    SENTINEL_LOG_DIR         if set, also write an Inspect eval log there for
-                             `inspect view` (see inspect_log.py)
-    SENTINEL_ON_REJECT       deny (default): the agent gets a 403 carrying the
-                             decision's message; explain: an Anthropic response
-                              is replaced by an assistant message saying what was
-                             blocked, so the agent's turn ends normally. A
-                             streamed response starts at once (head,
-                             message_start, then pings) while it is judged,
-                             so the agent's first-byte deadline is met
-
-Known gaps, as inspect_sentinel's deployment design describes them: a
-proxy sees `AfterToolCall` only in the next request (not projected here);
-`reject` here is an error the agent's SDK raises (or, with `explain`, the
-end of the agent's turn), not the append-and-regenerate replay an eval does;
-and streamed responses are held until judged, which costs time to first
-token.
+    SENTINEL_LOG_DIR         where the Inspect log goes (default /logs)
+    SENTINEL_TASK            the agent's name, for `context.task` and the log
 """
 
 from __future__ import annotations
@@ -53,7 +42,6 @@ import importlib
 import json
 import logging
 import os
-import sys
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Sequence
@@ -66,9 +54,7 @@ from inspect_ai.model import (
     ModelOutput,
     get_model,
     messages_from_anthropic,
-    messages_from_openai,
     model_output_from_anthropic,
-    model_output_from_openai,
 )
 from inspect_ai.tool import ToolCall, ToolCallView, ToolInfo
 from inspect_ai.util import Store
@@ -77,17 +63,15 @@ from inspect_sentinel import BeforeToolCall, Context, Decision, HumanAnswer, Ste
 # The host contract inspect_ai itself uses to run a sentinel.
 from inspect_sentinel._integration import HostContext, resolve_sentinel, run_sentinel
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from roxy_layer import Exchange, Request, Response, serve  # noqa: E402
-
-from inspect_log import InspectLog, InspectRecorder, Recorders  # noqa: E402
+from inspect_log import InspectLog, InspectRecorder
+from roxy_layer import Exchange, Request, Response, serve
 
 log = logging.getLogger("sentinel-sidecar")
 
 MAX_CONVERSATIONS = 10_000
 
-# While a streamed response is held for judging (explain mode), a ping
-# this often keeps the client's idle watchdogs from giving up on it.
+# While a streamed response is held for judging, a ping this often keeps
+# the agent's idle watchdogs from giving up on it.
 PING_EVERY = 10.0
 PING = b'event: ping\ndata: {"type": "ping"}\n\n'
 
@@ -125,54 +109,6 @@ class SidecarHost:
         raise RuntimeError("the sidecar has no person to ask")
 
 
-def _jsonable(v: Any) -> Any:
-    if hasattr(v, "model_dump"):
-        return v.model_dump(mode="json", exclude_none=True)
-    if dataclasses.is_dataclass(v) and not isinstance(v, type):
-        return {f.name: _jsonable(getattr(v, f.name)) for f in dataclasses.fields(v)}
-    if isinstance(v, (list, tuple)):
-        return [_jsonable(x) for x in v]
-    if isinstance(v, dict):
-        return {k: _jsonable(x) for k, x in v.items()}
-    return v if isinstance(v, (str, int, float, bool, type(None))) else str(v)
-
-
-class JsonlRecorder:
-    """Every report, failure and cancellation, one JSON line each, tagged
-    with roxy's flow id so it joins roxy's flow log."""
-
-    def __init__(self, flow: str | None) -> None:
-        self.flow = flow
-
-    def _emit(self, kind: str, context: Context, factory: str, step: Step, **data: Any) -> None:
-        call = getattr(step, "call", None)
-        line = {
-            "event": f"sentinel_{kind}",
-            "flow": self.flow,
-            "conversation": step.conversation,
-            "path": context.path,
-            "factory": factory,
-            "tool": call.function if call else None,
-            **{k: _jsonable(v) for k, v in data.items()},
-        }
-        print(json.dumps(line), flush=True)
-
-    def record(self, context: Context, factory: str, step: Step, reported: Any) -> None:
-        self._emit("report", context, factory, step, reported=reported)
-
-    def failed(self, context: Context, factory: str, step: Step, failed: Any) -> None:
-        self._emit("failed", context, factory, step, failed=failed)
-
-    def cancelled(self, context: Context, factory: str, step: Step, name: str) -> None:
-        self._emit("cancelled", context, factory, step, name=name)
-
-    def bypassed(self, context: Context, factory: str, step: Step, name: str) -> None:
-        self._emit("bypassed", context, factory, step, name=name)
-
-    def superseded(self, context: Context, factory: str, step: Step, reported: Any) -> None:
-        self._emit("superseded", context, factory, step, reported=reported)
-
-
 class Stores:
     """One store per conversation, least recently used dropped first. A
     miss is a fresh store: a monitor degrades to no history."""
@@ -188,7 +124,7 @@ class Stores:
         return store
 
 
-# ----- model API wire formats -------------------------------------------------
+# ----- the Anthropic Messages wire format ---------------------------------------
 
 
 def _system_text(system: Any) -> str | None:
@@ -197,12 +133,8 @@ def _system_text(system: Any) -> str | None:
     return "\n".join(b.get("text", "") for b in system if isinstance(b, dict))
 
 
-def _fingerprint(*parts: Any) -> str:
-    return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()[:24]
-
-
 def anthropic_from_sse(raw: bytes) -> dict[str, Any]:
-    """Rebuilds an Anthropic `Message` from its event stream."""
+    """Rebuilds a `Message` from its event stream."""
     message: dict[str, Any] = {}
     partial: dict[int, str] = {}
     for event in raw.decode().split("\n\n"):
@@ -235,55 +167,10 @@ def anthropic_from_sse(raw: bytes) -> dict[str, Any]:
     return message
 
 
-class Call:
-    """One model API exchange, as inspect_ai types."""
-
-    def __init__(
-        self,
-        api: str,
-        request: dict[str, Any],
-        response: dict[str, Any],
-        streamed: bool,
-    ) -> None:
-        self.api = api
-        self.request = request
-        self.response = response
-        self.streamed = streamed
-
-    async def input(self) -> list[ChatMessage]:
-        if self.api == "anthropic":
-            return await messages_from_anthropic(
-                self.request.get("messages", []), _system_text(self.request.get("system"))
-            )
-        return await messages_from_openai(self.request.get("messages", []))
-
-    async def output(self) -> ModelOutput:
-        if self.api == "anthropic":
-            return await model_output_from_anthropic(self.response)
-        return await model_output_from_openai(self.response)
-
-    def conversation(self) -> str:
-        messages = self.request.get("messages", [])
-        first_user = next((m for m in messages if m.get("role") == "user"), None)
-        return _fingerprint(self.api, self.request.get("system"), first_user)
-
-    def modify(self, call: ToolCall, replacement: ToolCall) -> None:
-        """Replaces a tool call's arguments in the response."""
-        if self.api == "anthropic":
-            for block in self.response.get("content", []):
-                if block.get("type") == "tool_use" and block.get("id") == call.id:
-                    block["input"] = replacement.arguments
-        else:
-            for choice in self.response.get("choices", []):
-                for tc in choice.get("message", {}).get("tool_calls") or []:
-                    if tc.get("id") == call.id:
-                        tc["function"]["arguments"] = json.dumps(replacement.arguments)
-
-
 def explanation(response: dict[str, Any], message: str) -> dict[str, Any]:
-    """An Anthropic `Message` that keeps the model's text, drops its tool
-    calls and thinking, and says what was blocked. Its `end_turn` hands the
-    turn back to the person, as an ordinary answer would."""
+    """A `Message` that keeps the model's text, drops its tool calls and
+    thinking, and says what was blocked. Its `end_turn` hands the turn back
+    to the person, as an ordinary answer would."""
     text = [b for b in response.get("content", []) if b.get("type") == "text"]
     return {
         **response,
@@ -294,8 +181,8 @@ def explanation(response: dict[str, Any], message: str) -> dict[str, Any]:
 
 
 def anthropic_to_sse(message: dict[str, Any], *, start: bool = True) -> bytes:
-    """The event stream for a whole Anthropic `Message` (text blocks only),
-    without its `message_start` event if that was already sent."""
+    """The event stream for a whole `Message` (text blocks only), without
+    its `message_start` event if that was already sent."""
     events: list[tuple[str, dict[str, Any]]] = []
     if start:
         head = {**message, "content": [], "stop_reason": None, "stop_sequence": None}
@@ -326,6 +213,37 @@ def anthropic_to_sse(message: dict[str, Any], *, start: bool = True) -> bytes:
     return "".join(f"event: {e}\ndata: {json.dumps(d)}\n\n" for e, d in events).encode()
 
 
+class Call:
+    """One Messages exchange, as inspect_ai types."""
+
+    def __init__(self, request: dict[str, Any], response: dict[str, Any], streamed: bool) -> None:
+        self.request = request
+        self.response = response
+        self.streamed = streamed
+
+    async def input(self) -> list[ChatMessage]:
+        return await messages_from_anthropic(
+            self.request.get("messages", []), _system_text(self.request.get("system"))
+        )
+
+    async def output(self) -> ModelOutput:
+        return await model_output_from_anthropic(self.response)
+
+    def conversation(self) -> str:
+        # The conversation's stable head (system prompt, first user turn),
+        # so the agent cannot rotate it.
+        messages = self.request.get("messages", [])
+        first_user = next((m for m in messages if m.get("role") == "user"), None)
+        head = json.dumps([self.request.get("system"), first_user], sort_keys=True)
+        return hashlib.sha256(head.encode()).hexdigest()[:24]
+
+    def modify(self, call: ToolCall, replacement: ToolCall) -> None:
+        """Replaces a tool call's arguments in the response."""
+        for block in self.response.get("content", []):
+            if block.get("type") == "tool_use" and block.get("id") == call.id:
+                block["input"] = replacement.arguments
+
+
 @dataclasses.dataclass
 class Refusal:
     """The agent does not get this response."""
@@ -334,34 +252,27 @@ class Refusal:
     call: Call | None = None
 
 
-def classify(req: Request) -> str | None:
-    path = req.url.split("?", 1)[0]
-    if path.endswith("/v1/messages"):
-        return "anthropic"
-    if path.endswith("/chat/completions"):
-        return "openai"
-    return None
+def is_model_call(req: Request) -> bool:
+    return req.method == "POST" and req.url.split("?", 1)[0].endswith("/v1/messages")
+
+
+def with_length(res: Response, length: int) -> Response:
+    headers = [(n, v) for n, v in res.headers if n.lower() != "content-length"]
+    return Response(res.status, [*headers, ("content-length", str(length))])
 
 
 # ----- the layer --------------------------------------------------------------
 
 
 class Sidecar:
-    def __init__(self, sentinel: Any, on_reject: str = "deny") -> None:
-        if on_reject not in ("deny", "explain"):
-            raise ValueError(f"SENTINEL_ON_REJECT must be deny or explain, not {on_reject!r}")
-        self.explain = on_reject == "explain"
+    def __init__(self, sentinel: Any, inspect_log: InspectLog) -> None:
         self.root = resolve_sentinel(sentinel)
-        log_dir = os.environ.get("SENTINEL_LOG_DIR")
-        self.inspect_log = (
-            InspectLog(log_dir, os.environ.get("SENTINEL_TASK", "roxy")) if log_dir else None
-        )
         self.host = SidecarHost()
         self.stores = Stores()
+        self.inspect_log = inspect_log
 
     async def handle(self, ex: Exchange) -> None:
-        api = classify(ex.request)
-        if api is None or ex.request.method != "POST":
+        if not is_model_call(ex.request):
             # Not a model call: stream it through untouched.
             res = await ex.forward(ex.request, ex.body())
             await ex.respond(res, ex.response_body())
@@ -369,33 +280,31 @@ class Sidecar:
         body = await ex.read_body()
         res = await ex.forward(ex.request, body)
         streamed = (res.header("content-type") or "").startswith("text/event-stream")
-        if self.explain and api == "anthropic" and streamed and res.status == 200 and not ex.observing:
+        if streamed and res.status == 200 and not ex.observing:
             head = [(n, v) for n, v in res.headers if n.lower() != "content-length"]
-            await ex.respond(Response(res.status, head), self.judged_stream(ex, api, body, res))
+            await ex.respond(Response(res.status, head), self.judged_stream(ex, body, res))
             return
         raw = await ex.read_response_body()
         if res.status != 200 or ex.observing:
             await ex.respond(res, raw)
             if ex.observing and res.status == 200:
-                await self.judge(ex, api, body, res, raw)
+                await self.judge(ex, body, res, raw)
             return
-        verdict = await self.judge(ex, api, body, res, raw)
+        verdict = await self.judge(ex, body, res, raw)
         if verdict is None:
             await ex.respond(res, raw)
         elif isinstance(verdict, bytes):
             await ex.respond(with_length(res, len(verdict)), verdict)
-        elif self.explain and verdict.call and verdict.call.api == "anthropic":
+        elif verdict.call:
             out = json.dumps(explanation(verdict.call.response, verdict.message)).encode()
             await ex.respond(with_length(res, len(out)), out)
         else:
             await ex.deny(403, verdict.message)
 
-    async def judged_stream(
-        self, ex: Exchange, api: str, body: bytes, res: Response
-    ) -> AsyncIterator[bytes]:
-        """A streamed Anthropic response, judged before the agent sees any
-        content: its `message_start` passes at once, pings follow while the
-        rest is held, then the rest or, if refused, the explanation."""
+    async def judged_stream(self, ex: Exchange, body: bytes, res: Response) -> AsyncIterator[bytes]:
+        """A streamed response, judged before the agent sees any content:
+        its `message_start` passes at once, pings follow while the rest is
+        held, then the rest or, if refused, the explanation."""
         chunks: list[bytes] = []
 
         async def read() -> None:
@@ -424,7 +333,7 @@ class Sidecar:
         reader.result()
         raw = b"".join(chunks)
         sent = max(sent, 0)
-        verdict = await self.judge(ex, api, body, res, raw)
+        verdict = await self.judge(ex, body, res, raw)
         if verdict is None or isinstance(verdict, bytes):
             # Streamed responses are never modified (see judge).
             yield raw[sent:]
@@ -434,41 +343,30 @@ class Sidecar:
             error = {"type": "error", "error": {"type": "api_error", "message": verdict.message}}
             yield f"event: error\ndata: {json.dumps(error)}\n\n".encode()
 
-    async def judge(
-        self, ex: Exchange, api: str, body: bytes, res: Response, raw: bytes
-    ) -> None | bytes | Refusal:
+    async def judge(self, ex: Exchange, body: bytes, res: Response, raw: bytes) -> None | bytes | Refusal:
         """None to pass the response on, new bytes for a modified response,
         or a refusal."""
         streamed = (res.header("content-type") or "").startswith("text/event-stream")
         try:
             request = json.loads(body)
-            if streamed and api == "anthropic":
-                response = anthropic_from_sse(raw)
-            elif streamed:
-                return Refusal("the sentinel cannot read this streamed response (use stream: false)")
-            else:
-                response = json.loads(raw)
+            response = anthropic_from_sse(raw) if streamed else json.loads(raw)
         except (ValueError, KeyError, IndexError) as e:
-            log.warning("unreadable %s exchange: %s", api, e)
+            log.warning("unreadable model exchange: %s", e)
             return Refusal("the sentinel could not read this model exchange")
-        call = Call(api, request, response, streamed)
+        call = Call(request, response, streamed)
         output = await call.output()
-        tool_calls = output.message.tool_calls or []
-        if not tool_calls and self.inspect_log is None:
-            return None
         try:
             input = await call.input()
         except Exception as e:  # noqa: BLE001
             # The history is context for the sentinel, not the thing it
             # judges: a conversation the converter cannot read still gets
             # its tool calls judged, with no history.
-            log.warning("unreadable %s conversation history: %s", api, e)
+            log.warning("unreadable conversation history: %s", e)
             input = []
         conversation = call.conversation()
-        flow = ex.flow.get("roxy-flow-id")
-        if self.inspect_log is not None:
-            model = f"{api}/{call.response.get('model', 'unknown')}"
-            self.inspect_log.model_call(conversation, flow, model, input, output)
+        model = f"anthropic/{response.get('model', 'unknown')}"
+        self.inspect_log.model_call(conversation, ex.flow.get("roxy-flow-id"), model, input, output)
+        tool_calls = output.message.tool_calls or []
         if not tool_calls:
             return None
         first_user = next((m for m in input if m.role == "user"), None)
@@ -485,11 +383,7 @@ class Sidecar:
         )
         host_context = HostContext(
             context=context,
-            recorder=(
-                Recorders(JsonlRecorder(flow), InspectRecorder(self.inspect_log))
-                if self.inspect_log is not None
-                else JsonlRecorder(flow)
-            ),
+            recorder=InspectRecorder(self.inspect_log),
             store=self.stores.get(conversation),
         )
         modified = False
@@ -520,32 +414,25 @@ class Sidecar:
         return json.dumps(call.response).encode() if modified else None
 
 
-def with_length(res: Response, length: int) -> Response:
-    headers = [(n, v) for n, v in res.headers if n.lower() != "content-length"]
-    return Response(res.status, [*headers, ("content-length", str(length))])
-
-
 def load_sentinel(spec: str) -> Any:
     module, _, attr = spec.partition(":")
-    sys.path.insert(0, os.path.dirname(__file__))
     obj = getattr(importlib.import_module(module), attr)
     return obj() if callable(obj) else obj
 
 
 async def main() -> None:
-    sidecar = Sidecar(
-        load_sentinel(os.environ.get("SENTINEL", "policies:no_network")),
-        os.environ.get("SENTINEL_ON_REJECT", "deny"),
+    inspect_log = InspectLog(
+        os.environ.get("SENTINEL_LOG_DIR", "/logs"), os.environ.get("SENTINEL_TASK", "roxy")
     )
+    sidecar = Sidecar(load_sentinel(os.environ.get("SENTINEL", "policies:deny_regex")), inspect_log)
+    writer = asyncio.create_task(inspect_log.run())  # noqa: F841 (held for its lifetime)
+    log.info("writing an Inspect log to %s", inspect_log.path)
     host, _, port = os.environ.get("SENTINEL_LISTEN", "127.0.0.1:9000").rpartition(":")
-    if sidecar.inspect_log is not None:
-        writer = asyncio.create_task(sidecar.inspect_log.run())  # noqa: F841 (held for its lifetime)
-        log.info("writing an Inspect log to %s", sidecar.inspect_log.path)
     async with serve(sidecar.handle, host, int(port)) as server:
         log.info("sentinel sidecar listening on %s:%s", host, port)
         await server.serve_forever()
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())

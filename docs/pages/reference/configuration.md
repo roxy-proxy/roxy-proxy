@@ -3,8 +3,8 @@
 One YAML file, `version: 1`. Parsing is strict: an unknown key anywhere is
 an error, not a silently ignored setting. Relative paths (`ca_dir`, `ca_cert`, `ca_key`, secret
 files, list files, addon paths, log and capture paths) resolve against the
-process's working directory. [`examples/roxy.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/roxy.yaml)
-shows every section.
+process's working directory. Each section is described on the page the
+table names.
 
 | key | page |
 |---|---|

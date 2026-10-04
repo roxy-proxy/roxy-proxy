@@ -72,24 +72,13 @@ Claude Code never ran the command. Its turn ends, and you can carry on. Tool cal
 
 Open [http://127.0.0.1:7575](http://127.0.0.1:7575). Each Claude Code conversation is a sample. Its transcript shows every model call, the tool calls the model asked for, and the sentinel's verdict under each one: `Continued`, or `Rejected` with the reason. Reload the page to see new calls.
 
-### Read the logs
-
-```sh
-docker compose logs sentinel
-```
-
-Every tool call the sentinel judged, allowed or blocked, is a JSON line tagged with roxy's flow id:
-
-```json
-{"event": "sentinel_report", "flow": "01M435BYT45CK0RFAQS7821JKA", "factory": "deny_regex", "tool": "Bash",
- "reported": {"report": {"action": "reject", "explanation": "Bash matches the denylist: 'curl'", ...}}}
-```
+### Read roxy's flow log
 
 ```sh
 docker compose logs roxy
 ```
 
-roxy's flow log has a line for every request Claude Code made, with the rule and the addons each one went through, and joins the sentinel's lines on the flow id. To keep whole requests and responses too, turn on [capture](/operate/flow-log#capture).
+roxy's flow log has a line for every request Claude Code made, model calls or not, with the rule and the addons each one went through. Each sample in Inspect View lists the flow ids of its model calls (Metadata tab), so the two join. To keep whole requests and responses too, turn on [capture](/operate/flow-log#capture).
 
 ### Clean up
 
@@ -134,17 +123,17 @@ The full policy is [`roxy.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/m
 
 ### The denylist
 
-The sentinel runs `deny_regex` from [`policies.py`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/addons/service/sentinel/policies.py). It searches `<tool name> <arguments as JSON>` for a regular expression. The default catches `curl`, `wget`, `nc`, `ssh`, `scp`, `rsync` and `rm -rf`. Set your own with `SENTINEL_DENY`:
+The sentinel runs `deny_regex` from [`policies.py`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/sentinel/policies.py). It searches `<tool name> <arguments as JSON>` for a regular expression. The default catches `curl`, `wget`, `nc`, `ssh`, `scp`, `rsync` and `rm -rf`. Set your own with `SENTINEL_DENY`:
 
 ```sh
 SENTINEL_DENY='\bgit\s+push\b|\bnpm\s+publish\b' docker compose up -d --wait
 ```
 
-Any inspect_sentinel monitor or protocol works in its place, including ones that ask a model. See the [sentinel example](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/addons/service/sentinel).
+Any inspect_sentinel monitor or protocol works in its place, including ones that ask a model: set `SENTINEL` to its `module:attribute`, and for one that asks a model, `SENTINEL_MONITOR_MODEL` and a route out (add the `sentinel` service to the `egress` network). The sidecar is in [`sentinel/`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/quickstart/sentinel).
 
 ### What a blocked call looks like
 
-The sentinel runs with `SENTINEL_ON_REJECT=explain`. A response with a blocked tool call reaches Claude Code as an ordinary assistant message that ends the turn, not as an API error. The sentinel holds each streamed response until it has judged it. It sends the start of the response and keep-alive pings at once, so Claude Code doesn't time out, and the content arrives in one burst rather than token by token.
+A response with a blocked tool call reaches Claude Code as an ordinary assistant message that ends the turn, not as an API error. The sentinel holds each streamed response until it has judged it. It sends the start of the response and keep-alive pings at once, so Claude Code doesn't time out, and the content arrives in one burst rather than token by token.
 
 ### This is not containment
 

@@ -34,22 +34,18 @@ services:
       sentinel:
         condition: service_healthy
 
-  # The sentinel sidecar (examples/addons/service/sentinel): a regex
-  # denylist over tool calls. It needs no route out, so it has none.
+  # The sentinel sidecar (./sentinel): a regex denylist over tool calls.
+  # It needs no route out, so it has none.
   sentinel:
     image: roxy-quickstart-sentinel
-    build:
-      context: ../addons/service
-      dockerfile: sentinel/Dockerfile
+    build: ./sentinel
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     tmpfs: [/tmp]
     environment:
       SENTINEL: policies:deny_regex
-      SENTINEL_ON_REJECT: explain      # a blocked call becomes an assistant message
       SENTINEL_DENY:                   # your regex, from the shell; unset = the default
-      SENTINEL_LOG_DIR: /logs          # an Inspect eval log, for inspect-view
     volumes:
       - sentinel-logs:/logs
     networks: [sidecar]

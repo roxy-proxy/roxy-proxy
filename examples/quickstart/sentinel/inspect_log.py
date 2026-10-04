@@ -195,29 +195,3 @@ class InspectRecorder:
 
     def bypassed(self, context: Context, factory: str, step: Step, name: str) -> None:
         self._emit(context, factory, step, _kind(factory), "bypassed")
-
-
-class Recorders:
-    """Every report to each of several recorders."""
-
-    def __init__(self, *recorders: Any) -> None:
-        self.recorders = recorders
-
-    def _each(self, name: str, *args: Any) -> None:
-        for r in self.recorders:
-            getattr(r, name)(*args)
-
-    def record(self, *args: Any) -> None:
-        self._each("record", *args)
-
-    def failed(self, *args: Any) -> None:
-        self._each("failed", *args)
-
-    def cancelled(self, *args: Any) -> None:
-        self._each("cancelled", *args)
-
-    def bypassed(self, *args: Any) -> None:
-        self._each("bypassed", *args)
-
-    def superseded(self, *args: Any) -> None:
-        self._each("superseded", *args)

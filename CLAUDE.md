@@ -39,10 +39,9 @@ cargo test --workspace
 ```
 
 CI also builds with `RUSTFLAGS=-D warnings`, so a warning fails the build.
-Changes to the wasm components (`crates/roxy-wasm/test-components`,
-`examples/addons`, `wit/`) also need the checks in CI's `wasm` job; the
-built components are checked in, so rebuild them with the `build.sh` scripts
-and commit the result. Changes to a fuzzed parser run the fuzz workflow on
+Changes to the wasm test components (`crates/roxy-wasm/test-components`,
+`wit/`) also need the checks in CI's `wasm` job; the built components are
+checked in, so rebuild them with `build.sh` and commit the result. Changes to a fuzzed parser run the fuzz workflow on
 the PR (`fuzz/README.md`).
 
 ## Code
