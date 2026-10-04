@@ -26,7 +26,7 @@ On the proxy port:
 - **CONNECT** opens a tunnel that roxy inspects ([below](#connect)).
 - **Origin-form requests** (`GET /path`) are rejected, except to the host
   `roxy.internal`, which serves the CA certificate at `/roxy-ca.pem`
-  ([TLS](tls.md#ca-distribution)). Anything else there is `404`.
+  ([TLS](/operate/ca-certificates#ca-distribution)). Anything else there is `404`.
 
 ### Proxy authentication
 
@@ -44,7 +44,7 @@ are no connect-time rules: every allow or deny decision is made on the
 requests inside the tunnel. roxy then peeks the tunnel's first bytes:
 
 - **A TLS ClientHello:** roxy reads the SNI and ALPN
-  ([ClientHello sniffing](tls.md#clienthello-sniffing)). The SNI must equal
+  ([ClientHello sniffing](/reference/tls#clienthello-sniffing)). The SNI must equal
   the CONNECT host (`tls.require_sni_match`, default true); a client that
   sends no SNI gets the CONNECT host. roxy terminates TLS with a leaf for
   that host, and the inner protocol must be HTTP/1.1 or HTTP/2 by ALPN.
@@ -59,7 +59,7 @@ Inside a tunnel, requests are origin-form, and their `Host` (or
 ## Direct listeners
 
 A direct listener takes connections that a client addressed to the origin
-itself, usually because roxy's [DNS listener](dns.md) answered the
+itself, usually because roxy's [DNS listener](/deploy/dns-steering) answered the
 origin's name with roxy's address. The client has no proxy settings and
 does not know roxy is there.
 
@@ -87,7 +87,7 @@ bytes, as it does inside a CONNECT tunnel:
   serves the CA certificate here, as on the proxy port.
 - **Anything else:** the connection is closed (`non_http_on_direct`).
 
-roxy resolves the target name itself ([upstream](upstream.md#dns)); the
+roxy resolves the target name itself ([upstream](/reference/upstream#dns)); the
 address the client connected to is roxy's own and plays no part. There are
 no connect-time rules: every decision is made on the requests, and
 `listener.mode` is `direct` in rules. Direct listeners take no `auth`,
@@ -102,7 +102,7 @@ spec, followed by the same semantic validation as HTTP/1.1
 ([HTTP/2 requests](#http2-requests)). Upstream, roxy offers `h2` and
 `http/1.1` and serialises each request as whichever the origin negotiates;
 the canonical model is version-agnostic. WebSocket upgrades always use
-HTTP/1.1 ([WebSockets](websockets.md)).
+HTTP/1.1 ([WebSockets](/policies/websockets)).
 
 gRPC and other HTTP/2-only protocols need trailers: set
 `http.allow_trailers`.
@@ -260,7 +260,7 @@ resource limits. hyper parses the response and roxy builds a
 
 roxy decodes `content-encoding` to inspect a body, never to forward it:
 `body.text` and `response.body.text` see the decoded text
-([rules](rules.md#body-access)), and the bytes forwarded are the bytes
+([rules](/policies/body-rules)), and the bytes forwarded are the bytes
 received.
 
 | coding | format |
@@ -281,7 +281,7 @@ received.
   sent.
 
 With addons, roxy also decodes bodies at the edge of the stack, so layers
-see them decoded ([addons](addons.md#content-codings)). This is the one case
+see them decoded ([addons](/addons/overview#content-codings)). This is the one case
 where roxy forwards a body decoded.
 
 `http.strip_accept_encoding` (default false) removes `accept-encoding` from

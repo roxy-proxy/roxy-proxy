@@ -1,4 +1,4 @@
-//! HTTP/2 request parts ↔ canonical model (docs/http.md#http2-requests).
+//! HTTP/2 request parts ↔ canonical model.
 //!
 //! Pure functions over `http` types; the `h2` connection itself is wired by
 //! `roxy-proxy`. The `h2` crate already enforces pseudo-header presence,

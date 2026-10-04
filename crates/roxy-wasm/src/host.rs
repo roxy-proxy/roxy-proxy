@@ -1,4 +1,4 @@
-//! The interface the proxy implements for a layer (docs/addons.md#host-services).
+//! The interface the proxy implements for a layer.
 
 use roxy_http::Body;
 
@@ -9,7 +9,7 @@ use roxy_http::Body;
 /// Requests handed *to* a layer come from the proxy's canonical model.
 /// Requests a layer passes *on* (`next`) are whatever the guest built; the
 /// host must re-validate them through the canonical model exactly as if a
-/// client had sent them (docs/addons.md#invariants, invariant 1) and fail the
+/// client had sent them (invariant 1) and fail the
 /// exchange closed if they do not validate. roxy-wasm sets no `host`
 /// header; the authority is in the URI.
 pub type LayerRequest = http::Request<Body>;

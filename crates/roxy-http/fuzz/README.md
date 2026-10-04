@@ -1,7 +1,7 @@
 # roxy-http fuzz targets
 
 `cargo-fuzz` targets for the parsers that see attacker-controlled bytes
-([docs/development.md](../../../docs/development.md#fuzzing)). This
+([fuzzing](https://roxy-proxy.github.io/roxy-proxy/reference/development#fuzzing)). This
 directory is its own Cargo workspace and is **not** a member of the main
 workspace, because `cargo fuzz` needs a nightly toolchain.
 

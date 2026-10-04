@@ -1,5 +1,5 @@
 //! Content codings (RFC 9110 §8.4.1): strict, bounded decoders for `gzip`,
-//! `deflate`, `br` and `zstd` (docs/http.md#content-codings).
+//! `deflate`, `br` and `zstd`.
 //!
 //! A [`Decoder`] is push in, pull out: [`Decoder::feed`] queues encoded
 //! bytes and [`Decoder::read`] produces at most as many decoded bytes as the

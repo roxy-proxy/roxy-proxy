@@ -7,7 +7,7 @@ use super::limits::{HttpFlags, Limits};
 use crate::chars::{is_field_value_byte, is_token, split_list, trim_ows};
 
 /// Header names that never appear in a canonical [`Headers`] set: the
-/// hop-by-hop fields of docs/http.md#rejection-rules plus the framing / routing fields roxy
+/// hop-by-hop fields plus the framing / routing fields roxy
 /// regenerates itself (`content-length` from the body, `host` from the
 /// authority).
 pub const RESERVED: &[&str] = &[

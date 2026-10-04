@@ -3,24 +3,26 @@
 How roxy reaches clients that have no proxy settings. roxy runs a DNS
 listener that answers every name with its own address, so the client
 connects to roxy as if roxy were the origin. A [direct
-listener](http.md#direct-listeners) then takes the target from the TLS SNI
+listener](/reference/http#direct-listeners) then takes the target from the TLS SNI
 or the `Host` header, and the exchange goes through the same core as any
 other: addons, rules, the address floor and the flow log.
 
-```mermaid
-sequenceDiagram
-    participant C as client
-    participant D as roxy DNS
-    participant L as roxy direct listener
-    participant U as api.example.com
-    C->>D: A api.example.com?
-    D-->>C: 10.16.0.2 (roxy)
-    C->>L: TLS, SNI api.example.com
-    L->>L: terminate TLS, parse, addons, rules
-    L->>U: roxy resolves api.example.com itself
+```
+  client                     roxy DNS              roxy direct listener         api.example.com
+    │  A api.example.com?       │                          │                           │
+    │ ─────────────────────────▶│                          │                           │
+    │  10.16.0.2 (roxy)         │                          │                           │
+    │ ◀─────────────────────────│                          │                           │
+    │  TLS, SNI api.example.com                            │                           │
+    │ ────────────────────────────────────────────────────▶│                           │
+    │                                                      │ terminate TLS, parse,     │
+    │                                                      │ addons, rules             │
+    │                                                      │ roxy resolves the name    │
+    │                                                      │ itself, then connects     │
+    │                                                      │ ─────────────────────────▶│
 ```
 
-The client needs only to trust roxy's CA ([CA distribution](tls.md#ca-distribution)).
+The client needs only to trust roxy's CA ([CA distribution](/operate/ca-certificates#ca-distribution)).
 This suits workloads that ignore `HTTPS_PROXY`: libraries that open their
 own sockets, tools without proxy support, runtimes with their own HTTP
 stacks.
@@ -57,8 +59,8 @@ decided when the request arrives, by the same rules as any other.
 - Every answer has the TTL `ttl`.
 
 The real address is resolved internally. Once the rules allow a request,
-roxy resolves its host with its own resolver ([upstream DNS](upstream.md#dns))
-and checks every address against the [address floor](upstream.md#address-floor)
+roxy resolves its host with its own resolver ([upstream DNS](/reference/upstream#dns))
+and checks every address against the [address floor](/policies/address-lists#address-floor)
 before it connects. The client never sees that address, and roxy never
 forwards the client's queries anywhere: a forwarding resolver would be a
 channel out of the sandbox (DNS tunnelling). roxy's own resolver must not
@@ -89,14 +91,14 @@ answer the same way. Over TCP (RFC 7766), queries are length-prefixed and a
 connection carries any number of them. It closes after
 `limits.idle_timeout` of silence, on a query longer than 4096 bytes, or on a
 message that is dropped. TCP connections count against the [connection
-caps](limits.md#connections); UDP has no per-client state.
+caps](/reference/limits#connections); UDP has no per-client state.
 
 ## What it does not contain
 
 DNS steering is a convenience, not containment. A client can still use a
 hard-coded address or its own resolver. As with the explicit proxy, the
 network is what contains a workload: it must have no route out except
-through roxy ([Deployment](deployment.md#dns-steering)).
+through roxy ([Deployment](/deploy/overview#dns-steering)).
 
 `dns` settings need a restart: a reload that changes them logs a warning,
-and the running listener keeps its settings ([reload](rules.md#reload)).
+and the running listener keeps its settings ([reload](/operate/operations#reload)).

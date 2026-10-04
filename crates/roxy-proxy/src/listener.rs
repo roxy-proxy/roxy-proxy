@@ -1,5 +1,4 @@
-//! Listeners and client connections (docs/http.md#explicit-proxy,
-//! docs/http.md#direct-listeners).
+//! Listeners and client connections.
 //!
 //! A [`Listener`] accepts a TCP stream and describes it as a
 //! [`ClientConn`]; the server then hands both to the pipeline for the

@@ -1,5 +1,5 @@
 //! Write [roxy](https://github.com/roxy-proxy/roxy-proxy) addon layers in
-//! Rust (docs/addons.md#authoring).
+//! Rust.
 //!
 //! A layer sits in an exchange's layer stack above roxy's rules. It gets
 //! each request with a streaming body, may pass a request down once with

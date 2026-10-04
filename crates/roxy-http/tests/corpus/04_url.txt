@@ -1,4 +1,4 @@
-# URL normalisation in request targets (docs/http.md#url-normalisation).
+# URL normalisation in request targets.
 
 === fragment_in_target
 expect: error fragment_in_target

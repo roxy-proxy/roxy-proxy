@@ -1,4 +1,4 @@
-//! Proxy authentication (docs/http.md#explicit-proxy): `Proxy-Authorization: Basic`
+//! Proxy authentication: `Proxy-Authorization: Basic`
 //! against a file of `user:bcrypt-hash` lines.
 
 use std::collections::HashMap;
