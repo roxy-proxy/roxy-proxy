@@ -1,4 +1,4 @@
-//! Semantic validation that serde cannot express (docs/rules.md#reload).
+//! Semantic validation that serde cannot express.
 //!
 //! Rules and metrics are compiled by [`roxy_rules::Policy::compile`]; its
 //! diagnostics (with line/column within an expression) are merged with the
@@ -45,7 +45,7 @@ impl Config {
         if d.is_empty() { Ok(()) } else { Err(d) }
     }
 
-    /// Compile the rules and metrics (docs/rules.md#reload). `validate` calls this; the run
+    /// Compile the rules and metrics. `validate` calls this; the run
     /// path and `roxy rule test` use the result.
     pub fn compile_policy(&self) -> Result<Policy, Vec<Diagnostic>> {
         let secret_names: HashSet<String> = self.secrets.keys().cloned().collect();
@@ -257,7 +257,7 @@ impl Config {
     }
 
     /// What only makes sense for, or is refused on, a `kind: service`
-    /// addon (docs/addons.md#service-layers): it streams through one of its own endpoints, and gets
+    /// addon: it streams through one of its own endpoints, and gets
     /// no host services and no WASM limits.
     fn validate_service(path: &str, a: &super::Addon, d: &mut Vec<Diagnostic>) {
         match &a.endpoint {

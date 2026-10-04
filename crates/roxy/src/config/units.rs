@@ -10,7 +10,7 @@ use serde::de::{self, Deserializer, SeqAccess, Visitor};
 // ----- sizes ----------------------------------------------------------------
 
 /// Parse a size such as `64kb`, `1 GiB`, `512` (bytes). Units are
-/// case-insensitive and **1024-based** (`kb` == `kib`, docs/rules.md#expressions).
+/// case-insensitive and **1024-based** (`kb` == `kib`).
 pub fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());

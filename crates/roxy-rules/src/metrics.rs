@@ -1,4 +1,4 @@
-//! The in-process stateful metric store (docs/rules.md#metrics).
+//! The in-process stateful metric store.
 //!
 //! # Design
 //!
@@ -214,8 +214,8 @@ pub trait MetricSource: Send + Sync {
     fn record(&self, view: &dyn FlowView, sample: &Sample) -> Result<(), MetricError>;
 }
 
-/// What one exchange contributed since its last [`MetricStore::record`]
-/// (docs/rules.md#metrics). An exchange records several samples over its life:
+/// What one exchange contributed since its last [`MetricStore::record`].
+/// An exchange records several samples over its life:
 ///
 /// * one with `head` set, right after the forwarding decision: it counts
 ///   `requests` and `unique(..)` (and `denied` if the head decision
@@ -832,7 +832,7 @@ impl Metric {
     }
 }
 
-/// Stateful metric series for one compiled policy (docs/rules.md#metrics). `Send + Sync`;
+/// Stateful metric series for one compiled policy. `Send + Sync`;
 /// share it behind an `Arc`. See the module docs for the design and bounds.
 pub struct MetricStore {
     metrics: Vec<Metric>,
@@ -1115,7 +1115,7 @@ impl MetricStore {
         removed
     }
 
-    /// Reload retention (docs/rules.md#reload): copy series from `previous` for metric ids
+    /// Reload retention: copy series from `previous` for metric ids
     /// whose definition has the same `count`, `unique`, `key` and `window`;
     /// every other metric starts empty. Carried series are kept even
     /// beyond this store's `max_keys` (new keys are then refused until

@@ -1,4 +1,4 @@
-//! The plain-HTTP CA endpoint (`ca_server.bind`, docs/tls.md#ca-distribution): `GET
+//! The plain-HTTP CA endpoint (`ca_server.bind`): `GET
 //! /roxy-ca.pem` and `GET /healthz`. Kept off the proxy port so it can be
 //! firewalled differently.
 

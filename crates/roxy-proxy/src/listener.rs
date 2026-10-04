@@ -1,4 +1,4 @@
-//! Listeners and client connections (docs/http.md#explicit-proxy).
+//! Listeners and client connections.
 //!
 //! [`Listener`] is the hook transparent mode (issue #15) will implement: it
 //! accepts a TCP stream and describes it as a [`ClientConn`]; the server

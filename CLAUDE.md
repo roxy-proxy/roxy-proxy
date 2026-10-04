@@ -59,7 +59,8 @@ the PR (`fuzz/README.md`).
 ## Docs
 
 - `README.md` is the overview and quickstart; `docs/` is the reference for
-  current behaviour. Code comments point at docs by page and section.
+  current behaviour. Code comments don't link to docs pages: the docs move,
+  and a comment should stand on its own.
 - Docs describe what roxy does now. No roadmap, "planned" or "deferred"
   prose: unbuilt work lives in issues.
 - A change that alters behaviour updates the matching docs page in the same

@@ -1,5 +1,5 @@
 //! Process-wide addon state that outlives a reload: each addon's keyed
-//! store (docs/addons.md#state).
+//! store.
 
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};

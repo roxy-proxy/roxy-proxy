@@ -1,4 +1,4 @@
-//! Named endpoints (docs/addons.md#endpoints): outbound calls an addon makes by name.
+//! Named endpoints: outbound calls an addon makes by name.
 //!
 //! roxy resolves the name to a URL, attaches the endpoint's headers
 //! (credentials from secrets, never visible to the addon), applies the

@@ -51,7 +51,7 @@ pub struct RuntimeConfig {
     /// `log.flow.ws_message_every`.
     pub ws_message_every: u64,
     pub sink: Arc<dyn FlowSink>,
-    /// Body capture / traffic tee (docs/flow-log.md#capture); `None` = capture disabled.
+    /// Body capture / traffic tee; `None` = capture disabled.
     pub capture: Option<Arc<crate::capture::CaptureLog>>,
     pub metrics: Arc<dyn MetricSource>,
     pub state: Arc<dyn StateSource>,
@@ -79,7 +79,7 @@ pub struct PolicyUpdate {
     /// floor in the connector. A name missing from `address_lists` fails
     /// the snapshot build (startup error / failed reload).
     pub deny_lists: Vec<String>,
-    /// The addon stack, outermost first (docs/addons.md#layer-stack). Swapped with the rest of
+    /// The addon stack, outermost first. Swapped with the rest of
     /// the policy: new exchanges use the new stack, in-flight ones finish
     /// on theirs.
     pub addons: Vec<Arc<crate::addons::AddonSpec>>,

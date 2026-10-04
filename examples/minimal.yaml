@@ -1,5 +1,5 @@
 # Minimal roxy configuration: one explicit-proxy listener and one allow rule.
-# Everything else uses the defaults (docs/http.md#rejection-rules, docs/rules.md#evaluation). Any request
+# Everything else uses the defaults. Any request
 # not matched by a rule is denied.
 version: 1
 

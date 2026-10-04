@@ -1,4 +1,4 @@
-//! The explicit-proxy connection state machine (docs/http.md#explicit-proxy):
+//! The explicit-proxy connection state machine:
 //! proxy-port requests, CONNECT → sniff → TLS termination or plaintext
 //! tunnel, and the request loop inside a tunnel.
 
@@ -23,7 +23,7 @@ use crate::pipeline::FlowCx;
 use crate::server::Shared;
 use crate::view::host_text;
 
-/// The magic host served by the proxy itself (docs/tls.md#ca-distribution).
+/// The magic host served by the proxy itself.
 pub const INTERNAL_HOST: &str = "roxy.internal";
 
 /// `407` header lines (the codec treats `proxy-authenticate` as reserved).
@@ -46,7 +46,7 @@ fn is_internal(req: &CanonicalRequest) -> bool {
     matches!(&req.authority.host, Host::Dns(h) if h == INTERNAL_HOST)
 }
 
-/// `http://roxy.internal/roxy-ca.pem` (docs/tls.md#ca-distribution). Anything else there is 404.
+/// `http://roxy.internal/roxy-ca.pem`. Anything else there is 404.
 fn internal_response(req: &CanonicalRequest, shared: &Shared) -> CanonicalResponse {
     let get = matches!(req.method, Method::Get | Method::Head);
     let mut res;
@@ -249,7 +249,7 @@ async fn handle_connect(
         &placeholder,
     );
     cx.facts.request = None;
-    // No connect-time rules (docs/http.md#connect): a CONNECT that passed proxy auth is
+    // No connect-time rules: a CONNECT that passed proxy auth is
     // accepted for inspection; every decision is made on the requests
     // inside the tunnel.
     cx.emit_connect_event(&authority, false);
@@ -262,7 +262,7 @@ async fn handle_connect(
     };
     drop(handle);
 
-    // Classify the first bytes (docs/http.md#explicit-proxy): TLS, plaintext HTTP, or close.
+    // Classify the first bytes: TLS, plaintext HTTP, or close.
     let classified = tokio::time::timeout(limits.header_timeout, async {
         let mut io = io;
         loop {

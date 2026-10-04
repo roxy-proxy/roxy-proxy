@@ -1,5 +1,4 @@
-//! Serde types for the rule-related parts of the config (docs/rules.md#config-file,
-//! docs/rules.md#actions, docs/rules.md#metrics).
+//! Serde types for the rule-related parts of the config.
 //!
 //! These are the *uncompiled* shapes. [`crate::Policy::compile`] turns them
 //! into an evaluable policy and reports every semantic problem as a
@@ -15,7 +14,7 @@ use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
 // ----- default decision ---------------------------------------------------
 
-/// What the request head gets when no head rule decides (docs/rules.md#evaluation): the
+/// What the request head gets when no head rule decides: the
 /// top-level `default:` key.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,7 +44,7 @@ impl fmt::Display for DefaultDecision {
 
 // ----- expressions ----------------------------------------------------------
 
-/// An uncompiled DSL expression (docs/rules.md#expressions).
+/// An uncompiled DSL expression.
 ///
 /// YAML turns `where: true` into a boolean, so booleans are accepted and
 /// stored as their literal text (a bool literal is a valid expression).
@@ -85,7 +84,7 @@ impl<'de> Deserialize<'de> for Expr {
 // ----- rules ----------------------------------------------------------------
 
 /// One entry of `rules:`. Rules form one ordered list; when a rule runs
-/// follows from what it reads (docs/rules.md#evaluation), so there is no `phase` key.
+/// follows from what it reads, so there is no `phase` key.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(try_from = "RawRule")]
 pub struct RuleConfig {
@@ -131,7 +130,7 @@ impl TryFrom<RawRule> for RuleConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Then(pub Vec<Action>);
 
-/// One action (docs/rules.md#actions). A closed enum, deliberately.
+/// One action. A closed enum, deliberately.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// Terminal. Bare `allow` or `allow: { upgrade, private_ok }`.
@@ -214,10 +213,10 @@ impl Action {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AllowArgs {
-    /// Permit an Upgrade (docs/websockets.md). Only `websocket` exists.
+    /// Permit an Upgrade. Only `websocket` exists.
     #[serde(default)]
     pub upgrade: Option<Upgrade>,
-    /// Permit private / loopback upstream addresses for this flow (docs/upstream.md#address-floor).
+    /// Permit private / loopback upstream addresses for this flow.
     #[serde(default)]
     pub private_ok: bool,
 }
@@ -332,7 +331,7 @@ pub struct SetStateArgs {
     pub ttl: Option<Duration>,
 }
 
-/// What `capture` writes (docs/flow-log.md#capture).
+/// What `capture` writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureTarget {
@@ -537,7 +536,7 @@ impl<'de> Deserialize<'de> for StringList {
 
 // ----- metrics --------------------------------------------------------------
 
-/// One entry of `metrics:` (docs/rules.md#metrics).
+/// One entry of `metrics:`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricConfig {
@@ -554,7 +553,7 @@ pub struct MetricConfig {
     pub window: Option<Duration>,
 }
 
-/// What a metric counts (docs/rules.md#metrics).
+/// What a metric counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetricCount {
     Requests,
@@ -568,7 +567,7 @@ pub enum MetricCount {
 
 impl MetricCount {
     /// Whether this metric grows as bytes stream (and so is *watched* by deny
-    /// rules that read it, docs/rules.md#metrics).
+    /// rules that read it).
     pub fn counts_bytes(&self) -> bool {
         matches!(self, Self::RequestBytes | Self::ResponseBytes)
     }

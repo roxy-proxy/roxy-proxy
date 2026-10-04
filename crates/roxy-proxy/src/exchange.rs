@@ -1,6 +1,6 @@
 //! One request/response exchange: request steps → upstream → response
-//! steps → client, plus the WebSocket relay (docs/websockets.md#relay) and
-//! its message-checking form (docs/websockets.md#message-rules).
+//! steps → client, plus the WebSocket relay and
+//! its message-checking form.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,7 +45,7 @@ pub(crate) struct ClientFraming {
 }
 
 /// Writes `res`. With `close`, the response carries `connection: close`
-/// (docs/http.md#deny-responses) and the connection is shut down
+/// and the connection is shut down
 /// gracefully afterwards. `extra` are additional raw header lines.
 pub(crate) async fn respond(
     mut conn: ServerConn<ConnIo>,
@@ -210,12 +210,12 @@ pub(crate) async fn process<F: Front>(
     cx: &mut FlowCx,
     mut req: CanonicalRequest,
 ) -> Outcome {
-    // Audit backpressure (docs/flow-log.md#writing): an exchange starts only while the flow
+    // Audit backpressure: an exchange starts only while the flow
     // log keeps up.
     crate::flowlog::sink_ready(&*cx.shared.sink).await;
     if cx.snap.flags.strip_accept_encoding {
         // Before the layers and the rules, so all of them, and the flow
-        // log, see the request as it will leave (docs/http.md#content-codings).
+        // log, see the request as it will leave.
         req.headers.remove("accept-encoding");
         if let Some(f) = cx.facts.request.as_mut() {
             f.headers.remove("accept-encoding");
@@ -335,7 +335,7 @@ enum Upstreamed {
 }
 
 /// The stop of a watching rule, as the outcome of an exchange whose
-/// response has not started (docs/rules.md#evaluation: answered with an error response).
+/// response has not started (answered with an error response).
 fn stopped_outcome(watch: &Watch) -> Option<Outcome> {
     watch.stopped().map(|s| Outcome::Refuse(s.refusal))
 }
@@ -379,10 +379,10 @@ async fn response_head<F: Future>(
 #[allow(clippy::too_many_lines)] // one linear flow; splitting it obscures the order
 async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalRequest) -> Outcome {
     // From here on the request is on its way: watching rules re-check the
-    // exchange as values arrive (docs/rules.md#evaluation).
+    // exchange as values arrive.
     let watch = Watch::new(cx);
     cx.watch = Some(watch.clone());
-    // Capture (docs/flow-log.md#capture): what is forwarded from here on is teed to the
+    // Capture: what is forwarded from here on is teed to the
     // capture log, heads included.
     let (mut up_tap, down_tap) = taps(cx);
     let host = host_text(&req.authority.host);
@@ -397,7 +397,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
     if let Some(u) = &req.meta.upgrade
         && !relay_ws
     {
-        // docs/websockets.md: plain `allow` strips the upgrade (the codec already removed
+        // Plain `allow` strips the upgrade (the codec already removed
         // the hop-by-hop headers) and forwards an ordinary request.
         cx.shared.sink.emit(&FlowEvent::UpgradeStripped {
             ts: chrono::Utc::now(),
@@ -426,8 +426,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
         };
         if crate::addons::ws_without_extensions(&cx.snap) {
             // Messages are read, by the rules or by `tunnel` layers, so no
-            // extension (permessage-deflate above all) may be negotiated
-            // (docs/websockets.md#extensions).
+            // extension (permessage-deflate above all) may be negotiated.
             req.headers.remove("sec-websocket-extensions");
         }
         let scheme = req.scheme;
@@ -596,7 +595,7 @@ async fn send_response(
     cx.record.response_headers_bytes = res.headers.wire_len() as u64;
     let r = conn.respond(res).await;
     // A watching stop mid-body ends the body with an error: the codec stops
-    // before any terminating chunk and the connection is dropped (docs/rules.md#evaluation).
+    // before any terminating chunk and the connection is dropped.
     let stopped = cx.watch.as_ref().is_some_and(|w| w.stopped().is_some());
     let failed = r.is_err() && !stopped;
     let next = match r {
@@ -692,7 +691,7 @@ async fn splice_websocket(
     let c2s_extra = leftover.len() as u64;
     if !leftover.is_empty() {
         // Bytes that arrived with the upgrade request: checked before they
-        // are written, like every other relayed chunk (docs/rules.md#evaluation).
+        // are written, like every other relayed chunk.
         if watch.on_ws_chunk(Dir::Request, c2s_extra).is_err() {
             cx.record_final_sample(false);
             cx.emit_request_event();
@@ -756,7 +755,7 @@ async fn pump<R, W>(
     let sink = watch.sink();
     let mut completed = false;
     loop {
-        // Audit backpressure (docs/flow-log.md#writing, docs/flow-log.md#capture): relay only while the flow log
+        // Audit backpressure: relay only while the flow log
         // and the capture log keep up.
         crate::flowlog::sink_ready(&*sink).await;
         if let Some(t) = &relay.tap {
@@ -771,7 +770,7 @@ async fn pump<R, W>(
             Ok(k) => k,
         };
         // Checked before the write: bytes that make a deny match are never
-        // relayed (docs/rules.md#evaluation).
+        // relayed.
         if watch.on_ws_chunk(relay.dir, k as u64).is_err() {
             break;
         }
@@ -1000,7 +999,7 @@ impl<W: tokio::io::AsyncWrite + Unpin> MessagePump<'_, W> {
                 Err(e) => return Some(End::Protocol(e)),
             };
             // Checked before the write: a message that makes a deny match
-            // is never relayed (docs/rules.md#evaluation).
+            // is never relayed.
             let (msg, r) = watch.on_ws_message(self.relay.dir, msg);
             if r.is_err() {
                 return Some(End::Stopped);
@@ -1043,7 +1042,7 @@ impl<W: tokio::io::AsyncWrite + Unpin> MessagePump<'_, W> {
             if let Some(e) = end.take() {
                 break e;
             }
-            // Audit backpressure (docs/flow-log.md#writing, docs/flow-log.md#capture).
+            // Audit backpressure.
             crate::flowlog::sink_ready(&*sink).await;
             if let Some(t) = &self.relay.tap {
                 std::future::poll_fn(|cx| t.log().poll_ready(cx)).await;
@@ -1072,7 +1071,7 @@ struct Relayed {
     closed: Option<FrameError>,
 }
 
-/// The message relay (docs/websockets.md#message-rules): each direction is
+/// The message relay: each direction is
 /// decoded into whole messages, each message is checked by the rules
 /// reading `ws.*` and then re-encoded as one frame, masked with roxy's own
 /// key toward the upstream. Runs until both sides close, nothing moves for

@@ -1,6 +1,6 @@
 //! Field catalogue, static types, and which values are *head* values
 //! (known when the forwarding decision is made) or *watched* values (known
-//! later) (docs/rules.md#fields).
+//! later).
 
 use std::fmt::{self, Write as _};
 
@@ -65,7 +65,7 @@ pub enum Field {
     Host,
     /// `port` (int)
     Port,
-    /// `path` (string, normalised per docs/http.md#url-normalisation)
+    /// `path` (string, normalised)
     Path,
     /// `url` (string)
     Url,
@@ -93,7 +93,7 @@ pub enum Field {
 }
 
 /// A set of values that become known (or change) after the forwarding
-/// decision (docs/rules.md#evaluation, docs/rules.md#expressions): what a rule reads beyond the request head, and
+/// decision: what a rule reads beyond the request head, and
 /// what an event during an exchange changed. A bit mask, so the per-chunk
 /// test "does any watching rule care about this?" is one `and`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]

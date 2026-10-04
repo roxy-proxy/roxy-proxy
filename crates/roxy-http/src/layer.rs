@@ -1,4 +1,4 @@
-//! Addon layer messages ↔ canonical model (docs/addons.md#layer-stack).
+//! Addon layer messages ↔ canonical model.
 //!
 //! A layer receives the canonical request as an `http::Request` with an
 //! absolute URI, and passes on whatever it likes. What it passes on is
