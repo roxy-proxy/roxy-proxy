@@ -42,8 +42,8 @@ pub(crate) struct Snapshot {
     /// The addon stack, outermost first.
     pub addons: Arc<[Arc<crate::addons::AddonSpec>]>,
     /// Service layers' connection pools. A reload starts empty ones, so
-    /// new exchanges dial under the new policy and secrets, and the old
-    /// connections close as their exchanges end.
+    /// new exchanges dial under the new policy and secrets, and retires
+    /// the old ones, whose connections close as their exchanges end.
     pub services: crate::addons::service::Pools,
 }
 
@@ -237,7 +237,8 @@ impl ServerHandle {
         self.shared
             .layer_state
             .configure(snap.addons.iter().map(|a| (a.name.as_str(), &a.state)));
-        self.shared.snapshot.store(Arc::new(snap));
+        let old = self.shared.snapshot.swap(Arc::new(snap));
+        old.services.retire();
         Ok(())
     }
 

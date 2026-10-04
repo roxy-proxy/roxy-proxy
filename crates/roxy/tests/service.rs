@@ -6,15 +6,17 @@
 mod support;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::{Value, json};
 use support::{Harness, Opts, fnv};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, mpsc};
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -479,6 +481,75 @@ async fn start_service() -> (std::net::SocketAddr, Arc<SvcState>) {
         }
     });
     (addr, st)
+}
+
+/// The TLS config of a `wss://` service, set once it is known (the test
+/// CA is made when the harness starts, after the URL is configured).
+type TlsSlot = Arc<OnceLock<Arc<rustls::ServerConfig>>>;
+
+/// A `wss://` service.
+async fn start_tls_service() -> (std::net::SocketAddr, Arc<SvcState>, TlsSlot) {
+    let st = Arc::new(SvcState::default());
+    let slot = TlsSlot::default();
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let s = st.clone();
+    let tls = slot.clone();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = l.accept().await {
+            let acceptor = TlsAcceptor::from(tls.get().expect("TLS config set").clone());
+            let s = s.clone();
+            tokio::spawn(async move {
+                if let Ok(io) = acceptor.accept(tcp).await {
+                    connection(io, s).await;
+                }
+            });
+        }
+    });
+    (addr, st, slot)
+}
+
+/// A server config whose certificate no trusted CA signed.
+fn self_signed() -> Arc<rustls::ServerConfig> {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["upstream.test".to_owned()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
+    let mut cfg = rustls::ServerConfig::builder_with_provider(support::provider())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], key)
+        .unwrap();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Arc::new(cfg)
+}
+
+/// roxy with service layer `s` on a `wss://` service at
+/// `upstream.test:<port>/echo`.
+async fn start_tls(private_ok: bool, trusted: bool) -> (Harness, Arc<SvcState>) {
+    let (addr, st, slot) = start_tls_service().await;
+    let url = format!("https://upstream.test:{}/echo", addr.port());
+    let mut yaml = addon("s", &url, "");
+    if !private_ok {
+        yaml = yaml.replace("        private_ok: true\n", "");
+    }
+    let addons = format!("addons:\n{yaml}");
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        extra: &addons,
+        ..Opts::default()
+    })
+    .await;
+    let cfg = if trusted {
+        h.test_ca.ws_server()
+    } else {
+        self_signed()
+    };
+    slot.set(cfg).unwrap();
+    (h, st)
 }
 
 /// An addon `name` streaming through the in-test service at `url`.
@@ -968,5 +1039,106 @@ async fn bytes_past_the_credit_fail_the_stream() {
     let res = h.client().get(h.https_url("/after")).send().await.unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(st.connections().len(), 1);
+    h.stop().await;
+}
+
+/// A `wss://` endpoint: dialled with TLS and verified against the
+/// upstream trust roots.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wss_endpoint_works_with_a_trusted_certificate() {
+    let (h, st) = start_tls(true, true).await;
+    let res = h
+        .client()
+        .post(h.https_url("/over-tls"))
+        .body(vec![b'z'; 400_000])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "{:#?}", h.events("layer_error"));
+    let v = json_of(&res.bytes().await.unwrap());
+    assert_eq!(v["body_len"], 400_000);
+    assert_eq!(st.connections().len(), 1);
+    assert_eq!(header(&st.connections()[0], "x-svc-key"), support::SECRET);
+    let calls = h.wait_events("endpoint_call", 1).await;
+    assert_eq!(calls[0]["status"], 101);
+    h.stop().await;
+}
+
+/// A certificate that fails verification fails the exchange closed, and
+/// the service never sees a handshake.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wss_endpoint_with_a_bad_certificate_fails_closed() {
+    let (h, st) = start_tls(true, false).await;
+    let res = h.client().get(h.https_url("/x")).send().await.unwrap();
+    assert_eq!(res.status(), 503);
+    assert_eq!(res.headers()["x-roxy-rule"], "layer:s");
+    let ev = h.wait_events("layer_error", 1).await;
+    assert_eq!(ev[0]["kind"], "service:connect", "{}", ev[0]);
+    assert_eq!(st.connections().len(), 0);
+    assert!(h.upstream.seen().is_empty());
+    let calls = h.wait_events("endpoint_call", 1).await;
+    assert!(calls[0]["status"].is_null(), "{}", calls[0]);
+    h.stop().await;
+}
+
+/// The address floor applies to a `wss://` endpoint as to any other:
+/// without `private_ok`, a private address is refused before TLS.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wss_endpoint_needs_private_ok_for_a_private_address() {
+    let (h, st) = start_tls(false, true).await;
+    let res = h.client().get(h.https_url("/x")).send().await.unwrap();
+    assert_eq!(res.status(), 503);
+    let ev = h.wait_events("layer_error", 1).await;
+    assert_eq!(ev[0]["kind"], "service:connect", "{}", ev[0]);
+    assert_eq!(st.connections().len(), 0);
+    h.stop().await;
+}
+
+/// A reload that rotates the endpoint's secret: new exchanges go on a new
+/// connection that carries the new value; the old connection finishes the
+/// exchange it has, then closes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rotated_secret_reaches_new_streams_and_old_connections_drain() {
+    let (h, st) = start("/mixed", "", ALLOW_UPSTREAM).await;
+    let c = h.client();
+    let held = tokio::spawn({
+        let c = c.clone();
+        let url = h.https_url("/hold-old");
+        async move { c.get(url).send().await.unwrap() }
+    });
+    st.until("the held stream", |s| s.opens().len() == 1).await;
+
+    std::fs::write(h.dir.path().join("token"), "rotated-token-value").unwrap();
+    assert!(h.running.as_ref().unwrap().reloader.reload_async().await);
+
+    let res = c.get(h.https_url("/after")).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    let conns = st.connections();
+    assert_eq!(conns.len(), 2, "{conns:?}");
+    assert_eq!(header(&conns[0], "x-svc-key"), support::SECRET);
+    assert_eq!(header(&conns[1], "x-svc-key"), "rotated-token-value");
+    assert_eq!(st.opens()[1]["conn_index"], 1);
+    // The old connection is still carrying the held exchange.
+    assert!(st.closed.lock().unwrap().is_empty());
+
+    st.release.notify_waiters();
+    let res = held.await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(json_of(&res.bytes().await.unwrap())["path"], "/hold-old");
+    st.until("the old connection to close", |s| {
+        s.closed.lock().unwrap().contains(&0)
+    })
+    .await;
+    assert!(!st.closed.lock().unwrap().contains(&1));
+    let res = c.get(h.https_url("/again")).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(st.connections().len(), 2);
+
+    // An idle connection closes as soon as a reload retires it.
+    assert!(h.running.as_ref().unwrap().reloader.reload_async().await);
+    st.until("the idle connection to close", |s| {
+        s.closed.lock().unwrap().contains(&1)
+    })
+    .await;
     h.stop().await;
 }

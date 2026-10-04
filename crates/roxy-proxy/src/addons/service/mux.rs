@@ -11,8 +11,8 @@
 //! closed); anything else fails only its stream, which is reset.
 //!
 //! The pools hang off the policy snapshot: a reload dials new connections
-//! under the new policy and secrets, and the old ones close once the
-//! exchanges still using them end.
+//! under the new policy and secrets, and retires the old snapshot's pools,
+//! whose connections close as soon as no exchange is using them.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,6 +77,21 @@ struct PoolKey {
 #[derive(Default)]
 pub(crate) struct Pools {
     by_key: Mutex<HashMap<PoolKey, Arc<Pool>>>,
+    retired: AtomicBool,
+}
+
+impl Pools {
+    /// A reload replaced this snapshot: its connections close once idle
+    /// (now, for those that are). Client connections can hold an old
+    /// snapshot for as long as they last, so this does not wait for it to
+    /// be dropped.
+    pub(crate) fn retire(&self) {
+        self.retired.store(true, Ordering::SeqCst);
+        for pool in lock(&self.by_key).values() {
+            pool.retired.store(true, Ordering::SeqCst);
+            lock(&pool.entries).retain(|e| e.reserved > 0);
+        }
+    }
 }
 
 struct Pool {
@@ -85,6 +100,8 @@ struct Pool {
     freed: Notify,
     max_connections: usize,
     max_streams: usize,
+    /// Its snapshot was replaced: connections close once idle.
+    retired: AtomicBool,
 }
 
 struct Entry {
@@ -115,8 +132,11 @@ impl Drop for Reservation {
         {
             let e = &mut entries[i];
             e.reserved = e.reserved.saturating_sub(1);
-            // Never connected, and nobody is waiting on it any more.
-            if e.reserved == 0 && e.link.get().is_none() {
+            // Never connected, and nobody is waiting on it any more; or
+            // idle in a retired pool.
+            if e.reserved == 0
+                && (e.link.get().is_none() || self.pool.retired.load(Ordering::SeqCst))
+            {
                 entries.remove(i);
             }
         }
@@ -624,9 +644,9 @@ impl Stream {
             }
             In::Deny { status, message } => {
                 let r = super::deny_response(status, message)?;
-                Self::give(s, r, "deny")?;
+                // Tagged before the answer goes, so the flow's record has it.
                 self.st.add_tag(format!("{}:deny", self.name()));
-                Ok(())
+                Self::give(s, r, "deny")
             }
             // Handled by `control`.
             In::Credit { .. } | In::Reset { .. } => Ok(()),
@@ -737,7 +757,8 @@ pub(super) async fn open(
         max_connections: svc.max_connections,
         max_streams: svc.max_streams,
     };
-    let pool = lock(&st.snap.services.by_key)
+    let pools = &st.snap.services;
+    let pool = lock(&pools.by_key)
         .entry(key)
         .or_insert_with(|| {
             Arc::new(Pool {
@@ -745,6 +766,7 @@ pub(super) async fn open(
                 freed: Notify::new(),
                 max_connections: svc.max_connections,
                 max_streams: svc.max_streams,
+                retired: AtomicBool::new(pools.retired.load(Ordering::SeqCst)),
             })
         })
         .clone();
