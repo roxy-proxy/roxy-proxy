@@ -163,12 +163,10 @@ pub mod rules {
         let metrics = metrics();
         let secrets: HashSet<String> = ["s0".to_owned()].into();
         let lists: HashSet<String> = ["l0".to_owned()].into();
-        let none = HashSet::new();
         Policy::compile(&PolicyInput {
             rules: &rules,
             metrics: &metrics,
             secret_names: &secrets,
-            addon_names: &none,
             address_lists: &lists,
             transparent_listeners: false,
             default: if default_allow {
