@@ -272,13 +272,20 @@ enum State {
     Broken,
 }
 
+/// `Expect: 100-continue` on the current request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Continue {
+    NotExpected,
+    /// Expected; `100 Continue` not sent yet.
+    Pending,
+    Sent,
+}
+
 #[derive(Debug)]
-#[allow(clippy::struct_excessive_bools)]
 struct Exchange {
     is_head: bool,
     close: bool,
-    expect_continue: bool,
-    sent_100: bool,
+    expect: Continue,
     version: Version,
     upgrade: Option<String>,
 }
@@ -601,8 +608,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
                 self.exchange = Some(Exchange {
                     is_head: false,
                     close: meta.close,
-                    expect_continue: false,
-                    sent_100: false,
+                    expect: Continue::NotExpected,
                     version: meta.version,
                     upgrade: None,
                 });
@@ -636,8 +642,11 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
                 self.exchange = Some(Exchange {
                     is_head: h.method == crate::model::Method::Head,
                     close: h.meta.close,
-                    expect_continue: h.meta.expect_continue,
-                    sent_100: false,
+                    expect: if h.meta.expect_continue {
+                        Continue::Pending
+                    } else {
+                        Continue::NotExpected
+                    },
                     version: h.meta.version,
                     upgrade: h.meta.upgrade.clone(),
                 });
@@ -671,10 +680,9 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         }
         let idle = self.limits.body_idle_timeout;
         if let Some(ex) = self.exchange.as_mut()
-            && ex.expect_continue
-            && !ex.sent_100
+            && ex.expect == Continue::Pending
         {
-            ex.sent_100 = true;
+            ex.expect = Continue::Sent;
             write_timed(&mut self.w, &[b"HTTP/1.1 100 Continue\r\n\r\n"], idle).await?;
             flush_timed(&mut self.w, idle).await?;
         }
@@ -758,7 +766,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         let Some(ex) = self.exchange.take() else {
             return Err(WriteError::State("no exchange"));
         };
-        if ex.expect_continue && !ex.sent_100 && self.r.feed.is_some() {
+        if ex.expect == Continue::Pending && self.r.feed.is_some() {
             // The client may or may not send the body now; we cannot know
             // where the next request starts, so close after the response.
             if let Some(mut feed) = self.r.feed.take()
