@@ -18,7 +18,11 @@ roxy forwards the upgrade request to the upstream over HTTP/1.1, after the
 usual header canonicalisation; `Sec-WebSocket-*` headers pass through. It
 checks that the upstream answered `101` with a correct
 `Sec-WebSocket-Accept`, relays the `101` to the client, and then relays
-traffic in both directions until either side closes.
+traffic in both directions until either side closes. Connecting, the
+upgrade request and taking over the upgraded connection share one
+`limits.response_header_timeout`; the client is sent the `101` only once
+roxy holds the upstream side, so a failed upgrade is a `502`, not a `101`
+followed by a close.
 
 How it relays depends on the policy. If no rule reads a `ws.*` field, roxy
 splices bytes: no frame parsing, re-masking or reassembly. Subprotocols
