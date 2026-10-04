@@ -7,8 +7,8 @@ use std::fmt::Write as _;
 use regex::Regex;
 
 use super::{
-    CAction, CompiledRule, Condition, MetricDef, Part, PolicyInput, RuleKind, RuleShape,
-    is_header_value, metric_reads,
+    CAction, CompiledRule, Condition, MetricDef, PolicyInput, RuleKind, RuleShape, is_header_value,
+    metric_reads,
 };
 use crate::compile::{Env, Needs, Pred, build_shared_regex, compile};
 use crate::config::{
@@ -17,6 +17,7 @@ use crate::config::{
 use crate::diag::{Diagnostic, RuleId};
 use crate::eval::{AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Effect};
 use crate::lexer::is_ident;
+use crate::template::{Part, has_secrets, mentions_secret, parse_template, secret_names};
 use crate::types::{Field, Reads, is_token};
 
 impl Condition {
@@ -52,8 +53,6 @@ impl Condition {
         Ok(Condition { pred })
     }
 }
-
-const SECRET_OPEN: &str = "${secret:";
 
 /// Headers rules may not set or remove: framing and hop-by-hop headers are
 /// owned by roxy's canonicaliser, and `host` changes go
@@ -422,7 +421,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         }
         if non_header_strings(action)
             .iter()
-            .any(|s| s.contains(SECRET_OPEN))
+            .any(|s| mentions_secret(s))
         {
             self.push(
                 rule,
@@ -668,42 +667,20 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         header: &str,
         value: &str,
     ) -> Option<Vec<Part>> {
-        let mut parts = Vec::new();
-        let mut rest = value;
-        let mut ok = true;
-        while let Some(i) = rest.find("${") {
-            if i > 0 {
-                parts.push(Part::Lit(rest[..i].to_owned()));
+        let parts = match parse_template(value) {
+            Ok(parts) => parts,
+            Err(e) => {
+                self.push(
+                    rule,
+                    apath,
+                    format!("set_header {header}: {e} in {value:?}"),
+                );
+                return None;
             }
-            let after = &rest[i..];
-            let Some(body) = after.strip_prefix(SECRET_OPEN) else {
-                self.push(
-                    rule,
-                    apath,
-                    format!(
-                        "set_header {header}: unknown interpolation in {value:?}; only \
-                         `${{secret:name}}` is supported"
-                    ),
-                );
-                return None;
-            };
-            let Some(end) = body.find('}') else {
-                self.push(
-                    rule,
-                    apath,
-                    format!("set_header {header}: unterminated `${{secret:` in {value:?}"),
-                );
-                return None;
-            };
-            let name = &body[..end];
-            if name.is_empty() {
-                self.push(
-                    rule,
-                    apath,
-                    format!("set_header {header}: empty secret name"),
-                );
-                ok = false;
-            } else if !self.input.secret_names.contains(name) {
+        };
+        let mut ok = true;
+        for name in secret_names(&parts) {
+            if !self.input.secret_names.contains(name) {
                 self.push(
                     rule,
                     apath,
@@ -711,13 +688,8 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 );
                 ok = false;
             }
-            parts.push(Part::Secret(name.to_owned()));
-            rest = &body[end + 1..];
         }
-        if !rest.is_empty() {
-            parts.push(Part::Lit(rest.to_owned()));
-        }
-        if parts.iter().any(|p| matches!(p, Part::Secret(_))) && shape.kind == RuleKind::Watching {
+        if has_secrets(&parts) && shape.kind == RuleKind::Watching {
             self.push(
                 rule,
                 apath,

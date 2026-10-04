@@ -4,6 +4,7 @@
 //! diagnostics (with line/column within an expression) are merged with the
 //! checks here.
 
+use roxy_rules::template::{parse_template, secret_names};
 use roxy_rules::{Condition, Diagnostic, Policy, PolicyInput};
 use std::collections::{HashMap, HashSet};
 
@@ -418,13 +419,21 @@ impl Config {
                     "invalid header name",
                 ));
             }
-            for secret in secret_refs(v) {
-                if !self.secrets.contains_key(secret) {
-                    d.push(Diagnostic::new(
-                        format!("{path}.headers.{h}"),
-                        format!("unknown secret {secret:?}"),
-                    ));
+            match parse_template(v) {
+                Ok(parts) => {
+                    for secret in secret_names(&parts) {
+                        if !self.secrets.contains_key(secret) {
+                            d.push(Diagnostic::new(
+                                format!("{path}.headers.{h}"),
+                                format!("unknown secret {secret:?}"),
+                            ));
+                        }
+                    }
                 }
+                Err(e) => d.push(Diagnostic::new(
+                    format!("{path}.headers.{h}"),
+                    format!("{e} in {v:?}"),
+                )),
             }
         }
     }
@@ -647,19 +656,6 @@ fn is_list_name(s: &str) -> bool {
     b.next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
         && b.all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-}
-
-/// The names in `${secret:name}` references.
-pub(crate) fn secret_refs(v: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut rest = v;
-    while let Some(i) = rest.find("${secret:") {
-        let after = &rest[i + "${secret:".len()..];
-        let Some(end) = after.find('}') else { break };
-        out.push(&after[..end]);
-        rest = &after[end + 1..];
-    }
-    out
 }
 
 /// The WASM limits `roxy run` would refuse or that would never act: a

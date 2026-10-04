@@ -162,6 +162,7 @@ mod metrics;
 mod parser;
 mod policy;
 mod state;
+pub mod template;
 mod types;
 mod view;
 
@@ -184,5 +185,6 @@ pub use metrics::{
 pub use parser::parse;
 pub use policy::{Condition, MetricDef, Policy, PolicyInput, RuleInfo, RuleKind, WatchState};
 pub use state::{StateFull, StateSource, StateStore};
+pub use template::{Part, TemplateError, expand, parse_template};
 pub use types::{Field, Reads, Type};
 pub use view::{BodyText, FlowView, MapView, Value};

@@ -38,22 +38,15 @@ const DROPPED: &[&str] = &[
     "content-length",
 ];
 
-/// `${secret:name}` expanded from the policy snapshot's secrets.
+/// `value` with its `${secret:name}` references expanded from the policy
+/// snapshot's secrets; `None` if one is missing or the value does not
+/// parse (validation refuses such a config, so this is a missing secret).
 pub(super) fn expand(
     value: &str,
     secrets: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
-    let mut out = String::with_capacity(value.len());
-    let mut rest = value;
-    while let Some(i) = rest.find("${secret:") {
-        out.push_str(&rest[..i]);
-        let after = &rest[i + "${secret:".len()..];
-        let end = after.find('}')?;
-        out.push_str(secrets.get(&after[..end])?);
-        rest = &after[end + 1..];
-    }
-    out.push_str(rest);
-    Some(out)
+    let parts = roxy_rules::parse_template(value).ok()?;
+    roxy_rules::expand(&parts, |name| secrets.get(name).cloned())
 }
 
 /// The URL for a call: the endpoint's URL with the request's path appended

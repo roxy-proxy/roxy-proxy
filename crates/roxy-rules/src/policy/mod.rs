@@ -12,6 +12,7 @@ use crate::compile::Pred;
 use crate::config::{DefaultDecision, MetricConfig, MetricCount, RuleConfig};
 use crate::diag::{Diagnostic, RuleId};
 use crate::eval::{Decision, Effect};
+use crate::template::Part;
 use crate::types::{Field, Reads};
 
 /// Everything [`Policy::compile`] needs from the config.
@@ -77,13 +78,6 @@ impl MetricDef {
 #[derive(Debug, Clone)]
 pub struct Condition {
     pred: Pred,
-}
-
-/// A `set_header` value: literal text and `${secret:name}` references.
-#[derive(Debug, Clone)]
-enum Part {
-    Lit(String),
-    Secret(String),
 }
 
 #[derive(Debug, Clone)]
