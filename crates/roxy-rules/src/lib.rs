@@ -111,8 +111,9 @@
 //!   `null` under `==`, `!=`, `in` and `not in`; any other operator on it
 //!   fails closed with [`FailClosedReason::MissingValue`].
 //! * **Case.** String comparisons are byte-exact, except operands involving
-//!   `host`, `tls.sni`, `method` and `scheme`, which compare ASCII
-//!   case-insensitively (also for `like`/`matches`/`in`). Header names in
+//!   `host`, `tls.sni` and `scheme`, which compare ASCII case-insensitively
+//!   (also for `like`/`matches`/`in`). `method` compares byte-exact, as HTTP
+//!   methods are case-sensitive: `get` is not `GET`. Header names in
 //!   `header["X-Y"]` are lower-cased at compile time.
 //! * **Operators.** `like` is a full-match glob (`*` any run including `/`,
 //!   `?` one char, nothing else special). `matches` is a full-match regex

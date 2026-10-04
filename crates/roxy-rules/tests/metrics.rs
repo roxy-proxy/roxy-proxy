@@ -139,34 +139,46 @@ fn keyed_vs_global() {
     let s = store_with(
         "- { id: per, count: requests, key: [client.ip] }
 - { id: all, count: requests }
-- { id: pair, count: requests, key: [client.ip, method] }",
+- { id: pair, count: requests, key: [client.ip, method, host] }",
         100,
         &c,
     );
+    let req = |n: u8, method: &str, host: &str| {
+        client(n)
+            .with_str(Field::Method, method)
+            .with_str(Field::Host, host)
+    };
     for _ in 0..3 {
-        rec(&s, &client(1).with_str(Field::Method, "GET"));
+        rec(&s, &req(1, "GET", "a.example"));
     }
-    rec(&s, &client(2).with_str(Field::Method, "get")); // same series as GET
-    rec(&s, &client(2).with_str(Field::Method, "POST"));
+    // Hosts compare case-insensitively, so they key one series...
+    rec(&s, &req(2, "GET", "A.Example"));
+    rec(&s, &req(2, "GET", "a.example"));
+    // ...while methods are byte-exact: `get` is its own series.
+    rec(&s, &req(2, "get", "a.example"));
     assert_eq!(s.get("per", &client(1)), Ok(3));
-    assert_eq!(s.get("per", &client(2)), Ok(2));
-    assert_eq!(s.get("all", &MapView::new()), Ok(5));
-    assert_eq!(
-        s.get("pair", &client(2).with_str(Field::Method, "GeT")),
-        Ok(1)
-    );
+    assert_eq!(s.get("per", &client(2)), Ok(3));
+    assert_eq!(s.get("all", &MapView::new()), Ok(6));
+    assert_eq!(s.get("pair", &req(2, "GET", "a.EXAMPLE")), Ok(2));
+    assert_eq!(s.get("pair", &req(2, "get", "a.example")), Ok(1));
+    assert_eq!(s.get("pair", &req(2, "GeT", "a.example")), Ok(0));
     // per: 2 keys, all: 1, pair: 3.
     assert_eq!(s.key_count(), 6);
     let snap = s.snapshot();
     assert!(snap.contains(&MetricSnapshot {
         id: "pair".into(),
-        key: vec!["10.0.0.1".into(), "get".into()],
+        key: vec!["10.0.0.1".into(), "GET".into(), "a.example".into()],
         value: 3,
+    }));
+    assert!(snap.contains(&MetricSnapshot {
+        id: "pair".into(),
+        key: vec!["10.0.0.2".into(), "GET".into(), "a.example".into()],
+        value: 2,
     }));
     assert!(snap.contains(&MetricSnapshot {
         id: "all".into(),
         key: vec![],
-        value: 5,
+        value: 6,
     }));
     assert_eq!(snap.len(), 6);
 }

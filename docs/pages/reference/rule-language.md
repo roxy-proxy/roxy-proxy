@@ -31,6 +31,14 @@ Strings are double-quoted with `\"` and `\\` escapes. `# ...` comments are
 allowed inside multi-line YAML block scalars. Size units are 1024-based
 (`kb` and `kib` are the same).
 
+String comparisons are byte-exact, with one exception: operands involving
+`host`, `tls.sni` or `scheme` compare ASCII case-insensitively (for every
+operator, including `like`, `matches` and `in`). `method` compares exactly,
+because HTTP methods are case-sensitive: a request with method `get` is
+forwarded as an extension method, may carry a body, and does not match
+`method == GET` or `method in [GET, HEAD]`. Header names in `header["X-Y"]`
+are case-insensitive; header values are not.
+
 Type errors are compile errors: `host under 443`, a regex that does not
 compile, a CIDR with a bad mask, a `metric.foo` with no such metric, an
 `@list` that is not defined. `in` takes a list of the operand's type, a

@@ -66,10 +66,11 @@
 //!   transient buffer a `get` on a `unique` metric builds (at most
 //!   61 × 256 × 8 + 4096 bytes ≈ 129 KiB per concurrent call, freed on
 //!   return).
-//! * **Keys.** Values of `host`, `tls.sni`, `method` and
-//!   `scheme` are ASCII-lower-cased before keying or hashing, because the
-//!   rule language compares them case-insensitively: otherwise `GET` and
-//!   `get` would be two series and an attacker could split a counter.
+//! * **Keys.** Values of `host`, `tls.sni` and `scheme` are
+//!   ASCII-lower-cased before keying or hashing, because the rule language
+//!   compares them case-insensitively: otherwise `Example.com` and
+//!   `example.com` would be two series and an attacker could split a
+//!   counter. `method` is keyed as sent, as the rule language compares it.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -297,17 +298,9 @@ impl fmt::Display for KeyPart {
 
 type Key = Box<[KeyPart]>;
 
-/// Fields the rule language compares ASCII case-insensitively.
-fn case_insensitive(f: Field) -> bool {
-    matches!(
-        f,
-        Field::Host | Field::TlsSni | Field::Method | Field::Scheme
-    )
-}
-
 fn key_part(metric: &str, view: &dyn FlowView, f: Field) -> Result<KeyPart, MetricError> {
     let fold = |s: &str| -> Box<str> {
-        if case_insensitive(f) {
+        if f.case_insensitive() {
             s.to_ascii_lowercase().into()
         } else {
             s.into()

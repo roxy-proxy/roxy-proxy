@@ -102,6 +102,31 @@ fn equality_and_ordering() {
     ]);
 }
 
+/// HTTP methods are case-sensitive: the proxy forwards `get` as an
+/// extension method, which may carry a body, so a rule written for `GET`
+/// must not match it.
+#[test]
+fn methods_compare_byte_exact() {
+    let lower = flow().with_str(Field::Method, "get");
+    for expr in [
+        "method == GET",
+        "method in [GET]",
+        "method in [GET, HEAD]",
+        "method starts_with \"GE\"",
+        "method like \"G*\"",
+        "method matches \"GET\"",
+    ] {
+        assert!(!eval_in(expr, &lower), "{expr} must not match `get`");
+    }
+    assert!(eval_in("method == \"get\"", &lower));
+    assert!(eval_in("method not in [GET]", &lower));
+    // Host comparisons stay case-insensitive.
+    assert!(eval_in(
+        "host == \"API.GITHUB.COM\"",
+        &flow().with_str(Field::Host, "api.github.com")
+    ));
+}
+
 #[test]
 fn string_operators() {
     check(&[
@@ -175,7 +200,7 @@ fn membership_and_cidrs() {
         ("method in [GET, POST]", true),
         ("method in [GET, HEAD]", false),
         ("method not in [GET, HEAD]", true),
-        ("method in [\"post\"]", true),
+        ("method in [\"post\"]", false),
         ("host in [\"pypi.org\", \"API.GITHUB.COM\"]", true),
         ("port in [80, 443]", true),
         ("port not in [80, 443]", false),
