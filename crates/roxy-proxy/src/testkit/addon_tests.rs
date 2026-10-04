@@ -530,8 +530,8 @@ mod service {
     use bytes::Bytes;
 
     use super::{RULES, strs};
-    use crate::addons::service::testing::{addon, kit};
-    use crate::testkit::{Answer, streaming_body};
+    use crate::addons::service::testing::{addon, kit, reload};
+    use crate::testkit::{Answer, Kit, streaming_body};
 
     /// The response head waits for `request_end`, and so does its clock:
     /// an upstream that answers while the client is still uploading, for
@@ -653,5 +653,49 @@ mod service {
         let lagged = kit.events("observer_lagged", 1).await;
         assert_eq!(lagged[0]["layer"], "o", "{lagged:#?}");
         assert_eq!(lagged[0]["direction"], "request");
+    }
+
+    /// A secret the rules inject is captured redacted, through the stack as
+    /// without one; the upstream gets the real value.
+    #[tokio::test]
+    async fn a_captured_head_redacts_an_injected_secret() {
+        const WITH_TOKEN: &str = r#"
+- id: up
+  when: host == "up.test"
+  then:
+    - set_header: { x-token: "Bearer ${secret:tok}" }
+    - allow
+"#;
+        let kit = Kit::builder().rules(RULES).capture_all().start().await;
+        reload(
+            &kit,
+            WITH_TOKEN,
+            &[("tok", "sk-live-123")],
+            vec![addon("s", "pass", false, |_| {})],
+        );
+        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+        assert_eq!(a.status, 200, "{a:?}");
+        let seen = kit.upstream.wait_seen(1).await;
+        assert_eq!(seen[0].headers["x-token"], "Bearer sk-live-123");
+        kit.request_event().await;
+        let captured = kit.captured();
+        let (_, head) = captured
+            .iter()
+            .find(|(h, _)| h["dir"] == "request" && h["kind"] == "head")
+            .expect("the request head is captured");
+        let head: serde_json::Value = serde_json::from_slice(head).unwrap();
+        let token = head["headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h[0] == "x-token")
+            .expect("x-token captured");
+        assert_eq!(token[1], "Bearer [REDACTED]", "{head:#}");
+        assert!(
+            !captured
+                .iter()
+                .any(|(_, p)| p.windows(11).any(|w| w == b"sk-live-123")),
+            "the secret is nowhere in the capture"
+        );
     }
 }

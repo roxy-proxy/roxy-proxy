@@ -474,17 +474,34 @@ pub(crate) mod testing {
     /// A kit running `rules` with the stack `addons`, outermost first.
     pub(crate) async fn kit(rules: &str, addons: Vec<Arc<AddonSpec>>) -> Kit {
         let kit = Kit::builder().rules(rules).start().await;
+        reload(&kit, rules, &[], addons);
+        kit
+    }
+
+    /// Reloads `kit` with `rules`, the `secrets` they may use (redacted
+    /// from the logs) and the stack `addons`, outermost first.
+    pub(crate) fn reload(
+        kit: &Kit,
+        rules: &str,
+        secrets: &[(&str, &str)],
+        addons: Vec<Arc<AddonSpec>>,
+    ) {
         let rules: Vec<RuleConfig> = serde_yaml_ng::from_str(rules).unwrap();
         let none = std::collections::HashSet::new();
+        let secret_names = secrets.iter().map(|(n, _)| (*n).to_owned()).collect();
         let input = PolicyInput {
             rules: &rules,
             metrics: &[],
-            secret_names: &none,
+            secret_names: &secret_names,
             address_lists: &none,
             transparent_listeners: false,
             default: DefaultDecision::Deny,
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
+        let mut redactor = Redactor::new();
+        for (_, v) in secrets {
+            redactor.add_secret(*v);
+        }
         let mut upstream = UpstreamSettings::default();
         upstream.dns.servers = Some(vec!["127.0.0.1:9".parse().unwrap()]);
         for (name, ip) in [
@@ -506,8 +523,11 @@ pub(crate) mod testing {
         kit.server
             .reload(PolicyUpdate {
                 policy,
-                secrets: HashMap::new(),
-                redactor: Redactor::new(),
+                secrets: secrets
+                    .iter()
+                    .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))
+                    .collect(),
+                redactor,
                 users: HashMap::new(),
                 limits: roxy_http::Limits::default(),
                 flags: roxy_http::HttpFlags::default(),
@@ -517,6 +537,5 @@ pub(crate) mod testing {
                 addons,
             })
             .unwrap();
-        kit
     }
 }
