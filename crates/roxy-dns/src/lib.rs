@@ -17,6 +17,9 @@
 //! [`answer`] and always fit in [`MAX_UDP_PAYLOAD`] bytes, so nothing is
 //! ever truncated.
 
+// Casts go through `From` / `TryFrom`, so a narrowing one cannot slip in.
+#![warn(clippy::as_conversions)]
+
 use std::net::IpAddr;
 
 /// The classic UDP payload limit (RFC 1035 §2.3.4). Every message
@@ -135,9 +138,8 @@ pub fn parse(msg: &[u8]) -> Parsed {
     if flags & FLAG_QR != 0 {
         return Parsed::Drop;
     }
-    // Four bits wide, so the cast is lossless.
-    #[allow(clippy::cast_possible_truncation)]
-    let opcode = ((flags >> OPCODE_SHIFT) & 0xf) as u8;
+    // Four bits wide, so it always fits.
+    let opcode = u8::try_from((flags >> OPCODE_SHIFT) & 0xf).unwrap_or(u8::MAX);
     let rd = flags & FLAG_RD != 0;
     let err = |rcode| Parsed::Error {
         id,

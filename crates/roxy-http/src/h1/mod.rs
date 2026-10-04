@@ -54,6 +54,7 @@ use tokio::time::{Instant, timeout, timeout_at};
 pub use chunked::{ChunkedDecoder, Decoded};
 pub use head::{Framing, Head, HeadScan, RequestHead, Role, parse_head, scan_head};
 
+use crate::len_u64;
 use crate::model::{
     Authority, Body, BodyError, BodySender, CanonicalRequest, CanonicalResponse, Headers,
     HttpFlags, Limits, ParseError, Reason, RequestMeta, TargetForm, Version, WriteError,
@@ -224,7 +225,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
                         return Ok(());
                     }
                     (None, Pending::Data(b)) => {
-                        feed.drained += b.len() as u64;
+                        feed.drained += len_u64(b.len());
                         if feed.drained > DRAIN_LIMIT {
                             tracing::debug!("drain limit reached; connection will close");
                             self.feed = None;
@@ -248,7 +249,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
                         .unwrap_or(usize::MAX)
                         .min(self.buf.len())
                         .min(READ_CHUNK);
-                    *rem -= n as u64;
+                    *rem -= len_u64(n);
                     Decoded::Data(self.buf.split_to(n).freeze())
                 }
                 BodyDecoder::Chunked(d) => d.decode(&mut self.buf)?,
@@ -410,7 +411,7 @@ async fn write_message<W: AsyncWrite + Unpin>(
         if data.is_empty() {
             continue;
         }
-        sent += data.len() as u64;
+        sent += len_u64(data.len());
         match framing {
             OutFraming::Length(n) => {
                 if sent > n {
@@ -929,7 +930,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
             }
             self.r.abandoned = true;
         }
-        let len = body.len() as u64;
+        let len = len_u64(body.len());
         // A HEAD response describes the body but never carries it.
         let framing = if self.exchange.as_ref().is_some_and(|e| e.is_head) {
             OutFraming::Head(Some(len))

@@ -22,6 +22,7 @@ use http::HeaderMap;
 use http_body::Frame;
 use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
 
+use crate::len_u64;
 use crate::{Body, BodyError, Headers};
 
 /// More codings than this in one `content-encoding` is refused rather than
@@ -314,7 +315,7 @@ impl Decoder {
         } else {
             self.pull(self.stages.len() - 1, buf)?
         };
-        self.produced += n as u64;
+        self.produced += len_u64(n);
         if self.produced > self.limit {
             return Err(DecodeError::TooLarge { limit: self.limit });
         }
@@ -714,7 +715,7 @@ fn zstd_block(b: &[u8]) -> Result<Option<(usize, bool)>, String> {
     };
     let h = u32::from_le_bytes([h[0], h[1], h[2], 0]);
     let last = h & 1 != 0;
-    let size = (h >> 3) as usize;
+    let size = usize::try_from(h >> 3).map_err(|_| "block too large".to_owned())?;
     let content = match (h >> 1) & 3 {
         0 | 2 => size,
         1 => 1,
@@ -762,7 +763,7 @@ impl Stage for Zstd {
             }
             ZState::Skip(left) => {
                 let n = usize::try_from(left).unwrap_or(usize::MAX).min(input.len());
-                self.state = ZState::Skip(left - n as u64);
+                self.state = ZState::Skip(left - len_u64(n));
                 Ok((n, 0))
             }
             ZState::Blocks { checksum } => {
@@ -1067,7 +1068,7 @@ mod tests {
         good[3] |= 0x02;
         let mut crc = Crc::new();
         crc.update(&good);
-        good.extend_from_slice(&((crc.sum() & 0xffff) as u16).to_le_bytes());
+        good.extend_from_slice(&u16::try_from(crc.sum() & 0xffff).unwrap().to_le_bytes());
         good.extend_from_slice(&body[10..]);
         assert_eq!(decode(&[Coding::Gzip], &good, 10).unwrap(), b"x");
         good[10] ^= 1;

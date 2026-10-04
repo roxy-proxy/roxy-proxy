@@ -5,6 +5,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use http::{HeaderMap, HeaderName};
 
 use crate::chars::{hex_val, is_field_value_byte, is_token};
+use crate::len_u64;
 use crate::model::{HttpFlags, Limits, ParseError, Reason, is_reserved, reject, validate_value};
 
 /// Longest chunk-size line accepted without extensions (16 hex digits).
@@ -118,7 +119,7 @@ impl ChunkedDecoder {
                     }
                     let n = usize::try_from(rem).unwrap_or(usize::MAX).min(buf.len());
                     let chunk = buf.split_to(n).freeze();
-                    let rem = rem - n as u64;
+                    let rem = rem - len_u64(n);
                     self.state = if rem == 0 {
                         State::DataCrlf
                     } else {

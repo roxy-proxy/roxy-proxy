@@ -12,6 +12,7 @@
 //! protocol error, and errors are sticky: a decoder that failed never
 //! yields again.
 
+use crate::len_u64;
 use thiserror::Error;
 
 /// Close codes roxy sends (RFC 6455 §7.4.1).
@@ -221,8 +222,8 @@ impl Decoder {
                 }
             }
             *input = &input[k..];
-            f.read += k as u64;
-            f.remaining -= k as u64;
+            f.read += len_u64(k);
+            f.remaining -= len_u64(k);
             if f.remaining > 0 {
                 return Ok(None);
             }
@@ -321,7 +322,7 @@ impl Decoder {
                 let Some((_, b)) = &self.partial else {
                     return fail(close::PROTOCOL_ERROR, "continuation without a message");
                 };
-                if (b.len() as u64).saturating_add(len) > self.max_message {
+                if len_u64(b.len()).saturating_add(len) > self.max_message {
                     return fail(close::TOO_BIG, "message too big");
                 }
             }
@@ -403,7 +404,7 @@ pub fn encode(opcode: Opcode, payload: &[u8], mask: Option<[u8; 4]>, out: &mut V
         }
         n => {
             out.push(m | 0x7f);
-            out.extend_from_slice(&(n as u64).to_be_bytes());
+            out.extend_from_slice(&len_u64(n).to_be_bytes());
         }
     }
     match mask {
@@ -447,7 +448,7 @@ mod tests {
         while let Some(m) = d.decode(&mut input)? {
             out.push(m);
         }
-        assert_eq!(input, &[] as &[u8]);
+        assert_eq!(input, b"");
         Ok(out)
     }
 
@@ -601,7 +602,7 @@ mod tests {
                 let mut input = &out[..];
                 let m = d.decode(&mut input).unwrap().unwrap();
                 assert_eq!(m.payload(), &payload[..], "n={n}");
-                assert_eq!(input, &[] as &[u8]);
+                assert_eq!(input, b"");
             }
         }
     }
