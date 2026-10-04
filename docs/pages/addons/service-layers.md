@@ -53,8 +53,8 @@ connection. A service should not close a connection it is not done with:
 an exchange roxy started on it as it closed fails.
 
 A reload gives new exchanges new connections, dialled under the new policy
-and secrets. The old connections take no new streams and close when their
-last exchange ends.
+and secrets. The old connections take no new streams: an idle one closes at
+once, a busy one when its last exchange ends.
 
 ### Frames
 
@@ -126,8 +126,9 @@ that stream. Control messages are not counted.
   `next`**: re-validated as strictly as a client request, then judged by the
   rules. Its response is handled as a WASM layer's.
 - **Deadlines.** `first_byte_timeout` bounds getting a stream (connecting,
-  or waiting for a free one) and each of the service's heads (its first answer, and its response after roxy sent the
-  upstream's head). `max_exchange_time` bounds the whole stream.
+  or waiting for a free one) and each of the service's heads (its first
+  answer, and its response after roxy sent the upstream's head).
+  `max_exchange_time` bounds the whole stream.
 - **Failure is closed** in enforce mode: a failed connection or handshake,
   a protocol violation (bad JSON, a message out of order, bytes before a
   head, an invalid head, a broken length, bytes past the credit), a missed
@@ -146,12 +147,13 @@ that stream. Control messages are not counted.
   messages for copies of both directions, and whatever it sends back other
   than `credit` and `reset` is ignored. The stream ends after roxy's
   `response_end` (or a `reset`). It cannot change or delay traffic; its
-  failures are logged only. An observer stream that falls behind the real
-  exchange is cut and reset on its own; roxy does not wait for credit
-  before cutting it. A service that wants whole copies of large bodies
-  grants credit up front when an observe stream opens. roxy credits back at
-  once whatever the service sends on an observe stream, so it never stalls
-  on its own answers.
+  failures are logged only. The real exchange never waits for an observer:
+  a stream whose copies fall behind it is cut and reset on its own
+  (`observer_lagged`). Waiting for credit is falling behind, so a service
+  that wants whole copies of large bodies grants extra credit as an observe
+  stream opens (`roxy_layer.py` grants 16 MiB). roxy credits back at once
+  whatever the service sends on an observe stream, so the service never
+  stalls on its own answers.
 - **WebSocket upgrades.** The service sees the upgrade request; a `101`
   passes straight back, roxy resets the stream, and the WebSocket's bytes
   do not go through it.
