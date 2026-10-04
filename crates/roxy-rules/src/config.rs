@@ -98,7 +98,7 @@ pub struct RuleConfig {
 /// Message for a rule that still sets the removed `phase` key.
 pub const PHASE_REMOVED: &str = "`phase` was removed: rules no longer have phases; each rule runs \
      when the values it reads are known (head rules at the request head; rules that read \
-     body.bytes, response.* or ws.* watch the rest of the exchange; see docs/rules.md#evaluation). Delete \
+     body.bytes, response.* or ws.* watch the rest of the exchange; see https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation). Delete \
      the `phase` key";
 
 #[derive(Deserialize)]
@@ -737,7 +737,10 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(err.contains("`phase` was removed"), "{err}");
-        assert!(err.contains("docs/rules.md#evaluation"), "{err}");
+        assert!(
+            err.contains("https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation"),
+            "{err}"
+        );
         let ok: Vec<RuleConfig> =
             serde_yaml_ng::from_str("- { id: r, when: 'body.bytes > 1', then: deny }").unwrap();
         assert_eq!(ok[0].id, "r");

@@ -30,24 +30,24 @@ concurrent ones (HTTP/2 streams). Both fronts feed one transport-agnostic
 exchange core (`roxy-proxy`'s `exchange` module):
 
 1. The request head is parsed into the canonical model
-   ([HTTP](http.md#canonical-request)). The body stays a stream.
-2. The addon stack runs, outermost first ([addons](addons.md)). The last
+   ([HTTP](/reference/http#canonical-request)). The body stays a stream.
+2. The addon stack runs, outermost first ([addons](/addons/overview)). The last
    addon's `next` runs the rest of the core on what it passed on.
 3. The request steps run, in a fixed order: a bounded body buffer only
    when a rule reads `body.text`, then the head decision and its effects
-   ([rules](rules.md#evaluation)). A step cannot forward anything itself;
+   ([rules](/policies/overview)). A step cannot forward anything itself;
    it returns a verdict, and the only verdict that leads to the upstream is
    `Continue`. Every error maps to a deny or a close. These steps are not
    an extension point: extensions are addons, above them.
 4. The upstream connector resolves the host, checks every candidate IP
-   against the address floor, and connects ([upstream](upstream.md)).
+   against the address floor, and connects ([upstream](/reference/upstream)).
 5. When the response head arrives, the response steps run: a bounded
    buffer of the response body only when a rule reads `response.body.text`,
    then the watching rules at the response head, which may still stop the
    exchange or change the head. For the rest of the exchange the watcher
    re-checks the watching rules as body bytes stream, records byte metrics,
    and holds each chunk until the flow log is ready
-   ([audit backpressure](flow-log.md#writing)).
+   ([audit backpressure](/operate/flow-log#writing)).
 6. The response is re-framed for the client and passes back up the addon
    stack.
 

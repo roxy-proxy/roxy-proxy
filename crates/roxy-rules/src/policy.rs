@@ -673,7 +673,7 @@ impl PolicyCompiler<'_, '_> {
                             at,
                             format!(
                                 "`{f}` is known only after forwarding; metric {what} fields must \
-                                 be head fields (docs/rules.md#metrics)"
+                                 be head fields (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)"
                             ),
                         );
                         None
@@ -711,7 +711,7 @@ impl PolicyCompiler<'_, '_> {
                         format!(
                             "a metric's `where` may only read head fields, because whether an \
                              exchange counts is decided at the request head; it reads {} \
-                             (docs/rules.md#metrics)",
+                             (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)",
                             needs
                                 .watched
                                 .iter()
@@ -1186,7 +1186,7 @@ impl RuleCx<'_> {
         let why = || {
             format!(
                 "this rule reads {}, which is known only after the request was forwarded \
-                 (docs/rules.md#evaluation)",
+                 (https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation)",
                 self.watched()
             )
         };

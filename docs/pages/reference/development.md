@@ -15,7 +15,7 @@ load them, so the binaries cannot drift from their sources. After changing
 one, rebuild it with its `build.sh` and commit the result.
 
 The crates and how they fit together are in
-[architecture](architecture.md#crates). [CLAUDE.md](../CLAUDE.md) has the
+[architecture](/reference/architecture#crates). [CLAUDE.md](https://github.com/roxy-proxy/roxy-proxy/blob/main/CLAUDE.md) has the
 working practices for picking up issues.
 
 ## Testing
@@ -24,7 +24,7 @@ working practices for picking up issues.
   TE.TE obfuscations, duplicate lengths, obs-fold, bare LF, `%2e%2e` path
   climbs, Host/authority mismatches, CRLF in header values, and more. Every
   case has an expected reason code. It is the acceptance test for the
-  [rejection rules](http.md#rejection-rules).
+  [rejection rules](/reference/http#rejection-rules).
 - **Property tests:** URL normalisation is idempotent; serialise → parse
   round-trips to an equal canonical model.
 - **Golden tests** (`insta`) for rule diagnostics
@@ -40,7 +40,7 @@ working practices for picking up issues.
 ## Fuzzing
 
 `fuzz/` is a cargo-fuzz workspace (nightly; see
-[fuzz/README.md](../fuzz/README.md)) with targets for:
+[fuzz/README.md](https://github.com/roxy-proxy/roxy-proxy/blob/main/fuzz/README.md)) with targets for:
 
 - the HTTP/1.1 request head, where the canonical form is a fixed point of
   parse → serialise → parse;
@@ -59,4 +59,4 @@ fuzzed parser. A crash becomes a regression test in the crate it hit.
 
 ## Releasing
 
-Push a `vX.Y.Z` tag; see [RELEASING.md](../RELEASING.md).
+Push a `vX.Y.Z` tag; see [RELEASING.md](https://github.com/roxy-proxy/roxy-proxy/blob/main/RELEASING.md).

@@ -1,7 +1,7 @@
 # Service layers in Python
 
 A service layer is an external service in roxy's network path
-([docs/addons.md](../../../docs/addons.md#service-layers)): each exchange streams through it over a WebSocket
+([service layers](https://roxy-proxy.github.io/roxy-proxy/addons/service-layers)): each exchange streams through it over a WebSocket
 (`roxy.layer.v1`), request and response, and it can pass either on,
 change it, hold it back, answer itself or refuse. Whatever it forwards is
 still checked like a client request and judged by roxy's rules, and if it

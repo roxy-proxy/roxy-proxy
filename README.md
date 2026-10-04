@@ -82,7 +82,7 @@ To contain something real, replace the `agent` service with your workload
 the running one stays (see `docker compose logs roxy`). Restart instead
 (`docker compose restart roxy`) for listener, TLS or capture settings.
 Outside Compose, the same recipe and the hardened container image are in
-[docs/deployment.md](docs/deployment.md).
+[deployment](https://roxy-proxy.github.io/roxy-proxy/deploy/overview).
 
 ## A policy
 
@@ -130,7 +130,7 @@ traffic:
 roxy rule test --config roxy.yaml POST https://api.github.com/repos/a/b/issues
 ```
 
-The full language is in [docs/rules.md](docs/rules.md).
+The full language is in the [rule language reference](https://roxy-proxy.github.io/roxy-proxy/reference/rule-language).
 
 ## Extending roxy
 
@@ -175,25 +175,23 @@ addon runs under budgets, and any failure denies the flow.
   [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel)
   sidecar supervising an AI agent at the boundary.
 
-See [docs/addons.md](docs/addons.md) and [`examples/addons`](examples/addons).
+See [addons](https://roxy-proxy.github.io/roxy-proxy/addons/overview) and [`examples/addons`](examples/addons).
 
 ## Documentation
 
-[`docs/`](docs/README.md) is the reference for how roxy behaves:
+The documentation site is at
+[roxy-proxy.github.io/roxy-proxy](https://roxy-proxy.github.io/roxy-proxy/). Its source is in [`docs/`](docs).
 
-- [Principles and threat model](docs/principles.md)
-- [Architecture](docs/architecture.md)
-- [HTTP](docs/http.md): the explicit proxy, CONNECT, strict parsing
-- [Rules](docs/rules.md): the config file and the rule language
-- [Upstream](docs/upstream.md): DNS, the address floor, address lists
-- [WebSockets](docs/websockets.md)
-- [TLS and the CA](docs/tls.md)
-- [Flow log and capture](docs/flow-log.md)
-- [Addons](docs/addons.md)
-- [Resource limits](docs/limits.md)
-- [Deployment](docs/deployment.md): containing a workload, the container
-  image, running without Docker
-- [Development](docs/development.md)
+- [Quickstart](https://roxy-proxy.github.io/roxy-proxy/quickstart) and [use cases](https://roxy-proxy.github.io/roxy-proxy/use-cases/ai-agents)
+- [Principles and threat model](https://roxy-proxy.github.io/roxy-proxy/principles)
+- [Configure policies](https://roxy-proxy.github.io/roxy-proxy/policies/overview): evaluation, secrets, rate
+  limits, body rules, the address floor, WebSockets, testing
+- [Addons](https://roxy-proxy.github.io/roxy-proxy/addons/overview): the layer stack, service layers, writing
+  addons
+- [Deploy](https://roxy-proxy.github.io/roxy-proxy/deploy/overview) and [operate](https://roxy-proxy.github.io/roxy-proxy/operate/operations):
+  containing a workload, the container image, the CA, the flow log
+- [Reference](https://roxy-proxy.github.io/roxy-proxy/reference/configuration): configuration, the rule
+  language, HTTP, upstream, TLS, limits, architecture, development
 
 Outstanding work is tracked in
 [issues](https://github.com/roxy-proxy/roxy-proxy/issues).
