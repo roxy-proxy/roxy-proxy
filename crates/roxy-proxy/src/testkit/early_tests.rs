@@ -212,7 +212,6 @@ async fn h2_a_layer_answers_after_next_mid_upload() {
 }
 
 #[tokio::test]
-#[ignore = "#31: the core's record is lost when a layer abandons a forwarded request"]
 async fn answering_after_next_keeps_what_the_rules_decided() {
     let kit = stack(&["a"]).await;
     let mut c = kit.h1().await;
@@ -233,7 +232,6 @@ async fn answering_after_next_keeps_what_the_rules_decided() {
 }
 
 #[tokio::test]
-#[ignore = "#31: the deepest layer entered is blamed, not the layer that answered"]
 async fn an_outer_layer_answering_after_the_inner_one_forwarded_is_the_one_named() {
     let kit = stack(&["a", "b"]).await;
     let mut c = kit.h1().await;

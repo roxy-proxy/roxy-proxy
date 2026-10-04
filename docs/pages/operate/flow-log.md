@@ -27,6 +27,8 @@ produces a `request` event:
 - `stage` says where the decision was made: `head` for the forwarding
   decision, or where a watching rule stopped the exchange: `request_body`,
   `response_head`, `response_body`, `websocket`.
+- `decision` is `allow` or `deny`, or `answered` when an addon layer
+  answered itself ([addons](/addons/overview#in-the-proxy)).
 - When an addon changed the request, `rules`, `decision` and
   `terminal_rule` describe the request that left, and `req` still describes
   what the client sent ([addons](/addons/overview#in-the-proxy)).

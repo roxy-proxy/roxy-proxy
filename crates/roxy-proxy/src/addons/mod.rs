@@ -22,7 +22,7 @@ pub use service::{ServiceError, ServiceSpec};
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
@@ -35,6 +35,8 @@ use roxy_http::upstream::from_upstream_response;
 use roxy_http::ws::WsKey;
 use roxy_http::{Body, BodyError, CanonicalRequest, Headers, coding};
 use roxy_wasm::{HostError, LayerError, LayerOutcome, LayerRequest, LayerResponse};
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use crate::body::{Collected, collect_prefix};
@@ -147,21 +149,149 @@ impl Default for StateLimits {
     }
 }
 
+/// How far one layer of an exchange got with `next`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum NextState {
+    /// The exchange never reached this layer.
+    Unentered,
+    /// Entered; `next` not called.
+    Entered,
+    /// `next` called; no response yet.
+    Pending,
+    /// `next` returned the response from below.
+    Resolved,
+    /// `next` failed.
+    Failed,
+    /// The layer dropped `next` before it returned.
+    Abandoned,
+}
+
+impl NextState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Entered,
+            2 => Self::Pending,
+            3 => Self::Resolved,
+            4 => Self::Failed,
+            5 => Self::Abandoned,
+            _ => Self::Unentered,
+        }
+    }
+}
+
+/// One layer's part in an exchange.
+#[derive(Default)]
+struct LayerSlot {
+    next: AtomicU8,
+    /// The layer's own outcome, once its handler returned a response: a
+    /// failure after the head shows here first.
+    outcome: Mutex<Option<LayerOutcome>>,
+}
+
+impl LayerSlot {
+    fn state(&self) -> NextState {
+        NextState::from_u8(self.next.load(Ordering::SeqCst))
+    }
+
+    fn set(&self, s: NextState) {
+        self.next.store(s as u8, Ordering::SeqCst);
+    }
+}
+
+/// Marks a layer's `next` pending, and settles it when `next` returns or
+/// is dropped unfinished.
+struct NextGuard {
+    st: Arc<StackFlow>,
+    index: usize,
+    settled: bool,
+}
+
+impl NextGuard {
+    fn new(st: Arc<StackFlow>, index: usize) -> Self {
+        st.layers[index].set(NextState::Pending);
+        Self {
+            st,
+            index,
+            settled: false,
+        }
+    }
+
+    fn settle(mut self, ok: bool) {
+        self.settled = true;
+        let s = if ok {
+            NextState::Resolved
+        } else {
+            NextState::Failed
+        };
+        self.st.layers[self.index].set(s);
+    }
+}
+
+impl Drop for NextGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.st.layers[self.index].set(NextState::Abandoned);
+        }
+    }
+}
+
+/// The flow's one [`FlowCx`], lent to the core for as long as it runs. It
+/// goes back to the stack however the core ends, dropped mid-flight
+/// included, so nothing the core recorded is lost.
+struct Lease {
+    st: Arc<StackFlow>,
+    cx: Option<FlowCx>,
+    /// The core ran to its outcome.
+    done: bool,
+}
+
+impl Lease {
+    fn cx(&mut self) -> &mut FlowCx {
+        self.cx.as_mut().expect("leased until dropped")
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let Some(mut cx) = self.cx.take() else {
+            return;
+        };
+        if !self.done && cx.record.decision.is_some() {
+            // The rules had decided and the request was on its way.
+            cx.record
+                .reason
+                .get_or_insert_with(|| "upstream_aborted".to_owned());
+        }
+        *self.st.cx.lock().unwrap_or_else(PoisonError::into_inner) = Some(cx);
+        self.st.returned.notify_one();
+    }
+}
+
 /// One exchange's trip through the stack, shared by every layer's host.
+/// It holds the flow's [`FlowCx`] while the layers run, lends it to the
+/// core, and hands it back to the front afterwards.
 pub(crate) struct StackFlow {
     pub(crate) shared: Arc<Shared>,
     pub(crate) snap: Arc<Snapshot>,
     pub(crate) flow: Ulid,
     pub(crate) client: ClientConn,
     pub(crate) tls: Option<TlsInfo>,
-    /// The client's request facts (for `metric-get`).
-    pub(crate) facts: FlowFacts,
+    /// The flow's facts as of the latest request to leave the stack (the
+    /// client's until then), for `metric-get`: the same keys the core's
+    /// samples use.
+    facts: Mutex<FlowFacts>,
     /// The client asked to upgrade (WebSocket); carried to the core, since
     /// a layer cannot express hop-by-hop fields.
     upgrade_req: Option<String>,
     tags: Mutex<Vec<String>>,
-    /// The core's flow context, once the last layer called `next`.
-    inner: Mutex<Option<FlowCx>>,
+    /// The flow context, while it is not with the front or the core.
+    cx: Mutex<Option<FlowCx>>,
+    /// The core gave the flow context back.
+    returned: Notify,
+    /// The response left without the core's: stop the core.
+    abandon: CancellationToken,
+    layers: Box<[LayerSlot]>,
     /// The first layer failure (it decides the outcome and attribution).
     failure: Mutex<Option<(String, StackError)>>,
     /// The enforce-mode failure has been logged.
@@ -170,8 +300,6 @@ pub(crate) struct StackFlow {
     pub(crate) close: AtomicBool,
     /// The upgraded upstream connection, when the core relayed a `101`.
     upgrade: Mutex<Option<(hyper::upgrade::Upgraded, WsKey)>>,
-    /// One more than the deepest layer entered.
-    depth: AtomicUsize,
 }
 
 impl StackFlow {
@@ -182,15 +310,72 @@ impl StackFlow {
             flow: cx.flow,
             client: cx.facts.client.clone(),
             tls: cx.facts.tls.clone(),
-            facts: cx.facts.clone(),
+            facts: Mutex::new(cx.facts.clone()),
             upgrade_req: req.meta.upgrade.clone(),
             tags: Mutex::new(Vec::new()),
-            inner: Mutex::new(None),
+            cx: Mutex::new(None),
+            returned: Notify::new(),
+            abandon: CancellationToken::new(),
+            layers: cx
+                .snap
+                .addons
+                .iter()
+                .map(|_| LayerSlot::default())
+                .collect(),
             failure: Mutex::new(None),
             reported: AtomicBool::new(false),
             close: AtomicBool::new(false),
             upgrade: Mutex::new(None),
-            depth: AtomicUsize::new(0),
+        }
+    }
+
+    /// The facts `metric-get` reads.
+    pub(crate) fn facts(&self) -> FlowFacts {
+        self.facts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_facts(&self, facts: &FlowFacts) {
+        facts.clone_into(&mut self.facts.lock().unwrap_or_else(PoisonError::into_inner));
+    }
+
+    /// Parks the flow context for the core to borrow.
+    fn park(&self, cx: FlowCx) {
+        *self.cx.lock().unwrap_or_else(PoisonError::into_inner) = Some(cx);
+    }
+
+    /// Lends the flow context to the core. `None` if it is already lent
+    /// (the core runs at most once per exchange).
+    fn lease(self: &Arc<Self>) -> Option<Lease> {
+        let cx = self
+            .cx
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()?;
+        Some(Lease {
+            st: self.clone(),
+            cx: Some(cx),
+            done: false,
+        })
+    }
+
+    /// Takes the flow context back once the stack has answered. A core
+    /// still running was abandoned by the layer that answered: it is
+    /// stopped, and its record comes back with it.
+    async fn reclaim(&self) -> FlowCx {
+        loop {
+            if let Some(cx) = self
+                .cx
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
+                return cx;
+            }
+            self.abandon.cancel();
+            self.returned.notified().await;
         }
     }
 
@@ -222,6 +407,26 @@ impl StackFlow {
             .clone()
     }
 
+    /// The layer failure behind a body cut after the head: the innermost
+    /// layer whose own outcome failed (an outer layer that reads a cut body
+    /// fails in turn), else the first recorded failure.
+    fn post_head_failure(&self) -> Option<(String, StackError)> {
+        self.layers
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, l)| {
+                let failure = l
+                    .outcome
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                    .and_then(LayerOutcome::failure)?;
+                Some((self.snap.addons[i].name.clone(), failure.into()))
+            })
+            .or_else(|| self.failure())
+    }
+
     fn take_upgrade(&self) -> Option<(hyper::upgrade::Upgraded, WsKey)> {
         self.upgrade
             .lock()
@@ -229,61 +434,23 @@ impl StackFlow {
             .take()
     }
 
-    fn inner_watch(&self) -> Option<Arc<crate::watch::Watch>> {
-        self.inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .and_then(|c| c.watch.clone())
+    /// The layer that answered: the outermost one whose `next` did not
+    /// return the response from below (never called, still pending,
+    /// failed or dropped). `None` when every layer entered passed on what
+    /// came from below, so the response is the core's.
+    fn answered_by(&self) -> Option<usize> {
+        self.layers.iter().position(|l| {
+            matches!(
+                l.state(),
+                NextState::Entered | NextState::Pending | NextState::Failed | NextState::Abandoned
+            )
+        })
     }
 
-    /// Folds the stack's outcome into the client-side flow record, just
-    /// before its `request` event: what the rules decided about the request
-    /// that left, the layers, their tags; or, if no request left, that a
-    /// layer answered.
-    pub(crate) fn merge_into(&self, cx: &mut FlowCx) {
+    /// Folds the stack into the flow record just before its `request`
+    /// event: the layers and the tags they added.
+    pub(crate) fn fold_into(&self, cx: &mut FlowCx) {
         cx.record.addons = self.snap.addons.iter().map(|a| a.name.clone()).collect();
-        let inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        match inner {
-            Some(mut icx) => {
-                if cx.watch.is_none() {
-                    icx.absorb_watch();
-                }
-                let r = &mut cx.record;
-                for rule in icx.record.rules {
-                    if !r.rules.contains(&rule) {
-                        r.rules.push(rule);
-                    }
-                }
-                for t in icx.record.tags {
-                    if !r.tags.contains(&t) {
-                        r.tags.push(t);
-                    }
-                }
-                r.mutations.extend(icx.record.mutations);
-                if r.decision.is_none() {
-                    r.decision = icx.record.decision;
-                    r.terminal_rule = icx.record.terminal_rule;
-                    r.reason = icx.record.reason;
-                    r.stage = icx.record.stage;
-                }
-                r.request_bytes = icx.record.request_bytes;
-                r.ttfb_ms = icx.record.ttfb_ms;
-            }
-            None => {
-                // Nothing left: the deepest layer reached answered itself.
-                if cx.record.decision.is_none() {
-                    let depth = self.depth.load(Ordering::Relaxed).max(1);
-                    let layer = &self.snap.addons[depth - 1].name;
-                    cx.record.decision = Some(DecisionKind::Deny);
-                    cx.record.terminal_rule = Some(format!("layer:{layer}"));
-                }
-            }
-        }
         for t in self.tags() {
             if !cx.record.tags.contains(&t) {
                 cx.record.tags.push(t);
@@ -354,21 +521,35 @@ fn layer_refusal(layer: &str) -> Refusal {
     }
 }
 
-/// Runs the exchange through the addon stack.
+/// Runs the exchange through the addon stack. The flow context is parked
+/// in the stack while the layers run, lent to the core if a request
+/// reaches it, and comes back with the outcome.
 pub(crate) async fn run<F: Front>(
     front: &mut F,
-    cx: &mut FlowCx,
+    cx: FlowCx,
     mut req: CanonicalRequest,
-) -> Outcome {
+) -> (FlowCx, Outcome) {
     if cx.snap.flags.decode_for_addons {
         let limit = cx.snap.limits.max_request_body_bytes;
         decode_for_layers(&mut req.headers, &mut req.body, limit);
     }
-    let st = Arc::new(StackFlow::new(cx, &req));
-    cx.stack = Some(st.clone());
+    let st = Arc::new(StackFlow::new(&cx, &req));
+    st.park(cx);
     let driven = front
         .drive(enter(st.clone(), 0, to_layer_request(req)))
         .await;
+    let mut cx = st.reclaim().await;
+    cx.stack = Some(st.clone());
+    let outcome = stack_outcome(&st, &mut cx, driven);
+    (cx, outcome)
+}
+
+/// What the stack's answer means for the client.
+fn stack_outcome(
+    st: &Arc<StackFlow>,
+    cx: &mut FlowCx,
+    driven: Result<Result<LayerResponse, HostError>, roxy_http::ParseError>,
+) -> Outcome {
     let resp = match driven {
         Err(e) => return Outcome::Close(e),
         Ok(Err(_)) => {
@@ -378,11 +559,15 @@ pub(crate) async fn run<F: Front>(
                     LayerError::NoResponse.into(),
                 )
             });
-            emit_stack_error(&st, &layer, &err, false);
+            emit_stack_error(st, &layer, &err, false);
             return Outcome::Refuse(layer_refusal(&layer));
         }
         Ok(Ok(r)) => r,
     };
+    if let Some(i) = st.answered_by() {
+        cx.record.decision = Some(DecisionKind::Answered);
+        cx.record.terminal_rule = Some(format!("layer:{}", st.snap.addons[i].name));
+    }
     // A failure after the head cuts the body (the codec then breaks the
     // connection); log which layer failed once it is known.
     if let Some(outcome) = resp.extensions().get::<LayerOutcome>().cloned() {
@@ -390,7 +575,7 @@ pub(crate) async fn run<F: Front>(
         tokio::spawn(async move {
             if let Err(e) = outcome.wait().await {
                 let (layer, err) = st2
-                    .failure()
+                    .post_head_failure()
                     .unwrap_or_else(|| (st2.snap.addons[0].name.clone(), e.into()));
                 emit_stack_error(&st2, &layer, &err, false);
             }
@@ -401,9 +586,6 @@ pub(crate) async fn run<F: Front>(
     if st.close.load(Ordering::Relaxed) {
         res.meta.close = true;
     }
-    if let Some(w) = st.inner_watch() {
-        cx.watch = Some(w);
-    }
     if res.status == http::StatusCode::SWITCHING_PROTOCOLS {
         if let Some((upstream, key)) = st.take_upgrade() {
             // A layer cannot express `upgrade: websocket` (hop-by-hop); the
@@ -413,7 +595,7 @@ pub(crate) async fn run<F: Front>(
         }
         let layer = st.snap.addons[0].name.clone();
         let err = LayerError::InvalidResponse("101 without an upgraded upstream".into());
-        emit_layer_error(&st, &layer, &err, false);
+        emit_layer_error(st, &layer, &err, false);
         return Outcome::Refuse(layer_refusal(&layer));
     }
     Outcome::Respond(res)
@@ -426,7 +608,7 @@ pub(crate) fn enter(
     req: LayerRequest,
 ) -> BoxFuture<Result<LayerResponse, HostError>> {
     Box::pin(async move {
-        st.depth.fetch_max(index + 1, Ordering::Relaxed);
+        st.layers[index].set(NextState::Entered);
         let addon = st.snap.addons[index].clone();
         if addon.observe {
             return tee::observe(st, index, req).await;
@@ -441,7 +623,14 @@ pub(crate) fn enter(
             observer: None,
         });
         match layer.handle(h, req).await {
-            Ok(r) => Ok(r),
+            Ok(r) => {
+                *st.layers[index]
+                    .outcome
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) =
+                    r.extensions().get::<LayerOutcome>().cloned();
+                Ok(r)
+            }
             Err(e) => {
                 st.fail(&addon.name, e);
                 Err(HostError::new(format!("layer {} failed", addon.name)))
@@ -456,11 +645,17 @@ pub(crate) fn below(
     index: usize,
     req: LayerRequest,
 ) -> BoxFuture<Result<LayerResponse, HostError>> {
-    if index + 1 < st.snap.addons.len() {
+    let guard = NextGuard::new(st.clone(), index);
+    let fut = if index + 1 < st.snap.addons.len() {
         enter(st, index + 1, req)
     } else {
         Box::pin(core(st, index, req))
-    }
+    };
+    Box::pin(async move {
+        let r = fut.await;
+        guard.settle(r.is_ok());
+        r
+    })
 }
 
 /// The client-side view the core needs when the "client" is the last
@@ -491,7 +686,9 @@ impl Front for Detached {
     }
 }
 
-/// The exchange core on what the last layer (`index`) passed on.
+/// The exchange core on what the last layer (`index`) passed on, with the
+/// flow's own [`FlowCx`]: what the rules judge is the request that left
+/// the stack.
 async fn core(
     st: Arc<StackFlow>,
     index: usize,
@@ -507,16 +704,29 @@ async fn core(
         }
     };
     creq.meta.upgrade.clone_from(&st.upgrade_req);
-    let mut icx = FlowCx::new(
-        st.shared.clone(),
-        snap.clone(),
-        st.client.clone(),
-        st.tls.clone(),
-        &creq,
-    );
-    icx.flow = st.flow;
-    let outcome = crate::exchange::core(&mut Detached, &mut icx, creq).await;
-    let resp = match outcome {
+    let Some(mut lease) = st.lease() else {
+        st.fail(&layer, LayerError::NextCalledTwice);
+        return Err(HostError::new("the flow already reached the core"));
+    };
+    let cx = lease.cx();
+    cx.facts.request = Some(crate::pipeline::request_facts(&creq));
+    st.set_facts(&cx.facts);
+    let mut front = Detached;
+    let outcome = tokio::select! {
+        biased;
+        () = st.abandon.cancelled() => None,
+        o = crate::exchange::core(&mut front, cx, creq) => Some(o),
+    };
+    let Some(outcome) = outcome else {
+        // The lease records the abandonment as it goes back.
+        return Err(HostError::new(
+            "the layer answered without the upstream's response",
+        ));
+    };
+    lease.done = true;
+    let cx = lease.cx();
+    st.set_facts(&cx.facts);
+    match outcome {
         Outcome::Respond(mut res) => {
             // A range of an encoded body is not decodable on its own.
             if snap.flags.decode_for_addons
@@ -532,10 +742,10 @@ async fn core(
             if refusal.close {
                 st.close.store(true, Ordering::Relaxed);
             }
-            if refusal.kind == RefusalKind::UpstreamError && icx.watch.is_some() {
-                icx.record_final_sample(true);
+            if refusal.kind == RefusalKind::UpstreamError && cx.watch.is_some() {
+                cx.record_final_sample(true);
             }
-            Ok(to_layer_response(refusal_response(&mut icx, &refusal)))
+            Ok(to_layer_response(refusal_response(cx, &refusal)))
         }
         Outcome::Close(e) => {
             st.fail(
@@ -548,9 +758,7 @@ async fn core(
             *st.upgrade.lock().unwrap_or_else(PoisonError::into_inner) = Some((upstream, key));
             Ok(to_layer_response(res))
         }
-    };
-    *st.inner.lock().unwrap_or_else(PoisonError::into_inner) = Some(icx);
-    resp
+    }
 }
 
 /// Decodes a body by its `content-encoding` for the layers,

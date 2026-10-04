@@ -147,6 +147,8 @@ pub(crate) struct KitBuilder {
     limits: Limits,
     flags: HttpFlags,
     metrics: Arc<dyn MetricSource>,
+    /// `metrics:` definitions (YAML); a real metric store holds them.
+    metric_defs: String,
     state: Arc<dyn StateSource>,
 }
 
@@ -182,6 +184,14 @@ impl KitBuilder {
         self
     }
 
+    /// Metric definitions (YAML, as under `metrics:`), held in a real
+    /// metric store.
+    #[must_use]
+    pub(crate) fn metric_defs(mut self, yaml: &str) -> Self {
+        yaml.clone_into(&mut self.metric_defs);
+        self
+    }
+
     /// The state store (default: none, every write fails).
     #[must_use]
     pub(crate) fn state(mut self, s: Arc<dyn StateSource>) -> Self {
@@ -198,16 +208,30 @@ impl KitBuilder {
         let upstream = Upstream::new(minter.clone());
 
         let rules: Vec<RuleConfig> = serde_yaml_ng::from_str(&self.rules).unwrap();
+        let metric_defs: Vec<roxy_rules::MetricConfig> = if self.metric_defs.is_empty() {
+            Vec::new()
+        } else {
+            serde_yaml_ng::from_str(&self.metric_defs).unwrap()
+        };
         let none = std::collections::HashSet::new();
         let policy = Policy::compile(&PolicyInput {
             rules: &rules,
-            metrics: &[],
+            metrics: &metric_defs,
             secret_names: &none,
             address_lists: &none,
             transparent_listeners: false,
             default: DefaultDecision::Deny,
         })
         .unwrap_or_else(|d| panic!("rules: {d:?}"));
+
+        let metrics: Arc<dyn MetricSource> = if metric_defs.is_empty() {
+            self.metrics
+        } else {
+            Arc::new(StoreMetrics(roxy_rules::MetricStore::new(
+                policy.metric_defs(),
+                1000,
+            )))
+        };
 
         let rt = roxy_wasm::WasmRuntime::new().unwrap();
         let mut addons = Vec::new();
@@ -253,7 +277,7 @@ impl KitBuilder {
             ws_message_every: 0,
             sink: sink.clone(),
             capture: None,
-            metrics: self.metrics,
+            metrics,
             state: self.state,
             policy: PolicyUpdate {
                 policy,
@@ -297,6 +321,7 @@ impl Kit {
             limits: Limits::default(),
             flags: HttpFlags::default(),
             metrics: Arc::new(UnavailableMetrics),
+            metric_defs: String::new(),
             state: Arc::new(UnavailableState),
         }
     }
@@ -636,6 +661,38 @@ impl Answer {
 /// A request body the test feeds chunk by chunk.
 pub(crate) fn streaming_body() -> (BodySender, Body) {
     Body::channel(u64::MAX, None)
+}
+
+/// A real metric store behind the proxy's metric trait.
+struct StoreMetrics(roxy_rules::MetricStore);
+
+impl MetricSource for StoreMetrics {
+    fn get(
+        &self,
+        id: &str,
+        view: &dyn roxy_rules::FlowView,
+    ) -> Result<i64, crate::sources::MetricSourceError> {
+        self.0
+            .get(id, view)
+            .map_err(|e| crate::sources::MetricSourceError::Unknown(e.to_string()))
+    }
+
+    fn record(
+        &self,
+        view: &dyn roxy_rules::FlowView,
+        sample: &crate::sources::Sample,
+    ) -> Result<(), crate::sources::MetricSourceError> {
+        let s = roxy_rules::Sample {
+            head: sample.head,
+            request_bytes: sample.request_bytes,
+            response_bytes: sample.response_bytes,
+            denied: sample.denied,
+            error: sample.error,
+        };
+        self.0
+            .record(view, &s)
+            .map_err(|e| crate::sources::MetricSourceError::Unknown(e.to_string()))
+    }
 }
 
 #[cfg(test)]

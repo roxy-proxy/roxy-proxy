@@ -136,9 +136,17 @@ sits in it.
   refused, and the workload's limits applied. `chain.next` fills in the
   scheme and authority from the exchange when the layer leaves them unset.
 - The flow log's `rules`, `decision` and `terminal_rule` describe the
-  request that left; `req` still describes what the client sent. If a layer
-  answered itself, the decision is `deny` with `terminal_rule:
-  layer:<name>`.
+  request that left; `req` still describes what the client sent. Metric
+  keys, for the rules' samples and for `metric-get`, come from the request
+  that left too.
+- A layer that answers itself is logged with `decision: answered` and
+  `terminal_rule: layer:<name>`, whatever its status: the status tells a
+  block (`403`) from a served answer (`200`). The answering layer is the
+  outermost one that did not pass on the response from below: it never
+  called `next`, or answered while `next` was pending, failed or dropped.
+  If its request had already left, the forwarded request is abandoned (its
+  body is cut, never ended as if complete), and the record keeps what the
+  rules decided and the bytes sent, with `reason: upstream_aborted`.
 - A layer failing before the response head denies with `503`,
   `terminal_rule: layer:<name>`, `reason: layer_error`, closes the
   connection, and emits a `layer_error` event whose `kind` is `trap`,

@@ -241,7 +241,7 @@ async fn serve_stream(
     let limits = snap.limits.clone();
     let flags = snap.flags.clone();
     let method = req.method.clone();
-    let mut cx = FlowCx::new(
+    let cx = FlowCx::new(
         ccx.shared.clone(),
         snap,
         ccx.client.clone(),
@@ -253,7 +253,7 @@ async fn serve_stream(
         fail,
         expect_continue: req.meta.expect_continue,
     };
-    let outcome = process(&mut front, &mut cx, req).await;
+    let (mut cx, outcome) = process(&mut front, cx, req).await;
     let H2Front { mut respond, .. } = front;
     let out = Out {
         method: &method,

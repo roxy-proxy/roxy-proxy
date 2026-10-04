@@ -144,7 +144,8 @@ async fn a_layer_can_answer_without_the_upstream() {
     assert_eq!(res.text().await.unwrap(), "denied by layer");
     assert!(h.upstream.seen().is_empty());
     let ev = h.wait_events("request", 1).await;
-    assert_eq!(ev[0]["decision"], "deny");
+    // A layer's own answer, whatever its status.
+    assert_eq!(ev[0]["decision"], "answered");
     assert_eq!(ev[0]["terminal_rule"], "layer:t");
     h.stop().await;
 }
@@ -392,6 +393,44 @@ async fn ws_echo(h: &Harness) {
     let back = ws.next().await.unwrap().unwrap();
     assert_eq!(back.into_data().len(), 100_000);
     ws.close(None).await.unwrap();
+}
+
+/// A WebSocket relayed through a layer is captured like any other: both
+/// heads, then the relayed bytes both ways.
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_through_a_layer_is_captured() {
+    let tmp = tempfile::tempdir().unwrap();
+    let extra = addon_yaml(tmp.path(), "");
+    let h = Harness::start_with(Opts {
+        rules: r#"
+  - id: ws
+    when: host == "ws.test"
+    then: [{ capture: both }, { allow: { upgrade: websocket, private_ok: true } }]
+"#,
+        extra: &extra,
+        capture: Some(""),
+        ..Opts::default()
+    })
+    .await;
+    ws_echo(&h).await;
+    let close = h.wait_events("ws_close", 1).await;
+    let ev = h.wait_events("request", 1).await;
+    let flow = ev[0]["flow"].as_str().unwrap().to_owned();
+    let records = h.captured();
+    for (dir, bytes) in [("request", "bytes_c2s"), ("response", "bytes_s2c")] {
+        let recs = support::capture_of(&records, &flow, dir);
+        assert_eq!(
+            recs.first().map(|(r, _)| &r["kind"]),
+            Some(&"head".into()),
+            "{dir}"
+        );
+        assert_eq!(
+            support::capture_body(&recs).len() as u64,
+            close[0][bytes].as_u64().unwrap(),
+            "{dir}"
+        );
+    }
+    h.stop().await;
 }
 
 /// A layer without `tunnel` sees (and could refuse) the upgrade request,

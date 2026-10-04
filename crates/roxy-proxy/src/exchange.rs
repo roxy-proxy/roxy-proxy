@@ -203,13 +203,14 @@ pub(crate) enum Outcome {
 }
 
 /// The transport-agnostic exchange: request steps → upstream → response
-/// steps. `cx` carries the flow record; the caller writes the outcome and
-/// emits the flow's `request` event.
+/// steps. `cx` carries the flow record and comes back with the outcome
+/// (through the addon stack, if there is one); the caller writes the
+/// outcome and emits the flow's `request` event.
 pub(crate) async fn process<F: Front>(
     front: &mut F,
-    cx: &mut FlowCx,
+    mut cx: FlowCx,
     mut req: CanonicalRequest,
-) -> Outcome {
+) -> (FlowCx, Outcome) {
     // Audit backpressure: an exchange starts only while the flow
     // log keeps up.
     crate::flowlog::sink_ready(&*cx.shared.sink).await;
@@ -217,12 +218,18 @@ pub(crate) async fn process<F: Front>(
         // Before the layers and the rules, so all of them, and the flow
         // log, see the request as it will leave.
         req.headers.remove("accept-encoding");
-        if let Some(f) = cx.facts.request.as_mut() {
+        let facts = &mut cx.facts;
+        for f in facts
+            .client_request
+            .iter_mut()
+            .chain(facts.request.iter_mut())
+        {
             f.headers.remove("accept-encoding");
         }
     }
     if cx.snap.addons.is_empty() {
-        core(front, cx, req).await
+        let outcome = core(front, &mut cx, req).await;
+        (cx, outcome)
     } else {
         crate::addons::run(front, cx, req).await
     }
@@ -261,8 +268,9 @@ pub(crate) async fn run(
     let framing = ClientFraming {
         close: req.meta.close,
     };
-    let mut cx = FlowCx::new(shared.clone(), snap, client, tls, &req);
-    match process(&mut conn, &mut cx, req).await {
+    let cx = FlowCx::new(shared.clone(), snap, client, tls, &req);
+    let (cx, outcome) = process(&mut conn, cx, req).await;
+    match outcome {
         Outcome::Respond(res) => send_response(conn, cx, res).await,
         Outcome::Refuse(refusal) => refuse(conn, handle, cx, refusal, framing).await,
         Outcome::Close(e) => {
@@ -509,6 +517,9 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
             up_tap.take(),
         );
         let (body, req_counter, sent) = counted_until_sent(body);
+        // Read when the flow is logged, so bytes sent before an abandoned
+        // forward, or after the response head, all count.
+        cx.request_counter = Some(req_counter.clone());
         req.body = body;
         let mut http_req = match to_upstream_request(req, UriForm::Absolute) {
             Ok(r) => r,
@@ -536,7 +547,6 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
             }
         };
         let driven = front.drive(fut).await;
-        cx.record.request_bytes = req_counter.load(Ordering::Relaxed);
         if let Some(o) = stopped_outcome(&watch) {
             return o;
         }
