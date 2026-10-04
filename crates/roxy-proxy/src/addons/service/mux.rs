@@ -456,40 +456,48 @@ impl Stream {
 
     /// Streams one message to the service: head, body frames (as credit
     /// allows), end. False if it did not get it all out.
-    pub(super) async fn pump(&self, head: Out, mut body: Body, end: Out) -> bool {
-        use http_body::Body as _;
+    pub(super) async fn pump(&self, head: Out, body: Body, end: Out) -> bool {
         if !self.send(&head).await {
             return false;
         }
+        // Nothing to read (and an empty observer copy may never be ended).
+        if body.known_length() != Some(0) && !self.pump_body(body).await {
+            return false;
+        }
+        self.send(&end).await
+    }
+
+    async fn pump_body(&self, mut body: Body) -> bool {
+        use http_body::Body as _;
         loop {
             let frame =
                 std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
-            match frame {
-                None => break,
+            let mut d = match frame {
+                None => return true,
                 // A body that fails is not forwarded as complete.
                 Some(Err(_)) => {
                     self.reset("the body failed");
                     return false;
                 }
-                Some(Ok(f)) => {
-                    let Ok(mut d) = f.into_data() else { continue };
-                    while !d.is_empty() {
-                        let Some(n) = self.take_credit(d.len().min(MAX_BODY_FRAME)).await else {
-                            return false;
-                        };
-                        let part = d.split_to(n);
-                        let sent = tokio::select! {
-                            r = self.link.data.send(binary(self.id, &part)) => r.is_ok(),
-                            () = self.ended.cancelled() => false,
-                        };
-                        if !sent {
-                            return false;
-                        }
-                    }
+                Some(Ok(f)) => match f.into_data() {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                },
+            };
+            while !d.is_empty() {
+                let Some(n) = self.take_credit(d.len().min(MAX_BODY_FRAME)).await else {
+                    return false;
+                };
+                let part = d.split_to(n);
+                let sent = tokio::select! {
+                    r = self.link.data.send(binary(self.id, &part)) => r.is_ok(),
+                    () = self.ended.cancelled() => false,
+                };
+                if !sent {
+                    return false;
                 }
             }
         }
-        self.send(&end).await
     }
 
     /// Credit back to the service for `n` bytes consumed.
@@ -508,10 +516,18 @@ impl Stream {
 
     /// Body bytes from the service.
     fn bytes(self: &Arc<Self>, b: &[u8]) {
-        if self.observe || b.is_empty() {
+        if b.is_empty() {
             return;
         }
         let n = b.len() as u64;
+        if self.observe {
+            // Ignored, and credited straight back so the service never
+            // stalls on what it sends (and stops reading the copies).
+            self.link
+                .shared
+                .send_ctl(self.id, &Out::Credit { bytes: n });
+            return;
+        }
         let mut s = lock(&self.state);
         let Some(inbox) = s.feeding.as_ref().map(|f| f.inbox.clone()) else {
             drop(s);
@@ -974,10 +990,17 @@ async fn read(shared: Arc<LinkShared>, mut ws: SplitStream<Ws>) {
                     break framing("a binary frame shorter than its stream id");
                 }
                 let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-                route(&shared, id).map(|s| {
-                    if let Some(s) = s {
-                        s.bytes(&b[4..]);
-                    }
+                route(&shared, id).map(|s| match s {
+                    Some(s) => s.bytes(&b[4..]),
+                    // Ignored, and credited back, so a service still
+                    // sending when the stream ended is never stalled.
+                    None if b.len() > 4 => shared.send_ctl(
+                        id,
+                        &Out::Credit {
+                            bytes: (b.len() - 4) as u64,
+                        },
+                    ),
+                    None => {}
                 })
             }
             Some(Ok(Message::Text(t))) => {

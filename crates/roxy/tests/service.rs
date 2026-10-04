@@ -30,6 +30,11 @@ const ALLOW_UPSTREAM: &str = r#"
 /// Each stream's starting credit, each way.
 const WINDOW: u64 = 256 * 1024;
 
+/// Extra credit granted to an observe stream as it opens, so roxy can
+/// send the copies on without waiting (an observer that falls behind is
+/// cut).
+const OBSERVE_CREDIT: u64 = 16 * 1024 * 1024;
+
 #[derive(Default)]
 struct SvcState {
     /// The handshake headers of every connection.
@@ -40,6 +45,8 @@ struct SvcState {
     resets: Mutex<Vec<(usize, u64, String)>>,
     /// Connections that ended, by index.
     closed: Mutex<Vec<usize>>,
+    /// `/echo` streams that saw the whole exchange through.
+    echoed: Mutex<Vec<u64>>,
     /// Lets `/mixed` streams that wait for it go on.
     release: Notify,
     changed: Notify,
@@ -166,8 +173,8 @@ async fn send_whole(s: &Sess, head: Value, body: &[u8], end: &str) {
 }
 
 /// Forwards every message as it arrives, applying `f` to heads and `g` to
-/// response bytes.
-async fn relay(s: &mut Sess, f: impl Fn(Value) -> Value, g: impl Fn(Vec<u8>) -> Vec<u8>) {
+/// response bytes. True if it got through to the response's end.
+async fn relay(s: &mut Sess, f: impl Fn(Value) -> Value, g: impl Fn(Vec<u8>) -> Vec<u8>) -> bool {
     let mut in_response = false;
     loop {
         match s.recv().await {
@@ -178,23 +185,28 @@ async fn relay(s: &mut Sess, f: impl Fn(Value) -> Value, g: impl Fn(Vec<u8>) -> 
                 let end = v["type"] == "response_end";
                 s.send(f(v));
                 if end {
-                    return;
+                    return true;
                 }
             }
             Got::Bytes(b) => {
                 let b = if in_response { g(b) } else { b };
                 s.send_bytes(&b).await;
             }
-            Got::End => return,
+            Got::End => return false,
         }
     }
 }
 
 async fn session(path: &str, mut s: Sess) {
     match path {
-        "/echo" => relay(&mut s, |v| v, |b| b).await,
+        "/echo" => {
+            if relay(&mut s, |v| v, |b| b).await {
+                s.st.echoed.lock().unwrap().push(s.id);
+                s.st.changed.notify_waiters();
+            }
+        }
         "/rewrite" => {
-            relay(
+            let _ = relay(
                 &mut s,
                 |mut v| {
                     if v["type"] == "request" {
@@ -285,8 +297,9 @@ async fn session(path: &str, mut s: Sess) {
 
 /// Per stream, by the request's path: `/hold…` waits for `release`, then
 /// echoes; `/bad…` sends an invalid head; `/kill` ends the connection;
-/// `/hang` never answers; `/big` answers with 1 MiB; `/overrun` sends past
-/// its credit; anything else echoes.
+/// `/hang` never answers; `/big` answers with 1 MiB; `/flood` sends four
+/// windows on credit; `/overrun` sends past its credit; anything else
+/// echoes.
 async fn mixed(mut s: Sess) {
     let Got::Ctl(head) = s.recv().await else {
         return;
@@ -316,6 +329,15 @@ async fn mixed(mut s: Sess) {
                 "headers": [["content-length", "1048576"]]});
             send_whole(&s, head, &vec![b'x'; 1 << 20], "response_end").await;
         }
+        // Sends four windows' worth, on credit, then says so.
+        "/flood" => {
+            s.send(json!({"type": "response", "status": 200}));
+            s.send_bytes(&vec![b'f'; 4 * usize::try_from(WINDOW).unwrap()])
+                .await;
+            s.send(json!({"type": "response_end"}));
+            s.st.echoed.lock().unwrap().push(s.id);
+            s.st.changed.notify_waiters();
+        }
         "/overrun" => {
             s.send(json!({"type": "response", "status": 200}));
             // One frame larger than the whole window.
@@ -324,7 +346,7 @@ async fn mixed(mut s: Sess) {
         }
         _ => {
             s.send(head);
-            relay(&mut s, |v| v, |b| b).await;
+            let _ = relay(&mut s, |v| v, |b| b).await;
         }
     }
 }
@@ -389,6 +411,10 @@ impl Demux {
                 o["conn_index"] = self.index.into();
                 self.st.opens.lock().unwrap().push(o);
                 self.st.changed.notify_waiters();
+                if v["mode"] == "observe" {
+                    let grant = json!({"type": "credit", "stream": id, "bytes": OBSERVE_CREDIT});
+                    let _ = self.out.tx.send(Message::text(grant.to_string()));
+                }
                 let (tx, rx) = mpsc::unbounded_channel();
                 self.streams.insert(id, tx);
                 let sess = Sess {
@@ -1140,5 +1166,33 @@ async fn a_rotated_secret_reaches_new_streams_and_old_connections_drain() {
         s.closed.lock().unwrap().contains(&1)
     })
     .await;
+    h.stop().await;
+}
+
+/// An observe stream sees an exchange with no body through to the end
+/// (an empty copy is not a cut one), and roxy credits back what it
+/// ignores, so a service that sends more than a window is never stalled.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_observer_sees_exchanges_through() {
+    let (h, st) = start("/echo", "    mode: observe\n", ALLOW_UPSTREAM).await;
+    let res = h.client().get(h.https_url("/x")).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    drop(res.bytes().await);
+    st.until("the observer to see it through", |s| {
+        s.echoed.lock().unwrap().len() == 1
+    })
+    .await;
+    assert_eq!(st.resets.lock().unwrap().len(), 0);
+    h.stop().await;
+
+    let (h, st) = start("/mixed", "    mode: observe\n", ALLOW_UPSTREAM).await;
+    let res = h.client().get(h.https_url("/flood")).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    drop(res.bytes().await);
+    st.until("the service to send it all", |s| {
+        s.echoed.lock().unwrap().len() == 1
+    })
+    .await;
+    assert_eq!(h.events("layer_error").len(), 0);
     h.stop().await;
 }

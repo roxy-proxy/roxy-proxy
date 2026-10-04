@@ -70,8 +70,9 @@ pub enum ServiceError {
     /// order, an invalid head).
     #[error("service protocol violation: {0}")]
     Protocol(String),
-    /// The socket closed or failed mid-exchange.
-    #[error("service connection lost: {0}")]
+    /// The connection closed or failed, or the stream was reset,
+    /// mid-exchange.
+    #[error("service stream lost: {0}")]
     Closed(String),
 }
 
@@ -390,18 +391,20 @@ pub(super) async fn observe(
     };
     stream.deadline(start + svc.max_exchange_time);
     let (parts, body) = req.into_parts();
-    if stream
+    let sent = stream
         .pump(request_head(&parts, &body), body, Out::RequestEnd)
-        .await
-    {
-        if let Ok(res) = next.response().await {
+        .await;
+    match next.response().await {
+        Ok(res) if sent => {
             let (parts, body) = res.into_parts();
             stream
                 .pump(response_head(&parts, &body), body, Out::ResponseEnd)
                 .await;
-        } else {
-            stream.reset("the exchange ended");
         }
+        // The stream ended early: the response copy is still read, so the
+        // tee does not count this direction as lagging too.
+        Ok(res) => drain(res.into_body()).await,
+        Err(_) => stream.reset("the exchange ended"),
     }
     stream.finish()
 }

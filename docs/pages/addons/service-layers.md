@@ -109,7 +109,9 @@ sent on). Either side may end a stream early with `reset`. roxy resets a
 stream when the client goes away, a deadline passes, the service broke the
 protocol on it, or the upstream switched protocols (a `101`). A service
 that resets an enforce stream fails that exchange closed. Each side
-ignores messages that arrive for a stream it has already ended.
+ignores messages that arrive for a stream it has already ended; roxy still
+credits back the body bytes among them, so a service that was mid-send
+when the stream ended is not left waiting for credit.
 
 **Flow control.** Body bytes are flow-controlled per stream, in each
 direction, so a slow body on one stream does not hold up the others. Each
@@ -144,8 +146,12 @@ that stream. Control messages are not counted.
   messages for copies of both directions, and whatever it sends back other
   than `credit` and `reset` is ignored. The stream ends after roxy's
   `response_end` (or a `reset`). It cannot change or delay traffic; its
-  failures are logged only. An observer stream that lags (it does not grant
-  credit fast enough) is cut and reset on its own.
+  failures are logged only. An observer stream that falls behind the real
+  exchange is cut and reset on its own; roxy does not wait for credit
+  before cutting it. A service that wants whole copies of large bodies
+  grants credit up front when an observe stream opens. roxy credits back at
+  once whatever the service sends on an observe stream, so it never stalls
+  on its own answers.
 - **WebSocket upgrades.** The service sees the upgrade request; a `101`
   passes straight back, roxy resets the stream, and the WebSocket's bytes
   do not go through it.

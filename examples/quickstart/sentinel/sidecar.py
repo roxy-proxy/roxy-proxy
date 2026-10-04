@@ -1,6 +1,6 @@
 """inspect_sentinel at the network boundary: a roxy service layer.
 
-Every exchange streams through this sidecar (roxy.layer.v1). For an
+Every exchange streams through this sidecar (roxy.layer.v2). For an
 Anthropic Messages call (`POST .../v1/messages`) it forwards the request,
 reads the model's response, turns each tool call in it into an
 inspect_sentinel `BeforeToolCall` step, and runs the configured sentinel on
@@ -391,7 +391,7 @@ class Sidecar:
             input = []
         conversation = call.conversation()
         model = f"anthropic/{response.get('model', 'unknown')}"
-        self.inspect_log.model_call(conversation, ex.flow.get("roxy-flow-id"), model, input, output)
+        self.inspect_log.model_call(conversation, ex.flow.get("flow"), model, input, output)
         tool_calls = output.message.tool_calls or []
         if not tool_calls:
             return None
