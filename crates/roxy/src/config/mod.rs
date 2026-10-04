@@ -652,6 +652,14 @@ pub struct Addon {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub mode: AddonMode,
+    /// The layer runs only on requests this head condition matches, as
+    /// they reach it; others go straight to the layer below.
+    #[serde(default)]
+    pub when: Option<roxy_rules::Expr>,
+    /// `mode: observe` only: the share of matching exchanges the layer
+    /// gets a copy of, in (0, 1].
+    #[serde(default)]
+    pub sample: Option<f64>,
     /// Opaque config passed to the addon as JSON.
     #[serde(default)]
     pub config: serde_yaml_ng::Value,

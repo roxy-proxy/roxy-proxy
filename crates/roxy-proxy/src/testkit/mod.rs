@@ -136,6 +136,8 @@ impl AddonDef {
             endpoints: HashMap::new(),
             state: StateLimits::default(),
             audit_endpoint: None,
+            when: None,
+            sample: None,
         })
     }
 }
