@@ -492,10 +492,12 @@ impl Handler for Layer {
                 let b = r.body().expect("body");
                 let fut = chain::next(r).expect("next");
                 {
+                    // The rules may refuse the request at its head and drop
+                    // its body before it is written: not an error here.
                     let s = b.write().expect("write");
-                    write_all(&s, b"replaced");
+                    let _ = s.blocking_write_and_flush(b"replaced");
                 }
-                OutgoingBody::finish(b, None).expect("finish");
+                let _ = OutgoingBody::finish(b, None);
                 drop(req);
                 answer_with(await_response(fut), out, false);
             }

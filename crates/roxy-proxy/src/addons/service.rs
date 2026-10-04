@@ -59,10 +59,8 @@ pub struct ServiceSpec {
     /// The addon's endpoint the exchange streams through.
     pub endpoint: String,
     /// From connecting, and again from sending the response head, until
-    /// the service's next head (or decision).
+    /// the service's next head (or decision). Bodies have no clock.
     pub first_byte_timeout: Duration,
-    /// The whole session, from connecting to the end of the last body.
-    pub max_exchange_time: Duration,
 }
 
 /// Why a service layer failed.
@@ -255,7 +253,6 @@ async fn run(
     req: LayerRequest,
 ) -> Result<LayerResponse, Fail> {
     let start = TokioInstant::now();
-    let end = start + svc.max_exchange_time;
     let ws = tokio::time::timeout_at(
         start + svc.first_byte_timeout,
         connect(st, index, svc, false),
@@ -276,7 +273,7 @@ async fn run(
         second: Some(second_tx),
         _open: writer.clone(),
     };
-    let reader = tokio::spawn(reader.run(end));
+    let reader = tokio::spawn(reader.run());
 
     let (parts, body) = req.into_parts();
     tokio::spawn(pump(
@@ -329,7 +326,6 @@ pub(super) async fn observe(
     next: &super::tee::ObserverNext,
 ) -> Result<(), ServiceError> {
     let start = TokioInstant::now();
-    let end = start + svc.max_exchange_time;
     let connected = tokio::time::timeout_at(
         start + svc.first_byte_timeout,
         connect(st, index, svc, true),
@@ -350,16 +346,12 @@ pub(super) async fn observe(
     let (sink, mut stream) = ws.split();
     let writer = spawn_writer(sink);
     let reading = tokio::spawn(async move {
-        tokio::time::timeout_at(end, async {
-            while let Some(m) = stream.next().await {
-                if let Err(e) = m {
-                    return Err(ServiceError::Closed(e.to_string()));
-                }
+        while let Some(m) = stream.next().await {
+            if let Err(e) = m {
+                return Err(ServiceError::Closed(e.to_string()));
             }
-            Ok(())
-        })
-        .await
-        .map_err(|_| ServiceError::Timeout("max_exchange_time"))?
+        }
+        Ok(())
     });
     let (parts, body) = req.into_parts();
     pump(
@@ -563,12 +555,9 @@ impl Reader {
         feeding.is_some() || self.first.is_some() || self.second.is_some()
     }
 
-    async fn run(mut self, end: TokioInstant) {
+    async fn run(mut self) {
         let mut feeding: Option<Feeding> = None;
-        let result = match tokio::time::timeout_at(end, self.read(&mut feeding)).await {
-            Ok(r) => r,
-            Err(_) => Err(ServiceError::Timeout("max_exchange_time")),
-        };
+        let result = self.read(&mut feeding).await;
         let Err(e) = result else {
             return;
         };
