@@ -14,15 +14,14 @@ Notes for agents (and people) working in this repository.
    each one, so the PR always shows where the work is. Don't sit on a large
    local diff. Keep the PR description current: what is done, what is left,
    and any decision a reviewer should look at.
-3. **Mark it ready and queue it when the work is done.** Done means the
-   issue's "done when" list is met, the checks in "Before pushing" pass
-   locally, and the description says what changed and anything moved,
-   dropped or left for later. Switch the PR from draft to ready and turn on
-   "merge when ready". The merge queue merges it once CI is green and it is
-   approved, so you do not wait for CI before queueing.
-4. **Stay with it until it merges.** Queueing is not the end of the work.
-   If CI fails, on the PR or in the queue, fix it and push, then check the
-   PR is still set to merge when ready. Answer review comments the same way.
+3. **Mark it ready for review when it is done.** Done means the issue's
+   "done when" list is met, CI is green, and the description says what
+   changed and anything moved, dropped or left for later. Then switch the PR
+   from draft to ready.
+4. **Stay with it once it is queued.** The repo merges through a merge
+   queue. A maintainer turns on "merge when ready" when they are happy with
+   the PR; don't turn it on yourself. From then until it merges, fix any CI
+   failure that appears, on the PR or in the queue, and push the fix.
 5. **Follow-up work gets an issue.** If you find something out of scope, open
    an issue for it (or note it on an existing one) instead of widening the PR.
 
