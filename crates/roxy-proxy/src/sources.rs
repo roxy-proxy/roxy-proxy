@@ -88,15 +88,16 @@ pub trait StateSource: Send + Sync {
     fn set(&self, key: &str, value: &str, ttl: Option<Duration>) -> Result<(), StateFull>;
 }
 
-/// Used when the build has no metric store: every read is unavailable (so
-/// any rule reaching `metric.x` fails closed) and recording is a no-op.
+/// A metric source with no store behind it (the test harness default):
+/// every read is unavailable, so any rule reaching `metric.x` fails closed,
+/// and recording is a no-op.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UnavailableMetrics;
 
 impl MetricSource for UnavailableMetrics {
     fn get(&self, id: &str, _view: &dyn FlowView) -> Result<i64, MetricSourceError> {
         Err(MetricSourceError::Unknown(format!(
-            "no metric store in this build (metric `{id}`)"
+            "no metric store (metric `{id}`)"
         )))
     }
 
@@ -105,7 +106,8 @@ impl MetricSource for UnavailableMetrics {
     }
 }
 
-/// Used when the build has no state store: reads are absent, writes fail.
+/// A state source with no store behind it (the test harness default):
+/// reads are absent, writes fail.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UnavailableState;
 

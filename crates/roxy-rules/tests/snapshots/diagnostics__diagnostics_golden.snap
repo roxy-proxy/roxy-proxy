@@ -114,8 +114,8 @@ rules[0].then[0]: `remove_header` changes the response head, so every value the 
 rules[0].then[0]: header `host` is managed by roxy and cannot be changed by rules (use `redirect: { ..., rewrite_host: true }`)  [rule a]
 rules[0].then[1]: set_header x-a: value "café" is not a valid header value (visible ASCII, space and tab only)  [rule a]
 
-== bad deny status and undefined addon
-rules[0].then[0]: `call` names undefined addon "nope"  [rule a]
+== bad deny status and reserved call
+rules[0].then[0]: `call` is reserved: addons run above the rules, in config order, not from a rule  [rule a]
 rules[0].then[1]: deny status 200 must be a 4xx or 5xx code  [rule a]
 
 == phase key removed

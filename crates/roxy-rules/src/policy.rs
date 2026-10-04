@@ -26,8 +26,6 @@ pub struct PolicyInput<'a> {
     pub metrics: &'a [MetricConfig],
     /// Names defined under `secrets:` (values are not needed to compile).
     pub secret_names: &'a HashSet<String>,
-    /// Names defined under `addons:`.
-    pub addon_names: &'a HashSet<String>,
     /// Names defined under `address_lists:` (for `ip in @name`; the data
     /// stays with the proxy).
     pub address_lists: &'a HashSet<String>,
@@ -1023,15 +1021,14 @@ impl PolicyCompiler<'_, '_> {
                 })]
             }
             Action::Capture(t) => vec![CAction::Effect(Effect::Capture(*t))],
-            Action::Call(name) => {
-                if !self.input.addon_names.contains(name) {
-                    self.push(
-                        rule,
-                        apath,
-                        format!("`call` names undefined addon {name:?}"),
-                    );
-                }
-                vec![CAction::Effect(Effect::CallAddon(name.clone()))]
+            Action::Call(_) => {
+                self.push(
+                    rule,
+                    apath,
+                    "`call` is reserved: addons run above the rules, in config order, not \
+                     from a rule",
+                );
+                Vec::new()
             }
         };
         (self.d.len() == errors_before).then_some(out)

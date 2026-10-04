@@ -53,7 +53,8 @@ fn check_reports_diagnostics() {
     std::fs::write(
         &bad,
         "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:3128 }]\nrules:\n  \
-         - { id: a, then: allow }\n  - { id: a, when: metric.nope > 1, then: deny }\n",
+         - { id: a, then: allow }\n  - { id: a, when: metric.nope > 1, then: deny }\n  \
+         - { id: b, then: [{ call: scan }, allow] }\n",
     )
     .unwrap();
     let out = roxy(&["check", "--config", bad.to_str().unwrap()]);
@@ -68,6 +69,8 @@ fn check_reports_diagnostics() {
         err.contains(&format!("{prefix}.when:1:1: reference to undefined metric")),
         "{err}"
     );
+    // What `roxy run` would refuse, `roxy check` refuses too.
+    assert!(err.contains("`call` is reserved"), "{err}");
 }
 
 #[test]
@@ -214,7 +217,6 @@ fn run_fails_closed_on_a_bad_addon() {
         assert_eq!(out.status.code(), Some(1));
         let err = text(&out.stderr);
         assert!(err.contains(expect), "{err}");
-        assert!(!err.contains("not in this build"), "{err}");
     }
 }
 

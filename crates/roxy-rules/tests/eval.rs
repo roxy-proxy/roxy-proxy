@@ -897,7 +897,6 @@ fn every_effect_kind() {
     - log: { level: warn, message: m }
     - set_state: { key: k, value: v }
     - capture: both
-    - call: pii-scan
     - allow: { upgrade: websocket, private_ok: true }
 "#,
     );
@@ -921,8 +920,7 @@ fn every_effect_kind() {
             "redirect",
             "log",
             "set_state",
-            "capture",
-            "call"
+            "capture"
         ]
     );
     assert_eq!(
@@ -947,7 +945,6 @@ fn every_effect_kind() {
         }
     );
     assert_eq!(out.effects[8], Effect::Capture(CaptureTarget::Both));
-    assert_eq!(out.effects[9], Effect::CallAddon("pii-scan".into()));
     let rendered: Vec<String> = out.effects.iter().map(ToString::to_string).collect();
     assert_eq!(rendered[2], "rewrite_path \"/old/(.*)\" -> \"/new/$1\"");
     assert_eq!(

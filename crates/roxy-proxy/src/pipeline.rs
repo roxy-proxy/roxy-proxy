@@ -903,11 +903,6 @@ fn apply_request_effect(
             *req |= matches!(target, CaptureTarget::Request | CaptureTarget::Both);
             *res |= matches!(target, CaptureTarget::Response | CaptureTarget::Both);
         }
-        // Addon calls are not in this build; `roxy run` refuses policies
-        // that use them. Deny defensively.
-        Effect::CallAddon(_) => {
-            return Err(Refusal::fail_closed("unsupported_effect"));
-        }
     }
     Ok(())
 }

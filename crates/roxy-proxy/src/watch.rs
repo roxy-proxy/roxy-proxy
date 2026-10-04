@@ -460,8 +460,7 @@ impl Inner {
                 | Effect::SetQuery { .. }
                 | Effect::RemoveQuery(_)
                 | Effect::Redirect { .. }
-                | Effect::Capture(_)
-                | Effect::CallAddon(_) => {
+                | Effect::Capture(_) => {
                     self.stop_with(Refusal::fail_closed("unsupported_effect"), stage);
                 }
             }

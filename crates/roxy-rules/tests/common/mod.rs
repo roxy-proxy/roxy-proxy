@@ -11,10 +11,6 @@ pub fn secret_names() -> HashSet<String> {
     ["openai", "gh"].into_iter().map(String::from).collect()
 }
 
-pub fn addon_names() -> HashSet<String> {
-    ["pii-scan"].into_iter().map(String::from).collect()
-}
-
 /// Deserialise and compile. Structural (serde) errors are returned as a
 /// single message, compile diagnostics as their rendered form.
 pub fn try_compile(metrics_yaml: &str, rules_yaml: &str) -> Result<Policy, Vec<String>> {
@@ -35,7 +31,6 @@ pub fn try_compile_with(
     let rules: Vec<RuleConfig> =
         serde_yaml_ng::from_str(rules_yaml).map_err(|e| vec![format!("parse: {e}")])?;
     let secrets = secret_names();
-    let addons = addon_names();
     let lists: HashSet<String> = ["internal", "blocked"]
         .into_iter()
         .map(String::from)
@@ -44,7 +39,6 @@ pub fn try_compile_with(
         rules: &rules,
         metrics: &metrics,
         secret_names: &secrets,
-        addon_names: &addons,
         address_lists: &lists,
         transparent_listeners: false,
         default,

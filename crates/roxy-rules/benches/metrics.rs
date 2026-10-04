@@ -17,7 +17,6 @@ fn store(metrics_yaml: &str) -> MetricStore {
         rules: &[],
         metrics: &metrics,
         secret_names: &none,
-        addon_names: &none,
         address_lists: &none,
         transparent_listeners: false,
         default: DefaultDecision::Deny,
