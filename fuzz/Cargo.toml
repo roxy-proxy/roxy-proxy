@@ -21,6 +21,7 @@ bytes = "1.12.1"
 http = "1.5.0"
 ipnet = "2"
 libfuzzer-sys = "0.4"
+roxy-dns = { path = "../crates/roxy-dns" }
 roxy-http = { path = "../crates/roxy-http" }
 roxy-rules = { path = "../crates/roxy-rules" }
 roxy-tls = { path = "../crates/roxy-tls" }
@@ -81,6 +82,13 @@ bench = false
 [[bin]]
 name = "rule_eval"
 path = "fuzz_targets/rule_eval.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_query"
+path = "fuzz_targets/dns_query.rs"
 test = false
 doc = false
 bench = false

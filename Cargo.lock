@@ -2520,6 +2520,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxy-dns"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "roxy-http"
 version = "0.1.0"
 dependencies = [

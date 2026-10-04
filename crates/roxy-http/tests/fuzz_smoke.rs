@@ -113,10 +113,10 @@ proptest! {
             allow_plain_in_connect: false,
         };
         let limits = Limits { max_header_bytes: 512, max_url_bytes: 128, max_headers: 8, ..Limits::default() };
-        let role = if cfg & 32 != 0 {
-            Role::ProxyPort
-        } else {
-            Role::Tunnel { authority: parse_authority(b"example.com", 443).unwrap(), scheme: Scheme::Https }
+        let role = match (cfg >> 5) & 3 {
+            0 | 1 => Role::ProxyPort,
+            2 => Role::Direct { port: 80 },
+            _ => Role::Tunnel { authority: parse_authority(b"example.com", 443).unwrap(), scheme: Scheme::Https },
         };
         let split = usize::from(cfg) % (input.len() + 1);
         let whole = scan_head(&input, 0, &limits).map_err(|e| e.reason);

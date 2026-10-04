@@ -28,6 +28,7 @@ The first directory is the working corpus, which grows as the fuzzer runs.
 | `client_hello` | `roxy-tls` `sniff` | Reading more never changes a verdict: over an input's prefixes, `NeedMore` until one constant answer. |
 | `rule_compile` | `roxy-rules` lexer, parser, type-checker, compiler | A policy that compiles evaluates without panicking, and a fail-closed outcome is never an allow. |
 | `rule_eval` | `Policy::evaluate_head` on generated policies | **Unavailable inputs only ever fail closed.** Making one input unavailable (a metric, the body text, the address list) leaves the outcome exactly as it was, or turns it into the fail-closed deny, never into a different decision. |
+| `dns_query` | `roxy-dns` `parse`, `answer`, `error` | Every reply fits in 512 bytes, carries the query's id and echoes the question as sent, and is itself dropped by `parse`, so roxy never answers an answer. |
 
 The input format is in each target's doc comment. For the HTTP targets the
 first byte selects the parser flags and the role (see `src/lib.rs`).
@@ -50,6 +51,8 @@ vectors, so the seeds are never stale and nothing derived is checked in:
   `crates/roxy-rules`.
 - **`ws_frame`:** the RFC 6455 example frames and a fragmented, masked
   message with a ping in the middle.
+- **`dns_query`:** A, AAAA and HTTPS queries, with and without EDNS, and a
+  few malformed shapes.
 
 ## CI
 
