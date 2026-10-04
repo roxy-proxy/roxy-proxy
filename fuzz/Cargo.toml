@@ -87,6 +87,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "content_coding"
+path = "fuzz_targets/content_coding.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "dns_query"
 path = "fuzz_targets/dns_query.rs"
 test = false

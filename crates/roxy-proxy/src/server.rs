@@ -229,6 +229,9 @@ impl ServerHandle {
     /// In-flight exchanges finish under the snapshot they started with.
     pub fn reload(&self, update: PolicyUpdate) -> Result<(), String> {
         let snap = self.shared.build_snapshot(update)?;
+        self.shared
+            .layer_state
+            .configure(snap.addons.iter().map(|a| (a.name.as_str(), &a.state)));
         self.shared.snapshot.store(Arc::new(snap));
         Ok(())
     }

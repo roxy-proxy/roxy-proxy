@@ -4,6 +4,7 @@
 
 use bytes::BytesMut;
 use proptest::prelude::*;
+use roxy_http::coding::{self, Coding, DecodeError};
 use roxy_http::h1::{ChunkedDecoder, Decoded, HeadScan, Role, parse_head, scan_head};
 use roxy_http::url::{
     normalize_path, normalize_query, parse_absolute_form, parse_authority, parse_origin_form,
@@ -111,6 +112,8 @@ proptest! {
             allow_obs_text: cfg & 8 != 0,
             allow_body_on_get: cfg & 16 != 0,
             allow_plain_in_connect: false,
+            strip_accept_encoding: false,
+            decode_for_addons: true,
         };
         let limits = Limits { max_header_bytes: 512, max_url_bytes: 128, max_headers: 8, ..Limits::default() };
         let role = match (cfg >> 5) & 3 {
@@ -166,6 +169,88 @@ proptest! {
         }
         if let Ok(a) = parse_authority(&input, 443) {
             prop_assert_eq!(parse_authority(a.to_string().as_bytes(), 443).unwrap(), a);
+        }
+    }
+}
+
+const CODINGS: [Coding; 4] = [Coding::Gzip, Coding::Deflate, Coding::Br, Coding::Zstd];
+
+fn compress(c: Coding, b: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    match c {
+        Coding::Gzip => {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            e.write_all(b).unwrap();
+            e.finish().unwrap()
+        }
+        Coding::Deflate => {
+            let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            e.write_all(b).unwrap();
+            e.finish().unwrap()
+        }
+        Coding::Br => {
+            let mut out = Vec::new();
+            let params = brotli::enc::BrotliEncoderParams::default();
+            brotli::BrotliCompress(&mut &b[..], &mut out, &params).unwrap();
+            out
+        }
+        Coding::Zstd => {
+            ruzstd::encoding::compress_to_vec(b, ruzstd::encoding::CompressionLevel::Fastest)
+        }
+    }
+}
+
+fn decode_pieces(c: Coding, input: &[u8], piece: usize) -> Result<Vec<u8>, DecodeError> {
+    let mut d = coding::Decoder::new(&[c], 1 << 20);
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; piece];
+    for p in input.chunks(piece) {
+        d.feed(p);
+        loop {
+            let n = d.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+    }
+    d.finish();
+    loop {
+        let n = d.read(&mut buf)?;
+        if n == 0 {
+            return Ok(out);
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// The `content_coding` fuzz target's invariant on mutated valid
+    /// streams: the result does not depend on how input is fed or output
+    /// read, and a stream that decodes is the text that was encoded.
+    #[test]
+    fn content_coding_split_independent(
+        text in http_bytes(),
+        c in 0..4usize,
+        flips in proptest::collection::vec((any::<usize>(), any::<u8>()), 0..3),
+        piece in 1..50usize,
+    ) {
+        let c = CODINGS[c];
+        let mut enc = compress(c, &text);
+        for (at, x) in &flips {
+            let i = at % enc.len();
+            enc[i] ^= x;
+        }
+        let whole = coding::decode(&[c], &enc, 1 << 20);
+        let pieces = decode_pieces(c, &enc, piece);
+        prop_assert_eq!(whole.is_ok(), pieces.is_ok(), "{:?} vs {:?}", whole, pieces);
+        if let (Ok(a), Ok(b)) = (&whole, &pieces) {
+            prop_assert_eq!(a, b);
+            if flips.iter().all(|(_, x)| *x == 0) {
+                prop_assert_eq!(a, &text);
+            }
         }
     }
 }

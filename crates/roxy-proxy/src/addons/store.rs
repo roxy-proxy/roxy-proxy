@@ -2,37 +2,26 @@
 //! store (docs/addons.md#state).
 
 use std::collections::HashMap;
-use std::sync::{Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, PoisonError, RwLock};
+use std::time::Duration;
+
+use roxy_rules::StateStore;
 
 use super::StateLimits;
 
-/// One addon's keyed store: JSON values with a TTL, an entry cap and a
-/// value cap. Nothing is evicted early: a write when full fails.
-#[derive(Debug, Default)]
-struct Store {
-    entries: HashMap<String, (String, Instant)>,
-}
-
-/// Every addon's store, by addon name.
+/// Every addon's store, by addon name. Each is a [`StateStore`]: sharded,
+/// bounded by the addon's `max_entries` with no early eviction (a write of
+/// a new key when full fails), and purged when full at most every 100 ms,
+/// so one addon's full store cannot stall another's. The outer lock is
+/// only written when an addon writes for the first time.
 #[derive(Debug, Default)]
 pub(crate) struct LayerStates {
-    stores: Mutex<HashMap<String, Store>>,
+    stores: RwLock<HashMap<String, Arc<StateStore>>>,
 }
 
 impl LayerStates {
     pub(crate) fn get(&self, layer: &str, key: &str) -> Option<String> {
-        let now = Instant::now();
-        let mut g = self.stores.lock().unwrap_or_else(PoisonError::into_inner);
-        let store = g.get_mut(layer)?;
-        match store.entries.get(key) {
-            Some((v, until)) if *until > now => Some(v.clone()),
-            Some(_) => {
-                store.entries.remove(key);
-                None
-            }
-            None => None,
-        }
+        self.existing(layer)?.get(key)
     }
 
     /// Writes `value` (already checked to be JSON). `Err` is the refusal
@@ -42,7 +31,7 @@ impl LayerStates {
         layer: &str,
         limits: &StateLimits,
         key: &str,
-        value: String,
+        value: &str,
         ttl: Option<Duration>,
     ) -> Result<(), String> {
         if value.len() > limits.max_value_bytes {
@@ -52,18 +41,41 @@ impl LayerStates {
                 limits.max_value_bytes
             ));
         }
-        let now = Instant::now();
-        let until = now + ttl.unwrap_or(limits.default_ttl);
-        let mut g = self.stores.lock().unwrap_or_else(PoisonError::into_inner);
-        let store = g.entry(layer.to_owned()).or_default();
-        if !store.entries.contains_key(key) && store.entries.len() >= limits.max_entries {
-            store.entries.retain(|_, (_, u)| *u > now);
-            if store.entries.len() >= limits.max_entries {
-                return Err("state store full".to_owned());
+        let store = match self.existing(layer) {
+            Some(s) => s,
+            None => self
+                .stores
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(layer.to_owned())
+                .or_insert_with(|| {
+                    Arc::new(StateStore::new(limits.max_entries, limits.default_ttl))
+                })
+                .clone(),
+        };
+        store.set(key, value, ttl).map_err(|e| e.to_string())
+    }
+
+    /// Applies each addon's entry cap and default ttl to its live store
+    /// on reload. Stored entries stay; a lower cap only refuses new keys.
+    pub(crate) fn configure<'a>(
+        &self,
+        addons: impl IntoIterator<Item = (&'a str, &'a StateLimits)>,
+    ) {
+        let g = self.stores.read().unwrap_or_else(PoisonError::into_inner);
+        for (layer, limits) in addons {
+            if let Some(s) = g.get(layer) {
+                s.set_limits(limits.max_entries, limits.default_ttl);
             }
         }
-        store.entries.insert(key.to_owned(), (value, until));
-        Ok(())
+    }
+
+    fn existing(&self, layer: &str) -> Option<Arc<StateStore>> {
+        self.stores
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(layer)
+            .cloned()
     }
 }
 
@@ -79,20 +91,48 @@ mod tests {
             max_value_bytes: 4,
             default_ttl: Duration::from_secs(60),
         };
-        assert!(s.put("a", &limits, "k1", "1".into(), None).is_ok());
-        assert!(s.put("a", &limits, "k2", "2".into(), None).is_ok());
-        assert!(s.put("a", &limits, "k3", "3".into(), None).is_err());
+        assert!(s.put("a", &limits, "k1", "1", None).is_ok());
+        assert!(s.put("a", &limits, "k2", "2", None).is_ok());
+        assert!(s.put("a", &limits, "k3", "3", None).is_err());
         // Overwriting an existing key is fine; other layers are separate.
-        assert!(s.put("a", &limits, "k1", "11".into(), None).is_ok());
-        assert!(s.put("b", &limits, "k3", "3".into(), None).is_ok());
-        assert!(s.put("a", &limits, "k1", "12345".into(), None).is_err());
+        assert!(s.put("a", &limits, "k1", "11", None).is_ok());
+        assert!(s.put("b", &limits, "k3", "3", None).is_ok());
+        assert!(s.put("a", &limits, "k1", "12345", None).is_err());
         assert_eq!(s.get("a", "k1").as_deref(), Some("11"));
         assert_eq!(s.get("b", "k1"), None);
         // Expired entries make room.
-        assert!(
-            s.put("c", &limits, "x", "1".into(), Some(Duration::ZERO))
-                .is_ok()
-        );
+        assert!(s.put("c", &limits, "x", "1", Some(Duration::ZERO)).is_ok());
         assert_eq!(s.get("c", "x"), None);
+    }
+
+    #[test]
+    fn reload_changes_limits_and_keeps_entries() {
+        let s = LayerStates::default();
+        let mut limits = StateLimits {
+            max_entries: 2,
+            max_value_bytes: 4,
+            default_ttl: Duration::from_secs(60),
+        };
+        assert!(s.put("a", &limits, "k1", "1", None).is_ok());
+        assert!(s.put("a", &limits, "k2", "2", None).is_ok());
+        assert!(s.put("a", &limits, "k3", "3", None).is_err());
+        // A raised cap admits more keys; the stored ones survive.
+        limits.max_entries = 3;
+        s.configure([("a", &limits), ("unused", &limits)]);
+        assert!(s.put("a", &limits, "k3", "3", None).is_ok());
+        assert!(s.put("a", &limits, "k4", "4", None).is_err());
+        // A lowered cap evicts nothing.
+        limits.max_entries = 1;
+        s.configure([("a", &limits)]);
+        assert_eq!(s.get("a", "k1").as_deref(), Some("1"));
+        assert_eq!(s.get("a", "k3").as_deref(), Some("3"));
+        assert!(s.put("a", &limits, "k2", "22", None).is_ok());
+        assert!(s.put("a", &limits, "k4", "4", None).is_err());
+        // A new default ttl applies to later writes.
+        limits.default_ttl = Duration::ZERO;
+        s.configure([("a", &limits)]);
+        assert!(s.put("a", &limits, "k1", "11", None).is_ok());
+        assert_eq!(s.get("a", "k1"), None);
+        assert_eq!(s.get("a", "k2").as_deref(), Some("22"));
     }
 }

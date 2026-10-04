@@ -125,7 +125,7 @@ impl LayerHost for StackHost {
             &addon.name,
             &addon.state,
             &key,
-            json,
+            &json,
             ttl_ms.map(Duration::from_millis),
         ))
     }

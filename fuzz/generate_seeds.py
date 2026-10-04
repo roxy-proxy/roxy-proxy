@@ -15,16 +15,20 @@ Sources:
 - rule_compile: every `when:` expression in examples/ and crates/roxy-rules;
 - h2map, rule_eval: structured inputs, seeded with a few byte patterns
   (libFuzzer finds the structure quickly);
+- content_coding: a small stream in each coding, a stacked pair, and gzip
+  with every optional header field.
 - ws_frame: the RFC 6455 example frames and a fragmented, masked message
   with a ping in the middle;
 - dns_query: A, AAAA and HTTPS queries, with and without an EDNS OPT
   record, and a few malformed shapes.
 """
 
+import gzip
 import hashlib
 import pathlib
 import re
 import ssl
+import zlib
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 OUT = ROOT / "fuzz" / "seeds"
@@ -125,6 +129,36 @@ def when_expressions():
                 yield expr
 
 
+# Small valid streams for the codings Python's standard library lacks
+# (made with the `brotli` and `ruzstd` crates).
+BR_SEED = bytes.fromhex(
+    "1b3a00889c09762c643a88a7982b23547aca2dcd35489e8ec22aca6ab2b2373ce09003e6b725916739540e5a23302da8ea184a3c2b97e8632027e9c800"
+)
+ZSTD_SEED = bytes.fromhex(
+    "28b52ffd0438d90100726f787920636f6e74656e7420636f64696e6720736565643a20424547494e2050524956415445204b455920726f787920726f787920726f78790a0b204ccb"
+)
+
+
+def coding_seeds():
+    """(name, config byte, encoded body) for content_coding: one stream per
+    coding, a stacked pair, and gzip with every optional header field."""
+    text = b"roxy content coding seed: BEGIN PRIVATE KEY roxy roxy roxy\n"
+    gz = gzip.compress(text)
+    yield "gzip", 0, gz
+    yield "gzip_two_members", 0, gz + gzip.compress(b"second member")
+    yield "deflate", 1, zlib.compress(text)
+    yield "br", 2, BR_SEED
+    yield "zstd", 3, ZSTD_SEED
+    # deflate, then gzip on top: codings [deflate, gzip] = 1 | 4 | (0 << 3).
+    yield "deflate_then_gzip", 1 | 4, gzip.compress(zlib.compress(text))
+    # FTEXT | FHCRC | FEXTRA | FNAME | FCOMMENT, header CRC16 included.
+    head = bytes([0x1F, 0x8B, 8, 0x1F, 0, 0, 0, 0, 0, 255]) + b"\x02\x00ab" + b"name\x00" + b"note\x00"
+    head += (zlib.crc32(head) & 0xFFFF).to_bytes(2, "little")
+    yield "gzip_all_fields", 0, head + gz[10:]
+    yield "empty", 0, b""
+
+
+
 def ws_frame(fin, opcode, payload, mask=None):
     b = bytes([(0x80 if fin else 0) | opcode])
     m = 0x80 if mask else 0
@@ -174,7 +208,7 @@ def dns_queries():
 
 def main():
     for target in ("h1_request", "h1_chunked", "url", "client_hello", "rule_compile", "h2map", "rule_eval",
-                   "ws_frame", "dns_query"):
+                   "ws_frame", "content_coding", "dns_query"):
         for old in (OUT / target).glob("*") if (OUT / target).is_dir() else []:
             old.unlink()
     n = 0
@@ -198,6 +232,9 @@ def main():
     for i, pat in enumerate([b"", b"\x00" * 64, b"\x01" * 64, bytes(range(256))]):
         write("h2map", f"pattern{i}", pat)
         write("rule_eval", f"pattern{i}", pat)
+    for name, cfg, body in coding_seeds():
+        for piece in (0, 7):
+            write("content_coding", f"{name}_{piece}", bytes([cfg | piece << 5]) + body)
     for name, cfg, frames in ws_frames():
         write("ws_frame", name, bytes([cfg]) + frames)
     for name, q in dns_queries():

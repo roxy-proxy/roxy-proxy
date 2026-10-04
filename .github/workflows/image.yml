@@ -4,7 +4,7 @@ name: Image
 # native runner. Every build is smoke-tested (read-only, no capabilities,
 # health check) and scanned with Trivy, failing on HIGH/CRITICAL findings.
 #
-# Pull requests only build. Pushes to main publish ghcr.io/roxy-proxy/roxy:edge;
+# Pull requests and the merge queue only build. Pushes to main publish ghcr.io/roxy-proxy/roxy:edge;
 # version tags publish vX.Y.Z, X.Y and latest. Published images carry an
 # SBOM and max-mode provenance and are signed keylessly with cosign.
 
@@ -13,6 +13,7 @@ on:
     branches: [main]
     tags: ["v*.*.*"]
   pull_request:
+  merge_group:
   workflow_dispatch:
 
 permissions:

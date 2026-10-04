@@ -22,7 +22,8 @@ produces a `request` event:
   `_fail_closed`, `_address_policy` or `layer:<name>` for built-in
   decisions.
 - `reason` is a stable code when the exchange failed closed or failed
-  (`body_too_large_to_inspect`, `missing_value`, `upstream_timeout`, ...).
+  (`body_too_large_to_inspect`, `body_decode_failed`, `missing_value`,
+  `upstream_timeout`, ...).
 - `stage` says where the decision was made: `head` for the forwarding
   decision, or where a watching rule stopped the exchange: `request_body`,
   `response_head`, `response_body`, `websocket`.

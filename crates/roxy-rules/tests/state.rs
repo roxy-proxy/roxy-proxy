@@ -100,3 +100,31 @@ fn concurrent_admission_never_exceeds_max_entries() {
     });
     assert_eq!(s.len(), 100);
 }
+
+#[test]
+fn set_limits_on_a_live_store() {
+    let (s, t) = clocked(3, Duration::from_secs(10));
+    s.set("a", "1", None).unwrap();
+    s.set("b", "1", Some(Duration::from_secs(1))).unwrap();
+    s.set("c", "1", None).unwrap();
+    // A lower cap evicts nothing: stored keys stay readable and writable.
+    s.set_limits(2, Duration::from_secs(100));
+    assert_eq!(s.len(), 3);
+    s.set("a", "2", None).unwrap();
+    assert_eq!(s.set("d", "1", None), Err(StateFull));
+    // Once expiry brings the count under the cap, new keys are admitted.
+    t.store(1_000, Ordering::SeqCst);
+    assert_eq!(s.set("d", "1", None), Err(StateFull));
+    s.remove("c");
+    s.set("d", "1", None).unwrap();
+    // The new default ttl applies to later writes; "a" was written after
+    // the change too.
+    t.store(50_000, Ordering::SeqCst);
+    assert_eq!(s.get("d").as_deref(), Some("1"));
+    assert_eq!(s.get("a").as_deref(), Some("2"));
+    // A higher cap admits more keys straight away.
+    s.set_limits(4, Duration::from_secs(100));
+    s.set("e", "1", None).unwrap();
+    s.set("f", "1", None).unwrap();
+    assert_eq!(s.set("g", "1", None), Err(StateFull));
+}

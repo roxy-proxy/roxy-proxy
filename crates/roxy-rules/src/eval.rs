@@ -133,6 +133,22 @@ pub enum FailClosedReason {
     /// A body predicate was reached but the body was not buffered or could
     /// not be read. Carries the field name.
     BodyUnavailable(String),
+    /// A body predicate was reached but the body's `content-encoding` names
+    /// a coding that cannot be decoded (docs/rules.md#body-access).
+    UnsupportedContentEncoding {
+        /// The field name.
+        field: String,
+        /// The coding.
+        coding: String,
+    },
+    /// A body predicate was reached but the body could not be decoded
+    /// (docs/rules.md#body-access).
+    BodyDecodeFailed {
+        /// The field name.
+        field: String,
+        /// What was wrong.
+        detail: String,
+    },
     /// An operator other than `==` / `!=` / `in` / `not in` was applied to a
     /// missing (`null`) value, which has no answer (docs/rules.md#missing-values-null). Carries the field
     /// as written, e.g. `body.size`.
@@ -154,6 +170,12 @@ impl fmt::Display for FailClosedReason {
                 write!(f, "`{field}`: body too large to inspect")
             }
             Self::BodyUnavailable(field) => write!(f, "`{field}`: body unavailable"),
+            Self::UnsupportedContentEncoding { field, coding } => {
+                write!(f, "`{field}`: unsupported content coding `{coding}`")
+            }
+            Self::BodyDecodeFailed { field, detail } => {
+                write!(f, "`{field}`: body could not be decoded: {detail}")
+            }
             Self::Unsupported(rule) => write!(f, "rule {rule:?}: action not possible here"),
             Self::MissingValue(field) => {
                 write!(
@@ -471,6 +493,10 @@ pub(crate) enum Unavailable<'a> {
     List(&'a str),
     /// Field name (`body.text` / `response.body.text`).
     BodyTooLarge(&'static str),
+    /// Field name, coding.
+    BodyEncoding(&'static str, &'a str),
+    /// Field name, what was wrong.
+    BodyDecode(&'static str, &'a str),
     Body(&'static str),
     /// A missing value reached an operator that cannot answer for `null`.
     Missing(&'a Access),
@@ -482,6 +508,14 @@ impl Unavailable<'_> {
             Unavailable::Metric(id) => FailClosedReason::MetricUnavailable(id.to_owned()),
             Unavailable::List(n) => FailClosedReason::AddressListUnavailable(n.to_owned()),
             Unavailable::BodyTooLarge(f) => FailClosedReason::BodyTooLargeToInspect(f.to_owned()),
+            Unavailable::BodyEncoding(f, c) => FailClosedReason::UnsupportedContentEncoding {
+                field: f.to_owned(),
+                coding: c.to_owned(),
+            },
+            Unavailable::BodyDecode(f, d) => FailClosedReason::BodyDecodeFailed {
+                field: f.to_owned(),
+                detail: d.to_owned(),
+            },
             Unavailable::Body(f) => FailClosedReason::BodyUnavailable(f.to_owned()),
             Unavailable::Missing(a) => FailClosedReason::MissingValue(a.display_name()),
         }
@@ -534,6 +568,14 @@ fn body<'a>(s: &Scope<'a>, b: BodyText<'a>, field: &'static str) -> Value<'a> {
         BodyText::Available(t) => Value::Str(t),
         BodyText::TooLarge => {
             s.fail(Unavailable::BodyTooLarge(field));
+            Value::Absent
+        }
+        BodyText::UnsupportedEncoding(c) => {
+            s.fail(Unavailable::BodyEncoding(field, c));
+            Value::Absent
+        }
+        BodyText::Undecodable(d) => {
+            s.fail(Unavailable::BodyDecode(field, d));
             Value::Absent
         }
         BodyText::Unavailable => {

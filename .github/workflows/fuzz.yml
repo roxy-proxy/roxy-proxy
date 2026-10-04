@@ -104,6 +104,7 @@ jobs:
           - client_hello
           - rule_compile
           - rule_eval
+          - content_coding
           - dns_query
     runs-on: ubuntu-24.04
     timeout-minutes: 45
