@@ -70,7 +70,9 @@ in one form ([WebSockets](/policies/websockets#message-rules)).
 A rule set is a list of allows and denies that restrict them. Any matching
 deny wins over any matching allow, wherever it sits in the list, and
 nothing can override a deny at any later point in an exchange. Rule order
-orders effects, never decisions. So adding a deny can only narrow what
+orders effects, never decisions: a rule that reads a tag must follow every
+rule that sets it, or the config is rejected. So adding a deny can only
+narrow what
 passes, and a reviewer can read each deny on its own
 ([rules](/policies/overview)).
 
