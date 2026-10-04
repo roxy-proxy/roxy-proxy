@@ -28,7 +28,8 @@ use crate::flowlog::{DecisionKind, FlowEvent};
 use crate::io::{ConnIo, Io};
 use crate::listener::ClientConn;
 use crate::pipeline::{
-    BodyIo, FlowCx, Refusal, RefusalKind, ResponseVerdict, Verdict, request_steps, response_steps,
+    BodyIo, FlowCx, PerDir, Refusal, RefusalKind, ResponseVerdict, Verdict, request_steps,
+    response_steps,
 };
 use crate::server::Shared;
 use crate::upstream::{ConnectError, Protocols, classify, describe};
@@ -395,7 +396,10 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
     cx.watch = Some(watch.clone());
     // Capture: what is forwarded from here on is teed to the
     // capture log, heads included.
-    let (mut up_tap, down_tap) = taps(cx);
+    let PerDir {
+        request: mut up_tap,
+        response: down_tap,
+    } = taps(cx);
     let host = host_text(&req.authority.host);
     let port = req.authority.port;
     let private = PrivateAddrs::from_private_ok(cx.opts.private_ok);
@@ -591,7 +595,10 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
             }
             if let Some((upstream, key)) = upgrade {
                 // The relay takes the taps after the `101`.
-                cx.taps = (up_tap, down_tap);
+                cx.taps = PerDir {
+                    request: up_tap,
+                    response: down_tap,
+                };
                 return Outcome::Upgrade { res, upstream, key };
             }
             let body = std::mem::take(&mut res.body);
@@ -702,10 +709,9 @@ async fn splice_websocket(
         cx.emit_request_event();
         return None;
     };
-    let (mut up_tap, down_tap) = std::mem::take(&mut cx.taps);
+    let mut taps = std::mem::take(&mut cx.taps);
     if parse {
         let max = cx.snap.limits.max_ws_message_bytes;
-        let taps = (up_tap, down_tap);
         let r = relay_messages(client_io, upstream, leftover, (idle, max), &watch, taps).await;
         finish_websocket(&mut cx, r);
         return None;
@@ -719,7 +725,7 @@ async fn splice_websocket(
             cx.emit_request_event();
             return None;
         }
-        if let Some(t) = up_tap.as_mut() {
+        if let Some(t) = taps.request.as_mut() {
             t.data(&leftover);
         }
         if upstream.write_all(&leftover).await.is_err() {
@@ -727,7 +733,7 @@ async fn splice_websocket(
             return None;
         }
     }
-    let (c2s, s2c) = splice(client_io, upstream, idle, &watch, (up_tap, down_tap)).await;
+    let (c2s, s2c) = splice(client_io, upstream, idle, &watch, taps).await;
     let r = Relayed {
         c2s: c2s + c2s_extra,
         s2c,
@@ -825,7 +831,7 @@ async fn splice(
     upstream: impl Io,
     idle: Duration,
     watch: &Watch,
-    taps: (Option<Tap>, Option<Tap>),
+    taps: PerDir<Option<Tap>>,
 ) -> (u64, u64) {
     use std::sync::atomic::AtomicU64;
     let base = Instant::now();
@@ -834,7 +840,10 @@ async fn splice(
     let s2c = Arc::new(AtomicU64::new(0));
     let (cr, cw) = tokio::io::split(client);
     let (ur, uw) = tokio::io::split(upstream);
-    let (up_tap, down_tap) = taps;
+    let PerDir {
+        request: up_tap,
+        response: down_tap,
+    } = taps;
     let a = pump(
         cr,
         uw,
@@ -1105,7 +1114,10 @@ async fn relay_messages(
     leftover: Vec<u8>,
     (idle, max): (Duration, u64),
     watch: &Watch,
-    (up_tap, down_tap): (Option<Tap>, Option<Tap>),
+    PerDir {
+        request: up_tap,
+        response: down_tap,
+    }: PerDir<Option<Tap>>,
 ) -> Relayed {
     let base = Instant::now();
     let last = AtomicU64::new(0);
@@ -1185,15 +1197,15 @@ async fn relay_messages(
 
 /// Capture taps for an exchange about to be forwarded: per direction, when
 /// a `capture` effect selected it or the capture log takes everything.
-fn taps(cx: &FlowCx) -> (Option<Tap>, Option<Tap>) {
+fn taps(cx: &FlowCx) -> PerDir<Option<Tap>> {
     let Some(log) = &cx.shared.capture else {
-        return (None, None);
+        return PerDir::default();
     };
     let all = log.captures_all();
     let flow = cx.flow.to_string();
     let tap = |on: bool, dir| (on || all).then(|| Tap::new(log.clone(), &flow, dir));
-    (
-        tap(cx.capture.0, capture::Dir::Request),
-        tap(cx.capture.1, capture::Dir::Response),
-    )
+    PerDir {
+        request: tap(cx.capture.request, capture::Dir::Request),
+        response: tap(cx.capture.response, capture::Dir::Response),
+    }
 }

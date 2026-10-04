@@ -236,6 +236,13 @@ pub(crate) async fn response_steps(
 // Per-flow context
 // ---------------------------------------------------------------------------
 
+/// One value for each direction of an exchange.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct PerDir<T> {
+    pub request: T,
+    pub response: T,
+}
+
 /// What the flow log needs about a flow.
 #[derive(Debug, Default)]
 pub(crate) struct FlowRecord {
@@ -270,10 +277,10 @@ pub(crate) struct FlowCx {
     /// Capture this exchange's request / response: set by a
     /// `capture` effect at the head, or for every exchange with
     /// `log.capture.all`.
-    pub capture: (bool, bool),
+    pub capture: PerDir<bool>,
     /// Capture taps not yet handed to a body adapter (the WebSocket relay
     /// takes them after the `101`).
-    pub taps: (Option<Tap>, Option<Tap>),
+    pub taps: PerDir<Option<Tap>>,
     /// `Host` to send upstream after a `redirect` without `rewrite_host`.
     pub host_override: Option<String>,
     /// Request body bytes forwarded so far, once the request is on its way.
@@ -350,8 +357,8 @@ impl FlowCx {
             record: FlowRecord::default(),
             started: Instant::now(),
             watch: None,
-            capture: (false, false),
-            taps: (None, None),
+            capture: PerDir::default(),
+            taps: PerDir::default(),
             host_override: None,
             request_counter: None,
             stack: None,
@@ -930,9 +937,8 @@ fn apply_request_effect(
             if cx.shared.capture.is_none() {
                 return Err(Refusal::fail_closed("capture_unavailable"));
             }
-            let (req, res) = &mut cx.capture;
-            *req |= matches!(target, CaptureTarget::Request | CaptureTarget::Both);
-            *res |= matches!(target, CaptureTarget::Response | CaptureTarget::Both);
+            cx.capture.request |= matches!(target, CaptureTarget::Request | CaptureTarget::Both);
+            cx.capture.response |= matches!(target, CaptureTarget::Response | CaptureTarget::Both);
         }
     }
     Ok(())
