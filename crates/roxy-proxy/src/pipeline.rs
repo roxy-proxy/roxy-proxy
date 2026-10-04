@@ -44,7 +44,7 @@ use crate::capture::Tap;
 use crate::flowlog::{
     ClientInfo, DecisionKind, DstInfo, FlowEvent, RequestInfo, ResponseInfo, Stage, Timing, TlsInfo,
 };
-use crate::io::ConnIo;
+use crate::io::ClientIo;
 use crate::listener::ClientConn;
 use crate::server::{Shared, Snapshot};
 use crate::sources::{MetricSourceError, Sample};
@@ -157,6 +157,7 @@ impl Refusal {
             tracing::debug!("rule id is not a valid header value");
         }
         res.body = Body::from_bytes(Bytes::from(body.to_string()));
+        res.meta.close = self.close;
         res
     }
 }
@@ -194,7 +195,7 @@ pub(crate) trait BodyIo: Send {
     ) -> CollectFuture<'a, Result<Collected, ParseError>>;
 }
 
-impl BodyIo for ServerConn<ConnIo> {
+impl BodyIo for ServerConn<ClientIo> {
     fn collect<'a>(
         &'a mut self,
         body: &'a mut Body,

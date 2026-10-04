@@ -260,40 +260,10 @@ impl KitBuilder {
             addons.push(a.load(&rt, &input).await);
         }
 
-        let mut settings = UpstreamSettings::default();
-        // Never consult real DNS: unknown names fail.
-        settings.dns.servers = Some(vec!["127.0.0.1:9".parse().unwrap()]);
-        for (name, ip) in [
-            ("up.test", UP_IP),
-            ("private.test", PRIVATE_IP),
-            ("down.test", DOWN_IP),
-        ] {
-            settings
-                .dns
-                .static_hosts
-                .insert(name.to_owned(), vec![ip.parse().unwrap()]);
-        }
-        settings.connect_timeout = Duration::from_secs(5);
-        let up = upstream.clone();
-        settings.dial = Some(TestDial(Arc::new(move |addr| {
-            let up = up.clone();
-            Box::pin(async move { up.dial(addr) })
-        })));
-
-        let capture = self.capture_all.then(|| {
-            Arc::new(
-                crate::capture::CaptureLog::open(
-                    &dir.path().join("capture"),
-                    crate::capture::CaptureOptions {
-                        max_body_bytes: 16 * 1024 * 1024,
-                        all: true,
-                        writer: roxy_log::WriterOptions::default(),
-                        rotate: roxy_log::RotateOptions::default(),
-                    },
-                )
-                .unwrap(),
-            )
-        });
+        let settings = upstream_settings(&upstream);
+        let capture = self
+            .capture_all
+            .then(|| Arc::new(capture_all_log(&dir.path().join("capture"))));
         let server = Server::start(RuntimeConfig {
             listeners: Vec::new(),
             ca_server: None,
@@ -744,6 +714,45 @@ impl Answer {
     pub(crate) fn json(&self) -> serde_json::Value {
         serde_json::from_slice(self.body.as_ref().expect("complete body")).expect("JSON body")
     }
+}
+
+/// The connector's settings: the test names, and the scripted upstream
+/// behind the dial.
+fn upstream_settings(upstream: &Arc<Upstream>) -> UpstreamSettings {
+    let mut settings = UpstreamSettings::default();
+    // Never consult real DNS: unknown names fail.
+    settings.dns.servers = Some(vec!["127.0.0.1:9".parse().unwrap()]);
+    for (name, ip) in [
+        ("up.test", UP_IP),
+        ("private.test", PRIVATE_IP),
+        ("down.test", DOWN_IP),
+    ] {
+        settings
+            .dns
+            .static_hosts
+            .insert(name.to_owned(), vec![ip.parse().unwrap()]);
+    }
+    settings.connect_timeout = Duration::from_secs(5);
+    let up = upstream.clone();
+    settings.dial = Some(TestDial(Arc::new(move |addr| {
+        let up = up.clone();
+        Box::pin(async move { up.dial(addr) })
+    })));
+    settings
+}
+
+/// A capture log in `dir` that takes every forwarded exchange.
+fn capture_all_log(dir: &std::path::Path) -> crate::capture::CaptureLog {
+    crate::capture::CaptureLog::open(
+        dir,
+        crate::capture::CaptureOptions {
+            max_body_bytes: 16 * 1024 * 1024,
+            all: true,
+            writer: roxy_log::WriterOptions::default(),
+            rotate: roxy_log::RotateOptions::default(),
+        },
+    )
+    .unwrap()
 }
 
 /// A request body the test feeds chunk by chunk.

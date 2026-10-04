@@ -292,6 +292,118 @@ async fn plaintext_in_connect_in_pieces_is_still_http() {
     assert_eq!(kit.upstream.wait_seen(1).await[0].addr.port(), 80);
 }
 
+// ---- refusals and the h1 connection ---------------------------------------
+
+const OPEN_DENY_RULES: &str = r#"
+- id: denied-open
+  when: host == "up.test" and path == "/denied"
+  then: { deny: { close: false } }
+- id: denied
+  when: host == "up.test" and path == "/denied-close"
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+
+/// Reads one h1 response (head, then a `content-length` body) as text.
+async fn read_response(io: &mut tokio::io::DuplexStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let read = async {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut b = [0u8; 1];
+            assert_eq!(io.read(&mut b).await.unwrap(), 1, "EOF in response head");
+            head.push(b[0]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        let len: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length: "))
+            .map_or(0, |v| v.parse().unwrap());
+        let mut body = vec![0u8; len];
+        io.read_exact(&mut body).await.unwrap();
+        head
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), read)
+        .await
+        .expect("a response")
+}
+
+/// A deny with `close: false` leaves the connection usable: the unread
+/// request body is consumed, and the next request parses from where it
+/// starts.
+#[tokio::test]
+async fn a_non_closing_deny_keeps_the_connection_in_sync() {
+    use tokio::io::AsyncWriteExt;
+    let kit = Kit::builder().rules(OPEN_DENY_RULES).start().await;
+    let mut io = kit.connect();
+    io.write_all(
+        b"POST http://up.test/denied HTTP/1.1\r\nhost: up.test\r\ncontent-length: 5\r\n\r\nhello\
+          GET http://up.test/second HTTP/1.1\r\nhost: up.test\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let first = read_response(&mut io).await;
+    assert!(first.starts_with("HTTP/1.1 403"), "{first}");
+    assert!(!first.contains("connection: close"), "{first}");
+    let second = read_response(&mut io).await;
+    assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, "/second");
+}
+
+/// A denied request waiting on `100 Continue` never gets one; the
+/// connection closes, since the client may or may not send the body.
+#[tokio::test]
+async fn a_deny_never_answers_100_continue() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let kit = Kit::builder().rules(OPEN_DENY_RULES).start().await;
+    let mut io = kit.connect();
+    io.write_all(
+        b"POST http://up.test/denied HTTP/1.1\r\nhost: up.test\r\ncontent-length: 5\r\nexpect: 100-continue\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let res = read_response(&mut io).await;
+    assert!(res.starts_with("HTTP/1.1 403"), "{res}");
+    assert!(res.contains("connection: close"), "{res}");
+    let mut rest = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), io.read_to_end(&mut rest))
+        .await
+        .expect("the connection closes")
+        .unwrap();
+    assert!(rest.is_empty(), "{}", String::from_utf8_lossy(&rest));
+    assert!(kit.upstream.seen().is_empty());
+}
+
+/// A closing deny of a large upload does not wait for the rest of the
+/// body: the connection closes as soon as the response is written.
+#[tokio::test]
+async fn a_closing_deny_does_not_drain_the_upload() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let kit = Kit::builder()
+        .rules(OPEN_DENY_RULES)
+        .limits(|l| l.body_idle_timeout = std::time::Duration::from_secs(5))
+        .start()
+        .await;
+    let mut io = kit.connect();
+    io.write_all(
+        b"POST http://up.test/denied-close HTTP/1.1\r\nhost: up.test\r\ncontent-length: 2000000\r\n\r\nabc",
+    )
+    .await
+    .unwrap();
+    let res = read_response(&mut io).await;
+    assert!(res.starts_with("HTTP/1.1 403"), "{res}");
+    assert!(res.contains("connection: close"), "{res}");
+    let mut rest = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(2), io.read_to_end(&mut rest))
+        .await
+        .expect("the connection closes without waiting for the body")
+        .unwrap();
+}
+
 /// Records every metric sample and keeps state in memory.
 #[derive(Default)]
 struct Recording {

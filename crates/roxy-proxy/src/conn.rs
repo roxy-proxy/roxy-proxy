@@ -17,9 +17,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_rustls::TlsAcceptor;
 
 use crate::auth::{AuthCache, authenticate};
-use crate::exchange::{self, ClientFraming, respond};
+use crate::exchange::{self, respond};
 use crate::flowlog::TlsInfo;
-use crate::io::{BoxIo, ConnIo, Rewind};
+use crate::io::{BoxIo, ClientIo, Rewind};
 use crate::listener::ClientConn;
 use crate::pipeline::emit_connect_event;
 use crate::server::Shared;
@@ -28,20 +28,21 @@ use crate::view::host_text;
 /// The magic host served by the proxy itself.
 pub const INTERNAL_HOST: &str = "roxy.internal";
 
-/// `407` header lines (the codec treats `proxy-authenticate` as reserved).
-const PROXY_AUTHENTICATE: &[u8] = b"proxy-authenticate: Basic realm=\"roxy\"\r\n";
+/// The realm of the `407` challenge.
+const AUTH_REALM: &str = "roxy";
+/// The body of a `407`.
+const AUTH_REQUIRED_BODY: &[u8] = b"{\"error\":\"proxy authentication required\"}";
 
 pub(crate) async fn serve_explicit(stream: BoxIo, client: ClientConn, shared: Arc<Shared>) {
     let snap = shared.snapshot();
-    let handle = ConnIo::new(stream);
     let conn = ServerConn::new(
-        handle.clone(),
+        ClientIo(stream),
         Role::ProxyPort,
         snap.limits.clone(),
         snap.flags.clone(),
     );
     drop(snap);
-    Box::pin(proxy_port_loop(conn, handle, client, shared)).await;
+    Box::pin(proxy_port_loop(conn, client, shared)).await;
 }
 
 fn is_internal(req: &CanonicalRequest) -> bool {
@@ -85,22 +86,15 @@ async fn check_auth(
     authenticate(db, header, cache).await.map(Some).ok_or(())
 }
 
-fn auth_required_response() -> CanonicalResponse {
-    let mut res = CanonicalResponse::new(StatusCode::PROXY_AUTHENTICATION_REQUIRED);
-    let _ = res.headers.insert("content-type", "application/json");
-    res.body = Body::from_bytes(Bytes::from_static(
-        b"{\"error\":\"proxy authentication required\"}",
-    ));
-    res
+/// Answers the pending request or CONNECT with `407` and closes.
+async fn require_auth(conn: ServerConn<ClientIo>) {
+    let body = Bytes::from_static(AUTH_REQUIRED_BODY);
+    if let Err(e) = conn.respond_proxy_auth_required(AUTH_REALM, body).await {
+        tracing::debug!(error = %e, "writing 407 failed");
+    }
 }
 
-#[allow(clippy::too_many_lines)]
-async fn proxy_port_loop(
-    mut conn: ServerConn<ConnIo>,
-    handle: ConnIo,
-    client: ClientConn,
-    shared: Arc<Shared>,
-) {
+async fn proxy_port_loop(mut conn: ServerConn<ClientIo>, client: ClientConn, shared: Arc<Shared>) {
     let mut auth_cache = AuthCache::default();
     loop {
         let next = tokio::select! {
@@ -119,7 +113,6 @@ async fn proxy_port_loop(
             Incoming::Connect {
                 authority, meta, ..
             } => {
-                let framing = ClientFraming { close: meta.close };
                 let Ok(user) = check_auth(
                     &client,
                     &shared,
@@ -128,22 +121,11 @@ async fn proxy_port_loop(
                 )
                 .await
                 else {
-                    {
-                        respond(
-                            conn,
-                            &handle,
-                            auth_required_response(),
-                            true,
-                            framing,
-                            PROXY_AUTHENTICATE,
-                        )
-                        .await;
-                        return;
-                    }
+                    require_auth(conn).await;
+                    return;
                 };
                 Box::pin(handle_connect(
                     conn,
-                    handle,
                     client.with_user(user),
                     authority,
                     shared,
@@ -160,24 +142,18 @@ async fn proxy_port_loop(
                     exchange::close_on_parse_error(conn, None, &client, &shared, &e).await;
                     return;
                 }
-                let framing = ClientFraming {
-                    close: req.meta.close,
-                };
                 let res = internal_response(&req, &shared);
                 drop(req);
-                match respond(conn, &handle, res, false, framing, b"").await {
+                match respond(conn, res).await {
                     Some(c) => conn = c,
                     None => return,
                 }
             }
             Incoming::Request(req) => {
-                let framing = ClientFraming {
-                    close: req.meta.close,
-                };
                 if is_internal(&req) {
                     let res = internal_response(&req, &shared);
                     drop(req);
-                    match respond(conn, &handle, res, false, framing, b"").await {
+                    match respond(conn, res).await {
                         Some(c) => conn = c,
                         None => return,
                     }
@@ -191,22 +167,11 @@ async fn proxy_port_loop(
                 )
                 .await
                 else {
-                    {
-                        drop(req);
-                        respond(
-                            conn,
-                            &handle,
-                            auth_required_response(),
-                            true,
-                            framing,
-                            PROXY_AUTHENTICATE,
-                        )
-                        .await;
-                        return;
-                    }
+                    drop(req);
+                    require_auth(conn).await;
+                    return;
                 };
-                match exchange::run(conn, &handle, req, client.with_user(user), None, &shared).await
-                {
+                match exchange::run(conn, req, client.with_user(user), None, &shared).await {
                     Some(c) => conn = c,
                     None => return,
                 }
@@ -220,10 +185,8 @@ fn norm_name(s: &str) -> String {
     s.trim_end_matches('.').to_ascii_lowercase()
 }
 
-#[allow(clippy::too_many_lines)]
 async fn handle_connect(
-    conn: ServerConn<ConnIo>,
-    handle: ConnIo,
+    conn: ServerConn<ClientIo>,
     client: ClientConn,
     authority: Authority,
     shared: Arc<Shared>,
@@ -240,7 +203,6 @@ async fn handle_connect(
     let Ok((io, buf)) = conn.accept_connect().await else {
         return;
     };
-    drop(handle);
 
     // Classify the first bytes: TLS, plaintext HTTP, or close.
     let Some((io, buf, sniffed)) = classify(io, buf, limits.header_timeout, &client, &shared).await
@@ -266,9 +228,8 @@ async fn handle_connect(
         }
         FirstBytes::Http if flags.allow_plain_in_connect => {
             let snap = shared.snapshot();
-            let handle = ConnIo::new(Box::new(io));
             let conn = ServerConn::with_buffered(
-                handle.clone(),
+                io,
                 buf,
                 Role::Tunnel {
                     authority,
@@ -278,7 +239,7 @@ async fn handle_connect(
                 snap.flags.clone(),
             );
             drop(snap);
-            tunnel_loop(conn, handle, client, None, shared).await;
+            tunnel_loop(conn, client, None, shared).await;
         }
         FirstBytes::Http | FirstBytes::Other => {
             shared.emit_parse_reason(&client, None, "non_http_in_connect", None);
@@ -385,7 +346,7 @@ pub(crate) async fn serve_direct(
                 }
             };
             Box::pin(terminate_tls(
-                ConnIo::new(io),
+                ClientIo(io),
                 buf.freeze(),
                 client,
                 authority,
@@ -398,22 +359,21 @@ pub(crate) async fn serve_direct(
         }
         FirstBytes::Http => {
             let snap = shared.snapshot();
-            let handle = ConnIo::new(io);
             let conn = ServerConn::with_buffered(
-                handle.clone(),
+                ClientIo(io),
                 buf,
                 Role::Direct { port },
                 snap.limits.clone(),
                 snap.flags.clone(),
             );
             drop(snap);
-            tunnel_loop(conn, handle, client, None, shared).await;
+            tunnel_loop(conn, client, None, shared).await;
         }
     }
 }
 
 async fn terminate_tls(
-    io: ConnIo,
+    io: ClientIo,
     hello: Bytes,
     client: ClientConn,
     authority: Authority,
@@ -469,9 +429,8 @@ async fn terminate_tls(
         return;
     }
     let snap = shared.snapshot();
-    let handle = ConnIo::new(Box::new(tls));
     let conn = ServerConn::new(
-        handle.clone(),
+        ClientIo::new(tls),
         Role::Tunnel {
             authority,
             scheme: Scheme::Https,
@@ -480,12 +439,11 @@ async fn terminate_tls(
         snap.flags.clone(),
     );
     drop(snap);
-    tunnel_loop(conn, handle, client, Some(info), shared).await;
+    tunnel_loop(conn, client, Some(info), shared).await;
 }
 
 async fn tunnel_loop(
-    mut conn: ServerConn<ConnIo>,
-    handle: ConnIo,
+    mut conn: ServerConn<ClientIo>,
     client: ClientConn,
     tls: Option<TlsInfo>,
     shared: Arc<Shared>,
@@ -506,19 +464,15 @@ async fn tunnel_loop(
             {
                 // A direct listener is reached through roxy's DNS, which
                 // steers `roxy.internal` here too.
-                let framing = ClientFraming {
-                    close: req.meta.close,
-                };
                 let res = internal_response(&req, &shared);
                 drop(req);
-                match respond(conn, &handle, res, false, framing, b"").await {
+                match respond(conn, res).await {
                     Some(c) => conn = c,
                     None => return,
                 }
             }
             Ok(Some(Incoming::Request(req))) => {
-                match exchange::run(conn, &handle, req, client.clone(), tls.clone(), &shared).await
-                {
+                match exchange::run(conn, req, client.clone(), tls.clone(), &shared).await {
                     Some(c) => conn = c,
                     None => return,
                 }

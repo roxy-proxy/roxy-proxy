@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use crate::body::{counted, counted_until_sent};
 use crate::capture::{self, Tap};
 use crate::flowlog::{DecisionKind, FlowEvent};
-use crate::io::{ConnIo, Io};
+use crate::io::{ClientIo, Io};
 use crate::listener::ClientConn;
 use crate::pipeline::{
     BodyIo, FlowCx, Refusal, RefusalKind, ResponseVerdict, Verdict, request_steps, response_steps,
@@ -35,41 +35,15 @@ use crate::view::host_text;
 use crate::watch::{Dir, Watch, watched};
 
 /// The client connection after an exchange: `None` once it is closed.
-pub(crate) type Next = Option<ServerConn<ConnIo>>;
+pub(crate) type Next = Option<ServerConn<ClientIo>>;
 
-/// How the client asked to be treated (for `connection: close` injection).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ClientFraming {
-    /// The client sent `Connection: close` (the codec already closes).
-    pub close: bool,
-}
-
-/// Writes `res`. With `close`, the response carries `connection: close`
-/// and the connection is shut down
-/// gracefully afterwards. `extra` are additional raw header lines.
-pub(crate) async fn respond(
-    mut conn: ServerConn<ConnIo>,
-    handle: &ConnIo,
-    res: CanonicalResponse,
-    close: bool,
-    framing: ClientFraming,
-    extra: &[u8],
-) -> Next {
-    let mut lines = extra.to_vec();
-    if close && !framing.close {
-        lines.extend_from_slice(b"connection: close\r\n");
-    }
-    handle.inject_after_status_line(lines);
-    let r = conn.respond(res).await;
-    if let Err(e) = &r {
+/// Writes `res` (`res.meta.close` ends the connection after it).
+pub(crate) async fn respond(mut conn: ServerConn<ClientIo>, res: CanonicalResponse) -> Next {
+    if let Err(e) = conn.respond(res).await {
         tracing::debug!(error = %e, "writing response failed; closing");
-    }
-    if r.is_err() || conn.is_closed() {
         return None;
     }
-    if close {
-        drop(conn);
-        handle.close_gracefully().await;
+    if conn.is_closed() {
         return None;
     }
     Some(conn)
@@ -112,15 +86,9 @@ pub(crate) fn finish_refusal(cx: &mut FlowCx, refusal: &Refusal) {
 }
 
 /// Answers a flow locally and logs it.
-pub(crate) async fn refuse(
-    conn: ServerConn<ConnIo>,
-    handle: &ConnIo,
-    mut cx: FlowCx,
-    refusal: Refusal,
-    framing: ClientFraming,
-) -> Next {
+pub(crate) async fn refuse(conn: ServerConn<ClientIo>, mut cx: FlowCx, refusal: Refusal) -> Next {
     let res = refusal_response(&mut cx, &refusal);
-    let next = respond(conn, handle, res, refusal.close, framing, b"").await;
+    let next = respond(conn, res).await;
     finish_refusal(&mut cx, &refusal);
     next
 }
@@ -136,7 +104,7 @@ pub(crate) fn record_client_failure(cx: &mut FlowCx, e: &ParseError, status: Opt
 
 /// The client body broke: answer with the parse error's status and close.
 pub(crate) async fn close_on_parse_error(
-    conn: ServerConn<ConnIo>,
+    conn: ServerConn<ClientIo>,
     mut cx: Option<FlowCx>,
     client: &ClientConn,
     shared: &Shared,
@@ -169,7 +137,7 @@ pub(crate) trait Front: BodyIo {
         F::Output: Send;
 }
 
-impl Front for ServerConn<ConnIo> {
+impl Front for ServerConn<ClientIo> {
     fn drive<F>(
         &mut self,
         fut: F,
@@ -256,29 +224,25 @@ pub(crate) async fn core<F: Front>(
 
 /// Runs one exchange on the h1 codec.
 pub(crate) async fn run(
-    mut conn: ServerConn<ConnIo>,
-    handle: &ConnIo,
+    mut conn: ServerConn<ClientIo>,
     req: CanonicalRequest,
     client: ClientConn,
     tls: Option<crate::flowlog::TlsInfo>,
     shared: &Arc<Shared>,
 ) -> Next {
     let snap = shared.snapshot();
-    let framing = ClientFraming {
-        close: req.meta.close,
-    };
     let cx = FlowCx::new(shared.clone(), snap, client, tls, &req);
     let (cx, outcome) = process(&mut conn, cx, req).await;
     match outcome {
         Outcome::Respond(res) => send_response(conn, cx, res).await,
-        Outcome::Refuse(refusal) => refuse(conn, handle, cx, refusal, framing).await,
+        Outcome::Refuse(refusal) => refuse(conn, cx, refusal).await,
         Outcome::Close(e) => {
             let client = cx.facts.client.clone();
             close_on_parse_error(conn, Some(cx), &client, shared, &e).await;
             None
         }
         Outcome::Upgrade { res, upstream, key } => {
-            splice_websocket(conn, handle, cx, res, upstream, &key, framing).await
+            splice_websocket(conn, cx, res, upstream, &key).await
         }
     }
 }
@@ -607,7 +571,7 @@ fn set_host_override(cx: &FlowCx, req: &mut http::Request<Body>) {
 }
 
 async fn send_response(
-    mut conn: ServerConn<ConnIo>,
+    mut conn: ServerConn<ClientIo>,
     mut cx: FlowCx,
     mut res: CanonicalResponse,
 ) -> Next {
@@ -642,13 +606,11 @@ async fn send_response(
 }
 
 async fn splice_websocket(
-    conn: ServerConn<ConnIo>,
-    handle: &ConnIo,
+    conn: ServerConn<ClientIo>,
     mut cx: FlowCx,
     res: CanonicalResponse,
     upgraded: hyper::upgrade::Upgraded,
     key: &WsKey,
-    framing: ClientFraming,
 ) -> Next {
     let parse = cx.snap.policy.reads_ws();
     let checked = validate_upgrade_response(&res, key).and_then(|()| {
@@ -667,7 +629,7 @@ async fn splice_websocket(
             .unwrap_or_default();
         let port = cx.facts.request.as_ref().map_or(0, |r| r.port);
         let r = protocol_refusal(&cx, &host, port, e.to_string());
-        return refuse(conn, handle, cx, r, framing).await;
+        return refuse(conn, cx, r).await;
     }
     cx.record.response_status = Some(101);
     let (client_io, leftover) = match conn.respond_upgrade(res).await {
