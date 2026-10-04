@@ -292,6 +292,50 @@ async fn plaintext_in_connect_in_pieces_is_still_http() {
     assert_eq!(kit.upstream.wait_seen(1).await[0].addr.port(), 80);
 }
 
+/// Roxy's own time before it reads the request body (here a slow
+/// `set_state` at the head) does not count against the client's
+/// `body_idle_timeout` on h2.
+#[tokio::test(flavor = "multi_thread")]
+async fn h2_body_idle_timeout_runs_from_when_the_body_is_read() {
+    struct SlowState;
+    impl crate::sources::StateSource for SlowState {
+        fn get(&self, _key: &str) -> Option<String> {
+            None
+        }
+        fn set(
+            &self,
+            _key: &str,
+            _value: &str,
+            _ttl: Option<std::time::Duration>,
+        ) -> Result<(), crate::sources::StateFull> {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            Ok(())
+        }
+    }
+    let kit = Kit::builder()
+        .rules(
+            r#"
+- id: up
+  when: host == "up.test"
+  then: [{ set_state: { key: k, value: "1" } }, allow]
+"#,
+        )
+        .limits(|l| l.body_idle_timeout = std::time::Duration::from_millis(300))
+        .state(std::sync::Arc::new(SlowState))
+        .start()
+        .await;
+    let mut c = kit.tunnel("up.test", true).await;
+    let (mut tx, body) = streaming_body();
+    let req = c.request("POST", "/upload", &[]).body(body).unwrap();
+    let pending = c.start(req);
+    // The head is upstream: roxy is now reading the body.
+    kit.wait_arrived(1).await;
+    tx.send_data(Bytes::from_static(b"hello")).await.unwrap();
+    tx.finish().await.unwrap();
+    let a = pending.await.unwrap().expect("a response");
+    assert_eq!(a.status, 200, "{a:?}");
+}
+
 // ---- refusals and the h1 connection ---------------------------------------
 
 const OPEN_DENY_RULES: &str = r#"

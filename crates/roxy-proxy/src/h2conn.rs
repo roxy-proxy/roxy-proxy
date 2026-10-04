@@ -570,12 +570,17 @@ impl Front for H2Front {
 /// An `h2::RecvStream` as an `http_body::Body`: flow-control capacity is
 /// released as each DATA frame is handed on (so the client can only get as
 /// far ahead as the windows allow: backpressure), the stream must make
-/// progress within `body_idle_timeout`, and trailers are refused unless
-/// `http.allow_trailers` (then validated).
+/// progress within `body_idle_timeout` of the consumer waiting for it, and
+/// trailers are refused unless `http.allow_trailers` (then validated).
+///
+/// The idle deadline is armed when a poll finds nothing and cleared by the
+/// frame that ends the wait, so the time roxy itself spends before reading
+/// the body (the rules, a `100 Continue` the client waits for) does not
+/// count against the client.
 struct H2Body {
     rx: RecvStream,
     idle: Duration,
-    deadline: Pin<Box<Sleep>>,
+    deadline: Option<Pin<Box<Sleep>>>,
     limits: Arc<Limits>,
     flags: Arc<HttpFlags>,
     data_done: bool,
@@ -590,11 +595,10 @@ impl H2Body {
         flags: &Arc<HttpFlags>,
         fail: Arc<BodyFail>,
     ) -> Self {
-        let idle = limits.body_idle_timeout;
         Self {
             rx,
-            idle,
-            deadline: Box::pin(sleep(idle)),
+            idle: limits.body_idle_timeout,
+            deadline: None,
             limits: limits.clone(),
             flags: flags.clone(),
             data_done: false,
@@ -614,7 +618,10 @@ impl H2Body {
     }
 
     fn pending(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
-        if self.deadline.as_mut().poll(cx).is_ready() {
+        let deadline = self
+            .deadline
+            .get_or_insert_with(|| Box::pin(sleep(self.idle)));
+        if deadline.as_mut().poll(cx).is_ready() {
             let e = ParseError::new(Reason::BodyTimeout, "request body idle timeout");
             return self.failed(e, BodyError::Timeout);
         }
@@ -646,8 +653,7 @@ impl http_body::Body for H2Body {
                     // Release as the data moves on: the window refills only
                     // as fast as the consumer (the upstream) takes it.
                     let _ = this.rx.flow_control().release_capacity(d.len());
-                    let next = Instant::now() + this.idle;
-                    this.deadline.as_mut().reset(next);
+                    this.deadline = None;
                     return Poll::Ready(Some(Ok(Frame::data(d))));
                 }
                 Poll::Ready(Some(Err(e))) => {
