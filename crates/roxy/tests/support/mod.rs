@@ -193,25 +193,7 @@ async fn handle(req: Request<Incoming>, st: Arc<UpState>) -> Result<Response<Box
         // Answers without echoing anything back (endpoint tests).
         p if p.starts_with("/no-echo") => full(StatusCode::OK, "scored"),
         // `n` chunks, `ms` apart: a long-lived streamed response.
-        "/drip" => {
-            let q = parts.uri.query().unwrap_or("");
-            let arg = |k: &str| {
-                q.split('&')
-                    .find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='))
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(0)
-            };
-            let (n, ms) = (arg("n"), arg("ms"));
-            let chunks = futures_util::stream::unfold(0, move |i| async move {
-                if i == n {
-                    return None;
-                }
-                tokio::time::sleep(Duration::from_millis(ms)).await;
-                let frame = hyper::body::Frame::data(Bytes::from(format!("chunk{i};")));
-                Some((Ok::<_, Infallible>(frame), i + 1))
-            });
-            Response::new(BoxBody::new(http_body_util::StreamBody::new(chunks)))
-        }
+        "/drip" => drip(parts.uri.query().unwrap_or("")),
         "/big" => {
             let size: usize = parts
                 .uri
@@ -243,6 +225,27 @@ async fn handle(req: Request<Incoming>, st: Arc<UpState>) -> Result<Response<Box
             r
         }
     })
+}
+
+/// `n` chunks, `ms` apart, from a query `n=..&ms=..`.
+fn drip(query: &str) -> Response<BoxBody> {
+    let arg = |k: &str| {
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let (n, ms) = (arg("n"), arg("ms"));
+    let chunks = futures_util::stream::unfold(0, move |i| async move {
+        if i == n {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        let frame = hyper::body::Frame::data(Bytes::from(format!("chunk{i};")));
+        Some((Ok::<_, Infallible>(frame), i + 1))
+    });
+    Response::new(BoxBody::new(http_body_util::StreamBody::new(chunks)))
 }
 
 /// FNV-1a as computed by the upstream.
