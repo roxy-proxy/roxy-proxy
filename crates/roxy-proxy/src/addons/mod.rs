@@ -44,7 +44,7 @@ use crate::body::{Collected, collect_prefix};
 use crate::exchange::{Front, Outcome, refusal_response};
 use crate::flowlog::{DecisionKind, FlowEvent, FlowSink, TlsInfo};
 use crate::listener::ClientConn;
-use crate::pipeline::{BodyIo, CollectFuture, FlowCx, Refusal, RefusalKind};
+use crate::pipeline::{BodyIo, CollectFuture, Decider, FlowCx, Refusal, RefusalKind};
 use crate::server::{Shared, Snapshot};
 use crate::view::{FlowFacts, ProxyView};
 
@@ -541,7 +541,7 @@ fn layer_refusal(layer: &str) -> Refusal {
         kind: RefusalKind::Deny,
         status: 503,
         message: "request blocked: an addon failed".to_owned(),
-        rule: Some(format!("layer:{layer}")),
+        rule: Some(Decider::Layer(layer.to_owned())),
         close: true,
         reason: Some("layer_error".to_owned()),
     }
@@ -592,7 +592,7 @@ fn stack_outcome(
     };
     if let Some(i) = st.answered_by() {
         cx.record.decision = Some(DecisionKind::Answered);
-        cx.record.terminal_rule = Some(format!("layer:{}", st.snap.addons[i].name));
+        cx.record.terminal_rule = Some(Decider::Layer(st.snap.addons[i].name.clone()));
     }
     // A failure after the head cuts the body (the codec then breaks the
     // connection); log which layer failed once it is known.

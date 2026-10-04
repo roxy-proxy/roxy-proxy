@@ -50,13 +50,13 @@ use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use roxy_http::ws::frame::Message;
 use roxy_http::{Body, BodyError, CanonicalResponse};
-use roxy_rules::{Decision, Effect, EvalContext, Reads, WatchState};
+use roxy_rules::{Decision, Effect, EvalContext, Reads, RuleId, WatchState};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use ulid::Ulid;
 
 use crate::capture::Tap;
 use crate::flowlog::{DecisionKind, FlowEvent, FlowSink, Stage};
-use crate::pipeline::{Events, FlowCx, Refusal, fail_closed_code};
+use crate::pipeline::{Events, FlowCx, Refusal, fail_closed_code, rule_names};
 use crate::server::{Shared, Snapshot};
 use crate::sources::Sample;
 use crate::view::{FlowFacts, ProxyView, ResponseFacts, WsFacts};
@@ -71,7 +71,7 @@ pub(crate) struct Stopped {
 /// What the flow log needs from the watcher at the end of an exchange.
 #[derive(Debug, Default)]
 pub(crate) struct Summary {
-    pub rules: Vec<String>,
+    pub rules: Vec<RuleId>,
     pub tags: Vec<String>,
     pub mutations: Vec<String>,
     pub stop: Option<Stopped>,
@@ -126,7 +126,7 @@ struct Inner {
     /// Watched fields known so far.
     known: Reads,
     stopped: Option<Stopped>,
-    rules: Vec<String>,
+    rules: Vec<RuleId>,
     mutations: Vec<String>,
     /// WebSocket messages checked so far, for `ws_message` sampling.
     ws_messages: u64,
@@ -326,8 +326,11 @@ impl Watch {
         let sampled = every > 0 && (g.ws_messages - 1).is_multiple_of(every);
         if g.stopped.is_some() || sampled {
             let (decision, rules) = match &g.stopped {
-                Some(s) => (DecisionKind::Deny, s.refusal.rule.iter().cloned().collect()),
-                None => (DecisionKind::Allow, g.rules[before..].to_vec()),
+                Some(s) => (
+                    DecisionKind::Deny,
+                    s.refusal.rule.iter().map(ToString::to_string).collect(),
+                ),
+                None => (DecisionKind::Allow, rule_names(&g.rules[before..])),
             };
             g.shared.sink.emit(&FlowEvent::WsMessage {
                 ts: chrono::Utc::now(),
@@ -458,9 +461,8 @@ impl Inner {
             return Vec::new();
         };
         for r in &o.matched {
-            let r = r.to_string();
-            if !self.rules.contains(&r) {
-                self.rules.push(r);
+            if !self.rules.contains(r) {
+                self.rules.push(r.clone());
             }
         }
         let mut headers = Vec::new();
@@ -497,10 +499,10 @@ impl Inner {
                     } => {
                         let rule = o
                             .terminal_rule
-                            .as_ref()
-                            .map_or_else(|| "_fail_closed".to_owned(), ToString::to_string);
-                        tracing::info!(flow = %self.flow, rule, stage = stage.as_str(), "watching rule stopped the exchange");
-                        Refusal::deny(status, &message, &rule, close)
+                            .clone()
+                            .unwrap_or_else(|| RuleId::new(RuleId::FAIL_CLOSED));
+                        tracing::info!(flow = %self.flow, %rule, stage = stage.as_str(), "watching rule stopped the exchange");
+                        Refusal::deny(status, &message, rule, close)
                     }
                     Decision::Allow(_) | Decision::Passthrough => {
                         Refusal::fail_closed("unsupported_effect")

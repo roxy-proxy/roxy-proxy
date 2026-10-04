@@ -18,6 +18,7 @@ use roxy_http::ws::{
     WsKey, validate_no_extensions, validate_upgrade_request, validate_upgrade_response,
 };
 use roxy_http::{Body, CanonicalRequest, CanonicalResponse, Limits, ParseError};
+use roxy_rules::RuleId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
@@ -435,7 +436,12 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
             Err(e) => {
                 return Outcome::Refuse(Refusal {
                     reason: Some(e.reason.as_str().to_owned()),
-                    ..Refusal::deny(400, "invalid websocket upgrade", "_websocket", true)
+                    ..Refusal::deny(
+                        400,
+                        "invalid websocket upgrade",
+                        RuleId::new("_websocket"),
+                        true,
+                    )
                 });
             }
         };
