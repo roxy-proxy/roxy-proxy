@@ -144,14 +144,13 @@ pub struct CaServer {
 pub struct DnsListener {
     /// Served over UDP and TCP.
     pub bind: SocketAddr,
-    /// What every name resolves to: roxy's own address.
+    /// What every name resolves to: roxy's own address. Every name, so
+    /// every connection comes to roxy; roxy resolves the real address
+    /// itself, after the rules allow the request (docs/dns.md).
     pub answer: DnsAnswer,
     /// TTL of every answer.
     #[serde(default = "default_dns_ttl", with = "humantime_serde")]
     pub ttl: Duration,
-    /// Fixed answers by name, checked first.
-    #[serde(default)]
-    pub records: BTreeMap<String, Vec<IpAddr>>,
 }
 
 /// `dns.answer`.

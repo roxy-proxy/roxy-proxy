@@ -3,7 +3,6 @@
 //! (docs/http.md#direct-listeners) as if to the origin. Nothing is ever
 //! forwarded to another resolver. The wire format is `roxy-dns`.
 
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,8 +29,6 @@ pub struct DnsServerSpec {
     pub ipv6: Option<Ipv6Addr>,
     /// Seconds.
     pub ttl: u32,
-    /// Fixed answers by name (lower-case, no trailing dot), checked first.
-    pub records: HashMap<String, Vec<IpAddr>>,
     /// Log a `dns_query` event per answer (`log.flow.dns_events`).
     pub log_queries: bool,
 }
@@ -62,17 +59,11 @@ impl DnsServerSpec {
                 answers: Vec::new(),
             }),
             Parsed::Query(q) => {
-                let addrs = match self.records.get(&q.name) {
-                    Some(fixed) => fixed.clone(),
-                    None => self
-                        .ipv4
-                        .map(IpAddr::V4)
-                        .into_iter()
-                        .chain(self.ipv6.map(IpAddr::V6))
-                        .collect(),
-                };
-                let answers = addrs
+                let answers = self
+                    .ipv4
+                    .map(IpAddr::V4)
                     .into_iter()
+                    .chain(self.ipv6.map(IpAddr::V6))
                     .filter(|ip| match q.qtype {
                         TYPE_A => ip.is_ipv4(),
                         TYPE_AAAA => ip.is_ipv6(),
@@ -235,10 +226,6 @@ mod tests {
             ipv4: Some(Ipv4Addr::new(10, 0, 0, 2)),
             ipv6: None,
             ttl: 30,
-            records: HashMap::from([(
-                "db.internal".to_owned(),
-                vec!["10.0.0.9".parse().unwrap(), "fd00::9".parse().unwrap()],
-            )]),
             log_queries: false,
         }
     }
@@ -264,14 +251,6 @@ mod tests {
         let r = spec().reply(&query("example.com", TYPE_AAAA)).unwrap();
         assert_eq!(r.rcode, roxy_dns::Rcode::NoError);
         assert_eq!(r.answers, Vec::<IpAddr>::new());
-    }
-
-    #[test]
-    fn records_win_and_are_split_by_family() {
-        let r = spec().reply(&query("DB.internal", TYPE_A)).unwrap();
-        assert_eq!(r.answers, vec!["10.0.0.9".parse::<IpAddr>().unwrap()]);
-        let r = spec().reply(&query("db.internal", TYPE_AAAA)).unwrap();
-        assert_eq!(r.answers, vec!["fd00::9".parse::<IpAddr>().unwrap()]);
     }
 
     #[test]

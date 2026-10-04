@@ -252,11 +252,6 @@ fn dns_spec(dns: &crate::config::DnsListener, log_queries: bool) -> DnsServerSpe
         ipv6: dns.answer.ipv6,
         // Validation caps it at u32::MAX.
         ttl: u32::try_from(dns.ttl.as_secs()).unwrap_or(u32::MAX),
-        records: dns
-            .records
-            .iter()
-            .map(|(name, ips)| (name.trim_end_matches('.').to_ascii_lowercase(), ips.clone()))
-            .collect(),
         log_queries,
     }
 }

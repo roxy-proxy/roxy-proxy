@@ -9,10 +9,6 @@ use std::collections::{HashMap, HashSet};
 
 use super::{AddressListSource, CONFIG_VERSION, Config, ListenerMode, UpstreamVerify};
 
-/// Addresses per `dns.records` name: an answer of eight addresses of one
-/// family always fits in 512 bytes, whatever the name's length.
-const MAX_DNS_RECORD_ADDRS: usize = 8;
-
 /// One problem found in a config, located by a YAML path such as
 /// `rules[2].when`. Displays as `path: message`, or `path:line:col: message`
 /// for expression errors (see [`roxy_rules::Diagnostic`]).
@@ -140,25 +136,6 @@ impl Config {
         }
         if dns.ttl.as_secs() > u64::from(u32::MAX) {
             d.push(Diagnostic::new("dns.ttl", "must fit in 32 bits of seconds"));
-        }
-        for (name, addrs) in &dns.records {
-            let path = format!("dns.records.{name}");
-            let norm = name.trim_end_matches('.').to_ascii_lowercase();
-            if !matches!(
-                roxy_http::url::parse_host(norm.as_bytes()),
-                Ok(roxy_http::Host::Dns(_))
-            ) {
-                d.push(Diagnostic::new(
-                    path.clone(),
-                    "must be a DNS host name (A-labels)",
-                ));
-            }
-            if addrs.is_empty() || addrs.len() > MAX_DNS_RECORD_ADDRS {
-                d.push(Diagnostic::new(
-                    path,
-                    format!("must have 1 to {MAX_DNS_RECORD_ADDRS} addresses"),
-                ));
-            }
         }
     }
 

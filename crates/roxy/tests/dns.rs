@@ -20,8 +20,7 @@ async fn start() -> Harness {
     Harness::start_with(Opts {
         rules: RULES,
         listeners: "  - { name: direct, mode: direct, bind: 127.0.0.1:0, target_port: {HTTPS} }\n",
-        extra: "dns:\n  bind: 127.0.0.1:0\n  answer: { ipv4: 127.0.0.1 }\n  ttl: 30s\n  \
-                records:\n    db.sandbox.test: [10.0.0.9]\n",
+        extra: "dns:\n  bind: 127.0.0.1:0\n  answer: { ipv4: 127.0.0.1 }\n  ttl: 30s\n",
         flow_log: "dns_events: true",
         ..Opts::default()
     })
@@ -66,11 +65,9 @@ fn a_records(query: &[u8], answer: &[u8]) -> Vec<Ipv4Addr> {
 async fn dns_answers_over_udp_and_tcp() {
     let h = start().await;
     let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    for (name, want) in [
-        ("example.com", Ipv4Addr::LOCALHOST),
-        ("API.Example.org", Ipv4Addr::LOCALHOST),
-        ("db.sandbox.test", Ipv4Addr::new(10, 0, 0, 9)),
-    ] {
+    // Every name gets roxy's address, whether or not a rule would allow a
+    // request to it: the rules decide once the request arrives.
+    for name in ["example.com", "API.Example.org", "denied.test"] {
         let q = query(7, name, 1);
         udp.send_to(&q, dns_addr(&h)).await.unwrap();
         let mut buf = [0u8; 512];
@@ -78,7 +75,11 @@ async fn dns_answers_over_udp_and_tcp() {
             .await
             .expect("an answer")
             .unwrap();
-        assert_eq!(a_records(&q, &buf[..n]), vec![want], "{name}");
+        assert_eq!(
+            a_records(&q, &buf[..n]),
+            vec![Ipv4Addr::LOCALHOST],
+            "{name}"
+        );
     }
 
     // Over TCP: two queries on one connection.

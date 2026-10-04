@@ -36,8 +36,6 @@ dns:
     ipv4: 10.16.0.2        # roxy's address as the clients reach it
     ipv6: fd00:16::2       # optional
   ttl: 60s                 # default 60s
-  records:                 # fixed answers, checked first
-    db.sandbox.internal: [10.16.0.9]
 
 log:
   flow:
@@ -46,23 +44,25 @@ log:
 
 ## Answers
 
+Every name gets roxy's address, so every connection comes to roxy. The
+answer says nothing about whether a request will be allowed; that is
+decided when the request arrives, by the same rules as any other.
+
 - **`A`** gets `answer.ipv4`; **`AAAA`** gets `answer.ipv6`. Without the
   address of that family, the answer is empty (NOERROR with no records,
   NODATA), and the client uses the other family.
-- **A name in `records`** gets its fixed addresses instead, split by family
-  the same way. Use it for a service on the sandbox network that clients
-  should reach directly. At most 8 addresses per name.
 - **Every other type** gets NODATA. That includes `HTTPS` and `SVCB`, whose
   records carry ECH configurations and alternative endpoints that would
   take a client around roxy's view of the name.
 - Every answer has the TTL `ttl`.
 
-roxy never forwards a query to another resolver. A forwarding resolver
-would be a channel out of the sandbox (DNS tunnelling), and the client's
-lookups never need one: roxy resolves the real addresses itself, with its
-own resolver ([upstream DNS](upstream.md#dns)), when it connects. That
-resolver must not be roxy's own DNS listener, or every name would resolve
-to roxy.
+The real address is resolved internally. Once the rules allow a request,
+roxy resolves its host with its own resolver ([upstream DNS](upstream.md#dns))
+and checks every address against the [address floor](upstream.md#address-floor)
+before it connects. The client never sees that address, and roxy never
+forwards the client's queries anywhere: a forwarding resolver would be a
+channel out of the sandbox (DNS tunnelling). roxy's own resolver must not
+be its DNS listener, or every name would resolve to roxy.
 
 ## The wire format
 
