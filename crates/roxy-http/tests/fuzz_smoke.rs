@@ -1,5 +1,6 @@
 //! Stable-toolchain smoke version of the `fuzz/` targets: the same
-//! invariants, driven by proptest over an HTTP-flavoured byte alphabet.
+//! invariants, driven by proptest over an HTTP-flavoured byte alphabet (and,
+//! for the WebSocket decoder, frame-shaped bytes).
 
 use bytes::BytesMut;
 use proptest::prelude::*;
@@ -7,6 +8,7 @@ use roxy_http::h1::{ChunkedDecoder, Decoded, HeadScan, Role, parse_head, scan_he
 use roxy_http::url::{
     normalize_path, normalize_query, parse_absolute_form, parse_authority, parse_origin_form,
 };
+use roxy_http::ws::frame::{Decoder, FrameError, Message, Opcode, Peer, encode};
 use roxy_http::{HttpFlags, Limits, Scheme};
 
 const TOKENS: &[&str] = &[
@@ -165,5 +167,75 @@ proptest! {
         if let Ok(a) = parse_authority(&input, 443) {
             prop_assert_eq!(parse_authority(a.to_string().as_bytes(), 443).unwrap(), a);
         }
+    }
+}
+
+/// Frame-shaped bytes for the `ws_frame` target: frames with random
+/// headers (any FIN, opcode and mask bit, some RSV bits), short payloads,
+/// and an optional junk tail.
+fn ws_bytes() -> impl Strategy<Value = Vec<u8>> {
+    let frame = (
+        any::<u8>(),
+        any::<bool>(),
+        proptest::collection::vec(any::<u8>(), 0..200),
+    );
+    (
+        proptest::collection::vec(frame, 0..8),
+        proptest::collection::vec(any::<u8>(), 0..4),
+    )
+        .prop_map(|(frames, tail)| {
+            let mut out = Vec::new();
+            for (head, masked, payload) in frames {
+                let opcode = [0u8, 1, 2, 8, 9, 10, 3][usize::from(head % 7)];
+                let rsv = if head & 0xe0 == 0xe0 { 0x40 } else { 0 };
+                let mask = masked.then_some([head, 0x5a, 0x01, 0xff]);
+                let mut f = Vec::new();
+                encode(Opcode::Binary, &payload, mask, &mut f);
+                f[0] = (head & 0x80) | rsv | opcode;
+                out.extend(f);
+            }
+            out.extend(tail);
+            out
+        })
+}
+
+fn decode_ws(
+    from: Peer,
+    max: u64,
+    input: &[u8],
+    piece: usize,
+) -> (Vec<Message>, Option<FrameError>) {
+    let mut d = Decoder::new(from, max);
+    let mut out = Vec::new();
+    for mut chunk in input.chunks(piece) {
+        loop {
+            match d.decode(&mut chunk) {
+                Ok(Some(m)) => out.push(m),
+                Ok(None) => break,
+                Err(e) => return (out, Some(e)),
+            }
+        }
+    }
+    (out, None)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(3000))]
+
+    #[test]
+    fn ws_frames_split_independent_and_re_encodable(input in ws_bytes(), cfg in any::<u8>()) {
+        let from = if cfg & 1 == 0 { Peer::Client } else { Peer::Server };
+        let max = [16, 125, 4096, 1 << 20][usize::from((cfg >> 4) & 3)];
+        let whole = decode_ws(from, max, &input, input.len().max(1));
+        let pieces = decode_ws(from, max, &input, usize::from((cfg >> 1) & 7) + 1);
+        prop_assert_eq!(&whole, &pieces);
+        let mask = (from == Peer::Client).then_some([0xa5, 0x01, 0x7f, 0xc3]);
+        let mut again = Vec::new();
+        for m in &whole.0 {
+            encode(m.opcode, m.payload(), mask, &mut again);
+        }
+        let (round, err) = decode_ws(from, max, &again, again.len().max(1));
+        prop_assert_eq!(err, None);
+        prop_assert_eq!(round, whole.0);
     }
 }

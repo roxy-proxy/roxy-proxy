@@ -224,6 +224,7 @@ impl KitBuilder {
             max_connections: 1024,
             max_connections_per_client: 1024,
             connection_events: false,
+            ws_message_every: 0,
             sink: sink.clone(),
             capture: None,
             metrics: Arc::new(UnavailableMetrics),

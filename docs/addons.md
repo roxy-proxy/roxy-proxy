@@ -121,7 +121,7 @@ sits in it.
   forwarded body ([audit backpressure](flow-log.md#writing)).
 - WebSocket `tunnel` layers are chained between the client and the relay,
   outermost first. The relay stays the hop next to the upstream, so byte
-  budgets see what leaves.
+  budgets and [message rules](websockets.md#message-rules) see what leaves.
 - Layers compile at config load and are cached across reloads while their
   file and settings are unchanged, so their instance pools stay warm. A
   reload swaps the stack for new exchanges; exchanges in flight finish on

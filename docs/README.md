@@ -11,7 +11,7 @@ the overview and quickstart; outstanding work is tracked in
 | [HTTP](http.md) | The explicit proxy, CONNECT, proxy auth, HTTP/2, the canonical model, rejection rules, URL normalisation, upstream serialisation, responses, deny responses. |
 | [Rules](rules.md) | The config file, how rules are evaluated, the expression language and fields, actions, secrets, metrics and state, reload, the dry run. |
 | [Upstream](upstream.md) | DNS, the address floor, address lists, upstream TLS, upstream errors. |
-| [WebSockets](websockets.md) | Upgrades and the byte relay. |
+| [WebSockets](websockets.md) | Upgrades, the relay and message rules. |
 | [TLS and the CA](tls.md) | CA generation, leaf certificates, client-facing TLS, CA distribution, ClientHello sniffing. |
 | [Flow log and capture](flow-log.md) | Flow log events, redaction, the never-drop writer, rotation, traffic capture and its format. |
 | [Addons](addons.md) | The layer stack, modes, configuration, host services, the WIT package, sandboxing, writing addons. |

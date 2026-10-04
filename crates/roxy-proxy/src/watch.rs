@@ -15,7 +15,9 @@
 //!   ends the body with [`BodyError::Stopped`], so the h1 front end breaks
 //!   the connection without a terminating chunk and the h2 front end
 //!   resets the stream.
-//! - **WebSocket relay.** [`Watch::on_ws_chunk`] before each write.
+//! - **WebSocket relay.** [`Watch::on_ws_chunk`] before each write, and
+//!   [`Watch::on_ws_message`] before each message when rules read `ws.*`
+//!   (docs/websockets.md#message-rules).
 //!
 //! # Fail closed
 //!
@@ -47,17 +49,18 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use http_body::{Frame, SizeHint};
+use roxy_http::ws::frame::Message;
 use roxy_http::{Body, BodyError, CanonicalResponse};
 use roxy_rules::{Decision, Effect, EvalContext, Reads, WatchState};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use ulid::Ulid;
 
 use crate::capture::Tap;
-use crate::flowlog::{FlowSink, Stage};
+use crate::flowlog::{DecisionKind, FlowEvent, FlowSink, Stage};
 use crate::pipeline::{Events, FlowCx, Refusal, fail_closed_code};
 use crate::server::{Shared, Snapshot};
 use crate::sources::Sample;
-use crate::view::{FlowFacts, ProxyView, ResponseFacts};
+use crate::view::{FlowFacts, ProxyView, ResponseFacts, WsFacts};
 
 /// Why and where a watching rule stopped the exchange.
 #[derive(Debug, Clone)]
@@ -108,6 +111,8 @@ struct Inner {
     stopped: Option<Stopped>,
     rules: Vec<String>,
     mutations: Vec<String>,
+    /// WebSocket messages checked so far, for `ws_message` sampling.
+    ws_messages: u64,
 }
 
 impl std::fmt::Debug for Watch {
@@ -146,6 +151,7 @@ impl Watch {
                 stopped: None,
                 rules: Vec::new(),
                 mutations: Vec::new(),
+                ws_messages: 0,
             }),
         })
     }
@@ -269,8 +275,61 @@ impl Watch {
         self.publish(&g)
     }
 
+    /// One whole WebSocket message is about to be relayed
+    /// (docs/websockets.md#message-rules): the rules reading `ws.*` are
+    /// checked with it. The message is handed back; `Err` means it must not
+    /// be relayed.
+    pub(crate) fn on_ws_message(
+        &self,
+        dir: Dir,
+        message: Message,
+    ) -> (Message, Result<(), Stopped>) {
+        let mut g = self.lock();
+        if let Some(s) = &g.stopped {
+            return (message, Err(s.clone()));
+        }
+        let direction = match dir {
+            Dir::Request => "c2s",
+            Dir::Response => "s2c",
+        };
+        g.facts.ws = Some(WsFacts { direction, message });
+        g.known |= Reads::WS;
+        let before = g.rules.len();
+        let effects = g.evaluate(Reads::WS, Stage::Websocket);
+        if !effects.is_empty() && g.stopped.is_none() {
+            g.stop_with(Refusal::fail_closed("unsupported_effect"), Stage::Websocket);
+        }
+        // The values describe this message only: a later event (a byte
+        // metric growing) must not re-check rules against it.
+        g.known = g.known.minus(Reads::WS);
+        let Some(WsFacts { message, .. }) = g.facts.ws.take() else {
+            unreachable!("set above")
+        };
+        g.ws_messages += 1;
+        let every = g.shared.ws_message_every;
+        let sampled = every > 0 && (g.ws_messages - 1).is_multiple_of(every);
+        if g.stopped.is_some() || sampled {
+            let (decision, rules) = match &g.stopped {
+                Some(s) => (DecisionKind::Deny, s.refusal.rule.iter().cloned().collect()),
+                None => (DecisionKind::Allow, g.rules[before..].to_vec()),
+            };
+            g.shared.sink.emit(&FlowEvent::WsMessage {
+                ts: chrono::Utc::now(),
+                flow: g.flow.to_string(),
+                conn: g.conn.clone(),
+                direction: direction.to_owned(),
+                opcode: message.opcode.as_u8(),
+                size: message.len() as u64,
+                decision,
+                rules,
+            });
+        }
+        let r = self.publish(&g);
+        (message, r)
+    }
+
     /// One WebSocket relay chunk of `n` bytes is about to be written. Only
-    /// byte metrics change (`ws.*` message rules are not in this build).
+    /// byte metrics change.
     pub(crate) fn on_ws_chunk(&self, dir: Dir, n: u64) -> Result<(), Stopped> {
         let needed = match dir {
             Dir::Request => self.request_chunks,

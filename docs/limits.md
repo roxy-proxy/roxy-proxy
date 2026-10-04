@@ -21,6 +21,7 @@ connect produces a deny response or a closed socket.
 | config reload fails | keep the old policy |
 | connection cap | refuse the new connection |
 | flow log or capture behind, or its disk failing | hold traffic until it catches up; never drop records |
+| WebSocket message that breaks the protocol or is over `max_ws_message_bytes`, when rules read messages | close both sides with `1002`, `1007` or `1009` ([WebSockets](websockets.md#message-rules)) |
 
 ## Limits
 
@@ -46,6 +47,7 @@ limits:
   # buffering
   max_inspect_body_bytes: 1mb     # body.text / response.body.text, and addons' default
   max_capture_body_bytes: 16mb    # per direction per exchange
+  max_ws_message_bytes: 16mb      # a reassembled WebSocket message, when rules read ws.*
 
   # connections
   max_connections: 10000
@@ -59,7 +61,9 @@ limits:
 ```
 
 Addons have their own budgets ([addons](addons.md#configuration)).
-`max_ws_message_bytes` is accepted and currently has no effect.
+`max_ws_message_bytes` applies only when rules read WebSocket messages
+([WebSockets](websockets.md#message-rules)); a message over it closes both
+sides with `1009`.
 
 ## Connections
 

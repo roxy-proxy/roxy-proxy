@@ -79,6 +79,8 @@ pub struct TestRequest {
     /// `response.body.bytes` (watching rules).
     pub response_body_bytes: Option<u64>,
     pub response_headers: Vec<(String, String)>,
+    /// A WebSocket message (`ws.*`); with it, rules reading `ws.*` run.
+    pub ws: Option<WsMessage>,
     /// `--metric id=N` (`Some(N)`) or `--metric id=unavailable` (`None`).
     /// Defined metrics not listed here evaluate as 0, a fresh series.
     pub metrics: Vec<(String, Option<i64>)>,
@@ -166,11 +168,77 @@ impl TestRequest {
             response_status: None,
             response_body_bytes: None,
             response_headers: Vec::new(),
+            ws: None,
             metrics: Vec::new(),
             state: Vec::new(),
             tags: Vec::new(),
         }
     }
+}
+
+/// A dry-run WebSocket message (docs/websockets.md#message-rules).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WsMessage {
+    /// `c2s` or `s2c`.
+    pub direction: String,
+    pub opcode: u8,
+    pub size: u64,
+    /// `ws.text`: set for a text message only.
+    pub text: Option<String>,
+}
+
+/// The message described by `--ws-direction`, `--ws-opcode`, `--ws-text`
+/// and `--ws-size`; `None` when none is given. A text message (opcode 1,
+/// the default with `--ws-text`) takes its size from its text; any other
+/// message has no text and is binary (2) by default.
+pub fn ws_message(
+    direction: Option<&str>,
+    opcode: Option<u8>,
+    text: Option<&str>,
+    size: Option<u64>,
+) -> Result<Option<WsMessage>, String> {
+    if direction.is_none() && opcode.is_none() && text.is_none() && size.is_none() {
+        return Ok(None);
+    }
+    let direction = match direction.unwrap_or("c2s") {
+        d @ ("c2s" | "s2c") => d.to_owned(),
+        d => return Err(format!("--ws-direction {d:?}: expected `c2s` or `s2c`")),
+    };
+    let opcode = opcode.unwrap_or(if text.is_some() { 1 } else { 2 });
+    if ![1, 2, 8, 9, 10].contains(&opcode) {
+        return Err(format!(
+            "--ws-opcode {opcode}: expected 1 (text), 2 (binary), 8 (close), 9 (ping) or 10 (pong)"
+        ));
+    }
+    if opcode == 1 {
+        if size.is_some() {
+            return Err("--ws-size: a text message's size is the length of --ws-text".into());
+        }
+        let text = text.unwrap_or("").to_owned();
+        return Ok(Some(WsMessage {
+            direction,
+            opcode,
+            size: text.len() as u64,
+            text: Some(text),
+        }));
+    }
+    if text.is_some() {
+        return Err(format!(
+            "--ws-text needs a text message (--ws-opcode 1), not {opcode}"
+        ));
+    }
+    let size = size.unwrap_or(0);
+    if opcode >= 8 && size > 125 {
+        return Err(format!(
+            "--ws-size {size}: a control message is at most 125 bytes"
+        ));
+    }
+    Ok(Some(WsMessage {
+        direction,
+        opcode,
+        size,
+        text: None,
+    }))
 }
 
 /// The parts of an absolute URL that rules see.
@@ -359,6 +427,15 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(DryRunView, Vec
     for (n, val) in &req.response_headers {
         v = v.with_response_header(n, val);
     }
+    if let Some(m) = &req.ws {
+        v = v
+            .with_str(Field::WsDirection, &m.direction)
+            .with_int(Field::WsOpcode, i64::from(m.opcode))
+            .with_int(Field::WsSize, int(m.size));
+        if let Some(t) = &m.text {
+            v = v.with_str(Field::WsText, t);
+        }
+    }
     // Unavailable metrics are simply not inserted: MapView then returns
     // `None`, which the engine treats as fail-closed.
     for (id, value) in metric_values(config, req) {
@@ -443,6 +520,9 @@ pub fn known(req: &TestRequest) -> Reads {
     }
     if req.response_body_bytes.is_some() {
         k |= Reads::RESPONSE_BODY_BYTES;
+    }
+    if req.ws.is_some() {
+        k |= Reads::WS;
     }
     k
 }
@@ -650,5 +730,56 @@ mod tests {
         assert!(parse_header("nocolon").is_err());
         assert_eq!(parse_pair("a=1").unwrap(), ("a".into(), "1".into()));
         assert!(parse_pair("=1").is_err());
+    }
+
+    #[test]
+    fn ws_messages() {
+        assert_eq!(ws_message(None, None, None, None), Ok(None));
+        let m = ws_message(None, None, Some("héllo"), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (m.direction.as_str(), m.opcode, m.size, m.text.as_deref()),
+            ("c2s", 1, 6, Some("héllo"))
+        );
+        let m = ws_message(Some("s2c"), None, None, Some(4096))
+            .unwrap()
+            .unwrap();
+        assert_eq!((m.opcode, m.size, m.text), (2, 4096, None));
+        let m = ws_message(None, Some(9), None, None).unwrap().unwrap();
+        assert_eq!((m.opcode, m.size), (9, 0));
+        for bad in [
+            ws_message(Some("up"), None, None, None),
+            ws_message(None, Some(3), None, None),
+            ws_message(None, Some(2), Some("x"), None),
+            ws_message(None, None, Some("x"), Some(1)),
+            ws_message(None, Some(9), None, Some(126)),
+        ] {
+            assert!(bad.is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn ws_rules_run_with_a_message() {
+        let config = Config::from_yaml(
+            "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:3128 }]\nrules:\n  \
+             - { id: ws, when: 'host == \"ws.test\"', then: { allow: { upgrade: websocket } } }\n  \
+             - { id: no-secrets, when: 'ws.opcode == 1 and ws.text contains \"secret\"', then: deny }\n",
+        )
+        .unwrap();
+        let policy = config.compile_policy().unwrap();
+        let dry = |ws| {
+            let mut req = TestRequest::new("GET", "https://ws.test/");
+            req.ws = ws;
+            let (view, _) = build_view(&config, &req).unwrap();
+            run(&policy, &view, &[], known(&req))
+        };
+        assert!(dry(None).decision().is_allow());
+        let hello = ws_message(None, None, Some("hello"), None).unwrap();
+        assert!(dry(hello).decision().is_allow());
+        let secret = ws_message(None, None, Some("my secret"), None).unwrap();
+        let r = dry(secret);
+        assert!(r.decision().is_deny());
+        assert_eq!(r.terminal_rule().as_str(), "no-secrets");
     }
 }
