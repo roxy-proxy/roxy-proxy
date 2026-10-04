@@ -763,6 +763,43 @@ mod tests {
         );
     }
 
+    /// A tracked path is hit by an event on it, on the file it resolves
+    /// to, or on nothing it names at all when what it resolves to has
+    /// changed: a ConfigMap-style swap renames `..data`, never the file.
+    #[test]
+    fn watch_targets_follow_symlink_swaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (generation, text) in [("..v1", "a"), ("..v2", "b")] {
+            std::fs::create_dir(root.join(generation)).unwrap();
+            std::fs::write(root.join(generation).join("roxy.yaml"), text).unwrap();
+        }
+        std::os::unix::fs::symlink("..v1", root.join("..data")).unwrap();
+        std::os::unix::fs::symlink("..data/roxy.yaml", root.join("roxy.yaml")).unwrap();
+        let config = root.join("roxy.yaml");
+        let mut t = Targets::new([config.clone()]);
+        let v1 = root.canonicalize().unwrap().join("..v1").join("roxy.yaml");
+        assert_eq!(t.files[&config], Some(v1.clone()));
+        assert!(t.dirs().contains(v1.parent().unwrap()));
+
+        assert!(!t.hit(&[root.join("other.yaml")]));
+        assert!(t.hit(std::slice::from_ref(&config)), "the path itself");
+        assert!(t.hit(&[v1]), "the file it resolves to");
+
+        // The swap: a new generation, `..data` repointed, `roxy.yaml` untouched.
+        std::fs::remove_file(root.join("..data")).unwrap();
+        std::os::unix::fs::symlink("..v2", root.join("..data")).unwrap();
+        assert!(t.hit(&[root.join("..data")]), "resolves elsewhere now");
+        assert!(!t.hit(&[root.join("..data")]), "and is then up to date");
+
+        // A missing file is tracked too, and its appearance is a hit.
+        let list = root.join("list.txt");
+        let mut t = Targets::new([list.clone()]);
+        assert_eq!(t.files[&list], None);
+        std::fs::write(&list, "10.0.0.0/8\n").unwrap();
+        assert!(t.hit(&[root.join("unrelated")]));
+    }
+
     /// Every setting the server reads once, at start, is kept on reload;
     /// a change to any of them is named.
     #[test]

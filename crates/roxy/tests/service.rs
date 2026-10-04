@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use support::{Harness, Opts, fnv};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -35,7 +35,6 @@ const WINDOW: u64 = 256 * 1024;
 /// cut).
 const OBSERVE_CREDIT: u64 = 16 * 1024 * 1024;
 
-#[derive(Default)]
 struct SvcState {
     /// The handshake headers of every connection.
     connections: Mutex<Vec<Vec<(String, String)>>>,
@@ -47,9 +46,24 @@ struct SvcState {
     closed: Mutex<Vec<usize>>,
     /// `/echo` streams that saw the whole exchange through.
     echoed: Mutex<Vec<u64>>,
-    /// Lets `/mixed` streams that wait for it go on.
-    release: Notify,
+    /// Lets `/mixed` streams that wait for it go on, whether they are
+    /// already waiting or get there later.
+    release: watch::Sender<bool>,
     changed: Notify,
+}
+
+impl Default for SvcState {
+    fn default() -> Self {
+        Self {
+            connections: Mutex::default(),
+            opens: Mutex::default(),
+            resets: Mutex::default(),
+            closed: Mutex::default(),
+            echoed: Mutex::default(),
+            release: watch::Sender::new(false),
+            changed: Notify::new(),
+        }
+    }
 }
 
 impl SvcState {
@@ -59,6 +73,11 @@ impl SvcState {
 
     fn opens(&self) -> Vec<Value> {
         self.opens.lock().unwrap().clone()
+    }
+
+    /// Lets every `/hold…` stream, waiting or to come, go on.
+    fn release(&self) {
+        self.release.send_replace(true);
     }
 
     async fn until(&self, what: &str, f: impl Fn(&Self) -> bool) {
@@ -311,7 +330,8 @@ async fn mixed(mut s: Sess) {
         .map_or("", |i| &after_scheme[i..])
         .to_owned();
     if path.starts_with("/hold") {
-        s.st.release.notified().await;
+        let mut released = s.st.release.subscribe();
+        released.wait_for(|r| *r).await.unwrap();
     }
     if path.starts_with("/bad") {
         s.send(json!({"type": "request", "method": "GET",
@@ -899,10 +919,7 @@ async fn the_pool_grows_to_its_cap_then_waits() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(st.opens().len(), 4);
     assert_eq!(st.connections().len(), 2);
-    for _ in 0..20 {
-        st.release.notify_waiters();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    st.release();
     for r in reqs {
         assert_eq!(r.await.unwrap(), 200);
     }
@@ -970,7 +987,7 @@ async fn one_streams_failure_leaves_the_others() {
         .await;
     assert_eq!(st.resets.lock().unwrap()[0].1, 2);
 
-    st.release.notify_waiters();
+    st.release();
     let res = held.await.unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(json_of(&res.bytes().await.unwrap())["path"], "/hold-good");
@@ -1011,12 +1028,13 @@ async fn losing_the_connection_fails_its_exchanges() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_that_gives_up_resets_its_stream() {
     let (h, st) = start("/mixed", "", ALLOW_UPSTREAM).await;
-    let impatient = h
-        .client_builder()
-        .timeout(Duration::from_millis(300))
-        .build()
-        .unwrap();
-    assert!(impatient.get(h.https_url("/hang")).send().await.is_err());
+    let c = h.client();
+    let url = h.https_url("/hang");
+    let gives_up = tokio::spawn(async move { c.get(url).send().await });
+    st.until("the hanging stream", |s| s.opens().len() == 1)
+        .await;
+    gives_up.abort();
+    assert!(gives_up.await.unwrap_err().is_cancelled());
     st.until("a reset", |s| !s.resets.lock().unwrap().is_empty())
         .await;
     let res = h.client().get(h.https_url("/after")).send().await.unwrap();
@@ -1056,9 +1074,15 @@ async fn bytes_past_the_credit_fail_the_stream() {
     let (h, st) = start("/mixed", "", ALLOW_UPSTREAM).await;
     // Cut either before the head reaches the client or after it: never
     // delivered as complete.
-    if let Ok(res) = h.client().get(h.https_url("/overrun")).send().await {
-        assert_eq!(res.status(), 200);
-        assert!(res.bytes().await.is_err(), "the body must not end cleanly");
+    match h.client().get(h.https_url("/overrun")).send().await {
+        Ok(res) => {
+            assert_eq!(res.status(), 200);
+            assert!(res.bytes().await.is_err(), "the body must not end cleanly");
+        }
+        Err(e) => assert!(
+            !e.is_timeout() && !e.is_connect(),
+            "the exchange itself must fail, not reaching roxy: {e}"
+        ),
     }
     let ev = h.wait_events("layer_error", 1).await;
     assert_eq!(ev[0]["kind"], "service:protocol", "{}", ev[0]);
@@ -1147,7 +1171,7 @@ async fn a_rotated_secret_reaches_new_streams_and_old_connections_drain() {
     // The old connection is still carrying the held exchange.
     assert!(st.closed.lock().unwrap().is_empty());
 
-    st.release.notify_waiters();
+    st.release();
     let res = held.await.unwrap();
     assert_eq!(res.status(), 200);
     assert_eq!(json_of(&res.bytes().await.unwrap())["path"], "/hold-old");
