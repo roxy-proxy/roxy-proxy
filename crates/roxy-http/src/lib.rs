@@ -1,6 +1,6 @@
 //! Canonical HTTP model and strict codecs for roxy.
 //!
-//! Responsibilities (see docs/architecture.md and docs/http.md): the canonical request/response
+//! Responsibilities: the canonical request/response
 //! model, the strict HTTP/1.1 server-side codec, the HTTP/2 ↔ canonical
 //! mapping, URL normalisation, body framing with size caps, hyper interop for
 //! the upstream side, and the WebSocket handshake check and frame codec.
@@ -12,8 +12,8 @@
 //! Modules:
 //! - [`model`]: `CanonicalRequest`, `CanonicalResponse`, `Headers`, `Body`,
 //!   `Limits`, `HttpFlags`, `ParseError` / `Reason`.
-//! - [`url`]: the URL normaliser (docs/http.md#url-normalisation).
-//! - [`coding`]: bounded content-coding decoders (docs/http.md#content-codings).
+//! - [`url`]: the URL normaliser.
+//! - [`coding`]: bounded content-coding decoders.
 //! - [`h1`]: client-facing HTTP/1.1 server codec (`ServerConn`).
 //! - [`h2map`]: h2 request parts ↔ canonical model.
 //! - [`upstream`]: canonical ↔ hyper client types.

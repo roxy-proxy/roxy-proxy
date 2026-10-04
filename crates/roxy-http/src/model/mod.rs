@@ -1,4 +1,4 @@
-//! Canonical HTTP model (docs/http.md#canonical-request, docs/http.md#responses).
+//! Canonical HTTP model.
 
 mod authority;
 mod body;

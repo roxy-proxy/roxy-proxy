@@ -1,4 +1,4 @@
-//! Buffered, single-writer log destinations for roxy (docs/flow-log.md#writing): the flow log today, body capture and traffic teeing later.
+//! Buffered, single-writer log destinations for roxy: the flow log today, body capture and traffic teeing later.
 //!
 //! # Guarantees
 //!

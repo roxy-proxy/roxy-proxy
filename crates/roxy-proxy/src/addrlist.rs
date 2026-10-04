@@ -1,4 +1,4 @@
-//! Address lists (docs/upstream.md#address-lists): large, named sets of CIDR ranges used
+//! Address lists: large, named sets of CIDR ranges used
 //! as an unconditional upstream denylist (`upstream.deny_lists`) and as
 //! `ip in @name` literals in rules.
 //!

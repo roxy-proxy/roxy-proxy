@@ -1,5 +1,4 @@
-//! WebSocket frame codec (RFC 6455 §5) for message rules
-//! (docs/websockets.md#message-rules).
+//! WebSocket frame codec (RFC 6455 §5) for message rules.
 //!
 //! [`Decoder`] is sans-IO and resumable: feed it bytes as they arrive and it
 //! yields whole messages. A data message is reassembled from its fragments;

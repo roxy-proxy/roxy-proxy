@@ -1,4 +1,4 @@
-//! The upstream address floor (docs/upstream.md#address-floor): every resolved candidate is
+//! The upstream address floor: every resolved candidate is
 //! checked before roxy connects, so DNS rebinding and IP-literal tricks
 //! cannot reach private destinations.
 
@@ -20,7 +20,7 @@ pub struct AddressPolicy {
     /// Exceptions to the private-range floor (not to `deny_cidrs` or
     /// `deny_lists`), for internal services every flow may reach.
     pub allow_cidrs: Vec<IpNet>,
-    /// `upstream.deny_lists`, resolved (docs/upstream.md#address-lists). Never valid destinations;
+    /// `upstream.deny_lists`, resolved. Never valid destinations;
     /// neither `private_ok` nor `allow_cidrs` opts out.
     pub deny_lists: Vec<Arc<AddressList>>,
 }

@@ -1,6 +1,6 @@
 [package]
 name = "roxy-wasm"
-description = "WASM layer host for roxy addons (docs/addons.md)"
+description = "WASM layer host for roxy addons"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

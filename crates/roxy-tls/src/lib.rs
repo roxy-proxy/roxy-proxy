@@ -1,4 +1,4 @@
-//! TLS for roxy (docs/tls.md).
+//! TLS for roxy.
 //!
 //! * [`Ca`]: the certificate authority (generation, persistence, strict reload).
 //! * [`LeafMinter`]: on-demand leaf certificates signed by the CA, cached.

@@ -1,6 +1,5 @@
-//! WebSocket handshake checks (docs/websockets.md#relay) and, in [`frame`],
-//! the frame codec used when rules read messages
-//! (docs/websockets.md#message-rules).
+//! WebSocket handshake checks and, in [`frame`],
+//! the frame codec used when rules read messages.
 
 pub mod frame;
 
