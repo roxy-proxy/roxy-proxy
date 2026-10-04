@@ -317,6 +317,8 @@ pub(crate) struct StackFlow {
     pub(crate) close: AtomicBool,
     /// The upgraded upstream connection, when the core relayed a `101`.
     upgrade: Mutex<Option<(hyper::upgrade::Upgraded, WsKey)>>,
+    /// The first layer to run has decoded the request for the layers.
+    request_decoded: AtomicBool,
 }
 
 impl StackFlow {
@@ -343,6 +345,7 @@ impl StackFlow {
             reported: AtomicBool::new(false),
             close: AtomicBool::new(false),
             upgrade: Mutex::new(None),
+            request_decoded: AtomicBool::new(false),
         }
     }
 
@@ -401,6 +404,19 @@ impl StackFlow {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Some layer ran on the flow (its `when` and `sample` let it).
+    fn any_ran(&self) -> bool {
+        self.layers.iter().any(|l| l.ran.load(Ordering::SeqCst))
+    }
+
+    /// A `tunnel` layer ran on the upgrade request, so it will join the
+    /// WebSocket.
+    fn tunnel_ran(&self) -> bool {
+        tunnel_layers(&self.snap.addons)
+            .into_iter()
+            .any(|i| self.layers[i].ran.load(Ordering::SeqCst))
     }
 
     pub(crate) fn add_tag(&self, tag: String) {
@@ -552,12 +568,8 @@ fn layer_refusal(layer: &str) -> Refusal {
 pub(crate) async fn run<F: Front>(
     front: &mut F,
     cx: FlowCx,
-    mut req: CanonicalRequest,
+    req: CanonicalRequest,
 ) -> (FlowCx, Outcome) {
-    if cx.snap.flags.decode_for_addons {
-        let limit = cx.snap.limits.max_request_body_bytes;
-        decode_for_layers(&mut req.headers, &mut req.body, limit);
-    }
     let st = Arc::new(StackFlow::new(&cx, &req));
     st.park(cx);
     let driven = front
@@ -645,6 +657,12 @@ pub(crate) fn enter(
         };
         st.layers[index].ran.store(true, Ordering::SeqCst);
         st.layers[index].set(NextState::Entered);
+        let mut req = req;
+        // Layers see bodies decoded; a flow no layer runs on is left as
+        // the client sent it.
+        if st.snap.flags.decode_for_addons && !st.request_decoded.swap(true, Ordering::SeqCst) {
+            decode_layer_request(&mut req, st.snap.limits.max_request_body_bytes);
+        }
         if addon.observe {
             return tee::observe(st, index, req).await;
         }
@@ -818,6 +836,7 @@ async fn core(
         return Err(HostError::new("the flow already reached the core"));
     };
     let cx = lease.cx();
+    cx.tunnel_ran = st.tunnel_ran();
     cx.facts.request = Some(crate::pipeline::request_facts(&creq));
     st.set_facts(&cx.facts);
     let mut front = Detached;
@@ -837,8 +856,10 @@ async fn core(
     st.set_facts(&cx.facts);
     match outcome {
         Outcome::Respond(mut res) => {
-            // A range of an encoded body is not decodable on its own.
+            // A range of an encoded body is not decodable on its own. A
+            // flow no layer ran on gets the response as the origin sent it.
             if snap.flags.decode_for_addons
+                && st.any_ran()
                 && res.status != http::StatusCode::PARTIAL_CONTENT
                 && !res.headers.contains("content-range")
             {
@@ -868,6 +889,17 @@ async fn core(
             Ok(to_layer_response(res))
         }
     }
+}
+
+/// [`decode_for_layers`] on a request on its way into a layer.
+fn decode_layer_request(req: &mut LayerRequest, limit: u64) {
+    let mut headers = Headers::from_header_map_lenient(req.headers());
+    let mut body = std::mem::take(req.body_mut());
+    decode_for_layers(&mut headers, &mut body, limit);
+    if !headers.contains("content-encoding") {
+        req.headers_mut().remove(http::header::CONTENT_ENCODING);
+    }
+    *req.body_mut() = body;
 }
 
 /// Decodes a body by its `content-encoding` for the layers,
@@ -928,11 +960,10 @@ fn tunnel_layers(addons: &[Arc<AddonSpec>]) -> Vec<usize> {
 }
 
 /// Whether a WebSocket must be relayed with no extension negotiated, so
-/// every message stays readable: message rules check them, or `tunnel`
-/// layers get them decoded.
-pub(crate) fn ws_without_extensions(snap: &Snapshot) -> bool {
-    snap.policy.reads_ws()
-        || (snap.flags.decode_for_addons && !tunnel_layers(&snap.addons).is_empty())
+/// every message stays readable: message rules check them, or a `tunnel`
+/// layer that ran on the upgrade request gets them decoded.
+pub(crate) fn ws_without_extensions(snap: &Snapshot, tunnel_ran: bool) -> bool {
+    snap.policy.reads_ws() || (snap.flags.decode_for_addons && tunnel_ran)
 }
 
 /// Inserts the stack's `tunnel` layers (outermost first) between the client

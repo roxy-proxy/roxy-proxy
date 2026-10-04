@@ -434,7 +434,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
                 });
             }
         };
-        if crate::addons::ws_without_extensions(&cx.snap) {
+        if crate::addons::ws_without_extensions(&cx.snap, cx.tunnel_ran) {
             // Messages are read, by the rules or by `tunnel` layers, so no
             // extension (permessage-deflate above all) may be negotiated.
             req.headers.remove("sec-websocket-extensions");
@@ -653,7 +653,7 @@ async fn splice_websocket(
 ) -> Next {
     let parse = cx.snap.policy.reads_ws();
     let checked = validate_upgrade_response(&res, key).and_then(|()| {
-        if crate::addons::ws_without_extensions(&cx.snap) {
+        if crate::addons::ws_without_extensions(&cx.snap, cx.tunnel_ran) {
             validate_no_extensions(&res)
         } else {
             Ok(())
