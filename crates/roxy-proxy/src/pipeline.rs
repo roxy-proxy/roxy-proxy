@@ -257,11 +257,97 @@ pub(crate) struct FlowRecord {
     pub addons: Vec<String>,
 }
 
-/// Per-flow state shared by the steps.
-pub(crate) struct FlowCx {
+/// What identifies a flow and the world it runs in. Shared, read-only,
+/// by everything that logs or evaluates for the flow: the flow context
+/// and the watcher.
+pub(crate) struct FlowMeta {
     pub shared: Arc<Shared>,
     pub snap: Arc<Snapshot>,
     pub flow: Ulid,
+    pub client: ClientConn,
+    pub tls: Option<TlsInfo>,
+}
+
+impl FlowMeta {
+    pub(crate) fn conn_id(&self) -> String {
+        self.client.id.to_string()
+    }
+
+    pub(crate) fn input_unavailable(
+        &self,
+        stage: Stage,
+        code: &str,
+        reason: &FailClosedReason,
+        metric_err: Option<&MetricSourceError>,
+    ) {
+        let ts = chrono::Utc::now();
+        if let Some(e @ MetricSourceError::TableFull(_)) = metric_err {
+            self.shared.sink.emit(&FlowEvent::MetricTableFull {
+                ts,
+                flow: self.flow.to_string(),
+                conn: self.conn_id(),
+                stage,
+                detail: e.to_string(),
+            });
+        }
+        tracing::warn!(flow = %self.flow, stage = stage.as_str(), code, %reason, "policy input unavailable; failing closed");
+        self.shared.sink.emit(&FlowEvent::PolicyInputUnavailable {
+            ts,
+            flow: self.flow.to_string(),
+            conn: self.conn_id(),
+            stage,
+            reason: format!(
+                "{code}: {}",
+                self.snap.redactor.redact_str(&reason.to_string())
+            ),
+        });
+    }
+
+    pub(crate) fn metric_error(&self, stage: Stage, e: &MetricSourceError) {
+        tracing::warn!(flow = %self.flow, stage = stage.as_str(), error = %e, "metric recording failed; failing closed");
+        let ts = chrono::Utc::now();
+        if matches!(e, MetricSourceError::TableFull(_)) {
+            self.shared.sink.emit(&FlowEvent::MetricTableFull {
+                ts,
+                flow: self.flow.to_string(),
+                conn: self.conn_id(),
+                stage,
+                detail: e.to_string(),
+            });
+        } else {
+            self.shared.sink.emit(&FlowEvent::PolicyInputUnavailable {
+                ts,
+                flow: self.flow.to_string(),
+                conn: self.conn_id(),
+                stage,
+                reason: format!("{}: {e}", e.code()),
+            });
+        }
+    }
+
+    pub(crate) fn rule_log(&self, stage: Stage, level: LogLevel, message: &str) {
+        let message = self.snap.redactor.redact_str(message).into_owned();
+        match level {
+            LogLevel::Trace => tracing::trace!(flow = %self.flow, %message, "rule log"),
+            LogLevel::Debug => tracing::debug!(flow = %self.flow, %message, "rule log"),
+            LogLevel::Info => tracing::info!(flow = %self.flow, %message, "rule log"),
+            LogLevel::Warn => tracing::warn!(flow = %self.flow, %message, "rule log"),
+            LogLevel::Error => tracing::error!(flow = %self.flow, %message, "rule log"),
+        }
+        self.shared.sink.emit(&FlowEvent::Log {
+            ts: chrono::Utc::now(),
+            flow: self.flow.to_string(),
+            conn: self.conn_id(),
+            stage,
+            level: level.as_str().to_owned(),
+            message,
+        });
+    }
+}
+
+/// Per-flow state shared by the steps. Derefs to its [`FlowMeta`].
+pub(crate) struct FlowCx {
+    pub meta: Arc<FlowMeta>,
     pub facts: FlowFacts,
     pub opts: AllowOpts,
     pub record: FlowRecord,
@@ -289,6 +375,14 @@ pub(crate) struct FlowCx {
     /// `aborted`, so an exchange cut off by its connection ending or the
     /// server stopping is never missing from the log.
     logged: bool,
+}
+
+impl std::ops::Deref for FlowCx {
+    type Target = FlowMeta;
+
+    fn deref(&self) -> &FlowMeta {
+        &self.meta
+    }
 }
 
 impl Drop for FlowCx {
@@ -351,20 +445,25 @@ impl FlowCx {
         tls: Option<TlsInfo>,
         req: &CanonicalRequest,
     ) -> Self {
+        let facts = FlowFacts {
+            client: client.clone(),
+            tls: tls.clone(),
+            client_request: Some(request_facts(req)),
+            request: Some(request_facts(req)),
+            response: None,
+            request_body_bytes: None,
+            response_body_bytes: None,
+            ws: None,
+        };
         Self {
-            shared,
-            snap,
-            flow: Ulid::generate(),
-            facts: FlowFacts {
+            meta: Arc::new(FlowMeta {
+                shared,
+                snap,
+                flow: Ulid::generate(),
                 client,
                 tls,
-                client_request: Some(request_facts(req)),
-                request: Some(request_facts(req)),
-                response: None,
-                request_body_bytes: None,
-                response_body_bytes: None,
-                ws: None,
-            },
+            }),
+            facts,
             opts: AllowOpts::default(),
             record: FlowRecord::default(),
             started: Instant::now(),
@@ -377,10 +476,6 @@ impl FlowCx {
             layer_ran: false,
             logged: false,
         }
-    }
-
-    pub(crate) fn conn_id(&self) -> String {
-        self.facts.client.id.to_string()
     }
 
     fn note_outcome(&mut self, out: &Outcome) {
@@ -399,16 +494,6 @@ impl FlowCx {
             && !self.record.rules.contains(&out.terminal_rule.to_string())
         {
             self.record.rules.push(out.terminal_rule.to_string());
-        }
-    }
-
-    /// The event helpers for this flow.
-    pub(crate) fn events(&self) -> Events<'_> {
-        Events {
-            shared: &self.shared,
-            snap: &self.snap,
-            flow: self.flow,
-            conn: self.conn_id(),
         }
     }
 
@@ -437,7 +522,7 @@ impl FlowCx {
         let mut refusal = None;
         if let Some(reason) = &out.fail_closed_reason {
             let code = fail_closed_code(reason, metric_err.as_ref());
-            self.events()
+            self.meta
                 .input_unavailable(Stage::Head, code, reason, metric_err.as_ref());
             refusal = Some(Refusal::fail_closed(code));
         } else {
@@ -519,9 +604,9 @@ impl FlowCx {
             ts: chrono::Utc::now(),
             flow: self.flow.to_string(),
             conn: self.conn_id(),
-            listener: self.facts.client.listener.name.clone(),
-            client: client_info(&self.facts.client),
-            tls: self.facts.tls.clone(),
+            listener: self.meta.client.listener.name.clone(),
+            client: client_info(&self.meta.client),
+            tls: self.meta.tls.clone(),
             req,
             res,
             decision: self.record.decision.unwrap_or(DecisionKind::Deny),
@@ -581,7 +666,7 @@ impl FlowCx {
             // the missing key fails closed at its decision.
             drop(view);
             let stage = self.record.stage.unwrap_or(Stage::ResponseBody);
-            self.events().metric_error(stage, &e);
+            self.meta.metric_error(stage, &e);
         }
     }
 
@@ -644,87 +729,6 @@ pub(crate) fn emit_connect_event(
         },
         rules: Vec::new(),
     });
-}
-
-/// Event helpers shared by the head decision and the watcher.
-pub(crate) struct Events<'a> {
-    pub shared: &'a Shared,
-    pub snap: &'a Snapshot,
-    pub flow: Ulid,
-    pub conn: String,
-}
-
-impl Events<'_> {
-    pub(crate) fn input_unavailable(
-        &self,
-        stage: Stage,
-        code: &str,
-        reason: &FailClosedReason,
-        metric_err: Option<&MetricSourceError>,
-    ) {
-        let ts = chrono::Utc::now();
-        if let Some(e @ MetricSourceError::TableFull(_)) = metric_err {
-            self.shared.sink.emit(&FlowEvent::MetricTableFull {
-                ts,
-                flow: self.flow.to_string(),
-                conn: self.conn.clone(),
-                stage,
-                detail: e.to_string(),
-            });
-        }
-        tracing::warn!(flow = %self.flow, stage = stage.as_str(), code, %reason, "policy input unavailable; failing closed");
-        self.shared.sink.emit(&FlowEvent::PolicyInputUnavailable {
-            ts,
-            flow: self.flow.to_string(),
-            conn: self.conn.clone(),
-            stage,
-            reason: format!(
-                "{code}: {}",
-                self.snap.redactor.redact_str(&reason.to_string())
-            ),
-        });
-    }
-
-    pub(crate) fn metric_error(&self, stage: Stage, e: &MetricSourceError) {
-        tracing::warn!(flow = %self.flow, stage = stage.as_str(), error = %e, "metric recording failed; failing closed");
-        let ts = chrono::Utc::now();
-        if matches!(e, MetricSourceError::TableFull(_)) {
-            self.shared.sink.emit(&FlowEvent::MetricTableFull {
-                ts,
-                flow: self.flow.to_string(),
-                conn: self.conn.clone(),
-                stage,
-                detail: e.to_string(),
-            });
-        } else {
-            self.shared.sink.emit(&FlowEvent::PolicyInputUnavailable {
-                ts,
-                flow: self.flow.to_string(),
-                conn: self.conn.clone(),
-                stage,
-                reason: format!("{}: {e}", e.code()),
-            });
-        }
-    }
-
-    pub(crate) fn rule_log(&self, stage: Stage, level: LogLevel, message: &str) {
-        let message = self.snap.redactor.redact_str(message).into_owned();
-        match level {
-            LogLevel::Trace => tracing::trace!(flow = %self.flow, %message, "rule log"),
-            LogLevel::Debug => tracing::debug!(flow = %self.flow, %message, "rule log"),
-            LogLevel::Info => tracing::info!(flow = %self.flow, %message, "rule log"),
-            LogLevel::Warn => tracing::warn!(flow = %self.flow, %message, "rule log"),
-            LogLevel::Error => tracing::error!(flow = %self.flow, %message, "rule log"),
-        }
-        self.shared.sink.emit(&FlowEvent::Log {
-            ts: chrono::Utc::now(),
-            flow: self.flow.to_string(),
-            conn: self.conn.clone(),
-            stage,
-            level: level.as_str().to_owned(),
-            message,
-        });
-    }
 }
 
 pub(crate) fn fail_closed_code(
@@ -817,7 +821,7 @@ fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
     if let Err(e) = cx.record_head_sample(refusal.is_some())
         && refusal.is_none()
     {
-        cx.events().metric_error(Stage::Head, &e);
+        cx.meta.metric_error(Stage::Head, &e);
         refusal = Some(Refusal::fail_closed(e.code()));
     }
     cx.record.terminal_rule = match &refusal {
@@ -963,7 +967,7 @@ fn apply_request_effect(
                 .mutations
                 .push(format!("redirect:{}://{}", req.scheme, req.authority));
         }
-        Effect::Log { level, message } => cx.events().rule_log(Stage::Head, level, &message),
+        Effect::Log { level, message } => cx.meta.rule_log(Stage::Head, level, &message),
         Effect::SetState { key, value, ttl } => {
             cx.shared
                 .state
