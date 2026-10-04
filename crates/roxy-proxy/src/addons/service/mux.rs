@@ -38,6 +38,7 @@ use super::{First, In, Out, ServiceError, ServiceSpec};
 use crate::addr::PrivateAddrs;
 use crate::flowlog::FlowEvent;
 use crate::upstream::MaybeTls;
+use crate::watch::Dir;
 
 /// The WebSocket subprotocol a service must accept.
 pub const SUBPROTOCOL: &str = "roxy.layer.v2";
@@ -224,7 +225,7 @@ impl LinkShared {
             s.open.drain().map(|(_, st)| st).collect()
         };
         for s in streams {
-            s.fail(e.clone(), false);
+            s.fail(e.clone(), Reset::Skip);
         }
         let _ = self.ctl.send(Message::Close(None));
     }
@@ -291,8 +292,16 @@ impl StreamState {
 /// A body being fed from the stream.
 struct Feeding {
     inbox: Arc<Inbox>,
-    /// It is the request's (else the response's).
-    request: bool,
+    /// Whose body it is.
+    dir: Dir,
+}
+
+/// Whether failing a stream tells the service (a `reset` message).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reset {
+    Send,
+    /// The connection is gone, or the service already ended the stream.
+    Skip,
 }
 
 /// Bytes for one body, between the reader and that body's feeder. At most
@@ -340,11 +349,11 @@ impl Stream {
     /// The service failed this stream: whoever is waiting learns of it (a
     /// pending answer, or the body being fed, which is cut; the failure is
     /// logged here when the head has gone on).
-    fn fail(&self, e: ServiceError, reset: bool) {
+    fn fail(&self, e: ServiceError, reset: Reset) {
         if !self.end() {
             return;
         }
-        if reset {
+        if reset == Reset::Send {
             self.link.shared.send_ctl(
                 self.id,
                 &Out::Reset {
@@ -520,14 +529,14 @@ impl Stream {
             drop(s);
             return self.fail(
                 ServiceError::Protocol("body bytes before a head".into()),
-                true,
+                Reset::Send,
             );
         };
         if s.unacked + n > WINDOW {
             drop(s);
             return self.fail(
                 ServiceError::Protocol("body bytes past the stream's credit".into()),
-                true,
+                Reset::Send,
             );
         }
         s.unacked += n;
@@ -559,7 +568,7 @@ impl Stream {
                     || "the service reset the stream".to_owned(),
                     |m| format!("the service reset the stream: {m}"),
                 );
-                return self.fail(ServiceError::Closed(why), false);
+                return self.fail(ServiceError::Closed(why), Reset::Skip);
             }
             // An observer's answers are ignored.
             _ if self.mode == AddonMode::Observe => return,
@@ -570,7 +579,7 @@ impl Stream {
         let done = !s.waiting();
         drop(s);
         match result {
-            Err(e) => self.fail(e, true),
+            Err(e) => self.fail(e, Reset::Send),
             Ok(()) if done => {
                 self.end();
             }
@@ -583,14 +592,18 @@ impl Stream {
         let limits = &self.st.snap.limits;
         match m {
             In::RequestEnd | In::ResponseEnd => {
-                let request = matches!(m, In::RequestEnd);
+                let dir = if matches!(m, In::RequestEnd) {
+                    Dir::Request
+                } else {
+                    Dir::Response
+                };
                 match s.feeding.take() {
-                    Some(f) if f.request == request => {
+                    Some(f) if f.dir == dir => {
                         lock(&f.inbox.q).end = true;
                         f.inbox.ready.notify_one();
                         Ok(())
                     }
-                    _ if request => Err(unexpected("request_end")),
+                    _ if dir == Dir::Request => Err(unexpected("request_end")),
                     _ => Err(unexpected("response_end")),
                 }
             }
@@ -619,7 +632,7 @@ impl Stream {
                 *r.method_mut() = method;
                 *r.uri_mut() = uri;
                 *r.headers_mut() = headers;
-                s.feeding = Some(self.feed(body_tx, true));
+                s.feeding = Some(self.feed(body_tx, Dir::Request));
                 if let Some(tx) = s.first.take() {
                     let _ = tx.send(Ok(First::Forward(r)));
                 }
@@ -642,7 +655,7 @@ impl Stream {
                 *r.status_mut() = status;
                 *r.headers_mut() = headers;
                 Self::give(s, r, "response")?;
-                s.feeding = Some(self.feed(body_tx, false));
+                s.feeding = Some(self.feed(body_tx, Dir::Response));
                 Ok(())
             }
             In::Deny { status, message } => {
@@ -673,16 +686,16 @@ impl Stream {
     }
 
     /// Starts feeding a body from the stream.
-    fn feed(self: &Arc<Self>, tx: BodySender, request: bool) -> Feeding {
+    fn feed(self: &Arc<Self>, tx: BodySender, dir: Dir) -> Feeding {
         let inbox = Arc::new(Inbox::default());
-        tokio::spawn(feeder(self.clone(), inbox.clone(), tx, request));
-        Feeding { inbox, request }
+        tokio::spawn(feeder(self.clone(), inbox.clone(), tx, dir));
+        Feeding { inbox, dir }
     }
 }
 
 /// Moves one body's bytes from its inbox to its consumer, crediting the
 /// service as they go.
-async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodySender, request: bool) {
+async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodySender, dir: Dir) {
     loop {
         let (chunk, end, abort) = {
             let mut q = lock(&inbox.q);
@@ -701,7 +714,7 @@ async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodySender, requ
             match sent {
                 Ok(()) => stream.grant(n),
                 Err(BodyError::Closed | BodyError::Stopped) => {
-                    if request {
+                    if dir == Dir::Request {
                         // A deny below, say: the rest is read and dropped,
                         // and the service still owes the response.
                         let rest = {
@@ -716,7 +729,7 @@ async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodySender, requ
                     return;
                 }
                 // More than declared, or than the limit.
-                Err(e) => return stream.fail(ServiceError::Protocol(e.to_string()), true),
+                Err(e) => return stream.fail(ServiceError::Protocol(e.to_string()), Reset::Send),
             }
             continue;
         }
@@ -724,7 +737,7 @@ async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodySender, requ
             match tx.finish().await {
                 Ok(()) | Err(BodyError::Closed | BodyError::Stopped) => {}
                 // Shorter than declared.
-                Err(e) => stream.fail(ServiceError::Protocol(e.to_string()), true),
+                Err(e) => stream.fail(ServiceError::Protocol(e.to_string()), Reset::Send),
             }
             return;
         }
@@ -1006,7 +1019,10 @@ async fn read(shared: Arc<LinkShared>, mut ws: SplitStream<Ws>) {
                         match serde_json::from_value::<In>(serde_json::Value::Object(v)) {
                             Ok(m) => s.control(m),
                             Err(e) => {
-                                s.fail(ServiceError::Protocol(format!("bad message: {e}")), true);
+                                s.fail(
+                                    ServiceError::Protocol(format!("bad message: {e}")),
+                                    Reset::Send,
+                                );
                             }
                         }
                     }
