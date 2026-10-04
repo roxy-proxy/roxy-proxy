@@ -1,6 +1,6 @@
-//! The DNS listener (docs/dns.md): answers every name with roxy's own
+//! The DNS listener: answers every name with roxy's own
 //! address, so clients connect to the direct listeners
-//! (docs/http.md#direct-listeners) as if to the origin. Nothing is ever
+//! as if to the origin. Nothing is ever
 //! forwarded to another resolver. The wire format is `roxy-dns`.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

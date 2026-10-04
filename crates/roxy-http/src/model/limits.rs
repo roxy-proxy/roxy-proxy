@@ -6,7 +6,7 @@ const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
 const GIB: u64 = 1024 * MIB;
 
-/// Mirrors the `limits.*` config block (docs/limits.md#limits) with the same
+/// Mirrors the `limits.*` config block with the same
 /// defaults. The binary builds this from config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {

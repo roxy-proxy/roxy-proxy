@@ -1,0 +1,71 @@
+---
+title: "Overview"
+description: "roxy is a strict, programmable HTTP firewall and egress proxy for code you don't fully trust. Default deny, credentials held at the boundary, every decision logged."
+---
+
+# Overview
+
+roxy is an HTTP firewall and egress proxy for workloads you don't fully trust. Clients use it as an explicit `HTTP_PROXY`, or reach it through its own DNS if they ignore proxy settings ([DNS steering](/deploy/dns-steering)). It decides what each request may reach, holds the credentials the workload needs so the workload never sees them, and logs every decision as a line of JSON.
+
+It is strict by design. roxy terminates TLS with certificates from its own CA, parses each request into one canonical form, and sends that form upstream. Ambiguous input is rejected, not guessed at. Request smuggling and header injection don't reach the upstream, and what the rules matched is exactly what is forwarded.
+
+The policy is one YAML file. Rules are a list of allows plus the denies that restrict them. A matching deny always wins, and anything no rule allows is denied. Rules can read the request head, and they can keep watching the bodies and the response as they stream. Metrics give you rate limits and byte budgets.
+
+Logic that needs to understand the traffic goes in an addon: a WASM component that runs in process, or an external service that the traffic streams through. Addons can rewrite, withhold, answer or block. Whatever an addon passes on is judged by the rules again.
+
+It fails closed. If roxy can't parse, verify or classify something, it denies it. A broken config is not loaded, a failing addon denies the flow, and a missing metric or secret denies rather than allows.
+
+## Try it
+
+If you want a demo, run the [quickstart](/quickstart). It's a Docker Compose setup with a client whose only route out is through roxy. It shows an allow, a default deny, a deny rule and a streaming upload cap, in about a minute.
+
+If you want to deploy it, read [deployment](/deploy/overview). It covers containing a workload, the hardened container image and running without Docker.
+
+If you want to see a real policy before you commit, read the [use cases](#use-cases) below.
+
+## Use cases
+
+- [AI agents](/use-cases/ai-agents): allow the model APIs and source hosts an agent needs, inject provider keys at the boundary, cap uploads and rate-limit writes.
+- [CI jobs](/use-cases/ci): read-only access to the registries a build needs, no route anywhere else, a log of every fetch.
+
+## A policy
+
+```yaml
+default: deny
+
+secrets:
+  openai: { env: OPENAI_API_KEY }
+
+rules:
+  - id: github-reads
+    when: host under "github.com" and method in [GET, HEAD]
+    then: allow
+
+  - id: openai
+    when: host == "api.openai.com" and path starts_with "/v1/" and method == POST
+    then:
+      - set_header: { authorization: "Bearer ${secret:openai}" }   # the client never sees the key
+      - allow
+
+  - id: upload-cap                         # watches the body as it streams
+    when: host == "api.openai.com" and body.bytes > 10mb
+    then: { deny: { status: 413 } }
+```
+
+You can try a policy without sending traffic:
+
+```sh
+roxy rule test --config roxy.yaml POST https://api.openai.com/v1/responses
+```
+
+The full language is in [rules](/reference/rule-language).
+
+## What roxy is not
+
+roxy is not a transparent gateway. It decides what passes through it, and it can't stop traffic that never reaches it. To contain a workload, the network has to give it no route out except through roxy. The [quickstart](/quickstart) does this with Docker networks, and [deployment](/deploy/overview) gives the recipe for other setups.
+
+roxy speaks HTTP/1.1, HTTP/2 and WebSockets to clients. Raw TCP doesn't pass. The [principles](/principles) page sets out the threat model: what roxy prevents and what it doesn't try to prevent.
+
+## Open source
+
+roxy is [open source](https://github.com/roxy-proxy/roxy-proxy), written in Rust, and dual-licensed under Apache 2.0 and MIT. Outstanding work is tracked in [issues](https://github.com/roxy-proxy/roxy-proxy/issues).

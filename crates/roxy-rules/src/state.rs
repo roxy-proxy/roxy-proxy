@@ -1,6 +1,6 @@
-//! The bounded TTL key/value state store (docs/rules.md#state): `state["k"]`
+//! The bounded TTL key/value state store: `state["k"]`
 //! in rules and the `set_state` action. Each addon's `flow.state-get` /
-//! `flow.state-put` store is one of these too (docs/addons.md#state).
+//! `flow.state-put` store is one of these too.
 //!
 //! Bounded by `max_entries` with **no eviction**: overwriting an existing key
 //! (live or expired-but-not-yet-purged) always succeeds; a new key when the

@@ -1,4 +1,4 @@
-//! Secret resolution (docs/rules.md#secrets, docs/flow-log.md#redaction).
+//! Secret resolution.
 //!
 //! Secrets are resolved once, at `roxy run`. `roxy check` never reads them.
 //! A missing environment variable or unreadable file is a fatal startup

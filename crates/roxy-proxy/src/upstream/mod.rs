@@ -1,4 +1,4 @@
-//! The upstream connector (docs/upstream.md): resolve → address floor →
+//! The upstream connector: resolve → address floor →
 //! connect → TLS, behind hyper-util's pooled client.
 //!
 //! # Pooling and the address floor
@@ -105,7 +105,7 @@ pub enum ConnectError {
 }
 
 impl ConnectError {
-    /// Stable flow-log reason code (docs/upstream.md#errors).
+    /// Stable flow-log reason code.
     pub fn reason(&self) -> &'static str {
         match self {
             Self::Dns(_) => "dns_failed",
@@ -303,7 +303,7 @@ impl tower_service::Service<Uri> for Connector {
     }
 
     // Entry point for every pooled upstream connection. Anything else that
-    // dials out (addon endpoint calls, docs/addons.md#endpoints) must also
+    // dials out (addon endpoint calls) must also
     // pass the address floor (`Upstream::preflight` or this connector), so
     // that `upstream.deny_lists` and the private-range floor apply to it
     // too: nothing opts out of a deny list.

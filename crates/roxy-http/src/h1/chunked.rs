@@ -1,5 +1,5 @@
-//! Strict chunked transfer-coding decoder (RFC 9112 §7.1 with the
-//! restrictions in docs/http.md#body). Pure state machine over a `BytesMut` (fuzz target).
+//! Strict chunked transfer-coding decoder (RFC 9112 §7.1 with roxy's
+//! restrictions). Pure state machine over a `BytesMut` (fuzz target).
 
 use bytes::{Buf, Bytes, BytesMut};
 use http::{HeaderMap, HeaderName};

@@ -1,0 +1,21 @@
+{
+  "name": "roxy-docs",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "postinstall": "node scripts/patch-vocs.mjs",
+    "dev": "ROXY_DOCS_BASE= vocs dev --port 4000",
+    "build": "vocs build",
+    "check-links": "node scripts/check-links.mjs",
+    "preview": "vocs preview"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "vocs": "1.4.1"
+  },
+  "devDependencies": {
+    "github-slugger": "^2.0.0"
+  }
+}

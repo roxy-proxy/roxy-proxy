@@ -1,5 +1,5 @@
 //! The compiled, immutable [`Policy`]: rule classification (head vs
-//! watching), the head decision, and watching evaluation (docs/rules.md#evaluation).
+//! watching), the head decision, and watching evaluation.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -38,7 +38,7 @@ pub struct PolicyInput<'a> {
     pub default: DefaultDecision,
 }
 
-/// A compiled metric definition (docs/rules.md#metrics). Counting is the proxy's job; this
+/// A compiled metric definition. Counting is the proxy's job; this
 /// carries the shape and the compiled `where` filter, which reads head
 /// fields only, so whether an exchange counts (and its series key) is
 /// fixed at the request head.
@@ -80,7 +80,7 @@ enum CAction {
     Terminal(Decision),
 }
 
-/// When a rule runs (docs/rules.md#evaluation).
+/// When a rule runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleKind {
     /// Reads only head values: decided at the request head.
@@ -159,7 +159,7 @@ pub struct Policy {
 const SECRET_OPEN: &str = "${secret:";
 
 /// Headers rules may not set or remove: framing and hop-by-hop headers are
-/// owned by roxy's canonicaliser (docs/http.md#rejection-rules, docs/http.md#upstream-serialisation), and `host` changes go
+/// owned by roxy's canonicaliser, and `host` changes go
 /// through `redirect: { rewrite_host: true }`.
 const RESERVED_HEADERS: &[&str] = &[
     "host",
@@ -174,7 +174,7 @@ const RESERVED_HEADERS: &[&str] = &[
     "upgrade",
 ];
 
-/// Valid header value bytes (docs/http.md#rejection-rules): visible ASCII, SP, HTAB.
+/// Valid header value bytes: visible ASCII, SP, HTAB.
 pub(crate) fn is_header_value(s: &str) -> bool {
     s.bytes().all(|b| b == b'\t' || (b' '..=b'~').contains(&b))
 }
@@ -244,7 +244,7 @@ impl Policy {
         })
     }
 
-    /// The head decision (docs/rules.md#evaluation): the forwarding decision at the request
+    /// The head decision: the forwarding decision at the request
     /// head.
     ///
     /// Every rule that takes part in it ([`RuleKind::at_head`]) is
@@ -265,7 +265,7 @@ impl Policy {
     /// allowed; when it is denied only `log` and `set_state` remain (tags
     /// are in [`Outcome::tags`]).
     ///
-    /// Fail closed (docs/rules.md#evaluation): if evaluating *any* head rule reaches a metric
+    /// Fail closed: if evaluating *any* head rule reaches a metric
     /// the view reports unavailable, an address list it cannot answer for,
     /// a missing value under an operator that cannot answer for `null`, an
     /// uninspectable body, or a `set_header` secret that cannot be resolved,
@@ -376,7 +376,7 @@ impl Policy {
         self.watch_triggers.intersects(changed)
     }
 
-    /// Re-check the watching rules after a value changed (docs/rules.md#evaluation).
+    /// Re-check the watching rules after a value changed.
     ///
     /// `changed` is what just became known or changed (e.g.
     /// [`Reads::BODY_BYTES`] for a request body chunk, plus
@@ -514,7 +514,7 @@ impl Policy {
     }
 
     /// Whether any rule reads `ws.*`: the proxy then decodes and checks
-    /// every WebSocket message (docs/websockets.md#message-rules).
+    /// every WebSocket message.
     pub fn reads_ws(&self) -> bool {
         self.rules.iter().any(|r| r.fields.intersects(Reads::WS))
     }
@@ -673,7 +673,7 @@ impl PolicyCompiler<'_, '_> {
                             at,
                             format!(
                                 "`{f}` is known only after forwarding; metric {what} fields must \
-                                 be head fields (docs/rules.md#metrics)"
+                                 be head fields (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)"
                             ),
                         );
                         None
@@ -711,7 +711,7 @@ impl PolicyCompiler<'_, '_> {
                         format!(
                             "a metric's `where` may only read head fields, because whether an \
                              exchange counts is decided at the request head; it reads {} \
-                             (docs/rules.md#metrics)",
+                             (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)",
                             needs
                                 .watched
                                 .iter()
@@ -1151,7 +1151,7 @@ impl PolicyCompiler<'_, '_> {
     }
 }
 
-/// What the action-legality checks need to know about a rule (docs/rules.md#actions).
+/// What the action-legality checks need to know about a rule.
 struct RuleCx<'a> {
     kind: RuleKind,
     /// Watched fields the rule reads.
@@ -1186,7 +1186,7 @@ impl RuleCx<'_> {
         let why = || {
             format!(
                 "this rule reads {}, which is known only after the request was forwarded \
-                 (docs/rules.md#evaluation)",
+                 (https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation)",
                 self.watched()
             )
         };

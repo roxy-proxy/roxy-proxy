@@ -38,7 +38,7 @@ Either way:
   could land inside a half-relayed frame. With message rules, both sides get
   a `1008` close frame first.
 - Each chunk waits for the flow log like any forwarded body
-  ([audit backpressure](flow-log.md#writing)), and capture records both
+  ([audit backpressure](/operate/flow-log#writing)), and capture records both
   directions as relayed.
 - A relayed WebSocket closes after `limits.idle_timeout` (300 s) with no
   traffic either way.
@@ -46,7 +46,7 @@ Either way:
   counts. When roxy ended the WebSocket with a close frame, `ws_close` has
   `close_code` and `close_reason`.
 - Addons that export `tunnel` are chained between the client and the relay
-  ([addons](addons.md#layer-stack)), so message rules see what the layers
+  ([addons](/addons/overview)), so message rules see what the layers
   pass on.
 
 ## Extensions
@@ -61,7 +61,7 @@ without extensions, so this costs only compression. roxy does this when:
 - a rule reads `ws.*` ([message rules](#message-rules)); or
 - the addon stack has a `tunnel` layer and `http.decode_for_addons` is on
   (the default), so the layer gets readable messages
-  ([addons](addons.md#content-codings)).
+  ([addons](/addons/overview#content-codings)).
 
 Otherwise the client's offer and the upstream's answer pass through
 untouched.
@@ -69,7 +69,7 @@ untouched.
 ## Message rules
 
 Rules that read `ws.direction`, `ws.opcode`, `ws.size` or `ws.text` are
-watching rules ([evaluation](rules.md#evaluation)), checked on every
+watching rules ([evaluation](/policies/overview)), checked on every
 message after the `101`:
 
 ```yaml

@@ -1,4 +1,4 @@
-//! End-to-end tests of DNS steering (docs/dns.md): `roxy run` with a DNS
+//! End-to-end tests of DNS steering: `roxy run` with a DNS
 //! listener and a direct listener, queried and used by real clients.
 
 mod support;

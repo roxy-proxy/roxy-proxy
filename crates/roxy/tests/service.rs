@@ -1,4 +1,4 @@
-//! End-to-end tests of service layers (docs/addons.md#service-layers): `roxy run` with a
+//! End-to-end tests of service layers: `roxy run` with a
 //! `kind: service` addon whose exchanges stream through an in-test service
 //! over a WebSocket (`roxy.layer.v1`). The service's behaviour is picked by
 //! its URL path.

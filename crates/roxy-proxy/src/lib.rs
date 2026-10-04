@@ -1,4 +1,4 @@
-//! roxy's proxy engine (docs/architecture.md): listeners, the connection state
+//! roxy's proxy engine: listeners, the connection state
 //! machine, the exchange core, the upstream connector (DNS, SSRF policy,
 //! pool), the WebSocket relay and flow-log emission.
 //!

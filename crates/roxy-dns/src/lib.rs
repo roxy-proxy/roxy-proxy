@@ -1,4 +1,4 @@
-//! The DNS wire codec behind roxy's DNS listener (docs/dns.md).
+//! The DNS wire codec behind roxy's DNS listener.
 //!
 //! Pure functions over bytes, no I/O, so it can be fuzzed directly. The
 //! listener needs very little of DNS: it reads one question and answers it
