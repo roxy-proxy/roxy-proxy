@@ -485,3 +485,54 @@ async fn a_layer_its_when_skips_stays_out_of_the_websocket() {
     let ev = kit.request_event().await;
     assert!(strs(&ev["addons"]).is_empty(), "{ev:#}");
 }
+
+/// Service layers: the in-test service (`testkit::upstream::service`)
+/// behind a `kind: service` addon.
+mod service {
+    use std::time::Duration;
+
+    use bytes::Bytes;
+
+    use super::{RULES, strs};
+    use crate::addons::service::testing::{addon, kit};
+    use crate::testkit::{Answer, streaming_body};
+
+    /// The response head waits for `request_end`, and so does its clock:
+    /// an upstream that answers while the client is still uploading, for
+    /// longer than `first_byte_timeout`, still completes.
+    #[tokio::test]
+    async fn an_early_response_waits_for_the_upload_without_timing_out() {
+        let kit = kit(
+            RULES,
+            vec![addon("s", "pass", false, |s| {
+                s.first_byte_timeout = Duration::from_millis(400);
+            })],
+        )
+        .await;
+        let mut c = kit.h1().await;
+        let (mut tx, body) = streaming_body();
+        let req = c.request("POST", "/early", &[]).body(body).unwrap();
+        let answer = c.start(req);
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            tx.send_data(Bytes::from_static(b"chunk")).await.unwrap();
+        }
+        tx.finish().await.unwrap();
+        let a: Answer = answer.await.unwrap().unwrap();
+        assert_eq!(a.status, 200, "{a:?}");
+        assert_eq!(a.text(), "early");
+        let seen = kit.upstream.wait_seen(1).await;
+        assert_eq!(seen[0].body, b"chunkchunkchunkchunk");
+        let ev = kit.request_event().await;
+        assert_eq!(strs(&ev["addons"]), ["s"], "{ev:#}");
+        assert!(
+            kit.sink
+                .events()
+                .iter()
+                .all(|e| e["event"] != "layer_error"),
+            "{:#?}",
+            kit.sink.events()
+        );
+        assert!(kit.upstream.service().resets().is_empty());
+    }
+}

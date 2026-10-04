@@ -46,9 +46,9 @@ pub use mux::SUBPROTOCOL;
 pub struct ServiceSpec {
     /// The addon's endpoint the exchange streams through.
     pub endpoint: String,
-    /// From asking for a stream, and again from sending the response
-    /// head, until the service's next head (or decision). Bodies have no
-    /// clock.
+    /// From asking for a stream until the service's first head (or
+    /// decision), and again from sending the response head (after the
+    /// request's end) until its second. Bodies have no clock.
     pub first_byte_timeout: Duration,
     /// Connections to the endpoint, at most.
     pub max_connections: usize,
@@ -306,7 +306,7 @@ async fn run(
     let (parts, body) = req.into_parts();
     let s = stream.clone();
     let head = request_head(&parts, &body);
-    tokio::spawn(async move { s.pump(head, body, Out::RequestEnd).await });
+    let request_sent = tokio::spawn(async move { s.pump(head, body, Out::RequestEnd).await });
 
     let first = tokio::time::timeout_at(start + svc.first_byte_timeout, answers.first)
         .await
@@ -329,6 +329,10 @@ async fn run(
         stream.reset("the upstream switched protocols");
         return Ok(res);
     }
+    // Body frames carry only a stream id, so the response head waits for
+    // `request_end`: until then the service would read response bytes as
+    // the request's. Its clock starts when the head goes.
+    let _ = request_sent.await;
     let sent = TokioInstant::now();
     let (parts, body) = res.into_parts();
     let s = stream.clone();
@@ -408,4 +412,111 @@ pub(super) async fn observe(
 
 async fn drain(body: Body) {
     drop(body.collect_up_to(u64::MAX).await);
+}
+
+/// A roxy with service layers, for tests: the test kit's server reloaded
+/// with a stack of `kind: service` addons whose endpoint is the in-test
+/// service behind the scripted upstream.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use roxy_rules::{DefaultDecision, Policy, PolicyInput, RuleConfig};
+
+    use super::ServiceSpec;
+    use crate::addons::{AddonImpl, AddonSpec, EndpointSpec, StateLimits};
+    use crate::config::PolicyUpdate;
+    use crate::flowlog::Redactor;
+    use crate::testkit::{DOWN_IP, Kit, PRIVATE_IP, UP_IP};
+    use crate::upstream::{TestDial, UpstreamSettings};
+
+    /// The port the in-test service answers on (`up.test`).
+    const PORT: u16 = 9000;
+
+    /// A service layer whose endpoint is the in-test service's `behaviour`
+    /// (`pass`, `flood` or `stall`).
+    pub(crate) fn addon(
+        name: &str,
+        behaviour: &str,
+        observe: bool,
+        spec: impl FnOnce(&mut ServiceSpec),
+    ) -> Arc<AddonSpec> {
+        let mut svc = ServiceSpec {
+            endpoint: "svc".to_owned(),
+            first_byte_timeout: Duration::from_secs(10),
+            max_connections: 2,
+            max_streams: 8,
+        };
+        spec(&mut svc);
+        let endpoint = EndpointSpec {
+            url: format!("http://up.test:{PORT}/svc/{behaviour}")
+                .parse()
+                .unwrap(),
+            headers: Vec::new(),
+            timeout: Duration::from_secs(10),
+            retries: 0,
+            private_ok: false,
+        };
+        Arc::new(AddonSpec {
+            name: name.to_owned(),
+            observe,
+            kind: AddonImpl::Service(svc),
+            endpoints: HashMap::from([("svc".to_owned(), endpoint)]),
+            state: StateLimits::default(),
+            audit_endpoint: None,
+            when: None,
+            sample: None,
+        })
+    }
+
+    /// A kit running `rules` with the stack `addons`, outermost first.
+    pub(crate) async fn kit(rules: &str, addons: Vec<Arc<AddonSpec>>) -> Kit {
+        let kit = Kit::builder().rules(rules).start().await;
+        let rules: Vec<RuleConfig> = serde_yaml_ng::from_str(rules).unwrap();
+        let none = std::collections::HashSet::new();
+        let input = PolicyInput {
+            rules: &rules,
+            metrics: &[],
+            secret_names: &none,
+            address_lists: &none,
+            transparent_listeners: false,
+            default: DefaultDecision::Deny,
+        };
+        let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
+        let mut upstream = UpstreamSettings::default();
+        upstream.dns.servers = Some(vec!["127.0.0.1:9".parse().unwrap()]);
+        for (name, ip) in [
+            ("up.test", UP_IP),
+            ("private.test", PRIVATE_IP),
+            ("down.test", DOWN_IP),
+        ] {
+            upstream
+                .dns
+                .static_hosts
+                .insert(name.to_owned(), vec![ip.parse().unwrap()]);
+        }
+        upstream.connect_timeout = Duration::from_secs(5);
+        let up = kit.upstream.clone();
+        upstream.dial = Some(TestDial(Arc::new(move |addr| {
+            let up = up.clone();
+            Box::pin(async move { up.dial(addr) })
+        })));
+        kit.server
+            .reload(PolicyUpdate {
+                policy,
+                secrets: HashMap::new(),
+                redactor: Redactor::new(),
+                users: HashMap::new(),
+                limits: roxy_http::Limits::default(),
+                flags: roxy_http::HttpFlags::default(),
+                upstream,
+                address_lists: Arc::new(HashMap::new()),
+                deny_lists: Vec::new(),
+                addons,
+            })
+            .unwrap();
+        kit
+    }
 }

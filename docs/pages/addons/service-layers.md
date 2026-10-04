@@ -97,9 +97,16 @@ either way       {"type":"credit","bytes":n}                              flow c
 `url` is absolute and `headers` are end-to-end fields as a WASM layer sees
 them (no hop-by-hop or framing fields). Heads carry `content-length` when
 the length is known; a `content-length` the service sends back is enforced,
-and more or fewer bytes than declared is a protocol violation. Both
-directions stream at once: the service may start forwarding the request
-before the client's body has ended.
+and more or fewer bytes than declared is a protocol violation.
+
+**Order on a stream.** Body frames carry only a stream id, so on each
+stream, in each direction, the messages are strictly in the order above: a
+head, its bytes, its end, then the next head. roxy sends its `response`
+head only after its `request_end`, even when the layer below answered
+while the client was still uploading, and a service must do the same
+(a `response` before `request_end` is a protocol violation). The two
+directions are independent: the service may start forwarding the request
+before the client's body has ended, and roxy forwards it as it arrives.
 
 **End of a stream.** A stream ends with the service's last message: the
 `response_end` of the client's response, or a `deny`. roxy sends nothing
@@ -125,9 +132,11 @@ that stream. Control messages are not counted.
   `next`**: re-validated as strictly as a client request, then judged by the
   rules. Its response is handled as a WASM layer's.
 - **Deadlines.** `first_byte_timeout` bounds getting a stream (connecting,
-  or waiting for a free one) and each of the service's heads (its first
-  answer, and its response after roxy sent the upstream's head). A stream
-  has no overall clock: bodies stream for as long as they take.
+  or waiting for a free one) and each of the service's heads: its first
+  answer, from roxy's `request` head, and its second, from roxy's
+  `response` head (which follows `request_end`). A stream has no overall
+  clock: bodies stream for as long as they take, and an upstream that
+  answers early waits for the upload to finish.
 - **Failure is closed** in enforce mode: a failed connection or handshake,
   a protocol violation (bad JSON, a message out of order, bytes before a
   head, an invalid head, a broken length, bytes past the credit), a missed
