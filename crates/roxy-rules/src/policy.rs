@@ -737,6 +737,7 @@ impl PolicyCompiler<'_, '_> {
     fn rules(&mut self) -> Vec<CompiledRule> {
         let mut out = Vec::new();
         let mut seen: HashMap<&str, usize> = HashMap::new();
+        let mut tag_reads: Vec<Vec<Box<str>>> = Vec::new();
         let input = self.input;
         for (i, rule) in input.rules.iter().enumerate() {
             let path = format!("rules[{i}]");
@@ -774,6 +775,7 @@ impl PolicyCompiler<'_, '_> {
                 },
                 None => (None, Needs::default()),
             };
+            tag_reads.push(needs.tags.clone());
             let fields = needs.reads.minus(Reads::METRICS);
             let metrics = needs.reads.minus(Reads::WATCHED_FIELDS);
             let denies = rule.then.0.iter().any(|a| matches!(a, Action::Deny(_)));
@@ -801,7 +803,62 @@ impl PolicyCompiler<'_, '_> {
                 watches,
             });
         }
+        self.tag_order(&out, &tag_reads);
         out
+    }
+
+    /// A rule may read `tag["x"]` only if every rule that can set `x` is
+    /// evaluated before it: a head rule above it, or for a watching rule
+    /// any head rule or a watching rule above it. Otherwise moving a rule
+    /// would change what the reader sees, and so the decision. A tag no
+    /// rule sets can only come from an addon, before any rule runs; a
+    /// rule's own tags are set after its own check wherever it sits.
+    fn tag_order(&mut self, rules: &[CompiledRule], tag_reads: &[Vec<Box<str>>]) {
+        let input = self.input;
+        let sets = |i: usize, tag: &str| {
+            input.rules[i]
+                .then
+                .0
+                .iter()
+                .any(|a| matches!(a, Action::Tag(t) if t == tag))
+        };
+        for (r, tags) in tag_reads.iter().enumerate() {
+            for tag in tags {
+                let late: Vec<String> = (0..rules.len())
+                    .filter(|&s| sets(s, tag))
+                    .filter_map(|s| {
+                        let id = &input.rules[s].id;
+                        let head_reader = rules[r].kind.at_head();
+                        // A rule's own tags come after its own check
+                        // wherever it sits, so they never depend on order.
+                        if s == r {
+                            None
+                        } else if head_reader && !rules[s].kind.at_head() {
+                            Some(format!(
+                                "rules[{s}] ({id:?}), a watching rule that runs only after \
+                                 the head decision"
+                            ))
+                        } else if s > r && (head_reader || !rules[s].kind.at_head()) {
+                            Some(format!("rules[{s}] ({id:?}), below this rule"))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !late.is_empty() {
+                    self.push(
+                        Some(&rules[r].id),
+                        format!("rules[{r}].when"),
+                        format!(
+                            "reads `tag[{tag:?}]`, which is set too late to be seen here, \
+                             by {}; a rule sees only the tags set before it is checked, so \
+                             the order of the rules would decide",
+                            late.join(" and by ")
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     fn actions(

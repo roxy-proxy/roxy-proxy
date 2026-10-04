@@ -435,6 +435,10 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
             // extension (permessage-deflate above all) may be negotiated.
             req.headers.remove("sec-websocket-extensions");
         }
+        // The upgrade request is captured as it leaves, like any other.
+        if let Some(t) = up_tap.as_mut() {
+            t.request_head(&req, &cx.snap.redactor);
+        }
         let scheme = req.scheme;
         let authority = req.authority.clone();
         let mut http_req = match to_upstream_upgrade_request(req, UriForm::Origin) {

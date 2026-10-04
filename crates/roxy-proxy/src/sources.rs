@@ -70,7 +70,7 @@ pub trait MetricSource: Send + Sync {
     /// `Ok(value)` for the metric as seen by this flow (0 for a fresh key).
     /// `Err` → the flow fails closed.
     fn get(&self, id: &str, view: &dyn FlowView) -> Result<i64, MetricSourceError>;
-    /// Called after the head decision (so denied flows count too), per
+    /// Called once the head step has settled (so denied flows count too), per
     /// streamed chunk and at the end. `Err` → the exchange fails closed.
     fn record(&self, view: &dyn FlowView, sample: &Sample) -> Result<(), MetricSourceError>;
 }

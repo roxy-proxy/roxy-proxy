@@ -202,6 +202,9 @@ async fn serve_stream(
     mut respond: SendResponse<Bytes>,
     ccx: Arc<ConnCx>,
 ) {
+    // Audit backpressure before anything is logged for this stream, a
+    // `parse_error` included: one connection can open many streams.
+    crate::flowlog::sink_ready(&*ccx.shared.sink).await;
     let snap = ccx.shared.snapshot();
     let (parts, recv) = req.into_parts();
     let fail = Arc::new(BodyFail::default());

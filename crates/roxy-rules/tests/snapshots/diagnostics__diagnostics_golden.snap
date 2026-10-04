@@ -92,6 +92,12 @@ rules[0].then[0]: secret references are only allowed in `set_header` values, not
 == passthrough without a transparent listener
 rules[0].then[0]: `passthrough` requires a transparent listener, which is not supported yet (issue #15)  [rule a]
 
+== tag read above the rule that sets it
+rules[0].when: reads `tag["risky"]`, which is set too late to be seen here, by rules[1] ("mark"), below this rule; a rule sees only the tags set before it is checked, so the order of the rules would decide  [rule read]
+
+== tag read at the head but set by a watching rule
+rules[1].when: reads `tag["big"]`, which is set too late to be seen here, by rules[0] ("big"), a watching rule that runs only after the head decision; a rule sees only the tags set before it is checked, so the order of the rules would decide  [rule read]
+
 == multi-key action map
 parse: .[0].then: an action is a map with exactly one key, but this one has `set_header` and `allow`; write each action as its own list item at line 1 column 18
 

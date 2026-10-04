@@ -785,6 +785,32 @@ fn tags_chain_and_initial_tags() {
     assert_eq!(out.tags, ["seen"]);
 }
 
+/// A rule may read a tag set by head rules above it, or (a watching rule)
+/// by any head rule, or its own; nothing about these depends on order.
+#[test]
+fn tags_read_after_every_setter_compile() {
+    compile(
+        "",
+        r#"
+- id: mark
+  when: path starts_with "/admin"
+  then: { tag: admin }
+- id: block
+  when: tag["admin"]
+  then: deny
+- id: once
+  when: not tag["seen"]
+  then: { tag: seen }
+- id: big-admin-upload
+  when: tag["late"] and body.bytes > 10
+  then: deny
+- id: late
+  when: host == "x"
+  then: { tag: late }
+"#,
+    );
+}
+
 #[test]
 fn set_state_is_visible_later_in_the_chain() {
     let p = compile(

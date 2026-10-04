@@ -29,7 +29,6 @@ fuzz_target!(|data: &[u8]| {
             rules: &rules,
             metrics: &metrics,
             secret_names: &none,
-            addon_names: &none,
             address_lists: &none,
             transparent_listeners: false,
             default: roxy_rules::DefaultDecision::Deny,

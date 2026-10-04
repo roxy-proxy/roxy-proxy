@@ -42,4 +42,7 @@ metrics:
 `state` is a bounded key/value map with per-entry TTL, written by
 `set_state` and read as `state["key"]`. At most `limits.max_state_entries`
 (100 000) live entries; a new key when full denies the flow that tried.
+State is shared across flows, so reading it is order-dependent by design:
+`state["key"]` sees what earlier flows wrote, and, within one flow, the
+`set_state` of rules above the reader.
 Addons have their own, separate store ([addons](/addons/host-services)).

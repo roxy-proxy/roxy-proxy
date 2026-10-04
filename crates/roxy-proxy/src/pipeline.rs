@@ -391,9 +391,8 @@ impl FlowCx {
         }
     }
 
-    /// The head decision, and the exchange's head metric sample.
-    /// Returns the outcome plus a refusal when the decision (or recording)
-    /// must deny.
+    /// The head decision. Returns the outcome plus a refusal when it
+    /// denies or an input was unavailable.
     fn evaluate_head(&mut self) -> (Outcome, Option<Refusal>) {
         let snap = self.snap.clone();
         let shared = self.shared.clone();
@@ -411,12 +410,6 @@ impl FlowCx {
         );
         let out = snap.policy.evaluate_head(&view, &ctx);
         let metric_err = view.take_metric_error();
-        let sample = Sample {
-            head: true,
-            denied: !out.decision.is_allow(),
-            ..Sample::default()
-        };
-        let record_err = shared.metrics.record(&view, &sample).err();
         drop(view);
         self.note_outcome(&out);
         self.record.stage = Some(Stage::Head);
@@ -446,17 +439,24 @@ impl FlowCx {
                 Decision::Allow(_) => {}
             }
         }
-        if refusal.is_none()
-            && let Some(e) = record_err
-        {
-            self.events().metric_error(Stage::Head, &e);
-            refusal = Some(Refusal::fail_closed(e.code()));
-        }
-        self.record.terminal_rule = match &refusal {
-            Some(r) => r.rule.clone(),
-            None => Some(out.terminal_rule.to_string()),
-        };
         (out, refusal)
+    }
+
+    /// Records the exchange's head metric sample, once the head step's
+    /// outcome is settled (`denied`).
+    fn record_head_sample(&self, denied: bool) -> Result<(), MetricSourceError> {
+        let view = ProxyView::new(
+            &self.facts,
+            &*self.shared.metrics,
+            &*self.shared.state,
+            &self.snap.address_lists,
+        );
+        let sample = Sample {
+            head: true,
+            denied,
+            ..Sample::default()
+        };
+        self.shared.metrics.record(&view, &sample)
     }
 
     /// Emits the flow's `request` event.
@@ -745,17 +745,42 @@ async fn inspect_request_body(
 
 /// The head decision and its effects.
 fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
-    let (out, refusal) = cx.evaluate_head();
+    let (out, mut refusal) = cx.evaluate_head();
+    // Request changes apply to an allowed request only (a refused outcome
+    // carries none). `log` and `set_state` apply whatever the outcome, in
+    // rule order, once the request changes are settled, so a failing change
+    // never leaves only some of them behind.
+    let (changes, side_effects): (Vec<Effect>, Vec<Effect>) = out
+        .effects
+        .into_iter()
+        .partition(|e| !matches!(e, Effect::Log { .. } | Effect::SetState { .. }));
+    if refusal.is_none() {
+        if let Decision::Allow(opts) = &out.decision {
+            cx.opts = *opts;
+        }
+        refusal = changes
+            .into_iter()
+            .try_for_each(|e| apply_request_effect(cx, &mut req, e))
+            .err();
+    }
+    for effect in side_effects {
+        if let Err(r) = apply_request_effect(cx, &mut req, effect) {
+            refusal.get_or_insert(r);
+        }
+    }
+    // The head sample counts the outcome as it finally stands.
+    if let Err(e) = cx.record_head_sample(refusal.is_some())
+        && refusal.is_none()
+    {
+        cx.events().metric_error(Stage::Head, &e);
+        refusal = Some(Refusal::fail_closed(e.code()));
+    }
+    cx.record.terminal_rule = match &refusal {
+        Some(r) => r.rule.clone(),
+        None => Some(out.terminal_rule.to_string()),
+    };
     if let Some(r) = refusal {
         return Verdict::Deny(r);
-    }
-    if let Decision::Allow(opts) = out.decision {
-        cx.opts = opts;
-    }
-    for effect in out.effects {
-        if let Err(r) = apply_request_effect(cx, &mut req, effect) {
-            return Verdict::Deny(r);
-        }
     }
     // The watching rules and the log see the request as it
     // will be forwarded.
