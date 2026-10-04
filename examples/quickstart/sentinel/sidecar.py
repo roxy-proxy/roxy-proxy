@@ -47,11 +47,19 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
+import httpx2
+from anthropic._models import construct_type
+from anthropic._streaming import SSEDecoder
+from anthropic.lib.streaming._beta_messages import accumulate_event
+from anthropic.types.beta import BetaMessage, BetaRawMessageStreamEvent
 from inspect_ai.model import (
     ChatMessage,
+    ChatMessageAssistant,
+    ContentText,
     GenerateConfig,
     Model,
     ModelOutput,
+    ModelUsage,
     get_model,
     messages_from_anthropic,
     model_output_from_anthropic,
@@ -60,7 +68,13 @@ from inspect_ai.tool import ToolCall, ToolCallView, ToolInfo
 from inspect_ai.util import Store
 from inspect_sentinel import BeforeToolCall, Context, Decision, HumanAnswer, Step
 
-# The host contract inspect_ai itself uses to run a sentinel.
+# The host contract inspect_ai itself uses to run a sentinel, and the
+# converters its agent bridge uses to answer an agent's Messages call.
+from inspect_ai.agent._bridge.anthropic_api_impl import (
+    anthropic_stop_reason,
+    anthropic_usage,
+    assistant_message_blocks,
+)
 from inspect_sentinel._integration import HostContext, resolve_sentinel, run_sentinel
 
 from inspect_log import InspectLog, InspectRecorder
@@ -133,51 +147,60 @@ def _system_text(system: Any) -> str | None:
     return "\n".join(b.get("text", "") for b in system if isinstance(b, dict))
 
 
-def anthropic_from_sse(raw: bytes) -> dict[str, Any]:
-    """Rebuilds a `Message` from its event stream."""
-    message: dict[str, Any] = {}
-    partial: dict[int, str] = {}
-    for event in raw.decode().split("\n\n"):
-        data = next(
-            (line[5:].strip() for line in event.splitlines() if line.startswith("data:")), None
-        )
-        if not data:
+# The stream events the SDK's own stream accumulates; `ping` is skipped and
+# `error` raises, as the SDK's stream does.
+STREAM_EVENTS = {
+    "message_start",
+    "message_delta",
+    "message_stop",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+}
+
+
+def message_from_sse(raw: bytes) -> dict[str, Any]:
+    """Rebuilds a `Message` from its event stream with the Anthropic SDK's
+    accumulator (beta types: Claude Code calls the beta endpoint)."""
+    snapshot = None
+    json_bufs: dict[int, bytes] = {}
+    for sse in SSEDecoder().iter_bytes(iter([raw])):
+        if sse.event == "error":
+            raise ValueError(f"error in the stream: {sse.data}")
+        if sse.event not in STREAM_EVENTS:
             continue
-        e = json.loads(data)
-        t = e.get("type")
-        if t == "message_start":
-            message = e["message"]
-            message["content"] = []
-        elif t == "content_block_start":
-            message["content"].append(e["content_block"])
-        elif t == "content_block_delta":
-            block, d = message["content"][e["index"]], e["delta"]
-            if d["type"] == "text_delta":
-                block["text"] = block.get("text", "") + d["text"]
-            elif d["type"] == "input_json_delta":
-                partial[e["index"]] = partial.get(e["index"], "") + d["partial_json"]
-            elif d["type"] == "thinking_delta":
-                block["thinking"] = block.get("thinking", "") + d["thinking"]
-        elif t == "content_block_stop":
-            if e["index"] in partial:
-                message["content"][e["index"]]["input"] = json.loads(partial[e["index"]] or "{}")
-        elif t == "message_delta":
-            message.update(e.get("delta", {}))
-            message.setdefault("usage", {}).update(e.get("usage", {}))
-    return message
+        event = construct_type(type_=BetaRawMessageStreamEvent, value=sse.json())
+        snapshot = accumulate_event(
+            event=event,
+            current_snapshot=snapshot,
+            json_bufs=json_bufs,
+            request_headers=httpx2.Headers(),
+        )
+    if snapshot is None:
+        raise ValueError("no message in the stream")
+    return snapshot.model_dump(mode="json")
 
 
-def explanation(response: dict[str, Any], message: str) -> dict[str, Any]:
-    """A `Message` that keeps the model's text, drops its tool calls and
-    thinking, and says what was blocked. Its `end_turn` hands the turn back
-    to the person, as an ordinary answer would."""
-    text = [b for b in response.get("content", []) if b.get("type") == "text"]
-    return {
-        **response,
-        "content": [*text, {"type": "text", "text": message}],
-        "stop_reason": "end_turn",
-        "stop_sequence": None,
-    }
+async def explanation(response: dict[str, Any], output: ModelOutput, note: str) -> dict[str, Any]:
+    """The reply to a refused response: the model's text, without its tool
+    calls or thinking, then what was blocked. Built as an inspect message and
+    converted as inspect's agent bridge answers an agent; its `end_turn`
+    hands the turn back to the person, as an ordinary answer would."""
+    said = output.message.text
+    message = ChatMessageAssistant(
+        content=[*([ContentText(text=said)] if said else []), ContentText(text=note)]
+    )
+    reply = BetaMessage.model_construct(
+        id=response.get("id"),
+        type="message",
+        role="assistant",
+        model=response.get("model"),
+        content=await assistant_message_blocks(message, beta=True),
+        stop_reason=anthropic_stop_reason("stop"),
+        stop_sequence=None,
+        usage=anthropic_usage(output.usage or ModelUsage(), beta=True),
+    )
+    return reply.model_dump(mode="json")
 
 
 def anthropic_to_sse(message: dict[str, Any], *, start: bool = True) -> bytes:
@@ -250,6 +273,7 @@ class Refusal:
 
     message: str
     call: Call | None = None
+    output: ModelOutput | None = None
 
 
 def is_model_call(req: Request) -> bool:
@@ -295,8 +319,9 @@ class Sidecar:
             await ex.respond(res, raw)
         elif isinstance(verdict, bytes):
             await ex.respond(with_length(res, len(verdict)), verdict)
-        elif verdict.call:
-            out = json.dumps(explanation(verdict.call.response, verdict.message)).encode()
+        elif verdict.call and verdict.output:
+            reply = await explanation(verdict.call.response, verdict.output, verdict.message)
+            out = json.dumps(reply).encode()
             await ex.respond(with_length(res, len(out)), out)
         else:
             await ex.deny(403, verdict.message)
@@ -337,8 +362,9 @@ class Sidecar:
         if verdict is None or isinstance(verdict, bytes):
             # Streamed responses are never modified (see judge).
             yield raw[sent:]
-        elif verdict.call:
-            yield anthropic_to_sse(explanation(verdict.call.response, verdict.message), start=not sent)
+        elif verdict.call and verdict.output:
+            reply = await explanation(verdict.call.response, verdict.output, verdict.message)
+            yield anthropic_to_sse(reply, start=not sent)
         else:
             error = {"type": "error", "error": {"type": "api_error", "message": verdict.message}}
             yield f"event: error\ndata: {json.dumps(error)}\n\n".encode()
@@ -349,7 +375,7 @@ class Sidecar:
         streamed = (res.header("content-type") or "").startswith("text/event-stream")
         try:
             request = json.loads(body)
-            response = anthropic_from_sse(raw) if streamed else json.loads(raw)
+            response = message_from_sse(raw) if streamed else json.loads(raw)
         except (ValueError, KeyError, IndexError) as e:
             log.warning("unreadable model exchange: %s", e)
             return Refusal("the sentinel could not read this model exchange")
@@ -410,6 +436,7 @@ class Sidecar:
             return Refusal(
                 (decision and decision.message) or f"tool call {tc.function} refused ({action})",
                 call,
+                output,
             )
         return json.dumps(call.response).encode() if modified else None
 
