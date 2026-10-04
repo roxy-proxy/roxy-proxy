@@ -569,7 +569,38 @@ mod service {
             "{:#?}",
             kit.sink.events()
         );
-        assert!(kit.upstream.service().resets().is_empty());
+        assert_eq!(kit.upstream.service().resets(), []);
+    }
+
+    /// What a service sends on an observe stream is discarded, never
+    /// credited, and bounded by the window like any body: past it the
+    /// stream fails, and the exchange goes on.
+    #[tokio::test]
+    async fn an_observe_stream_flooded_past_its_window_fails_on_its_own() {
+        let kit = kit(RULES, vec![addon("o", "flood", true, |_| {})]).await;
+        let mut c = kit.h1().await;
+        let (mut tx, body) = streaming_body();
+        let req = c.request("POST", "/x", &[]).body(body).unwrap();
+        let answer = c.start(req);
+        // The flood lands while the observe stream still waits for the
+        // request body.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        tx.send_data(Bytes::from_static(b"body")).await.unwrap();
+        tx.finish().await.unwrap();
+        let a: Answer = answer.await.unwrap().unwrap();
+        assert_eq!(a.status, 200, "{a:?}");
+        assert_eq!(a.json()["body_len"], 4);
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["layer"], "o", "{errs:#?}");
+        assert_eq!(errs[0]["mode"], "observe");
+        assert_eq!(errs[0]["kind"], "service:protocol");
+        let resets = kit.upstream.service().resets();
+        assert!(
+            resets
+                .iter()
+                .any(|(_, m)| m.contains("past the stream's credit")),
+            "{resets:?}"
+        );
     }
 
     /// An observer that holds its copy without reading it is lagging: the

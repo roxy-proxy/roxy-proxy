@@ -159,10 +159,9 @@ async fn attempt_all(
         headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
     }
 
+    // The connector runs the address floor on the address it dials; a
+    // denied one fails the first attempt.
     let upstream = st.snap.upstream.clone();
-    if let Err(e) = upstream.preflight(&authority, spec.private_ok).await {
-        return Err((connect_error(&e), 1));
-    }
     let mut attempt = 0u32;
     loop {
         attempt += 1;
