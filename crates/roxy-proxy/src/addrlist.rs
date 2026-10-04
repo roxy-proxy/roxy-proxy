@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
-use crate::addr::{canonical, embedded_v4};
+use crate::addr::reachable_forms;
 
 /// Named lists by name, as held in a policy snapshot.
 pub type AddressLists = HashMap<String, Arc<AddressList>>;
@@ -166,19 +166,6 @@ fn net_v6(b: Block<u128>) -> IpNet {
     IpNet::V6(Ipv6Net::new(Ipv6Addr::from(b.start), prefix).expect("prefix <= 128"))
 }
 
-/// The IPv4 address embedded by NAT64 (`64:ff9b::/96`) or 6to4
-/// (`2002::/16`), which a gateway would actually reach.
-fn translated_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
-    let seg = v6.segments();
-    if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
-        return Some(embedded_v4(seg[6], seg[7]));
-    }
-    if seg[0] == 0x2002 {
-        return Some(embedded_v4(seg[1], seg[2]));
-    }
-    None
-}
-
 impl AddressList {
     /// Parses list source text: one CIDR or address per line, `#` starts a
     /// comment (whole-line or trailing), blank lines are ignored and
@@ -248,21 +235,15 @@ impl AddressList {
         find(&self.v6, u128::from(ip)).map(net_v6)
     }
 
-    /// The list entry containing `ip`, if any. Checks every form of the
-    /// address: as given, its canonical IPv4 form (IPv4-mapped /
-    /// IPv4-compatible IPv6), and the IPv4 address embedded by NAT64 or
-    /// 6to4. Any hit counts. O(log n), no allocation.
+    /// The list entry containing `ip`, if any, in any of its
+    /// [`reachable_forms`]: as given, its IPv4 form (IPv4-mapped /
+    /// IPv4-compatible), and the IPv4 address a NAT64 or 6to4 gateway would
+    /// reach. Any hit counts. O(log n), no allocation.
     pub fn lookup(&self, ip: IpAddr) -> Option<IpNet> {
-        match ip {
+        reachable_forms(ip).find_map(|form| match form {
             IpAddr::V4(v4) => self.lookup_v4(v4),
-            IpAddr::V6(v6) => self
-                .lookup_v6(v6)
-                .or_else(|| match canonical(ip) {
-                    IpAddr::V4(v4) => self.lookup_v4(v4),
-                    IpAddr::V6(_) => None,
-                })
-                .or_else(|| translated_v4(v6).and_then(|v4| self.lookup_v4(v4))),
-        }
+            IpAddr::V6(v6) => self.lookup_v6(v6),
+        })
     }
 
     /// Whether `ip` is listed ([`AddressList::lookup`]). Broad: also matches
@@ -497,12 +478,7 @@ mod tests {
         /// The naive reference: any entry contains the address in any of
         /// its forms.
         fn naive(nets: &[IpNet], ip: IpAddr) -> bool {
-            let mut forms = vec![ip, canonical(ip)];
-            if let IpAddr::V6(v6) = ip
-                && let Some(v4) = translated_v4(v6)
-            {
-                forms.push(IpAddr::V4(v4));
-            }
+            let forms: Vec<IpAddr> = reachable_forms(ip).collect();
             nets.iter()
                 .any(|n| forms.iter().any(|f| normalise_net(*n).contains(f)))
         }
