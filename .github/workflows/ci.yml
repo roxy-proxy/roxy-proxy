@@ -1,11 +1,13 @@
 name: CI
 
 # Pull requests run on their own event; branch pushes would only repeat
-# them, so pushes run on main alone.
+# them, so pushes run on main alone. merge_group runs the required checks
+# on the merge queue's candidate commit.
 on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
