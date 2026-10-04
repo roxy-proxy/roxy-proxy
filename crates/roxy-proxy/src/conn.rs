@@ -21,7 +21,7 @@ use crate::exchange::{self, ClientFraming, respond};
 use crate::flowlog::TlsInfo;
 use crate::io::{BoxIo, ConnIo, Rewind};
 use crate::listener::ClientConn;
-use crate::pipeline::FlowCx;
+use crate::pipeline::emit_connect_event;
 use crate::server::Shared;
 use crate::view::host_text;
 
@@ -228,34 +228,11 @@ async fn handle_connect(
     authority: Authority,
     shared: Arc<Shared>,
 ) {
-    // A flow context carries the log helpers; there is no request yet.
     let snap = shared.snapshot();
-    let placeholder = CanonicalRequest {
-        method: Method::Connect,
-        scheme: Scheme::Https,
-        authority: authority.clone(),
-        path: roxy_http::Path::root(),
-        query: None,
-        headers: roxy_http::Headers::new(),
-        body: Body::empty(),
-        meta: roxy_http::RequestMeta::new(
-            roxy_http::Version::H1_1,
-            roxy_http::TargetForm::Authority,
-        ),
-    };
-    let mut cx = FlowCx::new(
-        shared.clone(),
-        snap.clone(),
-        client.clone(),
-        None,
-        &placeholder,
-    );
-    cx.facts.request = None;
-    cx.facts.client_request = None;
     // No connect-time rules: a CONNECT that passed proxy auth is
     // accepted for inspection; every decision is made on the requests
     // inside the tunnel.
-    cx.emit_connect_event(&authority, false);
+    emit_connect_event(&shared, &client, &authority, false);
     let limits = snap.limits.clone();
     let flags = snap.flags.clone();
     drop(snap);

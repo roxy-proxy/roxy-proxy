@@ -353,13 +353,21 @@ impl Kit {
             user: None,
             original_dst: None,
         };
-        tokio::spawn(crate::conn::serve_direct(
+        self.spawn_conn(crate::conn::serve_direct(
             Box::new(server),
             conn,
             port,
             self.server.shared().clone(),
         ));
         client
+    }
+
+    /// Serves a connection the way the accept loop does, so a server
+    /// shutdown reaches it (`stop`, then the kill switch).
+    fn spawn_conn(&self, fut: impl std::future::Future<Output = ()> + Send + 'static) {
+        let shared = self.server.shared();
+        let slot = crate::server::conn_slot(shared, "192.0.2.7".parse().unwrap()).unwrap();
+        shared.spawn_conn(slot, fut);
     }
 
     /// A raw client connection to the proxy port.
@@ -376,7 +384,7 @@ impl Kit {
             user: None,
             original_dst: None,
         };
-        tokio::spawn(crate::conn::serve_explicit(
+        self.spawn_conn(crate::conn::serve_explicit(
             Box::new(server),
             conn,
             self.server.shared().clone(),
@@ -491,6 +499,28 @@ impl Kit {
     pub(crate) async fn request_event(&self) -> serde_json::Value {
         self.events("request", 1).await.remove(0)
     }
+
+    /// Waits until `n` requests have reached the upstream (their bodies may
+    /// still be arriving).
+    pub(crate) async fn wait_arrived(&self, n: usize) -> Vec<Seen> {
+        let wait = async {
+            loop {
+                let seen = self.upstream.seen();
+                if seen.len() >= n {
+                    return seen;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "upstream: wanted {n} requests, have {:#?}",
+                    self.upstream.seen()
+                )
+            })
+    }
 }
 
 /// A client over HTTP/1.1 or HTTP/2.
@@ -500,10 +530,12 @@ pub(crate) enum Client {
     H1 {
         send: hyper::client::conn::http1::SendRequest<Body>,
         tunnel: Option<String>,
+        conn: tokio::task::JoinHandle<()>,
     },
     H2 {
         send: hyper::client::conn::http2::SendRequest<Body>,
         host: String,
+        conn: tokio::task::JoinHandle<()>,
     },
 }
 
@@ -515,12 +547,13 @@ impl Client {
         let (send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
             .await
             .unwrap();
-        tokio::spawn(async move {
+        let conn = tokio::spawn(async move {
             let _ = conn.with_upgrades().await;
         });
         Self::H1 {
             send,
             tunnel: tunnel.map(str::to_owned),
+            conn,
         }
     }
 
@@ -532,12 +565,21 @@ impl Client {
             hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io))
                 .await
                 .unwrap();
-        tokio::spawn(async move {
+        let conn = tokio::spawn(async move {
             let _ = conn.await;
         });
         Self::H2 {
             send,
             host: host.to_owned(),
+            conn,
+        }
+    }
+
+    /// Drops the connection where it stands (no GOAWAY, no close frame):
+    /// roxy sees the client vanish.
+    pub(crate) fn kill(&self) {
+        match self {
+            Self::H1 { conn, .. } | Self::H2 { conn, .. } => conn.abort(),
         }
     }
 

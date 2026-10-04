@@ -284,6 +284,21 @@ pub(crate) struct FlowCx {
     /// An addon layer ran on this request: on an upgrade, it is in the
     /// WebSocket's byte path.
     pub layer_ran: bool,
+    /// The `request` event went out. Dropping an unlogged flow logs it as
+    /// `aborted`, so an exchange cut off by its connection ending or the
+    /// server stopping is never missing from the log.
+    logged: bool,
+}
+
+impl Drop for FlowCx {
+    fn drop(&mut self) {
+        if !self.logged {
+            self.record
+                .reason
+                .get_or_insert_with(|| "aborted".to_owned());
+            self.emit_request_event();
+        }
+    }
 }
 
 pub(crate) fn request_facts(req: &CanonicalRequest) -> RequestFacts {
@@ -359,6 +374,7 @@ impl FlowCx {
             request_counter: None,
             stack: None,
             layer_ran: false,
+            logged: false,
         }
     }
 
@@ -465,6 +481,7 @@ impl FlowCx {
 
     /// Emits the flow's `request` event.
     pub(crate) fn emit_request_event(&mut self) {
+        self.logged = true;
         if let Some(st) = self.stack.take() {
             st.fold_into(self);
         }
@@ -519,32 +536,6 @@ impl FlowCx {
             terminal_rule: self.record.terminal_rule.clone(),
             reason: self.record.reason.clone(),
             stage: self.record.stage,
-        });
-    }
-
-    /// Emits a `connect` event for a CONNECT (refused, or accepted for
-    /// inspection).
-    pub(crate) fn emit_connect_event(&self, authority: &Authority, denied: bool) {
-        if !denied && !self.shared.connection_events {
-            return;
-        }
-        self.shared.sink.emit(&FlowEvent::Connect {
-            ts: chrono::Utc::now(),
-            conn: self.conn_id(),
-            listener: self.facts.client.listener.name.clone(),
-            client: client_info(&self.facts.client),
-            dst: DstInfo {
-                host: host_text(&authority.host),
-                port: authority.port,
-                ip: None,
-            },
-            tls: self.facts.tls.clone(),
-            decision: if denied {
-                DecisionKind::Deny
-            } else {
-                DecisionKind::Allow
-            },
-            rules: self.record.rules.clone(),
         });
     }
 
@@ -603,6 +594,37 @@ impl FlowCx {
             self.record.stage = Some(stop.stage);
         }
     }
+}
+
+/// Emits a `connect` event for a CONNECT (refused, or accepted for
+/// inspection). No connect-time rules exist, so the event carries none.
+pub(crate) fn emit_connect_event(
+    shared: &Shared,
+    client: &ClientConn,
+    authority: &Authority,
+    denied: bool,
+) {
+    if !denied && !shared.connection_events {
+        return;
+    }
+    shared.sink.emit(&FlowEvent::Connect {
+        ts: chrono::Utc::now(),
+        conn: client.id.to_string(),
+        listener: client.listener.name.clone(),
+        client: client_info(client),
+        dst: DstInfo {
+            host: host_text(&authority.host),
+            port: authority.port,
+            ip: None,
+        },
+        tls: None,
+        decision: if denied {
+            DecisionKind::Deny
+        } else {
+            DecisionKind::Allow
+        },
+        rules: Vec::new(),
+    });
 }
 
 /// Event helpers shared by the head decision and the watcher.

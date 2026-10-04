@@ -57,6 +57,8 @@ use crate::server::Shared;
 /// How long in-flight streams may continue after the connection started
 /// closing (a closing deny, server shutdown, idle timeout).
 pub(crate) const CLOSE_GRACE: Duration = Duration::from_secs(10);
+/// How long stream tasks may take to finish once their connection is gone.
+const STREAM_DRAIN: Duration = Duration::from_secs(1);
 /// Per-stream receive window. Large enough that a single upload is not
 /// throttled by round trips; the connection window bounds the total.
 const STREAM_WINDOW: u32 = 1024 * 1024;
@@ -126,8 +128,6 @@ pub(crate) async fn serve<IO: Io>(
         tls,
         closing: CancellationToken::new(),
     });
-    // Dropping the set (connection over, or the server's kill switch)
-    // aborts every stream task.
     let mut streams: JoinSet<()> = JoinSet::new();
     let mut closing = false;
     let mut close_deadline = Instant::now();
@@ -194,6 +194,14 @@ pub(crate) async fn serve<IO: Io>(
             }
         }
     }
+    // Without the connection every stream operation fails, so the tasks
+    // still running reach their outcome and log it on their own; one that
+    // does not is aborted, and its flow logged as `aborted` as it drops.
+    drop(conn);
+    let _ = timeout(STREAM_DRAIN, async {
+        while streams.join_next().await.is_some() {}
+    })
+    .await;
 }
 
 /// One stream: map, run the exchange core, write the outcome.

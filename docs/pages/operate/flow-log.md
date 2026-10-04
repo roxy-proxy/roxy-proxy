@@ -23,7 +23,10 @@ produces a `request` event:
   decisions.
 - `reason` is a stable code when the exchange failed closed or failed
   (`body_too_large_to_inspect`, `body_decode_failed`, `missing_value`,
-  `upstream_timeout`, ...).
+  `upstream_timeout`, ...). An exchange roxy could not finish has
+  `aborted` (its connection ended, or the server stopped, while it was in
+  flight); an exchange cut short because the client went away has
+  `client_gone`.
 - `stage` says where the decision was made: `head` for the forwarding
   decision, or where a watching rule stopped the exchange: `request_body`,
   `response_head`, `response_body`, `websocket`.

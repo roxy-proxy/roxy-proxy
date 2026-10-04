@@ -97,6 +97,77 @@ async fn a_watching_rule_stops_an_upload_mid_body() {
     assert_eq!(ev["terminal_rule"], "upload-cap");
 }
 
+/// A client that vanishes mid-upload still gets its exchange logged, on
+/// h1 (the codec sees EOF) and on h2 (the connection ends under the
+/// stream's task).
+async fn a_client_gone_mid_upload_is_logged(h2: bool) {
+    let kit = kit().await;
+    let mut c = if h2 {
+        kit.tunnel("up.test", true).await
+    } else {
+        kit.h1().await
+    };
+    let (mut tx, body) = streaming_body();
+    let req = c.request("POST", "/upload", &[]).body(body).unwrap();
+    let pending = c.start(req);
+    tx.send_data(Bytes::from(vec![b'x'; 1024])).await.unwrap();
+    kit.wait_arrived(1).await;
+    c.kill();
+    drop(tx);
+    let _ = pending.await;
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "allow", "{ev:#}");
+    assert!(ev["reason"].is_string(), "{ev:#}");
+}
+
+#[tokio::test]
+async fn h1_a_client_gone_mid_upload_is_logged() {
+    a_client_gone_mid_upload_is_logged(false).await;
+}
+
+#[tokio::test]
+async fn h2_a_client_gone_mid_upload_is_logged() {
+    a_client_gone_mid_upload_is_logged(true).await;
+}
+
+/// The server's kill switch drops exchanges in flight; each is still
+/// logged, as `aborted`.
+async fn a_server_killed_mid_exchange_logs_it_as_aborted(h2: bool) {
+    let kit = kit().await;
+    let mut c = if h2 {
+        kit.tunnel("up.test", true).await
+    } else {
+        kit.h1().await
+    };
+    let (mut tx, body) = streaming_body();
+    let req = c.request("POST", "/upload", &[]).body(body).unwrap();
+    let pending = c.start(req);
+    tx.send_data(Bytes::from(vec![b'x'; 1024])).await.unwrap();
+    kit.wait_arrived(1).await;
+    kit.server
+        .shutdown(std::time::Duration::from_millis(100))
+        .await;
+    let ev = kit
+        .sink
+        .wait_for("request", 1, std::time::Duration::from_secs(10))
+        .await
+        .remove(0);
+    assert_eq!(ev["reason"], "aborted", "{ev:#}");
+    assert_eq!(ev["decision"], "allow", "{ev:#}");
+    drop(tx);
+    let _ = pending.await;
+}
+
+#[tokio::test]
+async fn h1_a_server_killed_mid_exchange_logs_it_as_aborted() {
+    a_server_killed_mid_exchange_logs_it_as_aborted(false).await;
+}
+
+#[tokio::test]
+async fn h2_a_server_killed_mid_exchange_logs_it_as_aborted() {
+    a_server_killed_mid_exchange_logs_it_as_aborted(true).await;
+}
+
 #[tokio::test]
 async fn an_unreachable_upstream_is_a_502() {
     let kit = kit().await;
