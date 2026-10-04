@@ -4,7 +4,7 @@
 //! diagnostics (with line/column within an expression) are merged with the
 //! checks here.
 
-use roxy_rules::{Policy, PolicyInput};
+use roxy_rules::{Condition, Policy, PolicyInput};
 use std::collections::{HashMap, HashSet};
 
 use super::{AddressListSource, CONFIG_VERSION, Config, ListenerMode, UpstreamVerify};
@@ -42,6 +42,9 @@ impl Config {
         if let Err(policy) = self.compile_policy() {
             d.extend(policy);
         }
+        if let Err(conditions) = self.compile_addon_conditions() {
+            d.extend(conditions);
+        }
 
         if d.is_empty() { Ok(()) } else { Err(d) }
     }
@@ -49,10 +52,34 @@ impl Config {
     /// Compile the rules and metrics. `validate` calls this; the run
     /// path and `roxy rule test` use the result.
     pub fn compile_policy(&self) -> Result<Policy, Vec<Diagnostic>> {
+        self.with_policy_input(Policy::compile)
+    }
+
+    /// Compile each addon's `when` (`None` where it has none), against the
+    /// same metrics and address lists as the rules.
+    pub fn compile_addon_conditions(&self) -> Result<Vec<Option<Condition>>, Vec<Diagnostic>> {
+        self.with_policy_input(|input| {
+            let mut out = Vec::with_capacity(self.addons.len());
+            let mut d = Vec::new();
+            for (i, a) in self.addons.iter().enumerate() {
+                let Some(when) = &a.when else {
+                    out.push(None);
+                    continue;
+                };
+                match Condition::compile(input, &format!("addons[{i}].when"), when.as_str()) {
+                    Ok(c) => out.push(Some(c)),
+                    Err(e) => d.extend(e),
+                }
+            }
+            if d.is_empty() { Ok(out) } else { Err(d) }
+        })
+    }
+
+    fn with_policy_input<R>(&self, f: impl FnOnce(&PolicyInput<'_>) -> R) -> R {
         let secret_names: HashSet<String> = self.secrets.keys().cloned().collect();
         let address_lists: HashSet<String> =
             self.address_lists.iter().map(|l| l.name.clone()).collect();
-        Policy::compile(&PolicyInput {
+        f(&PolicyInput {
             rules: &self.rules,
             metrics: &self.metrics,
             secret_names: &secret_names,
@@ -240,6 +267,21 @@ impl Config {
                     "the `secrets` capability is not provided: put credentials on an \
                      endpoint's `headers`, which roxy attaches without the addon seeing them",
                 ));
+            }
+            if let Some(s) = a.sample {
+                if !(s > 0.0 && s <= 1.0) {
+                    d.push(Diagnostic::new(
+                        format!("{path}.sample"),
+                        "must be greater than 0 and at most 1",
+                    ));
+                }
+                if a.mode != super::AddonMode::Observe {
+                    d.push(Diagnostic::new(
+                        format!("{path}.sample"),
+                        "`sample` needs `mode: observe`: skipping an enforcing addon at random \
+                         would let traffic past it",
+                    ));
+                }
             }
             if a.limits.max_instances == Some(0) {
                 d.push(Diagnostic::new(

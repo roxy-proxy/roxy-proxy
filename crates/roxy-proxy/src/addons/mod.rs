@@ -45,7 +45,7 @@ use crate::flowlog::{DecisionKind, FlowEvent, FlowSink, TlsInfo};
 use crate::listener::ClientConn;
 use crate::pipeline::{BodyIo, CollectFuture, FlowCx, Refusal, RefusalKind};
 use crate::server::{Shared, Snapshot};
-use crate::view::FlowFacts;
+use crate::view::{FlowFacts, ProxyView};
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -64,6 +64,12 @@ pub struct AddonSpec {
     pub state: StateLimits,
     /// Endpoint that also receives `record(.., audit: true)` events.
     pub audit_endpoint: Option<String>,
+    /// `when`: the layer runs only on requests this matches, as they reach
+    /// it; the others go straight to the layer below.
+    pub when: Option<roxy_rules::Condition>,
+    /// `sample` (observe mode only): the share of matching exchanges the
+    /// layer gets a copy of.
+    pub sample: Option<f64>,
 }
 
 /// What runs a layer.
@@ -90,6 +96,12 @@ impl AddonSpec {
 pub(crate) enum StackError {
     Layer(LayerError),
     Service(ServiceError),
+    /// The layer's `when` reached an unavailable input. `code` is the
+    /// rules' fail-closed code.
+    Condition {
+        code: &'static str,
+        reason: String,
+    },
 }
 
 impl From<LayerError> for StackError {
@@ -103,6 +115,9 @@ impl std::fmt::Display for StackError {
         match self {
             StackError::Layer(e) => e.fmt(f),
             StackError::Service(e) => e.fmt(f),
+            StackError::Condition { reason, .. } => {
+                write!(f, "`when` could not be evaluated: {reason}")
+            }
         }
     }
 }
@@ -184,6 +199,8 @@ impl NextState {
 #[derive(Default)]
 struct LayerSlot {
     next: AtomicU8,
+    /// The layer ran on this exchange: its `when` and `sample` let it.
+    ran: AtomicBool,
     /// The layer's own outcome, once its handler returned a response: a
     /// failure after the head shows here first.
     outcome: Mutex<Option<LayerOutcome>>,
@@ -450,7 +467,14 @@ impl StackFlow {
     /// Folds the stack into the flow record just before its `request`
     /// event: the layers and the tags they added.
     pub(crate) fn fold_into(&self, cx: &mut FlowCx) {
-        cx.record.addons = self.snap.addons.iter().map(|a| a.name.clone()).collect();
+        cx.record.addons = self
+            .snap
+            .addons
+            .iter()
+            .zip(&self.layers)
+            .filter(|(_, l)| l.ran.load(Ordering::SeqCst))
+            .map(|(a, _)| a.name.clone())
+            .collect();
         for t in self.tags() {
             if !cx.record.tags.contains(&t) {
                 cx.record.tags.push(t);
@@ -464,6 +488,7 @@ fn error_kind(e: &StackError) -> String {
     let e = match e {
         StackError::Layer(e) => e,
         StackError::Service(e) => return e.kind().to_owned(),
+        StackError::Condition { code, .. } => return format!("when:{code}"),
     };
     match e {
         LayerError::Trap(_) => "trap".into(),
@@ -608,8 +633,18 @@ pub(crate) fn enter(
     req: LayerRequest,
 ) -> BoxFuture<Result<LayerResponse, HostError>> {
     Box::pin(async move {
-        st.layers[index].set(NextState::Entered);
         let addon = st.snap.addons[index].clone();
+        let req = match selects(&st, index, &addon, req) {
+            Ok((true, req)) => req,
+            // Skipped: as if the layer passed both directions on unchanged.
+            Ok((false, req)) => return below(st, index, req).await,
+            Err(e) => {
+                st.fail(&addon.name, e);
+                return Err(HostError::new(format!("layer {} failed", addon.name)));
+            }
+        };
+        st.layers[index].ran.store(true, Ordering::SeqCst);
+        st.layers[index].set(NextState::Entered);
         if addon.observe {
             return tee::observe(st, index, req).await;
         }
@@ -637,6 +672,80 @@ pub(crate) fn enter(
             }
         }
     })
+}
+
+/// Whether layer `index` runs on `req`: its `when` matches the request
+/// as it reaches the layer, and `sample` picks the exchange. The request
+/// comes back for the layer, or for the layer below when it is skipped.
+///
+/// A `when` sees the request re-validated as the core would, so a layer
+/// above that passed on something invalid fails here, attributed to it.
+fn selects(
+    st: &StackFlow,
+    index: usize,
+    addon: &AddonSpec,
+    req: LayerRequest,
+) -> Result<(bool, LayerRequest), StackError> {
+    let Some(when) = &addon.when else {
+        return Ok((sampled(st.flow, index, addon.sample), req));
+    };
+    let snap = &st.snap;
+    let mut creq = match from_layer_request(req, &snap.limits, &snap.flags) {
+        Ok(r) => r,
+        Err(e) => {
+            // Layer 0 gets the client's request, already canonical.
+            let above = &snap.addons[index.saturating_sub(1)].name;
+            st.fail(above, LayerError::InvalidRequest(e.to_string()));
+            return Err(LayerError::InvalidRequest(e.to_string()).into());
+        }
+    };
+    creq.meta.upgrade.clone_from(&st.upgrade_req);
+    let mut facts = st.facts();
+    facts.request = Some(crate::pipeline::request_facts(&creq));
+    let view = ProxyView::new(
+        &facts,
+        &*st.shared.metrics,
+        &*st.shared.state,
+        &snap.address_lists,
+    );
+    let matched = when.matches(&view, &st.tags());
+    let metric_err = view.take_metric_error();
+    drop(view);
+    match matched {
+        Ok(m) => Ok((
+            m && sampled(st.flow, index, addon.sample),
+            to_layer_request(creq),
+        )),
+        Err(reason) => {
+            let err = StackError::Condition {
+                code: crate::pipeline::fail_closed_code(&reason, metric_err.as_ref()),
+                reason: reason.to_string(),
+            };
+            if !addon.observe {
+                return Err(err);
+            }
+            // An observer cannot affect traffic, so neither can its `when`.
+            emit_stack_error(st, &addon.name, &err, true);
+            Ok((false, to_layer_request(creq)))
+        }
+    }
+}
+
+/// Whether `sample` picks this exchange for layer `index`. The draw comes
+/// from the flow id's random bits, so it is reproducible from the log, and
+/// is mixed with the index so two sampled layers draw independently.
+fn sampled(flow: Ulid, index: usize, sample: Option<f64>) -> bool {
+    let Some(p) = sample else {
+        return true;
+    };
+    // splitmix64's finaliser: every input bit reaches the top 32.
+    let low = u64::try_from(flow.random() & u128::from(u64::MAX)).unwrap_or(0);
+    let mut z = low ^ (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    let draw = u32::try_from(z >> 32).unwrap_or(u32::MAX);
+    f64::from(draw) < p * 4_294_967_296.0
 }
 
 /// What layer `index`'s `next` reaches: the next layer, or the core.
@@ -842,7 +951,12 @@ pub(crate) fn chain_tunnels(
     leftover: Vec<u8>,
 ) -> (crate::io::BoxIo, Vec<u8>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let tunnels = tunnel_layers(&st.snap.addons);
+    // Only the layers that ran on the upgrade request: a `when` that
+    // skipped a layer skips its tunnel too.
+    let tunnels: Vec<usize> = tunnel_layers(&st.snap.addons)
+        .into_iter()
+        .filter(|&i| st.layers[i].ran.load(Ordering::SeqCst))
+        .collect();
     if tunnels.is_empty() {
         return (client, leftover);
     }
@@ -888,4 +1002,31 @@ pub(crate) fn chain_tunnels(
         side_w = Box::new(down_w);
     }
     (Box::new(tokio::io::join(side_r, side_w)), Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sampled;
+    use ulid::Ulid;
+
+    #[test]
+    fn sampling_is_deterministic_and_proportional() {
+        let flows: Vec<Ulid> = (0..10_000).map(|_| Ulid::generate()).collect();
+        assert!(flows.iter().all(|&f| sampled(f, 0, None)));
+        assert!(flows.iter().all(|&f| sampled(f, 3, Some(1.0))));
+        for p in [0.01, 0.25, 0.9] {
+            let hits = flows.iter().filter(|&&f| sampled(f, 0, Some(p))).count();
+            #[allow(clippy::cast_precision_loss)]
+            let share = hits as f64 / flows.len() as f64;
+            assert!((share - p).abs() < 0.03, "p {p}: {share}");
+        }
+        let f = flows[0];
+        assert_eq!(sampled(f, 1, Some(0.5)), sampled(f, 1, Some(0.5)));
+        // Two layers draw independently.
+        let both = flows
+            .iter()
+            .filter(|&&f| sampled(f, 0, Some(0.5)) && sampled(f, 1, Some(0.5)))
+            .count();
+        assert!((2000..3000).contains(&both), "{both}");
+    }
 }

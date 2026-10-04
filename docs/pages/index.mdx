@@ -64,6 +64,38 @@ roxy rule test --config roxy.yaml POST https://api.openai.com/v1/responses
 
 The full language is in [rules](/reference/rule-language).
 
+## An addon
+
+Addons sit above the rules and own both streams of the exchanges they
+choose. This one judges an agent's model calls with a monitor model before
+they leave, and a second addon gets a copy of one write in ten for an
+external audit service:
+
+```yaml
+addons:                                    # above the rules, outermost first
+  - name: sentinel                         # a WASM component, run in process
+    path: /etc/roxy/addons/sentinel.wasm
+    when: host == "api.anthropic.com" and path starts_with "/v1/messages"
+    capabilities: [endpoints, record]
+    endpoints:
+      monitor:                             # the addon names it; roxy holds the key
+        url: https://api.anthropic.com/v1/messages
+        headers: { x-api-key: "${secret:monitor_key}" }
+
+  - name: audit-tap                        # an external service, sent a copy
+    kind: service
+    mode: observe                          # can't change or delay traffic
+    when: method in [POST, PUT, PATCH, DELETE]
+    sample: 0.1
+    endpoint: tap
+    endpoints:
+      tap: { url: "https://audit.internal/roxy", private_ok: true }
+```
+
+Whatever `sentinel` passes on is still judged by the rules. If it fails, the
+flow is denied. [Addons](/addons/overview) covers the model,
+[writing one](/addons/writing) the SDK.
+
 ## What roxy is not
 
 roxy is not a transparent gateway. It decides what passes through it, and it can't stop traffic that never reaches it. To contain a workload, the network has to give it no route out except through roxy. [Containing a workload](/deploy/overview) gives the recipe.

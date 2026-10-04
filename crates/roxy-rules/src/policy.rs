@@ -63,6 +63,62 @@ impl MetricDef {
     }
 }
 
+/// A standalone condition over head fields, compiled against a policy's
+/// metrics and address lists: an addon's `when`.
+///
+/// It may not read a watched field, nor `body.text`: whatever it guards
+/// owns the body stream, so nothing reads the body before it does.
+#[derive(Debug, Clone)]
+pub struct Condition {
+    pred: Pred,
+}
+
+impl Condition {
+    /// Compiles `src`. `path` locates it in diagnostics (`addons[0].when`).
+    pub fn compile(
+        input: &PolicyInput<'_>,
+        path: &str,
+        src: &str,
+    ) -> Result<Condition, Vec<Diagnostic>> {
+        let mut c = PolicyCompiler {
+            input,
+            d: Vec::new(),
+            needs: Needs::default(),
+        };
+        let Some((pred, needs)) = c.expr(None, path.to_owned(), src) else {
+            return Err(c.d);
+        };
+        // A byte metric's value is known at the head; only fields are late.
+        let mut late: Vec<String> = needs
+            .watched
+            .iter()
+            .filter(|n| !n.starts_with("metric."))
+            .map(|n| format!("`{n}`"))
+            .collect();
+        if needs.request_body {
+            late.push("`body.text`".to_owned());
+        }
+        if !late.is_empty() {
+            return Err(vec![Diagnostic::new(
+                path,
+                format!(
+                    "a condition here may only read head fields, and not `body.text`, because \
+                     it is decided before the request body is read; it reads {}",
+                    late.join(", ")
+                ),
+            )]);
+        }
+        Ok(Condition { pred })
+    }
+
+    /// Whether a flow matches. `tags` are visible as `tag["x"]`. `Err` if
+    /// evaluation reaches an unavailable input; the caller must then fail
+    /// the flow closed, never treat it as a mismatch.
+    pub fn matches(&self, view: &dyn FlowView, tags: &[String]) -> Result<bool, FailClosedReason> {
+        Scope::new(view, tags, &[]).check(&self.pred)
+    }
+}
+
 /// A `set_header` value: literal text and `${secret:name}` references.
 #[derive(Debug, Clone)]
 enum Part {
