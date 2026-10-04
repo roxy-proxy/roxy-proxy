@@ -104,27 +104,17 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
 
-      # The README's docker compose quickstart, end to end, on the image just
-      # built (no second build): roxy and the sandboxed agent start, and
-      # examples/compose/demo.sh checks that allowed traffic gets through,
-      # denied traffic is refused, and the agent has no route around roxy.
-      - name: Quickstart demo
+      # The quickstart, end to end, on the image just built: roxy and the
+      # inspect_sentinel sidecar start, and examples/quickstart/test.sh
+      # checks that the sentinel passes and blocks a fake model's tool
+      # calls, roxy's rules deny other hosts, and both record their
+      # decisions. It prints the compose logs if a check fails.
+      - name: Quickstart test
         if: matrix.arch == 'amd64'
-        working-directory: examples/compose
+        working-directory: examples/quickstart
         env:
           ROXY_IMAGE: roxy:test
-        run: |
-          docker compose up -d --wait --no-build
-          ./demo.sh
-
-      - name: Quickstart logs
-        if: always() && matrix.arch == 'amd64'
-        working-directory: examples/compose
-        env:
-          ROXY_IMAGE: roxy:test
-        run: |
-          docker compose logs --no-color
-          docker compose down -v
+        run: ./test.sh
 
       - name: Log in to GHCR
         if: env.PUBLISH == 'true'

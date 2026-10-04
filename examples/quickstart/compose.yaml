@@ -1,0 +1,58 @@
+# roxy quickstart: Claude Code behind roxy and an inspect_sentinel sidecar.
+#
+#   docker compose up -d --wait            # roxy on 127.0.0.1:3128, its CA on :3130
+#   curl -fsS http://127.0.0.1:3130/roxy-ca.pem -o roxy-ca.pem
+#   HTTPS_PROXY=http://127.0.0.1:3128 NODE_EXTRA_CA_CERTS=$PWD/roxy-ca.pem \
+#     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 claude
+#
+# Claude Code honours the proxy variables, but nothing on your machine makes
+# it: this shows what roxy and the sentinel decide, not containment. To
+# contain a workload, give it no route out except through roxy (see the
+# docs: Deploy > Containing a workload).
+#
+# To build roxy from this checkout instead of pulling it, add --build.
+name: roxy-quickstart
+
+services:
+  roxy:
+    image: ${ROXY_IMAGE:-ghcr.io/roxy-proxy/roxy:edge}
+    build:
+      context: ../..
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - ./roxy.yaml:/etc/roxy/roxy.yaml:ro
+      - roxy-ca:/var/lib/roxy/ca     # keep the CA across restarts
+    ports:
+      - "127.0.0.1:3128:3128"        # the proxy
+      - "127.0.0.1:3130:3130"        # the CA certificate
+    networks: [sidecar, egress]
+    depends_on:
+      sentinel:
+        condition: service_healthy
+
+  # The sentinel sidecar (examples/addons/service/sentinel): a regex
+  # denylist over tool calls. It needs no route out, so it has none.
+  sentinel:
+    image: roxy-quickstart-sentinel
+    build:
+      context: ../addons/service
+      dockerfile: sentinel/Dockerfile
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: [/tmp]
+    environment:
+      SENTINEL: policies:deny_regex
+      SENTINEL_ON_REJECT: explain      # a blocked call becomes an assistant message
+      SENTINEL_DENY:                   # your regex, from the shell; unset = the default
+    networks: [sidecar]
+
+networks:
+  sidecar:
+    internal: true                   # roxy and the sentinel only; no route out
+  egress: {}
+
+volumes:
+  roxy-ca: {}

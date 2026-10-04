@@ -1,0 +1,14 @@
+# For test.sh only: a fake model API on the sidecar network, and roxy's
+# policy with one rule added so it may reach it. See test.sh.
+services:
+  roxy:
+    volumes:
+      - ${ROXY_TEST_CONFIG:?run test.sh}:/etc/roxy/roxy.yaml:ro
+  fake-model:
+    image: roxy-quickstart-sentinel
+    command: ["python", "sentinel/fake_anthropic.py", "8082", "0.0.0.0"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8082), 1)"]
+      interval: 1s
+      retries: 30
+    networks: [sidecar]
