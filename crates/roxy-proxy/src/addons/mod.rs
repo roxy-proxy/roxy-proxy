@@ -39,6 +39,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+use crate::addr::PrivateAddrs;
 use crate::body::{Collected, collect_prefix};
 use crate::exchange::{Front, Outcome, refusal_response};
 use crate::flowlog::{DecisionKind, FlowEvent, FlowSink, TlsInfo};
@@ -142,8 +143,8 @@ pub struct EndpointSpec {
     pub timeout: Duration,
     /// Extra attempts after a connection failure or a 502/503/504.
     pub retries: u32,
-    /// Allow private addresses.
-    pub private_ok: bool,
+    /// Whether the endpoint may be on a private address.
+    pub private: PrivateAddrs,
 }
 
 /// An addon's keyed store limits.

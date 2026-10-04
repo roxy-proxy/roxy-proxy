@@ -21,6 +21,7 @@ use roxy_http::{Body, CanonicalRequest, CanonicalResponse, Limits, ParseError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
+use crate::addr::PrivateAddrs;
 use crate::body::{counted, counted_until_sent};
 use crate::capture::{self, Tap};
 use crate::flowlog::{DecisionKind, FlowEvent};
@@ -30,7 +31,7 @@ use crate::pipeline::{
     BodyIo, FlowCx, Refusal, RefusalKind, ResponseVerdict, Verdict, request_steps, response_steps,
 };
 use crate::server::Shared;
-use crate::upstream::{ConnectError, classify, describe};
+use crate::upstream::{ConnectError, Protocols, classify, describe};
 use crate::view::host_text;
 use crate::watch::{Dir, Watch, watched};
 
@@ -397,7 +398,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
     let (mut up_tap, down_tap) = taps(cx);
     let host = host_text(&req.authority.host);
     let port = req.authority.port;
-    let private_ok = cx.opts.private_ok;
+    let private = PrivateAddrs::from_private_ok(cx.opts.private_ok);
     let wants_ws = req
         .meta
         .upgrade
@@ -418,7 +419,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
         req.meta.upgrade = None;
     }
     let upstream_client = cx.snap.upstream.clone();
-    if let Err(e) = upstream_client.preflight(&req.authority, private_ok).await {
+    if let Err(e) = upstream_client.preflight(&req.authority, private).await {
         return Outcome::Refuse(upstream_refusal(cx, &e, &host, port));
     }
     let limits = cx.snap.limits.clone();
@@ -454,7 +455,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
         set_host_override(cx, &mut http_req);
         let attempt = async {
             let io = upstream_client
-                .connect_h1(scheme, &authority, private_ok)
+                .connect_h1(scheme, &authority, private)
                 .await
                 .map_err(Some)?;
             let (mut sender, connection) =
@@ -528,10 +529,13 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
             }
         };
         set_host_override(cx, &mut http_req);
+        let protocols = if cx.host_override.is_some() {
+            Protocols::Http1Only
+        } else {
+            Protocols::Any
+        };
         let upstream = response_head(
-            upstream_client
-                .client(private_ok, cx.host_override.is_some())
-                .request(http_req),
+            upstream_client.client(private, protocols).request(http_req),
             sent,
             req_counter.clone(),
             &limits,

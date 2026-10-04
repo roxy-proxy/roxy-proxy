@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use roxy_proxy::Redactor;
-use roxy_proxy::addr::AddressDenied;
+use roxy_proxy::addr::{AddressDenied, PrivateAddrs};
 use roxy_proxy::addrlist::AddressLists;
 use roxy_rules::{
     BodyText, Decision, EvalContext, Field, FlowView, MapView, Outcome, Policy, Reads, RuleId,
@@ -497,7 +497,11 @@ pub fn address_check(
             list: None,
         }));
     }
-    Some(policy.check(ip, opts.private_ok).map(|()| ip))
+    Some(
+        policy
+            .check(ip, PrivateAddrs::from_private_ok(opts.private_ok))
+            .map(|()| ip),
+    )
 }
 
 /// Applies an address-policy denial to the outcome: `403 _address_policy`.

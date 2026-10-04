@@ -42,7 +42,7 @@ use crate::io::BoxIo;
 pub(crate) use dns::Dns;
 pub use dns::DnsSettings;
 
-use crate::addr::{AddressDenied, AddressPolicy};
+use crate::addr::{AddressDenied, AddressPolicy, PrivateAddrs};
 
 /// `upstream.*` settings that may change on reload.
 #[derive(Debug, Clone)]
@@ -204,7 +204,7 @@ struct ConnectorInner {
     dns: Arc<Dns>,
     policy: AddressPolicy,
     connect_timeout: Duration,
-    private_ok: bool,
+    private: PrivateAddrs,
     #[cfg(test)]
     dial: Option<TestDial>,
 }
@@ -249,7 +249,7 @@ impl ConnectorInner {
     async fn resolve_checked(&self, host: &Host) -> Result<Vec<IpAddr>, ConnectError> {
         let ips = self.dns.resolve(host).await?;
         self.policy
-            .check_all(&ips, self.private_ok)
+            .check_all(&ips, self.private)
             .map_err(ConnectError::Denied)?;
         Ok(ips)
     }
@@ -339,6 +339,17 @@ pub(crate) type HttpClient = Client<Connector, Body>;
 /// The pooled clients that share one address-floor setting (`private_ok`
 /// or not), so a connection opened for a `private_ok` flow is never reused
 /// by a flow without it.
+/// Which protocols a pooled client may negotiate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Protocols {
+    /// `h2` or `http/1.1`, by ALPN.
+    Any,
+    /// HTTP/1.1 only: the connection target and `Host` may differ (a
+    /// `redirect` that keeps `Host`); over h2, `:authority` and `host` must
+    /// agree.
+    Http1Only,
+}
+
 struct Pools {
     inner: Arc<ConnectorInner>,
     /// ALPN `h2` or `http/1.1`, as the upstream chooses.
@@ -366,12 +377,12 @@ impl Upstream {
         let mut http1 = (**tls).clone();
         http1.alpn_protocols = vec![b"http/1.1".to_vec()];
         let http1_tls = Arc::new(http1);
-        let pools = |private_ok| {
+        let pools = |private| {
             let inner = Arc::new(ConnectorInner {
                 dns: dns.clone(),
                 policy: s.address_policy.clone(),
                 connect_timeout: s.connect_timeout,
-                private_ok,
+                private,
                 #[cfg(test)]
                 dial: s.dial.clone(),
             });
@@ -392,26 +403,25 @@ impl Upstream {
             }
         };
         Ok(Self {
-            strict: pools(false),
-            private: pools(true),
+            strict: pools(PrivateAddrs::Deny),
+            private: pools(PrivateAddrs::Allow),
         })
     }
 
-    fn pools(&self, private_ok: bool) -> &Pools {
-        if private_ok {
-            &self.private
-        } else {
-            &self.strict
+    fn pools(&self, private: PrivateAddrs) -> &Pools {
+        match private {
+            PrivateAddrs::Allow => &self.private,
+            PrivateAddrs::Deny => &self.strict,
         }
     }
 
-    /// The pooled client for a flow. `http1_only` keeps the exchange on
-    /// HTTP/1.1, where the connection target and `Host` may differ (a
-    /// `redirect` that keeps `Host`); over h2, `:authority` and `host` must
-    /// agree.
-    pub(crate) fn client(&self, private_ok: bool, http1_only: bool) -> &HttpClient {
-        let pools = self.pools(private_ok);
-        if http1_only { &pools.http1 } else { &pools.any }
+    /// The pooled client for a flow.
+    pub(crate) fn client(&self, private: PrivateAddrs, protocols: Protocols) -> &HttpClient {
+        let pools = self.pools(private);
+        match protocols {
+            Protocols::Any => &pools.any,
+            Protocols::Http1Only => &pools.http1,
+        }
     }
 
     /// Resolve and apply the address floor before any request bytes move, so
@@ -421,9 +431,9 @@ impl Upstream {
     pub(crate) async fn preflight(
         &self,
         authority: &Authority,
-        private_ok: bool,
+        private: PrivateAddrs,
     ) -> Result<(), ConnectError> {
-        self.pools(private_ok)
+        self.pools(private)
             .inner
             .resolve_checked(&authority.host)
             .await
@@ -435,9 +445,9 @@ impl Upstream {
         &self,
         scheme: Scheme,
         authority: &Authority,
-        private_ok: bool,
+        private: PrivateAddrs,
     ) -> Result<MaybeTls, ConnectError> {
-        let pools = self.pools(private_ok);
+        let pools = self.pools(private);
         pools
             .inner
             .connect(scheme, &authority.host, authority.port, &pools.http1_tls)
@@ -542,7 +552,11 @@ mod tests {
 
         let before = Upstream::new(&settings(Vec::new()), &tls).unwrap();
         for _ in 0..2 {
-            let res = before.client(true, false).request(get(port)).await.unwrap();
+            let res = before
+                .client(PrivateAddrs::Allow, Protocols::Any)
+                .request(get(port))
+                .await
+                .unwrap();
             assert_eq!(res.status(), 200);
         }
         assert_eq!(accepted.load(Ordering::SeqCst), 1, "second request pooled");
@@ -550,13 +564,14 @@ mod tests {
         let list = Arc::new(AddressList::parse("blocked", "127.0.0.1\n").unwrap());
         let after = Upstream::new(&settings(vec![list]), &tls).unwrap();
         let authority = Authority::new(Host::Dns("listed.test".into()), port);
-        let Err(ConnectError::Denied(d)) = after.preflight(&authority, true).await else {
+        let Err(ConnectError::Denied(d)) = after.preflight(&authority, PrivateAddrs::Allow).await
+        else {
             panic!("preflight must deny");
         };
         assert_eq!(d.list.as_deref(), Some("blocked"));
         // Straight through the pooled client, bypassing the preflight.
         let err = after
-            .client(true, false)
+            .client(PrivateAddrs::Allow, Protocols::Any)
             .request(get(port))
             .await
             .unwrap_err();
@@ -568,7 +583,9 @@ mod tests {
         assert_eq!(d.ip, "127.0.0.1".parse::<IpAddr>().unwrap());
         // And the WebSocket path.
         assert!(matches!(
-            after.connect_h1(Scheme::Http, &authority, true).await,
+            after
+                .connect_h1(Scheme::Http, &authority, PrivateAddrs::Allow)
+                .await,
             Err(ConnectError::Denied(_))
         ));
         assert_eq!(accepted.load(Ordering::SeqCst), 1, "nothing was dialled");

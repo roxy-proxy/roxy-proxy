@@ -36,6 +36,23 @@ impl Default for AddressPolicy {
     }
 }
 
+/// Whether a flow may reach the private ranges: a rule's
+/// `allow: { private_ok: true }`, or an addon endpoint's `private_ok`. An
+/// enum, not a `bool`, so it can't be swapped with another flag at a call
+/// site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateAddrs {
+    Deny,
+    Allow,
+}
+
+impl PrivateAddrs {
+    /// From a configured `private_ok`.
+    pub fn from_private_ok(private_ok: bool) -> Self {
+        if private_ok { Self::Allow } else { Self::Deny }
+    }
+}
+
 /// Why an address was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressDenied {
@@ -152,10 +169,10 @@ pub fn private_class(ip: IpAddr) -> Option<&'static str> {
 
 impl AddressPolicy {
     /// Checks one candidate address: `deny_cidrs`, then the private-range
-    /// floor, then every deny list. `private_ok` comes from the flow's
-    /// `allow: { private_ok: true }`; it never overrides `deny_cidrs` or a
-    /// deny list.
-    pub fn check(&self, ip: IpAddr, private_ok: bool) -> Result<(), AddressDenied> {
+    /// floor, then every deny list. [`PrivateAddrs::Allow`] lifts the
+    /// private-range floor only; it never overrides `deny_cidrs` or a deny
+    /// list.
+    pub fn check(&self, ip: IpAddr, private: PrivateAddrs) -> Result<(), AddressDenied> {
         let denied = |reason: String, matched_cidr, list| AddressDenied {
             ip: canonical(ip),
             reason,
@@ -171,7 +188,7 @@ impl AddressPolicy {
         // The exemption matches the address itself only (and its IPv4 form,
         // the same address): a translated form of it is a different address.
         if self.deny_private_ranges
-            && !private_ok
+            && private == PrivateAddrs::Deny
             && let Some(class) = private_class(ip)
             && !self.allow_cidrs.iter().any(|n| n.contains(&canonical(ip)))
         {
@@ -188,9 +205,9 @@ impl AddressPolicy {
 
     /// Checks every candidate; any denied candidate denies the whole set
     /// (an attacker-controlled name gets no second roll of the dice).
-    pub fn check_all(&self, ips: &[IpAddr], private_ok: bool) -> Result<(), AddressDenied> {
+    pub fn check_all(&self, ips: &[IpAddr], private: PrivateAddrs) -> Result<(), AddressDenied> {
         for ip in ips {
-            self.check(*ip, private_ok)?;
+            self.check(*ip, private)?;
         }
         Ok(())
     }
@@ -198,6 +215,7 @@ impl AddressPolicy {
 
 #[cfg(test)]
 mod tests {
+    use super::PrivateAddrs::{Allow, Deny};
     use super::*;
 
     fn ip(s: &str) -> IpAddr {
@@ -252,16 +270,16 @@ mod tests {
             allow_cidrs: vec!["10.9.9.9/32".parse().unwrap()],
             deny_lists: Vec::new(),
         };
-        assert!(p.check(ip("127.0.0.1"), false).is_err());
-        assert!(p.check(ip("127.0.0.1"), true).is_ok());
-        assert!(p.check(ip("10.9.9.9"), false).is_ok());
-        assert!(p.check(ip("10.9.9.8"), false).is_err());
-        let d = p.check(ip("::ffff:1.2.3.4"), true).unwrap_err();
+        assert!(p.check(ip("127.0.0.1"), Deny).is_err());
+        assert!(p.check(ip("127.0.0.1"), Allow).is_ok());
+        assert!(p.check(ip("10.9.9.9"), Deny).is_ok());
+        assert!(p.check(ip("10.9.9.8"), Deny).is_err());
+        let d = p.check(ip("::ffff:1.2.3.4"), Allow).unwrap_err();
         assert_eq!(d.reason, "deny_cidrs");
         assert_eq!(d.ip, ip("1.2.3.4"));
-        assert!(p.check(ip("8.8.8.8"), false).is_ok());
+        assert!(p.check(ip("8.8.8.8"), Deny).is_ok());
         assert!(
-            p.check_all(&[ip("8.8.8.8"), ip("192.168.0.1")], false)
+            p.check_all(&[ip("8.8.8.8"), ip("192.168.0.1")], Deny)
                 .is_err()
         );
     }
@@ -284,7 +302,7 @@ mod tests {
             "64:ff9b:1::cb00:7107",
             "2002:cb00:7107::1",
         ] {
-            let d = p.check(ip(a), true).unwrap_err();
+            let d = p.check(ip(a), Allow).unwrap_err();
             assert_eq!(d.reason, "deny_cidrs", "{a}");
             assert_eq!(
                 d.matched_cidr,
@@ -292,11 +310,11 @@ mod tests {
                 "{a}"
             );
         }
-        assert!(p.check(ip("10.9.9.9"), false).is_ok());
-        assert!(p.check(ip("::ffff:10.9.9.9"), false).is_ok());
+        assert!(p.check(ip("10.9.9.9"), Deny).is_ok());
+        assert!(p.check(ip("::ffff:10.9.9.9"), Deny).is_ok());
         for a in ["64:ff9b::a09:909", "2002:a09:909::1"] {
             assert_eq!(
-                p.check(ip(a), false).unwrap_err().reason,
+                p.check(ip(a), Deny).unwrap_err().reason,
                 "private_range:private",
                 "{a}"
             );
@@ -314,18 +332,18 @@ mod tests {
             deny_lists: vec![Arc::new(list)],
         };
         // `private_ok` does not bypass a list.
-        let d = p.check(ip("127.0.0.1"), true).unwrap_err();
+        let d = p.check(ip("127.0.0.1"), Allow).unwrap_err();
         assert_eq!(d.reason, "list:blocked");
         assert_eq!(d.list.as_deref(), Some("blocked"));
         assert_eq!(d.matched_cidr, Some("127.0.0.0/8".parse().unwrap()));
         // Neither does `allow_cidrs`.
         assert_eq!(
-            p.check(ip("10.9.9.9"), true).unwrap_err().reason,
+            p.check(ip("10.9.9.9"), Allow).unwrap_err().reason,
             "list:blocked"
         );
         // Without private_ok the private floor answers first.
         assert_eq!(
-            p.check(ip("127.0.0.1"), false).unwrap_err().reason,
+            p.check(ip("127.0.0.1"), Deny).unwrap_err().reason,
             "private_range:loopback"
         );
         // Public address, v6 spellings of it.
@@ -335,7 +353,7 @@ mod tests {
             "64:ff9b::cb00:7107",
             "2002:cb00:7107::1",
         ] {
-            let d = p.check(ip(a), true).unwrap_err();
+            let d = p.check(ip(a), Allow).unwrap_err();
             assert_eq!(d.list.as_deref(), Some("blocked"), "{a}");
             assert_eq!(
                 d.matched_cidr,
@@ -345,9 +363,9 @@ mod tests {
         }
         // Any listed candidate denies the whole set.
         let d = p
-            .check_all(&[ip("8.8.8.8"), ip("203.0.113.1")], true)
+            .check_all(&[ip("8.8.8.8"), ip("203.0.113.1")], Allow)
             .unwrap_err();
         assert_eq!(d.ip, ip("203.0.113.1"));
-        assert!(p.check_all(&[ip("8.8.8.8"), ip("1.1.1.1")], true).is_ok());
+        assert!(p.check_all(&[ip("8.8.8.8"), ip("1.1.1.1")], Allow).is_ok());
     }
 }

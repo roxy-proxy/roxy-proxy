@@ -426,11 +426,11 @@ async fn connect(
     let result = async {
         let upstream = st.snap.upstream.clone();
         upstream
-            .preflight(&authority, spec.private_ok)
+            .preflight(&authority, spec.private)
             .await
             .map_err(|e| ServiceError::Connect(e.to_string()))?;
         let io = upstream
-            .connect_h1(scheme, &authority, spec.private_ok)
+            .connect_h1(scheme, &authority, spec.private)
             .await
             .map_err(|e| ServiceError::Connect(e.to_string()))?;
         let config = WebSocketConfig::default()
