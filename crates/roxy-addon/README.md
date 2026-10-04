@@ -2,7 +2,7 @@
 
 Write [roxy](https://github.com/roxy-proxy/roxy-proxy) addon layers in Rust.
 
-roxy is a programmable, TLS-intercepting HTTP firewall built for streaming. An
+roxy is a TLS-intercepting HTTP firewall built for streaming. An
 addon is a WebAssembly component that sits in each exchange's layer stack
 above roxy's rules. It gets the request with a streaming body, may pass a
 request down once, and returns a response, whose body also streams. Whatever

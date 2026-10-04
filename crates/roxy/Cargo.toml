@@ -1,6 +1,6 @@
 [package]
 name = "roxy"
-description = "A programmable, TLS-intercepting HTTP firewall built for streaming"
+description = "A TLS-intercepting HTTP firewall built for streaming"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
