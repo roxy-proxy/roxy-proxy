@@ -1,11 +1,11 @@
 ---
 title: "Overview"
-description: "roxy is a programmable, TLS-intercepting HTTP proxy built for streaming. Addons rewrite, answer or block exchanges mid-stream; a strict policy layer underneath decides what leaves."
+description: "roxy is a programmable, TLS-intercepting HTTP firewall built for streaming. Addons rewrite, answer or block exchanges mid-stream; a strict policy layer underneath decides what leaves."
 ---
 
 # Overview
 
-roxy is a programmable, TLS-intercepting HTTP proxy built for streaming. Each exchange flows through the addons that match it, which can rewrite, answer or block it mid-stream, and a strict policy layer underneath decides what actually leaves. It is meant for workloads you don't fully trust: AI agents, CI jobs, sandboxes and third-party code.
+roxy is a programmable, TLS-intercepting HTTP firewall built for streaming. Each exchange flows through the addons that match it, which can rewrite, answer or block it mid-stream, and a strict policy layer underneath decides what actually leaves. It is meant for workloads you don't fully trust: AI agents, CI jobs, sandboxes and third-party code.
 
 Clients use it as an explicit `HTTP_PROXY`, or reach it through its own DNS if they ignore proxy settings ([DNS steering](/deploy/dns-steering)). roxy decides what each request may reach, holds the credentials the workload needs so the workload never sees them, and logs every decision as a line of JSON.
 

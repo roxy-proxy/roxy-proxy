@@ -1,4 +1,4 @@
-//! roxy: a programmable, TLS-intercepting HTTP proxy built for streaming.
+//! roxy: a programmable, TLS-intercepting HTTP firewall built for streaming.
 //!
 //! See `docs/` at the repository root. This binary owns the CLI, config
 //! loading and wiring; the engine lives in the library crates.
@@ -22,7 +22,7 @@ use roxy::ruletest;
 #[command(
     name = "roxy",
     version,
-    about = "Programmable, TLS-intercepting HTTP proxy built for streaming"
+    about = "Programmable, TLS-intercepting HTTP firewall built for streaming"
 )]
 struct Cli {
     /// Operational log format (default: pretty on a TTY, json otherwise).

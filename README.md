@@ -1,6 +1,6 @@
 # roxy
 
-roxy is a programmable, TLS-intercepting HTTP proxy built for streaming.
+roxy is a programmable, TLS-intercepting HTTP firewall built for streaming.
 Each exchange flows through the addons that match it, which can rewrite,
 answer or block it mid-stream, and a strict policy layer underneath decides
 what actually leaves. It is meant for workloads you don't fully trust: AI
