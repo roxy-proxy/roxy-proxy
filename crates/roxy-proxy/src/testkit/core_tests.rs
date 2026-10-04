@@ -220,6 +220,41 @@ async fn the_address_floor_refuses_private_addresses_without_private_ok() {
     assert_eq!(seen[0].path, "/ok");
 }
 
+/// Capture records what left: a refusal before the head leaves (here the
+/// address floor at preflight) leaves nothing in the capture, not a
+/// headless aborted end.
+#[tokio::test]
+async fn a_refusal_before_forwarding_captures_nothing() {
+    let kit = Kit::builder().rules(RULES).capture_all().start().await;
+    let mut c = kit.h1().await;
+    let req = c
+        .request_to("private.test", "GET", "/strict", &[])
+        .body(roxy_http::Body::empty())
+        .unwrap();
+    assert_eq!(Answer::read(c.send(req).await.unwrap()).await.status, 403);
+    kit.request_event().await;
+    assert!(kit.captured().is_empty(), "{:#?}", kit.captured());
+
+    let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    kit.events("request", 2).await;
+    let kinds: Vec<(String, String)> = kit
+        .captured()
+        .iter()
+        .map(|(h, _)| {
+            (
+                h["dir"].as_str().unwrap().to_owned(),
+                h["kind"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert!(
+        kinds.contains(&("request".to_owned(), "head".to_owned()))
+            && kinds.contains(&("response".to_owned(), "end".to_owned())),
+        "{kinds:?}"
+    );
+}
+
 #[tokio::test]
 async fn h2_clients_get_the_same_decisions() {
     let kit = kit().await;

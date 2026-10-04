@@ -162,9 +162,18 @@ pub(crate) struct KitBuilder {
     /// `metrics:` definitions (YAML); a real metric store holds them.
     metric_defs: String,
     state: Arc<dyn StateSource>,
+    /// Capture every forwarded exchange into the kit's capture log.
+    capture_all: bool,
 }
 
 impl KitBuilder {
+    /// Opens a capture log that takes every forwarded exchange.
+    #[must_use]
+    pub(crate) fn capture_all(mut self) -> Self {
+        self.capture_all = true;
+        self
+    }
+
     #[must_use]
     pub(crate) fn rules(mut self, yaml: &str) -> Self {
         yaml.clone_into(&mut self.rules);
@@ -271,6 +280,20 @@ impl KitBuilder {
             Box::pin(async move { up.dial(addr) })
         })));
 
+        let capture = self.capture_all.then(|| {
+            Arc::new(
+                crate::capture::CaptureLog::open(
+                    &dir.path().join("capture"),
+                    crate::capture::CaptureOptions {
+                        max_body_bytes: 16 * 1024 * 1024,
+                        all: true,
+                        writer: roxy_log::WriterOptions::default(),
+                        rotate: roxy_log::RotateOptions::default(),
+                    },
+                )
+                .unwrap(),
+            )
+        });
         let server = Server::start(RuntimeConfig {
             listeners: Vec::new(),
             ca_server: None,
@@ -288,7 +311,7 @@ impl KitBuilder {
             connection_events: false,
             ws_message_every: 0,
             sink: sink.clone(),
-            capture: None,
+            capture: capture.clone(),
             metrics,
             state: self.state,
             policy: PolicyUpdate {
@@ -310,6 +333,7 @@ impl KitBuilder {
             server,
             sink,
             upstream,
+            capture,
             ca_file: dir.path().join(roxy_tls::CA_CERT_FILE),
             _dir: dir,
         }
@@ -321,6 +345,8 @@ pub(crate) struct Kit {
     pub server: Server,
     pub sink: Arc<MemorySink>,
     pub upstream: Arc<Upstream>,
+    /// The capture log, with [`KitBuilder::capture_all`].
+    pub capture: Option<Arc<crate::capture::CaptureLog>>,
     ca_file: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -335,6 +361,7 @@ impl Kit {
             metrics: Arc::new(UnavailableMetrics),
             metric_defs: String::new(),
             state: Arc::new(UnavailableState),
+            capture_all: false,
         }
     }
 
@@ -498,6 +525,13 @@ impl Kit {
     /// The flow's single `request` event.
     pub(crate) async fn request_event(&self) -> serde_json::Value {
         self.events("request", 1).await.remove(0)
+    }
+
+    /// Everything captured so far, as `(header, payload)` records.
+    pub(crate) fn captured(&self) -> Vec<(serde_json::Value, Vec<u8>)> {
+        let log = self.capture.as_ref().expect("capture_all");
+        assert!(log.flush());
+        crate::capture::tests::parse(&std::fs::read(log.path()).unwrap())
     }
 
     /// Waits until `n` requests have reached the upstream (their bodies may
