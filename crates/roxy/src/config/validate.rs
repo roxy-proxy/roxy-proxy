@@ -147,6 +147,17 @@ impl Config {
             }
             _ => {}
         }
+        match (&self.tls.ca_cert, &self.tls.ca_key) {
+            (Some(_), None) => d.push(Diagnostic::new(
+                "tls.ca_key",
+                "ca_cert is set but ca_key is not; a provided CA needs both",
+            )),
+            (None, Some(_)) => d.push(Diagnostic::new(
+                "tls.ca_cert",
+                "ca_key is set but ca_cert is not; a provided CA needs both",
+            )),
+            _ => {}
+        }
         if self.tls.leaf_cache_size == 0 {
             d.push(Diagnostic::new("tls.leaf_cache_size", "must be at least 1"));
         }
