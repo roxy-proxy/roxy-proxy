@@ -17,7 +17,9 @@ use roxy_http::ws::frame::{self, Decoder, FrameError, Opcode, Peer, close};
 use roxy_http::ws::{
     WsKey, validate_no_extensions, validate_upgrade_request, validate_upgrade_response,
 };
-use roxy_http::{Body, CanonicalRequest, CanonicalResponse, Limits, ParseError};
+use roxy_http::{
+    Body, BodyError, CanonicalRequest, CanonicalResponse, Limits, ParseError, WriteError,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
@@ -47,6 +49,109 @@ pub(crate) async fn respond(mut conn: ServerConn<ClientIo>, res: CanonicalRespon
         return None;
     }
     Some(conn)
+}
+
+/// Why a front could not write a response.
+#[derive(Debug)]
+pub(crate) enum WriteFailure {
+    /// A watching rule stopped the exchange mid-body; the front cut the
+    /// body (h1 closes the connection, h2 resets the stream).
+    Stopped,
+    /// The client stopped reading or went away.
+    ClientGone(String),
+    /// Anything else: the upstream body failed mid-stream, a stalled or
+    /// broken write.
+    Io(String),
+}
+
+impl std::fmt::Display for WriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stopped => f.write_str("stopped by policy"),
+            Self::ClientGone(s) | Self::Io(s) => f.write_str(s),
+        }
+    }
+}
+
+impl From<WriteError> for WriteFailure {
+    fn from(e: WriteError) -> Self {
+        match e {
+            WriteError::Io(e) => Self::ClientGone(e.to_string()),
+            WriteError::Body(BodyError::Stopped) => Self::Stopped,
+            e => Self::Io(e.to_string()),
+        }
+    }
+}
+
+/// What a front writes to end an exchange: the upstream's response (after
+/// the response steps) or roxy's own answer.
+pub(crate) enum Answer {
+    Response(CanonicalResponse),
+    Refusal(Refusal),
+}
+
+/// How a sent answer left the connection.
+pub(crate) struct Sent {
+    /// The write failed: the client got nothing, or a cut body.
+    pub failed: bool,
+    /// The exchange ends the connection: a closing deny, or a watching
+    /// stop that closes. (The h1 codec closes on its own; h2 sends GOAWAY.)
+    pub close: bool,
+}
+
+/// Sends `answer` through `write`, the front's wire action, and does the
+/// accounting around it: the flow record, a `response_error` event if the
+/// write failed, the final metric sample and the `request` event. The
+/// fronts only write bytes.
+pub(crate) async fn send<W, Fut>(cx: &mut FlowCx, answer: Answer, write: W) -> Sent
+where
+    W: FnOnce(CanonicalResponse) -> Fut,
+    Fut: std::future::Future<Output = Result<(), WriteFailure>>,
+{
+    let (mut res, refusal) = match answer {
+        Answer::Response(res) => (res, None),
+        Answer::Refusal(r) => (refusal_response(cx, &r), Some(r)),
+    };
+    let (body, counter) = counted(std::mem::take(&mut res.body));
+    res.body = body;
+    cx.record.response_status = Some(res.status.as_u16());
+    cx.record.response_headers_bytes = res.headers.wire_len() as u64;
+    let r = write(res).await;
+    let failed = r.is_err();
+    cx.record.response_bytes = counter.load(Ordering::Relaxed);
+    let stop = cx.watch.as_ref().and_then(|w| w.stopped());
+    // Under a stop, the cut body is how the stop is delivered, not a
+    // failure of its own.
+    if stop.is_none()
+        && let Err(e @ (WriteFailure::ClientGone(_) | WriteFailure::Io(_))) = r
+    {
+        let reason = match e {
+            WriteFailure::ClientGone(_) => "client_gone",
+            _ => "response_write_failed",
+        };
+        cx.shared.sink.emit(&FlowEvent::ResponseError {
+            ts: chrono::Utc::now(),
+            flow: cx.flow.to_string(),
+            conn: cx.conn_id(),
+            reason: reason.to_owned(),
+            message: e.to_string(),
+        });
+        cx.record.reason.get_or_insert_with(|| reason.to_owned());
+    }
+    let close = match &refusal {
+        // A deny closes the connection; an upstream failure is not a
+        // decision about the client and leaves it alone.
+        Some(r) => r.kind == RefusalKind::Deny && r.close,
+        None => stop.as_ref().is_some_and(|s| s.refusal.close),
+    };
+    if let Some(r) = &refusal {
+        finish_refusal(cx, r);
+    } else {
+        // A client that stopped reading is not an upstream failure.
+        cx.record_final_sample(false);
+        cx.emit_request_event();
+    }
+    Sent { failed, close }
 }
 
 /// Records a local refusal on the flow and builds its response. Pair with
@@ -85,12 +190,13 @@ pub(crate) fn finish_refusal(cx: &mut FlowCx, refusal: &Refusal) {
     cx.emit_request_event();
 }
 
-/// Answers a flow locally and logs it.
-pub(crate) async fn refuse(conn: ServerConn<ClientIo>, mut cx: FlowCx, refusal: Refusal) -> Next {
-    let res = refusal_response(&mut cx, &refusal);
-    let next = respond(conn, res).await;
-    finish_refusal(&mut cx, &refusal);
-    next
+/// Writes `answer` on the h1 codec and logs the exchange.
+async fn answer(mut conn: ServerConn<ClientIo>, mut cx: FlowCx, answer: Answer) -> Next {
+    let sent = send(&mut cx, answer, |res| async {
+        conn.respond(res).await.map_err(WriteFailure::from)
+    })
+    .await;
+    (!sent.failed && !conn.is_closed()).then_some(conn)
 }
 
 /// Records a client-side failure (`status` is what the client was told, if
@@ -244,8 +350,8 @@ pub(crate) async fn run(
     let cx = FlowCx::new(shared.clone(), snap, client, tls, &req);
     let (cx, outcome) = process(&mut conn, cx, req).await;
     match outcome {
-        Outcome::Respond(res) => send_response(conn, cx, res).await,
-        Outcome::Refuse(refusal) => refuse(conn, cx, refusal).await,
+        Outcome::Respond(res) => answer(conn, cx, Answer::Response(res)).await,
+        Outcome::Refuse(refusal) => answer(conn, cx, Answer::Refusal(refusal)).await,
         Outcome::Close(e) => {
             let client = cx.facts.client.clone();
             close_on_parse_error(conn, Some(cx), &client, shared, &e).await;
@@ -580,41 +686,6 @@ fn set_host_override(cx: &FlowCx, req: &mut http::Request<Body>) {
     }
 }
 
-async fn send_response(
-    mut conn: ServerConn<ClientIo>,
-    mut cx: FlowCx,
-    mut res: CanonicalResponse,
-) -> Next {
-    let (body, counter) = counted(std::mem::take(&mut res.body));
-    res.body = body;
-    cx.record.response_status = Some(res.status.as_u16());
-    cx.record.response_headers_bytes = res.headers.wire_len() as u64;
-    let r = conn.respond(res).await;
-    // A watching stop mid-body ends the body with an error: the codec stops
-    // before any terminating chunk and the connection is dropped.
-    let stopped = cx.watch.as_ref().is_some_and(|w| w.stopped().is_some());
-    let next = match r {
-        Err(_) if stopped => None,
-        Err(e) => {
-            cx.shared.sink.emit(&FlowEvent::ResponseError {
-                ts: chrono::Utc::now(),
-                flow: cx.flow.to_string(),
-                conn: cx.conn_id(),
-                reason: "response_write_failed".to_owned(),
-                message: e.to_string(),
-            });
-            None
-        }
-        Ok(()) if conn.is_closed() => None,
-        Ok(()) => Some(conn),
-    };
-    cx.record.response_bytes = counter.load(Ordering::Relaxed);
-    // A client that stopped reading is not an upstream failure.
-    cx.record_final_sample(false);
-    cx.emit_request_event();
-    next
-}
-
 async fn splice_websocket(
     conn: ServerConn<ClientIo>,
     mut cx: FlowCx,
@@ -639,7 +710,7 @@ async fn splice_websocket(
             .unwrap_or_default();
         let port = cx.facts.request.as_ref().map_or(0, |r| r.port);
         let r = protocol_refusal(&cx, &host, port, e.to_string());
-        return refuse(conn, cx, r).await;
+        return answer(conn, cx, Answer::Refusal(r)).await;
     }
     cx.record.response_status = Some(101);
     let (client_io, leftover) = match conn.respond_upgrade(res).await {

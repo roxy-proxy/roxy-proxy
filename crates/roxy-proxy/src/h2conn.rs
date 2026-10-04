@@ -46,16 +46,15 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, Sleep, sleep, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::body::{Collected, collect_prefix, counted};
+use crate::body::{Collected, collect_prefix};
 use crate::conn::ConnLimits;
 use crate::exchange::{
-    Front, Outcome, finish_refusal, process, record_client_failure, record_client_gone,
-    refusal_response,
+    Answer, Front, Outcome, WriteFailure, process, record_client_failure, record_client_gone, send,
 };
-use crate::flowlog::{FlowEvent, TlsInfo};
+use crate::flowlog::TlsInfo;
 use crate::io::Io;
 use crate::listener::ClientConn;
-use crate::pipeline::{BodyIo, CollectFuture, FlowCx, RefusalKind, body_failure};
+use crate::pipeline::{BodyIo, CollectFuture, FlowCx, body_failure};
 use crate::server::Shared;
 
 /// How long in-flight streams may continue after the connection started
@@ -278,35 +277,32 @@ async fn serve_stream(
         idle: limits.body_idle_timeout,
         allow_trailers: flags.allow_trailers,
     };
-    match outcome {
-        Outcome::Respond(res) => send_upstream_response(&mut respond, cx, res, &out, &ccx).await,
-        Outcome::Refuse(refusal) => {
-            let res = refusal_response(&mut cx, &refusal);
-            if let Err(e) = write_response(&mut respond, res, &out).await {
-                tracing::debug!(error = %e, "writing h2 refusal failed");
-            }
-            // A deny closes the connection (GOAWAY once written).
-            // Upstream failures are not decisions about the client and
-            // leave the other streams alone.
-            if refusal.kind == RefusalKind::Deny && refusal.close {
-                ccx.closing.cancel();
-            }
-            finish_refusal(&mut cx, &refusal);
-        }
+    let answer = match outcome {
+        Outcome::Respond(res) => Answer::Response(res),
+        Outcome::Refuse(refusal) => Answer::Refusal(refusal),
         // The client went away: nothing to answer, nothing to reset.
-        Outcome::Close(_) if fail.gone() => record_client_gone(&mut cx),
+        Outcome::Close(_) if fail.gone() => return record_client_gone(&mut cx),
         Outcome::Close(e) => {
             ccx.shared
                 .emit_parse_error(&ccx.client, Some(cx.flow.to_string()), &e);
             respond.send_reset(h2::Reason::PROTOCOL_ERROR);
-            record_client_failure(&mut cx, &e, None);
+            return record_client_failure(&mut cx, &e, None);
         }
         Outcome::Upgrade { .. } => {
             // Unreachable: h2 requests never carry an upgrade. Fail closed.
             respond.send_reset(h2::Reason::INTERNAL_ERROR);
             let e = ParseError::new(Reason::H2UnsupportedMethod, "upgrade over h2");
-            record_client_failure(&mut cx, &e, None);
+            return record_client_failure(&mut cx, &e, None);
         }
+    };
+    let sent = send(&mut cx, answer, |res| {
+        write_response(&mut respond, res, &out)
+    })
+    .await;
+    // A closing deny, or a watching stop that closes, ends the connection:
+    // GOAWAY once the stream is written.
+    if sent.close {
+        ccx.closing.cancel();
     }
 }
 
@@ -317,41 +313,6 @@ struct Out<'a> {
     allow_trailers: bool,
 }
 
-async fn send_upstream_response(
-    respond: &mut SendResponse<Bytes>,
-    mut cx: FlowCx,
-    mut res: CanonicalResponse,
-    out: &Out<'_>,
-    ccx: &ConnCx,
-) {
-    let (body, counter) = counted(std::mem::take(&mut res.body));
-    res.body = body;
-    cx.record.response_status = Some(res.status.as_u16());
-    cx.record.response_headers_bytes = res.headers.wire_len() as u64;
-    let r = write_response(respond, res, out).await;
-    // A watching stop mid-body resets the stream (`CANCEL`, sent by
-    // `write_response`), and a closing deny also ends the connection
-    // (`GOAWAY`).
-    let stop = cx.watch.as_ref().and_then(|w| w.stopped());
-    if let Some(stop) = &stop {
-        if stop.refusal.close {
-            ccx.closing.cancel();
-        }
-    } else if let Err(e) = &r {
-        cx.shared.sink.emit(&FlowEvent::ResponseError {
-            ts: chrono::Utc::now(),
-            flow: cx.flow.to_string(),
-            conn: cx.conn_id(),
-            reason: "response_write_failed".to_owned(),
-            message: e.clone(),
-        });
-    }
-    cx.record.response_bytes = counter.load(Ordering::Relaxed);
-    // A client that stopped reading is not an upstream failure.
-    cx.record_final_sample(false);
-    cx.emit_request_event();
-}
-
 /// Writes `res` on the stream: head, then the body as DATA frames within
 /// the peer's flow-control window, then trailers (only with
 /// `http.allow_trailers`). A body that fails resets the stream, so the
@@ -360,10 +321,10 @@ async fn write_response(
     respond: &mut SendResponse<Bytes>,
     res: CanonicalResponse,
     out: &Out<'_>,
-) -> Result<(), String> {
+) -> Result<(), WriteFailure> {
     let head = to_h2_response(&res, out.method)
         .body(())
-        .map_err(|e| format!("response head: {e}"))?;
+        .map_err(|e| WriteFailure::Io(format!("response head: {e}")))?;
     let bodiless = status_forbids_body(res.status)
         || *out.method == Method::Head
         || res.body.known_length() == Some(0);
@@ -371,46 +332,35 @@ async fn write_response(
     if bodiless {
         respond
             .send_response(head, true)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| stream_error(&e))?;
         return Ok(());
     }
     let mut send = respond
         .send_response(head, false)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| stream_error(&e))?;
     let r = stream_body(&mut send, &mut body, out).await;
     match &r {
-        Err(BodyFailure::Stopped) => {
+        Err(WriteFailure::Stopped) => {
             tracing::debug!("h2 response stopped by policy; resetting the stream");
             send.send_reset(h2::Reason::CANCEL);
         }
-        Err(BodyFailure::Other(e)) => {
+        Err(WriteFailure::Io(e)) => {
             tracing::debug!(error = %e, "h2 response body failed; resetting the stream");
             send.send_reset(h2::Reason::INTERNAL_ERROR);
         }
-        Ok(()) => {}
+        // Nobody left to reset.
+        Err(WriteFailure::ClientGone(_)) | Ok(()) => {}
     }
-    r.map_err(|e| e.to_string())
+    r
 }
 
-/// Why a response body could not be streamed.
-enum BodyFailure {
-    /// A watching rule stopped the exchange.
-    Stopped,
-    Other(String),
-}
-
-impl From<String> for BodyFailure {
-    fn from(s: String) -> Self {
-        Self::Other(s)
-    }
-}
-
-impl std::fmt::Display for BodyFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Stopped => f.write_str("stopped by policy"),
-            Self::Other(s) => f.write_str(s),
-        }
+/// A failed stream operation: the client's doing (reset, connection gone)
+/// or not.
+fn stream_error(e: &h2::Error) -> WriteFailure {
+    if e.is_reset() || e.is_io() || e.is_go_away() {
+        WriteFailure::ClientGone(e.to_string())
+    } else {
+        WriteFailure::Io(e.to_string())
     }
 }
 
@@ -418,22 +368,22 @@ async fn stream_body(
     send: &mut SendStream<Bytes>,
     body: &mut Body,
     out: &Out<'_>,
-) -> Result<(), BodyFailure> {
+) -> Result<(), WriteFailure> {
     loop {
         let frame = timeout(
             out.idle,
             poll_fn(|cx| http_body::Body::poll_frame(Pin::new(&mut *body), cx)),
         )
         .await
-        .map_err(|_| "response body idle timeout".to_owned())?;
+        .map_err(|_| WriteFailure::Io("response body idle timeout".to_owned()))?;
         let frame = match frame {
             None => {
                 send.send_data(Bytes::new(), true)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| stream_error(&e))?;
                 return Ok(());
             }
-            Some(Err(BodyError::Stopped)) => return Err(BodyFailure::Stopped),
-            Some(Err(e)) => return Err(e.to_string().into()),
+            Some(Err(BodyError::Stopped)) => return Err(WriteFailure::Stopped),
+            Some(Err(e)) => return Err(WriteFailure::Io(e.to_string())),
             Some(Ok(f)) => f,
         };
         match frame.into_data() {
@@ -442,17 +392,25 @@ async fn stream_body(
                     send.reserve_capacity(data.len());
                     let cap = timeout(out.idle, poll_fn(|cx| send.poll_capacity(cx)))
                         .await
-                        .map_err(|_| "client flow-control window stalled".to_owned())?;
+                        .map_err(|_| {
+                            WriteFailure::ClientGone(
+                                "client flow-control window stalled".to_owned(),
+                            )
+                        })?;
                     let n = match cap {
-                        None => return Err("stream closed by the client".to_owned().into()),
-                        Some(Err(e)) => return Err(e.to_string().into()),
+                        None => {
+                            return Err(WriteFailure::ClientGone(
+                                "stream closed by the client".to_owned(),
+                            ));
+                        }
+                        Some(Err(e)) => return Err(stream_error(&e)),
                         Some(Ok(n)) => n.min(data.len()),
                     };
                     if n == 0 {
                         continue;
                     }
                     send.send_data(data.split_to(n), false)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| stream_error(&e))?;
                 }
             }
             Err(frame) => {
@@ -465,7 +423,7 @@ async fn stream_body(
                             t.append(n.clone(), v.clone());
                         }
                     }
-                    send.send_trailers(t).map_err(|e| e.to_string())?;
+                    send.send_trailers(t).map_err(|e| stream_error(&e))?;
                     return Ok(());
                 }
                 // Trailers not allowed: dropped; the body ends after the

@@ -666,8 +666,9 @@ async fn a_client_write_failure_is_not_an_upstream_error() {
     c.kill();
     drop(res);
     let err = kit.events("response_error", 1).await;
-    assert_eq!(err[0]["reason"], "response_write_failed", "{err:#?}");
-    kit.request_event().await;
+    assert_eq!(err[0]["reason"], "client_gone", "{err:#?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["reason"], "client_gone", "{ev:#}");
     assert!(final_samples(&rec).is_empty(), "{:?}", final_samples(&rec));
 }
 
