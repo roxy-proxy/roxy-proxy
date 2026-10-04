@@ -64,7 +64,7 @@ the connector, never through other layers or the rules.
 
 A layer may read, rewrite, split, delay, inject into or replace either
 stream, chunk by chunk. roxy buffers nothing on a layer's behalf; a layer
-that wants a whole body reads it, up to its `max_buffered_body_bytes`.
+that wants a whole body reads it, within its `max_memory`.
 Typical patterns:
 
 - **Observe:** `next(req)`, then return its response unchanged (or use
@@ -117,7 +117,7 @@ extensions client and upstream agree on.
 - `mode: observe`: roxy tees both streams to the layer through bounded
   channels and ignores anything it returns except host-service calls such
   as `record`. The layer cannot change or delay traffic, so its failures
-  cannot weaken containment: a trap or timeout is logged, not fatal, and a
+  cannot weaken containment: a trap or missed deadline is logged, not fatal, and a
   copy the layer does not keep up with is cut (`observer_lagged`) rather
   than stalling the flow. This is the way to deploy an uncalibrated
   monitor.

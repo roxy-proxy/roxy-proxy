@@ -307,8 +307,7 @@ impl Config {
             if set {
                 refuse(
                     &format!("limits.{field}"),
-                    "a WASM limit; a service layer takes `first_byte_timeout` and \
-                     `max_exchange_time`",
+                    "a WASM limit; a service layer takes `first_byte_timeout`",
                 );
             }
         }

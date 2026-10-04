@@ -82,8 +82,8 @@ logic of a layer can be unit-tested natively.
   - `pipe` runs it through a stateful [`ChunkTransform`] that can hold
     bytes back, for example to withhold part of a stream until it has been
     judged.
-  - `read_to_end(cap)` buffers it, up to a cap. roxy also enforces the
-    layer's `max_buffered_body_bytes`.
+  - `read_to_end(cap)` buffers it, up to a cap. The layer's `max_memory`
+    bounds it too.
 - **Answer directly.** Return a [`Response`] without calling `next`:
   `Response::json(403, ...)`, `Response::text(...)`.
 - **Host services** in [`flow`], each behind a capability granted in roxy's

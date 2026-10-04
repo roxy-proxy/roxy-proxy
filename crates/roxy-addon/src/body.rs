@@ -275,8 +275,8 @@ impl Body {
         }
     }
 
-    /// Reads the whole body, failing once it exceeds `cap` bytes. The host
-    /// also holds the layer to `max_buffered_body_bytes`.
+    /// Reads the whole body, failing once it exceeds `cap` bytes. The
+    /// layer's `max_memory` bounds it too.
     pub fn read_to_end(self, cap: usize) -> Result<Vec<u8>, BodyError> {
         let mut all = Vec::new();
         for chunk in self {
