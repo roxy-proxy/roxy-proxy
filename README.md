@@ -1,7 +1,8 @@
 # roxy
 
 roxy is a strict, programmable HTTP firewall and egress proxy. Clients use
-it as an explicit `HTTP_PROXY`. It terminates TLS with leaf certificates
+it as an explicit `HTTP_PROXY`, or, with no proxy settings at all, reach it
+through its own DNS ([DNS steering](docs/dns.md)). It terminates TLS with leaf certificates
 minted by its own CA, parses every request into a strict canonical model,
 and re-serialises it in one unambiguous wire form, so smuggling and
 header-injection tricks never reach the upstream. Every exchange then runs
@@ -181,7 +182,9 @@ See [docs/addons.md](docs/addons.md) and [`examples/addons`](examples/addons).
 
 - [Principles and threat model](docs/principles.md)
 - [Architecture](docs/architecture.md)
-- [HTTP](docs/http.md): the explicit proxy, CONNECT, strict parsing
+- [HTTP](docs/http.md): the explicit proxy, CONNECT, direct listeners,
+  strict parsing
+- [DNS steering](docs/dns.md): clients without proxy settings
 - [Rules](docs/rules.md): the config file and the rule language
 - [Upstream](docs/upstream.md): DNS, the address floor, address lists
 - [WebSockets](docs/websockets.md)

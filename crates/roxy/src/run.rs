@@ -666,6 +666,33 @@ mod tests {
     }
 
     #[test]
+    fn listener_modes_and_dns_need_a_restart() {
+        let base = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:443 }]\n";
+        let direct = "version: 1\nlisteners: [{ name: p, mode: direct, bind: 127.0.0.1:443 }]\n";
+        let remapped = "version: 1\nlisteners: [{ name: p, mode: direct, bind: 127.0.0.1:443, \
+                        target_port: 8443 }]\n";
+        let dns =
+            |ip: &str| format!("{base}dns: {{ bind: 127.0.0.1:53, answer: {{ ipv4: {ip} }} }}\n");
+        assert_eq!(restart_required(&cfg(base), &cfg(direct)), ["listeners"]);
+        assert_eq!(
+            restart_required(&cfg(direct), &cfg(remapped)),
+            ["listeners"]
+        );
+        assert_eq!(
+            restart_required(&cfg(base), &cfg(&dns("10.0.0.1"))),
+            ["dns"]
+        );
+        assert_eq!(
+            restart_required(&cfg(&dns("10.0.0.1")), &cfg(&dns("10.0.0.2"))),
+            ["dns"]
+        );
+        assert_eq!(
+            restart_required(&cfg(&dns("10.0.0.1")), &cfg(&dns("10.0.0.1"))),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
     fn plain_policies_are_supported() {
         let c = cfg("version: 1\nrules:\n  - id: a\n    when: host == \"x\"\n    then: allow\n");
         assert_eq!(

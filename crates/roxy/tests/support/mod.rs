@@ -370,6 +370,9 @@ pub struct Opts<'a> {
     pub users: Option<String>,
     /// Top-level YAML appended before `rules:` (e.g. `metrics:`).
     pub extra: &'a str,
+    /// More `listeners:` items (YAML, indented by two spaces per item);
+    /// the rule placeholders work here too.
+    pub listeners: &'a str,
     /// Extra lines under `upstream:` (e.g. `deny_lists: [x]`).
     pub upstream: &'a str,
     /// Extra lines under `log.flow:`.
@@ -467,12 +470,14 @@ impl Harness {
     }
 
     fn render_config(dir: &Path, up: &Upstream, opts: &Opts<'_>) -> String {
-        let rules = opts
-            .rules
-            .replace("{HTTPS}", &up.https.port().to_string())
-            .replace("{HTTP}", &up.http.port().to_string())
-            .replace("{WS}", &up.ws.port().to_string())
-            .replace("{DOWN}", &up.down.to_string());
+        let ports = |s: &str| {
+            s.replace("{HTTPS}", &up.https.port().to_string())
+                .replace("{HTTP}", &up.http.port().to_string())
+                .replace("{WS}", &up.ws.port().to_string())
+                .replace("{DOWN}", &up.down.to_string())
+        };
+        let rules = ports(opts.rules);
+        let listeners = ports(opts.listeners);
         let auth = if opts.users.is_some() {
             format!(
                 "    auth:\n      basic: {{ users_file: {} }}\n",
@@ -486,7 +491,7 @@ impl Harness {
 listeners:
   - name: proxy
     bind: 127.0.0.1:0
-{auth}ca_server:
+{auth}{listeners}ca_server:
   bind: 127.0.0.1:0
 tls:
   ca_dir: {dir}/ca
@@ -684,6 +689,26 @@ log:
         alpn: &[&[u8]],
     ) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let s = self.connect_tunnel(authority).await;
+        self.tls_over(s, sni, alpn).await
+    }
+
+    /// TLS for `sni` (ALPN `http/1.1`) straight to `addr`, trusting roxy's
+    /// CA: a client of a direct listener.
+    pub async fn tls_direct(
+        &self,
+        addr: SocketAddr,
+        sni: &str,
+    ) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        let s = TcpStream::connect(addr).await?;
+        self.tls_over(s, sni, &[b"http/1.1"]).await
+    }
+
+    async fn tls_over(
+        &self,
+        s: TcpStream,
+        sni: &str,
+        alpn: &[&[u8]],
+    ) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let mut roots = rustls::RootCertStore::empty();
         for c in rustls_pemfile_certs(&self.roxy_ca_pem) {
             roots.add(c).unwrap();

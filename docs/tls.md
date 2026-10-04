@@ -41,13 +41,16 @@ usually short-lived, and resumption state would be one more thing to bound.
 
 ## CA distribution
 
-The CA certificate, never the key, is available three ways:
+The CA certificate, never the key, is available four ways:
 
 ```sh
 roxy ca export --config roxy.yaml > roxy-ca.pem                   # at image build time (--der for DER)
 curl -s http://<ca_server.bind>/roxy-ca.pem > roxy-ca.pem         # from the CA server
 curl -s -x http://<proxy> http://roxy.internal/roxy-ca.pem        # through the proxy itself
+curl -s http://roxy.internal/roxy-ca.pem                          # with roxy as the DNS server (docs/dns.md)
 ```
+
+The last needs a [direct listener](http.md#direct-listeners) on port 80.
 
 The `ca_server` listener is separate from the proxy port so it can be
 firewalled differently. It also serves `/healthz` for container health
@@ -55,7 +58,7 @@ checks.
 
 ## ClientHello sniffing
 
-After a CONNECT, roxy reads just enough of the first TLS record to confirm
+After a CONNECT, or on a direct listener, roxy reads just enough of the first TLS record to confirm
 the tunnel carries TLS and to extract the SNI and ALPN, with a hard cap
 (16 KiB) and a timeout. The whole handshake message must be present and
 well-formed before it is parsed. A ClientHello split across several TLS

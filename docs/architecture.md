@@ -3,10 +3,11 @@
 ## Exchange
 
 ```
-  client ──TCP──▶  listener (explicit proxy)
+  client ──TCP──▶  listener: explicit proxy, or direct (reached through roxy's DNS)
                      ▼
                    CONNECT: proxy auth; first bytes must be a TLS ClientHello
                      ▼      whose SNI matches the CONNECT host
+                            (direct: the SNI or Host is the target)
                    TLS termination (leaf minted by roxy's CA), ALPN h1 | h2
                      ▼
                    strict parse → CanonicalRequest
@@ -24,8 +25,8 @@
                    flow log ◀── every stage emits events
 ```
 
-A client connection is accepted by a listener and, after CONNECT and TLS
-termination, carries a sequence of exchanges (HTTP/1.1 keep-alive) or
+A client connection is accepted by a listener and, after CONNECT (on an
+explicit listener) and TLS termination, carries a sequence of exchanges (HTTP/1.1 keep-alive) or
 concurrent ones (HTTP/2 streams). Both fronts feed one transport-agnostic
 exchange core (`roxy-proxy`'s `exchange` module):
 
@@ -58,15 +59,16 @@ snapshot it started with.
 ## Crates
 
 Dependencies point downward: `roxy` → `roxy-proxy` → {`roxy-http`,
-`roxy-tls`, `roxy-rules`, `roxy-wasm`, `roxy-log`}. `roxy-http` and
-`roxy-rules` do no network I/O, so they can be unit-tested and fuzzed
-directly.
+`roxy-tls`, `roxy-rules`, `roxy-dns`, `roxy-wasm`, `roxy-log`}.
+`roxy-http`, `roxy-rules` and `roxy-dns` do no network I/O, so they can be
+unit-tested and fuzzed directly.
 
 | crate | responsibility |
 |---|---|
 | `roxy` | The binary: CLI (`run`, `check`, `ca`, `rule test`, `health`), config loading and validation, secrets, address-list loading, reload, store wiring. |
-| `roxy-proxy` | Listeners, the connection state machine, the exchange core, the addon stack (including service layers), the watcher, the upstream connector and address floor, the WebSocket relay, flow-log events and capture. |
+| `roxy-proxy` | Listeners, the DNS listener, the connection state machines, the exchange core, the addon stack (including service layers), the watcher, the upstream connector and address floor, the WebSocket relay, flow-log events and capture. |
 | `roxy-http` | The canonical request/response model, the strict HTTP/1.1 codec, the h2 ↔ canonical mapping, URL normalisation, body framing with caps, the WebSocket handshake checks and frame codec. No I/O policy. |
+| `roxy-dns` | The DNS listener's wire codec: strict query parsing, answers that fit in 512 bytes. No I/O. |
 | `roxy-tls` | CA generation and persistence, leaf minting and cache, rustls configs, ClientHello sniffing. |
 | `roxy-rules` | The expression DSL (lexer, parser, type checker, compiler), policy evaluation, actions, the metric and state stores. |
 | `roxy-wasm` | The wasmtime component host for WASM addons: linking, capabilities, budgets, instance pools. |

@@ -8,8 +8,9 @@ the overview and quickstart; outstanding work is tracked in
 |---|---|
 | [Principles](principles.md) | The threat model and the design principles behind everything else: fail closed, canonical re-serialisation, deny always wins, never evict, audit backpressure. |
 | [Architecture](architecture.md) | How an exchange flows through roxy, the crates, a glossary. |
-| [HTTP](http.md) | The explicit proxy, CONNECT, proxy auth, HTTP/2, the canonical model, rejection rules, URL normalisation, upstream serialisation, responses, deny responses. |
+| [HTTP](http.md) | The explicit proxy, CONNECT, proxy auth, direct listeners, HTTP/2, the canonical model, rejection rules, URL normalisation, upstream serialisation, responses, deny responses. |
 | [Rules](rules.md) | The config file, how rules are evaluated, the expression language and fields, actions, secrets, metrics and state, reload, the dry run. |
+| [DNS steering](dns.md) | The DNS listener that sends clients without proxy settings to roxy's direct listeners. |
 | [Upstream](upstream.md) | DNS, the address floor, address lists, upstream TLS, upstream errors. |
 | [WebSockets](websockets.md) | Upgrades, the relay and message rules. |
 | [TLS and the CA](tls.md) | CA generation, leaf certificates, client-facing TLS, CA distribution, ClientHello sniffing. |
