@@ -220,48 +220,42 @@ fn dns_spec(dns: &crate::config::DnsListener, log_queries: bool) -> DnsServerSpe
     }
 }
 
-fn restart_required(old: &Config, new: &Config) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    let d = |a: &dyn std::fmt::Debug, b: &dyn std::fmt::Debug| format!("{a:?}") != format!("{b:?}");
-    if d(
-        &old.listeners
-            .iter()
-            .map(|l| (&l.name, l.bind, l.auth.is_some(), l.mode, l.target_port))
-            .collect::<Vec<_>>(),
-        &new.listeners
-            .iter()
-            .map(|l| (&l.name, l.bind, l.auth.is_some(), l.mode, l.target_port))
-            .collect::<Vec<_>>(),
-    ) {
-        out.push("listeners");
+/// Puts the running value of every setting that takes effect only at
+/// startup (listeners and their auth, the CA server, the DNS listener, TLS,
+/// HTTP/2, connection caps, the state store size, the flow and capture log
+/// destinations) into `new`, and names each one that differed. The reload
+/// then validates and applies `new` as a whole, so a restart-only change is
+/// never half-applied (for example, a listener's `auth` removed while the
+/// listener still requires it).
+fn keep_restart_only(running: &Config, new: &mut Config) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    macro_rules! keep {
+        ($name:literal, $($field:ident).+) => {
+            if new.$($field).+ != running.$($field).+ {
+                changed.push($name);
+                new.$($field).+ = running.$($field).+.clone();
+            }
+        };
     }
-    if d(&old.ca_server, &new.ca_server) {
-        out.push("ca_server");
-    }
-    if old.dns != new.dns {
-        out.push("dns");
-    }
-    if d(&old.tls, &new.tls) {
-        out.push("tls");
-    }
-    if old.http.enable_h2 != new.http.enable_h2 {
-        out.push("http.enable_h2");
-    }
-    if old.limits.max_connections != new.limits.max_connections
-        || old.limits.max_connections_per_client != new.limits.max_connections_per_client
-    {
-        out.push("limits.max_connections*");
-    }
-    if d(&old.log.flow, &new.log.flow) {
-        out.push("log.flow");
-    }
-    if d(&old.capture_dir, &new.capture_dir)
-        || d(&old.log.capture, &new.log.capture)
-        || old.limits.max_capture_body_bytes != new.limits.max_capture_body_bytes
-    {
-        out.push("capture_dir / log.capture / limits.max_capture_body_bytes");
-    }
-    out
+    keep!("listeners", listeners);
+    keep!("ca_server", ca_server);
+    keep!("dns", dns);
+    keep!("tls", tls);
+    keep!("http.enable_h2", http.enable_h2);
+    keep!("limits.max_connections", limits.max_connections);
+    keep!(
+        "limits.max_connections_per_client",
+        limits.max_connections_per_client
+    );
+    keep!("limits.max_state_entries", limits.max_state_entries);
+    keep!(
+        "limits.max_capture_body_bytes",
+        limits.max_capture_body_bytes
+    );
+    keep!("log.flow", log.flow);
+    keep!("log.capture", log.capture);
+    keep!("capture_dir", capture_dir);
+    changed
 }
 
 impl Reloader {
@@ -270,28 +264,23 @@ impl Reloader {
     /// reads, bcrypt-free but synchronous); call from a blocking context.
     pub fn reload(&self) -> bool {
         let sink = self.handle.sink();
-        let attempt = || -> Result<(Config, PolicyUpdate), Vec<String>> {
-            let config = Config::load(&self.path).map_err(|e| vec![format!("{e:#}")])?;
+        // Held throughout, so reloads (watcher and SIGHUP) never interleave.
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut restart = Vec::new();
+        let mut attempt = || -> Result<(Config, PolicyUpdate), Vec<String>> {
+            let mut config = Config::load(&self.path).map_err(|e| vec![format!("{e:#}")])?;
             // Track the list files even if this attempt fails, so fixing (or
             // creating) a broken list file triggers the next reload.
             if let Some(w) = self.watch.get() {
                 w.track(&self.path, &crate::lists::files(&config));
             }
+            restart = keep_restart_only(&last, &mut config);
             config.validate().map_err(|diags| {
                 diags
                     .iter()
                     .map(|d| format!("{}:{d}", self.path.display()))
                     .collect::<Vec<_>>()
             })?;
-            // Validation requires `capture_dir` with capture, but the
-            // capture log is only opened at startup.
-            if config.uses_capture() && self.handle.capture().is_none() {
-                return Err(vec![
-                    "capture needs the capture log, which is opened at startup: restart with \
-                     `capture_dir` set"
-                        .into(),
-                ]);
-            }
             let mut update = policy_update(&config).map_err(|e| vec![format!("{e:#}")])?;
             update.addons = self
                 .addons
@@ -312,11 +301,10 @@ impl Reloader {
         });
         match result {
             Ok(config) => {
-                let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
-                for field in restart_required(&last, &config) {
+                for field in restart {
                     tracing::warn!(
                         field,
-                        "config change requires a restart; ignored until then"
+                        "config change requires a restart; the running value is kept until then"
                     );
                 }
                 tracing::info!(path = %self.path.display(), rules = config.rules.len(), "config reloaded");
@@ -637,6 +625,16 @@ mod tests {
         assert_eq!(lines, 200);
     }
 
+    /// The restart-only changes from `running` to `new`; a second pass over
+    /// the result finds none, since every one was put back.
+    fn restart(running: &str, new: &str) -> Vec<&'static str> {
+        let running = cfg(running);
+        let mut new = cfg(new);
+        let changed = keep_restart_only(&running, &mut new);
+        assert!(keep_restart_only(&running, &mut new).is_empty(), "kept");
+        changed
+    }
+
     #[test]
     fn listener_modes_and_dns_need_a_restart() {
         let base = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:443 }]\n";
@@ -645,21 +643,37 @@ mod tests {
                         target_port: 8443 }]\n";
         let dns =
             |ip: &str| format!("{base}dns: {{ bind: 127.0.0.1:53, answer: {{ ipv4: {ip} }} }}\n");
-        assert_eq!(restart_required(&cfg(base), &cfg(direct)), ["listeners"]);
+        assert_eq!(restart(base, direct), ["listeners"]);
+        assert_eq!(restart(direct, remapped), ["listeners"]);
+        assert_eq!(restart(base, &dns("10.0.0.1")), ["dns"]);
+        assert_eq!(restart(&dns("10.0.0.1"), &dns("10.0.0.2")), ["dns"]);
         assert_eq!(
-            restart_required(&cfg(direct), &cfg(remapped)),
-            ["listeners"]
+            restart(&dns("10.0.0.1"), &dns("10.0.0.1")),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn startup_sizes_and_log_destinations_need_a_restart() {
+        let base = "version: 1\n";
+        assert_eq!(
+            restart(base, "version: 1\nlimits: { max_state_entries: 5 }\n"),
+            ["limits.max_state_entries"]
         );
         assert_eq!(
-            restart_required(&cfg(base), &cfg(&dns("10.0.0.1"))),
-            ["dns"]
+            restart(base, "version: 1\nlog: { flow: { path: /tmp/x.jsonl } }\n"),
+            ["log.flow"]
         );
         assert_eq!(
-            restart_required(&cfg(&dns("10.0.0.1")), &cfg(&dns("10.0.0.2"))),
-            ["dns"]
+            restart(base, "version: 1\ncapture_dir: /tmp/c\n"),
+            ["capture_dir"]
         );
+        // Reloadable limits and log settings are not restart-only.
         assert_eq!(
-            restart_required(&cfg(&dns("10.0.0.1")), &cfg(&dns("10.0.0.1"))),
+            restart(
+                base,
+                "version: 1\nlimits: { max_header_bytes: 8kb }\nlog: { redact_headers: [x-a] }\n"
+            ),
             Vec::<&str>::new()
         );
     }

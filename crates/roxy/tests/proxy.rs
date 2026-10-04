@@ -818,6 +818,33 @@ async fn proxy_auth() {
     assert!(ev.iter().any(|e| e["client"]["user"] == "bob"));
     let all = serde_json::to_string(&h.sink.events()).unwrap();
     assert!(!all.contains("wonderland"));
+
+    // Listener auth is restart-only: a reload that drops it keeps the
+    // running listener as it was, users included, instead of leaving it
+    // requiring auth with no users.
+    let no_auth = h.render(&Opts {
+        rules: r#"
+  - id: alice-only
+    when: client.user == "alice" and host == "upstream.test"
+    then: { allow: { private_ok: true } }
+"#,
+        ..Opts::default()
+    });
+    std::fs::write(&h.config_path, no_auth).unwrap();
+    h.wait_events("config_reloaded", 1).await;
+    let res = with("alice", "wonderland")
+        .get(h.http_url("/after-reload"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let res = h
+        .client()
+        .get(h.http_url("/after-reload"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 407);
     h.stop().await;
 }
 

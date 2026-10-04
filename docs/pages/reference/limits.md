@@ -43,7 +43,7 @@ limits:
 
   # responses
   max_response_body_bytes: 1gb
-  response_header_timeout: 60s    # from when the request body has been sent
+  response_header_timeout: 60s    # from when the request body has been sent; a WebSocket upgrade's whole upstream handshake
 
   # buffering
   max_inspect_body_bytes: 1mb     # body.text / response.body.text, and addons' default

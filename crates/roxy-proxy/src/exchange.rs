@@ -197,7 +197,7 @@ pub(crate) enum Outcome {
     /// An allowed WebSocket upgrade got its `101` (h1 only).
     Upgrade {
         res: CanonicalResponse,
-        on: hyper::upgrade::OnUpgrade,
+        upstream: hyper::upgrade::Upgraded,
         key: WsKey,
     },
 }
@@ -270,8 +270,8 @@ pub(crate) async fn run(
             close_on_parse_error(conn, Some(cx), &client, shared, &e).await;
             None
         }
-        Outcome::Upgrade { res, on, key } => {
-            splice_websocket(conn, handle, cx, res, on, &key, framing).await
+        Outcome::Upgrade { res, upstream, key } => {
+            splice_websocket(conn, handle, cx, res, upstream, &key, framing).await
         }
     }
 }
@@ -327,9 +327,11 @@ fn protocol_refusal(cx: &FlowCx, host: &str, port: u16, message: String) -> Refu
 /// What the upstream step produced.
 enum Upstreamed {
     Response(http::Response<hyper::body::Incoming>),
-    /// A `101` for an allowed WebSocket upgrade.
+    /// A `101` for an allowed WebSocket upgrade, with the upgraded
+    /// upstream connection.
     Upgrade {
         res: http::Response<hyper::body::Incoming>,
+        upstream: hyper::upgrade::Upgraded,
         key: WsKey,
     },
 }
@@ -452,10 +454,20 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
                     tracing::debug!(error = %e, "upstream websocket connection ended");
                 }
             });
-            sender.send_request(http_req).await.map_err(|e| {
+            let mut res = sender.send_request(http_req).await.map_err(|e| {
                 tracing::debug!(error = %e, "websocket upgrade request failed");
                 None
-            })
+            })?;
+            if res.status() != http::StatusCode::SWITCHING_PROTOCOLS {
+                return Ok((res, None));
+            }
+            // The upgraded connection is taken within the same wait, so the
+            // client is only sent a `101` once roxy holds the upstream side.
+            let upgraded = hyper::upgrade::on(&mut res).await.map_err(|e| {
+                tracing::debug!(error = %e, "upstream upgrade did not complete");
+                None
+            })?;
+            Ok((res, Some(upgraded)))
         };
         match tokio::time::timeout(limits.response_header_timeout, attempt).await {
             Err(_) => {
@@ -477,10 +489,8 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
                     "upgrade request failed".into(),
                 ));
             }
-            Ok(Ok(res)) if res.status() == http::StatusCode::SWITCHING_PROTOCOLS => {
-                Upstreamed::Upgrade { res, key }
-            }
-            Ok(Ok(res)) => Upstreamed::Response(res),
+            Ok(Ok((res, Some(upstream)))) => Upstreamed::Upgrade { res, upstream, key },
+            Ok(Ok((res, None))) => Upstreamed::Response(res),
         }
     } else {
         // Watched first: a chunk that makes a deny match is never counted
@@ -551,10 +561,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
 
     let (res, upgrade) = match upstreamed {
         Upstreamed::Response(res) => (res, None),
-        Upstreamed::Upgrade { mut res, key } => {
-            let on = hyper::upgrade::on(&mut res);
-            (res, Some((on, key)))
-        }
+        Upstreamed::Upgrade { res, upstream, key } => (res, Some((upstream, key))),
     };
     let res = from_upstream_response(res, &limits);
     let verdict = response_steps(cx, res, front).await;
@@ -564,10 +571,10 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
             if let Some(t) = down_tap.as_mut() {
                 t.response_head(&res, &cx.snap.redactor);
             }
-            if let Some((on, key)) = upgrade {
+            if let Some((upstream, key)) = upgrade {
                 // The relay takes the taps after the `101`.
                 cx.taps = (up_tap, down_tap);
-                return Outcome::Upgrade { res, on, key };
+                return Outcome::Upgrade { res, upstream, key };
             }
             let body = std::mem::take(&mut res.body);
             res.body = watched(body, watch, Dir::Response, down_tap);
@@ -626,7 +633,7 @@ async fn splice_websocket(
     handle: &ConnIo,
     mut cx: FlowCx,
     res: CanonicalResponse,
-    on: hyper::upgrade::OnUpgrade,
+    upgraded: hyper::upgrade::Upgraded,
     key: &WsKey,
     framing: ClientFraming,
 ) -> Next {
@@ -657,11 +664,6 @@ async fn splice_websocket(
             cx.emit_request_event();
             return None;
         }
-    };
-    let Ok(Ok(upgraded)) = tokio::time::timeout(Duration::from_secs(10), on).await else {
-        tracing::debug!("upstream upgrade did not complete");
-        cx.emit_request_event();
-        return None;
     };
     let host = cx.facts.request.as_ref().map(|r| host_text(&r.host));
     cx.shared.sink.emit(&FlowEvent::WsOpen {

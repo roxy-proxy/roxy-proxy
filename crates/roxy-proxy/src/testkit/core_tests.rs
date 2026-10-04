@@ -160,6 +160,32 @@ async fn h2_clients_get_the_same_decisions() {
     assert_eq!(rules, ["up", "no-admin"], "{reqs:#?}");
 }
 
+/// Plaintext inside a CONNECT tunnel (`http.allow_plain_in_connect`) is
+/// recognised even when the request line arrives in pieces.
+#[tokio::test]
+async fn plaintext_in_connect_in_pieces_is_still_http() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let kit = Kit::builder()
+        .rules(RULES)
+        .flags(|f| f.allow_plain_in_connect = true)
+        .start()
+        .await;
+    let mut io = kit.connect_tunnel("up.test", 80).await;
+    io.write_all(b"G").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    io.write_all(b"ET / HTTP/1.1\r\nhost: up.test\r\nconnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(10), io.read_to_end(&mut out))
+        .await
+        .expect("the connection closes")
+        .unwrap();
+    let out = String::from_utf8_lossy(&out);
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert_eq!(kit.upstream.wait_seen(1).await[0].addr.port(), 80);
+}
+
 /// A `redirect` that keeps the client's `Host` goes upstream over
 /// HTTP/1.1, even to an h2-capable upstream: over h2, `:authority` would
 /// name the new target while `host` named the old one (RFC 9113 §8.3.1).
