@@ -335,7 +335,8 @@ async fn send_upstream_response(
         });
     }
     cx.record.response_bytes = counter.load(Ordering::Relaxed);
-    cx.record_final_sample(r.is_err() && stop.is_none());
+    // A client that stopped reading is not an upstream failure.
+    cx.record_final_sample(false);
     cx.emit_request_event();
 }
 

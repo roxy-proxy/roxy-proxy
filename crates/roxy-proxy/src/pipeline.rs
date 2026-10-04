@@ -539,12 +539,30 @@ impl FlowCx {
         });
     }
 
-    /// Records the exchange's final metric sample (errors, and `denied` if
-    /// a watching rule stopped it). Bytes were recorded as they streamed.
+    /// A watching rule stopped the exchange.
+    fn stopped(&self) -> bool {
+        self.watch.as_ref().is_some_and(|w| w.stopped().is_some())
+    }
+
+    /// Records the final metric sample of an exchange whose response was
+    /// sent (or failed to reach the client, which is not an upstream
+    /// error): `denied` if a watching rule stopped it. `error` says the
+    /// upstream exchange failed. Bytes were recorded as they streamed.
     pub(crate) fn record_final_sample(&self, error: bool) {
-        let stopped = self.watch.as_ref().is_some_and(|w| w.stopped().is_some());
+        self.final_sample(self.stopped(), error);
+    }
+
+    /// Records the final metric sample of an exchange refused after the
+    /// forwarding decision: `denied` for a deny (a watching stop, the
+    /// address floor, an invalid upgrade), `error` for an upstream failure.
+    pub(crate) fn record_refusal_sample(&self, refusal: &Refusal) {
+        let denied = refusal.kind == RefusalKind::Deny || self.stopped();
+        self.final_sample(denied, refusal.kind == RefusalKind::UpstreamError);
+    }
+
+    fn final_sample(&self, denied: bool, error: bool) {
         let sample = Sample {
-            denied: stopped,
+            denied,
             error,
             ..Sample::default()
         };

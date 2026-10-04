@@ -396,6 +396,93 @@ async fn a_failing_effect_counts_as_denied() {
     assert!(samples[0].head && samples[0].denied, "{samples:?}");
 }
 
+/// The samples after the head sample.
+fn final_samples(rec: &Recording) -> Vec<crate::sources::Sample> {
+    rec.samples
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .filter(|s| !s.head)
+        .collect()
+}
+
+/// A deny after the forwarding decision that is not a watching stop (the
+/// address floor at preflight) still counts as denied in its final sample.
+#[tokio::test]
+async fn an_address_floor_deny_counts_as_denied() {
+    let (kit, rec) = recording_kit(RULES).await;
+    let mut c = kit.h1().await;
+    let req = c
+        .request_to("private.test", "GET", "/strict", &[])
+        .body(roxy_http::Body::empty())
+        .unwrap();
+    assert_eq!(Answer::read(c.send(req).await.unwrap()).await.status, 403);
+    kit.request_event().await;
+    let finals = final_samples(&rec);
+    assert_eq!(finals.len(), 1, "{finals:?}");
+    assert!(finals[0].denied && !finals[0].error, "{finals:?}");
+}
+
+#[tokio::test]
+async fn an_upstream_failure_counts_as_an_error() {
+    let (kit, rec) = recording_kit(RULES).await;
+    let mut c = kit.h1().await;
+    let req = c
+        .request_to("down.test", "GET", "/", &[])
+        .body(roxy_http::Body::empty())
+        .unwrap();
+    assert_eq!(Answer::read(c.send(req).await.unwrap()).await.status, 502);
+    kit.request_event().await;
+    let finals = final_samples(&rec);
+    assert_eq!(finals.len(), 1, "{finals:?}");
+    assert!(finals[0].error && !finals[0].denied, "{finals:?}");
+}
+
+#[tokio::test]
+async fn a_watching_stop_counts_as_denied() {
+    let (kit, rec) = recording_kit(RULES).await;
+    let mut c = kit.h1().await;
+    let (mut tx, body) = streaming_body();
+    let req = c.request("POST", "/upload", &[]).body(body).unwrap();
+    let pending = c.start(req);
+    for _ in 0..16 {
+        if tx.send_data(Bytes::from(vec![b'x'; 1024])).await.is_err() {
+            break;
+        }
+    }
+    let a = pending.await.unwrap().unwrap();
+    assert_eq!(a.status, 413, "{a:?}");
+    drop(tx);
+    kit.request_event().await;
+    let finals = final_samples(&rec);
+    assert_eq!(finals.len(), 1, "{finals:?}");
+    assert!(finals[0].denied && !finals[0].error, "{finals:?}");
+}
+
+/// A client that stops reading the response is not an upstream failure:
+/// the exchange leaves no final sample.
+#[tokio::test]
+async fn a_client_write_failure_is_not_an_upstream_error() {
+    let (kit, rec) = recording_kit(super::ALLOW_UP).await;
+    let mut c = kit.h1().await;
+    let req = c
+        .request("POST", "/echo", &[])
+        .body(roxy_http::Body::from_bytes(Bytes::from(vec![
+            b'x';
+            1 << 20
+        ])))
+        .unwrap();
+    let res = c.send(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    c.kill();
+    drop(res);
+    let err = kit.events("response_error", 1).await;
+    assert_eq!(err[0]["reason"], "response_write_failed", "{err:#?}");
+    kit.request_event().await;
+    assert!(final_samples(&rec).is_empty(), "{:?}", final_samples(&rec));
+}
+
 /// A `redirect` that keeps the client's `Host` goes upstream over
 /// HTTP/1.1, even to an h2-capable upstream: over h2, `:authority` would
 /// name the new target while `host` named the old one (RFC 9113 §8.3.1).

@@ -103,11 +103,10 @@ pub(crate) fn refusal_response(cx: &mut FlowCx, refusal: &Refusal) -> CanonicalR
 
 /// Final accounting for a refusal whose response has been written.
 pub(crate) fn finish_refusal(cx: &mut FlowCx, refusal: &Refusal) {
-    // After a forwarded request (upstream failure, a watching stop) the
+    // Past the forwarding decision (the watcher exists from then on) the
     // final sample is still due; head denies were recorded at the head.
-    let upstream_error = refusal.kind == RefusalKind::UpstreamError;
     if cx.watch.is_some() {
-        cx.record_final_sample(upstream_error);
+        cx.record_refusal_sample(refusal);
     }
     cx.emit_request_event();
 }
@@ -620,7 +619,6 @@ async fn send_response(
     // A watching stop mid-body ends the body with an error: the codec stops
     // before any terminating chunk and the connection is dropped.
     let stopped = cx.watch.as_ref().is_some_and(|w| w.stopped().is_some());
-    let failed = r.is_err() && !stopped;
     let next = match r {
         Err(_) if stopped => None,
         Err(e) => {
@@ -637,7 +635,8 @@ async fn send_response(
         Ok(()) => Some(conn),
     };
     cx.record.response_bytes = counter.load(Ordering::Relaxed);
-    cx.record_final_sample(failed);
+    // A client that stopped reading is not an upstream failure.
+    cx.record_final_sample(false);
     cx.emit_request_event();
     next
 }
