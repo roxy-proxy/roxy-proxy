@@ -89,7 +89,7 @@ pub enum Reason {
     /// Trailer section present while `http.allow_trailers` is false, or a
     /// forbidden field inside allowed trailers.
     Trailers,
-    /// Missing CRLF after chunk data, or malformed trailer section.
+    /// Missing CRLF after chunk data.
     BadChunkFraming,
     // ----- URL -----
     /// Path contains a character outside `pchar` / `/`, or does not start

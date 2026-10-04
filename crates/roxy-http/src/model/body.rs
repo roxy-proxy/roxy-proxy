@@ -453,11 +453,6 @@ pub struct BodySender {
 }
 
 impl BodySender {
-    /// Bytes accepted so far.
-    pub fn bytes_sent(&self) -> u64 {
-        self.sent
-    }
-
     /// Whether the consumer has dropped the body.
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()

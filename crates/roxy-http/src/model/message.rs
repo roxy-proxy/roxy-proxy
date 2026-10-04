@@ -21,13 +21,6 @@ pub enum Version {
     H2,
 }
 
-impl Version {
-    /// Whether this is an HTTP/1.x version.
-    pub fn is_h1(self) -> bool {
-        matches!(self, Version::H1_0 | Version::H1_1)
-    }
-}
-
 /// The request-target form the client used (RFC 9112 §3.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetForm {

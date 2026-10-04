@@ -2,30 +2,17 @@
 //! restrictions). Pure state machine over a `BytesMut` (fuzz target).
 
 use bytes::{Buf, Bytes, BytesMut};
-use http::{HeaderMap, HeaderName};
+use http::HeaderMap;
 
-use crate::chars::{hex_val, is_field_value_byte, is_token};
-use crate::model::{HttpFlags, Limits, ParseError, Reason, is_reserved, reject, validate_value};
+use crate::chars::{hex_val, is_field_value_byte};
+use crate::model::{
+    Headers, HttpFlags, Limits, ParseError, Reason, is_forbidden_trailer, parse_field_line, reject,
+};
 
 /// Longest chunk-size line accepted without extensions (16 hex digits).
 const MAX_SIZE_LINE: usize = 16;
 /// Longest chunk-size line accepted when extensions are allowed.
 const MAX_EXT_LINE: usize = 4096;
-
-/// Trailer fields that are never accepted even with `http.allow_trailers`
-/// (framing, routing, authentication and content metadata; RFC 9110 §6.5.1).
-const FORBIDDEN_TRAILERS: &[&str] = &[
-    "authorization",
-    "cookie",
-    "set-cookie",
-    "content-type",
-    "content-encoding",
-    "content-range",
-    "expect",
-    "range",
-    "max-forwards",
-    "cache-control",
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -54,12 +41,8 @@ pub enum Decoded {
 pub struct ChunkedDecoder {
     state: State,
     total: u64,
-    max_body: u64,
-    max_trailer_bytes: usize,
-    max_headers: usize,
-    allow_ext: bool,
-    allow_trailers: bool,
-    allow_obs_text: bool,
+    limits: Limits,
+    flags: HttpFlags,
 }
 
 impl ChunkedDecoder {
@@ -69,12 +52,8 @@ impl ChunkedDecoder {
         Self {
             state: State::Size,
             total: 0,
-            max_body: limits.max_request_body_bytes,
-            max_trailer_bytes: limits.max_header_bytes,
-            max_headers: limits.max_headers,
-            allow_ext: flags.allow_chunk_extensions,
-            allow_trailers: flags.allow_trailers,
-            allow_obs_text: flags.allow_obs_text,
+            limits: limits.clone(),
+            flags: flags.clone(),
         }
     }
 
@@ -97,12 +76,13 @@ impl ChunkedDecoder {
                     let Some(size) = self.size_line(buf)? else {
                         return Ok(Decoded::NeedMore);
                     };
+                    let max_body = self.limits.max_request_body_bytes;
                     self.total = match self.total.checked_add(size) {
-                        Some(t) if t <= self.max_body => t,
+                        Some(t) if t <= max_body => t,
                         _ => {
                             return reject(
                                 Reason::BodyTooLarge,
-                                format!("chunked body exceeds {} bytes", self.max_body),
+                                format!("chunked body exceeds {max_body} bytes"),
                             );
                         }
                     };
@@ -144,7 +124,7 @@ impl ChunkedDecoder {
                     [b'\n', ..] => return reject(Reason::BareLf, "bare LF ending chunked body"),
                     [b'\r', _, ..] => return reject(Reason::BareCr, "bare CR ending chunked body"),
                     _ => {
-                        if !self.allow_trailers {
+                        if !self.flags.allow_trailers {
                             return reject(Reason::Trailers, "trailer section present");
                         }
                         let Some(map) = self.trailers(buf)? else {
@@ -160,7 +140,8 @@ impl ChunkedDecoder {
 
     /// Parses a chunk-size line; `None` if incomplete.
     fn size_line(&self, buf: &mut BytesMut) -> Result<Option<u64>, ParseError> {
-        let max = if self.allow_ext {
+        let allow_ext = self.flags.allow_chunk_extensions;
+        let max = if allow_ext {
             MAX_EXT_LINE
         } else {
             MAX_SIZE_LINE
@@ -178,7 +159,7 @@ impl ChunkedDecoder {
         let after = &line[digits..];
         // Early rejection of malformed prefixes, before the line is complete.
         match after.first() {
-            Some(b';') if !self.allow_ext => {
+            Some(b';') if !allow_ext => {
                 return reject(Reason::ChunkExtension, "chunk extension");
             }
             None | Some(b'\r' | b';') => {}
@@ -217,8 +198,11 @@ impl ChunkedDecoder {
         Ok(Some(size))
     }
 
-    /// Parses the trailer section (allowed); `None` if incomplete.
+    /// Parses the trailer section (allowed); `None` if incomplete. Fields
+    /// go through the same line, name, value and count rules as the head,
+    /// and forbidden trailer names are refused before that.
     fn trailers(&self, buf: &mut BytesMut) -> Result<Option<HeaderMap>, ParseError> {
+        let max_bytes = self.limits.max_header_bytes;
         let mut end = None;
         for i in 0..buf.len() {
             match buf[i] {
@@ -236,52 +220,27 @@ impl ChunkedDecoder {
             }
         }
         let Some(end) = end else {
-            if buf.len() > self.max_trailer_bytes {
+            if buf.len() > max_bytes {
                 return reject(Reason::HeadTooLarge, "trailer section too large");
             }
             return Ok(None);
         };
-        if end > self.max_trailer_bytes {
+        if end > max_bytes {
             return reject(Reason::HeadTooLarge, "trailer section too large");
         }
         let section = buf.split_to(end);
-        let body = &section[..end - 4];
-        let mut map = HeaderMap::new();
-        for (count, line) in body.split(|&b| b == b'\n').enumerate() {
-            if count >= self.max_headers {
-                return reject(Reason::TooManyHeaders, "too many trailer fields");
-            }
+        let mut raw = Vec::new();
+        for line in section[..end - 4].split(|&b| b == b'\n') {
             let line = line.strip_suffix(b"\r").unwrap_or(line);
-            if matches!(line.first(), Some(b' ' | b'\t')) {
-                return reject(Reason::ObsFold, "obs-fold in trailers");
+            let (name, value) = parse_field_line(line, self.flags.allow_obs_text)?;
+            let lower = String::from_utf8_lossy(name).to_ascii_lowercase();
+            if is_forbidden_trailer(&lower) {
+                return reject(Reason::Trailers, format!("{lower} not allowed in trailers"));
             }
-            let Some(colon) = line.iter().position(|&b| b == b':') else {
-                return reject(Reason::BadChunkFraming, "malformed trailer line");
-            };
-            let name = &line[..colon];
-            if matches!(name.last(), Some(b' ' | b'\t')) {
-                return reject(Reason::WhitespaceBeforeColon, "whitespace before colon");
-            }
-            if !is_token(name) {
-                return reject(Reason::InvalidHeaderName, "invalid trailer name");
-            }
-            let lname = name.to_ascii_lowercase();
-            let lname_str = String::from_utf8_lossy(&lname);
-            if is_reserved(&lname_str)
-                || FORBIDDEN_TRAILERS.contains(&lname_str.as_ref())
-                || lname_str.starts_with("content-")
-            {
-                return reject(
-                    Reason::Trailers,
-                    format!("{lname_str} not allowed in trailers"),
-                );
-            }
-            let value = validate_value(&line[colon + 1..], self.allow_obs_text)?;
-            let name = HeaderName::from_bytes(&lname)
-                .map_err(|_| ParseError::new(Reason::InvalidHeaderName, "invalid trailer name"))?;
-            map.append(name, value);
+            raw.push((name, value));
         }
-        Ok(Some(map))
+        let checked = Headers::try_from_raw(raw, &self.limits, &self.flags)?;
+        Ok(Some(checked.to_header_map()))
     }
 }
 

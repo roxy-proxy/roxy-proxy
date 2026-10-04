@@ -42,36 +42,92 @@ pub struct Headers {
     entries: Vec<(HeaderName, HeaderValue)>,
 }
 
-fn validate_name(name: &[u8]) -> Result<HeaderName, ParseError> {
-    if !is_token(name) {
-        if name.iter().any(|&b| b >= 0x80) {
-            return reject(Reason::NonAscii, "non-ASCII header name");
-        }
-        return reject(
-            Reason::InvalidHeaderName,
-            format!("invalid header name {:?}", String::from_utf8_lossy(name)),
-        );
+/// Trailer fields never accepted even with `http.allow_trailers`: fields
+/// that frame, route or authenticate the message, or describe the content a
+/// recipient has already started processing (RFC 9110 §6.5.1), plus every
+/// [`RESERVED`] name.
+const FORBIDDEN_TRAILERS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "expect",
+    "range",
+    "max-forwards",
+    "cache-control",
+];
+
+/// Whether `name` (lower-case) may not appear in a trailer section.
+pub fn is_forbidden_trailer(name: &str) -> bool {
+    is_reserved(name) || FORBIDDEN_TRAILERS.contains(&name) || name.starts_with("content-")
+}
+
+fn check_name(name: &[u8]) -> Result<(), ParseError> {
+    if is_token(name) {
+        return Ok(());
     }
+    if name.iter().any(|&b| b >= 0x80) {
+        return reject(Reason::NonAscii, "non-ASCII header name");
+    }
+    reject(
+        Reason::InvalidHeaderName,
+        format!("invalid header name {:?}", String::from_utf8_lossy(name)),
+    )
+}
+
+fn check_value(value: &[u8], allow_obs_text: bool) -> Result<(), ParseError> {
+    let Some(&b) = value
+        .iter()
+        .find(|&&b| !is_field_value_byte(b, allow_obs_text))
+    else {
+        return Ok(());
+    };
+    if b >= 0x80 {
+        return reject(Reason::NonAscii, "non-ASCII header value");
+    }
+    reject(
+        Reason::InvalidHeaderValue,
+        format!("byte 0x{b:02x} in header value"),
+    )
+}
+
+fn validate_name(name: &[u8]) -> Result<HeaderName, ParseError> {
+    check_name(name)?;
     HeaderName::from_bytes(&name.to_ascii_lowercase())
         .map_err(|_| ParseError::new(Reason::InvalidHeaderName, "invalid header name"))
 }
 
-pub(crate) fn validate_value(
-    value: &[u8],
-    allow_obs_text: bool,
-) -> Result<HeaderValue, ParseError> {
+fn validate_value(value: &[u8], allow_obs_text: bool) -> Result<HeaderValue, ParseError> {
     let v = trim_ows(value);
-    if let Some(&b) = v.iter().find(|&&b| !is_field_value_byte(b, allow_obs_text)) {
-        if b >= 0x80 {
-            return reject(Reason::NonAscii, "non-ASCII header value");
-        }
-        return reject(
-            Reason::InvalidHeaderValue,
-            format!("byte 0x{b:02x} in header value"),
-        );
-    }
+    check_value(v, allow_obs_text)?;
     HeaderValue::from_bytes(v)
         .map_err(|_| ParseError::new(Reason::InvalidHeaderValue, "invalid header value"))
+}
+
+/// Splits one h1 field line (without its CRLF) into a validated name and an
+/// OWS-trimmed value, applying the field rules in the order a client sees
+/// them: no obs-fold, a colon, a non-empty token name with no whitespace
+/// before the colon, and value bytes within the allowed set.
+pub(crate) fn parse_field_line(
+    line: &[u8],
+    allow_obs_text: bool,
+) -> Result<(&[u8], &[u8]), ParseError> {
+    if matches!(line.first(), Some(b' ' | b'\t')) {
+        return reject(Reason::ObsFold, "obsolete line folding");
+    }
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        return reject(Reason::InvalidHeaderName, "header line without colon");
+    };
+    let name = &line[..colon];
+    if name.is_empty() {
+        return reject(Reason::InvalidHeaderName, "empty header name");
+    }
+    if matches!(name.last(), Some(b' ' | b'\t')) {
+        return reject(Reason::WhitespaceBeforeColon, "whitespace before colon");
+    }
+    check_name(name)?;
+    let value = trim_ows(&line[colon + 1..]);
+    check_value(value, allow_obs_text)?;
+    Ok((name, value))
 }
 
 /// Parses client `Connection` values into lower-case tokens; any element
@@ -366,6 +422,50 @@ mod tests {
         assert_eq!(e.reason, Reason::InvalidHeaderName);
         let e = Headers::try_from_raw([(&b"\xc3\xa9"[..], &b"1"[..])], &l, &f).unwrap_err();
         assert_eq!(e.reason, Reason::NonAscii);
+    }
+
+    #[test]
+    fn field_line_rules() {
+        assert_eq!(
+            parse_field_line(b"X-A:  1 \t", false).unwrap(),
+            (&b"X-A"[..], &b"1"[..])
+        );
+        for (line, r) in [
+            (&b" x: 1"[..], Reason::ObsFold),
+            (b"\tx: 1", Reason::ObsFold),
+            (b"no colon", Reason::InvalidHeaderName),
+            (b": 1", Reason::InvalidHeaderName),
+            (b"x : 1", Reason::WhitespaceBeforeColon),
+            (b"x(y): 1", Reason::InvalidHeaderName),
+            (b"caf\xc3\xa9: 1", Reason::NonAscii),
+            (b"x: a\x00b", Reason::InvalidHeaderValue),
+            (b"x: caf\xc3\xa9", Reason::NonAscii),
+        ] {
+            assert_eq!(
+                parse_field_line(line, false).unwrap_err().reason,
+                r,
+                "{:?}",
+                String::from_utf8_lossy(line)
+            );
+        }
+        assert!(parse_field_line(b"x: caf\xc3\xa9", true).is_ok());
+    }
+
+    #[test]
+    fn forbidden_trailers() {
+        for n in [
+            "content-length",
+            "content-md5",
+            "host",
+            "connection",
+            "transfer-encoding",
+            "authorization",
+            "set-cookie",
+        ] {
+            assert!(is_forbidden_trailer(n), "{n}");
+        }
+        assert!(!is_forbidden_trailer("grpc-status"));
+        assert!(!is_forbidden_trailer("x-checksum"));
     }
 
     #[test]

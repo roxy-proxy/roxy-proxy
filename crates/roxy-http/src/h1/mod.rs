@@ -505,11 +505,6 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         }
     }
 
-    /// Requests read so far.
-    pub fn requests_served(&self) -> u64 {
-        self.served
-    }
-
     /// The connection role.
     pub fn role(&self) -> &Role {
         &self.role
@@ -582,7 +577,6 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     /// the connection. Any violation returns `Err`; the caller must then drop
     /// the connection (calling [`ServerConn::respond_error_and_close`] first
     /// if it wants to send an error status).
-    #[allow(clippy::too_many_lines)]
     pub async fn next_request(&mut self) -> Result<Option<Incoming>, ParseError> {
         match self.state {
             State::Closed => return Ok(None),
@@ -635,53 +629,56 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
                     meta,
                 }))
             }
-            Head::Request(h) => {
-                let max = self.limits.max_request_body_bytes;
-                let (body, feed) = match h.framing {
-                    Framing::None => (Body::empty(), None),
-                    Framing::Length(n) => {
-                        let (tx, body) = Body::channel(max, Some(n));
-                        (body, Some((BodyDecoder::Length(n), tx)))
-                    }
-                    Framing::Chunked => {
-                        let (tx, body) = Body::channel(max, None);
-                        let d = ChunkedDecoder::new(&self.limits, &self.flags);
-                        (body, Some((BodyDecoder::Chunked(d), tx)))
-                    }
-                };
-                self.r.feed = feed.map(|(decoder, tx)| BodyFeed {
-                    decoder,
-                    sender: Some(tx),
-                    pending: None,
-                    drained: 0,
-                });
-                self.exchange = Some(Exchange {
-                    is_head: h.method == crate::model::Method::Head,
-                    close: h.meta.close,
-                    expect_continue: h.meta.expect_continue,
-                    sent_100: false,
-                    version: h.meta.version,
-                    upgrade: h.meta.upgrade.clone(),
-                });
-                self.state = State::AwaitingResponse;
-                let origin_on_proxy =
-                    self.role == Role::ProxyPort && h.meta.target_form == TargetForm::Origin;
-                let req = CanonicalRequest {
-                    method: h.method,
-                    scheme: h.scheme,
-                    authority: h.authority,
-                    path: h.path,
-                    query: h.query,
-                    headers: h.headers,
-                    body,
-                    meta: h.meta,
-                };
-                Ok(Some(if origin_on_proxy {
-                    Incoming::OriginFormOnProxyPort(req)
-                } else {
-                    Incoming::Request(req)
-                }))
+            Head::Request(h) => Ok(Some(self.begin_request(h))),
+        }
+    }
+
+    /// Sets up the body feed and exchange state for a parsed request head.
+    fn begin_request(&mut self, h: RequestHead) -> Incoming {
+        let max = self.limits.max_request_body_bytes;
+        let (body, feed) = match h.framing {
+            Framing::None => (Body::empty(), None),
+            Framing::Length(n) => {
+                let (tx, body) = Body::channel(max, Some(n));
+                (body, Some((BodyDecoder::Length(n), tx)))
             }
+            Framing::Chunked => {
+                let (tx, body) = Body::channel(max, None);
+                let d = ChunkedDecoder::new(&self.limits, &self.flags);
+                (body, Some((BodyDecoder::Chunked(d), tx)))
+            }
+        };
+        self.r.feed = feed.map(|(decoder, tx)| BodyFeed {
+            decoder,
+            sender: Some(tx),
+            pending: None,
+            drained: 0,
+        });
+        self.exchange = Some(Exchange {
+            is_head: h.method == crate::model::Method::Head,
+            close: h.meta.close,
+            expect_continue: h.meta.expect_continue,
+            sent_100: false,
+            version: h.meta.version,
+            upgrade: h.meta.upgrade.clone(),
+        });
+        self.state = State::AwaitingResponse;
+        let origin_on_proxy =
+            self.role == Role::ProxyPort && h.meta.target_form == TargetForm::Origin;
+        let req = CanonicalRequest {
+            method: h.method,
+            scheme: h.scheme,
+            authority: h.authority,
+            path: h.path,
+            query: h.query,
+            headers: h.headers,
+            body,
+            meta: h.meta,
+        };
+        if origin_on_proxy {
+            Incoming::OriginFormOnProxyPort(req)
+        } else {
+            Incoming::Request(req)
         }
     }
 

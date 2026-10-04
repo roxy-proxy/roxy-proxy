@@ -15,8 +15,10 @@ use std::fmt;
 use http::header::{CONNECTION, CONTENT_LENGTH, HOST, UPGRADE};
 use http::{HeaderMap, HeaderValue, Uri};
 
+use crate::chars::trim_ows;
 use crate::model::{
     Body, CanonicalRequest, CanonicalResponse, Headers, Limits, ParseError, Reason, ResponseMeta,
+    parse_content_length,
 };
 
 /// How the request URI is written into the `http::Request`.
@@ -92,11 +94,7 @@ fn single_content_length(map: &HeaderMap) -> Option<u64> {
     if it.next().is_some() {
         return None;
     }
-    let v = v.to_str().ok()?.trim();
-    if v.is_empty() || v.len() > 19 || !v.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    v.parse().ok()
+    parse_content_length(trim_ows(v.as_bytes())).ok()
 }
 
 /// Adapts an upstream response. Hop-by-hop headers (and those nominated by
