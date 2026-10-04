@@ -47,6 +47,7 @@ use tokio::time::{Instant, Sleep, sleep, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::body::{Collected, collect_prefix, counted};
+use crate::conn::ConnLimits;
 use crate::exchange::{
     Front, Outcome, finish_refusal, process, record_client_failure, record_client_gone,
     refusal_response,
@@ -99,6 +100,9 @@ struct ConnCx {
     client: ClientConn,
     authority: Authority,
     tls: TlsInfo,
+    /// The codec's limits, fixed at accept like the h1 codec's: the
+    /// connection's settings, the stream mapping, request body framing.
+    cl: ConnLimits,
     /// Cancelled by a stream whose deny closes the connection.
     closing: CancellationToken,
 }
@@ -110,8 +114,9 @@ pub(crate) async fn serve<IO: Io>(
     authority: Authority,
     tls: TlsInfo,
     shared: Arc<Shared>,
+    cl: ConnLimits,
 ) {
-    let limits = shared.snapshot().limits.clone();
+    let limits = cl.limits.clone();
     let handshake = builder(&limits).handshake::<_, Bytes>(io);
     let mut conn: Connection<IO, Bytes> = match timeout(limits.header_timeout, handshake).await {
         Ok(Ok(c)) => c,
@@ -129,6 +134,7 @@ pub(crate) async fn serve<IO: Io>(
         client,
         authority,
         tls,
+        cl,
         closing: CancellationToken::new(),
     });
     let mut streams: JoinSet<()> = JoinSet::new();
@@ -217,6 +223,7 @@ async fn serve_stream(
     // `parse_error` included: one connection can open many streams.
     crate::flowlog::sink_ready(&*ccx.shared.sink).await;
     let snap = ccx.shared.snapshot();
+    let ConnLimits { limits, flags } = &ccx.cl;
     let (parts, recv) = req.into_parts();
     let fail = Arc::new(BodyFail::default());
     let raw = if recv.is_end_stream() {
@@ -224,12 +231,12 @@ async fn serve_stream(
         Body::empty()
     } else {
         Body::wrap_native(
-            H2Body::new(recv, &snap.limits, &snap.flags, fail.clone()),
+            H2Body::new(recv, limits, flags, fail.clone()),
             u64::MAX,
             None,
         )
     };
-    let mut req = match from_h2_parts(parts, raw, &ccx.authority, &snap.limits, &snap.flags) {
+    let mut req = match from_h2_parts(parts, raw, &ccx.authority, limits, flags) {
         Ok(r) => r,
         Err(e) => {
             ccx.shared.emit_parse_error(&ccx.client, None, &e);
@@ -249,8 +256,6 @@ async fn serve_stream(
         u64::MAX,
         known,
     );
-    let limits = snap.limits.clone();
-    let flags = snap.flags.clone();
     let method = req.method.clone();
     let cx = FlowCx::new(
         ccx.shared.clone(),

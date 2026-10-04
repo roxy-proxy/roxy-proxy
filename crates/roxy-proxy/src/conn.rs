@@ -10,7 +10,8 @@ use bytes::{Bytes, BytesMut};
 use http::StatusCode;
 use roxy_http::h1::{Incoming, Role, ServerConn};
 use roxy_http::{
-    Authority, Body, CanonicalRequest, CanonicalResponse, Host, Method, Reason, Scheme,
+    Authority, Body, CanonicalRequest, CanonicalResponse, Host, HttpFlags, Limits, Method, Reason,
+    Scheme,
 };
 use roxy_tls::{ClientHelloInfo, MAX_HELLO_BYTES, Sniff, looks_like_http, sniff};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -33,16 +34,34 @@ const AUTH_REALM: &str = "roxy";
 /// The body of a `407`.
 const AUTH_REQUIRED_BODY: &[u8] = b"{\"error\":\"proxy authentication required\"}";
 
+/// The limits and flags that shape the client-facing codec, fixed for a
+/// connection when it is accepted. A reload changes them for new
+/// connections only; what is decided per exchange (the policy, the
+/// upstream side, inspection caps) comes from the exchange's snapshot.
+#[derive(Clone)]
+pub(crate) struct ConnLimits {
+    pub limits: Arc<Limits>,
+    pub flags: Arc<HttpFlags>,
+}
+
+impl ConnLimits {
+    fn current(shared: &Shared) -> Self {
+        let snap = shared.snapshot();
+        Self {
+            limits: snap.limits.clone(),
+            flags: snap.flags.clone(),
+        }
+    }
+
+    fn codec(&self, io: ClientIo, buffered: BytesMut, role: Role) -> ServerConn<ClientIo> {
+        ServerConn::with_buffered(io, buffered, role, self.limits.clone(), self.flags.clone())
+    }
+}
+
 pub(crate) async fn serve_explicit(stream: BoxIo, client: ClientConn, shared: Arc<Shared>) {
-    let snap = shared.snapshot();
-    let conn = ServerConn::new(
-        ClientIo(stream),
-        Role::ProxyPort,
-        snap.limits.clone(),
-        snap.flags.clone(),
-    );
-    drop(snap);
-    Box::pin(proxy_port_loop(conn, client, shared)).await;
+    let cl = ConnLimits::current(&shared);
+    let conn = cl.codec(ClientIo(stream), BytesMut::new(), Role::ProxyPort);
+    Box::pin(proxy_port_loop(conn, client, shared, cl)).await;
 }
 
 fn is_internal(req: &CanonicalRequest) -> bool {
@@ -94,7 +113,12 @@ async fn require_auth(conn: ServerConn<ClientIo>) {
     }
 }
 
-async fn proxy_port_loop(mut conn: ServerConn<ClientIo>, client: ClientConn, shared: Arc<Shared>) {
+async fn proxy_port_loop(
+    mut conn: ServerConn<ClientIo>,
+    client: ClientConn,
+    shared: Arc<Shared>,
+    cl: ConnLimits,
+) {
     let mut auth_cache = AuthCache::default();
     loop {
         let next = tokio::select! {
@@ -129,6 +153,7 @@ async fn proxy_port_loop(mut conn: ServerConn<ClientIo>, client: ClientConn, sha
                     client.with_user(user),
                     authority,
                     shared,
+                    cl,
                 ))
                 .await;
                 return;
@@ -190,23 +215,20 @@ async fn handle_connect(
     client: ClientConn,
     authority: Authority,
     shared: Arc<Shared>,
+    cl: ConnLimits,
 ) {
-    let snap = shared.snapshot();
     // No connect-time rules: a CONNECT that passed proxy auth is
     // accepted for inspection; every decision is made on the requests
     // inside the tunnel.
     emit_connect_event(&shared, &client, &authority, false);
-    let limits = snap.limits.clone();
-    let flags = snap.flags.clone();
-    drop(snap);
 
     let Ok((io, buf)) = conn.accept_connect().await else {
         return;
     };
 
     // Classify the first bytes: TLS, plaintext HTTP, or close.
-    let Some((io, buf, sniffed)) = classify(io, buf, limits.header_timeout, &client, &shared).await
-    else {
+    let timeout = cl.limits.header_timeout;
+    let Some((io, buf, sniffed)) = classify(io, buf, timeout, &client, &shared).await else {
         return;
     };
     match sniffed {
@@ -224,21 +246,22 @@ async fn handle_connect(
                 );
                 return;
             }
-            Box::pin(terminate_tls(io, buf.freeze(), client, authority, shared)).await;
-        }
-        FirstBytes::Http if flags.allow_plain_in_connect => {
-            let snap = shared.snapshot();
-            let conn = ServerConn::with_buffered(
+            Box::pin(terminate_tls(
                 io,
-                buf,
-                Role::Tunnel {
-                    authority,
-                    scheme: Scheme::Http,
-                },
-                snap.limits.clone(),
-                snap.flags.clone(),
-            );
-            drop(snap);
+                buf.freeze(),
+                client,
+                authority,
+                shared,
+                cl,
+            ))
+            .await;
+        }
+        FirstBytes::Http if cl.flags.allow_plain_in_connect => {
+            let role = Role::Tunnel {
+                authority,
+                scheme: Scheme::Http,
+            };
+            let conn = cl.codec(io, buf, role);
             tunnel_loop(conn, client, None, shared).await;
         }
         FirstBytes::Http | FirstBytes::Other => {
@@ -316,17 +339,10 @@ pub(crate) async fn serve_direct(
     port: u16,
     shared: Arc<Shared>,
 ) {
-    let snap = shared.snapshot();
-    let limits = snap.limits.clone();
-    drop(snap);
-    let Some((io, buf, sniffed)) = classify(
-        stream,
-        BytesMut::new(),
-        limits.header_timeout,
-        &client,
-        &shared,
-    )
-    .await
+    let cl = ConnLimits::current(&shared);
+    let timeout = cl.limits.header_timeout;
+    let Some((io, buf, sniffed)) =
+        classify(stream, BytesMut::new(), timeout, &client, &shared).await
     else {
         return;
     };
@@ -351,6 +367,7 @@ pub(crate) async fn serve_direct(
                 client,
                 authority,
                 shared,
+                cl,
             ))
             .await;
         }
@@ -358,15 +375,7 @@ pub(crate) async fn serve_direct(
             shared.emit_parse_reason(&client, None, "non_http_on_direct", None);
         }
         FirstBytes::Http => {
-            let snap = shared.snapshot();
-            let conn = ServerConn::with_buffered(
-                ClientIo(io),
-                buf,
-                Role::Direct { port },
-                snap.limits.clone(),
-                snap.flags.clone(),
-            );
-            drop(snap);
+            let conn = cl.codec(ClientIo(io), buf, Role::Direct { port });
             tunnel_loop(conn, client, None, shared).await;
         }
     }
@@ -378,6 +387,7 @@ async fn terminate_tls(
     client: ClientConn,
     authority: Authority,
     shared: Arc<Shared>,
+    cl: ConnLimits,
 ) {
     let host = host_text(&authority.host);
     let Ok(name) = roxy_tls::server_name_for_host(&host) else {
@@ -393,9 +403,8 @@ async fn terminate_tls(
         return;
     }
     let cfg = roxy_tls::server_config_for(shared.minter.clone(), name, shared.enable_h2);
-    let limits = shared.snapshot().limits.clone();
     let accept = TlsAcceptor::from(cfg).accept(Rewind::new(io, hello));
-    let tls = match tokio::time::timeout(limits.header_timeout, accept).await {
+    let tls = match tokio::time::timeout(cl.limits.header_timeout, accept).await {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
             shared.emit_parse_reason(&client, None, "tls_handshake_failed", Some(&e.to_string()));
@@ -425,20 +434,14 @@ async fn terminate_tls(
     };
     if info.alpn.as_deref() == Some("h2") {
         // Only offered with `http.enable_h2`.
-        crate::h2conn::serve(tls, client, authority, info, shared).await;
+        crate::h2conn::serve(tls, client, authority, info, shared, cl).await;
         return;
     }
-    let snap = shared.snapshot();
-    let conn = ServerConn::new(
-        ClientIo::new(tls),
-        Role::Tunnel {
-            authority,
-            scheme: Scheme::Https,
-        },
-        snap.limits.clone(),
-        snap.flags.clone(),
-    );
-    drop(snap);
+    let role = Role::Tunnel {
+        authority,
+        scheme: Scheme::Https,
+    };
+    let conn = cl.codec(ClientIo::new(tls), BytesMut::new(), role);
     tunnel_loop(conn, client, Some(info), shared).await;
 }
 
