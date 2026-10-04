@@ -17,50 +17,11 @@ use roxy_proxy::{
 };
 use roxy_tls::{Ca, CaError, LeafMinter};
 
-use crate::config::{Action, Config, ListenerMode};
+use crate::config::{Config, ListenerMode};
 use crate::secrets::Secrets;
 
 /// Debounce for config file events.
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
-
-/// Which optional stores the running build provides.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Capabilities {
-    /// A real [`MetricSource`] is plugged in.
-    pub metric_store: bool,
-    /// A real [`StateSource`] is plugged in.
-    pub state_store: bool,
-    /// A capture log was opened at startup (`capture_dir` was set then).
-    pub capture: bool,
-}
-
-/// Features the config uses that this build cannot run. `roxy check`
-/// accepts them; `roxy run` refuses to start (and a reload is rejected)
-/// rather than run with every affected flow failing closed.
-pub fn unsupported(config: &Config, caps: Capabilities) -> Vec<String> {
-    let mut out = Vec::new();
-    if !config.metrics.is_empty() && !caps.metric_store {
-        out.push(format!(
-            "this build has no metric store yet ({} metric(s) defined under `metrics`)",
-            config.metrics.len()
-        ));
-    }
-    let actions = || config.rules.iter().flat_map(|r| r.then.0.iter());
-    if config.uses_capture() && !caps.capture {
-        out.push(
-            "capture needs `capture_dir` set when roxy starts (the capture log is opened at \
-             startup; restart to enable it)"
-                .into(),
-        );
-    }
-    if actions().any(|a| matches!(a, Action::Call(_))) {
-        out.push("the `call` action (addons) is not in this build".into());
-    }
-    if !caps.state_store && actions().any(|a| matches!(a, Action::SetState(_))) {
-        out.push("`set_state` needs a state store, which is not in this build".into());
-    }
-    out
-}
 
 /// Loads and validates a config; diagnostics as `path:diagnostic` lines.
 pub fn load_checked(path: &Path) -> Result<Config, Vec<String>> {
@@ -210,7 +171,6 @@ pub struct StartOptions {
 pub struct Reloader {
     path: PathBuf,
     handle: ServerHandle,
-    caps: Capabilities,
     last: Mutex<Config>,
     /// The built-in metric store, rebuilt (with carry-over) on each reload.
     /// `None` when the caller supplied its own `MetricSource`.
@@ -323,9 +283,14 @@ impl Reloader {
                     .map(|d| format!("{}:{d}", self.path.display()))
                     .collect::<Vec<_>>()
             })?;
-            let bad = unsupported(&config, self.caps);
-            if !bad.is_empty() {
-                return Err(bad);
+            // Validation requires `capture_dir` with capture, but the
+            // capture log is only opened at startup.
+            if config.uses_capture() && self.handle.capture().is_none() {
+                return Err(vec![
+                    "capture needs the capture log, which is opened at startup: restart with \
+                     `capture_dir` set"
+                        .into(),
+                ]);
             }
             let mut update = policy_update(&config).map_err(|e| vec![format!("{e:#}")])?;
             update.addons = self
@@ -522,22 +487,11 @@ impl Running {
     }
 }
 
-/// Loads `path`, refuses unsupported features, resolves secrets, loads the
-/// CA and starts the server.
+/// Loads and validates `path`, resolves secrets, loads the CA and starts
+/// the server.
 pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
     roxy_tls::install_crypto_provider();
     let config = load_checked(path).map_err(|d| anyhow!("invalid config:\n{}", d.join("\n")))?;
-    // The built-in stores are always available; callers (tests) may still
-    // inject their own.
-    let caps = Capabilities {
-        metric_store: true,
-        state_store: true,
-        capture: config.capture_dir.is_some(),
-    };
-    let bad = unsupported(&config, caps);
-    if !bad.is_empty() {
-        return Err(anyhow!("cannot run this config: {}", bad.join("; ")));
-    }
     let mut update = policy_update(&config)?;
     let addon_loader = Arc::new(crate::addons::AddonLoader::default());
     update.addons = addon_loader.load(&config).await?;
@@ -597,7 +551,6 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
     let reloader = Arc::new(Reloader {
         path: path.to_path_buf(),
         handle: server.handle(),
-        caps,
         last: Mutex::new(config.clone()),
         metrics: builtin_metrics,
         watch: OnceLock::new(),
@@ -708,72 +661,6 @@ mod tests {
         assert_eq!(
             restart_required(&cfg(&dns("10.0.0.1")), &cfg(&dns("10.0.0.1"))),
             Vec::<&str>::new()
-        );
-    }
-
-    #[test]
-    fn plain_policies_are_supported() {
-        let c = cfg("version: 1\nrules:\n  - id: a\n    when: host == \"x\"\n    then: allow\n");
-        assert_eq!(
-            unsupported(&c, Capabilities::default()),
-            Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn refusals() {
-        let c = cfg("
-version: 1
-metrics:
-  - { id: m, count: requests }
-rules:
-  - id: effects
-    then:
-      - capture: request
-      - call: scan
-      - set_state: { key: k, value: v }
-      - allow
-");
-        let bad = unsupported(&c, Capabilities::default()).join("\n");
-        for needle in ["no metric store", "capture_dir", "`call`", "`set_state`"] {
-            assert!(bad.contains(needle), "{needle}: {bad}");
-        }
-        let with_stores = unsupported(
-            &c,
-            Capabilities {
-                metric_store: true,
-                state_store: true,
-                capture: true,
-            },
-        )
-        .join("\n");
-        assert!(!with_stores.contains("metric store"));
-        assert!(!with_stores.contains("set_state"));
-        assert!(!with_stores.contains("capture"));
-    }
-
-    #[test]
-    fn websocket_message_rules_are_supported() {
-        let c = cfg(
-            "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:3128 }]\nrules:\n  - id: w\n    \
-             when: ws.size > 1mb\n    then: deny\n",
-        );
-        c.validate().unwrap();
-        assert_eq!(
-            unsupported(&c, Capabilities::default()),
-            Vec::<String>::new()
-        );
-    }
-
-    #[test]
-    fn address_lists_are_supported() {
-        let c = cfg(
-            "version: 1\naddress_lists: [{ name: b, inline: [1.2.3.4] }]\nupstream: { deny_lists: [b] }\n\
-             rules: [{ id: r, when: 'client.ip in @b', then: deny }]\n",
-        );
-        assert_eq!(
-            unsupported(&c, Capabilities::default()),
-            Vec::<String>::new()
         );
     }
 }

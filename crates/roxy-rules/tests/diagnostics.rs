@@ -145,7 +145,7 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: a, then: [{ set_header: { Host: evil } }, { set_header: { x-a: \"caf\u{e9}\" } }, allow] }",
     ),
     (
-        "bad deny status and undefined addon",
+        "bad deny status and reserved call",
         "",
         "- { id: a, then: [{ call: nope }, { deny: { status: 200 } }] }",
     ),

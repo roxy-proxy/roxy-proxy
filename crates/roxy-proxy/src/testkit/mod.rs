@@ -183,12 +183,10 @@ impl KitBuilder {
 
         let rules: Vec<RuleConfig> = serde_yaml_ng::from_str(&self.rules).unwrap();
         let none = std::collections::HashSet::new();
-        let addon_names = self.addons.iter().map(|a| a.name.clone()).collect();
         let policy = Policy::compile(&PolicyInput {
             rules: &rules,
             metrics: &[],
             secret_names: &none,
-            addon_names: &addon_names,
             address_lists: &none,
             transparent_listeners: false,
             default: DefaultDecision::Deny,

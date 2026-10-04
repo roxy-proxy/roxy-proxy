@@ -50,14 +50,12 @@ impl Config {
     /// path and `roxy rule test` use the result.
     pub fn compile_policy(&self) -> Result<Policy, Vec<Diagnostic>> {
         let secret_names: HashSet<String> = self.secrets.keys().cloned().collect();
-        let addon_names: HashSet<String> = self.addons.iter().map(|a| a.name.clone()).collect();
         let address_lists: HashSet<String> =
             self.address_lists.iter().map(|l| l.name.clone()).collect();
         Policy::compile(&PolicyInput {
             rules: &self.rules,
             metrics: &self.metrics,
             secret_names: &secret_names,
-            addon_names: &addon_names,
             address_lists: &address_lists,
             transparent_listeners: self
                 .listeners

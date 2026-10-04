@@ -260,7 +260,6 @@ pub enum Effect {
         ttl: Option<Duration>,
     },
     Capture(CaptureTarget),
-    CallAddon(String),
 }
 
 impl Effect {
@@ -276,7 +275,6 @@ impl Effect {
             Effect::Log { .. } => "log",
             Effect::SetState { .. } => "set_state",
             Effect::Capture(_) => "capture",
-            Effect::CallAddon(_) => "call",
         }
     }
 
@@ -303,9 +301,9 @@ impl PartialEq for Effect {
             | (E::SetQuery { key: a, value: b }, E::SetQuery { key: c, value: d }) => {
                 a == c && b == d
             }
-            (E::RemoveHeader(a), E::RemoveHeader(b))
-            | (E::RemoveQuery(a), E::RemoveQuery(b))
-            | (E::CallAddon(a), E::CallAddon(b)) => a == b,
+            (E::RemoveHeader(a), E::RemoveHeader(b)) | (E::RemoveQuery(a), E::RemoveQuery(b)) => {
+                a == b
+            }
             (E::RewritePath { regex: a, to: b }, E::RewritePath { regex: c, to: d }) => {
                 a.as_str() == c.as_str() && b == d
             }
@@ -387,7 +385,6 @@ impl fmt::Display for Effect {
                 Ok(())
             }
             Effect::Capture(t) => write!(f, "capture {}", t.as_str()),
-            Effect::CallAddon(a) => write!(f, "call {a}"),
         }
     }
 }

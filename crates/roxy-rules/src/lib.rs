@@ -29,7 +29,7 @@
 //! "#).unwrap();
 //! let none = HashSet::new();
 //! let policy = Policy::compile(&PolicyInput {
-//!     rules: &rules, metrics: &[], secret_names: &none, addon_names: &none, address_lists: &none,
+//!     rules: &rules, metrics: &[], secret_names: &none, address_lists: &none,
 //!     transparent_listeners: false, default: DefaultDecision::Deny,
 //! }).unwrap();
 //! let flow = MapView::new()

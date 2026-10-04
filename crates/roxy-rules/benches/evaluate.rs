@@ -53,7 +53,6 @@ fn policy() -> Policy {
         rules: &rules,
         metrics: &metrics,
         secret_names: &none,
-        addon_names: &none,
         address_lists: &none,
         transparent_listeners: false,
         default: DefaultDecision::Deny,
