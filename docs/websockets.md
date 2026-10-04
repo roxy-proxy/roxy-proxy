@@ -21,9 +21,9 @@ checks that the upstream answered `101` with a correct
 traffic in both directions until either side closes.
 
 How it relays depends on the policy. If no rule reads a `ws.*` field, roxy
-splices bytes: no frame parsing, re-masking or reassembly, and the client's
-extension offer passes through untouched, so `permessage-deflate` and
-subprotocols work exactly as negotiated end to end. If any rule reads
+splices bytes: no frame parsing, re-masking or reassembly. Subprotocols
+work exactly as negotiated end to end, and so do extensions unless
+something must read the messages ([below](#extensions)). If any rule reads
 `ws.*`, roxy checks every message ([message rules](#message-rules)).
 
 Either way:
@@ -44,6 +44,23 @@ Either way:
 - Addons that export `tunnel` are chained between the client and the relay
   ([addons](addons.md#layer-stack)), so message rules see what the layers
   pass on.
+
+## Extensions
+
+A compressed message (`permessage-deflate`) cannot be read without the
+compression state of every message before it. So when something reads the
+messages, roxy makes sure no extension is negotiated: it removes
+`Sec-WebSocket-Extensions` from the upgrade request, and refuses with `502`
+a `101` that accepts an extension anyway. Every WebSocket server must work
+without extensions, so this costs only compression. roxy does this when:
+
+- a rule reads `ws.*` ([message rules](#message-rules)); or
+- the addon stack has a `tunnel` layer and `http.decode_for_addons` is on
+  (the default), so the layer gets readable messages
+  ([addons](addons.md#content-codings)).
+
+Otherwise the client's offer and the upstream's answer pass through
+untouched.
 
 ## Message rules
 
@@ -91,10 +108,8 @@ per WebSocket, the first time it matches.
 
 With message rules, roxy:
 
-- removes `Sec-WebSocket-Extensions` from the upgrade request, so no
-  extension (`permessage-deflate` above all) is negotiated and every message
-  stays readable. A `101` that accepts an extension anyway is refused with
-  `502`;
+- makes sure no extension is negotiated ([above](#extensions)), so every message stays
+  readable;
 - decodes each direction strictly (RFC 6455 §5). RSV bits must be zero,
   opcodes must be known, client frames must be masked and server frames
   must not be, lengths must use the shortest encoding, and control frames

@@ -141,7 +141,8 @@ impl Upstream {
     ///   `content-encoding` set to the request's `x-echo-encoding` and the
     ///   status to its `x-echo-status` (default `200`);
     /// * a WebSocket upgrade: `101`, then echoes bytes; with
-    ///   `x-echo: once`, echoes the first read and closes;
+    ///   `x-echo: once`, echoes the first read and closes; with
+    ///   `x-accept-extension`, accepts `permessage-deflate`;
     /// * anything else: reads the body, answers `200` with JSON
     ///   `{method, path, host, body_len, via}`.
     async fn answer(
@@ -266,12 +267,14 @@ fn echo(
 }
 
 /// Answers a WebSocket upgrade with `101` and echoes the upgraded bytes,
-/// closing after the first read when `once`.
+/// closing after the first read when `once`. With `x-accept-extension`, the
+/// `101` accepts `permessage-deflate` whether or not it was offered.
 fn upgrade_and_echo(
     req: &mut http::Request<Incoming>,
     key: &http::HeaderValue,
     once: bool,
 ) -> http::Response<Full<Bytes>> {
+    let accept_ext = req.headers().contains_key("x-accept-extension");
     let on = hyper::upgrade::on(req);
     tokio::spawn(async move {
         if let Ok(up) = on.await {
@@ -285,11 +288,13 @@ fn upgrade_and_echo(
         }
     });
     let accept = roxy_http::ws::compute_accept(&String::from_utf8_lossy(key.as_bytes()));
-    http::Response::builder()
+    let mut res = http::Response::builder()
         .status(101)
         .header("connection", "upgrade")
         .header("upgrade", "websocket")
-        .header("sec-websocket-accept", accept)
-        .body(Full::default())
-        .unwrap()
+        .header("sec-websocket-accept", accept);
+    if accept_ext {
+        res = res.header("sec-websocket-extensions", "permessage-deflate");
+    }
+    res.body(Full::default()).unwrap()
 }

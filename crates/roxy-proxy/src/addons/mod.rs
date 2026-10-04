@@ -600,6 +600,24 @@ fn gated(body: Body, sink: Arc<dyn FlowSink>) -> Body {
     Body::wrap_native(Gated { inner: body, sink }, u64::MAX, known)
 }
 
+/// The indexes of the stack's `tunnel` layers, outermost first.
+fn tunnel_layers(addons: &[Arc<AddonSpec>]) -> Vec<usize> {
+    addons
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| !a.observe && a.wasm().is_some_and(roxy_wasm::Layer::has_tunnel))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Whether a WebSocket must be relayed with no extension negotiated, so
+/// every message stays readable: message rules check them, or `tunnel`
+/// layers get them decoded (docs/websockets.md#extensions).
+pub(crate) fn ws_without_extensions(snap: &Snapshot) -> bool {
+    snap.policy.reads_ws()
+        || (snap.flags.decode_for_addons && !tunnel_layers(&snap.addons).is_empty())
+}
+
 /// Inserts the stack's `tunnel` layers (outermost first) between the client
 /// and the WebSocket relay (docs/addons.md#layer-stack): each gets the raw byte streams of the
 /// upgraded connection. The rules' relay stays the hop next to the
@@ -616,14 +634,7 @@ pub(crate) fn chain_tunnels(
     leftover: Vec<u8>,
 ) -> (crate::io::BoxIo, Vec<u8>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let tunnels: Vec<usize> = st
-        .snap
-        .addons
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| !a.observe && a.wasm().is_some_and(roxy_wasm::Layer::has_tunnel))
-        .map(|(i, _)| i)
-        .collect();
+    let tunnels = tunnel_layers(&st.snap.addons);
     if tunnels.is_empty() {
         return (client, leftover);
     }

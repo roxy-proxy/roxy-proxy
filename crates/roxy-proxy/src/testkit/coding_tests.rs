@@ -310,3 +310,68 @@ async fn a_corrupt_body_is_cut_on_its_way_to_a_layer() {
     let a = echo(&kit, false, "gzip", enc).await;
     assert!(a.body.is_err(), "{a:?}");
 }
+
+// ---------------------------------------------------------------------------
+// WebSocket extensions with `tunnel` layers (docs/websockets.md#extensions)
+// ---------------------------------------------------------------------------
+
+const WS_RULES: &str = r#"
+- id: ws
+  when: host == "up.test"
+  then: { allow: { upgrade: websocket } }
+"#;
+
+async fn with_tunnel(decode: bool) -> Kit {
+    Kit::builder()
+        .rules(WS_RULES)
+        .addon(AddonDef::tunnel_layer("t", false))
+        .flags(|f| f.decode_for_addons = decode)
+        .start()
+        .await
+}
+
+const DEFLATE: (&str, &str) = ("sec-websocket-extensions", "permessage-deflate");
+
+#[tokio::test]
+async fn a_tunnel_layer_gets_websockets_without_extensions() {
+    let kit = with_tunnel(true).await;
+    let (status, _io) = kit.websocket("/ws", &[DEFLATE]).await;
+    assert_eq!(status, 101);
+    let seen = kit.upstream.wait_seen(1).await;
+    assert!(!seen[0].headers.contains_key("sec-websocket-extensions"));
+}
+
+#[tokio::test]
+async fn a_tunnel_layer_refuses_an_extension_the_upstream_forces() {
+    let kit = with_tunnel(true).await;
+    let (status, _) = kit
+        .websocket("/ws", &[DEFLATE, ("x-accept-extension", "1")])
+        .await;
+    assert_eq!(status, 502);
+}
+
+#[tokio::test]
+async fn decode_for_addons_off_lets_tunnel_layers_negotiate_extensions() {
+    let kit = with_tunnel(false).await;
+    let (status, _io) = kit
+        .websocket("/ws", &[DEFLATE, ("x-accept-extension", "1")])
+        .await;
+    assert_eq!(status, 101);
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(
+        seen[0].headers["sec-websocket-extensions"],
+        "permessage-deflate"
+    );
+}
+
+#[tokio::test]
+async fn without_a_tunnel_layer_extensions_pass_through() {
+    let kit = Kit::builder().rules(WS_RULES).start().await;
+    let (status, _io) = kit.websocket("/ws", &[DEFLATE]).await;
+    assert_eq!(status, 101);
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(
+        seen[0].headers["sec-websocket-extensions"],
+        "permessage-deflate"
+    );
+}

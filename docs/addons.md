@@ -104,8 +104,13 @@ unknown.
 - The rules below the stack read the response before any layer, and decode
   it for themselves ([rules](rules.md#body-access)).
 
+- A `tunnel` layer gets WebSocket messages it can read: no extension
+  (`permessage-deflate` above all) is negotiated on a WebSocket that passes
+  through one ([WebSockets](websockets.md#extensions)).
+
 `http.decode_for_addons: false` turns this off: layers then see the bytes
-as sent, with their `content-encoding`.
+as sent, with their `content-encoding`, and WebSockets negotiate whatever
+extensions client and upstream agree on.
 
 ### Modes
 
