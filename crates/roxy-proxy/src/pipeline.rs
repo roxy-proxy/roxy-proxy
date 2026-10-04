@@ -285,7 +285,7 @@ pub(crate) struct FlowCx {
 
 pub(crate) fn request_facts(req: &CanonicalRequest) -> RequestFacts {
     RequestFacts {
-        method: req.method.as_str().to_owned(),
+        method: req.method.clone(),
         scheme: req.scheme,
         host: req.authority.host.clone(),
         port: req.authority.port,
@@ -470,7 +470,7 @@ impl FlowCx {
         }
         let r = self.facts.client_request.as_ref();
         let req = RequestInfo {
-            method: r.map(|r| r.method.clone()).unwrap_or_default(),
+            method: r.map(|r| r.method.as_str().to_owned()).unwrap_or_default(),
             host: r.map(|r| host_text(&r.host)).unwrap_or_default(),
             port: r.map_or(0, |r| r.port),
             path: r

@@ -18,13 +18,14 @@ use std::sync::{Mutex, PoisonError};
 
 use roxy_http::coding::{self, DecodeError};
 use roxy_http::ws::frame::Message;
-use roxy_http::{Headers, Host, Query, Scheme};
+use roxy_http::{Headers, Host, Method, Query, Scheme};
 use roxy_rules::{BodyText, Field, FlowView, Value};
 
 use crate::addrlist::AddressLists;
 use crate::flowlog::TlsInfo;
 use crate::listener::ClientConn;
 use crate::sources::{MetricSource, MetricSourceError, StateSource};
+use crate::watch::Dir;
 
 /// An inspected (buffered) body.
 #[derive(Debug, Clone, Default)]
@@ -82,7 +83,7 @@ impl Inspected {
 /// The request head.
 #[derive(Debug, Clone)]
 pub(crate) struct RequestFacts {
-    pub method: String,
+    pub method: Method,
     pub scheme: Scheme,
     pub host: Host,
     pub port: u16,
@@ -107,8 +108,7 @@ pub(crate) struct ResponseFacts {
 /// The WebSocket message being checked.
 #[derive(Debug, Clone)]
 pub(crate) struct WsFacts {
-    /// `c2s` or `s2c`.
-    pub direction: &'static str,
+    pub direction: Dir,
     pub message: Message,
 }
 
@@ -246,7 +246,9 @@ impl FlowView for ProxyView<'_> {
             Field::TlsSni => s(tls.and_then(|t| t.sni.as_ref())),
             Field::TlsAlpn => s(tls.and_then(|t| t.alpn.as_ref())),
             Field::TlsVersion => s(tls.and_then(|t| t.version.as_ref())),
-            Field::Method => req.map_or(Value::Absent, |r| Value::Str(Cow::Borrowed(&r.method))),
+            Field::Method => req.map_or(Value::Absent, |r| {
+                Value::Str(Cow::Borrowed(r.method.as_str()))
+            }),
             Field::Scheme => req.map_or(Value::Absent, |r| {
                 Value::Str(Cow::Borrowed(r.scheme.as_str()))
             }),
@@ -262,10 +264,9 @@ impl FlowView for ProxyView<'_> {
             Field::ResponseBodySize => res.and_then(|r| r.body_size).map_or(Value::Absent, int),
             Field::BodyBytes => fa.request_body_bytes.map_or(Value::Absent, int),
             Field::ResponseBodyBytes => fa.response_body_bytes.map_or(Value::Absent, int),
-            Field::WsDirection => fa
-                .ws
-                .as_ref()
-                .map_or(Value::Absent, |w| Value::Str(Cow::Borrowed(w.direction))),
+            Field::WsDirection => fa.ws.as_ref().map_or(Value::Absent, |w| {
+                Value::Str(Cow::Borrowed(w.direction.ws_str()))
+            }),
             Field::WsOpcode => fa.ws.as_ref().map_or(Value::Absent, |w| {
                 Value::Int(i64::from(w.message.opcode.as_u8()))
             }),

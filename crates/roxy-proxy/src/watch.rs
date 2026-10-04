@@ -86,6 +86,24 @@ pub(crate) enum Dir {
     Response,
 }
 
+impl Dir {
+    /// `request` or `response`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Dir::Request => "request",
+            Dir::Response => "response",
+        }
+    }
+
+    /// `c2s` or `s2c`: the WebSocket form (`ws.direction`).
+    pub(crate) fn ws_str(self) -> &'static str {
+        match self {
+            Dir::Request => "c2s",
+            Dir::Response => "s2c",
+        }
+    }
+}
+
 /// The watching state of one exchange. Shared (`Arc`) between the request
 /// body adapter (polled by the upstream connection), the response path and
 /// the exchange driver.
@@ -287,11 +305,10 @@ impl Watch {
         if let Some(s) = &g.stopped {
             return (message, Err(s.clone()));
         }
-        let direction = match dir {
-            Dir::Request => "c2s",
-            Dir::Response => "s2c",
-        };
-        g.facts.ws = Some(WsFacts { direction, message });
+        g.facts.ws = Some(WsFacts {
+            direction: dir,
+            message,
+        });
         g.known |= Reads::WS;
         let before = g.rules.len();
         let effects = g.evaluate(Reads::WS, Stage::Websocket);
@@ -316,7 +333,7 @@ impl Watch {
                 ts: chrono::Utc::now(),
                 flow: g.flow.to_string(),
                 conn: g.conn.clone(),
-                direction: direction.to_owned(),
+                direction: dir.ws_str().to_owned(),
                 opcode: message.opcode.as_u8(),
                 size: message.len() as u64,
                 decision,
