@@ -21,8 +21,6 @@ use crate::config::{Addon, AddonKind, AddonMode, Capability, Config};
 
 /// Endpoint timeout when none is configured.
 const DEFAULT_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(30);
-/// A service layer's `first_byte_timeout` when none is configured.
-const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn service(a: &Addon) -> anyhow::Result<ServiceSpec> {
     let endpoint = a
@@ -34,11 +32,7 @@ fn service(a: &Addon) -> anyhow::Result<ServiceSpec> {
         first_byte_timeout: a
             .limits
             .first_byte_timeout
-            .unwrap_or(DEFAULT_FIRST_BYTE_TIMEOUT),
-        max_exchange_time: a
-            .limits
-            .max_exchange_time
-            .unwrap_or(LayerLimits::default().max_exchange_time),
+            .unwrap_or(LayerLimits::default().first_byte_timeout),
     })
 }
 
@@ -73,19 +67,12 @@ fn usize_of(n: u64) -> usize {
     usize::try_from(n).unwrap_or(usize::MAX)
 }
 
-fn layer_config(config: &Config, a: &Addon) -> anyhow::Result<LayerConfig> {
+fn layer_config(a: &Addon) -> anyhow::Result<LayerConfig> {
     let d = LayerLimits::default();
     let l = &a.limits;
     let limits = LayerLimits {
         max_memory: l.max_memory.map_or(d.max_memory, |b| b.as_u64()),
-        max_buffered_body_bytes: l
-            .max_buffered_body_bytes
-            .map_or(config.limits.max_inspect_body_bytes.as_u64(), |b| {
-                b.as_u64()
-            }),
-        step_cpu: l.step_cpu.unwrap_or(d.step_cpu),
-        max_exchange_time: l.max_exchange_time.unwrap_or(d.max_exchange_time),
-        fuel_per_step: l.fuel_per_step.unwrap_or(d.fuel_per_step),
+        first_byte_timeout: l.first_byte_timeout.unwrap_or(d.first_byte_timeout),
         recycle_after_exchanges: l
             .recycle_after_exchanges
             .unwrap_or(d.recycle_after_exchanges),
@@ -169,7 +156,7 @@ impl AddonLoader {
             let kind = if a.kind == AddonKind::Service {
                 AddonImpl::Service(service(a)?)
             } else {
-                AddonImpl::Wasm(self.wasm(config, a, &mut keep).await?)
+                AddonImpl::Wasm(self.wasm(a, &mut keep).await?)
             };
             out.push(Arc::new(AddonSpec {
                 name: a.name.clone(),
@@ -191,19 +178,14 @@ impl AddonLoader {
     }
 
     /// Compiles (or reuses) a WASM addon's layer.
-    async fn wasm(
-        &self,
-        config: &Config,
-        a: &Addon,
-        keep: &mut Vec<(String, u64, Layer)>,
-    ) -> anyhow::Result<Layer> {
+    async fn wasm(&self, a: &Addon, keep: &mut Vec<(String, u64, Layer)>) -> anyhow::Result<Layer> {
         let path = a
             .path
             .as_ref()
             .ok_or_else(|| anyhow!("addon {}: no `path`", a.name))?;
         let bytes = std::fs::read(path)
             .with_context(|| format!("addon {}: reading {}", a.name, path.display()))?;
-        let lc = layer_config(config, a)?;
+        let lc = layer_config(a)?;
         let key = {
             let mut h = DefaultHasher::new();
             bytes.hash(&mut h);
@@ -229,7 +211,7 @@ impl AddonLoader {
             let layer = Layer::load(&rt, bytes, lc)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
-            tracing::info!(addon = a.name, tunnel = layer.has_tunnel(), "addon loaded");
+            tracing::info!(addon = a.name, "addon loaded");
             layer
         };
         keep.push((a.name.clone(), key, layer.clone()));

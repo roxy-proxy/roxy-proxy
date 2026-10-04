@@ -1,22 +1,36 @@
 # Addon safety
 
-- **CPU per step.** A step is the guest's run between host calls: every
-  call into the guest, and every host call returning to it, starts a new
-  one. Each step gets `fuel_per_step` fuel and `step_cpu` of wall time. The
-  time limit is checked on a 1 ms engine-wide epoch tick, which also yields
-  to the async runtime, so a spinning guest neither stalls a worker thread
-  nor escapes its clock.
-- **Wall clock per exchange.** `max_exchange_time` runs from the start of
-  the exchange until the guest's handler returns: waiting for an instance,
-  `next`, endpoint calls and streaming both bodies. A streamed response
-  longer than the limit is cut. Tunnels have no exchange clock; they live as
-  long as the relay's idle timeout allows.
+An addon's limits protect roxy and catch an addon that is broken. They
+don't police how fast it is: a slow addon makes its exchanges slow, never
+denied, and how fast it runs is its author's business. Nothing passes a
+slow layer unchecked while it works, so this keeps traffic fail-closed.
+
+- **A deadline to the response head.** `first_byte_timeout` (default 30s)
+  bounds the layer's own time to set its response head. Starting an
+  instance, the layer's work, endpoint calls and reading the client's body
+  count. The time `next` spends below the layer does not. A layer that
+  never answers is broken, not slow: it fails closed with
+  `budget:first_byte_timeout`. A service layer's `first_byte_timeout`
+  bounds each of the service's heads the same way.
+- **No clock on bodies.** Once the head is out, a body streams for as long
+  as it takes. An SSE stream or a long generation is never cut by an addon
+  limit. The client's and the upstream's idle timeouts still apply.
+- **No CPU limit.** A guest may compute for as long as it likes. It yields
+  to the async runtime on a 1 ms engine-wide tick, so a busy guest never
+  stalls a worker thread, and cancelling its exchange takes effect within
+  a tick.
+- **A client that gives up cancels the exchange.** The guest is stopped,
+  its instance discarded, and the slot freed. It is logged as cancelled,
+  not as a failure.
 - **Memory per instance.** Linear memory, summed over the instance's
   memories, is capped at `max_memory`; table growth and the host resource
-  table (4096 live resources) are capped too.
-- **Buffered bytes.** `max_buffered_body_bytes` bounds, per direction, the
-  bytes the guest has read from that direction's body minus the bytes it
-  has passed on. A streaming layer stays near zero.
+  table (4096 live resources) are capped too. This is what keeps one addon
+  from exhausting roxy's memory, and with it every flow. Whatever a layer
+  holds of a body lives here.
+- **Instances.** `max_instances` (default 1024) caps the live instances,
+  and so the layer's concurrent exchanges and, with `max_memory`, its
+  memory. An exchange that finds none free waits for one, without a
+  deadline. Instances start on demand.
 - **Every failure is closed.** A trap, an exceeded budget, a second `next`,
   a missing capability, a host failure, an unbuildable request, an error or
   missing response, a handler that returns while still holding resources,

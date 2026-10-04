@@ -13,13 +13,10 @@ use roxy_http::{Body, BodyError, BodySender};
 use roxy_wasm::{
     Budget, Capabilities, Capability, HostError, Layer, LayerError, LayerOutcome, LoadError,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 mod common;
 use common::*;
-
-const TUNNEL_LAYER: &[u8] = include_bytes!("fixtures/tunnel_layer.wasm");
 
 #[tokio::test]
 async fn passes_through_and_transforms() {
@@ -47,14 +44,11 @@ async fn passes_through_and_transforms() {
 }
 
 /// Bodies stream in both directions: each chunk crosses the layer before
-/// the next one exists, and nothing is buffered on the layer's behalf
-/// (the buffered-bytes budget here is smaller than either body).
+/// the next one exists, and nothing is buffered on the layer's behalf.
 #[tokio::test]
 async fn streams_both_directions() {
     let rt = runtime();
-    let mut cfg = config();
-    cfg.limits.max_buffered_body_bytes = 32;
-    let layer = load(&rt, cfg).await;
+    let layer = load(&rt, config()).await;
 
     let (mut up_tx, up_body) = Body::channel(u64::MAX, None);
     let (seen_tx, seen_rx) = oneshot::channel();
@@ -150,48 +144,57 @@ async fn second_next_traps() {
     assert_eq!(err, LayerError::NextCalledTwice);
 }
 
+/// A layer that never sets a response head, computing or calling the
+/// host, is broken: its head deadline fails it closed.
 #[tokio::test]
-async fn infinite_loop_is_stopped_by_fuel() {
+async fn no_head_in_time_fails_closed() {
     let rt = runtime();
     let mut cfg = config();
-    cfg.limits.fuel_per_step = 10_000_000;
-    cfg.limits.step_cpu = Duration::from_secs(30);
+    cfg.limits.first_byte_timeout = Duration::from_millis(200);
     let layer = load(&rt, cfg).await;
-    let err = exchange(&layer, Mock::echo(), request("loop", Body::empty()))
-        .await
-        .unwrap_err();
-    assert_eq!(err, LayerError::BudgetExceeded(Budget::Fuel));
+    for test in ["loop", "host-loop"] {
+        let start = std::time::Instant::now();
+        let err = exchange(&layer, Mock::echo(), request(test, Body::empty()))
+            .await
+            .unwrap_err();
+        assert_eq!(err, LayerError::BudgetExceeded(Budget::FirstByte), "{test}");
+        assert!(start.elapsed() < Duration::from_secs(5), "{test}");
+    }
 }
 
+/// The time `next` spends below the layer is not the layer's.
 #[tokio::test]
-async fn infinite_loop_is_stopped_by_epoch() {
+async fn the_head_deadline_excludes_time_below() {
     let rt = runtime();
     let mut cfg = config();
-    cfg.limits.fuel_per_step = u64::MAX / 2;
-    cfg.limits.step_cpu = Duration::from_millis(20);
+    cfg.limits.first_byte_timeout = Duration::from_millis(200);
     let layer = load(&rt, cfg).await;
-    let start = std::time::Instant::now();
-    let err = exchange(&layer, Mock::echo(), request("loop", Body::empty()))
+    let host = Mock::new(NextMode::SlowEcho(Duration::from_millis(600)));
+    let (status, body) = exchange(&layer, host, request("pass", Body::from_bytes("slow")))
         .await
-        .unwrap_err();
-    assert_eq!(err, LayerError::BudgetExceeded(Budget::StepCpu));
-    assert!(start.elapsed() < Duration::from_secs(5));
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "slow");
 }
 
-/// A loop that keeps calling the host never exhausts a step, but the
-/// exchange's wall clock still stops it.
+/// A guest computing for a long time is slow, not failed: nothing
+/// limits CPU between host calls, and the guest still yields.
 #[tokio::test]
-async fn host_call_loop_is_stopped_by_wall_clock() {
+async fn a_long_computation_is_not_a_failure() {
     let rt = runtime();
-    let mut cfg = config();
-    cfg.limits.max_exchange_time = Duration::from_millis(200);
-    let layer = load(&rt, cfg).await;
-    let start = std::time::Instant::now();
-    let err = exchange(&layer, Mock::echo(), request("host-loop", Body::empty()))
+    let layer = load(&rt, config()).await;
+    // A loop with no host calls, dropped after a second: the instance is
+    // reclaimed and the next exchange gets one.
+    let looping = exchange(&layer, Mock::echo(), request("loop", Body::empty()));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), looping)
+            .await
+            .is_err()
+    );
+    let (status, _) = exchange(&layer, Mock::echo(), request("pass", Body::empty()))
         .await
-        .unwrap_err();
-    assert_eq!(err, LayerError::BudgetExceeded(Budget::ExchangeTime));
-    assert!(start.elapsed() < Duration::from_secs(5));
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -206,39 +209,34 @@ async fn memory_hog_hits_the_limit() {
     assert_eq!(err, LayerError::BudgetExceeded(Budget::Memory));
 }
 
+/// A layer may read a whole body before passing it on; only its memory
+/// bounds what it holds.
 #[tokio::test]
-async fn buffering_past_the_budget_fails() {
+async fn a_layer_may_buffer_a_body() {
     let rt = runtime();
-    let mut cfg = config();
-    cfg.limits.max_buffered_body_bytes = 1024;
-    let layer = load(&rt, cfg).await;
-
-    // Within budget: fine.
-    let (_, body) = exchange(
-        &layer,
-        Mock::echo(),
-        request("buffer", Body::from_bytes(vec![b'a'; 1000])),
-    )
-    .await
-    .unwrap();
-    assert_eq!(body.len(), 1000);
-
-    // Reading the whole body before passing it on holds too much.
+    let layer = load(&rt, config()).await;
     let (mut tx, body) = Body::channel(u64::MAX, None);
     tokio::spawn(async move {
-        for _ in 0..8 {
-            if tx.send_data(Bytes::from(vec![b'a'; 512])).await.is_err() {
+        for _ in 0..64 {
+            if tx
+                .send_data(Bytes::from(vec![b'a'; 16 * 1024]))
+                .await
+                .is_err()
+            {
                 return;
             }
         }
         let _ = tx.finish().await;
     });
-    let host = Mock::echo();
-    let err = exchange(&layer, host.clone(), request("buffer", body))
+    let host = Mock::new(NextMode::Canned(200, "text/plain", b"ok".to_vec()));
+    let (_, body) = exchange(&layer, host.clone(), request("buffer", body))
         .await
-        .unwrap_err();
-    assert_eq!(err, LayerError::BudgetExceeded(Budget::BufferedBody));
-    assert_eq!(host.next_calls.load(Ordering::SeqCst), 0);
+        .unwrap();
+    assert_eq!(body, "ok");
+    assert_eq!(
+        host.seen_body.lock().unwrap().as_ref().unwrap().len(),
+        1 << 20
+    );
 }
 
 #[tokio::test]
@@ -587,15 +585,16 @@ async fn max_instances_bounds_concurrency() {
     assert_eq!(second.await.unwrap(), 2);
 }
 
+/// Bodies have no clock: a stream that outlives the head deadline many
+/// times over goes through whole.
 #[tokio::test]
-async fn exchange_wall_clock_covers_streaming() {
+async fn a_long_stream_is_not_cut() {
     let rt = runtime();
     let mut cfg = config();
-    cfg.limits.max_instances = 1;
-    cfg.limits.max_exchange_time = Duration::from_millis(300);
+    cfg.limits.first_byte_timeout = Duration::from_millis(100);
     let layer = load(&rt, cfg).await;
 
-    let (_up_tx, up_body): (BodySender, Body) = Body::channel(u64::MAX, None);
+    let (mut up_tx, up_body): (BodySender, Body) = Body::channel(u64::MAX, None);
     let (seen_tx, seen_rx) = oneshot::channel();
     let host = Mock::new(NextMode::Capture(Mutex::new(Some((
         seen_tx,
@@ -606,10 +605,14 @@ async fn exchange_wall_clock_covers_streaming() {
         async move { exchange(&layer, host, request("pass", Body::empty())).await }
     });
     let _upstream = seen_rx.await.unwrap();
-    assert_eq!(
-        first.await.unwrap().unwrap_err(),
-        LayerError::BudgetExceeded(Budget::ExchangeTime)
-    );
+    for chunk in ["one ", "two ", "three"] {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        up_tx.send_data(Bytes::from(chunk)).await.unwrap();
+    }
+    up_tx.finish().await.unwrap();
+    let (status, body) = first.await.unwrap().unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "one two three");
 }
 
 #[tokio::test]
@@ -649,7 +652,11 @@ async fn dropping_the_exchange_cancels_it() {
             .unwrap(),
         "partial"
     );
+    // Dropping the exchange: the call if it is still running, and the
+    // response it returned if it is not (a layer that streams both bodies
+    // answers as soon as `next` does).
     task.abort();
+    drop(task);
     let _ = done_rx.recv().await;
     // The upstream request body is cut, not ended cleanly.
     assert_eq!(
@@ -735,69 +742,31 @@ async fn bad_components_fail_to_load() {
     assert!(matches!(err, LoadError::Limits { .. }), "{err:?}");
 }
 
+/// Both bodies stream at once: each chunk of a request body that has not
+/// ended comes back (through an echo below the layer) before the next is
+/// sent. A WebSocket through a layer is exactly this.
 #[tokio::test]
-async fn tunnel_is_detected_and_relays() {
+async fn both_bodies_stream_at_once() {
     let rt = runtime();
-    let plain = load(&rt, config()).await;
-    assert!(!plain.has_tunnel());
-    let (a, _b) = tokio::io::duplex(64);
-    let (c, _d) = tokio::io::duplex(64);
-    let (ar, aw) = tokio::io::split(a);
-    let (cr, cw) = tokio::io::split(c);
-    assert_eq!(
-        plain
-            .tunnel(Mock::echo(), ar, aw, cr, cw)
-            .await
-            .unwrap_err(),
-        LayerError::NoTunnel
-    );
-
-    let mut cfg = config();
-    cfg.config_json = r#"{"upper": true}"#.into();
-    let layer = Layer::load(&rt, TUNNEL_LAYER.to_vec(), cfg).await.unwrap();
-    assert!(layer.has_tunnel());
-    // The tunnel layer passes plain exchanges through.
-    let (_, body) = exchange(&layer, Mock::echo(), request("x", Body::empty()))
-        .await
-        .unwrap();
-    assert_eq!(body, "");
-
-    // client <-> [layer] <-> upstream
-    let (client, client_side) = tokio::io::duplex(1024);
-    let (upstream, upstream_side) = tokio::io::duplex(1024);
-    let (from_client, to_client) = tokio::io::split(client_side);
-    let (from_upstream, to_upstream) = tokio::io::split(upstream_side);
-    let relay = tokio::spawn({
-        let layer = layer.clone();
-        async move {
-            layer
-                .tunnel(
-                    Mock::echo(),
-                    from_client,
-                    to_upstream,
-                    from_upstream,
-                    to_client,
-                )
+    let layer = load(&rt, config()).await;
+    let (mut client_tx, client_body) = Body::channel(u64::MAX, None);
+    let mut req = request("pass", client_body);
+    req.headers_mut().insert("x-upper", "1".parse().unwrap());
+    let resp = layer.handle(Mock::echo(), req).await.unwrap();
+    let mut body = resp.into_body();
+    for msg in ["ping", "pong", "done"] {
+        client_tx.send_data(Bytes::from(msg)).await.unwrap();
+        let mut got = Vec::new();
+        while got.len() < msg.len() {
+            let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
                 .await
+                .expect("each chunk comes back before the request body ends")
+                .unwrap()
+                .unwrap();
+            got.extend_from_slice(frame.data_ref().unwrap());
         }
-    });
-    let (mut client_r, mut client_w) = tokio::io::split(client);
-    let (mut up_r, mut up_w) = tokio::io::split(upstream);
-
-    client_w.write_all(b"ping").await.unwrap();
-    let mut buf = [0u8; 4];
-    up_r.read_exact(&mut buf).await.unwrap();
-    assert_eq!(&buf, b"PING");
-    up_w.write_all(b"pong").await.unwrap();
-    client_r.read_exact(&mut buf).await.unwrap();
-    assert_eq!(&buf, b"pong");
-
-    client_w.shutdown().await.unwrap();
-    up_w.shutdown().await.unwrap();
-    relay.await.unwrap().unwrap();
-    // Both directions closed through the layer.
-    let mut rest = Vec::new();
-    up_r.read_to_end(&mut rest).await.unwrap();
-    client_r.read_to_end(&mut rest).await.unwrap();
-    assert_eq!(rest, b"");
+        assert_eq!(got, msg.to_ascii_uppercase().as_bytes());
+    }
+    client_tx.finish().await.unwrap();
+    assert!(body.frame().await.is_none());
 }

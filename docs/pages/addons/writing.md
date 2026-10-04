@@ -32,7 +32,8 @@ roxy_addon::export!(RedactTokens);
   body buffers.
 - `flow::*` and `call_endpoint` wrap the host services. A panic traps, and
   the host fails the exchange closed.
-- The SDK does not wrap `tunnel`; use the raw bindings.
+- WebSockets need nothing extra: the request and response bodies carry
+  them ([WebSockets](/addons/overview#websockets)).
 - The crate carries a copy of `wit/` so it can be published; a test keeps
   the copy in sync.
 
@@ -57,9 +58,6 @@ the WASI 0.2 HTTP types for heads and bodies, vendored at 0.2.12 under
   `init` (called once per instance, with the config available through
   `flow.config`). It imports `chain` (`next`), `endpoints`, `flow`, and the
   WASI clocks, random, io, stdio and `wasi:http/types`.
-- **World `tunnel-layer`** adds the `tunnel` export. The component model has
-  no optional exports, so the host detects at load time which world a
-  component implements.
 - The host also links the rest of WASI 0.2 inertly: an empty environment, no
   arguments, no preopened directories, stdio closed, TCP, UDP and name
   lookup off, every socket address denied. Stock toolchains whose standard
@@ -76,8 +74,8 @@ A component is compiled and linked once per config load, on the blocking
 pool, then one instance is started and its `init` run, so a broken layer
 fails the load. Each exchange checks an instance out of the layer's pool for
 its whole duration. `max_instances` caps the live instances, and so the
-layer's concurrent exchanges; an exchange that finds none free waits within
-its `max_exchange_time`. Instances are replaced after
+layer's concurrent exchanges; an exchange that finds none free waits until
+one is. Instances are replaced after
 `recycle_after_exchanges`, or when an exchange leaves their linear memory
 above `recycle_above_memory`, which bounds linear-memory growth. An instance
 that failed in any way is discarded, never reused.

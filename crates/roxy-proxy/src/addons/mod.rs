@@ -33,7 +33,7 @@ use http_body::{Body as HttpBody, Frame, SizeHint};
 use roxy_http::layer::{from_layer_request, to_layer_request, to_layer_response};
 use roxy_http::upstream::from_upstream_response;
 use roxy_http::ws::WsKey;
-use roxy_http::{Body, BodyError, CanonicalRequest, Headers, coding};
+use roxy_http::{Body, BodyError, BodySender, CanonicalRequest, Headers, coding};
 use roxy_wasm::{HostError, LayerError, LayerOutcome, LayerRequest, LayerResponse};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -80,16 +80,6 @@ pub enum AddonImpl {
     Wasm(roxy_wasm::Layer),
     /// An external service the exchange streams through.
     Service(ServiceSpec),
-}
-
-impl AddonSpec {
-    /// The WASM layer, if this addon is one.
-    pub(crate) fn wasm(&self) -> Option<&roxy_wasm::Layer> {
-        match &self.kind {
-            AddonImpl::Wasm(l) => Some(l),
-            AddonImpl::Service(_) => None,
-        }
-    }
 }
 
 /// Why a layer failed.
@@ -318,6 +308,18 @@ pub(crate) struct StackFlow {
     pub(crate) close: AtomicBool,
     /// The upgraded upstream connection, when the core relayed a `101`.
     upgrade: Mutex<Option<(hyper::upgrade::Upgraded, WsKey)>>,
+    /// The first layer to run has decoded the request for the layers.
+    request_decoded: AtomicBool,
+    /// A WebSocket through the stack: the client's bytes after the `101`
+    /// go into the top request body through this sender.
+    ws_client_tx: Mutex<Option<BodySender>>,
+    /// The top response body of an upgraded exchange: the bytes for the
+    /// client.
+    ws_to_client: Mutex<Option<Body>>,
+    /// The bottom of the stack for an upgraded exchange: the relay's
+    /// client side (what the last layer passed on, and where the
+    /// upstream's bytes go).
+    ws_bottom: Mutex<Option<crate::io::BoxIo>>,
 }
 
 impl StackFlow {
@@ -344,6 +346,10 @@ impl StackFlow {
             reported: AtomicBool::new(false),
             close: AtomicBool::new(false),
             upgrade: Mutex::new(None),
+            request_decoded: AtomicBool::new(false),
+            ws_client_tx: Mutex::new(None),
+            ws_to_client: Mutex::new(None),
+            ws_bottom: Mutex::new(None),
         }
     }
 
@@ -402,6 +408,11 @@ impl StackFlow {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Some layer ran on the flow (its `when` and `sample` let it).
+    fn any_ran(&self) -> bool {
+        self.layers.iter().any(|l| l.ran.load(Ordering::SeqCst))
     }
 
     pub(crate) fn add_tag(&self, tag: String) {
@@ -555,11 +566,14 @@ pub(crate) async fn run<F: Front>(
     cx: FlowCx,
     mut req: CanonicalRequest,
 ) -> (FlowCx, Outcome) {
-    if cx.snap.flags.decode_for_addons {
-        let limit = cx.snap.limits.max_request_body_bytes;
-        decode_for_layers(&mut req.headers, &mut req.body, limit);
-    }
     let st = Arc::new(StackFlow::new(&cx, &req));
+    if req.meta.upgrade.is_some() {
+        // A WebSocket is a long-lived exchange: once upgraded, the client's
+        // bytes are the request body and the upstream's the response body.
+        let (tx, body) = Body::channel(u64::MAX, None);
+        req.body = body;
+        *lock(&st.ws_client_tx) = Some(tx);
+    }
     st.park(cx);
     let driven = front
         .drive(enter(st.clone(), 0, to_layer_request(req)))
@@ -607,6 +621,11 @@ fn stack_outcome(
             }
         });
     }
+    let mut resp = resp;
+    // A `101`'s body is the upgraded stream for the client, not an HTTP
+    // body: keep it out of the response model.
+    let upgraded_body = (resp.status() == http::StatusCode::SWITCHING_PROTOCOLS)
+        .then(|| std::mem::take(resp.body_mut()));
     let mut res = from_upstream_response(resp, &cx.snap.limits);
     res.body = gated(std::mem::take(&mut res.body), cx.shared.sink.clone());
     if st.close.load(Ordering::Relaxed) {
@@ -617,6 +636,7 @@ fn stack_outcome(
             // A layer cannot express `upgrade: websocket` (hop-by-hop); the
             // core relayed a real upgrade, so restore it.
             res.meta.upgrade = Some("websocket".to_owned());
+            *lock(&st.ws_to_client) = upgraded_body;
             return Outcome::Upgrade { res, upstream, key };
         }
         let layer = st.snap.addons[0].name.clone();
@@ -646,6 +666,12 @@ pub(crate) fn enter(
         };
         st.layers[index].ran.store(true, Ordering::SeqCst);
         st.layers[index].set(NextState::Entered);
+        let mut req = req;
+        // Layers see bodies decoded; a flow no layer runs on is left as
+        // the client sent it.
+        if st.snap.flags.decode_for_addons && !st.request_decoded.swap(true, Ordering::SeqCst) {
+            decode_layer_request(&mut req, st.snap.limits.max_request_body_bytes);
+        }
         if addon.observe {
             return tee::observe(st, index, req).await;
         }
@@ -691,6 +717,7 @@ fn selects(
         return Ok((sampled(st.flow, index, addon.sample), req));
     };
     let snap = &st.snap;
+    let (req, stream) = split_upgrade_stream(st, req);
     let mut creq = match from_layer_request(req, &snap.limits, &snap.flags) {
         Ok(r) => r,
         Err(e) => {
@@ -715,7 +742,7 @@ fn selects(
     match matched {
         Ok(m) => Ok((
             m && sampled(st.flow, index, addon.sample),
-            to_layer_request(creq),
+            join_upgrade_stream(to_layer_request(creq), stream),
         )),
         Err(reason) => {
             let err = StackError::Condition {
@@ -727,7 +754,7 @@ fn selects(
             }
             // An observer cannot affect traffic, so neither can its `when`.
             emit_stack_error(st, &addon.name, &err, true);
-            Ok((false, to_layer_request(creq)))
+            Ok((false, join_upgrade_stream(to_layer_request(creq), stream)))
         }
     }
 }
@@ -806,6 +833,7 @@ async fn core(
 ) -> Result<LayerResponse, HostError> {
     let snap = st.snap.clone();
     let layer = snap.addons[index].name.clone();
+    let (req, stream) = split_upgrade_stream(&st, req);
     let mut creq = match from_layer_request(req, &snap.limits, &snap.flags) {
         Ok(r) => r,
         Err(e) => {
@@ -819,6 +847,7 @@ async fn core(
         return Err(HostError::new("the flow already reached the core"));
     };
     let cx = lease.cx();
+    cx.layer_ran = st.any_ran();
     cx.facts.request = Some(crate::pipeline::request_facts(&creq));
     st.set_facts(&cx.facts);
     let mut front = Detached;
@@ -838,8 +867,10 @@ async fn core(
     st.set_facts(&cx.facts);
     match outcome {
         Outcome::Respond(mut res) => {
-            // A range of an encoded body is not decodable on its own.
+            // A range of an encoded body is not decodable on its own. A
+            // flow no layer ran on gets the response as the origin sent it.
             if snap.flags.decode_for_addons
+                && st.any_ran()
                 && res.status != http::StatusCode::PARTIAL_CONTENT
                 && !res.headers.contains("content-range")
             {
@@ -864,11 +895,35 @@ async fn core(
             );
             Err(HostError::new(format!("request body failed: {e}")))
         }
-        Outcome::Upgrade { res, upstream, key } => {
+        Outcome::Upgrade {
+            mut res,
+            upstream,
+            key,
+        } => {
             *st.upgrade.lock().unwrap_or_else(PoisonError::into_inner) = Some((upstream, key));
+            // The bottom of the stack: what the last layer passes on goes to
+            // the relay, and what the relay gets from the upstream comes
+            // back up as the response body. One pipe per direction, each
+            // end held whole, so a close on either side is seen (#36).
+            let (to_relay_w, to_relay_r) = tokio::io::duplex(64 * 1024);
+            let (from_relay_w, from_relay_r) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(body_to_writer(stream.unwrap_or_default(), to_relay_w));
+            res.body = reader_to_body(from_relay_r);
+            *lock(&st.ws_bottom) = Some(Box::new(tokio::io::join(to_relay_r, from_relay_w)));
             Ok(to_layer_response(res))
         }
     }
+}
+
+/// [`decode_for_layers`] on a request on its way into a layer.
+fn decode_layer_request(req: &mut LayerRequest, limit: u64) {
+    let mut headers = Headers::from_header_map_lenient(req.headers());
+    let mut body = std::mem::take(req.body_mut());
+    decode_for_layers(&mut headers, &mut body, limit);
+    if !headers.contains("content-encoding") {
+        req.headers_mut().remove(http::header::CONTENT_ENCODING);
+    }
+    *req.body_mut() = body;
 }
 
 /// Decodes a body by its `content-encoding` for the layers,
@@ -918,91 +973,113 @@ fn gated(body: Body, sink: Arc<dyn FlowSink>) -> Body {
     Body::wrap_native(Gated { inner: body, sink }, u64::MAX, known)
 }
 
-/// The indexes of the stack's `tunnel` layers, outermost first.
-fn tunnel_layers(addons: &[Arc<AddonSpec>]) -> Vec<usize> {
-    addons
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| !a.observe && a.wasm().is_some_and(roxy_wasm::Layer::has_tunnel))
-        .map(|(i, _)| i)
-        .collect()
-}
-
 /// Whether a WebSocket must be relayed with no extension negotiated, so
-/// every message stays readable: message rules check them, or `tunnel`
-/// layers get them decoded.
-pub(crate) fn ws_without_extensions(snap: &Snapshot) -> bool {
-    snap.policy.reads_ws()
-        || (snap.flags.decode_for_addons && !tunnel_layers(&snap.addons).is_empty())
+/// every message stays readable: message rules check them, or a layer
+/// that ran on the upgrade request reads its bytes.
+pub(crate) fn ws_without_extensions(snap: &Snapshot, layer_ran: bool) -> bool {
+    snap.policy.reads_ws() || (snap.flags.decode_for_addons && layer_ran)
 }
 
-/// Inserts the stack's `tunnel` layers (outermost first) between the client
-/// and the WebSocket relay: each gets the raw byte streams of the
-/// upgraded connection. The rules' relay stays the hop next to the
-/// upstream, so byte budgets still see what leaves. `leftover` (bytes that
-/// arrived with the upgrade request) goes through the layers too, and the
-/// returned leftover is then empty. Without a `tunnel` layer, returns its
-/// inputs.
-type ReadSide = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
-type WriteSide = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
-
-pub(crate) fn chain_tunnels(
-    st: &Arc<StackFlow>,
+/// An upgraded exchange's client side, once the front has sent the `101`:
+/// the client's bytes go into the top request body (those that came with
+/// the upgrade request first), and the top response body goes to the
+/// client. Returns the relay's client side, the bottom of the stack, or
+/// `None` when the exchange did not go through the stack as a WebSocket.
+pub(crate) fn splice_client(
+    st: &StackFlow,
     client: crate::io::BoxIo,
     leftover: Vec<u8>,
-) -> (crate::io::BoxIo, Vec<u8>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    // Only the layers that ran on the upgrade request: a `when` that
-    // skipped a layer skips its tunnel too.
-    let tunnels: Vec<usize> = tunnel_layers(&st.snap.addons)
-        .into_iter()
-        .filter(|&i| st.layers[i].ran.load(Ordering::SeqCst))
-        .collect();
-    if tunnels.is_empty() {
-        return (client, leftover);
+) -> Result<crate::io::BoxIo, crate::io::BoxIo> {
+    let (Some(tx), Some(to_client), Some(bottom)) = (
+        lock(&st.ws_client_tx).take(),
+        lock(&st.ws_to_client).take(),
+        lock(&st.ws_bottom).take(),
+    ) else {
+        return Err(client);
+    };
+    let (cr, cw) = tokio::io::split(client);
+    tokio::spawn(reader_into(leftover, cr, tx));
+    tokio::spawn(body_to_writer(to_client, cw));
+    Ok(bottom)
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// For an upgrade request, takes its body (the stream after the `101`)
+/// out, so the head is validated as the bodiless request it is.
+fn split_upgrade_stream(st: &StackFlow, mut req: LayerRequest) -> (LayerRequest, Option<Body>) {
+    if st.upgrade_req.is_none() {
+        return (req, None);
     }
-    let (cr, mut cw) = tokio::io::split(client);
-    let mut side_r: ReadSide = Box::new(std::io::Cursor::new(leftover).chain(cr));
-    // The outermost layer writes to the client through a pipe too: when it
-    // drops its writer, the copy ends and shuts the client's side down, so
-    // the client sees the close. Dropping a half of the client would not.
-    let (to_client, mut from_layers) = tokio::io::duplex(64 * 1024);
-    tokio::spawn(async move {
-        if tokio::io::copy(&mut from_layers, &mut cw).await.is_ok() {
-            let _ = cw.shutdown().await;
-        }
-    });
-    let mut side_w: WriteSide = Box::new(to_client);
-    for index in tunnels {
-        // One pipe per direction, each end held whole: when a side drops
-        // its writer, the reader on the far end sees EOF. Halves of one
-        // split duplex would not, as the other half keeps it open (#36).
-        let (up_w, up_r) = tokio::io::duplex(64 * 1024);
-        let (down_w, down_r) = tokio::io::duplex(64 * 1024);
-        let addon = st.snap.addons[index].clone();
-        let Some(layer) = addon.wasm().cloned() else {
-            continue;
+    let stream = std::mem::take(req.body_mut());
+    (req, Some(stream))
+}
+
+/// Puts the stream [`split_upgrade_stream`] took back.
+fn join_upgrade_stream(mut req: LayerRequest, stream: Option<Body>) -> LayerRequest {
+    if let Some(s) = stream {
+        *req.body_mut() = s;
+    }
+    req
+}
+
+/// Writes a body's bytes to `w`, then shuts it down. A failed body is not
+/// shut down cleanly: the writer is dropped, and the far side sees the
+/// stream end.
+async fn body_to_writer(mut body: Body, mut w: impl tokio::io::AsyncWrite + Unpin) {
+    use http_body_util::BodyExt as _;
+    use tokio::io::AsyncWriteExt as _;
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else {
+            return;
         };
-        let host = Arc::new(host::StackHost {
-            st: st.clone(),
-            index,
-            observer: None,
-        });
-        let from_client = std::mem::replace(&mut side_r, Box::new(tokio::io::empty()));
-        let to_client = std::mem::replace(&mut side_w, Box::new(tokio::io::sink()));
-        let st2 = st.clone();
-        tokio::spawn(async move {
-            if let Err(e) = layer
-                .tunnel(host, from_client, up_w, down_r, to_client)
-                .await
-            {
-                emit_layer_error(&st2, &addon.name, &e, false);
-            }
-        });
-        side_r = Box::new(up_r);
-        side_w = Box::new(down_w);
+        if let Some(d) = frame.data_ref()
+            && w.write_all(d).await.is_err()
+        {
+            return;
+        }
     }
-    (Box::new(tokio::io::join(side_r, side_w)), Vec::new())
+    let _ = w.shutdown().await;
+}
+
+/// A body read from `r` until its end.
+fn reader_to_body(r: impl tokio::io::AsyncRead + Send + Unpin + 'static) -> Body {
+    let (tx, body) = Body::channel(u64::MAX, None);
+    tokio::spawn(reader_into(Vec::new(), r, tx));
+    body
+}
+
+/// Sends `first`, then what `r` yields, into `tx`; ends the body with the
+/// reader.
+async fn reader_into(first: Vec<u8>, mut r: impl tokio::io::AsyncRead + Unpin, mut tx: BodySender) {
+    use tokio::io::AsyncReadExt as _;
+    if !first.is_empty() && tx.send_data(Bytes::from(first)).await.is_err() {
+        return;
+    }
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match r.read(&mut buf).await {
+            Ok(0) => {
+                let _ = tx.finish().await;
+                return;
+            }
+            Ok(n) => {
+                if tx
+                    .send_data(Bytes::copy_from_slice(&buf[..n]))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(e) => {
+                tx.abort(BodyError::Upstream(e.to_string()));
+                return;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

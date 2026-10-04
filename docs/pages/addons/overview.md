@@ -73,7 +73,7 @@ the connector, never through other layers or the rules.
 
 A layer may read, rewrite, split, delay, inject into or replace either
 stream, chunk by chunk. roxy buffers nothing on a layer's behalf; a layer
-that wants a whole body reads it, up to its `max_buffered_body_bytes`.
+that wants a whole body reads it, within its `max_memory`.
 Typical patterns:
 
 - **Observe:** `next(req)`, then return its response unchanged (or use
@@ -84,20 +84,39 @@ Typical patterns:
   them.
 - **Deny or answer:** return a response without calling `next`.
 
-For WebSockets, a layer that exports `tunnel` gets the two raw byte streams
-after the `101`. A layer without `tunnel` is not in that path, but the
-upgrade request still passes through it, so it can refuse the upgrade.
+## WebSockets
+
+A WebSocket is an exchange like any other, only long-lived. A layer gets
+the upgrade request in `handle` and passes it on with `next`; the response
+from below is the `101`. After it, the request body carries the client's
+bytes and the response body the upstream's, for as long as the WebSocket
+is open. A layer reads, rewrites or holds back either direction as it
+would any body, refuses the upgrade by answering without `next`, and is
+left out of the WebSocket entirely when its `when` skips the upgrade
+request.
+
+- The bodies carry raw WebSocket frames. Frames from the client are
+  masked, so their payload reads as sent only from the upstream's side.
+- A layer must stream both bodies at once: the request body ends only
+  when the client closes, while the response streams all along. The
+  `roxy-addon` SDK does this.
+- A transform that holds bytes back until more arrive (to match across
+  chunks, say) stalls an interactive protocol: the peer waits for the
+  held bytes.
+- No clock runs on the bodies ([safety](/addons/safety)): a WebSocket
+  lives as long as the relay's idle timeout allows.
 
 ## Content codings
 
 Layers see bodies decoded, so none needs its own decompressors. roxy
-decodes at the edge of the stack: the client's request body before the
-first layer, and the response before it reaches the innermost layer. It
-removes `content-encoding` as it does, and the body's length becomes
-unknown.
+decodes on the way into the stack, for a flow some layer runs on: the
+client's request body as the first layer that runs gets it, and the
+response before it reaches the innermost layer. It removes
+`content-encoding` as it does, and the body's length becomes unknown. A
+flow no layer runs on (every `when` skipped it) is not decoded at all.
 
-- So with addons, the client gets an uncompressed response and the upstream
-  an uncompressed request body. The origin's response to roxy stays
+- So on a flow a layer runs on, the client gets an uncompressed response
+  and the upstream an uncompressed request body. The origin's response to roxy stays
   compressed. Nothing re-encodes; a layer that wants a compressed body
   encodes it itself.
 - The codings and their strictness are those the rules use
@@ -111,9 +130,9 @@ unknown.
 - The rules below the stack read the response before any layer, and decode
   it for themselves ([rules](/policies/body-rules)).
 
-- A `tunnel` layer gets WebSocket messages it can read: no extension
-  (`permessage-deflate` above all) is negotiated on a WebSocket that passes
-  through one ([WebSockets](/policies/websockets#extensions)).
+- A layer gets WebSocket messages it can read: no extension
+  (`permessage-deflate` above all) is negotiated on a WebSocket a layer
+  runs on ([WebSockets](/policies/websockets#extensions)).
 
 `http.decode_for_addons: false` turns this off: layers then see the bytes
 as sent, with their `content-encoding`, and WebSockets negotiate whatever
@@ -126,7 +145,7 @@ extensions client and upstream agree on.
 - `mode: observe`: roxy tees both streams to the layer through bounded
   channels and ignores anything it returns except host-service calls such
   as `record`. The layer cannot change or delay traffic, so its failures
-  cannot weaken containment: a trap or timeout is logged, not fatal, and a
+  cannot weaken containment: a trap or missed deadline is logged, not fatal, and a
   copy the layer does not keep up with is cut (`observer_lagged`) rather
   than stalling the flow. This is the way to deploy an uncalibrated
   monitor.
@@ -167,9 +186,10 @@ sits in it.
   `layer_error` follows.
 - A layer's response body to the client waits for the flow log like every
   forwarded body ([audit backpressure](/operate/flow-log#writing)).
-- WebSocket `tunnel` layers are chained between the client and the relay,
-  outermost first. The relay stays the hop next to the upstream, so byte
-  budgets and [message rules](/policies/websockets#message-rules) see what leaves.
+- A WebSocket runs through the layers that ran on its upgrade request,
+  outermost first, in their bodies. The relay stays the hop next to the
+  upstream, so byte budgets and
+  [message rules](/policies/websockets#message-rules) see what leaves.
 - Layers compile at config load and are cached across reloads while their
   file and settings are unchanged, so their instance pools stay warm. A
   reload swaps the stack for new exchanges; exchanges in flight finish on

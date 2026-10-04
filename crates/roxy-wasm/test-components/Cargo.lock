@@ -204,13 +204,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tunnel-layer"
-version = "0.0.0"
-dependencies = [
- "wit-bindgen",
-]
-
-[[package]]
 name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"

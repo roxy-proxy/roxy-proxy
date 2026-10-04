@@ -22,6 +22,8 @@ pub enum NextMode {
     /// Answer 200 with the request body streamed back as the response
     /// body.
     Echo,
+    /// Like `Echo`, after this long below the layer.
+    SlowEcho(std::time::Duration),
     /// Hand the request to the test and answer with the response the test
     /// provided.
     Capture(Mutex<Option<(oneshot::Sender<LayerRequest>, LayerResponse)>>),
@@ -100,6 +102,10 @@ impl LayerHost for Mock {
                 .header("x-upstream", "yes")
                 .body(body)
                 .unwrap()),
+            NextMode::SlowEcho(delay) => {
+                tokio::time::sleep(*delay).await;
+                Ok(Response::builder().status(200).body(body).unwrap())
+            }
             NextMode::Capture(slot) => {
                 let (tx, resp) = slot.lock().unwrap().take().expect("one next");
                 let _ = tx.send(Request::from_parts(parts, body));
