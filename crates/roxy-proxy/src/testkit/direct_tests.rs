@@ -121,6 +121,19 @@ async fn a_plaintext_host_port_must_be_the_listeners() {
 }
 
 #[tokio::test]
+async fn a_request_line_in_pieces_is_still_http() {
+    let kit = kit().await;
+    let mut io = kit.connect_direct(80);
+    io.write_all(b"G").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    io.write_all(b"ET / HTTP/1.1\r\nhost: up.test\r\nconnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let out = read_to_end(&mut io).await;
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+}
+
+#[tokio::test]
 async fn tls_without_sni_is_closed() {
     let kit = kit().await;
     let mut cfg = kit.client_tls();

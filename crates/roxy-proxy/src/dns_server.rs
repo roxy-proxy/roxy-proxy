@@ -16,8 +16,7 @@ use crate::flowlog::{ClientInfo, FlowEvent};
 use crate::server::Shared;
 
 /// Largest query read. Queries roxy accepts are far smaller (one name of at
-/// most 255 bytes and an OPT record); a longer datagram is cut here and
-/// then fails to parse.
+/// most 255 bytes and an OPT record), so a longer one is dropped unread.
 const MAX_QUERY: usize = 4096;
 
 /// `dns.*`, as the server needs it.
@@ -127,7 +126,9 @@ fn log(
 
 /// Serves DNS over UDP until shutdown.
 pub(crate) async fn serve_udp(sock: UdpSocket, spec: Arc<DnsServerSpec>, shared: Arc<Shared>) {
-    let mut buf = vec![0u8; MAX_QUERY];
+    // One byte over, to tell a datagram of exactly MAX_QUERY bytes from a
+    // longer one the socket cut.
+    let mut buf = vec![0u8; MAX_QUERY + 1];
     loop {
         let received = tokio::select! {
             r = sock.recv_from(&mut buf) => r,
@@ -137,6 +138,9 @@ pub(crate) async fn serve_udp(sock: UdpSocket, spec: Arc<DnsServerSpec>, shared:
             // ICMP errors from earlier sends surface here on some systems.
             continue;
         };
+        if n > MAX_QUERY {
+            continue;
+        }
         let Some(reply) = spec.reply(&buf[..n]) else {
             continue;
         };
@@ -162,6 +166,7 @@ pub(crate) async fn serve_tcp(tcp: TcpListener, spec: Arc<DnsServerSpec>, shared
             }
         };
         let Some(slot) = crate::server::conn_slot(&shared, peer.ip()) else {
+            tracing::info!(%peer, "dns connection refused: connection cap");
             continue;
         };
         let s = shared.clone();
@@ -181,13 +186,14 @@ async fn tcp_conn(
     loop {
         let read = async {
             let len = usize::from(stream.read_u16().await?);
+            // A query too long for any name roxy answers closes the
+            // connection.
             if len > MAX_QUERY {
                 return Err(std::io::ErrorKind::InvalidData.into());
             }
             stream.read_exact(&mut buf[..len]).await?;
             Ok::<_, std::io::Error>(len)
         };
-        // A query too long for any name roxy answers closes the connection.
         let len = tokio::select! {
             r = tokio::time::timeout(idle, read) => match r {
                 Ok(Ok(len)) => len,

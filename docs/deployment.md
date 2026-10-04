@@ -88,7 +88,8 @@ services:
 networks:
   sandbox:
     internal: true
-    ipam: { config: [{ subnet: 172.30.0.0/24 }] }
+    # Other containers get addresses from ip_range, so roxy's is never taken.
+    ipam: { config: [{ subnet: 172.30.0.0/24, ip_range: 172.30.0.128/25 }] }
   egress: {}
 volumes:
   roxy-ca: {}

@@ -328,5 +328,6 @@ client, headers and body, and `--body-bytes`, `--response-status`,
 `--response-header` and `--response-body-bytes` run the watching rules
 that read them. `--ws-text`, `--ws-opcode`, `--ws-size` and
 `--ws-direction` describe one WebSocket message and run the rules that
-read `ws.*`. An IP-literal URL also shows an address-floor hit. See
-`roxy rule test --help`.
+read `ws.*`. The request arrives on the config's first listener, which
+sets `listener.name` and `listener.mode`. An IP-literal URL also shows an
+address-floor hit. See `roxy rule test --help`.

@@ -78,7 +78,7 @@ The listener reads a deliberately small part of DNS, strictly
 
 | query | reply |
 |---|---|
-| shorter than a header, or a response (`QR` set) | none: dropped |
+| shorter than a header, longer than 4096 bytes, or a response (`QR` set) | none: dropped |
 | an opcode other than QUERY | NOTIMP |
 | malformed: counts, compression, a cut or overlong name, trailing bytes | FORMERR |
 | a class other than IN, the root name, a byte outside the name alphabet | REFUSED |

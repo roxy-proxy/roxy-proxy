@@ -14,7 +14,7 @@ use roxy_rules::{
     RuleKind, Value, WatchOutcome,
 };
 
-use crate::config::Config;
+use crate::config::{Config, ListenerMode};
 
 /// The dry-run flow: a [`MapView`] whose address lists are the same
 /// compiled [`roxy_proxy::AddressList`]s `roxy run` uses.
@@ -368,16 +368,19 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(DryRunView, Vec
     let url = parse_url(&req.url)?;
     let mut warnings = Vec::new();
     let host_ip = url.host.parse::<IpAddr>().ok();
+    // The request is taken to arrive on the first listener.
+    let listener = config.listeners.first();
+    let mode = match listener.map(|l| l.mode) {
+        Some(ListenerMode::Direct) => "direct",
+        _ => "explicit",
+    };
     let mut v = MapView::new()
         .with(Field::ClientIp, Value::Ip(req.client_ip))
         .with_str(
             Field::ListenerName,
-            config
-                .listeners
-                .first()
-                .map_or("proxy", |l| l.name.as_str()),
+            listener.map_or("proxy", |l| l.name.as_str()),
         )
-        .with_str(Field::ListenerMode, "explicit")
+        .with_str(Field::ListenerMode, mode)
         .with_str(Field::Method, &req.method)
         .with_str(Field::Scheme, &url.scheme)
         .with_str(Field::Host, &url.host)
@@ -781,5 +784,20 @@ mod tests {
         let r = dry(secret);
         assert!(r.decision().is_deny());
         assert_eq!(r.terminal_rule().as_str(), "no-secrets");
+    }
+
+    #[test]
+    fn the_first_listener_gives_the_mode() {
+        let config = Config::from_yaml(
+            "version: 1\nlisteners: [{ name: d, mode: direct, bind: 127.0.0.1:443 }]\nrules:\n  \
+             - { id: direct, when: 'listener.mode == \"direct\" and listener.name == \"d\"', then: allow }\n",
+        )
+        .unwrap();
+        let policy = config.compile_policy().unwrap();
+        let req = TestRequest::new("GET", "https://example.com/");
+        let (view, _) = build_view(&config, &req).unwrap();
+        let r = run(&policy, &view, &[], known(&req));
+        assert!(r.decision().is_allow());
+        assert_eq!(r.terminal_rule().as_str(), "direct");
     }
 }

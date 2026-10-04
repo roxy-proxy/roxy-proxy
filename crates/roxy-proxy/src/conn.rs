@@ -347,6 +347,28 @@ async fn classify<IO: AsyncRead + Unpin>(
     }
 }
 
+/// Reads until `buf` holds a whole request method and the space after it,
+/// or plainly cannot (a byte that is not an upper-case letter, 16 bytes,
+/// EOF, `timeout`), so [`looks_like_http`] does not refuse a request line
+/// that arrived in pieces.
+async fn read_method<IO: AsyncRead + Unpin>(
+    mut io: IO,
+    mut buf: BytesMut,
+    timeout: std::time::Duration,
+) -> (IO, BytesMut) {
+    let pending = |b: &[u8]| b.len() < 16 && b.iter().all(u8::is_ascii_uppercase);
+    let _ = tokio::time::timeout(timeout, async {
+        while pending(&buf) {
+            match io.read_buf(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    (io, buf)
+}
+
 /// A direct listener's connection (docs/http.md#direct-listeners): the
 /// client believes it is talking to the origin on `port`. TLS is
 /// terminated for the SNI, plaintext is parsed with `Host` as the
@@ -386,10 +408,17 @@ pub(crate) async fn serve_direct(
                     return;
                 }
             };
-            let io = ConnIo::new(Box::new(io));
-            Box::pin(terminate_tls(io, buf.freeze(), client, authority, shared)).await;
+            Box::pin(terminate_tls(
+                ConnIo::new(io),
+                buf.freeze(),
+                client,
+                authority,
+                shared,
+            ))
+            .await;
         }
         Sniff::NotTls | Sniff::NeedMore => {
+            let (io, buf) = read_method(io, buf, limits.header_timeout).await;
             if !looks_like_http(&buf) {
                 shared.emit_parse_reason(&client, None, "non_http_on_direct", None);
                 return;
