@@ -94,6 +94,14 @@ pub fn test_ca() -> TestCa {
     }
 }
 
+impl TestCa {
+    /// A server config for a leaf of this CA (`upstream.test` and others,
+    /// and 127.0.0.1), offering only HTTP/1.1, as a WebSocket server needs.
+    pub fn ws_server(&self) -> Arc<rustls::ServerConfig> {
+        self.ws_server.clone()
+    }
+}
+
 /// What the upstream saw.
 #[derive(Debug, Clone)]
 pub struct Seen {

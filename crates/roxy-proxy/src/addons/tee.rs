@@ -123,7 +123,9 @@ impl HttpBody for Tee {
 /// best-effort copy.
 fn tee(body: Body, lag: Arc<Lag>) -> (Body, Body) {
     let known = body.known_length();
-    let (tx, copy) = Body::channel(u64::MAX, None);
+    // The copy declares the real body's length, so an empty one reads as
+    // empty even if nobody polls the real body to its end.
+    let (tx, copy) = Body::channel(u64::MAX, known);
     let real = Body::wrap_native(
         Tee {
             inner: body,

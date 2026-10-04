@@ -178,12 +178,12 @@ addons:
     #     timeout: 2s
     #     retries: 1
     #     private_ok: true
-  # An external service in the network path: each
-  # exchange streams through it over a WebSocket (roxy.layer.v1).
+  # An external service in the network path: each exchange is a
+  # stream on a pooled WebSocket connection (roxy.layer.v2).
   # - name: sentinel
   #   kind: service
   #   endpoint: sidecar
   #   mode: observe
   #   endpoints:
   #     sidecar: { url: "http://127.0.0.1:9000/layer", private_ok: true }
-  #   limits: { first_byte_timeout: 2s }
+  #   limits: { first_byte_timeout: 2s, max_connections: 4, max_streams: 100 }
