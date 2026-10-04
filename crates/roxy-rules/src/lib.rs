@@ -176,7 +176,7 @@ pub use metrics::{
     MetricLimits, MetricSnapshot, MetricSource, MetricStore, SERIES_OVERHEAD, SPARSE_CHUNK, Sample,
 };
 pub use parser::parse;
-pub use policy::{MetricDef, Policy, PolicyInput, RuleInfo, RuleKind, WatchState};
+pub use policy::{Condition, MetricDef, Policy, PolicyInput, RuleInfo, RuleKind, WatchState};
 pub use state::{StateFull, StateSource, StateStore};
 pub use types::{Field, Reads, Type};
 pub use view::{BodyText, FlowView, MapView, Value};
