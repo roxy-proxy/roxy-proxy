@@ -21,6 +21,8 @@ ca_server:
 
 tls:
   ca_dir: /var/lib/roxy/ca     # generated if absent
+  # ca_cert: /etc/roxy/ca/tls.crt  # use a provided CA instead (set both)
+  # ca_key: /etc/roxy/ca/tls.key
   require_sni_match: true
   upstream:
     verify: strict             # strict | strict+extra_roots
