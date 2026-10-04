@@ -120,6 +120,21 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: big, when: 'body.bytes > 10', then: [{ tag: big }] }\n- { id: read, when: 'tag[\"big\"]', then: deny }",
     ),
     (
+        "tag read by a watching rule but set by a watching rule above it",
+        "",
+        "- { id: big, when: 'body.bytes > 10', then: [{ tag: big }] }\n- { id: cap, when: 'tag[\"big\"] and response.body.bytes > 1mb', then: deny }",
+    ),
+    (
+        "rewrite_path group references",
+        "",
+        "- { id: a, then: [{ rewrite_path: { match: \"/v(\\\\d)/(?P<rest>.*)\", to: \"/$3/${nope}/$1a/${rest}/$$\" } }, allow] }",
+    ),
+    (
+        "metric where reads a tag",
+        "- { id: t, count: requests, where: 'tag[\"billing\"] and host == \"x\"' }",
+        "[]",
+    ),
+    (
         "multi-key action map",
         "",
         "- { id: a, then: { set_header: { x: y }, allow: {} } }",

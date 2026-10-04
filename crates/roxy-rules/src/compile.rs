@@ -24,7 +24,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use globset::{GlobBuilder, GlobMatcher};
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net};
 use regex::{Regex, RegexBuilder};
 
 use crate::ast::{Expr, Lit, LitNode, Node, Op, Operand};
@@ -56,11 +56,31 @@ pub(crate) struct Needs {
     pub response_body: bool,
     /// Watched fields and byte metrics read.
     pub reads: Reads,
-    /// The watched values read, as written (`body.bytes`,
-    /// `metric.egress (request_bytes)`), in order of first appearance.
-    pub watched: Vec<String>,
+    /// The watched values read, each with the bit it carries and its name
+    /// as written (`body.bytes`, `metric.egress (request_bytes)`), in order
+    /// of first appearance.
+    watched: Vec<(Reads, String)>,
     /// The tags read (`tag["x"]`), in order of first appearance.
     pub tags: Vec<Box<str>>,
+}
+
+impl Needs {
+    fn add_watched(&mut self, reads: Reads, name: String) {
+        self.reads |= reads;
+        if !self.watched.iter().any(|(_, n)| *n == name) {
+            self.watched.push((reads, name));
+        }
+    }
+
+    /// Names of the watched values whose bits intersect `mask`, as written,
+    /// for messages and `roxy check`.
+    pub fn watched_names(&self, mask: Reads) -> Vec<String> {
+        self.watched
+            .iter()
+            .filter(|(r, _)| r.intersects(mask))
+            .map(|(_, n)| n.clone())
+            .collect()
+    }
 }
 
 /// A compile-time constant operand.
@@ -447,10 +467,7 @@ impl Compiler<'_, '_> {
                     a => (a.reads(), a.display_name()),
                 };
                 if !reads.is_empty() {
-                    self.needs.reads |= reads;
-                    if !self.needs.watched.contains(&name) {
-                        self.needs.watched.push(name);
-                    }
+                    self.needs.add_watched(reads, name);
                 }
                 Ok(Typed::Field(access, f.span))
             }
@@ -709,7 +726,7 @@ impl Compiler<'_, '_> {
                 let mut nets = Vec::with_capacity(items.len());
                 for item in items {
                     nets.push(match item.lit {
-                        Lit::Cidr(n) => n,
+                        Lit::Cidr(n) => canonical_net(n),
                         Lit::Ip(ip) => IpNet::from(ip.to_canonical()),
                         _ => return Err(mismatch(item, "IP addresses or CIDRs")),
                     });
@@ -764,6 +781,18 @@ impl Compiler<'_, '_> {
                 format!("`{}` does not apply to booleans; use `==`", op.as_str()),
             )),
         }
+    }
+}
+
+/// The IPv4 network an IPv4-mapped IPv6 CIDR (`::ffff:10.0.0.0/104`)
+/// denotes. Flow addresses are canonicalised to IPv4 before matching, so a
+/// mapped network left in IPv6 form would never match. A mapped address
+/// has `ffff` in bits 80..96, so a prefix shorter than /96 sets host bits
+/// and the lexer has already rejected it.
+fn canonical_net(net: IpNet) -> IpNet {
+    match (net.addr().to_canonical(), net.prefix_len().checked_sub(96)) {
+        (IpAddr::V4(v4), Some(prefix)) => Ipv4Net::new(v4, prefix).map_or(net, IpNet::V4),
+        _ => net,
     }
 }
 

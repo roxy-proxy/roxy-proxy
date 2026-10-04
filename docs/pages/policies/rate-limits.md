@@ -12,13 +12,23 @@ A metric is defined once and compared in rules (`metric.<id> >= 30`).
 metrics:
   - id: <string>
     count: requests | request_bytes | response_bytes | errors | denied | unique(<field>)
-    where: <expr>        # head fields only: whether this exchange counts
+    where: <expr>        # head fields only, no tags: whether this exchange counts
     key: [<field>, ...]  # head fields only; omitted = one global series
     window: <duration>   # omitted = cumulative since start
 ```
 
 - **Windows** slide in 60 fixed buckets, so a 1-minute window has 1-second
-  resolution. `unique` uses a HyperLogLog sketch per bucket.
+  resolution. The store keeps the 60 complete buckets plus the current
+  partial one, so a value counts every event younger than the window and
+  may still include events up to one bucket older: at the edge a limit
+  trips slightly early, never late. `unique` uses a HyperLogLog sketch per
+  bucket.
+- **What `where` and `key` may read.** Head fields, `header[..]`,
+  `query[..]`, `state[..]`, `body.text` and metrics, so that whether an
+  exchange counts, and its series, are fixed at the request head. Not
+  `tag[..]`: tags are set by rules and addons on each flow, and a flow is
+  counted outside the rules, so a tag read would always be false. Both are
+  compile errors.
 - **When counts move.** `requests` and `denied` are read before the
   forwarding decision and incremented after it (denied flows count too, so
   probing is not free); a rule `metric.x >= 30` therefore denies the 31st

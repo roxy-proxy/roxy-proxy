@@ -2,6 +2,7 @@
 //! watching), the head decision, and watching evaluation.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -90,9 +91,8 @@ impl Condition {
         };
         // A byte metric's value is known at the head; only fields are late.
         let mut late: Vec<String> = needs
-            .watched
+            .watched_names(Reads::WATCHED_FIELDS)
             .iter()
-            .filter(|n| !n.starts_with("metric."))
             .map(|n| format!("`{n}`"))
             .collect();
         if needs.request_body {
@@ -606,6 +606,15 @@ impl Policy {
     }
 }
 
+/// Backquoted names joined with commas, for messages.
+fn quoted(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The watched bits a read of a metric counting `count` carries.
 fn metric_reads(count: &MetricCount) -> Reads {
     match count {
@@ -766,12 +775,22 @@ impl PolicyCompiler<'_, '_> {
                             "a metric's `where` may only read head fields, because whether an \
                              exchange counts is decided at the request head; it reads {} \
                              (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)",
-                            needs
-                                .watched
-                                .iter()
-                                .map(|n| format!("`{n}`"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                            quoted(&needs.watched_names(Reads::WATCHED_FIELDS))
+                        ),
+                    );
+                    return None;
+                }
+                // A flow is counted outside the rules, where no tag is set,
+                // so a tag read here would always be false.
+                if !needs.tags.is_empty() {
+                    self.push(
+                        None,
+                        at,
+                        format!(
+                            "a metric's `where` cannot read tags: tags are set by rules and \
+                             addons on each flow, and whether a flow counts is decided without \
+                             them; it reads {}",
+                            quoted(&needs.tags.iter().map(|t| format!("tag[{t:?}]")).collect::<Vec<_>>())
                         ),
                     );
                     return None;
@@ -836,9 +855,17 @@ impl PolicyCompiler<'_, '_> {
             let metrics = needs.reads.minus(Reads::WATCHED_FIELDS);
             let denies = rule.then.0.iter().any(|a| matches!(a, Action::Deny(_)));
             let (kind, triggers, watches) = if !fields.is_empty() {
-                (RuleKind::Watching, needs.reads, needs.watched)
+                (
+                    RuleKind::Watching,
+                    needs.reads,
+                    needs.watched_names(Reads::ALL),
+                )
             } else if denies && !metrics.is_empty() {
-                (RuleKind::HeadAndWatching, metrics, needs.watched)
+                (
+                    RuleKind::HeadAndWatching,
+                    metrics,
+                    needs.watched_names(Reads::METRICS),
+                )
             } else {
                 (RuleKind::Head, Reads::NONE, Vec::new())
             };
@@ -864,10 +891,13 @@ impl PolicyCompiler<'_, '_> {
     }
 
     /// A rule may read `tag["x"]` only if every rule that can set `x` is
-    /// evaluated before it: a head rule above it, or for a watching rule
-    /// any head rule or a watching rule above it. Otherwise moving a rule
-    /// would change what the reader sees, and so the decision. A tag no
-    /// rule sets can only come from an addon, before any rule runs; a
+    /// decided at the head and, for a reader that is itself decided at the
+    /// head, sits above it. Head rules run in list order, so what the
+    /// reader sees is then fixed by the config. A watching setter fires
+    /// when the values it reads arrive, not in list order, so whether its
+    /// tag is visible would depend on timing. (A deny that watches a byte
+    /// metric counts as head: if it fires later, the exchange stops.) A tag
+    /// no rule sets can only come from an addon, before any rule runs; a
     /// rule's own tags are set after its own check wherever it sits.
     fn tag_order(&mut self, rules: &[CompiledRule], tag_reads: &[Vec<Box<str>>]) {
         let input = self.input;
@@ -884,17 +914,14 @@ impl PolicyCompiler<'_, '_> {
                     .filter(|&s| sets(s, tag))
                     .filter_map(|s| {
                         let id = &input.rules[s].id;
-                        let head_reader = rules[r].kind.at_head();
-                        // A rule's own tags come after its own check
-                        // wherever it sits, so they never depend on order.
                         if s == r {
                             None
-                        } else if head_reader && !rules[s].kind.at_head() {
+                        } else if !rules[s].kind.at_head() {
                             Some(format!(
-                                "rules[{s}] ({id:?}), a watching rule that runs only after \
-                                 the head decision"
+                                "rules[{s}] ({id:?}), a watching rule, which fires when the \
+                                 values it reads arrive rather than in list order"
                             ))
-                        } else if s > r && (head_reader || !rules[s].kind.at_head()) {
+                        } else if s > r && rules[r].kind.at_head() {
                             Some(format!("rules[{s}] ({id:?}), below this rule"))
                         } else {
                             None
@@ -907,8 +934,7 @@ impl PolicyCompiler<'_, '_> {
                         format!("rules[{r}].when"),
                         format!(
                             "reads `tag[{tag:?}]`, which is set too late to be seen here, \
-                             by {}; a rule sees only the tags set before it is checked, so \
-                             the order of the rules would decide",
+                             by {}; a rule sees only the tags set before it is checked",
                             late.join(" and by ")
                         ),
                     );
@@ -1053,6 +1079,11 @@ impl PolicyCompiler<'_, '_> {
                 };
                 if !r.to.starts_with('/') {
                     self.push(rule, apath, "rewrite_path `to` must start with `/`");
+                }
+                if let Some(re) = &regex {
+                    for problem in unknown_groups(&r.to, re) {
+                        self.push(rule, apath, format!("rewrite_path `to`: {problem}"));
+                    }
                 }
                 regex.map_or_else(Vec::new, |regex: Arc<Regex>| {
                     vec![CAction::Effect(Effect::RewritePath {
@@ -1272,11 +1303,7 @@ struct RuleCx<'a> {
 
 impl RuleCx<'_> {
     fn watched(&self) -> String {
-        self.watches
-            .iter()
-            .map(|n| format!("`{n}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
+        quoted(self.watches)
     }
 
     /// Why `a` is not allowed in this rule, if it is not.
@@ -1351,6 +1378,74 @@ impl RuleCx<'_> {
             | Action::SetState(_)
             | Action::Call(_) => None,
         }
+    }
+}
+
+/// Group references in a `rewrite_path` replacement that `re` cannot
+/// satisfy. The replacement syntax is the regex crate's: `$1`, `$name`,
+/// `${name}`, with `$$` for a literal dollar. The crate expands a reference
+/// to a group that does not exist as empty text, which would silently drop
+/// part of the path, so every reference is checked here.
+fn unknown_groups(to: &str, re: &Regex) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut rest = to;
+    while let Some(i) = rest.find('$') {
+        let after = &rest[i + 1..];
+        let (name, consumed) = if let Some(braced) = after.strip_prefix('{') {
+            match braced.find('}') {
+                Some(end) => (&braced[..end], end + 2),
+                None => break,
+            }
+        } else if let Some(stripped) = after.strip_prefix('$') {
+            rest = stripped;
+            continue;
+        } else {
+            let len = after
+                .bytes()
+                .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                .count();
+            (&after[..len], len)
+        };
+        rest = &after[consumed..];
+        if name.is_empty() {
+            continue;
+        }
+        let known = match name.parse::<usize>() {
+            Ok(n) => n < re.captures_len(),
+            Err(_) => re.capture_names().flatten().any(|g| g == name),
+        };
+        if known {
+            continue;
+        }
+        let mut msg = format!("`${name}` refers to a group `match` does not have");
+        if name.starts_with(|c: char| c.is_ascii_digit()) && name.parse::<usize>().is_err() {
+            let digits: String = name.chars().take_while(char::is_ascii_digit).collect();
+            let _ = write!(
+                msg,
+                "; a reference runs to the end of the word, write `${{{digits}}}{}`",
+                &name[digits.len()..]
+            );
+        } else {
+            let unnamed = re.capture_names().skip(1).filter(Option::is_none).count();
+            let _ = write!(
+                msg,
+                " ({unnamed} unnamed group{}{})",
+                if unnamed == 1 { "" } else { "s" },
+                named_list(re)
+            );
+        }
+        problems.push(msg);
+    }
+    problems
+}
+
+/// `, named: a, b` for messages; empty if the regex names no group.
+fn named_list(re: &Regex) -> String {
+    let names: Vec<&str> = re.capture_names().flatten().collect();
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!("; named: {}", names.join(", "))
     }
 }
 
