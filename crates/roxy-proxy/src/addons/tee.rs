@@ -340,7 +340,8 @@ pub(crate) async fn observe(
                 // Whatever it answers is discarded, but read to the end so
                 // the layer's own failures surface.
                 let outcome = resp.extensions().get::<roxy_wasm::LayerOutcome>().cloned();
-                drop(resp.into_body().collect_up_to(u64::MAX).await);
+                let mut body = resp.into_body();
+                while body.frame().await.is_some_and(|f| f.is_ok()) {}
                 match outcome {
                     Some(o) => o.wait().await,
                     None => Ok(()),
