@@ -49,10 +49,6 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
-import httpx2
-from anthropic._models import construct_type
-from anthropic._streaming import SSEDecoder
-from anthropic.lib.streaming._beta_messages import accumulate_event
 from anthropic.types.beta import BetaMessage, BetaRawMessageStreamEvent
 from inspect_ai.model import (
     ChatMessage,
@@ -70,16 +66,18 @@ from inspect_ai.tool import ToolCall, ToolCallView, ToolInfo
 from inspect_ai.util import Store
 from inspect_sentinel import BeforeToolCall, Context, Decision, HumanAnswer, Step
 
-# The host contract inspect_ai itself uses to run a sentinel, and the
-# converters its agent bridge uses to answer an agent's Messages call.
-from inspect_ai.agent._bridge.anthropic_api_impl import (
+from inspect_log import InspectLog, InspectRecorder
+from private_api import (
+    HostContext,
+    SSEDecoder,
+    accumulate_event,
     anthropic_stop_reason,
     anthropic_usage,
     assistant_message_blocks,
+    construct_type,
+    resolve_sentinel,
+    run_sentinel,
 )
-from inspect_sentinel._integration import HostContext, resolve_sentinel, run_sentinel
-
-from inspect_log import InspectLog, InspectRecorder
 from roxy_layer import Exchange, Request, Response, serve
 
 log = logging.getLogger("sentinel-sidecar")
@@ -172,12 +170,7 @@ def message_from_sse(raw: bytes) -> dict[str, Any]:
         if sse.event not in STREAM_EVENTS:
             continue
         event = construct_type(type_=BetaRawMessageStreamEvent, value=sse.json())
-        snapshot = accumulate_event(
-            event=event,
-            current_snapshot=snapshot,
-            json_bufs=json_bufs,
-            request_headers=httpx2.Headers(),
-        )
+        snapshot = accumulate_event(event, snapshot, json_bufs)
     if snapshot is None:
         raise ValueError("no message in the stream")
     return snapshot.model_dump(mode="json")
