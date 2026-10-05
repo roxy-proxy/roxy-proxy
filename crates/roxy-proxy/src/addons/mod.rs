@@ -592,11 +592,26 @@ pub(crate) async fn run<F: Front>(
     let st = Arc::new(StackFlow::new(&cx, &req));
     // A WebSocket is a long-lived exchange: once upgraded, the client's
     // bytes are the request body and the upstream's the response body.
-    let client_tx = st.is_upgrade().then(|| {
+    let client_tx = if st.is_upgrade() {
+        // Check the handshake has no body before swapping.
+        if req.body.known_length() != Some(0) {
+            let refusal = Refusal {
+                reason: Some("ws_bad_handshake".to_owned()),
+                ..Refusal::deny(
+                    StatusCode::BAD_REQUEST,
+                    "invalid websocket upgrade",
+                    roxy_rules::RuleId::new("_websocket"),
+                    true,
+                )
+            };
+            return (cx, Outcome::Refuse(refusal));
+        }
         let (tx, body) = Body::channel(u64::MAX, None);
         req.body = body;
-        tx
-    });
+        Some(tx)
+    } else {
+        None
+    };
     st.park(cx);
     let driven = front
         .drive(enter(st.clone(), 0, to_layer_request(req)))
