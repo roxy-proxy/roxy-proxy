@@ -415,3 +415,163 @@ async fn a_client_reset_is_captured_as_aborted_through_a_layer_too() {
     let layered = end_after_client_reset(true).await;
     assert_eq!(layered["aborted"], true, "{layered}");
 }
+
+/// Service layers: a WebSocket runs through the service's stream like
+/// any exchange, the `101` as the response head and the two directions
+/// as the bodies.
+mod service {
+    use std::time::Duration;
+
+    use futures_util::SinkExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+
+    use super::{WS_ALLOW, echo, open, read_to_close};
+    use crate::addons::AddonMode;
+    use crate::addons::service::testing::{addon, kit};
+    use crate::testkit::Kit;
+
+    /// A masked client frame of `payload` bytes, and the unmasked echo.
+    const fn frame_sizes(payload: usize) -> (usize, usize) {
+        (2 + 4 + payload, 2 + payload)
+    }
+
+    /// The one stream the service saw opened.
+    async fn stream_id(kit: &Kit) -> u32 {
+        let opens = kit.upstream.service().until_opened(1).await;
+        u32::try_from(opens[0]["stream"].as_u64().unwrap()).unwrap()
+    }
+
+    fn no_layer_error(kit: &Kit) {
+        let events = kit.sink.events();
+        assert!(
+            events.iter().all(|e| e["event"] != "layer_error"),
+            "{events:#?}"
+        );
+    }
+
+    /// Both directions of a WebSocket go through a pass-through service
+    /// and come back: the client's masked frames as the request body, the
+    /// upstream's as the response body, and the close handshake with them.
+    #[tokio::test]
+    async fn frames_both_ways_go_through_the_service() {
+        let kit = kit(
+            WS_ALLOW,
+            vec![addon("s", "pass", AddonMode::Enforce, |_| {})],
+        )
+        .await;
+        let mut ws = open(&kit, None).await;
+        let back = echo(&mut ws, Message::text("hello")).await;
+        assert_eq!(back.into_text().unwrap().as_str(), "hello");
+        let back = echo(&mut ws, Message::binary(vec![1, 2, 3])).await;
+        assert_eq!(back.into_data().as_ref(), &[1, 2, 3]);
+        let id = stream_id(&kit).await;
+        let (up_text, down_text) = frame_sizes(5);
+        let (up_bin, down_bin) = frame_sizes(3);
+        let service = kit.upstream.service();
+        assert_eq!(service.received_in(id, "request"), up_text + up_bin);
+        assert_eq!(service.received_in(id, "response"), down_text + down_bin);
+        ws.close(None).await.unwrap();
+        let (got, code) = read_to_close(&mut ws).await;
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(code, None, "the upstream's close carries no code");
+        drop(ws);
+        kit.events("ws_close", 1).await;
+        let ev = kit.request_event().await;
+        assert_eq!(ev["decision"], "allow", "{ev:#}");
+        assert_eq!(ev["addons"][0], "s");
+        assert_eq!(
+            kit.upstream.ws_received(),
+            vec![b"hello".to_vec(), vec![1, 2, 3]]
+        );
+        no_layer_error(&kit);
+    }
+
+    /// A service rewrites a frame on its way to the client; the upstream
+    /// got what the client sent.
+    #[tokio::test]
+    async fn a_service_rewrites_a_frame_toward_the_client() {
+        let kit = kit(
+            WS_ALLOW,
+            vec![addon("s", "shout", AddonMode::Enforce, |_| {})],
+        )
+        .await;
+        let mut ws = open(&kit, None).await;
+        let back = echo(&mut ws, Message::text("hello")).await;
+        assert_eq!(back.into_text().unwrap().as_str(), "HELLO");
+        assert_eq!(kit.upstream.ws_received(), vec![b"hello".to_vec()]);
+        no_layer_error(&kit);
+    }
+
+    /// A service that resets its stream mid-WebSocket cuts both sides: the
+    /// client's connection and the upstream's close, and the failure is
+    /// the service's.
+    #[tokio::test]
+    async fn a_service_resetting_mid_websocket_closes_both_sides() {
+        let kit = kit(
+            WS_ALLOW,
+            vec![addon("s", "sever", AddonMode::Enforce, |_| {})],
+        )
+        .await;
+        let mut ws = open(&kit, None).await;
+        // The echo is the first response body byte the service sees.
+        ws.send(Message::text("hello")).await.unwrap();
+        let (got, code) = read_to_close(&mut ws).await;
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!(code, None, "the client is cut, not closed with a code");
+        kit.upstream.wait_ws_closed(1).await;
+        kit.events("ws_close", 1).await;
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
+        assert_eq!(errs[0]["kind"], "service:closed");
+        kit.request_event().await;
+    }
+
+    /// An observing service gets copies of both directions on its stream.
+    #[tokio::test]
+    async fn an_observing_service_gets_copies_of_both_directions() {
+        let kit = kit(
+            WS_ALLOW,
+            vec![addon("o", "pass", AddonMode::Observe, |_| {})],
+        )
+        .await;
+        let mut ws = open(&kit, None).await;
+        let back = echo(&mut ws, Message::text("hello")).await;
+        assert_eq!(back.into_text().unwrap().as_str(), "hello");
+        let id = stream_id(&kit).await;
+        let (up, down) = frame_sizes(5);
+        let service = kit.upstream.service();
+        service.until_received(id, up + down).await;
+        assert_eq!(service.received_in(id, "request"), up);
+        assert_eq!(service.received_in(id, "response"), down);
+        no_layer_error(&kit);
+    }
+
+    /// A WebSocket holds its stream for as long as it is open: with one
+    /// stream per connection, another exchange through the layer waits for
+    /// it, and gets it once the WebSocket has closed.
+    #[tokio::test]
+    async fn a_websocket_holds_its_place_on_the_connection() {
+        let kit = kit(
+            WS_ALLOW,
+            vec![addon("s", "pass", AddonMode::Enforce, |s| {
+                s.max_connections = 1;
+                s.max_streams = 1;
+                s.first_byte_timeout = Duration::from_millis(500);
+            })],
+        )
+        .await;
+        let mut ws = open(&kit, None).await;
+        let back = echo(&mut ws, Message::text("hello")).await;
+        assert_eq!(back.into_text().unwrap().as_str(), "hello");
+        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+        assert_eq!(a.status, 503, "no stream is free: {a:?}");
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["kind"], "service:timeout", "{errs:#?}");
+        ws.close(None).await.unwrap();
+        read_to_close(&mut ws).await;
+        drop(ws);
+        kit.events("ws_close", 1).await;
+        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+        assert_eq!(a.status, 200, "the WebSocket's stream is free: {a:?}");
+    }
+}

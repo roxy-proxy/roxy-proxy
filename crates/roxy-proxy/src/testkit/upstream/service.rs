@@ -13,6 +13,10 @@
 //!   never answers the response;
 //! * `/svc/overlong`: answers each request head by forwarding it with
 //!   `content-length: 3` and 5 bytes of body;
+//! * `/svc/shout`: a pass-through that uppercases ASCII letters in the
+//!   response body bytes;
+//! * `/svc/sever`: a pass-through that resets the stream on the first
+//!   response body bytes it gets;
 //! * `/svc/talk`: sends [`TALK_BYTES`] of request body on each stream as
 //!   it opens, with no head, within the credit roxy grants, and logs the
 //!   stream once all of it has gone;
@@ -87,8 +91,9 @@ pub(crate) struct ServiceLog {
     /// Resets for a stream that had not been opened.
     unknown_resets: Mutex<Vec<u32>>,
     talked: Mutex<Vec<u32>>,
-    /// Body bytes received per stream id, across connections.
-    received: Mutex<HashMap<u32, usize>>,
+    /// Body bytes received per stream id, across connections, by
+    /// direction byte.
+    received: Mutex<HashMap<u32, [usize; 2]>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -124,9 +129,18 @@ impl ServiceLog {
         self.opens()
     }
 
-    /// Body bytes received so far on stream `id`.
+    /// Body bytes received so far on stream `id`, both directions.
     pub(crate) fn received(&self, id: u32) -> usize {
-        lock(&self.received).get(&id).copied().unwrap_or(0)
+        lock(&self.received).get(&id).map_or(0, |n| n.iter().sum())
+    }
+
+    /// Body bytes received so far on stream `id` in direction `dir`
+    /// (`request` or `response`).
+    pub(crate) fn received_in(&self, id: u32, dir: &str) -> usize {
+        let dir = dir_of(dir).expect("a direction");
+        lock(&self.received)
+            .get(&id)
+            .map_or(0, |n| n[usize::from(dir)])
     }
 
     /// Waits until stream `id` has received `n` body bytes.
@@ -249,6 +263,8 @@ enum Mode {
     Flood,
     Pause,
     Slow,
+    Shout,
+    Sever,
 }
 
 impl Mode {
@@ -269,6 +285,10 @@ impl Mode {
             Self::Pause
         } else if path.ends_with("/slow") {
             Self::Slow
+        } else if path.ends_with("/shout") {
+            Self::Shout
+        } else if path.ends_with("/sever") {
+            Self::Sever
         } else {
             Self::Flood
         }
@@ -304,7 +324,7 @@ impl Conn {
     /// Whether body bytes in `dir` are passed on.
     fn passes(&self, dir: u8) -> bool {
         match self.mode {
-            Mode::Pass | Mode::Hoard | Mode::Slow => true,
+            Mode::Pass | Mode::Hoard | Mode::Slow | Mode::Shout | Mode::Sever => true,
             Mode::Hold | Mode::Forward => dir == REQUEST,
             Mode::Overlong | Mode::Talk | Mode::Flood | Mode::Pause => false,
         }
@@ -332,7 +352,9 @@ impl Conn {
                     | Mode::Forward
                     | Mode::Overlong
                     | Mode::Pause
-                    | Mode::Slow => {}
+                    | Mode::Slow
+                    | Mode::Shout
+                    | Mode::Sever => {}
                     Mode::Talk => {
                         let s = self.streams.get_mut(&id).expect("just opened");
                         s.lanes[usize::from(REQUEST)]
@@ -391,19 +413,29 @@ impl Conn {
         if data.is_empty() {
             return;
         }
-        *lock(&self.log.received).entry(id).or_insert(0) += data.len();
+        lock(&self.log.received).entry(id).or_default()[usize::from(dir)] += data.len();
         if self.mode != Mode::Hoard {
             self.send(text(
                 id,
                 json!({"type": "credit", "dir": dir_name(dir), "bytes": data.len()}),
             ));
         }
+        if self.mode == Mode::Sever && dir == RESPONSE {
+            self.streams.remove(&id);
+            self.send(text(id, json!({"type": "reset", "message": "severed"})));
+            return;
+        }
         if self.passes(dir)
             && let Some(s) = self.streams.get_mut(&id)
         {
+            let data = if self.mode == Mode::Shout && dir == RESPONSE {
+                Bytes::from(data.to_ascii_uppercase())
+            } else {
+                Bytes::copy_from_slice(data)
+            };
             s.lanes[usize::from(dir)]
                 .queue
-                .push_back(Queued::Bytes(Bytes::copy_from_slice(data)));
+                .push_back(Queued::Bytes(data));
             self.flush(id, dir);
         }
     }
