@@ -2,12 +2,14 @@
 //! inspection, WebSocket messages being reassembled, observers' copies.
 //!
 //! Each of those buffers is bounded by a `limits.*` cap on its own; the
-//! budget bounds their sum. An exchange reserves a cap in full before it
-//! fills the buffer, and holds the reservation until it ends, so what the
-//! process can hold in such buffers at once is `limits.max_buffered_bytes`
-//! whatever the number of exchanges. Nothing is evicted and nobody waits:
-//! a reservation the budget cannot cover fails at once, and the exchange
-//! fails closed (an observer's copy is cut).
+//! budget bounds their sum, so what the process can hold in such buffers
+//! at once is `limits.max_buffered_bytes` whatever the number of
+//! exchanges. Inspection and reassembly reserve their cap in full before
+//! they fill the buffer and hold it until the exchange ends: they fail
+//! closed when they cannot reserve, so they must not find out part-way.
+//! An observer's copy is charged frame by frame for what it has queued,
+//! since a copy that cannot grow is simply cut. Nothing is evicted and
+//! nobody waits: a reservation the budget cannot cover fails at once.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

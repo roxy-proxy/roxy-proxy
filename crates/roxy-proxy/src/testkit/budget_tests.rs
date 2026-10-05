@@ -1,7 +1,8 @@
-//! The buffer budget: each exchange reserves its cap before it buffers,
-//! so the exchanges holding a buffer at once are bounded by
+//! The buffer budget: an exchange that inspects reserves its cap before
+//! it buffers, so the exchanges holding a buffer at once are bounded by
 //! `max_buffered_bytes`, and one the budget cannot cover fails closed
-//! (an observer's copy is cut) rather than waiting.
+//! rather than waiting. An observer's copy is charged for what it has
+//! queued, and cut when the budget cannot cover its next frame.
 
 use std::time::Duration;
 
@@ -87,11 +88,11 @@ async fn stalled_uploads_fill_the_budget_and_the_next_is_refused() {
     until_buffered(&kit, 0).await;
 }
 
-/// An observer's copy takes `max_observer_lag_bytes` of the budget per
-/// direction; when the budget cannot cover one the copy is cut and
-/// reported with its own reason, and the real exchange goes through whole.
+/// An observer's copy is charged for what it has queued, not for its
+/// cap: many small observed exchanges fit at once in a budget smaller
+/// than one copy's `max_observer_lag_bytes`, and none is cut.
 #[tokio::test]
-async fn a_copy_the_budget_cannot_cover_is_cut_while_the_exchange_goes_through() {
+async fn small_observed_exchanges_fit_in_a_budget_under_one_copys_cap() {
     let kit = Kit::builder()
         .rules(ALLOW)
         .limits(|l| {
@@ -106,22 +107,74 @@ async fn a_copy_the_budget_cannot_cover_is_cut_while_the_exchange_goes_through()
         &[],
         vec![addon("o", "pass", AddonMode::Observe, |_| {})],
     );
-    let a = kit.h1().await.call("POST", "/x", &[], b"body").await;
-    assert_eq!(a.status, 200, "{a:?}");
-    assert_eq!(a.json()["body_len"], 4);
-    let seen = kit.upstream.wait_seen(1).await;
-    assert_eq!(seen[0].body, b"body");
-    assert_eq!(seen[0].complete, Some(true));
-    let lagged = kit.events("observer_lagged", 2).await;
-    let mut directions: Vec<&str> = lagged
-        .iter()
-        .map(|e| e["direction"].as_str().unwrap())
-        .collect();
-    directions.sort_unstable();
-    assert_eq!(directions, ["request", "response"], "{lagged:#?}");
-    for e in &lagged {
-        assert_eq!(e["layer"], "o", "{e:#}");
-        assert_eq!(e["reason"], "buffer_budget_exhausted", "{e:#}");
+    let mut open = Vec::new();
+    for _ in 0..16 {
+        let mut c = kit.h1().await;
+        let (mut tx, body) = streaming_body();
+        let req = c.request("POST", "/x", &[]).body(body).unwrap();
+        let answer = c.start(req);
+        tx.send_data(Bytes::from(vec![b'x'; 1024])).await.unwrap();
+        open.push((c, tx, answer));
     }
+    for (_c, tx, answer) in open {
+        tx.finish().await.unwrap();
+        let a = answer.await.unwrap().unwrap();
+        assert_eq!(a.status, 200, "{a:?}");
+        assert_eq!(a.json()["body_len"], 1024);
+    }
+    let seen = kit.upstream.wait_seen(16).await;
+    assert!(seen.iter().all(|s| s.complete == Some(true)), "{seen:#?}");
     until_buffered(&kit, 0).await;
+    let lagged: Vec<_> = kit
+        .sink
+        .events()
+        .into_iter()
+        .filter(|e| e["event"] == "observer_lagged")
+        .collect();
+    assert!(lagged.is_empty(), "{lagged:#?}");
+}
+
+/// A copy whose next frame the budget cannot cover is cut and reported
+/// with its own reason, while the real exchange goes through whole. The
+/// observer never reads, so its copy queues until the budget is full
+/// well before the copy reaches its own cap.
+#[tokio::test]
+async fn a_copy_the_budget_cannot_cover_is_cut_while_the_exchange_goes_through() {
+    let kit = Kit::builder()
+        .rules(ALLOW)
+        .limits(|l| {
+            l.max_observer_lag_bytes = 8 * CAP;
+            l.max_buffered_bytes = CAP;
+        })
+        .start()
+        .await;
+    reload(
+        &kit,
+        ALLOW,
+        &[],
+        vec![addon("o", "stall", AddonMode::Observe, |_| {})],
+    );
+    let mut c = kit.h1().await;
+    let (mut tx, body) = streaming_body();
+    let req = c.request("POST", "/x", &[]).body(body).unwrap();
+    let answer = c.start(req);
+    let chunk = Bytes::from(vec![b'x'; 16 * 1024]);
+    let chunks = 40;
+    for _ in 0..chunks {
+        tx.send_data(chunk.clone()).await.unwrap();
+    }
+    tx.finish().await.unwrap();
+    let a = answer.await.unwrap().unwrap();
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["body_len"], chunks * chunk.len());
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].complete, Some(true));
+    let lagged = kit.events("observer_lagged", 1).await;
+    let request = lagged
+        .iter()
+        .find(|e| e["direction"] == "request")
+        .unwrap_or_else(|| panic!("{lagged:#?}"));
+    assert_eq!(request["layer"], "o", "{request:#}");
+    assert_eq!(request["reason"], "buffer_budget_exhausted", "{request:#}");
+    assert!(kit.server.shared().buffered() <= CAP);
 }

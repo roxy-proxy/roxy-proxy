@@ -556,18 +556,19 @@ impl Config {
                 ));
             }
         }
-        // Each per-exchange cap is reserved whole, so a budget under one of
-        // them could never admit the exchanges that need that buffer.
+        // Inspection and WebSocket reassembly reserve their cap whole, so a
+        // budget under one of them could never admit the exchanges that
+        // need that buffer. An observer's copy grows into the budget frame
+        // by frame, so its cap sets no floor.
         let per_exchange = l
             .max_inspect_body_bytes
             .as_u64()
-            .max(l.max_ws_message_bytes.as_u64().saturating_mul(2))
-            .max(l.max_observer_lag_bytes.as_u64().saturating_mul(2));
+            .max(l.max_ws_message_bytes.as_u64().saturating_mul(2));
         if l.max_buffered_bytes.as_u64() < per_exchange {
             d.push(Diagnostic::new(
                 "limits.max_buffered_bytes",
-                "must cover one exchange's buffers: at least max_inspect_body_bytes, \
-                 twice max_ws_message_bytes and twice max_observer_lag_bytes",
+                "must cover one exchange's buffers: at least max_inspect_body_bytes \
+                 and twice max_ws_message_bytes",
             ));
         }
         if l.max_address_list_bytes.as_u64() == 0 {
