@@ -638,13 +638,10 @@ fn health_fails_on_other_status_and_garbage() {
 
 #[test]
 fn health_fails_when_refused_or_misused() {
-    let closed = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap()
-    };
-    let refused = format!("http://{closed}/healthz");
+    // Nothing can listen on port 0 (binding it picks an ephemeral port), so
+    // the connect is refused whatever other tests have bound.
     for url in [
-        refused.as_str(),
+        "http://127.0.0.1:0/healthz",
         "https://127.0.0.1:3130/healthz",
         "http:///healthz",
     ] {
