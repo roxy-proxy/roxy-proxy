@@ -30,8 +30,8 @@ use http::StatusCode;
 use roxy_http::h1::ServerConn;
 use roxy_http::url::{normalize_path, normalize_query};
 use roxy_http::{
-    Authority, Body, BodyError, CanonicalRequest, CanonicalResponse, ParseError, Query, Reason,
-    Scheme,
+    Authority, Body, BodyError, CanonicalRequest, CanonicalResponse, DriveError, ParseError, Query,
+    Reason, Scheme,
 };
 use roxy_rules::{
     AllowOpts, CaptureTarget, Decision, DenyStatus, Effect, EvalContext, FAIL_CLOSED_MESSAGE,
@@ -199,8 +199,9 @@ pub(crate) enum Verdict {
     Continue(CanonicalRequest),
     /// Answer locally (deny or fail-closed).
     Deny(Refusal),
-    /// The client side broke (body framing, timeout, cap): close.
-    Close(ParseError),
+    /// The client side ended the exchange (body framing, timeout, cap, a
+    /// failed `100 Continue`): close.
+    Close(DriveError),
 }
 
 /// Outcome of the response steps.
@@ -210,8 +211,9 @@ pub(crate) enum ResponseVerdict {
     Continue(CanonicalResponse),
     /// Replace it with a local answer.
     Deny(Refusal),
-    /// The client side broke while the response was being inspected.
-    Close(ParseError),
+    /// The client side ended the exchange while the response was being
+    /// inspected.
+    Close(DriveError),
 }
 
 /// Body access a step needs from the client connection: buffering while
@@ -221,7 +223,7 @@ pub(crate) trait BodyIo: Send {
         &'a mut self,
         body: &'a mut Body,
         cap: u64,
-    ) -> CollectFuture<'a, Result<Collected, ParseError>>;
+    ) -> CollectFuture<'a, Result<Collected, DriveError>>;
 }
 
 impl BodyIo for ServerConn<ClientIo> {
@@ -229,7 +231,7 @@ impl BodyIo for ServerConn<ClientIo> {
         &'a mut self,
         body: &'a mut Body,
         cap: u64,
-    ) -> CollectFuture<'a, Result<Collected, ParseError>> {
+    ) -> CollectFuture<'a, Result<Collected, DriveError>> {
         Box::pin(self.drive(collect_prefix(body, cap)))
     }
 }
@@ -814,7 +816,7 @@ async fn inspect_request_body(
     let cap = cx.snap.limits.max_inspect_body_bytes;
     let inspected = match io.collect(&mut req.body, cap).await {
         Err(e) => return Verdict::Close(e),
-        Ok(Collected::Failed(e)) => return Verdict::Close(body_failure(&e)),
+        Ok(Collected::Failed(e)) => return Verdict::Close(body_failure(&e).into()),
         Ok(Collected::Complete(b)) => {
             if let Some(f) = cx.facts.request.as_mut() {
                 f.body_size = Some(b.len() as u64);

@@ -56,8 +56,8 @@ pub use head::{Framing, Head, HeadScan, RequestHead, Role, parse_head, scan_head
 
 use crate::len_u64;
 use crate::model::{
-    Authority, Body, BodyError, BodySender, CanonicalRequest, CanonicalResponse, Headers,
-    HttpFlags, Limits, ParseError, Reason, RequestMeta, TargetForm, Version, WriteError,
+    Authority, Body, BodyError, BodySender, CanonicalRequest, CanonicalResponse, DriveError,
+    Headers, HttpFlags, Limits, ParseError, Reason, RequestMeta, TargetForm, Version, WriteError,
     status_forbids_body,
 };
 
@@ -770,15 +770,17 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     /// `req.body`. Sends `100 Continue` first if the client is waiting for
     /// it (driving the body means the request was allowed).
     ///
-    /// Returns `Err` if the request body is invalid, too large, stalls or
-    /// the client goes away (including a client that closes while waiting
-    /// for the response to a bodiless request); `fut` is dropped in that
-    /// case and the connection must be closed.
-    pub async fn drive<F: Future>(&mut self, fut: F) -> Result<F::Output, ParseError> {
-        if self.r.feed.is_some() {
-            self.send_100_continue()
-                .await
-                .map_err(|e| ParseError::new(Reason::Io, e.to_string()))?;
+    /// Returns [`DriveError::Client`] if the request body is invalid, too
+    /// large, stalls or the client goes away (including a client that
+    /// closes while waiting for the response to a bodiless request), and
+    /// [`DriveError::Write`] if the `100 Continue` could not be written.
+    /// `fut` is dropped in either case and the connection must be closed.
+    pub async fn drive<F: Future>(&mut self, fut: F) -> Result<F::Output, DriveError> {
+        if self.r.feed.is_some()
+            && let Err(e) = self.send_100_continue().await
+        {
+            self.state = State::Broken;
+            return Err(DriveError::Write(e));
         }
         let mut fut = std::pin::pin!(fut);
         tokio::select! {
@@ -787,7 +789,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
             r = self.r.pump_or_watch() => {
                 if let Err(e) = r {
                     self.state = State::Broken;
-                    return Err(e);
+                    return Err(DriveError::Client(e));
                 }
             }
         }

@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use roxy_http::h1::{Incoming, Role, ServerConn};
 use roxy_http::url::parse_authority;
-use roxy_http::{Body, CanonicalResponse, HttpFlags, Limits, Reason, Scheme};
+use roxy_http::{Body, CanonicalResponse, DriveError, HttpFlags, Limits, Reason, Scheme};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug)]
@@ -256,10 +256,11 @@ async fn run_case(case: &Case) -> Result<(), String> {
                 if kind == "body-error" {
                     let body = std::mem::take(&mut req.body);
                     match conn.drive(body.collect_up_to(u64::MAX)).await {
-                        Err(e) if code(e.reason) == rest[0] => return Ok(()),
-                        Err(e) => {
+                        Err(DriveError::Client(e)) if code(e.reason) == rest[0] => return Ok(()),
+                        Err(DriveError::Client(e)) => {
                             return Err(format!("{ctx}: body error {} ({})", e.reason, e.detail));
                         }
+                        Err(e @ DriveError::Write(_)) => return Err(format!("{ctx}: {e}")),
                         Ok(r) => return Err(format!("{ctx}: body completed: {r:?}")),
                     }
                 }

@@ -18,7 +18,8 @@ use roxy_http::ws::{
     WsKey, validate_no_extensions, validate_upgrade_request, validate_upgrade_response,
 };
 use roxy_http::{
-    Body, BodyError, CanonicalRequest, CanonicalResponse, Limits, ParseError, WriteError,
+    Body, BodyError, CanonicalRequest, CanonicalResponse, DriveError, Limits, ParseError,
+    WriteError,
 };
 use roxy_rules::RuleId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -135,13 +136,7 @@ where
     if stop.is_none()
         && let Some((reason, e)) = failure
     {
-        cx.shared.sink.emit(&FlowEvent::ResponseError {
-            ts: chrono::Utc::now(),
-            flow: cx.flow.to_string(),
-            conn: cx.conn_id(),
-            reason: reason.to_owned(),
-            message: e.to_string(),
-        });
+        emit_response_error(cx, reason, &e);
         cx.record.reason.get_or_insert_with(|| reason.to_owned());
     }
     let close = match &refusal {
@@ -158,6 +153,16 @@ where
         cx.emit_request_event();
     }
     Sent { failed, close }
+}
+
+fn emit_response_error(cx: &FlowCx, reason: &str, e: &dyn std::fmt::Display) {
+    cx.shared.sink.emit(&FlowEvent::ResponseError {
+        ts: chrono::Utc::now(),
+        flow: cx.flow.to_string(),
+        conn: cx.conn_id(),
+        reason: reason.to_owned(),
+        message: e.to_string(),
+    });
 }
 
 /// Records a local refusal on the flow and builds its response. Pair with
@@ -224,6 +229,21 @@ pub(crate) fn record_client_gone(cx: &mut FlowCx) {
     cx.emit_request_event();
 }
 
+/// roxy's own `100 Continue` could not be written: nothing more can reach
+/// the client, so the flow is logged (reason `client_gone` when the client
+/// went away, `continue_write_failed` otherwise) and the connection dropped.
+pub(crate) fn record_continue_failure(cx: &mut FlowCx, e: WriteError) {
+    let e = WriteFailure::from(e);
+    let reason = match e {
+        WriteFailure::ClientGone(_) => "client_gone",
+        WriteFailure::Stopped | WriteFailure::Io(_) => "continue_write_failed",
+    };
+    emit_response_error(cx, reason, &e);
+    cx.record.reason = Some(reason.to_owned());
+    cx.record.response_status = None;
+    cx.emit_request_event();
+}
+
 /// The client body broke: answer with the parse error's status and close.
 pub(crate) async fn close_on_parse_error(
     conn: ServerConn<ClientIo>,
@@ -241,19 +261,40 @@ pub(crate) async fn close_on_parse_error(
     }
 }
 
+/// The exchange ended on the client side: a parse error is answered and
+/// logged as the client's fault; a failed `100 Continue` is roxy's.
+async fn close_on_drive_error(
+    conn: ServerConn<ClientIo>,
+    mut cx: FlowCx,
+    shared: &Shared,
+    e: DriveError,
+) {
+    match e {
+        DriveError::Client(e) => {
+            let client = cx.facts.client.clone();
+            close_on_parse_error(conn, Some(cx), &client, shared, &e).await;
+        }
+        DriveError::Write(e) => {
+            drop(conn);
+            record_continue_failure(&mut cx, e);
+        }
+    }
+}
+
 /// The client side of an exchange, as the transport-agnostic core sees it:
 /// body access for the inspecting steps ([`BodyIo`]) plus a way to wait for
 /// the upstream while the client's request body keeps flowing.
 pub(crate) trait Front: BodyIo {
     /// Runs `fut` (the upstream request) while the client's request body
     /// keeps flowing into it, answering `100 Continue` first if the client
-    /// waits for it. `Err` means the client side broke (body invalid, too
-    /// large, stalled, client gone): `fut` is dropped and the flow must not
-    /// be answered as if it had been forwarded.
+    /// waits for it. `Err` means the client side ended the exchange (body
+    /// invalid, too large, stalled, client gone, or the `100 Continue`
+    /// could not be written): `fut` is dropped and the flow must not be
+    /// answered as if it had been forwarded.
     fn drive<F>(
         &mut self,
         fut: F,
-    ) -> impl std::future::Future<Output = Result<F::Output, ParseError>> + Send
+    ) -> impl std::future::Future<Output = Result<F::Output, DriveError>> + Send
     where
         F: std::future::Future + Send,
         F::Output: Send;
@@ -263,7 +304,7 @@ impl Front for ServerConn<ClientIo> {
     fn drive<F>(
         &mut self,
         fut: F,
-    ) -> impl std::future::Future<Output = Result<F::Output, ParseError>> + Send
+    ) -> impl std::future::Future<Output = Result<F::Output, DriveError>> + Send
     where
         F: std::future::Future + Send,
         F::Output: Send,
@@ -281,8 +322,9 @@ pub(crate) enum Outcome {
     Respond(CanonicalResponse),
     /// Answer locally (deny, fail-closed, upstream error).
     Refuse(Refusal),
-    /// The client side broke: close (h1) or reset the stream (h2).
-    Close(ParseError),
+    /// The client side ended the exchange: close (h1) or reset the stream
+    /// (h2).
+    Close(DriveError),
     /// An allowed WebSocket upgrade got its `101` (h1 only).
     Upgrade {
         res: CanonicalResponse,
@@ -359,8 +401,7 @@ pub(crate) async fn run(
         Outcome::Respond(res) => answer(conn, cx, Answer::Response(res)).await,
         Outcome::Refuse(refusal) => answer(conn, cx, Answer::Refusal(refusal)).await,
         Outcome::Close(e) => {
-            let client = cx.facts.client.clone();
-            close_on_parse_error(conn, Some(cx), &client, shared, &e).await;
+            close_on_drive_error(conn, cx, shared, e).await;
             None
         }
         Outcome::Upgrade { res, upstream, key } => {
@@ -437,8 +478,8 @@ enum Upstreamed {
 enum Failed {
     /// Answer locally.
     Refuse(Refusal),
-    /// The client side broke.
-    Close(ParseError),
+    /// The client side ended the exchange.
+    Close(DriveError),
 }
 
 impl From<Failed> for Outcome {

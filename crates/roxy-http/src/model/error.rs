@@ -392,6 +392,20 @@ pub enum WriteError {
     State(&'static str),
 }
 
+/// Why [`crate::h1::ServerConn::drive`] stopped short of its future's
+/// output: the client's fault, or roxy's own write failing. The connection
+/// must be dropped after either.
+#[derive(Debug, thiserror::Error)]
+pub enum DriveError {
+    /// The request body was invalid, too large or stalled, or the client
+    /// went away.
+    #[error(transparent)]
+    Client(#[from] ParseError),
+    /// roxy's `100 Continue` could not be written.
+    #[error("100 Continue: {0}")]
+    Write(#[from] WriteError),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

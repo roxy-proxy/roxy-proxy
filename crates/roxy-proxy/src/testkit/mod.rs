@@ -408,6 +408,31 @@ impl Kit {
         client
     }
 
+    /// A raw client that sent `bytes` to the proxy port and was gone before
+    /// roxy read them: roxy parses what arrived, then finds nobody to write
+    /// to.
+    pub(crate) async fn connect_and_leave(&self, bytes: &[u8]) {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        client.write_all(bytes).await.unwrap();
+        drop(client);
+        let conn = ClientConn {
+            id: Ulid::generate(),
+            listener: Arc::new(ListenerInfo {
+                name: "main".to_owned(),
+                mode: ListenerMode::Explicit,
+                auth_required: false,
+            }),
+            peer: "192.0.2.7:40000".parse().unwrap(),
+            user: None,
+            original_dst: None,
+        };
+        self.spawn_conn(crate::conn::serve_explicit(
+            Box::new(server),
+            conn,
+            self.server.shared().clone(),
+        ));
+    }
+
     /// An HTTP/1.1 client on the proxy port (absolute-form requests).
     pub(crate) async fn h1(&self) -> Client {
         Client::h1(self.connect(), None).await

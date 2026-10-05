@@ -682,6 +682,27 @@ async fn a_deny_never_answers_100_continue() {
     assert!(kit.upstream.seen().is_empty());
 }
 
+/// A client gone between `Expect: 100-continue` and the `100` is a client
+/// that went away, not a request roxy refused to parse.
+#[tokio::test]
+async fn a_client_gone_before_its_100_continue_is_not_a_parse_error() {
+    let kit = Kit::builder().start().await;
+    kit.connect_and_leave(
+        b"POST http://up.test/x HTTP/1.1\r\nhost: up.test\r\ncontent-length: 5\r\nexpect: 100-continue\r\n\r\n",
+    )
+    .await;
+    let ev = kit.events("response_error", 1).await;
+    assert_eq!(ev[0]["reason"], "client_gone", "{ev:#?}");
+    let req = kit.request_event().await;
+    assert_eq!(req["reason"], "client_gone", "{req:#}");
+    assert!(req["response_status"].is_null(), "{req:#}");
+    let events = kit.sink.events();
+    assert!(
+        events.iter().all(|e| e["event"] != "parse_error"),
+        "{events:#?}"
+    );
+}
+
 /// A closing deny of a large upload does not wait for the rest of the
 /// body: the connection closes as soon as the response is written.
 #[tokio::test]
