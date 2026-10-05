@@ -161,6 +161,6 @@ fn redact_json(v: serde_json::Value, r: &crate::flowlog::Redactor) -> serde_json
         Value::Object(o) => {
             Value::Object(o.into_iter().map(|(k, x)| (k, redact_json(x, r))).collect())
         }
-        other => other,
+        other @ (Value::Null | Value::Bool(_) | Value::Number(_)) => other,
     }
 }

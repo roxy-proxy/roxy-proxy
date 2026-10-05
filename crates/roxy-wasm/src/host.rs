@@ -81,7 +81,6 @@ impl HostError {
 /// `wasi:http/types.error-code`; the guest decides what to do (it is not
 /// fatal to the exchange).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum EndpointError {
     /// No endpoint with that name is configured for this layer.
     #[error("unknown endpoint")]

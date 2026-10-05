@@ -246,7 +246,13 @@ impl Watch {
                 }
                 // `evaluate` returns header effects only; never continue
                 // on anything else.
-                other => Err(format!("unexpected effect {}", other.kind())),
+                other @ (Effect::RewritePath { .. }
+                | Effect::SetQuery { .. }
+                | Effect::RemoveQuery(_)
+                | Effect::Redirect { .. }
+                | Effect::Log { .. }
+                | Effect::SetState { .. }
+                | Effect::Capture(_)) => Err(format!("unexpected effect {}", other.kind())),
             };
             match applied {
                 Ok(m) => g.mutations.push(m),

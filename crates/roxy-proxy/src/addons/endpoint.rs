@@ -196,7 +196,10 @@ fn connect_error(e: &ConnectError) -> EndpointError {
     match e {
         ConnectError::Denied(_) => EndpointError::Denied,
         ConnectError::Timeout(_) => EndpointError::Timeout,
-        other => EndpointError::Failed(other.to_string()),
+        other @ (ConnectError::Dns(_)
+        | ConnectError::Connect(_)
+        | ConnectError::Tls(_)
+        | ConnectError::Target(_)) => EndpointError::Failed(other.to_string()),
     }
 }
 
