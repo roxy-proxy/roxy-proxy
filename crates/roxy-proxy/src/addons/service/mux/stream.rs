@@ -15,7 +15,7 @@ use super::inbox::{Inbox, feeder};
 use super::link::{Link, Message, Queued, Wire, binary, dial, text};
 use super::lock;
 use super::pool::{Pool, PoolKey, Reservation};
-use super::window::{Feed, OBSERVE_GRANT, WINDOW};
+use super::window::Window;
 use crate::watch::Dir;
 
 /// Largest body frame roxy sends, so streams share the socket fairly.
@@ -41,35 +41,144 @@ pub(crate) struct Stream {
     pub(super) wire: Arc<Wire>,
 }
 
-#[derive(Default)]
 pub(super) struct StreamState {
-    pub(super) first: Option<oneshot::Sender<Result<First, Unanswered>>>,
-    pub(super) second: Option<oneshot::Sender<Result<LayerResponse, Unanswered>>>,
+    phase: Phase,
     /// The request body and the response body, each on its own.
-    pub(super) req: Feed,
-    pub(super) res: Feed,
-    /// Why an observe stream failed, for its driver to log.
-    pub(super) observe_error: Option<ServiceError>,
+    req: Lane,
+    res: Lane,
     pub(super) slot: Option<Reservation>,
+}
+
+/// Where the stream is in the protocol: what the service still owes roxy
+/// besides the bodies it is sending.
+pub(super) enum Phase {
+    /// Enforce: the request head is on its way, and the service owes its
+    /// first answer (a request to forward, a response, or a deny).
+    AwaitingFirst {
+        first: oneshot::Sender<Result<First, Unanswered>>,
+        second: oneshot::Sender<Result<LayerResponse, Unanswered>>,
+    },
+    /// It forwarded: the response head goes when the stack below answers,
+    /// and the service owes its second answer.
+    AwaitingSecond {
+        second: oneshot::Sender<Result<LayerResponse, Unanswered>>,
+    },
+    /// Answered (or observe mode, which is never answered): only the
+    /// bodies in flight are owed.
+    Answered,
     /// Settled: nothing more is sent or delivered on it.
-    pub(super) ended: bool,
+    Ended {
+        /// Why an observe stream failed, for its driver to log.
+        observe_error: Option<ServiceError>,
+    },
+}
+
+/// One body of a stream: the credit each way, and what the service is
+/// sending of it.
+#[derive(Default)]
+struct Lane {
+    window: Window,
+    /// Being fed from the stream: its head arrived and its end has not.
+    inbox: Option<Arc<Inbox>>,
+}
+
+/// What `settle` found when the stream ended: who was waiting on it.
+struct Ending {
+    inboxes: [Option<Arc<Inbox>>; 2],
+    pending: Pending,
+    slot: Option<Reservation>,
+}
+
+/// The answer the service still owed when the stream ended, to be told
+/// why it will not come.
+enum Pending {
+    First(oneshot::Sender<Result<First, Unanswered>>),
+    Second(oneshot::Sender<Result<LayerResponse, Unanswered>>),
+    None,
 }
 
 impl StreamState {
-    pub(super) fn feed(&mut self, dir: Dir) -> &mut Feed {
+    pub(super) fn new(phase: Phase, slot: Option<Reservation>) -> Self {
+        Self {
+            phase,
+            req: Lane::default(),
+            res: Lane::default(),
+            slot,
+        }
+    }
+
+    fn lane(&mut self, dir: Dir) -> &mut Lane {
         match dir {
             Dir::Request => &mut self.req,
             Dir::Response => &mut self.res,
         }
     }
 
+    pub(super) fn ended(&self) -> bool {
+        matches!(self.phase, Phase::Ended { .. })
+    }
+
     /// The service still owes something: an answer, or the end of a body
     /// it is sending.
-    pub(super) fn waiting(&self) -> bool {
-        self.req.inbox.is_some()
+    fn waiting(&self) -> bool {
+        !matches!(self.phase, Phase::Answered)
+            || self.req.inbox.is_some()
             || self.res.inbox.is_some()
-            || self.first.is_some()
-            || self.second.is_some()
+    }
+
+    /// Ends the stream, once: what was pending goes to the caller to be
+    /// told. `None` if it had already ended.
+    fn end(&mut self, observe_error: Option<ServiceError>) -> Option<Ending> {
+        let ended = Phase::Ended { observe_error };
+        let pending = match std::mem::replace(&mut self.phase, ended) {
+            Phase::AwaitingFirst { first, .. } => Pending::First(first),
+            Phase::AwaitingSecond { second } => Pending::Second(second),
+            Phase::Answered => Pending::None,
+            Phase::Ended { observe_error } => {
+                self.phase = Phase::Ended { observe_error };
+                return None;
+            }
+        };
+        Some(Ending {
+            inboxes: [self.req.inbox.take(), self.res.inbox.take()],
+            pending,
+            slot: self.slot.take(),
+        })
+    }
+
+    /// The service's first answer is a request to forward: it now owes the
+    /// second.
+    fn forwarded(&mut self) -> Result<oneshot::Sender<Result<First, Unanswered>>, ServiceError> {
+        match std::mem::replace(&mut self.phase, Phase::Answered) {
+            Phase::AwaitingFirst { first, second } => {
+                self.phase = Phase::AwaitingSecond { second };
+                Ok(first)
+            }
+            other @ (Phase::AwaitingSecond { .. } | Phase::Answered | Phase::Ended { .. }) => {
+                self.phase = other;
+                Err(ServiceError::Protocol("unexpected request".into()))
+            }
+        }
+    }
+
+    /// Hands a response to whoever is waiting: the first answer (the
+    /// service answers instead of forwarding, so no second follows), or
+    /// the second.
+    fn answered(&mut self, r: LayerResponse, what: &str) -> Result<(), ServiceError> {
+        match std::mem::replace(&mut self.phase, Phase::Answered) {
+            Phase::AwaitingFirst { first, .. } => {
+                let _ = first.send(Ok(First::Answer(r)));
+                Ok(())
+            }
+            Phase::AwaitingSecond { second } => {
+                let _ = second.send(Ok(r));
+                Ok(())
+            }
+            other @ (Phase::Answered | Phase::Ended { .. }) => {
+                self.phase = other;
+                Err(ServiceError::Protocol(format!("unexpected {what}")))
+            }
+        }
     }
 }
 
@@ -100,7 +209,7 @@ pub(super) enum Reset {
 }
 
 impl Stream {
-    pub(super) fn name(&self) -> String {
+    fn name(&self) -> String {
         self.st.snap.addons[self.index].name.clone()
     }
 
@@ -109,27 +218,16 @@ impl Stream {
     /// waiting on it (a pending answer, the body being fed) learns how it
     /// ended.
     pub(super) fn settle(&self, end: End<'_>) {
-        let (inboxes, first, second, slot) = {
-            let mut s = lock(&self.state);
-            if s.ended {
-                return;
-            }
-            s.ended = true;
-            if let End::Failed { e, .. } = &end
-                && self.mode == AddonMode::Observe
-            {
-                s.observe_error = Some(e.clone());
-            }
-            (
-                [s.req.inbox.take(), s.res.inbox.take()],
-                s.first.take(),
-                s.second.take(),
-                s.slot.take(),
-            )
+        let observe_error = match &end {
+            End::Failed { e, .. } if self.mode == AddonMode::Observe => Some(e.clone()),
+            End::Quiet | End::Failed { .. } | End::Abandoned(_) | End::BodyFailed(..) => None,
+        };
+        let Some(ending) = lock(&self.state).end(observe_error) else {
+            return;
         };
         self.ended.cancel();
         lock(&self.link.shared.streams).open.remove(&self.id);
-        drop(slot);
+        drop(ending.slot);
         let (e, reset) = match end {
             End::Quiet => return,
             End::Failed { e, reset } => {
@@ -163,19 +261,28 @@ impl Stream {
         } else {
             None
         };
-        for inbox in inboxes.into_iter().flatten() {
+        for inbox in ending.inboxes.into_iter().flatten() {
             inbox.abort(&e);
         }
-        if let Some(tx) = first {
-            let _ = tx.send(Err(e));
-        } else if let Some(tx) = second
-            && !tx.is_closed()
-        {
-            let _ = tx.send(Err(e));
-        } else if let Some((name, err)) = blame {
-            // The head has gone on: the failure is logged here, since no
-            // answer carries it.
-            super::super::super::emit_stack_error(&self.st, &name, &err, AddonMode::Enforce);
+        match ending.pending {
+            Pending::First(tx) => {
+                let _ = tx.send(Err(e));
+            }
+            Pending::Second(tx) if !tx.is_closed() => {
+                let _ = tx.send(Err(e));
+            }
+            Pending::Second(_) | Pending::None => {
+                if let Some((name, err)) = blame {
+                    // The head has gone on: the failure is logged here,
+                    // since no answer carries it.
+                    super::super::super::emit_stack_error(
+                        &self.st,
+                        &name,
+                        &err,
+                        AddonMode::Enforce,
+                    );
+                }
+            }
         }
     }
 
@@ -192,7 +299,10 @@ impl Stream {
     /// An observe stream: roxy sent all it had.
     pub(crate) fn finish(&self) -> Result<(), ServiceError> {
         self.settle(End::Quiet);
-        lock(&self.state).observe_error.take().map_or(Ok(()), Err)
+        match &mut lock(&self.state).phase {
+            Phase::Ended { observe_error } => observe_error.take().map_or(Ok(()), Err),
+            Phase::AwaitingFirst { .. } | Phase::AwaitingSecond { .. } | Phase::Answered => Ok(()),
+        }
     }
 
     /// Sends a control message in stream order. False once the stream or
@@ -223,14 +333,8 @@ impl Stream {
             let more = self.more_credit.notified();
             tokio::pin!(more);
             more.as_mut().enable();
-            {
-                let mut s = lock(&self.state);
-                let f = s.feed(dir);
-                if f.credit > 0 {
-                    let n = want.min(usize::try_from(f.credit).unwrap_or(usize::MAX));
-                    f.credit -= n as u64;
-                    return Some(n);
-                }
+            if let Some(n) = lock(&self.state).lane(dir).window.take(want) {
+                return Some(n);
             }
             tokio::select! {
                 () = more => {}
@@ -292,11 +396,10 @@ impl Stream {
         }
         {
             let mut s = lock(&self.state);
-            if s.ended {
+            if s.ended() {
                 return;
             }
-            let f = s.feed(dir);
-            f.unacked = f.unacked.saturating_sub(n);
+            s.lane(dir).window.acked(n);
         }
         self.link
             .shared
@@ -314,8 +417,8 @@ impl Stream {
         }
         let n = b.len() as u64;
         let mut s = lock(&self.state);
-        let feed = s.feed(dir);
-        let inbox = feed.inbox.clone();
+        let lane = s.lane(dir);
+        let inbox = lane.inbox.clone();
         if inbox.is_none() && self.mode == AddonMode::Enforce {
             drop(s);
             return self.fail(
@@ -326,7 +429,7 @@ impl Stream {
                 Reset::Send,
             );
         }
-        if feed.unacked + n > WINDOW {
+        if lane.window.received(n).is_err() {
             drop(s);
             return self.fail(
                 ServiceError::Protocol(format!(
@@ -336,15 +439,13 @@ impl Stream {
                 Reset::Send,
             );
         }
-        feed.unacked += n;
         let Some(inbox) = inbox else {
-            feed.discarded += n;
-            if feed.discarded < OBSERVE_GRANT {
-                return;
-            }
-            let granted = std::mem::take(&mut feed.discarded);
+            let granted = lane.window.discarded(n);
             drop(s);
-            return self.grant(dir, granted);
+            if let Some(granted) = granted {
+                self.grant(dir, granted);
+            }
+            return;
         };
         drop(s);
         let mut q = lock(&inbox.q);
@@ -362,11 +463,7 @@ impl Stream {
     pub(super) fn control(self: &Arc<Self>, m: In) {
         match m {
             In::Credit { dir, bytes } => {
-                {
-                    let mut s = lock(&self.state);
-                    let f = s.feed(dir);
-                    f.credit = f.credit.saturating_add(bytes);
-                }
+                lock(&self.state).lane(dir).window.granted(bytes);
                 self.more_credit.notify_waiters();
                 return;
             }
@@ -399,8 +496,7 @@ impl Stream {
         }
     }
 
-    pub(super) fn answer(self: &Arc<Self>, s: &mut StreamState, m: In) -> Result<(), ServiceError> {
-        let unexpected = |what: &str| ServiceError::Protocol(format!("unexpected {what}"));
+    fn answer(self: &Arc<Self>, s: &mut StreamState, m: In) -> Result<(), ServiceError> {
         let limits = &self.st.snap.limits;
         match m {
             In::RequestEnd | In::ResponseEnd => {
@@ -409,13 +505,13 @@ impl Stream {
                 } else {
                     (Dir::Response, "response_end")
                 };
-                match s.feed(dir).inbox.take() {
+                match s.lane(dir).inbox.take() {
                     Some(inbox) => {
                         lock(&inbox.q).end = true;
                         inbox.ready.notify_one();
                         Ok(())
                     }
-                    None => Err(unexpected(what)),
+                    None => Err(ServiceError::Protocol(format!("unexpected {what}"))),
                 }
             }
             In::Request {
@@ -423,9 +519,7 @@ impl Stream {
                 url,
                 headers,
             } => {
-                if s.first.is_none() {
-                    return Err(unexpected("request"));
-                }
+                let first = s.forwarded()?;
                 let method = http::Method::from_bytes(method.as_bytes())
                     .map_err(|_| ServiceError::Protocol(format!("invalid method {method:?}")))?;
                 let uri: http::Uri = url
@@ -445,9 +539,7 @@ impl Stream {
                 *r.uri_mut() = uri;
                 *r.headers_mut() = headers;
                 s.req.inbox = Some(self.feed(body_tx, Dir::Request));
-                if let Some(tx) = s.first.take() {
-                    let _ = tx.send(Ok(First::Forward(r)));
-                }
+                let _ = first.send(Ok(First::Forward(r)));
                 Ok(())
             }
             In::Response { status, headers } => {
@@ -471,7 +563,7 @@ impl Stream {
                 let mut r = http::Response::new(body);
                 *r.status_mut() = status;
                 *r.headers_mut() = headers;
-                Self::give(s, r, "response")?;
+                s.answered(r, "response")?;
                 s.res.inbox = Some(self.feed(body_tx, Dir::Response));
                 Ok(())
             }
@@ -479,35 +571,15 @@ impl Stream {
                 let r = super::super::deny_response(status, message)?;
                 // Tagged before the answer goes, so the flow's record has it.
                 self.st.add_tag(format!("{}:deny", self.name()));
-                Self::give(s, r, "deny")
+                s.answered(r, "deny")
             }
             // Handled by `control`.
             In::Credit { .. } | In::Reset { .. } => Ok(()),
         }
     }
 
-    /// Hands a response to whoever is waiting: the first answer (the
-    /// service answers instead of forwarding), or the second.
-    pub(super) fn give(
-        s: &mut StreamState,
-        r: LayerResponse,
-        what: &str,
-    ) -> Result<(), ServiceError> {
-        if let Some(tx) = s.first.take() {
-            // Answering instead of forwarding: no second answer follows.
-            s.second = None;
-            let _ = tx.send(Ok(First::Answer(r)));
-            Ok(())
-        } else if let Some(tx) = s.second.take() {
-            let _ = tx.send(Ok(r));
-            Ok(())
-        } else {
-            Err(ServiceError::Protocol(format!("unexpected {what}")))
-        }
-    }
-
     /// Starts feeding the `dir` body from the stream.
-    pub(super) fn feed(self: &Arc<Self>, tx: BodySender, dir: Dir) -> Arc<Inbox> {
+    fn feed(self: &Arc<Self>, tx: BodySender, dir: Dir) -> Arc<Inbox> {
         let inbox = Arc::new(Inbox::default());
         tokio::spawn(feeder(self.clone(), inbox.clone(), tx, dir));
         inbox
@@ -577,22 +649,23 @@ pub(crate) async fn open(
         .await?
         .clone();
 
-    let (first_tx, first_rx) = oneshot::channel();
-    let (second_tx, second_rx) = oneshot::channel();
-    let (answers, state) = if mode == AddonMode::Observe {
-        (None, StreamState::default())
-    } else {
-        (
-            Some(Answers {
-                first: first_rx,
-                second: second_rx,
-            }),
-            StreamState {
-                first: Some(first_tx),
-                second: Some(second_tx),
-                ..StreamState::default()
-            },
-        )
+    let (answers, phase) = match mode {
+        // An observer's answers are ignored: nothing is owed but bodies.
+        AddonMode::Observe => (None, Phase::Answered),
+        AddonMode::Enforce => {
+            let (first_tx, first_rx) = oneshot::channel();
+            let (second_tx, second_rx) = oneshot::channel();
+            (
+                Some(Answers {
+                    first: first_rx,
+                    second: second_rx,
+                }),
+                Phase::AwaitingFirst {
+                    first: first_tx,
+                    second: second_tx,
+                },
+            )
+        }
     };
     let stream = {
         let mut s = lock(&link.shared.streams);
@@ -607,10 +680,7 @@ pub(crate) async fn open(
             st: st.clone(),
             index,
             mode,
-            state: Mutex::new(StreamState {
-                slot: Some(slot),
-                ..state
-            }),
+            state: Mutex::new(StreamState::new(phase, Some(slot))),
             more_credit: Notify::new(),
             ended: CancellationToken::new(),
             wire: Arc::default(),
@@ -640,5 +710,111 @@ pub(super) fn open_message(st: &StackFlow, layer: &str, mode: AddonMode) -> Out 
         listener: st.client.listener.name.clone(),
         sni: st.tls.as_ref().and_then(|t| t.sni.clone()),
         tags: st.tags(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Receivers = (
+        oneshot::Receiver<Result<First, Unanswered>>,
+        oneshot::Receiver<Result<LayerResponse, Unanswered>>,
+    );
+
+    /// An enforce stream's state as opened, with the exchange's ends of
+    /// its answers.
+    fn enforce() -> (StreamState, Receivers) {
+        let (first_tx, first) = oneshot::channel();
+        let (second_tx, second) = oneshot::channel();
+        let phase = Phase::AwaitingFirst {
+            first: first_tx,
+            second: second_tx,
+        };
+        (StreamState::new(phase, None), (first, second))
+    }
+
+    fn response() -> LayerResponse {
+        http::Response::new(Body::empty())
+    }
+
+    /// Ending a stream tells the answer the service owed at that point,
+    /// and nothing when it owed none; a second end is a no-op.
+    #[test]
+    fn the_pending_answer_follows_the_phase() {
+        let (mut s, _answers) = enforce();
+        assert!(s.waiting());
+        assert!(matches!(
+            s.end(None),
+            Some(Ending {
+                pending: Pending::First(_),
+                ..
+            })
+        ));
+        assert!(s.ended());
+        assert!(s.end(None).is_none());
+
+        let (mut s, _answers) = enforce();
+        s.forwarded().unwrap();
+        assert!(s.waiting());
+        assert!(matches!(
+            s.end(None),
+            Some(Ending {
+                pending: Pending::Second(_),
+                ..
+            })
+        ));
+
+        let (mut s, _answers) = enforce();
+        s.forwarded().unwrap();
+        s.answered(response(), "response").unwrap();
+        assert!(!s.waiting());
+        assert!(matches!(
+            s.end(None),
+            Some(Ending {
+                pending: Pending::None,
+                ..
+            })
+        ));
+
+        let mut observe = StreamState::new(Phase::Answered, None);
+        assert!(!observe.waiting());
+        assert!(matches!(
+            observe.end(None),
+            Some(Ending {
+                pending: Pending::None,
+                ..
+            })
+        ));
+    }
+
+    /// A request may only come as the first answer, and a response or deny
+    /// only as an answer that is owed: the second is not once the first
+    /// answered instead of forwarding.
+    #[test]
+    fn heads_out_of_order_are_protocol_errors() {
+        let (mut s, _answers) = enforce();
+        s.forwarded().unwrap();
+        assert!(s.forwarded().is_err(), "a second request");
+        s.answered(response(), "response").unwrap();
+        assert!(s.answered(response(), "response").is_err(), "a third head");
+        assert!(s.forwarded().is_err());
+
+        let (mut s, (first, mut second)) = enforce();
+        s.answered(response(), "deny").unwrap();
+        assert!(matches!(first.blocking_recv(), Ok(Ok(First::Answer(_)))));
+        assert!(second.try_recv().is_err(), "no second answer follows");
+        assert!(s.answered(response(), "response").is_err());
+        assert!(!s.waiting());
+
+        let mut ended = StreamState::new(
+            Phase::Ended {
+                observe_error: None,
+            },
+            None,
+        );
+        assert!(ended.forwarded().is_err());
+        assert!(ended.answered(response(), "response").is_err());
+        assert!(ended.ended());
     }
 }
