@@ -534,32 +534,29 @@ mod service {
     use crate::addons::service::testing::{addon, kit, reload};
     use crate::testkit::{Answer, Kit, streaming_body};
 
-    /// The response head waits for `request_end`, and so does its clock:
-    /// an upstream that answers while the client is still uploading, for
-    /// longer than `first_byte_timeout`, still completes.
+    /// An upstream that answers while the client is still uploading
+    /// reaches the client through a pass-through layer at once: the
+    /// response head and body go through the stream while the request
+    /// body is still streaming, and the rest of the upload follows.
     #[tokio::test]
-    async fn an_early_response_waits_for_the_upload_without_timing_out() {
-        let kit = kit(
-            RULES,
-            vec![addon("s", "pass", AddonMode::Enforce, |s| {
-                s.first_byte_timeout = Duration::from_millis(400);
-            })],
-        )
-        .await;
+    async fn an_early_response_reaches_the_client_mid_upload() {
+        let kit = kit(RULES, vec![addon("s", "pass", AddonMode::Enforce, |_| {})]).await;
         let mut c = kit.h1().await;
         let (mut tx, body) = streaming_body();
         let req = c.request("POST", "/early", &[]).body(body).unwrap();
         let answer = c.start(req);
-        for _ in 0..4 {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            tx.send_data(Bytes::from_static(b"chunk")).await.unwrap();
-        }
-        tx.finish().await.unwrap();
-        let a: Answer = answer.await.unwrap().unwrap();
+        tx.send_data(Bytes::from_static(b"chunk")).await.unwrap();
+        let a: Answer = tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("the answer arrives while the client is still uploading")
+            .unwrap()
+            .unwrap();
         assert_eq!(a.status, 200, "{a:?}");
         assert_eq!(a.text(), "early");
+        tx.send_data(Bytes::from_static(b"chunk")).await.unwrap();
+        tx.finish().await.unwrap();
         let seen = kit.upstream.wait_seen(1).await;
-        assert_eq!(seen[0].body, b"chunkchunkchunkchunk");
+        assert_eq!(seen[0].body, b"chunkchunk");
         let ev = kit.request_event().await;
         assert_eq!(strs(&ev["addons"]), ["s"], "{ev:#}");
         assert!(
@@ -624,7 +621,7 @@ mod service {
         assert!(
             resets
                 .iter()
-                .any(|(_, m)| m.contains("past the stream's credit")),
+                .any(|(_, m)| m.contains("past the body's credit")),
             "{resets:?}"
         );
     }

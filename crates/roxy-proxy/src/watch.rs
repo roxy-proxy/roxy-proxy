@@ -51,6 +51,7 @@ use http_body::{Frame, SizeHint};
 use roxy_http::ws::frame::Message;
 use roxy_http::{Body, BodyError, CanonicalResponse};
 use roxy_rules::{Decision, Effect, EvalContext, Reads, RuleId, WatchState};
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::capture::Tap;
@@ -76,7 +77,8 @@ pub(crate) struct Summary {
 }
 
 /// Direction of a body or WebSocket chunk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Dir {
     /// Client to upstream.
     Request,

@@ -1,11 +1,14 @@
-//! Streams over pooled connections (`roxy.layer.v2`).
+//! Streams over pooled connections (`roxy.layer.v3`).
 //!
 //! Each endpoint has a small pool of WebSocket connections; each exchange
 //! is a stream on one of them. Text frames are JSON with a `stream` field;
-//! binary frames are a 4-byte big-endian stream id, then body bytes. Body
-//! bytes are flow-controlled per stream and direction by credit, so one
-//! slow body never holds up the connection: the reader hands each stream's
-//! bytes to that stream's own feeder and never waits on a consumer.
+//! binary frames are a 4-byte big-endian stream id, a direction byte
+//! (request or response body), then body bytes. The two bodies of a
+//! stream are fed independently, so a response head may arrive while the
+//! request body is still streaming. Body bytes are flow-controlled per
+//! stream, body and direction by credit, so one slow body never holds up
+//! the connection or the other body: the reader hands each body's bytes
+//! to its own feeder and never waits on a consumer.
 //!
 //! Broken framing fails the whole connection (every stream on it fails
 //! closed); anything else fails only its stream, which is reset.
@@ -41,9 +44,9 @@ use crate::upstream::MaybeTls;
 use crate::watch::Dir;
 
 /// The WebSocket subprotocol a service must accept.
-pub const SUBPROTOCOL: &str = "roxy.layer.v2";
+pub const SUBPROTOCOL: &str = "roxy.layer.v3";
 
-/// Each stream's starting credit, each way, in body bytes.
+/// Each body's starting credit, each way, in bytes.
 pub(super) const WINDOW: u64 = 256 * 1024;
 
 /// Largest control message or body frame accepted from a service.
@@ -254,9 +257,26 @@ fn text(stream: u32, m: &Out) -> Message {
     Message::text(serde_json::to_string(&Envelope { stream, msg: m }).unwrap_or_default())
 }
 
-fn binary(stream: u32, data: &[u8]) -> Message {
-    let mut b = BytesMut::with_capacity(4 + data.len());
+/// The direction byte of a binary frame.
+fn dir_byte(dir: Dir) -> u8 {
+    match dir {
+        Dir::Request => 0,
+        Dir::Response => 1,
+    }
+}
+
+fn dir_of(byte: u8) -> Option<Dir> {
+    match byte {
+        0 => Some(Dir::Request),
+        1 => Some(Dir::Response),
+        _ => None,
+    }
+}
+
+fn binary(stream: u32, dir: Dir, data: &[u8]) -> Message {
+    let mut b = BytesMut::with_capacity(5 + data.len());
     b.extend_from_slice(&stream.to_be_bytes());
+    b.extend_from_slice(&[dir_byte(dir)]);
     b.extend_from_slice(data);
     Message::binary(b.freeze())
 }
@@ -284,13 +304,9 @@ pub(super) struct Stream {
 struct StreamState {
     first: Option<oneshot::Sender<Result<First, ServiceError>>>,
     second: Option<oneshot::Sender<Result<LayerResponse, ServiceError>>>,
-    feeding: Option<Feeding>,
-    /// Body bytes received and not yet credited back.
-    unacked: u64,
-    /// Observe mode: bytes discarded since the last credit went back.
-    discarded: u64,
-    /// What roxy may still send: granted by the service.
-    credit: u64,
+    /// The request body and the response body, each on its own.
+    req: Feed,
+    res: Feed,
     /// Why an observe stream failed, for its driver to log.
     observe_error: Option<ServiceError>,
     slot: Option<Reservation>,
@@ -299,8 +315,44 @@ struct StreamState {
 }
 
 impl StreamState {
+    fn feed(&mut self, dir: Dir) -> &mut Feed {
+        match dir {
+            Dir::Request => &mut self.req,
+            Dir::Response => &mut self.res,
+        }
+    }
+
+    /// The service still owes something: an answer, or the end of a body
+    /// it is sending.
     fn waiting(&self) -> bool {
-        self.feeding.is_some() || self.first.is_some() || self.second.is_some()
+        self.req.inbox.is_some()
+            || self.res.inbox.is_some()
+            || self.first.is_some()
+            || self.second.is_some()
+    }
+}
+
+/// One body of a stream: what the service is sending of it, and the
+/// credit each way.
+struct Feed {
+    /// Being fed from the stream: its head arrived and its end has not.
+    inbox: Option<Arc<Inbox>>,
+    /// Bytes received and not yet credited back.
+    unacked: u64,
+    /// Observe mode: bytes discarded since the last credit went back.
+    discarded: u64,
+    /// What roxy may still send: granted by the service.
+    credit: u64,
+}
+
+impl Default for Feed {
+    fn default() -> Self {
+        Self {
+            inbox: None,
+            unacked: 0,
+            discarded: 0,
+            credit: WINDOW,
+        }
     }
 }
 
@@ -319,13 +371,6 @@ enum End<'a> {
     Abandoned(&'a str),
 }
 
-/// A body being fed from the stream.
-struct Feeding {
-    inbox: Arc<Inbox>,
-    /// Whose body it is.
-    dir: Dir,
-}
-
 /// Whether failing a stream tells the service (a `reset` message).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reset {
@@ -335,7 +380,7 @@ enum Reset {
 }
 
 /// Bytes for one body, between the reader and that body's feeder. At most
-/// the stream's credit is ever here.
+/// the body's credit is ever here.
 #[derive(Default)]
 struct Inbox {
     q: Mutex<InboxQ>,
@@ -369,7 +414,7 @@ impl Stream {
     /// waiting on it (a pending answer, the body being fed) learns how it
     /// ended.
     fn settle(&self, end: End<'_>) {
-        let (feeding, first, second, slot) = {
+        let (inboxes, first, second, slot) = {
             let mut s = lock(&self.state);
             if s.ended {
                 return;
@@ -381,7 +426,7 @@ impl Stream {
                 s.observe_error = Some(e.clone());
             }
             (
-                s.feeding.take(),
+                [s.req.inbox.take(), s.res.inbox.take()],
                 s.first.take(),
                 s.second.take(),
                 s.slot.take(),
@@ -405,8 +450,8 @@ impl Stream {
         if let Some(message) = reset {
             self.link.shared.send_ctl(self.id, &Out::Reset { message });
         }
-        if let Some(f) = feeding {
-            f.inbox.abort(&e);
+        for inbox in inboxes.into_iter().flatten() {
+            inbox.abort(&e);
         }
         if let Some(tx) = first {
             let _ = tx.send(Err(e));
@@ -450,17 +495,18 @@ impl Stream {
         }
     }
 
-    /// Waits for credit to send up to `want` body bytes.
-    async fn take_credit(&self, want: usize) -> Option<usize> {
+    /// Waits for credit to send up to `want` bytes of the `dir` body.
+    async fn take_credit(&self, dir: Dir, want: usize) -> Option<usize> {
         loop {
             let more = self.more_credit.notified();
             tokio::pin!(more);
             more.as_mut().enable();
             {
                 let mut s = lock(&self.state);
-                if s.credit > 0 {
-                    let n = want.min(usize::try_from(s.credit).unwrap_or(usize::MAX));
-                    s.credit -= n as u64;
+                let f = s.feed(dir);
+                if f.credit > 0 {
+                    let n = want.min(usize::try_from(f.credit).unwrap_or(usize::MAX));
+                    f.credit -= n as u64;
                     return Some(n);
                 }
             }
@@ -473,18 +519,22 @@ impl Stream {
 
     /// Streams one message to the service: head, body frames (as credit
     /// allows), end. False if it did not get it all out.
-    pub(super) async fn pump(&self, head: Out, body: Body, end: Out) -> bool {
+    pub(super) async fn pump(&self, dir: Dir, head: Out, body: Body) -> bool {
         if !self.send(&head).await {
             return false;
         }
         // Nothing to read (and an empty observer copy may never be ended).
-        if body.known_length() != Some(0) && !self.pump_body(body).await {
+        if body.known_length() != Some(0) && !self.pump_body(dir, body).await {
             return false;
         }
+        let end = match dir {
+            Dir::Request => Out::RequestEnd,
+            Dir::Response => Out::ResponseEnd,
+        };
         self.send(&end).await
     }
 
-    async fn pump_body(&self, mut body: Body) -> bool {
+    async fn pump_body(&self, dir: Dir, mut body: Body) -> bool {
         use http_body::Body as _;
         loop {
             let frame =
@@ -502,12 +552,12 @@ impl Stream {
                 },
             };
             while !d.is_empty() {
-                let Some(n) = self.take_credit(d.len().min(MAX_BODY_FRAME)).await else {
+                let Some(n) = self.take_credit(dir, d.len().min(MAX_BODY_FRAME)).await else {
                     return false;
                 };
                 let part = d.split_to(n);
                 let sent = tokio::select! {
-                    r = self.link.data.send(binary(self.id, &part)) => r.is_ok(),
+                    r = self.link.data.send(binary(self.id, dir, &part)) => r.is_ok(),
                     () = self.ended.cancelled() => false,
                 };
                 if !sent {
@@ -517,8 +567,8 @@ impl Stream {
         }
     }
 
-    /// Credit back to the service for `n` bytes consumed.
-    fn grant(&self, n: u64) {
+    /// Credit back to the service for `n` bytes of the `dir` body consumed.
+    fn grant(&self, dir: Dir, n: u64) {
         if n == 0 {
             return;
         }
@@ -527,54 +577,59 @@ impl Stream {
             if s.ended {
                 return;
             }
-            s.unacked = s.unacked.saturating_sub(n);
+            let f = s.feed(dir);
+            f.unacked = f.unacked.saturating_sub(n);
         }
         self.link
             .shared
-            .send_ctl(self.id, &Out::Credit { bytes: n });
+            .send_ctl(self.id, &Out::Credit { dir, bytes: n });
     }
 
-    /// Body bytes from the service. They count against the stream's
-    /// window in either mode. An observe stream's are discarded and
+    /// Bytes of the `dir` body from the service. They count against that
+    /// body's window in either mode. An observe stream's are discarded and
     /// credited back as they go, in steps: the service never waits on
     /// what it sends, and since it may only send what roxy has credited,
     /// the credit waiting for a stalled socket stays within the window.
-    fn bytes(self: &Arc<Self>, b: &[u8]) {
+    fn bytes(self: &Arc<Self>, dir: Dir, b: &[u8]) {
         if b.is_empty() {
             return;
         }
         let n = b.len() as u64;
         let mut s = lock(&self.state);
-        let inbox = s.feeding.as_ref().map(|f| f.inbox.clone());
+        let feed = s.feed(dir);
+        let inbox = feed.inbox.clone();
         if inbox.is_none() && self.mode == AddonMode::Enforce {
             drop(s);
             return self.fail(
-                ServiceError::Protocol("body bytes before a head".into()),
+                ServiceError::Protocol(format!("{} body bytes before its head", dir.as_str())),
                 Reset::Send,
             );
         }
-        if s.unacked + n > WINDOW {
+        if feed.unacked + n > WINDOW {
             drop(s);
             return self.fail(
-                ServiceError::Protocol("body bytes past the stream's credit".into()),
+                ServiceError::Protocol(format!(
+                    "{} body bytes past the body's credit",
+                    dir.as_str()
+                )),
                 Reset::Send,
             );
         }
-        s.unacked += n;
+        feed.unacked += n;
         let Some(inbox) = inbox else {
-            s.discarded += n;
-            if s.discarded < OBSERVE_GRANT {
+            feed.discarded += n;
+            if feed.discarded < OBSERVE_GRANT {
                 return;
             }
-            let granted = std::mem::take(&mut s.discarded);
+            let granted = std::mem::take(&mut feed.discarded);
             drop(s);
-            return self.grant(granted);
+            return self.grant(dir, granted);
         };
         drop(s);
         let mut q = lock(&inbox.q);
         if q.dropped {
             drop(q);
-            self.grant(n);
+            self.grant(dir, n);
         } else {
             q.buf.extend_from_slice(b);
             drop(q);
@@ -585,10 +640,11 @@ impl Stream {
     /// A control message from the service.
     fn control(self: &Arc<Self>, m: In) {
         match m {
-            In::Credit { bytes } => {
+            In::Credit { dir, bytes } => {
                 {
                     let mut s = lock(&self.state);
-                    s.credit = s.credit.saturating_add(bytes);
+                    let f = s.feed(dir);
+                    f.credit = f.credit.saturating_add(bytes);
                 }
                 self.more_credit.notify_waiters();
                 return;
@@ -620,24 +676,20 @@ impl Stream {
         let limits = &self.st.snap.limits;
         match m {
             In::RequestEnd | In::ResponseEnd => {
-                let dir = if matches!(m, In::RequestEnd) {
-                    Dir::Request
+                let (dir, what) = if matches!(m, In::RequestEnd) {
+                    (Dir::Request, "request_end")
                 } else {
-                    Dir::Response
+                    (Dir::Response, "response_end")
                 };
-                match s.feeding.take() {
-                    Some(f) if f.dir == dir => {
-                        lock(&f.inbox.q).end = true;
-                        f.inbox.ready.notify_one();
+                match s.feed(dir).inbox.take() {
+                    Some(inbox) => {
+                        lock(&inbox.q).end = true;
+                        inbox.ready.notify_one();
                         Ok(())
                     }
-                    _ if dir == Dir::Request => Err(unexpected("request_end")),
-                    _ => Err(unexpected("response_end")),
+                    None => Err(unexpected(what)),
                 }
             }
-            _ if s.feeding.is_some() => Err(ServiceError::Protocol(
-                "a new head before the previous body ended".into(),
-            )),
             In::Request {
                 method,
                 url,
@@ -660,7 +712,7 @@ impl Stream {
                 *r.method_mut() = method;
                 *r.uri_mut() = uri;
                 *r.headers_mut() = headers;
-                s.feeding = Some(self.feed(body_tx, Dir::Request));
+                s.req.inbox = Some(self.feed(body_tx, Dir::Request));
                 if let Some(tx) = s.first.take() {
                     let _ = tx.send(Ok(First::Forward(r)));
                 }
@@ -683,7 +735,7 @@ impl Stream {
                 *r.status_mut() = status;
                 *r.headers_mut() = headers;
                 Self::give(s, r, "response")?;
-                s.feeding = Some(self.feed(body_tx, Dir::Response));
+                s.res.inbox = Some(self.feed(body_tx, Dir::Response));
                 Ok(())
             }
             In::Deny { status, message } => {
@@ -713,11 +765,11 @@ impl Stream {
         }
     }
 
-    /// Starts feeding a body from the stream.
-    fn feed(self: &Arc<Self>, tx: BodySender, dir: Dir) -> Feeding {
+    /// Starts feeding the `dir` body from the stream.
+    fn feed(self: &Arc<Self>, tx: BodySender, dir: Dir) -> Arc<Inbox> {
         let inbox = Arc::new(Inbox::default());
         tokio::spawn(feeder(self.clone(), inbox.clone(), tx, dir));
-        Feeding { inbox, dir }
+        inbox
     }
 }
 
@@ -740,7 +792,7 @@ async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodySender, dir:
                 () = inbox.abort.cancelled() => continue,
             };
             match sent {
-                Ok(()) => stream.grant(n),
+                Ok(()) => stream.grant(dir, n),
                 Err(BodyError::Closed | BodyError::Stopped) => {
                     if dir == Dir::Request {
                         // A deny below, say: the rest is read and dropped,
@@ -750,7 +802,7 @@ async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodySender, dir:
                             q.dropped = true;
                             q.buf.split().len() as u64
                         };
-                        stream.grant(n + rest);
+                        stream.grant(dir, n + rest);
                     } else {
                         stream.reset("the client went away");
                     }
@@ -870,7 +922,6 @@ pub(super) async fn open(
             index,
             mode,
             state: Mutex::new(StreamState {
-                credit: WINDOW,
                 slot: Some(slot),
                 ..state
             }),
@@ -1041,18 +1092,22 @@ async fn read(shared: Arc<LinkShared>, mut ws: SplitStream<Ws>) {
             }
             Some(Err(e)) => break ServiceError::Closed(e.to_string()),
             Some(Ok(Message::Binary(b))) => {
-                if b.len() < 4 {
-                    break framing("a binary frame shorter than its stream id");
+                if b.len() < 5 {
+                    break framing("a binary frame shorter than its stream id and direction");
                 }
                 let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+                let Some(dir) = dir_of(b[4]) else {
+                    break framing("a binary frame with an unknown direction");
+                };
                 route(&shared, id).map(|s| match s {
-                    Some(s) => s.bytes(&b[4..]),
+                    Some(s) => s.bytes(dir, &b[5..]),
                     // Ignored, and credited back, so a service still
                     // sending when the stream ended is never stalled.
-                    None if b.len() > 4 => shared.send_ctl(
+                    None if b.len() > 5 => shared.send_ctl(
                         id,
                         &Out::Credit {
-                            bytes: (b.len() - 4) as u64,
+                            dir,
+                            bytes: (b.len() - 5) as u64,
                         },
                     ),
                     None => {}
@@ -1134,6 +1189,102 @@ mod tests {
         })
     }
 
+    /// An enforce stream on a link with nothing behind it, with the
+    /// answers an exchange would wait on. What the stream sends goes
+    /// nowhere.
+    async fn lone_stream() -> (Arc<Stream>, Answers, crate::testkit::Kit) {
+        let kit = testing::kit(
+            ALLOW_UP,
+            vec![testing::addon("s", "pass", AddonMode::Enforce, |_| {})],
+        )
+        .await;
+        let (st, _cx) = crate::addons::test_flow(&kit);
+        let (first_tx, first) = oneshot::channel();
+        let (second_tx, second) = oneshot::channel();
+        let link = failed_link();
+        let stream = Arc::new(Stream {
+            id: 1,
+            link: link.clone(),
+            st,
+            index: 0,
+            mode: AddonMode::Enforce,
+            state: Mutex::new(StreamState {
+                first: Some(first_tx),
+                second: Some(second_tx),
+                ..StreamState::default()
+            }),
+            more_credit: Notify::new(),
+            ended: CancellationToken::new(),
+        });
+        lock(&link.shared.streams).open.insert(1, stream.clone());
+        (stream, Answers { first, second }, kit)
+    }
+
+    fn request_head() -> In {
+        In::Request {
+            method: "POST".to_owned(),
+            url: "http://up.test/x".to_owned(),
+            headers: Vec::new(),
+        }
+    }
+
+    /// The service's response head is taken while the request body it is
+    /// forwarding is still streaming; each body's bytes reach their own
+    /// consumer, and the stream ends once both have.
+    #[tokio::test]
+    async fn a_response_head_arrives_while_the_request_body_streams() {
+        let (stream, answers, _kit) = lone_stream().await;
+        stream.control(request_head());
+        let First::Forward(req) = answers.first.await.unwrap().unwrap() else {
+            panic!("the request is forwarded");
+        };
+        stream.bytes(Dir::Request, b"up");
+        stream.control(In::Response {
+            status: 200,
+            headers: Vec::new(),
+        });
+        let res = tokio::time::timeout(Duration::from_millis(100), answers.second)
+            .await
+            .expect("the response head is not held behind the request body")
+            .unwrap()
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        stream.bytes(Dir::Response, b"down");
+        stream.control(In::ResponseEnd);
+        assert_eq!(
+            res.into_body().collect_up_to(u64::MAX).await.unwrap(),
+            &b"down"[..]
+        );
+        assert!(!lock(&stream.state).ended, "the request body is still owed");
+        stream.bytes(Dir::Request, b"load");
+        stream.control(In::RequestEnd);
+        assert_eq!(
+            req.into_body().collect_up_to(u64::MAX).await.unwrap(),
+            &b"upload"[..]
+        );
+        assert!(lock(&stream.state).ended);
+    }
+
+    /// Bytes are owed to a head in their own direction: response bytes
+    /// while only the request body is being fed fail the stream.
+    #[tokio::test]
+    async fn bytes_of_a_body_without_a_head_fail_the_stream() {
+        let (stream, answers, _kit) = lone_stream().await;
+        stream.control(request_head());
+        let First::Forward(req) = answers.first.await.unwrap().unwrap() else {
+            panic!("the request is forwarded");
+        };
+        stream.bytes(Dir::Response, b"early");
+        assert!(lock(&stream.state).ended);
+        assert!(req.into_body().collect_up_to(u64::MAX).await.is_err());
+        let e = answers.second.await.unwrap().unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("response body bytes before its head"),
+            "{e}"
+        );
+    }
+
     /// A connection that failed keeps its place in the pool while streams
     /// still hold it; the pool opens another only once they are gone.
     #[tokio::test]
@@ -1186,7 +1337,7 @@ mod tests {
         let (first, _) = open(&st, 0, svc, AddonMode::Enforce).await.unwrap();
         // The service never reads: the writer stalls on the socket, and
         // the queue behind it fills.
-        let frame = binary(first.id, &vec![0u8; MAX_BODY_FRAME]);
+        let frame = binary(first.id, Dir::Request, &vec![0u8; MAX_BODY_FRAME]);
         loop {
             while first.link.data.try_send(frame.clone()).is_ok() {}
             tokio::time::sleep(Duration::from_millis(50)).await;

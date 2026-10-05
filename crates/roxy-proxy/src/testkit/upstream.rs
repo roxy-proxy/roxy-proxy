@@ -149,7 +149,7 @@ impl Upstream {
     /// * `/echo`: reads the body, answers with the same bytes, with
     ///   `content-encoding` set to the request's `x-echo-encoding` and the
     ///   status to its `x-echo-status` (default `200`);
-    /// * a `roxy.layer.v2` handshake: the in-test service layer endpoint
+    /// * a `roxy.layer.v3` handshake: the in-test service layer endpoint
     ///   ([`service`]);
     /// * a WebSocket upgrade: `101`, then echoes bytes; with
     ///   `x-echo: once`, echoes the first read and closes; with

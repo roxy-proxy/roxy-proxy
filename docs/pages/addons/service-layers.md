@@ -28,7 +28,7 @@ refused on a WASM layer.
 
 roxy keeps a few long-lived WebSocket connections to each service endpoint
 and carries many exchanges over each one, as **streams**. The subprotocol is
-`roxy.layer.v2`; a service that does not accept it fails the handshake.
+`roxy.layer.v3`; a service that does not accept it fails the handshake.
 The URL is the endpoint's (`http` → `ws`, `https` → `wss`, with the
 upstream's certificate verification). It is dialled through the connector,
 so the address floor and deny lists apply, and it never passes through
@@ -58,8 +58,9 @@ once, a busy one when its last exchange ends.
 ### Frames
 
 Text frames are JSON control messages, each with a `stream` field. Binary
-frames are body bytes: a 4-byte big-endian stream id, then the bytes, which
-belong to the message whose head came last on that stream. roxy numbers the
+frames are body bytes: a 4-byte big-endian stream id, one direction byte
+(`0` for the request body, `1` for the response body), then the bytes,
+which belong to that stream's head in that direction. roxy numbers the
 streams on a connection from 1 upward and never reuses a number.
 
 A stream opens with an `open` message from roxy, carrying the exchange's
@@ -90,7 +91,7 @@ then, if it forwarded:
 roxy → service   {"type":"response","status":…,"headers":[…]}  bytes…  {"type":"response_end"}
 service → roxy   {"type":"response",…}  bytes…  {"type":"response_end"}   the client's response
                  or {"type":"deny",…}
-either way       {"type":"credit","bytes":n}                              flow control (below)
+either way       {"type":"credit","dir":"request"|"response","bytes":n}  flow control (below)
                  {"type":"reset","message":"…"}                           abandon the stream
 ```
 
@@ -99,19 +100,23 @@ them (no hop-by-hop or framing fields). Heads carry `content-length` when
 the length is known; a `content-length` the service sends back is enforced,
 and more or fewer bytes than declared is a protocol violation.
 
-**Order on a stream.** Body frames carry only a stream id, so on each
-stream, in each direction, the messages are strictly in the order above: a
-head, its bytes, its end, then the next head. roxy sends its `response`
-head only after its `request_end`, even when the layer below answered
-while the client was still uploading, and a service must do the same
-(a `response` before `request_end` is a protocol violation). The two
-directions are independent: the service may start forwarding the request
+**Order on a stream.** The request body and the response body are
+independent on a stream. Within each, from each side, the messages are
+strictly in the order above: the head, its bytes, its end. Between them
+there is no order: roxy sends its `response` head as soon as the layer
+below answers, even while the client's body is still arriving, and a
+service may send its `response` (or `deny`) while it is still forwarding
+the request body, so an early answer reaches the client at once. Bytes
+before their head, or after their end, are a protocol violation. The two
+sides are independent too: the service may start forwarding the request
 before the client's body has ended, and roxy forwards it as it arrives.
 
-**End of a stream.** A stream ends with the service's last message: the
-`response_end` of the client's response, or a `deny`. roxy sends nothing
-more on it after that (a request body the service did not wait for is not
-sent on). Either side may end a stream early with `reset`. roxy resets a
+**End of a stream.** A stream ends when the service has sent its last
+message: the `response_end` of the client's response (or a `deny`), and
+the `request_end` of the request it forwarded, if it was still sending
+that. roxy sends nothing more on it after that (a request body the
+service did not wait for is not sent on). Either side may end a stream
+early with `reset`. roxy resets a
 stream when the client goes away, a deadline passes, the service broke the
 protocol on it, or the upstream switched protocols (a `101`). A service
 that resets an enforce stream fails that exchange closed. Each side
@@ -119,14 +124,17 @@ ignores messages that arrive for a stream it has already ended; roxy still
 credits back the body bytes among them, so a service that was mid-send
 when the stream ended is not left waiting for credit.
 
-**Flow control.** Body bytes are flow-controlled per stream, in each
-direction, so a slow body on one stream does not hold up the others. Each
-stream starts with 256 KiB of credit each way. The receiver grants more
-with `{"type":"credit","stream":…,"bytes":n}` as it consumes what it got;
-the sender may have no more body bytes outstanding than it has been granted.
-roxy grants credit as the layer below (or the client) reads what the
-service sent. A service that sends past its credit breaks the protocol on
-that stream. Control messages are not counted.
+**Flow control.** Body bytes are flow-controlled per stream and per body,
+each way, so a slow body holds up neither the other streams nor the other
+body of its own stream (a client that reads nothing until its upload is
+done, say, does not stall the upload). Each body of a stream starts with
+256 KiB of credit each way. The receiver grants more with
+`{"type":"credit","stream":…,"dir":"request"|"response","bytes":n}` as it
+consumes what it got; the sender may have no more bytes of that body
+outstanding than it has been granted. roxy grants credit as the layer
+below (or the client) reads what the service sent. A service that sends
+past its credit breaks the protocol on that stream. Control messages are
+not counted.
 
 - **What the service forwards gets the same checks as a WASM layer's
   `next`**: re-validated as strictly as a client request, then judged by the
@@ -134,9 +142,8 @@ that stream. Control messages are not counted.
 - **Deadlines.** `first_byte_timeout` bounds getting a stream (connecting,
   or waiting for a free one) and each of the service's heads: its first
   answer, from roxy's `request` head, and its second, from roxy's
-  `response` head (which follows `request_end`). A stream has no overall
-  clock: bodies stream for as long as they take, and an upstream that
-  answers early waits for the upload to finish.
+  `response` head. A stream has no overall clock: bodies stream for as
+  long as they take.
 - **Failure is closed** in enforce mode: a failed connection or handshake,
   a protocol violation (bad JSON, a message out of order, bytes before a
   head, an invalid head, a broken length, bytes past the credit), a missed
@@ -148,8 +155,9 @@ that stream. Control messages are not counted.
 - **One stream's failure is its own.** A violation on one stream resets
   that stream only; the connection and its other streams carry on. Broken
   framing fails the whole connection: a text frame that is not a JSON
-  object with a valid `stream`, a binary frame shorter than its 4-byte
-  prefix, or a stream id roxy never opened. Every exchange on it then fails
+  object with a valid `stream`, a binary frame shorter than its 5-byte
+  prefix or with an unknown direction byte, or a stream id roxy never
+  opened. Every exchange on it then fails
   closed (`service:protocol`), and roxy closes it.
 - **Observe mode** uses the same streams: the service gets the same
   messages for copies of both directions, and whatever it sends back other
@@ -159,7 +167,7 @@ that stream. Control messages are not counted.
   a stream whose copies fall behind it is cut and reset on its own
   (`observer_lagged`). Waiting for credit is falling behind, so a service
   that wants whole copies of large bodies grants extra credit as an observe
-  stream opens (`roxy_layer.py` grants 16 MiB). Body bytes the service
+  stream opens (`roxy_layer.py` grants 16 MiB to each body). Body bytes the service
   sends on an observe stream are discarded, and credited back in steps of
   64 KiB as they are, so the service never waits on its own answers;
   sending past its credit is a protocol violation, as on any stream.

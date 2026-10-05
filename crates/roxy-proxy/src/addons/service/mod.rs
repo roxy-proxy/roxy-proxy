@@ -1,6 +1,6 @@
 //! Service layers: an external service in the network path.
 //!
-//! Each exchange is a stream (`roxy.layer.v2`) on one of a few pooled
+//! Each exchange is a stream (`roxy.layer.v3`) on one of a few pooled
 //! WebSocket connections to the layer's named endpoint ([`mux`]). roxy
 //! streams the request into it as it arrives; the service streams back
 //! the request to forward (or answers itself, or denies); roxy forwards
@@ -16,6 +16,10 @@
 //! roxy → service   {"type":"response", status, headers}  bytes…  response_end
 //! service → roxy   {"type":"response", …} bytes… response_end | {"type":"deny", …}
 //! ```
+//!
+//! The request and response bodies are independent: a response head goes
+//! (either way) as soon as there is one, even while the request body is
+//! still streaming.
 //!
 //! What the service forwards is held to the same checks as a WASM layer's
 //! `next` (re-validated as strictly as a client request, then judged by
@@ -37,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant as TokioInstant;
 
 use super::{AddonMode, StackError, StackFlow};
+use crate::watch::Dir;
 
 pub(crate) use mux::Pools;
 pub use mux::SUBPROTOCOL;
@@ -47,8 +52,8 @@ pub struct ServiceSpec {
     /// The addon's endpoint the exchange streams through.
     pub endpoint: String,
     /// From asking for a stream until the service's first head (or
-    /// decision), and again from sending the response head (after the
-    /// request's end) until its second. Bodies have no clock.
+    /// decision), and again from sending the response head until its
+    /// second. Bodies have no clock.
     pub first_byte_timeout: Duration,
     /// Connections to the endpoint, at most.
     pub max_connections: usize,
@@ -116,6 +121,7 @@ enum Out {
     },
     ResponseEnd,
     Credit {
+        dir: Dir,
         bytes: u64,
     },
     Reset {
@@ -147,6 +153,7 @@ enum In {
         message: Option<String>,
     },
     Credit {
+        dir: Dir,
         bytes: u64,
     },
     Reset {
@@ -306,7 +313,7 @@ async fn run(
     let (parts, body) = req.into_parts();
     let s = stream.clone();
     let head = request_head(&parts, &body);
-    let request_sent = tokio::spawn(async move { s.pump(head, body, Out::RequestEnd).await });
+    tokio::spawn(async move { s.pump(Dir::Request, head, body).await });
 
     let first = tokio::time::timeout_at(start + svc.first_byte_timeout, answers.first)
         .await
@@ -329,15 +336,13 @@ async fn run(
         stream.reset("the upstream switched protocols");
         return Ok(res);
     }
-    // Body frames carry only a stream id, so the response head waits for
-    // `request_end`: until then the service would read response bytes as
-    // the request's. Its clock starts when the head goes.
-    let _ = request_sent.await;
+    // The response head goes at once, however far the client's upload
+    // has got; the service's second clock starts with it.
     let sent = TokioInstant::now();
     let (parts, body) = res.into_parts();
     let s = stream.clone();
     let head = response_head(&parts, &body);
-    tokio::spawn(async move { s.pump(head, body, Out::ResponseEnd).await });
+    tokio::spawn(async move { s.pump(Dir::Response, head, body).await });
     let res = tokio::time::timeout_at(sent + svc.first_byte_timeout, answers.second)
         .await
         .map_err(|_| ServiceError::Timeout("first_byte_timeout"))?
@@ -391,22 +396,22 @@ pub(super) async fn observe(
             return Err(e);
         }
     };
+    // The copies go as the real exchange does: a response that comes
+    // while the request copy is still streaming is not held behind it.
     let (parts, body) = req.into_parts();
-    let sent = stream
-        .pump(request_head(&parts, &body), body, Out::RequestEnd)
-        .await;
+    let s = stream.clone();
+    let head = request_head(&parts, &body);
+    let request = tokio::spawn(async move { s.pump(Dir::Request, head, body).await });
     match next.response().await {
-        Ok(res) if sent => {
+        Ok(res) => {
             let (parts, body) = res.into_parts();
             stream
-                .pump(response_head(&parts, &body), body, Out::ResponseEnd)
+                .pump(Dir::Response, response_head(&parts, &body), body)
                 .await;
         }
-        // The stream ended early: the response copy is still read, so the
-        // tee does not count this direction as lagging too.
-        Ok(res) => drain(res.into_body()).await,
         Err(_) => stream.reset("the exchange ended"),
     }
+    let _ = request.await;
     stream.finish()
 }
 
