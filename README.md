@@ -25,8 +25,6 @@ It fails closed: anything roxy cannot parse, verify or classify is denied.
 
 - [Quickstart](https://roxy-proxy.github.io/roxy-proxy/quickstart): Claude
   Code behind roxy and an inspect_sentinel sidecar, in about five minutes
-- [Use cases](https://roxy-proxy.github.io/roxy-proxy/use-cases/ai-agents):
-  AI agents, CI jobs
 - [Configure policies](https://roxy-proxy.github.io/roxy-proxy/policies/overview),
   [addons](https://roxy-proxy.github.io/roxy-proxy/addons/overview),
   [deploy](https://roxy-proxy.github.io/roxy-proxy/deploy/overview) and
