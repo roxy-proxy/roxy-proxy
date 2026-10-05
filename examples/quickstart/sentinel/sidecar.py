@@ -1,6 +1,6 @@
 """inspect_sentinel at the network boundary: a roxy service layer.
 
-Every exchange streams through this sidecar (roxy.layer.v2). For an
+Every exchange streams through this sidecar (roxy.layer.v3). For an
 Anthropic Messages call (`POST .../v1/messages`) it forwards the request,
 reads the model's response, turns each tool call in it into an
 inspect_sentinel `BeforeToolCall` step, and runs the configured sentinel on

@@ -1,6 +1,6 @@
 //! End-to-end tests of service layers: `roxy run` with `kind: service`
 //! addons whose exchanges stream through an in-test service over
-//! `roxy.layer.v2`. The service's behaviour is picked by its URL path (one
+//! `roxy.layer.v3`. The service's behaviour is picked by its URL path (one
 //! per connection), and for `/mixed` by the request's path (per stream).
 
 mod support;
@@ -27,10 +27,56 @@ const ALLOW_UPSTREAM: &str = r#"
     then: { allow: { private_ok: true } }
 "#;
 
-/// Each stream's starting credit, each way.
+/// Each body's starting credit, each way.
 const WINDOW: u64 = 256 * 1024;
 
-/// Extra credit granted to an observe stream as it opens, so roxy can
+/// Which body a binary frame or a `credit` is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Dir {
+    Request,
+    Response,
+}
+
+impl Dir {
+    fn byte(self) -> u8 {
+        match self {
+            Dir::Request => 0,
+            Dir::Response => 1,
+        }
+    }
+
+    fn of_byte(b: u8) -> Self {
+        match b {
+            0 => Dir::Request,
+            1 => Dir::Response,
+            _ => panic!("unknown direction byte {b}"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Dir::Request => "request",
+            Dir::Response => "response",
+        }
+    }
+
+    fn of_name(n: &str) -> Self {
+        match n {
+            "request" => Dir::Request,
+            "response" => Dir::Response,
+            _ => panic!("unknown direction {n}"),
+        }
+    }
+
+    fn end(self) -> &'static str {
+        match self {
+            Dir::Request => "request_end",
+            Dir::Response => "response_end",
+        }
+    }
+}
+
+/// Extra credit granted to each body of an observe stream as it opens, so roxy can
 /// send the copies on without waiting (an observer that falls behind is
 /// cut).
 const OBSERVE_CREDIT: u64 = 16 * 1024 * 1024;
@@ -98,14 +144,15 @@ impl SvcState {
 /// The next message on a stream.
 enum Got {
     Ctl(Value),
-    Bytes(Vec<u8>),
+    Bytes(Dir, Vec<u8>),
     End,
 }
 
-/// What a connection's streams share: the way out, and roxy's credit.
+/// What a connection's streams share: the way out, and roxy's credit per
+/// stream and body.
 struct ConnOut {
     tx: mpsc::UnboundedSender<Message>,
-    credit: Mutex<HashMap<u64, u64>>,
+    credit: Mutex<HashMap<(u64, Dir), u64>>,
     more: Notify,
     kill: Notify,
 }
@@ -122,8 +169,8 @@ struct Sess {
 impl Sess {
     async fn recv(&mut self) -> Got {
         let g = self.rx.recv().await.unwrap_or(Got::End);
-        if let Got::Bytes(b) = &g {
-            self.send(json!({"type": "credit", "bytes": b.len()}));
+        if let Got::Bytes(dir, b) = &g {
+            self.send(json!({"type": "credit", "dir": dir.name(), "bytes": b.len()}));
         }
         g
     }
@@ -137,19 +184,20 @@ impl Sess {
         let _ = self.out.tx.send(m);
     }
 
-    fn frame(&self, b: &[u8]) -> Message {
+    fn frame(&self, dir: Dir, b: &[u8]) -> Message {
         let mut f = u32::try_from(self.id).unwrap().to_be_bytes().to_vec();
+        f.push(dir.byte());
         f.extend_from_slice(b);
         Message::binary(f)
     }
 
-    /// Sends body bytes as roxy's credit allows.
-    async fn send_bytes(&self, mut b: &[u8]) {
+    /// Sends bytes of the `dir` body as roxy's credit allows.
+    async fn send_bytes(&self, dir: Dir, mut b: &[u8]) {
         while !b.is_empty() {
             let more = self.out.more.notified();
             let n = {
                 let mut c = self.out.credit.lock().unwrap();
-                let have = c.entry(self.id).or_insert(WINDOW);
+                let have = c.entry((self.id, dir)).or_insert(WINDOW);
                 let n = usize::try_from(*have).unwrap().min(b.len()).min(32 * 1024);
                 *have -= n as u64;
                 n
@@ -158,7 +206,7 @@ impl Sess {
                 more.await;
                 continue;
             }
-            self.raw(self.frame(&b[..n]));
+            self.raw(self.frame(dir, &b[..n]));
             b = &b[n..];
         }
     }
@@ -177,39 +225,35 @@ async fn whole(s: &mut Sess) -> (Value, Vec<u8>) {
     let mut body = Vec::new();
     loop {
         match s.recv().await {
-            Got::Bytes(b) => body.extend(b),
+            Got::Bytes(_, b) => body.extend(b),
             Got::Ctl(_) => return (head, body),
             Got::End => panic!("closed mid-message"),
         }
     }
 }
 
-/// Sends a whole message back: head, body (if any), end.
-async fn send_whole(s: &Sess, head: Value, body: &[u8], end: &str) {
+/// Sends a whole `dir` message back: head, body (if any), end.
+async fn send_whole(s: &Sess, dir: Dir, head: Value, body: &[u8]) {
     s.send(head);
-    s.send_bytes(body).await;
-    s.send(json!({ "type": end }));
+    s.send_bytes(dir, body).await;
+    s.send(json!({ "type": dir.end() }));
 }
 
 /// Forwards every message as it arrives, applying `f` to heads and `g` to
 /// response bytes. True if it got through to the response's end.
 async fn relay(s: &mut Sess, f: impl Fn(Value) -> Value, g: impl Fn(Vec<u8>) -> Vec<u8>) -> bool {
-    let mut in_response = false;
     loop {
         match s.recv().await {
             Got::Ctl(v) => {
-                if v["type"] == "response" {
-                    in_response = true;
-                }
                 let end = v["type"] == "response_end";
                 s.send(f(v));
                 if end {
                     return true;
                 }
             }
-            Got::Bytes(b) => {
-                let b = if in_response { g(b) } else { b };
-                s.send_bytes(&b).await;
+            Got::Bytes(dir, b) => {
+                let b = if dir == Dir::Response { g(b) } else { b };
+                s.send_bytes(dir, &b).await;
             }
             Got::End => return false,
         }
@@ -244,7 +288,7 @@ async fn session(path: &str, mut s: Sess) {
         }
         "/deny-response" => {
             let (head, body) = whole(&mut s).await;
-            send_whole(&s, head, &body, "request_end").await;
+            send_whole(&s, Dir::Request, head, &body).await;
             let _ = whole(&mut s).await;
             s.send(json!({"type": "deny", "message": "not this answer"}));
         }
@@ -252,7 +296,7 @@ async fn session(path: &str, mut s: Sess) {
             let _ = s.recv().await;
             let head =
                 json!({"type": "response", "status": 200, "headers": [["x-from", "service"]]});
-            send_whole(&s, head, b"made up", "response_end").await;
+            send_whole(&s, Dir::Response, head, b"made up").await;
         }
         // Broken framing: fails the connection.
         "/garbage" => {
@@ -261,7 +305,7 @@ async fn session(path: &str, mut s: Sess) {
         }
         "/out-of-order" => {
             let _ = s.recv().await;
-            s.raw(s.frame(b"bytes first"));
+            s.raw(s.frame(Dir::Request, b"bytes first"));
         }
         "/bad-head" => {
             let _ = s.recv().await;
@@ -273,7 +317,7 @@ async fn session(path: &str, mut s: Sess) {
             let _ = whole(&mut s).await;
             let head = json!({"type": "request", "method": "POST", "url": "http://upstream.test/x",
                 "headers": [["content-length", "3"], ["transfer-encoding", "chunked"]]});
-            send_whole(&s, head, b"abc", "request_end").await;
+            send_whole(&s, Dir::Request, head, b"abc").await;
         }
         "/slow" => tokio::time::sleep(Duration::from_secs(5)).await,
         // roxy refuses the handshake (no subprotocol); nothing to do.
@@ -287,7 +331,7 @@ async fn session(path: &str, mut s: Sess) {
             // Undeclared length, so only the lost connection is wrong.
             head["headers"] = json!([]);
             s.send(head);
-            s.send_bytes(b"partial").await;
+            s.send_bytes(Dir::Request, b"partial").await;
             tokio::time::sleep(Duration::from_millis(200)).await;
             s.kill();
         }
@@ -295,17 +339,17 @@ async fn session(path: &str, mut s: Sess) {
         "/too-long" => {
             let (mut head, _) = whole(&mut s).await;
             head["headers"] = json!([["content-length", "3"]]);
-            send_whole(&s, head, b"too long", "request_end").await;
+            send_whole(&s, Dir::Request, head, b"too long").await;
         }
         // Passes the request on, then cuts the response short.
         "/drop-response" => {
             let (head, body) = whole(&mut s).await;
-            send_whole(&s, head, &body, "request_end").await;
+            send_whole(&s, Dir::Request, head, &body).await;
             let Got::Ctl(head) = s.recv().await else {
                 return;
             };
             s.send(head);
-            s.send_bytes(b"{\"partial\":").await;
+            s.send_bytes(Dir::Response, b"{\"partial\":").await;
             tokio::time::sleep(Duration::from_millis(200)).await;
             s.kill();
         }
@@ -347,13 +391,16 @@ async fn mixed(mut s: Sess) {
         "/big" => {
             let head = json!({"type": "response", "status": 200,
                 "headers": [["content-length", "1048576"]]});
-            send_whole(&s, head, &vec![b'x'; 1 << 20], "response_end").await;
+            send_whole(&s, Dir::Response, head, &vec![b'x'; 1 << 20]).await;
         }
         // Sends four windows' worth, on credit, then says so.
         "/flood" => {
             s.send(json!({"type": "response", "status": 200}));
-            s.send_bytes(&vec![b'f'; 4 * usize::try_from(WINDOW).unwrap()])
-                .await;
+            s.send_bytes(
+                Dir::Response,
+                &vec![b'f'; 4 * usize::try_from(WINDOW).unwrap()],
+            )
+            .await;
             s.send(json!({"type": "response_end"}));
             s.st.echoed.lock().unwrap().push(s.id);
             s.st.changed.notify_waiters();
@@ -361,7 +408,10 @@ async fn mixed(mut s: Sess) {
         "/overrun" => {
             s.send(json!({"type": "response", "status": 200}));
             // One frame larger than the whole window.
-            s.raw(s.frame(&vec![b'x'; usize::try_from(WINDOW).unwrap() + 1]));
+            s.raw(s.frame(
+                Dir::Response,
+                &vec![b'x'; usize::try_from(WINDOW).unwrap() + 1],
+            ));
             s.send(json!({"type": "response_end"}));
         }
         _ => {
@@ -387,7 +437,7 @@ where
         let mut conns = state.connections.lock().unwrap();
         if path != "/no-protocol" {
             res.headers_mut()
-                .insert("sec-websocket-protocol", "roxy.layer.v2".parse().unwrap());
+                .insert("sec-websocket-protocol", "roxy.layer.v3".parse().unwrap());
         }
         *record.lock().unwrap() = (path, conns.len());
         conns.push(
@@ -419,7 +469,7 @@ impl Demux {
     fn bytes(&self, b: &[u8]) {
         let id = u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
         if let Some(tx) = self.streams.get(&id) {
-            let _ = tx.send(Got::Bytes(b[4..].to_vec()));
+            let _ = tx.send(Got::Bytes(Dir::of_byte(b[4]), b[5..].to_vec()));
         }
     }
 
@@ -432,8 +482,11 @@ impl Demux {
                 self.st.opens.lock().unwrap().push(o);
                 self.st.changed.notify_waiters();
                 if v["mode"] == "observe" {
-                    let grant = json!({"type": "credit", "stream": id, "bytes": OBSERVE_CREDIT});
-                    let _ = self.out.tx.send(Message::text(grant.to_string()));
+                    for dir in [Dir::Request, Dir::Response] {
+                        let grant = json!({"type": "credit", "stream": id,
+                            "dir": dir.name(), "bytes": OBSERVE_CREDIT});
+                        let _ = self.out.tx.send(Message::text(grant.to_string()));
+                    }
                 }
                 let (tx, rx) = mpsc::unbounded_channel();
                 self.streams.insert(id, tx);
@@ -448,7 +501,14 @@ impl Demux {
             }
             "credit" => {
                 let n = v["bytes"].as_u64().unwrap();
-                *self.out.credit.lock().unwrap().entry(id).or_insert(WINDOW) += n;
+                let dir = Dir::of_name(v["dir"].as_str().unwrap());
+                *self
+                    .out
+                    .credit
+                    .lock()
+                    .unwrap()
+                    .entry((id, dir))
+                    .or_insert(WINDOW) += n;
                 self.out.more.notify_waiters();
             }
             "reset" => {

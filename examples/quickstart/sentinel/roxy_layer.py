@@ -1,10 +1,10 @@
-"""The service side of roxy's service layers (`roxy.layer.v2`).
+"""The service side of roxy's service layers (`roxy.layer.v3`).
 
 roxy keeps a few WebSocket connections open to the service and carries
 each exchange as a stream on one of them. Text frames are JSON control
 messages with a `stream` field; binary frames are a 4-byte big-endian
-stream id, then body bytes of the message whose head came last on that
-stream:
+stream id, a direction byte (0 for the request body, 1 for the response
+body), then body bytes:
 
     roxy -> service   open (the exchange's metadata), then the request:
                       head, body bytes, request_end
@@ -14,9 +14,12 @@ stream:
     service -> roxy   the response for the client (head, bytes, response_end),
                       or a deny
 
-Body bytes are flow-controlled per stream with `credit` messages, and
-either side may abandon a stream with `reset`. This module handles the
-streams, credit and resets, and turns each exchange into one coroutine:
+The request and response bodies of a stream are independent: roxy sends
+its `response` head as soon as the layer below answers, even while the
+client is still uploading, and the service may do the same. Each body is
+flow-controlled with `credit` messages, and either side may abandon a
+stream with `reset`. This module handles the streams, credit and resets,
+and turns each exchange into one coroutine:
 
     async def handle(ex: Exchange) -> None:
         response = await ex.forward(ex.request, ex.body())
@@ -25,8 +28,11 @@ streams, credit and resets, and turns each exchange into one coroutine:
     asyncio.run(serve(handle, "127.0.0.1", 9000))
 
 Bodies stream: `ex.body()` yields the client's request bytes as they
-arrive, and `forward` sends each one on as it is read. A handler that
-needs a whole body reads it with `read_body()` / `read_response_body()`.
+arrive, and `forward` sends each one on as it is read. `forward` returns
+as soon as the response head arrives, while the request body (if it is
+still going) carries on in the background, so an early answer reaches the
+client at once. A handler that needs a whole body reads it with
+`read_body()` / `read_response_body()`.
 
 If the handler raises, the stream is reset without an answer and roxy
 fails the exchange closed (enforce mode). If roxy resets the stream (the
@@ -45,14 +51,26 @@ from typing import Any
 
 from websockets.asyncio.server import ServerConnection, serve as ws_serve
 
-SUBPROTOCOL = "roxy.layer.v2"
+SUBPROTOCOL = "roxy.layer.v3"
 
-# Each stream's starting credit, each way, in body bytes.
+# The direction byte of a binary frame, and the `dir` of a credit message.
+REQUEST = 0
+RESPONSE = 1
+_DIR_NAMES = {REQUEST: "request", RESPONSE: "response"}
+_DIRS = {v: k for k, v in _DIR_NAMES.items()}
+_DIR_OF_MESSAGE = {
+    "request": REQUEST,
+    "request_end": REQUEST,
+    "response": RESPONSE,
+    "response_end": RESPONSE,
+}
+
+# Each body's starting credit, each way, in bytes.
 WINDOW = 256 * 1024
 
-# Extra credit granted to an observe stream as it opens. roxy cuts an
-# observer that falls behind the real exchange, so it may send this much
-# ahead of the handler; it is held here until read.
+# Extra credit granted to each body of an observe stream as it opens. roxy
+# cuts an observer that falls behind the real exchange, so it may send
+# this much ahead of the handler; it is held here until read.
 OBSERVE_CREDIT = 16 * 1024 * 1024
 
 # Largest body frame sent, so streams share the connection fairly.
@@ -108,9 +126,9 @@ class _Conn:
         async with self._send_lock:
             await self.ws.send(json.dumps(msg))
 
-    async def send_bytes(self, stream: int, data: bytes) -> None:
+    async def send_bytes(self, stream: int, direction: int, data: bytes) -> None:
         async with self._send_lock:
-            await self.ws.send(stream.to_bytes(4, "big") + data)
+            await self.ws.send(stream.to_bytes(4, "big") + bytes([direction]) + data)
 
     async def run(self) -> None:
         try:
@@ -118,7 +136,7 @@ class _Conn:
                 if isinstance(m, bytes):
                     s = self.streams.get(int.from_bytes(m[:4], "big"))
                     if s is not None:
-                        s.inbox.put_nowait(m[4:])
+                        s.inbox(m[4]).put_nowait(m[5:])
                     continue
                 msg = json.loads(m)
                 self._control(msg)
@@ -140,13 +158,26 @@ class _Conn:
             # A message that crossed the stream's end.
             return
         if kind == "credit":
-            s.credit += int(msg["bytes"])
-            s.more_credit.set()
+            lane = s.lane(_DIRS[msg["dir"]])
+            lane.credit += int(msg["bytes"])
+            lane.more_credit.set()
         elif kind == "reset":
             self.streams.pop(sid, None)
             s.task.cancel()
         else:
-            s.inbox.put_nowait(msg)
+            s.inbox(_DIR_OF_MESSAGE.get(kind, REQUEST)).put_nowait(msg)
+
+
+class _Lane:
+    """One body of a stream, each way: what roxy sent of it, and the credit
+    for what this side may send."""
+
+    def __init__(self) -> None:
+        self.inbox: asyncio.Queue[dict[str, Any] | bytes] = asyncio.Queue()
+        self.credit = WINDOW
+        self.more_credit = asyncio.Event()
+        # Bytes consumed and not yet credited back to roxy.
+        self.unacked = 0
 
 
 class _Stream:
@@ -154,18 +185,24 @@ class _Stream:
         self.conn = conn
         self.id = sid
         self.flow = flow
-        self.inbox: asyncio.Queue[dict[str, Any] | bytes] = asyncio.Queue()
-        self.credit = WINDOW
-        self.more_credit = asyncio.Event()
-        # Bytes consumed and not yet credited back to roxy.
-        self.unacked = 0
+        self.lanes = {REQUEST: _Lane(), RESPONSE: _Lane()}
         self.task: asyncio.Task[None]
 
+    def lane(self, direction: int) -> _Lane:
+        return self.lanes[direction]
+
+    def inbox(self, direction: int) -> asyncio.Queue[dict[str, Any] | bytes]:
+        return self.lanes[direction].inbox
+
     async def run(self, observe: bool) -> None:
+        exchange: Exchange | None = None
         try:
             if observe:
-                await self.conn.send(self.id, {"type": "credit", "bytes": OBSERVE_CREDIT})
-            first = await self.inbox.get()
+                for name in _DIR_NAMES.values():
+                    await self.conn.send(
+                        self.id, {"type": "credit", "dir": name, "bytes": OBSERVE_CREDIT}
+                    )
+            first = await self.inbox(REQUEST).get()
             if isinstance(first, bytes) or first.get("type") != "request":
                 raise ProtocolError("expected the request head")
             request = Request(
@@ -173,13 +210,19 @@ class _Stream:
                 url=first["url"],
                 headers=[tuple(h) for h in first.get("headers", [])],  # type: ignore[misc]
             )
-            await self.conn.handler(Exchange(self, request))
+            exchange = Exchange(self, request)
+            await self.conn.handler(exchange)
+            # The request body may still be going out after the handler
+            # has answered; the stream is roxy's to end once it has.
+            await exchange._finish_forwarding()
         except asyncio.CancelledError:
             # roxy reset the stream, or the connection went.
             pass
         except Exception as e:
             # Resetting without an answer fails the exchange closed in roxy.
             log.exception("exchange failed")
+            if exchange is not None:
+                exchange._cancel_forwarding()
             try:
                 await self.conn.send(self.id, {"type": "reset", "message": str(e)[:200]})
             except Exception:
@@ -187,26 +230,30 @@ class _Stream:
         finally:
             self.conn.streams.pop(self.id, None)
 
-    async def recv(self) -> dict[str, Any] | bytes:
-        m = await self.inbox.get()
+    async def recv(self, direction: int) -> dict[str, Any] | bytes:
+        lane = self.lanes[direction]
+        m = await lane.inbox.get()
         if isinstance(m, bytes) and m:
             # Credit roxy for what was consumed, a quarter window at a time
             # (or whenever the inbox runs dry), not a message per frame.
-            self.unacked += len(m)
-            if self.unacked >= WINDOW // 4 or self.inbox.empty():
-                n, self.unacked = self.unacked, 0
-                await self.conn.send(self.id, {"type": "credit", "bytes": n})
+            lane.unacked += len(m)
+            if lane.unacked >= WINDOW // 4 or lane.inbox.empty():
+                n, lane.unacked = lane.unacked, 0
+                await self.conn.send(
+                    self.id, {"type": "credit", "dir": _DIR_NAMES[direction], "bytes": n}
+                )
         return m
 
-    async def send_bytes(self, data: bytes) -> None:
+    async def send_bytes(self, direction: int, data: bytes) -> None:
+        lane = self.lanes[direction]
         view = memoryview(data)
         while view:
-            while self.credit <= 0:
-                self.more_credit.clear()
-                await self.more_credit.wait()
-            n = min(len(view), self.credit, MAX_BODY_FRAME)
-            self.credit -= n
-            await self.conn.send_bytes(self.id, bytes(view[:n]))
+            while lane.credit <= 0:
+                lane.more_credit.clear()
+                await lane.more_credit.wait()
+            n = min(len(view), lane.credit, MAX_BODY_FRAME)
+            lane.credit -= n
+            await self.conn.send_bytes(self.id, direction, bytes(view[:n]))
             view = view[n:]
 
 
@@ -223,15 +270,19 @@ class Exchange:
         (flow, layer) is unique to this exchange."""
         self._body_read = False
         self._response_read = False
+        # The forwarded request body still going out, if `forward` returned
+        # before it had all gone.
+        self._forwarding: asyncio.Task[None] | None = None
 
     @property
     def observing(self) -> bool:
         """roxy sends copies and ignores the answers (`mode: observe`)."""
         return self.flow.get("mode") == "observe"
 
-    async def _body(self, end: str) -> AsyncIterator[bytes]:
+    async def _body(self, direction: int) -> AsyncIterator[bytes]:
+        end = f"{_DIR_NAMES[direction]}_end"
         while True:
-            m = await self._s.recv()
+            m = await self._s.recv(direction)
             if isinstance(m, bytes):
                 yield m
                 continue
@@ -244,7 +295,7 @@ class Exchange:
         if self._body_read:
             raise ProtocolError("the request body was already read")
         self._body_read = True
-        return self._body("request_end")
+        return self._body(REQUEST)
 
     async def read_body(self) -> bytes:
         """The whole request body."""
@@ -253,20 +304,30 @@ class Exchange:
     async def _send(self, msg: dict[str, Any]) -> None:
         await self._s.conn.send(self._s.id, msg)
 
-    async def _send_body(self, body: Body, end: str) -> None:
+    async def _send_body(self, direction: int, body: Body) -> None:
         if isinstance(body, bytes):
             if body:
-                await self._s.send_bytes(body)
+                await self._s.send_bytes(direction, body)
         else:
             async for chunk in body:
                 if chunk:
-                    await self._s.send_bytes(chunk)
-        await self._send({"type": end})
+                    await self._s.send_bytes(direction, chunk)
+        await self._send({"type": f"{_DIR_NAMES[direction]}_end"})
+
+    async def _finish_forwarding(self) -> None:
+        if self._forwarding is not None:
+            await self._forwarding
+
+    def _cancel_forwarding(self) -> None:
+        if self._forwarding is not None:
+            self._forwarding.cancel()
 
     async def forward(self, request: Request, body: Body) -> Response:
         """Pass `request` on down the stack and return the response head
-        from below. roxy re-validates it and its rules judge it; read the
-        response body with `response_body()`."""
+        from below, as soon as there is one: the body keeps going out in
+        the background if roxy answers before it has all been sent. roxy
+        re-validates the request and its rules judge it; read the response
+        body with `response_body()`."""
         await self._send(
             {
                 "type": "request",
@@ -275,12 +336,20 @@ class Exchange:
                 "headers": request.headers,
             }
         )
-        await self._send_body(body, "request_end")
-        if not self._body_read:
-            # The client's body comes before roxy's response on the stream.
-            async for _ in self.body():
-                pass
-        m = await self._s.recv()
+        self._forwarding = asyncio.create_task(self._send_body(REQUEST, body))
+        head = asyncio.ensure_future(self._s.recv(RESPONSE))
+        try:
+            done, _ = await asyncio.wait(
+                {self._forwarding, head}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if head not in done:
+                # The body went first: a failure sending it is the error.
+                self._forwarding.result()
+                await head
+            m = head.result()
+        except BaseException:
+            head.cancel()
+            raise
         if isinstance(m, bytes):
             raise ProtocolError("body bytes before the response head")
         if m.get("type") != "response":
@@ -296,7 +365,7 @@ class Exchange:
         if self._response_read:
             raise ProtocolError("the response body was already read")
         self._response_read = True
-        return self._body("response_end")
+        return self._body(RESPONSE)
 
     async def read_response_body(self) -> bytes:
         """The whole response body from below."""
@@ -304,7 +373,8 @@ class Exchange:
 
     async def respond(self, response: Response, body: Body) -> None:
         """Give the client `response`: after `forward`, the response the
-        client gets; before it, an answer instead of forwarding."""
+        client gets; before it, an answer instead of forwarding. It may be
+        sent while the forwarded request body is still going out."""
         await self._send(
             {
                 "type": "response",
@@ -312,7 +382,7 @@ class Exchange:
                 "headers": response.headers,
             }
         )
-        await self._send_body(body, "response_end")
+        await self._send_body(RESPONSE, body)
 
     async def deny(self, status: int = 403, message: str | None = None) -> None:
         """Refuse: before `forward` the request is never sent; after it, the
