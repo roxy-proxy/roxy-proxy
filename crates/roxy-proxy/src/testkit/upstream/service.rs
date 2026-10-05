@@ -71,6 +71,8 @@ pub(crate) const PAUSE: std::time::Duration = std::time::Duration::from_millis(3
 pub(crate) struct ServiceLog {
     opens: Mutex<Vec<Value>>,
     resets: Mutex<Vec<(u32, String)>>,
+    /// Resets for a stream that had not been opened.
+    unknown_resets: Mutex<Vec<u32>>,
     talked: Mutex<Vec<u32>>,
     /// Body bytes received per stream id, across connections.
     received: Mutex<HashMap<u32, usize>>,
@@ -89,6 +91,11 @@ impl ServiceLog {
     /// Every reset roxy sent: (stream id, message).
     pub(crate) fn resets(&self) -> Vec<(u32, String)> {
         lock(&self.resets).clone()
+    }
+
+    /// Every reset for a stream the service had not seen opened.
+    pub(crate) fn unknown_resets(&self) -> Vec<u32> {
+        lock(&self.unknown_resets).clone()
     }
 
     /// Waits until `n` streams have been opened; every `open` so far.
@@ -299,7 +306,9 @@ impl Conn {
             "reset" => {
                 let msg = v["message"].as_str().unwrap_or_default().to_owned();
                 lock(&self.log.resets).push((id, msg));
-                self.streams.remove(&id);
+                if self.streams.remove(&id).is_none() {
+                    lock(&self.log.unknown_resets).push(id);
+                }
             }
             _ if self.mode == Mode::Pass => {
                 let Some(dir) = lane_of(&kind) else {
