@@ -5,6 +5,8 @@
 //! * `/svc/pass`: a conforming pass-through: every head, body byte and
 //!   end roxy sends comes straight back on the same stream, in its own
 //!   direction, within the credit roxy grants;
+//! * `/svc/hold`: a pass-through that sends the response head back and
+//!   holds the response body: none of its bytes, and no end;
 //! * `/svc/talk`: sends [`TALK_BYTES`] of request body on each stream as
 //!   it opens, with no head, within the credit roxy grants, and logs the
 //!   stream once all of it has gone;
@@ -233,6 +235,7 @@ fn lane_of(kind: &str) -> Option<u8> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Pass,
+    Hold,
     Talk,
     Flood,
     Pause,
@@ -243,6 +246,8 @@ impl Mode {
     fn of(path: &str) -> Self {
         if path.ends_with("/pass") {
             Self::Pass
+        } else if path.ends_with("/hold") {
+            Self::Hold
         } else if path.ends_with("/talk") {
             Self::Talk
         } else if path.ends_with("/pause") {
@@ -290,7 +295,7 @@ impl Conn {
                 lock(&self.log.opens).push(v);
                 self.streams.insert(id, Sess::new());
                 match self.mode {
-                    Mode::Pass | Mode::Pause | Mode::Slow => {}
+                    Mode::Pass | Mode::Hold | Mode::Pause | Mode::Slow => {}
                     Mode::Talk => {
                         let s = self.streams.get_mut(&id).expect("just opened");
                         s.lanes[usize::from(REQUEST)]
@@ -318,7 +323,8 @@ impl Conn {
                     lock(&self.log.unknown_resets).push(id);
                 }
             }
-            _ if matches!(self.mode, Mode::Pass | Mode::Slow) => {
+            "response_end" if self.mode == Mode::Hold => {}
+            _ if matches!(self.mode, Mode::Pass | Mode::Hold | Mode::Slow) => {
                 let Some(dir) = lane_of(&kind) else {
                     return;
                 };
@@ -341,9 +347,12 @@ impl Conn {
             id,
             json!({"type": "credit", "dir": dir_name(dir), "bytes": data.len()}),
         ));
-        if self.mode == Mode::Pass
-            && let Some(s) = self.streams.get_mut(&id)
-        {
+        let echo = match self.mode {
+            Mode::Pass | Mode::Slow => true,
+            Mode::Hold => dir == REQUEST,
+            Mode::Talk | Mode::Flood | Mode::Pause => false,
+        };
+        if echo && let Some(s) = self.streams.get_mut(&id) {
             s.lanes[usize::from(dir)]
                 .queue
                 .push_back(Queued::Bytes(Bytes::copy_from_slice(data)));
