@@ -41,6 +41,8 @@ mod head;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
 use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -252,6 +254,21 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
         }
     }
 
+    /// [`ReadSide::pump`], then, if `watch`, watches the socket so a client
+    /// that leaves while its response is being written is noticed at once.
+    /// `Ok(true)` when the client closed (EOF or a read error: h1 cannot
+    /// tell a half-close from a departure), `Ok(false)` otherwise; bytes
+    /// that arrive (a pipelined request) end the watch and stay buffered.
+    /// Cancel-safe.
+    async fn pump_then_watch(&mut self, watch: bool) -> Result<bool, ParseError> {
+        self.pump().await?;
+        if !watch || !self.buf.is_empty() {
+            return Ok(false);
+        }
+        self.buf.reserve(READ_CHUNK);
+        Ok(!matches!(self.rd.read_buf(&mut self.buf).await, Ok(n) if n > 0))
+    }
+
     async fn pump_inner(&mut self) -> Result<(), ParseError> {
         let idle = self.limits.body_idle_timeout;
         loop {
@@ -433,6 +450,13 @@ fn timed_out() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::TimedOut, "client write stalled")
 }
 
+fn client_left() -> WriteError {
+    WriteError::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionAborted,
+        "client closed while the response body was pending",
+    ))
+}
+
 async fn write_timed<W: AsyncWrite + Unpin>(
     w: &mut W,
     bufs: &[&[u8]],
@@ -452,12 +476,14 @@ async fn flush_timed<W: AsyncWrite + Unpin>(w: &mut W, idle: Duration) -> Result
 }
 
 /// Writes a response head and body. Bodies are streamed frame by frame.
+/// Once `client_closed` is set, waiting for a frame fails instead.
 async fn write_message<W: AsyncWrite + Unpin>(
     w: &mut W,
     head: BytesMut,
     mut body: Body,
     framing: OutFraming,
     idle: Duration,
+    client_closed: &AtomicBool,
 ) -> Result<(), WriteError> {
     write_timed(w, &[&head], idle).await?;
     let mut sent: u64 = 0;
@@ -472,9 +498,18 @@ async fn write_message<W: AsyncWrite + Unpin>(
     loop {
         // Flush whatever is buffered before possibly waiting on the producer.
         flush_timed(w, idle).await?;
-        let frame = timeout(idle, poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)))
-            .await
-            .map_err(|_| WriteError::Body(BodyError::Timeout))?;
+        let frame = timeout(
+            idle,
+            poll_fn(|cx| match Pin::new(&mut body).poll_frame(cx) {
+                Poll::Ready(frame) => Poll::Ready(Ok(frame)),
+                Poll::Pending if client_closed.load(Ordering::Relaxed) => {
+                    Poll::Ready(Err(client_left()))
+                }
+                Poll::Pending => Poll::Pending,
+            }),
+        )
+        .await
+        .map_err(|_| WriteError::Body(BodyError::Timeout))??;
         let Some(frame) = frame else { break };
         let frame = frame.map_err(WriteError::Body)?;
         let Ok(data) = frame.into_data() else {
@@ -823,6 +858,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     /// as [`ServerConn::respond_error_and_close`]. Bytes the client sent after
     /// this request (pipelining) are discarded, never parsed as a request.
     ///
+    /// A client that closes while the response body is waiting for its next
+    /// frame ends the write at once with [`WriteError::Io`], dropping the
+    /// body; a frame that is already there is still written.
+    ///
     /// 1xx responses are not accepted here (see
     /// [`ServerConn::send_100_continue`] and [`ServerConn::respond_upgrade`]),
     /// nor 2xx responses to CONNECT (see [`ServerConn::accept_connect`]).
@@ -871,15 +910,14 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         let head = response_head(res.status, &res.headers, &[], framing, close, None);
         let idle = self.limits.body_idle_timeout;
 
+        let client_closed = AtomicBool::new(false);
         let result = {
-            let write = write_message(&mut self.w, head, res.body, framing, idle);
-            let pump = self.r.pump();
+            let write = write_message(&mut self.w, head, res.body, framing, idle, &client_closed);
             let mut write = std::pin::pin!(write);
-            let mut pump = std::pin::pin!(pump);
             let mut write_done = false;
-            let mut pump_done = false;
+            let mut watch_done = false;
             loop {
-                if write_done && pump_done {
+                if write_done && self.r.feed.is_none() {
                     break Ok(());
                 }
                 tokio::select! {
@@ -887,9 +925,14 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
                         if let Err(e) = r { break Err(e); }
                         write_done = true;
                     }
-                    r = &mut pump, if !pump_done => {
-                        if let Err(e) = r { break Err(WriteError::Request(e)); }
-                        pump_done = true;
+                    // `write` is polled again on the next pass, so a body
+                    // that is waiting for its next frame fails at once.
+                    r = self.r.pump_then_watch(!write_done), if !watch_done => {
+                        match r {
+                            Err(e) => break Err(WriteError::Request(e)),
+                            Ok(closed) => client_closed.store(closed, Ordering::Relaxed),
+                        }
+                        watch_done = true;
                     }
                 }
             }
@@ -1015,7 +1058,15 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         };
         let head = response_head(status, headers, extra, framing, true, None);
         let idle = self.limits.body_idle_timeout;
-        let r = write_message(&mut self.w, head, Body::from_bytes(body), framing, idle).await;
+        let r = write_message(
+            &mut self.w,
+            head,
+            Body::from_bytes(body),
+            framing,
+            idle,
+            &AtomicBool::new(false),
+        )
+        .await;
         self.shutdown().await;
         self.state = State::Closed;
         r

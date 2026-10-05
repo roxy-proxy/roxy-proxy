@@ -259,6 +259,12 @@ resource limits. hyper parses the response and roxy builds a
   been sent, so a long upload is not cut short by it. While the body is
   still being sent, the exchange fails (`504`) only if the upstream stops
   taking it for twice `limits.body_idle_timeout`.
+- A client that closes its connection while roxy waits for the next part
+  of the response body ends the exchange at once, on HTTP/1.1 as on
+  HTTP/2: the body is dropped, which releases the upstream and any service
+  streams. A body that is already there is still written. HTTP/1.1 cannot
+  tell a client that only shut down its sending side from one that left,
+  so it treats both as gone.
 - Redirects are forwarded, not followed. The client's next request is a new
   exchange, judged on its own.
 - Encoded bodies pass through untouched ([below](#content-codings)).
