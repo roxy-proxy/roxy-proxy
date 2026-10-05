@@ -246,11 +246,24 @@ where
         .await;
 }
 
-pub(crate) async fn start_upstream(ca: &TestCa) -> Upstream {
+/// A loopback listener with fixed, generous socket buffers. Left to the
+/// kernel's autotuning, a slow reader under CPU contention can shrink the
+/// receive window below the loopback MSS, after which the sender holds its
+/// queued data indefinitely: an upload through roxy then stalls with every
+/// byte already written to the socket, which no proxy-side timer can see.
+fn listen() -> TcpListener {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4 << 20).unwrap();
+    socket.set_send_buffer_size(4 << 20).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    socket.listen(128).unwrap()
+}
+
+pub(crate) fn start_upstream(ca: &TestCa) -> Upstream {
     let st = Arc::new(UpState::default());
-    let https = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let https = listen();
+    let http = listen();
+    let ws = listen();
     let down = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
@@ -516,7 +529,7 @@ log:
         if let Some(users) = &opts.users {
             std::fs::write(dir.path().join("users"), users).unwrap();
         }
-        let upstream = start_upstream(&test_ca).await;
+        let upstream = start_upstream(&test_ca);
         let config_path = dir.path().join("roxy.yaml");
         std::fs::write(
             &config_path,
