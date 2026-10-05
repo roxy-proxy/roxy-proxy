@@ -330,3 +330,33 @@ async fn an_upgrade_the_rule_does_not_allow_is_stripped() {
     kit.request_event().await;
     assert!(kit.sink.events().iter().all(|e| e["event"] != "ws_open"));
 }
+
+/// With a stack, an upgrade request carrying a body is refused as `400
+/// ws_bad_handshake`, as it is without addons.
+#[tokio::test]
+async fn upgrade_with_body_is_refused_with_a_stack() {
+    use super::AddonDef;
+    let kit = Kit::builder()
+        .rules(WS_ALLOW)
+        .addon(AddonDef::test_layer("a"))
+        .flags(|f| f.allow_body_on_get = true)
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let hs = vec![
+        ("connection", "upgrade"),
+        ("upgrade", "websocket"),
+        ("sec-websocket-version", "13"),
+        ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+    ];
+    let req = c
+        .request("GET", "/ws/echo", &hs)
+        .body(roxy_http::Body::from_bytes("hello"))
+        .unwrap();
+    let res = c.send(req).await.unwrap();
+    assert_eq!(res.status(), 400);
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "deny");
+    assert_eq!(ev["terminal_rule"], "_websocket");
+    assert_eq!(ev["reason"], "ws_bad_handshake");
+}
