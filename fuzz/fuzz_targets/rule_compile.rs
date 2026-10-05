@@ -61,13 +61,7 @@ fuzz_target!(|data: &[u8]| {
                 assert!(!out.decision.is_allow(), "fail-closed allow: {out:?}");
             }
             let mut st = policy.watch_state(&out.tags);
-            let _ = policy.evaluate_watching(
-                Reads::ALL,
-                Reads::ALL,
-                &mut st,
-                view,
-                &EvalContext::empty(),
-            );
+            let _ = policy.evaluate_watching(Reads::ALL, Reads::ALL, &mut st, view);
         }
     }
 });
