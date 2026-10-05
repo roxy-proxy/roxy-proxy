@@ -159,3 +159,32 @@ async def test_an_unknown_block_type_in_a_stream_is_refused(sidecar: Sidecar) ->
     assert refused[5:].startswith(b"event: error\n")
     assert b"the sentinel could not read this model exchange" in refused
     assert (await roxy.ws.next_sent())["type"] == "response_end"
+
+
+async def test_message_start_passes_on_as_soon_as_it_arrives(sidecar: Sidecar) -> None:
+    roxy = FakeRoxy(sidecar.handle)
+    body = json.dumps({"model": "claude-test", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+    roxy.open(1, url=MESSAGES_URL)
+    roxy.ws.body(1, body.encode())
+    roxy.ws.control(1, "request_end")
+    for _ in range(3):
+        await roxy.ws.next_sent()
+    roxy.ws.control(1, "response", status=200, headers=[["content-type", "text/event-stream"]])
+    assert (await roxy.ws.next_sent())["type"] == "response"
+    roxy.ws.body(1, MESSAGE_START[:10], RESPONSE)
+    roxy.ws.body(1, MESSAGE_START[10:], RESPONSE)
+    assert await roxy.ws.next_sent(timeout=0.2) == b"\x00\x00\x00\x01\x01" + MESSAGE_START
+
+
+async def test_a_broken_stream_before_its_first_event_resets(sidecar: Sidecar) -> None:
+    roxy = FakeRoxy(sidecar.handle)
+    body = json.dumps({"model": "claude-test", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+    roxy.open(1, url=MESSAGES_URL)
+    roxy.ws.body(1, body.encode())
+    roxy.ws.control(1, "request_end")
+    for _ in range(3):
+        await roxy.ws.next_sent()
+    roxy.ws.control(1, "response", status=200, headers=[["content-type", "text/event-stream"]])
+    assert (await roxy.ws.next_sent())["type"] == "response"
+    roxy.ws.control(1, "response", status=200)
+    assert (await roxy.ws.next_sent())["type"] == "reset"
