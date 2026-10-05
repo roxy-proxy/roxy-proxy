@@ -45,9 +45,12 @@ working practices for picking up issues.
 - the HTTP/1.1 request head, where the canonical form is a fixed point of
   parse → serialise → parse;
 - the chunked body decoder;
+- the content-coding decoders;
 - the h2 → canonical mapping;
 - the URL normaliser (idempotent, no dot segments survive);
 - the ClientHello sniffer (verdicts never change as more bytes arrive);
+- the DNS query parser;
+- the WebSocket frame decoder;
 - the rule lexer, parser and compiler;
 - policy evaluation, where making an input unavailable either changes
   nothing or fails closed, and never yields a different decision.

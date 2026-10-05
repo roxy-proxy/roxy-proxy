@@ -48,9 +48,9 @@ runs follows from what it reads.
    not started, otherwise HTTP/1.1 breaks the connection without finishing
    the body and HTTP/2 resets the stream. Nothing overrides a deny.
 3. **Only head rules can `allow`.** A rule that reads a watched field cannot
-   allow and cannot change the request (`set_header` on the request,
-   `rewrite_path`, `redirect`, ...): the request is already on its way, so
-   both are compile errors. It can deny, and add effects that still make
+   allow, cannot change the request (`set_header` on the request,
+   `rewrite_path`, `redirect`, ...) and cannot `capture`: the request is
+   already on its way, so all three are compile errors. It can deny, and add effects that still make
    sense: `log`, `tag`, `set_state`, and header changes on a response that
    has not been sent yet.
 4. **A watching rule's non-terminal effects apply once**, the first time it
@@ -66,7 +66,8 @@ runs follows from what it reads.
    tag, and a tag no rule sets (from an addon). If
    the request is allowed, the effects of every matching rule apply in list
    order; if two set the same header, the later wins. If it is denied, or a
-   change to it fails (which denies it with `_fail_closed`), the `log` and
+   change to it fails (which denies it with `_fail_closed`, reason
+   `effect_invalid`), the `log` and
    `set_state` effects of the matching rules still apply, and the request's
    metric samples count it as denied. Allow options
    (`upgrade`, `private_ok`) come from the first matching allow only. The

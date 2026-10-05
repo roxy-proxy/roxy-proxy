@@ -126,7 +126,7 @@ The full policy is [`roxy.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/m
 
 ### The denylist
 
-The sentinel runs `deny_regex` from [`policies.py`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/sentinel/policies.py). It searches `<tool name> <arguments as JSON>` for a regular expression. The default catches `curl`, `wget`, `nc`, `ssh`, `scp`, `rsync` and `rm -rf`. Set your own with `SENTINEL_DENY`:
+The sentinel runs `deny_regex` from [`policies.py`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/sentinel/policies.py). It searches `<tool name> <arguments as JSON>` for a regular expression. The default catches `curl`, `wget`, `nc`, `ncat`, `ssh`, `scp`, `rsync` and `rm -rf`. Set your own with `SENTINEL_DENY`:
 
 ```sh
 SENTINEL_DENY='\bgit\s+push\b|\bnpm\s+publish\b' docker compose up -d --wait

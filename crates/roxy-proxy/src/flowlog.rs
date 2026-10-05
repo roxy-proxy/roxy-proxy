@@ -108,7 +108,7 @@ pub enum FlowEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal_rule: Option<String>,
         /// Stable reason code for a deny or failure (`body_too_large_to_inspect`,
-        /// `effect_invalid`, `upstream_timeout`, …).
+        /// `effect_invalid`, `timeout`, …).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
         /// Where the terminal decision was made: `head` for the forwarding

@@ -126,7 +126,7 @@ Non-terminal:
 
 | action | where | effect |
 |---|---|---|
-| `set_header: { name: value }` | request: head rules; response: watching rules | Set or replace. Request values may use `${secret:name}`. Invalid values deny the flow. On the response, every value the rule reads must be known before the response head is sent (`response.status`, `response.header[..]`, `response.body.size`, `response.body.text`); reading `body.bytes`, `response.body.bytes` or a byte metric as well is a compile error. |
+| `set_header: { name: value }` | request: head rules; response: watching rules | Set or replace. Request values may use `${secret:name}`. Invalid values deny the flow. On the response, every value the rule reads must be known before the response head is sent (`response.status`, `response.header[..]`, `response.body.size`, `response.body.text`); reading `body.bytes`, `response.body.bytes`, `ws.*` or a byte metric as well is a compile error. |
 | `remove_header: [names]` | same as `set_header` | |
 | `rewrite_path: { match, to }` | head rules | Regex (anchored, like `matches`) with `$1` / `${name}` groups. The result is re-normalised. |
 | `set_query: { k: v }`, `remove_query: [k]` | head rules | |

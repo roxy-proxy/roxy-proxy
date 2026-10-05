@@ -377,14 +377,14 @@ fn default_allow_parses() {
 }
 
 #[test]
-fn transparent_listener_is_deferred() {
+fn transparent_listener_is_rejected() {
     let d = diagnostics(
         "version: 1\nlisteners:\n  - name: t\n    mode: transparent\n    bind: 127.0.0.1:1\n    \
          allow_passthrough: false\n    upstream_target: resolve\n",
     );
     assert_eq!(d.len(), 1, "{d:?}");
     assert_eq!(d[0].path, "listeners[0].mode");
-    assert!(d[0].message.contains("deferred"));
+    assert!(d[0].message.contains("no transparent listeners"));
 
     let d = diagnostics(
         "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:1, upstream_target: resolve }]\n",

@@ -3,16 +3,22 @@
 One YAML file, `version: 1`. Parsing is strict: an unknown key anywhere is
 an error, not a silently ignored setting. Relative paths (`ca_dir`, `ca_cert`, `ca_key`, secret
 files, list files, addon paths, log and capture paths) resolve against the
-process's working directory. No `limits` count or size may be zero: a zero
-limit is not "off" but "refuse every request" (or, for the policy tables,
-"fail every metric and state rule closed"), so `roxy check` refuses it.
-Each section is described on the page the table names.
+process's working directory. `roxy check` refuses a zero value for the
+`limits` that would otherwise refuse every request, hold no connections or
+fail every metric and state rule closed: `max_headers`, `max_header_bytes`,
+`max_url_bytes`, `max_connections`, `max_connections_per_client`,
+`h2_max_concurrent_streams`, `h2_max_header_list_bytes`, `max_metric_keys`,
+`max_metric_bytes`, `max_state_entries`, `max_observer_lag_bytes` and
+`max_address_list_bytes`. The body, message and capture caps and the
+timeouts accept zero, and mean it. Each section is described on the page
+the table names.
 
 | key | page |
 |---|---|
 | `listeners`, `http` | [HTTP](/reference/http) |
 | `ca_server`, `tls` | [managing the CA](/operate/ca-certificates), [TLS](/reference/tls) |
 | `upstream` | [upstream](/reference/upstream), [address floor](/policies/address-lists#address-floor) |
+| `dns` | [DNS steering](/deploy/dns-steering) |
 | `address_lists` | [address lists](/policies/address-lists#address-lists) |
 | `limits` | [resource limits](/reference/limits) |
 | `default`, `rules` | [how policies work](/policies/overview), [rule language](/reference/rule-language) |

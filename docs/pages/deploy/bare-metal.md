@@ -23,5 +23,6 @@ rules:
     when: host == "example.com" and method in [GET, HEAD]
     then: allow
 ```
- Each GitHub
+
+Each GitHub
 release carries prebuilt binaries (static musl builds for Linux).
