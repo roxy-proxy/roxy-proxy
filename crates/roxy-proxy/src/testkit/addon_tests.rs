@@ -626,10 +626,9 @@ mod service {
         );
     }
 
-    /// An observer that keeps up on average sees whole bodies: the copy is
-    /// buffered for it up to `limits.max_observer_lag_bytes`, so an upload
-    /// that lands whole while the service is not reading still reaches it
-    /// whole, with the response after it.
+    /// An observer that keeps up sees every body in full: the copy is
+    /// buffered for it, so an upload that lands whole while the service is
+    /// not yet reading still reaches it whole, with the response after it.
     #[tokio::test]
     async fn a_fast_upload_reaches_an_observer_whole() {
         let kit = kit(RULES, vec![addon("o", "pause", AddonMode::Observe, |_| {})]).await;

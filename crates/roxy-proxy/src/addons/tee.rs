@@ -2,10 +2,10 @@
 //! neither change nor delay the real ones.
 //!
 //! The copy is fed as the real body is forwarded and buffered for the
-//! observer up to `limits.max_observer_lag_bytes` per direction. An
-//! observer further behind than that has its copy cut (it sees a body
-//! error) and an `observer_lagged` event is logged; the real traffic never
-//! waits. This is deliberately lossy: the observer is not the audit log,
+//! observer, which sees every body in full for as long as it keeps up. An
+//! observer with more than `limits.max_observer_lag_bytes` of copy unread
+//! has it cut (it sees a body error) and an `observer_lagged` event is
+//! logged; the real traffic never waits. This is deliberately lossy: the observer is not the audit log,
 //! which keeps its own backpressure. An observer that drops its copy is
 //! not lagging: the rest is simply not copied.
 

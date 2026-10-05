@@ -165,10 +165,10 @@ not counted.
   than `credit` and `reset` is ignored. The stream ends after roxy's
   `response_end` (or a `reset`). It cannot change or delay traffic; its
   failures are logged only. The real exchange never waits for an observer:
-  roxy buffers each copy up to `limits.max_observer_lag_bytes`, and a
-  stream whose copies fall further behind is cut and reset on its own
-  (`observer_lagged`). Waiting for credit is falling behind, so a service
-  that wants whole copies of large bodies grants extra credit as an observe
+  roxy buffers each copy for the service, and a stream with more than
+  `limits.max_observer_lag_bytes` of copy unread is cut and reset on its
+  own (`observer_lagged`). Waiting for credit is falling behind, so a
+  service that wants every copy in full grants extra credit as an observe
   stream opens (`roxy_layer.py` grants 16 MiB to each body). Body bytes
   the service sends on an observe stream are discarded, and credited back
   in steps of 64 KiB as they are, so the service never waits on its own

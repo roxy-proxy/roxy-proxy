@@ -49,7 +49,7 @@ limits:
   max_inspect_body_bytes: 1mb     # body.text / response.body.text, and addons' default
   max_capture_body_bytes: 16mb    # per direction per exchange
   max_ws_message_bytes: 16mb      # a reassembled WebSocket message, when rules read ws.*
-  max_observer_lag_bytes: 16mb    # an observe-mode addon's copy of a body, per direction
+  max_observer_lag_bytes: 16mb    # how far behind an observe-mode addon may fall, per direction
 
   # connections
   max_connections: 10000
@@ -67,7 +67,8 @@ Addons have their own limits ([addon safety](/addons/safety)).
 ([WebSockets](/policies/websockets#message-rules)); a message over it closes both
 sides with `1009`. `max_observer_lag_bytes` is how far behind the real
 exchange an observe-mode addon may fall: its copy of each body is buffered
-up to that many bytes, and an observer further behind has the copy cut
+for it, so an observer that keeps up sees every body in full however
+large, and one with more than that many bytes unread has the copy cut
 ([addon modes](/addons/overview#modes)).
 
 The limits that shape the client-facing codec (`max_header_bytes`,
