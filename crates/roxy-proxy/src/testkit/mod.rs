@@ -1201,5 +1201,8 @@ mod smoke {
         }
         let seen = kit.upstream.wait_seen(2).await;
         assert!(seen.iter().all(|s| s.addr.port() == 443));
+        let ev = kit.events("request", 2).await;
+        let alpn: Vec<_> = ev.iter().map(|e| e["tls"]["alpn"].clone()).collect();
+        assert_eq!(alpn, ["http/1.1", "h2"], "{ev:#?}");
     }
 }
