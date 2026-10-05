@@ -54,6 +54,28 @@ pub enum MetricSourceError {
     KeyUnavailable(String),
 }
 
+impl From<roxy_rules::MetricError> for MetricSourceError {
+    fn from(e: roxy_rules::MetricError) -> Self {
+        use roxy_rules::MetricError;
+        match e {
+            MetricError::Unknown(id) => Self::Unknown(format!("unknown metric {id}")),
+            // Out of bytes is the same condition as out of keys: deny, never
+            // evict.
+            MetricError::TableFull { metric } | MetricError::BudgetExhausted { metric } => {
+                Self::TableFull(metric)
+            }
+            MetricError::KeyUnavailable { metric, field } => {
+                Self::KeyUnavailable(format!("{metric}: key field {field:?}"))
+            }
+            // A filter that hit an unavailable input cannot say whether the
+            // flow counts; treat it as the store being unable to answer.
+            MetricError::FilterFailed { metric, reason } => {
+                Self::Unknown(format!("{metric}: filter input unavailable ({reason})"))
+            }
+        }
+    }
+}
+
 impl MetricSourceError {
     /// Stable reason code for the flow log.
     pub fn code(&self) -> &'static str {

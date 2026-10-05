@@ -23,6 +23,8 @@ mod addon_tests;
 #[cfg(test)]
 mod budget_tests;
 #[cfg(test)]
+mod capture_tests;
+#[cfg(test)]
 mod coding_tests;
 #[cfg(test)]
 mod core_tests;
@@ -30,7 +32,15 @@ mod core_tests;
 mod direct_tests;
 #[cfg(test)]
 mod early_tests;
+mod gate;
+mod h2raw;
+#[cfg(test)]
+mod http_tests;
+#[cfg(test)]
+mod rules_tests;
 mod upstream;
+#[cfg(test)]
+mod ws_tests;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,12 +57,18 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use ulid::Ulid;
 
 #[allow(unused_imports)]
+pub(crate) use gate::LogGate;
+#[allow(unused_imports)]
+pub(crate) use h2raw::{H2_GOAWAY, H2_HEADERS, H2_RST_STREAM, h2_client, h2_get, h2_raw_request};
+#[allow(unused_imports)]
 pub(crate) use upstream::{Seen, Upstream};
 
 use crate::Server;
-use crate::addons::{AddonMode, AddonSpec, StateLimits};
+use crate::addons::{AddonMode, AddonSpec, EndpointSpec, StateLimits};
+use crate::addr::PrivateAddrs;
+use crate::addrlist::{AddressList, AddressLists};
 use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
-use crate::flowlog::{MemorySink, Redactor};
+use crate::flowlog::{FlowSink, MemorySink, Redactor};
 use crate::listener::{ClientConn, ListenerInfo, ListenerMode};
 use crate::sources::{MetricSource, StateSource, UnavailableMetrics, UnavailableState};
 use crate::upstream::{TestDial, UpstreamSettings};
@@ -89,6 +105,7 @@ pub(crate) struct AddonDef {
     pub limits: roxy_wasm::LayerLimits,
     pub when: Option<String>,
     pub sample: Option<f64>,
+    pub endpoints: HashMap<String, EndpointSpec>,
 }
 
 impl AddonDef {
@@ -103,7 +120,46 @@ impl AddonDef {
             limits: roxy_wasm::LayerLimits::default(),
             when: None,
             sample: None,
+            endpoints: HashMap::new(),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn caps(mut self, caps: &[roxy_wasm::Capability]) -> Self {
+        self.caps = caps.to_vec();
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn limits(mut self, f: impl FnOnce(&mut roxy_wasm::LayerLimits)) -> Self {
+        f(&mut self.limits);
+        self
+    }
+
+    /// A named endpoint the layer may call; `headers` may use
+    /// `${secret:name}`.
+    #[must_use]
+    pub(crate) fn endpoint(
+        mut self,
+        name: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        private_ok: bool,
+    ) -> Self {
+        self.endpoints.insert(
+            name.to_owned(),
+            EndpointSpec {
+                url: url.parse().unwrap(),
+                headers: headers
+                    .iter()
+                    .map(|(n, v)| (n.parse().unwrap(), (*v).to_owned()))
+                    .collect(),
+                timeout: Duration::from_secs(5),
+                retries: 0,
+                private: PrivateAddrs::from_private_ok(private_ok),
+            },
+        );
+        self
     }
 
     #[must_use]
@@ -142,12 +198,12 @@ impl AddonDef {
             },
         )
         .await
-        .unwrap_or_else(|e| panic!("loading addon {}: {e}", self.name));
+        .expect("loading the addon layer");
         Arc::new(AddonSpec {
             name: self.name,
             mode: self.mode,
             kind: crate::addons::AddonImpl::Wasm(layer),
-            endpoints: HashMap::new(),
+            endpoints: self.endpoints,
             state: StateLimits::default(),
             audit_endpoint: None,
             when,
@@ -163,19 +219,89 @@ pub(crate) struct KitBuilder {
     limits: Limits,
     flags: HttpFlags,
     http: HttpBehaviour,
-    metrics: Arc<dyn MetricSource>,
+    /// An explicit metric store; `None` means a real store when there are
+    /// metric definitions, otherwise one with every read unavailable.
+    metrics: Option<Arc<dyn MetricSource>>,
     /// `metrics:` definitions (YAML); a real metric store holds them.
     metric_defs: String,
+    metric_limits: roxy_rules::MetricLimits,
     state: Arc<dyn StateSource>,
-    /// Capture every forwarded exchange into the kit's capture log.
-    capture_all: bool,
+    /// Open a capture log: `Some(true)` takes every forwarded exchange,
+    /// `Some(false)` only those a `capture` action selects.
+    capture: Option<bool>,
+    secrets: HashMap<String, String>,
+    /// `address_lists:` by name, as list source text.
+    address_lists: HashMap<String, String>,
+    deny_lists: Vec<String>,
+    ws_message_every: u64,
+    connection_events: bool,
+    log_gate: Option<Arc<LogGate>>,
 }
 
 impl KitBuilder {
     /// Opens a capture log that takes every forwarded exchange.
     #[must_use]
     pub(crate) fn capture_all(mut self) -> Self {
-        self.capture_all = true;
+        self.capture = Some(true);
+        self
+    }
+
+    /// Opens a capture log that takes the exchanges a `capture` action
+    /// selects.
+    #[must_use]
+    pub(crate) fn capture_selected(mut self) -> Self {
+        self.capture = Some(false);
+        self
+    }
+
+    /// A secret for `${secret:name}`, scrubbed from the flow log.
+    #[must_use]
+    pub(crate) fn secret(mut self, name: &str, value: &str) -> Self {
+        self.secrets.insert(name.to_owned(), value.to_owned());
+        self
+    }
+
+    /// An address list (`@name` in rules, or a deny list), as list source
+    /// text: one address or CIDR per line.
+    #[must_use]
+    pub(crate) fn address_list(mut self, name: &str, text: &str) -> Self {
+        self.address_lists.insert(name.to_owned(), text.to_owned());
+        self
+    }
+
+    /// `upstream.deny_lists`.
+    #[must_use]
+    pub(crate) fn deny_lists(mut self, names: &[&str]) -> Self {
+        self.deny_lists = names.iter().map(|n| (*n).to_owned()).collect();
+        self
+    }
+
+    /// `log.flow.ws_message_every`.
+    #[must_use]
+    pub(crate) fn ws_message_every(mut self, n: u64) -> Self {
+        self.ws_message_every = n;
+        self
+    }
+
+    /// `log.flow.connection_events`.
+    #[must_use]
+    pub(crate) fn connection_events(mut self) -> Self {
+        self.connection_events = true;
+        self
+    }
+
+    /// Puts the flow sink behind `gate`: while it is closed the sink is not
+    /// ready and traffic waits.
+    #[must_use]
+    pub(crate) fn log_gate(mut self, gate: Arc<LogGate>) -> Self {
+        self.log_gate = Some(gate);
+        self
+    }
+
+    /// The real metric store's size caps.
+    #[must_use]
+    pub(crate) fn metric_limits(mut self, f: impl FnOnce(&mut roxy_rules::MetricLimits)) -> Self {
+        f(&mut self.metric_limits);
         self
     }
 
@@ -209,10 +335,10 @@ impl KitBuilder {
         self
     }
 
-    /// The metric store (default: none, every read unavailable).
+    /// The metric store, used even when there are metric definitions.
     #[must_use]
     pub(crate) fn metrics(mut self, m: Arc<dyn MetricSource>) -> Self {
-        self.metrics = m;
+        self.metrics = Some(m);
         self
     }
 
@@ -245,24 +371,19 @@ impl KitBuilder {
         } else {
             serde_yaml_ng::from_str(&self.metric_defs).unwrap()
         };
-        let none = std::collections::HashSet::new();
+        let base = PolicyBase::new(self.secrets, &self.address_lists, self.deny_lists);
+        let secret_names = base.secrets.keys().cloned().collect();
+        let list_names = base.address_lists.keys().cloned().collect();
         let input = PolicyInput {
             rules: &rules,
             metrics: &metric_defs,
-            secret_names: &none,
-            address_lists: &none,
+            secret_names: &secret_names,
+            address_lists: &list_names,
             default: DefaultDecision::Deny,
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
 
-        let metrics: Arc<dyn MetricSource> = if metric_defs.is_empty() {
-            self.metrics
-        } else {
-            Arc::new(StoreMetrics(roxy_rules::MetricStore::new(
-                policy.metric_defs(),
-                1000,
-            )))
-        };
+        let metrics = metric_source(self.metrics, &policy, self.metric_limits);
 
         let rt = roxy_wasm::WasmRuntime::new().unwrap();
         let mut addons = Vec::new();
@@ -273,8 +394,12 @@ impl KitBuilder {
         let settings = upstream_settings(&upstream);
         let (limits, flags, http) = (self.limits.clone(), self.flags.clone(), self.http.clone());
         let capture = self
-            .capture_all
-            .then(|| Arc::new(capture_all_log(&dir.path().join("capture"))));
+            .capture
+            .map(|all| Arc::new(capture_log(&dir.path().join("capture"), all)));
+        let server_sink: Arc<dyn FlowSink> = match &self.log_gate {
+            Some(gate) => Arc::new(gate::GatedSink::new(sink.clone(), gate.clone())),
+            None => sink.clone(),
+        };
         let server = Server::start(RuntimeConfig {
             listeners: Vec::new(),
             ca_server: None,
@@ -289,23 +414,23 @@ impl KitBuilder {
             },
             max_connections: 1024,
             max_connections_per_client: 1024,
-            connection_events: false,
-            ws_message_every: 0,
-            sink: sink.clone(),
+            connection_events: self.connection_events,
+            ws_message_every: self.ws_message_every,
+            sink: server_sink,
             capture: capture.clone(),
             metrics,
             state: self.state,
             policy: PolicyUpdate {
                 policy,
-                secrets: HashMap::new(),
-                redactor: Redactor::new(),
+                secrets: base.secrets.clone(),
+                redactor: base.redactor(),
                 users: HashMap::new(),
                 limits: self.limits,
                 flags: self.flags,
                 http: self.http,
                 upstream: settings.clone(),
-                address_lists: Arc::new(HashMap::new()),
-                deny_lists: Vec::new(),
+                address_lists: base.address_lists.clone(),
+                deny_lists: base.deny_lists.clone(),
                 addons,
             },
         })
@@ -321,8 +446,46 @@ impl KitBuilder {
             flags,
             http,
             settings,
+            base,
             _dir: dir,
         }
+    }
+}
+
+/// What every policy of a kit shares: its secrets and address lists.
+struct PolicyBase {
+    secrets: HashMap<String, String>,
+    address_lists: Arc<AddressLists>,
+    deny_lists: Vec<String>,
+}
+
+impl PolicyBase {
+    /// Parses each address list's source text; a malformed list panics.
+    fn new(
+        secrets: HashMap<String, String>,
+        lists: &HashMap<String, String>,
+        deny_lists: Vec<String>,
+    ) -> Self {
+        let address_lists: AddressLists = lists
+            .iter()
+            .map(|(name, text)| {
+                let list = AddressList::parse(name, text).unwrap_or_else(|e| panic!("{e}"));
+                (name.clone(), Arc::new(list))
+            })
+            .collect();
+        Self {
+            secrets,
+            address_lists: Arc::new(address_lists),
+            deny_lists,
+        }
+    }
+
+    fn redactor(&self) -> Redactor {
+        let mut r = Redactor::new();
+        for v in self.secrets.values() {
+            r.add_secret(v.clone());
+        }
+        r
     }
 }
 
@@ -338,6 +501,7 @@ pub(crate) struct Kit {
     pub(crate) flags: HttpFlags,
     pub(crate) http: HttpBehaviour,
     settings: UpstreamSettings,
+    base: PolicyBase,
     _dir: tempfile::TempDir,
 }
 
@@ -349,10 +513,20 @@ impl Kit {
             limits: Limits::default(),
             flags: HttpFlags::default(),
             http: HttpBehaviour::default(),
-            metrics: Arc::new(UnavailableMetrics),
+            metrics: None,
             metric_defs: String::new(),
+            metric_limits: roxy_rules::MetricLimits {
+                max_keys: 1000,
+                ..roxy_rules::MetricLimits::default()
+            },
             state: Arc::new(UnavailableState),
-            capture_all: false,
+            capture: None,
+            secrets: HashMap::new(),
+            address_lists: HashMap::new(),
+            deny_lists: Vec::new(),
+            ws_message_every: 0,
+            connection_events: false,
+            log_gate: None,
         }
     }
 
@@ -435,6 +609,15 @@ impl Kit {
         ));
     }
 
+    /// Sends `bytes` on a fresh proxy-port connection and reads until EOF
+    /// (or 10 s): what came back, and whether the connection closed.
+    pub(crate) async fn raw(&self, bytes: &[u8]) -> (String, bool) {
+        let mut io = self.connect();
+        io.write_all(bytes).await.unwrap();
+        let (out, eof) = read_to_eof(&mut io).await;
+        (String::from_utf8_lossy(&out).into_owned(), eof)
+    }
+
     /// An HTTP/1.1 client on the proxy port (absolute-form requests).
     pub(crate) async fn h1(&self) -> Client {
         Client::h1(self.connect(), None).await
@@ -485,21 +668,30 @@ impl Kit {
         .clone()
     }
 
-    async fn tls_client<IO>(&self, io: IO, host: &str, h2: bool) -> Client
+    /// TLS for `host` over `io`, trusting roxy's CA and offering `alpn`.
+    pub(crate) async fn tls_connect<IO>(
+        &self,
+        io: IO,
+        host: &str,
+        alpn: &[&[u8]],
+    ) -> std::io::Result<tokio_rustls::client::TlsStream<IO>>
     where
         IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
         let mut cfg = self.client_tls();
-        cfg.alpn_protocols = vec![if h2 {
-            b"h2".to_vec()
-        } else {
-            b"http/1.1".to_vec()
-        }];
+        cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
         let name = roxy_tls::server_name_for_host(host).unwrap();
-        let tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+        tokio_rustls::TlsConnector::from(Arc::new(cfg))
             .connect(name, io)
             .await
-            .unwrap();
+    }
+
+    async fn tls_client<IO>(&self, io: IO, host: &str, h2: bool) -> Client
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let alpn: &[&[u8]] = if h2 { &[b"h2"] } else { &[b"http/1.1"] };
+        let tls = self.tls_connect(io, host, alpn).await.unwrap();
         if h2 {
             Client::h2(tls, host).await
         } else {
@@ -533,6 +725,19 @@ impl Kit {
         (status, Some(TokioIo::new(up)))
     }
 
+    /// A WebSocket to `http://up.test<path>` on the proxy port, after a
+    /// `101`.
+    pub(crate) async fn ws(&self, path: &str, headers: &[(&str, &str)]) -> Ws {
+        let (status, io) = self.websocket(path, headers).await;
+        assert_eq!(status, 101);
+        tokio_tungstenite::WebSocketStream::from_raw_socket(
+            io.unwrap(),
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await
+    }
+
     /// Waits until `n` events of `kind` were logged; returns them.
     pub(crate) async fn events(&self, kind: &str, n: usize) -> Vec<serde_json::Value> {
         self.sink.wait_for(kind, n, Duration::from_secs(10)).await
@@ -544,30 +749,31 @@ impl Kit {
     }
 
     /// Swaps in a new policy with these rules (no metrics, no addons); the
-    /// limits, flags and upstream settings stay.
+    /// limits, flags, upstream settings, secrets and address lists stay.
     pub(crate) fn reload(&self, rules: &str) {
         let rules: Vec<RuleConfig> = serde_yaml_ng::from_str(rules).unwrap();
-        let none = std::collections::HashSet::new();
+        let secret_names = self.base.secrets.keys().cloned().collect();
+        let list_names = self.base.address_lists.keys().cloned().collect();
         let input = PolicyInput {
             rules: &rules,
             metrics: &[],
-            secret_names: &none,
-            address_lists: &none,
+            secret_names: &secret_names,
+            address_lists: &list_names,
             default: DefaultDecision::Deny,
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
         self.server
             .reload(PolicyUpdate {
                 policy,
-                secrets: HashMap::new(),
-                redactor: Redactor::new(),
+                secrets: self.base.secrets.clone(),
+                redactor: self.base.redactor(),
                 users: HashMap::new(),
                 limits: self.limits.clone(),
                 flags: self.flags.clone(),
                 http: self.http.clone(),
                 upstream: self.settings.clone(),
-                address_lists: Arc::new(HashMap::new()),
-                deny_lists: Vec::new(),
+                address_lists: self.base.address_lists.clone(),
+                deny_lists: self.base.deny_lists.clone(),
                 addons: Vec::new(),
             })
             .unwrap();
@@ -660,6 +866,18 @@ impl Client {
     pub(crate) fn kill(&self) {
         match self {
             Self::H1 { conn, .. } | Self::H2 { conn, .. } => conn.abort(),
+        }
+    }
+
+    /// Waits until roxy has closed the connection.
+    pub(crate) async fn closed(&mut self) {
+        match self {
+            Self::H1 { conn, .. } | Self::H2 { conn, .. } => {
+                tokio::time::timeout(Duration::from_secs(10), conn)
+                    .await
+                    .expect("the connection closes")
+                    .unwrap();
+            }
         }
     }
 
@@ -833,13 +1051,86 @@ fn stalled() -> crate::io::BoxIo {
     Box::new(theirs)
 }
 
-/// A capture log in `dir` that takes every forwarded exchange.
-fn capture_all_log(dir: &std::path::Path) -> crate::capture::CaptureLog {
+/// Reads a response head byte by byte (so nothing after it is consumed).
+pub(crate) async fn read_head<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> String {
+    let mut buf = Vec::new();
+    loop {
+        let mut b = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(10), r.read(&mut b))
+            .await
+            .expect("timed out reading a response head")
+            .unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.push(b[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Reads one response (head + `content-length` body).
+pub(crate) async fn read_response<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> (String, Vec<u8>) {
+    let head = read_head(r).await;
+    let len = head
+        .to_ascii_lowercase()
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("content-length: ")
+                .map(|v| v.trim().parse::<usize>().unwrap())
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; len];
+    tokio::time::timeout(Duration::from_secs(10), r.read_exact(&mut body))
+        .await
+        .expect("timed out reading a body")
+        .unwrap();
+    (head, body)
+}
+
+/// Reads until EOF (or 10 s). Returns what was read and whether EOF was
+/// seen.
+pub(crate) async fn read_to_eof<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), r.read(&mut buf)).await {
+            Ok(Ok(0) | Err(_)) => return (out, true),
+            Ok(Ok(n)) => out.extend_from_slice(&buf[..n]),
+            Err(_) => return (out, false),
+        }
+    }
+}
+
+/// A WebSocket client over a tunnel the kit opened.
+pub(crate) type Ws = tokio_tungstenite::WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>;
+
+/// The metric store a kit runs with: the explicit one if given, else a
+/// real store for the policy's metric definitions, else none.
+fn metric_source(
+    explicit: Option<Arc<dyn MetricSource>>,
+    policy: &Policy,
+    limits: roxy_rules::MetricLimits,
+) -> Arc<dyn MetricSource> {
+    match explicit {
+        Some(m) => m,
+        None if policy.metric_defs().is_empty() => Arc::new(UnavailableMetrics),
+        None => Arc::new(StoreMetrics(roxy_rules::MetricStore::with_limits(
+            policy.metric_defs(),
+            limits,
+        ))),
+    }
+}
+
+/// A capture log in `dir`; `all` takes every forwarded exchange.
+fn capture_log(dir: &std::path::Path, all: bool) -> crate::capture::CaptureLog {
     crate::capture::CaptureLog::open(
         dir,
         crate::capture::CaptureOptions {
             max_body_bytes: 16 * 1024 * 1024,
-            all: true,
+            all,
             writer: roxy_log::WriterOptions::default(),
             rotate: roxy_log::RotateOptions::default(),
         },
@@ -861,9 +1152,7 @@ impl MetricSource for StoreMetrics {
         id: &str,
         view: &dyn roxy_rules::FlowView,
     ) -> Result<i64, crate::sources::MetricSourceError> {
-        self.0
-            .get(id, view)
-            .map_err(|e| crate::sources::MetricSourceError::Unknown(e.to_string()))
+        self.0.get(id, view).map_err(Into::into)
     }
 
     fn record(
@@ -878,9 +1167,7 @@ impl MetricSource for StoreMetrics {
             denied: sample.denied,
             error: sample.error,
         };
-        self.0
-            .record(view, &s)
-            .map_err(|e| crate::sources::MetricSourceError::Unknown(e.to_string()))
+        self.0.record(view, &s).map_err(Into::into)
     }
 }
 
@@ -914,5 +1201,8 @@ mod smoke {
         }
         let seen = kit.upstream.wait_seen(2).await;
         assert!(seen.iter().all(|s| s.addr.port() == 443));
+        let ev = kit.events("request", 2).await;
+        let alpn: Vec<_> = ev.iter().map(|e| e["tls"]["alpn"].clone()).collect();
+        assert_eq!(alpn, ["http/1.1", "h2"], "{ev:#?}");
     }
 }
