@@ -51,22 +51,7 @@ pub(crate) fn parse_inner(src: &str) -> Result<Node, ExprError> {
 }
 
 fn is_cmp_start(t: &Tok) -> bool {
-    matches!(
-        t,
-        Tok::Eq
-            | Tok::Ne
-            | Tok::Lt
-            | Tok::Le
-            | Tok::Gt
-            | Tok::Ge
-            | Tok::In
-            | Tok::StartsWith
-            | Tok::EndsWith
-            | Tok::Contains
-            | Tok::Like
-            | Tok::Matches
-            | Tok::Under
-    )
+    matches!(t, Tok::Op(_))
 }
 
 struct Parser {
@@ -123,7 +108,17 @@ impl Parser {
             let (l_bp, r_bp, is_or) = match self.peek().tok {
                 Tok::Or => (1, 2, true),
                 Tok::And => (3, 4, false),
-                _ => break,
+                Tok::Ident(_)
+                | Tok::Lit(_)
+                | Tok::Op(_)
+                | Tok::Not
+                | Tok::LParen
+                | Tok::RParen
+                | Tok::LBracket
+                | Tok::RBracket
+                | Tok::Comma
+                | Tok::Dot
+                | Tok::Eof => break,
             };
             if l_bp < min_bp {
                 break;
@@ -166,7 +161,17 @@ impl Parser {
                 self.depth -= 1;
                 Ok(inner)
             }
-            _ => self.comparison(),
+            Tok::Ident(_)
+            | Tok::Lit(_)
+            | Tok::Op(_)
+            | Tok::And
+            | Tok::Or
+            | Tok::RParen
+            | Tok::LBracket
+            | Tok::RBracket
+            | Tok::Comma
+            | Tok::Dot
+            | Tok::Eof => self.comparison(),
         }
     }
 
@@ -188,21 +193,9 @@ impl Parser {
     fn cmp_op(&mut self) -> Result<Option<Op>, ExprError> {
         let t = self.peek().clone();
         let op = match t.tok {
-            Tok::Eq => Op::Eq,
-            Tok::Ne => Op::Ne,
-            Tok::Lt => Op::Lt,
-            Tok::Le => Op::Le,
-            Tok::Gt => Op::Gt,
-            Tok::Ge => Op::Ge,
-            Tok::In => Op::In,
-            Tok::StartsWith => Op::StartsWith,
-            Tok::EndsWith => Op::EndsWith,
-            Tok::Contains => Op::Contains,
-            Tok::Like => Op::Like,
-            Tok::Matches => Op::Matches,
-            Tok::Under => Op::Under,
+            Tok::Op(op) => op,
             Tok::Not => {
-                if *self.peek_at(1) == Tok::In {
+                if *self.peek_at(1) == Tok::Op(Op::In) {
                     self.bump();
                     self.bump();
                     return Ok(Some(Op::NotIn));
@@ -212,7 +205,17 @@ impl Parser {
                     "unexpected `not` after an operand; did you mean `not in`?",
                 ));
             }
-            _ => return Ok(None),
+            Tok::Ident(_)
+            | Tok::Lit(_)
+            | Tok::And
+            | Tok::Or
+            | Tok::LParen
+            | Tok::RParen
+            | Tok::LBracket
+            | Tok::RBracket
+            | Tok::Comma
+            | Tok::Dot
+            | Tok::Eof => return Ok(None),
         };
         self.bump();
         Ok(Some(op))
@@ -235,27 +238,23 @@ impl Parser {
         while self.peek().tok == Tok::Dot {
             self.bump();
             let t = self.bump();
-            match t.tok {
-                Tok::Ident(seg) => {
-                    path.push(seg);
-                    span = span.to(t.span);
-                }
-                other => {
-                    return Err(ExprError::new(
-                        t.span,
-                        format!(
-                            "expected a field name after `.`, found {}",
-                            other.describe()
-                        ),
-                    ));
-                }
-            }
+            let Tok::Ident(seg) = t.tok else {
+                return Err(ExprError::new(
+                    t.span,
+                    format!(
+                        "expected a field name after `.`, found {}",
+                        t.tok.describe()
+                    ),
+                ));
+            };
+            path.push(seg);
+            span = span.to(t.span);
         }
         let mut index = None;
         if self.peek().tok == Tok::LBracket {
             self.bump();
             let t = self.bump();
-            let Tok::Str(key) = t.tok else {
+            let Tok::Lit(Lit::Str(key)) = t.tok else {
                 return Err(ExprError::new(
                     t.span,
                     format!(
@@ -274,23 +273,14 @@ impl Parser {
 
     fn literal(&mut self) -> Result<LitNode, ExprError> {
         let t = self.bump();
-        let lit = match t.tok {
-            Tok::Str(s) => Lit::Str(s),
-            Tok::Int(n, unit) => Lit::Int(n, unit),
-            Tok::True => Lit::Bool(true),
-            Tok::Null => Lit::Null,
-            Tok::False => Lit::Bool(false),
-            Tok::Ip(ip) => Lit::Ip(ip),
-            Tok::Cidr(net) => Lit::Cidr(net),
-            Tok::ListRef(n) => Lit::AddressList(n),
-            Tok::Upper(m) => Lit::Method(m),
-            Tok::LBracket => return self.list(t.span),
-            other => {
-                return Err(ExprError::new(
-                    t.span,
-                    format!("expected a field or a value, found {}", other.describe()),
-                ));
-            }
+        if t.tok == Tok::LBracket {
+            return self.list(t.span);
+        }
+        let Tok::Lit(lit) = t.tok else {
+            return Err(ExprError::new(
+                t.span,
+                format!("expected a field or a value, found {}", t.tok.describe()),
+            ));
         };
         Ok(LitNode { lit, span: t.span })
     }
@@ -314,21 +304,18 @@ impl Parser {
             }
             items.push(self.literal()?);
             let t = self.bump();
-            match t.tok {
-                Tok::Comma => {}
-                Tok::RBracket => {
-                    self.depth -= 1;
-                    return Ok(LitNode {
-                        lit: Lit::List(items),
-                        span: open.to(t.span),
-                    });
-                }
-                other => {
-                    return Err(ExprError::new(
-                        t.span,
-                        format!("expected `,` or `]` in list, found {}", other.describe()),
-                    ));
-                }
+            if t.tok == Tok::RBracket {
+                self.depth -= 1;
+                return Ok(LitNode {
+                    lit: Lit::List(items),
+                    span: open.to(t.span),
+                });
+            }
+            if t.tok != Tok::Comma {
+                return Err(ExprError::new(
+                    t.span,
+                    format!("expected `,` or `]` in list, found {}", t.tok.describe()),
+                ));
             }
         }
     }
