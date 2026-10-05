@@ -742,6 +742,34 @@ mod service {
         no_layer_error(&kit);
     }
 
+    /// A service that sends more of the request it forwards than it
+    /// declared fails as a protocol violation, logged against it, though
+    /// the exchange is still below the layer when it happens: here the
+    /// rules read the body, and the core ends on its failure.
+    #[tokio::test]
+    async fn a_forwarded_body_longer_than_declared_is_the_services_fault() {
+        const READS_BODY: &str = r#"
+- id: secret
+  when: host == "up.test" and body.text contains "SECRET"
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+        let kit = kit(
+            READS_BODY,
+            vec![addon("s", "overlong", AddonMode::Enforce, |_| {})],
+        )
+        .await;
+        let a = kit.h1().await.call("POST", "/x", &[], b"body").await;
+        assert_eq!(a.status, 503, "{a:?}");
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
+        assert_eq!(errs[0]["kind"], "service:protocol", "{errs:#?}");
+        let ev = kit.request_event().await;
+        assert_eq!(ev["reason"], "layer_error", "{ev:#}");
+    }
+
     /// What a service sends on an observe stream is discarded and credited
     /// back as it goes, so a service that keeps to its credit can send
     /// several windows' worth while the stream is open.

@@ -503,6 +503,19 @@ impl Stream {
         {
             self.link.shared.send_ctl(self.id, &Out::Reset { message });
         }
+        // Recorded before anything learns of the end: the exchange may
+        // finish on a body aborted here (the core failing on the request
+        // the service forwarded, say) before any answer is read.
+        let blame = if let Unanswered::Service(e) = &e
+            && self.mode == AddonMode::Enforce
+        {
+            let name = self.name();
+            let err = StackError::Service(e.clone());
+            self.st.fail(&name, err.clone());
+            Some((name, err))
+        } else {
+            None
+        };
         for inbox in inboxes.into_iter().flatten() {
             inbox.abort(&e);
         }
@@ -512,14 +525,9 @@ impl Stream {
             && !tx.is_closed()
         {
             let _ = tx.send(Err(e));
-        } else if let Unanswered::Service(e) = e
-            && self.mode == AddonMode::Enforce
-        {
+        } else if let Some((name, err)) = blame {
             // The head has gone on: the failure is logged here, since no
             // answer carries it.
-            let name = self.name();
-            let err = StackError::Service(e);
-            self.st.fail(&name, err.clone());
             super::super::emit_stack_error(&self.st, &name, &err, AddonMode::Enforce);
         }
     }
