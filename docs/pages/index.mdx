@@ -19,22 +19,22 @@ roxy terminates TLS with certificates from its own CA and parses each request in
 
 ## Addons
 
-Logic that needs to understand the traffic goes in an addon: a WASM component that runs in process, or an external service that the traffic streams through. An addon owns both streams of the exchanges it chooses. It can rewrite, withhold, answer or block. This one judges an agent's model calls with a monitor model before they leave, and a second addon gets a copy of one write in ten for an external audit service:
+Logic that needs to understand the traffic goes in an addon: an external service that the traffic streams through, or a WASM component that runs in process. An addon owns both streams of the exchanges it chooses. It can rewrite, withhold, answer or block. Here a sentinel runs as a sidecar and holds each of an agent's model calls until it has judged it, and a second addon gets a copy of one write in ten for an external audit service:
 
 ```yaml
 addons:                                    # above the rules, outermost first
-  - name: sentinel                         # a WASM component, run in process
-    path: /etc/roxy/addons/sentinel.wasm
-    when: host == "api.anthropic.com" and path starts_with "/v1/messages"
-    capabilities: [endpoints, record]
-    endpoints:
-      monitor:                             # the addon names it; roxy holds the key
-        url: https://api.anthropic.com/v1/messages
-        headers: { x-api-key: "${secret:monitor_key}" }
-
-  - name: audit-tap                        # an external service, sent a copy
+  - name: sentinel                         # a sidecar the exchange streams through
     kind: service
-    mode: observe                          # can't change or delay traffic
+    when: host == "api.anthropic.com" and path starts_with "/v1/messages"
+    endpoint: sidecar
+    endpoints:
+      sidecar: { url: "http://sentinel:9000/", private_ok: true }
+    limits:
+      first_byte_timeout: 120s             # how long it has to decide before roxy denies
+
+  - name: audit-tap                        # sent a copy; can't change or delay traffic
+    kind: service
+    mode: observe
     when: method in [POST, PUT, PATCH, DELETE]
     sample: 0.1
     endpoint: tap
@@ -42,7 +42,7 @@ addons:                                    # above the rules, outermost first
       tap: { url: "https://audit.internal/roxy", private_ok: true }
 ```
 
-Whatever `sentinel` passes on is still judged by the rules. If it fails, the flow is denied. [Addons](/addons/overview) covers the model, [writing one](/addons/writing) the SDK.
+Whatever `sentinel` passes on is still judged by the rules. If it fails, the flow is denied. [Addons](/addons/overview) covers the model, [service layers](/addons/service-layers) the protocol, and [writing one](/addons/writing) the WASM SDK.
 
 ## Rules
 
