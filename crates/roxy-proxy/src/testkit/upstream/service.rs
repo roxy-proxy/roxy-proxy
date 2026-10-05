@@ -11,6 +11,8 @@
 //!   body roxy sends stops at its first window;
 //! * `/svc/forward`: passes the request through as `/svc/pass` does, and
 //!   never answers the response;
+//! * `/svc/overlong`: answers each request head by forwarding it with
+//!   `content-length: 3` and 5 bytes of body;
 //! * `/svc/talk`: sends [`TALK_BYTES`] of request body on each stream as
 //!   it opens, with no head, within the credit roxy grants, and logs the
 //!   stream once all of it has gone;
@@ -242,6 +244,7 @@ enum Mode {
     Hold,
     Hoard,
     Forward,
+    Overlong,
     Talk,
     Flood,
     Pause,
@@ -258,6 +261,8 @@ impl Mode {
             Self::Hoard
         } else if path.ends_with("/forward") {
             Self::Forward
+        } else if path.ends_with("/overlong") {
+            Self::Overlong
         } else if path.ends_with("/talk") {
             Self::Talk
         } else if path.ends_with("/pause") {
@@ -301,7 +306,7 @@ impl Conn {
         match self.mode {
             Mode::Pass | Mode::Hoard | Mode::Slow => true,
             Mode::Hold | Mode::Forward => dir == REQUEST,
-            Mode::Talk | Mode::Flood | Mode::Pause => false,
+            Mode::Overlong | Mode::Talk | Mode::Flood | Mode::Pause => false,
         }
     }
 
@@ -325,6 +330,7 @@ impl Conn {
                     | Mode::Hold
                     | Mode::Hoard
                     | Mode::Forward
+                    | Mode::Overlong
                     | Mode::Pause
                     | Mode::Slow => {}
                     Mode::Talk => {
@@ -346,6 +352,19 @@ impl Conn {
                     s.lanes[usize::from(dir)].credit += n;
                 }
                 self.flush(id, dir);
+            }
+            "request" if self.mode == Mode::Overlong => {
+                self.send(text(
+                    id,
+                    json!({
+                        "type": "request",
+                        "method": v["method"],
+                        "url": v["url"],
+                        "headers": [["content-length", "3"]],
+                    }),
+                ));
+                self.send(binary(id, REQUEST, b"12345"));
+                self.send(text(id, json!({"type": "request_end"})));
             }
             "reset" => {
                 let msg = v["message"].as_str().unwrap_or_default().to_owned();
