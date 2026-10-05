@@ -110,6 +110,7 @@ fn minimal_config_uses_defaults() {
     assert_eq!(l.max_response_body_bytes.as_u64(), 1 << 30);
     assert_eq!(l.max_inspect_body_bytes.as_u64(), 1 << 20);
     assert_eq!(l.max_ws_message_bytes.as_u64(), 16 << 20);
+    assert_eq!(l.max_observer_lag_bytes.as_u64(), 16 << 20);
     assert_eq!(l.header_timeout, Duration::from_secs(10));
     assert_eq!(l.body_idle_timeout, Duration::from_secs(30));
     assert_eq!(l.max_connections_per_client, 256);
@@ -296,6 +297,7 @@ fn zero_limits_diagnosed() {
         "max_metric_bytes",
         "max_state_entries",
         "max_address_list_bytes",
+        "max_observer_lag_bytes",
     ] {
         let d = diagnostics(&format!("{BASE}limits: {{ {field}: 0 }}\n"));
         assert_eq!(d.len(), 1, "{field}: {d:?}");

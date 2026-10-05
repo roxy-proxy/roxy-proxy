@@ -25,6 +25,9 @@ pub struct Limits {
     /// Cap for a reassembled WebSocket message when rules read messages
     /// (`ws::frame::Decoder`).
     pub max_ws_message_bytes: u64,
+    /// How far behind the real body an observe-mode addon's copy may fall,
+    /// in buffered bytes per direction, before the copy is cut.
+    pub max_observer_lag_bytes: u64,
     /// Deadline for receiving a complete request head once it has started
     /// (and for the first request on a connection, from accept).
     pub header_timeout: Duration,
@@ -51,6 +54,7 @@ impl Default for Limits {
             max_response_body_bytes: GIB,
             max_inspect_body_bytes: MIB,
             max_ws_message_bytes: 16 * MIB,
+            max_observer_lag_bytes: 16 * MIB,
             header_timeout: Duration::from_secs(10),
             body_idle_timeout: Duration::from_secs(30),
             response_header_timeout: Duration::from_secs(60),

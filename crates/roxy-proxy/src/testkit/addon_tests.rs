@@ -626,13 +626,58 @@ mod service {
         );
     }
 
-    /// An observer that holds its copy without reading it is lagging: the
-    /// copy is cut and reported, and the real body goes through whole.
+    /// An observer that keeps up on average sees whole bodies: the copy is
+    /// buffered for it up to `limits.max_observer_lag_bytes`, so an upload
+    /// that lands whole while the service is not reading still reaches it
+    /// whole, with the response after it.
+    #[tokio::test]
+    async fn a_fast_upload_reaches_an_observer_whole() {
+        let kit = kit(RULES, vec![addon("o", "pause", AddonMode::Observe, |_| {})]).await;
+        let mut c = kit.h1().await;
+        let upload = 4 * 1024 * 1024;
+        let req = c
+            .request("POST", "/x", &[])
+            .body(roxy_http::Body::from_bytes(Bytes::from(vec![b'x'; upload])))
+            .unwrap();
+        let a = Answer::read(c.send(req).await.unwrap()).await;
+        assert_eq!(a.status, 200, "{a:?}");
+        assert_eq!(a.json()["body_len"], upload);
+        kit.request_event().await;
+        // Both copies travel on the observer's one stream.
+        let stream = kit.upstream.service().until_opened(1).await[0]["stream"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap();
+        let copied = upload + a.body.as_ref().unwrap().len();
+        kit.upstream.service().until_received(stream, copied).await;
+        assert_eq!(kit.upstream.service().received(stream), copied);
+        let lagged: Vec<_> = kit
+            .sink
+            .events()
+            .into_iter()
+            .filter(|e| e["event"] == "observer_lagged")
+            .collect();
+        assert!(lagged.is_empty(), "{lagged:#?}");
+    }
+
+    /// An observer that holds its copy without reading it is lagging: once
+    /// the copy is `max_observer_lag_bytes` behind it is cut and reported,
+    /// and the real body goes through whole.
     #[tokio::test]
     async fn a_slow_observer_is_cut_and_reported_while_the_body_goes_through() {
         // The service never reads (and so never grants credit): the copy
         // stalls once the stream's window is spent.
-        let kit = kit(RULES, vec![addon("o", "stall", AddonMode::Observe, |_| {})]).await;
+        let kit = Kit::builder()
+            .rules(RULES)
+            .limits(|l| l.max_observer_lag_bytes = 64 * 1024)
+            .start()
+            .await;
+        reload(
+            &kit,
+            RULES,
+            &[],
+            vec![addon("o", "stall", AddonMode::Observe, |_| {})],
+        );
         let mut c = kit.h1().await;
         let (mut tx, body) = streaming_body();
         let req = c.request("POST", "/x", &[]).body(body).unwrap();

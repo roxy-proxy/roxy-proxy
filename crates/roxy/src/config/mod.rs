@@ -305,6 +305,11 @@ pub struct Limits {
     pub max_ws_message_bytes: ByteSize,
     #[serde(deserialize_with = "units::size")]
     pub max_capture_body_bytes: ByteSize,
+    /// Bytes buffered per direction for an observe-mode addon's copy of a
+    /// body; an observer further behind the real exchange than this has its
+    /// copy cut.
+    #[serde(deserialize_with = "units::size")]
+    pub max_observer_lag_bytes: ByteSize,
     #[serde(with = "humantime_serde")]
     pub header_timeout: Duration,
     #[serde(with = "humantime_serde")]
@@ -353,6 +358,7 @@ impl Default for Limits {
             max_inspect_body_bytes: ByteSize::b(MIB),
             max_ws_message_bytes: ByteSize::b(16 * MIB),
             max_capture_body_bytes: ByteSize::b(16 * MIB),
+            max_observer_lag_bytes: ByteSize::b(16 * MIB),
             header_timeout: Duration::from_secs(10),
             body_idle_timeout: Duration::from_secs(30),
             response_header_timeout: Duration::from_secs(60),

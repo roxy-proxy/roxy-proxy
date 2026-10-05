@@ -1,8 +1,9 @@
 //! Observe mode: a layer gets a copy of both streams and can
 //! neither change nor delay the real ones.
 //!
-//! The copy is a bounded channel fed as the real body is forwarded. If the
-//! observer does not keep up, its copy is cut (the observer sees a body
+//! The copy is fed as the real body is forwarded and buffered for the
+//! observer up to `limits.max_observer_lag_bytes` per direction. An
+//! observer further behind than that has its copy cut (it sees a body
 //! error) and an `observer_lagged` event is logged; the real traffic never
 //! waits. This is deliberately lossy: the observer is not the audit log,
 //! which keeps its own backpressure. An observer that drops its copy is
@@ -11,14 +12,14 @@
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
-use roxy_http::{Body, BodyError, BodySender};
+use roxy_http::{Body, BodyError};
 use roxy_wasm::{HostError, LayerRequest, LayerResponse};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use super::StackFlow;
 use crate::flowlog::FlowEvent;
@@ -63,9 +64,95 @@ impl Lag {
     }
 }
 
+/// A frame of the copy, or how it ended.
+enum Msg {
+    Data(Bytes),
+    End,
+    Cut(BodyError),
+}
+
+/// The feeding end of a copy. Frames queue without ever blocking the real
+/// body; the queue is bounded in bytes, not frames, so an observer is cut
+/// for being far behind, never for taking small frames slowly.
+struct CopySender {
+    tx: mpsc::UnboundedSender<Msg>,
+    /// Bytes queued and not yet read by the observer.
+    pending: Arc<AtomicU64>,
+    budget: u64,
+    /// Bytes queued so far, against the real body's declared length.
+    sent: u64,
+    known: Option<u64>,
+}
+
+impl CopySender {
+    fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    /// Queues `data` for the observer; `Err` when it would take the queue
+    /// past the budget or the observer has dropped its copy.
+    fn try_push(&mut self, data: Bytes) -> Result<(), ()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let pending = self.pending.load(Ordering::Relaxed);
+        if pending.saturating_add(len) > self.budget {
+            return Err(());
+        }
+        self.pending.fetch_add(len, Ordering::Relaxed);
+        self.sent = self.sent.saturating_add(len);
+        self.tx.send(Msg::Data(data)).map_err(drop)
+    }
+
+    /// Whether the declared length has all been queued. A consumer that
+    /// knows the length may drop the real body without polling it to its
+    /// end, so the copy cannot wait for that to be finished.
+    fn complete(&self) -> bool {
+        self.known == Some(self.sent)
+    }
+
+    fn finish(self) {
+        let _ = self.tx.send(Msg::End);
+    }
+
+    fn cut(self, e: BodyError) {
+        let _ = self.tx.send(Msg::Cut(e));
+    }
+}
+
+/// The observer's copy: what the real body has produced and the observer
+/// has not yet read.
+struct CopyBody {
+    rx: mpsc::UnboundedReceiver<Msg>,
+    pending: Arc<AtomicU64>,
+}
+
+impl HttpBody for CopyBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        Poll::Ready(match ready!(self.rx.poll_recv(cx)) {
+            Some(Msg::Data(d)) => {
+                let len = u64::try_from(d.len()).unwrap_or(u64::MAX);
+                self.pending.fetch_sub(len, Ordering::Relaxed);
+                Some(Ok(Frame::data(d)))
+            }
+            Some(Msg::End) => None,
+            Some(Msg::Cut(e)) => Some(Err(e)),
+            // The real body was dropped before it ended.
+            None => Some(Err(BodyError::Incomplete)),
+        })
+    }
+}
+
 struct Tee {
     inner: Body,
-    copy: Option<BodySender>,
+    copy: Option<CopySender>,
     lag: Arc<Lag>,
 }
 
@@ -75,7 +162,7 @@ impl Tee {
     fn cut(&mut self) {
         if let Some(c) = self.copy.take() {
             let gone = c.is_closed();
-            c.abort(BodyError::Stopped);
+            c.cut(BodyError::Stopped);
             if !gone {
                 self.lag.report();
             }
@@ -95,23 +182,24 @@ impl HttpBody for Tee {
         let frame = ready!(Pin::new(&mut this.inner).poll_frame(cx));
         match &frame {
             Some(Ok(f)) => {
-                if let (Some(data), Some(copy)) = (f.data_ref(), this.copy.as_mut())
-                    && copy.try_push(data.clone()).is_err()
-                {
-                    this.cut();
+                if let (Some(data), Some(copy)) = (f.data_ref(), this.copy.as_mut()) {
+                    if copy.try_push(data.clone()).is_err() {
+                        this.cut();
+                    } else if copy.complete()
+                        && let Some(c) = this.copy.take()
+                    {
+                        c.finish();
+                    }
                 }
             }
             Some(Err(_)) => {
                 if let Some(c) = this.copy.take() {
-                    c.abort(BodyError::Stopped);
+                    c.cut(BodyError::Stopped);
                 }
             }
             None => {
                 if let Some(c) = this.copy.take() {
-                    let gone = c.is_closed();
-                    if c.try_finish().is_err() && !gone {
-                        this.lag.report();
-                    }
+                    c.finish();
                 }
             }
         }
@@ -128,16 +216,31 @@ impl HttpBody for Tee {
 }
 
 /// Splits `body` into the real body (unchanged, never delayed) and a
-/// best-effort copy.
-fn tee(body: Body, lag: Arc<Lag>) -> (Body, Body) {
+/// best-effort copy buffered up to `budget` bytes.
+fn tee(body: Body, lag: Arc<Lag>, budget: u64) -> (Body, Body) {
     let known = body.known_length();
+    let pending = Arc::new(AtomicU64::new(0));
+    let (tx, rx) = mpsc::unbounded_channel();
     // The copy declares the real body's length, so an empty one reads as
     // empty even if nobody polls the real body to its end.
-    let (tx, copy) = Body::channel(u64::MAX, known);
+    let copy = Body::wrap_native(
+        CopyBody {
+            rx,
+            pending: pending.clone(),
+        },
+        u64::MAX,
+        known,
+    );
     let real = Body::wrap_native(
         Tee {
             inner: body,
-            copy: Some(tx),
+            copy: Some(CopySender {
+                tx,
+                pending,
+                budget,
+                sent: 0,
+                known,
+            }),
             lag,
         },
         u64::MAX,
@@ -164,7 +267,8 @@ pub(crate) async fn observe(
 ) -> Result<LayerResponse, HostError> {
     let addon = st.snap.addons[index].clone();
     let (parts, body) = req.into_parts();
-    let (real_body, copy_body) = tee(body, lag(&st, &addon.name, Dir::Request));
+    let budget = st.snap.limits.max_observer_lag_bytes;
+    let (real_body, copy_body) = tee(body, lag(&st, &addon.name, Dir::Request), budget);
     let mut copy_req = http::Request::new(copy_body);
     *copy_req.method_mut() = parts.method.clone();
     *copy_req.uri_mut() = parts.uri.clone();
@@ -241,7 +345,8 @@ async fn forward(
     match real {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
-            let (real_body, copy_body) = tee(body, lag(&st, name, Dir::Response));
+            let budget = st.snap.limits.max_observer_lag_bytes;
+            let (real_body, copy_body) = tee(body, lag(&st, name, Dir::Response), budget);
             let mut copy = http::Response::new(copy_body);
             *copy.status_mut() = parts.status;
             *copy.headers_mut() = parts.headers.clone();

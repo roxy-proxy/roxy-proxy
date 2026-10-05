@@ -523,7 +523,7 @@ impl Config {
     /// or fail every metric and state rule closed.
     fn validate_limits(&self, d: &mut Vec<Diagnostic>) {
         let l = &self.limits;
-        let floors: [(&str, u64, u64); 10] = [
+        let floors: [(&str, u64, u64); 11] = [
             ("max_headers", l.max_headers as u64, 1),
             ("max_header_bytes", l.max_header_bytes.as_u64(), 1),
             ("max_url_bytes", l.max_url_bytes.as_u64(), 1),
@@ -546,6 +546,11 @@ impl Config {
             ("max_metric_keys", l.max_metric_keys as u64, 1),
             ("max_metric_bytes", l.max_metric_bytes.as_u64(), 1),
             ("max_state_entries", l.max_state_entries as u64, 1),
+            (
+                "max_observer_lag_bytes",
+                l.max_observer_lag_bytes.as_u64(),
+                1,
+            ),
         ];
         for (field, value, floor) in floors {
             if value < floor {

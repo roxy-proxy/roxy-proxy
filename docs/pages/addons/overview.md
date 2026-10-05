@@ -142,12 +142,15 @@ extensions client and upstream agree on.
 
 - `mode: enforce` (default): the layer is in the path and its decisions
   take effect.
-- `mode: observe`: roxy tees both streams to the layer through bounded
-  channels and ignores anything it returns except host-service calls such
-  as `record`. The layer cannot change or delay traffic, so its failures
-  cannot weaken containment: a trap or missed deadline is logged, not fatal, and a
-  copy the layer does not keep up with is cut (`observer_lagged`) rather
-  than stalling the flow. This is the way to deploy an uncalibrated
+- `mode: observe`: roxy tees both streams to the layer and ignores
+  anything it returns except host-service calls such as `record`. Each
+  copy is buffered for the layer up to `limits.max_observer_lag_bytes`
+  (16 MiB by default) per direction, so a layer that keeps up on average
+  sees whole bodies up to that size however fast they arrive. The layer
+  cannot change or delay traffic, so its failures cannot weaken
+  containment: a trap or missed deadline is logged, not fatal, and a copy
+  that falls further behind than the buffer is cut (`observer_lagged`)
+  rather than stalling the flow. This is the way to deploy an uncalibrated
   monitor.
 
 ## In the proxy
