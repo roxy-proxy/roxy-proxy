@@ -410,11 +410,15 @@ class Sidecar:
         try:
             request = json.loads(body)
             response = message_from_sse(raw) if streamed else json.loads(raw)
-        except (ValueError, KeyError, IndexError) as e:
-            log.warning("unreadable model exchange: %s", e)
-            return Refusal("the sentinel could not read this model exchange")
-        call = Call(request, response, streamed)
-        output = await call.output()
+            call = Call(request, response, streamed)
+            output = await call.output()
+        except Exception as e:  # noqa: BLE001
+            # A shape the SDK or inspect's converter does not know (a new
+            # block type, say) cannot be judged, so it is refused.
+            first_line = str(e).partition("\n")[0][:200]
+            error = f"{type(e).__name__}: {first_line}"
+            log.warning("unreadable model exchange: %s", error)
+            return Refusal(f"the sentinel could not read this model exchange ({error})")
         try:
             input = await call.input()
         except Exception as e:  # noqa: BLE001
