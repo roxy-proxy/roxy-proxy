@@ -34,8 +34,8 @@ or reshaped, the store follows the swap, and only an exchange that was
 still finishing under the old policy can find its metric gone (and is then
 failed closed).
 
-Some settings take effect only when roxy starts: `listeners` (including
-`auth`), `ca_server`, `dns`, `tls`, `http.enable_h2`,
+Some settings take effect only when roxy starts: `listeners`, `ca_server`,
+`dns`, `tls`, `http.enable_h2`,
 `limits.max_connections`, `limits.max_connections_per_client`,
 `limits.max_state_entries`, `limits.max_capture_body_bytes`, `log.flow`,
 `log.capture` and `capture_dir`. A reload keeps their running values,

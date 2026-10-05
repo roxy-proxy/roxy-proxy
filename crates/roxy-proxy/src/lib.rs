@@ -9,8 +9,7 @@
 //! - [`listener`]: the [`Listener`] trait (the hook for transparent mode, issue #15) and
 //!   [`TcpProxyListener`] (explicit and direct); [`ClientConn`].
 //! - `conn`: the connection state machines (proxy port, CONNECT, direct
-//!   listeners, sniff, TLS termination, tunnels, `roxy.internal`, proxy
-//!   auth).
+//!   listeners, sniff, TLS termination, tunnels, `roxy.internal`).
 //! - `dns_server`: the DNS listener (UDP and TCP) that steers clients to
 //!   the direct listeners.
 //! - `pipeline`: the core's fixed request and response steps, the
@@ -26,7 +25,6 @@
 //! - [`upstream`]: resolver, address floor, connector and pooled client.
 //! - [`addr`]: the private-range / CIDR address floor.
 //! - [`addrlist`]: compiled address lists (`upstream.deny_lists`, `@list`).
-//! - [`auth`]: `Proxy-Authorization: Basic` against bcrypt users files.
 //! - [`sources`]: the metric and state store traits.
 //! - [`flowlog`]: flow events, sinks and redaction. The file and stdout
 //!   sinks write through `roxy-log` (one writer thread, batching,
@@ -37,7 +35,6 @@
 pub mod addons;
 pub mod addr;
 pub mod addrlist;
-pub mod auth;
 mod body;
 mod budget;
 mod ca_server;
@@ -60,7 +57,6 @@ mod view;
 mod watch;
 
 pub use addrlist::{AddressList, AddressLists, ListError};
-pub use auth::UserDb;
 pub use ca_server::PEM_CONTENT_TYPE;
 pub use capture::{CAPTURE_FILE, CaptureLog, CaptureOptions};
 pub use config::{HttpBehaviour, ListenerKind, ListenerSpec, PolicyUpdate, RuntimeConfig};

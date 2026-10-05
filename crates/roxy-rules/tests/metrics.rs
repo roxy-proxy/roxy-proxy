@@ -353,21 +353,21 @@ fn full_table_reclaims_on_demand() {
 fn key_unavailable() {
     let c = TestClock::new();
     let s = store_with(
-        "- { id: u, count: requests, key: [client.user] }
-- { id: q, count: unique(client.user) }",
+        "- { id: u, count: requests, key: [tls.sni] }
+- { id: q, count: unique(tls.sni) }",
         10,
         &c,
     );
     let want = MetricError::KeyUnavailable {
         metric: "u".into(),
-        field: Field::ClientUser,
+        field: Field::TlsSni,
     };
     assert_eq!(s.get("u", &MapView::new()), Err(want.clone()));
     assert_eq!(s.record(&MapView::new(), &REQ), Err(want));
     assert_eq!(s.key_count(), 0);
-    let with_user = MapView::new().with_str(Field::ClientUser, "alice");
-    rec(&s, &with_user);
-    assert_eq!(s.get("u", &with_user), Ok(1));
+    let with_sni = MapView::new().with_str(Field::TlsSni, "a.example");
+    rec(&s, &with_sni);
+    assert_eq!(s.get("u", &with_sni), Ok(1));
     assert_eq!(s.get("q", &MapView::new()), Ok(1));
 }
 

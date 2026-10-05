@@ -106,7 +106,6 @@ fn log(
         client: ClientInfo {
             ip: peer.ip(),
             port: peer.port(),
-            user: None,
         },
         name: r.name.clone(),
         qtype: r.qtype.map(qtype_name),

@@ -1052,10 +1052,8 @@ pub(crate) fn test_flow(kit: &crate::testkit::Kit) -> (Arc<StackFlow>, FlowCx) {
         listener: Arc::new(ListenerInfo {
             name: "main".to_owned(),
             mode: ListenerMode::Explicit,
-            auth_required: false,
         }),
         peer: "192.0.2.7:40000".parse().unwrap(),
-        user: None,
         original_dst: None,
     };
     let cx = FlowCx::new(shared, snap, client, None, &creq);

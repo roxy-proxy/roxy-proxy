@@ -95,15 +95,13 @@ pub enum Incoming {
     /// `Host` (port 80 default), `scheme` is `http`.
     OriginFormOnProxyPort(CanonicalRequest),
     /// `CONNECT host:port` on the proxy port. Answer with
-    /// [`ServerConn::accept_connect`], [`ServerConn::respond`] (non-2xx),
-    /// [`ServerConn::respond_proxy_auth_required`] (407 with a challenge) or
+    /// [`ServerConn::accept_connect`], [`ServerConn::respond`] (non-2xx) or
     /// [`ServerConn::respond_error_and_close`].
     Connect {
         /// Target authority.
         authority: Authority,
         /// Canonical headers.
         headers: Headers,
-        /// Metadata (`proxy_authorization`).
         meta: RequestMeta,
     },
 }
@@ -162,7 +160,6 @@ fn body_error_for(e: &ParseError, limits: &Limits) -> BodyError {
         | Reason::BadConnectionHeader
         | Reason::MissingHost
         | Reason::MultipleHost
-        | Reason::MultipleProxyAuthorization
         | Reason::HostMismatch
         | Reason::BadAuthority
         | Reason::AuthorityMismatch
@@ -989,46 +986,6 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         let _ = headers.insert("content-type", "application/json");
         self.close_with(status, &headers, &[], Bytes::from(body))
             .await
-    }
-
-    /// Answers the pending request or CONNECT with `407 Proxy Authentication
-    /// Required`, a `proxy-authenticate: Basic realm="<realm>"` challenge,
-    /// `connection: close` and `body` (sent with `content-length` and
-    /// `content-type: <content_type>`), then closes like [`ServerConn::respond_error_and_close`] (an unread request
-    /// body is abandoned; half-close, then lingering close).
-    ///
-    /// `realm` must be printable ASCII (`0x20..=0x7e`) without `"` or `\`,
-    /// so it can be sent as a quoted-string without escaping. Otherwise this
-    /// returns [`WriteError::State`] and the connection is dropped without a
-    /// response.
-    pub async fn respond_proxy_auth_required(
-        mut self,
-        realm: &str,
-        content_type: &str,
-        body: Bytes,
-    ) -> Result<(), WriteError> {
-        if !matches!(self.state, State::AwaitingResponse | State::AwaitingConnect) {
-            return Err(WriteError::State("no request awaiting a response"));
-        }
-        if !realm
-            .bytes()
-            .all(|b| (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\')
-        {
-            return Err(WriteError::State(
-                "proxy auth realm must be printable ASCII without '\"' or '\\'",
-            ));
-        }
-        let challenge = format!("Basic realm=\"{realm}\"");
-        self.close_with(
-            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
-            &Headers::new(),
-            &[
-                ("proxy-authenticate", &challenge),
-                ("content-type", content_type),
-            ],
-            body,
-        )
-        .await
     }
 
     /// Writes a `connection: close` response with a fixed body, abandoning

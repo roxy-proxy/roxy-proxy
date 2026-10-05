@@ -33,10 +33,6 @@ fn full_config_parses_and_validates() {
     cfg.validate().unwrap();
     assert_eq!(cfg.listeners.len(), 1);
     assert_eq!(cfg.listeners[0].mode, ListenerMode::Explicit);
-    assert_eq!(
-        cfg.listeners[0].auth.as_ref().unwrap().basic.users_file,
-        PathBuf::from("/etc/roxy/users")
-    );
     assert_eq!(cfg.ca_server.as_ref().unwrap().bind.port(), 3130);
     assert_eq!(cfg.tls.upstream.min_version, TlsVersion::Tls12);
     assert!(cfg.http.enable_h2);
@@ -473,14 +469,13 @@ fn direct_listeners_and_dns_parse() {
 fn direct_and_dns_diagnostics() {
     let d = diagnostics(
         "version: 1\nlisteners:\n  - { name: d, mode: direct, bind: 127.0.0.1:1, target_port: 0, \
-         auth: { basic: { users_file: /u } }, upstream_target: resolve }\n  \
+         upstream_target: resolve }\n  \
          - { name: e, bind: 127.0.0.1:2, target_port: 80 }\n\
          dns:\n  bind: 127.0.0.1:2\n  answer: {}\n",
     );
     let paths: Vec<&str> = d.iter().map(|d| d.path.as_str()).collect();
     for want in [
         "listeners[0].target_port",
-        "listeners[0].auth",
         "listeners[0].upstream_target",
         "listeners[1].target_port",
         "dns.bind",
@@ -488,7 +483,7 @@ fn direct_and_dns_diagnostics() {
     ] {
         assert!(paths.contains(&want), "{want} missing from {d:?}");
     }
-    assert_eq!(d.len(), 6, "{d:?}");
+    assert_eq!(d.len(), 5, "{d:?}");
 }
 
 #[test]
@@ -888,4 +883,17 @@ fn addon_when_and_sample_diagnosed() {
         assert_eq!(d[0].path, path, "{bad}");
         assert!(d[0].to_string().contains(says), "{bad}: {}", d[0]);
     }
+}
+
+/// A listener that still configures proxy authentication is refused with a
+/// diagnostic saying so, not an unknown-field parse error.
+#[test]
+fn listener_auth_is_refused_as_removed() {
+    let d = diagnostics(
+        "version: 1\nlisteners:\n  - { name: p, bind: 127.0.0.1:1, \
+         auth: { basic: { users_file: /u } } }\n",
+    );
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].path, "listeners[0].auth");
+    assert!(d[0].message.contains("removed"), "{}", d[0]);
 }

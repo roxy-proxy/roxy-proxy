@@ -339,8 +339,6 @@ pub(crate) struct Opts<'a> {
     pub limits: &'a str,
     /// Extra lines under `http:`.
     pub http: &'a str,
-    /// `listeners[0].auth` users file content.
-    pub users: Option<String>,
     /// Top-level YAML appended before `rules:` (e.g. `metrics:`).
     pub extra: &'a str,
     /// More `listeners:` items (YAML, indented by two spaces per item);
@@ -451,20 +449,12 @@ impl Harness {
         };
         let rules = ports(opts.rules);
         let listeners = ports(opts.listeners);
-        let auth = if opts.users.is_some() {
-            format!(
-                "    auth:\n      basic: {{ users_file: {} }}\n",
-                dir.join("users").display()
-            )
-        } else {
-            String::new()
-        };
         format!(
             r#"version: 1
 listeners:
   - name: proxy
     bind: 127.0.0.1:0
-{auth}{listeners}ca_server:
+{listeners}ca_server:
   bind: 127.0.0.1:0
 tls:
   ca_dir: {dir}/ca
@@ -526,9 +516,6 @@ log:
         let test_ca = test_ca();
         std::fs::write(dir.path().join("upstream-ca.pem"), &test_ca.pem).unwrap();
         std::fs::write(dir.path().join("token"), SECRET).unwrap();
-        if let Some(users) = &opts.users {
-            std::fs::write(dir.path().join("users"), users).unwrap();
-        }
         let upstream = start_upstream(&test_ca);
         let config_path = dir.path().join("roxy.yaml");
         std::fs::write(

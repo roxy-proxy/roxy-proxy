@@ -21,7 +21,7 @@ fn parser_golden() {
         "true",
         r#"header["Upgrade"] == "websocket""#,
         r#"header.all["accept"] contains "json""#,
-        r#"not (client.ip in [10.0.0.0/8, fd00::/8]) or client.user == "ci""#,
+        r#"not (client.ip in [10.0.0.0/8, fd00::/8]) or tls.sni == "ci""#,
         "client.ip not in [192.168.0.0/16, 127.0.0.1, ::1]",
         r#"path like "/repos/*/issues" and query["page"] != "1""#,
         r#"url matches "https://[a-z]+\\.example\\.com/.*""#,

@@ -104,6 +104,13 @@ impl Config {
         let mut binds = HashMap::new();
         for (i, l) in self.listeners.iter().enumerate() {
             let path = format!("listeners[{i}]");
+            if l.auth.is_some() {
+                d.push(Diagnostic::new(
+                    format!("{path}.auth"),
+                    "proxy authentication has been removed: roxy identifies a client by \
+                     the listener it connected to and its address",
+                ));
+            }
             if l.name.trim().is_empty() {
                 d.push(Diagnostic::new(
                     format!("{path}.name"),
@@ -736,13 +743,6 @@ fn validate_listener_mode(l: &super::Listener, path: &str, d: &mut Vec<Diagnosti
     match l.mode {
         ListenerMode::Explicit => {}
         ListenerMode::Direct => {
-            if l.auth.is_some() {
-                d.push(Diagnostic::new(
-                    format!("{path}.auth"),
-                    "not valid on direct listeners: their clients do not know they \
-                     are talking to a proxy, so they send no Proxy-Authorization",
-                ));
-            }
             if l.target_port == Some(0) {
                 d.push(Diagnostic::new(
                     format!("{path}.target_port"),

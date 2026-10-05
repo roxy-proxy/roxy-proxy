@@ -26,8 +26,6 @@ pub type LayerResponse = http::Response<Body>;
 pub struct Principal {
     /// Client IP address.
     pub client_ip: IpAddr,
-    /// User from proxy authentication, if any.
-    pub client_user: Option<String>,
     /// Name of the listener the client connected to.
     pub listener: String,
     /// SNI of the client's TLS connection (intercepted CONNECT), if any.

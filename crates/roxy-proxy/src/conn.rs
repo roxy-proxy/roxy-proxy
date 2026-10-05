@@ -17,7 +17,6 @@ use roxy_tls::{ClientHelloInfo, MAX_HELLO_BYTES, Sniff, looks_like_http, sniff};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_rustls::TlsAcceptor;
 
-use crate::auth::{AuthCache, authenticate};
 use crate::exchange::{self, respond};
 use crate::flowlog::TlsInfo;
 use crate::io::{BoxIo, ClientIo, Rewind};
@@ -28,11 +27,6 @@ use crate::view::host_text;
 
 /// The magic host served by the proxy itself.
 pub const INTERNAL_HOST: &str = "roxy.internal";
-
-/// The realm of the `407` challenge.
-const AUTH_REALM: &str = "roxy";
-/// The body of a `407`.
-const AUTH_REQUIRED_BODY: &[u8] = b"{\"error\":\"proxy authentication required\"}";
 
 /// The limits and flags that shape the client-facing codec, and which
 /// codec a tunnel gets, fixed for a connection when it is accepted. A
@@ -89,43 +83,12 @@ fn internal_response(req: &CanonicalRequest, shared: &Shared) -> CanonicalRespon
     res
 }
 
-/// Proxy auth for one request or CONNECT. `Ok(user)` (None when the
-/// listener has no auth), `Err(())` → 407.
-async fn check_auth(
-    client: &ClientConn,
-    shared: &Shared,
-    header: Option<&http::HeaderValue>,
-    cache: &mut AuthCache,
-) -> Result<Option<String>, ()> {
-    if !client.listener.auth_required {
-        return Ok(None);
-    }
-    let snap = shared.snapshot();
-    let Some(db) = snap.users.get(&client.listener.name) else {
-        // Auth required but no user database: nobody gets in.
-        return Err(());
-    };
-    authenticate(db, header, cache).await.map(Some).ok_or(())
-}
-
-/// Answers the pending request or CONNECT with `407` and closes.
-async fn require_auth(conn: ServerConn<ClientIo>) {
-    let body = Bytes::from_static(AUTH_REQUIRED_BODY);
-    if let Err(e) = conn
-        .respond_proxy_auth_required(AUTH_REALM, "application/json", body)
-        .await
-    {
-        tracing::debug!(error = %e, "writing 407 failed");
-    }
-}
-
 async fn proxy_port_loop(
     mut conn: ServerConn<ClientIo>,
     client: ClientConn,
     shared: Arc<Shared>,
     cl: ConnLimits,
 ) {
-    let mut auth_cache = AuthCache::default();
     loop {
         let next = tokio::select! {
             r = conn.next_request() => r,
@@ -140,28 +103,8 @@ async fn proxy_port_loop(
             }
         };
         match incoming {
-            Incoming::Connect {
-                authority, meta, ..
-            } => {
-                let Ok(user) = check_auth(
-                    &client,
-                    &shared,
-                    meta.proxy_authorization.as_ref(),
-                    &mut auth_cache,
-                )
-                .await
-                else {
-                    require_auth(conn).await;
-                    return;
-                };
-                Box::pin(handle_connect(
-                    conn,
-                    client.with_user(user),
-                    authority,
-                    shared,
-                    cl,
-                ))
-                .await;
+            Incoming::Connect { authority, .. } => {
+                Box::pin(handle_connect(conn, client, authority, shared, cl)).await;
                 return;
             }
             Incoming::OriginFormOnProxyPort(req) => {
@@ -190,19 +133,7 @@ async fn proxy_port_loop(
                     }
                     continue;
                 }
-                let Ok(user) = check_auth(
-                    &client,
-                    &shared,
-                    req.meta.proxy_authorization.as_ref(),
-                    &mut auth_cache,
-                )
-                .await
-                else {
-                    drop(req);
-                    require_auth(conn).await;
-                    return;
-                };
-                match exchange::run(conn, req, client.with_user(user), None, &shared).await {
+                match exchange::run(conn, req, client.clone(), None, &shared).await {
                     Some(c) => conn = c,
                     None => return,
                 }
@@ -223,9 +154,8 @@ async fn handle_connect(
     shared: Arc<Shared>,
     cl: ConnLimits,
 ) {
-    // No connect-time rules: a CONNECT that passed proxy auth is
-    // accepted for inspection; every decision is made on the requests
-    // inside the tunnel.
+    // No connect-time rules: a CONNECT is accepted for inspection; every
+    // decision is made on the requests inside the tunnel.
     emit_connect_event(&shared, &client, &authority, false);
 
     let Ok((io, buf)) = conn.accept_connect().await else {

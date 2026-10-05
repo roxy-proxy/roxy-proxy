@@ -14,7 +14,6 @@ use roxy_rules::Policy;
 use roxy_tls::{Ca, LeafMinter, UpstreamTlsOptions};
 
 use crate::addrlist::AddressLists;
-use crate::auth::UserDb;
 use crate::flowlog::{FlowSink, Redactor};
 use crate::sources::{MetricSource, StateSource};
 use crate::upstream::UpstreamSettings;
@@ -24,9 +23,6 @@ use crate::upstream::UpstreamSettings;
 pub struct ListenerSpec {
     pub name: String,
     pub bind: SocketAddr,
-    /// Require `Proxy-Authorization` (users: [`PolicyUpdate::users`]).
-    /// Explicit listeners only.
-    pub auth_required: bool,
     pub kind: ListenerKind,
 }
 
@@ -107,8 +103,6 @@ pub struct PolicyUpdate {
     pub secrets: HashMap<String, String>,
     /// Scrubs secrets and sensitive headers from the flow log.
     pub redactor: Redactor,
-    /// Proxy-auth users by listener name.
-    pub users: HashMap<String, Arc<UserDb>>,
     pub limits: Limits,
     pub flags: HttpFlags,
     pub http: HttpBehaviour,
@@ -131,7 +125,6 @@ impl std::fmt::Debug for PolicyUpdate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PolicyUpdate")
             .field("secrets", &self.secrets.len())
-            .field("users", &self.users.len())
             .field("limits", &self.limits)
             .field("flags", &self.flags)
             .field("http", &self.http)

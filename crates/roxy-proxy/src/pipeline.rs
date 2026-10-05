@@ -455,7 +455,6 @@ pub(crate) fn client_info(c: &ClientConn) -> ClientInfo {
     ClientInfo {
         ip: c.peer.ip(),
         port: c.peer.port(),
-        user: c.user.clone(),
     }
 }
 

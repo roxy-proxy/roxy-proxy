@@ -21,7 +21,7 @@ first and the response last.
 
 ```
                  request ↓                                   ↑ response
- fixed   ┌─ CONNECT gate (proxy auth, SNI must match) ───────────────────┐
+ fixed   ┌─ CONNECT gate (SNI must match) ───────────────────────────────┐
  config  ├─ addon: first listed                                          │
  config  ├─ addon: second listed                                         │
  fixed   ├─ rules                  (head decision ↓ / watching ↑)        │

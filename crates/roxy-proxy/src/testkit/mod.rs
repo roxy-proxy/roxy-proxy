@@ -423,7 +423,6 @@ impl KitBuilder {
                 policy,
                 secrets: base.secrets.clone(),
                 redactor: base.redactor(),
-                users: HashMap::new(),
                 limits: self.limits,
                 flags: self.flags,
                 http: self.http,
@@ -538,10 +537,8 @@ impl Kit {
             listener: Arc::new(ListenerInfo {
                 name: "direct".to_owned(),
                 mode: ListenerMode::Direct { port },
-                auth_required: false,
             }),
             peer: "192.0.2.7:40000".parse().unwrap(),
-            user: None,
             original_dst: None,
         };
         self.spawn_conn(crate::conn::serve_direct(
@@ -586,10 +583,8 @@ impl Kit {
             listener: Arc::new(ListenerInfo {
                 name: "main".to_owned(),
                 mode: ListenerMode::Explicit,
-                auth_required: false,
             }),
             peer: "192.0.2.7:40000".parse().unwrap(),
-            user: None,
             original_dst: None,
         };
         self.spawn_conn(crate::conn::serve_explicit(
@@ -611,10 +606,8 @@ impl Kit {
             listener: Arc::new(ListenerInfo {
                 name: "main".to_owned(),
                 mode: ListenerMode::Explicit,
-                auth_required: false,
             }),
             peer: "192.0.2.7:40000".parse().unwrap(),
-            user: None,
             original_dst: None,
         };
         self.spawn_conn(crate::conn::serve_explicit(
@@ -790,7 +783,6 @@ impl Kit {
                 policy,
                 secrets: self.base.secrets.clone(),
                 redactor: self.base.redactor(),
-                users: HashMap::new(),
                 limits: self.limits.clone(),
                 flags: self.flags.clone(),
                 http: self.http.clone(),

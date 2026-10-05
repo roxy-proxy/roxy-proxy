@@ -2,7 +2,7 @@
 
 use std::time::SystemTime;
 
-use http::{HeaderValue, StatusCode};
+use http::StatusCode;
 
 use super::authority::{Authority, Scheme};
 use super::body::Body;
@@ -53,9 +53,6 @@ pub struct RequestMeta {
     /// (h1 only). The header itself is hop-by-hop and stripped; it is only
     /// re-emitted upstream through [`crate::ws`].
     pub upgrade: Option<String>,
-    /// `Proxy-Authorization` value (hop-by-hop, never forwarded), for the
-    /// proxy's own authentication.
-    pub proxy_authorization: Option<HeaderValue>,
     /// The connection closes after this exchange: the client asked
     /// (`Connection: close`), or it is HTTP/1.0, which roxy never keeps
     /// alive.
@@ -72,7 +69,6 @@ impl RequestMeta {
             target_form,
             expect_continue: false,
             upgrade: None,
-            proxy_authorization: None,
             close: false,
         }
     }

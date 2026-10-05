@@ -32,7 +32,6 @@ const STR_FIELDS: &[&str] = &[
     "scheme",
     "query.raw",
     "tls.sni",
-    "client.user",
     "header[\"x-a\"]",
     "query[\"q\"]",
     "state[\"k\"]",

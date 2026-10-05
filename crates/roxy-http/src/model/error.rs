@@ -59,8 +59,6 @@ pub enum Reason {
     MissingHost,
     /// More than one `Host` header.
     MultipleHost,
-    /// More than one `Proxy-Authorization` header.
-    MultipleProxyAuthorization,
     /// `Host` does not equal the absolute-form authority, the tunnel
     /// authority, or (h2) `:authority`.
     HostMismatch,
@@ -153,7 +151,6 @@ impl Reason {
         Reason::BadConnectionHeader,
         Reason::MissingHost,
         Reason::MultipleHost,
-        Reason::MultipleProxyAuthorization,
         Reason::HostMismatch,
         Reason::BadAuthority,
         Reason::AuthorityMismatch,
@@ -208,7 +205,6 @@ impl Reason {
             Reason::BadConnectionHeader => "bad_connection_header",
             Reason::MissingHost => "missing_host",
             Reason::MultipleHost => "multiple_host",
-            Reason::MultipleProxyAuthorization => "multiple_proxy_authorization",
             Reason::HostMismatch => "host_mismatch",
             Reason::BadAuthority => "bad_authority",
             Reason::AuthorityMismatch => "authority_mismatch",
@@ -274,7 +270,6 @@ impl Reason {
             | Reason::BadConnectionHeader
             | Reason::MissingHost
             | Reason::MultipleHost
-            | Reason::MultipleProxyAuthorization
             | Reason::HostMismatch
             | Reason::BadAuthority
             | Reason::AuthorityMismatch

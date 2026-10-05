@@ -163,15 +163,6 @@ pub fn from_h2_parts(
                 }
                 expect = true;
             }
-            "proxy-authorization" => {
-                if meta.proxy_authorization.is_some() {
-                    return reject(
-                        Reason::MultipleProxyAuthorization,
-                        "multiple proxy-authorization fields",
-                    );
-                }
-                meta.proxy_authorization = HeaderValue::from_bytes(v).ok();
-            }
             "cookie" => cookies.push(v),
             _ => rest.push((name.as_str().as_bytes(), value.as_bytes())),
         }
@@ -316,7 +307,6 @@ mod tests {
         assert!(!r.headers.contains("te"));
         assert!(!r.headers.contains("host"));
         assert!(!r.headers.contains("proxy-authorization"));
-        assert_eq!(r.meta.proxy_authorization.unwrap(), "Basic eA==");
         assert_eq!(r.body.known_length(), Some(0));
     }
 
@@ -384,21 +374,6 @@ mod tests {
             ))
             .unwrap_err(),
             Reason::MultipleHost
-        );
-    }
-
-    #[test]
-    fn proxy_authorization_must_be_single() {
-        assert_eq!(
-            map(req(
-                "https://api.example.com/",
-                &[
-                    ("proxy-authorization", "Basic eA=="),
-                    ("proxy-authorization", "Basic eQ==")
-                ]
-            ))
-            .unwrap_err(),
-            Reason::MultipleProxyAuthorization
         );
     }
 

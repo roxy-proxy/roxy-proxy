@@ -282,7 +282,7 @@ class Exchange:
         """The client's request head, as it reached this layer."""
         self.flow: dict[str, Any] = stream.flow
         """The stream's `open` metadata: flow, conn, layer, mode (`enforce`
-        or `observe`), client_ip, client_user, listener, sni, tags. The pair
+        or `observe`), client_ip, listener, sni, tags. The pair
         (flow, layer) is unique to this exchange."""
         self._body_read = False
         self._response_read = False

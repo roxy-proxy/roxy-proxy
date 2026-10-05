@@ -38,9 +38,9 @@ header.all["accept"] contains "json"
   sexpr:  (contains field:header.all["accept"] str:"json")
   pretty: header.all["accept"] contains "json"
 
-not (client.ip in [10.0.0.0/8, fd00::/8]) or client.user == "ci"
-  sexpr:  (or (not (in field:client.ip [cidr:10.0.0.0/8 cidr:fd00::/8])) (== field:client.user str:"ci"))
-  pretty: not (client.ip in [10.0.0.0/8, fd00::/8]) or client.user == "ci"
+not (client.ip in [10.0.0.0/8, fd00::/8]) or tls.sni == "ci"
+  sexpr:  (or (not (in field:client.ip [cidr:10.0.0.0/8 cidr:fd00::/8])) (== field:tls.sni str:"ci"))
+  pretty: not (client.ip in [10.0.0.0/8, fd00::/8]) or tls.sni == "ci"
 
 client.ip not in [192.168.0.0/16, 127.0.0.1, ::1]
   sexpr:  (not in field:client.ip [cidr:192.168.0.0/16 ip:127.0.0.1 ip:::1])

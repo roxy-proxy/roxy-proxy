@@ -71,12 +71,11 @@ metadata, then the request:
 
 ```json
 {"type":"open","stream":7,"flow":"01J…","conn":"01J…","layer":"sentinel",
- "mode":"enforce","client_ip":"10.0.0.5","client_user":"alice",
- "listener":"proxy","sni":"api.example.com","tags":["a","b"]}
+ "mode":"enforce","client_ip":"10.0.0.5","listener":"proxy",
+ "sni":"api.example.com","tags":["a","b"]}
 ```
 
-`mode` is `enforce` or `observe`. `client_user` and `sni` are left out when
-there is none. `stream` is roxy's, but the pair (`flow`, `layer`) is unique
+`mode` is `enforce` or `observe`. `sni` is left out when there is none. `stream` is roxy's, but the pair (`flow`, `layer`) is unique
 and stable: two layers that use the same endpoint in one flow get separate
 streams with different `layer`s, so a service can key its state on the pair.
 

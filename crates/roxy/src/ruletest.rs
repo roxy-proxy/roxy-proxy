@@ -71,7 +71,6 @@ pub struct TestRequest {
     pub headers: Vec<(String, String)>,
     pub body: Option<String>,
     pub client_ip: IpAddr,
-    pub user: Option<String>,
     /// `body.bytes`: request body bytes streamed so far (watching rules).
     pub body_bytes: Option<u64>,
     /// `response.status`; with it, rules reading the response head run.
@@ -163,7 +162,6 @@ impl TestRequest {
             headers: Vec::new(),
             body: None,
             client_ip: IpAddr::from([127, 0, 0, 1]),
-            user: None,
             body_bytes: None,
             response_status: None,
             response_body_bytes: None,
@@ -395,9 +393,6 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(DryRunView, Vec
         );
     if url.scheme == "https" && host_ip.is_none() {
         v = v.with_str(Field::TlsSni, &url.host);
-    }
-    if let Some(user) = &req.user {
-        v = v.with_str(Field::ClientUser, user);
     }
     if let Some(q) = &url.query {
         v = v.with_str(Field::QueryRaw, q);

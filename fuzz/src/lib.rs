@@ -121,11 +121,6 @@ pub fn serialise(head: &Head) -> Vec<u8> {
     if !connection.is_empty() {
         out.extend_from_slice(format!("Connection: {}\r\n", connection.join(", ")).as_bytes());
     }
-    if let Some(pa) = &meta.proxy_authorization {
-        out.extend_from_slice(b"Proxy-Authorization: ");
-        out.extend_from_slice(pa.as_bytes());
-        out.extend_from_slice(b"\r\n");
-    }
     for (name, value) in headers {
         out.extend_from_slice(name.as_str().as_bytes());
         out.extend_from_slice(b": ");

@@ -1,7 +1,7 @@
 //! End-to-end smoke tests of `roxy run`: a real server from a YAML config,
 //! a local TLS upstream signed by a test CA, and real clients. One or two
-//! per feature, plus what needs the binary's wiring (config reload, proxy
-//! auth, the CA endpoint, connection caps, capture to disk). Exchange
+//! per feature, plus what needs the binary's wiring (config reload, the CA
+//! endpoint, connection caps, capture to disk). Exchange
 //! semantics are tested in-process in `roxy-proxy`'s testkit.
 
 mod support;
@@ -166,102 +166,6 @@ async fn hot_reload_swaps_policy_and_keeps_it_on_failure() {
         "the old policy stays after a failed reload"
     );
     assert_eq!(res.headers()["x-roxy-rule"], "now-denied");
-    h.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn proxy_auth() {
-    let hash = bcrypt::hash("wonderland", 4).unwrap();
-    let h = Harness::start_with(Opts {
-        rules: r#"
-  - id: alice-only
-    when: client.user == "alice" and host == "upstream.test"
-    then: { allow: { private_ok: true } }
-"#,
-        users: Some(format!("alice:{hash}\nbob:{hash}\n")),
-        ..Opts::default()
-    })
-    .await;
-    // No credentials: 407 with a challenge, connection closed.
-    let port = h.upstream.http.port();
-    let (out, eof) = raw(
-        h.proxy,
-        format!("GET http://upstream.test:{port}/ HTTP/1.1\r\nHost: upstream.test:{port}\r\n\r\n")
-            .as_bytes(),
-    )
-    .await;
-    assert!(eof);
-    assert!(out.starts_with("HTTP/1.1 407"), "{out}");
-    assert!(
-        out.contains("proxy-authenticate: Basic realm=\"roxy\""),
-        "{out}"
-    );
-    let with = |user: &str, pass: &str| {
-        h.client_builder_with(
-            reqwest::Proxy::all(format!("http://{}", h.proxy))
-                .unwrap()
-                .basic_auth(user, pass),
-        )
-        .build()
-        .unwrap()
-    };
-    let res = with("alice", "wrong")
-        .get(h.http_url("/x"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 407);
-    let res = with("alice", "wonderland")
-        .get(h.https_url("/x"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 200);
-    let res = with("alice", "wonderland")
-        .get(h.http_url("/y"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 200);
-    // bob authenticates but the rule only lets alice through.
-    let res = with("bob", "wonderland")
-        .get(h.http_url("/z"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 403);
-    let ev = h.wait_events("request", 3).await;
-    assert!(ev.iter().any(|e| e["client"]["user"] == "alice"));
-    assert!(ev.iter().any(|e| e["client"]["user"] == "bob"));
-    let all = serde_json::to_string(&h.sink.events()).unwrap();
-    assert!(!all.contains("wonderland"));
-
-    // Listener auth is restart-only: a reload that drops it keeps the
-    // running listener as it was, users included, instead of leaving it
-    // requiring auth with no users.
-    let no_auth = h.render(&Opts {
-        rules: r#"
-  - id: alice-only
-    when: client.user == "alice" and host == "upstream.test"
-    then: { allow: { private_ok: true } }
-"#,
-        ..Opts::default()
-    });
-    std::fs::write(&h.config_path, no_auth).unwrap();
-    h.wait_events("config_reloaded", 1).await;
-    let res = with("alice", "wonderland")
-        .get(h.http_url("/after-reload"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 200);
-    let res = h
-        .client()
-        .get(h.http_url("/after-reload"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 407);
     h.stop().await;
 }
 
