@@ -53,6 +53,8 @@ pub(crate) struct Upstream {
     open: AtomicUsize,
     /// Data messages the framed WebSocket echo received.
     ws_received: Mutex<Vec<Vec<u8>>>,
+    /// Framed echo upgrades that have ended, from the upstream's side.
+    ws_closed: AtomicUsize,
 }
 
 /// Counts one dialled connection as open until it is dropped.
@@ -78,6 +80,7 @@ impl Upstream {
             service: Arc::new(service::ServiceLog::default()),
             open: AtomicUsize::new(0),
             ws_received: Mutex::new(Vec::new()),
+            ws_closed: AtomicUsize::new(0),
         })
     }
 
@@ -85,6 +88,28 @@ impl Upstream {
     /// received so far.
     pub(crate) fn ws_received(&self) -> Vec<Vec<u8>> {
         lock(&self.ws_received).clone()
+    }
+
+    /// Waits until `n` framed echo upgrades have ended on the upstream's
+    /// side: roxy closed its connection, or the close handshake finished.
+    pub(crate) async fn wait_ws_closed(&self, n: usize) {
+        let wait = async {
+            loop {
+                let changed = self.changed.notified();
+                if self.ws_closed.load(Ordering::SeqCst) >= n {
+                    return;
+                }
+                changed.await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "upstream: wanted {n} closed WebSockets, have {}",
+                    self.ws_closed.load(Ordering::SeqCst)
+                )
+            });
     }
 
     /// How many of the connections roxy dialled are still open.
@@ -375,6 +400,8 @@ impl Upstream {
                     }
                 }
             }
+            me.ws_closed.fetch_add(1, Ordering::SeqCst);
+            me.changed.notify_waiters();
         });
         let accept = roxy_http::ws::compute_accept(&String::from_utf8_lossy(key.as_bytes()));
         http::Response::builder()

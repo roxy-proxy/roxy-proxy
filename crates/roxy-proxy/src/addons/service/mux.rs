@@ -410,9 +410,9 @@ enum End<'a> {
     /// The service failed it. `reset` tells the service, when it has not
     /// already closed or reset the stream itself.
     Failed { e: ServiceError, reset: Reset },
-    /// roxy gave up on it (the client went away, a missed deadline, an
-    /// upgrade): the service is told, whoever is waiting gets `why`, and
-    /// nothing is logged as the service's fault.
+    /// roxy gave up on it (the client went away, a missed deadline): the
+    /// service is told, whoever is waiting gets `why`, and nothing is
+    /// logged as the service's fault.
     Abandoned(&'a str),
     /// The body roxy was sending in direction `dir` failed: abandoned, and
     /// whoever is waiting learns which body failed and how.
@@ -785,10 +785,14 @@ impl Stream {
                     .parse()
                     .map_err(|_| ServiceError::Protocol(format!("invalid url {url:?}")))?;
                 let headers = super::header_map(&headers)?;
-                let (body_tx, body) = Body::channel(
-                    limits.max_request_body_bytes,
-                    super::declared_length(&headers)?,
-                );
+                // On an upgrade the forwarded body is the client's side of
+                // the WebSocket, for as long as it is open: no cap.
+                let cap = if self.st.is_upgrade() {
+                    u64::MAX
+                } else {
+                    limits.max_request_body_bytes
+                };
+                let (body_tx, body) = Body::channel(cap, super::declared_length(&headers)?);
                 let mut r = http::Request::new(body);
                 *r.method_mut() = method;
                 *r.uri_mut() = uri;
@@ -800,7 +804,10 @@ impl Stream {
                 Ok(())
             }
             In::Response { status, headers } => {
-                if !(200..=599).contains(&status) {
+                // A `101` passes an upgrade on; its body is the upstream's
+                // side of the WebSocket, uncapped like the request's.
+                let upgrade = status == 101 && self.st.is_upgrade();
+                if !upgrade && !(200..=599).contains(&status) {
                     return Err(ServiceError::Protocol(format!(
                         "response status {status} is not 200-599"
                     )));
@@ -808,10 +815,12 @@ impl Stream {
                 let status = http::StatusCode::from_u16(status)
                     .map_err(|e| ServiceError::Protocol(e.to_string()))?;
                 let headers = super::header_map(&headers)?;
-                let (body_tx, body) = Body::channel(
-                    limits.max_response_body_bytes,
-                    super::declared_length(&headers)?,
-                );
+                let cap = if upgrade {
+                    u64::MAX
+                } else {
+                    limits.max_response_body_bytes
+                };
+                let (body_tx, body) = Body::channel(cap, super::declared_length(&headers)?);
                 let mut r = http::Response::new(body);
                 *r.status_mut() = status;
                 *r.headers_mut() = headers;
@@ -1355,6 +1364,24 @@ mod tests {
             &b"upload"[..]
         );
         assert!(lock(&stream.state).ended);
+    }
+
+    /// A `101` from the service answers an upgrade only: on an ordinary
+    /// exchange it is a protocol violation, like any status below 200.
+    #[tokio::test]
+    async fn a_101_on_an_exchange_that_is_not_an_upgrade_fails_the_stream() {
+        let (stream, answers, _kit) = lone_stream().await;
+        stream.control(request_head());
+        let First::Forward(_req) = answers.first.await.unwrap().unwrap() else {
+            panic!("the request is forwarded");
+        };
+        stream.control(In::Response {
+            status: 101,
+            headers: Vec::new(),
+        });
+        assert!(lock(&stream.state).ended);
+        let e = answers.second.await.unwrap().unwrap_err();
+        assert!(e.to_string().contains("status 101"), "{e}");
     }
 
     /// Bytes are owed to a head in their own direction: response bytes

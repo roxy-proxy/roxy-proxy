@@ -56,6 +56,24 @@ async def streamed_call(roxy: FakeRoxy, stream: int = 1) -> None:
     assert await roxy.ws.next_sent() == stream.to_bytes(4, "big") + b"\x01" + MESSAGE_START
 
 
+async def test_an_upgrade_passes_through_unchanged(sidecar: Sidecar) -> None:
+    """A WebSocket is not a model call: its `101` and both directions
+    stream through, with no `request_end` before the `101`."""
+    roxy = FakeRoxy(sidecar.handle)
+    roxy.open(1, url="https://api.anthropic.com/v1/ws", method="GET")
+    assert (await roxy.ws.next_sent())["type"] == "request"
+    roxy.ws.control(1, "response", status=101, headers=[])
+    head = await roxy.ws.next_sent()
+    assert isinstance(head, dict) and head["status"] == 101
+    roxy.ws.body(1, b"\x81\x05hello", RESPONSE)
+    assert await roxy.ws.next_sent() == b"\x00\x00\x00\x01\x01\x81\x05hello"
+    roxy.ws.body(1, b"\x81\x85\x01\x02\x03\x04ignnn")
+    assert await roxy.ws.next_sent() == b"\x00\x00\x00\x01\x00\x81\x85\x01\x02\x03\x04ignnn"
+    roxy.ws.control(1, "reset")
+    await roxy.until_closed(1)
+    assert stray_tasks(roxy.task) == set()
+
+
 async def test_reset_while_a_streamed_response_is_held_leaves_no_tasks(sidecar: Sidecar) -> None:
     roxy = FakeRoxy(sidecar.handle)
     await streamed_call(roxy)

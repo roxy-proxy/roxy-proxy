@@ -19,7 +19,9 @@
 //!
 //! The request and response bodies are independent: a response head goes
 //! (either way) as soon as there is one, even while the request body is
-//! still streaming.
+//! still streaming. A WebSocket is the same exchange, long-lived: after
+//! the `101` the request body is the client's bytes and the response body
+//! the upstream's, until each side closes.
 //!
 //! What the service forwards is held to the same checks as a WASM layer's
 //! `next` (re-validated as strictly as a client request, then judged by
@@ -347,15 +349,10 @@ async fn run(
     let res = super::below(st.clone(), index, forward)
         .await
         .map_err(Fail::Below)?;
-    if res.status() == http::StatusCode::SWITCHING_PROTOCOLS {
-        // An upgrade is not the service's to change, and the WebSocket
-        // bytes do not go through it.
-        guard.disarm();
-        stream.reset("the upstream switched protocols");
-        return Ok(res);
-    }
     // The response head goes at once, however far the client's upload
-    // has got; the service's second clock starts with it.
+    // has got; the service's second clock starts with it. A `101` goes
+    // the same way: its body is the upstream's side of the WebSocket, and
+    // the request body still streaming is the client's.
     let sent = TokioInstant::now();
     let (parts, body) = res.into_parts();
     let s = stream.clone();

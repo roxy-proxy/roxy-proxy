@@ -34,6 +34,14 @@ still going) carries on in the background, so an early answer reaches the
 client at once. A handler that needs a whole body reads it with
 `read_body()` / `read_response_body()`.
 
+A WebSocket is the same exchange, long-lived: roxy sends no `request_end`
+before the `101`, since the request body is the client's side of the
+WebSocket, and after the `101` the response body is the upstream's, each
+until that side closes. The handler above carries one as it is: `forward`
+returns on the `101` while the request body keeps going out. A handler
+that reads the request body whole before forwarding waits for an end that
+never comes, and roxy fails the exchange on its deadline.
+
 If the handler raises, the stream is reset without an answer and roxy
 fails the exchange closed (enforce mode). If roxy resets the stream (the
 client went away, say) or the connection closes, the handler is cancelled,

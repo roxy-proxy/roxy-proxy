@@ -310,6 +310,11 @@ class Sidecar:
             return
         body = await ex.read_body()
         res = await ex.forward(ex.request, body)
+        if res.status == 101:
+            # An upgrade's response body is the WebSocket: it has no end to
+            # read to, so it streams through.
+            await ex.respond(res, ex.response_body())
+            return
         streamed = (res.header("content-type") or "").startswith("text/event-stream")
         if streamed and res.status == 200 and not ex.observing:
             head = [(n, v) for n, v in res.headers if n.lower() != "content-length"]

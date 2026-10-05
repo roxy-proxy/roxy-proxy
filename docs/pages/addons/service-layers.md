@@ -17,7 +17,7 @@ addons:
     endpoints:
       sidecar: { url: "http://127.0.0.1:9000/layer", private_ok: true }
     limits:
-      first_byte_timeout: 2s            # to get a stream, then to each of the service's heads (default 30s)
+      first_byte_timeout: 2s            # to get a stream, then to each of the service's heads, from roxy's own (default 30s)
 ```
 
 `path`, `capabilities`, `config`, `audit_endpoint` and the WASM limits are
@@ -120,8 +120,8 @@ the `request_end` of the request it forwarded, if it was still sending
 that. roxy sends nothing more on it after that (a request body the
 service did not wait for is not sent on). Either side may end a stream
 early with `reset`. roxy resets a stream when the client goes away, a
-deadline passes, the service broke the protocol on it, or the upstream
-switched protocols (a `101`), and sends nothing on it after the `reset`.
+deadline passes or the service broke the protocol on it, and sends nothing
+on it after the `reset`.
 A stream roxy gives up before its `open` has gone out is dropped without
 a `reset`: the service never sees it. A service that resets an enforce
 stream fails that exchange closed. Each side ignores messages that arrive for a
@@ -147,8 +147,10 @@ not counted.
 - **Deadlines.** `first_byte_timeout` bounds getting a stream (connecting,
   or waiting for a free one) and each of the service's heads: its first
   answer, from roxy's `request` head, and its second, from roxy's
-  `response` head. A stream has no overall clock: bodies stream for as
-  long as they take.
+  `response` head, not from the end of the response body. A service that
+  reads the whole response before answering has that long to read and
+  judge it. A stream has no overall clock: bodies stream for as long as
+  they take.
 - **Failure is closed** in enforce mode: a failed connection or handshake,
   a protocol violation (bad JSON, a message out of order, bytes of a body
   that is not open, an invalid head, a broken length, bytes past the
@@ -185,9 +187,21 @@ not counted.
   in steps of 64 KiB as they are, so the service never waits on its own
   answers; sending past its credit is a protocol violation, as on any
   stream.
-- **WebSocket upgrades.** The service sees the upgrade request; a `101`
-  passes straight back, roxy resets the stream, and the WebSocket's bytes
-  do not go through it.
+- **WebSockets** run through the stream as the [addon
+  overview](/addons/overview#websockets) describes for every layer. The
+  service gets the upgrade request and forwards it; the `101` from below
+  arrives as roxy's `response` head, and the service answers it with a
+  `101` of its own (the one status outside 200–599 it may send, and only
+  on an upgrade). From then on the request body is the client's bytes and
+  the response body the upstream's, with no length cap on either, until
+  each side closes; the stream holds its place on the connection for as
+  long as the WebSocket is open. Roxy sends no `request_end` before the
+  `101`: the request body is the client's side of the WebSocket. A service
+  that waits for the end of the request body before forwarding never
+  forwards an upgrade, and the exchange fails on `first_byte_timeout`;
+  forward as the request arrives, as `roxy_layer.py` does. When the relay
+  ends, roxy closes the client's connection and resets the stream if its
+  bodies have not both ended.
 
 The [quickstart](/quickstart)'s sidecar is a service layer in Python:
 [`roxy_layer.py`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/sentinel/roxy_layer.py)

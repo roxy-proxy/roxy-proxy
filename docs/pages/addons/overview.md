@@ -87,9 +87,10 @@ Typical patterns:
 
 ## WebSockets
 
-A WebSocket is an exchange like any other, only long-lived. A layer gets
-the upgrade request in `handle` and passes it on with `next`; the response
-from below is the `101`. After it, the request body carries the client's
+A WebSocket is an exchange like any other, only long-lived, and this
+section applies to both kinds of layer. A layer gets the upgrade request
+in `handle` and passes it on with `next` (a service layer forwards it on
+its stream); the response from below is the `101`. After it, the request body carries the client's
 bytes and the response body the upstream's, for as long as the WebSocket
 is open. A layer reads, rewrites or holds back either direction as it
 would any body, refuses the upgrade by answering without `next`, and is
