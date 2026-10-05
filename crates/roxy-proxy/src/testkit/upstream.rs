@@ -4,6 +4,7 @@ pub(crate) mod service;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -41,6 +42,18 @@ pub(crate) struct Upstream {
     seen: Mutex<Vec<Arc<Mutex<Seen>>>>,
     changed: Notify,
     service: Arc<service::ServiceLog>,
+    /// Connections roxy dialled that are still open.
+    open: AtomicUsize,
+}
+
+/// Counts one dialled connection as open until it is dropped.
+struct OpenConn(Arc<Upstream>);
+
+impl Drop for OpenConn {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::SeqCst);
+        self.0.changed.notify_waiters();
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -54,7 +67,34 @@ impl Upstream {
             seen: Mutex::new(Vec::new()),
             changed: Notify::new(),
             service: Arc::new(service::ServiceLog::default()),
+            open: AtomicUsize::new(0),
         })
+    }
+
+    /// How many of the connections roxy dialled are still open.
+    pub(crate) fn open_connections(&self) -> usize {
+        self.open.load(Ordering::SeqCst)
+    }
+
+    /// Waits until exactly `n` dialled connections are open.
+    pub(crate) async fn wait_open(&self, n: usize) {
+        let wait = async {
+            loop {
+                let changed = self.changed.notified();
+                if self.open_connections() == n {
+                    return;
+                }
+                changed.await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "upstream: wanted {n} open connections, have {}",
+                    self.open_connections()
+                )
+            });
     }
 
     /// What the in-test service layer endpoint saw.
@@ -101,8 +141,13 @@ impl Upstream {
             "dial to an unexpected address {addr}"
         );
         let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        self.open.fetch_add(1, Ordering::SeqCst);
+        let open = OpenConn(self.clone());
         let me = self.clone();
-        tokio::spawn(async move { me.serve(addr, ours).await });
+        tokio::spawn(async move {
+            me.serve(addr, ours).await;
+            drop(open);
+        });
         Ok(Box::new(theirs))
     }
 

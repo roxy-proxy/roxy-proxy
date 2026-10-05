@@ -275,6 +275,56 @@ async fn a_reload_mid_exchange_does_not_change_its_policy() {
     assert_eq!(b.json()["rule"], "nothing");
 }
 
+/// A reload releases the old snapshot, its upstream pool included, while
+/// a client connection accepted before it stays open: the connection task
+/// keeps only its codec settings and takes a snapshot per exchange, so the
+/// pooled upstream connection closes with the pool rather than living on
+/// for as long as the client does.
+async fn a_reload_releases_the_old_upstream_pool_under_an_open_client_connection(
+    mut c: super::Client,
+    kit: &Kit,
+) {
+    let a = c.call("GET", "/one", &[], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(kit.upstream.open_connections(), 1, "pooled and idle");
+    let old = {
+        let snap = kit.server.shared().snapshot();
+        std::sync::Arc::downgrade(&snap.upstream)
+    };
+    kit.reload(RULES);
+    kit.upstream.wait_open(0).await;
+    assert!(
+        old.upgrade().is_none(),
+        "the old upstream pool is still held"
+    );
+    // The client connection is still usable and dials afresh.
+    let b = c.call("GET", "/two", &[], b"").await;
+    assert_eq!(b.status, 200, "{b:?}");
+    assert_eq!(kit.upstream.open_connections(), 1);
+}
+
+#[tokio::test]
+async fn a_reload_releases_the_old_upstream_pool_under_an_open_proxy_port_connection() {
+    let kit = kit().await;
+    let c = kit.h1().await;
+    a_reload_releases_the_old_upstream_pool_under_an_open_client_connection(c, &kit).await;
+}
+
+#[tokio::test]
+async fn a_reload_releases_the_old_upstream_pool_under_an_open_tunnel() {
+    let kit = kit().await;
+    let c = kit.tunnel("up.test", false).await;
+    a_reload_releases_the_old_upstream_pool_under_an_open_client_connection(c, &kit).await;
+}
+
+#[tokio::test]
+async fn h2_a_reload_releases_the_old_upstream_pool_under_an_open_tunnel() {
+    let kit = kit().await;
+    let c = kit.tunnel("up.test", true).await;
+    a_reload_releases_the_old_upstream_pool_under_an_open_client_connection(c, &kit).await;
+}
+
 /// A client that vanishes mid-upload still gets its exchange logged, on
 /// h1 (the codec sees EOF) and on h2 (the connection ends under the
 /// stream's task).
