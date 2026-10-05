@@ -80,7 +80,7 @@ large, and one with more than that many bytes unread has the copy cut
 
 `max_buffered_bytes` bounds those three buffers in aggregate; each is
 bounded per exchange, and without it the only bound on exchanges is the
-connection caps. An exchange that inspects a body reserves the whole cap
+connection caps. An exchange whose rules inspect reserves the whole cap
 before it fills the buffer (`max_inspect_body_bytes` for a body a rule
 reads, twice `max_ws_message_bytes` for a WebSocket whose messages rules
 read) and holds the reservation until it ends. A reservation the budget

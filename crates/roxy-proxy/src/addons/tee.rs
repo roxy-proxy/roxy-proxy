@@ -121,6 +121,8 @@ impl CopySender {
         };
         self.pending.fetch_add(len, Ordering::Relaxed);
         self.sent = self.sent.saturating_add(len);
+        // A send fails only once the observer has let go of its copy,
+        // which is not reported, so the reason is immaterial.
         self.tx.send(Msg::Data(data, lease)).map_err(|_| BEHIND)
     }
 
