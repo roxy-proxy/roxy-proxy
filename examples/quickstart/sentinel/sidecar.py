@@ -16,8 +16,8 @@ it before the agent sees the response:
 
 Everything else (other requests, and every non-200 answer) passes through
 untouched, for roxy's rules to decide. A streamed response starts at once
-(its head and `message_start`, then pings) while the rest is held and
-judged, so the agent's first-byte and idle deadlines are met.
+(its head and `message_start`), then pings until the rest has arrived and
+been judged, so the agent's first-byte and idle deadlines are met.
 
 Each Claude Code session (its `X-Claude-Code-Session-Id` header), its model
 calls and the sentinel's reports are written as an Inspect eval log for
@@ -343,7 +343,7 @@ class Sidecar:
     async def judged_stream(self, ex: Exchange, body: bytes, res: Response) -> AsyncIterator[bytes]:
         """A streamed response, judged before the agent sees any content:
         its `message_start` passes at once, pings follow while the rest is
-        held, then the rest or, if refused, the explanation."""
+        held and judged, then the rest or, if refused, the explanation."""
         chunks: list[bytes] = []
 
         async def read() -> None:
@@ -351,6 +351,7 @@ class Sidecar:
                 chunks.append(chunk)
 
         reader = asyncio.create_task(read())
+        judging: asyncio.Task[None | bytes | Refusal] | None = None
         try:
             sent = 0
             last = time.monotonic()
@@ -373,7 +374,17 @@ class Sidecar:
             reader.result()
             raw = b"".join(chunks)
             sent = max(sent, 0)
-            verdict = await self.judge(ex, body, res, raw)
+            # A model-backed sentinel may take a while: keep pinging.
+            judging = asyncio.create_task(self.judge(ex, body, res, raw))
+            while True:
+                wait = PING_EVERY - (time.monotonic() - last)
+                done, _ = await asyncio.wait({judging}, timeout=max(wait, 0))
+                if done:
+                    break
+                if sent:
+                    last = time.monotonic()
+                    yield PING
+            verdict = judging.result()
             if verdict is None or isinstance(verdict, bytes):
                 # Streamed responses are never modified (see judge).
                 yield raw[sent:]
@@ -385,9 +396,12 @@ class Sidecar:
                 yield f"event: error\ndata: {json.dumps(error)}\n\n".encode()
         finally:
             # The handler is cancelled here when roxy resets the stream:
-            # the reader would otherwise wait on the response for ever.
-            reader.cancel()
-            await asyncio.wait({reader})
+            # the reader would otherwise wait on the response for ever, and
+            # the sentinel's verdict is no longer wanted.
+            tasks = {reader} if judging is None else {reader, judging}
+            for t in tasks:
+                t.cancel()
+            await asyncio.wait(tasks)
 
     async def judge(self, ex: Exchange, body: bytes, res: Response, raw: bytes) -> None | bytes | Refusal:
         """None to pass the response on, new bytes for a modified response,
@@ -396,11 +410,15 @@ class Sidecar:
         try:
             request = json.loads(body)
             response = message_from_sse(raw) if streamed else json.loads(raw)
-        except (ValueError, KeyError, IndexError) as e:
-            log.warning("unreadable model exchange: %s", e)
-            return Refusal("the sentinel could not read this model exchange")
-        call = Call(request, response, streamed)
-        output = await call.output()
+            call = Call(request, response, streamed)
+            output = await call.output()
+        except Exception as e:  # noqa: BLE001
+            # A shape the SDK or inspect's converter does not know (a new
+            # block type, say) cannot be judged, so it is refused.
+            first_line = str(e).partition("\n")[0][:200]
+            error = f"{type(e).__name__}: {first_line}"
+            log.warning("unreadable model exchange: %s", error)
+            return Refusal(f"the sentinel could not read this model exchange ({error})")
         try:
             input = await call.input()
         except Exception as e:  # noqa: BLE001

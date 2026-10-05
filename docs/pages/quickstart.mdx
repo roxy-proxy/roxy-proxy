@@ -136,7 +136,7 @@ Any inspect_sentinel monitor or protocol works in its place, including ones that
 
 ### What a blocked call looks like
 
-A response with a blocked tool call reaches Claude Code as an ordinary assistant message that ends the turn, not as an API error. The sentinel holds each streamed response until it has judged it. It sends the start of the response and keep-alive pings at once, so Claude Code doesn't time out, and the content arrives in one burst rather than token by token.
+A response with a blocked tool call reaches Claude Code as an ordinary assistant message that ends the turn, not as an API error. The sentinel holds each streamed response until it has judged it. It sends the start of the response at once, then keep-alive pings until it has the whole response and the sentinel has decided, so Claude Code doesn't time out however long a model-backed sentinel takes. The content arrives in one burst rather than token by token.
 
 ### This is not containment
 
