@@ -66,8 +66,8 @@ impl Default for Limits {
 }
 
 /// The `http.*` strictness flags the codec reads. Every one defaults to
-/// the strict setting.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// the strict setting (off).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct HttpFlags {
     /// Accept `HTTP/1.0` request lines.
@@ -80,16 +80,4 @@ pub struct HttpFlags {
     pub allow_obs_text: bool,
     /// Accept a body on GET/HEAD/DELETE/OPTIONS/TRACE.
     pub allow_body_on_get: bool,
-}
-
-impl Default for HttpFlags {
-    fn default() -> Self {
-        Self {
-            allow_http10: false,
-            allow_trailers: false,
-            allow_chunk_extensions: false,
-            allow_obs_text: false,
-            allow_body_on_get: false,
-        }
-    }
 }
