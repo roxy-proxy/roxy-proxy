@@ -33,7 +33,7 @@ The first run builds the sentinel image, which takes a minute or two. Three cont
 
 - **roxy**: the proxy on `127.0.0.1:3128`. It generates its CA on first start and serves the certificate on `127.0.0.1:3130`.
 - **sentinel**: the inspect_sentinel sidecar, on a network with no route out. Every exchange streams through it. It runs a denylist over tool calls.
-- **inspect-view**: Inspect's log viewer on `127.0.0.1:7575`, showing each conversation and the sentinel's verdict on every tool call.
+- **inspect-view**: Inspect's log viewer on `127.0.0.1:7575`, showing each Claude Code session and the sentinel's verdict on every tool call.
 
 ### Trust roxy's CA
 
@@ -72,7 +72,7 @@ Claude Code never ran the command. Its turn ends, and you can carry on. Tool cal
 
 ### Watch it in Inspect View
 
-Open [http://127.0.0.1:7575](http://127.0.0.1:7575). Each Claude Code conversation is a sample. Its transcript shows every model call, the tool calls the model asked for, and the sentinel's verdict under each one: `Continued`, or `Rejected` with the reason. Reload the page to see new calls.
+Open [http://127.0.0.1:7575](http://127.0.0.1:7575). Each Claude Code session is a sample, grouped by the `X-Claude-Code-Session-Id` header Claude Code sends, so a subagent's calls appear in the same sample as the chat that started it. Its transcript shows every model call, the tool calls the model asked for, and the sentinel's verdict under each one: `Continued`, or `Rejected` with the reason. Reload the page to see new calls.
 
 <img src={inspectView} alt="Inspect View: Claude Code's curl tool call, and the sentinel's rejection under it" />
 
@@ -98,7 +98,7 @@ docker compose down -v
 
 roxy decides by **host**. The policy allows Anthropic's API and sign-in hosts and denies everything else. That covers everything Claude Code sends through the proxy, not only its model calls: the commands it runs (a `curl` that got past the sentinel, `git`, `npm`) and WebFetch get a `403` from roxy for any other host.
 
-The sentinel decides by **content**. It is a [service layer](/addons/service-layers): an addon that every exchange streams through, above the rules. It judges only model calls (`POST …/v1/messages`, or `…/chat/completions`), and passes every other request through untouched for the rules to decide. For each model response, it turns every tool call into an inspect_sentinel `BeforeToolCall` step and runs the configured sentinel on it. Whatever it passes on, roxy's rules judge again.
+The sentinel decides by **content**. It is a [service layer](/addons/service-layers): an addon that every exchange streams through, above the rules. It judges only Anthropic Messages calls (`POST …/v1/messages`), and passes every other request through untouched for the rules to decide. For each model response, it turns every tool call into an inspect_sentinel `BeforeToolCall` step and runs the configured sentinel on it. Whatever it passes on, roxy's rules judge again.
 
 ```yaml
 addons:
@@ -108,7 +108,7 @@ addons:
     endpoints:
       sidecar: { url: "http://sentinel:9000/", private_ok: true }
     limits:
-      first_byte_timeout: 120s  # a held (non-streamed) response arrives whole
+      first_byte_timeout: 120s  # how long the sentinel has to decide (or start forwarding) before roxy denies the exchange
 
 default: deny
 

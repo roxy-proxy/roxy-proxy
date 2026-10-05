@@ -5,7 +5,7 @@
 #   HTTPS_PROXY=http://127.0.0.1:3128 NODE_EXTRA_CA_CERTS=$PWD/roxy-ca.pem \
 #     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 claude
 #
-# Watch the conversations and the sentinel's decisions at http://127.0.0.1:7575.
+# Watch the sessions and the sentinel's decisions at http://127.0.0.1:7575.
 #
 # Claude Code honours the proxy variables, but nothing on your machine makes
 # it: this shows what roxy and the sentinel decide, not containment. To
@@ -51,8 +51,8 @@ services:
       - sentinel-logs:/logs
     networks: [sidecar]
 
-  # Inspect's log viewer over the sentinel's log: each conversation, its
-  # model calls and tool calls, and the sentinel's verdict on each.
+  # Inspect's log viewer over the sentinel's log: each Claude Code session,
+  # its model calls and tool calls, and the sentinel's verdict on each.
   inspect-view:
     image: roxy-quickstart-sentinel
     build: ./sentinel                # the sentinel's image; built once, cached

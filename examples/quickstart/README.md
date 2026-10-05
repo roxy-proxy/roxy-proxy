@@ -3,7 +3,7 @@
 Claude Code behind roxy and an
 [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel)
 sidecar that blocks tool calls matching a denylist, with Inspect View
-showing each conversation and the sentinel's verdicts. The walkthrough is
+showing each Claude Code session and the sentinel's verdicts. The walkthrough is
 the [quickstart](https://roxy-proxy.github.io/roxy-proxy/quickstart) on the
 docs site.
 
@@ -21,5 +21,5 @@ open http://127.0.0.1:7575    # Inspect View
 | [`roxy.yaml`](roxy.yaml) | the policy: Anthropic's API and sign-in hosts, every exchange through the sentinel |
 | [`sentinel/sidecar.py`](sentinel/sidecar.py) | the sidecar: judges each tool call in a model response, and replaces a refused response with an explanation |
 | [`sentinel/policies.py`](sentinel/policies.py) | `deny_regex`, the sentinel it runs (`SENTINEL_DENY` sets the regex) |
-| [`sentinel/inspect_log.py`](sentinel/inspect_log.py) | writes conversations and verdicts as an Inspect eval log |
+| [`sentinel/inspect_log.py`](sentinel/inspect_log.py) | writes each session's model calls and verdicts as an Inspect eval log |
 | [`sentinel/roxy_layer.py`](sentinel/roxy_layer.py) | the service side of roxy's service-layer protocol, for asyncio |
