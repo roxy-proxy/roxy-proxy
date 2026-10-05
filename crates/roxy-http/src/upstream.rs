@@ -49,7 +49,7 @@ pub fn to_upstream_request(
     };
     let uri = Uri::try_from(uri_str)
         .map_err(|e| ParseError::new(Reason::BadRequestTarget, format!("uri: {e}")))?;
-    let mut headers = HeaderMap::with_capacity(req.headers.len() + 2);
+    let mut headers = HeaderMap::with_capacity(req.headers.len().saturating_add(2));
     let host_value = HeaderValue::from_str(&host)
         .map_err(|_| ParseError::new(Reason::BadAuthority, "host header"))?;
     headers.insert(HOST, host_value);

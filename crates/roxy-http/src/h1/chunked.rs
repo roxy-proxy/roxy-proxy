@@ -4,6 +4,7 @@
 use bytes::{Buf, Bytes, BytesMut};
 use http::HeaderMap;
 
+use super::head::{Bare, scan_section};
 use crate::chars::{hex_val, is_field_value_byte};
 use crate::len_u64;
 use crate::model::{
@@ -99,7 +100,7 @@ impl ChunkedDecoder {
                     }
                     let n = usize::try_from(rem).unwrap_or(usize::MAX).min(buf.len());
                     let chunk = buf.split_to(n).freeze();
-                    let rem = rem - len_u64(n);
+                    let rem = rem.saturating_sub(len_u64(n));
                     self.state = if rem == 0 {
                         State::DataCrlf
                     } else {
@@ -151,10 +152,8 @@ impl ChunkedDecoder {
         let line_end = lf.unwrap_or(buf.len());
         let line = &buf[..line_end];
         // Bare CR anywhere before the (possible) final CR.
-        for (i, &b) in line.iter().enumerate() {
-            if b == b'\r' && i + 1 < line.len() {
-                return reject(Reason::BareCr, "bare CR in chunk-size line");
-            }
+        if line.strip_suffix(b"\r").unwrap_or(line).contains(&b'\r') {
+            return reject(Reason::BareCr, "bare CR in chunk-size line");
         }
         let digits = line.iter().take_while(|&&b| hex_val(b).is_some()).count();
         let after = &line[digits..];
@@ -170,32 +169,36 @@ impl ChunkedDecoder {
             return reject(Reason::BadChunkSize, "chunk size longer than 16 hex digits");
         }
         let Some(lf) = lf else {
-            if buf.len() > max + 1 {
+            if buf.len() > max.saturating_add(1) {
                 return reject(Reason::BadChunkSize, "chunk-size line too long");
             }
             return Ok(None);
         };
-        if lf == 0 || buf[lf - 1] != b'\r' {
+        let Some(cr) = lf.checked_sub(1).filter(|&cr| buf[cr] == b'\r') else {
             return reject(Reason::BareLf, "bare LF in chunk-size line");
-        }
+        };
         // Same bound as the partial-line check above: line without CRLF <= max.
-        if lf > max + 1 {
+        if lf > max.saturating_add(1) {
             return reject(Reason::BadChunkSize, "chunk-size line too long");
         }
         if digits == 0 {
             return reject(Reason::BadChunkSize, "empty chunk size");
         }
-        let ext = &line[digits..lf - 1];
+        let ext = &line[digits..cr];
         if !ext.is_empty() {
             // allow_ext is true here; extensions are validated and discarded.
             if !ext.iter().all(|&b| is_field_value_byte(b, false)) {
                 return reject(Reason::ChunkExtension, "malformed chunk extension");
             }
         }
-        let size = line[..digits].iter().fold(0u64, |acc, &b| {
-            acc << 4 | u64::from(hex_val(b).unwrap_or(0))
-        });
-        buf.advance(lf + 1);
+        // At most 16 hex digits, so the value always fits.
+        let Some(size) = str::from_utf8(&line[..digits])
+            .ok()
+            .and_then(|s| u64::from_str_radix(s, 16).ok())
+        else {
+            return reject(Reason::BadChunkSize, "invalid chunk size");
+        };
+        buf.advance(lf.saturating_add(1));
         Ok(Some(size))
     }
 
@@ -204,22 +207,11 @@ impl ChunkedDecoder {
     /// and forbidden trailer names are refused before that.
     fn trailers(&self, buf: &mut BytesMut) -> Result<Option<HeaderMap>, ParseError> {
         let max_bytes = self.limits.max_header_bytes;
-        let mut end = None;
-        for i in 0..buf.len() {
-            match buf[i] {
-                b'\n' if i == 0 || buf[i - 1] != b'\r' => {
-                    return reject(Reason::BareLf, "bare LF in trailers");
-                }
-                b'\n' if i >= 3 && &buf[i - 3..=i] == b"\r\n\r\n" => {
-                    end = Some(i + 1);
-                    break;
-                }
-                b'\r' if buf.get(i + 1).is_some_and(|&n| n != b'\n') => {
-                    return reject(Reason::BareCr, "bare CR in trailers");
-                }
-                _ => {}
-            }
-        }
+        let end = match scan_section(buf, 0) {
+            Err(Bare::Lf(_)) => return reject(Reason::BareLf, "bare LF in trailers"),
+            Err(Bare::Cr(_)) => return reject(Reason::BareCr, "bare CR in trailers"),
+            Ok(end) => end,
+        };
         let Some(end) = end else {
             if buf.len() > max_bytes {
                 return reject(Reason::HeadTooLarge, "trailer section too large");
@@ -231,7 +223,11 @@ impl ChunkedDecoder {
         }
         let section = buf.split_to(end);
         let mut raw = Vec::new();
-        for line in section[..end - 4].split(|&b| b == b'\n') {
+        for line in section
+            .strip_suffix(b"\r\n\r\n")
+            .unwrap_or(&section)
+            .split(|&b| b == b'\n')
+        {
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             let (name, value) = parse_field_line(line, self.flags.allow_obs_text)?;
             let lower = String::from_utf8_lossy(name).to_ascii_lowercase();

@@ -51,6 +51,10 @@ pub(crate) const fn is_field_value_byte(b: u8, allow_obs_text: bool) -> bool {
 }
 
 /// Value of an ASCII hex digit.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "each arm's range keeps the subtraction in bounds"
+)]
 pub(crate) const fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),

@@ -153,7 +153,11 @@ pub fn parse(msg: &[u8]) -> Parsed {
     if opcode != OPCODE_QUERY {
         return err(Rcode::NotImp);
     }
-    let mut counts = head[4..].as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes(*c));
+    let mut counts = head[4..]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_be_bytes(*c));
     let mut count = || counts.next().unwrap_or(u16::MAX);
     let (qd, an, ns, ar) = (count(), count(), count(), count());
     if qd != 1 || an != 0 || ns != 0 || ar > 1 {

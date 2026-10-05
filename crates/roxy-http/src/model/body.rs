@@ -213,7 +213,7 @@ impl Body {
                 Some(Err(e)) => return Err(e),
                 Some(Ok(f)) => {
                     if let Ok(d) = f.into_data() {
-                        if len_u64(buf.len() + d.len()) > max {
+                        if len_u64(buf.len()).saturating_add(len_u64(d.len())) > max {
                             return Err(BodyError::TooLarge { limit: max });
                         }
                         buf.extend_from_slice(&d);
@@ -264,7 +264,8 @@ impl Body {
                     return Ok((buf.freeze(), Some(self.prefixed(Some(trailers), len))));
                 }
             };
-            let room = cap - buf.len();
+            // Below, `buf` only grows while shorter than `cap`.
+            let room = cap.saturating_sub(buf.len());
             if data.len() < room {
                 buf.extend_from_slice(&data);
                 continue;
@@ -406,7 +407,7 @@ where
             Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                 Ok(mut d) => {
                     let bytes = d.copy_to_bytes(d.remaining());
-                    this.seen += len_u64(bytes.len());
+                    this.seen = this.seen.saturating_add(len_u64(bytes.len()));
                     if this.seen > this.max {
                         return Poll::Ready(Some(Err(BodyError::TooLarge { limit: this.max })));
                     }
@@ -490,7 +491,7 @@ impl BodySender {
         if data.is_empty() {
             return Ok(());
         }
-        let total = self.sent + len_u64(data.len());
+        let total = self.sent.saturating_add(len_u64(data.len()));
         if total > self.max {
             return Err(self.fail(BodyError::TooLarge { limit: self.max }));
         }

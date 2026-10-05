@@ -96,28 +96,22 @@ fn decode_form(s: &str) -> Cow<'_, str> {
     if !s.bytes().any(|b| b == b'%' || b == b'+') {
         return Cow::Borrowed(s);
     }
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
+    let mut out = Vec::with_capacity(s.len());
+    let mut rest = s.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        rest = tail;
+        match byte {
             b'+' => out.push(b' '),
-            b'%' => {
-                // Encodings were validated at construction.
-                match (
-                    bytes.get(i + 1).copied().and_then(hex_val),
-                    bytes.get(i + 2).copied().and_then(hex_val),
-                ) {
-                    (Some(hi), Some(lo)) => {
-                        out.push(hi << 4 | lo);
-                        i += 2;
-                    }
-                    _ => out.push(b'%'),
+            // Encodings were validated at construction.
+            b'%' => match tail {
+                [hi, lo, tail @ ..] if let (Some(hi), Some(lo)) = (hex_val(*hi), hex_val(*lo)) => {
+                    out.push(hi << 4 | lo);
+                    rest = tail;
                 }
-            }
+                _ => out.push(b'%'),
+            },
             other => out.push(other),
         }
-        i += 1;
     }
     Cow::Owned(String::from_utf8_lossy(&out).into_owned())
 }
@@ -131,14 +125,19 @@ fn canonicalize_encodings(
     decode_unreserved: bool,
 ) -> Result<String, ParseError> {
     let mut out = String::with_capacity(raw.len());
-    let mut i = 0;
-    while i < raw.len() {
-        let byte = raw[i];
+    let mut rest = raw;
+    while let Some((&byte, tail)) = rest.split_first() {
+        // Only for messages: `rest` is a suffix of `raw`.
+        let i = raw.len().saturating_sub(rest.len());
+        rest = tail;
         if byte == b'%' {
-            let (Some(hi), Some(lo)) = (
-                raw.get(i + 1).copied().and_then(hex_val),
-                raw.get(i + 2).copied().and_then(hex_val),
-            ) else {
+            let [hi, lo, tail @ ..] = tail else {
+                return reject(
+                    Reason::BadPercentEncoding,
+                    format!("bad percent-encoding at offset {i}"),
+                );
+            };
+            let (Some(hi), Some(lo)) = (hex_val(*hi), hex_val(*lo)) else {
                 return reject(
                     Reason::BadPercentEncoding,
                     format!("bad percent-encoding at offset {i}"),
@@ -152,7 +151,7 @@ fn canonicalize_encodings(
                 out.push(char::from(hex_upper(hi)));
                 out.push(char::from(hex_upper(lo)));
             }
-            i += 3;
+            rest = tail;
             continue;
         }
         if byte == b'#' {
@@ -168,7 +167,6 @@ fn canonicalize_encodings(
             );
         }
         out.push(char::from(byte));
-        i += 1;
     }
     Ok(out)
 }
@@ -197,7 +195,8 @@ pub fn normalize_path(raw: &[u8]) -> Result<Path, ParseError> {
 fn remove_dot_segments(path: &str) -> Result<String, ParseError> {
     debug_assert!(path.starts_with('/'));
     let segments: Vec<&str> = path[1..].split('/').collect();
-    let last = segments.len() - 1;
+    // `split` yields at least one segment.
+    let last = segments.len().saturating_sub(1);
     let mut out: Vec<&str> = Vec::with_capacity(segments.len());
     for (i, seg) in segments.iter().enumerate() {
         match *seg {
@@ -251,7 +250,7 @@ pub fn parse_origin_form(raw: &[u8]) -> Result<(Path, Option<Query>), ParseError
         return reject(Reason::BadRequestTarget, "origin-form must start with '/'");
     }
     let (p, q) = match raw.iter().position(|&b| b == b'?') {
-        Some(i) => (&raw[..i], Some(&raw[i + 1..])),
+        Some(i) => (&raw[..i], Some(&raw[i..][1..])),
         None => (raw, None),
     };
     let path = normalize_path(p)?;
@@ -324,7 +323,7 @@ pub fn parse_authority_opt(raw: &[u8], default_port: Option<u16>) -> Result<Auth
         let Some(close) = raw.iter().position(|&b| b == b']') else {
             return reject(Reason::BadAuthority, "unterminated IPv6 literal");
         };
-        let after = &raw[close + 1..];
+        let after = &raw[close..][1..];
         let port = match after {
             [] => None,
             [b':', p @ ..] => Some(p),
@@ -333,7 +332,7 @@ pub fn parse_authority_opt(raw: &[u8], default_port: Option<u16>) -> Result<Auth
         (&raw[..=close], port)
     } else {
         match raw.iter().position(|&b| b == b':') {
-            Some(i) => (&raw[..i], Some(&raw[i + 1..])),
+            Some(i) => (&raw[..i], Some(&raw[i..][1..])),
             None => (raw, None),
         }
     };
@@ -355,9 +354,8 @@ fn parse_port(p: &[u8]) -> Result<u16, ParseError> {
     if p.is_empty() || p.len() > 5 || !p.iter().all(u8::is_ascii_digit) {
         return reject(Reason::BadAuthority, "invalid port");
     }
-    let v: u32 = p.iter().fold(0, |acc, &d| acc * 10 + u32::from(d - b'0'));
-    match u16::try_from(v) {
-        Ok(port) if port != 0 => Ok(port),
+    match str::from_utf8(p).ok().and_then(|s| s.parse::<u16>().ok()) {
+        Some(port) if port != 0 => Ok(port),
         _ => reject(Reason::BadAuthority, "port out of range"),
     }
 }
@@ -612,10 +610,10 @@ mod tests {
                 }
                 // No encoded unreserved bytes and no lower-case hex survive.
                 let b = p.as_str().as_bytes();
-                for (i, _) in b.iter().enumerate().filter(|(_, c)| **c == b'%') {
-                    let v = hex_val(b[i + 1]).unwrap() << 4 | hex_val(b[i + 2]).unwrap();
+                for w in b.windows(3).filter(|w| w[0] == b'%') {
+                    let v = hex_val(w[1]).unwrap() << 4 | hex_val(w[2]).unwrap();
                     prop_assert!(!is_unreserved(v));
-                    prop_assert!(!b[i + 1].is_ascii_lowercase() && !b[i + 2].is_ascii_lowercase());
+                    prop_assert!(!w[1].is_ascii_lowercase() && !w[2].is_ascii_lowercase());
                 }
             }
         }
