@@ -410,6 +410,20 @@ pub(crate) async fn run(
     }
 }
 
+/// The `400` for a WebSocket handshake roxy will not relay, with and
+/// without a stack.
+pub(crate) fn bad_upgrade_refusal(reason: roxy_http::Reason) -> Refusal {
+    Refusal {
+        reason: Some(reason.as_str().to_owned()),
+        ..Refusal::deny(
+            StatusCode::BAD_REQUEST,
+            "invalid websocket upgrade",
+            RuleId::new("_websocket"),
+            true,
+        )
+    }
+}
+
 fn upstream_refusal(cx: &FlowCx, e: &ConnectError, host: &str, port: u16) -> Refusal {
     if let ConnectError::Denied(d) = e {
         cx.shared.sink.emit(&FlowEvent::UpstreamDenied {
@@ -621,17 +635,8 @@ async fn upgrade_upstream(
     up_tap: Option<&mut Tap>,
 ) -> Result<Upstreamed, Failed> {
     let (host, port) = (host_text(&req.authority.host), req.authority.port);
-    let key = validate_upgrade_request(&req).map_err(|e| {
-        Failed::Refuse(Refusal {
-            reason: Some(e.reason.as_str().to_owned()),
-            ..Refusal::deny(
-                StatusCode::BAD_REQUEST,
-                "invalid websocket upgrade",
-                RuleId::new("_websocket"),
-                true,
-            )
-        })
-    })?;
+    let key = validate_upgrade_request(&req)
+        .map_err(|e| Failed::Refuse(bad_upgrade_refusal(e.reason)))?;
     if crate::addons::ws_without_extensions(&cx.snap, cx.layer_ran) {
         // Messages are read, by the rules or by addon layers, so no
         // extension (permessage-deflate above all) may be negotiated.

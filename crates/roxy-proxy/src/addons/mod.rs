@@ -43,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::addr::PrivateAddrs;
 use crate::body::{Collected, collect_prefix};
-use crate::exchange::{Front, Outcome, refusal_response};
+use crate::exchange::{Front, Outcome, bad_upgrade_refusal, refusal_response};
 use crate::flowlog::{DecisionKind, FlowEvent, FlowSink};
 use crate::pipeline::{BodyIo, CollectFuture, Decider, FlowCx, FlowMeta, Refusal, RefusalKind};
 use crate::view::FlowFacts;
@@ -593,17 +593,9 @@ pub(crate) async fn run<F: Front>(
     // A WebSocket is a long-lived exchange: once upgraded, the client's
     // bytes are the request body and the upstream's the response body.
     let client_tx = if st.is_upgrade() {
-        // Check the handshake has no body before swapping.
+        // The swap below would hide a body from `validate_upgrade_request`.
         if req.body.known_length() != Some(0) {
-            let refusal = Refusal {
-                reason: Some("ws_bad_handshake".to_owned()),
-                ..Refusal::deny(
-                    StatusCode::BAD_REQUEST,
-                    "invalid websocket upgrade",
-                    roxy_rules::RuleId::new("_websocket"),
-                    true,
-                )
-            };
+            let refusal = bad_upgrade_refusal(roxy_http::Reason::WsBadHandshake);
             return (cx, Outcome::Refuse(refusal));
         }
         let (tx, body) = Body::channel(u64::MAX, None);
