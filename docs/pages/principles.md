@@ -41,8 +41,8 @@ reaches it.
 
 ## Fail closed
 
-Anything roxy cannot parse, verify or classify is dropped. Under
-`default: deny`, an empty rule set denies everything. A config that fails
+Anything roxy cannot parse, verify or classify is dropped. An
+empty rule set denies everything. A config that fails
 to compile is not loaded, and a failed reload keeps the running policy. An
 addon in `enforce` mode that fails denies the flow; an `observe` addon
 cannot affect traffic, so its failure is logged and the flow goes on.

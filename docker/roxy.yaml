@@ -19,7 +19,6 @@ log:
     connection_events: false # flow log to stdout (no path), for `docker logs`
 
 # Anything not allowed by a rule is denied. Replace this with your policy.
-default: deny
 rules:
   - id: example
     when: host == "example.com" and method in [GET, HEAD]

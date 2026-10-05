@@ -87,11 +87,9 @@ metrics:
     key: [client.ip]
     window: 1h
 
-# What a request gets when no rule decides it: deny (the default) or allow.
-# Any matching deny wins over any matching allow, wherever it sits in the
-# list; rule order only orders effects.
-default: deny
-
+# Anything no rule allows is denied. Any matching deny wins over any
+# matching allow, wherever it sits in the list; rule order only orders
+# effects.
 rules:
   - id: no-writes-burst
     when: metric.github_writes >= 30 and host under "api.github.com"

@@ -49,8 +49,6 @@ Whatever `sentinel` passes on is still judged by the rules. If it fails, the flo
 The rules are a list of allows plus the denies that restrict them, in one YAML file. A matching deny always wins, and anything no rule allows is denied. Rules read the request head, and they can keep watching the bodies and the response as they stream. Metrics give you rate limits and byte budgets.
 
 ```yaml
-default: deny
-
 secrets:
   openai: { env: OPENAI_API_KEY }
 

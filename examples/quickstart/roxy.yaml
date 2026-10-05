@@ -34,8 +34,6 @@ addons:
       first_byte_timeout: 120s
 
 # Anything no rule allows is denied. A matching deny always beats an allow.
-default: deny
-
 rules:
   - id: claude-api
     when: host == "api.anthropic.com"

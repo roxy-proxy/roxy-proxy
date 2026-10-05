@@ -21,7 +21,7 @@ the table names.
 | `dns` | [DNS steering](/deploy/dns-steering) |
 | `address_lists` | [address lists](/policies/address-lists#address-lists) |
 | `limits` | [resource limits](/reference/limits) |
-| `default`, `rules` | [how policies work](/policies/overview), [rule language](/reference/rule-language) |
+| `rules` | [how policies work](/policies/overview), [rule language](/reference/rule-language) |
 | `secrets` | [secrets](/policies/secrets) |
 | `metrics` | [rate limits](/policies/rate-limits) |
 | `addons` | [addons](/addons/overview) |
@@ -29,7 +29,6 @@ the table names.
 
 ```yaml
 version: 1
-default: deny                  # deny (the default) | allow: when no rule matches
 
 secrets:
   openai: { env: OPENAI_API_KEY }
