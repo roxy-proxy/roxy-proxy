@@ -1,7 +1,8 @@
-# The sidecar: inspect_sentinel (which installs its inspect_ai branch, and
-# with it Inspect View), the Anthropic SDK inspect_ai's converters use, and
-# websockets for roxy's service-layer protocol. inspect_sentinel is pinned
-# to a commit so builds are reproducible.
-inspect_sentinel @ git+https://github.com/meridianlabs-ai/inspect_sentinel@566a390535287e6e4ac3ed35fb5e8234a8e4a9b0
-anthropic
-websockets>=14
+# The sidecar's dependencies, pinned to versions known to work together:
+# private_api.py reaches into the anthropic SDK and inspect_ai, so an
+# unpinned upgrade can break it. inspect_sentinel is in
+# requirements-sentinel.txt.
+inspect_ai @ git+https://github.com/UKGovernmentBEIS/inspect_ai@f7f90645c9feed303f91d6146e43eaa6dfe06165
+anthropic==1.11.0
+httpx2==2.13.1
+websockets==17.2

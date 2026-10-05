@@ -27,17 +27,16 @@ from inspect_ai.log import EvalConfig, EvalDataset, EvalLog, EvalSample, EvalSpe
 from inspect_ai.model import ChatMessage, GenerateConfig, ModelOutput
 from inspect_sentinel import Context, Step
 
+from private_api import factory_kind
+
 log = logging.getLogger("sentinel-sidecar")
 
 WRITE_EVERY = 2.0
 
 
 def _kind(factory: str) -> str:
-    # The registry knows whether a factory is a monitor or a protocol.
     try:
-        from inspect_ai._sentinel._dispatch import _factory_kind
-
-        return _factory_kind(factory)
+        return factory_kind(factory)
     except Exception:  # noqa: BLE001
         return "decision"
 
