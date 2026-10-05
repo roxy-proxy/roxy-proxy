@@ -374,13 +374,14 @@ fn unanswered(st: &StackFlow, u: Unanswered) -> Fail {
         Unanswered::Service(e) => Fail::Service(e),
         Unanswered::Abandoned(why) => Fail::Below(HostError::new(why)),
         Unanswered::Body(Dir::Request, e) => {
-            st.set_client_fault(crate::pipeline::body_failure(&e).into());
+            st.record(super::Fault::Client(
+                crate::pipeline::body_failure(&e).into(),
+            ));
             Fail::Below(HostError::new(format!("request body failed: {e}")))
         }
         Unanswered::Body(Dir::Response, e) => {
             tracing::info!(flow = %st.flow, error = %e, "upstream response body failed");
-            st.upstream_body_failed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            st.record(super::Fault::UpstreamBody);
             Fail::Below(HostError::new(format!("response body failed: {e}")))
         }
     }
