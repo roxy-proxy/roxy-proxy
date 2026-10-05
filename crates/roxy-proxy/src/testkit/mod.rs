@@ -565,6 +565,23 @@ impl Kit {
     /// A raw client connection to the proxy port.
     pub(crate) fn connect(&self) -> tokio::io::DuplexStream {
         let (client, server) = tokio::io::duplex(64 * 1024);
+        self.serve_client(Box::new(server));
+        client
+    }
+
+    /// A raw client connection to the proxy port that the test can reset:
+    /// after [`Reset::reset`], roxy's reads and writes on it fail.
+    pub(crate) fn connect_resettable(&self) -> (tokio::io::DuplexStream, Reset) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let reset = Reset::default();
+        self.serve_client(Box::new(Resettable {
+            inner: server,
+            reset: reset.clone(),
+        }));
+        (client, reset)
+    }
+
+    fn serve_client(&self, server: crate::io::BoxIo) {
         let conn = ClientConn {
             id: Ulid::generate(),
             listener: Arc::new(ListenerInfo {
@@ -577,11 +594,10 @@ impl Kit {
             original_dst: None,
         };
         self.spawn_conn(crate::conn::serve_explicit(
-            Box::new(server),
+            server,
             conn,
             self.server.shared().clone(),
         ));
-        client
     }
 
     /// A raw client that sent `bytes` to the proxy port and was gone before
@@ -707,7 +723,16 @@ impl Kit {
         path: &str,
         headers: &[(&str, &str)],
     ) -> (u16, Option<TokioIo<hyper::upgrade::Upgraded>>) {
-        let mut c = self.h1().await;
+        self.websocket_over(self.h1().await, path, headers).await
+    }
+
+    /// [`Kit::websocket`] over the client `c`.
+    pub(crate) async fn websocket_over(
+        &self,
+        mut c: Client,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> (u16, Option<TokioIo<hyper::upgrade::Upgraded>>) {
         let mut hs = vec![
             ("connection", "upgrade"),
             ("upgrade", "websocket"),
@@ -1204,5 +1229,75 @@ mod smoke {
         let ev = kit.events("request", 2).await;
         let alpn: Vec<_> = ev.iter().map(|e| e["tls"]["alpn"].clone()).collect();
         assert_eq!(alpn, ["http/1.1", "h2"], "{ev:#?}");
+    }
+}
+
+/// Resets a [`Kit::connect_resettable`] connection.
+#[derive(Clone, Default)]
+pub(crate) struct Reset(Arc<std::sync::atomic::AtomicBool>);
+
+impl Reset {
+    /// From now on roxy's reads and writes on the connection fail. A read
+    /// already waiting fails once the client side is dropped.
+    pub(crate) fn reset(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn is_reset(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// roxy's side of a connection the test can reset.
+struct Resettable {
+    inner: tokio::io::DuplexStream,
+    reset: Reset,
+}
+
+fn connection_reset() -> std::io::Error {
+    std::io::ErrorKind::ConnectionReset.into()
+}
+
+impl tokio::io::AsyncRead for Resettable {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.reset.is_reset() {
+            return std::task::Poll::Ready(Err(connection_reset()));
+        }
+        let r = std::task::ready!(std::pin::Pin::new(&mut self.inner).poll_read(cx, buf));
+        if self.reset.is_reset() {
+            return std::task::Poll::Ready(Err(connection_reset()));
+        }
+        std::task::Poll::Ready(r)
+    }
+}
+
+impl tokio::io::AsyncWrite for Resettable {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.reset.is_reset() {
+            return std::task::Poll::Ready(Err(connection_reset()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }

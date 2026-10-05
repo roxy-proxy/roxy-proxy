@@ -8,7 +8,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
 
-use super::{Kit, KitBuilder, Ws};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+use super::{AddonDef, Client, Kit, KitBuilder, Ws};
 
 const WS_ALLOW: &str = r#"
 - id: ws
@@ -335,7 +337,6 @@ async fn an_upgrade_the_rule_does_not_allow_is_stripped() {
 /// ws_bad_handshake`, as it is without addons.
 #[tokio::test]
 async fn upgrade_with_body_is_refused_with_a_stack() {
-    use super::AddonDef;
     let kit = Kit::builder()
         .rules(WS_ALLOW)
         .addon(AddonDef::test_layer("a"))
@@ -359,4 +360,58 @@ async fn upgrade_with_body_is_refused_with_a_stack() {
     assert_eq!(ev["decision"], "deny");
     assert_eq!(ev["terminal_rule"], "_websocket");
     assert_eq!(ev["reason"], "ws_bad_handshake");
+}
+
+/// The capture `end` record of a WebSocket's client-to-server direction
+/// after the client's connection is reset, with or without a layer
+/// between the client and the relay.
+async fn end_after_client_reset(layer: bool) -> serde_json::Value {
+    let mut b = Kit::builder()
+        .rules(
+            r#"
+- id: ws
+  when: host == "up.test"
+  then: [{ capture: both }, { allow: { upgrade: websocket } }]
+"#,
+        )
+        .capture_selected();
+    if layer {
+        b = b.addon(AddonDef::test_layer("t"));
+    }
+    let kit = b.start().await;
+    let (io, reset) = kit.connect_resettable();
+    let (status, io) = kit
+        .websocket_over(Client::h1(io, None).await, "/ws", &[])
+        .await;
+    assert_eq!(status, 101);
+    let mut io = io.unwrap();
+    io.write_all(b"hello").await.unwrap();
+    let mut got = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(10), io.read_exact(&mut got))
+        .await
+        .expect("echo in time")
+        .unwrap();
+    reset.reset();
+    drop(io);
+    kit.events("ws_close", 1).await;
+    let flow = kit.request_event().await["flow"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    kit.captured()
+        .into_iter()
+        .map(|(h, _)| h)
+        .filter(|h| h["flow"] == flow.as_str() && h["dir"] == "request")
+        .find(|h| h["kind"] == "end")
+        .expect("an end record")
+}
+
+/// A client reset is captured as an aborted end, through a layer as
+/// without one: the layer's failed request body is not a clean close.
+#[tokio::test]
+async fn a_client_reset_is_captured_as_aborted_through_a_layer_too() {
+    let direct = end_after_client_reset(false).await;
+    assert_eq!(direct["aborted"], true, "{direct}");
+    let layered = end_after_client_reset(true).await;
+    assert_eq!(layered["aborted"], true, "{layered}");
 }

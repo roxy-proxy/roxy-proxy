@@ -6,10 +6,16 @@
 //! relays the real upgrade; the pieces gathered on the way down and up are
 //! spliced to the client once the front has sent the `101`.
 
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll, ready};
+
 use bytes::Bytes;
 use roxy_http::ws::WsKey;
 use roxy_http::{Body, BodyError, BodySender, CanonicalResponse};
 use roxy_wasm::LayerRequest;
+use tokio::io::{AsyncRead, ReadBuf};
 
 use super::StackFlow;
 use crate::io::BoxIo;
@@ -29,22 +35,66 @@ impl Relay {
     /// Wires the bottom of the stack: `stream` (what the last layer passed
     /// on after the head) goes to the relay, and the relay's output becomes
     /// `res`'s body. One pipe per direction, each end held whole, so a
-    /// close on either side is seen (#36).
+    /// close on either side is seen (#36). A failed `stream` reaches the
+    /// relay as a read error, as a broken client connection would.
     pub(crate) fn new(
         upstream: hyper::upgrade::Upgraded,
         key: WsKey,
-        stream: Body,
+        mut stream: Body,
         res: &mut CanonicalResponse,
     ) -> Self {
-        let (to_relay_w, to_relay_r) = tokio::io::duplex(64 * 1024);
+        let (mut to_relay_w, to_relay_r) = tokio::io::duplex(64 * 1024);
         let (from_relay_w, from_relay_r) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(body_to_writer(stream, to_relay_w));
+        let failed = Arc::new(AtomicBool::new(false));
+        let to_relay_r = FailedAtEof {
+            inner: to_relay_r,
+            failed: failed.clone(),
+        };
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            match copy_body(&mut stream, &mut to_relay_w).await {
+                Ok(()) => {
+                    let _ = to_relay_w.shutdown().await;
+                }
+                // Set before the writer drops, so the relay's read at the
+                // end sees it.
+                Err(()) => failed.store(true, Ordering::Release),
+            }
+        });
         res.body = reader_to_body(from_relay_r);
         Self {
             upstream,
             key,
             bottom: Box::new(tokio::io::join(to_relay_r, from_relay_w)),
         }
+    }
+}
+
+/// A pipe's reading end whose end of stream is an error once `failed` is
+/// set: the writer stopped because what it copied failed.
+struct FailedAtEof<R> {
+    inner: R,
+    failed: Arc<AtomicBool>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for FailedAtEof<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        ready!(Pin::new(&mut self.inner).poll_read(cx, buf))?;
+        if buf.filled().len() == before
+            && buf.remaining() > 0
+            && self.failed.load(Ordering::Acquire)
+        {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "the stream from the layers failed",
+            )));
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -153,19 +203,27 @@ pub(super) fn join_upgrade_stream(mut req: LayerRequest, stream: Option<Body>) -
 /// shut down cleanly: the writer is dropped, and the far side sees the
 /// stream end.
 async fn body_to_writer(mut body: Body, mut w: impl tokio::io::AsyncWrite + Unpin) {
+    use tokio::io::AsyncWriteExt as _;
+    if copy_body(&mut body, &mut w).await.is_ok() {
+        let _ = w.shutdown().await;
+    }
+}
+
+/// Writes a body's bytes to `w` until the body ends. `Err` if the body or
+/// the write failed.
+async fn copy_body(
+    body: &mut Body,
+    w: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<(), ()> {
     use http_body_util::BodyExt as _;
     use tokio::io::AsyncWriteExt as _;
     while let Some(frame) = body.frame().await {
-        let Ok(frame) = frame else {
-            return;
-        };
-        if let Some(d) = frame.data_ref()
-            && w.write_all(d).await.is_err()
-        {
-            return;
+        let frame = frame.map_err(|_| ())?;
+        if let Some(d) = frame.data_ref() {
+            w.write_all(d).await.map_err(|_| ())?;
         }
     }
-    let _ = w.shutdown().await;
+    Ok(())
 }
 
 /// A body read from `r` until its end.
