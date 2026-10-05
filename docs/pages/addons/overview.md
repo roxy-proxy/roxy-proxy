@@ -105,7 +105,9 @@ request.
   chunks, say) stalls an interactive protocol: the peer waits for the
   held bytes.
 - No clock runs on the bodies ([safety](/addons/safety)): a WebSocket
-  lives as long as the relay's idle timeout allows.
+  lives as long as the relay's idle timeout allows. When the relay ends,
+  roxy closes the client's connection too, whether or not the layers have
+  ended their bodies; bytes already on their way get a second to arrive.
 
 ## Content codings
 

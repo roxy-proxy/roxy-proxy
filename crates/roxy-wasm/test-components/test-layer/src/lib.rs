@@ -187,9 +187,11 @@ fn answer_with(resp: IncomingResponse, out: ResponseOutparam, upper: bool) {
 }
 
 /// The default: pass the exchange through, streaming both bodies, chunk by
-/// chunk (upper-cased when `x-upper` is set).
+/// chunk (upper-cased when `x-upper` is set). With `x-hold`, neither body
+/// it passes on is ever ended.
 fn pass(req: IncomingRequest, out: ResponseOutparam, buffer_first: bool) {
     let upper = header(&req, "x-upper").is_some();
+    let hold = header(&req, "x-hold").is_some();
     let next_req = forward_head(&req);
     let next_body = next_req.body().expect("body");
     let in_body = req.consume().expect("consume");
@@ -209,7 +211,7 @@ fn pass(req: IncomingRequest, out: ResponseOutparam, buffer_first: bool) {
 
     let fut = chain::next(next_req).expect("next");
     let Some(all) = buffered else {
-        duplex(req, in_body, next_body, fut, out, upper);
+        duplex(req, in_body, next_body, fut, out, (upper, hold));
         return;
     };
     {
@@ -233,7 +235,7 @@ fn duplex(
     next_body: OutgoingBody,
     fut: wasi::http::types::FutureIncomingResponse,
     out: ResponseOutparam,
-    upper: bool,
+    (upper, hold): (bool, bool),
 ) {
     let up = |mut c: Vec<u8>| {
         if upper {
@@ -314,6 +316,18 @@ fn duplex(
             let (below, body, mine_body) = resp.take().expect("response");
             drop(body);
             drop(below);
+            if hold {
+                // Keep both bodies open until the client's request body
+                // goes away.
+                while req_open && req_in.blocking_read(64 * 1024).is_ok() {}
+                drop(req_out);
+                drop(req_in);
+                drop(next_body);
+                drop(in_body);
+                drop(req);
+                drop(mine_body);
+                return;
+            }
             OutgoingBody::finish(mine_body, None).expect("finish");
             break;
         }

@@ -22,7 +22,7 @@ mod tee;
 mod ws;
 
 pub use service::{ServiceError, ServiceSpec};
-pub(crate) use ws::{splice_client, ws_without_extensions};
+pub(crate) use ws::{SplicedClient, splice_client, ws_without_extensions};
 
 use std::collections::HashMap;
 use std::pin::Pin;

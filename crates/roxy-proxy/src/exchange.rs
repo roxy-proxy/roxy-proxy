@@ -832,10 +832,14 @@ async fn splice_websocket(
     // Through an addon stack, the layers sit between the client and the
     // relay, carrying the WebSocket as the bodies of its exchange; the bytes
     // that came with the upgrade request go through them first.
+    let mut spliced = None;
     let (client_io, leftover): (crate::io::BoxIo, Vec<u8>) = match &cx.stack {
         Some(st) => {
             match crate::addons::splice_client(st, Box::new(client_io), leftover.to_vec()) {
-                Ok(bottom) => (bottom, Vec::new()),
+                Ok((bottom, client)) => {
+                    spliced = Some(client);
+                    (bottom, Vec::new())
+                }
                 Err(client_io) => (client_io, leftover.to_vec()),
             }
         }
@@ -851,6 +855,7 @@ async fn splice_websocket(
     if parse {
         let max = cx.snap.limits.max_ws_message_bytes;
         let r = relay_messages(client_io, upstream, leftover, (idle, max), &watch, taps).await;
+        close_spliced(spliced).await;
         finish_websocket(&mut cx, r);
         return None;
     }
@@ -877,8 +882,17 @@ async fn splice_websocket(
         s2c,
         closed: None,
     };
+    close_spliced(spliced).await;
     finish_websocket(&mut cx, r);
     None
+}
+
+/// Through a stack, the relay's end closes the client too: the layers
+/// hold its socket otherwise, for as long as they keep their bodies open.
+async fn close_spliced(client: Option<crate::addons::SplicedClient>) {
+    if let Some(c) = client {
+        c.close(CLOSE_TIMEOUT).await;
+    }
 }
 
 /// Logs the end of a relayed WebSocket and its exchange.
