@@ -324,8 +324,8 @@ pub(crate) struct Kit {
     /// The capture log, with [`KitBuilder::capture_all`].
     pub capture: Option<Arc<crate::capture::CaptureLog>>,
     ca_file: std::path::PathBuf,
-    limits: Limits,
-    flags: HttpFlags,
+    pub(crate) limits: Limits,
+    pub(crate) flags: HttpFlags,
     settings: UpstreamSettings,
     _dir: tempfile::TempDir,
 }

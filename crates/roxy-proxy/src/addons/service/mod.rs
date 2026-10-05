@@ -441,7 +441,7 @@ pub(crate) mod testing {
     const PORT: u16 = 9000;
 
     /// A service layer whose endpoint is the in-test service's `behaviour`
-    /// (`pass`, `flood` or `stall`).
+    /// (`pass`, `talk`, `flood`, `pause` or `stall`).
     pub(crate) fn addon(
         name: &str,
         behaviour: &str,
@@ -534,8 +534,8 @@ pub(crate) mod testing {
                     .collect(),
                 redactor,
                 users: HashMap::new(),
-                limits: roxy_http::Limits::default(),
-                flags: roxy_http::HttpFlags::default(),
+                limits: kit.limits.clone(),
+                flags: kit.flags.clone(),
                 upstream,
                 address_lists: Arc::new(HashMap::new()),
                 deny_lists: Vec::new(),

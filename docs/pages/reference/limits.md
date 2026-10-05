@@ -49,6 +49,7 @@ limits:
   max_inspect_body_bytes: 1mb     # body.text / response.body.text, and addons' default
   max_capture_body_bytes: 16mb    # per direction per exchange
   max_ws_message_bytes: 16mb      # a reassembled WebSocket message, when rules read ws.*
+  max_observer_lag_bytes: 16mb    # how far behind an observe-mode addon may fall, per direction
 
   # connections
   max_connections: 10000
@@ -64,7 +65,11 @@ limits:
 Addons have their own limits ([addon safety](/addons/safety)).
 `max_ws_message_bytes` applies only when rules read WebSocket messages
 ([WebSockets](/policies/websockets#message-rules)); a message over it closes both
-sides with `1009`.
+sides with `1009`. `max_observer_lag_bytes` is how far behind the real
+exchange an observe-mode addon may fall: its copy of each body is buffered
+for it, so an observer that keeps up sees every body in full however
+large, and one with more than that many bytes unread has the copy cut
+([addon modes](/addons/overview#modes)).
 
 The limits that shape the client-facing codec (`max_header_bytes`,
 `max_url_bytes`, `max_headers`, `max_request_body_bytes`, `header_timeout`,
@@ -73,7 +78,7 @@ the `http.*` flags are fixed for a connection when it is accepted, on
 HTTP/1.1 and HTTP/2 alike; a reload changes them for new connections only.
 Everything decided per exchange (`max_inspect_body_bytes`,
 `max_response_body_bytes`, `response_header_timeout`, the WebSocket limits,
-the policy itself) comes from the snapshot the exchange starts under, so an
+`max_observer_lag_bytes`, the policy itself) comes from the snapshot the exchange starts under, so an
 exchange on an old connection runs under the current values.
 
 ## Connections

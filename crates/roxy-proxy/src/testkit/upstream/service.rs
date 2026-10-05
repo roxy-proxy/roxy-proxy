@@ -11,6 +11,8 @@
 //! * `/svc/flood`: sends one request body frame of [`FLOOD_BYTES`] on
 //!   each stream as it opens, with no head and without waiting for
 //!   credit;
+//! * `/svc/pause`: reads nothing for [`PAUSE`] after the handshake, then
+//!   reads and credits everything without answering;
 //! * `/svc/stall`: completes the handshake and never reads.
 //!
 //! Every connection credits roxy back for the bytes it receives.
@@ -61,12 +63,17 @@ pub(crate) const FLOOD_BYTES: usize = 300 * 1024;
 /// What `/svc/talk` sends on each stream, on credit: several windows.
 pub(crate) const TALK_BYTES: usize = 4 * 256 * 1024;
 
+/// How long `/svc/pause` leaves its socket unread after the handshake.
+pub(crate) const PAUSE: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// What the service saw, across connections.
 #[derive(Default)]
 pub(crate) struct ServiceLog {
     opens: Mutex<Vec<Value>>,
     resets: Mutex<Vec<(u32, String)>>,
     talked: Mutex<Vec<u32>>,
+    /// Body bytes received per stream id, across connections.
+    received: Mutex<HashMap<u32, usize>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -82,6 +89,41 @@ impl ServiceLog {
     /// Every reset roxy sent: (stream id, message).
     pub(crate) fn resets(&self) -> Vec<(u32, String)> {
         lock(&self.resets).clone()
+    }
+
+    /// Waits until `n` streams have been opened; every `open` so far.
+    pub(crate) async fn until_opened(&self, n: usize) -> Vec<Value> {
+        let wait = async {
+            while lock(&self.opens).len() < n {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+            .await
+            .unwrap_or_else(|_| panic!("service: wanted {n} opens, have {:?}", self.opens()));
+        self.opens()
+    }
+
+    /// Body bytes received so far on stream `id`.
+    pub(crate) fn received(&self, id: u32) -> usize {
+        lock(&self.received).get(&id).copied().unwrap_or(0)
+    }
+
+    /// Waits until stream `id` has received `n` body bytes.
+    pub(crate) async fn until_received(&self, id: u32, n: usize) {
+        let wait = async {
+            while self.received(id) < n {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "service: wanted {n} body bytes on stream {id}, have {}",
+                    self.received(id)
+                )
+            });
     }
 
     /// Waits until `n` `/svc/talk` streams got all their bytes out.
@@ -181,6 +223,7 @@ enum Mode {
     Pass,
     Talk,
     Flood,
+    Pause,
 }
 
 impl Mode {
@@ -189,6 +232,8 @@ impl Mode {
             Self::Pass
         } else if path.ends_with("/talk") {
             Self::Talk
+        } else if path.ends_with("/pause") {
+            Self::Pause
         } else {
             Self::Flood
         }
@@ -230,7 +275,7 @@ impl Conn {
                 lock(&self.log.opens).push(v);
                 self.streams.insert(id, Sess::new());
                 match self.mode {
-                    Mode::Pass => {}
+                    Mode::Pass | Mode::Pause => {}
                     Mode::Talk => {
                         let s = self.streams.get_mut(&id).expect("just opened");
                         s.lanes[usize::from(REQUEST)]
@@ -274,6 +319,7 @@ impl Conn {
         if data.is_empty() {
             return;
         }
+        *lock(&self.log.received).entry(id).or_insert(0) += data.len();
         self.send(text(
             id,
             json!({"type": "credit", "dir": dir_name(dir), "bytes": data.len()}),
@@ -334,6 +380,9 @@ where
         // Holds the socket open without reading it.
         let _ws = ws;
         return std::future::pending::<()>().await;
+    }
+    if path.ends_with("/pause") {
+        tokio::time::sleep(PAUSE).await;
     }
     let (mut sink, mut stream) = ws.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
