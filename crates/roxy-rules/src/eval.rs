@@ -568,9 +568,14 @@ fn get<'a>(op: &'a ROperand, s: &Scope<'a>) -> Value<'a> {
             Access::RespHeaderAll(n) => list(s.view.response_header_all(n)),
             Access::Query(k) => opt(s.view.query(k)),
             Access::State(k) => {
-                let pending = s.effects.iter().rev().find_map(|e| match e {
-                    Effect::SetState { key, value, .. } if **key == **k => Some(value.as_str()),
-                    _ => None,
+                let pending = s.effects.iter().rev().find_map(|e| {
+                    if let Effect::SetState { key, value, .. } = e
+                        && **key == **k
+                    {
+                        Some(value.as_str())
+                    } else {
+                        None
+                    }
                 });
                 match pending {
                     Some(v) => Value::Str(Cow::Borrowed(v)),
@@ -668,7 +673,7 @@ fn any_str(v: &Value<'_>, f: impl Fn(&str) -> bool) -> bool {
     match v {
         Value::Str(s) => f(s),
         Value::List(items) => items.iter().any(|s| f(s)),
-        _ => false,
+        Value::Int(_) | Value::Bool(_) | Value::Ip(_) | Value::Absent => false,
     }
 }
 
@@ -734,7 +739,11 @@ impl Pred {
             }
             Pred::Under { lhs, suffix } => match get(lhs, s) {
                 Value::Str(h) => under(&h, suffix),
-                v => {
+                v @ (Value::Int(_)
+                | Value::Bool(_)
+                | Value::Ip(_)
+                | Value::List(_)
+                | Value::Absent) => {
                     missing(lhs, &v, s);
                     false
                 }
@@ -748,12 +757,18 @@ impl Pred {
                 negate,
             } => match get(lhs, s) {
                 Value::Absent => *negate,
-                v => any_str(&v, |x| set.iter().any(|m| str_eq(x, m, *ci))) != *negate,
+                v @ (Value::Str(_)
+                | Value::Int(_)
+                | Value::Bool(_)
+                | Value::Ip(_)
+                | Value::List(_)) => {
+                    any_str(&v, |x| set.iter().any(|m| str_eq(x, m, *ci))) != *negate
+                }
             },
             Pred::InInt { lhs, set, negate } => match get(lhs, s) {
                 Value::Int(n) => set.contains(&n) != *negate,
                 Value::Absent => *negate,
-                _ => false,
+                Value::Str(_) | Value::Bool(_) | Value::Ip(_) | Value::List(_) => false,
             },
             // CIDR and address-list membership need an address.
             Pred::InNet { lhs, nets, negate } => {
@@ -807,7 +822,7 @@ fn str_op<'a>(lhs: &'a ROperand, rhs: &'a ROperand, op: StrOp, ci: bool, s: &Sco
 fn address<'a>(op: &'a ROperand, s: &Scope<'a>) -> Option<IpAddr> {
     match get(op, s) {
         Value::Ip(ip) => Some(ip.to_canonical()),
-        v => {
+        v @ (Value::Str(_) | Value::Int(_) | Value::Bool(_) | Value::List(_) | Value::Absent) => {
             missing(op, &v, s);
             None
         }

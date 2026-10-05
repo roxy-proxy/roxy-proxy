@@ -106,12 +106,51 @@ pub(crate) enum StrOp {
     Contains,
 }
 
+impl StrOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::StartsWith => "starts_with",
+            Self::EndsWith => "ends_with",
+            Self::Contains => "contains",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OrdOp {
     Lt,
     Le,
     Gt,
     Ge,
+}
+
+impl OrdOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+        }
+    }
+}
+
+/// The operators that take a quoted pattern on the right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatternOp {
+    Like,
+    Matches,
+    Under,
+}
+
+impl PatternOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Like => "like",
+            Self::Matches => "matches",
+            Self::Under => "under",
+        }
+    }
 }
 
 /// A compiled boolean expression.
@@ -195,7 +234,13 @@ fn reject_list(t: &Typed<'_>) -> Result<(), ExprError> {
         match &l.lit {
             Lit::AddressList(n) => Err(list_misuse(l.span, n)),
             Lit::List(items) => items.iter().try_for_each(walk),
-            _ => Ok(()),
+            Lit::Str(_)
+            | Lit::Int(..)
+            | Lit::Bool(_)
+            | Lit::Ip(_)
+            | Lit::Cidr(_)
+            | Lit::Method(_)
+            | Lit::Null => Ok(()),
         }
     }
     match t {
@@ -258,7 +303,13 @@ fn reject_null(t: &Typed<'_>) -> Result<(), ExprError> {
                 "`null` can only be used with `==` or `!=` (e.g. `x != null and x > 10`)",
             )),
             Lit::List(items) => items.iter().try_for_each(walk),
-            _ => Ok(()),
+            Lit::Str(_)
+            | Lit::Int(..)
+            | Lit::Bool(_)
+            | Lit::Ip(_)
+            | Lit::Cidr(_)
+            | Lit::AddressList(_)
+            | Lit::Method(_) => Ok(()),
         }
     }
     match t {
@@ -309,6 +360,10 @@ pub(crate) fn build_shared_regex(pattern: &str) -> Result<Arc<Regex>, String> {
         .map_err(|e| regex_error(&e))
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "regex::Error is non_exhaustive"
+)]
 fn regex_error(e: &regex::Error) -> String {
     match e {
         regex::Error::CompiledTooBig(limit) => {
@@ -446,7 +501,7 @@ impl Compiler<'_, '_> {
                 self.flatten(a, or, out)?;
                 self.flatten(b, or, out)
             }
-            _ => {
+            Expr::Or(..) | Expr::And(..) | Expr::Not(_) | Expr::Cmp { .. } | Expr::Pred(_) => {
                 out.push(self.node(node)?);
                 Ok(())
             }
@@ -465,7 +520,15 @@ impl Compiler<'_, '_> {
                     Access::Tag(t) if !self.needs.tags.contains(t) => {
                         self.needs.tags.push(t.clone());
                     }
-                    _ => {}
+                    Access::Scalar(_)
+                    | Access::Header(_)
+                    | Access::HeaderAll(_)
+                    | Access::RespHeader(_)
+                    | Access::RespHeaderAll(_)
+                    | Access::Query(_)
+                    | Access::State(_)
+                    | Access::Tag(_)
+                    | Access::Metric(_) => {}
                 }
                 let (reads, name) = match &access {
                     Access::Metric(id) => {
@@ -477,7 +540,16 @@ impl Compiler<'_, '_> {
                         };
                         (r, format!("metric.{id} ({what})"))
                     }
-                    a => (a.reads(), a.display_name()),
+                    a @ (Access::Scalar(_)
+                    | Access::Header(_)
+                    | Access::HeaderAll(_)
+                    | Access::RespHeader(_)
+                    | Access::RespHeaderAll(_)
+                    | Access::Query(_)
+                    | Access::State(_)
+                    | Access::Tag(_)
+                    | Access::BodyText
+                    | Access::RespBodyText) => (a.reads(), a.display_name()),
                 };
                 if !reads.is_empty() {
                     self.needs.add_watched(reads, name);
@@ -540,10 +612,17 @@ impl Compiler<'_, '_> {
         reject_null(&r)?;
         match op {
             Op::Eq | Op::Ne => equality(l, lo, op, r, ro, span),
-            Op::Lt | Op::Le | Op::Gt | Op::Ge => ordering(l, lo, op, r, ro),
+            Op::Lt => ordering(l, lo, OrdOp::Lt, r, ro),
+            Op::Le => ordering(l, lo, OrdOp::Le, r, ro),
+            Op::Gt => ordering(l, lo, OrdOp::Gt, r, ro),
+            Op::Ge => ordering(l, lo, OrdOp::Ge, r, ro),
             Op::In | Op::NotIn => self.membership(l, lo, op, &r, span),
-            Op::StartsWith | Op::EndsWith | Op::Contains => string_op(l, lo, op, r, ro),
-            Op::Like | Op::Matches | Op::Under => pattern(l, lo, op, &r, ro),
+            Op::StartsWith => string_op(l, lo, StrOp::StartsWith, r, ro),
+            Op::EndsWith => string_op(l, lo, StrOp::EndsWith, r, ro),
+            Op::Contains => string_op(l, lo, StrOp::Contains, r, ro),
+            Op::Like => pattern(l, lo, PatternOp::Like, &r, ro),
+            Op::Matches => pattern(l, lo, PatternOp::Matches, &r, ro),
+            Op::Under => pattern(l, lo, PatternOp::Under, &r, ro),
         }
     }
 
@@ -589,7 +668,13 @@ impl Compiler<'_, '_> {
         let items: &[LitNode] = match &rl.lit {
             Lit::List(items) => items,
             Lit::Cidr(_) => std::slice::from_ref(*rl),
-            other => {
+            other @ (Lit::Str(_)
+            | Lit::Int(..)
+            | Lit::Bool(_)
+            | Lit::Ip(_)
+            | Lit::AddressList(_)
+            | Lit::Method(_)
+            | Lit::Null) => {
                 return Err(ExprError::new(
                     rl.span,
                     format!(
@@ -631,7 +716,13 @@ fn literal_set(
                 .map(|item| match item.lit {
                     Lit::Cidr(n) => Ok(canonical_net(n)),
                     Lit::Ip(ip) => Ok(IpNet::from(ip.to_canonical())),
-                    _ => Err(mismatch(item, "IP addresses or CIDRs")),
+                    Lit::Str(_)
+                    | Lit::Int(..)
+                    | Lit::Bool(_)
+                    | Lit::List(_)
+                    | Lit::AddressList(_)
+                    | Lit::Method(_)
+                    | Lit::Null => Err(mismatch(item, "IP addresses or CIDRs")),
                 })
                 .collect::<Result<_, _>>()?;
             Ok(Pred::InNet {
@@ -655,7 +746,13 @@ fn literal_set(
                     Lit::Str(s) => Ok(s.as_str().into()),
                     Lit::Method(m) if method => Ok(m.as_str().into()),
                     Lit::Method(m) => Err(method_literal_error(item.span, m)),
-                    _ => Err(mismatch(item, "strings")),
+                    Lit::Int(..)
+                    | Lit::Bool(_)
+                    | Lit::List(_)
+                    | Lit::Ip(_)
+                    | Lit::Cidr(_)
+                    | Lit::AddressList(_)
+                    | Lit::Null => Err(mismatch(item, "strings")),
                 })
                 .collect::<Result<_, _>>()?;
             Ok(Pred::InStr {
@@ -670,7 +767,14 @@ fn literal_set(
                 .iter()
                 .map(|item| match item.lit {
                     Lit::Int(n, u) => Ok(Lit::int_value(n, u)),
-                    _ => Err(mismatch(item, "numbers")),
+                    Lit::Str(_)
+                    | Lit::Bool(_)
+                    | Lit::List(_)
+                    | Lit::Ip(_)
+                    | Lit::Cidr(_)
+                    | Lit::AddressList(_)
+                    | Lit::Method(_)
+                    | Lit::Null => Err(mismatch(item, "numbers")),
                 })
                 .collect::<Result<_, _>>()?;
             Ok(Pred::InInt {
@@ -740,7 +844,7 @@ fn equality(
 fn ordering(
     l: Typed<'_>,
     lo: &Operand,
-    op: Op,
+    op: OrdOp,
     r: Typed<'_>,
     ro: &Operand,
 ) -> Result<Pred, ExprError> {
@@ -756,12 +860,6 @@ fn ordering(
             ));
         }
     }
-    let op = match op {
-        Op::Lt => OrdOp::Lt,
-        Op::Le => OrdOp::Le,
-        Op::Gt => OrdOp::Gt,
-        _ => OrdOp::Ge,
-    };
     Ok(Pred::Ord {
         lhs: lower(l),
         rhs: lower(r),
@@ -773,11 +871,11 @@ fn ordering(
 fn string_op(
     l: Typed<'_>,
     lo: &Operand,
-    op: Op,
+    op: StrOp,
     r: Typed<'_>,
     ro: &Operand,
 ) -> Result<Pred, ExprError> {
-    string_lhs(&l, lo, op)?;
+    string_lhs(&l, lo, op.as_str())?;
     if r.ty() != Some(Type::Str) {
         return Err(ExprError::new(
             r.span(),
@@ -788,16 +886,11 @@ fn string_op(
             ),
         ));
     }
-    let sop = match op {
-        Op::StartsWith => StrOp::StartsWith,
-        Op::EndsWith => StrOp::EndsWith,
-        _ => StrOp::Contains,
-    };
     Ok(Pred::Str {
         ci: l.ci() || r.ci(),
         lhs: lower(l),
         rhs: lower(r),
-        op: sop,
+        op,
     })
 }
 
@@ -805,20 +898,20 @@ fn string_op(
 fn pattern(
     l: Typed<'_>,
     lo: &Operand,
-    op: Op,
+    op: PatternOp,
     r: &Typed<'_>,
     ro: &Operand,
 ) -> Result<Pred, ExprError> {
-    string_lhs(&l, lo, op)?;
+    string_lhs(&l, lo, op.as_str())?;
     let Typed::Lit(LitNode {
         lit: Lit::Str(pattern),
         span: rspan,
     }) = r
     else {
         let what = match op {
-            Op::Like => "a quoted glob pattern",
-            Op::Matches => "a quoted regex",
-            _ => "a quoted domain",
+            PatternOp::Like => "a quoted glob pattern",
+            PatternOp::Matches => "a quoted regex",
+            PatternOp::Under => "a quoted domain",
         };
         return Err(ExprError::new(
             r.span(),
@@ -831,15 +924,15 @@ fn pattern(
     };
     let ci = l.ci();
     match op {
-        Op::Like => Ok(Pred::Glob {
+        PatternOp::Like => Ok(Pred::Glob {
             glob: build_glob(*rspan, pattern, ci)?,
             lhs: lower(l),
         }),
-        Op::Matches => Ok(Pred::Regex {
+        PatternOp::Matches => Ok(Pred::Regex {
             re: build_regex(*rspan, pattern, ci)?,
             lhs: lower(l),
         }),
-        _ => {
+        PatternOp::Under => {
             if l.ty() == Some(Type::StrList) {
                 return Err(ExprError::new(
                     l.span(),
@@ -857,7 +950,7 @@ fn pattern(
 fn article(t: Type) -> String {
     match t {
         Type::Int | Type::Ip => format!("an {t}"),
-        _ => format!("a {t}"),
+        Type::Bool | Type::Str | Type::StrList => format!("a {t}"),
     }
 }
 
@@ -884,14 +977,13 @@ fn scalar(t: &Typed<'_>, op: Op) -> Result<Type, ExprError> {
     })
 }
 
-fn string_lhs(l: &Typed<'_>, lo: &Operand, op: Op) -> Result<(), ExprError> {
+fn string_lhs(l: &Typed<'_>, lo: &Operand, op: &str) -> Result<(), ExprError> {
     match l.ty() {
         Some(Type::Str | Type::StrList) => Ok(()),
         _ => Err(ExprError::new(
             l.span(),
             format!(
-                "`{}` needs a string on the left, found {}",
-                op.as_str(),
+                "`{op}` needs a string on the left, found {}",
                 l.describe(Some(lo))
             ),
         )),

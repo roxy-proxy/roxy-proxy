@@ -298,6 +298,9 @@ fn metric_reads(count: &MetricCount) -> Reads {
     match count {
         MetricCount::RequestBytes => Reads::METRIC_REQUEST_BYTES,
         MetricCount::ResponseBytes => Reads::METRIC_RESPONSE_BYTES,
-        _ => Reads::NONE,
+        MetricCount::Requests
+        | MetricCount::Errors
+        | MetricCount::Denied
+        | MetricCount::Unique(_) => Reads::NONE,
     }
 }
