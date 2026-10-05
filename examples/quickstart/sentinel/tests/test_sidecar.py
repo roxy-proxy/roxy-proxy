@@ -75,8 +75,9 @@ async def test_close_while_a_streamed_response_is_held_leaves_no_tasks(sidecar: 
 REST = sse("message_stop", {"type": "message_stop"})
 
 
-async def test_pings_continue_while_the_sentinel_judges(sidecar: Sidecar, monkeypatch: Any) -> None:
-    monkeypatch.setattr(sidecar_module, "PING_EVERY", 0.05)
+def gate_judge(sidecar: Sidecar, monkeypatch: Any) -> tuple[asyncio.Event, asyncio.Event]:
+    """Holds the sentinel's verdict: the first event is set once it is
+    judging, and it answers (pass) once the second is set."""
     judging, verdict = asyncio.Event(), asyncio.Event()
 
     async def slow_judge(*args: Any) -> None:
@@ -84,11 +85,22 @@ async def test_pings_continue_while_the_sentinel_judges(sidecar: Sidecar, monkey
         await verdict.wait()
 
     monkeypatch.setattr(sidecar, "judge", slow_judge)
+    return judging, verdict
+
+
+async def held_and_judging(sidecar: Sidecar, monkeypatch: Any) -> tuple[FakeRoxy, asyncio.Event]:
+    judging, verdict = gate_judge(sidecar, monkeypatch)
     roxy = FakeRoxy(sidecar.handle)
     await streamed_call(roxy)
     roxy.ws.body(1, REST, RESPONSE)
     roxy.ws.control(1, "response_end")
     await asyncio.wait_for(judging.wait(), 2.0)
+    return roxy, verdict
+
+
+async def test_pings_continue_while_the_sentinel_judges(sidecar: Sidecar, monkeypatch: Any) -> None:
+    monkeypatch.setattr(sidecar_module, "PING_EVERY", 0.05)
+    roxy, verdict = await held_and_judging(sidecar, monkeypatch)
     while not roxy.ws.sent.empty():
         roxy.ws.sent.get_nowait()
     for _ in range(3):
@@ -98,3 +110,10 @@ async def test_pings_continue_while_the_sentinel_judges(sidecar: Sidecar, monkey
         pass
     assert m == b"\x00\x00\x00\x01\x01" + REST
     assert (await roxy.ws.next_sent())["type"] == "response_end"
+
+
+async def test_reset_while_the_sentinel_judges_leaves_no_tasks(sidecar: Sidecar, monkeypatch: Any) -> None:
+    roxy, _ = await held_and_judging(sidecar, monkeypatch)
+    roxy.ws.control(1, "reset")
+    await roxy.until_closed(1)
+    assert stray_tasks(roxy.task) == set()
