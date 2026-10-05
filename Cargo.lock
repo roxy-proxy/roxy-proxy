@@ -2520,7 +2520,6 @@ dependencies = [
  "chrono",
  "clap",
  "futures-util",
- "h2",
  "http",
  "http-body-util",
  "humantime-serde",
