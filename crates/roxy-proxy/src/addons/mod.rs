@@ -675,7 +675,12 @@ fn stack_outcome(
             // core relayed a real upgrade, so restore it.
             res.meta.upgrade = Some("websocket".to_owned());
             let to_client = upgraded_body.unwrap_or_default();
-            *lock(&st.ws) = Some(ws::WsPlumbing::new(client_tx, to_client, relay.bottom));
+            *lock(&st.ws) = Some(ws::WsPlumbing::new(
+                client_tx,
+                to_client,
+                relay.bottom,
+                cx.shared.sink.clone(),
+            ));
             return Outcome::Upgrade {
                 res,
                 upstream: relay.upstream,

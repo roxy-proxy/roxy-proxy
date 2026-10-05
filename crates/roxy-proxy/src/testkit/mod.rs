@@ -57,7 +57,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use ulid::Ulid;
 
 #[allow(unused_imports)]
-pub(crate) use gate::LogGate;
+pub(crate) use gate::{GatedSink, LogGate};
 #[allow(unused_imports)]
 pub(crate) use h2raw::{H2_GOAWAY, H2_HEADERS, H2_RST_STREAM, h2_client, h2_get, h2_raw_request};
 #[allow(unused_imports)]

@@ -50,7 +50,9 @@ Either way:
   a `1008` close frame first.
 - Each chunk waits for the flow log like any forwarded body
   ([audit backpressure](/operate/flow-log#writing)), and capture records both
-  directions as relayed.
+  directions as relayed. Through [addon layers](/addons/overview#websockets)
+  the relay is the hop next to the upstream, so capture records its bytes,
+  not what a layer changes on the way to the client.
 - A relayed WebSocket closes after `limits.idle_timeout` (300 s) with no
   traffic either way.
 - The flow log gets one `ws_open` event, naming the `host`, and one
