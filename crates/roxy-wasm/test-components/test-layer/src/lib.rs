@@ -188,10 +188,15 @@ fn answer_with(resp: IncomingResponse, out: ResponseOutparam, upper: bool) {
 
 /// The default: pass the exchange through, streaming both bodies, chunk by
 /// chunk (upper-cased when `x-upper` is set). With `x-hold`, neither body
-/// it passes on is ever ended.
+/// it passes on is ever ended. Unbuffered, the response from below goes
+/// out with `x-status` as its status, if set.
 fn pass(req: IncomingRequest, out: ResponseOutparam, buffer_first: bool) {
     let upper = header(&req, "x-upper").is_some();
-    let hold = header(&req, "x-hold").is_some();
+    let tweaks = Tweaks {
+        upper,
+        hold: header(&req, "x-hold").is_some(),
+        status: header(&req, "x-status").map(|v| v.parse().expect("x-status")),
+    };
     let next_req = forward_head(&req);
     let next_body = next_req.body().expect("body");
     let in_body = req.consume().expect("consume");
@@ -211,7 +216,7 @@ fn pass(req: IncomingRequest, out: ResponseOutparam, buffer_first: bool) {
 
     let fut = chain::next(next_req).expect("next");
     let Some(all) = buffered else {
-        duplex(req, in_body, next_body, fut, out, (upper, hold));
+        duplex(req, in_body, next_body, fut, out, tweaks);
         return;
     };
     {
@@ -225,6 +230,14 @@ fn pass(req: IncomingRequest, out: ResponseOutparam, buffer_first: bool) {
     answer_with(await_response(fut), out, upper);
 }
 
+/// What `pass` does to the exchange besides passing it on, from the
+/// request's `x-*` headers.
+struct Tweaks {
+    upper: bool,
+    hold: bool,
+    status: Option<u16>,
+}
+
 /// Streams both bodies at once: the request body into `next` and the
 /// response from below back out, each chunk as it comes, neither waiting
 /// for the other to end. A WebSocket's request body only ends when the
@@ -235,7 +248,11 @@ fn duplex(
     next_body: OutgoingBody,
     fut: wasi::http::types::FutureIncomingResponse,
     out: ResponseOutparam,
-    (upper, hold): (bool, bool),
+    Tweaks {
+        upper,
+        hold,
+        status,
+    }: Tweaks,
 ) {
     let up = |mut c: Vec<u8>| {
         if upper {
@@ -286,7 +303,8 @@ fn duplex(
             let below = r.expect("once").expect("response");
             let headers = Fields::from_list(&below.headers().entries()).expect("headers");
             let mine = OutgoingResponse::new(headers);
-            mine.set_status_code(below.status()).expect("status");
+            mine.set_status_code(status.unwrap_or(below.status()))
+                .expect("status");
             let mine_body = mine.body().expect("body");
             ResponseOutparam::set(out.take().expect("one answer"), Ok(mine));
             let body = below.consume().expect("consume");
