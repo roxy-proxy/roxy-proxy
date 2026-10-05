@@ -166,8 +166,8 @@ not counted.
   `response_end` (or a `reset`). It cannot change or delay traffic; its
   failures are logged only. The real exchange never waits for an observer:
   roxy buffers each copy for the service, and a stream with more than
-  `limits.max_observer_lag_bytes` of copy unread, or whose copy the
-  buffer budget could not cover, is cut and reset on its own
+  `limits.max_observer_lag_bytes` of copy unread, or whose copy's next
+  frame the buffer budget cannot cover, is cut and reset on its own
   (`observer_lagged`). Waiting for credit is falling behind, so a
   service that wants every copy in full grants extra credit as an observe
   stream opens (`roxy_layer.py` grants 16 MiB to each body). Body bytes

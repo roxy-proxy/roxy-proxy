@@ -5,11 +5,13 @@
 //! observer, which sees every body in full for as long as it keeps up. An
 //! observer with more than `limits.max_observer_lag_bytes` of copy unread
 //! has it cut (it sees a body error) and an `observer_lagged` event is
-//! logged; the real traffic never waits. That much of the buffer budget is
-//! reserved for each copy before it starts, and a copy the budget cannot
-//! cover is cut the same way. This is deliberately lossy: the observer is
-//! not the audit log, which keeps its own backpressure. An observer that
-//! drops its copy is not lagging: the rest is simply not copied.
+//! logged; the real traffic never waits. The bytes a copy has queued are
+//! charged to the buffer budget frame by frame, as they queue, and given
+//! back as the observer reads them; a copy whose next frame the budget
+//! cannot cover is cut the same way. This is deliberately lossy: the
+//! observer is not the audit log, which keeps its own backpressure. An
+//! observer that drops its copy is not lagging: the rest is simply not
+//! copied.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -26,6 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::StackFlow;
 use crate::budget::{self, BufferLease};
 use crate::flowlog::FlowEvent;
+use crate::server::Shared;
 use crate::watch::Dir;
 
 /// The copy outgrew `max_observer_lag_bytes`.
@@ -73,7 +76,9 @@ impl Lag {
 
 /// A frame of the copy, or how it ended.
 enum Msg {
-    Data(Bytes),
+    /// A frame and its share of the budget, which the observer's read
+    /// gives back; a frame dropped unread gives it back the same way.
+    Data(Bytes, BufferLease),
     End,
     Cut(BodyError),
 }
@@ -90,9 +95,8 @@ struct CopySender {
     /// Bytes queued so far, against the real body's declared length.
     sent: u64,
     known: Option<u64>,
-    /// The budget's share for this copy, released once neither end holds
-    /// queued bytes any more.
-    _lease: Option<Arc<BufferLease>>,
+    /// The budget the queued bytes are charged to.
+    shared: Arc<Shared>,
 }
 
 impl CopySender {
@@ -100,20 +104,24 @@ impl CopySender {
         self.tx.is_closed()
     }
 
-    /// Queues `data` for the observer; `Err` when it would take the queue
-    /// past the window or the observer has dropped its copy.
-    fn try_push(&mut self, data: Bytes) -> Result<(), ()> {
+    /// Queues `data` for the observer; `Err` names the reason it could
+    /// not: the queue would pass the window, the budget cannot cover the
+    /// frame, or the observer has dropped its copy.
+    fn try_push(&mut self, data: Bytes) -> Result<(), &'static str> {
         if data.is_empty() {
             return Ok(());
         }
         let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
         let pending = self.pending.load(Ordering::Relaxed);
         if pending.saturating_add(len) > self.window {
-            return Err(());
+            return Err(BEHIND);
         }
+        let Some(lease) = self.shared.reserve_buffer(len) else {
+            return Err(budget::EXHAUSTED);
+        };
         self.pending.fetch_add(len, Ordering::Relaxed);
         self.sent = self.sent.saturating_add(len);
-        self.tx.send(Msg::Data(data)).map_err(drop)
+        self.tx.send(Msg::Data(data, lease)).map_err(|_| BEHIND)
     }
 
     /// Whether the declared length has all been queued. A consumer that
@@ -133,11 +141,11 @@ impl CopySender {
 }
 
 /// The observer's copy: what the real body has produced and the observer
-/// has not yet read.
+/// has not yet read. Dropping it drops the queued frames, and their budget
+/// with them.
 struct CopyBody {
     rx: mpsc::UnboundedReceiver<Msg>,
     pending: Arc<AtomicU64>,
-    _lease: Option<Arc<BufferLease>>,
 }
 
 impl HttpBody for CopyBody {
@@ -149,7 +157,8 @@ impl HttpBody for CopyBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         Poll::Ready(match ready!(self.rx.poll_recv(cx)) {
-            Some(Msg::Data(d)) => {
+            Some(Msg::Data(d, lease)) => {
+                drop(lease);
                 let len = u64::try_from(d.len()).unwrap_or(u64::MAX);
                 self.pending.fetch_sub(len, Ordering::Relaxed);
                 Some(Ok(Frame::data(d)))
@@ -195,8 +204,8 @@ impl HttpBody for Tee {
         match &frame {
             Some(Ok(f)) => {
                 if let (Some(data), Some(copy)) = (f.data_ref(), this.copy.as_mut()) {
-                    if copy.try_push(data.clone()).is_err() {
-                        this.cut(BEHIND);
+                    if let Err(reason) = copy.try_push(data.clone()) {
+                        this.cut(reason);
                     } else if copy.complete()
                         && let Some(c) = this.copy.take()
                     {
@@ -228,41 +237,46 @@ impl HttpBody for Tee {
 }
 
 /// Splits `body` into the real body (unchanged, never delayed) and a
-/// best-effort copy buffered up to `lag_bytes`, reserved from the buffer
-/// budget first. A copy the budget cannot cover is cut before it starts.
+/// best-effort copy buffered up to `lag_bytes`, charged to the buffer
+/// budget as it queues.
 fn tee(st: &StackFlow, body: Body, lag: Arc<Lag>) -> (Body, Body) {
-    let lag_bytes = st.snap.limits.max_observer_lag_bytes;
-    let lease = st.shared.reserve_buffer(lag_bytes).map(Arc::new);
     let known = body.known_length();
+    let (sender, copy) = copy(
+        st.shared.clone(),
+        st.snap.limits.max_observer_lag_bytes,
+        known,
+    );
+    let real = Tee {
+        inner: body,
+        copy: Some(sender),
+        lag,
+    };
+    (Body::wrap_native(real, u64::MAX, known), copy)
+}
+
+/// A copy's two ends: the sender the real body feeds, and the body the
+/// observer reads, which declares the real body's length so an empty one
+/// reads as empty even if nobody polls the real body to its end.
+fn copy(shared: Arc<Shared>, lag_bytes: u64, known: Option<u64>) -> (CopySender, Body) {
     let pending = Arc::new(AtomicU64::new(0));
     let (tx, rx) = mpsc::unbounded_channel();
-    // The copy declares the real body's length, so an empty one reads as
-    // empty even if nobody polls the real body to its end.
-    let copy = Body::wrap_native(
+    let body = Body::wrap_native(
         CopyBody {
             rx,
             pending: pending.clone(),
-            _lease: lease.clone(),
         },
         u64::MAX,
         known,
     );
-    let mut real = Tee {
-        inner: body,
-        copy: Some(CopySender {
-            tx,
-            pending,
-            window: lag_bytes,
-            sent: 0,
-            known,
-            _lease: lease.clone(),
-        }),
-        lag,
+    let sender = CopySender {
+        tx,
+        pending,
+        window: lag_bytes,
+        sent: 0,
+        known,
+        shared,
     };
-    if lease.is_none() {
-        real.cut(budget::EXHAUSTED);
-    }
-    (Body::wrap_native(real, u64::MAX, known), copy)
+    (sender, body)
 }
 
 fn lag(st: &Arc<StackFlow>, layer: &str, direction: Dir) -> Arc<Lag> {
@@ -371,5 +385,49 @@ async fn forward(
             let _ = tx.send(Err(e.clone()));
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http_body_util::BodyExt as _;
+
+    use super::*;
+    use crate::testkit::Kit;
+
+    /// A copy charges the budget by what it has queued: each frame as it
+    /// queues, given back when the observer reads it or drops the copy,
+    /// and a frame the budget cannot cover is refused without charging.
+    #[tokio::test]
+    async fn a_copy_charges_the_budget_by_what_it_has_queued() {
+        let kit = Kit::builder()
+            .limits(|l| l.max_buffered_bytes = 25)
+            .start()
+            .await;
+        let shared = kit.server.shared().clone();
+        let frame = Bytes::from_static(b"0123456789");
+        let (mut sender, mut body) = copy(shared.clone(), 100, None);
+        sender.try_push(frame.clone()).unwrap();
+        sender.try_push(frame.clone()).unwrap();
+        assert_eq!(shared.buffered(), 20);
+        assert_eq!(sender.try_push(frame.clone()), Err(budget::EXHAUSTED));
+        assert_eq!(shared.buffered(), 20);
+
+        let read = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(read, frame);
+        assert_eq!(shared.buffered(), 10);
+        sender.try_push(frame.clone()).unwrap();
+        assert_eq!(shared.buffered(), 20);
+
+        drop(body);
+        assert_eq!(shared.buffered(), 0);
+        assert!(sender.try_push(frame.clone()).is_err());
+        assert_eq!(shared.buffered(), 0);
+
+        // The window is checked first, so a frame past it costs nothing.
+        let (mut sender, _body) = copy(shared.clone(), 15, None);
+        sender.try_push(frame.clone()).unwrap();
+        assert_eq!(sender.try_push(frame), Err(BEHIND));
+        assert_eq!(shared.buffered(), 10);
     }
 }

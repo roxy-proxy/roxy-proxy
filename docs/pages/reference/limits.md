@@ -80,18 +80,27 @@ large, and one with more than that many bytes unread has the copy cut
 
 `max_buffered_bytes` bounds those three buffers in aggregate; each is
 bounded per exchange, and without it the only bound on exchanges is the
-connection caps. An exchange reserves the whole cap before it fills a
-buffer (`max_inspect_body_bytes` for a body a rule reads, twice
-`max_ws_message_bytes` for a WebSocket whose messages rules read,
-`max_observer_lag_bytes` per direction for an observer's copy) and holds
-the reservation until it ends. A reservation the budget cannot cover fails
-at once, with no waiting and no eviction: the exchange fails closed (`503`,
-`_fail_closed`, `buffer_budget_exhausted`), or the observer's copy is cut
-(`observer_lagged`, `reason: buffer_budget_exhausted`). The budget divided
-by a cap is how many exchanges can hold that buffer at once (with the
-defaults: 1024 inspected bodies, 32 WebSockets with message rules, 32
-observed exchanges), so size it, or the caps, for the traffic that needs
-them. It must be at least the largest per-exchange reservation.
+connection caps. An exchange that inspects a body reserves the whole cap
+before it fills the buffer (`max_inspect_body_bytes` for a body a rule
+reads, twice `max_ws_message_bytes` for a WebSocket whose messages rules
+read) and holds the reservation until it ends. A reservation the budget
+cannot cover fails at once, with no waiting and no eviction: the exchange
+fails closed (`503`, `_fail_closed`, `buffer_budget_exhausted`). The
+budget divided by a cap is how many exchanges can hold that buffer at once
+(with the defaults: 1024 inspected bodies, 32 WebSockets with message
+rules), so size it, or the caps, for the traffic that needs them. It must
+be at least the largest of those reservations.
+
+An observer's copy is charged for the bytes it has queued and the observer
+has not yet read, frame by frame as they queue, and the charge is given
+back as the observer reads them (or drops the copy). A copy whose next
+frame would take the budget over `max_buffered_bytes` is cut
+(`observer_lagged`, `reason: buffer_budget_exhausted`), and the real
+exchange goes on. So the number of observed exchanges is not bounded by the
+budget: what is bounded is how far behind their observers can be in total.
+With the defaults, observers can hold up to 1 GiB of unread copy between
+them, each at most 16 MiB per direction; an observer that keeps up costs
+the budget nothing.
 
 The limits that shape the client-facing codec (`max_header_bytes`,
 `max_url_bytes`, `max_headers`, `max_request_body_bytes`, `header_timeout`,

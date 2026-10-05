@@ -312,8 +312,10 @@ fn zero_limits_diagnosed() {
     .unwrap();
 }
 
-/// The buffer budget is reserved a whole cap at a time, so one smaller
-/// than a cap would refuse every exchange that needs that buffer.
+/// Inspection and WebSocket reassembly reserve a whole cap at a time, so
+/// a budget smaller than one of those caps would refuse every exchange
+/// that needs that buffer; an observer's copy grows into the budget and
+/// sets no floor.
 #[test]
 fn buffer_budget_under_one_exchange_diagnosed() {
     let d = diagnostics(&format!("{BASE}limits: {{ max_buffered_bytes: 31mb }}\n"));
@@ -323,7 +325,7 @@ fn buffer_budget_under_one_exchange_diagnosed() {
         .validate()
         .unwrap();
     parse(&format!(
-        "{BASE}limits: {{ max_buffered_bytes: 2mb, max_ws_message_bytes: 1mb, max_observer_lag_bytes: 1mb }}\n"
+        "{BASE}limits: {{ max_buffered_bytes: 2mb, max_ws_message_bytes: 1mb, max_observer_lag_bytes: 16mb }}\n"
     ))
     .validate()
     .unwrap();

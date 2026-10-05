@@ -148,9 +148,10 @@ extensions client and upstream agree on.
   that keeps up sees every body in full, however large: each copy is
   buffered for it, and `limits.max_observer_lag_bytes` (16 MiB by default,
   per direction) is how far behind the real exchange it may fall before
-  its copy is cut. That much of `limits.max_buffered_bytes` is reserved
-  for each copy before it starts, and a copy the budget cannot cover is
-  cut before it starts. The layer cannot change or delay traffic, so its
+  its copy is cut. What a copy has queued is charged to
+  `limits.max_buffered_bytes` as it queues and given back as the layer
+  reads it, and a copy whose next frame the budget cannot cover is cut
+  the same way. The layer cannot change or delay traffic, so its
   failures cannot weaken containment: a trap or missed deadline is logged,
   not fatal, and a cut copy is reported (`observer_lagged`, with the
   `reason`) rather than stalling the flow. This is the way to deploy an
