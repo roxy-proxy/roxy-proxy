@@ -260,7 +260,47 @@ impl Reason {
             Reason::UnsupportedVersion => StatusCode::HTTP_VERSION_NOT_SUPPORTED,
             Reason::HeaderTimeout | Reason::BodyTimeout => StatusCode::REQUEST_TIMEOUT,
             Reason::InvalidState => StatusCode::INTERNAL_SERVER_ERROR,
-            _ => StatusCode::BAD_REQUEST,
+            Reason::InvalidMethod
+            | Reason::BadRequestLine
+            | Reason::BadRequestTarget
+            | Reason::TargetFormMismatch
+            | Reason::BareCr
+            | Reason::BareLf
+            | Reason::NonAscii
+            | Reason::InvalidHeaderName
+            | Reason::WhitespaceBeforeColon
+            | Reason::ObsFold
+            | Reason::InvalidHeaderValue
+            | Reason::ReservedHeader
+            | Reason::BadConnectionHeader
+            | Reason::MissingHost
+            | Reason::MultipleHost
+            | Reason::MultipleProxyAuthorization
+            | Reason::HostMismatch
+            | Reason::BadAuthority
+            | Reason::AuthorityMismatch
+            | Reason::DuplicateContentLength
+            | Reason::BadContentLength
+            | Reason::BadTransferEncoding
+            | Reason::ClAndTe
+            | Reason::BodyOnBodiless
+            | Reason::BadChunkSize
+            | Reason::ChunkExtension
+            | Reason::Trailers
+            | Reason::BadChunkFraming
+            | Reason::InvalidPath
+            | Reason::InvalidQuery
+            | Reason::PathClimbsAboveRoot
+            | Reason::BadPercentEncoding
+            | Reason::FragmentInTarget
+            | Reason::UnexpectedEof
+            | Reason::Io
+            | Reason::H2ConnectionHeader
+            | Reason::H2BadTe
+            | Reason::H2BadPseudoHeader
+            | Reason::H2BadScheme
+            | Reason::H2UnsupportedMethod
+            | Reason::WsBadHandshake => StatusCode::BAD_REQUEST,
         }
     }
 }

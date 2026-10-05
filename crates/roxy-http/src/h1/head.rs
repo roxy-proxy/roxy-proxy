@@ -238,7 +238,7 @@ fn check_raw_head(head: &[u8], limits: &Limits, flags: &HttpFlags) -> Result<Ver
     }
     match scan_head(head, 0, limits)? {
         HeadScan::Complete(n) if n == head.len() => {}
-        _ => {
+        HeadScan::Complete(_) | HeadScan::Partial(_) => {
             return reject(
                 Reason::BadRequestLine,
                 "head is not terminated by CRLF CRLF",

@@ -205,7 +205,9 @@ impl http_body::Body for DecodedBody {
                     this.done = true;
                     let e = match e {
                         DecodeError::TooLarge { limit } => BodyError::TooLarge { limit },
-                        e => BodyError::Undecodable(e.to_string()),
+                        e @ (DecodeError::Unsupported(_) | DecodeError::Invalid { .. }) => {
+                            BodyError::Undecodable(e.to_string())
+                        }
                     };
                     return Poll::Ready(Some(Err(e)));
                 }

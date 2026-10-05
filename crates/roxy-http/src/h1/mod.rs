@@ -141,7 +141,52 @@ fn body_error_for(e: &ParseError, limits: &Limits) -> BodyError {
         },
         Reason::BodyTimeout => BodyError::Timeout,
         Reason::UnexpectedEof | Reason::Io => BodyError::Incomplete,
-        _ => BodyError::Invalid(e.clone()),
+        Reason::InvalidMethod
+        | Reason::BadRequestLine
+        | Reason::BadRequestTarget
+        | Reason::TargetFormMismatch
+        | Reason::UnsupportedVersion
+        | Reason::BareCr
+        | Reason::BareLf
+        | Reason::NonAscii
+        | Reason::HeadTooLarge
+        | Reason::UrlTooLong
+        | Reason::TooManyHeaders
+        | Reason::InvalidHeaderName
+        | Reason::WhitespaceBeforeColon
+        | Reason::ObsFold
+        | Reason::InvalidHeaderValue
+        | Reason::ReservedHeader
+        | Reason::BadConnectionHeader
+        | Reason::MissingHost
+        | Reason::MultipleHost
+        | Reason::MultipleProxyAuthorization
+        | Reason::HostMismatch
+        | Reason::BadAuthority
+        | Reason::AuthorityMismatch
+        | Reason::DuplicateContentLength
+        | Reason::BadContentLength
+        | Reason::BadTransferEncoding
+        | Reason::ClAndTe
+        | Reason::BodyOnBodiless
+        | Reason::BadExpect
+        | Reason::BadChunkSize
+        | Reason::ChunkExtension
+        | Reason::Trailers
+        | Reason::BadChunkFraming
+        | Reason::InvalidPath
+        | Reason::InvalidQuery
+        | Reason::PathClimbsAboveRoot
+        | Reason::BadPercentEncoding
+        | Reason::FragmentInTarget
+        | Reason::HeaderTimeout
+        | Reason::H2ConnectionHeader
+        | Reason::H2BadTe
+        | Reason::H2BadPseudoHeader
+        | Reason::H2BadScheme
+        | Reason::H2UnsupportedMethod
+        | Reason::WsBadHandshake
+        | Reason::InvalidState => BodyError::Invalid(e.clone()),
     }
 }
 
@@ -451,7 +496,9 @@ async fn write_message<W: AsyncWrite + Unpin>(
                 let size = format!("{:X}\r\n", data.len());
                 write_timed(w, &[size.as_bytes(), &data, b"\r\n"], idle).await?;
             }
-            _ => write_timed(w, &[&data], idle).await?,
+            OutFraming::Empty | OutFraming::Head(_) | OutFraming::CloseDelimited => {
+                write_timed(w, &[&data], idle).await?;
+            }
         }
     }
     if let Some(n) = expected

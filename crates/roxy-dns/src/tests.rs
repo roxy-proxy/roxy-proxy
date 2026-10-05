@@ -39,7 +39,7 @@ fn with_opt(mut m: Vec<u8>, rdata: &[u8]) -> Vec<u8> {
 fn parsed_query(m: &[u8]) -> Query {
     match parse(m) {
         Parsed::Query(q) => q,
-        other => panic!("expected a query, got {other:?}"),
+        other @ (Parsed::Error { .. } | Parsed::Drop) => panic!("expected a query, got {other:?}"),
     }
 }
 
