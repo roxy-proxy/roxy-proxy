@@ -29,7 +29,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Notify;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 pub(crate) const SECRET: &str = "s3cr3t-token-value-0123456789";
@@ -127,13 +126,6 @@ impl Seen {
 #[derive(Default)]
 pub(crate) struct UpState {
     pub seen: Mutex<Vec<Seen>>,
-    /// Signalled when `/stream-probe` receives its first body bytes.
-    pub probe: Notify,
-    /// Upgrade request headers the WebSocket server saw, one list per
-    /// connection.
-    pub ws_upgrades: Mutex<Vec<Vec<(String, String)>>>,
-    /// Data messages the WebSocket server received.
-    pub ws_received: Mutex<Vec<Vec<u8>>>,
 }
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
@@ -152,9 +144,6 @@ async fn handle(req: Request<Incoming>, st: Arc<UpState>) -> Result<Response<Box
         .path_and_query()
         .map(ToString::to_string)
         .unwrap_or_default();
-    if path == "/slow-headers" {
-        tokio::time::sleep(Duration::from_secs(4)).await;
-    }
     let mut n: u64 = 0;
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut body_ok = true;
@@ -164,9 +153,6 @@ async fn handle(req: Request<Incoming>, st: Arc<UpState>) -> Result<Response<Box
             break;
         };
         if let Some(d) = f.data_ref() {
-            if n == 0 && path == "/stream-probe" {
-                st.probe.notify_one();
-            }
             n += d.len() as u64;
             for b in d {
                 hash = (hash ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3);
@@ -196,64 +182,34 @@ async fn handle(req: Request<Incoming>, st: Arc<UpState>) -> Result<Response<Box
     if !body_ok {
         return Ok(full(StatusCode::BAD_REQUEST, "body error"));
     }
-    Ok(match path.as_str() {
-        "/status/500" => full(StatusCode::INTERNAL_SERVER_ERROR, "upstream exploded"),
-        // Answers without echoing anything back (endpoint tests).
-        p if p.starts_with("/no-echo") => full(StatusCode::OK, "scored"),
-        // `n` chunks, `ms` apart: a long-lived streamed response.
-        "/drip" => drip(parts.uri.query().unwrap_or("")),
-        "/big" => {
-            let size: usize = parts
-                .uri
-                .query()
-                .and_then(|q| q.strip_prefix("n="))
-                .and_then(|n| n.parse().ok())
-                .unwrap_or(0);
-            full(StatusCode::OK, vec![b'x'; size])
-        }
-        _ => {
-            let hm: serde_json::Map<String, Value> = headers
-                .iter()
-                .map(|(k, v)| (k.clone(), Value::String(v.clone())))
-                .collect();
-            let v = serde_json::json!({
-                "method": parts.method.as_str(),
-                "path": pq,
-                "host": host,
-                "headers": hm,
-                "body_len": n,
-                "body_hash": format!("{hash:016x}"),
-                "version": format!("{:?}", parts.version),
-            });
-            let mut r = full(StatusCode::OK, v.to_string());
-            r.headers_mut().insert(
-                http::header::CONTENT_TYPE,
-                http::HeaderValue::from_static("application/json"),
-            );
-            r
-        }
-    })
-}
-
-/// `n` chunks, `ms` apart, from a query `n=..&ms=..`.
-fn drip(query: &str) -> Response<BoxBody> {
-    let arg = |k: &str| {
-        query
-            .split('&')
-            .find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='))
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0)
-    };
-    let (n, ms) = (arg("n"), arg("ms"));
-    let chunks = futures_util::stream::unfold(0, move |i| async move {
-        if i == n {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(ms)).await;
-        let frame = hyper::body::Frame::data(Bytes::from(format!("chunk{i};")));
-        Some((Ok::<_, Infallible>(frame), i + 1))
+    if path == "/big" {
+        let size: usize = parts
+            .uri
+            .query()
+            .and_then(|q| q.strip_prefix("n="))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        return Ok(full(StatusCode::OK, vec![b'x'; size]));
+    }
+    let hm: serde_json::Map<String, Value> = headers
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .collect();
+    let v = serde_json::json!({
+        "method": parts.method.as_str(),
+        "path": pq,
+        "host": host,
+        "headers": hm,
+        "body_len": n,
+        "body_hash": format!("{hash:016x}"),
+        "version": format!("{:?}", parts.version),
     });
-    Response::new(BoxBody::new(http_body_util::StreamBody::new(chunks)))
+    let mut r = full(StatusCode::OK, v.to_string());
+    r.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    Ok(r)
 }
 
 /// FNV-1a as computed by the upstream.
@@ -277,14 +233,6 @@ pub(crate) struct Upstream {
 impl Upstream {
     pub(crate) fn seen(&self) -> Vec<Seen> {
         self.state.seen.lock().unwrap().clone()
-    }
-
-    pub(crate) fn ws_upgrades(&self) -> Vec<Vec<(String, String)>> {
-        self.state.ws_upgrades.lock().unwrap().clone()
-    }
-
-    pub(crate) fn ws_received(&self) -> Vec<Vec<u8>> {
-        self.state.ws_received.lock().unwrap().clone()
     }
 }
 
@@ -340,30 +288,17 @@ pub(crate) async fn start_upstream(ca: &TestCa) -> Upstream {
         }
     });
     let acceptor = TlsAcceptor::from(ca.ws_server.clone());
-    let s = st.clone();
     tokio::spawn(async move {
         loop {
             let Ok((tcp, _)) = ws.accept().await else {
                 return;
             };
             let acceptor = acceptor.clone();
-            let s = s.clone();
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(tcp).await else {
                     return;
                 };
-                #[allow(clippy::result_large_err)] // tungstenite's callback type
-                let record = |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                              res| {
-                    let headers = req
-                        .headers()
-                        .iter()
-                        .map(|(n, v)| (n.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
-                        .collect();
-                    s.ws_upgrades.lock().unwrap().push(headers);
-                    Ok(res)
-                };
-                let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(tls, record).await else {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(tls).await else {
                     return;
                 };
                 while let Some(Ok(msg)) = ws.next().await {
@@ -371,14 +306,8 @@ pub(crate) async fn start_upstream(ca: &TestCa) -> Upstream {
                         let _ = ws.close(None).await;
                         break;
                     }
-                    if msg.is_text() || msg.is_binary() {
-                        s.ws_received
-                            .lock()
-                            .unwrap()
-                            .push(msg.clone().into_data().to_vec());
-                        if ws.send(msg).await.is_err() {
-                            break;
-                        }
+                    if (msg.is_text() || msg.is_binary()) && ws.send(msg).await.is_err() {
+                        break;
                     }
                 }
             });
@@ -745,24 +674,6 @@ log:
             .await
     }
 
-    /// A raw `h2` client over CONNECT + TLS (ALPN `h2`) to the HTTPS
-    /// upstream. The connection task is returned so tests can watch it end.
-    pub(crate) async fn h2_client(
-        &self,
-    ) -> (
-        h2::client::SendRequest<Bytes>,
-        tokio::task::JoinHandle<Result<(), h2::Error>>,
-    ) {
-        let authority = format!("upstream.test:{}", self.upstream.https.port());
-        let tls = self
-            .tls_tunnel_alpn(&authority, "upstream.test", &[b"h2"])
-            .await
-            .unwrap();
-        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
-        let (send, conn) = h2::client::handshake(tls).await.unwrap();
-        (send, tokio::spawn(conn))
-    }
-
     pub(crate) async fn stop(mut self) {
         if let Some(r) = self.running.take() {
             r.shutdown(Duration::from_secs(2)).await;
@@ -835,111 +746,6 @@ pub(crate) async fn raw(proxy: SocketAddr, bytes: &[u8]) -> (String, bool) {
     s.write_all(bytes).await.unwrap();
     let (out, eof) = read_to_eof(&mut s).await;
     (String::from_utf8_lossy(&out).into_owned(), eof)
-}
-
-/// Sends one h2 request (no body) and returns the response head and body,
-/// or the stream / connection error.
-pub(crate) async fn h2_get(
-    send: &h2::client::SendRequest<Bytes>,
-    uri: &str,
-    headers: &[(&str, &str)],
-) -> Result<(http::response::Parts, Bytes), h2::Error> {
-    let mut b = http::Request::builder().method("GET").uri(uri);
-    for (n, v) in headers {
-        b = b.header(*n, *v);
-    }
-    let req = b.body(()).unwrap();
-    let mut ready = send.clone().ready().await?;
-    let (resp, _) = ready.send_request(req, true)?;
-    let resp = tokio::time::timeout(Duration::from_secs(10), resp)
-        .await
-        .expect("timed out waiting for an h2 response")?;
-    let (parts, mut body) = resp.into_parts();
-    let mut out = Vec::new();
-    while let Some(chunk) = body.data().await {
-        let chunk = chunk?;
-        let _ = body.flow_control().release_capacity(chunk.len());
-        out.extend_from_slice(&chunk);
-    }
-    Ok((parts, Bytes::from(out)))
-}
-
-/// A minimal HPACK encoder: every field as a literal without indexing, no
-/// Huffman (so tests can send what the `h2` client refuses to).
-fn hpack_literal(out: &mut Vec<u8>, name: &str, value: &str) {
-    fn len(out: &mut Vec<u8>, n: usize) {
-        assert!(n < 127, "the test HPACK encoder only does short strings");
-        out.push(u8::try_from(n).unwrap());
-    }
-    out.push(0x00);
-    len(out, name.len());
-    out.extend_from_slice(name.as_bytes());
-    len(out, value.len());
-    out.extend_from_slice(value.as_bytes());
-}
-
-fn h2_frame(out: &mut Vec<u8>, kind: u8, flags: u8, stream: u32, payload: &[u8]) {
-    let n = u32::try_from(payload.len()).unwrap();
-    out.extend_from_slice(&n.to_be_bytes()[1..]);
-    out.push(kind);
-    out.push(flags);
-    out.extend_from_slice(&stream.to_be_bytes());
-    out.extend_from_slice(payload);
-}
-
-/// h2 frame type codes used by the tests.
-pub(crate) const H2_HEADERS: u8 = 0x1;
-pub(crate) const H2_RST_STREAM: u8 = 0x3;
-pub(crate) const H2_SETTINGS: u8 = 0x4;
-pub(crate) const H2_GOAWAY: u8 = 0x7;
-
-/// Opens an h2 tunnel and sends stream 1 with exactly `fields`
-/// (pseudo-headers included, in order) and `END_STREAM`, frame by frame.
-/// Returns the frames `(type, flags, stream id, payload)` received until
-/// stream 1 is reset or answered, or the connection ends.
-pub(crate) async fn h2_raw_request(
-    h: &Harness,
-    fields: &[(&str, &str)],
-) -> Vec<(u8, u8, u32, Vec<u8>)> {
-    let authority = format!("upstream.test:{}", h.upstream.https.port());
-    let mut tls = h
-        .tls_tunnel_alpn(&authority, "upstream.test", &[b"h2"])
-        .await
-        .unwrap();
-    let mut out = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
-    h2_frame(&mut out, H2_SETTINGS, 0, 0, &[]);
-    let mut block = Vec::new();
-    for (n, v) in fields {
-        hpack_literal(&mut block, n, v);
-    }
-    // END_HEADERS | END_STREAM
-    h2_frame(&mut out, H2_HEADERS, 0x4 | 0x1, 1, &block);
-    tls.write_all(&out).await.unwrap();
-    let mut frames = Vec::new();
-    loop {
-        let mut head = [0u8; 9];
-        let read = tokio::time::timeout(Duration::from_secs(10), tls.read_exact(&mut head)).await;
-        let Ok(Ok(_)) = read else { break };
-        let len = (usize::from(head[0]) << 16) | (usize::from(head[1]) << 8) | usize::from(head[2]);
-        let mut payload = vec![0u8; len];
-        if tls.read_exact(&mut payload).await.is_err() {
-            break;
-        }
-        let (kind, flags) = (head[3], head[4]);
-        let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff;
-        if kind == H2_SETTINGS && flags & 0x1 == 0 {
-            let mut ack = Vec::new();
-            h2_frame(&mut ack, H2_SETTINGS, 0x1, 0, &[]);
-            tls.write_all(&ack).await.unwrap();
-        }
-        let done =
-            (stream == 1 && (kind == H2_RST_STREAM || kind == H2_HEADERS)) || kind == H2_GOAWAY;
-        frames.push((kind, flags, stream, payload));
-        if done {
-            break;
-        }
-    }
-    frames
 }
 
 /// Parses a capture stream (`capture.rxc`) into `(header, payload)` records.
