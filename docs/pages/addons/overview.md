@@ -98,7 +98,10 @@ without `next`, and is left out of the WebSocket entirely when its `when`
 skips the upgrade request. A layer that turns the upstream's `101` into another status
 fails the exchange closed (a `503` from `layer:<name>`), and roxy closes
 the upstream WebSocket. A `101` with no upgrade from below fails closed
-too.
+too. Only `Upgrade: websocket` makes a request an upgrade for the layers.
+A request asking for any other upgrade (`h2c`, say) is the ordinary
+request roxy forwards once it strips the upgrade, with its body and the
+usual body cap.
 
 - The bodies carry raw WebSocket frames. Frames from the client are
   masked, so their payload reads as sent only from the upstream's side.

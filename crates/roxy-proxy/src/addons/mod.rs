@@ -488,9 +488,10 @@ impl StackFlow {
             .or_else(|| self.failure())
     }
 
-    /// The client asked to upgrade (a WebSocket).
+    /// The client asked for a WebSocket, the one upgrade the core relays.
+    /// The rules below the stack decide whether it is relayed.
     fn is_upgrade(&self) -> bool {
-        self.client_meta.upgrade.is_some()
+        crate::exchange::wants_websocket(&self.client_meta)
     }
 
     fn take_ws(&self) -> Option<ws::WsPlumbing> {

@@ -385,7 +385,11 @@ async fn non_websocket_upgrade_is_an_ordinary_request(kit: &Kit) {
     assert_eq!(a.json()["body_len"], 5);
     let seen = kit.upstream.wait_seen(1).await;
     assert_eq!(seen[0].body, b"hello");
-    assert!(!seen[0].headers.contains_key("upgrade"), "{:?}", seen[0].headers);
+    assert!(
+        !seen[0].headers.contains_key("upgrade"),
+        "{:?}",
+        seen[0].headers
+    );
     let ev = kit.events("upgrade_stripped", 1).await;
     assert_eq!(ev[0]["upgrade"], "h2c");
     assert_eq!(kit.request_event().await["decision"], "allow");
