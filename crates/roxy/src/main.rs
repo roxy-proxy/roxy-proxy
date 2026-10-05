@@ -352,7 +352,7 @@ fn rule_test(args: &RuleTestArgs) -> anyhow::Result<ExitCode> {
         "{}",
         ruletest::report(&policy, note.as_deref(), address.as_ref(), &run, &redactor)
     );
-    Ok(ExitCode::from(ruletest::exit_code(run.decision())))
+    Ok(ExitCode::from(ruletest::exit_code(&run.decision())))
 }
 
 /// `<file>:<diagnostic>` plus the indented snippet for expression errors.

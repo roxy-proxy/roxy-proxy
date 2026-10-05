@@ -95,7 +95,7 @@ fn bench(c: &mut Criterion) {
     let mut st = p.watch_state(&[]);
     let chunk = allowed.clone().with_int(Field::BodyBytes, 1 << 20);
     assert!(
-        p.evaluate_watching(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &chunk, &ctx)
+        p.evaluate_watching(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &chunk,)
             .is_none()
     );
     c.bench_function("watching_body_chunk_no_match", |b| {
@@ -105,7 +105,6 @@ fn bench(c: &mut Criterion) {
                 Reads::BODY_BYTES,
                 &mut st,
                 black_box(&chunk),
-                &ctx,
             )
         });
     });
@@ -117,7 +116,6 @@ fn bench(c: &mut Criterion) {
                 Reads::ALL,
                 &mut st,
                 &chunk,
-                &ctx,
             )
         });
     });

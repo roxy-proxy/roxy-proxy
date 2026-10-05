@@ -50,7 +50,7 @@ use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use roxy_http::ws::frame::Message;
 use roxy_http::{Body, BodyError, CanonicalResponse};
-use roxy_rules::{Decision, Effect, EvalContext, Reads, RuleId, WatchState};
+use roxy_rules::{Deny, Reads, RuleId, WatchEffect, WatchState};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
@@ -237,24 +237,20 @@ impl Watch {
                 break;
             }
             let applied = match e {
-                Effect::SetHeader { name, value } => res
+                WatchEffect::SetHeader { name, value } => res
                     .headers
                     .insert(&name, &value)
                     .map(|()| format!("response.set_header:{name}"))
                     .map_err(|e| e.to_string()),
-                Effect::RemoveHeader(name) => {
+                WatchEffect::RemoveHeader(name) => {
                     res.headers.remove(&name);
                     Ok(format!("response.remove_header:{name}"))
                 }
                 // `evaluate` returns header effects only; never continue
                 // on anything else.
-                other @ (Effect::RewritePath { .. }
-                | Effect::SetQuery { .. }
-                | Effect::RemoveQuery(_)
-                | Effect::Redirect { .. }
-                | Effect::Log { .. }
-                | Effect::SetState { .. }
-                | Effect::Capture(_)) => Err(format!("unexpected effect {}", other.kind())),
+                other @ (WatchEffect::Log { .. } | WatchEffect::SetState { .. }) => {
+                    Err(format!("unexpected effect {}", other.kind()))
+                }
             };
             match applied {
                 Ok(m) => g.mutations.push(m),
@@ -429,17 +425,12 @@ impl Inner {
     /// Re-checks the watching rules after `changed`. Applies `log`, `tag`
     /// and `set_state` effects, records a stop, and returns the header
     /// effects for the caller to apply to the response.
-    fn evaluate(&mut self, changed: Reads, stage: Stage) -> Vec<Effect> {
+    fn evaluate(&mut self, changed: Reads, stage: Stage) -> Vec<WatchEffect> {
         let meta = self.meta.clone();
         let FlowMeta { shared, snap, .. } = &*meta;
         if !snap.policy.watches(changed) {
             return Vec::new();
         }
-        let secrets = |name: &str| snap.secrets.get(name).cloned();
-        let ctx = EvalContext {
-            secrets: &secrets,
-            initial_tags: &[],
-        };
         let view = ProxyView::new(
             &self.facts,
             &*shared.metrics,
@@ -448,7 +439,7 @@ impl Inner {
         );
         let out = snap
             .policy
-            .evaluate_watching(changed, self.known, &mut self.st, &view, &ctx);
+            .evaluate_watching(changed, self.known, &mut self.st, &view);
         let metric_err = view.take_metric_error();
         drop(view);
         let Some(o) = out else {
@@ -462,43 +453,34 @@ impl Inner {
         let mut headers = Vec::new();
         for e in o.effects {
             match e {
-                Effect::Log { level, message } => meta.rule_log(stage, level, &message),
-                Effect::SetState { key, value, ttl } => {
+                WatchEffect::Log { level, message } => meta.rule_log(stage, level, &message),
+                WatchEffect::SetState { key, value, ttl } => {
                     if shared.state.set(&key, &value, ttl).is_err() {
                         self.stop_with(Refusal::fail_closed("state_unavailable"), stage);
                     }
                 }
-                e @ (Effect::SetHeader { .. } | Effect::RemoveHeader(_)) => headers.push(e),
-                Effect::RewritePath { .. }
-                | Effect::SetQuery { .. }
-                | Effect::RemoveQuery(_)
-                | Effect::Redirect { .. }
-                | Effect::Capture(_) => {
-                    self.stop_with(Refusal::fail_closed("unsupported_effect"), stage);
+                e @ (WatchEffect::SetHeader { .. } | WatchEffect::RemoveHeader(_)) => {
+                    headers.push(e);
                 }
             }
         }
-        if let Some(decision) = o.stop {
+        if let Some(Deny {
+            status,
+            message,
+            close,
+        }) = o.stop
+        {
             let refusal = if let Some(reason) = &o.fail_closed_reason {
                 let code = fail_closed_code(reason, metric_err.as_ref());
                 meta.input_unavailable(stage, code, reason, metric_err.as_ref());
                 Refusal::fail_closed(code)
             } else {
-                match decision {
-                    Decision::Deny {
-                        status,
-                        message,
-                        close,
-                    } => {
-                        let rule = o
-                            .terminal_rule
-                            .clone()
-                            .unwrap_or_else(|| RuleId::new(RuleId::FAIL_CLOSED));
-                        tracing::info!(flow = %meta.flow, %rule, stage = stage.as_str(), "watching rule stopped the exchange");
-                        Refusal::deny(status_code(status), &message, rule, close)
-                    }
-                    Decision::Allow(_) => Refusal::fail_closed("unsupported_effect"),
-                }
+                let rule = o
+                    .terminal_rule
+                    .clone()
+                    .unwrap_or_else(|| RuleId::new(RuleId::FAIL_CLOSED));
+                tracing::info!(flow = %meta.flow, %rule, stage = stage.as_str(), "watching rule stopped the exchange");
+                Refusal::deny(status_code(status), &message, rule, close)
             };
             // A stop's own refusal takes precedence over an effect failure
             // in the same evaluation only if nothing stopped earlier.

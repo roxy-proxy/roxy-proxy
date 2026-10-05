@@ -506,11 +506,7 @@ pub fn address_check(
 
 /// Applies an address-policy denial to the outcome: `403 _address_policy`.
 pub fn apply_address_denial(out: &mut Outcome) {
-    out.decision = Decision::Deny {
-        status: roxy_rules::DEFAULT_DENY_STATUS,
-        message: roxy_rules::DEFAULT_DENY_MESSAGE.to_owned(),
-        close: true,
-    };
+    out.decision = Decision::default_deny();
     out.terminal_rule = RuleId::new("_address_policy");
 }
 
@@ -546,11 +542,11 @@ pub struct DryRun {
 
 impl DryRun {
     /// The final decision: a watching stop overrides the head's allow.
-    pub fn decision(&self) -> &Decision {
+    pub fn decision(&self) -> Decision {
         self.watching
             .as_ref()
-            .and_then(|w| w.stop.as_ref())
-            .unwrap_or(&self.head.decision)
+            .and_then(|w| w.stop.clone())
+            .map_or_else(|| self.head.decision.clone(), Decision::Deny)
     }
 
     pub(crate) fn terminal_rule(&self) -> &RuleId {
@@ -576,7 +572,7 @@ pub fn run(policy: &Policy, view: &DryRunView, tags: &[String], known: Reads) ->
         let mut st = policy.watch_state(&head.tags);
         let changed = known | Reads::METRICS;
         policy
-            .evaluate_watching(changed, known, &mut st, view, &ctx)
+            .evaluate_watching(changed, known, &mut st, view)
             .unwrap_or_default()
     });
     DryRun { head, watching }

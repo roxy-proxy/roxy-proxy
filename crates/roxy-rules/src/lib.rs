@@ -43,7 +43,7 @@
 //! let mut st = policy.watch_state(&out.tags);
 //! let flow = flow.with_int(Field::BodyBytes, 11 << 20);
 //! let w = policy
-//!     .evaluate_watching(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &flow, &EvalContext::empty())
+//!     .evaluate_watching(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &flow,)
 //!     .unwrap();
 //! assert!(w.stops());
 //! ```
@@ -174,8 +174,8 @@ pub use config::{
 };
 pub use diag::{Diagnostic, RuleId, Span};
 pub use eval::{
-    AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, DenyStatus, Effect,
-    EvalContext, FAIL_CLOSED_STATUS, FailClosedReason, Outcome, WatchOutcome,
+    AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Deny, DenyStatus, Effect,
+    EvalContext, FAIL_CLOSED_STATUS, FailClosedReason, Outcome, WatchEffect, WatchOutcome,
 };
 pub use metrics::{
     CarryOverReport, Clock, DEFAULT_MAX_METRIC_BYTES, DEFAULT_MAX_METRIC_KEYS, MetricError,
