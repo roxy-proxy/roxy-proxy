@@ -10,7 +10,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use super::{AddonDef, Client, Kit, KitBuilder, Ws};
+use super::{AddonDef, Answer, Client, Kit, KitBuilder, Ws};
 
 const WS_ALLOW: &str = r#"
 - id: ws
@@ -360,6 +360,85 @@ async fn upgrade_with_body_is_refused_with_a_stack() {
     assert_eq!(ev["decision"], "deny");
     assert_eq!(ev["terminal_rule"], "_websocket");
     assert_eq!(ev["reason"], "ws_bad_handshake");
+}
+
+/// Sends `POST /up` asking to upgrade to h2c, with `body`.
+async fn h2c_post(kit: &Kit, body: roxy_http::Body) -> Answer {
+    let mut c = kit.h1().await;
+    let req = c
+        .request(
+            "POST",
+            "/up",
+            &[("connection", "upgrade"), ("upgrade", "h2c")],
+        )
+        .body(body)
+        .unwrap();
+    Answer::read(c.send(req).await.unwrap()).await
+}
+
+/// Only a WebSocket upgrade is relayed. Through a stack, any other is
+/// the ordinary request the core forwards once it strips the upgrade:
+/// its body goes out intact and the upstream's response comes back.
+async fn non_websocket_upgrade_is_an_ordinary_request(kit: &Kit) {
+    let a = h2c_post(kit, roxy_http::Body::from_bytes("hello")).await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["body_len"], 5);
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].body, b"hello");
+    assert!(
+        !seen[0].headers.contains_key("upgrade"),
+        "{:?}",
+        seen[0].headers
+    );
+    let ev = kit.events("upgrade_stripped", 1).await;
+    assert_eq!(ev[0]["upgrade"], "h2c");
+    assert_eq!(kit.request_event().await["decision"], "allow");
+}
+
+#[tokio::test]
+async fn non_websocket_upgrade_through_a_layer_is_an_ordinary_request() {
+    let kit = Kit::builder()
+        .rules(WS_ALLOW)
+        .addon(AddonDef::test_layer("a"))
+        .start()
+        .await;
+    non_websocket_upgrade_is_an_ordinary_request(&kit).await;
+}
+
+#[tokio::test]
+async fn non_websocket_upgrade_through_a_service_is_an_ordinary_request() {
+    use crate::addons::AddonMode;
+    use crate::addons::service::testing::{addon, kit};
+    let kit = kit(
+        WS_ALLOW,
+        vec![addon("s", "pass", AddonMode::Enforce, |_| {})],
+    )
+    .await;
+    non_websocket_upgrade_is_an_ordinary_request(&kit).await;
+}
+
+/// A non-WebSocket upgrade's body streamed through a stack is held to
+/// the request body cap.
+#[tokio::test]
+async fn non_websocket_upgrade_through_a_stack_keeps_the_body_cap() {
+    let kit = Kit::builder()
+        .rules(WS_ALLOW)
+        .addon(AddonDef::test_layer("a"))
+        .limits(|l| l.max_request_body_bytes = 1024)
+        .start()
+        .await;
+    let (mut tx, body) = super::streaming_body();
+    tokio::spawn(async move {
+        for _ in 0..4 {
+            let _ = tx.send_data(bytes::Bytes::from(vec![b'z'; 1024])).await;
+        }
+        let _ = tx.finish().await;
+    });
+    let a = h2c_post(&kit, body).await;
+    assert_eq!(a.status, 413, "{a:?}");
+    let ev = kit.events("parse_error", 1).await;
+    assert_eq!(ev[0]["reason"], "body_too_large");
+    assert!(kit.upstream.seen().iter().all(|s| s.body.len() <= 1024));
 }
 
 /// The capture `end` record of a WebSocket's client-to-server direction

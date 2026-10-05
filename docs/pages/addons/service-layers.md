@@ -192,7 +192,7 @@ not counted.
   service gets the upgrade request and forwards it; the `101` from below
   arrives as roxy's `response` head, and the service answers it with a
   `101` of its own (the one status outside 200–599 it may send, and only
-  on an upgrade). From then on the request body is the client's bytes and
+  on a WebSocket upgrade). From then on the request body is the client's bytes and
   the response body the upstream's, with no length cap on either, until
   each side closes; the stream holds its place on the connection for as
   long as the WebSocket is open. roxy sends no `request_end` before the

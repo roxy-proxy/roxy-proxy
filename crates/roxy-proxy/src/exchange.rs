@@ -19,7 +19,7 @@ use roxy_http::ws::{
 };
 use roxy_http::{
     Body, BodyError, CanonicalRequest, CanonicalResponse, DriveError, Limits, ParseError,
-    WriteError,
+    RequestMeta, WriteError,
 };
 use roxy_rules::RuleId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -543,6 +543,14 @@ async fn response_head<F: Future>(
         .map_err(|_| "upstream response headers")
 }
 
+/// The request asks for the one upgrade roxy can relay, a WebSocket. Any
+/// other upgrade is stripped, and the request forwarded as an ordinary one.
+pub(crate) fn wants_websocket(meta: &RequestMeta) -> bool {
+    meta.upgrade
+        .as_deref()
+        .is_some_and(|u| u.eq_ignore_ascii_case("websocket"))
+}
+
 /// The forwarded exchange: the upstream leg (a plain request, or a
 /// WebSocket upgrade), then the response steps. From here on the request
 /// is on its way: watching rules re-check the exchange as values arrive,
@@ -554,12 +562,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
         request: mut up_tap,
         response: down_tap,
     } = taps(cx);
-    let wants_ws = req
-        .meta
-        .upgrade
-        .as_deref()
-        .is_some_and(|u| u.eq_ignore_ascii_case("websocket"));
-    let relay_ws = wants_ws && cx.opts.upgrade_websocket;
+    let relay_ws = wants_websocket(&req.meta) && cx.opts.upgrade_websocket;
     if let Some(u) = &req.meta.upgrade
         && !relay_ws
     {
