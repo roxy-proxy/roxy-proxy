@@ -369,7 +369,7 @@ impl Layer {
 
         let (mut instance, permit, started) = self.checkout().await?;
         let shared = ExchangeShared::new();
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
         let (req_res, out_res) = {
             let data = instance.store.data_mut();
             data.exchange = Some(ExchangeCtx {
@@ -405,35 +405,49 @@ impl Layer {
         let settled = shared.wait_settled();
         let head_clock =
             shared.head_clock(limits.first_byte_timeout.saturating_sub(started.elapsed()));
-        tokio::select! {
+        // The answer is polled first, but the guest can answer and return
+        // between that poll and the next branch's, so a settle or an
+        // expired clock winning does not mean no answer came: each reads
+        // the channel before deciding.
+        let answer = tokio::select! {
             biased;
-            resp = rx => match resp {
-                Ok(Ok(resp)) => {
-                    let outcome = shared.outcome();
-                    let mut resp = resp.map(|b| FromGuest::response(b, shared.clone(), cancel));
-                    resp.extensions_mut().insert(outcome);
-                    Ok(resp)
-                }
-                Ok(Err(code)) => {
-                    let err = LayerError::ErrorResponse(format!("{code:?}"));
-                    shared.fail(err.clone());
-                    Err(err)
-                }
-                // The outparam was dropped: the handler returned without a
-                // response, or the instance was torn down.
-                Err(_) => Err(shared
-                    .wait_settled()
-                    .await
-                    .err()
-                    .unwrap_or(LayerError::NoResponse)),
+            answer = &mut rx => answer,
+            outcome = settled => match outcome {
+                Err(e) => return Err(e),
+                // The handler returned cleanly, so whatever it set is in
+                // the channel (or the sender went with the outparam).
+                Ok(()) => rx.await,
             },
-            outcome = settled => Err(outcome.err().unwrap_or(LayerError::NoResponse)),
             () = head_clock => {
-                let err = LayerError::BudgetExceeded(Budget::FirstByte);
-                // The driver sees the failure and tears the instance down.
+                if let Ok(answer) = rx.try_recv() {
+                    Ok(answer)
+                } else {
+                    let err = LayerError::BudgetExceeded(Budget::FirstByte);
+                    // The driver sees the failure and tears the instance down.
+                    shared.fail(err.clone());
+                    return Err(err);
+                }
+            }
+        };
+        match answer {
+            Ok(Ok(resp)) => {
+                let outcome = shared.outcome();
+                let mut resp = resp.map(|b| FromGuest::response(b, shared.clone(), cancel));
+                resp.extensions_mut().insert(outcome);
+                Ok(resp)
+            }
+            Ok(Err(code)) => {
+                let err = LayerError::ErrorResponse(format!("{code:?}"));
                 shared.fail(err.clone());
                 Err(err)
             }
+            // The outparam was dropped: the handler returned without a
+            // response, or the instance was torn down.
+            Err(_) => Err(shared
+                .wait_settled()
+                .await
+                .err()
+                .unwrap_or(LayerError::NoResponse)),
         }
     }
 }
