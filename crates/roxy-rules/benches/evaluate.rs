@@ -54,7 +54,6 @@ fn policy() -> Policy {
         metrics: &metrics,
         secret_names: &none,
         address_lists: &none,
-        transparent_listeners: false,
         default: DefaultDecision::Deny,
     })
     .unwrap()

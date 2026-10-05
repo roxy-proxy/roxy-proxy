@@ -98,7 +98,7 @@ pub(crate) fn splice_client(
 /// every message stays readable: message rules check them, or a layer
 /// that ran on the upgrade request reads its bytes.
 pub(crate) fn ws_without_extensions(snap: &Snapshot, layer_ran: bool) -> bool {
-    snap.policy.reads_ws() || (snap.flags.decode_for_addons && layer_ran)
+    snap.policy.reads_ws() || (snap.http.decode_for_addons && layer_ran)
 }
 
 /// For an upgrade request, takes its body (the stream after the `101`)

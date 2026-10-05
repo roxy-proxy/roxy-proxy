@@ -65,9 +65,9 @@ impl Default for Limits {
     }
 }
 
-/// Mirrors the `http.*` config block. Every strictness flag defaults to the
-/// strict setting; `decode_for_addons` defaults to true.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The `http.*` strictness flags the codec reads. Every one defaults to
+/// the strict setting (off).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct HttpFlags {
     /// Accept `HTTP/1.0` request lines.
@@ -80,28 +80,4 @@ pub struct HttpFlags {
     pub allow_obs_text: bool,
     /// Accept a body on GET/HEAD/DELETE/OPTIONS/TRACE.
     pub allow_body_on_get: bool,
-    /// Accept plaintext HTTP inside a CONNECT tunnel (used by the proxy's
-    /// tunnel classifier, not by this crate).
-    pub allow_plain_in_connect: bool,
-    /// Remove `accept-encoding` from requests, so origins answer
-    /// uncompressed (used by the proxy, not by this crate).
-    pub strip_accept_encoding: bool,
-    /// Decode bodies at the edge of the addon stack (used by the proxy, not
-    /// by this crate). Default true.
-    pub decode_for_addons: bool,
-}
-
-impl Default for HttpFlags {
-    fn default() -> Self {
-        Self {
-            allow_http10: false,
-            allow_trailers: false,
-            allow_chunk_extensions: false,
-            allow_obs_text: false,
-            allow_body_on_get: false,
-            allow_plain_in_connect: false,
-            strip_accept_encoding: false,
-            decode_for_addons: true,
-        }
-    }
 }

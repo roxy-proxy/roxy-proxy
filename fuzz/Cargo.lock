@@ -758,6 +758,7 @@ dependencies = [
  "ipnet",
  "parking_lot",
  "regex",
+ "roxy-http",
  "serde",
  "thiserror",
 ]

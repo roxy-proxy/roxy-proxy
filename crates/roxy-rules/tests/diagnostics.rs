@@ -105,9 +105,14 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: a, then: { log: { message: \"${secret:gh}\" } } }",
     ),
     (
-        "passthrough without a transparent listener",
+        "passthrough is reserved",
         "",
         "- { id: a, then: passthrough }",
+    ),
+    (
+        "call is reserved",
+        "",
+        "- { id: a, then: [{ call: scan }, allow] }",
     ),
     (
         "tag read above the rule that sets it",
@@ -170,9 +175,9 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: a, then: [{ set_header: { Host: evil } }, { set_header: { x-a: \"caf\u{e9}\" } }, allow] }",
     ),
     (
-        "bad deny status and reserved call",
+        "bad deny status",
         "",
-        "- { id: a, then: [{ call: nope }, { deny: { status: 200 } }] }",
+        "- { id: a, then: { deny: { status: 200 } } }",
     ),
     (
         "phase key removed",

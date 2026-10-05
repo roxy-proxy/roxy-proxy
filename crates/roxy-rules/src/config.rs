@@ -137,9 +137,6 @@ pub enum Action {
     Allow(AllowArgs),
     /// Terminal. Bare `deny` or `deny: { status, message, close }`.
     Deny(DenyArgs),
-    /// Terminal; reserved for transparent listeners (deferred), rejected by
-    /// the compiler.
-    Passthrough,
     /// `set_header: { name: value, ... }`, in YAML order.
     SetHeader(Vec<(String, String)>),
     /// `remove_header: [names]`
@@ -160,8 +157,6 @@ pub enum Action {
     SetState(SetStateArgs),
     /// `capture: request | response | both`
     Capture(CaptureTarget),
-    /// `call: addon_name`
-    Call(String),
 }
 
 impl Action {
@@ -169,7 +164,6 @@ impl Action {
     pub const NAMES: &'static [&'static str] = &[
         "allow",
         "deny",
-        "passthrough",
         "set_header",
         "remove_header",
         "rewrite_path",
@@ -180,7 +174,21 @@ impl Action {
         "log",
         "set_state",
         "capture",
-        "call",
+    ];
+
+    /// Words the rule language keeps for itself: each has a meaning roxy
+    /// does not implement, so a rule that uses one is rejected with the
+    /// reason instead of as an unknown action.
+    const RESERVED: &'static [(&'static str, &'static str)] = &[
+        (
+            "call",
+            "`call` is reserved: addons run above the rules, in config order, not from a rule",
+        ),
+        (
+            "passthrough",
+            "`passthrough` is reserved for a transparent listener, which roxy does not have \
+             (issue #15)",
+        ),
     ];
 
     /// The action's YAML name.
@@ -188,7 +196,6 @@ impl Action {
         match self {
             Self::Allow(_) => "allow",
             Self::Deny(_) => "deny",
-            Self::Passthrough => "passthrough",
             Self::SetHeader(_) => "set_header",
             Self::RemoveHeader(_) => "remove_header",
             Self::RewritePath(_) => "rewrite_path",
@@ -199,13 +206,12 @@ impl Action {
             Self::Log(_) => "log",
             Self::SetState(_) => "set_state",
             Self::Capture(_) => "capture",
-            Self::Call(_) => "call",
         }
     }
 
     /// Whether this action is terminal (decides the rule's outcome).
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Allow(_) | Self::Deny(_) | Self::Passthrough)
+        matches!(self, Self::Allow(_) | Self::Deny(_))
     }
 }
 
@@ -353,6 +359,9 @@ impl CaptureTarget {
 // ----- `then` deserialisation -------------------------------------------------
 
 fn unknown_action(name: &str) -> String {
+    if let Some((_, why)) = Action::RESERVED.iter().find(|(w, _)| *w == name) {
+        return (*why).to_owned();
+    }
     format!(
         "unknown action `{name}`; expected one of {}",
         Action::NAMES
@@ -364,15 +373,14 @@ fn unknown_action(name: &str) -> String {
 }
 
 impl Action {
-    /// A bare-word action (`allow`, `deny`, `passthrough`).
+    /// A bare-word action (`allow`, `deny`).
     fn from_word<E: de::Error>(word: &str) -> Result<Self, E> {
         match word {
             "allow" => Ok(Self::Allow(AllowArgs::default())),
             "deny" => Ok(Self::Deny(DenyArgs::default())),
-            "passthrough" => Ok(Self::Passthrough),
             other if Action::NAMES.contains(&other) => Err(E::custom(format!(
-                "action `{other}` needs an argument (write `{other}: ...`); only `allow`, \
-                 `deny` and `passthrough` may be bare words"
+                "action `{other}` needs an argument (write `{other}: ...`); only `allow` and \
+                 `deny` may be bare words"
             ))),
             other => Err(E::custom(unknown_action(other))),
         }
@@ -396,12 +404,6 @@ impl Action {
         let action = match name.as_str() {
             "allow" => Self::Allow(arg!(Option<AllowArgs>).unwrap_or_default()),
             "deny" => Self::Deny(arg!(Option<DenyArgs>).unwrap_or_default()),
-            "passthrough" => {
-                arg!(Option<de::IgnoredAny>).map_or(Ok(()), |_| {
-                    Err(de::Error::custom("`passthrough` takes no argument"))
-                })?;
-                Self::Passthrough
-            }
             "set_header" => Self::SetHeader(arg!(StringPairs).0),
             "remove_header" => Self::RemoveHeader(arg!(StringList).0),
             "rewrite_path" => Self::RewritePath(arg!(RewritePathArgs)),
@@ -412,7 +414,6 @@ impl Action {
             "log" => Self::Log(arg!(LogArgs)),
             "set_state" => Self::SetState(arg!(SetStateArgs)),
             "capture" => Self::Capture(arg!(CaptureTarget)),
-            "call" => Self::Call(arg!(String)),
             other => {
                 return Err(de::Error::custom(unknown_action(other)));
             }
@@ -624,7 +625,6 @@ mod tests {
             [Action::Allow(AllowArgs::default())]
         );
         assert_eq!(then("deny").unwrap(), [Action::Deny(DenyArgs::default())]);
-        assert_eq!(then("passthrough").unwrap(), [Action::Passthrough]);
         assert_eq!(
             then("[tag: x, allow]").unwrap(),
             [Action::Tag("x".into()), Action::Allow(AllowArgs::default())]
@@ -649,9 +649,7 @@ mod tests {
 - log: { message: default-level }
 - set_state: { key: k, value: v, ttl: 5m }
 - capture: both
-- call: pii-scan
 - allow:
-- passthrough:
 "#,
         )
         .unwrap();
@@ -673,9 +671,7 @@ mod tests {
                 "log",
                 "set_state",
                 "capture",
-                "call",
                 "allow",
-                "passthrough"
             ]
         );
         assert_eq!(
@@ -716,7 +712,6 @@ mod tests {
             ("~", "at least one action"),
             ("{ set_header: [a] }", "then.set_header"),
             ("{ capture: everything }", "then.capture"),
-            ("{ passthrough: 1 }", "takes no argument"),
             ("{ allow: { upgrade: h2c } }", "then.allow"),
             ("{ allow: { inspect: true } }", "then.allow"),
             (
@@ -727,6 +722,38 @@ mod tests {
         for (yaml, want) in cases {
             let err = then(yaml).expect_err(yaml);
             assert!(err.contains(want), "{yaml}: {err}");
+        }
+    }
+
+    /// A reserved word is refused with its reason, bare or with an
+    /// argument, in place of the generic unknown-action error.
+    #[test]
+    fn reserved_words_are_refused_with_the_reason() {
+        for (yaml, want) in [
+            (
+                "passthrough",
+                "`passthrough` is reserved for a transparent listener",
+            ),
+            (
+                "{ passthrough: ~ }",
+                "`passthrough` is reserved for a transparent listener",
+            ),
+            (
+                "[tag: x, passthrough]",
+                "`passthrough` is reserved for a transparent listener",
+            ),
+            (
+                "{ call: scan }",
+                "`call` is reserved: addons run above the rules",
+            ),
+            (
+                "[{ call: scan }, allow]",
+                "`call` is reserved: addons run above the rules",
+            ),
+        ] {
+            let err = then(yaml).expect_err(yaml);
+            assert!(err.contains(want), "{yaml}: {err}");
+            assert!(!err.contains("unknown action"), "{yaml}: {err}");
         }
     }
 

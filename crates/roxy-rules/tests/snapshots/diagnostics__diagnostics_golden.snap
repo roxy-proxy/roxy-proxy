@@ -89,8 +89,11 @@ rules[0].then[0]: secret references are only allowed in rules decided at the req
 == secret outside set_header
 rules[0].then[0]: secret references are only allowed in `set_header` values, not in `log`  [rule a]
 
-== passthrough without a transparent listener
-rules[0].then[0]: `passthrough` requires a transparent listener, which is not supported yet (issue #15)  [rule a]
+== passthrough is reserved
+parse: .[0].then: `passthrough` is reserved for a transparent listener, which roxy does not have (issue #15) at line 1 column 18
+
+== call is reserved
+parse: .[0].then[0]: `call` is reserved: addons run above the rules, in config order, not from a rule at line 1 column 19
 
 == tag read above the rule that sets it
 rules[0].when: reads `tag["risky"]`, which is set too late to be seen here, by rules[1] ("mark"), below this rule; a rule sees only the tags set before it is checked  [rule read]
@@ -116,7 +119,7 @@ parse: .[0].then: an action is a map with exactly one key, but this one has `set
 rules[0].then[1]: `tag` follows the terminal action `allow` and would never run; move it before `allow`  [rule a]
 
 == unknown action
-parse: .[0].then: unknown action `sethead`; expected one of `allow`, `deny`, `passthrough`, `set_header`, `remove_header`, `rewrite_path`, `set_query`, `remove_query`, `redirect`, `tag`, `log`, `set_state`, `capture`, `call` at line 1 column 18
+parse: .[0].then: unknown action `sethead`; expected one of `allow`, `deny`, `set_header`, `remove_header`, `rewrite_path`, `set_query`, `remove_query`, `redirect`, `tag`, `log`, `set_state`, `capture` at line 1 column 18
 
 == request mutation in a watching rule
 rules[0].then[0]: `rewrite_path` changes the request, which is already on its way; this rule reads `body.bytes`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation)  [rule a]
@@ -131,9 +134,8 @@ rules[0].then[0]: `remove_header` changes the response head, so every value the 
 rules[0].then[0]: header `host` is managed by roxy and cannot be changed by rules (use `redirect: { ..., rewrite_host: true }`)  [rule a]
 rules[0].then[1]: set_header x-a: value "café" is not a valid header value (visible ASCII, space and tab only)  [rule a]
 
-== bad deny status and reserved call
-rules[0].then[0]: `call` is reserved: addons run above the rules, in config order, not from a rule  [rule a]
-rules[0].then[1]: deny status 200 must be a 4xx or 5xx code  [rule a]
+== bad deny status
+rules[0].then[0]: deny status 200 must be a 4xx or 5xx code  [rule a]
 
 == phase key removed
 parse: rule "w": `phase` was removed: rules no longer have phases; each rule runs when the values it reads are known (head rules at the request head; rules that read body.bytes, response.* or ws.* watch the rest of the exchange; see https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation). Delete the `phase` key

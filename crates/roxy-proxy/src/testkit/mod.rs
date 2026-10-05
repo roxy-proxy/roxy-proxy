@@ -49,7 +49,7 @@ pub(crate) use upstream::{Seen, Upstream};
 
 use crate::Server;
 use crate::addons::{AddonMode, AddonSpec, StateLimits};
-use crate::config::{PolicyUpdate, RuntimeConfig};
+use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{MemorySink, Redactor};
 use crate::listener::{ClientConn, ListenerInfo, ListenerMode};
 use crate::sources::{MetricSource, StateSource, UnavailableMetrics, UnavailableState};
@@ -160,6 +160,7 @@ pub(crate) struct KitBuilder {
     addons: Vec<AddonDef>,
     limits: Limits,
     flags: HttpFlags,
+    http: HttpBehaviour,
     metrics: Arc<dyn MetricSource>,
     /// `metrics:` definitions (YAML); a real metric store holds them.
     metric_defs: String,
@@ -197,6 +198,12 @@ impl KitBuilder {
     #[must_use]
     pub(crate) fn flags(mut self, f: impl FnOnce(&mut HttpFlags)) -> Self {
         f(&mut self.flags);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn http(mut self, f: impl FnOnce(&mut HttpBehaviour)) -> Self {
+        f(&mut self.http);
         self
     }
 
@@ -242,7 +249,6 @@ impl KitBuilder {
             metrics: &metric_defs,
             secret_names: &none,
             address_lists: &none,
-            transparent_listeners: false,
             default: DefaultDecision::Deny,
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
@@ -263,7 +269,7 @@ impl KitBuilder {
         }
 
         let settings = upstream_settings(&upstream);
-        let (limits, flags) = (self.limits.clone(), self.flags.clone());
+        let (limits, flags, http) = (self.limits.clone(), self.flags.clone(), self.http.clone());
         let capture = self
             .capture_all
             .then(|| Arc::new(capture_all_log(&dir.path().join("capture"))));
@@ -294,6 +300,7 @@ impl KitBuilder {
                 users: HashMap::new(),
                 limits: self.limits,
                 flags: self.flags,
+                http: self.http,
                 upstream: settings.clone(),
                 address_lists: Arc::new(HashMap::new()),
                 deny_lists: Vec::new(),
@@ -310,6 +317,7 @@ impl KitBuilder {
             ca_file: dir.path().join(roxy_tls::CA_CERT_FILE),
             limits,
             flags,
+            http,
             settings,
             _dir: dir,
         }
@@ -326,6 +334,7 @@ pub(crate) struct Kit {
     ca_file: std::path::PathBuf,
     pub(crate) limits: Limits,
     pub(crate) flags: HttpFlags,
+    pub(crate) http: HttpBehaviour,
     settings: UpstreamSettings,
     _dir: tempfile::TempDir,
 }
@@ -337,6 +346,7 @@ impl Kit {
             addons: Vec::new(),
             limits: Limits::default(),
             flags: HttpFlags::default(),
+            http: HttpBehaviour::default(),
             metrics: Arc::new(UnavailableMetrics),
             metric_defs: String::new(),
             state: Arc::new(UnavailableState),
@@ -396,6 +406,31 @@ impl Kit {
             self.server.shared().clone(),
         ));
         client
+    }
+
+    /// A raw client that sent `bytes` to the proxy port and was gone before
+    /// roxy read them: roxy parses what arrived, then finds nobody to write
+    /// to.
+    pub(crate) async fn connect_and_leave(&self, bytes: &[u8]) {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        client.write_all(bytes).await.unwrap();
+        drop(client);
+        let conn = ClientConn {
+            id: Ulid::generate(),
+            listener: Arc::new(ListenerInfo {
+                name: "main".to_owned(),
+                mode: ListenerMode::Explicit,
+                auth_required: false,
+            }),
+            peer: "192.0.2.7:40000".parse().unwrap(),
+            user: None,
+            original_dst: None,
+        };
+        self.spawn_conn(crate::conn::serve_explicit(
+            Box::new(server),
+            conn,
+            self.server.shared().clone(),
+        ));
     }
 
     /// An HTTP/1.1 client on the proxy port (absolute-form requests).
@@ -516,7 +551,6 @@ impl Kit {
             metrics: &[],
             secret_names: &none,
             address_lists: &none,
-            transparent_listeners: false,
             default: DefaultDecision::Deny,
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
@@ -528,6 +562,7 @@ impl Kit {
                 users: HashMap::new(),
                 limits: self.limits.clone(),
                 flags: self.flags.clone(),
+                http: self.http.clone(),
                 upstream: self.settings.clone(),
                 address_lists: Arc::new(HashMap::new()),
                 deny_lists: Vec::new(),

@@ -322,7 +322,7 @@ pub(crate) struct StackFlow {
     failure: Mutex<Option<(String, StackError)>>,
     /// The request body failed in the core, as a client's would (framing,
     /// a cut): no layer's doing, so no layer is blamed for it.
-    client_fault: Mutex<Option<roxy_http::ParseError>>,
+    client_fault: Mutex<Option<roxy_http::DriveError>>,
     /// The enforce-mode failure has been logged.
     reported: AtomicBool,
     /// A layer asked to close the client connection.
@@ -454,7 +454,7 @@ impl StackFlow {
             .clone()
     }
 
-    fn take_client_fault(&self) -> Option<roxy_http::ParseError> {
+    fn take_client_fault(&self) -> Option<roxy_http::DriveError> {
         lock(&self.client_fault).take()
     }
 
@@ -612,7 +612,7 @@ pub(crate) async fn run<F: Front>(
 fn stack_outcome(
     st: &Arc<StackFlow>,
     cx: &mut FlowCx,
-    driven: Result<Result<LayerResponse, HostError>, roxy_http::ParseError>,
+    driven: Result<Result<LayerResponse, HostError>, roxy_http::DriveError>,
     client_tx: Option<BodySender>,
 ) -> Outcome {
     let resp = match driven {
@@ -704,7 +704,7 @@ pub(crate) fn enter(
         let mut req = req;
         // Layers see bodies decoded; a flow no layer runs on is left as
         // the client sent it.
-        if st.snap.flags.decode_for_addons && !st.request_decoded.swap(true, Ordering::SeqCst) {
+        if st.snap.http.decode_for_addons && !st.request_decoded.swap(true, Ordering::SeqCst) {
             decode::request(&mut req, st.snap.limits.max_request_body_bytes);
         }
         if addon.mode == AddonMode::Observe {
@@ -764,7 +764,7 @@ impl BodyIo for Detached {
         &'a mut self,
         body: &'a mut Body,
         cap: u64,
-    ) -> CollectFuture<'a, Result<Collected, roxy_http::ParseError>> {
+    ) -> CollectFuture<'a, Result<Collected, roxy_http::DriveError>> {
         Box::pin(async move { Ok(collect_prefix(body, cap).await) })
     }
 }
@@ -774,7 +774,7 @@ impl Front for Detached {
     fn drive<Fut>(
         &mut self,
         fut: Fut,
-    ) -> impl Future<Output = Result<Fut::Output, roxy_http::ParseError>> + Send
+    ) -> impl Future<Output = Result<Fut::Output, roxy_http::DriveError>> + Send
     where
         Fut: Future + Send,
         Fut::Output: Send,
@@ -828,7 +828,7 @@ async fn core(
         Outcome::Respond(mut res) => {
             // A flow no layer ran on gets the response as the origin sent
             // it.
-            if snap.flags.decode_for_addons && st.any_ran() {
+            if snap.http.decode_for_addons && st.any_ran() {
                 decode::response(&mut res, snap.limits.max_response_body_bytes);
             }
             Ok(to_layer_response(res))
@@ -943,15 +943,15 @@ mod tests {
         let fault = || roxy_http::ParseError::new(roxy_http::Reason::BadChunkSize, "zz");
         let failed = || Ok(Err(HostError::new("request body failed")));
 
-        *lock(&st.client_fault) = Some(fault());
+        *lock(&st.client_fault) = Some(fault().into());
         let out = stack_outcome(&st, &mut cx, failed(), None);
         assert!(
-            matches!(&out, Outcome::Close(e) if e.reason == roxy_http::Reason::BadChunkSize),
+            matches!(&out, Outcome::Close(roxy_http::DriveError::Client(e)) if e.reason == roxy_http::Reason::BadChunkSize),
             "closes as a parse error"
         );
         assert!(st.failure().is_none(), "no layer is blamed");
 
-        *lock(&st.client_fault) = Some(fault());
+        *lock(&st.client_fault) = Some(fault().into());
         st.fail("a", LayerError::Trap("boom".into()));
         let out = stack_outcome(&st, &mut cx, failed(), None);
         assert!(

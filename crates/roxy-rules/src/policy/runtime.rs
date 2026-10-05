@@ -102,9 +102,7 @@ impl Policy {
                     CAction::Terminal(d @ Decision::Allow(_)) => {
                         allow.get_or_insert((i, d));
                     }
-                    // `passthrough` is rejected by the compiler; were it
-                    // ever reached it must not forward: it ranks with deny.
-                    CAction::Terminal(d) => {
+                    CAction::Terminal(d @ Decision::Deny { .. }) => {
                         deny.get_or_insert((i, d));
                     }
                 }
@@ -251,9 +249,8 @@ impl Policy {
                         return Some(self.watch_stop(st, o, Some((rule.id.clone(), d)), None));
                     }
                     // `allow` cannot appear in a watching rule (compile
-                    // error) and `passthrough` is rejected; never continue
-                    // on either: fail closed.
-                    CAction::Terminal(_) => {
+                    // error); never continue on one: fail closed.
+                    CAction::Terminal(Decision::Allow(_)) => {
                         return Some(self.watch_stop(
                             st,
                             o,

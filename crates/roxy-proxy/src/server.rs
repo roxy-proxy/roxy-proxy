@@ -18,7 +18,7 @@ use tokio_util::task::TaskTracker;
 use crate::addr::canonical;
 use crate::addrlist::AddressLists;
 use crate::auth::UserDb;
-use crate::config::{ListenerKind, PolicyUpdate, RuntimeConfig};
+use crate::config::{HttpBehaviour, ListenerKind, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowEvent, FlowSink, Redactor};
 use crate::listener::{ClientConn, Listener, ListenerMode, TcpProxyListener};
 use crate::pipeline::client_info;
@@ -34,6 +34,7 @@ pub(crate) struct Snapshot {
     pub users: HashMap<String, Arc<UserDb>>,
     pub limits: Arc<Limits>,
     pub flags: Arc<HttpFlags>,
+    pub http: Arc<HttpBehaviour>,
     /// Rebuilt on every reload, which also flushes the upstream pools.
     pub upstream: Arc<Upstream>,
     /// Address lists for `ip in @name` (and, resolved into the upstream's
@@ -196,6 +197,7 @@ fn build_snapshot(u: PolicyUpdate, tls: &Arc<ClientConfig>) -> Result<Snapshot, 
         users: u.users,
         limits: Arc::new(u.limits),
         flags: Arc::new(u.flags),
+        http: Arc::new(u.http),
         upstream: Arc::new(upstream),
         address_lists: u.address_lists,
         addons: u.addons.into(),

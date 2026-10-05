@@ -9,8 +9,8 @@ use http::StatusCode;
 use roxy_http::h1::{DRAIN_LIMIT, Incoming, Role, ServerConn};
 use roxy_http::url::parse_authority;
 use roxy_http::{
-    Body, BodyError, CanonicalRequest, CanonicalResponse, HttpFlags, Limits, Reason, Scheme,
-    WriteError,
+    Body, BodyError, CanonicalRequest, CanonicalResponse, DriveError, HttpFlags, Limits, Reason,
+    Scheme, WriteError,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -34,6 +34,14 @@ fn conn_with(limits: Limits) -> (DuplexStream, ServerConn<DuplexStream>) {
 
 fn conn() -> (DuplexStream, ServerConn<DuplexStream>) {
     conn_with(Limits::default())
+}
+
+/// The client fault a `drive` ended on.
+fn client_fault<T: std::fmt::Debug>(r: Result<T, DriveError>) -> roxy_http::ParseError {
+    match r {
+        Err(DriveError::Client(e)) => e,
+        other => panic!("expected a client fault, got {other:?}"),
+    }
 }
 
 async fn expect_request(c: &mut ServerConn<DuplexStream>) -> CanonicalRequest {
@@ -575,7 +583,7 @@ async fn backpressure_bounds_reading() {
         }
         written
     });
-    let err = c.drive(std::future::pending::<()>()).await.unwrap_err();
+    let err = client_fault(c.drive(std::future::pending::<()>()).await);
     assert_eq!(err.reason, Reason::BodyTimeout);
     let written = writer.await.unwrap();
     // Duplex buffer (64 KiB) + channel depth * read chunk + read buffer.
@@ -611,6 +619,31 @@ async fn expect_100_continue_handshake() {
     assert!(!head.contains("connection: close"));
 }
 
+/// A client gone before the `100 Continue` is a failed write of roxy's,
+/// not a fault in what the client sent.
+#[tokio::test]
+async fn expect_100_write_failure_is_not_a_client_fault() {
+    let (mut tx, rx) = tokio::io::duplex(1 << 16);
+    tx.write_all(b"PUT /up HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n")
+        .await
+        .unwrap();
+    drop(tx);
+    let mut c = ServerConn::new(
+        rx,
+        tunnel(),
+        Arc::new(Limits::default()),
+        Arc::new(HttpFlags::default()),
+    );
+    let mut req = expect_request(&mut c).await;
+    let body = std::mem::take(&mut req.body);
+    let err = c.drive(body.collect_up_to(100)).await.unwrap_err();
+    assert!(
+        matches!(err, DriveError::Write(WriteError::Io(_))),
+        "{err:?}"
+    );
+    assert!(c.is_closed());
+}
+
 #[tokio::test]
 async fn expect_100_denied_closes() {
     let (mut client, mut c) = conn();
@@ -644,7 +677,7 @@ async fn body_over_cap_mid_stream_closes() {
     let mut req = expect_request(&mut c).await;
     let body = std::mem::take(&mut req.body);
     let consumer = tokio::spawn(body.collect_up_to(1 << 20));
-    let err = c.drive(std::future::pending::<()>()).await.unwrap_err();
+    let err = client_fault(c.drive(std::future::pending::<()>()).await);
     assert_eq!(err.reason, Reason::BodyTooLarge);
     assert_eq!(
         consumer.await.unwrap().unwrap_err(),
@@ -781,13 +814,14 @@ async fn client_close_during_bodiless_request_ends_drive() {
         .unwrap();
     let _ = expect_request(&mut c).await;
     drop(client);
-    let err = tokio::time::timeout(
-        Duration::from_secs(5),
-        c.drive(std::future::pending::<()>()),
-    )
-    .await
-    .expect("drive notices the closed client")
-    .unwrap_err();
+    let err = client_fault(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            c.drive(std::future::pending::<()>()),
+        )
+        .await
+        .expect("drive notices the closed client"),
+    );
     assert_eq!(err.reason, Reason::UnexpectedEof);
 }
 
@@ -826,7 +860,7 @@ async fn body_idle_timeout() {
     let mut req = expect_request(&mut c).await;
     let body = std::mem::take(&mut req.body);
     let consumer = tokio::spawn(body.collect_up_to(100));
-    let err = c.drive(std::future::pending::<()>()).await.unwrap_err();
+    let err = client_fault(c.drive(std::future::pending::<()>()).await);
     assert_eq!(err.reason, Reason::BodyTimeout);
     assert_eq!(consumer.await.unwrap().unwrap_err(), BodyError::Timeout);
 }

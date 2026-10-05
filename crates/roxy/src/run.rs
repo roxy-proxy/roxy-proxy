@@ -77,6 +77,7 @@ pub fn policy_update(config: &Config, policy: Policy) -> anyhow::Result<PolicyUp
         users,
         limits: config.into(),
         flags: config.into(),
+        http: config.into(),
         upstream: config.into(),
         address_lists: Arc::new(address_lists),
         deny_lists: config.upstream.deny_lists.clone(),

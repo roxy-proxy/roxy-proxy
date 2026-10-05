@@ -188,7 +188,7 @@ async fn strip_accept_encoding_removes_it_before_the_rules() {
 "#;
     let strip = Kit::builder()
         .rules(RULES)
-        .flags(|f| f.strip_accept_encoding = true)
+        .http(|h| h.strip_accept_encoding = true)
         .start()
         .await;
     for h2 in [false, true] {
@@ -226,7 +226,7 @@ async fn strip_accept_encoding_removes_it_before_the_rules() {
 async fn with_layer(decode: bool) -> Kit {
     Kit::builder()
         .addon(AddonDef::test_layer("a"))
-        .flags(|f| f.decode_for_addons = decode)
+        .http(|h| h.decode_for_addons = decode)
         .start()
         .await
 }
@@ -325,7 +325,7 @@ async fn with_ws_layer(decode: bool) -> Kit {
     Kit::builder()
         .rules(WS_RULES)
         .addon(AddonDef::test_layer("t"))
-        .flags(|f| f.decode_for_addons = decode)
+        .http(|h| h.decode_for_addons = decode)
         .start()
         .await
 }

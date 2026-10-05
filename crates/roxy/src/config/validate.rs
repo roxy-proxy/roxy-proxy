@@ -90,10 +90,6 @@ impl Config {
             metrics: &self.metrics,
             secret_names: &secret_names,
             address_lists: &address_lists,
-            transparent_listeners: self
-                .listeners
-                .iter()
-                .any(|l| l.mode == ListenerMode::Transparent),
             default: self.default,
         })
     }

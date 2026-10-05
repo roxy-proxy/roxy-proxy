@@ -12,9 +12,6 @@ pub fn flags(cfg: u8) -> HttpFlags {
         allow_chunk_extensions: cfg & 4 != 0,
         allow_obs_text: cfg & 8 != 0,
         allow_body_on_get: cfg & 16 != 0,
-        allow_plain_in_connect: false,
-        strip_accept_encoding: false,
-        decode_for_addons: true,
     }
 }
 
@@ -168,7 +165,6 @@ pub mod rules {
             metrics: &metrics,
             secret_names: &secrets,
             address_lists: &lists,
-            transparent_listeners: false,
             default: if default_allow {
                 DefaultDecision::Allow
             } else {

@@ -39,8 +39,8 @@ use h2::{RecvStream, SendStream};
 use http_body::Frame;
 use roxy_http::h2map::{from_h2_parts, to_h2_response, validate_h2_trailers};
 use roxy_http::{
-    Authority, Body, BodyError, CanonicalResponse, HttpFlags, Limits, Method, ParseError, Reason,
-    is_reserved, status_forbids_body,
+    Authority, Body, BodyError, CanonicalResponse, DriveError, HttpFlags, Limits, Method,
+    ParseError, Reason, WriteError, is_reserved, status_forbids_body,
 };
 use tokio::task::JoinSet;
 use tokio::time::{Instant, Sleep, sleep, sleep_until, timeout};
@@ -49,7 +49,8 @@ use tokio_util::sync::CancellationToken;
 use crate::body::{Collected, collect_prefix};
 use crate::conn::ConnLimits;
 use crate::exchange::{
-    Answer, Front, Outcome, WriteFailure, process, record_client_failure, record_client_gone, send,
+    Answer, Front, Outcome, WriteFailure, process, record_client_failure, record_client_gone,
+    record_continue_failure, send,
 };
 use crate::flowlog::TlsInfo;
 use crate::io::Io;
@@ -222,7 +223,7 @@ async fn serve_stream(
     // `parse_error` included: one connection can open many streams.
     crate::flowlog::sink_ready(&*ccx.shared.sink).await;
     let snap = ccx.shared.snapshot();
-    let ConnLimits { limits, flags } = &ccx.cl;
+    let ConnLimits { limits, flags, .. } = &ccx.cl;
     let (parts, recv) = req.into_parts();
     let fail = Arc::new(BodyFail::default());
     let raw = if recv.is_end_stream() {
@@ -282,11 +283,15 @@ async fn serve_stream(
         Outcome::Refuse(refusal) => Answer::Refusal(refusal),
         // The client went away: nothing to answer, nothing to reset.
         Outcome::Close(_) if fail.gone() => return record_client_gone(&mut cx),
-        Outcome::Close(e) => {
+        Outcome::Close(DriveError::Client(e)) => {
             ccx.shared
                 .emit_parse_error(&ccx.client, Some(cx.flow.to_string()), &e);
             respond.send_reset(h2::Reason::PROTOCOL_ERROR);
             return record_client_failure(&mut cx, &e, None);
+        }
+        Outcome::Close(DriveError::Write(e)) => {
+            respond.send_reset(h2::Reason::INTERNAL_ERROR);
+            return record_continue_failure(&mut cx, e);
         }
         Outcome::Upgrade { .. } => {
             // Unreachable: h2 requests never carry an upgrade. Fail closed.
@@ -492,17 +497,18 @@ struct H2Front {
 
 impl H2Front {
     /// `100 Continue` once, when the client waits for it.
-    fn continue_once(&mut self) -> Result<(), ParseError> {
+    fn continue_once(&mut self) -> Result<(), DriveError> {
         if !std::mem::take(&mut self.expect_continue) {
             return Ok(());
         }
         let head = http::Response::builder()
             .status(http::StatusCode::CONTINUE)
             .body(())
-            .map_err(|e| ParseError::new(Reason::Io, e.to_string()))?;
+            .map_err(|e| WriteError::Io(std::io::Error::other(e)))?;
         self.respond
             .send_informational(head)
-            .map_err(|e| ParseError::new(Reason::Io, e.to_string()))
+            .map_err(|e| WriteError::Io(std::io::Error::other(e)))?;
+        Ok(())
     }
 }
 
@@ -511,12 +517,12 @@ impl BodyIo for H2Front {
         &'a mut self,
         body: &'a mut Body,
         cap: u64,
-    ) -> CollectFuture<'a, Result<Collected, ParseError>> {
+    ) -> CollectFuture<'a, Result<Collected, DriveError>> {
         Box::pin(async move {
             self.continue_once()?;
             let c = collect_prefix(body, cap).await;
             if let Some(e) = self.fail.get() {
-                return Err(e);
+                return Err(e.into());
             }
             Ok(c)
         })
@@ -524,7 +530,7 @@ impl BodyIo for H2Front {
 }
 
 impl Front for H2Front {
-    async fn drive<F>(&mut self, fut: F) -> Result<F::Output, ParseError>
+    async fn drive<F>(&mut self, fut: F) -> Result<F::Output, DriveError>
     where
         F: Future + Send,
         F::Output: Send,
@@ -544,14 +550,14 @@ impl Front for H2Front {
                     Err(e) => format!("h2 connection failed: {e}"),
                 };
                 fail.gone.store(true, Ordering::Relaxed);
-                return Err(ParseError::new(Reason::UnexpectedEof, why));
+                return Err(ParseError::new(Reason::UnexpectedEof, why).into());
             }
             out = fut => Some(out),
         };
         if let Some(e) = fail.get() {
-            return Err(e);
+            return Err(e.into());
         }
-        out.ok_or_else(|| ParseError::new(Reason::Io, "request body failed"))
+        out.ok_or_else(|| ParseError::new(Reason::Io, "request body failed").into())
     }
 }
 
