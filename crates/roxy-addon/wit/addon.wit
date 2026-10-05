@@ -48,8 +48,6 @@ interface flow {
   record principal {
     /// Client IP address.
     client-ip: string,
-    /// User from proxy authentication, if any.
-    client-user: option<string>,
     /// Name of the listener the client connected to.
     listener: string,
     /// SNI of the client's TLS connection (intercepted CONNECT), if any.
