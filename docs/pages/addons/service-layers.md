@@ -17,7 +17,7 @@ addons:
     endpoints:
       sidecar: { url: "http://127.0.0.1:9000/layer", private_ok: true }
     limits:
-      first_byte_timeout: 2s            # until each of the service's heads (default 30s)
+      first_byte_timeout: 2s            # to get a stream, then to each of the service's heads (default 30s)
 ```
 
 `path`, `capabilities`, `config`, `audit_endpoint` and the WASM limits are

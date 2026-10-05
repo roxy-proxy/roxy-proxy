@@ -53,9 +53,9 @@ pub use mux::SUBPROTOCOL;
 pub struct ServiceSpec {
     /// The addon's endpoint the exchange streams through.
     pub endpoint: String,
-    /// From asking for a stream until the service's first head (or
-    /// decision), and again from sending the response head until its
-    /// second. Bodies have no clock.
+    /// Bounds getting a stream, then the service's first head (or
+    /// decision) from sending the request head, and its second from
+    /// sending the response head. Bodies have no clock.
     pub first_byte_timeout: Duration,
     /// Connections to the endpoint, at most.
     pub max_connections: usize,
@@ -298,9 +298,8 @@ async fn run(
     svc: &ServiceSpec,
     req: LayerRequest,
 ) -> Result<LayerResponse, Fail> {
-    let start = TokioInstant::now();
-    let (stream, answers) = tokio::time::timeout_at(
-        start + svc.first_byte_timeout,
+    let (stream, answers) = tokio::time::timeout(
+        svc.first_byte_timeout,
         mux::open(st, index, svc, AddonMode::Enforce),
     )
     .await
@@ -312,12 +311,15 @@ async fn run(
     // client went away, a missed head, a failure below) resets the stream.
     let guard = Guard(Some(stream.clone()));
 
+    // The service's first clock starts with the request head, however long
+    // getting the stream took.
+    let sent = TokioInstant::now();
     let (parts, body) = req.into_parts();
     let s = stream.clone();
     let head = request_head(&parts, &body);
     tokio::spawn(async move { s.pump(Dir::Request, head, body).await });
 
-    let first = answer_by(start + svc.first_byte_timeout, answers.first).await??;
+    let first = answer_by(sent + svc.first_byte_timeout, answers.first).await??;
     let forward = match first {
         First::Answer(res) => {
             guard.disarm();

@@ -536,7 +536,9 @@ mod service {
     use super::{RULES, strs};
     use crate::addons::AddonMode;
     use crate::addons::service::testing::{addon, kit, reload};
+    use crate::testkit::upstream::service::SLOW;
     use crate::testkit::{Answer, Kit, streaming_body};
+    use roxy_http::Body;
 
     /// An upstream that answers while the client is still uploading
     /// reaches the client through a pass-through layer at once: the
@@ -572,6 +574,36 @@ mod service {
             kit.sink.events()
         );
         assert_eq!(kit.upstream.service().resets(), []);
+    }
+
+    /// Getting a stream and the service's first answer each have their own
+    /// `first_byte_timeout`: an exchange that waited for the only stream
+    /// still has all of it for the answer.
+    #[tokio::test]
+    async fn waiting_for_a_stream_does_not_shorten_the_first_answer() {
+        let kit = kit(
+            RULES,
+            vec![addon("s", "slow", AddonMode::Enforce, |s| {
+                s.max_connections = 1;
+                s.max_streams = 1;
+                s.first_byte_timeout = SLOW * 3 / 2;
+            })],
+        )
+        .await;
+        let mut a = kit.h1().await;
+        let mut b = kit.h1().await;
+        let first = a.request("GET", "/a", &[]).body(Body::empty()).unwrap();
+        let first = a.start(first);
+        tokio::time::sleep(SLOW / 4).await;
+        // Waits for the stream until the service has answered `first`, and
+        // is answered `SLOW` after that: past `first_byte_timeout` from
+        // the start, within it from its request head.
+        let second = b.request("GET", "/b", &[]).body(Body::empty()).unwrap();
+        let second = b.start(second);
+        for answer in [first, second] {
+            let r: Answer = answer.await.unwrap().unwrap();
+            assert_eq!(r.status, 200, "{r:?}");
+        }
     }
 
     /// What a service sends on an observe stream is discarded and credited
