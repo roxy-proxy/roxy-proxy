@@ -545,6 +545,27 @@ async fn failed_instances_are_discarded() {
     assert_eq!(count(&layer).await, 1);
 }
 
+/// Each host resource a guest holds (fields, bodies, streams) costs host
+/// memory outside its `max_memory`, so the table is capped per instance.
+#[tokio::test]
+async fn a_guest_holding_too_many_resources_fails_closed() {
+    let rt = runtime();
+    let mut cfg = config();
+    cfg.limits.max_instances = 1;
+    let layer = load(&rt, cfg).await;
+    let err = exchange(&layer, Mock::echo(), request("hoard:5000", Body::empty()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, LayerError::Trap(_)), "{err:?}");
+    // Under the cap the same guest answers, on a fresh instance: the
+    // failed one was discarded, not returned to the pool.
+    let (status, body) = exchange(&layer, Mock::echo(), request("hoard:1000", Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "hoarded");
+}
+
 #[tokio::test]
 async fn max_instances_bounds_concurrency() {
     let rt = runtime();
