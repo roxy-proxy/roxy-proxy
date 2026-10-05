@@ -53,6 +53,31 @@ recycles an instance after every exchange.
 `kind: service` addons take a different set of keys
 ([service layers](/addons/service-layers)).
 
+## Capabilities
+
+A WASM layer runs with no access outside its own streams. `capabilities`
+grants it named [host services](/addons/host-services), each a set of
+calls on the `flow` or `endpoints` import:
+
+| capability | grants |
+|---|---|
+| `endpoints` | `endpoints.call`: outbound calls to the layer's named `endpoints`, with roxy attaching the headers |
+| `state` | `flow.state-get`, `flow.state-put`: the layer's keyed store, sized by `state` |
+| `record` | `flow.record`: structured events in the flow log, and `audit_endpoint` |
+| `metrics` | `flow.metric-get`: read a metric for this flow's key |
+| `log` | `flow.log`: roxy's operational log |
+
+Every import is linked whatever is granted, so one binary runs under any
+set; a call the layer was not granted traps with `CapabilityDenied` and
+fails the exchange. `flow.current`, `flow.add-tag` and `flow.config` need
+no capability. There is no `secrets` capability: credentials go on an
+endpoint's `headers`, where the layer never sees them.
+
+Service layers have no capabilities. A service is its own process and
+calls what it needs itself; what roxy gives it is the exchange, the flow's
+identity on `open`, and the endpoint's `headers` on the handshake
+([service layers](/addons/service-layers)).
+
 ## Choosing exchanges
 
 `when` is a condition in the [rule language](/reference/rule-language) over
