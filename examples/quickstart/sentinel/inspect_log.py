@@ -125,22 +125,6 @@ class InspectLog:
             sample.events.append(event)
             self._dirty = True
 
-    def snapshot(self) -> EvalLog:
-        """The log as it stands, for writing off the loop. Messages and
-        events are never changed once logged, so it shares them; only the
-        containers still appended to are copied."""
-        samples = [
-            s.model_copy(
-                update={
-                    "events": list(s.events),
-                    "messages": list(s.messages),
-                    "metadata": {**s.metadata, "roxy_flows": list(s.metadata["roxy_flows"])},
-                }
-            )
-            for s in self._samples.values()
-        ]
-        return self.log.model_copy(update={"samples": samples})
-
     async def run(self) -> None:
         """Writes the log whenever it changed, at most every WRITE_EVERY s."""
         while True:
@@ -148,8 +132,11 @@ class InspectLog:
             if not self._dirty:
                 continue
             self._dirty = False
+            snapshot = self.log.model_copy(
+                update={"samples": [s.model_copy(deep=True) for s in self._samples.values()]}
+            )
             try:
-                await asyncio.to_thread(write_eval_log, self.snapshot(), self.path)
+                await asyncio.to_thread(write_eval_log, snapshot, self.path)
             except Exception as e:  # noqa: BLE001
                 log.warning("could not write %s: %s", self.path, e)
 

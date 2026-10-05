@@ -44,6 +44,7 @@ import importlib
 import json
 import logging
 import os
+import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
@@ -337,36 +338,46 @@ class Sidecar:
         its `message_start` passes at once, pings follow while the rest is
         held and judged, then the rest or, if refused, the explanation."""
         chunks: list[bytes] = []
-        first_event = asyncio.Event()
 
-        async def read_and_judge() -> tuple[bytes, None | bytes | Refusal]:
-            try:
-                async for chunk in ex.response_body():
-                    chunks.append(chunk)
-                    if not first_event.is_set() and b"\n\n" in b"".join(chunks):
-                        first_event.set()
-            finally:
-                first_event.set()
-            raw = b"".join(chunks)
-            return raw, await self.judge(ex, body, res, raw)
+        async def read() -> None:
+            async for chunk in ex.response_body():
+                chunks.append(chunk)
 
-        judging = asyncio.create_task(read_and_judge())
+        reader = asyncio.create_task(read())
+        judging: asyncio.Task[None | bytes | Refusal] | None = None
         try:
-            await first_event.wait()
-            head = b"".join(chunks)
-            end = head.find(b"\n\n")
-            # Anything but the shape we know is held whole, without pings.
-            sent = end + 2 if end != -1 and b"message_start" in head[:end] else 0
-            if sent:
-                yield head[:sent]
-            # A model-backed sentinel may take a while: keep pinging.
+            sent = 0
+            last = time.monotonic()
             while True:
-                done, _ = await asyncio.wait({judging}, timeout=PING_EVERY)
+                done, _ = await asyncio.wait({reader}, timeout=0.5)
+                if not sent:
+                    raw = b"".join(chunks)
+                    end = raw.find(b"\n\n")
+                    if end != -1:
+                        if b"message_start" in raw[:end]:
+                            sent = end + 2
+                            yield raw[:sent]
+                        else:
+                            sent = -1  # not the shape we know: hold everything
+                if done:
+                    break
+                if sent > 0 and time.monotonic() - last >= PING_EVERY:
+                    last = time.monotonic()
+                    yield PING
+            reader.result()
+            raw = b"".join(chunks)
+            sent = max(sent, 0)
+            # A model-backed sentinel may take a while: keep pinging.
+            judging = asyncio.create_task(self.judge(ex, body, res, raw))
+            while True:
+                wait = PING_EVERY - (time.monotonic() - last)
+                done, _ = await asyncio.wait({judging}, timeout=max(wait, 0))
                 if done:
                     break
                 if sent:
+                    last = time.monotonic()
                     yield PING
-            raw, verdict = judging.result()
+            verdict = judging.result()
             if verdict is None or isinstance(verdict, bytes):
                 # Streamed responses are never modified (see judge).
                 yield raw[sent:]
@@ -377,11 +388,13 @@ class Sidecar:
                 error = {"type": "error", "error": {"type": "api_error", "message": verdict.message}}
                 yield f"event: error\ndata: {json.dumps(error)}\n\n".encode()
         finally:
-            # The handler is cancelled here when roxy resets the stream: the
-            # task would otherwise wait on the response for ever, and the
-            # sentinel's verdict is no longer wanted.
-            judging.cancel()
-            await asyncio.wait({judging})
+            # The handler is cancelled here when roxy resets the stream:
+            # the reader would otherwise wait on the response for ever, and
+            # the sentinel's verdict is no longer wanted.
+            tasks = {reader} if judging is None else {reader, judging}
+            for t in tasks:
+                t.cancel()
+            await asyncio.wait(tasks)
 
     async def judge(self, ex: Exchange, body: bytes, res: Response, raw: bytes) -> None | bytes | Refusal:
         """None to pass the response on, new bytes for a modified response,
