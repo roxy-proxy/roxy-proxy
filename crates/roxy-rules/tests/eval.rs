@@ -5,11 +5,10 @@ mod common;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use common::{METRICS, compile, try_compile, try_compile_with};
+use common::{METRICS, compile, try_compile};
 use roxy_rules::{
-    AllowOpts, CaptureTarget, Decision, DefaultDecision, Deny, DenyStatus, Effect, EvalContext,
-    FailClosedReason, Field, LogLevel, MapView, Policy, Reads, RuleKind, Scheme, Value,
-    WatchOutcome,
+    AllowOpts, CaptureTarget, Decision, Deny, DenyStatus, Effect, EvalContext, FailClosedReason,
+    Field, LogLevel, MapView, Policy, Reads, RuleKind, Scheme, Value, WatchOutcome,
 };
 
 fn ip(s: &str) -> Value<'static> {
@@ -458,63 +457,11 @@ fn default_decisions() {
     assert_eq!(out.fail_closed_reason, None);
     assert_eq!(out.matched, Vec::<roxy_rules::RuleId>::new());
 
-    // An empty policy denies (closing) under `default: deny`, and allows
-    // under `default: allow`, granting no allow options.
+    // An empty policy denies everything, closing the connection.
     let empty = compile("", "[]");
     let out = empty.evaluate_head(&other, &EvalContext::empty());
     assert_eq!(out.decision, Decision::default_deny());
     assert_eq!(out.terminal_rule, "_default");
-    let open = try_compile_with("", "[]", DefaultDecision::Allow).unwrap();
-    let out = open.evaluate_head(&other, &EvalContext::empty());
-    assert_eq!(out.decision, Decision::Allow(AllowOpts::default()));
-    assert_eq!(out.terminal_rule, "_default");
-    assert_eq!(open.default_decision(), DefaultDecision::Allow);
-}
-
-/// Under `default: allow`, a deny still wins and the implicit allow grants
-/// no options (no upgrade, no private destinations), even when a matching
-/// rule only has effects.
-#[test]
-fn default_allow_grants_no_options() {
-    let p = try_compile_with(
-        "",
-        r#"
-- id: tagger
-  when: host == "a.example"
-  then: [tag: t, { set_header: { x-a: "1" } }]
-- id: ws
-  when: host == "ws.example"
-  then: { allow: { upgrade: websocket, private_ok: true } }
-- id: no-b
-  when: host == "b.example"
-  then: deny
-"#,
-        DefaultDecision::Allow,
-    )
-    .unwrap();
-    let ctx = EvalContext::empty();
-    let host = |h: &str| MapView::new().with_str(Field::Host, h);
-    let out = p.evaluate_head(&host("a.example"), &ctx);
-    assert_eq!(out.decision, Decision::Allow(AllowOpts::default()));
-    assert_eq!(out.terminal_rule, "_default");
-    assert_eq!(out.matched, ["tagger"].map(roxy_rules::RuleId::new));
-    assert_eq!(
-        out.effects.len(),
-        1,
-        "effects of matching rules still apply"
-    );
-    let out = p.evaluate_head(&host("ws.example"), &ctx);
-    assert_eq!(
-        out.decision,
-        Decision::Allow(AllowOpts {
-            upgrade_websocket: true,
-            private_ok: true
-        })
-    );
-    assert_eq!(out.terminal_rule, "ws");
-    let out = p.evaluate_head(&host("b.example"), &ctx);
-    assert!(out.decision.is_deny());
-    assert_eq!(out.terminal_rule, "no-b");
 }
 
 /// Deny wins regardless of order; the first matching deny is the terminal

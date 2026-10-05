@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::compile::Pred;
-use crate::config::{DefaultDecision, MetricConfig, MetricCount, RuleConfig};
+use crate::config::{MetricConfig, MetricCount, RuleConfig};
 use crate::diag::{Diagnostic, RuleId};
 use crate::eval::{Decision, Deny, Effect, WatchEffect};
 use crate::template::Part;
@@ -25,8 +25,6 @@ pub struct PolicyInput<'a> {
     /// Names defined under `address_lists:` (for `ip in @name`; the data
     /// stays with the proxy).
     pub address_lists: &'a HashSet<String>,
-    /// The top-level `default:` (deny unless the config says `allow`).
-    pub default: DefaultDecision,
 }
 
 /// A compiled metric definition. Counting is the proxy's job; this
@@ -208,7 +206,6 @@ pub struct Policy {
     metrics: Vec<MetricDef>,
     needs_request_body: bool,
     needs_response_body: bool,
-    default: DefaultDecision,
     default_id: RuleId,
     fail_closed_id: RuleId,
 }
@@ -269,7 +266,6 @@ impl Policy {
             metrics,
             needs_request_body: needs.request_body,
             needs_response_body: needs.response_body,
-            default: input.default,
             default_id: RuleId::new(RuleId::DEFAULT),
             fail_closed_id: RuleId::new(RuleId::FAIL_CLOSED),
         })
@@ -320,11 +316,6 @@ impl Policy {
 
     pub fn metric_defs(&self) -> &[MetricDef] {
         &self.metrics
-    }
-
-    /// The `default:` decision.
-    pub fn default_decision(&self) -> DefaultDecision {
-        self.default
     }
 
     /// Number of rules.

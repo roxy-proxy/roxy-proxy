@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
-use roxy_rules::{DefaultDecision, Diagnostic, MetricConfig, Policy, PolicyInput, RuleConfig};
+use roxy_rules::{Diagnostic, MetricConfig, Policy, PolicyInput, RuleConfig};
 
 pub(crate) fn secret_names() -> HashSet<String> {
     ["openai", "gh"].into_iter().map(String::from).collect()
@@ -14,15 +14,6 @@ pub(crate) fn secret_names() -> HashSet<String> {
 /// Deserialise and compile. Structural (serde) errors are returned as a
 /// single message, compile diagnostics as their rendered form.
 pub(crate) fn try_compile(metrics_yaml: &str, rules_yaml: &str) -> Result<Policy, Vec<String>> {
-    try_compile_with(metrics_yaml, rules_yaml, DefaultDecision::Deny)
-}
-
-/// [`try_compile`] with an explicit `default:`.
-pub(crate) fn try_compile_with(
-    metrics_yaml: &str,
-    rules_yaml: &str,
-    default: DefaultDecision,
-) -> Result<Policy, Vec<String>> {
     let metrics: Vec<MetricConfig> = if metrics_yaml.trim().is_empty() {
         Vec::new()
     } else {
@@ -40,7 +31,6 @@ pub(crate) fn try_compile_with(
         metrics: &metrics,
         secret_names: &secrets,
         address_lists: &lists,
-        default,
     })
     .map_err(|ds| ds.iter().map(render).collect())
 }

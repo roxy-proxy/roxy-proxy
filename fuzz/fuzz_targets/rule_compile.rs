@@ -30,7 +30,6 @@ fuzz_target!(|data: &[u8]| {
             metrics: &metrics,
             secret_names: &none,
             address_lists: &none,
-            default: roxy_rules::DefaultDecision::Deny,
         });
     }
 
@@ -51,7 +50,7 @@ fuzz_target!(|data: &[u8]| {
         json!([{ "tag": "t0" }, "allow"]),
     ] {
         let Some(policy) =
-            roxy_fuzz::rules::compile(json!([{ "id": "r", "when": src, "then": then }]), false)
+            roxy_fuzz::rules::compile(json!([{ "id": "r", "when": src, "then": then }]))
         else {
             continue;
         };

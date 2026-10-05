@@ -4,10 +4,9 @@
 use super::{
     CAction, Condition, MetricDef, Part, Policy, WatchAction, WatchState, is_header_value,
 };
-use crate::config::DefaultDecision;
 use crate::diag::RuleId;
 use crate::eval::{
-    AllowOpts, Decision, Deny, Effect, EvalContext, FailClosedReason, Outcome, PendingState, Scope,
+    Decision, Deny, Effect, EvalContext, FailClosedReason, Outcome, PendingState, Scope,
     WatchEffect, WatchOutcome,
 };
 use crate::types::Reads;
@@ -56,8 +55,7 @@ impl Policy {
     /// * else if any matching rule allows, it is allowed (`terminal_rule` =
     ///   the first matching allow, whose options — `upgrade`, `private_ok`
     ///   — are the only ones granted; options are never merged);
-    /// * else the `default:` applies (`_default`; an implicit allow grants
-    ///   no options).
+    /// * else it is denied (`terminal_rule` = `_default`).
     ///
     /// Tags set by a matching rule are visible to the rules below it, and
     /// `state["k"]` sees earlier `set_state` effects. Effects of every
@@ -119,13 +117,7 @@ impl Policy {
         let (decision, terminal_rule) = match (deny, allow) {
             // Deny wins; otherwise the first matching allow.
             (Some((i, d)), _) | (None, Some((i, d))) => (d.clone(), self.rules[i].id.clone()),
-            (None, None) => (
-                match self.default {
-                    DefaultDecision::Deny => Decision::default_deny(),
-                    DefaultDecision::Allow => Decision::Allow(AllowOpts::default()),
-                },
-                self.default_id.clone(),
-            ),
+            (None, None) => (Decision::default_deny(), self.default_id.clone()),
         };
         if !decision.is_allow() {
             refused_effects(&mut effects);

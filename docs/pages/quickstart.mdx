@@ -110,8 +110,6 @@ addons:
     limits:
       first_byte_timeout: 120s  # how long the sentinel has to decide (or start forwarding) before roxy denies the exchange
 
-default: deny
-
 rules:
   - id: claude-api
     when: host == "api.anthropic.com"

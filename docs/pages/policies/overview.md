@@ -1,12 +1,10 @@
 # How policies work
 
 The policy decides what roxy forwards, what it denies, and what it changes
-on the way. It is a list of rules in the config file, plus a `default` for
-anything no rule decides:
+on the way. It is a list of rules in the config file. Anything no rule
+allows is denied:
 
 ```yaml
-default: deny                  # deny (the default) | allow
-
 rules:
   - id: github-reads
     when: host under "github.com" and method in [GET, HEAD]
@@ -33,8 +31,10 @@ runs follows from what it reads.
 1. **The forwarding decision is made at the request head, and deny wins.**
    roxy evaluates every rule whose values are known at that point. If any
    matching rule denies, the request is denied. Otherwise, if any matching
-   rule allows, it is allowed. Otherwise `default` applies, with rule id
-   `_default`. Rule order does not affect the decision. A rule that reads a
+   rule allows, it is allowed. Otherwise it is denied, with rule id
+   `_default`; an empty rule set denies everything. To let traffic through
+   while you find out what a workload reaches, say so with a rule:
+   `{ id: discover, when: host != null, then: allow }`. Rule order does not affect the decision. A rule that reads a
    value not yet known is skipped here, not treated as false.
 2. **After that, rules watch.** For the rest of the exchange, two kinds of
    rule are re-checked whenever a value they read becomes known or changes:

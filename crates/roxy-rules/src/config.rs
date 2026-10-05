@@ -12,36 +12,6 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
-// ----- default decision ---------------------------------------------------
-
-/// What the request head gets when no head rule decides: the
-/// top-level `default:` key.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DefaultDecision {
-    /// Deny 403 with `terminal_rule = "_default"`. The default.
-    #[default]
-    Deny,
-    /// Allow with `terminal_rule = "_default"`, granting no allow options
-    /// (no WebSocket upgrade, no private destinations).
-    Allow,
-}
-
-impl DefaultDecision {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Deny => "deny",
-            Self::Allow => "allow",
-        }
-    }
-}
-
-impl fmt::Display for DefaultDecision {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 // ----- expressions ----------------------------------------------------------
 
 /// An uncompiled DSL expression.

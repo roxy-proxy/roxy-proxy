@@ -16,7 +16,7 @@
 //! ```
 //! use std::collections::HashSet;
 //! use roxy_rules::{
-//!     DefaultDecision, EvalContext, Field, MapView, Policy, PolicyInput, Reads, RuleConfig,
+//!     EvalContext, Field, MapView, Policy, PolicyInput, Reads, RuleConfig,
 //! };
 //!
 //! let rules: Vec<RuleConfig> = serde_yaml_ng::from_str(r#"
@@ -30,7 +30,6 @@
 //! let none = HashSet::new();
 //! let policy = Policy::compile(&PolicyInput {
 //!     rules: &rules, metrics: &[], secret_names: &none, address_lists: &none,
-//!     default: DefaultDecision::Deny,
 //! }).unwrap();
 //! let flow = MapView::new()
 //!     .with_str(Field::Host, "api.github.com")
@@ -64,8 +63,7 @@
 //!   rule top to bottom (watching rules are skipped, not false). A matching
 //!   deny anywhere wins (`terminal_rule` = the first matching deny); else a
 //!   matching allow (the first one; only its `upgrade`/`private_ok` options
-//!   apply); else `default:` (`deny` unless configured `allow`; the
-//!   implicit allow grants no options), `terminal_rule = "_default"`. Tags
+//!   apply); else it is denied, `terminal_rule = "_default"`. Tags
 //!   set by a matching rule are visible to the rules below it. If allowed,
 //!   every matching rule's effects apply in list order (a later
 //!   `set_header` of the same name wins); if denied, only `log`, `tag` and
@@ -168,9 +166,8 @@ mod view;
 
 pub use compile::{REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
 pub use config::{
-    Action, AllowArgs, CaptureTarget, DefaultDecision, DenyArgs, Expr, LogArgs, LogLevel,
-    MetricConfig, MetricCount, PHASE_REMOVED, RedirectArgs, RewritePathArgs, RuleConfig, Scheme,
-    SetStateArgs, Then, Upgrade,
+    Action, AllowArgs, CaptureTarget, DenyArgs, Expr, LogArgs, LogLevel, MetricConfig, MetricCount,
+    PHASE_REMOVED, RedirectArgs, RewritePathArgs, RuleConfig, Scheme, SetStateArgs, Then, Upgrade,
 };
 pub use diag::{Diagnostic, RuleId, Span};
 pub use eval::{

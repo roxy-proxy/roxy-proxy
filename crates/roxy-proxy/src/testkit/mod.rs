@@ -51,7 +51,7 @@ use http_body_util::BodyExt as _;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use roxy_http::{Body, BodySender, HttpFlags, Limits};
-use roxy_rules::{DefaultDecision, Policy, PolicyInput, RuleConfig};
+use roxy_rules::{Policy, PolicyInput, RuleConfig};
 use roxy_tls::{Ca, LeafMinter, UpstreamTlsOptions};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use ulid::Ulid;
@@ -379,7 +379,6 @@ impl KitBuilder {
             metrics: &metric_defs,
             secret_names: &secret_names,
             address_lists: &list_names,
-            default: DefaultDecision::Deny,
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
 
@@ -784,7 +783,6 @@ impl Kit {
             metrics: &[],
             secret_names: &secret_names,
             address_lists: &list_names,
-            default: DefaultDecision::Deny,
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
         self.server

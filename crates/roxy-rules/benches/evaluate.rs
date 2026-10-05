@@ -5,9 +5,7 @@ use std::fmt::Write as _;
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use roxy_rules::{
-    DefaultDecision, EvalContext, Field, MapView, Policy, PolicyInput, Reads, RuleConfig, Value,
-};
+use roxy_rules::{EvalContext, Field, MapView, Policy, PolicyInput, Reads, RuleConfig, Value};
 
 /// 99 rules that do not match the benchmark request (a mix of every
 /// operator kind), then the rule that allows it.
@@ -54,7 +52,6 @@ fn policy() -> Policy {
         metrics: &metrics,
         secret_names: &none,
         address_lists: &none,
-        default: DefaultDecision::Deny,
     })
     .unwrap()
 }
