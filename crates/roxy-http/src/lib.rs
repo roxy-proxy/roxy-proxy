@@ -21,6 +21,9 @@
 
 // Casts go through `From` / `TryFrom`, so a narrowing one cannot slip in.
 #![warn(clippy::as_conversions)]
+// Length and offset arithmetic on untrusted input is checked, so a broken
+// invariant fails the message instead of wrapping.
+#![warn(clippy::arithmetic_side_effects)]
 
 mod chars;
 pub mod coding;
