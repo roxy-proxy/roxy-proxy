@@ -276,13 +276,13 @@ fn units() {
 #[test]
 fn null_is_a_value_for_equality_and_membership() {
     check(&[
-        ("tls.sni == null", true),
-        ("tls.sni != null", false),
+        ("tls.alpn == null", true),
+        ("tls.alpn != null", false),
         ("host != null", true),
-        ("tls.sni == \"x\"", false),
-        ("tls.sni != \"x\"", true),
-        ("tls.sni in [\"x\"]", false),
-        ("tls.sni not in [\"x\"]", true),
+        ("tls.alpn == \"x\"", false),
+        ("tls.alpn != \"x\"", true),
+        ("tls.alpn in [\"x\"]", false),
+        ("tls.alpn not in [\"x\"]", true),
         ("header[\"x-missing\"] != \"a\"", true),
         ("header[\"x-missing\"] == null", true),
         ("query[\"nope\"] == \"\"", false),
@@ -290,7 +290,7 @@ fn null_is_a_value_for_equality_and_membership() {
         ("tls.alpn != \"h2\"", true),
         // Guarding with `!= null` short-circuits before the operator that
         // cannot answer for null.
-        ("tls.sni != null and tls.sni starts_with \"a\"", false),
+        ("tls.alpn != null and tls.alpn starts_with \"a\"", false),
     ]);
 }
 
