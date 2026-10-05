@@ -287,8 +287,12 @@ async fn layers_carry_a_websocket_in_their_bodies() {
     assert_eq!(echo(&mut io, b"hello").await, b"HELLO");
     assert_eq!(echo(&mut io, b"again").await, b"AGAIN");
     drop(io);
+    let close = kit.events("ws_close", 1).await;
+    assert_eq!(close[0]["bytes_c2s"], 10, "{close:#?}");
+    assert_eq!(close[0]["bytes_s2c"], 10, "{close:#?}");
     let ev = kit.request_event().await;
     assert_eq!(strs(&ev["addons"]), ["a", "b", "c"], "{ev:#}");
+    assert_eq!(ev["terminal_rule"], "ws");
     let tags = strs(&ev["tags"]);
     for t in ["via:a", "via:b", "via:c"] {
         assert!(tags.iter().any(|x| x == t), "{t} in {tags:?}");
@@ -741,4 +745,201 @@ mod service {
             "the secret is nowhere in the capture"
         );
     }
+}
+
+// ---- one layer: effects, limits, capabilities -----------------------------
+
+const SECRET: &str = "s3cr3t-token-value-0123456789";
+
+/// A single test layer `t` in front of the default rules.
+async fn one(def: AddonDef) -> Kit {
+    Kit::builder().addon(def).start().await
+}
+
+/// `x-test-t: caps` with `x-cap`.
+async fn cap(kit: &Kit, cap: &str) -> super::Answer {
+    kit.h1()
+        .await
+        .call("POST", "/x", &[("x-test-t", "caps"), ("x-cap", cap)], b"")
+        .await
+}
+
+#[tokio::test]
+async fn a_rewrite_reaches_the_upstream() {
+    let kit = one(AddonDef::test_layer("t")).await;
+    let a = kit
+        .h1()
+        .await
+        .call("POST", "/fine", &[("x-test-t", "rewrite")], b"original")
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["path"], "/rewritten");
+    assert_eq!(a.json()["body_len"], 8, "replaced");
+}
+
+/// Each budget fails the exchange closed with a `layer_error` naming it.
+#[tokio::test]
+async fn limits_are_enforced() {
+    let kit = one(AddonDef::test_layer("t").limits(|l| {
+        l.max_memory = 16 << 20;
+        l.first_byte_timeout = std::time::Duration::from_millis(500);
+    }))
+    .await;
+    for (i, (test, kind)) in [
+        ("loop", "budget:first_byte_timeout"),
+        ("memory", "budget:max_memory"),
+        ("host-loop", "budget:first_byte_timeout"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let a = kit
+            .h1()
+            .await
+            .call("GET", "/x", &[("x-test-t", test)], b"")
+            .await;
+        assert_eq!(a.status, 503, "{test}: {a:?}");
+        let errs = kit.events("layer_error", i + 1).await;
+        assert_eq!(errs[i]["kind"], kind, "{test}: {errs:#?}");
+    }
+}
+
+/// Bodies have no clock: a response that streams for several times the
+/// head deadline goes through a layer whole.
+#[tokio::test]
+async fn a_long_stream_goes_through_whole() {
+    let kit = one(AddonDef::test_layer("t")
+        .limits(|l| l.first_byte_timeout = std::time::Duration::from_millis(200)))
+    .await;
+    let a = kit
+        .h1()
+        .await
+        .call("GET", "/drip?n=6&ms=100", &[], b"")
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.text(), "chunk0;chunk1;chunk2;chunk3;chunk4;chunk5;");
+}
+
+/// A client that gives up frees the layer's instance: with one instance,
+/// the next exchange gets it.
+#[tokio::test]
+async fn a_client_giving_up_frees_the_instance() {
+    use http_body_util::BodyExt as _;
+    let kit = one(AddonDef::test_layer("t").limits(|l| l.max_instances = 1)).await;
+    let mut c = kit.h1().await;
+    let req = c
+        .request("GET", "/drip?n=1000&ms=50", &[])
+        .body(roxy_http::Body::empty())
+        .unwrap();
+    let mut res = c.send(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(res.body_mut().frame().await.unwrap().is_ok());
+    c.kill();
+    drop(res);
+    let a = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        kit.h1().await.call("GET", "/after", &[], b""),
+    )
+    .await
+    .expect("the instance was freed");
+    assert_eq!(a.status, 200, "{a:?}");
+}
+
+/// An observer that overruns its head deadline is logged, and the real
+/// exchange goes through.
+#[tokio::test]
+async fn an_observer_that_times_out_is_logged_only() {
+    let kit = one(AddonDef::test_layer("t")
+        .observe()
+        .limits(|l| l.first_byte_timeout = std::time::Duration::from_millis(200)))
+    .await;
+    let a = kit
+        .h1()
+        .await
+        .call("POST", "/observed", &[("x-test-t", "loop")], b"payload")
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["body_len"], 7);
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["mode"], "observe", "{errs:#?}");
+    assert_eq!(errs[0]["kind"], "budget:first_byte_timeout");
+}
+
+fn endpoint_layer(url: &str, private_ok: bool) -> AddonDef {
+    AddonDef::test_layer("t")
+        .caps(&[roxy_wasm::Capability::Endpoints])
+        .endpoint(
+            "monitor",
+            url,
+            &[("x-api-key", "${secret:token}")],
+            private_ok,
+        )
+}
+
+/// roxy attaches an endpoint's credential on the way out; the layer and
+/// the flow log never see it.
+#[tokio::test]
+async fn endpoint_credentials_never_reach_the_layer() {
+    let kit = Kit::builder()
+        .secret("token", SECRET)
+        .addon(endpoint_layer("https://up.test/monitor", true))
+        .start()
+        .await;
+    let a = cap(&kit, "endpoint").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let text = a.text();
+    assert!(text.starts_with("200 "), "{text}");
+    assert!(!text.contains(SECRET));
+    let seen = kit.upstream.wait_seen(1).await;
+    let call = seen
+        .iter()
+        .find(|s| s.path == "/monitor/score?q=1")
+        .unwrap_or_else(|| panic!("{seen:#?}"));
+    assert_eq!(call.headers["x-api-key"], SECRET);
+    let calls = kit.events("endpoint_call", 1).await;
+    assert_eq!(calls[0]["endpoint"], "monitor");
+    assert_eq!(calls[0]["status"], 200);
+    assert!(!serde_json::to_string(&calls).unwrap().contains(SECRET));
+}
+
+/// An endpoint on a private address without `private_ok` is refused; the
+/// test layer treats a failed call as fatal, so the exchange fails closed.
+#[tokio::test]
+async fn endpoints_respect_the_address_floor() {
+    let kit = Kit::builder()
+        .secret("token", SECRET)
+        .addon(endpoint_layer("https://private.test/monitor", false))
+        .start()
+        .await;
+    let a = cap(&kit, "endpoint").await;
+    assert_eq!(a.status, 503, "{a:?}");
+    assert!(
+        kit.upstream.seen().is_empty(),
+        "the private endpoint was not reached"
+    );
+    let calls = kit.events("endpoint_call", 1).await;
+    assert_eq!(calls[0]["status"], serde_json::Value::Null);
+    assert_eq!(calls[0]["error"], "endpoint address denied");
+}
+
+/// `record` and `state` work with their capabilities; a call without its
+/// capability fails the flow closed.
+#[tokio::test]
+async fn records_and_state_reach_the_flow_log() {
+    use roxy_wasm::Capability;
+    let kit = one(AddonDef::test_layer("t").caps(&[Capability::Record, Capability::State])).await;
+    let a = cap(&kit, "record").await;
+    assert_eq!(a.text(), "ok", "{a:?}");
+    let r = kit.events("layer_record", 1).await;
+    assert_eq!(r[0]["kind"], "verdict");
+    assert_eq!(r[0]["data"]["score"], 0.9);
+    assert_eq!(r[0]["audit"], true);
+
+    let a = cap(&kit, "state").await;
+    assert_eq!(a.text(), "Ok(()) Some(\"{\\\"n\\\":1}\")", "{a:?}");
+
+    let a = cap(&kit, "metric").await;
+    assert_eq!(a.status, 503, "{a:?}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["kind"], "capability:metrics");
 }
