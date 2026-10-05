@@ -57,3 +57,8 @@ tls:
 | a target roxy cannot dial (no host, an unknown scheme) | `502` | `upstream_error`, reason `invalid_target` |
 | timeout | `504` | `upstream_error`, reason `timeout` |
 | a response roxy cannot canonicalise | `502` | `upstream_error`, reason `protocol_error` |
+
+Every row answers with the same body
+([Deny responses](/reference/http#deny-responses)); the reason is in the
+flow log only, so a client cannot tell a name that does not resolve from a
+port that is closed.

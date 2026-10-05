@@ -608,7 +608,7 @@ fn fail_closed(reason: FailClosedReason) -> impl Fn(&roxy_rules::Outcome) {
             out.decision,
             Decision::Deny {
                 status: DenyStatus::new(503).unwrap(),
-                message: "policy input unavailable".into(),
+                message: "blocked by roxy".into(),
                 close: true
             }
         );
