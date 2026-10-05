@@ -108,7 +108,7 @@ addons:
     endpoints:
       sidecar: { url: "http://sentinel:9000/", private_ok: true }
     limits:
-      first_byte_timeout: 120s  # a held (non-streamed) response arrives whole
+      first_byte_timeout: 120s  # a non-streamed response is judged whole before the sidecar answers
 
 default: deny
 
