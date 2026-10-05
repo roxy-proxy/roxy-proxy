@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use super::link::{Link, LinkShared, LinkState, Queued, binary};
 use super::lock;
 use super::pool::Pool;
-use super::stream::{Answers, MAX_BODY_FRAME, Stream, StreamState, open};
+use super::stream::{Answers, MAX_BODY_FRAME, Phase, Stream, StreamState, open};
 use crate::addons::service::testing;
 use crate::addons::service::{First, In, Unanswered};
 use crate::addons::{AddonImpl, AddonMode};
@@ -55,11 +55,13 @@ async fn lone_stream() -> (Arc<Stream>, Answers, crate::testkit::Kit) {
         st,
         index: 0,
         mode: AddonMode::Enforce,
-        state: Mutex::new(StreamState {
-            first: Some(first_tx),
-            second: Some(second_tx),
-            ..StreamState::default()
-        }),
+        state: Mutex::new(StreamState::new(
+            Phase::AwaitingFirst {
+                first: first_tx,
+                second: second_tx,
+            },
+            None,
+        )),
         more_credit: Notify::new(),
         ended: CancellationToken::new(),
         wire: Arc::default(),
@@ -103,14 +105,17 @@ async fn a_response_head_arrives_while_the_request_body_streams() {
         res.into_body().collect_up_to(u64::MAX).await.unwrap(),
         &b"down"[..]
     );
-    assert!(!lock(&stream.state).ended, "the request body is still owed");
+    assert!(
+        !lock(&stream.state).ended(),
+        "the request body is still owed"
+    );
     stream.bytes(Dir::Request, b"load");
     stream.control(In::RequestEnd);
     assert_eq!(
         req.into_body().collect_up_to(u64::MAX).await.unwrap(),
         &b"upload"[..]
     );
-    assert!(lock(&stream.state).ended);
+    assert!(lock(&stream.state).ended());
 }
 
 /// A `101` from the service answers an upgrade only: on an ordinary
@@ -126,7 +131,7 @@ async fn a_101_on_an_exchange_that_is_not_an_upgrade_fails_the_stream() {
         status: 101,
         headers: Vec::new(),
     });
-    assert!(lock(&stream.state).ended);
+    assert!(lock(&stream.state).ended());
     let e = answers.second.await.unwrap().unwrap_err();
     assert!(e.to_string().contains("status 101"), "{e}");
 }
@@ -141,7 +146,7 @@ async fn bytes_of_a_body_without_a_head_fail_the_stream() {
         panic!("the request is forwarded");
     };
     stream.bytes(Dir::Response, b"early");
-    assert!(lock(&stream.state).ended);
+    assert!(lock(&stream.state).ended());
     assert!(req.into_body().collect_up_to(u64::MAX).await.is_err());
     let e = answers.second.await.unwrap().unwrap_err();
     assert!(
