@@ -6,7 +6,8 @@
   client ──TCP──▶  listener: explicit proxy, or direct (reached through roxy's DNS)
                      ▼
                    CONNECT: proxy auth; first bytes must be a TLS ClientHello
-                     ▼      whose SNI matches the CONNECT host
+                     ▼      whose SNI matches the CONNECT host (the defaults:
+                            http.allow_plain_in_connect, tls.require_sni_match)
                             (direct: the SNI or Host is the target)
                    TLS termination (leaf minted by roxy's CA), ALPN h1 | h2
                      ▼
@@ -58,8 +59,11 @@ snapshot it started with.
 
 ## Crates
 
-Dependencies point downward: `roxy` → `roxy-proxy` → {`roxy-http`,
-`roxy-tls`, `roxy-rules`, `roxy-dns`, `roxy-wasm`, `roxy-log`}.
+Dependencies point downward. `roxy` depends on `roxy-proxy`, `roxy-http`,
+`roxy-rules`, `roxy-tls` and `roxy-wasm`; `roxy-proxy` on `roxy-http`,
+`roxy-tls`, `roxy-rules`, `roxy-dns`, `roxy-wasm` and `roxy-log`;
+`roxy-rules` and `roxy-wasm` on `roxy-http`. `roxy-http`, `roxy-dns`,
+`roxy-tls`, `roxy-log` and `roxy-addon` depend on no other roxy crate.
 `roxy-http`, `roxy-rules` and `roxy-dns` do no network I/O, so they can be
 unit-tested and fuzzed directly.
 

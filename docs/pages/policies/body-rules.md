@@ -1,13 +1,15 @@
 # Body rules
 
-`body.text` and `response.body.text` are the only fields that buffer. For an
-exchange whose other predicates match, roxy collects the body up to
-`limits.max_inspect_body_bytes` (1 MiB), evaluates, then streams the bytes
-on. A larger body **fails closed** (`_fail_closed`, reason
+`body.text` and `response.body.text` are the only fields that buffer. If
+any rule reads `body.text`, roxy collects every request body up to
+`limits.max_inspect_body_bytes` (1 MiB) before the head decision, evaluates,
+then streams the bytes on; `response.body.text` does the same for every
+response body. A body over the cap is **unavailable**, and a rule that
+reads it **fails closed** (`_fail_closed`, reason
 `body_too_large_to_inspect`). Raise the cap to inspect larger bodies, or
 scope the rule (`body.size != null and body.size < 1mb and ...`) so it
-short-circuits before the body is touched. Rules that do not read a body
-never buffer.
+short-circuits before reading the text: that avoids the fail-closed, not
+the buffering. A policy with no rule reading a body never buffers.
 
 The text is the body decoded by its `content-encoding` (`gzip`, `deflate`,
 `br`, `zstd`, stacked or not; [HTTP](/reference/http#content-codings)), then read

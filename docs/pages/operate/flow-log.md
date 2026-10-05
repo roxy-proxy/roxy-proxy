@@ -21,12 +21,19 @@ produces a `request` event:
 - `terminal_rule` is what decided: a rule id, or `_default`,
   `_fail_closed`, `_address_policy` or `layer:<name>` for built-in
   decisions.
-- `reason` is a stable code when the exchange failed closed or failed
-  (`body_too_large_to_inspect`, `body_decode_failed`, `missing_value`,
-  `upstream_timeout`, ...). An exchange roxy could not finish has
-  `aborted` (its connection ended, or the server stopped, while it was in
-  flight); an exchange cut short because the client went away has
-  `client_gone`.
+- `reason` is a stable code when the exchange failed closed or failed.
+  With `terminal_rule: _fail_closed` it is one of: `metric_unavailable`,
+  `metric_key_unavailable`, `metric_table_full`,
+  `address_list_unavailable`, `secret_missing`, `secret_invalid`,
+  `body_too_large_to_inspect`, `body_unavailable`,
+  `unsupported_content_encoding`, `body_decode_failed`, `missing_value`,
+  `effect_invalid`, `unsupported_effect`, `state_unavailable`,
+  `capture_unavailable`, `watch_missing` or `watch_stopped`. With
+  `_address_policy` it is `address_policy`; an upstream failure carries
+  the `upstream_error` reason (`timeout`, `connect_failed`, ...). An
+  exchange roxy could not finish has `aborted` (its connection ended, or
+  the server stopped, while it was in flight); an exchange cut short
+  because the client went away has `client_gone`.
 - `stage` says where the decision was made: `head` for the forwarding
   decision, or where a watching rule stopped the exchange: `request_body`,
   `response_head`, `response_body`, `websocket`.

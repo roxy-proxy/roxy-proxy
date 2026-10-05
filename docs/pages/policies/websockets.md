@@ -21,8 +21,19 @@ checks that the upstream answered `101` with a correct
 traffic in both directions until either side closes. Connecting, the
 upgrade request and taking over the upgraded connection share one
 `limits.response_header_timeout`; the client is sent the `101` only once
-roxy holds the upstream side, so a failed upgrade is a `502`, not a `101`
-followed by a close.
+roxy holds the upstream side, so a failed upgrade is an error response,
+not a `101` followed by a close:
+
+- a client upgrade request that is not a valid WebSocket handshake (not
+  `GET`, not HTTP/1.1, a body, a `Sec-WebSocket-Version` other than 13, a
+  missing or repeated `Sec-WebSocket-Key`) is `400`, `terminal_rule:
+  _websocket`, reason `ws_bad_handshake`;
+- running out of `response_header_timeout` is `504`;
+- an upstream that answers anything other than `101` has its answer
+  relayed as it is, like any response;
+- a `101` with a wrong `Sec-WebSocket-Accept`, or one that accepts an
+  extension when none may be negotiated ([below](#extensions)), is `502`,
+  `upstream_error` with reason `protocol_error`.
 
 How it relays depends on the policy. If no rule reads a `ws.*` field, roxy
 splices bytes: no frame parsing, re-masking or reassembly. Subprotocols
@@ -42,9 +53,12 @@ Either way:
   directions as relayed.
 - A relayed WebSocket closes after `limits.idle_timeout` (300 s) with no
   traffic either way.
-- The flow log gets one `ws_open` and one `ws_close` event, with byte
-  counts. When roxy ended the WebSocket with a close frame, `ws_close` has
-  `close_code` and `close_reason`.
+- The flow log gets one `ws_open` event, naming the `host`, and one
+  `ws_close` with `bytes_c2s` and `bytes_s2c`. When roxy ended the
+  WebSocket with a close frame, `ws_close` has `close_code` and
+  `close_reason`. The exchange's `request` event follows `ws_close`, with
+  `res.status: 101` and the relayed byte totals as its request and
+  response `body_bytes`.
 - Addon layers carry the WebSocket in their bodies, between the client
   and the relay ([addons](/addons/overview#websockets)), so message rules
   see what the layers pass on.
@@ -93,9 +107,11 @@ rules:
 | `ws.size` | the message's payload length in bytes |
 | `ws.text` | a text message's text; `null` for every other opcode |
 
-`ws.text` is `null` on binary and control messages, and an operator other
-than `==` or `!=` on `null` fails closed. Guard text rules with
-`ws.opcode == 1 and ...`, or the first ping closes the WebSocket.
+`ws.text` is `null` on binary and control messages. `==`, `!=`, `in` and
+`not in` treat `null` as an ordinary value; any other operator on it fails
+closed ([missing values](/reference/rule-language#missing-values-null)).
+Guard text rules with `ws.opcode == 1 and ...`, or the first ping closes
+the WebSocket.
 
 Control messages (close, ping, pong) are checked like data messages, so
 their payloads cannot carry what a rule forbids. An allowlist is a deny of
@@ -135,8 +151,8 @@ only once it is complete.
 
 ### Logging
 
-A denied message is logged as a `ws_message` event with its direction,
-opcode, size and the denying rule. `log.flow.ws_message_every: N` also logs
+A denied message is logged as a `ws_message` event with its `direction`,
+`opcode`, `size`, `decision` and the `rules` that matched. `log.flow.ws_message_every: N` also logs
 every Nth checked message of each WebSocket (`0`, the default, logs only
 denied ones). Message payloads are never logged.
 

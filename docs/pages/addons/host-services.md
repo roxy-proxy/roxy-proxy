@@ -61,6 +61,5 @@ are refused. `flow.log` writes to roxy's operational log with the flow id
 and layer name.
 
 There is no `secrets` capability (the config refuses it and points to
-endpoint `headers`), and no way to terminate or quarantine a client
-(issue #28): a layer denies the exchange and reports through `record` or an
-endpoint.
+endpoint `headers`), and no way to terminate or quarantine a client: a
+layer denies the exchange and reports through `record` or an endpoint.

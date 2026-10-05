@@ -13,7 +13,7 @@ The policy is one YAML file. Rules are a list of allows plus the denies that res
 
 Logic that needs to understand the traffic goes in an addon: a WASM component that runs in process, or an external service that the traffic streams through. Addons can rewrite, withhold, answer or block. Whatever an addon passes on is judged by the rules again.
 
-It fails closed. If roxy can't parse, verify or classify something, it denies it. A broken config is not loaded, a failing addon denies the flow, and a missing metric or secret denies rather than allows.
+It fails closed. If roxy can't parse, verify or classify something, it denies it. A broken config is not loaded, a failing addon in `enforce` mode denies the flow (an `observe` addon's failure is only logged), and a missing metric or secret denies rather than allows.
 
 ## Try it
 
@@ -31,7 +31,11 @@ If you want to see a real policy before you commit, read the [use cases](#use-ca
 ## A policy
 
 ```yaml
+version: 1
 default: deny
+
+listeners:
+  - { name: proxy, bind: 127.0.0.1:3128 }
 
 secrets:
   openai: { env: OPENAI_API_KEY }
@@ -52,7 +56,8 @@ rules:
     then: { deny: { status: 413 } }
 ```
 
-You can try a policy without sending traffic:
+Saved as `roxy.yaml`, that is a complete config. You can try a policy
+without sending traffic:
 
 ```sh
 roxy rule test --config roxy.yaml POST https://api.openai.com/v1/responses
@@ -65,7 +70,9 @@ The full language is in [rules](/reference/rule-language).
 Addons sit above the rules and own both streams of the exchanges they
 choose. This one judges an agent's model calls with a monitor model before
 they leave, and a second addon gets a copy of one write in ten for an
-external audit service:
+external audit service. This is the `addons:` section of a config; it needs
+the WASM file at `path`, a `monitor_key` secret and listeners and rules
+around it:
 
 ```yaml
 addons:                                    # above the rules, outermost first
@@ -89,7 +96,7 @@ addons:                                    # above the rules, outermost first
 ```
 
 Whatever `sentinel` passes on is still judged by the rules. If it fails, the
-flow is denied. [Addons](/addons/overview) covers the model,
+flow is denied; `audit-tap` observes, so its failure is only logged. [Addons](/addons/overview) covers the model,
 [writing one](/addons/writing) the SDK.
 
 ## What roxy is not

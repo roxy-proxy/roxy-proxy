@@ -41,9 +41,11 @@ reaches it.
 
 ## Fail closed
 
-Anything roxy cannot parse, verify or classify is dropped. An empty rule set
-denies everything. A config that fails to compile is not loaded, and a
-failed reload keeps the running policy. An addon that fails denies the flow.
+Anything roxy cannot parse, verify or classify is dropped. Under
+`default: deny`, an empty rule set denies everything. A config that fails
+to compile is not loaded, and a failed reload keeps the running policy. An
+addon in `enforce` mode that fails denies the flow; an `observe` addon
+cannot affect traffic, so its failure is logged and the flow goes on.
 A policy input that is unavailable (a full metric table, a list that failed
 to load, a missing secret, a body too large to inspect) denies the flow
 rather than making a predicate false. Nothing in roxy turns "could not
