@@ -63,6 +63,7 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
+wildcard_enum_match_arm = "warn"
 
 # The wasm compiler runs in debug test builds (every addon test compiles a
 # component); unoptimised it takes about a second per component.

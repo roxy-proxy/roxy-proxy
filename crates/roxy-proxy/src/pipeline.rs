@@ -792,7 +792,12 @@ pub(crate) fn body_failure(e: &BodyError) -> ParseError {
         BodyError::Invalid(pe) => pe.clone(),
         BodyError::TooLarge { .. } => ParseError::new(Reason::BodyTooLarge, e.to_string()),
         BodyError::Timeout => ParseError::new(Reason::BodyTimeout, e.to_string()),
-        _ => ParseError::new(Reason::UnexpectedEof, e.to_string()),
+        BodyError::LengthMismatch
+        | BodyError::Incomplete
+        | BodyError::Closed
+        | BodyError::Upstream(_)
+        | BodyError::Stopped
+        | BodyError::Undecodable(_) => ParseError::new(Reason::UnexpectedEof, e.to_string()),
     }
 }
 

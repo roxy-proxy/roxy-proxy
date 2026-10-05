@@ -255,7 +255,20 @@ impl Field {
             | Self::ResponseBodyBytes
             | Self::WsOpcode
             | Self::WsSize => Type::Int,
-            _ => Type::Str,
+            Self::ClientUser
+            | Self::ListenerName
+            | Self::ListenerMode
+            | Self::TlsSni
+            | Self::TlsAlpn
+            | Self::TlsVersion
+            | Self::Method
+            | Self::Scheme
+            | Self::Host
+            | Self::Path
+            | Self::Url
+            | Self::QueryRaw
+            | Self::WsDirection
+            | Self::WsText => Type::Str,
         }
     }
 
@@ -273,7 +286,22 @@ impl Field {
             Self::ResponseStatus | Self::ResponseBodySize => Reads::RESPONSE_HEAD,
             Self::ResponseBodyBytes => Reads::RESPONSE_BODY_BYTES,
             Self::WsDirection | Self::WsOpcode | Self::WsSize | Self::WsText => Reads::WS,
-            _ => Reads::NONE,
+            Self::ClientIp
+            | Self::ClientPort
+            | Self::ClientUser
+            | Self::ListenerName
+            | Self::ListenerMode
+            | Self::TlsSni
+            | Self::TlsAlpn
+            | Self::TlsVersion
+            | Self::Method
+            | Self::Scheme
+            | Self::Host
+            | Self::Port
+            | Self::Path
+            | Self::Url
+            | Self::QueryRaw
+            | Self::BodySize => Reads::NONE,
         }
     }
 
@@ -331,7 +359,12 @@ impl Access {
             Self::HeaderAll(_) | Self::RespHeaderAll(_) => Type::StrList,
             Self::Tag(_) => Type::Bool,
             Self::Metric(_) => Type::Int,
-            _ => Type::Str,
+            Self::Header(_)
+            | Self::RespHeader(_)
+            | Self::Query(_)
+            | Self::State(_)
+            | Self::BodyText
+            | Self::RespBodyText => Type::Str,
         }
     }
 

@@ -183,7 +183,7 @@ impl Config {
                     "`strict+extra_roots` requires at least one entry in extra_roots",
                 ));
             }
-            _ => {}
+            UpstreamVerify::Strict | UpstreamVerify::StrictExtraRoots => {}
         }
         match (&self.tls.ca_cert, &self.tls.ca_key) {
             (Some(_), None) => d.push(Diagnostic::new(

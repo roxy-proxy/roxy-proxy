@@ -81,7 +81,9 @@ impl From<WriteError> for WriteFailure {
         match e {
             WriteError::Io(e) => Self::ClientGone(e.to_string()),
             WriteError::Body(BodyError::Stopped) => Self::Stopped,
-            e => Self::Io(e.to_string()),
+            e @ (WriteError::Body(_) | WriteError::Request(_) | WriteError::State(_)) => {
+                Self::Io(e.to_string())
+            }
         }
     }
 }
@@ -125,13 +127,14 @@ where
     let stop = cx.watch.as_ref().and_then(|w| w.stopped());
     // Under a stop, the cut body is how the stop is delivered, not a
     // failure of its own.
+    let failure = match r {
+        Ok(()) | Err(WriteFailure::Stopped) => None,
+        Err(e @ WriteFailure::ClientGone(_)) => Some(("client_gone", e)),
+        Err(e @ WriteFailure::Io(_)) => Some(("response_write_failed", e)),
+    };
     if stop.is_none()
-        && let Err(e @ (WriteFailure::ClientGone(_) | WriteFailure::Io(_))) = r
+        && let Some((reason, e)) = failure
     {
-        let reason = match e {
-            WriteFailure::ClientGone(_) => "client_gone",
-            _ => "response_write_failed",
-        };
         cx.shared.sink.emit(&FlowEvent::ResponseError {
             ts: chrono::Utc::now(),
             flow: cx.flow.to_string(),
@@ -1256,7 +1259,7 @@ async fn relay_messages(
             };
             match e {
                 End::Eof if !(a_done && b_done) => {}
-                e => break e,
+                e @ (End::Eof | End::Broken | End::Stopped | End::Protocol(_)) => break e,
             }
         }
     };

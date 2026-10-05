@@ -89,9 +89,10 @@ pub enum LayerError {
 impl LayerError {
     /// The budget this error reports, if any.
     pub fn budget(&self) -> Option<Budget> {
-        match self {
-            LayerError::BudgetExceeded(b) => Some(*b),
-            _ => None,
+        if let LayerError::BudgetExceeded(b) = self {
+            Some(*b)
+        } else {
+            None
         }
     }
 }
@@ -99,7 +100,6 @@ impl LayerError {
 /// Why a layer could not be loaded. A layer that fails to load fails the
 /// config load; roxy keeps its old policy.
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub enum LoadError {
     /// The bytes are not a valid component, or compilation failed.
     #[error("layer `{layer}`: compile failed: {message}")]

@@ -425,14 +425,7 @@ async fn terminate_tls(
             alpn: sc
                 .alpn_protocol()
                 .map(|p| String::from_utf8_lossy(p).into_owned()),
-            version: sc.protocol_version().map(|v| {
-                match v {
-                    rustls::ProtocolVersion::TLSv1_3 => "1.3",
-                    rustls::ProtocolVersion::TLSv1_2 => "1.2",
-                    _ => "other",
-                }
-                .to_owned()
-            }),
+            version: sc.protocol_version().map(|v| tls_version(v).to_owned()),
         }
     };
     if info.alpn.as_deref() == Some("h2") {
@@ -493,5 +486,17 @@ async fn tunnel_loop(
                 return;
             }
         }
+    }
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "rustls::ProtocolVersion is non_exhaustive"
+)]
+fn tls_version(v: rustls::ProtocolVersion) -> &'static str {
+    match v {
+        rustls::ProtocolVersion::TLSv1_3 => "1.3",
+        rustls::ProtocolVersion::TLSv1_2 => "1.2",
+        _ => "other",
     }
 }

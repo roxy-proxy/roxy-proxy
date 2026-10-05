@@ -6,7 +6,7 @@ use std::net::{IpAddr, Ipv6Addr};
 
 use ipnet::IpNet;
 
-use crate::ast::Unit;
+use crate::ast::{Lit, Op, Unit};
 use crate::diag::{ExprError, Span};
 
 /// Longest expression accepted, in bytes. Generous for hand-written rules;
@@ -17,35 +17,15 @@ pub(crate) const MAX_EXPR_BYTES: usize = 64 * 1024;
 pub(crate) enum Tok {
     /// Field path segment (`host`, `client`, `ip`, metric ids).
     Ident(String),
-    /// Bare `[A-Z][A-Z_]*` identifier: an HTTP method literal.
-    Upper(String),
-    Str(String),
-    /// Integer as written plus its unit; the scaled value is checked to fit.
-    Int(i64, Option<Unit>),
-    Ip(IpAddr),
-    Cidr(IpNet),
-    /// `@name`: a named address list.
-    ListRef(String),
-    True,
-    False,
-    /// `null`: the value of anything not present.
-    Null,
+    /// A single literal as written. Never `Lit::List`: the parser builds
+    /// lists from brackets.
+    Lit(Lit),
+    /// A comparison operator. Never `Op::NotIn`, which is the two tokens
+    /// `not` `in`.
+    Op(Op),
     And,
     Or,
     Not,
-    In,
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    StartsWith,
-    EndsWith,
-    Contains,
-    Like,
-    Matches,
-    Under,
     LParen,
     RParen,
     LBracket,
@@ -59,46 +39,31 @@ impl Tok {
     /// How the token is shown in "found ..." messages.
     pub(crate) fn describe(&self) -> String {
         match self {
-            Tok::Ident(s) | Tok::Upper(s) => format!("`{s}`"),
-            Tok::Str(_) => "a string".into(),
-            Tok::Int(..) => "a number".into(),
-            Tok::Ip(_) => "an IP address".into(),
-            Tok::Cidr(_) => "a CIDR".into(),
-            Tok::ListRef(n) => format!("`@{n}`"),
+            Tok::Ident(s) => format!("`{s}`"),
+            Tok::Lit(l) => describe_lit(l),
+            Tok::Op(op) => format!("`{}`", op.as_str()),
+            Tok::And => "`and`".into(),
+            Tok::Or => "`or`".into(),
+            Tok::Not => "`not`".into(),
+            Tok::LParen => "`(`".into(),
+            Tok::RParen => "`)`".into(),
+            Tok::LBracket => "`[`".into(),
+            Tok::RBracket => "`]`".into(),
+            Tok::Comma => "`,`".into(),
+            Tok::Dot => "`.`".into(),
             Tok::Eof => "end of expression".into(),
-            other => format!("`{}`", other.symbol()),
         }
     }
+}
 
-    fn symbol(&self) -> &'static str {
-        match self {
-            Tok::True => "true",
-            Tok::Null => "null",
-            Tok::False => "false",
-            Tok::And => "and",
-            Tok::Or => "or",
-            Tok::Not => "not",
-            Tok::In => "in",
-            Tok::Eq => "==",
-            Tok::Ne => "!=",
-            Tok::Lt => "<",
-            Tok::Le => "<=",
-            Tok::Gt => ">",
-            Tok::Ge => ">=",
-            Tok::StartsWith => "starts_with",
-            Tok::EndsWith => "ends_with",
-            Tok::Contains => "contains",
-            Tok::Like => "like",
-            Tok::Matches => "matches",
-            Tok::Under => "under",
-            Tok::LParen => "(",
-            Tok::RParen => ")",
-            Tok::LBracket => "[",
-            Tok::RBracket => "]",
-            Tok::Comma => ",",
-            Tok::Dot => ".",
-            _ => "?",
-        }
+fn describe_lit(l: &Lit) -> String {
+    match l {
+        Lit::Str(_) => "a string".into(),
+        Lit::Int(..) => "a number".into(),
+        Lit::Ip(_) => "an IP address".into(),
+        Lit::Cidr(_) => "a CIDR".into(),
+        Lit::List(_) => "a list".into(),
+        Lit::Bool(_) | Lit::Null | Lit::AddressList(_) | Lit::Method(_) => format!("`{l}`"),
     }
 }
 
@@ -217,15 +182,15 @@ impl Lexer<'_> {
         let start = self.pos;
         let two = self.bytes.get(start..start + 2).unwrap_or(&[]);
         let (tok, len) = match two {
-            b"==" => (Tok::Eq, 2),
-            b"!=" => (Tok::Ne, 2),
-            b"<=" => (Tok::Le, 2),
-            b">=" => (Tok::Ge, 2),
+            b"==" => (Tok::Op(Op::Eq), 2),
+            b"!=" => (Tok::Op(Op::Ne), 2),
+            b"<=" => (Tok::Op(Op::Le), 2),
+            b">=" => (Tok::Op(Op::Ge), 2),
             b"&&" => return self.err(start, start + 2, "unexpected `&&`; use `and`"),
             b"||" => return self.err(start, start + 2, "unexpected `||`; use `or`"),
             _ => match self.bytes[start] {
-                b'<' => (Tok::Lt, 1),
-                b'>' => (Tok::Gt, 1),
+                b'<' => (Tok::Op(Op::Lt), 1),
+                b'>' => (Tok::Op(Op::Gt), 1),
                 b'=' => return self.err(start, start + 1, "unexpected `=`; use `==`"),
                 b'!' => {
                     return self.err(start, start + 1, "unexpected `!`; use `not` or `!=`");
@@ -249,7 +214,7 @@ impl Lexer<'_> {
             match c {
                 '"' => {
                     self.pos += 1;
-                    return Ok(Tok::Str(out));
+                    return Ok(Tok::Lit(Lit::Str(out)));
                 }
                 '\n' | '\r' => return self.err(start, self.pos, "unterminated string"),
                 '\\' => {
@@ -306,7 +271,9 @@ impl Lexer<'_> {
         {
             self.pos += 1;
         }
-        Ok(Tok::ListRef(self.src[start + 1..self.pos].to_owned()))
+        Ok(Tok::Lit(Lit::AddressList(
+            self.src[start + 1..self.pos].to_owned(),
+        )))
     }
 
     fn word(&mut self) -> Tok {
@@ -320,23 +287,24 @@ impl Lexer<'_> {
             return Tok::Ident(w.to_owned());
         }
         match w {
-            "true" => Tok::True,
-            "null" => Tok::Null,
-            "false" => Tok::False,
+            "true" => Tok::Lit(Lit::Bool(true)),
+            "null" => Tok::Lit(Lit::Null),
+            "false" => Tok::Lit(Lit::Bool(false)),
             "and" => Tok::And,
             "or" => Tok::Or,
             "not" => Tok::Not,
-            "in" => Tok::In,
-            "starts_with" => Tok::StartsWith,
-            "ends_with" => Tok::EndsWith,
-            "contains" => Tok::Contains,
-            "like" => Tok::Like,
-            "matches" => Tok::Matches,
-            "under" => Tok::Under,
+            "in" => Tok::Op(Op::In),
+            "starts_with" => Tok::Op(Op::StartsWith),
+            "ends_with" => Tok::Op(Op::EndsWith),
+            "contains" => Tok::Op(Op::Contains),
+            "like" => Tok::Op(Op::Like),
+            "matches" => Tok::Op(Op::Matches),
+            "under" => Tok::Op(Op::Under),
+            // A bare `[A-Z][A-Z_]*` word is an HTTP method literal.
             _ if w.as_bytes()[0].is_ascii_uppercase()
                 && w.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') =>
             {
-                Tok::Upper(w.to_owned())
+                Tok::Lit(Lit::Method(w.to_owned()))
             }
             _ => Tok::Ident(w.to_owned()),
         }
@@ -388,7 +356,7 @@ impl Lexer<'_> {
     fn finish_ip(&mut self, start: usize, addr: IpAddr) -> Result<Tok, ExprError> {
         let Some(prefix) = self.prefix()? else {
             self.reject_trailing_ident(start)?;
-            return Ok(Tok::Ip(addr));
+            return Ok(Tok::Lit(Lit::Ip(addr)));
         };
         self.reject_trailing_ident(start)?;
         let text = &self.src[start..self.pos];
@@ -410,7 +378,7 @@ impl Lexer<'_> {
                 ),
             );
         }
-        Ok(Tok::Cidr(net))
+        Ok(Tok::Lit(Lit::Cidr(net)))
     }
 
     fn reject_trailing_ident(&self, start: usize) -> Result<(), ExprError> {
@@ -499,7 +467,7 @@ impl Lexer<'_> {
                 format!("`{}` is too large", &self.src[start..self.pos]),
             );
         }
-        Ok(Tok::Int(value, unit))
+        Ok(Tok::Lit(Lit::Int(value, unit)))
     }
 }
 
@@ -521,18 +489,18 @@ mod tests {
             toks("host == \"a\\\"b\\\\\" and not x.y in [GET, 1] # c\n or"),
             vec![
                 Tok::Ident("host".into()),
-                Tok::Eq,
-                Tok::Str("a\"b\\".into()),
+                Tok::Op(Op::Eq),
+                Tok::Lit(Lit::Str("a\"b\\".into())),
                 Tok::And,
                 Tok::Not,
                 Tok::Ident("x".into()),
                 Tok::Dot,
                 Tok::Ident("y".into()),
-                Tok::In,
+                Tok::Op(Op::In),
                 Tok::LBracket,
-                Tok::Upper("GET".into()),
+                Tok::Lit(Lit::Method("GET".into())),
                 Tok::Comma,
-                Tok::Int(1, None),
+                Tok::Lit(Lit::Int(1, None)),
                 Tok::RBracket,
                 Tok::Or,
                 Tok::Eof,
@@ -545,18 +513,18 @@ mod tests {
         assert_eq!(
             toks("== != < <= > >= starts_with ends_with contains like matches under"),
             vec![
-                Tok::Eq,
-                Tok::Ne,
-                Tok::Lt,
-                Tok::Le,
-                Tok::Gt,
-                Tok::Ge,
-                Tok::StartsWith,
-                Tok::EndsWith,
-                Tok::Contains,
-                Tok::Like,
-                Tok::Matches,
-                Tok::Under,
+                Tok::Op(Op::Eq),
+                Tok::Op(Op::Ne),
+                Tok::Op(Op::Lt),
+                Tok::Op(Op::Le),
+                Tok::Op(Op::Gt),
+                Tok::Op(Op::Ge),
+                Tok::Op(Op::StartsWith),
+                Tok::Op(Op::EndsWith),
+                Tok::Op(Op::Contains),
+                Tok::Op(Op::Like),
+                Tok::Op(Op::Matches),
+                Tok::Op(Op::Under),
                 Tok::Eof
             ]
         );
@@ -567,14 +535,14 @@ mod tests {
         assert_eq!(
             toks("5 500mb 1kb 2gb 10ms 3s 1m 2h"),
             vec![
-                Tok::Int(5, None),
-                Tok::Int(500, Some(Unit::Mb)),
-                Tok::Int(1, Some(Unit::Kb)),
-                Tok::Int(2, Some(Unit::Gb)),
-                Tok::Int(10, Some(Unit::Ms)),
-                Tok::Int(3, Some(Unit::S)),
-                Tok::Int(1, Some(Unit::M)),
-                Tok::Int(2, Some(Unit::H)),
+                Tok::Lit(Lit::Int(5, None)),
+                Tok::Lit(Lit::Int(500, Some(Unit::Mb))),
+                Tok::Lit(Lit::Int(1, Some(Unit::Kb))),
+                Tok::Lit(Lit::Int(2, Some(Unit::Gb))),
+                Tok::Lit(Lit::Int(10, Some(Unit::Ms))),
+                Tok::Lit(Lit::Int(3, Some(Unit::S))),
+                Tok::Lit(Lit::Int(1, Some(Unit::M))),
+                Tok::Lit(Lit::Int(2, Some(Unit::H))),
                 Tok::Eof
             ]
         );
@@ -589,11 +557,11 @@ mod tests {
         assert_eq!(
             toks("10.0.0.0/8 fd00::/8 ::1 1.2.3.4 2001:db8::1"),
             vec![
-                Tok::Cidr("10.0.0.0/8".parse().unwrap()),
-                Tok::Cidr("fd00::/8".parse().unwrap()),
-                Tok::Ip("::1".parse().unwrap()),
-                Tok::Ip("1.2.3.4".parse().unwrap()),
-                Tok::Ip("2001:db8::1".parse().unwrap()),
+                Tok::Lit(Lit::Cidr("10.0.0.0/8".parse().unwrap())),
+                Tok::Lit(Lit::Cidr("fd00::/8".parse().unwrap())),
+                Tok::Lit(Lit::Ip("::1".parse().unwrap())),
+                Tok::Lit(Lit::Ip("1.2.3.4".parse().unwrap())),
+                Tok::Lit(Lit::Ip("2001:db8::1".parse().unwrap())),
                 Tok::Eof
             ]
         );
@@ -612,8 +580,8 @@ mod tests {
         assert_eq!(
             toks("GET X_Y Host metric.in"),
             vec![
-                Tok::Upper("GET".into()),
-                Tok::Upper("X_Y".into()),
+                Tok::Lit(Lit::Method("GET".into())),
+                Tok::Lit(Lit::Method("X_Y".into())),
                 Tok::Ident("Host".into()),
                 Tok::Ident("metric".into()),
                 Tok::Dot,
@@ -631,8 +599,8 @@ mod tests {
                 Tok::Ident("client".into()),
                 Tok::Dot,
                 Tok::Ident("ip".into()),
-                Tok::In,
-                Tok::ListRef("internal-v4_2".into()),
+                Tok::Op(Op::In),
+                Tok::Lit(Lit::AddressList("internal-v4_2".into())),
                 Tok::Eof
             ]
         );

@@ -53,7 +53,7 @@ impl Host {
     pub fn dns_name(&self) -> Option<&str> {
         match self {
             Host::Dns(s) => Some(s),
-            _ => None,
+            Host::Ipv4(_) | Host::Ipv6(_) => None,
         }
     }
 }

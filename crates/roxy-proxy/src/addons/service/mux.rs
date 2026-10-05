@@ -600,9 +600,16 @@ impl Stream {
                 );
                 return self.fail(ServiceError::Closed(why), Reset::Skip);
             }
-            // An observer's answers are ignored.
-            _ if self.mode == AddonMode::Observe => return,
-            _ => {}
+            In::Request { .. }
+            | In::RequestEnd
+            | In::Response { .. }
+            | In::ResponseEnd
+            | In::Deny { .. } => {
+                // An observer's answers are ignored.
+                if self.mode == AddonMode::Observe {
+                    return;
+                }
+            }
         }
         let mut s = lock(&self.state);
         let result = self.answer(&mut s, m);

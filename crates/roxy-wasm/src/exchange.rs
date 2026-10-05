@@ -239,7 +239,12 @@ fn to_wasi_error(err: &BodyError, dir: Dir) -> WasiError {
             Dir::Request => WasiError::ConnectionTerminated,
             Dir::Response => WasiError::HttpResponseIncomplete,
         },
-        other => WasiError::InternalError(Some(other.to_string())),
+        other @ (BodyError::LengthMismatch
+        | BodyError::Closed
+        | BodyError::Invalid(_)
+        | BodyError::Upstream(_)
+        | BodyError::Stopped
+        | BodyError::Undecodable(_)) => WasiError::InternalError(Some(other.to_string())),
     }
 }
 

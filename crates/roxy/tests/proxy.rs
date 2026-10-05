@@ -655,10 +655,10 @@ async fn websocket_upgrade_needs_the_rule() {
     let err = tokio_tungstenite::client_async(format!("wss://upstream.test:{port}/echo"), tls)
         .await
         .unwrap_err();
-    match err {
-        tokio_tungstenite::tungstenite::Error::Http(res) => assert_eq!(res.status(), 200),
-        other => panic!("expected a plain HTTP answer, got {other:?}"),
-    }
+    let tokio_tungstenite::tungstenite::Error::Http(res) = err else {
+        panic!("expected a plain HTTP answer, got {err:?}");
+    };
+    assert_eq!(res.status(), 200);
     let seen = h.upstream.seen();
     assert_eq!(seen.len(), 1);
     assert!(seen[0].header("upgrade").is_none());

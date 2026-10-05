@@ -499,7 +499,15 @@ fn ca_init(path: &Path, force: bool) -> anyhow::Result<ExitCode> {
         CaError::AlreadyExists(_) => {
             anyhow::anyhow!("{e} (use --force to replace it; clients trusting it will break)")
         }
-        other => other.into(),
+        other @ (CaError::NotFound(_)
+        | CaError::Incomplete { .. }
+        | CaError::Io { .. }
+        | CaError::NotCurrent { .. }
+        | CaError::InvalidCert { .. }
+        | CaError::InvalidKey { .. }
+        | CaError::KeyMismatch { .. }
+        | CaError::Generate(_)
+        | CaError::Rng) => other.into(),
     })?;
     tracing::info!(dir = %dir.display(), "generated roxy CA");
     println!("{}", ca.cert_path().display());

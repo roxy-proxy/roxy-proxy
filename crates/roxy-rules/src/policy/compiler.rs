@@ -15,7 +15,8 @@ use super::{
 };
 use crate::compile::{Env, Needs, Pred, build_shared_regex, compile};
 use crate::config::{
-    Action, DenyArgs, MetricConfig, MetricCount, RedirectArgs, RewritePathArgs, RuleConfig, Upgrade,
+    Action, AllowArgs, DenyArgs, MetricConfig, MetricCount, RedirectArgs, RewritePathArgs,
+    RuleConfig, Upgrade,
 };
 use crate::diag::{Diagnostic, RuleId};
 use crate::eval::{
@@ -76,6 +77,13 @@ const RESERVED_HEADERS: &[&str] = &[
 ];
 
 /// Backquoted names joined with commas, for messages.
+fn allow(a: &AllowArgs) -> Decision {
+    Decision::Allow(AllowOpts {
+        upgrade_websocket: a.upgrade == Some(Upgrade::Websocket),
+        private_ok: a.private_ok,
+    })
+}
+
 fn quoted(names: &[String]) -> String {
     names
         .iter()
@@ -192,7 +200,11 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             .collect();
         let unique = match &m.count {
             MetricCount::Unique(f) => self.metric_field(f, format!("{path}.count"), "unique()"),
-            _ => None,
+            MetricCount::Requests
+            | MetricCount::RequestBytes
+            | MetricCount::ResponseBytes
+            | MetricCount::Errors
+            | MetricCount::Denied => None,
         };
         let filter = m
             .where_
@@ -438,9 +450,9 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             );
         }
         let out = match action {
-            Action::Allow(_) | Action::Deny(_) | Action::Passthrough => {
-                vec![CAction::Terminal(self.terminal(action, rule, apath))]
-            }
+            Action::Allow(a) => vec![CAction::Terminal(allow(a))],
+            Action::Deny(d) => vec![CAction::Terminal(self.deny(d, rule, apath))],
+            Action::Passthrough => vec![CAction::Terminal(self.passthrough(rule, apath))],
             Action::SetHeader(pairs) => self.set_header(shape, pairs, rule, apath),
             Action::RemoveHeader(names) => names
                 .iter()
@@ -516,51 +528,44 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         (self.d.len() == errors_before).then_some(out)
     }
 
-    /// The decision of a terminal action.
-    fn terminal(&mut self, action: &Action, rule: Option<&RuleId>, apath: &str) -> Decision {
-        match action {
-            Action::Allow(a) => Decision::Allow(AllowOpts {
-                upgrade_websocket: a.upgrade == Some(Upgrade::Websocket),
-                private_ok: a.private_ok,
-            }),
-            Action::Deny(DenyArgs {
-                status,
-                message,
-                close,
-            }) => {
-                let status = match status.map(|s| (s, DenyStatus::new(s))) {
-                    None => DEFAULT_DENY_STATUS,
-                    Some((_, Some(s))) => s,
-                    Some((s, None)) => {
-                        self.push(
-                            rule,
-                            apath,
-                            format!("deny status {s} must be a 4xx or 5xx code"),
-                        );
-                        // The error fails the compile; this is never served.
-                        DEFAULT_DENY_STATUS
-                    }
-                };
-                Decision::Deny {
-                    status,
-                    message: message
-                        .clone()
-                        .unwrap_or_else(|| DEFAULT_DENY_MESSAGE.into()),
-                    close: close.unwrap_or(true),
-                }
+    fn deny(&mut self, d: &DenyArgs, rule: Option<&RuleId>, apath: &str) -> Decision {
+        let DenyArgs {
+            status,
+            message,
+            close,
+        } = d;
+        let status = match status.map(|s| (s, DenyStatus::new(s))) {
+            None => DEFAULT_DENY_STATUS,
+            Some((_, Some(s))) => s,
+            Some((s, None)) => {
+                self.push(
+                    rule,
+                    apath,
+                    format!("deny status {s} must be a 4xx or 5xx code"),
+                );
+                // The error fails the compile; this is never served.
+                DEFAULT_DENY_STATUS
             }
-            _ => {
-                if !self.input.transparent_listeners {
-                    self.push(
-                        rule,
-                        apath,
-                        "`passthrough` requires a transparent listener, which is not supported \
-                         yet (issue #15)",
-                    );
-                }
-                Decision::Passthrough
-            }
+        };
+        Decision::Deny {
+            status,
+            message: message
+                .clone()
+                .unwrap_or_else(|| DEFAULT_DENY_MESSAGE.into()),
+            close: close.unwrap_or(true),
         }
+    }
+
+    fn passthrough(&mut self, rule: Option<&RuleId>, apath: &str) -> Decision {
+        if !self.input.transparent_listeners {
+            self.push(
+                rule,
+                apath,
+                "`passthrough` requires a transparent listener, which is not supported yet \
+                 (issue #15)",
+            );
+        }
+        Decision::Passthrough
     }
 
     fn set_header(

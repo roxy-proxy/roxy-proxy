@@ -192,7 +192,14 @@ impl Node {
             LitNode {
                 lit: match &l.lit {
                     Lit::List(items) => Lit::List(items.iter().map(lit).collect()),
-                    other => other.clone(),
+                    other @ (Lit::Str(_)
+                    | Lit::Int(..)
+                    | Lit::Bool(_)
+                    | Lit::Ip(_)
+                    | Lit::Cidr(_)
+                    | Lit::AddressList(_)
+                    | Lit::Method(_)
+                    | Lit::Null) => other.clone(),
                 },
                 span: Span::default(),
             }

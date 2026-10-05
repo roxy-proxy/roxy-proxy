@@ -250,7 +250,18 @@ impl Layer {
                 let instance = inner.pre.instantiate_async(&mut store).await.map_err(|e| {
                     match classify(&e) {
                         LayerError::Trap(msg) => LayerError::Instantiate(msg),
-                        other => other,
+                        other @ (LayerError::BudgetExceeded(_)
+                        | LayerError::CapabilityDenied { .. }
+                        | LayerError::NextCalledTwice
+                        | LayerError::OutsideExchange(_)
+                        | LayerError::InvalidRequest(_)
+                        | LayerError::NoResponse
+                        | LayerError::ErrorResponse(_)
+                        | LayerError::InvalidResponse(_)
+                        | LayerError::Host(_)
+                        | LayerError::Init(_)
+                        | LayerError::Instantiate(_)
+                        | LayerError::Cancelled) => other,
                     }
                 })?;
                 let handler = inner

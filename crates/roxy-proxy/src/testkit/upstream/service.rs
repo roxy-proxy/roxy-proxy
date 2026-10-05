@@ -302,7 +302,7 @@ where
                 conn.bytes(id, &b[4..]);
             }
             Message::Close(_) => return,
-            _ => {}
+            Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
         }
     }
 }

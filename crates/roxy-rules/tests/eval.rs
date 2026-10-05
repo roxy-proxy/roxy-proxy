@@ -581,7 +581,7 @@ fn deny_close_defaults_and_opt_out() {
     let ctx = EvalContext::empty();
     let close_of = |v: &MapView| match p.evaluate_head(v, &ctx).decision {
         Decision::Deny { close, .. } => Some(close),
-        _ => None,
+        Decision::Allow(_) | Decision::Passthrough => None,
     };
     let path = |s: &str| MapView::new().with_str(Field::Path, s);
     assert_eq!(close_of(&path("/keep")), Some(false));

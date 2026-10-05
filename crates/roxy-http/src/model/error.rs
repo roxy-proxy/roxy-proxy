@@ -9,7 +9,6 @@ use http::StatusCode;
 /// exactly one variant; [`Reason::as_str`] is the stable snake-case code used
 /// in `parse_error` flow events and alerting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum Reason {
     // ----- request line -----
     /// Method is not a valid `token`.
@@ -260,7 +259,47 @@ impl Reason {
             Reason::UnsupportedVersion => StatusCode::HTTP_VERSION_NOT_SUPPORTED,
             Reason::HeaderTimeout | Reason::BodyTimeout => StatusCode::REQUEST_TIMEOUT,
             Reason::InvalidState => StatusCode::INTERNAL_SERVER_ERROR,
-            _ => StatusCode::BAD_REQUEST,
+            Reason::InvalidMethod
+            | Reason::BadRequestLine
+            | Reason::BadRequestTarget
+            | Reason::TargetFormMismatch
+            | Reason::BareCr
+            | Reason::BareLf
+            | Reason::NonAscii
+            | Reason::InvalidHeaderName
+            | Reason::WhitespaceBeforeColon
+            | Reason::ObsFold
+            | Reason::InvalidHeaderValue
+            | Reason::ReservedHeader
+            | Reason::BadConnectionHeader
+            | Reason::MissingHost
+            | Reason::MultipleHost
+            | Reason::MultipleProxyAuthorization
+            | Reason::HostMismatch
+            | Reason::BadAuthority
+            | Reason::AuthorityMismatch
+            | Reason::DuplicateContentLength
+            | Reason::BadContentLength
+            | Reason::BadTransferEncoding
+            | Reason::ClAndTe
+            | Reason::BodyOnBodiless
+            | Reason::BadChunkSize
+            | Reason::ChunkExtension
+            | Reason::Trailers
+            | Reason::BadChunkFraming
+            | Reason::InvalidPath
+            | Reason::InvalidQuery
+            | Reason::PathClimbsAboveRoot
+            | Reason::BadPercentEncoding
+            | Reason::FragmentInTarget
+            | Reason::UnexpectedEof
+            | Reason::Io
+            | Reason::H2ConnectionHeader
+            | Reason::H2BadTe
+            | Reason::H2BadPseudoHeader
+            | Reason::H2BadScheme
+            | Reason::H2UnsupportedMethod
+            | Reason::WsBadHandshake => StatusCode::BAD_REQUEST,
         }
     }
 }
@@ -298,7 +337,6 @@ pub(crate) fn reject<T>(reason: Reason, detail: impl Into<String>) -> Result<T, 
 
 /// Error carried by a [`crate::Body`] stream.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum BodyError {
     /// More bytes than the configured cap.
     #[error("body exceeds the {limit} byte cap")]
@@ -338,7 +376,6 @@ pub enum BodyError {
 /// Error while writing to (or driving) a client connection. After any of
 /// these the connection must be dropped.
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub enum WriteError {
     /// Transport error or timeout while writing.
     #[error("write failed: {0}")]
