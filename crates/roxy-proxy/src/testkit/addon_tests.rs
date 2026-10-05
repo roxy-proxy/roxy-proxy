@@ -361,6 +361,35 @@ async fn a_layer_can_refuse_an_upgrade() {
     assert!(kit.upstream.seen().is_empty());
 }
 
+/// A layer that turns the core's `101` into another status leaves the
+/// relayed upgrade with nowhere to go: the exchange fails closed and the
+/// upstream WebSocket is closed, both at once.
+#[tokio::test]
+async fn a_layer_that_rewrites_the_101_fails_closed() {
+    let kit = stack(&named(&["a", "b"])).await;
+    let mut c = kit.h1().await;
+    let headers = [
+        ("connection", "upgrade"),
+        ("upgrade", "websocket"),
+        ("sec-websocket-version", "13"),
+        ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ("x-status", "200"),
+    ];
+    let a = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        c.call("GET", "/ws", &headers, b""),
+    )
+    .await
+    .expect("the client's exchange ends");
+    assert_eq!(a.status, 503, "{a:?}");
+    assert!(a.body.is_ok(), "{a:?}");
+    assert_eq!(kit.upstream.seen().len(), 1, "the upstream upgraded");
+    kit.upstream.wait_open(0).await;
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["layer"], "a", "{errs:#?}");
+    assert_eq!(errs[0]["kind"], "invalid_response");
+}
+
 #[tokio::test]
 async fn a_layer_runs_only_where_its_when_matches() {
     let kit = stack(&[

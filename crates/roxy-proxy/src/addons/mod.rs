@@ -668,8 +668,9 @@ fn stack_outcome(
     if st.close.load(Ordering::Relaxed) {
         res.meta.close = true;
     }
+    let relay = lock(&st.relay).take();
     if res.status == http::StatusCode::SWITCHING_PROTOCOLS {
-        if let (Some(relay), Some(client_tx)) = (lock(&st.relay).take(), client_tx) {
+        if let (Some(relay), Some(client_tx)) = (relay, client_tx) {
             // A layer cannot express `upgrade: websocket` (hop-by-hop); the
             // core relayed a real upgrade, so restore it.
             res.meta.upgrade = Some("websocket".to_owned());
@@ -683,6 +684,15 @@ fn stack_outcome(
         }
         let layer = st.snap.addons[0].name.clone();
         let err = LayerError::InvalidResponse("101 without an upgrade to relay".into());
+        emit_layer_error(st, &layer, &err, AddonMode::Enforce);
+        return Outcome::Refuse(layer_refusal(&layer));
+    }
+    if let Some(relay) = relay {
+        // The upstream switched protocols but the stack answered otherwise:
+        // no body can carry the relay, so close it and fail closed.
+        tokio::spawn(crate::exchange::close_upstream_ws(relay.upstream));
+        let layer = st.snap.addons[0].name.clone();
+        let err = LayerError::InvalidResponse(format!("{} over a relayed upgrade", res.status));
         emit_layer_error(st, &layer, &err, AddonMode::Enforce);
         return Outcome::Refuse(layer_refusal(&layer));
     }

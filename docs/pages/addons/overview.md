@@ -94,7 +94,10 @@ bytes and the response body the upstream's, for as long as the WebSocket
 is open. A layer reads, rewrites or holds back either direction as it
 would any body, refuses the upgrade by answering without `next`, and is
 left out of the WebSocket entirely when its `when` skips the upgrade
-request.
+request. A layer that turns the upstream's `101` into another status
+fails the exchange closed (a `503` from `layer:<name>`), and roxy closes
+the upstream WebSocket. A `101` with no upgrade from below fails closed
+too.
 
 - The bodies carry raw WebSocket frames. Frames from the client are
   masked, so their payload reads as sent only from the upstream's side.

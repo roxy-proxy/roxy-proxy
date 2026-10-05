@@ -1152,6 +1152,14 @@ impl<W: tokio::io::AsyncWrite + Unpin> FrameOut<W> {
     }
 }
 
+/// Closes an upgraded upstream that nothing will relay: a `1008`, then a
+/// shutdown.
+pub(crate) async fn close_upstream_ws(upstream: hyper::upgrade::Upgraded) {
+    FrameOut::new(TokioIo::new(upstream), Some(Masks::new()))
+        .close(close::POLICY)
+        .await;
+}
+
 /// How one direction of the message relay ended.
 enum End {
     /// The sender closed its stream.
