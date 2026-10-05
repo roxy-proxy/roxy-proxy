@@ -121,8 +121,6 @@ enum Out {
         layer: String,
         mode: &'static str,
         client_ip: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        client_user: Option<String>,
         listener: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         sni: Option<String>,
@@ -626,7 +624,6 @@ pub(crate) mod testing {
                     .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))
                     .collect(),
                 redactor,
-                users: HashMap::new(),
                 limits: kit.limits.clone(),
                 flags: kit.flags.clone(),
                 http: kit.http.clone(),

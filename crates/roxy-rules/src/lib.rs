@@ -106,7 +106,7 @@
 //!   This is never "predicate false". `and`/`or` short-circuit, so only
 //!   inputs actually reached count.
 //! * **Missing values (`null`).** A field the flow does not have
-//!   (`client.user` without proxy auth, an unset header or state key,
+//!   (`tls.sni` on a plain connection, an unset header or state key,
 //!   `body.size` of a chunked body) is [`Value::Absent`]. It equals only
 //!   `null` under `==`, `!=`, `in` and `not in`; any other operator on it
 //!   fails closed with [`FailClosedReason::MissingValue`].

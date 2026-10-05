@@ -5,7 +5,7 @@
 ```
   client ──TCP──▶  listener: explicit proxy, or direct (reached through roxy's DNS)
                      ▼
-                   CONNECT: proxy auth; first bytes must be a TLS ClientHello
+                   CONNECT: first bytes must be a TLS ClientHello
                      ▼      whose SNI matches the CONNECT host (the defaults:
                             http.allow_plain_in_connect, tls.require_sni_match)
                             (direct: the SNI or Host is the target)

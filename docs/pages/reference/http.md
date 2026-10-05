@@ -15,8 +15,6 @@ listeners:
   - name: proxy                # rules can match listener.name
     mode: explicit             # the default; or direct
     bind: 0.0.0.0:3128
-    auth:                      # optional
-      basic: { users_file: /etc/roxy/users }
 ```
 
 On the proxy port:
@@ -28,18 +26,14 @@ On the proxy port:
   `roxy.internal`, which serves the CA certificate at `/roxy-ca.pem`
   ([TLS](/operate/ca-certificates#ca-distribution)). Anything else there is `404`.
 
-### Proxy authentication
-
-With `auth.basic`, every request and CONNECT needs
-`Proxy-Authorization: Basic`, checked against a file of `user:bcrypt-hash`
-lines (blank lines and `#` comments ignored). A missing or wrong credential
-gets `407`. Unknown users are checked against a dummy hash, so they take as
-long as known ones. The user becomes `client.user` in rules and in the flow
-log. `Proxy-Authorization` is never forwarded.
+roxy does not authenticate clients: a client is who its network position
+says it is, which rules see as `listener.name`, `listener.mode` and
+`client.ip`. A `Proxy-Authorization` header is hop-by-hop and dropped, never
+forwarded.
 
 ## CONNECT
 
-A CONNECT that passes proxy auth gets `200 Connection Established`. There
+A CONNECT gets `200 Connection Established`. There
 are no connect-time rules: every allow or deny decision is made on the
 requests inside the tunnel. roxy then peeks the tunnel's first bytes:
 
@@ -90,8 +84,7 @@ bytes, as it does inside a CONNECT tunnel:
 roxy resolves the target name itself ([upstream](/reference/upstream#dns)); the
 address the client connected to is roxy's own and plays no part. There are
 no connect-time rules: every decision is made on the requests, and
-`listener.mode` is `direct` in rules. Direct listeners take no `auth`,
-since their clients send no `Proxy-Authorization`.
+`listener.mode` is `direct` in rules.
 
 ## HTTP/2
 
@@ -331,6 +324,4 @@ closed (`connection: close` on HTTP/1.1, `GOAWAY` on HTTP/2) unless the
 rule says `deny: { close: false }`, so a probing
 client loses its warm connection on every attempt, and roxy does not read
 the rest of a request body it has refused: the response goes out at once
-and the connection closes behind it. A refused proxy authentication gets
-`407` with a `proxy-authenticate: Basic` challenge and the same JSON body
-shape.
+and the connection closes behind it.

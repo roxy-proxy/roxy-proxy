@@ -242,7 +242,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                     at,
                     format!(
                         "unknown {what} field `{name}`; metric fields must be scalar fields \
-                         such as client.ip, client.user, host"
+                         such as client.ip, host, tls.sni"
                     ),
                 );
                 None

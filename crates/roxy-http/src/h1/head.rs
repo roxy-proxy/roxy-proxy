@@ -1,8 +1,6 @@
 //! Request-head parsing: raw pre-checks, `httparse` tokenisation, and the
 //! semantic validation of the rejection rules. Pure functions over bytes (fuzz target).
 
-use http::HeaderValue;
-
 use crate::chars::{split_list, trim_ows};
 use crate::model::{
     Authority, Headers, HttpFlags, Limits, Method, ParseError, Reason, RequestMeta, Scheme,
@@ -351,8 +349,8 @@ fn request_framing(
     Ok(framing)
 }
 
-/// Metadata from the hop-by-hop fields: `Expect`, `Connection`, `Upgrade`
-/// and `Proxy-Authorization`.
+/// Metadata from the hop-by-hop fields: `Expect`, `Connection` and
+/// `Upgrade`.
 fn hop_by_hop_meta(
     raw: &[(&[u8], &[u8])],
     version: Version,
@@ -380,16 +378,6 @@ fn hop_by_hop_meta(
             .map(|u| String::from_utf8_lossy(u).to_ascii_lowercase())
             .collect();
         meta.upgrade = Some(joined.join(", "));
-    }
-    let proxy_auth = all(raw, "proxy-authorization");
-    if proxy_auth.len() > 1 {
-        return reject(
-            Reason::MultipleProxyAuthorization,
-            "multiple proxy-authorization fields",
-        );
-    }
-    if let Some(pa) = proxy_auth.first() {
-        meta.proxy_authorization = HeaderValue::from_bytes(pa).ok();
     }
     Ok(meta)
 }
@@ -605,14 +593,12 @@ mod tests {
 
     #[test]
     fn connect_ok() {
-        let Head::Connect { authority, meta, .. } = parse(
-            "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic eA==\r\n\r\n",
-        )
-        .unwrap() else {
+        let Head::Connect { authority, .. } =
+            parse("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n").unwrap()
+        else {
             panic!()
         };
         assert_eq!(authority.to_string(), "example.com:443");
-        assert_eq!(meta.proxy_authorization.unwrap(), "Basic eA==");
         assert_eq!(
             parse("CONNECT example.com HTTP/1.1\r\n\r\n").unwrap_err(),
             Reason::BadAuthority
@@ -620,17 +606,6 @@ mod tests {
         assert_eq!(
             parse("CONNECT http://example.com/ HTTP/1.1\r\n\r\n").unwrap_err(),
             Reason::BadRequestTarget
-        );
-    }
-
-    #[test]
-    fn proxy_authorization_must_be_single() {
-        assert_eq!(
-            parse(
-                "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic eA==\r\nProxy-Authorization: Basic eQ==\r\n\r\n"
-            )
-            .unwrap_err(),
-            Reason::MultipleProxyAuthorization
         );
     }
 

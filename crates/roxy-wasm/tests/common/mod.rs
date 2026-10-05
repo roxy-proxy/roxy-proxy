@@ -159,7 +159,6 @@ impl LayerHost for Mock {
             conn_id: "conn-1".into(),
             principal: Principal {
                 client_ip: std::net::IpAddr::from([10, 0, 0, 1]),
-                client_user: None,
                 listener: "main".into(),
                 tls_sni: None,
             },

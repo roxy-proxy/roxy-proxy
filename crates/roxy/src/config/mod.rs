@@ -84,8 +84,10 @@ pub struct Listener {
     #[serde(default)]
     pub mode: ListenerMode,
     pub bind: SocketAddr,
+    /// Proxy authentication is gone. Parsed so a config that still sets
+    /// it is refused with a diagnostic rather than an unknown-field error.
     #[serde(default)]
-    pub auth: Option<ListenerAuth>,
+    pub auth: Option<serde_yaml_ng::Value>,
     /// Direct listeners only: the port clients connect to, when something
     /// in between remaps it. Defaults to the bind port.
     #[serde(default)]
@@ -116,18 +118,6 @@ pub enum UpstreamTarget {
     Resolve,
     OriginalDst,
     RequireMatch,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ListenerAuth {
-    pub basic: BasicAuth,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BasicAuth {
-    pub users_file: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

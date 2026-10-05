@@ -13,7 +13,7 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use roxy_proxy::{
     CaptureLog, DnsServerSpec, FileSink, FlowEvent, FlowSink, ListenerKind, ListenerSpec,
     MetricSource, PolicyUpdate, Redactor, RuntimeConfig, Server, ServerHandle, StateSource,
-    StdoutSink, UserDb,
+    StdoutSink,
 };
 use roxy_rules::Policy;
 use roxy_tls::{Ca, LeafMinter};
@@ -42,8 +42,8 @@ fn validate_at(config: &Config, path: &Path) -> Result<Compiled, Vec<String>> {
     })
 }
 
-/// Everything a reload may change, resolved (secrets, users files, address
-/// lists). Any address list that fails to load fails the whole update.
+/// Everything a reload may change, resolved (secrets, address lists). Any
+/// address list that fails to load fails the whole update.
 pub fn policy_update(config: &Config, policy: Policy) -> anyhow::Result<PolicyUpdate> {
     let secrets = Secrets::resolve(&config.secrets)?;
     let mut redactor = Redactor::new();
@@ -52,13 +52,6 @@ pub fn policy_update(config: &Config, policy: Policy) -> anyhow::Result<PolicyUp
     }
     for header in &config.log.redact_headers {
         redactor.add_header(header);
-    }
-    let mut users = HashMap::new();
-    for l in &config.listeners {
-        if let Some(auth) = &l.auth {
-            let db = UserDb::load(&auth.basic.users_file).map_err(|e| anyhow!(e))?;
-            users.insert(l.name.clone(), Arc::new(db));
-        }
     }
     let address_lists = crate::lists::load_all(config)
         .map_err(|errs| anyhow!("address lists failed to load: {}", errs.join("; ")))?;
@@ -74,7 +67,6 @@ pub fn policy_update(config: &Config, policy: Policy) -> anyhow::Result<PolicyUp
         policy,
         secrets: secret_map,
         redactor,
-        users,
         limits: config.into(),
         flags: config.into(),
         http: config.into(),
@@ -194,7 +186,6 @@ fn listener_specs(config: &Config) -> Vec<ListenerSpec> {
         .map(|l| ListenerSpec {
             name: l.name.clone(),
             bind: l.bind,
-            auth_required: l.auth.is_some(),
             kind: match l.mode {
                 ListenerMode::Direct => ListenerKind::Direct {
                     target_port: l.target_port,
@@ -218,12 +209,11 @@ fn dns_spec(dns: &crate::config::DnsListener, log_queries: bool) -> DnsServerSpe
 }
 
 /// Puts the running value of every setting that takes effect only at
-/// startup (listeners and their auth, the CA server, the DNS listener, TLS,
-/// HTTP/2, connection caps, the state store size, the flow and capture log
+/// startup (listeners, the CA server, the DNS listener, TLS, HTTP/2,
+/// connection caps, the state store size, the flow and capture log
 /// destinations) into `new`, and names each one that differed. The reload
 /// then validates and applies `new` as a whole, so a restart-only change is
-/// never half-applied (for example, a listener's `auth` removed while the
-/// listener still requires it).
+/// never half-applied.
 fn keep_restart_only(running: &Config, new: &mut Config) -> Vec<&'static str> {
     let mut changed = Vec::new();
     macro_rules! keep {

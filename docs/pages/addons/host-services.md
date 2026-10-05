@@ -40,8 +40,8 @@ entries expire.
 ## Identity
 
 `flow.current()` gives the flow id, connection id, tags, and the principal
-as roxy established it: `client.user` from proxy auth, client IP, listener,
-TLS SNI. These are the safe keys for per-principal state; a layer should
+as roxy established it: client IP, listener, TLS SNI. These are the safe
+keys for per-principal state; a layer should
 not trust client-supplied session headers.
 
 ## Record (`record`)

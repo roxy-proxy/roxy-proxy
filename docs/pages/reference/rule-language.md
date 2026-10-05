@@ -51,7 +51,7 @@ fields become known later, so rules that read them watch.
 
 | field | type | known |
 |---|---|---|
-| `client.ip`, `client.port`, `client.user` | ip, int, string | head |
+| `client.ip`, `client.port` | ip, int | head |
 | `listener.name`, `listener.mode` (`explicit` or `direct`) | string | head |
 | `tls.sni`, `tls.alpn`, `tls.version` | string | head |
 | `method`, `scheme`, `host`, `port`, `path`, `url` | string / int | head |
@@ -76,8 +76,8 @@ WebSocket extensions so messages stay readable.
 ### Missing values (`null`)
 
 A value that is not present is `null`: an unsent header or query parameter,
-an unset state key, `client.user` without proxy auth, `tls.sni` from a
-client that sent none, `body.size` for a chunked body.
+an unset state key, `tls.sni` from a client that sent none, `body.size`
+for a chunked body.
 
 > `null` is equal only to `null`, so `==`, `!=`, `in` and `not in` treat it
 > as an ordinary value. Any other operator on `null` is an error, and an

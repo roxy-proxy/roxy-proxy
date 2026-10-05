@@ -45,9 +45,6 @@ pub struct ListenerInfo {
     pub name: String,
     /// `listener.mode`.
     pub mode: ListenerMode,
-    /// Whether `Proxy-Authorization` is required (users come from the
-    /// policy snapshot, keyed by listener name).
-    pub auth_required: bool,
 }
 
 /// One accepted client connection.
@@ -59,23 +56,8 @@ pub struct ClientConn {
     pub listener: Arc<ListenerInfo>,
     /// Client address.
     pub peer: SocketAddr,
-    /// Proxy-auth user (`client.user`), once authenticated. On the proxy
-    /// port each request authenticates on its own; inside a CONNECT tunnel
-    /// the CONNECT's user applies.
-    pub user: Option<String>,
     /// Original destination (transparent mode only; always `None` today).
     pub original_dst: Option<SocketAddr>,
-}
-
-impl ClientConn {
-    /// A copy with `user` set.
-    #[must_use]
-    pub fn with_user(&self, user: Option<String>) -> Self {
-        Self {
-            user,
-            ..self.clone()
-        }
-    }
 }
 
 /// Future returned by [`Listener::accept`].
@@ -101,13 +83,12 @@ pub struct TcpProxyListener {
 
 impl TcpProxyListener {
     /// Binds an explicit-proxy listener on `addr`.
-    pub async fn bind(name: &str, addr: SocketAddr, auth_required: bool) -> io::Result<Self> {
+    pub async fn bind(name: &str, addr: SocketAddr) -> io::Result<Self> {
         let tcp = TcpListener::bind(addr).await?;
         Ok(Self {
             info: Arc::new(ListenerInfo {
                 name: name.to_owned(),
                 mode: ListenerMode::Explicit,
-                auth_required,
             }),
             tcp,
         })
@@ -129,7 +110,6 @@ impl TcpProxyListener {
             info: Arc::new(ListenerInfo {
                 name: name.to_owned(),
                 mode: ListenerMode::Direct { port },
-                auth_required: false,
             }),
             tcp,
         })
@@ -155,7 +135,6 @@ impl Listener for TcpProxyListener {
                     id: Ulid::generate(),
                     listener: self.info.clone(),
                     peer,
-                    user: None,
                     original_dst: None,
                 },
             ))

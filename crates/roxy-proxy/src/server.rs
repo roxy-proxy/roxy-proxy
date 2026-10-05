@@ -17,7 +17,6 @@ use tokio_util::task::TaskTracker;
 
 use crate::addr::canonical;
 use crate::addrlist::AddressLists;
-use crate::auth::UserDb;
 use crate::budget::{BufferBudget, BufferLease};
 use crate::config::{HttpBehaviour, ListenerKind, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowEvent, FlowSink, Redactor};
@@ -32,7 +31,6 @@ pub(crate) struct Snapshot {
     pub policy: Policy,
     pub secrets: HashMap<String, String>,
     pub redactor: Redactor,
-    pub users: HashMap<String, Arc<UserDb>>,
     pub limits: Arc<Limits>,
     pub flags: Arc<HttpFlags>,
     pub http: Arc<HttpBehaviour>,
@@ -212,7 +210,6 @@ fn build_snapshot(u: PolicyUpdate, tls: &Arc<ClientConfig>) -> Result<Snapshot, 
         policy: u.policy,
         secrets: u.secrets,
         redactor: u.redactor,
-        users: u.users,
         limits: Arc::new(u.limits),
         flags: Arc::new(u.flags),
         http: Arc::new(u.http),
@@ -249,7 +246,7 @@ impl std::fmt::Debug for ServerHandle {
 }
 
 impl ServerHandle {
-    /// Swaps in a new policy snapshot (policy, secrets, users, limits,
+    /// Swaps in a new policy snapshot (policy, secrets, limits,
     /// upstream settings) atomically. On error the old snapshot stays.
     /// In-flight exchanges finish under the snapshot they started with.
     pub fn reload(&self, update: PolicyUpdate) -> Result<(), String> {
@@ -325,9 +322,7 @@ impl Server {
         let mut addrs = Vec::new();
         for spec in &cfg.listeners {
             let bound_listener = match spec.kind {
-                ListenerKind::Explicit => {
-                    TcpProxyListener::bind(&spec.name, spec.bind, spec.auth_required).await
-                }
+                ListenerKind::Explicit => TcpProxyListener::bind(&spec.name, spec.bind).await,
                 ListenerKind::Direct { target_port } => {
                     TcpProxyListener::bind_direct(&spec.name, spec.bind, target_port).await
                 }

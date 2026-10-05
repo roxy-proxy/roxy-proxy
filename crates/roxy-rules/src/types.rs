@@ -46,8 +46,6 @@ pub enum Field {
     ClientIp,
     /// `client.port` (int)
     ClientPort,
-    /// `client.user` (string; absent without proxy auth)
-    ClientUser,
     /// `listener.name` (string)
     ListenerName,
     /// `listener.mode` (string: `explicit` / `direct`)
@@ -182,10 +180,9 @@ impl std::ops::BitOrAssign for Reads {
 }
 
 impl Field {
-    pub const ALL: [Field; 24] = [
+    pub const ALL: [Field; 23] = [
         Self::ClientIp,
         Self::ClientPort,
-        Self::ClientUser,
         Self::ListenerName,
         Self::ListenerMode,
         Self::TlsSni,
@@ -214,7 +211,6 @@ impl Field {
         match self {
             Self::ClientIp => "client.ip",
             Self::ClientPort => "client.port",
-            Self::ClientUser => "client.user",
             Self::ListenerName => "listener.name",
             Self::ListenerMode => "listener.mode",
             Self::TlsSni => "tls.sni",
@@ -255,8 +251,7 @@ impl Field {
             | Self::ResponseBodyBytes
             | Self::WsOpcode
             | Self::WsSize => Type::Int,
-            Self::ClientUser
-            | Self::ListenerName
+            Self::ListenerName
             | Self::ListenerMode
             | Self::TlsSni
             | Self::TlsAlpn
@@ -288,7 +283,6 @@ impl Field {
             Self::WsDirection | Self::WsOpcode | Self::WsSize | Self::WsText => Reads::WS,
             Self::ClientIp
             | Self::ClientPort
-            | Self::ClientUser
             | Self::ListenerName
             | Self::ListenerMode
             | Self::TlsSni

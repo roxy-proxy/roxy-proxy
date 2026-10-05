@@ -18,14 +18,9 @@ pub fn current() -> FlowInfo {
     raw::current()
 }
 
-/// A stable key for per-principal state: the authenticated user if there
-/// is one, else the client IP.
+/// A stable key for per-principal state: the client IP.
 pub fn principal_key() -> String {
-    let p = current().principal;
-    match p.client_user {
-        Some(u) => format!("user:{u}"),
-        None => format!("ip:{}", p.client_ip),
-    }
+    format!("ip:{}", current().principal.client_ip)
 }
 
 /// Adds a tag to the flow's log record.

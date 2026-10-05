@@ -7,7 +7,7 @@ produces a `request` event:
 
 ```json
 {"ts":"2026-10-03T10:12:00.123Z","event":"request","flow":"01J9…","conn":"01J9…",
- "listener":"proxy","client":{"ip":"10.0.0.7","port":51234,"user":null},
+ "listener":"proxy","client":{"ip":"10.0.0.7","port":51234},
  "tls":{"sni":"api.github.com","alpn":"h2","version":"1.3"},
  "req":{"method":"POST","host":"api.github.com","port":443,"path":"/repos/x/y/issues",
         "query":null,"headers_bytes":812,"body_bytes":1032,"content_type":"application/json"},

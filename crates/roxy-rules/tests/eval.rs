@@ -276,13 +276,13 @@ fn units() {
 #[test]
 fn null_is_a_value_for_equality_and_membership() {
     check(&[
-        ("client.user == null", true),
-        ("client.user != null", false),
+        ("tls.sni == null", true),
+        ("tls.sni != null", false),
         ("host != null", true),
-        ("client.user == \"x\"", false),
-        ("client.user != \"x\"", true),
-        ("client.user in [\"x\"]", false),
-        ("client.user not in [\"x\"]", true),
+        ("tls.sni == \"x\"", false),
+        ("tls.sni != \"x\"", true),
+        ("tls.sni in [\"x\"]", false),
+        ("tls.sni not in [\"x\"]", true),
         ("header[\"x-missing\"] != \"a\"", true),
         ("header[\"x-missing\"] == null", true),
         ("query[\"nope\"] == \"\"", false),
@@ -290,10 +290,7 @@ fn null_is_a_value_for_equality_and_membership() {
         ("tls.alpn != \"h2\"", true),
         // Guarding with `!= null` short-circuits before the operator that
         // cannot answer for null.
-        (
-            "client.user != null and client.user starts_with \"a\"",
-            false,
-        ),
+        ("tls.sni != null and tls.sni starts_with \"a\"", false),
     ]);
 }
 
@@ -303,9 +300,9 @@ fn null_is_a_value_for_equality_and_membership() {
 fn null_with_other_operators_fails_closed() {
     let ctx = EvalContext::empty();
     for (expr, field) in [
-        ("client.user starts_with \"\"", "client.user"),
-        ("client.user like \"*\"", "client.user"),
-        ("client.user matches \".*\"", "client.user"),
+        ("tls.sni starts_with \"\"", "tls.sni"),
+        ("tls.sni like \"*\"", "tls.sni"),
+        ("tls.sni matches \".*\"", "tls.sni"),
         (
             "header[\"x-missing\"] contains \"a\"",
             "header[\"x-missing\"]",
@@ -1162,8 +1159,8 @@ fn guarded_size_rule() {
 fn null_literal_misuse_is_a_compile_error() {
     for bad in [
         "body.size > null",
-        "client.user contains null",
-        "client.user in [null]",
+        "tls.sni contains null",
+        "tls.sni in [null]",
         "null == null",
         "\"a\" == null",
         "null",

@@ -119,9 +119,6 @@ struct RuleTestArgs {
     /// `client.ip`.
     #[arg(long, default_value = "127.0.0.1")]
     client_ip: std::net::IpAddr,
-    /// `client.user` (proxy-auth user).
-    #[arg(long)]
-    user: Option<String>,
     /// Request header `name: value` (repeatable).
     #[arg(short = 'H', long = "header")]
     headers: Vec<String>,
@@ -295,7 +292,6 @@ fn rule_test(args: &RuleTestArgs) -> anyhow::Result<ExitCode> {
     };
     let mut req = ruletest::TestRequest::new(&method, &url);
     req.client_ip = args.client_ip;
-    req.user.clone_from(&args.user);
     req.body.clone_from(&args.body);
     req.body_bytes = args.body_bytes;
     req.response_status = args.response_status;

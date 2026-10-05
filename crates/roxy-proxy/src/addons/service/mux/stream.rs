@@ -706,7 +706,6 @@ pub(super) fn open_message(st: &StackFlow, layer: &str, mode: AddonMode) -> Out 
         layer: layer.to_owned(),
         mode: mode.as_str(),
         client_ip: st.client.peer.ip().to_string(),
-        client_user: st.client.user.clone(),
         listener: st.client.listener.name.clone(),
         sni: st.tls.as_ref().and_then(|t| t.sni.clone()),
         tags: st.tags(),

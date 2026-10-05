@@ -6,8 +6,6 @@ listeners:
   - name: proxy
     mode: explicit
     bind: 0.0.0.0:3128
-    auth:                      # optional; makes client.user available
-      basic: { users_file: /etc/roxy/users }
   # Deferred (issue #15). Shape reserved so configs do not change when it lands:
   # - name: tproxy
   #   mode: transparent

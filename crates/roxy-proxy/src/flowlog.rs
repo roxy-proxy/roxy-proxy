@@ -72,8 +72,8 @@ pub enum FlowEvent {
         diagnostics: Vec<String>,
     },
     /// A CONNECT (explicit mode). There are no connect-time rules:
-    /// a CONNECT is accepted for inspection unless proxy auth or the SNI
-    /// check refuses it. Only emitted when `log.flow.connection_events` is
+    /// a CONNECT is accepted for inspection unless the SNI check refuses
+    /// it. Only emitted when `log.flow.connection_events` is
     /// enabled or the connect was refused.
     Connect {
         #[serde(serialize_with = "ser_ts")]
@@ -329,7 +329,6 @@ pub enum FlowEvent {
 pub struct ClientInfo {
     pub ip: IpAddr,
     pub port: u16,
-    pub user: Option<String>,
 }
 
 /// A CONNECT destination.
@@ -880,7 +879,6 @@ mod tests {
             client: ClientInfo {
                 ip: "10.0.0.7".parse().unwrap(),
                 port: 51234,
-                user: None,
             },
             tls: Some(TlsInfo {
                 sni: Some("api.github.com".into()),
@@ -924,7 +922,6 @@ mod tests {
         assert_eq!(v["event"], "request");
         assert_eq!(v["ts"], "2026-10-03T10:12:00.123Z");
         assert_eq!(v["client"]["ip"], "10.0.0.7");
-        assert_eq!(v["client"]["user"], serde_json::Value::Null);
         assert_eq!(v["tls"]["sni"], "api.github.com");
         assert_eq!(v["req"]["query"], serde_json::Value::Null);
         assert_eq!(v["res"]["status"], 201);

@@ -53,7 +53,6 @@ impl LayerHost for StackHost {
             conn_id: st.client.id.to_string(),
             principal: Principal {
                 client_ip: st.client.peer.ip(),
-                client_user: st.client.user.clone(),
                 listener: st.client.listener.name.clone(),
                 tls_sni: st.tls.as_ref().and_then(|t| t.sni.clone()),
             },

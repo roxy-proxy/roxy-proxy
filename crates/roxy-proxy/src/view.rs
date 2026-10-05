@@ -242,7 +242,6 @@ impl FlowView for ProxyView<'_> {
         match f {
             Field::ClientIp => Value::Ip(fa.client.peer.ip()),
             Field::ClientPort => Value::Int(i64::from(fa.client.peer.port())),
-            Field::ClientUser => s(fa.client.user.as_ref()),
             Field::ListenerName => Value::Str(Cow::Borrowed(&fa.client.listener.name)),
             Field::ListenerMode => Value::Str(Cow::Borrowed(fa.client.listener.mode.as_str())),
             Field::TlsSni => s(tls.and_then(|t| t.sni.as_ref())),

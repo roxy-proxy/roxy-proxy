@@ -28,8 +28,8 @@ metrics:
   whether an exchange counts is fixed at the request head. Not `tag[..]`:
   tags are set by rules and addons on each flow, and a flow is counted
   outside the rules, so a tag read would always be false. `key` and the
-  field of `unique(..)` take scalar head fields only (`client.ip`,
-  `client.user`, `host`, ...), not `header[..]` or any other indexed value.
+  field of `unique(..)` take scalar head fields only (`client.ip`, `host`,
+  `tls.sni`, ...), not `header[..]` or any other indexed value.
   Anything else is a compile error.
 - **When counts move.** `requests` and `denied` are read before the
   forwarding decision and incremented after it (denied flows count too, so
