@@ -50,12 +50,12 @@ use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use roxy_http::ws::frame::Message;
 use roxy_http::{Body, BodyError, CanonicalResponse};
-use roxy_rules::{Decision, Effect, EvalContext, Reads, WatchState};
+use roxy_rules::{Decision, Effect, EvalContext, Reads, RuleId, WatchState};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::capture::Tap;
 use crate::flowlog::{DecisionKind, FlowEvent, FlowSink, Stage};
-use crate::pipeline::{FlowCx, FlowMeta, Refusal, fail_closed_code};
+use crate::pipeline::{FlowCx, FlowMeta, Refusal, fail_closed_code, rule_names, status_code};
 use crate::sources::Sample;
 use crate::view::{FlowFacts, ProxyView, ResponseFacts, WsFacts};
 
@@ -69,7 +69,7 @@ pub(crate) struct Stopped {
 /// What the flow log needs from the watcher at the end of an exchange.
 #[derive(Debug, Default)]
 pub(crate) struct Summary {
-    pub rules: Vec<String>,
+    pub rules: Vec<RuleId>,
     pub tags: Vec<String>,
     pub mutations: Vec<String>,
     pub stop: Option<Stopped>,
@@ -82,6 +82,24 @@ pub(crate) enum Dir {
     Request,
     /// Upstream to client.
     Response,
+}
+
+impl Dir {
+    /// `request` or `response`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Dir::Request => "request",
+            Dir::Response => "response",
+        }
+    }
+
+    /// `c2s` or `s2c`: the WebSocket form (`ws.direction`).
+    pub(crate) fn ws_str(self) -> &'static str {
+        match self {
+            Dir::Request => "c2s",
+            Dir::Response => "s2c",
+        }
+    }
 }
 
 /// The watching state of one exchange. Shared (`Arc`) between the request
@@ -104,7 +122,7 @@ struct Inner {
     /// Watched fields known so far.
     known: Reads,
     stopped: Option<Stopped>,
-    rules: Vec<String>,
+    rules: Vec<RuleId>,
     mutations: Vec<String>,
     /// WebSocket messages checked so far, for `ws_message` sampling.
     ws_messages: u64,
@@ -281,11 +299,10 @@ impl Watch {
         if let Some(s) = &g.stopped {
             return (message, Err(s.clone()));
         }
-        let direction = match dir {
-            Dir::Request => "c2s",
-            Dir::Response => "s2c",
-        };
-        g.facts.ws = Some(WsFacts { direction, message });
+        g.facts.ws = Some(WsFacts {
+            direction: dir,
+            message,
+        });
         g.known |= Reads::WS;
         let before = g.rules.len();
         let effects = g.evaluate(Reads::WS, Stage::Websocket);
@@ -303,14 +320,17 @@ impl Watch {
         let sampled = every > 0 && (g.ws_messages - 1).is_multiple_of(every);
         if g.stopped.is_some() || sampled {
             let (decision, rules) = match &g.stopped {
-                Some(s) => (DecisionKind::Deny, s.refusal.rule.iter().cloned().collect()),
-                None => (DecisionKind::Allow, g.rules[before..].to_vec()),
+                Some(s) => (
+                    DecisionKind::Deny,
+                    s.refusal.rule.iter().map(ToString::to_string).collect(),
+                ),
+                None => (DecisionKind::Allow, rule_names(&g.rules[before..])),
             };
             g.meta.shared.sink.emit(&FlowEvent::WsMessage {
                 ts: chrono::Utc::now(),
                 flow: g.meta.flow.to_string(),
                 conn: g.meta.conn_id(),
-                direction: direction.to_owned(),
+                direction: dir.ws_str().to_owned(),
                 opcode: message.opcode.as_u8(),
                 size: message.len() as u64,
                 decision,
@@ -427,9 +447,8 @@ impl Inner {
             return Vec::new();
         };
         for r in &o.matched {
-            let r = r.to_string();
-            if !self.rules.contains(&r) {
-                self.rules.push(r);
+            if !self.rules.contains(r) {
+                self.rules.push(r.clone());
             }
         }
         let mut headers = Vec::new();
@@ -465,10 +484,10 @@ impl Inner {
                     } => {
                         let rule = o
                             .terminal_rule
-                            .as_ref()
-                            .map_or_else(|| "_fail_closed".to_owned(), ToString::to_string);
-                        tracing::info!(flow = %meta.flow, rule, stage = stage.as_str(), "watching rule stopped the exchange");
-                        Refusal::deny(status, &message, &rule, close)
+                            .clone()
+                            .unwrap_or_else(|| RuleId::new(RuleId::FAIL_CLOSED));
+                        tracing::info!(flow = %meta.flow, %rule, stage = stage.as_str(), "watching rule stopped the exchange");
+                        Refusal::deny(status_code(status), &message, rule, close)
                     }
                     Decision::Allow(_) | Decision::Passthrough => {
                         Refusal::fail_closed("unsupported_effect")

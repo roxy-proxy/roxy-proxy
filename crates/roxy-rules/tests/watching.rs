@@ -4,7 +4,8 @@ mod common;
 
 use common::{compile, try_compile};
 use roxy_rules::{
-    Decision, Effect, EvalContext, FailClosedReason, Field, LogLevel, MapView, Reads, RuleKind,
+    Decision, DenyStatus, Effect, EvalContext, FailClosedReason, Field, LogLevel, MapView, Reads,
+    RuleKind,
 };
 
 const ALL: Reads = Reads::ALL;
@@ -92,7 +93,7 @@ fn effects_apply_once_and_a_deny_stops() {
     assert_eq!(
         o.stop,
         Some(Decision::Deny {
-            status: 413,
+            status: DenyStatus::new(413).unwrap(),
             message: "upload too large".into(),
             close: true
         })

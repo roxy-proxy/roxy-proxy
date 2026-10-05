@@ -14,6 +14,7 @@ humantime-serde.workspace = true
 ipnet.workspace = true
 parking_lot = "0.12.5"
 regex.workspace = true
+roxy-http.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

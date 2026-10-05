@@ -2652,6 +2652,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "regex",
+ "roxy-http",
  "serde",
  "serde_yaml_ng",
  "thiserror",

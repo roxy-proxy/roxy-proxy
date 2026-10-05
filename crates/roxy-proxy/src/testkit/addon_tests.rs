@@ -530,6 +530,7 @@ mod service {
     use bytes::Bytes;
 
     use super::{RULES, strs};
+    use crate::addons::AddonMode;
     use crate::addons::service::testing::{addon, kit, reload};
     use crate::testkit::{Answer, Kit, streaming_body};
 
@@ -540,7 +541,7 @@ mod service {
     async fn an_early_response_waits_for_the_upload_without_timing_out() {
         let kit = kit(
             RULES,
-            vec![addon("s", "pass", false, |s| {
+            vec![addon("s", "pass", AddonMode::Enforce, |s| {
                 s.first_byte_timeout = Duration::from_millis(400);
             })],
         )
@@ -577,7 +578,7 @@ mod service {
     /// several windows' worth while the stream is open.
     #[tokio::test]
     async fn an_observe_stream_credits_back_what_it_discards() {
-        let kit = kit(RULES, vec![addon("o", "talk", true, |_| {})]).await;
+        let kit = kit(RULES, vec![addon("o", "talk", AddonMode::Observe, |_| {})]).await;
         let mut c = kit.h1().await;
         let (mut tx, body) = streaming_body();
         let req = c.request("POST", "/x", &[]).body(body).unwrap();
@@ -602,7 +603,7 @@ mod service {
     /// body: a frame past it fails the stream, and the exchange goes on.
     #[tokio::test]
     async fn an_observe_stream_flooded_past_its_window_fails_on_its_own() {
-        let kit = kit(RULES, vec![addon("o", "flood", true, |_| {})]).await;
+        let kit = kit(RULES, vec![addon("o", "flood", AddonMode::Observe, |_| {})]).await;
         let mut c = kit.h1().await;
         let (mut tx, body) = streaming_body();
         let req = c.request("POST", "/x", &[]).body(body).unwrap();
@@ -634,7 +635,7 @@ mod service {
     async fn a_slow_observer_is_cut_and_reported_while_the_body_goes_through() {
         // The service never reads (and so never grants credit): the copy
         // stalls once the stream's window is spent.
-        let kit = kit(RULES, vec![addon("o", "stall", true, |_| {})]).await;
+        let kit = kit(RULES, vec![addon("o", "stall", AddonMode::Observe, |_| {})]).await;
         let mut c = kit.h1().await;
         let (mut tx, body) = streaming_body();
         let req = c.request("POST", "/x", &[]).body(body).unwrap();
@@ -671,7 +672,7 @@ mod service {
             &kit,
             WITH_TOKEN,
             &[("tok", "sk-live-123")],
-            vec![addon("s", "pass", false, |_| {})],
+            vec![addon("s", "pass", AddonMode::Enforce, |_| {})],
         );
         let a = kit.h1().await.call("GET", "/x", &[], b"").await;
         assert_eq!(a.status, 200, "{a:?}");

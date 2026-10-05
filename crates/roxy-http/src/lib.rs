@@ -19,6 +19,9 @@
 //! - [`upstream`]: canonical ↔ hyper client types.
 //! - [`ws`]: WebSocket upgrade handshake validation and the frame codec.
 
+// Casts go through `From` / `TryFrom`, so a narrowing one cannot slip in.
+#![warn(clippy::as_conversions)]
+
 mod chars;
 pub mod coding;
 pub mod h1;
@@ -30,3 +33,9 @@ pub mod url;
 pub mod ws;
 
 pub use model::*;
+
+/// A length as `u64`. `usize` is at most 64 bits on every target roxy
+/// builds for; it saturates otherwise.
+pub(crate) fn len_u64(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}

@@ -6,7 +6,7 @@ use roxy_wasm::{LayerError, LayerRequest};
 use ulid::Ulid;
 
 use super::ws::{join_upgrade_stream, split_upgrade_stream};
-use super::{AddonSpec, StackError, StackFlow, emit_stack_error};
+use super::{AddonMode, AddonSpec, StackError, StackFlow, emit_stack_error};
 use crate::view::ProxyView;
 
 /// Whether layer `index` runs on `req`: its `when` matches the request
@@ -56,11 +56,11 @@ pub(super) fn selects(
                 code: crate::pipeline::fail_closed_code(&reason, metric_err.as_ref()),
                 reason: reason.to_string(),
             };
-            if !addon.observe {
+            if addon.mode == AddonMode::Enforce {
                 return Err(err);
             }
             // An observer cannot affect traffic, so neither can its `when`.
-            emit_stack_error(st, &addon.name, &err, true);
+            emit_stack_error(st, &addon.name, &err, AddonMode::Observe);
             Ok((false, join_upgrade_stream(to_layer_request(creq), stream)))
         }
     }

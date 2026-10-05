@@ -36,7 +36,7 @@ use roxy_wasm::{HostError, LayerRequest, LayerResponse};
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant as TokioInstant;
 
-use super::{StackError, StackFlow};
+use super::{AddonMode, StackError, StackFlow};
 
 pub(crate) use mux::Pools;
 pub use mux::SUBPROTOCOL;
@@ -292,7 +292,7 @@ async fn run(
     let start = TokioInstant::now();
     let (stream, answers) = tokio::time::timeout_at(
         start + svc.first_byte_timeout,
-        mux::open(st, index, svc, false),
+        mux::open(st, index, svc, AddonMode::Enforce),
     )
     .await
     .map_err(|_| ServiceError::Timeout("first_byte_timeout"))??;
@@ -376,7 +376,7 @@ pub(super) async fn observe(
     let start = TokioInstant::now();
     let opened = tokio::time::timeout_at(
         start + svc.first_byte_timeout,
-        mux::open(st, index, svc, true),
+        mux::open(st, index, svc, AddonMode::Observe),
     )
     .await
     .unwrap_or(Err(ServiceError::Timeout("first_byte_timeout")));
@@ -426,7 +426,7 @@ pub(crate) mod testing {
     use roxy_rules::{DefaultDecision, Policy, PolicyInput, RuleConfig};
 
     use super::ServiceSpec;
-    use crate::addons::{AddonImpl, AddonSpec, EndpointSpec, StateLimits};
+    use crate::addons::{AddonImpl, AddonMode, AddonSpec, EndpointSpec, StateLimits};
     use crate::config::PolicyUpdate;
     use crate::flowlog::Redactor;
     use crate::testkit::{DOWN_IP, Kit, PRIVATE_IP, UP_IP};
@@ -440,7 +440,7 @@ pub(crate) mod testing {
     pub(crate) fn addon(
         name: &str,
         behaviour: &str,
-        observe: bool,
+        mode: AddonMode,
         spec: impl FnOnce(&mut ServiceSpec),
     ) -> Arc<AddonSpec> {
         let mut svc = ServiceSpec {
@@ -457,11 +457,11 @@ pub(crate) mod testing {
             headers: Vec::new(),
             timeout: Duration::from_secs(10),
             retries: 0,
-            private_ok: false,
+            private: crate::addr::PrivateAddrs::Deny,
         };
         Arc::new(AddonSpec {
             name: name.to_owned(),
-            observe,
+            mode,
             kind: AddonImpl::Service(svc),
             endpoints: HashMap::from([("svc".to_owned(), endpoint)]),
             state: StateLimits::default(),

@@ -393,7 +393,7 @@ impl flow::Host for StoreState {
             flow_id: info.flow_id,
             conn_id: info.conn_id,
             principal: flow::Principal {
-                client_ip: info.principal.client_ip,
+                client_ip: info.principal.client_ip.to_string(),
                 client_user: info.principal.client_user,
                 listener: info.principal.listener,
                 tls_sni: info.principal.tls_sni,

@@ -22,6 +22,7 @@ use tokio::sync::oneshot;
 
 use super::StackFlow;
 use crate::flowlog::FlowEvent;
+use crate::watch::Dir;
 
 /// What an observer's `next` returns: the copy of the real response.
 pub(crate) struct ObserverNext {
@@ -45,7 +46,7 @@ impl ObserverNext {
 struct Lag {
     st: Arc<StackFlow>,
     layer: String,
-    direction: &'static str,
+    direction: Dir,
     reported: AtomicBool,
 }
 
@@ -56,7 +57,7 @@ impl Lag {
                 ts: chrono::Utc::now(),
                 flow: self.st.flow.to_string(),
                 layer: self.layer.clone(),
-                direction: self.direction.to_owned(),
+                direction: self.direction.as_str().to_owned(),
             });
         }
     }
@@ -145,7 +146,7 @@ fn tee(body: Body, lag: Arc<Lag>) -> (Body, Body) {
     (real, copy)
 }
 
-fn lag(st: &Arc<StackFlow>, layer: &str, direction: &'static str) -> Arc<Lag> {
+fn lag(st: &Arc<StackFlow>, layer: &str, direction: Dir) -> Arc<Lag> {
     Arc::new(Lag {
         st: st.clone(),
         layer: layer.to_owned(),
@@ -163,7 +164,7 @@ pub(crate) async fn observe(
 ) -> Result<LayerResponse, HostError> {
     let addon = st.snap.addons[index].clone();
     let (parts, body) = req.into_parts();
-    let (real_body, copy_body) = tee(body, lag(&st, &addon.name, "request"));
+    let (real_body, copy_body) = tee(body, lag(&st, &addon.name, Dir::Request));
     let mut copy_req = http::Request::new(copy_body);
     *copy_req.method_mut() = parts.method.clone();
     *copy_req.uri_mut() = parts.uri.clone();
@@ -188,7 +189,7 @@ pub(crate) async fn observe(
                         &observer_st,
                         &observer_addon.name,
                         &super::StackError::Service(e),
-                        true,
+                        super::AddonMode::Observe,
                     );
                 }
             });
@@ -215,7 +216,12 @@ pub(crate) async fn observe(
             Err(e) => Err(e),
         };
         if let Err(e) = result {
-            super::emit_layer_error(&observer_st, &observer_addon.name, &e, true);
+            super::emit_layer_error(
+                &observer_st,
+                &observer_addon.name,
+                &e,
+                super::AddonMode::Observe,
+            );
         }
     });
 
@@ -235,7 +241,7 @@ async fn forward(
     match real {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
-            let (real_body, copy_body) = tee(body, lag(&st, name, "response"));
+            let (real_body, copy_body) = tee(body, lag(&st, name, Dir::Response));
             let mut copy = http::Response::new(copy_body);
             *copy.status_mut() = parts.status;
             *copy.headers_mut() = parts.headers.clone();

@@ -17,7 +17,7 @@ use roxy_wasm::{EndpointError, LayerRequest, LayerResponse};
 
 use super::{AddonSpec, EndpointSpec, StackFlow};
 use crate::flowlog::FlowEvent;
-use crate::upstream::{ConnectError, classify};
+use crate::upstream::{ConnectError, Protocols, classify};
 
 /// Largest request body an endpoint call carries (it is buffered so a retry
 /// can resend it).
@@ -164,7 +164,7 @@ async fn attempt_all(
         *r.headers_mut() = headers.clone();
         let sent = tokio::time::timeout(
             spec.timeout,
-            upstream.client(spec.private_ok, false).request(r),
+            upstream.client(spec.private, Protocols::Any).request(r),
         )
         .await;
         let err = match sent {
@@ -231,7 +231,7 @@ mod tests {
             headers: Vec::new(),
             timeout: Duration::from_secs(1),
             retries: 0,
-            private_ok: false,
+            private: crate::addr::PrivateAddrs::Deny,
         }
     }
 

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use http::HeaderValue;
 use http::header::HOST;
+use http::{HeaderValue, StatusCode};
 use hyper_util::rt::TokioIo;
 use roxy_http::h1::ServerConn;
 use roxy_http::upstream::{
@@ -20,19 +20,22 @@ use roxy_http::ws::{
 use roxy_http::{
     Body, BodyError, CanonicalRequest, CanonicalResponse, Limits, ParseError, WriteError,
 };
+use roxy_rules::RuleId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
+use crate::addr::PrivateAddrs;
 use crate::body::{counted, counted_until_sent};
 use crate::capture::{self, Tap};
 use crate::flowlog::{DecisionKind, FlowEvent};
 use crate::io::{ClientIo, Io};
 use crate::listener::ClientConn;
 use crate::pipeline::{
-    BodyIo, FlowCx, Refusal, RefusalKind, ResponseVerdict, Verdict, request_steps, response_steps,
+    BodyIo, FlowCx, PerDir, Refusal, RefusalKind, ResponseVerdict, Verdict, request_steps,
+    response_steps,
 };
 use crate::server::Shared;
-use crate::upstream::{ConnectError, classify, describe};
+use crate::upstream::{ConnectError, Protocols, classify, describe};
 use crate::view::host_text;
 use crate::watch::{Dir, Watch, watched};
 
@@ -174,7 +177,7 @@ pub(crate) fn refusal_response(cx: &mut FlowCx, refusal: &Refusal) -> CanonicalR
         cx.record.reason.clone_from(&refusal.reason);
     }
     let res = refusal.response(&cx.flow);
-    cx.record.response_status = Some(refusal.status);
+    cx.record.response_status = Some(refusal.status.as_u16());
     cx.record.response_headers_bytes = res.headers.wire_len() as u64;
     cx.record.response_bytes = res.body.known_length().unwrap_or(0);
     res
@@ -391,9 +394,9 @@ fn upstream_refusal(cx: &FlowCx, e: &ConnectError, host: &str, port: u16) -> Ref
     });
     tracing::info!(flow = %cx.flow, host, reason, error = %e, "upstream error");
     let status = if matches!(e, ConnectError::Timeout(_)) {
-        504
+        StatusCode::GATEWAY_TIMEOUT
     } else {
-        502
+        StatusCode::BAD_GATEWAY
     };
     Refusal::upstream(status, reason, "upstream unavailable")
 }
@@ -408,7 +411,11 @@ fn protocol_refusal(cx: &FlowCx, host: &str, port: u16, message: String) -> Refu
         reason: "protocol_error".to_owned(),
         message,
     });
-    Refusal::upstream(502, "protocol_error", "upstream protocol error")
+    Refusal::upstream(
+        StatusCode::BAD_GATEWAY,
+        "protocol_error",
+        "upstream protocol error",
+    )
 }
 
 /// What the upstream step produced.
@@ -489,7 +496,10 @@ async fn response_head<F: Future>(
 async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalRequest) -> Outcome {
     let watch = Watch::new(cx);
     cx.watch = Some(watch.clone());
-    let (mut up_tap, down_tap) = taps(cx);
+    let PerDir {
+        request: mut up_tap,
+        response: down_tap,
+    } = taps(cx);
     let wants_ws = req
         .meta
         .upgrade
@@ -512,7 +522,10 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
     if let Err(e) = cx
         .snap
         .upstream
-        .preflight(&req.authority, cx.opts.private_ok)
+        .preflight(
+            &req.authority,
+            PrivateAddrs::from_private_ok(cx.opts.private_ok),
+        )
         .await
     {
         let (host, port) = (host_text(&req.authority.host), req.authority.port);
@@ -542,7 +555,10 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
             }
             if let Some((upstream, key)) = upgrade {
                 // The relay takes the taps after the `101`.
-                cx.taps = (up_tap, down_tap);
+                cx.taps = PerDir {
+                    request: up_tap,
+                    response: down_tap,
+                };
                 return Outcome::Upgrade { res, upstream, key };
             }
             let body = std::mem::take(&mut res.body);
@@ -568,7 +584,12 @@ async fn upgrade_upstream(
     let key = validate_upgrade_request(&req).map_err(|e| {
         Failed::Refuse(Refusal {
             reason: Some(e.reason.as_str().to_owned()),
-            ..Refusal::deny(400, "invalid websocket upgrade", "_websocket", true)
+            ..Refusal::deny(
+                StatusCode::BAD_REQUEST,
+                "invalid websocket upgrade",
+                RuleId::new("_websocket"),
+                true,
+            )
         })
     })?;
     if crate::addons::ws_without_extensions(&cx.snap, cx.layer_ran) {
@@ -586,10 +607,10 @@ async fn upgrade_upstream(
         .map_err(|e| Failed::Refuse(protocol_refusal(cx, &host, port, e.to_string())))?;
     set_host_override(cx, &mut http_req);
     let upstream_client = cx.snap.upstream.clone();
-    let private_ok = cx.opts.private_ok;
+    let private = PrivateAddrs::from_private_ok(cx.opts.private_ok);
     let attempt = async {
         let io = upstream_client
-            .connect_h1(scheme, &authority, private_ok)
+            .connect_h1(scheme, &authority, private)
             .await
             .map_err(Some)?;
         let (mut sender, connection) =
@@ -666,7 +687,14 @@ async fn plain_upstream<F: Front>(
     let upstream = response_head(
         cx.snap
             .upstream
-            .client(cx.opts.private_ok, cx.host_override.is_some())
+            .client(
+                PrivateAddrs::from_private_ok(cx.opts.private_ok),
+                if cx.host_override.is_some() {
+                    Protocols::Http1Only
+                } else {
+                    Protocols::Any
+                },
+            )
             .request(http_req),
         sent,
         req_counter,
@@ -770,10 +798,9 @@ async fn splice_websocket(
         cx.emit_request_event();
         return None;
     };
-    let (mut up_tap, down_tap) = std::mem::take(&mut cx.taps);
+    let mut taps = std::mem::take(&mut cx.taps);
     if parse {
         let max = cx.snap.limits.max_ws_message_bytes;
-        let taps = (up_tap, down_tap);
         let r = relay_messages(client_io, upstream, leftover, (idle, max), &watch, taps).await;
         finish_websocket(&mut cx, r);
         return None;
@@ -787,7 +814,7 @@ async fn splice_websocket(
             cx.emit_request_event();
             return None;
         }
-        if let Some(t) = up_tap.as_mut() {
+        if let Some(t) = taps.request.as_mut() {
             t.data(&leftover);
         }
         if upstream.write_all(&leftover).await.is_err() {
@@ -795,7 +822,7 @@ async fn splice_websocket(
             return None;
         }
     }
-    let (c2s, s2c) = splice(client_io, upstream, idle, &watch, (up_tap, down_tap)).await;
+    let (c2s, s2c) = splice(client_io, upstream, idle, &watch, taps).await;
     let r = Relayed {
         c2s: c2s + c2s_extra,
         s2c,
@@ -893,7 +920,7 @@ async fn splice(
     upstream: impl Io,
     idle: Duration,
     watch: &Watch,
-    taps: (Option<Tap>, Option<Tap>),
+    taps: PerDir<Option<Tap>>,
 ) -> (u64, u64) {
     use std::sync::atomic::AtomicU64;
     let base = Instant::now();
@@ -902,7 +929,10 @@ async fn splice(
     let s2c = Arc::new(AtomicU64::new(0));
     let (cr, cw) = tokio::io::split(client);
     let (ur, uw) = tokio::io::split(upstream);
-    let (up_tap, down_tap) = taps;
+    let PerDir {
+        request: up_tap,
+        response: down_tap,
+    } = taps;
     let a = pump(
         cr,
         uw,
@@ -1173,7 +1203,10 @@ async fn relay_messages(
     leftover: Vec<u8>,
     (idle, max): (Duration, u64),
     watch: &Watch,
-    (up_tap, down_tap): (Option<Tap>, Option<Tap>),
+    PerDir {
+        request: up_tap,
+        response: down_tap,
+    }: PerDir<Option<Tap>>,
 ) -> Relayed {
     let base = Instant::now();
     let last = AtomicU64::new(0);
@@ -1253,15 +1286,15 @@ async fn relay_messages(
 
 /// Capture taps for an exchange about to be forwarded: per direction, when
 /// a `capture` effect selected it or the capture log takes everything.
-fn taps(cx: &FlowCx) -> (Option<Tap>, Option<Tap>) {
+fn taps(cx: &FlowCx) -> PerDir<Option<Tap>> {
     let Some(log) = &cx.shared.capture else {
-        return (None, None);
+        return PerDir::default();
     };
     let all = log.captures_all();
     let flow = cx.flow.to_string();
     let tap = |on: bool, dir| (on || all).then(|| Tap::new(log.clone(), &flow, dir));
-    (
-        tap(cx.capture.0, capture::Dir::Request),
-        tap(cx.capture.1, capture::Dir::Response),
-    )
+    PerDir {
+        request: tap(cx.capture.request, capture::Dir::Request),
+        response: tap(cx.capture.response, capture::Dir::Response),
+    }
 }

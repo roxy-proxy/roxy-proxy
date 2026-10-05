@@ -3,8 +3,11 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::net::Ipv4Addr;
+use std::num::NonZeroU16;
 
 use regex::Regex;
+use roxy_http::Host;
 
 use super::{
     CAction, CompiledRule, Condition, MetricDef, PolicyInput, RuleKind, RuleShape, is_header_value,
@@ -15,7 +18,9 @@ use crate::config::{
     Action, DenyArgs, MetricConfig, MetricCount, RedirectArgs, RewritePathArgs, RuleConfig, Upgrade,
 };
 use crate::diag::{Diagnostic, RuleId};
-use crate::eval::{AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Effect};
+use crate::eval::{
+    AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, DenyStatus, Effect,
+};
 use crate::lexer::is_ident;
 use crate::template::{Part, has_secrets, mentions_secret, parse_template, secret_names};
 use crate::types::{Field, Reads, is_token};
@@ -523,14 +528,19 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 message,
                 close,
             }) => {
-                let status = status.unwrap_or(DEFAULT_DENY_STATUS);
-                if !(400..=599).contains(&status) {
-                    self.push(
-                        rule,
-                        apath,
-                        format!("deny status {status} must be a 4xx or 5xx code"),
-                    );
-                }
+                let status = match status.map(|s| (s, DenyStatus::new(s))) {
+                    None => DEFAULT_DENY_STATUS,
+                    Some((_, Some(s))) => s,
+                    Some((s, None)) => {
+                        self.push(
+                            rule,
+                            apath,
+                            format!("deny status {s} must be a 4xx or 5xx code"),
+                        );
+                        // The error fails the compile; this is never served.
+                        DEFAULT_DENY_STATUS
+                    }
+                };
                 Decision::Deny {
                     status,
                     message: message
@@ -611,24 +621,24 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
     }
 
     fn redirect(&mut self, r: &RedirectArgs, rule: Option<&RuleId>, apath: &str) -> Effect {
-        let host = r.host.strip_suffix('.').unwrap_or(&r.host);
-        let valid = !host.is_empty()
-            && host
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b':'));
-        if !valid {
+        // The same grammar as a request target's host, so the proxy never
+        // meets a redirect host it can't parse. On an error the compile
+        // fails, so the placeholders below are never served.
+        let host = roxy_http::url::parse_host(r.host.as_bytes()).unwrap_or_else(|e| {
             self.push(
                 rule,
                 apath,
-                format!("redirect host {:?} is not a valid host name or IP", r.host),
+                format!("redirect host {:?} is not a valid host: {e}", r.host),
             );
-        }
-        if r.port == 0 {
+            Host::Ipv4(Ipv4Addr::UNSPECIFIED)
+        });
+        let port = NonZeroU16::new(r.port).unwrap_or_else(|| {
             self.push(rule, apath, "redirect port must not be 0");
-        }
+            NonZeroU16::MIN
+        });
         Effect::Redirect {
-            host: host.to_ascii_lowercase(),
-            port: r.port,
+            host,
+            port,
             scheme: r.scheme,
             rewrite_host: r.rewrite_host,
         }

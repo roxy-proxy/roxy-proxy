@@ -158,7 +158,7 @@ impl LayerHost for Mock {
             flow_id: "flow-1".into(),
             conn_id: "conn-1".into(),
             principal: Principal {
-                client_ip: "10.0.0.1".into(),
+                client_ip: std::net::IpAddr::from([10, 0, 0, 1]),
                 client_user: None,
                 listener: "main".into(),
                 tls_sni: None,

@@ -54,6 +54,7 @@ use tokio::time::{Instant, timeout, timeout_at};
 pub use chunked::{ChunkedDecoder, Decoded};
 pub use head::{Framing, Head, HeadScan, RequestHead, Role, parse_head, scan_head};
 
+use crate::len_u64;
 use crate::model::{
     Authority, Body, BodyError, BodySender, CanonicalRequest, CanonicalResponse, Headers,
     HttpFlags, Limits, ParseError, Reason, RequestMeta, TargetForm, Version, WriteError,
@@ -243,7 +244,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
                         return Ok(());
                     }
                     (None, Pending::Data(b)) => {
-                        feed.drained += b.len() as u64;
+                        feed.drained += len_u64(b.len());
                         if feed.drained > DRAIN_LIMIT {
                             tracing::debug!("drain limit reached; connection will close");
                             self.feed = None;
@@ -267,7 +268,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
                         .unwrap_or(usize::MAX)
                         .min(self.buf.len())
                         .min(READ_CHUNK);
-                    *rem -= n as u64;
+                    *rem -= len_u64(n);
                     Decoded::Data(self.buf.split_to(n).freeze())
                 }
                 BodyDecoder::Chunked(d) => d.decode(&mut self.buf)?,
@@ -291,13 +292,20 @@ enum State {
     Broken,
 }
 
+/// `Expect: 100-continue` on the current request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Continue {
+    NotExpected,
+    /// Expected; `100 Continue` not sent yet.
+    Pending,
+    Sent,
+}
+
 #[derive(Debug)]
-#[allow(clippy::struct_excessive_bools)]
 struct Exchange {
     is_head: bool,
     close: bool,
-    expect_continue: bool,
-    sent_100: bool,
+    expect: Continue,
     version: Version,
     upgrade: Option<String>,
 }
@@ -422,7 +430,7 @@ async fn write_message<W: AsyncWrite + Unpin>(
         if data.is_empty() {
             continue;
         }
-        sent += data.len() as u64;
+        sent += len_u64(data.len());
         match framing {
             OutFraming::Length(n) => {
                 if sent > n {
@@ -617,8 +625,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
                 self.exchange = Some(Exchange {
                     is_head: false,
                     close: meta.close,
-                    expect_continue: false,
-                    sent_100: false,
+                    expect: Continue::NotExpected,
                     version: meta.version,
                     upgrade: None,
                 });
@@ -657,8 +664,11 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         self.exchange = Some(Exchange {
             is_head: h.method == crate::model::Method::Head,
             close: h.meta.close,
-            expect_continue: h.meta.expect_continue,
-            sent_100: false,
+            expect: if h.meta.expect_continue {
+                Continue::Pending
+            } else {
+                Continue::NotExpected
+            },
             version: h.meta.version,
             upgrade: h.meta.upgrade.clone(),
         });
@@ -690,10 +700,9 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         }
         let idle = self.limits.body_idle_timeout;
         if let Some(ex) = self.exchange.as_mut()
-            && ex.expect_continue
-            && !ex.sent_100
+            && ex.expect == Continue::Pending
         {
-            ex.sent_100 = true;
+            ex.expect = Continue::Sent;
             write_timed(&mut self.w, &[b"HTTP/1.1 100 Continue\r\n\r\n"], idle).await?;
             flush_timed(&mut self.w, idle).await?;
         }
@@ -776,7 +785,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         let Some(ex) = self.exchange.take() else {
             return Err(WriteError::State("no exchange"));
         };
-        if ex.expect_continue && !ex.sent_100 && self.r.feed.is_some() {
+        if ex.expect == Continue::Pending && self.r.feed.is_some() {
             // The client may or may not send the body now; we cannot know
             // where the next request starts, so close after the response.
             if let Some(mut feed) = self.r.feed.take()
@@ -939,7 +948,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
             }
             self.r.abandoned = true;
         }
-        let len = body.len() as u64;
+        let len = len_u64(body.len());
         // A HEAD response describes the body but never carries it.
         let framing = if self.exchange.as_ref().is_some_and(|e| e.is_head) {
             OutFraming::Head(Some(len))

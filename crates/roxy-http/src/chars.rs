@@ -61,6 +61,10 @@ pub(crate) const fn hex_val(b: u8) -> Option<u8> {
 }
 
 /// Upper-case hex digit for a nibble.
+#[expect(
+    clippy::as_conversions,
+    reason = "`usize::from` is not const; u8 to usize is lossless"
+)]
 pub(crate) const fn hex_upper(n: u8) -> u8 {
     b"0123456789ABCDEF"[(n & 0x0f) as usize]
 }

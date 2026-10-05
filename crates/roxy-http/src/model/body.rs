@@ -12,6 +12,7 @@ use http_body::{Frame, SizeHint};
 use tokio::sync::mpsc;
 
 use super::error::BodyError;
+use crate::len_u64;
 
 /// Frames buffered in a body channel before the sender blocks
 /// (backpressure). With the h1 codec's read size this bounds per-request
@@ -95,7 +96,7 @@ impl Body {
     /// A body from a single buffer.
     pub fn from_bytes(b: impl Into<Bytes>) -> Self {
         let b = b.into();
-        let len = b.len() as u64;
+        let len = len_u64(b.len());
         if len == 0 {
             return Self::empty();
         }
@@ -212,7 +213,7 @@ impl Body {
                 Some(Err(e)) => return Err(e),
                 Some(Ok(f)) => {
                     if let Ok(d) = f.into_data() {
-                        if (buf.len() + d.len()) as u64 > max {
+                        if len_u64(buf.len() + d.len()) > max {
                             return Err(BodyError::TooLarge { limit: max });
                         }
                         buf.extend_from_slice(&d);
@@ -259,7 +260,7 @@ impl Body {
                 Ok(d) => d,
                 Err(trailers) => {
                     // Trailers end the data: hand them back as the rest.
-                    let len = buf.len() as u64;
+                    let len = len_u64(buf.len());
                     return Ok((buf.freeze(), Some(self.prefixed(Some(trailers), len))));
                 }
             };
@@ -272,7 +273,7 @@ impl Body {
                 // Exactly `max` bytes so far: the body is longer only if
                 // anything else follows. Peek one more frame.
                 buf.extend_from_slice(&data);
-                let len = buf.len() as u64;
+                let len = len_u64(buf.len());
                 let next = poll_fn(|cx| http_body::Body::poll_frame(Pin::new(&mut self), cx)).await;
                 return match next {
                     None => Ok((buf.freeze(), None)),
@@ -282,7 +283,7 @@ impl Body {
             }
             let tail = data.split_off(room);
             buf.extend_from_slice(&data);
-            let len = buf.len() as u64;
+            let len = len_u64(buf.len());
             return Ok((
                 buf.freeze(),
                 Some(self.prefixed(Some(Frame::data(tail)), len)),
@@ -405,7 +406,7 @@ where
             Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                 Ok(mut d) => {
                     let bytes = d.copy_to_bytes(d.remaining());
-                    this.seen += bytes.len() as u64;
+                    this.seen += len_u64(bytes.len());
                     if this.seen > this.max {
                         return Poll::Ready(Some(Err(BodyError::TooLarge { limit: this.max })));
                     }
@@ -489,7 +490,7 @@ impl BodySender {
         if data.is_empty() {
             return Ok(());
         }
-        let total = self.sent + data.len() as u64;
+        let total = self.sent + len_u64(data.len());
         if total > self.max {
             return Err(self.fail(BodyError::TooLarge { limit: self.max }));
         }

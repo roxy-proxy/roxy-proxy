@@ -1,5 +1,7 @@
 //! The interface the proxy implements for a layer.
 
+use std::net::IpAddr;
+
 use roxy_http::Body;
 
 /// A request passing through a layer: the head as an [`http::Request`]
@@ -20,10 +22,10 @@ pub type LayerRequest = http::Request<Body>;
 pub type LayerResponse = http::Response<Body>;
 
 /// The client as roxy established it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
     /// Client IP address.
-    pub client_ip: String,
+    pub client_ip: IpAddr,
     /// User from proxy authentication, if any.
     pub client_user: Option<String>,
     /// Name of the listener the client connected to.
@@ -33,7 +35,7 @@ pub struct Principal {
 }
 
 /// The current flow (`flow.current`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowInfo {
     /// Flow id, as in the flow log.
     pub flow_id: String,

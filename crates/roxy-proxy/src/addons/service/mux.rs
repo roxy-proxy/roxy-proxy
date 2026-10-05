@@ -33,10 +33,12 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_util::sync::CancellationToken;
 
-use super::super::{EndpointSpec, StackError, StackFlow, endpoint};
+use super::super::{AddonMode, EndpointSpec, StackError, StackFlow, endpoint};
 use super::{First, In, Out, ServiceError, ServiceSpec};
+use crate::addr::PrivateAddrs;
 use crate::flowlog::FlowEvent;
 use crate::upstream::MaybeTls;
+use crate::watch::Dir;
 
 /// The WebSocket subprotocol a service must accept.
 pub const SUBPROTOCOL: &str = "roxy.layer.v2";
@@ -72,7 +74,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 struct PoolKey {
     url: String,
     headers: Vec<(String, String)>,
-    private_ok: bool,
+    private: PrivateAddrs,
     max_connections: usize,
     max_streams: usize,
 }
@@ -234,7 +236,7 @@ impl LinkShared {
             s.open.drain().map(|(_, st)| st).collect()
         };
         for s in streams {
-            s.fail(e.clone(), false);
+            s.fail(e.clone(), Reset::Skip);
         }
         let _ = self.ctl.send(Message::Close(None));
     }
@@ -271,7 +273,7 @@ pub(super) struct Stream {
     link: Arc<Link>,
     st: Arc<StackFlow>,
     index: usize,
-    observe: bool,
+    mode: AddonMode,
     state: Mutex<StreamState>,
     more_credit: Notify,
     /// Wakes whatever is sending or waiting on the stream once it ended.
@@ -310,7 +312,7 @@ enum End<'a> {
     Quiet,
     /// The service failed it. `reset` tells the service, when it has not
     /// already closed or reset the stream itself.
-    Failed { e: ServiceError, reset: bool },
+    Failed { e: ServiceError, reset: Reset },
     /// roxy gave up on it (the client went away, a missed deadline, an
     /// upgrade): the service is told, whoever is waiting gets `why`, and
     /// nothing is logged as the service's fault.
@@ -320,8 +322,16 @@ enum End<'a> {
 /// A body being fed from the stream.
 struct Feeding {
     inbox: Arc<Inbox>,
-    /// It is the request's (else the response's).
-    request: bool,
+    /// Whose body it is.
+    dir: Dir,
+}
+
+/// Whether failing a stream tells the service (a `reset` message).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reset {
+    Send,
+    /// The connection is gone, or the service already ended the stream.
+    Skip,
 }
 
 /// Bytes for one body, between the reader and that body's feeder. At most
@@ -366,7 +376,7 @@ impl Stream {
             }
             s.ended = true;
             if let End::Failed { e, .. } = &end
-                && self.observe
+                && self.mode == AddonMode::Observe
             {
                 s.observe_error = Some(e.clone());
             }
@@ -384,7 +394,7 @@ impl Stream {
             End::Quiet => return,
             End::Failed { e, reset } => {
                 let message = e.to_string();
-                (e, reset.then_some(message), true)
+                (e, (reset == Reset::Send).then_some(message), true)
             }
             End::Abandoned(why) => (
                 ServiceError::Closed(why.to_owned()),
@@ -404,18 +414,18 @@ impl Stream {
             && !tx.is_closed()
         {
             let _ = tx.send(Err(e));
-        } else if blame && !self.observe {
+        } else if blame && self.mode == AddonMode::Enforce {
             // The head has gone on: the failure is logged here, since no
             // answer carries it.
             let name = self.name();
             let err = StackError::Service(e);
             self.st.fail(&name, err.clone());
-            super::super::emit_stack_error(&self.st, &name, &err, false);
+            super::super::emit_stack_error(&self.st, &name, &err, AddonMode::Enforce);
         }
     }
 
     /// The service failed this stream.
-    fn fail(&self, e: ServiceError, reset: bool) {
+    fn fail(&self, e: ServiceError, reset: Reset) {
         self.settle(End::Failed { e, reset });
     }
 
@@ -536,18 +546,18 @@ impl Stream {
         let n = b.len() as u64;
         let mut s = lock(&self.state);
         let inbox = s.feeding.as_ref().map(|f| f.inbox.clone());
-        if inbox.is_none() && !self.observe {
+        if inbox.is_none() && self.mode == AddonMode::Enforce {
             drop(s);
             return self.fail(
                 ServiceError::Protocol("body bytes before a head".into()),
-                true,
+                Reset::Send,
             );
         }
         if s.unacked + n > WINDOW {
             drop(s);
             return self.fail(
                 ServiceError::Protocol("body bytes past the stream's credit".into()),
-                true,
+                Reset::Send,
             );
         }
         s.unacked += n;
@@ -588,10 +598,10 @@ impl Stream {
                     || "the service reset the stream".to_owned(),
                     |m| format!("the service reset the stream: {m}"),
                 );
-                return self.fail(ServiceError::Closed(why), false);
+                return self.fail(ServiceError::Closed(why), Reset::Skip);
             }
             // An observer's answers are ignored.
-            _ if self.observe => return,
+            _ if self.mode == AddonMode::Observe => return,
             _ => {}
         }
         let mut s = lock(&self.state);
@@ -599,7 +609,7 @@ impl Stream {
         let done = !s.waiting();
         drop(s);
         match result {
-            Err(e) => self.fail(e, true),
+            Err(e) => self.fail(e, Reset::Send),
             Ok(()) if done => self.settle(End::Quiet),
             Ok(()) => {}
         }
@@ -610,14 +620,18 @@ impl Stream {
         let limits = &self.st.snap.limits;
         match m {
             In::RequestEnd | In::ResponseEnd => {
-                let request = matches!(m, In::RequestEnd);
+                let dir = if matches!(m, In::RequestEnd) {
+                    Dir::Request
+                } else {
+                    Dir::Response
+                };
                 match s.feeding.take() {
-                    Some(f) if f.request == request => {
+                    Some(f) if f.dir == dir => {
                         lock(&f.inbox.q).end = true;
                         f.inbox.ready.notify_one();
                         Ok(())
                     }
-                    _ if request => Err(unexpected("request_end")),
+                    _ if dir == Dir::Request => Err(unexpected("request_end")),
                     _ => Err(unexpected("response_end")),
                 }
             }
@@ -646,7 +660,7 @@ impl Stream {
                 *r.method_mut() = method;
                 *r.uri_mut() = uri;
                 *r.headers_mut() = headers;
-                s.feeding = Some(self.feed(body_tx, true));
+                s.feeding = Some(self.feed(body_tx, Dir::Request));
                 if let Some(tx) = s.first.take() {
                     let _ = tx.send(Ok(First::Forward(r)));
                 }
@@ -669,7 +683,7 @@ impl Stream {
                 *r.status_mut() = status;
                 *r.headers_mut() = headers;
                 Self::give(s, r, "response")?;
-                s.feeding = Some(self.feed(body_tx, false));
+                s.feeding = Some(self.feed(body_tx, Dir::Response));
                 Ok(())
             }
             In::Deny { status, message } => {
@@ -700,16 +714,16 @@ impl Stream {
     }
 
     /// Starts feeding a body from the stream.
-    fn feed(self: &Arc<Self>, tx: BodySender, request: bool) -> Feeding {
+    fn feed(self: &Arc<Self>, tx: BodySender, dir: Dir) -> Feeding {
         let inbox = Arc::new(Inbox::default());
-        tokio::spawn(feeder(self.clone(), inbox.clone(), tx, request));
-        Feeding { inbox, request }
+        tokio::spawn(feeder(self.clone(), inbox.clone(), tx, dir));
+        Feeding { inbox, dir }
     }
 }
 
 /// Moves one body's bytes from its inbox to its consumer, crediting the
 /// service as they go.
-async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodySender, request: bool) {
+async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodySender, dir: Dir) {
     loop {
         let (chunk, end, abort) = {
             let mut q = lock(&inbox.q);
@@ -728,7 +742,7 @@ async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodySender, requ
             match sent {
                 Ok(()) => stream.grant(n),
                 Err(BodyError::Closed | BodyError::Stopped) => {
-                    if request {
+                    if dir == Dir::Request {
                         // A deny below, say: the rest is read and dropped,
                         // and the service still owes the response.
                         let rest = {
@@ -743,7 +757,7 @@ async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodySender, requ
                     return;
                 }
                 // More than declared, or than the limit.
-                Err(e) => return stream.fail(ServiceError::Protocol(e.to_string()), true),
+                Err(e) => return stream.fail(ServiceError::Protocol(e.to_string()), Reset::Send),
             }
             continue;
         }
@@ -751,7 +765,7 @@ async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodySender, requ
             match tx.finish().await {
                 Ok(()) | Err(BodyError::Closed | BodyError::Stopped) => {}
                 // Shorter than declared.
-                Err(e) => stream.fail(ServiceError::Protocol(e.to_string()), true),
+                Err(e) => stream.fail(ServiceError::Protocol(e.to_string()), Reset::Send),
             }
             return;
         }
@@ -787,7 +801,7 @@ pub(super) async fn open(
     st: &Arc<StackFlow>,
     index: usize,
     svc: &ServiceSpec,
-    observe: bool,
+    mode: AddonMode,
 ) -> Result<(Arc<Stream>, Option<Answers>), ServiceError> {
     let addon = &st.snap.addons[index];
     let spec = addon
@@ -801,7 +815,7 @@ pub(super) async fn open(
             .iter()
             .map(|(n, v)| (n.as_str().to_owned(), v.clone()))
             .collect(),
-        private_ok: spec.private_ok,
+        private: spec.private,
         max_connections: svc.max_connections,
         max_streams: svc.max_streams,
     };
@@ -827,7 +841,7 @@ pub(super) async fn open(
 
     let (first_tx, first_rx) = oneshot::channel();
     let (second_tx, second_rx) = oneshot::channel();
-    let (answers, state) = if observe {
+    let (answers, state) = if mode == AddonMode::Observe {
         (None, StreamState::default())
     } else {
         (
@@ -854,7 +868,7 @@ pub(super) async fn open(
             link: link.clone(),
             st: st.clone(),
             index,
-            observe,
+            mode,
             state: Mutex::new(StreamState {
                 credit: WINDOW,
                 slot: Some(slot),
@@ -867,7 +881,7 @@ pub(super) async fn open(
         stream
     };
     let opening = Opening(Some(&stream));
-    if !stream.send(&open_message(st, &addon.name, observe)).await {
+    if !stream.send(&open_message(st, &addon.name, mode)).await {
         drop(opening);
         return Err(ServiceError::Closed("the connection closed".into()));
     }
@@ -877,12 +891,12 @@ pub(super) async fn open(
 
 /// The `open` message: who the client is and where the exchange is, so
 /// the service can key its state on (flow, layer).
-fn open_message(st: &StackFlow, layer: &str, observe: bool) -> Out {
+fn open_message(st: &StackFlow, layer: &str, mode: AddonMode) -> Out {
     Out::Open {
         flow: st.flow.to_string(),
         conn: st.client.id.to_string(),
         layer: layer.to_owned(),
-        mode: if observe { "observe" } else { "enforce" },
+        mode: mode.as_str(),
         client_ip: st.client.peer.ip().to_string(),
         client_user: st.client.user.clone(),
         listener: st.client.listener.name.clone(),
@@ -939,7 +953,7 @@ async fn dial(
         let io = st
             .snap
             .upstream
-            .connect_h1(scheme, &authority, spec.private_ok)
+            .connect_h1(scheme, &authority, spec.private)
             .await
             .map_err(|e| ServiceError::Connect(e.to_string()))?;
         let config = WebSocketConfig::default()
@@ -1060,7 +1074,10 @@ async fn read(shared: Arc<LinkShared>, mut ws: SplitStream<Ws>) {
                         match serde_json::from_value::<In>(serde_json::Value::Object(v)) {
                             Ok(m) => s.control(m),
                             Err(e) => {
-                                s.fail(ServiceError::Protocol(format!("bad message: {e}")), true);
+                                s.fail(
+                                    ServiceError::Protocol(format!("bad message: {e}")),
+                                    Reset::Send,
+                                );
                             }
                         }
                     }
@@ -1154,7 +1171,7 @@ mod tests {
     async fn an_open_given_up_mid_send_releases_its_place() {
         let kit = testing::kit(
             ALLOW_UP,
-            vec![testing::addon("s", "stall", false, |s| {
+            vec![testing::addon("s", "stall", AddonMode::Enforce, |s| {
                 s.max_connections = 1;
                 s.max_streams = 2;
             })],
@@ -1166,7 +1183,7 @@ mod tests {
             panic!("a service layer");
         };
 
-        let (first, _) = open(&st, 0, svc, false).await.unwrap();
+        let (first, _) = open(&st, 0, svc, AddonMode::Enforce).await.unwrap();
         // The service never reads: the writer stalls on the socket, and
         // the queue behind it fills.
         let frame = binary(first.id, &vec![0u8; MAX_BODY_FRAME]);
@@ -1177,8 +1194,11 @@ mod tests {
                 break;
             }
         }
-        let given_up =
-            tokio::time::timeout(Duration::from_millis(100), open(&st, 0, svc, false)).await;
+        let given_up = tokio::time::timeout(
+            Duration::from_millis(100),
+            open(&st, 0, svc, AddonMode::Enforce),
+        )
+        .await;
         assert!(given_up.is_err(), "the open message cannot go");
 
         assert_eq!(lock(&first.link.shared.streams).open.len(), 1);

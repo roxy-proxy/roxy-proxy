@@ -130,7 +130,7 @@ Non-terminal:
 | `remove_header: [names]` | same as `set_header` | |
 | `rewrite_path: { match, to }` | head rules | Regex (anchored, like `matches`) with `$1` / `${name}` groups. The result is re-normalised. |
 | `set_query: { k: v }`, `remove_query: [k]` | head rules | |
-| `redirect: { host, port, scheme?, rewrite_host? }` | head rules | Change the upstream target. The address floor and deny lists check the new target's IPs. `Host` is unchanged unless `rewrite_host: true`; while it is unchanged, the request goes upstream over HTTP/1.1, because HTTP/2 needs `:authority` and `host` to agree. |
+| `redirect: { host, port, scheme?, rewrite_host? }` | head rules | Change the upstream target. `host` follows the same rules as a request's host: a DNS name, a dotted-quad IPv4 address or a bracketed IPv6 address (`[::1]`). Anything else, and port `0`, is a config error. The address floor and deny lists check the new target's IPs. `Host` is unchanged unless `rewrite_host: true`; while it is unchanged, the request goes upstream over HTTP/1.1, because HTTP/2 needs `:authority` and `host` to agree. |
 | `tag: name` | all | Sets `tag["name"]` for later rules, addons and the log. |
 | `log: { level, message }` | all | Emits a `log` flow event. |
 | `set_state: { key, value, ttl? }` | all | Writes the [state store](#state). |

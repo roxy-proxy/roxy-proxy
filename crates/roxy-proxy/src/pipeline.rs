@@ -19,7 +19,7 @@
 //! verdicts exhaustively with no wildcard arm, so a new variant cannot
 //! silently fall through to forwarding.
 
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -28,14 +28,14 @@ use std::time::Instant;
 use bytes::Bytes;
 use http::StatusCode;
 use roxy_http::h1::ServerConn;
-use roxy_http::url::{normalize_path, normalize_query, parse_host};
+use roxy_http::url::{normalize_path, normalize_query};
 use roxy_http::{
     Authority, Body, BodyError, CanonicalRequest, CanonicalResponse, ParseError, Query, Reason,
     Scheme,
 };
 use roxy_rules::{
-    AllowOpts, CaptureTarget, Decision, Effect, EvalContext, FAIL_CLOSED_MESSAGE,
-    FAIL_CLOSED_STATUS, FailClosedReason, LogLevel, Outcome,
+    AllowOpts, CaptureTarget, Decision, DenyStatus, Effect, EvalContext, FAIL_CLOSED_MESSAGE,
+    FAIL_CLOSED_STATUS, FailClosedReason, LogLevel, Outcome, RuleId,
 };
 use ulid::Ulid;
 
@@ -56,8 +56,6 @@ pub(crate) type CollectFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + '
 
 /// Rule id used for denies by the upstream address floor.
 pub(crate) const ADDRESS_POLICY_RULE: &str = "_address_policy";
-/// Rule id for fail-closed denies.
-pub(crate) const FAIL_CLOSED_RULE: &str = "_fail_closed";
 
 /// Whether a local answer is a policy decision or a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,14 +66,42 @@ pub(crate) enum RefusalKind {
     UpstreamError,
 }
 
+/// What decided a flow: a rule (or one of the reserved `_…` ids roxy uses
+/// for its own decisions), or an addon layer. Rendered as the flow log's
+/// `terminal_rule`, `x-roxy-rule` and the deny body's `rule`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Decider {
+    Rule(RuleId),
+    Layer(String),
+}
+
+impl fmt::Display for Decider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Decider::Rule(id) => write!(f, "{id}"),
+            Decider::Layer(name) => write!(f, "layer:{name}"),
+        }
+    }
+}
+
+/// A deny status as an HTTP status code.
+pub(crate) fn status_code(s: DenyStatus) -> StatusCode {
+    StatusCode::from_u16(s.get()).expect("4xx and 5xx are valid status codes")
+}
+
+/// Rule ids as the flow log writes them.
+pub(crate) fn rule_names(rules: &[RuleId]) -> Vec<String> {
+    rules.iter().map(ToString::to_string).collect()
+}
+
 /// A response roxy writes itself instead of forwarding.
 #[derive(Debug, Clone)]
 pub(crate) struct Refusal {
     pub kind: RefusalKind,
-    pub status: u16,
+    pub status: StatusCode,
     pub message: String,
-    /// Rule id for `x-roxy-rule` and the JSON body (denies only).
-    pub rule: Option<String>,
+    /// For `x-roxy-rule` and the JSON body (denies only).
+    pub rule: Option<Decider>,
     /// Close the client connection after the response.
     pub close: bool,
     /// Stable reason code for the flow log (and the body of upstream errors).
@@ -83,12 +109,12 @@ pub(crate) struct Refusal {
 }
 
 impl Refusal {
-    pub(crate) fn deny(status: u16, message: &str, rule: &str, close: bool) -> Self {
+    pub(crate) fn deny(status: StatusCode, message: &str, rule: RuleId, close: bool) -> Self {
         Self {
             kind: RefusalKind::Deny,
             status,
             message: message.to_owned(),
-            rule: Some(rule.to_owned()),
+            rule: Some(Decider::Rule(rule)),
             close,
             reason: None,
         }
@@ -99,9 +125,9 @@ impl Refusal {
         Self {
             reason: Some(reason.to_owned()),
             ..Self::deny(
-                FAIL_CLOSED_STATUS,
+                status_code(FAIL_CLOSED_STATUS),
                 FAIL_CLOSED_MESSAGE,
-                FAIL_CLOSED_RULE,
+                RuleId::new(RuleId::FAIL_CLOSED),
                 true,
             )
         }
@@ -112,16 +138,16 @@ impl Refusal {
         Self {
             reason: Some(reason.to_owned()),
             ..Self::deny(
-                403,
+                StatusCode::FORBIDDEN,
                 roxy_rules::DEFAULT_DENY_MESSAGE,
-                ADDRESS_POLICY_RULE,
+                RuleId::new(ADDRESS_POLICY_RULE),
                 true,
             )
         }
     }
 
     /// 502/504 for an upstream failure; always closes.
-    pub(crate) fn upstream(status: u16, reason: &str, message: &str) -> Self {
+    pub(crate) fn upstream(status: StatusCode, reason: &str, message: &str) -> Self {
         Self {
             kind: RefusalKind::UpstreamError,
             status,
@@ -134,11 +160,11 @@ impl Refusal {
 
     /// The deny response.
     pub(crate) fn response(&self, flow: &Ulid) -> CanonicalResponse {
-        let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::FORBIDDEN);
+        let status = self.status;
         let body = match (&self.rule, self.kind) {
             (Some(rule), RefusalKind::Deny) => serde_json::json!({
                 "error": self.message,
-                "rule": rule,
+                "rule": rule.to_string(),
                 "flow": flow.to_string(),
             }),
             _ => serde_json::json!({
@@ -151,7 +177,10 @@ impl Refusal {
         let _ = res.headers.insert("content-type", "application/json");
         let _ = res.headers.insert("cache-control", "no-store");
         if let Some(rule) = &self.rule
-            && res.headers.insert("x-roxy-rule", rule).is_err()
+            && res
+                .headers
+                .insert("x-roxy-rule", &rule.to_string())
+                .is_err()
         {
             // A rule id that is not a valid header value is still in the body.
             tracing::debug!("rule id is not a valid header value");
@@ -237,13 +266,20 @@ pub(crate) async fn response_steps(
 // Per-flow context
 // ---------------------------------------------------------------------------
 
+/// One value for each direction of an exchange.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct PerDir<T> {
+    pub request: T,
+    pub response: T,
+}
+
 /// What the flow log needs about a flow.
 #[derive(Debug, Default)]
 pub(crate) struct FlowRecord {
-    pub rules: Vec<String>,
+    pub rules: Vec<RuleId>,
     pub tags: Vec<String>,
     pub mutations: Vec<String>,
-    pub terminal_rule: Option<String>,
+    pub terminal_rule: Option<Decider>,
     pub reason: Option<String>,
     pub decision: Option<DecisionKind>,
     pub request_bytes: u64,
@@ -357,10 +393,10 @@ pub(crate) struct FlowCx {
     /// Capture this exchange's request / response: set by a
     /// `capture` effect at the head, or for every exchange with
     /// `log.capture.all`.
-    pub capture: (bool, bool),
+    pub capture: PerDir<bool>,
     /// Capture taps not yet handed to a body adapter (the WebSocket relay
     /// takes them after the `101`).
-    pub taps: (Option<Tap>, Option<Tap>),
+    pub taps: PerDir<Option<Tap>>,
     /// `Host` to send upstream after a `redirect` without `rewrite_host`.
     pub host_override: Option<String>,
     /// Request body bytes forwarded so far, once the request is on its way.
@@ -398,7 +434,7 @@ impl Drop for FlowCx {
 
 pub(crate) fn request_facts(req: &CanonicalRequest) -> RequestFacts {
     RequestFacts {
-        method: req.method.as_str().to_owned(),
+        method: req.method.clone(),
         scheme: req.scheme,
         host: req.authority.host.clone(),
         port: req.authority.port,
@@ -468,8 +504,8 @@ impl FlowCx {
             record: FlowRecord::default(),
             started: Instant::now(),
             watch: None,
-            capture: (false, false),
-            taps: (None, None),
+            capture: PerDir::default(),
+            taps: PerDir::default(),
             host_override: None,
             request_counter: None,
             stack: None,
@@ -480,9 +516,8 @@ impl FlowCx {
 
     fn note_outcome(&mut self, out: &Outcome) {
         for r in &out.matched {
-            let r = r.to_string();
-            if !self.record.rules.contains(&r) {
-                self.record.rules.push(r);
+            if !self.record.rules.contains(r) {
+                self.record.rules.push(r.clone());
             }
         }
         for t in &out.tags {
@@ -490,10 +525,10 @@ impl FlowCx {
                 self.record.tags.push(t.clone());
             }
         }
-        if !out.terminal_rule.to_string().starts_with('_')
-            && !self.record.rules.contains(&out.terminal_rule.to_string())
+        if !out.terminal_rule.as_str().starts_with('_')
+            && !self.record.rules.contains(&out.terminal_rule)
         {
-            self.record.rules.push(out.terminal_rule.to_string());
+            self.record.rules.push(out.terminal_rule.clone());
         }
     }
 
@@ -533,9 +568,9 @@ impl FlowCx {
                     close,
                 } => {
                     refusal = Some(Refusal::deny(
-                        *status,
+                        status_code(*status),
                         message,
-                        out.terminal_rule.as_str(),
+                        out.terminal_rule.clone(),
                         *close,
                     ));
                 }
@@ -577,7 +612,7 @@ impl FlowCx {
         }
         let r = self.facts.client_request.as_ref();
         let req = RequestInfo {
-            method: r.map(|r| r.method.clone()).unwrap_or_default(),
+            method: r.map(|r| r.method.as_str().to_owned()).unwrap_or_default(),
             host: r.map(|r| host_text(&r.host)).unwrap_or_default(),
             port: r.map_or(0, |r| r.port),
             path: r
@@ -610,7 +645,7 @@ impl FlowCx {
             req,
             res,
             decision: self.record.decision.unwrap_or(DecisionKind::Deny),
-            rules: self.record.rules.clone(),
+            rules: rule_names(&self.record.rules),
             tags: self.record.tags.clone(),
             mutations: self.record.mutations.clone(),
             addons: self.record.addons.clone(),
@@ -619,7 +654,7 @@ impl FlowCx {
                 upstream_connect_ms: None,
                 upstream_ttfb_ms: self.record.ttfb_ms,
             },
-            terminal_rule: self.record.terminal_rule.clone(),
+            terminal_rule: self.record.terminal_rule.as_ref().map(ToString::to_string),
             reason: self.record.reason.clone(),
             stage: self.record.stage,
         });
@@ -826,7 +861,7 @@ fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
     }
     cx.record.terminal_rule = match &refusal {
         Some(r) => r.rule.clone(),
-        None => Some(out.terminal_rule.to_string()),
+        None => Some(Decider::Rule(out.terminal_rule.clone())),
     };
     if let Some(r) = refusal {
         return Verdict::Deny(r);
@@ -951,13 +986,12 @@ fn apply_request_effect(
             scheme,
             rewrite_host,
         } => {
-            let new_host = parse_host(host.as_bytes()).map_err(|e| invalid(kind, &e))?;
             if rewrite_host {
                 cx.host_override = None;
             } else if cx.host_override.is_none() {
                 cx.host_override = Some(req.authority.to_host_header(req.scheme));
             }
-            req.authority = Authority::new(new_host, port);
+            req.authority = Authority::new(host, port.get());
             if let Some(s) = scheme {
                 req.scheme = rules_scheme(s);
             }
@@ -980,9 +1014,8 @@ fn apply_request_effect(
             if cx.shared.capture.is_none() {
                 return Err(Refusal::fail_closed("capture_unavailable"));
             }
-            let (req, res) = &mut cx.capture;
-            *req |= matches!(target, CaptureTarget::Request | CaptureTarget::Both);
-            *res |= matches!(target, CaptureTarget::Response | CaptureTarget::Both);
+            cx.capture.request |= matches!(target, CaptureTarget::Request | CaptureTarget::Both);
+            cx.capture.response |= matches!(target, CaptureTarget::Response | CaptureTarget::Both);
         }
     }
     Ok(())
@@ -999,7 +1032,7 @@ async fn inspect_response_body(
     io: &mut dyn BodyIo,
 ) -> ResponseVerdict {
     cx.facts.response = Some(ResponseFacts {
-        status: res.status.as_u16(),
+        status: res.status,
         headers: res.headers.clone(),
         body_size: res.body.known_length(),
         body: Inspected::NotBuffered,
@@ -1012,7 +1045,7 @@ async fn inspect_response_body(
         Err(e) => return ResponseVerdict::Close(e),
         Ok(Collected::Failed(e)) => {
             return ResponseVerdict::Deny(Refusal::upstream(
-                502,
+                StatusCode::BAD_GATEWAY,
                 "upstream_body_failed",
                 &format!("upstream response body failed: {e}"),
             ));
@@ -1067,12 +1100,20 @@ mod tests {
     #[test]
     fn refusal_body_shape() {
         let flow = Ulid::generate();
-        let r = Refusal::deny(403, "blocked by roxy", "_default", true);
+        let r = Refusal::deny(
+            StatusCode::FORBIDDEN,
+            "blocked by roxy",
+            RuleId::new(RuleId::DEFAULT),
+            true,
+        );
         let res = r.response(&flow);
         assert_eq!(res.status, StatusCode::FORBIDDEN);
         assert_eq!(res.headers.get("x-roxy-rule"), Some("_default"));
         let r = Refusal::fail_closed("body_too_large_to_inspect");
         assert_eq!(r.status, 503);
-        assert_eq!(r.rule.as_deref(), Some("_fail_closed"));
+        assert_eq!(
+            r.rule,
+            Some(Decider::Rule(RuleId::new(RuleId::FAIL_CLOSED)))
+        );
     }
 }

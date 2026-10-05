@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use roxy_proxy::addons::{AddonImpl, AddonSpec, EndpointSpec, ServiceSpec, StateLimits};
+use roxy_proxy::addr::PrivateAddrs;
 use roxy_rules::Condition;
 use roxy_wasm::{
     Capabilities, Capability as WasmCap, Layer, LayerConfig, LayerLimits, WasmRuntime,
@@ -141,7 +142,7 @@ fn endpoints(a: &Addon) -> anyhow::Result<HashMap<String, EndpointSpec>> {
                     headers,
                     timeout: e.timeout.unwrap_or(DEFAULT_ENDPOINT_TIMEOUT),
                     retries: e.retries,
-                    private_ok: e.private_ok,
+                    private: PrivateAddrs::from_private_ok(e.private_ok),
                 },
             ))
         })
@@ -197,7 +198,10 @@ impl AddonLoader {
             };
             specs.push(Arc::new(AddonSpec {
                 name: a.name.clone(),
-                observe: a.mode == AddonMode::Observe,
+                mode: match a.mode {
+                    AddonMode::Enforce => roxy_proxy::addons::AddonMode::Enforce,
+                    AddonMode::Observe => roxy_proxy::addons::AddonMode::Observe,
+                },
                 kind,
                 endpoints: endpoints(a)?,
                 state: state_limits(a),

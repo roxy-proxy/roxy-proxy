@@ -5,10 +5,12 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::fmt;
 use std::net::IpAddr;
+use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
 
 use regex::Regex;
+use roxy_http::Host;
 
 use crate::compile::{Const, OrdOp, Pred, ROperand, StrOp};
 use crate::config::{CaptureTarget, LogLevel, Scheme};
@@ -69,7 +71,7 @@ pub enum Decision {
     /// an exchange whose response is already streaming always closes the
     /// connection (h1) or resets the stream (h2).
     Deny {
-        status: u16,
+        status: DenyStatus,
         message: String,
         close: bool,
     },
@@ -78,8 +80,39 @@ pub enum Decision {
     Passthrough,
 }
 
+/// A deny's status code: always 4xx or 5xx.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DenyStatus(u16);
+
+impl DenyStatus {
+    /// `None` unless `code` is 4xx or 5xx.
+    pub const fn new(code: u16) -> Option<Self> {
+        if code >= 400 && code <= 599 {
+            Some(Self(code))
+        } else {
+            None
+        }
+    }
+
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl fmt::Display for DenyStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl PartialEq<u16> for DenyStatus {
+    fn eq(&self, other: &u16) -> bool {
+        self.0 == *other
+    }
+}
+
 /// Default deny status and message.
-pub const DEFAULT_DENY_STATUS: u16 = 403;
+pub const DEFAULT_DENY_STATUS: DenyStatus = DenyStatus(403);
 pub const DEFAULT_DENY_MESSAGE: &str = "blocked by roxy";
 
 impl Decision {
@@ -111,7 +144,7 @@ impl Decision {
 }
 
 /// Status and message when a policy input is unavailable.
-pub const FAIL_CLOSED_STATUS: u16 = 503;
+pub const FAIL_CLOSED_STATUS: DenyStatus = DenyStatus(503);
 pub const FAIL_CLOSED_MESSAGE: &str = "policy input unavailable";
 
 /// Why an evaluation failed closed (`terminal_rule = "_fail_closed"`), for
@@ -244,8 +277,8 @@ pub enum Effect {
     },
     RemoveQuery(String),
     Redirect {
-        host: String,
-        port: u16,
+        host: Host,
+        port: NonZeroU16,
         /// `None` keeps the request's scheme.
         scheme: Option<Scheme>,
         rewrite_host: bool,
