@@ -198,7 +198,7 @@ impl AddonDef {
             },
         )
         .await
-        .unwrap_or_else(|e| panic!("loading addon {}: {e}", self.name));
+        .expect("loading the addon layer");
         Arc::new(AddonSpec {
             name: self.name,
             mode: self.mode,
