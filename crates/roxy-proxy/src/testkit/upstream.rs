@@ -212,6 +212,8 @@ impl Upstream {
     ///   status to its `x-echo-status` (default `200`);
     /// * `/drip?n=<n>&ms=<ms>`: `n` chunks, `ms` apart, without reading the
     ///   body;
+    /// * `/cut`: reads the body, answers `200` declaring 10 bytes of body,
+    ///   sends 3 and breaks the connection;
     /// * a `roxy.layer.v3` handshake: the in-test service layer endpoint
     ///   ([`service`]);
     /// * a WebSocket upgrade: `101`, then echoes bytes; with
@@ -289,6 +291,12 @@ impl Upstream {
         if path == "/echo" {
             let body = lock(&entry).body.clone();
             return echo(echo_status.as_ref(), echo_encoding, body);
+        }
+        if path == "/cut" {
+            return http::Response::builder()
+                .header("content-length", "10")
+                .body(cut())
+                .unwrap();
         }
         if let Some(code) = path.strip_prefix("/status/") {
             return http::Response::builder()
@@ -381,6 +389,20 @@ impl Upstream {
 
 fn full(b: impl Into<Bytes>) -> Body {
     Full::new(b.into()).boxed()
+}
+
+/// 3 bytes, then (once they have gone out with the head) the end, 7
+/// short of the declared length.
+fn cut() -> Body {
+    let frames = futures_util::stream::unfold(true, |first| async move {
+        if !first {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            return None;
+        }
+        let frame = hyper::body::Frame::data(Bytes::from_static(b"cut"));
+        Some((Ok::<_, Infallible>(frame), false))
+    });
+    BoxBody::new(http_body_util::StreamBody::new(frames))
 }
 
 /// `n` chunks `chunk<i>;`, `ms` apart, from `/drip?n=..&ms=..`.

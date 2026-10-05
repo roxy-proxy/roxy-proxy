@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::{HeaderMap, HeaderName, HeaderValue};
-use roxy_http::Body;
+use roxy_http::{Body, BodyError};
 use roxy_wasm::{HostError, LayerRequest, LayerResponse};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -81,6 +81,20 @@ pub enum ServiceError {
     /// mid-exchange.
     #[error("service stream lost: {0}")]
     Closed(String),
+}
+
+/// Why the service's answer will not come.
+#[derive(Debug, Clone, thiserror::Error)]
+pub(super) enum Unanswered {
+    /// The service failed the stream.
+    #[error(transparent)]
+    Service(ServiceError),
+    /// roxy gave up on the stream: the service is not at fault.
+    #[error("service stream lost: {0}")]
+    Abandoned(String),
+    /// The body roxy was streaming to the service failed on its own side.
+    #[error("service stream lost: the {dir} body failed: {e}", dir = .0.as_str(), e = .1)]
+    Body(Dir, BodyError),
 }
 
 impl ServiceError {
@@ -320,7 +334,9 @@ async fn run(
     let head = request_head(&parts, &body);
     tokio::spawn(async move { s.pump(Dir::Request, head, body).await });
 
-    let first = answer_by(sent + svc.first_byte_timeout, answers.first).await??;
+    let first = answer_by(sent + svc.first_byte_timeout, answers.first)
+        .await?
+        .map_err(|u| unanswered(st, u))?;
     let forward = match first {
         First::Answer(res) => {
             guard.disarm();
@@ -345,9 +361,32 @@ async fn run(
     let s = stream.clone();
     let head = response_head(&parts, &body);
     tokio::spawn(async move { s.pump(Dir::Response, head, body).await });
-    let res = answer_by(sent + svc.first_byte_timeout, answers.second).await??;
+    let res = answer_by(sent + svc.first_byte_timeout, answers.second)
+        .await?
+        .map_err(|u| unanswered(st, u))?;
     guard.disarm();
     Ok(res)
+}
+
+/// The exchange's failure when the service's answer will not come. A body
+/// that failed on its way to the service is attributed as it would be
+/// without the layer: the client's upload to the client, the upstream's
+/// response to the upstream.
+fn unanswered(st: &StackFlow, u: Unanswered) -> Fail {
+    match u {
+        Unanswered::Service(e) => Fail::Service(e),
+        Unanswered::Abandoned(why) => Fail::Below(HostError::new(why)),
+        Unanswered::Body(Dir::Request, e) => {
+            st.set_client_fault(crate::pipeline::body_failure(&e).into());
+            Fail::Below(HostError::new(format!("request body failed: {e}")))
+        }
+        Unanswered::Body(Dir::Response, e) => {
+            tracing::info!(flow = %st.flow, error = %e, "upstream response body failed");
+            st.upstream_body_failed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Fail::Below(HostError::new(format!("response body failed: {e}")))
+        }
+    }
 }
 
 /// The service's answer, within `first_byte_timeout`. An answer that lands

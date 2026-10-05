@@ -37,7 +37,7 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_util::sync::CancellationToken;
 
 use super::super::{AddonMode, EndpointSpec, StackError, StackFlow, endpoint};
-use super::{First, In, Out, ServiceError, ServiceSpec};
+use super::{First, In, Out, ServiceError, ServiceSpec, Unanswered};
 use crate::addr::PrivateAddrs;
 use crate::flowlog::FlowEvent;
 use crate::upstream::MaybeTls;
@@ -327,8 +327,8 @@ fn binary(stream: u32, dir: Dir, data: &[u8]) -> Message {
 
 /// The service's answers to an enforce stream, in protocol order.
 pub(super) struct Answers {
-    pub first: oneshot::Receiver<Result<First, ServiceError>>,
-    pub second: oneshot::Receiver<Result<LayerResponse, ServiceError>>,
+    pub first: oneshot::Receiver<Result<First, Unanswered>>,
+    pub second: oneshot::Receiver<Result<LayerResponse, Unanswered>>,
 }
 
 /// One exchange on a connection.
@@ -347,8 +347,8 @@ pub(super) struct Stream {
 
 #[derive(Default)]
 struct StreamState {
-    first: Option<oneshot::Sender<Result<First, ServiceError>>>,
-    second: Option<oneshot::Sender<Result<LayerResponse, ServiceError>>>,
+    first: Option<oneshot::Sender<Result<First, Unanswered>>>,
+    second: Option<oneshot::Sender<Result<LayerResponse, Unanswered>>>,
     /// The request body and the response body, each on its own.
     req: Feed,
     res: Feed,
@@ -414,6 +414,9 @@ enum End<'a> {
     /// upgrade): the service is told, whoever is waiting gets `why`, and
     /// nothing is logged as the service's fault.
     Abandoned(&'a str),
+    /// The body roxy was sending in direction `dir` failed: abandoned, and
+    /// whoever is waiting learns which body failed and how.
+    BodyFailed(Dir, BodyError),
 }
 
 /// Whether failing a stream tells the service (a `reset` message).
@@ -443,7 +446,7 @@ struct InboxQ {
 }
 
 impl Inbox {
-    fn abort(&self, e: &ServiceError) {
+    fn abort(&self, e: &Unanswered) {
         lock(&self.q).abort = Some(e.to_string());
         self.abort.cancel();
     }
@@ -480,17 +483,20 @@ impl Stream {
         self.ended.cancel();
         lock(&self.link.shared.streams).open.remove(&self.id);
         drop(slot);
-        let (e, reset, blame) = match end {
+        let (e, reset) = match end {
             End::Quiet => return,
             End::Failed { e, reset } => {
                 let message = e.to_string();
-                (e, (reset == Reset::Send).then_some(message), true)
+                (
+                    Unanswered::Service(e),
+                    (reset == Reset::Send).then_some(message),
+                )
             }
-            End::Abandoned(why) => (
-                ServiceError::Closed(why.to_owned()),
-                Some(why.to_owned()),
-                false,
-            ),
+            End::Abandoned(why) => (Unanswered::Abandoned(why.to_owned()), Some(why.to_owned())),
+            End::BodyFailed(dir, e) => {
+                let message = format!("the {} body failed", dir.as_str());
+                (Unanswered::Body(dir, e), Some(message))
+            }
         };
         if let Some(message) = reset
             && self.wire.reset()
@@ -506,7 +512,9 @@ impl Stream {
             && !tx.is_closed()
         {
             let _ = tx.send(Err(e));
-        } else if blame && self.mode == AddonMode::Enforce {
+        } else if let Unanswered::Service(e) = e
+            && self.mode == AddonMode::Enforce
+        {
             // The head has gone on: the failure is logged here, since no
             // answer carries it.
             let name = self.name();
@@ -601,8 +609,8 @@ impl Stream {
             let mut d = match frame {
                 None => return true,
                 // A body that fails is not forwarded as complete.
-                Some(Err(_)) => {
-                    self.reset("the body failed");
+                Some(Err(e)) => {
+                    self.settle(End::BodyFailed(dir, e));
                     return false;
                 }
                 Some(Ok(f)) => match f.into_data() {
@@ -1359,6 +1367,28 @@ mod tests {
                 .contains("bytes of a response body that is not open"),
             "{e}"
         );
+    }
+
+    /// A body that fails on its way to the service ends the stream without
+    /// blaming the service: the pending answer says which body failed, and
+    /// the exchange takes a request body's failure as the client's.
+    #[tokio::test]
+    async fn a_body_failing_on_its_way_to_the_service_is_not_its_failure() {
+        let (stream, answers, _kit) = lone_stream().await;
+        let (tx, body) = Body::channel(u64::MAX, None);
+        tx.abort(BodyError::Incomplete);
+        assert!(!stream.pump_body(Dir::Request, body).await);
+        let lost = answers.first.await.unwrap().err().expect("no answer");
+        assert!(
+            matches!(lost, Unanswered::Body(Dir::Request, BodyError::Incomplete)),
+            "{lost:?}"
+        );
+        assert!(matches!(
+            super::super::unanswered(&stream.st, lost),
+            super::super::Fail::Below(_)
+        ));
+        assert!(stream.st.failure().is_none(), "the service is not blamed");
+        assert!(stream.st.take_client_fault().is_some());
     }
 
     /// A connection that failed keeps its place in the pool while streams

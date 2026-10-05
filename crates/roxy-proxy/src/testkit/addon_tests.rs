@@ -695,6 +695,53 @@ mod service {
         assert_eq!(resets[0].1, "the client went away");
     }
 
+    /// No `layer_error` was logged.
+    fn no_layer_error(kit: &Kit) {
+        let events = kit.sink.events();
+        assert!(
+            events.iter().all(|e| e["event"] != "layer_error"),
+            "{events:#?}"
+        );
+    }
+
+    /// A client upload that breaks mid-body is the client's fault through a
+    /// service layer as without one: the connection closes on the parse
+    /// error, and the service is not blamed.
+    #[tokio::test]
+    async fn a_client_upload_failing_mid_body_is_not_the_services_fault() {
+        let kit = kit(RULES, vec![addon("s", "pass", AddonMode::Enforce, |_| {})]).await;
+        let (out, eof) = kit
+            .raw(
+                b"POST http://up.test/x HTTP/1.1\r\nhost: up.test\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\nzz\r\n",
+            )
+            .await;
+        assert!(eof);
+        assert!(out.starts_with("HTTP/1.1 400"), "{out}");
+        let errs = kit.events("parse_error", 1).await;
+        assert_eq!(errs[0]["reason"], "bad_chunk_size", "{errs:#?}");
+        let ev = kit.request_event().await;
+        assert_eq!(ev["reason"], "bad_chunk_size", "{ev:#}");
+        no_layer_error(&kit);
+    }
+
+    /// An upstream response body that fails before the service has
+    /// answered the response head is the upstream's fault: the client gets
+    /// the `502` it would if the core had read the body, and the service is
+    /// not blamed.
+    #[tokio::test]
+    async fn an_upstream_body_failing_before_the_services_answer_is_not_its_fault() {
+        let kit = kit(
+            RULES,
+            vec![addon("s", "forward", AddonMode::Enforce, |_| {})],
+        )
+        .await;
+        let a = kit.h1().await.call("GET", "/cut", &[], b"").await;
+        assert_eq!(a.status, 502, "{a:?}");
+        let ev = kit.request_event().await;
+        assert_eq!(ev["reason"], "upstream_body_failed", "{ev:#}");
+        no_layer_error(&kit);
+    }
+
     /// What a service sends on an observe stream is discarded and credited
     /// back as it goes, so a service that keeps to its credit can send
     /// several windows' worth while the stream is open.

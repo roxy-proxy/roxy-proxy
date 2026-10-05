@@ -158,6 +158,11 @@ not counted.
   body after it. A body cut short never reaches the upstream or the client
   as complete. `layer_error.kind` is `service:connect`, `service:protocol`,
   `service:timeout` or `service:closed`.
+- **A body that fails on its way to the service is not its failure.** A
+  client upload that breaks closes the connection as it would without the
+  layer. An upstream response body that fails before the service's second
+  head gets a `502` (`upstream_body_failed`), as when the rules read the
+  body. Neither logs a `layer_error`.
 - **One stream's failure is its own.** A violation on one stream resets
   that stream only; the connection and its other streams carry on. Broken
   framing fails the whole connection: a text frame that is not a JSON
