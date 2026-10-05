@@ -33,7 +33,7 @@ The first run builds the sentinel image, which takes a minute or two. Three cont
 
 - **roxy**: the proxy on `127.0.0.1:3128`. It generates its CA on first start and serves the certificate on `127.0.0.1:3130`.
 - **sentinel**: the inspect_sentinel sidecar, on a network with no route out. Every exchange streams through it. It runs a denylist over tool calls.
-- **inspect-view**: Inspect's log viewer on `127.0.0.1:7575`, showing each conversation and the sentinel's verdict on every tool call.
+- **inspect-view**: Inspect's log viewer on `127.0.0.1:7575`, showing each Claude Code session and the sentinel's verdict on every tool call.
 
 ### Trust roxy's CA
 
@@ -72,7 +72,7 @@ Claude Code never ran the command. Its turn ends, and you can carry on. Tool cal
 
 ### Watch it in Inspect View
 
-Open [http://127.0.0.1:7575](http://127.0.0.1:7575). Each Claude Code conversation is a sample. Its transcript shows every model call, the tool calls the model asked for, and the sentinel's verdict under each one: `Continued`, or `Rejected` with the reason. Reload the page to see new calls.
+Open [http://127.0.0.1:7575](http://127.0.0.1:7575). Each Claude Code session is a sample (its `X-Claude-Code-Session-Id` header; a subagent's calls land in its session's sample). Its transcript shows every model call, the tool calls the model asked for, and the sentinel's verdict under each one: `Continued`, or `Rejected` with the reason. Reload the page to see new calls.
 
 <img src={inspectView} alt="Inspect View: Claude Code's curl tool call, and the sentinel's rejection under it" />
 

@@ -1,9 +1,12 @@
 """What the sidecar sees, as an Inspect eval log for `inspect view`.
 
-Each agent conversation is a sample. Every model call the sidecar judged is
-a model event (the messages new since the conversation's last call, and the
-model's output), followed by a sentinel event for each report the sentinel
-made about it, as an Inspect eval records them. The log is rewritten at
+Each Claude Code session is a sample. Every model call the sidecar judged
+is a model event (the messages new since the last call on the same
+conversation, and the model's output), followed by a sentinel event for each
+report the sentinel made about it, as an Inspect eval records them. A
+session's subagents share its sample: each is its own conversation, so its
+calls are logged alongside the main agent's without garbling either; the
+sample's transcript follows the main agent. The log is rewritten at
 most every `WRITE_EVERY` seconds while anything changed; its status stays
 `started`, since the proxy never finishes.
 
@@ -57,36 +60,46 @@ class InspectLog:
             samples=[],
         )
         self._samples: dict[str, EvalSample] = {}
-        self._logged: dict[str, int] = {}
+        self._sample_of: dict[str, str] = {}  # conversation -> sample id
+        self._logged: dict[str, int] = {}  # conversation -> messages logged
         self._dirty = False
 
-    def _sample(self, conversation: str, input: list[ChatMessage]) -> EvalSample:
-        sample = self._samples.get(conversation)
+    def _sample(self, sample_id: str) -> EvalSample:
+        sample = self._samples.get(sample_id)
         if sample is None:
-            first_user = next((m for m in input if m.role == "user"), None)
             sample = EvalSample(
-                id=conversation,
+                id=sample_id,
                 epoch=1,
-                input=first_user.text if first_user else "",
+                input="",
                 target="",
                 messages=[],
                 events=[],
                 metadata={"roxy_flows": []},
             )
-            self._samples[conversation] = sample
+            self._samples[sample_id] = sample
             assert self.log.samples is not None
             self.log.samples.append(sample)
         return sample
 
     def model_call(
         self,
+        sample_id: str,
         conversation: str,
         flow: str | None,
         model: str,
         input: list[ChatMessage],
         output: ModelOutput,
+        *,
+        main: bool = True,
     ) -> None:
-        sample = self._sample(conversation, input)
+        """Logs a model call on `conversation` to sample `sample_id`. The
+        sample's transcript is updated only by a `main` call: a subagent's
+        calls are logged as events without replacing it."""
+        sample = self._sample(sample_id)
+        if main and not sample.input:
+            first_user = next((m for m in input if m.role == "user"), None)
+            sample.input = first_user.text if first_user else ""
+        self._sample_of[conversation] = sample_id
         logged = self._logged.get(conversation, 0)
         # Each call resends the whole conversation: log only what is new
         # since the last one (all of it if the agent compacted its history).
@@ -101,13 +114,14 @@ class InspectLog:
                 output=output,
             )
         )
-        sample.messages = [*input, output.message]
+        if main:
+            sample.messages = [*input, output.message]
         sample.metadata["roxy_flows"].append(flow)
         self._logged[conversation] = len(input) + 1
         self._dirty = True
 
     def sentinel(self, event: SentinelEvent) -> None:
-        sample = self._samples.get(event.conversation)
+        sample = self._samples.get(self._sample_of.get(event.conversation, ""))
         if sample is not None:
             sample.events.append(event)
             self._dirty = True

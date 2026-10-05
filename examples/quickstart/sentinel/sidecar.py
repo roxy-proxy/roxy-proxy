@@ -19,8 +19,10 @@ untouched, for roxy's rules to decide. A streamed response starts at once
 (its head and `message_start`, then pings) while the rest is held and
 judged, so the agent's first-byte and idle deadlines are met.
 
-Each conversation, its model calls and the sentinel's reports are written
-as an Inspect eval log for `inspect view` (inspect_log.py).
+Each Claude Code session (its `X-Claude-Code-Session-Id` header), its model
+calls and the sentinel's reports are written as an Inspect eval log for
+`inspect view` (inspect_log.py). A call without that header is logged under
+its conversation instead.
 
 Configuration (environment):
 
@@ -267,6 +269,18 @@ class Call:
                 block["input"] = replacement.arguments
 
 
+def session(req: Request) -> str | None:
+    """The Claude Code session a request belongs to, if it says. Every call a
+    session makes carries it, the main agent's and its subagents' alike."""
+    return req.header("x-claude-code-session-id") or None
+
+
+def is_subagent(req: Request) -> bool:
+    """Claude Code marks a subagent's calls with its agent id; the main
+    agent's calls have none."""
+    return req.header("x-claude-code-agent-id") is not None
+
+
 @dataclasses.dataclass
 class Refusal:
     """The agent does not get this response."""
@@ -391,7 +405,15 @@ class Sidecar:
             input = []
         conversation = call.conversation()
         model = f"anthropic/{response.get('model', 'unknown')}"
-        self.inspect_log.model_call(conversation, ex.flow.get("flow"), model, input, output)
+        self.inspect_log.model_call(
+            session(ex.request) or conversation,
+            conversation,
+            ex.flow.get("flow"),
+            model,
+            input,
+            output,
+            main=not is_subagent(ex.request),
+        )
         tool_calls = output.message.tool_calls or []
         if not tool_calls:
             return None
