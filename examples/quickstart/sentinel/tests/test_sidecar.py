@@ -117,3 +117,45 @@ async def test_reset_while_the_sentinel_judges_leaves_no_tasks(sidecar: Sidecar,
     roxy.ws.control(1, "reset")
     await roxy.until_closed(1)
     assert stray_tasks(roxy.task) == set()
+
+
+UNKNOWN_BLOCK = {"type": "mystery_block", "data": "?"}
+
+
+async def test_an_unknown_block_type_is_refused(sidecar: Sidecar) -> None:
+    roxy = FakeRoxy(sidecar.handle)
+    body = json.dumps({"model": "claude-test", "messages": [{"role": "user", "content": "hi"}]})
+    roxy.open(1, url=MESSAGES_URL)
+    roxy.ws.body(1, body.encode())
+    roxy.ws.control(1, "request_end")
+    for _ in range(3):
+        await roxy.ws.next_sent()
+    response = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-test",
+        "content": [UNKNOWN_BLOCK],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    roxy.ws.control(1, "response", status=200, headers=[["content-type", "application/json"]])
+    roxy.ws.body(1, json.dumps(response).encode(), RESPONSE)
+    roxy.ws.control(1, "response_end")
+    denied = await roxy.ws.next_sent()
+    assert denied["type"] == "deny" and denied["status"] == 403
+    assert denied["message"].startswith("the sentinel could not read this model exchange")
+
+
+async def test_an_unknown_block_type_in_a_stream_is_refused(sidecar: Sidecar) -> None:
+    roxy = FakeRoxy(sidecar.handle)
+    await streamed_call(roxy)
+    start = {"type": "content_block_start", "index": 0, "content_block": UNKNOWN_BLOCK}
+    roxy.ws.body(1, sse("content_block_start", start) + REST, RESPONSE)
+    roxy.ws.control(1, "response_end")
+    refused = await roxy.ws.next_sent()
+    assert refused[:5] == b"\x00\x00\x00\x01\x01"
+    assert refused[5:].startswith(b"event: error\n")
+    assert b"the sentinel could not read this model exchange" in refused
+    assert (await roxy.ws.next_sent())["type"] == "response_end"
