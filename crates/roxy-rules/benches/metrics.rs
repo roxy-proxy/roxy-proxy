@@ -6,9 +6,7 @@ use std::hint::black_box;
 use std::net::{IpAddr, Ipv4Addr};
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use roxy_rules::{
-    DefaultDecision, Field, MapView, MetricConfig, MetricStore, Policy, PolicyInput, Sample, Value,
-};
+use roxy_rules::{Field, MapView, MetricConfig, MetricStore, Policy, PolicyInput, Sample, Value};
 
 fn store(metrics_yaml: &str) -> MetricStore {
     let metrics: Vec<MetricConfig> = serde_yaml_ng::from_str(metrics_yaml).unwrap();
@@ -18,7 +16,6 @@ fn store(metrics_yaml: &str) -> MetricStore {
         metrics: &metrics,
         secret_names: &none,
         address_lists: &none,
-        default: DefaultDecision::Deny,
     })
     .unwrap();
     MetricStore::new(policy.metric_defs(), 100_000)

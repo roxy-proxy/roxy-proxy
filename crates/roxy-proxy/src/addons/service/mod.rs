@@ -504,7 +504,7 @@ pub(crate) mod testing {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use roxy_rules::{DefaultDecision, Policy, PolicyInput, RuleConfig};
+    use roxy_rules::{Policy, PolicyInput, RuleConfig};
 
     use super::ServiceSpec;
     use crate::addons::{AddonImpl, AddonMode, AddonSpec, EndpointSpec, StateLimits};
@@ -560,7 +560,6 @@ pub(crate) mod testing {
             metrics: &[],
             secret_names: &none,
             address_lists: &none,
-            default: DefaultDecision::Deny,
         };
         let a = Arc::get_mut(&mut addon).expect("a fresh addon");
         a.when = Some(
@@ -593,7 +592,6 @@ pub(crate) mod testing {
             metrics: &[],
             secret_names: &secret_names,
             address_lists: &none,
-            default: DefaultDecision::Deny,
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
         let mut redactor = Redactor::new();

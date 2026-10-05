@@ -4,9 +4,7 @@ mod common;
 
 use std::collections::HashSet;
 
-use roxy_rules::{
-    Condition, DefaultDecision, FailClosedReason, Field, MapView, MetricConfig, PolicyInput,
-};
+use roxy_rules::{Condition, FailClosedReason, Field, MapView, MetricConfig, PolicyInput};
 
 fn try_condition(src: &str) -> Result<Condition, Vec<String>> {
     let metrics: Vec<MetricConfig> = serde_yaml_ng::from_str(common::METRICS).unwrap();
@@ -17,7 +15,6 @@ fn try_condition(src: &str) -> Result<Condition, Vec<String>> {
         metrics: &metrics,
         secret_names: &secrets,
         address_lists: &lists,
-        default: DefaultDecision::Deny,
     };
     Condition::compile(&input, "addons[0].when", src)
         .map_err(|ds| ds.iter().map(common::render).collect())

@@ -166,6 +166,10 @@ fn check(out: &Outcome) {
     if out.fail_closed_reason.is_some() {
         assert_eq!(out.decision, Decision::fail_closed(), "{out:?}");
     }
+    // No rule decided: always deny.
+    if out.terminal_rule.is_default() {
+        assert_eq!(out.decision, Decision::default_deny(), "{out:?}");
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -180,13 +184,10 @@ fuzz_target!(|data: &[u8]| {
         };
         rules.push(json!({ "id": format!("r{i}"), "when": when, "then": then }));
     }
-    let Ok(default_allow) = u.arbitrary::<bool>() else {
-        return;
-    };
     let Ok(flow) = Flow::arbitrary(&mut u) else {
         return;
     };
-    let Some(policy) = roxy_fuzz::rules::compile(json!(rules), default_allow) else {
+    let Some(policy) = roxy_fuzz::rules::compile(json!(rules)) else {
         return;
     };
     let ctx = EvalContext::empty();

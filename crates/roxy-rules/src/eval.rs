@@ -51,8 +51,7 @@ impl fmt::Debug for EvalContext<'_> {
 }
 
 /// Options of an `allow` decision.
-/// Only the first matching allow rule's options apply; the implicit
-/// allow of `default: allow` grants none.
+/// Only the first matching allow rule's options apply.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AllowOpts {
     /// `allow: { upgrade: websocket }`: honour a WebSocket Upgrade.
@@ -126,7 +125,7 @@ impl Decision {
         matches!(self, Self::Deny(_))
     }
 
-    /// The `default: deny` decision: 403, closing the connection.
+    /// The decision when no rule decides: 403, closing the connection.
     pub fn default_deny() -> Self {
         Self::Deny(Deny::default_deny())
     }
@@ -138,7 +137,7 @@ impl Decision {
 }
 
 impl Deny {
-    /// The `default: deny` decision: 403, closing the connection.
+    /// The deny when no rule decides: 403, closing the connection.
     pub fn default_deny() -> Self {
         Self {
             status: DEFAULT_DENY_STATUS,

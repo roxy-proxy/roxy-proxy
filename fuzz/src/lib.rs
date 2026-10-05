@@ -141,7 +141,7 @@ pub fn serialise(head: &Head) -> Vec<u8> {
 pub mod rules {
     use std::collections::HashSet;
 
-    use roxy_rules::{DefaultDecision, MetricConfig, Policy, PolicyInput, RuleConfig};
+    use roxy_rules::{MetricConfig, Policy, PolicyInput, RuleConfig};
 
     /// `m0` counts requests per client IP; `m1` counts request bytes (a
     /// byte metric, so a deny reading it is also a watching rule).
@@ -155,7 +155,7 @@ pub mod rules {
 
     /// Compiles `rules` (as JSON) against the fixed metrics, address list
     /// `l0` and secret `s0`. `None` if the JSON or the policy is rejected.
-    pub fn compile(rules: serde_json::Value, default_allow: bool) -> Option<Policy> {
+    pub fn compile(rules: serde_json::Value) -> Option<Policy> {
         let rules: Vec<RuleConfig> = serde_json::from_value(rules).ok()?;
         let metrics = metrics();
         let secrets: HashSet<String> = ["s0".to_owned()].into();
@@ -165,11 +165,6 @@ pub mod rules {
             metrics: &metrics,
             secret_names: &secrets,
             address_lists: &lists,
-            default: if default_allow {
-                DefaultDecision::Allow
-            } else {
-                DefaultDecision::Deny
-            },
         })
         .ok()
     }

@@ -12,7 +12,7 @@ use super::{
     Clock, DEFAULT_MAX_METRIC_BYTES, MetricError, MetricLimits, MetricStore, SERIES_OVERHEAD,
     SPARSE_CHUNK, Sample,
 };
-use crate::{DefaultDecision, Field, MapView, MetricConfig, Policy, PolicyInput, Value};
+use crate::{Field, MapView, MetricConfig, Policy, PolicyInput, Value};
 
 /// A manually advanced clock.
 #[derive(Clone)]
@@ -48,7 +48,6 @@ fn compile(metrics_yaml: &str) -> Policy {
         metrics: &metrics,
         secret_names: &none,
         address_lists: &none,
-        default: DefaultDecision::Deny,
     })
     .unwrap()
 }

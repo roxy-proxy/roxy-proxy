@@ -22,7 +22,7 @@ use serde::Deserialize;
 
 pub use roxy_rules::Diagnostic;
 pub use roxy_rules::config::{
-    Action, DefaultDecision, Expr, MetricConfig as Metric, MetricCount, RuleConfig as Rule, Then,
+    Action, Expr, MetricConfig as Metric, MetricCount, RuleConfig as Rule, Then,
 };
 pub use units::Resolver;
 pub use validate::Compiled;
@@ -60,10 +60,6 @@ pub struct Config {
     pub address_lists: Vec<AddressList>,
     #[serde(default)]
     pub metrics: Vec<Metric>,
-    /// What a request gets when no rule decides it: `deny` (the
-    /// default) or `allow`.
-    #[serde(default)]
-    pub default: DefaultDecision,
     #[serde(default)]
     pub rules: Vec<Rule>,
     #[serde(default)]

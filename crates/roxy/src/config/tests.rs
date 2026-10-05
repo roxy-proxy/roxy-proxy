@@ -59,7 +59,6 @@ fn full_config_parses_and_validates() {
     assert_eq!(cfg.metrics[1].window, Some(Duration::from_secs(3600)));
     assert_eq!(cfg.rules.len(), 9);
     assert_eq!(cfg.rules[4].then.0.len(), 2);
-    assert_eq!(cfg.default, DefaultDecision::Deny);
     let policy = cfg.validate().unwrap().policy;
     let kinds: Vec<&str> = policy
         .rule_info()
@@ -123,7 +122,6 @@ fn minimal_config_uses_defaults() {
     assert_eq!(cfg.upstream.dns.cache_ttl_cap, Duration::from_secs(60));
     assert!(cfg.log.flow.path.is_none());
     assert!(!cfg.log.flow.connection_events);
-    assert_eq!(cfg.default, DefaultDecision::Deny);
     assert_eq!(
         cfg.rules[0].then.0,
         vec![Action::Allow(roxy_rules::AllowArgs::default())]
@@ -204,7 +202,6 @@ fn unknown_fields_rejected_everywhere() {
 fn unknown_enum_values_rejected() {
     for bad in [
         "rules: [{ id: r, phase: request, then: allow }]",
-        "default: maybe",
         "tls: { upstream: { verify: lax } }",
         "tls: { upstream: { min_version: \"1.1\" } }",
         "metrics: [{ id: m, count: bananas }]",
@@ -389,11 +386,14 @@ fn secret_in_watching_rule_diagnosed() {
 }
 
 #[test]
-fn default_allow_parses() {
-    let cfg = parse(&format!("{BASE}default: allow\n"));
-    let p = cfg.validate().unwrap().policy;
-    assert_eq!(cfg.default, DefaultDecision::Allow);
-    assert_eq!(p.default_decision(), DefaultDecision::Allow);
+fn default_key_is_rejected() {
+    // Nothing opens an empty rule set: a policy that allows says so in a rule.
+    for value in ["allow", "deny"] {
+        let yaml = format!("{BASE}default: {value}\n");
+        let err = Config::from_yaml(&yaml).unwrap_err();
+        let msg = describe_parse_error(&yaml, &err);
+        assert!(msg.contains("unknown field `default`"), "{msg}");
+    }
 }
 
 #[test]
