@@ -601,7 +601,10 @@ impl Stream {
         if inbox.is_none() && self.mode == AddonMode::Enforce {
             drop(s);
             return self.fail(
-                ServiceError::Protocol(format!("{} body bytes before its head", dir.as_str())),
+                ServiceError::Protocol(format!(
+                    "bytes of a {} body that is not open",
+                    dir.as_str()
+                )),
                 Reset::Send,
             );
         }
@@ -1280,7 +1283,7 @@ mod tests {
         let e = answers.second.await.unwrap().unwrap_err();
         assert!(
             e.to_string()
-                .contains("response body bytes before its head"),
+                .contains("bytes of a response body that is not open"),
             "{e}"
         );
     }

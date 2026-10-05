@@ -76,7 +76,7 @@ impl Dir {
     }
 }
 
-/// Extra credit granted to an observe stream as it opens, so roxy can
+/// Extra credit granted to each body of an observe stream as it opens, so roxy can
 /// send the copies on without waiting (an observer that falls behind is
 /// cut).
 const OBSERVE_CREDIT: u64 = 16 * 1024 * 1024;
@@ -482,8 +482,11 @@ impl Demux {
                 self.st.opens.lock().unwrap().push(o);
                 self.st.changed.notify_waiters();
                 if v["mode"] == "observe" {
-                    let grant = json!({"type": "credit", "stream": id, "bytes": OBSERVE_CREDIT});
-                    let _ = self.out.tx.send(Message::text(grant.to_string()));
+                    for dir in [Dir::Request, Dir::Response] {
+                        let grant = json!({"type": "credit", "stream": id,
+                            "dir": dir.name(), "bytes": OBSERVE_CREDIT});
+                        let _ = self.out.tx.send(Message::text(grant.to_string()));
+                    }
                 }
                 let (tx, rx) = mpsc::unbounded_channel();
                 self.streams.insert(id, tx);

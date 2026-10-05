@@ -116,13 +116,13 @@ message: the `response_end` of the client's response (or a `deny`), and
 the `request_end` of the request it forwarded, if it was still sending
 that. roxy sends nothing more on it after that (a request body the
 service did not wait for is not sent on). Either side may end a stream
-early with `reset`. roxy resets a
-stream when the client goes away, a deadline passes, the service broke the
-protocol on it, or the upstream switched protocols (a `101`). A service
-that resets an enforce stream fails that exchange closed. Each side
-ignores messages that arrive for a stream it has already ended; roxy still
-credits back the body bytes among them, so a service that was mid-send
-when the stream ended is not left waiting for credit.
+early with `reset`. roxy resets a stream when the client goes away, a
+deadline passes, the service broke the protocol on it, or the upstream
+switched protocols (a `101`). A service that resets an enforce stream
+fails that exchange closed. Each side ignores messages that arrive for a
+stream it has already ended; roxy still credits back the body bytes among
+them, so a service that was mid-send when the stream ended is not left
+waiting for credit.
 
 **Flow control.** Body bytes are flow-controlled per stream and per body,
 each way, so a slow body holds up neither the other streams nor the other
@@ -145,8 +145,9 @@ not counted.
   `response` head. A stream has no overall clock: bodies stream for as
   long as they take.
 - **Failure is closed** in enforce mode: a failed connection or handshake,
-  a protocol violation (bad JSON, a message out of order, bytes before a
-  head, an invalid head, a broken length, bytes past the credit), a missed
+  a protocol violation (bad JSON, a message out of order, bytes of a body
+  that is not open, an invalid head, a broken length, bytes past the
+  credit), a missed
   deadline, a reset from the service or a lost connection denies the
   exchange (`503`, `layer:<name>`) before the response head and cuts the
   body after it. A body cut short never reaches the upstream or the client
@@ -157,8 +158,8 @@ not counted.
   framing fails the whole connection: a text frame that is not a JSON
   object with a valid `stream`, a binary frame shorter than its 5-byte
   prefix or with an unknown direction byte, or a stream id roxy never
-  opened. Every exchange on it then fails
-  closed (`service:protocol`), and roxy closes it.
+  opened. Every exchange on it then fails closed (`service:protocol`), and
+  roxy closes it.
 - **Observe mode** uses the same streams: the service gets the same
   messages for copies of both directions, and whatever it sends back other
   than `credit` and `reset` is ignored. The stream ends after roxy's
@@ -167,10 +168,11 @@ not counted.
   a stream whose copies fall behind it is cut and reset on its own
   (`observer_lagged`). Waiting for credit is falling behind, so a service
   that wants whole copies of large bodies grants extra credit as an observe
-  stream opens (`roxy_layer.py` grants 16 MiB to each body). Body bytes the service
-  sends on an observe stream are discarded, and credited back in steps of
-  64 KiB as they are, so the service never waits on its own answers;
-  sending past its credit is a protocol violation, as on any stream.
+  stream opens (`roxy_layer.py` grants 16 MiB to each body). Body bytes
+  the service sends on an observe stream are discarded, and credited back
+  in steps of 64 KiB as they are, so the service never waits on its own
+  answers; sending past its credit is a protocol violation, as on any
+  stream.
 - **WebSocket upgrades.** The service sees the upgrade request; a `101`
   passes straight back, roxy resets the stream, and the WebSocket's bytes
   do not go through it.
