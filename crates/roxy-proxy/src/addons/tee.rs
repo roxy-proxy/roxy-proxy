@@ -5,9 +5,11 @@
 //! observer, which sees every body in full for as long as it keeps up. An
 //! observer with more than `limits.max_observer_lag_bytes` of copy unread
 //! has it cut (it sees a body error) and an `observer_lagged` event is
-//! logged; the real traffic never waits. This is deliberately lossy: the observer is not the audit log,
-//! which keeps its own backpressure. An observer that drops its copy is
-//! not lagging: the rest is simply not copied.
+//! logged; the real traffic never waits. That much of the buffer budget is
+//! reserved for each copy before it starts, and a copy the budget cannot
+//! cover is cut the same way. This is deliberately lossy: the observer is
+//! not the audit log, which keeps its own backpressure. An observer that
+//! drops its copy is not lagging: the rest is simply not copied.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,8 +24,12 @@ use roxy_wasm::{HostError, LayerRequest, LayerResponse};
 use tokio::sync::{mpsc, oneshot};
 
 use super::StackFlow;
+use crate::budget::{self, BufferLease};
 use crate::flowlog::FlowEvent;
 use crate::watch::Dir;
+
+/// The copy outgrew `max_observer_lag_bytes`.
+const BEHIND: &str = "observer_behind";
 
 /// What an observer's `next` returns: the copy of the real response.
 pub(crate) struct ObserverNext {
@@ -43,7 +49,7 @@ impl ObserverNext {
     }
 }
 
-/// Reports a lagging observer once per direction.
+/// Reports a cut copy once per direction.
 struct Lag {
     st: Arc<StackFlow>,
     layer: String,
@@ -52,13 +58,14 @@ struct Lag {
 }
 
 impl Lag {
-    fn report(&self) {
+    fn report(&self, reason: &str) {
         if !self.reported.swap(true, Ordering::Relaxed) {
             self.st.shared.sink.emit(&FlowEvent::ObserverLagged {
                 ts: chrono::Utc::now(),
                 flow: self.st.flow.to_string(),
                 layer: self.layer.clone(),
                 direction: self.direction.as_str().to_owned(),
+                reason: reason.to_owned(),
             });
         }
     }
@@ -78,10 +85,14 @@ struct CopySender {
     tx: mpsc::UnboundedSender<Msg>,
     /// Bytes queued and not yet read by the observer.
     pending: Arc<AtomicU64>,
-    budget: u64,
+    /// `max_observer_lag_bytes`.
+    window: u64,
     /// Bytes queued so far, against the real body's declared length.
     sent: u64,
     known: Option<u64>,
+    /// The budget's share for this copy, released once neither end holds
+    /// queued bytes any more.
+    _lease: Option<Arc<BufferLease>>,
 }
 
 impl CopySender {
@@ -90,14 +101,14 @@ impl CopySender {
     }
 
     /// Queues `data` for the observer; `Err` when it would take the queue
-    /// past the budget or the observer has dropped its copy.
+    /// past the window or the observer has dropped its copy.
     fn try_push(&mut self, data: Bytes) -> Result<(), ()> {
         if data.is_empty() {
             return Ok(());
         }
         let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
         let pending = self.pending.load(Ordering::Relaxed);
-        if pending.saturating_add(len) > self.budget {
+        if pending.saturating_add(len) > self.window {
             return Err(());
         }
         self.pending.fetch_add(len, Ordering::Relaxed);
@@ -126,6 +137,7 @@ impl CopySender {
 struct CopyBody {
     rx: mpsc::UnboundedReceiver<Msg>,
     pending: Arc<AtomicU64>,
+    _lease: Option<Arc<BufferLease>>,
 }
 
 impl HttpBody for CopyBody {
@@ -157,14 +169,14 @@ struct Tee {
 }
 
 impl Tee {
-    /// The copy could not take a frame: the observer fell behind, or let
-    /// go of its copy. Only the first is worth a word.
-    fn cut(&mut self) {
+    /// The copy cannot go on for `reason`, unless the observer has let go
+    /// of it already, which is not worth a word.
+    fn cut(&mut self, reason: &str) {
         if let Some(c) = self.copy.take() {
             let gone = c.is_closed();
             c.cut(BodyError::Stopped);
             if !gone {
-                self.lag.report();
+                self.lag.report(reason);
             }
         }
     }
@@ -184,7 +196,7 @@ impl HttpBody for Tee {
             Some(Ok(f)) => {
                 if let (Some(data), Some(copy)) = (f.data_ref(), this.copy.as_mut()) {
                     if copy.try_push(data.clone()).is_err() {
-                        this.cut();
+                        this.cut(BEHIND);
                     } else if copy.complete()
                         && let Some(c) = this.copy.take()
                     {
@@ -216,8 +228,11 @@ impl HttpBody for Tee {
 }
 
 /// Splits `body` into the real body (unchanged, never delayed) and a
-/// best-effort copy buffered up to `budget` bytes.
-fn tee(body: Body, lag: Arc<Lag>, budget: u64) -> (Body, Body) {
+/// best-effort copy buffered up to `lag_bytes`, reserved from the buffer
+/// budget first. A copy the budget cannot cover is cut before it starts.
+fn tee(st: &StackFlow, body: Body, lag: Arc<Lag>) -> (Body, Body) {
+    let lag_bytes = st.snap.limits.max_observer_lag_bytes;
+    let lease = st.shared.reserve_buffer(lag_bytes).map(Arc::new);
     let known = body.known_length();
     let pending = Arc::new(AtomicU64::new(0));
     let (tx, rx) = mpsc::unbounded_channel();
@@ -227,26 +242,27 @@ fn tee(body: Body, lag: Arc<Lag>, budget: u64) -> (Body, Body) {
         CopyBody {
             rx,
             pending: pending.clone(),
+            _lease: lease.clone(),
         },
         u64::MAX,
         known,
     );
-    let real = Body::wrap_native(
-        Tee {
-            inner: body,
-            copy: Some(CopySender {
-                tx,
-                pending,
-                budget,
-                sent: 0,
-                known,
-            }),
-            lag,
-        },
-        u64::MAX,
-        known,
-    );
-    (real, copy)
+    let mut real = Tee {
+        inner: body,
+        copy: Some(CopySender {
+            tx,
+            pending,
+            window: lag_bytes,
+            sent: 0,
+            known,
+            _lease: lease.clone(),
+        }),
+        lag,
+    };
+    if lease.is_none() {
+        real.cut(budget::EXHAUSTED);
+    }
+    (Body::wrap_native(real, u64::MAX, known), copy)
 }
 
 fn lag(st: &Arc<StackFlow>, layer: &str, direction: Dir) -> Arc<Lag> {
@@ -267,8 +283,7 @@ pub(crate) async fn observe(
 ) -> Result<LayerResponse, HostError> {
     let addon = st.snap.addons[index].clone();
     let (parts, body) = req.into_parts();
-    let budget = st.snap.limits.max_observer_lag_bytes;
-    let (real_body, copy_body) = tee(body, lag(&st, &addon.name, Dir::Request), budget);
+    let (real_body, copy_body) = tee(&st, body, lag(&st, &addon.name, Dir::Request));
     let mut copy_req = http::Request::new(copy_body);
     *copy_req.method_mut() = parts.method.clone();
     *copy_req.uri_mut() = parts.uri.clone();
@@ -345,8 +360,7 @@ async fn forward(
     match real {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
-            let budget = st.snap.limits.max_observer_lag_bytes;
-            let (real_body, copy_body) = tee(body, lag(&st, name, Dir::Response), budget);
+            let (real_body, copy_body) = tee(&st, body, lag(&st, name, Dir::Response));
             let mut copy = http::Response::new(copy_body);
             *copy.status_mut() = parts.status;
             *copy.headers_mut() = parts.headers.clone();

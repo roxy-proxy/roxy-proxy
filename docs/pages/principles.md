@@ -107,8 +107,10 @@ the network, and the address floor checks the IP actually dialled
 An exchange is a request head, a request body stream, a response head and a
 response body stream. Every stage works on those streams. A body is
 buffered only when a rule or addon needs its content, and then only up to a
-cap. Large uploads and long responses stream end to end, and memory use does
-not grow with body size.
+cap, and the buffers of all exchanges together stay within one process-wide
+budget ([limits](/reference/limits#limits)). Large uploads and long responses
+stream end to end, and memory use grows with neither body size nor the
+number of clients holding a buffer.
 
 ## Well-behaved clients work unhindered
 

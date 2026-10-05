@@ -18,6 +18,7 @@ use tokio_util::task::TaskTracker;
 use crate::addr::canonical;
 use crate::addrlist::AddressLists;
 use crate::auth::UserDb;
+use crate::budget::{BufferBudget, BufferLease};
 use crate::config::{HttpBehaviour, ListenerKind, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowEvent, FlowSink, Redactor};
 use crate::listener::{ClientConn, Listener, ListenerMode, TcpProxyListener};
@@ -117,6 +118,9 @@ pub(crate) struct Shared {
     pub ws_message_every: u64,
     /// Each addon's keyed store, by addon name; survives reloads.
     pub layer_state: crate::addons::store::LayerStates,
+    /// Bytes reserved for per-exchange buffers, against the current
+    /// snapshot's `max_buffered_bytes`.
+    buffers: Arc<BufferBudget>,
     caps: Arc<ConnCaps>,
     /// Stop accepting; idle connections end.
     pub stop: CancellationToken,
@@ -133,6 +137,20 @@ impl Shared {
 
     fn build_snapshot(&self, u: PolicyUpdate) -> Result<Snapshot, String> {
         build_snapshot(u, &self.upstream_tls)
+    }
+
+    /// Reserves `bytes` of the buffer budget, or `None` when that would
+    /// take the process past `limits.max_buffered_bytes` as it stands now
+    /// (a reload applies to the next reservation, not to those held).
+    pub(crate) fn reserve_buffer(&self, bytes: u64) -> Option<BufferLease> {
+        let cap = self.snapshot().limits.max_buffered_bytes;
+        self.buffers.reserve(cap, bytes)
+    }
+
+    /// Bytes of the buffer budget reserved right now.
+    #[cfg(test)]
+    pub(crate) fn buffered(&self) -> u64 {
+        self.buffers.used()
     }
 
     pub(crate) fn emit_parse_error(&self, c: &ClientConn, flow: Option<String>, e: &ParseError) {
@@ -293,6 +311,7 @@ impl Server {
             connection_events: cfg.connection_events,
             ws_message_every: cfg.ws_message_every,
             layer_state: crate::addons::store::LayerStates::default(),
+            buffers: Arc::new(BufferBudget::default()),
             caps: Arc::new(ConnCaps {
                 max: cfg.max_connections.max(1),
                 max_per_client: cfg.max_connections_per_client.max(1),

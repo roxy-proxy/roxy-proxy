@@ -32,12 +32,14 @@
 //!   sinks write through `roxy-log` (one writer thread, batching,
 //!   backpressure, rotation).
 //! - [`io`]: stream adapters.
+//! - `budget`: the process-wide byte budget for per-exchange buffers.
 
 pub mod addons;
 pub mod addr;
 pub mod addrlist;
 pub mod auth;
 mod body;
+mod budget;
 mod ca_server;
 pub mod capture;
 pub mod config;

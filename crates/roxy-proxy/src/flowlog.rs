@@ -231,8 +231,8 @@ pub enum FlowEvent {
         duration_ms: u64,
         error: Option<String>,
     },
-    /// An observe-mode addon fell behind; its copy of the stream was cut
-    /// (the real traffic was not delayed).
+    /// An observe-mode addon's copy of a stream was cut (the real traffic
+    /// was not delayed).
     ObserverLagged {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,
@@ -240,6 +240,9 @@ pub enum FlowEvent {
         layer: String,
         /// `request` or `response`.
         direction: String,
+        /// `observer_behind` (the copy outgrew `max_observer_lag_bytes`) or
+        /// `buffer_budget_exhausted` (the budget could not cover a copy).
+        reason: String,
     },
     /// The upstream address policy refused every connection for the flow:
     /// a resolved address is private or on a deny list.

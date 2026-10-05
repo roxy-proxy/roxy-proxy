@@ -310,6 +310,11 @@ pub struct Limits {
     /// copy cut.
     #[serde(deserialize_with = "units::size")]
     pub max_observer_lag_bytes: ByteSize,
+    /// Process-wide budget for inspection buffers, WebSocket reassembly
+    /// and observer copies together; an exchange that cannot reserve its
+    /// cap fails closed (an observer copy is cut instead).
+    #[serde(deserialize_with = "units::size")]
+    pub max_buffered_bytes: ByteSize,
     #[serde(with = "humantime_serde")]
     pub header_timeout: Duration,
     #[serde(with = "humantime_serde")]
@@ -359,6 +364,7 @@ impl Default for Limits {
             max_ws_message_bytes: ByteSize::b(16 * MIB),
             max_capture_body_bytes: ByteSize::b(16 * MIB),
             max_observer_lag_bytes: ByteSize::b(16 * MIB),
+            max_buffered_bytes: ByteSize::b(GIB),
             header_timeout: Duration::from_secs(10),
             body_idle_timeout: Duration::from_secs(30),
             response_header_timeout: Duration::from_secs(60),
