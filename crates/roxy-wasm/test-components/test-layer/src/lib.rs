@@ -452,12 +452,13 @@ fn call_capability(req: &IncomingRequest) -> String {
         "unknown-endpoint" => {
             let r = OutgoingRequest::new(Fields::new());
             match endpoints::call("nope", r) {
-                Ok(fut) => match fut.subscribe().block() {
-                    () => match fut.get().expect("ready").expect("once") {
+                Ok(fut) => {
+                    fut.subscribe().block();
+                    match fut.get().expect("ready").expect("once") {
                         Ok(_) => "ok".to_owned(),
                         Err(e) => format!("error {e:?}"),
-                    },
-                },
+                    }
+                }
                 Err(e) => format!("error {e:?}"),
             }
         }
@@ -469,6 +470,15 @@ impl Handler for Layer {
     fn handle(req: IncomingRequest, out: ResponseOutparam) {
         let n = EXCHANGES.fetch_add(1, Ordering::Relaxed) + 1;
         let test = test_for(&req);
+        if let Some(n) = test.strip_prefix("hoard:") {
+            // Hold `n` host resources at once, then answer. Past the host's
+            // per-instance cap this traps instead of answering.
+            let n: usize = n.parse().expect("count");
+            let held: Vec<Fields> = (0..n).map(|_| Fields::new()).collect();
+            respond(out, 200, b"hoarded");
+            drop(held);
+            return;
+        }
         match test.as_str() {
             "pass" => pass(req, out, false),
             "relay" => relay(req, out),
