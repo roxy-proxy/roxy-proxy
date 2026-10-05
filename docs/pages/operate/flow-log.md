@@ -127,7 +127,8 @@ with `capture: request | response | both`, or every forwarded exchange with
 `log.capture.all: true`. Capture is decided at the request head and covers
 the exchange from its first byte. The taps sit after the watching rules
 allowed a chunk and before it is handed on, so what is captured is what was
-relayed. WebSocket relays are captured in both directions.
+relayed. WebSocket relays are captured in both directions, at the relay
+next to the upstream, so not as an addon layer changes them for the client.
 
 Capture is written like the flow log: one writer, batching, rotation, and
 backpressure (a slow disk slows traffic; capture is never dropped).

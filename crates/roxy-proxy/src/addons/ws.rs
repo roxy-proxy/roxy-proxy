@@ -17,7 +17,8 @@ use roxy_http::{Body, BodyError, BodySender, CanonicalResponse};
 use roxy_wasm::LayerRequest;
 use tokio::io::{AsyncRead, ReadBuf};
 
-use super::StackFlow;
+use super::{StackFlow, gated};
+use crate::flowlog::FlowSink;
 use crate::io::BoxIo;
 use crate::server::Snapshot;
 
@@ -108,25 +109,34 @@ pub(crate) struct WsPlumbing {
     to_client: Body,
     /// The relay's client side, the bottom of the stack.
     bottom: BoxIo,
+    sink: Arc<dyn FlowSink>,
 }
 
 impl WsPlumbing {
-    pub(crate) fn new(client_tx: BodySender, to_client: Body, bottom: BoxIo) -> Self {
+    pub(crate) fn new(
+        client_tx: BodySender,
+        to_client: Body,
+        bottom: BoxIo,
+        sink: Arc<dyn FlowSink>,
+    ) -> Self {
         Self {
             client_tx,
             to_client,
             bottom,
+            sink,
         }
     }
 
     /// Splices the client in: its bytes (those that came with the upgrade
     /// request first) go into the top request body, and the top response
-    /// body goes to it. Returns the relay's client side, and the client.
+    /// body goes to it, waiting for the flow log like any forwarded body.
+    /// Returns the relay's client side, and the client.
     fn splice(self, client: BoxIo, leftover: Vec<u8>) -> (BoxIo, SplicedClient) {
         let (cr, cw) = tokio::io::split(client);
+        let to_client = gated(self.to_client, self.sink);
         let client = SplicedClient {
             reader: tokio::spawn(reader_into(leftover, cr, self.client_tx)),
-            writer: tokio::spawn(body_to_writer(self.to_client, cw)),
+            writer: tokio::spawn(body_to_writer(to_client, cw)),
         };
         (self.bottom, client)
     }
@@ -261,5 +271,47 @@ async fn reader_into(first: Vec<u8>, mut r: impl tokio::io::AsyncRead + Unpin, m
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::io::AsyncReadExt as _;
+
+    use super::*;
+    use crate::testkit::{GatedSink, LogGate};
+
+    /// What the layers send toward the client waits for the flow log, as
+    /// the relay's bytes do.
+    #[tokio::test]
+    async fn bytes_toward_the_client_wait_for_the_flow_log() {
+        let gate = Arc::new(LogGate::default());
+        let sink = Arc::new(GatedSink::new(Arc::default(), gate.clone()));
+        let (client_tx, _from_client) = Body::channel(u64::MAX, None);
+        let (mut layer_tx, to_client) = Body::channel(u64::MAX, None);
+        let (bottom, _relay) = tokio::io::duplex(64);
+        let (client, mut peer) = tokio::io::duplex(64);
+        let plumbing = WsPlumbing::new(client_tx, to_client, Box::new(bottom), sink);
+        gate.set_closed(true);
+        let (_bottom, _client) = plumbing.splice(Box::new(client), Vec::new());
+        tokio::spawn(async move {
+            let _ = layer_tx.send_data(Bytes::from_static(b"hello")).await;
+            std::future::pending::<()>().await;
+        });
+        gate.wait_held().await;
+        let mut got = [0u8; 5];
+        let early = tokio::time::timeout(Duration::from_millis(100), peer.read_exact(&mut got));
+        assert!(
+            early.await.is_err(),
+            "bytes reached the client while the log was behind"
+        );
+        gate.set_closed(false);
+        tokio::time::timeout(Duration::from_secs(10), peer.read_exact(&mut got))
+            .await
+            .expect("bytes flow once the log catches up")
+            .unwrap();
+        assert_eq!(&got, b"hello");
     }
 }
