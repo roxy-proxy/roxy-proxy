@@ -533,7 +533,7 @@ async fn plaintext_in_connect_in_pieces_is_still_http() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let kit = Kit::builder()
         .rules(RULES)
-        .flags(|f| f.allow_plain_in_connect = true)
+        .http(|h| h.allow_plain_in_connect = true)
         .start()
         .await;
     let mut io = kit.connect_tunnel("up.test", 80).await;

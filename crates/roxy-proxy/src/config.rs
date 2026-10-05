@@ -75,6 +75,31 @@ pub struct RuntimeConfig {
     pub policy: PolicyUpdate,
 }
 
+/// What the proxy does with HTTP beyond parsing it: the `http.*` keys the
+/// codec does not read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpBehaviour {
+    /// `http.allow_plain_in_connect`: serve plaintext HTTP inside a CONNECT
+    /// tunnel instead of refusing it.
+    pub allow_plain_in_connect: bool,
+    /// `http.strip_accept_encoding`: remove `accept-encoding` from
+    /// requests, so origins answer uncompressed.
+    pub strip_accept_encoding: bool,
+    /// `http.decode_for_addons`: decode bodies at the edge of the addon
+    /// stack. Default true.
+    pub decode_for_addons: bool,
+}
+
+impl Default for HttpBehaviour {
+    fn default() -> Self {
+        Self {
+            allow_plain_in_connect: false,
+            strip_accept_encoding: false,
+            decode_for_addons: true,
+        }
+    }
+}
+
 /// The reloadable part of the configuration.
 pub struct PolicyUpdate {
     pub policy: Policy,
@@ -86,6 +111,7 @@ pub struct PolicyUpdate {
     pub users: HashMap<String, Arc<UserDb>>,
     pub limits: Limits,
     pub flags: HttpFlags,
+    pub http: HttpBehaviour,
     pub upstream: UpstreamSettings,
     /// Every `address_lists:` entry, loaded and compiled. A list that failed
     /// to load must never be represented here as empty: loading errors fail
@@ -108,6 +134,7 @@ impl std::fmt::Debug for PolicyUpdate {
             .field("users", &self.users.len())
             .field("limits", &self.limits)
             .field("flags", &self.flags)
+            .field("http", &self.http)
             .field("upstream", &self.upstream)
             .field("address_lists", &self.address_lists.len())
             .field("deny_lists", &self.deny_lists)

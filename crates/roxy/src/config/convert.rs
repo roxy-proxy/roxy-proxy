@@ -1,7 +1,9 @@
 //! The one place config values become runtime types (`roxy_http::Limits`,
-//! `roxy_http::HttpFlags`, upstream settings, upstream TLS options).
+//! `roxy_http::HttpFlags`, the proxy's HTTP behaviour, upstream settings,
+//! upstream TLS options).
 
 use roxy_http::{HttpFlags, Limits};
+use roxy_proxy::HttpBehaviour;
 use roxy_proxy::addr::AddressPolicy;
 use roxy_proxy::{DnsSettings, UpstreamSettings};
 use roxy_tls::{MinTlsVersion, UpstreamTlsOptions};
@@ -43,6 +45,14 @@ impl From<&Config> for HttpFlags {
             allow_chunk_extensions: h.allow_chunk_extensions,
             allow_obs_text: h.allow_obs_text,
             allow_body_on_get: h.allow_body_on_get,
+        }
+    }
+}
+
+impl From<&Config> for HttpBehaviour {
+    fn from(c: &Config) -> Self {
+        let h = &c.http;
+        HttpBehaviour {
             allow_plain_in_connect: h.allow_plain_in_connect,
             strip_accept_encoding: h.strip_accept_encoding,
             decode_for_addons: h.decode_for_addons,
@@ -106,6 +116,7 @@ mod tests {
         let c = Config::from_yaml("version: 1\n").unwrap();
         assert_eq!(Limits::from(&c), Limits::default());
         assert_eq!(HttpFlags::from(&c), HttpFlags::default());
+        assert_eq!(HttpBehaviour::from(&c), HttpBehaviour::default());
     }
 
     #[test]

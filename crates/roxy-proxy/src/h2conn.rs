@@ -222,7 +222,7 @@ async fn serve_stream(
     // `parse_error` included: one connection can open many streams.
     crate::flowlog::sink_ready(&*ccx.shared.sink).await;
     let snap = ccx.shared.snapshot();
-    let ConnLimits { limits, flags } = &ccx.cl;
+    let ConnLimits { limits, flags, .. } = &ccx.cl;
     let (parts, recv) = req.into_parts();
     let fail = Arc::new(BodyFail::default());
     let raw = if recv.is_end_stream() {

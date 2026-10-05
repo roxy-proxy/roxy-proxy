@@ -49,7 +49,7 @@ pub(crate) use upstream::{Seen, Upstream};
 
 use crate::Server;
 use crate::addons::{AddonMode, AddonSpec, StateLimits};
-use crate::config::{PolicyUpdate, RuntimeConfig};
+use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{MemorySink, Redactor};
 use crate::listener::{ClientConn, ListenerInfo, ListenerMode};
 use crate::sources::{MetricSource, StateSource, UnavailableMetrics, UnavailableState};
@@ -160,6 +160,7 @@ pub(crate) struct KitBuilder {
     addons: Vec<AddonDef>,
     limits: Limits,
     flags: HttpFlags,
+    http: HttpBehaviour,
     metrics: Arc<dyn MetricSource>,
     /// `metrics:` definitions (YAML); a real metric store holds them.
     metric_defs: String,
@@ -197,6 +198,12 @@ impl KitBuilder {
     #[must_use]
     pub(crate) fn flags(mut self, f: impl FnOnce(&mut HttpFlags)) -> Self {
         f(&mut self.flags);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn http(mut self, f: impl FnOnce(&mut HttpBehaviour)) -> Self {
+        f(&mut self.http);
         self
     }
 
@@ -263,7 +270,7 @@ impl KitBuilder {
         }
 
         let settings = upstream_settings(&upstream);
-        let (limits, flags) = (self.limits.clone(), self.flags.clone());
+        let (limits, flags, http) = (self.limits.clone(), self.flags.clone(), self.http.clone());
         let capture = self
             .capture_all
             .then(|| Arc::new(capture_all_log(&dir.path().join("capture"))));
@@ -294,6 +301,7 @@ impl KitBuilder {
                 users: HashMap::new(),
                 limits: self.limits,
                 flags: self.flags,
+                http: self.http,
                 upstream: settings.clone(),
                 address_lists: Arc::new(HashMap::new()),
                 deny_lists: Vec::new(),
@@ -310,6 +318,7 @@ impl KitBuilder {
             ca_file: dir.path().join(roxy_tls::CA_CERT_FILE),
             limits,
             flags,
+            http,
             settings,
             _dir: dir,
         }
@@ -326,6 +335,7 @@ pub(crate) struct Kit {
     ca_file: std::path::PathBuf,
     pub(crate) limits: Limits,
     pub(crate) flags: HttpFlags,
+    pub(crate) http: HttpBehaviour,
     settings: UpstreamSettings,
     _dir: tempfile::TempDir,
 }
@@ -337,6 +347,7 @@ impl Kit {
             addons: Vec::new(),
             limits: Limits::default(),
             flags: HttpFlags::default(),
+            http: HttpBehaviour::default(),
             metrics: Arc::new(UnavailableMetrics),
             metric_defs: String::new(),
             state: Arc::new(UnavailableState),
@@ -528,6 +539,7 @@ impl Kit {
                 users: HashMap::new(),
                 limits: self.limits.clone(),
                 flags: self.flags.clone(),
+                http: self.http.clone(),
                 upstream: self.settings.clone(),
                 address_lists: Arc::new(HashMap::new()),
                 deny_lists: Vec::new(),

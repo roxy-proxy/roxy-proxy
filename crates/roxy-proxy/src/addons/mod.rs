@@ -704,7 +704,7 @@ pub(crate) fn enter(
         let mut req = req;
         // Layers see bodies decoded; a flow no layer runs on is left as
         // the client sent it.
-        if st.snap.flags.decode_for_addons && !st.request_decoded.swap(true, Ordering::SeqCst) {
+        if st.snap.http.decode_for_addons && !st.request_decoded.swap(true, Ordering::SeqCst) {
             decode::request(&mut req, st.snap.limits.max_request_body_bytes);
         }
         if addon.mode == AddonMode::Observe {
@@ -828,7 +828,7 @@ async fn core(
         Outcome::Respond(mut res) => {
             // A flow no layer ran on gets the response as the origin sent
             // it.
-            if snap.flags.decode_for_addons && st.any_ran() {
+            if snap.http.decode_for_addons && st.any_ran() {
                 decode::response(&mut res, snap.limits.max_response_body_bytes);
             }
             Ok(to_layer_response(res))

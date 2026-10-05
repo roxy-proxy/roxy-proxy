@@ -34,14 +34,16 @@ const AUTH_REALM: &str = "roxy";
 /// The body of a `407`.
 const AUTH_REQUIRED_BODY: &[u8] = b"{\"error\":\"proxy authentication required\"}";
 
-/// The limits and flags that shape the client-facing codec, fixed for a
-/// connection when it is accepted. A reload changes them for new
-/// connections only; what is decided per exchange (the policy, the
-/// upstream side, inspection caps) comes from the exchange's snapshot.
+/// The limits and flags that shape the client-facing codec, and which
+/// codec a tunnel gets, fixed for a connection when it is accepted. A
+/// reload changes them for new connections only; what is decided per
+/// exchange (the policy, the upstream side, inspection caps) comes from
+/// the exchange's snapshot.
 #[derive(Clone)]
 pub(crate) struct ConnLimits {
     pub limits: Arc<Limits>,
     pub flags: Arc<HttpFlags>,
+    pub allow_plain_in_connect: bool,
 }
 
 impl ConnLimits {
@@ -50,6 +52,7 @@ impl ConnLimits {
         Self {
             limits: snap.limits.clone(),
             flags: snap.flags.clone(),
+            allow_plain_in_connect: snap.http.allow_plain_in_connect,
         }
     }
 
@@ -259,7 +262,7 @@ async fn handle_connect(
             ))
             .await;
         }
-        FirstBytes::Http if cl.flags.allow_plain_in_connect => {
+        FirstBytes::Http if cl.allow_plain_in_connect => {
             let role = Role::Tunnel {
                 authority,
                 scheme: Scheme::Http,

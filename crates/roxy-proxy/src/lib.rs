@@ -61,7 +61,7 @@ pub use addrlist::{AddressList, AddressLists, ListError};
 pub use auth::UserDb;
 pub use ca_server::PEM_CONTENT_TYPE;
 pub use capture::{CAPTURE_FILE, CaptureLog, CaptureOptions};
-pub use config::{ListenerKind, ListenerSpec, PolicyUpdate, RuntimeConfig};
+pub use config::{HttpBehaviour, ListenerKind, ListenerSpec, PolicyUpdate, RuntimeConfig};
 pub use conn::INTERNAL_HOST;
 pub use dns_server::DnsServerSpec;
 pub use flowlog::{

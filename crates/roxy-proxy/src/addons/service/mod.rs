@@ -550,6 +550,7 @@ pub(crate) mod testing {
                 users: HashMap::new(),
                 limits: kit.limits.clone(),
                 flags: kit.flags.clone(),
+                http: kit.http.clone(),
                 upstream,
                 address_lists: Arc::new(HashMap::new()),
                 deny_lists: Vec::new(),

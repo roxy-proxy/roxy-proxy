@@ -303,7 +303,7 @@ pub(crate) async fn process<F: Front>(
     // Audit backpressure: an exchange starts only while the flow
     // log keeps up.
     crate::flowlog::sink_ready(&*cx.shared.sink).await;
-    if cx.snap.flags.strip_accept_encoding {
+    if cx.snap.http.strip_accept_encoding {
         // Before the layers and the rules, so all of them, and the flow
         // log, see the request as it will leave.
         req.headers.remove("accept-encoding");
