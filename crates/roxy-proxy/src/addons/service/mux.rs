@@ -18,7 +18,7 @@
 //! whose connections close as soon as no exchange is using them.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
@@ -203,7 +203,51 @@ pub(super) struct Link {
     shared: Arc<LinkShared>,
     /// Ordered per stream: open, heads, body frames, ends. The socket
     /// closes once every sender is gone (the pool's, and each stream's).
-    data: mpsc::Sender<Message>,
+    data: mpsc::Sender<Queued>,
+}
+
+/// A message on a connection's data queue.
+struct Queued {
+    msg: Message,
+    wire: Arc<Wire>,
+    /// It is the stream's `open`.
+    open: bool,
+}
+
+/// How far a stream has got on the wire. Once it is reset, nothing more
+/// of it is written. A reset before its `open` was written does not tell
+/// the service (the reset would overtake the queued `open`): the service
+/// never hears of the stream.
+#[derive(Default)]
+struct Wire(AtomicU8);
+
+impl Wire {
+    const UNSENT: u8 = 0;
+    const WRITTEN: u8 = 1;
+    const DROPPED: u8 = 2;
+
+    /// Whether the writer writes a message of the stream (`open`: its
+    /// `open` message).
+    fn write(&self, open: bool) -> bool {
+        if open {
+            self.0
+                .compare_exchange(
+                    Self::UNSENT,
+                    Self::WRITTEN,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+        } else {
+            self.0.load(Ordering::SeqCst) != Self::DROPPED
+        }
+    }
+
+    /// The stream is reset: whether the service is told, which it is
+    /// once the `open` has been written.
+    fn reset(&self) -> bool {
+        self.0.swap(Self::DROPPED, Ordering::SeqCst) == Self::WRITTEN
+    }
 }
 
 struct LinkShared {
@@ -298,6 +342,7 @@ pub(super) struct Stream {
     more_credit: Notify,
     /// Wakes whatever is sending or waiting on the stream once it ended.
     ended: CancellationToken,
+    wire: Arc<Wire>,
 }
 
 #[derive(Default)]
@@ -447,7 +492,9 @@ impl Stream {
                 false,
             ),
         };
-        if let Some(message) = reset {
+        if let Some(message) = reset
+            && self.wire.reset()
+        {
             self.link.shared.send_ctl(self.id, &Out::Reset { message });
         }
         for inbox in inboxes.into_iter().flatten() {
@@ -488,10 +535,22 @@ impl Stream {
     /// Sends a control message in stream order. False once the stream or
     /// the connection is gone.
     async fn send(&self, m: &Out) -> bool {
-        let msg = text(self.id, m);
+        let open = matches!(m, Out::Open { .. });
+        self.queue(text(self.id, m), open).await
+    }
+
+    /// Queues a message of the stream for the socket. Nothing is queued
+    /// once the stream has ended.
+    async fn queue(&self, msg: Message, open: bool) -> bool {
+        let q = Queued {
+            msg,
+            wire: self.wire.clone(),
+            open,
+        };
         tokio::select! {
-            r = self.link.data.send(msg) => r.is_ok(),
+            biased;
             () = self.ended.cancelled() => false,
+            r = self.link.data.send(q) => r.is_ok(),
         }
     }
 
@@ -556,11 +615,7 @@ impl Stream {
                     return false;
                 };
                 let part = d.split_to(n);
-                let sent = tokio::select! {
-                    r = self.link.data.send(binary(self.id, dir, &part)) => r.is_ok(),
-                    () = self.ended.cancelled() => false,
-                };
-                if !sent {
+                if !self.queue(binary(self.id, dir, &part), false).await {
                     return false;
                 }
             }
@@ -937,6 +992,7 @@ pub(super) async fn open(
             }),
             more_credit: Notify::new(),
             ended: CancellationToken::new(),
+            wire: Arc::default(),
         });
         s.open.insert(id, stream.clone());
         stream
@@ -1067,11 +1123,12 @@ async fn dial(
     }))
 }
 
-/// Owns the socket's write half. Control messages go first; the socket
-/// closes once every data sender is gone, or on a close.
+/// Owns the socket's write half. Control messages go first, but a reset
+/// never overtakes its stream's `open` ([`Wire`]). The socket closes once
+/// every data sender is gone, or on a close.
 async fn write(
     mut sink: SplitSink<Ws, Message>,
-    mut data: mpsc::Receiver<Message>,
+    mut data: mpsc::Receiver<Queued>,
     mut ctl: mpsc::UnboundedReceiver<Message>,
 ) {
     loop {
@@ -1079,7 +1136,8 @@ async fn write(
             biased;
             Some(m) = ctl.recv() => m,
             m = data.recv() => match m {
-                Some(m) => m,
+                Some(q) if q.wire.write(q.open) => q.msg,
+                Some(_) => continue,
                 None => break,
             },
         };
@@ -1225,6 +1283,7 @@ mod tests {
             }),
             more_credit: Notify::new(),
             ended: CancellationToken::new(),
+            wire: Arc::default(),
         });
         lock(&link.shared.streams).open.insert(1, stream.clone());
         (stream, Answers { first, second }, kit)
@@ -1325,6 +1384,70 @@ mod tests {
         assert!(fresh.link.get().is_none(), "a new connection");
     }
 
+    /// Fills the data queue of `stream`'s connection with body frames of
+    /// its own, until the writer is stalled on a socket nobody reads and
+    /// the queue stays full.
+    async fn fill(stream: &Stream) {
+        let frame = binary(stream.id, Dir::Request, &vec![0u8; MAX_BODY_FRAME]);
+        let queued = || Queued {
+            msg: frame.clone(),
+            wire: stream.wire.clone(),
+            open: false,
+        };
+        loop {
+            while stream.link.data.try_send(queued()).is_ok() {}
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if stream.link.data.try_send(queued()).is_err() {
+                break;
+            }
+        }
+    }
+
+    /// A stream reset while its `open` is still queued, behind a full
+    /// data queue: the service sees its `open` before its `reset`, or
+    /// neither.
+    #[tokio::test]
+    async fn a_reset_never_overtakes_its_open() {
+        let kit = testing::kit(
+            ALLOW_UP,
+            vec![testing::addon("s", "pause", AddonMode::Enforce, |s| {
+                s.max_connections = 1;
+            })],
+        )
+        .await;
+        let (st, _cx) = crate::addons::test_flow(&kit);
+        let snap = st.snap.clone();
+        let AddonImpl::Service(svc) = &snap.addons[0].kind else {
+            panic!("a service layer");
+        };
+
+        let (first, _) = open(&st, 0, svc, AddonMode::Enforce).await.unwrap();
+        // The service reads nothing until its pause is over.
+        fill(&first).await;
+        // Queued at the back once the writer moves again.
+        let (second, _) = open(&st, 0, svc, AddonMode::Enforce).await.unwrap();
+        second.reset("the exchange ended");
+        // Everything before this is on the wire once its `open` is.
+        let (third, _) = open(&st, 0, svc, AddonMode::Enforce).await.unwrap();
+
+        let log = kit.upstream.service();
+        let opened = |id: u32| log.opens().iter().any(|o| o["stream"] == id);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !opened(third.id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the third stream opens");
+        assert_eq!(
+            log.unknown_resets(),
+            Vec::<u32>::new(),
+            "a reset before its open"
+        );
+        let reset = log.resets().iter().any(|(id, _)| *id == second.id);
+        assert_eq!(opened(second.id), reset, "open and reset, or neither");
+    }
+
     /// An `open` given up while its message waits for the socket (a
     /// missed `first_byte_timeout`) leaves no stream behind: the next
     /// exchange gets its place.
@@ -1345,16 +1468,8 @@ mod tests {
         };
 
         let (first, _) = open(&st, 0, svc, AddonMode::Enforce).await.unwrap();
-        // The service never reads: the writer stalls on the socket, and
-        // the queue behind it fills.
-        let frame = binary(first.id, Dir::Request, &vec![0u8; MAX_BODY_FRAME]);
-        loop {
-            while first.link.data.try_send(frame.clone()).is_ok() {}
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if first.link.data.try_send(frame.clone()).is_err() {
-                break;
-            }
-        }
+        // The service never reads.
+        fill(&first).await;
         let given_up = tokio::time::timeout(
             Duration::from_millis(100),
             open(&st, 0, svc, AddonMode::Enforce),

@@ -118,8 +118,10 @@ that. roxy sends nothing more on it after that (a request body the
 service did not wait for is not sent on). Either side may end a stream
 early with `reset`. roxy resets a stream when the client goes away, a
 deadline passes, the service broke the protocol on it, or the upstream
-switched protocols (a `101`). A service that resets an enforce stream
-fails that exchange closed. Each side ignores messages that arrive for a
+switched protocols (a `101`), and sends nothing on it after the `reset`.
+A stream roxy gives up before its `open` has gone out is dropped without
+a `reset`: the service never sees it. A service that resets an enforce
+stream fails that exchange closed. Each side ignores messages that arrive for a
 stream it has already ended; roxy still credits back the body bytes among
 them, so a service that was mid-send when the stream ended is not left
 waiting for credit.
