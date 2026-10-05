@@ -13,6 +13,8 @@
 //!   credit;
 //! * `/svc/pause`: reads nothing for [`PAUSE`] after the handshake, then
 //!   reads and credits everything without answering;
+//! * `/svc/slow`: a pass-through that reads nothing more for [`SLOW`]
+//!   after each `request` head it gets, so it answers [`SLOW`] late;
 //! * `/svc/stall`: completes the handshake and never reads.
 //!
 //! Every connection credits roxy back for the bytes it receives.
@@ -65,6 +67,9 @@ pub(crate) const TALK_BYTES: usize = 4 * 256 * 1024;
 
 /// How long `/svc/pause` leaves its socket unread after the handshake.
 pub(crate) const PAUSE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// How long `/svc/slow` holds each `request` head.
+pub(crate) const SLOW: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// What the service saw, across connections.
 #[derive(Default)]
@@ -231,6 +236,7 @@ enum Mode {
     Talk,
     Flood,
     Pause,
+    Slow,
 }
 
 impl Mode {
@@ -241,6 +247,8 @@ impl Mode {
             Self::Talk
         } else if path.ends_with("/pause") {
             Self::Pause
+        } else if path.ends_with("/slow") {
+            Self::Slow
         } else {
             Self::Flood
         }
@@ -282,7 +290,7 @@ impl Conn {
                 lock(&self.log.opens).push(v);
                 self.streams.insert(id, Sess::new());
                 match self.mode {
-                    Mode::Pass | Mode::Pause => {}
+                    Mode::Pass | Mode::Pause | Mode::Slow => {}
                     Mode::Talk => {
                         let s = self.streams.get_mut(&id).expect("just opened");
                         s.lanes[usize::from(REQUEST)]
@@ -310,7 +318,7 @@ impl Conn {
                     lock(&self.log.unknown_resets).push(id);
                 }
             }
-            _ if self.mode == Mode::Pass => {
+            _ if matches!(self.mode, Mode::Pass | Mode::Slow) => {
                 let Some(dir) = lane_of(&kind) else {
                     return;
                 };
@@ -412,6 +420,9 @@ where
         match m {
             Message::Text(t) => {
                 if let Ok(v) = serde_json::from_str::<Value>(t.as_str()) {
+                    if conn.mode == Mode::Slow && v["type"] == "request" {
+                        tokio::time::sleep(SLOW).await;
+                    }
                     conn.control(v);
                 }
             }
