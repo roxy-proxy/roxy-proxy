@@ -10,20 +10,21 @@ use regex::Regex;
 use roxy_http::Host;
 
 use super::{
-    CAction, CompiledRule, Condition, MetricDef, PolicyInput, RuleKind, RuleShape, is_header_value,
-    metric_reads,
+    CAction, CompiledRule, Condition, MetricDef, PolicyInput, RuleKind, RuleShape, WatchAction,
+    is_header_value, metric_reads,
 };
 use crate::compile::{Env, Needs, Pred, build_shared_regex, compile};
 use crate::config::{
     Action, AllowArgs, DenyArgs, MetricConfig, MetricCount, RedirectArgs, RewritePathArgs,
-    RuleConfig, Upgrade,
+    RuleConfig, SetStateArgs, Upgrade,
 };
 use crate::diag::{Diagnostic, RuleId};
 use crate::eval::{
-    AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, DenyStatus, Effect,
+    AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Deny, DenyStatus, Effect,
+    WatchEffect,
 };
 use crate::lexer::is_ident;
-use crate::template::{Part, has_secrets, mentions_secret, parse_template, secret_names};
+use crate::template::{Part, literal, mentions_secret, parse_template, secret_names};
 use crate::types::{Field, Reads, is_token};
 
 impl Condition {
@@ -327,11 +328,12 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             };
             tag_reads.push(needs.tags.clone());
             let shape = RuleShape::classify(&needs, rule);
-            let actions = self.actions(rule, &rid, &path, &shape);
+            let (head, watching) = self.actions(rule, &rid, &path, &shape);
             out.push(CompiledRule {
                 id: rid,
                 when,
-                actions: actions.into(),
+                head,
+                watching,
                 shape,
             });
         }
@@ -392,15 +394,18 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         }
     }
 
+    /// Compile a rule's actions for where it runs: at the head, after
+    /// forwarding, or (a deny watching a byte metric) both.
     fn actions(
         &mut self,
         rule: &RuleConfig,
         rid: &RuleId,
         path: &str,
         shape: &RuleShape,
-    ) -> Vec<CAction> {
+    ) -> (Box<[CAction]>, Box<[WatchAction]>) {
         let actions = &rule.then.0;
-        let mut out = Vec::with_capacity(actions.len());
+        let mut head = Vec::with_capacity(actions.len());
+        let mut watching = Vec::with_capacity(actions.len());
         for (j, action) in actions.iter().enumerate() {
             let apath = format!("{path}.then[{j}]");
             if j > 0 && actions[j - 1].is_terminal() {
@@ -416,43 +421,36 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                     ),
                 );
             }
-            if let Some(a) = self.action(shape, action, rid, &apath) {
-                out.extend(a);
+            match shape.kind {
+                RuleKind::Watching => {
+                    if let Some(a) = self.watch_action(shape, action, rid, &apath) {
+                        watching.extend(a);
+                    }
+                }
+                RuleKind::Head | RuleKind::HeadAndWatching => {
+                    let Some(compiled) = self.action(action, rid, &apath) else {
+                        continue;
+                    };
+                    if shape.kind == RuleKind::HeadAndWatching {
+                        watching.extend(compiled.iter().filter_map(WatchAction::after_forwarding));
+                    }
+                    head.extend(compiled);
+                }
             }
         }
-        out
+        (head.into(), watching.into())
     }
 
-    /// Check one action; `None` if it has errors (already reported).
-    fn action(
-        &mut self,
-        shape: &RuleShape,
-        action: &Action,
-        rid: &RuleId,
-        apath: &str,
-    ) -> Option<Vec<CAction>> {
+    /// Check one action of a rule decided at the request head, where every
+    /// action is possible; `None` if it has errors (already reported).
+    fn action(&mut self, action: &Action, rid: &RuleId, apath: &str) -> Option<Vec<CAction>> {
         let errors_before = self.d.len();
         let rule = Some(rid);
-        if let Some(msg) = shape.illegal(action) {
-            self.push(rule, apath, msg);
-        }
-        if non_header_strings(action)
-            .iter()
-            .any(|s| mentions_secret(s))
-        {
-            self.push(
-                rule,
-                apath,
-                format!(
-                    "secret references are only allowed in `set_header` values, not in `{}`",
-                    action.name()
-                ),
-            );
-        }
+        self.secrets_outside_header(action, rule, apath);
         let out = match action {
             Action::Allow(a) => vec![CAction::Terminal(allow(a))],
-            Action::Deny(d) => vec![CAction::Terminal(self.deny(d, rule, apath))],
-            Action::SetHeader(pairs) => self.set_header(shape, pairs, rule, apath),
+            Action::Deny(d) => vec![CAction::Terminal(Decision::Deny(self.deny(d, rule, apath)))],
+            Action::SetHeader(pairs) => self.set_header(pairs, rule, apath),
             Action::RemoveHeader(names) => names
                 .iter()
                 .filter_map(|n| self.header_name(rule, apath, n))
@@ -487,30 +485,19 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             }
             Action::Redirect(r) => vec![CAction::Effect(self.redirect(r, rule, apath))],
             Action::Tag(t) => {
-                if t.is_empty() || t.chars().any(|c| c.is_whitespace() || c.is_control()) {
-                    self.push(
-                        rule,
-                        apath,
-                        format!("tag name {t:?} must be non-empty without whitespace"),
-                    );
-                }
+                self.tag(t, rule, apath);
                 vec![CAction::Tag(t.clone())]
             }
             Action::Log(l) => vec![CAction::Effect(Effect::Log {
                 level: l.level,
                 message: l.message.clone(),
             })],
-            Action::SetState(s) => {
-                if s.key.is_empty() {
-                    self.push(rule, apath, "set_state key must not be empty");
-                }
-                if s.ttl.is_some_and(|t| t.is_zero()) {
-                    self.push(rule, apath, "set_state ttl must be greater than zero");
-                }
+            Action::SetState(st) => {
+                self.set_state(st, rule, apath);
                 vec![CAction::Effect(Effect::SetState {
-                    key: s.key.clone(),
-                    value: s.value.clone(),
-                    ttl: s.ttl,
+                    key: st.key.clone(),
+                    value: st.value.clone(),
+                    ttl: st.ttl,
                 })]
             }
             Action::Capture(t) => vec![CAction::Effect(Effect::Capture(*t))],
@@ -518,7 +505,135 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         (self.d.len() == errors_before).then_some(out)
     }
 
-    fn deny(&mut self, d: &DenyArgs, rule: Option<&RuleId>, apath: &str) -> Decision {
+    /// Check one action of a rule that reads a watched field, which runs
+    /// after the request is on its way: it cannot allow or change the
+    /// request, and its header changes apply to the response. `None` if it
+    /// has errors (already reported).
+    fn watch_action(
+        &mut self,
+        shape: &RuleShape,
+        action: &Action,
+        rid: &RuleId,
+        apath: &str,
+    ) -> Option<Vec<WatchAction>> {
+        let errors_before = self.d.len();
+        let rule = Some(rid);
+        self.secrets_outside_header(action, rule, apath);
+        let out = match action {
+            Action::Allow(_) => {
+                self.push(
+                    rule,
+                    apath,
+                    format!(
+                        "`allow` is only possible in rules decided at the request head; {}. \
+                         Write the allow as a head rule and this rule as a `deny`",
+                        shape.forwarded_why()
+                    ),
+                );
+                Vec::new()
+            }
+            Action::RewritePath(_)
+            | Action::SetQuery(_)
+            | Action::RemoveQuery(_)
+            | Action::Redirect(_) => {
+                self.push(
+                    rule,
+                    apath,
+                    format!(
+                        "`{}` changes the request, which is already on its way; {}",
+                        action.name(),
+                        shape.forwarded_why()
+                    ),
+                );
+                Vec::new()
+            }
+            Action::Capture(_) => {
+                self.push(
+                    rule,
+                    apath,
+                    format!(
+                        "`capture` is decided at the request head, so the whole exchange is \
+                         captured from its first byte; {}. Capture in a head rule (e.g. the \
+                         allow that forwards this traffic)",
+                        shape.forwarded_why()
+                    ),
+                );
+                Vec::new()
+            }
+            Action::SetHeader(pairs) => {
+                if let Some(msg) = shape.response_header_problem(action) {
+                    self.push(rule, apath, msg);
+                }
+                self.response_set_header(shape, pairs, rule, apath)
+            }
+            Action::RemoveHeader(names) => {
+                if let Some(msg) = shape.response_header_problem(action) {
+                    self.push(rule, apath, msg);
+                }
+                names
+                    .iter()
+                    .filter_map(|n| self.header_name(rule, apath, n))
+                    .map(|n| WatchAction::Effect(WatchEffect::RemoveHeader(n)))
+                    .collect()
+            }
+            Action::Deny(d) => vec![WatchAction::Deny(self.deny(d, rule, apath))],
+            Action::Tag(t) => {
+                self.tag(t, rule, apath);
+                vec![WatchAction::Tag(t.clone())]
+            }
+            Action::Log(l) => vec![WatchAction::Effect(WatchEffect::Log {
+                level: l.level,
+                message: l.message.clone(),
+            })],
+            Action::SetState(st) => {
+                self.set_state(st, rule, apath);
+                vec![WatchAction::Effect(WatchEffect::SetState {
+                    key: st.key.clone(),
+                    value: st.value.clone(),
+                    ttl: st.ttl,
+                })]
+            }
+        };
+        (self.d.len() == errors_before).then_some(out)
+    }
+
+    /// `${secret:..}` may appear only in a `set_header` value.
+    fn secrets_outside_header(&mut self, action: &Action, rule: Option<&RuleId>, apath: &str) {
+        if non_header_strings(action)
+            .iter()
+            .any(|s| mentions_secret(s))
+        {
+            self.push(
+                rule,
+                apath,
+                format!(
+                    "secret references are only allowed in `set_header` values, not in `{}`",
+                    action.name()
+                ),
+            );
+        }
+    }
+
+    fn tag(&mut self, t: &str, rule: Option<&RuleId>, apath: &str) {
+        if t.is_empty() || t.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            self.push(
+                rule,
+                apath,
+                format!("tag name {t:?} must be non-empty without whitespace"),
+            );
+        }
+    }
+
+    fn set_state(&mut self, s: &SetStateArgs, rule: Option<&RuleId>, apath: &str) {
+        if s.key.is_empty() {
+            self.push(rule, apath, "set_state key must not be empty");
+        }
+        if s.ttl.is_some_and(|t| t.is_zero()) {
+            self.push(rule, apath, "set_state ttl must be greater than zero");
+        }
+    }
+
+    fn deny(&mut self, d: &DenyArgs, rule: Option<&RuleId>, apath: &str) -> Deny {
         let DenyArgs {
             status,
             message,
@@ -537,7 +652,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 DEFAULT_DENY_STATUS
             }
         };
-        Decision::Deny {
+        Deny {
             status,
             message: message
                 .clone()
@@ -546,9 +661,10 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         }
     }
 
+    /// Request headers, set at the head: a value may carry secrets, which
+    /// are substituted per flow.
     fn set_header(
         &mut self,
-        shape: &RuleShape,
         pairs: &[(String, String)],
         rule: Option<&RuleId>,
         apath: &str,
@@ -558,7 +674,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             let Some(name) = self.header_name(rule, apath, name) else {
                 continue;
             };
-            let Some(parts) = self.template(shape, rule, apath, &name, value) else {
+            let Some(parts) = self.template(rule, apath, &name, value) else {
                 continue;
             };
             out.push(match parts.as_slice() {
@@ -572,6 +688,40 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 }),
                 _ => CAction::SetHeader { name, parts },
             });
+        }
+        out
+    }
+
+    /// Response headers, set by a watching rule: secrets set request
+    /// headers, so a value here is a literal.
+    fn response_set_header(
+        &mut self,
+        shape: &RuleShape,
+        pairs: &[(String, String)],
+        rule: Option<&RuleId>,
+        apath: &str,
+    ) -> Vec<WatchAction> {
+        let mut out = Vec::with_capacity(pairs.len());
+        for (name, value) in pairs {
+            let Some(name) = self.header_name(rule, apath, name) else {
+                continue;
+            };
+            let Some(parts) = self.template(rule, apath, &name, value) else {
+                continue;
+            };
+            let Some(value) = literal(&parts) else {
+                self.push(
+                    rule,
+                    apath,
+                    format!(
+                        "secret references are only allowed in rules decided at the request \
+                         head (they set request headers); this rule watches {}",
+                        shape.watched()
+                    ),
+                );
+                continue;
+            };
+            out.push(WatchAction::Effect(WatchEffect::SetHeader { name, value }));
         }
         out
     }
@@ -654,7 +804,6 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
     /// Parse `${secret:name}` references out of a `set_header` value.
     fn template(
         &mut self,
-        shape: &RuleShape,
         rule: Option<&RuleId>,
         apath: &str,
         header: &str,
@@ -681,18 +830,6 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 );
                 ok = false;
             }
-        }
-        if has_secrets(&parts) && shape.kind == RuleKind::Watching {
-            self.push(
-                rule,
-                apath,
-                format!(
-                    "secret references are only allowed in rules decided at the request head \
-                     (they set request headers); this rule watches {}",
-                    shape.watched()
-                ),
-            );
-            ok = false;
         }
         for p in &parts {
             if let Part::Lit(s) = p
@@ -750,72 +887,41 @@ impl RuleShape {
         quoted(&self.watches)
     }
 
-    /// Why `a` is not allowed in this rule, if it is not.
-    ///
-    /// Head rules (including deny rules that also watch a byte metric) may
-    /// use every action; their header changes apply to the request. A rule
-    /// that reads a watched field runs after the request is on its way: it
-    /// cannot allow or change the request. Its `set_header` /
-    /// `remove_header` apply to the *response*, which is only possible when
-    /// everything that can re-check the rule is known before the response
-    /// head is sent (`response.status`, `response.header[..]`,
-    /// `response.body.size`, `response.body.text`).
-    fn illegal(&self, a: &Action) -> Option<String> {
-        if self.kind != RuleKind::Watching {
-            return None;
-        }
-        let why = || {
-            format!(
-                "this rule reads {}, which is known only after the request was forwarded \
-                 (https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation)",
-                self.watched()
-            )
-        };
-        match a {
-            Action::Allow(_) => Some(format!(
-                "`allow` is only possible in rules decided at the request head; {}. Write the \
-                 allow as a head rule and this rule as a `deny`",
-                why()
-            )),
-            Action::RewritePath(_)
-            | Action::SetQuery(_)
-            | Action::RemoveQuery(_)
-            | Action::Redirect(_) => Some(format!(
-                "`{}` changes the request, which is already on its way; {}",
+    /// Why a rule that reads a watched field runs after forwarding, for
+    /// diagnostics about actions it cannot have.
+    fn forwarded_why(&self) -> String {
+        format!(
+            "this rule reads {}, which is known only after the request was forwarded \
+             (https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation)",
+            self.watched()
+        )
+    }
+
+    /// Why a watching rule's `set_header` / `remove_header` cannot apply to
+    /// the response, if it cannot: everything that can re-check the rule
+    /// must be known before the response head is sent (`response.status`,
+    /// `response.header[..]`, `response.body.size`, `response.body.text`).
+    fn response_header_problem(&self, a: &Action) -> Option<String> {
+        if !self.fields.intersects(Reads::BEFORE_RESPONSE_SENT) {
+            Some(format!(
+                "`{}` in this rule would change the request, which is already on its way; \
+                 {}. (In a rule that reads response values it changes the response.)",
                 a.name(),
-                why()
-            )),
-            Action::SetHeader(_) | Action::RemoveHeader(_) => {
-                if !self.fields.intersects(Reads::BEFORE_RESPONSE_SENT) {
-                    Some(format!(
-                        "`{}` in this rule would change the request, which is already on its \
-                         way; {}. (In a rule that reads response values it changes the \
-                         response.)",
-                        a.name(),
-                        why()
-                    ))
-                } else if !self.triggers.is_subset(Reads::BEFORE_RESPONSE_SENT) {
-                    Some(format!(
-                        "`{}` changes the response head, so every value the rule reads must be \
-                         known before the response head is sent; this rule also reads {}, which \
-                         can change after that",
-                        a.name(),
-                        self.triggers
-                            .minus(Reads::BEFORE_RESPONSE_SENT)
-                            .names()
-                            .join(", ")
-                    ))
-                } else {
-                    None
-                }
-            }
-            Action::Capture(_) => Some(format!(
-                "`capture` is decided at the request head, so the whole exchange is captured \
-                 from its first byte; {}. Capture in a head rule (e.g. the allow that \
-                 forwards this traffic)",
-                why()
-            )),
-            Action::Deny(_) | Action::Tag(_) | Action::Log(_) | Action::SetState(_) => None,
+                self.forwarded_why()
+            ))
+        } else if !self.triggers.is_subset(Reads::BEFORE_RESPONSE_SENT) {
+            Some(format!(
+                "`{}` changes the response head, so every value the rule reads must be known \
+                 before the response head is sent; this rule also reads {}, which can change \
+                 after that",
+                a.name(),
+                self.triggers
+                    .minus(Reads::BEFORE_RESPONSE_SENT)
+                    .names()
+                    .join(", ")
+            ))
+        } else {
+            None
         }
     }
 }

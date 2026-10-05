@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::compile::Pred;
 use crate::config::{DefaultDecision, MetricConfig, MetricCount, RuleConfig};
 use crate::diag::{Diagnostic, RuleId};
-use crate::eval::{Decision, Effect};
+use crate::eval::{Decision, Deny, Effect, WatchEffect};
 use crate::template::Part;
 use crate::types::{Field, Reads};
 
@@ -77,12 +77,51 @@ pub struct Condition {
     pred: Pred,
 }
 
+/// An action as it runs at the request head.
 #[derive(Debug, Clone)]
 enum CAction {
     Effect(Effect),
     SetHeader { name: String, parts: Vec<Part> },
     Tag(String),
     Terminal(Decision),
+}
+
+/// An action as it runs after the request was forwarded. There is no
+/// allow and nothing that changes the request; the compiler reports an
+/// action it cannot express here.
+#[derive(Debug, Clone)]
+enum WatchAction {
+    Effect(WatchEffect),
+    Tag(String),
+    Deny(Deny),
+}
+
+impl WatchAction {
+    /// What a head action still does when its rule fires while watching a
+    /// byte metric: the deny, and the effects that apply whatever the
+    /// outcome. Its request changes happened at the head.
+    fn after_forwarding(a: &CAction) -> Option<Self> {
+        match a {
+            CAction::Terminal(Decision::Deny(d)) => Some(Self::Deny(d.clone())),
+            CAction::Tag(t) => Some(Self::Tag(t.clone())),
+            CAction::Effect(Effect::Log { level, message }) => {
+                Some(Self::Effect(WatchEffect::Log {
+                    level: *level,
+                    message: message.clone(),
+                }))
+            }
+            CAction::Effect(Effect::SetState { key, value, ttl }) => {
+                Some(Self::Effect(WatchEffect::SetState {
+                    key: key.clone(),
+                    value: value.clone(),
+                    ttl: *ttl,
+                }))
+            }
+            CAction::Terminal(Decision::Allow(_))
+            | CAction::SetHeader { .. }
+            | CAction::Effect(_) => None,
+        }
+    }
 }
 
 /// When a rule runs.
@@ -143,7 +182,11 @@ pub(crate) struct RuleShape {
 struct CompiledRule {
     id: RuleId,
     when: Option<Pred>,
-    actions: Box<[CAction]>,
+    /// Actions when the rule takes part in the head decision; empty for a
+    /// rule that only watches.
+    head: Box<[CAction]>,
+    /// Actions when the rule fires after forwarding; empty for a head rule.
+    watching: Box<[WatchAction]>,
     shape: RuleShape,
 }
 

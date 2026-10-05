@@ -1,11 +1,14 @@
 //! The head decision and watching evaluation over a compiled [`Policy`],
 //! plus the runtime side of [`MetricDef`] and [`Condition`].
 
-use super::{CAction, Condition, MetricDef, Part, Policy, WatchState, is_header_value};
+use super::{
+    CAction, Condition, MetricDef, Part, Policy, WatchAction, WatchState, is_header_value,
+};
 use crate::config::DefaultDecision;
 use crate::diag::RuleId;
 use crate::eval::{
-    AllowOpts, Decision, Effect, EvalContext, FailClosedReason, Outcome, Scope, WatchOutcome,
+    AllowOpts, Decision, Deny, Effect, EvalContext, FailClosedReason, Outcome, PendingState, Scope,
+    WatchEffect, WatchOutcome,
 };
 use crate::types::Reads;
 use crate::view::FlowView;
@@ -17,7 +20,7 @@ impl MetricDef {
     pub fn matches(&self, view: &dyn FlowView) -> Result<bool, FailClosedReason> {
         self.filter
             .as_ref()
-            .map_or(Ok(true), |p| Scope::new(view, &[], &[]).check(p))
+            .map_or(Ok(true), |p| Scope::new(view, &[], &()).check(p))
     }
 }
 
@@ -26,13 +29,18 @@ impl Condition {
     /// evaluation reaches an unavailable input; the caller must then fail
     /// the flow closed, never treat it as a mismatch.
     pub fn matches(&self, view: &dyn FlowView, tags: &[String]) -> Result<bool, FailClosedReason> {
-        Scope::new(view, tags, &[]).check(&self.pred)
+        Scope::new(view, tags, &()).check(&self.pred)
     }
 }
 
-/// Keep only the effects that still apply when the exchange is refused.
+/// Keep only the effects that still apply when the request is refused.
 fn refused_effects(effects: &mut Vec<Effect>) {
     effects.retain(|e| matches!(e, Effect::Log { .. } | Effect::SetState { .. }));
+}
+
+/// Keep only the effects that still apply when the exchange is stopped.
+fn stopped_effects(effects: &mut Vec<WatchEffect>) {
+    effects.retain(|e| matches!(e, WatchEffect::Log { .. } | WatchEffect::SetState { .. }));
 }
 
 impl Policy {
@@ -84,7 +92,7 @@ impl Policy {
                 Err(reason) => return self.fail(reason, matched, effects, tags),
             }
             matched.push(rule.id.clone());
-            for action in &rule.actions {
+            for action in &rule.head {
                 match action {
                     CAction::Effect(e) => effects.push(e.clone()),
                     CAction::Tag(t) => {
@@ -102,7 +110,7 @@ impl Policy {
                     CAction::Terminal(d @ Decision::Allow(_)) => {
                         allow.get_or_insert((i, d));
                     }
-                    CAction::Terminal(d @ Decision::Deny { .. }) => {
+                    CAction::Terminal(d @ Decision::Deny(_)) => {
                         deny.get_or_insert((i, d));
                     }
                 }
@@ -189,7 +197,6 @@ impl Policy {
         known: Reads,
         st: &mut WatchState,
         view: &dyn FlowView,
-        ctx: &EvalContext<'_>,
     ) -> Option<WatchOutcome> {
         if st.stopped || !self.watch_triggers.intersects(changed) {
             return None;
@@ -203,7 +210,7 @@ impl Policy {
             {
                 continue;
             }
-            let pending: &[Effect] = out.as_ref().map_or(&[], |o| &o.effects);
+            let pending: &dyn PendingState = out.as_ref().map_or(&(), |o| &o.effects);
             let hit = match &rule.when {
                 None => Ok(true),
                 Some(p) => Scope::new(view, &st.tags, pending).check(p),
@@ -218,44 +225,21 @@ impl Policy {
             }
             st.fired[k] = true;
             o.matched.push(rule.id.clone());
-            for action in &rule.actions {
+            for action in &rule.watching {
                 match action {
-                    CAction::Effect(e) => o.effects.push(e.clone()),
-                    CAction::Tag(t) => {
+                    WatchAction::Effect(e) => o.effects.push(e.clone()),
+                    WatchAction::Tag(t) => {
                         if !st.tags.contains(t) {
                             st.tags.push(t.clone());
                             o.tags.push(t.clone());
                         }
                     }
-                    CAction::SetHeader { name, parts } => match render(parts, ctx) {
-                        Ok(value) => o.effects.push(Effect::SetHeader {
-                            name: name.clone(),
-                            value,
-                        }),
-                        Err(reason) => {
-                            return Some(self.watch_stop(st, o, None, Some(reason)));
-                        }
-                    },
-                    CAction::Terminal(Decision::Deny {
-                        status,
-                        message,
-                        close,
-                    }) => {
-                        let d = Decision::Deny {
-                            status: *status,
-                            message: message.clone(),
-                            close: *close,
-                        };
-                        return Some(self.watch_stop(st, o, Some((rule.id.clone(), d)), None));
-                    }
-                    // `allow` cannot appear in a watching rule (compile
-                    // error); never continue on one: fail closed.
-                    CAction::Terminal(Decision::Allow(_)) => {
+                    WatchAction::Deny(d) => {
                         return Some(self.watch_stop(
                             st,
                             o,
+                            Some((rule.id.clone(), d.clone())),
                             None,
-                            Some(FailClosedReason::Unsupported(rule.id.to_string())),
                         ));
                     }
                 }
@@ -268,19 +252,19 @@ impl Policy {
         &self,
         st: &mut WatchState,
         o: &mut WatchOutcome,
-        deny: Option<(RuleId, Decision)>,
+        deny: Option<(RuleId, Deny)>,
         reason: Option<FailClosedReason>,
     ) -> WatchOutcome {
         st.stopped = true;
         let mut o = std::mem::take(o);
-        refused_effects(&mut o.effects);
+        stopped_effects(&mut o.effects);
         match (deny, reason) {
             (Some((id, d)), _) => {
                 o.stop = Some(d);
                 o.terminal_rule = Some(id);
             }
             (None, reason) => {
-                o.stop = Some(Decision::fail_closed());
+                o.stop = Some(Deny::fail_closed());
                 o.terminal_rule = Some(self.fail_closed_id.clone());
                 o.fail_closed_reason = reason;
             }

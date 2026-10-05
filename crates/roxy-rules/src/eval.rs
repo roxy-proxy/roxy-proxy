@@ -61,20 +61,25 @@ pub struct AllowOpts {
     pub private_ok: bool,
 }
 
-/// A decision: the head decision, or a watching rule stopping the exchange.
+/// The head decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Allow(AllowOpts),
-    /// `close`: after writing the deny response the proxy closes the client
+    Deny(Deny),
+}
+
+/// A deny: the head decision refusing the request, or a watching rule
+/// stopping the exchange. The only decision a watching rule can reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deny {
+    pub status: DenyStatus,
+    pub message: String,
+    /// After writing the deny response the proxy closes the client
     /// connection (h1 `connection: close`, h2 `GOAWAY`). Defaults to
     /// `true`; `deny: { close: false }` opts out per rule. A deny that stops
     /// an exchange whose response is already streaming always closes the
     /// connection (h1) or resets the stream (h2).
-    Deny {
-        status: DenyStatus,
-        message: String,
-        close: bool,
-    },
+    pub close: bool,
 }
 
 /// A deny's status code: always 4xx or 5xx.
@@ -118,21 +123,33 @@ impl Decision {
     }
 
     pub fn is_deny(&self) -> bool {
-        matches!(self, Self::Deny { .. })
+        matches!(self, Self::Deny(_))
     }
 
     /// The `default: deny` decision: 403, closing the connection.
     pub fn default_deny() -> Self {
-        Self::Deny {
+        Self::Deny(Deny::default_deny())
+    }
+
+    /// The decision for a fail-closed outcome: 503, closing the connection.
+    pub fn fail_closed() -> Self {
+        Self::Deny(Deny::fail_closed())
+    }
+}
+
+impl Deny {
+    /// The `default: deny` decision: 403, closing the connection.
+    pub fn default_deny() -> Self {
+        Self {
             status: DEFAULT_DENY_STATUS,
             message: DEFAULT_DENY_MESSAGE.into(),
             close: true,
         }
     }
 
-    /// The decision for a fail-closed outcome: 503, closing the connection.
+    /// The deny for a fail-closed outcome: 503, closing the connection.
     pub fn fail_closed() -> Self {
-        Self::Deny {
+        Self {
             status: FAIL_CLOSED_STATUS,
             message: DEFAULT_DENY_MESSAGE.into(),
             close: true,
@@ -183,10 +200,6 @@ pub enum FailClosedReason {
     /// missing (`null`) value, which has no answer. Carries the field
     /// as written, e.g. `body.size`.
     MissingValue(String),
-    /// A watching rule reached an `allow`, which cannot run after
-    /// forwarding (prevented by the compiler; fail closed if ever reached).
-    /// Carries the rule id.
-    Unsupported(String),
 }
 
 impl fmt::Display for FailClosedReason {
@@ -206,7 +219,6 @@ impl fmt::Display for FailClosedReason {
             Self::BodyDecodeFailed { field, detail } => {
                 write!(f, "`{field}`: body could not be decoded: {detail}")
             }
-            Self::Unsupported(rule) => write!(f, "rule {rule:?}: action not possible here"),
             Self::MissingValue(field) => {
                 write!(
                     f,
@@ -234,18 +246,18 @@ impl fmt::Display for Decision {
                 }
                 Ok(())
             }
-            Decision::Deny {
-                status,
-                message,
-                close,
-            } => {
-                write!(f, "deny {status} {message:?}")?;
-                if *close {
-                    f.write_str(" (close)")?;
-                }
-                Ok(())
-            }
+            Decision::Deny(d) => d.fmt(f),
         }
+    }
+}
+
+impl fmt::Display for Deny {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "deny {} {:?}", self.status, self.message)?;
+        if self.close {
+            f.write_str(" (close)")?;
+        }
+        Ok(())
     }
 }
 
@@ -402,20 +414,74 @@ impl fmt::Display for Effect {
                 )
             }
             Effect::Log { level, message } => write!(f, "log {}: {message}", level.as_str()),
-            Effect::SetState { key, value, ttl } => {
-                write!(f, "set_state {key}={value}")?;
-                if let Some(ttl) = ttl {
-                    write!(
-                        f,
-                        " (ttl {})",
-                        humantime_serde::re::humantime::format_duration(*ttl)
-                    )?;
-                }
-                Ok(())
-            }
+            Effect::SetState { key, value, ttl } => fmt_set_state(f, key, value, *ttl),
             Effect::Capture(t) => write!(f, "capture {}", t.as_str()),
         }
     }
+}
+
+/// A non-terminal effect of a rule that fires after the request was
+/// forwarded: nothing here changes the request. Header changes apply to the
+/// response; `log` and `set_state` apply whatever the outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchEffect {
+    /// Lower-case name; the value is a validated header value (a watching
+    /// rule's `set_header` takes no secrets, so nothing is substituted).
+    SetHeader {
+        name: String,
+        value: String,
+    },
+    /// Lower-case name.
+    RemoveHeader(String),
+    Log {
+        level: LogLevel,
+        message: String,
+    },
+    SetState {
+        key: String,
+        value: String,
+        ttl: Option<Duration>,
+    },
+}
+
+impl WatchEffect {
+    /// The action name that produced this effect.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            WatchEffect::SetHeader { .. } => "set_header",
+            WatchEffect::RemoveHeader(_) => "remove_header",
+            WatchEffect::Log { .. } => "log",
+            WatchEffect::SetState { .. } => "set_state",
+        }
+    }
+}
+
+impl fmt::Display for WatchEffect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WatchEffect::SetHeader { name, value } => write!(f, "set_header {name}: {value}"),
+            WatchEffect::RemoveHeader(n) => write!(f, "remove_header {n}"),
+            WatchEffect::Log { level, message } => write!(f, "log {}: {message}", level.as_str()),
+            WatchEffect::SetState { key, value, ttl } => fmt_set_state(f, key, value, *ttl),
+        }
+    }
+}
+
+fn fmt_set_state(
+    f: &mut fmt::Formatter<'_>,
+    key: &str,
+    value: &str,
+    ttl: Option<Duration>,
+) -> fmt::Result {
+    write!(f, "set_state {key}={value}")?;
+    if let Some(ttl) = ttl {
+        write!(
+            f,
+            " (ttl {})",
+            humantime_serde::re::humantime::format_duration(ttl)
+        )?;
+    }
+    Ok(())
 }
 
 /// The pattern as written, without the implicit anchors.
@@ -450,9 +516,9 @@ pub struct Outcome {
 /// in which at least one rule matched or an input failed.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WatchOutcome {
-    /// `Some(Deny)` = stop the exchange: a matching watching deny, or
-    /// [`Decision::fail_closed`]. `None` = continue (effects only).
-    pub stop: Option<Decision>,
+    /// `Some` = stop the exchange: a matching watching deny, or
+    /// [`Deny::fail_closed`]. `None` = continue (effects only).
+    pub stop: Option<Deny>,
     /// The rule that stopped it (`_fail_closed` for an input failure).
     pub terminal_rule: Option<RuleId>,
     /// Set when the stop is a fail-closed one.
@@ -461,7 +527,7 @@ pub struct WatchOutcome {
     pub matched: Vec<RuleId>,
     /// Their non-terminal effects, in list order (only `log` and
     /// `set_state` when stopping). Header effects apply to the response.
-    pub effects: Vec<Effect>,
+    pub effects: Vec<WatchEffect>,
     /// Tags newly set.
     pub tags: Vec<String>,
 }
@@ -475,18 +541,64 @@ impl WatchOutcome {
 
 // ----- predicate evaluation -------------------------------------------------
 
+/// The effects an evaluation has produced so far, as `state["k"]` sees them:
+/// the last `set_state` of a key wins over the store.
+pub(crate) trait PendingState {
+    fn pending_state(&self, key: &str) -> Option<&str>;
+}
+
+/// Nothing pending: a standalone condition or metric filter.
+impl PendingState for () {
+    fn pending_state(&self, _key: &str) -> Option<&str> {
+        None
+    }
+}
+
+impl PendingState for Vec<Effect> {
+    fn pending_state(&self, key: &str) -> Option<&str> {
+        self.iter().rev().find_map(|e| match e {
+            Effect::SetState { key: k, value, .. } if k == key => Some(value.as_str()),
+            Effect::SetState { .. }
+            | Effect::SetHeader { .. }
+            | Effect::RemoveHeader(_)
+            | Effect::RewritePath { .. }
+            | Effect::SetQuery { .. }
+            | Effect::RemoveQuery(_)
+            | Effect::Redirect { .. }
+            | Effect::Log { .. }
+            | Effect::Capture(_) => None,
+        })
+    }
+}
+
+impl PendingState for Vec<WatchEffect> {
+    fn pending_state(&self, key: &str) -> Option<&str> {
+        self.iter().rev().find_map(|e| match e {
+            WatchEffect::SetState { key: k, value, .. } if k == key => Some(value.as_str()),
+            WatchEffect::SetState { .. }
+            | WatchEffect::SetHeader { .. }
+            | WatchEffect::RemoveHeader(_)
+            | WatchEffect::Log { .. } => None,
+        })
+    }
+}
+
 /// What a predicate can see: the flow plus the evaluation's running state.
 pub(crate) struct Scope<'a> {
     pub view: &'a dyn FlowView,
     pub tags: &'a [String],
     /// Effects so far; `state["k"]` sees earlier `set_state` effects.
-    pub effects: &'a [Effect],
+    pub effects: &'a dyn PendingState,
     /// First unavailable input met during evaluation, if any.
     pub failed: Cell<Option<Unavailable<'a>>>,
 }
 
 impl<'a> Scope<'a> {
-    pub(crate) fn new(view: &'a dyn FlowView, tags: &'a [String], effects: &'a [Effect]) -> Self {
+    pub(crate) fn new(
+        view: &'a dyn FlowView,
+        tags: &'a [String],
+        effects: &'a dyn PendingState,
+    ) -> Self {
         Self {
             view,
             tags,
@@ -564,16 +676,7 @@ fn get<'a>(op: &'a ROperand, s: &Scope<'a>) -> Value<'a> {
             Access::RespHeaderAll(n) => list(s.view.response_header_all(n)),
             Access::Query(k) => opt(s.view.query(k)),
             Access::State(k) => {
-                let pending = s.effects.iter().rev().find_map(|e| {
-                    if let Effect::SetState { key, value, .. } = e
-                        && **key == **k
-                    {
-                        Some(value.as_str())
-                    } else {
-                        None
-                    }
-                });
-                match pending {
+                match s.effects.pending_state(k) {
                     Some(v) => Value::Str(Cow::Borrowed(v)),
                     // An unset key is a legitimate state: absent, not unavailable.
                     None => opt(s.view.state(k)),

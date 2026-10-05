@@ -4,8 +4,8 @@ mod common;
 
 use common::{compile, try_compile};
 use roxy_rules::{
-    Decision, DenyStatus, Effect, EvalContext, FailClosedReason, Field, LogLevel, MapView, Reads,
-    RuleKind,
+    Deny, DenyStatus, EvalContext, FailClosedReason, Field, LogLevel, MapView, Reads, RuleKind,
+    WatchEffect,
 };
 
 const ALL: Reads = Reads::ALL;
@@ -63,36 +63,36 @@ fn effects_apply_once_and_a_deny_stops() {
 
     // Nothing matches: `None`.
     assert_eq!(
-        p.evaluate_watching(changed, changed, &mut st, &at(10), &ctx),
+        p.evaluate_watching(changed, changed, &mut st, &at(10),),
         None
     );
     // Crossing 1 KiB: effects and a tag, once.
     let o = p
-        .evaluate_watching(changed, changed, &mut st, &at(2048), &ctx)
+        .evaluate_watching(changed, changed, &mut st, &at(2048))
         .unwrap();
     assert!(!o.stops());
     assert_eq!(o.matched, ["upload-log"].map(roxy_rules::RuleId::new));
     assert_eq!(o.tags, ["big-upload"]);
     assert_eq!(
         o.effects,
-        [Effect::Log {
+        [WatchEffect::Log {
             level: LogLevel::Info,
             message: "big upload".into()
         }]
     );
     assert_eq!(st.tags, ["metered", "big-upload"]);
     assert_eq!(
-        p.evaluate_watching(changed, changed, &mut st, &at(4096), &ctx),
+        p.evaluate_watching(changed, changed, &mut st, &at(4096),),
         None,
         "a watching rule's effects apply once"
     );
     // Crossing 10 KiB: stop.
     let o = p
-        .evaluate_watching(changed, changed, &mut st, &at(20_000), &ctx)
+        .evaluate_watching(changed, changed, &mut st, &at(20_000))
         .unwrap();
     assert_eq!(
         o.stop,
-        Some(Decision::Deny {
+        Some(Deny {
             status: DenyStatus::new(413).unwrap(),
             message: "upload too large".into(),
             close: true
@@ -101,16 +101,12 @@ fn effects_apply_once_and_a_deny_stops() {
     assert_eq!(o.terminal_rule.unwrap(), "upload-cap");
     assert!(st.is_stopped());
     // After a stop nothing is evaluated again.
-    assert_eq!(
-        p.evaluate_watching(ALL, ALL, &mut st, &at(1 << 30), &ctx),
-        None
-    );
+    assert_eq!(p.evaluate_watching(ALL, ALL, &mut st, &at(1 << 30),), None);
 }
 
 #[test]
 fn rules_wait_until_everything_they_read_is_known() {
     let p = compile("", POLICY);
-    let ctx = EvalContext::empty();
     let mut st = p.watch_state(&["metered".to_owned()]);
     let v = MapView::new()
         .with_int(Field::BodyBytes, 10)
@@ -118,7 +114,7 @@ fn rules_wait_until_everything_they_read_is_known() {
         .with_int(Field::ResponseBodyBytes, 2 << 20);
     // A body-bytes event does not re-check response rules.
     assert_eq!(
-        p.evaluate_watching(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &v, &ctx),
+        p.evaluate_watching(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &v,),
         None
     );
     // Response head known, but `response.body.bytes` is not yet.
@@ -128,12 +124,11 @@ fn rules_wait_until_everything_they_read_is_known() {
             Reads::BODY_BYTES | Reads::RESPONSE_HEAD,
             &mut st,
             &v,
-            &ctx
         ),
         None
     );
     let o = p
-        .evaluate_watching(Reads::RESPONSE_BODY_BYTES, ALL, &mut st, &v, &ctx)
+        .evaluate_watching(Reads::RESPONSE_BODY_BYTES, ALL, &mut st, &v)
         .unwrap();
     assert_eq!(o.terminal_rule.unwrap(), "download-cap");
 }
@@ -141,22 +136,15 @@ fn rules_wait_until_everything_they_read_is_known() {
 #[test]
 fn response_header_effects() {
     let p = compile("", POLICY);
-    let ctx = EvalContext::empty();
     let mut st = p.watch_state(&[]);
     let v = MapView::new().with_int(Field::ResponseStatus, 200);
     let o = p
-        .evaluate_watching(
-            Reads::RESPONSE_HEAD,
-            Reads::RESPONSE_HEAD,
-            &mut st,
-            &v,
-            &ctx,
-        )
+        .evaluate_watching(Reads::RESPONSE_HEAD, Reads::RESPONSE_HEAD, &mut st, &v)
         .unwrap();
     assert!(!o.stops());
     assert_eq!(
         o.effects,
-        [Effect::SetHeader {
+        [WatchEffect::SetHeader {
             name: "x-checked".into(),
             value: "1".into()
         }]
@@ -165,7 +153,6 @@ fn response_header_effects() {
 
 #[test]
 fn errors_stop_the_exchange() {
-    let ctx = EvalContext::empty();
     // A missing value under an ordering operator: fail closed, stop.
     let p = compile(
         "",
@@ -178,10 +165,9 @@ fn errors_stop_the_exchange() {
             Reads::RESPONSE_HEAD,
             &mut st,
             &MapView::new(),
-            &ctx,
         )
         .unwrap();
-    assert_eq!(o.stop, Some(Decision::fail_closed()));
+    assert_eq!(o.stop, Some(Deny::fail_closed()));
     assert_eq!(o.terminal_rule.unwrap(), "_fail_closed");
     assert_eq!(
         o.fail_closed_reason,
@@ -197,7 +183,7 @@ fn errors_stop_the_exchange() {
     );
     let mut st = p.watch_state(&[]);
     let o = p
-        .evaluate_watching(ALL, ALL, &mut st, &MapView::new(), &ctx)
+        .evaluate_watching(ALL, ALL, &mut st, &MapView::new())
         .unwrap();
     assert!(o.stops());
     assert_eq!(o.effects, [], "no effects from a failed evaluation");
@@ -214,7 +200,6 @@ fn errors_stop_the_exchange() {
             Reads::NONE,
             &mut st,
             &MapView::new(),
-            &ctx,
         )
         .unwrap();
     assert_eq!(
@@ -262,10 +247,7 @@ fn byte_metric_denies_watch() {
     assert_eq!(head.terminal_rule, "ok");
     let mut st = p.watch_state(&head.tags);
     // `n` grew to 30 because of this exchange: not re-checked.
-    assert_eq!(
-        p.evaluate_watching(ALL, ALL, &mut st, &v(1000, 30), &ctx),
-        None
-    );
+    assert_eq!(p.evaluate_watching(ALL, ALL, &mut st, &v(1000, 30),), None);
     // The upload pushes egress over the budget: stop.
     let o = p
         .evaluate_watching(
@@ -273,7 +255,6 @@ fn byte_metric_denies_watch() {
             Reads::BODY_BYTES,
             &mut st,
             &v(2 << 20, 30),
-            &ctx,
         )
         .unwrap();
     assert_eq!(o.terminal_rule.unwrap(), "budget");

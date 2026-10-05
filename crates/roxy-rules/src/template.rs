@@ -87,6 +87,17 @@ pub fn has_secrets(parts: &[Part]) -> bool {
     secret_names(parts).next().is_some()
 }
 
+/// The template as one string, if it references no secret.
+pub fn literal(parts: &[Part]) -> Option<String> {
+    parts
+        .iter()
+        .map(|p| match p {
+            Part::Lit(s) => Some(s.as_str()),
+            Part::Secret(_) => None,
+        })
+        .collect()
+}
+
 /// Renders a template with `lookup`; `None` if a referenced secret is
 /// missing, so the caller fails closed rather than sending a placeholder.
 pub fn expand(parts: &[Part], mut lookup: impl FnMut(&str) -> Option<String>) -> Option<String> {

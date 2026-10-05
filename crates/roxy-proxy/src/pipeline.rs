@@ -34,8 +34,8 @@ use roxy_http::{
     Reason, Scheme,
 };
 use roxy_rules::{
-    AllowOpts, CaptureTarget, DEFAULT_DENY_MESSAGE, Decision, DenyStatus, Effect, EvalContext,
-    FAIL_CLOSED_STATUS, FailClosedReason, LogLevel, Outcome, RuleId,
+    AllowOpts, CaptureTarget, DEFAULT_DENY_MESSAGE, Decision, Deny, DenyStatus, Effect,
+    EvalContext, FAIL_CLOSED_STATUS, FailClosedReason, LogLevel, Outcome, RuleId,
 };
 use ulid::Ulid;
 
@@ -561,11 +561,11 @@ impl FlowCx {
             refusal = Some(Refusal::fail_closed(code));
         } else {
             match &out.decision {
-                Decision::Deny {
+                Decision::Deny(Deny {
                     status,
                     message,
                     close,
-                } => {
+                }) => {
                     refusal = Some(Refusal::deny(
                         status_code(*status),
                         message,
@@ -778,7 +778,6 @@ pub(crate) fn fail_closed_code(
         FailClosedReason::UnsupportedContentEncoding { .. } => "unsupported_content_encoding",
         FailClosedReason::BodyDecodeFailed { .. } => "body_decode_failed",
         FailClosedReason::MissingValue(_) => "missing_value",
-        FailClosedReason::Unsupported(_) => "unsupported_effect",
     }
 }
 
