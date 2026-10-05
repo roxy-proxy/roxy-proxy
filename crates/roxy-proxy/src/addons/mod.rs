@@ -291,9 +291,100 @@ impl Drop for Lease {
                 .reason
                 .get_or_insert_with(|| "upstream_aborted".to_owned());
         }
-        *self.st.cx.lock().unwrap_or_else(PoisonError::into_inner) = Some(cx);
-        self.st.returned.notify_one();
+        self.st.loan.give_back(cx);
     }
+}
+
+/// The flow's [`FlowCx`], parked in the stack while the layers run and lent
+/// to the core (once) while it runs. However the core ends, the context
+/// comes back here, so nothing it recorded is lost.
+struct Loan {
+    cx: Mutex<Option<FlowCx>>,
+    /// The core gave the flow context back.
+    returned: Notify,
+    /// The response left without the core's: stop the core.
+    abandon: CancellationToken,
+}
+
+impl Loan {
+    fn new() -> Self {
+        Self {
+            cx: Mutex::new(None),
+            returned: Notify::new(),
+            abandon: CancellationToken::new(),
+        }
+    }
+
+    fn park(&self, cx: FlowCx) {
+        *lock(&self.cx) = Some(cx);
+    }
+
+    /// Takes the context to lend it. `None` if it is already lent.
+    fn take(&self) -> Option<FlowCx> {
+        lock(&self.cx).take()
+    }
+
+    fn give_back(&self, cx: FlowCx) {
+        *lock(&self.cx) = Some(cx);
+        self.returned.notify_one();
+    }
+
+    /// Takes the context back once the stack has answered. A core still
+    /// running was abandoned by the layer that answered: it is stopped, and
+    /// its record comes back with it.
+    async fn reclaim(&self) -> FlowCx {
+        loop {
+            if let Some(cx) = self.take() {
+                return cx;
+            }
+            self.abandon.cancel();
+            self.returned.notified().await;
+        }
+    }
+}
+
+/// Why the exchange is not getting the response it asked for, as recorded
+/// by the layers and the core ahead of the stack's answer. A layer's
+/// failure decides the outcome and its attribution, so it outranks the
+/// other two; within a kind the first recorded wins.
+enum Fault {
+    None,
+    Layer {
+        name: String,
+        err: StackError,
+    },
+    /// The request body failed in the core as a client's would (framing, a
+    /// cut): no layer's doing, so no layer is blamed for it.
+    Client(roxy_http::DriveError),
+    /// The upstream's response body failed before a layer had answered
+    /// with a head of its own: no layer's doing, so the client gets the
+    /// `502` it would if the core had read the body.
+    UpstreamBody,
+}
+
+impl Fault {
+    fn record(&mut self, fault: Fault) {
+        let outranks = matches!(
+            (&*self, &fault),
+            (
+                Fault::None,
+                Fault::Layer { .. } | Fault::Client(_) | Fault::UpstreamBody
+            ) | (Fault::Client(_) | Fault::UpstreamBody, Fault::Layer { .. })
+        );
+        if outranks {
+            *self = fault;
+        }
+    }
+}
+
+/// The relayed WebSocket on its way from the core to the front.
+enum Upgrade {
+    None,
+    /// The core answered a `101`: the relay waits for the stack's answer.
+    Relayed(ws::Relay),
+    /// The stack's answer was the `101`: the client side waits for the
+    /// front to splice it in once it has sent the `101`.
+    Plumbed(ws::WsPlumbing),
 }
 
 /// One exchange's trip through the stack, shared by every layer's host.
@@ -311,34 +402,16 @@ pub(crate) struct StackFlow {
     /// version, the target form or an upgrade.
     client_meta: RequestMeta,
     tags: Mutex<Vec<String>>,
-    /// The flow context, while it is not with the front or the core.
-    cx: Mutex<Option<FlowCx>>,
-    /// The core gave the flow context back.
-    returned: Notify,
-    /// The response left without the core's: stop the core.
-    abandon: CancellationToken,
+    loan: Loan,
     layers: Box<[LayerSlot]>,
-    /// The first layer failure (it decides the outcome and attribution).
-    failure: Mutex<Option<(String, StackError)>>,
-    /// The request body failed in the core, as a client's would (framing,
-    /// a cut): no layer's doing, so no layer is blamed for it.
-    client_fault: Mutex<Option<roxy_http::DriveError>>,
-    /// The upstream's response body failed before a layer had answered
-    /// with a head of its own: no layer's doing, so the client gets the
-    /// `502` it would if the core had read the body.
-    upstream_body_failed: AtomicBool,
+    fault: Mutex<Fault>,
     /// The enforce-mode failure has been logged.
     reported: AtomicBool,
     /// A layer asked to close the client connection.
     pub(crate) close: AtomicBool,
     /// The first layer to run has decoded the request for the layers.
     request_decoded: AtomicBool,
-    /// What the core relayed, when it answered a `101`: taken by the
-    /// stack's outcome.
-    relay: Mutex<Option<ws::Relay>>,
-    /// An upgraded exchange's client side, for the front to splice in
-    /// once it has sent the `101`.
-    ws: Mutex<Option<ws::WsPlumbing>>,
+    upgrade: Mutex<Upgrade>,
 }
 
 impl std::ops::Deref for StackFlow {
@@ -356,23 +429,18 @@ impl StackFlow {
             facts: Mutex::new(cx.facts.clone()),
             client_meta: req.meta.clone(),
             tags: Mutex::new(Vec::new()),
-            cx: Mutex::new(None),
-            returned: Notify::new(),
-            abandon: CancellationToken::new(),
+            loan: Loan::new(),
             layers: cx
                 .snap
                 .addons
                 .iter()
                 .map(|_| LayerSlot::default())
                 .collect(),
-            failure: Mutex::new(None),
-            client_fault: Mutex::new(None),
-            upstream_body_failed: AtomicBool::new(false),
+            fault: Mutex::new(Fault::None),
             reported: AtomicBool::new(false),
             close: AtomicBool::new(false),
             request_decoded: AtomicBool::new(false),
-            relay: Mutex::new(None),
-            ws: Mutex::new(None),
+            upgrade: Mutex::new(Upgrade::None),
         }
     }
 
@@ -388,42 +456,14 @@ impl StackFlow {
         facts.clone_into(&mut self.facts.lock().unwrap_or_else(PoisonError::into_inner));
     }
 
-    /// Parks the flow context for the core to borrow.
-    fn park(&self, cx: FlowCx) {
-        *self.cx.lock().unwrap_or_else(PoisonError::into_inner) = Some(cx);
-    }
-
     /// Lends the flow context to the core. `None` if it is already lent
     /// (the core runs at most once per exchange).
     fn lease(self: &Arc<Self>) -> Option<Lease> {
-        let cx = self
-            .cx
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()?;
         Some(Lease {
             st: self.clone(),
-            cx: Some(cx),
+            cx: Some(self.loan.take()?),
             done: false,
         })
-    }
-
-    /// Takes the flow context back once the stack has answered. A core
-    /// still running was abandoned by the layer that answered: it is
-    /// stopped, and its record comes back with it.
-    async fn reclaim(&self) -> FlowCx {
-        loop {
-            if let Some(cx) = self
-                .cx
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take()
-            {
-                return cx;
-            }
-            self.abandon.cancel();
-            self.returned.notified().await;
-        }
     }
 
     pub(crate) fn tags(&self) -> Vec<String> {
@@ -445,27 +485,28 @@ impl StackFlow {
         }
     }
 
+    /// Layer `layer` failed the exchange.
     fn fail(&self, layer: &str, err: impl Into<StackError>) {
-        let mut f = self.failure.lock().unwrap_or_else(PoisonError::into_inner);
-        if f.is_none() {
-            *f = Some((layer.to_owned(), err.into()));
+        self.record(Fault::Layer {
+            name: layer.to_owned(),
+            err: err.into(),
+        });
+    }
+
+    fn record(&self, fault: Fault) {
+        lock(&self.fault).record(fault);
+    }
+
+    /// The layer failure that decides the outcome, if a layer failed.
+    fn failure(&self) -> Option<(String, StackError)> {
+        match &*lock(&self.fault) {
+            Fault::Layer { name, err } => Some((name.clone(), err.clone())),
+            Fault::None | Fault::Client(_) | Fault::UpstreamBody => None,
         }
     }
 
-    fn failure(&self) -> Option<(String, StackError)> {
-        self.failure
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-
-    /// The request body failed as a client's would, unless it already has.
-    fn set_client_fault(&self, e: roxy_http::DriveError) {
-        lock(&self.client_fault).get_or_insert(e);
-    }
-
-    fn take_client_fault(&self) -> Option<roxy_http::DriveError> {
-        lock(&self.client_fault).take()
+    fn take_fault(&self) -> Fault {
+        std::mem::replace(&mut *lock(&self.fault), Fault::None)
     }
 
     /// The layer failure behind a body cut after the head: the innermost
@@ -494,8 +535,36 @@ impl StackFlow {
         crate::exchange::wants_websocket(&self.client_meta)
     }
 
+    /// The core relayed an upgrade; the stack's answer decides its fate.
+    fn relayed(&self, relay: ws::Relay) {
+        *lock(&self.upgrade) = Upgrade::Relayed(relay);
+    }
+
+    fn take_relay(&self) -> Option<ws::Relay> {
+        let mut u = lock(&self.upgrade);
+        match std::mem::replace(&mut *u, Upgrade::None) {
+            Upgrade::Relayed(relay) => Some(relay),
+            other @ (Upgrade::None | Upgrade::Plumbed(_)) => {
+                *u = other;
+                None
+            }
+        }
+    }
+
+    /// The stack answered the `101`: the client side waits for the front.
+    fn plumbed(&self, plumbing: ws::WsPlumbing) {
+        *lock(&self.upgrade) = Upgrade::Plumbed(plumbing);
+    }
+
     fn take_ws(&self) -> Option<ws::WsPlumbing> {
-        lock(&self.ws).take()
+        let mut u = lock(&self.upgrade);
+        match std::mem::replace(&mut *u, Upgrade::None) {
+            Upgrade::Plumbed(plumbing) => Some(plumbing),
+            other @ (Upgrade::None | Upgrade::Relayed(_)) => {
+                *u = other;
+                None
+            }
+        }
     }
 
     /// The layer that answered: the outermost one whose `next` did not
@@ -639,11 +708,11 @@ pub(crate) async fn run<F: Front>(
     } else {
         None
     };
-    st.park(cx);
+    st.loan.park(cx);
     let driven = front
         .drive(enter(st.clone(), 0, to_layer_request(req)))
         .await;
-    let mut cx = st.reclaim().await;
+    let mut cx = st.loan.reclaim().await;
     cx.stack = Some(st.clone());
     let outcome = stack_outcome(&st, &mut cx, driven, client_tx);
     (cx, outcome)
@@ -663,16 +732,18 @@ fn stack_outcome(
         // that failed in the core with no layer at fault closes the
         // connection as it would without a stack.
         Ok(Err(_)) => {
-            let (layer, err) = match (st.failure(), st.take_client_fault()) {
-                (Some(f), _) => f,
-                (None, Some(e)) => return Outcome::Close(e),
-                (None, None) if st.upstream_body_failed.load(Ordering::SeqCst) => {
+            let (layer, err) = match st.take_fault() {
+                Fault::Layer { name, err } => (name, err),
+                Fault::Client(e) => return Outcome::Close(e),
+                Fault::UpstreamBody => {
                     return Outcome::Refuse(Refusal::upstream(
                         StatusCode::BAD_GATEWAY,
                         "upstream_body_failed",
                     ));
                 }
-                (None, None) => (st.blamed(), LayerError::NoResponse.into()),
+                // Every path that fails a layer records it, so this is a
+                // layer that returned an error without saying why.
+                Fault::None => (st.blamed(), LayerError::NoResponse.into()),
             };
             emit_stack_error(st, &layer, &err, AddonMode::Enforce);
             return Outcome::Refuse(layer_refusal(&layer));
@@ -706,14 +777,14 @@ fn stack_outcome(
     if st.close.load(Ordering::Relaxed) {
         res.meta.close = true;
     }
-    let relay = lock(&st.relay).take();
+    let relay = st.take_relay();
     if res.status == http::StatusCode::SWITCHING_PROTOCOLS {
         if let (Some(relay), Some(client_tx)) = (relay, client_tx) {
             // A layer cannot express `upgrade: websocket` (hop-by-hop); the
             // core relayed a real upgrade, so restore it.
             res.meta.upgrade = Some("websocket".to_owned());
             let to_client = upgraded_body.unwrap_or_default();
-            *lock(&st.ws) = Some(ws::WsPlumbing::new(
+            st.plumbed(ws::WsPlumbing::new(
                 client_tx,
                 to_client,
                 relay.bottom,
@@ -874,7 +945,7 @@ async fn core(
     let mut front = Detached;
     let outcome = tokio::select! {
         biased;
-        () = st.abandon.cancelled() => None,
+        () = st.loan.abandon.cancelled() => None,
         o = crate::exchange::core(&mut front, cx, creq) => Some(o),
     };
     let Some(outcome) = outcome else {
@@ -906,7 +977,7 @@ async fn core(
         }
         Outcome::Close(e) => {
             let msg = format!("request body failed: {e}");
-            *lock(&st.client_fault) = Some(e);
+            st.record(Fault::Client(e));
             Err(HostError::new(msg))
         }
         Outcome::Upgrade {
@@ -914,8 +985,12 @@ async fn core(
             upstream,
             key,
         } => {
-            let relay = ws::Relay::new(upstream, key, stream.unwrap_or_default(), &mut res);
-            *lock(&st.relay) = Some(relay);
+            st.relayed(ws::Relay::new(
+                upstream,
+                key,
+                stream.unwrap_or_default(),
+                &mut res,
+            ));
             Ok(to_layer_response(res))
         }
     }
@@ -1005,7 +1080,7 @@ mod tests {
         let fault = || roxy_http::ParseError::new(roxy_http::Reason::BadChunkSize, "zz");
         let failed = || Ok(Err(HostError::new("request body failed")));
 
-        *lock(&st.client_fault) = Some(fault().into());
+        st.record(Fault::Client(fault().into()));
         let out = stack_outcome(&st, &mut cx, failed(), None);
         assert!(
             matches!(&out, Outcome::Close(roxy_http::DriveError::Client(e)) if e.reason == roxy_http::Reason::BadChunkSize),
@@ -1013,7 +1088,7 @@ mod tests {
         );
         assert!(st.failure().is_none(), "no layer is blamed");
 
-        *lock(&st.client_fault) = Some(fault().into());
+        st.record(Fault::Client(fault().into()));
         st.fail("a", LayerError::Trap("boom".into()));
         let out = stack_outcome(&st, &mut cx, failed(), None);
         assert!(

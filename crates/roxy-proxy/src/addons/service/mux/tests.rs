@@ -174,8 +174,10 @@ async fn a_body_failing_on_its_way_to_the_service_is_not_its_failure() {
         super::super::unanswered(&stream.st, lost),
         super::super::Fail::Below(_)
     ));
-    assert!(stream.st.failure().is_none(), "the service is not blamed");
-    assert!(stream.st.take_client_fault().is_some());
+    assert!(
+        matches!(stream.st.take_fault(), crate::addons::Fault::Client(_)),
+        "the client is at fault, not the service"
+    );
 }
 
 /// A connection that failed keeps its place in the pool while streams
