@@ -689,7 +689,7 @@ pub fn report(
     s
 }
 
-/// Process exit code for a decision: 0 allow/passthrough, 3 deny.
+/// Process exit code for a decision: 0 allow, 3 deny.
 pub fn exit_code(d: &Decision) -> u8 {
     if d.is_deny() { 3 } else { 0 }
 }

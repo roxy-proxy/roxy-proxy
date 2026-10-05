@@ -479,7 +479,7 @@ fn misc_diagnostics() {
          tls: {{ upstream: {{ verify: strict+extra_roots }} }}\n\
          metrics: [{{ id: bad-id, count: requests }}]\n\
          addons: [{{ name: x, path: {wasm} }}, {{ name: x, path: {wasm} }}]\n\
-         rules:\n  - {{ id: _default, then: allow }}\n  - {{ id: c, then: {{ call: nope }} }}\n",
+         rules:\n  - {{ id: _default, then: allow }}\n  - {{ id: c, when: 'body.bytes > 1', then: allow }}\n",
     ));
     let paths: Vec<&str> = d.iter().map(|d| d.path.as_str()).collect();
     assert_eq!(
@@ -528,6 +528,12 @@ fn action_parse_errors_name_action_and_rule() {
     let msg = describe_parse_error(&yaml, &err);
     assert!(msg.contains("exactly one key"), "{msg}");
     assert!(msg.ends_with("(rule \"m\")"), "{msg}");
+
+    let yaml = format!("{BASE}rules: [{{ id: r, then: [{{ call: scan }}, allow] }}]\n");
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = describe_parse_error(&yaml, &err);
+    assert!(msg.contains("`call` is reserved"), "{msg}");
+    assert!(msg.ends_with("(rule \"r\")"), "{msg}");
 }
 
 #[test]

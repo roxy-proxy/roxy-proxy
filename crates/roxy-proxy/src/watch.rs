@@ -497,9 +497,7 @@ impl Inner {
                         tracing::info!(flow = %meta.flow, %rule, stage = stage.as_str(), "watching rule stopped the exchange");
                         Refusal::deny(status_code(status), &message, rule, close)
                     }
-                    Decision::Allow(_) | Decision::Passthrough => {
-                        Refusal::fail_closed("unsupported_effect")
-                    }
+                    Decision::Allow(_) => Refusal::fail_closed("unsupported_effect"),
                 }
             };
             // A stop's own refusal takes precedence over an effect failure

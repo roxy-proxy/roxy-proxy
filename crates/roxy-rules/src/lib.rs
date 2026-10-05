@@ -30,7 +30,7 @@
 //! let none = HashSet::new();
 //! let policy = Policy::compile(&PolicyInput {
 //!     rules: &rules, metrics: &[], secret_names: &none, address_lists: &none,
-//!     transparent_listeners: false, default: DefaultDecision::Deny,
+//!     default: DefaultDecision::Deny,
 //! }).unwrap();
 //! let flow = MapView::new()
 //!     .with_str(Field::Host, "api.github.com")

@@ -18,7 +18,6 @@ fn store(metrics_yaml: &str) -> MetricStore {
         metrics: &metrics,
         secret_names: &none,
         address_lists: &none,
-        transparent_listeners: false,
         default: DefaultDecision::Deny,
     })
     .unwrap();

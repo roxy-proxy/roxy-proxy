@@ -137,5 +137,6 @@ Non-terminal:
 | `capture: request \| response \| both` | head rules | Tees the exchange, as forwarded, to the [capture log](/operate/flow-log#capture). |
 
 The actions are a small closed set on purpose: anything richer is an addon.
-`call` is reserved and rejected (addons always run above the rules).
-`passthrough` is reserved for transparent mode and rejected (issue #15).
+Two words are reserved and rejected with the reason: `call` (addons run
+above the rules, not from one) and `passthrough` (for a transparent
+listener, which roxy does not have: issue #15).

@@ -513,7 +513,6 @@ pub(crate) mod testing {
             metrics: &[],
             secret_names: &secret_names,
             address_lists: &none,
-            transparent_listeners: false,
             default: DefaultDecision::Deny,
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));

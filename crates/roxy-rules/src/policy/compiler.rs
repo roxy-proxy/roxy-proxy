@@ -452,7 +452,6 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         let out = match action {
             Action::Allow(a) => vec![CAction::Terminal(allow(a))],
             Action::Deny(d) => vec![CAction::Terminal(self.deny(d, rule, apath))],
-            Action::Passthrough => vec![CAction::Terminal(self.passthrough(rule, apath))],
             Action::SetHeader(pairs) => self.set_header(shape, pairs, rule, apath),
             Action::RemoveHeader(names) => names
                 .iter()
@@ -515,15 +514,6 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 })]
             }
             Action::Capture(t) => vec![CAction::Effect(Effect::Capture(*t))],
-            Action::Call(_) => {
-                self.push(
-                    rule,
-                    apath,
-                    "`call` is reserved: addons run above the rules, in config order, not \
-                     from a rule",
-                );
-                Vec::new()
-            }
         };
         (self.d.len() == errors_before).then_some(out)
     }
@@ -554,18 +544,6 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 .unwrap_or_else(|| DEFAULT_DENY_MESSAGE.into()),
             close: close.unwrap_or(true),
         }
-    }
-
-    fn passthrough(&mut self, rule: Option<&RuleId>, apath: &str) -> Decision {
-        if !self.input.transparent_listeners {
-            self.push(
-                rule,
-                apath,
-                "`passthrough` requires a transparent listener, which is not supported yet \
-                 (issue #15)",
-            );
-        }
-        Decision::Passthrough
     }
 
     fn set_header(
@@ -837,12 +815,7 @@ impl RuleShape {
                  forwards this traffic)",
                 why()
             )),
-            Action::Deny(_)
-            | Action::Passthrough
-            | Action::Tag(_)
-            | Action::Log(_)
-            | Action::SetState(_)
-            | Action::Call(_) => None,
+            Action::Deny(_) | Action::Tag(_) | Action::Log(_) | Action::SetState(_) => None,
         }
     }
 }
@@ -928,9 +901,9 @@ fn non_header_strings(a: &Action) -> Vec<&str> {
         Action::Deny(d) => d.message.as_deref().into_iter().collect(),
         Action::RewritePath(r) => vec![&r.pattern, &r.to],
         Action::Redirect(r) => vec![&r.host],
-        Action::Tag(s) | Action::Call(s) => vec![s],
+        Action::Tag(s) => vec![s],
         Action::Log(l) => vec![&l.message],
         Action::SetState(s) => vec![&s.key, &s.value],
-        Action::Allow(_) | Action::Passthrough | Action::Capture(_) => Vec::new(),
+        Action::Allow(_) | Action::Capture(_) => Vec::new(),
     }
 }

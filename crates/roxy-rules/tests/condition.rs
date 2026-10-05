@@ -17,7 +17,6 @@ fn try_condition(src: &str) -> Result<Condition, Vec<String>> {
         metrics: &metrics,
         secret_names: &secrets,
         address_lists: &lists,
-        transparent_listeners: false,
         default: DefaultDecision::Deny,
     };
     Condition::compile(&input, "addons[0].when", src)

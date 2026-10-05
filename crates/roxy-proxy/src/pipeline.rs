@@ -574,9 +574,6 @@ impl FlowCx {
                         *close,
                     ));
                 }
-                Decision::Passthrough => {
-                    refusal = Some(Refusal::fail_closed("passthrough_unsupported"));
-                }
                 Decision::Allow(_) => {}
             }
         }

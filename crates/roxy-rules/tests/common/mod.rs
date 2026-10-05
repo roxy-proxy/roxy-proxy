@@ -40,7 +40,6 @@ pub(crate) fn try_compile_with(
         metrics: &metrics,
         secret_names: &secrets,
         address_lists: &lists,
-        transparent_listeners: false,
         default,
     })
     .map_err(|ds| ds.iter().map(render).collect())

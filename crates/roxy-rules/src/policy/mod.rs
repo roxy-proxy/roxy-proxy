@@ -25,9 +25,6 @@ pub struct PolicyInput<'a> {
     /// Names defined under `address_lists:` (for `ip in @name`; the data
     /// stays with the proxy).
     pub address_lists: &'a HashSet<String>,
-    /// Whether any transparent listener exists. Always false in M1, which
-    /// makes `passthrough` a compile error.
-    pub transparent_listeners: bool,
     /// The top-level `default:` (deny unless the config says `allow`).
     pub default: DefaultDecision,
 }

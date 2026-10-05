@@ -249,7 +249,6 @@ impl KitBuilder {
             metrics: &metric_defs,
             secret_names: &none,
             address_lists: &none,
-            transparent_listeners: false,
             default: DefaultDecision::Deny,
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
@@ -527,7 +526,6 @@ impl Kit {
             metrics: &[],
             secret_names: &none,
             address_lists: &none,
-            transparent_listeners: false,
             default: DefaultDecision::Deny,
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));

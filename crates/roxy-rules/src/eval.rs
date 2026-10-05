@@ -75,9 +75,6 @@ pub enum Decision {
         message: String,
         close: bool,
     },
-    /// Reserved for transparent listeners (deferred); rejected by the
-    /// compiler and never forwards.
-    Passthrough,
 }
 
 /// A deny's status code: always 4xx or 5xx.
@@ -186,9 +183,9 @@ pub enum FailClosedReason {
     /// missing (`null`) value, which has no answer. Carries the field
     /// as written, e.g. `body.size`.
     MissingValue(String),
-    /// A watching rule reached an action that cannot run after forwarding
-    /// (prevented by the compiler; fail closed if ever reached). Carries
-    /// the rule id.
+    /// A watching rule reached an `allow`, which cannot run after
+    /// forwarding (prevented by the compiler; fail closed if ever reached).
+    /// Carries the rule id.
     Unsupported(String),
 }
 
@@ -248,7 +245,6 @@ impl fmt::Display for Decision {
                 }
                 Ok(())
             }
-            Decision::Passthrough => f.write_str("passthrough"),
         }
     }
 }
