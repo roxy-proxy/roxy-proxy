@@ -92,10 +92,10 @@ section applies to both kinds of layer. A layer gets the upgrade request
 in `handle` and passes it on with `next` (a service layer forwards it on
 its stream); the response from below is the `101`. After it, the request
 body carries the client's bytes and the response body the upstream's, for
-as long as the WebSocket is open. A layer reads, rewrites or holds back either direction as it
-would any body, refuses the upgrade by answering without `next`, and is
-left out of the WebSocket entirely when its `when` skips the upgrade
-request. A layer that turns the upstream's `101` into another status
+as long as the WebSocket is open. A layer reads, rewrites or holds back
+either direction as it would any body, refuses the upgrade by answering
+without `next`, and is left out of the WebSocket entirely when its `when`
+skips the upgrade request. A layer that turns the upstream's `101` into another status
 fails the exchange closed (a `503` from `layer:<name>`), and roxy closes
 the upstream WebSocket. A `101` with no upgrade from below fails closed
 too.
