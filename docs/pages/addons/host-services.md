@@ -7,7 +7,7 @@ grants, so one binary runs under any of them; calling one that was not
 granted traps (`CapabilityDenied`) and fails the exchange. `flow.current`,
 `flow.add-tag` and `flow.config` need no capability.
 
-## Endpoints
+## Endpoints (`endpoints`)
 
 `endpoints.call(name, request)`: roxy resolves the name to the configured
 URL (appending the request's path and query), attaches the endpoint's
@@ -21,7 +21,7 @@ resend it; retries back off from 100 ms. An unknown name, a denied address,
 a timeout and a failure reach the layer as distinct `error-code`s. Each call
 emits an `endpoint_call` flow event.
 
-## State
+## State (`state`)
 
 `flow.state-get` / `flow.state-put`: a JSON-value store namespaced per
 layer, with per-entry TTL, a value size cap and an entry cap. A miss returns
@@ -44,7 +44,7 @@ as roxy established it: `client.user` from proxy auth, client IP, listener,
 TLS SNI. These are the safe keys for per-principal state; a layer should
 not trust client-supplied session headers.
 
-## Record
+## Record (`record`)
 
 `flow.record(kind, json, audit)` writes a `layer_record` event to the flow
 log with the flow id, the layer name and a timestamp. String values pass
@@ -53,7 +53,7 @@ exchange. Like any audit record it is never dropped: the call waits while
 the flow log is behind. `audit: true` also POSTs the record to the layer's
 `audit_endpoint`.
 
-## Metrics and log
+## Metrics and log (`metrics`, `log`)
 
 `flow.metric-get(id, [])` reads a metric for this flow's own key (the
 metric's key fields evaluated on the request that left the addon stack, so
