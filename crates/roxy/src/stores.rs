@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use roxy_proxy::{MetricSource, MetricSourceError, Sample, StateFull, StateSource};
-use roxy_rules::{FlowView, MetricDef, MetricError, MetricLimits, MetricStore, Policy, StateStore};
+use roxy_rules::{FlowView, MetricDef, MetricLimits, MetricStore, Policy, StateStore};
 
 /// Default TTL for `set_state` entries written without an explicit `ttl`.
 pub const STATE_DEFAULT_TTL: Duration = Duration::from_secs(3600);
@@ -85,28 +85,9 @@ impl ReloadableMetrics {
     }
 }
 
-fn map_err(e: MetricError) -> MetricSourceError {
-    match e {
-        MetricError::Unknown(id) => MetricSourceError::Unknown(format!("unknown metric {id}")),
-        // Out of bytes is the same condition as out of keys: deny, never
-        // evict.
-        MetricError::TableFull { metric } | MetricError::BudgetExhausted { metric } => {
-            MetricSourceError::TableFull(metric)
-        }
-        MetricError::KeyUnavailable { metric, field } => {
-            MetricSourceError::KeyUnavailable(format!("{metric}: key field {field:?}"))
-        }
-        // A filter that hit an unavailable input cannot say whether the flow
-        // counts; treat it as the store being unable to answer.
-        MetricError::FilterFailed { metric, reason } => {
-            MetricSourceError::Unknown(format!("{metric}: filter input unavailable ({reason})"))
-        }
-    }
-}
-
 impl MetricSource for ReloadableMetrics {
     fn get(&self, id: &str, view: &dyn FlowView) -> Result<i64, MetricSourceError> {
-        self.inner.load().get(id, view).map_err(map_err)
+        self.inner.load().get(id, view).map_err(Into::into)
     }
 
     fn record(&self, view: &dyn FlowView, sample: &Sample) -> Result<(), MetricSourceError> {
@@ -117,7 +98,7 @@ impl MetricSource for ReloadableMetrics {
             denied: sample.denied,
             error: sample.error,
         };
-        self.inner.load().record(view, &s).map_err(map_err)
+        self.inner.load().record(view, &s).map_err(Into::into)
     }
 }
 
