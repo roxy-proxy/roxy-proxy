@@ -1,3 +1,8 @@
+#![expect(
+    clippy::arithmetic_side_effects,
+    reason = "offsets into test vectors built from constants"
+)]
+
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use proptest::prelude::*;
