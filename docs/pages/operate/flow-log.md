@@ -25,7 +25,7 @@ produces a `request` event:
   With `terminal_rule: _fail_closed` it is one of: `metric_unavailable`,
   `metric_key_unavailable`, `metric_table_full`,
   `address_list_unavailable`, `secret_missing`, `secret_invalid`,
-  `body_too_large_to_inspect`, `body_unavailable`,
+  `body_too_large_to_inspect`, `body_unavailable`, `buffer_budget_exhausted`,
   `unsupported_content_encoding`, `body_decode_failed`, `missing_value`,
   `effect_invalid`, `unsupported_effect`, `state_unavailable`,
   `capture_unavailable`, `watch_missing` or `watch_stopped`. With
@@ -61,7 +61,8 @@ produces a `request` event:
 | `ws_open`, `ws_close` | a relayed WebSocket, with byte counts; `ws_close` has `close_code` and `close_reason` when roxy ended it |
 | `ws_message` | a WebSocket message a rule denied, or one sampled by `log.flow.ws_message_every` ([WebSockets](/policies/websockets#message-rules)) |
 | `log` | a rule's `log` action |
-| `layer_error`, `layer_record`, `endpoint_call`, `observer_lagged` | [addons](/addons/overview) |
+| `layer_error`, `layer_record`, `endpoint_call` | [addons](/addons/overview) |
+| `observer_lagged` | an observe-mode addon's copy of a stream was cut; `reason` is `observer_behind` (it fell `max_observer_lag_bytes` behind) or `buffer_budget_exhausted` (the [buffer budget](/reference/limits#limits) could not cover the copy) |
 | `connect` | a CONNECT, when `log.flow.connection_events` is on or it was refused |
 | `dns_query` | a query the [DNS listener](/deploy/dns-steering) answered, when `log.flow.dns_events` is on: `transport`, `client`, `name`, `qtype`, `rcode` and the `answers` |
 | `connection_refused` | a connection cap was hit ([limits](/reference/limits#connections)) |

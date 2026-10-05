@@ -40,6 +40,7 @@ use roxy_rules::{
 use ulid::Ulid;
 
 use crate::body::{Collected, collect_prefix};
+use crate::budget::{self, BufferLease};
 use crate::capture::Tap;
 use crate::flowlog::{
     ClientInfo, DecisionKind, DstInfo, FlowEvent, RequestInfo, ResponseInfo, Stage, Timing, TlsInfo,
@@ -406,6 +407,9 @@ pub(crate) struct FlowCx {
     /// An addon layer ran on this request: on an upgrade, it is in the
     /// WebSocket's byte path.
     pub layer_ran: bool,
+    /// The exchange's share of the buffer budget, held until it ends: the
+    /// buffered body text stays with the facts for as long as the flow.
+    pub buffers: Vec<BufferLease>,
     /// The `request` event went out. Dropping an unlogged flow logs it as
     /// `aborted`, so an exchange cut off by its connection ending or the
     /// server stopping is never missing from the log.
@@ -509,6 +513,7 @@ impl FlowCx {
             request_counter: None,
             stack: None,
             layer_ran: false,
+            buffers: Vec::new(),
             logged: false,
         }
     }
@@ -810,6 +815,10 @@ async fn inspect_request_body(
         return Verdict::Continue(req);
     }
     let cap = cx.snap.limits.max_inspect_body_bytes;
+    let Some(lease) = cx.shared.reserve_buffer(cap) else {
+        return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
+    };
+    cx.buffers.push(lease);
     let inspected = match io.collect(&mut req.body, cap).await {
         Err(e) => return Verdict::Close(e),
         Ok(Collected::Failed(e)) => return Verdict::Close(body_failure(&e).into()),
@@ -1041,6 +1050,10 @@ async fn inspect_response_body(
         return ResponseVerdict::Continue(res);
     }
     let cap = cx.snap.limits.max_inspect_body_bytes;
+    let Some(lease) = cx.shared.reserve_buffer(cap) else {
+        return ResponseVerdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
+    };
+    cx.buffers.push(lease);
     let inspected = match io.collect(&mut res.body, cap).await {
         Err(e) => return ResponseVerdict::Close(e),
         Ok(Collected::Failed(e)) => {

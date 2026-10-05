@@ -111,6 +111,7 @@ fn minimal_config_uses_defaults() {
     assert_eq!(l.max_inspect_body_bytes.as_u64(), 1 << 20);
     assert_eq!(l.max_ws_message_bytes.as_u64(), 16 << 20);
     assert_eq!(l.max_observer_lag_bytes.as_u64(), 16 << 20);
+    assert_eq!(l.max_buffered_bytes.as_u64(), 1 << 30);
     assert_eq!(l.header_timeout, Duration::from_secs(10));
     assert_eq!(l.body_idle_timeout, Duration::from_secs(30));
     assert_eq!(l.max_connections_per_client, 256);
@@ -306,6 +307,23 @@ fn zero_limits_diagnosed() {
     }
     parse(&format!(
         "{BASE}limits: {{ max_headers: 1, max_header_bytes: 1 }}\n"
+    ))
+    .validate()
+    .unwrap();
+}
+
+/// The buffer budget is reserved a whole cap at a time, so one smaller
+/// than a cap would refuse every exchange that needs that buffer.
+#[test]
+fn buffer_budget_under_one_exchange_diagnosed() {
+    let d = diagnostics(&format!("{BASE}limits: {{ max_buffered_bytes: 31mb }}\n"));
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].path, "limits.max_buffered_bytes");
+    parse(&format!("{BASE}limits: {{ max_buffered_bytes: 32mb }}\n"))
+        .validate()
+        .unwrap();
+    parse(&format!(
+        "{BASE}limits: {{ max_buffered_bytes: 2mb, max_ws_message_bytes: 1mb, max_observer_lag_bytes: 1mb }}\n"
     ))
     .validate()
     .unwrap();

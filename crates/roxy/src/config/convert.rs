@@ -26,6 +26,7 @@ impl From<&Config> for Limits {
             max_inspect_body_bytes: l.max_inspect_body_bytes.as_u64(),
             max_ws_message_bytes: l.max_ws_message_bytes.as_u64(),
             max_observer_lag_bytes: l.max_observer_lag_bytes.as_u64(),
+            max_buffered_bytes: l.max_buffered_bytes.as_u64(),
             header_timeout: l.header_timeout,
             body_idle_timeout: l.body_idle_timeout,
             response_header_timeout: l.response_header_timeout,

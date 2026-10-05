@@ -695,6 +695,7 @@ mod service {
         let lagged = kit.events("observer_lagged", 1).await;
         assert_eq!(lagged[0]["layer"], "o", "{lagged:#?}");
         assert_eq!(lagged[0]["direction"], "request");
+        assert_eq!(lagged[0]["reason"], "observer_behind");
     }
 
     /// A secret the rules inject is captured redacted, through the stack as

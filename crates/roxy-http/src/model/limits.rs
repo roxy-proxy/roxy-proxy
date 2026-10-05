@@ -28,6 +28,9 @@ pub struct Limits {
     /// How far behind the real body an observe-mode addon's copy may fall,
     /// in buffered bytes per direction, before the copy is cut.
     pub max_observer_lag_bytes: u64,
+    /// Process-wide budget for the buffers the three caps above bound:
+    /// an exchange reserves each cap in full before it fills that buffer.
+    pub max_buffered_bytes: u64,
     /// Deadline for receiving a complete request head once it has started
     /// (and for the first request on a connection, from accept).
     pub header_timeout: Duration,
@@ -55,6 +58,7 @@ impl Default for Limits {
             max_inspect_body_bytes: MIB,
             max_ws_message_bytes: 16 * MIB,
             max_observer_lag_bytes: 16 * MIB,
+            max_buffered_bytes: GIB,
             header_timeout: Duration::from_secs(10),
             body_idle_timeout: Duration::from_secs(30),
             response_header_timeout: Duration::from_secs(60),

@@ -15,6 +15,7 @@ connect produces a deny response or a closed socket.
 | metric key table full or byte budget exhausted | deny, `metric_table_full` |
 | body too large to inspect, as sent or decoded | deny, `_fail_closed`, `body_too_large_to_inspect` |
 | body to inspect cannot be decoded | deny, `_fail_closed`, `body_decode_failed` or `unsupported_content_encoding` |
+| buffer budget cannot cover the exchange's inspection or WebSocket buffers | deny, `_fail_closed`, `buffer_budget_exhausted`; an observer's copy is cut instead (`observer_lagged`) |
 | body or header limit exceeded mid-stream | close both sides |
 | upstream DNS, connect or TLS failure | `502`, `upstream_error` |
 | upstream connect or response-header timeout | `504`, `upstream_error`, reason `timeout` |
@@ -55,6 +56,7 @@ limits:
   max_capture_body_bytes: 16mb    # per direction per exchange
   max_ws_message_bytes: 16mb      # a reassembled WebSocket message, when rules read ws.*
   max_observer_lag_bytes: 16mb    # how far behind an observe-mode addon may fall, per direction
+  max_buffered_bytes: 1gb         # all of the above together, across the process
 
   # connections
   max_connections: 10000
@@ -76,6 +78,21 @@ for it, so an observer that keeps up sees every body in full however
 large, and one with more than that many bytes unread has the copy cut
 ([addon modes](/addons/overview#modes)).
 
+`max_buffered_bytes` bounds those three buffers in aggregate; each is
+bounded per exchange, and without it the only bound on exchanges is the
+connection caps. An exchange reserves the whole cap before it fills a
+buffer (`max_inspect_body_bytes` for a body a rule reads, twice
+`max_ws_message_bytes` for a WebSocket whose messages rules read,
+`max_observer_lag_bytes` per direction for an observer's copy) and holds
+the reservation until it ends. A reservation the budget cannot cover fails
+at once, with no waiting and no eviction: the exchange fails closed (`503`,
+`_fail_closed`, `buffer_budget_exhausted`), or the observer's copy is cut
+(`observer_lagged`, `reason: buffer_budget_exhausted`). The budget divided
+by a cap is how many exchanges can hold that buffer at once (with the
+defaults: 1024 inspected bodies, 32 WebSockets with message rules, 32
+observed exchanges), so size it, or the caps, for the traffic that needs
+them. It must be at least the largest per-exchange reservation.
+
 The limits that shape the client-facing codec (`max_header_bytes`,
 `max_url_bytes`, `max_headers`, `max_request_body_bytes`, `header_timeout`,
 `body_idle_timeout`, the keep-alive `idle_timeout`, the `h2_*` limits) and
@@ -85,6 +102,10 @@ Everything decided per exchange (`max_inspect_body_bytes`,
 `max_response_body_bytes`, `response_header_timeout`, the WebSocket limits,
 `max_observer_lag_bytes`, the policy itself) comes from the snapshot the exchange starts under, so an
 exchange on an old connection runs under the current values.
+`max_buffered_bytes` is process-wide: each reservation is checked against
+the value in force at that moment, so a reload applies to every exchange's
+next reservation, and the reservations already held stay as they are (a
+smaller budget admits nothing new until enough of them end).
 
 ## Connections
 
@@ -96,6 +117,9 @@ exchange on an old connection runs under the current values.
   stage has a timeout.
 - Nothing is allocated in proportion to an attacker-supplied number before
   it is validated (`content-length: 10^18` does not pre-allocate).
+- What exchanges buffer (inspection, WebSocket reassembly, observer
+  copies) is bounded in aggregate by `max_buffered_bytes`, not only per
+  exchange.
 - Bounded policy tables (metrics, state, addon state) never evict
   to make room: a flow that needs a new entry in a full table is denied
   ([never evict](/principles#never-evict)).
