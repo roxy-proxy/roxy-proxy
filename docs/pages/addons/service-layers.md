@@ -17,7 +17,7 @@ addons:
     endpoints:
       sidecar: { url: "http://127.0.0.1:9000/layer", private_ok: true }
     limits:
-      first_byte_timeout: 2s            # to get a stream, then to each of the service's heads, from roxy's own (default 30s)
+      first_byte_timeout: 2s            # to get a stream, then to each of the service's heads (default 30s)
 ```
 
 `path`, `capabilities`, `config`, `audit_endpoint` and the WASM limits are
@@ -195,7 +195,7 @@ not counted.
   on an upgrade). From then on the request body is the client's bytes and
   the response body the upstream's, with no length cap on either, until
   each side closes; the stream holds its place on the connection for as
-  long as the WebSocket is open. Roxy sends no `request_end` before the
+  long as the WebSocket is open. roxy sends no `request_end` before the
   `101`: the request body is the client's side of the WebSocket. A service
   that waits for the end of the request body before forwarding never
   forwards an upgrade, and the exchange fails on `first_byte_timeout`;
