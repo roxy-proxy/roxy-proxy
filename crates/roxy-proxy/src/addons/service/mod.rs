@@ -38,6 +38,8 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 use roxy_http::Body;
 use roxy_wasm::{HostError, LayerRequest, LayerResponse};
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::error::TryRecvError;
 use tokio::time::Instant as TokioInstant;
 
 use super::{AddonMode, StackError, StackFlow};
@@ -315,10 +317,7 @@ async fn run(
     let head = request_head(&parts, &body);
     tokio::spawn(async move { s.pump(Dir::Request, head, body).await });
 
-    let first = tokio::time::timeout_at(start + svc.first_byte_timeout, answers.first)
-        .await
-        .map_err(|_| ServiceError::Timeout("first_byte_timeout"))?
-        .map_err(|_| ServiceError::Closed("the stream ended".into()))??;
+    let first = answer_by(start + svc.first_byte_timeout, answers.first).await??;
     let forward = match first {
         First::Answer(res) => {
             guard.disarm();
@@ -343,12 +342,27 @@ async fn run(
     let s = stream.clone();
     let head = response_head(&parts, &body);
     tokio::spawn(async move { s.pump(Dir::Response, head, body).await });
-    let res = tokio::time::timeout_at(sent + svc.first_byte_timeout, answers.second)
-        .await
-        .map_err(|_| ServiceError::Timeout("first_byte_timeout"))?
-        .map_err(|_| ServiceError::Closed("the stream ended".into()))??;
+    let res = answer_by(sent + svc.first_byte_timeout, answers.second).await??;
     guard.disarm();
     Ok(res)
+}
+
+/// The service's answer, within `first_byte_timeout`. An answer that lands
+/// as the deadline passes is still an answer: the timeout polls the channel
+/// and then the clock, so it reports elapsed with a value already queued.
+async fn answer_by<T>(
+    deadline: TokioInstant,
+    mut answer: oneshot::Receiver<T>,
+) -> Result<T, ServiceError> {
+    match tokio::time::timeout_at(deadline, &mut answer).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(_)) => Err(ServiceError::Closed("the stream ended".into())),
+        Err(_) => match answer.try_recv() {
+            Ok(v) => Ok(v),
+            Err(TryRecvError::Closed) => Err(ServiceError::Closed("the stream ended".into())),
+            Err(TryRecvError::Empty) => Err(ServiceError::Timeout("first_byte_timeout")),
+        },
+    }
 }
 
 /// Resets a stream whose exchange ended before the service's answer.
