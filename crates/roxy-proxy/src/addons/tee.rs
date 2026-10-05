@@ -21,6 +21,7 @@ use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
+use http_body_util::BodyExt as _;
 use roxy_http::{Body, BodyError};
 use roxy_wasm::{HostError, LayerRequest, LayerResponse};
 use tokio::sync::{mpsc, oneshot};
@@ -340,7 +341,7 @@ pub(crate) async fn observe(
                 // Whatever it answers is discarded, but read to the end so
                 // the layer's own failures surface.
                 let outcome = resp.extensions().get::<roxy_wasm::LayerOutcome>().cloned();
-                drop(resp.into_body().collect_up_to(u64::MAX).await);
+                discard(resp.into_body()).await;
                 match outcome {
                     Some(o) => o.wait().await,
                     None => Ok(()),
@@ -359,6 +360,11 @@ pub(crate) async fn observe(
     });
 
     forward(st, index, &addon.name, real_req, tx).await
+}
+
+/// Reads `body` to its end or first error, holding one frame at a time.
+async fn discard(mut body: Body) {
+    while body.frame().await.is_some_and(|f| f.is_ok()) {}
 }
 
 /// The real exchange below observer `index`; the observer gets a copy of
@@ -390,8 +396,6 @@ async fn forward(
 
 #[cfg(test)]
 mod tests {
-    use http_body_util::BodyExt as _;
-
     use super::*;
     use crate::testkit::Kit;
 
@@ -429,5 +433,64 @@ mod tests {
         sender.try_push(frame.clone()).unwrap();
         assert_eq!(sender.try_push(frame), Err(BEHIND));
         assert_eq!(shared.buffered(), 10);
+    }
+
+    /// A long body of `left` frames that samples the process's anonymous
+    /// memory as it ends, while whoever reads it still holds what it kept.
+    #[cfg(target_os = "linux")]
+    struct Sampled {
+        left: usize,
+        rss_at_end: Arc<AtomicU64>,
+    }
+
+    #[cfg(target_os = "linux")]
+    static FRAME: [u8; 1 << 20] = [7; 1 << 20];
+
+    #[cfg(target_os = "linux")]
+    impl HttpBody for Sampled {
+        type Data = Bytes;
+        type Error = BodyError;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+            if self.left == 0 {
+                self.rss_at_end.store(rss_anon(), Ordering::SeqCst);
+                return Poll::Ready(None);
+            }
+            self.left -= 1;
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(&FRAME)))))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rss_anon() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = status.lines().find(|l| l.starts_with("RssAnon:")).unwrap();
+        let kib: u64 = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+        kib * 1024
+    }
+
+    /// Discarding an observer's answer keeps none of it: a 512 MiB body
+    /// leaves the process no bigger by the time it ends. Frames are static,
+    /// so any growth is the reader's own buffering; the margin absorbs
+    /// other tests running alongside.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn discarding_a_long_body_costs_no_memory() {
+        let rss_at_end = Arc::new(AtomicU64::new(0));
+        let body = Body::wrap_native(
+            Sampled {
+                left: 512,
+                rss_at_end: rss_at_end.clone(),
+            },
+            u64::MAX,
+            None,
+        );
+        let before = rss_anon();
+        discard(body).await;
+        let grown = rss_at_end.load(Ordering::SeqCst).saturating_sub(before);
+        assert!(grown < 128 << 20, "grew by {} MiB", grown >> 20);
     }
 }
