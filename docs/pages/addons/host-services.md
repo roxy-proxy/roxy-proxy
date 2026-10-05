@@ -56,8 +56,8 @@ the flow log is behind. `audit: true` also POSTs the record to the layer's
 ## Metrics and log
 
 `flow.metric-get(id, [])` reads a metric for this flow's own key (the
-metric's key fields evaluated on the client's request); explicit key values
-are refused. `flow.log` writes to roxy's operational log with the flow id
+metric's key fields evaluated on the request that left the addon stack, so
+after any layer changed it); explicit key values are refused. `flow.log` writes to roxy's operational log with the flow id
 and layer name.
 
 There is no `secrets` capability (the config refuses it and points to

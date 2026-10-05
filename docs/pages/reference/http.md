@@ -310,12 +310,13 @@ connection: close
 {"error":"blocked by roxy","rule":"<rule id>","flow":"<flow id>"}
 ```
 
-A refusal that is not a rule's deny (an upstream error, a failed addon)
-carries a `reason` instead of `rule`.
+An upstream error carries a `reason` instead of `rule`. A failed addon
+layer's `503` carries `rule: layer:<name>`.
 
 The status and message can be set per rule
 (`deny: { status: 451, message: "..." }`). After a deny the connection is
-closed (`connection: close` on HTTP/1.1, `GOAWAY` on HTTP/2), so a probing
+closed (`connection: close` on HTTP/1.1, `GOAWAY` on HTTP/2) unless the
+rule says `deny: { close: false }`, so a probing
 client loses its warm connection on every attempt, and roxy does not read
 the rest of a request body it has refused: the response goes out at once
 and the connection closes behind it. A refused proxy authentication gets

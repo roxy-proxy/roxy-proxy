@@ -52,7 +52,7 @@ tls:
 
 | failure | response | flow log |
 |---|---|---|
-| address floor | `403`, `_address_policy` | `upstream_denied` |
+| address floor | `403`, `_address_policy` | `upstream_denied`, reason `private_range:<class>`, `deny_cidrs` or `list:<name>` |
 | DNS, connect, TLS | `502` | `upstream_error`, reason `dns_failed`, `connect_failed` or `tls_failed` |
 | a target roxy cannot dial (no host, an unknown scheme) | `502` | `upstream_error`, reason `invalid_target` |
 | timeout | `504` | `upstream_error`, reason `timeout` |

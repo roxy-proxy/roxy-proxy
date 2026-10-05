@@ -738,7 +738,7 @@ fn validate_listener_mode(l: &super::Listener, path: &str, d: &mut Vec<Diagnosti
         }
         ListenerMode::Transparent => d.push(Diagnostic::new(
             format!("{path}.mode"),
-            "transparent mode is deferred and not yet supported (issue #15); use `explicit` or `direct`",
+            "there are no transparent listeners; use `explicit` or `direct`",
         )),
     }
 }

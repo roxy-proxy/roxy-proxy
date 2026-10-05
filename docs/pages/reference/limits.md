@@ -17,6 +17,7 @@ connect produces a deny response or a closed socket.
 | body to inspect cannot be decoded | deny, `_fail_closed`, `body_decode_failed` or `unsupported_content_encoding` |
 | body or header limit exceeded mid-stream | close both sides |
 | upstream DNS, connect or TLS failure | `502`, `upstream_error` |
+| upstream connect or response-header timeout | `504`, `upstream_error`, reason `timeout` |
 | address floor | `403`, `_address_policy` |
 | addon trap, budget exceeded or invalid output (enforce mode) | deny, `layer_error`; observe-mode addons only log |
 | config reload fails | keep the old policy |
@@ -85,7 +86,8 @@ exchange on an old connection runs under the current values.
 
 - A connection over `max_connections` or `max_connections_per_client` (per
   client IP) is accepted and closed at once, with a `connection_refused`
-  event.
+  event. A DNS-over-TCP connection the caps refuse is closed the same way
+  but noted only in the operational log, not in the flow log.
 - Every read is bounded (head size, body size, ClientHello size), and every
   stage has a timeout.
 - Nothing is allocated in proportion to an attacker-supplied number before

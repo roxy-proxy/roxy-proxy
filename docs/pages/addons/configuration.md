@@ -43,9 +43,12 @@ before answering. Bodies have no clock, so a long generation streams
 through whatever its length.
 
 `roxy check` refuses what `roxy run` would refuse, or what could never act:
-a zero limit or endpoint `timeout`, a `recycle_above_memory` above
-`max_memory` (an instance fails its exchange at `max_memory`, so it would
-never be recycled), and a `path` that does not exist.
+a zero `max_instances`, `max_memory`, `recycle_above_memory`,
+`first_byte_timeout`, endpoint `timeout`, or service `max_connections` or
+`max_streams`; a `recycle_above_memory` above `max_memory` (an instance
+fails its exchange at `max_memory`, so it would never be recycled); and a
+`path` that does not exist. `recycle_after_exchanges: 0` is accepted and
+recycles an instance after every exchange.
 
 `kind: service` addons take a different set of keys
 ([service layers](/addons/service-layers)).

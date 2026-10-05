@@ -90,10 +90,10 @@ pub struct Listener {
     /// in between remaps it. Defaults to the bind port.
     #[serde(default)]
     pub target_port: Option<u16>,
-    /// Transparent listeners only (deferred, issue #15).
+    /// Transparent listeners only; rejected by `roxy check`.
     #[serde(default)]
     pub allow_passthrough: Option<bool>,
-    /// Transparent listeners only (deferred, issue #15).
+    /// Transparent listeners only; rejected by `roxy check`.
     #[serde(default)]
     pub upstream_target: Option<UpstreamTarget>,
 }
