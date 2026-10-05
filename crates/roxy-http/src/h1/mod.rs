@@ -254,14 +254,15 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
         }
     }
 
-    /// [`ReadSide::pump`], then watches the socket so a client that leaves
-    /// while its response is being written is noticed at once. `Ok(true)`
-    /// when the client closed (EOF or a read error: h1 cannot tell a
-    /// half-close from a departure), `Ok(false)` when bytes arrived instead
-    /// (a pipelined request, which stays buffered). Cancel-safe.
-    async fn pump_then_watch(&mut self) -> Result<bool, ParseError> {
+    /// [`ReadSide::pump`], then, if `watch`, watches the socket so a client
+    /// that leaves while its response is being written is noticed at once.
+    /// `Ok(true)` when the client closed (EOF or a read error: h1 cannot
+    /// tell a half-close from a departure), `Ok(false)` otherwise; bytes
+    /// that arrive (a pipelined request) end the watch and stay buffered.
+    /// Cancel-safe.
+    async fn pump_then_watch(&mut self, watch: bool) -> Result<bool, ParseError> {
         self.pump().await?;
-        if !self.buf.is_empty() {
+        if !watch || !self.buf.is_empty() {
             return Ok(false);
         }
         self.buf.reserve(READ_CHUNK);
@@ -926,7 +927,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
                     }
                     // `write` is polled again on the next pass, so a body
                     // that is waiting for its next frame fails at once.
-                    r = self.r.pump_then_watch(), if !watch_done => {
+                    r = self.r.pump_then_watch(!write_done), if !watch_done => {
                         match r {
                             Err(e) => break Err(WriteError::Request(e)),
                             Ok(closed) => client_closed.store(closed, Ordering::Relaxed),

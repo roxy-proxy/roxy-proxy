@@ -720,6 +720,33 @@ async fn dropped_body_is_drained_and_connection_reused() {
     assert_eq!(req.path.as_str(), "/next");
 }
 
+#[tokio::test(start_paused = true)]
+async fn early_response_returns_once_the_upload_ends() {
+    let (mut client, mut c) = conn();
+    client
+        .write_all(b"POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\n\r\nhello")
+        .await
+        .unwrap();
+    let req = expect_request(&mut c).await;
+    drop(req);
+    // The response is written before the rest of the body arrives, so
+    // `respond` must not go on to wait on the idle client afterwards.
+    let rest = async {
+        let _ = read_response(&mut client, false).await;
+        client.write_all(b"world").await.unwrap();
+    };
+    let (r, ()) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            c.respond(ok(Body::from_bytes("early")))
+        ),
+        rest
+    );
+    r.expect("respond returns once the request body is in")
+        .unwrap();
+    assert!(!c.is_closed());
+}
+
 #[tokio::test]
 async fn dropped_large_body_closes_after_drain_limit() {
     let (mut client, mut c) = conn();
