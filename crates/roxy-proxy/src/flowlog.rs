@@ -830,14 +830,14 @@ mod tests {
     /// Writes JSON lines to any [`Write`]r, flushing after every line, and
     /// drops an event whose write fails. For tests and tools; an audit log is a
     /// [`BufferedSink`].
-    pub struct WriterSink<W: Write + Send> {
+    pub(crate) struct WriterSink<W: Write + Send> {
         name: &'static str,
         writer: Mutex<W>,
     }
 
     impl<W: Write + Send> WriterSink<W> {
         /// `name` identifies the sink in warnings.
-        pub fn new(name: &'static str, writer: W) -> Self {
+        pub(crate) fn new(name: &'static str, writer: W) -> Self {
             Self {
                 name,
                 writer: Mutex::new(writer),
@@ -845,7 +845,7 @@ mod tests {
         }
 
         /// Consume the sink and return the writer.
-        pub fn into_inner(self) -> W {
+        pub(crate) fn into_inner(self) -> W {
             self.writer
                 .into_inner()
                 .unwrap_or_else(PoisonError::into_inner)

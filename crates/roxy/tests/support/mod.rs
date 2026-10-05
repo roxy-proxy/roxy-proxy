@@ -32,20 +32,20 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-pub const SECRET: &str = "s3cr3t-token-value-0123456789";
+pub(crate) const SECRET: &str = "s3cr3t-token-value-0123456789";
 
-pub fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+pub(crate) fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
 /// The upstream's test CA and server configs.
-pub struct TestCa {
+pub(crate) struct TestCa {
     pub pem: String,
     server: Arc<rustls::ServerConfig>,
     ws_server: Arc<rustls::ServerConfig>,
 }
 
-pub fn test_ca() -> TestCa {
+pub(crate) fn test_ca() -> TestCa {
     let mut ca_params = CertificateParams::default();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![
@@ -97,14 +97,14 @@ pub fn test_ca() -> TestCa {
 impl TestCa {
     /// A server config for a leaf of this CA (`upstream.test` and others,
     /// and 127.0.0.1), offering only HTTP/1.1, as a WebSocket server needs.
-    pub fn ws_server(&self) -> Arc<rustls::ServerConfig> {
+    pub(crate) fn ws_server(&self) -> Arc<rustls::ServerConfig> {
         self.ws_server.clone()
     }
 }
 
 /// What the upstream saw.
 #[derive(Debug, Clone)]
-pub struct Seen {
+pub(crate) struct Seen {
     pub method: String,
     pub path_and_query: String,
     pub host: Option<String>,
@@ -116,7 +116,7 @@ pub struct Seen {
 }
 
 impl Seen {
-    pub fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(n, _)| n == name)
@@ -125,7 +125,7 @@ impl Seen {
 }
 
 #[derive(Default)]
-pub struct UpState {
+pub(crate) struct UpState {
     pub seen: Mutex<Vec<Seen>>,
     /// Signalled when `/stream-probe` receives its first body bytes.
     pub probe: Notify,
@@ -257,7 +257,7 @@ fn drip(query: &str) -> Response<BoxBody> {
 }
 
 /// FNV-1a as computed by the upstream.
-pub fn fnv(data: &[u8]) -> String {
+pub(crate) fn fnv(data: &[u8]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for b in data {
         hash = (hash ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3);
@@ -265,7 +265,7 @@ pub fn fnv(data: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
-pub struct Upstream {
+pub(crate) struct Upstream {
     pub https: SocketAddr,
     pub http: SocketAddr,
     pub ws: SocketAddr,
@@ -275,15 +275,15 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    pub fn seen(&self) -> Vec<Seen> {
+    pub(crate) fn seen(&self) -> Vec<Seen> {
         self.state.seen.lock().unwrap().clone()
     }
 
-    pub fn ws_upgrades(&self) -> Vec<Vec<(String, String)>> {
+    pub(crate) fn ws_upgrades(&self) -> Vec<Vec<(String, String)>> {
         self.state.ws_upgrades.lock().unwrap().clone()
     }
 
-    pub fn ws_received(&self) -> Vec<Vec<u8>> {
+    pub(crate) fn ws_received(&self) -> Vec<Vec<u8>> {
         self.state.ws_received.lock().unwrap().clone()
     }
 }
@@ -298,7 +298,7 @@ where
         .await;
 }
 
-pub async fn start_upstream(ca: &TestCa) -> Upstream {
+pub(crate) async fn start_upstream(ca: &TestCa) -> Upstream {
     let st = Arc::new(UpState::default());
     let https = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -389,7 +389,7 @@ pub async fn start_upstream(ca: &TestCa) -> Upstream {
 
 /// Options for [`Harness::start_with`].
 #[derive(Default)]
-pub struct Opts<'a> {
+pub(crate) struct Opts<'a> {
     /// The `rules:` list (YAML, indented by two spaces per item).
     pub rules: &'a str,
     /// Extra lines under `limits:`. A `response_header_timeout` here
@@ -421,13 +421,13 @@ pub struct Opts<'a> {
 
 /// Makes the test flow sink report backpressure on demand.
 #[derive(Default)]
-pub struct LogGate {
+pub(crate) struct LogGate {
     closed: std::sync::atomic::AtomicBool,
     waiters: std::sync::Mutex<Vec<std::task::Waker>>,
 }
 
 impl LogGate {
-    pub fn set_closed(&self, closed: bool) {
+    pub(crate) fn set_closed(&self, closed: bool) {
         self.closed
             .store(closed, std::sync::atomic::Ordering::SeqCst);
         if !closed {
@@ -463,7 +463,7 @@ impl roxy_proxy::FlowSink for GatedSink {
     }
 }
 
-pub struct Harness {
+pub(crate) struct Harness {
     pub dir: tempfile::TempDir,
     pub config_path: PathBuf,
     pub running: Option<Running>,
@@ -487,7 +487,7 @@ fn indent(s: &str, n: usize) -> String {
 }
 
 impl Harness {
-    pub async fn start(rules: &str) -> Self {
+    pub(crate) async fn start(rules: &str) -> Self {
         Self::start_with(Opts {
             rules,
             ..Opts::default()
@@ -496,7 +496,7 @@ impl Harness {
     }
 
     /// Placeholders in rules: `{HTTPS}`, `{HTTP}`, `{WS}`, `{DOWN}` ports.
-    pub fn render(&self, opts: &Opts<'_>) -> String {
+    pub(crate) fn render(&self, opts: &Opts<'_>) -> String {
         Self::render_config(self.dir.path(), &self.upstream, opts)
     }
 
@@ -579,7 +579,7 @@ log:
         .replace("rules:\n  []\n", "rules: []\n")
     }
 
-    pub async fn start_with(opts: Opts<'_>) -> Self {
+    pub(crate) async fn start_with(opts: Opts<'_>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let test_ca = test_ca();
         std::fs::write(dir.path().join("upstream-ca.pem"), &test_ca.pem).unwrap();
@@ -628,7 +628,7 @@ log:
 
     /// Every capture record so far, `(header, payload)`, after flushing
     /// the capture log.
-    pub fn captured(&self) -> Vec<(Value, Vec<u8>)> {
+    pub(crate) fn captured(&self) -> Vec<(Value, Vec<u8>)> {
         let log = self
             .running
             .as_ref()
@@ -641,19 +641,19 @@ log:
         parse_capture(&std::fs::read(log.path()).unwrap())
     }
 
-    pub fn https_url(&self, path: &str) -> String {
+    pub(crate) fn https_url(&self, path: &str) -> String {
         format!("https://upstream.test:{}{path}", self.upstream.https.port())
     }
 
-    pub fn http_url(&self, path: &str) -> String {
+    pub(crate) fn http_url(&self, path: &str) -> String {
         format!("http://upstream.test:{}{path}", self.upstream.http.port())
     }
 
-    pub fn client_builder(&self) -> reqwest::ClientBuilder {
+    pub(crate) fn client_builder(&self) -> reqwest::ClientBuilder {
         self.client_builder_with(reqwest::Proxy::all(format!("http://{}", self.proxy)).unwrap())
     }
 
-    pub fn client_builder_with(&self, proxy: reqwest::Proxy) -> reqwest::ClientBuilder {
+    pub(crate) fn client_builder_with(&self, proxy: reqwest::Proxy) -> reqwest::ClientBuilder {
         reqwest::Client::builder()
             .no_proxy()
             .proxy(proxy)
@@ -663,11 +663,11 @@ log:
             .timeout(Duration::from_secs(30))
     }
 
-    pub fn client(&self) -> reqwest::Client {
+    pub(crate) fn client(&self) -> reqwest::Client {
         self.client_builder().build().unwrap()
     }
 
-    pub fn events(&self, kind: &str) -> Vec<Value> {
+    pub(crate) fn events(&self, kind: &str) -> Vec<Value> {
         self.sink
             .events()
             .into_iter()
@@ -676,7 +676,7 @@ log:
     }
 
     /// Waits until at least `n` events of `kind` exist.
-    pub async fn wait_events(&self, kind: &str, n: usize) -> Vec<Value> {
+    pub(crate) async fn wait_events(&self, kind: &str, n: usize) -> Vec<Value> {
         for _ in 0..200 {
             let ev = self.events(kind);
             if ev.len() >= n {
@@ -691,7 +691,7 @@ log:
     }
 
     /// Opens a CONNECT tunnel; returns the stream after `200`.
-    pub async fn connect_tunnel(&self, authority: &str) -> TcpStream {
+    pub(crate) async fn connect_tunnel(&self, authority: &str) -> TcpStream {
         let mut s = TcpStream::connect(self.proxy).await.unwrap();
         s.write_all(
             format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
@@ -704,7 +704,7 @@ log:
     }
 
     /// CONNECT + TLS (trusting roxy's CA) with the given SNI.
-    pub async fn tls_tunnel(
+    pub(crate) async fn tls_tunnel(
         &self,
         authority: &str,
         sni: &str,
@@ -713,7 +713,7 @@ log:
     }
 
     /// CONNECT + TLS offering `alpn`.
-    pub async fn tls_tunnel_alpn(
+    pub(crate) async fn tls_tunnel_alpn(
         &self,
         authority: &str,
         sni: &str,
@@ -725,7 +725,7 @@ log:
 
     /// TLS for `sni` (ALPN `http/1.1`) straight to `addr`, trusting roxy's
     /// CA: a client of a direct listener.
-    pub async fn tls_direct(
+    pub(crate) async fn tls_direct(
         &self,
         addr: SocketAddr,
         sni: &str,
@@ -757,7 +757,7 @@ log:
 
     /// A raw `h2` client over CONNECT + TLS (ALPN `h2`) to the HTTPS
     /// upstream. The connection task is returned so tests can watch it end.
-    pub async fn h2_client(
+    pub(crate) async fn h2_client(
         &self,
     ) -> (
         h2::client::SendRequest<Bytes>,
@@ -773,7 +773,7 @@ log:
         (send, tokio::spawn(conn))
     }
 
-    pub async fn stop(mut self) {
+    pub(crate) async fn stop(mut self) {
         if let Some(r) = self.running.take() {
             r.shutdown(Duration::from_secs(2)).await;
         }
@@ -788,7 +788,7 @@ fn rustls_pemfile_certs(pem: &str) -> Vec<CertificateDer<'static>> {
 }
 
 /// Reads a response head byte by byte (so nothing after it is consumed).
-pub async fn read_head<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> String {
+pub(crate) async fn read_head<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> String {
     let mut buf = Vec::new();
     loop {
         let mut b = [0u8; 1];
@@ -808,7 +808,7 @@ pub async fn read_head<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> String {
 }
 
 /// Reads one response (head + content-length body).
-pub async fn read_response<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> (String, Vec<u8>) {
+pub(crate) async fn read_response<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> (String, Vec<u8>) {
     let head = read_head(r).await;
     let len = head
         .to_ascii_lowercase()
@@ -827,7 +827,7 @@ pub async fn read_response<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> (Strin
 }
 
 /// Reads until EOF (or 10 s). Returns what was read and whether EOF was seen.
-pub async fn read_to_eof<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> (Vec<u8>, bool) {
+pub(crate) async fn read_to_eof<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
@@ -840,7 +840,7 @@ pub async fn read_to_eof<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> (Vec<u8>
 }
 
 /// Sends raw bytes to the proxy and reads until EOF.
-pub async fn raw(proxy: SocketAddr, bytes: &[u8]) -> (String, bool) {
+pub(crate) async fn raw(proxy: SocketAddr, bytes: &[u8]) -> (String, bool) {
     let mut s = TcpStream::connect(proxy).await.unwrap();
     s.write_all(bytes).await.unwrap();
     let (out, eof) = read_to_eof(&mut s).await;
@@ -849,7 +849,7 @@ pub async fn raw(proxy: SocketAddr, bytes: &[u8]) -> (String, bool) {
 
 /// Sends one h2 request (no body) and returns the response head and body,
 /// or the stream / connection error.
-pub async fn h2_get(
+pub(crate) async fn h2_get(
     send: &h2::client::SendRequest<Bytes>,
     uri: &str,
     headers: &[(&str, &str)],
@@ -898,16 +898,19 @@ fn h2_frame(out: &mut Vec<u8>, kind: u8, flags: u8, stream: u32, payload: &[u8])
 }
 
 /// h2 frame type codes used by the tests.
-pub const H2_HEADERS: u8 = 0x1;
-pub const H2_RST_STREAM: u8 = 0x3;
-pub const H2_SETTINGS: u8 = 0x4;
-pub const H2_GOAWAY: u8 = 0x7;
+pub(crate) const H2_HEADERS: u8 = 0x1;
+pub(crate) const H2_RST_STREAM: u8 = 0x3;
+pub(crate) const H2_SETTINGS: u8 = 0x4;
+pub(crate) const H2_GOAWAY: u8 = 0x7;
 
 /// Opens an h2 tunnel and sends stream 1 with exactly `fields`
 /// (pseudo-headers included, in order) and `END_STREAM`, frame by frame.
 /// Returns the frames `(type, flags, stream id, payload)` received until
 /// stream 1 is reset or answered, or the connection ends.
-pub async fn h2_raw_request(h: &Harness, fields: &[(&str, &str)]) -> Vec<(u8, u8, u32, Vec<u8>)> {
+pub(crate) async fn h2_raw_request(
+    h: &Harness,
+    fields: &[(&str, &str)],
+) -> Vec<(u8, u8, u32, Vec<u8>)> {
     let authority = format!("upstream.test:{}", h.upstream.https.port());
     let mut tls = h
         .tls_tunnel_alpn(&authority, "upstream.test", &[b"h2"])
@@ -950,7 +953,7 @@ pub async fn h2_raw_request(h: &Harness, fields: &[(&str, &str)]) -> Vec<(u8, u8
 }
 
 /// Parses a capture stream (`capture.rxc`) into `(header, payload)` records.
-pub fn parse_capture(bytes: &[u8]) -> Vec<(Value, Vec<u8>)> {
+pub(crate) fn parse_capture(bytes: &[u8]) -> Vec<(Value, Vec<u8>)> {
     let mut out = Vec::new();
     let mut rest = bytes;
     while !rest.is_empty() {
@@ -966,7 +969,7 @@ pub fn parse_capture(bytes: &[u8]) -> Vec<(Value, Vec<u8>)> {
 }
 
 /// The records of one flow and direction, in order.
-pub fn capture_of<'a>(
+pub(crate) fn capture_of<'a>(
     recs: &'a [(Value, Vec<u8>)],
     flow: &str,
     dir: &str,
@@ -977,7 +980,7 @@ pub fn capture_of<'a>(
 }
 
 /// Concatenated `data` payloads.
-pub fn capture_body(recs: &[&(Value, Vec<u8>)]) -> Vec<u8> {
+pub(crate) fn capture_body(recs: &[&(Value, Vec<u8>)]) -> Vec<u8> {
     recs.iter()
         .filter(|(h, _)| h["kind"] == "data")
         .flat_map(|(_, p)| p.iter().copied())

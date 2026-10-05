@@ -74,7 +74,7 @@ impl Needs {
 
     /// Names of the watched values whose bits intersect `mask`, as written,
     /// for messages and `roxy check`.
-    pub fn watched_names(&self, mask: Reads) -> Vec<String> {
+    pub(crate) fn watched_names(&self, mask: Reads) -> Vec<String> {
         self.watched
             .iter()
             .filter(|(r, _)| r.intersects(mask))
