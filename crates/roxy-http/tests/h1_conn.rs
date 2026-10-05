@@ -851,6 +851,58 @@ async fn pipelined_bytes_during_bodiless_request_are_kept() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn client_close_while_response_body_waits_drops_the_body() {
+    let (mut client, mut c) = conn();
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    let _ = expect_request(&mut c).await;
+    let (mut tx, body) = Body::channel(1 << 20, None);
+    tx.send_data(Bytes::from_static(b"first")).await.unwrap();
+    let leave = async move {
+        let mut seen = Vec::new();
+        while !seen.ends_with(b"first\r\n") {
+            let mut b = [0u8; 256];
+            let n = client.read(&mut b).await.unwrap();
+            assert!(n > 0, "EOF before the first chunk");
+            seen.extend_from_slice(&b[..n]);
+        }
+    };
+    let (r, ()) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(5), c.respond(ok(body))),
+        leave
+    );
+    let r = r.expect("the departure is noticed before any timeout");
+    assert!(matches!(r, Err(WriteError::Io(_))), "{r:?}");
+    assert!(tx.is_closed(), "the response body is dropped");
+}
+
+#[tokio::test(start_paused = true)]
+async fn half_closed_client_gets_a_ready_body_in_full() {
+    // A small pipe, so the write blocks on the client while the read side
+    // has already seen its EOF.
+    let (mut client, server) = tokio::io::duplex(64);
+    let mut c = ServerConn::new(
+        server,
+        tunnel(),
+        Arc::new(Limits::default()),
+        Arc::new(HttpFlags::default()),
+    );
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    client.shutdown().await.unwrap();
+    let _ = expect_request(&mut c).await;
+    let big = vec![b'x'; 64 * 1024];
+    let respond = async move { c.respond(ok(Body::from_bytes(big))).await };
+    let (r, (_, body)) = tokio::join!(respond, read_response(&mut client, false));
+    r.unwrap();
+    assert_eq!(body.len(), 64 * 1024);
+}
+
+#[tokio::test(start_paused = true)]
 async fn body_idle_timeout() {
     let (mut client, mut c) = conn();
     client

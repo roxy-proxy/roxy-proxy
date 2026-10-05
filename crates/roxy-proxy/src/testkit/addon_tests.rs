@@ -669,30 +669,37 @@ mod service {
     /// stream), so the stream gives up its place on the connection.
     #[tokio::test]
     async fn a_client_leaving_mid_response_resets_a_quiet_stream() {
-        let kit = kit(RULES, vec![addon("s", "hold", AddonMode::Enforce, |_| {})]).await;
-        // Over h2 roxy drops the response body as soon as the client's
-        // connection goes.
-        let mut c = kit.tunnel("up.test", true).await;
-        let req = c
-            .request("GET", "/x", &[])
-            .body(roxy_http::Body::empty())
-            .unwrap();
-        let res = c.send(req).await.unwrap();
-        assert_eq!(res.status(), 200);
-        drop(res);
-        drop(c);
-        let service = kit.upstream.service();
-        let stream = service.until_opened(1).await[0]["stream"].as_u64().unwrap();
-        let reset = tokio::time::timeout(Duration::from_secs(2), async {
-            while service.resets().is_empty() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        assert!(reset.is_ok(), "the stream is reset once the client leaves");
-        let resets = service.resets();
-        assert_eq!(resets[0].0, u32::try_from(stream).unwrap(), "{resets:?}");
-        assert_eq!(resets[0].1, "the client went away");
+        for client in ["h1", "h1 tunnel", "h2"] {
+            let kit = kit(RULES, vec![addon("s", "hold", AddonMode::Enforce, |_| {})]).await;
+            let mut c = match client {
+                "h1" => kit.h1().await,
+                "h1 tunnel" => kit.tunnel("up.test", false).await,
+                _ => kit.tunnel("up.test", true).await,
+            };
+            let req = c
+                .request("GET", "/x", &[])
+                .body(roxy_http::Body::empty())
+                .unwrap();
+            let res = c.send(req).await.unwrap();
+            assert_eq!(res.status(), 200, "{client}");
+            drop(res);
+            drop(c);
+            let service = kit.upstream.service();
+            let stream = service.until_opened(1).await[0]["stream"].as_u64().unwrap();
+            let reset = tokio::time::timeout(Duration::from_secs(2), async {
+                while service.resets().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(
+                reset.is_ok(),
+                "{client}: the stream is reset once the client leaves"
+            );
+            let resets = service.resets();
+            assert_eq!(resets[0].0, u32::try_from(stream).unwrap(), "{resets:?}");
+            assert_eq!(resets[0].1, "the client went away", "{client}");
+        }
     }
 
     /// What a service sends on an observe stream is discarded and credited
