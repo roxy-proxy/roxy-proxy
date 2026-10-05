@@ -592,7 +592,8 @@ mod service {
 
     use super::{RULES, strs};
     use crate::addons::AddonMode;
-    use crate::addons::service::testing::{addon, kit, reload};
+    use crate::addons::service::ServiceSpec;
+    use crate::addons::service::testing::{addon, kit, only_when, reload};
     use crate::testkit::upstream::service::SLOW;
     use crate::testkit::{Answer, Kit, streaming_body};
     use roxy_http::Body;
@@ -785,21 +786,36 @@ mod service {
 
     /// An observer that holds its copy without reading it is lagging: once
     /// the copy is `max_observer_lag_bytes` behind it is cut and reported,
-    /// and the real body goes through whole.
+    /// and the real body goes through whole. The cut resets the observer's
+    /// stream and frees its place on the connection, which an enforce
+    /// layer on the same endpoint shares.
     #[tokio::test]
     async fn a_slow_observer_is_cut_and_reported_while_the_body_goes_through() {
-        // The service never reads (and so never grants credit): the copy
-        // stalls once the stream's window is spent.
+        // The service never grants credit: the copy stalls once the
+        // stream's window is spent.
         let kit = Kit::builder()
             .rules(RULES)
             .limits(|l| l.max_observer_lag_bytes = 64 * 1024)
             .start()
             .await;
+        let one_place = |s: &mut ServiceSpec| {
+            s.max_connections = 1;
+            s.max_streams = 1;
+        };
         reload(
             &kit,
             RULES,
             &[],
-            vec![addon("o", "stall", AddonMode::Observe, |_| {})],
+            vec![
+                only_when(
+                    addon("o", "hoard", AddonMode::Observe, one_place),
+                    r#"path == "/x""#,
+                ),
+                only_when(
+                    addon("e", "hoard", AddonMode::Enforce, one_place),
+                    r#"path == "/e""#,
+                ),
+            ],
         );
         let mut c = kit.h1().await;
         let (mut tx, body) = streaming_body();
@@ -820,6 +836,25 @@ mod service {
         assert_eq!(lagged[0]["layer"], "o", "{lagged:#?}");
         assert_eq!(lagged[0]["direction"], "request");
         assert_eq!(lagged[0]["reason"], "observer_behind");
+
+        let service = kit.upstream.service();
+        let observed = service.until_opened(1).await[0]["stream"].as_u64().unwrap();
+        let reset = tokio::time::timeout(Duration::from_secs(5), async {
+            while service.resets().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(reset.is_ok(), "the cut observer stream is reset");
+        assert_eq!(service.resets()[0].0, u32::try_from(observed).unwrap());
+
+        let enforced = tokio::time::timeout(
+            Duration::from_secs(2),
+            kit.h1().await.call("GET", "/e", &[], b""),
+        )
+        .await
+        .expect("the enforce stream opens at once: the observer's place is free");
+        assert_eq!(enforced.status, 200, "{enforced:?}");
     }
 
     /// A secret the rules inject is captured redacted, through the stack as

@@ -25,6 +25,7 @@ use http_body_util::BodyExt as _;
 use roxy_http::{Body, BodyError};
 use roxy_wasm::{HostError, LayerRequest, LayerResponse};
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use super::StackFlow;
 use crate::budget::{self, BufferLease};
@@ -75,6 +76,19 @@ impl Lag {
     }
 }
 
+/// Fires when a copy ends short: cut, or its real body gone before the
+/// end. Carried in the copy's extensions, since the error frame queues
+/// behind the copy's unread bytes, where a reader that is waiting on
+/// something else (credit, say) would not see it.
+#[derive(Clone)]
+pub(crate) struct CopyCut(CancellationToken);
+
+impl CopyCut {
+    pub(crate) async fn cancelled(&self) {
+        self.0.cancelled().await;
+    }
+}
+
 /// A frame of the copy, or how it ended.
 enum Msg {
     /// A frame and its share of the budget, which the observer's read
@@ -98,6 +112,16 @@ struct CopySender {
     known: Option<u64>,
     /// The budget the queued bytes are charged to.
     shared: Arc<Shared>,
+    cut: CancellationToken,
+    finished: bool,
+}
+
+impl Drop for CopySender {
+    fn drop(&mut self) {
+        if !self.finished && !self.complete() {
+            self.cut.cancel();
+        }
+    }
 }
 
 impl CopySender {
@@ -132,8 +156,9 @@ impl CopySender {
         self.known == Some(self.sent)
     }
 
-    fn finish(self) {
+    fn finish(mut self) {
         let _ = self.tx.send(Msg::End);
+        self.finished = true;
     }
 
     fn cut(self, e: BodyError) {
@@ -240,19 +265,20 @@ impl HttpBody for Tee {
 /// Splits `body` into the real body (unchanged, never delayed) and a
 /// best-effort copy buffered up to `lag_bytes`, charged to the buffer
 /// budget as it queues.
-fn tee(st: &StackFlow, body: Body, lag: Arc<Lag>) -> (Body, Body) {
+fn tee(st: &StackFlow, body: Body, lag: Arc<Lag>) -> (Body, Body, CopyCut) {
     let known = body.known_length();
     let (sender, copy) = copy(
         st.shared.clone(),
         st.snap.limits.max_observer_lag_bytes,
         known,
     );
+    let cut = CopyCut(sender.cut.clone());
     let real = Tee {
         inner: body,
         copy: Some(sender),
         lag,
     };
-    (Body::wrap_native(real, u64::MAX, known), copy)
+    (Body::wrap_native(real, u64::MAX, known), copy, cut)
 }
 
 /// A copy's two ends: the sender the real body feeds, and the body the
@@ -276,6 +302,8 @@ fn copy(shared: Arc<Shared>, lag_bytes: u64, known: Option<u64>) -> (CopySender,
         sent: 0,
         known,
         shared,
+        cut: CancellationToken::new(),
+        finished: false,
     };
     (sender, body)
 }
@@ -298,8 +326,9 @@ pub(crate) async fn observe(
 ) -> Result<LayerResponse, HostError> {
     let addon = st.snap.addons[index].clone();
     let (parts, body) = req.into_parts();
-    let (real_body, copy_body) = tee(&st, body, lag(&st, &addon.name, Dir::Request));
+    let (real_body, copy_body, cut) = tee(&st, body, lag(&st, &addon.name, Dir::Request));
     let mut copy_req = http::Request::new(copy_body);
+    copy_req.extensions_mut().insert(cut);
     *copy_req.method_mut() = parts.method.clone();
     *copy_req.uri_mut() = parts.uri.clone();
     *copy_req.headers_mut() = parts.headers.clone();
@@ -380,8 +409,9 @@ async fn forward(
     match real {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
-            let (real_body, copy_body) = tee(&st, body, lag(&st, name, Dir::Response));
+            let (real_body, copy_body, cut) = tee(&st, body, lag(&st, name, Dir::Response));
             let mut copy = http::Response::new(copy_body);
+            copy.extensions_mut().insert(cut);
             *copy.status_mut() = parts.status;
             *copy.headers_mut() = parts.headers.clone();
             let _ = tx.send(Ok(copy));

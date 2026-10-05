@@ -42,6 +42,7 @@ use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::time::Instant as TokioInstant;
 
+use super::tee::CopyCut;
 use super::{AddonMode, StackError, StackFlow};
 use crate::watch::Dir;
 
@@ -417,18 +418,41 @@ pub(super) async fn observe(
     let (parts, body) = req.into_parts();
     let s = stream.clone();
     let head = request_head(&parts, &body);
-    let request = tokio::spawn(async move { s.pump(Dir::Request, head, body).await });
+    let cut = parts.extensions.get::<CopyCut>().cloned();
+    let request = tokio::spawn(async move { pump_copy(&s, Dir::Request, head, body, cut).await });
     match next.response().await {
         Ok(res) => {
             let (parts, body) = res.into_parts();
-            stream
-                .pump(Dir::Response, response_head(&parts, &body), body)
-                .await;
+            let head = response_head(&parts, &body);
+            let cut = parts.extensions.get::<CopyCut>().cloned();
+            pump_copy(&stream, Dir::Response, head, body, cut).await;
         }
         Err(_) => stream.reset("the exchange ended"),
     }
     let _ = request.await;
     stream.finish()
+}
+
+/// Pumps an observer's copy, resetting the stream as soon as the copy is
+/// cut: the pump may be waiting for credit, not reading the copy.
+async fn pump_copy(
+    stream: &mux::Stream,
+    dir: Dir,
+    head: Out,
+    body: Body,
+    cut: Option<CopyCut>,
+) -> bool {
+    let Some(cut) = cut else {
+        return stream.pump(dir, head, body).await;
+    };
+    tokio::select! {
+        biased;
+        sent = stream.pump(dir, head, body) => sent,
+        () = cut.cancelled() => {
+            stream.reset("the observer's copy was cut");
+            false
+        }
+    }
 }
 
 async fn drain(body: Body) {
@@ -457,7 +481,7 @@ pub(crate) mod testing {
     const PORT: u16 = 9000;
 
     /// A service layer whose endpoint is the in-test service's `behaviour`
-    /// (`pass`, `hold`, `talk`, `flood`, `pause` or `stall`).
+    /// (`pass`, `hold`, `hoard`, `talk`, `flood`, `pause`, `slow` or `stall`).
     pub(crate) fn addon(
         name: &str,
         behaviour: &str,
@@ -490,6 +514,24 @@ pub(crate) mod testing {
             when: None,
             sample: None,
         })
+    }
+
+    /// `addon`, run only on requests `when` matches.
+    pub(crate) fn only_when(mut addon: Arc<AddonSpec>, when: &str) -> Arc<AddonSpec> {
+        let none = std::collections::HashSet::new();
+        let input = PolicyInput {
+            rules: &[],
+            metrics: &[],
+            secret_names: &none,
+            address_lists: &none,
+            default: DefaultDecision::Deny,
+        };
+        let a = Arc::get_mut(&mut addon).expect("a fresh addon");
+        a.when = Some(
+            roxy_rules::Condition::compile(&input, &format!("{}.when", a.name), when)
+                .unwrap_or_else(|d| panic!("when: {d:?}")),
+        );
+        addon
     }
 
     /// A kit running `rules` with the stack `addons`, outermost first.
