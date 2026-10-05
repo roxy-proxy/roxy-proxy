@@ -1,3 +1,4 @@
+import asyncio
 import json
 from typing import Any
 
@@ -6,7 +7,8 @@ import pytest
 from fake_roxy import FakeRoxy, stray_tasks
 from inspect_log import InspectLog
 from roxy_layer import RESPONSE
-from sidecar import Sidecar, load_sentinel
+import sidecar as sidecar_module
+from sidecar import PING, Sidecar, load_sentinel
 
 MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 
@@ -68,3 +70,31 @@ async def test_close_while_a_streamed_response_is_held_leaves_no_tasks(sidecar: 
     roxy.ws.close()
     await roxy.task
     assert stray_tasks() == set()
+
+
+REST = sse("message_stop", {"type": "message_stop"})
+
+
+async def test_pings_continue_while_the_sentinel_judges(sidecar: Sidecar, monkeypatch: Any) -> None:
+    monkeypatch.setattr(sidecar_module, "PING_EVERY", 0.05)
+    judging, verdict = asyncio.Event(), asyncio.Event()
+
+    async def slow_judge(*args: Any) -> None:
+        judging.set()
+        await verdict.wait()
+
+    monkeypatch.setattr(sidecar, "judge", slow_judge)
+    roxy = FakeRoxy(sidecar.handle)
+    await streamed_call(roxy)
+    roxy.ws.body(1, REST, RESPONSE)
+    roxy.ws.control(1, "response_end")
+    await asyncio.wait_for(judging.wait(), 2.0)
+    while not roxy.ws.sent.empty():
+        roxy.ws.sent.get_nowait()
+    for _ in range(3):
+        assert await roxy.ws.next_sent(timeout=1.0) == b"\x00\x00\x00\x01\x01" + PING
+    verdict.set()
+    while (m := await roxy.ws.next_sent()) == b"\x00\x00\x00\x01\x01" + PING:
+        pass
+    assert m == b"\x00\x00\x00\x01\x01" + REST
+    assert (await roxy.ws.next_sent())["type"] == "response_end"
