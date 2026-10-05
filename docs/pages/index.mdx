@@ -88,13 +88,6 @@ If you want a demo, run the [quickstart](/quickstart). It puts Claude Code behin
 
 If you want to deploy it, read [deployment](/deploy/overview). It covers containing a workload, the hardened container image and running without Docker.
 
-If you want to see a real policy before you commit, read the [use cases](#use-cases) below.
-
-## Use cases
-
-- [AI agents](/use-cases/ai-agents): allow the model APIs and source hosts an agent needs, inject provider keys at the boundary, cap uploads and rate-limit writes.
-- [CI jobs](/use-cases/ci): read-only access to the registries a build needs, no route anywhere else, a log of every fetch.
-
 ## What roxy is not
 
 roxy is not a transparent gateway. It decides what passes through it, and it can't stop traffic that never reaches it. To contain a workload, the network has to give it no route out except through roxy. [Containing a workload](/deploy/overview) gives the recipe.

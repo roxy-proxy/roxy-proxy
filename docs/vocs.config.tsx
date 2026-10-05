@@ -66,13 +66,6 @@ export default defineConfig({
     { text: "Quickstart", link: "/quickstart" },
     { text: "Principles and threat model", link: "/principles" },
     {
-      text: "Use cases",
-      items: [
-        { text: "AI agents", link: "/use-cases/ai-agents" },
-        { text: "CI jobs", link: "/use-cases/ci" },
-      ],
-    },
-    {
       text: "Configure policies",
       items: [
         { text: "How policies work", link: "/policies/overview" },
