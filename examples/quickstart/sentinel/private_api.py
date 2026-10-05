@@ -1,6 +1,7 @@
 """The private anthropic, inspect_ai and inspect_sentinel APIs the sidecar
-uses, all in one place. requirements.txt pins the versions they are known
-to work with; an upgrade that moves one fails here, at import."""
+uses, all in one place. requirements.txt pins what it can (inspect_ai
+follows inspect_sentinel's branch); a version that moves one of these
+fails here, at import."""
 
 from __future__ import annotations
 
