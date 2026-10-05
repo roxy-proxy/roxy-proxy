@@ -42,6 +42,9 @@ other layers or the rules. The handshake carries the endpoint's `headers`
       max_streams: 100                  # exchanges at once per connection (default 100)
 ```
 
+Both must be at least 1: `roxy check` refuses a zero, which would leave no
+room for any exchange and time every one of them out.
+
 **Pooling.** roxy opens a connection when it needs one and keeps it open
 while idle. A new exchange takes a stream on an open connection; roxy opens
 another connection only when every open one has `max_streams` streams. With
