@@ -189,9 +189,9 @@ impl Decoder {
                     return fail(close::PROTOCOL_ERROR, "frame after close");
                 }
                 let need = self.head_needed();
-                let k = (need - self.head_len).min(input.len());
-                self.head[self.head_len..self.head_len + k].copy_from_slice(&input[..k]);
-                self.head_len += k;
+                let k = need.saturating_sub(self.head_len).min(input.len());
+                self.head[self.head_len..][..k].copy_from_slice(&input[..k]);
+                self.head_len = self.head_len.saturating_add(k);
                 *input = &input[k..];
                 // The first two bytes decide the header length.
                 if self.head_len < self.head_needed() {
@@ -217,13 +217,14 @@ impl Decoder {
             buf.extend_from_slice(&input[..k]);
             if let Some(m) = f.mask {
                 let off = usize::try_from(f.read % 4).unwrap_or(0);
-                for (i, b) in buf[start..].iter_mut().enumerate() {
-                    *b ^= m[(off + i) % 4];
+                for (b, &key) in buf[start..].iter_mut().zip(m.iter().cycle().skip(off)) {
+                    *b ^= key;
                 }
             }
             *input = &input[k..];
-            f.read += len_u64(k);
-            f.remaining -= len_u64(k);
+            // `read` only matters modulo 4, which a wrap preserves.
+            f.read = f.read.wrapping_add(len_u64(k));
+            f.remaining = f.remaining.saturating_sub(len_u64(k));
             if f.remaining > 0 {
                 return Ok(None);
             }
@@ -234,6 +235,7 @@ impl Decoder {
     }
 
     /// Header bytes needed, as far as the bytes so far tell.
+    #[expect(clippy::arithmetic_side_effects, reason = "at most 2 + 8 + 4")]
     fn head_needed(&self) -> usize {
         if self.head_len < 2 {
             return 2;

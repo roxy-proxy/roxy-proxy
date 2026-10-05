@@ -315,12 +315,11 @@ impl Decoder {
         if buf.is_empty() {
             return Ok(0);
         }
-        let n = if self.stages.is_empty() {
-            self.passthrough_read(buf)
-        } else {
-            self.pull(self.stages.len() - 1, buf)?
+        let n = match self.stages.len().checked_sub(1) {
+            None => self.passthrough_read(buf),
+            Some(last) => self.pull(last, buf)?,
         };
-        self.produced += len_u64(n);
+        self.produced = self.produced.saturating_add(len_u64(n));
         if self.produced > self.limit {
             return Err(DecodeError::TooLarge { limit: self.limit });
         }
@@ -348,11 +347,11 @@ impl Decoder {
                 continue;
             }
             // Stage `i` needs more input.
-            if i == 0 {
+            let Some(upstream) = i.checked_sub(1) else {
                 return Ok(0);
-            }
+            };
             let mut tmp = vec![0u8; STAGE_CHUNK];
-            let n = self.pull(i - 1, &mut tmp)?;
+            let n = self.pull(upstream, &mut tmp)?;
             if n == 0 {
                 return Ok(0);
             }
@@ -402,7 +401,8 @@ impl Pending {
     }
 
     fn consume(&mut self, n: usize) {
-        self.start += n;
+        debug_assert!(n <= self.as_slice().len());
+        self.start = self.start.saturating_add(n).min(self.buf.len());
         if self.start == self.buf.len() {
             self.buf.clear();
             self.start = 0;
@@ -439,8 +439,14 @@ fn flate_step(
         .decompress(input, out, FlushDecompress::None)
         .map_err(|e| e.to_string())?;
     // Both deltas are bounded by the slice lengths.
-    let used = usize::try_from(z.total_in() - in0).unwrap_or(usize::MAX);
-    let made = usize::try_from(z.total_out() - out0).unwrap_or(usize::MAX);
+    let delta = |after: u64, before: u64| {
+        after
+            .checked_sub(before)
+            .and_then(|d| usize::try_from(d).ok())
+            .ok_or_else(|| "inflater counters went backwards".to_owned())
+    };
+    let used = delta(z.total_in(), in0)?;
+    let made = delta(z.total_out(), out0)?;
     Ok((used, made, status))
 }
 
@@ -487,12 +493,15 @@ fn gzip_header_len(b: &[u8]) -> Result<Option<usize>, String> {
     if flags & 0xe0 != 0 {
         return Err("reserved header flags set".to_owned());
     }
-    let mut i = 10;
+    // Optional fields only ever push the end further out, so an offset the
+    // buffer cannot reach is "not all there yet", never an error.
+    let mut i: usize = 10;
     if flags & 0x04 != 0 {
-        let Some(x) = b.get(i..i + 2) else {
+        let Some(x) = i.checked_add(2).and_then(|e| b.get(i..e)) else {
             return Ok(None);
         };
-        i += 2 + usize::from(u16::from_le_bytes([x[0], x[1]]));
+        let extra = usize::from(u16::from_le_bytes([x[0], x[1]]));
+        i = i.saturating_add(2).saturating_add(extra);
     }
     for flag in [0x08, 0x10] {
         if flags & flag != 0 {
@@ -502,11 +511,11 @@ fn gzip_header_len(b: &[u8]) -> Result<Option<usize>, String> {
             let Some(nul) = rest.iter().position(|&c| c == 0) else {
                 return Ok(None);
             };
-            i += nul + 1;
+            i = i.saturating_add(nul).saturating_add(1);
         }
     }
     if flags & 0x02 != 0 {
-        let Some(x) = b.get(i..i + 2) else {
+        let Some(x) = i.checked_add(2).and_then(|e| b.get(i..e)) else {
             return Ok(None);
         };
         let mut crc = Crc::new();
@@ -514,7 +523,7 @@ fn gzip_header_len(b: &[u8]) -> Result<Option<usize>, String> {
         if crc.sum() & 0xffff != u32::from(u16::from_le_bytes([x[0], x[1]])) {
             return Err("header checksum mismatch".to_owned());
         }
-        i += 2;
+        i = i.saturating_add(2);
     }
     Ok((b.len() >= i).then_some(i))
 }
@@ -699,6 +708,7 @@ impl Zstd {
 
 /// The length of the zstd frame header at the front of `b` (RFC 8878
 /// §3.1.1.1), `None` if fewer than 5 bytes are there.
+#[expect(clippy::arithmetic_side_effects, reason = "every term is at most 8")]
 fn zstd_header_len(b: &[u8]) -> Option<usize> {
     let fhd = *b.get(4)?;
     let single_segment = fhd & 0x20 != 0;
@@ -726,7 +736,10 @@ fn zstd_block(b: &[u8]) -> Result<Option<(usize, bool)>, String> {
         1 => 1,
         _ => return Err("reserved block type".to_owned()),
     };
-    Ok(Some((3 + content, last)))
+    let len = content
+        .checked_add(3)
+        .ok_or_else(|| "block too large".to_owned())?;
+    Ok(Some((len, last)))
 }
 
 impl Stage for Zstd {
@@ -768,7 +781,7 @@ impl Stage for Zstd {
             }
             ZState::Skip(left) => {
                 let n = usize::try_from(left).unwrap_or(usize::MAX).min(input.len());
-                self.state = ZState::Skip(left - len_u64(n));
+                self.state = ZState::Skip(left.saturating_sub(len_u64(n)));
                 Ok((n, 0))
             }
             ZState::Blocks { checksum } => {
@@ -782,7 +795,9 @@ impl Stage for Zstd {
                     return Ok((0, 0));
                 };
                 if last && checksum {
-                    len += 4;
+                    len = len
+                        .checked_add(4)
+                        .ok_or_else(|| "block too large".to_owned())?;
                 }
                 let Some(mut block) = input.get(..len) else {
                     return Ok((0, 0));
@@ -793,7 +808,8 @@ impl Stage for Zstd {
                 if last {
                     self.state = ZState::Drain { checksum };
                 }
-                Ok((len - block.len(), 0))
+                // `block` is what the decoder left of `input[..len]`.
+                Ok((len.saturating_sub(block.len()), 0))
             }
             ZState::Drain { checksum } => {
                 let n = self.dec.read(out).map_err(|e| e.to_string())?;
@@ -860,6 +876,10 @@ mod tests {
 
     const ALL: [Coding; 4] = [Coding::Gzip, Coding::Deflate, Coding::Br, Coding::Zstd];
 
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "20_000 * 7919 fits in a u32"
+    )]
     fn sample() -> Vec<u8> {
         let mut v = Vec::new();
         for i in 0..20_000u32 {

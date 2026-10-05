@@ -11,7 +11,7 @@ use serde::de::{self, Deserializer, SeqAccess, Visitor};
 
 /// Parse a size such as `64kb`, `1 GiB`, `512` (bytes). Units are
 /// case-insensitive and **1024-based** (`kb` == `kib`).
-pub fn parse_size(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     let (digits, unit) = s.split_at(split);
@@ -41,7 +41,7 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
 
 /// `deserialize_with` for [`ByteSize`] fields: accepts an integer number of
 /// bytes or a string with a 1024-based unit.
-pub fn size<'de, D: Deserializer<'de>>(d: D) -> Result<ByteSize, D::Error> {
+pub(crate) fn size<'de, D: Deserializer<'de>>(d: D) -> Result<ByteSize, D::Error> {
     struct V;
     impl Visitor<'_> for V {
         type Value = ByteSize;
@@ -65,7 +65,7 @@ pub fn size<'de, D: Deserializer<'de>>(d: D) -> Result<ByteSize, D::Error> {
 
 /// `deserialize_with` for optional [`ByteSize`] fields (use with
 /// `#[serde(default)]`).
-pub fn opt_size<'de, D: Deserializer<'de>>(d: D) -> Result<Option<ByteSize>, D::Error> {
+pub(crate) fn opt_size<'de, D: Deserializer<'de>>(d: D) -> Result<Option<ByteSize>, D::Error> {
     size(d).map(Some)
 }
 
@@ -73,7 +73,7 @@ pub fn opt_size<'de, D: Deserializer<'de>>(d: D) -> Result<Option<ByteSize>, D::
 
 /// Parse a count such as `100000` or `100_000_000` (underscores as digit
 /// separators, as in the documented examples).
-pub fn parse_count(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_count(s: &str) -> Result<u64, String> {
     let t = s.trim();
     if t.is_empty()
         || t.starts_with('_')
@@ -91,7 +91,7 @@ pub fn parse_count(s: &str) -> Result<u64, String> {
 
 /// `deserialize_with` for optional counts: an integer or a string with `_`
 /// separators (use with `#[serde(default)]`).
-pub fn opt_count<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+pub(crate) fn opt_count<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
     struct V;
     impl Visitor<'_> for V {
         type Value = u64;

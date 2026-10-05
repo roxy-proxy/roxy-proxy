@@ -19,6 +19,9 @@
 
 // Casts go through `From` / `TryFrom`, so a narrowing one cannot slip in.
 #![warn(clippy::as_conversions)]
+// Length and offset arithmetic on untrusted input is checked, so a broken
+// invariant fails the message instead of wrapping.
+#![warn(clippy::arithmetic_side_effects)]
 
 use std::net::IpAddr;
 
@@ -150,20 +153,28 @@ pub fn parse(msg: &[u8]) -> Parsed {
     if opcode != OPCODE_QUERY {
         return err(Rcode::NotImp);
     }
-    let count = |i: usize| u16::from_be_bytes([head[i], head[i + 1]]);
-    let (qd, an, ns, ar) = (count(4), count(6), count(8), count(10));
+    let mut counts = head[4..]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_be_bytes(*c));
+    let mut count = || counts.next().unwrap_or(u16::MAX);
+    let (qd, an, ns, ar) = (count(), count(), count(), count());
     if qd != 1 || an != 0 || ns != 0 || ar > 1 {
         return err(Rcode::FormErr);
     }
-    let Some((name, qend)) = read_name(msg, HEADER) else {
+    let Some((name, name_end)) = read_name(msg, HEADER) else {
         return err(Rcode::FormErr);
     };
-    let Some(fixed) = msg.get(qend..qend + 4) else {
+    let Some(qend) = name_end.checked_add(4) else {
+        return err(Rcode::FormErr);
+    };
+    let Some(fixed) = msg.get(name_end..qend) else {
         return err(Rcode::FormErr);
     };
     let qtype = u16::from_be_bytes([fixed[0], fixed[1]]);
     let qclass = u16::from_be_bytes([fixed[2], fixed[3]]);
-    let mut end = qend + 4;
+    let mut end = qend;
     if ar == 1 {
         match read_opt(msg, end) {
             Some(e) => end = e,
@@ -184,7 +195,7 @@ pub fn parse(msg: &[u8]) -> Parsed {
         rd,
         name,
         qtype,
-        question: msg[HEADER..qend + 4].to_vec(),
+        question: msg[HEADER..qend].to_vec(),
     })
 }
 
@@ -202,13 +213,14 @@ fn read_name(msg: &[u8], mut at: usize) -> Option<(Option<String>, usize)> {
         if len > MAX_LABEL {
             return None;
         }
-        at += 1;
+        at = at.checked_add(1)?;
         if len == 0 {
             break;
         }
-        let label = msg.get(at..at + len)?;
-        at += len;
-        if at - start >= MAX_WIRE_NAME {
+        let end = at.checked_add(len)?;
+        let label = msg.get(at..end)?;
+        at = end;
+        if at.checked_sub(start)? >= MAX_WIRE_NAME {
             return None;
         }
         if !name.is_empty() {
@@ -228,14 +240,14 @@ fn read_name(msg: &[u8], mut at: usize) -> Option<(Option<String>, usize)> {
 
 /// Reads an EDNS OPT record at `at` (RFC 6891 §6.1.2); returns its end.
 fn read_opt(msg: &[u8], at: usize) -> Option<usize> {
-    let fixed = msg.get(at..at + 11)?;
+    let fixed = msg.get(at..at.checked_add(11)?)?;
     // Owner name is the root; type OPT. Class (UDP size), TTL (extended
     // rcode, version, flags) and the options are not used.
     if fixed[0] != 0 || u16::from_be_bytes([fixed[1], fixed[2]]) != TYPE_OPT {
         return None;
     }
     let rdlen = usize::from(u16::from_be_bytes([fixed[9], fixed[10]]));
-    let end = at + 11 + rdlen;
+    let end = at.checked_add(11)?.checked_add(rdlen)?;
     (end <= msg.len()).then_some(end)
 }
 
@@ -274,11 +286,13 @@ pub fn answer(q: &Query, addrs: &[IpAddr], ttl: u32) -> Vec<u8> {
         .collect();
     // Owner (a pointer to the question name), type, class, TTL, length.
     let fixed = 2 + 2 + 2 + 4 + 2;
-    let room = MAX_UDP_PAYLOAD - HEADER - q.question.len();
+    let room = MAX_UDP_PAYLOAD
+        .saturating_sub(HEADER)
+        .saturating_sub(q.question.len());
     let fits = rdata
         .iter()
-        .scan(0, |used, r| {
-            *used += fixed + r.len();
+        .scan(0usize, |used, r| {
+            *used = used.saturating_add(fixed).saturating_add(r.len());
             Some(*used)
         })
         .take_while(|used| *used <= room)

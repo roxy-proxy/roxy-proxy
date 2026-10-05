@@ -97,31 +97,16 @@ pub enum HeadScan {
 /// CR and bare LF as soon as they are seen, and enforcing the head and
 /// request-line size limits on partial input.
 pub fn scan_head(buf: &[u8], from: usize, limits: &Limits) -> Result<HeadScan, ParseError> {
-    let mut i = from;
-    while i < buf.len() {
-        match buf[i] {
-            b'\n' => {
-                if i == 0 || buf[i - 1] != b'\r' {
-                    return reject(Reason::BareLf, format!("bare LF at offset {i}"));
-                }
-                if i >= 3 && &buf[i - 3..=i] == b"\r\n\r\n" {
-                    let end = i + 1;
-                    if end > limits.max_header_bytes {
-                        return reject(Reason::HeadTooLarge, format!("head is {end} bytes"));
-                    }
-                    return Ok(HeadScan::Complete(end));
-                }
+    match scan_section(buf, from) {
+        Err(Bare::Lf(i)) => return reject(Reason::BareLf, format!("bare LF at offset {i}")),
+        Err(Bare::Cr(i)) => return reject(Reason::BareCr, format!("bare CR at offset {i}")),
+        Ok(Some(end)) => {
+            if end > limits.max_header_bytes {
+                return reject(Reason::HeadTooLarge, format!("head is {end} bytes"));
             }
-            b'\r' => {
-                if let Some(&next) = buf.get(i + 1)
-                    && next != b'\n'
-                {
-                    return reject(Reason::BareCr, format!("bare CR at offset {i}"));
-                }
-            }
-            _ => {}
+            return Ok(HeadScan::Complete(end));
         }
-        i += 1;
+        Ok(None) => {}
     }
     if buf.len() > limits.max_header_bytes {
         return reject(
@@ -137,6 +122,39 @@ pub fn scan_head(buf: &[u8], from: usize, limits: &Limits) -> Result<HeadScan, P
     Ok(HeadScan::Partial(buf.len().saturating_sub(1)))
 }
 
+/// A line ending the head and trailer scanners refuse, with its offset.
+pub(crate) enum Bare {
+    /// A CR not followed by LF.
+    Cr(usize),
+    /// A LF not preceded by CR.
+    Lf(usize),
+}
+
+/// Looks from `from` for the CRLF CRLF that ends a head or trailer
+/// section: the offset just past it, or `None` while it has not arrived.
+/// Any bare CR or LF before it is a fault. A CR as the last byte is left
+/// undecided until its successor arrives.
+pub(crate) fn scan_section(buf: &[u8], from: usize) -> Result<Option<usize>, Bare> {
+    for (i, &b) in buf.iter().enumerate().skip(from) {
+        match b {
+            b'\n' => {
+                if i.checked_sub(1).is_none_or(|p| buf[p] != b'\r') {
+                    return Err(Bare::Lf(i));
+                }
+                if i.checked_sub(3).is_some_and(|s| &buf[s..=i] == b"\r\n\r\n") {
+                    // `i` indexes `buf`, so the end offset fits.
+                    return Ok(Some(i.saturating_add(1)));
+                }
+            }
+            b'\r' if buf[i..].get(1).is_some_and(|&next| next != b'\n') => {
+                return Err(Bare::Cr(i));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
 /// Splits a head (ending in CRLF CRLF, already scanned) into lines.
 fn lines(head: &[u8]) -> Vec<&[u8]> {
     let body = head.strip_suffix(b"\r\n\r\n").unwrap_or(head);
@@ -145,7 +163,7 @@ fn lines(head: &[u8]) -> Vec<&[u8]> {
     loop {
         if let Some(i) = rest.windows(2).position(|w| w == b"\r\n") {
             out.push(&rest[..i]);
-            rest = &rest[i + 2..];
+            rest = &rest[i..][2..];
         } else {
             out.push(rest);
             return out;
@@ -247,7 +265,8 @@ fn check_raw_head(head: &[u8], limits: &Limits, flags: &HttpFlags) -> Result<Ver
 /// `(name, OWS-trimmed value)` pairs.
 #[allow(clippy::type_complexity)]
 fn tokenise(head: &[u8]) -> Result<(Method, &[u8], Vec<(&[u8], &[u8])>), ParseError> {
-    let field_count = lines(head).len() - 1;
+    // The request line is always there.
+    let field_count = lines(head).len().saturating_sub(1);
     let mut storage = vec![httparse::EMPTY_HEADER; field_count];
     let mut req = httparse::Request::new(&mut storage);
     match req.parse(head) {

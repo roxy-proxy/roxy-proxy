@@ -7,18 +7,18 @@ use std::fmt::Write as _;
 
 use roxy_rules::{DefaultDecision, Diagnostic, MetricConfig, Policy, PolicyInput, RuleConfig};
 
-pub fn secret_names() -> HashSet<String> {
+pub(crate) fn secret_names() -> HashSet<String> {
     ["openai", "gh"].into_iter().map(String::from).collect()
 }
 
 /// Deserialise and compile. Structural (serde) errors are returned as a
 /// single message, compile diagnostics as their rendered form.
-pub fn try_compile(metrics_yaml: &str, rules_yaml: &str) -> Result<Policy, Vec<String>> {
+pub(crate) fn try_compile(metrics_yaml: &str, rules_yaml: &str) -> Result<Policy, Vec<String>> {
     try_compile_with(metrics_yaml, rules_yaml, DefaultDecision::Deny)
 }
 
 /// [`try_compile`] with an explicit `default:`.
-pub fn try_compile_with(
+pub(crate) fn try_compile_with(
     metrics_yaml: &str,
     rules_yaml: &str,
     default: DefaultDecision,
@@ -46,7 +46,7 @@ pub fn try_compile_with(
     .map_err(|ds| ds.iter().map(render).collect())
 }
 
-pub fn render(d: &Diagnostic) -> String {
+pub(crate) fn render(d: &Diagnostic) -> String {
     let mut s = d.to_string();
     if let Some(rule) = &d.rule {
         let _ = write!(s, "  [rule {rule}]");
@@ -59,11 +59,11 @@ pub fn render(d: &Diagnostic) -> String {
     s
 }
 
-pub fn compile(metrics_yaml: &str, rules_yaml: &str) -> Policy {
+pub(crate) fn compile(metrics_yaml: &str, rules_yaml: &str) -> Policy {
     try_compile(metrics_yaml, rules_yaml).unwrap_or_else(|d| panic!("{}", d.join("\n")))
 }
 
-pub const METRICS: &str = r"
+pub(crate) const METRICS: &str = r"
 - id: writes
   count: requests
   where: method in [POST, PUT, PATCH, DELETE]

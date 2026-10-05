@@ -90,11 +90,11 @@ pub fn from_layer_request(
     }
     let (path, query) = url::parse_origin_form(pq.as_bytes())?;
 
-    let head_bytes: usize = parts
-        .headers
-        .iter()
-        .map(|(n, v)| n.as_str().len() + v.len() + 4)
-        .sum();
+    let head_bytes = parts.headers.iter().fold(0usize, |acc, (n, v)| {
+        acc.saturating_add(n.as_str().len())
+            .saturating_add(v.len())
+            .saturating_add(4)
+    });
     if head_bytes > limits.max_header_bytes {
         return reject(Reason::HeadTooLarge, format!("head is {head_bytes} bytes"));
     }

@@ -77,10 +77,11 @@ fn target_from_uri(
 /// `limits.h2_max_header_list_bytes`, with the field count checked against
 /// `limits.max_headers`.
 fn header_list_size(headers: &http::HeaderMap, limits: &Limits) -> Result<usize, ParseError> {
-    let list_size: usize = headers
-        .iter()
-        .map(|(n, v)| n.as_str().len() + v.len() + FIELD_OVERHEAD)
-        .sum();
+    let list_size = headers.iter().fold(0usize, |acc, (n, v)| {
+        acc.saturating_add(n.as_str().len())
+            .saturating_add(v.len())
+            .saturating_add(FIELD_OVERHEAD)
+    });
     if list_size > limits.h2_max_header_list_bytes {
         return reject(
             Reason::HeadTooLarge,

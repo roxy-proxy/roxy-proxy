@@ -70,6 +70,15 @@ pub const DRAIN_LIMIT: u64 = 1024 * 1024;
 /// request bytes unread, roxy half-closes and discards input for at most
 /// this long so the client sees the response rather than a reset.
 const LINGER: Duration = Duration::from_secs(1);
+
+/// `after` from now.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "timeouts come from configuration; overflowing an Instant takes centuries"
+)]
+fn deadline(after: Duration) -> Instant {
+    Instant::now() + after
+}
 const LINGER_BYTES: usize = 1024 * 1024;
 
 /// What the client sent.
@@ -244,7 +253,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
                         return Ok(());
                     }
                     (None, Pending::Data(b)) => {
-                        feed.drained += len_u64(b.len());
+                        feed.drained = feed.drained.saturating_add(len_u64(b.len()));
                         if feed.drained > DRAIN_LIMIT {
                             tracing::debug!("drain limit reached; connection will close");
                             self.feed = None;
@@ -268,7 +277,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
                         .unwrap_or(usize::MAX)
                         .min(self.buf.len())
                         .min(READ_CHUNK);
-                    *rem -= len_u64(n);
+                    *rem = rem.saturating_sub(len_u64(n));
                     Decoded::Data(self.buf.split_to(n).freeze())
                 }
                 BodyDecoder::Chunked(d) => d.decode(&mut self.buf)?,
@@ -334,7 +343,7 @@ fn response_head(
     close: bool,
     upgrade: Option<&str>,
 ) -> BytesMut {
-    let mut out = BytesMut::with_capacity(256 + headers.wire_len());
+    let mut out = BytesMut::with_capacity(headers.wire_len().saturating_add(256));
     out.extend_from_slice(b"HTTP/1.1 ");
     out.extend_from_slice(status.as_str().as_bytes());
     out.extend_from_slice(b" ");
@@ -430,7 +439,7 @@ async fn write_message<W: AsyncWrite + Unpin>(
         if data.is_empty() {
             continue;
         }
-        sent += len_u64(data.len());
+        sent = sent.saturating_add(len_u64(data.len()));
         match framing {
             OutFraming::Length(n) => {
                 if sent > n {
@@ -530,7 +539,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         // The head has started once anything is buffered (pipelined bytes
         // count), so the header deadline applies from the outset.
         let started = self.served == 0 || !self.r.buf.is_empty();
-        let mut deadline = started.then(|| Instant::now() + limits.header_timeout);
+        let mut deadline = started.then(|| deadline(limits.header_timeout));
         let mut scan_from = 0;
         loop {
             // RFC 9112 §2.2: ignore empty lines before the request line.
@@ -575,7 +584,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
                 };
             }
             if deadline.is_none() {
-                deadline = Some(Instant::now() + limits.header_timeout);
+                deadline = Some(self::deadline(limits.header_timeout));
             }
         }
     }
@@ -615,7 +624,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
                 return Err(e);
             }
         };
-        self.served += 1;
+        self.served = self.served.saturating_add(1);
         match parsed {
             Head::Connect {
                 authority,
@@ -860,12 +869,12 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         if self.r.abandoned || self.r.feed.is_some() || !self.r.buf.is_empty() {
             self.r.feed = None;
             self.r.buf.clear();
-            let deadline = Instant::now() + LINGER;
-            let mut discarded = 0;
+            let deadline = deadline(LINGER);
+            let mut discarded = 0usize;
             let mut scratch = vec![0u8; READ_CHUNK];
             while discarded < LINGER_BYTES {
                 match timeout_at(deadline, self.r.rd.read(&mut scratch)).await {
-                    Ok(Ok(n)) if n > 0 => discarded += n,
+                    Ok(Ok(n)) if n > 0 => discarded = discarded.saturating_add(n),
                     _ => break,
                 }
             }

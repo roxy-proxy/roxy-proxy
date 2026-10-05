@@ -12,9 +12,14 @@ pub(crate) fn parse_content_length(v: &[u8]) -> Result<u64, ParseError> {
             format!("content-length {:?}", String::from_utf8_lossy(v)),
         );
     }
-    // 19 digits always fit in a u64.
-    Ok(v.iter()
-        .fold(0u64, |acc, &d| acc * 10 + u64::from(d - b'0')))
+    // 19 digits always fit in a u64, so this cannot fail.
+    str::from_utf8(v)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map_or_else(
+            || reject(Reason::BadContentLength, "content-length out of range"),
+            Ok,
+        )
 }
 
 /// How a request body arriving as a stream of frames (h2 DATA, a layer's

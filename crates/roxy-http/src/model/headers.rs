@@ -125,7 +125,7 @@ pub(crate) fn parse_field_line(
         return reject(Reason::WhitespaceBeforeColon, "whitespace before colon");
     }
     check_name(name)?;
-    let value = trim_ows(&line[colon + 1..]);
+    let value = trim_ows(&line[colon..][1..]);
     check_value(value, allow_obs_text)?;
     Ok((name, value))
 }
@@ -287,17 +287,21 @@ impl Headers {
     /// name, rejects reserved names, CR/LF/NUL/controls and non-ASCII.
     pub fn insert(&mut self, name: &str, value: &str) -> Result<(), ParseError> {
         let (n, v) = Self::checked(name, value)?;
-        if let Some(pos) = self.entries.iter().position(|(e, _)| *e == n) {
-            self.entries[pos].1 = v;
-            let mut i = pos + 1;
-            while i < self.entries.len() {
-                if self.entries[i].0 == n {
-                    self.entries.remove(i);
-                } else {
-                    i += 1;
-                }
+        let mut v = Some(v);
+        // The first occurrence takes the value; the others go.
+        self.entries.retain_mut(|(e, slot)| {
+            if *e != n {
+                return true;
             }
-        } else {
+            match v.take() {
+                Some(new) => {
+                    *slot = new;
+                    true
+                }
+                None => false,
+            }
+        });
+        if let Some(v) = v {
             self.entries.push((n, v));
         }
         Ok(())
@@ -316,7 +320,7 @@ impl Headers {
         let before = self.entries.len();
         self.entries
             .retain(|(n, _)| !n.as_str().eq_ignore_ascii_case(name));
-        before - self.entries.len()
+        before.saturating_sub(self.entries.len())
     }
 
     /// Fields in insertion order.
@@ -336,10 +340,11 @@ impl Headers {
 
     /// Approximate h1 wire size (`name: value\r\n` per field).
     pub fn wire_len(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|(n, v)| n.as_str().len() + v.len() + 4)
-            .sum()
+        self.entries.iter().fold(0usize, |acc, (n, v)| {
+            acc.saturating_add(n.as_str().len())
+                .saturating_add(v.len())
+                .saturating_add(4)
+        })
     }
 
     /// Copies into an `http::HeaderMap` (repeated names appended in order).
