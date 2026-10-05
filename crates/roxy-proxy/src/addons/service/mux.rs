@@ -859,19 +859,7 @@ async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodySender, dir:
             match sent {
                 Ok(()) => stream.grant(dir, n),
                 Err(BodyError::Closed | BodyError::Stopped) => {
-                    if dir == Dir::Request {
-                        // A deny below, say: the rest is read and dropped,
-                        // and the service still owes the response.
-                        let rest = {
-                            let mut q = lock(&inbox.q);
-                            q.dropped = true;
-                            q.buf.split().len() as u64
-                        };
-                        stream.grant(dir, n + rest);
-                    } else {
-                        stream.reset("the client went away");
-                    }
-                    return;
+                    return consumer_gone(&stream, &inbox, dir, n);
                 }
                 // More than declared, or than the limit.
                 Err(e) => return stream.fail(ServiceError::Protocol(e.to_string()), Reset::Send),
@@ -886,10 +874,29 @@ async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodySender, dir:
             }
             return;
         }
+        // A consumer that leaves is noticed here too, not only on the next
+        // byte: a quiet service may send none for a long time.
         tokio::select! {
             () = inbox.ready.notified() => {}
             () = inbox.abort.cancelled() => {}
+            () = tx.closed() => return consumer_gone(&stream, &inbox, dir, 0),
         }
+    }
+}
+
+/// The consumer of the `dir` body went away, `n` bytes it was sent unread.
+fn consumer_gone(stream: &Stream, inbox: &Inbox, dir: Dir, n: u64) {
+    if dir == Dir::Request {
+        // A deny below, say: the rest is read and dropped, and the service
+        // still owes the response.
+        let rest = {
+            let mut q = lock(&inbox.q);
+            q.dropped = true;
+            q.buf.split().len() as u64
+        };
+        stream.grant(dir, n + rest);
+    } else {
+        stream.reset("the client went away");
     }
 }
 

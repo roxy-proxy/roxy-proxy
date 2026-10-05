@@ -457,7 +457,7 @@ pub(crate) mod testing {
     const PORT: u16 = 9000;
 
     /// A service layer whose endpoint is the in-test service's `behaviour`
-    /// (`pass`, `talk`, `flood`, `pause` or `stall`).
+    /// (`pass`, `hold`, `talk`, `flood`, `pause` or `stall`).
     pub(crate) fn addon(
         name: &str,
         behaviour: &str,

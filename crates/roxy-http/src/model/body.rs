@@ -460,6 +460,11 @@ impl BodySender {
         self.tx.is_closed()
     }
 
+    /// Waits until the consumer has dropped the body. Cancel-safe.
+    pub async fn closed(&self) {
+        self.tx.closed().await;
+    }
+
     /// Waits until a frame can be pushed without blocking. Cancel-safe.
     pub async fn ready(&mut self) -> Result<(), BodyError> {
         if self.failed {
