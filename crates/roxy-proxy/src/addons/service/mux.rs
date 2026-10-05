@@ -33,7 +33,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_util::sync::CancellationToken;
 
-use super::super::{AddonMode, StackError, StackFlow, endpoint};
+use super::super::{AddonMode, EndpointSpec, StackError, StackFlow, endpoint};
 use super::{First, In, Out, ServiceError, ServiceSpec};
 use crate::addr::PrivateAddrs;
 use crate::flowlog::FlowEvent;
@@ -48,6 +48,11 @@ pub(super) const WINDOW: u64 = 256 * 1024;
 
 /// Largest control message or body frame accepted from a service.
 const MAX_FRAME: usize = 16 * 1024 * 1024;
+
+/// Bytes discarded from an observe stream before they are credited back
+/// in one message, so the credit queue holds a few messages per stream
+/// however small the service's frames.
+const OBSERVE_GRANT: u64 = WINDOW / 4;
 
 /// Largest body frame roxy sends, so streams share the socket fairly.
 const MAX_BODY_FRAME: usize = 64 * 1024;
@@ -105,6 +110,8 @@ struct Pool {
     retired: AtomicBool,
 }
 
+/// One connection of a pool. It counts against `max_connections` for as
+/// long as anything holds a place on it, closed or not.
 struct Entry {
     link: Arc<OnceCell<Arc<Link>>>,
     /// Streams on it, and exchanges waiting for it to connect.
@@ -133,10 +140,12 @@ impl Drop for Reservation {
         {
             let e = &mut entries[i];
             e.reserved = e.reserved.saturating_sub(1);
-            // Never connected, and nobody is waiting on it any more; or
-            // idle in a retired pool.
+            // Nobody is left on it, and it will take no one new: it never
+            // connected, it closed, or its pool is retired.
             if e.reserved == 0
-                && (e.link.get().is_none() || self.pool.retired.load(Ordering::SeqCst))
+                && (e.link.get().is_none()
+                    || e.closed()
+                    || self.pool.retired.load(Ordering::SeqCst))
             {
                 entries.remove(i);
             }
@@ -156,21 +165,23 @@ impl Pool {
             freed.as_mut().enable();
             {
                 let mut entries = lock(&self.entries);
-                entries.retain(|e| !e.closed());
-                let pick =
-                    if let Some(e) = entries.iter_mut().find(|e| e.reserved < self.max_streams) {
-                        e.reserved += 1;
-                        Some(e.link.clone())
-                    } else if entries.len() < self.max_connections {
-                        let link = Arc::new(OnceCell::new());
-                        entries.push(Entry {
-                            link: link.clone(),
-                            reserved: 1,
-                        });
-                        Some(link)
-                    } else {
-                        None
-                    };
+                entries.retain(|e| e.reserved > 0 || !e.closed());
+                let pick = if let Some(e) = entries
+                    .iter_mut()
+                    .find(|e| !e.closed() && e.reserved < self.max_streams)
+                {
+                    e.reserved += 1;
+                    Some(e.link.clone())
+                } else if entries.len() < self.max_connections {
+                    let link = Arc::new(OnceCell::new());
+                    entries.push(Entry {
+                        link: link.clone(),
+                        reserved: 1,
+                    });
+                    Some(link)
+                } else {
+                    None
+                };
                 if let Some(link) = pick {
                     return Reservation {
                         pool: self.clone(),
@@ -264,14 +275,9 @@ pub(super) struct Stream {
     index: usize,
     mode: AddonMode,
     state: Mutex<StreamState>,
-    /// What roxy may still send: granted by the service.
-    credit: Mutex<u64>,
     more_credit: Notify,
+    /// Wakes whatever is sending or waiting on the stream once it ended.
     ended: CancellationToken,
-    ending: AtomicBool,
-    /// Why an observe stream failed, for its driver to log.
-    observe_error: Mutex<Option<ServiceError>>,
-    slot: Mutex<Option<Reservation>>,
 }
 
 #[derive(Default)]
@@ -281,12 +287,36 @@ struct StreamState {
     feeding: Option<Feeding>,
     /// Body bytes received and not yet credited back.
     unacked: u64,
+    /// Observe mode: bytes discarded since the last credit went back.
+    discarded: u64,
+    /// What roxy may still send: granted by the service.
+    credit: u64,
+    /// Why an observe stream failed, for its driver to log.
+    observe_error: Option<ServiceError>,
+    slot: Option<Reservation>,
+    /// Settled: nothing more is sent or delivered on it.
+    ended: bool,
 }
 
 impl StreamState {
     fn waiting(&self) -> bool {
         self.feeding.is_some() || self.first.is_some() || self.second.is_some()
     }
+}
+
+/// How a stream ends.
+enum End<'a> {
+    /// Nothing to tell anyone: the service's last message arrived, an
+    /// observe stream sent all it had, or an `open` was given up before
+    /// its message went.
+    Quiet,
+    /// The service failed it. `reset` tells the service, when it has not
+    /// already closed or reset the stream itself.
+    Failed { e: ServiceError, reset: Reset },
+    /// roxy gave up on it (the client went away, a missed deadline, an
+    /// upgrade): the service is told, whoever is waiting gets `why`, and
+    /// nothing is logged as the service's fault.
+    Abandoned(&'a str),
 }
 
 /// A body being fed from the stream.
@@ -334,49 +364,59 @@ impl Stream {
         self.st.snap.addons[self.index].name.clone()
     }
 
-    /// Ends the stream, once: no more is sent on it, its connection place
-    /// is released, and the reader forgets it. True if this call ended it.
-    fn end(&self) -> bool {
-        if self.ending.swap(true, Ordering::SeqCst) {
-            return false;
-        }
+    /// Ends the stream, once: nothing more goes on it, its place on the
+    /// connection is released, the reader forgets it, and whoever was
+    /// waiting on it (a pending answer, the body being fed) learns how it
+    /// ended.
+    fn settle(&self, end: End<'_>) {
+        let (feeding, first, second, slot) = {
+            let mut s = lock(&self.state);
+            if s.ended {
+                return;
+            }
+            s.ended = true;
+            if let End::Failed { e, .. } = &end
+                && self.mode == AddonMode::Observe
+            {
+                s.observe_error = Some(e.clone());
+            }
+            (
+                s.feeding.take(),
+                s.first.take(),
+                s.second.take(),
+                s.slot.take(),
+            )
+        };
         self.ended.cancel();
         lock(&self.link.shared.streams).open.remove(&self.id);
-        drop(lock(&self.slot).take());
-        true
-    }
-
-    /// The service failed this stream: whoever is waiting learns of it (a
-    /// pending answer, or the body being fed, which is cut; the failure is
-    /// logged here when the head has gone on).
-    fn fail(&self, e: ServiceError, reset: Reset) {
-        if !self.end() {
-            return;
-        }
-        if reset == Reset::Send {
-            self.link.shared.send_ctl(
-                self.id,
-                &Out::Reset {
-                    message: e.to_string(),
-                },
-            );
-        }
-        let (feeding, first, second) = {
-            let mut s = lock(&self.state);
-            (s.feeding.take(), s.first.take(), s.second.take())
+        drop(slot);
+        let (e, reset, blame) = match end {
+            End::Quiet => return,
+            End::Failed { e, reset } => {
+                let message = e.to_string();
+                (e, (reset == Reset::Send).then_some(message), true)
+            }
+            End::Abandoned(why) => (
+                ServiceError::Closed(why.to_owned()),
+                Some(why.to_owned()),
+                false,
+            ),
         };
+        if let Some(message) = reset {
+            self.link.shared.send_ctl(self.id, &Out::Reset { message });
+        }
         if let Some(f) = feeding {
             f.inbox.abort(&e);
         }
-        if self.mode == AddonMode::Observe {
-            *lock(&self.observe_error) = Some(e);
-        } else if let Some(tx) = first {
+        if let Some(tx) = first {
             let _ = tx.send(Err(e));
         } else if let Some(tx) = second
             && !tx.is_closed()
         {
             let _ = tx.send(Err(e));
-        } else {
+        } else if blame && self.mode == AddonMode::Enforce {
+            // The head has gone on: the failure is logged here, since no
+            // answer carries it.
             let name = self.name();
             let err = StackError::Service(e);
             self.st.fail(&name, err.clone());
@@ -384,39 +424,20 @@ impl Stream {
         }
     }
 
-    /// roxy gives up on the stream (the client went away, a missed
-    /// `first_byte_timeout`, an upgrade): the service is told, and anyone still waiting on an
-    /// answer gets `why`, without it being logged as the service's fault.
+    /// The service failed this stream.
+    fn fail(&self, e: ServiceError, reset: Reset) {
+        self.settle(End::Failed { e, reset });
+    }
+
+    /// roxy gives up on the stream.
     pub(super) fn reset(&self, why: &str) {
-        if !self.end() {
-            return;
-        }
-        self.link.shared.send_ctl(
-            self.id,
-            &Out::Reset {
-                message: why.to_owned(),
-            },
-        );
-        let (feeding, first, second) = {
-            let mut s = lock(&self.state);
-            (s.feeding.take(), s.first.take(), s.second.take())
-        };
-        let e = ServiceError::Closed(why.to_owned());
-        if let Some(f) = feeding {
-            f.inbox.abort(&e);
-        }
-        if let Some(tx) = first {
-            let _ = tx.send(Err(e.clone()));
-        }
-        if let Some(tx) = second {
-            let _ = tx.send(Err(e));
-        }
+        self.settle(End::Abandoned(why));
     }
 
     /// An observe stream: roxy sent all it had.
     pub(super) fn finish(&self) -> Result<(), ServiceError> {
-        self.end();
-        lock(&self.observe_error).take().map_or(Ok(()), Err)
+        self.settle(End::Quiet);
+        lock(&self.state).observe_error.take().map_or(Ok(()), Err)
     }
 
     /// Sends a control message in stream order. False once the stream or
@@ -436,10 +457,10 @@ impl Stream {
             tokio::pin!(more);
             more.as_mut().enable();
             {
-                let mut c = lock(&self.credit);
-                if *c > 0 {
-                    let n = want.min(usize::try_from(*c).unwrap_or(usize::MAX));
-                    *c -= n as u64;
+                let mut s = lock(&self.state);
+                if s.credit > 0 {
+                    let n = want.min(usize::try_from(s.credit).unwrap_or(usize::MAX));
+                    s.credit -= n as u64;
                     return Some(n);
                 }
             }
@@ -498,11 +519,14 @@ impl Stream {
 
     /// Credit back to the service for `n` bytes consumed.
     fn grant(&self, n: u64) {
-        if n == 0 || self.ended.is_cancelled() {
+        if n == 0 {
             return;
         }
         {
             let mut s = lock(&self.state);
+            if s.ended {
+                return;
+            }
             s.unacked = s.unacked.saturating_sub(n);
         }
         self.link
@@ -510,28 +534,25 @@ impl Stream {
             .send_ctl(self.id, &Out::Credit { bytes: n });
     }
 
-    /// Body bytes from the service.
+    /// Body bytes from the service. They count against the stream's
+    /// window in either mode. An observe stream's are discarded and
+    /// credited back as they go, in steps: the service never waits on
+    /// what it sends, and since it may only send what roxy has credited,
+    /// the credit waiting for a stalled socket stays within the window.
     fn bytes(self: &Arc<Self>, b: &[u8]) {
         if b.is_empty() {
             return;
         }
         let n = b.len() as u64;
-        if self.mode == AddonMode::Observe {
-            // Ignored, and credited straight back so the service never
-            // stalls on what it sends (and stops reading the copies).
-            self.link
-                .shared
-                .send_ctl(self.id, &Out::Credit { bytes: n });
-            return;
-        }
         let mut s = lock(&self.state);
-        let Some(inbox) = s.feeding.as_ref().map(|f| f.inbox.clone()) else {
+        let inbox = s.feeding.as_ref().map(|f| f.inbox.clone());
+        if inbox.is_none() && self.mode == AddonMode::Enforce {
             drop(s);
             return self.fail(
                 ServiceError::Protocol("body bytes before a head".into()),
                 Reset::Send,
             );
-        };
+        }
         if s.unacked + n > WINDOW {
             drop(s);
             return self.fail(
@@ -540,6 +561,15 @@ impl Stream {
             );
         }
         s.unacked += n;
+        let Some(inbox) = inbox else {
+            s.discarded += n;
+            if s.discarded < OBSERVE_GRANT {
+                return;
+            }
+            let granted = std::mem::take(&mut s.discarded);
+            drop(s);
+            return self.grant(granted);
+        };
         drop(s);
         let mut q = lock(&inbox.q);
         if q.dropped {
@@ -557,8 +587,8 @@ impl Stream {
         match m {
             In::Credit { bytes } => {
                 {
-                    let mut c = lock(&self.credit);
-                    *c = c.saturating_add(bytes);
+                    let mut s = lock(&self.state);
+                    s.credit = s.credit.saturating_add(bytes);
                 }
                 self.more_credit.notify_waiters();
                 return;
@@ -580,9 +610,7 @@ impl Stream {
         drop(s);
         match result {
             Err(e) => self.fail(e, Reset::Send),
-            Ok(()) if done => {
-                self.end();
-            }
+            Ok(()) if done => self.settle(End::Quiet),
             Ok(()) => {}
         }
     }
@@ -748,9 +776,27 @@ async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodySender, dir:
     }
 }
 
+/// Ends a stream whose `open` was given up (a missed deadline) before its
+/// message went, so it holds no place on the connection.
+struct Opening<'a>(Option<&'a Arc<Stream>>);
+
+impl Opening<'_> {
+    fn sent(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Opening<'_> {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.take() {
+            s.settle(End::Quiet);
+        }
+    }
+}
+
 /// A stream for service layer `index` of the flow `st`: a place on one of
 /// its endpoint's connections (connecting one if needed), and the `open`
-/// message sent.
+/// message sent. Cancel-safe: given up part way, it holds nothing.
 pub(super) async fn open(
     st: &Arc<StackFlow>,
     index: usize,
@@ -789,7 +835,7 @@ pub(super) async fn open(
     let slot = pool.reserve().await;
     let link = slot
         .link
-        .get_or_try_init(|| dial(st, index, svc))
+        .get_or_try_init(|| dial(st, &addon.name, &svc.endpoint, spec))
         .await?
         .clone();
 
@@ -823,21 +869,23 @@ pub(super) async fn open(
             st: st.clone(),
             index,
             mode,
-            state: Mutex::new(state),
-            credit: Mutex::new(WINDOW),
+            state: Mutex::new(StreamState {
+                credit: WINDOW,
+                slot: Some(slot),
+                ..state
+            }),
             more_credit: Notify::new(),
             ended: CancellationToken::new(),
-            ending: AtomicBool::new(false),
-            observe_error: Mutex::new(None),
-            slot: Mutex::new(Some(slot)),
         });
         s.open.insert(id, stream.clone());
         stream
     };
+    let opening = Opening(Some(&stream));
     if !stream.send(&open_message(st, &addon.name, mode)).await {
-        stream.reset("the connection closed");
+        drop(opening);
         return Err(ServiceError::Closed("the connection closed".into()));
     }
+    opening.sent();
     Ok((stream, answers))
 }
 
@@ -857,14 +905,12 @@ fn open_message(st: &StackFlow, layer: &str, mode: AddonMode) -> Out {
     }
 }
 
-/// Connects and completes the handshake through the connector, then
-/// starts the connection's reader and writer.
-async fn dial(st: &StackFlow, index: usize, svc: &ServiceSpec) -> Result<Arc<Link>, ServiceError> {
-    let addon = &st.snap.addons[index];
-    let spec = addon
-        .endpoints
-        .get(&svc.endpoint)
-        .ok_or_else(|| ServiceError::Connect(format!("no endpoint {:?}", svc.endpoint)))?;
+/// The handshake request for `spec`: the endpoint's URL as a WebSocket
+/// one, its headers with secrets expanded, and the subprotocol.
+fn handshake_request(
+    st: &StackFlow,
+    spec: &EndpointSpec,
+) -> Result<(Scheme, roxy_http::Authority, http::Request<()>), ServiceError> {
     let uri = &spec.url;
     let (scheme, authority) = endpoint::authority_of(uri).map_err(ServiceError::Connect)?;
     let ws_scheme = if scheme == Scheme::Http { "ws" } else { "wss" };
@@ -889,15 +935,24 @@ async fn dial(st: &StackFlow, index: usize, svc: &ServiceSpec) -> Result<Arc<Lin
         http::header::SEC_WEBSOCKET_PROTOCOL,
         HeaderValue::from_static(SUBPROTOCOL),
     );
+    Ok((scheme, authority, request))
+}
 
+/// Connects and completes the handshake through the connector (which runs
+/// the address floor on the address it dials), then starts the
+/// connection's reader and writer.
+async fn dial(
+    st: &StackFlow,
+    layer: &str,
+    endpoint: &str,
+    spec: &EndpointSpec,
+) -> Result<Arc<Link>, ServiceError> {
     let started = Instant::now();
     let result = async {
-        let upstream = st.snap.upstream.clone();
-        upstream
-            .preflight(&authority, spec.private)
-            .await
-            .map_err(|e| ServiceError::Connect(e.to_string()))?;
-        let io = upstream
+        let (scheme, authority, request) = handshake_request(st, spec)?;
+        let io = st
+            .snap
+            .upstream
             .connect_h1(scheme, &authority, spec.private)
             .await
             .map_err(|e| ServiceError::Connect(e.to_string()))?;
@@ -923,10 +978,10 @@ async fn dial(st: &StackFlow, index: usize, svc: &ServiceSpec) -> Result<Arc<Lin
         ts: chrono::Utc::now(),
         flow: st.flow.to_string(),
         conn: st.client.id.to_string(),
-        layer: addon.name.clone(),
-        endpoint: svc.endpoint.clone(),
+        layer: layer.to_owned(),
+        endpoint: endpoint.to_owned(),
         method: "GET".to_owned(),
-        path: uri.path().to_owned(),
+        path: spec.url.path().to_owned(),
         status: result.is_ok().then_some(101),
         attempts: 1,
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -1051,4 +1106,105 @@ fn route(shared: &LinkShared, id: u32) -> Result<Option<Arc<Stream>>, ServiceErr
         )));
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::addons::AddonImpl;
+    use crate::addons::service::testing;
+    use crate::testkit::ALLOW_UP;
+
+    /// A link whose connection has failed, with nothing behind it.
+    fn failed_link() -> Arc<Link> {
+        let (ctl, _) = mpsc::unbounded_channel();
+        let (data, _) = mpsc::channel(1);
+        Arc::new(Link {
+            shared: Arc::new(LinkShared {
+                streams: Mutex::new(LinkState {
+                    open: HashMap::new(),
+                    next_id: 1,
+                    failed: true,
+                }),
+                ctl,
+            }),
+            data,
+        })
+    }
+
+    /// A connection that failed keeps its place in the pool while streams
+    /// still hold it; the pool opens another only once they are gone.
+    #[tokio::test]
+    async fn a_failed_connection_counts_until_its_streams_end() {
+        let pool = Arc::new(Pool {
+            entries: Mutex::new(Vec::new()),
+            freed: Notify::new(),
+            max_connections: 1,
+            max_streams: 2,
+            retired: AtomicBool::new(false),
+        });
+        let first = pool.reserve().await;
+        let second = pool.reserve().await;
+        assert!(Arc::ptr_eq(&first.link, &second.link));
+        first.link.set(failed_link()).ok().unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), pool.reserve())
+                .await
+                .is_err(),
+            "the pool is full: one connection, held by two streams"
+        );
+        drop(first);
+        drop(second);
+        assert!(lock(&pool.entries).is_empty());
+        let fresh = tokio::time::timeout(Duration::from_millis(100), pool.reserve())
+            .await
+            .expect("room again");
+        assert!(fresh.link.get().is_none(), "a new connection");
+    }
+
+    /// An `open` given up while its message waits for the socket (a
+    /// missed `first_byte_timeout`) leaves no stream behind: the next
+    /// exchange gets its place.
+    #[tokio::test]
+    async fn an_open_given_up_mid_send_releases_its_place() {
+        let kit = testing::kit(
+            ALLOW_UP,
+            vec![testing::addon("s", "stall", AddonMode::Enforce, |s| {
+                s.max_connections = 1;
+                s.max_streams = 2;
+            })],
+        )
+        .await;
+        let (st, _cx) = crate::addons::test_flow(&kit);
+        let snap = st.snap.clone();
+        let AddonImpl::Service(svc) = &snap.addons[0].kind else {
+            panic!("a service layer");
+        };
+
+        let (first, _) = open(&st, 0, svc, AddonMode::Enforce).await.unwrap();
+        // The service never reads: the writer stalls on the socket, and
+        // the queue behind it fills.
+        let frame = binary(first.id, &vec![0u8; MAX_BODY_FRAME]);
+        loop {
+            while first.link.data.try_send(frame.clone()).is_ok() {}
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if first.link.data.try_send(frame.clone()).is_err() {
+                break;
+            }
+        }
+        let given_up = tokio::time::timeout(
+            Duration::from_millis(100),
+            open(&st, 0, svc, AddonMode::Enforce),
+        )
+        .await;
+        assert!(given_up.is_err(), "the open message cannot go");
+
+        assert_eq!(lock(&first.link.shared.streams).open.len(), 1);
+        let pool = lock(&snap.services.by_key).values().next().unwrap().clone();
+        assert_eq!(lock(&pool.entries)[0].reserved, 1);
+        let place = tokio::time::timeout(Duration::from_millis(100), pool.reserve()).await;
+        assert!(place.is_ok(), "the given-up stream's place is free");
+    }
 }

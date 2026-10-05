@@ -23,7 +23,10 @@ produces a `request` event:
   decisions.
 - `reason` is a stable code when the exchange failed closed or failed
   (`body_too_large_to_inspect`, `body_decode_failed`, `missing_value`,
-  `upstream_timeout`, ...).
+  `upstream_timeout`, ...). An exchange roxy could not finish has
+  `aborted` (its connection ended, or the server stopped, while it was in
+  flight); an exchange cut short because the client went away has
+  `client_gone`.
 - `stage` says where the decision was made: `head` for the forwarding
   decision, or where a watching rule stopped the exchange: `request_body`,
   `response_head`, `response_body`, `websocket`.
@@ -41,7 +44,7 @@ produces a `request` event:
 | event | when |
 |---|---|
 | `request` | every exchange |
-| `response_error` | the response failed after the request was allowed (for example, a body limit mid-stream) |
+| `response_error` | the response could not be written after the request was allowed; `reason` is `client_gone` (the client stopped reading or went away) or `response_write_failed` (for example, a body limit mid-stream) |
 | `parse_error` | the client sent something roxy refused to parse; `reason` is a stable code |
 | `upstream_error`, `upstream_denied` | [upstream](/reference/upstream#errors) failures and address-floor hits |
 | `policy_input_unavailable`, `metric_table_full` | a flow failed closed for want of an input |
@@ -133,6 +136,10 @@ log:
 limits:
   max_capture_body_bytes: 16mb       # per direction per exchange
 ```
+
+Every `log.capture` setting needs `capture_dir`: without it nothing is
+captured, and `roxy check` reports the settings rather than leave them
+looking active.
 
 ### Capture format
 

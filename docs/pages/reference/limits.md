@@ -66,6 +66,16 @@ Addons have their own limits ([addon safety](/addons/safety)).
 ([WebSockets](/policies/websockets#message-rules)); a message over it closes both
 sides with `1009`.
 
+The limits that shape the client-facing codec (`max_header_bytes`,
+`max_url_bytes`, `max_headers`, `max_request_body_bytes`, `header_timeout`,
+`body_idle_timeout`, the keep-alive `idle_timeout`, the `h2_*` limits) and
+the `http.*` flags are fixed for a connection when it is accepted, on
+HTTP/1.1 and HTTP/2 alike; a reload changes them for new connections only.
+Everything decided per exchange (`max_inspect_body_bytes`,
+`max_response_body_bytes`, `response_header_timeout`, the WebSocket limits,
+the policy itself) comes from the snapshot the exchange starts under, so an
+exchange on an old connection runs under the current values.
+
 ## Connections
 
 - A connection over `max_connections` or `max_connections_per_client` (per

@@ -4,12 +4,14 @@
 //! absolute URI, and passes on whatever it likes. What it passes on is
 //! re-validated here exactly as strictly as a client's request (invariant
 //! 1: the rules then judge it as if the agent had sent it), and held to the
-//! same limits.
+//! same limits. The client's [`RequestMeta`] travels with it: a layer
+//! cannot express the protocol version, the target form, the upgrade or
+//! the time the head arrived, and those stay the client's.
 
 use crate::chars::trim_ows;
 use crate::model::{
     Body, CanonicalRequest, CanonicalResponse, Headers, HttpFlags, Limits, Method, ParseError,
-    Reason, RequestMeta, Scheme, TargetForm, Version, reject,
+    Reason, RequestMeta, Scheme, parse_content_length, plan_body, reject,
 };
 use crate::url;
 
@@ -55,7 +57,8 @@ pub fn to_layer_response(res: CanonicalResponse) -> http::Response<Body> {
     out
 }
 
-/// Re-validates a request a layer passes on.
+/// Re-validates a request a layer passes on, as the client's request
+/// `meta` describes.
 ///
 /// The URI must be absolute (`http` or `https`, with an authority). A
 /// `host` field, if present, must match the authority and is dropped. A
@@ -65,6 +68,7 @@ pub fn to_layer_response(res: CanonicalResponse) -> http::Response<Body> {
 /// `limits.max_request_body_bytes`.
 pub fn from_layer_request(
     req: http::Request<Body>,
+    meta: RequestMeta,
     limits: &Limits,
     flags: &HttpFlags,
 ) -> Result<CanonicalRequest, ParseError> {
@@ -117,41 +121,21 @@ pub fn from_layer_request(
                 if content_length.is_some() {
                     return reject(Reason::DuplicateContentLength, "multiple content-length");
                 }
-                if v.is_empty() || v.len() > 19 || !v.iter().all(u8::is_ascii_digit) {
-                    return reject(Reason::BadContentLength, "invalid content-length");
-                }
-                content_length = Some(
-                    v.iter()
-                        .fold(0u64, |acc, &d| acc * 10 + u64::from(d - b'0')),
-                );
+                content_length = Some(parse_content_length(v)?);
             }
             _ => rest.push((name.as_str().as_bytes(), value.as_bytes())),
         }
     }
     let headers = Headers::try_from_raw(rest.iter().copied(), limits, flags)?;
 
-    let bodiless = !method.allows_body(flags.allow_body_on_get);
-    if bodiless && content_length.is_some_and(|n| n > 0) {
-        return reject(Reason::BodyOnBodiless, format!("body on {method} request"));
-    }
-    if let Some(n) = content_length
-        && n > limits.max_request_body_bytes
-    {
-        return reject(Reason::BodyTooLarge, format!("content-length {n}"));
-    }
-    let cap = if bodiless {
-        0
-    } else {
-        limits.max_request_body_bytes
-    };
-    let known = if bodiless || http_body::Body::is_end_stream(&body) {
-        Some(0)
-    } else {
-        content_length.or(body.known_length())
-    };
-    let body = Body::wrap_native(body, cap, known);
-    let mut meta = RequestMeta::new(Version::H1_1, TargetForm::Absolute);
-    meta.head_bytes = head_bytes;
+    let plan = plan_body(
+        &method,
+        content_length.or(body.known_length()),
+        http_body::Body::is_end_stream(&body),
+        limits,
+        flags,
+    )?;
+    let body = Body::wrap_native(body, plan.cap, plan.known);
 
     Ok(CanonicalRequest {
         method,
@@ -168,6 +152,7 @@ pub fn from_layer_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{TargetForm, Version};
 
     fn req(uri: &str, headers: &[(&str, &str)], body: &'static str) -> http::Request<Body> {
         let mut b = http::Request::builder().method("POST").uri(uri);
@@ -177,12 +162,19 @@ mod tests {
         b.body(Body::from_bytes(body)).unwrap()
     }
 
+    fn client_meta() -> RequestMeta {
+        let mut meta = RequestMeta::new(Version::H2, TargetForm::Absolute);
+        meta.head_bytes = 321;
+        meta.upgrade = Some("websocket".to_owned());
+        meta
+    }
+
     fn check(r: http::Request<Body>) -> Result<CanonicalRequest, ParseError> {
-        from_layer_request(r, &Limits::default(), &HttpFlags::default())
+        from_layer_request(r, client_meta(), &Limits::default(), &HttpFlags::default())
     }
 
     #[test]
-    fn accepts_a_plain_request() {
+    fn accepts_a_plain_request_and_keeps_the_clients_meta() {
         let c = check(req(
             "https://api.example.com/v1/x?a=1",
             &[
@@ -197,6 +189,9 @@ mod tests {
         assert_eq!(c.path_and_query(), "/v1/x?a=1");
         assert_eq!(c.headers.len(), 1);
         assert_eq!(c.body.known_length(), Some(2));
+        assert_eq!(c.meta.version, Version::H2);
+        assert_eq!(c.meta.head_bytes, 321);
+        assert_eq!(c.meta.upgrade.as_deref(), Some("websocket"));
     }
 
     #[test]
@@ -208,27 +203,52 @@ mod tests {
 
     #[test]
     fn refuses_what_a_client_could_not_send() {
-        for (uri, headers) in [
-            ("/relative", vec![]),
-            ("ftp://example.com/", vec![]),
+        for (uri, headers, reason) in [
+            ("/relative", vec![], Reason::BadRequestTarget),
+            ("ftp://example.com/", vec![], Reason::BadRequestTarget),
             (
                 "https://example.com/",
                 vec![("transfer-encoding", "chunked")],
+                Reason::ReservedHeader,
             ),
-            ("https://example.com/", vec![("connection", "close")]),
-            ("https://example.com/", vec![("host", "other.example")]),
+            (
+                "https://example.com/",
+                vec![("connection", "close")],
+                Reason::ReservedHeader,
+            ),
+            (
+                "https://example.com/",
+                vec![("host", "other.example")],
+                Reason::HostMismatch,
+            ),
+            (
+                "https://example.com/",
+                vec![("host", "example.com"), ("host", "example.com")],
+                Reason::MultipleHost,
+            ),
             (
                 "https://example.com/",
                 vec![("content-length", "1"), ("content-length", "1")],
+                Reason::DuplicateContentLength,
             ),
-            ("https://example.com/", vec![("content-length", "-1")]),
+            (
+                "https://example.com/",
+                vec![("content-length", "-1")],
+                Reason::BadContentLength,
+            ),
             (
                 "https://example.com/",
                 vec![("proxy-authorization", "Basic x")],
+                Reason::ReservedHeader,
             ),
-            ("https://example.com/../../etc", vec![]),
+            (
+                "https://example.com/../../etc",
+                vec![],
+                Reason::PathClimbsAboveRoot,
+            ),
         ] {
-            assert!(check(req(uri, &headers, "")).is_err(), "{uri} {headers:?}");
+            let e = check(req(uri, &headers, "")).unwrap_err();
+            assert_eq!(e.reason, reason, "{uri} {headers:?}: {e}");
         }
         let get = http::Request::builder()
             .method("GET")
@@ -236,6 +256,6 @@ mod tests {
             .header("content-length", "3")
             .body(Body::from_bytes("abc"))
             .unwrap();
-        assert!(check(get).is_err());
+        assert_eq!(check(get).unwrap_err().reason, Reason::BodyOnBodiless);
     }
 }

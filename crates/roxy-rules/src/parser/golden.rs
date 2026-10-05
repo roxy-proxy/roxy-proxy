@@ -3,10 +3,11 @@
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use crate::ast::{Expr, FieldRef, Lit, LitNode, Node, Op, Operand, Unit};
+use crate::diag::Span;
+use crate::parser::parse;
 use ipnet::IpNet;
 use proptest::prelude::*;
-use roxy_rules::Span;
-use roxy_rules::ast::{Expr, FieldRef, Lit, LitNode, Node, Op, Operand, Unit};
 
 #[test]
 fn parser_golden() {
@@ -38,7 +39,7 @@ fn parser_golden() {
     ];
     let mut out = String::new();
     for src in cases {
-        let node = roxy_rules::parse(src).unwrap_or_else(|d| panic!("{src}: {d}"));
+        let node = parse(src).unwrap_or_else(|d| panic!("{src}: {d}"));
         writeln!(out, "{src}\n  sexpr:  {}\n  pretty: {node}\n", node.sexpr()).unwrap();
     }
     insta::assert_snapshot!("parser_golden", out);
@@ -62,7 +63,7 @@ fn parse_error_golden() {
     ];
     let mut out = String::new();
     for src in cases {
-        let d = roxy_rules::parse(src).expect_err(src);
+        let d = parse(src).expect_err(src);
         writeln!(
             out,
             "{src:?}\n  {}:{}: {}\n{}\n",
@@ -218,7 +219,7 @@ proptest! {
     /// Any printable input either parses or yields a positioned diagnostic.
     #[test]
     fn never_panics(src in "[ -~\t\n]{0,80}") {
-        match roxy_rules::parse(&src) {
+        match parse(&src) {
             Ok(_) => {}
             Err(d) => {
                 prop_assert!(d.line >= 1 && d.col >= 1);
@@ -230,7 +231,7 @@ proptest! {
     /// Arbitrary unicode, including control characters.
     #[test]
     fn never_panics_unicode(src in "\\PC{0,40}") {
-        let _ = roxy_rules::parse(&src);
+        let _ = parse(&src);
     }
 
     /// Token soup built from the DSL's own vocabulary reaches deeper paths.
@@ -241,15 +242,15 @@ proptest! {
         "matches", "#c\n", "\"", "::", "1.2", "/", "@internal", "@", "@-",
     ]), 0..20)) {
         let src = toks.join(" ");
-        let _ = roxy_rules::parse(&src);
-        let _ = roxy_rules::parse(&toks.concat());
+        let _ = parse(&src);
+        let _ = parse(&toks.concat());
     }
 
     /// pretty-print -> parse yields the same tree.
     #[test]
     fn round_trip(ast in expr()) {
         let printed = ast.to_string();
-        let parsed = roxy_rules::parse(&printed)
+        let parsed = parse(&printed)
             .map_err(|d| TestCaseError::fail(format!("{printed:?}: {d}")))?;
         prop_assert_eq!(parsed.strip_spans(), ast, "printed: {}", printed);
     }

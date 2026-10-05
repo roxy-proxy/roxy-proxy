@@ -485,3 +485,218 @@ async fn a_layer_its_when_skips_stays_out_of_the_websocket() {
     let ev = kit.request_event().await;
     assert!(strs(&ev["addons"]).is_empty(), "{ev:#}");
 }
+
+/// An observer that answers without reading its copy is not lagging: the
+/// copy is dropped and the exchange is not reported.
+#[tokio::test]
+async fn an_observer_that_drops_its_copy_is_not_lagging() {
+    let kit = stack(&[
+        AddonDef::test_layer("o").observe(),
+        AddonDef::test_layer("b"),
+    ])
+    .await;
+    let mut c = kit.h1().await;
+    let (mut tx, body) = super::streaming_body();
+    let req = c
+        .request("POST", "/x", &[("x-test-o", "answer")])
+        .body(body)
+        .unwrap();
+    let answer = c.start(req);
+    // The observer has answered (and dropped its copy) long before the
+    // body arrives.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    tx.send_data(bytes::Bytes::from_static(b"late"))
+        .await
+        .unwrap();
+    tx.finish().await.unwrap();
+    let a = answer.await.unwrap().unwrap();
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["body_len"], 4);
+    kit.request_event().await;
+    let lagged: Vec<_> = kit
+        .sink
+        .events()
+        .into_iter()
+        .filter(|e| e["event"] == "observer_lagged")
+        .collect();
+    assert!(lagged.is_empty(), "{lagged:#?}");
+}
+
+/// Service layers: the in-test service (`testkit::upstream::service`)
+/// behind a `kind: service` addon.
+mod service {
+    use std::time::Duration;
+
+    use bytes::Bytes;
+
+    use super::{RULES, strs};
+    use crate::addons::AddonMode;
+    use crate::addons::service::testing::{addon, kit, reload};
+    use crate::testkit::{Answer, Kit, streaming_body};
+
+    /// The response head waits for `request_end`, and so does its clock:
+    /// an upstream that answers while the client is still uploading, for
+    /// longer than `first_byte_timeout`, still completes.
+    #[tokio::test]
+    async fn an_early_response_waits_for_the_upload_without_timing_out() {
+        let kit = kit(
+            RULES,
+            vec![addon("s", "pass", AddonMode::Enforce, |s| {
+                s.first_byte_timeout = Duration::from_millis(400);
+            })],
+        )
+        .await;
+        let mut c = kit.h1().await;
+        let (mut tx, body) = streaming_body();
+        let req = c.request("POST", "/early", &[]).body(body).unwrap();
+        let answer = c.start(req);
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            tx.send_data(Bytes::from_static(b"chunk")).await.unwrap();
+        }
+        tx.finish().await.unwrap();
+        let a: Answer = answer.await.unwrap().unwrap();
+        assert_eq!(a.status, 200, "{a:?}");
+        assert_eq!(a.text(), "early");
+        let seen = kit.upstream.wait_seen(1).await;
+        assert_eq!(seen[0].body, b"chunkchunkchunkchunk");
+        let ev = kit.request_event().await;
+        assert_eq!(strs(&ev["addons"]), ["s"], "{ev:#}");
+        assert!(
+            kit.sink
+                .events()
+                .iter()
+                .all(|e| e["event"] != "layer_error"),
+            "{:#?}",
+            kit.sink.events()
+        );
+        assert_eq!(kit.upstream.service().resets(), []);
+    }
+
+    /// What a service sends on an observe stream is discarded and credited
+    /// back as it goes, so a service that keeps to its credit can send
+    /// several windows' worth while the stream is open.
+    #[tokio::test]
+    async fn an_observe_stream_credits_back_what_it_discards() {
+        let kit = kit(RULES, vec![addon("o", "talk", AddonMode::Observe, |_| {})]).await;
+        let mut c = kit.h1().await;
+        let (mut tx, body) = streaming_body();
+        let req = c.request("POST", "/x", &[]).body(body).unwrap();
+        let answer = c.start(req);
+        kit.upstream.service().until_talked(1).await;
+        tx.send_data(Bytes::from_static(b"body")).await.unwrap();
+        tx.finish().await.unwrap();
+        let a: Answer = answer.await.unwrap().unwrap();
+        assert_eq!(a.status, 200, "{a:?}");
+        kit.request_event().await;
+        assert!(
+            kit.sink
+                .events()
+                .iter()
+                .all(|e| e["event"] != "layer_error"),
+            "{:#?}",
+            kit.sink.events()
+        );
+    }
+
+    /// Body bytes on an observe stream are bounded by the window like any
+    /// body: a frame past it fails the stream, and the exchange goes on.
+    #[tokio::test]
+    async fn an_observe_stream_flooded_past_its_window_fails_on_its_own() {
+        let kit = kit(RULES, vec![addon("o", "flood", AddonMode::Observe, |_| {})]).await;
+        let mut c = kit.h1().await;
+        let (mut tx, body) = streaming_body();
+        let req = c.request("POST", "/x", &[]).body(body).unwrap();
+        let answer = c.start(req);
+        // The flood lands while the observe stream still waits for the
+        // request body.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        tx.send_data(Bytes::from_static(b"body")).await.unwrap();
+        tx.finish().await.unwrap();
+        let a: Answer = answer.await.unwrap().unwrap();
+        assert_eq!(a.status, 200, "{a:?}");
+        assert_eq!(a.json()["body_len"], 4);
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["layer"], "o", "{errs:#?}");
+        assert_eq!(errs[0]["mode"], "observe");
+        assert_eq!(errs[0]["kind"], "service:protocol");
+        let resets = kit.upstream.service().resets();
+        assert!(
+            resets
+                .iter()
+                .any(|(_, m)| m.contains("past the stream's credit")),
+            "{resets:?}"
+        );
+    }
+
+    /// An observer that holds its copy without reading it is lagging: the
+    /// copy is cut and reported, and the real body goes through whole.
+    #[tokio::test]
+    async fn a_slow_observer_is_cut_and_reported_while_the_body_goes_through() {
+        // The service never reads (and so never grants credit): the copy
+        // stalls once the stream's window is spent.
+        let kit = kit(RULES, vec![addon("o", "stall", AddonMode::Observe, |_| {})]).await;
+        let mut c = kit.h1().await;
+        let (mut tx, body) = streaming_body();
+        let req = c.request("POST", "/x", &[]).body(body).unwrap();
+        let answer = c.start(req);
+        let chunk = Bytes::from(vec![b'x'; 16 * 1024]);
+        let chunks = 40;
+        for _ in 0..chunks {
+            tx.send_data(chunk.clone()).await.unwrap();
+        }
+        tx.finish().await.unwrap();
+        let a: Answer = answer.await.unwrap().unwrap();
+        assert_eq!(a.status, 200, "{a:?}");
+        assert_eq!(a.json()["body_len"], chunks * chunk.len());
+        let seen = kit.upstream.wait_seen(1).await;
+        assert_eq!(seen[0].complete, Some(true));
+        let lagged = kit.events("observer_lagged", 1).await;
+        assert_eq!(lagged[0]["layer"], "o", "{lagged:#?}");
+        assert_eq!(lagged[0]["direction"], "request");
+    }
+
+    /// A secret the rules inject is captured redacted, through the stack as
+    /// without one; the upstream gets the real value.
+    #[tokio::test]
+    async fn a_captured_head_redacts_an_injected_secret() {
+        const WITH_TOKEN: &str = r#"
+- id: up
+  when: host == "up.test"
+  then:
+    - set_header: { x-token: "Bearer ${secret:tok}" }
+    - allow
+"#;
+        let kit = Kit::builder().rules(RULES).capture_all().start().await;
+        reload(
+            &kit,
+            WITH_TOKEN,
+            &[("tok", "sk-live-123")],
+            vec![addon("s", "pass", AddonMode::Enforce, |_| {})],
+        );
+        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+        assert_eq!(a.status, 200, "{a:?}");
+        let seen = kit.upstream.wait_seen(1).await;
+        assert_eq!(seen[0].headers["x-token"], "Bearer sk-live-123");
+        kit.request_event().await;
+        let captured = kit.captured();
+        let (_, head) = captured
+            .iter()
+            .find(|(h, _)| h["dir"] == "request" && h["kind"] == "head")
+            .expect("the request head is captured");
+        let head: serde_json::Value = serde_json::from_slice(head).unwrap();
+        let token = head["headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h[0] == "x-token")
+            .expect("x-token captured");
+        assert_eq!(token[1], "Bearer [REDACTED]", "{head:#}");
+        assert!(
+            !captured
+                .iter()
+                .any(|(_, p)| p.windows(11).any(|w| w == b"sk-live-123")),
+            "the secret is nowhere in the capture"
+        );
+    }
+}

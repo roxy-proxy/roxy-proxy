@@ -1,5 +1,5 @@
 ---
-source: crates/roxy-rules/tests/parser.rs
+source: crates/roxy-rules/src/parser/golden.rs
 expression: out
 ---
 ""

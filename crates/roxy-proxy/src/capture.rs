@@ -148,7 +148,9 @@ impl Dir {
 /// One direction of one captured exchange. Owned by the single producer
 /// of that direction (a body adapter or a relay pump). Dropping it before
 /// [`Tap::end`] records an aborted end, so an exchange cut short is
-/// explicit in the capture.
+/// explicit in the capture. A tap that recorded nothing (the exchange was
+/// refused before its head left) ends silently: there is no record to
+/// close.
 #[derive(Debug)]
 pub(crate) struct Tap {
     log: Arc<CaptureLog>,
@@ -251,7 +253,7 @@ impl Tap {
 
     /// The direction ended; `aborted` if it did not complete.
     pub(crate) fn end(&mut self, aborted: bool) {
-        if self.ended {
+        if self.ended || self.seq == 0 {
             return;
         }
         self.ended = true;
@@ -327,6 +329,7 @@ pub(crate) mod tests {
         let mut r = Tap::new(log.clone(), "F1", Dir::Response);
         r.data(b"partial");
         drop(r); // never ended: aborted
+        drop(Tap::new(log.clone(), "F2", Dir::Request)); // nothing recorded: nothing to end
         assert!(log.flush());
         let recs = parse(&std::fs::read(log.path()).unwrap());
         let kinds: Vec<(&str, &str)> = recs

@@ -139,6 +139,13 @@ fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Whether `s` lexes as one identifier (`[A-Za-z_][A-Za-z0-9_]*`), so it
+/// can be a path segment such as a metric id.
+pub(crate) fn is_ident(s: &str) -> bool {
+    let mut b = s.bytes();
+    b.next().is_some_and(is_ident_start) && b.all(is_ident_char)
+}
+
 impl Lexer<'_> {
     fn run(mut self) -> Result<Vec<Token>, ExprError> {
         loop {

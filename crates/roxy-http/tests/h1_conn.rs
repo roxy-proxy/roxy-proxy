@@ -338,9 +338,13 @@ async fn proxy_auth_required_on_connect() {
         panic!()
     };
     let server = tokio::spawn(async move {
-        c.respond_proxy_auth_required("roxy proxy", Bytes::from_static(b"auth needed"))
-            .await
-            .unwrap();
+        c.respond_proxy_auth_required(
+            "roxy proxy",
+            "text/plain",
+            Bytes::from_static(b"auth needed"),
+        )
+        .await
+        .unwrap();
     });
     let (head, body) = read_response(&mut client, false).await;
     assert!(
@@ -372,7 +376,7 @@ async fn proxy_auth_required_on_request_abandons_body() {
         panic!()
     };
     let server = tokio::spawn(async move {
-        c.respond_proxy_auth_required("r", Bytes::new())
+        c.respond_proxy_auth_required("r", "text/plain", Bytes::new())
             .await
             .unwrap();
     });
@@ -400,7 +404,7 @@ async fn proxy_auth_required_on_head_sends_no_body() {
         panic!()
     };
     let server = tokio::spawn(async move {
-        c.respond_proxy_auth_required("r", Bytes::from_static(b"body"))
+        c.respond_proxy_auth_required("r", "text/plain", Bytes::from_static(b"body"))
             .await
             .unwrap();
     });
@@ -433,7 +437,8 @@ async fn proxy_auth_realm_is_validated() {
         };
         assert!(
             matches!(
-                c.respond_proxy_auth_required(bad, Bytes::new()).await,
+                c.respond_proxy_auth_required(bad, "text/plain", Bytes::new())
+                    .await,
                 Err(WriteError::State(_))
             ),
             "{bad:?}"
@@ -446,7 +451,8 @@ async fn proxy_auth_realm_is_validated() {
     // No pending request: refused.
     let (_client, c) = proxy_conn();
     assert!(matches!(
-        c.respond_proxy_auth_required("r", Bytes::new()).await,
+        c.respond_proxy_auth_required("r", "text/plain", Bytes::new())
+            .await,
         Err(WriteError::State(_))
     ));
 }
@@ -731,6 +737,21 @@ async fn header_timeout() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn header_timeout_applies_to_pipelined_partial_head() {
+    let (mut client, mut c) = conn();
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\nGET /b HTTP/1.1\r\nHost: exa")
+        .await
+        .unwrap();
+    let _ = expect_request(&mut c).await;
+    c.respond(ok(Body::empty())).await.unwrap();
+    let start = tokio::time::Instant::now();
+    let err = c.next_request().await.unwrap_err();
+    assert_eq!(err.reason, Reason::HeaderTimeout);
+    assert!(start.elapsed() < Limits::default().idle_timeout);
+}
+
+#[tokio::test(start_paused = true)]
 async fn first_request_never_sent_times_out() {
     let (_client, mut c) = conn();
     let err = c.next_request().await.unwrap_err();
@@ -749,6 +770,50 @@ async fn idle_timeout_between_requests() {
     let start = tokio::time::Instant::now();
     assert!(c.next_request().await.unwrap().is_none());
     assert!(start.elapsed() >= Limits::default().idle_timeout);
+}
+
+#[tokio::test(start_paused = true)]
+async fn client_close_during_bodiless_request_ends_drive() {
+    let (mut client, mut c) = conn();
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    let _ = expect_request(&mut c).await;
+    drop(client);
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        c.drive(std::future::pending::<()>()),
+    )
+    .await
+    .expect("drive notices the closed client")
+    .unwrap_err();
+    assert_eq!(err.reason, Reason::UnexpectedEof);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pipelined_bytes_during_bodiless_request_are_kept() {
+    let (mut client, mut c) = conn();
+    client
+        .write_all(b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    let _ = expect_request(&mut c).await;
+    // The pipelined head arrives while the response is pending, so the
+    // idle-socket watch is what reads it.
+    let upstream = async move {
+        client
+            .write_all(b"GET /b HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        client
+    };
+    let mut client = c.drive(upstream).await.unwrap();
+    c.respond(ok(Body::empty())).await.unwrap();
+    let _ = read_response(&mut client, false).await;
+    let second = expect_request(&mut c).await;
+    assert_eq!(second.path.as_str(), "/b");
 }
 
 #[tokio::test(start_paused = true)]
@@ -865,7 +930,7 @@ fn futures_are_send() {
     let f = c.accept_connect();
     assert_send(&f);
     let (_client, c) = conn();
-    let f = c.respond_proxy_auth_required("r", Bytes::new());
+    let f = c.respond_proxy_auth_required("r", "text/plain", Bytes::new());
     assert_send(&f);
     let (_client, c) = conn();
     let f = c.respond_upgrade(CanonicalResponse::new(StatusCode::SWITCHING_PROTOCOLS));

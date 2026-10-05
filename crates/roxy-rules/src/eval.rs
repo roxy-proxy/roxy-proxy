@@ -4,6 +4,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::fmt;
+use std::net::IpAddr;
 use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +22,7 @@ use crate::view::{BodyText, FlowView, Value};
 #[derive(Clone, Copy)]
 pub struct EvalContext<'a> {
     /// Resolves `${secret:name}` in `set_header` values. Returning `None`
-    /// makes the flow fail closed (see [`crate::Policy::evaluate`]).
+    /// makes the flow fail closed (see [`crate::Policy::evaluate_head`]).
     pub secrets: &'a dyn Fn(&str) -> Option<String>,
     /// Tags already set on the flow (by an addon); visible as `tag["x"]`.
     pub initial_tags: &'a [String],
@@ -694,7 +695,6 @@ impl Pred {
     /// unavailable input is recorded in the scope (see [`Scope::failed`]); the
     /// returned bool is then meaningless and the caller must fail closed.
     /// Recording instead of returning `Result` keeps the hot path cheap.
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn eval<'a>(&'a self, s: &Scope<'a>) -> bool {
         match self {
             Pred::Const(b) => *b,
@@ -722,31 +722,8 @@ impl Pred {
                 ci,
                 negate,
             } => eq(&get(lhs, s), &get(rhs, s), *ci).is_some_and(|r| r != *negate),
-            Pred::Ord { lhs, rhs, op } => {
-                let (a, b) = (get(lhs, s), get(rhs, s));
-                if missing(lhs, &a, s) | missing(rhs, &b, s) {
-                    return false;
-                }
-                match (a, b) {
-                    (Value::Int(a), Value::Int(b)) => match op {
-                        OrdOp::Lt => a < b,
-                        OrdOp::Le => a <= b,
-                        OrdOp::Gt => a > b,
-                        OrdOp::Ge => a >= b,
-                    },
-                    _ => false,
-                }
-            }
-            Pred::Str { lhs, rhs, op, ci } => {
-                let (hay, rv) = (get(lhs, s), get(rhs, s));
-                if missing(lhs, &hay, s) | missing(rhs, &rv, s) {
-                    return false;
-                }
-                let Value::Str(needle) = &rv else {
-                    return false;
-                };
-                any_str(&hay, |h| str_test(h, needle, *op, *ci))
-            }
+            Pred::Ord { lhs, rhs, op } => ord(lhs, rhs, *op, s),
+            Pred::Str { lhs, rhs, op, ci } => str_op(lhs, rhs, *op, *ci, s),
             Pred::Glob { lhs, glob } => {
                 let v = get(lhs, s);
                 !missing(lhs, &v, s) && any_str(&v, |x| glob.is_match(x))
@@ -779,31 +756,60 @@ impl Pred {
                 _ => false,
             },
             // CIDR and address-list membership need an address.
-            Pred::InNet { lhs, nets, negate } => match get(lhs, s) {
-                Value::Ip(ip) => {
-                    let ip = ip.to_canonical();
-                    nets.iter().any(|n| n.contains(&ip)) != *negate
-                }
-                v => {
-                    missing(lhs, &v, s);
-                    false
-                }
-            },
-            Pred::InList { lhs, list, negate } => match get(lhs, s) {
-                Value::Ip(ip) => {
-                    if let Some(hit) = s.view.in_address_list(list, ip.to_canonical()) {
-                        hit != *negate
-                    } else {
+            Pred::InNet { lhs, nets, negate } => {
+                address(lhs, s).is_some_and(|ip| nets.iter().any(|n| n.contains(&ip)) != *negate)
+            }
+            Pred::InList { lhs, list, negate } => address(lhs, s).is_some_and(|ip| {
+                s.view.in_address_list(list, ip).map_or_else(
+                    || {
                         s.fail(Unavailable::List(list));
                         false
-                    }
-                }
-                v => {
-                    missing(lhs, &v, s);
-                    false
-                }
-            },
+                    },
+                    |hit| hit != *negate,
+                )
+            }),
             Pred::IsNull { op, negate } => matches!(get(op, s), Value::Absent) != *negate,
+        }
+    }
+}
+
+/// `<`, `<=`, `>`, `>=` on ints; a missing side fails closed.
+fn ord<'a>(lhs: &'a ROperand, rhs: &'a ROperand, op: OrdOp, s: &Scope<'a>) -> bool {
+    let (a, b) = (get(lhs, s), get(rhs, s));
+    if missing(lhs, &a, s) | missing(rhs, &b, s) {
+        return false;
+    }
+    match (a, b) {
+        (Value::Int(a), Value::Int(b)) => match op {
+            OrdOp::Lt => a < b,
+            OrdOp::Le => a <= b,
+            OrdOp::Gt => a > b,
+            OrdOp::Ge => a >= b,
+        },
+        _ => false,
+    }
+}
+
+/// `starts_with` / `ends_with` / `contains`; a missing side fails closed.
+fn str_op<'a>(lhs: &'a ROperand, rhs: &'a ROperand, op: StrOp, ci: bool, s: &Scope<'a>) -> bool {
+    let (hay, rv) = (get(lhs, s), get(rhs, s));
+    if missing(lhs, &hay, s) | missing(rhs, &rv, s) {
+        return false;
+    }
+    let Value::Str(needle) = &rv else {
+        return false;
+    };
+    any_str(&hay, |h| str_test(h, needle, op, ci))
+}
+
+/// The canonical address of an ip operand; `None` (failing closed) if it
+/// is missing.
+fn address<'a>(op: &'a ROperand, s: &Scope<'a>) -> Option<IpAddr> {
+    match get(op, s) {
+        Value::Ip(ip) => Some(ip.to_canonical()),
+        v => {
+            missing(op, &v, s);
+            None
         }
     }
 }

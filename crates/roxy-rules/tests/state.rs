@@ -128,3 +128,27 @@ fn set_limits_on_a_live_store() {
     s.set("f", "1", None).unwrap();
     assert_eq!(s.set("g", "1", None), Err(StateFull));
 }
+
+/// A purge is O(entries), so a full table triggers one at most every
+/// 100 ms: a client cannot force a full scan per request by filling the
+/// table with short-lived keys. Inside that interval a new key is refused
+/// even though every stored entry has expired.
+#[test]
+fn full_table_purges_at_most_every_100ms() {
+    let (s, t) = clocked(2, Duration::from_millis(10));
+    s.set("a", "1", None).unwrap();
+    s.set("b", "1", None).unwrap();
+    // Everything expired: the first new key purges and is admitted.
+    t.store(20, Ordering::SeqCst);
+    s.set("c", "1", None).unwrap();
+    s.set("d", "1", None).unwrap();
+    assert_eq!(s.len(), 2);
+    // Expired again, but within 100 ms of that purge: refused.
+    t.store(50, Ordering::SeqCst);
+    assert_eq!(s.set("e", "1", None), Err(StateFull));
+    assert_eq!(s.get("e"), None);
+    // Once the interval has passed, the purge runs and the key fits.
+    t.store(120, Ordering::SeqCst);
+    s.set("e", "1", None).unwrap();
+    assert_eq!(s.len(), 1);
+}

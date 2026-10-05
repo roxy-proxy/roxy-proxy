@@ -12,7 +12,7 @@ const ALL: Reads = Reads::ALL;
 
 const POLICY: &str = r#"
 - id: allow-all
-  then: allow
+  then: [{ tag: metered }, allow]
 - id: upload-log
   when: body.bytes > 1kb
   then: [tag: big-upload, { log: { level: info, message: "big upload" } }]
@@ -23,7 +23,7 @@ const POLICY: &str = r#"
   when: response.status == 200
   then: { set_header: { x-checked: "1" } }
 - id: download-cap
-  when: tag["big-upload"] and response.body.bytes > 1mb
+  when: tag["metered"] and response.body.bytes > 1mb
   then: deny
 "#;
 
@@ -80,7 +80,7 @@ fn effects_apply_once_and_a_deny_stops() {
             message: "big upload".into()
         }]
     );
-    assert_eq!(st.tags, ["big-upload"]);
+    assert_eq!(st.tags, ["metered", "big-upload"]);
     assert_eq!(
         p.evaluate_watching(changed, changed, &mut st, &at(4096), &ctx),
         None,
@@ -111,7 +111,7 @@ fn effects_apply_once_and_a_deny_stops() {
 fn rules_wait_until_everything_they_read_is_known() {
     let p = compile("", POLICY);
     let ctx = EvalContext::empty();
-    let mut st = p.watch_state(&["big-upload".to_owned()]);
+    let mut st = p.watch_state(&["metered".to_owned()]);
     let v = MapView::new()
         .with_int(Field::BodyBytes, 10)
         .with_int(Field::ResponseStatus, 500)
@@ -283,6 +283,48 @@ fn byte_metric_denies_watch() {
         "- { id: t, when: 'metric.egress > 1mb', then: { tag: heavy } }",
     );
     assert_eq!(p.rule_info()[0].kind, RuleKind::Head);
+}
+
+/// Watching rules fire when the values they read arrive, not in list
+/// order, so a tag set by one is visible to another watching rule only by
+/// timing: the reader below would see it after a slow upload and not after
+/// a fast one. The compiler rejects the read wherever the setter sits.
+#[test]
+fn watching_rules_cannot_read_tags_set_by_watching_rules() {
+    for rules in [
+        r#"
+- id: big
+  when: body.bytes > 1kb
+  then: { tag: big }
+- id: cap
+  when: tag["big"] and response.body.bytes > 1mb
+  then: deny
+"#,
+        r#"
+- id: cap
+  when: tag["big"] and response.body.bytes > 1mb
+  then: deny
+- id: big
+  when: body.bytes > 1kb
+  then: { tag: big }
+"#,
+    ] {
+        let err = try_compile("", rules).unwrap_err().join("\n");
+        assert!(err.contains("reads `tag[\"big\"]`"), "{err}");
+        assert!(err.contains("(\"big\"), a watching rule"), "{err}");
+    }
+    // A head setter anywhere in the list is fine for a watching reader.
+    compile(
+        "",
+        r#"
+- id: cap
+  when: tag["big"] and response.body.bytes > 1mb
+  then: deny
+- id: big
+  when: body.size != null and body.size > 1kb
+  then: { tag: big }
+"#,
+    );
 }
 
 #[test]

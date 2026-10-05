@@ -3,10 +3,10 @@
 
 use http::HeaderValue;
 
-use crate::chars::{is_field_value_byte, is_tchar, split_list, trim_ows};
+use crate::chars::{split_list, trim_ows};
 use crate::model::{
     Authority, Headers, HttpFlags, Limits, Method, ParseError, Reason, RequestMeta, Scheme,
-    TargetForm, Version, connection_tokens, reject,
+    TargetForm, Version, connection_tokens, parse_content_length, parse_field_line, reject,
 };
 use crate::url::{self, Path, Query};
 
@@ -196,45 +196,6 @@ fn check_request_line(
     }
 }
 
-fn check_header_line(line: &[u8], flags: &HttpFlags) -> Result<(), ParseError> {
-    if matches!(line.first(), Some(b' ' | b'\t')) {
-        return reject(Reason::ObsFold, "obsolete line folding");
-    }
-    let Some(colon) = line.iter().position(|&b| b == b':') else {
-        return reject(Reason::InvalidHeaderName, "header line without colon");
-    };
-    let name = &line[..colon];
-    if name.is_empty() {
-        return reject(Reason::InvalidHeaderName, "empty header name");
-    }
-    if matches!(name.last(), Some(b' ' | b'\t')) {
-        return reject(Reason::WhitespaceBeforeColon, "whitespace before colon");
-    }
-    if name.iter().any(|&b| b >= 0x80) {
-        return reject(Reason::NonAscii, "non-ASCII header name");
-    }
-    if !name.iter().all(|&b| is_tchar(b)) {
-        return reject(
-            Reason::InvalidHeaderName,
-            format!("invalid header name {:?}", String::from_utf8_lossy(name)),
-        );
-    }
-    let value = &line[colon + 1..];
-    if let Some(&b) = value
-        .iter()
-        .find(|&&b| !is_field_value_byte(b, flags.allow_obs_text))
-    {
-        if b >= 0x80 {
-            return reject(Reason::NonAscii, "non-ASCII header value");
-        }
-        return reject(
-            Reason::InvalidHeaderValue,
-            format!("byte 0x{b:02x} in header value"),
-        );
-    }
-    Ok(())
-}
-
 fn map_httparse(e: httparse::Error) -> ParseError {
     let reason = match e {
         httparse::Error::HeaderName => Reason::InvalidHeaderName,
@@ -248,27 +209,9 @@ fn map_httparse(e: httparse::Error) -> ParseError {
     ParseError::new(reason, format!("httparse: {e}"))
 }
 
-fn parse_content_length(v: &[u8]) -> Result<u64, ParseError> {
-    if v.is_empty() || v.len() > 19 || !v.iter().all(u8::is_ascii_digit) {
-        return reject(
-            Reason::BadContentLength,
-            format!("content-length {:?}", String::from_utf8_lossy(v)),
-        );
-    }
-    // 19 digits always fit in a u64.
-    Ok(v.iter()
-        .fold(0u64, |acc, &d| acc * 10 + u64::from(d - b'0')))
-}
-
-/// Parses and validates a complete head (as delimited by [`scan_head`]).
-#[allow(clippy::too_many_lines)] // one linear pass over the rejection rules; splitting obscures the order of checks
-pub fn parse_head(
-    head: &[u8],
-    role: &Role,
-    limits: &Limits,
-    flags: &HttpFlags,
-) -> Result<Head, ParseError> {
-    // ----- raw pre-checks (stricter than httparse) -----
+/// Raw pre-checks, stricter than httparse: head termination and size, the
+/// request line, then every field line in order. Returns the version.
+fn check_raw_head(head: &[u8], limits: &Limits, flags: &HttpFlags) -> Result<Version, ParseError> {
     if head.len() > limits.max_header_bytes {
         return reject(
             Reason::HeadTooLarge,
@@ -294,11 +237,18 @@ pub fn parse_head(
         );
     }
     for line in header_lines {
-        check_header_line(line, flags)?;
+        parse_field_line(line, flags.allow_obs_text)?;
     }
+    Ok(version)
+}
 
-    // ----- tokenisation (defence in depth: httparse must agree) -----
-    let mut storage = vec![httparse::EMPTY_HEADER; header_lines.len()];
+/// Tokenises a pre-checked head with httparse (defence in depth: it must
+/// agree with the raw checks). Returns the method, the target and the raw
+/// `(name, OWS-trimmed value)` pairs.
+#[allow(clippy::type_complexity)]
+fn tokenise(head: &[u8]) -> Result<(Method, &[u8], Vec<(&[u8], &[u8])>), ParseError> {
+    let field_count = lines(head).len() - 1;
+    let mut storage = vec![httparse::EMPTY_HEADER; field_count];
     let mut req = httparse::Request::new(&mut storage);
     match req.parse(head) {
         Ok(httparse::Status::Complete(n)) if n == head.len() => {}
@@ -307,28 +257,34 @@ pub fn parse_head(
     }
     let method = Method::parse(req.method.unwrap_or("").as_bytes())?;
     let target = req.path.unwrap_or("").as_bytes();
-    let raw: Vec<(&[u8], &[u8])> = req
+    let raw = req
         .headers
         .iter()
         .map(|h| (h.name.as_bytes(), trim_ows(h.value)))
         .collect();
+    Ok((method, target, raw))
+}
 
-    // ----- semantic validation -----
-    let all = |name: &str| -> Vec<&[u8]> {
-        raw.iter()
-            .filter(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
-            .map(|(_, v)| *v)
-            .collect()
-    };
-    let hosts = all("host");
-    let cls = all("content-length");
-    let tes = all("transfer-encoding");
-    let expects = all("expect");
-    let conn = connection_tokens(all("connection"))?;
-    let upgrades = all("upgrade");
-    let proxy_auth = all("proxy-authorization");
+/// Values of every field named `name`, in order.
+fn all<'a>(raw: &[(&'a [u8], &'a [u8])], name: &str) -> Vec<&'a [u8]> {
+    raw.iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
+        .map(|(_, v)| *v)
+        .collect()
+}
 
-    // Framing: Content-Length / Transfer-Encoding.
+/// Body framing from `Content-Length` / `Transfer-Encoding`, with the body
+/// policy applied: one `Content-Length` or exactly `chunked`, never both;
+/// no body on a bodiless method; a declared length within the cap.
+fn request_framing(
+    raw: &[(&[u8], &[u8])],
+    method: &Method,
+    version: Version,
+    limits: &Limits,
+    flags: &HttpFlags,
+) -> Result<Framing, ParseError> {
+    let cls = all(raw, "content-length");
+    let tes = all(raw, "transfer-encoding");
     if !cls.is_empty() && !tes.is_empty() {
         return reject(Reason::ClAndTe, "both content-length and transfer-encoding");
     }
@@ -373,27 +329,31 @@ pub fn parse_head(
     {
         return reject(Reason::BodyTooLarge, format!("content-length {n}"));
     }
+    Ok(framing)
+}
 
-    // Expect.
-    let mut expect_continue = false;
+/// Metadata from the hop-by-hop fields: `Expect`, `Connection`, `Upgrade`
+/// and `Proxy-Authorization`.
+fn hop_by_hop_meta(
+    raw: &[(&[u8], &[u8])],
+    version: Version,
+    framing: Framing,
+    head_bytes: usize,
+) -> Result<RequestMeta, ParseError> {
+    let mut meta = RequestMeta::new(version, TargetForm::Origin);
+    meta.head_bytes = head_bytes;
+    let expects = all(raw, "expect");
     if !expects.is_empty() {
         if expects.len() > 1 || !expects[0].eq_ignore_ascii_case(b"100-continue") {
             return reject(Reason::BadExpect, "unsupported expectation");
         }
-        expect_continue = version == Version::H1_1 && framing != Framing::None;
+        meta.expect_continue = version == Version::H1_1 && framing != Framing::None;
     }
-
-    // Host.
-    if hosts.len() > 1 {
-        return reject(Reason::MultipleHost, "multiple host fields");
-    }
-    let host = hosts.first().copied();
-
-    let mut meta = RequestMeta::new(version, TargetForm::Origin);
-    meta.head_bytes = head.len();
-    meta.expect_continue = expect_continue;
-    meta.close = conn.iter().any(|t| t == "close")
-        || (version == Version::H1_0 && !conn.iter().any(|t| t == "keep-alive"));
+    let conn = connection_tokens(all(raw, "connection"))?;
+    // roxy never keeps an HTTP/1.0 connection alive, whatever `Connection`
+    // says, so the flag is simply true for every 1.0 request.
+    meta.close = version == Version::H1_0 || conn.iter().any(|t| t == "close");
+    let upgrades = all(raw, "upgrade");
     if conn.iter().any(|t| t == "upgrade") && !upgrades.is_empty() {
         let joined: Vec<String> = upgrades
             .iter()
@@ -402,94 +362,117 @@ pub fn parse_head(
             .collect();
         meta.upgrade = Some(joined.join(", "));
     }
+    let proxy_auth = all(raw, "proxy-authorization");
+    if proxy_auth.len() > 1 {
+        return reject(
+            Reason::MultipleProxyAuthorization,
+            "multiple proxy-authorization fields",
+        );
+    }
     if let Some(pa) = proxy_auth.first() {
         meta.proxy_authorization = HeaderValue::from_bytes(pa).ok();
     }
+    Ok(meta)
+}
 
-    let mut headers = Headers::try_from_raw(raw.iter().copied(), limits, flags)?;
-    headers.remove("expect");
-
-    // Request target vs role.
-    if method == Method::Connect {
-        if *role != Role::ProxyPort {
-            return reject(
-                Reason::TargetFormMismatch,
-                "CONNECT is only accepted on the proxy port",
-            );
-        }
-        if target.starts_with(b"/") || target.contains(&b'/') {
-            return reject(
-                Reason::BadRequestTarget,
-                "CONNECT target must be authority-form",
-            );
-        }
-        let authority = url::parse_authority_opt(target, None)?;
-        if let Some(h) = host {
-            let ha = url::parse_authority(h, authority.port)?;
-            if ha != authority {
-                return reject(
-                    Reason::HostMismatch,
-                    "host does not match CONNECT authority",
-                );
-            }
-        }
-        meta.target_form = TargetForm::Authority;
-        return Ok(Head::Connect {
-            authority,
-            headers,
-            meta,
-        });
+/// The single `Host` value, if any.
+fn single_host<'a>(raw: &[(&'a [u8], &'a [u8])]) -> Result<Option<&'a [u8]>, ParseError> {
+    let hosts = all(raw, "host");
+    if hosts.len() > 1 {
+        return reject(Reason::MultipleHost, "multiple host fields");
     }
+    Ok(hosts.first().copied())
+}
+
+/// `Host` must name `authority` (with `default_port` implied) when present.
+fn check_host(
+    host: &[u8],
+    authority: &Authority,
+    default_port: u16,
+    what: &str,
+) -> Result<(), ParseError> {
+    let ha = url::parse_authority(host, default_port)?;
+    if ha != *authority {
+        return reject(Reason::HostMismatch, format!("host does not match {what}"));
+    }
+    Ok(())
+}
+
+/// The CONNECT target: authority-form on the proxy port, agreeing with
+/// `Host` when one is sent.
+fn connect_target(
+    target: &[u8],
+    host: Option<&[u8]>,
+    role: &Role,
+) -> Result<Authority, ParseError> {
+    if *role != Role::ProxyPort {
+        return reject(
+            Reason::TargetFormMismatch,
+            "CONNECT is only accepted on the proxy port",
+        );
+    }
+    if target.contains(&b'/') {
+        return reject(
+            Reason::BadRequestTarget,
+            "CONNECT target must be authority-form",
+        );
+    }
+    let authority = url::parse_authority_opt(target, None)?;
+    if let Some(h) = host {
+        check_host(h, &authority, authority.port, "CONNECT authority")?;
+    }
+    Ok(authority)
+}
+
+/// Where a non-CONNECT request goes, from its target form, `Host` and the
+/// connection's role.
+type Target = (Scheme, Authority, Path, Option<Query>, TargetForm);
+
+fn resolve_target(
+    target: &[u8],
+    host: Option<&[u8]>,
+    role: &Role,
+    version: Version,
+) -> Result<Target, ParseError> {
     if target == b"*" {
         return reject(Reason::BadRequestTarget, "asterisk-form is not supported");
     }
-    let is_origin = target.starts_with(b"/");
-    let (scheme, authority, path, query) = match (role, is_origin) {
-        (Role::ProxyPort, false) => {
-            let (scheme, authority, path, query) = url::parse_absolute_form(target)?;
-            match host {
-                Some(h) => {
-                    let ha = url::parse_authority(h, scheme.default_port())?;
-                    if ha != authority {
-                        return reject(
-                            Reason::HostMismatch,
-                            "host does not match target authority",
-                        );
+    if !target.starts_with(b"/") {
+        return match role {
+            Role::ProxyPort => {
+                let (scheme, authority, path, query) = url::parse_absolute_form(target)?;
+                match host {
+                    Some(h) => {
+                        check_host(h, &authority, scheme.default_port(), "target authority")?;
                     }
+                    None if version == Version::H1_1 => {
+                        return reject(Reason::MissingHost, "no host field");
+                    }
+                    None => {}
                 }
-                None if version == Version::H1_1 => {
-                    return reject(Reason::MissingHost, "no host field");
-                }
-                None => {}
+                Ok((scheme, authority, path, query, TargetForm::Absolute))
             }
-            meta.target_form = TargetForm::Absolute;
-            (scheme, authority, path, query)
-        }
-        (Role::ProxyPort, true) => {
-            let Some(h) = host else {
-                return reject(Reason::MissingHost, "no host field");
-            };
-            let authority = url::parse_authority(h, Scheme::Http.default_port())?;
-            let (path, query) = url::parse_origin_form(target)?;
-            meta.target_form = TargetForm::Origin;
-            (Scheme::Http, authority, path, query)
-        }
-        (Role::Tunnel { .. }, false) => {
-            return reject(
+            Role::Tunnel { .. } => reject(
                 Reason::TargetFormMismatch,
                 "only origin-form is accepted inside a tunnel",
-            );
-        }
-        (Role::Direct { .. }, false) => {
-            return reject(
+            ),
+            Role::Direct { .. } => reject(
                 Reason::TargetFormMismatch,
                 "only origin-form is accepted on a direct listener",
-            );
-        }
-        (Role::Direct { port }, true) => {
-            let Some(h) = host else {
-                return reject(Reason::MissingHost, "no host field");
-            };
+            ),
+        };
+    }
+    // Origin-form: `Host` names the target, or must agree with the tunnel.
+    let Some(h) = host else {
+        return reject(Reason::MissingHost, "no host field");
+    };
+    let (path, query) = url::parse_origin_form(target)?;
+    let (scheme, authority) = match role {
+        Role::ProxyPort => (
+            Scheme::Http,
+            url::parse_authority(h, Scheme::Http.default_port())?,
+        ),
+        Role::Direct { port } => {
             let authority = url::parse_authority(h, Scheme::Http.default_port())?;
             if authority.port != *port {
                 return reject(
@@ -497,23 +480,42 @@ pub fn parse_head(
                     "host port does not match the listener's port",
                 );
             }
-            let (path, query) = url::parse_origin_form(target)?;
-            meta.target_form = TargetForm::Origin;
-            (Scheme::Http, authority, path, query)
+            (Scheme::Http, authority)
         }
-        (Role::Tunnel { authority, scheme }, true) => {
-            let Some(h) = host else {
-                return reject(Reason::MissingHost, "no host field");
-            };
-            let ha = url::parse_authority(h, scheme.default_port())?;
-            if ha != *authority {
-                return reject(Reason::HostMismatch, "host does not match tunnel authority");
-            }
-            let (path, query) = url::parse_origin_form(target)?;
-            meta.target_form = TargetForm::Origin;
-            (*scheme, authority.clone(), path, query)
+        Role::Tunnel { authority, scheme } => {
+            check_host(h, authority, scheme.default_port(), "tunnel authority")?;
+            (*scheme, authority.clone())
         }
     };
+    Ok((scheme, authority, path, query, TargetForm::Origin))
+}
+
+/// Parses and validates a complete head (as delimited by [`scan_head`]).
+pub fn parse_head(
+    head: &[u8],
+    role: &Role,
+    limits: &Limits,
+    flags: &HttpFlags,
+) -> Result<Head, ParseError> {
+    let version = check_raw_head(head, limits, flags)?;
+    let (method, target, raw) = tokenise(head)?;
+    let framing = request_framing(&raw, &method, version, limits, flags)?;
+    let mut meta = hop_by_hop_meta(&raw, version, framing, head.len())?;
+    let host = single_host(&raw)?;
+    let mut headers = Headers::try_from_raw(raw.iter().copied(), limits, flags)?;
+    headers.remove("expect");
+
+    if method == Method::Connect {
+        let authority = connect_target(target, host, role)?;
+        meta.target_form = TargetForm::Authority;
+        return Ok(Head::Connect {
+            authority,
+            headers,
+            meta,
+        });
+    }
+    let (scheme, authority, path, query, form) = resolve_target(target, host, role, version)?;
+    meta.target_form = form;
     Ok(Head::Request(RequestHead {
         method,
         scheme,
@@ -600,5 +602,34 @@ mod tests {
             parse("CONNECT http://example.com/ HTTP/1.1\r\n\r\n").unwrap_err(),
             Reason::BadRequestTarget
         );
+    }
+
+    #[test]
+    fn proxy_authorization_must_be_single() {
+        assert_eq!(
+            parse(
+                "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic eA==\r\nProxy-Authorization: Basic eQ==\r\n\r\n"
+            )
+            .unwrap_err(),
+            Reason::MultipleProxyAuthorization
+        );
+    }
+
+    #[test]
+    fn http10_always_closes() {
+        let flags = HttpFlags {
+            allow_http10: true,
+            ..HttpFlags::default()
+        };
+        let Head::Request(h) = parse_head(
+            b"GET http://example.com/ HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
+            &Role::ProxyPort,
+            &Limits::default(),
+            &flags,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert!(h.meta.close);
     }
 }

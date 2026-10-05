@@ -38,42 +38,34 @@ const DROPPED: &[&str] = &[
     "content-length",
 ];
 
-/// `${secret:name}` expanded from the policy snapshot's secrets.
+/// `value` with its `${secret:name}` references expanded from the policy
+/// snapshot's secrets; `None` if one is missing or the value does not
+/// parse (validation refuses such a config, so this is a missing secret).
 pub(super) fn expand(
     value: &str,
     secrets: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
-    let mut out = String::with_capacity(value.len());
-    let mut rest = value;
-    while let Some(i) = rest.find("${secret:") {
-        out.push_str(&rest[..i]);
-        let after = &rest[i + "${secret:".len()..];
-        let end = after.find('}')?;
-        out.push_str(secrets.get(&after[..end])?);
-        rest = &after[end + 1..];
-    }
-    out.push_str(rest);
-    Some(out)
+    let parts = roxy_rules::parse_template(value).ok()?;
+    roxy_rules::expand(&parts, |name| secrets.get(name).cloned())
 }
 
-/// The URL for a call: the endpoint's URL with the request's path and query
-/// appended.
+/// The URL for a call: the endpoint's URL with the request's path appended
+/// (a bare `/` adds nothing), and both URLs' queries, the endpoint's first.
 fn target(spec: &EndpointSpec, req: &Uri) -> Result<Uri, String> {
     let base = spec.url.path().trim_end_matches('/');
-    let pq = req.path_and_query().map_or("/", |p| p.as_str());
-    let pq = if pq == "/" && !base.is_empty() {
-        ""
-    } else {
-        pq
+    let path = match req.path() {
+        "/" | "" if !base.is_empty() => base.to_owned(),
+        "" => "/".to_owned(),
+        p => format!("{base}{p}"),
     };
-    let pq = if base.is_empty() && pq.is_empty() {
-        "/"
-    } else {
-        pq
+    let query = match (spec.url.query(), req.query()) {
+        (None, None) => String::new(),
+        (Some(q), None) | (None, Some(q)) => format!("?{q}"),
+        (Some(a), Some(b)) => format!("?{a}&{b}"),
     };
     let authority = spec.url.authority().map_or("", |a| a.as_str());
     let scheme = spec.url.scheme_str().unwrap_or("https");
-    format!("{scheme}://{authority}{base}{pq}")
+    format!("{scheme}://{authority}{path}{query}")
         .parse()
         .map_err(|e| format!("endpoint URL: {e}"))
 }
@@ -159,10 +151,9 @@ async fn attempt_all(
         headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
     }
 
+    // The connector runs the address floor on the address it dials; a
+    // denied one fails the first attempt.
     let upstream = st.snap.upstream.clone();
-    if let Err(e) = upstream.preflight(&authority, spec.private).await {
-        return Err((connect_error(&e), 1));
-    }
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -266,6 +257,15 @@ mod tests {
         assert_eq!(
             t("http://ti.internal:8443", "/x"),
             "http://ti.internal:8443/x"
+        );
+        // The endpoint's own query is kept, ahead of the request's.
+        assert_eq!(
+            t("https://api.example.com/v1?key=k", "/score?q=1"),
+            "https://api.example.com/v1/score?key=k&q=1"
+        );
+        assert_eq!(
+            t("https://api.example.com/v1?key=k", "/"),
+            "https://api.example.com/v1?key=k"
         );
     }
 

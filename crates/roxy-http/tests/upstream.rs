@@ -297,3 +297,17 @@ async fn upstream_response_cap_applies_while_streaming() {
         BodyError::TooLarge { limit: 4096 }
     );
 }
+
+#[test]
+fn upgrade_detected_beside_a_malformed_connection_element() {
+    let res = http::Response::builder()
+        .status(http::StatusCode::SWITCHING_PROTOCOLS)
+        .header("connection", "upgrade, (bad)")
+        .header("upgrade", "WebSocket")
+        .header("x-hop", "1")
+        .body(Body::empty())
+        .unwrap();
+    let c = from_upstream_response(res, &Limits::default());
+    assert_eq!(c.meta.upgrade.as_deref(), Some("websocket"));
+    assert!(!c.headers.contains("upgrade"));
+}

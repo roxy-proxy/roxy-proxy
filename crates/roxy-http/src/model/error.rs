@@ -60,6 +60,8 @@ pub enum Reason {
     MissingHost,
     /// More than one `Host` header.
     MultipleHost,
+    /// More than one `Proxy-Authorization` header.
+    MultipleProxyAuthorization,
     /// `Host` does not equal the absolute-form authority, the tunnel
     /// authority, or (h2) `:authority`.
     HostMismatch,
@@ -87,7 +89,7 @@ pub enum Reason {
     /// Trailer section present while `http.allow_trailers` is false, or a
     /// forbidden field inside allowed trailers.
     Trailers,
-    /// Missing CRLF after chunk data, or malformed trailer section.
+    /// Missing CRLF after chunk data.
     BadChunkFraming,
     // ----- URL -----
     /// Path contains a character outside `pchar` / `/`, or does not start
@@ -152,6 +154,7 @@ impl Reason {
         Reason::BadConnectionHeader,
         Reason::MissingHost,
         Reason::MultipleHost,
+        Reason::MultipleProxyAuthorization,
         Reason::HostMismatch,
         Reason::BadAuthority,
         Reason::AuthorityMismatch,
@@ -206,6 +209,7 @@ impl Reason {
             Reason::BadConnectionHeader => "bad_connection_header",
             Reason::MissingHost => "missing_host",
             Reason::MultipleHost => "multiple_host",
+            Reason::MultipleProxyAuthorization => "multiple_proxy_authorization",
             Reason::HostMismatch => "host_mismatch",
             Reason::BadAuthority => "bad_authority",
             Reason::AuthorityMismatch => "authority_mismatch",
@@ -355,6 +359,26 @@ pub enum WriteError {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn suggested_status_per_reason() {
+        for (r, status) in [
+            (Reason::HeadTooLarge, 431),
+            (Reason::TooManyHeaders, 431),
+            (Reason::UrlTooLong, 414),
+            (Reason::BodyTooLarge, 413),
+            (Reason::BadExpect, 417),
+            (Reason::UnsupportedVersion, 505),
+            (Reason::HeaderTimeout, 408),
+            (Reason::BodyTimeout, 408),
+            (Reason::InvalidState, 500),
+            (Reason::BareCr, 400),
+            (Reason::MultipleHost, 400),
+            (Reason::H2BadScheme, 400),
+        ] {
+            assert_eq!(r.suggested_status().as_u16(), status, "{r}");
+        }
+    }
 
     #[test]
     fn codes_unique_and_round_trip() {

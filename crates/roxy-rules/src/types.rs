@@ -36,9 +36,10 @@ impl fmt::Display for Type {
 /// texts have their own `FlowView` methods.
 ///
 /// Normalisation contract for implementors: `Host` and `TlsSni`
-/// are lower-case without a trailing dot; `Method` is the request method as
-/// sent (comparisons against `method`, `scheme` and the host fields are
-/// ASCII case-insensitive anyway); everything else is compared byte-exact.
+/// are lower-case without a trailing dot (comparisons against them and
+/// `scheme` are ASCII case-insensitive anyway); `Method` is the request
+/// method as sent, and like everything else is compared byte-exact (HTTP
+/// methods are case-sensitive: `get` is not `GET`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Field {
     /// `client.ip` (ip)
@@ -49,7 +50,7 @@ pub enum Field {
     ClientUser,
     /// `listener.name` (string)
     ListenerName,
-    /// `listener.mode` (string: `explicit`)
+    /// `listener.mode` (string: `explicit` / `direct`)
     ListenerMode,
     /// `tls.sni` (string)
     TlsSni,
@@ -258,12 +259,11 @@ impl Field {
         }
     }
 
-    /// Fields compared ASCII case-insensitively (DNS names, method, scheme).
+    /// Fields compared ASCII case-insensitively (DNS names and the scheme).
+    /// `method` is not one: HTTP methods are case-sensitive, and the proxy
+    /// treats `get` as an extension method, not as `GET`.
     pub fn case_insensitive(self) -> bool {
-        matches!(
-            self,
-            Self::Host | Self::TlsSni | Self::Method | Self::Scheme
-        )
+        matches!(self, Self::Host | Self::TlsSni | Self::Scheme)
     }
 
     /// The watched values this field reads; empty for a head field.

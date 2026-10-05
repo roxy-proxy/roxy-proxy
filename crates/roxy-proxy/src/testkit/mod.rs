@@ -62,6 +62,8 @@ pub(crate) const UP_IP: &str = "93.184.215.14";
 pub(crate) const PRIVATE_IP: &str = "10.0.0.5";
 /// An address whose dial is refused (`down.test`).
 pub(crate) const DOWN_IP: &str = "93.184.215.99";
+/// An address that accepts and reads but never answers (`stall.test`).
+pub(crate) const STALL_IP: &str = "93.184.215.77";
 
 /// Allows everything to `up.test`.
 pub(crate) const ALLOW_UP: &str = r#"
@@ -162,9 +164,18 @@ pub(crate) struct KitBuilder {
     /// `metrics:` definitions (YAML); a real metric store holds them.
     metric_defs: String,
     state: Arc<dyn StateSource>,
+    /// Capture every forwarded exchange into the kit's capture log.
+    capture_all: bool,
 }
 
 impl KitBuilder {
+    /// Opens a capture log that takes every forwarded exchange.
+    #[must_use]
+    pub(crate) fn capture_all(mut self) -> Self {
+        self.capture_all = true;
+        self
+    }
+
     #[must_use]
     pub(crate) fn rules(mut self, yaml: &str) -> Self {
         yaml.clone_into(&mut self.rules);
@@ -251,26 +262,11 @@ impl KitBuilder {
             addons.push(a.load(&rt, &input).await);
         }
 
-        let mut settings = UpstreamSettings::default();
-        // Never consult real DNS: unknown names fail.
-        settings.dns.servers = Some(vec!["127.0.0.1:9".parse().unwrap()]);
-        for (name, ip) in [
-            ("up.test", UP_IP),
-            ("private.test", PRIVATE_IP),
-            ("down.test", DOWN_IP),
-        ] {
-            settings
-                .dns
-                .static_hosts
-                .insert(name.to_owned(), vec![ip.parse().unwrap()]);
-        }
-        settings.connect_timeout = Duration::from_secs(5);
-        let up = upstream.clone();
-        settings.dial = Some(TestDial(Arc::new(move |addr| {
-            let up = up.clone();
-            Box::pin(async move { up.dial(addr) })
-        })));
-
+        let settings = upstream_settings(&upstream);
+        let (limits, flags) = (self.limits.clone(), self.flags.clone());
+        let capture = self
+            .capture_all
+            .then(|| Arc::new(capture_all_log(&dir.path().join("capture"))));
         let server = Server::start(RuntimeConfig {
             listeners: Vec::new(),
             ca_server: None,
@@ -288,7 +284,7 @@ impl KitBuilder {
             connection_events: false,
             ws_message_every: 0,
             sink: sink.clone(),
-            capture: None,
+            capture: capture.clone(),
             metrics,
             state: self.state,
             policy: PolicyUpdate {
@@ -298,7 +294,7 @@ impl KitBuilder {
                 users: HashMap::new(),
                 limits: self.limits,
                 flags: self.flags,
-                upstream: settings,
+                upstream: settings.clone(),
                 address_lists: Arc::new(HashMap::new()),
                 deny_lists: Vec::new(),
                 addons,
@@ -310,7 +306,11 @@ impl KitBuilder {
             server,
             sink,
             upstream,
+            capture,
             ca_file: dir.path().join(roxy_tls::CA_CERT_FILE),
+            limits,
+            flags,
+            settings,
             _dir: dir,
         }
     }
@@ -321,7 +321,12 @@ pub(crate) struct Kit {
     pub server: Server,
     pub sink: Arc<MemorySink>,
     pub upstream: Arc<Upstream>,
+    /// The capture log, with [`KitBuilder::capture_all`].
+    pub capture: Option<Arc<crate::capture::CaptureLog>>,
     ca_file: std::path::PathBuf,
+    limits: Limits,
+    flags: HttpFlags,
+    settings: UpstreamSettings,
     _dir: tempfile::TempDir,
 }
 
@@ -335,6 +340,7 @@ impl Kit {
             metrics: Arc::new(UnavailableMetrics),
             metric_defs: String::new(),
             state: Arc::new(UnavailableState),
+            capture_all: false,
         }
     }
 
@@ -353,13 +359,21 @@ impl Kit {
             user: None,
             original_dst: None,
         };
-        tokio::spawn(crate::conn::serve_direct(
+        self.spawn_conn(crate::conn::serve_direct(
             Box::new(server),
             conn,
             port,
             self.server.shared().clone(),
         ));
         client
+    }
+
+    /// Serves a connection the way the accept loop does, so a server
+    /// shutdown reaches it (`stop`, then the kill switch).
+    fn spawn_conn(&self, fut: impl std::future::Future<Output = ()> + Send + 'static) {
+        let shared = self.server.shared();
+        let slot = crate::server::conn_slot(shared, "192.0.2.7".parse().unwrap()).unwrap();
+        shared.spawn_conn(slot, fut);
     }
 
     /// A raw client connection to the proxy port.
@@ -376,7 +390,7 @@ impl Kit {
             user: None,
             original_dst: None,
         };
-        tokio::spawn(crate::conn::serve_explicit(
+        self.spawn_conn(crate::conn::serve_explicit(
             Box::new(server),
             conn,
             self.server.shared().clone(),
@@ -491,6 +505,65 @@ impl Kit {
     pub(crate) async fn request_event(&self) -> serde_json::Value {
         self.events("request", 1).await.remove(0)
     }
+
+    /// Swaps in a new policy with these rules (no metrics, no addons); the
+    /// limits, flags and upstream settings stay.
+    pub(crate) fn reload(&self, rules: &str) {
+        let rules: Vec<RuleConfig> = serde_yaml_ng::from_str(rules).unwrap();
+        let none = std::collections::HashSet::new();
+        let input = PolicyInput {
+            rules: &rules,
+            metrics: &[],
+            secret_names: &none,
+            address_lists: &none,
+            transparent_listeners: false,
+            default: DefaultDecision::Deny,
+        };
+        let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
+        self.server
+            .reload(PolicyUpdate {
+                policy,
+                secrets: HashMap::new(),
+                redactor: Redactor::new(),
+                users: HashMap::new(),
+                limits: self.limits.clone(),
+                flags: self.flags.clone(),
+                upstream: self.settings.clone(),
+                address_lists: Arc::new(HashMap::new()),
+                deny_lists: Vec::new(),
+                addons: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    /// Everything captured so far, as `(header, payload)` records.
+    pub(crate) fn captured(&self) -> Vec<(serde_json::Value, Vec<u8>)> {
+        let log = self.capture.as_ref().expect("capture_all");
+        assert!(log.flush());
+        crate::capture::tests::parse(&std::fs::read(log.path()).unwrap())
+    }
+
+    /// Waits until `n` requests have reached the upstream (their bodies may
+    /// still be arriving).
+    pub(crate) async fn wait_arrived(&self, n: usize) -> Vec<Seen> {
+        let wait = async {
+            loop {
+                let seen = self.upstream.seen();
+                if seen.len() >= n {
+                    return seen;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "upstream: wanted {n} requests, have {:#?}",
+                    self.upstream.seen()
+                )
+            })
+    }
 }
 
 /// A client over HTTP/1.1 or HTTP/2.
@@ -500,10 +573,12 @@ pub(crate) enum Client {
     H1 {
         send: hyper::client::conn::http1::SendRequest<Body>,
         tunnel: Option<String>,
+        conn: tokio::task::JoinHandle<()>,
     },
     H2 {
         send: hyper::client::conn::http2::SendRequest<Body>,
         host: String,
+        conn: tokio::task::JoinHandle<()>,
     },
 }
 
@@ -515,12 +590,13 @@ impl Client {
         let (send, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
             .await
             .unwrap();
-        tokio::spawn(async move {
+        let conn = tokio::spawn(async move {
             let _ = conn.with_upgrades().await;
         });
         Self::H1 {
             send,
             tunnel: tunnel.map(str::to_owned),
+            conn,
         }
     }
 
@@ -532,12 +608,21 @@ impl Client {
             hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io))
                 .await
                 .unwrap();
-        tokio::spawn(async move {
+        let conn = tokio::spawn(async move {
             let _ = conn.await;
         });
         Self::H2 {
             send,
             host: host.to_owned(),
+            conn,
+        }
+    }
+
+    /// Drops the connection where it stands (no GOAWAY, no close frame):
+    /// roxy sees the client vanish.
+    pub(crate) fn kill(&self) {
+        match self {
+            Self::H1 { conn, .. } | Self::H2 { conn, .. } => conn.abort(),
         }
     }
 
@@ -668,6 +753,61 @@ impl Answer {
     pub(crate) fn json(&self) -> serde_json::Value {
         serde_json::from_slice(self.body.as_ref().expect("complete body")).expect("JSON body")
     }
+}
+
+/// The connector's settings: the test names, and the scripted upstream
+/// behind the dial.
+fn upstream_settings(upstream: &Arc<Upstream>) -> UpstreamSettings {
+    let mut settings = UpstreamSettings::default();
+    // Never consult real DNS: unknown names fail.
+    settings.dns.servers = Some(vec!["127.0.0.1:9".parse().unwrap()]);
+    for (name, ip) in [
+        ("up.test", UP_IP),
+        ("private.test", PRIVATE_IP),
+        ("down.test", DOWN_IP),
+        ("stall.test", STALL_IP),
+    ] {
+        settings
+            .dns
+            .static_hosts
+            .insert(name.to_owned(), vec![ip.parse().unwrap()]);
+    }
+    settings.connect_timeout = Duration::from_secs(5);
+    let up = upstream.clone();
+    settings.dial = Some(TestDial(Arc::new(move |addr| {
+        let up = up.clone();
+        Box::pin(async move {
+            if addr.ip().to_string() == STALL_IP {
+                return Ok(stalled());
+            }
+            up.dial(addr)
+        })
+    })));
+    settings
+}
+
+/// A connection whose peer reads everything and never writes.
+fn stalled() -> crate::io::BoxIo {
+    let (mut ours, theirs) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        while matches!(ours.read(&mut buf).await, Ok(n) if n > 0) {}
+    });
+    Box::new(theirs)
+}
+
+/// A capture log in `dir` that takes every forwarded exchange.
+fn capture_all_log(dir: &std::path::Path) -> crate::capture::CaptureLog {
+    crate::capture::CaptureLog::open(
+        dir,
+        crate::capture::CaptureOptions {
+            max_body_bytes: 16 * 1024 * 1024,
+            all: true,
+            writer: roxy_log::WriterOptions::default(),
+            rotate: roxy_log::RotateOptions::default(),
+        },
+    )
+    .unwrap()
 }
 
 /// A request body the test feeds chunk by chunk.

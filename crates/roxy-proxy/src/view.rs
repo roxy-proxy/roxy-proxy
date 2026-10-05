@@ -14,7 +14,7 @@
 
 use std::borrow::Cow;
 use std::net::IpAddr;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use roxy_http::coding::{self, DecodeError};
 use roxy_http::ws::frame::Message;
@@ -33,8 +33,10 @@ pub(crate) enum Inspected {
     /// No rule needs the body; it streams untouched.
     #[default]
     NotBuffered,
-    /// Buffered and decoded (lossy UTF-8).
-    Text(String),
+    /// Buffered and decoded (lossy UTF-8). Shared: the facts are cloned
+    /// into the watcher and the addon stack, and the text can be as large
+    /// as `limits.max_inspect_body_bytes`.
+    Text(Arc<str>),
     /// Larger than `limits.max_inspect_body_bytes`, as sent or decoded.
     TooLarge,
     /// `content-encoding` names a coding roxy cannot decode.
@@ -53,10 +55,10 @@ impl Inspected {
             Err(e) => return Self::from_error(e),
         };
         if codings.is_empty() {
-            return Self::Text(String::from_utf8_lossy(body).into_owned());
+            return Self::Text(String::from_utf8_lossy(body).into());
         }
         match coding::decode(&codings, body, cap) {
-            Ok(d) => Self::Text(String::from_utf8_lossy(&d).into_owned()),
+            Ok(d) => Self::Text(String::from_utf8_lossy(&d).into()),
             Err(e) => Self::from_error(e),
         }
     }

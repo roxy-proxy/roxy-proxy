@@ -10,6 +10,8 @@ use support::{Harness, Opts, SECRET, h2_get};
 use tokio_tungstenite::tungstenite::Message;
 
 const TEST_LAYER: &[u8] = include_bytes!("../../roxy-wasm/tests/fixtures/test_layer.wasm");
+/// A layer that knows no `x-test`: it passes every request on.
+const REDACT_LAYER: &[u8] = include_bytes!("../../roxy-wasm/tests/fixtures/redact.wasm");
 
 const ALLOW_UPSTREAM: &str = r#"
   - id: upstream
@@ -54,6 +56,30 @@ async fn start_layer(wasm: &[u8], addon: &str, rules: &str) -> Harness {
     // at load); keep the dir alive anyway for reloads.
     std::mem::forget(tmp);
     h
+}
+
+/// The addon file is watched like the config: replacing it reloads, and
+/// the new component serves the next exchange.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_wasm_file_triggers_a_reload() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The test layer ignores `config`; the redact layer needs its needles.
+    let extra = addon_yaml(tmp.path(), "config: { needles: [hunter2] }");
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        extra: &extra,
+        ..Opts::default()
+    })
+    .await;
+    let res = send(&h, "deny", "/x", "").await;
+    assert_eq!(res.status(), 403, "the test layer denies on request");
+
+    std::fs::write(tmp.path().join("layer.wasm"), REDACT_LAYER).unwrap();
+    h.wait_events("config_reloaded", 1).await;
+    let res = send(&h, "deny", "/x", "").await;
+    assert_eq!(res.status(), 200);
+    assert_eq!(json(&res.bytes().await.unwrap())["path"], "/x");
+    h.stop().await;
 }
 
 fn json(b: &[u8]) -> Value {
@@ -239,9 +265,15 @@ async fn a_failure_after_the_head_cuts_the_body() {
         .header("x-test", "trap-after-head")
         .send()
         .await;
-    if let Ok(res) = res {
-        assert_eq!(res.status(), 200);
-        assert!(res.bytes().await.is_err(), "the body must not end cleanly");
+    match res {
+        Ok(res) => {
+            assert_eq!(res.status(), 200);
+            assert!(res.bytes().await.is_err(), "the body must not end cleanly");
+        }
+        Err(e) => assert!(
+            !e.is_timeout() && !e.is_connect(),
+            "the exchange itself must fail, not reaching roxy: {e}"
+        ),
     }
     let err = h.wait_events("layer_error", 1).await;
     assert_eq!(err[0]["kind"], "trap");
@@ -291,7 +323,7 @@ async fn start_endpoint(private_ok: bool) -> Harness {
         ..Opts::default()
     });
     std::fs::write(&h.config_path, cfg).unwrap();
-    assert!(h.running.as_ref().unwrap().reloader.reload_async().await);
+    assert!(h.running.as_ref().unwrap().reloader.reload().await);
     std::mem::forget(tmp);
     h
 }

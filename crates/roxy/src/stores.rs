@@ -5,22 +5,13 @@
 //! so it is rebuilt on every successful reload. Series whose definition is
 //! unchanged are carried over ([`MetricStore::carry_over`]) so an unrelated
 //! config edit never resets a rate limit.
-//!
-//! Reload ordering: the new store is prepared (and the old series copied
-//! into it) before the policy swap, and swapped in immediately after the
-//! policy swap succeeds. In the microseconds between the two swaps a flow
-//! may see a metric id that only one side knows about; that resolves to
-//! `MetricSourceError::Unknown`, which fails the flow closed. Records landing
-//! on the old store after the carry-over copy are lost; the window is the
-//! duration of one `ArcSwap::store`, so the undercount is bounded by the
-//! flows recorded in that instant.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use roxy_proxy::{MetricSource, MetricSourceError, Sample, StateFull, StateSource};
-use roxy_rules::{FlowView, MetricError, MetricLimits, MetricStore, Policy, StateStore};
+use roxy_rules::{FlowView, MetricDef, MetricError, MetricLimits, MetricStore, Policy, StateStore};
 
 /// Default TTL for `set_state` entries written without an explicit `ttl`.
 pub const STATE_DEFAULT_TTL: Duration = Duration::from_secs(3600);
@@ -29,6 +20,19 @@ pub const STATE_DEFAULT_TTL: Duration = Duration::from_secs(3600);
 #[derive(Debug)]
 pub struct ReloadableMetrics {
     inner: ArcSwap<MetricStore>,
+    /// The definitions the live store was built for, and the lock that
+    /// serialises installs.
+    defs: Mutex<Vec<MetricDef>>,
+}
+
+/// Whether two definitions keep each other's series: the same shape, so
+/// a value recorded under one reads the same under the other.
+fn same_shape(a: &MetricDef, b: &MetricDef) -> bool {
+    a.id == b.id
+        && a.count == b.count
+        && a.unique == b.unique
+        && a.key == b.key
+        && a.window == b.window
 }
 
 impl ReloadableMetrics {
@@ -37,17 +41,30 @@ impl ReloadableMetrics {
     pub fn new(policy: &Policy, limits: MetricLimits) -> Self {
         Self {
             inner: ArcSwap::from_pointee(MetricStore::with_limits(policy.metric_defs(), limits)),
+            defs: Mutex::new(policy.metric_defs().to_vec()),
         }
     }
 
-    /// Builds the store for a new policy and copies over every series whose
-    /// definition is unchanged. Call [`ReloadableMetrics::install`] with the
-    /// result once the policy swap has succeeded; drop it otherwise.
+    /// Whether a store built for `policy` also serves the policy the live
+    /// store was built for: every metric it defines is in `policy` with the
+    /// same shape. Then the new store can go in before the policy swap, and
+    /// no flow on either side meets a metric its store does not know.
+    pub fn keeps_every_metric(&self, policy: &Policy) -> bool {
+        let defs = self.defs.lock().unwrap_or_else(PoisonError::into_inner);
+        defs.iter()
+            .all(|old| policy.metric_defs().iter().any(|new| same_shape(old, new)))
+    }
+
+    /// Builds the store for `policy`, copies over every series whose
+    /// definition is unchanged and swaps it in. The copy and the swap are
+    /// one step under the install lock, so a record on the old store can
+    /// be lost only in the instant of the pointer swap itself.
     ///
     /// `limits` are the new config's: a smaller budget than the old store's
     /// is respected, and series that no longer fit are dropped (and logged)
     /// rather than carried past it.
-    pub fn prepare(&self, policy: &Policy, limits: MetricLimits) -> MetricStore {
+    pub fn install(&self, policy: &Policy, limits: MetricLimits) {
+        let mut defs = self.defs.lock().unwrap_or_else(PoisonError::into_inner);
         let next = MetricStore::with_limits(policy.metric_defs(), limits);
         let report = next.carry_over(&self.inner.load());
         if report.skipped_budget > 0 {
@@ -58,12 +75,8 @@ impl ReloadableMetrics {
                 "metric series not carried over on reload: byte budget exhausted"
             );
         }
-        next
-    }
-
-    /// Swaps in a store returned by [`ReloadableMetrics::prepare`].
-    pub fn install(&self, next: MetricStore) {
         self.inner.store(Arc::new(next));
+        *defs = policy.metric_defs().to_vec();
     }
 
     /// Live key count, for diagnostics.
@@ -135,12 +148,24 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
-    const CONFIG: &str = "version: 1\nmetrics:\n  \
+    const CONFIG: &str = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:3128 }]\nmetrics:\n  \
         - { id: by_path, count: requests, key: [path], window: 1h }\n";
 
     fn policy() -> Policy {
-        let config = Config::from_yaml(CONFIG).unwrap();
-        crate::run::policy_update(&config).unwrap().policy
+        Config::from_yaml(CONFIG)
+            .unwrap()
+            .validate()
+            .unwrap()
+            .policy
+    }
+
+    /// `yaml` is the config after the listener line.
+    fn policy_for(yaml: &str) -> Policy {
+        let yaml = format!(
+            "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:3128 }}]\n{}",
+            yaml.trim_start_matches("version: 1\n")
+        );
+        Config::from_yaml(&yaml).unwrap().validate().unwrap().policy
     }
 
     fn limits(max_bytes: usize) -> MetricLimits {
@@ -174,11 +199,12 @@ mod tests {
         assert_eq!(m.key_count(), 4);
 
         let budget = 2 * per_series + per_series / 2;
-        let next = m.prepare(&policy, limits(budget));
-        assert_eq!(next.max_bytes(), budget);
-        assert_eq!(next.key_count(), 2, "only two series fit the new budget");
-        assert!(next.byte_count() <= budget);
-        m.install(next);
+        m.install(&policy, limits(budget));
+        let store = m.inner.load();
+        assert_eq!(store.max_bytes(), budget);
+        assert_eq!(store.key_count(), 2, "only two series fit the new budget");
+        assert!(store.byte_count() <= budget);
+        drop(store);
 
         let view = |p: &str| MapView::new().with_str(Field::Path, p);
         let carried = ["/a", "/b", "/c", "/d"]
@@ -201,8 +227,32 @@ mod tests {
         for p in ["/a", "/b", "/c"] {
             record(&m, p).unwrap();
         }
-        let next = m.prepare(&policy, limits(2 << 20));
-        assert_eq!(next.key_count(), 3);
-        assert_eq!(next.max_bytes(), 2 << 20);
+        m.install(&policy, limits(2 << 20));
+        assert_eq!(m.key_count(), 3);
+        assert_eq!(m.inner.load().max_bytes(), 2 << 20);
+    }
+
+    /// Adding a metric, or leaving them alone, keeps every running one;
+    /// removing one or changing its shape does not. Only in the first case
+    /// may the new store go in ahead of the policy swap.
+    #[test]
+    fn keeps_every_metric_means_same_shape_for_every_running_metric() {
+        let m = ReloadableMetrics::new(&policy(), limits(1 << 20));
+        assert!(m.keeps_every_metric(&policy()));
+        assert!(m.keeps_every_metric(&policy_for(
+            "version: 1\nmetrics:\n  - { id: by_path, count: requests, key: [path], window: 1h }\n  \
+             - { id: errors, count: errors }\n"
+        )));
+        for changed in [
+            "version: 1\n",
+            "version: 1\nmetrics: [{ id: by_path, count: requests, key: [path], window: 2h }]\n",
+            "version: 1\nmetrics: [{ id: by_path, count: requests, key: [host], window: 1h }]\n",
+            "version: 1\nmetrics: [{ id: by_path, count: errors, key: [path], window: 1h }]\n",
+        ] {
+            assert!(!m.keeps_every_metric(&policy_for(changed)), "{changed}");
+        }
+        // Installing moves the baseline.
+        m.install(&policy_for("version: 1\n"), limits(1 << 20));
+        assert!(m.keeps_every_metric(&policy_for("version: 1\n")));
     }
 }

@@ -20,11 +20,12 @@ use bytesize::ByteSize;
 use ipnet::IpNet;
 use serde::Deserialize;
 
+pub use roxy_rules::Diagnostic;
 pub use roxy_rules::config::{
     Action, DefaultDecision, Expr, MetricConfig as Metric, MetricCount, RuleConfig as Rule, Then,
 };
 pub use units::Resolver;
-pub use validate::Diagnostic;
+pub use validate::Compiled;
 
 /// The only supported config `version`.
 pub const CONFIG_VERSION: u32 = 1;
@@ -514,7 +515,7 @@ impl TryFrom<RawAddressList> for AddressList {
 /// A host service an addon may use. Each gates imports that are
 /// always linked: calling one without its capability fails the flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(try_from = "RawCapability")]
 pub enum Capability {
     /// Named outbound calls (`endpoints:`).
     Endpoints,
@@ -526,9 +527,40 @@ pub enum Capability {
     Metrics,
     /// roxy's operational log.
     Log,
-    /// Parsed for compatibility and refused: endpoints attach credentials,
-    /// so an addon never needs to see a secret.
+}
+
+/// YAML names of [`Capability`], plus `secrets`, which gets a pointed
+/// refusal rather than "unknown variant": endpoints attach credentials, so
+/// an addon never needs to see a secret.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawCapability {
+    Endpoints,
+    State,
+    Record,
+    Metrics,
+    Log,
     Secrets,
+}
+
+impl TryFrom<RawCapability> for Capability {
+    type Error = &'static str;
+    fn try_from(raw: RawCapability) -> Result<Self, Self::Error> {
+        Ok(match raw {
+            RawCapability::Endpoints => Self::Endpoints,
+            RawCapability::State => Self::State,
+            RawCapability::Record => Self::Record,
+            RawCapability::Metrics => Self::Metrics,
+            RawCapability::Log => Self::Log,
+            RawCapability::Secrets => {
+                return Err(
+                    "the `secrets` capability is not provided: put credentials on an \
+                            endpoint's `headers`, which roxy attaches without the addon seeing \
+                            them",
+                );
+            }
+        })
+    }
 }
 
 /// A named outbound endpoint. The addon names it; roxy resolves the

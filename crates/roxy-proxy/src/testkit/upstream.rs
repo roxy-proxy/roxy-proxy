@@ -1,5 +1,7 @@
 //! The scripted upstream behind the connector's test dial.
 
+pub(crate) mod service;
+
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -38,6 +40,7 @@ pub(crate) struct Upstream {
     minter: Arc<LeafMinter>,
     seen: Mutex<Vec<Arc<Mutex<Seen>>>>,
     changed: Notify,
+    service: Arc<service::ServiceLog>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -50,7 +53,13 @@ impl Upstream {
             minter,
             seen: Mutex::new(Vec::new()),
             changed: Notify::new(),
+            service: Arc::new(service::ServiceLog::default()),
         })
+    }
+
+    /// What the in-test service layer endpoint saw.
+    pub(crate) fn service(&self) -> &service::ServiceLog {
+        &self.service
     }
 
     /// A snapshot of what arrived so far.
@@ -140,6 +149,8 @@ impl Upstream {
     /// * `/echo`: reads the body, answers with the same bytes, with
     ///   `content-encoding` set to the request's `x-echo-encoding` and the
     ///   status to its `x-echo-status` (default `200`);
+    /// * a `roxy.layer.v2` handshake: the in-test service layer endpoint
+    ///   ([`service`]);
     /// * a WebSocket upgrade: `101`, then echoes bytes; with
     ///   `x-echo: once`, echoes the first read and closes; with
     ///   `x-accept-extension`, accepts `permessage-deflate`;
@@ -155,6 +166,9 @@ impl Upstream {
             .path_and_query()
             .map_or("/", |p| p.as_str())
             .to_owned();
+        if service::is_handshake(&req) {
+            return service::accept(&mut req, path, self.service.clone());
+        }
         let entry = Arc::new(Mutex::new(Seen {
             addr,
             method: req.method().to_string(),

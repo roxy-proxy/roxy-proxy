@@ -107,10 +107,15 @@ pub enum DecodeError {
 
 /// The codings in `headers`' `content-encoding` fields, in the order they
 /// were applied. `identity` and empty list elements are skipped, so a body
-/// with no coding gives an empty list.
+/// with no coding gives an empty list. A value that is not a readable
+/// string names no coding roxy knows, so it is [`DecodeError::Unsupported`]
+/// rather than identity: the body must not be read as plain text.
 pub fn content_codings(headers: &Headers) -> Result<Vec<Coding>, DecodeError> {
     let mut out = Vec::new();
-    for value in headers.get_all("content-encoding") {
+    for raw in headers.get_all_raw("content-encoding") {
+        let value = raw.to_str().map_err(|_| {
+            DecodeError::Unsupported(String::from_utf8_lossy(raw.as_bytes()).into_owned())
+        })?;
         for token in value.split(',').map(str::trim) {
             if token.is_empty() || token.eq_ignore_ascii_case("identity") {
                 continue;
@@ -1207,5 +1212,23 @@ mod tests {
             DecodeError::Unsupported("compress".into())
         );
         assert!(h(&["gzip, gzip, gzip, gzip, gzip"]).is_err());
+    }
+
+    #[test]
+    fn content_codings_unreadable_value_is_not_identity() {
+        let obs = crate::HttpFlags {
+            allow_obs_text: true,
+            ..crate::HttpFlags::default()
+        };
+        let h = Headers::try_from_raw(
+            [(&b"content-encoding"[..], &b"gz\xffip"[..])],
+            &crate::Limits::default(),
+            &obs,
+        )
+        .unwrap();
+        assert!(matches!(
+            content_codings(&h).unwrap_err(),
+            DecodeError::Unsupported(_)
+        ));
     }
 }

@@ -179,6 +179,25 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
         r.map_err(|e| self.fail(e))
     }
 
+    /// [`ReadSide::pump`] while a body is being read; otherwise watches the
+    /// idle socket so a client that closes while its response is pending is
+    /// reported rather than waited for. Bytes that arrive instead (pipelined
+    /// requests) stay buffered and end the watch. Cancel-safe.
+    async fn pump_or_watch(&mut self) -> Result<(), ParseError> {
+        if self.feed.is_some() {
+            return self.pump().await;
+        }
+        self.buf.reserve(READ_CHUNK);
+        match self.rd.read_buf(&mut self.buf).await {
+            Ok(0) => Err(ParseError::new(
+                Reason::UnexpectedEof,
+                "client closed while awaiting the response",
+            )),
+            Ok(_) => Ok(()),
+            Err(e) => Err(io_err(&e)),
+        }
+    }
+
     async fn pump_inner(&mut self) -> Result<(), ParseError> {
         let idle = self.limits.body_idle_timeout;
         loop {
@@ -494,11 +513,6 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         }
     }
 
-    /// Requests read so far.
-    pub fn requests_served(&self) -> u64 {
-        self.served
-    }
-
     /// The connection role.
     pub fn role(&self) -> &Role {
         &self.role
@@ -513,7 +527,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     /// keep-alive idle timeout.
     async fn read_head(&mut self) -> Result<Option<BytesMut>, ParseError> {
         let limits = self.limits.clone();
-        let mut deadline = (self.served == 0).then(|| Instant::now() + limits.header_timeout);
+        // The head has started once anything is buffered (pipelined bytes
+        // count), so the header deadline applies from the outset.
+        let started = self.served == 0 || !self.r.buf.is_empty();
+        let mut deadline = started.then(|| Instant::now() + limits.header_timeout);
         let mut scan_from = 0;
         loop {
             // RFC 9112 §2.2: ignore empty lines before the request line.
@@ -568,7 +585,6 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     /// the connection. Any violation returns `Err`; the caller must then drop
     /// the connection (calling [`ServerConn::respond_error_and_close`] first
     /// if it wants to send an error status).
-    #[allow(clippy::too_many_lines)]
     pub async fn next_request(&mut self) -> Result<Option<Incoming>, ParseError> {
         match self.state {
             State::Closed => return Ok(None),
@@ -620,56 +636,59 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
                     meta,
                 }))
             }
-            Head::Request(h) => {
-                let max = self.limits.max_request_body_bytes;
-                let (body, feed) = match h.framing {
-                    Framing::None => (Body::empty(), None),
-                    Framing::Length(n) => {
-                        let (tx, body) = Body::channel(max, Some(n));
-                        (body, Some((BodyDecoder::Length(n), tx)))
-                    }
-                    Framing::Chunked => {
-                        let (tx, body) = Body::channel(max, None);
-                        let d = ChunkedDecoder::new(&self.limits, &self.flags);
-                        (body, Some((BodyDecoder::Chunked(d), tx)))
-                    }
-                };
-                self.r.feed = feed.map(|(decoder, tx)| BodyFeed {
-                    decoder,
-                    sender: Some(tx),
-                    pending: None,
-                    drained: 0,
-                });
-                self.exchange = Some(Exchange {
-                    is_head: h.method == crate::model::Method::Head,
-                    close: h.meta.close,
-                    expect: if h.meta.expect_continue {
-                        Continue::Pending
-                    } else {
-                        Continue::NotExpected
-                    },
-                    version: h.meta.version,
-                    upgrade: h.meta.upgrade.clone(),
-                });
-                self.state = State::AwaitingResponse;
-                let origin_on_proxy =
-                    self.role == Role::ProxyPort && h.meta.target_form == TargetForm::Origin;
-                let req = CanonicalRequest {
-                    method: h.method,
-                    scheme: h.scheme,
-                    authority: h.authority,
-                    path: h.path,
-                    query: h.query,
-                    headers: h.headers,
-                    body,
-                    meta: h.meta,
-                };
-                Ok(Some(if origin_on_proxy {
-                    Incoming::OriginFormOnProxyPort(req)
-                } else {
-                    Incoming::Request(req)
-                }))
+            Head::Request(h) => Ok(Some(self.begin_request(h))),
+        }
+    }
+
+    /// Sets up the body feed and exchange state for a parsed request head.
+    fn begin_request(&mut self, h: RequestHead) -> Incoming {
+        let max = self.limits.max_request_body_bytes;
+        let (body, feed) = match h.framing {
+            Framing::None => (Body::empty(), None),
+            Framing::Length(n) => {
+                let (tx, body) = Body::channel(max, Some(n));
+                (body, Some((BodyDecoder::Length(n), tx)))
             }
+            Framing::Chunked => {
+                let (tx, body) = Body::channel(max, None);
+                let d = ChunkedDecoder::new(&self.limits, &self.flags);
+                (body, Some((BodyDecoder::Chunked(d), tx)))
+            }
+        };
+        self.r.feed = feed.map(|(decoder, tx)| BodyFeed {
+            decoder,
+            sender: Some(tx),
+            pending: None,
+            drained: 0,
+        });
+        self.exchange = Some(Exchange {
+            is_head: h.method == crate::model::Method::Head,
+            close: h.meta.close,
+            expect: if h.meta.expect_continue {
+                Continue::Pending
+            } else {
+                Continue::NotExpected
+            },
+            version: h.meta.version,
+            upgrade: h.meta.upgrade.clone(),
+        });
+        self.state = State::AwaitingResponse;
+        let origin_on_proxy =
+            self.role == Role::ProxyPort && h.meta.target_form == TargetForm::Origin;
+        let req = CanonicalRequest {
+            method: h.method,
+            scheme: h.scheme,
+            authority: h.authority,
+            path: h.path,
+            query: h.query,
+            headers: h.headers,
+            body,
+            meta: h.meta,
+        };
+        if origin_on_proxy {
+            Incoming::OriginFormOnProxyPort(req)
+        } else {
+            Incoming::Request(req)
         }
     }
 
@@ -696,8 +715,9 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     /// it (driving the body means the request was allowed).
     ///
     /// Returns `Err` if the request body is invalid, too large, stalls or
-    /// the client goes away; `fut` is dropped in that case and the connection
-    /// must be closed.
+    /// the client goes away (including a client that closes while waiting
+    /// for the response to a bodiless request); `fut` is dropped in that
+    /// case and the connection must be closed.
     pub async fn drive<F: Future>(&mut self, fut: F) -> Result<F::Output, ParseError> {
         if self.r.feed.is_some() {
             self.send_100_continue()
@@ -705,15 +725,13 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
                 .map_err(|e| ParseError::new(Reason::Io, e.to_string()))?;
         }
         let mut fut = std::pin::pin!(fut);
-        if self.r.feed.is_some() {
-            tokio::select! {
-                biased;
-                out = &mut fut => return Ok(out),
-                r = self.r.pump() => {
-                    if let Err(e) = r {
-                        self.state = State::Broken;
-                        return Err(e);
-                    }
+        tokio::select! {
+            biased;
+            out = &mut fut => return Ok(out),
+            r = self.r.pump_or_watch() => {
+                if let Err(e) = r {
+                    self.state = State::Broken;
+                    return Err(e);
                 }
             }
         }
@@ -790,11 +808,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
             self.r.abandoned = true;
         }
         let framing = Self::out_framing(&res, &ex);
-        let close = ex.close
-            || res.meta.close
-            || ex.version == Version::H1_0
-            || self.r.abandoned
-            || framing == OutFraming::CloseDelimited;
+        let close =
+            ex.close || res.meta.close || self.r.abandoned || framing == OutFraming::CloseDelimited;
         let head = response_head(res.status, &res.headers, &[], framing, close, None);
         let idle = self.limits.body_idle_timeout;
 
@@ -877,9 +892,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
 
     /// Answers the pending request or CONNECT with `407 Proxy Authentication
     /// Required`, a `proxy-authenticate: Basic realm="<realm>"` challenge,
-    /// `connection: close` and `body` (sent with `content-length`; the caller
-    /// supplies any `content-type` semantics by choosing the body), then
-    /// closes like [`ServerConn::respond_error_and_close`] (an unread request
+    /// `connection: close` and `body` (sent with `content-length` and
+    /// `content-type: <content_type>`), then closes like [`ServerConn::respond_error_and_close`] (an unread request
     /// body is abandoned; half-close, then lingering close).
     ///
     /// `realm` must be printable ASCII (`0x20..=0x7e`) without `"` or `\`,
@@ -889,6 +903,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     pub async fn respond_proxy_auth_required(
         mut self,
         realm: &str,
+        content_type: &str,
         body: Bytes,
     ) -> Result<(), WriteError> {
         if !matches!(self.state, State::AwaitingResponse | State::AwaitingConnect) {
@@ -906,7 +921,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         self.close_with(
             StatusCode::PROXY_AUTHENTICATION_REQUIRED,
             &Headers::new(),
-            &[("proxy-authenticate", &challenge)],
+            &[
+                ("proxy-authenticate", &challenge),
+                ("content-type", content_type),
+            ],
             body,
         )
         .await

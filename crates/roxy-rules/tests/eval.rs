@@ -103,6 +103,31 @@ fn equality_and_ordering() {
     ]);
 }
 
+/// HTTP methods are case-sensitive: the proxy forwards `get` as an
+/// extension method, which may carry a body, so a rule written for `GET`
+/// must not match it.
+#[test]
+fn methods_compare_byte_exact() {
+    let lower = flow().with_str(Field::Method, "get");
+    for expr in [
+        "method == GET",
+        "method in [GET]",
+        "method in [GET, HEAD]",
+        "method starts_with \"GE\"",
+        "method like \"G*\"",
+        "method matches \"GET\"",
+    ] {
+        assert!(!eval_in(expr, &lower), "{expr} must not match `get`");
+    }
+    assert!(eval_in("method == \"get\"", &lower));
+    assert!(eval_in("method not in [GET]", &lower));
+    // Host comparisons stay case-insensitive.
+    assert!(eval_in(
+        "host == \"API.GITHUB.COM\"",
+        &flow().with_str(Field::Host, "api.github.com")
+    ));
+}
+
 #[test]
 fn string_operators() {
     check(&[
@@ -176,7 +201,7 @@ fn membership_and_cidrs() {
         ("method in [GET, POST]", true),
         ("method in [GET, HEAD]", false),
         ("method not in [GET, HEAD]", true),
-        ("method in [\"post\"]", true),
+        ("method in [\"post\"]", false),
         ("host in [\"pypi.org\", \"API.GITHUB.COM\"]", true),
         ("port in [80, 443]", true),
         ("port not in [80, 443]", false),
@@ -191,6 +216,28 @@ fn membership_and_cidrs() {
     assert!(eval_in("client.ip in [fd00::/8]", &v6));
     let mapped = MapView::new().with(Field::ClientIp, ip("::ffff:10.9.9.9"));
     assert!(eval_in("client.ip in 10.0.0.0/8", &mapped));
+}
+
+/// Flow addresses are canonicalised to IPv4 before matching, so an
+/// IPv4-mapped CIDR literal must denote the IPv4 network it maps.
+#[test]
+fn ipv4_mapped_cidrs_match_ipv4_addresses() {
+    let v4 = MapView::new().with(Field::ClientIp, ip("10.1.2.3"));
+    let mapped = MapView::new().with(Field::ClientIp, ip("::ffff:10.1.2.3"));
+    for view in [&v4, &mapped] {
+        assert!(eval_in("client.ip in ::ffff:10.0.0.0/104", view));
+        assert!(eval_in("client.ip in [::ffff:10.1.2.3/128]", view));
+        assert!(eval_in("client.ip in ::ffff:0.0.0.0/96", view));
+        assert!(!eval_in("client.ip in ::ffff:192.168.0.0/112", view));
+        assert!(!eval_in(
+            "client.ip not in [fd00::/8, ::ffff:10.0.0.0/104]",
+            view
+        ));
+    }
+    // A plain IPv6 network with a long prefix is left alone.
+    let v6 = MapView::new().with(Field::ClientIp, ip("2001:db8::1"));
+    assert!(eval_in("client.ip in 2001:db8::/112", &v6));
+    assert!(!eval_in("client.ip in 2001:db8::/112", &v4));
 }
 
 #[test]
@@ -691,6 +738,37 @@ fn unavailable_inputs_fail_closed() {
     let out = p.evaluate_head(&MapView::new(), &ctx);
     assert_eq!(out.terminal_rule, "_default");
     assert_eq!(out.fail_closed_reason, None);
+}
+
+/// Every head rule is evaluated, so an unavailable input anywhere in the
+/// list fails the flow closed even when a deny above it already matched:
+/// the flow log must say `_fail_closed`, not name a deny that masked an
+/// outage.
+#[test]
+fn fail_closed_wins_over_an_earlier_deny() {
+    let p = compile(
+        METRICS,
+        r#"
+- id: block
+  when: path starts_with "/admin"
+  then: { deny: { status: 451 }, }
+- id: burst
+  when: metric.writes >= 30
+  then: deny
+"#,
+    );
+    let v = MapView::new().with_str(Field::Path, "/admin/x");
+    let out = p.evaluate_head(&v, &EvalContext::empty());
+    assert_eq!(out.decision, Decision::fail_closed());
+    assert_eq!(out.terminal_rule, "_fail_closed");
+    assert_eq!(
+        out.fail_closed_reason,
+        Some(FailClosedReason::MetricUnavailable("writes".into()))
+    );
+    assert_eq!(out.matched, ["block"].map(roxy_rules::RuleId::new));
+    // With the metric available the deny stands.
+    let out = p.evaluate_head(&v.with_metric("writes", 0), &EvalContext::empty());
+    assert_eq!(out.terminal_rule, "block");
 }
 
 #[test]

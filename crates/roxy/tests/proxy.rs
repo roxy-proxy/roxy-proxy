@@ -17,7 +17,7 @@ use support::{
     H2_HEADERS, H2_RST_STREAM, Harness, LogGate, Opts, SECRET, capture_body, capture_of, fnv,
     h2_get, h2_raw_request, raw, read_head, read_response, read_to_eof,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -856,11 +856,25 @@ async fn per_client_connection_cap() {
         ..Opts::default()
     })
     .await;
-    let a = TcpStream::connect(h.proxy).await.unwrap();
-    let b = TcpStream::connect(h.proxy).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let mut c = TcpStream::connect(h.proxy).await.unwrap();
     let port = h.upstream.http.port();
+    // Each holds its slot once roxy has answered a request on it.
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let mut s = TcpStream::connect(h.proxy).await.unwrap();
+        s.write_all(
+            format!(
+                "GET http://upstream.test:{port}/ok HTTP/1.1\r\nHost: upstream.test:{port}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut status_line = [0u8; 12];
+        s.read_exact(&mut status_line).await.unwrap();
+        assert_eq!(&status_line, b"HTTP/1.1 200");
+        held.push(s);
+    }
+    let mut c = TcpStream::connect(h.proxy).await.unwrap();
     let _ = c
         .write_all(
             format!(
@@ -875,10 +889,17 @@ async fn per_client_connection_cap() {
     let ev = h.wait_events("connection_refused", 1).await;
     assert_eq!(ev[0]["reason"], "max_connections_per_client");
     // Slots free up when connections close.
-    drop((a, b));
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let res = h.client().get(h.http_url("/ok")).send().await.unwrap();
-    assert_eq!(res.status(), 200);
+    drop(held);
+    let client = h.client();
+    let mut status = None;
+    for _ in 0..100 {
+        if let Ok(res) = client.get(h.http_url("/ok")).send().await {
+            status = Some(res.status());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(status, Some(reqwest::StatusCode::OK), "a slot never freed");
     h.stop().await;
 }
 
