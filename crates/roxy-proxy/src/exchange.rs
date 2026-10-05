@@ -837,18 +837,15 @@ async fn splice_websocket(
     // Through an addon stack, the layers sit between the client and the
     // relay, carrying the WebSocket as the bodies of its exchange; the bytes
     // that came with the upgrade request go through them first.
+    let leftover = leftover.to_vec();
     let mut spliced = None;
     let (client_io, leftover): (crate::io::BoxIo, Vec<u8>) = match &cx.stack {
         Some(st) => {
-            match crate::addons::splice_client(st, Box::new(client_io), leftover.to_vec()) {
-                Ok((bottom, client)) => {
-                    spliced = Some(client);
-                    (bottom, Vec::new())
-                }
-                Err(client_io) => (client_io, leftover.to_vec()),
-            }
+            let (bottom, client) = crate::addons::splice_client(st, Box::new(client_io), leftover);
+            spliced = Some(client);
+            (bottom, Vec::new())
         }
-        None => (Box::new(client_io), leftover.to_vec()),
+        None => (Box::new(client_io), leftover),
     };
     let mut upstream = TokioIo::new(upgraded);
     let idle = cx.snap.limits.idle_timeout;

@@ -29,8 +29,9 @@ pub(super) fn selects(
     let creq = match from_layer_request(req, st.client_meta.clone(), &snap.limits, &snap.flags) {
         Ok(r) => r,
         Err(e) => {
-            // Layer 0 gets the client's request, already canonical.
-            let above = &snap.addons[index.saturating_sub(1)].name;
+            // A request no layer passed on is the client's, already
+            // canonical.
+            let above = &snap.addons[st.passed_on_by(index).unwrap_or(0)].name;
             st.fail(above, LayerError::InvalidRequest(e.to_string()));
             return Err(LayerError::InvalidRequest(e.to_string()).into());
         }
