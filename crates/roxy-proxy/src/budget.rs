@@ -50,6 +50,7 @@ impl BufferBudget {
     }
 
     /// Bytes reserved right now.
+    #[cfg(test)]
     pub(crate) fn used(&self) -> u64 {
         self.used.load(Ordering::Acquire)
     }
@@ -75,11 +76,15 @@ mod tests {
         drop(a);
         assert_eq!(b.used(), 6);
         assert!(b.reserve(10, 5).is_none());
-        assert!(b.reserve(10, 4).is_some());
+        let d = b.reserve(10, 4).unwrap();
         drop(c);
+        assert_eq!(b.used(), 4);
         // A lower cap after a reload refuses until enough is released.
         assert!(b.reserve(3, 1).is_none());
         assert!(b.reserve(4, 0).is_some());
+        drop(d);
+        let _e = b.reserve(3, 1).unwrap();
+        // A total past `u64::MAX` is refused, not wrapped.
         assert!(b.reserve(u64::MAX, u64::MAX).is_none());
     }
 }

@@ -73,7 +73,7 @@ async fn stalled_uploads_fill_the_budget_and_the_next_is_refused() {
     assert_eq!(ev["reason"], "buffer_budget_exhausted");
     assert!(kit.upstream.seen().is_empty());
 
-    let (_c, mut tx, answer) = stalled.remove(0);
+    let (_c, tx, answer) = stalled.remove(0);
     tx.finish().await.unwrap();
     let a = answer.await.unwrap().unwrap();
     assert_eq!(a.status, 200, "{a:?}");
@@ -81,7 +81,7 @@ async fn stalled_uploads_fill_the_budget_and_the_next_is_refused() {
     let a = kit.h1().await.call("POST", "/x", &[], b"admitted").await;
     assert_eq!(a.status, 200, "{a:?}");
 
-    let (_c, mut tx, answer) = stalled.remove(0);
+    let (_c, tx, answer) = stalled.remove(0);
     tx.finish().await.unwrap();
     assert_eq!(answer.await.unwrap().unwrap().status, 200);
     until_buffered(&kit, 0).await;

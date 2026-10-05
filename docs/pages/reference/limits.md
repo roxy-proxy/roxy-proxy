@@ -78,24 +78,20 @@ for it, so an observer that keeps up sees every body in full however
 large, and one with more than that many bytes unread has the copy cut
 ([addon modes](/addons/overview#modes)).
 
-`max_buffered_bytes` bounds those three buffers in aggregate. Each is
-bounded per exchange, and the only bound on exchanges is the connection
-caps, so without it a client could hold `max_inspect_body_bytes` for
-`body_idle_timeout` on each of thousands of stalled uploads. An exchange
-reserves the whole cap before it fills a buffer: `max_inspect_body_bytes`
-for a request or response body a rule reads, twice `max_ws_message_bytes`
-(one message per direction) for a WebSocket whose messages rules read,
-and `max_observer_lag_bytes` per direction for an observer's copy. It
-holds the reservation until it ends. A reservation the budget cannot
-cover fails at once: the exchange fails closed (`503`, `_fail_closed`,
-`buffer_budget_exhausted`), or the observer's copy is cut
-(`observer_lagged` with `reason: buffer_budget_exhausted`). Nothing waits
-for room and nothing is evicted. The budget divided by a cap is how many
-exchanges can hold that buffer at once (with the defaults, 1024 inspected
-bodies, 32 WebSockets with message rules or 32 observed exchanges): size
-it, or the caps, for the traffic that needs them. It must be at least the
-largest of those per-exchange reservations, or no such exchange could
-ever be admitted.
+`max_buffered_bytes` bounds those three buffers in aggregate; each is
+bounded per exchange, and without it the only bound on exchanges is the
+connection caps. An exchange reserves the whole cap before it fills a
+buffer (`max_inspect_body_bytes` for a body a rule reads, twice
+`max_ws_message_bytes` for a WebSocket whose messages rules read,
+`max_observer_lag_bytes` per direction for an observer's copy) and holds
+the reservation until it ends. A reservation the budget cannot cover fails
+at once, with no waiting and no eviction: the exchange fails closed (`503`,
+`_fail_closed`, `buffer_budget_exhausted`), or the observer's copy is cut
+(`observer_lagged`, `reason: buffer_budget_exhausted`). The budget divided
+by a cap is how many exchanges can hold that buffer at once (with the
+defaults: 1024 inspected bodies, 32 WebSockets with message rules, 32
+observed exchanges), so size it, or the caps, for the traffic that needs
+them. It must be at least the largest per-exchange reservation.
 
 The limits that shape the client-facing codec (`max_header_bytes`,
 `max_url_bytes`, `max_headers`, `max_request_body_bytes`, `header_timeout`,
