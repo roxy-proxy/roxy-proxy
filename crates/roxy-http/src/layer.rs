@@ -73,6 +73,11 @@ pub fn from_layer_request(
     flags: &HttpFlags,
 ) -> Result<CanonicalRequest, ParseError> {
     let (parts, body) = req.into_parts();
+    // A tunnel is opened by the client at the proxy port, never by a layer:
+    // forwarded as a request it would ask the upstream to open one.
+    if parts.method == http::Method::CONNECT {
+        return reject(Reason::InvalidMethod, "a layer cannot pass on CONNECT");
+    }
     let method = Method::from_http(&parts.method)?;
     let scheme = match parts.uri.scheme_str() {
         Some("http") => Scheme::Http,
@@ -257,5 +262,11 @@ mod tests {
             .body(Body::from_bytes("abc"))
             .unwrap();
         assert_eq!(check(get).unwrap_err().reason, Reason::BodyOnBodiless);
+        let connect = http::Request::builder()
+            .method("CONNECT")
+            .uri("https://example.com:443/")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(check(connect).unwrap_err().reason, Reason::InvalidMethod);
     }
 }

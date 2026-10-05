@@ -52,7 +52,8 @@ so they run beside the stream rather than in it.
    addon does.
 2. **Every layer is held to the workload's limits.** Whatever a layer passes
    on is treated as if a client sent it: header limits, body caps, idle
-   timeouts.
+   timeouts. A layer cannot pass on `CONNECT`: a tunnel is something the
+   client opens at the proxy port, never a request to forward.
 3. **Failure is closed.** A layer that traps, exceeds a budget or returns an
    invalid head denies the flow, or cuts the exchange if the response head
    is already out. There is no "on error, pass"; observe mode is the one
