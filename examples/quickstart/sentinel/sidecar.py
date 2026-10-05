@@ -351,37 +351,43 @@ class Sidecar:
                 chunks.append(chunk)
 
         reader = asyncio.create_task(read())
-        sent = 0
-        last = time.monotonic()
-        while True:
-            done, _ = await asyncio.wait({reader}, timeout=0.5)
-            if not sent:
-                raw = b"".join(chunks)
-                end = raw.find(b"\n\n")
-                if end != -1:
-                    if b"message_start" in raw[:end]:
-                        sent = end + 2
-                        yield raw[:sent]
-                    else:
-                        sent = -1  # not the shape we know: hold everything
-            if done:
-                break
-            if sent > 0 and time.monotonic() - last >= PING_EVERY:
-                last = time.monotonic()
-                yield PING
-        reader.result()
-        raw = b"".join(chunks)
-        sent = max(sent, 0)
-        verdict = await self.judge(ex, body, res, raw)
-        if verdict is None or isinstance(verdict, bytes):
-            # Streamed responses are never modified (see judge).
-            yield raw[sent:]
-        elif verdict.call and verdict.output:
-            reply = await explanation(verdict.call.response, verdict.output, verdict.message)
-            yield anthropic_to_sse(reply, start=not sent)
-        else:
-            error = {"type": "error", "error": {"type": "api_error", "message": verdict.message}}
-            yield f"event: error\ndata: {json.dumps(error)}\n\n".encode()
+        try:
+            sent = 0
+            last = time.monotonic()
+            while True:
+                done, _ = await asyncio.wait({reader}, timeout=0.5)
+                if not sent:
+                    raw = b"".join(chunks)
+                    end = raw.find(b"\n\n")
+                    if end != -1:
+                        if b"message_start" in raw[:end]:
+                            sent = end + 2
+                            yield raw[:sent]
+                        else:
+                            sent = -1  # not the shape we know: hold everything
+                if done:
+                    break
+                if sent > 0 and time.monotonic() - last >= PING_EVERY:
+                    last = time.monotonic()
+                    yield PING
+            reader.result()
+            raw = b"".join(chunks)
+            sent = max(sent, 0)
+            verdict = await self.judge(ex, body, res, raw)
+            if verdict is None or isinstance(verdict, bytes):
+                # Streamed responses are never modified (see judge).
+                yield raw[sent:]
+            elif verdict.call and verdict.output:
+                reply = await explanation(verdict.call.response, verdict.output, verdict.message)
+                yield anthropic_to_sse(reply, start=not sent)
+            else:
+                error = {"type": "error", "error": {"type": "api_error", "message": verdict.message}}
+                yield f"event: error\ndata: {json.dumps(error)}\n\n".encode()
+        finally:
+            # The handler is cancelled here when roxy resets the stream:
+            # the reader would otherwise wait on the response for ever.
+            reader.cancel()
+            await asyncio.wait({reader})
 
     async def judge(self, ex: Exchange, body: bytes, res: Response, raw: bytes) -> None | bytes | Refusal:
         """None to pass the response on, new bytes for a modified response,
