@@ -500,6 +500,30 @@ impl StackFlow {
         })
     }
 
+    /// The nearest layer above `below` that ran: the one that passed on
+    /// what reached `below` (a skipped layer passes it on untouched).
+    /// `None` when the request reaching `below` is the client's.
+    fn passed_on_by(&self, below: usize) -> Option<usize> {
+        self.layers[..below]
+            .iter()
+            .rposition(|l| l.ran.load(Ordering::SeqCst))
+    }
+
+    /// The layer a failure no layer recorded is put down to: the one that
+    /// answered, else the outermost that ran, since what the client got
+    /// came from it.
+    fn blamed(&self) -> String {
+        let i = self
+            .answered_by()
+            .or_else(|| {
+                self.layers
+                    .iter()
+                    .position(|l| l.ran.load(Ordering::SeqCst))
+            })
+            .unwrap_or(0);
+        self.snap.addons[i].name.clone()
+    }
+
     /// Folds the stack into the flow record just before its `request`
     /// event: the layers and the tags they added.
     pub(crate) fn fold_into(&self, cx: &mut FlowCx) {
@@ -631,10 +655,7 @@ fn stack_outcome(
             let (layer, err) = match (st.failure(), st.take_client_fault()) {
                 (Some(f), _) => f,
                 (None, Some(e)) => return Outcome::Close(e),
-                (None, None) => (
-                    st.snap.addons[0].name.clone(),
-                    LayerError::NoResponse.into(),
-                ),
+                (None, None) => (st.blamed(), LayerError::NoResponse.into()),
             };
             emit_stack_error(st, &layer, &err, AddonMode::Enforce);
             return Outcome::Refuse(layer_refusal(&layer));
@@ -653,7 +674,7 @@ fn stack_outcome(
             if let Err(e) = outcome.wait().await {
                 let (layer, err) = st2
                     .post_head_failure()
-                    .unwrap_or_else(|| (st2.snap.addons[0].name.clone(), e.into()));
+                    .unwrap_or_else(|| (st2.blamed(), e.into()));
                 emit_stack_error(&st2, &layer, &err, AddonMode::Enforce);
             }
         });
@@ -682,7 +703,7 @@ fn stack_outcome(
                 key: relay.key,
             };
         }
-        let layer = st.snap.addons[0].name.clone();
+        let layer = st.blamed();
         let err = LayerError::InvalidResponse("101 without an upgrade to relay".into());
         emit_layer_error(st, &layer, &err, AddonMode::Enforce);
         return Outcome::Refuse(layer_refusal(&layer));
@@ -691,7 +712,7 @@ fn stack_outcome(
         // The upstream switched protocols but the stack answered otherwise:
         // no body can carry the relay, so close it and fail closed.
         tokio::spawn(crate::exchange::close_upstream_ws(relay.upstream));
-        let layer = st.snap.addons[0].name.clone();
+        let layer = st.blamed();
         let err = LayerError::InvalidResponse(format!("{} over a relayed upgrade", res.status));
         emit_layer_error(st, &layer, &err, AddonMode::Enforce);
         return Outcome::Refuse(layer_refusal(&layer));
@@ -809,7 +830,9 @@ async fn core(
     req: LayerRequest,
 ) -> Result<LayerResponse, HostError> {
     let snap = st.snap.clone();
-    let layer = snap.addons[index].name.clone();
+    let layer = snap.addons[st.passed_on_by(index + 1).unwrap_or(index)]
+        .name
+        .clone();
     let (req, stream) = ws::split_upgrade_stream(&st, req);
     let creq = match from_layer_request(req, st.client_meta.clone(), &snap.limits, &snap.flags) {
         Ok(r) => r,
@@ -974,6 +997,51 @@ mod tests {
         assert!(
             matches!(&out, Outcome::Refuse(r) if r.rule == Some(Decider::Layer("a".into()))),
             "the layer's failure comes first"
+        );
+    }
+
+    /// A failure is put down to a layer that ran, never to one its `when`
+    /// skipped: the request a skipped layer passes on is its caller's, and
+    /// the response it passes back is from below.
+    #[tokio::test]
+    async fn blame_skips_layers_that_did_not_run() {
+        let skipped = r#"path == "/never""#;
+        let kit = Kit::builder()
+            .addon(AddonDef::test_layer("a"))
+            .addon(AddonDef::test_layer("b").when(skipped))
+            .addon(AddonDef::test_layer("c").when(skipped))
+            .start()
+            .await;
+        let invalid = || {
+            http::Request::get("ftp://up.test/")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let ran = |st: &StackFlow, i: usize| {
+            st.layers[i].ran.store(true, Ordering::SeqCst);
+            st.layers[i].set(NextState::Resolved);
+        };
+        let blamed = |st: &StackFlow| st.failure().expect("a failure").0;
+
+        // What reaches `c`'s `when` was passed on by `a`, through `b`.
+        let (st, _) = test_flow(&kit);
+        ran(&st, 0);
+        assert!(select::selects(&st, 2, &st.snap.addons[2], invalid()).is_err());
+        assert_eq!(blamed(&st), "a");
+
+        // Likewise what reaches the core below a skipped last layer.
+        let (st, _) = test_flow(&kit);
+        ran(&st, 0);
+        assert!(core(st.clone(), 2, invalid()).await.is_err());
+        assert_eq!(blamed(&st), "a");
+
+        // A failure no layer recorded goes to the outermost that ran.
+        let (st, mut cx) = test_flow(&kit);
+        ran(&st, 1);
+        let out = stack_outcome(&st, &mut cx, Ok(Err(HostError::new("x"))), None);
+        assert!(
+            matches!(&out, Outcome::Refuse(r) if r.rule == Some(Decider::Layer("b".into()))),
+            "blames b"
         );
     }
 }

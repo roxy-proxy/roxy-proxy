@@ -158,17 +158,15 @@ impl Drop for SplicedClient {
 }
 
 /// Splices the client into an exchange that went through the stack as a
-/// WebSocket, returning the relay's client side; gives the client back
-/// when it did not.
+/// WebSocket, returning the relay's client side, and the client.
 pub(crate) fn splice_client(
     st: &StackFlow,
     client: BoxIo,
     leftover: Vec<u8>,
-) -> Result<(BoxIo, SplicedClient), BoxIo> {
-    match st.take_ws() {
-        Some(plumbing) => Ok(plumbing.splice(client, leftover)),
-        None => Err(client),
-    }
+) -> (BoxIo, SplicedClient) {
+    st.take_ws()
+        .expect("a stack's upgrade sets its plumbing")
+        .splice(client, leftover)
 }
 
 /// Whether a WebSocket must be relayed with no extension negotiated, so
