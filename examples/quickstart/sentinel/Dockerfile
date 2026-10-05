@@ -1,16 +1,14 @@
 # The quickstart's inspect_sentinel sidecar, and Inspect View over its log.
 FROM python:3.12-slim
 
-# pip installs inspect_sentinel and inspect_ai from git.
+# pip installs inspect_sentinel (and its inspect_ai branch) from git.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt requirements-sentinel.txt ./
-RUN pip install --no-cache-dir -r requirements.txt \
- && pip install --no-cache-dir --no-deps -r requirements-sentinel.txt \
- && pip check
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 COPY *.py ./
 # The Inspect log; a volume mounted here inherits the ownership.
 RUN mkdir /logs && chown 65532:65532 /logs

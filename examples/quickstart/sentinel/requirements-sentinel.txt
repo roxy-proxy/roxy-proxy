@@ -1,5 +1,0 @@
-# Installed with --no-deps after requirements.txt: inspect_sentinel names
-# inspect_ai's moving `feature/sentinel` branch, which pip will not let
-# requirements.txt's pinned commit override. Its other dependencies (anyio,
-# pydantic) come with inspect_ai.
-inspect_sentinel @ git+https://github.com/meridianlabs-ai/inspect_sentinel@566a390535287e6e4ac3ed35fb5e8234a8e4a9b0
