@@ -73,6 +73,11 @@ fails the exchange. `flow.current`, `flow.add-tag` and `flow.config` need
 no capability. There is no `secrets` capability: credentials go on an
 endpoint's `headers`, where the layer never sees them.
 
+Service layers have no capabilities. A service is its own process and
+calls what it needs itself; what roxy gives it is the exchange, the flow's
+identity on `open`, and the endpoint's `headers` on the handshake
+([service layers](/addons/service-layers)).
+
 ## Choosing exchanges
 
 `when` is a condition in the [rule language](/reference/rule-language) over
