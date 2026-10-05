@@ -71,12 +71,39 @@ impl WsPlumbing {
 
     /// Splices the client in: its bytes (those that came with the upgrade
     /// request first) go into the top request body, and the top response
-    /// body goes to it. Returns the relay's client side.
-    fn splice(self, client: BoxIo, leftover: Vec<u8>) -> BoxIo {
+    /// body goes to it. Returns the relay's client side, and the client.
+    fn splice(self, client: BoxIo, leftover: Vec<u8>) -> (BoxIo, SplicedClient) {
         let (cr, cw) = tokio::io::split(client);
-        tokio::spawn(reader_into(leftover, cr, self.client_tx));
-        tokio::spawn(body_to_writer(self.to_client, cw));
-        self.bottom
+        let client = SplicedClient {
+            reader: tokio::spawn(reader_into(leftover, cr, self.client_tx)),
+            writer: tokio::spawn(body_to_writer(self.to_client, cw)),
+        };
+        (self.bottom, client)
+    }
+}
+
+/// The client socket of a WebSocket through the stack, held by the two
+/// tasks that splice it into the top bodies. A layer decides when those
+/// bodies end, so the socket is closed when the relay ends, not when the
+/// layers let go of it. Dropping it closes the socket at once.
+pub(crate) struct SplicedClient {
+    reader: tokio::task::JoinHandle<()>,
+    writer: tokio::task::JoinHandle<()>,
+}
+
+impl SplicedClient {
+    /// Closes the client once the relay has ended: what the layers still
+    /// pass on toward it gets up to `drain` to arrive, then the socket is
+    /// dropped.
+    pub(crate) async fn close(mut self, drain: std::time::Duration) {
+        let _ = tokio::time::timeout(drain, &mut self.writer).await;
+    }
+}
+
+impl Drop for SplicedClient {
+    fn drop(&mut self) {
+        self.reader.abort();
+        self.writer.abort();
     }
 }
 
@@ -87,7 +114,7 @@ pub(crate) fn splice_client(
     st: &StackFlow,
     client: BoxIo,
     leftover: Vec<u8>,
-) -> Result<BoxIo, BoxIo> {
+) -> Result<(BoxIo, SplicedClient), BoxIo> {
     match st.take_ws() {
         Some(plumbing) => Ok(plumbing.splice(client, leftover)),
         None => Err(client),

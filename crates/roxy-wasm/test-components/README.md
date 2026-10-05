@@ -5,8 +5,8 @@ Small `roxy:addon` components used by `crates/roxy-wasm/tests/`.
 - `test-layer` (world `layer`): a pass-through layer, chunk by chunk, that can
   also relay full duplex, deny, answer itself (at once, after reading part of
   the body, or after forwarding part of it to `next`), rewrite, loop, hog
-  memory, call `next` twice, trap at various points, leak a body and call
-  every host service. The request's `x-test` header picks the behaviour. A
+  memory, call `next` twice, hold its bodies open, trap at various points,
+  leak a body and call every host service. The request's `x-test` header picks the behaviour. A
   layer configured with `{"name": "a"}` reads `x-test-a` first, tags flows it
   passes on `via:a` and appends `a` to the forwarded `x-via`, so each layer of
   a stack can be driven separately.
