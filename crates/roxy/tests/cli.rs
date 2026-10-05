@@ -419,7 +419,7 @@ fn rule_test_unavailable_metric_fails_closed() {
     assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
     let stdout = text(&out.stdout);
     assert!(
-        stdout.contains("decision: deny 503 \"policy input unavailable\" (close)"),
+        stdout.contains("decision: deny 503 \"blocked by roxy\" (close)"),
         "{stdout}"
     );
     assert!(stdout.contains("rule:     _fail_closed"), "{stdout}");

@@ -442,7 +442,7 @@ fn upstream_refusal(cx: &FlowCx, e: &ConnectError, host: &str, port: u16) -> Ref
     } else {
         StatusCode::BAD_GATEWAY
     };
-    Refusal::upstream(status, reason, "upstream unavailable")
+    Refusal::upstream(status, reason)
 }
 
 fn protocol_refusal(cx: &FlowCx, host: &str, port: u16, message: String) -> Refusal {
@@ -455,11 +455,7 @@ fn protocol_refusal(cx: &FlowCx, host: &str, port: u16, message: String) -> Refu
         reason: "protocol_error".to_owned(),
         message,
     });
-    Refusal::upstream(
-        StatusCode::BAD_GATEWAY,
-        "protocol_error",
-        "upstream protocol error",
-    )
+    Refusal::upstream(StatusCode::BAD_GATEWAY, "protocol_error")
 }
 
 /// What the upstream step produced.

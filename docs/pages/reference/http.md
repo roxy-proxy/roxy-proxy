@@ -310,8 +310,14 @@ connection: close
 {"error":"blocked by roxy","rule":"<rule id>","flow":"<flow id>"}
 ```
 
-An upstream error carries a `reason` instead of `rule`. A failed addon
-layer's `503` carries `rule: layer:<name>`.
+Every refusal roxy originates has this body. The address floor answers
+`403` with `rule: _address_policy`; an unavailable policy input answers
+`503` with `rule: _fail_closed`; a failed addon layer answers `503` with
+`rule: layer:<name>`; an upstream failure answers `502` (`504` for a
+timeout) with no `rule`. The body never says why: the reason code
+(`dns_failed`, `connect_failed`, `metric_table_full`, ...) is in the flow
+log only, so a client cannot tell an unresolvable name from a closed port,
+or learn that a table is full.
 
 The status and message can be set per rule
 (`deny: { status: 451, message: "..." }`). After a deny the connection is

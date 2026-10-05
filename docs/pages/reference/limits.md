@@ -25,6 +25,10 @@ connect produces a deny response or a closed socket.
 | flow log or capture behind, or its disk failing | hold traffic until it catches up; never drop records |
 | WebSocket message that breaks the protocol or is over `max_ws_message_bytes`, when rules read messages | close both sides with `1002`, `1007` or `1009` ([WebSockets](/policies/websockets#message-rules)) |
 
+The reason codes above are flow-log values. A deny response carries the
+status, the rule id and the flow id, never the reason
+([Deny responses](/reference/http#deny-responses)).
+
 ## Limits
 
 All under `limits:`; defaults shown. Sizes are 1024-based.

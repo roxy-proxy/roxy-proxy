@@ -188,7 +188,7 @@ async fn an_upstream_that_never_answers_is_a_504() {
         .unwrap();
     let a = Answer::read(c.send(req).await.unwrap()).await;
     assert_eq!(a.status, 504, "{a:?}");
-    assert_eq!(a.json()["reason"], "timeout");
+    assert!(a.json().get("reason").is_none(), "{a:?}");
     let err = kit.events("upstream_error", 1).await;
     assert_eq!(err[0]["reason"], "timeout", "{err:#?}");
     let ev = kit.request_event().await;
@@ -443,6 +443,50 @@ async fn an_unreachable_upstream_is_a_502() {
     let ev = kit.request_event().await;
     assert_eq!(ev["decision"], "allow", "{ev:#}");
     assert_eq!(ev["terminal_rule"], "down");
+}
+
+/// Under one wildcard allow, a name that does not resolve, one that
+/// resolves to a private address and one whose port is closed get the
+/// same body text. Only the status and the floor's rule id differ; the
+/// cause is in the flow log alone, so the body cannot enumerate names.
+#[tokio::test]
+async fn refusal_bodies_do_not_say_why() {
+    let kit = Kit::builder()
+        .rules("- id: any\n  when: host ends_with \".test\"\n  then: allow\n")
+        .start()
+        .await;
+    let mut answers = Vec::new();
+    for host in ["nx.test", "private.test", "down.test"] {
+        let mut c = kit.h1().await;
+        let req = c
+            .request_to(host, "GET", "/", &[])
+            .body(roxy_http::Body::empty())
+            .unwrap();
+        answers.push(Answer::read(c.send(req).await.unwrap()).await);
+    }
+    let statuses: Vec<u16> = answers.iter().map(|a| a.status).collect();
+    assert_eq!(statuses, [502, 403, 502], "{answers:?}");
+    for a in &answers {
+        let body = a.json();
+        assert_eq!(body["error"], "blocked by roxy", "{a:?}");
+        assert!(body["flow"].is_string(), "{a:?}");
+        let extra: Vec<&String> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| !["error", "flow", "rule"].contains(&k.as_str()))
+            .collect();
+        assert!(extra.is_empty(), "{a:?}");
+    }
+    assert!(answers[0].json().get("rule").is_none(), "{answers:?}");
+    assert_eq!(answers[1].json()["rule"], "_address_policy");
+    assert!(answers[2].json().get("rule").is_none(), "{answers:?}");
+    let errs = kit.events("upstream_error", 2).await;
+    let mut reasons: Vec<&str> = errs.iter().map(|e| e["reason"].as_str().unwrap()).collect();
+    reasons.sort_unstable();
+    assert_eq!(reasons, ["connect_failed", "dns_failed"], "{errs:#?}");
+    let denied = kit.events("upstream_denied", 1).await;
+    assert_eq!(denied[0]["reason"], "private_range:private", "{denied:#?}");
 }
 
 #[tokio::test]

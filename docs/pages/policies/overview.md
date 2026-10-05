@@ -80,6 +80,6 @@ rules: a config that sets `phase` is rejected.
 **Unavailable inputs fail closed.** If evaluating a rule needs a metric
 value, an address-list lookup or a secret and it is unavailable (store
 overloaded, table full, list failed to load), the flow is denied with
-`503 policy input unavailable`, `terminal_rule: _fail_closed`, and a
+`503`, `terminal_rule: _fail_closed`, and a
 `policy_input_unavailable` event. A field that is simply absent, like an
 unsent header, is not unavailable: it is `null`.

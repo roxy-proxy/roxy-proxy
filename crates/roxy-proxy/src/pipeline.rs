@@ -34,7 +34,7 @@ use roxy_http::{
     Reason, Scheme,
 };
 use roxy_rules::{
-    AllowOpts, CaptureTarget, Decision, DenyStatus, Effect, EvalContext, FAIL_CLOSED_MESSAGE,
+    AllowOpts, CaptureTarget, DEFAULT_DENY_MESSAGE, Decision, DenyStatus, Effect, EvalContext,
     FAIL_CLOSED_STATUS, FailClosedReason, LogLevel, Outcome, RuleId,
 };
 use ulid::Ulid;
@@ -104,7 +104,9 @@ pub(crate) struct Refusal {
     pub rule: Option<Decider>,
     /// Close the client connection after the response.
     pub close: bool,
-    /// Stable reason code for the flow log (and the body of upstream errors).
+    /// Stable reason code for the flow log. Never sent to the client: the
+    /// body says no more than the rule id, so a probing client cannot tell
+    /// an unresolvable name from a closed port or a full table.
     pub reason: Option<String>,
 }
 
@@ -120,13 +122,13 @@ impl Refusal {
         }
     }
 
-    /// 503 `_fail_closed` with `reason`.
+    /// 503 `_fail_closed`; `reason` goes to the flow log.
     pub(crate) fn fail_closed(reason: &str) -> Self {
         Self {
             reason: Some(reason.to_owned()),
             ..Self::deny(
                 status_code(FAIL_CLOSED_STATUS),
-                FAIL_CLOSED_MESSAGE,
+                DEFAULT_DENY_MESSAGE,
                 RuleId::new(RuleId::FAIL_CLOSED),
                 true,
             )
@@ -139,19 +141,20 @@ impl Refusal {
             reason: Some(reason.to_owned()),
             ..Self::deny(
                 StatusCode::FORBIDDEN,
-                roxy_rules::DEFAULT_DENY_MESSAGE,
+                DEFAULT_DENY_MESSAGE,
                 RuleId::new(ADDRESS_POLICY_RULE),
                 true,
             )
         }
     }
 
-    /// 502/504 for an upstream failure; always closes.
-    pub(crate) fn upstream(status: StatusCode, reason: &str, message: &str) -> Self {
+    /// 502/504 for an upstream failure; always closes. `reason` goes to the
+    /// flow log.
+    pub(crate) fn upstream(status: StatusCode, reason: &str) -> Self {
         Self {
             kind: RefusalKind::UpstreamError,
             status,
-            message: message.to_owned(),
+            message: DEFAULT_DENY_MESSAGE.to_owned(),
             rule: None,
             close: true,
             reason: Some(reason.to_owned()),
@@ -160,20 +163,14 @@ impl Refusal {
 
     /// The deny response.
     pub(crate) fn response(&self, flow: &Ulid) -> CanonicalResponse {
-        let status = self.status;
-        let body = match (&self.rule, self.kind) {
-            (Some(rule), RefusalKind::Deny) => serde_json::json!({
-                "error": self.message,
-                "rule": rule.to_string(),
-                "flow": flow.to_string(),
-            }),
-            _ => serde_json::json!({
-                "error": self.message,
-                "reason": self.reason,
-                "flow": flow.to_string(),
-            }),
-        };
-        let mut res = CanonicalResponse::new(status);
+        let mut body = serde_json::json!({
+            "error": self.message,
+            "flow": flow.to_string(),
+        });
+        if let Some(rule) = &self.rule {
+            body["rule"] = serde_json::Value::String(rule.to_string());
+        }
+        let mut res = CanonicalResponse::new(self.status);
         let _ = res.headers.insert("content-type", "application/json");
         let _ = res.headers.insert("cache-control", "no-store");
         if let Some(rule) = &self.rule
@@ -1048,10 +1045,10 @@ async fn inspect_response_body(
     let inspected = match io.collect(&mut res.body, cap).await {
         Err(e) => return ResponseVerdict::Close(e),
         Ok(Collected::Failed(e)) => {
+            tracing::info!(flow = %cx.flow, error = %e, "upstream response body failed");
             return ResponseVerdict::Deny(Refusal::upstream(
                 StatusCode::BAD_GATEWAY,
                 "upstream_body_failed",
-                &format!("upstream response body failed: {e}"),
             ));
         }
         Ok(Collected::Complete(b)) => {

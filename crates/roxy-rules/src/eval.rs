@@ -134,15 +134,15 @@ impl Decision {
     pub fn fail_closed() -> Self {
         Self::Deny {
             status: FAIL_CLOSED_STATUS,
-            message: FAIL_CLOSED_MESSAGE.into(),
+            message: DEFAULT_DENY_MESSAGE.into(),
             close: true,
         }
     }
 }
 
-/// Status and message when a policy input is unavailable.
+/// Status when a policy input is unavailable. The message is the default
+/// deny's: a client is not told that an input was missing.
 pub const FAIL_CLOSED_STATUS: DenyStatus = DenyStatus(503);
-pub const FAIL_CLOSED_MESSAGE: &str = "policy input unavailable";
 
 /// Why an evaluation failed closed (`terminal_rule = "_fail_closed"`), for
 /// the proxy's `policy_input_unavailable` flow event. Carries names only,
