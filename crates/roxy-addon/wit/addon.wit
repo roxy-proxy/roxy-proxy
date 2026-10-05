@@ -88,8 +88,10 @@ interface flow {
   /// Fails with a message when the store is full or the value too large;
   /// nothing is evicted.
   state-put: func(key: string, json: string, ttl-ms: option<u64>) -> result<_, string>;
-  /// Read a metric (capability `metrics`): the metric's `id` and the values
-  /// of its key fields, in order. `none` when the key has no entry.
+  /// Read a metric (capability `metrics`) for this flow's own key, the
+  /// metric's key fields evaluated on the request that left the stack. The
+  /// key list must be empty; a non-empty one is refused. `none` when the
+  /// key has no entry.
   metric-get: func(id: string, key: list<string>) -> option<s64>;
 }
 
