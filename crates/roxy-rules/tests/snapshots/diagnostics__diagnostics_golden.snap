@@ -173,11 +173,11 @@ rules[0].when:1:18: reference to undefined address list `@nope` (define it under
 == bad metrics
 metrics[0].id: invalid metric id "bad-id": must match [A-Za-z_][A-Za-z0-9_]* so it can be used as metric.<id>
 metrics[0].window: window must be greater than zero
-metrics[0].key[0]: unknown key field `client.nope`; metric fields must be scalar fields such as client.ip, client.user, host
+metrics[0].key[0]: unknown key field `client.nope`; metric fields must be scalar fields such as client.ip, host, tls.sni
 metrics[1].where:1:1: unknown field `dst.port`
     | dst.port == 1
     | ^^^^^^^^
-metrics[2].count: unknown unique() field `nope`; metric fields must be scalar fields such as client.ip, client.user, host
+metrics[2].count: unknown unique() field `nope`; metric fields must be scalar fields such as client.ip, host, tls.sni
 metrics[3].key[0]: `body.bytes` is known only after forwarding; metric key fields must be head fields (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)
 metrics[3].where: a metric's `where` may only read head fields, because whether an exchange counts is decided at the request head; it reads `response.status` (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)
 metrics[4].count: `response.status` is known only after forwarding; metric unique() fields must be head fields (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)
