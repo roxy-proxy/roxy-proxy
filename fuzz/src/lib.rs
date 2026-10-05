@@ -165,7 +165,6 @@ pub mod rules {
             metrics: &metrics,
             secret_names: &secrets,
             address_lists: &lists,
-            transparent_listeners: false,
             default: if default_allow {
                 DefaultDecision::Allow
             } else {
