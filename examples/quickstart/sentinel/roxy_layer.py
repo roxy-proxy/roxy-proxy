@@ -36,8 +36,9 @@ client at once. A handler that needs a whole body reads it with
 
 If the handler raises, the stream is reset without an answer and roxy
 fails the exchange closed (enforce mode). If roxy resets the stream (the
-client went away, say), the handler is cancelled. Only the `websockets`
-package is needed.
+client went away, say) or the connection closes, the handler is cancelled,
+and with it a request body still going out. Only the `websockets` package
+is needed.
 """
 
 from __future__ import annotations
@@ -141,8 +142,10 @@ class _Conn:
                 msg = json.loads(m)
                 self._control(msg)
         finally:
-            for s in list(self.streams.values()):
-                s.task.cancel()
+            tasks = [s.task for s in self.streams.values()]
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _control(self, msg: dict[str, Any]) -> None:
         sid = msg["stream"]
@@ -228,6 +231,11 @@ class _Stream:
             except Exception:
                 pass
         finally:
+            # Nothing the exchange started outlives it: roxy sends nothing
+            # more on a reset stream, so a body still going out would wait
+            # for input or credit forever.
+            if exchange is not None:
+                await exchange._stop_forwarding()
             self.conn.streams.pop(self.id, None)
 
     async def recv(self, direction: int) -> dict[str, Any] | bytes:
@@ -322,6 +330,16 @@ class Exchange:
         if self._forwarding is not None:
             self._forwarding.cancel()
 
+    async def _stop_forwarding(self) -> None:
+        if self._forwarding is None:
+            return
+        self._forwarding.cancel()
+        await asyncio.wait({self._forwarding})
+        if not self._forwarding.cancelled():
+            # Retrieved, so a send that failed as the socket closed is not
+            # logged as never retrieved; the exchange's outcome is reported.
+            self._forwarding.exception()
+
     async def forward(self, request: Request, body: Body) -> Response:
         """Pass `request` on down the stack and return the response head
         from below, as soon as there is one: the body keeps going out in
@@ -349,6 +367,7 @@ class Exchange:
             m = head.result()
         except BaseException:
             head.cancel()
+            await asyncio.wait({head})
             raise
         if isinstance(m, bytes):
             raise ProtocolError("body bytes before the response head")
