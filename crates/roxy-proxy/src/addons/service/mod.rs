@@ -457,7 +457,7 @@ pub(crate) mod testing {
     const PORT: u16 = 9000;
 
     /// A service layer whose endpoint is the in-test service's `behaviour`
-    /// (`pass`, `hold`, `talk`, `flood`, `pause` or `stall`).
+    /// (`pass`, `hold`, `hoard`, `talk`, `flood`, `pause`, `slow` or `stall`).
     pub(crate) fn addon(
         name: &str,
         behaviour: &str,
@@ -490,6 +490,24 @@ pub(crate) mod testing {
             when: None,
             sample: None,
         })
+    }
+
+    /// `addon`, run only on requests `when` matches.
+    pub(crate) fn only_when(mut addon: Arc<AddonSpec>, when: &str) -> Arc<AddonSpec> {
+        let none = std::collections::HashSet::new();
+        let input = PolicyInput {
+            rules: &[],
+            metrics: &[],
+            secret_names: &none,
+            address_lists: &none,
+            default: DefaultDecision::Deny,
+        };
+        let a = Arc::get_mut(&mut addon).expect("a fresh addon");
+        a.when = Some(
+            roxy_rules::Condition::compile(&input, &format!("{}.when", a.name), when)
+                .unwrap_or_else(|d| panic!("when: {d:?}")),
+        );
+        addon
     }
 
     /// A kit running `rules` with the stack `addons`, outermost first.

@@ -7,6 +7,8 @@
 //!   direction, within the credit roxy grants;
 //! * `/svc/hold`: a pass-through that sends the response head back and
 //!   holds the response body: none of its bytes, and no end;
+//! * `/svc/hoard`: a pass-through that never credits roxy back, so each
+//!   body roxy sends stops at its first window;
 //! * `/svc/talk`: sends [`TALK_BYTES`] of request body on each stream as
 //!   it opens, with no head, within the credit roxy grants, and logs the
 //!   stream once all of it has gone;
@@ -19,7 +21,7 @@
 //!   after each `request` head it gets, so it answers [`SLOW`] late;
 //! * `/svc/stall`: completes the handshake and never reads.
 //!
-//! Every connection credits roxy back for the bytes it receives.
+//! Every other connection credits roxy back for the bytes it receives.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -236,6 +238,7 @@ fn lane_of(kind: &str) -> Option<u8> {
 enum Mode {
     Pass,
     Hold,
+    Hoard,
     Talk,
     Flood,
     Pause,
@@ -248,6 +251,8 @@ impl Mode {
             Self::Pass
         } else if path.ends_with("/hold") {
             Self::Hold
+        } else if path.ends_with("/hoard") {
+            Self::Hoard
         } else if path.ends_with("/talk") {
             Self::Talk
         } else if path.ends_with("/pause") {
@@ -295,7 +300,7 @@ impl Conn {
                 lock(&self.log.opens).push(v);
                 self.streams.insert(id, Sess::new());
                 match self.mode {
-                    Mode::Pass | Mode::Hold | Mode::Pause | Mode::Slow => {}
+                    Mode::Pass | Mode::Hold | Mode::Hoard | Mode::Pause | Mode::Slow => {}
                     Mode::Talk => {
                         let s = self.streams.get_mut(&id).expect("just opened");
                         s.lanes[usize::from(REQUEST)]
@@ -324,7 +329,11 @@ impl Conn {
                 }
             }
             "response_end" if self.mode == Mode::Hold => {}
-            _ if matches!(self.mode, Mode::Pass | Mode::Hold | Mode::Slow) => {
+            _ if matches!(
+                self.mode,
+                Mode::Pass | Mode::Hold | Mode::Hoard | Mode::Slow
+            ) =>
+            {
                 let Some(dir) = lane_of(&kind) else {
                     return;
                 };
@@ -343,12 +352,14 @@ impl Conn {
             return;
         }
         *lock(&self.log.received).entry(id).or_insert(0) += data.len();
-        self.send(text(
-            id,
-            json!({"type": "credit", "dir": dir_name(dir), "bytes": data.len()}),
-        ));
+        if self.mode != Mode::Hoard {
+            self.send(text(
+                id,
+                json!({"type": "credit", "dir": dir_name(dir), "bytes": data.len()}),
+            ));
+        }
         let echo = match self.mode {
-            Mode::Pass | Mode::Slow => true,
+            Mode::Pass | Mode::Hoard | Mode::Slow => true,
             Mode::Hold => dir == REQUEST,
             Mode::Talk | Mode::Flood | Mode::Pause => false,
         };
