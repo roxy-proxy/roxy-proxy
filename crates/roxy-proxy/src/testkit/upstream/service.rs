@@ -9,6 +9,8 @@
 //!   holds the response body: none of its bytes, and no end;
 //! * `/svc/hoard`: a pass-through that never credits roxy back, so each
 //!   body roxy sends stops at its first window;
+//! * `/svc/forward`: passes the request through as `/svc/pass` does, and
+//!   never answers the response;
 //! * `/svc/talk`: sends [`TALK_BYTES`] of request body on each stream as
 //!   it opens, with no head, within the credit roxy grants, and logs the
 //!   stream once all of it has gone;
@@ -239,6 +241,7 @@ enum Mode {
     Pass,
     Hold,
     Hoard,
+    Forward,
     Talk,
     Flood,
     Pause,
@@ -253,6 +256,8 @@ impl Mode {
             Self::Hold
         } else if path.ends_with("/hoard") {
             Self::Hoard
+        } else if path.ends_with("/forward") {
+            Self::Forward
         } else if path.ends_with("/talk") {
             Self::Talk
         } else if path.ends_with("/pause") {
@@ -290,6 +295,22 @@ impl Conn {
         let _ = self.tx.send(m);
     }
 
+    /// Whether what roxy sends in direction `dir` comes straight back.
+    /// Whether body bytes in `dir` are passed on.
+    fn passes(&self, dir: u8) -> bool {
+        match self.mode {
+            Mode::Pass | Mode::Hoard | Mode::Slow => true,
+            Mode::Hold | Mode::Forward => dir == REQUEST,
+            Mode::Talk | Mode::Flood | Mode::Pause => false,
+        }
+    }
+
+    /// Whether a head or end in `dir` is passed on: `hold` passes the
+    /// response head and keeps the body.
+    fn passes_head(&self, dir: u8) -> bool {
+        self.mode == Mode::Hold || self.passes(dir)
+    }
+
     fn control(&mut self, mut v: Value) {
         let Some(id) = v["stream"].as_u64().and_then(|n| u32::try_from(n).ok()) else {
             return;
@@ -300,7 +321,12 @@ impl Conn {
                 lock(&self.log.opens).push(v);
                 self.streams.insert(id, Sess::new());
                 match self.mode {
-                    Mode::Pass | Mode::Hold | Mode::Hoard | Mode::Pause | Mode::Slow => {}
+                    Mode::Pass
+                    | Mode::Hold
+                    | Mode::Hoard
+                    | Mode::Forward
+                    | Mode::Pause
+                    | Mode::Slow => {}
                     Mode::Talk => {
                         let s = self.streams.get_mut(&id).expect("just opened");
                         s.lanes[usize::from(REQUEST)]
@@ -329,12 +355,8 @@ impl Conn {
                 }
             }
             "response_end" if self.mode == Mode::Hold => {}
-            _ if matches!(
-                self.mode,
-                Mode::Pass | Mode::Hold | Mode::Hoard | Mode::Slow
-            ) =>
-            {
-                let Some(dir) = lane_of(&kind) else {
+            _ => {
+                let Some(dir) = lane_of(&kind).filter(|d| self.passes_head(*d)) else {
                     return;
                 };
                 v.as_object_mut().map(|o| o.remove("stream"));
@@ -343,7 +365,6 @@ impl Conn {
                 }
                 self.flush(id, dir);
             }
-            _ => {}
         }
     }
 
@@ -358,12 +379,9 @@ impl Conn {
                 json!({"type": "credit", "dir": dir_name(dir), "bytes": data.len()}),
             ));
         }
-        let echo = match self.mode {
-            Mode::Pass | Mode::Hoard | Mode::Slow => true,
-            Mode::Hold => dir == REQUEST,
-            Mode::Talk | Mode::Flood | Mode::Pause => false,
-        };
-        if echo && let Some(s) = self.streams.get_mut(&id) {
+        if self.passes(dir)
+            && let Some(s) = self.streams.get_mut(&id)
+        {
             s.lanes[usize::from(dir)]
                 .queue
                 .push_back(Queued::Bytes(Bytes::copy_from_slice(data)));

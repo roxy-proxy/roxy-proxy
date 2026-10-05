@@ -323,6 +323,10 @@ pub(crate) struct StackFlow {
     /// The request body failed in the core, as a client's would (framing,
     /// a cut): no layer's doing, so no layer is blamed for it.
     client_fault: Mutex<Option<roxy_http::DriveError>>,
+    /// The upstream's response body failed before a layer had answered
+    /// with a head of its own: no layer's doing, so the client gets the
+    /// `502` it would if the core had read the body.
+    upstream_body_failed: AtomicBool,
     /// The enforce-mode failure has been logged.
     reported: AtomicBool,
     /// A layer asked to close the client connection.
@@ -363,6 +367,7 @@ impl StackFlow {
                 .collect(),
             failure: Mutex::new(None),
             client_fault: Mutex::new(None),
+            upstream_body_failed: AtomicBool::new(false),
             reported: AtomicBool::new(false),
             close: AtomicBool::new(false),
             request_decoded: AtomicBool::new(false),
@@ -452,6 +457,11 @@ impl StackFlow {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// The request body failed as a client's would, unless it already has.
+    fn set_client_fault(&self, e: roxy_http::DriveError) {
+        lock(&self.client_fault).get_or_insert(e);
     }
 
     fn take_client_fault(&self) -> Option<roxy_http::DriveError> {
@@ -655,6 +665,12 @@ fn stack_outcome(
             let (layer, err) = match (st.failure(), st.take_client_fault()) {
                 (Some(f), _) => f,
                 (None, Some(e)) => return Outcome::Close(e),
+                (None, None) if st.upstream_body_failed.load(Ordering::SeqCst) => {
+                    return Outcome::Refuse(Refusal::upstream(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_body_failed",
+                    ));
+                }
                 (None, None) => (st.blamed(), LayerError::NoResponse.into()),
             };
             emit_stack_error(st, &layer, &err, AddonMode::Enforce);
