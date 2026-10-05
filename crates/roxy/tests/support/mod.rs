@@ -675,19 +675,9 @@ log:
             .collect()
     }
 
-    /// Waits until at least `n` events of `kind` exist.
+    /// Waits until at least `n` events of `kind` were emitted; returns them.
     pub(crate) async fn wait_events(&self, kind: &str, n: usize) -> Vec<Value> {
-        for _ in 0..200 {
-            let ev = self.events(kind);
-            if ev.len() >= n {
-                return ev;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        panic!(
-            "timed out waiting for {n} `{kind}` event(s); have: {:#?}",
-            self.sink.events()
-        );
+        self.sink.wait_for(kind, n, Duration::from_secs(10)).await
     }
 
     /// Opens a CONNECT tunnel; returns the stream after `200`.
