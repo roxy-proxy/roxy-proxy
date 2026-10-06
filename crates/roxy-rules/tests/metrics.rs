@@ -350,25 +350,31 @@ fn full_table_reclaims_on_demand() {
 }
 
 #[test]
-fn key_unavailable() {
+fn null_key_guarded_by_where_skips_the_flow() {
     let c = TestClock::new();
     let s = store_with(
-        "- { id: u, count: requests, key: [tls.sni] }
-- { id: q, count: unique(tls.sni) }",
+        "- { id: u, count: requests, key: [tls.sni], where: 'tls.sni != null' }
+- { id: q, count: unique(tls.sni), where: 'tls.sni != null and method == GET' }",
         10,
         &c,
     );
-    let want = MetricError::KeyUnavailable {
-        metric: "u".into(),
-        field: Field::TlsSni,
-    };
-    assert_eq!(s.get("u", &MapView::new()), Err(want.clone()));
-    assert_eq!(s.record(&MapView::new(), &REQ), Err(want));
+    // No SNI: `where` excludes the flow before the key is built.
+    let no_sni = MapView::new().with_str(Field::Method, "GET");
+    rec(&s, &no_sni);
     assert_eq!(s.key_count(), 0);
-    let with_sni = MapView::new().with_str(Field::TlsSni, "a.example");
+    // Reading the metric still needs the key, so a rule reading it must
+    // carry the same guard.
+    assert_eq!(
+        s.get("u", &no_sni),
+        Err(MetricError::KeyUnavailable {
+            metric: "u".into(),
+            field: Field::TlsSni,
+        })
+    );
+    let with_sni = no_sni.clone().with_str(Field::TlsSni, "a.example");
     rec(&s, &with_sni);
     assert_eq!(s.get("u", &with_sni), Ok(1));
-    assert_eq!(s.get("q", &MapView::new()), Ok(1));
+    assert_eq!(s.get("q", &with_sni), Ok(1));
 }
 
 #[test]

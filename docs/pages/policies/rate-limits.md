@@ -31,6 +31,17 @@ metrics:
   field of `unique(..)` take scalar head fields only (`client.ip`, `host`,
   `tls.sni`, ...), not `header[..]` or any other indexed value.
   Anything else is a compile error.
+- **Keys that can be `null`.** A flow whose key field is `null` cannot be
+  counted and is denied (`_fail_closed`). So a key or `unique(..)` field
+  that can be `null` on an ordinary flow (`tls.sni`, `tls.alpn` and
+  `tls.version` on a plaintext connection, `query.raw` without a query,
+  `body.size` for a chunked body) must be guarded by the metric's `where`:
+  `where: tls.sni != null`, or an `and` with that as one of its top-level
+  terms. Flows where the field is `null` are then not counted. Without the
+  guard the metric does not compile; the error names the field and the
+  guard. A rule that reads such a metric needs the same guard
+  (`tls.sni != null and metric.by_sni > 30`), because reading it on a flow
+  without the key fails closed too.
 - **When counts move.** `requests` and `denied` are read before the
   forwarding decision and incremented after it (denied flows count too, so
   probing is not free); a rule `metric.x >= 30` therefore denies the 31st

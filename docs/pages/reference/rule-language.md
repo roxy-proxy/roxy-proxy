@@ -93,7 +93,9 @@ for a chunked body.
 
 `and` short-circuits, so a guard applies a rule only when the value is
 present: `body.size != null and body.size > 10mb`. `null` may only appear
-in `x == null` or `x != null`.
+in `x == null` or `x != null`. A metric keyed on a field that can be `null`
+must carry the same guard in its `where`
+([rate limits](/policies/rate-limits#metrics)).
 
 ## Actions
 

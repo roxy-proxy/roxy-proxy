@@ -102,7 +102,21 @@ fn guards_not_null(pred: &Pred, f: Field) -> bool {
             negate: true,
         } => *g == f,
         Pred::All(terms) => terms.iter().any(|t| guards_not_null(t, f)),
-        _ => false,
+        Pred::IsNull { .. }
+        | Pred::Const(_)
+        | Pred::Any(_)
+        | Pred::Not(_)
+        | Pred::Truthy(_)
+        | Pred::Eq { .. }
+        | Pred::Ord { .. }
+        | Pred::Str { .. }
+        | Pred::Glob { .. }
+        | Pred::Regex { .. }
+        | Pred::Under { .. }
+        | Pred::InStr { .. }
+        | Pred::InInt { .. }
+        | Pred::InNet { .. }
+        | Pred::InList { .. } => false,
     }
 }
 
