@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 roxy-wasm.workspace = true
 arc-swap = "1.9.2"
+aws-sigv4 = { version = "1.6.0", default-features = false, features = ["sign-http"] }
 bytes = "1.12.1"
 chrono.workspace = true
 futures-util = { version = "0.3.34", default-features = false, features = ["std", "sink"] }
