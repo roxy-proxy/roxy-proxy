@@ -24,7 +24,7 @@ produces a `request` event:
 - `req.body_bytes` and `res.body_bytes` count the body bytes roxy
   forwarded in each direction; `req.body_sha256` and `res.body_sha256` are
   the lower-case hex SHA-256 of those same bytes, so a record can be tied
-  to a [capture](#capture) or to what the other end received. Each digest
+  to a [capture](/operate/flow-log#capture) or to what the other end received. Each digest
   is present once its body completed, and absent when the exchange ended
   before the body did (a cut body, a watching stop, a client that went
   away). An empty body has the digest of the empty string. A relayed
