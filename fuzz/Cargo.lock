@@ -726,6 +726,7 @@ dependencies = [
  "roxy-http",
  "roxy-rules",
  "roxy-tls",
+ "rustls",
  "serde_json",
 ]
 
@@ -771,6 +772,7 @@ dependencies = [
  "pem",
  "rcgen",
  "ring",
+ "roxy-http",
  "rustls",
  "rustls-pki-types",
  "thiserror",
