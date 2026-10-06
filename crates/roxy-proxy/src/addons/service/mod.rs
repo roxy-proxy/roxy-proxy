@@ -534,6 +534,7 @@ pub(crate) mod testing {
             url: format!("http://up.test:{PORT}/svc/{behaviour}")
                 .parse()
                 .unwrap(),
+            path: crate::addons::EndpointPath::Fixed,
             headers: Vec::new(),
             timeout: Duration::from_secs(10),
             retries: 0,

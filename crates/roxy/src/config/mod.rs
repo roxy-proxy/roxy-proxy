@@ -571,9 +571,12 @@ impl TryFrom<RawCapability> for Capability {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Endpoint {
-    /// `http(s)://host[:port][/base/path]`; the request's path and query are
-    /// appended.
+    /// `http(s)://host[:port][/path]`: the whole target (`path: fixed`) or
+    /// the prefix the addon's path goes under (`path: prefix`).
     pub url: String,
+    /// What the addon's request path contributes (default `fixed`).
+    #[serde(default)]
+    pub path: EndpointPath,
     /// Headers roxy attaches (values may use `${secret:name}`). They replace
     /// any the addon set.
     #[serde(default, deserialize_with = "units::unique_map")]
@@ -587,6 +590,19 @@ pub struct Endpoint {
     /// Allow private, loopback and link-local addresses (default false).
     #[serde(default)]
     pub private_ok: bool,
+}
+
+/// How an endpoint call's URL takes the addon's path and query.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointPath {
+    /// The configured URL is the whole target; the addon's path and query
+    /// are ignored.
+    #[default]
+    Fixed,
+    /// The addon's path and query are normalised and appended under the
+    /// configured path. A `..` segment is refused.
+    Prefix,
 }
 
 /// An addon's keyed store. Nothing is evicted: a write when full
