@@ -103,6 +103,33 @@ async fn unknown_length_is_clean_chunked() {
     );
 }
 
+/// hyper's HTTP/1.1 encoder writes trailers only for names a `trailer`
+/// header announces, which a canonical request never carries: trailers
+/// handed to it end the body as plain `0\r\n\r\n`. The proxy's refusal of
+/// trailers towards an HTTP/1.1 upstream rests on this.
+#[tokio::test]
+async fn h1_encoder_drops_trailers_without_a_trailer_header() {
+    let (mut tx, body) = Body::channel(1 << 20, None);
+    tokio::spawn(async move {
+        tx.send_data(Bytes::from_static(b"abc")).await.unwrap();
+        let mut t = http::HeaderMap::new();
+        t.insert("x-checksum", http::HeaderValue::from_static("abc"));
+        tx.send_trailers(t).await.unwrap();
+        tx.finish().await.unwrap();
+    });
+    let req = to_upstream_request(
+        canon(Method::Post, "/t", Headers::new(), body),
+        UriForm::Origin,
+    )
+    .unwrap();
+    let wire = capture(req).await;
+    assert!(
+        wire.ends_with("\r\n\r\n3\r\nabc\r\n0\r\n\r\n"),
+        "{wire:?}"
+    );
+    assert!(!wire.contains("x-checksum"), "{wire:?}");
+}
+
 #[tokio::test]
 async fn known_length_uses_content_length() {
     let req = to_upstream_request(

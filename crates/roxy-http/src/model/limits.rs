@@ -76,7 +76,10 @@ impl Default for Limits {
 pub struct HttpFlags {
     /// Accept `HTTP/1.0` request lines.
     pub allow_http10: bool,
-    /// Accept chunked trailer sections (forwarded as trailers).
+    /// Accept chunked trailer sections. They are forwarded to an HTTP/2
+    /// upstream; a request that carries them to an HTTP/1.1 upstream is
+    /// refused, since HTTP/1.1 cannot carry them without naming them up
+    /// front.
     pub allow_trailers: bool,
     /// Accept (and discard) chunk extensions.
     pub allow_chunk_extensions: bool,
