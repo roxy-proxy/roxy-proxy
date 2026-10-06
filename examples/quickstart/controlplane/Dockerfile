@@ -6,6 +6,9 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY controlplane.py ./
+# The CA and revocation list, and the CA certificate roxy is given; volumes
+# mounted here inherit the ownership.
+RUN mkdir /data /shared && chown 65532:65532 /data /shared
 
 USER 65532:65532
 ENV HOME=/tmp PYTHONUNBUFFERED=1 PORT=8443

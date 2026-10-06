@@ -1,0 +1,16 @@
+# roxy from roxy.yaml, with no control plane:
+#   docker compose -f compose.yaml -f compose.standalone.yaml up --build --attach traffic
+# The secret comes from roxy's own environment, the way the file declares it.
+services:
+  roxy:
+    command: ["run", "--config", "/etc/roxy/roxy.yaml"]
+    secrets: !reset []
+    environment:
+      MODEL_API_KEY: fake-model-key
+    volumes:
+      - ./roxy.yaml:/etc/roxy/roxy.yaml:ro
+      - { type: tmpfs, target: /var/lib/roxy/ca, tmpfs: { mode: 0o1777 } }
+    depends_on:
+      controlplane: !reset null
+  controlplane:
+    profiles: [controlplane]               # not started

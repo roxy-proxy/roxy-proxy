@@ -8,7 +8,7 @@ import stack from "../assets/quickstart-stack.svg";
 
 # Quickstart
 
-Run clients through roxy with three controls on every model call: a WASM addon that authenticates the client with a central auth service, a WASM addon that holds each user to a token quota kept by a quota service, and an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar that blocks tool calls matching a denylist. The model is a scripted stand-in and the traffic is generated, so the stack needs no API key and no route out: start it and watch. The setup is [`examples/quickstart`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/quickstart) in the roxy repo.
+Run clients through roxy with three controls on every model call: a WASM addon that authenticates the client with a central auth service, a WASM addon that holds each user to a token quota kept by a quota service, and an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar that blocks tool calls matching a denylist. roxy runs in [node mode](/deploy/node-mode): it leases its policy and the model's API key from a minimal control plane and ships its flow log back. The model is a scripted stand-in and the traffic is generated, so the stack needs no API key and no route out: start it and watch. The setup is [`examples/quickstart`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/quickstart) in the roxy repo.
 
 ## Prerequisites
 
@@ -29,9 +29,10 @@ cd roxy-proxy/examples/quickstart
 docker compose up --build --attach traffic
 ```
 
-The first run builds the images, which takes a few minutes: the two addons compile to WebAssembly inside roxy's image, and the sentinel's image installs inspect_sentinel. Seven containers start, and only the last one's output is shown:
+The first run builds the images, which takes a few minutes: the two addons compile to WebAssembly inside roxy's image, and the sentinel's image installs inspect_sentinel. Eight containers start, and only the last one's output is shown:
 
-- **roxy**: the proxy on `127.0.0.1:3128`, with the two addons at `/etc/roxy/addons/`.
+- **controlplane**: a small Python control plane. It enrols roxy, serves [`roxy.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/roxy.yaml) and the model's API key as a one-minute lease, and prints every flow event roxy ships to it.
+- **roxy**: the proxy on `127.0.0.1:3128`, with the two addons at `/etc/roxy/addons/`. It starts with no config file, enrols with the control plane and runs the policy it leases.
 - **fake-model**: the model. It answers `POST /v1/messages` from [`responses.json`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/mocks/responses.json), one entry per call in order, streamed or whole, with the `usage` the real API sends. It refuses a request without the API key, which only roxy has.
 - **auth-service**: which credential belongs to whom. `alice-secret` is alice and `bob-secret` is bob.
 - **quota-board**: the quota service, with a live page on `127.0.0.1:8090`. Each user has a bucket of 600 tokens that refills at five a second.
@@ -87,6 +88,22 @@ docker compose logs roxy
 ```
 
 roxy's flow log has a line for every request, with the rule it matched, the addons it went through in order (`"addons":["auth-gate","token-quota","sentinel"]`), the `user:alice` tag the auth gate set, and the `set_header:x-api-key` mutation the rule made. Each addon's own events are there too: `endpoint_call` for every call to the auth service and the quota board, and `layer_record` for the verdicts and the usage reports. To keep whole requests and responses too, turn on [capture](/operate/flow-log#capture).
+
+The same events reach the control plane in batches a few seconds later; `docker compose logs controlplane` shows each one prefixed with the node's id.
+
+### Let the lease run down
+
+roxy's lease is valid for sixty seconds and refreshed every fifteen. Stop the control plane and watch:
+
+```sh
+docker compose stop controlplane
+```
+
+Within a minute every call in the traffic's output fails with a `403` and roxy's `/readyz` answers `503 policy_expired`: an unreachable control plane is not itself a reason to deny, but an expired lease is. `docker compose start controlplane` brings the next lease, and roxy recovers without a restart. To revoke the node instead, add its id (the `enrolled node-...` line in the control plane's log) to the control plane's `revoked` file; the next poll answers `410` and roxy denies everything until it is re-enrolled:
+
+```sh
+docker compose exec controlplane sh -c 'echo node-xxxxxx >> /data/revoked'
+```
 
 ### Clean up
 
@@ -151,6 +168,16 @@ Putting a secret in a header and having roxy swap it for the real one is the sim
 **The token quota** ([`addons/token-quota`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/addons/token-quota/src/lib.rs)) runs only on model calls. Before the call leaves it asks the quota board whether the user's bucket holds anything; the user is the `user:` tag if a layer above set one, else the client IP, so the layer also works alone. A refusal is answered with a `429` and a `retry-after`, in the shape the Anthropic SDK expects. Otherwise it passes the call on and reads the response as it streams through: `input_tokens` from `message_start`, the running `output_tokens` from `message_delta`, changing nothing. When the stream ends it reports them, and the board takes them out of the bucket. A call's usage is only known once its response has arrived, so the check is whether the bucket holds anything, not whether it holds enough: a user can overrun by one call, the bucket goes into debt, and the next call waits for the refill. That is the trade the layer makes on purpose. Cutting a response partway through would leave the client with half an answer and still cost the tokens. Both calls are endpoints.
 
 **The sentinel** is a [service layer](/addons/service-layers): an out-of-process addon that each exchange streams through over a WebSocket. For each model response it turns every tool call into an inspect_sentinel `BeforeToolCall` step and runs the configured sentinel on it. It sits below the quota layer, so what the quota layer meters is what the client got. Whatever any layer passes on, roxy's rules judge again, and the rules decide by host: the model and nothing else.
+
+### roxy runs in node mode
+
+In [node mode](/deploy/node-mode) roxy has no config file. It enrols once with a token, keeps the certificate it is given in its state dir, and from then on polls the control plane for its lease: the whole `roxy.yaml`, the secret values the file declares as `lease: true`, and how to ship the flow log. The control plane here is [`controlplane/controlplane.py`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/controlplane/controlplane.py), the server side of the [node protocol](/reference/node-protocol) in one file: it signs the node's CSR with a CA it keeps, checks the node certificate on every other request, reads `roxy.yaml` and turns `model_key: { env: MODEL_API_KEY }` into a lease secret with the value from its own environment, and prints the flow batches it is sent. The `lease_id` is a hash of the config and the secrets, so editing `roxy.yaml` changes the lease and roxy applies it on its next poll; nothing is restarted.
+
+To run roxy from the file instead, with no control plane, add the standalone override:
+
+```sh
+docker compose -f compose.yaml -f compose.standalone.yaml up --build --attach traffic
+```
 
 ### Failure is closed
 

@@ -1,8 +1,10 @@
 # roxy quickstart: clients behind roxy, with an auth gate, a per-user token
-# quota and an inspect_sentinel sidecar, talking to a scripted model.
+# quota and an inspect_sentinel sidecar, talking to a scripted model. roxy
+# runs in node mode, leasing its policy from a minimal control plane.
 # Nothing here needs an API key or a route out.
 #
 #   docker compose up --build --attach traffic    # Ctrl-C stops it; down -v cleans up
+#   docker compose -f compose.yaml -f compose.standalone.yaml up --build   # roxy from the file instead
 #
 # Quota board: http://127.0.0.1:8090    Inspect View: http://127.0.0.1:7575
 # The proxy is on 127.0.0.1:3128 for a client of your own (see README.md).
@@ -23,7 +25,8 @@ x-mock: &mock
     retries: 30
 
 services:
-  # roxy with the two WASM addons (./addons) baked into its image.
+  # roxy with the two WASM addons (./addons) baked into its image. In node
+  # mode: it enrols with the control plane and leases roxy.yaml from it.
   roxy:
     image: roxy-quickstart
     build:
@@ -35,13 +38,18 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    environment:
-      MODEL_API_KEY: fake-model-key        # the secret roxy injects; the client never has it
+    command:
+      - run
+      - --control-plane=https://controlplane:8443
+      - --enrol-token-file=/run/secrets/enrol-token
+      - --state-dir=/var/lib/roxy/node
+      - --control-plane-ca=/shared/cp-ca.pem
+    secrets: [enrol-token]
     volumes:
-      - ./roxy.yaml:/etc/roxy/roxy.yaml:ro
-      # The CA is unused here (the model is plain HTTP); a fresh one each
-      # start rather than a volume. Writable by roxy's non-root user.
-      - { type: tmpfs, target: /var/lib/roxy/ca, tmpfs: { mode: 0o1777 } }
+      # The node certificate, key and interception CA. A fresh enrolment
+      # each start rather than a volume. Writable by roxy's non-root user.
+      - { type: tmpfs, target: /var/lib/roxy/node, tmpfs: { mode: 0o1777 } }
+      - cp-shared:/shared:ro               # the control plane's CA certificate
     ports:
       - "127.0.0.1:3128:3128"              # the proxy
       - "127.0.0.1:3130:3130"              # the CA certificate
@@ -51,10 +59,35 @@ services:
       retries: 30
     networks: [lab, sidecar, egress]
     depends_on:
+      controlplane: { condition: service_healthy }
       fake-model: { condition: service_healthy }
       auth-service: { condition: service_healthy }
       quota-board: { condition: service_healthy }
       sentinel: { condition: service_healthy }
+
+  # The control plane (./controlplane): enrols roxy, serves roxy.yaml as its
+  # lease with the model key from this environment, and prints the flow
+  # events roxy ships. `docker compose stop controlplane` lets the lease run
+  # down; `start` recovers it. Revoke the node with
+  #   docker compose exec controlplane sh -c 'echo node-xxxxxx >> /data/revoked'
+  controlplane:
+    image: roxy-quickstart-controlplane
+    build: ./controlplane
+    pull_policy: build
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      ENROL_TOKEN: quickstart-enrol-token  # what ./controlplane/enrol-token holds
+      MODEL_API_KEY: fake-model-key        # the secret in the lease; the client never has it
+      ROXY_CONFIG: /etc/roxy/roxy.yaml
+      CA_OUT: /shared/cp-ca.pem
+      LEASE_VALID_SECONDS: ${LEASE_VALID_SECONDS:-60}
+    volumes:
+      - ./roxy.yaml:/etc/roxy/roxy.yaml:ro
+      - cp-data:/data                      # CA, server certificate, `revoked`
+      - cp-shared:/shared
+    networks: [lab]
 
   # The model: scripted responses from ./mocks/responses.json, in order.
   fake-model:
@@ -178,3 +211,9 @@ networks:
 
 volumes:
   sentinel-logs: {}
+  cp-data: {}
+  cp-shared: {}
+
+secrets:
+  enrol-token:
+    file: ./controlplane/enrol-token
