@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 #
 # Hardened roxy image: a static musl binary on distroless/static (no shell,
 # no package manager), running as UID 65532 and compatible with a read-only
@@ -16,6 +16,10 @@
 # links statically by default, so the same Dockerfile builds amd64 and arm64
 # natively on each platform's runner.
 FROM rust:1.99-alpine3.22@sha256:d0486f70555afb827c0cafecb4052d6139e1bc7b3f7170c79307884c6af32e90 AS toolchain
+# Unpinned on purpose: Alpine's repositories carry only the current build
+# of a package per release, so `musl-dev=<version>` fails to install as
+# soon as 3.22 rebuilds it. The package is signed by Alpine's keys and the
+# only thing it gives this build is the headers and static libc.
 RUN apk add --no-cache musl-dev
 # cargo-auditable embeds the crate dependency list in the binary, so image
 # scanners (Trivy) and the SBOM see the Rust dependencies, not just the base.

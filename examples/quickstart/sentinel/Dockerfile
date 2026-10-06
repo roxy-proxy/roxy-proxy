@@ -1,5 +1,6 @@
 # The quickstart's inspect_sentinel sidecar, and Inspect View over its log.
-FROM python:3.12-slim
+# python:3.12-slim, pinned by digest (multi-arch index); bump deliberately.
+FROM python:3.12-slim@sha256:ddb0207ae1f0356c2b724d740769b0c5f5f51cc54a0525178f721825f78fe74c
 
 # pip installs inspect_sentinel (and its inspect_ai branch) from git.
 RUN apt-get update \

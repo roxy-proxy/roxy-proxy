@@ -14,7 +14,7 @@ test` do not resolve secrets.
 ```yaml
 secrets:
   openai: { env: OPENAI_API_KEY }
-  gh:     { file: /run/secrets/github_token }   # one trailing newline (`\n` or `\r\n`) stripped
+  gh:     { file: /run/secrets/github_token }   # one trailing newline (`\n` or `\r\n`) stripped; warns if group or world can read it
 
 rules:
   - id: openai

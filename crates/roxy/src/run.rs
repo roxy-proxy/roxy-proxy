@@ -245,6 +245,30 @@ fn keep_restart_only(running: &Config, new: &mut Config) -> Vec<&'static str> {
     changed
 }
 
+/// Puts the running restart-only values into `config` and validates the
+/// result. A failure is then reported against the config as validated: when
+/// the file changed a restart-only setting, the diagnostics say which, so
+/// a file that adds `capture` together with `capture_dir` is told that
+/// `capture_dir` needs a restart rather than that it is missing.
+fn validate_reload(
+    running: &Config,
+    config: &mut Config,
+    path: &Path,
+) -> Result<(Compiled, Vec<&'static str>), Vec<String>> {
+    let restart = keep_restart_only(running, config);
+    let compiled = validate_at(config, path).map_err(|mut diagnostics| {
+        if !restart.is_empty() {
+            diagnostics.push(format!(
+                "{}: validated with the running value of {}; changing it needs a restart",
+                path.display(),
+                restart.join(", ")
+            ));
+        }
+        diagnostics
+    })?;
+    Ok((compiled, restart))
+}
+
 /// What a reload has ready before anything is swapped.
 struct Staged {
     config: Config,
@@ -321,8 +345,7 @@ impl Reloader {
         if let Some(w) = self.watch.get() {
             w.track(&self.path, &watched_files(&config));
         }
-        let restart = keep_restart_only(running, &mut config);
-        let compiled = validate_at(&config, &self.path)?;
+        let (compiled, restart) = validate_reload(running, &mut config, &self.path)?;
         Ok((config, compiled, restart))
     }
 
@@ -827,6 +850,34 @@ mod tests {
             ),
             Vec::<&str>::new()
         );
+    }
+
+    /// The diagnostics for a reload that fails validation name the
+    /// restart-only settings it changed, since the running values, not the
+    /// file's, were validated.
+    #[test]
+    fn a_reload_that_needs_a_restart_says_so_when_validation_fails() {
+        let base = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:3128 }]\n";
+        let running = cfg(base);
+        let mut new = cfg(&format!(
+            "{base}capture_dir: /tmp/c\nrules: [{{ id: c, then: [{{ capture: both }}, allow] }}]\n"
+        ));
+        let err = validate_reload(&running, &mut new, Path::new("roxy.yaml")).unwrap_err();
+        assert!(
+            err.iter().any(|d| d.contains("needs `capture_dir`")),
+            "{err:?}"
+        );
+        assert!(
+            err.iter()
+                .any(|d| d.contains("capture_dir") && d.contains("needs a restart")),
+            "{err:?}"
+        );
+
+        let mut new = cfg(&format!(
+            "{base}rules: [{{ id: c, then: [{{ capture: both }}, allow] }}]\n"
+        ));
+        let err = validate_reload(&running, &mut new, Path::new("roxy.yaml")).unwrap_err();
+        assert!(!err.iter().any(|d| d.contains("restart")), "{err:?}");
     }
 
     /// A reload that fails while building the snapshot leaves the metric

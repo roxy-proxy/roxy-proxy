@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{
-    ConnectionConfig, NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts,
+    ConnectionConfig, LookupIpStrategy, NameServerConfig, ResolveHosts, ResolverConfig,
+    ResolverOpts,
 };
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use roxy_http::Host;
@@ -83,6 +84,9 @@ impl Dns {
         let opts: &mut ResolverOpts = builder.options_mut();
         opts.positive_max_ttl = Some(s.cache_ttl_cap);
         opts.negative_max_ttl = Some(s.cache_ttl_cap);
+        // Both families, so the connector can alternate between them; the
+        // default asks for AAAA only when there are no A records.
+        opts.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
         // The hosts file is part of "system" only; explicit servers mean
         // exactly those servers.
         if s.servers.is_some() {
