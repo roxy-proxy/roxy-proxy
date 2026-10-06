@@ -1,0 +1,54 @@
+[package]
+name = "roxy-node"
+description = "The node side of roxy's control-plane protocol: enrolment, lease refresh, flow shipping"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# A scripted control plane over mTLS for tests of the client and of roxy's
+# node mode.
+testkit = [
+    "dep:bytes",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:rustls",
+    "dep:time",
+    "dep:tokio-rustls",
+]
+
+[dependencies]
+base64 = "0.22.1"
+chrono.workspace = true
+flate2 = "1.1.5"
+rcgen.workspace = true
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "http2"] }
+ring.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros", "fs"] }
+tracing.workspace = true
+x509-parser.workspace = true
+
+bytes = { version = "1.12.1", optional = true }
+http = { version = "1.5.0", optional = true }
+http-body-util = { version = "0.1.5", default-features = false, optional = true }
+hyper = { version = "1.11.1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1.21", features = ["server", "tokio", "http1"], optional = true }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "tls12", "std"], optional = true }
+time = { workspace = true, optional = true }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"], optional = true }
+
+[dev-dependencies]
+roxy-node = { path = ".", features = ["testkit"] }
+roxy-node-spec = { path = "../roxy-node-spec" }
+tempfile.workspace = true
+
+[lints]
+workspace = true

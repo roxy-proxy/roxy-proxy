@@ -159,6 +159,12 @@ impl StateStore {
         Ok(())
     }
 
+    /// Drops every entry, live or expired.
+    pub fn clear(&self) {
+        self.map.clear();
+        self.stored.store(0, Ordering::Release);
+    }
+
     /// Delete `key` (no-op if absent).
     pub fn remove(&self, key: &str) {
         if self.map.remove(key).is_some() {

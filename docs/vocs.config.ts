@@ -49,6 +49,7 @@ export default defineConfig({
         { text: "Containing a workload", link: "/deploy/overview" },
         { text: "Container image", link: "/deploy/docker" },
         { text: "Running without Docker", link: "/deploy/bare-metal" },
+        { text: "Node mode", link: "/deploy/node-mode" },
       ],
     },
     {

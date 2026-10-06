@@ -57,7 +57,9 @@ the status code, not the body.
 | `5xx`, timeout, connection or TLS error | the control plane is unavailable | retry with backoff; the lease runs down |
 
 A TLS handshake the server rejects because of the client certificate is
-treated as `401`.
+treated as a TLS error (retry with backoff; the lease runs down), not as
+`401`: the node cannot tell a rejected certificate from any other handshake
+failure.
 
 ## Enrol
 

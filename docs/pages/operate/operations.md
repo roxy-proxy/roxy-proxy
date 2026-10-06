@@ -109,7 +109,8 @@ says `valid` otherwise), and `roxy health` prints `ok (policy expired)`;
 `/readyz` answers `503 policy_expired` ([health](/operate/operations#health)).
 A document already past its `valid_until` loads and denies rather than
 failing to start, so a stale lease on disk fails closed. `roxy check`
-prints `valid until:` and warns when the instant has passed.
+prints `valid until:` and warns when the instant has passed. In
+[node mode](/deploy/node-mode) the control plane's lease sets it.
 
 The way back is a reload: a config whose `valid_until` is later, or
 absent, is swapped in like any other and traffic resumes under it. There

@@ -2725,6 +2725,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "roxy-http",
+ "roxy-node",
  "roxy-proxy",
  "roxy-rules",
  "roxy-tls",
@@ -2781,6 +2782,36 @@ dependencies = [
  "flate2",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "roxy-node"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "flate2",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "reqwest",
+ "ring",
+ "roxy-node",
+ "roxy-node-spec",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "x509-parser",
 ]
 
 [[package]]

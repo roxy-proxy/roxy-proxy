@@ -45,6 +45,21 @@ fn validate_at(config: &Config, path: &Path) -> Result<Compiled, Vec<String>> {
 /// address list that fails to load fails the whole update.
 pub fn policy_update(config: &Config, policy: Policy) -> anyhow::Result<PolicyUpdate> {
     let secrets = Secrets::resolve(&config.secrets)?;
+    let secret_map = config
+        .secrets
+        .keys()
+        .filter_map(|k| secrets.get(k).map(|v| (k.clone(), v.expose().to_owned())));
+    policy_update_with_secrets(config, policy, secret_map)
+}
+
+/// [`policy_update`] with the secret values already resolved, for a loader
+/// that supplies them itself (node mode).
+pub fn policy_update_with_secrets(
+    config: &Config,
+    policy: Policy,
+    secrets: impl IntoIterator<Item = (String, String)>,
+) -> anyhow::Result<PolicyUpdate> {
+    let secret_map: HashMap<String, String> = secrets.into_iter().collect();
     let mut redactor = Redactor::new();
     for header in &config.log.redact_headers {
         redactor.add_header(header);
@@ -54,11 +69,6 @@ pub fn policy_update(config: &Config, policy: Policy) -> anyhow::Result<PolicyUp
     for (name, list) in &address_lists {
         tracing::info!(list = %name, entries = list.len(), "address list loaded");
     }
-    let secret_map = config
-        .secrets
-        .keys()
-        .filter_map(|k| secrets.get(k).map(|v| (k.clone(), v.expose().to_owned())))
-        .collect();
     Ok(PolicyUpdate {
         policy,
         valid_until: config.valid_until,
@@ -183,7 +193,7 @@ impl std::fmt::Debug for Reloader {
     }
 }
 
-fn listener_specs(config: &Config) -> Vec<ListenerSpec> {
+pub(crate) fn listener_specs(config: &Config) -> Vec<ListenerSpec> {
     config
         .listeners
         .iter()
@@ -200,7 +210,7 @@ fn listener_specs(config: &Config) -> Vec<ListenerSpec> {
 /// destinations) into `new`, and names each one that differed. The reload
 /// then validates and applies `new` as a whole, so a restart-only change is
 /// never half-applied.
-fn keep_restart_only(running: &Config, new: &mut Config) -> Vec<&'static str> {
+pub(crate) fn keep_restart_only(running: &Config, new: &mut Config) -> Vec<&'static str> {
     let mut changed = Vec::new();
     macro_rules! keep {
         ($name:literal, $($field:ident).+) => {
