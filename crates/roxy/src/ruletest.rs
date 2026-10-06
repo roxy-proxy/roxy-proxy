@@ -708,7 +708,10 @@ mod tests {
     #[test]
     fn urls_are_canonical() {
         let config = config();
-        let req = TestRequest::new("GET", "HTTPS://API.GitHub.com.:443/repos/%7ea/./b/../c%2e?x=%2f&y");
+        let req = TestRequest::new(
+            "GET",
+            "HTTPS://API.GitHub.com.:443/repos/%7ea/./b/../c%2e?x=%2f&y",
+        );
         let h = parse_head(&config, &req).unwrap();
         assert_eq!(h.scheme, Scheme::Https);
         assert_eq!(host_text(&h.authority.host), "api.github.com");
@@ -781,7 +784,10 @@ mod tests {
         let config = config();
         let mut req = TestRequest::new("GET", "https://h.example/");
         req.headers = vec![("host".into(), "H.EXAMPLE.:443".into())];
-        assert_eq!(parse_head(&config, &req).unwrap().host_header(), "h.example");
+        assert_eq!(
+            parse_head(&config, &req).unwrap().host_header(),
+            "h.example"
+        );
         req.headers = vec![("host".into(), "other.example".into())];
         let err = parse_head(&config, &req).unwrap_err();
         assert!(err.contains("host_mismatch"), "{err}");
