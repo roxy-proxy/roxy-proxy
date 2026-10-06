@@ -2,8 +2,10 @@
 
 Each user has a token bucket: QUOTA_CAPACITY tokens, refilling at
 QUOTA_REFILL_PER_SEC. A call is allowed while the bucket holds anything;
-the tokens it then used are taken out, so a bucket can go into debt, and
-the user waits for it to refill past zero.
+the tokens it then used are taken out, so a bucket can go into debt by at
+most one call, and the user waits for it to refill past zero. Usage is only
+known once a response has arrived, so this is what lets a response finish
+rather than be cut off partway.
 
     POST /check  {"user"}                                   -> an allowance (below)
     POST /report {"user", "input_tokens", "output_tokens"}  -> the allowance after taking them
