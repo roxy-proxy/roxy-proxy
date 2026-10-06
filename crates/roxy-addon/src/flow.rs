@@ -23,7 +23,8 @@ pub fn principal_key() -> String {
     format!("ip:{}", current().principal.client_ip)
 }
 
-/// Adds a tag to the flow's log record.
+/// Adds a tag to the flow's log record. Enforce layers only: from an
+/// observer the call fails the exchange.
 pub fn add_tag(tag: &str) {
     raw::add_tag(tag);
 }
