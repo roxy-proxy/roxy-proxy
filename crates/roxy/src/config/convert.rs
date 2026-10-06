@@ -57,6 +57,8 @@ impl From<&Config> for HttpBehaviour {
     fn from(c: &Config) -> Self {
         let h = &c.http;
         HttpBehaviour {
+            require_sni_match: c.tls.require_sni_match,
+            enable_h2: h.enable_h2,
             allow_plain_in_connect: h.allow_plain_in_connect,
             strip_accept_encoding: h.strip_accept_encoding,
             decode_for_addons: h.decode_for_addons,

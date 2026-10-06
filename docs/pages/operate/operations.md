@@ -43,11 +43,16 @@ still finishing under the old policy can find its metric gone (and is then
 failed closed).
 
 Some settings take effect only when roxy starts: `listeners`, `ca_server`,
-`dns`, `tls`, `http.enable_h2`,
-`limits.max_connections`, `limits.max_connections_per_client`,
-`limits.max_state_entries`, `limits.max_capture_body_bytes`, `log.flow`,
-`log.capture` and `capture_dir`. A reload keeps their running values,
-applies everything else, and logs a warning naming each one that changed.
-The new config is validated with those running values, so nothing is
-half-applied; when that validation fails, the diagnostics name the
-restart-only settings the file changed, since the failure may be theirs.
+`dns`, `tls` (except `tls.require_sni_match`), `limits.max_connections`,
+`limits.max_connections_per_client`, `limits.max_state_entries`,
+`limits.max_capture_body_bytes`, `log.flow`, `log.capture` and
+`capture_dir`. A reload keeps their running values, applies everything
+else, and logs a warning naming each one that changed. The new config is
+validated with those running values, so nothing is half-applied; when that
+validation fails, the diagnostics name the restart-only settings the file
+changed, since the failure may be theirs.
+
+A connection takes `tls.require_sni_match`, `http.enable_h2`,
+`http.allow_plain_in_connect` and the `limits` and `http` parsing settings
+when it is accepted and keeps them; a reload changes them for new
+connections only.

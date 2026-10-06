@@ -19,7 +19,7 @@ use roxy_rules::Policy;
 use roxy_tls::{Ca, LeafMinter};
 
 use crate::addons::{AddonLoader, PreparedAddons};
-use crate::config::{Compiled, Config, ListenerMode};
+use crate::config::{Compiled, Config, ListenerMode, Tls};
 use crate::secrets::Secrets;
 use crate::stores::ReloadableMetrics;
 
@@ -216,8 +216,8 @@ fn dns_spec(dns: &crate::config::DnsListener, log_queries: bool) -> DnsServerSpe
 }
 
 /// Puts the running value of every setting that takes effect only at
-/// startup (listeners, the CA server, the DNS listener, TLS, HTTP/2,
-/// connection caps, the state store size, the flow and capture log
+/// startup (listeners, the CA server, the DNS listener, the CA and upstream
+/// TLS, connection caps, the state store size, the flow and capture log
 /// destinations) into `new`, and names each one that differed. The reload
 /// then validates and applies `new` as a whole, so a restart-only change is
 /// never half-applied.
@@ -234,8 +234,16 @@ fn keep_restart_only(running: &Config, new: &mut Config) -> Vec<&'static str> {
     keep!("listeners", listeners);
     keep!("ca_server", ca_server);
     keep!("dns", dns);
-    keep!("tls", tls);
-    keep!("http.enable_h2", http.enable_h2);
+    // `tls.require_sni_match` is per connection and reloads; the rest of
+    // `tls` is read once.
+    let tls = Tls {
+        require_sni_match: new.tls.require_sni_match,
+        ..running.tls.clone()
+    };
+    if new.tls != tls {
+        changed.push("tls");
+        new.tls = tls;
+    }
     keep!("limits.max_connections", limits.max_connections);
     keep!(
         "limits.max_connections_per_client",
@@ -627,8 +635,6 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
             .map(|d| dns_spec(d, config.log.flow.dns_events)),
         ca,
         minter,
-        require_sni_match: config.tls.require_sni_match,
-        enable_h2: config.http.enable_h2,
         upstream_tls: (&config).into(),
         max_connections: config.limits.max_connections,
         max_connections_per_client: config.limits.max_connections_per_client,
@@ -830,11 +836,9 @@ mod tests {
     fn startup_only_settings_need_a_restart() {
         let base = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:443 }]\n";
         for (yaml, field) in [
-            ("tls: { require_sni_match: false }", "tls"),
             ("tls: { leaf_cache_size: 5 }", "tls"),
             ("tls: { upstream: { min_version: \"1.3\" } }", "tls"),
             ("ca_server: { bind: 127.0.0.1:3130 }", "ca_server"),
-            ("http: { enable_h2: false }", "http.enable_h2"),
             ("limits: { max_connections: 5 }", "limits.max_connections"),
             (
                 "limits: { max_connections_per_client: 5 }",
@@ -849,11 +853,15 @@ mod tests {
         ] {
             assert_eq!(restart(base, &format!("{base}{yaml}\n")), [field], "{yaml}");
         }
-        // The rest of `http` and `limits` reload.
+        // The rest of `http` and `limits` reload, as does
+        // `tls.require_sni_match` alone among `tls`.
         assert_eq!(
             restart(
                 base,
-                &format!("{base}http: {{ allow_http10: true }}\nlimits: {{ max_headers: 5 }}\n")
+                &format!(
+                    "{base}http: {{ allow_http10: true, enable_h2: false }}\n\
+                     limits: {{ max_headers: 5 }}\ntls: {{ require_sni_match: false }}\n"
+                )
             ),
             Vec::<&str>::new()
         );

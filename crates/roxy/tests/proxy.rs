@@ -169,6 +169,31 @@ async fn hot_reload_swaps_policy_and_keeps_it_on_failure() {
     h.stop().await;
 }
 
+/// `tls.require_sni_match` is read when a connection is accepted: after a
+/// reload turns it off, a new tunnel completes the handshake under a
+/// mismatched SNI and is served a leaf for that SNI.
+#[tokio::test(flavor = "multi_thread")]
+async fn hot_reload_applies_require_sni_match_to_new_connections() {
+    let h = Harness::start(ALLOW_UPSTREAM).await;
+    let authority = format!("upstream.test:{}", h.upstream.https.port());
+    let r = h.tls_tunnel(&authority, "alias.test").await;
+    assert!(r.is_err(), "TLS must not complete with a mismatched SNI");
+    let ev = h.wait_events("parse_error", 1).await;
+    assert_eq!(ev[0]["reason"], "sni_mismatch");
+
+    let relaxed = h.render(&Opts {
+        rules: ALLOW_UPSTREAM,
+        tls: "require_sni_match: false",
+        ..Opts::default()
+    });
+    std::fs::write(&h.config_path, relaxed).unwrap();
+    h.wait_events("config_reloaded", 1).await;
+    // The client verified the leaf against `alias.test`, so the handshake
+    // completing is also proof of which host the leaf names.
+    h.tls_tunnel(&authority, "alias.test").await.unwrap();
+    h.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn per_client_connection_cap() {
     let h = Harness::start_with(Opts {

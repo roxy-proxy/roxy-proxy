@@ -431,8 +431,6 @@ impl KitBuilder {
             dns: None,
             ca: ca.clone(),
             minter: minter.clone(),
-            require_sni_match: true,
-            enable_h2: true,
             upstream_tls: UpstreamTlsOptions {
                 extra_roots_pem: vec![dir.path().join(roxy_tls::CA_CERT_FILE)],
                 ..UpstreamTlsOptions::default()

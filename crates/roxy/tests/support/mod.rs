@@ -339,6 +339,8 @@ pub(crate) struct Opts<'a> {
     pub limits: &'a str,
     /// Extra lines under `http:`.
     pub http: &'a str,
+    /// Extra lines under `tls:` (e.g. `require_sni_match: false`).
+    pub tls: &'a str,
     /// Top-level YAML appended before `rules:` (e.g. `metrics:`).
     pub extra: &'a str,
     /// More `listeners:` items (YAML, indented by two spaces per item);
@@ -458,7 +460,7 @@ listeners:
   bind: 127.0.0.1:0
 tls:
   ca_dir: {dir}/ca
-  upstream:
+{tls}  upstream:
     verify: strict+extra_roots
     extra_roots: [{dir}/upstream-ca.pem]
 http:
@@ -485,6 +487,7 @@ log:
 {rules}"#,
             dir = dir.display(),
             http = indent(opts.http, 2),
+            tls = indent(opts.tls, 2),
             limits = indent(opts.limits, 2),
             response_header_timeout = if opts.limits.contains("response_header_timeout") {
                 ""
