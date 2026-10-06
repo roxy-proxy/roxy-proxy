@@ -194,6 +194,25 @@ fn under_operator() {
     ));
 }
 
+/// `*` in `like` stands for any run of characters, including none, but a
+/// pattern is matched whole: `*.example.com` needs the dot, so neither the
+/// bare domain nor a look-alike nor a trailing-dot form matches.
+#[test]
+fn like_host_boundaries() {
+    let host = |h: &str| MapView::new().with_str(Field::Host, h);
+    for (h, want) in [
+        ("a.example.com", true),
+        ("a.b.example.com", true),
+        ("A.EXAMPLE.COM", true),
+        ("example.com", false),
+        ("evil-example.com", false),
+        ("a.example.com.", false),
+        ("a.example.com.evil.org", false),
+    ] {
+        assert_eq!(eval_in("host like \"*.example.com\"", &host(h)), want, "{h}");
+    }
+}
+
 #[test]
 fn membership_and_cidrs() {
     check(&[
