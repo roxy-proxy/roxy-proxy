@@ -72,10 +72,7 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for OneByte<IO> {
         Pin::new(&mut self.0).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.0).poll_shutdown(cx)
     }
 }
@@ -415,7 +412,11 @@ async fn smuggling_corpus() {
                 let _ = writeln!(failures, "{}/{}: {msg}", case.file, case.name);
             }
             if let Err(msg) = run_case(&case, true).await {
-                let _ = writeln!(failures, "{}/{} (byte at a time): {msg}", case.file, case.name);
+                let _ = writeln!(
+                    failures,
+                    "{}/{} (byte at a time): {msg}",
+                    case.file, case.name
+                );
             }
         }
     }
