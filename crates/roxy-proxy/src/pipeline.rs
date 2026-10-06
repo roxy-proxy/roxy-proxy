@@ -303,6 +303,9 @@ pub(crate) struct FlowRecord {
     pub decision: Option<DecisionKind>,
     pub request_bytes: u64,
     pub response_bytes: u64,
+    /// SHA-256 (hex) of each body, once it completed.
+    pub request_sha256: Option<String>,
+    pub response_sha256: Option<String>,
     pub response_status: Option<u16>,
     pub response_headers_bytes: u64,
     pub ttfb_ms: Option<u64>,
@@ -423,8 +426,9 @@ pub(crate) struct FlowCx {
     pub taps: PerDir<Option<Tap>>,
     /// `Host` to send upstream after a `redirect` without `rewrite_host`.
     pub host_override: Option<String>,
-    /// Request body bytes forwarded so far, once the request is on its way.
-    pub request_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Request body bytes forwarded so far (and their digest once the
+    /// body completed), once the request is on its way.
+    pub request_tally: Option<Arc<crate::body::Tally>>,
     /// The addon stack this exchange went through (set once the stack has
     /// handed the flow back), folded into the record when it is logged.
     pub stack: Option<Arc<crate::addons::StackFlow>>,
@@ -533,7 +537,7 @@ impl FlowCx {
             capture: PerDir::default(),
             taps: PerDir::default(),
             host_override: None,
-            request_counter: None,
+            request_tally: None,
             stack: None,
             layer_ran: false,
             buffers: Vec::new(),
@@ -645,8 +649,9 @@ impl FlowCx {
             st.fold_into(self);
         }
         self.absorb_watch();
-        if let Some(c) = &self.request_counter {
-            self.record.request_bytes = c.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = &self.request_tally {
+            self.record.request_bytes = t.bytes();
+            self.record.request_sha256 = t.sha256_hex();
         }
         let redactor = self.snap.secrets.redactor();
         let r = self.facts.client_request.as_ref();
@@ -662,6 +667,7 @@ impl FlowCx {
                 .map(|q| redactor.redact_str(&redact_query(q)).into_owned()),
             headers_bytes: r.map_or(0, |r| r.head_bytes as u64),
             body_bytes: self.record.request_bytes,
+            body_sha256: self.record.request_sha256.clone(),
             content_type: r
                 .and_then(|r| r.headers.get("content-type"))
                 .map(|v| redactor.redact_header("content-type", v).into_owned()),
@@ -670,6 +676,7 @@ impl FlowCx {
             status,
             headers_bytes: self.record.response_headers_bytes,
             body_bytes: self.record.response_bytes,
+            body_sha256: self.record.response_sha256.clone(),
         });
         self.shared.sink.emit(&FlowEvent::Request {
             ts: chrono::Utc::now(),

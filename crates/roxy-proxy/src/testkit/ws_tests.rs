@@ -278,6 +278,11 @@ async fn messages_are_sampled_and_a_clean_close_passes_through() {
     assert_eq!(msgs[0]["direction"], "c2s");
     let ev = kit.request_event().await;
     assert_eq!(ev["decision"], "allow", "{ev:#}");
+    // The relay's byte counts are not HTTP bodies: no digest in either
+    // direction.
+    assert!(ev["req"]["body_bytes"].as_u64().unwrap() > 0, "{ev:#}");
+    assert!(ev["req"].get("body_sha256").is_none(), "{ev:#}");
+    assert!(ev["res"].get("body_sha256").is_none(), "{ev:#}");
 }
 
 /// A byte budget applies to the relay: it closes before writing the bytes
