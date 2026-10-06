@@ -29,6 +29,7 @@ impl From<&Config> for Limits {
             max_buffered_bytes: l.max_buffered_bytes.as_u64(),
             header_timeout: l.header_timeout,
             body_idle_timeout: l.body_idle_timeout,
+            response_body_idle_timeout: l.response_body_idle_timeout,
             response_header_timeout: l.response_header_timeout,
             idle_timeout: l.idle_timeout,
             h2_max_concurrent_streams: l.h2_max_concurrent_streams,

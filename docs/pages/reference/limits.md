@@ -42,7 +42,7 @@ limits:
   max_headers: 100
   max_request_body_bytes: 1gb
   header_timeout: 10s
-  body_idle_timeout: 30s
+  body_idle_timeout: 30s          # the client's stall: sending its body, or taking the response
   idle_timeout: 300s              # keep-alive idle; also a relayed WebSocket's idle timeout
   h2_max_concurrent_streams: 100
   h2_max_header_list_bytes: 64kb
@@ -50,6 +50,7 @@ limits:
   # responses
   max_response_body_bytes: 1gb
   response_header_timeout: 60s    # from when the request body has been sent; a WebSocket upgrade's whole upstream handshake
+  response_body_idle_timeout: 5m  # the upstream's stall between parts of the response body
 
   # buffering
   max_inspect_body_bytes: 1mb     # body.text / response.body.text, and addons' default
@@ -68,6 +69,19 @@ limits:
   max_state_entries: 100000
   max_address_list_bytes: 256mb
 ```
+
+The two body idle timeouts bound the two ends of an exchange.
+`body_idle_timeout` is the client's: how long it may go without sending the
+next part of its request body, or without taking the next part of the
+response. It is short because the client is untrusted. A client that
+overruns it has its request cut off (`parse_error`, `body_timeout`) or its
+response cut off (`response_error`, `client_gone`).
+`response_body_idle_timeout` is the upstream's: how long it may pause
+between parts of the response body. It is generous so that gRPC server
+streams, server-sent events and long polls go through. An upstream that
+overruns it ends the exchange (`response_error`, `response_body_timeout`):
+on HTTP/1.1 the connection closes so the client cannot take the body for
+complete, on HTTP/2 the stream is reset with `CANCEL`.
 
 Addons have their own limits ([addon safety](/addons/safety)).
 `max_ws_message_bytes` applies only when rules read WebSocket messages
@@ -104,7 +118,8 @@ the budget nothing.
 
 The limits that shape the client-facing codec (`max_header_bytes`,
 `max_url_bytes`, `max_headers`, `max_request_body_bytes`, `header_timeout`,
-`body_idle_timeout`, the keep-alive `idle_timeout`, the `h2_*` limits) and
+`body_idle_timeout`, `response_body_idle_timeout`, the keep-alive
+`idle_timeout`, the `h2_*` limits) and
 the `http.*` flags are fixed for a connection when it is accepted, on
 HTTP/1.1 and HTTP/2 alike; a reload changes them for new connections only.
 Everything decided per exchange (`max_inspect_body_bytes`,

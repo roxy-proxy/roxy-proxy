@@ -10,8 +10,12 @@ fail every metric and state rule closed: `max_headers`, `max_header_bytes`,
 `h2_max_concurrent_streams`, `h2_max_header_list_bytes`, `max_metric_keys`,
 `max_metric_bytes`, `max_state_entries`, `max_observer_lag_bytes` and
 `max_address_list_bytes`. The body, message and capture caps and the
-timeouts accept zero, and mean it. Each section is described on the page
-the table names.
+timeouts accept zero, and mean it. The two body idle timeouts bound
+different ends of an exchange: `body_idle_timeout` (30 s) is how long the
+client may stall, sending its request body or taking the response;
+`response_body_idle_timeout` (5 m) is how long the upstream may pause
+between parts of the response body ([resource limits](/reference/limits#limits)).
+Each section is described on the page the table names.
 
 | key | page |
 |---|---|

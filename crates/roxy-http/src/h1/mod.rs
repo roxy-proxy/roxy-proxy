@@ -472,14 +472,16 @@ async fn flush_timed<W: AsyncWrite + Unpin>(w: &mut W, idle: Duration) -> Result
     Ok(())
 }
 
-/// Writes a response head and body. Bodies are streamed frame by frame.
-/// Once `client_closed` is set, waiting for a frame fails instead.
+/// Writes a response head and body. Bodies are streamed frame by frame:
+/// each write to the client must progress within `idle`, and the body must
+/// yield its next frame within `body_idle`. Once `client_closed` is set,
+/// waiting for a frame fails instead.
 async fn write_message<W: AsyncWrite + Unpin>(
     w: &mut W,
     head: BytesMut,
     mut body: Body,
     framing: OutFraming,
-    idle: Duration,
+    (idle, body_idle): (Duration, Duration),
     client_closed: &AtomicBool,
 ) -> Result<(), WriteError> {
     write_timed(w, &[&head], idle).await?;
@@ -496,7 +498,7 @@ async fn write_message<W: AsyncWrite + Unpin>(
         // Flush whatever is buffered before possibly waiting on the producer.
         flush_timed(w, idle).await?;
         let frame = timeout(
-            idle,
+            body_idle,
             poll_fn(|cx| match Pin::new(&mut body).poll_frame(cx) {
                 Poll::Ready(frame) => Poll::Ready(Ok(frame)),
                 Poll::Pending if client_closed.load(Ordering::Relaxed) => {
@@ -905,7 +907,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         let close =
             ex.close || res.meta.close || self.r.abandoned || framing == OutFraming::CloseDelimited;
         let head = response_head(res.status, &res.headers, &[], framing, close, None);
-        let idle = self.limits.body_idle_timeout;
+        let idle = (
+            self.limits.body_idle_timeout,
+            self.limits.response_body_idle_timeout,
+        );
 
         let client_closed = AtomicBool::new(false);
         let result = {
@@ -1020,7 +1025,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
             head,
             Body::from_bytes(body),
             framing,
-            idle,
+            (idle, idle),
             &AtomicBool::new(false),
         )
         .await;

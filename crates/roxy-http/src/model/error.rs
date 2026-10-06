@@ -103,7 +103,8 @@ pub enum Reason {
     // ----- timing / transport -----
     /// Head not received within `limits.header_timeout`.
     HeaderTimeout,
-    /// No body progress within `limits.body_idle_timeout`.
+    /// No body progress within `limits.body_idle_timeout` (a request body)
+    /// or `limits.response_body_idle_timeout` (a response body).
     BodyTimeout,
     /// Peer closed the connection mid-head or mid-body.
     UnexpectedEof,

@@ -109,6 +109,7 @@ fn minimal_config_uses_defaults() {
     assert_eq!(l.max_buffered_bytes.as_u64(), 1 << 30);
     assert_eq!(l.header_timeout, Duration::from_secs(10));
     assert_eq!(l.body_idle_timeout, Duration::from_secs(30));
+    assert_eq!(l.response_body_idle_timeout, Duration::from_secs(300));
     assert_eq!(l.max_connections_per_client, 256);
     assert_eq!(l.max_metric_keys, 100_000);
     assert_eq!(l.max_metric_bytes.as_u64(), 256 << 20);
@@ -129,7 +130,8 @@ fn sizes_and_durations_parse() {
     let cfg = parse(&format!(
         "{BASE}limits:\n  max_header_bytes: 32kb\n  max_url_bytes: 4096\n  \
          max_request_body_bytes: 2gb\n  max_capture_body_bytes: 3 MiB\n  \
-         header_timeout: 1m 30s\n  body_idle_timeout: 500ms\n\
+         header_timeout: 1m 30s\n  body_idle_timeout: 500ms\n  \
+         response_body_idle_timeout: 2m\n\
          upstream:\n  connect_timeout: 2s\n  dns:\n    cache_ttl_cap: 1h\n    \
          resolver: [\"1.1.1.1:53\", \"[2606:4700::1111]:53\"]\n"
     ));
@@ -139,6 +141,10 @@ fn sizes_and_durations_parse() {
     assert_eq!(cfg.limits.max_capture_body_bytes.as_u64(), 3 << 20);
     assert_eq!(cfg.limits.header_timeout, Duration::from_secs(90));
     assert_eq!(cfg.limits.body_idle_timeout, Duration::from_millis(500));
+    assert_eq!(
+        cfg.limits.response_body_idle_timeout,
+        Duration::from_secs(120)
+    );
     // Unset keys in a partially specified section keep their defaults.
     assert_eq!(cfg.limits.max_headers, 100);
     assert_eq!(cfg.upstream.connect_timeout, Duration::from_secs(2));

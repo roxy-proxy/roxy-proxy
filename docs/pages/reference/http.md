@@ -174,7 +174,8 @@ The strictness knobs live under `http:` and all default to strict.
 - The head must arrive within `limits.header_timeout` (10 s) of its first
   byte, whether that byte opened the connection or was pipelined behind
   the previous request. The body may not stall for longer than
-  `limits.body_idle_timeout` (30 s).
+  `limits.body_idle_timeout` (30 s), which also bounds how long the client
+  may go without taking the next part of the response.
 - A client that closes its connection while roxy is still waiting for the
   response ends the exchange, body or no body.
 
@@ -252,6 +253,10 @@ resource limits. hyper parses the response and roxy builds a
   been sent, so a long upload is not cut short by it. While the body is
   still being sent, the exchange fails (`504`) only if the upstream stops
   taking it for twice `limits.body_idle_timeout`.
+- The upstream may pause for up to `limits.response_body_idle_timeout`
+  (5 m) between parts of the response body. A longer pause ends the
+  exchange (`response_error`, reason `response_body_timeout`): on HTTP/1.1
+  the connection closes, on HTTP/2 the stream is reset with `CANCEL`.
 - A client that closes its connection while roxy waits for the next part
   of the response body ends the exchange at once, on HTTP/1.1 as on
   HTTP/2: the body is dropped, which releases the upstream and any service
