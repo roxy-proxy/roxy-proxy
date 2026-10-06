@@ -1,7 +1,9 @@
 # Configuration
 
 One YAML file, `version: 1`. Parsing is strict: an unknown key anywhere is
-an error, not a silently ignored setting. Relative paths (`ca_dir`, `ca_cert`, `ca_key`, secret
+an error, not a silently ignored setting, and a key repeated in the same
+map (a setting, a secret, a `static_hosts` name, an endpoint header or an
+addon endpoint) is an error naming the key, not a last-wins override. Relative paths (`ca_dir`, `ca_cert`, `ca_key`, secret
 files, list files, addon paths, log and capture paths) resolve against the
 process's working directory. `roxy check` refuses a zero value for the
 `limits` that would otherwise refuse every request, hold no connections or

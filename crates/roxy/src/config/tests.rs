@@ -194,6 +194,40 @@ fn unknown_fields_rejected_everywhere() {
     }
 }
 
+/// A repeated key in a named map is a parse error that names the key and
+/// the section, not a last-wins override.
+#[test]
+fn duplicate_map_keys_rejected() {
+    for (yaml, path) in [
+        (
+            "secrets:\n  gh: { env: GH_PROD }\n  gh: { env: GH_SANDBOX }\n",
+            "secrets",
+        ),
+        (
+            "upstream:\n  dns:\n    static_hosts:\n      gh: 10.0.0.1\n      gh: 10.0.0.2\n",
+            "upstream.dns.static_hosts",
+        ),
+        (
+            "addons:\n  - name: a\n    path: /a.wasm\n    endpoints:\n      gh: { url: https://a.test }\n      \
+             gh: { url: https://b.test }\n",
+            "addons[0].endpoints",
+        ),
+        (
+            "addons:\n  - name: a\n    path: /a.wasm\n    endpoints:\n      api:\n        url: https://a.test\n        \
+             headers: { gh: one, gh: two }\n",
+            "addons[0].endpoints.api.headers",
+        ),
+    ] {
+        let msg = Config::from_yaml(&format!("{BASE}{yaml}"))
+            .expect_err(path)
+            .to_string();
+        assert!(
+            msg.starts_with(&format!("{path}: duplicate key `gh`")),
+            "{path}: {msg}"
+        );
+    }
+}
+
 #[test]
 fn unknown_enum_values_rejected() {
     for bad in [

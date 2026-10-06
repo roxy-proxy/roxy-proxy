@@ -1,11 +1,13 @@
-//! Custom deserialisers for config scalars.
+//! Custom deserialisers for config scalars and maps.
 
+use std::collections::BTreeMap;
 use std::fmt;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 
 use bytesize::ByteSize;
 use serde::Deserialize;
-use serde::de::{self, Deserializer, SeqAccess, Visitor};
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
 // ----- sizes ----------------------------------------------------------------
 
@@ -151,6 +153,38 @@ impl<'de> Deserialize<'de> for Resolver {
         }
         d.deserialize_any(V)
     }
+}
+
+// ----- maps -----------------------------------------------------------------
+
+/// Deserialise a `name: value` map, refusing a repeated name. serde only
+/// detects duplicate keys for struct fields; a plain map is last-wins, which
+/// would let the second of two `secrets.gh` entries silently replace the
+/// first.
+pub(super) fn unique_map<'de, D, V>(d: D) -> Result<BTreeMap<String, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    struct Vis<V>(PhantomData<V>);
+    impl<'de, V: Deserialize<'de>> Visitor<'de> for Vis<V> {
+        type Value = BTreeMap<String, V>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a map of unique names to values")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut out = BTreeMap::new();
+            while let Some(k) = map.next_key::<String>()? {
+                if out.contains_key(&k) {
+                    return Err(de::Error::custom(format!("duplicate key `{k}`")));
+                }
+                let v = map.next_value::<V>()?;
+                out.insert(k, v);
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_map(Vis(PhantomData))
 }
 
 #[cfg(test)]
