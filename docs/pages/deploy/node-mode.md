@@ -74,36 +74,35 @@ Workloads fetch the CA from `ca_server` as usual
    restarted with a fresh token. Any other failure is retried with backoff.
    With a `node.crt` present the token file is not read and nothing is
    enrolled.
-3. The node `GET`s `/roxy/v1/lease` with its certificate and applies the
+3. The node `POST`s `/roxy/v1/lease` with its certificate and applies the
    lease. The first lease's `listeners`, `ca_server`, `tls`, connection
    limits and log destinations replace the bootstrap ones: the bootstrap
    listeners close and the lease's open. Later leases that change one of
    those settings are applied with the running value kept and a warning
    naming the field, exactly as a file reload does; a restart picks them up.
 
-The node reports `roxy_version` and a feature list (`valid_until`,
-`sourceless_secrets`, `readyz`, `action:<name>` for every rule action,
-`addon:wasm`, `addon:service`) with every request, so the control plane
-never renders a policy this build cannot load.
+Every request reports `roxy_version` and `protocol_version`; a lease
+fetch also reports the `lease_id` the node holds, its uptime, its policy
+state (`none`, `loaded` or `expired`) and the spooled flow bytes.
 
 ## The lease
 
-Every lease is applied in full or not at all. The rendered config goes
-through the same validation as `roxy check`; a config it would reject, a
-`config_hash` that is not the SHA-256 of the config text, or a declared
-secret with no value is logged (`lease could not be applied`) and the
-running policy stays. The node then reports the old `lease_id` and hashes
-on its next fetch, which is how the control plane learns the lease did not
-take.
+Every poll answers with the whole lease, and every lease is applied in
+full or not at all. The rendered config goes through the same validation
+as `roxy check`; a config it would reject, or a declared secret with no
+value, is logged (`lease could not be applied`) and the running policy
+stays. The node then reports the old `lease_id` on its next fetch, which
+is how the control plane learns the lease did not take.
 
 - `valid_for_seconds` becomes the policy's `valid_until`, counted from the
   moment the response arrived on the node's own clock. Past it, with no
   newer lease, every request is denied with `terminal_rule: _expired`
   ([lease](/operate/operations#lease)).
 - `refresh_after_seconds` is when the node polls next.
-- A changed `config_hash` compiles and swaps the policy atomically, as a
-  reload does. A changed `secrets_hash` with the same `config_hash` swaps
-  the secret map. A lease with neither changed only moves `valid_until`.
+- The node compares `config` and `secrets` with the lease it runs. A
+  changed `config` compiles and swaps the policy atomically, as a reload
+  does. Changed `secrets` with the same `config` swap the secret map. A
+  lease with neither changed only moves `valid_until`.
 - A changed `state_epoch` clears every rule `set_state` entry and every
   metric window before the lease is applied. An unchanged epoch keeps them
   across a config change. The first lease sets the epoch without clearing.
@@ -116,11 +115,10 @@ take.
 
 | response | what the node does |
 |---|---|
-| `200` | Applies the lease as above and polls again after `refresh_after_seconds`. |
-| `304` | Keeps the lease it has, moves `valid_until` forward by `Roxy-Lease-Valid-For` and polls after `Roxy-Lease-Refresh-After`. Nothing is rebuilt. |
+| `200` | Applies what differs, moves `valid_until`, and polls again after `refresh_after_seconds`. |
 | `410` | Revoked. Installs an empty, already expired policy at once (every request denied with `_expired`, `/readyz` `503 policy_expired`), ships the flow events still spooled, stops polling. `/healthz` stays `200`. Definite: a restart with the same state dir ends the same way. |
 | `401` | The certificate is not recognised. Logged distinctly; the lease runs down. The node never re-enrols, since the token is gone: to re-enrol, empty the state dir and start with a new token. |
-| `426` | The control plane will not render for this roxy version or feature set. Logged with the `missing` list; the lease runs down. |
+| `426` | The control plane will not serve this `protocol_version` or `roxy_version`. Logged with the `missing` list; the lease runs down. |
 | `5xx`, timeout, connection or TLS error | Retried with backoff (1 s doubling to 60 s, with jitter); the lease runs down. Unreachability is not itself a reason to deny; expiry is. |
 
 A lease that runs down denies everything until a lease arrives; the next
@@ -145,7 +143,7 @@ per-node `seq`. The lease's `flow` settings say how the spool is shipped:
 | setting | meaning |
 |---|---|
 | `ship` | `false` turns shipping off; nothing is spooled. |
-| `batch_max_bytes`, `batch_max_events` | A batch is sent when either is reached. A `413` halves the event count for later batches, down to one; a single event still refused is dropped and logged once. |
+| `batch_max_bytes` | A batch is sent when the spooled lines reach this size (measured on the JSON before compression). A `413` for a batch within it is treated as a server error and retried. |
 | `flush_interval_seconds` | A partial batch is sent this long after its first event. |
 | `spool_high_water_bytes` | Spooled but unacknowledged bytes at which `on_high_water` applies. |
 | `on_high_water` | `hold`: traffic waits, through roxy's flow-log backpressure, until the control plane acknowledges enough to bring the spool under the high water. `spool`: traffic flows and the oldest spooled events are dropped, with one `flow spool over its high water` log line per episode. |
@@ -157,8 +155,9 @@ until a lease with a new `lease_id` arrives; meanwhile `on_high_water`
 applies to what accumulates. Shutdown ships what is still spooled, for up
 to ten seconds.
 
-Before the first lease the spool runs with `spool` mode and an 8 MiB high
-water, so a control plane that is slow to answer cannot hold traffic.
+Before the first lease the spool runs with `spool` mode, a 1 MiB batch and
+an 8 MiB high water, so a control plane that is slow to answer cannot hold
+traffic.
 
 ## Signals and health
 

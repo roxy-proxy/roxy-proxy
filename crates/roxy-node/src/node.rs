@@ -3,6 +3,7 @@
 //! spooled flows. What a lease means for the proxy is the [`LeaseHandler`]'s
 //! business; this module decides *when* and *whether* to call it.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -23,9 +24,6 @@ use crate::state::{StateDir, StateError};
 /// Backoff for a failed lease fetch, certificate call or flow upload.
 const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 const BACKOFF_CAP: Duration = Duration::from_secs(60);
-/// How long the shipper keeps a batch cap it lowered after a 413 before
-/// trying the lease's again.
-const BATCH_CAP_RESET: Duration = Duration::from_secs(600);
 
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
@@ -56,9 +54,9 @@ pub enum NodeError {
 /// What changed between the lease the node runs and the one it fetched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Change {
-    /// `config_hash` differs: the policy must be recompiled and swapped.
+    /// `config` differs: the policy must be recompiled and swapped.
     pub config: bool,
-    /// `secrets_hash` differs: the secret map must be swapped.
+    /// `secrets` differ: the secret map must be swapped.
     pub secrets: bool,
     /// `state_epoch` differs: rule state and metric windows are cleared.
     pub state_epoch: bool,
@@ -71,9 +69,9 @@ pub type HandlerFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// one at a time.
 pub trait LeaseHandler: Send + Sync {
     /// Applies `lease`, received at `received_at` (the base of
-    /// `valid_until`). A lease with no change in `change` still extends
-    /// the lease. `Err` keeps the running policy; the error is logged and
-    /// the node reports the old hashes on its next fetch.
+    /// `valid_until`). A lease with no change in `change` still moves
+    /// `valid_until`. `Err` keeps the running policy; the error is logged
+    /// and the node reports the old lease id on its next fetch.
     fn apply<'a>(
         &'a self,
         lease: &'a Lease,
@@ -81,18 +79,10 @@ pub trait LeaseHandler: Send + Sync {
         change: Change,
     ) -> HandlerFuture<'a, Result<(), String>>;
 
-    /// A `304`: the lease the node runs is extended to `received_at +
-    /// valid_for`. Nothing else changes.
-    fn extend(
-        &self,
-        received_at: DateTime<Utc>,
-        valid_for: Duration,
-    ) -> HandlerFuture<'_, Result<(), String>>;
-
     /// The node is revoked: deny everything, at once.
     fn revoke(&self) -> HandlerFuture<'_, ()>;
 
-    /// What the proxy is running, for the lease fetch headers.
+    /// What the proxy is running, for the lease fetch body.
     fn policy_state(&self) -> PolicyState;
 }
 
@@ -111,29 +101,22 @@ pub struct NodeConfig {
     pub time_scale: f64,
 }
 
-/// The lease the node runs, as reported back to the control plane.
-#[derive(Debug, Clone)]
+/// The lease the node runs: what the next one is compared with.
+#[derive(Default)]
 struct Current {
     lease_id: Option<String>,
-    config_hash: Option<String>,
-    secrets_hash: Option<String>,
+    config: Option<String>,
+    secrets: Option<BTreeMap<String, String>>,
     state_epoch: Option<String>,
-    etag: Option<String>,
-    refresh_after: Duration,
 }
 
-impl Default for Current {
-    fn default() -> Self {
-        Self {
-            lease_id: None,
-            config_hash: None,
-            secrets_hash: None,
-            state_epoch: None,
-            etag: None,
-            // Only reached when the control plane answers 304 to a node
-            // that has no lease, which it should not; poll, don't spin.
-            refresh_after: Duration::from_secs(60),
-        }
+/// Never prints the secret values.
+impl std::fmt::Debug for Current {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Current")
+            .field("lease_id", &self.lease_id)
+            .field("state_epoch", &self.state_epoch)
+            .finish_non_exhaustive()
     }
 }
 
@@ -239,7 +222,7 @@ impl Node {
         self.spool.close();
         let deadline = Instant::now() + grace;
         while self.spool.pending_events() > 0 && Instant::now() < deadline {
-            if !self.ship_once(&mut BatchCap::default()).await {
+            if !self.ship_once(&mut Stopped::default()).await {
                 break;
             }
         }
@@ -334,14 +317,10 @@ impl Node {
     }
 
     fn node_state(&self) -> NodeState {
-        let current = lock(&self.current).clone();
         NodeState {
-            lease_id: current.lease_id,
-            config_hash: current.config_hash,
-            secrets_hash: current.secrets_hash,
+            lease_id: lock(&self.current).lease_id.clone(),
             roxy_version: self.config.info.roxy_version.clone(),
             protocol_version: PROTOCOL_VERSION,
-            features: self.config.info.features.clone(),
             uptime_seconds: self.started.elapsed().as_secs(),
             policy_state: self.handler.policy_state(),
             spooled_bytes: self.spool.pending_bytes(),
@@ -356,18 +335,10 @@ impl Node {
         loop {
             let Some(id) = self.client() else { return };
             let state = self.node_state();
-            let etag = lock(&self.current).etag.clone();
-            let wait = match id.client.fetch_lease(&state, etag.as_deref()).await {
-                LeaseFetch::Lease(lease, etag) => {
+            let wait = match id.client.fetch_lease(&state).await {
+                LeaseFetch::Lease(lease) => {
                     backoff.reset();
-                    self.apply(&lease, etag).await
-                }
-                LeaseFetch::Unchanged {
-                    valid_for_seconds,
-                    refresh_after_seconds,
-                } => {
-                    backoff.reset();
-                    self.extend(valid_for_seconds, refresh_after_seconds).await
+                    self.apply(&lease).await
                 }
                 LeaseFetch::Revoked => {
                     tracing::warn!(
@@ -381,7 +352,7 @@ impl Node {
                     tracing::error!(
                         missing = %e.missing.join(","),
                         message = %e.message,
-                        "control plane will not render a lease for this roxy version or feature set; the lease runs down"
+                        "control plane will not serve this roxy or protocol version; the lease runs down"
                     );
                     backoff.wait()
                 }
@@ -401,53 +372,20 @@ impl Node {
         }
     }
 
-    /// A `304` with the lease's durations moves `valid_until` forward from
-    /// now. Without them (an older server) the lease is left to run down
-    /// and only the poll interval is kept.
-    async fn extend(
-        &self,
-        valid_for_seconds: Option<u64>,
-        refresh_after_seconds: Option<u64>,
-    ) -> Duration {
-        let Some(valid_for) = valid_for_seconds else {
-            tracing::warn!("304 without roxy-lease-valid-for; the lease is not extended");
-            return lock(&self.current).refresh_after;
-        };
-        if let Some(refresh) = refresh_after_seconds {
-            lock(&self.current).refresh_after =
-                Duration::from_secs(refresh.clamp(1, valid_for.max(1)));
-        }
-        if let Err(e) = self
-            .handler
-            .extend(Utc::now(), Duration::from_secs(valid_for))
-            .await
-        {
-            tracing::error!(error = %e, "lease could not be extended");
-        }
-        lock(&self.current).refresh_after
-    }
-
-    /// Checks and applies a fetched lease; returns how long to wait for the
-    /// next fetch.
-    async fn apply(&self, lease: &Lease, etag: Option<String>) -> Duration {
+    /// Applies a fetched lease, diffing it against the one the node runs;
+    /// returns how long to wait for the next fetch.
+    async fn apply(&self, lease: &Lease) -> Duration {
         let received_at = Utc::now();
         let refresh = Duration::from_secs(
             lease
                 .refresh_after_seconds
                 .clamp(1, lease.valid_for_seconds.max(1)),
         );
-        if !lease.config_hash_matches() {
-            tracing::error!(
-                lease_id = %lease.lease_id,
-                "lease refused: config_hash does not match the rendered config"
-            );
-            return refresh;
-        }
         let change = {
             let current = lock(&self.current);
             Change {
-                config: current.config_hash.as_deref() != Some(&lease.config_hash),
-                secrets: current.secrets_hash.as_deref() != Some(&lease.secrets_hash),
+                config: current.config.as_deref() != Some(&lease.config),
+                secrets: current.secrets.as_ref() != Some(&lease.secrets),
                 // The first lease sets the epoch without clearing anything.
                 state_epoch: current
                     .state_epoch
@@ -470,18 +408,15 @@ impl Node {
                 self.spool.configure(lease.flow);
                 *current = Current {
                     lease_id: Some(lease.lease_id.clone()),
-                    config_hash: Some(lease.config_hash.clone()),
-                    secrets_hash: Some(lease.secrets_hash.clone()),
+                    config: Some(lease.config.clone()),
+                    secrets: Some(lease.secrets.clone()),
                     state_epoch: Some(lease.state_epoch.clone()),
-                    etag,
-                    refresh_after: refresh,
                 };
             }
             Err(e) => {
-                // The next fetch reports the old hashes, which is how the
+                // The next fetch reports the old lease id, which is how the
                 // control plane learns the lease did not take.
                 tracing::error!(lease_id = %lease.lease_id, error = %e, "lease could not be applied; keeping the running policy");
-                current.etag = None;
             }
         }
         refresh
@@ -557,13 +492,12 @@ impl Node {
     /// Ships batches as they fill or every `flush_interval`, until the
     /// spool is closed and drained, or the quota is exhausted.
     async fn ship_loop(self: Arc<Self>) {
-        let mut cap = BatchCap::default();
+        let mut stopped = Stopped::default();
         let mut backoff = Backoff::new();
         loop {
             let settings = self.spool.settings();
             let flush = self.scaled(Duration::from_secs(settings.flush_interval_seconds.max(1)));
-            let full = self.spool.pending_bytes() >= settings.batch_max_bytes
-                || self.spool.pending_events() as u64 >= settings.batch_max_events;
+            let full = self.spool.pending_bytes() >= settings.batch_max_bytes;
             // Before the first lease there is nothing to tag a batch with.
             let no_lease = lock(&self.current).lease_id.is_none();
             if (!full || no_lease) && !self.spool.is_closed() {
@@ -579,16 +513,16 @@ impl Node {
                 continue;
             }
             let lease_id = lock(&self.current).lease_id.clone();
-            if cap.stopped_for.is_some() && cap.stopped_for == lease_id {
+            if stopped.under.is_some() && stopped.under == lease_id {
                 // Shipping resumes with a new lease id; meanwhile the spool
                 // applies `on_high_water`.
                 let _ = tokio::time::timeout(flush, self.spool.pushed.notified()).await;
                 continue;
             }
-            cap.stopped_for = None;
-            if self.ship_once(&mut cap).await {
+            stopped.under = None;
+            if self.ship_once(&mut stopped).await {
                 backoff.reset();
-            } else if cap.stopped_for.is_some() {
+            } else if stopped.under.is_some() {
                 if self.spool.is_closed() {
                     return;
                 }
@@ -599,14 +533,12 @@ impl Node {
     }
 
     /// One upload attempt. `true` when a batch was acknowledged.
-    async fn ship_once(&self, cap: &mut BatchCap) -> bool {
+    async fn ship_once(&self, stopped: &mut Stopped) -> bool {
         let Some(id) = self.client() else {
             return false;
         };
         let settings = self.spool.settings();
-        let (max_bytes, max_events) =
-            cap.limits(settings.batch_max_bytes, settings.batch_max_events);
-        let Some(batch) = self.spool.batch(max_bytes, max_events) else {
+        let Some(batch) = self.spool.batch(settings.batch_max_bytes) else {
             return false;
         };
         let lease_id = lock(&self.current).lease_id.clone().unwrap_or_default();
@@ -616,25 +548,6 @@ impl Node {
                 self.spool.ack(ack.acked_through);
                 true
             }
-            ShipOutcome::TooLarge if batch.lines.len() == 1 => {
-                // Nothing smaller to send: the event is lost, and said so.
-                tracing::error!(
-                    seq = batch.seq_first,
-                    bytes = batch.bytes,
-                    "a single flow event is larger than the control plane accepts; dropped"
-                );
-                self.spool.ack(batch.seq_first);
-                true
-            }
-            ShipOutcome::TooLarge => {
-                cap.halve(batch.lines.len());
-                tracing::warn!(
-                    events = batch.lines.len(),
-                    bytes = batch.bytes,
-                    "flow batch too large for the control plane; halving"
-                );
-                false
-            }
             ShipOutcome::QuotaExhausted => {
                 tracing::error!(
                     lease_id = %lease_id,
@@ -642,14 +555,14 @@ impl Node {
                     on_high_water = ?settings.on_high_water,
                     "control plane flow quota exhausted for this node; flow shipping stops until a new lease"
                 );
-                cap.stopped_for = Some(lease_id);
+                stopped.under = Some(lease_id);
                 false
             }
             ShipOutcome::Revoked => {
                 tracing::warn!(
                     "control plane refuses flows from a revoked node; flow shipping stops"
                 );
-                cap.stopped_for = Some(lease_id);
+                stopped.under = Some(lease_id);
                 false
             }
             ShipOutcome::Failed(e) => {
@@ -660,31 +573,10 @@ impl Node {
     }
 }
 
-/// The shipper's own batch limit after a 413 (reset after a while), and
-/// the lease under which shipping stopped (507 or 410).
+/// The lease under which shipping stopped (507 or 410), if any.
 #[derive(Debug, Default)]
-struct BatchCap {
-    events: Option<(u64, Instant)>,
-    stopped_for: Option<String>,
-}
-
-impl BatchCap {
-    fn limits(&mut self, max_bytes: u64, max_events: u64) -> (u64, u64) {
-        if let Some((_, since)) = self.events
-            && since.elapsed() > BATCH_CAP_RESET
-        {
-            self.events = None;
-        }
-        match self.events {
-            Some((cap, _)) => (max_bytes / 2, cap.min(max_events)),
-            None => (max_bytes, max_events),
-        }
-    }
-
-    fn halve(&mut self, sent: usize) {
-        let cap = (sent as u64 / 2).max(1);
-        self.events = Some((cap, Instant::now()));
-    }
+struct Stopped {
+    under: Option<String>,
 }
 
 /// Exponential backoff with jitter, capped.
@@ -743,14 +635,11 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
-    use crate::protocol::{
-        FlowAck, LEASE_REFRESH_AFTER_HEADER, LEASE_VALID_FOR_HEADER, sha256_hex,
-    };
+    use crate::protocol::FlowAck;
     use crate::testkit::{MockServer, Reply};
 
     struct Recorder {
         applied: Mutex<Vec<(Lease, DateTime<Utc>, Change)>>,
-        extended: Mutex<Vec<(DateTime<Utc>, Duration)>>,
         revoked: AtomicUsize,
         state: Mutex<PolicyState>,
         fail_next: AtomicBool,
@@ -760,7 +649,6 @@ mod tests {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 applied: Mutex::new(Vec::new()),
-                extended: Mutex::new(Vec::new()),
                 revoked: AtomicUsize::new(0),
                 state: Mutex::new(PolicyState::None),
                 fail_next: AtomicBool::new(false),
@@ -769,15 +657,6 @@ mod tests {
     }
 
     impl LeaseHandler for Recorder {
-        fn extend(
-            &self,
-            at: DateTime<Utc>,
-            valid_for: Duration,
-        ) -> HandlerFuture<'_, Result<(), String>> {
-            lock(&self.extended).push((at, valid_for));
-            Box::pin(async { Ok(()) })
-        }
-
         fn apply<'a>(
             &'a self,
             lease: &'a Lease,
@@ -805,11 +684,11 @@ mod tests {
         }
     }
 
-    fn lease(id: &str, config: &str, secrets_hash: &str, epoch: &str) -> Lease {
+    /// A lease whose `secrets` is `{token: <secret>}`.
+    fn lease(id: &str, config: &str, secret: &str, epoch: &str) -> Lease {
         Lease {
-            config_hash: sha256_hex(config.as_bytes()),
             config: config.to_owned(),
-            secrets_hash: secrets_hash.to_owned(),
+            secrets: [("token".to_owned(), secret.to_owned())].into(),
             state_epoch: epoch.to_owned(),
             ..crate::client::tests::lease(id)
         }
@@ -840,7 +719,6 @@ mod tests {
                 enrol_token_file: with_token.then(|| self.token.clone()),
                 info: NodeInfo {
                     roxy_version: "test".into(),
-                    features: vec!["valid_until".into()],
                 },
                 time_scale: 0.01,
             }
@@ -861,9 +739,7 @@ mod tests {
         let h = Harness::new().await;
         h.mock.push("/roxy/v1/enrol", Reply::issue("n1"));
         let l1 = lease("L1", "version: 1\n", "s1", "e1");
-        h.mock
-            .push(LEASE, Reply::json(200, &l1).with_header("etag", "\"1\""));
-        h.mock.fallback(LEASE, Reply::status(304));
+        h.mock.fallback(LEASE, Reply::json(200, &l1));
         let (node, rec) = h.node(true);
         let task = tokio::spawn(node.clone().run());
         h.mock.wait_for(LEASE, 2).await;
@@ -872,14 +748,11 @@ mod tests {
         let first = fetches[0].node_state();
         assert_eq!(first.policy_state, PolicyState::None);
         assert_eq!(first.lease_id, None);
-        assert_eq!(fetches[1].header("if-none-match"), Some("\"1\""));
         let second = fetches[1].node_state();
         assert_eq!(second.lease_id.as_deref(), Some("L1"));
-        assert_eq!(second.config_hash.as_deref(), Some(l1.config_hash.as_str()));
-        assert_eq!(second.secrets_hash.as_deref(), Some("s1"));
         assert_eq!(second.policy_state, PolicyState::Loaded);
         let applied = lock(&rec.applied).clone();
-        assert_eq!(applied.len(), 1);
+        assert_eq!(applied.len(), 1, "an identical lease is not re-applied");
         let (lease, at, change) = &applied[0];
         assert_eq!(lease.lease_id, "L1");
         assert!((Utc::now() - *at).num_seconds() < 5);
@@ -944,7 +817,7 @@ mod tests {
         h.mock.push("/roxy/v1/enrol", Reply::status(503));
         h.mock.push("/roxy/v1/enrol", Reply::Hangup);
         h.mock.push("/roxy/v1/enrol", Reply::issue("n1"));
-        h.mock.fallback(LEASE, Reply::status(304));
+        h.mock.fallback(LEASE, Reply::status(500));
         let (node, _) = h.node(true);
         let task = tokio::spawn(node.clone().run());
         h.mock.wait_for(LEASE, 1).await;
@@ -953,7 +826,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hash_changes_select_what_is_applied() {
+    async fn the_local_diff_selects_what_is_applied() {
         let h = Harness::new().await;
         h.mock.push("/roxy/v1/enrol", Reply::issue("n1"));
         let cfg = "version: 1\n";
@@ -962,19 +835,14 @@ mod tests {
         // Secrets only.
         h.mock
             .push(LEASE, Reply::json(200, &lease("L2", cfg, "s2", "e1")));
-        // Nothing but the lease itself.
+        // Nothing but the lease itself: applied, so valid_until moves.
         h.mock
             .push(LEASE, Reply::json(200, &lease("L3", cfg, "s2", "e1")));
         // Config and epoch.
-        h.mock.push(
-            LEASE,
-            Reply::json(200, &lease("L4", "version: 1\nrules: []\n", "s2", "e2")),
-        );
-        // A lease whose hash lies is refused and the node keeps reporting L4.
-        let mut lying = lease("L5", cfg, "s2", "e2");
-        lying.config_hash = "sha256:0000".into();
-        h.mock.push(LEASE, Reply::json(200, &lying));
-        h.mock.fallback(LEASE, Reply::status(304));
+        let l4 = lease("L4", "version: 1\nrules: []\n", "s2", "e2");
+        h.mock.push(LEASE, Reply::json(200, &l4));
+        // The same lease again: nothing to apply.
+        h.mock.fallback(LEASE, Reply::json(200, &l4));
         let (node, rec) = h.node(true);
         let task = tokio::spawn(node.clone().run());
         h.mock.wait_for(LEASE, 6).await;
@@ -988,13 +856,22 @@ mod tests {
             state_epoch,
         };
         assert_eq!(
-            changes,
-            vec![
+            changes[..4],
+            [
                 ("L1".to_owned(), c(true, true, false)),
                 ("L2".to_owned(), c(false, true, false)),
                 ("L3".to_owned(), c(false, false, false)),
                 ("L4".to_owned(), c(true, false, true)),
             ]
+        );
+        // Every later poll re-applies L4 with nothing changed, which is
+        // what moves `valid_until` forward.
+        assert!(changes.len() > 4);
+        assert!(
+            changes[4..]
+                .iter()
+                .all(|(id, ch)| id == "L4" && *ch == c(false, false, false)),
+            "{changes:?}"
         );
         let last = h.mock.requests_to(LEASE).pop().unwrap();
         assert_eq!(last.node_state().lease_id.as_deref(), Some("L4"));
@@ -1002,59 +879,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unchanged_lease_is_extended_from_the_304_headers() {
-        let h = Harness::new().await;
-        h.mock.push("/roxy/v1/enrol", Reply::issue("n1"));
-        h.mock.push(
-            LEASE,
-            Reply::json(200, &lease("L1", "version: 1\n", "s1", "e1")),
-        );
-        h.mock.push(
-            LEASE,
-            Reply::status(304)
-                .with_header(LEASE_VALID_FOR_HEADER, "900")
-                .with_header(LEASE_REFRESH_AFTER_HEADER, "1"),
-        );
-        h.mock.push(LEASE, Reply::status(304));
-        h.mock.fallback(
-            LEASE,
-            Reply::status(304).with_header(LEASE_VALID_FOR_HEADER, "60"),
-        );
-        let (node, rec) = h.node(true);
-        let task = tokio::spawn(node.clone().run());
-        h.mock.wait_for(LEASE, 4).await;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while lock(&rec.extended).len() < 2 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        let extended = lock(&rec.extended).clone();
-        assert_eq!(extended[0].1, Duration::from_mins(15));
-        assert!((Utc::now() - extended[0].0).num_seconds() < 5);
-        assert_eq!(
-            extended[1].1,
-            Duration::from_secs(60),
-            "a 304 without durations extends nothing"
-        );
-        assert_eq!(lock(&rec.applied).len(), 1, "nothing was rebuilt");
-        task.abort();
-    }
-
-    #[tokio::test]
     async fn a_lease_the_handler_refuses_keeps_the_old_one_reported() {
         let h = Harness::new().await;
         h.mock.push("/roxy/v1/enrol", Reply::issue("n1"));
+        let l1 = lease("L1", "version: 1\n", "s1", "e1");
+        h.mock.push(LEASE, Reply::json(200, &l1));
         h.mock.push(
             LEASE,
-            Reply::json(200, &lease("L1", "version: 1\n", "s1", "e1")).with_header("etag", "\"1\""),
+            Reply::json(200, &lease("L2", "version: 2\n", "s1", "e1")),
         );
-        h.mock.push(
-            LEASE,
-            Reply::json(200, &lease("L2", "version: 2\n", "s1", "e1")).with_header("etag", "\"2\""),
-        );
-        h.mock.fallback(LEASE, Reply::status(304));
+        h.mock.fallback(LEASE, Reply::json(200, &l1));
         let (node, rec) = h.node(true);
         let task = tokio::spawn(node.clone().run());
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -1068,11 +902,6 @@ mod tests {
         h.mock.wait_for(LEASE, 3).await;
         let third = &h.mock.requests_to(LEASE)[2];
         assert_eq!(third.node_state().lease_id.as_deref(), Some("L1"));
-        assert_eq!(
-            third.header("if-none-match"),
-            None,
-            "asks for the lease again"
-        );
         assert_eq!(lock(&rec.applied).len(), 1);
         task.abort();
     }
@@ -1086,7 +915,7 @@ mod tests {
             Reply::json(200, &lease("L1", "version: 1\n", "s1", "e1")),
         );
         h.mock.push(LEASE, Reply::status(410));
-        h.mock.fallback(LEASE, Reply::status(304));
+        h.mock.fallback(LEASE, Reply::status(500));
         h.mock.fallback(
             FLOWS,
             Reply::json(
@@ -1133,18 +962,16 @@ mod tests {
                 426,
                 &crate::protocol::ErrorBody {
                     error: "unsupported".into(),
-                    message: "node lacks: action:respond".into(),
-                    missing: vec!["action:respond".into()],
+                    message: "roxy test is below the floor".into(),
+                    missing: vec!["roxy_version:9".into()],
                 },
             ),
         );
         h.mock.push(LEASE, Reply::status(500));
         h.mock.push(LEASE, Reply::Hangup);
-        h.mock.push(
-            LEASE,
-            Reply::json(200, &lease("L2", "version: 1\n", "s1", "e1")),
-        );
-        h.mock.fallback(LEASE, Reply::status(304));
+        let l2 = lease("L2", "version: 1\n", "s1", "e1");
+        h.mock.push(LEASE, Reply::json(200, &l2));
+        h.mock.fallback(LEASE, Reply::json(200, &l2));
         let (node, rec) = h.node(true);
         let task = tokio::spawn(node.clone().run());
         h.mock.wait_for(LEASE, 7).await;
@@ -1168,10 +995,10 @@ mod tests {
         let h = Harness::new().await;
         h.mock.push("/roxy/v1/enrol", Reply::issue("n1"));
         let mut l = lease("L1", "version: 1\n", "s1", "e1");
-        l.flow.batch_max_events = 2;
+        // Two tagged events of the shape pushed below fit; three do not.
+        l.flow.batch_max_bytes = 70;
         l.flow.flush_interval_seconds = 1;
-        h.mock.push(LEASE, Reply::json(200, &l));
-        h.mock.fallback(LEASE, Reply::status(304));
+        h.mock.fallback(LEASE, Reply::json(200, &l));
         h.mock
             .push(FLOWS, Reply::json(200, &FlowAck { acked_through: 1 }));
         h.mock.push(FLOWS, Reply::status(503));
@@ -1206,14 +1033,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn too_large_halves_the_batch_and_quota_exhaustion_stops_shipping() {
+    async fn quota_exhaustion_stops_shipping_until_a_new_lease() {
         let h = Harness::new().await;
         h.mock.push("/roxy/v1/enrol", Reply::issue("n1"));
         let mut l = lease("L1", "version: 1\n", "s1", "e1");
-        l.flow.batch_max_events = 4;
         l.flow.flush_interval_seconds = 1;
-        h.mock.push(LEASE, Reply::json(200, &l));
-        h.mock.fallback(LEASE, Reply::status(304));
+        h.mock.fallback(LEASE, Reply::json(200, &l));
+        // A 413 for a batch within the stated size is a server error: the
+        // same batch is retried whole.
         h.mock.push(FLOWS, Reply::status(413));
         h.mock
             .push(FLOWS, Reply::json(200, &FlowAck { acked_through: 1 }));
@@ -1238,8 +1065,8 @@ mod tests {
         assert_eq!(posts[0].json()["events"].as_array().unwrap().len(), 4);
         assert_eq!(
             posts[1].json()["events"].as_array().unwrap().len(),
-            2,
-            "halved"
+            4,
+            "retried whole"
         );
         assert_eq!(posts[2].json()["seq_first"], 2);
         // 507: nothing more is sent under this lease, whatever is pushed.
@@ -1254,40 +1081,11 @@ mod tests {
             "events stay spooled up to the high water"
         );
         // A new lease id resumes shipping.
-        h.mock.push(
-            LEASE,
-            Reply::json(200, &lease("L2", "version: 1\n", "s1", "e1")),
-        );
+        let mut l2 = lease("L2", "version: 1\n", "s1", "e1");
+        l2.flow.flush_interval_seconds = 1;
+        h.mock.fallback(LEASE, Reply::json(200, &l2));
         h.mock.wait_for(FLOWS, 4).await;
         assert_eq!(h.mock.requests_to(FLOWS)[3].json()["lease_id"], "L2");
-        task.abort();
-    }
-
-    #[tokio::test]
-    async fn a_single_event_too_large_is_dropped_and_shipping_goes_on() {
-        let h = Harness::new().await;
-        h.mock.push("/roxy/v1/enrol", Reply::issue("n1"));
-        let mut l = lease("L1", "version: 1\n", "s1", "e1");
-        l.flow.batch_max_events = 1;
-        l.flow.flush_interval_seconds = 1;
-        h.mock.push(LEASE, Reply::json(200, &l));
-        h.mock.fallback(LEASE, Reply::status(304));
-        h.mock.push(FLOWS, Reply::status(413));
-        h.mock
-            .fallback(FLOWS, Reply::json(200, &FlowAck { acked_through: 1 }));
-        let (node, _) = h.node(true);
-        let spool = node.spool().clone();
-        let task = tokio::spawn(node.clone().run());
-        h.mock.wait_for(LEASE, 1).await;
-        spool.push(b"{\"i\":0}");
-        spool.push(b"{\"i\":1}");
-        let posts = h.mock.wait_for(FLOWS, 2).await;
-        assert_eq!(posts[0].json()["seq_first"], 0);
-        assert_eq!(
-            posts[1].json()["seq_first"],
-            1,
-            "seq 0 was dropped, not retried"
-        );
         task.abort();
     }
 
@@ -1310,7 +1108,7 @@ mod tests {
                 renew_after_seconds: 3000,
             },
         );
-        h.mock.fallback(LEASE, Reply::status(304));
+        h.mock.fallback(LEASE, Reply::json(200, &lease("L1", "version: 1\n", "s1", "e1")));
         let (node, _) = h.node(true);
         let state = node.state_dir().clone();
         let task = tokio::spawn(node.clone().run());
@@ -1367,7 +1165,7 @@ mod tests {
                 renew_after_seconds: 3000,
             },
         );
-        h.mock.fallback(LEASE, Reply::status(304));
+        h.mock.fallback(LEASE, Reply::json(200, &lease("L1", "version: 1\n", "s1", "e1")));
         let (node, _) = h.node(true);
         let task = tokio::spawn(node.clone().run());
         let renewals = h.mock.wait_for("/roxy/v1/renew", 3).await;

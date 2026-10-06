@@ -174,9 +174,9 @@ impl Recorded {
         self.headers.get(name).and_then(|v| v.to_str().ok())
     }
 
-    /// The `Roxy-Node-State` header, parsed.
+    /// A lease fetch's body, parsed.
     pub fn node_state(&self) -> crate::protocol::NodeState {
-        serde_json::from_str(self.header(crate::protocol::NODE_STATE_HEADER).unwrap()).unwrap()
+        serde_json::from_slice(&self.body).unwrap()
     }
 
     pub fn json(&self) -> serde_json::Value {

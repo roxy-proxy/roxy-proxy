@@ -20,7 +20,6 @@ pub const SEQ_BLOCK: u64 = 1024;
 pub const BOOTSTRAP_SETTINGS: FlowSettings = FlowSettings {
     ship: true,
     batch_max_bytes: 1 << 20,
-    batch_max_events: 1000,
     flush_interval_seconds: 5,
     spool_high_water_bytes: 8 << 20,
     on_high_water: OnHighWater::Spool,
@@ -250,9 +249,9 @@ impl Spool {
         }
     }
 
-    /// The oldest unacknowledged events, up to `max_bytes` of lines and
-    /// `max_events` of them (at least one). `None` when empty.
-    pub fn batch(&self, max_bytes: u64, max_events: u64) -> Option<Batch> {
+    /// The oldest unacknowledged events, up to `max_bytes` of lines (at
+    /// least one). `None` when empty.
+    pub fn batch(&self, max_bytes: u64) -> Option<Batch> {
         let q = lock(&self.queue);
         let first = q.events.front()?;
         let mut lines = vec![first.line.clone()];
@@ -260,7 +259,7 @@ impl Spool {
         let (seq_first, mut seq_last) = (first.seq, first.seq);
         for e in q.events.iter().skip(1) {
             let len = e.line.len() as u64;
-            if lines.len() as u64 >= max_events.max(1) || bytes + len > max_bytes {
+            if bytes + len > max_bytes {
                 break;
             }
             lines.push(e.line.clone());
@@ -341,7 +340,7 @@ mod tests {
         s.push(b"{\"event\":\"a\"}\n");
         s.push(b"{}");
         assert_eq!(s.next_seq(), 2050);
-        let b = s.batch(1 << 20, 100).unwrap();
+        let b = s.batch(1 << 20).unwrap();
         assert_eq!((b.seq_first, b.seq_last), (2048, 2049));
         assert_eq!(b.lines[0], b"{\"seq\":2048,\"event\":\"a\"}");
         assert_eq!(b.lines[1], b"{\"seq\":2049}");
@@ -349,23 +348,22 @@ mod tests {
         assert_eq!(persisted.load(Ordering::Relaxed), 2049 + SEQ_BLOCK);
         s.ack(2048);
         assert_eq!(s.pending_events(), 1);
-        assert_eq!(s.batch(1 << 20, 100).unwrap().seq_first, 2049);
+        assert_eq!(s.batch(1 << 20).unwrap().seq_first, 2049);
         s.ack(5000);
-        assert!(s.batch(1 << 20, 100).is_none());
+        assert!(s.batch(1 << 20).is_none());
         assert_eq!(s.pending_bytes(), 0);
     }
 
     #[test]
-    fn a_batch_respects_both_caps_but_always_carries_one_event() {
+    fn a_batch_respects_the_byte_cap_but_always_carries_one_event() {
         let (s, _) = spool(0);
         for _ in 0..10 {
             s.push(br#"{"k":"0123456789"}"#);
         }
-        let line_len = s.batch(1 << 20, 1).unwrap().bytes;
-        assert_eq!(s.batch(1 << 20, 3).unwrap().lines.len(), 3);
-        assert_eq!(s.batch(line_len * 2 + 1, 100).unwrap().lines.len(), 2);
-        assert_eq!(s.batch(1, 100).unwrap().lines.len(), 1, "never empty");
-        assert_eq!(s.batch(1 << 20, 0).unwrap().lines.len(), 1);
+        let line_len = s.batch(1).unwrap().bytes;
+        assert_eq!(s.batch(1).unwrap().lines.len(), 1, "never empty");
+        assert_eq!(s.batch(line_len * 2 + 1).unwrap().lines.len(), 2);
+        assert_eq!(s.batch(1 << 20).unwrap().lines.len(), 10);
     }
 
     #[test]
@@ -399,7 +397,7 @@ mod tests {
         }
         assert!(ready(&s), "spool mode never holds");
         assert!(s.pending_bytes() <= 60);
-        let b = s.batch(1 << 20, 100).unwrap();
+        let b = s.batch(1 << 20).unwrap();
         assert_eq!(b.seq_first, 5 - b.lines.len() as u64, "the newest survive");
         assert_eq!(s.dropped(), 5 - b.lines.len() as u64);
         assert_eq!(s.next_seq(), 5, "dropped events keep their seq");

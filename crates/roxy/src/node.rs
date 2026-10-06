@@ -101,25 +101,6 @@ impl NodeOptions {
     }
 }
 
-/// What this build can run, as reported to the control plane.
-pub fn features() -> Vec<String> {
-    let mut f: Vec<String> = ["valid_until", "sourceless_secrets", "readyz"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-    f.extend(
-        roxy_rules::config::Action::NAMES
-            .iter()
-            .map(|n| format!("action:{n}")),
-    );
-    f.extend(
-        ["wasm", "service"]
-            .into_iter()
-            .map(|k| format!("addon:{k}")),
-    );
-    f
-}
-
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -219,7 +200,7 @@ fn parse_lease_config(text: &str, state_dir: &StateDir) -> Result<Config, String
 /// The full secret map: `env`/`file` entries resolved here, the rest from
 /// the lease. A declared name with no value anywhere refuses the lease.
 fn resolve_secrets(config: &Config, lease: &Lease) -> Result<HashMap<String, String>, String> {
-    let (from_lease, undecodable) = lease.decoded_secrets();
+    let from_lease = &lease.secrets;
     let mut sourced = BTreeMap::new();
     for (name, source) in &config.secrets {
         match source {
@@ -242,13 +223,8 @@ fn resolve_secrets(config: &Config, lease: &Lease) -> Result<HashMap<String, Str
     }
     if !missing.is_empty() {
         return Err(format!(
-            "lease secrets missing for: {} (undecodable: {})",
-            missing.join(", "),
-            if undecodable.is_empty() {
-                "none".to_owned()
-            } else {
-                undecodable.join(", ")
-            }
+            "lease secrets missing for: {}",
+            missing.join(", ")
         ));
     }
     Ok(map)
@@ -462,28 +438,6 @@ impl NodeHandler {
         Ok(())
     }
 
-    async fn extend_lease(
-        &self,
-        received_at: DateTime<Utc>,
-        valid_for: Duration,
-    ) -> Result<(), String> {
-        let mut run = self.running.lock().await;
-        if !run.leased || run.revoked {
-            return Err("no lease to extend".into());
-        }
-        let valid_until = received_at
-            .checked_add_signed(chrono::Duration::from_std(valid_for).map_err(|e| e.to_string())?)
-            .ok_or_else(|| "valid_for out of range".to_owned())?;
-        let (policy, update, prepared) = self
-            .build_update(&run.config, run.secrets.clone(), Some(valid_until), false)
-            .await?;
-        self.swap(&run.config, &policy, update, prepared, false)
-            .await?;
-        run.valid_until = Some(valid_until);
-        self.summarise(&run);
-        Ok(())
-    }
-
     /// The empty policy, already expired: the running config with no rules
     /// and no secrets, so every request is denied with `_expired` and
     /// `/readyz` reports the policy expired, until a restart.
@@ -541,14 +495,6 @@ impl LeaseHandler for NodeHandler {
         change: Change,
     ) -> HandlerFuture<'a, Result<(), String>> {
         Box::pin(self.apply_lease(lease, received_at, change))
-    }
-
-    fn extend(
-        &self,
-        received_at: DateTime<Utc>,
-        valid_for: Duration,
-    ) -> HandlerFuture<'_, Result<(), String>> {
-        Box::pin(self.extend_lease(received_at, valid_for))
     }
 
     fn revoke(&self) -> HandlerFuture<'_, ()> {
@@ -757,7 +703,6 @@ pub async fn start(opts: NodeOptions) -> anyhow::Result<NodeRunning> {
             enrol_token_file: opts.enrol_token_file,
             info: NodeInfo {
                 roxy_version: env!("CARGO_PKG_VERSION").to_owned(),
-                features: features(),
             },
             time_scale: opts.time_scale,
         },
@@ -874,18 +819,14 @@ mod tests {
         .unwrap();
         let mut lease = roxy_node::protocol::Lease {
             lease_id: "L".into(),
-            issued_at: Utc::now(),
             valid_for_seconds: 1,
             refresh_after_seconds: 1,
             config: String::new(),
-            config_hash: String::new(),
             secrets: BTreeMap::new(),
-            secrets_hash: "s".into(),
             state_epoch: "e".into(),
             flow: FlowSettings {
                 ship: false,
                 batch_max_bytes: 1,
-                batch_max_events: 1,
                 flush_interval_seconds: 1,
                 spool_high_water_bytes: 1,
                 on_high_water: OnHighWater::Spool,
@@ -900,10 +841,7 @@ mod tests {
             dir.path().join("t").display()
         ))
         .unwrap();
-        lease.secrets.insert(
-            "b".into(),
-            roxy_node::protocol::SecretValue::Text("ignored".into()),
-        );
+        lease.secrets.insert("b".into(), "ignored".into());
         let err = resolve_secrets(&config, &lease).unwrap_err();
         assert!(err.contains("ROXY_NODE_TEST_UNSET"), "{err}");
     }
@@ -916,7 +854,6 @@ mod tests {
         spool.configure(FlowSettings {
             ship: true,
             batch_max_bytes: 1 << 20,
-            batch_max_events: 10,
             flush_interval_seconds: 1,
             spool_high_water_bytes: 200,
             on_high_water: OnHighWater::Hold,

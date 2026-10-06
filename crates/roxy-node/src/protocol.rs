@@ -1,6 +1,5 @@
 //! Wire types for `/roxy/v1/`: the request and response bodies of enrol,
-//! renew, lease and flow upload, and the headers the lease fetch reports
-//! node state in.
+//! renew, lease and flow upload.
 
 use std::collections::BTreeMap;
 
@@ -13,20 +12,13 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Path prefix of every endpoint.
 pub const PREFIX: &str = "/roxy/v1";
 
-/// Lease fetch request header: [`NodeState`] as one compact JSON object.
-pub const NODE_STATE_HEADER: &str = "roxy-node-state";
-/// `304` response headers: the unchanged lease's `valid_for_seconds` and
-/// `refresh_after_seconds`, which extend it exactly as a `200` would.
-pub const LEASE_VALID_FOR_HEADER: &str = "roxy-lease-valid-for";
-pub const LEASE_REFRESH_AFTER_HEADER: &str = "roxy-lease-refresh-after";
-
-/// Body of every non-2xx, non-304 response.
+/// Body of every non-2xx response.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ErrorBody {
     /// A stable code.
     pub error: String,
     pub message: String,
-    /// On 426: the features or protocol version the node lacks.
+    /// On 426: the protocol or roxy version the node lacks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing: Vec<String>,
 }
@@ -38,7 +30,6 @@ pub struct CertificateRequest {
     pub csr: String,
     pub roxy_version: String,
     pub protocol_version: u32,
-    pub features: Vec<String>,
 }
 
 /// Enrol and renew response.
@@ -53,19 +44,16 @@ pub struct CertificateResponse {
     pub renew_after_seconds: u64,
 }
 
-/// What the node is running, as reported with every lease fetch in
-/// [`NODE_STATE_HEADER`]. The three hashes are `null` before the first
-/// lease.
+/// `POST /roxy/v1/lease` body: what the node is running.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeState {
+    /// The lease the node holds; `null` before the first.
     pub lease_id: Option<String>,
-    pub config_hash: Option<String>,
-    pub secrets_hash: Option<String>,
     pub roxy_version: String,
     pub protocol_version: u32,
-    pub features: Vec<String>,
     pub uptime_seconds: u64,
     pub policy_state: PolicyState,
+    /// Flow-log bytes accepted but not yet acknowledged.
     pub spooled_bytes: u64,
 }
 
@@ -77,7 +65,8 @@ pub enum PolicyState {
     None,
     /// A lease is applied and inside `valid_until`.
     Loaded,
-    /// The last lease ran out: everything is denied.
+    /// The last lease ran out, or the node is revoked: everything is
+    /// denied.
     Expired,
 }
 
@@ -91,11 +80,12 @@ impl PolicyState {
     }
 }
 
-/// `GET /roxy/v1/lease` 200 body.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `POST /roxy/v1/lease` 200 body. Every poll carries the whole lease; the
+/// node compares `config` and `secrets` with what it holds.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Lease {
+    /// Opaque; changes whenever any other field does.
     pub lease_id: String,
-    pub issued_at: DateTime<Utc>,
     /// The node turns this into an absolute `valid_until` from its own
     /// receipt time.
     pub valid_for_seconds: u64,
@@ -103,10 +93,10 @@ pub struct Lease {
     pub refresh_after_seconds: u64,
     /// The rendered, secret-free `roxy.yaml`.
     pub config: String,
-    pub config_hash: String,
+    /// Each secret name the config declares with `lease: true`, to its
+    /// value.
     #[serde(default)]
-    pub secrets: BTreeMap<String, SecretValue>,
-    pub secrets_hash: String,
+    pub secrets: BTreeMap<String, String>,
     /// Opaque. A change clears rule state and metric windows.
     pub state_epoch: String,
     pub flow: FlowSettings,
@@ -115,33 +105,18 @@ pub struct Lease {
     pub interception_ca: Option<serde_json::Value>,
 }
 
-/// A secret value: a UTF-8 string, or `{b64: ...}` for anything else.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum SecretValue {
-    Text(String),
-    Encoded { b64: String },
-}
-
-impl std::fmt::Debug for SecretValue {
+/// Never prints the secret values.
+impl std::fmt::Debug for Lease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SecretValue([REDACTED])")
-    }
-}
-
-impl SecretValue {
-    /// The value as roxy's `${secret:name}` substitutes it. Base64 that
-    /// does not decode, or decodes to non-UTF-8, is `None`: such a secret
-    /// is left out of the map, so a rule that needs it fails closed.
-    pub fn decode(&self) -> Option<String> {
-        use base64::Engine as _;
-        match self {
-            Self::Text(s) => Some(s.clone()),
-            Self::Encoded { b64 } => base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok()),
-        }
+        f.debug_struct("Lease")
+            .field("lease_id", &self.lease_id)
+            .field("valid_for_seconds", &self.valid_for_seconds)
+            .field("refresh_after_seconds", &self.refresh_after_seconds)
+            .field("config_bytes", &self.config.len())
+            .field("secrets", &self.secrets.len())
+            .field("state_epoch", &self.state_epoch)
+            .field("flow", &self.flow)
+            .finish()
     }
 }
 
@@ -149,8 +124,8 @@ impl SecretValue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlowSettings {
     pub ship: bool,
+    /// Largest batch, measured on the JSON before compression.
     pub batch_max_bytes: u64,
-    pub batch_max_events: u64,
     pub flush_interval_seconds: u64,
     pub spool_high_water_bytes: u64,
     pub on_high_water: OnHighWater,
@@ -188,17 +163,9 @@ pub fn encode_flow_batch(
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"{\"node_id\":");
-    out.extend_from_slice(
-        serde_json::to_string(node_id)
-            .unwrap_or_default()
-            .as_bytes(),
-    );
+    out.extend_from_slice(serde_json::to_string(node_id).unwrap_or_default().as_bytes());
     out.extend_from_slice(b",\"lease_id\":");
-    out.extend_from_slice(
-        serde_json::to_string(lease_id)
-            .unwrap_or_default()
-            .as_bytes(),
-    );
+    out.extend_from_slice(serde_json::to_string(lease_id).unwrap_or_default().as_bytes());
     out.extend_from_slice(format!(",\"seq_first\":{seq_first},\"events\":[").as_bytes());
     for (i, event) in events.into_iter().enumerate() {
         if i > 0 {
@@ -217,7 +184,8 @@ pub struct FlowAck {
     pub acked_through: u64,
 }
 
-/// `sha256:<hex>` of `bytes`, the form of `config_hash`.
+/// `sha256:<hex>` of `bytes`: the fingerprint form roxy logs certificates
+/// in.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
     let mut out = String::with_capacity(7 + 64);
@@ -229,37 +197,12 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-impl Lease {
-    /// Whether `config_hash` is the hash of `config`. The hash is what the
-    /// node reports back and compares across refreshes, so a lease whose
-    /// hash does not describe its config is refused rather than applied.
-    pub fn config_hash_matches(&self) -> bool {
-        self.config_hash == sha256_hex(self.config.as_bytes())
-    }
-
-    /// Secret values decoded, in name order. A value that does not decode
-    /// is left out (and named), so the rule that reads it fails closed.
-    pub fn decoded_secrets(&self) -> (BTreeMap<String, String>, Vec<String>) {
-        let mut out = BTreeMap::new();
-        let mut undecodable = Vec::new();
-        for (name, value) in &self.secrets {
-            match value.decode() {
-                Some(v) => {
-                    out.insert(name.clone(), v);
-                }
-                None => undecodable.push(name.clone()),
-            }
-        }
-        (out, undecodable)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn config_hash_is_sha256_of_the_config_text() {
+    fn sha256_fingerprint_form() {
         assert_eq!(
             sha256_hex(b"abc"),
             "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -280,15 +223,16 @@ mod tests {
     }
 
     #[test]
-    fn secret_values_decode_text_and_base64_only_when_utf8() {
-        let text: SecretValue = serde_json::from_str("\"plain\"").unwrap();
-        assert_eq!(text.decode().as_deref(), Some("plain"));
-        let b64: SecretValue = serde_json::from_str("{\"b64\":\"aGVsbG8=\"}").unwrap();
-        assert_eq!(b64.decode().as_deref(), Some("hello"));
-        let bad: SecretValue = serde_json::from_str("{\"b64\":\"/w==\"}").unwrap();
-        assert_eq!(bad.decode(), None, "0xff is not UTF-8");
-        let junk: SecretValue = serde_json::from_str("{\"b64\":\"!!\"}").unwrap();
-        assert_eq!(junk.decode(), None);
-        assert_eq!(format!("{text:?}"), "SecretValue([REDACTED])");
+    fn a_lease_never_debug_prints_its_secrets() {
+        let lease: Lease = serde_json::from_str(
+            r#"{"lease_id":"L","valid_for_seconds":1,"refresh_after_seconds":1,"config":"version: 1\n",
+                "secrets":{"token":"hunter2"},"state_epoch":"e",
+                "flow":{"ship":true,"batch_max_bytes":1,"flush_interval_seconds":1,"spool_high_water_bytes":1,"on_high_water":"hold"}}"#,
+        )
+        .unwrap();
+        let text = format!("{lease:?}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("lease_id: \"L\""));
+        assert_eq!(lease.secrets["token"], "hunter2");
     }
 }

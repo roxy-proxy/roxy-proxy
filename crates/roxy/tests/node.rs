@@ -9,10 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use roxy::node::{Bootstrap, NodeOptions, NodeRunning};
-use roxy_node::protocol::{
-    FlowAck, FlowSettings, LEASE_REFRESH_AFTER_HEADER, LEASE_VALID_FOR_HEADER, Lease, OnHighWater,
-    PolicyState, sha256_hex,
-};
+use roxy_node::protocol::{FlowAck, FlowSettings, Lease, OnHighWater, PolicyState};
 use roxy_node::testkit::{MockServer, Reply};
 use roxy_proxy::MemorySink;
 use serde_json::Value;
@@ -129,21 +126,18 @@ impl NodeHarness {
         )
     }
 
-    fn lease(id: &str, config: &str, secrets_hash: &str, epoch: &str) -> Lease {
+    /// A lease whose `secrets` map is `{lease_token: <secret>}`.
+    fn lease(id: &str, config: &str, secret: &str, epoch: &str) -> Lease {
         Lease {
             lease_id: id.to_owned(),
-            issued_at: chrono::Utc::now(),
             valid_for_seconds: 600,
             refresh_after_seconds: 1,
-            config_hash: sha256_hex(config.as_bytes()),
             config: config.to_owned(),
-            secrets: std::collections::BTreeMap::default(),
-            secrets_hash: secrets_hash.to_owned(),
+            secrets: [("lease_token".to_owned(), secret.to_owned())].into(),
             state_epoch: epoch.to_owned(),
             flow: FlowSettings {
                 ship: true,
                 batch_max_bytes: 1 << 20,
-                batch_max_events: 1,
                 flush_interval_seconds: 1,
                 spool_high_water_bytes: 8 << 20,
                 on_high_water: OnHighWater::Spool,
@@ -264,22 +258,12 @@ async fn a_node_denies_until_its_first_lease_then_serves_it_and_ships_flows() {
         "",
     );
     // The lease arrives after a while, so the bootstrap window can be seen.
+    let l1 = NodeHarness::lease("L1", &config, "s1", "e1");
     h.mock.push(
         LEASE,
-        Reply::Delayed(
-            Duration::from_millis(700),
-            Box::new(Reply::json(
-                200,
-                &NodeHarness::lease("L1", &config, "s1", "e1"),
-            )),
-        ),
+        Reply::Delayed(Duration::from_millis(700), Box::new(Reply::json(200, &l1))),
     );
-    h.mock.fallback(
-        LEASE,
-        Reply::status(304)
-            .with_header(LEASE_VALID_FOR_HEADER, "600")
-            .with_header(LEASE_REFRESH_AFTER_HEADER, "1"),
-    );
+    h.mock.fallback(LEASE, Reply::json(200, &l1));
     h.run(true).await;
 
     // Before the lease: the bootstrap listener is up, denies and is not ready.
@@ -346,7 +330,7 @@ async fn a_node_denies_until_its_first_lease_then_serves_it_and_ships_flows() {
     h.stop().await;
 
     // A second start finds the identity and goes straight to the lease.
-    h.mock.push(
+    h.mock.fallback(
         LEASE,
         Reply::json(200, &NodeHarness::lease("L2", &config, "s1", "e1")),
     );
@@ -373,15 +357,9 @@ async fn a_changed_state_epoch_clears_metric_windows_and_rule_state() {
     .concat();
     let metrics = "metrics: [{ id: hits, count: requests, window: 1h }]\n";
     let config = h.config(0, &rules, metrics);
-    h.mock.push(
-        LEASE,
-        Reply::json(200, &NodeHarness::lease("L1", &config, "s1", "e1")),
-    );
     h.mock.fallback(
         LEASE,
-        Reply::status(304)
-            .with_header(LEASE_VALID_FOR_HEADER, "600")
-            .with_header(LEASE_REFRESH_AFTER_HEADER, "1"),
+        Reply::json(200, &NodeHarness::lease("L1", &config, "s1", "e1")),
     );
     h.run(true).await;
     h.wait_applied("L1").await;
@@ -392,7 +370,7 @@ async fn a_changed_state_epoch_clears_metric_windows_and_rule_state() {
 
     // Same epoch, changed config: windows and state carry over.
     let config2 = format!("{config}# v2\n");
-    h.mock.push(
+    h.mock.fallback(
         LEASE,
         Reply::json(200, &NodeHarness::lease("L2", &config2, "s1", "e1")),
     );
@@ -400,7 +378,7 @@ async fn a_changed_state_epoch_clears_metric_windows_and_rule_state() {
     assert_eq!(h.get(proxy, "/d").await, (403, Some("limit".into())));
 
     // A new epoch starts the windows afresh.
-    h.mock.push(
+    h.mock.fallback(
         LEASE,
         Reply::json(200, &NodeHarness::lease("L3", &config2, "s1", "e2")),
     );
@@ -410,7 +388,7 @@ async fn a_changed_state_epoch_clears_metric_windows_and_rule_state() {
     assert_eq!(h.get(proxy, "/f").await, (403, Some("tripped".into())));
 
     // And clears rule state.
-    h.mock.push(
+    h.mock.fallback(
         LEASE,
         Reply::json(200, &NodeHarness::lease("L4", &config2, "s1", "e3")),
     );
@@ -423,15 +401,9 @@ async fn a_changed_state_epoch_clears_metric_windows_and_rule_state() {
 async fn revocation_denies_at_once_and_keeps_health_up() {
     let mut h = NodeHarness::start().await;
     let config = h.config(0, &rule("up", "host == \"upstream.test\"", ALLOW), "");
-    h.mock.push(
-        LEASE,
-        Reply::json(200, &NodeHarness::lease("L1", &config, "s1", "e1")),
-    );
     h.mock.fallback(
         LEASE,
-        Reply::status(304)
-            .with_header(LEASE_VALID_FOR_HEADER, "600")
-            .with_header(LEASE_REFRESH_AFTER_HEADER, "1"),
+        Reply::json(200, &NodeHarness::lease("L1", &config, "s1", "e1")),
     );
     h.run(true).await;
     h.wait_applied("L1").await;
@@ -491,7 +463,7 @@ async fn an_unreachable_control_plane_lets_the_lease_run_down() {
     );
 
     // A lease that reaches the node recovers it without a restart.
-    h.mock.push(
+    h.mock.fallback(
         LEASE,
         Reply::json(200, &NodeHarness::lease("L2", &config, "s1", "e1")),
     );
@@ -504,24 +476,19 @@ async fn an_unreachable_control_plane_lets_the_lease_run_down() {
 async fn a_lease_the_node_cannot_apply_is_refused_and_the_old_one_stays() {
     let mut h = NodeHarness::start().await;
     let config = h.config(0, &rule("up", "host == \"upstream.test\"", ALLOW), "");
-    h.mock.push(
-        LEASE,
-        Reply::json(200, &NodeHarness::lease("L1", &config, "s1", "e1")),
-    );
+    let l1 = NodeHarness::lease("L1", &config, "s1", "e1");
+    h.mock.push(LEASE, Reply::json(200, &l1));
     // Invalid rule language.
     let broken = h.config(0, &rule("bad", "host ===", ALLOW), "");
     h.mock.push(
         LEASE,
         Reply::json(200, &NodeHarness::lease("L2", &broken, "s1", "e1")),
     );
-    // A hash that lies about the config.
-    let mut lying = NodeHarness::lease("L3", &config, "s1", "e1");
-    lying.config_hash = "sha256:0".into();
-    h.mock.push(LEASE, Reply::json(200, &lying));
-    h.mock.fallback(
-        LEASE,
-        Reply::status(304).with_header(LEASE_VALID_FOR_HEADER, "600"),
-    );
+    // A config that declares a secret the lease does not supply.
+    let mut unsupplied = NodeHarness::lease("L3", &config, "s1", "e1");
+    unsupplied.secrets.clear();
+    h.mock.push(LEASE, Reply::json(200, &unsupplied));
+    h.mock.fallback(LEASE, Reply::json(200, &l1));
     h.run(true).await;
     h.wait_applied("L1").await;
     let proxy = h.proxy_addr().await;
