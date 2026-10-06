@@ -1,0 +1,17 @@
+[package]
+name = "roxy-node-spec"
+description = "The roxy node protocol's OpenAPI document, with validators for its body schemas"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+jsonschema = { version = "0.58.6", default-features = false }
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+
+[lints]
+workspace = true
