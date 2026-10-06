@@ -384,5 +384,6 @@ reported as skipped and the run fails.
 The crate also contains a minimal in-memory reference server:
 `cargo run -p roxy-node-conformance -- serve` starts one on the loopback
 interface and prints its URL, CA bundle, admin URL and tokens as JSON, for
-developing a node against. `cargo test -p roxy-node-conformance` runs the
-harness against it.
+developing a node against. Its admin URL takes the four hook actions and
+one more, `re-lease`, which issues the node a new `lease_id` on its next
+poll. `cargo test -p roxy-node-conformance` runs the harness against it.
