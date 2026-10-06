@@ -140,9 +140,10 @@ done, say, does not stall the upload). Each body of a stream starts with
 `{"type":"credit","stream":…,"dir":"request"|"response","bytes":n}` as it
 consumes what it got; the sender may have no more bytes of that body
 outstanding than it has been granted. roxy grants credit as the layer
-below (or the client) reads what the service sent. A service that sends
-past its credit breaks the protocol on that stream. Control messages are
-not counted.
+below (or the client) reads what the service sent, in steps of 64 KiB, so
+a stream never has more than a few credit messages waiting on the
+socket. A service that sends past its credit breaks the protocol on that
+stream. Control messages are not counted.
 
 - **What the service forwards gets the same checks as a WASM layer's
   `next`**: re-validated as strictly as a client request, then judged by the

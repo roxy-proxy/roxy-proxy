@@ -189,7 +189,7 @@ async fn a_body_failing_on_its_way_to_the_service_is_not_its_failure() {
         "{lost:?}"
     );
     assert!(matches!(
-        super::super::unanswered(&stream.st, lost),
+        super::super::unanswered(&stream.st, 0, lost),
         super::super::Fail::Below(_)
     ));
     assert!(

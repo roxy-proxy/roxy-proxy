@@ -23,7 +23,7 @@ use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::BodyExt as _;
 use roxy_http::{Body, BodyError};
-use roxy_wasm::{HostError, LayerRequest, LayerResponse};
+use roxy_wasm::{HostError, LayerError, LayerRequest, LayerResponse};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -338,6 +338,7 @@ pub(crate) async fn observe(
     let next = ObserverNext {
         rx: Mutex::new(Some(rx)),
     };
+    let below_failed = Arc::new(AtomicBool::new(false));
     let observer_st = st.clone();
     let observer_addon = addon.clone();
     let layer = match &addon.kind {
@@ -356,7 +357,7 @@ pub(crate) async fn observe(
                     );
                 }
             });
-            return forward(st, index, &addon.name, real_req, tx).await;
+            return forward(st, index, &addon.name, real_req, tx, &below_failed).await;
         }
     };
     let host = Arc::new(super::host::StackHost {
@@ -364,6 +365,7 @@ pub(crate) async fn observe(
         index,
         observer: Some(next),
     });
+    let failed_below = below_failed.clone();
     tokio::spawn(async move {
         let result = match layer.handle(host, copy_req).await {
             Ok(resp) => {
@@ -379,6 +381,12 @@ pub(crate) async fn observe(
             Err(e) => Err(e),
         };
         if let Err(e) = result {
+            // The exchange failing below the observer ends its `next` with
+            // the host's error: that failure is logged against the party
+            // at fault, not as the observer's.
+            if matches!(e, LayerError::Host(_)) && failed_below.load(Ordering::SeqCst) {
+                return;
+            }
             super::emit_layer_error(
                 &observer_st,
                 &observer_addon.name,
@@ -388,7 +396,7 @@ pub(crate) async fn observe(
         }
     });
 
-    forward(st, index, &addon.name, real_req, tx).await
+    forward(st, index, &addon.name, real_req, tx, &below_failed).await
 }
 
 /// Reads `body` to its end or first error, holding one frame at a time.
@@ -397,13 +405,15 @@ async fn discard(mut body: Body) {
 }
 
 /// The real exchange below observer `index`; the observer gets a copy of
-/// the response through `tx`.
+/// the response through `tx`, or the failure below, noted in
+/// `below_failed` first so the observer's own end is not taken for one.
 async fn forward(
     st: Arc<StackFlow>,
     index: usize,
     name: &str,
     real_req: LayerRequest,
     tx: oneshot::Sender<Result<LayerResponse, HostError>>,
+    below_failed: &AtomicBool,
 ) -> Result<LayerResponse, HostError> {
     let real = super::below(st.clone(), index, real_req).await;
     match real {
@@ -418,6 +428,7 @@ async fn forward(
             Ok(http::Response::from_parts(parts, real_body))
         }
         Err(e) => {
+            below_failed.store(true, Ordering::SeqCst);
             let _ = tx.send(Err(e.clone()));
             Err(e)
         }

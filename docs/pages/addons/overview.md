@@ -133,6 +133,9 @@ flow no layer runs on (every `when` skipped it) is not decoded at all.
   ([HTTP](/reference/http#content-codings)). Data that does not decode, or a
   decoded body over `limits.max_request_body_bytes` or
   `limits.max_response_body_bytes`, cuts the exchange like any failed body.
+  An observer counts as a layer that runs: on a flow only an observer
+  runs on, the bodies are decoded for its copy, so a body that does not
+  decode fails the exchange that would have been forwarded as it was.
 - A body in a coding roxy does not know passes through as it is, with its
   `content-encoding`, for a layer to judge. So does a `206` or any response
   with `content-range`: part of an encoded body cannot be decoded on its
@@ -187,7 +190,11 @@ sits in it.
 - The flow log's `rules`, `decision` and `terminal_rule` describe the
   request that left; `req` still describes what the client sent. Metric
   keys, for the rules' samples and for `metric-get`, come from the request
-  that left too.
+  that left too. They record what the rules decided, not what the client
+  got: a layer whose `next` returned the rules' `403` and then answered
+  with a `200` of its own is logged with `decision: deny` and
+  `res.status: 200`. The stack cannot tell that answer from the response
+  passed on unchanged, so `res.status` is the record of what left.
 - A layer that answers itself is logged with `decision: answered` and
   `terminal_rule: layer:<name>`, whatever its status: the status tells a
   block (`403`) from a served answer (`200`). The answering layer is the
@@ -202,7 +209,13 @@ sits in it.
   `budget:<limit>`, `capability:<name>`, `invalid_request`,
   `invalid_response`, `no_response`, ... After the head, the body is cut
   (HTTP/1.1 breaks the connection, HTTP/2 resets the stream) and
-  `layer_error` follows.
+  `layer_error` follows. A failure found below the layer that caused it
+  (a request a layer passed on that does not validate, say) is put down
+  to the nearest enforcing layer above: an observer passes nothing on, so
+  it is never the one blamed, and the end of its copy when the exchange
+  fails below it is not logged as its own failure.
+- A layer's answer must be a final response. A `1xx` other than the
+  `101` of a relayed upgrade fails closed as `invalid_response`.
 - A layer's response body to the client waits for the flow log like every
   forwarded body ([audit backpressure](/operate/flow-log#writing)).
 - A WebSocket runs through the layers that ran on its upgrade request,

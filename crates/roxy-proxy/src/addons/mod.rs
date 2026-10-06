@@ -545,9 +545,16 @@ impl StackFlow {
     /// layer whose own outcome failed (an outer layer that reads a cut body
     /// fails in turn), else the first recorded failure.
     fn post_head_failure(&self) -> Option<(String, StackError)> {
+        self.innermost_failed(0).or_else(|| self.failure())
+    }
+
+    /// The innermost WASM layer at or below `from` whose own outcome
+    /// failed, if one has.
+    fn innermost_failed(&self, from: usize) -> Option<(String, StackError)> {
         self.layers
             .iter()
             .enumerate()
+            .skip(from)
             .rev()
             .find_map(|(i, l)| {
                 let failure = l
@@ -558,7 +565,17 @@ impl StackFlow {
                     .and_then(LayerOutcome::failure)?;
                 Some((self.snap.addons[i].name.clone(), failure.into()))
             })
-            .or_else(|| self.failure())
+    }
+
+    /// A response body from below layer `index` failed: the WASM layer
+    /// below whose own outcome failed is at fault, if one is. Records it;
+    /// `None` leaves the failure to whoever produced the body.
+    pub(crate) fn blame_below(&self, index: usize) -> bool {
+        let Some((layer, err)) = self.innermost_failed(index + 1) else {
+            return false;
+        };
+        self.fail(&layer, err);
+        true
     }
 
     /// The outcomes of the WASM layers whose handlers returned a response.
@@ -625,26 +642,28 @@ impl StackFlow {
         })
     }
 
-    /// The nearest layer above `below` that ran: the one that passed on
-    /// what reached `below` (a skipped layer passes it on untouched).
-    /// `None` when the request reaching `below` is the client's.
+    /// Layer `i` ran in enforce mode: what left it is its own. An observer
+    /// runs beside the exchange and passes nothing on, so it is never the
+    /// one to blame for what reached the layers below.
+    fn enforced(&self, i: usize) -> bool {
+        self.layers[i].ran.load(Ordering::SeqCst) && self.snap.addons[i].mode == AddonMode::Enforce
+    }
+
+    /// The nearest enforcing layer above `below` that ran: the one that
+    /// passed on what reached `below` (a skipped layer or an observer
+    /// passes it on untouched). `None` when the request reaching `below`
+    /// is the client's.
     fn passed_on_by(&self, below: usize) -> Option<usize> {
-        self.layers[..below]
-            .iter()
-            .rposition(|l| l.ran.load(Ordering::SeqCst))
+        (0..below).rev().find(|&i| self.enforced(i))
     }
 
     /// The layer a failure no layer recorded is put down to: the one that
-    /// answered, else the outermost that ran, since what the client got
-    /// came from it.
+    /// answered, else the outermost enforcing layer that ran, since what
+    /// the client got came from it.
     fn blamed(&self) -> String {
         let i = self
             .answered_by()
-            .or_else(|| {
-                self.layers
-                    .iter()
-                    .position(|l| l.ran.load(Ordering::SeqCst))
-            })
+            .or_else(|| (0..self.layers.len()).find(|&i| self.enforced(i)))
             .unwrap_or(0);
         self.snap.addons[i].name.clone()
     }
@@ -795,6 +814,14 @@ fn stack_outcome(
         }
         Ok(Ok(r)) => r,
     };
+    // A layer's answer is a final response; the one `1xx` with a meaning
+    // here is the `101` of a relayed upgrade, judged below.
+    if resp.status().is_informational() && resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+        let layer = st.blamed();
+        let err = LayerError::InvalidResponse(format!("{} is not a final response", resp.status()));
+        emit_layer_error(st, &layer, &err, AddonMode::Enforce);
+        return Outcome::Refuse(layer_refusal(&layer));
+    }
     if let Some(i) = st.answered_by() {
         cx.record.decision = Some(DecisionKind::Answered);
         cx.record.terminal_rule = Some(Decider::Layer(st.snap.addons[i].name.clone()));
@@ -1196,5 +1223,76 @@ mod tests {
             matches!(&out, Outcome::Refuse(r) if r.rule == Some(Decider::Layer("b".into()))),
             "blames b"
         );
+    }
+
+    /// An observer that ran passed nothing on: what reaches the layers
+    /// below it came from the nearest enforcing layer above, which is the
+    /// one blamed when it does not validate.
+    #[tokio::test]
+    async fn blame_skips_observers() {
+        let kit = Kit::builder()
+            .addon(AddonDef::test_layer("a"))
+            .addon(AddonDef::test_layer("o").observe())
+            .addon(AddonDef::test_layer("c").when(r#"path == "/x""#))
+            .start()
+            .await;
+        let invalid = || {
+            http::Request::get("ftp://up.test/")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let ran = |st: &StackFlow, i: usize| {
+            st.layers[i].ran.store(true, Ordering::SeqCst);
+            st.layers[i].set(NextState::Resolved);
+        };
+        let blamed = |st: &StackFlow| st.failure().expect("a failure").0;
+
+        let (st, _) = test_flow(&kit);
+        ran(&st, 0);
+        ran(&st, 1);
+        assert!(select::selects(&st, 2, &st.snap.addons[2], invalid()).is_err());
+        assert_eq!(blamed(&st), "a");
+
+        let (st, _) = test_flow(&kit);
+        ran(&st, 0);
+        ran(&st, 1);
+        assert!(core(st.clone(), 2, invalid()).await.is_err());
+        assert_eq!(blamed(&st), "a");
+
+        // A failure no layer recorded goes past an observer too.
+        let (st, mut cx) = test_flow(&kit);
+        ran(&st, 1);
+        ran(&st, 2);
+        let out = stack_outcome(&st, &mut cx, Ok(Err(HostError::new("x"))), None);
+        assert!(
+            matches!(&out, Outcome::Refuse(r) if r.rule == Some(Decider::Layer("c".into()))),
+            "blames c"
+        );
+    }
+
+    /// A `1xx` other than a relayed `101` is not a response a client can
+    /// be given: the stack refuses it as the answering layer's invalid
+    /// response.
+    #[tokio::test]
+    async fn an_interim_response_from_a_layer_is_refused() {
+        let kit = Kit::builder()
+            .addon(AddonDef::test_layer("a"))
+            .start()
+            .await;
+        let (st, mut cx) = test_flow(&kit);
+        st.layers[0].ran.store(true, Ordering::SeqCst);
+        st.layers[0].set(NextState::Resolved);
+        let resp = http::Response::builder()
+            .status(StatusCode::CONTINUE)
+            .body(Body::empty())
+            .unwrap();
+        let out = stack_outcome(&st, &mut cx, Ok(Ok(resp)), None);
+        assert!(
+            matches!(&out, Outcome::Refuse(r) if r.rule == Some(Decider::Layer("a".into()))),
+            "refused as a's"
+        );
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["kind"], "invalid_response", "{errs:#?}");
+        assert_eq!(errs[0]["layer"], "a");
     }
 }

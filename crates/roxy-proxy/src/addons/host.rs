@@ -161,16 +161,33 @@ impl LayerHost for StackHost {
     }
 }
 
-/// Strings in a record pass through the redactor, so a secret an addon
-/// copies into a record does not reach the log.
+/// Strings in a record, keys included, pass through the redactor, so a
+/// secret an addon copies into a record does not reach the log.
 fn redact_json(v: serde_json::Value, r: &crate::flowlog::Redactor) -> serde_json::Value {
     use serde_json::Value;
     match v {
         Value::String(s) => Value::String(r.redact_str(&s).into_owned()),
         Value::Array(a) => Value::Array(a.into_iter().map(|x| redact_json(x, r)).collect()),
-        Value::Object(o) => {
-            Value::Object(o.into_iter().map(|(k, x)| (k, redact_json(x, r))).collect())
-        }
+        Value::Object(o) => Value::Object(
+            o.into_iter()
+                .map(|(k, x)| (r.redact_str(&k).into_owned(), redact_json(x, r)))
+                .collect(),
+        ),
         other @ (Value::Null | Value::Bool(_) | Value::Number(_)) => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_json;
+    use crate::flowlog::Redactor;
+
+    #[test]
+    fn records_are_redacted_in_keys_as_well_as_values() {
+        let mut r = Redactor::new();
+        r.add_secret("hunter2");
+        let v = serde_json::json!({"token hunter2": ["hunter2", {"hunter2": 1}]});
+        let out = redact_json(v, &r).to_string();
+        assert!(!out.contains("hunter2"), "{out}");
     }
 }

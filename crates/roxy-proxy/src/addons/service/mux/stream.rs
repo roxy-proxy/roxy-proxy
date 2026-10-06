@@ -389,28 +389,29 @@ impl Stream {
         }
     }
 
-    /// Credit back to the service for `n` bytes of the `dir` body consumed.
+    /// Credit back to the service for `n` bytes of the `dir` body
+    /// consumed, in the window's batches.
     pub(super) fn grant(&self, dir: Dir, n: u64) {
         if n == 0 {
             return;
         }
-        {
+        let due = {
             let mut s = lock(&self.state);
             if s.ended() {
                 return;
             }
-            s.lane(dir).window.acked(n);
+            s.lane(dir).window.acked(n)
+        };
+        if let Some(bytes) = due {
+            self.link
+                .shared
+                .send_ctl(self.id, &Out::Credit { dir, bytes });
         }
-        self.link
-            .shared
-            .send_ctl(self.id, &Out::Credit { dir, bytes: n });
     }
 
     /// Bytes of the `dir` body from the service. They count against that
     /// body's window in either mode. An observe stream's are discarded and
-    /// credited back as they go, in steps: the service never waits on
-    /// what it sends, and since it may only send what roxy has credited,
-    /// the credit waiting for a stalled socket stays within the window.
+    /// credited back as they go: the service never waits on what it sends.
     pub(super) fn bytes(self: &Arc<Self>, dir: Dir, b: &[u8]) {
         if b.is_empty() {
             return;
@@ -440,11 +441,8 @@ impl Stream {
             );
         }
         let Some(inbox) = inbox else {
-            let granted = lane.window.discarded(n);
             drop(s);
-            if let Some(granted) = granted {
-                self.grant(dir, granted);
-            }
+            self.grant(dir, n);
             return;
         };
         drop(s);

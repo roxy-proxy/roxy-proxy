@@ -343,7 +343,7 @@ async fn run(
 
     let first = answer_by(sent + svc.first_byte_timeout, answers.first)
         .await?
-        .map_err(|u| unanswered(st, u))?;
+        .map_err(|u| unanswered(st, index, u))?;
     let forward = match first {
         First::Answer(res) => {
             guard.disarm();
@@ -365,16 +365,16 @@ async fn run(
     tokio::spawn(async move { s.pump(Dir::Response, head, body).await });
     let res = answer_by(sent + svc.first_byte_timeout, answers.second)
         .await?
-        .map_err(|u| unanswered(st, u))?;
+        .map_err(|u| unanswered(st, index, u))?;
     guard.disarm();
     Ok(res)
 }
 
-/// The exchange's failure when the service's answer will not come. A body
-/// that failed on its way to the service is attributed as it would be
-/// without the layer: the client's upload to the client, the upstream's
-/// response to the upstream.
-fn unanswered(st: &StackFlow, u: Unanswered) -> Fail {
+/// The exchange's failure when service layer `index`'s answer will not
+/// come. A body that failed on its way to the service is attributed as it
+/// would be without the layer: the client's upload to the client, the
+/// response to the layer below that cut it, else to the upstream.
+fn unanswered(st: &StackFlow, index: usize, u: Unanswered) -> Fail {
     match u {
         Unanswered::Service(e) => Fail::Service(e),
         Unanswered::Abandoned(why) => Fail::Below(HostError::new(why)),
@@ -385,8 +385,10 @@ fn unanswered(st: &StackFlow, u: Unanswered) -> Fail {
             Fail::Below(HostError::new(format!("request body failed: {e}")))
         }
         Unanswered::Body(Dir::Response, e) => {
-            tracing::info!(flow = %st.flow, error = %e, "upstream response body failed");
-            st.record(super::Fault::UpstreamBody);
+            if !st.blame_below(index) {
+                tracing::info!(flow = %st.flow, error = %e, "upstream response body failed");
+                st.record(super::Fault::UpstreamBody);
+            }
             Fail::Below(HostError::new(format!("response body failed: {e}")))
         }
     }

@@ -5,10 +5,11 @@
 /// Each body's starting credit, each way, in bytes.
 pub(super) const WINDOW: u64 = 256 * 1024;
 
-/// Bytes discarded from an observe stream before they are credited back
-/// in one message, so the credit queue holds a few messages per stream
-/// however small the service's frames.
-const OBSERVE_GRANT: u64 = WINDOW / 4;
+/// Bytes consumed before they are credited back in one message, so the
+/// credit queue holds a few messages per stream however small the
+/// service's frames. The service always has the rest of the window to
+/// send, so credit held back this way never stalls it.
+const GRANT: u64 = WINDOW / 4;
 
 /// The credit each way for one body. The service may have at most
 /// [`WINDOW`] bytes in flight to roxy: what it has sent and roxy has not
@@ -19,8 +20,8 @@ pub(super) struct Window {
     credit: u64,
     /// Bytes received from the service and not yet credited back.
     unacked: u64,
-    /// Observe mode: bytes discarded since the last credit went back.
-    discarded: u64,
+    /// Bytes consumed since the last credit went back.
+    pending: u64,
 }
 
 /// The service sent more than its credit.
@@ -32,7 +33,7 @@ impl Default for Window {
         Self {
             credit: WINDOW,
             unacked: 0,
-            discarded: 0,
+            pending: 0,
         }
     }
 }
@@ -64,16 +65,16 @@ impl Window {
         Ok(())
     }
 
-    /// `n` received bytes are consumed: credit for them goes back.
-    pub(super) fn acked(&mut self, n: u64) {
-        self.unacked = self.unacked.saturating_sub(n);
-    }
-
-    /// `n` received bytes are discarded (observe mode). Their credit goes
-    /// back in batches: the batch due now, if one is.
-    pub(super) fn discarded(&mut self, n: u64) -> Option<u64> {
-        self.discarded = self.discarded.saturating_add(n);
-        (self.discarded >= OBSERVE_GRANT).then(|| std::mem::take(&mut self.discarded))
+    /// `n` received bytes are consumed. Their credit goes back in batches
+    /// of [`GRANT`]: the batch due now, if one is.
+    pub(super) fn acked(&mut self, n: u64) -> Option<u64> {
+        self.pending = self.pending.saturating_add(n);
+        if self.pending < GRANT {
+            return None;
+        }
+        let batch = std::mem::take(&mut self.pending);
+        self.unacked = self.unacked.saturating_sub(batch);
+        Some(batch)
     }
 }
 
@@ -100,19 +101,24 @@ mod tests {
         let mut w = Window::default();
         assert_eq!(w.received(WINDOW), Ok(()));
         assert_eq!(w.received(1), Err(PastCredit));
-        w.acked(1);
-        assert_eq!(w.received(1), Ok(()));
+        assert_eq!(w.acked(GRANT), Some(GRANT));
+        assert_eq!(w.received(GRANT), Ok(()));
         assert_eq!(w.received(1), Err(PastCredit));
         // A failed receive leaves the window as it was.
-        w.acked(WINDOW);
+        assert_eq!(w.acked(WINDOW), Some(WINDOW));
         assert_eq!(w.received(WINDOW), Ok(()));
     }
 
+    /// Credit held back for a batch is still the service's: its window
+    /// opens only as the batch goes.
     #[test]
-    fn discarded_bytes_are_credited_back_in_batches() {
+    fn consumed_bytes_are_credited_back_in_batches() {
         let mut w = Window::default();
-        assert_eq!(w.discarded(OBSERVE_GRANT - 1), None);
-        assert_eq!(w.discarded(2), Some(OBSERVE_GRANT + 1));
-        assert_eq!(w.discarded(1), None);
+        assert_eq!(w.received(WINDOW), Ok(()));
+        assert_eq!(w.acked(GRANT - 1), None);
+        assert_eq!(w.received(1), Err(PastCredit));
+        assert_eq!(w.acked(2), Some(GRANT + 1));
+        assert_eq!(w.received(GRANT + 1), Ok(()));
+        assert_eq!(w.acked(1), None);
     }
 }

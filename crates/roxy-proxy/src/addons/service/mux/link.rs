@@ -94,7 +94,11 @@ impl Wire {
 pub(super) struct LinkShared {
     pub(super) streams: Mutex<LinkState>,
     /// Credit and resets: never held up behind body frames, so the reader
-    /// and feeders can always send them.
+    /// and feeders can always send them. Unbounded in count, bounded in
+    /// fact: credit goes back in batches of a quarter window, so a stream
+    /// queues a few credit messages per body and one reset, however small
+    /// the service's frames, and the service cannot send more to earn
+    /// more until the socket takes them.
     pub(super) ctl: mpsc::UnboundedSender<Message>,
 }
 
