@@ -182,6 +182,20 @@ impl AddonDef {
         self
     }
 
+    /// The loaded addon, for a stack handed to the server directly rather
+    /// than through the builder (`when` is compiled against no rules).
+    pub(crate) async fn spec(self) -> Arc<AddonSpec> {
+        let none = std::collections::HashSet::new();
+        let input = PolicyInput {
+            rules: &[],
+            metrics: &[],
+            secret_names: &none,
+            address_lists: &none,
+        };
+        let rt = roxy_wasm::WasmRuntime::new().unwrap();
+        self.load(&rt, &input).await
+    }
+
     async fn load(self, rt: &roxy_wasm::WasmRuntime, input: &PolicyInput<'_>) -> Arc<AddonSpec> {
         let when = self.when.as_deref().map(|w| {
             roxy_rules::Condition::compile(input, &format!("{}.when", self.name), w)

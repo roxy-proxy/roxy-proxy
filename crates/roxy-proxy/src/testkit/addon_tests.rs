@@ -595,8 +595,38 @@ mod service {
     use crate::addons::service::ServiceSpec;
     use crate::addons::service::testing::{addon, kit, only_when, reload};
     use crate::testkit::upstream::service::SLOW;
-    use crate::testkit::{Answer, Kit, streaming_body};
+    use crate::testkit::{AddonDef, Answer, Kit, streaming_body};
     use roxy_http::Body;
+
+    /// A WASM layer below the service fails after the response head: the
+    /// service passes the cut body on, and the flow log names the layer
+    /// that failed.
+    #[tokio::test]
+    async fn a_wasm_layer_failing_after_the_head_below_the_service_is_logged() {
+        let kit = kit(
+            RULES,
+            vec![
+                addon("s", "pass", AddonMode::Enforce, |_| {}),
+                AddonDef::test_layer("w").spec().await,
+            ],
+        )
+        .await;
+        let a = kit
+            .h1()
+            .await
+            .call(
+                "GET",
+                "/x",
+                &[("x-test-w", "trap-after-head"), ("x-delay-ms", "300")],
+                b"",
+            )
+            .await;
+        assert_eq!(a.status, 200, "{a:?}");
+        assert!(a.body.is_err(), "the body is cut: {a:?}");
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["layer"], "w", "{errs:#?}");
+        assert_eq!(errs[0]["kind"], "trap", "{errs:#?}");
+    }
 
     /// An upstream that answers while the client is still uploading
     /// reaches the client through a pass-through layer at once: the

@@ -645,6 +645,10 @@ impl Handler for Layer {
                     let stream = body.write().expect("write");
                     write_all(&stream, b"partial");
                 }
+                // `x-delay-ms` holds the cut back so the head lands first.
+                if let Some(ms) = header(&req, "x-delay-ms").and_then(|v| v.parse::<u64>().ok()) {
+                    wasi::clocks::monotonic_clock::subscribe_duration(ms * 1_000_000).block();
+                }
                 panic!("layer panics mid-body");
             }
             "trap-after-finish" => {
