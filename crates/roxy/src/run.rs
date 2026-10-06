@@ -61,9 +61,6 @@ pub fn policy_update_with_secrets(
 ) -> anyhow::Result<PolicyUpdate> {
     let secret_map: HashMap<String, String> = secrets.into_iter().collect();
     let mut redactor = Redactor::new();
-    for value in secret_map.values() {
-        redactor.add_secret(value);
-    }
     for header in &config.log.redact_headers {
         redactor.add_header(header);
     }

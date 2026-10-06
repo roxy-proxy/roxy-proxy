@@ -122,7 +122,7 @@ impl NodeHarness {
              limits: {{ header_timeout: 5s, response_header_timeout: 2s }}\n\
              upstream:\n  connect_timeout: 2s\n  dns:\n    resolver: [\"127.0.0.1:9\"]\n    \
              static_hosts: {{ upstream.test: 127.0.0.1 }}\n\
-             secrets:\n  token: {{ file: {dir}/token }}\n{extra}{rules}"
+             secrets:\n  token: {{ file: {dir}/token }}\n  lease_token: {{ lease: true }}\n{extra}{rules}"
         )
     }
 
@@ -253,7 +253,7 @@ async fn a_node_denies_until_its_first_lease_then_serves_it_and_ships_flows() {
         &rule(
             "up",
             "host == \"upstream.test\"",
-            "[{ set_header: { authorization: \"Bearer ${secret:token}\" } }, { allow: { private_ok: true } }]",
+            "[{ set_header: { authorization: \"Bearer ${secret:token}\", x-lease: \"${secret:lease_token}\" } }, { allow: { private_ok: true } }]",
         ),
         "",
     );
@@ -286,6 +286,21 @@ async fn a_node_denies_until_its_first_lease_then_serves_it_and_ships_flows() {
         Some(format!("Bearer {SECRET}").as_str()),
         "file-sourced secrets are resolved on the node"
     );
+    assert_eq!(
+        seen[0].header("x-lease"),
+        Some("s1"),
+        "lease secrets reach the rules"
+    );
+
+    // A lease that changes only a secret value: the next request carries
+    // the new value.
+    h.mock.fallback(
+        LEASE,
+        Reply::json(200, &NodeHarness::lease("L1b", &config, "s2", "e1")),
+    );
+    h.wait_applied("L1b").await;
+    assert_eq!(h.get(proxy, "/rotated").await, (200, None));
+    assert_eq!(h.upstream.seen()[1].header("x-lease"), Some("s2"));
 
     // Flow events reach the control plane with the node's sequence numbers.
     let posts = h.mock.wait_for(FLOWS, 2).await;

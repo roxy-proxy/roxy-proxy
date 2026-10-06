@@ -207,6 +207,7 @@ fn resolve_secrets(config: &Config, lease: &Lease) -> Result<HashMap<String, Str
             SecretSource::Env(_) | SecretSource::File(_) => {
                 sourced.insert(name.clone(), source.clone());
             }
+            SecretSource::Lease => {}
         }
     }
     let resolved = Secrets::resolve(&sourced).map_err(|e| e.to_string())?;
@@ -222,10 +223,7 @@ fn resolve_secrets(config: &Config, lease: &Lease) -> Result<HashMap<String, Str
         }
     }
     if !missing.is_empty() {
-        return Err(format!(
-            "lease secrets missing for: {}",
-            missing.join(", ")
-        ));
+        return Err(format!("lease secrets missing for: {}", missing.join(", ")));
     }
     Ok(map)
 }
@@ -844,6 +842,24 @@ mod tests {
         lease.secrets.insert("b".into(), "ignored".into());
         let err = resolve_secrets(&config, &lease).unwrap_err();
         assert!(err.contains("ROXY_NODE_TEST_UNSET"), "{err}");
+
+        let config = Config::from_yaml(
+            "version: 1\nsecrets:\n  from_lease: { lease: true }\n  other: { lease: true }\n",
+        )
+        .unwrap();
+        lease.secrets.clear();
+        lease.secrets.insert("from_lease".into(), "v1".into());
+        let err = resolve_secrets(&config, &lease).unwrap_err();
+        assert!(
+            err.contains("other") && !err.contains("from_lease"),
+            "{err}"
+        );
+        lease.secrets.insert("other".into(), "v2".into());
+        let map = resolve_secrets(&config, &lease).unwrap();
+        assert_eq!(
+            (map["from_lease"].as_str(), map["other"].as_str()),
+            ("v1", "v2")
+        );
     }
 
     /// The node sink holds traffic exactly when the spool does: `hold`
@@ -882,7 +898,7 @@ mod tests {
             spool.pending_events(),
             "the local log gets every event"
         );
-        let batch = spool.batch(1 << 20, 100).unwrap();
+        let batch = spool.batch(1 << 20).unwrap();
         assert_eq!(batch.seq_first, 0);
         assert!(batch.lines[0].starts_with(b"{\"seq\":0,\"event\":\"config_reloaded\""));
         spool.ack(batch.seq_last);

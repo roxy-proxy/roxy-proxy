@@ -116,6 +116,7 @@ impl std::fmt::Debug for Lease {
             .field("secrets", &self.secrets.len())
             .field("state_epoch", &self.state_epoch)
             .field("flow", &self.flow)
+            .field("interception_ca", &self.interception_ca.is_some())
             .finish()
     }
 }
@@ -163,9 +164,17 @@ pub fn encode_flow_batch(
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"{\"node_id\":");
-    out.extend_from_slice(serde_json::to_string(node_id).unwrap_or_default().as_bytes());
+    out.extend_from_slice(
+        serde_json::to_string(node_id)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     out.extend_from_slice(b",\"lease_id\":");
-    out.extend_from_slice(serde_json::to_string(lease_id).unwrap_or_default().as_bytes());
+    out.extend_from_slice(
+        serde_json::to_string(lease_id)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     out.extend_from_slice(format!(",\"seq_first\":{seq_first},\"events\":[").as_bytes());
     for (i, event) in events.into_iter().enumerate() {
         if i > 0 {

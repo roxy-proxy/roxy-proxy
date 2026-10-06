@@ -1108,7 +1108,10 @@ mod tests {
                 renew_after_seconds: 3000,
             },
         );
-        h.mock.fallback(LEASE, Reply::json(200, &lease("L1", "version: 1\n", "s1", "e1")));
+        h.mock.fallback(
+            LEASE,
+            Reply::json(200, &lease("L1", "version: 1\n", "s1", "e1")),
+        );
         let (node, _) = h.node(true);
         let state = node.state_dir().clone();
         let task = tokio::spawn(node.clone().run());
@@ -1165,7 +1168,10 @@ mod tests {
                 renew_after_seconds: 3000,
             },
         );
-        h.mock.fallback(LEASE, Reply::json(200, &lease("L1", "version: 1\n", "s1", "e1")));
+        h.mock.fallback(
+            LEASE,
+            Reply::json(200, &lease("L1", "version: 1\n", "s1", "e1")),
+        );
         let (node, _) = h.node(true);
         let task = tokio::spawn(node.clone().run());
         let renewals = h.mock.wait_for("/roxy/v1/renew", 3).await;

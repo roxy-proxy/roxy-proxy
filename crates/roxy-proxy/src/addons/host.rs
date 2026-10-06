@@ -93,8 +93,7 @@ impl LayerHost for StackHost {
         let addon = self.addon().clone();
         // Never dropped: wait for the flow log like any other audit record.
         sink_ready(&*self.st.shared.sink).await;
-        let redactor = &self.st.snap.redactor;
-        let data = redact_json(data, redactor);
+        let data = redact_json(data, &self.st.snap.secrets.redactor());
         self.st.shared.sink.emit(&FlowEvent::LayerRecord {
             ts: chrono::Utc::now(),
             flow: self.st.flow.to_string(),

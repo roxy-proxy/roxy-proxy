@@ -405,7 +405,12 @@ pub(crate) mod tests {
         assert_eq!(enrol.header("authorization"), Some("Bearer tok"));
         assert_eq!(enrol.client, None, "no client certificate yet");
         let body = enrol.json();
-        assert!(body["csr"].as_str().unwrap().contains("CERTIFICATE REQUEST"));
+        assert!(
+            body["csr"]
+                .as_str()
+                .unwrap()
+                .contains("CERTIFICATE REQUEST")
+        );
         assert_eq!(body["protocol_version"], 1);
         assert_eq!(body["roxy_version"], "0.1.0-test");
         assert!(body.get("features").is_none());
@@ -461,7 +466,10 @@ pub(crate) mod tests {
         let (cp, _) = enrolled(&mock).await;
         let path = "/roxy/v1/lease";
         mock.push(path, Reply::status(410));
-        assert!(matches!(cp.fetch_lease(&state()).await, LeaseFetch::Revoked));
+        assert!(matches!(
+            cp.fetch_lease(&state()).await,
+            LeaseFetch::Revoked
+        ));
         mock.push(
             path,
             Reply::json(
@@ -495,9 +503,15 @@ pub(crate) mod tests {
             LeaseFetch::Unauthorized
         ));
         mock.push(path, Reply::status(500));
-        assert!(matches!(cp.fetch_lease(&state()).await, LeaseFetch::Failed(_)));
+        assert!(matches!(
+            cp.fetch_lease(&state()).await,
+            LeaseFetch::Failed(_)
+        ));
         mock.push(path, Reply::Hangup);
-        assert!(matches!(cp.fetch_lease(&state()).await, LeaseFetch::Failed(_)));
+        assert!(matches!(
+            cp.fetch_lease(&state()).await,
+            LeaseFetch::Failed(_)
+        ));
         mock.push(
             path,
             Reply::Status {
@@ -535,12 +549,8 @@ pub(crate) mod tests {
         let mock = MockServer::start().await;
         let (cp, _) = enrolled(&mock).await;
         let path = "/roxy/v1/flows";
-        let body = crate::protocol::encode_flow_batch(
-            "node-1",
-            "L1",
-            5,
-            [r#"{"seq":5}"#, r#"{"seq":6}"#],
-        );
+        let body =
+            crate::protocol::encode_flow_batch("node-1", "L1", 5, [r#"{"seq":5}"#, r#"{"seq":6}"#]);
         mock.push(path, Reply::json(200, &FlowAck { acked_through: 6 }));
         assert!(matches!(
             cp.ship_flows(&body).await,

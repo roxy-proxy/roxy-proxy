@@ -38,15 +38,12 @@ const DROPPED: &[&str] = &[
     "content-length",
 ];
 
-/// `value` with its `${secret:name}` references expanded from the policy
-/// snapshot's secrets; `None` if one is missing or the value does not
-/// parse (validation refuses such a config, so this is a missing secret).
-pub(super) fn expand(
-    value: &str,
-    secrets: &std::collections::HashMap<String, String>,
-) -> Option<String> {
+/// `value` with its `${secret:name}` references expanded from the live
+/// secret store; `None` if one is missing or the value does not parse
+/// (validation refuses such a config, so this is a missing secret).
+pub(super) fn expand(value: &str, secret: impl Fn(&str) -> Option<String>) -> Option<String> {
     let parts = roxy_rules::parse_template(value).ok()?;
-    roxy_rules::expand(&parts, |name| secrets.get(name).cloned())
+    roxy_rules::expand(&parts, secret)
 }
 
 /// The URL for a call. `fixed`: the endpoint's URL as configured. `prefix`:
@@ -138,7 +135,7 @@ pub(crate) async fn call(
         layer: addon.name.clone(),
         endpoint: name.to_owned(),
         method: method.to_string(),
-        path: st.snap.redactor.redact_str(&path).into_owned(),
+        path: st.snap.secrets.redactor().redact_str(&path).into_owned(),
         status,
         attempts,
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -168,7 +165,7 @@ async fn attempt_all(
         }
     }
     for (n, v) in &spec.headers {
-        let v = expand(v, &st.snap.secrets)
+        let v = expand(v, |name| st.snap.secrets.get(name))
             .ok_or_else(|| fail(format!("endpoint header {n}: secret not loaded")))?;
         let v = HeaderValue::from_str(&v).map_err(|_| fail(format!("endpoint header {n}")))?;
         headers.insert(n.clone(), v);
@@ -353,13 +350,12 @@ mod tests {
 
     #[test]
     fn expands_secrets() {
-        let mut s = std::collections::HashMap::new();
-        s.insert("k".to_owned(), "sk-1".to_owned());
+        let s = |name: &str| (name == "k").then(|| "sk-1".to_owned());
         assert_eq!(
-            expand("Bearer ${secret:k}", &s).as_deref(),
+            expand("Bearer ${secret:k}", s).as_deref(),
             Some("Bearer sk-1")
         );
-        assert_eq!(expand("${secret:missing}", &s), None);
-        assert_eq!(expand("plain", &s).as_deref(), Some("plain"));
+        assert_eq!(expand("${secret:missing}", s), None);
+        assert_eq!(expand("plain", s).as_deref(), Some("plain"));
     }
 }

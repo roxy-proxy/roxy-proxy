@@ -414,23 +414,32 @@ pub enum SecretSource {
     Env(String),
     /// `{ file: /path }`; one trailing newline is stripped.
     File(PathBuf),
+    /// `{ lease: true }`: the value arrives with the control-plane lease at
+    /// runtime. `roxy run --config` has no lease, so it refuses the config.
+    Lease,
 }
 
-/// YAML shape of [`SecretSource`]: a map with exactly one of `env` / `file`.
+/// YAML shape of [`SecretSource`]: a map with exactly one of `env` / `file`
+/// / `lease`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSecretSource {
     env: Option<String>,
     file: Option<PathBuf>,
+    lease: Option<bool>,
 }
 
 impl TryFrom<RawSecretSource> for SecretSource {
     type Error = &'static str;
     fn try_from(raw: RawSecretSource) -> Result<Self, Self::Error> {
-        match (raw.env, raw.file) {
-            (Some(env), None) => Ok(Self::Env(env)),
-            (None, Some(file)) => Ok(Self::File(file)),
-            _ => Err("a secret must have exactly one of `env` or `file`"),
+        match (raw.env, raw.file, raw.lease) {
+            (Some(env), None, None) => Ok(Self::Env(env)),
+            (None, Some(file), None) => Ok(Self::File(file)),
+            (None, None, Some(true)) => Ok(Self::Lease),
+            (None, None, Some(false)) => {
+                Err("`lease: false` names no source; use `env` or `file` instead")
+            }
+            _ => Err("a secret must have exactly one of `env`, `file` or `lease: true`"),
         }
     }
 }
