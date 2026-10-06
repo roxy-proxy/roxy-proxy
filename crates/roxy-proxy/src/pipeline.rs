@@ -30,8 +30,8 @@ use http::StatusCode;
 use roxy_http::h1::ServerConn;
 use roxy_http::url::{normalize_path, normalize_query};
 use roxy_http::{
-    Authority, Body, BodyError, CanonicalRequest, CanonicalResponse, DriveError, Method, ParseError,
-    Query, Reason, Scheme, status_forbids_body,
+    Authority, Body, BodyError, CanonicalRequest, CanonicalResponse, DriveError, Method,
+    ParseError, Query, Reason, Scheme, status_forbids_body,
 };
 use roxy_rules::{
     AllowOpts, CaptureTarget, DEFAULT_DENY_MESSAGE, Decision, Deny, DenyStatus, Effect,
@@ -853,9 +853,10 @@ fn reserve_inspection(cx: &FlowCx, body: &Body, cap: u64) -> Option<BufferLease>
 /// bytes as sent (they go on to be forwarded) and, if `content-encoding`
 /// was decoded, the text the facts carry, which can be larger.
 fn buffered_bytes(sent: &Bytes, inspected: &Inspected) -> u64 {
-    let text = match inspected {
-        Inspected::Text(t) => t.len(),
-        _ => 0,
+    let text = if let Inspected::Text(t) = inspected {
+        t.len()
+    } else {
+        0
     };
     sent.len().max(text) as u64
 }

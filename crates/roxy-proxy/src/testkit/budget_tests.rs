@@ -1,12 +1,15 @@
-//! The buffer budget: an exchange that inspects reserves its cap before
-//! it buffers, so the exchanges holding a buffer at once are bounded by
-//! `max_buffered_bytes`, and one the budget cannot cover fails closed
-//! rather than waiting. An observer's copy is charged for what it has
-//! queued, and cut when the budget cannot cover its next frame.
+//! The buffer budget: an exchange that inspects reserves what its body can
+//! need before it buffers, so the exchanges holding a buffer at once are
+//! bounded by `max_buffered_bytes`, and one the budget cannot cover fails
+//! closed rather than waiting. A body known to be empty reserves nothing.
+//! An observer's copy is charged for what it has queued, and cut when the
+//! budget cannot cover its next frame.
 
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::{SinkExt as _, StreamExt as _};
+use tokio_tungstenite::tungstenite::Message;
 
 use super::{Kit, streaming_body};
 use crate::addons::AddonMode;
@@ -22,6 +25,18 @@ const BODY_RULES: &str = r#"
 "#;
 
 const ALLOW: &str = r#"
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+
+const BODY_RULES_WS: &str = r#"
+- id: no-secret-out
+  when: host == "up.test" and body.text contains "SECRET"
+  then: deny
+- id: ws
+  when: host == "up.test" and path starts_with "/ws"
+  then: { allow: { upgrade: websocket } }
 - id: up
   when: host == "up.test"
   then: allow
@@ -86,6 +101,112 @@ async fn stalled_uploads_fill_the_budget_and_the_next_is_refused() {
     tx.finish().await.unwrap();
     assert_eq!(answer.await.unwrap().unwrap().status, 200);
     until_buffered(&kit, 0).await;
+}
+
+/// A request with no body holds none of the budget however long its
+/// exchange lasts: with room for two inspected bodies, three bodiless GETs
+/// to a slow upstream are all forwarded, and an upload is still admitted
+/// while their responses stream.
+#[tokio::test]
+async fn bodiless_requests_reserve_nothing() {
+    let kit = Kit::builder()
+        .rules(BODY_RULES)
+        .limits(|l| {
+            l.max_inspect_body_bytes = CAP;
+            l.max_buffered_bytes = 2 * CAP;
+        })
+        .start()
+        .await;
+    let mut open = Vec::new();
+    for _ in 0..3 {
+        let mut c = kit.h1().await;
+        let req = c
+            .request("GET", "/drip?n=2&ms=2000", &[])
+            .body(roxy_http::Body::empty())
+            .unwrap();
+        let answer = c.start(req);
+        open.push((c, answer));
+    }
+    kit.upstream.wait_seen(3).await;
+    assert_eq!(kit.server.shared().buffered(), 0);
+
+    let (mut tx, body) = streaming_body();
+    let mut c = kit.h1().await;
+    let req = c.request("POST", "/x", &[]).body(body).unwrap();
+    let answer = c.start(req);
+    tx.send_data(Bytes::from_static(b"an upload"))
+        .await
+        .unwrap();
+    until_buffered(&kit, CAP).await;
+    tx.finish().await.unwrap();
+    let a = answer.await.unwrap().unwrap();
+    assert_eq!(a.status, 200, "{a:?}");
+    // A declared length reserves that much, and a complete body only what
+    // it holds.
+    assert_eq!(kit.server.shared().buffered(), 0);
+
+    for (_c, answer) in open {
+        let a = answer.await.unwrap().unwrap();
+        assert_eq!(a.status, 200, "{a:?}");
+        assert_eq!(a.text(), "chunk0;chunk1;");
+    }
+}
+
+/// A body with a declared length reserves that length, not the cap, and a
+/// buffered body is charged for what it holds while the exchange runs.
+#[tokio::test]
+async fn a_declared_length_reserves_only_that_much() {
+    let kit = Kit::builder()
+        .rules(BODY_RULES)
+        .limits(|l| {
+            l.max_inspect_body_bytes = CAP;
+            l.max_buffered_bytes = 2 * CAP;
+        })
+        .start()
+        .await;
+    let mut open = Vec::new();
+    for _ in 0..3 {
+        let mut c = kit.h1().await;
+        let req = c
+            .request("POST", "/drip?n=2&ms=2000", &[("content-length", "9")])
+            .body(roxy_http::Body::from_bytes(Bytes::from_static(
+                b"an upload",
+            )))
+            .unwrap();
+        let answer = c.start(req);
+        open.push((c, answer));
+    }
+    kit.upstream.wait_seen(3).await;
+    assert_eq!(kit.server.shared().buffered(), 3 * 9);
+    for (_c, answer) in open {
+        let a = answer.await.unwrap().unwrap();
+        assert_eq!(a.status, 200, "{a:?}");
+    }
+    until_buffered(&kit, 0).await;
+}
+
+/// A WebSocket under a body-reading policy is a bodiless GET answered with
+/// a `101`: it holds none of the budget for the life of the session.
+#[tokio::test]
+async fn a_websocket_under_a_body_policy_holds_no_lease() {
+    let kit = Kit::builder()
+        .rules(BODY_RULES_WS)
+        .limits(|l| {
+            l.max_inspect_body_bytes = CAP;
+            l.max_buffered_bytes = 2 * CAP;
+        })
+        .start()
+        .await;
+    let mut ws = kit.ws("/ws/echo", &[("x-echo", "frames")]).await;
+    assert_eq!(kit.server.shared().buffered(), 0);
+    ws.send(Message::Text("hello".into())).await.unwrap();
+    let echoed = tokio::time::timeout(Duration::from_secs(10), ws.next())
+        .await
+        .expect("no echo")
+        .unwrap()
+        .unwrap();
+    assert_eq!(echoed, Message::Text("hello".into()));
+    assert_eq!(kit.server.shared().buffered(), 0);
 }
 
 /// An observer's copy is charged for what it has queued, not for its
