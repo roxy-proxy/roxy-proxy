@@ -110,3 +110,30 @@ fn rejects_unknown_names() {
     let err = try_condition("host ==").unwrap_err().join("\n");
     assert!(err.starts_with("addons[0].when"), "{err}");
 }
+
+/// A flat `or`/`and` chain parses left-deep and is not nested in the
+/// parser's sense, so its length must not drive recursion in the compiler
+/// or in `Display`.
+#[test]
+fn long_flat_chain_compiles_on_a_small_stack() {
+    let run = |op: &'static str| {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let link = r#"host == "a""#;
+                // Just over 60 KiB, under the 64 KiB expression limit.
+                let links = 60 * 1024 / (link.len() + op.len() + 2) + 1;
+                let src = vec![link; links].join(&format!(" {op} "));
+                assert!(src.len() >= 60 * 1024);
+                assert_eq!(roxy_rules::parse(&src).unwrap().to_string(), src);
+                let c = condition(&src);
+                assert_eq!(c.matches(&post("a", "/"), &[]), Ok(true));
+                assert_eq!(c.matches(&post("b", "/"), &[]), Ok(false));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    };
+    run("or");
+    run("and");
+}

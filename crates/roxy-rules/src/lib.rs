@@ -172,7 +172,8 @@ pub use config::{
 pub use diag::{Diagnostic, RuleId, Span};
 pub use eval::{
     AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Deny, DenyStatus, Effect,
-    EvalContext, FAIL_CLOSED_STATUS, FailClosedReason, Outcome, WatchEffect, WatchOutcome,
+    EvalContext, FAIL_CLOSED_STATUS, FailClosedReason, Outcome, SetHeaderValue, WatchEffect,
+    WatchOutcome,
 };
 pub use metrics::{
     CarryOverReport, Clock, DEFAULT_MAX_METRIC_BYTES, DEFAULT_MAX_METRIC_KEYS, MetricError,

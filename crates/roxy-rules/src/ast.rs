@@ -252,18 +252,7 @@ impl Node {
             f.write_char('(')?;
         }
         match &self.expr {
-            // Left-associative: the right child of `a or b` needs parens if
-            // it is itself an `or`, so the tree shape survives a round trip.
-            Expr::Or(a, b) => {
-                a.write_prec(1, f)?;
-                f.write_str(" or ")?;
-                b.write_prec(2, f)?;
-            }
-            Expr::And(a, b) => {
-                a.write_prec(2, f)?;
-                f.write_str(" and ")?;
-                b.write_prec(3, f)?;
-            }
+            Expr::Or(..) | Expr::And(..) => self.write_chain(f)?,
             Expr::Not(a) => {
                 f.write_str("not ")?;
                 // `not (a in [..])` rather than `not a in [..]`, which reads
@@ -280,6 +269,39 @@ impl Node {
         }
         if paren {
             f.write_char(')')?;
+        }
+        Ok(())
+    }
+
+    /// An `or` (`and`) chain, which the parser builds left-deep without
+    /// counting its links against the nesting limit: the left spine is
+    /// walked iteratively so a long flat chain does not recurse per link.
+    /// Left-associative: the right child of `a or b` needs parens if it is
+    /// itself an `or`, so the tree shape survives a round trip.
+    fn write_chain(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let or = matches!(self.expr, Expr::Or(..));
+        let (sep, left_min, right_min) = if or { (" or ", 1, 2) } else { (" and ", 2, 3) };
+        let mut rights = Vec::new();
+        let mut node = self;
+        loop {
+            match &node.expr {
+                Expr::Or(a, b) if or => {
+                    rights.push(b);
+                    node = a;
+                }
+                Expr::And(a, b) if !or => {
+                    rights.push(b);
+                    node = a;
+                }
+                Expr::Or(..) | Expr::And(..) | Expr::Not(_) | Expr::Cmp { .. } | Expr::Pred(_) => {
+                    break;
+                }
+            }
+        }
+        node.write_prec(left_min, f)?;
+        for b in rights.into_iter().rev() {
+            f.write_str(sep)?;
+            b.write_prec(right_min, f)?;
         }
         Ok(())
     }

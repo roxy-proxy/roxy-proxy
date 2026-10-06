@@ -21,7 +21,7 @@ use crate::config::{
 use crate::diag::{Diagnostic, RuleId};
 use crate::eval::{
     AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Deny, DenyStatus, Effect,
-    WatchEffect,
+    SetHeaderValue, WatchEffect,
 };
 use crate::lexer::is_ident;
 use crate::template::{Part, literal, mentions_secret, parse_template, secret_names};
@@ -791,11 +791,11 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             out.push(match parts.as_slice() {
                 [] => CAction::Effect(Effect::SetHeader {
                     name,
-                    value: String::new(),
+                    value: SetHeaderValue::literal(""),
                 }),
                 [Part::Lit(s)] => CAction::Effect(Effect::SetHeader {
                     name,
-                    value: s.clone(),
+                    value: SetHeaderValue::literal(s.as_str()),
                 }),
                 _ => CAction::SetHeader { name, parts },
             });

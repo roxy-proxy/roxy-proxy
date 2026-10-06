@@ -12,8 +12,8 @@ use roxy_proxy::Redactor;
 use roxy_proxy::addr::{AddressDenied, PrivateAddrs};
 use roxy_proxy::addrlist::AddressLists;
 use roxy_rules::{
-    BodyText, Decision, EvalContext, Field, FlowView, MapView, Outcome, Policy, Reads, RuleId,
-    RuleKind, Value, WatchOutcome,
+    BodyText, Decision, Effect, EvalContext, Field, FlowView, MapView, Outcome, Policy, Reads,
+    RuleId, RuleKind, Value, WatchOutcome,
 };
 
 use crate::config::{Config, ListenerMode};
@@ -637,13 +637,20 @@ pub fn report(
         "matched:  {}",
         list(out.matched.iter().map(ToString::to_string).collect())
     );
-    let effects = |s: &mut String, effects: &[roxy_rules::Effect]| {
+    let effects = |s: &mut String, effects: &[Effect]| {
         if effects.is_empty() {
             let _ = writeln!(s, "effects:  (none)");
         } else {
             let _ = writeln!(s, "effects:");
             for e in effects {
-                let _ = writeln!(s, "  - {}", redactor.redact_str(&e.to_string()));
+                // A dry run resolves secrets to `[secret:name]` placeholders,
+                // which the report shows rather than the redacted form.
+                let text = if let Effect::SetHeader { name, value } = e {
+                    format!("set_header {name}: {}", value.as_str())
+                } else {
+                    e.to_string()
+                };
+                let _ = writeln!(s, "  - {}", redactor.redact_str(&text));
             }
         }
     };

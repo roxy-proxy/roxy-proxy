@@ -33,7 +33,9 @@ allowed inside multi-line YAML block scalars. Size units are 1024-based
 
 String comparisons are byte-exact, with one exception: operands involving
 `host`, `tls.sni` or `scheme` compare ASCII case-insensitively (for every
-operator, including `like`, `matches` and `in`). `method` compares exactly,
+operator, including `like`, `matches` and `in`). `under` is ASCII
+case-insensitive whatever its left operand, because it compares domain
+names. `method` compares exactly,
 because HTTP methods are case-sensitive: a request with method `get` is
 forwarded as an extension method, may carry a body, and does not match
 `method == GET` or `method in [GET, HEAD]`. Header names in `header["X-Y"]`
@@ -59,7 +61,7 @@ fields become known later, so rules that read them watch.
 | `header["name"]`, `header.all["name"]` | string, list | head |
 | `body.size` | int: declared length, `null` if undeclared (chunked) | head |
 | `body.text` | string: the buffered body, up to the cap | head |
-| `metric.<id>` | int | head, and watched for byte metrics |
+| `metric.<id>` | int | head; a `deny` reading a byte metric also watches it ([rate limits](/policies/rate-limits#metrics)) |
 | `state["key"]`, `tag["name"]` | string, bool | head |
 | `body.bytes` | int: request body bytes so far | watched |
 | `response.status`, `response.header["name"]`, `response.header.all["name"]` | int, string, list | watched |
@@ -77,7 +79,8 @@ WebSocket extensions so messages stay readable.
 
 A value that is not present is `null`: an unsent header or query parameter,
 an unset state key, `tls.sni` from a client that sent none, `body.size`
-for a chunked body.
+for a chunked body. A tag is never `null`: `tag["x"]` is `false` until a
+rule or addon sets it, so `tag["x"] == null` is always false.
 
 > `null` is equal only to `null`, so `==`, `!=`, `in` and `not in` treat it
 > as an ordinary value. Any other operator on `null` is an error, and an
