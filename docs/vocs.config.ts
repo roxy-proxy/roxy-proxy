@@ -1,65 +1,20 @@
-import { defineConfig } from "vocs";
-
-// Light only. One accent, a deep teal, with neutral greys around it.
-const accent = "#0f766e";
-const accentHover = "#115e59";
+import { defineConfig } from "vocs/config";
 
 export default defineConfig({
   title: "roxy",
   description: "A strict, programmable HTTP firewall and egress proxy.",
-  rootDir: ".",
-  aiCta: false,
+  // Pages live in docs/pages rather than the default src/pages.
+  srcDir: ".",
   // GitHub Pages serves the site from /roxy-proxy/. Local dev overrides it.
   basePath: process.env.ROXY_DOCS_BASE ?? "/roxy-proxy",
-  font: {
-    google: "Inter",
-    mono: { google: "JetBrains Mono" },
-  },
+  renderStrategy: "full-static",
+  colorScheme: "light",
+  // Deep teal; the rest of the palette is in pages/_root.css.
+  accentColor: "#0f766e",
   socials: [{ icon: "github", link: "https://github.com/roxy-proxy/roxy-proxy" }],
   editLink: {
-    pattern: "https://github.com/roxy-proxy/roxy-proxy/edit/main/docs/pages/:path",
+    link: "https://github.com/roxy-proxy/roxy-proxy/edit/main/docs/pages/:path",
     text: "Edit on GitHub",
-  },
-  theme: {
-    colorScheme: "light",
-    accentColor: accent,
-    variables: {
-      color: {
-        background: "#ffffff",
-        background2: "#f8f9f8",
-        background3: "#f3f5f4",
-        background4: "#eceeed",
-        background5: "#e3e6e5",
-        backgroundDark: "#f8f9f8",
-        backgroundAccent: accent,
-        backgroundAccentHover: accentHover,
-        backgroundAccentText: "#ffffff",
-        border: "#e6e8e7",
-        border2: "#cfd4d2",
-        borderAccent: accent,
-        heading: "#16201e",
-        text: "#3d4846",
-        text2: "#5f6b68",
-        text3: "#7e8986",
-        text4: "#b6bdbb",
-        textAccent: accent,
-        textAccentHover: accentHover,
-        link: accent,
-        linkHover: accentHover,
-        codeBlockBackground: "#f8f9f8",
-        codeInlineBackground: "#f1f4f3",
-        codeInlineBorder: "#e3e6e5",
-        codeInlineText: "#16201e",
-        codeTitleBackground: "#f1f4f3",
-        infoBackground: "#0f766e0f",
-        infoBorder: "#0f766e40",
-        infoText: accentHover,
-        tableBorder: "#e6e8e7",
-        tableHeaderBackground: "#f3f5f4",
-        tableHeaderText: "#16201e",
-        hr: "#e6e8e7",
-      },
-    },
   },
   sidebar: [
     { text: "Overview", link: "/" },
