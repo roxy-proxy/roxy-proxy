@@ -54,6 +54,7 @@ limits:
 
   # buffering
   max_inspect_body_bytes: 1mb     # body.text / response.body.text, and addons' default
+  max_sign_body_bytes: 100mb      # a request body hashed for sign: aws_sigv4; larger is 413
   max_capture_body_bytes: 16mb    # per direction per exchange
   max_ws_message_bytes: 16mb      # a reassembled WebSocket message, when rules read ws.*
   max_observer_lag_bytes: 16mb    # how far behind an observe-mode addon may fall, per direction
@@ -94,7 +95,7 @@ for it, so an observer that keeps up sees every body in full however
 large, and one with more than that many bytes unread has the copy cut
 ([addon modes](/addons/overview#modes)).
 
-`max_buffered_bytes` bounds those three buffers in aggregate; each is
+`max_buffered_bytes` bounds those buffers in aggregate; each is
 bounded per exchange, and without it the only bound on exchanges is the
 connection caps. An exchange reserves before it fills a buffer, and a
 reservation the budget cannot cover fails at once, with no waiting and no
@@ -108,6 +109,10 @@ eviction: the exchange fails closed (`503`, `_fail_closed`,
   reservation shrinks to what is held (the body as sent, or its decoded
   text if larger), and that stays reserved until the exchange ends, since
   the text stays with the exchange for its rules and log.
+- A request body hashed for `sign: aws_sigv4` reserves
+  `max_sign_body_bytes`, or its `content-length` if that is smaller, until
+  the exchange ends ([signing AWS requests](/policies/secrets#signing-aws-requests)).
+  With `unsigned_payload: true` the body streams and reserves nothing.
 - A WebSocket whose messages rules read reserves twice
   `max_ws_message_bytes` at the upgrade and holds it for the session. A
   WebSocket under a policy that reads bodies but not messages holds
@@ -136,7 +141,7 @@ The limits that shape the client-facing codec (`max_header_bytes`,
 the `http.*` flags are fixed for a connection when it is accepted, on
 HTTP/1.1 and HTTP/2 alike; a reload changes them for new connections only.
 Everything decided per exchange (`max_inspect_body_bytes`,
-`max_response_body_bytes`, `response_header_timeout`, the WebSocket limits,
+`max_sign_body_bytes`, `max_response_body_bytes`, `response_header_timeout`, the WebSocket limits,
 `max_observer_lag_bytes`, the policy itself) comes from the snapshot the exchange starts under, so an
 exchange on an old connection runs under the current values.
 `max_buffered_bytes` is process-wide: each reservation is checked against

@@ -22,6 +22,9 @@ pub struct Limits {
     pub max_response_body_bytes: u64,
     /// Cap for bodies buffered for inspection (`Body::collect_up_to`).
     pub max_inspect_body_bytes: u64,
+    /// Cap for a request body buffered to hash it for `sign: aws_sigv4`;
+    /// a larger body is refused with 413.
+    pub max_sign_body_bytes: u64,
     /// Cap for a reassembled WebSocket message when rules read messages
     /// (`ws::frame::Decoder`).
     pub max_ws_message_bytes: u64,
@@ -58,6 +61,7 @@ impl Default for Limits {
             max_request_body_bytes: GIB,
             max_response_body_bytes: GIB,
             max_inspect_body_bytes: MIB,
+            max_sign_body_bytes: 100 * MIB,
             max_ws_message_bytes: 16 * MIB,
             max_observer_lag_bytes: 16 * MIB,
             max_buffered_bytes: GIB,

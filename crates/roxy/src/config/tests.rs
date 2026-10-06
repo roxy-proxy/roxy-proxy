@@ -104,6 +104,7 @@ fn minimal_config_uses_defaults() {
     assert_eq!(l.max_request_body_bytes.as_u64(), 1 << 30);
     assert_eq!(l.max_response_body_bytes.as_u64(), 1 << 30);
     assert_eq!(l.max_inspect_body_bytes.as_u64(), 1 << 20);
+    assert_eq!(l.max_sign_body_bytes.as_u64(), 100 << 20);
     assert_eq!(l.max_ws_message_bytes.as_u64(), 16 << 20);
     assert_eq!(l.max_observer_lag_bytes.as_u64(), 16 << 20);
     assert_eq!(l.max_buffered_bytes.as_u64(), 1 << 30);

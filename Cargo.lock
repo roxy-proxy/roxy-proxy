@@ -250,6 +250,7 @@ dependencies = [
  "form_urlencoded",
  "hex",
  "hmac",
+ "http",
  "percent-encoding",
  "sha2 0.11.0",
  "time",
@@ -2998,7 +2999,9 @@ name = "roxy-proxy"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "aws-credential-types",
  "aws-sigv4",
+ "aws-smithy-runtime-api",
  "bytes",
  "chrono",
  "criterion",

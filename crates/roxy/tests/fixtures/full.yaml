@@ -42,6 +42,7 @@ limits:
   max_request_body_bytes: 1gb
   max_response_body_bytes: 1gb
   max_inspect_body_bytes: 1mb   # only buffered when a rule/addon needs body content
+  max_sign_body_bytes: 100mb    # a request body hashed for sign: aws_sigv4
   header_timeout: 10s
   body_idle_timeout: 30s          # the client's stall: sending its body, taking the response
   response_body_idle_timeout: 5m  # the upstream's stall between response body chunks
