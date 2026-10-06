@@ -66,6 +66,11 @@ enum Command {
         #[command(subcommand)]
         command: RuleCommand,
     },
+    /// Compose policy layers onto a per-node base.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
     /// Probe a health endpoint (`ca_server`'s `/healthz`) for container
     /// health checks, where there is no shell or curl. Exits 0 on a `200`
     /// response and 1 on anything else.
@@ -112,6 +117,49 @@ enum RuleCommand {
     /// rules, effects and the decision; exits 0 for allow, 3 for deny.
     /// Secrets are not resolved (`[secret:name]` placeholders).
     Test(Box<RuleTestArgs>),
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    /// Render the layers onto the base into one config, after running every
+    /// layer's tests against the result. A failing deny test is an error; a
+    /// failing allow test is a warning.
+    Render(PolicyRenderArgs),
+    /// Render and run the layers' tests, writing nothing.
+    Test(PolicyArgs),
+}
+
+#[derive(Debug, Args)]
+struct PolicyArgs {
+    /// The per-node config: everything but rules, metrics, address lists
+    /// and addons; its `secrets` give the sources of the layers' secrets.
+    #[arg(long)]
+    base: PathBuf,
+    /// A layer, repeatable; the first is outermost. Named by its `name:`
+    /// or its file stem.
+    #[arg(long = "layer", required = true)]
+    layers: Vec<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct PolicyRenderArgs {
+    #[command(flatten)]
+    inputs: PolicyArgs,
+    /// Write the config here instead of stdout.
+    #[arg(long, short = 'o')]
+    output: Option<PathBuf>,
+    /// Print the inputs' content hash (also the output's first line).
+    #[arg(long, requires = "output")]
+    print_hash: bool,
+}
+
+impl From<PolicyArgs> for roxy::policy::Inputs {
+    fn from(a: PolicyArgs) -> Self {
+        Self {
+            base: a.base,
+            layers: a.layers,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -203,6 +251,16 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Rule {
             command: RuleCommand::Test(args),
         } => rule_test(&args),
+        Command::Policy {
+            command: PolicyCommand::Render(args),
+        } => roxy::policy::render_command(
+            &args.inputs.into(),
+            args.output.as_deref(),
+            args.print_hash,
+        ),
+        Command::Policy {
+            command: PolicyCommand::Test(args),
+        } => roxy::policy::test_command(&args.into()),
         Command::Health(args) => health(&args.url, Duration::from_secs(args.timeout.max(1))),
     }
 }

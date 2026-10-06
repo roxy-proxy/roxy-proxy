@@ -1,0 +1,37 @@
+# The organisation's layer: the ceiling every proxy runs under.
+name: org
+metrics:
+  - { id: github_writes, count: requests, where: 'host under "github.com" and method in [POST, PUT, PATCH, DELETE]', key: [client.ip], window: 1h }
+address_lists:
+  - { name: internal, inline: [10.0.0.0/8] }
+secrets: [github_token]
+rules:
+  - id: ceiling
+    when: not host under "github.com"
+    then: deny
+  - id: mark-writes
+    when: method in [POST, PUT, PATCH, DELETE]
+    then: { tag: write }
+  - id: write-budget
+    when: metric.github_writes > 100 and client.ip not in @internal
+    then: { deny: { status: 429 } }
+  - id: github
+    when: host under "github.com"
+    then:
+      - set_header: { authorization: "Bearer ${secret:github_token}" }
+      - allow
+tests:
+  - name: outside github is denied
+    request: GET https://example.com/
+    expect: deny
+    rule: ceiling
+  - name: reads are allowed
+    request: GET https://api.github.com/repos/a/b
+    expect: allow
+    rule: github
+  - name: the write budget holds
+    request: POST https://api.github.com/repos/a/b/issues
+    client_ip: 203.0.113.9
+    metrics: { github_writes: 101 }
+    expect: deny
+    rule: write-budget

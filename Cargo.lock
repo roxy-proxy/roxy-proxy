@@ -2481,6 +2481,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "roxy-http",
+ "roxy-policy",
  "roxy-proxy",
  "roxy-rules",
  "roxy-tls",

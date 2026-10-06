@@ -1,0 +1,8 @@
+# Per-node configuration: what a layer may not carry.
+version: 1
+listeners:
+  - { name: proxy, bind: 127.0.0.1:0 }
+tls:
+  ca_dir: /tmp/roxy-policy-fixture-ca
+secrets:
+  "org:github_token": { env: GITHUB_TOKEN }

@@ -1,0 +1,17 @@
+# A per-proxy layer: narrows the org's policy and reads its tag.
+rules:
+  - id: no-deletes
+    when: tag["write"] and method == DELETE
+    then: deny
+  - id: trace-writes
+    when: tag["write"] and metric.org__github_writes > 50
+    then: { log: { level: warn, message: "write budget half used" } }
+tests:
+  - name: deletes are denied here
+    request: DELETE https://api.github.com/repos/a/b
+    expect: deny
+    rule: no-deletes
+  - name: the org's reads still work
+    request: GET https://api.github.com/repos/a/b
+    expect: allow
+    rule: org:github
