@@ -333,6 +333,42 @@ fn run_fails_on_missing_secret() {
     );
 }
 
+/// A sourceless secret is for whatever loads the policy to supply. `check`
+/// never resolves secrets, so it passes; standalone `run` has nothing to
+/// supply it and refuses, naming the secret, before it touches the CA dir.
+#[test]
+fn sourceless_secret_passes_check_and_fails_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("roxy.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:3128 }}]\n\
+             tls: {{ ca_dir: {:?} }}\nsecrets: {{ lease_token: {{}} }}\n\
+             rules: [{{ id: r, when: true, then: [{{ set_header: {{ authorization: \"Bearer ${{secret:lease_token}}\" }} }}, allow] }}]\n",
+            dir.path().join("ca").to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let out = roxy(&["check", "--config", cfg.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("1 secret(s)"),
+        "{}",
+        text(&out.stdout)
+    );
+
+    let out = roxy(&["run", "--config", cfg.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = text(&out.stderr);
+    assert!(err.contains("\"lease_token\""), "{err}");
+    assert!(err.contains("supplied at runtime"), "{err}");
+    assert!(
+        !dir.path().join("ca").exists(),
+        "no CA before secrets resolve"
+    );
+}
+
 #[test]
 fn check_warns_on_client_chosen_metric_keys() {
     let dir = tempfile::tempdir().unwrap();
