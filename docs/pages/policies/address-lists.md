@@ -90,6 +90,10 @@ address_lists:
 - **Reload.** List files are watched with the config. A changed file is
   recompiled and swapped with the policy, and the upstream connection pools
   are flushed, so a pooled connection to a newly denied IP is never reused.
+  An exchange already in flight keeps the policy it started under until it
+  ends, including its pools and lists, so it can still open a connection
+  the new lists would deny. The window is that one exchange; the next one
+  on the connection uses the new lists.
 - `roxy check` reports the entry count of each list. `roxy rule test` loads
   the lists as `roxy run` would; if any fails to load it warns and treats
   every `@list` as unavailable, so a rule reading one fails closed.
