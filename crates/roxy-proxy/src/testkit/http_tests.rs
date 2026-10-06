@@ -7,7 +7,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::io::AsyncWriteExt as _;
 
-use super::{Answer, Kit, LogGate, read_response, streaming_body};
+use super::{Answer, Kit, LogGate, read_response, sha256_hex, streaming_body};
 
 const SOFT_DENY: &str = r#"
 - id: soft
@@ -256,6 +256,80 @@ async fn h1_large_uploads_stream_intact() {
 #[tokio::test]
 async fn h2_large_uploads_stream_intact() {
     large_uploads_stream_intact(true).await;
+}
+
+/// The `request` record digests each body as forwarded: a request body
+/// sent whole or in chunks, the echoed response, and the empty body of a
+/// bare GET.
+async fn the_request_record_digests_both_bodies(h2: bool) {
+    let kit = Kit::builder().start().await;
+    let mut c = h2_or_h1(&kit, h2).await;
+    let data: Vec<u8> = (0..100 * 1024u32).map(|i| (i % 241) as u8).collect();
+    let req = c
+        .request("POST", "/echo", &[])
+        .body(roxy_http::Body::from_bytes(Bytes::from(data.clone())))
+        .unwrap();
+    let a = Answer::read(c.send(req).await.unwrap()).await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.body.as_deref().ok(), Some(&data[..]));
+
+    let (mut tx, body) = streaming_body();
+    let req = c.request("POST", "/echo", &[]).body(body).unwrap();
+    let pending = c.start(req);
+    for chunk in data.chunks(7 * 1024) {
+        tx.send_data(Bytes::copy_from_slice(chunk)).await.unwrap();
+    }
+    tx.finish().await.unwrap();
+    let a = pending.await.unwrap().unwrap();
+    assert_eq!(a.status, 200, "{a:?}");
+
+    let a = c.call("GET", "/nothing", &[], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let answer = a.body.unwrap();
+
+    let ev = kit.events("request", 3).await;
+    let digest = sha256_hex(&data);
+    for e in &ev[..2] {
+        assert_eq!(e["req"]["body_bytes"], data.len(), "{e:#}");
+        assert_eq!(e["req"]["body_sha256"], digest, "{e:#}");
+        assert_eq!(e["res"]["body_sha256"], digest, "{e:#}");
+    }
+    assert_eq!(
+        ev[2]["req"]["body_sha256"],
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "{:#}",
+        ev[2]
+    );
+    assert_eq!(
+        ev[2]["res"]["body_sha256"],
+        sha256_hex(&answer),
+        "{:#}",
+        ev[2]
+    );
+}
+
+#[tokio::test]
+async fn h1_the_request_record_digests_both_bodies() {
+    the_request_record_digests_both_bodies(false).await;
+}
+
+#[tokio::test]
+async fn h2_the_request_record_digests_both_bodies() {
+    the_request_record_digests_both_bodies(true).await;
+}
+
+/// A response body the upstream cut short has no digest; the request body,
+/// which completed, keeps its own.
+#[tokio::test]
+async fn a_cut_response_body_has_no_digest() {
+    let kit = Kit::builder().start().await;
+    let a = kit.h1().await.call("POST", "/cut", &[], b"abc").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert!(a.body.is_err(), "{a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["req"]["body_sha256"], sha256_hex(b"abc"), "{ev:#}");
+    assert_eq!(ev["res"]["body_bytes"], 3, "{ev:#}");
+    assert!(ev["res"].get("body_sha256").is_none(), "{ev:#}");
 }
 
 /// The upstream gets body bytes while the client still holds the rest.

@@ -32,20 +32,26 @@ impl Tally {
     /// `None` while it is still flowing, and for good if it failed or was
     /// dropped before its end.
     pub(crate) fn sha256_hex(&self) -> Option<String> {
-        self.sha256.get().map(|d| {
-            use std::fmt::Write as _;
-            d.iter().fold(String::with_capacity(64), |mut s, b| {
-                let _ = write!(s, "{b:02x}");
-                s
-            })
-        })
+        self.sha256.get().map(|d| hex(d))
     }
+}
+
+/// Lower-case hex.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// Counts and digests data bytes as they pass through.
 struct Counted {
     inner: Body,
     tally: Arc<Tally>,
+    known: Option<u64>,
     /// The running digest; taken at the body's end, or discarded when the
     /// body fails.
     digest: Option<Digest>,
@@ -54,13 +60,16 @@ struct Counted {
 }
 
 impl Counted {
-    /// Publishes the digest if the body has reached its end. A consumer
-    /// may not poll again once the body says it has ended (hyper never
-    /// polls an empty one), so this runs after each frame and on drop.
+    /// Publishes the digest once the body is complete: it reported its
+    /// end, or every byte of its declared length has passed (a sender
+    /// that falls short fails the body instead). A consumer may not poll
+    /// again once it has what it needs (hyper never polls an empty body,
+    /// and its h1 client drops a body once the declared bytes are
+    /// written), so this runs after each frame and on drop.
     fn finish_if_ended(&mut self) {
-        if http_body::Body::is_end_stream(&self.inner)
-            && let Some(d) = self.digest.take()
-        {
+        let complete = http_body::Body::is_end_stream(&self.inner)
+            || self.known.is_some_and(|n| n == self.tally.bytes());
+        if complete && let Some(d) = self.digest.take() {
             let mut out = [0u8; 32];
             out.copy_from_slice(d.finish().as_ref());
             let _ = self.tally.sha256.set(out);
@@ -89,7 +98,9 @@ impl http_body::Body for Counted {
         match &r {
             Poll::Ready(Some(Ok(f))) => {
                 if let Some(d) = f.data_ref() {
-                    self.tally.bytes.fetch_add(d.len() as u64, Ordering::Relaxed);
+                    self.tally
+                        .bytes
+                        .fetch_add(d.len() as u64, Ordering::Relaxed);
                     if let Some(h) = self.digest.as_mut() {
                         h.update(d);
                     }
@@ -145,6 +156,7 @@ fn wrap_counted(body: Body, ended: Option<CancellationToken>) -> (Body, Arc<Tall
         Counted {
             inner: body,
             tally: tally.clone(),
+            known,
             digest: Some(Digest::new(&SHA256)),
             ended,
         },
@@ -371,6 +383,23 @@ mod tests {
             tx.try_finish().unwrap();
         });
         assert_eq!(drain(b).await.unwrap(), b"hello");
+        assert_eq!(t.sha256_hex().as_deref(), Some(HELLO_SHA256));
+    }
+
+    /// hyper's h1 client drops a body once its declared bytes are
+    /// written, without polling for the end.
+    #[tokio::test]
+    async fn declared_length_reached_completes_the_digest() {
+        let (mut tx, b) = Body::channel(1 << 20, Some(5));
+        let (mut b, t) = counted(b);
+        for part in ["hel", "lo"] {
+            tx.ready().await.unwrap();
+            tx.try_push(Bytes::from_static(part.as_bytes())).unwrap();
+            let f = poll_fn(|cx| http_body::Body::poll_frame(Pin::new(&mut b), cx)).await;
+            assert!(f.unwrap().is_ok());
+        }
+        assert_eq!(t.sha256_hex().as_deref(), Some(HELLO_SHA256));
+        drop(b);
         assert_eq!(t.sha256_hex().as_deref(), Some(HELLO_SHA256));
     }
 

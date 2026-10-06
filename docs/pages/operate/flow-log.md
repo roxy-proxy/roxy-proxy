@@ -10,14 +10,25 @@ produces a `request` event:
  "listener":"proxy","client":{"ip":"10.0.0.7","port":51234},
  "tls":{"sni":"api.github.com","alpn":"h2","version":"1.3"},
  "req":{"method":"POST","host":"api.github.com","port":443,"path":"/repos/x/y/issues",
-        "query":null,"headers_bytes":812,"body_bytes":1032,"content_type":"application/json"},
- "res":{"status":201,"headers_bytes":1420,"body_bytes":5120},
+        "query":null,"headers_bytes":812,"body_bytes":1032,
+        "body_sha256":"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "content_type":"application/json"},
+ "res":{"status":201,"headers_bytes":1420,"body_bytes":5120,
+        "body_sha256":"60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752"},
  "decision":"allow","rules":["github-writes"],"tags":["billing"],
  "mutations":["set_header:authorization"],"addons":["redact"],
  "timing":{"total_ms":412,"upstream_connect_ms":38,"upstream_ttfb_ms":350},
  "terminal_rule":"github-writes","stage":"head"}
 ```
 
+- `req.body_bytes` and `res.body_bytes` count the body bytes roxy
+  forwarded in each direction; `req.body_sha256` and `res.body_sha256` are
+  the lower-case hex SHA-256 of those same bytes, so a record can be tied
+  to a [capture](#capture) or to what the other end received. Each digest
+  is present once its body completed, and absent when the exchange ended
+  before the body did (a cut body, a watching stop, a client that went
+  away). An empty body has the digest of the empty string. A relayed
+  WebSocket has byte counts but no digests.
 - `terminal_rule` is what decided: a rule id, or `_default`,
   `_fail_closed`, `_address_policy`, `_expired` or `layer:<name>` for
   built-in decisions.

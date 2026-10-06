@@ -1195,6 +1195,11 @@ pub(crate) fn streaming_body() -> (BodySender, Body) {
     Body::channel(u64::MAX, None)
 }
 
+/// What the flow log's `body_sha256` of `data` should read.
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
+    crate::body::hex(ring::digest::digest(&ring::digest::SHA256, data).as_ref())
+}
+
 /// A real metric store behind the proxy's metric trait, keeping every
 /// sample it was given for tests to inspect.
 struct StoreMetrics {

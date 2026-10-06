@@ -475,6 +475,8 @@ async fn a_client_gone_mid_upload_is_logged(h2: bool) {
     assert_eq!(ev["decision"], "allow", "{ev:#}");
     assert_eq!(ev["reason"], "client_gone", "{ev:#}");
     assert!(ev["res"].is_null(), "{ev:#}");
+    assert_eq!(ev["req"]["body_bytes"], 1024, "{ev:#}");
+    assert!(ev["req"].get("body_sha256").is_none(), "{ev:#}");
     let events = kit.sink.events();
     assert!(
         events.iter().all(|e| e["event"] != "parse_error"),
