@@ -2547,6 +2547,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxy-policy"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "roxy-rules",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "thiserror",
+]
+
+[[package]]
 name = "roxy-proxy"
 version = "0.1.0"
 dependencies = [
