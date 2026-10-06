@@ -322,11 +322,7 @@ denied everything until a lease arrived.
 
 ## Not in v1
 
-Push from the server to the node: polling at `refresh_after_seconds` is
-enough. Conditional fetch (`ETag`, `304`): a lease is small, and the node
-diffs it locally. Secrets with their own expiry: the server re-leases before
-a credential expires. Binary secret values: a secret is a UTF-8 string.
-Capture body upload: `capture_dir` is local. Server-side
-storage, a UI, or any particular control plane: the control plane is
-whatever implements these endpoints. Per-node interception CA issuance:
-`interception_ca` is reserved for it.
+Conditional fetch: every poll returns the full lease and the node diffs it
+locally. Secrets with their own expiry: the server re-leases before a
+credential expires. Capture body upload: `capture_dir` stays local. Per-node
+interception CA issuance: `interception_ca` is reserved for it.
