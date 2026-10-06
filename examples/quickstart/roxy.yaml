@@ -7,8 +7,8 @@
 #
 # The control plane (./controlplane) serves this file as roxy's lease, with
 # each `env` secret below turned into `{ lease: true }` and its value taken
-# from the control plane's own environment. Run standalone
-# (compose.standalone.yaml), roxy reads the file and the environment itself.
+# from the control plane's own environment. Standalone
+# (compose.standalone.yaml), roxy reads the file and its own environment.
 version: 1
 
 listeners:

@@ -100,8 +100,13 @@ def test_renew_keeps_the_node_id(cp):
     assert again["certificate_chain"] != first["certificate_chain"]
 
 
+STATE = {"lease_id": None, "roxy_version": "0.0.0", "protocol_version": 1,
+         "uptime_seconds": 0, "policy_state": "none", "spooled_bytes": 0}
+
+
 def test_lease_carries_the_config_with_secrets_moved_into_the_map(cp):
-    lease = cp.lease("node-1", {"roxy_version": "0.0.0", "protocol_version": 1})
+    valid("NodeState", STATE)
+    lease = cp.lease("node-1", STATE)
     valid("Lease", lease)
     doc = yaml.safe_load(lease["config"])
     assert doc["secrets"] == {"model_key": {"lease": True}}
@@ -113,7 +118,7 @@ def test_lease_carries_the_config_with_secrets_moved_into_the_map(cp):
 
 
 def test_lease_id_changes_only_when_config_or_secrets_do(cp):
-    state = {"roxy_version": "0.0.0", "protocol_version": 1}
+    state = STATE
     a = cp.lease("node-1", state)["lease_id"]
     assert cp.lease("node-1", state)["lease_id"] == a
     cp.environ["MODEL_API_KEY"] = "k2"
@@ -124,13 +129,19 @@ def test_lease_id_changes_only_when_config_or_secrets_do(cp):
 
 
 def test_a_revoked_node_gets_410_everywhere(cp):
-    state = {"roxy_version": "0.0.0", "protocol_version": 1}
+    state = STATE
     cp.lease("node-1", state)
     (cp.data_dir / "revoked").write_text("node-0\nnode-1\n")
     expect(410, "revoked", lambda: cp.lease("node-1", state))
     expect(410, "revoked", lambda: cp.renew("node-1", enrol_body(csr_pem()[0])))
     expect(410, "revoked", lambda: cp.flows("node-1", batch("node-1", 1, 1)))
     cp.lease("node-2", state)
+
+
+def test_a_malformed_node_state_is_400(cp):
+    expect(400, "bad_request", lambda: cp.lease("node-1", {**STATE, "policy_state": "gone"}))
+    expect(400, "bad_request", lambda: cp.lease("node-1", {k: v for k, v in STATE.items() if k != "lease_id"}))
+    expect(426, "unsupported", lambda: cp.lease("node-1", {**STATE, "protocol_version": 2}))
 
 
 def batch(node_id, first, count, lease_id="lease-x"):
@@ -166,9 +177,7 @@ def test_over_tls_the_client_certificate_names_the_node(cp, tmp_path):
         res = conn.getresponse()
         return res.status, json.loads(res.read())
 
-    state = {"lease_id": None, "roxy_version": "0.0.0", "protocol_version": 1,
-             "uptime_seconds": 0, "policy_state": "none", "spooled_bytes": 0}
-    valid("NodeState", state)
+    state = STATE
     status, err = post("/roxy/v1/lease", state, trust)
     assert (status, err["error"]) == (401, "unrecognised")
     valid("Error", err)

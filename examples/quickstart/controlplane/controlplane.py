@@ -206,6 +206,11 @@ class ControlPlane:
     def lease(self, node_id, body):
         self.check_revoked(node_id)
         self.check_version(body)
+        if body.get("policy_state") not in ("none", "loaded", "expired"):
+            raise ApiError(400, "bad_request", "policy_state must be none, loaded or expired")
+        for field in ("lease_id", "uptime_seconds", "spooled_bytes"):
+            if field not in body:
+                raise ApiError(400, "bad_request", f"{field} is required")
         config, secrets = self.policy()
         digest = hashlib.sha256(config.encode() + json.dumps(secrets, sort_keys=True).encode()).hexdigest()
         return {

@@ -17,8 +17,9 @@ fail() { echo "smoke: $*" >&2; exit 1; }
 
 # `<status> <body>` of roxy's /readyz, or `000` while it is not listening.
 readyz() {
-    curl -s -m 2 -w ' %{http_code}' http://127.0.0.1:3130/readyz 2>/dev/null \
-        | awk '{print $NF, $1}' || echo 000
+    local out
+    out=$(curl -s -m 2 -w ' %{http_code}' http://127.0.0.1:3130/readyz 2>/dev/null) || { echo 000; return; }
+    awk '{print $NF, $1}' <<<"$out"
 }
 
 # Polls readyz until it answers `$1`, for up to `$2` seconds.
@@ -44,12 +45,17 @@ if [[ -z "${KEEP:-}" ]]; then
     trap 'docker compose down -v' EXIT
 fi
 
-# roxy alone, with no control plane to lease from: up, but not ready.
+# roxy with no control plane to lease from: up, but not ready. The control
+# plane runs once first so the CA certificate roxy verifies it with exists.
+docker compose up -d --wait controlplane
+docker compose stop controlplane
 docker compose up -d --no-deps roxy
 wait_readyz "503 no_policy" 30
+echo "smoke: no policy before the first lease"
 
 docker compose up -d --wait
 wait_readyz "200 ready" 5
+echo "smoke: lease applied"
 
 wanted=(
     '^\[alice #[0-9]+\] 429 RateLimitError: token bucket empty'
@@ -81,7 +87,8 @@ grep -qE '"addons":\["auth-gate","token-quota","sentinel"\]' <<<"$flows" \
     || fail "no flow went through all three addons"
 
 # The flow log reached the control plane: one line per event, node id first.
-docker compose logs --no-log-prefix controlplane | grep -qE '^node-[0-9a-f]+ \{.*"event":"request"' \
+shipped=$(docker compose logs --no-log-prefix controlplane)
+grep -qE '^node-[0-9a-f]+ \{.*"event":"request"' <<<"$shipped" \
     || fail "no flow event on the control plane's stdout"
 
 # With the control plane gone the lease runs down and roxy denies everything.
@@ -89,6 +96,7 @@ docker compose stop controlplane
 wait_readyz "503 policy_expired" $((LEASE_VALID_SECONDS + 30))
 got=$(proxied)
 [[ $got == "403 _expired" ]] || fail "proxied request during expiry answered '$got', wanted '403 _expired'"
+echo "smoke: lease expired"
 
 # The control plane coming back recovers roxy without a restart. The lease
 # client backs off up to 60s between attempts.
@@ -96,4 +104,5 @@ docker compose start controlplane
 wait_readyz "200 ready" 120
 got=$(proxied)
 [[ $got != "403 _expired" ]] || fail "proxied request still '_expired' after recovery"
+echo "smoke: lease recovered"
 echo "smoke: ok"
