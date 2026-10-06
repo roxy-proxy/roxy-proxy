@@ -8,8 +8,8 @@
 //! ```
 //!
 //! * Names: `up.test` resolves to a public test address, `private.test` to a
-//!   private one (denied by the floor unless `private_ok`), `down.test` to
-//!   an address that refuses connections.
+//!   private one (denied by the floor unless `private_ok`), `mixed.test` to
+//!   both, `down.test` to an address that refuses connections.
 //! * The upstream answers by path (see [`upstream_answer`]) and records what
 //!   reached it ([`Seen`]): the head, the body bytes, and whether the body
 //!   completed or was cut.
@@ -22,6 +22,8 @@
 mod addon_tests;
 #[cfg(test)]
 mod budget_tests;
+#[cfg(test)]
+mod ca_server_tests;
 #[cfg(test)]
 mod capture_tests;
 #[cfg(test)]
@@ -261,6 +263,7 @@ pub(crate) struct KitBuilder {
     ws_message_every: u64,
     connection_events: bool,
     log_gate: Option<Arc<LogGate>>,
+    ca_server: bool,
 }
 
 impl KitBuilder {
@@ -312,6 +315,14 @@ impl KitBuilder {
     #[must_use]
     pub(crate) fn connection_events(mut self) -> Self {
         self.connection_events = true;
+        self
+    }
+
+    /// Binds the plain-HTTP CA endpoint on a loopback port
+    /// ([`Kit::ca_server_addr`]).
+    #[must_use]
+    pub(crate) fn ca_server(mut self) -> Self {
+        self.ca_server = true;
         self
     }
 
@@ -427,7 +438,7 @@ impl KitBuilder {
         };
         let server = Server::start(RuntimeConfig {
             listeners: Vec::new(),
-            ca_server: None,
+            ca_server: self.ca_server.then(|| "127.0.0.1:0".parse().unwrap()),
             dns: None,
             ca: ca.clone(),
             minter: minter.clone(),
@@ -557,7 +568,18 @@ impl Kit {
             ws_message_every: 0,
             connection_events: false,
             log_gate: None,
+            ca_server: false,
         }
+    }
+
+    /// The CA endpoint's address, with [`KitBuilder::ca_server`].
+    pub(crate) fn ca_server_addr(&self) -> std::net::SocketAddr {
+        self.server.ca_server_addr().expect("ca_server")
+    }
+
+    /// The CA certificate, as the CA endpoint serves it.
+    pub(crate) fn ca_pem(&self) -> String {
+        self.server.shared().ca.cert_pem()
     }
 
     /// A raw client connection to a direct listener whose clients connect
@@ -1063,16 +1085,15 @@ fn upstream_settings(upstream: &Arc<Upstream>) -> UpstreamSettings {
     let mut settings = UpstreamSettings::default();
     // Never consult real DNS: unknown names fail.
     settings.dns.servers = Some(vec!["127.0.0.1:9".parse().unwrap()]);
-    for (name, ip) in [
-        ("up.test", UP_IP),
-        ("private.test", PRIVATE_IP),
-        ("down.test", DOWN_IP),
-        ("stall.test", STALL_IP),
+    for (name, ips) in [
+        ("up.test", vec![UP_IP]),
+        ("private.test", vec![PRIVATE_IP]),
+        ("mixed.test", vec![UP_IP, PRIVATE_IP]),
+        ("down.test", vec![DOWN_IP]),
+        ("stall.test", vec![STALL_IP]),
     ] {
-        settings
-            .dns
-            .static_hosts
-            .insert(name.to_owned(), vec![ip.parse().unwrap()]);
+        let ips = ips.iter().map(|ip| ip.parse().unwrap()).collect();
+        settings.dns.static_hosts.insert(name.to_owned(), ips);
     }
     settings.connect_timeout = Duration::from_secs(5);
     let up = upstream.clone();

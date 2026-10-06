@@ -1205,3 +1205,31 @@ async fn a_redirect_keeping_host_goes_over_http1() {
     let rewritten = seen.iter().find(|s| s.path == "/rewritten").unwrap();
     assert_eq!(rewritten.version, http::Version::HTTP_2);
 }
+
+/// A request pipelined behind a closing deny is never parsed: the
+/// connection closes after the deny and the upstream sees nothing.
+#[tokio::test]
+async fn a_request_pipelined_behind_a_closing_deny_is_discarded() {
+    let kit = Kit::builder().rules(OPEN_DENY_RULES).start().await;
+    let (out, eof) = kit
+        .raw(
+            b"GET http://up.test/denied-close HTTP/1.1\r\nhost: up.test\r\n\r\n\
+              GET http://up.test/second HTTP/1.1\r\nhost: up.test\r\n\r\n",
+        )
+        .await;
+    assert!(eof);
+    assert!(out.starts_with("HTTP/1.1 403"), "{out}");
+    assert!(out.contains("connection: close"), "{out}");
+    assert_eq!(out.matches("HTTP/1.1 ").count(), 1, "{out}");
+    let ev = kit.events("request", 1).await;
+    assert_eq!(ev[0]["req"]["path"], "/denied-close", "{ev:#?}");
+    // Nothing for the second request, now or later.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let events = kit.sink.events();
+    assert_eq!(
+        events.iter().filter(|e| e["event"] == "request").count(),
+        1,
+        "{events:#?}"
+    );
+    assert!(kit.upstream.seen().is_empty());
+}

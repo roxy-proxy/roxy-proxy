@@ -537,3 +537,32 @@ async fn a_byte_budget_stops_the_crossing_upload() {
         "counted {counted} bytes, forwarded {total}"
     );
 }
+
+/// A name that resolves to a public and a private address is denied as a
+/// whole: the floor judges every address, not the one that would be
+/// dialled. With `private_ok` the same name is reachable.
+#[tokio::test]
+async fn a_name_with_a_private_address_among_its_answers_is_denied() {
+    let kit = Kit::builder()
+        .rules("- id: any\n  when: port in [80, 443]\n  then: allow\n")
+        .start()
+        .await;
+    let a = get(&kit, "mixed.test", "/").await;
+    assert_eq!(a.status, 403, "{a:?}");
+    assert_eq!(a.headers["x-roxy-rule"], "_address_policy");
+    let ev = kit.events("upstream_denied", 1).await;
+    assert_eq!(ev[0]["reason"], "private_range:private", "{ev:#?}");
+    assert_eq!(ev[0]["resolved_ip"], "10.0.0.5", "{ev:#?}");
+    assert!(kit.upstream.seen().is_empty());
+
+    let kit = Kit::builder()
+        .rules("- id: any\n  when: port in [80, 443]\n  then: { allow: { private_ok: true } }\n")
+        .start()
+        .await;
+    let a = get(&kit, "mixed.test", "/").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(
+        kit.upstream.wait_seen(1).await[0].addr.ip().to_string(),
+        UP_IP
+    );
+}
