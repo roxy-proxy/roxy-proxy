@@ -48,8 +48,6 @@ pub enum Field {
     ClientPort,
     /// `listener.name` (string)
     ListenerName,
-    /// `listener.mode` (string: `explicit`)
-    ListenerMode,
     /// `tls.sni` (string)
     TlsSni,
     /// `tls.alpn` (string)
@@ -180,11 +178,10 @@ impl std::ops::BitOrAssign for Reads {
 }
 
 impl Field {
-    pub const ALL: [Field; 23] = [
+    pub const ALL: [Field; 22] = [
         Self::ClientIp,
         Self::ClientPort,
         Self::ListenerName,
-        Self::ListenerMode,
         Self::TlsSni,
         Self::TlsAlpn,
         Self::TlsVersion,
@@ -212,7 +209,6 @@ impl Field {
             Self::ClientIp => "client.ip",
             Self::ClientPort => "client.port",
             Self::ListenerName => "listener.name",
-            Self::ListenerMode => "listener.mode",
             Self::TlsSni => "tls.sni",
             Self::TlsAlpn => "tls.alpn",
             Self::TlsVersion => "tls.version",
@@ -252,7 +248,6 @@ impl Field {
             | Self::WsOpcode
             | Self::WsSize => Type::Int,
             Self::ListenerName
-            | Self::ListenerMode
             | Self::TlsSni
             | Self::TlsAlpn
             | Self::TlsVersion
@@ -299,7 +294,6 @@ impl Field {
             Self::ClientIp
             | Self::ClientPort
             | Self::ListenerName
-            | Self::ListenerMode
             | Self::TlsSni
             | Self::TlsAlpn
             | Self::TlsVersion

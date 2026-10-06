@@ -28,7 +28,6 @@ fn flow() -> MapView {
         .with(Field::ClientIp, ip("10.1.2.3"))
         .with_int(Field::ClientPort, 50_000)
         .with_str(Field::ListenerName, "proxy")
-        .with_str(Field::ListenerMode, "explicit")
         .with_str(Field::TlsSni, "api.github.com")
         .with_str(Field::TlsVersion, "1.3")
         .with_int(Field::BodySize, 1500)
@@ -94,7 +93,6 @@ fn equality_and_ordering() {
         ("443 == port", true),
         ("client.ip == 10.1.2.3", true),
         ("client.ip == ::ffff:10.1.2.3", true),
-        ("listener.mode == \"explicit\"", true),
         ("tls.sni == host", true),
         ("true", true),
         ("false", false),

@@ -26,8 +26,7 @@ On the proxy port:
   ([TLS](/operate/ca-certificates#ca-distribution)). Anything else there is `404`.
 
 roxy does not authenticate clients: a client is who its network position
-says it is, which rules see as `listener.name`, `listener.mode` and
-`client.ip`. A `Proxy-Authorization` header is hop-by-hop and dropped, never
+says it is, which rules see as `listener.name` and `client.ip`. A `Proxy-Authorization` header is hop-by-hop and dropped, never
 forwarded.
 
 ## CONNECT

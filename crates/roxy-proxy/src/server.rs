@@ -20,7 +20,7 @@ use crate::addrlist::AddressLists;
 use crate::budget::{BufferBudget, BufferLease};
 use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowEvent, FlowSink, Redactor};
-use crate::listener::{ClientConn, Listener, ListenerMode, TcpProxyListener};
+use crate::listener::{ClientConn, Listener, TcpProxyListener};
 use crate::pipeline::client_info;
 use crate::sources::{MetricSource, StateSource};
 use crate::upstream::Upstream;
@@ -455,14 +455,10 @@ async fn accept_loop(listener: Arc<dyn Listener>, shared: Arc<Shared>) {
         match shared.caps.acquire(client.peer.ip()) {
             Ok(slot) => {
                 let s = shared.clone();
-                match client.listener.mode {
-                    ListenerMode::Explicit => {
-                        shared.spawn_conn(
-                            slot,
-                            crate::conn::serve_explicit(Box::new(stream), client, s),
-                        );
-                    }
-                }
+                shared.spawn_conn(
+                    slot,
+                    crate::conn::serve_explicit(Box::new(stream), client, s),
+                );
             }
             Err(reason) => {
                 drop(stream);

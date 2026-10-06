@@ -1,9 +1,8 @@
 //! Listeners and client connections.
 //!
 //! A [`Listener`] accepts a TCP stream and describes it as a
-//! [`ClientConn`]; the server then hands both to the pipeline for the
-//! listener's [`ListenerMode`]. Transparent mode (issue #15) would be one
-//! more implementation.
+//! [`ClientConn`]; the server then hands both to the explicit-proxy
+//! pipeline. Transparent mode (issue #15) would be one more implementation.
 
 use std::future::Future;
 use std::io;
@@ -14,29 +13,11 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use ulid::Ulid;
 
-/// Listener mode (`listener.mode` in rules).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ListenerMode {
-    /// `HTTP_PROXY` mode: absolute-form requests and CONNECT.
-    Explicit,
-}
-
-impl ListenerMode {
-    /// The rule-visible name.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Explicit => "explicit",
-        }
-    }
-}
-
 /// Static description of a listener.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenerInfo {
     /// `listener.name`.
     pub name: String,
-    /// `listener.mode`.
-    pub mode: ListenerMode,
 }
 
 /// One accepted client connection.
@@ -80,7 +61,6 @@ impl TcpProxyListener {
         Ok(Self {
             info: Arc::new(ListenerInfo {
                 name: name.to_owned(),
-                mode: ListenerMode::Explicit,
             }),
             tcp,
         })

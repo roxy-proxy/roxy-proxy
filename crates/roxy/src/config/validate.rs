@@ -37,7 +37,6 @@ impl Config {
         }
 
         self.validate_listeners(&mut d);
-        self.validate_dns(&mut d);
         self.validate_tls(&mut d);
         self.validate_secrets(&mut d);
         self.validate_address_lists(&mut d);
@@ -143,15 +142,6 @@ impl Config {
             d.push(Diagnostic::new(
                 "ca_server.bind",
                 format!("bind address {} is already used by {first}", ca.bind),
-            ));
-        }
-    }
-
-    fn validate_dns(&self, d: &mut Vec<Diagnostic>) {
-        if self.dns.is_some() {
-            d.push(Diagnostic::new(
-                "dns",
-                "DNS steering has been removed: clients use the explicit proxy",
             ));
         }
     }
@@ -742,10 +732,6 @@ fn validate_listener_mode(l: &super::Listener, path: &str, d: &mut Vec<Diagnosti
     }
     match l.mode {
         ListenerMode::Explicit => {}
-        ListenerMode::Direct => d.push(Diagnostic::new(
-            format!("{path}.mode"),
-            "direct listeners have been removed with DNS steering; use `explicit`",
-        )),
         ListenerMode::Transparent => d.push(Diagnostic::new(
             format!("{path}.mode"),
             "there are no transparent listeners; use `explicit`",

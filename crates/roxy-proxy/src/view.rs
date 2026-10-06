@@ -249,7 +249,6 @@ impl FlowView for ProxyView<'_> {
             Field::ClientIp => Value::Ip(fa.client.peer.ip()),
             Field::ClientPort => Value::Int(i64::from(fa.client.peer.port())),
             Field::ListenerName => Value::Str(Cow::Borrowed(&fa.client.listener.name)),
-            Field::ListenerMode => Value::Str(Cow::Borrowed(fa.client.listener.mode.as_str())),
             Field::TlsSni => s(tls.and_then(|t| t.sni.as_ref())),
             Field::TlsAlpn => s(tls.and_then(|t| t.alpn.as_ref())),
             Field::TlsVersion => s(tls.and_then(|t| t.version.as_ref())),

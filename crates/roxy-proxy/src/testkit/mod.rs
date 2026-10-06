@@ -70,7 +70,7 @@ use crate::addr::PrivateAddrs;
 use crate::addrlist::{AddressList, AddressLists};
 use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowSink, MemorySink, Redactor};
-use crate::listener::{ClientConn, ListenerInfo, ListenerMode};
+use crate::listener::{ClientConn, ListenerInfo};
 use crate::sources::{MetricSource, Sample, StateSource, UnavailableMetrics, UnavailableState};
 use crate::upstream::{TestDial, UpstreamSettings};
 
@@ -612,7 +612,6 @@ impl Kit {
             id: Ulid::generate(),
             listener: Arc::new(ListenerInfo {
                 name: "main".to_owned(),
-                mode: ListenerMode::Explicit,
             }),
             peer: "192.0.2.7:40000".parse().unwrap(),
             original_dst: None,
@@ -635,7 +634,6 @@ impl Kit {
             id: Ulid::generate(),
             listener: Arc::new(ListenerInfo {
                 name: "main".to_owned(),
-                mode: ListenerMode::Explicit,
             }),
             peer: "192.0.2.7:40000".parse().unwrap(),
             original_dst: None,

@@ -43,10 +43,6 @@ pub struct Config {
     /// Plain-HTTP endpoint serving the CA cert and health checks. Absent = off.
     #[serde(default)]
     pub ca_server: Option<CaServer>,
-    /// DNS steering is gone. Parsed so a config that still sets it is
-    /// refused with a diagnostic rather than an unknown-field error.
-    #[serde(default)]
-    pub dns: Option<serde_yaml_ng::Value>,
     #[serde(default)]
     pub tls: Tls,
     #[serde(default)]
@@ -99,9 +95,6 @@ pub struct Listener {
 pub enum ListenerMode {
     #[default]
     Explicit,
-    /// Removed with DNS steering. Parsed so a config that still asks for
-    /// it is refused with a diagnostic rather than a parse error.
-    Direct,
     /// Parsed so the config shape is stable, but rejected by validation
     /// until transparent mode is built (issue #15).
     Transparent,

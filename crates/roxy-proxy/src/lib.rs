@@ -65,7 +65,7 @@ pub use flowlog::{
     FlowSink, MemorySink, MultiSink, REDACTED, Redactor, RequestInfo, ResponseInfo, Stage,
     StdoutSink, Timing, TlsInfo,
 };
-pub use listener::{ClientConn, Listener, ListenerInfo, ListenerMode, TcpProxyListener};
+pub use listener::{ClientConn, Listener, ListenerInfo, TcpProxyListener};
 pub use server::{PreparedReload, Server, ServerHandle, StartError};
 pub use sources::{
     MetricSource, MetricSourceError, Sample, StateFull, StateSource, UnavailableMetrics,

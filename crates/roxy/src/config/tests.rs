@@ -500,24 +500,6 @@ fn listener_field_diagnostics() {
     assert_eq!(d[0].path, "listeners[0].upstream_target");
 }
 
-/// DNS steering is gone; a config that still asks for it is refused
-/// rather than run without it.
-#[test]
-fn dns_steering_is_refused() {
-    let d = diagnostics(
-        "version: 1\nlisteners:\n  - { name: https, mode: direct, bind: 0.0.0.0:443 }\n\
-         dns:\n  bind: 0.0.0.0:53\n  answer: { ipv4: 10.16.0.2 }\n",
-    );
-    let paths: Vec<&str> = d.iter().map(|d| d.path.as_str()).collect();
-    assert_eq!(paths, ["listeners[0].mode", "dns"], "{d:?}");
-    for removed in [
-        "listeners: [{ name: p, bind: 127.0.0.1:443, target_port: 443 }]",
-        "log: { flow: { dns_events: true } }",
-    ] {
-        assert!(Config::from_yaml(&format!("version: 1\n{removed}\n")).is_err());
-    }
-}
-
 #[test]
 fn misc_diagnostics() {
     let (_dir, wasm) = wasm_file();

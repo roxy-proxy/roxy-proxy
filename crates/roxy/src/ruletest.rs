@@ -379,7 +379,6 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(DryRunView, Vec
             Field::ListenerName,
             listener.map_or("proxy", |l| l.name.as_str()),
         )
-        .with_str(Field::ListenerMode, "explicit")
         .with_str(Field::Method, &req.method)
         .with_str(Field::Scheme, head.scheme.as_str())
         .with_str(Field::Host, &host)
