@@ -70,3 +70,47 @@ async fn healthz_reports_the_lease_state() {
     assert_eq!(body, b"ok");
     assert_eq!(kit.events("policy_expired", 1).await.len(), 1);
 }
+
+/// `/readyz` is `200` once a policy has been applied and its lease has
+/// not run out, and `503` with the reason otherwise; `/healthz` is `200`
+/// throughout. The startup placeholder is `no_policy`; an empty policy is
+/// a deny-all someone applied, so it is ready.
+#[tokio::test]
+async fn readiness_follows_the_applied_policy_and_liveness_does_not() {
+    let kit = Kit::builder()
+        .placeholder_policy()
+        .ca_server()
+        .start()
+        .await;
+    let readyz = "GET /readyz HTTP/1.1\r\nhost: roxy\r\n\r\n";
+    let healthz = "GET /healthz HTTP/1.1\r\nhost: roxy\r\n\r\n";
+    let (head, body, _) = fetch(&kit, readyz).await;
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+    assert_eq!(body, b"no_policy");
+    let (head, _, _) = fetch(&kit, healthz).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    kit.reload("[]");
+    let (head, body, eof) = fetch(&kit, readyz).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"ready");
+    assert!(eof);
+
+    kit.reload_lease(
+        super::ALLOW_UP,
+        Some(chrono::Utc::now() - chrono::TimeDelta::seconds(1)),
+    );
+    let (head, body, _) = fetch(&kit, readyz).await;
+    assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+    assert_eq!(body, b"policy_expired");
+    let (head, _, _) = fetch(&kit, healthz).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    kit.reload_lease(
+        super::ALLOW_UP,
+        Some(chrono::Utc::now() + chrono::TimeDelta::hours(1)),
+    );
+    let (head, body, _) = fetch(&kit, readyz).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"ready");
+}

@@ -66,17 +66,22 @@ enum Command {
         #[command(subcommand)]
         command: RuleCommand,
     },
-    /// Probe a health endpoint (`ca_server`'s `/healthz`) for container
-    /// health checks, where there is no shell or curl. Exits 0 on a `200`
-    /// response and 1 on anything else.
+    /// Probe `ca_server`'s `/healthz` (the process is up) or, with
+    /// `--ready`, `/readyz` (a policy is in force) for
+    /// container health checks, where there is no shell or curl. Exits 0
+    /// on a `200` response and 1 on anything else.
     Health(HealthArgs),
 }
 
 #[derive(Debug, Args)]
 struct HealthArgs {
-    /// Plain `http://` URL to GET.
-    #[arg(long, default_value = "http://127.0.0.1:3130/healthz")]
-    url: String,
+    /// Plain `http://` URL to GET. Defaults to `/healthz`, or `/readyz`
+    /// with `--ready`, on `127.0.0.1:3130`.
+    #[arg(long, conflicts_with = "ready")]
+    url: Option<String>,
+    /// Probe readiness (`/readyz`) instead of liveness.
+    #[arg(long)]
+    ready: bool,
     /// Connect, write and read timeout, in seconds.
     #[arg(long, default_value_t = 3)]
     timeout: u64,
@@ -203,14 +208,22 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
         Command::Rule {
             command: RuleCommand::Test(args),
         } => rule_test(&args),
-        Command::Health(args) => health(&args.url, Duration::from_secs(args.timeout.max(1))),
+        Command::Health(args) => {
+            let url = args.url.unwrap_or_else(|| {
+                let path = if args.ready { "readyz" } else { "healthz" };
+                format!("http://127.0.0.1:3130/{path}")
+            });
+            health(&url, Duration::from_secs(args.timeout.max(1)))
+        }
     }
 }
 
 /// `GET url` over HTTP/1.1 with std only. Success is a `200` status line;
 /// anything else (refused, timeout, other status, garbage) is unhealthy.
 /// An `x-roxy-policy: expired` header is reported, not a failure: the
-/// process is up and denying everything until a reload.
+/// process is up and denying everything until a reload. A failing status
+/// is reported with the body's first line, which is the reason word
+/// `/readyz` answers with.
 fn health(url: &str, timeout: Duration) -> anyhow::Result<ExitCode> {
     let rest = url
         .strip_prefix("http://")
@@ -271,15 +284,18 @@ fn health(url: &str, timeout: Duration) -> anyhow::Result<ExitCode> {
             Err(_) => break,
         }
     }
-    let head = String::from_utf8_lossy(&head);
-    let status = head.lines().next().unwrap_or_default();
-    let mut parts = status.split(' ');
+    let status_line = String::from_utf8_lossy(&head)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let mut parts = status_line.split(' ');
     let healthy = matches!(
         (parts.next(), parts.next()),
         (Some("HTTP/1.1" | "HTTP/1.0"), Some("200"))
     );
     if healthy {
-        let expired = head.lines().any(|l| {
+        let expired = String::from_utf8_lossy(&head).lines().any(|l| {
             l.split_once(':').is_some_and(|(k, v)| {
                 k.eq_ignore_ascii_case(roxy_proxy::POLICY_HEADER)
                     && v.trim().eq_ignore_ascii_case("expired")
@@ -290,11 +306,26 @@ fn health(url: &str, timeout: Duration) -> anyhow::Result<ExitCode> {
         } else {
             println!("ok");
         }
-        Ok(ExitCode::SUCCESS)
-    } else {
-        eprintln!("roxy: unhealthy: {url}: {status:?}");
-        Ok(ExitCode::FAILURE)
+        return Ok(ExitCode::SUCCESS);
     }
+    // The server closes after one response; read the rest (bounded) for
+    // the reason. A read error here only loses the reason.
+    while head.len() < 4096 {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+    }
+    let head = String::from_utf8_lossy(&head);
+    let reason = head
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| body.lines().next())
+        .filter(|l| !l.is_empty());
+    match reason {
+        Some(reason) => eprintln!("roxy: unhealthy: {url}: {status_line:?}: {reason}"),
+        None => eprintln!("roxy: unhealthy: {url}: {status_line:?}"),
+    }
+    Ok(ExitCode::FAILURE)
 }
 
 fn rule_test(args: &RuleTestArgs) -> anyhow::Result<ExitCode> {

@@ -89,9 +89,10 @@ USER 65532:65532
 # restarts or every client must re-trust a new CA), and the flow log
 # directory for configs that log to a file.
 VOLUME ["/var/lib/roxy/ca", "/var/log/roxy"]
-# 3128: proxy listener. 3130: ca_server (/roxy-ca.pem, /healthz).
+# 3128: proxy listener. 3130: ca_server (/roxy-ca.pem, /healthz, /readyz).
 EXPOSE 3128 3130
 
+# Liveness. A stack that waits for a policy to be in force uses `health --ready`.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["/roxy", "health", "--url", "http://127.0.0.1:3130/healthz"]
 

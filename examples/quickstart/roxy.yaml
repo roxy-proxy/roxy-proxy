@@ -11,7 +11,7 @@ listeners:
     bind: 0.0.0.0:3128
 
 ca_server:
-  bind: 0.0.0.0:3130          # /roxy-ca.pem and /healthz
+  bind: 0.0.0.0:3130          # /roxy-ca.pem, /healthz and /readyz
 
 tls:
   ca_dir: /var/lib/roxy/ca

@@ -36,6 +36,10 @@ pub(crate) struct Snapshot {
     /// Set when the snapshot was first seen expired, so `policy_expired`
     /// is logged once per snapshot.
     expired_logged: AtomicBool,
+    /// A stand-in from startup, not a policy anyone applied: `/readyz`
+    /// says `no_policy` until a reload replaces it. See
+    /// [`RuntimeConfig::placeholder_policy`].
+    pub placeholder: bool,
     pub secrets: HashMap<String, String>,
     pub redactor: Redactor,
     pub limits: Arc<Limits>,
@@ -52,6 +56,20 @@ pub(crate) struct Snapshot {
     /// new exchanges dial under the new policy and secrets, and retires
     /// the old ones, whose connections close as their exchanges end.
     pub services: crate::addons::service::Pools,
+}
+
+/// What `/readyz` reports: whether an applied policy is in force. An
+/// empty policy is a legitimate deny-all that serves and logs its
+/// denials, so it counts as loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PolicyState {
+    /// A policy has been applied and its lease has not run out.
+    Loaded,
+    /// No policy has been applied yet (the startup placeholder).
+    Missing,
+    /// The policy's lease has run out. Denies everything until a reload
+    /// brings a later lease.
+    Expired,
 }
 
 /// Per-client and global connection counting.
@@ -164,6 +182,18 @@ impl Shared {
         self.expired(&self.snapshot())
     }
 
+    /// The current policy's state, for `/readyz`.
+    pub(crate) fn policy_state(&self) -> PolicyState {
+        let snap = self.snapshot();
+        if snap.placeholder {
+            PolicyState::Missing
+        } else if self.expired(&snap) {
+            PolicyState::Expired
+        } else {
+            PolicyState::Loaded
+        }
+    }
+
     fn build_snapshot(&self, u: PolicyUpdate) -> Result<Snapshot, String> {
         build_snapshot(u, &self.upstream_tls)
     }
@@ -241,6 +271,7 @@ fn build_snapshot(u: PolicyUpdate, tls: &Arc<ClientConfig>) -> Result<Snapshot, 
         policy: u.policy,
         valid_until: u.valid_until,
         expired_logged: AtomicBool::new(false),
+        placeholder: false,
         secrets: u.secrets,
         redactor: u.redactor,
         limits: Arc::new(u.limits),
@@ -352,7 +383,8 @@ impl Server {
         roxy_tls::install_crypto_provider();
         let upstream_tls = roxy_tls::client_config(&cfg.upstream_tls)
             .map_err(|e| StartError(format!("upstream TLS configuration: {e}")))?;
-        let snap = build_snapshot(cfg.policy, &upstream_tls).map_err(StartError)?;
+        let mut snap = build_snapshot(cfg.policy, &upstream_tls).map_err(StartError)?;
+        snap.placeholder = cfg.placeholder_policy;
         let shared = Arc::new(Shared {
             snapshot: ArcSwap::from_pointee(snap),
             sink: cfg.sink,

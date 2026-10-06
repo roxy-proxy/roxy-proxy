@@ -50,6 +50,11 @@ pub struct RuntimeConfig {
     pub state: Arc<dyn StateSource>,
     /// The initial reloadable part.
     pub policy: PolicyUpdate,
+    /// `policy` is a stand-in until the first reload, not one anyone
+    /// applied: `/readyz` reports `no_policy` until then. A node under a
+    /// control plane starts this way, with a deny-all, before its first
+    /// lease.
+    pub placeholder_policy: bool,
 }
 
 /// What the proxy does with HTTP beyond parsing it: the `http.*` keys the

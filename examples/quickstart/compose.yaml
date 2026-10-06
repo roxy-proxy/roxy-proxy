@@ -45,6 +45,10 @@ services:
     ports:
       - "127.0.0.1:3128:3128"              # the proxy
       - "127.0.0.1:3130:3130"              # the CA certificate
+    healthcheck:                           # ready: a policy is in force
+      test: ["CMD", "/roxy", "health", "--ready"]
+      interval: 2s
+      retries: 30
     networks: [lab, sidecar, egress]
     depends_on:
       fake-model: { condition: service_healthy }

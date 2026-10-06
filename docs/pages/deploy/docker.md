@@ -31,11 +31,14 @@ docker run -d --name roxy \
 | `capture_dir` | [Capture](/operate/flow-log#capture) is off by default. If you set `capture_dir`, mount a volume there; the root filesystem is read-only. |
 
 Ports: `3128` is the proxy listener and `3130` is `ca_server`
-(`/roxy-ca.pem`, `/healthz`). The image's `HEALTHCHECK` runs `roxy health`,
-a small built-in HTTP probe (there is no curl), against
-`http://127.0.0.1:3130/healthz`. A config that moves or removes `ca_server`
-needs `--health-cmd` or `--no-healthcheck`. Other subcommands run the same
-way:
+(`/roxy-ca.pem`, `/healthz`, `/readyz`). The image's `HEALTHCHECK` runs
+`roxy health`, a small built-in HTTP probe (there is no curl), against
+`http://127.0.0.1:3130/healthz`. That is liveness: the process is up. Use
+`roxy health --ready` (`/readyz`) where a check should mean "a policy is in
+force", such as a compose `depends_on` or a Kubernetes readiness probe
+([health](/operate/operations#health)). A config that moves or removes
+`ca_server` needs `--health-cmd` or `--no-healthcheck`. Other subcommands
+run the same way:
 
 ```sh
 docker run --rm -v ./roxy.yaml:/etc/roxy/roxy.yaml:ro ghcr.io/roxy-proxy/roxy:edge \
