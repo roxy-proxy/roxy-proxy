@@ -1,4 +1,4 @@
-//! The OpenAPI document is valid OpenAPI 3.1, every `$ref` in it resolves,
+//! The document is valid `OpenAPI` 3.1, every `$ref` in it resolves,
 //! every body it names has an example on the reference page, every example
 //! validates against its schema, and the schemas reject the shapes the spec
 //! rules out.
@@ -40,7 +40,7 @@ fn refs(value: &Value, at: &str, out: &mut Vec<(String, String)>) {
                 refs(v, &format!("{at}/{i}"), out);
             }
         }
-        _ => {}
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -48,7 +48,7 @@ fn refs(value: &Value, at: &str, out: &mut Vec<(String, String)>) {
 fn every_ref_resolves_inside_the_document() {
     let mut found = Vec::new();
     refs(document(), "", &mut found);
-    assert!(!found.is_empty());
+    assert!(found.len() > 10, "only {} $refs found", found.len());
     for (at, target) in found {
         let pointer = target
             .strip_prefix('#')
@@ -93,7 +93,11 @@ fn page_example(name: &str) -> Value {
 #[test]
 fn page_examples_validate_against_their_schemas() {
     let examples = examples();
-    assert!(!examples.is_empty(), "no examples found on the page");
+    assert!(
+        examples.len() >= 7,
+        "only {} examples found on the page",
+        examples.len()
+    );
     for (name, value) in &examples {
         if let Err(e) = validate(name, value) {
             panic!("example does not validate: {e}\n{value}");
