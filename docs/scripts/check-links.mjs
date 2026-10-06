@@ -52,6 +52,11 @@ function check(source, link) {
 for (const file of walk(pagesDir).filter((f) => /\.mdx?$/.test(f))) {
   const text = readFileSync(file, "utf8");
   for (const [, link] of text.matchAll(/\]\((\/[^)\s]*)\)/g)) check(relative(repo, file), link);
+  // Vocs renders a bare `#anchor` link without the base path, so under
+  // GitHub Pages it 404s; write the route out.
+  for (const [, anchor] of text.matchAll(/\]\(#([^)\s]*)\)/g)) {
+    errors.push(`${relative(repo, file)}: #${anchor}: write the page's route (/path#${anchor}); a bare anchor loses the base path`);
+  }
 }
 
 const tracked = execFileSync("git", ["-C", repo, "grep", "-lF", site, "--", ":!docs"], { encoding: "utf8" })

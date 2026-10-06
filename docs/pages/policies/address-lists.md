@@ -79,7 +79,7 @@ address_lists:
   `limits.max_address_list_bytes` (256 MiB), or one that is not valid
   UTF-8, is a load error.
 - **Two matching modes.** The deny floor matches broadly, every form
-  [above](#address-floor), because matching more is the safe direction for
+  [above](/policies/address-lists#address-floor), because matching more is the safe direction for
   a deny. Rule membership
   (`ip in @list`) is exact, with only the IPv4-mapped equivalence, because a
   rule might *allow* on membership: `client.ip in @internal` must not treat

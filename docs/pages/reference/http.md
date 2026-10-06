@@ -8,7 +8,7 @@ connection handling in `roxy-proxy`.
 
 Clients set `HTTP_PROXY` / `HTTPS_PROXY` and speak HTTP/1.1 to an
 explicit listener. (Clients without proxy settings use [direct
-listeners](#direct-listeners) instead.)
+listeners](/reference/http#direct-listeners) instead.)
 
 ```yaml
 listeners:
@@ -21,7 +21,7 @@ On the proxy port:
 
 - **Absolute-form requests** (`GET http://host/path HTTP/1.1`) are plain
   HTTP. The `Host` header must equal the URI authority.
-- **CONNECT** opens a tunnel that roxy inspects ([below](#connect)).
+- **CONNECT** opens a tunnel that roxy inspects ([below](/reference/http#connect)).
 - **Origin-form requests** (`GET /path`) are rejected, except to the host
   `roxy.internal`, which serves the CA certificate at `/roxy-ca.pem`
   ([TLS](/operate/ca-certificates#ca-distribution)). Anything else there is `404`.
@@ -92,7 +92,7 @@ Clients may speak HTTP/2 inside a TLS tunnel, negotiated by ALPN
 (`http.enable_h2`, default true; every mainstream client falls back to
 HTTP/1.1 when it is off). HTTP/2 uses the `h2` crate, which is strict by
 spec, followed by the same semantic validation as HTTP/1.1
-([HTTP/2 requests](#http2-requests)). Upstream, roxy offers `h2` and
+([HTTP/2 requests](/reference/http#http2-requests)). Upstream, roxy offers `h2` and
 `http/1.1` and serialises each request as whichever the origin negotiates;
 the canonical model is version-agnostic. WebSocket upgrades always use
 HTTP/1.1 ([WebSockets](/policies/websockets)).
@@ -270,7 +270,7 @@ resource limits. hyper parses the response and roxy builds a
   so it treats both as gone.
 - Redirects are forwarded, not followed. The client's next request is a new
   exchange, judged on its own.
-- Encoded bodies pass through untouched ([below](#content-codings)).
+- Encoded bodies pass through untouched ([below](/reference/http#content-codings)).
 
 ## Content codings
 

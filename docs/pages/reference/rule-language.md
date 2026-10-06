@@ -120,7 +120,7 @@ Terminal:
 | action | where | effect |
 |---|---|---|
 | `allow` | head rules | Forward. `allow: { upgrade: websocket }` also permits a WebSocket upgrade; `private_ok: true` lets this flow reach private addresses ([address floor](/policies/address-lists#address-floor)). |
-| `deny` | all rules | `deny: { status, message, close }`. Status defaults to 403 and must be 4xx or 5xx. At the head: refuse ([deny responses](/reference/http#deny-responses)); the connection is closed afterwards unless `close: false`. Watching: stop the exchange, as in [evaluation](#evaluation). On a WebSocket: close both sides (with a `1008` close frame when rules read messages, [WebSockets](/policies/websockets#message-rules)). |
+| `deny` | all rules | `deny: { status, message, close }`. Status defaults to 403 and must be 4xx or 5xx. At the head: refuse ([deny responses](/reference/http#deny-responses)); the connection is closed afterwards unless `close: false`. Watching: stop the exchange, as in [evaluation](/policies/overview#evaluation). On a WebSocket: close both sides (with a `1008` close frame when rules read messages, [WebSockets](/policies/websockets#message-rules)). |
 
 Non-terminal:
 
@@ -133,7 +133,7 @@ Non-terminal:
 | `redirect: { host, port, scheme?, rewrite_host? }` | head rules | Change the upstream target. `host` follows the same rules as a request's host: a DNS name, a dotted-quad IPv4 address or a bracketed IPv6 address (`[::1]`). Anything else, and port `0`, is a config error. The address floor and deny lists check the new target's IPs. `Host` is unchanged unless `rewrite_host: true`; while it is unchanged, the request goes upstream over HTTP/1.1, because HTTP/2 needs `:authority` and `host` to agree. |
 | `tag: name` | all | Sets `tag["name"]` for later rules, addons and the log. |
 | `log: { level, message }` | all | Emits a `log` flow event. |
-| `set_state: { key, value, ttl? }` | all | Writes the [state store](#state). |
+| `set_state: { key, value, ttl? }` | all | Writes the [state store](/policies/rate-limits#state). |
 | `capture: request \| response \| both` | head rules | Tees the exchange, as forwarded, to the [capture log](/operate/flow-log#capture). |
 
 The actions are a small closed set on purpose: anything richer is an addon.

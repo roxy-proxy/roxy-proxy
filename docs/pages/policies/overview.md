@@ -38,7 +38,7 @@ runs follows from what it reads.
    value not yet known is skipped here, not treated as false.
 2. **After that, rules watch.** For the rest of the exchange, two kinds of
    rule are re-checked whenever a value they read becomes known or changes:
-   rules that read a *watched* field ([fields](#fields)), and `deny` rules
+   rules that read a *watched* field ([fields](/reference/rule-language#fields)), and `deny` rules
    that read a byte metric (`count: request_bytes` or `response_bytes`),
    which this exchange adds to as bytes stream. A deny reading a
    `requests`, `denied`, `errors` or `unique` metric is decided at the head
