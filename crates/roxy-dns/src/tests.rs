@@ -236,6 +236,59 @@ fn a_name_over_255_bytes_is_formerr() {
     assert_eq!(rcode_of(&query(1, &long, TYPE_A)), Some(Rcode::FormErr));
 }
 
+/// A zero-length label can only be the root, so one in the middle of a
+/// name ends the name there and leaves the rest of the labels where the
+/// type and class should be: the message does not parse, whatever follows.
+#[test]
+fn a_zero_length_label_mid_name_is_formerr() {
+    for name in ["foo..bar", ".example.com", "example..com"] {
+        assert_eq!(
+            rcode_of(&query(1, name, TYPE_A)),
+            Some(Rcode::FormErr),
+            "{name:?}"
+        );
+    }
+    // With the type and class in place after the second part, too.
+    let mut m = query(1, "foo", TYPE_A);
+    let fixed = m.split_off(m.len() - 4);
+    m.pop();
+    m.extend_from_slice(&[0, 3, b'b', b'a', b'r', 0]);
+    m.extend_from_slice(&fixed);
+    assert_eq!(rcode_of(&m), Some(Rcode::FormErr));
+}
+
+/// The 255-octet limit is the name's own, not the question's: a name of
+/// exactly 255 wire octets followed by an OPT record parses, keeps its
+/// name, and its answer still fits in 512 bytes.
+#[test]
+fn a_255_byte_name_followed_by_opt_parses() {
+    let longest = [
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61),
+    ]
+    .join(".");
+    let plain = query(7, &longest, TYPE_A);
+    let q = parsed_query(&with_opt(plain.clone(), &[]));
+    assert_eq!(q.name, longest);
+    assert_eq!(q.question, plain[HEADER..].to_vec());
+    let many: Vec<IpAddr> = (0..64u8)
+        .map(|i| IpAddr::V4(Ipv4Addr::new(10, 0, 0, i)))
+        .collect();
+    let m = answer(&q, &many, 1);
+    let r = read_reply(&m);
+    assert_eq!(r.id, 7);
+    assert_ne!(r.records, Vec::new());
+    assert!(m.len() <= MAX_UDP_PAYLOAD);
+    // One octet more is still too long, OPT or not.
+    let over = format!("{longest}d");
+    assert_eq!(
+        rcode_of(&with_opt(query(7, &over, TYPE_A), &[])),
+        Some(Rcode::FormErr)
+    );
+}
+
 #[test]
 fn unanswerable_names_and_classes_are_refused() {
     let mut chaos = query(1, "version.bind", 16);

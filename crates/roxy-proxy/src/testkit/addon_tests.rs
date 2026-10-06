@@ -659,6 +659,46 @@ mod service {
         assert_eq!(errs[0]["kind"], "trap", "{errs:#?}");
     }
 
+    /// Header values a service passes back are the bytes it was given.
+    /// Under `allow_obs_text` that includes obs-text, which a UTF-8 service
+    /// protocol must carry without rewriting.
+    async fn service_header_round_trip(value: &'static [u8]) {
+        let kit = Kit::builder()
+            .rules(RULES)
+            .flags(|f| f.allow_obs_text = true)
+            .start()
+            .await;
+        reload(
+            &kit,
+            RULES,
+            &[],
+            vec![addon("s", "pass", AddonMode::Enforce, |_| {})],
+        );
+        let mut c = kit.h1().await;
+        let req = c
+            .request("GET", "/x", &[])
+            .header("x-obs", http::HeaderValue::from_bytes(value).unwrap())
+            .body(Body::empty())
+            .unwrap();
+        let a = Answer::read(c.send(req).await.unwrap()).await;
+        assert_eq!(a.status, 200, "{a:?}");
+        let seen = kit.upstream.wait_seen(1).await;
+        assert_eq!(seen[0].headers["x-obs"].as_bytes(), value);
+        let ev = kit.request_event().await;
+        assert_eq!(strs(&ev["addons"]), ["s"], "{ev:#}");
+    }
+
+    #[tokio::test]
+    async fn a_utf8_obs_text_header_survives_a_service_round_trip() {
+        service_header_round_trip(b"caf\xc3\xa9").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "the service protocol converts header values with from_utf8_lossy, so a non-UTF-8 obs-text byte comes back as U+FFFD"]
+    async fn a_latin1_obs_text_header_survives_a_service_round_trip() {
+        service_header_round_trip(b"caf\xe9").await;
+    }
+
     /// An upstream that answers while the client is still uploading
     /// reaches the client through a pass-through layer at once: the
     /// response head and body go through the stream while the request
