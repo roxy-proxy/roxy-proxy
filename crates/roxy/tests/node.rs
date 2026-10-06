@@ -197,6 +197,20 @@ impl NodeHarness {
         format!("https://upstream.test:{}{path}", self.upstream.https.port())
     }
 
+    /// `(status, body)` of `GET /readyz` on the running `ca_server`.
+    async fn readyz(&self) -> (u16, String) {
+        let ca_server = self.running().handler.ca_server_addr().await.unwrap();
+        let res = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{ca_server}/readyz"))
+            .send()
+            .await
+            .unwrap();
+        (res.status().as_u16(), res.text().await.unwrap())
+    }
+
     /// `(status, x-roxy-rule)` of a request through `proxy`.
     async fn get(&self, proxy: SocketAddr, path: &str) -> (u16, Option<String>) {
         let res = self
@@ -268,16 +282,18 @@ async fn a_node_denies_until_its_first_lease_then_serves_it_and_ships_flows() {
     );
     h.run(true).await;
 
-    // Before the lease: the bootstrap listener is up and denies.
+    // Before the lease: the bootstrap listener is up, denies and is not ready.
     let (status, rule) = h.get(h.bootstrap_proxy, "/early").await;
     assert_eq!(status, 403);
     assert_eq!(rule.as_deref(), Some("_default"));
     assert!(h.upstream.seen().is_empty());
+    assert_eq!(h.readyz().await, (503, "no_policy".to_owned()));
 
     h.wait_applied("L1").await;
     // The lease's listener replaced the bootstrap one.
     let proxy = h.proxy_addr().await;
     assert_eq!(proxy.port(), port);
+    assert_eq!(h.readyz().await, (200, "ready".to_owned()));
     assert_eq!(h.get(proxy, "/after").await, (200, None));
     let seen = h.upstream.seen();
     assert_eq!(seen.len(), 1);
@@ -429,9 +445,10 @@ async fn revocation_denies_at_once_and_keeps_health_up() {
     })
     .await
     .unwrap();
-    // The handler installs the empty policy before the node marks itself
-    // revoked, so the very next request is denied.
-    assert_eq!(h.get(proxy, "/gone").await, (403, Some("_default".into())));
+    // The handler installs the expired empty policy before the node marks
+    // itself revoked, so the very next request is denied.
+    assert_eq!(h.get(proxy, "/gone").await, (403, Some("_expired".into())));
+    assert_eq!(h.readyz().await, (503, "policy_expired".to_owned()));
     let ca_server = h.running().handler.ca_server_addr().await.unwrap();
     let health = reqwest::Client::builder()
         .no_proxy()
@@ -462,6 +479,7 @@ async fn an_unreachable_control_plane_lets_the_lease_run_down() {
     assert_eq!(h.get(proxy, "/ok").await.0, 200);
     tokio::time::sleep(Duration::from_millis(1300)).await;
     assert_eq!(h.get(proxy, "/late").await, (403, Some("_expired".into())));
+    assert_eq!(h.readyz().await, (503, "policy_expired".to_owned()));
     let so_far = h.mock.requests_to(LEASE).len();
     let fetches = h.mock.wait_for(LEASE, so_far + 1).await;
     let last = fetches.last().unwrap().node_state();

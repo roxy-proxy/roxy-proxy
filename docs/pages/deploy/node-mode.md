@@ -64,9 +64,9 @@ Workloads fetch the CA from `ca_server` as usual
 
 1. The listeners open at once. Until the first lease is applied the node
    runs an empty policy: every request is denied with `terminal_rule:
-   _default`, `/healthz` answers `200` and `/readyz` answers `503`. Before
-   the first lease those listeners are the bootstrap ones: the proxy on
-   `0.0.0.0:3128` and `ca_server` on `0.0.0.0:3130`.
+   _default`, `/healthz` answers `200` and `/readyz` answers `503
+   no_policy`. Before the first lease those listeners are the bootstrap
+   ones: the proxy on `0.0.0.0:3128` and `ca_server` on `0.0.0.0:3130`.
 2. With no `node.crt` in the state dir the node reads the token, generates
    a key pair and a CSR, and `POST`s `/roxy/v1/enrol`. The certificate and
    key are written to the state dir. A `401` here means the token is spent
@@ -118,7 +118,7 @@ take.
 |---|---|
 | `200` | Applies the lease as above and polls again after `refresh_after_seconds`. |
 | `304` | Keeps the lease it has, moves `valid_until` forward by `Roxy-Lease-Valid-For` and polls after `Roxy-Lease-Refresh-After`. Nothing is rebuilt. |
-| `410` | Revoked. Installs the empty policy at once (every request denied, `/readyz` `503`), ships the flow events still spooled, stops polling. `/healthz` stays `200`. Definite: a restart with the same state dir ends the same way. |
+| `410` | Revoked. Installs an empty, already expired policy at once (every request denied with `_expired`, `/readyz` `503 policy_expired`), ships the flow events still spooled, stops polling. `/healthz` stays `200`. Definite: a restart with the same state dir ends the same way. |
 | `401` | The certificate is not recognised. Logged distinctly; the lease runs down. The node never re-enrols, since the token is gone: to re-enrol, empty the state dir and start with a new token. |
 | `426` | The control plane will not render for this roxy version or feature set. Logged with the `missing` list; the lease runs down. |
 | `5xx`, timeout, connection or TLS error | Retried with backoff (1 s doubling to 60 s, with jitter); the lease runs down. Unreachability is not itself a reason to deny; expiry is. |

@@ -304,8 +304,15 @@ impl NodeHandler {
         Ok((policy, update, prepared))
     }
 
-    /// Starts a server for `config` with `update` as its policy.
-    async fn start_server(&self, config: &Config, update: PolicyUpdate) -> anyhow::Result<Server> {
+    /// Starts a server for `config` with `update` as its policy;
+    /// `placeholder` marks the bootstrap policy, which `/readyz` reports as
+    /// no policy at all.
+    async fn start_server(
+        &self,
+        config: &Config,
+        update: PolicyUpdate,
+        placeholder: bool,
+    ) -> anyhow::Result<Server> {
         let ca = Arc::new(load_ca(config)?);
         let minter = Arc::new(LeafMinter::new(ca.clone(), config.tls.leaf_cache_size)?);
         let local = match &self.local_sink {
@@ -341,6 +348,7 @@ impl NodeHandler {
             metrics: self.metrics.clone(),
             state,
             policy: update,
+            placeholder_policy: placeholder,
         };
         Ok(Server::start(rt).await?)
     }
@@ -428,7 +436,7 @@ impl NodeHandler {
                 self.metrics.install(&policy, config.limits.metric_limits());
             }
             let server = self
-                .start_server(&config, update)
+                .start_server(&config, update, false)
                 .await
                 .map_err(|e| format!("starting the listeners for the lease: {e:#}"))?;
             *self.server.lock().await = Some(server);
@@ -476,17 +484,18 @@ impl NodeHandler {
         Ok(())
     }
 
-    /// The empty policy: the running config with no rules, no secrets and
-    /// no expiry, so every request is denied until a restart.
+    /// The empty policy, already expired: the running config with no rules
+    /// and no secrets, so every request is denied with `_expired` and
+    /// `/readyz` reports the policy expired, until a restart.
     async fn revoke_lease(&self) {
         let mut run = self.running.lock().await;
         let mut config = run.config.clone();
         config.rules.clear();
         config.secrets.clear();
-        config.valid_until = None;
+        let expired = Utc::now() - chrono::Duration::seconds(1);
         let result = async {
             let (policy, update, prepared) = self
-                .build_update(&config, HashMap::new(), None, false)
+                .build_update(&config, HashMap::new(), Some(expired), false)
                 .await?;
             self.swap(&config, &policy, update, prepared, false).await
         }
@@ -496,6 +505,7 @@ impl NodeHandler {
         }
         run.revoked = true;
         run.secrets.clear();
+        run.valid_until = Some(expired);
         self.summarise(&run);
     }
 
@@ -755,7 +765,7 @@ pub async fn start(opts: NodeOptions) -> anyhow::Result<NodeRunning> {
     )?;
     let _ = handler.spool.set(node.spool().clone());
     let update = policy_update_with_secrets(&config, compiled.policy, HashMap::new())?;
-    let server = handler.start_server(&config, update).await?;
+    let server = handler.start_server(&config, update, true).await?;
     *handler.server.lock().await = Some(server);
     tracing::info!(
         state_dir = %state_dir.path().display(),
