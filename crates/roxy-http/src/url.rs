@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::chars::{hex_upper, hex_val, is_pchar_literal, is_unreserved};
+use crate::chars::{hex_upper, hex_val, is_pchar_literal, is_unreserved, is_url_encodable};
 use crate::model::{Authority, Host, ParseError, Reason, Scheme, reject};
 
 /// Longest DNS name accepted (RFC 1035).
@@ -18,7 +18,8 @@ const MAX_DNS_LABEL: usize = 63;
 /// A normalised request path. Only produced by [`normalize_path`] (or the
 /// equivalent `TryFrom`), so holding one means it is canonical: starts with
 /// `/`, contains only `pchar` / `/`, upper-case percent-encodings of
-/// non-unreserved bytes only, and no dot segments.
+/// non-unreserved bytes only (including the visible ASCII that arrived raw
+/// but is not `pchar`), and no dot segments.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Path(String);
 
@@ -54,8 +55,8 @@ impl TryFrom<&str> for Path {
 pub struct Query(String);
 
 impl Query {
-    /// The canonical raw query (percent-encodings upper-cased, otherwise
-    /// untouched).
+    /// The canonical raw query (percent-encodings upper-cased, raw bytes
+    /// outside the literal set percent-encoded, otherwise untouched).
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -117,7 +118,9 @@ fn decode_form(s: &str) -> Cow<'_, str> {
 }
 
 /// Validates percent-encodings and literal characters, decoding encoded
-/// unreserved bytes when `decode_unreserved`, upper-casing the rest.
+/// unreserved bytes when `decode_unreserved`, upper-casing the rest. Bytes
+/// that are not `allowed` but [`is_url_encodable`] are percent-encoded;
+/// anything else visible is rejected with `invalid`.
 fn canonicalize_encodings(
     raw: &[u8],
     allowed: impl Fn(u8) -> bool,
@@ -160,13 +163,18 @@ fn canonicalize_encodings(
         if byte >= 0x80 {
             return reject(Reason::NonAscii, format!("non-ASCII byte at offset {i}"));
         }
-        if !allowed(byte) {
+        if allowed(byte) {
+            out.push(char::from(byte));
+        } else if is_url_encodable(byte) {
+            out.push('%');
+            out.push(char::from(hex_upper(byte >> 4)));
+            out.push(char::from(hex_upper(byte)));
+        } else {
             return reject(
                 invalid,
                 format!("byte 0x{byte:02x} not allowed at offset {i}"),
             );
         }
-        out.push(char::from(byte));
     }
     Ok(out)
 }
@@ -228,8 +236,9 @@ fn remove_dot_segments(path: &str) -> Result<String, ParseError> {
 /// Validates a query (without the leading `?`) (URL normalisation step 6).
 ///
 /// Allowed literals are `pchar`, `/`, `?`, plus `[` and `]`: Python
-/// `requests` (and others) send brackets unencoded in queries, and rejecting
-/// them would trip well-behaved clients. They are forwarded untouched.
+/// `requests` (and others) send brackets unencoded in queries, and they are
+/// forwarded untouched. Other raw bytes that clients send unencoded (`{`,
+/// `}`, `|`, `^`, `` ` ``) are percent-encoded.
 pub fn normalize_query(raw: &[u8]) -> Result<Query, ParseError> {
     canonicalize_encodings(
         raw,
@@ -439,6 +448,9 @@ mod tests {
         assert_eq!(np("/a%2Fb").unwrap(), "/a%2Fb");
         assert_eq!(np("/%e2%82%ac").unwrap(), "/%E2%82%AC");
         assert_eq!(np("/a:b@c;d=e,f!$&'()*+").unwrap(), "/a:b@c;d=e,f!$&'()*+");
+        assert_eq!(np("/a|b^c").unwrap(), "/a%7Cb%5Ec");
+        assert_eq!(np("/a[b]{c}`d").unwrap(), "/a%5Bb%5D%7Bc%7D%60d");
+        assert_eq!(np("/%7c%5e").unwrap(), "/%7C%5E");
     }
 
     #[test]
@@ -457,7 +469,9 @@ mod tests {
         assert_eq!(np("/a b"), Err(Reason::InvalidPath));
         assert_eq!(np("/a\\b"), Err(Reason::InvalidPath));
         assert_eq!(np("/a\"b"), Err(Reason::InvalidPath));
-        assert_eq!(np("/a[b]"), Err(Reason::InvalidPath));
+        assert_eq!(np("/a<b>"), Err(Reason::InvalidPath));
+        assert_eq!(np("/a?b"), Err(Reason::InvalidPath));
+        assert_eq!(np("/a\x7f"), Err(Reason::InvalidPath));
         assert_eq!(np("/a\x00"), Err(Reason::InvalidPath));
         assert_eq!(np("/a#b"), Err(Reason::FragmentInTarget));
         assert_eq!(np("/caf\u{e9}"), Err(Reason::NonAscii));
@@ -483,10 +497,20 @@ mod tests {
         assert_eq!(q.get("c").as_deref(), Some("x y"));
         assert_eq!(normalize_query(b"a[]=1").unwrap().as_str(), "a[]=1");
         assert_eq!(normalize_query(b"a=?/").unwrap().as_str(), "a=?/");
+        assert_eq!(
+            normalize_query(b"filter={\"a\":1}").unwrap_err().reason,
+            Reason::InvalidQuery
+        );
+        assert_eq!(
+            normalize_query(b"filter={a:1}&ids=1|2^3`").unwrap().as_str(),
+            "filter=%7Ba:1%7D&ids=1%7C2%5E3%60"
+        );
         for (bad, r) in [
             (&b"a=%g0"[..], Reason::BadPercentEncoding),
             (b"a b", Reason::InvalidQuery),
             (b"a=\"", Reason::InvalidQuery),
+            (b"a=<b>", Reason::InvalidQuery),
+            (b"a=\\", Reason::InvalidQuery),
             (b"a#b", Reason::FragmentInTarget),
             (b"a=\xff", Reason::NonAscii),
         ] {
@@ -643,6 +667,31 @@ mod tests {
             let enc = if lower { "%2f" } else { "%2F" };
             let p = np(&format!("/{a}{enc}{b}")).unwrap();
             prop_assert_eq!(p, format!("/{a}%2F{b}"));
+        }
+
+        #[test]
+        fn visible_ascii_survives_or_is_encoded(c in proptest::char::range('!', '~')) {
+            let b = u8::try_from(u32::from(c)).unwrap();
+            let raw = format!("/x{c}y");
+            let encoded = format!("/x%{b:02X}y");
+            let path_rejects = matches!(b, b'"' | b'#' | b'%' | b'<' | b'>' | b'?' | b'\\');
+            match normalize_path(raw.as_bytes()) {
+                Ok(p) => {
+                    prop_assert!(!path_rejects);
+                    prop_assert!(p.as_str() == raw || p.as_str() == encoded, "{}", p);
+                    prop_assert_eq!(normalize_path(p.as_str().as_bytes()).unwrap(), p);
+                }
+                Err(_) => prop_assert!(path_rejects, "{raw} rejected"),
+            }
+            let query_rejects = matches!(b, b'"' | b'#' | b'%' | b'<' | b'>' | b'\\');
+            match normalize_query(raw.as_bytes()) {
+                Ok(q) => {
+                    prop_assert!(!query_rejects);
+                    prop_assert!(q.as_str() == raw || q.as_str() == encoded, "{}", q);
+                    prop_assert_eq!(normalize_query(q.as_str().as_bytes()).unwrap(), q);
+                }
+                Err(_) => prop_assert!(query_rejects, "{raw} rejected"),
+            }
         }
 
         #[test]

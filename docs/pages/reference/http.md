@@ -197,8 +197,11 @@ The strictness knobs live under `http:` and all default to strict.
 Applied to the request target, both for rule matching and for what is
 forwarded, so the upstream sees exactly what the rules matched.
 
-1. The path starts with `/` and contains only `pchar` and `/`, with
-   well-formed percent-encodings. Anything else is rejected.
+1. The path starts with `/` and contains `pchar` and `/`, with well-formed
+   percent-encodings. The visible ASCII that mainstream clients send raw
+   but RFC 3986 excludes (`[ ] { } | ^` and `` ` ``) is percent-encoded
+   rather than rejected, so `/a|b` is forwarded and matched as `/a%7Cb`.
+   Space, control bytes, `"`, `<`, `>`, `\` and non-ASCII are rejected.
 2. Percent-encoded unreserved characters (`A–Z a–z 0–9 - . _ ~`) are
    decoded. Other encodings stay as they are, so `%2F` stays `%2F`: roxy
    takes no position on whether it is a separator, and the client cannot
@@ -208,8 +211,10 @@ forwarded, so the upstream sees exactly what the rules matched.
    removed per RFC 3986 §5.2.4. A path that climbs above the root is
    rejected.
 5. An empty path becomes `/`.
-6. The query is validated the same way and its hex upper-cased, but
-   otherwise untouched. It is parsed into pairs for matching only.
+6. The query is validated the same way and its hex upper-cased. `/`, `?`,
+   `[` and `]` are also allowed raw; `{ } | ^` and `` ` `` are
+   percent-encoded; nothing is decoded. It is parsed into pairs for
+   matching only.
 7. A fragment in a request target is rejected.
 8. The host is lower-cased; IDNA labels must already be A-labels (`xn--`)
    and raw Unicode is rejected; the port is made explicit; a trailing dot is

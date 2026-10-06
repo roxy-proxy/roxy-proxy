@@ -44,6 +44,14 @@ pub(crate) const fn is_pchar_literal(b: u8) -> bool {
     is_unreserved(b) || is_sub_delim(b) || matches!(b, b':' | b'@')
 }
 
+/// Visible ASCII outside `pchar` that mainstream clients send raw in paths
+/// and queries (the WHATWG URL serialiser leaves them unencoded; Go and curl
+/// send them verbatim). roxy percent-encodes these rather than rejecting the
+/// request.
+pub(crate) const fn is_url_encodable(b: u8) -> bool {
+    matches!(b, b'[' | b']' | b'^' | b'`' | b'{' | b'|' | b'}')
+}
+
 /// Field-value byte under roxy's rule: visible ASCII, SP, HTAB, and obs-text
 /// only when allowed.
 pub(crate) const fn is_field_value_byte(b: u8, allow_obs_text: bool) -> bool {

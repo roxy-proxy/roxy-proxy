@@ -89,10 +89,11 @@ pub enum Reason {
     /// Missing CRLF after chunk data.
     BadChunkFraming,
     // ----- URL -----
-    /// Path contains a character outside `pchar` / `/`, or does not start
-    /// with `/`.
+    /// Path contains a byte that is neither `pchar` / `/` nor one roxy
+    /// percent-encodes, or does not start with `/`.
     InvalidPath,
-    /// Query contains a character outside the allowed set.
+    /// Query contains a byte that is neither in the literal set nor one roxy
+    /// percent-encodes.
     InvalidQuery,
     /// Dot segments climb above the root.
     PathClimbsAboveRoot,
