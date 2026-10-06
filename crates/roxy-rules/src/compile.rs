@@ -491,21 +491,33 @@ impl Compiler<'_, '_> {
         })
     }
 
+    /// Collect the operands of an `or` (`and`) chain, left to right. The
+    /// parser builds a chain left-deep and does not count its links against
+    /// `MAX_DEPTH`, so the left spine is walked iteratively; a right child
+    /// of the same kind only arises from parentheses, which are counted.
     fn flatten(&mut self, node: &Node, or: bool, out: &mut Vec<Pred>) -> Result<(), ExprError> {
-        match &node.expr {
-            Expr::Or(a, b) if or => {
-                self.flatten(a, or, out)?;
-                self.flatten(b, or, out)
-            }
-            Expr::And(a, b) if !or => {
-                self.flatten(a, or, out)?;
-                self.flatten(b, or, out)
-            }
-            Expr::Or(..) | Expr::And(..) | Expr::Not(_) | Expr::Cmp { .. } | Expr::Pred(_) => {
-                out.push(self.node(node)?);
-                Ok(())
+        let mut rights = Vec::new();
+        let mut node = node;
+        loop {
+            match &node.expr {
+                Expr::Or(a, b) if or => {
+                    rights.push(b);
+                    node = a;
+                }
+                Expr::And(a, b) if !or => {
+                    rights.push(b);
+                    node = a;
+                }
+                Expr::Or(..) | Expr::And(..) | Expr::Not(_) | Expr::Cmp { .. } | Expr::Pred(_) => {
+                    break;
+                }
             }
         }
+        out.push(self.node(node)?);
+        rights
+            .into_iter()
+            .rev()
+            .try_for_each(|b| self.flatten(b, or, out))
     }
 
     fn operand<'n>(&mut self, o: &'n Operand) -> Result<Typed<'n>, ExprError> {
@@ -1039,8 +1051,11 @@ fn lower(t: Typed<'_>) -> ROperand {
             Lit::Int(n, u) => Const::Int(Lit::int_value(*n, *u)),
             Lit::Bool(b) => Const::Bool(*b),
             Lit::Ip(ip) => Const::Ip(ip.to_canonical()),
-            // Rejected by the type checks before lowering.
-            Lit::List(_) | Lit::Cidr(_) | Lit::AddressList(_) | Lit::Null => Const::Bool(false),
+            Lit::List(_) | Lit::Cidr(_) | Lit::AddressList(_) | Lit::Null => {
+                unreachable!(
+                    "list, CIDR, address list and null literals are rejected before lowering"
+                )
+            }
         }),
     }
 }

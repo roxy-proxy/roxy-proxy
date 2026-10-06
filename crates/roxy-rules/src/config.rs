@@ -38,6 +38,11 @@ impl<'de> Deserialize<'de> for Expr {
             fn visit_bool<E: de::Error>(self, v: bool) -> Result<Expr, E> {
                 Ok(Expr(v.to_string()))
             }
+            fn visit_unit<E: de::Error>(self) -> Result<Expr, E> {
+                Err(E::custom(
+                    "expression must not be null (omit the key to match everything)",
+                ))
+            }
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Expr, E> {
                 if v.trim().is_empty() {
                     return Err(E::custom(
@@ -49,6 +54,12 @@ impl<'de> Deserialize<'de> for Expr {
         }
         d.deserialize_any(V)
     }
+}
+
+/// An optional expression key. The key may be omitted, but an explicit
+/// `null` is rejected rather than read as "match everything".
+fn optional_expr<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Expr>, D::Error> {
+    Expr::deserialize(d).map(Some)
 }
 
 // ----- rules ----------------------------------------------------------------
@@ -77,7 +88,7 @@ struct RawRule {
     id: String,
     #[serde(default)]
     phase: Option<de::IgnoredAny>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_expr")]
     when: Option<Expr>,
     then: Then,
 }
@@ -514,7 +525,7 @@ pub struct MetricConfig {
     pub id: String,
     pub count: MetricCount,
     /// Filter expression; absent = every flow.
-    #[serde(default, rename = "where")]
+    #[serde(default, rename = "where", deserialize_with = "optional_expr")]
     pub where_: Option<Expr>,
     /// Series key fields; empty = one global series.
     #[serde(default)]
@@ -749,6 +760,27 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(unknown.contains("bogus"), "{unknown}");
+    }
+
+    #[test]
+    fn explicit_null_expression_is_rejected() {
+        for yaml in [
+            "- { id: r, when: ~, then: deny }",
+            "- { id: r, when: null, then: deny }",
+            "- id: r\n  when:\n  then: deny\n",
+        ] {
+            let err = serde_yaml_ng::from_str::<Vec<RuleConfig>>(yaml)
+                .expect_err(yaml)
+                .to_string();
+            assert!(err.contains("must not be null"), "{yaml}: {err}");
+        }
+        let err =
+            serde_yaml_ng::from_str::<Vec<MetricConfig>>("- { id: m, count: requests, where: ~ }")
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("must not be null"), "{err}");
+        let omitted: Vec<RuleConfig> = serde_yaml_ng::from_str("- { id: r, then: deny }").unwrap();
+        assert_eq!(omitted[0].when, None);
     }
 
     #[test]

@@ -8,8 +8,7 @@ use std::time::Duration;
 use common::{METRICS, compile, try_compile};
 use roxy_rules::{
     AllowOpts, CaptureTarget, Decision, Deny, DenyStatus, Effect, EvalContext, FailClosedReason,
-    Field, LogLevel, MapView, Policy, Reads, RuleKind, Scheme, SetHeaderValue, Value,
-    WatchOutcome,
+    Field, LogLevel, MapView, Policy, Reads, RuleKind, Scheme, SetHeaderValue, Value, WatchOutcome,
 };
 
 fn ip(s: &str) -> Value<'static> {
