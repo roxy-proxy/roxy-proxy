@@ -2770,32 +2770,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "roxy-node-conformance"
+name = "roxy-node-spec"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bytes",
- "clap",
- "flate2",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
  "jsonschema",
- "pem",
- "rcgen",
- "reqwest",
- "ring",
- "rustls",
- "rustls-pki-types",
- "serde",
  "serde_json",
- "sha2",
- "time",
- "tokio",
- "tokio-rustls",
- "x509-parser",
+ "serde_yaml_ng",
 ]
 
 [[package]]

@@ -1,0 +1,585 @@
+openapi: 3.1.0
+info:
+  title: roxy node protocol
+  version: "1"
+  summary: The contract between a roxy node and its control plane.
+  description: |
+    Enrolment authenticates with a single-use bearer token; every other
+    operation authenticates with the node certificate (mutual TLS). The
+    listener must accept connections without a client certificate so that
+    enrolment can happen, and answer every other operation that arrives
+    without one with `401`. Unknown fields in any body are ignored by both
+    sides. The prose explanation is `docs/pages/reference/node-protocol.md`.
+  license:
+    name: MIT OR Apache-2.0
+servers:
+  - url: https://{control_plane}/roxy/v1
+    variables:
+      control_plane:
+        default: control-plane.example
+        description: Host and port from the node's bootstrap material.
+
+security:
+  - nodeCertificate: []
+
+paths:
+  /enrol:
+    post:
+      operationId: enrol
+      summary: Exchange a single-use enrolment token for a node certificate.
+      description: |
+        The CSR's signature proves the node holds the key. The server takes
+        the public key, ignores the CSR's subject and extensions, and issues a
+        certificate whose only SAN is the URI `urn:roxy:node:<node_id>`. The
+        token is consumed only by a `200`.
+      security:
+        - enrolmentToken: []
+      requestBody:
+        $ref: "#/components/requestBodies/EnrolRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/Enrolled"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          description: The token is unknown, already used or expired. The node cannot recover.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: invalid_token
+                message: enrolment token already used
+        "426":
+          $ref: "#/components/responses/Unsupported"
+        "5XX":
+          $ref: "#/components/responses/ServerError"
+
+  /renew:
+    post:
+      operationId: renew
+      summary: Replace the node certificate before it expires.
+      description: |
+        Same body and response as enrolment; `node_id` is unchanged. The old
+        certificate stays valid until its own `not_after`. A failed renewal is
+        retried with backoff; if the certificate expires first the node can no
+        longer fetch leases and its lease runs down.
+      requestBody:
+        $ref: "#/components/requestBodies/EnrolRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/Enrolled"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unrecognised"
+        "410":
+          $ref: "#/components/responses/Revoked"
+        "426":
+          $ref: "#/components/responses/Unsupported"
+        "5XX":
+          $ref: "#/components/responses/ServerError"
+
+  /lease:
+    get:
+      operationId: lease
+      summary: Fetch the node's lease, or learn that it is unchanged.
+      description: |
+        The node reports its state in `Roxy-Node-State` and the ETag of the
+        lease it holds in `If-None-Match`. The server renders for the reported
+        version and features. A `304` extends the lease the node already holds
+        by the amounts in its headers; the node applies them exactly as it
+        would `valid_for_seconds` and `refresh_after_seconds` from a `200`.
+      parameters:
+        - $ref: "#/components/parameters/NodeState"
+        - name: If-None-Match
+          in: header
+          required: false
+          description: The `ETag` of the lease the node holds, which is its `lease_id` quoted.
+          schema:
+            type: string
+            examples: ['"lease-01J9Z8K3"']
+      responses:
+        "200":
+          description: A lease. The node applies it in full or not at all.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Lease"
+        "304":
+          description: |
+            The lease the node holds is still the one the server would issue.
+            No body. The headers extend it.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+            Roxy-Lease-Valid-For:
+              required: true
+              description: Seconds from receipt for which the held lease is now valid.
+              schema:
+                type: integer
+                minimum: 1
+            Roxy-Lease-Refresh-After:
+              required: true
+              description: Seconds from receipt after which to poll again; inside `Roxy-Lease-Valid-For`.
+              schema:
+                type: integer
+                minimum: 1
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unrecognised"
+        "410":
+          $ref: "#/components/responses/Revoked"
+        "426":
+          $ref: "#/components/responses/Unsupported"
+        "5XX":
+          $ref: "#/components/responses/ServerError"
+
+  /flows:
+    post:
+      operationId: flows
+      summary: Upload a batch of flow-log events, at least once.
+      description: |
+        Events carry a per-node `seq` that increases by one per event and
+        survives restarts. The server deduplicates on `(node_id, seq)` and
+        acknowledges the highest `seq` it has stored; the node drops spooled
+        events at or below it. A gap in a node's sequence is a server-side
+        alert, not an error.
+      parameters:
+        - name: Content-Encoding
+          in: header
+          required: false
+          description: "`gzip` when the body is compressed."
+          schema:
+            type: string
+            enum: [gzip]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FlowBatch"
+      responses:
+        "200":
+          description: The batch is stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FlowAck"
+        "400":
+          description: |
+            Malformed, `node_id` does not match the certificate (`node_mismatch`),
+            `lease_id` was never issued to this node, or events are not
+            consecutive from `seq_first`. Not retried.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unrecognised"
+        "410":
+          $ref: "#/components/responses/Revoked"
+        "413":
+          description: |
+            The batch is larger than the server will take, measured on the
+            JSON before compression. The node halves `batch_max_events` and
+            retries, down to one event; a single event still refused is
+            dropped and logged once.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "507":
+          description: |
+            The node's flow quota is exhausted. Terminal for shipping until a
+            lease with a new `lease_id` arrives: the node stops shipping, logs
+            once and applies `on_high_water` to what accumulates.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "5XX":
+          $ref: "#/components/responses/ServerError"
+
+components:
+  securitySchemes:
+    enrolmentToken:
+      type: http
+      scheme: bearer
+      description: The single-use enrolment token from the node's bootstrap material.
+    nodeCertificate:
+      type: mutualTLS
+      description: |
+        The node certificate issued at enrolment, whose URI SAN
+        `urn:roxy:node:<node_id>` names the node. The node presents the whole
+        chain from the enrolment response.
+
+  parameters:
+    NodeState:
+      name: Roxy-Node-State
+      in: header
+      required: true
+      description: The node's state as one compact JSON object.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/NodeState"
+
+  headers:
+    ETag:
+      required: true
+      description: The `lease_id`, quoted. Sent back as `If-None-Match`.
+      schema:
+        type: string
+
+  requestBodies:
+    EnrolRequest:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/EnrolRequest"
+
+  responses:
+    Enrolled:
+      description: A certificate for the node.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/EnrolResponse"
+    BadRequest:
+      description: The request was malformed. The node logs it and does not retry the same request.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unrecognised:
+      description: |
+        No client certificate, or one that does not map to a known node. The
+        node logs once per outcome change and lets its lease run down. It
+        never re-enrols: the token is gone. A TLS handshake the server rejects
+        because of the client certificate is treated the same way.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Revoked:
+      description: |
+        The node is revoked. Definite and terminal: the node writes an empty
+        policy at once, ships what is spooled, stops polling and keeps health
+        up.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unsupported:
+      description: |
+        The server will not serve this protocol version, or will not render
+        for the node's features. `missing` names what the node lacks. For the
+        lease the node treats this as a server error (the lease runs down)
+        but logs it distinctly.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: unsupported
+            message: "node lacks: addon:wasm"
+            missing: ["addon:wasm"]
+    ServerError:
+      description: |
+        The control plane is unavailable. Together with timeouts and
+        connection errors: retry with backoff; the lease runs down.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    NodeId:
+      type: string
+      pattern: "^[A-Za-z0-9._-]{1,128}$"
+      description: Chosen by the server at enrolment; stable for the life of the node.
+
+    Features:
+      type: array
+      description: |
+        What the node can run. `valid_until`, `sourceless_secrets`, `readyz`,
+        `action:<name>` per rule action, `addon:<kind>` per addon kind.
+        Case-sensitive; a server ignores names it does not know.
+      items:
+        type: string
+        minLength: 1
+      uniqueItems: true
+
+    Seq:
+      type: integer
+      minimum: 0
+      maximum: 18446744073709551615
+
+    EnrolRequest:
+      type: object
+      description: Body of enrol and renew.
+      required: [csr, roxy_version, protocol_version, features]
+      properties:
+        csr:
+          type: string
+          description: PEM `CERTIFICATE REQUEST` for an ECDSA P-256 or Ed25519 key, signed by that key.
+          pattern: "^-----BEGIN CERTIFICATE REQUEST-----[\\s\\S]+-----END CERTIFICATE REQUEST-----\\s*$"
+        roxy_version:
+          type: string
+          minLength: 1
+        protocol_version:
+          type: integer
+          const: 1
+        features:
+          $ref: "#/components/schemas/Features"
+
+    EnrolResponse:
+      type: object
+      description: "`200` body of enrol and renew."
+      required: [node_id, certificate_chain, not_after, renew_after_seconds]
+      properties:
+        node_id:
+          $ref: "#/components/schemas/NodeId"
+        certificate_chain:
+          type: string
+          description: |
+            PEM: the node certificate first, then intermediates up to but not
+            including the root. The node certificate's only SAN is the URI
+            `urn:roxy:node:<node_id>`.
+          pattern: "^-----BEGIN CERTIFICATE-----[\\s\\S]+-----END CERTIFICATE-----\\s*$"
+        not_after:
+          type: string
+          format: date-time
+          description: The certificate's expiry, RFC 3339 in UTC, as in the certificate.
+        renew_after_seconds:
+          type: integer
+          minimum: 1
+          description: Seconds after receipt at which the node renews. Well inside the certificate lifetime.
+
+    NodeState:
+      type: object
+      description: Value of the `Roxy-Node-State` header.
+      required:
+        - lease_id
+        - config_hash
+        - secrets_hash
+        - roxy_version
+        - protocol_version
+        - features
+        - uptime_seconds
+        - policy_state
+        - spooled_bytes
+      properties:
+        lease_id:
+          type: [string, "null"]
+          minLength: 1
+          description: Null before the first lease.
+        config_hash:
+          type: [string, "null"]
+          pattern: "^sha256:[0-9a-f]{64}$"
+        secrets_hash:
+          type: [string, "null"]
+          minLength: 1
+        roxy_version:
+          type: string
+          minLength: 1
+        protocol_version:
+          type: integer
+          const: 1
+        features:
+          $ref: "#/components/schemas/Features"
+        uptime_seconds:
+          type: integer
+          minimum: 0
+        policy_state:
+          type: string
+          enum: [none, loaded, expired]
+          description: "`none` before the first lease; `expired` after it ran down or the node was revoked."
+        spooled_bytes:
+          type: integer
+          minimum: 0
+          description: Flow-log bytes accepted but not yet acknowledged.
+
+    SecretValue:
+      description: UTF-8 text, or bytes as standard base64 with padding.
+      oneOf:
+        - type: string
+        - type: object
+          required: [b64]
+          additionalProperties: false
+          properties:
+            b64:
+              type: string
+              pattern: "^[A-Za-z0-9+/]*={0,2}$"
+
+    FlowSettings:
+      type: object
+      required:
+        - ship
+        - batch_max_bytes
+        - batch_max_events
+        - flush_interval_seconds
+        - spool_high_water_bytes
+        - on_high_water
+      properties:
+        ship:
+          type: boolean
+          description: "`false` turns shipping off; the other fields are still required."
+        batch_max_bytes:
+          type: integer
+          minimum: 1
+          description: Largest batch, measured on the JSON before compression.
+        batch_max_events:
+          type: integer
+          minimum: 1
+        flush_interval_seconds:
+          type: integer
+          minimum: 1
+          description: Flush when this long has passed since the first unsent event.
+        spool_high_water_bytes:
+          type: integer
+          minimum: 0
+        on_high_water:
+          type: string
+          enum: [hold, spool]
+          description: "`hold` stalls traffic with roxy's backpressure; `spool` drops the oldest spooled events, logging once."
+
+    Lease:
+      type: object
+      description: "`200` body of the lease fetch."
+      required:
+        - lease_id
+        - issued_at
+        - valid_for_seconds
+        - refresh_after_seconds
+        - config
+        - config_hash
+        - secrets
+        - secrets_hash
+        - state_epoch
+        - flow
+      properties:
+        lease_id:
+          type: string
+          minLength: 1
+          description: Opaque; changes whenever any other field changes. Also the `ETag`.
+        issued_at:
+          type: string
+          format: date-time
+          description: The server's clock, for logs only.
+        valid_for_seconds:
+          type: integer
+          minimum: 1
+          description: |
+            A duration. The node sets `valid_until = now + valid_for_seconds`
+            from its own clock at receipt, so clock skew between node and
+            server cannot shorten or lengthen the lease.
+        refresh_after_seconds:
+          type: integer
+          minimum: 1
+          description: When to poll next, counted the same way; well inside `valid_for_seconds`.
+        config:
+          type: string
+          description: A complete `roxy.yaml` with no secret values; every `secrets:` entry is sourceless.
+        config_hash:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+          description: SHA-256 of the UTF-8 bytes of `config`. A change rebuilds the policy.
+        secrets:
+          type: object
+          description: Each secret name the config declares, to its value.
+          additionalProperties:
+            $ref: "#/components/schemas/SecretValue"
+        secrets_hash:
+          type: string
+          minLength: 1
+          description: |
+            Opaque; changes whenever any value changes. Not a plain digest of
+            the values, because the node reports and may log it. A change with
+            `config_hash` unchanged swaps the secret map only.
+        state_epoch:
+          type: string
+          minLength: 1
+          description: |
+            Opaque. When it differs from the previous lease's, the node clears
+            every rule `set_state` entry and metric window before applying the
+            lease. The first lease sets it without clearing anything.
+        flow:
+          $ref: "#/components/schemas/FlowSettings"
+        interception_ca:
+          description: Reserved for a later version. A v1 server must not send it; a v1 node ignores it.
+          not: {}
+
+    FlowEvent:
+      type: object
+      description: A flow-log record with `seq` added.
+      required: [seq, ts, event]
+      properties:
+        seq:
+          $ref: "#/components/schemas/Seq"
+        ts:
+          type: string
+          format: date-time
+        event:
+          type: string
+          minLength: 1
+
+    FlowBatch:
+      type: object
+      description: Body of the flow upload, optionally gzip-compressed.
+      required: [node_id, lease_id, seq_first, events]
+      properties:
+        node_id:
+          $ref: "#/components/schemas/NodeId"
+        lease_id:
+          type: string
+          minLength: 1
+          description: The lease in force when the batch was assembled; any lease id issued to the node is accepted.
+        seq_first:
+          $ref: "#/components/schemas/Seq"
+        events:
+          type: array
+          minItems: 1
+          description: Consecutive, in order, starting at `seq_first`.
+          items:
+            $ref: "#/components/schemas/FlowEvent"
+
+    FlowAck:
+      type: object
+      description: "`200` body of the flow upload."
+      required: [acked_through]
+      properties:
+        acked_through:
+          $ref: "#/components/schemas/Seq"
+          description: The highest `seq` the server has stored for this node.
+
+    Error:
+      type: object
+      description: Body of every non-`2xx`, non-`304` response. The node acts on the status code, not the body.
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          pattern: "^[a-z][a-z0-9_]*$"
+          description: A stable code.
+        message:
+          type: string
+        missing:
+          type: array
+          description: "On `426`: the features or protocol version the node lacks, for example `protocol_version:1` or `addon:wasm`."
+          minItems: 1
+          items:
+            type: string
+            minLength: 1
+      if:
+        properties:
+          error:
+            const: unsupported
+      then:
+        required: [missing]

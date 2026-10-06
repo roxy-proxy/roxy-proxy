@@ -2,10 +2,11 @@
 
 The protocol between a roxy node and its control plane. A node is a roxy
 process started in node mode; a control plane is any server that implements
-these four endpoints. The protocol is the contract: JSON schemas for every
-body live in `spec/node-protocol/v1/` and a conformance harness,
-`roxy-node-conformance`, checks a server against them (see
-[conformance](#conformance)).
+these four operations. The contract is the OpenAPI document at
+[`spec/node-protocol/v1/openapi.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/spec/node-protocol/v1/openapi.yaml):
+every operation, header, status code and body schema. This page explains
+it. The example bodies here are checked against the document's schemas in
+CI, and each is titled with the schema it satisfies.
 
 The flow is: a node enrols once with a bootstrap token and receives a
 certificate; from then on it authenticates with that certificate, polls for
@@ -38,7 +39,7 @@ and the key never leaves the node.
 
 Every non-`2xx`, non-`304` response carries an error body:
 
-```json title="error.json"
+```json title="Error"
 {"error": "invalid_token", "message": "enrolment token already used"}
 ```
 
@@ -64,7 +65,7 @@ treated as `401`.
 `POST /roxy/v1/enrol` with `Authorization: Bearer <token>` and no client
 certificate.
 
-```json title="enrol-request.json"
+```json title="EnrolRequest"
 {
   "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIH...\n-----END CERTIFICATE REQUEST-----\n",
   "roxy_version": "0.1.0",
@@ -81,7 +82,7 @@ certificate.
   answers `426` with `missing: ["protocol_version:1"]`.
 - `features` is the node's [feature list](#features).
 
-```json title="enrol-response.json"
+```json title="EnrolResponse"
 {
   "node_id": "node-7f3a9c",
   "certificate_chain": "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n",
@@ -129,7 +130,7 @@ failure: a node the control plane will not renew stops serving.
 `GET /roxy/v1/lease` with the node certificate. The node reports its state
 in one header, `Roxy-Node-State`, whose value is a compact JSON object:
 
-```json title="node-state.json"
+```json title="NodeState"
 {
   "lease_id": "lease-01J9Z8K3",
   "config_hash": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
@@ -167,7 +168,7 @@ a node that did not apply what it was sent.
 
 ### Lease body
 
-```json title="lease.json"
+```json title="Lease"
 {
   "lease_id": "lease-01J9Z8K3",
   "issued_at": "2026-10-06T10:12:00Z",
@@ -243,7 +244,7 @@ renders a lease only from features the node reported, and compares the
 rendered document against the list before sending it. If the policy needs
 something the node lacks, the answer is `426` whose body names it:
 
-```json title="error.json"
+```json title="Error"
 {"error": "unsupported", "message": "node lacks: addon:wasm", "missing": ["addon:wasm"]}
 ```
 
@@ -268,7 +269,7 @@ renderer can never send a node a policy it would fail to load.
 `POST /roxy/v1/flows` with the node certificate. The body may be gzip
 compressed, signalled with `Content-Encoding: gzip`.
 
-```json title="flow-batch.json"
+```json title="FlowBatch"
 {
   "node_id": "node-7f3a9c",
   "lease_id": "lease-01J9Z8K3",
@@ -293,7 +294,7 @@ compressed, signalled with `Content-Encoding: gzip`.
   reached or `flush_interval_seconds` has passed since the first unsent
   event.
 
-```json title="flow-ack.json"
+```json title="FlowAck"
 {"acked_through": 1043}
 ```
 
@@ -354,36 +355,3 @@ credential expires. Capture body upload: `capture_dir` is local. Server-side
 storage, a UI, or any particular control plane: the control plane is
 whatever implements these endpoints. Per-node interception CA issuance:
 `interception_ca` is reserved for it.
-
-## Conformance
-
-`crates/roxy-node-conformance` checks a server against this page. It
-enrols several nodes, then exercises every response code above and the
-idempotent flow acknowledgement, validating every body against the
-schemas in `spec/node-protocol/v1/`. The harness needs five single-use
-enrolment tokens and, for the responses a server produces on its own
-initiative (`410`, `401` for a forgotten node, `426`, `507`), a hook it can
-call to put the server in that state:
-
-```sh
-cargo run -p roxy-node-conformance -- check \
-  --url https://control-plane.example:8443 --ca-bundle cp-ca.pem \
-  --enrol-token T1 --enrol-token T2 --enrol-token T3 --enrol-token T4 --enrol-token T5 \
-  --hook ./conformance-hook.sh
-```
-
-The hook is run as `<hook> <action> <node_id> [<argument>]` with the
-actions `revoke`, `forget` (the server no longer recognises the node's
-certificate but still accepts it at the TLS layer), `require-feature
-<name>` (the node's lease now needs a feature the node did not report) and
-`exhaust-flow-quota`. `--admin-url URL` instead `POST`s
-`{"action", "node_id", "argument"}` as JSON to that URL, which is what the
-reference server accepts. Without either, the checks that need a hook are
-reported as skipped and the run fails.
-
-The crate also contains a minimal in-memory reference server:
-`cargo run -p roxy-node-conformance -- serve` starts one on the loopback
-interface and prints its URL, CA bundle, admin URL and tokens as JSON, for
-developing a node against. Its admin URL takes the four hook actions and
-one more, `re-lease`, which issues the node a new `lease_id` on its next
-poll. `cargo test -p roxy-node-conformance` runs the harness against it.
