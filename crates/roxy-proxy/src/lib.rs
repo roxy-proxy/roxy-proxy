@@ -51,6 +51,7 @@ pub mod listener;
 mod pipeline;
 pub mod secrets;
 pub mod server;
+mod sign;
 pub mod sources;
 #[cfg(test)]
 mod testkit;

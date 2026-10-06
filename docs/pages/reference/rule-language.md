@@ -140,6 +140,7 @@ Non-terminal:
 | `log: { level, message }` | all | Emits a `log` flow event. |
 | `set_state: { key, value, ttl? }` | all | Writes the [state store](/policies/rate-limits#state). |
 | `capture: request \| response \| both` | head rules | Tees the exchange, as forwarded, to the [capture log](/operate/flow-log#capture). |
+| `sign: { aws_sigv4: { service, region, access_key_id, secret_access_key, session_token?, unsigned_payload? } }` | head rules | Signs the forwarded request with AWS Signature Version 4, after every other head effect; the credentials may use `${secret:name}` ([signing AWS requests](/policies/secrets#signing-aws-requests)). |
 
 The actions are a small closed set on purpose: anything richer is an addon.
 Two words are reserved and rejected with the reason: `call` (addons run

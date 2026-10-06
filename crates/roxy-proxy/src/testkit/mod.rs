@@ -41,6 +41,8 @@ mod http_tests;
 mod lease_tests;
 #[cfg(test)]
 mod rules_tests;
+#[cfg(test)]
+mod sign_tests;
 mod upstream;
 #[cfg(test)]
 mod ws_tests;

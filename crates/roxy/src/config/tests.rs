@@ -104,6 +104,7 @@ fn minimal_config_uses_defaults() {
     assert_eq!(l.max_request_body_bytes.as_u64(), 1 << 30);
     assert_eq!(l.max_response_body_bytes.as_u64(), 1 << 30);
     assert_eq!(l.max_inspect_body_bytes.as_u64(), 1 << 20);
+    assert_eq!(l.max_sign_body_bytes.as_u64(), 100 << 20);
     assert_eq!(l.max_ws_message_bytes.as_u64(), 16 << 20);
     assert_eq!(l.max_observer_lag_bytes.as_u64(), 16 << 20);
     assert_eq!(l.max_buffered_bytes.as_u64(), 1 << 30);
@@ -421,20 +422,29 @@ fn zero_limits_diagnosed() {
     .unwrap();
 }
 
-/// Inspection and WebSocket reassembly reserve a whole cap at a time, so
-/// a budget smaller than one of those caps would refuse every exchange
-/// that needs that buffer; an observer's copy grows into the budget and
-/// sets no floor.
+/// Inspection, signing and WebSocket reassembly reserve a whole cap at a
+/// time, so a budget smaller than one of those caps would refuse every
+/// exchange that needs that buffer; an observer's copy grows into the
+/// budget and sets no floor.
 #[test]
 fn buffer_budget_under_one_exchange_diagnosed() {
-    let d = diagnostics(&format!("{BASE}limits: {{ max_buffered_bytes: 31mb }}\n"));
+    let d = diagnostics(&format!("{BASE}limits: {{ max_buffered_bytes: 99mb }}\n"));
     assert_eq!(d.len(), 1, "{d:?}");
     assert_eq!(d[0].path, "limits.max_buffered_bytes");
-    parse(&format!("{BASE}limits: {{ max_buffered_bytes: 32mb }}\n"))
+    parse(&format!("{BASE}limits: {{ max_buffered_bytes: 100mb }}\n"))
         .validate()
         .unwrap();
+    let d = diagnostics(&format!(
+        "{BASE}limits: {{ max_buffered_bytes: 31mb, max_sign_body_bytes: 1mb }}\n"
+    ));
+    assert_eq!(d.len(), 1, "{d:?}");
     parse(&format!(
-        "{BASE}limits: {{ max_buffered_bytes: 2mb, max_ws_message_bytes: 1mb, max_observer_lag_bytes: 16mb }}\n"
+        "{BASE}limits: {{ max_buffered_bytes: 32mb, max_sign_body_bytes: 1mb }}\n"
+    ))
+    .validate()
+    .unwrap();
+    parse(&format!(
+        "{BASE}limits: {{ max_buffered_bytes: 2mb, max_sign_body_bytes: 1mb, max_ws_message_bytes: 1mb, max_observer_lag_bytes: 16mb }}\n"
     ))
     .validate()
     .unwrap();
@@ -481,6 +491,30 @@ fn undefined_secret_reference_diagnosed() {
     assert_eq!(d.len(), 1, "{d:?}");
     assert_eq!(d[0].path, "rules[0].then[0]");
     assert!(d[0].message.contains("\"missing\""));
+}
+
+/// `roxy check` refuses `unsigned_payload` for a service other than S3.
+#[test]
+fn sign_unsigned_payload_outside_s3_diagnosed() {
+    let d = diagnostics(&format!(
+        "{BASE}secrets: {{ akid: {{ env: AKID }}, sk: {{ env: SK }} }}\nrules:\n  - id: a\n    then:\n      \
+         - sign: {{ aws_sigv4: {{ service: bedrock, region: eu-west-2, \
+         access_key_id: \"${{secret:akid}}\", secret_access_key: \"${{secret:sk}}\", \
+         unsigned_payload: true }} }}\n      \
+         - allow\n"
+    ));
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].path, "rules[0].then[0]");
+    assert!(d[0].message.contains("`unsigned_payload`"), "{d:?}");
+    parse(&format!(
+        "{BASE}secrets: {{ akid: {{ env: AKID }}, sk: {{ env: SK }} }}\nrules:\n  - id: a\n    then:\n      \
+         - sign: {{ aws_sigv4: {{ service: s3, region: eu-west-2, \
+         access_key_id: \"${{secret:akid}}\", secret_access_key: \"${{secret:sk}}\", \
+         unsigned_payload: true }} }}\n      \
+         - allow\n"
+    ))
+    .validate()
+    .unwrap();
 }
 
 #[test]

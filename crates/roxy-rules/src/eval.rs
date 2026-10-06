@@ -329,6 +329,58 @@ impl fmt::Debug for SetHeaderValue {
     }
 }
 
+/// A signing credential, resolved per flow. Prints as `[REDACTED]` in
+/// both `Display` and `Debug`, so an effect carrying it can be logged.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Credential(String);
+
+impl Credential {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+/// `sign: aws_sigv4`, with its credentials resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwsSigV4 {
+    pub service: String,
+    pub region: String,
+    pub access_key_id: Credential,
+    pub secret_access_key: Credential,
+    pub session_token: Option<Credential>,
+    /// Sign `UNSIGNED-PAYLOAD` and stream the body (S3 only).
+    pub unsigned_payload: bool,
+}
+
+impl AwsSigV4 {
+    /// Whether `service` is one of the S3 signing names, which take the S3
+    /// variant of the algorithm (single URI encoding, no path
+    /// normalisation, `x-amz-content-sha256` in the signed headers).
+    pub fn is_s3(&self) -> bool {
+        Self::is_s3_service(&self.service)
+    }
+
+    pub fn is_s3_service(service: &str) -> bool {
+        matches!(service, "s3" | "s3-control" | "s3-outposts")
+    }
+}
+
 /// A non-terminal action's effect, for the proxy to apply (mutations) or
 /// perform (log, state, capture, addon call), in list order.
 #[derive(Debug, Clone)]
@@ -368,6 +420,8 @@ pub enum Effect {
         ttl: Option<Duration>,
     },
     Capture(CaptureTarget),
+    /// Sign the request as it will be forwarded, after every other change.
+    Sign(AwsSigV4),
 }
 
 impl Effect {
@@ -383,6 +437,7 @@ impl Effect {
             Effect::Log { .. } => "log",
             Effect::SetState { .. } => "set_state",
             Effect::Capture(_) => "capture",
+            Effect::Sign(_) => "sign",
         }
     }
 
@@ -396,6 +451,7 @@ impl Effect {
                 | Effect::SetQuery { .. }
                 | Effect::RemoveQuery(_)
                 | Effect::Redirect { .. }
+                | Effect::Sign(_)
         )
     }
 }
@@ -454,6 +510,7 @@ impl PartialEq for Effect {
                 },
             ) => a == d && b == e && c == f,
             (E::Capture(a), E::Capture(b)) => a == b,
+            (E::Sign(a), E::Sign(b)) => a == b,
             _ => false,
         }
     }
@@ -485,6 +542,17 @@ impl fmt::Display for Effect {
             Effect::Log { level, message } => write!(f, "log {}: {message}", level.as_str()),
             Effect::SetState { key, value, ttl } => fmt_set_state(f, key, value, *ttl),
             Effect::Capture(t) => write!(f, "capture {}", t.as_str()),
+            Effect::Sign(s) => write!(
+                f,
+                "sign aws_sigv4 service={} region={}{}",
+                s.service,
+                s.region,
+                if s.unsigned_payload {
+                    " (unsigned payload)"
+                } else {
+                    ""
+                }
+            ),
         }
     }
 }
@@ -635,7 +703,8 @@ impl PendingState for Vec<Effect> {
             | Effect::RemoveQuery(_)
             | Effect::Redirect { .. }
             | Effect::Log { .. }
-            | Effect::Capture(_) => None,
+            | Effect::Capture(_)
+            | Effect::Sign(_) => None,
         })
     }
 }

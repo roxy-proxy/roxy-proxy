@@ -867,6 +867,33 @@ mod tests {
         }
     }
 
+    /// A dry run shows that a `sign` effect would apply, without a
+    /// signature: credentials are placeholders and no body is hashed.
+    #[test]
+    fn sign_effect_is_reported_without_a_signature() {
+        let config = Config::from_yaml(
+            "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:3128 }]\n\
+             secrets: { akid: { env: AKID }, sk: { env: SK } }\n\
+             rules:\n  \
+             - id: aws\n    when: 'host == \"bedrock.test\"'\n    then:\n      \
+             - sign: { aws_sigv4: { service: bedrock, region: eu-west-2, \
+             access_key_id: \"${secret:akid}\", secret_access_key: \"${secret:sk}\" } }\n      \
+             - allow\n",
+        )
+        .unwrap();
+        let policy = config.validate().unwrap().policy;
+        let req = TestRequest::new("POST", "https://bedrock.test/model/invoke");
+        let (view, _) = build_view(&config, &req).unwrap();
+        let r = run(&policy, &view, &[], known(&req));
+        assert!(r.decision().is_allow());
+        let text = report(&policy, None, None, &r, &Redactor::new());
+        assert!(
+            text.contains("  - sign aws_sigv4 service=bedrock region=eu-west-2\n"),
+            "{text}"
+        );
+        assert!(!text.contains("AWS4-HMAC-SHA256"), "{text}");
+    }
+
     #[test]
     fn ws_rules_run_with_a_message() {
         let config = Config::from_yaml(

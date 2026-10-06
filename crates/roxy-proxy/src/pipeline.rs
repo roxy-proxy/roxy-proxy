@@ -23,8 +23,9 @@ use std::fmt::{self, Write as _};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
+use aws_sigv4::http_request::SignableBody;
 use bytes::Bytes;
 use http::StatusCode;
 use roxy_http::h1::ServerConn;
@@ -34,7 +35,7 @@ use roxy_http::{
     ParseError, Query, Reason, Scheme, status_forbids_body,
 };
 use roxy_rules::{
-    AllowOpts, CaptureTarget, DEFAULT_DENY_MESSAGE, Decision, Deny, DenyStatus, Effect,
+    AllowOpts, AwsSigV4, CaptureTarget, DEFAULT_DENY_MESSAGE, Decision, Deny, DenyStatus, Effect,
     EvalContext, FAIL_CLOSED_STATUS, FailClosedReason, LogLevel, Outcome, RuleId,
 };
 use ulid::Ulid;
@@ -48,6 +49,7 @@ use crate::flowlog::{
 use crate::io::ClientIo;
 use crate::listener::ClientConn;
 use crate::server::{Shared, Snapshot};
+use crate::sign;
 use crate::sources::{MetricSourceError, Sample};
 use crate::view::{FlowFacts, Inspected, ProxyView, RequestFacts, ResponseFacts, host_text};
 use crate::watch::Watch;
@@ -63,6 +65,13 @@ pub(crate) const EXPIRED_RULE: &str = "_expired";
 
 /// Flow-log `reason` of an `_expired` deny.
 pub(crate) const EXPIRED_REASON: &str = "policy_expired";
+
+/// Rule id used for the refusal of a request `sign` cannot hash.
+pub(crate) const SIGN_RULE: &str = "_sign";
+
+/// Flow-log `reason` of a `_sign` refusal: the body is over
+/// `limits.max_sign_body_bytes`.
+pub(crate) const SIGN_BODY_TOO_LARGE: &str = "sign_body_too_large";
 
 /// Whether a local answer is a policy decision or a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +160,20 @@ impl Refusal {
                 DEFAULT_DENY_MESSAGE,
                 RuleId::new(EXPIRED_RULE),
                 false,
+            )
+        }
+    }
+
+    /// 413 `_sign`: the body to sign is over `limits.max_sign_body_bytes`.
+    /// The connection closes, since the body was not read to its end.
+    pub(crate) fn sign_body_too_large() -> Self {
+        Self {
+            reason: Some(SIGN_BODY_TOO_LARGE.to_owned()),
+            ..Self::deny(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                DEFAULT_DENY_MESSAGE,
+                RuleId::new(SIGN_RULE),
+                true,
             )
         }
     }
@@ -254,14 +277,20 @@ impl BodyIo for ServerConn<ClientIo> {
 }
 
 /// The request side: inspect the body if a rule needs it, then the head
-/// decision and its effects.
+/// decision and its effects, then the signature over the result if a
+/// `sign` effect asked for one.
 pub(crate) async fn request_steps(
     cx: &mut FlowCx,
     req: CanonicalRequest,
     io: &mut dyn BodyIo,
 ) -> Verdict {
-    match inspect_request_body(cx, req, io).await {
-        Verdict::Continue(req) => request_rules(cx, req),
+    let req = match inspect_request_body(cx, req, io).await {
+        Verdict::Continue(req) => req,
+        Verdict::Deny(d) => return Verdict::Deny(d),
+        Verdict::Close(e) => return Verdict::Close(e),
+    };
+    match request_rules(cx, req) {
+        Verdict::Continue(req) => sign_request(cx, req, io).await,
         Verdict::Deny(d) => Verdict::Deny(d),
         Verdict::Close(e) => Verdict::Close(e),
     }
@@ -426,6 +455,9 @@ pub(crate) struct FlowCx {
     pub taps: PerDir<Option<Tap>>,
     /// `Host` to send upstream after a `redirect` without `rewrite_host`.
     pub host_override: Option<String>,
+    /// A `sign` effect of the head decision, applied once every other
+    /// request change has settled.
+    pub sign: Option<AwsSigV4>,
     /// Request body bytes forwarded so far (and their digest once the
     /// body completed), once the request is on its way.
     pub request_tally: Option<Arc<crate::body::Tally>>,
@@ -537,6 +569,7 @@ impl FlowCx {
             capture: PerDir::default(),
             taps: PerDir::default(),
             host_override: None,
+            sign: None,
             request_tally: None,
             stack: None,
             layer_ran: false,
@@ -952,19 +985,71 @@ fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
     if let Some(r) = refusal {
         return Verdict::Deny(r);
     }
-    // The watching rules and the log see the request as it
-    // will be forwarded.
+    settle_request_facts(cx, &req);
+    Verdict::Continue(req)
+}
+
+/// The watching rules and the log see the request as it will be
+/// forwarded; what was learnt about the body stays.
+fn settle_request_facts(cx: &mut FlowCx, req: &CanonicalRequest) {
     let body = cx
         .facts
         .request
         .as_ref()
         .map(|r| (r.body.clone(), r.body_size));
-    let mut facts = request_facts(&req);
+    let mut facts = request_facts(req);
     if let Some((inspected, size)) = body {
         facts.body = inspected;
         facts.body_size = size;
     }
     cx.facts.request = Some(facts);
+}
+
+/// The `sign` effect, over the request as every other effect left it. A
+/// presigned request (`X-Amz-Signature` in its query) authenticates
+/// itself and goes untouched. The payload hash needs the whole body, so it
+/// is buffered under `limits.max_sign_body_bytes`; a body over that is
+/// refused with 413 rather than forwarded with a signature AWS would
+/// reject. `unsigned_payload` streams the body instead.
+async fn sign_request(cx: &mut FlowCx, mut req: CanonicalRequest, io: &mut dyn BodyIo) -> Verdict {
+    let Some(spec) = cx.sign.take() else {
+        return Verdict::Continue(req);
+    };
+    if sign::is_presigned(req.query.as_ref()) {
+        return Verdict::Continue(req);
+    }
+    let buffered;
+    let body = if spec.unsigned_payload {
+        SignableBody::UnsignedPayload
+    } else if known_empty(&req.body) {
+        SignableBody::Bytes(&[])
+    } else {
+        let cap = cx.snap.limits.max_sign_body_bytes;
+        let Some(mut lease) = reserve_inspection(cx, &req.body, cap) else {
+            return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
+        };
+        buffered = match io.collect(&mut req.body, cap).await {
+            Err(e) => return Verdict::Close(e),
+            Ok(Collected::Failed(e)) => return Verdict::Close(body_failure(&e).into()),
+            Ok(Collected::TooLarge) => return Verdict::Deny(Refusal::sign_body_too_large()),
+            Ok(Collected::Complete(b)) => b,
+        };
+        lease.shrink_to(buffered.len() as u64);
+        cx.buffers.push(lease);
+        if let Some(f) = cx.facts.request.as_mut() {
+            f.body_size = Some(buffered.len() as u64);
+        }
+        SignableBody::Bytes(&buffered)
+    };
+    let host = cx
+        .host_override
+        .clone()
+        .unwrap_or_else(|| req.authority.to_host_header(req.scheme));
+    if let Err(e) = sign::sign_request(&mut req, &host, body, &spec, SystemTime::now()) {
+        return Verdict::Deny(invalid("sign", &e));
+    }
+    cx.record.mutations.push("sign:aws_sigv4".to_owned());
+    settle_request_facts(cx, &req);
     Verdict::Continue(req)
 }
 
@@ -1102,6 +1187,13 @@ fn apply_request_effect(
             }
             cx.capture.request |= matches!(target, CaptureTarget::Request | CaptureTarget::Both);
             cx.capture.response |= matches!(target, CaptureTarget::Response | CaptureTarget::Both);
+        }
+        Effect::Sign(spec) => {
+            // Two signatures cannot both hold; the pipeline signs once the
+            // other changes have settled.
+            if cx.sign.replace(spec).is_some() {
+                return Err(Refusal::fail_closed("sign_conflict"));
+            }
         }
     }
     Ok(())

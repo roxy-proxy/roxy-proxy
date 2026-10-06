@@ -251,6 +251,10 @@ pub struct Limits {
     pub max_response_body_bytes: ByteSize,
     #[serde(deserialize_with = "units::size")]
     pub max_inspect_body_bytes: ByteSize,
+    /// Largest request body `sign: aws_sigv4` buffers to hash; a larger
+    /// one is refused with 413.
+    #[serde(deserialize_with = "units::size")]
+    pub max_sign_body_bytes: ByteSize,
     #[serde(deserialize_with = "units::size")]
     pub max_ws_message_bytes: ByteSize,
     #[serde(deserialize_with = "units::size")]
@@ -316,6 +320,7 @@ impl Default for Limits {
             max_request_body_bytes: ByteSize::b(GIB),
             max_response_body_bytes: ByteSize::b(GIB),
             max_inspect_body_bytes: ByteSize::b(MIB),
+            max_sign_body_bytes: ByteSize::b(100 * MIB),
             max_ws_message_bytes: ByteSize::b(16 * MIB),
             max_capture_body_bytes: ByteSize::b(16 * MIB),
             max_observer_lag_bytes: ByteSize::b(16 * MIB),

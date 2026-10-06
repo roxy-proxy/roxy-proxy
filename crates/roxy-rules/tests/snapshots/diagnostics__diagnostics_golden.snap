@@ -87,7 +87,18 @@ rules[0].then[0]: reference to undefined secret "missing" (define it under `secr
 rules[0].then[0]: secret references are only allowed in rules decided at the request head (they set request headers); this rule watches `response.status`  [rule a]
 
 == secret outside set_header
-rules[0].then[0]: secret references are only allowed in `set_header` values, not in `log`  [rule a]
+rules[0].then[0]: secret references are only allowed in `set_header` values and the credentials of `sign`, not in `log`  [rule a]
+
+== sign unsigned_payload outside S3
+rules[0].then[0]: sign aws_sigv4: `unsigned_payload` is accepted only for S3 (`s3`, `s3-control`, `s3-outposts`); "bedrock" requires the payload hash  [rule a]
+
+== sign with undefined and misplaced secrets, and an empty credential
+rules[0].then[0]: secret references are only allowed in `set_header` values and the credentials of `sign`, not in the `service` or `region` of `sign`  [rule a]
+rules[0].then[0]: reference to undefined secret "missing" (define it under `secrets`)  [rule a]
+rules[0].then[0]: sign aws_sigv4: `secret_access_key` must not be empty  [rule a]
+
+== sign in a watching rule
+rules[0].then[0]: `sign` changes the request, which is already on its way; this rule reads `response.status`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation)  [rule a]
 
 == passthrough is reserved
 parse: .[0].then: `passthrough` is reserved for a transparent listener, which roxy does not have (issue #15) at line 1 column 18
@@ -119,7 +130,7 @@ parse: .[0].then: an action is a map with exactly one key, but this one has `set
 rules[0].then[1]: `tag` follows the terminal action `allow` and would never run; move it before `allow`  [rule a]
 
 == unknown action
-parse: .[0].then: unknown action `sethead`; expected one of `allow`, `deny`, `set_header`, `remove_header`, `rewrite_path`, `set_query`, `remove_query`, `redirect`, `tag`, `log`, `set_state`, `capture` at line 1 column 18
+parse: .[0].then: unknown action `sethead`; expected one of `allow`, `deny`, `set_header`, `remove_header`, `rewrite_path`, `set_query`, `remove_query`, `redirect`, `tag`, `log`, `set_state`, `capture`, `sign` at line 1 column 18
 
 == request mutation in a watching rule
 rules[0].then[0]: `rewrite_path` changes the request, which is already on its way; this rule reads `body.bytes`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation)  [rule a]

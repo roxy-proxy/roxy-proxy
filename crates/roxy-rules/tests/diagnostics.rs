@@ -106,6 +106,21 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: a, then: { log: { message: \"${secret:gh}\" } } }",
     ),
     (
+        "sign unsigned_payload outside S3",
+        "",
+        "- { id: a, then: [{ sign: { aws_sigv4: { service: bedrock, region: eu-west-2, access_key_id: \"${secret:openai}\", secret_access_key: \"${secret:gh}\", unsigned_payload: true } } }, allow] }",
+    ),
+    (
+        "sign with undefined and misplaced secrets, and an empty credential",
+        "",
+        "- { id: a, then: [{ sign: { aws_sigv4: { service: \"${secret:gh}\", region: eu-west-2, access_key_id: \"${secret:missing}\", secret_access_key: \"\" } } }, allow] }",
+    ),
+    (
+        "sign in a watching rule",
+        "",
+        "- { id: a, when: 'response.status == 500', then: { sign: { aws_sigv4: { service: s3, region: us-east-1, access_key_id: \"${secret:openai}\", secret_access_key: \"${secret:gh}\" } } } }",
+    ),
+    (
         "passthrough is reserved",
         "",
         "- { id: a, then: passthrough }",

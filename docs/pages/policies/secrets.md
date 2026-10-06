@@ -30,6 +30,69 @@ rules:
 The client can send any placeholder in `authorization`; `set_header`
 replaces it before the request is forwarded.
 
+## Signing AWS requests
+
+`sign: { aws_sigv4: ... }` is a head-rule action that signs the outgoing
+request with AWS Signature Version 4, so a client holding placeholder
+credentials reaches AWS with real ones that never enter its environment.
+The three credential fields take `${secret:name}` under the same rules as
+`set_header` values (head rules only; an undefined name is a compile
+error; a name missing at evaluation fails the flow closed with
+`secret_missing`). `session_token` is optional.
+
+```yaml
+secrets:
+  aws_akid:  { env: AWS_ACCESS_KEY_ID }
+  aws_sk:    { env: AWS_SECRET_ACCESS_KEY }
+  aws_token: { env: AWS_SESSION_TOKEN }
+
+rules:
+  - id: bedrock
+    when: host under "bedrock-runtime.eu-west-2.amazonaws.com" and scheme == "https"
+    then:
+      - sign:
+          aws_sigv4:
+            service: bedrock
+            region: eu-west-2
+            access_key_id: "${secret:aws_akid}"
+            secret_access_key: "${secret:aws_sk}"
+            session_token: "${secret:aws_token}"   # optional
+      - allow
+```
+
+The signature covers the request as it is forwarded, after every other
+head effect (`set_header`, `rewrite_path`, `redirect`, ...), whatever the
+action's position in `then`. First the client's `authorization`,
+`x-amz-date`, `x-amz-security-token` and `x-amz-content-sha256` are
+removed. `host` is always signed, as it goes upstream. The hop-by-hop and
+framing fields roxy re-serialises (`connection`, `transfer-encoding`,
+`content-length`, `accept-encoding`, `te`, `trailer`, `upgrade`,
+`keep-alive`, `proxy-connection`), and `user-agent` and
+`x-amzn-trace-id`, which intermediaries change, are never signed; every
+other header is. `service` is the signing name (`bedrock`, `s3`,
+`execute-api`, ...), and `s3`, `s3-control` and `s3-outposts` use the S3
+variant of the algorithm (the path encoded once, not normalised, and the
+payload hash sent as `x-amz-content-sha256`).
+
+A request whose query carries `X-Amz-Signature` is presigned: it
+authenticates itself and is forwarded untouched, with no `sign` mutation
+recorded. Two matching rules that both sign fail the flow closed
+(`sign_conflict`).
+
+The payload hash needs the whole body, so a request with a body is
+buffered up to `limits.max_sign_body_bytes` (100 MiB) before it is signed
+and forwarded. A body over that, declared or chunked, is refused with
+`413` (`terminal_rule: _sign`, `reason: sign_body_too_large`) and the
+connection closed. `unsigned_payload: true` signs `UNSIGNED-PAYLOAD`
+instead and streams the body with no buffering; only S3 accepts it, so it
+is a config error with any other `service`.
+
+The flow log records `sign:aws_sigv4` in `mutations`. The injected
+credentials are redacted from the flow log and capture heads like any
+secret. `roxy rule test` shows the effect as `sign aws_sigv4 service=...
+region=...` without computing a signature, and `roxy check` validates the
+block.
+
 ## Lease secrets
 
 `name: { lease: true }` declares a secret the config does not resolve: the
