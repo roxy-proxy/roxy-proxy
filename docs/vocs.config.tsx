@@ -114,6 +114,7 @@ export default defineConfig({
         { text: "TLS", link: "/reference/tls" },
         { text: "Resource limits", link: "/reference/limits" },
         { text: "Architecture", link: "/reference/architecture" },
+        { text: "Node protocol", link: "/reference/node-protocol" },
         { text: "Development", link: "/reference/development" },
       ],
     },

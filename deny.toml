@@ -28,6 +28,7 @@ allow = [
     "OpenSSL",
     "CDLA-Permissive-2.0",  # webpki-roots: Mozilla root store data
     "Unlicense",
+    "MIT-0",  # borrow-or-share, via jsonschema
 ]
 confidence-threshold = 0.9
 

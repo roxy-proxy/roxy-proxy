@@ -9,6 +9,7 @@ members = [
     "crates/roxy-tls",
     "crates/roxy-wasm",
     "crates/roxy-addon",
+    "crates/roxy-node-spec",
 ]
 
 [workspace.package]
