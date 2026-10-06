@@ -132,7 +132,7 @@ pub(crate) fn parse_field_line(
 
 /// Parses client `Connection` values into lower-case tokens; any element
 /// that is not a token rejects the request.
-pub(crate) fn connection_tokens<'a>(
+pub fn connection_tokens<'a>(
     values: impl IntoIterator<Item = &'a [u8]>,
 ) -> Result<Vec<String>, ParseError> {
     values
@@ -149,6 +149,25 @@ pub(crate) fn connection_tokens<'a>(
             }
         })
         .collect()
+}
+
+/// The protocols a request asks to switch to: its lower-case `Upgrade`
+/// tokens joined with `, `, when the `Connection` tokens nominate
+/// `upgrade`. An `Upgrade` field without that nomination is ignored (RFC
+/// 9110 §7.8).
+pub fn requested_upgrade<'a>(
+    connection: &[String],
+    upgrade: impl IntoIterator<Item = &'a [u8]>,
+) -> Option<String> {
+    if !connection.iter().any(|t| t == "upgrade") {
+        return None;
+    }
+    let joined: Vec<String> = upgrade
+        .into_iter()
+        .flat_map(split_list)
+        .map(|u| String::from_utf8_lossy(u).to_ascii_lowercase())
+        .collect();
+    (!joined.is_empty()).then(|| joined.join(", "))
 }
 
 /// Parses upstream `Connection` values into lower-case tokens, skipping

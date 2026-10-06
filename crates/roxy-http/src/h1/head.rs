@@ -1,10 +1,11 @@
 //! Request-head parsing: raw pre-checks, `httparse` tokenisation, and the
 //! semantic validation of the rejection rules. Pure functions over bytes (fuzz target).
 
-use crate::chars::{split_list, trim_ows};
+use crate::chars::trim_ows;
 use crate::model::{
     Authority, Headers, HttpFlags, Limits, Method, ParseError, Reason, RequestMeta, Scheme,
     TargetForm, Version, connection_tokens, parse_content_length, parse_field_line, reject,
+    requested_upgrade,
 };
 use crate::url::{self, Path, Query};
 
@@ -370,15 +371,7 @@ fn hop_by_hop_meta(
     // roxy never keeps an HTTP/1.0 connection alive, whatever `Connection`
     // says, so the flag is simply true for every 1.0 request.
     meta.close = version == Version::H1_0 || conn.iter().any(|t| t == "close");
-    let upgrades = all(raw, "upgrade");
-    if conn.iter().any(|t| t == "upgrade") && !upgrades.is_empty() {
-        let joined: Vec<String> = upgrades
-            .iter()
-            .flat_map(|u| split_list(u))
-            .map(|u| String::from_utf8_lossy(u).to_ascii_lowercase())
-            .collect();
-        meta.upgrade = Some(joined.join(", "));
-    }
+    meta.upgrade = requested_upgrade(&conn, all(raw, "upgrade"));
     Ok(meta)
 }
 

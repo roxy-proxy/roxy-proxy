@@ -6,6 +6,8 @@ use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use roxy_http::url::{self, Path, Query};
+use roxy_http::{Authority, Headers, Host, HttpFlags, Limits, ParseError, Reason, Scheme};
 use roxy_proxy::Redactor;
 use roxy_proxy::addr::{AddressDenied, PrivateAddrs};
 use roxy_proxy::addrlist::AddressLists;
@@ -70,6 +72,9 @@ pub struct TestRequest {
     /// `name: value` pairs.
     pub headers: Vec<(String, String)>,
     pub body: Option<String>,
+    /// A chunked body: `body.size` and `header["content-length"]` are
+    /// absent, as they are until a chunked body is buffered.
+    pub chunked: bool,
     pub client_ip: IpAddr,
     /// `body.bytes`: request body bytes streamed so far (watching rules).
     pub body_bytes: Option<u64>,
@@ -161,6 +166,7 @@ impl TestRequest {
             url: url.to_owned(),
             headers: Vec::new(),
             body: None,
+            chunked: false,
             client_ip: IpAddr::from([127, 0, 0, 1]),
             body_bytes: None,
             response_status: None,
@@ -239,102 +245,101 @@ pub fn ws_message(
     }))
 }
 
-/// The parts of an absolute URL that rules see.
+/// The request head as the proxy hands it to the rules: canonical URL
+/// parts and the header fields that survive parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ParsedUrl {
-    pub scheme: String,
-    /// Lower-case, trailing dot removed, IPv6 without brackets.
-    pub host: String,
-    pub port: u16,
-    pub path: String,
-    pub query: Option<String>,
+pub(crate) struct Head {
+    pub scheme: Scheme,
+    pub authority: Authority,
+    pub path: Path,
+    pub query: Option<Query>,
+    /// Without the hop-by-hop and framing fields; `host`,
+    /// `content-length` and `upgrade` are served from the model instead.
+    pub headers: Headers,
+    /// The protocols `Upgrade` names, when `Connection` nominates it.
+    pub upgrade: Option<String>,
 }
 
-impl ParsedUrl {
-    /// `scheme://host[:port]/path[?query]`, port shown only if non-default.
+impl Head {
+    /// The `Host` header value: the authority with a non-default port only.
+    pub(crate) fn host_header(&self) -> String {
+        self.authority.to_host_header(self.scheme)
+    }
+
+    /// `scheme://host[:port]/path[?query]`.
     pub(crate) fn url(&self) -> String {
-        let host = if self.host.contains(':') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
-        let default = matches!(
-            (self.scheme.as_str(), self.port),
-            ("http", 80) | ("https", 443)
-        );
-        let port = if default {
-            String::new()
-        } else {
-            format!(":{}", self.port)
-        };
         let query = self
             .query
             .as_ref()
             .map_or_else(String::new, |q| format!("?{q}"));
-        format!("{}://{host}{port}{}{query}", self.scheme, self.path)
-    }
-
-    fn authority(&self) -> String {
-        let u = self.url();
-        let rest = &u[self.scheme.len() + 3..];
-        rest.split('/').next().unwrap_or(rest).to_owned()
+        format!(
+            "{}://{}{}{query}",
+            self.scheme,
+            self.host_header(),
+            self.path
+        )
     }
 }
 
-/// Parse an absolute `http`/`https` URL. Deliberately small: roxy-http owns
-/// real normalisation; this only splits the parts.
-pub(crate) fn parse_url(url: &str) -> Result<ParsedUrl, String> {
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or_else(|| format!("{url:?} is not an absolute URL (expected http(s)://host/...)"))?;
-    let scheme = scheme.to_ascii_lowercase();
-    let default_port = match scheme.as_str() {
-        "http" => 80,
-        "https" => 443,
-        other => return Err(format!("unsupported scheme {other:?}")),
+/// `host` as the rules see it: lower-case, no trailing dot, IPv6 without
+/// brackets.
+fn host_text(h: &Host) -> String {
+    match h {
+        Host::Dns(n) => n.clone(),
+        Host::Ipv4(ip) => ip.to_string(),
+        Host::Ipv6(ip) => ip.to_string(),
+    }
+}
+
+/// Parse the URL and headers with the proxy's own parser, so the dry run
+/// sees the canonical request and refuses what the proxy would refuse,
+/// naming the same reason code.
+pub(crate) fn parse_head(config: &Config, req: &TestRequest) -> Result<Head, String> {
+    let (scheme, authority, path, query) = url::parse_absolute_form(req.url.as_bytes())
+        .map_err(|e| format!("{:?} is not an absolute URL roxy accepts ({e})", req.url))?;
+    let raw: Vec<(&[u8], &[u8])> = req
+        .headers
+        .iter()
+        .map(|(n, v)| (n.as_bytes(), v.as_bytes()))
+        .collect();
+    let rejected = |e: ParseError| format!("roxy would reject these headers ({e})");
+    let headers = Headers::try_from_raw(
+        raw.iter().copied(),
+        &Limits::from(config),
+        &HttpFlags::from(config),
+    )
+    .map_err(rejected)?;
+    let all = |name: &str| -> Vec<&[u8]> {
+        raw.iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
+            .map(|(_, v)| *v)
+            .collect()
     };
-    if rest.contains('#') {
-        return Err("fragments are not valid in request targets".into());
+    let hosts = all("host");
+    if hosts.len() > 1 {
+        return Err(rejected(ParseError::new(
+            Reason::MultipleHost,
+            "multiple host fields",
+        )));
     }
-    let end = rest.find(['/', '?']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(end);
-    if authority.contains('@') {
-        return Err("userinfo in URLs is not supported".into());
-    }
-    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
-        let (h, after) = v6
-            .split_once(']')
-            .ok_or("unterminated IPv6 literal in URL")?;
-        (h, after.strip_prefix(':'))
-    } else {
-        match authority.rsplit_once(':') {
-            Some((h, p)) => (h, Some(p)),
-            None => (authority, None),
+    if let Some(h) = hosts.first() {
+        let given = url::parse_authority(h, scheme.default_port()).map_err(rejected)?;
+        if given != authority {
+            return Err(rejected(ParseError::new(
+                Reason::HostMismatch,
+                "host does not match the URL",
+            )));
         }
-    };
-    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
-    if host.is_empty() {
-        return Err(format!("{url:?} has no host"));
     }
-    let port = match port {
-        Some(p) => p
-            .parse::<u16>()
-            .ok()
-            .filter(|p| *p != 0)
-            .ok_or_else(|| format!("invalid port {p:?}"))?,
-        None => default_port,
-    };
-    let (path, query) = match tail.split_once('?') {
-        Some((p, q)) => (p, Some(q.to_owned())),
-        None => (tail, None),
-    };
-    let path = if path.is_empty() { "/" } else { path };
-    Ok(ParsedUrl {
+    let connection = roxy_http::connection_tokens(all("connection")).map_err(rejected)?;
+    let upgrade = roxy_http::requested_upgrade(&connection, all("upgrade"));
+    Ok(Head {
         scheme,
-        host,
-        port,
-        path: path.to_owned(),
+        authority,
+        path,
         query,
+        headers,
+        upgrade,
     })
 }
 
@@ -363,9 +368,9 @@ pub fn parse_pair(s: &str) -> Result<(String, String), String> {
 /// unloaded, so `in @list` fails closed (at run time the config would not
 /// start at all).
 pub fn build_view(config: &Config, req: &TestRequest) -> Result<(DryRunView, Vec<String>), String> {
-    let url = parse_url(&req.url)?;
+    let head = parse_head(config, req)?;
     let mut warnings = Vec::new();
-    let host_ip = url.host.parse::<IpAddr>().ok();
+    let host = host_text(&head.authority.host);
     // The request is taken to arrive on the first listener.
     let listener = config.listeners.first();
     let mode = match listener.map(|l| l.mode) {
@@ -380,39 +385,45 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(DryRunView, Vec
         )
         .with_str(Field::ListenerMode, mode)
         .with_str(Field::Method, &req.method)
-        .with_str(Field::Scheme, &url.scheme)
-        .with_str(Field::Host, &url.host)
-        .with_int(Field::Port, i64::from(url.port))
-        .with_str(Field::Path, &url.path)
-        .with_str(Field::Url, &url.url())
-        .with_int(
-            Field::BodySize,
-            req.body
-                .as_ref()
-                .map_or(0, |b| i64::try_from(b.len()).unwrap_or(i64::MAX)),
-        );
-    if url.scheme == "https" && host_ip.is_none() {
-        v = v.with_str(Field::TlsSni, &url.host);
+        .with_str(Field::Scheme, head.scheme.as_str())
+        .with_str(Field::Host, &host)
+        .with_int(Field::Port, i64::from(head.authority.port))
+        .with_str(Field::Path, head.path.as_str())
+        .with_str(Field::Url, &head.url())
+        .with_header("host", &head.host_header());
+    let int = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+    // No --body means an empty body with a declared length of 0; a chunked
+    // body has no declared length.
+    if !req.chunked {
+        let size = req.body.as_ref().map_or(0, |b| b.len() as u64);
+        v = v
+            .with_int(Field::BodySize, int(size))
+            .with_header("content-length", &size.to_string());
     }
-    if let Some(q) = &url.query {
-        v = v.with_str(Field::QueryRaw, q);
-        for pair in q.split('&').filter(|p| !p.is_empty()) {
-            let (k, val) = pair.split_once('=').unwrap_or((pair, ""));
-            v = v.with_query(k, val);
+    if let Some(u) = &head.upgrade {
+        v = v.with_header("upgrade", u);
+    }
+    if head.scheme == Scheme::Https
+        && let Some(name) = head.authority.host.dns_name()
+    {
+        v = v.with_str(Field::TlsSni, name);
+    }
+    if let Some(q) = &head.query {
+        v = v.with_str(Field::QueryRaw, q.as_str());
+        for (k, val) in q.pairs() {
+            v = v.with_query(&k, &val);
         }
     }
-    if !req.headers.iter().any(|(n, _)| n == "host") {
-        v = v.with_header("host", &url.authority());
+    for (n, val) in head.headers.iter() {
+        if let Ok(val) = val.to_str() {
+            v = v.with_header(n.as_str(), val);
+        }
     }
-    for (n, val) in &req.headers {
-        v = v.with_header(n, val);
-    }
-    // No --body means an empty (and therefore inspectable) body; the dry run
-    // has no response body, so `response.body.text` is empty too.
+    // The body text is inspectable whether or not it is chunked; the dry
+    // run has no response body, so `response.body.text` is empty too.
     v = v
         .with_body(req.body.as_deref().unwrap_or(""))
         .with_response_body("");
-    let int = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
     if let Some(n) = req.body_bytes {
         v = v.with_int(Field::BodyBytes, int(n));
     }
@@ -689,34 +700,124 @@ pub fn exit_code(d: &Decision) -> u8 {
 mod tests {
     use super::*;
 
+    fn config() -> Config {
+        Config::from_yaml("version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:3128 }]\nrules: []\n")
+            .unwrap()
+    }
+
     #[test]
-    fn urls() {
-        let u = parse_url("https://API.GitHub.com./repos/a/b?x=1&y").unwrap();
-        assert_eq!(u.scheme, "https");
-        assert_eq!(u.host, "api.github.com");
-        assert_eq!(u.port, 443);
-        assert_eq!(u.path, "/repos/a/b");
-        assert_eq!(u.query.as_deref(), Some("x=1&y"));
-        assert_eq!(u.url(), "https://api.github.com/repos/a/b?x=1&y");
-
-        let u = parse_url("http://[::1]:8080").unwrap();
-        assert_eq!(
-            (u.host.as_str(), u.port, u.path.as_str()),
-            ("::1", 8080, "/")
+    fn urls_are_canonical() {
+        let config = config();
+        let req = TestRequest::new(
+            "GET",
+            "HTTPS://API.GitHub.com.:443/repos/%7ea/./b/../c%2e?x=%2f&y",
         );
-        assert_eq!(u.authority(), "[::1]:8080");
+        let h = parse_head(&config, &req).unwrap();
+        assert_eq!(h.scheme, Scheme::Https);
+        assert_eq!(host_text(&h.authority.host), "api.github.com");
+        assert_eq!(h.authority.port, 443);
+        assert_eq!(h.path.as_str(), "/repos/~a/c.");
+        assert_eq!(h.query.as_ref().unwrap().as_str(), "x=%2F&y");
+        assert_eq!(h.url(), "https://api.github.com/repos/~a/c.?x=%2F&y");
+        assert_eq!(h.host_header(), "api.github.com");
 
-        for bad in [
-            "example.com/x",
-            "ftp://x/",
-            "http:///x",
-            "http://x:0/",
-            "http://x:99999/",
-            "http://u@x/",
-            "http://x/#f",
+        let req = TestRequest::new("GET", "http://[::1]:8080");
+        let h = parse_head(&config, &req).unwrap();
+        assert_eq!(host_text(&h.authority.host), "::1");
+        assert_eq!((h.authority.port, h.path.as_str()), (8080, "/"));
+        assert_eq!(h.host_header(), "[::1]:8080");
+
+        for (bad, reason) in [
+            ("example.com/x", "bad_request_target"),
+            ("ftp://x/", "bad_request_target"),
+            ("http:///x", "bad_authority"),
+            ("http://x:0/", "bad_authority"),
+            ("http://u@x/", "bad_authority"),
+            ("http://x/#f", "fragment_in_target"),
+            ("http://x/../a", "path_climbs_above_root"),
+            ("http://b\u{fc}cher.example/", "non_ascii"),
+            ("http://127.1/", "bad_authority"),
         ] {
-            assert!(parse_url(bad).is_err(), "{bad}");
+            let err = parse_head(&config, &TestRequest::new("GET", bad)).unwrap_err();
+            assert!(err.contains(reason), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn headers_are_canonical() {
+        let config = config();
+        let mut req = TestRequest::new("GET", "https://h.example/");
+        req.headers = vec![
+            ("connection".into(), "close, x-hop".into()),
+            ("x-hop".into(), "1".into()),
+            ("transfer-encoding".into(), "chunked".into()),
+            ("content-length".into(), "99".into()),
+            ("upgrade".into(), "websocket".into()),
+            ("x-keep".into(), "yes".into()),
+        ];
+        let h = parse_head(&config, &req).unwrap();
+        let names: Vec<_> = h.headers.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["x-keep"]);
+        // `Upgrade` without `Connection: upgrade` is not a request to switch.
+        assert_eq!(h.upgrade, None);
+
+        req.headers = vec![
+            ("connection".into(), "Upgrade".into()),
+            ("upgrade".into(), "WebSocket".into()),
+        ];
+        let h = parse_head(&config, &req).unwrap();
+        assert_eq!(h.upgrade.as_deref(), Some("websocket"));
+
+        req.headers = vec![("connection".into(), "(bad)".into())];
+        let err = parse_head(&config, &req).unwrap_err();
+        assert!(err.contains("bad_connection_header"), "{err}");
+        req.headers = vec![("bad name".into(), "x".into())];
+        let err = parse_head(&config, &req).unwrap_err();
+        assert!(err.contains("invalid_header_name"), "{err}");
+        req.headers = vec![("x".into(), "a\u{7f}b".into())];
+        let err = parse_head(&config, &req).unwrap_err();
+        assert!(err.contains("invalid_header_value"), "{err}");
+    }
+
+    #[test]
+    fn host_header_must_name_the_url_authority() {
+        let config = config();
+        let mut req = TestRequest::new("GET", "https://h.example/");
+        req.headers = vec![("host".into(), "H.EXAMPLE.:443".into())];
+        assert_eq!(
+            parse_head(&config, &req).unwrap().host_header(),
+            "h.example"
+        );
+        req.headers = vec![("host".into(), "other.example".into())];
+        let err = parse_head(&config, &req).unwrap_err();
+        assert!(err.contains("host_mismatch"), "{err}");
+        req.headers = vec![("host".into(), "h.example:8443".into())];
+        let err = parse_head(&config, &req).unwrap_err();
+        assert!(err.contains("host_mismatch"), "{err}");
+        req.headers = vec![
+            ("host".into(), "h.example".into()),
+            ("host".into(), "h.example".into()),
+        ];
+        let err = parse_head(&config, &req).unwrap_err();
+        assert!(err.contains("multiple_host"), "{err}");
+    }
+
+    #[test]
+    fn body_size_follows_the_framing() {
+        let config = config();
+        let mut req = TestRequest::new("POST", "https://h.example/");
+        req.body = Some("hello".into());
+        let (view, _) = build_view(&config, &req).unwrap();
+        assert_eq!(view.field(Field::BodySize), Value::Int(5));
+        assert_eq!(view.header("content-length").as_deref(), Some("5"));
+        req.chunked = true;
+        let (view, _) = build_view(&config, &req).unwrap();
+        assert_eq!(view.field(Field::BodySize), Value::Absent);
+        assert_eq!(view.header("content-length"), None);
+        assert_eq!(
+            view.body_text(),
+            BodyText::Available(std::borrow::Cow::Borrowed("hello"))
+        );
     }
 
     #[test]
