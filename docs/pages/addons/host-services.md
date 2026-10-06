@@ -7,6 +7,8 @@ grants, so one binary runs under any of them; calling one that was not
 granted traps (`CapabilityDenied`) and fails the exchange. `flow.current`,
 `flow.add-tag` and `flow.config` need no capability, but `flow.add-tag` is
 for enforce layers only: an observer's call fails its exchange the same way.
+A flow holds at most 64 tags, and 4 KiB of them together; a tag past that
+fails the exchange (`budget:tags`).
 
 ## Endpoints (`endpoints`)
 
@@ -69,16 +71,17 @@ not trust client-supplied session headers.
 `flow.record(kind, json, audit)` writes a `layer_record` event to the flow
 log with the flow id, the layer name and a timestamp. String values pass
 through the secret redactor, and a value that is not JSON fails the
-exchange. Like any audit record it is never dropped: the call waits while
-the flow log is behind. `audit: true` also POSTs the record to the layer's
-`audit_endpoint`.
+exchange, as does a kind and document over 64 KiB together
+(`budget:message`). Like any audit record it is never dropped: the call
+waits while the flow log is behind. `audit: true` also POSTs the record to
+the layer's `audit_endpoint`.
 
 ## Metrics and log (`metrics`, `log`)
 
 `flow.metric-get(id, [])` reads a metric for this flow's own key (the
 metric's key fields evaluated on the request that left the addon stack, so
 after any layer changed it); explicit key values are refused. `flow.log` writes to roxy's operational log with the flow id
-and layer name.
+and layer name; a message over 64 KiB fails the exchange (`budget:message`).
 
 There is no `secrets` capability (the config refuses it and points to
 endpoint `headers`), and no way to terminate or quarantine a client: a

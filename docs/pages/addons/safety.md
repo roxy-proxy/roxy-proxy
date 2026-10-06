@@ -27,6 +27,15 @@ slow layer unchecked while it works, so this keeps traffic fail-closed.
   table (4096 live resources) are capped too. This is what keeps one addon
   from exhausting roxy's memory, and with it every flow. Whatever a layer
   holds of a body lives here.
+- **Fixed caps on what the host holds for a guest.** A `fields` a guest
+  builds, the flow's tags and the payloads of `flow.log` and `flow.record`
+  live in the host, outside `max_memory`, so each has a fixed cap. A
+  `fields` holds at most 128 KiB of names and values (`budget:fields`). A
+  flow holds at most 64 tags, and 4 KiB of them together, across all its
+  layers (`budget:tags`). A `flow.log` message, or a `flow.record` kind and
+  document together, is at most 64 KiB (`budget:message`). A call past a
+  cap fails the exchange closed, like any other budget. These caps are not
+  configurable.
 - **Instances.** `max_instances` (default 1024) caps the live instances,
   and so the layer's concurrent exchanges and, with `max_memory`, its
   memory. An exchange that finds none free waits for one, without a
