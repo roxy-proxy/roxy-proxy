@@ -735,7 +735,7 @@ async fn client_close_after_the_upload_ends_drive() {
     let upstream = async move {
         assert_eq!(body.collect_up_to(100).await.unwrap(), "hello");
         drop(client);
-        std::future::pending::<()>().await
+        std::future::pending::<()>().await;
     };
     let err = client_fault(
         tokio::time::timeout(Duration::from_secs(5), c.drive(upstream))

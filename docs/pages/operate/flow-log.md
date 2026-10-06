@@ -35,7 +35,9 @@ produces a `request` event:
   An exchange roxy could not finish has `aborted` (its connection ended, or
   the server stopped, while it was in flight); one an addon layer dropped
   after the rules had forwarded it has `upstream_aborted`; an exchange cut
-  short because the client went away has `client_gone`.
+  short because the client went away has `client_gone`; one cut short
+  because an HTTP/2 client stopped taking the response has
+  `client_stalled`.
 - `stage` says where the decision was made: `head` for the forwarding
   decision, or where a watching rule stopped the exchange: `request_body`,
   `response_head`, `response_body`, `websocket`.
@@ -53,7 +55,7 @@ produces a `request` event:
 | event | when |
 |---|---|
 | `request` | every exchange |
-| `response_error` | the response could not be written after the request was allowed; `reason` is `client_gone` (the client stopped reading or went away), `response_body_timeout` (the upstream paused mid-body for longer than `limits.response_body_idle_timeout`), `response_write_failed` (for example, a body limit mid-stream) or `continue_write_failed` (roxy's own `100 Continue` could not be written) |
+| `response_error` | the response could not be written after the request was allowed; `reason` is `client_gone` (the client stopped reading or went away), `client_stalled` (an HTTP/2 client left its flow-control window shut for `limits.body_idle_timeout`), `response_body_timeout` (the upstream paused mid-body for longer than `limits.response_body_idle_timeout`), `response_write_failed` (for example, a body limit mid-stream) or `continue_write_failed` (roxy's own `100 Continue` could not be written) |
 | `parse_error` | the client sent something roxy refused to parse; `reason` is a stable code |
 | `upstream_error`, `upstream_denied` | [upstream](/reference/upstream#errors) failures and address-floor hits; `upstream_denied.reason` is `private_range:<class>`, `deny_cidrs` or `list:<name>` ([address floor](/policies/address-lists#address-floor)) |
 | `policy_input_unavailable`, `metric_table_full` | a flow failed closed for want of an input |

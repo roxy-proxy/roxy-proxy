@@ -246,6 +246,8 @@ impl Upstream {
     /// * `/echo`: reads the body, answers with the same bytes, with
     ///   `content-encoding` set to the request's `x-echo-encoding` and the
     ///   status to its `x-echo-status` (default `200`);
+    /// * `/trailers`: reads the body, answers `200` with an empty body
+    ///   followed by the trailer `x-checksum: none`;
     /// * `/drip?n=<n>&ms=<ms>`: `n` chunks, `ms` apart, without reading the
     ///   body;
     /// * `/cut`: reads the body, answers `200` declaring 10 bytes of body,
@@ -334,6 +336,13 @@ impl Upstream {
                 .header("content-length", "10")
                 .body(cut())
                 .unwrap();
+        }
+        if path == "/trailers" {
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("x-checksum", http::HeaderValue::from_static("none"));
+            let body = Full::new(Bytes::new())
+                .with_trailers(async move { Some(Ok::<_, Infallible>(trailers)) });
+            return http::Response::new(body.boxed());
         }
         if let Some(code) = path.strip_prefix("/status/") {
             return http::Response::builder()

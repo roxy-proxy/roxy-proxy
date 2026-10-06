@@ -149,15 +149,15 @@ impl Refusal {
         }
     }
 
-    /// 502/504 for an upstream failure; always closes. `reason` goes to the
-    /// flow log.
+    /// 502/504 for an upstream failure. It says nothing about the client,
+    /// so the connection stays open. `reason` goes to the flow log.
     pub(crate) fn upstream(status: StatusCode, reason: &str) -> Self {
         Self {
             kind: RefusalKind::UpstreamError,
             status,
             message: DEFAULT_DENY_MESSAGE.to_owned(),
             rule: None,
-            close: true,
+            close: false,
             reason: Some(reason.to_owned()),
         }
     }

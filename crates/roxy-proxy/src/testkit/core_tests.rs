@@ -329,6 +329,48 @@ async fn h2_a_stalled_response_is_reset_with_cancel() {
     assert_stalled_response_logged(&kit).await;
 }
 
+/// An h2 client that stops taking the response (its flow-control window
+/// stays shut for `body_idle_timeout`) has its stream cancelled, and the
+/// flow is logged as `client_stalled`: it did not go away.
+#[tokio::test]
+async fn h2_a_client_that_stops_reading_is_cancelled_as_stalled() {
+    let kit = Kit::builder()
+        .rules(RULES)
+        .limits(|l| l.body_idle_timeout = std::time::Duration::from_millis(300))
+        .start()
+        .await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    // Well over the client's 64 KiB initial window.
+    let req = http::Request::get("https://up.test/drip?n=10000&ms=0")
+        .body(())
+        .unwrap();
+    let mut ready = send.clone().ready().await.unwrap();
+    let (resp, _) = ready.send_request(req, true).unwrap();
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(10), resp)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut body = resp.into_body();
+    // Take frames without ever releasing capacity: the window shuts.
+    let mut failure = None;
+    while let Some(chunk) = tokio::time::timeout(std::time::Duration::from_secs(10), body.data())
+        .await
+        .expect("the stall is cut off")
+    {
+        if let Err(e) = chunk {
+            failure = Some(e);
+            break;
+        }
+    }
+    let e = failure.expect("the stream must be reset");
+    assert_eq!(e.reason(), Some(h2::Reason::CANCEL), "{e}");
+    let err = kit.events("response_error", 1).await;
+    assert_eq!(err[0]["reason"], "client_stalled", "{err:#?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["reason"], "client_stalled", "{ev:#}");
+}
+
 /// An exchange finishes under the policy it started with; the next one
 /// runs under the reloaded policy.
 #[tokio::test]
@@ -411,9 +453,9 @@ async fn h2_a_reload_releases_the_old_upstream_pool_under_an_open_tunnel() {
     a_reload_releases_the_old_upstream_pool_under_an_open_client_connection(c, &kit).await;
 }
 
-/// A client that vanishes mid-upload still gets its exchange logged, on
-/// h1 (the codec sees EOF) and on h2 (the connection ends under the
-/// stream's task).
+/// A client that vanishes mid-upload still gets its exchange logged as
+/// `client_gone`, on h1 (the codec sees EOF) and on h2 (the connection
+/// ends under the stream's task); it is not a parse error.
 async fn a_client_gone_mid_upload_is_logged(h2: bool) {
     let kit = kit().await;
     let mut c = if h2 {
@@ -431,8 +473,13 @@ async fn a_client_gone_mid_upload_is_logged(h2: bool) {
     let _ = pending.await;
     let ev = kit.request_event().await;
     assert_eq!(ev["decision"], "allow", "{ev:#}");
-    let reason = if h2 { "client_gone" } else { "unexpected_eof" };
-    assert_eq!(ev["reason"], reason, "{ev:#}");
+    assert_eq!(ev["reason"], "client_gone", "{ev:#}");
+    assert!(ev["res"].is_null(), "{ev:#}");
+    let events = kit.sink.events();
+    assert!(
+        events.iter().all(|e| e["event"] != "parse_error"),
+        "{events:#?}"
+    );
 }
 
 /// An h2 client cancelling its stream (`RST_STREAM`) is not a protocol
@@ -529,6 +576,42 @@ async fn an_unreachable_upstream_is_a_502() {
     let ev = kit.request_event().await;
     assert_eq!(ev["decision"], "allow", "{ev:#}");
     assert_eq!(ev["terminal_rule"], "down");
+}
+
+/// An upstream failure says nothing about the client: the connection is
+/// not closed behind the `502` (no `connection: close` on h1, no GOAWAY on
+/// h2) and serves the next request.
+async fn an_upstream_failure_leaves_the_connection_open(h2: bool) {
+    let kit = kit().await;
+    let mut c = if h2 {
+        kit.tunnel("down.test", true).await
+    } else {
+        kit.h1().await
+    };
+    for path in ["/first", "/second"] {
+        let req = c
+            .request_to("down.test", "GET", path, &[])
+            .body(roxy_http::Body::empty())
+            .unwrap();
+        let res = c
+            .send(req)
+            .await
+            .expect("the connection is still open after a 502");
+        let a = Answer::read(res).await;
+        assert_eq!(a.status, 502, "{a:?}");
+        assert!(a.headers.get("connection").is_none(), "{a:?}");
+    }
+    assert_eq!(kit.events("upstream_error", 2).await.len(), 2);
+}
+
+#[tokio::test]
+async fn h1_an_upstream_failure_leaves_the_connection_open() {
+    an_upstream_failure_leaves_the_connection_open(false).await;
+}
+
+#[tokio::test]
+async fn h2_an_upstream_failure_leaves_the_connection_open() {
+    an_upstream_failure_leaves_the_connection_open(true).await;
 }
 
 /// Under one wildcard allow, a name that does not resolve, one that
@@ -810,6 +893,40 @@ async fn a_deny_never_answers_100_continue() {
         .unwrap();
     assert!(rest.is_empty(), "{}", String::from_utf8_lossy(&rest));
     assert!(kit.upstream.seen().is_empty());
+}
+
+/// When a rule reads the body, the decision needs it: the `100 Continue`
+/// goes out before the rules decide, and the deny follows the body.
+#[tokio::test]
+async fn a_body_rule_deny_answers_100_continue_first() {
+    use tokio::io::AsyncWriteExt;
+    let kit = Kit::builder()
+        .rules(
+            r#"
+- id: no-secrets
+  when: host == "up.test" and body.text contains "secret"
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#,
+        )
+        .start()
+        .await;
+    let mut io = kit.connect();
+    io.write_all(
+        b"POST http://up.test/x HTTP/1.1\r\nhost: up.test\r\ncontent-length: 6\r\nexpect: 100-continue\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let interim = read_response(&mut io).await;
+    assert!(interim.starts_with("HTTP/1.1 100 Continue"), "{interim}");
+    io.write_all(b"secret").await.unwrap();
+    let res = read_response(&mut io).await;
+    assert!(res.starts_with("HTTP/1.1 403"), "{res}");
+    assert!(kit.upstream.seen().is_empty());
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "no-secrets", "{ev:#}");
 }
 
 /// A client gone between `Expect: 100-continue` and the `100` is a client

@@ -153,8 +153,12 @@ async fn handle_connect(
     // decision is made on the requests inside the tunnel.
     emit_connect_event(&shared, &client, &authority, false);
 
-    let Ok((io, buf)) = conn.accept_connect().await else {
-        return;
+    let (io, buf) = match conn.accept_connect().await {
+        Ok(x) => x,
+        Err(e) => {
+            shared.emit_parse_reason(&client, None, "connect_write_failed", Some(&e.to_string()));
+            return;
+        }
     };
 
     // Classify the first bytes: TLS, plaintext HTTP, or close.
@@ -334,14 +338,17 @@ async fn terminate_tls(
     cl: ConnLimits,
 ) {
     let host = host_text(&authority.host);
-    // Mint (or warm) the leaf off the async workers (~1 ms on a miss), so the
-    // resolver inside the handshake hits the cache.
-    let minter = shared.minter.clone();
+    // Mint the leaf off the async workers (~1 ms on a miss), so the resolver
+    // inside the handshake hits the cache; a leaf already cached needs no
+    // hop.
     let warm_host = sni_host.unwrap_or_else(|| authority.host.clone());
-    let warmed = tokio::task::spawn_blocking(move || minter.certified_key(&warm_host)).await;
-    if !matches!(warmed, Ok(Ok(_))) {
-        shared.emit_parse_reason(&client, None, "leaf_mint_failed", Some(&host));
-        return;
+    if !shared.minter.is_cached(&warm_host) {
+        let minter = shared.minter.clone();
+        let warmed = tokio::task::spawn_blocking(move || minter.certified_key(&warm_host)).await;
+        if !matches!(warmed, Ok(Ok(_))) {
+            shared.emit_parse_reason(&client, None, "leaf_mint_failed", Some(&host));
+            return;
+        }
     }
     let cfg = roxy_tls::server_config_for(
         shared.minter.clone(),

@@ -17,7 +17,7 @@ use roxy_http::upstream::{
 };
 use roxy_http::ws::{WsKey, validate_upgrade_request};
 use roxy_http::{
-    Body, BodyError, CanonicalRequest, CanonicalResponse, DriveError, Limits, ParseError,
+    Body, BodyError, CanonicalRequest, CanonicalResponse, DriveError, Limits, ParseError, Reason,
     RequestMeta, WriteError,
 };
 use roxy_rules::RuleId;
@@ -63,6 +63,9 @@ pub(crate) enum WriteFailure {
     Stopped,
     /// The client stopped reading or went away.
     ClientGone(String),
+    /// The client's HTTP/2 flow-control window stayed shut for
+    /// `body_idle_timeout`; the front cut the body.
+    ClientStalled,
     /// The upstream sent no response-body frame for
     /// `response_body_idle_timeout`; the front cut the body.
     UpstreamStalled,
@@ -75,6 +78,7 @@ impl std::fmt::Display for WriteFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Stopped => f.write_str("stopped by policy"),
+            Self::ClientStalled => f.write_str("client flow-control window stalled"),
             Self::UpstreamStalled => f.write_str("response body idle timeout"),
             Self::ClientGone(s) | Self::Io(s) => f.write_str(s),
         }
@@ -105,8 +109,9 @@ pub(crate) enum Answer {
 pub(crate) struct Sent {
     /// The write failed: the client got nothing, or a cut body.
     pub failed: bool,
-    /// The exchange ends the connection: a closing deny, or a watching
-    /// stop that closes. (The h1 codec closes on its own; h2 sends GOAWAY.)
+    /// The exchange ends the connection: a closing refusal, or a watching
+    /// stop that closes. The h1 codec sees the same value as
+    /// `res.meta.close`; h2 sends GOAWAY on it.
     pub close: bool,
 }
 
@@ -136,6 +141,7 @@ where
     let failure = match r {
         Ok(()) | Err(WriteFailure::Stopped) => None,
         Err(e @ WriteFailure::ClientGone(_)) => Some(("client_gone", e)),
+        Err(e @ WriteFailure::ClientStalled) => Some(("client_stalled", e)),
         Err(e @ WriteFailure::UpstreamStalled) => Some(("response_body_timeout", e)),
         Err(e @ WriteFailure::Io(_)) => Some(("response_write_failed", e)),
     };
@@ -145,10 +151,10 @@ where
         emit_response_error(cx, reason, &e);
         cx.record.reason.get_or_insert_with(|| reason.to_owned());
     }
+    // One source for both fronts: `refusal_response` sets `res.meta.close`
+    // from the same field.
     let close = match &refusal {
-        // A deny closes the connection; an upstream failure is not a
-        // decision about the client and leaves it alone.
-        Some(r) => r.kind == RefusalKind::Deny && r.close,
+        Some(r) => r.close,
         None => stop.as_ref().is_some_and(|s| s.refusal.close),
     };
     if let Some(r) = &refusal {
@@ -225,8 +231,8 @@ pub(crate) fn record_client_failure(cx: &mut FlowCx, e: &ParseError, status: Opt
     cx.emit_request_event();
 }
 
-/// The client went away mid-exchange (reset its stream, dropped the
-/// connection): nothing is written; the flow is logged with reason
+/// The client went away mid-exchange (dropped the connection, or on h2
+/// reset its stream): nothing is written; the flow is logged with reason
 /// `client_gone`.
 pub(crate) fn record_client_gone(cx: &mut FlowCx) {
     cx.record.decision.get_or_insert(DecisionKind::Deny);
@@ -242,9 +248,10 @@ pub(crate) fn record_continue_failure(cx: &mut FlowCx, e: WriteError) {
     let e = WriteFailure::from(e);
     let reason = match e {
         WriteFailure::ClientGone(_) => "client_gone",
-        WriteFailure::Stopped | WriteFailure::UpstreamStalled | WriteFailure::Io(_) => {
-            "continue_write_failed"
-        }
+        WriteFailure::Stopped
+        | WriteFailure::ClientStalled
+        | WriteFailure::UpstreamStalled
+        | WriteFailure::Io(_) => "continue_write_failed",
     };
     emit_response_error(cx, reason, &e);
     cx.record.reason = Some(reason.to_owned());
@@ -270,7 +277,10 @@ pub(crate) async fn close_on_parse_error(
 }
 
 /// The exchange ended on the client side: a parse error is answered and
-/// logged as the client's fault; a failed `100 Continue` is roxy's.
+/// logged as the client's fault; a failed `100 Continue` is roxy's. EOF
+/// is a client that left (h1 cannot tell a half-close from a departure):
+/// there is nobody to answer, so nothing is written and the flow is
+/// logged as `client_gone`, as on h2.
 async fn close_on_drive_error(
     conn: ServerConn<ClientIo>,
     mut cx: FlowCx,
@@ -278,6 +288,10 @@ async fn close_on_drive_error(
     e: DriveError,
 ) {
     match e {
+        DriveError::Client(e) if e.reason == Reason::UnexpectedEof => {
+            drop(conn);
+            record_client_gone(&mut cx);
+        }
         DriveError::Client(e) => {
             let client = cx.facts.client.clone();
             close_on_parse_error(conn, Some(cx), &client, shared, &e).await;

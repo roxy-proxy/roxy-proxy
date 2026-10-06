@@ -165,7 +165,10 @@ The strictness knobs live under `http:` and all default to strict.
 - GET, HEAD, DELETE, OPTIONS, CONNECT and TRACE with a non-empty body are
   rejected unless `http.allow_body_on_get`.
 - `Expect` may only be `100-continue`; roxy sends `100 Continue` itself once
-  the rules allow the request. Anything else gets `417`.
+  the rules allow the request. When a rule reads the request body
+  (`body.text`, `body.bytes`, ...) the body is part of the decision, so the
+  `100 Continue` goes out before it; a deny then follows the body. Anything
+  else gets `417`.
 - Hop-by-hop fields (`Connection` and every field it names, `Keep-Alive`,
   `Proxy-Connection`, `Proxy-Authorization`, `TE`, `Trailer`,
   `Transfer-Encoding`, `Upgrade`) are consumed by roxy and never forwarded.
@@ -183,9 +186,11 @@ The strictness knobs live under `http:` and all default to strict.
   byte, whether that byte opened the connection or was pipelined behind
   the previous request. The body may not stall for longer than
   `limits.body_idle_timeout` (30 s), which also bounds how long the client
-  may go without taking the next part of the response.
+  may go without taking the next part of the response (on HTTP/2 the
+  stream is reset with `CANCEL`; `response_error`, reason `client_stalled`).
 - A client that closes its connection while roxy is still waiting for the
-  response ends the exchange, body or no body.
+  response ends the exchange, body or no body. Nothing is written back, and
+  the flow is logged with reason `client_gone`.
 
 ### HTTP/2 requests
 
@@ -200,6 +205,9 @@ The strictness knobs live under `http:` and all default to strict.
 - Streams per connection and header bytes per stream are capped by
   `limits.h2_max_concurrent_streams` and `limits.h2_max_header_list_bytes`.
   CONTINUATION-flood and rapid-reset defences come from the `h2` crate.
+- The first stream must open within `limits.header_timeout` of the
+  connection, as an HTTP/1.1 request head must; between requests the
+  connection may idle for `limits.idle_timeout`.
 
 ## URL normalisation
 
@@ -345,4 +353,6 @@ closed (`connection: close` on HTTP/1.1, `GOAWAY` on HTTP/2) unless the
 rule says `deny: { close: false }`, so a probing
 client loses its warm connection on every attempt, and roxy does not read
 the rest of a request body it has refused: the response goes out at once
-and the connection closes behind it.
+and the connection closes behind it. An upstream failure (`502`, `504`)
+says nothing about the client, so the connection stays open on both
+versions.
