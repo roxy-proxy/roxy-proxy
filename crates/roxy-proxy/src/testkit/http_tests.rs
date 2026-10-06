@@ -200,6 +200,19 @@ async fn a_mismatched_sni_in_a_tunnel_closes() {
     assert_eq!(ev[0]["reason"], "sni_mismatch");
 }
 
+/// The SNI check and the leaf cache key use the same canonical host: a
+/// CONNECT host that differs from the SNI only in case and a trailing dot
+/// is accepted, and the warm-up and the handshake share one leaf.
+#[tokio::test]
+async fn sni_and_connect_host_are_compared_canonically() {
+    let kit = Kit::builder().start().await;
+    let io = kit.connect_tunnel("UP.TEST.", 443).await;
+    kit.tls_connect(io, "up.test", &[b"http/1.1"])
+        .await
+        .unwrap();
+    assert_eq!(kit.minter.cached(), 1);
+}
+
 // ---- bodies ---------------------------------------------------------------
 
 /// Bodies arrive whole, with and without a declared length, on h1 and h2.

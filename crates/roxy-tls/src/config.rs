@@ -14,14 +14,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use roxy_http::Host;
 use rustls::crypto::CryptoProvider;
 use rustls::server::{ClientHello, NoServerSessionStorage, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, SupportedProtocolVersion};
 use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, ServerName};
+use rustls_pki_types::{CertificateDer, DnsName, ServerName};
 
-use crate::leaf::{LeafError, LeafMinter, parse_host};
+use crate::leaf::LeafMinter;
 
 /// Errors building TLS configurations.
 #[derive(Debug, thiserror::Error)]
@@ -42,9 +43,6 @@ pub enum TlsError {
     /// A certificate in a root file was rejected as a trust anchor.
     #[error("unusable root certificate in {}: {reason}", path.display())]
     InvalidRoot { path: PathBuf, reason: String },
-    /// Not a usable host name or IP address.
-    #[error("invalid host name: {0}")]
-    InvalidName(#[from] LeafError),
     /// rustls rejected the configuration.
     #[error("rustls: {0}")]
     Rustls(#[from] rustls::Error),
@@ -96,34 +94,41 @@ pub fn install_crypto_provider() {
     }
 }
 
-/// Parse a host (DNS name, IPv4, or IPv6 with or without brackets) into a
-/// canonical [`ServerName`]. Rejects wildcards, trailing dots, names over 253
-/// bytes and anything that is not a valid DNS name.
-pub fn server_name_for_host(host: &str) -> Result<ServerName<'static>, TlsError> {
-    Ok(parse_host(host)?)
+/// The rustls [`ServerName`] for a canonical host.
+///
+/// Every name `roxy_http::url::parse_host` accepts is a valid DNS name to
+/// rustls (its label rules are the stricter of the two), so this cannot fail.
+pub fn server_name(host: &Host) -> ServerName<'static> {
+    match host {
+        Host::Dns(name) => ServerName::DnsName(
+            DnsName::try_from(name.clone()).expect("a canonical host is a valid DNS name"),
+        ),
+        Host::Ipv4(ip) => ServerName::IpAddress((*ip).into()),
+        Host::Ipv6(ip) => ServerName::IpAddress((*ip).into()),
+    }
 }
 
 #[derive(Debug)]
 struct Resolver {
     minter: Arc<LeafMinter>,
-    default_name: ServerName<'static>,
+    default_host: Host,
 }
 
 impl ResolvesServerCert for Resolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let name = match hello.server_name() {
+        let host = match hello.server_name() {
             // An SNI that is present but invalid fails the handshake rather
             // than silently falling back.
-            Some(sni) => parse_host(sni).ok()?,
-            None => self.default_name.clone(),
+            Some(sni) => roxy_http::url::parse_host(sni.as_bytes()).ok()?,
+            None => self.default_host.clone(),
         };
-        self.minter.certified_key(&name).ok()
+        self.minter.certified_key(&host).ok()
     }
 }
 
 /// Build the client-facing config for one accepted connection.
 ///
-/// The certificate is chosen by SNI, or `default_name` (normally the CONNECT
+/// The certificate is chosen by SNI, or `default_host` (normally the CONNECT
 /// host) when the client sends no SNI. ALPN is `h2, http/1.1` if `enable_h2`
 /// else `http/1.1`; TLS 1.2 and 1.3; no client authentication.
 ///
@@ -132,12 +137,12 @@ impl ResolvesServerCert for Resolver {
 /// `LeafMinter::certified_key` on the blocking pool for the default name.
 pub fn server_config_for(
     minter: Arc<LeafMinter>,
-    default_name: ServerName<'static>,
+    default_host: Host,
     enable_h2: bool,
 ) -> Arc<ServerConfig> {
     let resolver = Arc::new(Resolver {
         minter,
-        default_name,
+        default_host,
     });
     let mut cfg = ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(rustls::ALL_VERSIONS)
@@ -281,8 +286,12 @@ mod tests {
         Ok(())
     }
 
+    fn host(s: &str) -> Host {
+        roxy_http::url::parse_host(s.as_bytes()).unwrap()
+    }
+
     fn name(s: &str) -> ServerName<'static> {
-        server_name_for_host(s).unwrap()
+        server_name(&host(s))
     }
 
     #[test]
@@ -292,7 +301,7 @@ mod tests {
         let (ca, m) = minter();
         let client = ca_only_client(&ca, true, MinTlsVersion::Tls12);
         for (h2, want) in [(true, &b"h2"[..]), (false, &b"http/1.1"[..])] {
-            let scfg = server_config_for(Arc::clone(&m), name("fallback.test"), h2);
+            let scfg = server_config_for(Arc::clone(&m), host("fallback.test"), h2);
             let mut c = ClientConnection::new(Arc::clone(&client), name("example.com")).unwrap();
             let mut s = ServerConnection::new(scfg).unwrap();
             handshake(&mut c, &mut s).unwrap();
@@ -309,7 +318,7 @@ mod tests {
         let client = ca_only_client(&ca, false, MinTlsVersion::Tls12);
         let mut c = ClientConnection::new(Arc::clone(&client), name("example.com")).unwrap();
         let mut s =
-            ServerConnection::new(server_config_for(Arc::clone(&m), name("example.com"), true))
+            ServerConnection::new(server_config_for(Arc::clone(&m), host("example.com"), true))
                 .unwrap();
         handshake(&mut c, &mut s).unwrap();
         assert_eq!(s.server_name(), None);
@@ -317,14 +326,14 @@ mod tests {
         // Wrong default: the client must reject the certificate.
         let mut c = ClientConnection::new(client, name("example.com")).unwrap();
         let mut s =
-            ServerConnection::new(server_config_for(Arc::clone(&m), name("wrong.test"), true))
+            ServerConnection::new(server_config_for(Arc::clone(&m), host("wrong.test"), true))
                 .unwrap();
         assert!(handshake(&mut c, &mut s).is_err());
 
         // IP target: no SNI is sent at all, IP SAN is used.
         let client = ca_only_client(&ca, true, MinTlsVersion::Tls13);
         let mut c = ClientConnection::new(client, name("127.0.0.1")).unwrap();
-        let mut s = ServerConnection::new(server_config_for(m, name("127.0.0.1"), false)).unwrap();
+        let mut s = ServerConnection::new(server_config_for(m, host("127.0.0.1"), false)).unwrap();
         handshake(&mut c, &mut s).unwrap();
         assert_eq!(s.server_name(), None);
     }
@@ -334,7 +343,7 @@ mod tests {
         let (_ca, m) = minter();
         let client = client_config(&UpstreamTlsOptions::default()).unwrap();
         let mut c = ClientConnection::new(client, name("example.com")).unwrap();
-        let mut s = ServerConnection::new(server_config_for(m, name("example.com"), true)).unwrap();
+        let mut s = ServerConnection::new(server_config_for(m, host("example.com"), true)).unwrap();
         assert!(handshake(&mut c, &mut s).is_err());
     }
 
@@ -382,7 +391,7 @@ mod tests {
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(Resolver {
                 minter: m,
-                default_name: name("example.com"),
+                default_host: host("example.com"),
             }));
         scfg.alpn_protocols = vec![b"http/1.1".to_vec()];
         let scfg = Arc::new(scfg);
@@ -428,7 +437,7 @@ mod tests {
             let m = Arc::new(LeafMinter::new(ca, 4).unwrap());
             let mut c = ClientConnection::new(client(), name("example.com")).unwrap();
             let mut s =
-                ServerConnection::new(server_config_for(m, name("example.com"), true)).unwrap();
+                ServerConnection::new(server_config_for(m, host("example.com"), true)).unwrap();
             handshake(&mut c, &mut s).map(|()| c.peer_certificates().unwrap().len())
         };
 
@@ -438,17 +447,20 @@ mod tests {
         assert!(handshake_with(&sub_pem).is_err());
     }
 
+    /// A canonical host maps onto rustls's name type without re-parsing.
     #[test]
-    fn host_parsing() {
+    fn server_name_of_canonical_host() {
         assert!(matches!(
-            server_name_for_host("Example.COM").unwrap(),
+            server_name(&host("Example.COM.")),
             ServerName::DnsName(d) if d.as_ref() == "example.com"
         ));
         assert!(matches!(
-            server_name_for_host("[::1]").unwrap(),
+            server_name(&host("a_b.example")),
+            ServerName::DnsName(d) if d.as_ref() == "a_b.example"
+        ));
+        assert!(matches!(
+            server_name(&host("[::1]")),
             ServerName::IpAddress(_)
         ));
-        assert!(server_name_for_host("*.example.com").is_err());
-        assert!(server_name_for_host("").is_err());
     }
 }

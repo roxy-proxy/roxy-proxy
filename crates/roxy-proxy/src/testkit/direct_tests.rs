@@ -138,7 +138,7 @@ async fn tls_without_sni_is_closed() {
     let kit = kit().await;
     let mut cfg = kit.client_tls();
     cfg.enable_sni = false;
-    let name = roxy_tls::server_name_for_host("up.test").unwrap();
+    let name = roxy_tls::server_name(&roxy_http::url::parse_host(b"up.test").unwrap());
     let res = tokio_rustls::TlsConnector::from(Arc::new(cfg))
         .connect(name, kit.connect_direct(443))
         .await;

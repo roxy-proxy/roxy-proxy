@@ -430,7 +430,7 @@ impl KitBuilder {
             ca_server: None,
             dns: None,
             ca: ca.clone(),
-            minter,
+            minter: minter.clone(),
             require_sni_match: true,
             enable_h2: true,
             upstream_tls: UpstreamTlsOptions {
@@ -464,6 +464,7 @@ impl KitBuilder {
             server,
             sink,
             upstream,
+            minter,
             capture,
             samples,
             ca_file: dir.path().join(roxy_tls::CA_CERT_FILE),
@@ -519,6 +520,8 @@ pub(crate) struct Kit {
     pub server: Server,
     pub sink: Arc<MemorySink>,
     pub upstream: Arc<Upstream>,
+    /// roxy's leaf minter, shared with the scripted upstream.
+    pub minter: Arc<LeafMinter>,
     /// The capture log, with [`KitBuilder::capture_all`].
     pub capture: Option<Arc<crate::capture::CaptureLog>>,
     /// Every sample recorded in the kit's own metric store (the one
@@ -719,7 +722,7 @@ impl Kit {
     {
         let mut cfg = self.client_tls();
         cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-        let name = roxy_tls::server_name_for_host(host).unwrap();
+        let name = roxy_tls::server_name(&roxy_http::url::parse_host(host.as_bytes()).unwrap());
         tokio_rustls::TlsConnector::from(Arc::new(cfg))
             .connect(name, io)
             .await

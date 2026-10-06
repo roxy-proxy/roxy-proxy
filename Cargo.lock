@@ -2616,6 +2616,7 @@ dependencies = [
  "proptest",
  "rcgen",
  "ring",
+ "roxy-http",
  "rustls",
  "rustls-pki-types",
  "tempfile",

@@ -14,7 +14,7 @@ mod sniff;
 pub use ca::{CA_CERT_FILE, CA_KEY_FILE, Ca, CaError};
 pub use config::{
     MinTlsVersion, TlsError, UpstreamTlsOptions, client_config, install_crypto_provider,
-    server_config_for, server_name_for_host,
+    server_config_for, server_name,
 };
 pub use leaf::{LeafError, LeafMinter};
 pub use sniff::{ClientHelloInfo, MAX_HELLO_BYTES, Sniff, looks_like_http, sniff};
