@@ -136,6 +136,24 @@ async fn a_101_on_an_exchange_that_is_not_an_upgrade_fails_the_stream() {
     assert!(e.to_string().contains("status 101"), "{e}");
 }
 
+/// A request head that does not parse is the service's protocol error,
+/// and the first answer is where the exchange learns it: nothing was
+/// forwarded, so that answer is still owed.
+#[tokio::test]
+async fn an_invalid_request_head_fails_the_first_answer() {
+    let (stream, answers, _kit) = lone_stream().await;
+    stream.control(In::Request {
+        method: "GET".to_owned(),
+        url: "http://up.test/".to_owned(),
+        headers: vec![("bad header".to_owned(), "x".to_owned())],
+    });
+    assert!(lock(&stream.state).ended());
+    let Err(Unanswered::Service(e)) = answers.first.await.expect("the first answer is told") else {
+        panic!("the request is not forwarded");
+    };
+    assert_eq!(e.kind(), "service:protocol", "{e}");
+}
+
 /// Bytes are owed to a head in their own direction: response bytes
 /// while only the request body is being fed fail the stream.
 #[tokio::test]

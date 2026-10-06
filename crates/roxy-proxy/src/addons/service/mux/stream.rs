@@ -519,13 +519,16 @@ impl Stream {
                 url,
                 headers,
             } => {
-                let first = s.forwarded()?;
+                // Parsed before the first answer is taken: a head that fails
+                // leaves the answer owed, so `settle` tells it the error.
                 let method = http::Method::from_bytes(method.as_bytes())
                     .map_err(|_| ServiceError::Protocol(format!("invalid method {method:?}")))?;
                 let uri: http::Uri = url
                     .parse()
                     .map_err(|_| ServiceError::Protocol(format!("invalid url {url:?}")))?;
                 let headers = super::super::header_map(&headers)?;
+                let declared = super::super::declared_length(&headers)?;
+                let first = s.forwarded()?;
                 // On an upgrade the forwarded body is the client's side of
                 // the WebSocket, for as long as it is open: no cap.
                 let cap = if self.st.is_upgrade() {
@@ -533,7 +536,7 @@ impl Stream {
                 } else {
                     limits.max_request_body_bytes
                 };
-                let (body_tx, body) = Body::channel(cap, super::super::declared_length(&headers)?);
+                let (body_tx, body) = Body::channel(cap, declared);
                 let mut r = http::Request::new(body);
                 *r.method_mut() = method;
                 *r.uri_mut() = uri;
