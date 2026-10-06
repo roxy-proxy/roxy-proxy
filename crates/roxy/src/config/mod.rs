@@ -86,10 +86,6 @@ pub struct Listener {
     /// it is refused with a diagnostic rather than an unknown-field error.
     #[serde(default)]
     pub auth: Option<serde_yaml_ng::Value>,
-    /// Direct listeners only: the port clients connect to, when something
-    /// in between remaps it. Defaults to the bind port.
-    #[serde(default)]
-    pub target_port: Option<u16>,
     /// Transparent listeners only; rejected by `roxy check`.
     #[serde(default)]
     pub allow_passthrough: Option<bool>,
@@ -103,7 +99,8 @@ pub struct Listener {
 pub enum ListenerMode {
     #[default]
     Explicit,
-    /// Connections addressed to the origin, steered here by DNS.
+    /// Removed with DNS steering. Parsed so a config that still asks for
+    /// it is refused with a diagnostic rather than a parse error.
     Direct,
     /// Parsed so the config shape is stable, but rejected by validation
     /// until transparent mode is built (issue #15).

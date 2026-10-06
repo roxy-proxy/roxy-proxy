@@ -727,12 +727,6 @@ fn validate_wasm_limits(path: &str, l: &super::AddonLimits, d: &mut Vec<Diagnost
 
 /// The checks that depend on a listener's mode.
 fn validate_listener_mode(l: &super::Listener, path: &str, d: &mut Vec<Diagnostic>) {
-    if l.mode != ListenerMode::Direct && l.target_port.is_some() {
-        d.push(Diagnostic::new(
-            format!("{path}.target_port"),
-            "only valid on direct listeners",
-        ));
-    }
     if l.mode != ListenerMode::Transparent {
         for (field, set) in [
             ("allow_passthrough", l.allow_passthrough.is_some()),
@@ -748,17 +742,13 @@ fn validate_listener_mode(l: &super::Listener, path: &str, d: &mut Vec<Diagnosti
     }
     match l.mode {
         ListenerMode::Explicit => {}
-        ListenerMode::Direct => {
-            if l.target_port == Some(0) {
-                d.push(Diagnostic::new(
-                    format!("{path}.target_port"),
-                    "must not be 0",
-                ));
-            }
-        }
+        ListenerMode::Direct => d.push(Diagnostic::new(
+            format!("{path}.mode"),
+            "direct listeners have been removed with DNS steering; use `explicit`",
+        )),
         ListenerMode::Transparent => d.push(Diagnostic::new(
             format!("{path}.mode"),
-            "there are no transparent listeners; use `explicit` or `direct`",
+            "there are no transparent listeners; use `explicit`",
         )),
     }
 }

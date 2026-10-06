@@ -299,53 +299,6 @@ CONNECT evil.com:443 HTTP/1.1\r\n
 Host: evil.com:443\r\n
 \r\n
 
-=== direct_origin_ok
-role: direct 80
-expect: request GET http://api.example.com:80/v1?q=1
-expect: request GET http://other.example.com:80/
----
-GET /v1?q=1 HTTP/1.1\r\n
-Host: API.example.com\r\n
-\r\n
-GET / HTTP/1.1\r\n
-Host: other.example.com:80\r\n
-\r\n
-
-=== direct_host_port_must_be_the_listeners
-role: direct 8080
-expect: request GET http://api.example.com:8080/
-expect: error host_mismatch
----
-GET / HTTP/1.1\r\n
-Host: api.example.com:8080\r\n
-\r\n
-GET / HTTP/1.1\r\n
-Host: api.example.com\r\n
-\r\n
-
-=== direct_missing_host
-role: direct 80
-expect: error missing_host
----
-GET / HTTP/1.1\r\n
-\r\n
-
-=== direct_absolute_form
-role: direct 80
-expect: error target_form_mismatch
----
-GET http://api.example.com/ HTTP/1.1\r\n
-Host: api.example.com\r\n
-\r\n
-
-=== direct_connect
-role: direct 80
-expect: error target_form_mismatch
----
-CONNECT evil.com:443 HTTP/1.1\r\n
-Host: evil.com:443\r\n
-\r\n
-
 === tunnel_plain_http
 role: tunnel http plain.example.com:80
 expect: request GET http://plain.example.com:80/

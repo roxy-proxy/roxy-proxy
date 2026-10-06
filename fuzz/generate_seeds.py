@@ -82,9 +82,6 @@ def corpus_cases():
                 elif key == "role" and value.split()[0] == "tunnel":
                     # roxy_fuzz::role: 2 = https tunnel, 3 = http tunnel
                     cfg |= (2 if value.split()[1] == "https" else 3) << 5
-                elif key == "role" and value.split()[0] == "direct":
-                    # roxy_fuzz::role: 1 = direct listener on port 80
-                    cfg |= 1 << 5
             data = unescape("".join(raw.splitlines()))
             yield f"{path.stem}_{name.strip()}", cfg, data
 

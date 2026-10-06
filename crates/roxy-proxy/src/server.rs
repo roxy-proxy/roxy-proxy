@@ -18,7 +18,7 @@ use tokio_util::task::TaskTracker;
 use crate::addr::canonical;
 use crate::addrlist::AddressLists;
 use crate::budget::{BufferBudget, BufferLease};
-use crate::config::{HttpBehaviour, ListenerKind, PolicyUpdate, RuntimeConfig};
+use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowEvent, FlowSink, Redactor};
 use crate::listener::{ClientConn, Listener, ListenerMode, TcpProxyListener};
 use crate::pipeline::client_info;
@@ -342,18 +342,14 @@ impl Server {
         let mut bound: Vec<Arc<dyn Listener>> = Vec::new();
         let mut addrs = Vec::new();
         for spec in &cfg.listeners {
-            let bound_listener = match spec.kind {
-                ListenerKind::Explicit => TcpProxyListener::bind(&spec.name, spec.bind).await,
-                ListenerKind::Direct { target_port } => {
-                    TcpProxyListener::bind_direct(&spec.name, spec.bind, target_port).await
-                }
-            };
-            let l = bound_listener.map_err(|e| {
-                StartError(format!(
-                    "binding listener {:?} on {}: {e}",
-                    spec.name, spec.bind
-                ))
-            })?;
+            let l = TcpProxyListener::bind(&spec.name, spec.bind)
+                .await
+                .map_err(|e| {
+                    StartError(format!(
+                        "binding listener {:?} on {}: {e}",
+                        spec.name, spec.bind
+                    ))
+                })?;
             let addr = l
                 .local_addr()
                 .map_err(|e| StartError(format!("listener {:?}: {e}", spec.name)))?;
@@ -464,12 +460,6 @@ async fn accept_loop(listener: Arc<dyn Listener>, shared: Arc<Shared>) {
                         shared.spawn_conn(
                             slot,
                             crate::conn::serve_explicit(Box::new(stream), client, s),
-                        );
-                    }
-                    ListenerMode::Direct { port } => {
-                        shared.spawn_conn(
-                            slot,
-                            crate::conn::serve_direct(Box::new(stream), client, port, s),
                         );
                     }
                 }

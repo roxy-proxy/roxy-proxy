@@ -7,9 +7,9 @@
 //! - [`server`]: [`Server`] (`start`, `local_addrs`, `reload`, `shutdown`),
 //!   connection caps, the atomically swapped policy snapshot.
 //! - [`listener`]: the [`Listener`] trait (the hook for transparent mode, issue #15) and
-//!   [`TcpProxyListener`] (explicit and direct); [`ClientConn`].
-//! - `conn`: the connection state machines (proxy port, CONNECT, direct
-//!   listeners, sniff, TLS termination, tunnels, `roxy.internal`).
+//!   [`TcpProxyListener`]; [`ClientConn`].
+//! - `conn`: the connection state machines (proxy port, CONNECT, sniff,
+//!   TLS termination, tunnels, `roxy.internal`).
 //! - `pipeline`: the core's fixed request and response steps, the
 //!   `Verdict` they return (consumed exhaustively), the head decision and
 //!   its effects, the per-flow context.
@@ -58,7 +58,7 @@ mod watch;
 pub use addrlist::{AddressList, AddressLists, ListError};
 pub use ca_server::PEM_CONTENT_TYPE;
 pub use capture::{CAPTURE_FILE, CaptureLog, CaptureOptions};
-pub use config::{HttpBehaviour, ListenerKind, ListenerSpec, PolicyUpdate, RuntimeConfig};
+pub use config::{HttpBehaviour, ListenerSpec, PolicyUpdate, RuntimeConfig};
 pub use conn::INTERNAL_HOST;
 pub use flowlog::{
     BufferedSink, ClientInfo, DEFAULT_REDACTED_HEADERS, DecisionKind, DstInfo, FileSink, FlowEvent,

@@ -23,19 +23,6 @@ use crate::upstream::UpstreamSettings;
 pub struct ListenerSpec {
     pub name: String,
     pub bind: SocketAddr,
-    pub kind: ListenerKind,
-}
-
-/// What a listener serves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ListenerKind {
-    /// The explicit proxy.
-    Explicit,
-    /// Connections addressed to the origin.
-    Direct {
-        /// The port clients connect to; `None` = the bound port.
-        target_port: Option<u16>,
-    },
 }
 
 /// Fixed server configuration.

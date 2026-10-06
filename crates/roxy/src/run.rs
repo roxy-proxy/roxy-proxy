@@ -11,14 +11,14 @@ use std::time::Duration;
 use anyhow::{Context as _, anyhow};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use roxy_proxy::{
-    CaptureLog, FileSink, FlowEvent, FlowSink, ListenerKind, ListenerSpec, MetricSource,
-    PolicyUpdate, Redactor, RuntimeConfig, Server, ServerHandle, StateSource, StdoutSink,
+    CaptureLog, FileSink, FlowEvent, FlowSink, ListenerSpec, MetricSource, PolicyUpdate, Redactor,
+    RuntimeConfig, Server, ServerHandle, StateSource, StdoutSink,
 };
 use roxy_rules::Policy;
 use roxy_tls::{Ca, LeafMinter};
 
 use crate::addons::{AddonLoader, PreparedAddons};
-use crate::config::{Compiled, Config, ListenerMode, Tls};
+use crate::config::{Compiled, Config, Tls};
 use crate::secrets::Secrets;
 use crate::stores::ReloadableMetrics;
 
@@ -192,13 +192,6 @@ fn listener_specs(config: &Config) -> Vec<ListenerSpec> {
         .map(|l| ListenerSpec {
             name: l.name.clone(),
             bind: l.bind,
-            kind: match l.mode {
-                ListenerMode::Direct => ListenerKind::Direct {
-                    target_port: l.target_port,
-                },
-                // Validation refuses transparent listeners.
-                ListenerMode::Explicit | ListenerMode::Transparent => ListenerKind::Explicit,
-            },
         })
         .collect()
 }
@@ -734,13 +727,12 @@ mod tests {
     }
 
     #[test]
-    fn listener_modes_need_a_restart() {
+    fn listeners_need_a_restart() {
         let base = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:443 }]\n";
-        let direct = "version: 1\nlisteners: [{ name: p, mode: direct, bind: 127.0.0.1:443 }]\n";
-        let remapped = "version: 1\nlisteners: [{ name: p, mode: direct, bind: 127.0.0.1:443, \
-                        target_port: 8443 }]\n";
-        assert_eq!(restart(base, direct), ["listeners"]);
-        assert_eq!(restart(direct, remapped), ["listeners"]);
+        let moved = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:8443 }]\n";
+        let renamed = "version: 1\nlisteners: [{ name: q, bind: 127.0.0.1:8443 }]\n";
+        assert_eq!(restart(base, moved), ["listeners"]);
+        assert_eq!(restart(moved, renamed), ["listeners"]);
     }
 
     #[test]

@@ -19,13 +19,6 @@ use ulid::Ulid;
 pub enum ListenerMode {
     /// `HTTP_PROXY` mode: absolute-form requests and CONNECT.
     Explicit,
-    /// Clients connect as if to the origin (DNS steering): the target comes
-    /// from the TLS SNI or the `Host` header.
-    Direct {
-        /// The port clients believe they are connecting to, which becomes
-        /// the target's port.
-        port: u16,
-    },
 }
 
 impl ListenerMode {
@@ -33,7 +26,6 @@ impl ListenerMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Explicit => "explicit",
-            Self::Direct { .. } => "direct",
         }
     }
 }
@@ -74,7 +66,7 @@ pub trait Listener: Send + Sync {
     fn accept(&self) -> AcceptFuture<'_>;
 }
 
-/// A plain TCP listener: explicit or direct, by its [`ListenerMode`].
+/// A plain TCP listener for the explicit proxy.
 #[derive(Debug)]
 pub struct TcpProxyListener {
     info: Arc<ListenerInfo>,
@@ -89,27 +81,6 @@ impl TcpProxyListener {
             info: Arc::new(ListenerInfo {
                 name: name.to_owned(),
                 mode: ListenerMode::Explicit,
-            }),
-            tcp,
-        })
-    }
-
-    /// Binds a direct listener on `addr`. `target_port` defaults to the
-    /// bound port.
-    pub async fn bind_direct(
-        name: &str,
-        addr: SocketAddr,
-        target_port: Option<u16>,
-    ) -> io::Result<Self> {
-        let tcp = TcpListener::bind(addr).await?;
-        let port = match target_port {
-            Some(p) => p,
-            None => tcp.local_addr()?.port(),
-        };
-        Ok(Self {
-            info: Arc::new(ListenerInfo {
-                name: name.to_owned(),
-                mode: ListenerMode::Direct { port },
             }),
             tcp,
         })

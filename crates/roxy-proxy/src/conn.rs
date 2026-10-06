@@ -1,8 +1,6 @@
 //! The connection state machines: the explicit proxy
 //! (proxy-port requests, CONNECT → sniff → TLS
-//! termination or plaintext tunnel), direct listeners
-//! (sniff → TLS termination by SNI, or
-//! plaintext by `Host`), and the request loop inside a tunnel.
+//! termination or plaintext tunnel), and the request loop inside a tunnel.
 
 use std::sync::Arc;
 
@@ -220,7 +218,7 @@ async fn handle_connect(
     }
 }
 
-/// What the first bytes of a tunnel or direct connection are.
+/// What the first bytes of a tunnel are.
 enum FirstBytes {
     /// A TLS `ClientHello`.
     Tls(ClientHelloInfo),
@@ -275,57 +273,6 @@ async fn classify<IO: AsyncRead + Unpin>(
         Err(_) => {
             shared.emit_parse_reason(client, None, "tunnel_timeout", None);
             None
-        }
-    }
-}
-
-/// A direct listener's connection: the
-/// client believes it is talking to the origin on `port`. TLS is
-/// terminated for the SNI, plaintext is parsed with `Host` as the
-/// authority, anything else is closed.
-pub(crate) async fn serve_direct(
-    stream: BoxIo,
-    client: ClientConn,
-    port: u16,
-    shared: Arc<Shared>,
-) {
-    let cl = ConnLimits::current(&shared);
-    let timeout = cl.limits.header_timeout;
-    let Some((io, buf, sniffed)) =
-        classify(stream, BytesMut::new(), timeout, &client, &shared).await
-    else {
-        return;
-    };
-    match sniffed {
-        FirstBytes::Tls(hello) => {
-            let Some(sni) = hello.sni else {
-                shared.emit_parse_reason(&client, None, "no_sni", None);
-                return;
-            };
-            // The SNI names the host; the port is the one the client
-            // connected to.
-            let Ok(host) = roxy_http::url::parse_host(sni.as_bytes()) else {
-                shared.emit_parse_reason(&client, None, "bad_sni", Some(&sni));
-                return;
-            };
-            let authority = Authority { host, port };
-            Box::pin(terminate_tls(
-                ClientIo(io),
-                buf.freeze(),
-                client,
-                authority,
-                None,
-                shared,
-                cl,
-            ))
-            .await;
-        }
-        FirstBytes::Other => {
-            shared.emit_parse_reason(&client, None, "non_http_on_direct", None);
-        }
-        FirstBytes::Http => {
-            let conn = cl.codec(ClientIo(io), buf, Role::Direct { port });
-            tunnel_loop(conn, client, None, shared).await;
         }
     }
 }
@@ -407,18 +354,6 @@ async fn tunnel_loop(
             Err(e) => {
                 exchange::close_on_parse_error(conn, None, &client, &shared, &e).await;
                 return;
-            }
-            Ok(Some(Incoming::Request(req)))
-                if is_internal(&req) && matches!(conn.role(), Role::Direct { .. }) =>
-            {
-                // A direct listener is reached through roxy's DNS, which
-                // steers `roxy.internal` here too.
-                let res = internal_response(&req, &shared);
-                drop(req);
-                match respond(conn, res).await {
-                    Some(c) => conn = c,
-                    None => return,
-                }
             }
             Ok(Some(Incoming::Request(req))) => {
                 match exchange::run(conn, req, client.clone(), tls.clone(), &shared).await {

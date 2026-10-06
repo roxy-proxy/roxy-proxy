@@ -48,7 +48,7 @@ pub enum Field {
     ClientPort,
     /// `listener.name` (string)
     ListenerName,
-    /// `listener.mode` (string: `explicit` / `direct`)
+    /// `listener.mode` (string: `explicit`)
     ListenerMode,
     /// `tls.sni` (string)
     TlsSni,
