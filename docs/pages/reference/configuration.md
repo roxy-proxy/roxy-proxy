@@ -19,7 +19,9 @@ different ends of an exchange: `body_idle_timeout` (30 s) is how long the
 client may stall, sending its request body or taking the response;
 `response_body_idle_timeout` (5 m) is how long the upstream may pause
 between parts of the response body ([resource limits](/reference/limits#limits)).
-Each section is described on the page the table names.
+An optional top-level `valid_until` (RFC 3339) makes the policy a lease
+([lease](/operate/operations#lease)). Each section is described on the
+page the table names.
 
 | key | page |
 |---|---|
@@ -33,6 +35,7 @@ Each section is described on the page the table names.
 | `metrics` | [rate limits](/policies/rate-limits) |
 | `addons` | [addons](/addons/overview) |
 | `log`, `capture_dir` | [flow log](/operate/flow-log) |
+| `valid_until` | [lease](/operate/operations#lease) |
 
 ```yaml
 version: 1

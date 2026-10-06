@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use bytesize::ByteSize;
+use chrono::{DateTime, Utc};
 use ipnet::IpNet;
 use serde::Deserialize;
 
@@ -38,6 +39,10 @@ pub const CONFIG_VERSION: u32 = 1;
 pub struct Config {
     /// Schema version; must be [`CONFIG_VERSION`].
     pub version: u32,
+    /// The policy is a lease that ends at this instant (RFC 3339): past it,
+    /// every exchange is denied until a reload. Absent = no expiry.
+    #[serde(default, deserialize_with = "units::opt_rfc3339")]
+    pub valid_until: Option<DateTime<Utc>>,
     #[serde(default)]
     pub listeners: Vec<Listener>,
     /// Plain-HTTP endpoint serving the CA cert and health checks. Absent = off.

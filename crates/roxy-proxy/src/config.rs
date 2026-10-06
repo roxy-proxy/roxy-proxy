@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use roxy_http::{HttpFlags, Limits};
 use roxy_rules::Policy;
 use roxy_tls::{Ca, LeafMinter, UpstreamTlsOptions};
@@ -89,6 +90,9 @@ impl Default for HttpBehaviour {
 /// The reloadable part of the configuration.
 pub struct PolicyUpdate {
     pub policy: Policy,
+    /// The lease's end: from this instant every exchange is denied with
+    /// `_expired` until a reload replaces the snapshot. `None` = no expiry.
+    pub valid_until: Option<DateTime<Utc>>,
     /// Resolved secret values by name, for `${secret:name}`.
     pub secrets: HashMap<String, String>,
     /// Scrubs secrets and sensitive headers from the flow log.
@@ -114,6 +118,7 @@ pub struct PolicyUpdate {
 impl std::fmt::Debug for PolicyUpdate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PolicyUpdate")
+            .field("valid_until", &self.valid_until)
             .field("secrets", &self.secrets.len())
             .field("limits", &self.limits)
             .field("flags", &self.flags)

@@ -209,6 +209,8 @@ fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
 
 /// `GET url` over HTTP/1.1 with std only. Success is a `200` status line;
 /// anything else (refused, timeout, other status, garbage) is unhealthy.
+/// An `x-roxy-policy: expired` header is reported, not a failure: the
+/// process is up and denying everything until a reload.
 fn health(url: &str, timeout: Duration) -> anyhow::Result<ExitCode> {
     let rest = url
         .strip_prefix("http://")
@@ -256,10 +258,10 @@ fn health(url: &str, timeout: Duration) -> anyhow::Result<ExitCode> {
          Connection: close\r\n\r\n"
     )
     .context("sending the request")?;
-    // Only the status line matters: read until its end (at most 1 KiB).
+    // Only the head matters: read until the blank line (at most 4 KiB).
     let mut head = Vec::new();
     let mut buf = [0u8; 256];
-    while !head.contains(&b'\n') && head.len() < 1024 {
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 4096 {
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => head.extend_from_slice(&buf[..n]),
@@ -277,7 +279,17 @@ fn health(url: &str, timeout: Duration) -> anyhow::Result<ExitCode> {
         (Some("HTTP/1.1" | "HTTP/1.0"), Some("200"))
     );
     if healthy {
-        println!("ok");
+        let expired = head.lines().any(|l| {
+            l.split_once(':').is_some_and(|(k, v)| {
+                k.eq_ignore_ascii_case(roxy_proxy::POLICY_HEADER)
+                    && v.trim().eq_ignore_ascii_case("expired")
+            })
+        });
+        if expired {
+            println!("ok (policy expired)");
+        } else {
+            println!("ok");
+        }
         Ok(ExitCode::SUCCESS)
     } else {
         eprintln!("roxy: unhealthy: {url}: {status:?}");
@@ -481,6 +493,15 @@ fn check(path: &Path) -> ExitCode {
             );
             if policy.rule_count() > 0 {
                 print!("rules:\n{}", roxy::ruletest::classification(&policy));
+            }
+            if let Some(until) = config.valid_until {
+                println!("valid until: {}", until.to_rfc3339());
+                if until <= chrono::Utc::now() {
+                    eprintln!(
+                        "{}: warning: valid_until has passed; roxy will load this policy and deny everything until a reload moves or removes it",
+                        path.display()
+                    );
+                }
             }
             ExitCode::SUCCESS
         }

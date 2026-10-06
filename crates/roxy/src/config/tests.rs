@@ -200,6 +200,39 @@ fn unknown_fields_rejected_everywhere() {
     }
 }
 
+/// `valid_until` is an RFC 3339 date-time, quoted or not, normalised to
+/// UTC; a date alone, a space separator or a relative phrase is refused
+/// with a message saying what was expected.
+#[test]
+fn valid_until_parses_rfc3339_only() {
+    assert_eq!(parse(BASE).valid_until, None);
+    for (yaml, utc) in [
+        (
+            "valid_until: 2026-10-06T12:00:00Z",
+            "2026-10-06T12:00:00+00:00",
+        ),
+        (
+            "valid_until: \"2026-10-06T12:00:00.5+01:00\"",
+            "2026-10-06T11:00:00.500+00:00",
+        ),
+    ] {
+        let t = parse(&format!("{BASE}{yaml}\n")).valid_until.unwrap();
+        assert_eq!(t.to_rfc3339(), utc, "{yaml}");
+    }
+    for bad in [
+        "valid_until: 2026-10-06",
+        "valid_until: 2026-10-06T12:00:00",
+        "valid_until: tomorrow",
+        "valid_until: 1760000000",
+    ] {
+        let e = Config::from_yaml(&format!("{BASE}{bad}\n"))
+            .err()
+            .unwrap_or_else(|| panic!("should reject: {bad}"))
+            .to_string();
+        assert!(e.contains("RFC 3339"), "{bad}: {e}");
+    }
+}
+
 /// A repeated key in a named map is a parse error that names the key and
 /// the section, not a last-wins override.
 #[test]

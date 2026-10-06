@@ -650,6 +650,7 @@ pub(crate) mod testing {
         kit.server
             .reload(PolicyUpdate {
                 policy,
+                valid_until: None,
                 secrets: secrets
                     .iter()
                     .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))

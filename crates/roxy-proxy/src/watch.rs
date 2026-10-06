@@ -33,7 +33,8 @@
 //! Whether a chunk needs anything is decided once per exchange from the
 //! policy's masks. When no rule watches a direction and no metric counts
 //! its bytes, a chunk costs two atomic loads (the stop flag and the flow
-//! log's readiness) and no lock.
+//! log's readiness) and no lock; a WebSocket chunk under a policy with
+//! `valid_until` adds a clock read.
 //!
 //! # Audit backpressure
 //!
@@ -300,8 +301,9 @@ impl Watch {
         message: Message,
     ) -> (Message, Result<(), Stopped>) {
         let mut g = self.lock();
-        if let Some(s) = &g.stopped {
-            return (message, Err(s.clone()));
+        g.stop_if_expired(Stage::Websocket);
+        if g.stopped.is_some() {
+            return (message, self.publish(&g));
         }
         g.facts.ws = Some(WsFacts {
             direction: dir,
@@ -352,12 +354,13 @@ impl Watch {
             Dir::Request => self.request_chunks,
             Dir::Response => self.response_chunks,
         };
-        if !needed {
+        if !needed && !self.meta.shared.expired(&self.meta.snap) {
             return self.check();
         }
         let mut g = self.lock();
-        if let Some(s) = &g.stopped {
-            return Err(s.clone());
+        g.stop_if_expired(Stage::Websocket);
+        if g.stopped.is_some() {
+            return self.publish(&g);
         }
         g.bytes(dir, n, Reads::NONE, Stage::Websocket);
         self.publish(&g)
@@ -375,6 +378,15 @@ impl Inner {
     fn stop_with(&mut self, refusal: Refusal, stage: Stage) {
         if self.stopped.is_none() {
             self.stopped = Some(Stopped { refusal, stage });
+        }
+    }
+
+    /// A relay outlives the head decision, so the lease is re-checked
+    /// before each write: once it has run out the exchange stops with
+    /// `_expired`.
+    fn stop_if_expired(&mut self, stage: Stage) {
+        if self.meta.shared.expired(&self.meta.snap) {
+            self.stop_with(Refusal::expired(), stage);
         }
     }
 

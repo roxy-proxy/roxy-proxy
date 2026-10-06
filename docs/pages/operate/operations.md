@@ -6,6 +6,9 @@
   `SIGHUP`. A bad config is rejected and the running one stays
   ([reload](/operate/operations#reload)). Some settings need a restart;
   [reload](/operate/operations#reload) lists them.
+- **Lease:** a config with `valid_until` denies everything once that
+  instant passes, until a reload replaces it
+  ([lease](/operate/operations#lease)).
 - **Logs:** the flow log goes to stdout or `log.flow.path`; roxy's own logs
   go to stderr (`--log-format json|pretty`, `--log-level` or `RUST_LOG`).
   `SIGHUP` also reopens log files.
@@ -56,3 +59,25 @@ A connection takes `tls.require_sni_match`, `http.enable_h2`,
 `http.allow_plain_in_connect` and the `limits` and `http` parsing settings
 when it is accepted and keeps them; a reload changes them for new
 connections only.
+
+## Lease
+
+A top-level `valid_until: <RFC 3339>` makes the loaded policy a lease.
+Until that instant the policy applies as written. From it, every request
+is denied with `terminal_rule: _expired` and reason `policy_expired`,
+before the rules and the addons run, and an open WebSocket relay stops at
+its next message. The check is a wall-clock comparison on each exchange:
+`valid_until` is an absolute instant, so the host's clock is what it is
+measured against. The first exchange that finds the policy expired logs
+one `policy_expired` event; later ones are ordinary `_expired` denies.
+
+An expired policy is a policy, not a fault. The listeners stay up,
+`/healthz` keeps answering `200` and says `x-roxy-policy: expired` (it
+says `valid` otherwise), and `roxy health` prints `ok (policy expired)`.
+A document already past its `valid_until` loads and denies rather than
+failing to start, so a stale lease on disk fails closed. `roxy check`
+prints `valid until:` and warns when the instant has passed.
+
+The way back is a reload: a config whose `valid_until` is later, or
+absent, is swapped in like any other and traffic resumes under it. There
+is no fallback policy: a policy that must not expire has no `valid_until`.

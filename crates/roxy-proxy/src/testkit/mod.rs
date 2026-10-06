@@ -38,6 +38,8 @@ mod h2raw;
 #[cfg(test)]
 mod http_tests;
 #[cfg(test)]
+mod lease_tests;
+#[cfg(test)]
 mod rules_tests;
 mod upstream;
 #[cfg(test)]
@@ -48,6 +50,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use http_body_util::BodyExt as _;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -263,6 +266,7 @@ pub(crate) struct KitBuilder {
     connection_events: bool,
     log_gate: Option<Arc<LogGate>>,
     ca_server: bool,
+    valid_until: Option<DateTime<Utc>>,
 }
 
 impl KitBuilder {
@@ -320,6 +324,12 @@ impl KitBuilder {
     /// Binds the plain-HTTP CA endpoint on a loopback port
     /// ([`Kit::ca_server_addr`]).
     #[must_use]
+    /// The initial policy's `valid_until`.
+    pub(crate) fn valid_until(mut self, t: DateTime<Utc>) -> Self {
+        self.valid_until = Some(t);
+        self
+    }
+
     pub(crate) fn ca_server(mut self) -> Self {
         self.ca_server = true;
         self
@@ -454,6 +464,7 @@ impl KitBuilder {
             state: self.state,
             policy: PolicyUpdate {
                 policy,
+                valid_until: self.valid_until,
                 secrets: base.secrets.clone(),
                 redactor: base.redactor(),
                 limits: self.limits,
@@ -567,6 +578,7 @@ impl Kit {
             connection_events: false,
             log_gate: None,
             ca_server: false,
+            valid_until: None,
         }
     }
 
@@ -784,6 +796,11 @@ impl Kit {
     /// Swaps in a new policy with these rules (no metrics, no addons); the
     /// limits, flags, upstream settings, secrets and address lists stay.
     pub(crate) fn reload(&self, rules: &str) {
+        self.reload_lease(rules, None);
+    }
+
+    /// [`Self::reload`] with a `valid_until` on the new policy.
+    pub(crate) fn reload_lease(&self, rules: &str, valid_until: Option<DateTime<Utc>>) {
         let rules: Vec<RuleConfig> = serde_yaml_ng::from_str(rules).unwrap();
         let secret_names = self.base.secrets.keys().cloned().collect();
         let list_names = self.base.address_lists.keys().cloned().collect();
@@ -797,6 +814,7 @@ impl Kit {
         self.server
             .reload(PolicyUpdate {
                 policy,
+                valid_until,
                 secrets: self.base.secrets.clone(),
                 redactor: self.base.redactor(),
                 limits: self.limits.clone(),

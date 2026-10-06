@@ -58,6 +58,12 @@ pub(crate) type CollectFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + '
 /// Rule id used for denies by the upstream address floor.
 pub(crate) const ADDRESS_POLICY_RULE: &str = "_address_policy";
 
+/// Rule id used for denies after the policy's `valid_until`.
+pub(crate) const EXPIRED_RULE: &str = "_expired";
+
+/// Flow-log `reason` of an `_expired` deny.
+pub(crate) const EXPIRED_REASON: &str = "policy_expired";
+
 /// Whether a local answer is a policy decision or a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefusalKind {
@@ -132,6 +138,19 @@ impl Refusal {
                 DEFAULT_DENY_MESSAGE,
                 RuleId::new(RuleId::FAIL_CLOSED),
                 true,
+            )
+        }
+    }
+
+    /// 403 `_expired`: the policy's lease has run out.
+    pub(crate) fn expired() -> Self {
+        Self {
+            reason: Some(EXPIRED_REASON.to_owned()),
+            ..Self::deny(
+                status_code(roxy_rules::DEFAULT_DENY_STATUS),
+                DEFAULT_DENY_MESSAGE,
+                RuleId::new(EXPIRED_RULE),
+                false,
             )
         }
     }
@@ -533,6 +552,20 @@ impl FlowCx {
         {
             self.record.rules.push(out.terminal_rule.clone());
         }
+    }
+
+    /// The deny every exchange gets once the policy's lease has run out,
+    /// recorded as the head decision. Nothing of the policy (the addons
+    /// included) runs for it.
+    pub(crate) fn expiry_refusal(&mut self) -> Option<Refusal> {
+        if !self.shared.expired(&self.snap) {
+            return None;
+        }
+        self.record.stage = Some(Stage::Head);
+        if let Err(e) = self.record_head_sample(true) {
+            self.meta.metric_error(Stage::Head, &e);
+        }
+        Some(Refusal::expired())
     }
 
     /// The head decision. Returns the outcome plus a refusal when it

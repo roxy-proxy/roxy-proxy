@@ -3,10 +3,12 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use chrono::{DateTime, Utc};
 use roxy_http::{HttpFlags, Limits, ParseError};
 use roxy_rules::Policy;
 use roxy_tls::{Ca, LeafMinter};
@@ -29,6 +31,11 @@ use crate::upstream::Upstream;
 /// `Arc` at its start and finishes under that snapshot.
 pub(crate) struct Snapshot {
     pub policy: Policy,
+    /// The lease's end; `None` = no expiry. See [`Shared::expired`].
+    pub valid_until: Option<DateTime<Utc>>,
+    /// Set when the snapshot was first seen expired, so `policy_expired`
+    /// is logged once per snapshot.
+    expired_logged: AtomicBool,
     pub secrets: HashMap<String, String>,
     pub redactor: Redactor,
     pub limits: Arc<Limits>,
@@ -130,6 +137,33 @@ impl Shared {
         self.snapshot.load_full()
     }
 
+    /// Whether `snap`'s lease has run out. Checked against the wall clock
+    /// on every exchange and WebSocket message, since `valid_until` is an
+    /// absolute instant and a reload is the only way back. The first check
+    /// that finds a snapshot expired logs `policy_expired`.
+    pub(crate) fn expired(&self, snap: &Snapshot) -> bool {
+        let Some(until) = snap.valid_until else {
+            return false;
+        };
+        let now = Utc::now();
+        if now < until {
+            return false;
+        }
+        if !snap.expired_logged.swap(true, Ordering::AcqRel) {
+            tracing::warn!(valid_until = %until.to_rfc3339(), "policy expired; denying every exchange until a reload");
+            self.sink.emit(&FlowEvent::PolicyExpired {
+                ts: now,
+                valid_until: until,
+            });
+        }
+        true
+    }
+
+    /// Whether the current policy's lease has run out.
+    pub(crate) fn policy_expired(&self) -> bool {
+        self.expired(&self.snapshot())
+    }
+
     fn build_snapshot(&self, u: PolicyUpdate) -> Result<Snapshot, String> {
         build_snapshot(u, &self.upstream_tls)
     }
@@ -205,6 +239,8 @@ fn build_snapshot(u: PolicyUpdate, tls: &Arc<ClientConfig>) -> Result<Snapshot, 
     let upstream = Upstream::new(&settings, tls)?;
     Ok(Snapshot {
         policy: u.policy,
+        valid_until: u.valid_until,
+        expired_logged: AtomicBool::new(false),
         secrets: u.secrets,
         redactor: u.redactor,
         limits: Arc::new(u.limits),

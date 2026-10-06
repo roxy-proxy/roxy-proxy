@@ -278,6 +278,14 @@ pub enum FlowEvent {
         stage: Stage,
         reason: String,
     },
+    /// The policy's `valid_until` passed and no reload has replaced it:
+    /// every exchange is denied with `_expired`. Once per snapshot.
+    PolicyExpired {
+        #[serde(serialize_with = "ser_ts")]
+        ts: DateTime<Utc>,
+        #[serde(serialize_with = "ser_ts")]
+        valid_until: DateTime<Utc>,
+    },
     /// A metric key could not be created because the table is full.
     MetricTableFull {
         #[serde(serialize_with = "ser_ts")]

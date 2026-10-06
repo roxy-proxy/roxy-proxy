@@ -1,6 +1,9 @@
 //! The plain-HTTP CA endpoint (`ca_server.bind`): `GET
 //! /roxy-ca.pem` and `GET /healthz`. Kept off the proxy port so it can be
 //! firewalled differently.
+//!
+//! `/healthz` is liveness: `200` while the process serves, with the
+//! policy's lease state in [`POLICY_HEADER`] (`valid` or `expired`).
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -19,6 +22,9 @@ use crate::server::{Shared, conn_slot};
 /// `content-type` of the CA certificate.
 pub const PEM_CONTENT_TYPE: &str = "application/x-pem-file";
 
+/// `/healthz` response header carrying the policy's lease state.
+pub const POLICY_HEADER: &str = "x-roxy-policy";
+
 fn reply(status: StatusCode, ctype: &str, body: impl Into<Bytes>) -> Response<Full<Bytes>> {
     let mut res = Response::new(Full::new(body.into()));
     *res.status_mut() = status;
@@ -32,7 +38,17 @@ fn route(req: &Request<Incoming>, shared: &Shared) -> Response<Full<Bytes>> {
     let get = req.method() == Method::GET || req.method() == Method::HEAD;
     match (get, req.uri().path()) {
         (true, "/roxy-ca.pem") => reply(StatusCode::OK, PEM_CONTENT_TYPE, shared.ca.cert_pem()),
-        (true, "/healthz") => reply(StatusCode::OK, "text/plain", "ok"),
+        (true, "/healthz") => {
+            let mut res = reply(StatusCode::OK, "text/plain", "ok");
+            let state = if shared.policy_expired() {
+                "expired"
+            } else {
+                "valid"
+            };
+            res.headers_mut()
+                .insert(POLICY_HEADER, http::HeaderValue::from_static(state));
+            res
+        }
         _ => reply(StatusCode::NOT_FOUND, "text/plain", "not found"),
     }
 }

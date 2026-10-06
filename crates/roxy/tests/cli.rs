@@ -656,6 +656,61 @@ fn rule_test_checks_a_websocket_message() {
     assert!(text(&out.stderr).contains("--ws-opcode 3"));
 }
 
+/// `check` reports `valid_until`, warns when it has already passed (the
+/// document still passes: it loads and denies), and refuses a malformed one.
+#[test]
+fn check_reports_valid_until() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("roxy.yaml");
+    let write = |valid_until: &str| {
+        std::fs::write(
+            &cfg,
+            format!("version: 1\nvalid_until: {valid_until}\nlisteners: [{{ name: p, bind: 127.0.0.1:0 }}]\n"),
+        )
+        .unwrap();
+        roxy(&["check", "--config", cfg.to_str().unwrap()])
+    };
+
+    let out = write("2999-01-01T00:00:00Z");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("valid until: 2999-01-01T00:00:00+00:00\n"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(
+        !text(&out.stderr).contains("warning"),
+        "{}",
+        text(&out.stderr)
+    );
+
+    let out = write("2000-01-01T00:00:00Z");
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("valid until: 2000-01-01T00:00:00+00:00\n"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(
+        text(&out.stderr).contains("warning: valid_until has passed"),
+        "{}",
+        text(&out.stderr)
+    );
+
+    let out = write("2000-01-01");
+    assert!(!out.status.success());
+    assert!(
+        text(&out.stderr).contains("valid_until"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(
+        text(&out.stderr).contains("RFC 3339"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
 // ----- health -----------------------------------------------------------------
 
 /// A one-shot HTTP server answering `response`; yields the request it read.
@@ -702,7 +757,7 @@ fn health_ok_without_waiting_for_close() {
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
         let (mut s, _) = listener.accept().unwrap();
-        s.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
+        s.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap();
         // Hold the connection open past the probe's timeout.
         std::thread::sleep(std::time::Duration::from_secs(3));
         drop(s);
@@ -711,6 +766,17 @@ fn health_ok_without_waiting_for_close() {
     let out = roxy(&["health", "--timeout", "2", "--url", &url]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(t.elapsed() < std::time::Duration::from_secs(2));
+    server.join().unwrap();
+}
+
+/// An expired lease is reported, not a failure: the process is up.
+#[test]
+fn health_reports_an_expired_policy() {
+    let (url, server) =
+        stub_http("HTTP/1.1 200 OK\r\nX-Roxy-Policy: expired\r\ncontent-length: 2\r\n\r\nok");
+    let out = roxy(&["health", "--url", &url]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert_eq!(text(&out.stdout), "ok (policy expired)\n");
     server.join().unwrap();
 }
 

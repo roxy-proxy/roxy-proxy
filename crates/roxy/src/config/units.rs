@@ -6,6 +6,7 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 
 use bytesize::ByteSize;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
@@ -69,6 +70,25 @@ pub(crate) fn size<'de, D: Deserializer<'de>>(d: D) -> Result<ByteSize, D::Error
 /// `#[serde(default)]`).
 pub(crate) fn opt_size<'de, D: Deserializer<'de>>(d: D) -> Result<Option<ByteSize>, D::Error> {
     size(d).map(Some)
+}
+
+// ----- timestamps -----------------------------------------------------------
+
+/// `deserialize_with` for the optional `valid_until` (use with
+/// `#[serde(default)]`): an RFC 3339 date-time with a `Z` or numeric
+/// offset, nothing else. The field is named in the error because a custom
+/// error loses the YAML path.
+pub(crate) fn opt_rfc3339<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<DateTime<Utc>>, D::Error> {
+    let s = String::deserialize(d)?;
+    DateTime::parse_from_rfc3339(&s)
+        .map(|t| Some(t.with_timezone(&Utc)))
+        .map_err(|e| {
+            de::Error::custom(format!(
+                "valid_until: invalid timestamp {s:?}: expected RFC 3339, e.g. 2026-10-06T12:00:00Z ({e})"
+            ))
+        })
 }
 
 // ----- counts ---------------------------------------------------------------
