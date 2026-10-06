@@ -570,7 +570,8 @@ impl Stream {
             In::Deny { status, message } => {
                 let r = super::super::deny_response(status, message)?;
                 // Tagged before the answer goes, so the flow's record has it.
-                self.st.add_tag(format!("{}:deny", self.name()));
+                // A flow at its tag cap loses the label; the deny stands.
+                let _ = self.st.add_tag(format!("{}:deny", self.name()));
                 s.answered(r, "deny")
             }
             // Handled by `control`.

@@ -7,21 +7,32 @@ use std::fmt;
 use crate::config::Capability;
 use crate::host::HostError;
 
-/// A limit from [`crate::LayerLimits`].
+/// A limit on a layer: one from [`crate::LayerLimits`], or a fixed cap on
+/// what the host holds on a guest's behalf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Budget {
     /// `max_memory`: linear memory would grow past the cap.
     Memory,
     /// `first_byte_timeout`: no response head in time.
     FirstByte,
+    /// The flow holds as many tags, or as many bytes of them, as it may.
+    Tags,
+    /// A `fields` the guest built would grow past [`crate::MAX_FIELDS_BYTES`].
+    Fields,
+    /// A `flow.log` message or `flow.record` document is over
+    /// [`crate::MAX_MESSAGE_BYTES`].
+    Message,
 }
 
 impl Budget {
-    /// The config key of the limit.
+    /// The config key of the limit, or the fixed cap's name.
     pub fn name(self) -> &'static str {
         match self {
             Budget::Memory => "max_memory",
             Budget::FirstByte => "first_byte_timeout",
+            Budget::Tags => "tags",
+            Budget::Fields => "fields",
+            Budget::Message => "message",
         }
     }
 }

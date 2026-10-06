@@ -11,7 +11,7 @@ use http_body_util::BodyExt;
 use roxy_http::{Body, BodyError};
 use roxy_wasm::{
     EndpointError, FlowInfo, HostError, Layer, LayerConfig, LayerError, LayerHost, LayerOutcome,
-    LayerRequest, LayerResponse, LogLevel, Principal, WasmRuntime, async_trait,
+    LayerRequest, LayerResponse, LogLevel, Principal, TagError, WasmRuntime, async_trait,
 };
 use tokio::sync::oneshot;
 
@@ -53,7 +53,12 @@ pub struct Mock {
     pub upload: tokio::sync::watch::Sender<Option<Result<Bytes, BodyError>>>,
     /// The layer's keyed store.
     pub state: Mutex<HashMap<String, String>>,
+    /// The flow's tags; `add_tag` refuses past `MOCK_TAG_CAP`.
+    pub tags: Mutex<Vec<String>>,
 }
+
+/// How many tags the mock host lets a flow hold.
+pub const MOCK_TAG_CAP: usize = 8;
 
 impl Mock {
     pub fn new(mode: NextMode) -> Arc<Self> {
@@ -66,6 +71,7 @@ impl Mock {
             entered: tokio::sync::Notify::new(),
             upload: tokio::sync::watch::Sender::new(None),
             state: Mutex::new(HashMap::new()),
+            tags: Mutex::new(Vec::new()),
         })
     }
 
@@ -162,12 +168,17 @@ impl LayerHost for Mock {
                 listener: "main".into(),
                 tls_sni: None,
             },
-            tags: vec![],
+            tags: self.tags.lock().unwrap().clone(),
         }
     }
 
-    fn add_tag(&self, tag: String) -> Result<(), HostError> {
+    fn add_tag(&self, tag: String) -> Result<(), TagError> {
         self.call(format!("tag {tag}"));
+        let mut tags = self.tags.lock().unwrap();
+        if tags.len() >= MOCK_TAG_CAP {
+            return Err(TagError::Full);
+        }
+        tags.push(tag);
         Ok(())
     }
 

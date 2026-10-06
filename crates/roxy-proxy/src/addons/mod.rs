@@ -39,7 +39,7 @@ use http_body::{Body as HttpBody, Frame, SizeHint};
 use roxy_http::layer::{from_layer_request, to_layer_request, to_layer_response};
 use roxy_http::upstream::from_upstream_response;
 use roxy_http::{Body, BodyError, BodySender, CanonicalRequest, RequestMeta};
-use roxy_wasm::{HostError, LayerError, LayerOutcome, LayerRequest, LayerResponse};
+use roxy_wasm::{HostError, LayerError, LayerOutcome, LayerRequest, LayerResponse, TagError};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -192,6 +192,12 @@ impl Default for StateLimits {
         }
     }
 }
+
+/// Most tags a flow holds, and most bytes of them together. Tags are
+/// labels for `when` and the flow log; the host keeps them outside any
+/// layer's `max_memory`, so a guest cannot grow them without end.
+const MAX_TAGS: usize = 64;
+const MAX_TAG_BYTES: usize = 4096;
 
 /// How far one layer of an exchange got with `next`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -496,11 +502,19 @@ impl StackFlow {
         self.layers.iter().any(|l| l.ran.load(Ordering::SeqCst))
     }
 
-    pub(crate) fn add_tag(&self, tag: String) {
+    /// Adds a tag, unless the flow already has it or is at
+    /// [`MAX_TAGS`] / [`MAX_TAG_BYTES`].
+    pub(crate) fn add_tag(&self, tag: String) -> Result<(), TagError> {
         let mut t = self.tags.lock().unwrap_or_else(PoisonError::into_inner);
-        if !t.contains(&tag) {
-            t.push(tag);
+        if t.contains(&tag) {
+            return Ok(());
         }
+        let bytes: usize = t.iter().map(String::len).sum();
+        if t.len() >= MAX_TAGS || bytes.saturating_add(tag.len()) > MAX_TAG_BYTES {
+            return Err(TagError::Full);
+        }
+        t.push(tag);
+        Ok(())
     }
 
     /// Layer `layer` failed the exchange.

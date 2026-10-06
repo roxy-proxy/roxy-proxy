@@ -1087,6 +1087,7 @@ async fn limits_are_enforced() {
         ("loop", "budget:first_byte_timeout"),
         ("memory", "budget:max_memory"),
         ("host-loop", "budget:first_byte_timeout"),
+        ("fields:200000", "budget:fields"),
     ]
     .into_iter()
     .enumerate()
@@ -1099,6 +1100,33 @@ async fn limits_are_enforced() {
         assert_eq!(a.status, 503, "{test}: {a:?}");
         let errs = kit.events("layer_error", i + 1).await;
         assert_eq!(errs[i]["kind"], kind, "{test}: {errs:#?}");
+    }
+}
+
+/// A flow holds at most 64 tags and 4 KiB of them. A layer that tags
+/// without end after its head is out has no clock to stop it, so the cap
+/// does: the exchange fails `budget:tags`, cutting the body, and the flow
+/// keeps the tags that fit.
+#[tokio::test]
+async fn tagging_without_end_after_the_head_is_cut_at_the_cap() {
+    for (tag_len, fit) in [("2", 64), ("1024", 4)] {
+        let kit = one(AddonDef::test_layer("t")).await;
+        let a = kit
+            .h1()
+            .await
+            .call(
+                "GET",
+                "/x",
+                &[("x-test-t", "tags-after-head"), ("x-tag-len", tag_len)],
+                b"",
+            )
+            .await;
+        assert_eq!(a.status, 200, "{tag_len}: {a:?}");
+        assert!(a.body.is_err(), "{tag_len}: the body is cut: {a:?}");
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["kind"], "budget:tags", "{tag_len}: {errs:#?}");
+        let ev = kit.request_event().await;
+        assert_eq!(strs(&ev["tags"]).len(), fit, "{tag_len}: {ev:#}");
     }
 }
 

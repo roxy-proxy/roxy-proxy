@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use roxy_wasm::{
     EndpointError, FlowInfo, HostError, LayerHost, LayerRequest, LayerResponse, LogLevel,
-    Principal, async_trait,
+    Principal, TagError, async_trait,
 };
 
 use super::{AddonSpec, StackFlow, endpoint};
@@ -60,7 +60,7 @@ impl LayerHost for StackHost {
         }
     }
 
-    fn add_tag(&self, tag: String) -> Result<(), HostError> {
+    fn add_tag(&self, tag: String) -> Result<(), TagError> {
         if self.observer.is_some() {
             // A tag steers the `when` of every layer below, so it is an
             // effect on traffic, which an observer must not have.
@@ -69,10 +69,10 @@ impl LayerHost for StackHost {
             tracing::warn!(layer, flow, tag, "observer called `flow.add-tag`: refused");
             return Err(HostError::new(
                 "layer called `flow.add-tag` in observe mode: an observer cannot tag",
-            ));
+            )
+            .into());
         }
-        self.st.add_tag(tag);
-        Ok(())
+        self.st.add_tag(tag)
     }
 
     fn log(&self, level: LogLevel, msg: &str) {
