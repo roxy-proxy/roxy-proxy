@@ -43,6 +43,9 @@ pub enum Decoded {
 pub struct ChunkedDecoder {
     state: State,
     total: u64,
+    /// Where the trailer-section scan resumes: bytes before it were checked
+    /// on an earlier call and hold no `CRLF CRLF`.
+    trailer_scanned: usize,
     limits: Limits,
     flags: HttpFlags,
 }
@@ -54,6 +57,7 @@ impl ChunkedDecoder {
         Self {
             state: State::Size,
             total: 0,
+            trailer_scanned: 0,
             limits: limits.clone(),
             flags: flags.clone(),
         }
@@ -205,9 +209,9 @@ impl ChunkedDecoder {
     /// Parses the trailer section (allowed); `None` if incomplete. Fields
     /// go through the same line, name, value and count rules as the head,
     /// and forbidden trailer names are refused before that.
-    fn trailers(&self, buf: &mut BytesMut) -> Result<Option<HeaderMap>, ParseError> {
+    fn trailers(&mut self, buf: &mut BytesMut) -> Result<Option<HeaderMap>, ParseError> {
         let max_bytes = self.limits.max_header_bytes;
-        let end = match scan_section(buf, 0) {
+        let end = match scan_section(buf, self.trailer_scanned) {
             Err(Bare::Lf(_)) => return reject(Reason::BareLf, "bare LF in trailers"),
             Err(Bare::Cr(_)) => return reject(Reason::BareCr, "bare CR in trailers"),
             Ok(end) => end,
@@ -216,6 +220,8 @@ impl ChunkedDecoder {
             if buf.len() > max_bytes {
                 return reject(Reason::HeadTooLarge, "trailer section too large");
             }
+            // A trailing CR is re-examined once its successor arrives.
+            self.trailer_scanned = buf.len().saturating_sub(1);
             return Ok(None);
         };
         if end > max_bytes {

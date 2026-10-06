@@ -199,16 +199,19 @@ pub fn from_h2_parts(
     })
 }
 
-/// Validates an h2 request trailer section. Only call this when
-/// `http.allow_trailers` is set (otherwise any trailer section is a
-/// rejection). Applies the same field rules as the h1 chunked decoder:
-/// framing, routing, authentication and content metadata are refused, and
-/// values go through the header validator.
+/// Validates an h2 request trailer section. Any trailer section is a
+/// rejection unless `http.allow_trailers`; with it, the same field rules as
+/// the h1 chunked decoder apply: framing, routing, authentication and
+/// content metadata are refused, and values go through the header
+/// validator.
 pub fn validate_h2_trailers(
     trailers: &http::HeaderMap,
     limits: &Limits,
     flags: &HttpFlags,
 ) -> Result<http::HeaderMap, ParseError> {
+    if !flags.allow_trailers {
+        return reject(Reason::Trailers, "trailer section present");
+    }
     if trailers.len() > limits.max_headers {
         return reject(Reason::TooManyHeaders, "too many trailer fields");
     }
@@ -228,8 +231,8 @@ pub fn validate_h2_trailers(
 
 /// Response head for an h2 stream (the caller streams `res.body` as DATA
 /// frames). `content-length` is set when the length is known and the status
-/// permits a body; for HEAD requests the upstream's declared length is used.
-/// `date` is added if absent. No connection-specific headers are emitted
+/// permits a body. A HEAD response's body is always empty, so only the
+/// length the upstream declared is forwarded. `date` is added if absent. No connection-specific headers are emitted
 /// (canonical headers never contain them).
 pub fn to_h2_response(res: &CanonicalResponse, request_method: &Method) -> http::response::Builder {
     let mut b = http::Response::builder()
@@ -245,7 +248,7 @@ pub fn to_h2_response(res: &CanonicalResponse, request_method: &Method) -> http:
     }
     if !status_forbids_body(res.status) {
         let len = if *request_method == Method::Head {
-            res.meta.declared_length.or(res.body.known_length())
+            res.meta.declared_length
         } else {
             res.body.known_length()
         };
@@ -539,10 +542,26 @@ mod tests {
     }
 
     #[test]
-    fn trailers_validated() {
+    fn trailers_refused_unless_allowed() {
         let mut t = http::HeaderMap::new();
         t.insert("grpc-status", HeaderValue::from_static("0"));
-        let ok = validate_h2_trailers(&t, &Limits::default(), &HttpFlags::default()).unwrap();
+        assert_eq!(
+            validate_h2_trailers(&t, &Limits::default(), &HttpFlags::default())
+                .unwrap_err()
+                .reason,
+            Reason::Trailers
+        );
+    }
+
+    #[test]
+    fn trailers_validated() {
+        let flags = HttpFlags {
+            allow_trailers: true,
+            ..HttpFlags::default()
+        };
+        let mut t = http::HeaderMap::new();
+        t.insert("grpc-status", HeaderValue::from_static("0"));
+        let ok = validate_h2_trailers(&t, &Limits::default(), &flags).unwrap();
         assert_eq!(ok.get("grpc-status").unwrap(), "0");
         for bad in [
             "authorization",
@@ -557,7 +576,7 @@ mod tests {
                 HeaderValue::from_static("x"),
             );
             assert_eq!(
-                validate_h2_trailers(&t, &Limits::default(), &HttpFlags::default())
+                validate_h2_trailers(&t, &Limits::default(), &flags)
                     .unwrap_err()
                     .reason,
                 Reason::Trailers,
@@ -582,6 +601,13 @@ mod tests {
         res.meta.declared_length = Some(99);
         let r = to_h2_response(&res, &Method::Head).body(()).unwrap();
         assert_eq!(r.headers().get("content-length").unwrap(), "99");
+
+        // A HEAD response's empty body says nothing about the length.
+        let mut res = CanonicalResponse::new(StatusCode::OK);
+        res.body = Body::empty();
+        assert_eq!(res.body.known_length(), Some(0));
+        let r = to_h2_response(&res, &Method::Head).body(()).unwrap();
+        assert!(!r.headers().contains_key("content-length"));
 
         let res = CanonicalResponse::new(StatusCode::NOT_MODIFIED);
         let r = to_h2_response(&res, &Method::Get).body(()).unwrap();

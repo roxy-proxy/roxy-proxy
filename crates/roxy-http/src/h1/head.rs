@@ -502,8 +502,7 @@ pub fn parse_head(
     let framing = request_framing(&raw, &method, version, limits, flags)?;
     let mut meta = hop_by_hop_meta(&raw, version, framing, head.len())?;
     let host = single_host(&raw)?;
-    let mut headers = Headers::try_from_raw(raw.iter().copied(), limits, flags)?;
-    headers.remove("expect");
+    let headers = Headers::try_from_raw(raw.iter().copied(), limits, flags)?;
 
     if method == Method::Connect {
         let authority = connect_target(target, host, role)?;

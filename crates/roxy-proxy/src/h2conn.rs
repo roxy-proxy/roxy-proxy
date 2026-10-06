@@ -679,19 +679,13 @@ impl http_body::Body for H2Body {
                 this.finished = true;
                 Poll::Ready(None)
             }
-            Poll::Ready(Ok(Some(t))) => {
-                if !this.flags.allow_trailers {
-                    let e = ParseError::new(Reason::Trailers, "trailer section present");
-                    return this.failed(e.clone(), BodyError::Invalid(e));
+            Poll::Ready(Ok(Some(t))) => match validate_h2_trailers(&t, &this.limits, &this.flags) {
+                Ok(t) => {
+                    this.finished = true;
+                    Poll::Ready(Some(Ok(Frame::trailers(t))))
                 }
-                match validate_h2_trailers(&t, &this.limits, &this.flags) {
-                    Ok(t) => {
-                        this.finished = true;
-                        Poll::Ready(Some(Ok(Frame::trailers(t))))
-                    }
-                    Err(e) => this.failed(e.clone(), BodyError::Invalid(e)),
-                }
-            }
+                Err(e) => this.failed(e.clone(), BodyError::Invalid(e)),
+            },
             Poll::Ready(Err(e)) => {
                 this.fail.stream_failed(&e);
                 this.finished = true;

@@ -9,9 +9,10 @@ use crate::chars::{is_field_value_byte, is_token, split_list, trim_ows};
 /// Header names that never appear in a canonical [`Headers`] set: the
 /// hop-by-hop fields plus the framing / routing fields roxy
 /// regenerates itself (`content-length` from the body, `host` from the
-/// authority).
+/// authority) and `expect`, which roxy answers itself.
 pub const RESERVED: &[&str] = &[
     "connection",
+    "expect",
     "keep-alive",
     "proxy-connection",
     "proxy-authorization",
@@ -50,7 +51,6 @@ const FORBIDDEN_TRAILERS: &[&str] = &[
     "authorization",
     "cookie",
     "set-cookie",
-    "expect",
     "range",
     "max-forwards",
     "cache-control",

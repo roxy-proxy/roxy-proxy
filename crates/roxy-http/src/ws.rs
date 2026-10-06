@@ -5,7 +5,7 @@ pub mod frame;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use http::StatusCode;
+use http::{HeaderValue, StatusCode};
 use sha1::{Digest, Sha1};
 
 use crate::model::{
@@ -34,10 +34,17 @@ pub fn compute_accept(key: &str) -> String {
     STANDARD.encode(h.finalize())
 }
 
-fn single<'a>(it: impl Iterator<Item = &'a str>, name: &str) -> Result<&'a str, ParseError> {
-    let v: Vec<&str> = it.collect();
+/// The one value of `name`. Counted over the raw values so that an
+/// obs-text duplicate (`http.allow_obs_text`) is a duplicate, not an absence.
+fn single<'a>(
+    it: impl Iterator<Item = &'a HeaderValue>,
+    name: &str,
+) -> Result<&'a str, ParseError> {
+    let v: Vec<&HeaderValue> = it.collect();
     match v.as_slice() {
-        [one] => Ok(one),
+        [one] => one
+            .to_str()
+            .map_err(|_| ParseError::new(Reason::WsBadHandshake, format!("{name} is not ASCII"))),
         [] => reject(Reason::WsBadHandshake, format!("missing {name}")),
         _ => reject(Reason::WsBadHandshake, format!("multiple {name}")),
     }
@@ -65,14 +72,14 @@ pub fn validate_upgrade_request(req: &CanonicalRequest) -> Result<WsKey, ParseEr
         return reject(Reason::WsBadHandshake, "upgrade request with a body");
     }
     let version = single(
-        req.headers.get_all("sec-websocket-version"),
+        req.headers.get_all_raw("sec-websocket-version"),
         "sec-websocket-version",
     )?;
     if version != "13" {
         return reject(Reason::WsBadHandshake, "sec-websocket-version must be 13");
     }
     let key = single(
-        req.headers.get_all("sec-websocket-key"),
+        req.headers.get_all_raw("sec-websocket-key"),
         "sec-websocket-key",
     )?;
     match STANDARD.decode(key) {
@@ -102,7 +109,7 @@ pub fn validate_upgrade_response(res: &CanonicalResponse, key: &WsKey) -> Result
         return reject(Reason::WsBadHandshake, "101 without upgrade: websocket");
     }
     let accept = single(
-        res.headers.get_all("sec-websocket-accept"),
+        res.headers.get_all_raw("sec-websocket-accept"),
         "sec-websocket-accept",
     )?;
     if accept != compute_accept(key.as_str()) {
@@ -126,7 +133,7 @@ pub fn validate_no_extensions(res: &CanonicalResponse) -> Result<(), ParseError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Body, Headers, RequestMeta, Scheme, TargetForm};
+    use crate::model::{Body, Headers, HttpFlags, Limits, RequestMeta, Scheme, TargetForm};
     use crate::url::{Path, parse_authority};
 
     #[test]
@@ -185,6 +192,30 @@ mod tests {
         let mut r = upgrade_req(&[KEY, V13]);
         r.meta.version = Version::H2;
         assert!(validate_upgrade_request(&r).is_err());
+    }
+
+    #[test]
+    fn obs_text_duplicate_key_is_a_duplicate() {
+        let mut r = upgrade_req(&[KEY, V13]);
+        let obs = HttpFlags {
+            allow_obs_text: true,
+            ..HttpFlags::default()
+        };
+        r.headers = Headers::try_from_raw(
+            [
+                (KEY.0.as_bytes(), KEY.1.as_bytes()),
+                (KEY.0.as_bytes(), &b"caf\xe9"[..]),
+                (V13.0.as_bytes(), V13.1.as_bytes()),
+            ],
+            &Limits::default(),
+            &obs,
+        )
+        .unwrap();
+        assert_eq!(r.headers.get_all("sec-websocket-key").count(), 1);
+        assert_eq!(
+            validate_upgrade_request(&r).unwrap_err().reason,
+            Reason::WsBadHandshake
+        );
     }
 
     #[test]
