@@ -90,7 +90,11 @@ services:
       HTTP_PROXY: http://roxy:3128
       ANTHROPIC_BASE_URL: http://fake-model:8080
       TRAFFIC_SCHEDULE: ${TRAFFIC_SCHEDULE:-alice=alice-secret@6,bob=bob-secret@20,mallory=wrong@30}
-    healthcheck: { disable: true }
+    healthcheck:                           # healthy once its threads are up; `up --wait` needs one
+      test: ["CMD", "test", "-f", "/tmp/traffic-started"]
+      interval: 2s
+      retries: 30
+    tmpfs: [/tmp]
     networks: [lab]
     depends_on:
       roxy: { condition: service_healthy }

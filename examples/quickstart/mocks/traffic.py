@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import pathlib
 import threading
 import time
 
@@ -49,6 +50,7 @@ def main() -> None:
     for i, t in enumerate(threads):
         time.sleep(1.5 * i)  # stagger the first calls so the log reads in order
         t.start()
+    pathlib.Path("/tmp/traffic-started").touch()  # the healthcheck looks for it
     while True:
         time.sleep(3600)
 

@@ -426,6 +426,10 @@ class Sidecar:
             log.warning("unreadable conversation history: %s", e)
             input = []
         conversation = call.conversation()
+        if sid := session(ex.request):
+            # Two sessions can open with the same first message; the
+            # session keeps their conversations, and their verdicts, apart.
+            conversation = hashlib.sha256(f"{sid}:{conversation}".encode()).hexdigest()[:24]
         model = f"anthropic/{response.get('model', 'unknown')}"
         self.inspect_log.model_call(
             session(ex.request) or conversation,
