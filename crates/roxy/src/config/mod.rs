@@ -305,8 +305,13 @@ pub struct Limits {
     pub max_buffered_bytes: ByteSize,
     #[serde(with = "humantime_serde")]
     pub header_timeout: Duration,
+    /// Longest stall the client is allowed: sending its request body, or
+    /// taking the response.
     #[serde(with = "humantime_serde")]
     pub body_idle_timeout: Duration,
+    /// Longest gap between the upstream's response-body frames.
+    #[serde(with = "humantime_serde")]
+    pub response_body_idle_timeout: Duration,
     #[serde(with = "humantime_serde")]
     pub response_header_timeout: Duration,
     /// Keep-alive idle time between requests on a client connection; also
@@ -355,6 +360,7 @@ impl Default for Limits {
             max_buffered_bytes: ByteSize::b(GIB),
             header_timeout: Duration::from_secs(10),
             body_idle_timeout: Duration::from_secs(30),
+            response_body_idle_timeout: Duration::from_secs(300),
             response_header_timeout: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(300),
             max_connections: 10_000,

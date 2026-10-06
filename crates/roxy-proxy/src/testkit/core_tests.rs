@@ -243,6 +243,92 @@ async fn h2_a_stalled_upload_is_cut_off() {
     a_stalled_upload_is_cut_off(true).await;
 }
 
+/// An upstream that pauses between parts of the response body for longer
+/// than the client's `body_idle_timeout`, but within
+/// `response_body_idle_timeout`, is relayed whole.
+async fn a_slow_streaming_response_goes_through_whole(h2: bool) {
+    let kit = Kit::builder()
+        .rules(RULES)
+        .limits(|l| {
+            l.body_idle_timeout = std::time::Duration::from_millis(200);
+            l.response_body_idle_timeout = std::time::Duration::from_secs(5);
+        })
+        .start()
+        .await;
+    let mut c = if h2 {
+        kit.tunnel("up.test", true).await
+    } else {
+        kit.h1().await
+    };
+    let a = c.call("GET", "/drip?n=3&ms=500", &[], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.text(), "chunk0;chunk1;chunk2;");
+    let ev = kit.request_event().await;
+    assert!(ev["reason"].is_null(), "{ev:#}");
+}
+
+#[tokio::test]
+async fn h1_a_slow_streaming_response_goes_through_whole() {
+    a_slow_streaming_response_goes_through_whole(false).await;
+}
+
+#[tokio::test]
+async fn h2_a_slow_streaming_response_goes_through_whole() {
+    a_slow_streaming_response_goes_through_whole(true).await;
+}
+
+/// A stall in the response body over `response_body_idle_timeout` ends the
+/// exchange with `response_body_timeout`, however long the client's own
+/// `body_idle_timeout` is.
+fn stalled_response_kit() -> super::KitBuilder {
+    Kit::builder().rules(RULES).limits(|l| {
+        l.body_idle_timeout = std::time::Duration::from_secs(5);
+        l.response_body_idle_timeout = std::time::Duration::from_millis(300);
+    })
+}
+
+async fn assert_stalled_response_logged(kit: &Kit) {
+    let err = kit.events("response_error", 1).await;
+    assert_eq!(err[0]["reason"], "response_body_timeout", "{err:#?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["reason"], "response_body_timeout", "{ev:#}");
+    assert_eq!(ev["res"]["status"], 200, "{ev:#}");
+}
+
+/// On h1 the body is cut and the connection closed, so the client cannot
+/// take it for complete.
+#[tokio::test]
+async fn h1_a_stalled_response_is_cut_off() {
+    let kit = stalled_response_kit().start().await;
+    let mut c = kit.h1().await;
+    let a = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        c.call("GET", "/drip?n=2&ms=1500", &[], b""),
+    )
+    .await
+    .expect("the stall is cut off");
+    assert_eq!(a.status, 200, "{a:?}");
+    assert!(a.body.is_err(), "the body is cut: {a:?}");
+    assert_stalled_response_logged(&kit).await;
+}
+
+/// On h2 the stream is reset with `CANCEL`: the upstream stalled, roxy did
+/// not fail.
+#[tokio::test]
+async fn h2_a_stalled_response_is_reset_with_cancel() {
+    let kit = stalled_response_kit().start().await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let r = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        super::h2_get(&send, "https://up.test/drip?n=2&ms=1500", &[]),
+    )
+    .await
+    .expect("the stall is cut off");
+    let e = r.expect_err("the stream must be reset");
+    assert_eq!(e.reason(), Some(h2::Reason::CANCEL), "{e}");
+    assert_stalled_response_logged(&kit).await;
+}
+
 /// An exchange finishes under the policy it started with; the next one
 /// runs under the reloaded policy.
 #[tokio::test]

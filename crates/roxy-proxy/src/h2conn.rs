@@ -276,6 +276,7 @@ async fn serve_stream(
     let out = Out {
         method: &method,
         idle: limits.body_idle_timeout,
+        body_idle: limits.response_body_idle_timeout,
         allow_trailers: flags.allow_trailers,
     };
     let answer = match outcome {
@@ -311,10 +312,13 @@ async fn serve_stream(
     }
 }
 
-/// Response-writing parameters for one stream.
+/// Response-writing parameters for one stream: the client's flow-control
+/// window must open within `idle`, the body must yield its next frame
+/// within `body_idle`.
 struct Out<'a> {
     method: &'a Method,
     idle: Duration,
+    body_idle: Duration,
     allow_trailers: bool,
 }
 
@@ -349,6 +353,12 @@ async fn write_response(
             tracing::debug!("h2 response stopped by policy; resetting the stream");
             send.send_reset(h2::Reason::CANCEL);
         }
+        // The upstream stalled, not roxy: the client sees a cancelled
+        // stream rather than a proxy fault.
+        Err(WriteFailure::UpstreamStalled) => {
+            tracing::debug!("h2 response body stalled; resetting the stream");
+            send.send_reset(h2::Reason::CANCEL);
+        }
         Err(WriteFailure::Io(e)) => {
             tracing::debug!(error = %e, "h2 response body failed; resetting the stream");
             send.send_reset(h2::Reason::INTERNAL_ERROR);
@@ -376,11 +386,11 @@ async fn stream_body(
 ) -> Result<(), WriteFailure> {
     loop {
         let frame = timeout(
-            out.idle,
+            out.body_idle,
             poll_fn(|cx| http_body::Body::poll_frame(Pin::new(&mut *body), cx)),
         )
         .await
-        .map_err(|_| WriteFailure::Io("response body idle timeout".to_owned()))?;
+        .map_err(|_| WriteFailure::UpstreamStalled)?;
         let frame = match frame {
             None => {
                 send.send_data(Bytes::new(), true)
@@ -388,6 +398,7 @@ async fn stream_body(
                 return Ok(());
             }
             Some(Err(BodyError::Stopped)) => return Err(WriteFailure::Stopped),
+            Some(Err(BodyError::Timeout)) => return Err(WriteFailure::UpstreamStalled),
             Some(Err(e)) => return Err(WriteFailure::Io(e.to_string())),
             Some(Ok(f)) => f,
         };

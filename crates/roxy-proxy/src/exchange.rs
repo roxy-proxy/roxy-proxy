@@ -63,6 +63,9 @@ pub(crate) enum WriteFailure {
     Stopped,
     /// The client stopped reading or went away.
     ClientGone(String),
+    /// The upstream sent no response-body frame for
+    /// `response_body_idle_timeout`; the front cut the body.
+    UpstreamStalled,
     /// Anything else: the upstream body failed mid-stream, a stalled or
     /// broken write.
     Io(String),
@@ -72,6 +75,7 @@ impl std::fmt::Display for WriteFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Stopped => f.write_str("stopped by policy"),
+            Self::UpstreamStalled => f.write_str("response body idle timeout"),
             Self::ClientGone(s) | Self::Io(s) => f.write_str(s),
         }
     }
@@ -82,6 +86,7 @@ impl From<WriteError> for WriteFailure {
         match e {
             WriteError::Io(e) => Self::ClientGone(e.to_string()),
             WriteError::Body(BodyError::Stopped) => Self::Stopped,
+            WriteError::Body(BodyError::Timeout) => Self::UpstreamStalled,
             e @ (WriteError::Body(_) | WriteError::Request(_) | WriteError::State(_)) => {
                 Self::Io(e.to_string())
             }
@@ -131,6 +136,7 @@ where
     let failure = match r {
         Ok(()) | Err(WriteFailure::Stopped) => None,
         Err(e @ WriteFailure::ClientGone(_)) => Some(("client_gone", e)),
+        Err(e @ WriteFailure::UpstreamStalled) => Some(("response_body_timeout", e)),
         Err(e @ WriteFailure::Io(_)) => Some(("response_write_failed", e)),
     };
     if stop.is_none()
@@ -236,7 +242,9 @@ pub(crate) fn record_continue_failure(cx: &mut FlowCx, e: WriteError) {
     let e = WriteFailure::from(e);
     let reason = match e {
         WriteFailure::ClientGone(_) => "client_gone",
-        WriteFailure::Stopped | WriteFailure::Io(_) => "continue_write_failed",
+        WriteFailure::Stopped | WriteFailure::UpstreamStalled | WriteFailure::Io(_) => {
+            "continue_write_failed"
+        }
     };
     emit_response_error(cx, reason, &e);
     cx.record.reason = Some(reason.to_owned());

@@ -34,9 +34,11 @@ pub struct Limits {
     /// Deadline for receiving a complete request head once it has started
     /// (and for the first request on a connection, from accept).
     pub header_timeout: Duration,
-    /// Maximum time without request-body progress (read or backpressure) and
-    /// without response-write progress.
+    /// Maximum time without progress from the client: reading its request
+    /// body, or writing the response to it.
     pub body_idle_timeout: Duration,
+    /// Maximum wait for the upstream's next response-body frame.
+    pub response_body_idle_timeout: Duration,
     /// Upstream response-head timeout (enforced by the caller).
     pub response_header_timeout: Duration,
     /// Keep-alive idle time between requests on a client connection.
@@ -61,6 +63,7 @@ impl Default for Limits {
             max_buffered_bytes: GIB,
             header_timeout: Duration::from_secs(10),
             body_idle_timeout: Duration::from_secs(30),
+            response_body_idle_timeout: Duration::from_secs(300),
             response_header_timeout: Duration::from_secs(60),
             idle_timeout: Duration::from_secs(300),
             h2_max_concurrent_streams: 100,

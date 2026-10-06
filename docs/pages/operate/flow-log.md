@@ -53,7 +53,7 @@ produces a `request` event:
 | event | when |
 |---|---|
 | `request` | every exchange |
-| `response_error` | the response could not be written after the request was allowed; `reason` is `client_gone` (the client stopped reading or went away), `response_write_failed` (for example, a body limit mid-stream) or `continue_write_failed` (roxy's own `100 Continue` could not be written) |
+| `response_error` | the response could not be written after the request was allowed; `reason` is `client_gone` (the client stopped reading or went away), `response_body_timeout` (the upstream paused mid-body for longer than `limits.response_body_idle_timeout`), `response_write_failed` (for example, a body limit mid-stream) or `continue_write_failed` (roxy's own `100 Continue` could not be written) |
 | `parse_error` | the client sent something roxy refused to parse; `reason` is a stable code |
 | `upstream_error`, `upstream_denied` | [upstream](/reference/upstream#errors) failures and address-floor hits; `upstream_denied.reason` is `private_range:<class>`, `deny_cidrs` or `list:<name>` ([address floor](/policies/address-lists#address-floor)) |
 | `policy_input_unavailable`, `metric_table_full` | a flow failed closed for want of an input |
