@@ -13,7 +13,7 @@ use super::{
     CAction, CompiledRule, Condition, MetricDef, PolicyInput, RuleKind, RuleShape, WatchAction,
     is_header_value, metric_reads,
 };
-use crate::compile::{Env, Needs, Pred, build_shared_regex, compile};
+use crate::compile::{Env, Needs, Pred, ROperand, build_shared_regex, compile};
 use crate::config::{
     Action, AllowArgs, DenyArgs, MetricConfig, MetricCount, RedirectArgs, RewritePathArgs,
     RuleConfig, SetStateArgs, Upgrade,
@@ -25,7 +25,7 @@ use crate::eval::{
 };
 use crate::lexer::is_ident;
 use crate::template::{Part, literal, mentions_secret, parse_template, secret_names};
-use crate::types::{Field, Reads, is_token};
+use crate::types::{Access, Field, Reads, is_token};
 
 impl Condition {
     /// Compiles `src`. `path` locates it in diagnostics (`addons[0].when`).
@@ -91,6 +91,19 @@ fn quoted(names: &[String]) -> String {
         .map(|n| format!("`{n}`"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Whether `pred` is false whenever `f` is `null`: it is `f != null`, or a
+/// top-level `and` with that as a term.
+fn guards_not_null(pred: &Pred, f: Field) -> bool {
+    match pred {
+        Pred::IsNull {
+            op: ROperand::Get(Access::Scalar(g)),
+            negate: true,
+        } => *g == f,
+        Pred::All(terms) => terms.iter().any(|t| guards_not_null(t, f)),
+        _ => false,
+    }
 }
 
 pub(super) struct PolicyCompiler<'i, 'a> {
@@ -193,24 +206,35 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 "window must be greater than zero",
             );
         }
+        let filter = m
+            .where_
+            .as_ref()
+            .and_then(|w| self.metric_filter(w.as_str(), format!("{path}.where")));
+        // A `where` that failed to compile has its diagnostic; do not also
+        // ask for a guard in it.
+        let where_ok = m.where_.is_none() || filter.is_some();
         let key: Vec<Field> = m
             .key
             .iter()
             .enumerate()
-            .filter_map(|(j, k)| self.metric_field(k, format!("{path}.key[{j}]"), "key"))
+            .filter_map(|(j, k)| {
+                let at = format!("{path}.key[{j}]");
+                let f = self.metric_field(k, at.clone(), "key")?;
+                self.null_guarded(f, at, "key", filter.as_ref(), where_ok)
+            })
             .collect();
         let unique = match &m.count {
-            MetricCount::Unique(f) => self.metric_field(f, format!("{path}.count"), "unique()"),
+            MetricCount::Unique(f) => {
+                let at = format!("{path}.count");
+                self.metric_field(f, at.clone(), "unique()")
+                    .and_then(|f| self.null_guarded(f, at, "unique()", filter.as_ref(), where_ok))
+            }
             MetricCount::Requests
             | MetricCount::RequestBytes
             | MetricCount::ResponseBytes
             | MetricCount::Errors
             | MetricCount::Denied => None,
         };
-        let filter = m
-            .where_
-            .as_ref()
-            .and_then(|w| self.metric_filter(w.as_str(), format!("{path}.where")));
         MetricDef {
             id: m.id.clone(),
             count: m.count.clone(),
@@ -219,6 +243,34 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             window: m.window,
             filter,
         }
+    }
+
+    /// A metric `key` or `unique()` field `f` that may be `null` must be
+    /// guarded by the metric's `where`: a `null` key value denies the flow,
+    /// and the guard turns that into "not counted". The guard is `f != null`
+    /// as the whole `where` or as a term of its top-level `and`, the only
+    /// places where it is certain to have excluded the flow.
+    fn null_guarded(
+        &mut self,
+        f: Field,
+        at: String,
+        what: &str,
+        filter: Option<&Pred>,
+        where_ok: bool,
+    ) -> Option<Field> {
+        if !f.nullable() || !where_ok || filter.is_some_and(|p| guards_not_null(p, f)) {
+            return Some(f);
+        }
+        self.push(
+            None,
+            at,
+            format!(
+                "`{f}` can be null, and a null {what} field denies the flow; guard it with \
+                 `where: {f} != null` (or `{f} != null and ...`) so that such flows are not \
+                 counted (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)"
+            ),
+        );
+        None
     }
 
     /// A metric `key` or `unique()` field, which must be a head field.
