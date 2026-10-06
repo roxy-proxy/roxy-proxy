@@ -502,7 +502,9 @@ mod tests {
             Reason::InvalidQuery
         );
         assert_eq!(
-            normalize_query(b"filter={a:1}&ids=1|2^3`").unwrap().as_str(),
+            normalize_query(b"filter={a:1}&ids=1|2^3`")
+                .unwrap()
+                .as_str(),
             "filter=%7Ba:1%7D&ids=1%7C2%5E3%60"
         );
         for (bad, r) in [
