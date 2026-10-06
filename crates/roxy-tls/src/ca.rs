@@ -866,7 +866,7 @@ pub(crate) mod tests {
             generated.not_after().unix_timestamp(),
             loaded.not_after().unix_timestamp()
         );
-        assert!(loaded.warnings().is_empty());
+        assert_eq!(loaded.warnings(), Vec::<String>::new());
     }
 
     #[test]
