@@ -721,9 +721,10 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             .iter()
             .any(|s| mentions_secret(s))
         {
-            let where_ = match action {
-                Action::Sign(_) => "in the `service` or `region` of `sign`".to_owned(),
-                _ => format!("in `{}`", action.name()),
+            let where_ = if matches!(action, Action::Sign(_)) {
+                "in the `service` or `region` of `sign`".to_owned()
+            } else {
+                format!("in `{}`", action.name())
             };
             self.push(
                 rule,

@@ -106,6 +106,7 @@ pub enum Incoming {
     },
 }
 
+#[allow(clippy::large_enum_variant)] // one per request body, never copied
 enum BodyDecoder {
     Length(u64),
     Chunked(ChunkedDecoder),

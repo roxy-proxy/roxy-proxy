@@ -8,6 +8,7 @@
 //! `UNSIGNED-PAYLOAD` instead and streams it.
 
 use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::time::SystemTime;
 
 use aws_credential_types::Credentials;
@@ -153,7 +154,7 @@ fn aws_encoded_path(path: &str) -> String {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/') {
             out.push(char::from(b));
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            let _ = write!(out, "%{b:02X}");
         }
         i += 1;
     }
@@ -205,8 +206,7 @@ mod tests {
             .map(|(n, v)| (n.as_bytes(), v.as_bytes()))
             .collect();
         let headers =
-            Headers::try_from_raw(raw.into_iter(), &Limits::default(), &HttpFlags::default())
-                .unwrap();
+            Headers::try_from_raw(raw, &Limits::default(), &HttpFlags::default()).unwrap();
         CanonicalRequest {
             method: Method::parse(method.as_bytes()).unwrap(),
             scheme: Scheme::Https,

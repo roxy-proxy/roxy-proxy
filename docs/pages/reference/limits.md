@@ -15,7 +15,8 @@ connect produces a deny response or a closed socket.
 | metric key table full or byte budget exhausted | deny, `metric_table_full` |
 | body too large to inspect, as sent or decoded | deny, `_fail_closed`, `body_too_large_to_inspect` |
 | body to inspect cannot be decoded | deny, `_fail_closed`, `body_decode_failed` or `unsupported_content_encoding` |
-| buffer budget cannot cover the exchange's inspection or WebSocket buffers | deny, `_fail_closed`, `buffer_budget_exhausted`; an observer's copy is cut instead (`observer_lagged`) |
+| body to sign over `max_sign_body_bytes` | `413`, `_sign`, `sign_body_too_large` |
+| buffer budget cannot cover the exchange's inspection, signing or WebSocket buffers | deny, `_fail_closed`, `buffer_budget_exhausted`; an observer's copy is cut instead (`observer_lagged`) |
 | body or header limit exceeded mid-stream | close both sides |
 | upstream DNS, connect or TLS failure | `502`, `upstream_error` |
 | upstream connect or response-header timeout | `504`, `upstream_error`, reason `timeout` |
