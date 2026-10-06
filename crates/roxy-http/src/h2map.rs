@@ -262,6 +262,7 @@ pub fn to_h2_response(res: &CanonicalResponse, request_method: &Method) -> http:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BodyError;
     use http::StatusCode;
 
     fn auth() -> Authority {
@@ -495,6 +496,54 @@ mod tests {
                 .unwrap_err()
                 .reason,
             Reason::HeadTooLarge
+        );
+    }
+
+    /// Without a content-length the body's length is unknown: it is held
+    /// to the cap, not to any declared length, and the client's `expect`
+    /// still earns a 100. A bodiless method is capped at zero, so the first
+    /// data frame on its stream is the error, whatever the stream says.
+    #[tokio::test]
+    async fn an_unknown_length_is_capped_and_a_bodiless_method_takes_no_data() {
+        let limits = Limits {
+            max_request_body_bytes: 4,
+            ..Limits::default()
+        };
+        let post = |body: &'static str| {
+            let mut p = req("https://api.example.com/", &[("expect", "100-continue")]);
+            p.method = http::Method::POST;
+            from_h2_parts(
+                p,
+                Body::from_bytes(body),
+                &auth(),
+                &limits,
+                &HttpFlags::default(),
+            )
+            .unwrap()
+        };
+        let r = post("hell");
+        assert_eq!(r.body.known_length(), None);
+        assert!(r.meta.expect_continue);
+        assert_eq!(r.body.collect_up_to(100).await.unwrap(), "hell");
+        let r = post("hello");
+        assert_eq!(
+            r.body.collect_up_to(100).await.unwrap_err(),
+            BodyError::TooLarge { limit: 4 }
+        );
+
+        let r = from_h2_parts(
+            req("https://api.example.com/", &[("expect", "100-continue")]),
+            Body::from_bytes("x"),
+            &auth(),
+            &Limits::default(),
+            &HttpFlags::default(),
+        )
+        .unwrap();
+        assert_eq!(r.body.known_length(), Some(0));
+        assert!(!r.meta.expect_continue);
+        assert_eq!(
+            r.body.collect_up_to(100).await.unwrap_err(),
+            BodyError::TooLarge { limit: 0 }
         );
     }
 

@@ -209,7 +209,11 @@ fn like_host_boundaries() {
         ("a.example.com.", false),
         ("a.example.com.evil.org", false),
     ] {
-        assert_eq!(eval_in("host like \"*.example.com\"", &host(h)), want, "{h}");
+        assert_eq!(
+            eval_in("host like \"*.example.com\"", &host(h)),
+            want,
+            "{h}"
+        );
     }
 }
 

@@ -1236,6 +1236,33 @@ mod tests {
         assert!(h(&["gzip, gzip, gzip, gzip, gzip"]).is_err());
     }
 
+    /// The cap counts codings across every `content-encoding` field, not
+    /// per field; `identity` and empty elements never count.
+    #[test]
+    fn content_codings_cap_spans_fields() {
+        let h = |vals: &[&str]| {
+            let mut h = Headers::new();
+            for v in vals {
+                h.append("content-encoding", v).unwrap();
+            }
+            content_codings(&h)
+        };
+        let four = vec![Coding::Gzip, Coding::Br, Coding::Deflate, Coding::Zstd];
+        assert_eq!(h(&["gzip, br", "deflate, zstd"]).unwrap(), four);
+        assert_eq!(
+            h(&["gzip", "br", "deflate", "identity, , zstd", "identity"]).unwrap(),
+            four
+        );
+        assert_eq!(
+            h(&["gzip, br", "deflate, zstd", "gzip"]).unwrap_err(),
+            DecodeError::Unsupported(format!("more than {MAX_CODINGS} codings"))
+        );
+        assert_eq!(
+            h(&["gzip", "br", "deflate", "zstd", "br"]).unwrap_err(),
+            DecodeError::Unsupported(format!("more than {MAX_CODINGS} codings"))
+        );
+    }
+
     #[test]
     fn content_codings_unreadable_value_is_not_identity() {
         let obs = crate::HttpFlags {

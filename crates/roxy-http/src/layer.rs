@@ -144,9 +144,11 @@ pub fn from_layer_request(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
     use crate::chars::is_pchar_literal;
-    use crate::model::{TargetForm, Version};
+    use crate::model::{TargetForm, Version, is_reserved};
 
     fn req(uri: &str, headers: &[(&str, &str)], body: &'static str) -> http::Request<Body> {
         let mut b = http::Request::builder().method("POST").uri(uri);
@@ -281,5 +283,73 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(check(connect).unwrap_err().reason, Reason::InvalidMethod);
+    }
+
+    fn header_strategy() -> impl Strategy<Value = Vec<(String, String)>> {
+        let name = prop_oneof![
+            "[a-z][a-z0-9-]{0,8}",
+            Just("host".to_owned()),
+            Just("content-length".to_owned()),
+            Just("connection".to_owned()),
+            Just("transfer-encoding".to_owned()),
+            Just("te".to_owned()),
+            Just("proxy-authorization".to_owned()),
+            Just("upgrade".to_owned()),
+        ];
+        let value = prop_oneof![
+            "[ -~]{0,12}",
+            Just("example.com".to_owned()),
+            Just("example.com:8443".to_owned()),
+            Just("EXAMPLE.com:443".to_owned()),
+            Just("0".to_owned()),
+            Just("5".to_owned()),
+        ];
+        proptest::collection::vec((name, value), 0..6)
+    }
+
+    proptest! {
+        /// A request a layer passes on is canonical when accepted: the
+        /// authority is the URI's (with the scheme's default port filled
+        /// in), the path is already normalised, and no hop-by-hop or
+        /// framing field survives.
+        #[test]
+        fn accepted_layer_requests_are_canonical(
+            method in prop_oneof![Just("GET"), Just("POST"), Just("HEAD"), Just("DELETE"), Just("CONNECT"), Just("PATCH")],
+            scheme in prop_oneof![Just("http"), Just("https"), Just("ftp")],
+            authority in prop_oneof![
+                Just("example.com"),
+                Just("EXAMPLE.com:443"),
+                Just("example.com:8443"),
+                Just("example.com."),
+                Just("[::1]:8080"),
+                Just("a..b"),
+                Just("x:0"),
+            ],
+            path in "(/[a-zA-Z0-9._~%!$&'()*+,;=:@-]{0,6}){0,4}(\\?[a-z=&%]{0,8})?",
+            headers in header_strategy(),
+            body in "[a-z]{0,8}",
+        ) {
+            let mut b = http::Request::builder()
+                .method(method)
+                .uri(format!("{scheme}://{authority}{path}"));
+            for (n, v) in &headers {
+                b = b.header(n.as_str(), v.as_str());
+            }
+            let Ok(req) = b.body(Body::from_bytes(body)) else {
+                return Ok(());
+            };
+            let Ok(c) = check(req) else {
+                return Ok(());
+            };
+            let want = url::parse_authority(authority.as_bytes(), c.scheme.default_port()).unwrap();
+            prop_assert_eq!(&c.authority, &want);
+            prop_assert_eq!(
+                url::normalize_path(c.path.as_str().as_bytes()).unwrap(),
+                c.path.clone()
+            );
+            for (name, _) in &c.headers {
+                prop_assert!(!is_reserved(name.as_str()), "reserved field {} kept", name);
+            }
+        }
     }
 }

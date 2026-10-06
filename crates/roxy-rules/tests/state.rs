@@ -200,7 +200,10 @@ fn concurrent_overwrite_remove_and_purge_keep_the_count_exact() {
     });
     s.purge();
     let live = s.len();
-    assert!(format!("{s:?}").contains(&format!("stored: {live}")), "{s:?}");
+    assert!(
+        format!("{s:?}").contains(&format!("stored: {live}")),
+        "{s:?}"
+    );
     // Exactly the free slots are admitted.
     for i in 0..MAX - live {
         s.set(&format!("fresh{i}"), "v", None).unwrap();
