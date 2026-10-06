@@ -22,7 +22,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig, SupportedProtocolVersion
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, DnsName, ServerName};
 
-use crate::leaf::{LeafError, LeafMinter};
+use crate::leaf::LeafMinter;
 
 /// Errors building TLS configurations.
 #[derive(Debug, thiserror::Error)]
@@ -43,9 +43,6 @@ pub enum TlsError {
     /// A certificate in a root file was rejected as a trust anchor.
     #[error("unusable root certificate in {}: {reason}", path.display())]
     InvalidRoot { path: PathBuf, reason: String },
-    /// A leaf could not be minted.
-    #[error(transparent)]
-    Leaf(#[from] LeafError),
     /// rustls rejected the configuration.
     #[error("rustls: {0}")]
     Rustls(#[from] rustls::Error),

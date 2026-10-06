@@ -42,8 +42,8 @@ requests inside the tunnel. roxy then peeks the tunnel's first bytes:
   the CONNECT host (`tls.require_sni_match`, default true), compared after
   both are canonicalised (`sni_mismatch` otherwise); an SNI that is not a usable
   host name is closed (`bad_sni`). A client that sends no SNI gets the CONNECT
-  host. roxy terminates TLS with a leaf for
-  that host, and the inner protocol must be HTTP/1.1 or HTTP/2 by ALPN.
+  host. roxy terminates TLS with a leaf for that host, and the inner protocol
+  must be HTTP/1.1 or HTTP/2 by ALPN.
 - **Plaintext HTTP**, if `http.allow_plain_in_connect` is true (default
   false): parsed as HTTP.
 - **Anything else:** the connection is closed. Raw TCP never passes

@@ -18,10 +18,12 @@ CONNECT host when the client sends none).
 The server certificate is picked by SNI. A client that sends no SNI gets
 the CONNECT host as the fallback name; an SNI that is present but invalid
 fails the handshake rather than using the fallback. An SNI is valid when it
-is a valid request host: lower-cased, one trailing dot removed, A-labels only,
-IPv6 in brackets, and a final label that is all digits or `0x`-hex only as a
-dotted-quad IPv4 address. That canonical form is the leaf cache key, so
-`Example.COM` and `example.com.` share a leaf. ALPN offers `h2` (with
+would be valid as a request host: ASCII A-labels, IPv6 in brackets, and a
+name whose last label is numeric or `0x`-hex only as a dotted-quad IPv4
+address. Hosts are canonicalised the same way everywhere (lower-cased, one
+trailing dot removed), and that form is the leaf cache key: `CONNECT
+Example.COM.:443` with SNI `example.com` names one host and gets one leaf.
+ALPN offers `h2` (with
 `http.enable_h2`) and `http/1.1`. TLS 1.2 and 1.3. Session resumption is
 off (no session storage, no TLS 1.3 tickets): clients behind roxy are
 usually short-lived, and resumption state would be one more thing to bound.
