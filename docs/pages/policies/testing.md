@@ -37,3 +37,7 @@ head (`--response-header` adds headers to it but on its own runs nothing).
 WebSocket message and run the rules that read `ws.*`. The request arrives on the config's first listener, which
 sets `listener.name` and `listener.mode`. An IP-literal URL also shows an
 address-floor hit. See `roxy rule test --help`.
+
+A policy composed from layers carries its tests in the layers; `roxy policy
+test` runs them against the composed result
+([policy layers](/operate/policy-layers#tests)).

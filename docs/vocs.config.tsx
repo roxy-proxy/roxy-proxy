@@ -103,6 +103,7 @@ export default defineConfig({
         { text: "Operations", link: "/operate/operations" },
         { text: "Managing the CA", link: "/operate/ca-certificates" },
         { text: "Flow log and capture", link: "/operate/flow-log" },
+        { text: "Policy layers", link: "/operate/policy-layers" },
       ],
     },
     {

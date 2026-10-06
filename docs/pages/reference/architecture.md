@@ -60,21 +60,23 @@ snapshot it started with.
 ## Crates
 
 Dependencies point downward. `roxy` depends on `roxy-proxy`, `roxy-http`,
-`roxy-rules`, `roxy-tls` and `roxy-wasm`; `roxy-proxy` on `roxy-http`,
-`roxy-tls`, `roxy-rules`, `roxy-dns`, `roxy-wasm` and `roxy-log`;
-`roxy-rules`, `roxy-wasm` and `roxy-tls` on `roxy-http`. `roxy-http`,
+`roxy-rules`, `roxy-tls`, `roxy-wasm` and `roxy-policy`; `roxy-proxy` on
+`roxy-http`, `roxy-tls`, `roxy-rules`, `roxy-dns`, `roxy-wasm` and
+`roxy-log`; `roxy-rules`, `roxy-wasm` and `roxy-tls` on `roxy-http`;
+`roxy-policy` on `roxy-rules`. `roxy-http`,
 `roxy-dns`, `roxy-log` and `roxy-addon` depend on no other roxy crate.
 `roxy-http`, `roxy-rules` and `roxy-dns` do no network I/O, so they can be
 unit-tested and fuzzed directly.
 
 | crate | responsibility |
 |---|---|
-| `roxy` | The binary: CLI (`run`, `check`, `ca`, `rule test`, `health`), config loading and validation, secrets, address-list loading, reload, store wiring. |
+| `roxy` | The binary: CLI (`run`, `check`, `ca`, `rule test`, `policy`, `health`), config loading and validation, secrets, address-list loading, reload, store wiring. |
 | `roxy-proxy` | Listeners, the DNS listener, the connection state machines, the exchange core, the addon stack (including service layers), the watcher, the upstream connector and address floor, the WebSocket relay, flow-log events and capture. |
 | `roxy-http` | The canonical request/response model, the strict HTTP/1.1 codec, the h2 ↔ canonical mapping, URL normalisation, body framing with caps, content-coding decoders, the WebSocket handshake checks and frame codec. No I/O policy. |
 | `roxy-dns` | The DNS listener's wire codec: strict query parsing, answers that fit in 512 bytes. No I/O. |
 | `roxy-tls` | CA generation and persistence, leaf minting and cache (keyed on `roxy-http`'s canonical `Host`), rustls configs, ClientHello sniffing. |
 | `roxy-rules` | The expression DSL (lexer, parser, type checker, compiler), policy evaluation, actions, the metric and state stores. |
+| `roxy-policy` | Composition of policy layers onto a per-node base: name prefixing, reference rewriting, the tag-order check, the content hash. |
 | `roxy-wasm` | The wasmtime component host for WASM addons: linking, capabilities, budgets, instance pools. |
 | `roxy-log` | Buffered single-writer log destinations: one writer thread, batching, backpressure, rotation, compression. Knows bytes, not events. |
 | `roxy-addon` | SDK for Rust addon authors: generated WIT bindings and wrappers. |
