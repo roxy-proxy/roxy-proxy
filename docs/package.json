@@ -4,18 +4,24 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "postinstall": "node scripts/patch-vocs.mjs",
-    "dev": "ROXY_DOCS_BASE= vocs dev --port 4000",
+    "dev": "ROXY_DOCS_BASE=/ vocs dev --port 4000",
     "build": "vocs build",
     "check-links": "node scripts/check-links.mjs",
     "preview": "vocs preview"
   },
   "dependencies": {
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "vocs": "1.4.1"
+    "@fontsource/inter": "^5.3.0",
+    "@fontsource/jetbrains-mono": "^5.3.0",
+    "react": "~19.3.0",
+    "react-dom": "~19.3.0",
+    "vite": "^8.3.3",
+    "vocs": "2.10.2",
+    "waku": "1.0.0-rc.3"
   },
   "devDependencies": {
     "github-slugger": "^2.0.0"
+  },
+  "overrides": {
+    "remark-mdx-frontmatter": "^6.0.0"
   }
 }

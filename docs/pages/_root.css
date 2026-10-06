@@ -1,0 +1,35 @@
+/* Light only. One accent, a deep teal (set in vocs.config.ts), with neutral
+   greys around it. */
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/inter/700.css";
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/500.css";
+
+:root {
+  --vocs-font-family: "Inter", sans-serif;
+  --vocs-font-family-mono: "JetBrains Mono", monospace;
+
+  --vocs-background-color-primary: #ffffff;
+  --vocs-background-color-surface: #f8f9f8;
+  --vocs-background-color-surfaceMuted: #f3f5f4;
+  --vocs-background-color-surfaceTint: #eceeed;
+  --vocs-background-color-code-block: #f8f9f8;
+  --vocs-background-color-inline-code: #f1f4f3;
+  --vocs-background-color-blockquote: #f8f9f8;
+
+  --vocs-text-color-heading: #16201e;
+  --vocs-text-color-primary: #3d4846;
+  --vocs-text-color-secondary: #5f6b68;
+  --vocs-text-color-muted: #7e8986;
+  --vocs-text-color-link: #0f766e;
+  --vocs-text-color-link-hover: #115e59;
+
+  --vocs-border-color-primary: #e6e8e7;
+  --vocs-border-color-secondary: #cfd4d2;
+
+  --vocs-color-info: #115e59;
+  --vocs-background-color-info-tint: #0f766e0f;
+  --vocs-border-color-info-tint: #0f766e40;
+}
