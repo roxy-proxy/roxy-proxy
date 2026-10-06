@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://roxy-proxy.github.io/roxy-proxy/spec/node-protocol/v1/flow-batch.json",
+  "title": "Flow batch",
+  "description": "Body of POST /roxy/v1/flows, optionally gzip-compressed.",
+  "type": "object",
+  "required": ["node_id", "lease_id", "seq_first", "events"],
+  "properties": {
+    "node_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$"},
+    "lease_id": {"type": "string", "minLength": 1},
+    "seq_first": {"$ref": "#/$defs/seq"},
+    "events": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/event"}
+    }
+  },
+  "$defs": {
+    "seq": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+    "event": {
+      "type": "object",
+      "description": "A flow log record with seq added.",
+      "required": ["seq", "ts", "event"],
+      "properties": {
+        "seq": {"$ref": "#/$defs/seq"},
+        "ts": {"type": "string", "format": "date-time"},
+        "event": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

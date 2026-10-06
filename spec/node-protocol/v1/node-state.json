@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://roxy-proxy.github.io/roxy-proxy/spec/node-protocol/v1/node-state.json",
+  "title": "Node state",
+  "description": "Value of the Roxy-Node-State header on GET /roxy/v1/lease, as one compact JSON object.",
+  "type": "object",
+  "required": [
+    "lease_id", "config_hash", "secrets_hash", "roxy_version", "protocol_version",
+    "features", "uptime_seconds", "policy_state", "spooled_bytes"
+  ],
+  "properties": {
+    "lease_id": {"type": ["string", "null"], "minLength": 1},
+    "config_hash": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
+    "secrets_hash": {"type": ["string", "null"], "minLength": 1},
+    "roxy_version": {"type": "string", "minLength": 1},
+    "protocol_version": {"type": "integer", "const": 1},
+    "features": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "uptime_seconds": {"type": "integer", "minimum": 0},
+    "policy_state": {"type": "string", "enum": ["none", "loaded", "expired"]},
+    "spooled_bytes": {"type": "integer", "minimum": 0}
+  }
+}
