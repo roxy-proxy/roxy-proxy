@@ -24,17 +24,61 @@
 //! `request` line with a body expectation drains the body through
 //! `ServerConn::drive`; the server then answers `200` before reading the next
 //! request.
+//!
+//! Every case runs twice: once with the raw bytes available in one read, and
+//! once through [`OneByte`], which hands the parser a single byte per read so
+//! heads, chunk lines and trailers are all split at every position.
 
 #![allow(clippy::too_many_lines, clippy::many_single_char_names)]
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use roxy_http::h1::{Incoming, Role, ServerConn};
 use roxy_http::url::parse_authority;
 use roxy_http::{Body, CanonicalResponse, DriveError, HttpFlags, Limits, Reason, Scheme};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+/// Delivers at most one byte per `poll_read`; writes pass straight through.
+struct OneByte<IO>(IO);
+
+impl<IO: AsyncRead + Unpin> AsyncRead for OneByte<IO> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let mut byte = [0u8; 1];
+        let mut one = ReadBuf::new(&mut byte);
+        let res = Pin::new(&mut self.0).poll_read(cx, &mut one);
+        buf.put_slice(one.filled());
+        res
+    }
+}
+
+impl<IO: AsyncWrite + Unpin> AsyncWrite for OneByte<IO> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
 
 #[derive(Debug)]
 struct Case {
@@ -194,7 +238,7 @@ fn code(r: Reason) -> &'static str {
 }
 
 /// Runs one case; returns a description of the first mismatch.
-async fn run_case(case: &Case) -> Result<(), String> {
+async fn run_case(case: &Case, byte_at_a_time: bool) -> Result<(), String> {
     let (mut client, server) = tokio::io::duplex(1 << 20);
     let raw = case.raw.clone();
     let writer = tokio::spawn(async move {
@@ -204,12 +248,22 @@ async fn run_case(case: &Case) -> Result<(), String> {
         let _ = client.read_to_end(&mut sink).await;
         sink
     });
-    let mut conn = ServerConn::new(
-        server,
-        case.role.clone(),
-        Arc::new(case.limits.clone()),
-        Arc::new(case.flags.clone()),
-    );
+    let limits = Arc::new(case.limits.clone());
+    let flags = Arc::new(case.flags.clone());
+    if byte_at_a_time {
+        let conn = ServerConn::new(OneByte(server), case.role.clone(), limits, flags);
+        return check_case(case, conn, writer, true).await;
+    }
+    let conn = ServerConn::new(server, case.role.clone(), limits, flags);
+    check_case(case, conn, writer, false).await
+}
+
+async fn check_case<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    case: &Case,
+    mut conn: ServerConn<IO>,
+    writer: tokio::task::JoinHandle<Vec<u8>>,
+    byte_at_a_time: bool,
+) -> Result<(), String> {
     for (idx, exp) in case.expects.iter().enumerate() {
         let mut words = exp.split_whitespace();
         let kind = words.next().unwrap();
@@ -230,7 +284,15 @@ async fn run_case(case: &Case) -> Result<(), String> {
                 }
                 if let Some(l) = rest.iter().find_map(|w| w.strip_prefix("leftover=")) {
                     let (_, leftover) = conn.accept_connect().await.map_err(|e| e.to_string())?;
-                    if leftover[..] != unescape(l)[..] {
+                    // One byte per read leaves the tunnel bytes unread; what
+                    // is buffered must still be a prefix of them.
+                    let want = unescape(l);
+                    let ok = if byte_at_a_time {
+                        want.starts_with(&leftover)
+                    } else {
+                        leftover[..] == want[..]
+                    };
+                    if !ok {
                         return Err(format!("{ctx}: leftover {leftover:?}"));
                     }
                     return Ok(());
@@ -349,8 +411,11 @@ async fn smuggling_corpus() {
                     seen_codes.insert(c.trim().to_owned());
                 }
             }
-            if let Err(msg) = run_case(&case).await {
+            if let Err(msg) = run_case(&case, false).await {
                 let _ = writeln!(failures, "{}/{}: {msg}", case.file, case.name);
+            }
+            if let Err(msg) = run_case(&case, true).await {
+                let _ = writeln!(failures, "{}/{} (byte at a time): {msg}", case.file, case.name);
             }
         }
     }

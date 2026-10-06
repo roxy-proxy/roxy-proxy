@@ -200,3 +200,32 @@ Host: example.com\r\n
 Content-Length: 10\r\n
 \r\n
 helloworld
+
+=== zero_chunk_then_pipelined
+expect: request POST http://example.com:80/one body=
+expect: request GET http://example.com:80/two
+expect: eof
+---
+POST http://example.com/one HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+0\r\n\r\n
+GET http://example.com/two HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== chunk_extension_on_last_chunk_allowed
+flags: allow_chunk_extensions
+expect: request POST http://example.com:80/one body=hello
+expect: request GET http://example.com:80/two
+expect: eof
+---
+POST http://example.com/one HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+\r\n
+5\r\nhello\r\n0;x=y\r\n\r\n
+GET http://example.com/two HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n

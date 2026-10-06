@@ -426,3 +426,35 @@ Content-Length: 5\r\n
 Expect: 100-Continue\r\n
 \r\n
 hello
+
+=== connection_content_length_keeps_framing
+# Nominating content-length as hop-by-hop drops the field from the
+# forwarded head but not from the framing: the body stays a body.
+expect: request POST http://example.com:80/one body=hello
+expect: request GET http://example.com:80/two
+expect: eof
+---
+POST http://example.com/one HTTP/1.1\r\n
+Host: example.com\r\n
+Content-Length: 5\r\n
+Connection: content-length\r\n
+\r\n
+hello
+GET http://example.com/two HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== expect_100_continue_chunked_then_pipelined
+expect: request POST http://example.com:80/one body=hello nohdr:expect
+expect: request GET http://example.com:80/two
+expect: eof
+---
+POST http://example.com/one HTTP/1.1\r\n
+Host: example.com\r\n
+Transfer-Encoding: chunked\r\n
+Expect: 100-continue\r\n
+\r\n
+5\r\nhello\r\n0\r\n\r\n
+GET http://example.com/two HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
