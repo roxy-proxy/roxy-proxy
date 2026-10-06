@@ -18,6 +18,7 @@
 //!     config: { cache_ttl_secs: 30 }
 //! ```
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use roxy_addon::prelude::*;
@@ -116,7 +117,6 @@ fn validated(user: String) -> String {
 /// credential itself.
 fn cache_key(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
-    use std::fmt::Write as _;
     digest.iter().fold(String::with_capacity(64), |mut hex, b| {
         let _ = write!(hex, "{b:02x}");
         hex
