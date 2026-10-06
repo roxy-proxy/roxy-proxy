@@ -535,11 +535,7 @@ impl PolicyBase {
     }
 
     fn redactor(&self) -> Redactor {
-        let mut r = Redactor::new();
-        for v in self.secrets.values() {
-            r.add_secret(v.clone());
-        }
-        r
+        Redactor::new()
     }
 }
 

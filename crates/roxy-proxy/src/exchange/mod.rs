@@ -633,7 +633,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
         ResponseVerdict::Continue(mut res) => {
             let mut down_tap = down_tap;
             if let Some(t) = down_tap.as_mut() {
-                t.response_head(&res, &cx.snap.redactor);
+                t.response_head(&res, &cx.snap.secrets.redactor());
             }
             if let Some((upstream, key)) = upgrade {
                 // The relay takes the taps after the `101`.
@@ -672,7 +672,7 @@ async fn upgrade_upstream(
     }
     // The upgrade request is captured as it leaves, like any other.
     if let Some(t) = up_tap {
-        t.request_head(&req, &cx.snap.redactor);
+        t.request_head(&req, &cx.snap.secrets.redactor());
     }
     let scheme = req.scheme;
     let authority = req.authority.clone();
@@ -740,7 +740,7 @@ async fn plain_upstream<F: Front>(
     // as forwarded nor handed to the upstream.
     let mut up_tap = up_tap;
     if let Some(t) = up_tap.as_mut() {
-        t.request_head(&req, &cx.snap.redactor);
+        t.request_head(&req, &cx.snap.secrets.redactor());
     }
     let body = watched(
         std::mem::take(&mut req.body),

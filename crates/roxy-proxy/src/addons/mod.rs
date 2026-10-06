@@ -733,7 +733,12 @@ pub(crate) fn emit_stack_error(st: &StackFlow, layer: &str, e: &StackError, mode
         layer: layer.to_owned(),
         mode: mode.as_str().to_owned(),
         kind: error_kind(e),
-        message: st.snap.redactor.redact_str(&e.to_string()).into_owned(),
+        message: st
+            .snap
+            .secrets
+            .redactor()
+            .redact_str(&e.to_string())
+            .into_owned(),
     });
 }
 

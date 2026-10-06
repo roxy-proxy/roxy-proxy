@@ -98,9 +98,12 @@ pub struct PolicyUpdate {
     /// The lease's end: from this instant every exchange is denied with
     /// `_expired` until a reload replaces the snapshot. `None` = no expiry.
     pub valid_until: Option<DateTime<Utc>>,
-    /// Resolved secret values by name, for `${secret:name}`.
+    /// Resolved secret values by name, for `${secret:name}`. Installed in
+    /// the server's [`crate::secrets::SecretStore`], which a
+    /// [`crate::ServerHandle::swap_secrets`] replaces without a reload.
     pub secrets: HashMap<String, String>,
-    /// Scrubs secrets and sensitive headers from the flow log.
+    /// The header names never logged. The secret values are added when
+    /// the store builds the redactor exchanges use.
     pub redactor: Redactor,
     pub limits: Limits,
     pub flags: HttpFlags,

@@ -46,9 +46,6 @@ fn validate_at(config: &Config, path: &Path) -> Result<Compiled, Vec<String>> {
 pub fn policy_update(config: &Config, policy: Policy) -> anyhow::Result<PolicyUpdate> {
     let secrets = Secrets::resolve(&config.secrets)?;
     let mut redactor = Redactor::new();
-    for value in secrets.values() {
-        redactor.add_secret(value.expose());
-    }
     for header in &config.log.redact_headers {
         redactor.add_header(header);
     }
