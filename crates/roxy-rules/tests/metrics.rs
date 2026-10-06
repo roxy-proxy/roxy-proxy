@@ -349,6 +349,55 @@ fn full_table_reclaims_on_demand() {
     assert_eq!(s.get("w", &client(2)), Ok(1));
 }
 
+/// A metric's own `max_keys` is a second bound beside the table's: filling
+/// it refuses that metric's new series only, the slot comes back when a
+/// series expires, and carried series count towards it.
+#[test]
+fn per_metric_cap_does_not_starve_other_metrics() {
+    let c = TestClock::new();
+    let defs = "- { id: a, count: requests, key: [client.ip], window: 1m, max_keys: 2 }
+- { id: b, count: requests, key: [client.ip], window: 1m }";
+    let s = store_with(defs, 10, &c);
+    rec(&s, &client(1));
+    rec(&s, &client(2));
+    assert_eq!(
+        s.record(&client(3), &REQ),
+        Err(MetricError::TableFull { metric: "a".into() })
+    );
+    // `b` had the same flow and admitted it: the refusal is `a`'s alone.
+    assert_eq!(s.get("b", &client(3)), Ok(1));
+    assert_eq!(s.get("a", &client(3)), Ok(0));
+    assert_eq!(s.key_count(), 5);
+    for n in 4..=8 {
+        s.record(&client(n), &REQ).unwrap_err();
+        assert_eq!(s.get("b", &client(n)), Ok(1));
+    }
+    // The table's bound still holds across both metrics.
+    assert_eq!(s.key_count(), 10);
+    s.record(&client(9), &REQ).unwrap_err();
+    assert_eq!(s.get("b", &client(9)), Ok(0));
+
+    // Expired series free their slot in the metric as well as the table.
+    c.advance(Duration::from_secs(62));
+    assert_eq!(s.reclaim(), 10);
+    rec(&s, &client(20));
+    rec(&s, &client(21));
+    assert_eq!(s.get("a", &client(21)), Ok(1));
+    assert_eq!(
+        s.record(&client(22), &REQ),
+        Err(MetricError::TableFull { metric: "a".into() })
+    );
+
+    // Carried series occupy the metric's slots too.
+    let next = store_with(defs, 10, &c);
+    assert_eq!(next.carry_over(&s).carried, 5);
+    assert_eq!(
+        next.record(&client(23), &REQ),
+        Err(MetricError::TableFull { metric: "a".into() })
+    );
+    assert_eq!(next.get("b", &client(23)), Ok(1));
+}
+
 #[test]
 fn null_key_guarded_by_where_skips_the_flow() {
     let c = TestClock::new();

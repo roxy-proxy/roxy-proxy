@@ -314,6 +314,23 @@ fn max_metric_bytes_out_of_range_diagnosed() {
     }
 }
 
+#[test]
+fn metric_max_keys_is_bounded_by_the_shared_limit() {
+    let metrics = |n: usize| {
+        format!(
+            "{BASE}limits: {{ max_metric_keys: 10 }}\nmetrics: [{{ id: a, count: requests, key: [client.ip], max_keys: {n} }}]\n"
+        )
+    };
+    parse(&metrics(10)).validate().unwrap();
+    let d = diagnostics(&metrics(11));
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].path, "metrics[0].max_keys");
+    assert_eq!(d[0].message, "must not exceed limits.max_metric_keys (10)");
+    let d = diagnostics(&metrics(0));
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].to_string(), "metrics[0].max_keys: must be at least 1");
+}
+
 /// A zero limit is a config error, not a way to switch something off: it
 /// would refuse every request, hold no connection or fail every metric
 /// and state rule closed.

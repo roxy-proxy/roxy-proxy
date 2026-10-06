@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 
 use common::{METRICS, try_compile};
 use proptest::prelude::*;
+use roxy_rules::Policy;
 
 /// (title, metrics yaml, rules yaml)
 const CASES: &[(&str, &str, &str)] = &[
@@ -221,7 +222,7 @@ const CASES: &[(&str, &str, &str)] = &[
     ),
     (
         "bad metrics",
-        "- { id: bad-id, count: requests, key: [client.nope], window: 0s }\n- { id: r, count: response_bytes, where: 'dst.port == 1' }\n- { id: u, count: unique(nope) }\n- { id: w, count: errors, where: 'response.status >= 500', key: [body.bytes] }\n- { id: v, count: unique(response.status) }",
+        "- { id: bad-id, count: requests, key: [client.nope], window: 0s, max_keys: 0 }\n- { id: r, count: response_bytes, where: 'dst.port == 1' }\n- { id: u, count: unique(nope) }\n- { id: w, count: errors, where: 'response.status >= 500', key: [body.bytes] }\n- { id: v, count: unique(response.status) }",
         "[]",
     ),
 ];
@@ -240,6 +241,31 @@ fn diagnostics_golden() {
         out.push('\n');
     }
     insta::assert_snapshot!("diagnostics_golden", out);
+}
+
+/// `roxy check` advice, not a compile error: a metric keyed on a field the
+/// client picks freely needs a `where` to bound its series.
+#[test]
+fn client_chosen_key_without_where_warns() {
+    let metrics: Vec<roxy_rules::MetricConfig> = serde_yaml_ng::from_str(
+        "- { id: a, count: requests, key: [host] }
+- { id: b, count: requests, key: [client.ip, path] }
+- { id: c, count: unique(url) }
+- { id: d, count: requests, key: [path], where: 'host under \"example.com\"' }
+- { id: e, count: unique(query.raw), where: 'query.raw != null' }",
+    )
+    .unwrap();
+    let warnings: Vec<String> = Policy::metric_warnings(&metrics)
+        .iter()
+        .map(|d| format!("{}: {}", d.path, d.message.split(',').next().unwrap()))
+        .collect();
+    assert_eq!(
+        warnings,
+        [
+            "metrics[1].key[1]: `path` is chosen by the client",
+            "metrics[2].count: `url` is chosen by the client",
+        ]
+    );
 }
 
 proptest! {

@@ -179,6 +179,7 @@ metrics[3].key[0]: `tls.alpn` can be null, and a null key field denies the flow;
 == bad metrics
 metrics[0].id: invalid metric id "bad-id": must match [A-Za-z_][A-Za-z0-9_]* so it can be used as metric.<id>
 metrics[0].window: window must be greater than zero
+metrics[0].max_keys: must be at least 1
 metrics[0].key[0]: unknown key field `client.nope`; metric fields must be scalar fields such as client.ip, host, tls.sni
 metrics[1].where:1:1: unknown field `dst.port`
     | dst.port == 1

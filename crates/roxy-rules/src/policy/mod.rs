@@ -40,6 +40,8 @@ pub struct MetricDef {
     /// Series key fields; empty = one global series.
     pub key: Vec<Field>,
     pub window: Option<Duration>,
+    /// Series this metric alone may hold; `None` = the store's shared limit.
+    pub max_keys: Option<usize>,
     filter: Option<Pred>,
 }
 
@@ -269,6 +271,13 @@ impl Policy {
             default_id: RuleId::new(RuleId::DEFAULT),
             fail_closed_id: RuleId::new(RuleId::FAIL_CLOSED),
         })
+    }
+
+    /// Problems worth reporting that do not stop `metrics` compiling, for
+    /// `roxy check`: a key or `unique()` field the client chooses freely
+    /// (`path`, `url`, `query.raw`) on a metric with no `where`.
+    pub fn metric_warnings(metrics: &[MetricConfig]) -> Vec<Diagnostic> {
+        compiler::PolicyCompiler::metric_warnings(metrics)
     }
 
     /// Whether any rule or metric filter reads `body.text`.

@@ -11,7 +11,9 @@ fail every metric and state rule closed: `max_headers`, `max_header_bytes`,
 `max_url_bytes`, `max_connections`, `max_connections_per_client`,
 `h2_max_concurrent_streams`, `h2_max_header_list_bytes`, `max_metric_keys`,
 `max_metric_bytes`, `max_state_entries`, `max_observer_lag_bytes` and
-`max_address_list_bytes`. The body, message and capture caps and the
+`max_address_list_bytes`. A metric's own `max_keys` is refused at zero the
+same way, and may not exceed `limits.max_metric_keys` ([rate
+limits](/policies/rate-limits#key-cardinality)). The body, message and capture caps and the
 timeouts accept zero, and mean it. The two body idle timeouts bound
 different ends of an exchange: `body_idle_timeout` (30 s) is how long the
 client may stall, sending its request body or taking the response;

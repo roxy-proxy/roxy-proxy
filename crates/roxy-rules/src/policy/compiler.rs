@@ -177,6 +177,47 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         }
     }
 
+    /// Advice that does not stop a policy compiling: a metric keyed on a
+    /// field the client chooses freely (`path`, `url`, `query.raw`) holds as
+    /// many series as the client cares to send unless a `where` bounds it.
+    pub(super) fn metric_warnings(metrics: &[MetricConfig]) -> Vec<Diagnostic> {
+        let unbounded = |name: &str| {
+            Field::from_name(name)
+                .is_some_and(|f| matches!(f, Field::Path | Field::Url | Field::QueryRaw))
+        };
+        let mut out = Vec::new();
+        for (i, m) in metrics.iter().enumerate() {
+            if m.where_.is_some() {
+                continue;
+            }
+            let keys = m
+                .key
+                .iter()
+                .enumerate()
+                .map(|(j, k)| (format!("metrics[{i}].key[{j}]"), k.as_str()));
+            let unique = match &m.count {
+                MetricCount::Unique(f) => Some((format!("metrics[{i}].count"), f.as_str())),
+                MetricCount::Requests
+                | MetricCount::RequestBytes
+                | MetricCount::ResponseBytes
+                | MetricCount::Errors
+                | MetricCount::Denied => None,
+            };
+            for (at, name) in keys.chain(unique).filter(|(_, n)| unbounded(n)) {
+                out.push(Diagnostic::new(
+                    at,
+                    format!(
+                        "`{name}` is chosen by the client, so without a `where` this metric \
+                         holds one series per value the client sends, up to its `max_keys`; \
+                         bound it (`where: host under \"example.com\"`) or lower `max_keys` \
+                         (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#key-cardinality)"
+                    ),
+                ));
+            }
+        }
+        out
+    }
+
     pub(super) fn metrics(&mut self) -> Vec<MetricDef> {
         let mut ids: HashMap<&str, usize> = HashMap::new();
         let input = self.input;
@@ -220,6 +261,9 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 "window must be greater than zero",
             );
         }
+        if m.max_keys == Some(0) {
+            self.push(None, format!("{path}.max_keys"), "must be at least 1");
+        }
         let filter = m
             .where_
             .as_ref()
@@ -255,6 +299,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             unique,
             key,
             window: m.window,
+            max_keys: m.max_keys,
             filter,
         }
     }
