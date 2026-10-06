@@ -123,10 +123,7 @@ async fn h1_encoder_drops_trailers_without_a_trailer_header() {
     )
     .unwrap();
     let wire = capture(req).await;
-    assert!(
-        wire.ends_with("\r\n\r\n3\r\nabc\r\n0\r\n\r\n"),
-        "{wire:?}"
-    );
+    assert!(wire.ends_with("\r\n\r\n3\r\nabc\r\n0\r\n\r\n"), "{wire:?}");
     assert!(!wire.contains("x-checksum"), "{wire:?}");
 }
 

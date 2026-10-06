@@ -117,7 +117,8 @@ impl http_body::Body for TrailersGate {
         match &r {
             Poll::Ready(Some(Ok(f))) if f.is_trailers() && (self.may_be_h1)() => {
                 self.done = true;
-                let e = ParseError::new(Reason::Trailers, "request trailers need an HTTP/2 upstream");
+                let e =
+                    ParseError::new(Reason::Trailers, "request trailers need an HTTP/2 upstream");
                 return Poll::Ready(Some(Err(BodyError::Invalid(e))));
             }
             Poll::Ready(None | Some(Err(_))) => self.done = true,

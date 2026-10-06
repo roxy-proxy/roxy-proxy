@@ -308,7 +308,9 @@ fn trailered(target: &str) -> Vec<u8> {
 /// An HTTP/1.1 client inside a `CONNECT up.test:443` tunnel.
 async fn h1_in_tunnel(kit: &Kit) -> tokio_rustls::client::TlsStream<tokio::io::DuplexStream> {
     let io = kit.connect_tunnel("up.test", 443).await;
-    kit.tls_connect(io, "up.test", &[b"http/1.1"]).await.unwrap()
+    kit.tls_connect(io, "up.test", &[b"http/1.1"])
+        .await
+        .unwrap()
 }
 
 /// With `http.allow_trailers`, the trailers of a chunked request reach an
@@ -348,10 +350,7 @@ where
     assert_eq!(ev[0]["reason"], "trailers", "{ev:#?}");
     kit.upstream.wait_open(0).await;
     let seen = kit.upstream.seen();
-    assert!(
-        seen.iter().all(|s| s.complete != Some(true)),
-        "{seen:#?}"
-    );
+    assert!(seen.iter().all(|s| s.complete != Some(true)), "{seen:#?}");
 }
 
 #[tokio::test]
