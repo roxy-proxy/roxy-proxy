@@ -23,6 +23,9 @@ use crate::pipeline::{FlowCx, PerDir, Refusal};
 use crate::view::host_text;
 use crate::watch::{Dir, Watch};
 
+/// Finishes an allowed upgrade: checks the upstream's `101`, writes it to
+/// the client and relays until the WebSocket ends. The connection is spent
+/// either way.
 pub(super) async fn splice_websocket(
     conn: ServerConn<ClientIo>,
     mut cx: FlowCx,
