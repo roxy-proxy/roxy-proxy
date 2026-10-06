@@ -98,7 +98,11 @@ either way       {"type":"credit","dir":"request"|"response","bytes":n}  flow co
 ```
 
 `url` is absolute and `headers` are end-to-end fields as a WASM layer sees
-them (no hop-by-hop or framing fields). Heads carry `content-length` when
+them (no hop-by-hop or framing fields). A header value is a byte string:
+each byte is the code point of the same value (ISO-8859-1), so a value
+with obs-text bytes (`http.allow_obs_text`) reads as Latin-1 and goes back
+as the same bytes. A value the service sends with a code point above
+U+00FF is a protocol violation. Heads carry `content-length` when
 the length is known; a `content-length` the service sends back is enforced,
 and more or fewer bytes than declared is a protocol violation.
 
