@@ -1,6 +1,7 @@
 //! The policy as a lease: `valid_until` on the snapshot, `_expired` denies
 //! past it, one `policy_expired` event per snapshot, recovery by reload.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
@@ -65,6 +66,36 @@ async fn an_expired_lease_denies_until_a_reload_moves_it() {
     let a = kit.h1().await.call("GET", "/x", &[], b"").await;
     assert_eq!(a.status, 403, "{a:?}");
     assert_eq!(kit.events("policy_expired", 2).await.len(), 2);
+}
+
+/// Extending the lease moves `valid_until` on the running snapshot: no
+/// rebuild, so the snapshot and its upstream pools are the same objects
+/// before and after, and an expired policy recovers at the next request.
+/// Once extended, running out again is a new `policy_expired` event.
+#[tokio::test]
+async fn extending_the_lease_does_not_rebuild_the_snapshot() {
+    let kit = Kit::builder().valid_until(past()).start().await;
+    let before = kit.server.shared().snapshot();
+    let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+    assert_eq!(a.status, 403, "{a:?}");
+    assert_eq!(kit.events("policy_expired", 1).await.len(), 1);
+
+    kit.server.handle().extend_valid_until(future());
+    let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let after = kit.server.shared().snapshot();
+    assert!(
+        Arc::ptr_eq(&before, &after),
+        "an extension must not rebuild"
+    );
+    assert!(Arc::ptr_eq(&before.upstream, &after.upstream));
+
+    kit.server.handle().extend_valid_until(past());
+    let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+    assert_eq!(a.status, 403, "{a:?}");
+    assert_eq!(a.headers["x-roxy-rule"], "_expired");
+    assert_eq!(kit.events("policy_expired", 2).await.len(), 2);
+    assert!(Arc::ptr_eq(&before, &kit.server.shared().snapshot()));
 }
 
 /// The lease is checked above the addon stack: an expired policy denies

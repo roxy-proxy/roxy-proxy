@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use chrono::{DateTime, Utc};
 use roxy_http::{HttpFlags, Limits, ParseError};
 use roxy_rules::Policy;
@@ -32,10 +32,11 @@ use crate::upstream::Upstream;
 /// `Arc` at its start and finishes under that snapshot.
 pub(crate) struct Snapshot {
     pub policy: Policy,
-    /// The lease's end; `None` = no expiry. See [`Shared::expired`].
-    pub valid_until: Option<DateTime<Utc>>,
+    /// The lease's end; `None` = no expiry. Read live by [`Shared::expired`]
+    /// and moved by [`ServerHandle::extend_valid_until`] without a rebuild.
+    valid_until: ArcSwapOption<DateTime<Utc>>,
     /// Set when the snapshot was first seen expired, so `policy_expired`
-    /// is logged once per snapshot.
+    /// is logged once per expiry; cleared when the expiry moves later.
     expired_logged: AtomicBool,
     /// A stand-in from startup, not a policy anyone applied: `/readyz`
     /// says `no_policy` until a reload replaces it. See
@@ -160,10 +161,10 @@ impl Shared {
 
     /// Whether `snap`'s lease has run out. Checked against the wall clock
     /// on every exchange and WebSocket message, since `valid_until` is an
-    /// absolute instant and a reload is the only way back. The first check
-    /// that finds a snapshot expired logs `policy_expired`.
+    /// absolute instant and only a reload or an extension brings it back.
+    /// The first check that finds the lease expired logs `policy_expired`.
     pub(crate) fn expired(&self, snap: &Snapshot) -> bool {
-        let Some(until) = snap.valid_until else {
+        let Some(until) = snap.valid_until.load().as_deref().copied() else {
             return false;
         };
         let now = Utc::now();
@@ -276,7 +277,7 @@ fn build_snapshot(
     let upstream = Upstream::new(&settings, tls)?;
     Ok(Snapshot {
         policy: u.policy,
-        valid_until: u.valid_until,
+        valid_until: ArcSwapOption::from_pointee(u.valid_until),
         expired_logged: AtomicBool::new(false),
         placeholder: false,
         secrets: secrets.clone(),
@@ -369,6 +370,18 @@ impl ServerHandle {
         Ok(())
     }
 
+    /// Moves the current policy's `valid_until` to `until` without a
+    /// rebuild: the snapshot, its upstream pools and the addon stack stay
+    /// as they are. An extension past an expiry already logged lets the
+    /// next expiry log `policy_expired` again.
+    pub fn extend_valid_until(&self, until: DateTime<Utc>) {
+        let snap = self.shared.snapshot();
+        let old = snap.valid_until.swap(Some(Arc::new(until)));
+        if old.is_none_or(|old| *old < until) {
+            snap.expired_logged.store(false, Ordering::Release);
+        }
+    }
+
     /// Replaces the secret map without touching the policy: the rules,
     /// addons and upstream pools stay as they are and no event is logged.
     /// `secrets` is the whole map, by the names the config declares under
@@ -380,6 +393,13 @@ impl ServerHandle {
     pub fn swap_secrets(&self, secrets: HashMap<String, String>) {
         tracing::info!(secrets = secrets.len(), "secrets swapped");
         self.shared.secrets.swap(secrets);
+    }
+
+    /// Identifies the current snapshot: two calls return the same value
+    /// only if no reload swapped it between them. For tests of the paths
+    /// that must not rebuild.
+    pub fn snapshot_id(&self) -> usize {
+        Arc::as_ptr(&self.shared.snapshot()) as usize
     }
 
     /// The flow sink.

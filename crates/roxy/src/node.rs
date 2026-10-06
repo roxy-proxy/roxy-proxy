@@ -143,6 +143,8 @@ impl FlowSink for ShipSink {
 /// The policy the node runs.
 struct RunningPolicy {
     config: Config,
+    /// `config` compiled, for the metric store.
+    policy: Policy,
     secrets: HashMap<String, String>,
     valid_until: Option<DateTime<Utc>>,
     /// A lease has been applied: the bootstrap listeners are gone.
@@ -375,11 +377,14 @@ impl NodeHandler {
         let valid_until = received_at
             .checked_add_signed(chrono::Duration::seconds(valid_for))
             .ok_or_else(|| "valid_for_seconds out of range".to_owned())?;
-        let mut config = parse_lease_config(&lease.config, &self.state_dir)?;
         let mut run = self.running.lock().await;
         if run.revoked {
             return Err("node is revoked".into());
         }
+        if run.leased && !change.config {
+            return self.renew_lease(&mut run, lease, valid_until, change).await;
+        }
+        let mut config = parse_lease_config(&lease.config, &self.state_dir)?;
         // The first lease replaces the bootstrap listeners outright; after
         // that, restart-only settings keep their running values, as on a
         // file reload.
@@ -409,11 +414,15 @@ impl NodeHandler {
             } else {
                 self.metrics.install(&policy, config.limits.metric_limits());
             }
-            let server = self
-                .start_server(&config, update, false)
-                .await
-                .map_err(|e| format!("starting the listeners for the lease: {e:#}"))?;
-            *self.server.lock().await = Some(server);
+            match self.start_server(&config, update, false).await {
+                Ok(server) => *self.server.lock().await = Some(server),
+                Err(e) => {
+                    let e = format!("starting the listeners for the lease: {e:#}");
+                    tracing::error!(lease_id = %lease.lease_id, error = %e, "lease refused");
+                    self.reopen_bootstrap(&run).await;
+                    return Err(e);
+                }
+            }
         } else {
             self.swap(&config, &policy, update, prepared, change.state_epoch)
                 .await?;
@@ -427,6 +436,7 @@ impl NodeHandler {
         );
         *run = RunningPolicy {
             config,
+            policy,
             secrets,
             valid_until: Some(valid_until),
             leased: true,
@@ -434,6 +444,70 @@ impl NodeHandler {
         };
         self.summarise(&run);
         Ok(())
+    }
+
+    /// A lease whose config is the one running: the lease moves forward
+    /// on the live snapshot, the secret map is swapped if it changed and a
+    /// new epoch clears state and metrics. Nothing is rebuilt, so the
+    /// upstream pools and addon stack carry on.
+    async fn renew_lease(
+        &self,
+        run: &mut RunningPolicy,
+        lease: &Lease,
+        valid_until: DateTime<Utc>,
+        change: Change,
+    ) -> Result<(), String> {
+        let secrets = change
+            .secrets
+            .then(|| resolve_secrets(&run.config, lease))
+            .transpose()?;
+        let server = self.server.lock().await;
+        let handle = server
+            .as_ref()
+            .ok_or_else(|| "server is not running".to_owned())?
+            .handle();
+        if change.state_epoch {
+            lock(&self.state).clear();
+            self.metrics
+                .reset(&run.policy, run.config.limits.metric_limits());
+        }
+        if let Some(secrets) = secrets {
+            handle.swap_secrets(secrets.clone());
+            run.secrets = secrets;
+        }
+        handle.extend_valid_until(valid_until);
+        drop(server);
+        tracing::debug!(
+            lease_id = %lease.lease_id,
+            valid_until = %valid_until.to_rfc3339(),
+            secrets = change.secrets,
+            state_epoch = change.state_epoch,
+            "lease renewed"
+        );
+        run.valid_until = Some(valid_until);
+        self.summarise(run);
+        Ok(())
+    }
+
+    /// Puts the bootstrap listeners back when the first lease's server
+    /// failed to start after they were shut down, so `/healthz` stays up
+    /// and `/readyz` keeps reporting `no_policy` until a lease applies.
+    async fn reopen_bootstrap(&self, run: &RunningPolicy) {
+        let limits = run.config.limits.metric_limits();
+        let result = async {
+            let update =
+                policy_update_with_secrets(&run.config, run.policy.clone(), HashMap::new())?;
+            self.metrics.install(&run.policy, limits);
+            self.start_server(&run.config, update, true).await
+        }
+        .await;
+        match result {
+            Ok(server) => *self.server.lock().await = Some(server),
+            Err(e) => tracing::error!(
+                error = format!("{e:#}"),
+                "could not reopen the bootstrap listeners; nothing listens until a restart"
+            ),
+        }
     }
 
     /// The empty policy, already expired: the running config with no rules
@@ -686,6 +760,7 @@ pub async fn start(opts: NodeOptions) -> anyhow::Result<NodeRunning> {
         server: tokio::sync::Mutex::new(None),
         running: tokio::sync::Mutex::new(RunningPolicy {
             config: config.clone(),
+            policy: compiled.policy.clone(),
             secrets: HashMap::new(),
             valid_until: None,
             leased: false,

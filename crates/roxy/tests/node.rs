@@ -518,3 +518,102 @@ async fn a_lease_the_node_cannot_apply_is_refused_and_the_old_one_stays() {
     assert_eq!(h.get(proxy, "/still").await.0, 200);
     h.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn renewals_and_secret_rotations_do_not_rebuild_the_policy() {
+    let mut h = NodeHarness::start().await;
+    let config = h.config(
+        0,
+        &rule(
+            "up",
+            "host == \"upstream.test\"",
+            "[{ set_header: { x-lease: \"${secret:lease_token}\" } }, { allow: { private_ok: true } }]",
+        ),
+        "",
+    );
+    // A short lease, polled every 50ms (time_scale) with the same reply:
+    // every poll re-applies it with nothing changed.
+    let mut l1 = NodeHarness::lease("L1", &config, "s1", "e1");
+    l1.valid_for_seconds = 1;
+    h.mock.fallback(LEASE, Reply::json(200, &l1));
+    h.run(true).await;
+    h.wait_applied("L1").await;
+    let proxy = h.proxy_addr().await;
+    let handle = h.running().handler.handle().await.unwrap();
+    let snapshot = handle.snapshot_id();
+    assert_eq!(h.get(proxy, "/a").await, (200, None));
+
+    // Well past the first lease's end: the renewals moved valid_until
+    // without touching the snapshot.
+    let fetches = h.mock.requests_to(LEASE).len();
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    assert!(h.mock.requests_to(LEASE).len() >= fetches + 3);
+    assert_eq!(h.get(proxy, "/b").await, (200, None));
+    assert_eq!(h.readyz().await, (200, "ready".to_owned()));
+    assert_eq!(
+        handle.snapshot_id(),
+        snapshot,
+        "a renewal rebuilt the snapshot"
+    );
+
+    // Secrets only: the next request carries the new value, same snapshot.
+    let mut l2 = NodeHarness::lease("L2", &config, "s2", "e1");
+    l2.valid_for_seconds = 1;
+    h.mock.fallback(LEASE, Reply::json(200, &l2));
+    h.wait_applied("L2").await;
+    assert_eq!(h.get(proxy, "/c").await, (200, None));
+    let seen = h.upstream.seen();
+    assert_eq!(seen[1].header("x-lease"), Some("s1"));
+    assert_eq!(seen[2].header("x-lease"), Some("s2"));
+    assert_eq!(
+        handle.snapshot_id(),
+        snapshot,
+        "a secret swap rebuilt the snapshot"
+    );
+
+    // A config change is what rebuilds.
+    let config2 = format!("{config}# v2\n");
+    h.mock.fallback(
+        LEASE,
+        Reply::json(200, &NodeHarness::lease("L3", &config2, "s2", "e1")),
+    );
+    h.wait_applied("L3").await;
+    assert_ne!(handle.snapshot_id(), snapshot);
+    assert_eq!(h.get(proxy, "/d").await, (200, None));
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_lease_whose_listeners_cannot_bind_leaves_the_bootstrap_listeners_up() {
+    let mut h = NodeHarness::start().await;
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = held.local_addr().unwrap().port();
+    let up = rule("up", "host == \"upstream.test\"", ALLOW);
+    let unbindable = NodeHarness::lease("L1", &h.config(taken, &up, ""), "s1", "e1");
+    h.mock.push(LEASE, Reply::json(200, &unbindable));
+    let l2 = NodeHarness::lease("L2", &h.config(0, &up, ""), "s1", "e1");
+    h.mock.push(
+        LEASE,
+        Reply::Delayed(Duration::from_millis(800), Box::new(Reply::json(200, &l2))),
+    );
+    h.mock.fallback(LEASE, Reply::json(200, &l2));
+    h.run(true).await;
+
+    // The second fetch happens once L1 has been refused.
+    h.mock.wait_for(LEASE, 2).await;
+    let refetch = h.mock.requests_to(LEASE)[1].node_state();
+    assert_eq!(refetch.lease_id, None);
+    assert_eq!(refetch.policy_state, PolicyState::None);
+    assert_eq!(h.readyz().await, (503, "no_policy".to_owned()));
+    let proxy = h.proxy_addr().await;
+    assert_ne!(proxy.port(), taken);
+    assert_eq!(h.get(proxy, "/early").await, (403, Some("_default".into())));
+    assert!(h.upstream.seen().is_empty());
+
+    // A lease that can bind still replaces them.
+    h.wait_applied("L2").await;
+    drop(held);
+    assert_eq!(h.readyz().await, (200, "ready".to_owned()));
+    assert_eq!(h.get(h.proxy_addr().await, "/late").await, (200, None));
+    h.stop().await;
+}
