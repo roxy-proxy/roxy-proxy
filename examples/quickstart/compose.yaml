@@ -1,9 +1,10 @@
-# roxy quickstart: a chat client behind roxy, with an auth gate, a per-user
-# token quota and an inspect_sentinel sidecar, talking to a scripted model.
-# Nothing here needs an API key or a route out.
+# roxy quickstart: clients behind roxy, with an auth gate, a per-user token
+# quota and an inspect_sentinel sidecar, talking to a scripted model.
+# Nothing here needs an API key or a route out, and nothing survives
+# `docker compose down`.
 #
 #   docker compose up -d --build --wait
-#   docker compose run --rm client --user alice --repeat 6
+#   docker compose logs -f traffic
 #
 # Quota board: http://127.0.0.1:8090    Inspect View: http://127.0.0.1:7575
 # The proxy is on 127.0.0.1:3128 for a client of your own (see README.md).
@@ -40,7 +41,9 @@ services:
       MODEL_API_KEY: fake-model-key        # the secret roxy injects; the client never has it
     volumes:
       - ./roxy.yaml:/etc/roxy/roxy.yaml:ro
-      - roxy-ca:/var/lib/roxy/ca           # keep the CA across restarts
+      # The CA is unused here (the model is plain HTTP); a fresh one each
+      # start rather than a volume. Writable by roxy's non-root user.
+      - { type: tmpfs, target: /var/lib/roxy/ca, tmpfs: { mode: 0o1777 } }
     ports:
       - "127.0.0.1:3128:3128"              # the proxy
       - "127.0.0.1:3130:3130"              # the CA certificate
@@ -80,20 +83,30 @@ services:
       - "127.0.0.1:8090:8090"
     networks: [lab, viewer]
 
-  # The chat client: `docker compose run --rm client --user alice --repeat 6`.
-  # Not started by `up`; it goes through roxy like any client would.
+  # The traffic: calls for alice, bob and mallory on their own cadences, for
+  # ever. `docker compose logs -f traffic` to watch.
+  traffic:
+    <<: *mock
+    command: ["python", "traffic.py"]
+    environment:
+      HTTP_PROXY: http://roxy:3128
+      ANTHROPIC_BASE_URL: http://fake-model:8080
+      TRAFFIC_SCHEDULE: ${TRAFFIC_SCHEDULE:-alice=alice-secret@6,bob=bob-secret@20,mallory=wrong@30}
+    healthcheck: { disable: true }
+    networks: [lab]
+    depends_on:
+      roxy: { condition: service_healthy }
+
+  # A call of your own: `docker compose run --rm client --user bob`. It
+  # starts nothing else, so running it never restarts the stack.
   client:
     image: roxy-quickstart-mocks
-    build: ./mocks
-    pull_policy: build
     entrypoint: ["python", "chat.py"]
     environment:
       HTTP_PROXY: http://roxy:3128
       ANTHROPIC_BASE_URL: http://fake-model:8080
     networks: [lab]
     profiles: [client]
-    depends_on:
-      roxy: { condition: service_started }
 
   # The sentinel sidecar (./sentinel): a regex denylist over tool calls.
   # It needs no route out, so it has none.
@@ -105,6 +118,9 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     tmpfs: [/tmp]
+    # Starts with an empty log: the volume only exists to share it with
+    # Inspect View, not to keep it.
+    command: ["sh", "-c", "rm -rf /logs/* && exec python sidecar.py"]
     environment:
       SENTINEL: policies:deny_regex
       SENTINEL_DENY:                       # your regex, from the shell; unset = the default
@@ -156,5 +172,4 @@ networks:
   viewer: {}
 
 volumes:
-  roxy-ca: {}
   sentinel-logs: {}

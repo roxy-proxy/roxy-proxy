@@ -1,6 +1,6 @@
 ---
 title: "Quickstart"
-description: "Run a chat client through roxy with an auth gate, a per-user token quota and an inspect_sentinel sidecar, against a scripted model."
+description: "Watch generated traffic go through roxy with an auth gate, a per-user token quota and an inspect_sentinel sidecar, against a scripted model."
 ---
 
 import inspectView from "../assets/quickstart-inspect-view.png";
@@ -8,7 +8,7 @@ import stack from "../assets/quickstart-stack.svg";
 
 # Quickstart
 
-Run a chat client through roxy with three controls on every model call: a WASM addon that authenticates the client with a central auth service, a WASM addon that holds each user to a token quota kept by a quota service, and an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar that blocks tool calls matching a denylist. The model is a scripted stand-in, so the stack needs no API key and no route out. The setup is [`examples/quickstart`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/quickstart) in the roxy repo.
+Run clients through roxy with three controls on every model call: a WASM addon that authenticates the client with a central auth service, a WASM addon that holds each user to a token quota kept by a quota service, and an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar that blocks tool calls matching a denylist. The model is a scripted stand-in and the traffic is generated, so the stack needs no API key and no route out: start it and watch. The setup is [`examples/quickstart`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/quickstart) in the roxy repo.
 
 ## Prerequisites
 
@@ -29,7 +29,7 @@ cd roxy-proxy/examples/quickstart
 docker compose up -d --build --wait
 ```
 
-The first run builds the images, which takes a few minutes: the two addons compile to WebAssembly inside roxy's image, and the sentinel's image installs inspect_sentinel. Six containers start:
+The first run builds the images, which takes a few minutes: the two addons compile to WebAssembly inside roxy's image, and the sentinel's image installs inspect_sentinel. Seven containers start:
 
 - **roxy**: the proxy on `127.0.0.1:3128`, with the two addons at `/etc/roxy/addons/`.
 - **fake-model**: the model. It answers `POST /v1/messages` from [`responses.json`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/mocks/responses.json), one entry per call in order, streamed or whole, with the `usage` the real API sends. It refuses a request without the API key, which only roxy has.
@@ -37,46 +37,48 @@ The first run builds the images, which takes a few minutes: the two addons compi
 - **quota-board**: the quota service, with a live page on `127.0.0.1:8090`. Each user gets 600 tokens per minute.
 - **sentinel**: the inspect_sentinel sidecar, on a network with no route out. Every model response streams through it.
 - **inspect-view**: Inspect's log viewer on `127.0.0.1:7575`, showing each client session and the sentinel's verdict on every tool call.
+- **traffic**: the clients. Alice calls every six seconds, bob every twenty, and mallory, whose credential is unknown, every thirty.
 
-### Make some calls as alice
+Nothing is kept: `docker compose down` forgets everything, and the sentinel starts with an empty log.
 
-```sh
-docker compose run --rm client --user alice --repeat 6
-```
-
-The client is the Anthropic SDK, pointed at the model through roxy, with alice's credential in an `x-roxy-auth` header. Each call is one streamed `POST /v1/messages`. Watch the scripted responses go by: a greeting, a `Bash` tool call that runs `ls -la`, then one that runs `curl`, which comes back as
-
-```
-I will fetch that page for you.roxy's sentinel blocked a Bash tool call (denylist match: 'curl').
-```
-
-The sentinel saw the tool call before the client did, took it out, and put a note in its place. The fourth response is long on purpose, and the sixth call never reaches the model:
-
-```
-[alice #6] 429 RateLimitError: token quota exhausted: 618 of 600 tokens used; resets in 55s
-```
-
-### Watch the quota board
-
-Open [http://127.0.0.1:8090](http://127.0.0.1:8090). It shows what each user has used in the current window, live, and resets a user when their minute is up. Now run bob:
+### Watch the traffic
 
 ```sh
-docker compose run --rm client --user bob --repeat 2
+docker compose logs -f traffic
 ```
 
-Bob's calls go through: the quota is per user, and the user is whoever the auth gate said. A credential the auth service does not know never gets that far:
+Each client is the Anthropic SDK, pointed at the model through roxy, with its credential in an `x-roxy-auth` header; each call is one streamed `POST /v1/messages`. The scripted responses go by: a greeting, a `Bash` tool call that runs `ls -la`, then one that runs `curl`, which comes back as
 
-```sh
-docker compose run --rm client --user mallory --secret wrong
 ```
+[alice #2] I will fetch that page for you. roxy's sentinel blocked a Bash tool call (denylist match: 'curl').
+```
+
+The sentinel saw the tool call before the client did, took it out, and put a note in its place. Mallory never gets that far:
 
 ```
 [mallory #1] 401 AuthenticationError: credential refused by the auth service
 ```
 
+And within the first minute alice's calls stop reaching the model:
+
+```
+[alice #6] 429 RateLimitError: token quota exhausted: 620 of 600 tokens used; resets in 25s
+```
+
+### Watch the quota board
+
+Open [http://127.0.0.1:8090](http://127.0.0.1:8090). It shows what each user has used in the current window, live, and resets a user when their minute is up: alice climbs to the line, is refused until her window resets, then climbs again, while bob stays well under it. The quota is per user, and the user is whoever the auth gate said.
+
+To make a call of your own:
+
+```sh
+docker compose run --rm client --user bob
+docker compose run --rm client --user mallory --secret wrong
+```
+
 ### Watch it in Inspect View
 
-Open [http://127.0.0.1:7575](http://127.0.0.1:7575). Each client run is a sample, grouped by the `X-Claude-Code-Session-Id` header the client sends. Its transcript shows every model call, the tool calls the model asked for, and the sentinel's verdict under each one: `Continued`, or `Rejected` with the reason. Reload the page to see new calls.
+Open [http://127.0.0.1:7575](http://127.0.0.1:7575). Each client is a sample, grouped by the `X-Claude-Code-Session-Id` header it sends. Its transcript shows every model call, the tool calls the model asked for, and the sentinel's verdict under each one: `Continued`, or `Rejected` with the reason. Reload the page to see new calls.
 
 <img src={inspectView} alt="Inspect View: a curl tool call, and the sentinel's rejection under it" />
 
@@ -152,7 +154,7 @@ Putting a secret in a header and having roxy swap it for the real one is the sim
 
 ### Failure is closed
 
-Each layer fails the exchange when it cannot do its job: the auth service unreachable, the quota board answering something that is not an allowance, the sentinel unable to read a response. roxy answers a `503` naming the layer, and the flow log records a `layer_error`. There is no "on error, pass". Stop the quota board and run the client to see it.
+Each layer fails the exchange when it cannot do its job: the auth service unreachable, the quota board answering something that is not an allowance, the sentinel unable to read a response. roxy answers a `503` naming the layer, and the flow log records a `layer_error`. There is no "on error, pass". Stop the quota board (`docker compose stop quota-board`) and watch the traffic to see it.
 
 ### The denylist
 
