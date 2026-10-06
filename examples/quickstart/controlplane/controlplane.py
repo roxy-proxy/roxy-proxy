@@ -12,6 +12,7 @@ stdout, one event per line. A node id listed in DATA_DIR/revoked gets 410.
 import datetime as dt
 import gzip
 import hashlib
+import hmac
 import json
 import os
 import ssl
@@ -166,7 +167,9 @@ class ControlPlane:
     # -- enrolment and renewal --
 
     def enrol(self, token, body):
-        if token != self.token:
+        # The token is reusable: roxy's state dir is tmpfs, so every `compose up`
+        # re-enrols. A real control plane consumes a token on first use.
+        if token is None or not hmac.compare_digest(token.encode(), self.token.encode()):
             raise ApiError(401, "invalid_token", "enrolment token not recognised")
         node_id = "node-" + os.urandom(3).hex()
         print(f"enrolled {node_id}", flush=True)
