@@ -128,11 +128,18 @@ A lease that runs down denies everything until a lease arrives; the next
 
 The enrolment response states `renew_after_seconds`. When it passes the
 node `POST`s `/roxy/v1/renew` under its current certificate with a new CSR
-for the same key, stores the new certificate and uses it from then on. A
-failed renewal is retried with backoff while the old certificate stays in
-use. If the certificate expires before a renewal succeeds, lease fetches
-fail, the lease runs down and the node denies everything, which is the
-intended failure for a node the control plane will not renew.
+for the same key, stores the new certificate and uses it from then on. The
+old certificate stays in use until a renewal succeeds.
+
+| response | what the node does |
+|---|---|
+| `410` | Revoked. The same as a `410` on the lease: empty policy at once, spooled flows shipped, polling stops. |
+| `401`, `426`, other `4xx` | Logged once; renewal stops. The certificate serves until its `not_after`, then lease fetches fail and the lease runs down. |
+| `5xx`, timeout, connection or TLS error | Retried with backoff (1 s doubling to 60 s, with jitter). |
+
+A node whose certificate expires before a renewal succeeds denies
+everything, which is the intended failure for a node the control plane will
+not renew. To re-enrol it, empty the state dir and start with a new token.
 
 ## Flow shipping
 

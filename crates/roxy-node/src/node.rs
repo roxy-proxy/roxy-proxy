@@ -208,8 +208,13 @@ impl Node {
     pub async fn run(self: Arc<Self>) -> Result<(), NodeError> {
         self.establish_identity().await?;
         let shipper = tokio::spawn(self.clone().ship_loop());
-        let renewer = tokio::spawn(self.clone().renew_loop());
-        self.lease_loop().await;
+        let mut renewer = tokio::spawn(self.clone().renew_loop());
+        tokio::select! {
+            () = self.lease_loop() => {}
+            // A renewal answered 410 ends the node like a lease fetch does;
+            // any other end of the renewer leaves the lease loop running.
+            Ok(true) = &mut renewer => {}
+        }
         // Revoked: ship what is spooled, then stop.
         self.spool.close();
         let _ = tokio::time::timeout(self.scaled(Duration::from_secs(30)), shipper).await;
@@ -293,14 +298,15 @@ impl Node {
             let csr = identity::csr_pem(&key)?;
             match anon.enrol(&token, csr).await {
                 Ok(issued) => break issued,
-                Err(CertificateError::Rejected(why)) => {
-                    return Err(NodeError::EnrolRejected(why));
-                }
                 Err(CertificateError::Failed(e)) => {
                     let wait = backoff.wait();
                     tracing::warn!(error = %e, retry_in = ?wait, "enrolment failed; retrying");
                     tokio::time::sleep(self.scaled(wait)).await;
                 }
+                Err(CertificateError::Rejected(why)) => {
+                    return Err(NodeError::EnrolRejected(why));
+                }
+                Err(e) => return Err(NodeError::EnrolRejected(e.to_string())),
             }
         };
         let key_pem = key.serialize_pem();
@@ -341,11 +347,7 @@ impl Node {
                     self.apply(&lease).await
                 }
                 LeaseFetch::Revoked => {
-                    tracing::warn!(
-                        "control plane says this node is revoked; denying everything and stopping"
-                    );
-                    self.revoked.store(true, Ordering::Release);
-                    self.handler.revoke().await;
+                    self.revoke().await;
                     return;
                 }
                 LeaseFetch::Unsupported(e) => {
@@ -370,6 +372,12 @@ impl Node {
             };
             tokio::time::sleep(self.scaled(wait)).await;
         }
+    }
+
+    async fn revoke(&self) {
+        tracing::warn!("control plane says this node is revoked; denying everything and stopping");
+        self.revoked.store(true, Ordering::Release);
+        self.handler.revoke().await;
     }
 
     /// Applies a fetched lease, diffing it against the one the node runs;
@@ -423,21 +431,26 @@ impl Node {
     }
 
     /// Renews the certificate at its renewal time, retrying with backoff
-    /// on failure while the current one stays in use.
-    async fn renew_loop(self: Arc<Self>) {
+    /// while the control plane is unavailable and the current one stays in
+    /// use. A 4xx is final: the loop ends and the current certificate serves
+    /// until `not_after`. Returns `true` if the control plane said the node
+    /// is revoked.
+    async fn renew_loop(self: Arc<Self>) -> bool {
         let mut backoff = Backoff::new();
         loop {
-            let Some(id) = self.client() else { return };
+            let Some(id) = self.client() else {
+                return false;
+            };
             tokio::time::sleep_until(id.renew_at.into()).await;
             let Some(stored) = self.state.identity().ok().flatten() else {
-                return;
+                return false;
             };
             let Ok(key) = identity::load_key(&stored.key_pem) else {
                 tracing::error!("node key in the state dir no longer parses; cannot renew");
-                return;
+                return false;
             };
             let Ok(csr) = identity::csr_pem(&key) else {
-                return;
+                return false;
             };
             match id.client.renew(csr).await {
                 Ok(issued) => match identity::cert_info(&issued.certificate_chain) {
@@ -475,9 +488,30 @@ impl Node {
                         tracing::error!(error = %e, "renewed certificate does not parse; ignored");
                     }
                 },
-                Err(e) => {
+                Err(CertificateError::Revoked) => {
+                    self.revoke().await;
+                    return true;
+                }
+                Err(CertificateError::Unsupported(e)) => {
+                    tracing::error!(
+                        missing = %e.missing.join(","),
+                        message = %e.message,
+                        not_after = %id.not_after.to_rfc3339(),
+                        "control plane will not renew the certificate for this roxy or protocol version; the current one stays in use until it expires"
+                    );
+                    return false;
+                }
+                Err(CertificateError::Rejected(why)) => {
+                    tracing::error!(
+                        error = %why,
+                        not_after = %id.not_after.to_rfc3339(),
+                        "control plane rejected the certificate renewal; the current certificate stays in use until it expires (re-enrolment needs a new token and an empty state dir)"
+                    );
+                    return false;
+                }
+                Err(CertificateError::Failed(e)) => {
                     let wait = backoff.wait();
-                    tracing::warn!(error = %e, retry_in = ?wait, not_after = %id.not_after.to_rfc3339(), "certificate renewal failed; the current certificate stays in use");
+                    tracing::warn!(error = %e, retry_in = ?wait, not_after = %id.not_after.to_rfc3339(), "certificate renewal failed; retrying while the current certificate stays in use");
                     tokio::time::sleep(self.scaled(wait)).await;
                     continue;
                 }
@@ -1159,7 +1193,7 @@ mod tests {
             },
         );
         h.mock.push("/roxy/v1/renew", Reply::status(500));
-        h.mock.push("/roxy/v1/renew", Reply::status(401));
+        h.mock.push("/roxy/v1/renew", Reply::Hangup);
         h.mock.fallback(
             "/roxy/v1/renew",
             Reply::Issue {
@@ -1177,6 +1211,82 @@ mod tests {
         let renewals = h.mock.wait_for("/roxy/v1/renew", 3).await;
         assert!(renewals.iter().all(|r| r.client.as_deref() == Some("n1")));
         h.mock.wait_for(LEASE, 2).await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_revoked_renewal_ends_the_node() {
+        let h = Harness::new().await;
+        h.mock.push(
+            "/roxy/v1/enrol",
+            Reply::Issue {
+                node_id: "n1".into(),
+                lifetime_secs: 3600,
+                renew_after_seconds: 1,
+            },
+        );
+        h.mock.fallback("/roxy/v1/renew", Reply::status(410));
+        h.mock.fallback(
+            LEASE,
+            Reply::json(200, &lease("L1", "version: 1\n", "s1", "e1")),
+        );
+        let (node, rec) = h.node(true);
+        let task = tokio::spawn(node.clone().run());
+        h.mock.wait_for("/roxy/v1/renew", 1).await;
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("run ends on revocation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.revoked.load(Ordering::Acquire), 1);
+        assert!(node.is_revoked());
+        assert_eq!(
+            h.mock.requests_to("/roxy/v1/renew").len(),
+            1,
+            "no renewal is retried after 410"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_renewal_stops_renewing_and_leaves_the_lease_loop_alone() {
+        let h = Harness::new().await;
+        h.mock.push(
+            "/roxy/v1/enrol",
+            Reply::Issue {
+                node_id: "n1".into(),
+                lifetime_secs: 3600,
+                renew_after_seconds: 1,
+            },
+        );
+        h.mock.push("/roxy/v1/renew", Reply::status(401));
+        h.mock.fallback(
+            "/roxy/v1/renew",
+            Reply::Issue {
+                node_id: "n1".into(),
+                lifetime_secs: 7200,
+                renew_after_seconds: 3000,
+            },
+        );
+        h.mock.fallback(
+            LEASE,
+            Reply::json(200, &lease("L1", "version: 1\n", "s1", "e1")),
+        );
+        let (node, rec) = h.node(true);
+        let state = node.state_dir().clone();
+        let task = tokio::spawn(node.clone().run());
+        h.mock.wait_for("/roxy/v1/renew", 1).await;
+        let before = state.identity().unwrap().unwrap().cert_pem;
+        // Several lease refreshes outlast the renewal backoff many times over.
+        h.mock.wait_for(LEASE, 4).await;
+        assert_eq!(
+            h.mock.requests_to("/roxy/v1/renew").len(),
+            1,
+            "a 401 is not retried"
+        );
+        assert_eq!(state.identity().unwrap().unwrap().cert_pem, before);
+        assert_eq!(rec.revoked.load(Ordering::Acquire), 0);
+        assert!(!node.is_revoked());
+        assert!(!task.is_finished(), "the lease loop keeps running");
         task.abort();
     }
 

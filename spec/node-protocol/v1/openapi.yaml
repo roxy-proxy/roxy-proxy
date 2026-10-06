@@ -61,9 +61,10 @@ paths:
       summary: Replace the node certificate before it expires.
       description: |
         Same body and response as enrolment; `node_id` is unchanged. The old
-        certificate stays valid until its own `not_after`. A failed renewal is
-        retried with backoff; if the certificate expires first the node can no
-        longer fetch leases and its lease runs down.
+        certificate stays valid until its own `not_after`. A `5xx` or
+        transport failure is retried with backoff; `410` is terminal; any
+        other `4xx` ends renewal. If the certificate expires first the node
+        can no longer fetch leases and its lease runs down.
       requestBody:
         $ref: "#/components/requestBodies/EnrolRequest"
       responses:

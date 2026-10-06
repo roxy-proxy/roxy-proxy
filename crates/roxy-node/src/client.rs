@@ -77,8 +77,15 @@ pub enum ShipOutcome {
 /// How an enrolment or renewal failed.
 #[derive(Debug, thiserror::Error)]
 pub enum CertificateError {
-    /// A 4xx: the token is spent or invalid, or the certificate is not
-    /// recognised. Retrying cannot help.
+    /// 410: the node is revoked. Definite and terminal.
+    #[error("revoked")]
+    Revoked,
+    /// 426: the server will not serve this protocol or roxy version;
+    /// `missing` names what it wants.
+    #[error("unsupported: missing {}", .0.missing.join(","))]
+    Unsupported(ErrorBody),
+    /// Any other 4xx: the token is spent or invalid, or the certificate is
+    /// not recognised. Retrying cannot help.
     #[error("rejected: {0}")]
     Rejected(String),
     #[error("{0}")]
@@ -228,14 +235,18 @@ impl ControlPlane {
                 CertificateError::Failed(Transient(format!("certificate response: {e}")))
             });
         }
-        if status.is_client_error() {
-            let text = String::from_utf8_lossy(&body[..body.len().min(200)]);
-            return Err(CertificateError::Rejected(format!(
-                "{status}: {}",
-                text.trim()
-            )));
+        match status {
+            StatusCode::GONE => Err(CertificateError::Revoked),
+            StatusCode::UPGRADE_REQUIRED => Err(CertificateError::Unsupported(error_body(&body))),
+            s if s.is_client_error() => {
+                let text = String::from_utf8_lossy(&body[..body.len().min(200)]);
+                Err(CertificateError::Rejected(format!(
+                    "{status}: {}",
+                    text.trim()
+                )))
+            }
+            _ => Err(CertificateError::Failed(Transient::status(status, &body))),
         }
-        Err(CertificateError::Failed(Transient::status(status, &body)))
     }
 
     /// `POST /lease`, reporting `state`.
@@ -542,6 +553,44 @@ pub(crate) mod tests {
             Err(CertificateError::Failed(_))
         ));
         assert!(mock.requests_to("/roxy/v1/enrol").is_empty());
+    }
+
+    #[tokio::test]
+    async fn renew_distinguishes_the_terminal_statuses() {
+        let mock = MockServer::start().await;
+        let (cp, _) = enrolled(&mock).await;
+        let csr = crate::identity::csr_pem(&crate::identity::generate_key().unwrap()).unwrap();
+        let path = "/roxy/v1/renew";
+        mock.push(path, Reply::status(410));
+        assert!(matches!(
+            cp.renew(csr.clone()).await,
+            Err(CertificateError::Revoked)
+        ));
+        mock.push(
+            path,
+            Reply::json(
+                426,
+                &ErrorBody {
+                    error: "unsupported".into(),
+                    message: "too old".into(),
+                    missing: vec!["roxy_version:0.2.0".into()],
+                },
+            ),
+        );
+        assert!(matches!(
+            cp.renew(csr.clone()).await,
+            Err(CertificateError::Unsupported(e)) if e.missing == ["roxy_version:0.2.0"]
+        ));
+        mock.push(path, Reply::status(401));
+        assert!(matches!(
+            cp.renew(csr.clone()).await,
+            Err(CertificateError::Rejected(m)) if m.starts_with("401")
+        ));
+        mock.push(path, Reply::status(503));
+        assert!(matches!(
+            cp.renew(csr).await,
+            Err(CertificateError::Failed(_))
+        ));
     }
 
     #[tokio::test]
