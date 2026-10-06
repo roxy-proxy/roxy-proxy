@@ -20,6 +20,10 @@ log:
   flow:
     connection_events: false  # flow log to stdout: `docker compose logs roxy`
 
+upstream:
+  dns:
+    cache_ttl_cap: 1s         # compose recreates containers at new addresses; don't hold on to the old ones
+
 secrets:
   model_key: { env: MODEL_API_KEY }   # the client never holds it; roxy sets x-api-key
 
