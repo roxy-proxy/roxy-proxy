@@ -15,12 +15,13 @@ here needs an API key or a route out: start it and watch. Nothing survives
 [quickstart](https://roxy-proxy.github.io/roxy-proxy/quickstart) on the docs site.
 
 ```sh
-docker compose up -d --build --wait
-docker compose logs -f traffic    # alice, bob and mallory calling on their own cadences
-open http://127.0.0.1:8090        # the quota board
-open http://127.0.0.1:7575        # Inspect View: the sentinel's verdicts
-docker compose run --rm client --user bob   # a call of your own
+docker compose up --build --attach traffic   # alice, bob and mallory calling on their own cadences
+open http://127.0.0.1:8090                   # the quota board
+open http://127.0.0.1:7575                   # Inspect View: the sentinel's verdicts
+docker compose run --rm client --user bob    # a call of your own, from another terminal
 ```
+
+Ctrl-C stops the stack; `docker compose down -v` removes it.
 
 | file | what it is |
 |---|---|

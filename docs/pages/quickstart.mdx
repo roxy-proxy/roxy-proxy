@@ -26,10 +26,10 @@ cd roxy-proxy/examples/quickstart
 ### Start the stack
 
 ```sh
-docker compose up -d --build --wait
+docker compose up --build --attach traffic
 ```
 
-The first run builds the images, which takes a few minutes: the two addons compile to WebAssembly inside roxy's image, and the sentinel's image installs inspect_sentinel. Seven containers start:
+The first run builds the images, which takes a few minutes: the two addons compile to WebAssembly inside roxy's image, and the sentinel's image installs inspect_sentinel. Seven containers start, and only the last one's output is shown:
 
 - **roxy**: the proxy on `127.0.0.1:3128`, with the two addons at `/etc/roxy/addons/`.
 - **fake-model**: the model. It answers `POST /v1/messages` from [`responses.json`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/mocks/responses.json), one entry per call in order, streamed or whole, with the `usage` the real API sends. It refuses a request without the API key, which only roxy has.
@@ -39,37 +39,33 @@ The first run builds the images, which takes a few minutes: the two addons compi
 - **inspect-view**: Inspect's log viewer on `127.0.0.1:7575`, showing each client session and the sentinel's verdict on every tool call.
 - **traffic**: the clients. Alice calls every six seconds, bob every twenty, and mallory, whose credential is unknown, every thirty.
 
-Nothing is kept: `docker compose down` forgets everything, and the sentinel starts with an empty log.
+Nothing is kept: Ctrl-C stops the stack, `docker compose down -v` removes it, and the next start begins from nothing.
 
 ### Watch the traffic
-
-```sh
-docker compose logs -f traffic
-```
 
 Each client is the Anthropic SDK, pointed at the model through roxy, with its credential in an `x-roxy-auth` header; each call is one streamed `POST /v1/messages`. The scripted responses go by: a greeting, a `Bash` tool call that runs `ls -la`, then one that runs `curl`, which comes back as
 
 ```
-[alice #2] I will fetch that page for you. roxy's sentinel blocked a Bash tool call (denylist match: 'curl').
+traffic-1  | [alice #2] I will fetch that page for you. roxy's sentinel blocked a Bash tool call (denylist match: 'curl').
 ```
 
 The sentinel saw the tool call before the client did, took it out, and put a note in its place. Mallory never gets that far:
 
 ```
-[mallory #1] 401 AuthenticationError: credential refused by the auth service
+traffic-1  | [mallory #1] 401 AuthenticationError: credential refused by the auth service
 ```
 
 And within the first minute alice's calls stop reaching the model:
 
 ```
-[alice #6] 429 RateLimitError: token quota exhausted: 620 of 600 tokens used; resets in 25s
+traffic-1  | [alice #6] 429 RateLimitError: token quota exhausted: 620 of 600 tokens used; resets in 25s
 ```
 
 ### Watch the quota board
 
 Open [http://127.0.0.1:8090](http://127.0.0.1:8090). It shows what each user has used in the current window, live, and resets a user when their minute is up: alice climbs to the line, is refused until her window resets, then climbs again, while bob stays well under it. The quota is per user, and the user is whoever the auth gate said.
 
-To make a call of your own:
+To make a call of your own, from another terminal:
 
 ```sh
 docker compose run --rm client --user bob
@@ -84,6 +80,8 @@ Open [http://127.0.0.1:7575](http://127.0.0.1:7575). Each client is a sample, gr
 
 ### Read roxy's flow log
 
+From another terminal:
+
 ```sh
 docker compose logs roxy
 ```
@@ -91,6 +89,8 @@ docker compose logs roxy
 roxy's flow log has a line for every request, with the rule it matched, the addons it went through in order (`"addons":["auth-gate","token-quota","sentinel"]`), the `user:alice` tag the auth gate set, and the `set_header:x-api-key` mutation the rule made. Each addon's own events are there too: `endpoint_call` for every call to the auth service and the quota board, and `layer_record` for the verdicts and the usage reports. To keep whole requests and responses too, turn on [capture](/operate/flow-log#capture).
 
 ### Clean up
+
+Ctrl-C in the terminal running `up`, then:
 
 ```sh
 docker compose down -v

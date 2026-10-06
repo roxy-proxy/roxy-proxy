@@ -3,8 +3,7 @@
 # Nothing here needs an API key or a route out, and nothing survives
 # `docker compose down`.
 #
-#   docker compose up -d --build --wait
-#   docker compose logs -f traffic
+#   docker compose up --build --attach traffic    # Ctrl-C stops it; down -v cleans up
 #
 # Quota board: http://127.0.0.1:8090    Inspect View: http://127.0.0.1:7575
 # The proxy is on 127.0.0.1:3128 for a client of your own (see README.md).
@@ -84,7 +83,7 @@ services:
     networks: [lab, viewer]
 
   # The traffic: calls for alice, bob and mallory on their own cadences, for
-  # ever. `docker compose logs -f traffic` to watch.
+  # ever. The only service `up --attach traffic` shows.
   traffic:
     <<: *mock
     command: ["python", "traffic.py"]
