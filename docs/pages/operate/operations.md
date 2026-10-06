@@ -25,7 +25,7 @@ The `ca_server` listener answers two probes, both plain HTTP `GET`:
 | path | `200` when | otherwise |
 |---|---|---|
 | `/healthz` | the process is up and accepting connections | no answer |
-| `/readyz` | a policy has been applied and its lease has not run out | `503` with a one-word reason: `no_policy` (nothing applied yet) or `policy_expired` ([lease](#lease)) |
+| `/readyz` | a policy has been applied and its lease has not run out | `503` with a one-word reason: `no_policy` (nothing applied yet) or `policy_expired` ([lease](/operate/operations#lease)) |
 
 Liveness is for restarting a stuck process. Readiness is for routing: a
 roxy that has no policy in force should not receive traffic, and a
@@ -106,7 +106,7 @@ one `policy_expired` event; later ones are ordinary `_expired` denies.
 An expired policy is a policy, not a fault. The listeners stay up,
 `/healthz` keeps answering `200` and says `x-roxy-policy: expired` (it
 says `valid` otherwise), and `roxy health` prints `ok (policy expired)`;
-`/readyz` answers `503 policy_expired` ([health](#health)).
+`/readyz` answers `503 policy_expired` ([health](/operate/operations#health)).
 A document already past its `valid_until` loads and denies rather than
 failing to start, so a stale lease on disk fails closed. `roxy check`
 prints `valid until:` and warns when the instant has passed.
