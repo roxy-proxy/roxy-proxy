@@ -22,6 +22,7 @@ use crate::config::{HttpBehaviour, ListenerKind, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowEvent, FlowSink, Redactor};
 use crate::listener::{ClientConn, Listener, ListenerMode, TcpProxyListener};
 use crate::pipeline::client_info;
+use crate::secrets::SecretStore;
 use crate::sources::{MetricSource, StateSource};
 use crate::upstream::Upstream;
 
@@ -29,8 +30,9 @@ use crate::upstream::Upstream;
 /// `Arc` at its start and finishes under that snapshot.
 pub(crate) struct Snapshot {
     pub policy: Policy,
-    pub secrets: HashMap<String, String>,
-    pub redactor: Redactor,
+    /// The server's one secret store, shared by every snapshot; its values
+    /// and redactor change under a running exchange.
+    pub secrets: Arc<SecretStore>,
     pub limits: Arc<Limits>,
     pub flags: Arc<HttpFlags>,
     pub http: Arc<HttpBehaviour>,
@@ -42,7 +44,7 @@ pub(crate) struct Snapshot {
     /// The addon stack, outermost first.
     pub addons: Arc<[Arc<crate::addons::AddonSpec>]>,
     /// Service layers' connection pools. A reload starts empty ones, so
-    /// new exchanges dial under the new policy and secrets, and retires
+    /// new exchanges dial under the new policy, and retires
     /// the old ones, whose connections close as their exchanges end.
     pub services: crate::addons::service::Pools,
 }
@@ -100,6 +102,7 @@ impl ConnCaps {
 /// State shared by every connection task.
 pub(crate) struct Shared {
     snapshot: ArcSwap<Snapshot>,
+    secrets: Arc<SecretStore>,
     pub sink: Arc<dyn FlowSink>,
     pub capture: Option<Arc<crate::capture::CaptureLog>>,
     pub metrics: Arc<dyn MetricSource>,
@@ -131,7 +134,7 @@ impl Shared {
     }
 
     fn build_snapshot(&self, u: PolicyUpdate) -> Result<Snapshot, String> {
-        build_snapshot(u, &self.upstream_tls)
+        build_snapshot(u, &self.upstream_tls, &self.secrets)
     }
 
     /// Reserves `bytes` of the buffer budget, or `None` when that would
@@ -160,7 +163,7 @@ impl Shared {
         detail: Option<&str>,
     ) {
         tracing::debug!(conn = %c.id, reason, detail, "client protocol error");
-        let redactor = self.snapshot().redactor.clone();
+        let redactor = self.secrets.redactor();
         self.sink.emit(&FlowEvent::ParseError {
             ts: chrono::Utc::now(),
             conn: c.id.to_string(),
@@ -191,7 +194,11 @@ impl Shared {
     }
 }
 
-fn build_snapshot(u: PolicyUpdate, tls: &Arc<ClientConfig>) -> Result<Snapshot, String> {
+fn build_snapshot(
+    u: PolicyUpdate,
+    tls: &Arc<ClientConfig>,
+    secrets: &Arc<SecretStore>,
+) -> Result<Snapshot, String> {
     let mut settings = u.upstream;
     for name in &u.deny_lists {
         // Fail closed: a deny list that is not loaded refuses the snapshot
@@ -205,8 +212,7 @@ fn build_snapshot(u: PolicyUpdate, tls: &Arc<ClientConfig>) -> Result<Snapshot, 
     let upstream = Upstream::new(&settings, tls)?;
     Ok(Snapshot {
         policy: u.policy,
-        secrets: u.secrets,
-        redactor: u.redactor,
+        secrets: secrets.clone(),
         limits: Arc::new(u.limits),
         flags: Arc::new(u.flags),
         http: Arc::new(u.http),
@@ -247,6 +253,8 @@ impl std::fmt::Debug for ServerHandle {
 /// was.
 pub struct PreparedReload {
     snapshot: Snapshot,
+    secrets: HashMap<String, String>,
+    redactor: Redactor,
 }
 
 impl std::fmt::Debug for PreparedReload {
@@ -260,15 +268,26 @@ impl ServerHandle {
     /// settings) without installing it. Everything in a reload that can
     /// fail happens here, so a caller with other state to swap alongside
     /// the policy can do so between this and [`Self::commit`].
-    pub fn prepare(&self, update: PolicyUpdate) -> Result<PreparedReload, String> {
+    pub fn prepare(&self, mut update: PolicyUpdate) -> Result<PreparedReload, String> {
+        let secrets = std::mem::take(&mut update.secrets);
+        let redactor = std::mem::take(&mut update.redactor);
         let snapshot = self.shared.build_snapshot(update)?;
-        Ok(PreparedReload { snapshot })
+        Ok(PreparedReload {
+            snapshot,
+            secrets,
+            redactor,
+        })
     }
 
     /// Swaps in a prepared snapshot atomically. In-flight exchanges finish
-    /// under the snapshot they started with.
+    /// under the snapshot they started with. The secret store is replaced
+    /// first, so the redactor covers every value before a rule can inject
+    /// it.
     pub fn commit(&self, prepared: PreparedReload) {
         let snap = prepared.snapshot;
+        self.shared
+            .secrets
+            .replace(prepared.secrets, prepared.redactor);
         self.shared
             .layer_state
             .configure(snap.addons.iter().map(|a| (a.name.as_str(), &a.state)));
@@ -282,6 +301,19 @@ impl ServerHandle {
         let prepared = self.prepare(update)?;
         self.commit(prepared);
         Ok(())
+    }
+
+    /// Replaces the secret map without touching the policy: the rules,
+    /// addons and upstream pools stay as they are and no event is logged.
+    /// `secrets` is the whole map, by the names the config declares under
+    /// `secrets:`; a name the policy references but the map lacks fails
+    /// each flow that needs it closed (`secret_missing`). The next request
+    /// to evaluate sees the new values; an exchange already under way keeps
+    /// the value it injected, and the redactor scrubs both until the swap
+    /// after this one.
+    pub fn swap_secrets(&self, secrets: HashMap<String, String>) {
+        tracing::info!(secrets = secrets.len(), "secrets swapped");
+        self.shared.secrets.swap(secrets);
     }
 
     /// The flow sink.
@@ -318,9 +350,15 @@ impl Server {
         roxy_tls::install_crypto_provider();
         let upstream_tls = roxy_tls::client_config(&cfg.upstream_tls)
             .map_err(|e| StartError(format!("upstream TLS configuration: {e}")))?;
-        let snap = build_snapshot(cfg.policy, &upstream_tls).map_err(StartError)?;
+        let mut policy = cfg.policy;
+        let secrets = Arc::new(SecretStore::new(
+            std::mem::take(&mut policy.secrets),
+            std::mem::take(&mut policy.redactor),
+        ));
+        let snap = build_snapshot(policy, &upstream_tls, &secrets).map_err(StartError)?;
         let shared = Arc::new(Shared {
             snapshot: ArcSwap::from_pointee(snap),
+            secrets,
             sink: cfg.sink,
             capture: cfg.capture,
             metrics: cfg.metrics,

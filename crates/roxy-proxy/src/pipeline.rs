@@ -334,7 +334,7 @@ impl FlowMeta {
             stage,
             reason: format!(
                 "{code}: {}",
-                self.snap.redactor.redact_str(&reason.to_string())
+                self.snap.secrets.redactor().redact_str(&reason.to_string())
             ),
         });
     }
@@ -362,7 +362,12 @@ impl FlowMeta {
     }
 
     pub(crate) fn rule_log(&self, stage: Stage, level: LogLevel, message: &str) {
-        let message = self.snap.redactor.redact_str(message).into_owned();
+        let message = self
+            .snap
+            .secrets
+            .redactor()
+            .redact_str(message)
+            .into_owned();
         match level {
             LogLevel::Trace => tracing::trace!(flow = %self.flow, %message, "rule log"),
             LogLevel::Debug => tracing::debug!(flow = %self.flow, %message, "rule log"),
@@ -540,7 +545,7 @@ impl FlowCx {
     fn evaluate_head(&mut self) -> (Outcome, Option<Refusal>) {
         let snap = self.snap.clone();
         let shared = self.shared.clone();
-        let secrets = |name: &str| snap.secrets.get(name).cloned();
+        let secrets = |name: &str| snap.secrets.get(name);
         let tags = self.record.tags.clone();
         let ctx = EvalContext {
             secrets: &secrets,
@@ -610,25 +615,23 @@ impl FlowCx {
         if let Some(c) = &self.request_counter {
             self.record.request_bytes = c.load(std::sync::atomic::Ordering::Relaxed);
         }
+        let redactor = self.snap.secrets.redactor();
         let r = self.facts.client_request.as_ref();
         let req = RequestInfo {
             method: r.map(|r| r.method.as_str().to_owned()).unwrap_or_default(),
             host: r.map(|r| host_text(&r.host)).unwrap_or_default(),
             port: r.map_or(0, |r| r.port),
             path: r
-                .map(|r| self.snap.redactor.redact_str(&r.path).into_owned())
+                .map(|r| redactor.redact_str(&r.path).into_owned())
                 .unwrap_or_default(),
             query: r
                 .and_then(|r| r.query.as_ref())
-                .map(|q| self.snap.redactor.redact_str(&redact_query(q)).into_owned()),
+                .map(|q| redactor.redact_str(&redact_query(q)).into_owned()),
             headers_bytes: r.map_or(0, |r| r.head_bytes as u64),
             body_bytes: self.record.request_bytes,
-            content_type: r.and_then(|r| r.headers.get("content-type")).map(|v| {
-                self.snap
-                    .redactor
-                    .redact_header("content-type", v)
-                    .into_owned()
-            }),
+            content_type: r
+                .and_then(|r| r.headers.get("content-type"))
+                .map(|v| redactor.redact_header("content-type", v).into_owned()),
         };
         let res = self.record.response_status.map(|status| ResponseInfo {
             status,

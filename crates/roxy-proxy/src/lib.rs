@@ -6,6 +6,8 @@
 //!
 //! - [`server`]: [`Server`] (`start`, `local_addrs`, `reload`, `shutdown`),
 //!   connection caps, the atomically swapped policy snapshot.
+//! - [`secrets`]: the live secret map and its redactor, swapped
+//!   independently of the snapshot.
 //! - [`listener`]: the [`Listener`] trait (the hook for transparent mode, issue #15) and
 //!   [`TcpProxyListener`] (explicit and direct); [`ClientConn`].
 //! - `conn`: the connection state machines (proxy port, CONNECT, direct
@@ -50,6 +52,7 @@ mod h2conn;
 pub mod io;
 pub mod listener;
 mod pipeline;
+pub mod secrets;
 pub mod server;
 pub mod sources;
 #[cfg(test)]
