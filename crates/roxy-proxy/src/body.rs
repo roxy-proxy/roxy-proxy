@@ -1,28 +1,76 @@
-//! Body helpers: byte counting as frames stream, bounded buffering for
-//! body-inspecting rules that never loses the rest of the stream, and the
-//! gate that keeps request trailers off HTTP/1.1 upstreams.
+//! Body helpers: byte counting and digesting as frames stream, bounded
+//! buffering for body-inspecting rules that never loses the rest of the
+//! stream, and the gate that keeps request trailers off HTTP/1.1 upstreams.
 
 use std::future::poll_fn;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
 use http_body::{Frame, SizeHint};
+use ring::digest::{Context as Digest, SHA256};
 use roxy_http::{Body, BodyError, ParseError, Reason};
 use tokio_util::sync::CancellationToken;
 
-/// Counts data bytes as they pass through.
+/// What a [`counted`] body has let through: the byte count as it grows,
+/// and the SHA-256 of the whole body once it has completed.
+#[derive(Debug, Default)]
+pub(crate) struct Tally {
+    bytes: AtomicU64,
+    sha256: OnceLock<[u8; 32]>,
+}
+
+impl Tally {
+    /// Data bytes that have flowed through so far.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Lower-case hex SHA-256 of the body, once it has ended cleanly.
+    /// `None` while it is still flowing, and for good if it failed or was
+    /// dropped before its end.
+    pub(crate) fn sha256_hex(&self) -> Option<String> {
+        self.sha256.get().map(|d| {
+            use std::fmt::Write as _;
+            d.iter().fold(String::with_capacity(64), |mut s, b| {
+                let _ = write!(s, "{b:02x}");
+                s
+            })
+        })
+    }
+}
+
+/// Counts and digests data bytes as they pass through.
 struct Counted {
     inner: Body,
-    counter: Arc<AtomicU64>,
+    tally: Arc<Tally>,
+    /// The running digest; taken at the body's end, or discarded when the
+    /// body fails.
+    digest: Option<Digest>,
     /// Cancelled once the body has ended, failed or been dropped.
     ended: Option<CancellationToken>,
 }
 
+impl Counted {
+    /// Publishes the digest if the body has reached its end. A consumer
+    /// may not poll again once the body says it has ended (hyper never
+    /// polls an empty one), so this runs after each frame and on drop.
+    fn finish_if_ended(&mut self) {
+        if http_body::Body::is_end_stream(&self.inner)
+            && let Some(d) = self.digest.take()
+        {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(d.finish().as_ref());
+            let _ = self.tally.sha256.set(out);
+        }
+    }
+}
+
 impl Drop for Counted {
     fn drop(&mut self) {
+        self.finish_if_ended();
         if let Some(t) = &self.ended {
             t.cancel();
         }
@@ -41,10 +89,21 @@ impl http_body::Body for Counted {
         match &r {
             Poll::Ready(Some(Ok(f))) => {
                 if let Some(d) = f.data_ref() {
-                    self.counter.fetch_add(d.len() as u64, Ordering::Relaxed);
+                    self.tally.bytes.fetch_add(d.len() as u64, Ordering::Relaxed);
+                    if let Some(h) = self.digest.as_mut() {
+                        h.update(d);
+                    }
+                }
+                self.finish_if_ended();
+            }
+            Poll::Ready(None) => {
+                self.finish_if_ended();
+                if let Some(t) = &self.ended {
+                    t.cancel();
                 }
             }
-            Poll::Ready(None | Some(Err(_))) => {
+            Poll::Ready(Some(Err(_))) => {
+                self.digest = None;
                 if let Some(t) = &self.ended {
                     t.cancel();
                 }
@@ -63,34 +122,36 @@ impl http_body::Body for Counted {
     }
 }
 
-/// Wraps `body` so the returned counter tracks the data bytes that have
-/// flowed through it. Framing (known length) is preserved.
-pub(crate) fn counted(body: Body) -> (Body, Arc<AtomicU64>) {
+/// Wraps `body` so the returned tally tracks the data bytes that have
+/// flowed through it, and their digest once it has ended. Framing (known
+/// length) is preserved.
+pub(crate) fn counted(body: Body) -> (Body, Arc<Tally>) {
     wrap_counted(body, None)
 }
 
 /// [`counted`], plus a token cancelled once the body is done with: it
 /// ended, failed, or its consumer dropped it (an HTTP client drops a
 /// request body once it has been sent, or never polls an empty one).
-pub(crate) fn counted_until_sent(body: Body) -> (Body, Arc<AtomicU64>, CancellationToken) {
+pub(crate) fn counted_until_sent(body: Body) -> (Body, Arc<Tally>, CancellationToken) {
     let ended = CancellationToken::new();
-    let (body, counter) = wrap_counted(body, Some(ended.clone()));
-    (body, counter, ended)
+    let (body, tally) = wrap_counted(body, Some(ended.clone()));
+    (body, tally, ended)
 }
 
-fn wrap_counted(body: Body, ended: Option<CancellationToken>) -> (Body, Arc<AtomicU64>) {
-    let counter = Arc::new(AtomicU64::new(0));
+fn wrap_counted(body: Body, ended: Option<CancellationToken>) -> (Body, Arc<Tally>) {
+    let tally = Arc::new(Tally::default());
     let known = body.known_length();
     let body = Body::wrap_native(
         Counted {
             inner: body,
-            counter: counter.clone(),
+            tally: tally.clone(),
+            digest: Some(Digest::new(&SHA256)),
             ended,
         },
         u64::MAX,
         known,
     );
-    (body, counter)
+    (body, tally)
 }
 
 /// Fails instead of yielding trailers that would not reach the upstream.
@@ -278,18 +339,69 @@ mod tests {
         assert!(!sent.is_cancelled());
         assert_eq!(drain(b).await.unwrap(), b"hello");
         assert!(sent.is_cancelled());
-        assert_eq!(c.load(Ordering::Relaxed), 5);
+        assert_eq!(c.bytes(), 5);
         let (b, _, sent) = counted_until_sent(Body::from_bytes("never polled"));
         drop(b);
         assert!(sent.is_cancelled());
     }
 
+    const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
     #[tokio::test]
-    async fn counts_bytes() {
-        let (b, c) = counted(Body::from_bytes("hello"));
+    async fn counts_and_digests_bytes() {
+        let (b, t) = counted(Body::from_bytes("hello"));
         assert_eq!(b.known_length(), Some(5));
+        assert_eq!(t.sha256_hex(), None, "not before the end");
         assert_eq!(drain(b).await.unwrap(), b"hello");
-        assert_eq!(c.load(Ordering::Relaxed), 5);
+        assert_eq!(t.bytes(), 5);
+        assert_eq!(t.sha256_hex().as_deref(), Some(HELLO_SHA256));
+    }
+
+    #[tokio::test]
+    async fn digest_spans_the_chunks() {
+        let (mut tx, b) = Body::channel(1 << 20, None);
+        let (b, t) = counted(b);
+        tokio::spawn(async move {
+            for part in ["he", "l", "lo"] {
+                tx.ready().await.unwrap();
+                tx.try_push(Bytes::from_static(part.as_bytes())).unwrap();
+            }
+            tx.ready().await.unwrap();
+            tx.try_finish().unwrap();
+        });
+        assert_eq!(drain(b).await.unwrap(), b"hello");
+        assert_eq!(t.sha256_hex().as_deref(), Some(HELLO_SHA256));
+    }
+
+    #[tokio::test]
+    async fn empty_body_has_the_empty_digest_even_unpolled() {
+        let (b, t) = counted(Body::empty());
+        drop(b);
+        assert_eq!(t.bytes(), 0);
+        assert_eq!(t.sha256_hex().as_deref(), Some(EMPTY_SHA256));
+    }
+
+    #[tokio::test]
+    async fn aborted_body_has_no_digest() {
+        // Dropped by its consumer mid-stream.
+        let (mut tx, b) = Body::channel(1 << 20, None);
+        let (mut b, t) = counted(b);
+        tx.ready().await.unwrap();
+        tx.try_push(Bytes::from_static(b"hel")).unwrap();
+        let f = poll_fn(|cx| http_body::Body::poll_frame(Pin::new(&mut b), cx)).await;
+        assert!(f.unwrap().is_ok());
+        drop(b);
+        assert_eq!(t.bytes(), 3);
+        assert_eq!(t.sha256_hex(), None);
+        // Failed by its producer.
+        let (mut tx, b) = Body::channel(1 << 20, None);
+        let (b, t) = counted(b);
+        tx.ready().await.unwrap();
+        tx.try_push(Bytes::from_static(b"hel")).unwrap();
+        drop(tx);
+        assert!(drain(b).await.is_err());
+        assert_eq!(t.sha256_hex(), None);
     }
 
     #[tokio::test]
