@@ -1,8 +1,6 @@
 //! Test scaffolding: a CA that issues node certificates from CSRs, and a
 //! scripted control plane over mTLS that records what it was sent.
 
-#![allow(dead_code)]
-
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -30,14 +28,20 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// A CA for the control plane's server certificate and the node
 /// certificates it issues.
-pub(crate) struct TestCa {
+pub struct TestCa {
     pub pem: String,
     der: CertificateDer<'static>,
     issuer: Issuer<'static, KeyPair>,
 }
 
+impl Default for TestCa {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TestCa {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let mut params = CertificateParams::default();
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![
@@ -58,7 +62,7 @@ impl TestCa {
 
     /// Signs `csr_pem` as a node certificate for `node_id`, valid for
     /// `lifetime_secs`.
-    pub(crate) fn issue(&self, csr_pem: &str, node_id: &str, lifetime_secs: i64) -> String {
+    pub fn issue(&self, csr_pem: &str, node_id: &str, lifetime_secs: i64) -> String {
         let mut csr = CertificateSigningRequestParams::from_pem(csr_pem).unwrap();
         let uri = format!("{NODE_ID_URI_PREFIX}{node_id}");
         csr.params.subject_alt_names = vec![SanType::URI(uri.as_str().try_into().unwrap())];
@@ -68,7 +72,7 @@ impl TestCa {
         csr.signed_by(&self.issuer).unwrap().pem()
     }
 
-    pub(crate) fn issue_without_node_id(&self, csr_pem: &str) -> String {
+    pub fn issue_without_node_id(&self, csr_pem: &str) -> String {
         let csr = CertificateSigningRequestParams::from_pem(csr_pem).unwrap();
         csr.signed_by(&self.issuer).unwrap().pem()
     }
@@ -101,7 +105,7 @@ impl TestCa {
 
 /// One scripted answer.
 #[derive(Debug, Clone)]
-pub(crate) enum Reply {
+pub enum Reply {
     /// A fixed response.
     Status {
         status: u16,
@@ -121,7 +125,7 @@ pub(crate) enum Reply {
 }
 
 impl Reply {
-    pub(crate) fn status(status: u16) -> Self {
+    pub fn status(status: u16) -> Self {
         Self::Status {
             status,
             headers: Vec::new(),
@@ -129,7 +133,7 @@ impl Reply {
         }
     }
 
-    pub(crate) fn json(status: u16, value: &impl serde::Serialize) -> Self {
+    pub fn json(status: u16, value: &impl serde::Serialize) -> Self {
         Self::Status {
             status,
             headers: vec![("content-type".into(), "application/json".into())],
@@ -137,14 +141,15 @@ impl Reply {
         }
     }
 
-    pub(crate) fn with_header(mut self, name: &str, value: &str) -> Self {
+    #[must_use]
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
         if let Self::Status { headers, .. } = &mut self {
             headers.push((name.to_owned(), value.to_owned()));
         }
         self
     }
 
-    pub(crate) fn issue(node_id: &str) -> Self {
+    pub fn issue(node_id: &str) -> Self {
         Self::Issue {
             node_id: node_id.to_owned(),
             lifetime_secs: 3600,
@@ -155,7 +160,7 @@ impl Reply {
 
 /// A request the mock received.
 #[derive(Debug, Clone)]
-pub(crate) struct Recorded {
+pub struct Recorded {
     pub method: Method,
     pub path: String,
     pub headers: HeaderMap,
@@ -165,16 +170,16 @@ pub(crate) struct Recorded {
 }
 
 impl Recorded {
-    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+    pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).and_then(|v| v.to_str().ok())
     }
 
     /// The `Roxy-Node-State` header, parsed.
-    pub(crate) fn node_state(&self) -> crate::protocol::NodeState {
+    pub fn node_state(&self) -> crate::protocol::NodeState {
         serde_json::from_str(self.header(crate::protocol::NODE_STATE_HEADER).unwrap()).unwrap()
     }
 
-    pub(crate) fn json(&self) -> serde_json::Value {
+    pub fn json(&self) -> serde_json::Value {
         let body = if self.header("content-encoding") == Some("gzip") {
             use std::io::Read as _;
             let mut out = Vec::new();
@@ -199,7 +204,7 @@ struct Script {
 }
 
 /// The scripted control plane.
-pub(crate) struct MockServer {
+pub struct MockServer {
     pub ca: Arc<TestCa>,
     pub addr: SocketAddr,
     script: Arc<Mutex<Script>>,
@@ -208,7 +213,7 @@ pub(crate) struct MockServer {
 }
 
 impl MockServer {
-    pub(crate) async fn start() -> Self {
+    pub async fn start() -> Self {
         let ca = Arc::new(TestCa::new());
         let acceptor = TlsAcceptor::from(ca.server_config());
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -265,12 +270,12 @@ impl MockServer {
         }
     }
 
-    pub(crate) fn url(&self) -> String {
+    pub fn url(&self) -> String {
         format!("https://{}", self.addr)
     }
 
     /// Queues `reply` for the next request to `path`.
-    pub(crate) fn push(&self, path: &str, reply: Reply) {
+    pub fn push(&self, path: &str, reply: Reply) {
         lock(&self.script)
             .queued
             .entry(path.to_owned())
@@ -279,15 +284,15 @@ impl MockServer {
     }
 
     /// The reply for `path` once its queue is empty.
-    pub(crate) fn fallback(&self, path: &str, reply: Reply) {
+    pub fn fallback(&self, path: &str, reply: Reply) {
         lock(&self.script).fallback.insert(path.to_owned(), reply);
     }
 
-    pub(crate) fn received(&self) -> Vec<Recorded> {
+    pub fn received(&self) -> Vec<Recorded> {
         lock(&self.script).received.clone()
     }
 
-    pub(crate) fn requests_to(&self, path: &str) -> Vec<Recorded> {
+    pub fn requests_to(&self, path: &str) -> Vec<Recorded> {
         self.received()
             .into_iter()
             .filter(|r| r.path == path)
@@ -295,7 +300,7 @@ impl MockServer {
     }
 
     /// Waits until `path` has been requested at least `n` times.
-    pub(crate) async fn wait_for(&self, path: &str, n: usize) -> Vec<Recorded> {
+    pub async fn wait_for(&self, path: &str, n: usize) -> Vec<Recorded> {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let notified = self.received.notified();

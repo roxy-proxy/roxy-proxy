@@ -5,6 +5,7 @@
 pub mod addons;
 pub mod config;
 pub mod lists;
+pub mod node;
 pub mod ruletest;
 pub mod run;
 pub mod secrets;

@@ -79,6 +79,17 @@ impl ReloadableMetrics {
         *defs = policy.metric_defs().to_vec();
     }
 
+    /// Builds the store for `policy` with nothing carried over: every
+    /// window starts empty.
+    pub fn reset(&self, policy: &Policy, limits: MetricLimits) {
+        let mut defs = self.defs.lock().unwrap_or_else(PoisonError::into_inner);
+        self.inner.store(Arc::new(MetricStore::with_limits(
+            policy.metric_defs(),
+            limits,
+        )));
+        *defs = policy.metric_defs().to_vec();
+    }
+
     /// Live key count, for diagnostics.
     pub fn key_count(&self) -> usize {
         self.inner.load().key_count()
@@ -109,6 +120,11 @@ pub struct BuiltinState(pub StateStore);
 impl BuiltinState {
     pub fn new(max_entries: usize) -> Self {
         Self(StateStore::new(max_entries, STATE_DEFAULT_TTL))
+    }
+
+    /// Drops every `set_state` entry.
+    pub fn clear(&self) {
+        self.0.clear();
     }
 }
 
@@ -198,6 +214,32 @@ mod tests {
             Err(MetricSourceError::TableFull(id)) if id == "by_path"
         ));
         assert_eq!(m.key_count(), 2);
+    }
+
+    /// `reset` is the install with nothing carried: the series are gone
+    /// and the next record starts a fresh window, while a plain install
+    /// of the same policy keeps them.
+    #[test]
+    fn reset_drops_every_series_where_install_keeps_them() {
+        let policy = policy();
+        let m = ReloadableMetrics::new(&policy, limits(1 << 20));
+        record(&m, "/a").unwrap();
+        record(&m, "/a").unwrap();
+        let view = MapView::new().with_str(Field::Path, "/a");
+        m.install(&policy, limits(1 << 20));
+        assert_eq!(m.get("by_path", &view), Ok(2));
+        m.reset(&policy, limits(1 << 20));
+        assert_eq!(m.get("by_path", &view), Ok(0));
+        assert_eq!(m.key_count(), 0);
+        record(&m, "/a").unwrap();
+        assert_eq!(m.get("by_path", &view), Ok(1));
+        assert!(m.keeps_every_metric(&policy));
+
+        let state = BuiltinState::new(10);
+        state.set("quarantine", "1", None).unwrap();
+        state.clear();
+        assert_eq!(state.get("quarantine"), None);
+        assert!(state.0.is_empty());
     }
 
     /// Growing the budget on reload carries everything over.

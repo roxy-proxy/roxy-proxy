@@ -1,0 +1,520 @@
+//! Node mode end to end: a scripted control plane, a roxy node and the
+//! test upstream.
+
+mod support;
+
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use roxy::node::{Bootstrap, NodeOptions, NodeRunning};
+use roxy_node::protocol::{
+    FlowAck, FlowSettings, LEASE_REFRESH_AFTER_HEADER, LEASE_VALID_FOR_HEADER, Lease, OnHighWater,
+    PolicyState, sha256_hex,
+};
+use roxy_node::testkit::{MockServer, Reply};
+use roxy_proxy::MemorySink;
+use serde_json::Value;
+use support::{SECRET, TestCa, Upstream, start_upstream, test_ca};
+
+const ENROL: &str = "/roxy/v1/enrol";
+const LEASE: &str = "/roxy/v1/lease";
+const FLOWS: &str = "/roxy/v1/flows";
+
+struct NodeHarness {
+    mock: MockServer,
+    dir: tempfile::TempDir,
+    upstream: Upstream,
+    _test_ca: TestCa,
+    sink: Arc<MemorySink>,
+    running: Option<NodeRunning>,
+    /// The bootstrap proxy listener.
+    bootstrap_proxy: SocketAddr,
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+impl NodeHarness {
+    async fn start() -> Self {
+        let mock = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let test_ca = test_ca();
+        std::fs::write(dir.path().join("upstream-ca.pem"), &test_ca.pem).unwrap();
+        std::fs::write(dir.path().join("token"), SECRET).unwrap();
+        std::fs::write(dir.path().join("enrol-token"), "tok-1\n").unwrap();
+        std::fs::write(dir.path().join("cp-ca.pem"), &mock.ca.pem).unwrap();
+        let upstream = start_upstream(&test_ca);
+        mock.push(ENROL, Reply::issue("n1"));
+        mock.fallback(
+            FLOWS,
+            Reply::json(
+                200,
+                &FlowAck {
+                    acked_through: u64::MAX,
+                },
+            ),
+        );
+        Self {
+            mock,
+            dir,
+            upstream,
+            _test_ca: test_ca,
+            sink: Arc::new(MemorySink::new()),
+            running: None,
+            bootstrap_proxy: "127.0.0.1:0".parse().unwrap(),
+        }
+    }
+
+    fn state_dir(&self) -> std::path::PathBuf {
+        self.dir.path().join("state")
+    }
+
+    fn options(&self, with_token: bool) -> NodeOptions {
+        NodeOptions {
+            enrol_token_file: with_token.then(|| self.dir.path().join("enrol-token")),
+            control_plane_ca: Some(self.dir.path().join("cp-ca.pem")),
+            bootstrap: Bootstrap {
+                proxy_bind: "127.0.0.1:0".parse().unwrap(),
+                ca_server_bind: Some("127.0.0.1:0".parse().unwrap()),
+            },
+            local_sink: Some(self.sink.clone()),
+            time_scale: 0.05,
+            ..NodeOptions::new(&self.mock.url(), &self.state_dir())
+        }
+    }
+
+    async fn run(&mut self, with_token: bool) {
+        let running = roxy::node::start(self.options(with_token))
+            .await
+            .unwrap_or_else(|e| panic!("node failed to start: {e:#}"));
+        self.bootstrap_proxy = running
+            .handler
+            .local_addrs()
+            .await
+            .into_iter()
+            .find(|(n, _)| n == "proxy")
+            .map(|(_, a)| a)
+            .unwrap();
+        self.running = Some(running);
+    }
+
+    fn running(&self) -> &NodeRunning {
+        self.running.as_ref().unwrap()
+    }
+
+    /// A rendered config for the lease: the test upstream's CA and hosts,
+    /// `rules` and anything in `extra` at the top level.
+    fn config(&self, proxy_port: u16, rules: &str, extra: &str) -> String {
+        let dir = self.dir.path().display();
+        let rules = if rules.trim().is_empty() {
+            "rules: []\n".to_owned()
+        } else {
+            format!("rules:\n{rules}")
+        };
+        format!(
+            "version: 1\nlisteners: [{{ name: proxy, bind: 127.0.0.1:{proxy_port} }}]\n\
+             ca_server: {{ bind: 127.0.0.1:0 }}\n\
+             tls:\n  upstream:\n    verify: strict+extra_roots\n    extra_roots: [{dir}/upstream-ca.pem]\n\
+             limits: {{ header_timeout: 5s, response_header_timeout: 2s }}\n\
+             upstream:\n  connect_timeout: 2s\n  dns:\n    resolver: [\"127.0.0.1:9\"]\n    \
+             static_hosts: {{ upstream.test: 127.0.0.1 }}\n\
+             secrets:\n  token: {{ file: {dir}/token }}\n{extra}{rules}"
+        )
+    }
+
+    fn lease(id: &str, config: &str, secrets_hash: &str, epoch: &str) -> Lease {
+        Lease {
+            lease_id: id.to_owned(),
+            issued_at: chrono::Utc::now(),
+            valid_for_seconds: 600,
+            refresh_after_seconds: 1,
+            config_hash: sha256_hex(config.as_bytes()),
+            config: config.to_owned(),
+            secrets: std::collections::BTreeMap::default(),
+            secrets_hash: secrets_hash.to_owned(),
+            state_epoch: epoch.to_owned(),
+            flow: FlowSettings {
+                ship: true,
+                batch_max_bytes: 1 << 20,
+                batch_max_events: 1,
+                flush_interval_seconds: 1,
+                spool_high_water_bytes: 8 << 20,
+                on_high_water: OnHighWater::Spool,
+            },
+            interception_ca: None,
+        }
+    }
+
+    /// Waits until the node reports `lease_id` as the lease it runs.
+    async fn wait_applied(&self, lease_id: &str) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if self
+                    .mock
+                    .requests_to(LEASE)
+                    .iter()
+                    .any(|r| r.node_state().lease_id.as_deref() == Some(lease_id))
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("lease {lease_id} was never reported as applied"));
+    }
+
+    async fn proxy_addr(&self) -> SocketAddr {
+        self.running()
+            .handler
+            .local_addrs()
+            .await
+            .into_iter()
+            .find(|(n, _)| n == "proxy")
+            .map(|(_, a)| a)
+            .expect("a proxy listener")
+    }
+
+    fn client(&self, proxy: SocketAddr) -> reqwest::Client {
+        let ca = std::fs::read(self.state_dir().join("ca/roxy-ca.pem")).unwrap();
+        reqwest::Client::builder()
+            .no_proxy()
+            .proxy(reqwest::Proxy::all(format!("http://{proxy}")).unwrap())
+            .add_root_certificate(reqwest::Certificate::from_pem(&ca).unwrap())
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap()
+    }
+
+    fn https_url(&self, path: &str) -> String {
+        format!("https://upstream.test:{}{path}", self.upstream.https.port())
+    }
+
+    /// `(status, x-roxy-rule)` of a request through `proxy`.
+    async fn get(&self, proxy: SocketAddr, path: &str) -> (u16, Option<String>) {
+        let res = self
+            .client(proxy)
+            .get(self.https_url(path))
+            .send()
+            .await
+            .unwrap();
+        let rule = res
+            .headers()
+            .get("x-roxy-rule")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        (res.status().as_u16(), rule)
+    }
+
+    async fn stop(&mut self) {
+        if let Some(r) = self.running.take() {
+            r.shutdown(Duration::from_secs(1)).await;
+        }
+    }
+}
+
+/// One rule in block YAML, so `when` may hold quotes and brackets.
+fn rule(id: &str, when: &str, then: &str) -> String {
+    format!("  - id: {id}\n    when: {when}\n    then: {then}\n")
+}
+
+const ALLOW: &str = "{ allow: { private_ok: true } }";
+
+fn files_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_denies_until_its_first_lease_then_serves_it_and_ships_flows() {
+    let mut h = NodeHarness::start().await;
+    let port = free_port();
+    let config = h.config(
+        port,
+        &rule(
+            "up",
+            "host == \"upstream.test\"",
+            "[{ set_header: { authorization: \"Bearer ${secret:token}\" } }, { allow: { private_ok: true } }]",
+        ),
+        "",
+    );
+    // The lease arrives after a while, so the bootstrap window can be seen.
+    h.mock.push(
+        LEASE,
+        Reply::Delayed(
+            Duration::from_millis(700),
+            Box::new(Reply::json(
+                200,
+                &NodeHarness::lease("L1", &config, "s1", "e1"),
+            )),
+        ),
+    );
+    h.mock.fallback(
+        LEASE,
+        Reply::status(304)
+            .with_header(LEASE_VALID_FOR_HEADER, "600")
+            .with_header(LEASE_REFRESH_AFTER_HEADER, "1"),
+    );
+    h.run(true).await;
+
+    // Before the lease: the bootstrap listener is up and denies.
+    let (status, rule) = h.get(h.bootstrap_proxy, "/early").await;
+    assert_eq!(status, 403);
+    assert_eq!(rule.as_deref(), Some("_default"));
+    assert!(h.upstream.seen().is_empty());
+
+    h.wait_applied("L1").await;
+    // The lease's listener replaced the bootstrap one.
+    let proxy = h.proxy_addr().await;
+    assert_eq!(proxy.port(), port);
+    assert_eq!(h.get(proxy, "/after").await, (200, None));
+    let seen = h.upstream.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].header("authorization"),
+        Some(format!("Bearer {SECRET}").as_str()),
+        "file-sourced secrets are resolved on the node"
+    );
+
+    // Flow events reach the control plane with the node's sequence numbers.
+    let posts = h.mock.wait_for(FLOWS, 2).await;
+    let shipped: Vec<Value> = posts
+        .iter()
+        .flat_map(|p| p.json()["events"].as_array().unwrap().clone())
+        .collect();
+    assert!(
+        shipped
+            .iter()
+            .all(|e| e["seq"].is_u64() && e["ts"].is_string()),
+        "{shipped:?}"
+    );
+    assert!(
+        shipped
+            .iter()
+            .any(|e| e["event"] == "request" && e["rules"][0] == "up"),
+        "{shipped:?}"
+    );
+    assert_eq!(posts[0].json()["node_id"], "n1");
+    assert_eq!(posts[0].json()["lease_id"], "L1");
+    assert_eq!(posts[0].client.as_deref(), Some("n1"));
+    let early_denied = h
+        .sink
+        .events()
+        .iter()
+        .any(|e| e["event"] == "request" && e["terminal_rule"] == "_default");
+    assert!(early_denied, "the local flow log keeps every event too");
+
+    // Nothing but the identity, the counter and the CA touch the disk.
+    assert_eq!(
+        files_in(&h.state_dir()),
+        ["ca", "flow.seq", "node.crt", "node.key"]
+    );
+    assert_eq!(
+        files_in(&h.state_dir().join("ca")),
+        ["roxy-ca.key", "roxy-ca.pem"]
+    );
+    let state_text = std::fs::read_to_string(h.state_dir().join("node.crt")).unwrap();
+    assert!(!state_text.contains(SECRET));
+
+    h.stop().await;
+
+    // A second start finds the identity and goes straight to the lease.
+    h.mock.push(
+        LEASE,
+        Reply::json(200, &NodeHarness::lease("L2", &config, "s1", "e1")),
+    );
+    h.run(false).await;
+    h.wait_applied("L2").await;
+    assert_eq!(h.mock.requests_to(ENROL).len(), 1);
+    assert_eq!(h.proxy_addr().await.port(), port);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_state_epoch_clears_metric_windows_and_rule_state() {
+    let mut h = NodeHarness::start().await;
+    let rules = [
+        rule("tripped", "state[\"tripped\"] == \"1\"", "deny"),
+        rule(
+            "trip",
+            "path == \"/trip\"",
+            "[{ set_state: { key: tripped, value: \"1\" } }, { allow: { private_ok: true } }]",
+        ),
+        rule("limit", "metric.hits >= 2", "deny"),
+        rule("up", "host == \"upstream.test\"", ALLOW),
+    ]
+    .concat();
+    let metrics = "metrics: [{ id: hits, count: requests, window: 1h }]\n";
+    let config = h.config(0, &rules, metrics);
+    h.mock.push(
+        LEASE,
+        Reply::json(200, &NodeHarness::lease("L1", &config, "s1", "e1")),
+    );
+    h.mock.fallback(
+        LEASE,
+        Reply::status(304)
+            .with_header(LEASE_VALID_FOR_HEADER, "600")
+            .with_header(LEASE_REFRESH_AFTER_HEADER, "1"),
+    );
+    h.run(true).await;
+    h.wait_applied("L1").await;
+    let proxy = h.proxy_addr().await;
+    assert_eq!(h.get(proxy, "/a").await.0, 200);
+    assert_eq!(h.get(proxy, "/b").await.0, 200);
+    assert_eq!(h.get(proxy, "/c").await, (403, Some("limit".into())));
+
+    // Same epoch, changed config: windows and state carry over.
+    let config2 = format!("{config}# v2\n");
+    h.mock.push(
+        LEASE,
+        Reply::json(200, &NodeHarness::lease("L2", &config2, "s1", "e1")),
+    );
+    h.wait_applied("L2").await;
+    assert_eq!(h.get(proxy, "/d").await, (403, Some("limit".into())));
+
+    // A new epoch starts the windows afresh.
+    h.mock.push(
+        LEASE,
+        Reply::json(200, &NodeHarness::lease("L3", &config2, "s1", "e2")),
+    );
+    h.wait_applied("L3").await;
+    assert_eq!(h.get(proxy, "/e").await, (200, None));
+    assert_eq!(h.get(proxy, "/trip").await, (200, None));
+    assert_eq!(h.get(proxy, "/f").await, (403, Some("tripped".into())));
+
+    // And clears rule state.
+    h.mock.push(
+        LEASE,
+        Reply::json(200, &NodeHarness::lease("L4", &config2, "s1", "e3")),
+    );
+    h.wait_applied("L4").await;
+    assert_eq!(h.get(proxy, "/g").await, (200, None));
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revocation_denies_at_once_and_keeps_health_up() {
+    let mut h = NodeHarness::start().await;
+    let config = h.config(0, &rule("up", "host == \"upstream.test\"", ALLOW), "");
+    h.mock.push(
+        LEASE,
+        Reply::json(200, &NodeHarness::lease("L1", &config, "s1", "e1")),
+    );
+    h.mock.fallback(
+        LEASE,
+        Reply::status(304)
+            .with_header(LEASE_VALID_FOR_HEADER, "600")
+            .with_header(LEASE_REFRESH_AFTER_HEADER, "1"),
+    );
+    h.run(true).await;
+    h.wait_applied("L1").await;
+    let proxy = h.proxy_addr().await;
+    assert_eq!(h.get(proxy, "/ok").await.0, 200);
+    h.mock.push(LEASE, Reply::status(410));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !h.running().node.is_revoked() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The handler installs the empty policy before the node marks itself
+    // revoked, so the very next request is denied.
+    assert_eq!(h.get(proxy, "/gone").await, (403, Some("_default".into())));
+    let ca_server = h.running().handler.ca_server_addr().await.unwrap();
+    let health = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("http://{ca_server}/healthz"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), 200);
+    let fetches = h.mock.requests_to(LEASE).len();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(h.mock.requests_to(LEASE).len(), fetches, "polling stopped");
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_control_plane_lets_the_lease_run_down() {
+    let mut h = NodeHarness::start().await;
+    let config = h.config(0, &rule("up", "host == \"upstream.test\"", ALLOW), "");
+    let mut lease = NodeHarness::lease("L1", &config, "s1", "e1");
+    lease.valid_for_seconds = 1;
+    h.mock.push(LEASE, Reply::json(200, &lease));
+    h.mock.fallback(LEASE, Reply::status(503));
+    h.run(true).await;
+    h.wait_applied("L1").await;
+    let proxy = h.proxy_addr().await;
+    assert_eq!(h.get(proxy, "/ok").await.0, 200);
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    assert_eq!(h.get(proxy, "/late").await, (403, Some("_expired".into())));
+    let so_far = h.mock.requests_to(LEASE).len();
+    let fetches = h.mock.wait_for(LEASE, so_far + 1).await;
+    let last = fetches.last().unwrap().node_state();
+    assert_eq!(last.policy_state, PolicyState::Expired);
+    assert_eq!(
+        last.lease_id.as_deref(),
+        Some("L1"),
+        "the run-down lease is still reported"
+    );
+
+    // A lease that reaches the node recovers it without a restart.
+    h.mock.push(
+        LEASE,
+        Reply::json(200, &NodeHarness::lease("L2", &config, "s1", "e1")),
+    );
+    h.wait_applied("L2").await;
+    assert_eq!(h.get(proxy, "/again").await.0, 200);
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_the_node_cannot_apply_is_refused_and_the_old_one_stays() {
+    let mut h = NodeHarness::start().await;
+    let config = h.config(0, &rule("up", "host == \"upstream.test\"", ALLOW), "");
+    h.mock.push(
+        LEASE,
+        Reply::json(200, &NodeHarness::lease("L1", &config, "s1", "e1")),
+    );
+    // Invalid rule language.
+    let broken = h.config(0, &rule("bad", "host ===", ALLOW), "");
+    h.mock.push(
+        LEASE,
+        Reply::json(200, &NodeHarness::lease("L2", &broken, "s1", "e1")),
+    );
+    // A hash that lies about the config.
+    let mut lying = NodeHarness::lease("L3", &config, "s1", "e1");
+    lying.config_hash = "sha256:0".into();
+    h.mock.push(LEASE, Reply::json(200, &lying));
+    h.mock.fallback(
+        LEASE,
+        Reply::status(304).with_header(LEASE_VALID_FOR_HEADER, "600"),
+    );
+    h.run(true).await;
+    h.wait_applied("L1").await;
+    let proxy = h.proxy_addr().await;
+    h.mock.wait_for(LEASE, 4).await;
+    let reported: Vec<Option<String>> = h
+        .mock
+        .requests_to(LEASE)
+        .iter()
+        .map(|r| r.node_state().lease_id)
+        .collect();
+    assert_eq!(reported[3].as_deref(), Some("L1"), "{reported:?}");
+    assert_eq!(h.get(proxy, "/still").await.0, 200);
+    h.stop().await;
+}

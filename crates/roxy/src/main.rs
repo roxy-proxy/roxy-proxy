@@ -50,10 +50,51 @@ struct ConfigArg {
     config: PathBuf,
 }
 
+/// `roxy run`: a config file, or node mode against a control plane.
+#[derive(Debug, Args)]
+#[command(group(
+    clap::ArgGroup::new("source")
+        .required(true)
+        .args(["config", "control_plane"])
+))]
+struct RunArgs {
+    /// Path to the roxy YAML config.
+    #[arg(long, short = 'c')]
+    config: Option<PathBuf>,
+    /// Node mode: the control plane's `https://` URL. The config and
+    /// secrets come from its lease; nothing but the node certificate, key,
+    /// flow counter and interception CA is kept in `--state-dir`.
+    #[arg(long, requires = "state_dir", conflicts_with = "config")]
+    control_plane: Option<String>,
+    /// Single-use enrolment token, read once on a start with no node
+    /// certificate in the state dir.
+    #[arg(long, requires = "control_plane")]
+    enrol_token_file: Option<PathBuf>,
+    /// Where the node keeps its certificate and key.
+    #[arg(long, requires = "control_plane")]
+    state_dir: Option<PathBuf>,
+    /// PEM CA bundle to verify the control plane with (default: system
+    /// roots).
+    #[arg(long, requires = "control_plane")]
+    control_plane_ca: Option<PathBuf>,
+    /// Interception CA certificate to import into the state dir when it
+    /// holds none.
+    #[arg(long, requires_all = ["control_plane", "interception_ca_key"])]
+    interception_ca_cert: Option<PathBuf>,
+    /// Its PKCS#8 PEM key.
+    #[arg(long, requires = "interception_ca_cert")]
+    interception_ca_key: Option<PathBuf>,
+    /// Replace a stored interception CA that differs from the one given.
+    /// Every workload trusting the old CA breaks.
+    #[arg(long, requires = "interception_ca_cert")]
+    replace_interception_ca: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Load the config and CA and run the proxy.
-    Run(ConfigArg),
+    /// Load the config and CA and run the proxy, or run as a node of a
+    /// control plane (`--control-plane`).
+    Run(RunArgs),
     /// Validate a config and print diagnostics. Exits 1 if it has problems.
     Check(ConfigArg),
     /// Manage roxy's certificate authority.
@@ -197,7 +238,10 @@ fn main() -> ExitCode {
 
 fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
     match command {
-        Command::Run(args) => run(&args.config),
+        Command::Run(args) => match args.config {
+            Some(path) => run(&path),
+            None => run_node(args),
+        },
         Command::Check(args) => Ok(check(&args.config)),
         Command::Ca {
             command: CaCommand::Init { config, force },
@@ -664,6 +708,65 @@ fn run(path: &Path) -> anyhow::Result<ExitCode> {
 
 /// In-flight exchanges get this long to finish at shutdown.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `roxy run --control-plane`: node mode. The listeners open at once and
+/// deny everything until the first lease. `SIGHUP` reopens the logs; there
+/// is no file to reload.
+fn run_node(args: RunArgs) -> anyhow::Result<ExitCode> {
+    let control_plane = args.control_plane.expect("clap: --control-plane");
+    let state_dir = args.state_dir.expect("clap: --state-dir");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting tokio runtime")?;
+    runtime.block_on(async {
+        let running = roxy::node::start(roxy::node::NodeOptions {
+            enrol_token_file: args.enrol_token_file,
+            control_plane_ca: args.control_plane_ca,
+            interception_ca: args.interception_ca_cert.zip(args.interception_ca_key),
+            replace_interception_ca: args.replace_interception_ca,
+            ..roxy::node::NodeOptions::new(&control_plane, &state_dir)
+        })
+        .await?;
+        let listeners: Vec<String> = running
+            .handler
+            .local_addrs()
+            .await
+            .iter()
+            .map(|(n, a)| format!("{n}={a}"))
+            .collect();
+        tracing::info!(
+            listeners = listeners.join(","),
+            ca_server = ?running.handler.ca_server_addr().await,
+            control_plane = %control_plane,
+            "roxy running as a node"
+        );
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut term = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+            let mut hup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
+            loop {
+                tokio::select! {
+                    r = tokio::signal::ctrl_c() => break r.context("waiting for ctrl-c")?,
+                    _ = term.recv() => break,
+                    _ = hup.recv() => {
+                        tracing::info!("SIGHUP: reopening logs");
+                        running.reopen_logs().await;
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c()
+            .await
+            .context("waiting for ctrl-c")?;
+        tracing::info!("roxy shutting down");
+        running.shutdown(SHUTDOWN_GRACE).await;
+        anyhow::Ok(())
+    })?;
+    Ok(ExitCode::SUCCESS)
+}
 
 /// Waits for ctrl-c or SIGTERM; on SIGHUP meanwhile, reopens the flow log
 /// file (for external log rotation) and reloads the config. The reload runs

@@ -3,7 +3,9 @@
 //! spooled flows. What a lease means for the proxy is the [`LeaseHandler`]'s
 //! business; this module decides *when* and *whether* to call it.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -62,25 +64,33 @@ pub struct Change {
     pub state_epoch: bool,
 }
 
-/// Applies leases to the proxy.
+/// The future a [`LeaseHandler`] method returns.
+pub type HandlerFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Applies leases to the proxy. The methods run on the node's lease task,
+/// one at a time.
 pub trait LeaseHandler: Send + Sync {
     /// Applies `lease`, received at `received_at` (the base of
     /// `valid_until`). A lease with no change in `change` still extends
     /// the lease. `Err` keeps the running policy; the error is logged and
     /// the node reports the old hashes on its next fetch.
-    fn apply(
-        &self,
-        lease: &Lease,
+    fn apply<'a>(
+        &'a self,
+        lease: &'a Lease,
         received_at: DateTime<Utc>,
         change: Change,
-    ) -> Result<(), String>;
+    ) -> HandlerFuture<'a, Result<(), String>>;
 
     /// A `304`: the lease the node runs is extended to `received_at +
     /// valid_for`. Nothing else changes.
-    fn extend(&self, received_at: DateTime<Utc>, valid_for: Duration) -> Result<(), String>;
+    fn extend(
+        &self,
+        received_at: DateTime<Utc>,
+        valid_for: Duration,
+    ) -> HandlerFuture<'_, Result<(), String>>;
 
     /// The node is revoked: deny everything, at once.
-    fn revoke(&self);
+    fn revoke(&self) -> HandlerFuture<'_, ()>;
 
     /// What the proxy is running, for the lease fetch headers.
     fn policy_state(&self) -> PolicyState;
@@ -350,21 +360,21 @@ impl Node {
             let wait = match id.client.fetch_lease(&state, etag.as_deref()).await {
                 LeaseFetch::Lease(lease, etag) => {
                     backoff.reset();
-                    self.apply(&lease, etag)
+                    self.apply(&lease, etag).await
                 }
                 LeaseFetch::Unchanged {
                     valid_for_seconds,
                     refresh_after_seconds,
                 } => {
                     backoff.reset();
-                    self.extend(valid_for_seconds, refresh_after_seconds)
+                    self.extend(valid_for_seconds, refresh_after_seconds).await
                 }
                 LeaseFetch::Revoked => {
                     tracing::warn!(
                         "control plane says this node is revoked; denying everything and stopping"
                     );
                     self.revoked.store(true, Ordering::Release);
-                    self.handler.revoke();
+                    self.handler.revoke().await;
                     return;
                 }
                 LeaseFetch::Unsupported(e) => {
@@ -394,33 +404,33 @@ impl Node {
     /// A `304` with the lease's durations moves `valid_until` forward from
     /// now. Without them (an older server) the lease is left to run down
     /// and only the poll interval is kept.
-    fn extend(
+    async fn extend(
         &self,
         valid_for_seconds: Option<u64>,
         refresh_after_seconds: Option<u64>,
     ) -> Duration {
-        let mut current = lock(&self.current);
-        if let Some(valid_for) = valid_for_seconds {
-            if let Some(refresh) = refresh_after_seconds {
-                current.refresh_after = Duration::from_secs(refresh.clamp(1, valid_for.max(1)));
-            }
-            if let Err(e) = self
-                .handler
-                .extend(Utc::now(), Duration::from_secs(valid_for))
-            {
-                tracing::error!(error = %e, "lease could not be extended");
-            }
-        } else {
+        let Some(valid_for) = valid_for_seconds else {
             tracing::warn!("304 without roxy-lease-valid-for; the lease is not extended");
+            return lock(&self.current).refresh_after;
+        };
+        if let Some(refresh) = refresh_after_seconds {
+            lock(&self.current).refresh_after =
+                Duration::from_secs(refresh.clamp(1, valid_for.max(1)));
         }
-        current.refresh_after
+        if let Err(e) = self
+            .handler
+            .extend(Utc::now(), Duration::from_secs(valid_for))
+            .await
+        {
+            tracing::error!(error = %e, "lease could not be extended");
+        }
+        lock(&self.current).refresh_after
     }
 
     /// Checks and applies a fetched lease; returns how long to wait for the
     /// next fetch.
-    fn apply(&self, lease: &Lease, etag: Option<String>) -> Duration {
+    async fn apply(&self, lease: &Lease, etag: Option<String>) -> Duration {
         let received_at = Utc::now();
-        let mut current = lock(&self.current);
         let refresh = Duration::from_secs(
             lease
                 .refresh_after_seconds
@@ -433,16 +443,21 @@ impl Node {
             );
             return refresh;
         }
-        let change = Change {
-            config: current.config_hash.as_deref() != Some(&lease.config_hash),
-            secrets: current.secrets_hash.as_deref() != Some(&lease.secrets_hash),
-            // The first lease sets the epoch without clearing anything.
-            state_epoch: current
-                .state_epoch
-                .as_deref()
-                .is_some_and(|e| e != lease.state_epoch),
+        let change = {
+            let current = lock(&self.current);
+            Change {
+                config: current.config_hash.as_deref() != Some(&lease.config_hash),
+                secrets: current.secrets_hash.as_deref() != Some(&lease.secrets_hash),
+                // The first lease sets the epoch without clearing anything.
+                state_epoch: current
+                    .state_epoch
+                    .as_deref()
+                    .is_some_and(|e| e != lease.state_epoch),
+            }
         };
-        match self.handler.apply(lease, received_at, change) {
+        let applied = self.handler.apply(lease, received_at, change).await;
+        let mut current = lock(&self.current);
+        match applied {
             Ok(()) => {
                 tracing::info!(
                     lease_id = %lease.lease_id,
@@ -754,23 +769,35 @@ mod tests {
     }
 
     impl LeaseHandler for Recorder {
-        fn extend(&self, at: DateTime<Utc>, valid_for: Duration) -> Result<(), String> {
+        fn extend(
+            &self,
+            at: DateTime<Utc>,
+            valid_for: Duration,
+        ) -> HandlerFuture<'_, Result<(), String>> {
             lock(&self.extended).push((at, valid_for));
-            Ok(())
+            Box::pin(async { Ok(()) })
         }
 
-        fn apply(&self, lease: &Lease, at: DateTime<Utc>, change: Change) -> Result<(), String> {
-            if self.fail_next.swap(false, Ordering::AcqRel) {
-                return Err("config invalid: boom".into());
-            }
-            lock(&self.applied).push((lease.clone(), at, change));
-            *lock(&self.state) = PolicyState::Loaded;
-            Ok(())
+        fn apply<'a>(
+            &'a self,
+            lease: &'a Lease,
+            at: DateTime<Utc>,
+            change: Change,
+        ) -> HandlerFuture<'a, Result<(), String>> {
+            Box::pin(async move {
+                if self.fail_next.swap(false, Ordering::AcqRel) {
+                    return Err("config invalid: boom".into());
+                }
+                lock(&self.applied).push((lease.clone(), at, change));
+                *lock(&self.state) = PolicyState::Loaded;
+                Ok(())
+            })
         }
 
-        fn revoke(&self) {
+        fn revoke(&self) -> HandlerFuture<'_, ()> {
             self.revoked.fetch_add(1, Ordering::AcqRel);
-            *lock(&self.state) = PolicyState::None;
+            *lock(&self.state) = PolicyState::Expired;
+            Box::pin(async {})
         }
 
         fn policy_state(&self) -> PolicyState {
