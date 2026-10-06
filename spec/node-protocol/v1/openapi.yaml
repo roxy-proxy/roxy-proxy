@@ -81,53 +81,27 @@ paths:
           $ref: "#/components/responses/ServerError"
 
   /lease:
-    get:
+    post:
       operationId: lease
-      summary: Fetch the node's lease, or learn that it is unchanged.
+      summary: Report the node's state and fetch its lease.
       description: |
-        The node reports its state in `Roxy-Node-State` and the ETag of the
-        lease it holds in `If-None-Match`. A `304` extends the lease the node
-        already holds by the amounts in its headers; the node applies them
-        exactly as it would `valid_for_seconds` and `refresh_after_seconds`
-        from a `200`.
-      parameters:
-        - $ref: "#/components/parameters/NodeState"
-        - name: If-None-Match
-          in: header
-          required: false
-          description: The `ETag` of the lease the node holds, which is its `lease_id` quoted.
-          schema:
-            type: string
-            examples: ['"lease-01J9Z8K3"']
+        The body is the node's state. Every poll answers `200` with the full
+        lease; the node compares `config` and `secrets` with what it holds
+        and applies only what differs. A lease whose `lease_id` matches the
+        one reported only moves `valid_until`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NodeState"
       responses:
         "200":
-          description: A lease. The node applies it in full or not at all.
-          headers:
-            ETag:
-              $ref: "#/components/headers/ETag"
+          description: The node's lease. The node applies it in full or not at all.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Lease"
-        "304":
-          description: |
-            The lease the node holds is still the one the server would issue.
-            No body. The headers extend it.
-          headers:
-            ETag:
-              $ref: "#/components/headers/ETag"
-            Roxy-Lease-Valid-For:
-              required: true
-              description: Seconds from receipt for which the held lease is now valid.
-              schema:
-                type: integer
-                minimum: 1
-            Roxy-Lease-Refresh-After:
-              required: true
-              description: Seconds from receipt after which to poll again; inside `Roxy-Lease-Valid-For`.
-              schema:
-                type: integer
-                minimum: 1
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -148,7 +122,9 @@ paths:
         survives restarts. The server deduplicates on `(node_id, seq)` and
         acknowledges the highest `seq` it has stored; the node drops spooled
         events at or below it. A gap in a node's sequence is a server-side
-        alert, not an error.
+        alert, not an error. The node keeps every batch within the lease's
+        `batch_max_bytes`; a server that refuses a batch within that size is
+        a server error, treated as `5XX`.
       parameters:
         - name: Content-Encoding
           in: header
@@ -183,16 +159,6 @@ paths:
           $ref: "#/components/responses/Unrecognised"
         "410":
           $ref: "#/components/responses/Revoked"
-        "413":
-          description: |
-            The batch is larger than the server will take, measured on the
-            JSON before compression. The node halves `batch_max_events` and
-            retries, down to one event; a single event still refused is
-            dropped and logged once.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
         "507":
           description: |
             The node's flow quota is exhausted. Terminal for shipping until a
@@ -217,24 +183,6 @@ components:
         The node certificate issued at enrolment, whose URI SAN
         `urn:roxy:node:<node_id>` names the node. The node presents the whole
         chain from the enrolment response.
-
-  parameters:
-    NodeState:
-      name: Roxy-Node-State
-      in: header
-      required: true
-      description: The node's state as one compact JSON object.
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/NodeState"
-
-  headers:
-    ETag:
-      required: true
-      description: The `lease_id`, quoted. Sent back as `If-None-Match`.
-      schema:
-        type: string
 
   requestBodies:
     EnrolRequest:
@@ -351,11 +299,9 @@ components:
 
     NodeState:
       type: object
-      description: Value of the `Roxy-Node-State` header.
+      description: Body of the lease fetch.
       required:
         - lease_id
-        - config_hash
-        - secrets_hash
         - roxy_version
         - protocol_version
         - uptime_seconds
@@ -365,13 +311,7 @@ components:
         lease_id:
           type: [string, "null"]
           minLength: 1
-          description: Null before the first lease.
-        config_hash:
-          type: [string, "null"]
-          pattern: "^sha256:[0-9a-f]{64}$"
-        secrets_hash:
-          type: [string, "null"]
-          minLength: 1
+          description: The lease the node holds; null before the first lease.
         roxy_version:
           type: string
           minLength: 1
@@ -391,23 +331,14 @@ components:
           description: Flow-log bytes accepted but not yet acknowledged.
 
     SecretValue:
-      description: UTF-8 text, or bytes as standard base64 with padding.
-      oneOf:
-        - type: string
-        - type: object
-          required: [b64]
-          additionalProperties: false
-          properties:
-            b64:
-              type: string
-              pattern: "^[A-Za-z0-9+/]*={0,2}$"
+      type: string
+      description: UTF-8 text.
 
     FlowSettings:
       type: object
       required:
         - ship
         - batch_max_bytes
-        - batch_max_events
         - flush_interval_seconds
         - spool_high_water_bytes
         - on_high_water
@@ -419,9 +350,6 @@ components:
           type: integer
           minimum: 1
           description: Largest batch, measured on the JSON before compression.
-        batch_max_events:
-          type: integer
-          minimum: 1
         flush_interval_seconds:
           type: integer
           minimum: 1
@@ -439,24 +367,17 @@ components:
       description: "`200` body of the lease fetch."
       required:
         - lease_id
-        - issued_at
         - valid_for_seconds
         - refresh_after_seconds
         - config
-        - config_hash
         - secrets
-        - secrets_hash
         - state_epoch
         - flow
       properties:
         lease_id:
           type: string
           minLength: 1
-          description: Opaque; changes whenever any other field changes. Also the `ETag`.
-        issued_at:
-          type: string
-          format: date-time
-          description: The server's clock, for logs only.
+          description: Opaque; changes whenever any other field changes. The node reports it on every poll.
         valid_for_seconds:
           type: integer
           minimum: 1
@@ -470,23 +391,17 @@ components:
           description: When to poll next, counted the same way; well inside `valid_for_seconds`.
         config:
           type: string
-          description: A complete `roxy.yaml` with no secret values; every `secrets:` entry is sourceless.
-        config_hash:
-          type: string
-          pattern: "^sha256:[0-9a-f]{64}$"
-          description: SHA-256 of the UTF-8 bytes of `config`. A change rebuilds the policy.
+          description: |
+            A complete `roxy.yaml` with no secret values; every `secrets:`
+            entry is sourceless. A change from what the node holds rebuilds
+            the policy.
         secrets:
           type: object
-          description: Each secret name the config declares, to its value.
+          description: |
+            Each secret name the config declares, to its value. A change with
+            `config` unchanged swaps the secret map only.
           additionalProperties:
             $ref: "#/components/schemas/SecretValue"
-        secrets_hash:
-          type: string
-          minLength: 1
-          description: |
-            Opaque; changes whenever any value changes. Not a plain digest of
-            the values, because the node reports and may log it. A change with
-            `config_hash` unchanged swaps the secret map only.
         state_epoch:
           type: string
           minLength: 1
@@ -545,7 +460,7 @@ components:
 
     Error:
       type: object
-      description: Body of every non-`2xx`, non-`304` response. The node acts on the status code, not the body.
+      description: Body of every non-`2xx` response. The node acts on the status code, not the body.
       required: [error, message]
       properties:
         error:
