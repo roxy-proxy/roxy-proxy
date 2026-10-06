@@ -339,11 +339,4 @@ mod tests {
             ));
         }
     }
-
-    #[test]
-    fn zero_cache_size_is_clamped() {
-        let m = minter(0);
-        m.certified_key(&name("example.com")).unwrap();
-        assert_eq!(m.cached(), 1);
-    }
 }

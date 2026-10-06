@@ -33,10 +33,9 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     }
-    if let Some((_, Sniff::Tls(info))) = &verdict {
-        assert!(info.record_len <= 5 + MAX_HELLO_BYTES);
-        if let Some(sni) = &info.sni {
-            assert_eq!(sni, &sni.to_ascii_lowercase());
-        }
+    if let Some((_, Sniff::Tls(info))) = &verdict
+        && let Some(sni) = &info.sni
+    {
+        assert_eq!(sni, &sni.to_ascii_lowercase());
     }
 });

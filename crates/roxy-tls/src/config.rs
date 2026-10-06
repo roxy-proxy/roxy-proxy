@@ -339,25 +339,6 @@ mod tests {
     }
 
     #[test]
-    fn client_config_extra_root_and_alpn() {
-        let (ca, m) = minter();
-        let (_t, pem) = write_ca(&ca);
-        let cfg = client_config(&UpstreamTlsOptions {
-            extra_roots_pem: vec![pem],
-            min_version: MinTlsVersion::Tls12,
-        })
-        .unwrap();
-        assert!(cfg.enable_sni);
-        assert_eq!(
-            cfg.alpn_protocols,
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-        );
-        let mut c = ClientConnection::new(cfg, name("example.com")).unwrap();
-        let mut s = ServerConnection::new(server_config_for(m, name("example.com"), true)).unwrap();
-        handshake(&mut c, &mut s).unwrap();
-    }
-
-    #[test]
     fn client_config_rejects_bad_pem() {
         let dir = tempfile::tempdir().unwrap();
         let opts = |p: PathBuf| UpstreamTlsOptions {

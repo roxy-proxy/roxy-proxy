@@ -21,7 +21,6 @@ const CONTENT_TYPE_HANDSHAKE: u8 = 22;
 const HANDSHAKE_CLIENT_HELLO: u8 = 1;
 const EXT_SERVER_NAME: u16 = 0;
 const EXT_ALPN: u16 = 16;
-const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const MAX_HOST: usize = 253;
 
 /// Result of [`sniff`].
@@ -42,12 +41,6 @@ pub struct ClientHelloInfo {
     pub sni: Option<String>,
     /// ALPN protocol names offered, in order.
     pub alpn: Vec<String>,
-    /// Total size in bytes of the first TLS record, header included: how much
-    /// of the stream the hello occupies.
-    pub record_len: usize,
-    /// Highest version the client advertises (`supported_versions` if present,
-    /// else the legacy `client_version`), e.g. `0x0304` for TLS 1.3.
-    pub version_hint: u16,
 }
 
 /// Parse the start of a TLS stream. Never panics, for any input.
@@ -92,12 +85,7 @@ pub fn sniff(buf: &[u8]) -> Sniff {
         return Sniff::NeedMore;
     };
     match parse_body(body) {
-        Some((sni, alpn, version_hint)) => Sniff::Tls(ClientHelloInfo {
-            sni,
-            alpn,
-            record_len: RECORD_HEADER + record_payload,
-            version_hint,
-        }),
+        Some((sni, alpn)) => Sniff::Tls(ClientHelloInfo { sni, alpn }),
         None => Sniff::NotTls,
     }
 }
@@ -132,7 +120,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-type Parsed = (Option<String>, Vec<String>, u16);
+type Parsed = (Option<String>, Vec<String>);
 
 fn parse_body(body: &[u8]) -> Option<Parsed> {
     let mut r = Reader(body);
@@ -151,9 +139,8 @@ fn parse_body(body: &[u8]) -> Option<Parsed> {
     }
     let mut sni = None;
     let mut alpn = Vec::new();
-    let mut version_hint = legacy_version;
     if r.is_empty() {
-        return Some((sni, alpn, version_hint)); // no extensions at all
+        return Some((sni, alpn)); // no extensions at all
     }
     let exts = r.vec16()?;
     if !r.is_empty() {
@@ -177,26 +164,10 @@ fn parse_body(body: &[u8]) -> Option<Parsed> {
                 }
                 alpn = parse_alpn(data)?;
             }
-            EXT_SUPPORTED_VERSIONS => {
-                let mut v = Reader(data);
-                let list = v.vec8()?;
-                if !v.is_empty() || list.len() % 2 != 0 {
-                    return None;
-                }
-                #[allow(clippy::chunks_exact_to_as_chunks)]
-                let best = list
-                    .chunks_exact(2) // clippy: as_chunks needs a newer MSRV
-                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                    .filter(|v| (0x0301..=0x0304).contains(v))
-                    .max();
-                if let Some(best) = best {
-                    version_hint = version_hint.max(best);
-                }
-            }
             _ => {}
         }
     }
-    Some((sni, alpn, version_hint))
+    Some((sni, alpn))
 }
 
 /// `Some(Some(host))`, `Some(None)` for a list with no `host_name` entry,
@@ -315,8 +286,6 @@ mod tests {
             };
             assert_eq!(info.sni.as_deref(), Some(sni.to_ascii_lowercase().as_str()));
             assert_eq!(info.alpn, alpn);
-            assert_eq!(info.record_len, buf.len());
-            assert_eq!(info.version_hint, 0x0304);
         }
     }
 
@@ -333,12 +302,10 @@ mod tests {
     #[test]
     fn trailing_bytes_are_ignored() {
         let mut buf = hello("example.com", &["h2"], false);
-        let len = buf.len();
+        let whole = sniff(&buf);
+        assert!(matches!(whole, Sniff::Tls(_)));
         buf.extend_from_slice(b"extra application bytes");
-        let Sniff::Tls(info) = sniff(&buf) else {
-            panic!()
-        };
-        assert_eq!(info.record_len, len);
+        assert_eq!(sniff(&buf), whole);
     }
 
     #[test]
