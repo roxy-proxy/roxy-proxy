@@ -3,7 +3,13 @@
 version: 2
 updates:
   - package-ecosystem: cargo
-    directory: /
+    # Every Cargo workspace with its own lock file; the nested ones depend on
+    # the root crates by path and CI runs them with --locked.
+    directories:
+      - /
+      - /crates/roxy-wasm/test-components
+      - /examples/quickstart/addons
+      - /fuzz
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
