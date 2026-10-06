@@ -38,9 +38,11 @@ are no connect-time rules: every allow or deny decision is made on the
 requests inside the tunnel. roxy then peeks the tunnel's first bytes:
 
 - **A TLS ClientHello:** roxy reads the SNI and ALPN
-  ([ClientHello sniffing](/reference/tls#clienthello-sniffing)). The SNI must equal
-  the CONNECT host (`tls.require_sni_match`, default true); a client that
-  sends no SNI gets the CONNECT host. roxy terminates TLS with a leaf for
+  ([ClientHello sniffing](/reference/tls#clienthello-sniffing)). The SNI must name
+  the CONNECT host (`tls.require_sni_match`, default true), compared after
+  both are canonicalised (`sni_mismatch` otherwise); an SNI that is not a usable
+  host name is closed (`bad_sni`). A client that sends no SNI gets the CONNECT
+  host. roxy terminates TLS with a leaf for
   that host, and the inner protocol must be HTTP/1.1 or HTTP/2 by ALPN.
 - **Plaintext HTTP**, if `http.allow_plain_in_connect` is true (default
   false): parsed as HTTP.

@@ -14,12 +14,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use roxy_http::Host;
 use rustls::crypto::CryptoProvider;
 use rustls::server::{ClientHello, NoServerSessionStorage, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, RootCertStore, ServerConfig, SupportedProtocolVersion};
 use rustls_pki_types::pem::PemObject;
-use roxy_http::Host;
 use rustls_pki_types::{CertificateDer, DnsName, ServerName};
 
 use crate::leaf::{LeafError, LeafMinter};

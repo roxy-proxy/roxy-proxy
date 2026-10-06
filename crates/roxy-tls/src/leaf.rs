@@ -21,9 +21,9 @@ use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, SanType,
 };
+use roxy_http::Host;
 use rustls::crypto::ring::sign::any_ecdsa_type;
 use rustls::sign::{CertifiedKey, SigningKey};
-use roxy_http::Host;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use time::{Duration, OffsetDateTime};
 

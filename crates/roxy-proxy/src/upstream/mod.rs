@@ -280,15 +280,6 @@ fn host_of(uri: &Uri) -> Result<Host, ConnectError> {
     roxy_http::url::parse_host(raw.as_bytes()).map_err(|e| ConnectError::Target(e.to_string()))
 }
 
-/// The host as a TLS server name (IPv6 without brackets).
-fn tls_name(host: &Host) -> String {
-    match host {
-        Host::Dns(n) => n.clone(),
-        Host::Ipv4(ip) => ip.to_string(),
-        Host::Ipv6(ip) => ip.to_string(),
-    }
-}
-
 impl ConnectorInner {
     /// Opens the byte stream to an address that already passed the floor.
     async fn dial(&self, addr: SocketAddr) -> std::io::Result<BoxIo> {
@@ -340,8 +331,7 @@ impl ConnectorInner {
         match scheme {
             Scheme::Http => Ok(MaybeTls::Plain(tcp)),
             Scheme::Https => {
-                let name = roxy_tls::server_name_for_host(&tls_name(host))
-                    .map_err(|e| ConnectError::Tls(e.to_string()))?;
+                let name = roxy_tls::server_name(host);
                 let tls = tokio::time::timeout(
                     self.connect_timeout,
                     TlsConnector::from(tls.clone()).connect(name, tcp),

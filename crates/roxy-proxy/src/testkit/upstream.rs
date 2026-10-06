@@ -204,9 +204,9 @@ impl Upstream {
 
     async fn serve(self: Arc<Self>, addr: SocketAddr, io: tokio::io::DuplexStream) {
         if addr.port() == 443 {
-            let name = roxy_tls::server_name_for_host("up.test").unwrap();
+            let host = roxy_http::url::parse_host(b"up.test").unwrap();
             let h2_offered = !self.h1_only.load(Ordering::SeqCst);
-            let cfg = roxy_tls::server_config_for(self.minter.clone(), name, h2_offered);
+            let cfg = roxy_tls::server_config_for(self.minter.clone(), host, h2_offered);
             let Ok(tls) = tokio_rustls::TlsAcceptor::from(cfg).accept(io).await else {
                 return;
             };
