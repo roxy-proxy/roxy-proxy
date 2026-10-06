@@ -5,6 +5,7 @@
 use roxy_http::{HttpFlags, Limits};
 use roxy_proxy::HttpBehaviour;
 use roxy_proxy::addr::AddressPolicy;
+use roxy_proxy::addrlist::normalise_net;
 use roxy_proxy::{DnsSettings, UpstreamSettings};
 use roxy_tls::{MinTlsVersion, UpstreamTlsOptions};
 
@@ -80,8 +81,8 @@ impl From<&Config> for UpstreamSettings {
             },
             address_policy: AddressPolicy {
                 deny_private_ranges: u.deny_private_ranges,
-                deny_cidrs: u.deny_cidrs.clone(),
-                allow_cidrs: u.allow_cidrs.clone(),
+                deny_cidrs: u.deny_cidrs.iter().map(|n| normalise_net(n.trunc())).collect(),
+                allow_cidrs: u.allow_cidrs.iter().map(|n| normalise_net(n.trunc())).collect(),
                 // Resolved from `upstream.deny_lists` when the snapshot is
                 // built (`PolicyUpdate::deny_lists`).
                 deny_lists: Vec::new(),
@@ -110,6 +111,8 @@ impl From<&Config> for UpstreamTlsOptions {
 
 #[cfg(test)]
 mod tests {
+    use roxy_proxy::addr::PrivateAddrs;
+
     use super::*;
 
     #[test]
@@ -131,5 +134,20 @@ mod tests {
             u.dns.static_hosts.get("upstream.test"),
             Some(&vec!["127.0.0.1".parse().unwrap()])
         );
+    }
+
+    /// `deny_cidrs`/`allow_cidrs` entries are stored as address-list entries
+    /// are, so a mapped-form entry denies (or exempts) the plain IPv4 address.
+    #[test]
+    fn cidrs_are_normalised_like_address_lists() {
+        let c = Config::from_yaml(
+            "version: 1\nupstream:\n  deny_cidrs: [\"::ffff:203.0.113.0/120\"]\n  allow_cidrs: [\"::ffff:10.9.9.9/128\"]\n",
+        )
+        .unwrap();
+        let p = UpstreamSettings::from(&c).address_policy;
+        assert_eq!(p.deny_cidrs, vec!["203.0.113.0/24".parse().unwrap()]);
+        assert_eq!(p.allow_cidrs, vec!["10.9.9.9/32".parse().unwrap()]);
+        assert!(p.check("203.0.113.7".parse().unwrap(), PrivateAddrs::Allow).is_err());
+        assert!(p.check("10.9.9.9".parse().unwrap(), PrivateAddrs::Deny).is_ok());
     }
 }

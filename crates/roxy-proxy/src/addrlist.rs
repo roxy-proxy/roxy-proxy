@@ -101,8 +101,10 @@ pub fn parse_entry(s: &str) -> Result<IpNet, String> {
     Ok(normalise_net(net))
 }
 
-/// `::ffff:a.b.c.d/96+n` → `a.b.c.d/n`.
-fn normalise_net(net: IpNet) -> IpNet {
+/// `::ffff:a.b.c.d/96+n` → `a.b.c.d/n`, so an IPv4-mapped entry matches
+/// the IPv4 address it names however a client spells it. Every CIDR config
+/// surface stores entries through this.
+pub fn normalise_net(net: IpNet) -> IpNet {
     if let IpNet::V6(v6) = net
         && v6.prefix_len() >= 96
         && let Some(v4) = v6.network().to_ipv4_mapped()

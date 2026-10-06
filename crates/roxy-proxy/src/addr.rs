@@ -217,6 +217,7 @@ impl AddressPolicy {
 mod tests {
     use super::PrivateAddrs::{Allow, Deny};
     use super::*;
+    use crate::addrlist::normalise_net;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
@@ -319,6 +320,29 @@ mod tests {
                 "{a}"
             );
         }
+    }
+
+    /// An entry written in IPv4-mapped form denies the plain IPv4 address
+    /// once stored through [`normalise_net`], the way config stores it.
+    #[test]
+    fn mapped_form_deny_cidrs_deny_the_plain_ipv4_address() {
+        let mapped: IpNet = "::ffff:203.0.113.0/120".parse().unwrap();
+        let p = AddressPolicy {
+            deny_private_ranges: false,
+            deny_cidrs: vec![normalise_net(mapped.trunc())],
+            allow_cidrs: Vec::new(),
+            deny_lists: Vec::new(),
+        };
+        for a in ["203.0.113.7", "::ffff:203.0.113.7", "64:ff9b::cb00:7107"] {
+            let d = p.check(ip(a), Allow).unwrap_err();
+            assert_eq!(d.reason, "deny_cidrs", "{a}");
+            assert_eq!(
+                d.matched_cidr,
+                Some("203.0.113.0/24".parse().unwrap()),
+                "{a}"
+            );
+        }
+        assert!(p.check(ip("203.0.114.1"), Allow).is_ok());
     }
 
     #[test]
