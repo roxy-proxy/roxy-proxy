@@ -50,8 +50,17 @@ is a fatal startup error, and `roxy ca init` refuses to run.
 Every CA, provided or generated, is checked at startup. It must be a CA
 certificate (`CA:TRUE`), allow `keyCertSign` if it has a key usage
 extension, be within its validity period, and match its key. Each
-intermediate must be the issuer of the certificate before it. Any failure
-stops roxy rather than failing every handshake later.
+intermediate must be a CA within its validity period whose key signed the
+certificate before it. Any failure stops roxy rather than failing every
+handshake later.
+
+Two conditions are warnings in the log, not errors:
+
+- The key file is readable by its group or by others. Make it mode 0600.
+- The CA expires within seven days. Leaves normally last seven days; one
+  minted now ends when the CA does, and once the CA has expired roxy
+  mints nothing and every TLS handshake fails (`leaf_mint_failed`).
+  Replace the CA before then; a restart after expiry refuses to start.
 
 ## CA distribution
 

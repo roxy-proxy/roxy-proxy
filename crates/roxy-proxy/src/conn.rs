@@ -13,7 +13,7 @@ use roxy_http::{
     Authority, Body, CanonicalRequest, CanonicalResponse, Host, HttpFlags, Limits, Method, Reason,
     Scheme,
 };
-use roxy_tls::{ClientHelloInfo, MAX_HELLO_BYTES, Sniff, looks_like_http, sniff};
+use roxy_tls::{ClientHelloInfo, MAX_HELLO_BYTES, ServerName, Sniff, looks_like_http, sniff};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_rustls::TlsAcceptor;
 
@@ -170,23 +170,32 @@ async fn handle_connect(
     match sniffed {
         FirstBytes::Tls(hello) => {
             let connect_host = host_text(&authority.host);
+            let mut sni_name = None;
             if let Some(sni) = &hello.sni
-                && shared.require_sni_match
                 && norm_name(sni) != norm_name(&connect_host)
             {
-                shared.emit_parse_reason(
-                    &client,
-                    None,
-                    "sni_mismatch",
-                    Some(&format!("SNI {sni:?} != CONNECT host {connect_host:?}")),
-                );
-                return;
+                if shared.require_sni_match {
+                    shared.emit_parse_reason(
+                        &client,
+                        None,
+                        "sni_mismatch",
+                        Some(&format!("SNI {sni:?} != CONNECT host {connect_host:?}")),
+                    );
+                    return;
+                }
+                // The leaf will be for the SNI, not the CONNECT host.
+                let Ok(name) = roxy_tls::server_name_for_host(sni) else {
+                    shared.emit_parse_reason(&client, None, "bad_sni", Some(sni));
+                    return;
+                };
+                sni_name = Some(name);
             }
             Box::pin(terminate_tls(
                 io,
                 buf.freeze(),
                 client,
                 authority,
+                sni_name,
                 shared,
                 cl,
             ))
@@ -290,18 +299,17 @@ pub(crate) async fn serve_direct(
             };
             // The SNI names the host; the port is the one the client
             // connected to.
-            let authority = match roxy_http::url::parse_authority(sni.as_bytes(), port) {
-                Ok(a) if a.port == port => a,
-                _ => {
-                    shared.emit_parse_reason(&client, None, "bad_sni", Some(&sni));
-                    return;
-                }
+            let Ok(host) = roxy_http::url::parse_host(sni.as_bytes()) else {
+                shared.emit_parse_reason(&client, None, "bad_sni", Some(&sni));
+                return;
             };
+            let authority = Authority { host, port };
             Box::pin(terminate_tls(
                 ClientIo(io),
                 buf.freeze(),
                 client,
                 authority,
+                None,
                 shared,
                 cl,
             ))
@@ -317,11 +325,14 @@ pub(crate) async fn serve_direct(
     }
 }
 
+/// `sni_name` is an SNI that differs from the authority's host and is
+/// allowed to (`require_sni_match: false`); the leaf served is for it.
 async fn terminate_tls(
     io: ClientIo,
     hello: Bytes,
     client: ClientConn,
     authority: Authority,
+    sni_name: Option<ServerName<'static>>,
     shared: Arc<Shared>,
     cl: ConnLimits,
 ) {
@@ -330,9 +341,10 @@ async fn terminate_tls(
         shared.emit_parse_reason(&client, None, "bad_connect_host", Some(&host));
         return;
     };
-    // Mint (or warm) the leaf off the async workers (~1 ms on a miss).
+    // Mint (or warm) the leaf off the async workers (~1 ms on a miss), so the
+    // resolver inside the handshake hits the cache.
     let minter = shared.minter.clone();
-    let warm_name = name.clone();
+    let warm_name = sni_name.unwrap_or_else(|| name.clone());
     let warmed = tokio::task::spawn_blocking(move || minter.certified_key(&warm_name)).await;
     if !matches!(warmed, Ok(Ok(_))) {
         shared.emit_parse_reason(&client, None, "leaf_mint_failed", Some(&host));

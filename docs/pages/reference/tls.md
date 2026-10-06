@@ -7,9 +7,11 @@ how clients come to trust it, see [managing the CA](/operate/ca-certificates).
 ## Leaf certificates
 
 Minted on demand per host: a DNS SAN, or an IP SAN for IP targets; ECDSA
-P-256; 7-day validity; signed by the CA. All leaves share one key pair (the
-CA key is what matters). They are cached in an LRU of
-`tls.leaf_cache_size` entries, and minted on the blocking pool.
+P-256; 7-day validity, or until the CA expires if that is sooner; signed by
+the CA. All leaves share one key pair (the CA key is what matters). They
+are cached in an LRU of `tls.leaf_cache_size` entries, and minted on the
+blocking pool for the name the handshake will serve (the SNI, or the
+CONNECT host when the client sends none).
 
 ## Client-facing TLS
 
