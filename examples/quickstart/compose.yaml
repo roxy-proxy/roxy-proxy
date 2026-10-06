@@ -83,6 +83,7 @@ services:
       ROXY_CONFIG: /etc/roxy/roxy.yaml
       CA_OUT: /shared/cp-ca.pem
       LEASE_VALID_SECONDS: ${LEASE_VALID_SECONDS:-60}
+      NODE_CERT_SECONDS: ${NODE_CERT_SECONDS:-600}  # the node certificate's lifetime; renewed halfway
     volumes:
       - ./roxy.yaml:/etc/roxy/roxy.yaml:ro
       - cp-data:/data                      # CA, server certificate, `revoked`
