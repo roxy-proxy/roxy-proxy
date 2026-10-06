@@ -579,6 +579,45 @@ pub(crate) mod tests {
         assert!(matches!(cp.ship_flows(&body).await, ShipOutcome::Failed(_)));
     }
 
+    /// Every body the client sends, and the lease it parses, match the
+    /// published contract's component schemas.
+    #[tokio::test]
+    async fn bodies_match_the_openapi_contract() {
+        let mock = MockServer::start().await;
+        let (cp, _) = enrolled(&mock).await;
+        let enrol = mock.requests_to("/roxy/v1/enrol")[0].json();
+        roxy_node_spec::validate("EnrolRequest", &enrol).unwrap();
+
+        mock.push("/roxy/v1/lease", Reply::json(200, &lease("L2")));
+        cp.fetch_lease(&state()).await;
+        let node_state = mock.requests_to("/roxy/v1/lease")[0].json();
+        roxy_node_spec::validate("NodeState", &node_state).unwrap();
+        let fresh = NodeState {
+            lease_id: None,
+            ..state()
+        };
+        roxy_node_spec::validate("NodeState", &serde_json::to_value(&fresh).unwrap()).unwrap();
+
+        roxy_node_spec::validate("Lease", &serde_json::to_value(lease("L")).unwrap()).unwrap();
+
+        mock.push(
+            "/roxy/v1/flows",
+            Reply::json(200, &FlowAck { acked_through: 1 }),
+        );
+        let batch = crate::protocol::encode_flow_batch(
+            "node-1",
+            "L2",
+            0,
+            [
+                r#"{"seq":0,"ts":"2026-10-06T10:12:00.123Z","event":"request"}"#,
+                r#"{"seq":1,"ts":"2026-10-06T10:12:00.410Z","event":"log"}"#,
+            ],
+        );
+        cp.ship_flows(&batch).await;
+        let sent = mock.requests_to("/roxy/v1/flows")[0].json();
+        roxy_node_spec::validate("FlowBatch", &sent).unwrap();
+    }
+
     #[test]
     fn the_control_plane_must_be_https_and_the_prefix_follows_the_base_path() {
         let trust = Trust::default();

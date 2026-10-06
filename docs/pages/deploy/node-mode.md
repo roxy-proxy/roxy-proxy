@@ -2,8 +2,8 @@
 
 In node mode roxy has no config file. It enrols with a control plane, pulls
 its policy and secrets from there as a lease, and ships its flow log back.
-The control plane is any server that implements roxy's node protocol
-(`spec/node-protocol/v1/openapi.yaml` in the repository).
+The control plane is any server that implements the
+[node protocol](/reference/node-protocol).
 
 ```sh
 roxy run --control-plane https://cp.example:8443 \

@@ -47,6 +47,7 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring
 
 [dev-dependencies]
 roxy-node = { path = ".", features = ["testkit"] }
+roxy-node-spec = { path = "../roxy-node-spec" }
 tempfile.workspace = true
 
 [lints]
