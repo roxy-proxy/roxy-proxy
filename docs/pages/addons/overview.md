@@ -163,8 +163,11 @@ extensions client and upstream agree on.
   the same way. The layer cannot change or delay traffic, so its
   failures cannot weaken containment: a trap or missed deadline is logged,
   not fatal, and a cut copy is reported (`observer_lagged`, with the
-  `reason`) rather than stalling the flow. This is the way to deploy an
-  uncalibrated monitor.
+  `reason`) rather than stalling the flow. Nor can it tag the flow: a tag
+  steers the `when` of every layer below, so `flow.add-tag` from an
+  observer is refused like a call without its capability, and the attempt
+  is logged. An observer may `record`; it may not tag. This is the way to
+  deploy an uncalibrated monitor.
 
 ## In the proxy
 

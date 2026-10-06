@@ -5,7 +5,8 @@ itself. Everything a layer can do outside its own streams is on this list, and e
 item is a capability granted in config. Every import is linked whatever the
 grants, so one binary runs under any of them; calling one that was not
 granted traps (`CapabilityDenied`) and fails the exchange. `flow.current`,
-`flow.add-tag` and `flow.config` need no capability.
+`flow.add-tag` and `flow.config` need no capability, but `flow.add-tag` is
+for enforce layers only: an observer's call fails its exchange the same way.
 
 ## Endpoints (`endpoints`)
 

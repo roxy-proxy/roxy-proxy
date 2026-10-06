@@ -402,8 +402,10 @@ impl flow::Host for StoreState {
     }
 
     async fn add_tag(&mut self, tag: String) -> wasmtime::Result<()> {
-        self.exchange("flow.add-tag")?.host.add_tag(tag);
-        Ok(())
+        self.exchange("flow.add-tag")?
+            .host
+            .add_tag(tag)
+            .map_err(|e| self.host_failed(e))
     }
 
     async fn config(&mut self) -> wasmtime::Result<String> {

@@ -162,9 +162,12 @@ impl AddonDef {
         self
     }
 
+    /// Observe mode. The test layer is told not to tag the flows it passes
+    /// on, since the host refuses an observer's tags.
     #[must_use]
     pub(crate) fn observe(mut self) -> Self {
         self.mode = AddonMode::Observe;
+        self.config["tag"] = serde_json::Value::Bool(false);
         self
     }
 

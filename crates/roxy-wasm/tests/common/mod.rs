@@ -166,8 +166,9 @@ impl LayerHost for Mock {
         }
     }
 
-    fn add_tag(&self, tag: String) {
+    fn add_tag(&self, tag: String) -> Result<(), HostError> {
         self.call(format!("tag {tag}"));
+        Ok(())
     }
 
     fn log(&self, level: LogLevel, msg: &str) {

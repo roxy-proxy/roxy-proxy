@@ -129,8 +129,10 @@ pub trait LayerHost: Send + Sync + 'static {
     /// The current flow. Always available.
     fn flow_info(&self) -> FlowInfo;
 
-    /// Add a tag to the flow's log record. Always available.
-    fn add_tag(&self, tag: String);
+    /// Add a tag to the flow's log record. Needs no capability, but only
+    /// an enforcing layer may tag: `Err` from an observer fails its
+    /// exchange closed, as a call without its capability would.
+    fn add_tag(&self, tag: String) -> Result<(), HostError>;
 
     /// Write to the operational log (capability `log`).
     fn log(&self, level: LogLevel, msg: &str);

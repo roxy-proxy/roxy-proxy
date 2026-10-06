@@ -60,8 +60,19 @@ impl LayerHost for StackHost {
         }
     }
 
-    fn add_tag(&self, tag: String) {
+    fn add_tag(&self, tag: String) -> Result<(), HostError> {
+        if self.observer.is_some() {
+            // A tag steers the `when` of every layer below, so it is an
+            // effect on traffic, which an observer must not have.
+            let layer = &self.addon().name;
+            let flow = self.st.flow.to_string();
+            tracing::warn!(layer, flow, tag, "observer called `flow.add-tag`: refused");
+            return Err(HostError::new(
+                "layer called `flow.add-tag` in observe mode: an observer cannot tag",
+            ));
+        }
         self.st.add_tag(tag);
+        Ok(())
     }
 
     fn log(&self, level: LogLevel, msg: &str) {
