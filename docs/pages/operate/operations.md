@@ -14,6 +14,38 @@
   `SIGHUP` also reopens log files.
 - **Shutdown:** `SIGTERM` drains for up to 10 seconds
   ([limits](/reference/limits#connections)).
+- **Health:** `ca_server` serves `/healthz` (alive) and `/readyz` (a
+  policy is in force); `roxy health [--ready]` probes them
+  ([health](/operate/operations#health)).
+
+## Health
+
+The `ca_server` listener answers two probes, both plain HTTP `GET`:
+
+| path | `200` when | otherwise |
+|---|---|---|
+| `/healthz` | the process is up and accepting connections | no answer |
+| `/readyz` | a policy has been applied and its lease has not run out | `503` with a one-word reason: `no_policy` (nothing applied yet) or `policy_expired` ([lease](#lease)) |
+
+Liveness is for restarting a stuck process. Readiness is for routing: a
+roxy that has no policy in force should not receive traffic, and a
+restart would not change that. Use `/readyz` for a compose `depends_on`
+wait or a Kubernetes readiness probe, and `/healthz` for a liveness probe
+or a container `HEALTHCHECK`. Readiness reads the policy the proxy is
+evaluating against, so a reload with a later lease makes it ready without
+a restart.
+
+An empty policy is ready. It is a deny-all that someone applied, and its
+refusals are served and logged like any other; a roxy that is quarantined
+that way stays in rotation so they are audited rather than becoming
+connection errors. Running from a config file, a policy is always applied
+at startup, so `no_policy` is only seen by a node waiting for its first
+lease from a control plane.
+
+`roxy health` is the probe for images without a shell or curl: it `GET`s
+`http://127.0.0.1:3130/healthz` (`--ready`: `/readyz`; `--url` names
+another address) and exits 0 on a `200`, 1 on anything else, with the
+reason on stderr.
 
 ## Reload
 
@@ -73,7 +105,8 @@ one `policy_expired` event; later ones are ordinary `_expired` denies.
 
 An expired policy is a policy, not a fault. The listeners stay up,
 `/healthz` keeps answering `200` and says `x-roxy-policy: expired` (it
-says `valid` otherwise), and `roxy health` prints `ok (policy expired)`.
+says `valid` otherwise), and `roxy health` prints `ok (policy expired)`;
+`/readyz` answers `503 policy_expired` ([health](#health)).
 A document already past its `valid_until` loads and denies rather than
 failing to start, so a stale lease on disk fails closed. `roxy check`
 prints `valid until:` and warns when the instant has passed.

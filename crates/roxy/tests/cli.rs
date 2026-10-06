@@ -811,7 +811,36 @@ fn health_fails_when_refused_or_misused() {
     }
 }
 
-/// End to end: `roxy health` against a running roxy's `ca_server`.
+/// A failing probe reports the reason the endpoint answered with.
+#[test]
+fn health_reports_the_reason_body_on_failure() {
+    let (url, server) =
+        stub_http("HTTP/1.1 503 Service Unavailable\r\ncontent-length: 9\r\n\r\nno_policy");
+    let out = roxy(&["health", "--url", &url]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("no_policy"),
+        "{}",
+        text(&out.stderr)
+    );
+    server.join().unwrap();
+}
+
+/// `--ready` picks the default URL's path, so it has no meaning with `--url`.
+#[test]
+fn health_ready_conflicts_with_url() {
+    let out = roxy(&["health", "--ready", "--url", "http://127.0.0.1:0/readyz"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        text(&out.stderr).contains("cannot be used with"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+/// End to end: `roxy health` against a running roxy's `ca_server`. With
+/// an expired lease the proxy is alive but not ready; a reload with a
+/// later one makes it ready without a restart.
 #[test]
 fn health_probes_a_running_roxy() {
     let dir = tempfile::tempdir().unwrap();
@@ -823,15 +852,12 @@ fn health_probes_a_running_roxy() {
     };
     let (proxy, ca) = (free(), free());
     let cfg = dir.path().join("roxy.yaml");
-    std::fs::write(
-        &cfg,
-        format!(
-            "version: 1\nlisteners: [{{ name: p, bind: \"{proxy}\" }}]\n\
-             ca_server: {{ bind: \"{ca}\" }}\ntls: {{ ca_dir: {:?} }}\n",
-            dir.path().join("ca").to_str().unwrap()
-        ),
-    )
-    .unwrap();
+    let base = format!(
+        "version: 1\nlisteners: [{{ name: p, bind: \"{proxy}\" }}]\n\
+         ca_server: {{ bind: \"{ca}\" }}\ntls: {{ ca_dir: {:?} }}\n",
+        dir.path().join("ca").to_str().unwrap()
+    );
+    std::fs::write(&cfg, format!("{base}valid_until: 2000-01-01T00:00:00Z\n")).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_roxy"))
         .args([
             "--log-level",
@@ -846,17 +872,33 @@ fn health_probes_a_running_roxy() {
         .spawn()
         .unwrap();
     let url = format!("http://{ca}/healthz");
-    let mut healthy = false;
-    for _ in 0..100 {
-        if roxy(&["health", "--url", &url]).status.success() {
-            healthy = true;
-            break;
+    let ready_url = format!("http://{ca}/readyz");
+    let probe_until_ok = |url: &str| {
+        for _ in 0..100 {
+            if roxy(&["health", "--url", url]).status.success() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        false
+    };
+    let healthy = probe_until_ok(&url);
+    let not_ready = healthy.then(|| roxy(&["health", "--url", &ready_url]));
+    if healthy {
+        std::fs::write(&cfg, format!("{base}valid_until: 2999-01-01T00:00:00Z\n")).unwrap();
     }
+    let ready = healthy && probe_until_ok(&ready_url);
     child.kill().unwrap();
     child.wait().unwrap();
     assert!(healthy, "roxy never reported healthy at {url}");
+    let not_ready = not_ready.unwrap();
+    assert_eq!(not_ready.status.code(), Some(1), "expired lease: not ready");
+    assert!(
+        text(&not_ready.stderr).contains("policy_expired"),
+        "{}",
+        text(&not_ready.stderr)
+    );
+    assert!(ready, "roxy never reported ready at {ready_url}");
     let out = roxy(&["health", "--url", &url]);
     assert_eq!(out.status.code(), Some(1), "a stopped roxy is unhealthy");
 }

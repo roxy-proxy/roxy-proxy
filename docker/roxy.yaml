@@ -9,7 +9,7 @@ listeners:
     bind: 0.0.0.0:3128
 
 ca_server:
-  bind: 0.0.0.0:3130         # plain HTTP: /roxy-ca.pem and /healthz (the HEALTHCHECK)
+  bind: 0.0.0.0:3130         # plain HTTP: /roxy-ca.pem, /healthz (the HEALTHCHECK) and /readyz
 
 tls:
   ca_dir: /var/lib/roxy/ca   # a volume; the CA is generated on first start

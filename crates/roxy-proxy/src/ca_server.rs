@@ -1,9 +1,10 @@
-//! The plain-HTTP CA endpoint (`ca_server.bind`): `GET
-//! /roxy-ca.pem` and `GET /healthz`. Kept off the proxy port so it can be
+//! The plain-HTTP CA endpoint (`ca_server.bind`): `GET /roxy-ca.pem`,
+//! `GET /healthz` and `GET /readyz`. Kept off the proxy port so it can be
 //! firewalled differently.
 //!
 //! `/healthz` is liveness: `200` while the process serves, with the
 //! policy's lease state in [`POLICY_HEADER`] (`valid` or `expired`).
+//! `/readyz` is `200` when an applied policy is in force, else `503`.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
 
-use crate::server::{Shared, conn_slot};
+use crate::server::{PolicyState, Shared, conn_slot};
 
 /// `content-type` of the CA certificate.
 pub const PEM_CONTENT_TYPE: &str = "application/x-pem-file";
@@ -32,6 +33,16 @@ fn reply(status: StatusCode, ctype: &str, body: impl Into<Bytes>) -> Response<Fu
         res.headers_mut().insert(http::header::CONTENT_TYPE, v);
     }
     res
+}
+
+/// `/readyz`: `200 ready`, or `503` with one reason word a probe can log.
+fn readiness(shared: &Shared) -> Response<Full<Bytes>> {
+    let (status, body) = match shared.policy_state() {
+        PolicyState::Loaded => (StatusCode::OK, "ready"),
+        PolicyState::Missing => (StatusCode::SERVICE_UNAVAILABLE, "no_policy"),
+        PolicyState::Expired => (StatusCode::SERVICE_UNAVAILABLE, "policy_expired"),
+    };
+    reply(status, "text/plain", body)
 }
 
 fn route(req: &Request<Incoming>, shared: &Shared) -> Response<Full<Bytes>> {
@@ -49,6 +60,7 @@ fn route(req: &Request<Incoming>, shared: &Shared) -> Response<Full<Bytes>> {
                 .insert(POLICY_HEADER, http::HeaderValue::from_static(state));
             res
         }
+        (true, "/readyz") => readiness(shared),
         _ => reply(StatusCode::NOT_FOUND, "text/plain", "not found"),
     }
 }

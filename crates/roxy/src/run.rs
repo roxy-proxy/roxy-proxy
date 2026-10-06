@@ -608,6 +608,7 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
         addons: config.addons.len(),
     });
     let rt = RuntimeConfig {
+        placeholder_policy: false,
         listeners: listener_specs(&config),
         ca_server: config.ca_server.as_ref().map(|c| c.bind),
         ca,

@@ -267,6 +267,7 @@ pub(crate) struct KitBuilder {
     log_gate: Option<Arc<LogGate>>,
     ca_server: bool,
     valid_until: Option<DateTime<Utc>>,
+    placeholder_policy: bool,
 }
 
 impl KitBuilder {
@@ -324,14 +325,22 @@ impl KitBuilder {
     /// Binds the plain-HTTP CA endpoint on a loopback port
     /// ([`Kit::ca_server_addr`]).
     #[must_use]
+    pub(crate) fn ca_server(mut self) -> Self {
+        self.ca_server = true;
+        self
+    }
+
     /// The initial policy's `valid_until`.
+    #[must_use]
     pub(crate) fn valid_until(mut self, t: DateTime<Utc>) -> Self {
         self.valid_until = Some(t);
         self
     }
 
-    pub(crate) fn ca_server(mut self) -> Self {
-        self.ca_server = true;
+    /// The initial policy is the startup placeholder: nothing applied yet.
+    #[must_use]
+    pub(crate) fn placeholder_policy(mut self) -> Self {
+        self.placeholder_policy = true;
         self
     }
 
@@ -446,6 +455,7 @@ impl KitBuilder {
             None => sink.clone(),
         };
         let server = Server::start(RuntimeConfig {
+            placeholder_policy: self.placeholder_policy,
             listeners: Vec::new(),
             ca_server: self.ca_server.then(|| "127.0.0.1:0".parse().unwrap()),
             ca: ca.clone(),
@@ -579,6 +589,7 @@ impl Kit {
             log_gate: None,
             ca_server: false,
             valid_until: None,
+            placeholder_policy: false,
         }
     }
 
