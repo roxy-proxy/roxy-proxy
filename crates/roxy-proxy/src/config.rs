@@ -47,11 +47,6 @@ pub struct RuntimeConfig {
     pub dns: Option<crate::dns_server::DnsServerSpec>,
     pub ca: Arc<Ca>,
     pub minter: Arc<LeafMinter>,
-    /// `tls.require_sni_match`.
-    pub require_sni_match: bool,
-    /// `http.enable_h2`: offer ALPN `h2` (then `http/1.1`) in terminated
-    /// tunnels; otherwise only `http/1.1`.
-    pub enable_h2: bool,
     /// `tls.upstream.*`.
     pub upstream_tls: UpstreamTlsOptions,
     /// `limits.max_connections`.
@@ -72,9 +67,16 @@ pub struct RuntimeConfig {
 }
 
 /// What the proxy does with HTTP beyond parsing it: the `http.*` keys the
-/// codec does not read.
+/// codec does not read, and the `tls.*` key that shapes a CONNECT tunnel.
+/// A connection takes these when it is accepted and keeps them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpBehaviour {
+    /// `tls.require_sni_match`: a tunnel's ClientHello must name the
+    /// CONNECT host.
+    pub require_sni_match: bool,
+    /// `http.enable_h2`: offer ALPN `h2` (then `http/1.1`) in terminated
+    /// tunnels; otherwise only `http/1.1`.
+    pub enable_h2: bool,
     /// `http.allow_plain_in_connect`: serve plaintext HTTP inside a CONNECT
     /// tunnel instead of refusing it.
     pub allow_plain_in_connect: bool,
@@ -89,6 +91,8 @@ pub struct HttpBehaviour {
 impl Default for HttpBehaviour {
     fn default() -> Self {
         Self {
+            require_sni_match: true,
+            enable_h2: true,
             allow_plain_in_connect: false,
             strip_accept_encoding: false,
             decode_for_addons: true,

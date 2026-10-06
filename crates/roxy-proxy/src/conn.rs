@@ -37,6 +37,8 @@ pub const INTERNAL_HOST: &str = "roxy.internal";
 pub(crate) struct ConnLimits {
     pub limits: Arc<Limits>,
     pub flags: Arc<HttpFlags>,
+    pub require_sni_match: bool,
+    pub enable_h2: bool,
     pub allow_plain_in_connect: bool,
 }
 
@@ -46,6 +48,8 @@ impl ConnLimits {
         Self {
             limits: snap.limits.clone(),
             flags: snap.flags.clone(),
+            require_sni_match: snap.http.require_sni_match,
+            enable_h2: snap.http.enable_h2,
             allow_plain_in_connect: snap.http.allow_plain_in_connect,
         }
     }
@@ -173,7 +177,7 @@ async fn handle_connect(
                     return;
                 };
                 if host != authority.host {
-                    if shared.require_sni_match {
+                    if cl.require_sni_match {
                         let connect_host = host_text(&authority.host);
                         shared.emit_parse_reason(
                             &client,
@@ -346,7 +350,7 @@ async fn terminate_tls(
     let cfg = roxy_tls::server_config_for(
         shared.minter.clone(),
         authority.host.clone(),
-        shared.enable_h2,
+        cl.enable_h2,
     );
     let accept = TlsAcceptor::from(cfg).accept(Rewind::new(io, hello));
     let tls = match tokio::time::timeout(cl.limits.header_timeout, accept).await {

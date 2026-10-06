@@ -107,9 +107,6 @@ pub(crate) struct Shared {
     pub ca: Arc<Ca>,
     pub minter: Arc<LeafMinter>,
     upstream_tls: Arc<ClientConfig>,
-    pub require_sni_match: bool,
-    /// Offer ALPN `h2` in terminated tunnels.
-    pub enable_h2: bool,
     pub connection_events: bool,
     /// `log.flow.ws_message_every`: log every Nth checked WebSocket message
     /// (0: only denied ones).
@@ -331,8 +328,6 @@ impl Server {
             ca: cfg.ca,
             minter: cfg.minter,
             upstream_tls,
-            require_sni_match: cfg.require_sni_match,
-            enable_h2: cfg.enable_h2,
             connection_events: cfg.connection_events,
             ws_message_every: cfg.ws_message_every,
             layer_state: crate::addons::store::LayerStates::default(),
