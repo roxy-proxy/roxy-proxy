@@ -30,8 +30,8 @@ use http::StatusCode;
 use roxy_http::h1::ServerConn;
 use roxy_http::url::{normalize_path, normalize_query};
 use roxy_http::{
-    Authority, Body, BodyError, CanonicalRequest, CanonicalResponse, DriveError, ParseError, Query,
-    Reason, Scheme,
+    Authority, Body, BodyError, CanonicalRequest, CanonicalResponse, DriveError, Method, ParseError,
+    Query, Reason, Scheme, status_forbids_body,
 };
 use roxy_rules::{
     AllowOpts, CaptureTarget, DEFAULT_DENY_MESSAGE, Decision, Deny, DenyStatus, Effect,
@@ -810,14 +810,13 @@ async fn inspect_request_body(
     mut req: CanonicalRequest,
     io: &mut dyn BodyIo,
 ) -> Verdict {
-    if !cx.snap.policy.needs_request_body() {
+    if !cx.snap.policy.needs_request_body() || known_empty(&req.body) {
         return Verdict::Continue(req);
     }
     let cap = cx.snap.limits.max_inspect_body_bytes;
-    let Some(lease) = cx.shared.reserve_buffer(cap) else {
+    let Some(mut lease) = reserve_inspection(cx, &req.body, cap) else {
         return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
     };
-    cx.buffers.push(lease);
     let inspected = match io.collect(&mut req.body, cap).await {
         Err(e) => return Verdict::Close(e),
         Ok(Collected::Failed(e)) => return Verdict::Close(body_failure(&e).into()),
@@ -825,14 +824,40 @@ async fn inspect_request_body(
             if let Some(f) = cx.facts.request.as_mut() {
                 f.body_size = Some(b.len() as u64);
             }
-            Inspected::decode(&req.headers, &b, cap)
+            let inspected = Inspected::decode(&req.headers, &b, cap);
+            lease.shrink_to(buffered_bytes(&b, &inspected));
+            inspected
         }
         Ok(Collected::TooLarge) => Inspected::TooLarge,
     };
+    cx.buffers.push(lease);
     if let Some(f) = cx.facts.request.as_mut() {
         f.body = inspected;
     }
     Verdict::Continue(req)
+}
+
+/// A body that carries no bytes needs no inspection buffer.
+fn known_empty(body: &Body) -> bool {
+    body.known_length() == Some(0) || http_body::Body::is_end_stream(body)
+}
+
+/// Reserves the budget an inspected body can need: its declared length
+/// when the framing gives one, else the whole cap.
+fn reserve_inspection(cx: &FlowCx, body: &Body, cap: u64) -> Option<BufferLease> {
+    let bytes = body.known_length().map_or(cap, |n| n.min(cap));
+    cx.shared.reserve_buffer(bytes)
+}
+
+/// What a completely buffered body holds for the rest of the exchange: the
+/// bytes as sent (they go on to be forwarded) and, if `content-encoding`
+/// was decoded, the text the facts carry, which can be larger.
+fn buffered_bytes(sent: &Bytes, inspected: &Inspected) -> u64 {
+    let text = match inspected {
+        Inspected::Text(t) => t.len(),
+        _ => 0,
+    };
+    sent.len().max(text) as u64
 }
 
 /// The head decision and its effects.
@@ -1045,14 +1070,13 @@ async fn inspect_response_body(
         body_size: res.body.known_length(),
         body: Inspected::NotBuffered,
     });
-    if !cx.snap.policy.needs_response_body() {
+    if !cx.snap.policy.needs_response_body() || response_known_empty(cx, &res) {
         return ResponseVerdict::Continue(res);
     }
     let cap = cx.snap.limits.max_inspect_body_bytes;
-    let Some(lease) = cx.shared.reserve_buffer(cap) else {
+    let Some(mut lease) = reserve_inspection(cx, &res.body, cap) else {
         return ResponseVerdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
     };
-    cx.buffers.push(lease);
     let inspected = match io.collect(&mut res.body, cap).await {
         Err(e) => return ResponseVerdict::Close(e),
         Ok(Collected::Failed(e)) => {
@@ -1066,14 +1090,29 @@ async fn inspect_response_body(
             if let Some(f) = cx.facts.response.as_mut() {
                 f.body_size = Some(b.len() as u64);
             }
-            Inspected::decode(&res.headers, &b, cap)
+            let inspected = Inspected::decode(&res.headers, &b, cap);
+            lease.shrink_to(buffered_bytes(&b, &inspected));
+            inspected
         }
         Ok(Collected::TooLarge) => Inspected::TooLarge,
     };
+    cx.buffers.push(lease);
     if let Some(f) = cx.facts.response.as_mut() {
         f.body = inspected;
     }
     ResponseVerdict::Continue(res)
+}
+
+/// A response with no body by its status, its framing, or because the
+/// request was a `HEAD`.
+fn response_known_empty(cx: &FlowCx, res: &CanonicalResponse) -> bool {
+    status_forbids_body(res.status)
+        || cx
+            .facts
+            .request
+            .as_ref()
+            .is_some_and(|r| r.method == Method::Head)
+        || known_empty(&res.body)
 }
 
 /// The watching rules at the response head: they may stop the
