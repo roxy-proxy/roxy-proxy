@@ -7,7 +7,7 @@ import exchange from "../assets/exchange.svg";
 
 # Overview
 
-roxy is an HTTP firewall and egress proxy for workloads you don't fully trust. Clients use it as an explicit `HTTP_PROXY`, or reach it through its own DNS if they ignore proxy settings ([DNS steering](/deploy/dns-steering)). It decides what each request may reach, holds the credentials the workload needs so the workload never sees them, and logs every decision as a line of JSON.
+roxy is an HTTP firewall and egress proxy for workloads you don't fully trust. Clients use it as an explicit `HTTP_PROXY`. It decides what each request may reach, holds the credentials the workload needs so the workload never sees them, and logs every decision as a line of JSON.
 
 Every exchange takes the same path: roxy decrypts it, the addons see it, the rules judge it, and the connector dials the upstream. The response comes back the same way in reverse.
 

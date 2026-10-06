@@ -69,7 +69,6 @@ produces a `request` event:
 | `layer_error`, `layer_record`, `endpoint_call` | [addons](/addons/overview) |
 | `observer_lagged` | an observe-mode addon's copy of a stream was cut; `reason` is `observer_behind` (it fell `max_observer_lag_bytes` behind) or `buffer_budget_exhausted` (the [buffer budget](/reference/limits#limits) could not cover the copy) |
 | `connect` | a CONNECT, when `log.flow.connection_events` is on or it was refused |
-| `dns_query` | a query the [DNS listener](/deploy/dns-steering) answered, when `log.flow.dns_events` is on: `transport`, `client`, `name`, `qtype`, `rcode` and the `answers` |
 | `connection_refused` | a connection cap was hit ([limits](/reference/limits#connections)) |
 | `config_loaded`, `config_reloaded`, `config_reload_failed` | startup and [reload](/operate/operations#reload) |
 
@@ -95,8 +94,7 @@ while roxy runs, and is built to scale with cores and traffic (the
   Once unwritten bytes pass `log.flow.high_water` (8 MiB) the log reports
   not ready, and every traffic producer waits for it: each new client
   connection, the start of each exchange and each HTTP/2 stream, each
-  forwarded body chunk, each WebSocket read, and, with `dns_events`, each
-  DNS answer. roxy stops
+  forwarded body chunk and each WebSocket read. roxy stops
   reading from clients and upstreams until the log catches up, slowing
   traffic rather than losing records. A destination that fails (disk full,
   I/O error) holds traffic the same way, and is reported.
@@ -126,7 +124,6 @@ log:
   flow:
     path: /var/log/roxy/flow.jsonl  # absent = stdout
     connection_events: false
-    dns_events: false               # log every DNS listener answer
     ws_message_every: 0             # also log every Nth WebSocket message; 0 = denied only
     high_water: 8mb                 # at least 64kb
     max_file_bytes: 100mb           # absent = never rotate

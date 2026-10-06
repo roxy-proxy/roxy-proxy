@@ -7,13 +7,12 @@ connection handling in `roxy-proxy`.
 ## Explicit proxy
 
 Clients set `HTTP_PROXY` / `HTTPS_PROXY` and speak HTTP/1.1 to an
-explicit listener. (Clients without proxy settings use [direct
-listeners](/reference/http#direct-listeners) instead.)
+explicit listener.
 
 ```yaml
 listeners:
   - name: proxy                # rules can match listener.name
-    mode: explicit             # the default; or direct
+    mode: explicit             # the default, and the only mode
     bind: 0.0.0.0:3128
 ```
 
@@ -51,42 +50,6 @@ requests inside the tunnel. roxy then peeks the tunnel's first bytes:
 
 Inside a tunnel, requests are origin-form, and their `Host` (or
 `:authority`) must match the SNI / CONNECT host, port-normalised.
-
-## Direct listeners
-
-A direct listener takes connections that a client addressed to the origin
-itself, usually because roxy's [DNS listener](/deploy/dns-steering) answered the
-origin's name with roxy's address. The client has no proxy settings and
-does not know roxy is there.
-
-```yaml
-listeners:
-  - { name: https, mode: direct, bind: 0.0.0.0:443 }
-  - { name: http,  mode: direct, bind: 0.0.0.0:80 }
-  - { name: alt,   mode: direct, bind: 0.0.0.0:8443, target_port: 443 }
-```
-
-The target's port is `target_port`: the port clients connect to. It
-defaults to the bind port; set it when something in between (such as
-Docker port publishing) maps one port to another. roxy peeks at the first
-bytes, as it does inside a CONNECT tunnel:
-
-- **A TLS ClientHello with an SNI:** the target is the SNI and
-  `target_port`. roxy terminates TLS with a leaf for the SNI, and from
-  there the connection is a terminated tunnel: ALPN `h2` or `http/1.1`,
-  origin-form requests whose `Host` must match the SNI. A ClientHello
-  without an SNI is closed (`no_sni`): roxy cannot know the target. So
-  is one whose SNI is not a usable host name (`bad_sni`).
-- **Plaintext HTTP:** origin-form requests, and each request's `Host`
-  names its target. `Host` is required, and its port (80 when absent)
-  must equal `target_port` (`host_mismatch` otherwise). `roxy.internal`
-  serves the CA certificate here, as on the proxy port.
-- **Anything else:** the connection is closed (`non_http_on_direct`).
-
-roxy resolves the target name itself ([upstream](/reference/upstream#dns)); the
-address the client connected to is roxy's own and plays no part. There are
-no connect-time rules: every decision is made on the requests, and
-`listener.mode` is `direct` in rules.
 
 ## HTTP/2
 

@@ -26,7 +26,6 @@ Each section is described on the page the table names.
 | `listeners`, `http` | [HTTP](/reference/http) |
 | `ca_server`, `tls` | [managing the CA](/operate/ca-certificates), [TLS](/reference/tls) |
 | `upstream` | [upstream](/reference/upstream), [address floor](/policies/address-lists#address-floor) |
-| `dns` | [DNS steering](/deploy/dns-steering) |
 | `address_lists` | [address lists](/policies/address-lists#address-lists) |
 | `limits` | [resource limits](/reference/limits) |
 | `rules` | [how policies work](/policies/overview), [rule language](/reference/rule-language) |
