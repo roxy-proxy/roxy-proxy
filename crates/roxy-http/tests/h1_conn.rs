@@ -720,6 +720,31 @@ async fn client_close_during_bodiless_request_ends_drive() {
     assert_eq!(err.reason, Reason::UnexpectedEof);
 }
 
+/// Once the request body has been pumped, the socket is watched as for a
+/// bodiless request: a client that leaves while the upstream is still
+/// thinking ends the drive instead of waiting out the upstream.
+#[tokio::test(start_paused = true)]
+async fn client_close_after_the_upload_ends_drive() {
+    let (mut client, mut c) = conn();
+    client
+        .write_all(b"POST /up HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello")
+        .await
+        .unwrap();
+    let mut req = expect_request(&mut c).await;
+    let body = std::mem::take(&mut req.body);
+    let upstream = async move {
+        assert_eq!(body.collect_up_to(100).await.unwrap(), "hello");
+        drop(client);
+        std::future::pending::<()>().await
+    };
+    let err = client_fault(
+        tokio::time::timeout(Duration::from_secs(5), c.drive(upstream))
+            .await
+            .expect("drive notices the closed client"),
+    );
+    assert_eq!(err.reason, Reason::UnexpectedEof);
+}
+
 #[tokio::test(start_paused = true)]
 async fn pipelined_bytes_during_bodiless_request_are_kept() {
     let (mut client, mut c) = conn();

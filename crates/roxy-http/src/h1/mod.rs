@@ -232,13 +232,16 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
         r.map_err(|e| self.fail(e))
     }
 
-    /// [`ReadSide::pump`] while a body is being read; otherwise watches the
-    /// idle socket so a client that closes while its response is pending is
+    /// [`ReadSide::pump`] while a body is being read, then watches the idle
+    /// socket so a client that closes while its response is pending is
     /// reported rather than waited for. Bytes that arrive instead (pipelined
     /// requests) stay buffered and end the watch. Cancel-safe.
     async fn pump_or_watch(&mut self) -> Result<(), ParseError> {
         if self.feed.is_some() {
-            return self.pump().await;
+            self.pump().await?;
+            if !self.buf.is_empty() {
+                return Ok(());
+            }
         }
         self.buf.reserve(READ_CHUNK);
         match self.rd.read_buf(&mut self.buf).await {
@@ -806,7 +809,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     ///
     /// Returns [`DriveError::Client`] if the request body is invalid, too
     /// large, stalls or the client goes away (including a client that
-    /// closes while waiting for the response to a bodiless request), and
+    /// closes while waiting for the response, body or no body), and
     /// [`DriveError::Write`] if the `100 Continue` could not be written.
     /// `fut` is dropped in either case and the connection must be closed.
     pub async fn drive<F: Future>(&mut self, fut: F) -> Result<F::Output, DriveError> {
