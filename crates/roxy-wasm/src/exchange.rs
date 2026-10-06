@@ -241,6 +241,7 @@ fn to_wasi_error(err: &BodyError, dir: Dir) -> WasiError {
         },
         other @ (BodyError::LengthMismatch
         | BodyError::Closed
+        | BodyError::Abandoned
         | BodyError::Invalid(_)
         | BodyError::Upstream(_)
         | BodyError::Stopped
@@ -280,6 +281,13 @@ impl HttpBody for IntoGuest {
         let this = &mut *self;
         match ready!(Pin::new(&mut this.inner).poll_frame(cx)) {
             Some(Ok(frame)) => Poll::Ready(Some(Ok(frame))),
+            // An observer's copy whose real body the stack dropped unread
+            // ends where the reading stopped. Nobody is at fault, and the
+            // guest learns what became of the request from `next`.
+            Some(Err(BodyError::Abandoned)) => {
+                this.failed = true;
+                Poll::Ready(None)
+            }
             Some(Err(e)) => {
                 this.failed = true;
                 Poll::Ready(Some(Err(to_wasi_error(&e, this.dir))))
@@ -495,5 +503,17 @@ mod tests {
         tx.abort(BodyError::Incomplete);
         let body = IntoGuest::new(body, Dir::Request);
         assert!(body.collect().await.is_err());
+    }
+
+    /// A body abandoned by its consumer ends for the guest where it stood,
+    /// with the bytes that did flow; a body that failed does not.
+    #[tokio::test]
+    async fn into_guest_ends_an_abandoned_body_cleanly() {
+        let (mut tx, body) = Body::channel(u64::MAX, Some(4));
+        tx.send_data(Bytes::from_static(b"ab")).await.unwrap();
+        tx.abort(BodyError::Abandoned);
+        let body = IntoGuest::new(body, Dir::Request);
+        let got = body.collect().await.unwrap().to_bytes();
+        assert_eq!(got, Bytes::from_static(b"ab"));
     }
 }

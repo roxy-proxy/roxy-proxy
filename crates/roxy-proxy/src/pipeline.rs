@@ -794,6 +794,7 @@ pub(crate) fn body_failure(e: &BodyError) -> ParseError {
         BodyError::LengthMismatch
         | BodyError::Incomplete
         | BodyError::Closed
+        | BodyError::Abandoned
         | BodyError::Upstream(_)
         | BodyError::Stopped
         | BodyError::Undecodable(_) => ParseError::new(Reason::UnexpectedEof, e.to_string()),

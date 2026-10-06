@@ -352,6 +352,11 @@ pub enum BodyError {
     /// The consumer dropped the body.
     #[error("body receiver dropped")]
     Closed,
+    /// The body this one copies was dropped by its consumer before the
+    /// end: the rest was never read, by anyone. Not a fault of either
+    /// peer.
+    #[error("body abandoned by its consumer")]
+    Abandoned,
     /// No progress within the idle timeout.
     #[error("body idle timeout")]
     Timeout,
