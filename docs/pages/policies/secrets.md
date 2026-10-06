@@ -1,7 +1,7 @@
 # Secrets
 
 `secrets:` maps names to where each value comes from: an environment
-variable, a file, or nothing (`{}`), meaning whatever loads the policy
+variable, a file, or the control-plane lease (`{ lease: true }`), which
 supplies the value at runtime. `${secret:name}` in a head rule's
 `set_header` value (or an addon endpoint's `headers`) injects the value, so
 the client only ever holds a placeholder; a secret reference anywhere else
@@ -17,7 +17,7 @@ resolve secrets.
 secrets:
   openai: { env: OPENAI_API_KEY }
   gh:     { file: /run/secrets/github_token }   # one trailing newline (`\n` or `\r\n`) stripped; warns if group or world can read it
-  lease:  {}                                    # supplied at runtime by whatever loads the policy
+  lease:  { lease: true }                       # supplied by the control-plane lease
 
 rules:
   - id: openai
@@ -30,13 +30,15 @@ rules:
 The client can send any placeholder in `authorization`; `set_header`
 replaces it before the request is forwarded.
 
-## Sourceless secrets
+## Lease secrets
 
-`name: {}` declares a secret the config does not resolve. The process that
-loads the policy into roxy hands the value over in memory, together with the
-rest of the map; `roxy check` accepts the document, since it never resolves
-secrets, but standalone `roxy run --config` has nothing to supply it and
-refuses to start, naming the secret. `null` or a bare word is a parse error.
+`name: { lease: true }` declares a secret the config does not resolve: the
+control plane hands the value over in memory with the lease, together with
+the rest of the map. `roxy check` accepts the document, since it never
+resolves secrets, but standalone `roxy run --config` has no lease and
+refuses to start, naming the secret. A secret has exactly one of `env`,
+`file` or `lease: true`; `{}`, `null`, a bare word and `lease: false` are
+parse errors.
 
 Secret values live in a store beside the compiled policy, not inside it.
 Replacing the map swaps the store and rebuilds the redactor without

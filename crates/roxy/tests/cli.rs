@@ -333,18 +333,18 @@ fn run_fails_on_missing_secret() {
     );
 }
 
-/// A sourceless secret is for whatever loads the policy to supply. `check`
-/// never resolves secrets, so it passes; standalone `run` has nothing to
-/// supply it and refuses, naming the secret, before it touches the CA dir.
+/// A lease secret is for the control plane to supply. `check` never resolves
+/// secrets, so it passes; standalone `run` has no lease and refuses, naming
+/// the secret, before it touches the CA dir.
 #[test]
-fn sourceless_secret_passes_check_and_fails_run() {
+fn lease_secret_passes_check_and_fails_run() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("roxy.yaml");
     std::fs::write(
         &cfg,
         format!(
             "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:3128 }}]\n\
-             tls: {{ ca_dir: {:?} }}\nsecrets: {{ lease_token: {{}} }}\n\
+             tls: {{ ca_dir: {:?} }}\nsecrets: {{ lease_token: {{ lease: true }} }}\n\
              rules: [{{ id: r, when: true, then: [{{ set_header: {{ authorization: \"Bearer ${{secret:lease_token}}\" }} }}, allow] }}]\n",
             dir.path().join("ca").to_str().unwrap()
         ),
@@ -362,7 +362,7 @@ fn sourceless_secret_passes_check_and_fails_run() {
     assert_eq!(out.status.code(), Some(1));
     let err = text(&out.stderr);
     assert!(err.contains("\"lease_token\""), "{err}");
-    assert!(err.contains("supplied at runtime"), "{err}");
+    assert!(err.contains("has no lease"), "{err}");
     assert!(
         !dir.path().join("ca").exists(),
         "no CA before secrets resolve"

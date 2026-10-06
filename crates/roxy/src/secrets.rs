@@ -3,8 +3,9 @@
 //! Secrets are resolved at `roxy run` and on each reload. `roxy check` never
 //! reads them. A missing environment variable or unreadable file is a fatal
 //! startup error: a rule that injects a secret must never run with a blank
-//! value. A sourceless secret (`{}`) has nothing here to resolve it from,
-//! so `roxy run --config` refuses it the same way.
+//! value. A lease secret (`{ lease: true }`) is supplied by the control
+//! plane's lease; `roxy run --config` has none, so it refuses it the same
+//! way.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -41,10 +42,7 @@ pub enum SecretError {
     },
     #[error("secret {name:?} resolved to an empty value")]
     Empty { name: String },
-    #[error(
-        "secret {name:?} has no `env` or `file` source; its value is supplied at runtime, \
-         which `roxy run --config` cannot do"
-    )]
+    #[error("secret {name:?} is supplied by a lease; `roxy run --config` has no lease")]
     Unresolvable { name: String },
 }
 
@@ -90,7 +88,7 @@ impl Secrets {
         let mut values = BTreeMap::new();
         for (name, source) in sources {
             let value = match source {
-                SecretSource::Runtime => {
+                SecretSource::Lease => {
                     return Err(SecretError::Unresolvable { name: name.clone() });
                 }
                 SecretSource::Env(var) => env(var).ok_or_else(|| SecretError::MissingEnv {
@@ -186,10 +184,10 @@ mod tests {
     }
 
     #[test]
-    fn a_sourceless_secret_cannot_be_resolved_here() {
+    fn a_lease_secret_cannot_be_resolved_here() {
         let mut sources = BTreeMap::new();
         sources.insert("a".to_owned(), SecretSource::Env("A_VAR".into()));
-        sources.insert("lease".to_owned(), SecretSource::Runtime);
+        sources.insert("lease".to_owned(), SecretSource::Lease);
         let err = Secrets::resolve_with(&sources, |_| Some("v".into())).unwrap_err();
         assert!(matches!(&err, SecretError::Unresolvable { name } if name == "lease"));
         assert!(err.to_string().contains("\"lease\""), "{err}");

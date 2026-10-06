@@ -168,16 +168,25 @@ fn bad_size_and_duration_rejected() {
     }
 }
 
-/// `{}` names a secret whose value arrives at runtime; it validates like any
-/// other, so a `${secret:..}` reference to it compiles.
+/// `{ lease: true }` names a secret whose value arrives with the lease; it
+/// validates like any other, so a `${secret:..}` reference to it compiles.
 #[test]
-fn sourceless_secret_parses_and_validates() {
+fn lease_secret_parses_and_validates() {
     let cfg = parse(&format!(
-        "{BASE}secrets: {{ lease: {{}} }}\n\
-         rules: [{{ id: r, when: true, then: [{{ set_header: {{ authorization: \"Bearer ${{secret:lease}}\" }} }}, allow] }}]\n"
+        "{BASE}secrets: {{ tok: {{ lease: true }} }}\n\
+         rules: [{{ id: r, when: true, then: [{{ set_header: {{ authorization: \"Bearer ${{secret:tok}}\" }} }}, allow] }}]\n"
     ));
-    assert_eq!(cfg.secrets["lease"], SecretSource::Runtime);
+    assert_eq!(cfg.secrets["tok"], SecretSource::Lease);
     cfg.validate().unwrap();
+}
+
+/// `lease: false` is rejected with a hint, not read as "no lease".
+#[test]
+fn lease_false_is_an_error_naming_the_alternatives() {
+    let err = Config::from_yaml(&format!("{BASE}secrets: {{ tok: {{ lease: false }} }}\n"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("use `env` or `file` instead"), "{err}");
 }
 
 #[test]
@@ -194,6 +203,9 @@ fn unknown_fields_rejected_everywhere() {
         "secrets: { a: { vault: X } }",
         "secrets: { a: null }",
         "secrets: { a: env }",
+        "secrets: { a: {} }",
+        "secrets: { a: { env: X, lease: true } }",
+        "secrets: { a: { lease: yes } }",
         "metrics: [{ id: m, count: requests, every: 1m }]",
         "rules: [{ id: r, then: allow, when_not: true }]",
         "addons: [{ name: a, path: /a.wasm, fuel: 1 }]",
