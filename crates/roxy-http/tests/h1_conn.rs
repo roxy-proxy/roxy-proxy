@@ -114,7 +114,7 @@ fn ok(body: Body) -> CanonicalResponse {
 async fn response_wire_form() {
     let (mut client, mut c) = conn();
     client
-        .write_all(b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\nGET /b HTTP/1.1\r\nHost: example.com\r\n\r\nHEAD /c HTTP/1.1\r\nHost: example.com\r\n\r\nGET /d HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .write_all(b"GET /a HTTP/1.1\r\nHost: example.com\r\n\r\nGET /b HTTP/1.1\r\nHost: example.com\r\n\r\nHEAD /c HTTP/1.1\r\nHost: example.com\r\n\r\nHEAD /c2 HTTP/1.1\r\nHost: example.com\r\n\r\nGET /d HTTP/1.1\r\nHost: example.com\r\n\r\n")
         .await
         .unwrap();
 
@@ -157,6 +157,17 @@ async fn response_wire_form() {
     c.respond(res).await.unwrap();
     let (head, _) = read_response(&mut client, true).await;
     assert!(head.contains("content-length: 1234"), "{head}");
+
+    // HEAD with no declared length: the empty body must not become
+    // `content-length: 0`.
+    let req = expect_request(&mut c).await;
+    assert_eq!(req.method.as_str(), "HEAD");
+    let res = ok(Body::empty());
+    assert_eq!(res.body.known_length(), Some(0));
+    c.respond(res).await.unwrap();
+    let (head, _) = read_response(&mut client, true).await;
+    assert!(!head.contains("content-length"), "{head}");
+    assert!(!head.contains("transfer-encoding"), "{head}");
 
     // 204 -> no framing headers at all.
     let _ = expect_request(&mut c).await;

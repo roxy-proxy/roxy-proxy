@@ -11,25 +11,9 @@
 use crate::chars::trim_ows;
 use crate::model::{
     Body, CanonicalRequest, CanonicalResponse, Headers, HttpFlags, Limits, Method, ParseError,
-    Reason, RequestMeta, Scheme, parse_content_length, plan_body, reject,
+    Reason, RequestMeta, Scheme, is_reserved, parse_content_length, plan_body, reject,
 };
 use crate::url;
-
-/// Fields a layer may not set on a request it passes on: hop-by-hop and
-/// framing fields roxy owns. `host` and `content-length` are checked
-/// separately.
-const REFUSED: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-connection",
-    "proxy-authorization",
-    "proxy-authenticate",
-    "transfer-encoding",
-    "upgrade",
-    "te",
-    "trailer",
-    "expect",
-];
 
 /// The canonical request as a layer sees it: `scheme://authority/path?query`,
 /// end-to-end headers, the body. No `host` or framing fields; the body's
@@ -43,8 +27,9 @@ pub fn to_layer_request(req: CanonicalRequest) -> http::Request<Body> {
     );
     let mut out = http::Request::new(req.body);
     *out.method_mut() = req.method.to_http();
-    // A canonical request always forms a valid absolute URI.
-    *out.uri_mut() = uri.parse().unwrap_or_default();
+    *out.uri_mut() = uri
+        .parse()
+        .expect("a canonical request serialises to a valid absolute URI");
     *out.headers_mut() = req.headers.to_header_map();
     out
 }
@@ -109,10 +94,10 @@ pub fn from_layer_request(
     for (name, value) in &parts.headers {
         let n = name.as_str();
         let v = trim_ows(value.as_bytes());
-        if REFUSED.contains(&n) {
-            return reject(Reason::ReservedHeader, format!("{n} set by a layer"));
-        }
         match n {
+            // `host` and `content-length` are reserved too, but a layer
+            // states them as part of the request rather than owning them:
+            // they are checked against the URI and the body, then dropped.
             "host" => {
                 if host_seen {
                     return reject(Reason::MultipleHost, "multiple host fields");
@@ -127,6 +112,9 @@ pub fn from_layer_request(
                     return reject(Reason::DuplicateContentLength, "multiple content-length");
                 }
                 content_length = Some(parse_content_length(v)?);
+            }
+            _ if is_reserved(n) => {
+                return reject(Reason::ReservedHeader, format!("{n} set by a layer"));
             }
             _ => rest.push((name.as_str().as_bytes(), value.as_bytes())),
         }
@@ -157,6 +145,7 @@ pub fn from_layer_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chars::is_pchar_literal;
     use crate::model::{TargetForm, Version};
 
     fn req(uri: &str, headers: &[(&str, &str)], body: &'static str) -> http::Request<Body> {
@@ -206,6 +195,25 @@ mod tests {
         assert_eq!(back.url(), "http://example.com:8080/a%20b");
     }
 
+    /// Every byte the normaliser leaves literal in a path or query must
+    /// also be accepted by `http::Uri`, or `to_layer_request` panics.
+    #[test]
+    fn round_trips_every_literal_byte() {
+        let path_literals: String = (0x21u8..0x7f)
+            .filter(|&b| b != b'/' && is_pchar_literal(b))
+            .map(char::from)
+            .collect();
+        let query_literals: String = (0x21u8..0x7f)
+            .filter(|&b| matches!(b, b'/' | b'?' | b'[' | b']') || is_pchar_literal(b))
+            .map(char::from)
+            .collect();
+        let uri = format!("https://example.com/{path_literals}/%2F%7B?{query_literals}&%2F");
+        let c = check(req(&uri, &[], "")).unwrap();
+        assert_eq!(c.path_and_query(), &uri["https://example.com".len()..]);
+        let back = check(to_layer_request(c)).unwrap();
+        assert_eq!(back.url(), uri.replace("example.com", "example.com:443"));
+    }
+
     #[test]
     fn refuses_what_a_client_could_not_send() {
         for (uri, headers, reason) in [
@@ -244,6 +252,11 @@ mod tests {
             (
                 "https://example.com/",
                 vec![("proxy-authorization", "Basic x")],
+                Reason::ReservedHeader,
+            ),
+            (
+                "https://example.com/",
+                vec![("expect", "100-continue")],
                 Reason::ReservedHeader,
             ),
             (

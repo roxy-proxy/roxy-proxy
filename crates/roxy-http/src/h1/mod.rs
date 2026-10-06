@@ -834,7 +834,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         if status_forbids_body(res.status) {
             OutFraming::Empty
         } else if ex.is_head {
-            OutFraming::Head(res.meta.declared_length.or(res.body.known_length()))
+            OutFraming::Head(res.meta.declared_length)
         } else {
             match res.body.known_length() {
                 Some(n) => OutFraming::Length(n),

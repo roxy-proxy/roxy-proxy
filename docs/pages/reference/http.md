@@ -152,7 +152,8 @@ The strictness knobs live under `http:` and all default to strict.
   non-ASCII needs `http.allow_obs_text`.
 - At most `limits.max_headers` (100) fields.
 - Exactly one `Host`, matching the URI authority (absolute-form) or the
-  SNI / CONNECT host (in a tunnel).
+  SNI / CONNECT host (in a tunnel). An HTTP/1.0 absolute-form request
+  (`http.allow_http10`) may omit it; the URI names the target.
 - At most one `Proxy-Authorization`.
 - At most one `Content-Length`, digits only, at most 19 digits. A
   duplicate is rejected even when the values are equal.
@@ -221,7 +222,9 @@ forwarded, so the upstream sees exactly what the rules matched.
    `[` and `]` are also allowed raw; `{ } | ^` and `` ` `` are
    percent-encoded; nothing is decoded. It is parsed into pairs for
    matching only.
-7. A fragment in a request target is rejected.
+7. A fragment in an HTTP/1.1 request target is rejected. The `h2` crate
+   drops a fragment from an HTTP/2 `:path` before roxy sees it; matching and
+   forwarding both use the path without it.
 8. The host is lower-cased; IDNA labels must already be A-labels (`xn--`)
    and raw Unicode is rejected; the port is made explicit; a trailing dot is
    removed.
