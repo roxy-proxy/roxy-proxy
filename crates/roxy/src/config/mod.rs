@@ -1,7 +1,9 @@
 //! roxy's YAML configuration.
 //!
 //! Parsing is strict: every struct denies unknown fields, so a typo is an
-//! error rather than a silently ignored setting. [`Config::validate`] adds the
+//! error rather than a silently ignored setting, and the named maps
+//! (`secrets`, `static_hosts`, endpoint `headers`, addon `endpoints`) refuse
+//! a repeated key. [`Config::validate`] adds the
 //! cross-reference checks serde cannot express. Secrets are *not* resolved
 //! here; see [`crate::secrets`]. Rule and metric types (and their compiler)
 //! live in `roxy-rules` and are re-exported here.
@@ -53,7 +55,7 @@ pub struct Config {
     pub limits: Limits,
     #[serde(default)]
     pub upstream: Upstream,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "units::unique_map")]
     pub secrets: BTreeMap<String, SecretSource>,
     /// Named IP address lists, referenced as `@name` in rules.
     #[serde(default)]
@@ -420,6 +422,7 @@ pub struct Dns {
     /// Fixed answers (`name: ip`) consulted before DNS. Intended for tests
     /// and air-gapped deployments; the answers are still subject to the
     /// address floor (`deny_private_ranges`, `deny_cidrs`).
+    #[serde(deserialize_with = "units::unique_map")]
     pub static_hosts: BTreeMap<String, IpAddr>,
 }
 
@@ -573,8 +576,8 @@ pub struct Endpoint {
     pub url: String,
     /// Headers roxy attaches (values may use `${secret:name}`). They replace
     /// any the addon set.
-    #[serde(default)]
-    pub headers: std::collections::BTreeMap<String, String>,
+    #[serde(default, deserialize_with = "units::unique_map")]
+    pub headers: BTreeMap<String, String>,
     /// Per attempt, until the response head (default 30s).
     #[serde(default, with = "humantime_serde")]
     pub timeout: Option<Duration>,
@@ -693,8 +696,8 @@ pub struct Addon {
     #[serde(default)]
     pub limits: AddonLimits,
     /// Named endpoints this addon may call.
-    #[serde(default)]
-    pub endpoints: std::collections::BTreeMap<String, Endpoint>,
+    #[serde(default, deserialize_with = "units::unique_map")]
+    pub endpoints: BTreeMap<String, Endpoint>,
     /// The addon's keyed store.
     #[serde(default)]
     pub state: AddonState,
