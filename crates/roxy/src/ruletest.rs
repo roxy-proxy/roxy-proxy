@@ -445,6 +445,13 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(DryRunView, Vec
             v = v.with_str(Field::WsText, t);
         }
     }
+    for (id, _) in &req.metrics {
+        if !config.metrics.iter().any(|m| &m.id == id) {
+            warnings.push(format!(
+                "--metric {id}: no metric {id:?} is defined, so no rule can read it"
+            ));
+        }
+    }
     // Unavailable metrics are simply not inserted: MapView then returns
     // `None`, which the engine treats as fail-closed.
     for (id, value) in metric_values(config, req) {

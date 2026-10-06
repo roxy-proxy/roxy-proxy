@@ -587,7 +587,8 @@ pub struct Endpoint {
     /// Per attempt, until the response head (default 30s).
     #[serde(default, with = "humantime_serde")]
     pub timeout: Option<Duration>,
-    /// Extra attempts after a connection failure or a 502/503/504 (default 0).
+    /// Extra attempts after a connection failure or a 502/503/504 (default 0,
+    /// at most 9).
     #[serde(default)]
     pub retries: u32,
     /// Allow private, loopback and link-local addresses (default false).

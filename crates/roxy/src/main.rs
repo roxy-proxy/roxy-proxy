@@ -611,24 +611,36 @@ fn run(path: &Path) -> anyhow::Result<ExitCode> {
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Waits for ctrl-c or SIGTERM; on SIGHUP meanwhile, reopens the flow log
-/// file (for external log rotation) and reloads the config.
+/// file (for external log rotation) and reloads the config. The reload runs
+/// as its own task (the `Reloader` serialises overlapping ones), so a
+/// shutdown signal during a long reload is seen at once; a reload still in
+/// flight then is cancelled, which leaves the running policy in place.
 async fn wait_for_shutdown(running: &roxy::run::Running) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
         let mut term = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
         let mut hup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
-        loop {
+        let mut reload: Option<tokio::task::JoinHandle<bool>> = None;
+        let result = loop {
             tokio::select! {
-                r = tokio::signal::ctrl_c() => return r.context("waiting for ctrl-c"),
-                _ = term.recv() => return Ok(()),
+                r = tokio::signal::ctrl_c() => break r.context("waiting for ctrl-c"),
+                _ = term.recv() => break Ok(()),
                 _ = hup.recv() => {
                     tracing::info!("SIGHUP: reopening logs and reloading config");
                     running.reopen_logs();
-                    running.reloader.reload().await;
+                    let reloader = running.reloader.clone();
+                    reload = Some(tokio::spawn(async move { reloader.reload().await }));
                 }
             }
+        };
+        if let Some(task) = reload
+            && !task.is_finished()
+        {
+            tracing::warn!("shutting down during a config reload; the reload is abandoned");
+            task.abort();
         }
+        result
     }
     #[cfg(not(unix))]
     {

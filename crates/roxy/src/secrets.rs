@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::SecretSource;
 
@@ -41,6 +41,27 @@ pub enum SecretError {
     Empty { name: String },
 }
 
+/// A secret file that group or world can read is most likely a deployment
+/// mistake (a `chmod 644` or a checkout); the secret still loads, since the
+/// permissions of a mounted secret are not always the operator's to set.
+#[cfg(unix)]
+fn warn_if_readable_by_others(name: &str, path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.permissions().mode() & 0o077 != 0
+    {
+        tracing::warn!(
+            secret = name,
+            path = %path.display(),
+            mode = format_args!("{:04o}", meta.permissions().mode() & 0o7777),
+            "secret file is readable by other users"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_readable_by_others(_name: &str, _path: &Path) {}
+
 /// All resolved secrets, by name.
 #[derive(Debug, Default, Clone)]
 pub struct Secrets {
@@ -73,6 +94,7 @@ impl Secrets {
                             path: path.clone(),
                             source,
                         })?;
+                    warn_if_readable_by_others(name, path);
                     // Files written by `echo` or editors end in a newline.
                     if s.ends_with('\n') {
                         s.pop();

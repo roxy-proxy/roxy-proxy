@@ -116,3 +116,18 @@ fn what_the_proxy_rejects_is_rejected_with_its_reason() {
         assert!(stderr.contains(reason), "{args:?}: {stderr}");
     }
 }
+
+#[test]
+fn a_metric_the_config_does_not_define_gets_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path());
+    let (code, stdout, stderr) = rule_test(
+        &cfg,
+        &["--metric", "nope=1", "GET", "https://h.example/a/c"],
+    );
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stderr.contains("warning: --metric nope: no metric \"nope\" is defined"),
+        "{stderr}"
+    );
+}

@@ -18,7 +18,7 @@ open http://127.0.0.1:7575    # Inspect View
 | file | what it is |
 |---|---|
 | [`compose.yaml`](compose.yaml) | roxy, the sentinel sidecar and Inspect View |
-| [`roxy.yaml`](roxy.yaml) | the policy: Anthropic's API and sign-in hosts, every exchange through the sentinel |
+| [`roxy.yaml`](roxy.yaml) | the policy: Anthropic's API and sign-in hosts, every exchange through the sentinel. The sentinel judges only `POST …/v1/messages`; every other path on `api.anthropic.com` is allowed through unjudged |
 | [`sentinel/sidecar.py`](sentinel/sidecar.py) | the sidecar: judges each tool call in a model response, and replaces a refused response with an explanation |
 | [`sentinel/policies.py`](sentinel/policies.py) | `deny_regex`, the sentinel it runs (`SENTINEL_DENY` sets the regex) |
 | [`sentinel/inspect_log.py`](sentinel/inspect_log.py) | writes each session's model calls and verdicts as an Inspect eval log |

@@ -30,8 +30,9 @@ or explicit servers. Results are cached for their TTL, capped by
 the network layer. `static_hosts` answers fixed names before DNS (for tests
 and air-gapped deployments), and its answers still pass the address floor.
 
-A name with several addresses is dialled one address at a time, IPv4 and
-IPv6 alternating from the resolver's first, within one `connect_timeout`
+Both A and AAAA records are looked up. A name with several addresses is
+dialled one address at a time, IPv4 and IPv6 alternating from the
+resolver's first, within one `connect_timeout`
 for all of them: each attempt gets an equal share of the time left, so an
 address that drops packets does not take the whole budget from the ones
 after it. The TLS handshake has its own `connect_timeout`.
