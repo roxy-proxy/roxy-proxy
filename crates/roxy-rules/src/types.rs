@@ -267,6 +267,21 @@ impl Field {
         }
     }
 
+    /// Fields that can be `null` on an ordinary flow: the `tls.*` values on
+    /// a plaintext connection, `query.raw` without a query, a declared
+    /// length when the body is chunked.
+    pub fn nullable(self) -> bool {
+        matches!(
+            self,
+            Self::TlsSni
+                | Self::TlsAlpn
+                | Self::TlsVersion
+                | Self::QueryRaw
+                | Self::BodySize
+                | Self::ResponseBodySize
+        )
+    }
+
     /// Fields compared ASCII case-insensitively (DNS names and the scheme).
     /// `method` is not one: HTTP methods are case-sensitive, and the proxy
     /// treats `get` as an extension method, not as `GET`.

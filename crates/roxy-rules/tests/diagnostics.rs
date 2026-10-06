@@ -215,6 +215,11 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: a, when: 'client.ip not in @nope', then: deny }",
     ),
     (
+        "nullable metric key without a guard",
+        "- { id: a, count: requests, key: [client.ip, tls.sni] }\n- { id: b, count: unique(body.size), where: 'method == POST' }\n- { id: c, count: requests, key: [query.raw], where: 'query.raw != null or host == \"x\"' }\n- { id: d, count: requests, key: [tls.alpn], where: 'tls.sni != null' }",
+        "[]",
+    ),
+    (
         "bad metrics",
         "- { id: bad-id, count: requests, key: [client.nope], window: 0s }\n- { id: r, count: response_bytes, where: 'dst.port == 1' }\n- { id: u, count: unique(nope) }\n- { id: w, count: errors, where: 'response.status >= 500', key: [body.bytes] }\n- { id: v, count: unique(response.status) }",
         "[]",
