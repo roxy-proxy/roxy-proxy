@@ -245,17 +245,45 @@ impl std::fmt::Debug for ServerHandle {
     }
 }
 
+/// A snapshot built by [`ServerHandle::prepare`] and not yet serving.
+/// Dropping it without [`ServerHandle::commit`] leaves the server as it
+/// was.
+pub struct PreparedReload {
+    snapshot: Snapshot,
+}
+
+impl std::fmt::Debug for PreparedReload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedReload").finish_non_exhaustive()
+    }
+}
+
 impl ServerHandle {
-    /// Swaps in a new policy snapshot (policy, secrets, limits,
-    /// upstream settings) atomically. On error the old snapshot stays.
-    /// In-flight exchanges finish under the snapshot they started with.
-    pub fn reload(&self, update: PolicyUpdate) -> Result<(), String> {
-        let snap = self.shared.build_snapshot(update)?;
+    /// Builds the snapshot for `update` (policy, secrets, limits, upstream
+    /// settings) without installing it. Everything in a reload that can
+    /// fail happens here, so a caller with other state to swap alongside
+    /// the policy can do so between this and [`Self::commit`].
+    pub fn prepare(&self, update: PolicyUpdate) -> Result<PreparedReload, String> {
+        let snapshot = self.shared.build_snapshot(update)?;
+        Ok(PreparedReload { snapshot })
+    }
+
+    /// Swaps in a prepared snapshot atomically. In-flight exchanges finish
+    /// under the snapshot they started with.
+    pub fn commit(&self, prepared: PreparedReload) {
+        let snap = prepared.snapshot;
         self.shared
             .layer_state
             .configure(snap.addons.iter().map(|a| (a.name.as_str(), &a.state)));
         let old = self.shared.snapshot.swap(Arc::new(snap));
         old.services.retire();
+    }
+
+    /// [`Self::prepare`] then [`Self::commit`]. On error the old snapshot
+    /// stays.
+    pub fn reload(&self, update: PolicyUpdate) -> Result<(), String> {
+        let prepared = self.prepare(update)?;
+        self.commit(prepared);
         Ok(())
     }
 
