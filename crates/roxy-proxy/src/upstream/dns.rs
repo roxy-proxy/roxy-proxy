@@ -27,6 +27,15 @@ pub struct DnsSettings {
     pub static_hosts: HashMap<String, Vec<IpAddr>>,
 }
 
+impl DnsSettings {
+    /// Builds the resolver these settings describe and discards it, so a
+    /// config check fails where startup would. No socket is opened: the
+    /// resolver only dials on lookup.
+    pub fn check(&self) -> Result<(), String> {
+        Dns::new(self).map(drop)
+    }
+}
+
 impl Default for DnsSettings {
     fn default() -> Self {
         Self {

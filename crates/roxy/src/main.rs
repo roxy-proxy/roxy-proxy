@@ -11,10 +11,12 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use roxy_proxy::Redactor;
-use roxy_tls::{Ca, CaError};
+use roxy_proxy::{Redactor, UpstreamSettings};
+use roxy_rules::Condition;
+use roxy_tls::{Ca, CaError, UpstreamTlsOptions};
 use tracing_subscriber::EnvFilter;
 
+use roxy::addons::AddonLoader;
 use roxy::config::{Compiled, Config};
 use roxy::ruletest;
 
@@ -448,6 +450,18 @@ fn check(path: &Path) -> ExitCode {
                     println!("address list {}: {} entries", spec.name, l.len());
                 }
             }
+            let Compiled {
+                policy,
+                addon_conditions,
+            } = compiled;
+            let errs = startup_checks(&config, addon_conditions);
+            if !errs.is_empty() {
+                for e in &errs {
+                    eprintln!("{}:{e}", path.display());
+                }
+                eprintln!("{}: {} problem(s) found", path.display(), errs.len());
+                return ExitCode::FAILURE;
+            }
             println!(
                 "{}: OK ({} listener(s), {} rule(s), {} metric(s), {} secret(s), {} addon(s))",
                 path.display(),
@@ -457,11 +471,8 @@ fn check(path: &Path) -> ExitCode {
                 config.secrets.len(),
                 config.addons.len(),
             );
-            if compiled.policy.rule_count() > 0 {
-                print!(
-                    "rules:\n{}",
-                    roxy::ruletest::classification(&compiled.policy)
-                );
+            if policy.rule_count() > 0 {
+                print!("rules:\n{}", roxy::ruletest::classification(&policy));
             }
             ExitCode::SUCCESS
         }
@@ -473,6 +484,38 @@ fn check(path: &Path) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The rest of startup's loading that needs no socket and writes nothing:
+/// compiling the addons, loading a provided CA (one in `tls.ca_dir` is
+/// generated at startup, never here), reading `tls.upstream.extra_roots`
+/// and building the resolver. Every failure is reported as `<field>: <why>`.
+fn startup_checks(config: &Config, addon_conditions: Vec<Option<Condition>>) -> Vec<String> {
+    let mut errs = Vec::new();
+    let addons = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("starting tokio runtime: {e}"))
+        .and_then(|rt| rt.block_on(AddonLoader::default().prepare(config, addon_conditions)));
+    if let Err(e) = addons {
+        errs.push(format!("addons: {e:#}"));
+    }
+    match config.tls.provided_ca() {
+        Ok(Some((cert, key))) => {
+            if let Err(e) = Ca::load_provided(cert, key) {
+                errs.push(format!("tls.ca_cert: {e}"));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => errs.push(format!("tls.ca_cert: {e}")),
+    }
+    if let Err(e) = roxy_tls::client_config(&UpstreamTlsOptions::from(config)) {
+        errs.push(format!("tls.upstream.extra_roots: {e}"));
+    }
+    if let Err(e) = UpstreamSettings::from(config).dns.check() {
+        errs.push(format!("upstream.dns.resolver: {e}"));
+    }
+    errs
 }
 
 fn ca_init(path: &Path, force: bool) -> anyhow::Result<ExitCode> {
