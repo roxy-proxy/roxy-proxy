@@ -14,6 +14,7 @@ flate2 = "1.1.5"
 rcgen.workspace = true
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "http2"] }
 ring.workspace = true
+rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -29,6 +30,7 @@ hyper = { version = "1.11.1", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["server", "tokio", "http1"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "tls12", "std"] }
 tempfile.workspace = true
+time.workspace = true
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
 
 [lints]
