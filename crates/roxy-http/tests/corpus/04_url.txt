@@ -118,11 +118,19 @@ GET /a"b HTTP/1.1\r\n
 Host: example.com\r\n
 \r\n
 
-=== brace_in_query
+=== brace_in_query_encoded
 role: tunnel https example.com:443
-expect: error invalid_query
+expect: request GET https://example.com:443/a?x=%7B%7D
 ---
 GET /a?x={} HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== pipe_caret_in_path_encoded
+role: tunnel https example.com:443
+expect: request GET https://example.com:443/a%7Cb%5Ec?ids=1%7C2
+---
+GET /a|b^c?ids=1|2 HTTP/1.1\r\n
 Host: example.com\r\n
 \r\n
 
