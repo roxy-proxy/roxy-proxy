@@ -23,7 +23,8 @@ use rcgen::{
 };
 use rustls::crypto::ring::sign::any_ecdsa_type;
 use rustls::sign::{CertifiedKey, SigningKey};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use roxy_http::Host;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use time::{Duration, OffsetDateTime};
 
 use crate::ca::Ca;
@@ -34,21 +35,10 @@ pub(crate) const LEAF_VALIDITY: Duration = Duration::days(7);
 const LEAF_BACKDATE: Duration = Duration::hours(1);
 /// Cached entries are dropped (and re-minted) within this long of expiry.
 const EVICT_BEFORE_EXPIRY: Duration = Duration::hours(1);
-/// Maximum DNS name length (RFC 1035 presentation form).
-const MAX_DNS_NAME: usize = 253;
 
 /// Errors from minting leaf certificates.
 #[derive(Debug, thiserror::Error)]
 pub enum LeafError {
-    /// Not a valid DNS name or IP address.
-    #[error("invalid server name {0:?}")]
-    InvalidName(String),
-    /// Longer than 253 bytes.
-    #[error("server name too long ({0} bytes, max 253)")]
-    NameTooLong(usize),
-    /// Wildcard names are never minted.
-    #[error("wildcard server names are not allowed: {0:?}")]
-    Wildcard(String),
     /// Certificate generation failed.
     #[error("leaf certificate generation failed: {0}")]
     Generate(#[from] rcgen::Error),
@@ -68,7 +58,7 @@ struct Entry {
     not_after: OffsetDateTime,
 }
 
-type Cache = LruCache<ServerName<'static>, Entry>;
+type Cache = LruCache<Host, Entry>;
 
 /// Mints and caches leaf certificates signed by the roxy CA.
 pub struct LeafMinter {
@@ -113,27 +103,26 @@ impl LeafMinter {
         self.lock().len()
     }
 
-    /// Get (minting if needed) the certified key for `name`.
+    /// Get (minting if needed) the certified key for `host`.
     ///
-    /// The chain is `[leaf, CA, intermediates...]`. Names are validated and canonicalised
-    /// (lower-cased); invalid names, names over 253 bytes and wildcards are
-    /// rejected. This blocks for ~1 ms on a cache miss; see the module docs.
-    pub fn certified_key(&self, name: &ServerName<'_>) -> Result<Arc<CertifiedKey>, LeafError> {
-        let name = canonical_name(name)?;
+    /// The chain is `[leaf, CA, intermediates...]`. A [`Host`] is already
+    /// canonical (`roxy_http::url::parse_host`), so it is the cache key as is.
+    /// This blocks for ~1 ms on a cache miss; see the module docs.
+    pub fn certified_key(&self, host: &Host) -> Result<Arc<CertifiedKey>, LeafError> {
         let now = self.now();
         {
             let mut cache = self.lock();
-            if let Some(entry) = cache.get(&name) {
+            if let Some(entry) = cache.get(host) {
                 if entry.not_after - now > EVICT_BEFORE_EXPIRY {
                     return Ok(Arc::clone(&entry.key));
                 }
-                cache.pop(&name);
+                cache.pop(host);
             }
         }
-        let (key, not_after) = self.mint(&name, now)?;
+        let (key, not_after) = self.mint(host, now)?;
         let key = Arc::new(key);
         self.lock().put(
-            name,
+            host.clone(),
             Entry {
                 key: Arc::clone(&key),
                 not_after,
@@ -144,19 +133,13 @@ impl LeafMinter {
 
     fn mint(
         &self,
-        name: &ServerName<'static>,
+        host: &Host,
         now: OffsetDateTime,
     ) -> Result<(CertifiedKey, OffsetDateTime), LeafError> {
-        let (san, cn) = match name {
-            ServerName::DnsName(dns) => {
-                let s = dns.as_ref().to_owned();
-                (SanType::DnsName(s.clone().try_into()?), s)
-            }
-            ServerName::IpAddress(ip) => {
-                let ip = IpAddr::from(*ip);
-                (SanType::IpAddress(ip), ip.to_string())
-            }
-            _ => return Err(LeafError::InvalidName(format!("{name:?}"))),
+        let (san, cn) = match host {
+            Host::Dns(name) => (SanType::DnsName(name.clone().try_into()?), name.clone()),
+            Host::Ipv4(ip) => (SanType::IpAddress(IpAddr::V4(*ip)), ip.to_string()),
+            Host::Ipv6(ip) => (SanType::IpAddress(IpAddr::V6(*ip)), ip.to_string()),
         };
         let mut params = CertificateParams::default();
         let mut dn = DistinguishedName::new();
@@ -201,38 +184,6 @@ impl LeafMinter {
     }
 }
 
-/// Parse a host string (DNS name, IPv4, IPv6 with or without brackets) into a
-/// canonical [`ServerName`]: lower-case, no trailing dot, no wildcard, at most
-/// 253 bytes.
-pub(crate) fn parse_host(host: &str) -> Result<ServerName<'static>, LeafError> {
-    let trimmed = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    if let Ok(ip) = trimmed.parse::<IpAddr>() {
-        return Ok(ServerName::IpAddress(ip.into()));
-    }
-    if host.len() > MAX_DNS_NAME {
-        return Err(LeafError::NameTooLong(host.len()));
-    }
-    if host.contains('*') {
-        return Err(LeafError::Wildcard(host.to_owned()));
-    }
-    if host.ends_with('.') || !host.is_ascii() {
-        return Err(LeafError::InvalidName(host.to_owned()));
-    }
-    let lower = host.to_ascii_lowercase();
-    ServerName::try_from(lower).map_err(|_| LeafError::InvalidName(host.to_owned()))
-}
-
-fn canonical_name(name: &ServerName<'_>) -> Result<ServerName<'static>, LeafError> {
-    match name {
-        ServerName::DnsName(dns) => parse_host(dns.as_ref()),
-        ServerName::IpAddress(ip) => Ok(ServerName::IpAddress(*ip)),
-        _ => Err(LeafError::InvalidName(format!("{name:?}"))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,8 +194,8 @@ mod tests {
         LeafMinter::new(Arc::new(ca), size).unwrap()
     }
 
-    fn name(s: &str) -> ServerName<'static> {
-        parse_host(s).unwrap()
+    fn name(s: &str) -> Host {
+        roxy_http::url::parse_host(s.as_bytes()).unwrap()
     }
 
     #[test]
@@ -304,33 +255,6 @@ mod tests {
         assert_eq!(m.cached(), 1);
     }
 
-    #[test]
-    fn rejects_bad_names() {
-        let m = minter(8);
-        for bad in [
-            "",
-            "*.example.com",
-            "*",
-            "exa mple.com",
-            "example.com.",
-            "-bad-.com",
-            "a..b",
-            "münchen.de",
-            "nul\0.com",
-        ] {
-            assert!(parse_host(bad).is_err(), "{bad:?} should be rejected");
-        }
-        assert!(matches!(
-            parse_host(&format!("{}.com", "a".repeat(250))),
-            Err(LeafError::NameTooLong(_))
-        ));
-        assert!(matches!(
-            parse_host("*.example.com"),
-            Err(LeafError::Wildcard(_))
-        ));
-        assert_eq!(m.cached(), 0);
-    }
-
     /// A CA with less than `LEAF_VALIDITY` left bounds its leaves, and once
     /// it has expired nothing is minted.
     #[test]
@@ -359,9 +283,9 @@ mod tests {
     #[test]
     fn ip_san_works() {
         let m = minter(8);
-        for host in ["127.0.0.1", "[::1]", "2001:db8::1"] {
+        for host in ["127.0.0.1", "[::1]", "[2001:db8::1]"] {
             let n = name(host);
-            assert!(matches!(n, ServerName::IpAddress(_)));
+            assert!(matches!(n, Host::Ipv4(_) | Host::Ipv6(_)));
             let ck = m.certified_key(&n).unwrap();
             let (_, x509) = x509_parser::parse_x509_certificate(ck.cert[0].as_ref()).unwrap();
             let san = x509.subject_alternative_name().unwrap().unwrap();

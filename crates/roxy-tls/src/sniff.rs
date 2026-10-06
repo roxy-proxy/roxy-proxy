@@ -262,7 +262,7 @@ mod tests {
             .with_root_certificates(RootCertStore::empty())
             .with_no_client_auth();
         cfg.alpn_protocols = alpn.iter().map(|a| a.as_bytes().to_vec()).collect();
-        let name = crate::server_name_for_host(sni).unwrap();
+        let name = crate::server_name(&roxy_http::url::parse_host(sni.as_bytes()).unwrap());
         let mut conn = ClientConnection::new(Arc::new(cfg), name).unwrap();
         let mut out = Vec::new();
         while conn.wants_write() {
