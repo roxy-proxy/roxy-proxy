@@ -37,23 +37,22 @@ and the key never leaves the node.
 
 ### Errors
 
-Every non-`2xx`, non-`304` response carries an error body:
+Every non-`2xx` response carries an error body:
 
 ```json title="Error"
 {"error": "invalid_token", "message": "enrolment token already used"}
 ```
 
 `error` is a stable code; `message` is for humans. A `426` adds `missing`
-(see [features](/reference/node-protocol#features)). A node acts on the status code, not the
-body.
+(see [unsupported versions](/reference/node-protocol#unsupported-versions)). A node acts on
+the status code, not the body.
 
 | status | meaning | node behaviour |
 |---|---|---|
 | `400` | the request was malformed; `error` says how | log; do not retry the same request |
 | `401` | at enrolment: the token is unknown, used or expired. Elsewhere: the certificate is not recognised as a node | enrolment: fail. Elsewhere: log once per outcome change, keep the current lease and let it run down. Never re-enrol: the token is gone |
 | `410` | the node is revoked. Definite and terminal | write an empty policy at once, finish shipping what is spooled, stop polling, keep health up |
-| `413` | flow batch too large | halve the batch and retry |
-| `426` | the server will not render for this node's version or features | treat as `5xx` for the lease; log the `missing` list distinctly |
+| `426` | the server will not serve this node's `protocol_version` or `roxy_version` | treat as `5xx` for the lease; log the `missing` list distinctly |
 | `507` | flow quota exhausted | stop shipping until a new lease id arrives |
 | `5xx`, timeout, connection or TLS error | the control plane is unavailable | retry with backoff; the lease runs down |
 
@@ -69,8 +68,7 @@ certificate.
 {
   "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIH...\n-----END CERTIFICATE REQUEST-----\n",
   "roxy_version": "0.1.0",
-  "protocol_version": 1,
-  "features": ["valid_until", "sourceless_secrets", "readyz", "action:deny", "addon:wasm"]
+  "protocol_version": 1
 }
 ```
 
@@ -80,7 +78,9 @@ certificate.
   extensions: it sets the subject and SAN itself.
 - `protocol_version` is `1`. A server that does not speak the version
   answers `426` with `missing: ["protocol_version:1"]`.
-- `features` is the node's [feature list](/reference/node-protocol#features).
+- `roxy_version` is the node's roxy release. A server may refuse a node
+  below a version floor with `426` (see
+  [unsupported versions](/reference/node-protocol#unsupported-versions)).
 
 ```json title="EnrolResponse"
 {
@@ -127,65 +127,52 @@ failure: a node the control plane will not renew stops serving.
 
 ## Lease
 
-`GET /roxy/v1/lease` with the node certificate. The node reports its state
-in one header, `Roxy-Node-State`, whose value is a compact JSON object:
+`POST /roxy/v1/lease` with the node certificate. The body is the node's
+state:
 
 ```json title="NodeState"
 {
   "lease_id": "lease-01J9Z8K3",
-  "config_hash": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-  "secrets_hash": "v12",
   "roxy_version": "0.1.0",
   "protocol_version": 1,
-  "features": ["valid_until", "sourceless_secrets", "readyz", "action:deny", "addon:wasm"],
   "uptime_seconds": 86400,
   "policy_state": "loaded",
   "spooled_bytes": 0
 }
 ```
 
-- `lease_id`, `config_hash` and `secrets_hash` are null before the first
-  lease.
+- `lease_id` is the lease the node holds; null before the first lease.
 - `policy_state` is `none` (no lease yet), `loaded` (a lease is in force)
   or `expired` (the lease ran down, or the node is revoked).
 - `spooled_bytes` is flow-log data accepted but not yet acknowledged.
 
-The node sends `If-None-Match` with the `ETag` of the lease it holds. The
-server answers:
+The server answers:
 
-- `200` with a lease body and an `ETag`. The node applies it.
-- `304` when the lease the node holds is still the one the server would
-  issue. The response has no body and carries `Roxy-Lease-Valid-For` and
-  `Roxy-Lease-Refresh-After`, both in seconds, which the node applies
-  exactly as it would `valid_for_seconds` and `refresh_after_seconds` from
-  a `200`. An unchanged lease costs a request and a few headers, and is
-  extended by it.
+- `200` with the full lease, on every poll. The node compares `config` and
+  `secrets` with what it holds and applies only what differs; a lease that
+  changes neither only moves `valid_until`. A lease is small and the poll
+  is infrequent, so there is no conditional fetch.
 - `410`, `401`, `426`, `5xx` as in the [errors table](/reference/node-protocol#errors).
 
-The server renders the lease for the node's reported version and features
-(see [features](/reference/node-protocol#features)). It may also use the reported hashes to notice
-a node that did not apply what it was sent.
+The server may use the reported `roxy_version` to refuse a node it will not
+serve, and the reported `lease_id` to notice a node that did not apply what
+it was sent.
 
 ### Lease body
 
 ```json title="Lease"
 {
   "lease_id": "lease-01J9Z8K3",
-  "issued_at": "2026-10-06T10:12:00Z",
   "valid_for_seconds": 900,
   "refresh_after_seconds": 300,
   "config": "listeners:\n  proxy: 0.0.0.0:8080\nsecrets:\n  github: {}\nrules:\n  - id: github\n    match: {host: api.github.com}\n    action: allow\n",
-  "config_hash": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
   "secrets": {
-    "github": "ghp_example",
-    "hmac_key": {"b64": "AAECAwQFBgc="}
+    "github": "ghp_example"
   },
-  "secrets_hash": "v12",
   "state_epoch": "2026-10-06T09:00:00Z",
   "flow": {
     "ship": true,
     "batch_max_bytes": 1048576,
-    "batch_max_events": 1000,
     "flush_interval_seconds": 5,
     "spool_high_water_bytes": 67108864,
     "on_high_water": "hold"
@@ -193,32 +180,27 @@ a node that did not apply what it was sent.
 }
 ```
 
-- `lease_id` is opaque and changes whenever any other field changes. It is
-  also the `ETag`. The node quotes it in flow batches.
+- `lease_id` is opaque and changes whenever any other field changes. The
+  node reports it on every poll and quotes it in flow batches.
 - `valid_for_seconds` is a duration, not an instant. The node computes
   `valid_until = now + valid_for_seconds` from its own clock at the moment
   it receives the response, and writes that as the policy's `valid_until`.
   The server's clock is never used: a node whose clock is an hour ahead of
   the server's would otherwise expire an hour early, and one an hour behind
   would serve for an hour after the control plane meant it to stop.
-  `issued_at` is the server's view, for logs only.
 - `refresh_after_seconds` is when to poll next, counted the same way. It
   must leave room for several retries before `valid_for_seconds` runs out;
   a third of it is a reasonable choice. The node adds jitter.
 - `config` is a complete `roxy.yaml` as a string, with no secret values in
   it: every `secrets:` entry is sourceless (`name: {}`), meaning the value
-  comes from the lease. `config_hash` is `sha256:` followed by the
-  lower-case hex SHA-256 of the UTF-8 bytes of `config`.
-- `secrets` maps each secret name the config declares to its value: a
-  string, or `{"b64": "..."}` (standard base64 with padding) for a value
-  that is not UTF-8. `secrets_hash` is opaque: it changes whenever any
-  value changes, and must not be a plain digest of the values, because the
-  node reports and may log it. A version counter or a keyed hash is fine.
-- The two hashes drive what the node does with a new lease. A changed
-  `config_hash` rebuilds the policy: the atomic snapshot swap, as a file
-  reload does. A changed `secrets_hash` alone swaps the in-memory secret
-  map and updates the redactor; rules, addons and upstream pools are left
-  alone. A lease with neither changed only moves `valid_until`.
+  comes from the lease.
+- `secrets` maps each secret name the config declares to its value, a
+  UTF-8 string.
+- The node compares `config` and `secrets` with what it holds. A changed
+  `config` rebuilds the policy: the atomic snapshot swap, as a file reload
+  does. Changed `secrets` alone swap the in-memory secret map and update
+  the redactor; rules, addons and upstream pools are left alone. A lease
+  with neither changed only moves `valid_until`.
 - `state_epoch` is opaque. When it differs from the previous lease's, the
   node clears every rule `set_state` entry and every metric window before
   applying the lease. That is how a control plane lifts a sticky quarantine
@@ -237,32 +219,22 @@ would reject, or a `secrets` map missing a name the config declares, is
 logged and discarded, and the node keeps the lease it has. A node without
 a lease denies everything and reports not ready.
 
-### Features
+### Unsupported versions
 
-`features` is a list of strings naming what the node can run. A server
-renders a lease only from features the node reported, and compares the
-rendered document against the list before sending it. If the policy needs
-something the node lacks, the answer is `426` whose body names it:
+A node reports `protocol_version` and `roxy_version` at enrolment, renewal
+and every lease fetch. A server that does not speak the protocol version,
+or that will not serve nodes below some roxy release, answers `426` whose
+body names what the node lacks:
 
 ```json title="Error"
-{"error": "unsupported", "message": "node lacks: addon:wasm", "missing": ["addon:wasm"]}
+{"error": "unsupported", "message": "roxy 0.1.0 is below this server's floor of 0.2.0", "missing": ["roxy_version:0.2.0"]}
 ```
 
-Feature names in v1:
-
-- `valid_until`: the node honours a top-level `valid_until`.
-- `sourceless_secrets`: the node accepts `secrets:` entries with no `env`
-  or `file` source.
-- `readyz`: the node serves `/readyz`.
-- `action:<name>` for each rule action the node's compiler knows, for
-  example `action:allow`, `action:deny`, `action:set_header`.
-- `addon:<kind>` for each addon kind the node can load, for example
-  `addon:wasm`.
-
-A node reports the same list at enrolment, renewal and every lease fetch.
-Feature names are case-sensitive. A server ignores names it does not know.
-This is what lets a fleet of mixed roxy versions take a rollout: the
-renderer can never send a node a policy it would fail to load.
+There is no capability negotiation beyond this. The node parses the
+rendered `config` strictly, so a lease that uses something the node does
+not understand fails to load and the node keeps the lease it has; the
+`lease_id` it reports on the next poll shows the server that the new lease
+was not applied.
 
 ## Flow upload
 
@@ -290,9 +262,10 @@ compressed, signalled with `Content-Encoding: gzip`.
   node_mismatch`. `lease_id` is the lease in force when the batch was
   assembled; the server accepts any lease id it has issued to the node.
 - The batch respects the lease's `batch_max_bytes` (the JSON body before
-  compression) and `batch_max_events`. The node flushes when either is
-  reached or `flush_interval_seconds` has passed since the first unsent
-  event.
+  compression). The node flushes when it is reached or
+  `flush_interval_seconds` has passed since the first unsent event. A
+  server that refuses a batch within the size it stated is a server error,
+  treated as `5xx`.
 
 ```json title="FlowAck"
 {"acked_through": 1043}
@@ -309,9 +282,6 @@ dropped events will have one.
 
 Other responses:
 
-- `413`: the batch is larger than the server will take. The node halves
-  `batch_max_events` for its next attempts, down to one. A single event
-  that is still `413` is dropped and logged once.
 - `507`: the node's flow quota is exhausted. The node stops shipping, logs
   once, and applies `on_high_water` to what accumulates: `hold` stalls
   traffic when the spool fills, `spool` drops oldest. Shipping resumes when
@@ -327,17 +297,18 @@ Other responses:
    `POST`s `/roxy/v1/enrol` with the token. It gets `node-7f3a9c`, a
    certificate valid for 30 days, and `renew_after_seconds` of 15 days. It
    writes the certificate and key to the state directory.
-2. It `GET`s `/roxy/v1/lease` with the certificate and `policy_state:
-   none`. It gets `200`, lease `lease-01J9Z8K3`, `valid_for_seconds: 900`,
-   `refresh_after_seconds: 300`. It sets `valid_until` to its own clock
-   plus 900 s, loads the config, stores the secrets in memory, records the
-   epoch, and reports ready.
-3. Five minutes later it `GET`s the lease again with `If-None-Match:
-   "lease-01J9Z8K3"`. It gets `304` with `Roxy-Lease-Valid-For: 900`. It
-   moves `valid_until` forward 900 s from now. Nothing is rebuilt.
+2. It `POST`s `/roxy/v1/lease` with the certificate, `lease_id: null` and
+   `policy_state: none`. It gets `200`, lease `lease-01J9Z8K3`,
+   `valid_for_seconds: 900`, `refresh_after_seconds: 300`. It sets
+   `valid_until` to its own clock plus 900 s, loads the config, stores the
+   secrets in memory, records the epoch, and reports ready.
+3. Five minutes later it `POST`s the lease again, reporting `lease_id:
+   "lease-01J9Z8K3"`. It gets `200` with the same `lease_id`: nothing has
+   changed. It moves `valid_until` forward 900 s from now. Nothing is
+   rebuilt.
 4. An operator rotates the GitHub token. The next poll gets `200`, lease
-   `lease-01J9ZB7Q`, the same `config_hash`, a new `secrets_hash`. The node
-   swaps the secret map. In-flight requests that already read the old
+   `lease-01J9ZB7Q`, the same `config`, a new value under `secrets`. The
+   node swaps the secret map. In-flight requests that already read the old
    value finish with it; the redactor scrubs both.
 5. The operator revokes the node. The next poll gets `410`. The node
    writes an empty policy, denies everything, ships its spooled flow
@@ -350,8 +321,10 @@ denied everything until a lease arrived.
 ## Not in v1
 
 Push from the server to the node: polling at `refresh_after_seconds` is
-enough. Secrets with their own expiry: the server re-leases before a
-credential expires. Capture body upload: `capture_dir` is local. Server-side
+enough. Conditional fetch (`ETag`, `304`): a lease is small, and the node
+diffs it locally. Secrets with their own expiry: the server re-leases before
+a credential expires. Binary secret values: a secret is a UTF-8 string.
+Capture body upload: `capture_dir` is local. Server-side
 storage, a UI, or any particular control plane: the control plane is
 whatever implements these endpoints. Per-node interception CA issuance:
 `interception_ca` is reserved for it.

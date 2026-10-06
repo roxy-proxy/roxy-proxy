@@ -105,8 +105,8 @@ fn page_examples_validate_against_their_schemas() {
     }
 }
 
-/// The schemas the operations send or receive: every request body, response
-/// body and JSON-valued header parameter, by the component they reference.
+/// The schemas the operations send or receive: every request body and
+/// response body, by the component they reference.
 fn body_schemas() -> BTreeSet<String> {
     let mut found = Vec::new();
     refs(&document()["paths"], "/paths", &mut found);
@@ -118,11 +118,6 @@ fn body_schemas() -> BTreeSet<String> {
     refs(
         &document()["components"]["requestBodies"],
         "/components/requestBodies",
-        &mut found,
-    );
-    refs(
-        &document()["components"]["parameters"],
-        "/components/parameters",
         &mut found,
     );
     found
@@ -157,22 +152,21 @@ fn lease_rejects_the_reserved_interception_ca() {
 }
 
 #[test]
-fn lease_rejects_a_non_sha256_config_hash_and_a_bad_on_high_water() {
-    let mut lease = page_example("Lease");
-    lease["config_hash"] = json!("md5:abc");
-    assert!(validate("Lease", &lease).is_err());
+fn lease_rejects_a_bad_on_high_water() {
     let mut lease = page_example("Lease");
     lease["flow"]["on_high_water"] = json!("drop");
     assert!(validate("Lease", &lease).is_err());
 }
 
 #[test]
-fn lease_secret_values_are_text_or_b64_only() {
+fn lease_secret_values_are_strings_only() {
     let mut lease = page_example("Lease");
-    lease["secrets"]["bad"] = json!({"hex": "00ff"});
+    lease["secrets"]["bad"] = json!({"b64": "AAECAwQFBgc="});
     assert!(validate("Lease", &lease).is_err());
     lease["secrets"]["bad"] = json!(42);
     assert!(validate("Lease", &lease).is_err());
+    lease["secrets"]["bad"] = json!("plain");
+    assert!(validate("Lease", &lease).is_ok());
 }
 
 #[test]
@@ -181,7 +175,7 @@ fn unsupported_error_must_name_what_is_missing() {
     assert!(
         validate(
             "Error",
-            &json!({"error": "unsupported", "message": "no", "missing": ["addon:wasm"]})
+            &json!({"error": "unsupported", "message": "no", "missing": ["roxy_version:0.2.0"]})
         )
         .is_ok()
     );
@@ -202,16 +196,16 @@ fn enrol_request_pins_protocol_version_one() {
 }
 
 #[test]
-fn node_state_policy_state_is_an_enum_and_hashes_may_be_null() {
+fn node_state_policy_state_is_an_enum_and_only_lease_id_may_be_null() {
     let mut state = page_example("NodeState");
     state["policy_state"] = json!("loading");
     assert!(validate("NodeState", &state).is_err());
     let mut state = page_example("NodeState");
     state["lease_id"] = Value::Null;
-    state["config_hash"] = Value::Null;
-    state["secrets_hash"] = Value::Null;
     state["policy_state"] = json!("none");
     assert!(validate("NodeState", &state).is_ok());
+    state["roxy_version"] = Value::Null;
+    assert!(validate("NodeState", &state).is_err());
 }
 
 #[test]
