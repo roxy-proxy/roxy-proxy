@@ -33,7 +33,8 @@
 //! Whether a chunk needs anything is decided once per exchange from the
 //! policy's masks. When no rule watches a direction and no metric counts
 //! its bytes, a chunk costs two atomic loads (the stop flag and the flow
-//! log's readiness) and no lock.
+//! log's readiness) and no lock; a WebSocket chunk under a policy with
+//! `valid_until` adds a clock read.
 //!
 //! # Audit backpressure
 //!
