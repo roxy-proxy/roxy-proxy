@@ -169,3 +169,75 @@ async fn roxy_internal_serves_the_ca_over_plaintext() {
     assert!(a.text().starts_with("-----BEGIN CERTIFICATE-----"));
     assert!(kit.upstream.seen().is_empty());
 }
+
+/// The SNI is a name: case does not matter, and the leaf, the routing and
+/// the log all use the lower-case form.
+#[tokio::test]
+async fn an_upper_case_sni_is_the_same_host() {
+    let kit = kit().await;
+    let mut cfg = kit.client_tls();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let name = rustls::pki_types::ServerName::try_from("UP.TEST".to_owned()).unwrap();
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+        .connect(name, kit.connect_direct(443))
+        .await
+        .expect("the handshake completes");
+    tls.write_all(b"GET /u HTTP/1.1\r\nhost: UP.TEST\r\n\r\n")
+        .await
+        .unwrap();
+    let (head, _) = super::read_response(&mut tls).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["tls"]["sni"], "up.test", "{ev:#}");
+    assert_eq!(ev["req"]["host"], "up.test", "{ev:#}");
+}
+
+/// A client that connected to an IP sends no SNI, and there is no other
+/// way to learn the host: closed as `no_sni`, never forwarded.
+#[tokio::test]
+async fn an_ip_target_has_no_sni_and_is_closed() {
+    let kit = kit().await;
+    let name = roxy_tls::server_name_for_host(super::UP_IP).unwrap();
+    let res = tokio_rustls::TlsConnector::from(Arc::new(kit.client_tls()))
+        .connect(name, kit.connect_direct(443))
+        .await;
+    assert!(res.is_err(), "the handshake fails");
+    let ev = kit.events("parse_error", 1).await;
+    assert_eq!(ev[0]["reason"], "no_sni", "{ev:#?}");
+    assert!(kit.upstream.seen().is_empty());
+}
+
+/// An SNI carrying a port is not a host name: the handshake never
+/// completes and nothing is forwarded. No rustls client sends one, so the
+/// hello is a real one with the name patched in place.
+#[tokio::test]
+async fn an_sni_with_a_port_is_closed() {
+    let kit = kit().await;
+    let (mut ours, theirs) = tokio::io::duplex(64 * 1024);
+    let cfg = Arc::new(kit.client_tls());
+    let name = roxy_tls::server_name_for_host("up.testx443").unwrap();
+    let hs = tokio::spawn(async move {
+        tokio_rustls::TlsConnector::from(cfg)
+            .connect(name, theirs)
+            .await
+    });
+    let mut hello = vec![0u8; 16 * 1024];
+    let n = ours.read(&mut hello).await.unwrap();
+    hello.truncate(n);
+    let at = hello
+        .windows(11)
+        .position(|w| w == b"up.testx443")
+        .expect("the SNI is in the hello");
+    hello[at..at + 11].copy_from_slice(b"up.test:443");
+    let mut io = kit.connect_direct(443);
+    io.write_all(&hello).await.unwrap();
+    let out = read_to_end(&mut io).await;
+    hs.abort();
+    // At most a TLS alert comes back: the handshake never completes.
+    assert!(out.is_empty() || out.as_bytes()[0] == 0x15, "{out:?}");
+    // `up.test:443` parses as an authority on port 443, so it is the TLS
+    // layer that refuses the name, not the SNI check.
+    let ev = kit.events("parse_error", 1).await;
+    assert_eq!(ev[0]["reason"], "tls_handshake_failed", "{ev:#?}");
+    assert!(kit.upstream.seen().is_empty());
+}

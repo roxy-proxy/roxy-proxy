@@ -827,6 +827,8 @@ impl Redactor {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::Waker;
 
     /// Writes JSON lines to any [`Write`]r, flushing after every line, and
     /// drops an event whose write fails. For tests and tools; an audit log is a
@@ -1019,6 +1021,48 @@ mod tests {
         assert_eq!(a.events().len(), 1);
         assert_eq!(b.events().len(), 1);
         assert_eq!(a.events()[0]["event"], "request");
+    }
+
+    /// The fan-out is ready only when every sink is, and asks every sink on
+    /// each poll so each one registers the waker: a sink that becomes ready
+    /// later can wake the producer whichever sink held it.
+    #[test]
+    fn multi_sink_is_ready_only_when_every_sink_is() {
+        struct Gated {
+            ready: Arc<AtomicBool>,
+            polls: Arc<AtomicUsize>,
+        }
+        impl FlowSink for Gated {
+            fn emit(&self, _: &FlowEvent) {}
+            fn poll_ready(&self, _: &mut Context<'_>) -> Poll<()> {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                if self.ready.load(Ordering::SeqCst) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+        let gated = |ready: bool| {
+            let flag = Arc::new(AtomicBool::new(ready));
+            let polls = Arc::new(AtomicUsize::new(0));
+            let sink = Gated {
+                ready: flag.clone(),
+                polls: polls.clone(),
+            };
+            (Box::new(sink) as Box<dyn FlowSink>, flag, polls)
+        };
+        let (a, _, a_polls) = gated(true);
+        let (b, b_ready, b_polls) = gated(false);
+        let (c, _, c_polls) = gated(true);
+        let multi = MultiSink::new(vec![a, b, c]);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(multi.poll_ready(&mut cx).is_pending());
+        for polls in [&a_polls, &b_polls, &c_polls] {
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+        }
+        b_ready.store(true, Ordering::SeqCst);
+        assert!(multi.poll_ready(&mut cx).is_ready());
     }
 
     #[test]

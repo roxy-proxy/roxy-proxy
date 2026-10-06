@@ -711,3 +711,227 @@ async fn a_stalled_flow_log_holds_traffic() {
         .unwrap();
     assert_eq!(a.status, 200, "{a:?}");
 }
+
+// ---- h2 streams and the connection -----------------------------------------
+
+const UPLOAD_CAP_OPEN: &str = r#"
+- id: upload-cap
+  when: body.bytes > 10kb
+  then: { deny: { status: 413, message: "upload too large", close: false } }
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+
+/// A client waiting on `Expect: 100-continue` over h2 gets the `100`
+/// before it sends the body, and the body then reaches the upstream.
+#[tokio::test]
+async fn h2_expect_100_continue_is_answered_then_the_body_forwarded() {
+    let kit = Kit::builder().start().await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let req = http::Request::builder()
+        .method("POST")
+        .uri("https://up.test/upload")
+        .header("expect", "100-continue")
+        .body(())
+        .unwrap();
+    let mut ready = send.clone().ready().await.unwrap();
+    let (mut resp, mut stream) = ready.send_request(req, false).unwrap();
+    let info = std::future::poll_fn(|cx| resp.poll_informational(cx))
+        .await
+        .expect("an informational response")
+        .unwrap();
+    assert_eq!(info.status(), 100);
+    stream
+        .send_data(Bytes::from_static(b"hello"), true)
+        .unwrap();
+    let res = resp.await.unwrap();
+    assert_eq!(res.status(), 200);
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].body, b"hello");
+    assert!(
+        !seen[0].headers.contains_key("expect"),
+        "{:?}",
+        seen[0].headers
+    );
+}
+
+/// A client that resets its stream after the `100` went away: the flow is
+/// logged as `client_gone`, not as a parse error, and the connection keeps
+/// serving.
+#[tokio::test]
+async fn h2_a_reset_after_the_100_is_the_client_going_away() {
+    let kit = Kit::builder().start().await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let req = http::Request::builder()
+        .method("POST")
+        .uri("https://up.test/upload")
+        .header("expect", "100-continue")
+        .body(())
+        .unwrap();
+    let mut ready = send.clone().ready().await.unwrap();
+    let (mut resp, mut stream) = ready.send_request(req, false).unwrap();
+    let info = std::future::poll_fn(|cx| resp.poll_informational(cx))
+        .await
+        .expect("an informational response")
+        .unwrap();
+    assert_eq!(info.status(), 100);
+    stream.send_reset(h2::Reason::CANCEL);
+    drop(resp);
+    let ev = kit.request_event().await;
+    assert_eq!(ev["reason"], "client_gone", "{ev:#}");
+    assert!(ev["res"].is_null(), "{ev:#}");
+    let (parts, _) = super::h2_get(&send, "https://up.test/next", &[])
+        .await
+        .unwrap();
+    assert_eq!(parts.status, 200);
+    let events = kit.sink.events();
+    assert!(
+        events.iter().all(|e| e["event"] != "parse_error"),
+        "{events:#?}"
+    );
+}
+
+/// A deny with `close: false` that stops an upload mid-body answers on the
+/// stream and ends it; the connection then serves the next stream.
+#[tokio::test]
+async fn h2_a_soft_deny_mid_upload_ends_the_stream_not_the_connection() {
+    let kit = Kit::builder()
+        .rules(UPLOAD_CAP_OPEN)
+        .connection_events()
+        .start()
+        .await;
+    let mut c = kit.tunnel("up.test", true).await;
+    let (mut tx, body) = streaming_body();
+    let req = c.request("POST", "/upload", &[]).body(body).unwrap();
+    let pending = c.start(req);
+    let chunk = Bytes::from(vec![b'x'; 4096]);
+    for _ in 0..3 {
+        tx.send_data(chunk.clone()).await.unwrap();
+    }
+    let a = pending.await.unwrap().unwrap();
+    assert_eq!(a.status, 413, "{a:?}");
+    assert_eq!(a.headers["x-roxy-rule"], "upload-cap");
+    // The stream is over: the rest of the upload has nowhere to go.
+    let mut refused = false;
+    for _ in 0..64 {
+        if tx.send_data(chunk.clone()).await.is_err() {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "the denied stream must not keep taking data");
+    let b = c.call("GET", "/next", &[], b"").await;
+    assert_eq!(b.status, 200, "{b:?}");
+    assert_eq!(b.json()["path"], "/next");
+    let ev = kit.events("request", 2).await;
+    assert_eq!(ev[0]["stage"], "request_body", "{ev:#?}");
+    assert_eq!(kit.events("connect", 1).await.len(), 1);
+}
+
+/// A closing deny starts the connection's GOAWAY, but a stream already
+/// mid-upload is not cut: it finishes, within the close grace, and the
+/// connection ends once it has.
+#[tokio::test]
+async fn h2_a_closing_deny_lets_a_stream_mid_upload_finish() {
+    let rules = r#"
+- id: denied
+  when: host == "up.test" and path == "/denied"
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+    let kit = Kit::builder().rules(rules).start().await;
+    let mut c = kit.tunnel("up.test", true).await;
+    let (mut tx, body) = streaming_body();
+    let req = c.request("POST", "/upload", &[]).body(body).unwrap();
+    let pending = c.start(req);
+    tx.send_data(Bytes::from_static(b"first ")).await.unwrap();
+    kit.wait_arrived(1).await;
+
+    let d = c.call("GET", "/denied", &[], b"").await;
+    assert_eq!(d.status, 403, "{d:?}");
+
+    tx.send_data(Bytes::from_static(b"second")).await.unwrap();
+    tx.finish().await.unwrap();
+    let a = pending.await.unwrap().unwrap();
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["body_len"], 12);
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].body, b"first second");
+    assert_eq!(seen[0].complete, Some(true));
+
+    let closed = tokio::time::timeout(crate::h2conn::CLOSE_GRACE, c.closed()).await;
+    assert!(
+        closed.is_ok(),
+        "the connection ends once the upload is done"
+    );
+    let ev = kit.events("request", 2).await;
+    assert!(ev.iter().all(|e| e["reason"].is_null()), "{ev:#?}");
+}
+
+// ---- CONNECT and SNI ---------------------------------------------------------
+
+/// The CONNECT host and the SNI are compared as names: case and a trailing
+/// dot do not make them differ, and the request's `Host` is held to the
+/// normalised CONNECT host.
+#[tokio::test]
+async fn a_tunnel_host_is_normalised_before_the_sni_check() {
+    let kit = Kit::builder().start().await;
+    let io = kit.connect_tunnel("UP.TEST.", 443).await;
+    let mut tls = kit
+        .tls_connect(io, "up.test", &[b"http/1.1"])
+        .await
+        .expect("the SNI names the CONNECT host");
+    tls.write_all(b"GET /n HTTP/1.1\r\nhost: up.test\r\n\r\n")
+        .await
+        .unwrap();
+    let (head, _) = read_response(&mut tls).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["req"]["host"], "up.test", "{ev:#}");
+    assert_eq!(ev["tls"]["sni"], "up.test", "{ev:#}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].path, "/n");
+}
+
+/// With `require_sni_match: false` a foreign SNI completes the handshake
+/// with a leaf for that SNI, but the requests inside are still the CONNECT
+/// host's: a `Host` naming the SNI is a mismatch.
+#[tokio::test]
+async fn a_foreign_sni_gets_its_leaf_but_host_stays_the_connect_host() {
+    let kit = Kit::builder()
+        .http(|h| h.require_sni_match = false)
+        .start()
+        .await;
+    let io = kit.connect_tunnel("up.test", 443).await;
+    // rustls checks the leaf against the SNI, so a completed handshake is a
+    // leaf minted for `other.test`.
+    let mut tls = kit
+        .tls_connect(io, "other.test", &[b"http/1.1"])
+        .await
+        .expect("a foreign SNI is allowed");
+    tls.write_all(b"GET /a HTTP/1.1\r\nhost: other.test\r\n\r\n")
+        .await
+        .unwrap();
+    let (head, _) = read_response(&mut tls).await;
+    assert!(head.starts_with("HTTP/1.1 400"), "{head}");
+    let ev = kit.events("parse_error", 1).await;
+    assert_eq!(ev[0]["reason"], "host_mismatch", "{ev:#?}");
+    assert!(kit.upstream.seen().is_empty());
+
+    let io = kit.connect_tunnel("up.test", 443).await;
+    let mut tls = kit
+        .tls_connect(io, "other.test", &[b"http/1.1"])
+        .await
+        .unwrap();
+    tls.write_all(b"GET /b HTTP/1.1\r\nhost: up.test\r\n\r\n")
+        .await
+        .unwrap();
+    let (head, _) = read_response(&mut tls).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["req"]["host"], "up.test", "{ev:#}");
+    assert_eq!(ev["tls"]["sni"], "other.test", "{ev:#}");
+}
