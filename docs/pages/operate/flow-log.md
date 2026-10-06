@@ -77,8 +77,9 @@ are logged with their values redacted.
 
 ### Writing
 
-The flow log is an audit trail, so the write path never drops a record and
-is built to scale with cores and traffic (the `roxy-log` crate):
+The flow log is an audit trail, so the write path never drops a record
+while roxy runs, and is built to scale with cores and traffic (the
+`roxy-log` crate):
 
 - **One writer per destination.** Emitters serialise each event on their own
   thread and enqueue the bytes; one writer thread owns the file.
@@ -98,9 +99,21 @@ is built to scale with cores and traffic (the `roxy-log` crate):
   record never spans two files. The file is renamed to
   `<path>.<UTC timestamp>-<seq>` (names sort in rotation order), a new one
   is opened, files beyond `max_files` are deleted, and rotated files are
-  optionally gzipped in the background. A failed rotation is a failed
+  optionally gzipped in the background. Only files of that name shape
+  count towards `max_files` or are deleted: a `<path>.bak` or another
+  file next to the log is left alone. A failed rotation is a failed
   write: traffic is held and it is retried. `SIGHUP` reopens the file, for
   external rotation.
+- **Shutdown.** roxy writes everything queued before it exits. A
+  destination that is still failing after 10 seconds of retries at
+  shutdown is given up on: the unwritten batch (at most `high_water`
+  bytes) is discarded and an error is logged. This is the one point at
+  which a record can be dropped.
+- **Durability.** A batch is written and flushed to the operating system
+  at every batch boundary, and `max_file_bytes` is checked there. roxy
+  does not `fsync`: a roxy crash loses nothing that was queued, but a
+  kernel crash or power loss can lose the batches the OS had not yet
+  written to disk.
 
 ```yaml
 log:

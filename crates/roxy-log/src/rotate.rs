@@ -32,8 +32,8 @@ pub struct RotateOptions {
 ///
 /// Rotation and reopen errors are returned to the writer, which holds
 /// traffic and retries; nothing written is ever lost. If the rename succeeds
-/// but opening the new file fails, writes continue into the renamed file
-/// until the retry succeeds.
+/// but opening the new file fails, the retry picks up from the open, so the
+/// renamed file is still compressed and pruned once it succeeds.
 #[derive(Debug)]
 pub struct RotatingFile {
     path: PathBuf,
@@ -42,9 +42,15 @@ pub struct RotatingFile {
     opts: RotateOptions,
     /// Stamp and sequence of the last rotated name.
     last: Option<(String, u32)>,
+    /// A rotation that renamed the file but could not open the new one:
+    /// the renamed file, still to be compressed and pruned.
+    pending: Option<PathBuf>,
     /// Test hook: the next N rotations fail.
     #[cfg(test)]
     fail_rotations: Arc<AtomicUsize>,
+    /// Test hook: the next N opens of the new file after a rename fail.
+    #[cfg(test)]
+    fail_opens: Arc<AtomicUsize>,
 }
 
 fn open_append(path: &Path) -> io::Result<File> {
@@ -62,8 +68,11 @@ impl RotatingFile {
             size,
             opts,
             last: None,
+            pending: None,
             #[cfg(test)]
             fail_rotations: Arc::default(),
+            #[cfg(test)]
+            fail_opens: Arc::default(),
         })
     }
 
@@ -118,18 +127,43 @@ impl RotatingFile {
         {
             return Err(io::Error::other("injected rotation failure"));
         }
-        let target = self.rotated_name();
-        match fs::rename(&self.path, &target) {
-            Ok(()) => {}
-            // Already renamed by an earlier attempt whose reopen failed, or
-            // removed externally: just open a fresh file.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+        let target = if let Some(target) = self.pending.take() {
+            Some(target)
+        } else {
+            let target = self.rotated_name();
+            match fs::rename(&self.path, &target) {
+                Ok(()) => Some(target),
+                // Removed externally: nothing to archive, just open a fresh
+                // file.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e),
+            }
+        };
+        #[cfg(test)]
+        let opened = if self
+            .fail_opens
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            Err(io::Error::other("injected open failure"))
+        } else {
+            open_append(&self.path)
+        };
+        #[cfg(not(test))]
+        let opened = open_append(&self.path);
+        match opened {
+            Ok(file) => self.file = file,
+            Err(e) => {
+                self.pending = target;
+                return Err(e);
+            }
         }
-        self.file = open_append(&self.path)?;
         self.size = 0;
+        let Some(target) = target else {
+            return Ok(());
+        };
         tracing::info!(path = %self.path.display(), rotated = %target.display(), "log file rotated");
-        if self.opts.compress && target.exists() {
+        if self.opts.compress {
             let keep = self.opts.max_files;
             let me = self.clone_for_prune();
             std::thread::Builder::new()
@@ -160,6 +194,25 @@ struct Pruner {
     prefix: String,
 }
 
+/// Whether `rest` (a name with the `<file>.` prefix removed) is a rotated
+/// name, `<UTC stamp>-<seq>` with an optional `.gz`. Anything else next to
+/// the log (`.bak`, another destination, an archive being written) is not
+/// roxy's to count or delete.
+fn is_rotated_suffix(rest: &str) -> bool {
+    let rest = rest.strip_suffix(".gz").unwrap_or(rest);
+    let b = rest.as_bytes();
+    // 20261003T184200.123Z-0000 (the sequence grows past four digits)
+    b.len() >= 25
+        && b[..8].iter().all(u8::is_ascii_digit)
+        && b[8] == b'T'
+        && b[9..15].iter().all(u8::is_ascii_digit)
+        && b[15] == b'.'
+        && b[16..19].iter().all(u8::is_ascii_digit)
+        && b[19] == b'Z'
+        && b[20] == b'-'
+        && b[21..].iter().all(u8::is_ascii_digit)
+}
+
 impl Pruner {
     fn prune(&self, max_files: Option<usize>) {
         let Some(max) = max_files else { return };
@@ -171,9 +224,7 @@ impl Pruner {
         let mut keys: Vec<String> = entries
             .filter_map(Result::ok)
             .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| n.starts_with(&self.prefix) && n.len() > self.prefix.len())
-            // An archive being written is not a rotated file yet.
-            .filter(|n| Path::new(n).extension().is_none_or(|e| e != "tmp"))
+            .filter(|n| n.strip_prefix(&self.prefix).is_some_and(is_rotated_suffix))
             .map(|n| n.strip_suffix(".gz").map(str::to_owned).unwrap_or(n))
             .collect();
         keys.sort();
@@ -372,6 +423,42 @@ mod tests {
         );
     }
 
+    /// The rename succeeds and the open of the new file fails: the retry
+    /// resumes from the open, and the file already renamed is compressed.
+    #[test]
+    fn a_failed_open_after_rename_still_archives_the_renamed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flow.jsonl");
+        let dest = RotatingFile::open(
+            &path,
+            RotateOptions {
+                max_file_bytes: Some(20),
+                max_files: None,
+                compress: true,
+            },
+        )
+        .unwrap();
+        let failures = dest.fail_opens.clone();
+        failures.store(3, Ordering::Release);
+        let w = LogWriter::spawn("t", dest, opts(1 << 20)).unwrap();
+        w.append(b"first record that triggers rotation\n");
+        assert!(w.flush(), "recovers once the open succeeds");
+        assert_eq!(failures.load(Ordering::Acquire), 0);
+        w.append(b"second record\n");
+        assert!(w.flush());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let files = loop {
+            let files = rotated(dir.path(), "flow.jsonl");
+            if files.len() == 1 && files[0].extension().is_some_and(|e| e == "gz") {
+                break files;
+            }
+            assert!(Instant::now() < deadline, "{files:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(read(&files[0]), "first record that triggers rotation\n");
+        assert_eq!(read(&path), "second record\n");
+    }
+
     #[test]
     fn prunes_to_max_files_and_compresses() {
         let dir = tempfile::tempdir().unwrap();
@@ -409,6 +496,49 @@ mod tests {
             .map(|p| read(p).trim().to_owned())
             .collect();
         assert_eq!(kept, ["record 7", "record 8", "record 9"]);
+    }
+
+    /// Only names of the rotated shape count towards `max_files`; a
+    /// `.bak`, another destination and a half-written archive next to the
+    /// log are neither counted nor deleted.
+    #[test]
+    fn pruning_ignores_siblings_that_are_not_rotated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flow.jsonl");
+        let siblings = [
+            "flow.jsonl.bak",
+            "flow.jsonl.capture",
+            "flow.jsonl.20260101T000000.000Z-0000.gz.tmp",
+        ];
+        for s in siblings {
+            fs::write(dir.path().join(s), b"keep\n").unwrap();
+        }
+        let dest = RotatingFile::open(
+            &path,
+            RotateOptions {
+                max_file_bytes: Some(1),
+                max_files: Some(2),
+                compress: false,
+            },
+        )
+        .unwrap();
+        let w = LogWriter::spawn("t", dest, opts(1 << 20)).unwrap();
+        for i in 0..5 {
+            w.append(format!("record {i}\n").as_bytes());
+            assert!(w.flush());
+        }
+        for s in siblings {
+            assert_eq!(read(&dir.path().join(s)), "keep\n", "{s} was touched");
+        }
+        let kept: Vec<String> = rotated(dir.path(), "flow.jsonl")
+            .iter()
+            .filter(|p| {
+                let n = p.file_name().unwrap().to_string_lossy();
+                is_rotated_suffix(&n["flow.jsonl.".len()..])
+            })
+            .map(|p| read(p).trim().to_owned())
+            .collect();
+        assert_eq!(kept, ["record 3", "record 4"]);
     }
 
     #[test]
