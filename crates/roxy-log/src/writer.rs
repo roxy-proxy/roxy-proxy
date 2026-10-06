@@ -452,6 +452,42 @@ pub(crate) mod tests {
         assert_eq!(g.written(), b"audit record\n");
     }
 
+    /// A destination that panics kills the writer thread. Producers must
+    /// not carry on as if the log were being written: readiness turns
+    /// Pending and stays there.
+    #[test]
+    fn a_writer_thread_panic_holds_traffic() {
+        struct Panics;
+        impl Write for Panics {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                panic!("destination blew up")
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let w = LogWriter::spawn("t", Stream(Panics), opts(1 << 20)).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let waker = Waker::from(Arc::new(Flag(tx)));
+        let mut cx = Context::from_waker(&waker);
+        assert!(w.poll_ready(&mut cx).is_ready());
+        w.append(b"audit record\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while w.poll_ready(&mut cx).is_ready() {
+            assert!(
+                Instant::now() < deadline,
+                "a dead writer never held traffic"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(w.is_holding());
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            w.poll_ready(&mut cx).is_pending(),
+            "nothing recovers a dead writer"
+        );
+    }
+
     #[test]
     fn drop_writes_what_is_left() {
         let g = Gate::new(true);
