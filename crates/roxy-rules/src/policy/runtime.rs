@@ -2,12 +2,12 @@
 //! plus the runtime side of [`MetricDef`] and [`Condition`].
 
 use super::{
-    CAction, Condition, MetricDef, Part, Policy, WatchAction, WatchState, is_header_value,
+    CAction, Condition, MetricDef, Part, Policy, SignSpec, WatchAction, WatchState, is_header_value,
 };
 use crate::diag::RuleId;
 use crate::eval::{
-    Decision, Deny, Effect, EvalContext, FailClosedReason, Outcome, PendingState, Scope,
-    SetHeaderValue, WatchEffect, WatchOutcome,
+    AwsSigV4, Credential, Decision, Deny, Effect, EvalContext, FailClosedReason, Outcome,
+    PendingState, Scope, SetHeaderValue, WatchEffect, WatchOutcome,
 };
 use crate::types::Reads;
 use crate::view::FlowView;
@@ -103,6 +103,10 @@ impl Policy {
                             name: name.clone(),
                             value,
                         }),
+                        Err(reason) => return self.fail(reason, matched, effects, tags),
+                    },
+                    CAction::Sign(spec) => match resolve_sign(spec, ctx) {
+                        Ok(s) => effects.push(Effect::Sign(s)),
                         Err(reason) => return self.fail(reason, matched, effects, tags),
                     },
                     CAction::Terminal(d @ Decision::Allow(_)) => {
@@ -267,6 +271,18 @@ impl Policy {
 
 /// Substitute secrets into a `set_header` value and validate the result.
 fn render(parts: &[Part], ctx: &EvalContext<'_>) -> Result<SetHeaderValue, FailClosedReason> {
+    let (out, from_secret) = render_text(parts, ctx)?;
+    Ok(if from_secret {
+        SetHeaderValue::from_secret(out)
+    } else {
+        SetHeaderValue::literal(out)
+    })
+}
+
+/// Substitute secrets into a template. Every secret must be a valid header
+/// value: the rendered text goes into a request header, or (a signing key)
+/// into a signature that does. Also returns whether a secret was used.
+fn render_text(parts: &[Part], ctx: &EvalContext<'_>) -> Result<(String, bool), FailClosedReason> {
     let mut out = String::new();
     let mut from_secret = false;
     for part in parts {
@@ -283,9 +299,18 @@ fn render(parts: &[Part], ctx: &EvalContext<'_>) -> Result<SetHeaderValue, FailC
             }
         }
     }
-    Ok(if from_secret {
-        SetHeaderValue::from_secret(out)
-    } else {
-        SetHeaderValue::literal(out)
+    Ok((out, from_secret))
+}
+
+/// Resolve the credentials of a `sign: aws_sigv4` action.
+fn resolve_sign(spec: &SignSpec, ctx: &EvalContext<'_>) -> Result<AwsSigV4, FailClosedReason> {
+    let credential = |parts: &[Part]| render_text(parts, ctx).map(|(v, _)| Credential::new(v));
+    Ok(AwsSigV4 {
+        service: spec.service.clone(),
+        region: spec.region.clone(),
+        access_key_id: credential(&spec.access_key_id)?,
+        secret_access_key: credential(&spec.secret_access_key)?,
+        session_token: spec.session_token.as_deref().map(credential).transpose()?,
+        unsigned_payload: spec.unsigned_payload,
     })
 }

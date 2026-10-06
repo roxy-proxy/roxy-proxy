@@ -166,14 +166,15 @@ mod view;
 
 pub use compile::{REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
 pub use config::{
-    Action, AllowArgs, CaptureTarget, DenyArgs, Expr, LogArgs, LogLevel, MetricConfig, MetricCount,
-    PHASE_REMOVED, RedirectArgs, RewritePathArgs, RuleConfig, Scheme, SetStateArgs, Then, Upgrade,
+    Action, AllowArgs, AwsSigV4Args, CaptureTarget, DenyArgs, Expr, LogArgs, LogLevel,
+    MetricConfig, MetricCount, PHASE_REMOVED, RedirectArgs, RewritePathArgs, RuleConfig, Scheme,
+    SetStateArgs, SignArgs, Then, Upgrade,
 };
 pub use diag::{Diagnostic, RuleId, Span};
 pub use eval::{
-    AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Deny, DenyStatus, Effect,
-    EvalContext, FAIL_CLOSED_STATUS, FailClosedReason, Outcome, SetHeaderValue, WatchEffect,
-    WatchOutcome,
+    AllowOpts, AwsSigV4, Credential, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Deny,
+    DenyStatus, Effect, EvalContext, FAIL_CLOSED_STATUS, FailClosedReason, Outcome, SetHeaderValue,
+    WatchEffect, WatchOutcome,
 };
 pub use metrics::{
     CarryOverReport, Clock, DEFAULT_MAX_METRIC_BYTES, DEFAULT_MAX_METRIC_KEYS, MetricError,

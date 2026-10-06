@@ -138,6 +138,8 @@ pub enum Action {
     SetState(SetStateArgs),
     /// `capture: request | response | both`
     Capture(CaptureTarget),
+    /// `sign: { aws_sigv4: { ... } }`
+    Sign(SignArgs),
 }
 
 impl Action {
@@ -155,6 +157,7 @@ impl Action {
         "log",
         "set_state",
         "capture",
+        "sign",
     ];
 
     /// Words the rule language keeps for itself: each has a meaning roxy
@@ -187,6 +190,7 @@ impl Action {
             Self::Log(_) => "log",
             Self::SetState(_) => "set_state",
             Self::Capture(_) => "capture",
+            Self::Sign(_) => "sign",
         }
     }
 
@@ -337,6 +341,32 @@ impl CaptureTarget {
     }
 }
 
+/// Arguments of `sign`: one signing scheme.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignArgs {
+    pub aws_sigv4: AwsSigV4Args,
+}
+
+/// `sign: { aws_sigv4: ... }`: AWS Signature Version 4 over the request
+/// as it leaves roxy. The credential fields are templates like
+/// `set_header` values, so they can name secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AwsSigV4Args {
+    /// The signing name (`bedrock`, `s3`, `execute-api`, ...).
+    pub service: String,
+    pub region: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
+    /// Sign with `UNSIGNED-PAYLOAD` instead of the body's hash, so the body
+    /// streams. Only S3 accepts it.
+    #[serde(default)]
+    pub unsigned_payload: bool,
+}
+
 // ----- `then` deserialisation -------------------------------------------------
 
 fn unknown_action(name: &str) -> String {
@@ -395,6 +425,7 @@ impl Action {
             "log" => Self::Log(arg!(LogArgs)),
             "set_state" => Self::SetState(arg!(SetStateArgs)),
             "capture" => Self::Capture(arg!(CaptureTarget)),
+            "sign" => Self::Sign(arg!(SignArgs)),
             other => {
                 return Err(de::Error::custom(unknown_action(other)));
             }
@@ -633,6 +664,7 @@ mod tests {
 - log: { message: default-level }
 - set_state: { key: k, value: v, ttl: 5m }
 - capture: both
+- sign: { aws_sigv4: { service: bedrock, region: eu-west-2, access_key_id: "${secret:akid}", secret_access_key: "${secret:sk}", session_token: "${secret:tok}", unsigned_payload: false } }
 - allow:
 "#,
         )
@@ -655,6 +687,7 @@ mod tests {
                 "log",
                 "set_state",
                 "capture",
+                "sign",
                 "allow",
             ]
         );
@@ -681,6 +714,19 @@ mod tests {
                 message: "default-level".into()
             })
         );
+        assert_eq!(
+            actions[14],
+            Action::Sign(SignArgs {
+                aws_sigv4: AwsSigV4Args {
+                    service: "bedrock".into(),
+                    region: "eu-west-2".into(),
+                    access_key_id: "${secret:akid}".into(),
+                    secret_access_key: "${secret:sk}".into(),
+                    session_token: Some("${secret:tok}".into()),
+                    unsigned_payload: false,
+                }
+            })
+        );
     }
 
     #[test]
@@ -698,6 +744,9 @@ mod tests {
             ("{ capture: everything }", "then.capture"),
             ("{ allow: { upgrade: h2c } }", "then.allow"),
             ("{ allow: { inspect: true } }", "then.allow"),
+            ("{ sign: { aws_sigv4: { service: s3 } } }", "then.sign"),
+            ("{ sign: { hmac: {} } }", "then.sign"),
+            ("sign", "action `sign` needs an argument"),
             (
                 "[allow, { log: { level: loud, message: x } }]",
                 "then[1].log",

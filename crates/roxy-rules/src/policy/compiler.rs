@@ -10,18 +10,18 @@ use regex::Regex;
 use roxy_http::Host;
 
 use super::{
-    CAction, CompiledRule, Condition, MetricDef, PolicyInput, RuleKind, RuleShape, WatchAction,
-    is_header_value, metric_reads,
+    CAction, CompiledRule, Condition, MetricDef, PolicyInput, RuleKind, RuleShape, SignSpec,
+    WatchAction, is_header_value, metric_reads,
 };
 use crate::compile::{Env, Needs, Pred, ROperand, build_shared_regex, compile};
 use crate::config::{
-    Action, AllowArgs, DenyArgs, MetricConfig, MetricCount, RedirectArgs, RewritePathArgs,
-    RuleConfig, SetStateArgs, Upgrade,
+    Action, AllowArgs, AwsSigV4Args, DenyArgs, MetricConfig, MetricCount, RedirectArgs,
+    RewritePathArgs, RuleConfig, SetStateArgs, Upgrade,
 };
 use crate::diag::{Diagnostic, RuleId};
 use crate::eval::{
-    AllowOpts, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Deny, DenyStatus, Effect,
-    SetHeaderValue, WatchEffect,
+    AllowOpts, AwsSigV4, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Deny, DenyStatus,
+    Effect, SetHeaderValue, WatchEffect,
 };
 use crate::lexer::is_ident;
 use crate::template::{Part, literal, mentions_secret, parse_template, secret_names};
@@ -612,6 +612,11 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 })]
             }
             Action::Capture(t) => vec![CAction::Effect(Effect::Capture(*t))],
+            Action::Sign(s) => self
+                .sign(&s.aws_sigv4, rule, apath)
+                .into_iter()
+                .map(CAction::Sign)
+                .collect(),
         };
         (self.d.len() == errors_before).then_some(out)
     }
@@ -646,7 +651,8 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             Action::RewritePath(_)
             | Action::SetQuery(_)
             | Action::RemoveQuery(_)
-            | Action::Redirect(_) => {
+            | Action::Redirect(_)
+            | Action::Sign(_) => {
                 self.push(
                     rule,
                     apath,
@@ -708,18 +714,23 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         (self.d.len() == errors_before).then_some(out)
     }
 
-    /// `${secret:..}` may appear only in a `set_header` value.
+    /// `${secret:..}` may appear only in a `set_header` value or a `sign`
+    /// credential.
     fn secrets_outside_header(&mut self, action: &Action, rule: Option<&RuleId>, apath: &str) {
         if non_header_strings(action)
             .iter()
             .any(|s| mentions_secret(s))
         {
+            let where_ = match action {
+                Action::Sign(_) => "in the `service` or `region` of `sign`".to_owned(),
+                _ => format!("in `{}`", action.name()),
+            };
             self.push(
                 rule,
                 apath,
                 format!(
-                    "secret references are only allowed in `set_header` values, not in `{}`",
-                    action.name()
+                    "secret references are only allowed in `set_header` values and the \
+                     credentials of `sign`, not {where_}"
                 ),
             );
         }
@@ -785,7 +796,8 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             let Some(name) = self.header_name(rule, apath, name) else {
                 continue;
             };
-            let Some(parts) = self.template(rule, apath, &name, value) else {
+            let Some(parts) = self.template(rule, apath, &format!("set_header {name}"), value)
+            else {
                 continue;
             };
             out.push(match parts.as_slice() {
@@ -817,7 +829,8 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             let Some(name) = self.header_name(rule, apath, name) else {
                 continue;
             };
-            let Some(parts) = self.template(rule, apath, &name, value) else {
+            let Some(parts) = self.template(rule, apath, &format!("set_header {name}"), value)
+            else {
                 continue;
             };
             let Some(value) = literal(&parts) else {
@@ -912,22 +925,79 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         Some(lower)
     }
 
-    /// Parse `${secret:name}` references out of a `set_header` value.
+    /// `sign: aws_sigv4`. The credentials are templates, so they can name
+    /// secrets, substituted per flow.
+    fn sign(&mut self, a: &AwsSigV4Args, rule: Option<&RuleId>, apath: &str) -> Option<SignSpec> {
+        let errors_before = self.d.len();
+        for (field, value) in [("service", &a.service), ("region", &a.region)] {
+            if value.is_empty() {
+                self.push(
+                    rule,
+                    apath,
+                    format!("sign aws_sigv4: `{field}` must not be empty"),
+                );
+            }
+        }
+        if a.unsigned_payload && !AwsSigV4::is_s3_service(&a.service) {
+            self.push(
+                rule,
+                apath,
+                format!(
+                    "sign aws_sigv4: `unsigned_payload` is accepted only for S3 (`s3`, \
+                     `s3-control`, `s3-outposts`); {:?} requires the payload hash",
+                    a.service
+                ),
+            );
+        }
+        let access_key_id = self.credential(rule, apath, "access_key_id", &a.access_key_id);
+        let secret_access_key =
+            self.credential(rule, apath, "secret_access_key", &a.secret_access_key);
+        let session_token = a
+            .session_token
+            .as_ref()
+            .map(|t| self.credential(rule, apath, "session_token", t));
+        (self.d.len() == errors_before).then(|| SignSpec {
+            service: a.service.clone(),
+            region: a.region.clone(),
+            access_key_id: access_key_id.unwrap_or_default(),
+            secret_access_key: secret_access_key.unwrap_or_default(),
+            session_token: session_token.map(Option::unwrap_or_default),
+            unsigned_payload: a.unsigned_payload,
+        })
+    }
+
+    /// One credential of `sign: aws_sigv4`: a non-empty template.
+    fn credential(
+        &mut self,
+        rule: Option<&RuleId>,
+        apath: &str,
+        field: &str,
+        value: &str,
+    ) -> Option<Vec<Part>> {
+        if value.is_empty() {
+            self.push(
+                rule,
+                apath,
+                format!("sign aws_sigv4: `{field}` must not be empty"),
+            );
+            return None;
+        }
+        self.template(rule, apath, &format!("sign aws_sigv4 {field}"), value)
+    }
+
+    /// Parse `${secret:name}` references out of a templated value; `what`
+    /// names it in diagnostics (`set_header x-k`).
     fn template(
         &mut self,
         rule: Option<&RuleId>,
         apath: &str,
-        header: &str,
+        what: &str,
         value: &str,
     ) -> Option<Vec<Part>> {
         let parts = match parse_template(value) {
             Ok(parts) => parts,
             Err(e) => {
-                self.push(
-                    rule,
-                    apath,
-                    format!("set_header {header}: {e} in {value:?}"),
-                );
+                self.push(rule, apath, format!("{what}: {e} in {value:?}"));
                 return None;
             }
         };
@@ -950,8 +1020,8 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                     rule,
                     apath,
                     format!(
-                        "set_header {header}: value {value:?} is not a valid header value \
-                         (visible ASCII, space and tab only)"
+                        "{what}: value {value:?} is not a valid header value (visible ASCII, \
+                         space and tab only)"
                     ),
                 );
                 ok = false;
@@ -1105,10 +1175,11 @@ fn named_list(re: &Regex) -> String {
     }
 }
 
-/// Strings of an action other than `set_header` values, which must not
-/// contain secret references.
+/// Strings of an action other than `set_header` values and `sign`
+/// credentials, which must not contain secret references.
 fn non_header_strings(a: &Action) -> Vec<&str> {
     match a {
+        Action::Sign(s) => vec![&s.aws_sigv4.service, &s.aws_sigv4.region],
         Action::SetHeader(pairs) => pairs.iter().map(|(k, _)| k.as_str()).collect(),
         Action::SetQuery(pairs) => pairs
             .iter()

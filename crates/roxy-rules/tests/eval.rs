@@ -983,6 +983,82 @@ fn missing_secret_fails_closed() {
     );
 }
 
+const SIGN: &str = r#"
+- id: bedrock
+  when: host == "bedrock-runtime.eu-west-2.amazonaws.com"
+  then:
+    - sign:
+        aws_sigv4:
+          service: bedrock
+          region: eu-west-2
+          access_key_id: "${secret:openai}"
+          secret_access_key: "${secret:gh}"
+          session_token: "${secret:gh}"
+    - allow
+"#;
+
+fn bedrock() -> MapView {
+    MapView::new().with_str(Field::Host, "bedrock-runtime.eu-west-2.amazonaws.com")
+}
+
+/// `sign` resolves its credentials from the secret store like `set_header`,
+/// and nothing printed about the outcome shows them.
+#[test]
+fn sign_resolves_credentials_without_printing_them() {
+    let p = compile("", SIGN);
+    let lookup = |name: &str| match name {
+        "openai" => Some("AKIDEXAMPLE".to_owned()),
+        "gh" => Some("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_owned()),
+        _ => None,
+    };
+    let ctx = EvalContext {
+        secrets: &lookup,
+        initial_tags: &[],
+    };
+    let out = p.evaluate_head(&bedrock(), &ctx);
+    assert!(out.decision.is_allow());
+    let [Effect::Sign(s)] = out.effects.as_slice() else {
+        panic!("{:?}", out.effects);
+    };
+    assert_eq!(s.service, "bedrock");
+    assert_eq!(s.region, "eu-west-2");
+    assert_eq!(s.access_key_id.as_str(), "AKIDEXAMPLE");
+    assert_eq!(
+        s.secret_access_key.as_str(),
+        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+    );
+    assert_eq!(
+        s.session_token.as_ref().map(roxy_rules::Credential::as_str),
+        Some("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+    );
+    assert!(!s.unsigned_payload);
+    for text in [format!("{out:?}"), out.effects[0].to_string()] {
+        assert!(!text.contains("AKIDEXAMPLE"), "{text}");
+        assert!(!text.contains("wJalrXUtnFEMI"), "{text}");
+    }
+    assert_eq!(
+        out.effects[0].to_string(),
+        "sign aws_sigv4 service=bedrock region=eu-west-2"
+    );
+    assert_eq!(out.effects[0].kind(), "sign");
+    assert!(out.effects[0].is_mutation());
+}
+
+/// A credential whose secret is missing fails the flow closed, the same as
+/// a `set_header` secret.
+#[test]
+fn sign_with_a_missing_secret_fails_closed() {
+    let p = compile("", SIGN);
+    let only_openai = |name: &str| (name == "openai").then(|| "AKIDEXAMPLE".to_owned());
+    let ctx = EvalContext {
+        secrets: &only_openai,
+        initial_tags: &[],
+    };
+    let out = p.evaluate_head(&bedrock(), &ctx);
+    fail_closed(FailClosedReason::SecretMissing("gh".into()))(&out);
+    assert_eq!(out.effects, []);
+}
+
 #[test]
 fn every_effect_kind() {
     let p = compile(

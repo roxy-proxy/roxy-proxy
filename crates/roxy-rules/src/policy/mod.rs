@@ -82,8 +82,20 @@ pub struct Condition {
 enum CAction {
     Effect(Effect),
     SetHeader { name: String, parts: Vec<Part> },
+    Sign(SignSpec),
     Tag(String),
     Terminal(Decision),
+}
+
+/// `sign: aws_sigv4` before its credentials are resolved.
+#[derive(Debug, Clone)]
+struct SignSpec {
+    service: String,
+    region: String,
+    access_key_id: Vec<Part>,
+    secret_access_key: Vec<Part>,
+    session_token: Option<Vec<Part>>,
+    unsigned_payload: bool,
 }
 
 /// An action as it runs after the request was forwarded. There is no
@@ -119,6 +131,7 @@ impl WatchAction {
             }
             CAction::Terminal(Decision::Allow(_))
             | CAction::SetHeader { .. }
+            | CAction::Sign(_)
             | CAction::Effect(_) => None,
         }
     }
