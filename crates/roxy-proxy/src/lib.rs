@@ -20,7 +20,9 @@
 //!   byte metrics recorded as they stream.
 //! - `exchange`: the transport-agnostic exchange core (`process`: request
 //!   steps → upstream → response steps → `Outcome`), the h1 adapter,
-//!   upstream errors, the WebSocket relay.
+//!   upstream errors.
+//! - `exchange::ws`: the WebSocket relay after a `101`: the byte splice
+//!   and the message relay.
 //! - `h2conn`: the client-side HTTP/2 front end (ALPN `h2` in a tunnel).
 //! - [`upstream`]: resolver, address floor, connector and pooled client.
 //! - [`addr`]: the private-range / CIDR address floor.
