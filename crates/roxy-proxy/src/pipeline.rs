@@ -996,7 +996,7 @@ fn apply_request_effect(
     match effect {
         Effect::SetHeader { name, value } => {
             req.headers
-                .insert(&name, &value)
+                .insert(&name, value.as_str())
                 .map_err(|e| invalid(kind, &e))?;
             cx.record.mutations.push(format!("set_header:{name}"));
         }

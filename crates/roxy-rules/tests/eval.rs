@@ -8,7 +8,8 @@ use std::time::Duration;
 use common::{METRICS, compile, try_compile};
 use roxy_rules::{
     AllowOpts, CaptureTarget, Decision, Deny, DenyStatus, Effect, EvalContext, FailClosedReason,
-    Field, LogLevel, MapView, Policy, Reads, RuleKind, Scheme, Value, WatchOutcome,
+    Field, LogLevel, MapView, Policy, Reads, RuleKind, Scheme, SetHeaderValue, Value,
+    WatchOutcome,
 };
 
 fn ip(s: &str) -> Value<'static> {
@@ -890,13 +891,45 @@ fn secrets_are_substituted() {
         [
             Effect::SetHeader {
                 name: "authorization".into(),
-                value: "Bearer sk-123".into()
+                value: SetHeaderValue::from_secret("Bearer sk-123")
             },
             Effect::SetHeader {
                 name: "x-both".into(),
-                value: "sk-123/ghp_x".into()
+                value: SetHeaderValue::from_secret("sk-123/ghp_x")
             },
         ]
+    );
+}
+
+#[test]
+fn secret_values_are_redacted_when_printed() {
+    let p = compile(
+        "",
+        r#"
+- id: openai
+  when: host == "api.openai.com"
+  then:
+    - set_header: { authorization: "Bearer ${secret:openai}", x-plain: literal-value }
+    - allow
+"#,
+    );
+    let lookup = |name: &str| (name == "openai").then(|| "sk-123".to_owned());
+    let ctx = EvalContext {
+        secrets: &lookup,
+        initial_tags: &[],
+    };
+    let out = p.evaluate_head(&openai(), &ctx);
+    assert!(out.decision.is_allow());
+    let displayed: Vec<String> = out.effects.iter().map(ToString::to_string).collect();
+    for text in [format!("{out:?}"), displayed.join("\n")] {
+        assert!(!text.contains("sk-123"), "{text}");
+    }
+    assert_eq!(displayed[0], "set_header authorization: [REDACTED]");
+    // Only a secret-derived value is redacted.
+    assert_eq!(displayed[1], "set_header x-plain: literal-value");
+    assert_eq!(
+        format!("{:?}", out.effects[1]),
+        "SetHeader { name: \"x-plain\", value: \"literal-value\" }"
     );
 }
 

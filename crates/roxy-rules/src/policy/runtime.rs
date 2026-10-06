@@ -7,7 +7,7 @@ use super::{
 use crate::diag::RuleId;
 use crate::eval::{
     Decision, Deny, Effect, EvalContext, FailClosedReason, Outcome, PendingState, Scope,
-    WatchEffect, WatchOutcome,
+    SetHeaderValue, WatchEffect, WatchOutcome,
 };
 use crate::types::Reads;
 use crate::view::FlowView;
@@ -266,8 +266,9 @@ impl Policy {
 }
 
 /// Substitute secrets into a `set_header` value and validate the result.
-fn render(parts: &[Part], ctx: &EvalContext<'_>) -> Result<String, FailClosedReason> {
+fn render(parts: &[Part], ctx: &EvalContext<'_>) -> Result<SetHeaderValue, FailClosedReason> {
     let mut out = String::new();
+    let mut from_secret = false;
     for part in parts {
         match part {
             Part::Lit(s) => out.push_str(s),
@@ -278,8 +279,13 @@ fn render(parts: &[Part], ctx: &EvalContext<'_>) -> Result<String, FailClosedRea
                     return Err(FailClosedReason::SecretInvalid(name.clone()));
                 }
                 out.push_str(&value);
+                from_secret = true;
             }
         }
     }
-    Ok(out)
+    Ok(if from_secret {
+        SetHeaderValue::from_secret(out)
+    } else {
+        SetHeaderValue::literal(out)
+    })
 }

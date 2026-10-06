@@ -260,15 +260,83 @@ impl fmt::Display for Deny {
     }
 }
 
+/// A `set_header` value, secret-substituted and validated as a header
+/// value (visible ASCII, SP, HTAB; no CR/LF/NUL). One that substituted a
+/// secret prints as `[REDACTED]` in both `Display` and `Debug`, so an
+/// [`Outcome`] or [`Effect`] can be logged as it is.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SetHeaderValue {
+    text: String,
+    from_secret: bool,
+}
+
+impl SetHeaderValue {
+    /// A value written in the policy.
+    pub fn literal(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            from_secret: false,
+        }
+    }
+
+    /// A value with a secret substituted into it.
+    pub fn from_secret(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            from_secret: true,
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// Whether a secret was substituted into the value.
+    pub fn is_from_secret(&self) -> bool {
+        self.from_secret
+    }
+}
+
+impl From<&str> for SetHeaderValue {
+    fn from(text: &str) -> Self {
+        Self::literal(text)
+    }
+}
+
+impl From<String> for SetHeaderValue {
+    fn from(text: String) -> Self {
+        Self::literal(text)
+    }
+}
+
+impl fmt::Display for SetHeaderValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.from_secret {
+            f.write_str("[REDACTED]")
+        } else {
+            f.write_str(&self.text)
+        }
+    }
+}
+
+impl fmt::Debug for SetHeaderValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.from_secret {
+            fmt::Debug::fmt("[REDACTED]", f)
+        } else {
+            fmt::Debug::fmt(&self.text, f)
+        }
+    }
+}
+
 /// A non-terminal action's effect, for the proxy to apply (mutations) or
 /// perform (log, state, capture, addon call), in list order.
 #[derive(Debug, Clone)]
 pub enum Effect {
-    /// Lower-case name; value already secret-substituted and validated as a
-    /// header value (visible ASCII, SP, HTAB; no CR/LF/NUL).
+    /// Lower-case name.
     SetHeader {
         name: String,
-        value: String,
+        value: SetHeaderValue,
     },
     /// Lower-case name.
     RemoveHeader(String),
@@ -337,8 +405,10 @@ impl PartialEq for Effect {
     fn eq(&self, other: &Self) -> bool {
         use Effect as E;
         match (self, other) {
-            (E::SetHeader { name: a, value: b }, E::SetHeader { name: c, value: d })
-            | (E::SetQuery { key: a, value: b }, E::SetQuery { key: c, value: d }) => {
+            (E::SetHeader { name: a, value: b }, E::SetHeader { name: c, value: d }) => {
+                a == c && b == d
+            }
+            (E::SetQuery { key: a, value: b }, E::SetQuery { key: c, value: d }) => {
                 a == c && b == d
             }
             (E::RemoveHeader(a), E::RemoveHeader(b)) | (E::RemoveQuery(a), E::RemoveQuery(b)) => {
