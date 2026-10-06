@@ -31,7 +31,6 @@ mod coding_tests;
 #[cfg(test)]
 mod core_tests;
 #[cfg(test)]
-mod direct_tests;
 #[cfg(test)]
 mod early_tests;
 mod gate;
@@ -71,7 +70,7 @@ use crate::addr::PrivateAddrs;
 use crate::addrlist::{AddressList, AddressLists};
 use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowSink, MemorySink, Redactor};
-use crate::listener::{ClientConn, ListenerInfo, ListenerMode};
+use crate::listener::{ClientConn, ListenerInfo};
 use crate::sources::{MetricSource, Sample, StateSource, UnavailableMetrics, UnavailableState};
 use crate::upstream::{TestDial, UpstreamSettings};
 
@@ -439,7 +438,6 @@ impl KitBuilder {
         let server = Server::start(RuntimeConfig {
             listeners: Vec::new(),
             ca_server: self.ca_server.then(|| "127.0.0.1:0".parse().unwrap()),
-            dns: None,
             ca: ca.clone(),
             minter: minter.clone(),
             upstream_tls: UpstreamTlsOptions {
@@ -582,28 +580,6 @@ impl Kit {
         self.server.shared().ca.cert_pem()
     }
 
-    /// A raw client connection to a direct listener whose clients connect
-    /// to `port`.
-    pub(crate) fn connect_direct(&self, port: u16) -> tokio::io::DuplexStream {
-        let (client, server) = tokio::io::duplex(64 * 1024);
-        let conn = ClientConn {
-            id: Ulid::generate(),
-            listener: Arc::new(ListenerInfo {
-                name: "direct".to_owned(),
-                mode: ListenerMode::Direct { port },
-            }),
-            peer: "192.0.2.7:40000".parse().unwrap(),
-            original_dst: None,
-        };
-        self.spawn_conn(crate::conn::serve_direct(
-            Box::new(server),
-            conn,
-            port,
-            self.server.shared().clone(),
-        ));
-        client
-    }
-
     /// Serves a connection the way the accept loop does, so a server
     /// shutdown reaches it (`stop`, then the kill switch).
     fn spawn_conn(&self, fut: impl std::future::Future<Output = ()> + Send + 'static) {
@@ -636,7 +612,6 @@ impl Kit {
             id: Ulid::generate(),
             listener: Arc::new(ListenerInfo {
                 name: "main".to_owned(),
-                mode: ListenerMode::Explicit,
             }),
             peer: "192.0.2.7:40000".parse().unwrap(),
             original_dst: None,
@@ -659,7 +634,6 @@ impl Kit {
             id: Ulid::generate(),
             listener: Arc::new(ListenerInfo {
                 name: "main".to_owned(),
-                mode: ListenerMode::Explicit,
             }),
             peer: "192.0.2.7:40000".parse().unwrap(),
             original_dst: None,
@@ -706,18 +680,6 @@ impl Kit {
         let head = String::from_utf8_lossy(&head);
         assert!(head.starts_with("HTTP/1.1 200"), "CONNECT: {head}");
         io
-    }
-
-    /// A direct listener on port 443: TLS with SNI `host` and roxy's leaf,
-    /// then HTTP/2 (`h2`) or HTTP/1.1 inside.
-    pub(crate) async fn direct_tls(&self, host: &str, h2: bool) -> Client {
-        self.tls_client(self.connect_direct(443), host, h2).await
-    }
-
-    /// A plaintext HTTP/1.1 client on a direct listener on port 80, sending
-    /// `host` as `Host`.
-    pub(crate) async fn direct_plain(&self, host: &str) -> Client {
-        Client::h1(self.connect_direct(80), Some(host)).await
     }
 
     /// Roxy's CA as a client trust store.

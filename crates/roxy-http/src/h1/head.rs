@@ -25,14 +25,6 @@ pub enum Role {
         /// `https` after TLS termination, `http` for plaintext tunnels.
         scheme: Scheme,
     },
-    /// A plaintext connection the client addressed to the origin itself (a
-    /// `direct` listener): origin-form only,
-    /// `Host` names the authority, and its port must be `port`, the port the
-    /// client connected to.
-    Direct {
-        /// The listener's `target_port`.
-        port: u16,
-    },
 }
 
 /// How the request body is framed on the wire.
@@ -456,10 +448,6 @@ fn resolve_target(
                 Reason::TargetFormMismatch,
                 "only origin-form is accepted inside a tunnel",
             ),
-            Role::Direct { .. } => reject(
-                Reason::TargetFormMismatch,
-                "only origin-form is accepted on a direct listener",
-            ),
         };
     }
     // Origin-form: `Host` names the target, or must agree with the tunnel.
@@ -472,16 +460,6 @@ fn resolve_target(
             Scheme::Http,
             url::parse_authority(h, Scheme::Http.default_port())?,
         ),
-        Role::Direct { port } => {
-            let authority = url::parse_authority(h, Scheme::Http.default_port())?;
-            if authority.port != *port {
-                return reject(
-                    Reason::HostMismatch,
-                    "host port does not match the listener's port",
-                );
-            }
-            (Scheme::Http, authority)
-        }
         Role::Tunnel { authority, scheme } => {
             check_host(h, authority, scheme.default_port(), "tunnel authority")?;
             (*scheme, authority.clone())

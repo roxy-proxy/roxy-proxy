@@ -2,7 +2,6 @@
 resolver = "3"
 members = [
     "crates/roxy",
-    "crates/roxy-dns",
     "crates/roxy-http",
     "crates/roxy-log",
     "crates/roxy-proxy",
@@ -21,7 +20,6 @@ repository = "https://github.com/roxy-proxy/roxy-proxy"
 
 [workspace.dependencies]
 # Internal crates
-roxy-dns = { path = "crates/roxy-dns", version = "0.1.0" }
 roxy-http = { path = "crates/roxy-http", version = "0.1.0" }
 roxy-log = { path = "crates/roxy-log", version = "0.1.0" }
 roxy-proxy = { path = "crates/roxy-proxy", version = "0.1.0" }

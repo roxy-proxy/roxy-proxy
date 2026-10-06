@@ -92,7 +92,6 @@ export default defineConfig({
       text: "Deploy",
       items: [
         { text: "Containing a workload", link: "/deploy/overview" },
-        { text: "DNS steering", link: "/deploy/dns-steering" },
         { text: "Container image", link: "/deploy/docker" },
         { text: "Running without Docker", link: "/deploy/bare-metal" },
       ],

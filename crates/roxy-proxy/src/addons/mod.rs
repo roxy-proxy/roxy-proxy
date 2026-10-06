@@ -1123,7 +1123,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// proxy port.
 #[cfg(test)]
 pub(crate) fn test_flow(kit: &crate::testkit::Kit) -> (Arc<StackFlow>, FlowCx) {
-    use crate::listener::{ClientConn, ListenerInfo, ListenerMode};
+    use crate::listener::{ClientConn, ListenerInfo};
     use ulid::Ulid;
     let shared = kit.server.shared().clone();
     let snap = shared.snapshot();
@@ -1136,7 +1136,6 @@ pub(crate) fn test_flow(kit: &crate::testkit::Kit) -> (Arc<StackFlow>, FlowCx) {
         id: Ulid::generate(),
         listener: Arc::new(ListenerInfo {
             name: "main".to_owned(),
-            mode: ListenerMode::Explicit,
         }),
         peer: "192.0.2.7:40000".parse().unwrap(),
         original_dst: None,

@@ -11,15 +11,14 @@ use std::time::Duration;
 use anyhow::{Context as _, anyhow};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use roxy_proxy::{
-    CaptureLog, DnsServerSpec, FileSink, FlowEvent, FlowSink, ListenerKind, ListenerSpec,
-    MetricSource, PolicyUpdate, Redactor, RuntimeConfig, Server, ServerHandle, StateSource,
-    StdoutSink,
+    CaptureLog, FileSink, FlowEvent, FlowSink, ListenerSpec, MetricSource, PolicyUpdate, Redactor,
+    RuntimeConfig, Server, ServerHandle, StateSource, StdoutSink,
 };
 use roxy_rules::Policy;
 use roxy_tls::{Ca, LeafMinter};
 
 use crate::addons::{AddonLoader, PreparedAddons};
-use crate::config::{Compiled, Config, ListenerMode, Tls};
+use crate::config::{Compiled, Config, Tls};
 use crate::secrets::Secrets;
 use crate::stores::ReloadableMetrics;
 
@@ -193,30 +192,12 @@ fn listener_specs(config: &Config) -> Vec<ListenerSpec> {
         .map(|l| ListenerSpec {
             name: l.name.clone(),
             bind: l.bind,
-            kind: match l.mode {
-                ListenerMode::Direct => ListenerKind::Direct {
-                    target_port: l.target_port,
-                },
-                // Validation refuses transparent listeners.
-                ListenerMode::Explicit | ListenerMode::Transparent => ListenerKind::Explicit,
-            },
         })
         .collect()
 }
 
-fn dns_spec(dns: &crate::config::DnsListener, log_queries: bool) -> DnsServerSpec {
-    DnsServerSpec {
-        bind: dns.bind,
-        ipv4: dns.answer.ipv4,
-        ipv6: dns.answer.ipv6,
-        // Validation caps it at u32::MAX.
-        ttl: u32::try_from(dns.ttl.as_secs()).unwrap_or(u32::MAX),
-        log_queries,
-    }
-}
-
 /// Puts the running value of every setting that takes effect only at
-/// startup (listeners, the CA server, the DNS listener, the CA and upstream
+/// startup (listeners, the CA server, the CA and upstream
 /// TLS, connection caps, the state store size, the flow and capture log
 /// destinations) into `new`, and names each one that differed. The reload
 /// then validates and applies `new` as a whole, so a restart-only change is
@@ -233,7 +214,6 @@ fn keep_restart_only(running: &Config, new: &mut Config) -> Vec<&'static str> {
     }
     keep!("listeners", listeners);
     keep!("ca_server", ca_server);
-    keep!("dns", dns);
     // `tls.require_sni_match` is per connection and reloads; the rest of
     // `tls` is read once.
     let tls = Tls {
@@ -629,10 +609,6 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
     let rt = RuntimeConfig {
         listeners: listener_specs(&config),
         ca_server: config.ca_server.as_ref().map(|c| c.bind),
-        dns: config
-            .dns
-            .as_ref()
-            .map(|d| dns_spec(d, config.log.flow.dns_events)),
         ca,
         minter,
         upstream_tls: (&config).into(),
@@ -751,21 +727,12 @@ mod tests {
     }
 
     #[test]
-    fn listener_modes_and_dns_need_a_restart() {
+    fn listeners_need_a_restart() {
         let base = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:443 }]\n";
-        let direct = "version: 1\nlisteners: [{ name: p, mode: direct, bind: 127.0.0.1:443 }]\n";
-        let remapped = "version: 1\nlisteners: [{ name: p, mode: direct, bind: 127.0.0.1:443, \
-                        target_port: 8443 }]\n";
-        let dns =
-            |ip: &str| format!("{base}dns: {{ bind: 127.0.0.1:53, answer: {{ ipv4: {ip} }} }}\n");
-        assert_eq!(restart(base, direct), ["listeners"]);
-        assert_eq!(restart(direct, remapped), ["listeners"]);
-        assert_eq!(restart(base, &dns("10.0.0.1")), ["dns"]);
-        assert_eq!(restart(&dns("10.0.0.1"), &dns("10.0.0.2")), ["dns"]);
-        assert_eq!(
-            restart(&dns("10.0.0.1"), &dns("10.0.0.1")),
-            Vec::<&str>::new()
-        );
+        let moved = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:8443 }]\n";
+        let renamed = "version: 1\nlisteners: [{ name: q, bind: 127.0.0.1:8443 }]\n";
+        assert_eq!(restart(base, moved), ["listeners"]);
+        assert_eq!(restart(moved, renamed), ["listeners"]);
     }
 
     #[test]

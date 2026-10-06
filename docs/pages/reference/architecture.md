@@ -3,12 +3,11 @@
 ## Exchange
 
 ```
-  client ──TCP──▶  listener: explicit proxy, or direct (reached through roxy's DNS)
+  client ──TCP──▶  listener: explicit proxy
                      ▼
                    CONNECT: first bytes must be a TLS ClientHello
                      ▼      whose SNI matches the CONNECT host (the defaults:
                             http.allow_plain_in_connect, tls.require_sni_match)
-                            (direct: the SNI or Host is the target)
                    TLS termination (leaf minted by roxy's CA), ALPN h1 | h2
                      ▼
                    strict parse → CanonicalRequest
@@ -61,18 +60,17 @@ snapshot it started with.
 
 Dependencies point downward. `roxy` depends on `roxy-proxy`, `roxy-http`,
 `roxy-rules`, `roxy-tls` and `roxy-wasm`; `roxy-proxy` on `roxy-http`,
-`roxy-tls`, `roxy-rules`, `roxy-dns`, `roxy-wasm` and `roxy-log`;
+`roxy-tls`, `roxy-rules`, `roxy-wasm` and `roxy-log`;
 `roxy-rules`, `roxy-wasm` and `roxy-tls` on `roxy-http`. `roxy-http`,
-`roxy-dns`, `roxy-log` and `roxy-addon` depend on no other roxy crate.
-`roxy-http`, `roxy-rules` and `roxy-dns` do no network I/O, so they can be
+`roxy-log` and `roxy-addon` depend on no other roxy crate.
+`roxy-http` and `roxy-rules` do no network I/O, so they can be
 unit-tested and fuzzed directly.
 
 | crate | responsibility |
 |---|---|
 | `roxy` | The binary: CLI (`run`, `check`, `ca`, `rule test`, `health`), config loading and validation, secrets, address-list loading, reload, store wiring. |
-| `roxy-proxy` | Listeners, the DNS listener, the connection state machines, the exchange core, the addon stack (including service layers), the watcher, the upstream connector and address floor, the WebSocket relay, flow-log events and capture. |
+| `roxy-proxy` | Listeners, the connection state machines, the exchange core, the addon stack (including service layers), the watcher, the upstream connector and address floor, the WebSocket relay, flow-log events and capture. |
 | `roxy-http` | The canonical request/response model, the strict HTTP/1.1 codec, the h2 ↔ canonical mapping, URL normalisation, body framing with caps, content-coding decoders, the WebSocket handshake checks and frame codec. No I/O policy. |
-| `roxy-dns` | The DNS listener's wire codec: strict query parsing, answers that fit in 512 bytes. No I/O. |
 | `roxy-tls` | CA generation and persistence, leaf minting and cache (keyed on `roxy-http`'s canonical `Host`), rustls configs, ClientHello sniffing. |
 | `roxy-rules` | The expression DSL (lexer, parser, type checker, compiler), policy evaluation, actions, the metric and state stores. |
 | `roxy-wasm` | The wasmtime component host for WASM addons: linking, capabilities, budgets, instance pools. |

@@ -645,17 +645,6 @@ log:
         self.tls_over(s, sni, alpn).await
     }
 
-    /// TLS for `sni` (ALPN `http/1.1`) straight to `addr`, trusting roxy's
-    /// CA: a client of a direct listener.
-    pub(crate) async fn tls_direct(
-        &self,
-        addr: SocketAddr,
-        sni: &str,
-    ) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
-        let s = TcpStream::connect(addr).await?;
-        self.tls_over(s, sni, &[b"http/1.1"]).await
-    }
-
     async fn tls_over(
         &self,
         s: TcpStream,

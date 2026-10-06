@@ -114,8 +114,7 @@ proptest! {
         };
         let limits = Limits { max_header_bytes: 512, max_url_bytes: 128, max_headers: 8, ..Limits::default() };
         let role = match (cfg >> 5) & 3 {
-            0 | 1 => Role::ProxyPort,
-            2 => Role::Direct { port: 80 },
+            0..=2 => Role::ProxyPort,
             _ => Role::Tunnel { authority: parse_authority(b"example.com", 443).unwrap(), scheme: Scheme::Https },
         };
         let split = usize::from(cfg) % (input.len() + 1);

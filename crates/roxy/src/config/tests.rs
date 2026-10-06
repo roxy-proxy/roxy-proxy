@@ -492,55 +492,12 @@ fn provided_ca_needs_cert_and_key() {
 }
 
 #[test]
-fn direct_listeners_and_dns_parse() {
-    let cfg = parse(
-        "version: 1\nlisteners:\n  - { name: https, mode: direct, bind: 0.0.0.0:8443, target_port: 443 }\n  \
-         - { name: http, mode: direct, bind: 0.0.0.0:80 }\n\
-         dns:\n  bind: 0.0.0.0:53\n  answer: { ipv4: 10.16.0.2, ipv6: \"fd00:16::2\" }\n  ttl: 5m\n\
-         log: { flow: { dns_events: true } }\n",
-    );
-    cfg.validate().unwrap();
-    assert_eq!(cfg.listeners[0].mode, ListenerMode::Direct);
-    assert_eq!(cfg.listeners[0].target_port, Some(443));
-    assert_eq!(cfg.listeners[1].target_port, None);
-    let dns = cfg.dns.as_ref().unwrap();
-    assert_eq!(dns.answer.ipv4, Some(Ipv4Addr::new(10, 16, 0, 2)));
-    assert_eq!(dns.ttl, Duration::from_secs(300));
-    assert!(cfg.log.flow.dns_events);
-    // The TTL defaults to a minute.
-    let cfg = parse(&format!(
-        "{BASE}dns: {{ bind: 127.0.0.1:53, answer: {{ ipv6: \"::1\" }} }}\n"
-    ));
-    cfg.validate().unwrap();
-    assert_eq!(cfg.dns.unwrap().ttl, Duration::from_secs(60));
-    // Every name gets roxy's address: there are no fixed answers.
-    assert!(
-        Config::from_yaml(&format!(
-            "{BASE}dns: {{ bind: 127.0.0.1:53, answer: {{ ipv4: 10.0.0.1 }}, records: {{ a.test: [10.0.0.9] }} }}\n"
-        ))
-        .is_err()
-    );
-}
-
-#[test]
-fn direct_and_dns_diagnostics() {
+fn listener_field_diagnostics() {
     let d = diagnostics(
-        "version: 1\nlisteners:\n  - { name: d, mode: direct, bind: 127.0.0.1:1, target_port: 0, \
-         upstream_target: resolve }\n  \
-         - { name: e, bind: 127.0.0.1:2, target_port: 80 }\n\
-         dns:\n  bind: 127.0.0.1:2\n  answer: {}\n",
+        "version: 1\nlisteners:\n  - { name: e, bind: 127.0.0.1:2, upstream_target: resolve }\n",
     );
-    let paths: Vec<&str> = d.iter().map(|d| d.path.as_str()).collect();
-    for want in [
-        "listeners[0].target_port",
-        "listeners[0].upstream_target",
-        "listeners[1].target_port",
-        "dns.bind",
-        "dns.answer",
-    ] {
-        assert!(paths.contains(&want), "{want} missing from {d:?}");
-    }
-    assert_eq!(d.len(), 5, "{d:?}");
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].path, "listeners[0].upstream_target");
 }
 
 #[test]

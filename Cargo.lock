@@ -2506,13 +2506,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "roxy-dns"
-version = "0.1.0"
-dependencies = [
- "proptest",
-]
-
-[[package]]
 name = "roxy-http"
 version = "0.1.0"
 dependencies = [
@@ -2566,7 +2559,6 @@ dependencies = [
  "ipnet",
  "proptest",
  "ring",
- "roxy-dns",
  "roxy-http",
  "roxy-log",
  "roxy-rules",

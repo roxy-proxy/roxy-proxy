@@ -35,5 +35,5 @@ those counts; `--response-status` runs the rules that read the response
 head (`--response-header` adds headers to it but on its own runs nothing).
 `--ws-text`, `--ws-opcode`, `--ws-size` and `--ws-direction` describe one
 WebSocket message and run the rules that read `ws.*`. The request arrives on the config's first listener, which
-sets `listener.name` and `listener.mode`. An IP-literal URL also shows an
+sets `listener.name`. An IP-literal URL also shows an
 address-floor hit. See `roxy rule test --help`.
