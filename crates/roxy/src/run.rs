@@ -326,11 +326,13 @@ impl Reloader {
         Ok((config, compiled, restart))
     }
 
-    /// The swap. The metric store is rebuilt around it: before the policy
-    /// swap when the new policy keeps every running metric, so no flow on
-    /// either side meets a metric its store does not know; otherwise right
-    /// after, where only flows still finishing under the old policy can.
-    /// The addon cache follows a successful swap.
+    /// The swap. The snapshot is built first, since that is the last step
+    /// that can fail; from there everything is applied. The metric store
+    /// is rebuilt around the policy swap: before it when the new policy
+    /// keeps every running metric, so no flow on either side meets a
+    /// metric its store does not know; otherwise right after, where only
+    /// flows still finishing under the old policy can. The addon cache
+    /// follows the swap.
     fn swap(&self, staged: Staged) -> Result<(Config, Vec<&'static str>), Vec<String>> {
         let Staged {
             config,
@@ -340,6 +342,7 @@ impl Reloader {
         } = staged;
         let limits = config.limits.metric_limits();
         let policy = update.policy.clone();
+        let prepared = self.handle.prepare(update).map_err(|e| vec![e])?;
         let early = self
             .metrics
             .as_ref()
@@ -347,7 +350,7 @@ impl Reloader {
         if let Some(m) = early {
             m.install(&policy, limits);
         }
-        self.handle.reload(update).map_err(|e| vec![e])?;
+        self.handle.commit(prepared);
         if early.is_none()
             && let Some(m) = &self.metrics
         {
@@ -824,5 +827,65 @@ mod tests {
             ),
             Vec::<&str>::new()
         );
+    }
+
+    /// A reload that fails while building the snapshot leaves the metric
+    /// store as it was: the running series under the running limits, even
+    /// when the new policy keeps every metric and the store would otherwise
+    /// have been rebuilt ahead of the swap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_snapshot_build_leaves_the_metric_store_alone() {
+        use roxy_proxy::{MemorySink, Sample};
+        use roxy_rules::{Field, MapView};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("roxy.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:0 }}]\n\
+                 tls: {{ ca_dir: {:?} }}\n\
+                 metrics: [{{ id: by_path, count: requests, key: [path], window: 1h }}]\n",
+                dir.path().join("ca")
+            ),
+        )
+        .unwrap();
+        let running = start(
+            &path,
+            StartOptions {
+                sink: Some(Arc::new(MemorySink::new())),
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let reloader = running.reloader.clone();
+        let m = reloader.metrics.as_ref().unwrap();
+        let view = |p: &str| MapView::new().with_str(Field::Path, p);
+        let sample = Sample {
+            head: true,
+            ..Sample::default()
+        };
+        for p in ["/a", "/b", "/c"] {
+            m.record(&view(p), &sample).unwrap();
+        }
+
+        let config = reloader.last.lock().await.clone();
+        let mut staged = reloader.stage(&config).await.unwrap();
+        assert!(m.keeps_every_metric(&staged.update.policy));
+        // A budget no series fits, and a deny list the snapshot cannot
+        // resolve: the store must not be rebuilt for a reload that fails.
+        staged.config.limits.max_metric_bytes = bytesize::ByteSize::b(1);
+        staged.update.deny_lists.push("ghost".into());
+        let err = reloader.swap(staged).unwrap_err();
+        assert!(err[0].contains("\"ghost\" is not loaded"), "{err:?}");
+
+        for p in ["/a", "/b", "/c"] {
+            assert_eq!(m.get("by_path", &view(p)), Ok(1), "{p}");
+        }
+        m.record(&view("/d"), &sample)
+            .expect("the running byte budget still applies");
+        assert_eq!(m.key_count(), 4);
+        running.shutdown(Duration::ZERO).await;
     }
 }
