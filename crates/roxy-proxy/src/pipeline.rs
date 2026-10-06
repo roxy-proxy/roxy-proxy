@@ -810,7 +810,14 @@ async fn inspect_request_body(
     mut req: CanonicalRequest,
     io: &mut dyn BodyIo,
 ) -> Verdict {
-    if !cx.snap.policy.needs_request_body() || known_empty(&req.body) {
+    if !cx.snap.policy.needs_request_body() {
+        return Verdict::Continue(req);
+    }
+    if known_empty(&req.body) {
+        if let Some(f) = cx.facts.request.as_mut() {
+            f.body_size = Some(0);
+            f.body = Inspected::empty();
+        }
         return Verdict::Continue(req);
     }
     let cap = cx.snap.limits.max_inspect_body_bytes;
@@ -837,7 +844,8 @@ async fn inspect_request_body(
     Verdict::Continue(req)
 }
 
-/// A body that carries no bytes needs no inspection buffer.
+/// A body that carries no bytes needs no inspection buffer; the rules see
+/// it as empty text.
 fn known_empty(body: &Body) -> bool {
     body.known_length() == Some(0) || http_body::Body::is_end_stream(body)
 }
@@ -1071,7 +1079,14 @@ async fn inspect_response_body(
         body_size: res.body.known_length(),
         body: Inspected::NotBuffered,
     });
-    if !cx.snap.policy.needs_response_body() || response_known_empty(cx, &res) {
+    if !cx.snap.policy.needs_response_body() {
+        return ResponseVerdict::Continue(res);
+    }
+    if response_known_empty(cx, &res) {
+        if let Some(f) = cx.facts.response.as_mut() {
+            f.body_size = Some(0);
+            f.body = Inspected::empty();
+        }
         return ResponseVerdict::Continue(res);
     }
     let cap = cx.snap.limits.max_inspect_body_bytes;

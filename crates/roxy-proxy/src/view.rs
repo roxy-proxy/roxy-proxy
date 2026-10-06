@@ -46,6 +46,12 @@ pub(crate) enum Inspected {
 }
 
 impl Inspected {
+    /// A body known to carry no bytes: its text is empty whatever its
+    /// headers say.
+    pub(crate) fn empty() -> Self {
+        Self::Text(Arc::from(""))
+    }
+
     /// A buffered body, decoded by its `content-encoding` for the rules.
     /// The decoded text may be at most `cap`
     /// bytes, like the body as sent.

@@ -44,6 +44,18 @@ const BODY_RULES_WS: &str = r#"
 
 const CAP: u64 = 64 * 1024;
 
+/// Waits until `n` requests have reached the upstream, whether or not
+/// their bodies have (the drip answers without reading the body).
+async fn until_seen(kit: &Kit, n: usize) {
+    let arrived = tokio::time::timeout(Duration::from_secs(10), async {
+        while kit.upstream.seen().len() < n {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(arrived.is_ok(), "{:#?}", kit.upstream.seen());
+}
+
 /// Waits until exactly `n` bytes of the budget are reserved.
 async fn until_buffered(kit: &Kit, n: u64) {
     let shared = kit.server.shared();
@@ -106,7 +118,8 @@ async fn stalled_uploads_fill_the_budget_and_the_next_is_refused() {
 /// A request with no body holds none of the budget however long its
 /// exchange lasts: with room for two inspected bodies, three bodiless GETs
 /// to a slow upstream are all forwarded, and an upload is still admitted
-/// while their responses stream.
+/// while their responses stream. The upload, of unknown length, reserves
+/// the cap while it arrives and only what it held once it is buffered.
 #[tokio::test]
 async fn bodiless_requests_reserve_nothing() {
     let kit = Kit::builder()
@@ -127,33 +140,35 @@ async fn bodiless_requests_reserve_nothing() {
         let answer = c.start(req);
         open.push((c, answer));
     }
-    kit.upstream.wait_seen(3).await;
+    until_seen(&kit, 3).await;
     assert_eq!(kit.server.shared().buffered(), 0);
 
     let (mut tx, body) = streaming_body();
     let mut c = kit.h1().await;
-    let req = c.request("POST", "/x", &[]).body(body).unwrap();
+    let req = c
+        .request("POST", "/drip?n=2&ms=2000", &[])
+        .body(body)
+        .unwrap();
     let answer = c.start(req);
     tx.send_data(Bytes::from_static(b"an upload"))
         .await
         .unwrap();
     until_buffered(&kit, CAP).await;
     tx.finish().await.unwrap();
-    let a = answer.await.unwrap().unwrap();
-    assert_eq!(a.status, 200, "{a:?}");
-    // A declared length reserves that much, and a complete body only what
-    // it holds.
-    assert_eq!(kit.server.shared().buffered(), 0);
+    until_buffered(&kit, 9).await;
+    open.push((c, answer));
 
     for (_c, answer) in open {
         let a = answer.await.unwrap().unwrap();
         assert_eq!(a.status, 200, "{a:?}");
         assert_eq!(a.text(), "chunk0;chunk1;");
     }
+    until_buffered(&kit, 0).await;
 }
 
-/// A body with a declared length reserves that length, not the cap, and a
-/// buffered body is charged for what it holds while the exchange runs.
+/// A body with a declared length reserves that length, not the cap: three
+/// small declared uploads fit in a budget with room for two bodies of
+/// unknown length.
 #[tokio::test]
 async fn a_declared_length_reserves_only_that_much() {
     let kit = Kit::builder()
@@ -176,7 +191,7 @@ async fn a_declared_length_reserves_only_that_much() {
         let answer = c.start(req);
         open.push((c, answer));
     }
-    kit.upstream.wait_seen(3).await;
+    until_seen(&kit, 3).await;
     assert_eq!(kit.server.shared().buffered(), 3 * 9);
     for (_c, answer) in open {
         let a = answer.await.unwrap().unwrap();
