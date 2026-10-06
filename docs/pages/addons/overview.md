@@ -163,14 +163,18 @@ extensions client and upstream agree on.
   its copy is cut. What a copy has queued is charged to
   `limits.max_buffered_bytes` as it queues and given back as the layer
   reads it, and a copy whose next frame the budget cannot cover is cut
-  the same way. The layer cannot change or delay traffic, so its
-  failures cannot weaken containment: a trap or missed deadline is logged,
-  not fatal, and a cut copy is reported (`observer_lagged`, with the
-  `reason`) rather than stalling the flow. Nor can it tag the flow: a tag
-  steers the `when` of every layer below, so `flow.add-tag` from an
-  observer is refused like a call without its capability, and the attempt
-  is logged. An observer may `record`; it may not tag. This is the way to
-  deploy an uncalibrated monitor.
+  the same way. A request refused or answered below the observer without
+  its body being read (a deny at the head, say) ends the copy where the
+  reading stopped, without an error: the observer sees the refusal from
+  `next`. A copy that fails (the client went away mid-upload) ends with
+  that failure, so the layer can tell the two apart. The layer cannot
+  change or delay traffic, so its failures cannot weaken containment: a
+  trap or missed deadline is logged, not fatal, and a cut copy is reported
+  (`observer_lagged`, with the `reason`) rather than stalling the flow.
+  Nor can it tag the flow: a tag steers the `when` of every layer below,
+  so `flow.add-tag` from an observer is refused like a call without its
+  capability, and the attempt is logged. An observer may `record`; it may
+  not tag. This is the way to deploy an uncalibrated monitor.
 
 ## In the proxy
 

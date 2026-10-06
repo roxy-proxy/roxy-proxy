@@ -56,7 +56,8 @@ impl ObserverNext {
 
 /// Reports a cut copy once per direction.
 struct Lag {
-    st: Arc<StackFlow>,
+    shared: Arc<Shared>,
+    flow: String,
     layer: String,
     direction: Dir,
     reported: AtomicBool,
@@ -65,9 +66,9 @@ struct Lag {
 impl Lag {
     fn report(&self, reason: &str) {
         if !self.reported.swap(true, Ordering::Relaxed) {
-            self.st.shared.sink.emit(&FlowEvent::ObserverLagged {
+            self.shared.sink.emit(&FlowEvent::ObserverLagged {
                 ts: chrono::Utc::now(),
-                flow: self.st.flow.to_string(),
+                flow: self.flow.clone(),
                 layer: self.layer.clone(),
                 direction: self.direction.as_str().to_owned(),
                 reason: reason.to_owned(),
@@ -95,6 +96,9 @@ enum Msg {
     /// gives back; a frame dropped unread gives it back the same way.
     Data(Bytes, BufferLease),
     End,
+    /// The copy ends short, with why: the real body's own error, or
+    /// [`BodyError::Abandoned`] when the real body was dropped unread
+    /// (refused at the head, say). An observer tells the two apart.
     Cut(BodyError),
 }
 
@@ -118,7 +122,13 @@ struct CopySender {
 
 impl Drop for CopySender {
     fn drop(&mut self) {
-        if !self.finished && !self.complete() {
+        if self.finished {
+            return;
+        }
+        if self.complete() {
+            let _ = self.tx.send(Msg::End);
+        } else {
+            let _ = self.tx.send(Msg::Cut(BodyError::Abandoned));
             self.cut.cancel();
         }
     }
@@ -161,8 +171,10 @@ impl CopySender {
         self.finished = true;
     }
 
-    fn cut(self, e: BodyError) {
+    fn cut(mut self, e: BodyError) {
         let _ = self.tx.send(Msg::Cut(e));
+        self.finished = true;
+        self.cut.cancel();
     }
 }
 
@@ -191,7 +203,8 @@ impl HttpBody for CopyBody {
             }
             Some(Msg::End) => None,
             Some(Msg::Cut(e)) => Some(Err(e)),
-            // The real body was dropped before it ended.
+            // The sender always says how the copy ended; a bare close is a
+            // bug, not a complete body.
             None => Some(Err(BodyError::Incomplete)),
         })
     }
@@ -239,9 +252,9 @@ impl HttpBody for Tee {
                     }
                 }
             }
-            Some(Err(_)) => {
+            Some(Err(e)) => {
                 if let Some(c) = this.copy.take() {
-                    c.cut(BodyError::Stopped);
+                    c.cut(e.clone());
                 }
             }
             None => {
@@ -266,12 +279,23 @@ impl HttpBody for Tee {
 /// best-effort copy buffered up to `lag_bytes`, charged to the buffer
 /// budget as it queues.
 fn tee(st: &StackFlow, body: Body, lag: Arc<Lag>) -> (Body, Body, CopyCut) {
-    let known = body.known_length();
-    let (sender, copy) = copy(
+    tee_with(
         st.shared.clone(),
         st.snap.limits.max_observer_lag_bytes,
-        known,
-    );
+        body,
+        lag,
+    )
+}
+
+/// [`tee`] with the budget and window spelt out.
+fn tee_with(
+    shared: Arc<Shared>,
+    lag_bytes: u64,
+    body: Body,
+    lag: Arc<Lag>,
+) -> (Body, Body, CopyCut) {
+    let known = body.known_length();
+    let (sender, copy) = copy(shared, lag_bytes, known);
     let cut = CopyCut(sender.cut.clone());
     let real = Tee {
         inner: body,
@@ -308,9 +332,10 @@ fn copy(shared: Arc<Shared>, lag_bytes: u64, known: Option<u64>) -> (CopySender,
     (sender, body)
 }
 
-fn lag(st: &Arc<StackFlow>, layer: &str, direction: Dir) -> Arc<Lag> {
+fn lag(st: &StackFlow, layer: &str, direction: Dir) -> Arc<Lag> {
     Arc::new(Lag {
-        st: st.clone(),
+        shared: st.shared.clone(),
+        flow: st.flow.to_string(),
         layer: layer.to_owned(),
         direction,
         reported: AtomicBool::new(false),
@@ -474,6 +499,67 @@ mod tests {
         sender.try_push(frame.clone()).unwrap();
         assert_eq!(sender.try_push(frame), Err(BEHIND));
         assert_eq!(shared.buffered(), 10);
+    }
+
+    fn test_lag(kit: &Kit) -> Arc<Lag> {
+        Arc::new(Lag {
+            shared: kit.server.shared().clone(),
+            flow: "flow".to_owned(),
+            layer: "o".to_owned(),
+            direction: Dir::Request,
+            reported: AtomicBool::new(false),
+        })
+    }
+
+    /// How a copy ends says what became of the real body. Dropped unread
+    /// short of its declared length, the copy is abandoned, not failed;
+    /// dropped once the declared length has all been queued, the copy is
+    /// complete, however little of the real body was polled.
+    #[tokio::test]
+    async fn a_real_body_dropped_short_abandons_its_copy() {
+        let kit = Kit::builder().start().await;
+        let shared = kit.server.shared().clone();
+
+        let (mut tx, body) = Body::channel(u64::MAX, Some(4));
+        tx.send_data(Bytes::from_static(b"ab")).await.unwrap();
+        let (mut real, mut copy, cut) = tee_with(shared.clone(), 100, body, test_lag(&kit));
+        let first = real.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(first, Bytes::from_static(b"ab"));
+        drop(real);
+        cut.cancelled().await;
+        let got = copy.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(got, Bytes::from_static(b"ab"));
+        let end = copy.frame().await.unwrap().unwrap_err();
+        assert_eq!(end, BodyError::Abandoned);
+
+        let (_tx, body) = Body::channel(u64::MAX, Some(0));
+        let (real, mut copy, _cut) = tee_with(shared, 100, body, test_lag(&kit));
+        drop(real);
+        assert!(copy.frame().await.is_none());
+    }
+
+    /// The real body failing (the client gone mid-upload, say) ends the
+    /// copy with that failure, which is the observer's to tell from a copy
+    /// the stack abandoned.
+    #[tokio::test]
+    async fn a_real_body_failing_fails_its_copy_the_same_way() {
+        let kit = Kit::builder().start().await;
+        let (mut tx, body) = Body::channel(u64::MAX, None);
+        tx.send_data(Bytes::from_static(b"ab")).await.unwrap();
+        tx.abort(BodyError::Incomplete);
+        let (mut real, mut copy, cut) =
+            tee_with(kit.server.shared().clone(), 100, body, test_lag(&kit));
+        real.frame().await.unwrap().unwrap();
+        assert_eq!(
+            real.frame().await.unwrap().unwrap_err(),
+            BodyError::Incomplete
+        );
+        cut.cancelled().await;
+        copy.frame().await.unwrap().unwrap();
+        assert_eq!(
+            copy.frame().await.unwrap().unwrap_err(),
+            BodyError::Incomplete
+        );
     }
 
     /// A long body of `left` frames that samples the process's anonymous

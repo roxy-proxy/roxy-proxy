@@ -6,7 +6,7 @@
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use super::{AddonDef, Kit};
+use super::{AddonDef, Answer, Kit};
 use crate::addons::EndpointPath;
 
 const RULES: &str = r#"
@@ -260,6 +260,62 @@ async fn a_failure_below_an_observer_is_not_logged_as_the_observers() {
         .filter(|e| e["event"] == "layer_error")
         .collect();
     assert_eq!(errs.len(), 1, "{errs:#?}");
+}
+
+/// A deny at the head, by the rules or by a layer, never reads the request
+/// body. The observer above it reads its copy to a clean end and sees the
+/// deny from `next`; nothing is logged against it.
+#[tokio::test]
+async fn an_observer_above_a_deny_sees_its_copy_end_cleanly() {
+    const RULES: &str = r#"
+- id: blocked
+  when: host == "blocked.test"
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+    let kit = Kit::builder()
+        .rules(RULES)
+        .addon(AddonDef::test_layer("o").observe())
+        .addon(AddonDef::test_layer("b"))
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+
+    let req = c
+        .request_to("blocked.test", "POST", "/x", &[])
+        .body(roxy_http::Body::from_bytes(bytes::Bytes::from_static(
+            b"never read",
+        )))
+        .unwrap();
+    let a = Answer::read(c.send(req).await.unwrap()).await;
+    assert_eq!(a.status, 403, "{a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "deny", "{ev:#}");
+    assert_eq!(ev["terminal_rule"], "blocked");
+    assert_eq!(strs(&ev["addons"]), ["o", "b"]);
+
+    // The connection closed with the unread body; a fresh one for the layer.
+    let a = kit
+        .h1()
+        .await
+        .call("POST", "/x", &[("x-test-b", "deny")], b"never read")
+        .await;
+    assert_eq!(a.status, 403, "{a:?}");
+    let reqs = kit.events("request", 2).await;
+    assert_eq!(reqs[1]["terminal_rule"], "layer:b", "{reqs:#?}");
+
+    // The observer's trap, had its copy failed, would be logged after the
+    // request.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let errs: Vec<_> = kit
+        .sink
+        .events()
+        .into_iter()
+        .filter(|e| e["event"] == "layer_error")
+        .collect();
+    assert!(errs.is_empty(), "{errs:#?}");
 }
 
 #[tokio::test]
