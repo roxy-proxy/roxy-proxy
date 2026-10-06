@@ -21,6 +21,7 @@ addons:                               # above the rules, in this order
         retries: 2                    # after a connection failure or 502/503/504 (default 0)
       threat-intel:
         url: https://ti.internal:8443/score
+        path: prefix                  # the layer's path goes under the URL (default fixed: the URL is the whole target)
         private_ok: true              # may reach private addresses
     state:
       max_entries: 100000

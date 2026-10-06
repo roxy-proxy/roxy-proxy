@@ -87,8 +87,8 @@ pub enum EndpointError {
     /// lists.
     #[error("endpoint address denied")]
     Denied,
-    /// The request's path has a `..` segment or does not normalise, so it
-    /// cannot be appended under the endpoint's prefix.
+    /// The request's path has a `..` segment, or does not normalise so
+    /// cannot go under the endpoint's prefix.
     #[error("endpoint path refused: {0}")]
     PathRefused(String),
     /// The endpoint did not answer within its timeout.

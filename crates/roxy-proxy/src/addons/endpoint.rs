@@ -53,18 +53,19 @@ pub(super) fn expand(
 /// the endpoint's URL with the request's normalised path appended (a bare
 /// `/` adds nothing) and the request's query after the endpoint's own.
 ///
-/// Dot segments are resolved before the join, and a `..` segment is refused
-/// whether or not it would have climbed out: a layer that reflects text it
-/// inspected into the path must not be able to express "up" at all.
+/// A `..` segment is refused in either mode, whether or not it would have
+/// climbed out: a layer that reflects text it inspected into the path must
+/// not be able to express "up" at all, and the refusal is the signal that
+/// it tried.
 fn target(spec: &EndpointSpec, req: &Uri) -> Result<Uri, EndpointError> {
-    if spec.path == EndpointPath::Fixed {
-        return Ok(spec.url.clone());
-    }
     let req_path = req.path();
     if req_path.split('/').any(is_dot_dot) {
         return Err(EndpointError::PathRefused(format!(
             "{req_path:?} has a `..` segment"
         )));
+    }
+    if spec.path == EndpointPath::Fixed {
+        return Ok(spec.url.clone());
     }
     let normalised = roxy_http::url::normalize_path(req_path.as_bytes())
         .map_err(|e| EndpointError::PathRefused(e.to_string()))?;
@@ -311,24 +312,26 @@ mod tests {
         assert_eq!(t("/%7ex?q=%2f"), "https://api.example.com/v1/~x?q=%2F");
     }
 
-    /// `..` is refused outright under `prefix`, even where it would not have
+    /// `..` is refused outright in both modes, even where it would not have
     /// left the prefix, and in any percent-encoded spelling.
     #[test]
-    fn prefix_refuses_dot_dot() {
-        for req in [
-            "/../admin",
-            "/a/../admin",
-            "/a/../../admin",
-            "/%2e%2e/admin",
-            "/.%2E/admin",
-        ] {
-            assert!(
-                matches!(
-                    join(EndpointPath::Prefix, "https://api.example.com/v1", req),
-                    Err(EndpointError::PathRefused(_))
-                ),
-                "{req}"
-            );
+    fn dot_dot_is_refused() {
+        for mode in [EndpointPath::Fixed, EndpointPath::Prefix] {
+            for req in [
+                "/../admin",
+                "/a/../admin",
+                "/a/../../admin",
+                "/%2e%2e/admin",
+                "/.%2E/admin",
+            ] {
+                assert!(
+                    matches!(
+                        join(mode, "https://api.example.com/v1", req),
+                        Err(EndpointError::PathRefused(_))
+                    ),
+                    "{mode:?} {req}"
+                );
+            }
         }
     }
 
@@ -343,7 +346,7 @@ mod tests {
             )
             .unwrap()
         };
-        for req in ["/", "/score?q=1", "/../admin", "/?admin=1"] {
+        for req in ["/", "/score?q=1", "/admin", "/?admin=1"] {
             assert_eq!(t(req), "https://api.example.com/v1/messages", "{req}");
         }
     }

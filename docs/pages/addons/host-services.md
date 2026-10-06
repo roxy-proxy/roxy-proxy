@@ -11,16 +11,35 @@ for enforce layers only: an observer's call fails its exchange the same way.
 ## Endpoints (`endpoints`)
 
 `endpoints.call(name, request)`: roxy resolves the name to the configured
-URL (appending the request's path and query), attaches the endpoint's
-headers (replacing any the layer set), applies the timeout and retries, and
-enforces the address floor and deny lists. The layer cannot express a
-destination, so text injected into the traffic it inspects cannot steer it
-to another host, and credentials never enter the layer. Calls never pass
-through the layer stack, so a monitor's own model call cannot recurse
-through it. The request body is buffered (up to 16 MiB) so a retry can
-resend it; retries back off from 100 ms. An unknown name, a denied address,
-a timeout and a failure reach the layer as distinct `error-code`s. Each call
-emits an `endpoint_call` flow event.
+URL, attaches the endpoint's headers (replacing any the layer set), applies
+the timeout and retries, and enforces the address floor and deny lists.
+The layer cannot express a destination, and credentials never enter the
+layer. Calls never pass through the layer stack, so a monitor's own model
+call cannot recurse through it. The request body is buffered (up to 16 MiB)
+so a retry can resend it; retries back off from 100 ms. An unknown name, a
+denied address, a refused path, a timeout and a failure reach the layer as
+distinct `error-code`s. Each call emits an `endpoint_call` flow event.
+
+What the request's path and query contribute is the endpoint's `path`
+setting:
+
+- `fixed` (the default): the configured URL is the whole target. The
+  request's path and query are ignored.
+- `prefix`: the request's path is normalised (percent-encodings
+  canonicalised, `.` segments removed) and appended under the configured
+  path; its query follows the endpoint's own.
+
+A path with a `..` segment, in any percent-encoded spelling, is refused in
+both modes, whether or not it would have resolved inside the prefix. The
+call fails with `HTTP-request-URI-invalid`, nothing is dialled, and the
+`endpoint_call` event records the refusal.
+
+Text injected into the traffic a layer inspects therefore cannot steer a
+call to another host, and under `fixed` cannot steer it at all. Under
+`prefix` it can pick any route below the configured path, with roxy's
+credential attached, so a layer that reflects client-influenced text into
+the path should only call a `prefix` endpoint whose routes it is content to
+expose. Endpoint responses go back to the layer, not through the rules.
 
 ## State (`state`)
 

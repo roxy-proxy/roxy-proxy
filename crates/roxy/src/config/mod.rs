@@ -592,7 +592,8 @@ pub struct Endpoint {
     pub private_ok: bool,
 }
 
-/// How an endpoint call's URL takes the addon's path and query.
+/// How an endpoint call's URL takes the addon's path and query. A `..`
+/// segment is refused in either mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointPath {
@@ -601,7 +602,7 @@ pub enum EndpointPath {
     #[default]
     Fixed,
     /// The addon's path and query are normalised and appended under the
-    /// configured path. A `..` segment is refused.
+    /// configured path.
     Prefix,
 }
 

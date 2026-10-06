@@ -144,15 +144,16 @@ impl std::fmt::Debug for AddonSpec {
     }
 }
 
-/// How an endpoint call's URL takes the layer's path and query.
+/// How an endpoint call's URL takes the layer's path and query. A `..`
+/// segment is refused in either mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EndpointPath {
     /// The configured URL is the whole target; the layer's path and query
-    /// are not consulted.
+    /// are ignored.
     #[default]
     Fixed,
     /// The layer's path and query are normalised and appended under the
-    /// configured path. A `..` segment is refused.
+    /// configured path.
     Prefix,
 }
 
