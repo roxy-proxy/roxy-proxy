@@ -32,6 +32,8 @@ use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::StreamExt as _;
+use futures_util::stream::FuturesUnordered;
 use http::{HeaderName, StatusCode};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use roxy_http::layer::{from_layer_request, to_layer_request, to_layer_response};
@@ -529,6 +531,19 @@ impl StackFlow {
             .or_else(|| self.failure())
     }
 
+    /// The outcomes of the WASM layers whose handlers returned a response.
+    fn layer_outcomes(&self) -> Vec<LayerOutcome> {
+        self.layers
+            .iter()
+            .filter_map(|l| {
+                l.outcome
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+            })
+            .collect()
+    }
+
     /// The client asked for a WebSocket, the one upgrade the core relays.
     /// The rules below the stack decide whether it is relayed.
     fn is_upgrade(&self) -> bool {
@@ -755,11 +770,15 @@ fn stack_outcome(
         cx.record.terminal_rule = Some(Decider::Layer(st.snap.addons[i].name.clone()));
     }
     // A failure after the head cuts the body (the codec then breaks the
-    // connection); log which layer failed once it is known.
-    if let Some(outcome) = resp.extensions().get::<LayerOutcome>().cloned() {
+    // connection); log which layer failed once it is known. Every WASM
+    // layer that ran is awaited: a service layer above it answers with a
+    // fresh response, so the top response's extensions say nothing about
+    // the layers below.
+    let outcomes = st.layer_outcomes();
+    if !outcomes.is_empty() {
         let st2 = st.clone();
         tokio::spawn(async move {
-            if let Err(e) = outcome.wait().await {
+            if let Err(e) = first_failure(outcomes).await {
                 let (layer, err) = st2
                     .post_head_failure()
                     .unwrap_or_else(|| (st2.blamed(), e.into()));
@@ -811,6 +830,15 @@ fn stack_outcome(
         return Outcome::Refuse(layer_refusal(&layer));
     }
     Outcome::Respond(res)
+}
+
+/// Waits for every layer to finish; the first to fail decides.
+async fn first_failure(outcomes: Vec<LayerOutcome>) -> Result<(), LayerError> {
+    let mut pending: FuturesUnordered<_> = outcomes.into_iter().map(LayerOutcome::wait).collect();
+    while let Some(r) = pending.next().await {
+        r?;
+    }
+    Ok(())
 }
 
 /// Runs layer `index` on `req`.
