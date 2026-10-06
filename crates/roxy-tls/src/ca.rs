@@ -24,6 +24,10 @@ use rcgen::{
 use ring::rand::{SecureRandom, SystemRandom};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use time::OffsetDateTime;
+use x509_parser::certificate::X509Certificate;
+
+use crate::leaf::LEAF_VALIDITY;
 
 /// File name of the CA certificate (PEM) inside the CA directory.
 pub const CA_CERT_FILE: &str = "roxy-ca.pem";
@@ -98,6 +102,8 @@ pub struct Ca {
     chain: Vec<CertificateDer<'static>>,
     key_der: PrivateKeyDer<'static>,
     issuer: Issuer<'static, KeyPair>,
+    not_after: OffsetDateTime,
+    warnings: Vec<String>,
 }
 
 impl fmt::Debug for Ca {
@@ -191,7 +197,22 @@ impl Ca {
             reason: e.to_string(),
         })?;
 
-        check_ca_cert(&cert_der, &chain, &cert_path, key_path, &key_pair)?;
+        let not_after = check_ca_cert(&cert_der, &chain, &cert_path, key_path, &key_pair)?;
+
+        let mut warnings = Vec::new();
+        if let Some(mode) = key_mode(key_path)? {
+            warnings.push(format!(
+                "CA key {} is readable by others (mode {mode:04o}); make it 0600",
+                key_path.display()
+            ));
+        }
+        if not_after - OffsetDateTime::now_utc() < LEAF_VALIDITY {
+            warnings.push(format!(
+                "CA certificate {} expires at {not_after}; leaves are cut short to that and \
+                 every handshake fails after it, so replace the CA now",
+                cert_path.display()
+            ));
+        }
 
         let issuer = Issuer::from_ca_cert_der(&cert_der, key_pair)
             .map_err(|e| invalid_cert(e.to_string()))?;
@@ -202,6 +223,8 @@ impl Ca {
             chain,
             key_der,
             issuer,
+            not_after,
+            warnings,
         })
     }
 
@@ -228,13 +251,16 @@ impl Ca {
         // incomplete pair and refuses to run rather than minting a new CA.
         write_new(&key_path, key_pem.as_bytes(), 0o600)?;
         write_new(&cert_path, cert.pem().as_bytes(), 0o644)?;
+        sync_dir(dir)?;
 
         Ok(Self {
             cert_path,
             cert_der,
             chain: Vec::new(),
             key_der,
+            not_after: params.not_after,
             issuer: Issuer::new(params, key_pair),
+            warnings: Vec::new(),
         })
     }
 
@@ -293,6 +319,17 @@ impl Ca {
     pub fn issuer(&self) -> &Issuer<'static, KeyPair> {
         &self.issuer
     }
+
+    /// End of the CA certificate's validity. No leaf outlives it.
+    pub fn not_after(&self) -> OffsetDateTime {
+        self.not_after
+    }
+
+    /// Problems found at load that an operator should fix but that do not
+    /// stop roxy: a key readable by others, a CA about to expire.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
 }
 
 fn ca_params() -> Result<CertificateParams, CaError> {
@@ -324,24 +361,21 @@ pub(crate) fn random_serial() -> Result<SerialNumber, CaError> {
 
 /// Verify that `cert_der` is a currently valid CA certificate that may sign
 /// certificates, whose public key belongs to `key`, and that `chain` (if any)
-/// runs upwards from it in order.
+/// runs upwards from it in order, each a current CA that signed the one
+/// before it. Returns the CA's `notAfter`.
 fn check_ca_cert(
     cert_der: &CertificateDer<'_>,
     chain: &[CertificateDer<'_>],
     cert_path: &Path,
     key_path: &Path,
     key: &KeyPair,
-) -> Result<(), CaError> {
+) -> Result<OffsetDateTime, CaError> {
     let invalid = |reason: String| CaError::InvalidCert {
         path: cert_path.to_path_buf(),
         reason,
     };
     let x509 = parse_cert(cert_der).map_err(invalid)?;
-    let is_ca = x509
-        .basic_constraints()
-        .map_err(|e| invalid(e.to_string()))?
-        .is_some_and(|bc| bc.value.ca);
-    if !is_ca {
+    if !is_ca(&x509).map_err(invalid)? {
         return Err(invalid(
             "certificate is not a CA (basicConstraints CA:FALSE or absent)".into(),
         ));
@@ -363,31 +397,86 @@ fn check_ca_cert(
             not_after: validity.not_after.to_string(),
         });
     }
+    let not_after = OffsetDateTime::from_unix_timestamp(validity.not_after.timestamp())
+        .map_err(|e| invalid(format!("notAfter: {e}")))?;
     if x509.public_key().subject_public_key.data.as_ref() != key.public_key_raw() {
         return Err(CaError::KeyMismatch {
             cert: cert_path.to_path_buf(),
             key: key_path.to_path_buf(),
         });
     }
-    // Each certificate must be issued by the next: a misordered or unrelated
-    // bundle would be served as a chain no client can build.
+    // Each certificate must be a current CA that signed the one before it: a
+    // misordered, unrelated, expired or non-CA bundle would be served as a
+    // chain no client can build.
     let mut below = x509;
     for (i, der) in chain.iter().enumerate() {
         let above = parse_cert(der).map_err(invalid)?;
+        let n = i + 2;
         if below.issuer() != above.subject() {
             return Err(invalid(format!(
-                "certificate {} (subject {}) is not the issuer of the one before it (issuer {})",
-                i + 2,
+                "certificate {n} (subject {}) is not the issuer of the one before it (issuer {})",
                 above.subject(),
                 below.issuer()
             )));
         }
+        if !is_ca(&above).map_err(invalid)? {
+            return Err(invalid(format!(
+                "certificate {n} (subject {}) is not a CA",
+                above.subject()
+            )));
+        }
+        let validity = above.validity();
+        if !validity.is_valid() {
+            return Err(invalid(format!(
+                "certificate {n} (subject {}) is not valid now (valid {} to {})",
+                above.subject(),
+                validity.not_before,
+                validity.not_after
+            )));
+        }
+        below
+            .verify_signature(Some(above.public_key()))
+            .map_err(|e| {
+                invalid(format!(
+                    "certificate {n} (subject {}) did not sign the one before it: {e}",
+                    above.subject()
+                ))
+            })?;
         below = above;
     }
-    Ok(())
+    Ok(not_after)
 }
 
-fn parse_cert(der: &[u8]) -> Result<x509_parser::certificate::X509Certificate<'_>, String> {
+fn is_ca(x509: &X509Certificate<'_>) -> Result<bool, String> {
+    Ok(x509
+        .basic_constraints()
+        .map_err(|e| e.to_string())?
+        .is_some_and(|bc| bc.value.ca))
+}
+
+/// The key file's mode if it is readable or writable by group or others.
+fn key_mode(key_path: &Path) -> Result<Option<u32>, CaError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(key_path)
+            .map_err(|source| CaError::Io {
+                path: key_path.to_path_buf(),
+                source,
+            })?
+            .permissions()
+            .mode()
+            & 0o777;
+        Ok((mode & 0o077 != 0).then_some(mode))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = key_path;
+        Ok(None)
+    }
+}
+
+fn parse_cert(der: &[u8]) -> Result<X509Certificate<'_>, String> {
     let (rest, x509) = x509_parser::parse_x509_certificate(der).map_err(|e| e.to_string())?;
     if rest.is_empty() {
         Ok(x509)
@@ -425,6 +514,9 @@ fn create_dir(dir: &Path) -> Result<(), CaError> {
 }
 
 /// Create `path` exclusively (never overwrite) with the given unix mode.
+///
+/// A file that appeared since the caller's existence check (two processes
+/// generating at once) is [`CaError::AlreadyExists`].
 fn write_new(path: &Path, contents: &[u8], #[allow(unused)] mode: u32) -> Result<(), CaError> {
     let io_err = |source| CaError::Io {
         path: path.to_path_buf(),
@@ -437,9 +529,28 @@ fn write_new(path: &Path, contents: &[u8], #[allow(unused)] mode: u32) -> Result
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(mode);
     }
-    let mut file = opts.open(path).map_err(io_err)?;
+    let mut file = opts.open(path).map_err(|e| {
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            CaError::AlreadyExists(path.parent().unwrap_or(path).to_path_buf())
+        } else {
+            io_err(e)
+        }
+    })?;
     file.write_all(contents).map_err(io_err)?;
     file.sync_all().map_err(io_err)
+}
+
+/// Flush the directory entries, so a crash right after first start does
+/// not lose the files and have the next start mint a different CA.
+fn sync_dir(dir: &Path) -> Result<(), CaError> {
+    let io_err = |source| CaError::Io {
+        path: dir.to_path_buf(),
+        source,
+    };
+    fs::File::open(dir)
+        .map_err(io_err)?
+        .sync_all()
+        .map_err(io_err)
 }
 
 #[cfg(test)]
@@ -703,6 +814,107 @@ pub(crate) mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn provided_chain_must_be_current_cas_that_signed_each_other() {
+        let tmp = tmp();
+        let (root_pem, root_key) = make_ca(&ca_named("Org Root"), None);
+        let root = Issuer::from_ca_cert_pem(&root_pem, root_key).unwrap();
+        let now = time::OffsetDateTime::now_utc();
+
+        let mut expired = ca_named("Org Mid");
+        expired.not_before = now - time::Duration::days(20);
+        expired.not_after = now - time::Duration::days(10);
+        let mut not_ca = ca_named("Org Mid");
+        not_ca.is_ca = IsCa::NoCa;
+        for (mid_params, want) in [(expired, "not valid now"), (not_ca, "not a CA")] {
+            let (mid_pem, mid_key) = make_ca(&mid_params, Some(&root));
+            let mid = Issuer::from_ca_cert_pem(&mid_pem, mid_key).unwrap();
+            let (sub_pem, sub_key) = make_ca(&ca_named("roxy sub-CA"), Some(&mid));
+            let (cert, key) = write_provided(tmp.path(), &(sub_pem + &mid_pem), &sub_key);
+            let err = Ca::load_provided(&cert, &key).unwrap_err();
+            assert!(
+                matches!(&err, CaError::InvalidCert { reason, .. } if reason.contains(want)),
+                "{err}"
+            );
+        }
+
+        // Same subject as the real issuer, different key: the names chain but
+        // the signature does not.
+        let (mid_pem, mid_key) = make_ca(&ca_named("Org Mid"), Some(&root));
+        let mid = Issuer::from_ca_cert_pem(&mid_pem, mid_key).unwrap();
+        let (sub_pem, sub_key) = make_ca(&ca_named("roxy sub-CA"), Some(&mid));
+        let (impostor_pem, _) = make_ca(&ca_named("Org Mid"), Some(&root));
+        let (cert, key) = write_provided(tmp.path(), &(sub_pem.clone() + &impostor_pem), &sub_key);
+        let err = Ca::load_provided(&cert, &key).unwrap_err();
+        assert!(
+            matches!(&err, CaError::InvalidCert { reason, .. } if reason.contains("did not sign")),
+            "{err}"
+        );
+        let (cert, key) = write_provided(tmp.path(), &(sub_pem + &mid_pem), &sub_key);
+        Ca::load_provided(&cert, &key).unwrap();
+    }
+
+    #[test]
+    fn not_after_is_the_certificate_s() {
+        let tmp = tmp();
+        let generated = Ca::generate(tmp.path()).unwrap();
+        let loaded = Ca::load(tmp.path()).unwrap();
+        // DER time has one-second resolution.
+        assert_eq!(
+            generated.not_after().unix_timestamp(),
+            loaded.not_after().unix_timestamp()
+        );
+        assert!(loaded.warnings().is_empty(), "{:?}", loaded.warnings());
+    }
+
+    #[test]
+    fn short_lived_ca_warns_on_load() {
+        let tmp = tmp();
+        let mut params = ca_named("nearly expired");
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(3);
+        let (pem, key) = make_ca(&params, None);
+        let (cert, key_path) = write_provided(tmp.path(), &pem, &key);
+        let ca = Ca::load_provided(&cert, &key_path).unwrap();
+        assert!(
+            ca.warnings().iter().any(|w| w.contains("expires")),
+            "{:?}",
+            ca.warnings()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_or_world_readable_key_warns_on_load() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tmp();
+        Ca::generate(tmp.path()).unwrap();
+        let key_path = tmp.path().join(CA_KEY_FILE);
+        for (mode, warns) in [(0o640, true), (0o644, true), (0o600, false), (0o400, false)] {
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(mode)).unwrap();
+            let ca = Ca::load(tmp.path()).unwrap();
+            assert_eq!(
+                ca.warnings()
+                    .iter()
+                    .any(|w| w.contains("readable by others")),
+                warns,
+                "mode {mode:o}: {:?}",
+                ca.warnings()
+            );
+        }
+    }
+
+    #[test]
+    fn losing_a_generation_race_is_already_exists() {
+        let tmp = tmp();
+        let path = tmp.path().join(CA_KEY_FILE);
+        write_new(&path, b"first", 0o600).unwrap();
+        assert!(matches!(
+            write_new(&path, b"second", 0o600),
+            Err(CaError::AlreadyExists(dir)) if dir == tmp.path()
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"first");
     }
 
     #[test]

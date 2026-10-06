@@ -81,14 +81,21 @@ pub fn policy_update(config: &Config, policy: Policy) -> anyhow::Result<PolicyUp
 /// Loads the provided CA (`tls.ca_cert` / `tls.ca_key`), or else the CA in
 /// `tls.ca_dir`, generating it there on first start.
 pub fn load_ca(config: &Config) -> anyhow::Result<Ca> {
-    if let Some((cert, key)) = config.tls.provided_ca()? {
-        return Ok(Ca::load_provided(cert, key)?);
-    }
-    let dir = &config.tls.ca_dir;
-    let existed = Ca::load(dir).is_ok();
-    let ca = Ca::load_or_generate(dir)?;
-    if !existed {
-        tracing::info!(dir = %dir.display(), "generated new roxy CA");
+    let ca = if let Some((cert, key)) = config.tls.provided_ca()? {
+        Ca::load_provided(cert, key)?
+    } else {
+        let dir = &config.tls.ca_dir;
+        match Ca::load(dir) {
+            Err(roxy_tls::CaError::NotFound(_)) => {
+                let ca = Ca::generate(dir)?;
+                tracing::info!(dir = %dir.display(), "generated new roxy CA");
+                ca
+            }
+            loaded => loaded?,
+        }
+    };
+    for warning in ca.warnings() {
+        tracing::warn!("{warning}");
     }
     Ok(ca)
 }

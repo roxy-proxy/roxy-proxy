@@ -28,8 +28,8 @@ use time::{Duration, OffsetDateTime};
 
 use crate::ca::Ca;
 
-/// Leaf validity.
-const LEAF_VALIDITY: Duration = Duration::days(7);
+/// Leaf validity, cut short to the CA's `notAfter` when that comes first.
+pub(crate) const LEAF_VALIDITY: Duration = Duration::days(7);
 /// `notBefore` backdating for clock skew.
 const LEAF_BACKDATE: Duration = Duration::hours(1);
 /// Cached entries are dropped (and re-minted) within this long of expiry.
@@ -58,6 +58,9 @@ pub enum LeafError {
     /// The system random number generator failed.
     #[error("system random number generator failed")]
     Rng,
+    /// The CA certificate has expired; no leaf it signs is valid.
+    #[error("CA certificate expired at {0}")]
+    CaExpired(OffsetDateTime),
 }
 
 struct Entry {
@@ -164,9 +167,13 @@ impl LeafMinter {
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         params.serial_number = Some(crate::ca::random_serial().map_err(|_| LeafError::Rng)?);
+        // A leaf that outlives its CA is rejected by every client.
+        let not_after = (now + LEAF_VALIDITY).min(self.ca.not_after());
+        if not_after <= now {
+            return Err(LeafError::CaExpired(self.ca.not_after()));
+        }
         params.not_before = now - LEAF_BACKDATE;
-        params.not_after = now + LEAF_VALIDITY;
-        let not_after = params.not_after;
+        params.not_after = not_after;
         let cert = params.signed_by(&self.leaf_key, self.ca.issuer())?;
         let chain: Vec<CertificateDer<'static>> = [cert.der(), self.ca.certificate()]
             .into_iter()
@@ -322,6 +329,31 @@ mod tests {
             Err(LeafError::Wildcard(_))
         ));
         assert_eq!(m.cached(), 0);
+    }
+
+    /// A CA with less than `LEAF_VALIDITY` left bounds its leaves, and once
+    /// it has expired nothing is minted.
+    #[test]
+    fn leaf_validity_is_clamped_to_the_ca() {
+        use crate::ca::tests::{ca_named, make_ca, write_provided};
+        let dir = tempfile::tempdir().unwrap();
+        let mut params = ca_named("short");
+        params.not_after = OffsetDateTime::now_utc() + Duration::days(2);
+        let (pem, key) = make_ca(&params, None);
+        let (cert, key) = write_provided(dir.path(), &pem, &key);
+        let ca = Ca::load_provided(&cert, &key).unwrap();
+        let ca_not_after = ca.not_after().unix_timestamp();
+        let m = LeafMinter::new(Arc::new(ca), 8).unwrap();
+
+        let ck = m.certified_key(&name("example.com")).unwrap();
+        let (_, x509) = x509_parser::parse_x509_certificate(ck.cert[0].as_ref()).unwrap();
+        assert_eq!(x509.validity().not_after.timestamp(), ca_not_after);
+
+        m.advance_clock(Duration::days(3));
+        assert!(matches!(
+            m.certified_key(&name("example.com")),
+            Err(LeafError::CaExpired(_))
+        ));
     }
 
     #[test]
