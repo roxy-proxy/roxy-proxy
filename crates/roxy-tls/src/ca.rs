@@ -866,7 +866,7 @@ pub(crate) mod tests {
             generated.not_after().unix_timestamp(),
             loaded.not_after().unix_timestamp()
         );
-        assert!(loaded.warnings().is_empty(), "{:?}", loaded.warnings());
+        assert!(loaded.warnings().is_empty());
     }
 
     #[test]
@@ -877,11 +877,7 @@ pub(crate) mod tests {
         let (pem, key) = make_ca(&params, None);
         let (cert, key_path) = write_provided(tmp.path(), &pem, &key);
         let ca = Ca::load_provided(&cert, &key_path).unwrap();
-        assert!(
-            ca.warnings().iter().any(|w| w.contains("expires")),
-            "{:?}",
-            ca.warnings()
-        );
+        assert!(ca.warnings().iter().any(|w| w.contains("expires")));
     }
 
     #[cfg(unix)]
@@ -899,8 +895,7 @@ pub(crate) mod tests {
                     .iter()
                     .any(|w| w.contains("readable by others")),
                 warns,
-                "mode {mode:o}: {:?}",
-                ca.warnings()
+                "mode {mode:o}"
             );
         }
     }
