@@ -19,8 +19,8 @@ produces a `request` event:
 ```
 
 - `terminal_rule` is what decided: a rule id, or `_default`,
-  `_fail_closed`, `_address_policy` or `layer:<name>` for built-in
-  decisions.
+  `_fail_closed`, `_address_policy`, `_expired` or `layer:<name>` for
+  built-in decisions.
 - `reason` is a stable code when the exchange failed closed or failed.
   With `terminal_rule: _fail_closed` it is one of: `metric_unavailable`,
   `metric_key_unavailable`, `metric_table_full`,
@@ -29,8 +29,9 @@ produces a `request` event:
   `unsupported_content_encoding`, `body_decode_failed`, `missing_value`,
   `effect_invalid`, `unsupported_effect`, `state_unavailable`,
   `capture_unavailable`, `watch_missing` or `watch_stopped`. With
-  `_address_policy` it is `address_policy`; with `layer:<name>` it is
-  `layer_error`. An upstream failure carries the `upstream_error` reason
+  `_address_policy` it is `address_policy`; with `_expired` it is
+  `policy_expired` ([lease](/operate/operations#lease)); with
+  `layer:<name>` it is `layer_error`. An upstream failure carries the `upstream_error` reason
   (`timeout`, `connect_failed`, ...; [upstream](/reference/upstream#errors)).
   An exchange roxy could not finish has `aborted` (its connection ended, or
   the server stopped, while it was in flight); one an addon layer dropped
@@ -62,6 +63,7 @@ produces a `request` event:
 | `parse_error` | the client sent something roxy refused to parse; `reason` is a stable code |
 | `upstream_error`, `upstream_denied` | [upstream](/reference/upstream#errors) failures and address-floor hits; `upstream_denied.reason` is `private_range:<class>`, `deny_cidrs` or `list:<name>` ([address floor](/policies/address-lists#address-floor)) |
 | `policy_input_unavailable`, `metric_table_full` | a flow failed closed for want of an input |
+| `policy_expired` | the policy's `valid_until` passed; once per loaded policy, with `valid_until` ([lease](/operate/operations#lease)) |
 | `upgrade_stripped` | an upgrade was not allowed, so the request went upstream as plain HTTP ([WebSockets](/policies/websockets)) |
 | `ws_open`, `ws_close` | a relayed WebSocket, with byte counts; `ws_close` has `close_code` and `close_reason` when roxy ended it |
 | `ws_message` | a WebSocket message a rule denied, or one sampled by `log.flow.ws_message_every` ([WebSockets](/policies/websockets#message-rules)) |

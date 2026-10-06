@@ -42,7 +42,8 @@ reaches it.
 ## Fail closed
 
 Anything roxy cannot parse, verify or classify is dropped. An
-empty rule set denies everything. A config that fails
+empty rule set denies everything, and so does a policy past its
+`valid_until` ([lease](/operate/operations#lease)). A config that fails
 to compile is not loaded, and a failed reload keeps the running policy. An
 addon in `enforce` mode that fails denies the flow; an `observe` addon
 cannot affect traffic, so its failure is logged and the flow goes on.
