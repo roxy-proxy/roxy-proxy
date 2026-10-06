@@ -13,13 +13,16 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use roxy_proxy::addons::{AddonImpl, AddonSpec, EndpointSpec, ServiceSpec, StateLimits};
+use roxy_proxy::addons::{
+    AddonImpl, AddonSpec, EndpointPath, EndpointSpec, ServiceSpec, StateLimits,
+};
 use roxy_proxy::addr::PrivateAddrs;
 use roxy_rules::Condition;
 use roxy_wasm::{
     Capabilities, Capability as WasmCap, Layer, LayerConfig, LayerLimits, WasmRuntime,
 };
 
+use crate::config::EndpointPath as ConfigPath;
 use crate::config::{Addon, AddonKind, AddonMode, Capability, Config};
 
 /// Endpoint timeout when none is configured.
@@ -139,6 +142,10 @@ fn endpoints(a: &Addon) -> anyhow::Result<HashMap<String, EndpointSpec>> {
                 name.clone(),
                 EndpointSpec {
                     url,
+                    path: match e.path {
+                        ConfigPath::Fixed => EndpointPath::Fixed,
+                        ConfigPath::Prefix => EndpointPath::Prefix,
+                    },
                     headers,
                     timeout: e.timeout.unwrap_or(DEFAULT_ENDPOINT_TIMEOUT),
                     retries: e.retries,

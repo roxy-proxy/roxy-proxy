@@ -374,6 +374,7 @@ impl endpoints::Host for StoreState {
                 Ok(resp) => Ok(response_into_guest(resp)),
                 Err(EndpointError::NotFound) => Err(WasiError::DestinationNotFound),
                 Err(EndpointError::Denied) => Err(WasiError::DestinationIpProhibited),
+                Err(EndpointError::PathRefused(_)) => Err(WasiError::HttpRequestUriInvalid),
                 Err(EndpointError::Timeout) => Err(WasiError::ConnectionTimeout),
                 Err(e) => Err(WasiError::InternalError(Some(e.to_string()))),
             }

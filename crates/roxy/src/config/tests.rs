@@ -690,6 +690,26 @@ fn addon_limits_parse_and_terminate_is_unknown() {
     }
 }
 
+/// An endpoint's `path` is `fixed` unless the config says `prefix`; any
+/// other spelling is a parse error.
+#[test]
+fn endpoint_path_mode() {
+    let c = parse(&format!(
+        "{BASE}addons: [{{ name: a, path: /a.wasm, endpoints: {{ \
+         m: {{ url: https://a.test/v1 }}, p: {{ url: https://a.test/v1, path: prefix }} }} }}]\n"
+    ));
+    let e = &c.addons[0].endpoints;
+    assert_eq!(e["m"].path, EndpointPath::Fixed);
+    assert_eq!(e["p"].path, EndpointPath::Prefix);
+    assert!(
+        Config::from_yaml(&format!(
+            "{BASE}addons: [{{ name: a, path: /a.wasm, endpoints: {{ \
+             m: {{ url: https://a.test/v1, path: append }} }} }}]\n"
+        ))
+        .is_err()
+    );
+}
+
 #[test]
 fn flow_log_defaults_and_rotation_settings() {
     let cfg = parse(BASE);

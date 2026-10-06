@@ -144,11 +144,27 @@ impl std::fmt::Debug for AddonSpec {
     }
 }
 
+/// How an endpoint call's URL takes the layer's path and query. A `..`
+/// segment is refused in either mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EndpointPath {
+    /// The configured URL is the whole target; the layer's path and query
+    /// are ignored.
+    #[default]
+    Fixed,
+    /// The layer's path and query are normalised and appended under the
+    /// configured path.
+    Prefix,
+}
+
 /// A named endpoint.
 #[derive(Debug, Clone)]
 pub struct EndpointSpec {
-    /// Base URL; the request's path and query are appended.
+    /// Base URL: the whole target, or the prefix the request's path goes
+    /// under, as `path` says.
     pub url: http::Uri,
+    /// What the request's path and query contribute to the URL.
+    pub path: EndpointPath,
     /// Headers roxy attaches; values may contain `${secret:name}`.
     pub headers: Vec<(HeaderName, String)>,
     /// Per attempt, until the response head.

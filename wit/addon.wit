@@ -33,11 +33,14 @@ interface endpoints {
   use wasi:http/types@0.2.12.{outgoing-request, future-incoming-response, error-code};
 
   /// Call the endpoint configured under `name`. The request's scheme and
-  /// authority are ignored; its path and query are appended to the
-  /// endpoint's URL. roxy attaches the endpoint's credentials, applies its
-  /// timeout and retry policy and the address floor. The call goes straight
-  /// to the connector: it never passes through other layers or the rules.
-  /// An unknown name returns `error-code.destination-not-found`.
+  /// authority are ignored. Its path and query are appended under the
+  /// endpoint's URL only if the endpoint is configured `path: prefix`, and
+  /// a `..` segment is refused (`error-code.HTTP-request-URI-invalid`);
+  /// under `path: fixed` they are ignored. roxy attaches the endpoint's
+  /// credentials, applies its timeout and retry policy and the address
+  /// floor. The call goes straight to the connector: it never passes
+  /// through other layers or the rules. An unknown name returns
+  /// `error-code.destination-not-found`.
   call: func(name: string, req: outgoing-request) -> result<future-incoming-response, error-code>;
 }
 

@@ -347,8 +347,9 @@ pub(crate) fn send(
 }
 
 /// Calls the endpoint configured under `name` (capability `endpoints`).
-/// Only the request's method, path, headers and body are used: roxy picks
-/// the destination and attaches the credentials.
+/// Only the request's method, headers and body are used, plus its path if
+/// the endpoint is configured `path: prefix`: roxy picks the destination
+/// and attaches the credentials.
 pub fn call_endpoint(name: &str, req: Request) -> Result<Response, Error> {
     send(req, |out| endpoints::call(name, out))
 }

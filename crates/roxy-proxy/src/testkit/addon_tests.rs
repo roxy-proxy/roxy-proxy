@@ -7,6 +7,7 @@
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::{AddonDef, Kit};
+use crate::addons::EndpointPath;
 
 const RULES: &str = r#"
 - id: no-rewritten
@@ -1173,8 +1174,27 @@ fn endpoint_layer(url: &str, private_ok: bool) -> AddonDef {
         )
 }
 
+/// The test layer's `endpoint` capability call, with the layer asking for
+/// `path` on the endpoint.
+async fn endpoint_call(kit: &Kit, path: &str) -> super::Answer {
+    kit.h1()
+        .await
+        .call(
+            "POST",
+            "/x",
+            &[
+                ("x-test-t", "caps"),
+                ("x-cap", "endpoint"),
+                ("x-cap-path", path),
+            ],
+            b"",
+        )
+        .await
+}
+
 /// roxy attaches an endpoint's credential on the way out; the layer and
-/// the flow log never see it.
+/// the flow log never see it. The default `path: fixed` sends the
+/// configured URL, not the path the layer asked for.
 #[tokio::test]
 async fn endpoint_credentials_never_reach_the_layer() {
     let kit = Kit::builder()
@@ -1190,13 +1210,58 @@ async fn endpoint_credentials_never_reach_the_layer() {
     let seen = kit.upstream.wait_seen(1).await;
     let call = seen
         .iter()
-        .find(|s| s.path == "/monitor/score?q=1")
+        .find(|s| s.path == "/monitor")
         .unwrap_or_else(|| panic!("{seen:#?}"));
     assert_eq!(call.headers["x-api-key"], SECRET);
     let calls = kit.events("endpoint_call", 1).await;
     assert_eq!(calls[0]["endpoint"], "monitor");
     assert_eq!(calls[0]["status"], 200);
     assert!(!serde_json::to_string(&calls).unwrap().contains(SECRET));
+}
+
+/// `path: prefix` appends the layer's path and query under the configured
+/// path, with dot segments and percent-encodings normalised first.
+#[tokio::test]
+async fn prefix_endpoint_normalises_the_layers_path() {
+    let kit = Kit::builder()
+        .secret("token", SECRET)
+        .addon(
+            endpoint_layer("https://up.test/monitor/", true)
+                .endpoint_path("monitor", EndpointPath::Prefix),
+        )
+        .start()
+        .await;
+    let a = endpoint_call(&kit, "/a/./b/?q=%2f").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].path, "/monitor/a/b/?q=%2F", "{seen:#?}");
+}
+
+/// A layer path with a `..` segment is refused before anything is dialled,
+/// under both modes, and the refusal is in the flow log. The test layer
+/// treats a failed call as fatal, so the exchange fails closed.
+#[tokio::test]
+async fn endpoint_paths_cannot_climb() {
+    for mode in [EndpointPath::Fixed, EndpointPath::Prefix] {
+        let kit = Kit::builder()
+            .secret("token", SECRET)
+            .addon(endpoint_layer("https://up.test/monitor", true).endpoint_path("monitor", mode))
+            .start()
+            .await;
+        let a = endpoint_call(&kit, "/../admin").await;
+        assert_eq!(a.status, 503, "{mode:?}: {a:?}");
+        assert!(
+            kit.upstream.seen().is_empty(),
+            "{mode:?}: the endpoint was dialled"
+        );
+        let calls = kit.events("endpoint_call", 1).await;
+        assert_eq!(calls[0]["status"], serde_json::Value::Null, "{mode:?}");
+        let error = calls[0]["error"].as_str().unwrap_or_default();
+        assert!(
+            error.starts_with("endpoint path refused"),
+            "{mode:?}: {error}"
+        );
+    }
 }
 
 /// An endpoint on a private address without `private_ok` is refused; the

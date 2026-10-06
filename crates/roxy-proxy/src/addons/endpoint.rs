@@ -15,7 +15,7 @@ use roxy_http::upstream::from_upstream_response;
 use roxy_http::{Authority, Body, Scheme};
 use roxy_wasm::{EndpointError, LayerRequest, LayerResponse};
 
-use super::{AddonSpec, EndpointSpec, StackFlow};
+use super::{AddonSpec, EndpointPath, EndpointSpec, StackFlow};
 use crate::flowlog::FlowEvent;
 use crate::upstream::{ConnectError, Protocols, classify};
 
@@ -49,25 +49,54 @@ pub(super) fn expand(
     roxy_rules::expand(&parts, |name| secrets.get(name).cloned())
 }
 
-/// The URL for a call: the endpoint's URL with the request's path appended
-/// (a bare `/` adds nothing), and both URLs' queries, the endpoint's first.
-fn target(spec: &EndpointSpec, req: &Uri) -> Result<Uri, String> {
+/// The URL for a call. `fixed`: the endpoint's URL as configured. `prefix`:
+/// the endpoint's URL with the request's normalised path appended (a bare
+/// `/` adds nothing) and the request's query after the endpoint's own.
+///
+/// A `..` segment is refused in either mode, whether or not it would have
+/// climbed out: a layer that reflects text it inspected into the path must
+/// not be able to express "up" at all, and the refusal is the signal that
+/// it tried.
+fn target(spec: &EndpointSpec, req: &Uri) -> Result<Uri, EndpointError> {
+    let req_path = req.path();
+    if req_path.split('/').any(is_dot_dot) {
+        return Err(EndpointError::PathRefused(format!(
+            "{req_path:?} has a `..` segment"
+        )));
+    }
+    if spec.path == EndpointPath::Fixed {
+        return Ok(spec.url.clone());
+    }
+    let normalised = roxy_http::url::normalize_path(req_path.as_bytes())
+        .map_err(|e| EndpointError::PathRefused(e.to_string()))?;
     let base = spec.url.path().trim_end_matches('/');
-    let path = match req.path() {
-        "/" | "" if !base.is_empty() => base.to_owned(),
-        "" => "/".to_owned(),
+    let path = match normalised.as_str() {
+        "/" if !base.is_empty() => base.to_owned(),
         p => format!("{base}{p}"),
     };
-    let query = match (spec.url.query(), req.query()) {
+    let req_query = match req.query() {
+        Some(q) if !q.is_empty() => Some(
+            roxy_http::url::normalize_query(q.as_bytes())
+                .map_err(|e| EndpointError::PathRefused(e.to_string()))?,
+        ),
+        _ => None,
+    };
+    let query = match (spec.url.query(), req_query) {
         (None, None) => String::new(),
-        (Some(q), None) | (None, Some(q)) => format!("?{q}"),
+        (Some(q), None) => format!("?{q}"),
+        (None, Some(q)) => format!("?{q}"),
         (Some(a), Some(b)) => format!("?{a}&{b}"),
     };
     let authority = spec.url.authority().map_or("", |a| a.as_str());
     let scheme = spec.url.scheme_str().unwrap_or("https");
     format!("{scheme}://{authority}{path}{query}")
         .parse()
-        .map_err(|e| format!("endpoint URL: {e}"))
+        .map_err(|e| EndpointError::Failed(format!("endpoint URL: {e}")))
+}
+
+/// Whether a raw path segment is `..`, allowing for percent-encoded dots.
+fn is_dot_dot(segment: &str) -> bool {
+    segment.to_ascii_lowercase().replace("%2e", ".") == ".."
 }
 
 pub(super) fn authority_of(uri: &Uri) -> Result<(Scheme, Authority), String> {
@@ -124,7 +153,7 @@ async fn attempt_all(
     req: LayerRequest,
 ) -> Result<(LayerResponse, u32), (EndpointError, u32)> {
     let fail = |e: String| (EndpointError::Failed(e), 0);
-    let uri = target(spec, req.uri()).map_err(fail)?;
+    let uri = target(spec, req.uri()).map_err(|e| (e, 0))?;
     let (scheme, authority) = authority_of(&uri).map_err(fail)?;
     let (parts, body) = req.into_parts();
     let body = body
@@ -228,9 +257,10 @@ pub(crate) async fn notify(st: &StackFlow, addon: &AddonSpec, name: &str, json: 
 mod tests {
     use super::*;
 
-    fn spec(url: &str) -> EndpointSpec {
+    fn spec(url: &str, path: EndpointPath) -> EndpointSpec {
         EndpointSpec {
             url: url.parse().unwrap(),
+            path,
             headers: Vec::new(),
             timeout: Duration::from_secs(1),
             retries: 0,
@@ -238,13 +268,13 @@ mod tests {
         }
     }
 
+    fn join(path: EndpointPath, base: &str, req: &str) -> Result<String, EndpointError> {
+        target(&spec(base, path), &req.parse().unwrap()).map(|u| u.to_string())
+    }
+
     #[test]
-    fn joins_paths() {
-        let t = |base: &str, req: &str| {
-            target(&spec(base), &req.parse().unwrap())
-                .unwrap()
-                .to_string()
-        };
+    fn prefix_joins_paths() {
+        let t = |base, req| join(EndpointPath::Prefix, base, req).unwrap();
         assert_eq!(
             t("https://api.example.com/v1/messages", "/"),
             "https://api.example.com/v1/messages"
@@ -270,6 +300,55 @@ mod tests {
             t("https://api.example.com/v1?key=k", "/"),
             "https://api.example.com/v1?key=k"
         );
+    }
+
+    /// Dot segments that stay inside the prefix are resolved; encodings are
+    /// canonicalised rather than passed through.
+    #[test]
+    fn prefix_normalises_the_request_path() {
+        let t = |req| join(EndpointPath::Prefix, "https://api.example.com/v1", req).unwrap();
+        assert_eq!(t("/a/./b"), "https://api.example.com/v1/a/b");
+        assert_eq!(t("/a/"), "https://api.example.com/v1/a/");
+        assert_eq!(t("/%7ex?q=%2f"), "https://api.example.com/v1/~x?q=%2F");
+    }
+
+    /// `..` is refused outright in both modes, even where it would not have
+    /// left the prefix, and in any percent-encoded spelling.
+    #[test]
+    fn dot_dot_is_refused() {
+        for mode in [EndpointPath::Fixed, EndpointPath::Prefix] {
+            for req in [
+                "/../admin",
+                "/a/../admin",
+                "/a/../../admin",
+                "/%2e%2e/admin",
+                "/.%2E/admin",
+            ] {
+                assert!(
+                    matches!(
+                        join(mode, "https://api.example.com/v1", req),
+                        Err(EndpointError::PathRefused(_))
+                    ),
+                    "{mode:?} {req}"
+                );
+            }
+        }
+    }
+
+    /// `fixed` sends the configured URL whatever the request says.
+    #[test]
+    fn fixed_ignores_the_request_path() {
+        let t = |req| {
+            join(
+                EndpointPath::Fixed,
+                "https://api.example.com/v1/messages",
+                req,
+            )
+            .unwrap()
+        };
+        for req in ["/", "/score?q=1", "/admin", "/?admin=1"] {
+            assert_eq!(t(req), "https://api.example.com/v1/messages", "{req}");
+        }
     }
 
     #[test]

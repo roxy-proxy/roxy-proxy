@@ -64,7 +64,7 @@ pub(crate) use h2raw::{H2_GOAWAY, H2_HEADERS, H2_RST_STREAM, h2_client, h2_get, 
 pub(crate) use upstream::{Seen, Upstream};
 
 use crate::Server;
-use crate::addons::{AddonMode, AddonSpec, EndpointSpec, StateLimits};
+use crate::addons::{AddonMode, AddonSpec, EndpointPath, EndpointSpec, StateLimits};
 use crate::addr::PrivateAddrs;
 use crate::addrlist::{AddressList, AddressLists};
 use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
@@ -150,6 +150,7 @@ impl AddonDef {
             name.to_owned(),
             EndpointSpec {
                 url: url.parse().unwrap(),
+                path: EndpointPath::Fixed,
                 headers: headers
                     .iter()
                     .map(|(n, v)| (n.parse().unwrap(), (*v).to_owned()))
@@ -159,6 +160,13 @@ impl AddonDef {
                 private: PrivateAddrs::from_private_ok(private_ok),
             },
         );
+        self
+    }
+
+    /// Sets how endpoint `name` takes the layer's path.
+    #[must_use]
+    pub(crate) fn endpoint_path(mut self, name: &str, path: EndpointPath) -> Self {
+        self.endpoints.get_mut(name).expect("endpoint").path = path;
         self
     }
 
