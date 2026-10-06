@@ -197,7 +197,7 @@ async fn an_upper_case_sni_is_the_same_host() {
 #[tokio::test]
 async fn an_ip_target_has_no_sni_and_is_closed() {
     let kit = kit().await;
-    let name = roxy_tls::server_name_for_host(super::UP_IP).unwrap();
+    let name = roxy_tls::server_name(&roxy_http::url::parse_host(super::UP_IP.as_bytes()).unwrap());
     let res = tokio_rustls::TlsConnector::from(Arc::new(kit.client_tls()))
         .connect(name, kit.connect_direct(443))
         .await;
@@ -207,15 +207,17 @@ async fn an_ip_target_has_no_sni_and_is_closed() {
     assert!(kit.upstream.seen().is_empty());
 }
 
-/// An SNI carrying a port is not a host name: the handshake never
-/// completes and nothing is forwarded. No rustls client sends one, so the
-/// hello is a real one with the name patched in place.
+/// An SNI carrying a port is not a host name: the listener refuses it as
+/// `bad_sni` before rustls sees the hello, and nothing is forwarded. No
+/// rustls client sends one, so the hello is a real one with the name
+/// patched in place.
 #[tokio::test]
 async fn an_sni_with_a_port_is_closed() {
     let kit = kit().await;
     let (mut ours, theirs) = tokio::io::duplex(64 * 1024);
     let cfg = Arc::new(kit.client_tls());
-    let name = roxy_tls::server_name_for_host("up.testx443").unwrap();
+    let name =
+        roxy_tls::server_name(&roxy_http::url::parse_host("up.testx443".as_bytes()).unwrap());
     let hs = tokio::spawn(async move {
         tokio_rustls::TlsConnector::from(cfg)
             .connect(name, theirs)
@@ -233,11 +235,12 @@ async fn an_sni_with_a_port_is_closed() {
     io.write_all(&hello).await.unwrap();
     let out = read_to_end(&mut io).await;
     hs.abort();
-    // At most a TLS alert comes back: the handshake never completes.
-    assert!(out.is_empty() || out.as_bytes()[0] == 0x15, "{out:?}");
-    // `up.test:443` parses as an authority on port 443, so it is the TLS
-    // layer that refuses the name, not the SNI check.
+    // The SNI is parsed as a bare host (`parse_host`), which `:443` is
+    // not, so the connection is closed before the handshake starts:
+    // nothing, not even a TLS alert, comes back.
+    assert!(out.is_empty(), "{out:?}");
     let ev = kit.events("parse_error", 1).await;
-    assert_eq!(ev[0]["reason"], "tls_handshake_failed", "{ev:#?}");
+    assert_eq!(ev[0]["reason"], "bad_sni", "{ev:#?}");
+    assert_eq!(ev[0]["detail"], "up.test:443", "{ev:#?}");
     assert!(kit.upstream.seen().is_empty());
 }
