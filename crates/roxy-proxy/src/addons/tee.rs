@@ -338,6 +338,8 @@ pub(crate) async fn observe(
     let next = ObserverNext {
         rx: Mutex::new(Some(rx)),
     };
+    // Whether the real exchange failed below the observer, once known.
+    let (below_failed, below_outcome) = oneshot::channel();
     let observer_st = st.clone();
     let observer_addon = addon.clone();
     let layer = match &addon.kind {
@@ -356,7 +358,7 @@ pub(crate) async fn observe(
                     );
                 }
             });
-            return forward(st, index, &addon.name, real_req, tx).await;
+            return forward(st, index, &addon.name, real_req, tx, below_failed).await;
         }
     };
     let host = Arc::new(super::host::StackHost {
@@ -379,6 +381,12 @@ pub(crate) async fn observe(
             Err(e) => Err(e),
         };
         if let Err(e) = result {
+            // The exchange failing below the observer ends its copies and
+            // its `next` early; what it makes of that is a consequence,
+            // logged against the party at fault, not as its own failure.
+            if below_outcome.await.unwrap_or(false) {
+                return;
+            }
             super::emit_layer_error(
                 &observer_st,
                 &observer_addon.name,
@@ -388,7 +396,7 @@ pub(crate) async fn observe(
         }
     });
 
-    forward(st, index, &addon.name, real_req, tx).await
+    forward(st, index, &addon.name, real_req, tx, below_failed).await
 }
 
 /// Reads `body` to its end or first error, holding one frame at a time.
@@ -397,15 +405,18 @@ async fn discard(mut body: Body) {
 }
 
 /// The real exchange below observer `index`; the observer gets a copy of
-/// the response through `tx`.
+/// the response through `tx`, or the failure below. `below_failed` learns
+/// which, first.
 async fn forward(
     st: Arc<StackFlow>,
     index: usize,
     name: &str,
     real_req: LayerRequest,
     tx: oneshot::Sender<Result<LayerResponse, HostError>>,
+    below_failed: oneshot::Sender<bool>,
 ) -> Result<LayerResponse, HostError> {
     let real = super::below(st.clone(), index, real_req).await;
+    let _ = below_failed.send(real.is_err());
     match real {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();

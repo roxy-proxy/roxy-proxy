@@ -48,7 +48,10 @@ produces a `request` event:
   answered itself ([addons](/addons/overview#in-the-proxy)).
 - When an addon changed the request, `rules`, `decision` and
   `terminal_rule` describe the request that left, and `req` still describes
-  what the client sent ([addons](/addons/overview#in-the-proxy)).
+  what the client sent ([addons](/addons/overview#in-the-proxy)). They are
+  the rules' decision on that request, not a description of the response:
+  `res.status` is what the client got, which a layer above the rules may
+  have replaced after `next` returned.
 
 ### Events
 

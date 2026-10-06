@@ -185,12 +185,15 @@ enum First {
     Answer(LayerResponse),
 }
 
+/// Header values on the wire are bytes, and JSON strings are text: each
+/// byte goes as the code point of the same value (ISO-8859-1), so an
+/// obs-text value (`http.allow_obs_text`) crosses losslessly either way.
 fn pairs(h: &HeaderMap) -> Vec<(String, String)> {
     h.iter()
         .map(|(n, v)| {
             (
                 n.as_str().to_owned(),
-                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                v.as_bytes().iter().map(|&b| char::from(b)).collect(),
             )
         })
         .collect()
@@ -201,8 +204,12 @@ fn header_map(pairs: &[(String, String)]) -> Result<HeaderMap, ServiceError> {
     for (n, v) in pairs {
         let name = HeaderName::from_bytes(n.as_bytes())
             .map_err(|_| ServiceError::Protocol(format!("invalid header name {n:?}")))?;
-        let value = HeaderValue::from_str(v)
-            .map_err(|_| ServiceError::Protocol(format!("invalid value for header {n}")))?;
+        let invalid = || ServiceError::Protocol(format!("invalid value for header {n}"));
+        let bytes: Vec<u8> = v
+            .chars()
+            .map(|c| u8::try_from(u32::from(c)).map_err(|_| invalid()))
+            .collect::<Result<_, _>>()?;
+        let value = HeaderValue::from_bytes(&bytes).map_err(|_| invalid())?;
         h.append(name, value);
     }
     Ok(h)
@@ -336,7 +343,7 @@ async fn run(
 
     let first = answer_by(sent + svc.first_byte_timeout, answers.first)
         .await?
-        .map_err(|u| unanswered(st, u))?;
+        .map_err(|u| unanswered(st, index, u))?;
     let forward = match first {
         First::Answer(res) => {
             guard.disarm();
@@ -358,16 +365,16 @@ async fn run(
     tokio::spawn(async move { s.pump(Dir::Response, head, body).await });
     let res = answer_by(sent + svc.first_byte_timeout, answers.second)
         .await?
-        .map_err(|u| unanswered(st, u))?;
+        .map_err(|u| unanswered(st, index, u))?;
     guard.disarm();
     Ok(res)
 }
 
-/// The exchange's failure when the service's answer will not come. A body
-/// that failed on its way to the service is attributed as it would be
-/// without the layer: the client's upload to the client, the upstream's
-/// response to the upstream.
-fn unanswered(st: &StackFlow, u: Unanswered) -> Fail {
+/// The exchange's failure when service layer `index`'s answer will not
+/// come. A body that failed on its way to the service is attributed as it
+/// would be without the layer: the client's upload to the client, the
+/// response to the layer below that cut it, else to the upstream.
+fn unanswered(st: &StackFlow, index: usize, u: Unanswered) -> Fail {
     match u {
         Unanswered::Service(e) => Fail::Service(e),
         Unanswered::Abandoned(why) => Fail::Below(HostError::new(why)),
@@ -378,8 +385,10 @@ fn unanswered(st: &StackFlow, u: Unanswered) -> Fail {
             Fail::Below(HostError::new(format!("request body failed: {e}")))
         }
         Unanswered::Body(Dir::Response, e) => {
-            tracing::info!(flow = %st.flow, error = %e, "upstream response body failed");
-            st.record(super::Fault::UpstreamBody);
+            if !st.blame_below(index) {
+                tracing::info!(flow = %st.flow, error = %e, "upstream response body failed");
+                st.record(super::Fault::UpstreamBody);
+            }
             Fail::Below(HostError::new(format!("response body failed: {e}")))
         }
     }
@@ -492,6 +501,28 @@ async fn pump_copy(
 
 async fn drain(body: Body) {
     drop(body.collect_up_to(u64::MAX).await);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{header_map, pairs};
+    use http::{HeaderMap, HeaderValue};
+
+    /// A header value's bytes above 0x7f reach the service as the code
+    /// points of the same value and come back as the same bytes; a code
+    /// point no byte has is a protocol violation.
+    #[test]
+    fn obs_text_header_values_cross_the_stream_unchanged() {
+        let raw = b"caf\xe9 \xff";
+        let mut h = HeaderMap::new();
+        h.insert("x-obs", HeaderValue::from_bytes(raw).unwrap());
+        let sent = pairs(&h);
+        assert_eq!(sent, [("x-obs".to_owned(), "caf\u{e9} \u{ff}".to_owned())]);
+        let back = header_map(&sent).unwrap();
+        assert_eq!(back["x-obs"].as_bytes(), raw);
+        let wide = [("x-obs".to_owned(), "\u{100}".to_owned())];
+        assert!(header_map(&wide).is_err());
+    }
 }
 
 /// A roxy with service layers, for tests: the test kit's server reloaded

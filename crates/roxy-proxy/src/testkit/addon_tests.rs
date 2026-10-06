@@ -231,6 +231,37 @@ async fn an_observer_cannot_block_but_an_enforcer_below_it_can() {
     assert_eq!(reqs[1]["terminal_rule"], "layer:b", "{reqs:#?}");
 }
 
+/// An enforcer failing below an observer ends the observer's `next` too;
+/// the one `layer_error` is the enforcer's.
+#[tokio::test]
+async fn a_failure_below_an_observer_is_not_logged_as_the_observers() {
+    let kit = stack(&[
+        AddonDef::test_layer("o").observe(),
+        AddonDef::test_layer("b"),
+    ])
+    .await;
+    let a = kit
+        .h1()
+        .await
+        .call("GET", "/x", &[("x-test-b", "trap")], b"")
+        .await;
+    assert_eq!(a.status, 503, "{a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "layer:b", "{ev:#}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["layer"], "b", "{errs:#?}");
+    assert_eq!(errs[0]["mode"], "enforce");
+    // The observer's own end would be logged just after the enforcer's.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let errs: Vec<_> = kit
+        .sink
+        .events()
+        .into_iter()
+        .filter(|e| e["event"] == "layer_error")
+        .collect();
+    assert_eq!(errs.len(), 1, "{errs:#?}");
+}
+
 #[tokio::test]
 async fn an_observer_sees_the_real_exchange_without_changing_it() {
     let kit = stack(&[
@@ -391,6 +422,26 @@ async fn a_layer_that_rewrites_the_101_fails_closed() {
     assert_eq!(errs[0]["kind"], "invalid_response");
 }
 
+/// A `1xx` other than a relayed `101` is not a response the client can be
+/// given: the stack refuses it as the layer's invalid response rather than
+/// letting the codec choke on it.
+#[tokio::test]
+async fn a_layer_answering_1xx_fails_closed() {
+    let kit = stack(&named(&["a"])).await;
+    let a = kit
+        .h1()
+        .await
+        .call("GET", "/x", &[("x-status", "100")], b"")
+        .await;
+    assert_eq!(a.status, 503, "{a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "layer:a", "{ev:#}");
+    assert_eq!(ev["reason"], "layer_error");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["layer"], "a", "{errs:#?}");
+    assert_eq!(errs[0]["kind"], "invalid_response");
+}
+
 #[tokio::test]
 async fn a_layer_runs_only_where_its_when_matches() {
     let kit = stack(&[
@@ -450,6 +501,30 @@ async fn when_sees_the_request_the_layer_above_passed_on() {
     assert_eq!(a.status, 403, "{a:?}");
     let ev = kit.request_event().await;
     assert_eq!(strs(&ev["addons"]), ["a", "b"], "{ev:#}");
+}
+
+/// An observer passes nothing on, so what reaches the layers below it is
+/// the nearest enforcing layer's: that layer is blamed when its request
+/// does not validate, whether a `when` or the core finds out.
+#[tokio::test]
+async fn an_invalid_request_through_an_observer_blames_the_layer_that_passed_it_on() {
+    let kit = stack(&[
+        AddonDef::test_layer("a"),
+        AddonDef::test_layer("o").observe(),
+        AddonDef::test_layer("c").when(r#"path == "/x""#),
+    ])
+    .await;
+    let a = kit
+        .h1()
+        .await
+        .call("GET", "/x", &[("x-test-a", "invalid-next")], b"")
+        .await;
+    assert_eq!(a.status, 503, "{a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "layer:a", "{ev:#}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["layer"], "a", "{errs:#?}");
+    assert_eq!(errs[0]["kind"], "invalid_request");
 }
 
 #[tokio::test]
@@ -694,9 +769,35 @@ mod service {
     }
 
     #[tokio::test]
-    #[ignore = "the service protocol converts header values with from_utf8_lossy, so a non-UTF-8 obs-text byte comes back as U+FFFD"]
     async fn a_latin1_obs_text_header_survives_a_service_round_trip() {
         service_header_round_trip(b"caf\xe9").await;
+    }
+
+    /// A WASM layer below the service fails before the service has
+    /// answered the response head: the layer is blamed, not the upstream,
+    /// and the client gets the layer's `503`.
+    #[tokio::test]
+    async fn a_wasm_layer_failing_before_the_services_answer_is_the_one_blamed() {
+        let kit = kit(
+            RULES,
+            vec![
+                addon("s", "forward", AddonMode::Enforce, |_| {}),
+                AddonDef::test_layer("w").spec().await,
+            ],
+        )
+        .await;
+        let a = kit
+            .h1()
+            .await
+            .call("GET", "/x", &[("x-test-w", "trap-after-head")], b"")
+            .await;
+        assert_eq!(a.status, 503, "{a:?}");
+        let ev = kit.request_event().await;
+        assert_eq!(ev["terminal_rule"], "layer:w", "{ev:#}");
+        assert_eq!(ev["reason"], "layer_error", "{ev:#}");
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["layer"], "w", "{errs:#?}");
+        assert_eq!(errs[0]["kind"], "trap", "{errs:#?}");
     }
 
     /// An upstream that answers while the client is still uploading

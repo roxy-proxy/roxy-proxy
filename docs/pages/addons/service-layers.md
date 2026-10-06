@@ -98,7 +98,11 @@ either way       {"type":"credit","dir":"request"|"response","bytes":n}  flow co
 ```
 
 `url` is absolute and `headers` are end-to-end fields as a WASM layer sees
-them (no hop-by-hop or framing fields). Heads carry `content-length` when
+them (no hop-by-hop or framing fields). A header value is a byte string:
+each byte is the code point of the same value (ISO-8859-1), so a value
+with obs-text bytes (`http.allow_obs_text`) reads as Latin-1 and goes back
+as the same bytes. A value the service sends with a code point above
+U+00FF is a protocol violation. Heads carry `content-length` when
 the length is known; a `content-length` the service sends back is enforced,
 and more or fewer bytes than declared is a protocol violation.
 
@@ -136,9 +140,10 @@ done, say, does not stall the upload). Each body of a stream starts with
 `{"type":"credit","stream":…,"dir":"request"|"response","bytes":n}` as it
 consumes what it got; the sender may have no more bytes of that body
 outstanding than it has been granted. roxy grants credit as the layer
-below (or the client) reads what the service sent. A service that sends
-past its credit breaks the protocol on that stream. Control messages are
-not counted.
+below (or the client) reads what the service sent, in steps of 64 KiB, so
+a stream never has more than a few credit messages waiting on the
+socket. A service that sends past its credit breaks the protocol on that
+stream. Control messages are not counted.
 
 - **What the service forwards gets the same checks as a WASM layer's
   `next`**: re-validated as strictly as a client request, then judged by the

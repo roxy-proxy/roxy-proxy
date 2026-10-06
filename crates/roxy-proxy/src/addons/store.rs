@@ -1,7 +1,7 @@
 //! Process-wide addon state that outlives a reload: each addon's keyed
 //! store.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -58,16 +58,22 @@ impl LayerStates {
 
     /// Applies each addon's entry cap and default ttl to its live store
     /// on reload. Stored entries stay; a lower cap only refuses new keys.
+    /// The store of an addon absent from the new configuration is dropped:
+    /// its name is free for a different addon, and its memory is not kept
+    /// for one that may never come back.
     pub(crate) fn configure<'a>(
         &self,
         addons: impl IntoIterator<Item = (&'a str, &'a StateLimits)>,
     ) {
-        let g = self.stores.read().unwrap_or_else(PoisonError::into_inner);
+        let mut g = self.stores.write().unwrap_or_else(PoisonError::into_inner);
+        let mut kept = HashSet::new();
         for (layer, limits) in addons {
+            kept.insert(layer);
             if let Some(s) = g.get(layer) {
                 s.set_limits(limits.max_entries, limits.default_ttl);
             }
         }
+        g.retain(|name, _| kept.contains(name.as_str()));
     }
 
     fn existing(&self, layer: &str) -> Option<Arc<StateStore>> {
@@ -134,5 +140,24 @@ mod tests {
         assert!(s.put("a", &limits, "k1", "11", None).is_ok());
         assert_eq!(s.get("a", "k1"), None);
         assert_eq!(s.get("a", "k2").as_deref(), Some("22"));
+    }
+
+    #[test]
+    fn reload_drops_the_stores_of_removed_addons() {
+        let s = LayerStates::default();
+        let limits = StateLimits {
+            max_entries: 2,
+            max_value_bytes: 4,
+            default_ttl: Duration::from_secs(60),
+        };
+        assert!(s.put("a", &limits, "k1", "1", None).is_ok());
+        assert!(s.put("b", &limits, "k1", "1", None).is_ok());
+        s.configure([("a", &limits)]);
+        assert_eq!(s.get("a", "k1").as_deref(), Some("1"));
+        assert_eq!(s.get("b", "k1"), None);
+        // An addon added back starts empty.
+        s.configure([("a", &limits), ("b", &limits)]);
+        assert_eq!(s.get("b", "k1"), None);
+        assert!(s.put("b", &limits, "k2", "2", None).is_ok());
     }
 }
