@@ -10,8 +10,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, timeout_at};
 use wasmtime::component::{Component, InstancePre, Linker, Resource};
 use wasmtime::{Config, Engine, Store, StoreContextMut};
-use wasmtime_wasi_http::WasiHttpView;
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme as WasiScheme;
+use wasmtime_wasi_http::{FieldMapError, WasiHttpView};
 
 use crate::bindings::exports::roxy::addon::init;
 use crate::bindings::exports::wasi::http::incoming_handler;
@@ -142,10 +142,16 @@ impl std::fmt::Debug for Layer {
 /// recorded for the exchange (a limit or host failure that made the guest
 /// trap) takes precedence.
 fn classify(err: &wasmtime::Error) -> LayerError {
-    match err.downcast_ref::<LayerError>() {
-        Some(e) => e.clone(),
-        None => LayerError::Trap(format!("{err:#}")),
+    if let Some(e) = err.downcast_ref::<LayerError>() {
+        return e.clone();
     }
+    // wasi-http traps a `fields` that would grow past the size limit.
+    if let Some(FieldMapError::TotalSizeTooBig | FieldMapError::TooManyFields) =
+        err.downcast_ref::<FieldMapError>()
+    {
+        return LayerError::BudgetExceeded(Budget::Fields);
+    }
+    LayerError::Trap(format!("{err:#}"))
 }
 
 /// Runs once per epoch tick while the guest runs: yields to the async

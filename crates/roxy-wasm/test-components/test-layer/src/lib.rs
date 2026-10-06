@@ -512,6 +512,30 @@ impl Handler for Layer {
     fn handle(req: IncomingRequest, out: ResponseOutparam) {
         let n = EXCHANGES.fetch_add(1, Ordering::Relaxed) + 1;
         let test = test_for(&req);
+        if let Some(n) = test.strip_prefix("fields:") {
+            // Build a `fields` holding one value of `n` bytes, then answer.
+            // Past the host's cap on a `fields` this traps instead.
+            let n: usize = n.parse().expect("size");
+            let f = Fields::new();
+            f.append("x-big", &vec![b'a'; n]).expect("append");
+            respond(out, 200, b"fields ok");
+            drop(f);
+            return;
+        }
+        if let Some(n) = test.strip_prefix("log:") {
+            // Log one message of `n` bytes, then answer.
+            let n: usize = n.parse().expect("size");
+            flow::log(flow::LogLevel::Info, &"m".repeat(n));
+            respond(out, 200, b"logged");
+            return;
+        }
+        if let Some(n) = test.strip_prefix("record:") {
+            // Record one document of about `n` bytes, then answer.
+            let n: usize = n.parse().expect("size");
+            flow::record("big", &format!("{{\"s\":\"{}\"}}", "r".repeat(n)), false);
+            respond(out, 200, b"recorded");
+            return;
+        }
         if let Some(n) = test.strip_prefix("hoard:") {
             // Hold `n` host resources at once, then answer. Past the host's
             // per-instance cap this traps instead of answering.
@@ -660,6 +684,26 @@ impl Handler for Layer {
                     wasi::clocks::monotonic_clock::subscribe_duration(ms * 1_000_000).block();
                 }
                 panic!("layer panics mid-body");
+            }
+            "tags-after-head" => {
+                // Answer, then tag the flow without end, each tag unique and
+                // `x-tag-len` bytes long (default 2). Only the host's cap on a
+                // flow's tags stops this.
+                let len: usize = header(&req, "x-tag-len")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2);
+                let resp = OutgoingResponse::new(Fields::new());
+                let body = resp.body().expect("body");
+                ResponseOutparam::set(out, Ok(resp));
+                {
+                    let stream = body.write().expect("write");
+                    write_all(&stream, b"partial");
+                }
+                let mut i: u64 = 0;
+                loop {
+                    flow::add_tag(&format!("{i:0>len$}"));
+                    i += 1;
+                }
             }
             "trap-after-finish" => {
                 respond(out, 200, b"complete");

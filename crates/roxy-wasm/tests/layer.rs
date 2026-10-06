@@ -12,6 +12,7 @@ use http_body_util::BodyExt;
 use roxy_http::{Body, BodyError, BodySender};
 use roxy_wasm::{
     Budget, Capabilities, Capability, HostError, Layer, LayerError, LayerOutcome, LoadError,
+    MAX_FIELDS_BYTES, MAX_MESSAGE_BYTES,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -292,6 +293,93 @@ async fn failures_after_the_head_cut_the_body() {
                 "{test}: {failure:?}"
             ),
         }
+    }
+}
+
+/// Tags live on the host, outside `max_memory`, so the host caps them: a
+/// guest that keeps tagging after its head is out is failed at the cap,
+/// and its body cut, rather than growing the host's memory until the
+/// client gives up.
+#[tokio::test]
+async fn looping_on_add_tag_after_the_head_fails_at_the_cap() {
+    let rt = runtime();
+    let layer = load(&rt, config()).await;
+    let host = Mock::echo();
+    let resp = layer
+        .handle(host.clone(), request("tags-after-head", Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let outcome = resp.extensions().get::<LayerOutcome>().cloned().unwrap();
+    assert_eq!(
+        collect(resp.into_body()).await.unwrap_err(),
+        BodyError::Stopped
+    );
+    assert_eq!(
+        outcome.wait().await.unwrap_err(),
+        LayerError::BudgetExceeded(Budget::Tags)
+    );
+    // The refused tag is the first one past the cap.
+    assert_eq!(host.tags.lock().unwrap().len(), MOCK_TAG_CAP);
+    let tag_calls = host
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("tag "))
+        .count();
+    assert_eq!(tag_calls, MOCK_TAG_CAP + 1);
+}
+
+/// A `fields` a guest builds is host memory outside `max_memory`, so its
+/// size is capped; one over the cap fails the exchange, named.
+#[tokio::test]
+async fn an_oversized_fields_is_refused() {
+    let rt = runtime();
+    let layer = load(&rt, config()).await;
+    let under = format!("fields:{}", MAX_FIELDS_BYTES / 2);
+    let (status, body) = exchange(&layer, Mock::echo(), request(&under, Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(
+        (status, body.as_ref()),
+        (StatusCode::OK, b"fields ok".as_slice())
+    );
+    let over = format!("fields:{}", MAX_FIELDS_BYTES + 1);
+    let err = exchange(&layer, Mock::echo(), request(&over, Body::empty()))
+        .await
+        .unwrap_err();
+    assert_eq!(err, LayerError::BudgetExceeded(Budget::Fields));
+}
+
+/// `flow.log` messages and `flow.record` documents are held by the host, so
+/// their length is capped.
+#[tokio::test]
+async fn an_oversized_log_or_record_payload_is_refused() {
+    let rt = runtime();
+    let mut cfg = config();
+    cfg.capabilities = Capabilities::NONE
+        .with(Capability::Log)
+        .with(Capability::Record);
+    let layer = load(&rt, cfg).await;
+    for (test, answer) in [("log", "logged"), ("record", "recorded")] {
+        let host = Mock::echo();
+        let under = format!("{test}:{}", MAX_MESSAGE_BYTES / 2);
+        let (status, body) = exchange(&layer, host.clone(), request(&under, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            (status, body.as_ref()),
+            (StatusCode::OK, answer.as_bytes()),
+            "{test}"
+        );
+        assert_eq!(host.calls().len(), 1, "{test}: {:?}", host.calls());
+
+        let host = Mock::echo();
+        let over = format!("{test}:{}", MAX_MESSAGE_BYTES + 1);
+        let err = exchange(&layer, host.clone(), request(&over, Body::empty()))
+            .await
+            .unwrap_err();
+        assert_eq!(err, LayerError::BudgetExceeded(Budget::Message), "{test}");
+        assert!(host.calls().is_empty(), "{test}: never reached the host");
     }
 }
 

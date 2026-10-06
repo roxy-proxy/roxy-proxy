@@ -21,13 +21,21 @@ use crate::bindings::roxy::addon::{chain, endpoints, flow};
 use crate::config::{Capability, LayerConfig};
 use crate::error::{Budget, LayerError};
 use crate::exchange::{Dir, ExchangeShared, FromGuest, IntoGuest};
-use crate::host::{EndpointError, LayerHost, LogLevel};
+use crate::host::{EndpointError, LayerHost, LogLevel, TagError};
 
 /// Most resources (requests, bodies, streams, fields) a guest may hold at
 /// once. Each costs host memory outside the guest's `max_memory`.
 const MAX_RESOURCES: usize = 4096;
 /// Most elements a guest table may grow to.
 const MAX_TABLE_ELEMENTS: usize = 100_000;
+/// Most bytes of names and values (with wasi-http's per-entry accounting)
+/// in one `fields` a guest builds. With [`MAX_RESOURCES`] this bounds what
+/// the host holds in headers for an instance. Twice the default
+/// `max_header_bytes`, so a head roxy accepts can be copied and added to.
+pub const MAX_FIELDS_BYTES: usize = 128 * 1024;
+/// Longest `flow.log` message, and longest `flow.record` document (kind and
+/// JSON together), in bytes.
+pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// The layer, as every instance of it sees it.
 #[derive(Debug)]
@@ -134,10 +142,12 @@ impl StoreState {
             .build();
         let mut table = ResourceTable::new();
         table.set_max_capacity(MAX_RESOURCES);
+        let mut http = WasiHttpCtx::new();
+        http.set_field_size_limit(MAX_FIELDS_BYTES);
         let max_memory = layer.config.limits.max_memory;
         Self {
             wasi,
-            http: WasiHttpCtx::new(),
+            http,
             table,
             hooks: NoOutgoing,
             layer,
@@ -173,11 +183,25 @@ impl StoreState {
     /// Runs a host-service future, turning a [`crate::HostError`] into a
     /// trap that fails the exchange.
     fn host_failed(&self, err: crate::host::HostError) -> wasmtime::Error {
-        let err = LayerError::Host(err);
+        self.fail(LayerError::Host(err))
+    }
+
+    /// A trap that fails the exchange, if one is running, with `err`.
+    fn fail(&self, err: LayerError) -> wasmtime::Error {
         if let Some(ex) = &self.exchange {
             ex.shared.fail(err.clone());
         }
         wasmtime::Error::new(err)
+    }
+
+    /// Refuses a `flow.log` or `flow.record` payload over
+    /// [`MAX_MESSAGE_BYTES`], so a guest cannot grow the host's memory (or
+    /// its log) a payload at a time.
+    fn check_message(&self, len: usize) -> wasmtime::Result<()> {
+        if len > MAX_MESSAGE_BYTES {
+            return Err(self.fail(LayerError::BudgetExceeded(Budget::Message)));
+        }
+        Ok(())
     }
 }
 
@@ -406,7 +430,10 @@ impl flow::Host for StoreState {
         self.exchange("flow.add-tag")?
             .host
             .add_tag(tag)
-            .map_err(|e| self.host_failed(e))
+            .map_err(|e| match e {
+                TagError::Full => self.fail(LayerError::BudgetExceeded(Budget::Tags)),
+                TagError::Host(e) => self.host_failed(e),
+            })
     }
 
     async fn config(&mut self) -> wasmtime::Result<String> {
@@ -415,6 +442,7 @@ impl flow::Host for StoreState {
 
     async fn log(&mut self, level: flow::LogLevel, msg: String) -> wasmtime::Result<()> {
         self.require(Capability::Log, "flow.log")?;
+        self.check_message(msg.len())?;
         let level = match level {
             flow::LogLevel::Trace => LogLevel::Trace,
             flow::LogLevel::Debug => LogLevel::Debug,
@@ -440,6 +468,7 @@ impl flow::Host for StoreState {
 
     async fn record(&mut self, kind: String, json: String, audit: bool) -> wasmtime::Result<()> {
         self.require(Capability::Record, "flow.record")?;
+        self.check_message(kind.len().saturating_add(json.len()))?;
         let host = self.host("flow.record")?;
         host.record(kind, json, audit)
             .await

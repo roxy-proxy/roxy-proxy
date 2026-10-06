@@ -75,6 +75,18 @@ impl HostError {
     }
 }
 
+/// Why `flow.add-tag` was refused. Either fails the exchange closed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TagError {
+    /// The flow holds as many tags, or as many bytes of them, as the host
+    /// allows.
+    #[error("the flow is at its tag cap")]
+    Full,
+    /// The host refused the tag for another reason.
+    #[error(transparent)]
+    Host(#[from] HostError),
+}
+
 /// Why an endpoint call failed. Returned to the guest as a
 /// `wasi:http/types.error-code`; the guest decides what to do (it is not
 /// fatal to the exchange).
@@ -135,8 +147,10 @@ pub trait LayerHost: Send + Sync + 'static {
 
     /// Add a tag to the flow's log record. Needs no capability, but only
     /// an enforcing layer may tag: `Err` from an observer fails its
-    /// exchange closed, as a call without its capability would.
-    fn add_tag(&self, tag: String) -> Result<(), HostError>;
+    /// exchange closed, as a call without its capability would. The host
+    /// caps a flow's tags, in number and in bytes; [`TagError::Full`] fails
+    /// the exchange with [`crate::Budget::Tags`].
+    fn add_tag(&self, tag: String) -> Result<(), TagError>;
 
     /// Write to the operational log (capability `log`).
     fn log(&self, level: LogLevel, msg: &str);

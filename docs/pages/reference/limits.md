@@ -83,8 +83,10 @@ overruns it ends the exchange (`response_error`, `response_body_timeout`):
 on HTTP/1.1 the connection closes so the client cannot take the body for
 complete, on HTTP/2 the stream is reset with `CANCEL`.
 
-Addons have their own limits ([addon safety](/addons/safety)).
-`max_ws_message_bytes` applies only when rules read WebSocket messages
+Addons have their own limits ([addon safety](/addons/safety)), and three
+fixed caps on what the host holds for a guest: a `fields` it builds (128
+KiB), a flow's tags (64, and 4 KiB together) and a `flow.log` or
+`flow.record` payload (64 KiB). `max_ws_message_bytes` applies only when rules read WebSocket messages
 ([WebSockets](/policies/websockets#message-rules)); a message over it closes both
 sides with `1009`. `max_observer_lag_bytes` is how far behind the real
 exchange an observe-mode addon may fall: its copy of each body is buffered
