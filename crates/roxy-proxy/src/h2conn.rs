@@ -140,7 +140,9 @@ pub(crate) async fn serve<IO: Io>(
     let mut streams: JoinSet<()> = JoinSet::new();
     let mut closing = false;
     let mut close_deadline = Instant::now();
-    let mut idle_deadline = Some(Instant::now() + limits.idle_timeout);
+    // The first request head is owed within `header_timeout`, as on h1;
+    // `idle_timeout` is for the gaps between requests.
+    let mut idle_deadline = Some(Instant::now() + limits.header_timeout);
     loop {
         let idle_at = idle_deadline.unwrap_or_else(Instant::now);
         tokio::select! {
@@ -334,9 +336,12 @@ async fn write_response(
     let head = to_h2_response(&res, out.method)
         .body(())
         .map_err(|e| WriteFailure::Io(format!("response head: {e}")))?;
+    // `content-length: 0` may still carry trailers when they are allowed,
+    // so only a body that has nothing more to yield ends on the HEADERS.
     let bodiless = status_forbids_body(res.status)
         || *out.method == Method::Head
-        || res.body.known_length() == Some(0);
+        || (res.body.known_length() == Some(0)
+            && (!out.allow_trailers || http_body::Body::is_end_stream(&res.body)));
     let mut body = res.body;
     if bodiless {
         respond
@@ -357,6 +362,12 @@ async fn write_response(
         // stream rather than a proxy fault.
         Err(WriteFailure::UpstreamStalled) => {
             tracing::debug!("h2 response body stalled; resetting the stream");
+            send.send_reset(h2::Reason::CANCEL);
+        }
+        // The client stopped taking the body: cancel rather than wait on
+        // a window it may never open.
+        Err(WriteFailure::ClientStalled) => {
+            tracing::debug!("client flow-control window stalled; resetting the stream");
             send.send_reset(h2::Reason::CANCEL);
         }
         Err(WriteFailure::Io(e)) => {
@@ -408,11 +419,7 @@ async fn stream_body(
                     send.reserve_capacity(data.len());
                     let cap = timeout(out.idle, poll_fn(|cx| send.poll_capacity(cx)))
                         .await
-                        .map_err(|_| {
-                            WriteFailure::ClientGone(
-                                "client flow-control window stalled".to_owned(),
-                            )
-                        })?;
+                        .map_err(|_| WriteFailure::ClientStalled)?;
                     let n = match cap {
                         None => {
                             return Err(WriteFailure::ClientGone(

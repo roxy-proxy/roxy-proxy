@@ -103,6 +103,13 @@ impl LeafMinter {
         self.lock().len()
     }
 
+    /// Whether [`LeafMinter::certified_key`] for `host` would be served
+    /// from the cache (a fresh entry), so a caller can skip the blocking
+    /// pool.
+    pub fn is_cached(&self, host: &Host) -> bool {
+        self.fresh(host, self.now()).is_some()
+    }
+
     /// Get (minting if needed) the certified key for `host`.
     ///
     /// The chain is `[leaf, CA, intermediates...]`. A [`Host`] is already
@@ -110,14 +117,8 @@ impl LeafMinter {
     /// This blocks for ~1 ms on a cache miss; see the module docs.
     pub fn certified_key(&self, host: &Host) -> Result<Arc<CertifiedKey>, LeafError> {
         let now = self.now();
-        {
-            let mut cache = self.lock();
-            if let Some(entry) = cache.get(host) {
-                if entry.not_after - now > EVICT_BEFORE_EXPIRY {
-                    return Ok(Arc::clone(&entry.key));
-                }
-                cache.pop(host);
-            }
+        if let Some(key) = self.fresh(host, now) {
+            return Ok(key);
         }
         let (key, not_after) = self.mint(host, now)?;
         let key = Arc::new(key);
@@ -129,6 +130,18 @@ impl LeafMinter {
             },
         );
         Ok(key)
+    }
+
+    /// The cached key for `host` unless it is within [`EVICT_BEFORE_EXPIRY`]
+    /// of expiry, in which case it is dropped for re-minting.
+    fn fresh(&self, host: &Host, now: OffsetDateTime) -> Option<Arc<CertifiedKey>> {
+        let mut cache = self.lock();
+        let entry = cache.get(host)?;
+        if entry.not_after - now > EVICT_BEFORE_EXPIRY {
+            return Some(Arc::clone(&entry.key));
+        }
+        cache.pop(host);
+        None
     }
 
     fn mint(
@@ -231,6 +244,19 @@ mod tests {
         let c = m.certified_key(&name("other.example")).unwrap();
         assert!(!Arc::ptr_eq(&a, &c));
         assert_eq!(m.cached(), 2);
+    }
+
+    #[test]
+    fn is_cached_follows_freshness() {
+        let m = minter(8);
+        assert!(!m.is_cached(&name("example.com")));
+        m.certified_key(&name("example.com")).unwrap();
+        assert!(m.is_cached(&name("EXAMPLE.com")));
+        m.advance_clock(Duration::days(6) + Duration::hours(23) + Duration::minutes(30));
+        assert!(
+            !m.is_cached(&name("example.com")),
+            "stale within 1h of expiry"
+        );
     }
 
     #[test]

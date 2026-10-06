@@ -461,6 +461,66 @@ async fn a_slow_upload_outlasts_the_response_header_timeout() {
 
 // ---- h2 connections -------------------------------------------------------
 
+/// An h2 connection owes its first stream within `header_timeout`, as an
+/// h1 tunnel owes its first request head; between requests it may idle
+/// for `idle_timeout`.
+#[tokio::test]
+async fn h2_first_stream_must_arrive_within_header_timeout() {
+    let kit = Kit::builder()
+        .limits(|l| l.header_timeout = Duration::from_millis(500))
+        .start()
+        .await;
+    let (_send, conn) = super::h2_client(&kit).await;
+    tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("the connection closes without a first stream")
+        .unwrap()
+        .unwrap();
+
+    let (send, _conn) = super::h2_client(&kit).await;
+    let (parts, _) = super::h2_get(&send, "https://up.test/first", &[])
+        .await
+        .unwrap();
+    assert_eq!(parts.status, 200);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (parts, _) = super::h2_get(&send, "https://up.test/second", &[])
+        .await
+        .expect("a gap between requests is bounded by idle_timeout");
+    assert_eq!(parts.status, 200);
+}
+
+/// With `http.allow_trailers`, a response of `content-length: 0` that ends
+/// with trailers delivers them on h2.
+#[tokio::test]
+async fn h2_response_trailers_follow_an_empty_body() {
+    let kit = Kit::builder()
+        .flags(|f| f.allow_trailers = true)
+        .start()
+        .await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let req = http::Request::get("https://up.test/trailers")
+        .body(())
+        .unwrap();
+    let mut ready = send.clone().ready().await.unwrap();
+    let (resp, _) = ready.send_request(req, true).unwrap();
+    let resp = tokio::time::timeout(Duration::from_secs(10), resp)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-length"], "0");
+    let mut body = resp.into_body();
+    while let Some(chunk) = body.data().await {
+        assert!(chunk.unwrap().is_empty());
+    }
+    let trailers = tokio::time::timeout(Duration::from_secs(10), body.trailers())
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("the trailers are delivered");
+    assert_eq!(trailers["x-checksum"], "none");
+}
+
 #[tokio::test]
 async fn h2_streams_multiplex_on_one_connection() {
     let kit = Kit::builder().connection_events().start().await;

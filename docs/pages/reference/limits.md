@@ -156,7 +156,10 @@ smaller budget admits nothing new until enough of them end).
   it is validated (`content-length: 10^18` does not pre-allocate).
 - What exchanges buffer (inspection, WebSocket reassembly, observer
   copies) is bounded in aggregate by `max_buffered_bytes`, not only per
-  exchange.
+  exchange. Request bytes in flight on an HTTP/2 connection (sent by the
+  client, not yet taken by the upstream) sit outside that budget: the
+  connection's receive window caps them at 4 MiB, so one client IP can
+  hold at most `max_connections_per_client` × 4 MiB (1 GiB by default).
 - Bounded policy tables (metrics, state, addon state) never evict
   to make room: a flow that needs a new entry in a full table is denied
   ([never evict](/principles#never-evict)).
