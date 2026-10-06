@@ -10,8 +10,8 @@ Sources:
   (each case's role and flags are encoded in the leading config byte, see
   fuzz/src/lib.rs `flags` / `role`);
 - url: request targets from that corpus plus a few path / query shapes;
-- client_hello: real ClientHellos from Python's ssl module (with and
-  without SNI / ALPN, TLS 1.2 and 1.3);
+- client_hello, client_hello_rustls: real ClientHellos from Python's ssl
+  module (with and without SNI / ALPN, TLS 1.2 and 1.3);
 - rule_compile: every `when:` expression in examples/, the roxy config test
   fixtures and crates/roxy-rules;
 - h2map, rule_eval: structured inputs, seeded with a few byte patterns
@@ -210,8 +210,8 @@ def dns_queries():
 
 
 def main():
-    for target in ("h1_request", "h1_chunked", "url", "client_hello", "rule_compile", "h2map", "rule_eval",
-                   "ws_frame", "content_coding", "dns_query"):
+    for target in ("h1_request", "h1_chunked", "url", "client_hello", "client_hello_rustls", "rule_compile",
+                   "h2map", "rule_eval", "ws_frame", "content_coding", "dns_query"):
         for old in (OUT / target).glob("*") if (OUT / target).is_dir() else []:
             old.unlink()
     n = 0
@@ -228,8 +228,9 @@ def main():
               b"https://[::1]:8443/p", b"example.com:443", b"xn--bcher-kva.example"]:
         write("url", "shape", t)
     for name, hello in client_hellos():
-        write("client_hello", name, hello)
-        write("client_hello", name + "_trailing", hello + b"GET / HTTP/1.1\r\n")
+        for target in ("client_hello", "client_hello_rustls"):
+            write(target, name, hello)
+            write(target, name + "_trailing", hello + b"GET / HTTP/1.1\r\n")
     for i, expr in enumerate(when_expressions()):
         write("rule_compile", f"when{i}", expr.encode())
     for i, pat in enumerate([b"", b"\x00" * 64, b"\x01" * 64, bytes(range(256))]):

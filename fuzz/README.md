@@ -26,6 +26,7 @@ The first directory is the working corpus, which grows as the fuzzer runs.
 | `ws_frame` | `roxy-http` `ws::frame::Decoder` | The result does not depend on how input is split into reads. No message is over its limit. Re-encoding the messages as roxy relays them and decoding again gives the same messages, without error. |
 | `url` | `url::*` | Path, query, origin-form, absolute-form and authority normalisation are idempotent. A normalised path starts with `/` and has no `.` or `..` segment, `%2E`-encoded or not. |
 | `client_hello` | `roxy-tls` `sniff` | Reading more never changes a verdict: over an input's prefixes, `NeedMore` until one constant answer. |
+| `client_hello_rustls` | `roxy-tls` `sniff` against rustls | **The sniffer and rustls agree on the SNI.** When `sniff` accepts a hello and a rustls server gets as far as choosing a certificate for the same bytes, the name rustls acts on is the host roxy keys on (none for an IP literal). rustls rejecting the hello is fine. |
 | `rule_compile` | `roxy-rules` lexer, parser, type-checker, compiler | A policy that compiles evaluates without panicking, and a fail-closed outcome is never an allow. |
 | `content_coding` | `roxy-http` `coding::Decoder` (gzip, deflate, br, zstd, stacked) | The result does not depend on how input is fed or output read, and the decoded-size limit holds exactly: a body of `n` decoded bytes is refused under a limit of `n - 1`. |
 | `rule_eval` | `Policy::evaluate_head` on generated policies | **Unavailable inputs only ever fail closed.** Making one input unavailable (a metric, the body text, the address list) leaves the outcome exactly as it was, or turns it into the fail-closed deny, never into a different decision. |
@@ -47,7 +48,7 @@ vectors, so the seeds are never stale and nothing derived is checked in:
   `crates/roxy-http/tests/corpus`, with each case's role and flags in the
   config byte.
 - **`url`:** request targets from that corpus.
-- **`client_hello`:** real ClientHellos from Python's `ssl`.
+- **`client_hello`, `client_hello_rustls`:** real ClientHellos from Python's `ssl`.
 - **`rule_compile`:** every `when:` expression in `examples/`, the roxy
   config test fixtures (`crates/roxy/tests/fixtures`) and
   `crates/roxy-rules`.

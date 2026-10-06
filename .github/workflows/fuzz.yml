@@ -102,6 +102,7 @@ jobs:
           - ws_frame
           - url
           - client_hello
+          - client_hello_rustls
           - rule_compile
           - rule_eval
           - content_coding

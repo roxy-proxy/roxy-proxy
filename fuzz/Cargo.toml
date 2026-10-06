@@ -25,6 +25,7 @@ roxy-dns = { path = "../crates/roxy-dns" }
 roxy-http = { path = "../crates/roxy-http" }
 roxy-rules = { path = "../crates/roxy-rules" }
 roxy-tls = { path = "../crates/roxy-tls" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
 serde_json = "1.0.151"
 
 [profile.release]
@@ -68,6 +69,13 @@ bench = false
 [[bin]]
 name = "client_hello"
 path = "fuzz_targets/client_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_hello_rustls"
+path = "fuzz_targets/client_hello_rustls.rs"
 test = false
 doc = false
 bench = false

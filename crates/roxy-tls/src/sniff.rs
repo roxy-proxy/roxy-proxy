@@ -246,8 +246,12 @@ pub fn looks_like_http(buf: &[u8]) -> bool {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use rustls::{ClientConfig, ClientConnection, RootCertStore};
-    use std::sync::Arc;
+    use roxy_http::Host;
+    use roxy_http::url::parse_host;
+    use rustls::server::{ClientHello, ResolvesServerCert};
+    use rustls::sign::CertifiedKey;
+    use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
+    use std::sync::{Arc, Mutex};
 
     fn hello(sni: &str, alpn: &[&str], tls13_only: bool) -> Vec<u8> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -262,13 +266,180 @@ mod tests {
             .with_root_certificates(RootCertStore::empty())
             .with_no_client_auth();
         cfg.alpn_protocols = alpn.iter().map(|a| a.as_bytes().to_vec()).collect();
-        let name = crate::server_name(&roxy_http::url::parse_host(sni.as_bytes()).unwrap());
+        let name = crate::server_name(&parse_host(sni.as_bytes()).unwrap());
         let mut conn = ClientConnection::new(Arc::new(cfg), name).unwrap();
         let mut out = Vec::new();
         while conn.wants_write() {
             conn.write_tls(&mut out).unwrap();
         }
         out
+    }
+
+    fn be16(n: usize) -> [u8; 2] {
+        u16::try_from(n).unwrap().to_be_bytes()
+    }
+
+    /// A hand-built TLS 1.2 `ClientHello` record: one cipher suite, null
+    /// compression, `signature_algorithms` (without which rustls never gets
+    /// as far as choosing a certificate), then `extensions` as
+    /// `(type, payload)` pairs.
+    fn raw_hello(extensions: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut exts = Vec::new();
+        for (ty, data) in [(13u16, &[0u8, 4, 0x04, 0x03, 0x08, 0x04][..])]
+            .iter()
+            .chain(extensions)
+        {
+            exts.extend_from_slice(&ty.to_be_bytes());
+            exts.extend_from_slice(&be16(data.len()));
+            exts.extend_from_slice(data);
+        }
+        let mut body = vec![3, 3];
+        body.extend_from_slice(&[0; 32]);
+        body.push(0);
+        body.extend_from_slice(&[0, 2, 0xc0, 0x2f]);
+        body.extend_from_slice(&[1, 0]);
+        body.extend_from_slice(&be16(exts.len()));
+        body.extend_from_slice(&exts);
+        let mut out = vec![CONTENT_TYPE_HANDSHAKE, 3, 1];
+        out.extend_from_slice(&be16(body.len() + HANDSHAKE_HEADER));
+        out.push(HANDSHAKE_CLIENT_HELLO);
+        out.extend_from_slice(&u32::try_from(body.len()).unwrap().to_be_bytes()[1..]);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// A `server_name` extension payload listing `(name_type, name)` entries.
+    fn server_name_list(entries: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut list = Vec::new();
+        for (ty, name) in entries {
+            list.push(*ty);
+            list.extend_from_slice(&be16(name.len()));
+            list.extend_from_slice(name);
+        }
+        let mut out = be16(list.len()).to_vec();
+        out.extend_from_slice(&list);
+        out
+    }
+
+    /// Records the SNI rustls hands to its certificate resolver.
+    #[derive(Debug, Default)]
+    #[allow(clippy::option_option)]
+    struct RecordSni(Mutex<Option<Option<String>>>);
+
+    impl ResolvesServerCert for RecordSni {
+        fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            *self.0.lock().unwrap() = Some(hello.server_name().map(str::to_owned));
+            None
+        }
+    }
+
+    /// What a rustls server makes of `bytes`: `None` if it rejects them
+    /// before choosing a certificate, else the SNI it acts on.
+    #[allow(clippy::option_option)]
+    fn rustls_sni(bytes: &[u8]) -> Option<Option<String>> {
+        let recorder = Arc::new(RecordSni::default());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let cfg = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(recorder.clone());
+        let mut conn = ServerConnection::new(Arc::new(cfg)).unwrap();
+        let mut cursor = bytes;
+        while !cursor.is_empty() {
+            if matches!(conn.read_tls(&mut cursor), Ok(0) | Err(_))
+                || conn.process_new_packets().is_err()
+            {
+                break;
+            }
+        }
+        recorder.0.lock().unwrap().clone()
+    }
+
+    /// The SNI rustls must act on for a hello the sniffer accepted: the
+    /// canonical host roxy keys on, or no name for an IP literal (rustls
+    /// ignores those). `None` when roxy rejects the sniffed name itself and
+    /// so never hands the bytes to rustls.
+    #[allow(clippy::option_option)]
+    fn expected_rustls_sni(info: &ClientHelloInfo) -> Option<Option<String>> {
+        let Some(sni) = &info.sni else {
+            return Some(None);
+        };
+        match parse_host(sni.as_bytes()) {
+            Ok(Host::Dns(name)) => Some(Some(name)),
+            Ok(Host::Ipv4(_) | Host::Ipv6(_)) => Some(None),
+            Err(_) => None,
+        }
+    }
+
+    /// The differential property: whenever the sniffer accepts a hello and
+    /// rustls completes the same hello far enough to choose a certificate,
+    /// they agree on the SNI.
+    fn agrees_with_rustls(buf: &[u8]) -> Result<(), TestCaseError> {
+        if let Sniff::Tls(info) = sniff(buf)
+            && let Some(expected) = expected_rustls_sni(&info)
+            && let Some(got) = rustls_sni(buf)
+        {
+            prop_assert_eq!(got, expected, "sniffed {:?}", info);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn raw_hello_reaches_the_rustls_resolver() {
+        let buf = raw_hello(&[(EXT_SERVER_NAME, &server_name_list(&[(0, b"Example.COM")]))]);
+        let Sniff::Tls(info) = sniff(&buf) else {
+            panic!("not tls");
+        };
+        assert_eq!(info.sni.as_deref(), Some("example.com"));
+        assert_eq!(rustls_sni(&buf), Some(Some("example.com".to_owned())));
+        assert_eq!(
+            rustls_sni(&hello("example.com", &["h2"], true)),
+            Some(Some("example.com".to_owned()))
+        );
+        assert_eq!(rustls_sni(&hello("127.0.0.1", &[], false)), Some(None));
+    }
+
+    #[test]
+    fn second_handshake_message_in_the_record_is_ignored() {
+        let plain = raw_hello(&[(EXT_SERVER_NAME, &server_name_list(&[(0, b"example.com")]))]);
+        let Sniff::Tls(info) = sniff(&plain) else {
+            panic!("not tls");
+        };
+        let mut buf = plain.clone();
+        buf.extend_from_slice(&[HANDSHAKE_CLIENT_HELLO, 0, 0, 1, 0xff]);
+        buf[3..5].copy_from_slice(&be16(plain.len() - RECORD_HEADER + 5));
+        assert_eq!(sniff(&buf), Sniff::Tls(info));
+        assert_eq!(
+            rustls_sni(&buf),
+            None,
+            "rustls requires an aligned handshake"
+        );
+    }
+
+    #[test]
+    fn non_host_name_entry_before_host_name() {
+        let buf = raw_hello(&[(
+            EXT_SERVER_NAME,
+            &server_name_list(&[(1, b"other"), (0, b"example.com")]),
+        )]);
+        let Sniff::Tls(info) = sniff(&buf) else {
+            panic!("not tls");
+        };
+        assert_eq!(info.sni.as_deref(), Some("example.com"));
+        // rustls cannot skip an unknown name type, so it refuses the hello:
+        // the two never disagree on a name here because rustls never acts.
+        assert_eq!(rustls_sni(&buf), None);
+    }
+
+    #[test]
+    fn empty_server_name_list_has_no_sni() {
+        let buf = raw_hello(&[(EXT_SERVER_NAME, &server_name_list(&[]))]);
+        let Sniff::Tls(info) = sniff(&buf) else {
+            panic!("not tls");
+        };
+        assert_eq!(info.sni, None);
+        assert_eq!(rustls_sni(&buf), None);
     }
 
     #[test]
@@ -460,6 +631,56 @@ mod tests {
             if cut < buf.len() {
                 prop_assert_eq!(sniff(&buf[..cut]), Sniff::NeedMore);
             }
+        }
+    }
+
+    fn sni_sample() -> impl Strategy<Value = &'static str> {
+        prop_oneof![
+            Just("example.com"),
+            Just("Sub.Example.ORG"),
+            Just("a-b_c.x1"),
+            Just("127.0.0.1"),
+            Just("[::1]"),
+        ]
+    }
+
+    /// Bytes shaped like a `server_name` list entry's name: host-like
+    /// characters, IP punctuation, and the odd byte of anything.
+    fn name_bytes() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            4 => "[a-zA-Z0-9._:\\[\\]-]{0,40}".prop_map(String::into_bytes),
+            1 => proptest::collection::vec(any::<u8>(), 0..40),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(300))]
+
+        #[test]
+        fn mutated_hellos_agree_with_rustls(
+            sni in sni_sample(),
+            t13 in any::<bool>(),
+            flips in proptest::collection::vec((0usize..1024, any::<u8>()), 0..4),
+        ) {
+            let mut buf = hello(sni, &["h2", "http/1.1"], t13);
+            for (i, v) in flips {
+                if let Some(b) = buf.get_mut(i) {
+                    *b = v;
+                }
+            }
+            agrees_with_rustls(&buf)?;
+        }
+
+        #[test]
+        fn raw_server_name_lists_agree_with_rustls(
+            entries in proptest::collection::vec(
+                (prop_oneof![3 => Just(0u8), 1 => any::<u8>()], name_bytes()),
+                0..3,
+            ),
+        ) {
+            let entries: Vec<(u8, &[u8])> = entries.iter().map(|(t, n)| (*t, n.as_slice())).collect();
+            let buf = raw_hello(&[(EXT_SERVER_NAME, &server_name_list(&entries))]);
+            agrees_with_rustls(&buf)?;
         }
     }
 }
