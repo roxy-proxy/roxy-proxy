@@ -232,16 +232,13 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
         r.map_err(|e| self.fail(e))
     }
 
-    /// [`ReadSide::pump`] while a body is being read, then watches the idle
-    /// socket so a client that closes while its response is pending is
-    /// reported rather than waited for. Bytes that arrive instead (pipelined
-    /// requests) stay buffered and end the watch. Cancel-safe.
-    async fn pump_or_watch(&mut self) -> Result<(), ParseError> {
-        if self.feed.is_some() {
-            self.pump().await?;
-            if !self.buf.is_empty() {
-                return Ok(());
-            }
+    /// Watches the idle socket so a client that closes while its response
+    /// is pending is reported rather than waited for. Bytes that arrive
+    /// instead (pipelined requests), or are already buffered, end the
+    /// watch. Cancel-safe.
+    async fn watch(&mut self) -> Result<(), ParseError> {
+        if !self.buf.is_empty() {
+            return Ok(());
         }
         self.buf.reserve(READ_CHUNK);
         match self.rd.read_buf(&mut self.buf).await {
@@ -820,17 +817,32 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
             return Err(DriveError::Write(e));
         }
         let mut fut = std::pin::pin!(fut);
-        tokio::select! {
-            biased;
-            out = &mut fut => return Ok(out),
-            r = self.r.pump_or_watch() => {
-                if let Err(e) = r {
-                    self.state = State::Broken;
-                    return Err(DriveError::Client(e));
+        if self.r.feed.is_some() {
+            tokio::select! {
+                biased;
+                out = &mut fut => return Ok(out),
+                r = self.r.pump() => {
+                    if let Err(e) = r {
+                        self.state = State::Broken;
+                        return Err(DriveError::Client(e));
+                    }
                 }
             }
         }
-        Ok(fut.await)
+        // The body, if any, is in. `fut` goes first so a consumer that is
+        // done with it completes before an EOF is read as a departure: a
+        // client may half-close once it has sent its whole request.
+        tokio::select! {
+            biased;
+            out = &mut fut => Ok(out),
+            r = self.r.watch() => match r {
+                Err(e) => {
+                    self.state = State::Broken;
+                    Err(DriveError::Client(e))
+                }
+                Ok(()) => Ok(fut.await),
+            }
+        }
     }
 
     fn out_framing(res: &CanonicalResponse, ex: &Exchange) -> OutFraming {
