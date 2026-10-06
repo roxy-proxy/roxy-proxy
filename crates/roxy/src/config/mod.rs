@@ -452,9 +452,14 @@ pub enum SecretSource {
     Env(String),
     /// `{ file: /path }`; one trailing newline is stripped.
     File(PathBuf),
+    /// `{}`: no source in the config; whatever loads the policy supplies
+    /// the value at runtime. `roxy run --config` cannot, so it refuses the
+    /// config.
+    Runtime,
 }
 
-/// YAML shape of [`SecretSource`]: a map with exactly one of `env` / `file`.
+/// YAML shape of [`SecretSource`]: a map with one of `env` / `file`, or
+/// empty.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSecretSource {
@@ -468,7 +473,8 @@ impl TryFrom<RawSecretSource> for SecretSource {
         match (raw.env, raw.file) {
             (Some(env), None) => Ok(Self::Env(env)),
             (None, Some(file)) => Ok(Self::File(file)),
-            _ => Err("a secret must have exactly one of `env` or `file`"),
+            (None, None) => Ok(Self::Runtime),
+            (Some(_), Some(_)) => Err("a secret may have `env` or `file`, not both"),
         }
     }
 }

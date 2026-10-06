@@ -41,6 +41,7 @@ version: 1
 secrets:
   openai: { env: OPENAI_API_KEY }
   gh:     { file: /run/secrets/github_token }   # one trailing newline stripped
+  lease:  {}                                    # supplied at runtime; standalone `run` refuses it
 
 metrics:
   - id: github_writes

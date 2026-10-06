@@ -214,6 +214,7 @@ impl Config {
             let empty = match source {
                 super::SecretSource::Env(var) => var.trim().is_empty(),
                 super::SecretSource::File(path) => path.as_os_str().is_empty(),
+                super::SecretSource::Runtime => false,
             };
             if empty {
                 d.push(Diagnostic::new(

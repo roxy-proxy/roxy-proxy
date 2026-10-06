@@ -168,6 +168,18 @@ fn bad_size_and_duration_rejected() {
     }
 }
 
+/// `{}` names a secret whose value arrives at runtime; it validates like any
+/// other, so a `${secret:..}` reference to it compiles.
+#[test]
+fn sourceless_secret_parses_and_validates() {
+    let cfg = parse(&format!(
+        "{BASE}secrets: {{ lease: {{}} }}\n\
+         rules: [{{ id: r, when: true, then: [{{ set_header: {{ authorization: \"Bearer ${{secret:lease}}\" }} }}, allow] }}]\n"
+    ));
+    assert_eq!(cfg.secrets["lease"], SecretSource::Runtime);
+    cfg.validate().unwrap();
+}
+
 #[test]
 fn unknown_fields_rejected_everywhere() {
     for bad in [
@@ -180,6 +192,8 @@ fn unknown_fields_rejected_everywhere() {
         "upstream: { dns: { resolvers: system } }",
         "secrets: { a: { env: X, file: /y } }",
         "secrets: { a: { vault: X } }",
+        "secrets: { a: null }",
+        "secrets: { a: env }",
         "metrics: [{ id: m, count: requests, every: 1m }]",
         "rules: [{ id: r, then: allow, when_not: true }]",
         "addons: [{ name: a, path: /a.wasm, fuel: 1 }]",

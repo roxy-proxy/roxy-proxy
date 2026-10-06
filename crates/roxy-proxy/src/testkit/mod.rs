@@ -457,7 +457,7 @@ impl KitBuilder {
             policy: PolicyUpdate {
                 policy,
                 secrets: base.secrets.clone(),
-                redactor: base.redactor(),
+                redactor: Redactor::new(),
                 limits: self.limits,
                 flags: self.flags,
                 http: self.http,
@@ -513,10 +513,6 @@ impl PolicyBase {
             address_lists: Arc::new(address_lists),
             deny_lists,
         }
-    }
-
-    fn redactor(&self) -> Redactor {
-        Redactor::new()
     }
 }
 
@@ -832,7 +828,7 @@ impl Kit {
             .reload(PolicyUpdate {
                 policy,
                 secrets: self.base.secrets.clone(),
-                redactor: self.base.redactor(),
+                redactor: Redactor::new(),
                 limits: self.limits.clone(),
                 flags: self.flags.clone(),
                 http: self.http.clone(),

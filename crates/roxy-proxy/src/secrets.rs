@@ -9,7 +9,7 @@
 //! prints only a count.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arc_swap::ArcSwap;
 
@@ -27,13 +27,16 @@ struct State {
 /// scrubs them from logged text.
 pub struct SecretStore {
     state: ArcSwap<State>,
+    /// Serialises writers (a swap racing a reload), so neither loses the
+    /// other's values; readers never take it.
+    write: Mutex<()>,
 }
 
 impl std::fmt::Debug for SecretStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SecretStore")
             .field("secrets", &self.state.load().values.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -64,6 +67,7 @@ impl SecretStore {
                 headers,
                 redactor,
             }),
+            write: Mutex::new(()),
         }
     }
 
@@ -80,27 +84,27 @@ impl SecretStore {
 
     /// Replaces every value, keeping the redacted header names.
     pub(crate) fn swap(&self, values: HashMap<String, String>) {
-        self.state.rcu(|old| {
-            let redactor = redactor(&old.headers, &values, &old.values);
-            State {
-                values: values.clone(),
-                headers: old.headers.clone(),
-                redactor,
-            }
-        });
+        let _w = self.write.lock().unwrap_or_else(PoisonError::into_inner);
+        let old = self.state.load();
+        let redactor = redactor(&old.headers, &values, &old.values);
+        self.state.store(Arc::new(State {
+            values,
+            headers: old.headers.clone(),
+            redactor,
+        }));
     }
 
     /// Replaces every value and the redacted header names together (a
     /// policy reload).
     pub(crate) fn replace(&self, values: HashMap<String, String>, headers: Redactor) {
-        self.state.rcu(|old| {
-            let redactor = redactor(&headers, &values, &old.values);
-            State {
-                values: values.clone(),
-                headers: headers.clone(),
-                redactor,
-            }
-        });
+        let _w = self.write.lock().unwrap_or_else(PoisonError::into_inner);
+        let old = self.state.load();
+        let redactor = redactor(&headers, &values, &old.values);
+        self.state.store(Arc::new(State {
+            values,
+            headers,
+            redactor,
+        }));
     }
 }
 

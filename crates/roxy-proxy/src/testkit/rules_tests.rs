@@ -69,6 +69,70 @@ async fn set_header_injects_a_secret_without_logging_it() {
     assert!(!all.contains(SECRET), "secret leaked into the flow log");
 }
 
+/// A secret swap takes effect on the next request without rebuilding the
+/// snapshot, and the redactor scrubs the replaced value for an exchange
+/// that was in flight across the swap as well as the new one.
+#[tokio::test]
+async fn swapped_secrets_reach_the_next_request_without_a_rebuild() {
+    const OLD: &str = "old-token-value-abcdefghij";
+    const NEW: &str = "new-token-value-0123456789";
+    let kit = Kit::builder()
+        .secret("token", OLD)
+        .rules(
+            r#"
+- id: inject
+  when: host == "up.test"
+  then:
+    - set_header: { authorization: "Bearer ${secret:token}" }
+    - allow
+"#,
+        )
+        .start()
+        .await;
+    let before = kit.server.shared().snapshot();
+
+    // Request 1 is decided (OLD injected) and reaches the upstream, then
+    // waits on its body; its request event is only logged once it ends.
+    let mut c = kit.h1().await;
+    let (tx, body) = streaming_body();
+    let req = c
+        .request("POST", &format!("/p/{OLD}"), &[])
+        .body(body)
+        .unwrap();
+    let pending = c.start(req);
+    let seen = kit.wait_arrived(1).await;
+    assert_eq!(seen[0].headers["authorization"], format!("Bearer {OLD}"));
+
+    kit.server
+        .handle()
+        .swap_secrets([("token".to_owned(), NEW.to_owned())].into());
+    tx.finish().await.unwrap();
+    let a = pending.await.unwrap().unwrap();
+    assert_eq!(a.status, 200, "{a:?}");
+
+    let a = get(&kit, "up.test", &format!("/p/{NEW}")).await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(2).await;
+    assert_eq!(seen[1].headers["authorization"], format!("Bearer {NEW}"));
+
+    let after = kit.server.shared().snapshot();
+    assert!(
+        Arc::ptr_eq(&before, &after),
+        "a secret swap must not rebuild the snapshot"
+    );
+    let events = kit.events("request", 2).await;
+    let paths: Vec<&str> = events
+        .iter()
+        .map(|e| e["req"]["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["/p/[REDACTED]", "/p/[REDACTED]"], "{events:#?}");
+    let all = serde_json::to_string(&kit.sink.events()).unwrap();
+    assert!(
+        !all.contains(OLD) && !all.contains(NEW),
+        "secret leaked into the flow log"
+    );
+}
+
 #[tokio::test]
 async fn rewrite_path_and_query_change_what_leaves() {
     let kit = Kit::builder()
