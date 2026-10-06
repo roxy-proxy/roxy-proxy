@@ -1,6 +1,7 @@
-# The quickstart policy: Claude Code may reach Anthropic's API and sign-in
-# hosts, nothing else, and every model response goes through the sentinel
-# sidecar first. Validate with:
+# The quickstart policy. The client may reach the scripted model and nothing
+# else, and every model call goes through three addons first: the auth gate
+# (who is this?), the token quota (may they still spend?) and the sentinel
+# (is every tool call in the response allowed?). Validate with:
 #   docker run --rm -v ./roxy.yaml:/etc/roxy/roxy.yaml:ro ghcr.io/roxy-proxy/roxy:edge \
 #     check --config /etc/roxy/roxy.yaml
 version: 1
@@ -19,9 +20,37 @@ log:
   flow:
     connection_events: false  # flow log to stdout: `docker compose logs roxy`
 
-# Above the rules: every exchange streams through the sentinel, which judges
-# each tool call in a model response before Claude Code sees it.
+secrets:
+  model_key: { env: MODEL_API_KEY }   # the client never holds it; roxy sets x-api-key
+
+# Above the rules, in this order. Each one is skipped on exchanges its `when`
+# does not match.
 addons:
+  # Who is calling: the credential in x-roxy-auth, checked with the auth
+  # service, becomes a `user:<name>` tag on the flow for the layers below.
+  - name: auth-gate
+    kind: wasm
+    path: /etc/roxy/addons/auth_gate.wasm
+    when: host == "fake-model"
+    capabilities: [endpoints, state, record]
+    endpoints:
+      auth: { url: "http://auth-service:9100/introspect", private_ok: true, timeout: 5s }
+    config: { cache_ttl_secs: 30 }
+
+  # May they spend: asks the quota board before the call leaves, answers a
+  # 429 if not, and reports the tokens the response used once it has
+  # streamed through.
+  - name: token-quota
+    kind: wasm
+    path: /etc/roxy/addons/token_quota.wasm
+    when: host == "fake-model" and method == POST and path == "/v1/messages"
+    capabilities: [endpoints, record]
+    endpoints:
+      quota-check: { url: "http://quota-board:8090/check", private_ok: true, timeout: 5s }
+      quota-report: { url: "http://quota-board:8090/report", private_ok: true, timeout: 5s }
+
+  # Is the response allowed: judges each tool call in a model response
+  # before the client sees it.
   - name: sentinel
     kind: service
     endpoint: sidecar
@@ -35,10 +64,8 @@ addons:
 
 # Anything no rule allows is denied. A matching deny always beats an allow.
 rules:
-  - id: claude-api
-    when: host == "api.anthropic.com"
-    then: allow
-
-  - id: claude-sign-in
-    when: host in ["claude.ai", "claude.com", "platform.claude.com"]
-    then: allow
+  - id: model-api
+    when: host == "fake-model" and path starts_with "/v1/"
+    then:
+      - set_header: { x-api-key: "${secret:model_key}" }
+      - allow: { private_ok: true }   # the model is on the compose network

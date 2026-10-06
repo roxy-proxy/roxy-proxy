@@ -1,61 +1,122 @@
-# roxy quickstart: Claude Code behind roxy and an inspect_sentinel sidecar.
+# roxy quickstart: a chat client behind roxy, with an auth gate, a per-user
+# token quota and an inspect_sentinel sidecar, talking to a scripted model.
+# Nothing here needs an API key or a route out.
 #
-#   docker compose up -d --wait            # roxy on 127.0.0.1:3128, its CA on :3130
-#   curl -fsS http://127.0.0.1:3130/roxy-ca.pem -o roxy-ca.pem
-#   HTTPS_PROXY=http://127.0.0.1:3128 NODE_EXTRA_CA_CERTS=$PWD/roxy-ca.pem \
-#     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 claude
+#   docker compose up -d --build --wait
+#   docker compose run --rm client --user alice --repeat 6
 #
-# Watch the sessions and the sentinel's decisions at http://127.0.0.1:7575.
-#
-# Claude Code honours the proxy variables, but nothing on your machine makes
-# it: this shows what roxy and the sentinel decide, not containment. To
-# contain a workload, give it no route out except through roxy (see the
-# docs: Deploy > Containing a workload).
-#
-# To build roxy from this checkout instead of pulling it, add --build.
+# Quota board: http://127.0.0.1:8090    Inspect View: http://127.0.0.1:7575
+# The proxy is on 127.0.0.1:3128 for a client of your own (see README.md).
 name: roxy-quickstart
 
+# The mock services share this: hardened like the rest, and healthy once
+# /healthz answers on their PORT.
+x-mock: &mock
+  image: roxy-quickstart-mocks
+  build: ./mocks
+  pull_policy: build
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  healthcheck:
+    test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ[\"PORT\"]}/healthz', timeout=2)"]
+    interval: 2s
+    retries: 30
+
 services:
+  # roxy with the two WASM addons (./addons) baked into its image.
   roxy:
-    image: ${ROXY_IMAGE:-ghcr.io/roxy-proxy/roxy:edge}
+    image: roxy-quickstart
     build:
-      context: ../..
+      context: ../..                       # the addons build against crates/roxy-addon
+      dockerfile: examples/quickstart/addons/Dockerfile
+      args:
+        ROXY_IMAGE: ${ROXY_IMAGE:-ghcr.io/roxy-proxy/roxy:edge}
+    pull_policy: build
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    environment:
+      MODEL_API_KEY: fake-model-key        # the secret roxy injects; the client never has it
     volumes:
       - ./roxy.yaml:/etc/roxy/roxy.yaml:ro
-      - roxy-ca:/var/lib/roxy/ca     # keep the CA across restarts
+      - roxy-ca:/var/lib/roxy/ca           # keep the CA across restarts
     ports:
-      - "127.0.0.1:3128:3128"        # the proxy
-      - "127.0.0.1:3130:3130"        # the CA certificate
-    networks: [sidecar, egress]
+      - "127.0.0.1:3128:3128"              # the proxy
+      - "127.0.0.1:3130:3130"              # the CA certificate
+    networks: [lab, sidecar, egress]
     depends_on:
-      sentinel:
-        condition: service_healthy
+      fake-model: { condition: service_healthy }
+      auth-service: { condition: service_healthy }
+      quota-board: { condition: service_healthy }
+      sentinel: { condition: service_healthy }
+
+  # The model: scripted responses from ./mocks/responses.json, in order.
+  fake-model:
+    <<: *mock
+    command: ["python", "fake_model.py"]
+    environment:
+      PORT: 8080
+      MODEL_API_KEY: fake-model-key        # refuses a call roxy did not put the key on
+    networks: [lab]
+
+  # Who a credential belongs to. alice-secret is alice, bob-secret is bob.
+  auth-service:
+    <<: *mock
+    command: ["python", "auth_service.py"]
+    environment:
+      PORT: 9100
+    networks: [lab]
+
+  # Per-user token quota, with a live page. Published on loopback only.
+  quota-board:
+    <<: *mock
+    command: ["python", "quota_board.py"]
+    environment:
+      PORT: 8090
+      QUOTA_TOKENS: ${QUOTA_TOKENS:-600}
+      QUOTA_WINDOW_SECS: ${QUOTA_WINDOW_SECS:-60}
+    ports:
+      - "127.0.0.1:8090:8090"
+    networks: [lab, viewer]
+
+  # The chat client: `docker compose run --rm client --user alice --repeat 6`.
+  # Not started by `up`; it goes through roxy like any client would.
+  client:
+    image: roxy-quickstart-mocks
+    build: ./mocks
+    pull_policy: build
+    entrypoint: ["python", "chat.py"]
+    environment:
+      HTTP_PROXY: http://roxy:3128
+      ANTHROPIC_BASE_URL: http://fake-model:8080
+    networks: [lab]
+    profiles: [client]
+    depends_on:
+      roxy: { condition: service_started }
 
   # The sentinel sidecar (./sentinel): a regex denylist over tool calls.
   # It needs no route out, so it has none.
   sentinel:
     image: roxy-quickstart-sentinel
     build: ./sentinel
-    pull_policy: build               # built here, never pulled
+    pull_policy: build
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     tmpfs: [/tmp]
     environment:
       SENTINEL: policies:deny_regex
-      SENTINEL_DENY:                   # your regex, from the shell; unset = the default
+      SENTINEL_DENY:                       # your regex, from the shell; unset = the default
     volumes:
       - sentinel-logs:/logs
     networks: [sidecar]
 
-  # Inspect's log viewer over the sentinel's log: each Claude Code session,
-  # its model calls and tool calls, and the sentinel's verdict on each.
+  # Inspect's log viewer over the sentinel's log: each client session, its
+  # model calls and tool calls, and the sentinel's verdict on each.
   inspect-view:
     image: roxy-quickstart-sentinel
-    build: ./sentinel                # the sentinel's image; built once, cached
+    build: ./sentinel                      # the sentinel's image; built once, cached
     pull_policy: build
     # Unauthenticated, so published on the host's loopback only.
     command:
@@ -87,9 +148,11 @@ services:
         condition: service_healthy
 
 networks:
+  lab:
+    internal: true                         # roxy and the mocks; no route out
   sidecar:
-    internal: true                   # roxy and the sentinel only; no route out
-  egress: {}
+    internal: true                         # roxy and the sentinel only
+  egress: {}                               # roxy's published ports need a non-internal network
   viewer: {}
 
 volumes:

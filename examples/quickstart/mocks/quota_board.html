@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>roxy quota board</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --surface: #fcfcfb; --surface-2: #f0efec;
+    --text: #0b0b0b; --text-2: #52514e;
+    --fill: #2a78d6; --over: #e34948;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --surface: #1a1a19; --surface-2: #383835; --text: #ffffff; --text-2: #c3c2b7; --fill: #3987e5; --over: #e66767; }
+  }
+  body { margin: 0; padding: 2rem; background: var(--surface); color: var(--text);
+         font: 15px/1.5 system-ui, sans-serif; }
+  h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
+  p  { margin: 0 0 1.5rem; color: var(--text-2); }
+  table { border-collapse: collapse; width: 100%; max-width: 56rem; }
+  th, td { text-align: left; padding: .5rem .75rem; border-bottom: 1px solid var(--surface-2); }
+  th { font-weight: 600; color: var(--text-2); font-size: .85rem; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .bar { position: relative; height: 6px; background: var(--surface-2); border-radius: 3px; min-width: 12rem; }
+  .bar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; background: var(--fill); }
+  .over .bar i { background: var(--over); }
+  .status { font-size: .85rem; color: var(--text-2); white-space: nowrap; }
+  .over .status { color: var(--over); font-weight: 600; }
+  .empty { color: var(--text-2); padding: 1rem 0; }
+</style>
+<h1>Quota board</h1>
+<p id="limit">…</p>
+<table>
+  <thead><tr><th>user</th><th>tokens used</th><th></th><th class="num">requests</th><th class="num">refused</th><th class="num">resets in</th><th>status</th></tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<div id="empty" class="empty">No calls yet. Run the client and watch this fill in.</div>
+<script>
+  const rows = document.getElementById("rows");
+  const empty = document.getElementById("empty");
+  const limit = document.getElementById("limit");
+  const es = new EventSource("/events");
+  es.onmessage = (e) => {
+    const snap = JSON.parse(e.data);
+    limit.textContent = `${snap.limit} tokens per user per ${snap.window}s window. Live; nothing is stored.`;
+    empty.hidden = snap.users.length > 0;
+    rows.replaceChildren(...snap.users.map((u) => {
+      const tr = document.createElement("tr");
+      if (!u.allowed) tr.className = "over";
+      const pct = Math.min(100, 100 * u.used / u.limit);
+      tr.innerHTML = `
+        <td>${u.user}</td>
+        <td class="num">${u.used} / ${u.limit}</td>
+        <td><div class="bar"><i style="width:${pct}%"></i></div></td>
+        <td class="num">${u.requests}</td>
+        <td class="num">${u.refused}</td>
+        <td class="num">${u.resets_in}s</td>
+        <td class="status">${u.allowed ? "✓ within quota" : "✕ over quota"}</td>`;
+      return tr;
+    }));
+  };
+</script>

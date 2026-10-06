@@ -1,0 +1,32 @@
+[
+  {
+    "content": [
+      {"type": "text", "text": "Hello from the scripted model. Every response you see here comes from responses.json, in order, so a run is the same every time. Ask me to do something and I will reach for a tool."}
+    ],
+    "stop_reason": "end_turn",
+    "output_tokens": 48
+  },
+  {
+    "content": [
+      {"type": "text", "text": "Let me list the working directory first."},
+      {"type": "tool_use", "id": "toolu_fake_0001", "name": "Bash", "input": {"command": "ls -la"}}
+    ],
+    "stop_reason": "tool_use",
+    "output_tokens": 61
+  },
+  {
+    "content": [
+      {"type": "text", "text": "I will fetch that page for you."},
+      {"type": "tool_use", "id": "toolu_fake_0002", "name": "Bash", "input": {"command": "curl -s https://example.com"}}
+    ],
+    "stop_reason": "tool_use",
+    "output_tokens": 57
+  },
+  {
+    "content": [
+      {"type": "text", "text": "Here is a longer answer, to use up more of the quota. roxy sits between this client and the model: the auth gate checked who you are, the token quota layer asked whether you may still spend, the sentinel judged any tool call in this response, and the rules decided whether the request could leave at all. The quota board shows what each user has used in the current window, and resets it when the window ends."}
+    ],
+    "stop_reason": "end_turn",
+    "output_tokens": 124
+  }
+]

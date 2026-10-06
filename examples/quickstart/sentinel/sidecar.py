@@ -32,7 +32,7 @@ Configuration (environment):
                              that ask one (e.g. anthropic/claude-haiku-4-5)
     SENTINEL_LISTEN          host:port to listen on (default 127.0.0.1:9000)
     SENTINEL_LOG_DIR         where the Inspect log goes (default /logs)
-    SENTINEL_TASK            the agent's name, for `context.task` and the log
+    SENTINEL_TASK            the agent's name, for the Inspect log
 """
 
 from __future__ import annotations
@@ -439,18 +439,8 @@ class Sidecar:
         tool_calls = output.message.tool_calls or []
         if not tool_calls:
             return None
-        first_user = next((m for m in input if m.role == "user"), None)
-        context = Context(
-            task=os.environ.get("SENTINEL_TASK", "roxy"),
-            task_description=None,
-            sample_id=None,
-            epoch=None,
-            sample_description=None,
-            sample_input=first_user.text if first_user else "",
-            metadata={"roxy": ex.flow, "url": ex.request.url},
-            path="",
-            host=self.host,
-        )
+        # No eval: a proxy has no task, sample or epoch to give a sentinel.
+        context = Context(path="", host=self.host, eval=None)
         host_context = HostContext(
             context=context,
             recorder=InspectRecorder(self.inspect_log),

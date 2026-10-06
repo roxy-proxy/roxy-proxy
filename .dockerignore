@@ -5,6 +5,8 @@
 !crates/
 !wit/
 !docker/roxy.yaml
+# The quickstart's addons build against crates/roxy-addon from the same context.
+!examples/quickstart/addons/
 # rust-toolchain.toml is left out on purpose: inside the build image it would
 # make rustup download "stable" instead of using the pinned image's toolchain.
 **/target/
