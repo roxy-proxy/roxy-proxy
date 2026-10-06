@@ -22,7 +22,7 @@ testkit = [
 ]
 
 [dependencies]
-base64 = "0.22.1"
+base64 = "0.23.1"
 chrono.workspace = true
 flate2 = "1.1.5"
 rcgen.workspace = true
