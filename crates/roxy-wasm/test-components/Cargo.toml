@@ -12,7 +12,7 @@ publish = false
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-wit-bindgen = { version = "0.57.1", default-features = false, features = ["macros", "realloc", "std"] }
+wit-bindgen = { version = "0.62.0", default-features = false, features = ["macros", "realloc", "std"] }
 
 [profile.release]
 opt-level = "s"
