@@ -122,10 +122,14 @@ enrol. The response has the same shape as the enrolment response, and
 `node_id` is unchanged. The old certificate stays valid until its own
 `not_after`; the node switches to the new one on receipt.
 
-A renewal that fails for any reason is retried with backoff. If the
-certificate expires before a renewal succeeds, the node can no longer fetch
-leases, its lease runs down, and it denies everything. That is the intended
-failure: a node the control plane will not renew stops serving.
+A renewal the control plane cannot answer (`5xx`, timeout, connection or
+TLS error) is retried with backoff. A `410` is terminal, as in the
+[errors table](/reference/node-protocol#errors). A `401`, `426` or other
+`4xx` is logged once and ends renewal: the certificate serves until its
+`not_after`. If the certificate expires before a renewal succeeds, the node
+can no longer fetch leases, its lease runs down, and it denies everything.
+That is the intended failure: a node the control plane will not renew stops
+serving.
 
 ## Lease
 
