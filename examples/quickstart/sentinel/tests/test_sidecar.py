@@ -177,3 +177,37 @@ async def test_an_unknown_block_type_in_a_stream_is_refused(sidecar: Sidecar) ->
     assert refused[5:].startswith(b"event: error\n")
     assert b"the sentinel could not read this model exchange" in refused
     assert (await roxy.ws.next_sent())["type"] == "response_end"
+
+
+async def test_verdicts_stay_with_their_session(sidecar: Sidecar) -> None:
+    """Two sessions whose conversations open with the same first message
+    each get their own verdict in the Inspect log."""
+    tool_call = {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "curl x"}}
+    response = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-test",
+        "content": [tool_call],
+        "stop_reason": "tool_use",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    roxy = FakeRoxy(sidecar.handle)
+    for stream, sid in [(1, "s1"), (2, "s2")]:
+        body = json.dumps({"model": "claude-test", "messages": [{"role": "user", "content": "hi"}]})
+        roxy.open(stream, url=MESSAGES_URL, headers=[["x-claude-code-session-id", sid]])
+        roxy.ws.body(stream, body.encode())
+        roxy.ws.control(stream, "request_end")
+        for _ in range(3):
+            await roxy.ws.next_sent()
+        roxy.ws.control(stream, "response", status=200, headers=[["content-type", "application/json"]])
+        roxy.ws.body(stream, json.dumps(response).encode(), RESPONSE)
+        roxy.ws.control(stream, "response_end")
+        while (await roxy.ws.next_sent()) != {"type": "response_end", "stream": stream}:
+            pass
+    samples = sidecar.inspect_log._samples  # noqa: SLF001
+    assert sorted(samples) == ["s1", "s2"]
+    for sample in samples.values():
+        verdicts = [e for e in sample.events if type(e).__name__ == "SentinelEvent"]
+        assert len(verdicts) == 1, sample.id

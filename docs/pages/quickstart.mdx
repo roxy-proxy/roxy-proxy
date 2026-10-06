@@ -1,19 +1,19 @@
 ---
 title: "Quickstart"
-description: "Run Claude Code through roxy and an inspect_sentinel sidecar that blocks tool calls matching a denylist."
+description: "Watch generated traffic go through roxy with an auth gate, a per-user token quota and an inspect_sentinel sidecar, against a scripted model."
 ---
 
 import inspectView from "../assets/quickstart-inspect-view.png";
+import stack from "../assets/quickstart-stack.svg";
 
 # Quickstart
 
-Run Claude Code through roxy, with an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar that judges every tool call before Claude Code sees it. By the end, Claude Code works as usual, except that tool calls matching a denylist are blocked, and every request it makes is in roxy's flow log. The setup is [`examples/quickstart`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/quickstart) in the roxy repo.
+Run clients through roxy with three controls on every model call: a WASM addon that authenticates the client with a central auth service, a WASM addon that holds each user to a token quota kept by a quota service, and an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar that blocks tool calls matching a denylist. The model is a scripted stand-in and the traffic is generated, so the stack needs no API key and no route out: start it and watch. The setup is [`examples/quickstart`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/quickstart) in the roxy repo.
 
 ## Prerequisites
 
 - Docker with Docker Compose
 - Git
-- [Claude Code](https://code.claude.com/docs/en/overview), signed in or with `ANTHROPIC_API_KEY` set
 
 ::::steps
 ### Clone the repo
@@ -23,68 +23,74 @@ git clone https://github.com/roxy-proxy/roxy-proxy.git
 cd roxy-proxy/examples/quickstart
 ```
 
-### Start roxy and the sentinel
+### Start the stack
 
 ```sh
-docker compose up -d --wait
+docker compose up --build --attach traffic
 ```
 
-The first run builds the sentinel image, which takes a minute or two. Three containers start:
+The first run builds the images, which takes a few minutes: the two addons compile to WebAssembly inside roxy's image, and the sentinel's image installs inspect_sentinel. Seven containers start, and only the last one's output is shown:
 
-- **roxy**: the proxy on `127.0.0.1:3128`. It generates its CA on first start and serves the certificate on `127.0.0.1:3130`.
-- **sentinel**: the inspect_sentinel sidecar, on a network with no route out. Every exchange streams through it. It runs a denylist over tool calls.
-- **inspect-view**: Inspect's log viewer on `127.0.0.1:7575`, showing each Claude Code session and the sentinel's verdict on every tool call.
+- **roxy**: the proxy on `127.0.0.1:3128`, with the two addons at `/etc/roxy/addons/`.
+- **fake-model**: the model. It answers `POST /v1/messages` from [`responses.json`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/mocks/responses.json), one entry per call in order, streamed or whole, with the `usage` the real API sends. It refuses a request without the API key, which only roxy has.
+- **auth-service**: which credential belongs to whom. `alice-secret` is alice and `bob-secret` is bob.
+- **quota-board**: the quota service, with a live page on `127.0.0.1:8090`. Each user has a bucket of 600 tokens that refills at five a second.
+- **sentinel**: the inspect_sentinel sidecar, on a network with no route out. Every model response streams through it.
+- **inspect-view**: Inspect's log viewer on `127.0.0.1:7575`, showing each client session and the sentinel's verdict on every tool call.
+- **traffic**: the clients. Alice calls every six seconds, bob every twenty, and mallory, whose credential is unknown, every thirty.
 
-### Trust roxy's CA
+Ctrl-C stops the stack; `docker compose down -v` removes it.
 
-roxy terminates TLS with certificates from its own CA, so Claude Code has to trust that CA:
+### Watch the traffic
+
+Each client is the Anthropic SDK, pointed at the model through roxy, with its credential in an `x-roxy-auth` header; each call is one streamed `POST /v1/messages`. The scripted responses go by: a greeting, a `Bash` tool call that runs `ls -la`, then one that runs `curl`, which comes back as
+
+```
+traffic-1  | [alice #2] I will fetch that page for you. roxy's sentinel blocked a Bash tool call (denylist match: 'curl').
+```
+
+The sentinel saw the tool call before the client did, took it out, and put a note in its place. Mallory never gets that far:
+
+```
+traffic-1  | [mallory #1] 401 AuthenticationError: credential refused by the auth service
+```
+
+And within the first minute alice has drained her bucket, and her calls stop reaching the model until it refills:
+
+```
+traffic-1  | [alice #8] 429 RateLimitError: token bucket empty (600 tokens, refills 5/s); try again in 15s
+```
+
+### Watch the quota board
+
+Open [http://127.0.0.1:8090](http://127.0.0.1:8090). It shows each user's bucket, live, and the last five minutes of levels: alice's drains faster than it refills, bottoms out, and is refused until it climbs back above zero, while bob's barely moves. The quota is per user, and the user is whoever the auth gate said.
+
+To make a call of your own, from another terminal:
 
 ```sh
-curl -fsS http://127.0.0.1:3130/roxy-ca.pem -o roxy-ca.pem
+docker compose run --rm client --user bob
+docker compose run --rm client --user mallory --secret wrong
 ```
-
-### Run Claude Code through roxy
-
-```sh
-HTTPS_PROXY=http://127.0.0.1:3128 \
-NODE_EXTRA_CA_CERTS=$PWD/roxy-ca.pem \
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-claude
-```
-
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` turns off telemetry and error reporting, whose hosts the policy doesn't allow.
-
-### Ask for something the denylist blocks
-
-Ask Claude to fetch a page with curl:
-
-```
-> Use curl to fetch https://example.com
-```
-
-The model answers with a Bash tool call that runs `curl`. The sentinel sees it before Claude Code does, takes the tool call out, and puts a note in its place:
-
-```
-roxy's sentinel blocked a Bash tool call (denylist match: 'curl').
-```
-
-Claude Code never ran the command. Its turn ends, and you can carry on. Tool calls that don't match work as usual.
 
 ### Watch it in Inspect View
 
-Open [http://127.0.0.1:7575](http://127.0.0.1:7575). Each Claude Code session is a sample, grouped by the `X-Claude-Code-Session-Id` header Claude Code sends, so a subagent's calls appear in the same sample as the chat that started it. Its transcript shows every model call, the tool calls the model asked for, and the sentinel's verdict under each one: `Continued`, or `Rejected` with the reason. Reload the page to see new calls.
+Open [http://127.0.0.1:7575](http://127.0.0.1:7575). Each client is a sample, grouped by the `X-Claude-Code-Session-Id` header it sends. Its transcript shows every model call, the tool calls the model asked for, and the sentinel's verdict under each one: `Continued`, or `Rejected` with the reason. Reload the page to see new calls.
 
-<img src={inspectView} alt="Inspect View: Claude Code's curl tool call, and the sentinel's rejection under it" />
+<img src={inspectView} alt="Inspect View: a curl tool call, and the sentinel's rejection under it" />
 
 ### Read roxy's flow log
+
+From another terminal:
 
 ```sh
 docker compose logs roxy
 ```
 
-roxy's flow log has a line for every request Claude Code made, model calls or not, with the rule and the addons each one went through. Each sample in Inspect View lists the flow ids of its model calls (Metadata tab), so the two join. To keep whole requests and responses too, turn on [capture](/operate/flow-log#capture).
+roxy's flow log has a line for every request, with the rule it matched, the addons it went through in order (`"addons":["auth-gate","token-quota","sentinel"]`), the `user:alice` tag the auth gate set, and the `set_header:x-api-key` mutation the rule made. Each addon's own events are there too: `endpoint_call` for every call to the auth service and the quota board, and `layer_record` for the verdicts and the usage reports. To keep whole requests and responses too, turn on [capture](/operate/flow-log#capture).
 
 ### Clean up
+
+Ctrl-C in the terminal running `up`, then:
 
 ```sh
 docker compose down -v
@@ -94,54 +100,93 @@ docker compose down -v
 
 ## What just happened
 
-### Two layers
+### Three layers above the rules
 
-roxy decides by **host**. The policy allows Anthropic's API and sign-in hosts and denies everything else. That covers everything Claude Code sends through the proxy, not only its model calls: the commands it runs (a `curl` that got past the sentinel, `git`, `npm`) and WebFetch get a `403` from roxy for any other host.
+An exchange passes through the [addons](/addons/overview) in the order `roxy.yaml` lists them, and then the rules. Each addon wraps everything below it.
 
-The sentinel decides by **content**. It is a [service layer](/addons/service-layers): an addon that every exchange streams through, above the rules. It judges only Anthropic Messages calls (`POST …/v1/messages`), and passes every other request through untouched for the rules to decide. For each model response, it turns every tool call into an inspect_sentinel `BeforeToolCall` step and runs the configured sentinel on it. Whatever it passes on, roxy's rules judge again.
+<img src={stack} alt="A model call from the client passes through the auth gate, the token quota and the sentinel, then the rules and the connector, to the fake model; each layer calls its own service, and the flow log records the exchange" />
 
 ```yaml
 addons:
+  - name: auth-gate
+    kind: wasm
+    path: /etc/roxy/addons/auth_gate.wasm
+    when: host == "fake-model"
+    capabilities: [endpoints, state, record]
+    endpoints:
+      auth: { url: "http://auth-service:9100/introspect", private_ok: true, timeout: 5s }
+    config: { cache_ttl_secs: 30 }
+
+  - name: token-quota
+    kind: wasm
+    path: /etc/roxy/addons/token_quota.wasm
+    when: host == "fake-model" and method == POST and path == "/v1/messages"
+    capabilities: [endpoints, record]
+    endpoints:
+      quota-check: { url: "http://quota-board:8090/check", private_ok: true, timeout: 5s }
+      quota-report: { url: "http://quota-board:8090/report", private_ok: true, timeout: 5s }
+
   - name: sentinel
     kind: service
     endpoint: sidecar
     endpoints:
       sidecar: { url: "http://sentinel:9000/", private_ok: true }
     limits:
-      first_byte_timeout: 120s  # how long the sentinel has to decide (or start forwarding) before roxy denies the exchange
+      first_byte_timeout: 120s
 
 rules:
-  - id: claude-api
-    when: host == "api.anthropic.com"
-    then: allow
-
-  - id: claude-sign-in
-    when: host in ["claude.ai", "claude.com", "platform.claude.com"]
-    then: allow
+  - id: model-api
+    when: host == "fake-model" and path starts_with "/v1/"
+    then:
+      - set_header: { x-api-key: "${secret:model_key}" }
+      - allow: { private_ok: true }
 ```
 
 The full policy is [`roxy.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/roxy.yaml).
+
+**The auth gate** ([`addons/auth-gate`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/addons/auth-gate/src/lib.rs)) reads the client's credential from `x-roxy-auth` and asks the auth service who it belongs to, through a [named endpoint](/addons/host-services#endpoints-endpoints): the layer says `auth`, roxy picks the URL. It caches the answer in the layer's [state store](/addons/host-services#state-state) under a hash of the credential, so the store never holds the credential itself, then tags the flow `user:alice`, strips the header and passes the request on. A missing or refused credential is answered with a `401` here; the request never leaves. The tag is how one layer hands an identity to the next: roxy's own notion of a principal is the client IP, listener and SNI, and a layer below sees the tags of the layers above.
+
+Putting a secret in a header and having roxy swap it for the real one is the simple case, and the rule does that for the API key with `set_header` and a [secret](/policies/secrets). The auth gate is for when authentication takes a round trip: here a lookup of a fixed string, in a real deployment the validation of a signed token.
+
+**The token quota** ([`addons/token-quota`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/addons/token-quota/src/lib.rs)) runs only on model calls. Before the call leaves it asks the quota board whether the user's bucket holds anything; the user is the `user:` tag if a layer above set one, else the client IP, so the layer also works alone. A refusal is answered with a `429` and a `retry-after`, in the shape the Anthropic SDK expects. Otherwise it passes the call on and reads the response as it streams through: `input_tokens` from `message_start`, the running `output_tokens` from `message_delta`, changing nothing. When the stream ends it reports them, and the board takes them out of the bucket. A call's usage is only known once its response has arrived, so the check is whether the bucket holds anything, not whether it holds enough: a user can overrun by one call, the bucket goes into debt, and the next call waits for the refill. That is the trade the layer makes on purpose. Cutting a response partway through would leave the client with half an answer and still cost the tokens. Both calls are endpoints.
+
+**The sentinel** is a [service layer](/addons/service-layers): an out-of-process addon that each exchange streams through over a WebSocket. For each model response it turns every tool call into an inspect_sentinel `BeforeToolCall` step and runs the configured sentinel on it. It sits below the quota layer, so what the quota layer meters is what the client got. Whatever any layer passes on, roxy's rules judge again, and the rules decide by host: the model and nothing else.
+
+### Failure is closed
+
+Each layer fails the exchange when it cannot do its job: the auth service unreachable, the quota board answering something that is not an allowance, the sentinel unable to read a response. roxy answers a `503` naming the layer, and the flow log records a `layer_error`. There is no "on error, pass". Stop the quota board (`docker compose stop quota-board`) and watch the traffic to see it.
 
 ### The denylist
 
 The sentinel runs `deny_regex` from [`policies.py`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/sentinel/policies.py). It searches `<tool name> <arguments as JSON>` for a regular expression. The default catches `curl`, `wget`, `nc`, `ncat`, `ssh`, `scp`, `rsync` and `rm -rf`. Set your own with `SENTINEL_DENY`:
 
 ```sh
-SENTINEL_DENY='\bgit\s+push\b|\bnpm\s+publish\b' docker compose up -d --wait
+SENTINEL_DENY='\bls\b' docker compose up --attach traffic
 ```
 
 Any inspect_sentinel monitor or protocol works in its place, including ones that ask a model: set `SENTINEL` to its `module:attribute`, and for one that asks a model, `SENTINEL_MONITOR_MODEL` and a route out (add the `sentinel` service to the `egress` network). The sidecar is in [`sentinel/`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/quickstart/sentinel).
 
-### What a blocked call looks like
+### Using it with a real client
 
-A response with a blocked tool call reaches Claude Code as an ordinary assistant message that ends the turn, not as an API error. The sentinel holds each streamed response until it has judged it. It sends the start of the response at once, then keep-alive pings until it has the whole response and the sentinel has decided, so Claude Code doesn't time out however long a model-backed sentinel takes. The content arrives in one burst rather than token by token.
+Any HTTP client that honours `HTTP_PROXY` can take the client's place; the proxy is on `127.0.0.1:3128`. Claude Code works against the scripted model with its base URL and the credential header set:
+
+```sh
+HTTP_PROXY=http://127.0.0.1:3128 \
+ANTHROPIC_BASE_URL=http://fake-model:8080 \
+ANTHROPIC_API_KEY=placeholder \
+ANTHROPIC_CUSTOM_HEADERS='x-roxy-auth: alice-secret' \
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+claude
+```
+
+The scripted answers will not make much sense of your prompts, but every call goes through the same three layers. To point the stack at the real API instead, allow `api.anthropic.com` in the rules, set the real key as the `model_key` secret, and trust roxy's CA (`http://127.0.0.1:3130/roxy-ca.pem`) in the client, since roxy then terminates TLS.
 
 ### This is not containment
 
-Claude Code follows `HTTPS_PROXY` because it chooses to. The commands it runs inherit the variable, but any process can ignore it. This quickstart shows what roxy and the sentinel decide, not a boundary. To contain an agent, run it where its only route out is roxy: see [containing a workload](/deploy/overview).
+The client follows `HTTP_PROXY` because it chooses to; any process can ignore it. This quickstart shows what roxy and its addons decide, not a boundary. To contain an agent, run it where its only route out is roxy: see [containing a workload](/deploy/overview).
 
 ## Next steps
 
+- **Write an addon.** [Writing addons](/addons/writing) covers the `roxy-addon` SDK the two addons here use.
 - **Contain the agent.** [Containing a workload](/deploy/overview) has the network recipe and a Compose layout.
-- **Hold the API key in roxy.** With [secrets](/policies/secrets), roxy sets `x-api-key` on the way out, and the agent only holds a placeholder.
 - **Write your own policy.** [How policies work](/policies/overview) explains how rules are evaluated.

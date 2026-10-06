@@ -1,0 +1,16 @@
+[package]
+name = "auth-gate"
+description = "roxy addon: authenticates the client with a central auth service and tags the flow with its user"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+roxy-addon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"

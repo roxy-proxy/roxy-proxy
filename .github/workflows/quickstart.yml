@@ -1,17 +1,22 @@
 name: Quickstart
 
-# The quickstart's sentinel sidecar is Python, outside the Rust workspace
-# that ci.yml tests, so its tests (including the fail-closed cases) run
-# here when the example changes.
+# The quickstart is outside the Rust workspace that ci.yml tests: its
+# addons are their own workspace, and the sentinel sidecar and mocks are
+# Python. Their checks run here when the example changes, and the stack is
+# run end to end.
 on:
   push:
     branches: [main]
     paths:
       - examples/quickstart/**
+      - crates/roxy-addon/**
+      - .dockerignore
       - .github/workflows/quickstart.yml
   pull_request:
     paths:
       - examples/quickstart/**
+      - crates/roxy-addon/**
+      - .dockerignore
       - .github/workflows/quickstart.yml
 
 permissions:
@@ -35,3 +40,38 @@ jobs:
           cache-dependency-path: examples/quickstart/sentinel/requirements.txt
       - run: pip install -r requirements.txt pytest pytest-asyncio
       - run: pytest
+
+  addons:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: examples/quickstart/addons
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: examples/quickstart/addons
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings -W clippy::pedantic
+      - run: cargo test --locked
+      - run: cargo build --release --locked --target wasm32-wasip2
+
+  stack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: examples/quickstart/smoke.sh
+      - if: failure()
+        run: docker compose logs
+        working-directory: examples/quickstart

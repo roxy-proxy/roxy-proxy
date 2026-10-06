@@ -1,0 +1,15 @@
+[package]
+name = "token-quota"
+description = "roxy addon: checks a per-user token quota before each model call and reports the tokens it used"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+roxy-addon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
