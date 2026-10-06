@@ -179,9 +179,17 @@ pub fn encode_flow_batch(
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"{\"node_id\":");
-    out.extend_from_slice(serde_json::to_string(node_id).unwrap_or_default().as_bytes());
+    out.extend_from_slice(
+        serde_json::to_string(node_id)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     out.extend_from_slice(b",\"lease_id\":");
-    out.extend_from_slice(serde_json::to_string(lease_id).unwrap_or_default().as_bytes());
+    out.extend_from_slice(
+        serde_json::to_string(lease_id)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     out.extend_from_slice(format!(",\"seq_first\":{seq_first},\"events\":[").as_bytes());
     for (i, event) in events.into_iter().enumerate() {
         if i > 0 {
@@ -257,8 +265,9 @@ mod tests {
         assert_eq!(batch.seq_first, 7);
         assert_eq!(batch.events.len(), 2);
         assert_eq!(batch.events[1]["b"], "x");
-        let empty: FlowBatch = serde_json::from_slice(&encode_flow_batch("n", "l", 0, Vec::<&[u8]>::new())).unwrap();
-        assert!(empty.events.is_empty());
+        let empty: FlowBatch =
+            serde_json::from_slice(&encode_flow_batch("n", "l", 0, Vec::<&[u8]>::new())).unwrap();
+        assert_eq!(empty.events.len(), 0);
     }
 
     #[test]

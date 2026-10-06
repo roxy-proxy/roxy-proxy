@@ -66,11 +66,11 @@ pub fn cert_info(chain_pem: &str) -> Result<CertInfo, IdentityError> {
     let node_id = san
         .into_iter()
         .flat_map(|ext| ext.value.general_names.iter())
-        .find_map(|name| match name {
-            x509_parser::extensions::GeneralName::URI(uri) => {
-                uri.strip_prefix(NODE_ID_URI_PREFIX).map(str::to_owned)
-            }
-            _ => None,
+        .find_map(|name| {
+            let x509_parser::extensions::GeneralName::URI(uri) = name else {
+                return None;
+            };
+            uri.strip_prefix(NODE_ID_URI_PREFIX).map(str::to_owned)
         })
         .ok_or(IdentityError::NoNodeId)?;
     Ok(CertInfo { node_id, not_after })

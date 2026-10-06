@@ -147,7 +147,12 @@ impl StateDir {
 
     /// Writes through a temporary file and a rename, so a reader never sees
     /// a partial file and a crash leaves the old one.
-    fn write(&self, name: &str, contents: &[u8], #[allow(unused)] mode: u32) -> Result<(), StateError> {
+    fn write(
+        &self,
+        name: &str,
+        contents: &[u8],
+        #[allow(unused)] mode: u32,
+    ) -> Result<(), StateError> {
         use std::io::Write as _;
         let path = self.file(name);
         let tmp = self.file(&format!(".{name}.tmp"));

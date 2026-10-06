@@ -181,10 +181,7 @@ impl ControlPlane {
 
     fn endpoint(&self, name: &str) -> Url {
         let mut url = self.base.clone();
-        let path = format!(
-            "{}{PREFIX}/{name}",
-            url.path().trim_end_matches('/')
-        );
+        let path = format!("{}{PREFIX}/{name}", url.path().trim_end_matches('/'));
         url.set_path(&path);
         url
     }
@@ -228,9 +225,7 @@ impl ControlPlane {
         &self,
         req: reqwest::RequestBuilder,
     ) -> Result<CertificateResponse, CertificateError> {
-        let (status, body) = send(req)
-            .await
-            .map_err(CertificateError::Failed)?;
+        let (status, body) = send(req).await.map_err(CertificateError::Failed)?;
         if status.is_success() {
             return serde_json::from_slice(&body).map_err(|e| {
                 CertificateError::Failed(Transient(format!("certificate response: {e}")))
@@ -365,7 +360,7 @@ fn describe(e: reqwest::Error) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::protocol::{FlowSettings, OnHighWater, PolicyState};
     use crate::testkit::{MockServer, Reply};
@@ -399,7 +394,7 @@ mod tests {
             refresh_after_seconds: 60,
             config_hash: crate::protocol::sha256_hex(config.as_bytes()),
             config,
-            secrets: Default::default(),
+            secrets: std::collections::BTreeMap::default(),
             secrets_hash: "sha256:none".into(),
             state_epoch: "e1".into(),
             flow: FlowSettings {
@@ -443,7 +438,12 @@ mod tests {
         assert_eq!(enrol.header("authorization"), Some("Bearer tok"));
         assert_eq!(enrol.client, None, "no client certificate yet");
         let body = enrol.json();
-        assert!(body["csr"].as_str().unwrap().contains("CERTIFICATE REQUEST"));
+        assert!(
+            body["csr"]
+                .as_str()
+                .unwrap()
+                .contains("CERTIFICATE REQUEST")
+        );
         assert_eq!(body["protocol_version"], "1");
         assert_eq!(body["features"][0], "valid_until");
 
@@ -494,16 +494,20 @@ mod tests {
         let mock = MockServer::start().await;
         let (cp, _) = enrolled(&mock).await;
         let path = "/roxy/v1/lease";
-        mock.push(path, Reply::json(200, &lease("L2")).with_header("etag", "\"e2\""));
-        match cp.fetch_lease(&state(), None).await {
-            LeaseFetch::Lease(l, etag) => {
-                assert_eq!(l.lease_id, "L2");
-                assert_eq!(etag.as_deref(), Some("\"e2\""));
-            }
-            other => panic!("{other:?}"),
-        }
+        mock.push(
+            path,
+            Reply::json(200, &lease("L2")).with_header("etag", "\"e2\""),
+        );
+        let LeaseFetch::Lease(l, etag) = cp.fetch_lease(&state(), None).await else {
+            panic!("expected a lease");
+        };
+        assert_eq!(l.lease_id, "L2");
+        assert_eq!(etag.as_deref(), Some("\"e2\""));
         mock.push(path, Reply::status(410));
-        assert!(matches!(cp.fetch_lease(&state(), None).await, LeaseFetch::Revoked));
+        assert!(matches!(
+            cp.fetch_lease(&state(), None).await,
+            LeaseFetch::Revoked
+        ));
         mock.push(
             path,
             Reply::Status {
@@ -522,9 +526,15 @@ mod tests {
             LeaseFetch::Unauthorized
         ));
         mock.push(path, Reply::status(500));
-        assert!(matches!(cp.fetch_lease(&state(), None).await, LeaseFetch::Failed(_)));
+        assert!(matches!(
+            cp.fetch_lease(&state(), None).await,
+            LeaseFetch::Failed(_)
+        ));
         mock.push(path, Reply::Hangup);
-        assert!(matches!(cp.fetch_lease(&state(), None).await, LeaseFetch::Failed(_)));
+        assert!(matches!(
+            cp.fetch_lease(&state(), None).await,
+            LeaseFetch::Failed(_)
+        ));
         mock.push(
             path,
             Reply::Status {
@@ -562,7 +572,8 @@ mod tests {
         let mock = MockServer::start().await;
         let (cp, _) = enrolled(&mock).await;
         let path = "/roxy/v1/flows";
-        let body = crate::protocol::encode_flow_batch("node-1", "L1", 5, [r#"{"seq":5}"#, r#"{"seq":6}"#]);
+        let body =
+            crate::protocol::encode_flow_batch("node-1", "L1", 5, [r#"{"seq":5}"#, r#"{"seq":6}"#]);
         mock.push(path, Reply::json(200, &FlowAck { acked_through: 6 }));
         assert!(matches!(
             cp.ship_flows(&body).await,
@@ -578,7 +589,10 @@ mod tests {
         mock.push(path, Reply::status(413));
         assert!(matches!(cp.ship_flows(&body).await, ShipOutcome::TooLarge));
         mock.push(path, Reply::status(507));
-        assert!(matches!(cp.ship_flows(&body).await, ShipOutcome::QuotaExhausted));
+        assert!(matches!(
+            cp.ship_flows(&body).await,
+            ShipOutcome::QuotaExhausted
+        ));
         mock.push(path, Reply::status(502));
         assert!(matches!(cp.ship_flows(&body).await, ShipOutcome::Failed(_)));
     }
@@ -596,7 +610,10 @@ mod tests {
             "https://cp.example/base/roxy/v1/lease"
         );
         let cp = ControlPlane::unauthenticated("https://cp.example", &trust, info()).unwrap();
-        assert_eq!(cp.endpoint("enrol").as_str(), "https://cp.example/roxy/v1/enrol");
+        assert_eq!(
+            cp.endpoint("enrol").as_str(),
+            "https://cp.example/roxy/v1/enrol"
+        );
         assert!(matches!(
             ControlPlane::unauthenticated(
                 "https://cp.example",

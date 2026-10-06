@@ -15,8 +15,8 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use rcgen::{
-    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType, IsCa, Issuer,
+    KeyPair, KeyUsagePurpose, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::net::TcpListener;
@@ -40,7 +40,10 @@ impl TestCa {
     pub(crate) fn new() -> Self {
         let mut params = CertificateParams::default();
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::DigitalSignature];
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
         params
             .distinguished_name
             .push(DnType::CommonName, "roxy test control plane CA");
@@ -230,11 +233,11 @@ impl MockServer {
                         .and_then(|c| {
                             let (_, x509) = x509_parser::parse_x509_certificate(c).ok()?;
                             let san = x509.subject_alternative_name().ok()??;
-                            san.value.general_names.iter().find_map(|g| match g {
-                                x509_parser::extensions::GeneralName::URI(u) => {
-                                    u.strip_prefix(NODE_ID_URI_PREFIX).map(str::to_owned)
-                                }
-                                _ => None,
+                            san.value.general_names.iter().find_map(|g| {
+                                let x509_parser::extensions::GeneralName::URI(u) = g else {
+                                    return None;
+                                };
+                                u.strip_prefix(NODE_ID_URI_PREFIX).map(str::to_owned)
                             })
                         });
                     let service = service_fn(move |req: Request<Incoming>| {
@@ -327,7 +330,11 @@ async fn handle(
     issuer: &TestCa,
 ) -> Result<Response<Full<Bytes>>, Hangup> {
     let (parts, body) = req.into_parts();
-    let body = body.collect().await.map(|b| b.to_bytes().to_vec()).unwrap_or_default();
+    let body = body
+        .collect()
+        .await
+        .map(|b| b.to_bytes().to_vec())
+        .unwrap_or_default();
     let path = parts.uri.path().to_owned();
     let recorded = Recorded {
         method: parts.method,

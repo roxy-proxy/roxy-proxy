@@ -4,7 +4,9 @@
 
 pub mod client;
 pub mod identity;
+pub mod node;
 pub mod protocol;
+pub mod spool;
 pub mod state;
 #[cfg(test)]
 mod testkit;
