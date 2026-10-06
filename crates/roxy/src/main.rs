@@ -125,6 +125,10 @@ struct RuleTestArgs {
     /// Request body text (`body.text`, `body.size`).
     #[arg(long)]
     body: Option<String>,
+    /// The body is chunked: `body.size` (and `header["content-length"]`)
+    /// are absent, as they are before a chunked body is buffered.
+    #[arg(long)]
+    chunked: bool,
     /// `body.bytes`: request body bytes streamed so far. Runs the watching
     /// rules that read it.
     #[arg(long)]
@@ -293,6 +297,7 @@ fn rule_test(args: &RuleTestArgs) -> anyhow::Result<ExitCode> {
     let mut req = ruletest::TestRequest::new(&method, &url);
     req.client_ip = args.client_ip;
     req.body.clone_from(&args.body);
+    req.chunked = args.chunked;
     req.body_bytes = args.body_bytes;
     req.response_status = args.response_status;
     req.response_body_bytes = args.response_body_bytes;
