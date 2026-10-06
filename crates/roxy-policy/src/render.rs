@@ -44,8 +44,8 @@ pub fn render(base: &Base, layers: &[Layer]) -> Result<Rendered, Error> {
         stack.render_layer(i, &mut out)?;
     }
     check_tag_order(&out.rule_tags, layers)?;
-    let secrets = check_secrets(base, layers)?;
-    compile(&out, &secrets)?;
+    let sources = check_sources(base, layers)?;
+    compile(&out, &sources)?;
     let tests = (0..layers.len())
         .map(|i| stack.tests(i))
         .collect::<Result<Vec<_>, _>>()?
@@ -248,8 +248,9 @@ impl Stack<'_> {
         ))
     }
 
-    /// The prefixed form of a secret used in layer `i`: only its own.
-    fn resolve_secret(&self, i: usize, name: &str) -> Result<String, Error> {
+    /// The prefixed form of a `${secret:name}` placeholder's name used in
+    /// layer `i`: only the layer's own.
+    fn prefix_placeholder(&self, i: usize, name: &str) -> Result<String, Error> {
         let layer = &self.layers[i];
         if layer.secrets.iter().any(|s| s == name) {
             return Ok(format!("{}{NAME_SEP}{name}", layer.name));
@@ -352,7 +353,7 @@ impl Stack<'_> {
                 Part::Lit(t) => out.push_str(&t),
                 Part::Secret(name) => {
                     out.push_str("${secret:");
-                    out.push_str(&self.resolve_secret(i, &name)?);
+                    out.push_str(&self.prefix_placeholder(i, &name)?);
                     out.push('}');
                 }
             }
@@ -448,8 +449,9 @@ fn check_tag_order(rules: &[RuleTags], layers: &[Layer]) -> Result<(), Error> {
 }
 
 /// The base must give a source for exactly the secrets the layers name.
-fn check_secrets(base: &Base, layers: &[Layer]) -> Result<HashSet<String>, Error> {
-    let given = base.secret_names();
+/// Returns the prefixed names.
+fn check_sources(base: &Base, layers: &[Layer]) -> Result<HashSet<String>, Error> {
+    let given = base.source_names();
     let mut declared = HashSet::new();
     for layer in layers {
         for name in &layer.secrets {
@@ -479,11 +481,11 @@ fn check_secrets(base: &Base, layers: &[Layer]) -> Result<HashSet<String>, Error
 
 /// Compiles the composed rules, metrics and addon conditions exactly as
 /// the node will.
-fn compile(out: &Output, secrets: &HashSet<String>) -> Result<(), Error> {
+fn compile(out: &Output, sources: &HashSet<String>) -> Result<(), Error> {
     let input = PolicyInput {
         rules: &out.typed_rules,
         metrics: &out.typed_metrics,
-        secret_names: secrets,
+        secret_names: sources,
         address_lists: &out.list_names,
     };
     let mut diags = Policy::compile(&input).err().unwrap_or_default();

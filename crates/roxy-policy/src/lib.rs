@@ -277,7 +277,7 @@ impl Layer {
                 )));
             }
         }
-        let secrets = secret_names(parsed.secrets.as_ref(), &err)?;
+        let secrets = placeholder_names(parsed.secrets.as_ref(), &err)?;
         Ok(Self {
             name,
             doc,
@@ -324,7 +324,10 @@ fn named(
 
 /// A layer's `secrets`: a list of names. The config file's map form, with
 /// sources, is refused: where a value comes from is per-node.
-fn secret_names(v: Option<&Value>, err: &impl Fn(String) -> Error) -> Result<Vec<String>, Error> {
+fn placeholder_names(
+    v: Option<&Value>,
+    err: &impl Fn(String) -> Error,
+) -> Result<Vec<String>, Error> {
     let items = match v {
         None | Some(Value::Null) => return Ok(Vec::new()),
         Some(Value::Sequence(items)) => items,
@@ -396,7 +399,7 @@ impl Base {
     }
 
     /// The prefixed names the base gives a source for.
-    fn secret_names(&self) -> Vec<String> {
+    fn source_names(&self) -> Vec<String> {
         self.doc
             .get("secrets")
             .and_then(Value::as_mapping)
@@ -487,6 +490,6 @@ mod tests {
             );
         }
         let ok = Base::parse("version: 1\nsecrets: { 'org:t': { env: T } }").unwrap();
-        assert_eq!(ok.secret_names(), ["org:t"]);
+        assert_eq!(ok.source_names(), ["org:t"]);
     }
 }
