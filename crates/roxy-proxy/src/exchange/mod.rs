@@ -5,7 +5,6 @@
 mod ws;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use http::header::HOST;
@@ -24,7 +23,7 @@ use roxy_rules::RuleId;
 use tokio_util::sync::CancellationToken;
 
 use crate::addr::PrivateAddrs;
-use crate::body::{counted, counted_until_sent, trailers_need_h2};
+use crate::body::{Tally, counted, counted_until_sent, trailers_need_h2};
 use crate::capture::{self, Tap};
 use crate::flowlog::{DecisionKind, FlowEvent};
 use crate::io::ClientIo;
@@ -128,13 +127,14 @@ where
         Answer::Response(res) => (res, None),
         Answer::Refusal(r) => (refusal_response(cx, &r), Some(r)),
     };
-    let (body, counter) = counted(std::mem::take(&mut res.body));
+    let (body, tally) = counted(std::mem::take(&mut res.body));
     res.body = body;
     cx.record.response_status = Some(res.status.as_u16());
     cx.record.response_headers_bytes = res.headers.wire_len() as u64;
     let r = write(res).await;
     let failed = r.is_err();
-    cx.record.response_bytes = counter.load(Ordering::Relaxed);
+    cx.record.response_bytes = tally.bytes();
+    cx.record.response_sha256 = tally.sha256_hex();
     let stop = cx.watch.as_ref().and_then(|w| w.stopped());
     // Under a stop, the cut body is how the stop is delivered, not a
     // failure of its own.
@@ -543,19 +543,19 @@ fn stopped_outcome(watch: &Watch) -> Option<Failed> {
 async fn response_head<F: Future>(
     fut: F,
     sent: CancellationToken,
-    progress: Arc<AtomicU64>,
+    progress: Arc<Tally>,
     limits: &Limits,
 ) -> Result<F::Output, &'static str> {
     let mut fut = std::pin::pin!(fut);
     let stall = limits.body_idle_timeout.saturating_mul(2);
-    let mut seen = progress.load(Ordering::Relaxed);
+    let mut seen = progress.bytes();
     loop {
         tokio::select! {
             biased;
             out = &mut fut => return Ok(out),
             () = sent.cancelled() => break,
             () = tokio::time::sleep(stall) => {
-                let now = progress.load(Ordering::Relaxed);
+                let now = progress.bytes();
                 if now == seen {
                     return Err("upstream stopped reading the request body");
                 }
@@ -760,10 +760,10 @@ async fn plain_upstream<F: Front>(
         let authority = req.authority.to_host_header(req.scheme);
         move || upstream.may_be_h1(private, protocols, &scheme, &authority)
     });
-    let (body, req_counter, sent) = counted_until_sent(body);
+    let (body, req_tally, sent) = counted_until_sent(body);
     // Read when the flow is logged, so bytes sent before an abandoned
     // forward, or after the response head, all count.
-    cx.request_counter = Some(req_counter.clone());
+    cx.request_tally = Some(req_tally.clone());
     req.body = body;
     let mut http_req = to_upstream_request(req, UriForm::Absolute)
         .map_err(|e| Failed::Refuse(protocol_refusal(cx, &host, port, e.to_string())))?;
@@ -775,7 +775,7 @@ async fn plain_upstream<F: Front>(
             .client(private, protocols)
             .request(http_req),
         sent,
-        req_counter,
+        req_tally,
         &limits,
     );
     // A stop (from a request body chunk) abandons the upstream request

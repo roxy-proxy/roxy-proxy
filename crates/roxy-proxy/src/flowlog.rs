@@ -349,6 +349,10 @@ pub struct RequestInfo {
     pub query: Option<String>,
     pub headers_bytes: u64,
     pub body_bytes: u64,
+    /// Lower-case hex SHA-256 of the body as forwarded; absent when the
+    /// exchange ended before the body did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_sha256: Option<String>,
     pub content_type: Option<String>,
 }
 
@@ -358,6 +362,10 @@ pub struct ResponseInfo {
     pub status: u16,
     pub headers_bytes: u64,
     pub body_bytes: u64,
+    /// Lower-case hex SHA-256 of the body as sent; absent when the
+    /// exchange ended before the body did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_sha256: Option<String>,
 }
 
 /// Timings in milliseconds; `None` where the stage did not happen.
@@ -887,12 +895,16 @@ mod tests {
                 query: None,
                 headers_bytes: 812,
                 body_bytes: 1032,
+                body_sha256: Some(
+                    "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".into(),
+                ),
                 content_type: Some("application/json".into()),
             },
             res: Some(ResponseInfo {
                 status: 201,
                 headers_bytes: 1420,
                 body_bytes: 5120,
+                body_sha256: None,
             }),
             decision: DecisionKind::Allow,
             rules: vec!["openai-key".into(), "github-writes".into()],
@@ -918,7 +930,12 @@ mod tests {
         assert_eq!(v["client"]["ip"], "10.0.0.7");
         assert_eq!(v["tls"]["sni"], "api.github.com");
         assert_eq!(v["req"]["query"], serde_json::Value::Null);
+        assert_eq!(
+            v["req"]["body_sha256"],
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
         assert_eq!(v["res"]["status"], 201);
+        assert!(v["res"].get("body_sha256").is_none(), "{v:#}");
         assert_eq!(v["decision"], "allow");
         assert_eq!(v["timing"]["upstream_ttfb_ms"], 350);
         assert_eq!(v["terminal_rule"], "github-writes");
