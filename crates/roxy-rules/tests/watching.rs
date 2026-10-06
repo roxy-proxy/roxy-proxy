@@ -352,3 +352,129 @@ fn watching_rules_cannot_allow_or_change_the_request() {
         "- { id: a, when: 'response.status == 200 and response.body.text contains \"x\"', then: { remove_header: [x-a] } }",
     );
 }
+
+/// A deny watching a byte metric is decided at the head and, if it fires
+/// later, stops the exchange. A watching rule may therefore read a tag it
+/// sets: when the setter fires late nothing after it runs, so the reader
+/// is never evaluated with the tag present and what it sees is fixed.
+#[test]
+fn watching_reader_of_a_head_and_watching_setters_tag() {
+    let metrics = "- { id: egress, count: request_bytes }";
+    let setter = r"
+- id: budget
+  when: metric.egress > 1mb
+  then: [{ tag: over }, deny]
+";
+    let reader = r#"
+- id: note
+  when: tag["over"] and response.body.bytes > 0
+  then: { log: { level: info, message: over } }
+"#;
+    let tail = "- { id: ok, then: allow }\n";
+    for rules in [
+        format!("{setter}{reader}{tail}"),
+        format!("{reader}{setter}{tail}"),
+    ] {
+        let p = compile(metrics, &rules);
+        let kinds: Vec<RuleKind> = p.rule_info().iter().map(|r| r.kind).collect();
+        assert!(kinds.contains(&RuleKind::HeadAndWatching), "{kinds:?}");
+        let ctx = EvalContext::empty();
+        let v = |egress: i64| {
+            MapView::new()
+                .with_metric("egress", egress)
+                .with_int(Field::ResponseBodyBytes, 10)
+        };
+        let head = p.evaluate_head(&v(0), &ctx);
+        assert_eq!(head.terminal_rule, "ok");
+        assert_eq!(head.tags, Vec::<String>::new());
+        let mut st = p.watch_state(&head.tags);
+        // Tag absent, budget not exceeded: the reader has nothing to match.
+        assert_eq!(
+            p.evaluate_watching(Reads::RESPONSE_BODY_BYTES, ALL, &mut st, &v(0)),
+            None
+        );
+        // The setter fires: the tag is recorded, the exchange stops, and the
+        // reader is not evaluated with it.
+        let o = p
+            .evaluate_watching(
+                Reads::BODY_BYTES | Reads::METRIC_REQUEST_BYTES,
+                ALL,
+                &mut st,
+                &v(2 << 20),
+            )
+            .unwrap();
+        assert!(o.stops());
+        assert_eq!(o.terminal_rule.unwrap(), "budget");
+        assert_eq!(o.matched, ["budget"]);
+        assert_eq!(o.tags, ["over"]);
+        assert!(st.is_stopped());
+        assert_eq!(p.evaluate_watching(ALL, ALL, &mut st, &v(2 << 20)), None);
+    }
+}
+
+/// A rule reading two watched fields is checked only once both are known:
+/// a change to one of them while the other is still unknown is skipped
+/// rather than evaluated against a missing value, and an event the rule
+/// does not read never checks it, however much is known.
+#[test]
+fn a_rule_waits_for_a_field_that_arrives_on_a_later_event() {
+    let p = compile(
+        "",
+        r"
+- id: w
+  when: body.bytes > 1kb and response.status == 200
+  then: deny
+",
+    );
+    let info = p.rule_info();
+    assert_eq!(info[0].triggers, Reads::BODY_BYTES | Reads::RESPONSE_HEAD);
+    let v = |body: i64| {
+        MapView::new()
+            .with_int(Field::BodyBytes, body)
+            .with_int(Field::ResponseStatus, 200)
+    };
+    let mut st = p.watch_state(&[]);
+    // Body bytes known and over the limit, response head not yet: skipped.
+    assert_eq!(
+        p.evaluate_watching(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &v(2048)),
+        None
+    );
+    assert!(!st.is_stopped());
+    // Everything known, but the event is one the rule does not read.
+    assert_eq!(
+        p.evaluate_watching(Reads::RESPONSE_BODY_BYTES, ALL, &mut st, &v(2048)),
+        None
+    );
+    // The response head arrives: both fields known, the rule fires.
+    let o = p
+        .evaluate_watching(
+            Reads::RESPONSE_HEAD,
+            Reads::BODY_BYTES | Reads::RESPONSE_HEAD,
+            &mut st,
+            &v(2048),
+        )
+        .unwrap();
+    assert_eq!(o.terminal_rule.unwrap(), "w");
+
+    // Evaluated false once everything is known, a rule is re-checked when
+    // one of its fields changes again.
+    let mut st = p.watch_state(&[]);
+    assert_eq!(
+        p.evaluate_watching(
+            Reads::RESPONSE_HEAD,
+            Reads::BODY_BYTES | Reads::RESPONSE_HEAD,
+            &mut st,
+            &v(10),
+        ),
+        None
+    );
+    let o = p
+        .evaluate_watching(
+            Reads::BODY_BYTES,
+            Reads::BODY_BYTES | Reads::RESPONSE_HEAD,
+            &mut st,
+            &v(2048),
+        )
+        .unwrap();
+    assert_eq!(o.terminal_rule.unwrap(), "w");
+}

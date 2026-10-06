@@ -152,3 +152,61 @@ fn full_table_purges_at_most_every_100ms() {
     s.set("e", "1", None).unwrap();
     assert_eq!(s.len(), 1);
 }
+
+/// Overwrites, removes and purges racing on the same keys leave the slot
+/// count equal to the entries in the table: a miscount in either direction
+/// would admit one key too many or refuse keys with room still free.
+#[test]
+fn concurrent_overwrite_remove_and_purge_keep_the_count_exact() {
+    const MAX: usize = 64;
+    let (s, t) = clocked(MAX, Duration::from_secs(60));
+    std::thread::scope(|scope| {
+        for w in 0..4 {
+            let (s, t) = (&s, &t);
+            scope.spawn(move || {
+                for i in 0..2000 {
+                    let key = format!("k{}", (i + w * 5) % 24);
+                    // Short-lived and long-lived writes alternate, so a purge
+                    // and an overwrite often race on the same key.
+                    let ttl = if i % 3 == 0 {
+                        Some(Duration::from_millis(1))
+                    } else {
+                        None
+                    };
+                    let _ = s.set(&key, "v", ttl);
+                    if i % 7 == 0 {
+                        t.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            });
+        }
+        let (s, t) = (&s, &t);
+        scope.spawn(move || {
+            for i in 0..2000 {
+                s.remove(&format!("k{}", i % 24));
+                if i % 50 == 0 {
+                    // Advance well past any default-ttl write so purges
+                    // actually remove entries.
+                    t.fetch_add(70_000, Ordering::SeqCst);
+                }
+            }
+        });
+        scope.spawn(move || {
+            for _ in 0..500 {
+                s.purge();
+                std::thread::yield_now();
+            }
+        });
+    });
+    s.purge();
+    let live = s.len();
+    assert!(
+        format!("{s:?}").contains(&format!("stored: {live}")),
+        "{s:?}"
+    );
+    // Exactly the free slots are admitted.
+    for i in 0..MAX - live {
+        s.set(&format!("fresh{i}"), "v", None).unwrap();
+    }
+    assert_eq!(s.set("one-too-many", "v", None), Err(StateFull));
+}
