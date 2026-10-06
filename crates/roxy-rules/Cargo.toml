@@ -19,7 +19,7 @@ serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-criterion = { version = "0.7.0", default-features = false }
+criterion = { version = "0.8.2", default-features = false }
 insta = "1.49.0"
 proptest = "1.11.0"
 serde_yaml_ng.workspace = true
