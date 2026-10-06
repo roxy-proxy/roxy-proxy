@@ -1,5 +1,5 @@
-# Weekly version updates. Minor and patch bumps arrive as one grouped PR per
-# ecosystem; major bumps get their own PR.
+# Weekly version updates. npm and Actions: minor and patch bumps arrive as one
+# grouped PR per ecosystem and majors get their own; cargo: see below.
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -13,9 +13,13 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # One PR for every cargo bump across all four workspaces, majors
+    # included: the nested lock files pin the root crates' dependencies
+    # through path dependencies, so a bump that lands in only one lock
+    # fails CI's --locked runs.
     groups:
-      cargo-minor-patch:
-        update-types: [minor, patch]
+      cargo:
+        patterns: ["*"]
   - package-ecosystem: npm
     directory: /docs
     schedule:
