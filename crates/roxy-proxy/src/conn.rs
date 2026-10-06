@@ -347,11 +347,8 @@ async fn terminate_tls(
         shared.emit_parse_reason(&client, None, "leaf_mint_failed", Some(&host));
         return;
     }
-    let cfg = roxy_tls::server_config_for(
-        shared.minter.clone(),
-        authority.host.clone(),
-        cl.enable_h2,
-    );
+    let cfg =
+        roxy_tls::server_config_for(shared.minter.clone(), authority.host.clone(), cl.enable_h2);
     let accept = TlsAcceptor::from(cfg).accept(Rewind::new(io, hello));
     let tls = match tokio::time::timeout(cl.limits.header_timeout, accept).await {
         Ok(Ok(t)) => t,
