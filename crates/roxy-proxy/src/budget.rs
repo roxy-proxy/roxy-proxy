@@ -58,6 +58,20 @@ impl BufferBudget {
     }
 }
 
+impl BufferLease {
+    /// Gives back all but `bytes` of the reservation, once what the lease
+    /// covers is known to be no larger than that. A larger `bytes` is a
+    /// no-op: a lease never grows.
+    pub(crate) fn shrink_to(&mut self, bytes: u64) {
+        if bytes < self.bytes {
+            self.budget
+                .used
+                .fetch_sub(self.bytes - bytes, Ordering::AcqRel);
+            self.bytes = bytes;
+        }
+    }
+}
+
 impl Drop for BufferLease {
     fn drop(&mut self) {
         self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
@@ -88,5 +102,19 @@ mod tests {
         let _e = b.reserve(3, 1).unwrap();
         // A total past `u64::MAX` is refused, not wrapped.
         assert!(b.reserve(u64::MAX, u64::MAX).is_none());
+    }
+
+    #[test]
+    fn shrinking_releases_the_difference_and_never_grows() {
+        let b = Arc::new(BufferBudget::default());
+        let mut a = b.reserve(10, 8).unwrap();
+        assert!(b.reserve(10, 3).is_none());
+        a.shrink_to(5);
+        assert_eq!(b.used(), 5);
+        let _c = b.reserve(10, 3).unwrap();
+        a.shrink_to(7);
+        assert_eq!(b.used(), 8);
+        drop(a);
+        assert_eq!(b.used(), 3);
     }
 }

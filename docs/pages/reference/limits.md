@@ -94,16 +94,27 @@ large, and one with more than that many bytes unread has the copy cut
 
 `max_buffered_bytes` bounds those three buffers in aggregate; each is
 bounded per exchange, and without it the only bound on exchanges is the
-connection caps. An exchange that inspects a body reserves the whole cap
-before it fills the buffer (`max_inspect_body_bytes` for a body a rule
-reads, twice `max_ws_message_bytes` for a WebSocket whose messages rules
-read) and holds the reservation until it ends. A reservation the budget
-cannot cover fails at once, with no waiting and no eviction: the exchange
-fails closed (`503`, `_fail_closed`, `buffer_budget_exhausted`). The
-budget divided by a cap is how many exchanges can hold that buffer at once
-(with the defaults: 1024 inspected bodies, 32 WebSockets with message
-rules), so size it, or the caps, for the traffic that needs them. It must
-be at least the largest of those reservations.
+connection caps. An exchange reserves before it fills a buffer, and a
+reservation the budget cannot cover fails at once, with no waiting and no
+eviction: the exchange fails closed (`503`, `_fail_closed`,
+`buffer_budget_exhausted`). What is reserved, and when:
+
+- A body a rule reads (`body.text`, `response.body.text`) reserves
+  `max_inspect_body_bytes`, or its `content-length` if that is smaller.
+  A body known to be empty reserves nothing: a request without a body, a
+  `HEAD` response, a `1xx`, `204` or `304`. Once the body is buffered the
+  reservation shrinks to what is held (the body as sent, or its decoded
+  text if larger), and that stays reserved until the exchange ends, since
+  the text stays with the exchange for its rules and log.
+- A WebSocket whose messages rules read reserves twice
+  `max_ws_message_bytes` at the upgrade and holds it for the session. A
+  WebSocket under a policy that reads bodies but not messages holds
+  nothing.
+
+The budget divided by a cap is how many exchanges can hold that buffer at
+once (with the defaults: 1024 bodies of unknown length being inspected, 32
+WebSockets with message rules), so size it, or the caps, for the traffic
+that needs them. It must be at least the largest of those reservations.
 
 An observer's copy is charged for the bytes it has queued and the observer
 has not yet read, frame by frame as they queue, and the charge is given
