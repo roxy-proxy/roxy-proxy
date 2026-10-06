@@ -43,7 +43,7 @@ mod upstream;
 mod ws_tests;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -70,7 +70,7 @@ use crate::addrlist::{AddressList, AddressLists};
 use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowSink, MemorySink, Redactor};
 use crate::listener::{ClientConn, ListenerInfo, ListenerMode};
-use crate::sources::{MetricSource, StateSource, UnavailableMetrics, UnavailableState};
+use crate::sources::{MetricSource, Sample, StateSource, UnavailableMetrics, UnavailableState};
 use crate::upstream::{TestDial, UpstreamSettings};
 
 /// The scripted upstream's public address (`up.test`).
@@ -399,7 +399,8 @@ impl KitBuilder {
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
 
-        let metrics = metric_source(self.metrics, &policy, self.metric_limits);
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let metrics = metric_source(self.metrics, &policy, self.metric_limits, samples.clone());
 
         let rt = roxy_wasm::WasmRuntime::new().unwrap();
         let mut addons = Vec::new();
@@ -456,6 +457,7 @@ impl KitBuilder {
             sink,
             upstream,
             capture,
+            samples,
             ca_file: dir.path().join(roxy_tls::CA_CERT_FILE),
             limits,
             flags,
@@ -511,6 +513,10 @@ pub(crate) struct Kit {
     pub upstream: Arc<Upstream>,
     /// The capture log, with [`KitBuilder::capture_all`].
     pub capture: Option<Arc<crate::capture::CaptureLog>>,
+    /// Every sample recorded in the kit's own metric store (the one
+    /// [`KitBuilder::metric_defs`] fills; empty with an explicit
+    /// [`KitBuilder::metrics`]).
+    pub samples: Arc<Mutex<Vec<Sample>>>,
     ca_file: std::path::PathBuf,
     pub(crate) limits: Limits,
     pub(crate) flags: HttpFlags,
@@ -1145,14 +1151,15 @@ fn metric_source(
     explicit: Option<Arc<dyn MetricSource>>,
     policy: &Policy,
     limits: roxy_rules::MetricLimits,
+    samples: Arc<Mutex<Vec<Sample>>>,
 ) -> Arc<dyn MetricSource> {
     match explicit {
         Some(m) => m,
         None if policy.metric_defs().is_empty() => Arc::new(UnavailableMetrics),
-        None => Arc::new(StoreMetrics(roxy_rules::MetricStore::with_limits(
-            policy.metric_defs(),
-            limits,
-        ))),
+        None => Arc::new(StoreMetrics {
+            store: roxy_rules::MetricStore::with_limits(policy.metric_defs(), limits),
+            samples,
+        }),
     }
 }
 
@@ -1175,8 +1182,12 @@ pub(crate) fn streaming_body() -> (BodySender, Body) {
     Body::channel(u64::MAX, None)
 }
 
-/// A real metric store behind the proxy's metric trait.
-struct StoreMetrics(roxy_rules::MetricStore);
+/// A real metric store behind the proxy's metric trait, keeping every
+/// sample it was given for tests to inspect.
+struct StoreMetrics {
+    store: roxy_rules::MetricStore,
+    samples: Arc<Mutex<Vec<Sample>>>,
+}
 
 impl MetricSource for StoreMetrics {
     fn get(
@@ -1184,14 +1195,15 @@ impl MetricSource for StoreMetrics {
         id: &str,
         view: &dyn roxy_rules::FlowView,
     ) -> Result<i64, crate::sources::MetricSourceError> {
-        self.0.get(id, view).map_err(Into::into)
+        self.store.get(id, view).map_err(Into::into)
     }
 
     fn record(
         &self,
         view: &dyn roxy_rules::FlowView,
-        sample: &crate::sources::Sample,
+        sample: &Sample,
     ) -> Result<(), crate::sources::MetricSourceError> {
+        self.samples.lock().unwrap().push(*sample);
         let s = roxy_rules::Sample {
             head: sample.head,
             request_bytes: sample.request_bytes,
@@ -1199,7 +1211,7 @@ impl MetricSource for StoreMetrics {
             denied: sample.denied,
             error: sample.error,
         };
-        self.0.record(view, &s).map_err(Into::into)
+        self.store.record(view, &s).map_err(Into::into)
     }
 }
 

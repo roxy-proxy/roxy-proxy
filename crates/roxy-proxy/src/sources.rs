@@ -22,7 +22,9 @@ use roxy_rules::FlowView;
 ///   the exchange).
 ///
 /// Invariant: summing `request_bytes` over every sample of an exchange
-/// gives the request-body bytes roxy accepted for forwarding (the same for
+/// gives the request-body bytes roxy read and checked against the rules:
+/// everything it forwarded, plus the chunk whose arrival stopped the
+/// exchange, which is counted but not forwarded (the same for
 /// `response_bytes`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Sample {

@@ -523,4 +523,17 @@ async fn a_byte_budget_stops_the_crossing_upload() {
         total <= 100 * 1024,
         "forwarded {total} bytes past the budget"
     );
+    // The metric counts what roxy read: everything forwarded plus the
+    // chunk whose arrival crossed the budget, which was refused.
+    let counted: u64 = kit
+        .samples
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| s.request_bytes)
+        .sum();
+    assert!(
+        counted > total as u64 && counted <= 128 * 1024,
+        "counted {counted} bytes, forwarded {total}"
+    );
 }

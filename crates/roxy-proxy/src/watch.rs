@@ -380,6 +380,8 @@ impl Inner {
 
     /// Records `n` bytes in byte metrics (if any count this direction),
     /// then re-checks the rules watching `changed` (plus the metric bit).
+    /// Recording first is what lets a budget rule stop the chunk that
+    /// crosses it: the chunk counts, and is then refused.
     fn bytes(&mut self, dir: Dir, n: u64, mut changed: Reads, stage: Stage) {
         let (bit, sample) = match dir {
             Dir::Request => (
