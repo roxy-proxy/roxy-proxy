@@ -568,6 +568,17 @@ impl Config {
                 ));
             }
         }
+        for (i, m) in self.metrics.iter().enumerate() {
+            if m.max_keys.is_some_and(|n| n > l.max_metric_keys) {
+                d.push(Diagnostic::new(
+                    format!("metrics[{i}].max_keys"),
+                    format!(
+                        "must not exceed limits.max_metric_keys ({})",
+                        l.max_metric_keys
+                    ),
+                ));
+            }
+        }
         // Inspection and WebSocket reassembly reserve their cap whole, so a
         // budget under one of them could never admit the exchanges that
         // need that buffer. An observer's copy grows into the budget frame

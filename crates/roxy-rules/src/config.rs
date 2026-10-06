@@ -522,6 +522,9 @@ pub struct MetricConfig {
     /// Sliding window; absent = cumulative since start.
     #[serde(default, with = "humantime_serde")]
     pub window: Option<Duration>,
+    /// Series this metric alone may hold; absent = the store's shared limit.
+    #[serde(default)]
+    pub max_keys: Option<usize>,
 }
 
 /// What a metric counts.

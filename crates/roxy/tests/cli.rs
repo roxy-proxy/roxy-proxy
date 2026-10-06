@@ -334,6 +334,31 @@ fn run_fails_on_missing_secret() {
 }
 
 #[test]
+fn check_warns_on_client_chosen_metric_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("roxy.yaml");
+    std::fs::write(
+        &cfg,
+        "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:3128 }]\nmetrics:\n  \
+         - { id: paths, count: requests, key: [client.ip, path], window: 1m }\n  \
+         - { id: bounded, count: requests, key: [path], where: 'host under \"example.com\"' }\n",
+    )
+    .unwrap();
+    let out = roxy(&["check", "--config", cfg.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains(": OK"));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains(&format!(
+            "{}:metrics[0].key[1]: warning: `path` is chosen by the client",
+            cfg.display()
+        )),
+        "{err}"
+    );
+    assert_eq!(err.matches("warning:").count(), 1, "{err}");
+}
+
+#[test]
 fn check_catches_expression_type_errors() {
     let dir = tempfile::tempdir().unwrap();
     let bad = dir.path().join("bad.yaml");

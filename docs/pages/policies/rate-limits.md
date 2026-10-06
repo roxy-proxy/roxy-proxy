@@ -15,6 +15,7 @@ metrics:
     where: <expr>        # head values only, no tags: whether this exchange counts
     key: [<field>, ...]  # scalar head fields only; omitted = one global series
     window: <duration>   # omitted = cumulative since start; 0 is a compile error
+    max_keys: <n>        # series this metric alone may hold; omitted = limits.max_metric_keys
 ```
 
 - **Windows** slide in 60 fixed buckets, so a 1-minute window has 1-second
@@ -51,18 +52,52 @@ metrics:
   stops the exchange, so a budget may be overcounted by at most one chunk.
   `errors` are counted when the exchange ends.
 - **Bounded, never evicting.** Series are capped by `limits.max_metric_keys`
-  (100 000) and, approximately, by `limits.max_metric_bytes` (256 MiB, at
-  most 64 GiB; each series is charged for its key, its buckets and a fixed
-  overhead). A flow that needs a new series when either is exhausted is
-  denied (`_fail_closed`, reason `metric_table_full`). A byte metric that
+  (100 000) across all metrics, by each metric's own `max_keys` (at most
+  the shared limit, which is also its default) and, approximately, by
+  `limits.max_metric_bytes` (256 MiB, at most 64 GiB; each series is
+  charged for its key, its buckets and a fixed overhead). A flow that needs
+  a new series when any of these is exhausted is denied (`_fail_closed`,
+  reason `metric_table_full`). A byte metric that
   cannot record a chunk mid-stream stops the exchange the same way.
   Evicting would let a client reset its own counter by varying the key.
   Series are reclaimed only once their window has fully expired.
 - **Reload.** Series whose metric definition (`count`, `key`, `window`) is
   unchanged carry over; series of a changed or removed metric are dropped
   without comment. Carried series may exceed a lowered `max_metric_keys`
-  until they expire (new series are refused meanwhile), but never the byte
-  budget: a series that does not fit is dropped with a warning.
+  or `max_keys` until they expire (new series are refused meanwhile), but
+  never the byte budget: a series that does not fit is dropped with a
+  warning.
+
+### Key cardinality
+
+Every distinct key value is a series, and series are never evicted. Some
+head fields are chosen by the client on each request: `host`, `path`,
+`url`, `query.raw` and `client.port`. A metric keyed on one of them with no
+`where` holds as many series as the client cares to send. Denied flows
+count too, so a client sending junk `Host` values at a `key: [host]` metric
+fills it without one request being allowed. Once a metric is at its
+`max_keys`, or the store at `limits.max_metric_keys`, every flow that needs
+a new series there is denied (`metric_table_full`) until series expire.
+
+Bound such a key with the metric's `where`, so that only the values you
+expect are counted:
+
+```yaml
+metrics:
+  - id: github_requests
+    count: requests
+    where: host under "github.com"
+    key: [host]
+    window: 1m
+```
+
+`client.ip` is bounded by the addresses that can reach the proxy, and
+`host` by a `where` like the one above. `path`, `url` and `query.raw` have
+no such bound: a `where` on `host` limits whose paths are counted, not how
+many. `roxy check` warns when a metric keys on one of them, or counts
+`unique(..)` of one, with no `where` at all. A metric that must key on such
+a field should also carry its own `max_keys`, so that filling it refuses
+new series in that metric alone and not in every other.
 
 ## State
 

@@ -8,14 +8,17 @@
 //!   that series' mutex; only admitting a new key (or reclaiming) takes a
 //!   shard write lock. There is no global lock.
 //! * **Bounded keys, no eviction.** `max_keys` counts series across all
-//!   metrics. Admission reserves a slot with a compare-and-swap on one
-//!   atomic counter *while holding the shard entry for the new key*, so the
-//!   bound is exact: [`MetricStore::key_count`] never exceeds `max_keys`
-//!   through admission, under any number of concurrent writers, and no key is
-//!   admitted once the count has reached `max_keys`. (The only way past the
-//!   bound is [`MetricStore::carry_over`] into a store with a smaller
-//!   `max_keys`; carried keys are kept and new keys are refused until enough
-//!   expire.) A flow that needs a new key when the table is full gets
+//!   metrics, and a metric's own `max_keys` (default: the shared one) counts
+//!   its series alone, so one metric fed client-chosen key values cannot
+//!   take every slot from the others. Admission reserves a slot in each with
+//!   a compare-and-swap on an atomic counter *while holding the shard entry
+//!   for the new key*, so both bounds are exact: [`MetricStore::key_count`]
+//!   never exceeds `max_keys` through admission, under any number of
+//!   concurrent writers, and no key is admitted once either count has
+//!   reached its cap. (The only way past a bound is
+//!   [`MetricStore::carry_over`] into a store with a smaller cap; carried
+//!   keys are kept and new keys are refused until enough expire.) A flow
+//!   that needs a new key when its metric or the table is full gets
 //!   [`MetricError::TableFull`] and must be denied. Series are only removed
 //!   by [`MetricStore::reclaim`] once their whole window has expired, so
 //!   reclaiming never changes a value; cumulative series are never removed.
@@ -392,6 +395,10 @@ struct Metric {
     def: MetricDef,
     geom: Option<Geometry>,
     series: DashMap<Key, Mutex<Series>>,
+    /// Series this metric alone may hold (its `max_keys`, or the shared
+    /// limit), with a CAS-reserved count like the store's `live`.
+    max_keys: usize,
+    live: AtomicUsize,
 }
 
 impl Metric {
@@ -478,6 +485,8 @@ impl MetricStore {
                 def: d.clone(),
                 geom: d.window.map(Geometry::new),
                 series: DashMap::new(),
+                max_keys: d.max_keys.unwrap_or(max_keys),
+                live: AtomicUsize::new(0),
             })
             .collect();
         let by_id = metrics
@@ -605,6 +614,7 @@ impl MetricStore {
         // New key (probably). Reclaim first if full: never while holding an
         // entry of this map.
         if self.live.load(Ordering::Acquire) >= self.max_keys
+            || m.live.load(Ordering::Acquire) >= m.max_keys
             || self.budget.used().saturating_add(SERIES_OVERHEAD) > self.budget.max
         {
             self.reclaim_if_due(now);
@@ -616,7 +626,7 @@ impl MetricStore {
                 .apply(m.geom, now, &delta, &self.budget)
                 .map_err(|Refused| exhausted())?,
             Entry::Vacant(v) => {
-                if !self.reserve() {
+                if !self.reserve(m) {
                     return Err(MetricError::TableFull {
                         metric: m.def.id.clone(),
                     });
@@ -630,7 +640,7 @@ impl MetricStore {
                         false
                     });
                 if !admitted {
-                    self.live.fetch_sub(1, Ordering::AcqRel);
+                    self.release(m, 1);
                     return Err(exhausted());
                 }
                 v.insert(Mutex::new(s));
@@ -639,14 +649,23 @@ impl MetricStore {
         Ok(())
     }
 
-    /// Take one key slot; false if the table is full. A CAS loop, so the
-    /// count never exceeds `max_keys` through admission.
-    fn reserve(&self) -> bool {
-        self.live
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.max_keys).then_some(n + 1)
-            })
-            .is_ok()
+    /// Take one key slot in `m` and in the table; false if either is full.
+    /// CAS loops, so neither count exceeds its cap through admission.
+    fn reserve(&self, m: &Metric) -> bool {
+        if !take_slot(&m.live, m.max_keys) {
+            return false;
+        }
+        if take_slot(&self.live, self.max_keys) {
+            return true;
+        }
+        m.live.fetch_sub(1, Ordering::AcqRel);
+        false
+    }
+
+    /// Give back `n` key slots taken by [`MetricStore::reserve`] for `m`.
+    fn release(&self, m: &Metric, n: usize) {
+        m.live.fetch_sub(n, Ordering::AcqRel);
+        self.live.fetch_sub(n, Ordering::AcqRel);
     }
 
     /// Run a reclaim pass unless one ran in the last 100 ms. Returns whether
@@ -677,18 +696,22 @@ impl MetricStore {
         let mut removed = 0;
         let mut freed = 0;
         for m in self.metrics.iter().filter(|m| m.geom.is_some()) {
+            let mut from_m = 0;
             m.series.retain(|_, s| {
                 let s = s.get_mut();
                 let keep = !s.expired(m.geom, now);
                 if !keep {
-                    removed += 1;
+                    from_m += 1;
                     freed += s.bytes;
                 }
                 keep
             });
+            if from_m > 0 {
+                self.release(m, from_m);
+                removed += from_m;
+            }
         }
-        if removed > 0 {
-            self.live.fetch_sub(removed, Ordering::AcqRel);
+        if freed > 0 {
             self.budget.give(freed);
         }
         removed
@@ -697,9 +720,9 @@ impl MetricStore {
     /// Reload retention: copy series from `previous` for metric ids
     /// whose definition has the same `count`, `unique`, `key` and `window`;
     /// every other metric starts empty. Carried series are kept even
-    /// beyond this store's `max_keys` (new keys are then refused until
-    /// enough expire), but *not* beyond its byte budget: a series whose
-    /// charge does not fit is skipped and counted in
+    /// beyond this store's `max_keys` or the metric's (new keys are then
+    /// refused until enough expire), but *not* beyond its byte budget: a
+    /// series whose charge does not fit is skipped and counted in
     /// [`CarryOverReport::skipped_budget`], so `byte_count() <= max_bytes`
     /// still holds afterwards. Call before the store takes traffic.
     pub fn carry_over(&self, previous: &MetricStore) -> CarryOverReport {
@@ -732,6 +755,7 @@ impl MetricStore {
                 }
                 match m.series.insert(entry.key().clone(), Mutex::new(s)) {
                     None => {
+                        m.live.fetch_add(1, Ordering::AcqRel);
                         self.live.fetch_add(1, Ordering::AcqRel);
                     }
                     Some(old) => self.budget.give(old.into_inner().bytes),
@@ -784,6 +808,15 @@ impl MetricSource for MetricStore {
     fn record(&self, view: &dyn FlowView, sample: &Sample) -> Result<(), MetricError> {
         MetricStore::record(self, view, sample)
     }
+}
+
+/// Take one slot of `cap` from `live`; false if it is full. A CAS loop, so
+/// the count never passes `cap` through admission.
+fn take_slot(live: &AtomicUsize, cap: usize) -> bool {
+    live.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        (n < cap).then_some(n + 1)
+    })
+    .is_ok()
 }
 
 /// `a - b` in signed nanoseconds, saturating.
