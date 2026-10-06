@@ -476,7 +476,7 @@ impl KitBuilder {
                 policy,
                 valid_until: self.valid_until,
                 secrets: base.secrets.clone(),
-                redactor: base.redactor(),
+                redactor: Redactor::new(),
                 limits: self.limits,
                 flags: self.flags,
                 http: self.http,
@@ -532,14 +532,6 @@ impl PolicyBase {
             address_lists: Arc::new(address_lists),
             deny_lists,
         }
-    }
-
-    fn redactor(&self) -> Redactor {
-        let mut r = Redactor::new();
-        for v in self.secrets.values() {
-            r.add_secret(v.clone());
-        }
-        r
     }
 }
 
@@ -827,7 +819,7 @@ impl Kit {
                 policy,
                 valid_until,
                 secrets: self.base.secrets.clone(),
-                redactor: self.base.redactor(),
+                redactor: Redactor::new(),
                 limits: self.limits.clone(),
                 flags: self.flags.clone(),
                 http: self.http.clone(),

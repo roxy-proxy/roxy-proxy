@@ -1,8 +1,11 @@
 //! Secret resolution.
 //!
-//! Secrets are resolved once, at `roxy run`. `roxy check` never reads them.
-//! A missing environment variable or unreadable file is a fatal startup
-//! error: a rule that injects a secret must never run with a blank value.
+//! Secrets are resolved at `roxy run` and on each reload. `roxy check` never
+//! reads them. A missing environment variable or unreadable file is a fatal
+//! startup error: a rule that injects a secret must never run with a blank
+//! value. A lease secret (`{ lease: true }`) is supplied by the control
+//! plane's lease; `roxy run --config` has none, so it refuses it the same
+//! way.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -39,6 +42,8 @@ pub enum SecretError {
     },
     #[error("secret {name:?} resolved to an empty value")]
     Empty { name: String },
+    #[error("secret {name:?} is supplied by a lease; `roxy run --config` has no lease")]
+    Unresolvable { name: String },
 }
 
 /// A secret file that group or world can read is most likely a deployment
@@ -83,6 +88,9 @@ impl Secrets {
         let mut values = BTreeMap::new();
         for (name, source) in sources {
             let value = match source {
+                SecretSource::Lease => {
+                    return Err(SecretError::Unresolvable { name: name.clone() });
+                }
                 SecretSource::Env(var) => env(var).ok_or_else(|| SecretError::MissingEnv {
                     name: name.clone(),
                     var: var.clone(),
@@ -173,5 +181,15 @@ mod tests {
             Secrets::resolve_with(&sources, |_| None),
             Err(SecretError::File { .. })
         ));
+    }
+
+    #[test]
+    fn a_lease_secret_cannot_be_resolved_here() {
+        let mut sources = BTreeMap::new();
+        sources.insert("a".to_owned(), SecretSource::Env("A_VAR".into()));
+        sources.insert("lease".to_owned(), SecretSource::Lease);
+        let err = Secrets::resolve_with(&sources, |_| Some("v".into())).unwrap_err();
+        assert!(matches!(&err, SecretError::Unresolvable { name } if name == "lease"));
+        assert!(err.to_string().contains("\"lease\""), "{err}");
     }
 }

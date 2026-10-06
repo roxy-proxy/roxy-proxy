@@ -188,6 +188,7 @@ impl Config {
             let empty = match source {
                 super::SecretSource::Env(var) => var.trim().is_empty(),
                 super::SecretSource::File(path) => path.as_os_str().is_empty(),
+                super::SecretSource::Lease => false,
             };
             if empty {
                 d.push(Diagnostic::new(

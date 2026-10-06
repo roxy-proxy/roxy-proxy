@@ -625,10 +625,6 @@ pub(crate) mod testing {
             address_lists: &none,
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
-        let mut redactor = Redactor::new();
-        for (_, v) in secrets {
-            redactor.add_secret(*v);
-        }
         let mut upstream = UpstreamSettings::default();
         upstream.dns.servers = Some(vec!["127.0.0.1:9".parse().unwrap()]);
         for (name, ip) in [
@@ -655,7 +651,7 @@ pub(crate) mod testing {
                     .iter()
                     .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))
                     .collect(),
-                redactor,
+                redactor: Redactor::new(),
                 limits: kit.limits.clone(),
                 flags: kit.flags.clone(),
                 http: kit.http.clone(),
