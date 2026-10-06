@@ -14,8 +14,14 @@
 
 ## Reload
 
-`roxy check <config>` and reload share one path: parse, validate, compile,
-returning diagnostics with the config path, rule id and position. roxy
+`roxy check <config>` runs the part of startup that opens no socket and
+writes no file: parse, validate, compile the rules and the WASM addons, load
+the address lists, load a provided CA (`tls.ca_cert`, `tls.ca_key`), read
+`tls.upstream.extra_roots` and build the resolver. Diagnostics carry the
+config path, rule id and position. `check` leaves to startup: resolving
+`secrets` from the environment, generating a CA in `tls.ca_dir`, opening
+`log.flow.path` and `capture_dir`, and binding the listeners. Reload shares
+the same parse, validate and compile path. roxy
 watches the config file, the address-list files and the addon `.wasm`
 files; a change, or `SIGHUP`, triggers a reload. Each file is followed
 through symlinks, so a file swapped underneath its path (a Kubernetes

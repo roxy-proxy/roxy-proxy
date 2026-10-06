@@ -243,6 +243,75 @@ fn run_fails_closed_on_a_bad_addon() {
 }
 
 #[test]
+fn check_fails_where_startup_would() {
+    // `check` loads what startup loads before it binds a socket or writes a
+    // file, and names the field and the file for each failure.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("roxy.yaml");
+    let write = |body: &str| {
+        std::fs::write(
+            &cfg,
+            format!("version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:0 }}]\n{body}"),
+        )
+        .unwrap();
+    };
+    let check = || {
+        let out = roxy(&["check", "--config", cfg.to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+        text(&out.stderr)
+    };
+
+    // A file named `.wasm` that is not a WASM component.
+    let wasm = dir.path().join("layer.wasm");
+    std::fs::write(&wasm, "version: 1\n").unwrap();
+    write(&format!("addons: [{{ name: a, path: {wasm:?} }}]\n"));
+    let err = check();
+    let prefix = format!("{}:addons: layer `a`: compile failed", cfg.display());
+    assert!(err.contains(&prefix), "{err}");
+
+    // A provided CA whose files are missing; nothing is generated instead.
+    let cert = dir.path().join("tls.crt");
+    let key = dir.path().join("tls.key");
+    write(&format!("tls: {{ ca_cert: {cert:?}, ca_key: {key:?} }}\n"));
+    let err = check();
+    let expect = format!(
+        "{}:tls.ca_cert: {}: No such file",
+        cfg.display(),
+        cert.display()
+    );
+    assert!(err.contains(&expect), "{err}");
+    assert!(!cert.exists() && !key.exists());
+
+    // An extra root the upstream TLS config cannot read.
+    let roots = dir.path().join("roots.pem");
+    write(&format!(
+        "tls: {{ upstream: {{ verify: strict+extra_roots, extra_roots: [{roots:?}] }} }}\n"
+    ));
+    let err = check();
+    let expect = format!(
+        "{}:tls.upstream.extra_roots: {}: No such file",
+        cfg.display(),
+        roots.display()
+    );
+    assert!(err.contains(&expect), "{err}");
+
+    // A resolver entry that is not a nameserver address. hickory builds a
+    // resolver from any list of socket addresses, so this is the only
+    // resolver list `check` can refuse.
+    write("upstream: { dns: { resolver: [\"1.1.1.1:53\", \"dns.test\"] } }\n");
+    let err = check();
+    let expect = format!("{}:upstream.dns.resolver[1]:", cfg.display());
+    assert!(err.contains(&expect), "{err}");
+
+    // A CA in `tls.ca_dir` is startup's to generate: `check` passes without it.
+    let ca_dir = dir.path().join("ca");
+    write(&format!("tls: {{ ca_dir: {ca_dir:?} }}\n"));
+    let out = roxy(&["check", "--config", cfg.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(!ca_dir.exists(), "check must not generate a CA");
+}
+
+#[test]
 fn run_fails_on_missing_secret() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("roxy.yaml");
