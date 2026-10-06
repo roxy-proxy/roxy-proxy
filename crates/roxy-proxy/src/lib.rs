@@ -59,7 +59,7 @@ mod view;
 mod watch;
 
 pub use addrlist::{AddressList, AddressLists, ListError};
-pub use ca_server::PEM_CONTENT_TYPE;
+pub use ca_server::{PEM_CONTENT_TYPE, POLICY_HEADER};
 pub use capture::{CAPTURE_FILE, CaptureLog, CaptureOptions};
 pub use config::{HttpBehaviour, ListenerKind, ListenerSpec, PolicyUpdate, RuntimeConfig};
 pub use conn::INTERNAL_HOST;

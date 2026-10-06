@@ -65,6 +65,7 @@ pub fn policy_update(config: &Config, policy: Policy) -> anyhow::Result<PolicyUp
         .collect();
     Ok(PolicyUpdate {
         policy,
+        valid_until: config.valid_until,
         secrets: secret_map,
         redactor,
         limits: config.into(),
