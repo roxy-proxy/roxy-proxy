@@ -42,3 +42,31 @@ async fn serves_the_certificate_once_per_connection_and_nothing_else() {
         assert!(eof, "{req}");
     }
 }
+
+/// `/healthz` is liveness: it stays `200` when the policy's lease has run
+/// out, and says so in `x-roxy-policy`.
+#[tokio::test]
+async fn healthz_reports_the_lease_state() {
+    let kit = Kit::builder().ca_server().start().await;
+    let probe = "GET /healthz HTTP/1.1\r\nhost: roxy\r\n\r\n";
+    let (head, body, _) = fetch(&kit, probe).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        head.to_ascii_lowercase().contains("x-roxy-policy: valid"),
+        "{head}"
+    );
+    assert_eq!(body, b"ok");
+
+    kit.reload_lease(
+        super::ALLOW_UP,
+        Some(chrono::Utc::now() - chrono::TimeDelta::seconds(1)),
+    );
+    let (head, body, _) = fetch(&kit, probe).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        head.to_ascii_lowercase().contains("x-roxy-policy: expired"),
+        "{head}"
+    );
+    assert_eq!(body, b"ok");
+    assert_eq!(kit.events("policy_expired", 1).await.len(), 1);
+}

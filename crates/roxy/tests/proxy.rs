@@ -169,6 +169,63 @@ async fn hot_reload_swaps_policy_and_keeps_it_on_failure() {
     h.stop().await;
 }
 
+/// A config already past `valid_until` loads and denies everything with
+/// `_expired`; `roxy health` stays healthy and says so; a reload that moves
+/// the lease into the future lets traffic through again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_valid_until_loads_denies_and_recovers_on_reload() {
+    let lease = |extra: &'static str| Opts {
+        rules: ALLOW_UPSTREAM,
+        extra,
+        ..Opts::default()
+    };
+    let h = Harness::start_with(lease("valid_until: 2000-01-01T00:00:00Z\n")).await;
+    let c = h.client();
+    let url = h.https_url("/r");
+    let res = c.get(&url).send().await.unwrap();
+    assert_eq!(res.status(), 403);
+    assert_eq!(res.headers()["x-roxy-rule"], "_expired");
+    let ev = h.wait_events("request", 1).await;
+    assert_eq!(ev[0]["terminal_rule"], "_expired", "{ev:#?}");
+    assert_eq!(ev[0]["reason"], "policy_expired", "{ev:#?}");
+    assert_eq!(h.wait_events("policy_expired", 1).await.len(), 1);
+
+    let health_url = format!("http://{}/healthz", h.ca_server.unwrap());
+    let health = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_roxy"))
+            .args(["health", "--url", &health_url])
+            .output()
+            .unwrap()
+    };
+    let out = health();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ok (policy expired)\n"
+    );
+
+    std::fs::write(
+        &h.config_path,
+        h.render(&lease("valid_until: 2999-01-01T00:00:00Z\n")),
+    )
+    .unwrap();
+    h.wait_events("config_reloaded", 1).await;
+    let res = c.get(&url).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    let out = health();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
+    h.stop().await;
+}
+
 /// `tls.require_sni_match` is read when a connection is accepted: after a
 /// reload turns it off, a new tunnel completes the handshake under a
 /// mismatched SNI and is served a leaf for that SNI.

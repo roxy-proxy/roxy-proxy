@@ -39,6 +39,8 @@ mod h2raw;
 #[cfg(test)]
 mod http_tests;
 #[cfg(test)]
+mod lease_tests;
+#[cfg(test)]
 mod rules_tests;
 mod upstream;
 #[cfg(test)]
