@@ -44,8 +44,8 @@ Every non-`2xx`, non-`304` response carries an error body:
 ```
 
 `error` is a stable code; `message` is for humans. A `426` adds `missing`
-(see [features](/reference/node-protocol#features)). A node acts on the status code, not the
-body.
+(see [unsupported versions](/reference/node-protocol#unsupported-versions)). A node acts on
+the status code, not the body.
 
 | status | meaning | node behaviour |
 |---|---|---|
@@ -53,7 +53,7 @@ body.
 | `401` | at enrolment: the token is unknown, used or expired. Elsewhere: the certificate is not recognised as a node | enrolment: fail. Elsewhere: log once per outcome change, keep the current lease and let it run down. Never re-enrol: the token is gone |
 | `410` | the node is revoked. Definite and terminal | write an empty policy at once, finish shipping what is spooled, stop polling, keep health up |
 | `413` | flow batch too large | halve the batch and retry |
-| `426` | the server will not render for this node's version or features | treat as `5xx` for the lease; log the `missing` list distinctly |
+| `426` | the server will not serve this node's `protocol_version` or `roxy_version` | treat as `5xx` for the lease; log the `missing` list distinctly |
 | `507` | flow quota exhausted | stop shipping until a new lease id arrives |
 | `5xx`, timeout, connection or TLS error | the control plane is unavailable | retry with backoff; the lease runs down |
 
@@ -69,8 +69,7 @@ certificate.
 {
   "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIH...\n-----END CERTIFICATE REQUEST-----\n",
   "roxy_version": "0.1.0",
-  "protocol_version": 1,
-  "features": ["valid_until", "sourceless_secrets", "readyz", "action:deny", "addon:wasm"]
+  "protocol_version": 1
 }
 ```
 
@@ -80,7 +79,9 @@ certificate.
   extensions: it sets the subject and SAN itself.
 - `protocol_version` is `1`. A server that does not speak the version
   answers `426` with `missing: ["protocol_version:1"]`.
-- `features` is the node's [feature list](/reference/node-protocol#features).
+- `roxy_version` is the node's roxy release. A server may refuse a node
+  below a version floor with `426` (see
+  [unsupported versions](/reference/node-protocol#unsupported-versions)).
 
 ```json title="EnrolResponse"
 {
@@ -137,7 +138,6 @@ in one header, `Roxy-Node-State`, whose value is a compact JSON object:
   "secrets_hash": "v12",
   "roxy_version": "0.1.0",
   "protocol_version": 1,
-  "features": ["valid_until", "sourceless_secrets", "readyz", "action:deny", "addon:wasm"],
   "uptime_seconds": 86400,
   "policy_state": "loaded",
   "spooled_bytes": 0
@@ -162,9 +162,9 @@ server answers:
   extended by it.
 - `410`, `401`, `426`, `5xx` as in the [errors table](/reference/node-protocol#errors).
 
-The server renders the lease for the node's reported version and features
-(see [features](/reference/node-protocol#features)). It may also use the reported hashes to notice
-a node that did not apply what it was sent.
+The server may use the reported `roxy_version` to refuse a node it will not
+serve, and the reported hashes to notice a node that did not apply what it
+was sent.
 
 ### Lease body
 
@@ -237,32 +237,22 @@ would reject, or a `secrets` map missing a name the config declares, is
 logged and discarded, and the node keeps the lease it has. A node without
 a lease denies everything and reports not ready.
 
-### Features
+### Unsupported versions
 
-`features` is a list of strings naming what the node can run. A server
-renders a lease only from features the node reported, and compares the
-rendered document against the list before sending it. If the policy needs
-something the node lacks, the answer is `426` whose body names it:
+A node reports `protocol_version` and `roxy_version` at enrolment, renewal
+and every lease fetch. A server that does not speak the protocol version,
+or that will not serve nodes below some roxy release, answers `426` whose
+body names what the node lacks:
 
 ```json title="Error"
-{"error": "unsupported", "message": "node lacks: addon:wasm", "missing": ["addon:wasm"]}
+{"error": "unsupported", "message": "roxy 0.1.0 is below this server's floor of 0.2.0", "missing": ["roxy_version:0.2.0"]}
 ```
 
-Feature names in v1:
-
-- `valid_until`: the node honours a top-level `valid_until`.
-- `sourceless_secrets`: the node accepts `secrets:` entries with no `env`
-  or `file` source.
-- `readyz`: the node serves `/readyz`.
-- `action:<name>` for each rule action the node's compiler knows, for
-  example `action:allow`, `action:deny`, `action:set_header`.
-- `addon:<kind>` for each addon kind the node can load, for example
-  `addon:wasm`.
-
-A node reports the same list at enrolment, renewal and every lease fetch.
-Feature names are case-sensitive. A server ignores names it does not know.
-This is what lets a fleet of mixed roxy versions take a rollout: the
-renderer can never send a node a policy it would fail to load.
+There is no capability negotiation beyond this. The node parses the
+rendered `config` strictly, so a lease that uses something the node does
+not understand fails to load and the node keeps the lease it has; the
+`config_hash` it reports on the next poll shows the server that the new
+lease was not applied.
 
 ## Flow upload
 

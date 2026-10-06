@@ -181,7 +181,7 @@ fn unsupported_error_must_name_what_is_missing() {
     assert!(
         validate(
             "Error",
-            &json!({"error": "unsupported", "message": "no", "missing": ["addon:wasm"]})
+            &json!({"error": "unsupported", "message": "no", "missing": ["roxy_version:0.2.0"]})
         )
         .is_ok()
     );

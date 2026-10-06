@@ -86,10 +86,10 @@ paths:
       summary: Fetch the node's lease, or learn that it is unchanged.
       description: |
         The node reports its state in `Roxy-Node-State` and the ETag of the
-        lease it holds in `If-None-Match`. The server renders for the reported
-        version and features. A `304` extends the lease the node already holds
-        by the amounts in its headers; the node applies them exactly as it
-        would `valid_for_seconds` and `refresh_after_seconds` from a `200`.
+        lease it holds in `If-None-Match`. A `304` extends the lease the node
+        already holds by the amounts in its headers; the node applies them
+        exactly as it would `valid_for_seconds` and `refresh_after_seconds`
+        from a `200`.
       parameters:
         - $ref: "#/components/parameters/NodeState"
         - name: If-None-Match
@@ -278,18 +278,18 @@ components:
             $ref: "#/components/schemas/Error"
     Unsupported:
       description: |
-        The server will not serve this protocol version, or will not render
-        for the node's features. `missing` names what the node lacks. For the
-        lease the node treats this as a server error (the lease runs down)
-        but logs it distinctly.
+        The server will not serve this protocol version, or this
+        `roxy_version` is below the floor it serves. `missing` names what the
+        node lacks. For the lease the node treats this as a server error (the
+        lease runs down) but logs it distinctly.
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
           example:
             error: unsupported
-            message: "node lacks: addon:wasm"
-            missing: ["addon:wasm"]
+            message: "roxy 0.1.0 is below this server's floor of 0.2.0"
+            missing: ["roxy_version:0.2.0"]
     ServerError:
       description: |
         The control plane is unavailable. Together with timeouts and
@@ -305,17 +305,6 @@ components:
       pattern: "^[A-Za-z0-9._-]{1,128}$"
       description: Chosen by the server at enrolment; stable for the life of the node.
 
-    Features:
-      type: array
-      description: |
-        What the node can run. `valid_until`, `sourceless_secrets`, `readyz`,
-        `action:<name>` per rule action, `addon:<kind>` per addon kind.
-        Case-sensitive; a server ignores names it does not know.
-      items:
-        type: string
-        minLength: 1
-      uniqueItems: true
-
     Seq:
       type: integer
       minimum: 0
@@ -324,7 +313,7 @@ components:
     EnrolRequest:
       type: object
       description: Body of enrol and renew.
-      required: [csr, roxy_version, protocol_version, features]
+      required: [csr, roxy_version, protocol_version]
       properties:
         csr:
           type: string
@@ -336,8 +325,6 @@ components:
         protocol_version:
           type: integer
           const: 1
-        features:
-          $ref: "#/components/schemas/Features"
 
     EnrolResponse:
       type: object
@@ -371,7 +358,6 @@ components:
         - secrets_hash
         - roxy_version
         - protocol_version
-        - features
         - uptime_seconds
         - policy_state
         - spooled_bytes
@@ -392,8 +378,6 @@ components:
         protocol_version:
           type: integer
           const: 1
-        features:
-          $ref: "#/components/schemas/Features"
         uptime_seconds:
           type: integer
           minimum: 0
@@ -572,7 +556,7 @@ components:
           type: string
         missing:
           type: array
-          description: "On `426`: the features or protocol version the node lacks, for example `protocol_version:1` or `addon:wasm`."
+          description: "On `426`: what the node lacks, for example `protocol_version:1` or `roxy_version:0.2.0`."
           minItems: 1
           items:
             type: string
