@@ -10,8 +10,8 @@ use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
 use reqwest::{Identity, StatusCode, Url};
 
 use crate::protocol::{
-    CertificateRequest, CertificateResponse, FlowAck, Lease, NodeState, PREFIX, PROTOCOL_VERSION,
-    headers,
+    CertificateRequest, CertificateResponse, ErrorBody, FlowAck, LEASE_REFRESH_AFTER_HEADER,
+    LEASE_VALID_FOR_HEADER, Lease, NODE_STATE_HEADER, NodeState, PREFIX, PROTOCOL_VERSION,
 };
 
 /// Per-request timeout. Lease and certificate calls are small; a flow
@@ -51,13 +51,17 @@ impl Transient {
 pub enum LeaseFetch {
     /// A new lease, with the etag to send on the next fetch.
     Lease(Box<Lease>, Option<String>),
-    /// 304: the lease the node holds is current.
-    Unchanged,
+    /// 304: the lease the node holds is current, and is extended by the
+    /// `valid_for_seconds` and `refresh_after_seconds` the headers carry.
+    Unchanged {
+        valid_for_seconds: Option<u64>,
+        refresh_after_seconds: Option<u64>,
+    },
     /// 410: the node is revoked. Definite and terminal.
     Revoked,
     /// 426: the server will not render for this node's version or
-    /// features; the body names what is missing.
-    Unsupported(String),
+    /// features; `missing` names what it lacks.
+    Unsupported(ErrorBody),
     /// 401: the certificate is not recognised.
     Unauthorized,
     /// 5xx, timeout, connection error, unreadable body.
@@ -70,8 +74,10 @@ pub enum ShipOutcome {
     Acked(FlowAck),
     /// 413: the batch was too large.
     TooLarge,
-    /// 507: this node's flow quota is exhausted. Terminal for shipping.
+    /// 507: this node's flow quota is exhausted under the current lease.
     QuotaExhausted,
+    /// 410: the node is revoked.
+    Revoked,
     Failed(Transient),
 }
 
@@ -109,12 +115,12 @@ pub struct ControlPlane {
     info: NodeInfo,
 }
 
-fn builder(trust: &Trust) -> Result<reqwest::ClientBuilder, ClientError> {
+fn builder(trust: &Trust, info: &NodeInfo) -> Result<reqwest::ClientBuilder, ClientError> {
     let mut b = reqwest::Client::builder()
         .use_rustls_tls()
         .https_only(true)
         .timeout(REQUEST_TIMEOUT)
-        .user_agent(format!("roxy-node/{PROTOCOL_VERSION}"))
+        .user_agent(format!("roxy/{}", info.roxy_version))
         .no_proxy();
     if let Some(pem) = &trust.ca_pem {
         b = b.tls_built_in_root_certs(false);
@@ -145,7 +151,7 @@ impl ControlPlane {
     pub fn unauthenticated(url: &str, trust: &Trust, info: NodeInfo) -> Result<Self, ClientError> {
         Ok(Self {
             base: parse_base(url)?,
-            http: builder(trust)?
+            http: builder(trust, &info)?
                 .build()
                 .map_err(|e| ClientError::Build(e.to_string()))?,
             info,
@@ -167,7 +173,7 @@ impl ControlPlane {
             Identity::from_pem(&pem).map_err(|e| ClientError::Identity(e.to_string()))?;
         Ok(Self {
             base: parse_base(url)?,
-            http: builder(trust)?
+            http: builder(trust, &info)?
                 .identity(identity)
                 .build()
                 .map_err(|e| ClientError::Build(e.to_string()))?,
@@ -190,7 +196,7 @@ impl ControlPlane {
         serde_json::to_vec(&CertificateRequest {
             csr: csr_pem,
             roxy_version: self.info.roxy_version.clone(),
-            protocol_version: PROTOCOL_VERSION.to_owned(),
+            protocol_version: PROTOCOL_VERSION,
             features: self.info.features.clone(),
         })
         .unwrap_or_default()
@@ -243,29 +249,34 @@ impl ControlPlane {
 
     /// `GET /lease`, conditional on `etag`, reporting `state`.
     pub async fn fetch_lease(&self, state: &NodeState, etag: Option<&str>) -> LeaseFetch {
-        let mut req = self
-            .http
-            .get(self.endpoint("lease"))
-            .header(headers::ROXY_VERSION, &state.roxy_version)
-            .header(headers::PROTOCOL_VERSION, PROTOCOL_VERSION)
-            .header(headers::FEATURES, state.features.join(","))
-            .header(headers::UPTIME, state.uptime_seconds.to_string())
-            .header(headers::POLICY_STATE, state.policy_state.as_str())
-            .header(headers::SPOOLED_BYTES, state.spooled_bytes.to_string());
-        for (name, value) in [
-            (headers::LEASE_ID, &state.lease_id),
-            (headers::CONFIG_HASH, &state.config_hash),
-            (headers::SECRETS_HASH, &state.secrets_hash),
-        ] {
-            if let Some(v) = value {
-                req = req.header(name, v);
-            }
-        }
+        let mut req = self.http.get(self.endpoint("lease")).header(
+            NODE_STATE_HEADER,
+            serde_json::to_string(state).unwrap_or_default(),
+        );
         if let Some(etag) = etag {
             req = req.header(IF_NONE_MATCH, etag);
         }
-        let (status, etag, body) = match send_with_etag(req).await {
-            Ok(r) => r,
+        let res = match req.send().await {
+            Ok(res) => res,
+            Err(e) => return LeaseFetch::Failed(Transient(describe(e))),
+        };
+        let status = res.status();
+        let header = |name: &str| {
+            res.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        if status == StatusCode::NOT_MODIFIED {
+            let seconds = |name| header(name).and_then(|v| v.trim().parse::<u64>().ok());
+            return LeaseFetch::Unchanged {
+                valid_for_seconds: seconds(LEASE_VALID_FOR_HEADER),
+                refresh_after_seconds: seconds(LEASE_REFRESH_AFTER_HEADER),
+            };
+        }
+        let etag = header(ETAG.as_str());
+        let body = match read_body(res).await {
+            Ok(b) => b,
             Err(e) => return LeaseFetch::Failed(e),
         };
         match status {
@@ -273,13 +284,8 @@ impl ControlPlane {
                 Ok(lease) => LeaseFetch::Lease(Box::new(lease), etag),
                 Err(e) => LeaseFetch::Failed(Transient(format!("lease body: {e}"))),
             },
-            StatusCode::NOT_MODIFIED => LeaseFetch::Unchanged,
             StatusCode::GONE => LeaseFetch::Revoked,
-            StatusCode::UPGRADE_REQUIRED => LeaseFetch::Unsupported(
-                String::from_utf8_lossy(&body[..body.len().min(1000)])
-                    .trim()
-                    .to_owned(),
-            ),
+            StatusCode::UPGRADE_REQUIRED => LeaseFetch::Unsupported(error_body(&body)),
             StatusCode::UNAUTHORIZED => LeaseFetch::Unauthorized,
             other => LeaseFetch::Failed(Transient::status(other, &body)),
         }
@@ -312,27 +318,32 @@ impl ControlPlane {
             },
             StatusCode::PAYLOAD_TOO_LARGE => ShipOutcome::TooLarge,
             StatusCode::INSUFFICIENT_STORAGE => ShipOutcome::QuotaExhausted,
+            StatusCode::GONE => ShipOutcome::Revoked,
             other => ShipOutcome::Failed(Transient::status(other, &body)),
         }
     }
 }
 
-async fn send(req: reqwest::RequestBuilder) -> Result<(StatusCode, Vec<u8>), Transient> {
-    send_with_etag(req)
-        .await
-        .map(|(status, _, body)| (status, body))
+/// The error body of a non-2xx response, or a stand-in built from the
+/// raw text when it is not one.
+fn error_body(body: &[u8]) -> ErrorBody {
+    serde_json::from_slice(body).unwrap_or_else(|_| ErrorBody {
+        error: "unknown".into(),
+        message: String::from_utf8_lossy(&body[..body.len().min(200)])
+            .trim()
+            .to_owned(),
+        missing: Vec::new(),
+    })
 }
 
-async fn send_with_etag(
-    req: reqwest::RequestBuilder,
-) -> Result<(StatusCode, Option<String>, Vec<u8>), Transient> {
+async fn send(req: reqwest::RequestBuilder) -> Result<(StatusCode, Vec<u8>), Transient> {
     let res = req.send().await.map_err(|e| Transient(describe(e)))?;
     let status = res.status();
-    let etag = res
-        .headers()
-        .get(ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    Ok((status, read_body(res).await?))
+}
+
+async fn read_body(res: reqwest::Response) -> Result<Vec<u8>, Transient> {
+    let status = res.status();
     if res.content_length().is_some_and(|n| n > MAX_BODY as u64) {
         return Err(Transient(format!("{status}: response body too large")));
     }
@@ -343,7 +354,7 @@ async fn send_with_etag(
     if body.len() > MAX_BODY {
         return Err(Transient(format!("{status}: response body too large")));
     }
-    Ok((status, etag, body.to_vec()))
+    Ok(body.to_vec())
 }
 
 /// A reqwest error without the URL, which may carry a query string.
@@ -378,6 +389,7 @@ pub(crate) mod tests {
             config_hash: Some("sha256:aa".into()),
             secrets_hash: None,
             roxy_version: "0.1.0-test".into(),
+            protocol_version: PROTOCOL_VERSION,
             features: vec!["valid_until".into(), "readyz".into()],
             uptime_seconds: 42,
             policy_state: PolicyState::Loaded,
@@ -444,23 +456,44 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("CERTIFICATE REQUEST")
         );
-        assert_eq!(body["protocol_version"], "1");
+        assert_eq!(body["protocol_version"], 1);
+        assert_eq!(enrol.header("user-agent"), Some("roxy/0.1.0-test"));
         assert_eq!(body["features"][0], "valid_until");
 
+        mock.push(
+            "/roxy/v1/lease",
+            Reply::status(304)
+                .with_header(LEASE_VALID_FOR_HEADER, "900")
+                .with_header(LEASE_REFRESH_AFTER_HEADER, "300"),
+        );
+        assert!(matches!(
+            cp.fetch_lease(&state(), Some("\"e1\"")).await,
+            LeaseFetch::Unchanged {
+                valid_for_seconds: Some(900),
+                refresh_after_seconds: Some(300),
+            }
+        ));
         mock.push("/roxy/v1/lease", Reply::status(304));
         assert!(matches!(
             cp.fetch_lease(&state(), Some("\"e1\"")).await,
-            LeaseFetch::Unchanged
+            LeaseFetch::Unchanged {
+                valid_for_seconds: None,
+                refresh_after_seconds: None,
+            }
         ));
         let fetch = &mock.requests_to("/roxy/v1/lease")[0];
         assert_eq!(fetch.client.as_deref(), Some("node-1"), "mTLS identity");
         assert_eq!(fetch.header("if-none-match"), Some("\"e1\""));
-        assert_eq!(fetch.header(headers::LEASE_ID), Some("L1"));
-        assert_eq!(fetch.header(headers::CONFIG_HASH), Some("sha256:aa"));
-        assert_eq!(fetch.header(headers::SECRETS_HASH), None);
-        assert_eq!(fetch.header(headers::POLICY_STATE), Some("loaded"));
-        assert_eq!(fetch.header(headers::SPOOLED_BYTES), Some("7"));
-        assert_eq!(fetch.header(headers::FEATURES), Some("valid_until,readyz"));
+        let reported: serde_json::Value =
+            serde_json::from_str(fetch.header(NODE_STATE_HEADER).unwrap()).unwrap();
+        assert_eq!(reported["lease_id"], "L1");
+        assert_eq!(reported["config_hash"], "sha256:aa");
+        assert_eq!(reported["secrets_hash"], serde_json::Value::Null);
+        assert_eq!(reported["protocol_version"], 1);
+        assert_eq!(reported["policy_state"], "loaded");
+        assert_eq!(reported["spooled_bytes"], 7);
+        assert_eq!(reported["uptime_seconds"], 42);
+        assert_eq!(reported["features"][1], "readyz");
     }
 
     #[tokio::test]
@@ -510,15 +543,30 @@ pub(crate) mod tests {
         ));
         mock.push(
             path,
+            Reply::json(
+                426,
+                &ErrorBody {
+                    error: "unsupported".into(),
+                    message: "node lacks: action:respond".into(),
+                    missing: vec!["action:respond".into()],
+                },
+            ),
+        );
+        assert!(matches!(
+            cp.fetch_lease(&state(), None).await,
+            LeaseFetch::Unsupported(e) if e.missing == ["action:respond"] && e.error == "unsupported"
+        ));
+        mock.push(
+            path,
             Reply::Status {
                 status: 426,
                 headers: vec![],
-                body: b"missing feature: respond".to_vec(),
+                body: b"nope".to_vec(),
             },
         );
         assert!(matches!(
             cp.fetch_lease(&state(), None).await,
-            LeaseFetch::Unsupported(m) if m == "missing feature: respond"
+            LeaseFetch::Unsupported(e) if e.message == "nope"
         ));
         mock.push(path, Reply::status(401));
         assert!(matches!(
@@ -593,6 +641,8 @@ pub(crate) mod tests {
             cp.ship_flows(&body).await,
             ShipOutcome::QuotaExhausted
         ));
+        mock.push(path, Reply::status(410));
+        assert!(matches!(cp.ship_flows(&body).await, ShipOutcome::Revoked));
         mock.push(path, Reply::status(502));
         assert!(matches!(cp.ship_flows(&body).await, ShipOutcome::Failed(_)));
     }
@@ -618,7 +668,7 @@ pub(crate) mod tests {
             ControlPlane::unauthenticated(
                 "https://cp.example",
                 &Trust {
-                    ca_pem: Some("garbage".into())
+                    ca_pem: Some("garbage".into()),
                 },
                 info()
             ),

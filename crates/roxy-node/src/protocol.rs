@@ -8,22 +8,27 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// The protocol version this client speaks.
-pub const PROTOCOL_VERSION: &str = "1";
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Path prefix of every endpoint.
 pub const PREFIX: &str = "/roxy/v1";
 
-/// Request headers a lease fetch reports node state in.
-pub mod headers {
-    pub const LEASE_ID: &str = "x-roxy-lease-id";
-    pub const CONFIG_HASH: &str = "x-roxy-config-hash";
-    pub const SECRETS_HASH: &str = "x-roxy-secrets-hash";
-    pub const ROXY_VERSION: &str = "x-roxy-version";
-    pub const PROTOCOL_VERSION: &str = "x-roxy-protocol-version";
-    pub const FEATURES: &str = "x-roxy-features";
-    pub const UPTIME: &str = "x-roxy-uptime-seconds";
-    pub const POLICY_STATE: &str = "x-roxy-policy-state";
-    pub const SPOOLED_BYTES: &str = "x-roxy-spooled-bytes";
+/// Lease fetch request header: [`NodeState`] as one compact JSON object.
+pub const NODE_STATE_HEADER: &str = "roxy-node-state";
+/// `304` response headers: the unchanged lease's `valid_for_seconds` and
+/// `refresh_after_seconds`, which extend it exactly as a `200` would.
+pub const LEASE_VALID_FOR_HEADER: &str = "roxy-lease-valid-for";
+pub const LEASE_REFRESH_AFTER_HEADER: &str = "roxy-lease-refresh-after";
+
+/// Body of every non-2xx, non-304 response.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ErrorBody {
+    /// A stable code.
+    pub error: String,
+    pub message: String,
+    /// On 426: the features or protocol version the node lacks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<String>,
 }
 
 /// `POST /roxy/v1/enrol` and `POST /roxy/v1/renew` body.
@@ -32,7 +37,7 @@ pub struct CertificateRequest {
     /// PEM `CERTIFICATE REQUEST`; the key never leaves the node.
     pub csr: String,
     pub roxy_version: String,
-    pub protocol_version: String,
+    pub protocol_version: u32,
     pub features: Vec<String>,
 }
 
@@ -48,13 +53,16 @@ pub struct CertificateResponse {
     pub renew_after_seconds: u64,
 }
 
-/// What the node is running, as reported with every lease fetch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What the node is running, as reported with every lease fetch in
+/// [`NODE_STATE_HEADER`]. The three hashes are `null` before the first
+/// lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeState {
     pub lease_id: Option<String>,
     pub config_hash: Option<String>,
     pub secrets_hash: Option<String>,
     pub roxy_version: String,
+    pub protocol_version: u32,
     pub features: Vec<String>,
     pub uptime_seconds: u64,
     pub policy_state: PolicyState,
@@ -62,7 +70,8 @@ pub struct NodeState {
 }
 
 /// The node's view of its own policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PolicyState {
     /// No lease has been applied: everything is denied.
     None,

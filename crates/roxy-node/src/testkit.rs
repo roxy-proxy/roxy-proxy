@@ -169,6 +169,11 @@ impl Recorded {
         self.headers.get(name).and_then(|v| v.to_str().ok())
     }
 
+    /// The `Roxy-Node-State` header, parsed.
+    pub(crate) fn node_state(&self) -> crate::protocol::NodeState {
+        serde_json::from_str(self.header(crate::protocol::NODE_STATE_HEADER).unwrap()).unwrap()
+    }
+
     pub(crate) fn json(&self) -> serde_json::Value {
         let body = if self.header("content-encoding") == Some("gzip") {
             use std::io::Read as _;

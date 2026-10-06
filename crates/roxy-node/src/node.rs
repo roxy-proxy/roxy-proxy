@@ -14,7 +14,7 @@ use crate::client::{
     CertificateError, ClientError, ControlPlane, LeaseFetch, NodeInfo, ShipOutcome, Trust,
 };
 use crate::identity::{self, IdentityError};
-use crate::protocol::{Lease, NodeState, PolicyState, encode_flow_batch};
+use crate::protocol::{Lease, NodeState, PROTOCOL_VERSION, PolicyState, encode_flow_batch};
 use crate::spool::Spool;
 use crate::state::{StateDir, StateError};
 
@@ -74,6 +74,10 @@ pub trait LeaseHandler: Send + Sync {
         received_at: DateTime<Utc>,
         change: Change,
     ) -> Result<(), String>;
+
+    /// A `304`: the lease the node runs is extended to `received_at +
+    /// valid_for`. Nothing else changes.
+    fn extend(&self, received_at: DateTime<Utc>, valid_for: Duration) -> Result<(), String>;
 
     /// The node is revoked: deny everything, at once.
     fn revoke(&self);
@@ -326,6 +330,7 @@ impl Node {
             config_hash: current.config_hash,
             secrets_hash: current.secrets_hash,
             roxy_version: self.config.info.roxy_version.clone(),
+            protocol_version: PROTOCOL_VERSION,
             features: self.config.info.features.clone(),
             uptime_seconds: self.started.elapsed().as_secs(),
             policy_state: self.handler.policy_state(),
@@ -347,9 +352,12 @@ impl Node {
                     backoff.reset();
                     self.apply(&lease, etag)
                 }
-                LeaseFetch::Unchanged => {
+                LeaseFetch::Unchanged {
+                    valid_for_seconds,
+                    refresh_after_seconds,
+                } => {
                     backoff.reset();
-                    lock(&self.current).refresh_after
+                    self.extend(valid_for_seconds, refresh_after_seconds)
                 }
                 LeaseFetch::Revoked => {
                     tracing::warn!(
@@ -359,9 +367,10 @@ impl Node {
                     self.handler.revoke();
                     return;
                 }
-                LeaseFetch::Unsupported(what) => {
+                LeaseFetch::Unsupported(e) => {
                     tracing::error!(
-                        missing = %what,
+                        missing = %e.missing.join(","),
+                        message = %e.message,
                         "control plane will not render a lease for this roxy version or feature set; the lease runs down"
                     );
                     backoff.wait()
@@ -380,6 +389,31 @@ impl Node {
             };
             tokio::time::sleep(self.scaled(wait)).await;
         }
+    }
+
+    /// A `304` with the lease's durations moves `valid_until` forward from
+    /// now. Without them (an older server) the lease is left to run down
+    /// and only the poll interval is kept.
+    fn extend(
+        &self,
+        valid_for_seconds: Option<u64>,
+        refresh_after_seconds: Option<u64>,
+    ) -> Duration {
+        let mut current = lock(&self.current);
+        if let Some(valid_for) = valid_for_seconds {
+            if let Some(refresh) = refresh_after_seconds {
+                current.refresh_after = Duration::from_secs(refresh.clamp(1, valid_for.max(1)));
+            }
+            if let Err(e) = self
+                .handler
+                .extend(Utc::now(), Duration::from_secs(valid_for))
+            {
+                tracing::error!(error = %e, "lease could not be extended");
+            }
+        } else {
+            tracing::warn!("304 without roxy-lease-valid-for; the lease is not extended");
+        }
+        current.refresh_after
     }
 
     /// Checks and applies a fetched lease; returns how long to wait for the
@@ -402,7 +436,11 @@ impl Node {
         let change = Change {
             config: current.config_hash.as_deref() != Some(&lease.config_hash),
             secrets: current.secrets_hash.as_deref() != Some(&lease.secrets_hash),
-            state_epoch: current.state_epoch.as_deref() != Some(&lease.state_epoch),
+            // The first lease sets the epoch without clearing anything.
+            state_epoch: current
+                .state_epoch
+                .as_deref()
+                .is_some_and(|e| e != lease.state_epoch),
         };
         match self.handler.apply(lease, received_at, change) {
             Ok(()) => {
@@ -525,10 +563,20 @@ impl Node {
             if lock(&self.current).lease_id.is_none() && !self.spool.is_closed() {
                 continue;
             }
+            let lease_id = lock(&self.current).lease_id.clone();
+            if cap.stopped_for.is_some() && cap.stopped_for == lease_id {
+                // Shipping resumes with a new lease id; meanwhile the spool
+                // applies `on_high_water`.
+                let _ = tokio::time::timeout(flush, self.spool.pushed.notified()).await;
+                continue;
+            }
+            cap.stopped_for = None;
             if self.ship_once(&mut cap).await {
                 backoff.reset();
-            } else if cap.terminal {
-                return;
+            } else if cap.stopped_for.is_some() {
+                if self.spool.is_closed() {
+                    return;
+                }
             } else {
                 tokio::time::sleep(self.scaled(backoff.wait())).await;
             }
@@ -553,6 +601,16 @@ impl Node {
                 self.spool.ack(ack.acked_through);
                 true
             }
+            ShipOutcome::TooLarge if batch.lines.len() == 1 => {
+                // Nothing smaller to send: the event is lost, and said so.
+                tracing::error!(
+                    seq = batch.seq_first,
+                    bytes = batch.bytes,
+                    "a single flow event is larger than the control plane accepts; dropped"
+                );
+                self.spool.ack(batch.seq_first);
+                true
+            }
             ShipOutcome::TooLarge => {
                 cap.halve(batch.lines.len());
                 tracing::warn!(
@@ -563,14 +621,20 @@ impl Node {
                 false
             }
             ShipOutcome::QuotaExhausted => {
-                if !cap.terminal {
-                    tracing::error!(
-                        spooled_bytes = self.spool.pending_bytes(),
-                        on_high_water = ?settings.on_high_water,
-                        "control plane flow quota exhausted for this node; flow shipping stopped"
-                    );
-                }
-                cap.terminal = true;
+                tracing::error!(
+                    lease_id = %lease_id,
+                    spooled_bytes = self.spool.pending_bytes(),
+                    on_high_water = ?settings.on_high_water,
+                    "control plane flow quota exhausted for this node; flow shipping stops until a new lease"
+                );
+                cap.stopped_for = Some(lease_id);
+                false
+            }
+            ShipOutcome::Revoked => {
+                tracing::warn!(
+                    "control plane refuses flows from a revoked node; flow shipping stops"
+                );
+                cap.stopped_for = Some(lease_id);
                 false
             }
             ShipOutcome::Failed(e) => {
@@ -581,11 +645,12 @@ impl Node {
     }
 }
 
-/// The shipper's own batch limit after a 413, reset after a while.
+/// The shipper's own batch limit after a 413 (reset after a while), and
+/// the lease under which shipping stopped (507 or 410).
 #[derive(Debug, Default)]
 struct BatchCap {
     events: Option<(u64, Instant)>,
-    terminal: bool,
+    stopped_for: Option<String>,
 }
 
 impl BatchCap {
@@ -663,11 +728,14 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
-    use crate::protocol::{FlowAck, OnHighWater, sha256_hex};
+    use crate::protocol::{
+        FlowAck, LEASE_REFRESH_AFTER_HEADER, LEASE_VALID_FOR_HEADER, sha256_hex,
+    };
     use crate::testkit::{MockServer, Reply};
 
     struct Recorder {
         applied: Mutex<Vec<(Lease, DateTime<Utc>, Change)>>,
+        extended: Mutex<Vec<(DateTime<Utc>, Duration)>>,
         revoked: AtomicUsize,
         state: Mutex<PolicyState>,
         fail_next: AtomicBool,
@@ -677,6 +745,7 @@ mod tests {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 applied: Mutex::new(Vec::new()),
+                extended: Mutex::new(Vec::new()),
                 revoked: AtomicUsize::new(0),
                 state: Mutex::new(PolicyState::None),
                 fail_next: AtomicBool::new(false),
@@ -685,6 +754,11 @@ mod tests {
     }
 
     impl LeaseHandler for Recorder {
+        fn extend(&self, at: DateTime<Utc>, valid_for: Duration) -> Result<(), String> {
+            lock(&self.extended).push((at, valid_for));
+            Ok(())
+        }
+
         fn apply(&self, lease: &Lease, at: DateTime<Utc>, change: Change) -> Result<(), String> {
             if self.fail_next.swap(false, Ordering::AcqRel) {
                 return Err("config invalid: boom".into());
@@ -768,16 +842,15 @@ mod tests {
         h.mock.wait_for(LEASE, 2).await;
         let fetches = h.mock.requests_to(LEASE);
         assert_eq!(fetches[0].client.as_deref(), Some("n1"));
-        assert_eq!(fetches[0].header("x-roxy-policy-state"), Some("none"));
-        assert_eq!(fetches[0].header("x-roxy-lease-id"), None);
+        let first = fetches[0].node_state();
+        assert_eq!(first.policy_state, PolicyState::None);
+        assert_eq!(first.lease_id, None);
         assert_eq!(fetches[1].header("if-none-match"), Some("\"1\""));
-        assert_eq!(fetches[1].header("x-roxy-lease-id"), Some("L1"));
-        assert_eq!(
-            fetches[1].header("x-roxy-config-hash"),
-            Some(l1.config_hash.as_str())
-        );
-        assert_eq!(fetches[1].header("x-roxy-secrets-hash"), Some("s1"));
-        assert_eq!(fetches[1].header("x-roxy-policy-state"), Some("loaded"));
+        let second = fetches[1].node_state();
+        assert_eq!(second.lease_id.as_deref(), Some("L1"));
+        assert_eq!(second.config_hash.as_deref(), Some(l1.config_hash.as_str()));
+        assert_eq!(second.secrets_hash.as_deref(), Some("s1"));
+        assert_eq!(second.policy_state, PolicyState::Loaded);
         let applied = lock(&rec.applied).clone();
         assert_eq!(applied.len(), 1);
         let (lease, at, change) = &applied[0];
@@ -788,8 +861,9 @@ mod tests {
             Change {
                 config: true,
                 secrets: true,
-                state_epoch: true
-            }
+                state_epoch: false
+            },
+            "the first lease sets the epoch without clearing"
         );
         assert_eq!(node.node_id().as_deref(), Some("n1"));
         task.abort();
@@ -889,14 +963,55 @@ mod tests {
         assert_eq!(
             changes,
             vec![
-                ("L1".to_owned(), c(true, true, true)),
+                ("L1".to_owned(), c(true, true, false)),
                 ("L2".to_owned(), c(false, true, false)),
                 ("L3".to_owned(), c(false, false, false)),
                 ("L4".to_owned(), c(true, false, true)),
             ]
         );
         let last = h.mock.requests_to(LEASE).pop().unwrap();
-        assert_eq!(last.header("x-roxy-lease-id"), Some("L4"));
+        assert_eq!(last.node_state().lease_id.as_deref(), Some("L4"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_lease_is_extended_from_the_304_headers() {
+        let h = Harness::new().await;
+        h.mock.push("/roxy/v1/enrol", Reply::issue("n1"));
+        h.mock.push(
+            LEASE,
+            Reply::json(200, &lease("L1", "version: 1\n", "s1", "e1")),
+        );
+        h.mock.push(
+            LEASE,
+            Reply::status(304)
+                .with_header(LEASE_VALID_FOR_HEADER, "900")
+                .with_header(LEASE_REFRESH_AFTER_HEADER, "1"),
+        );
+        h.mock.push(LEASE, Reply::status(304));
+        h.mock.fallback(
+            LEASE,
+            Reply::status(304).with_header(LEASE_VALID_FOR_HEADER, "60"),
+        );
+        let (node, rec) = h.node(true);
+        let task = tokio::spawn(node.clone().run());
+        h.mock.wait_for(LEASE, 4).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while lock(&rec.extended).len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let extended = lock(&rec.extended).clone();
+        assert_eq!(extended[0].1, Duration::from_mins(15));
+        assert!((Utc::now() - extended[0].0).num_seconds() < 5);
+        assert_eq!(
+            extended[1].1,
+            Duration::from_secs(60),
+            "a 304 without durations extends nothing"
+        );
+        assert_eq!(lock(&rec.applied).len(), 1, "nothing was rebuilt");
         task.abort();
     }
 
@@ -925,7 +1040,7 @@ mod tests {
         rec.fail_next.store(true, Ordering::Release);
         h.mock.wait_for(LEASE, 3).await;
         let third = &h.mock.requests_to(LEASE)[2];
-        assert_eq!(third.header("x-roxy-lease-id"), Some("L1"));
+        assert_eq!(third.node_state().lease_id.as_deref(), Some("L1"));
         assert_eq!(
             third.header("if-none-match"),
             None,
@@ -987,11 +1102,14 @@ mod tests {
         h.mock.push(LEASE, Reply::status(401));
         h.mock.push(
             LEASE,
-            Reply::Status {
-                status: 426,
-                headers: vec![],
-                body: b"needs respond".to_vec(),
-            },
+            Reply::json(
+                426,
+                &crate::protocol::ErrorBody {
+                    error: "unsupported".into(),
+                    message: "node lacks: action:respond".into(),
+                    missing: vec!["action:respond".into()],
+                },
+            ),
         );
         h.mock.push(LEASE, Reply::status(500));
         h.mock.push(LEASE, Reply::Hangup);
@@ -1097,7 +1215,7 @@ mod tests {
             "halved"
         );
         assert_eq!(posts[2].json()["seq_first"], 2);
-        // 507: nothing more is sent, whatever is pushed.
+        // 507: nothing more is sent under this lease, whatever is pushed.
         for i in 4..8 {
             spool.push(format!("{{\"i\":{i}}}").as_bytes());
         }
@@ -1107,6 +1225,41 @@ mod tests {
             spool.pending_events(),
             6,
             "events stay spooled up to the high water"
+        );
+        // A new lease id resumes shipping.
+        h.mock.push(
+            LEASE,
+            Reply::json(200, &lease("L2", "version: 1\n", "s1", "e1")),
+        );
+        h.mock.wait_for(FLOWS, 4).await;
+        assert_eq!(h.mock.requests_to(FLOWS)[3].json()["lease_id"], "L2");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_single_event_too_large_is_dropped_and_shipping_goes_on() {
+        let h = Harness::new().await;
+        h.mock.push("/roxy/v1/enrol", Reply::issue("n1"));
+        let mut l = lease("L1", "version: 1\n", "s1", "e1");
+        l.flow.batch_max_events = 1;
+        l.flow.flush_interval_seconds = 1;
+        h.mock.push(LEASE, Reply::json(200, &l));
+        h.mock.fallback(LEASE, Reply::status(304));
+        h.mock.push(FLOWS, Reply::status(413));
+        h.mock
+            .fallback(FLOWS, Reply::json(200, &FlowAck { acked_through: 1 }));
+        let (node, _) = h.node(true);
+        let spool = node.spool().clone();
+        let task = tokio::spawn(node.clone().run());
+        h.mock.wait_for(LEASE, 1).await;
+        spool.push(b"{\"i\":0}");
+        spool.push(b"{\"i\":1}");
+        let posts = h.mock.wait_for(FLOWS, 2).await;
+        assert_eq!(posts[0].json()["seq_first"], 0);
+        assert_eq!(
+            posts[1].json()["seq_first"],
+            1,
+            "seq 0 was dropped, not retried"
         );
         task.abort();
     }
@@ -1194,7 +1347,6 @@ mod tests {
         assert!(renewals.iter().all(|r| r.client.as_deref() == Some("n1")));
         h.mock.wait_for(LEASE, 2).await;
         task.abort();
-        let _ = OnHighWater::Hold;
     }
 
     #[test]
