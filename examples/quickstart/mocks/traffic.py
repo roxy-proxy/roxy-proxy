@@ -2,8 +2,9 @@
 quota board and Inspect View have something to show from `compose up`.
 
 Each user calls on their own cadence, in their own thread. At the default
-quota (600 tokens a minute) alice's cadence takes her over it in the first
-minute, bob's never does, and mallory's credential is unknown. One line per
+quota (a bucket of 600 tokens refilling 5 a second) alice's cadence drains
+hers inside the first minute, bob's holds, and mallory's credential is
+unknown. One line per
 thing that came back, prefixed with the user and call number.
 
     TRAFFIC_SCHEDULE   user=secret@seconds, comma-separated

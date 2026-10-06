@@ -5,13 +5,12 @@ Clients behind roxy, with three controls on every model call:
 - an **auth gate**: a WASM addon that checks the client's credential with a
   central auth service and tags the flow with the user it belongs to;
 - a **token quota**: a WASM addon that asks a quota service whether that
-  user may still spend, and reports the tokens each response used;
+  user's token bucket holds anything, and reports the tokens each response used;
 - the **sentinel**: an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel)
   sidecar that blocks tool calls matching a denylist.
 
 The model is a scripted stand-in and the traffic is generated, so nothing
-here needs an API key or a route out: start it and watch. Nothing survives
-`docker compose down`. The walkthrough is the
+here needs an API key or a route out: start it and watch. The walkthrough is the
 [quickstart](https://roxy-proxy.github.io/roxy-proxy/quickstart) on the docs site.
 
 ```sh
@@ -32,7 +31,7 @@ Ctrl-C stops the stack; `docker compose down -v` removes it.
 | [`addons/Dockerfile`](addons/Dockerfile) | builds both addons for `wasm32-wasip2` and puts them in roxy's image |
 | [`mocks/fake_model.py`](mocks/fake_model.py) | the model: the responses in [`responses.json`](mocks/responses.json), in order, streamed or whole, with Anthropic-shaped usage |
 | [`mocks/auth_service.py`](mocks/auth_service.py) | the auth service: which credential is whose |
-| [`mocks/quota_board.py`](mocks/quota_board.py) | the quota service and its live page |
+| [`mocks/quota_board.py`](mocks/quota_board.py) | the quota service: a token bucket per user, with a live page and the last five minutes of levels |
 | [`mocks/traffic.py`](mocks/traffic.py) | the traffic: a call every few seconds for each user in `TRAFFIC_SCHEDULE` |
 | [`mocks/chat.py`](mocks/chat.py) | the client the traffic uses: the Anthropic SDK through roxy, as a named user |
 | [`sentinel/`](sentinel/) | the sentinel sidecar, a service layer; `SENTINEL_DENY` sets its regex |

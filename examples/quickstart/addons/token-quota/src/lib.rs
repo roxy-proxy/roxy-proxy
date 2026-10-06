@@ -1,7 +1,8 @@
 //! Holds each user to a token quota kept by a quota service.
 //!
 //! Before a model call leaves, the layer asks the `quota-check` endpoint
-//! whether the user may spend; a refusal is answered here with a `429`.
+//! whether the user's bucket holds anything; a refusal is answered here
+//! with a `429` that says when to try again.
 //! After the model's response has streamed through, it reports the tokens
 //! the response said it used to `quota-report`. The layer reads the usage
 //! Anthropic Messages responses carry (`message_start` and `message_delta`
@@ -34,9 +35,10 @@ const MAX_RESPONSE: usize = 8 * 1024 * 1024;
 #[derive(Deserialize)]
 struct Allowance {
     allowed: bool,
-    used: u64,
-    limit: u64,
-    resets_in: u64,
+    available: i64,
+    capacity: u64,
+    refill_per_sec: f64,
+    retry_in: u64,
 }
 
 pub struct TokenQuota;
@@ -54,7 +56,7 @@ impl Layer for TokenQuota {
                 "quota",
                 &serde_json::json!({
                     "result": "refused", "user": user,
-                    "used": allowance.used, "limit": allowance.limit,
+                    "available": allowance.available, "capacity": allowance.capacity,
                 })
                 .to_string(),
                 false,
@@ -127,11 +129,11 @@ fn report(user: &str, usage: Usage) {
 }
 
 /// An Anthropic-shaped rate-limit error, so SDK clients raise their usual
-/// exception, with `retry-after` saying when the window resets.
+/// exception, with `retry-after` saying when the bucket is positive again.
 fn over_quota(a: &Allowance) -> Response {
     let message = format!(
-        "token quota exhausted: {} of {} tokens used; resets in {}s",
-        a.used, a.limit, a.resets_in
+        "token bucket empty ({} tokens, refills {}/s); try again in {}s",
+        a.capacity, a.refill_per_sec, a.retry_in
     );
     Response::json(
         429,
@@ -141,7 +143,7 @@ fn over_quota(a: &Allowance) -> Response {
         })
         .to_string(),
     )
-    .with_header("retry-after", a.resets_in.max(1).to_string())
+    .with_header("retry-after", a.retry_in.max(1).to_string())
 }
 
 /// The tokens a response reported. Anthropic sends `input_tokens` with the

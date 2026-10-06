@@ -1,7 +1,6 @@
 # roxy quickstart: clients behind roxy, with an auth gate, a per-user token
 # quota and an inspect_sentinel sidecar, talking to a scripted model.
-# Nothing here needs an API key or a route out, and nothing survives
-# `docker compose down`.
+# Nothing here needs an API key or a route out.
 #
 #   docker compose up --build --attach traffic    # Ctrl-C stops it; down -v cleans up
 #
@@ -70,14 +69,14 @@ services:
       PORT: 9100
     networks: [lab]
 
-  # Per-user token quota, with a live page. Published on loopback only.
+  # Per-user token buckets, with a live page. Published on loopback only.
   quota-board:
     <<: *mock
     command: ["python", "quota_board.py"]
     environment:
       PORT: 8090
-      QUOTA_TOKENS: ${QUOTA_TOKENS:-600}
-      QUOTA_WINDOW_SECS: ${QUOTA_WINDOW_SECS:-60}
+      QUOTA_CAPACITY: ${QUOTA_CAPACITY:-600}        # tokens in a full bucket
+      QUOTA_REFILL_PER_SEC: ${QUOTA_REFILL_PER_SEC:-5}
     ports:
       - "127.0.0.1:8090:8090"
     networks: [lab, viewer]
@@ -117,8 +116,7 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     tmpfs: [/tmp]
-    # Starts with an empty log: the volume only exists to share it with
-    # Inspect View, not to keep it.
+    # Starts with an empty log; the volume is there to share it with Inspect View.
     command: ["sh", "-c", "rm -rf /logs/* && exec python sidecar.py"]
     environment:
       SENTINEL: policies:deny_regex

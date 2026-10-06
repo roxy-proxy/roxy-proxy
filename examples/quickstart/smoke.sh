@@ -14,7 +14,7 @@ if [[ -z "${KEEP:-}" ]]; then
 fi
 
 wanted=(
-    '^\[alice #[0-9]+\] 429 RateLimitError: token quota exhausted'
+    '^\[alice #[0-9]+\] 429 RateLimitError: token bucket empty'
     '^\[mallory #1\] 401 AuthenticationError'
     "^\[(alice|bob) #[0-9]+\] tool call: Bash \{'command': 'ls -la'\}"
     "sentinel blocked a Bash tool call \(denylist match: 'curl'\)"

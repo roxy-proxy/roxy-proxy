@@ -34,12 +34,12 @@ The first run builds the images, which takes a few minutes: the two addons compi
 - **roxy**: the proxy on `127.0.0.1:3128`, with the two addons at `/etc/roxy/addons/`.
 - **fake-model**: the model. It answers `POST /v1/messages` from [`responses.json`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/mocks/responses.json), one entry per call in order, streamed or whole, with the `usage` the real API sends. It refuses a request without the API key, which only roxy has.
 - **auth-service**: which credential belongs to whom. `alice-secret` is alice and `bob-secret` is bob.
-- **quota-board**: the quota service, with a live page on `127.0.0.1:8090`. Each user gets 600 tokens per minute.
+- **quota-board**: the quota service, with a live page on `127.0.0.1:8090`. Each user has a bucket of 600 tokens that refills at five a second.
 - **sentinel**: the inspect_sentinel sidecar, on a network with no route out. Every model response streams through it.
 - **inspect-view**: Inspect's log viewer on `127.0.0.1:7575`, showing each client session and the sentinel's verdict on every tool call.
 - **traffic**: the clients. Alice calls every six seconds, bob every twenty, and mallory, whose credential is unknown, every thirty.
 
-Nothing is kept: Ctrl-C stops the stack, `docker compose down -v` removes it, and the next start begins from nothing.
+Ctrl-C stops the stack; `docker compose down -v` removes it.
 
 ### Watch the traffic
 
@@ -55,15 +55,15 @@ The sentinel saw the tool call before the client did, took it out, and put a not
 traffic-1  | [mallory #1] 401 AuthenticationError: credential refused by the auth service
 ```
 
-And within the first minute alice's calls stop reaching the model:
+And within the first minute alice has drained her bucket, and her calls stop reaching the model until it refills:
 
 ```
-traffic-1  | [alice #6] 429 RateLimitError: token quota exhausted: 620 of 600 tokens used; resets in 25s
+traffic-1  | [alice #8] 429 RateLimitError: token bucket empty (600 tokens, refills 5/s); try again in 15s
 ```
 
 ### Watch the quota board
 
-Open [http://127.0.0.1:8090](http://127.0.0.1:8090). It shows what each user has used in the current window, live, and resets a user when their minute is up: alice climbs to the line, is refused until her window resets, then climbs again, while bob stays well under it. The quota is per user, and the user is whoever the auth gate said.
+Open [http://127.0.0.1:8090](http://127.0.0.1:8090). It shows each user's bucket, live, and the last five minutes of levels: alice's drains faster than it refills, bottoms out, and is refused until it climbs back above zero, while bob's barely moves. The quota is per user, and the user is whoever the auth gate said.
 
 To make a call of your own, from another terminal:
 
@@ -148,7 +148,7 @@ The full policy is [`roxy.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/m
 
 Putting a secret in a header and having roxy swap it for the real one is the simple case, and the rule does that for the API key with `set_header` and a [secret](/policies/secrets). The auth gate is for when authentication takes a round trip: here a lookup of a fixed string, in a real deployment the validation of a signed token.
 
-**The token quota** ([`addons/token-quota`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/addons/token-quota/src/lib.rs)) runs only on model calls. Before the call leaves it asks the quota board whether the user may spend; the user is the `user:` tag if a layer above set one, else the client IP, so the layer also works alone. A refusal is answered with a `429` and a `retry-after`, in the shape the Anthropic SDK expects. Otherwise it passes the call on and reads the response as it streams through: `input_tokens` from `message_start`, the running `output_tokens` from `message_delta`, changing nothing. When the stream ends it reports them. Both calls are endpoints; the board is in memory, so restarting it forgets everyone.
+**The token quota** ([`addons/token-quota`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/addons/token-quota/src/lib.rs)) runs only on model calls. Before the call leaves it asks the quota board whether the user's bucket holds anything; the user is the `user:` tag if a layer above set one, else the client IP, so the layer also works alone. A refusal is answered with a `429` and a `retry-after`, in the shape the Anthropic SDK expects. Otherwise it passes the call on and reads the response as it streams through: `input_tokens` from `message_start`, the running `output_tokens` from `message_delta`, changing nothing. When the stream ends it reports them, and the board takes them out of the bucket, into debt if need be. Both calls are endpoints.
 
 **The sentinel** is a [service layer](/addons/service-layers): an out-of-process addon that each exchange streams through over a WebSocket. For each model response it turns every tool call into an inspect_sentinel `BeforeToolCall` step and runs the configured sentinel on it. It sits below the quota layer, so what the quota layer meters is what the client got. Whatever any layer passes on, roxy's rules judge again, and the rules decide by host: the model and nothing else.
 
@@ -161,7 +161,7 @@ Each layer fails the exchange when it cannot do its job: the auth service unreac
 The sentinel runs `deny_regex` from [`policies.py`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/sentinel/policies.py). It searches `<tool name> <arguments as JSON>` for a regular expression. The default catches `curl`, `wget`, `nc`, `ncat`, `ssh`, `scp`, `rsync` and `rm -rf`. Set your own with `SENTINEL_DENY`:
 
 ```sh
-SENTINEL_DENY='\bls\b' docker compose up -d --wait
+SENTINEL_DENY='\bls\b' docker compose up --attach traffic
 ```
 
 Any inspect_sentinel monitor or protocol works in its place, including ones that ask a model: set `SENTINEL` to its `module:attribute`, and for one that asks a model, `SENTINEL_MONITOR_MODEL` and a route out (add the `sentinel` service to the `egress` network). The sidecar is in [`sentinel/`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/quickstart/sentinel).

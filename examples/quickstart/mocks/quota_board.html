@@ -6,57 +6,154 @@
 <style>
   :root {
     color-scheme: light dark;
-    --surface: #fcfcfb; --surface-2: #f0efec;
+    --surface: #fcfcfb; --surface-2: #f0efec; --grid: #e6e5e1;
     --text: #0b0b0b; --text-2: #52514e;
-    --fill: #2a78d6; --over: #e34948;
+    --over: #e34948;
+    --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --surface: #1a1a19; --surface-2: #383835; --text: #ffffff; --text-2: #c3c2b7; --fill: #3987e5; --over: #e66767; }
+    :root { --surface: #1a1a19; --surface-2: #383835; --grid: #2c2c2a; --text: #ffffff; --text-2: #c3c2b7;
+            --over: #e66767; --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; }
   }
   body { margin: 0; padding: 2rem; background: var(--surface); color: var(--text);
          font: 15px/1.5 system-ui, sans-serif; }
   h1 { font-size: 1.25rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1rem; margin: 2rem 0 .5rem; color: var(--text-2); }
   p  { margin: 0 0 1.5rem; color: var(--text-2); }
-  table { border-collapse: collapse; width: 100%; max-width: 56rem; }
+  main { max-width: 56rem; }
+  table { border-collapse: collapse; width: 100%; }
   th, td { text-align: left; padding: .5rem .75rem; border-bottom: 1px solid var(--surface-2); }
   th { font-weight: 600; color: var(--text-2); font-size: .85rem; }
-  td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  .bar { position: relative; height: 6px; background: var(--surface-2); border-radius: 3px; min-width: 12rem; }
-  .bar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; background: var(--fill); }
-  .over .bar i { background: var(--over); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: .5rem; vertical-align: -1px; }
+  .bar { position: relative; height: 6px; background: var(--surface-2); border-radius: 3px; min-width: 10rem; }
+  .bar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; }
+  .over .bar i { background: var(--over) !important; }
   .status { font-size: .85rem; color: var(--text-2); white-space: nowrap; }
   .over .status { color: var(--over); font-weight: 600; }
   .empty { color: var(--text-2); padding: 1rem 0; }
+  #chart { width: 100%; height: 220px; display: block; }
+  #chart .grid { stroke: var(--grid); stroke-width: 1; }
+  #chart .zero { stroke: var(--text-2); stroke-width: 1; stroke-dasharray: 3 3; }
+  #chart .axis { fill: var(--text-2); font-size: 11px; }
+  #chart .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  #chart .cursor { stroke: var(--text-2); stroke-width: 1; }
+  #chart .marker { stroke: var(--surface); stroke-width: 2; }
+  .legend { display: flex; gap: 1.25rem; font-size: .85rem; color: var(--text-2); margin: .5rem 0 0; }
+  #tip { position: fixed; pointer-events: none; background: var(--surface); border: 1px solid var(--surface-2);
+         border-radius: 6px; padding: .4rem .6rem; font-size: .8rem; display: none; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+  #tip b { font-weight: 600; }
 </style>
+<main>
 <h1>Quota board</h1>
 <p id="limit">…</p>
 <table>
-  <thead><tr><th>user</th><th>tokens used</th><th></th><th class="num">requests</th><th class="num">refused</th><th class="num">resets in</th><th>status</th></tr></thead>
+  <thead><tr><th>user</th><th class="num">tokens available</th><th></th><th class="num">calls</th><th class="num">refused</th><th class="num">tokens used</th><th>status</th></tr></thead>
   <tbody id="rows"></tbody>
 </table>
-<div id="empty" class="empty">No calls yet. Run the client and watch this fill in.</div>
+<div id="empty" class="empty">No calls yet.</div>
+<h2>Bucket levels</h2>
+<svg id="chart" viewBox="0 0 900 220" preserveAspectRatio="none" aria-label="Each user's tokens available over time"></svg>
+<div class="legend" id="legend"></div>
+</main>
+<div id="tip"></div>
 <script>
+  const SERIES = ["--s1", "--s2", "--s3", "--s4"];
+  const colour = (i) => `var(${SERIES[Math.min(i, SERIES.length - 1)]})`;
   const rows = document.getElementById("rows");
   const empty = document.getElementById("empty");
   const limit = document.getElementById("limit");
+  const chart = document.getElementById("chart");
+  const legend = document.getElementById("legend");
+  const tip = document.getElementById("tip");
+  let snap = null;
+
   const es = new EventSource("/events");
-  es.onmessage = (e) => {
-    const snap = JSON.parse(e.data);
-    limit.textContent = `${snap.limit} tokens per user per ${snap.window}s window. Live; nothing is stored.`;
+  es.onmessage = (e) => { snap = JSON.parse(e.data); render(); };
+
+  function render() {
+    limit.textContent = `Each user has a bucket of ${snap.capacity} tokens, refilling at ${snap.refill_per_sec} a second.`;
     empty.hidden = snap.users.length > 0;
-    rows.replaceChildren(...snap.users.map((u) => {
+    rows.replaceChildren(...snap.users.map((u, i) => {
       const tr = document.createElement("tr");
       if (!u.allowed) tr.className = "over";
-      const pct = Math.min(100, 100 * u.used / u.limit);
+      const pct = Math.max(0, Math.min(100, 100 * u.available / u.capacity));
+      const status = u.allowed ? "✓ within quota" : `✕ empty, refills in ${u.retry_in}s`;
       tr.innerHTML = `
-        <td>${u.user}</td>
-        <td class="num">${u.used} / ${u.limit}</td>
-        <td><div class="bar"><i style="width:${pct}%"></i></div></td>
+        <td><span class="dot" style="background:${colour(i)}"></span>${u.user}</td>
+        <td class="num">${u.available} / ${u.capacity}</td>
+        <td><div class="bar"><i style="width:${pct}%;background:${colour(i)}"></i></div></td>
         <td class="num">${u.requests}</td>
         <td class="num">${u.refused}</td>
-        <td class="num">${u.resets_in}s</td>
-        <td class="status">${u.allowed ? "✓ within quota" : "✕ over quota"}</td>`;
+        <td class="num">${u.used_total}</td>
+        <td class="status">${status}</td>`;
       return tr;
     }));
-  };
+    drawChart();
+  }
+
+  // The chart: one line per user, x is time over the history window, y is
+  // tokens available, from the deepest debt seen up to the capacity.
+  const W = 900, H = 220, L = 44, R = 12, T = 10, B = 24;
+  function scales() {
+    const h = snap.history;
+    const t0 = h.length ? h[0].t : Date.now() / 1000 - 1;
+    const t1 = Math.max(h.length ? h[h.length - 1].t : 0, t0 + 60);
+    let lo = 0;
+    for (const s of h) for (const v of Object.values(s.levels)) lo = Math.min(lo, v);
+    const hi = snap.capacity;
+    return {
+      x: (t) => L + (W - L - R) * (t - t0) / (t1 - t0),
+      y: (v) => T + (H - T - B) * (hi - v) / (hi - lo),
+      t0, t1, lo, hi,
+    };
+  }
+  function drawChart() {
+    const users = snap.users.map((u) => u.user);
+    const { x, y, t0, t1, lo, hi } = scales();
+    const span = Math.round(t1 - t0);
+    const ago = span < 120 ? `${span}s ago` : `${Math.round(span / 60)} min ago`;
+    let svg = "";
+    for (const v of [hi, hi / 2, 0].filter((v) => v >= lo)) {
+      svg += `<line class="${v === 0 ? "zero" : "grid"}" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/>`;
+      svg += `<text class="axis" x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v}</text>`;
+    }
+    svg += `<text class="axis" x="${L}" y="${H - 6}">${ago}</text><text class="axis" x="${W - R}" y="${H - 6}" text-anchor="end">now</text>`;
+    users.forEach((user, i) => {
+      const pts = snap.history.filter((s) => user in s.levels).map((s) => `${x(s.t).toFixed(1)},${y(s.levels[user]).toFixed(1)}`);
+      if (pts.length > 1) svg += `<polyline class="line" stroke="${colour(i)}" points="${pts.join(" ")}"/>`;
+    });
+    svg += `<g id="hover"></g>`;
+    chart.innerHTML = svg;
+    legend.replaceChildren(...users.map((user, i) => {
+      const el = document.createElement("span");
+      el.innerHTML = `<span class="dot" style="background:${colour(i)}"></span>${user}`;
+      return el;
+    }));
+  }
+
+  chart.addEventListener("mousemove", (e) => {
+    if (!snap || !snap.history.length) return;
+    const { x, y, t0, t1 } = scales();
+    const box = chart.getBoundingClientRect();
+    const t = t0 + (t1 - t0) * ((e.clientX - box.left) / box.width * W - L) / (W - L - R);
+    let best = snap.history[0];
+    for (const s of snap.history) if (Math.abs(s.t - t) < Math.abs(best.t - t)) best = s;
+    const hover = document.getElementById("hover");
+    let g = `<line class="cursor" x1="${x(best.t)}" x2="${x(best.t)}" y1="${T}" y2="${H - B}"/>`;
+    snap.users.forEach((u, i) => {
+      if (u.user in best.levels) g += `<circle class="marker" cx="${x(best.t)}" cy="${y(best.levels[u.user])}" r="4" fill="${colour(i)}"/>`;
+    });
+    hover.innerHTML = g;
+    const when = new Date(best.t * 1000).toLocaleTimeString();
+    tip.innerHTML = `<b>${when}</b><br>` + snap.users.map((u) => `${u.user}: ${best.levels[u.user] ?? "–"}`).join("<br>");
+    tip.style.display = "block";
+    tip.style.left = `${e.clientX + 12}px`;
+    tip.style.top = `${e.clientY + 12}px`;
+  });
+  chart.addEventListener("mouseleave", () => {
+    tip.style.display = "none";
+    const hover = document.getElementById("hover");
+    if (hover) hover.innerHTML = "";
+  });
 </script>
