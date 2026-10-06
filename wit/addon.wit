@@ -68,7 +68,8 @@ interface flow {
 
   /// The current flow. Always available.
   current: func() -> flow-info;
-  /// Add a tag to the flow's log record. Always available.
+  /// Add a tag to the flow's log record. Needs no capability, but only
+  /// an enforce layer may tag: from an observer it fails the exchange.
   add-tag: func(tag: string);
   /// The layer's `config:` value as a JSON document. Always available.
   config: func() -> string;

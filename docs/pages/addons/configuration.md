@@ -70,7 +70,9 @@ calls on the `flow` or `endpoints` import:
 Every import is linked whatever is granted, so one binary runs under any
 set; a call the layer was not granted traps with `CapabilityDenied` and
 fails the exchange. `flow.current`, `flow.add-tag` and `flow.config` need
-no capability. There is no `secrets` capability: credentials go on an
+no capability; `flow.add-tag` from an observe layer is refused the same
+way, since a tag steers the `when` of the layers below. There is no
+`secrets` capability: credentials go on an
 endpoint's `headers`, where the layer never sees them.
 
 Service layers have no capabilities. A service is its own process and
@@ -92,8 +94,8 @@ service session.
 - It may read head fields, headers, the query, `state[..]`, `metric.<id>`
   and address lists. `body.*`, `response.*` and `ws.*` are config errors:
   a layer owns the body, so nothing reads it first.
-- `tag["x"]` sees tags set by layers above. The rules run below the stack,
-  so their tags are not visible here.
+- `tag["x"]` sees tags set by enforce layers above; an observer cannot
+  tag. The rules run below the stack, so their tags are not visible here.
 - A `when` that reaches an unavailable input (a metric, an address list, a
   missing value under an operator that cannot answer for `null`) fails the
   flow closed like a layer failure (`503`, `layer_error` with `kind:

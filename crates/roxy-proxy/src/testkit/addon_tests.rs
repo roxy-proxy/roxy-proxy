@@ -464,6 +464,36 @@ async fn when_sees_tags_set_by_layers_above() {
     assert_eq!(a.json()["via"], "a,b");
 }
 
+/// An observer's tag is refused, so it cannot steer a lower layer's `when`:
+/// the gate below stays skipped and the flow carries no such tag. The
+/// refusal is the observer's failure, logged like any other.
+#[tokio::test]
+async fn an_observer_cannot_tag_a_flow_past_a_gate_below_it() {
+    let kit = stack(&[
+        AddonDef::test_layer("monitor").observe(),
+        AddonDef::test_layer("gate").when(r#"tag["tagged"]"#),
+    ])
+    .await;
+    let a = kit
+        .h1()
+        .await
+        .call(
+            "GET",
+            "/x",
+            &[("x-test-monitor", "caps"), ("x-cap", "add-tag")],
+            b"",
+        )
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["via"], serde_json::Value::Null, "{a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(strs(&ev["addons"]), ["monitor"], "{ev:#}");
+    assert!(strs(&ev["tags"]).is_empty(), "{ev:#}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["layer"], "monitor", "{errs:#?}");
+    assert_eq!(errs[0]["mode"], "observe");
+}
+
 /// An input `when` cannot evaluate fails the flow closed; the layer is
 /// never skipped on an error.
 #[tokio::test]

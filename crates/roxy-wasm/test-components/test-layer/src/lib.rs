@@ -3,8 +3,9 @@
 //!
 //! A layer configured with a name (`{"name": "a"}`) reads `x-test-a` in
 //! preference to `x-test`, so each layer of a stack can be told what to do,
-//! and when it passes an exchange on it tags the flow `via:a` and appends
-//! `a` to the forwarded request's `x-via` header.
+//! and when it passes an exchange on it tags the flow `via:a` (unless
+//! configured `"tag": false`, as an observer is) and appends `a` to the
+//! forwarded request's `x-via` header.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -42,6 +43,12 @@ fn name() -> Option<String> {
     let start = config.find("\"name\":\"")? + "\"name\":\"".len();
     let len = config[start..].find('"')?;
     Some(config[start..start + len].to_owned())
+}
+
+/// Whether a named layer tags the flows it passes on. Off for an observer,
+/// whose tags the host refuses.
+fn tags() -> bool {
+    !flow::config().contains("\"tag\":false")
 }
 
 /// The behaviour for this exchange: `x-test-<name>`, else `x-test`.
@@ -140,7 +147,9 @@ fn respond(out: ResponseOutparam, status: u16, body: &[u8]) {
 fn forward_head(req: &IncomingRequest) -> OutgoingRequest {
     let mut entries = req.headers().entries();
     if let Some(n) = name() {
-        flow::add_tag(&format!("via:{n}"));
+        if tags() {
+            flow::add_tag(&format!("via:{n}"));
+        }
         let via = match entries.iter().position(|(k, _)| k == "x-via") {
             Some(i) => {
                 let (_, v) = entries.remove(i);
