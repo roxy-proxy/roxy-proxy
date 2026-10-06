@@ -57,7 +57,8 @@ key meets a full store, expired entries are purged at most every 100 ms.
 The store survives a reload. A reload that changes `state.max_entries` or
 `state.default_ttl` applies to the live store: stored entries keep their
 expiry, and a lower cap evicts nothing but refuses new keys until enough
-entries expire.
+entries expire. The store of an addon a reload removes is dropped with it;
+an addon added back later starts with an empty store.
 
 ## Identity
 
