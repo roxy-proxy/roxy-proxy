@@ -2,7 +2,7 @@
 # private_api.py reaches into the anthropic SDK and inspect_ai, so an
 # unpinned upgrade can break it.
 # inspect_ai is not pinned: it follows inspect_sentinel's dependency on its `feature/sentinel` branch.
-inspect_sentinel @ git+https://github.com/meridianlabs-ai/inspect_sentinel@566a390535287e6e4ac3ed35fb5e8234a8e4a9b0
+inspect_sentinel @ git+https://github.com/meridianlabs-ai/inspect_sentinel@083a3a0c34fc55ef79e1314bbc622e89580011d4
 anthropic==1.11.0
 httpx2==2.13.1
 websockets==17.2

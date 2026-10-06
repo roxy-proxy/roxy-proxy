@@ -860,7 +860,7 @@ mod tests {
         let base = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:3128 }]\n";
         let running = cfg(base);
         let mut new = cfg(&format!(
-            "{base}capture_dir: /tmp/c\nlog:\n  capture:\n    all: true\n"
+            "{base}capture_dir: /tmp/c\nrules: [{{ id: c, then: [{{ capture: both }}, allow] }}]\n"
         ));
         let err = validate_reload(&running, &mut new, Path::new("roxy.yaml")).unwrap_err();
         assert!(
@@ -873,7 +873,9 @@ mod tests {
             "{err:?}"
         );
 
-        let mut new = cfg(&format!("{base}log:\n  capture:\n    all: true\n"));
+        let mut new = cfg(&format!(
+            "{base}rules: [{{ id: c, then: [{{ capture: both }}, allow] }}]\n"
+        ));
         let err = validate_reload(&running, &mut new, Path::new("roxy.yaml")).unwrap_err();
         assert!(!err.iter().any(|d| d.contains("restart")), "{err:?}");
     }

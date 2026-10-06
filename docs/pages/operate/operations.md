@@ -30,7 +30,9 @@ swapped in atomically: exchanges in flight finish under the policy they
 started with, and the next request on any connection uses the new one. On
 failure the old policy stays, a `config_reload_failed` event carries the
 diagnostics, and nothing is partially applied: not the policy, not the
-metric store, and not the compiled addons the next reload reuses.
+metric store, and not the compiled addons the next reload reuses. A
+shutdown signal during a reload is acted on at once: the reload is
+abandoned and the running policy drains.
 
 Metric series whose definition is unchanged survive a reload. When the
 new config keeps every running metric (it only adds or leaves them), the
@@ -47,4 +49,5 @@ Some settings take effect only when roxy starts: `listeners`, `ca_server`,
 `log.capture` and `capture_dir`. A reload keeps their running values,
 applies everything else, and logs a warning naming each one that changed.
 The new config is validated with those running values, so nothing is
-half-applied.
+half-applied; when that validation fails, the diagnostics name the
+restart-only settings the file changed, since the failure may be theirs.
