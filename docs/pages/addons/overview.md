@@ -9,7 +9,7 @@ both streams of every exchange. An addon is either:
   ([`wit/addon.wit`](https://github.com/roxy-proxy/roxy-proxy/blob/main/wit/addon.wit)); or
 - **a service layer** (`kind: service`): an external service in the network
   path, which each exchange streams through over a WebSocket
-  ([below](#service-layers)).
+  ([below](/addons/service-layers)).
 
 Both sit in the same stack and obey the same invariants.
 
@@ -67,7 +67,7 @@ stack carries the client's traffic and nothing else: a layer never
 originates requests through the layers below it. Retrying, regenerating or
 replaying is the client's job, and a layer that rejects something answers
 with a response the client can act on. A layer that needs to talk to
-anything else calls a [named endpoint](#endpoints), which goes straight to
+anything else calls a [named endpoint](/addons/host-services#endpoints-endpoints), which goes straight to
 the connector, never through other layers or the rules.
 
 ## Full access to both streams

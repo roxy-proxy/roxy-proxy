@@ -32,14 +32,14 @@ not a `101` followed by a close:
 - an upstream that answers anything other than `101` has its answer
   relayed as it is, like any response;
 - a `101` with a wrong `Sec-WebSocket-Accept`, or one that accepts an
-  extension when none may be negotiated ([below](#extensions)), is `502`,
+  extension when none may be negotiated ([below](/policies/websockets#extensions)), is `502`,
   `upstream_error` with reason `protocol_error`.
 
 How it relays depends on the policy. If no rule reads a `ws.*` field, roxy
 splices bytes: no frame parsing, re-masking or reassembly. Subprotocols
 work exactly as negotiated end to end, and so do extensions unless
-something must read the messages ([below](#extensions)). If any rule reads
-`ws.*`, roxy checks every message ([message rules](#message-rules)).
+something must read the messages ([below](/policies/websockets#extensions)). If any rule reads
+`ws.*`, roxy checks every message ([message rules](/policies/websockets#message-rules)).
 
 Either way:
 
@@ -74,7 +74,7 @@ messages, roxy makes sure no extension is negotiated: it removes
 a `101` that accepts an extension anyway. Every WebSocket server must work
 without extensions, so this costs only compression. roxy does this when:
 
-- a rule reads `ws.*` ([message rules](#message-rules)); or
+- a rule reads `ws.*` ([message rules](/policies/websockets#message-rules)); or
 - an addon layer runs on the upgrade request (its `when` matched) and
   `http.decode_for_addons` is on (the default), so the layer gets readable
   messages
@@ -131,7 +131,7 @@ per WebSocket, the first time it matches.
 
 With message rules, roxy:
 
-- makes sure no extension is negotiated ([above](#extensions)), so every message stays
+- makes sure no extension is negotiated ([above](/policies/websockets#extensions)), so every message stays
   readable;
 - decodes each direction strictly (RFC 6455 §5). RSV bits must be zero,
   opcodes must be known, client frames must be masked and server frames
