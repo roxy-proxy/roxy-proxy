@@ -58,9 +58,9 @@ impl LayerStates {
 
     /// Applies each addon's entry cap and default ttl to its live store
     /// on reload. Stored entries stay; a lower cap only refuses new keys.
-    /// The store of an addon no longer configured is dropped: its name is
-    /// free for a different addon, and its memory is not kept for one that
-    /// may never come back.
+    /// The store of an addon absent from the new configuration is dropped:
+    /// its name is free for a different addon, and its memory is not kept
+    /// for one that may never come back.
     pub(crate) fn configure<'a>(
         &self,
         addons: impl IntoIterator<Item = (&'a str, &'a StateLimits)>,
