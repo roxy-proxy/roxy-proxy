@@ -18,6 +18,10 @@ upstream:
   connect_timeout: 10s         # TCP connect, over all of a name's addresses together
 ```
 
+`deny_cidrs` and `allow_cidrs` entries are stored as address-list entries
+are: an IPv4-mapped entry (`::ffff:203.0.113.0/120`) becomes the IPv4 CIDR
+(`203.0.113.0/24`) and matches the address however a client spells it.
+
 ## DNS
 
 roxy resolves names itself with `hickory-resolver`, from the system config
