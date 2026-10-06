@@ -227,7 +227,6 @@ pub struct Server {
     shared: Arc<Shared>,
     listeners: Vec<(String, SocketAddr)>,
     ca_addr: Option<SocketAddr>,
-    dns_addr: Option<SocketAddr>,
 }
 
 /// A cloneable handle for reloads (e.g. from a file watcher).
@@ -300,7 +299,6 @@ impl std::fmt::Debug for Server {
         f.debug_struct("Server")
             .field("listeners", &self.listeners)
             .field("ca_server", &self.ca_addr)
-            .field("dns", &self.dns_addr)
             .finish_non_exhaustive()
     }
 }
@@ -376,10 +374,6 @@ impl Server {
             }
             None => None,
         };
-        let dns_addr = match cfg.dns {
-            Some(spec) => Some(start_dns(spec, &shared).await?),
-            None => None,
-        };
         for l in bound {
             let s = shared.clone();
             shared.tasks.spawn(accept_loop(l, s));
@@ -391,7 +385,6 @@ impl Server {
             shared,
             listeners: addrs,
             ca_addr,
-            dns_addr,
         })
     }
 
@@ -411,11 +404,6 @@ impl Server {
     /// The bound CA server address.
     pub fn ca_server_addr(&self) -> Option<SocketAddr> {
         self.ca_addr
-    }
-
-    /// The bound DNS listener address (UDP and TCP).
-    pub fn dns_addr(&self) -> Option<SocketAddr> {
-        self.dns_addr
     }
 
     /// A cloneable reload handle.
@@ -444,30 +432,6 @@ impl Server {
             self.shared.tasks.wait().await;
         }
     }
-}
-
-/// Binds the DNS listener and starts serving it over UDP and TCP.
-async fn start_dns(
-    spec: crate::dns_server::DnsServerSpec,
-    shared: &Arc<Shared>,
-) -> Result<SocketAddr, StartError> {
-    let (udp, tcp) = crate::dns_server::bind(spec.bind)
-        .await
-        .map_err(|e| StartError(format!("binding dns on {}: {e}", spec.bind)))?;
-    let addr = udp
-        .local_addr()
-        .map_err(|e| StartError(format!("dns: {e}")))?;
-    let spec = Arc::new(spec);
-    shared.tasks.spawn(crate::dns_server::serve_udp(
-        udp,
-        spec.clone(),
-        shared.clone(),
-    ));
-    shared
-        .tasks
-        .spawn(crate::dns_server::serve_tcp(tcp, spec, shared.clone()));
-    tracing::info!(%addr, "dns listening (udp, tcp)");
-    Ok(addr)
 }
 
 async fn accept_loop(listener: Arc<dyn Listener>, shared: Arc<Shared>) {
@@ -524,7 +488,7 @@ async fn accept_loop(listener: Arc<dyn Listener>, shared: Arc<Shared>) {
     }
 }
 
-/// Acquires a connection slot for a CA-server or DNS connection.
+/// Acquires a connection slot for a CA-server connection.
 pub(crate) fn conn_slot(shared: &Shared, ip: IpAddr) -> Option<ConnSlot> {
     shared.caps.acquire(ip).ok()
 }

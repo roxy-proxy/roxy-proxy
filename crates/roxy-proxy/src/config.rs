@@ -43,8 +43,6 @@ pub struct RuntimeConfig {
     pub listeners: Vec<ListenerSpec>,
     /// Plain-HTTP CA download + health endpoint.
     pub ca_server: Option<SocketAddr>,
-    /// The DNS listener (`dns:`).
-    pub dns: Option<crate::dns_server::DnsServerSpec>,
     pub ca: Arc<Ca>,
     pub minter: Arc<LeafMinter>,
     /// `tls.upstream.*`.

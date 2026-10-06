@@ -22,7 +22,6 @@ on:
       - crates/roxy-http/src/**
       - crates/roxy-tls/src/sniff.rs
       - crates/roxy-rules/src/**
-      - crates/roxy-dns/src/**
       - .github/workflows/fuzz.yml
   workflow_dispatch:
     inputs:
@@ -106,7 +105,6 @@ jobs:
           - rule_compile
           - rule_eval
           - content_coding
-          - dns_query
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:

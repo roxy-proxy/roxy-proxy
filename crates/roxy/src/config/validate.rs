@@ -145,30 +145,14 @@ impl Config {
                 format!("bind address {} is already used by {first}", ca.bind),
             ));
         }
-        // The DNS listener's TCP side shares the TCP port space.
-        if let Some(dns) = &self.dns
-            && dns.bind.port() != 0
-            && let Some(first) = binds.get(&dns.bind)
-        {
-            d.push(Diagnostic::new(
-                "dns.bind",
-                format!("bind address {} is already used by {first}", dns.bind),
-            ));
-        }
     }
 
     fn validate_dns(&self, d: &mut Vec<Diagnostic>) {
-        let Some(dns) = &self.dns else {
-            return;
-        };
-        if dns.answer.ipv4.is_none() && dns.answer.ipv6.is_none() {
+        if self.dns.is_some() {
             d.push(Diagnostic::new(
-                "dns.answer",
-                "set ipv4, ipv6 or both: roxy's address as the clients reach it",
+                "dns",
+                "DNS steering has been removed: clients use the explicit proxy",
             ));
-        }
-        if dns.ttl.as_secs() > u64::from(u32::MAX) {
-            d.push(Diagnostic::new("dns.ttl", "must fit in 32 bits of seconds"));
         }
     }
 

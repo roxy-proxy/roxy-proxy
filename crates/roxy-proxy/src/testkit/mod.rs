@@ -439,7 +439,6 @@ impl KitBuilder {
         let server = Server::start(RuntimeConfig {
             listeners: Vec::new(),
             ca_server: self.ca_server.then(|| "127.0.0.1:0".parse().unwrap()),
-            dns: None,
             ca: ca.clone(),
             minter: minter.clone(),
             upstream_tls: UpstreamTlsOptions {

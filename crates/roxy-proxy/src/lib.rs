@@ -10,8 +10,6 @@
 //!   [`TcpProxyListener`] (explicit and direct); [`ClientConn`].
 //! - `conn`: the connection state machines (proxy port, CONNECT, direct
 //!   listeners, sniff, TLS termination, tunnels, `roxy.internal`).
-//! - `dns_server`: the DNS listener (UDP and TCP) that steers clients to
-//!   the direct listeners.
 //! - `pipeline`: the core's fixed request and response steps, the
 //!   `Verdict` they return (consumed exhaustively), the head decision and
 //!   its effects, the per-flow context.
@@ -43,7 +41,6 @@ mod ca_server;
 pub mod capture;
 pub mod config;
 mod conn;
-mod dns_server;
 mod exchange;
 pub mod flowlog;
 mod h2conn;
@@ -63,7 +60,6 @@ pub use ca_server::PEM_CONTENT_TYPE;
 pub use capture::{CAPTURE_FILE, CaptureLog, CaptureOptions};
 pub use config::{HttpBehaviour, ListenerKind, ListenerSpec, PolicyUpdate, RuntimeConfig};
 pub use conn::INTERNAL_HOST;
-pub use dns_server::DnsServerSpec;
 pub use flowlog::{
     BufferedSink, ClientInfo, DEFAULT_REDACTED_HEADERS, DecisionKind, DstInfo, FileSink, FlowEvent,
     FlowSink, MemorySink, MultiSink, REDACTED, Redactor, RequestInfo, ResponseInfo, Stage,

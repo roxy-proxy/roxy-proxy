@@ -19,9 +19,7 @@ Sources:
 - content_coding: a small stream in each coding, a stacked pair, and gzip
   with every optional header field.
 - ws_frame: the RFC 6455 example frames and a fragmented, masked message
-  with a ping in the middle;
-- dns_query: A, AAAA and HTTPS queries, with and without an EDNS OPT
-  record, and a few malformed shapes.
+  with a ping in the middle.
 """
 
 import gzip
@@ -191,27 +189,9 @@ def ws_frames():
     yield "close", 0x31, ws_frame(True, 8, b"\x03\xe8bye")
 
 
-def dns_query(qid, name, qtype, opt=False, flags=0x0100):
-    q = qid.to_bytes(2, "big") + flags.to_bytes(2, "big") + bytes([0, 1, 0, 0, 0, 0, 0, 1 if opt else 0])
-    for label in name.split("."):
-        q += bytes([len(label)]) + label.encode()
-    q += b"\x00" + qtype.to_bytes(2, "big") + b"\x00\x01"
-    if opt:
-        q += b"\x00\x00\x29\x04\xd0\x00\x00\x00\x00\x00\x00"
-    return q
-
-
-def dns_queries():
-    yield "a", dns_query(1, "example.com", 1)
-    yield "aaaa_opt", dns_query(2, "api.ExAmPlE.org", 28, opt=True)
-    yield "https", dns_query(3, "www.example.com", 65)
-    yield "status", dns_query(4, "example.com", 1, flags=0x1000)
-    yield "pointer", dns_query(5, "x", 1)[:12] + b"\xc0\x0c\x00\x01\x00\x01"
-
-
 def main():
     for target in ("h1_request", "h1_chunked", "url", "client_hello", "client_hello_rustls", "rule_compile",
-                   "h2map", "rule_eval", "ws_frame", "content_coding", "dns_query"):
+                   "h2map", "rule_eval", "ws_frame", "content_coding"):
         for old in (OUT / target).glob("*") if (OUT / target).is_dir() else []:
             old.unlink()
     n = 0
@@ -241,8 +221,6 @@ def main():
             write("content_coding", f"{name}_{piece}", bytes([cfg | piece << 5]) + body)
     for name, cfg, frames in ws_frames():
         write("ws_frame", name, bytes([cfg]) + frames)
-    for name, q in dns_queries():
-        write("dns_query", name, q)
     print(f"{n} corpus cases")
 
 
