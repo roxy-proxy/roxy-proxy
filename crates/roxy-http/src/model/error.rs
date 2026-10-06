@@ -83,8 +83,9 @@ pub enum Reason {
     BadChunkSize,
     /// Chunk extension present while `http.allow_chunk_extensions` is false.
     ChunkExtension,
-    /// Trailer section present while `http.allow_trailers` is false, or a
-    /// forbidden field inside allowed trailers.
+    /// Trailer section present while `http.allow_trailers` is false, a
+    /// forbidden field inside allowed trailers, or trailers on a request
+    /// whose upstream speaks HTTP/1.1 (which cannot carry them).
     Trailers,
     /// Missing CRLF after chunk data.
     BadChunkFraming,

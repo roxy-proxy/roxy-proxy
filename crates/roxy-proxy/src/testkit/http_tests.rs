@@ -297,6 +297,83 @@ async fn h1_request_body_cap_closes_mid_stream() {
     assert!(kit.upstream.seen().iter().all(|s| s.body.len() <= 1024));
 }
 
+/// A chunked request for `target` with trailers, as the client sends it.
+fn trailered(target: &str) -> Vec<u8> {
+    format!(
+        "POST {target} HTTP/1.1\r\nhost: up.test\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nx-checksum: abc\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+/// An HTTP/1.1 client inside a `CONNECT up.test:443` tunnel.
+async fn h1_in_tunnel(kit: &Kit) -> tokio_rustls::client::TlsStream<tokio::io::DuplexStream> {
+    let io = kit.connect_tunnel("up.test", 443).await;
+    kit.tls_connect(io, "up.test", &[b"http/1.1"])
+        .await
+        .unwrap()
+}
+
+/// With `http.allow_trailers`, the trailers of a chunked request reach an
+/// h2 upstream as trailers.
+#[tokio::test]
+async fn request_trailers_reach_an_h2_upstream() {
+    let kit = Kit::builder()
+        .flags(|f| f.allow_trailers = true)
+        .start()
+        .await;
+    let mut io = h1_in_tunnel(&kit).await;
+    io.write_all(&trailered("/t")).await.unwrap();
+    let (head, _) = super::read_response(&mut io).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].version, http::Version::HTTP_2);
+    assert_eq!(seen[0].body, b"abc");
+    let trailers = seen[0]
+        .trailers
+        .as_ref()
+        .unwrap_or_else(|| panic!("{:?}", seen[0]));
+    assert_eq!(trailers["x-checksum"], "abc");
+}
+
+/// The same request towards an upstream that speaks HTTP/1.1: the client
+/// gets a `400` with the `trailers` reason, and the upstream never sees the
+/// body complete.
+async fn trailers_refused<IO>(kit: &Kit, mut io: IO, target: &str)
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    io.write_all(&trailered(target)).await.unwrap();
+    let (out, _) = super::read_to_eof(&mut io).await;
+    let out = String::from_utf8_lossy(&out);
+    assert!(out.starts_with("HTTP/1.1 400"), "{out}");
+    let ev = kit.events("parse_error", 1).await;
+    assert_eq!(ev[0]["reason"], "trailers", "{ev:#?}");
+    kit.upstream.wait_open(0).await;
+    let seen = kit.upstream.seen();
+    assert!(seen.iter().all(|s| s.complete != Some(true)), "{seen:#?}");
+}
+
+#[tokio::test]
+async fn request_trailers_to_an_h1_tls_upstream_are_refused() {
+    let kit = Kit::builder()
+        .flags(|f| f.allow_trailers = true)
+        .start()
+        .await;
+    kit.upstream.h1_only();
+    let io = h1_in_tunnel(&kit).await;
+    trailers_refused(&kit, io, "/t").await;
+}
+
+/// A plaintext upstream is always HTTP/1.1.
+#[tokio::test]
+async fn request_trailers_to_a_plaintext_upstream_are_refused() {
+    let kit = Kit::builder()
+        .flags(|f| f.allow_trailers = true)
+        .start()
+        .await;
+    trailers_refused(&kit, kit.connect(), "http://up.test/t").await;
+}
+
 /// Over h2 the cap resets the stream, whether crossed while streaming or
 /// declared up front; the connection stays usable.
 #[tokio::test]

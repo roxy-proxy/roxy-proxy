@@ -4,7 +4,7 @@ pub(crate) mod service;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -35,6 +35,8 @@ pub(crate) struct Seen {
     pub version: http::Version,
     /// Body bytes received so far.
     pub body: Vec<u8>,
+    /// The trailers, if the body ended with some.
+    pub trailers: Option<http::HeaderMap>,
     /// `Some(true)` once the body ended cleanly, `Some(false)` if it was
     /// cut, `None` while it is still arriving.
     pub complete: Option<bool>,
@@ -55,6 +57,8 @@ pub(crate) struct Upstream {
     ws_received: Mutex<Vec<Vec<u8>>>,
     /// Framed echo upgrades that have ended, from the upstream's side.
     ws_closed: AtomicUsize,
+    /// Offer only `http/1.1` in ALPN.
+    h1_only: AtomicBool,
 }
 
 /// Counts one dialled connection as open until it is dropped.
@@ -81,7 +85,13 @@ impl Upstream {
             open: AtomicUsize::new(0),
             ws_received: Mutex::new(Vec::new()),
             ws_closed: AtomicUsize::new(0),
+            h1_only: AtomicBool::new(false),
         })
+    }
+
+    /// Makes connections from here on negotiate HTTP/1.1 only.
+    pub(crate) fn h1_only(&self) {
+        self.h1_only.store(true, Ordering::SeqCst);
     }
 
     /// The data messages the framed WebSocket echo (`x-echo: frames`)
@@ -195,7 +205,8 @@ impl Upstream {
     async fn serve(self: Arc<Self>, addr: SocketAddr, io: tokio::io::DuplexStream) {
         if addr.port() == 443 {
             let name = roxy_tls::server_name_for_host("up.test").unwrap();
-            let cfg = roxy_tls::server_config_for(self.minter.clone(), name, true);
+            let h2_offered = !self.h1_only.load(Ordering::SeqCst);
+            let cfg = roxy_tls::server_config_for(self.minter.clone(), name, h2_offered);
             let Ok(tls) = tokio_rustls::TlsAcceptor::from(cfg).accept(io).await else {
                 return;
             };
@@ -268,6 +279,7 @@ impl Upstream {
             headers: req.headers().clone(),
             version: req.version(),
             body: Vec::new(),
+            trailers: None,
             complete: None,
         }));
         lock(&self.seen).push(entry.clone());
@@ -355,6 +367,9 @@ impl Upstream {
                     if let Some(d) = f.data_ref() {
                         lock(&entry).body.extend_from_slice(d);
                         self.changed.notify_waiters();
+                    }
+                    if let Some(t) = f.trailers_ref() {
+                        lock(&entry).trailers = Some(t.clone());
                     }
                 }
                 Some(Err(_)) => {

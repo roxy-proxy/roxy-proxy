@@ -6,9 +6,14 @@
 //! - no hop-by-hop header can be present (canonical [`Headers`] cannot hold
 //!   them);
 //! - `content-length` is set exactly when the body length is known; otherwise
-//!   hyper sends clean `chunked` (no extensions, no trailers, since roxy's
-//!   bodies only yield trailers when `http.allow_trailers` let them in);
+//!   hyper sends clean `chunked` with no extensions;
 //! - never both.
+//!
+//! Request trailers (`http.allow_trailers`) reach the upstream only over
+//! HTTP/2. hyper's HTTP/1.1 encoder writes trailers only for the names a
+//! `trailer` header announces, and roxy cannot announce them: the names
+//! are not known until the body ends. Over HTTP/1.1 a body's trailers are
+//! dropped, so the proxy refuses such a body instead of sending it.
 
 use std::fmt;
 

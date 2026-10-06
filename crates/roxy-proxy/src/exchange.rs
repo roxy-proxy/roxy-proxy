@@ -26,14 +26,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::addr::PrivateAddrs;
-use crate::body::{counted, counted_until_sent};
+use crate::body::{counted, counted_until_sent, trailers_need_h2};
 use crate::capture::{self, Tap};
 use crate::flowlog::{DecisionKind, FlowEvent};
 use crate::io::{ClientIo, Io};
 use crate::listener::ClientConn;
 use crate::pipeline::{
-    BodyIo, FlowCx, PerDir, Refusal, RefusalKind, ResponseVerdict, Verdict, request_steps,
-    response_steps,
+    BodyIo, FlowCx, PerDir, Refusal, RefusalKind, ResponseVerdict, Verdict, body_failure,
+    request_steps, response_steps,
 };
 use crate::server::Shared;
 use crate::upstream::{ConnectError, Protocols, classify, describe};
@@ -731,6 +731,18 @@ async fn plain_upstream<F: Front>(
         Dir::Request,
         up_tap,
     );
+    let private = PrivateAddrs::from_private_ok(cx.opts.private_ok);
+    let protocols = if cx.host_override.is_some() {
+        Protocols::Http1Only
+    } else {
+        Protocols::Any
+    };
+    let body = trailers_need_h2(body, {
+        let upstream = cx.snap.upstream.clone();
+        let scheme = req.scheme.to_string();
+        let authority = req.authority.to_host_header(req.scheme);
+        move || upstream.may_be_h1(private, protocols, &scheme, &authority)
+    });
     let (body, req_counter, sent) = counted_until_sent(body);
     // Read when the flow is logged, so bytes sent before an abandoned
     // forward, or after the response head, all count.
@@ -743,14 +755,7 @@ async fn plain_upstream<F: Front>(
     let upstream = response_head(
         cx.snap
             .upstream
-            .client(
-                PrivateAddrs::from_private_ok(cx.opts.private_ok),
-                if cx.host_override.is_some() {
-                    Protocols::Http1Only
-                } else {
-                    Protocols::Any
-                },
-            )
+            .client(private, protocols)
             .request(http_req),
         sent,
         req_counter,
@@ -778,12 +783,30 @@ async fn plain_upstream<F: Front>(
             let e = ConnectError::Timeout(what);
             Err(Failed::Refuse(upstream_refusal(cx, &e, &host, port)))
         }
-        Ok(Some(Ok(Err(e)))) => Err(Failed::Refuse(match classify(&e) {
-            Some(ce) => upstream_refusal(cx, &ce, &host, port),
-            None => protocol_refusal(cx, &host, port, describe(&e)),
-        })),
+        Ok(Some(Ok(Err(e)))) => Err(match request_body_failure(&e) {
+            Some(pe) => Failed::Close(DriveError::Client(pe)),
+            None => Failed::Refuse(match classify(&e) {
+                Some(ce) => upstream_refusal(cx, &ce, &host, port),
+                None => protocol_refusal(cx, &host, port, describe(&e)),
+            }),
+        }),
         Ok(Some(Ok(Ok(res)))) => Ok(Upstreamed::Response(res)),
     }
+}
+
+/// The request body failed while hyper was sending it (a frame roxy would
+/// not forward, or the client side's own failure), which hyper reports as
+/// its user's body error. That is the client's fault, mapped as body
+/// failures are elsewhere; `None` leaves the error to be the upstream's.
+fn request_body_failure(e: &hyper_util::client::legacy::Error) -> Option<ParseError> {
+    let mut src: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(s) = src {
+        if let Some(b) = s.downcast_ref::<BodyError>() {
+            return Some(body_failure(b));
+        }
+        src = s.source();
+    }
+    None
 }
 
 fn set_host_override(cx: &FlowCx, req: &mut http::Request<Body>) {
