@@ -4,6 +4,7 @@ description: "Run a chat client through roxy with an auth gate, a per-user token
 ---
 
 import inspectView from "../assets/quickstart-inspect-view.png";
+import stack from "../assets/quickstart-stack.svg";
 
 # Quickstart
 
@@ -100,6 +101,8 @@ docker compose down -v
 ### Three layers above the rules
 
 An exchange passes through the [addons](/addons/overview) in the order `roxy.yaml` lists them, and then the rules. Each addon wraps everything below it.
+
+<img src={stack} alt="A model call from the client passes through the auth gate, the token quota and the sentinel, then the rules and the connector, to the fake model; each layer calls its own service, and the flow log records the exchange" />
 
 ```yaml
 addons:
