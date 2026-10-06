@@ -67,7 +67,7 @@ enum Command {
         command: RuleCommand,
     },
     /// Probe `ca_server`'s `/healthz` (the process is up) or, with
-    /// `--ready`, `/readyz` (a policy that can forward is loaded) for
+    /// `--ready`, `/readyz` (a policy is in force) for
     /// container health checks, where there is no shell or curl. Exits 0
     /// on a `200` response and 1 on anything else.
     Health(HealthArgs),
