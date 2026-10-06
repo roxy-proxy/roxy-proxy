@@ -98,7 +98,12 @@ the canonical model is version-agnostic. WebSocket upgrades always use
 HTTP/1.1 ([WebSockets](/policies/websockets)).
 
 gRPC and other HTTP/2-only protocols need trailers: set
-`http.allow_trailers`.
+`http.allow_trailers`. Request trailers are forwarded only when the origin
+negotiates `h2`. HTTP/1.1 cannot carry them without naming them in a
+`Trailer` header up front, and roxy does not know the names until the body
+ends, so a request that carries trailers to an HTTP/1.1 origin fails with
+the `trailers` reason (`400` and the connection closed on HTTP/1.1, a
+stream reset on HTTP/2) before the origin sees it complete.
 
 ## Canonical request
 
@@ -166,8 +171,8 @@ The strictness knobs live under `http:` and all default to strict.
 ### Body
 
 - Chunk sizes are hex digits only, at most 16. Chunk extensions need
-  `http.allow_chunk_extensions`; trailers need `http.allow_trailers`. The
-  final CRLF is enforced.
+  `http.allow_chunk_extensions`; trailers need `http.allow_trailers` and
+  an origin that negotiates `h2` (see above). The final CRLF is enforced.
 - The body is at most `limits.max_request_body_bytes` (1 GiB), enforced
   while streaming: exceeding it closes the connection mid-stream. The
   default is generous so large uploads work.
@@ -225,7 +230,8 @@ whichever ALPN negotiates. For HTTP/2 the mapping is the obvious one
 - `METHOD <origin-form path[?query]> HTTP/1.1`;
 - `host` first, then the headers in canonical order, lowercase;
 - `content-length` when the length is known, otherwise clean `chunked`
-  with no extensions or trailers, never both;
+  with no extensions, never both. A body with trailers is not sent over
+  HTTP/1.1: the request fails instead;
 - connection management by roxy's pool; no client hop-by-hop field
   survives.
 

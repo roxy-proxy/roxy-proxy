@@ -1,5 +1,6 @@
-//! Body helpers: byte counting as frames stream, and bounded buffering for
-//! body-inspecting rules that never loses the rest of the stream.
+//! Body helpers: byte counting as frames stream, bounded buffering for
+//! body-inspecting rules that never loses the rest of the stream, and the
+//! gate that keeps request trailers off HTTP/1.1 upstreams.
 
 use std::future::poll_fn;
 use std::pin::Pin;
@@ -9,7 +10,7 @@ use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
 use http_body::{Frame, SizeHint};
-use roxy_http::{Body, BodyError};
+use roxy_http::{Body, BodyError, ParseError, Reason};
 use tokio_util::sync::CancellationToken;
 
 /// Counts data bytes as they pass through.
@@ -90,6 +91,69 @@ fn wrap_counted(body: Body, ended: Option<CancellationToken>) -> (Body, Arc<Atom
         known,
     );
     (body, counter)
+}
+
+/// Fails instead of yielding trailers that would not reach the upstream.
+struct TrailersGate {
+    inner: Body,
+    /// Whether the body may be on an HTTP/1.1 connection, asked only when
+    /// a trailers frame arrives.
+    may_be_h1: Box<dyn Fn() -> bool + Send + Sync>,
+    done: bool,
+}
+
+impl http_body::Body for TrailersGate {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        let r = Pin::new(&mut self.inner).poll_frame(cx);
+        match &r {
+            Poll::Ready(Some(Ok(f))) if f.is_trailers() && (self.may_be_h1)() => {
+                self.done = true;
+                let e = ParseError::new(Reason::Trailers, "request trailers need an HTTP/2 upstream");
+                return Poll::Ready(Some(Err(BodyError::Invalid(e))));
+            }
+            Poll::Ready(None | Some(Err(_))) => self.done = true,
+            Poll::Ready(Some(Ok(_))) | Poll::Pending => {}
+        }
+        r
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Request trailers reach an upstream only over HTTP/2: hyper's HTTP/1.1
+/// encoder drops them, since nothing announced their names. When a
+/// trailers frame arrives and `may_be_h1` says the body may be on an
+/// HTTP/1.1 connection, the body fails with [`Reason::Trailers`] instead,
+/// so the upstream never sees it complete and the exchange says why.
+pub(crate) fn trailers_need_h2(
+    body: Body,
+    may_be_h1: impl Fn() -> bool + Send + Sync + 'static,
+) -> Body {
+    let known = body.known_length();
+    Body::wrap_native(
+        TrailersGate {
+            inner: body,
+            may_be_h1: Box::new(may_be_h1),
+            done: false,
+        },
+        u64::MAX,
+        known,
+    )
 }
 
 /// Replays `prefix`, then the rest of `rest`.

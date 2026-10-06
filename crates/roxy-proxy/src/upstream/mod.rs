@@ -20,10 +20,11 @@
 
 mod dns;
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -166,6 +167,58 @@ impl AsyncWrite for MaybeTls {
 pub(crate) struct UpstreamIo {
     io: TokioIo<MaybeTls>,
     h2: bool,
+    /// Counted in [`H1Open`] for as long as hyper holds the connection.
+    _h1: Option<H1Guard>,
+}
+
+/// Open HTTP/1.1 connections per pool key (`scheme://authority`).
+///
+/// hyper polls a request body only once the connection carrying it is up,
+/// and does not say which connection that is. While no HTTP/1.1 connection
+/// to the body's key is open, the body is on an HTTP/2 one; while one is,
+/// it may be the carrier. Entries leave the map when their count hits
+/// zero, so the map is bounded by open connections.
+#[derive(Default)]
+struct H1Open(Mutex<HashMap<String, usize>>);
+
+impl H1Open {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn open(self: &Arc<Self>, key: String) -> H1Guard {
+        *self.lock().entry(key.clone()).or_default() += 1;
+        H1Guard {
+            open: self.clone(),
+            key,
+        }
+    }
+
+    fn any(&self, key: &str) -> bool {
+        self.lock().contains_key(key)
+    }
+}
+
+struct H1Guard {
+    open: Arc<H1Open>,
+    key: String,
+}
+
+impl Drop for H1Guard {
+    fn drop(&mut self) {
+        let mut map = self.open.lock();
+        if let Some(n) = map.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// hyper-util's pool key for a URI, as the connector is asked for it.
+fn pool_key(scheme: &str, authority: &str) -> String {
+    format!("{scheme}://{authority}")
 }
 
 impl hyper::rt::Read for UpstreamIo {
@@ -206,6 +259,7 @@ struct ConnectorInner {
     policy: AddressPolicy,
     connect_timeout: Duration,
     private: PrivateAddrs,
+    h1_open: Arc<H1Open>,
     #[cfg(test)]
     dial: Option<TestDial>,
 }
@@ -352,9 +406,14 @@ impl tower_service::Service<Uri> for Connector {
                 MaybeTls::Tls(t) => t.get_ref().1.alpn_protocol() == Some(b"h2".as_slice()),
                 MaybeTls::Plain(_) => false,
             };
+            let key = pool_key(
+                uri.scheme_str().unwrap_or_default(),
+                uri.authority().map_or("", http::uri::Authority::as_str),
+            );
             Ok(UpstreamIo {
                 io: TokioIo::new(io),
                 h2,
+                _h1: (!h2).then(|| inner.h1_open.open(key)),
             })
         })
     }
@@ -410,6 +469,7 @@ impl Upstream {
                 policy: s.address_policy.clone(),
                 connect_timeout: s.connect_timeout,
                 private,
+                h1_open: Arc::default(),
                 #[cfg(test)]
                 dial: s.dial.clone(),
             });
@@ -448,6 +508,27 @@ impl Upstream {
         match protocols {
             Protocols::Any => &pools.any,
             Protocols::Http1Only => &pools.http1,
+        }
+    }
+
+    /// Whether a request body going through the pooled client for
+    /// `protocols` to `scheme://authority` may be on an HTTP/1.1 connection
+    /// right now ([`H1Open`]). Over HTTP/1.1 hyper drops the body's
+    /// trailers, so a body asks this when one arrives.
+    pub(crate) fn may_be_h1(
+        &self,
+        private: PrivateAddrs,
+        protocols: Protocols,
+        scheme: &str,
+        authority: &str,
+    ) -> bool {
+        match protocols {
+            Protocols::Http1Only => true,
+            Protocols::Any => self
+                .pools(private)
+                .inner
+                .h1_open
+                .any(&pool_key(scheme, authority)),
         }
     }
 
