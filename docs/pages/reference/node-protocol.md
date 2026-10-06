@@ -44,7 +44,7 @@ Every non-`2xx`, non-`304` response carries an error body:
 ```
 
 `error` is a stable code; `message` is for humans. A `426` adds `missing`
-(see [features](#features)). A node acts on the status code, not the
+(see [features](/reference/node-protocol#features)). A node acts on the status code, not the
 body.
 
 | status | meaning | node behaviour |
@@ -80,7 +80,7 @@ certificate.
   extensions: it sets the subject and SAN itself.
 - `protocol_version` is `1`. A server that does not speak the version
   answers `426` with `missing: ["protocol_version:1"]`.
-- `features` is the node's [feature list](#features).
+- `features` is the node's [feature list](/reference/node-protocol#features).
 
 ```json title="EnrolResponse"
 {
@@ -102,7 +102,7 @@ certificate.
 - `not_after` is the certificate's expiry, RFC 3339 in UTC, the same value
   as in the certificate.
 - `renew_after_seconds` is counted from the node's receipt of the response.
-  Once it has passed the node [renews](#renew). It must be well inside the
+  Once it has passed the node [renews](/reference/node-protocol#renew). It must be well inside the
   certificate lifetime, so that a failed renewal has time to be retried.
 
 The token is consumed by a successful enrolment. A second use, a token the
@@ -160,10 +160,10 @@ server answers:
   exactly as it would `valid_for_seconds` and `refresh_after_seconds` from
   a `200`. An unchanged lease costs a request and a few headers, and is
   extended by it.
-- `410`, `401`, `426`, `5xx` as in the [errors table](#errors).
+- `410`, `401`, `426`, `5xx` as in the [errors table](/reference/node-protocol#errors).
 
 The server renders the lease for the node's reported version and features
-(see [features](#features)). It may also use the reported hashes to notice
+(see [features](/reference/node-protocol#features)). It may also use the reported hashes to notice
 a node that did not apply what it was sent.
 
 ### Lease body
@@ -225,7 +225,7 @@ a node that did not apply what it was sent.
   a rule tripped locally, once it has decided to: it changes the epoch. An
   unchanged epoch keeps state across a config change. The first lease sets
   the epoch without clearing anything.
-- `flow` configures [flow upload](#flow-upload). `ship: false` turns it
+- `flow` configures [flow upload](/reference/node-protocol#flow-upload). `ship: false` turns it
   off; the other fields are still required. `on_high_water` is `hold`
   (apply roxy's backpressure to traffic when the spool is full) or `spool`
   (drop the oldest spooled events, logging once).
@@ -317,7 +317,7 @@ Other responses:
   traffic when the spool fills, `spool` drops oldest. Shipping resumes when
   a lease with a new `lease_id` arrives. The control plane is expected to
   revoke the node or issue it a new lease.
-- `410`, `401`, `5xx` as in the [errors table](#errors). On `410` the node
+- `410`, `401`, `5xx` as in the [errors table](/reference/node-protocol#errors). On `410` the node
   attempts to ship what is spooled before it stops.
 
 ## A worked sequence
