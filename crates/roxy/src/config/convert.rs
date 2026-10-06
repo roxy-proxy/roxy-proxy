@@ -2,6 +2,7 @@
 //! `roxy_http::HttpFlags`, the proxy's HTTP behaviour, upstream settings,
 //! upstream TLS options).
 
+use ipnet::IpNet;
 use roxy_http::{HttpFlags, Limits};
 use roxy_proxy::HttpBehaviour;
 use roxy_proxy::addr::AddressPolicy;
@@ -62,6 +63,12 @@ impl From<&Config> for HttpBehaviour {
     }
 }
 
+/// Stores CIDR entries as address-list files do, so a mapped-form entry
+/// matches the IPv4 address it names.
+fn cidrs(nets: &[IpNet]) -> Vec<IpNet> {
+    nets.iter().map(|n| normalise_net(n.trunc())).collect()
+}
+
 impl From<&Config> for UpstreamSettings {
     fn from(c: &Config) -> Self {
         let u = &c.upstream;
@@ -81,8 +88,8 @@ impl From<&Config> for UpstreamSettings {
             },
             address_policy: AddressPolicy {
                 deny_private_ranges: u.deny_private_ranges,
-                deny_cidrs: u.deny_cidrs.iter().map(|n| normalise_net(n.trunc())).collect(),
-                allow_cidrs: u.allow_cidrs.iter().map(|n| normalise_net(n.trunc())).collect(),
+                deny_cidrs: cidrs(&u.deny_cidrs),
+                allow_cidrs: cidrs(&u.allow_cidrs),
                 // Resolved from `upstream.deny_lists` when the snapshot is
                 // built (`PolicyUpdate::deny_lists`).
                 deny_lists: Vec::new(),
@@ -147,7 +154,13 @@ mod tests {
         let p = UpstreamSettings::from(&c).address_policy;
         assert_eq!(p.deny_cidrs, vec!["203.0.113.0/24".parse().unwrap()]);
         assert_eq!(p.allow_cidrs, vec!["10.9.9.9/32".parse().unwrap()]);
-        assert!(p.check("203.0.113.7".parse().unwrap(), PrivateAddrs::Allow).is_err());
-        assert!(p.check("10.9.9.9".parse().unwrap(), PrivateAddrs::Deny).is_ok());
+        assert!(
+            p.check("203.0.113.7".parse().unwrap(), PrivateAddrs::Allow)
+                .is_err()
+        );
+        assert!(
+            p.check("10.9.9.9".parse().unwrap(), PrivateAddrs::Deny)
+                .is_ok()
+        );
     }
 }
