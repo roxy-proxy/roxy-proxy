@@ -48,10 +48,10 @@ runs follows from what it reads.
    deny.
 3. **Only head rules can `allow`.** A rule that reads a watched field cannot
    allow, change the request (`set_header` on the request, `rewrite_path`,
-   `redirect`, ...) or `capture`: the request is already on its way, so all
-   three are compile errors. It can deny, and add effects that still make
-   sense: `log`, `tag`, `set_state`, and header changes on a response that
-   has not been sent yet.
+   `redirect`, ...), `capture` or `digest`: the request is already on its
+   way, so each is a compile error. It can deny, and add effects that
+   still make sense: `log`, `tag`, `set_state`, and header changes on a
+   response that has not been sent yet.
 4. **A watching rule's non-terminal effects apply once**, the first time it
    matches.
 5. **Order matters for effects, not decisions.** Rules are evaluated top to

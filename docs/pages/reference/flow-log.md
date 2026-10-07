@@ -24,7 +24,7 @@ produces a `request` event:
 | field | meaning |
 |---|---|
 | `req.body_bytes`, `res.body_bytes` | body bytes roxy forwarded in each direction |
-| `req.body_sha256`, `res.body_sha256` | lower-case hex SHA-256 of those bytes; present once the body completed, absent if the exchange ended first (a cut body, a watching stop, a client that left). An empty body has the empty-string digest; a relayed WebSocket has counts but no digests |
+| `req.body_sha256`, `res.body_sha256` | lower-case hex SHA-256 of those bytes, only for the sides a head rule's `digest` action selected ([actions](/reference/rule-language#actions)); present once the body completed, absent if the exchange ended first (a cut body, a watching stop, a client that left). An empty body has the empty-string digest; a relayed WebSocket has counts but no digests. Hashing is opt-in because a digest nobody compares against is wasted work: software SHA-256 costs about one core per 400 MB/s on CPUs without SHA-NI |
 | `timing.upstream_connect_ms` | how long opening the upstream connection took (DNS, TCP and TLS); `null` when the request reused a pooled connection, or none was opened |
 | `timing.upstream_ttfb_ms` | from the forwarding decision to the upstream's response head |
 | `decision` | `allow`, `deny`, or `answered` when an addon layer answered itself |

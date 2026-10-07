@@ -126,6 +126,7 @@ Non-terminal:
 | `log: { level, message }` | all | Emits a `log` flow event. |
 | `set_state: { key, value, ttl? }` | all | Writes the [state store](/reference/rate-limits#state). |
 | `capture: request \| response \| both` | head rules | Tees the exchange, as forwarded, to the [capture log](/reference/flow-log#capture). |
+| `digest: request \| response \| both` | head rules | Hashes the selected bodies, as forwarded, into the flow record's [`body_sha256`](/reference/flow-log#flow-log). Nothing is hashed without it. |
 | `sign: { aws_sigv4: { service, region, access_key_id, secret_access_key, session_token?, unsigned_payload? } }` | head rules | AWS Signature Version 4 over the forwarded request, after every other head effect ([signing AWS requests](/reference/secrets#signing-aws-requests)). |
 
 Anything richer is an addon. `call` and `passthrough` are rejected with a
