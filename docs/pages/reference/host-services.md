@@ -58,9 +58,9 @@ on these, not on client-supplied session headers.
 ## Record (`record`)
 
 `flow.record(kind, json, audit)` writes a `layer_record` event to the flow
-log with the flow id, layer name and timestamp. String values in the
-document pass through the secret redactor; `kind` is logged as given; a
-document that is not JSON fails the exchange. The call
+log with the flow id, layer name and timestamp. `kind` and every string
+value in the document pass through the secret redactor; a document that
+is not JSON fails the exchange. The call
 waits while the flow log is behind and is never dropped. `audit: true` also
 POSTs the record to the layer's `audit_endpoint`.
 

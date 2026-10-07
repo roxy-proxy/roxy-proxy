@@ -1664,6 +1664,37 @@ async fn endpoints_respect_the_address_floor() {
     assert_eq!(calls[0]["error"], "endpoint address denied");
 }
 
+/// A record's `kind` is the guest's string as much as its document: a
+/// secret in it is redacted in the flow log and in the audit POST.
+#[tokio::test]
+async fn a_record_kind_is_redacted_like_its_document() {
+    use roxy_wasm::Capability;
+    let kit = Kit::builder()
+        .secret("tok", "verdict")
+        .addon(
+            AddonDef::test_layer("t")
+                .caps(&[Capability::Record])
+                .endpoint("audit", "https://up.test/audit", &[], true)
+                .audit_endpoint("audit"),
+        )
+        .start()
+        .await;
+    let a = cap(&kit, "record").await;
+    assert_eq!(a.text(), "ok", "{a:?}");
+    let r = kit.events("layer_record", 1).await;
+    assert_eq!(r[0]["kind"], "[REDACTED]", "{r:#?}");
+    assert_eq!(r[0]["data"]["score"], 0.9);
+    let seen = kit.upstream.wait_seen(1).await;
+    let post = seen
+        .iter()
+        .find(|s| s.path == "/audit")
+        .unwrap_or_else(|| panic!("{seen:#?}"));
+    let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+    assert_eq!(body["kind"], "[REDACTED]", "{body:#}");
+    assert_eq!(body["layer"], "t");
+    assert_eq!(body["data"]["score"], 0.9);
+}
+
 /// `record` and `state` work with their capabilities; a call without its
 /// capability fails the flow closed.
 #[tokio::test]
