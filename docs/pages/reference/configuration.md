@@ -17,24 +17,22 @@ table names.
 | `log`, `capture_dir` | [flow log](/reference/flow-log) |
 | `valid_until` | [lease](/guides/operations#lease) |
 
-- Parsing is strict: an unknown key anywhere is an error, and a key
-  repeated in the same map (a setting, a secret, a `static_hosts` name, an
-  endpoint header or an addon endpoint) is an error naming the key, not a
-  last-wins override.
-- Relative paths (`ca_dir`, `ca_cert`, `ca_key`, secret files, list files,
-  addon paths, log and capture paths) resolve against the process's
-  working directory.
-- `roxy check` refuses a zero value for the `limits` that would otherwise
-  refuse every request, hold no connections or fail every metric and state
-  rule closed: `max_headers`, `max_header_bytes`, `max_url_bytes`,
+- Strict parsing: an unknown key anywhere, or a key repeated in one map (a
+  setting, a secret, a `static_hosts` name, an endpoint header, an addon
+  endpoint), is an error naming the key, not a last-wins override.
+- Relative paths (`ca_dir`, `ca_cert`, `ca_key`, secret, list and addon
+  files, log and capture paths) resolve against the working directory.
+- `roxy check` refuses zero for the `limits` that would otherwise refuse
+  every request, hold no connections or fail every metric and state rule
+  closed: `max_headers`, `max_header_bytes`, `max_url_bytes`,
   `max_connections`, `max_connections_per_client`,
   `h2_max_concurrent_streams`, `h2_max_header_list_bytes`,
   `max_metric_keys`, `max_metric_bytes`, `max_state_entries`,
-  `max_observer_lag_bytes` and `max_address_list_bytes`. A metric's own
-  `max_keys` is refused at zero the same way, and may not exceed
-  `limits.max_metric_keys` ([rate limits](/reference/rate-limits#key-cardinality)).
-  The body, message and capture caps and the timeouts accept zero, and
-  mean it ([resource limits](/reference/limits#limits)).
+  `max_observer_lag_bytes`, `max_address_list_bytes`; and for a metric's
+  `max_keys`, which also may not exceed `limits.max_metric_keys`
+  ([rate limits](/reference/rate-limits#key-cardinality)). The body,
+  message and capture caps and the timeouts accept zero and mean it
+  ([resource limits](/reference/limits#limits)).
 
 ```yaml
 version: 1

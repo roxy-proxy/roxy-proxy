@@ -24,15 +24,13 @@ produces a `request` event:
 | field | meaning |
 |---|---|
 | `req.body_bytes`, `res.body_bytes` | body bytes roxy forwarded in each direction |
-| `req.body_sha256`, `res.body_sha256` | lower-case hex SHA-256 of those bytes, present once the body completed and absent when the exchange ended before it did (a cut body, a watching stop, a client that went away). An empty body has the digest of the empty string. A relayed WebSocket has byte counts but no digests |
-| `decision` | `allow`, `deny`, or `answered` when an addon layer answered itself ([addons](/reference/addon-configuration#in-the-proxy)) |
+| `req.body_sha256`, `res.body_sha256` | lower-case hex SHA-256 of those bytes; present once the body completed, absent if the exchange ended first (a cut body, a watching stop, a client that left). An empty body has the empty-string digest; a relayed WebSocket has counts but no digests |
+| `decision` | `allow`, `deny`, or `answered` when an addon layer answered itself |
 | `terminal_rule` | what decided: a rule id, or `_default`, `_fail_closed`, `_address_policy`, `_expired`, `_sign`, `_websocket` or `layer:<name>` |
-| `stage` | where the decision was made: `head`, or where a watching rule stopped the exchange: `request_body`, `response_head`, `response_body`, `websocket` |
-| `addons` | the addon layers that ran, outermost first; a layer skipped by its `when` or `sample` is not listed ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)) |
-| `rules`, `decision`, `terminal_rule` with addons | describe the request that left the stack; `req` describes what the client sent. `res.status` is what the client got, which a layer above the rules may have replaced ([addons](/reference/addon-configuration#in-the-proxy)) |
-| `reason` | a stable code when the exchange failed closed or failed (below) |
-
-`reason` by `terminal_rule`:
+| `stage` | `head`, or where a watching rule stopped the exchange: `request_body`, `response_head`, `response_body`, `websocket` |
+| `addons` | the layers that ran, outermost first; one skipped by its `when` or `sample` is not listed ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)) |
+| `rules`, `decision`, `terminal_rule` with addons | describe the request that left the stack; `req` is what the client sent and `res.status` what it got, which a layer above the rules may have replaced ([addons](/reference/addon-configuration#in-the-proxy)) |
+| `reason` | a stable code when the exchange failed closed or failed, by `terminal_rule`: |
 
 | `terminal_rule` | `reason` |
 |---|---|
@@ -42,18 +40,18 @@ produces a `request` event:
 | `_sign` | `sign_body_too_large`, `sign_header_invalid` ([signing AWS requests](/reference/secrets#signing-aws-requests)) |
 | `_websocket` | `ws_bad_handshake` ([WebSockets](/reference/websockets)) |
 | `layer:<name>` | `layer_error` |
-| an upstream failure | the `upstream_error` reason (`timeout`, `connect_failed`, ...; [upstream](/reference/upstream#errors)) |
-| an exchange roxy could not finish (its connection ended, or the server stopped, while it was in flight) | `aborted` |
-| an exchange an addon layer dropped after the rules had forwarded it | `upstream_aborted` |
-| cut short because the client went away | `client_gone` |
-| cut short because an HTTP/2 client stopped taking the response | `client_stalled` |
+| an upstream failure | the `upstream_error` reason ([upstream](/reference/upstream#errors)) |
+| roxy could not finish the exchange (its connection ended, or the server stopped, mid-flight) | `aborted` |
+| an addon layer dropped the exchange after the rules had forwarded it | `upstream_aborted` |
+| the client went away | `client_gone` |
+| an HTTP/2 client stopped taking the response | `client_stalled` |
 
 ### Events
 
 | event | when |
 |---|---|
 | `request` | every exchange |
-| `response_error` | the response could not be written after the request was allowed; `reason` is `client_gone` (the client stopped reading or went away), `client_stalled` (an HTTP/2 client left its flow-control window shut for `limits.body_idle_timeout`), `response_body_timeout` (the upstream paused mid-body for longer than `limits.response_body_idle_timeout`), `response_write_failed` (for example a body limit mid-stream) or `continue_write_failed` (roxy's own `100 Continue` could not be written) |
+| `response_error` | the response could not be written after the request was allowed; `reason` is `client_gone` (the client stopped reading or left), `client_stalled` (an HTTP/2 client kept its flow-control window shut for `limits.body_idle_timeout`), `response_body_timeout` (the upstream paused mid-body past `limits.response_body_idle_timeout`), `response_write_failed` (for example a body limit mid-stream) or `continue_write_failed` (roxy's `100 Continue` could not be written) |
 | `parse_error` | the client sent something roxy refused to parse; `reason` is a stable code |
 | `upstream_error`, `upstream_denied` | [upstream](/reference/upstream#errors) failures and address-floor hits; `upstream_denied.reason` is `private_range:<class>`, `deny_cidrs` or `list:<name>` ([address floor](/reference/address-lists#address-floor)) |
 | `policy_input_unavailable`, `metric_table_full` | a flow failed closed for want of an input |
@@ -72,8 +70,8 @@ produces a `request` event:
 
 Every injected secret value is scrubbed from any logged string. Values of
 `authorization`, `proxy-authorization`, `cookie`, `set-cookie` and
-`x-api-key` are never logged; `log.redact_headers` adds more. Query strings
-are logged with their values redacted.
+`x-api-key` are never logged; `log.redact_headers` adds more. Query values
+are redacted.
 
 ### Writing
 
@@ -81,33 +79,29 @@ The write path never drops a record while roxy runs
 ([audit backpressure](/design/threat-model#audit-backpressure)).
 
 - **One writer per destination.** Emitters serialise each event on their
-  own thread and enqueue the bytes; one writer thread owns the file.
-- **Batching.** The writer drains everything queued and issues one write:
-  under load each write carries everything since the last, at low load each
-  line goes out as it arrives.
-- **Backpressure.** Emitting never blocks and never drops. Once unwritten
-  bytes pass `log.flow.high_water` (8 MiB) the log reports not ready, and
-  every traffic producer waits for it: each new client connection, the
-  start of each exchange and each HTTP/2 stream, each forwarded body chunk
-  and each WebSocket read. A destination that fails (disk full, I/O error)
-  holds traffic the same way, and is reported.
-- **Rotation** happens in the writer thread at a batch boundary, so a
-  record never spans two files. The file is renamed to
-  `<path>.<UTC timestamp>-<seq>` (names sort in rotation order), a new one
-  is opened, files beyond `max_files` are deleted, and rotated files are
-  optionally gzipped in the background. Only files of that name shape count
-  towards `max_files` or are deleted. A failed rotation is a failed write:
-  traffic is held and it is retried. `SIGHUP` reopens the file, for
-  external rotation.
-- **Shutdown.** roxy writes everything queued before it exits. A
-  destination still failing after 10 seconds of retries at shutdown is
-  given up on: the unwritten batch (at most `high_water` bytes) is
-  discarded and an error is logged. This is the one point at which a
-  record can be dropped.
-- **Durability.** A batch is written and flushed to the operating system at
-  every batch boundary, where `max_file_bytes` is also checked. roxy does
-  not `fsync`: a roxy crash loses nothing queued, but a kernel crash or
-  power loss can lose batches the OS had not yet written to disk.
+  own thread and enqueue the bytes; one writer thread owns the file and
+  writes everything queued in one batch.
+- **Backpressure.** Emitting never blocks or drops. Once unwritten bytes
+  pass `log.flow.high_water` (8 MiB) the log reports not ready and every
+  traffic producer waits for it: each new client connection, exchange and
+  HTTP/2 stream, each forwarded body chunk and each WebSocket read. A
+  failing destination (disk full, I/O error) holds traffic the same way, and
+  is reported.
+- **Rotation** happens at a batch boundary, so a record never spans two
+  files: the file is renamed to `<path>.<UTC timestamp>-<seq>` (names sort
+  in rotation order), a new one is opened, files beyond `max_files` are
+  deleted, and rotated files are optionally gzipped in the background. Only
+  files of that name shape count towards `max_files` or are deleted. A
+  failed rotation is a failed write: traffic is held and it is retried.
+  `SIGHUP` reopens the file, for external rotation.
+- **Shutdown.** Everything queued is written before exit. A destination
+  still failing after 10 seconds of retries is given up on: the unwritten
+  batch (at most `high_water` bytes) is discarded and an error logged. This
+  is the one point at which a record can be dropped.
+- **Durability.** Each batch is flushed to the operating system, and
+  `max_file_bytes` checked, at the batch boundary. roxy does not `fsync`: a
+  roxy crash loses nothing queued; a kernel crash or power loss can lose
+  batches the OS had not yet written to disk.
 
 ```yaml
 log:
@@ -127,21 +121,18 @@ json|pretty` and `--log-level` (or `RUST_LOG`).
 
 ## Capture
 
-roxy can tee the heads and bodies of exchanges, exactly as forwarded, to
-`<capture_dir>/capture.rxc`: the exchanges a head rule selects with
-`capture: request | response | both`, or every forwarded exchange with
+roxy tees the heads and bodies of exchanges, exactly as forwarded, to
+`<capture_dir>/capture.rxc`: those a head rule selects with `capture:
+request | response | both`, or every forwarded exchange with
 `log.capture.all: true`. Capture is decided at the request head and covers
-the exchange from its first byte. The taps sit after the watching rules
-allowed a chunk and before it is handed on, so what is captured is what was
-relayed. WebSocket relays are captured in both directions, at the relay
-next to the upstream, not as an addon layer changes them for the client.
+the exchange from its first byte; the taps sit after the watching rules
+allowed a chunk. WebSocket relays are captured both ways at the relay next
+to the upstream, not as an addon layer changes them for the client.
 
-Capture is written like the flow log: one writer, batching, rotation, and
-backpressure. Injected secret values are scrubbed from captured heads;
-nothing else is. The header-name redaction above applies to the flow log
-only: a capture keeps every header value the client sent (a client-sent
-credential is a placeholder in roxy's model), and bodies are captured
-**unredacted**.
+Capture is written like the flow log (one writer, batching, rotation,
+backpressure). Injected secret values are scrubbed from captured heads;
+nothing else is: the header-name redaction above is flow-log only, and
+bodies are captured **unredacted**.
 
 ```yaml
 capture_dir: /var/lib/roxy/capture   # absent = capture disabled; restart to change
@@ -176,5 +167,5 @@ hello
 |---|---|
 | `flow` | joins records to the flow log |
 | `dir` | `request` (client to upstream) or `response` |
-| `kind` | `head` (the canonical head as JSON, as forwarded), `data` (forwarded bytes), `truncated` (`limits.max_capture_body_bytes` was reached for this direction and nothing more is captured; carries `cap`), or `end` (carries the total forwarded `bytes`, and `aborted: true` if the direction did not complete) |
+| `kind` | `head` (the canonical head as JSON, as forwarded), `data` (forwarded bytes), `truncated` (`limits.max_capture_body_bytes` reached for this direction; nothing more is captured; carries `cap`), or `end` (carries the total forwarded `bytes`, and `aborted: true` if the direction did not complete) |
 | `seq` | counts records per flow and direction |
