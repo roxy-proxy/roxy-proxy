@@ -79,7 +79,8 @@ class JsonHandler(BaseHTTPRequestHandler):
         self.route("POST")
 
     def route(self, method: str) -> None:
-        name = f"do_{method}_{self.path.split('?', 1)[0].strip('/').replace('/', '_') or 'index'}"
+        path = self.path.split("?", 1)[0]
+        name = f"do_{method}_{path.removeprefix('/').replace('/', '_') or 'index'}"
         handler = getattr(self, name, None)
         if handler is None:
             self.send_error_json(404, "not_found_error", f"no route for {method} {self.path}")

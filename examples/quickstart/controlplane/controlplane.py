@@ -53,6 +53,15 @@ def utcnow():
     return dt.datetime.now(dt.timezone.utc)
 
 
+def write_private(path, data):
+    """Writes key material readable by its owner alone, from creation on,
+    whatever the umask or the mode of a file already there."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with open(fd, "wb") as f:
+        f.write(data)
+
+
 class Ca:
     """One CA for the server certificate and every node certificate, kept
     in `data_dir` so a restart recognises the nodes it enrolled."""
@@ -82,10 +91,9 @@ class Ca:
             ), critical=True)
             .sign(self.key, hashes.SHA256())
         )
-        key_path.write_bytes(self.key.private_bytes(
+        write_private(key_path, self.key.private_bytes(
             serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
         ))
-        key_path.chmod(0o600)
         cert_path.write_bytes(self.pem)
 
     @property
@@ -360,7 +368,7 @@ class Server(ThreadingHTTPServer):
         self.tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.tls.minimum_version = ssl.TLSVersion.TLSv1_3
         chain = cp.data_dir / "server.pem"
-        chain.write_bytes(cp.ca.server_certificate(hostnames))
+        write_private(chain, cp.ca.server_certificate(hostnames))
         self.tls.load_cert_chain(chain)
         # Enrolment arrives without a certificate, so one is asked for, not
         # required; the handlers answer 401 where one is needed. A presented

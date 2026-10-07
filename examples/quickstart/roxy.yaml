@@ -34,7 +34,9 @@ secrets:
   model_key: { env: MODEL_API_KEY }   # the client never holds it; roxy sets x-api-key
 
 # Above the rules, in this order. Each one is skipped on exchanges its `when`
-# does not match.
+# does not match. What counts as a model call is written once (`&model-call`)
+# and shared by the quota, the sentinel and the allow rule, so a request the
+# layers skip is one the rules deny: `/v1/messages/` is not `/v1/messages`.
 addons:
   # Who is calling: the credential in x-roxy-auth, checked with the auth
   # service, becomes a `user:<name>` tag on the flow for the layers below.
@@ -53,7 +55,7 @@ addons:
   - name: token-quota
     kind: wasm
     path: /etc/roxy/addons/token_quota.wasm
-    when: host == "fake-model" and method == POST and path == "/v1/messages"
+    when: &model-call host == "fake-model" and method == POST and path == "/v1/messages"
     capabilities: [endpoints, record]
     endpoints:
       quota-check: { url: "http://quota-board:8090/check", private_ok: true, timeout: 5s }
@@ -63,6 +65,7 @@ addons:
   # before the client sees it.
   - name: sentinel
     kind: service
+    when: *model-call
     endpoint: sidecar
     endpoints:
       sidecar: { url: "http://sentinel:9000/", private_ok: true }
@@ -75,7 +78,7 @@ addons:
 # Anything no rule allows is denied. A matching deny always beats an allow.
 rules:
   - id: model-api
-    when: host == "fake-model" and path starts_with "/v1/"
+    when: *model-call
     then:
       - set_header: { x-api-key: "${secret:model_key}" }
       - allow: { private_ok: true }   # the model is on the compose network

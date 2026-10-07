@@ -75,6 +75,15 @@ echo "smoke: lease applied"
 expect "$(as_bob http://example.com/)" '^403 _default$'
 echo "smoke: default deny"
 
+# A model call is `POST /v1/messages` exactly. The trailing-slash form is
+# skipped by the quota and the sentinel, and the allow rule, the same
+# condition, denies it: authenticated by the gate, then nowhere.
+expect "$(as_bob http://fake-model:8080/v1/messages/)" '^403 _default$'
+docker compose logs --no-log-prefix roxy | grep -F '"path":"/v1/messages/"' \
+    | grep -qE '"addons":\["auth-gate"\].*"terminal_rule":"_default"' \
+    || fail "the trailing-slash call did not run the auth gate alone and end at _default"
+echo "smoke: exact model path"
+
 wanted=(
     '^\[alice #[0-9]+\] 429 RateLimitError: token bucket empty'
     '^\[mallory #1\] 401 AuthenticationError'
