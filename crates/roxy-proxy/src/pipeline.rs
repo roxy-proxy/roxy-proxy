@@ -869,15 +869,11 @@ impl FlowCx {
     }
 }
 
-/// Emits a `connect` event for a CONNECT (refused, or accepted for
-/// inspection). No connect-time rules exist, so the event carries none.
-pub(crate) fn emit_connect_event(
-    shared: &Shared,
-    client: &ClientConn,
-    authority: &Authority,
-    denied: bool,
-) {
-    if !denied && !shared.connection_events {
+/// Emits a `connect` event for a CONNECT accepted for inspection. No
+/// connect-time rules exist, so the event carries none and its decision
+/// is always `allow`.
+pub(crate) fn emit_connect_event(shared: &Shared, client: &ClientConn, authority: &Authority) {
+    if !shared.connection_events {
         return;
     }
     shared.sink.emit(&FlowEvent::Connect {
@@ -891,11 +887,7 @@ pub(crate) fn emit_connect_event(
             ip: None,
         },
         tls: None,
-        decision: if denied {
-            DecisionKind::Deny
-        } else {
-            DecisionKind::Allow
-        },
+        decision: DecisionKind::Allow,
         rules: Vec::new(),
     });
 }

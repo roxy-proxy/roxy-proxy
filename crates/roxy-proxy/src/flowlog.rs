@@ -77,10 +77,11 @@ pub enum FlowEvent<'a> {
         path: PathBuf,
         diagnostics: Vec<String>,
     },
-    /// A CONNECT on the proxy port. There are no connect-time rules:
-    /// a CONNECT is accepted for inspection unless the SNI check refuses
-    /// it. Only emitted when `log.flow.connection_events` is
-    /// enabled or the connect was refused.
+    /// A CONNECT on the proxy port, accepted for inspection. There are no
+    /// connect-time rules: every decision is made on the requests inside
+    /// the tunnel, and a tunnel closed at its first bytes is a
+    /// `parse_error`. Only emitted when `log.flow.connection_events` is
+    /// enabled.
     Connect {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,
