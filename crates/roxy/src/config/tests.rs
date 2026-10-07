@@ -769,12 +769,53 @@ fn endpoint_path_mode() {
     let e = &c.addons[0].endpoints;
     assert_eq!(e["m"].path, EndpointPath::Fixed);
     assert_eq!(e["p"].path, EndpointPath::Prefix);
+    let err = Config::from_yaml(&format!(
+        "{BASE}addons: [{{ name: a, path: /a.wasm, endpoints: {{ \
+         m: {{ url: https://a.test/v1, path: append }} }} }}]\n"
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("unknown variant `append`"), "{err}");
+}
+
+/// Endpoint header names are case-insensitive, so two spellings of one
+/// name are a duplicate the map alone would not catch.
+#[test]
+fn endpoint_headers_differing_only_in_case_are_duplicates() {
+    let d = diagnostics(&format!(
+        "{BASE}addons: [{{ name: a, path: /a.wasm, endpoints: {{ \
+         m: {{ url: https://a.test/v1, headers: {{ X-Token: a, x-token: b }} }} }} }}]\n"
+    ));
+    let dup: Vec<_> = d
+        .iter()
+        .filter(|d| d.message.contains("duplicate key"))
+        .collect();
+    assert_eq!(dup.len(), 1, "{d:#?}");
+    assert_eq!(dup[0].path, "addons[0].endpoints.m.headers.x-token");
+}
+
+/// `deny_cidrs` and `allow_cidrs` are networks: host bits are refused as
+/// they are in address lists and rule literals, not silently dropped.
+#[test]
+fn upstream_cidrs_with_host_bits_are_rejected() {
+    let d = diagnostics(&format!(
+        "{BASE}upstream: {{ deny_cidrs: [10.0.0.1/8, 192.0.2.0/24], allow_cidrs: [\"2001:db8::1/32\"] }}\n"
+    ));
+    let paths: Vec<&str> = d.iter().map(|d| d.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["upstream.deny_cidrs[0]", "upstream.allow_cidrs[0]"],
+        "{d:#?}"
+    );
     assert!(
-        Config::from_yaml(&format!(
-            "{BASE}addons: [{{ name: a, path: /a.wasm, endpoints: {{ \
-             m: {{ url: https://a.test/v1, path: append }} }} }}]\n"
-        ))
-        .is_err()
+        d[0].message.contains("did you mean 10.0.0.0/8?"),
+        "{}",
+        d[0]
+    );
+    assert!(
+        d[1].message.contains("did you mean 2001:db8::/32?"),
+        "{}",
+        d[1]
     );
 }
 

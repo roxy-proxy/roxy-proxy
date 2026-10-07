@@ -106,7 +106,10 @@ async fn unknown_length_is_clean_chunked() {
 /// hyper's HTTP/1.1 encoder writes trailers only for names a `trailer`
 /// header announces, which a canonical request never carries: trailers
 /// handed to it end the body as plain `0\r\n\r\n`. The proxy's refusal of
-/// trailers towards an HTTP/1.1 upstream rests on this.
+/// trailers towards an HTTP/1.1 upstream rests on this. This pins hyper,
+/// not roxy: if a hyper upgrade fails it, re-check whether roxy-proxy's
+/// `trailers` refusal for HTTP/1.1 origins is still needed, and what the
+/// encoder now does with a `Trailer` header the client sent.
 #[tokio::test]
 async fn h1_encoder_drops_trailers_without_a_trailer_header() {
     let (mut tx, body) = Body::channel(1 << 20, None);

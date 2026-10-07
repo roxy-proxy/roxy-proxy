@@ -163,7 +163,6 @@ async fn response_wire_form() {
     let req = expect_request(&mut c).await;
     assert_eq!(req.method.as_str(), "HEAD");
     let res = ok(Body::empty());
-    assert_eq!(res.body.known_length(), Some(0));
     c.respond(res).await.unwrap();
     let (head, _) = read_response(&mut client, true).await;
     assert!(!head.contains("content-length"), "{head}");

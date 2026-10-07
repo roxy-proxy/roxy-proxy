@@ -7,9 +7,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use roxy_http::url::{self, Path, Query};
-use roxy_http::{
-    Authority, Headers, Host, HttpFlags, Limits, Method, ParseError, Reason, Scheme,
-};
+use roxy_http::{Authority, Headers, Host, HttpFlags, Limits, Method, ParseError, Reason, Scheme};
 use roxy_proxy::Redactor;
 use roxy_proxy::addr::{AddressDenied, PrivateAddrs};
 use roxy_proxy::addrlist::AddressLists;

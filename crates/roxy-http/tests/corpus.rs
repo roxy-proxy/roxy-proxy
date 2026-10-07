@@ -278,15 +278,18 @@ async fn check_case<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 }
                 if let Some(l) = rest.iter().find_map(|w| w.strip_prefix("leftover=")) {
                     let (_, leftover) = conn.accept_connect().await.map_err(|e| e.to_string())?;
-                    // One byte per read leaves the tunnel bytes unread; what
-                    // is buffered must still be a prefix of them.
+                    // One byte per read never buffers past the head, so the
+                    // expectation has nothing to check in that mode.
+                    if byte_at_a_time {
+                        if !leftover.is_empty() {
+                            return Err(format!(
+                                "{ctx}: leftover {leftover:?} read one byte at a time"
+                            ));
+                        }
+                        return Ok(());
+                    }
                     let want = unescape(l);
-                    let ok = if byte_at_a_time {
-                        want.starts_with(&leftover)
-                    } else {
-                        leftover[..] == want[..]
-                    };
-                    if !ok {
+                    if leftover[..] != want[..] {
                         return Err(format!("{ctx}: leftover {leftover:?}"));
                     }
                     return Ok(());

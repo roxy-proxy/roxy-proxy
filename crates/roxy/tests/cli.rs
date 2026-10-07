@@ -312,7 +312,10 @@ fn check_fails_where_startup_would() {
     let err = check();
     let expect = format!("{}:tls.ca_dir: ", cfg.display());
     assert!(err.contains(&expect), "{err}");
-    assert_eq!(std::fs::read_to_string(&ca_cert).unwrap(), "not a certificate\n");
+    assert_eq!(
+        std::fs::read_to_string(&ca_cert).unwrap(),
+        "not a certificate\n"
+    );
     assert_eq!(std::fs::read_to_string(&ca_key).unwrap(), "not a key\n");
 }
 

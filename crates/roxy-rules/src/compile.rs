@@ -806,7 +806,8 @@ fn literal_set(
 /// denotes. Flow addresses are canonicalised to IPv4 before matching, so a
 /// mapped network left in IPv6 form would never match. A mapped address
 /// has `ffff` in bits 80..96, so a prefix shorter than /96 sets host bits
-/// and the lexer has already rejected it.
+/// and the lexer has already rejected it. roxy-proxy's address lists do the
+/// same in `addrlist::normalise_net`; this crate cannot depend on it.
 fn canonical_net(net: IpNet) -> IpNet {
     match (net.addr().to_canonical(), net.prefix_len().checked_sub(96)) {
         (IpAddr::V4(v4), Some(prefix)) => Ipv4Net::new(v4, prefix).map_or(net, IpNet::V4),

@@ -3,7 +3,8 @@
 //! upstream TLS options).
 
 use ipnet::IpNet;
-use roxy_http::{HttpFlags, Limits};
+use roxy_http::url::parse_host;
+use roxy_http::{Host, HttpFlags, Limits};
 use roxy_proxy::HttpBehaviour;
 use roxy_proxy::addr::AddressPolicy;
 use roxy_proxy::addrlist::normalise_net;
@@ -83,11 +84,16 @@ impl From<&Config> for UpstreamSettings {
                     Resolver::Servers(s) => Some(s.clone()),
                 },
                 cache_ttl_cap: u.dns.cache_ttl_cap,
+                // Keyed on the canonical name the resolver is asked for;
+                // validation has refused any other spelling.
                 static_hosts: u
                     .dns
                     .static_hosts
                     .iter()
-                    .map(|(name, ip)| (name.trim_end_matches('.').to_ascii_lowercase(), vec![*ip]))
+                    .filter_map(|(name, ip)| match parse_host(name.as_bytes()) {
+                        Ok(Host::Dns(name)) => Some((name, vec![*ip])),
+                        _ => None,
+                    })
                     .collect(),
             },
             address_policy: AddressPolicy {

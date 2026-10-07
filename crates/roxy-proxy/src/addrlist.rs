@@ -103,7 +103,8 @@ pub fn parse_entry(s: &str) -> Result<IpNet, String> {
 
 /// `::ffff:a.b.c.d/96+n` → `a.b.c.d/n`, so an IPv4-mapped entry matches
 /// the IPv4 address it names however a client spells it. Every CIDR config
-/// surface stores entries through this.
+/// surface stores entries through this; rule literals, compiled in
+/// roxy-rules, which cannot depend on this crate, have their own copy.
 pub fn normalise_net(net: IpNet) -> IpNet {
     if let IpNet::V6(v6) = net
         && v6.prefix_len() >= 96

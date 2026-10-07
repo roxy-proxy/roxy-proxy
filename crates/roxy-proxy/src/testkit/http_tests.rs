@@ -967,6 +967,28 @@ async fn a_tunnel_host_is_normalised_before_the_sni_check() {
     assert_eq!(seen[0].path, "/n");
 }
 
+/// An SNI with a trailing dot names the same host as the CONNECT: the
+/// handshake completes and the flow records the canonical name.
+#[tokio::test]
+async fn a_trailing_dot_sni_is_compared_canonically() {
+    let kit = Kit::builder().start().await;
+    let io = kit.connect_tunnel("up.test", 443).await;
+    let mut cfg = kit.client_tls();
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let name = rustls::pki_types::ServerName::try_from("up.test.").unwrap();
+    let mut tls = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg))
+        .connect(name, io)
+        .await
+        .expect("the SNI names the CONNECT host");
+    tls.write_all(b"GET /dot HTTP/1.1\r\nhost: up.test\r\n\r\n")
+        .await
+        .unwrap();
+    let (head, _) = read_response(&mut tls).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["tls"]["sni"], "up.test", "{ev:#}");
+}
+
 /// With `require_sni_match: false` a foreign SNI completes the handshake
 /// with a leaf for that SNI, but the requests inside are still the CONNECT
 /// host's: a `Host` naming the SNI is a mismatch.

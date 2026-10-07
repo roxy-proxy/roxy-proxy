@@ -9,8 +9,9 @@
 //! before it is parsed, so a hello is never partially interpreted. A hello
 //! split across several TLS records is reported as `NotTls` (no real client
 //! does this). A malformed or hostile `server_name` (non-ASCII, control
-//! characters, NUL, trailing dot, duplicate entries) also yields `NotTls`
-//! rather than silently becoming "no SNI".
+//! characters, NUL, duplicate entries) also yields `NotTls` rather than
+//! silently becoming "no SNI". The name is returned as sent: whether it is
+//! a host, and which, is the caller's one host parser's to say.
 
 /// Hard cap on the TLS record and handshake length we are willing to parse.
 pub const MAX_HELLO_BYTES: usize = 16 * 1024;
@@ -194,19 +195,16 @@ fn parse_server_name(data: &[u8]) -> Option<Option<String>> {
     Some(host)
 }
 
+/// The wire checks only: a bounded run of printable ASCII (no NUL,
+/// whitespace, controls or non-ASCII).
 fn validate_host(name: &[u8]) -> Option<String> {
     if name.is_empty() || name.len() > MAX_HOST {
         return None;
     }
-    // Printable ASCII only: rules out NUL, whitespace, controls and non-ASCII.
     if !name.iter().all(|b| (0x21..=0x7e).contains(b)) {
         return None;
     }
-    if name.ends_with(b".") {
-        return None;
-    }
-    let s = std::str::from_utf8(name).ok()?;
-    Some(s.to_ascii_lowercase())
+    std::str::from_utf8(name).ok().map(str::to_owned)
 }
 
 fn parse_alpn(data: &[u8]) -> Option<Vec<String>> {
@@ -328,7 +326,12 @@ mod tests {
 
     impl ResolvesServerCert for RecordSni {
         fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-            *self.0.lock().unwrap() = Some(hello.server_name().map(str::to_owned));
+            // rustls keeps a trailing dot; roxy's canonical host drops it.
+            *self.0.lock().unwrap() = Some(
+                hello
+                    .server_name()
+                    .map(|n| n.strip_suffix('.').unwrap_or(n).to_owned()),
+            );
             None
         }
     }
@@ -391,7 +394,7 @@ mod tests {
         let Sniff::Tls(info) = sniff(&buf) else {
             panic!("not tls");
         };
-        assert_eq!(info.sni.as_deref(), Some("example.com"));
+        assert_eq!(info.sni.as_deref(), Some("Example.COM"));
         assert_eq!(rustls_sni(&buf), Some(Some("example.com".to_owned())));
         assert_eq!(
             rustls_sni(&hello("example.com", &["h2"], true)),
@@ -455,6 +458,7 @@ mod tests {
             let Sniff::Tls(info) = sniff(&buf) else {
                 panic!("not tls: {sni}");
             };
+            // The rustls client sends the canonical (lower-case) name.
             assert_eq!(info.sni.as_deref(), Some(sni.to_ascii_lowercase().as_str()));
             assert_eq!(info.alpn, alpn);
         }
@@ -556,12 +560,23 @@ mod tests {
         ));
         for bad in [
             &b"a\0aaaaaaaaa"[..],
-            b"aaaaaaaaaa.",
             b"aaaa aaaaaa",
             b"aaaa\xc3\xa9aaaaa",
             b"aaaa\naaaaaa",
         ] {
             assert_eq!(sniff(&with_sni_bytes(bad)), Sniff::NotTls, "{bad:?}");
+        }
+    }
+
+    /// A trailing dot or an IP literal is a name on the wire; whether it
+    /// is a host roxy accepts is the host parser's call, not the sniffer's.
+    #[test]
+    fn host_shaped_names_pass_through_as_sent() {
+        for name in [&b"aaaaaaaaaa."[..], b"10.0.0.1..."] {
+            let Sniff::Tls(info) = sniff(&with_sni_bytes(name)) else {
+                panic!("not tls: {name:?}");
+            };
+            assert_eq!(info.sni.as_deref(), std::str::from_utf8(name).ok());
         }
     }
 
