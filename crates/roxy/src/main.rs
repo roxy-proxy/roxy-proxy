@@ -20,6 +20,11 @@ use roxy::addons::AddonLoader;
 use roxy::config::{Compiled, Config};
 use roxy::ruletest;
 
+// musl's malloc takes a global lock on every call, which halves the
+// throughput of the static release image.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "roxy",
