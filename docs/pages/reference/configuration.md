@@ -38,6 +38,11 @@ page the table names.
 ```yaml
 version: 1
 
+listeners:
+  - name: proxy
+    mode: http_proxy      # the default; `http` serves origin-form requests directly
+    bind: 0.0.0.0:3128
+
 secrets:
   openai: { env: OPENAI_API_KEY }
   gh:     { file: /run/secrets/github_token }   # one trailing newline stripped

@@ -10,7 +10,8 @@
                             http.allow_plain_in_connect, tls.require_sni_match)
                    TLS termination (leaf minted by roxy's CA), ALPN h1 | h2
                      ▼
-                   strict parse → CanonicalRequest
+                   strict parse → CanonicalRequest   ◀── or plain origin-form
+                     ▼                                   requests (mode: http)
                      ▼
                    addons (in config order)
                      ▼
@@ -26,8 +27,9 @@
 ```
 
 A client connection is accepted by a listener and, after CONNECT (on an
-`http_proxy` listener) and TLS termination, carries a sequence of exchanges (HTTP/1.1 keep-alive) or
-concurrent ones (HTTP/2 streams). Both fronts feed one transport-agnostic
+`http_proxy` listener) and TLS termination, or directly (an `http`
+listener, [HTTP](/reference/http#http-listener)), carries a sequence of
+exchanges (HTTP/1.1 keep-alive) or concurrent ones (HTTP/2 streams). Both fronts feed one transport-agnostic
 exchange core (`roxy-proxy`'s `exchange` module):
 
 1. The request head is parsed into the canonical model

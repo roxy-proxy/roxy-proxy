@@ -16,6 +16,7 @@ use roxy_tls::{Ca, LeafMinter, UpstreamTlsOptions};
 
 use crate::addrlist::AddressLists;
 use crate::flowlog::{FlowSink, Redactor};
+use crate::listener::ListenerMode;
 use crate::sources::{MetricSource, StateSource};
 use crate::upstream::UpstreamSettings;
 
@@ -23,6 +24,7 @@ use crate::upstream::UpstreamSettings;
 #[derive(Debug, Clone)]
 pub struct ListenerSpec {
     pub name: String,
+    pub mode: ListenerMode,
     pub bind: SocketAddr,
 }
 

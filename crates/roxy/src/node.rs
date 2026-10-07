@@ -310,7 +310,7 @@ impl NodeHandler {
         let state = Arc::new(BuiltinState::new(config.limits.max_state_entries));
         *lock(&self.state) = state.clone();
         let rt = RuntimeConfig {
-            listeners: listener_specs(config),
+            listeners: listener_specs(config)?,
             ca_server: config.ca_server.as_ref().map(|c| c.bind),
             ca,
             minter,

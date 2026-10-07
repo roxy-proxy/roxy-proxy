@@ -307,6 +307,51 @@ GET / HTTP/1.1\r\n
 Host: plain.example.com\r\n
 \r\n
 
+=== origin_listener_hosts_differ_per_request
+# On an http listener each request's Host names its own target.
+role: origin
+expect: request GET http://a.gw.example.com:80/v1/a
+expect: request GET http://b.gw.example.com:8080/v1/b
+expect: eof
+---
+GET /v1/a HTTP/1.1\r\n
+Host: A.gw.example.com\r\n
+\r\n
+GET /v1/b HTTP/1.1\r\n
+Host: b.gw.example.com:8080\r\n
+\r\n
+
+=== origin_listener_absolute_form
+role: origin
+expect: error target_form_mismatch
+---
+GET http://a.gw.example.com/ HTTP/1.1\r\n
+Host: a.gw.example.com\r\n
+\r\n
+
+=== origin_listener_connect
+role: origin
+expect: error target_form_mismatch
+---
+CONNECT a.gw.example.com:443 HTTP/1.1\r\n
+Host: a.gw.example.com:443\r\n
+\r\n
+
+=== origin_listener_missing_host
+role: origin
+expect: error missing_host
+---
+GET / HTTP/1.1\r\n
+\r\n
+
+=== origin_listener_malformed_host
+role: origin
+expect: error bad_authority
+---
+GET / HTTP/1.1\r\n
+Host: a.gw.example.com:\r\n
+\r\n
+
 === connection_host_still_checked
 # Nominating host as hop-by-hop does not exempt it from the target check.
 expect: error host_mismatch

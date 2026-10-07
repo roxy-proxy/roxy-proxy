@@ -5,7 +5,7 @@
 //! ```text
 //! === case_name
 //! # comment
-//! role: proxy | tunnel <http|https> <host:port>
+//! role: proxy | origin | tunnel <http|https> <host:port>
 //! flags: allow_http10 allow_trailers ...
 //! limits: max_headers=5 max_header_bytes=300 ...
 //! expect: request <METHOD> <url> [body=<escaped>] [hdr:<name>=<value>] [nohdr:<name>]
@@ -170,6 +170,7 @@ fn parse_cases(file: &str, text: &str) -> Vec<Case> {
                     let parts: Vec<_> = v.split_whitespace().collect();
                     case.role = match parts.as_slice() {
                         ["proxy"] => Role::ProxyPort,
+                        ["origin"] => Role::Origin,
                         ["tunnel", scheme, auth] => {
                             let scheme = if *scheme == "https" {
                                 Scheme::Https

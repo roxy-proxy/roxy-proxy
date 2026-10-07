@@ -16,10 +16,12 @@ pub fn flags(cfg: u8) -> HttpFlags {
 }
 
 /// The connection role from one fuzz byte (bits 5..=6): the proxy port
-/// (0 or 1), or a tunnel (https or plaintext http) to `example.com`.
+/// (0), an `http` listener (1), or a tunnel (https or plaintext http) to
+/// `example.com`.
 pub fn role(cfg: u8) -> Role {
     match (cfg >> 5) & 3 {
-        0 | 1 => Role::ProxyPort,
+        0 => Role::ProxyPort,
+        1 => Role::Origin,
         2 => Role::Tunnel {
             authority: parse_authority(b"example.com", 443).expect("valid authority"),
             scheme: Scheme::Https,

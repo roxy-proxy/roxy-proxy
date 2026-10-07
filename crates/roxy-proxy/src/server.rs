@@ -22,7 +22,7 @@ use crate::addrlist::AddressLists;
 use crate::budget::{BufferBudget, BufferLease};
 use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowEvent, FlowSink, Redactor};
-use crate::listener::{ClientConn, Listener, TcpProxyListener};
+use crate::listener::{ClientConn, Listener, ListenerMode, TcpProxyListener};
 use crate::pipeline::client_info;
 use crate::secrets::SecretStore;
 use crate::sources::{MetricSource, StateSource};
@@ -475,7 +475,7 @@ impl Server {
         let mut bound: Vec<Arc<dyn Listener>> = Vec::new();
         let mut addrs = Vec::new();
         for spec in &cfg.listeners {
-            let l = TcpProxyListener::bind(&spec.name, spec.bind)
+            let l = TcpProxyListener::bind(&spec.name, spec.mode, spec.bind)
                 .await
                 .map_err(|e| {
                     StartError(format!(
@@ -588,10 +588,15 @@ async fn accept_loop(listener: Arc<dyn Listener>, shared: Arc<Shared>) {
         match shared.caps.acquire(client.peer.ip()) {
             Ok(slot) => {
                 let s = shared.clone();
-                shared.spawn_conn(
-                    slot,
-                    crate::conn::serve_http_proxy(Box::new(stream), client, s),
-                );
+                let stream = Box::new(stream);
+                match client.listener.mode {
+                    ListenerMode::HttpProxy => {
+                        shared.spawn_conn(slot, crate::conn::serve_http_proxy(stream, client, s));
+                    }
+                    ListenerMode::Http => {
+                        shared.spawn_conn(slot, crate::conn::serve_http(stream, client, s));
+                    }
+                }
             }
             Err(reason) => {
                 drop(stream);

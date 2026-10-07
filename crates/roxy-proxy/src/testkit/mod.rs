@@ -4,7 +4,7 @@
 //! overrides, the real address floor and real upstream TLS).
 //!
 //! ```text
-//!   test client ──duplex──▶ conn::serve_http_proxy ─▶ … ─▶ Connector ──TestDial──▶ scripted upstream
+//!   test client ──duplex──▶ conn::serve_http_proxy | conn::serve_http ─▶ … ─▶ Connector ──TestDial──▶ scripted upstream
 //! ```
 //!
 //! * Names: `up.test` resolves to a public test address, `private.test` to a
@@ -34,6 +34,8 @@ mod core_tests;
 #[cfg(test)]
 mod early_tests;
 mod gate;
+#[cfg(test)]
+mod gateway_tests;
 mod h2raw;
 #[cfg(test)]
 mod http_tests;
@@ -75,7 +77,7 @@ use crate::addr::PrivateAddrs;
 use crate::addrlist::{AddressList, AddressLists};
 use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowSink, MemorySink, Redactor};
-use crate::listener::{ClientConn, ListenerInfo};
+use crate::listener::{ClientConn, ListenerInfo, ListenerMode};
 use crate::sources::{MetricSource, Sample, StateSource, UnavailableMetrics, UnavailableState};
 use crate::upstream::{TestDial, UpstreamSettings};
 
@@ -508,6 +510,24 @@ impl KitBuilder {
     }
 }
 
+/// The test client's connection, as the accept loop would describe it:
+/// listener `main` for the proxy, `gateway` for the `http` listener.
+fn client_conn(mode: ListenerMode) -> ClientConn {
+    let name = match mode {
+        ListenerMode::HttpProxy => "main",
+        ListenerMode::Http => "gateway",
+    };
+    ClientConn {
+        id: Ulid::generate(),
+        listener: Arc::new(ListenerInfo {
+            name: name.to_owned(),
+            mode,
+        }),
+        peer: "192.0.2.7:40000".parse().unwrap(),
+        original_dst: None,
+    }
+}
+
 /// What every policy of a kit shares: its secrets and address lists.
 struct PolicyBase {
     secrets: HashMap<String, String>,
@@ -625,19 +645,37 @@ impl Kit {
     }
 
     fn serve_client(&self, server: crate::io::BoxIo) {
-        let conn = ClientConn {
-            id: Ulid::generate(),
-            listener: Arc::new(ListenerInfo {
-                name: "main".to_owned(),
-            }),
-            peer: "192.0.2.7:40000".parse().unwrap(),
-            original_dst: None,
-        };
         self.spawn_conn(crate::conn::serve_http_proxy(
             server,
-            conn,
+            client_conn(ListenerMode::HttpProxy),
             self.server.shared().clone(),
         ));
+    }
+
+    /// A raw client connection to an `http` listener (named `gateway`).
+    pub(crate) fn connect_http(&self) -> tokio::io::DuplexStream {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        self.spawn_conn(crate::conn::serve_http(
+            Box::new(server),
+            client_conn(ListenerMode::Http),
+            self.server.shared().clone(),
+        ));
+        client
+    }
+
+    /// Sends `bytes` on a fresh `http`-listener connection and reads until
+    /// EOF (or 10 s): what came back, and whether the connection closed.
+    pub(crate) async fn raw_http(&self, bytes: &[u8]) -> (String, bool) {
+        let mut io = self.connect_http();
+        io.write_all(bytes).await.unwrap();
+        let (out, eof) = read_to_eof(&mut io).await;
+        (String::from_utf8_lossy(&out).into_owned(), eof)
+    }
+
+    /// An HTTP/1.1 client on an `http` listener: origin-form requests with
+    /// `Host: <host>`.
+    pub(crate) async fn http_client(&self, host: &str) -> Client {
+        Client::h1(self.connect_http(), Some(host)).await
     }
 
     /// A raw client that sent `bytes` to the proxy port and was gone before
@@ -647,17 +685,9 @@ impl Kit {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         client.write_all(bytes).await.unwrap();
         drop(client);
-        let conn = ClientConn {
-            id: Ulid::generate(),
-            listener: Arc::new(ListenerInfo {
-                name: "main".to_owned(),
-            }),
-            peer: "192.0.2.7:40000".parse().unwrap(),
-            original_dst: None,
-        };
         self.spawn_conn(crate::conn::serve_http_proxy(
             Box::new(server),
-            conn,
+            client_conn(ListenerMode::HttpProxy),
             self.server.shared().clone(),
         ));
     }
@@ -865,8 +895,9 @@ impl Kit {
 
 /// A client over HTTP/1.1 or HTTP/2.
 pub(crate) enum Client {
-    /// `tunnel`: the CONNECT host (origin-form requests), or `None` on the
-    /// proxy port (absolute-form requests to `up.test`).
+    /// `tunnel`: the CONNECT host, or the `Host` on an `http` listener
+    /// (origin-form requests), or `None` on the proxy port (absolute-form
+    /// requests to `up.test`).
     H1 {
         send: hyper::client::conn::http1::SendRequest<Body>,
         tunnel: Option<String>,

@@ -87,7 +87,7 @@ const LINGER_BYTES: usize = 1024 * 1024;
 #[derive(Debug)]
 pub enum Incoming {
     /// A request in the form legal for the role (absolute-form on the proxy
-    /// port, origin-form in a tunnel).
+    /// port, origin-form in a tunnel or on an `http` listener).
     Request(CanonicalRequest),
     /// Origin-form on the proxy port. The proxy must reject this unless
     /// the host is `roxy.internal`. Kept as a separate variant so it cannot be

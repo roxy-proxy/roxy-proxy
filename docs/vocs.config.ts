@@ -56,6 +56,7 @@ export default defineConfig({
         { text: "Container image", link: "/deploy/docker" },
         { text: "Running without Docker", link: "/deploy/bare-metal" },
         { text: "Node mode", link: "/deploy/node-mode" },
+        { text: "Gateway", link: "/deploy/gateway" },
       ],
     },
     {

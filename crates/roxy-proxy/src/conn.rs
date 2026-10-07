@@ -1,6 +1,6 @@
-//! The connection state machines: the HTTP proxy
-//! (proxy-port requests, CONNECT → sniff → TLS
-//! termination or plaintext tunnel), and the request loop inside a tunnel.
+//! The connection state machines: the HTTP proxy (proxy-port requests,
+//! CONNECT → sniff → TLS termination or plaintext tunnel), the `http`
+//! listener, and the request loop both feed.
 
 use std::sync::Arc;
 
@@ -61,6 +61,51 @@ pub(crate) async fn serve_http_proxy(stream: BoxIo, client: ClientConn, shared: 
     let cl = ConnLimits::current(&shared);
     let conn = cl.codec(ClientIo(stream), BytesMut::new(), Role::ProxyPort);
     Box::pin(proxy_port_loop(conn, client, shared, cl)).await;
+}
+
+/// An `http` listener: plain HTTP/1.1 spoken to roxy as the server. Every
+/// request is origin-form and names its own target in `Host`; from there
+/// the exchange is the same as inside a tunnel. One protocol per
+/// listener: a client that starts TLS is closed, not sniffed for.
+pub(crate) async fn serve_http(stream: BoxIo, client: ClientConn, shared: Arc<Shared>) {
+    let cl = ConnLimits::current(&shared);
+    let mut io = ClientIo(stream);
+    let mut buf = BytesMut::new();
+    let starts_tls = async {
+        loop {
+            buf.reserve(4096);
+            match io.read_buf(&mut buf).await {
+                Ok(0) | Err(_) => return None,
+                Ok(_) => {}
+            }
+            match sniff(&buf) {
+                Sniff::NotTls => return Some(false),
+                // The record type and version are enough to tell; the
+                // hello is never read in full.
+                Sniff::NeedMore if buf.len() < 3 => {}
+                Sniff::NeedMore | Sniff::Tls(_) => return Some(true),
+            }
+        }
+    };
+    let first = tokio::select! {
+        r = tokio::time::timeout(cl.limits.header_timeout, starts_tls) => r,
+        () = shared.stop.cancelled() => return,
+    };
+    match first {
+        Ok(Some(false)) => {}
+        Ok(Some(true)) => {
+            shared.emit_parse_reason(&client, None, "tls_on_http_listener", None);
+            return;
+        }
+        Ok(None) => return,
+        Err(_) => {
+            let e = roxy_http::ParseError::new(Reason::HeaderTimeout, "request head timeout");
+            shared.emit_parse_error(&client, None, &e);
+            return;
+        }
+    }
+    let conn = cl.codec(io, buf, Role::Origin);
+    Box::pin(request_loop(conn, client, None, shared)).await;
 }
 
 fn is_internal(req: &CanonicalRequest) -> bool {
@@ -210,7 +255,7 @@ async fn handle_connect(
                 scheme: Scheme::Http,
             };
             let conn = cl.codec(io, buf, role);
-            tunnel_loop(conn, client, None, shared).await;
+            request_loop(conn, client, None, shared).await;
         }
         FirstBytes::Http | FirstBytes::Other => {
             shared.emit_parse_reason(&client, None, "non_http_in_connect", None);
@@ -335,10 +380,12 @@ async fn terminate_tls(
         scheme: Scheme::Https,
     };
     let conn = cl.codec(ClientIo::new(tls), BytesMut::new(), role);
-    tunnel_loop(conn, client, Some(info), shared).await;
+    request_loop(conn, client, Some(info), shared).await;
 }
 
-async fn tunnel_loop(
+/// Serves requests on a connection whose role only yields requests (a
+/// tunnel, or an `http` listener), each as its own exchange.
+async fn request_loop(
     mut conn: ServerConn<ClientIo>,
     client: ClientConn,
     tls: Option<TlsInfo>,
@@ -362,10 +409,10 @@ async fn tunnel_loop(
                 }
             }
             Ok(Some(Incoming::Connect { .. } | Incoming::OriginFormOnProxyPort(_))) => {
-                // The tunnel role never yields these; refuse defensively.
+                // Neither role yields these; refuse defensively.
                 let e = roxy_http::ParseError::new(
                     Reason::TargetFormMismatch,
-                    "unexpected request form inside a tunnel",
+                    "unexpected request form on this connection",
                 );
                 exchange::close_on_parse_error(conn, None, &client, &shared, &e).await;
                 return;
