@@ -20,25 +20,15 @@ workloads, or a gateway in front of the APIs your clients call.
   It never drops a record: backpressure holds traffic until the log catches
   up.
 
-It fails closed: anything roxy cannot parse, verify or classify is denied.
-
 ## Documentation
 
-**[roxy-proxy.github.io/roxy-proxy](https://roxy-proxy.github.io/roxy-proxy/)**
-
-- [Quickstart](https://roxy-proxy.github.io/roxy-proxy/quickstart): generated
-  traffic through an auth gate, a token quota and an inspect_sentinel sidecar,
-  with roxy in node mode leasing its policy from a minimal control plane
-- Guides: deploy it for
-  [sandbox containment](https://roxy-proxy.github.io/roxy-proxy/guides/containment)
-  or as an [HTTP gateway](https://roxy-proxy.github.io/roxy-proxy/guides/gateway)
-- Design: [how roxy works](https://roxy-proxy.github.io/roxy-proxy/design/how-it-works)
-  and the [threat model](https://roxy-proxy.github.io/roxy-proxy/design/threat-model)
-- [Reference](https://roxy-proxy.github.io/roxy-proxy/reference/configuration),
-  from the config file to the flow log
-
-The site's source is in [`docs/`](docs). Outstanding work is tracked in
-[issues](https://github.com/roxy-proxy/roxy-proxy/issues).
+**[roxy-proxy.github.io/roxy-proxy](https://roxy-proxy.github.io/roxy-proxy/)**:
+the [quickstart](https://roxy-proxy.github.io/roxy-proxy/quickstart), guides
+for [sandbox containment](https://roxy-proxy.github.io/roxy-proxy/guides/containment)
+and an [HTTP gateway](https://roxy-proxy.github.io/roxy-proxy/guides/gateway),
+the [design](https://roxy-proxy.github.io/roxy-proxy/design/how-it-works) and
+the [reference](https://roxy-proxy.github.io/roxy-proxy/reference/configuration).
+The site's source is in [`docs/`](docs).
 
 ## License
 
