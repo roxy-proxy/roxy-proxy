@@ -198,7 +198,7 @@ async fn handle_connect(
 ) {
     // No connect-time rules: a CONNECT is accepted for inspection; every
     // decision is made on the requests inside the tunnel.
-    emit_connect_event(&shared, &client, &authority, false);
+    emit_connect_event(&shared, &client, &authority);
 
     let (io, buf) = match conn.accept_connect().await {
         Ok(x) => x,

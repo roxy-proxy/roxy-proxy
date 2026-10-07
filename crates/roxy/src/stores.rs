@@ -93,8 +93,8 @@ impl ReloadableMetrics {
 }
 
 impl MetricSource for ReloadableMetrics {
-    fn get(&self, id: &str, view: &dyn FlowView) -> Result<i64, MetricSourceError> {
-        self.inner.load().get(id, view).map_err(Into::into)
+    fn get(&self, id: &str, view: &dyn FlowView) -> Result<Option<i64>, MetricSourceError> {
+        self.inner.load().lookup(id, view).map_err(Into::into)
     }
 
     fn record(&self, view: &dyn FlowView, sample: &Sample) -> Result<(), MetricSourceError> {
@@ -202,7 +202,7 @@ mod tests {
         let view = |p: &str| MapView::new().with_str(Field::Path, p);
         let carried = ["/a", "/b", "/c", "/d"]
             .iter()
-            .filter(|p| m.get("by_path", &view(p)) == Ok(1))
+            .filter(|p| m.get("by_path", &view(p)) == Ok(Some(1)))
             .count();
         assert_eq!(carried, 2);
         assert!(matches!(
@@ -223,12 +223,12 @@ mod tests {
         record(&m, "/a").unwrap();
         let view = MapView::new().with_str(Field::Path, "/a");
         m.install(&policy, limits(1 << 20));
-        assert_eq!(m.get("by_path", &view), Ok(2));
+        assert_eq!(m.get("by_path", &view), Ok(Some(2)));
         m.reset(&policy, limits(1 << 20));
-        assert_eq!(m.get("by_path", &view), Ok(0));
+        assert_eq!(m.get("by_path", &view), Ok(None));
         assert_eq!(m.key_count(), 0);
         record(&m, "/a").unwrap();
-        assert_eq!(m.get("by_path", &view), Ok(1));
+        assert_eq!(m.get("by_path", &view), Ok(Some(1)));
         assert!(m.keeps_every_metric(&policy));
 
         let state = BuiltinState::new(10);
@@ -273,12 +273,12 @@ mod tests {
         m.record(&view, &sample).unwrap();
 
         m.install(&policy_for(FILTERED), limits(1 << 20));
-        assert_eq!(m.get("by_path", &view), Ok(2));
+        assert_eq!(m.get("by_path", &view), Ok(Some(2)));
 
         assert!(!m.keeps_every_metric(&policy_for(NARROWED)));
         m.install(&policy_for(NARROWED), limits(1 << 20));
         assert_eq!(m.key_count(), 0);
-        assert_eq!(m.get("by_path", &view), Ok(0));
+        assert_eq!(m.get("by_path", &view), Ok(None));
     }
 
     /// Adding a metric, or leaving them alone, keeps every running one;

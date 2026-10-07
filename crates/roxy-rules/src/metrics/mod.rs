@@ -519,17 +519,21 @@ impl MetricStore {
             .ok_or_else(|| MetricError::Unknown(id.to_owned()))
     }
 
-    /// Value of `id` for the key derived from `view`, over the live window.
-    /// A key that has never been recorded reads 0 *without* being admitted
-    /// (reads never allocate a series). `Err` on an unknown id or an
+    /// Value of `id` for the key derived from `view`, over the live window;
+    /// `None` for a key with no series (never recorded, or reclaimed).
+    /// Reads never allocate a series. `Err` on an unknown id or an
     /// unavailable key field.
-    pub fn get(&self, id: &str, view: &dyn FlowView) -> Result<i64, MetricError> {
+    pub fn lookup(&self, id: &str, view: &dyn FlowView) -> Result<Option<i64>, MetricError> {
         let m = self.metric(id)?;
         let key = m.key(view)?;
         let now = self.now();
-        Ok(m.series
-            .get(&key)
-            .map_or(0, |s| s.lock().value(m.geom, now)))
+        Ok(m.series.get(&key).map(|s| s.lock().value(m.geom, now)))
+    }
+
+    /// [`lookup`](Self::lookup) as a rule reads it: a key with no series
+    /// is 0.
+    pub fn get(&self, id: &str, view: &dyn FlowView) -> Result<i64, MetricError> {
+        self.lookup(id, view).map(|v| v.unwrap_or(0))
     }
 
     /// Record one [`Sample`] for every metric whose

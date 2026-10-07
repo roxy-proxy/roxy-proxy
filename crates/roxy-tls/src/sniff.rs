@@ -38,7 +38,8 @@ pub enum Sniff {
 /// What was extracted from a `ClientHello`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientHelloInfo {
-    /// `server_name` host name, lower-cased.
+    /// `server_name` host name as sent: printable ASCII, not canonicalised
+    /// (the host parser lower-cases and validates it).
     pub sni: Option<String>,
     /// ALPN protocol names offered, in order.
     pub alpn: Vec<String>,

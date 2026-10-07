@@ -93,7 +93,11 @@ impl LayerHost for StackHost {
         let addon = self.addon().clone();
         // Never dropped: wait for the flow log like any other audit record.
         sink_ready(&*self.st.shared.sink).await;
-        let data = self.st.secrets().redactor().redact_json(data);
+        // `kind` is the guest's string too: both go through this exchange's
+        // redactor before reaching the flow log or the audit endpoint.
+        let redactor = self.st.secrets().redactor();
+        let kind = redactor.redact_str(&kind).into_owned();
+        let data = redactor.redact_json(data);
         self.st.shared.sink.emit(&FlowEvent::LayerRecord {
             ts: chrono::Utc::now(),
             flow: self.st.flow.to_string(),
@@ -153,9 +157,9 @@ impl LayerHost for StackHost {
             &*shared.state,
             &self.st.snap.address_lists,
         );
-        match shared.metrics.get(&id, &view) {
-            Ok(v) => Ok(Some(v)),
-            Err(e) => Err(HostError::new(format!("metric {id}: {e}"))),
-        }
+        shared
+            .metrics
+            .get(&id, &view)
+            .map_err(|e| HostError::new(format!("metric {id}: {e}")))
     }
 }

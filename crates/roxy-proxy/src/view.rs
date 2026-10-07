@@ -357,7 +357,7 @@ impl FlowView for ProxyView<'_> {
 
     fn metric(&self, id: &str) -> Option<i64> {
         match self.metrics.get(id, self) {
-            Ok(v) => Some(v),
+            Ok(v) => Some(v.unwrap_or(0)),
             Err(e) => {
                 let mut slot = self
                     .metric_error

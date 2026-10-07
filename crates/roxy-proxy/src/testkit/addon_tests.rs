@@ -171,6 +171,37 @@ async fn metric_keys_follow_the_request_that_left() {
     );
 }
 
+/// `metric-get` on a key the store has no series for is `none`, not 0:
+/// a metric whose `where` excludes the flow never records its key.
+#[tokio::test]
+async fn metric_get_is_none_for_a_key_with_no_entry() {
+    let kit = Kit::builder()
+        .metric_defs("- { id: by_host, count: requests, key: [host], where: 'method == POST' }")
+        .addon(AddonDef {
+            caps: vec![roxy_wasm::Capability::Metrics],
+            ..AddonDef::test_layer("a")
+        })
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let headers = [("x-test-a", "elsewhere-then-metric"), ("x-to", "up.test")];
+    let get = c.call("GET", "/m", &headers, b"").await;
+    assert_eq!(get.status, 200, "{get:?}");
+    assert_eq!(
+        get.text(),
+        "None",
+        "a GET is not counted, so its key has no entry"
+    );
+    let post = c.call("POST", "/m", &headers, b"").await;
+    assert_eq!(post.text(), "Some(1)");
+    let get = c.call("GET", "/m", &headers, b"").await;
+    assert_eq!(
+        get.text(),
+        "Some(1)",
+        "the key exists once any flow recorded it"
+    );
+}
+
 #[tokio::test]
 async fn an_inner_layer_failing_after_the_head_cuts_the_body() {
     let kit = stack(&named(&["a", "b"])).await;
@@ -1631,6 +1662,37 @@ async fn endpoints_respect_the_address_floor() {
     let calls = kit.events("endpoint_call", 1).await;
     assert_eq!(calls[0]["status"], serde_json::Value::Null);
     assert_eq!(calls[0]["error"], "endpoint address denied");
+}
+
+/// A record's `kind` is the guest's string as much as its document: a
+/// secret in it is redacted in the flow log and in the audit POST.
+#[tokio::test]
+async fn a_record_kind_is_redacted_like_its_document() {
+    use roxy_wasm::Capability;
+    let kit = Kit::builder()
+        .secret("tok", "verdict")
+        .addon(
+            AddonDef::test_layer("t")
+                .caps(&[Capability::Record])
+                .endpoint("audit", "https://up.test/audit", &[], true)
+                .audit_endpoint("audit"),
+        )
+        .start()
+        .await;
+    let a = cap(&kit, "record").await;
+    assert_eq!(a.text(), "ok", "{a:?}");
+    let r = kit.events("layer_record", 1).await;
+    assert_eq!(r[0]["kind"], "[REDACTED]", "{r:#?}");
+    assert_eq!(r[0]["data"]["score"], 0.9);
+    let seen = kit.upstream.wait_seen(1).await;
+    let post = seen
+        .iter()
+        .find(|s| s.path == "/audit")
+        .unwrap_or_else(|| panic!("{seen:#?}"));
+    let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+    assert_eq!(body["kind"], "[REDACTED]", "{body:#}");
+    assert_eq!(body["layer"], "t");
+    assert_eq!(body["data"]["score"], 0.9);
 }
 
 /// `record` and `state` work with their capabilities; a call without its

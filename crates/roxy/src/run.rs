@@ -877,7 +877,7 @@ mod tests {
         assert!(err[0].contains("\"ghost\" is not loaded"), "{err:?}");
 
         for p in ["/a", "/b", "/c"] {
-            assert_eq!(m.get("by_path", &view(p)), Ok(1), "{p}");
+            assert_eq!(m.get("by_path", &view(p)), Ok(Some(1)), "{p}");
         }
         m.record(&view("/d"), &sample)
             .expect("the running byte budget still applies");
