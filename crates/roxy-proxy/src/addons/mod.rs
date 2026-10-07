@@ -44,7 +44,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::addr::PrivateAddrs;
-use crate::body::{Collected, collect_prefix};
+use crate::body::{Collected, collect_prefix, collect_prefix_metered};
 use crate::exchange::{Front, Outcome, bad_upgrade_refusal, refusal_response};
 use crate::flowlog::{DecisionKind, FlowEvent, FlowSink};
 use crate::pipeline::{BodyIo, CollectFuture, Decider, FlowCx, FlowMeta, Refusal, RefusalKind};
@@ -987,6 +987,15 @@ impl BodyIo for Detached {
         cap: u64,
     ) -> CollectFuture<'a, Result<Collected, roxy_http::DriveError>> {
         Box::pin(async move { Ok(collect_prefix(body, cap).await) })
+    }
+
+    fn collect_metered<'a>(
+        &'a mut self,
+        body: &'a mut Body,
+        cap: u64,
+        meter: &'a mut (dyn FnMut(u64) -> bool + Send),
+    ) -> CollectFuture<'a, Result<Collected, roxy_http::DriveError>> {
+        Box::pin(async move { Ok(collect_prefix_metered(body, cap, meter).await) })
     }
 }
 

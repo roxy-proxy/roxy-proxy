@@ -22,7 +22,7 @@
 use std::fmt::{self, Write as _};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime};
 
 use aws_sigv4::http_request::SignableBody;
@@ -40,7 +40,7 @@ use roxy_rules::{
 };
 use ulid::Ulid;
 
-use crate::body::{Collected, collect_prefix};
+use crate::body::{Collected, collect_prefix, collect_prefix_metered};
 use crate::budget::{self, BufferLease};
 use crate::capture::Tap;
 use crate::flowlog::{
@@ -48,6 +48,7 @@ use crate::flowlog::{
 };
 use crate::io::ClientIo;
 use crate::listener::ClientConn;
+use crate::secrets::Secrets;
 use crate::server::{Shared, Snapshot};
 use crate::sign;
 use crate::sources::{MetricSourceError, Sample};
@@ -72,6 +73,14 @@ pub(crate) const SIGN_RULE: &str = "_sign";
 /// Flow-log `reason` of a `_sign` refusal: the body is over
 /// `limits.max_sign_body_bytes`.
 pub(crate) const SIGN_BODY_TOO_LARGE: &str = "sign_body_too_large";
+
+/// Flow-log `reason` of a `_sign` refusal: a request header holds a value
+/// the signature cannot cover.
+pub(crate) const SIGN_HEADER_INVALID: &str = "sign_header_invalid";
+
+/// Flow-log `mutations` entry of a request a `sign` rule matched but that
+/// went out under its own presigned query, roxy's signature withheld.
+pub(crate) const SIGN_PRESIGNED: &str = "sign:presigned";
 
 /// Whether a local answer is a policy decision or a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +187,20 @@ impl Refusal {
         }
     }
 
+    /// 400 `_sign`: a request header cannot be signed, so the request is
+    /// not forwarded. The connection closes: its body may be unread.
+    pub(crate) fn sign_header_invalid() -> Self {
+        Self {
+            reason: Some(SIGN_HEADER_INVALID.to_owned()),
+            ..Self::deny(
+                StatusCode::BAD_REQUEST,
+                DEFAULT_DENY_MESSAGE,
+                RuleId::new(SIGN_RULE),
+                true,
+            )
+        }
+    }
+
     /// 403 `_address_policy`.
     pub(crate) fn address_policy(reason: &str) -> Self {
         Self {
@@ -264,6 +287,15 @@ pub(crate) trait BodyIo: Send {
         body: &'a mut Body,
         cap: u64,
     ) -> CollectFuture<'a, Result<Collected, DriveError>>;
+
+    /// [`Self::collect`] with a meter asked after each frame whether the
+    /// bytes held so far may be kept ([`collect_prefix_metered`]).
+    fn collect_metered<'a>(
+        &'a mut self,
+        body: &'a mut Body,
+        cap: u64,
+        meter: &'a mut (dyn FnMut(u64) -> bool + Send),
+    ) -> CollectFuture<'a, Result<Collected, DriveError>>;
 }
 
 impl BodyIo for ServerConn<ClientIo> {
@@ -273,6 +305,15 @@ impl BodyIo for ServerConn<ClientIo> {
         cap: u64,
     ) -> CollectFuture<'a, Result<Collected, DriveError>> {
         Box::pin(self.drive(collect_prefix(body, cap)))
+    }
+
+    fn collect_metered<'a>(
+        &'a mut self,
+        body: &'a mut Body,
+        cap: u64,
+        meter: &'a mut (dyn FnMut(u64) -> bool + Send),
+    ) -> CollectFuture<'a, Result<Collected, DriveError>> {
+        Box::pin(self.drive(collect_prefix_metered(body, cap, meter)))
     }
 }
 
@@ -353,11 +394,19 @@ pub(crate) struct FlowMeta {
     pub flow: Ulid,
     pub client: ClientConn,
     pub tls: Option<TlsInfo>,
+    /// The secret generation this exchange resolves from and redacts
+    /// with: loaded on first use (the head evaluation) and kept for the
+    /// exchange's life, however many swaps happen meanwhile.
+    secrets: OnceLock<Arc<Secrets>>,
 }
 
 impl FlowMeta {
     pub(crate) fn conn_id(&self) -> String {
         self.client.id.to_string()
+    }
+
+    pub(crate) fn secrets(&self) -> &Arc<Secrets> {
+        self.secrets.get_or_init(|| self.snap.secrets.load())
     }
 
     pub(crate) fn input_unavailable(
@@ -385,7 +434,7 @@ impl FlowMeta {
             stage,
             reason: format!(
                 "{code}: {}",
-                self.snap.secrets.redactor().redact_str(&reason.to_string())
+                self.secrets().redactor().redact_str(&reason.to_string())
             ),
         });
     }
@@ -413,12 +462,7 @@ impl FlowMeta {
     }
 
     pub(crate) fn rule_log(&self, stage: Stage, level: LogLevel, message: &str) {
-        let message = self
-            .snap
-            .secrets
-            .redactor()
-            .redact_str(message)
-            .into_owned();
+        let message = self.secrets().redactor().redact_str(message).into_owned();
         match level {
             LogLevel::Trace => tracing::trace!(flow = %self.flow, %message, "rule log"),
             LogLevel::Debug => tracing::debug!(flow = %self.flow, %message, "rule log"),
@@ -560,6 +604,7 @@ impl FlowCx {
                 flow: Ulid::generate(),
                 client,
                 tls,
+                secrets: OnceLock::new(),
             }),
             facts,
             opts: AllowOpts::default(),
@@ -600,7 +645,7 @@ impl FlowCx {
     /// recorded as the head decision. Nothing of the policy (the addons
     /// included) runs for it.
     pub(crate) fn expiry_refusal(&mut self) -> Option<Refusal> {
-        if !self.shared.expired(&self.snap) {
+        if !self.shared.expired() {
             return None;
         }
         self.record.stage = Some(Stage::Head);
@@ -615,7 +660,8 @@ impl FlowCx {
     fn evaluate_head(&mut self) -> (Outcome, Option<Refusal>) {
         let snap = self.snap.clone();
         let shared = self.shared.clone();
-        let secrets = |name: &str| snap.secrets.get(name);
+        let generation = self.meta.secrets().clone();
+        let secrets = |name: &str| generation.get(name);
         let tags = self.record.tags.clone();
         let ctx = EvalContext {
             secrets: &secrets,
@@ -686,7 +732,7 @@ impl FlowCx {
             self.record.request_bytes = t.bytes();
             self.record.request_sha256 = t.sha256_hex();
         }
-        let redactor = self.snap.secrets.redactor();
+        let redactor = self.meta.secrets().redactor();
         let r = self.facts.client_request.as_ref();
         let req = RequestInfo {
             method: r.map(|r| r.method.as_str().to_owned()).unwrap_or_default(),
@@ -913,6 +959,9 @@ async fn inspect_request_body(
             inspected
         }
         Ok(Collected::TooLarge) => Inspected::TooLarge,
+        Ok(Collected::BudgetExhausted) => {
+            return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
+        }
     };
     cx.buffers.push(lease);
     if let Some(f) = cx.facts.request.as_mut() {
@@ -1006,9 +1055,10 @@ fn settle_request_facts(cx: &mut FlowCx, req: &CanonicalRequest) {
 }
 
 /// The `sign` effect, over the request as every other effect left it. A
-/// presigned request (`X-Amz-Signature` in its query) authenticates
-/// itself and goes untouched. The payload hash needs the whole body, so it
-/// is buffered under `limits.max_sign_body_bytes`; a body over that is
+/// presigned request (`X-Amz-Signature` in its query) authenticates by its
+/// query and goes out without roxy's signature, the client's signature
+/// headers stripped. The payload hash needs the whole body, so it is
+/// buffered under `limits.max_sign_body_bytes`; a body over that is
 /// refused with 413 rather than forwarded with a signature AWS would
 /// reject. `unsigned_payload` streams the body instead.
 async fn sign_request(cx: &mut FlowCx, mut req: CanonicalRequest, io: &mut dyn BodyIo) -> Verdict {
@@ -1016,6 +1066,9 @@ async fn sign_request(cx: &mut FlowCx, mut req: CanonicalRequest, io: &mut dyn B
         return Verdict::Continue(req);
     };
     if sign::is_presigned(req.query.as_ref()) {
+        sign::strip_client_signature(&mut req);
+        cx.record.mutations.push(SIGN_PRESIGNED.to_owned());
+        settle_request_facts(cx, &req);
         return Verdict::Continue(req);
     }
     let buffered;
@@ -1023,15 +1076,28 @@ async fn sign_request(cx: &mut FlowCx, mut req: CanonicalRequest, io: &mut dyn B
         SignableBody::UnsignedPayload
     } else if known_empty(&req.body) {
         SignableBody::Bytes(&[])
+    } else if let Some(b) = req.body.as_bytes() {
+        // Already buffered (inspected for the rules); its lease is held.
+        buffered = b.clone();
+        SignableBody::Bytes(&buffered)
     } else {
+        // A declared length is reserved up front; a chunked body grows its
+        // reservation as it is read, since the cap is far above the usual
+        // body and reserving it whole would starve other exchanges.
         let cap = cx.snap.limits.max_sign_body_bytes;
-        let Some(mut lease) = reserve_inspection(cx, &req.body, cap) else {
+        let declared = req.body.known_length().map_or(0, |n| n.min(cap));
+        let Some(mut lease) = cx.shared.reserve_buffer(declared) else {
             return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
         };
-        buffered = match io.collect(&mut req.body, cap).await {
+        let shared = cx.shared.clone();
+        let mut meter = |held: u64| shared.grow_buffer(&mut lease, held);
+        buffered = match io.collect_metered(&mut req.body, cap, &mut meter).await {
             Err(e) => return Verdict::Close(e),
             Ok(Collected::Failed(e)) => return Verdict::Close(body_failure(&e).into()),
             Ok(Collected::TooLarge) => return Verdict::Deny(Refusal::sign_body_too_large()),
+            Ok(Collected::BudgetExhausted) => {
+                return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
+            }
             Ok(Collected::Complete(b)) => b,
         };
         lease.shrink_to(buffered.len() as u64);
@@ -1045,8 +1111,13 @@ async fn sign_request(cx: &mut FlowCx, mut req: CanonicalRequest, io: &mut dyn B
         .host_override
         .clone()
         .unwrap_or_else(|| req.authority.to_host_header(req.scheme));
-    if let Err(e) = sign::sign_request(&mut req, &host, body, &spec, SystemTime::now()) {
-        return Verdict::Deny(invalid("sign", &e));
+    match sign::sign_request(&mut req, &host, body, &spec, SystemTime::now()) {
+        Ok(()) => {}
+        Err(e @ sign::SignError::UnsignableHeader(_)) => {
+            tracing::info!(flow = %cx.flow, error = %e, "request cannot be signed; denying");
+            return Verdict::Deny(Refusal::sign_header_invalid());
+        }
+        Err(e) => return Verdict::Deny(invalid("sign", &e)),
     }
     cx.record.mutations.push("sign:aws_sigv4".to_owned());
     settle_request_facts(cx, &req);
@@ -1189,8 +1260,9 @@ fn apply_request_effect(
             cx.capture.response |= matches!(target, CaptureTarget::Response | CaptureTarget::Both);
         }
         Effect::Sign(spec) => {
-            // Two signatures cannot both hold; the pipeline signs once the
-            // other changes have settled.
+            // Two rules signing one request is a policy mistake (which
+            // identity did the author mean?), so it is an error rather
+            // than last-wins.
             if cx.sign.replace(spec).is_some() {
                 return Err(Refusal::fail_closed("sign_conflict"));
             }
@@ -1247,6 +1319,9 @@ async fn inspect_response_body(
             inspected
         }
         Ok(Collected::TooLarge) => Inspected::TooLarge,
+        Ok(Collected::BudgetExhausted) => {
+            return ResponseVerdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
+        }
     };
     cx.buffers.push(lease);
     if let Some(f) = cx.facts.response.as_mut() {

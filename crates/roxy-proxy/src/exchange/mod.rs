@@ -633,7 +633,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
         ResponseVerdict::Continue(mut res) => {
             let mut down_tap = down_tap;
             if let Some(t) = down_tap.as_mut() {
-                t.response_head(&res, &cx.snap.secrets.redactor());
+                t.response_head(&res, cx.secrets().redactor());
             }
             if let Some((upstream, key)) = upgrade {
                 // The relay takes the taps after the `101`.
@@ -672,7 +672,7 @@ async fn upgrade_upstream(
     }
     // The upgrade request is captured as it leaves, like any other.
     if let Some(t) = up_tap {
-        t.request_head(&req, &cx.snap.secrets.redactor());
+        t.request_head(&req, cx.secrets().redactor());
     }
     let scheme = req.scheme;
     let authority = req.authority.clone();
@@ -740,7 +740,7 @@ async fn plain_upstream<F: Front>(
     // as forwarded nor handed to the upstream.
     let mut up_tap = up_tap;
     if let Some(t) = up_tap.as_mut() {
-        t.request_head(&req, &cx.snap.secrets.redactor());
+        t.request_head(&req, cx.secrets().redactor());
     }
     let body = watched(
         std::mem::take(&mut req.body),
@@ -827,9 +827,9 @@ fn request_body_failure(e: &hyper_util::client::legacy::Error) -> Option<ParseEr
 }
 
 fn set_host_override(cx: &FlowCx, req: &mut http::Request<Body>) {
-    if let Some(h) = &cx.host_override
-        && let Ok(v) = HeaderValue::from_str(h)
-    {
+    if let Some(h) = &cx.host_override {
+        let v = HeaderValue::from_str(h)
+            .expect("host_override is a to_host_header value, always a valid header value");
         req.headers_mut().insert(HOST, v);
     }
 }

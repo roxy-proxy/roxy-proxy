@@ -107,10 +107,13 @@ eviction: the exchange fails closed (`503`, `_fail_closed`,
   reservation shrinks to what is held (the body as sent, or its decoded
   text if larger), and that stays reserved until the exchange ends, since
   the text stays with the exchange for its rules and log.
-- A request body hashed for `sign: aws_sigv4` reserves
-  `max_sign_body_bytes`, or its `content-length` if that is smaller, until
-  the exchange ends ([signing AWS requests](/policies/secrets#signing-aws-requests)).
-  With `unsigned_payload: true` the body streams and reserves nothing.
+- A request body hashed for `sign: aws_sigv4` reserves its
+  `content-length` (at most `max_sign_body_bytes`) up front; a chunked body
+  reserves what it has read, chunk by chunk, up to that cap, and is refused
+  (`buffer_budget_exhausted`) at the chunk the budget cannot cover. Either
+  way the reservation is held until the exchange ends
+  ([signing AWS requests](/policies/secrets#signing-aws-requests)). With
+  `unsigned_payload: true` the body streams and reserves nothing.
 - A WebSocket whose messages rules read reserves twice
   `max_ws_message_bytes` at the upgrade and holds it for the session. A
   WebSocket under a policy that reads bodies but not messages holds
@@ -150,8 +153,7 @@ smaller budget admits nothing new until enough of them end).
 
 - A connection over `max_connections` or `max_connections_per_client` (per
   client IP) is accepted and closed at once, with a `connection_refused`
-  event. A DNS-over-TCP connection the caps refuse is closed the same way
-  but noted only in the operational log, not in the flow log.
+  event.
 - Every read is bounded (head size, body size, ClientHello size), and every
   stage has a timeout.
 - Nothing is allocated in proportion to an attacker-supplied number before

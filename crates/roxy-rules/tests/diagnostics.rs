@@ -196,11 +196,6 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: a, then: { deny: { status: 200 } } }",
     ),
     (
-        "phase key removed",
-        "",
-        "- { id: w, phase: ws, when: 'ws.size > 1mb', then: deny }",
-    ),
-    (
         "duplicate and reserved ids",
         "",
         "- { id: a, then: allow }\n- { id: a, then: deny }\n- { id: _default, then: deny }\n- { id: _fail_closed, then: deny }",

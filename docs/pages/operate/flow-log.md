@@ -42,7 +42,7 @@ produces a `request` event:
   `capture_unavailable`, `sign_conflict`, `watch_missing` or
   `watch_stopped`. With `_address_policy` it is `address_policy`; with
   `_expired` it is `policy_expired` ([lease](/operate/operations#lease));
-  with `_sign` it is `sign_body_too_large`
+  with `_sign` it is `sign_body_too_large` or `sign_header_invalid`
   ([signing AWS requests](/policies/secrets#signing-aws-requests)); with
   `_websocket` it is `ws_bad_handshake`
   ([WebSockets](/policies/websockets)); with `layer:<name>` it is

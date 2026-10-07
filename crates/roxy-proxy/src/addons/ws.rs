@@ -36,7 +36,7 @@ impl Relay {
     /// Wires the bottom of the stack: `stream` (what the last layer passed
     /// on after the head) goes to the relay, and the relay's output becomes
     /// `res`'s body. One pipe per direction, each end held whole, so a
-    /// close on either side is seen (#36). A failed `stream` reaches the
+    /// close on either side is seen. A failed `stream` reaches the
     /// relay as a read error, as a broken client connection would.
     pub(crate) fn new(
         upstream: hyper::upgrade::Upgraded,

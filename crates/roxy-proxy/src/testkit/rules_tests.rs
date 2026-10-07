@@ -133,6 +133,52 @@ async fn swapped_secrets_reach_the_next_request_without_a_rebuild() {
     );
 }
 
+/// An exchange redacts with the secret generation it was evaluated under,
+/// so a value it injected is scrubbed from its record even when it ends
+/// after several swaps.
+#[tokio::test]
+async fn an_exchange_spanning_two_swaps_still_redacts_the_value_it_injected() {
+    const GEN1: &str = "token-generation-one-abcdef";
+    const GEN2: &str = "token-generation-two-ghijkl";
+    const GEN3: &str = "token-generation-three-mnop";
+    let kit = Kit::builder()
+        .secret("token", GEN1)
+        .rules(
+            r#"
+- id: inject
+  when: host == "up.test"
+  then:
+    - set_header: { authorization: "Bearer ${secret:token}" }
+    - allow
+"#,
+        )
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let (tx, body) = streaming_body();
+    let req = c
+        .request("POST", &format!("/p/{GEN1}"), &[])
+        .body(body)
+        .unwrap();
+    let pending = c.start(req);
+    let seen = kit.wait_arrived(1).await;
+    assert_eq!(seen[0].headers["authorization"], format!("Bearer {GEN1}"));
+
+    let swap = |v: &str| {
+        kit.server
+            .handle()
+            .swap_secrets([("token".to_owned(), v.to_owned())].into());
+    };
+    swap(GEN2);
+    swap(GEN3);
+    tx.finish().await.unwrap();
+    let a = pending.await.unwrap().unwrap();
+    assert_eq!(a.status, 200, "{a:?}");
+
+    let ev = kit.request_event().await;
+    assert_eq!(ev["req"]["path"], "/p/[REDACTED]", "{ev:#}");
+}
+
 #[tokio::test]
 async fn rewrite_path_and_query_change_what_leaves() {
     let kit = Kit::builder()

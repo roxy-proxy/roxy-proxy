@@ -1,11 +1,5 @@
 //! `sign: aws_sigv4`: AWS Signature Version 4 over the request as roxy
 //! forwards it, with credentials the client never held.
-//!
-//! The signature covers the request after every other head effect, so it
-//! is applied last, by the pipeline, once the body (or its absence) is
-//! known. The payload hash needs the whole body, which the pipeline
-//! buffers under `limits.max_sign_body_bytes`; `unsigned_payload` signs
-//! `UNSIGNED-PAYLOAD` instead and streams it.
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -55,10 +49,16 @@ pub(crate) enum SignError {
     Params(String),
     #[error("signed header: {0}")]
     Header(#[from] roxy_http::ParseError),
+    /// A request header's value is not valid UTF-8 (obs-text), so it
+    /// cannot go into the canonical request. Forwarding it unsigned would
+    /// weaken the signature the policy asked for.
+    #[error("header {0} holds obs-text and cannot be signed")]
+    UnsignableHeader(String),
 }
 
-/// Whether the query carries a presigned URL's signature, in which case
-/// the request already authenticates itself and is forwarded untouched.
+/// Whether the query carries a presigned URL's signature: the request
+/// authenticates by its query alone, so it is forwarded without roxy's
+/// signature and without the client's signature headers.
 pub(crate) fn is_presigned(query: Option<&Query>) -> bool {
     query.is_some_and(|q| {
         q.pairs()
@@ -78,9 +78,7 @@ pub(crate) fn sign_request(
     spec: &AwsSigV4,
     now: SystemTime,
 ) -> Result<(), SignError> {
-    for name in CLIENT_SIGNATURE_HEADERS {
-        req.headers.remove(name);
-    }
+    strip_client_signature(req);
     let identity = Identity::new(
         Credentials::new(
             spec.access_key_id.as_str(),
@@ -121,12 +119,14 @@ pub(crate) fn sign_request(
         req.scheme,
         aws_encoded_path(req.path.as_str())
     );
-    let headers = std::iter::once(("host", host)).chain(
-        req.headers
-            .iter()
-            .filter_map(|(n, v)| Some((n.as_str(), v.to_str().ok()?))),
-    );
-    let signable = SignableRequest::new(req.method.as_str(), uri, headers, body)?;
+    let mut headers = vec![("host", host)];
+    for (n, v) in req.headers.iter() {
+        let v = v
+            .to_str()
+            .map_err(|_| SignError::UnsignableHeader(n.as_str().to_owned()))?;
+        headers.push((n.as_str(), v));
+    }
+    let signable = SignableRequest::new(req.method.as_str(), uri, headers.into_iter(), body)?;
     let (instructions, _) = sign(signable, &params)?.into_parts();
     let (headers, _) = instructions.into_parts();
     for h in headers {
@@ -135,11 +135,22 @@ pub(crate) fn sign_request(
     Ok(())
 }
 
+/// Removes the client's own signature fields, so its credentials never
+/// reach AWS under a `sign` rule.
+pub(crate) fn strip_client_signature(req: &mut CanonicalRequest) {
+    for name in CLIENT_SIGNATURE_HEADERS {
+        req.headers.remove(name);
+    }
+}
+
 /// The path in the once-encoded form AWS canonicalises from: every byte
 /// percent-encoded except the unreserved set and `/`. roxy's normaliser
 /// leaves sub-delimiters such as `$` literal, which AWS would encode, so
 /// the two must agree before the signer encodes a second time (non-S3) or
 /// takes the path as is (S3). Existing escapes are kept, including `%2F`.
+///
+/// `path` is a normalised path: ASCII, every `%` starting a complete hex
+/// escape. The slice below relies on that.
 fn aws_encoded_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     let bytes = path.as_bytes();
@@ -147,6 +158,10 @@ fn aws_encoded_path(path: &str) -> String {
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'%' && bytes.len() >= i + 3 {
+            debug_assert!(
+                bytes[i + 1].is_ascii_hexdigit() && bytes[i + 2].is_ascii_hexdigit(),
+                "normalised path with a bare `%`: {path}"
+            );
             out.push_str(&path[i..i + 3]);
             i += 3;
             continue;
@@ -386,6 +401,35 @@ mod tests {
         assert_eq!(req.headers.get("x-amz-security-token"), Some("real-token"));
         assert_eq!(req.headers.get("x-amz-content-sha256"), None);
         assert_eq!(req.headers.get("accept-encoding"), Some("gzip"));
+    }
+
+    /// A header value with obs-text cannot go into the canonical request,
+    /// so signing fails rather than leaving the header out of
+    /// `SignedHeaders`.
+    #[test]
+    fn an_obs_text_header_is_an_error_not_left_unsigned() {
+        let host = "example.amazonaws.com";
+        let raw: Vec<(&[u8], &[u8])> = vec![(b"x-note", b"caf\xe9")];
+        let flags = HttpFlags {
+            allow_obs_text: true,
+            ..HttpFlags::default()
+        };
+        let headers = Headers::try_from_raw(raw, &Limits::default(), &flags).unwrap();
+        let mut req = canonical("GET", "/", host, &[], b"");
+        req.headers = headers;
+        let err = sign_request(
+            &mut req,
+            host,
+            SignableBody::Bytes(b""),
+            &spec("service", "us-east-1", "AKIDEXAMPLE", "secret", None),
+            at("2015-08-30T12:36:00Z"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SignError::UnsignableHeader(n) if n == "x-note"),
+            "{err:?}"
+        );
+        assert_eq!(req.headers.get_raw("authorization"), None);
     }
 
     #[test]

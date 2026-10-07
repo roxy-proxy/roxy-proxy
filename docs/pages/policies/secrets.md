@@ -3,15 +3,15 @@
 `secrets:` maps names to where each value comes from: an environment
 variable, a file, or the control-plane lease (`{ lease: true }`), which
 supplies the value at runtime. `${secret:name}` in a head rule's
-`set_header` value (or an addon endpoint's `headers`) injects the value, so
-the client only ever holds a placeholder; a secret reference anywhere else
-in a rule is a compile error. `env` and `file` secrets are resolved when
-roxy starts and on reload, and one that is missing or empty is a fatal start
-or reload error. At evaluation time a missing secret fails the flow closed
-(`_fail_closed`, reason `secret_missing`), and so does one that is not a
-valid header value (`secret_invalid`). Every injected value is redacted from
-the flow log and capture heads. `roxy check` and `roxy rule test` do not
-resolve secrets.
+`set_header` value or `sign` credentials (or an addon endpoint's `headers`)
+injects the value, so the client only ever holds a placeholder; a secret
+reference anywhere else in a rule is a compile error. `env` and `file`
+secrets are resolved when roxy starts and on reload, and one that is missing
+or empty is a fatal start or reload error. At evaluation time a missing
+secret fails the flow closed (`_fail_closed`, reason `secret_missing`), and
+so does one that is not a valid header value (`secret_invalid`). Every
+injected value is redacted from the flow log and capture heads. `roxy check`
+and `roxy rule test` do not resolve secrets.
 
 ```yaml
 secrets:
@@ -69,15 +69,22 @@ framing fields roxy re-serialises (`connection`, `transfer-encoding`,
 `content-length`, `accept-encoding`, `te`, `trailer`, `upgrade`,
 `keep-alive`, `proxy-connection`), and `user-agent` and
 `x-amzn-trace-id`, which intermediaries change, are never signed; every
-other header is. `service` is the signing name (`bedrock`, `s3`,
-`execute-api`, ...), and `s3`, `s3-control` and `s3-outposts` use the S3
-variant of the algorithm (the path encoded once, not normalised, and the
-payload hash sent as `x-amz-content-sha256`).
+other header is. A header whose value is not UTF-8 (obs-text, accepted
+under `http.allow_obs_text`) cannot be signed, so the request is refused
+with `400` (`terminal_rule: _sign`, `reason: sign_header_invalid`) rather
+than forwarded with that header outside the signature. `service` is the
+signing name (`bedrock`, `s3`, `execute-api`, ...), and `s3`, `s3-control`
+and `s3-outposts` use the S3 variant of the algorithm (the path encoded
+once, not normalised, and the payload hash sent as `x-amz-content-sha256`).
 
-A request whose query carries `X-Amz-Signature` is presigned: it
-authenticates itself and is forwarded untouched, with no `sign` mutation
-recorded. Two matching rules that both sign fail the flow closed
-(`sign_conflict`).
+A request whose query carries `X-Amz-Signature` is presigned, and `sign`
+does not cover it: it goes out under the client's query signature, with
+the client's `authorization` and `x-amz-*` signature headers stripped and
+no signature of roxy's. The flow log records `sign:presigned` in
+`mutations` in place of `sign:aws_sigv4`. Such a request reaches AWS as
+whoever signed the URL, so the rule's `host` and `path` conditions are
+what bound where it may go. Two matching rules that both sign fail the
+flow closed (`sign_conflict`).
 
 The payload hash needs the whole body, so a request with a body is
 buffered up to `limits.max_sign_body_bytes` (100 MiB) before it is signed
@@ -106,9 +113,11 @@ parse errors.
 Secret values live in a store beside the compiled policy, not inside it.
 Replacing the map swaps the store and rebuilds the redactor without
 recompiling rules, rebuilding addons or flushing upstream pools, and
-without a reload event. A request evaluated after the swap injects the new
-value; an exchange already under way keeps the one it injected, and the
-redactor scrubs both until the next swap. A name the policy references but
+without a reload event. An exchange resolves every name from the
+generation current at its head evaluation, so a swap landing mid-evaluation
+cannot pair one credential with another's replacement; an exchange already
+under way keeps the generation it injected, and redacts its log with it,
+however many swaps follow. A name the policy references but
 the map lacks fails the flow closed (`secret_missing`). Values never appear
 in the config file, on disk or in logs. A config reload resolves `env` and
 `file` sources into the same store and swaps the policy as usual.

@@ -96,8 +96,8 @@ pub struct Listener {
 pub enum ListenerMode {
     #[default]
     Explicit,
-    /// Parsed so the config shape is stable, but rejected by validation
-    /// until transparent mode is built (issue #15).
+    /// Parsed so the config shape is stable, but rejected by validation:
+    /// roxy has no transparent mode.
     Transparent,
 }
 

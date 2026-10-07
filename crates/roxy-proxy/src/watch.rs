@@ -354,7 +354,7 @@ impl Watch {
             Dir::Request => self.request_chunks,
             Dir::Response => self.response_chunks,
         };
-        if !needed && !self.meta.shared.expired(&self.meta.snap) {
+        if !needed && !self.meta.shared.expired() {
             return self.check();
         }
         let mut g = self.lock();
@@ -385,7 +385,7 @@ impl Inner {
     /// before each write: once it has run out the exchange stops with
     /// `_expired`.
     fn stop_if_expired(&mut self, stage: Stage) {
-        if self.meta.shared.expired(&self.meta.snap) {
+        if self.meta.shared.expired() {
             self.stop_with(Refusal::expired(), stage);
         }
     }

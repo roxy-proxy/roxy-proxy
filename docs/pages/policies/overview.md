@@ -76,7 +76,7 @@ runs follows from what it reads.
 
 `roxy check` and `roxy rule test` report whether each rule is decided at the
 head or watches. There is no `phase` key and there are no connect-time
-rules: a config that sets `phase` is rejected.
+rules.
 
 **Unavailable inputs fail closed.** If evaluating a rule needs a metric
 value, an address-list lookup or a secret and it is unavailable (store

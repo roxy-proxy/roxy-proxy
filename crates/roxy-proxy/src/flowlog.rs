@@ -71,7 +71,7 @@ pub enum FlowEvent {
         path: PathBuf,
         diagnostics: Vec<String>,
     },
-    /// A CONNECT (explicit mode). There are no connect-time rules:
+    /// A CONNECT on the proxy port. There are no connect-time rules:
     /// a CONNECT is accepted for inspection unless the SNI check refuses
     /// it. Only emitted when `log.flow.connection_events` is
     /// enabled or the connect was refused.
