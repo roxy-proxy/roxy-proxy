@@ -47,7 +47,7 @@ use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
 use http::{HeaderMap, StatusCode};
-use http_body::Body as _;
+use http_body::{Body as _, Frame};
 use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter, ReadHalf, WriteHalf,
 };
@@ -473,43 +473,92 @@ async fn flush_timed<W: AsyncWrite + Unpin>(w: &mut W, idle: Duration) -> Result
     Ok(())
 }
 
+/// The next body frame; `None` at the end of the body.
+type NextFrame = Option<Result<Frame<Bytes>, BodyError>>;
+
+/// Polls `body` once; a pending producer with `client_closed` set is an
+/// error rather than a wait.
+fn poll_body_once(
+    body: &mut Body,
+    client_closed: &AtomicBool,
+    cx: &mut std::task::Context<'_>,
+) -> Poll<Result<NextFrame, WriteError>> {
+    match Pin::new(body).poll_frame(cx) {
+        Poll::Ready(frame) => Poll::Ready(Ok(frame)),
+        Poll::Pending if client_closed.load(Ordering::Relaxed) => Poll::Ready(Err(client_left())),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
 /// Writes a response head and body. Bodies are streamed frame by frame:
 /// each write to the client must progress within `idle`, and the body must
 /// yield its next frame within `body_idle`. Once `client_closed` is set,
 /// waiting for a frame fails instead.
+///
+/// Output is buffered by `w` and flushed only when the body has nothing
+/// ready, so a response whose body is already in hand goes out in one
+/// write (one TLS record inside a tunnel).
 async fn write_message<W: AsyncWrite + Unpin>(
     w: &mut W,
     head: BytesMut,
-    mut body: Body,
+    body: Body,
     framing: OutFraming,
     (idle, body_idle): (Duration, Duration),
     client_closed: &AtomicBool,
 ) -> Result<(), WriteError> {
     write_timed(w, &[&head], idle).await?;
+    if matches!(framing, OutFraming::Empty | OutFraming::Head(_)) {
+        return flush_timed(w, idle).await;
+    }
+    match write_body(w, body, framing, (idle, body_idle), client_closed).await {
+        Ok(()) => flush_timed(w, idle).await,
+        // The head is committed once written: a body that fails still lets
+        // the client see it, and the data before the failure, as a cut body.
+        Err(e @ WriteError::Body(_)) => {
+            let _ = flush_timed(w, idle).await;
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn write_body<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    mut body: Body,
+    framing: OutFraming,
+    (idle, body_idle): (Duration, Duration),
+    client_closed: &AtomicBool,
+) -> Result<(), WriteError> {
     let mut sent: u64 = 0;
     let expected = match framing {
-        OutFraming::Empty | OutFraming::Head(_) => {
-            flush_timed(w, idle).await?;
-            return Ok(());
-        }
         OutFraming::Length(n) => Some(n),
-        OutFraming::Chunked | OutFraming::CloseDelimited => None,
+        OutFraming::Empty
+        | OutFraming::Head(_)
+        | OutFraming::Chunked
+        | OutFraming::CloseDelimited => None,
     };
+    // One timer for the whole body, re-armed each time a frame is waited on.
+    let mut stall = std::pin::pin!(tokio::time::sleep(body_idle));
     loop {
-        // Flush whatever is buffered before possibly waiting on the producer.
-        flush_timed(w, idle).await?;
-        let frame = timeout(
-            body_idle,
-            poll_fn(|cx| match Pin::new(&mut body).poll_frame(cx) {
-                Poll::Ready(frame) => Poll::Ready(Ok(frame)),
-                Poll::Pending if client_closed.load(Ordering::Relaxed) => {
-                    Poll::Ready(Err(client_left()))
-                }
-                Poll::Pending => Poll::Pending,
-            }),
-        )
-        .await
-        .map_err(|_| WriteError::Body(BodyError::Timeout))??;
+        let ready = poll_fn(|cx| Poll::Ready(poll_body_once(&mut body, client_closed, cx))).await;
+        let frame = match ready {
+            Poll::Ready(r) => r?,
+            Poll::Pending => {
+                // Flush whatever is buffered before waiting on the producer.
+                flush_timed(w, idle).await?;
+                stall.as_mut().reset(deadline(body_idle));
+                poll_fn(|cx| {
+                    if let Poll::Ready(r) = poll_body_once(&mut body, client_closed, cx) {
+                        return Poll::Ready(r);
+                    }
+                    stall
+                        .as_mut()
+                        .poll(cx)
+                        .map(|()| Err(WriteError::Body(BodyError::Timeout)))
+                })
+                .await?
+            }
+        };
         let Some(frame) = frame else { break };
         let frame = frame.map_err(WriteError::Body)?;
         let Ok(data) = frame.into_data() else {
@@ -544,7 +593,7 @@ async fn write_message<W: AsyncWrite + Unpin>(
     if framing == OutFraming::Chunked {
         write_timed(w, &[b"0\r\n\r\n"], idle).await?;
     }
-    flush_timed(w, idle).await
+    Ok(())
 }
 
 /// A strict HTTP/1.1 server connection over any byte stream.

@@ -29,11 +29,11 @@ use crate::flowlog::{DecisionKind, FlowEvent};
 use crate::io::ClientIo;
 use crate::listener::ClientConn;
 use crate::pipeline::{
-    BodyIo, FlowCx, PerDir, Refusal, RefusalKind, ResponseVerdict, Verdict, body_failure,
+    BodyIo, FlowCx, PerDir, Refusal, RefusalKind, ResponseVerdict, Verdict, body_failure, ms,
     request_steps, response_steps,
 };
 use crate::server::Shared;
-use crate::upstream::{ConnectError, Protocols, UpstreamBody, classify, describe};
+use crate::upstream::{ConnectError, ConnectInfo, Protocols, UpstreamBody, classify, describe};
 use crate::view::host_text;
 use crate::watch::{Dir, Watch, watched};
 
@@ -623,7 +623,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
         Ok(u) => u,
         Err(failed) => return failed.into(),
     };
-    cx.record.ttfb_ms = Some(u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX));
+    cx.record.ttfb_ms = Some(ms(t0.elapsed()));
     let (res, upgrade) = match upstreamed {
         Upstreamed::Response(res) => (res, None),
         Upstreamed::Upgrade { res, upstream, key } => {
@@ -684,10 +684,12 @@ async fn upgrade_upstream(
     let upstream_client = cx.snap.upstream.clone();
     let private = PrivateAddrs::from_private_ok(cx.opts.private_ok);
     let attempt = async {
+        let dialled = Instant::now();
         let io = upstream_client
             .connect_h1(scheme, &authority, private)
             .await
             .map_err(Some)?;
+        let dial = dialled.elapsed();
         let (mut sender, connection) =
             hyper::client::conn::http1::handshake::<_, Body>(TokioIo::new(io))
                 .await
@@ -702,13 +704,13 @@ async fn upgrade_upstream(
             None
         })?;
         if res.status() != http::StatusCode::SWITCHING_PROTOCOLS {
-            return Ok((res, None));
+            return Ok((res, None, dial));
         }
         let upgraded = hyper::upgrade::on(&mut res).await.map_err(|e| {
             tracing::debug!(error = %e, "upstream upgrade did not complete");
             None
         })?;
-        Ok((res, Some(upgraded)))
+        Ok((res, Some(upgraded), dial))
     };
     let timeout = cx.snap.limits.response_header_timeout;
     match tokio::time::timeout(timeout, attempt).await {
@@ -723,8 +725,13 @@ async fn upgrade_upstream(
             port,
             "upgrade request failed".into(),
         ))),
-        Ok(Ok((res, Some(upstream)))) => Ok(Upstreamed::Upgrade { res, upstream, key }),
-        Ok(Ok((res, None))) => Ok(Upstreamed::Response(res.map(UpstreamBody::untracked))),
+        Ok(Ok((res, upgraded, dial))) => {
+            cx.record.upstream_connect_ms = Some(ms(dial));
+            Ok(match upgraded {
+                Some(upstream) => Upstreamed::Upgrade { res, upstream, key },
+                None => Upstreamed::Response(res.map(UpstreamBody::untracked)),
+            })
+        }
     }
 }
 
@@ -809,7 +816,14 @@ async fn plain_upstream<F: Front>(
                 None => protocol_refusal(cx, &host, port, describe(&e)),
             }),
         }),
-        Ok(Some(Ok(Ok(res)))) => Ok(Upstreamed::Response(res)),
+        Ok(Some(Ok(Ok(res)))) => {
+            cx.record.upstream_connect_ms = res
+                .extensions()
+                .get::<ConnectInfo>()
+                .and_then(ConnectInfo::take_dial)
+                .map(ms);
+            Ok(Upstreamed::Response(res))
+        }
     }
 }
 

@@ -14,7 +14,7 @@ upstream:
   deny_cidrs: []               # never valid destinations
   allow_cidrs: []              # exceptions to the private-range floor only
   deny_lists: [blocked]        # names from address_lists
-  connect_timeout: 10s         # TCP connect, over all of a name's addresses together; the TLS handshake gets its own
+  connect_timeout: 10s         # TCP connect, over all of a name's addresses together; then the TLS handshake, within another
   max_h2_connections_per_origin: 4   # at least 1
 
 tls:
@@ -41,7 +41,9 @@ attempt gets an equal share of the time left.
 rustls with the bundled Mozilla roots (`webpki-roots`), plus `extra_roots`
 under `strict+extra_roots`. Verification is always on. The SNI is the
 canonical host. ALPN offers `h2` and `http/1.1` (only `http/1.1` for
-WebSocket upgrades).
+WebSocket upgrades). The handshake has its own `connect_timeout` after the
+TCP connect's: an upstream that accepts the connection but never completes
+TLS fails with `504`, reason `timeout`, message `upstream TLS handshake`.
 
 ## Connections
 
@@ -69,7 +71,7 @@ streamed to the connection.
 | address floor | `403`, `_address_policy` | `upstream_denied`, reason `private_range:<class>`, `deny_cidrs` or `list:<name>` |
 | DNS, connect, TLS | `502` | `upstream_error`, reason `dns_failed`, `connect_failed` or `tls_failed` |
 | a target roxy cannot dial (no host, an unknown scheme) | `502` | `upstream_error`, reason `invalid_target` |
-| timeout | `504` | `upstream_error`, reason `timeout` |
+| timeout (connect, TLS handshake or response headers) | `504` | `upstream_error`, reason `timeout`; `message` names the stage |
 | a response roxy cannot canonicalise | `502` | `upstream_error`, reason `protocol_error` |
 
 Every row answers with the same body

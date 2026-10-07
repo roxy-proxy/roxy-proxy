@@ -296,8 +296,25 @@ Every refusal roxy originates has this body:
 | failed addon layer | `503` | `layer:<name>` |
 | upstream failure | `502` (`504` for a timeout) | none |
 
-The body never says why: the reason code (`dns_failed`, `connect_failed`,
-`metric_table_full`, ...) is in the flow log only.
+The body names the rule and the flow, never why: the reason code
+(`dns_failed`, `connect_failed`, `metric_table_full`, ...) is in the flow
+log only.
+
+A request roxy cannot parse is refused with a different body, before any
+rule has seen it:
+
+```
+HTTP/1.1 400 Bad Request
+content-type: application/json
+connection: close
+
+{"error":"rejected by roxy","reason":"cl_and_te"}
+```
+
+`reason` is the `parse_error` code ([rejection rules](/reference/http#rejection-rules)),
+which describes the request's syntax and says nothing about policy. The
+status is `400`, or the closer one the code has (`413`, `414`, `431`, ...);
+on HTTP/2 the stream is reset instead.
 
 A rule sets the status and message with `deny: { status: 451, message:
 "..." }`. After a deny the connection is closed (`connection: close` on

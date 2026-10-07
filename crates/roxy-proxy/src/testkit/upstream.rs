@@ -19,6 +19,7 @@ use roxy_tls::LeafMinter;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::Notify;
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
 use super::{DOWN_IP, PRIVATE_IP, UP_IP};
@@ -60,6 +61,8 @@ pub(crate) struct Upstream {
     ws_received: Mutex<Vec<Vec<u8>>>,
     /// Framed echo upgrades that have ended, from the upstream's side.
     ws_closed: AtomicUsize,
+    /// The close codes the framed echo received, one per close frame.
+    ws_close_codes: Mutex<Vec<Option<u16>>>,
     /// Offer only `http/1.1` in ALPN.
     h1_only: AtomicBool,
 }
@@ -88,6 +91,7 @@ impl Upstream {
             open: AtomicUsize::new(0),
             ws_received: Mutex::new(Vec::new()),
             ws_closed: AtomicUsize::new(0),
+            ws_close_codes: Mutex::new(Vec::new()),
             h1_only: AtomicBool::new(false),
         })
     }
@@ -101,6 +105,11 @@ impl Upstream {
     /// received so far.
     pub(crate) fn ws_received(&self) -> Vec<Vec<u8>> {
         lock(&self.ws_received).clone()
+    }
+
+    /// The close codes the framed echo has received so far.
+    pub(crate) fn ws_close_codes(&self) -> Vec<Option<u16>> {
+        lock(&self.ws_close_codes).clone()
     }
 
     /// Waits until `n` framed echo upgrades have ended on the upstream's
@@ -433,7 +442,8 @@ impl Upstream {
             let mut ws =
                 WebSocketStream::from_raw_socket(TokioIo::new(up), Role::Server, None).await;
             while let Some(Ok(msg)) = ws.next().await {
-                if msg.is_close() {
+                if let Message::Close(c) = &msg {
+                    lock(&me.ws_close_codes).push(c.as_ref().map(|c| u16::from(c.code)));
                     let _ = ws.close(None).await;
                     break;
                 }

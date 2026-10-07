@@ -390,18 +390,38 @@ fn stream_error(e: &h2::Error) -> WriteFailure {
     }
 }
 
+fn poll_frame(
+    body: &mut Body,
+    cx: &mut Context<'_>,
+) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+    http_body::Body::poll_frame(Pin::new(body), cx)
+}
+
 async fn stream_body(
     send: &mut SendStream<Bytes>,
     body: &mut Body,
     out: &Out<'_>,
 ) -> Result<(), WriteFailure> {
+    // One timer for the whole body. The two waits (next frame, then window
+    // capacity for it) never overlap, so each re-arms it with its own limit.
+    let mut stall = std::pin::pin!(sleep(out.body_idle));
     loop {
-        let frame = timeout(
-            out.body_idle,
-            poll_fn(|cx| http_body::Body::poll_frame(Pin::new(&mut *body), cx)),
-        )
-        .await
-        .map_err(|_| WriteFailure::UpstreamStalled)?;
+        let frame = match poll_fn(|cx| Poll::Ready(poll_frame(body, cx))).await {
+            Poll::Ready(frame) => frame,
+            Poll::Pending => {
+                stall.as_mut().reset(Instant::now() + out.body_idle);
+                poll_fn(|cx| {
+                    if let Poll::Ready(f) = poll_frame(body, cx) {
+                        return Poll::Ready(Ok(f));
+                    }
+                    stall
+                        .as_mut()
+                        .poll(cx)
+                        .map(|()| Err(WriteFailure::UpstreamStalled))
+                })
+                .await?
+            }
+        };
         let frame = match frame {
             None => {
                 send.send_data(Bytes::new(), true)
@@ -417,9 +437,17 @@ async fn stream_body(
             Ok(mut data) => {
                 while !data.is_empty() {
                     send.reserve_capacity(data.len());
-                    let cap = timeout(out.idle, poll_fn(|cx| send.poll_capacity(cx)))
-                        .await
-                        .map_err(|_| WriteFailure::ClientStalled)?;
+                    stall.as_mut().reset(Instant::now() + out.idle);
+                    let cap = poll_fn(|cx| {
+                        if let Poll::Ready(c) = send.poll_capacity(cx) {
+                            return Poll::Ready(Ok(c));
+                        }
+                        stall
+                            .as_mut()
+                            .poll(cx)
+                            .map(|()| Err(WriteFailure::ClientStalled))
+                    })
+                    .await?;
                     let n = match cap {
                         None => {
                             return Err(WriteFailure::ClientGone(

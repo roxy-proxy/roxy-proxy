@@ -17,6 +17,8 @@ use thiserror::Error;
 
 /// Close codes roxy sends (RFC 6455 §7.4.1).
 pub mod close {
+    /// roxy ended an idle WebSocket.
+    pub const GOING_AWAY: u16 = 1001;
     /// The peer broke the protocol.
     pub const PROTOCOL_ERROR: u16 = 1002;
     /// A text message (or close reason) that is not UTF-8.
