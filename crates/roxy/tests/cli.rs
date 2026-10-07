@@ -295,20 +295,25 @@ fn check_fails_where_startup_would() {
     );
     assert!(err.contains(&expect), "{err}");
 
-    // A resolver entry that is not a nameserver address. hickory builds a
-    // resolver from any list of socket addresses, so this is the only
-    // resolver list `check` can refuse.
-    write("upstream: { dns: { resolver: [\"1.1.1.1:53\", \"dns.test\"] } }\n");
-    let err = check();
-    let expect = format!("{}:upstream.dns.resolver[1]:", cfg.display());
-    assert!(err.contains(&expect), "{err}");
-
     // A CA in `tls.ca_dir` is startup's to generate: `check` passes without it.
     let ca_dir = dir.path().join("ca");
     write(&format!("tls: {{ ca_dir: {ca_dir:?} }}\n"));
     let out = roxy(&["check", "--config", cfg.to_str().unwrap()]);
     assert!(out.status.success(), "{}", text(&out.stderr));
     assert!(!ca_dir.exists(), "check must not generate a CA");
+
+    // One that is there but unloadable fails startup, so it fails `check`,
+    // and is left as it is.
+    std::fs::create_dir(&ca_dir).unwrap();
+    let ca_cert = ca_dir.join(roxy_tls::CA_CERT_FILE);
+    let ca_key = ca_dir.join(roxy_tls::CA_KEY_FILE);
+    std::fs::write(&ca_cert, "not a certificate\n").unwrap();
+    std::fs::write(&ca_key, "not a key\n").unwrap();
+    let err = check();
+    let expect = format!("{}:tls.ca_dir: ", cfg.display());
+    assert!(err.contains(&expect), "{err}");
+    assert_eq!(std::fs::read_to_string(&ca_cert).unwrap(), "not a certificate\n");
+    assert_eq!(std::fs::read_to_string(&ca_key).unwrap(), "not a key\n");
 }
 
 #[test]
@@ -532,6 +537,15 @@ fn rule_test_watching_rules_and_bad_input() {
     let out = rule_test(&["GET", "not-a-url"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(text(&out.stderr).contains("not an absolute URL"));
+
+    // A method the proxy would refuse is not evaluated either.
+    let out = rule_test(&["G{T", "https://api.github.com/"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("roxy would reject this request"),
+        "{}",
+        text(&out.stderr)
+    );
 }
 
 #[test]

@@ -599,9 +599,10 @@ fn check(path: &Path) -> ExitCode {
 }
 
 /// The rest of startup's loading that needs no socket and writes nothing:
-/// compiling the addons, loading a provided CA (one in `tls.ca_dir` is
-/// generated at startup, never here), reading `tls.upstream.extra_roots`
-/// and building the resolver. Every failure is reported as `<field>: <why>`.
+/// compiling the addons, loading the CA (a provided one, else the one in
+/// `tls.ca_dir`; a missing one there is startup's to generate, never
+/// here), reading `tls.upstream.extra_roots` and building the resolver.
+/// Every failure is reported as `<field>: <why>`.
 fn startup_checks(config: &Config, addon_conditions: Vec<Option<Condition>>) -> Vec<String> {
     let mut errs = Vec::new();
     let addons = tokio::runtime::Builder::new_current_thread()
@@ -618,7 +619,10 @@ fn startup_checks(config: &Config, addon_conditions: Vec<Option<Condition>>) -> 
                 errs.push(format!("tls.ca_cert: {e}"));
             }
         }
-        Ok(None) => {}
+        Ok(None) => match Ca::load(&config.tls.ca_dir) {
+            Ok(_) | Err(roxy_tls::CaError::NotFound(_)) => {}
+            Err(e) => errs.push(format!("tls.ca_dir: {e}")),
+        },
         Err(e) => errs.push(format!("tls.ca_cert: {e}")),
     }
     if let Err(e) = roxy_tls::client_config(&UpstreamTlsOptions::from(config)) {

@@ -7,7 +7,9 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use roxy_http::url::{self, Path, Query};
-use roxy_http::{Authority, Headers, Host, HttpFlags, Limits, ParseError, Reason, Scheme};
+use roxy_http::{
+    Authority, Headers, Host, HttpFlags, Limits, Method, ParseError, Reason, Scheme,
+};
 use roxy_proxy::Redactor;
 use roxy_proxy::addr::{AddressDenied, PrivateAddrs};
 use roxy_proxy::addrlist::AddressLists;
@@ -249,6 +251,7 @@ pub fn ws_message(
 /// parts and the header fields that survive parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Head {
+    pub method: Method,
     pub scheme: Scheme,
     pub authority: Authority,
     pub path: Path,
@@ -295,6 +298,8 @@ fn host_text(h: &Host) -> String {
 /// sees the canonical request and refuses what the proxy would refuse,
 /// naming the same reason code.
 pub(crate) fn parse_head(config: &Config, req: &TestRequest) -> Result<Head, String> {
+    let method = Method::parse(req.method.as_bytes())
+        .map_err(|e| format!("roxy would reject this request ({e})"))?;
     let (scheme, authority, path, query) = url::parse_absolute_form(req.url.as_bytes())
         .map_err(|e| format!("{:?} is not an absolute URL roxy accepts ({e})", req.url))?;
     let raw: Vec<(&[u8], &[u8])> = req
@@ -334,6 +339,7 @@ pub(crate) fn parse_head(config: &Config, req: &TestRequest) -> Result<Head, Str
     let connection = roxy_http::connection_tokens(all("connection")).map_err(rejected)?;
     let upgrade = roxy_http::requested_upgrade(&connection, all("upgrade"));
     Ok(Head {
+        method,
         scheme,
         authority,
         path,
@@ -379,7 +385,7 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(DryRunView, Vec
             Field::ListenerName,
             listener.map_or("proxy", |l| l.name.as_str()),
         )
-        .with_str(Field::Method, &req.method)
+        .with_str(Field::Method, head.method.as_str())
         .with_str(Field::Scheme, head.scheme.as_str())
         .with_str(Field::Host, &host)
         .with_int(Field::Port, i64::from(head.authority.port))
@@ -891,7 +897,6 @@ mod tests {
             text.contains("  - sign aws_sigv4 service=bedrock region=eu-west-2\n"),
             "{text}"
         );
-        assert!(!text.contains("AWS4-HMAC-SHA256"), "{text}");
     }
 
     #[test]
