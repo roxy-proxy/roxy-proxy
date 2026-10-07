@@ -461,6 +461,15 @@ const H2_STREAM_WINDOW: u32 = 2 << 20;
 const H2_CONNECTION_WINDOW: u32 = 8 << 20;
 const H2_MAX_FRAME_SIZE: u32 = 1 << 20;
 
+/// Read buffer cap for HTTP/1.1 origins. hyper hands body chunks out as
+/// slices of this buffer and cannot reuse a block while a chunk is in
+/// flight, so a streaming body allocates a block of up to this size per
+/// read, and that block is most of a connection's working set. 256 KiB is
+/// the largest of hyper's doubling read sizes below its ~400 KiB default:
+/// it keeps throughput level with the default, where every read is a frame
+/// through the relay and a 64 KiB cap costs up to 17% on 1 MiB bodies.
+const H1_MAX_BUF_SIZE: usize = 256 << 10;
+
 /// Attempts after the first for a request that never reached the origin.
 const MAX_RETRIES: u32 = 2;
 
@@ -723,6 +732,7 @@ impl Upstream {
                     .http2_initial_stream_window_size(H2_STREAM_WINDOW)
                     .http2_initial_connection_window_size(H2_CONNECTION_WINDOW)
                     .http2_max_frame_size(H2_MAX_FRAME_SIZE)
+                    .http1_max_buf_size(H1_MAX_BUF_SIZE)
                     .build(Connector {
                         inner: inner.clone(),
                         tls: tls.clone(),
