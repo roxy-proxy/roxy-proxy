@@ -46,7 +46,7 @@ pub trait Listener: Send + Sync {
     fn accept(&self) -> AcceptFuture<'_>;
 }
 
-/// A plain TCP listener for the explicit proxy.
+/// A plain TCP listener for the HTTP proxy.
 #[derive(Debug)]
 pub struct TcpProxyListener {
     info: Arc<ListenerInfo>,
@@ -54,7 +54,7 @@ pub struct TcpProxyListener {
 }
 
 impl TcpProxyListener {
-    /// Binds an explicit-proxy listener on `addr`.
+    /// Binds an HTTP-proxy listener on `addr`.
     pub async fn bind(name: &str, addr: SocketAddr) -> io::Result<Self> {
         let tcp = TcpListener::bind(addr).await?;
         Ok(Self {
