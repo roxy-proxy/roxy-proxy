@@ -357,12 +357,13 @@ fn watching_rules_cannot_allow_or_change_the_request() {
     );
 }
 
-/// A deny watching a byte metric is decided at the head and, if it fires
-/// later, stops the exchange. A watching rule may therefore read a tag it
-/// sets: when the setter fires late nothing after it runs, so the reader
-/// is never evaluated with the tag present and what it sees is fixed.
+/// A deny watching a byte metric can fire while watching, and a pass runs
+/// every triggered rule even after a deny matched, so a watching reader of
+/// its tag would see the tag only when both fire in the same pass. The
+/// compiler rejects that read wherever the reader sits; a head reader below
+/// the setter sees the tag exactly when the setter matched at the head.
 #[test]
-fn watching_reader_of_a_head_and_watching_setters_tag() {
+fn watching_reader_of_a_head_and_watching_setters_tag_is_rejected() {
     let metrics = "- { id: egress, count: request_bytes }";
     let setter = r"
 - id: budget
@@ -379,41 +380,114 @@ fn watching_reader_of_a_head_and_watching_setters_tag() {
         format!("{setter}{reader}{tail}"),
         format!("{reader}{setter}{tail}"),
     ] {
-        let p = compile(metrics, &rules);
-        let kinds: Vec<RuleKind> = p.rule_info().iter().map(|r| r.kind).collect();
-        assert!(kinds.contains(&RuleKind::HeadAndWatching), "{kinds:?}");
-        let ctx = EvalContext::empty();
-        let v = |egress: i64| {
-            MapView::new()
-                .with_metric("egress", egress)
-                .with_int(Field::ResponseBodyBytes, 10)
-        };
-        let head = p.evaluate_head(&v(0), &ctx);
-        assert_eq!(head.terminal_rule, "ok");
-        assert_eq!(head.tags, Vec::<String>::new());
-        let mut st = p.watch_state(&head.tags);
-        // Tag absent, budget not exceeded: the reader has nothing to match.
-        assert_eq!(
-            p.evaluate_watching(Reads::RESPONSE_BODY_BYTES, ALL, &mut st, &v(0)),
-            None
-        );
-        // The setter fires: the tag is recorded, the exchange stops, and the
-        // reader is not evaluated with it.
-        let o = p
-            .evaluate_watching(
-                Reads::BODY_BYTES | Reads::METRIC_REQUEST_BYTES,
-                ALL,
-                &mut st,
-                &v(2 << 20),
-            )
-            .unwrap();
-        assert!(o.stops());
-        assert_eq!(o.terminal_rule.unwrap(), "budget");
-        assert_eq!(o.matched, ["budget"]);
-        assert_eq!(o.tags, ["over"]);
-        assert!(st.is_stopped());
-        assert_eq!(p.evaluate_watching(ALL, ALL, &mut st, &v(2 << 20)), None);
+        let err = try_compile(metrics, &rules).unwrap_err().join("\n");
+        assert!(err.contains("reads `tag[\"over\"]`"), "{err}");
+        assert!(err.contains("a deny watching a byte metric"), "{err}");
     }
+    let p = compile(
+        metrics,
+        &format!(
+            "{setter}- {{ id: note, when: 'tag[\"over\"]', then: {{ log: {{ level: info, message: over }} }} }}\n{tail}"
+        ),
+    );
+    assert_eq!(p.rule_info()[0].kind, RuleKind::HeadAndWatching);
+    assert_eq!(p.rule_info()[1].kind, RuleKind::Head);
+}
+
+/// A watching deny does not cut the pass short: the rules below it that
+/// the same event triggers are still checked, and their `log` and
+/// `set_state` effects and tags apply, as they do at the head. The first
+/// deny in list order is the terminal rule.
+#[test]
+fn a_watching_deny_keeps_the_effects_of_the_rules_below_it() {
+    let p = compile(
+        "",
+        r#"
+- id: ok
+  then: allow
+- id: cap
+  when: body.bytes > 10kb
+  then: { deny: { status: 413, message: "upload too large" } }
+- id: note
+  when: body.bytes > 1kb
+  then:
+    - tag: big
+    - set_state: { key: last-big, value: "1" }
+    - log: { level: info, message: "big upload" }
+- id: second-cap
+  when: body.bytes > 10kb
+  then: { deny: { status: 400 } }
+"#,
+    );
+    let mut st = p.watch_state(&[]);
+    let changed = Reads::BODY_BYTES;
+    let o = p
+        .evaluate_watching(
+            changed,
+            changed,
+            &mut st,
+            &MapView::new().with_int(Field::BodyBytes, 20_000),
+        )
+        .unwrap();
+    assert_eq!(
+        o.stop,
+        Some(Deny {
+            status: DenyStatus::new(413).unwrap(),
+            message: "upload too large".into(),
+            close: true
+        })
+    );
+    assert_eq!(o.terminal_rule.unwrap(), "cap");
+    assert_eq!(
+        o.matched,
+        ["cap", "note", "second-cap"].map(roxy_rules::RuleId::new)
+    );
+    assert_eq!(o.tags, ["big"]);
+    assert_eq!(
+        o.effects,
+        [
+            WatchEffect::SetState {
+                key: "last-big".into(),
+                value: "1".into(),
+                ttl: None,
+            },
+            WatchEffect::Log {
+                level: LogLevel::Info,
+                message: "big upload".into(),
+            },
+        ]
+    );
+    assert!(st.is_stopped());
+
+    // An unavailable input below a matching deny fails closed, as at the
+    // head: the log must not name a deny that masked it.
+    let p = compile(
+        "",
+        r"
+- id: cap
+  when: body.bytes > 10kb
+  then: deny
+- id: w
+  when: response.body.size > 1mb
+  then: deny
+",
+    );
+    let mut st = p.watch_state(&[]);
+    let o = p
+        .evaluate_watching(
+            ALL,
+            ALL,
+            &mut st,
+            &MapView::new().with_int(Field::BodyBytes, 20_000),
+        )
+        .unwrap();
+    assert_eq!(o.stop, Some(Deny::fail_closed()));
+    assert_eq!(o.terminal_rule.unwrap(), "_fail_closed");
+    assert_eq!(
+        o.fail_closed_reason,
+        Some(FailClosedReason::MissingValue("response.body.size".into()))
+    );
+    assert_eq!(o.matched, ["cap"].map(roxy_rules::RuleId::new));
 }
 
 /// A rule reading two watched fields is checked only once both are known:

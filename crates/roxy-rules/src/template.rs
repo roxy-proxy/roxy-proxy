@@ -41,6 +41,11 @@ impl std::error::Error for TemplateError {}
 const OPEN: &str = "${";
 const SECRET_OPEN: &str = "${secret:";
 
+/// Where a placeholder may appear, for every diagnostic that rejects one
+/// elsewhere (`{SECRET_PLACES}, not in ...`).
+pub(crate) const SECRET_PLACES: &str =
+    "secret references are only allowed in `set_header` values and the credentials of `sign`";
+
 /// Whether `value` contains the opening of a secret placeholder, well
 /// formed or not: where secrets are not allowed at all, a broken
 /// placeholder is still an attempt to use one.

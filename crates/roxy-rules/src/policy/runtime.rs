@@ -177,8 +177,11 @@ impl Policy {
     /// [`Reads::METRIC_REQUEST_BYTES`] if this exchange's bytes were just
     /// added to such a metric); `known` is every watched field known so far
     /// (a rule is only checked once everything it reads is known). Rules
-    /// whose triggers intersect `changed` are checked top to bottom; the
-    /// first matching deny stops the exchange. A watching rule's
+    /// whose triggers intersect `changed` are checked top to bottom, every
+    /// one of them even after a deny matched, as at the head: the `log` and
+    /// `set_state` effects of every matching rule apply, the first matching
+    /// deny in list order is the terminal rule, and an unavailable input
+    /// anywhere in the pass fails closed over a deny. A watching rule's
     /// non-terminal effects apply once, the first time it matches; it is not
     /// checked again after that.
     ///
@@ -198,6 +201,7 @@ impl Policy {
             return None;
         }
         let mut out: Option<WatchOutcome> = None;
+        let mut deny: Option<(RuleId, Deny)> = None;
         for (k, &i) in self.watching.iter().enumerate() {
             let rule = &self.rules[i];
             if st.fired[k]
@@ -211,14 +215,14 @@ impl Policy {
                 None => Ok(true),
                 Some(p) => Scope::new(view, &st.tags, pending).check(p),
             };
-            let o = out.get_or_insert_with(WatchOutcome::default);
             match hit {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(reason) => {
-                    return Some(self.watch_stop(st, o, None, Some(reason)));
+                    return Some(self.watch_stop(st, out, None, Some(reason)));
                 }
             }
+            let o = out.get_or_insert_with(WatchOutcome::default);
             st.fired[k] = true;
             o.matched.push(rule.id.clone());
             for action in &rule.watching {
@@ -231,15 +235,15 @@ impl Policy {
                         }
                     }
                     WatchAction::Deny(d) => {
-                        return Some(self.watch_stop(
-                            st,
-                            o,
-                            Some((rule.id.clone(), d.clone())),
-                            None,
-                        ));
+                        if deny.is_none() {
+                            deny = Some((rule.id.clone(), d.clone()));
+                        }
                     }
                 }
             }
+        }
+        if deny.is_some() {
+            return Some(self.watch_stop(st, out, deny, None));
         }
         out.filter(|o| !o.matched.is_empty())
     }
@@ -247,12 +251,12 @@ impl Policy {
     fn watch_stop(
         &self,
         st: &mut WatchState,
-        o: &mut WatchOutcome,
+        o: Option<WatchOutcome>,
         deny: Option<(RuleId, Deny)>,
         reason: Option<FailClosedReason>,
     ) -> WatchOutcome {
         st.stopped = true;
-        let mut o = std::mem::take(o);
+        let mut o = o.unwrap_or_default();
         stopped_effects(&mut o.effects);
         match (deny, reason) {
             (Some((id, d)), _) => {

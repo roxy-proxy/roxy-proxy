@@ -39,8 +39,12 @@ method      := [A-Z][A-Z_]*                       ; HTTP method names only
   body, and matches neither `method == GET` nor `method in [GET, HEAD]`.
 - Compile errors: type mismatch (`host under 443`), a regex that does not
   compile, a bad CIDR mask, `metric.foo` with no such metric, an undefined
-  `@list`. `in` takes a list of the operand's type, a CIDR, or an `@list`
-  for ip fields.
+  `@list`, a `${secret:name}` placeholder in a string (it would compare
+  against its own text; [secrets](/reference/secrets)), and a predicate
+  that can never match: `under` with an empty label (`"a..b"`,
+  `"example.com.."`), or `null` compared with a value that is never `null`
+  ([missing values](/reference/rule-language#missing-values-null)). `in`
+  takes a list of the operand's type, a CIDR, or an `@list` for ip fields.
 
 ### Fields
 
@@ -74,8 +78,10 @@ WebSocket extensions.
 
 An absent value is `null`: an unsent header or query parameter, an unset
 state key, `tls.sni` when none was sent, `body.size` for a chunked body.
-`tag["x"]` is never `null`: `false` until set. `==`, `!=`, `in` and `not
-in` treat `null` as a value; any other operator on it fails closed.
+`tag["x"]` is never `null` (`false` until set), nor are `metric.<id>`,
+`body.text` and `response.body.text` (unavailable, they fail closed);
+comparing any of them with `null` is a compile error. `==`, `!=`, `in` and
+`not in` treat `null` as a value; any other operator on it fails closed.
 
 | expression, with `x` missing | result |
 |---|---|

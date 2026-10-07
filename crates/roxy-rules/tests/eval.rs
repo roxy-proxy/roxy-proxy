@@ -8,7 +8,8 @@ use std::time::Duration;
 use common::{METRICS, compile, try_compile};
 use roxy_rules::{
     AllowOpts, CaptureTarget, Decision, Deny, DenyStatus, Effect, EvalContext, FailClosedReason,
-    Field, LogLevel, MapView, Policy, Reads, RuleKind, Scheme, SetHeaderValue, Value, WatchOutcome,
+    Field, LogLevel, MapView, Policy, Reads, RuleKind, Scheme, SetHeaderValue, Type, Value,
+    WatchOutcome,
 };
 
 fn ip(s: &str) -> Value<'static> {
@@ -1233,6 +1234,60 @@ fn guarded_size_rule() {
     );
     let out = unguarded.evaluate_head(&MapView::new(), &ctx);
     assert_eq!(out.terminal_rule, "_fail_closed");
+}
+
+/// A view that gives a field a value of another type than the field's
+/// (a bug in the view) fails the flow closed under every operator, naming
+/// the field and both types, instead of a predicate that is quietly false.
+#[test]
+fn a_value_of_the_wrong_type_fails_closed() {
+    let ctx = EvalContext::empty();
+    let view = MapView::new()
+        .with(Field::BodySize, Value::str("huge"))
+        .with(Field::Host, Value::Int(7))
+        .with(Field::ClientIp, Value::str("10.0.0.1"))
+        .with(Field::Path, Value::Bool(true))
+        .with(Field::ClientPort, Value::Ip("::1".parse().unwrap()));
+    for (expr, field, expected, found) in [
+        ("body.size > 10mb", "body.size", Type::Int, Type::Str),
+        ("body.size == 10", "body.size", Type::Int, Type::Str),
+        ("body.size in [10, 20]", "body.size", Type::Int, Type::Str),
+        ("host under \"example.com\"", "host", Type::Str, Type::Int),
+        ("host like \"*\"", "host", Type::Str, Type::Int),
+        ("host in [\"a\"]", "host", Type::Str, Type::Int),
+        ("client.ip in 10.0.0.0/8", "client.ip", Type::Ip, Type::Str),
+        ("client.ip in @internal", "client.ip", Type::Ip, Type::Str),
+        ("path contains \"a\"", "path", Type::Str, Type::Bool),
+        ("path matches \".*\"", "path", Type::Str, Type::Bool),
+        ("client.port < 1024", "client.port", Type::Int, Type::Ip),
+    ] {
+        let p = compile(
+            "",
+            &format!(
+                "- {{ id: r, when: '{}', then: deny }}\n- {{ id: ok, then: allow }}",
+                expr.replace('\'', "''")
+            ),
+        );
+        let out = p.evaluate_head(&view, &ctx);
+        assert_eq!(out.decision, Decision::fail_closed(), "{expr}");
+        assert_eq!(out.terminal_rule, "_fail_closed", "{expr}");
+        assert_eq!(
+            out.fail_closed_reason,
+            Some(FailClosedReason::WrongType {
+                field: field.into(),
+                expected,
+                found,
+            }),
+            "{expr}"
+        );
+    }
+    // `null` is of every type: a missing value is still missing, not mistyped.
+    let out = compile(
+        "",
+        "- { id: r, when: 'body.size == null', then: deny }\n- { id: ok, then: allow }",
+    )
+    .evaluate_head(&MapView::new(), &ctx);
+    assert_eq!(out.terminal_rule, "r");
 }
 
 #[test]

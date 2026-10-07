@@ -17,6 +17,25 @@ rules[0].when:1:12: `under` needs a quoted domain on the right, found the number
     | host under 443
     |            ^^^
 
+== under with an empty label
+rules[0].when:1:12: domain "example.com.." has an empty label (`..`), which no host has  [rule a]
+    | host under "example.com.."
+    |            ^^^^^^^^^^^^^^^
+rules[1].when:1:12: domain "a..b" has an empty label (`..`), which no host has  [rule b]
+    | host under "a..b"
+    |            ^^^^^^
+
+== null compared with a field that is never null
+rules[0].when:1:1: `tag["x"]` is never null (false until set), so comparing it with `null` is always the same answer; remove it  [rule a]
+    | tag["x"] == null
+    | ^^^^^^^^
+rules[1].when:1:1: `metric.writes` is never null (an unavailable metric fails the flow closed), so comparing it with `null` is always the same answer; remove it  [rule b]
+    | metric.writes != null
+    | ^^^^^^^^^^^^^
+rules[2].when:1:9: `body.text` is never null (an unavailable body fails the flow closed), so comparing it with `null` is always the same answer; remove it  [rule c]
+    | null != body.text
+    |         ^^^^^^^^^
+
 == ordering on strings
 rules[0].when:1:1: `<` compares numbers, but this is `path` (string)  [rule a]
     | path < 5
@@ -89,6 +108,22 @@ rules[0].then[0]: secret references are only allowed in rules decided at the req
 == secret outside set_header
 rules[0].then[0]: secret references are only allowed in `set_header` values and the credentials of `sign`, not in `log`  [rule a]
 
+== secret in a when expression
+rules[0].when:1:28: secret references are only allowed in `set_header` values and the credentials of `sign`, not in an expression  [rule a]
+    | header["authorization"] == "Bearer ${secret:gh}"
+    |                            ^^^^^^^^^^^^^^^^^^^^^
+rules[1].when:1:7: secret references are only allowed in `set_header` values and the credentials of `sign`, not in an expression  [rule b]
+    | state["${secret:gh}"] == "x"
+    |       ^^^^^^^^^^^^^^
+rules[2].when:1:16: secret references are only allowed in `set_header` values and the credentials of `sign`, not in an expression  [rule c]
+    | path in ["/a", "${secret:nope"]
+    |                ^^^^^^^^^^^^^^^
+
+== secret in a metric where
+metrics[0].where:1:9: secret references are only allowed in `set_header` values and the credentials of `sign`, not in an expression
+    | path == "${secret:gh}"
+    |         ^^^^^^^^^^^^^^
+
 == sign unsigned_payload outside S3
 rules[0].then[0]: sign aws_sigv4: `unsigned_payload` is accepted only for S3 (`s3`, `s3-control`, `s3-outposts`); "bedrock" requires the payload hash  [rule a]
 
@@ -114,6 +149,9 @@ rules[1].when: reads `tag["big"]`, which is set too late to be seen here, by rul
 
 == tag read by a watching rule but set by a watching rule above it
 rules[1].when: reads `tag["big"]`, which is set too late to be seen here, by rules[0] ("big"), a watching rule, which fires when the values it reads arrive rather than in list order; a rule sees only the tags set before it is checked  [rule cap]
+
+== tag read by a watching rule but set by a deny watching a byte metric
+rules[1].when: reads `tag["over"]`, which is set too late to be seen here, by rules[0] ("budget"), a deny watching a byte metric, which can fire while this rule watches, when the values it reads arrive rather than in list order; a rule sees only the tags set before it is checked  [rule note]
 
 == rewrite_path group references
 rules[0].then[0]: rewrite_path `to`: `$3` refers to a group `match` does not have (1 unnamed group; named: rest)  [rule a]

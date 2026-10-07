@@ -8,6 +8,7 @@ use ipnet::IpNet;
 
 use crate::ast::{Lit, Op, Unit};
 use crate::diag::{ExprError, Span};
+use crate::template::{SECRET_PLACES, mentions_secret};
 
 /// Longest expression accepted, in bytes. Generous for hand-written rules;
 /// keeps spans in `u32` and bounds compile work.
@@ -214,6 +215,17 @@ impl Lexer<'_> {
             match c {
                 '"' => {
                     self.pos += 1;
+                    // Every string literal (operands, list items, `[..]`
+                    // indices) is lexed here, so this is where a placeholder
+                    // that would otherwise compare against its own text is
+                    // caught.
+                    if mentions_secret(&out) {
+                        return self.err(
+                            start,
+                            self.pos,
+                            format!("{SECRET_PLACES}, not in an expression"),
+                        );
+                    }
                     return Ok(Tok::Lit(Lit::Str(out)));
                 }
                 '\n' | '\r' => return self.err(start, self.pos, "unterminated string"),

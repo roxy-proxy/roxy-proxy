@@ -15,7 +15,7 @@ use roxy_http::Host;
 use crate::compile::{Const, OrdOp, Pred, ROperand, StrOp};
 use crate::config::{CaptureTarget, LogLevel, Scheme};
 use crate::diag::RuleId;
-use crate::types::Access;
+use crate::types::{Access, Type};
 use crate::view::{BodyText, FlowView, Value};
 
 /// Per-evaluation inputs that are not part of the flow.
@@ -199,6 +199,16 @@ pub enum FailClosedReason {
     /// missing (`null`) value, which has no answer. Carries the field
     /// as written, e.g. `body.size`.
     MissingValue(String),
+    /// The view gave a field a value of another type than the field's. A
+    /// bug in the view, not in the rule: the predicate has no answer.
+    WrongType {
+        /// The field as written, e.g. `body.size`.
+        field: String,
+        /// The field's type.
+        expected: Type,
+        /// The type of the value the view gave.
+        found: Type,
+    },
 }
 
 impl fmt::Display for FailClosedReason {
@@ -224,6 +234,11 @@ impl fmt::Display for FailClosedReason {
                     "`{field}` is null; guard the rule with `{field} != null and ...`"
                 )
             }
+            Self::WrongType {
+                field,
+                expected,
+                found,
+            } => write!(f, "`{field}` is {expected} but the flow view gave {found}"),
         }
     }
 }
@@ -781,6 +796,8 @@ pub(crate) enum Unavailable<'a> {
     Body(&'static str),
     /// A missing value reached an operator that cannot answer for `null`.
     Missing(&'a Access),
+    /// The view gave a value of this type where the access has another.
+    WrongType(&'a Access, Type),
 }
 
 impl Unavailable<'_> {
@@ -799,6 +816,11 @@ impl Unavailable<'_> {
             },
             Unavailable::Body(f) => FailClosedReason::BodyUnavailable(f.to_owned()),
             Unavailable::Missing(a) => FailClosedReason::MissingValue(a.display_name()),
+            Unavailable::WrongType(a, found) => FailClosedReason::WrongType {
+                field: a.display_name(),
+                expected: a.ty(),
+                found,
+            },
         }
     }
 }
@@ -812,7 +834,7 @@ fn get<'a>(op: &'a ROperand, s: &Scope<'a>) -> Value<'a> {
             Const::Ip(ip) => Value::Ip(*ip),
         },
         ROperand::Get(access) => match access {
-            Access::Scalar(f) => s.view.field(*f),
+            Access::Scalar(f) => typed(s, access, s.view.field(*f)),
             Access::Header(n) => opt(s.view.header(n)),
             Access::HeaderAll(n) => list(s.view.header_all(n)),
             Access::RespHeader(n) => opt(s.view.response_header(n)),
@@ -836,6 +858,22 @@ fn get<'a>(op: &'a ROperand, s: &Scope<'a>) -> Value<'a> {
             Access::BodyText => body(s, s.view.body_text(), "body.text"),
             Access::RespBodyText => body(s, s.view.response_body_text(), "response.body.text"),
         },
+    }
+}
+
+/// The one place a view's value meets its field's static type. The other
+/// accesses build their values here from the view's typed answers; a scalar
+/// field is whatever the view returns, and a value of another type is a
+/// view bug that fails the flow closed rather than reading as a predicate
+/// that is quietly false. Every operator may therefore take an operand to
+/// be of its static type or `Absent`.
+fn typed<'a>(s: &Scope<'a>, access: &'a Access, v: Value<'a>) -> Value<'a> {
+    match v.ty() {
+        Some(found) if found != access.ty() => {
+            s.fail(Unavailable::WrongType(access, found));
+            Value::Absent
+        }
+        _ => v,
     }
 }
 

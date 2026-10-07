@@ -6,7 +6,7 @@ use std::net::IpAddr;
 
 use ipnet::IpNet;
 
-use crate::types::Field;
+use crate::types::{Field, Type};
 
 /// A runtime value. Borrowed wherever the view can lend its own storage, so
 /// evaluation does not copy strings.
@@ -40,6 +40,19 @@ impl Value<'_> {
     pub fn str(s: impl Into<String>) -> Value<'static> {
         Value::Str(Cow::Owned(s.into()))
     }
+
+    /// The static type this value has; `None` for `null`, which every type
+    /// admits.
+    pub fn ty(&self) -> Option<Type> {
+        match self {
+            Value::Str(_) => Some(Type::Str),
+            Value::Int(_) => Some(Type::Int),
+            Value::Bool(_) => Some(Type::Bool),
+            Value::Ip(_) => Some(Type::Ip),
+            Value::List(_) => Some(Type::StrList),
+            Value::Absent => None,
+        }
+    }
 }
 
 /// A body as seen by `body.text` / `response.body.text`.
@@ -69,7 +82,9 @@ pub enum BodyText<'a> {
 /// an empty vector for anything unknown, which the evaluator treats as absent
 /// (predicate false) — except `metric` and `in_address_list`, see below.
 pub trait FlowView {
-    /// A scalar field. Normalisation contract: see [`Field`].
+    /// A scalar field: a value of its type ([`Field::ty`]) or `Absent`.
+    /// Any other variant fails the flow closed (`wrong_type`).
+    /// Normalisation contract: see [`Field`].
     fn field(&self, f: Field) -> Value<'_>;
     /// First value of a request header.
     fn header(&self, name: &str) -> Option<Cow<'_, str>>;
