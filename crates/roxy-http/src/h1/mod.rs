@@ -473,13 +473,16 @@ async fn flush_timed<W: AsyncWrite + Unpin>(w: &mut W, idle: Duration) -> Result
     Ok(())
 }
 
-/// Polls `body` once. `Ready(None)` means the producer is not ready yet;
-/// a pending producer with `client_closed` set is an error.
+/// The next body frame; `None` at the end of the body.
+type NextFrame = Option<Result<Frame<Bytes>, BodyError>>;
+
+/// Polls `body` once; a pending producer with `client_closed` set is an
+/// error rather than a wait.
 fn poll_body_once(
     body: &mut Body,
     client_closed: &AtomicBool,
     cx: &mut std::task::Context<'_>,
-) -> Poll<Result<Option<Result<Frame<Bytes>, BodyError>>, WriteError>> {
+) -> Poll<Result<NextFrame, WriteError>> {
     match Pin::new(body).poll_frame(cx) {
         Poll::Ready(frame) => Poll::Ready(Ok(frame)),
         Poll::Pending if client_closed.load(Ordering::Relaxed) => Poll::Ready(Err(client_left())),
@@ -522,7 +525,7 @@ async fn write_message<W: AsyncWrite + Unpin>(
             Poll::Pending => {
                 // Flush whatever is buffered before waiting on the producer.
                 flush_timed(w, idle).await?;
-                stall.as_mut().reset(Instant::now() + body_idle);
+                stall.as_mut().reset(deadline(body_idle));
                 poll_fn(|cx| {
                     if let Poll::Ready(r) = poll_body_once(&mut body, client_closed, cx) {
                         return Poll::Ready(r);
