@@ -79,7 +79,7 @@ use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowSink, MemorySink, Redactor};
 use crate::listener::{ClientConn, ListenerInfo, ListenerMode};
 use crate::sources::{MetricSource, Sample, StateSource, UnavailableMetrics, UnavailableState};
-use crate::upstream::{TestDial, UpstreamSettings};
+use crate::upstream::{DnsSettings, TestDial, UpstreamSettings};
 
 /// The scripted upstream's public address (`up.test`).
 pub(crate) const UP_IP: &str = "93.184.215.14";
@@ -463,7 +463,7 @@ impl KitBuilder {
             addons.push(a.load(&rt, &input).await);
         }
 
-        let mut settings = upstream_settings(&upstream);
+        let (mut settings, dns) = upstream_settings(&upstream);
         if let Some(f) = self.upstream {
             f(&mut settings);
         }
@@ -485,6 +485,7 @@ impl KitBuilder {
                 extra_roots_pem: vec![dir.path().join(roxy_tls::CA_CERT_FILE)],
                 ..UpstreamTlsOptions::default()
             },
+            dns,
             max_connections: 1024,
             max_connections_per_client: 1024,
             connection_events: self.connection_events,
@@ -1113,12 +1114,15 @@ impl Answer {
     }
 }
 
-/// The connector's settings: the test names, and the scripted upstream
-/// behind the dial.
-fn upstream_settings(upstream: &Arc<Upstream>) -> UpstreamSettings {
+/// The connector's settings, with the scripted upstream behind the dial,
+/// and a resolver for the test names.
+fn upstream_settings(upstream: &Arc<Upstream>) -> (UpstreamSettings, DnsSettings) {
     let mut settings = UpstreamSettings::default();
     // Never consult real DNS: unknown names fail.
-    settings.dns.servers = Some(vec!["127.0.0.1:9".parse().unwrap()]);
+    let mut dns = DnsSettings {
+        servers: Some(vec!["127.0.0.1:9".parse().unwrap()]),
+        ..DnsSettings::default()
+    };
     for (name, ips) in [
         ("up.test", vec![UP_IP]),
         ("private.test", vec![PRIVATE_IP]),
@@ -1127,7 +1131,7 @@ fn upstream_settings(upstream: &Arc<Upstream>) -> UpstreamSettings {
         ("stall.test", vec![STALL_IP]),
     ] {
         let ips = ips.iter().map(|ip| ip.parse().unwrap()).collect();
-        settings.dns.static_hosts.insert(name.to_owned(), ips);
+        dns.static_hosts.insert(name.to_owned(), ips);
     }
     settings.connect_timeout = Duration::from_secs(5);
     let up = upstream.clone();
@@ -1140,7 +1144,7 @@ fn upstream_settings(upstream: &Arc<Upstream>) -> UpstreamSettings {
             up.dial(addr)
         })
     })));
-    settings
+    (settings, dns)
 }
 
 /// A connection whose peer reads everything and never writes.

@@ -16,9 +16,10 @@ use roxy_proxy::{
 };
 use roxy_rules::Policy;
 use roxy_tls::{Ca, LeafMinter};
+use tokio::task::JoinSet;
 
 use crate::addons::{AddonLoader, PreparedAddons};
-use crate::config::{Compiled, Config, ListenerMode, Tls};
+use crate::config::{Compiled, Config, Listener, ListenerMode, Startup};
 use crate::secrets::Secrets;
 use crate::stores::ReloadableMetrics;
 
@@ -85,21 +86,32 @@ pub fn policy_update_with_secrets(
     })
 }
 
-/// Loads the provided CA (`tls.ca_cert` / `tls.ca_key`), or else the CA in
-/// `tls.ca_dir`, generating it there on first start.
-pub fn load_ca(config: &Config) -> anyhow::Result<Ca> {
-    let ca = if let Some((cert, key)) = config.tls.provided_ca()? {
-        Ca::load_provided(cert, key)?
+/// Loads the CA on disk: the provided one (`tls.ca_cert` / `tls.ca_key`),
+/// else the one in `tls.ca_dir`; `None` when that directory holds none yet.
+/// Both `roxy check` and startup load through here, so a CA `check` passes
+/// is one startup accepts, with the same [`Ca::warnings`] for each to
+/// report. Errors name the field.
+pub fn load_existing_ca(startup: &Startup) -> anyhow::Result<Option<Ca>> {
+    if let Some((cert, key)) = startup.provided_ca().context("tls.ca_cert")? {
+        return Ca::load_provided(cert, key)
+            .map(Some)
+            .context("tls.ca_cert");
+    }
+    match Ca::load(&startup.ca_dir) {
+        Err(roxy_tls::CaError::NotFound(_)) => Ok(None),
+        loaded => loaded.map(Some).context("tls.ca_dir"),
+    }
+}
+
+/// The CA startup runs with: [`load_existing_ca`], or a new one generated
+/// in `tls.ca_dir` on first start. Its warnings go to the log.
+pub fn load_ca(startup: &Startup) -> anyhow::Result<Ca> {
+    let ca = if let Some(ca) = load_existing_ca(startup)? {
+        ca
     } else {
-        let dir = &config.tls.ca_dir;
-        match Ca::load(dir) {
-            Err(roxy_tls::CaError::NotFound(_)) => {
-                let ca = Ca::generate(dir)?;
-                tracing::info!(dir = %dir.display(), "generated new roxy CA");
-                ca
-            }
-            loaded => loaded?,
-        }
+        let ca = Ca::generate(&startup.ca_dir)?;
+        tracing::info!(dir = %startup.ca_dir.display(), "generated new roxy CA");
+        ca
     };
     for warning in ca.warnings() {
         tracing::warn!("{warning}");
@@ -108,8 +120,8 @@ pub fn load_ca(config: &Config) -> anyhow::Result<Ca> {
 }
 
 /// The flow sink configured by `log.flow`.
-pub fn build_sink(config: &Config) -> anyhow::Result<Arc<dyn FlowSink>> {
-    let f = &config.log.flow;
+pub fn build_sink(startup: &Startup) -> anyhow::Result<Arc<dyn FlowSink>> {
+    let f = &startup.flow;
     let opts = roxy_proxy::logging::WriterOptions {
         high_water: usize::try_from(f.high_water.as_u64()).unwrap_or(usize::MAX),
         ..roxy_proxy::logging::WriterOptions::default()
@@ -131,13 +143,13 @@ pub fn build_sink(config: &Config) -> anyhow::Result<Arc<dyn FlowSink>> {
 }
 
 /// The capture log under `capture_dir`, if set.
-pub fn build_capture(config: &Config) -> anyhow::Result<Option<Arc<CaptureLog>>> {
-    let Some(dir) = &config.capture_dir else {
+pub fn build_capture(startup: &Startup) -> anyhow::Result<Option<Arc<CaptureLog>>> {
+    let Some(dir) = &startup.capture_dir else {
         return Ok(None);
     };
-    let c = &config.log.capture;
+    let c = &startup.capture;
     let opts = roxy_proxy::CaptureOptions {
-        max_body_bytes: config.limits.max_capture_body_bytes.as_u64(),
+        max_body_bytes: startup.max_capture_body_bytes.as_u64(),
         all: c.all,
         writer: roxy_proxy::logging::WriterOptions {
             high_water: usize::try_from(c.high_water.as_u64()).unwrap_or(usize::MAX),
@@ -193,9 +205,8 @@ impl std::fmt::Debug for Reloader {
     }
 }
 
-pub(crate) fn listener_specs(config: &Config) -> anyhow::Result<Vec<ListenerSpec>> {
-    config
-        .listeners
+fn listener_specs(listeners: &[Listener]) -> anyhow::Result<Vec<ListenerSpec>> {
+    listeners
         .iter()
         .map(|l| {
             let mode = match l.mode {
@@ -214,48 +225,43 @@ pub(crate) fn listener_specs(config: &Config) -> anyhow::Result<Vec<ListenerSpec
         .collect()
 }
 
-/// Puts the running value of every setting that takes effect only at
-/// startup (listeners, the CA server, the CA and upstream
-/// TLS, connection caps, the state store size, the flow and capture log
-/// destinations) into `new`, and names each one that differed. The reload
-/// then validates and applies `new` as a whole, so a restart-only change is
-/// never half-applied.
-pub(crate) fn keep_restart_only(running: &Config, new: &mut Config) -> Vec<&'static str> {
-    let mut changed = Vec::new();
-    macro_rules! keep {
-        ($name:literal, $($field:ident).+) => {
-            if new.$($field).+ != running.$($field).+ {
-                changed.push($name);
-                new.$($field).+ = running.$($field).+.clone();
-            }
-        };
-    }
-    keep!("listeners", listeners);
-    keep!("ca_server", ca_server);
-    // `tls.require_sni_match` is per connection and reloads; the rest of
-    // `tls` is read once.
-    let tls = Tls {
-        require_sni_match: new.tls.require_sni_match,
-        ..running.tls.clone()
-    };
-    if new.tls != tls {
-        changed.push("tls");
-        new.tls = tls;
-    }
-    keep!("limits.max_connections", limits.max_connections);
-    keep!(
-        "limits.max_connections_per_client",
-        limits.max_connections_per_client
-    );
-    keep!("limits.max_state_entries", limits.max_state_entries);
-    keep!(
-        "limits.max_capture_body_bytes",
-        limits.max_capture_body_bytes
-    );
-    keep!("log.flow", log.flow);
-    keep!("log.capture", log.capture);
-    keep!("capture_dir", capture_dir);
-    changed
+/// What startup opens before the server starts: the resources the config
+/// names rather than the settings it holds.
+pub struct Opened {
+    pub ca: Arc<Ca>,
+    pub sink: Arc<dyn FlowSink>,
+    pub metrics: Arc<dyn MetricSource>,
+    pub state: Arc<dyn StateSource>,
+}
+
+/// The server's fixed configuration: the restart-only settings, read from
+/// `startup` and nowhere else, plus what startup opened. `policy` is the
+/// reloadable part.
+pub fn runtime_config(
+    startup: &Startup,
+    opened: Opened,
+    policy: PolicyUpdate,
+    placeholder_policy: bool,
+) -> anyhow::Result<RuntimeConfig> {
+    let minter = Arc::new(LeafMinter::new(opened.ca.clone(), startup.leaf_cache_size)?);
+    Ok(RuntimeConfig {
+        placeholder_policy,
+        listeners: listener_specs(&startup.listeners)?,
+        ca_server: startup.ca_server.as_ref().map(|c| c.bind),
+        ca: opened.ca,
+        minter,
+        upstream_tls: startup.into(),
+        dns: startup.into(),
+        max_connections: startup.max_connections,
+        max_connections_per_client: startup.per_client_cap(),
+        connection_events: startup.flow.connection_events,
+        ws_message_every: startup.flow.ws_message_every,
+        sink: opened.sink,
+        capture: build_capture(startup)?,
+        metrics: opened.metrics,
+        state: opened.state,
+        policy,
+    })
 }
 
 /// Puts the running restart-only values into `config` and validates the
@@ -268,7 +274,7 @@ fn validate_reload(
     config: &mut Config,
     path: &Path,
 ) -> Result<(Compiled, Vec<&'static str>), Vec<String>> {
-    let restart = keep_restart_only(running, config);
+    let restart = config.keep_startup(&running.startup());
     let compiled = validate_at(config, path).map_err(|mut diagnostics| {
         if !restart.is_empty() {
             diagnostics.push(format!(
@@ -312,6 +318,9 @@ impl Reloader {
                     path: self.path.clone(),
                     rules: config.rules.len(),
                 });
+                if let Some(w) = self.watch.get() {
+                    w.track(&self.path, &watched_files(&config));
+                }
                 *last = config;
                 true
             }
@@ -353,10 +362,13 @@ impl Reloader {
 
     fn load(&self, running: &Config) -> Result<(Config, Compiled, Vec<&'static str>), Vec<String>> {
         let mut config = Config::load(&self.path).map_err(|e| vec![format!("{e:#}")])?;
-        // Track the files even if this attempt fails, so fixing (or
-        // creating) a broken one triggers the next reload.
+        // Track the new file's files even if this attempt fails, so fixing
+        // (or creating) a broken one triggers the next reload, and the
+        // running policy's, which stay in use until an attempt succeeds.
         if let Some(w) = self.watch.get() {
-            w.track(&self.path, &watched_files(&config));
+            let mut files = watched_files(running);
+            files.extend(watched_files(&config));
+            w.track(&self.path, &files);
         }
         let (compiled, restart) = validate_reload(running, &mut config, &self.path)?;
         Ok((config, compiled, restart))
@@ -551,6 +563,9 @@ pub struct Running {
     pub server: Server,
     pub reloader: Arc<Reloader>,
     watcher: Option<Arc<Watch>>,
+    /// Reloads started by [`Running::reload_in_background`], every one of
+    /// which shutdown abandons.
+    reloads: Mutex<JoinSet<bool>>,
 }
 
 impl std::fmt::Debug for Running {
@@ -571,9 +586,29 @@ impl Running {
         }
     }
 
-    /// Graceful shutdown: stop accepting, drain for up to `grace`.
+    /// Starts a reload (`SIGHUP`) without waiting for it. Reloads serialise
+    /// on the [`Reloader`], so one started during another queues behind it;
+    /// shutdown abandons every one still queued or running.
+    pub fn reload_in_background(&self) {
+        let mut reloads = self.reloads.lock().unwrap_or_else(PoisonError::into_inner);
+        while reloads.try_join_next().is_some() {}
+        let reloader = self.reloader.clone();
+        reloads.spawn(async move { reloader.reload().await });
+    }
+
+    /// Graceful shutdown: abandon any reload in progress, stop accepting,
+    /// drain for up to `grace`.
     pub async fn shutdown(self, grace: Duration) {
         drop(self.watcher);
+        let mut reloads = self
+            .reloads
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        while reloads.try_join_next().is_some() {}
+        if !reloads.is_empty() {
+            tracing::warn!("shutting down during a config reload; the reload is abandoned");
+            reloads.shutdown().await;
+        }
         let sink = self.server.handle().sink();
         let capture = self.server.handle().capture();
         self.server.shutdown(grace).await;
@@ -610,11 +645,11 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
             ));
             (b.clone(), Some(b))
         };
-    let ca = Arc::new(load_ca(&config)?);
-    let minter = Arc::new(LeafMinter::new(ca.clone(), config.tls.leaf_cache_size)?);
+    let startup = config.startup();
+    let ca = Arc::new(load_ca(&startup)?);
     let sink = match opts.sink {
         Some(s) => s,
-        None => build_sink(&config)?,
+        None => build_sink(&startup)?,
     };
     sink.emit(&FlowEvent::ConfigLoaded {
         ts: chrono::Utc::now(),
@@ -624,28 +659,16 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
         metrics: config.metrics.len(),
         addons: config.addons.len(),
     });
-    let rt = RuntimeConfig {
-        placeholder_policy: false,
-        listeners: listener_specs(&config)?,
-        ca_server: config.ca_server.as_ref().map(|c| c.bind),
+    let state = opts
+        .state
+        .unwrap_or_else(|| Arc::new(crate::stores::BuiltinState::new(startup.max_state_entries)));
+    let opened = Opened {
         ca,
-        minter,
-        upstream_tls: (&config).into(),
-        max_connections: config.limits.max_connections,
-        max_connections_per_client: config.limits.max_connections_per_client,
-        connection_events: config.log.flow.connection_events,
-        ws_message_every: config.log.flow.ws_message_every,
         sink,
-        capture: build_capture(&config)?,
         metrics: metric_source,
-        state: opts.state.unwrap_or_else(|| {
-            Arc::new(crate::stores::BuiltinState::new(
-                config.limits.max_state_entries,
-            ))
-        }),
-        policy: update,
+        state,
     };
-    let server = Server::start(rt).await?;
+    let server = Server::start(runtime_config(&startup, opened, update, false)?).await?;
     let reloader = Arc::new(Reloader {
         path: path.to_path_buf(),
         handle: server.handle(),
@@ -663,6 +686,7 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
         server,
         reloader,
         watcher,
+        reloads: Mutex::new(JoinSet::new()),
     })
 }
 
@@ -687,6 +711,7 @@ mod tests {
             generated.cert_path(),
             dir.path().join("gen").join(roxy_tls::CA_KEY_FILE),
         ));
+        let c = c.startup();
         assert_eq!(load_ca(&c).unwrap().cert_der(), generated.cert_der());
 
         std::fs::remove_dir_all(dir.path().join("gen")).unwrap();
@@ -706,7 +731,7 @@ mod tests {
             path.display()
         ));
         c.validate().unwrap();
-        let sink = build_sink(&c).unwrap();
+        let sink = build_sink(&c.startup()).unwrap();
         for i in 0..200 {
             sink.emit(&FlowEvent::ConfigLoaded {
                 ts: chrono::Utc::now(),
@@ -733,50 +758,6 @@ mod tests {
             })
             .sum();
         assert_eq!(lines, 200);
-    }
-
-    /// The restart-only changes from `running` to `new`; a second pass over
-    /// the result finds none, since every one was put back.
-    fn restart(running: &str, new: &str) -> Vec<&'static str> {
-        let running = cfg(running);
-        let mut new = cfg(new);
-        let changed = keep_restart_only(&running, &mut new);
-        assert!(keep_restart_only(&running, &mut new).is_empty(), "kept");
-        changed
-    }
-
-    #[test]
-    fn listeners_need_a_restart() {
-        let base = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:443 }]\n";
-        let moved = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:8443 }]\n";
-        let renamed = "version: 1\nlisteners: [{ name: q, bind: 127.0.0.1:8443 }]\n";
-        assert_eq!(restart(base, moved), ["listeners"]);
-        assert_eq!(restart(moved, renamed), ["listeners"]);
-    }
-
-    #[test]
-    fn startup_sizes_and_log_destinations_need_a_restart() {
-        let base = "version: 1\n";
-        assert_eq!(
-            restart(base, "version: 1\nlimits: { max_state_entries: 5 }\n"),
-            ["limits.max_state_entries"]
-        );
-        assert_eq!(
-            restart(base, "version: 1\nlog: { flow: { path: /tmp/x.jsonl } }\n"),
-            ["log.flow"]
-        );
-        assert_eq!(
-            restart(base, "version: 1\ncapture_dir: /tmp/c\n"),
-            ["capture_dir"]
-        );
-        // Reloadable limits and log settings are not restart-only.
-        assert_eq!(
-            restart(
-                base,
-                "version: 1\nlimits: { max_header_bytes: 8kb }\nlog: { redact_headers: [x-a] }\n"
-            ),
-            Vec::<&str>::new()
-        );
     }
 
     /// A tracked path is hit by an event on it, on the file it resolves
@@ -814,43 +795,6 @@ mod tests {
         assert_eq!(t.files[&list], None);
         std::fs::write(&list, "10.0.0.0/8\n").unwrap();
         assert!(t.hit(&[root.join("unrelated")]));
-    }
-
-    /// Every setting the server reads once, at start, is kept on reload;
-    /// a change to any of them is named.
-    #[test]
-    fn startup_only_settings_need_a_restart() {
-        let base = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:443 }]\n";
-        for (yaml, field) in [
-            ("tls: { leaf_cache_size: 5 }", "tls"),
-            ("tls: { upstream: { min_version: \"1.3\" } }", "tls"),
-            ("ca_server: { bind: 127.0.0.1:3130 }", "ca_server"),
-            ("limits: { max_connections: 5 }", "limits.max_connections"),
-            (
-                "limits: { max_connections_per_client: 5 }",
-                "limits.max_connections_per_client",
-            ),
-            (
-                "limits: { max_capture_body_bytes: 1mb }",
-                "limits.max_capture_body_bytes",
-            ),
-            ("log: { capture: { all: true } }", "log.capture"),
-            ("log: { capture: { max_file_bytes: 1mb } }", "log.capture"),
-        ] {
-            assert_eq!(restart(base, &format!("{base}{yaml}\n")), [field], "{yaml}");
-        }
-        // The rest of `http` and `limits` reload, as does
-        // `tls.require_sni_match` alone among `tls`.
-        assert_eq!(
-            restart(
-                base,
-                &format!(
-                    "{base}http: {{ allow_http10: true, enable_h2: false }}\n\
-                     limits: {{ max_headers: 5 }}\ntls: {{ require_sni_match: false }}\n"
-                )
-            ),
-            Vec::<&str>::new()
-        );
     }
 
     /// The diagnostics for a reload that fails validation name the
@@ -939,5 +883,108 @@ mod tests {
             .expect("the running byte budget still applies");
         assert_eq!(m.key_count(), 4);
         running.shutdown(Duration::ZERO).await;
+    }
+
+    /// Starts roxy on `yaml` (written to `roxy.yaml` in `dir`) with a
+    /// memory sink.
+    async fn start_in(
+        dir: &Path,
+        yaml: &str,
+        watch: bool,
+    ) -> (PathBuf, Running, Arc<roxy_proxy::MemorySink>) {
+        let path = dir.join("roxy.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let sink = Arc::new(roxy_proxy::MemorySink::new());
+        let running = start(
+            &path,
+            StartOptions {
+                sink: Some(sink.clone()),
+                watch,
+                ..StartOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        (path, running, sink)
+    }
+
+    fn events(sink: &roxy_proxy::MemorySink, kind: &str) -> Vec<serde_json::Value> {
+        sink.events()
+            .into_iter()
+            .filter(|e| e["event"] == kind)
+            .collect()
+    }
+
+    async fn wait_events(sink: &roxy_proxy::MemorySink, kind: &str, n: usize) {
+        for _ in 0..200 {
+            if events(sink, kind).len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{n} {kind} events: {:?}", events(sink, kind));
+    }
+
+    /// A reload that fails validation keeps the running policy, so its
+    /// address-list files stay watched: a later change to one still
+    /// triggers a reload attempt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_reload_keeps_watching_the_running_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = dir.path().join("blocked.txt");
+        std::fs::write(&list, "192.0.2.0/24\n").unwrap();
+        let base = format!(
+            "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:0 }}]\ntls: {{ ca_dir: {:?} }}\n",
+            dir.path().join("ca")
+        );
+        let with_list = format!(
+            "{base}address_lists: [{{ name: blocked, file: {list:?} }}]\n\
+             rules: [{{ id: b, when: client.ip in @blocked, then: deny }}]\n"
+        );
+        let (path, running, sink) = start_in(dir.path(), &with_list, true).await;
+        let watched = || {
+            let w = running.reloader.watch.get().unwrap();
+            let t = w.targets.lock().unwrap_or_else(PoisonError::into_inner);
+            t.files.contains_key(&absolute(&list))
+        };
+        assert!(watched());
+
+        // Drops the list and is invalid: the running policy stays.
+        std::fs::write(
+            &path,
+            format!("{base}rules: [{{ id: b, when: client.ip in @blocked, then: deny }}]\n"),
+        )
+        .unwrap();
+        wait_events(&sink, "config_reload_failed", 1).await;
+        assert!(watched(), "the running policy's list file");
+
+        std::fs::write(&list, "192.0.2.0/24\n198.51.100.0/24\n").unwrap();
+        wait_events(&sink, "config_reload_failed", 2).await;
+        running.shutdown(Duration::ZERO).await;
+    }
+
+    /// Every reload started by `SIGHUP` and still pending at shutdown is
+    /// abandoned, including one queued behind another.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_abandons_every_queued_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:0 }}]\ntls: {{ ca_dir: {:?} }}\n",
+            dir.path().join("ca")
+        );
+        let (_, running, sink) = start_in(dir.path(), &yaml, false).await;
+        let reloader = running.reloader.clone();
+        // Held across shutdown, so both reloads are still queued then.
+        let held = reloader.last.lock().await;
+        running.reload_in_background();
+        running.reload_in_background();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        running.shutdown(Duration::ZERO).await;
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            events(&sink, "config_reloaded").is_empty(),
+            "a reload ran after shutdown"
+        );
     }
 }

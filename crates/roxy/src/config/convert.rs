@@ -1,6 +1,7 @@
-//! The one place config values become runtime types (`roxy_http::Limits`,
-//! `roxy_http::HttpFlags`, the proxy's HTTP behaviour, upstream settings,
-//! upstream TLS options).
+//! The one place config values become runtime types: the reloadable ones
+//! from `Config` (`roxy_http::Limits`, `roxy_http::HttpFlags`, the proxy's
+//! HTTP behaviour, upstream settings), the restart-only ones from
+//! [`Startup`] (upstream TLS options, DNS settings).
 
 use ipnet::IpNet;
 use roxy_http::url::parse_host;
@@ -11,7 +12,7 @@ use roxy_proxy::addrlist::normalise_net;
 use roxy_proxy::{DnsSettings, UpstreamSettings};
 use roxy_tls::{MinTlsVersion, UpstreamTlsOptions};
 
-use super::{Config, Resolver, TlsVersion, UpstreamVerify};
+use super::{Config, Resolver, Startup, TlsVersion, UpstreamVerify};
 
 fn usize_of(b: bytesize::ByteSize) -> usize {
     usize::try_from(b.as_u64()).unwrap_or(usize::MAX)
@@ -75,28 +76,33 @@ fn cidrs(nets: &[IpNet]) -> Vec<IpNet> {
     nets.iter().map(|n| normalise_net(n.trunc())).collect()
 }
 
+impl From<&Startup> for DnsSettings {
+    fn from(s: &Startup) -> Self {
+        let d = &s.dns;
+        DnsSettings {
+            servers: match &d.resolver {
+                Resolver::System => None,
+                Resolver::Servers(s) => Some(s.clone()),
+            },
+            cache_ttl_cap: d.cache_ttl_cap,
+            // Keyed on the canonical name the resolver is asked for;
+            // validation has refused any other spelling.
+            static_hosts: d
+                .static_hosts
+                .iter()
+                .filter_map(|(name, ip)| match parse_host(name.as_bytes()) {
+                    Ok(Host::Dns(name)) => Some((name, vec![*ip])),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+}
+
 impl From<&Config> for UpstreamSettings {
     fn from(c: &Config) -> Self {
         let u = &c.upstream;
         UpstreamSettings {
-            dns: DnsSettings {
-                servers: match &u.dns.resolver {
-                    Resolver::System => None,
-                    Resolver::Servers(s) => Some(s.clone()),
-                },
-                cache_ttl_cap: u.dns.cache_ttl_cap,
-                // Keyed on the canonical name the resolver is asked for;
-                // validation has refused any other spelling.
-                static_hosts: u
-                    .dns
-                    .static_hosts
-                    .iter()
-                    .filter_map(|(name, ip)| match parse_host(name.as_bytes()) {
-                        Ok(Host::Dns(name)) => Some((name, vec![*ip])),
-                        _ => None,
-                    })
-                    .collect(),
-            },
             address_policy: AddressPolicy {
                 deny_private_ranges: u.deny_private_ranges,
                 deny_cidrs: cidrs(&u.deny_cidrs),
@@ -112,9 +118,9 @@ impl From<&Config> for UpstreamSettings {
     }
 }
 
-impl From<&Config> for UpstreamTlsOptions {
-    fn from(c: &Config) -> Self {
-        let t = &c.tls.upstream;
+impl From<&Startup> for UpstreamTlsOptions {
+    fn from(s: &Startup) -> Self {
+        let t = &s.upstream_tls;
         UpstreamTlsOptions {
             extra_roots_pem: match t.verify {
                 UpstreamVerify::Strict => Vec::new(),
@@ -148,9 +154,9 @@ mod tests {
             "version: 1\nupstream:\n  dns:\n    static_hosts: { \"Upstream.Test.\": 127.0.0.1 }\n",
         )
         .unwrap();
-        let u = UpstreamSettings::from(&c);
+        let d = DnsSettings::from(&c.startup());
         assert_eq!(
-            u.dns.static_hosts.get("upstream.test"),
+            d.static_hosts.get("upstream.test"),
             Some(&vec!["127.0.0.1".parse().unwrap()])
         );
     }

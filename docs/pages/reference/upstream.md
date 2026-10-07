@@ -31,8 +31,10 @@ are: an IPv4-mapped entry (`::ffff:203.0.113.0/120`) becomes the IPv4 CIDR
 ## DNS
 
 roxy resolves names itself with `hickory-resolver` (the workload's own DNS
-is irrelevant; block it at the network layer). A and AAAA are both looked
-up. Several addresses are dialled one at a time, IPv4 and IPv6 alternating
+is irrelevant; block it at the network layer). The resolver and its cache
+are built once, at start: `upstream.dns` is a
+[restart-only setting](/guides/operations#restart-only-settings), and a
+reload keeps the cached answers. A and AAAA are both looked up. Several addresses are dialled one at a time, IPv4 and IPv6 alternating
 from the resolver's first, within one `connect_timeout` for all; each
 attempt gets an equal share of the time left.
 

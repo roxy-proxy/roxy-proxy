@@ -146,11 +146,18 @@ impl Tls {
     /// configured. `Config::validate` reports it too; this guards the CA
     /// commands, which skip validation.
     pub fn provided_ca(&self) -> anyhow::Result<Option<(&Path, &Path)>> {
-        match (&self.ca_cert, &self.ca_key) {
-            (Some(cert), Some(key)) => Ok(Some((cert, key))),
-            (None, None) => Ok(None),
-            _ => anyhow::bail!("tls.ca_cert and tls.ca_key must be set together"),
-        }
+        provided_ca(self.ca_cert.as_deref(), self.ca_key.as_deref())
+    }
+}
+
+fn provided_ca<'a>(
+    cert: Option<&'a Path>,
+    key: Option<&'a Path>,
+) -> anyhow::Result<Option<(&'a Path, &'a Path)>> {
+    match (cert, key) {
+        (Some(cert), Some(key)) => Ok(Some((cert, key))),
+        (None, None) => Ok(None),
+        _ => anyhow::bail!("tls.ca_cert and tls.ca_key must be set together"),
     }
 }
 
@@ -291,10 +298,11 @@ pub struct Limits {
     pub idle_timeout: Duration,
     /// Global cap on concurrent client connections.
     pub max_connections: usize,
-    /// Cap on concurrent connections from one client IP. Equal to
-    /// `max_connections` by default, so it only bites when lowered: behind a
-    /// load balancer every client arrives from one IP.
-    pub max_connections_per_client: usize,
+    /// Cap on concurrent connections from one client IP. Absent means
+    /// `max_connections`, so it only bites when lowered: behind a load
+    /// balancer every client arrives from one IP
+    /// ([`Startup::per_client_cap`]).
+    pub max_connections_per_client: Option<usize>,
     /// Client-side h2 (when it lands): concurrent streams per connection.
     pub h2_max_concurrent_streams: u32,
     /// Client-side h2: header list size cap per stream.
@@ -339,7 +347,7 @@ impl Default for Limits {
             response_header_timeout: Duration::from_mins(15),
             idle_timeout: Duration::from_hours(1),
             max_connections: 10_000,
-            max_connections_per_client: 10_000,
+            max_connections_per_client: None,
             h2_max_concurrent_streams: 100,
             h2_max_header_list_bytes: ByteSize::b(64 * KIB),
             max_metric_keys: 100_000,
@@ -397,7 +405,7 @@ impl Default for Upstream {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Dns {
     pub resolver: Resolver,
@@ -810,6 +818,83 @@ impl Config {
                 .iter()
                 .flat_map(|r| r.then.0.iter())
                 .any(|a| matches!(a, Action::Capture(_)))
+    }
+}
+
+// ----- startup --------------------------------------------------------------
+
+/// The settings the server reads once, at start: each is a field of
+/// [`Startup`] and the `Config` path it comes from, whose spelling names it
+/// in reload warnings and in the docs. Everything else is reloadable and
+/// reaches the server through `PolicyUpdate`.
+macro_rules! startup_settings {
+    ($($(#[$attr:meta])* $field:ident: $ty:ty = $($path:ident).+;)+) => {
+        /// The settings that take effect only when roxy starts. The server
+        /// is wired from this alone, so a setting it needs has to be
+        /// declared here, where a reload keeps the running value
+        /// ([`Config::keep_startup`]).
+        #[derive(Debug, Clone, PartialEq)]
+        pub struct Startup {
+            $($(#[$attr])* pub $field: $ty,)+
+        }
+
+        impl Startup {
+            /// Every restart-only setting by config path.
+            pub const NAMES: &'static [&'static str] = &[$(stringify!($($path).+),)+];
+        }
+
+        impl Config {
+            /// The restart-only settings.
+            pub fn startup(&self) -> Startup {
+                Startup { $($field: self.$($path).+.clone(),)+ }
+            }
+
+            /// Puts the `running` values of the restart-only settings into
+            /// `self` and names each one that differed, so a reload applies
+            /// `self` as a whole and a restart-only change is never
+            /// half-applied.
+            pub fn keep_startup(&mut self, running: &Startup) -> Vec<&'static str> {
+                let mut changed = Vec::new();
+                $(if self.$($path).+ != running.$field {
+                    changed.push(stringify!($($path).+));
+                    self.$($path).+ = running.$field.clone();
+                })+
+                changed
+            }
+        }
+    };
+}
+
+startup_settings! {
+    listeners: Vec<Listener> = listeners;
+    ca_server: Option<CaServer> = ca_server;
+    ca_dir: PathBuf = tls.ca_dir;
+    ca_cert: Option<PathBuf> = tls.ca_cert;
+    ca_key: Option<PathBuf> = tls.ca_key;
+    leaf_cache_size: usize = tls.leaf_cache_size;
+    upstream_tls: TlsUpstream = tls.upstream;
+    dns: Dns = upstream.dns;
+    max_connections: usize = limits.max_connections;
+    max_connections_per_client: Option<usize> = limits.max_connections_per_client;
+    max_state_entries: usize = limits.max_state_entries;
+    max_capture_body_bytes: ByteSize = limits.max_capture_body_bytes;
+    flow: FlowLog = log.flow;
+    capture: CaptureLog = log.capture;
+    capture_dir: Option<PathBuf> = capture_dir;
+}
+
+impl Startup {
+    /// The per-client connection cap in force: `max_connections_per_client`,
+    /// or `max_connections` when it is absent.
+    pub fn per_client_cap(&self) -> usize {
+        self.max_connections_per_client
+            .unwrap_or(self.max_connections)
+    }
+
+    /// The provided CA's certificate and key paths, if both are set
+    /// ([`Tls::provided_ca`]).
+    pub fn provided_ca(&self) -> anyhow::Result<Option<(&Path, &Path)>> {
+        provided_ca(self.ca_cert.as_deref(), self.ca_key.as_deref())
     }
 }
 

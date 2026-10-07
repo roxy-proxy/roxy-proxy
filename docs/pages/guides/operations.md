@@ -35,8 +35,11 @@ reason on stderr.
 `roxy check --config <file>` runs the part of startup that opens no socket
 and writes no file: parse, validate, compile the rules and the WASM
 addons, load the address lists, load a provided CA (`tls.ca_cert`,
-`tls.ca_key`), read `tls.upstream.extra_roots` and build the resolver.
-Diagnostics carry the config path, rule id and position. It leaves to
+`tls.ca_key`), read `tls.upstream.extra_roots` and build the resolver. It
+loads the CA through the same function startup does, so the warnings
+startup logs about it (a key readable by others, a certificate close to
+expiry) are printed by `check` as `warning:` lines. Diagnostics carry the
+config path, rule id and position. It leaves to
 startup resolving `secrets` from the environment, generating a CA in
 `tls.ca_dir`, opening `log.flow.path` and `capture_dir`, and binding the
 listeners.
@@ -63,13 +66,18 @@ gone (and is then failed closed).
 ### Restart-only settings
 
 Some settings take effect only when roxy starts: `listeners`, `ca_server`,
-`dns`, `tls` (except `tls.require_sni_match`), `limits.max_connections`,
+`tls.ca_dir`, `tls.ca_cert`, `tls.ca_key`, `tls.leaf_cache_size`,
+`tls.upstream`, `upstream.dns`, `limits.max_connections`,
 `limits.max_connections_per_client`, `limits.max_state_entries`,
 `limits.max_capture_body_bytes`, `log.flow`, `log.capture` and
 `capture_dir`. A reload keeps their running values, applies everything
 else, and warns naming each one that changed. The new config is validated
 with the running values; when that fails, the diagnostics name the
 restart-only settings the file changed.
+
+The resolver is one of them: its cache serves every policy, so a reload
+that touches only rules or lists keeps every cached answer. The upstream
+connection pools are the snapshot's and start empty on each reload.
 
 A connection takes `tls.require_sni_match`, `http.enable_h2`,
 `http.allow_plain_in_connect` and the `limits` and `http` parsing settings

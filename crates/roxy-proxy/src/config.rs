@@ -18,7 +18,7 @@ use crate::addrlist::AddressLists;
 use crate::flowlog::{FlowSink, Redactor};
 use crate::listener::ListenerMode;
 use crate::sources::{MetricSource, StateSource};
-use crate::upstream::UpstreamSettings;
+use crate::upstream::{DnsSettings, UpstreamSettings};
 
 /// One listener to bind.
 #[derive(Debug, Clone)]
@@ -37,6 +37,9 @@ pub struct RuntimeConfig {
     pub minter: Arc<LeafMinter>,
     /// `tls.upstream.*`.
     pub upstream_tls: UpstreamTlsOptions,
+    /// `upstream.dns.*`: one resolver, with one cache, for the life of the
+    /// server.
+    pub dns: DnsSettings,
     /// `limits.max_connections`.
     pub max_connections: usize,
     /// `limits.max_connections_per_client`.

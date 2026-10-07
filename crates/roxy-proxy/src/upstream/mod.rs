@@ -49,10 +49,10 @@ pub use dns::DnsSettings;
 
 use crate::addr::{AddressDenied, AddressPolicy, PrivateAddrs};
 
-/// `upstream.*` settings that may change on reload.
+/// `upstream.*` settings that may change on reload. The resolver is not
+/// one: `upstream.dns` is read once, at start ([`crate::RuntimeConfig::dns`]).
 #[derive(Debug, Clone)]
 pub struct UpstreamSettings {
-    pub dns: DnsSettings,
     pub address_policy: AddressPolicy,
     pub connect_timeout: Duration,
     /// Idle pooled connections are closed after this long.
@@ -84,7 +84,6 @@ impl std::fmt::Debug for TestDial {
 impl Default for UpstreamSettings {
     fn default() -> Self {
         Self {
-            dns: DnsSettings::default(),
             address_policy: AddressPolicy::default(),
             connect_timeout: Duration::from_secs(10),
             pool_idle_timeout: Duration::from_secs(90),
@@ -710,8 +709,9 @@ impl std::fmt::Debug for Upstream {
 }
 
 impl Upstream {
-    pub(crate) fn new(s: &UpstreamSettings, tls: &Arc<ClientConfig>) -> Result<Self, String> {
-        let dns = Arc::new(Dns::new(&s.dns)?);
+    /// Pools and connectors for one snapshot. `dns` is the server's: its
+    /// cache outlives the snapshot.
+    pub(crate) fn new(s: &UpstreamSettings, dns: &Arc<Dns>, tls: &Arc<ClientConfig>) -> Self {
         let mut http1 = (**tls).clone();
         http1.alpn_protocols = vec![b"http/1.1".to_vec()];
         let http1_tls = Arc::new(http1);
@@ -745,10 +745,10 @@ impl Upstream {
                 inner,
             }
         };
-        Ok(Self {
+        Self {
             strict: pools(PrivateAddrs::Deny),
             private: pools(PrivateAddrs::Allow),
-        })
+        }
     }
 
     fn pools(&self, private: PrivateAddrs) -> &Pools {
@@ -893,26 +893,37 @@ mod tests {
         (port, accepted)
     }
 
-    /// Settings whose dial records each address and hands it to `connect`.
-    fn dialing(
-        hosts: &[(&str, &[&str])],
-        connect: impl Fn(SocketAddr) -> TestDialFuture + Send + Sync + 'static,
-    ) -> (UpstreamSettings, Arc<Mutex<Vec<SocketAddr>>>) {
-        let mut s = UpstreamSettings::default();
-        s.dns.servers = Some(vec!["127.0.0.1:9".parse().unwrap()]);
+    /// A resolver answering `hosts` and nothing else: real DNS is never
+    /// consulted.
+    fn static_dns(hosts: &[(&str, &[&str])]) -> Arc<Dns> {
+        let mut s = DnsSettings {
+            servers: Some(vec!["127.0.0.1:9".parse().unwrap()]),
+            ..DnsSettings::default()
+        };
         for (name, ips) in hosts {
-            s.dns.static_hosts.insert(
+            s.static_hosts.insert(
                 (*name).to_owned(),
                 ips.iter().map(|ip| ip.parse().unwrap()).collect(),
             );
         }
+        Arc::new(Dns::new(&s).unwrap())
+    }
+
+    /// Settings whose dial records each address and hands it to `connect`,
+    /// with a resolver for `hosts`.
+    fn dialing(
+        hosts: &[(&str, &[&str])],
+        connect: impl Fn(SocketAddr) -> TestDialFuture + Send + Sync + 'static,
+    ) -> (UpstreamSettings, Arc<Dns>, Arc<Mutex<Vec<SocketAddr>>>) {
+        let mut s = UpstreamSettings::default();
+        let dns = static_dns(hosts);
         let dialled = Arc::new(Mutex::new(Vec::new()));
         let seen = dialled.clone();
         s.dial = Some(TestDial(Arc::new(move |addr| {
             seen.lock().unwrap().push(addr);
             connect(addr)
         })));
-        (s, dialled)
+        (s, dns, dialled)
     }
 
     fn tls() -> Arc<ClientConfig> {
@@ -981,7 +992,7 @@ mod tests {
             ..roxy_tls::UpstreamTlsOptions::default()
         })
         .unwrap();
-        let (s, dialled) = dialing(&[("go.test", &["93.184.216.34"])], move |_| {
+        let (s, dns, dialled) = dialing(&[("go.test", &["93.184.216.34"])], move |_| {
             let (ours, theirs) = tokio::io::duplex(64 * 1024);
             let acceptor = tokio_rustls::TlsAcceptor::from(server.clone());
             tokio::spawn(async move {
@@ -991,7 +1002,7 @@ mod tests {
             });
             Box::pin(async move { Ok(Box::new(theirs) as BoxIo) })
         });
-        (Upstream::new(&s, &client).unwrap(), dialled)
+        (Upstream::new(&s, &dns, &client), dialled)
     }
 
     fn goaway_get() -> http::Request<Body> {
@@ -1046,10 +1057,10 @@ mod tests {
     #[tokio::test]
     async fn unroutable_addresses_share_one_connect_timeout() {
         let ips = ["93.184.216.1", "93.184.216.2", "2606:4700::1"];
-        let (mut s, dialled) =
+        let (mut s, dns, dialled) =
             dialing(&[("many.test", &ips)], |_| Box::pin(std::future::pending()));
         s.connect_timeout = Duration::from_millis(300);
-        let up = Upstream::new(&s, &tls()).unwrap();
+        let up = Upstream::new(&s, &dns, &tls());
         let authority = Authority::new(Host::Dns("many.test".into()), 80);
         let started = std::time::Instant::now();
         let Err(err) = up
@@ -1078,12 +1089,12 @@ mod tests {
     #[tokio::test]
     async fn ipv6_targets_are_dialled() {
         let ip = "2606:4700::1111";
-        let (s, dialled) = dialing(&[("v6.test", &[ip])], |_| {
+        let (s, dns, dialled) = dialing(&[("v6.test", &[ip])], |_| {
             let (ours, theirs) = tokio::io::duplex(16 * 1024);
             tokio::spawn(answer_ok(ours));
             Box::pin(async move { Ok(Box::new(theirs) as BoxIo) })
         });
-        let up = Upstream::new(&s, &tls()).unwrap();
+        let up = Upstream::new(&s, &dns, &tls());
         for host in [format!("[{ip}]"), "v6.test".to_owned()] {
             let req = http::Request::get(format!("http://{host}:8080/"))
                 .body(Body::empty())
@@ -1101,10 +1112,6 @@ mod tests {
 
     fn settings(lists: Vec<Arc<AddressList>>) -> UpstreamSettings {
         let mut s = UpstreamSettings::default();
-        s.dns.servers = Some(vec!["127.0.0.1:9".parse().unwrap()]);
-        s.dns
-            .static_hosts
-            .insert("listed.test".into(), vec!["127.0.0.1".parse().unwrap()]);
         s.address_policy.deny_lists = lists;
         s
     }
@@ -1124,7 +1131,8 @@ mod tests {
         let tls = roxy_tls::client_config(&roxy_tls::UpstreamTlsOptions::default()).unwrap();
         let (port, accepted) = tiny_server().await;
 
-        let before = Upstream::new(&settings(Vec::new()), &tls).unwrap();
+        let dns = static_dns(&[("listed.test", &["127.0.0.1"])]);
+        let before = Upstream::new(&settings(Vec::new()), &dns, &tls);
         for _ in 0..2 {
             let res = before
                 .client(PrivateAddrs::Allow, Protocols::Any)
@@ -1136,7 +1144,7 @@ mod tests {
         assert_eq!(accepted.load(Ordering::SeqCst), 1, "second request pooled");
 
         let list = Arc::new(AddressList::parse("blocked", "127.0.0.1\n").unwrap());
-        let after = Upstream::new(&settings(vec![list]), &tls).unwrap();
+        let after = Upstream::new(&settings(vec![list]), &dns, &tls);
         let authority = Authority::new(Host::Dns("listed.test".into()), port);
         let Err(ConnectError::Denied(d)) = after.preflight(&authority, PrivateAddrs::Allow).await
         else {

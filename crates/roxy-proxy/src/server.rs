@@ -26,7 +26,7 @@ use crate::listener::{ClientConn, Listener, ListenerMode, TcpProxyListener};
 use crate::pipeline::client_info;
 use crate::secrets::SecretStore;
 use crate::sources::{MetricSource, StateSource};
-use crate::upstream::Upstream;
+use crate::upstream::{Dns, Upstream};
 
 /// Everything that a reload swaps, as one unit. Each exchange clones the
 /// `Arc` at its start and finishes under that snapshot, except for the
@@ -50,7 +50,8 @@ pub(crate) struct Snapshot {
     pub limits: Arc<Limits>,
     pub flags: Arc<HttpFlags>,
     pub http: Arc<HttpBehaviour>,
-    /// Rebuilt on every reload, which also flushes the upstream pools.
+    /// Rebuilt on every reload, which also flushes the upstream pools; the
+    /// resolver inside is the server's and keeps its cache.
     pub upstream: Arc<Upstream>,
     /// Address lists for `ip in @name` (and, resolved into the upstream's
     /// address policy, `upstream.deny_lists`).
@@ -138,6 +139,7 @@ pub(crate) struct Shared {
     pub ca: Arc<Ca>,
     pub minter: Arc<LeafMinter>,
     upstream_tls: Arc<ClientConfig>,
+    dns: Arc<Dns>,
     pub connection_events: bool,
     /// `log.flow.ws_message_every`: log every Nth checked WebSocket message
     /// (0: only denied ones).
@@ -199,7 +201,7 @@ impl Shared {
     }
 
     fn build_snapshot(&self, u: PolicyUpdate) -> Result<Snapshot, String> {
-        build_snapshot(u, &self.upstream_tls, &self.secrets)
+        build_snapshot(u, &self.dns, &self.upstream_tls, &self.secrets)
     }
 
     /// Reserves `bytes` of the buffer budget, or `None` when that would
@@ -266,8 +268,12 @@ impl Shared {
     }
 }
 
+/// Builds a snapshot from the reloadable part of the config. Everything
+/// read once at start ([`RuntimeConfig`]) reaches it only as the server's
+/// built state: the resolver, the upstream TLS config, the secret store.
 fn build_snapshot(
     u: PolicyUpdate,
+    dns: &Arc<Dns>,
     tls: &Arc<ClientConfig>,
     secrets: &Arc<SecretStore>,
 ) -> Result<Snapshot, String> {
@@ -281,7 +287,7 @@ fn build_snapshot(
             .ok_or_else(|| format!("upstream.deny_lists: address list {name:?} is not loaded"))?;
         settings.address_policy.deny_lists.push(list.clone());
     }
-    let upstream = Upstream::new(&settings, tls)?;
+    let upstream = Upstream::new(&settings, dns, tls);
     Ok(Snapshot {
         policy: u.policy,
         valid_until: ArcSwapOption::from_pointee(u.valid_until),
@@ -442,12 +448,14 @@ impl Server {
         roxy_tls::install_crypto_provider();
         let upstream_tls = roxy_tls::client_config(&cfg.upstream_tls)
             .map_err(|e| StartError(format!("upstream TLS configuration: {e}")))?;
+        let dns =
+            Arc::new(Dns::new(&cfg.dns).map_err(|e| StartError(format!("upstream.dns: {e}")))?);
         let mut policy = cfg.policy;
         let secrets = Arc::new(SecretStore::new(
             std::mem::take(&mut policy.secrets),
             std::mem::take(&mut policy.redactor),
         ));
-        let mut snap = build_snapshot(policy, &upstream_tls, &secrets).map_err(StartError)?;
+        let mut snap = build_snapshot(policy, &dns, &upstream_tls, &secrets).map_err(StartError)?;
         snap.placeholder = cfg.placeholder_policy;
         let shared = Arc::new(Shared {
             snapshot: ArcSwap::from_pointee(snap),
@@ -459,6 +467,7 @@ impl Server {
             ca: cfg.ca,
             minter: cfg.minter,
             upstream_tls,
+            dns,
             connection_events: cfg.connection_events,
             ws_message_every: cfg.ws_message_every,
             layer_state: crate::addons::store::LayerStates::default(),

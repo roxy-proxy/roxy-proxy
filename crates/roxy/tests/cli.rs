@@ -319,6 +319,45 @@ fn check_fails_where_startup_would() {
     assert_eq!(std::fs::read_to_string(&ca_key).unwrap(), "not a key\n");
 }
 
+/// `check` loads the CA through the function startup uses, so the warnings
+/// startup would log reach the operator from CI too.
+#[test]
+fn check_prints_the_ca_warnings_startup_logs() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut params = rcgen::CertificateParams::default();
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "nearly expired");
+    params.not_after = (std::time::SystemTime::now() + std::time::Duration::from_hours(72)).into();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key).unwrap();
+    let cert_path = dir.path().join("ca.pem");
+    let key_path = dir.path().join("ca.key");
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
+    let cfg = dir.path().join("roxy.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:0 }}]\n\
+             tls: {{ ca_cert: {cert_path:?}, ca_key: {key_path:?} }}\n"
+        ),
+    )
+    .unwrap();
+
+    let out = roxy(&["check", "--config", cfg.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let err = text(&out.stderr);
+    let prefix = format!("{}: warning: CA certificate", cfg.display());
+    assert!(
+        err.lines()
+            .any(|l| l.starts_with(&prefix) && l.contains("expires")),
+        "{err}"
+    );
+}
+
 #[test]
 fn run_fails_on_missing_secret() {
     let dir = tempfile::tempdir().unwrap();

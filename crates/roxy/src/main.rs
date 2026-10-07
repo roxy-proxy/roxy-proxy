@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use roxy_proxy::{Redactor, UpstreamSettings};
+use roxy_proxy::{DnsSettings, Redactor};
 use roxy_rules::Condition;
 use roxy_tls::{Ca, CaError, UpstreamTlsOptions};
 use tracing_subscriber::EnvFilter;
@@ -562,7 +562,10 @@ fn check(path: &Path) -> ExitCode {
             for w in roxy_rules::Policy::metric_warnings(&config.metrics) {
                 eprintln!("{}:{}: warning: {}", path.display(), w.path, w.message);
             }
-            let errs = startup_checks(&config, addon_conditions);
+            let (warnings, errs) = startup_checks(&config, addon_conditions);
+            for w in warnings {
+                eprintln!("{}: warning: {w}", path.display());
+            }
             if !errs.is_empty() {
                 for e in &errs {
                     eprintln!("{}:{e}", path.display());
@@ -604,11 +607,16 @@ fn check(path: &Path) -> ExitCode {
 }
 
 /// The rest of startup's loading that needs no socket and writes nothing:
-/// compiling the addons, loading the CA (a provided one, else the one in
-/// `tls.ca_dir`; a missing one there is startup's to generate, never
-/// here), reading `tls.upstream.extra_roots` and building the resolver.
-/// Every failure is reported as `<field>: <why>`.
-fn startup_checks(config: &Config, addon_conditions: Vec<Option<Condition>>) -> Vec<String> {
+/// compiling the addons, loading the CA (through the function startup
+/// uses, so its warnings are startup's; a CA missing from `tls.ca_dir` is
+/// startup's to generate, never here), reading `tls.upstream.extra_roots`
+/// and building the resolver. Returns the warnings and the errors, each
+/// error as `<field>: <why>`.
+fn startup_checks(
+    config: &Config,
+    addon_conditions: Vec<Option<Condition>>,
+) -> (Vec<String>, Vec<String>) {
+    let mut warnings = Vec::new();
     let mut errs = Vec::new();
     let addons = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -618,25 +626,19 @@ fn startup_checks(config: &Config, addon_conditions: Vec<Option<Condition>>) -> 
     if let Err(e) = addons {
         errs.push(format!("addons: {e:#}"));
     }
-    match config.tls.provided_ca() {
-        Ok(Some((cert, key))) => {
-            if let Err(e) = Ca::load_provided(cert, key) {
-                errs.push(format!("tls.ca_cert: {e}"));
-            }
-        }
-        Ok(None) => match Ca::load(&config.tls.ca_dir) {
-            Ok(_) | Err(roxy_tls::CaError::NotFound(_)) => {}
-            Err(e) => errs.push(format!("tls.ca_dir: {e}")),
-        },
-        Err(e) => errs.push(format!("tls.ca_cert: {e}")),
+    let startup = config.startup();
+    match roxy::run::load_existing_ca(&startup) {
+        Ok(Some(ca)) => warnings.extend(ca.warnings().iter().cloned()),
+        Ok(None) => {}
+        Err(e) => errs.push(format!("{e:#}")),
     }
-    if let Err(e) = roxy_tls::client_config(&UpstreamTlsOptions::from(config)) {
+    if let Err(e) = roxy_tls::client_config(&UpstreamTlsOptions::from(&startup)) {
         errs.push(format!("tls.upstream.extra_roots: {e}"));
     }
-    if let Err(e) = UpstreamSettings::from(config).dns.check() {
+    if let Err(e) = DnsSettings::from(&startup).check() {
         errs.push(format!("upstream.dns.resolver: {e}"));
     }
-    errs
+    (warnings, errs)
 }
 
 fn ca_init(path: &Path, force: bool) -> anyhow::Result<ExitCode> {
@@ -805,36 +807,27 @@ fn run_node(args: RunArgs) -> anyhow::Result<ExitCode> {
 }
 
 /// Waits for ctrl-c or SIGTERM; on SIGHUP meanwhile, reopens the flow log
-/// file (for external log rotation) and reloads the config. The reload runs
-/// as its own task (the `Reloader` serialises overlapping ones), so a
-/// shutdown signal during a long reload is seen at once; a reload still in
-/// flight then is cancelled, which leaves the running policy in place.
+/// file (for external log rotation) and reloads the config. The reload
+/// runs in the background, so a shutdown signal during a long reload is
+/// seen at once; shutdown then abandons it, leaving the running policy in
+/// place.
 async fn wait_for_shutdown(running: &roxy::run::Running) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
         let mut term = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
         let mut hup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
-        let mut reload: Option<tokio::task::JoinHandle<bool>> = None;
-        let result = loop {
+        loop {
             tokio::select! {
                 r = tokio::signal::ctrl_c() => break r.context("waiting for ctrl-c"),
                 _ = term.recv() => break Ok(()),
                 _ = hup.recv() => {
                     tracing::info!("SIGHUP: reopening logs and reloading config");
                     running.reopen_logs();
-                    let reloader = running.reloader.clone();
-                    reload = Some(tokio::spawn(async move { reloader.reload().await }));
+                    running.reload_in_background();
                 }
             }
-        };
-        if let Some(task) = reload
-            && !task.is_finished()
-        {
-            tracing::warn!("shutting down during a config reload; the reload is abandoned");
-            task.abort();
         }
-        result
     }
     #[cfg(not(unix))]
     {
