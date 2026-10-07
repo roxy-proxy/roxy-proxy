@@ -427,7 +427,7 @@ components:
         flow:
           $ref: "#/components/schemas/FlowSettings"
         interception_ca:
-          description: Reserved for a later version. A v1 server must not send it; a v1 node ignores it.
+          description: Reserved; a v1 server does not send it and a v1 node ignores it.
           not: {}
 
     FlowEvent:

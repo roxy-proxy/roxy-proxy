@@ -1,17 +1,9 @@
 # Secrets
 
-`secrets:` maps names to where each value comes from: an environment
-variable, a file, or the control-plane lease (`{ lease: true }`), which
-supplies the value at runtime. `${secret:name}` in a head rule's
-`set_header` value or `sign` credentials (or an addon endpoint's `headers`)
-injects the value, so the client only ever holds a placeholder; a secret
-reference anywhere else in a rule is a compile error. `env` and `file`
-secrets are resolved when roxy starts and on reload, and one that is missing
-or empty is a fatal start or reload error. At evaluation time a missing
-secret fails the flow closed (`_fail_closed`, reason `secret_missing`), and
-so does one that is not a valid header value (`secret_invalid`). Every
-injected value is redacted from the flow log and capture heads. `roxy check`
-and `roxy rule test` do not resolve secrets.
+`secrets:` maps names to sources. `${secret:name}` in a head rule's
+`set_header` value or `sign` credentials, or an addon endpoint's `headers`,
+injects the value; the client holds only a placeholder. A reference
+anywhere else is a compile error.
 
 ```yaml
 secrets:
@@ -23,22 +15,24 @@ rules:
   - id: openai
     when: host == "api.openai.com" and path starts_with "/v1/" and method == POST
     then:
-      - set_header: { authorization: "Bearer ${secret:openai}" }
+      - set_header: { authorization: "Bearer ${secret:openai}" }   # replaces whatever the client sent
       - allow
 ```
 
-The client can send any placeholder in `authorization`; `set_header`
-replaces it before the request is forwarded.
+- Exactly one of `env`, `file`, `lease: true`; `{}`, `null`, a bare word
+  and `lease: false` are parse errors.
+- `env` and `file` resolve at start and on reload; missing or empty is
+  fatal. `roxy check` and `roxy rule test` do not resolve secrets.
+- At evaluation, a missing secret fails closed (`_fail_closed`, reason
+  `secret_missing`); one that is not a valid header value, `secret_invalid`.
+- Injected values are redacted from the flow log and capture heads.
 
 ## Signing AWS requests
 
-`sign: { aws_sigv4: ... }` is a head-rule action that signs the outgoing
-request with AWS Signature Version 4, so a client holding placeholder
-credentials reaches AWS with real ones that never enter its environment.
-The three credential fields take `${secret:name}` under the same rules as
-`set_header` values (head rules only; an undefined name is a compile
-error; a name missing at evaluation fails the flow closed with
-`secret_missing`). `session_token` is optional.
+`sign: { aws_sigv4: ... }`, a head-rule action, signs the forwarded request
+with AWS Signature Version 4, so a client holding placeholder credentials
+reaches AWS with a real signature. Credential fields take `${secret:name}` as
+`set_header` does; `session_token` is optional.
 
 ```yaml
 secrets:
@@ -60,64 +54,49 @@ rules:
       - allow
 ```
 
-The signature covers the request as it is forwarded, after every other
-head effect (`set_header`, `rewrite_path`, `redirect`, ...), whatever the
-action's position in `then`. First the client's `authorization`,
-`x-amz-date`, `x-amz-security-token` and `x-amz-content-sha256` are
-removed. `host` is always signed, as it goes upstream. The hop-by-hop and
-framing fields roxy re-serialises (`connection`, `transfer-encoding`,
-`content-length`, `accept-encoding`, `te`, `trailer`, `upgrade`,
-`keep-alive`, `proxy-connection`), and `user-agent` and
-`x-amzn-trace-id`, which intermediaries change, are never signed; every
-other header is. A header whose value is not UTF-8 (obs-text, accepted
-under `http.allow_obs_text`) cannot be signed, so the request is refused
-with `400` (`terminal_rule: _sign`, `reason: sign_header_invalid`) rather
-than forwarded with that header outside the signature. `service` is the
-signing name (`bedrock`, `s3`, `execute-api`, ...), and `s3`, `s3-control`
-and `s3-outposts` use the S3 variant of the algorithm (the path encoded
-once, not normalised, and the payload hash sent as `x-amz-content-sha256`).
-
-A request whose query carries `X-Amz-Signature` is presigned, and `sign`
-does not cover it: it goes out under the client's query signature, with
-the client's `authorization` and `x-amz-*` signature headers stripped and
-no signature of roxy's. The flow log records `sign:presigned` in
-`mutations` in place of `sign:aws_sigv4`. Such a request reaches AWS as
-whoever signed the URL, so the rule's `host` and `path` conditions are
-what bound where it may go. Two matching rules that both sign fail the
-flow closed (`sign_conflict`).
-
-The payload hash needs the whole body, so a request with a body is
-buffered up to `limits.max_sign_body_bytes` (100 MiB) before it is signed
-and forwarded. A body over that, declared or chunked, is refused with
-`413` (`terminal_rule: _sign`, `reason: sign_body_too_large`) and the
-connection closed. `unsigned_payload: true` signs `UNSIGNED-PAYLOAD`
-instead and streams the body with no buffering; only S3 accepts it, so it
-is a config error with any other `service`.
-
-The flow log records `sign:aws_sigv4` in `mutations`. The injected
-credentials are redacted from the flow log and capture heads like any
-secret. `roxy rule test` shows the effect as `sign aws_sigv4 service=...
-region=...` without computing a signature, and `roxy check` validates the
-block.
+- **Signed:** the request as forwarded, after every other head effect
+  (`set_header`, `rewrite_path`, `redirect`, ...) whatever `sign`'s
+  position in `then`. The client's `authorization`, `x-amz-date`,
+  `x-amz-security-token` and `x-amz-content-sha256` are removed first.
+  `host` is signed as sent upstream. Not signed: `connection`,
+  `transfer-encoding`, `content-length`, `accept-encoding`, `te`,
+  `trailer`, `upgrade`, `keep-alive`, `proxy-connection` (re-serialised by
+  roxy), `user-agent`, `x-amzn-trace-id` (changed by intermediaries).
+  Every other header is. A non-UTF-8 header value (obs-text, under
+  `http.allow_obs_text`) is refused with `400` (`terminal_rule: _sign`,
+  `reason: sign_header_invalid`).
+- **`service`** is the signing name (`bedrock`, `s3`, `execute-api`, ...).
+  `s3`, `s3-control` and `s3-outposts` use the S3 variant: path encoded
+  once, not normalised; payload hash sent as `x-amz-content-sha256`.
+- **Presigned:** a request whose query carries `X-Amz-Signature` goes out
+  under the client's query signature, its `authorization` and `x-amz-*`
+  signature headers stripped, no signature of roxy's; `mutations` records
+  `sign:presigned`. It reaches AWS as whoever signed the URL; the rule's
+  `host` and `path` conditions bound where it may go.
+- **Two matching rules that both sign** fail closed (`sign_conflict`).
+- **Body:** buffered up to `limits.max_sign_body_bytes` (100 MiB) for the
+  payload hash; over that, declared or chunked, is `413` (`terminal_rule:
+  _sign`, `reason: sign_body_too_large`) and the connection closed.
+  `unsigned_payload: true` signs `UNSIGNED-PAYLOAD` and streams the body;
+  only S3 accepts it, so it is a config error with any other `service`.
+- **Tools:** `mutations` records `sign:aws_sigv4`; the credentials are
+  redacted like any secret. `roxy rule test` shows `sign aws_sigv4
+  service=... region=...` without computing a signature; `roxy check`
+  validates the block.
 
 ## Lease secrets
 
-`name: { lease: true }` declares a secret the config does not resolve: the
-control plane hands the value over in memory with the lease, together with
-the rest of the map. `roxy check` accepts the document, since it never
-resolves secrets, but standalone `roxy run --config` has no lease and
-refuses to start, naming the secret. A secret has exactly one of `env`,
-`file` or `lease: true`; `{}`, `null`, a bare word and `lease: false` are
-parse errors.
+`name: { lease: true }` declares a secret the control plane supplies in
+memory with the lease ([node protocol](/reference/node-protocol#lease-body)).
+`roxy check` accepts it; standalone `roxy run --config` refuses to start,
+naming the secret.
 
-Secret values live in a store beside the compiled policy, not inside it.
-Replacing the map swaps the store and rebuilds the redactor without
-recompiling rules, rebuilding addons or flushing upstream pools, and
-without a reload event. An exchange resolves every name from the
-generation current at its head evaluation, so a swap landing mid-evaluation
-cannot pair one credential with another's replacement; an exchange already
-under way keeps the generation it injected, and redacts its log with it,
-however many swaps follow. A name the policy references but
-the map lacks fails the flow closed (`secret_missing`). Values never appear
-in the config file, on disk or in logs. A config reload resolves `env` and
-`file` sources into the same store and swaps the policy as usual.
+Values live in a store beside the compiled policy. Replacing the map swaps
+the store and rebuilds the redactor without recompiling rules, rebuilding
+addons, flushing upstream pools or a reload event. An exchange resolves
+every name from the generation current at its head evaluation, so a swap
+mid-evaluation cannot pair one credential with another's replacement; an
+exchange under way keeps the generation it injected, and redacts with it,
+however many swaps follow. A name the map lacks is `secret_missing`. Values
+never appear in the config file, on disk or in logs. A config reload
+resolves `env` and `file` sources into the same store.
