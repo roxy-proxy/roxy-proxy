@@ -86,8 +86,10 @@ alone.
 
 A bounded key/value map with per-entry TTL: the rule's `ttl`, or one hour;
 `ttl: 0` is a compile error. At most `limits.max_state_entries` (100 000)
-live entries; a new key when full denies the flow (`503`, `_fail_closed`,
-reason `state_unavailable`). State is shared across flows, so reads are
+stored entries, expired ones included until they are purged (every 1024
+writes, and at most every 100 ms when a new key meets a full table); a new
+key when full denies the flow (`503`, `_fail_closed`, reason
+`state_unavailable`). State is shared across flows, so reads are
 order-dependent: `state["key"]` sees what earlier flows wrote and, within
 a flow, the `set_state` of rules above the reader. Addons have a separate
 store ([host services](/reference/host-services#state-state)).

@@ -64,7 +64,7 @@ produces a `request` event:
 | `log` | a rule's `log` action |
 | `layer_error`, `layer_record`, `endpoint_call` | [addons](/design/addon-model) |
 | `observer_lagged` | an observe-mode addon's copy of a stream was cut; `reason` is `observer_behind` (it fell `max_observer_lag_bytes` behind), `buffer_budget_exhausted` (the [buffer budget](/reference/limits#limits) could not cover the copy) or `no_instance` (no instance of the layer came free within its `first_byte_timeout`) |
-| `connect` | a CONNECT, when `log.flow.connection_events` is on or it was refused |
+| `connect` | a CONNECT, when `log.flow.connection_events` is on. A tunnel closed at its first bytes (`sni_mismatch`, `bad_sni`, neither TLS nor HTTP) is a `parse_error` |
 | `connection_refused` | a connection cap was hit ([limits](/reference/limits#connections)) |
 | `config_loaded`, `config_reloaded`, `config_reload_failed` | startup and [reload](/guides/operations#reload) |
 
@@ -103,10 +103,10 @@ The write path never drops a record while roxy runs
   `max_files` or are deleted. A
   failed rotation is a failed write: traffic is held and it is retried.
   `SIGHUP` reopens the file, for external rotation.
-- **Shutdown.** Everything queued is written before exit. A destination
-  still failing after 10 seconds of retries is given up on: the unwritten
-  batch (at most `high_water` bytes) is discarded and an error logged. This
-  is the one point at which a record can be dropped.
+- **Shutdown.** Everything queued is written before exit, with up to 10
+  seconds of retries for a failing destination; whatever is still unwritten
+  when roxy then exits is lost, and an error logged. This is the one point
+  at which a record can be dropped.
 - **Durability.** Each batch is flushed to the operating system, and
   `max_file_bytes` checked, at the batch boundary. roxy does not `fsync`: a
   roxy crash loses nothing queued; a kernel crash or power loss can lose

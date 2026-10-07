@@ -36,8 +36,9 @@ translate it to (`64:ff9b::/96`, the local-use `64:ff9b:1::/48` with the
 IPv4 address in the last 32 bits, `2002::/16`). `deny_cidrs:
 [203.0.113.0/24]` also denies `64:ff9b::cb00:7107`; a NAT64 address
 embedding a private IPv4 address is private. `allow_cidrs` matches narrowly:
-the address itself and its IPv4 form (`::ffff:a.b.c.d` or `::a.b.c.d`),
-never a translated form.
+the address in canonical form only, so an IPv4-mapped or IPv4-compatible
+address (`::ffff:a.b.c.d`, `::a.b.c.d`) matches an IPv4 entry and nothing
+else, and a translated form never matches.
 
 The check is on the resolved IP, not the name, so DNS rebinding does not
 help; IP-literal hosts pass the same check. If any resolved address is

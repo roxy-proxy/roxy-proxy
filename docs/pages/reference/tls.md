@@ -30,5 +30,4 @@ After a CONNECT, roxy reads just enough of the first TLS record to confirm
 the tunnel carries TLS and extract the SNI and ALPN, with a hard cap
 (16 KiB) and a timeout. The whole handshake message must be present and
 well-formed. A ClientHello split across several TLS records, or a malformed
-`server_name` (non-ASCII, control characters, NUL, trailing dot, duplicate
-entries), counts as not TLS and the connection is closed.
+`server_name` (non-ASCII, control characters, NUL, duplicate entries), counts as not TLS and the connection is closed.

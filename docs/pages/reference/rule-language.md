@@ -15,7 +15,7 @@ and         := not ( "and" not )*
 not         := "not" not | primary
 primary     := "(" expr ")" | comparison | predicate
 comparison  := operand OP operand
-predicate   := field                         ; boolean field
+predicate   := field | bool                  ; boolean field, or a literal (`where: true`)
 operand     := field | field "[" string "]" | literal
 OP          := "==" | "!=" | "<" | "<=" | ">" | ">="
              | "in" | "not in"
@@ -25,10 +25,12 @@ OP          := "==" | "!=" | "<" | "<=" | ">" | ">="
              | "under"       ; host == X or host ends_with "." + X
 literal     := string | number [unit] | bool | list | cidr | @list | method | "null"
 list        := "[" literal ("," literal)* "]"
-unit        := kb | mb | gb | ms | s | m | h      ; sizes are 1024-based (kb and kib are the same)
+unit        := kb | mb | gb | ms | s | m | h      ; sizes are 1024-based
 method      := [A-Z][A-Z_]*                       ; HTTP method names only
 ```
 
+- A rule without `when` matches every exchange; a metric without `where`
+  counts every one.
 - Strings: double-quoted, `\"` and `\\` escapes. `# ...` comments are
   allowed in multi-line YAML block scalars.
 - Comparison is byte-exact, except: `host`, `tls.sni` and `scheme` operands
@@ -91,8 +93,11 @@ comparing any of them with `null` is a compile error. `==`, `!=`, `in` and
 | `x != "a"`, `x not in [...]` | true |
 | `x > 10`, `x contains "a"`, `x matches "..."`, `x under "..."`, `x in 10.0.0.0/8`, `x in @list` | fails closed: `_fail_closed`, reason `missing_value`, naming the field |
 
-`and` short-circuits: `body.size != null and body.size > 10mb`. `null` may
-appear only in `x == null` / `x != null`. A metric keyed on a nullable field
+`and` and `or` short-circuit, and a failure in any branch they reach is
+final: `body.size != null and body.size > 10mb` is safe, `body.size > 1 or
+true` on a chunked body fails closed, so the null test goes first in an
+`or` as well (`body.size == null or body.size > 1`). `null` may appear only
+in `x == null` / `x != null`. A metric keyed on a nullable field
 needs the same guard in its `where` ([rate limits](/reference/rate-limits#metrics)).
 
 ## Actions
@@ -125,7 +130,7 @@ Non-terminal:
 |---|---|---|
 | `set_header: { name: value }` | request: head rules; response: watching rules | Set or replace. Request values may use `${secret:name}`; an invalid value denies the flow. A response rule may read only values known before the response head is sent (`response.status`, `response.header[..]`, `response.body.size`, `response.body.text`); `body.bytes`, `response.body.bytes`, `ws.*` or a byte metric is a compile error. |
 | `remove_header: [names]` | as `set_header` | |
-| `rewrite_path: { match, to }` | head rules | Anchored regex (as `matches`), `$1` / `${name}` groups; result re-normalised. |
+| `rewrite_path: { match, to }` | head rules | Anchored regex (as `matches`), `$1` / `${name}` groups; `to` must start with `/`; result re-normalised. |
 | `set_query: { k: v }`, `remove_query: [k]` | head rules | |
 | `redirect: { host, port, scheme?, rewrite_host? }` | head rules | Change the upstream target. `host`: DNS name, dotted-quad IPv4 or bracketed IPv6 (`[::1]`); anything else, or port `0`, is a config error. The new IPs pass the address floor and deny lists. `Host` is unchanged unless `rewrite_host: true`, and while unchanged the request goes upstream over HTTP/1.1 (HTTP/2 needs `:authority` and `host` to agree). |
 | `tag: name` | all | Sets `tag["name"]` for later rules, addons and the log. |

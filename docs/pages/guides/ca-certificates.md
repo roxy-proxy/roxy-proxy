@@ -21,8 +21,8 @@ tls:
 
 On first `roxy run` (or `roxy ca init`) roxy generates an ECDSA P-256 CA:
 10-year validity, `CA:TRUE, pathlen:0`, key usage `keyCertSign, cRLSign`.
-It is written to `tls.ca_dir` as `roxy-ca.pem` and `roxy-ca.key`
-(mode 0600). An existing pair is reused. A corrupt pair is a fatal startup
+It is written to `tls.ca_dir` as `roxy-ca.pem` (mode 0644) and
+`roxy-ca.key` (mode 0600). An existing pair is reused. A corrupt pair is a fatal startup
 error, never silently regenerated, since a new CA breaks the trust every
 client already has; `roxy ca init --force` replaces it deliberately.
 

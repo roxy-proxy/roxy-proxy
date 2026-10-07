@@ -16,8 +16,10 @@ path, whichever way roxy is deployed.
 
 A listener accepts the connection. On an `http_proxy` listener a CONNECT
 opens a tunnel; roxy checks that its first bytes are a TLS ClientHello
-whose SNI names the CONNECT host, terminates TLS with a leaf from its own
-CA, and reads HTTP/1.1 or HTTP/2 inside. On an `http` listener TLS ends at
+(by default its SNI, if sent, must name the CONNECT host), terminates TLS
+with a leaf from its own CA, and reads HTTP/1.1 or HTTP/2 inside;
+`http.allow_plain_in_connect` also admits plain HTTP in the tunnel
+([CONNECT](/reference/http#connect)). On an `http` listener TLS ends at
 the load balancer in front and roxy reads plain origin-form requests
 ([HTTP](/reference/http)). Either way the connection then carries a
 sequence of exchanges (HTTP/1.1 keep-alive) or concurrent ones (HTTP/2
