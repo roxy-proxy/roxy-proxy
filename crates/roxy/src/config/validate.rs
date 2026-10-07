@@ -750,7 +750,7 @@ fn validate_listener_mode(l: &super::Listener, path: &str, d: &mut Vec<Diagnosti
         }
     }
     match l.mode {
-        ListenerMode::HttpProxy => {}
+        ListenerMode::HttpProxy | ListenerMode::Http => {}
         ListenerMode::Transparent => d.push(Diagnostic::new(
             format!("{path}.mode"),
             "there are no transparent listeners; use `http_proxy`",

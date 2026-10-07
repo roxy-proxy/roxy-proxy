@@ -1166,6 +1166,7 @@ pub(crate) fn test_flow(kit: &crate::testkit::Kit) -> (Arc<StackFlow>, FlowCx) {
         id: Ulid::generate(),
         listener: Arc::new(ListenerInfo {
             name: "main".to_owned(),
+            mode: crate::listener::ListenerMode::HttpProxy,
         }),
         peer: "192.0.2.7:40000".parse().unwrap(),
         original_dst: None,

@@ -18,7 +18,7 @@ use roxy_rules::Policy;
 use roxy_tls::{Ca, LeafMinter};
 
 use crate::addons::{AddonLoader, PreparedAddons};
-use crate::config::{Compiled, Config, Tls};
+use crate::config::{Compiled, Config, ListenerMode, Tls};
 use crate::secrets::Secrets;
 use crate::stores::ReloadableMetrics;
 
@@ -193,13 +193,23 @@ impl std::fmt::Debug for Reloader {
     }
 }
 
-pub(crate) fn listener_specs(config: &Config) -> Vec<ListenerSpec> {
+pub(crate) fn listener_specs(config: &Config) -> anyhow::Result<Vec<ListenerSpec>> {
     config
         .listeners
         .iter()
-        .map(|l| ListenerSpec {
-            name: l.name.clone(),
-            bind: l.bind,
+        .map(|l| {
+            let mode = match l.mode {
+                ListenerMode::HttpProxy => roxy_proxy::ListenerMode::HttpProxy,
+                ListenerMode::Http => roxy_proxy::ListenerMode::Http,
+                ListenerMode::Transparent => {
+                    anyhow::bail!("listener {:?}: there are no transparent listeners", l.name)
+                }
+            };
+            Ok(ListenerSpec {
+                name: l.name.clone(),
+                mode,
+                bind: l.bind,
+            })
         })
         .collect()
 }
@@ -616,7 +626,7 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
     });
     let rt = RuntimeConfig {
         placeholder_policy: false,
-        listeners: listener_specs(&config),
+        listeners: listener_specs(&config)?,
         ca_server: config.ca_server.as_ref().map(|c| c.bind),
         ca,
         minter,

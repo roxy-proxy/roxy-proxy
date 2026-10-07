@@ -1,7 +1,8 @@
 //! Listeners and client connections.
 //!
 //! A [`Listener`] accepts a TCP stream and describes it as a
-//! [`ClientConn`]; the server then hands both to the proxy pipeline.
+//! [`ClientConn`]; the server then hands both to the connection handler
+//! for the listener's [`ListenerMode`].
 
 use std::future::Future;
 use std::io;
@@ -12,11 +13,23 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use ulid::Ulid;
 
+/// What a listener's clients speak to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerMode {
+    /// An HTTP proxy: absolute-form requests and CONNECT.
+    HttpProxy,
+    /// Plain HTTP/1.1 spoken to roxy as if it were the server: origin-form
+    /// requests, each to the host its `Host` names.
+    Http,
+}
+
 /// Static description of a listener.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenerInfo {
     /// `listener.name`.
     pub name: String,
+    /// `listener.mode`.
+    pub mode: ListenerMode,
 }
 
 /// One accepted client connection.
@@ -46,7 +59,7 @@ pub trait Listener: Send + Sync {
     fn accept(&self) -> AcceptFuture<'_>;
 }
 
-/// A plain TCP listener for the HTTP proxy.
+/// A plain TCP listener, in either mode.
 #[derive(Debug)]
 pub struct TcpProxyListener {
     info: Arc<ListenerInfo>,
@@ -54,12 +67,13 @@ pub struct TcpProxyListener {
 }
 
 impl TcpProxyListener {
-    /// Binds an HTTP-proxy listener on `addr`.
-    pub async fn bind(name: &str, addr: SocketAddr) -> io::Result<Self> {
+    /// Binds a listener on `addr`.
+    pub async fn bind(name: &str, mode: ListenerMode, addr: SocketAddr) -> io::Result<Self> {
         let tcp = TcpListener::bind(addr).await?;
         Ok(Self {
             info: Arc::new(ListenerInfo {
                 name: name.to_owned(),
+                mode,
             }),
             tcp,
         })

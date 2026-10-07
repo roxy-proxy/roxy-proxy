@@ -653,8 +653,7 @@ mod tests {
             Reason::BadAuthority
         );
         assert_eq!(
-            parse_origin("GET / HTTP/1.1\r\nHost: a.test\r\nHost: b.test\r\n\r\n")
-                .unwrap_err(),
+            parse_origin("GET / HTTP/1.1\r\nHost: a.test\r\nHost: b.test\r\n\r\n").unwrap_err(),
             Reason::MultipleHost
         );
     }

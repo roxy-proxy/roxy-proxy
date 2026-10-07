@@ -97,6 +97,9 @@ pub enum ListenerMode {
     /// An HTTP proxy: absolute-form requests and CONNECT.
     #[default]
     HttpProxy,
+    /// Plain HTTP spoken to roxy as the server: origin-form requests, the
+    /// target from each request's `Host`.
+    Http,
     /// Parsed so the config shape is stable, but rejected by validation:
     /// roxy has no transparent mode.
     Transparent,

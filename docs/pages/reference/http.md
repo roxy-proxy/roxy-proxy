@@ -4,6 +4,19 @@ How clients talk to roxy, how requests are parsed and canonicalised, and
 what goes to the upstream and back. The parsing lives in `roxy-http`; the
 connection handling in `roxy-proxy`.
 
+## Listener modes
+
+A listener's `mode` names what its clients speak to it:
+
+| mode | the client speaks | request target |
+|---|---|---|
+| `http_proxy` (default) | HTTP/1.1 to a proxy (`HTTP_PROXY` / `HTTPS_PROXY`) | absolute-form, or CONNECT and then origin-form inside the tunnel |
+| `http` | plain HTTP/1.1 to roxy as if it were the server | origin-form; `Host` names the target |
+
+Rules can match `listener.name`, so one roxy can serve both kinds side by
+side with different policies. There is no sniffing within a listener: each
+mode accepts one protocol and closes anything else.
+
 ## HTTP proxy
 
 Clients set `HTTP_PROXY` / `HTTPS_PROXY` and speak HTTP/1.1 to an
@@ -29,6 +42,41 @@ On the proxy port:
 roxy does not authenticate clients: a client is who its network position
 says it is, which rules see as `listener.name` and `client.ip`. A
 `Proxy-Authorization` header is hop-by-hop and dropped, never forwarded.
+
+## HTTP listener
+
+An `http` listener is spoken to as the server: the client sends
+`GET /v1/messages HTTP/1.1` with `Host: anthropic.gw.example.com`, as it
+would to the origin, and the rules decide where the request goes. This is
+the mode for a gateway behind a TLS-terminating load balancer
+([gateway](/deploy/gateway)).
+
+```yaml
+listeners:
+  - name: gateway
+    mode: http
+    bind: 0.0.0.0:8080
+```
+
+On an `http` listener:
+
+- Every request must be **origin-form**. Absolute-form, CONNECT and `*`
+  are refused (`target_form_mismatch`, `bad_request_target` for `*`) and
+  the connection closed.
+- The target is the request's **`Host`**: required, exactly one, parsed
+  with the usual host rules (`missing_host`, `multiple_host`,
+  `bad_authority` otherwise), port 80 unless given. The scheme is `http`.
+  Hosts may differ between requests on one keep-alive connection; each
+  request is its own exchange.
+- From there the exchange is the same as on the proxy: addons, rules, the
+  address floor, the flow log. Without a `redirect` the upstream is the
+  `Host` authority over plain HTTP, so the default deny governs what is
+  reachable; a `redirect` with `scheme: https` sends it on over TLS.
+- `roxy.internal` is not served here; it is a host like any other, which
+  the rules deny.
+- A client that starts a TLS handshake is closed (`tls_on_http_listener`)
+  as soon as the record header is seen. roxy does not terminate TLS on an
+  `http` listener: put a load balancer or other TLS terminator in front.
 
 ## CONNECT
 
@@ -104,7 +152,8 @@ The strictness knobs live under `http:` and all default to strict.
 
 - The method must be a valid `token`.
 - The request-target form must fit the context: absolute-form on the proxy
-  port, origin-form inside a tunnel, authority-form only for CONNECT.
+  port, origin-form inside a tunnel or on an `http` listener,
+  authority-form only for CONNECT on the proxy port.
 - The version must be exactly `HTTP/1.1`. `HTTP/1.0` needs
   `http.allow_http10`, and an HTTP/1.0 connection is closed after its
   response whatever `Connection` says; `HTTP/0.9` is never accepted.
@@ -120,8 +169,9 @@ The strictness knobs live under `http:` and all default to strict.
   non-ASCII needs `http.allow_obs_text`.
 - At most `limits.max_headers` (100) fields.
 - Exactly one `Host`, matching the URI authority (absolute-form) or the
-  SNI / CONNECT host (in a tunnel). An HTTP/1.0 absolute-form request
-  (`http.allow_http10`) may omit it; the URI names the target.
+  SNI / CONNECT host (in a tunnel); on an `http` listener it names the
+  target. An HTTP/1.0 absolute-form request (`http.allow_http10`) may omit
+  it; the URI names the target.
 - At most one `Proxy-Authorization`.
 - At most one `Content-Length`, digits only, at most 19 digits. A
   duplicate is rejected even when the values are equal.
