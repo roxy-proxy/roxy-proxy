@@ -24,6 +24,7 @@ bytesize.workspace = true
 clap.workspace = true
 humantime-serde.workspace = true
 ipnet.workspace = true
+mimalloc.workspace = true
 roxy-node.workspace = true
 roxy-proxy.workspace = true
 roxy-rules.workspace = true

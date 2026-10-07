@@ -96,6 +96,13 @@ fn validate_name(name: &[u8]) -> Result<HeaderName, ParseError> {
         .map_err(|_| ParseError::new(Reason::InvalidHeaderName, "invalid header name"))
 }
 
+/// `v` in an allocation of its own. hyper parses a response head as slices
+/// of the connection's read buffer, so a value kept past the exchange (an
+/// HPACK table entry, say) would otherwise pin that whole buffer.
+fn owned(v: &HeaderValue) -> HeaderValue {
+    HeaderValue::from_bytes(v.as_bytes()).unwrap_or_else(|_| v.clone())
+}
+
 fn validate_value(value: &[u8], allow_obs_text: bool) -> Result<HeaderValue, ParseError> {
     let v = trim_ows(value);
     check_value(v, allow_obs_text)?;
@@ -246,7 +253,7 @@ impl Headers {
         let entries = map
             .iter()
             .filter(|(n, _)| !is_reserved(n.as_str()) && !nominated.iter().any(|t| t == n.as_str()))
-            .map(|(n, v)| (n.clone(), v.clone()))
+            .map(|(n, v)| (n.clone(), owned(v)))
             .collect();
         (Self { entries }, nominated)
     }
@@ -389,6 +396,11 @@ impl<'a> IntoIterator for &'a Headers {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use bytes::Bytes;
+
     use super::*;
 
     fn raw(pairs: &[(&'static str, &'static str)]) -> Vec<(&'static [u8], &'static [u8])> {
@@ -552,6 +564,38 @@ mod tests {
         let h = Headers::from_header_map_lenient(&m);
         assert_eq!(h.len(), 2);
         assert_eq!(h.get_all("set-cookie").count(), 2);
+    }
+
+    /// A value that outlives the response must not keep the parser's
+    /// buffer alive with it.
+    #[test]
+    fn lenient_map_does_not_alias_the_source_buffer() {
+        struct Buffer(Vec<u8>, Arc<AtomicBool>);
+        impl AsRef<[u8]> for Buffer {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+        impl Drop for Buffer {
+            fn drop(&mut self) {
+                self.1.store(true, Ordering::Relaxed);
+            }
+        }
+        let freed = Arc::new(AtomicBool::new(false));
+        let buf = Bytes::from_owner(Buffer(b"x-a: hello\r\n".to_vec(), freed.clone()));
+        let mut m = HeaderMap::new();
+        m.insert(
+            "x-a",
+            HeaderValue::from_maybe_shared(buf.slice(5..10)).unwrap(),
+        );
+        drop(buf);
+        let h = Headers::from_header_map_lenient(&m);
+        drop(m);
+        assert_eq!(h.get("x-a"), Some("hello"));
+        assert!(
+            freed.load(Ordering::Relaxed),
+            "the source buffer is still referenced"
+        );
     }
 
     #[test]

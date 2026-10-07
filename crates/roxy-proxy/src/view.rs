@@ -144,10 +144,15 @@ pub(crate) struct FlowFacts {
 
 /// Lower-case host text without brackets.
 pub(crate) fn host_text(h: &Host) -> String {
+    host_str(h).into_owned()
+}
+
+/// [`host_text`], borrowing a DNS name.
+pub(crate) fn host_str(h: &Host) -> Cow<'_, str> {
     match h {
-        Host::Dns(n) => n.clone(),
-        Host::Ipv4(ip) => ip.to_string(),
-        Host::Ipv6(ip) => ip.to_string(),
+        Host::Dns(n) => Cow::Borrowed(n),
+        Host::Ipv4(ip) => Cow::Owned(ip.to_string()),
+        Host::Ipv6(ip) => Cow::Owned(ip.to_string()),
     }
 }
 

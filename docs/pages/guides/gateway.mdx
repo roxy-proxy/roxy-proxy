@@ -93,7 +93,10 @@ below see the tag, so a per-user quota is another addon.
   ([threat model](/design/threat-model#which-use-case-claims-what)).
 - **`client.ip` is the load balancer's address.** Rules and the flow log
   see the connection roxy accepted, not the original client. roxy reads no
-  forwarded-for header.
+  forwarded-for header. Every client therefore shares one source IP, so
+  `limits.max_connections_per_client` caps the whole gateway: leave it at
+  its default (equal to `max_connections`) or raise it with the fleet
+  ([limits](/reference/limits#connections)).
 - **TLS stays in front.** roxy does not terminate TLS on an `http`
   listener; a client that starts a handshake is closed
   (`tls_on_http_listener`). Keep the hop from the load balancer to roxy on a
