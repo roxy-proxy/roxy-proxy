@@ -1,5 +1,8 @@
 # roxy
 
+> roxy is in early development. Expect frequent breaking changes to config,
+> rules and interfaces.
+
 roxy is a strict, programmable HTTP firewall and egress proxy for workloads
 you don't fully trust: AI agents, CI jobs, sandboxes and third-party code.
 

@@ -11,6 +11,12 @@ export default defineConfig({
   colorScheme: "light",
   // Deep teal; the rest of the palette is in pages/_root.css.
   accentColor: "#0f766e",
+  banner: {
+    content:
+      "roxy is in early development. Expect frequent breaking changes to config, rules and interfaces.",
+    variant: "warning",
+    dismissable: false,
+  },
   socials: [{ icon: "github", link: "https://github.com/roxy-proxy/roxy-proxy" }],
   editLink: {
     link: "https://github.com/roxy-proxy/roxy-proxy/edit/main/docs/pages/:path",
