@@ -103,13 +103,6 @@ impl Config {
         let mut binds = HashMap::new();
         for (i, l) in self.listeners.iter().enumerate() {
             let path = format!("listeners[{i}]");
-            if l.auth.is_some() {
-                d.push(Diagnostic::new(
-                    format!("{path}.auth"),
-                    "proxy authentication has been removed: roxy identifies a client by \
-                     the listener it connected to and its address",
-                ));
-            }
             if l.name.trim().is_empty() {
                 d.push(Diagnostic::new(
                     format!("{path}.name"),

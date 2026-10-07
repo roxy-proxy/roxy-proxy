@@ -83,10 +83,6 @@ pub struct Listener {
     #[serde(default)]
     pub mode: ListenerMode,
     pub bind: SocketAddr,
-    /// Proxy authentication is gone. Parsed so a config that still sets
-    /// it is refused with a diagnostic rather than an unknown-field error.
-    #[serde(default)]
-    pub auth: Option<serde_yaml_ng::Value>,
     /// Transparent listeners only; rejected by `roxy check`.
     #[serde(default)]
     pub allow_passthrough: Option<bool>,
