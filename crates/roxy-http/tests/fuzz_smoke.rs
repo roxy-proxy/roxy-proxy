@@ -199,7 +199,7 @@ fn compress(c: Coding, b: &[u8]) -> Vec<u8> {
 }
 
 fn decode_pieces(c: Coding, input: &[u8], piece: usize) -> Result<Vec<u8>, DecodeError> {
-    let mut d = coding::Decoder::new(&[c], 1 << 20);
+    let mut d = coding::Decoder::new(&[c], 1 << 20, coding::unmetered());
     let mut out = Vec::new();
     let mut buf = vec![0u8; piece];
     for p in input.chunks(piece) {
@@ -241,7 +241,7 @@ proptest! {
             let i = at % enc.len();
             enc[i] ^= x;
         }
-        let whole = coding::decode(&[c], &enc, 1 << 20);
+        let whole = coding::decode(&[c], &enc, 1 << 20, coding::unmetered());
         let pieces = decode_pieces(c, &enc, piece);
         prop_assert_eq!(whole.is_ok(), pieces.is_ok(), "{:?} vs {:?}", whole, pieces);
         if let (Ok(a), Ok(b)) = (&whole, &pieces) {

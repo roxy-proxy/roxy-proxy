@@ -95,8 +95,9 @@ Layers see bodies decoded, so none needs its own decompressors
 
   Each copy is buffered for the layer, so one that keeps up sees every
   body in full, however large. A copy is cut, and the flow goes on, when
-  the layer falls `limits.max_observer_lag_bytes` behind or the
-  [buffer budget](/reference/limits#limits) cannot cover its next frame
+  the layer falls `limits.max_observer_lag_bytes` behind, the
+  [buffer budget](/reference/limits#limits) cannot cover its next frame,
+  or no instance of the layer comes free within its `first_byte_timeout`
   (`observer_lagged`, with the `reason`). A request refused or answered
   below the observer without its body being read ends the copy where the
   reading stopped, without an error, and the observer sees the refusal

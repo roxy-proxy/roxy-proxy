@@ -6,6 +6,7 @@
 //! call goes straight to the connector: it never passes through the layer
 //! stack or the rules.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -16,12 +17,15 @@ use roxy_http::{Authority, Body, Scheme};
 use roxy_wasm::{EndpointError, LayerRequest, LayerResponse};
 
 use super::{AddonSpec, EndpointPath, EndpointSpec, StackFlow};
+use crate::body::{Collected, collect_prefix};
+use crate::budget::{self, BufferLease};
 use crate::flowlog::FlowEvent;
 use crate::secrets::Secrets;
+use crate::server::Shared;
 use crate::upstream::{ConnectError, Protocols, classify};
 
 /// Largest request body an endpoint call carries (it is buffered so a retry
-/// can resend it).
+/// can resend it, and charged to the buffer budget for as long as it is).
 const MAX_ENDPOINT_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Endpoint calls one exchange has in flight at once; the rest wait their
@@ -76,17 +80,19 @@ pub(super) fn credentials(
 /// the endpoint's URL with the request's normalised path appended (a bare
 /// `/` adds nothing) and the request's query after the endpoint's own.
 ///
-/// A `..` segment is refused in either mode, whether or not it would have
-/// climbed out: a layer that reflects text it inspected into the path must
-/// not be able to express "up" at all, and the refusal is the signal that
-/// it tried. Under `prefix` an encoded slash or backslash is refused too:
-/// roxy keeps it opaque, but an origin that decodes before routing would
-/// read it as a separator, and `..` beside it as a climb.
+/// A segment that starts with `..` is refused in either mode, whether or
+/// not it would have climbed out: a layer that reflects text it inspected
+/// into the path must not be able to express "up" at all, and the refusal
+/// is the signal that it tried. The check is on the segment as an origin
+/// reads it, so `..;params` and `%2e%2e` count. Under `prefix` an encoded
+/// slash or backslash is refused too: roxy keeps it opaque, but an origin
+/// that decodes before routing would read it as a separator, and `..`
+/// beside it as a climb.
 fn target(spec: &EndpointSpec, req: &Uri) -> Result<Uri, EndpointError> {
     let req_path = req.path();
-    if req_path.split('/').any(is_dot_dot) {
+    if req_path.split('/').any(climbs) {
         return Err(EndpointError::PathRefused(format!(
-            "{req_path:?} has a `..` segment"
+            "{req_path:?} has a segment that starts with `..`"
         )));
     }
     if spec.path == EndpointPath::Fixed {
@@ -124,9 +130,21 @@ fn target(spec: &EndpointSpec, req: &Uri) -> Result<Uri, EndpointError> {
         .map_err(|e| EndpointError::Failed(format!("endpoint URL: {e}")))
 }
 
-/// Whether a raw path segment is `..`, allowing for percent-encoded dots.
-fn is_dot_dot(segment: &str) -> bool {
-    segment.to_ascii_lowercase().replace("%2e", ".") == ".."
+/// Whether a raw path segment reads as `..` to an origin: canonicalised
+/// as a path of its own, it starts with two dots. Origins that strip
+/// `;params` before routing (Java servlet containers) resolve `..;x` as
+/// `..`, so the start of the segment is what counts, not the whole of it.
+/// A segment the canonicaliser refuses (a bare `..` climbs above its own
+/// root) is refused too.
+fn climbs(segment: &str) -> bool {
+    let alone = format!("/{segment}");
+    match roxy_http::url::normalize_path(alone.as_bytes()) {
+        Ok(p) => p
+            .as_str()
+            .strip_prefix('/')
+            .is_none_or(|s| s.starts_with("..")),
+        Err(_) => true,
+    }
 }
 
 /// Whether a raw path carries `%2F` or `%5C` in either case.
@@ -196,14 +214,14 @@ async fn attempt_all(
     // the attempt itself; the permit holds the exchange's in-flight cap.
     let admitted = tokio::time::timeout(spec.timeout, async {
         let permit = st.endpoint_calls.acquire().await;
-        (permit, body.collect_up_to(MAX_ENDPOINT_REQUEST_BYTES).await)
+        (permit, collect_body(&st.shared, body).await)
     })
     .await;
     let Ok((permit, body)) = admitted else {
         return Err((EndpointError::Timeout, 0));
     };
     let _permit = permit.map_err(|e| fail(format!("endpoint calls: {e}")))?;
-    let body = body.map_err(|e| fail(format!("request body: {e}")))?.data;
+    let (body, _lease) = body.map_err(|e| (e, 0))?;
 
     let mut headers = http::HeaderMap::new();
     for (n, v) in &parts.headers {
@@ -259,6 +277,31 @@ async fn attempt_all(
         }
         let backoff = Duration::from_millis(100) * 2u32.saturating_pow(attempt - 1);
         tokio::time::sleep(backoff.min(Duration::from_secs(2))).await;
+    }
+}
+
+/// Buffers the guest's request body whole, charged to the budget by the
+/// returned lease for as long as the attempts need it. Trailers are not
+/// sent and not kept.
+async fn collect_body(
+    shared: &Arc<Shared>,
+    mut body: Body,
+) -> Result<(Bytes, BufferLease), EndpointError> {
+    let exhausted = || EndpointError::Failed(format!("request body: {}", budget::EXHAUSTED));
+    let Some(mut lease) = shared.reserve_buffer(0) else {
+        return Err(exhausted());
+    };
+    let mut meter = |held: u64| shared.grow_buffer(&mut lease, held);
+    match collect_prefix(&mut body, MAX_ENDPOINT_REQUEST_BYTES, &mut meter).await {
+        Collected::Complete { data, .. } => {
+            lease.shrink_to(data.len() as u64);
+            Ok((data, lease))
+        }
+        Collected::TooLarge { .. } => Err(EndpointError::Failed(format!(
+            "request body over {MAX_ENDPOINT_REQUEST_BYTES} bytes"
+        ))),
+        Collected::BudgetExhausted => Err(exhausted()),
+        Collected::Failed(e) => Err(EndpointError::Failed(format!("request body: {e}"))),
     }
 }
 
@@ -357,10 +400,12 @@ mod tests {
         assert_eq!(t("/%7ex?q=%2f"), "https://api.example.com/v1/~x?q=%2F");
     }
 
-    /// `..` is refused outright in both modes, even where it would not have
-    /// left the prefix, and in any percent-encoded spelling. Under `prefix`
-    /// so is a percent-encoded slash or backslash, which an origin that
-    /// decodes before routing would read as a separator.
+    /// A segment starting with `..` is refused outright in both modes, even
+    /// where it would not have left the prefix, in any percent-encoded
+    /// spelling, and with anything after the dots (`..;x` is `..` to an
+    /// origin that strips path parameters). Under `prefix` so is a
+    /// percent-encoded slash or backslash, which an origin that decodes
+    /// before routing would read as a separator.
     #[test]
     fn dot_dot_is_refused() {
         let refused = |mode, req: &str| {
@@ -376,8 +421,19 @@ mod tests {
                 "/a/../../admin",
                 "/%2e%2e/admin",
                 "/.%2E/admin",
+                "/a/..;x/admin",
+                "/a/..;/admin",
+                "/a/%2e%2e;x/admin",
+                "/a/.%2E;jsessionid=1/admin",
+                "/a/...",
+                "/a/..x/admin",
             ] {
                 assert!(refused(mode, req), "{mode:?} {req}");
+            }
+            // Dots that do not start a segment, and path parameters on an
+            // ordinary segment, are not climbs.
+            for req in ["/a/b..", "/a/.hidden", "/a;x/b", "/a/.;x/b"] {
+                assert!(!refused(mode, req), "{mode:?} {req}");
             }
         }
         for req in [
@@ -444,6 +500,44 @@ mod tests {
             credentials(&spec, &store.load()).unwrap_err(),
             "endpoint header x-key-id: secret not loaded"
         );
+    }
+
+    /// An endpoint call's body is charged to the budget while the call
+    /// holds it and given back when the call is done; a body the budget
+    /// cannot cover, or one declared over the cap, is refused before it is
+    /// held.
+    #[tokio::test]
+    async fn request_bodies_are_charged_to_the_budget_while_the_call_holds_them() {
+        use crate::testkit::Kit;
+        let kit = Kit::builder()
+            .limits(|l| l.max_buffered_bytes = 100)
+            .start()
+            .await;
+        let shared = kit.server.shared().clone();
+        let (data, lease) = collect_body(&shared, Body::from_bytes(vec![7u8; 60]))
+            .await
+            .unwrap();
+        assert_eq!(data.len(), 60);
+        assert_eq!(shared.buffered(), 60);
+
+        let (mut tx, body) = Body::channel(u64::MAX, None);
+        tx.send_data(Bytes::from(vec![7u8; 50])).await.unwrap();
+        let err = collect_body(&shared, body).await.unwrap_err();
+        assert!(
+            matches!(&err, EndpointError::Failed(m) if m.contains(budget::EXHAUSTED)),
+            "{err:?}"
+        );
+        assert_eq!(shared.buffered(), 60);
+        drop(lease);
+        assert_eq!(shared.buffered(), 0);
+
+        let (_tx, body) = Body::channel(u64::MAX, Some(MAX_ENDPOINT_REQUEST_BYTES + 1));
+        let err = collect_body(&shared, body).await.unwrap_err();
+        assert!(
+            matches!(&err, EndpointError::Failed(m) if m.contains("over")),
+            "{err:?}"
+        );
+        assert_eq!(shared.buffered(), 0);
     }
 
     #[test]

@@ -14,7 +14,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use roxy_http::coding::{Coding, DecodeError, Decoder};
+use roxy_http::coding::{self, Coding, DecodeError, Decoder};
 
 const CODINGS: [Coding; 4] = [Coding::Gzip, Coding::Deflate, Coding::Br, Coding::Zstd];
 
@@ -27,7 +27,7 @@ fn decode(
     piece: usize,
     limit: u64,
 ) -> Result<Vec<u8>, DecodeError> {
-    let mut d = Decoder::new(codings, limit);
+    let mut d = Decoder::new(codings, limit, coding::unmetered());
     let mut out = Vec::new();
     let mut buf = vec![0u8; piece];
     let mut drain = |d: &mut Decoder, out: &mut Vec<u8>| -> Result<(), DecodeError> {

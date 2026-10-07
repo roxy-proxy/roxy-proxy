@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, timeout, timeout_at};
 use wasmtime::component::{Component, InstancePre, Linker, Resource};
 use wasmtime::{Config, Engine, Store, StoreContextMut};
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme as WasiScheme;
@@ -16,7 +16,7 @@ use wasmtime_wasi_http::{FieldMapError, WasiHttpView};
 use crate::bindings::exports::roxy::addon::init;
 use crate::bindings::exports::wasi::http::incoming_handler;
 use crate::bindings::roxy::addon::{chain, endpoints, flow};
-use crate::config::LayerConfig;
+use crate::config::{LayerConfig, LayerLimits};
 use crate::error::{Budget, LayerError, LoadError};
 use crate::exchange::{CancelGuard, Dir, ExchangeShared, FromGuest, IntoGuest};
 use crate::host::{LayerHost, LayerRequest, LayerResponse};
@@ -121,6 +121,17 @@ impl LayerInner {
     fn idle(&self) -> MutexGuard<'_, Vec<Instance>> {
         self.idle.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// How long an exchange may wait for a free instance when all
+/// `max_instances` are busy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotWait {
+    /// Until one is free: the exchange is slow, never refused.
+    Unbounded,
+    /// At most this long; past it the exchange fails with
+    /// [`LayerError::NoInstance`].
+    Within(Duration),
 }
 
 /// A compiled layer with its instance pool. Cheap to clone; clones share
@@ -239,6 +250,11 @@ impl Layer {
         &self.inner.shared.config.name
     }
 
+    /// The layer's limits.
+    pub fn limits(&self) -> &LayerLimits {
+        &self.inner.shared.config.limits
+    }
+
     /// Instances currently idle in the pool.
     pub fn idle_instances(&self) -> usize {
         self.inner.idle().len()
@@ -267,6 +283,7 @@ impl Layer {
                         | LayerError::Host(_)
                         | LayerError::Init(_)
                         | LayerError::Instantiate(_)
+                        | LayerError::NoInstance
                         | LayerError::Cancelled) => other,
                     }
                 })?;
@@ -295,17 +312,21 @@ impl Layer {
     }
 
     /// Takes an idle instance or starts a new one, once a slot is free.
-    /// Waiting for a slot has no deadline; starting an instance must finish
-    /// within `first_byte_timeout`, and counts towards it. Returns when the
-    /// head clock started.
-    async fn checkout(&self) -> Result<(Instance, OwnedSemaphorePermit, Instant), LayerError> {
-        let permit = self
-            .inner
-            .slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| LayerError::Cancelled)?;
+    /// Waiting for a slot is bounded only by `wait`; starting an instance
+    /// must finish within `first_byte_timeout`, and counts towards it.
+    /// Returns when the head clock started.
+    async fn checkout(
+        &self,
+        wait: SlotWait,
+    ) -> Result<(Instance, OwnedSemaphorePermit, Instant), LayerError> {
+        let acquire = self.inner.slots.clone().acquire_owned();
+        let permit = match wait {
+            SlotWait::Unbounded => acquire.await,
+            SlotWait::Within(d) => timeout(d, acquire)
+                .await
+                .map_err(|_| LayerError::NoInstance)?,
+        }
+        .map_err(|_| LayerError::Cancelled)?;
         let started = Instant::now();
         let idle = self.inner.idle().pop();
         let instance = if let Some(i) = idle {
@@ -355,6 +376,18 @@ impl Layer {
         host: Arc<dyn LayerHost>,
         req: LayerRequest,
     ) -> Result<LayerResponse, LayerError> {
+        self.handle_waiting(host, req, SlotWait::Unbounded).await
+    }
+
+    /// [`Self::handle`], waiting at most `wait` for a free instance when
+    /// all `max_instances` are busy; past that the exchange fails with
+    /// [`LayerError::NoInstance`] before the layer has seen it.
+    pub async fn handle_waiting(
+        &self,
+        host: Arc<dyn LayerHost>,
+        req: LayerRequest,
+        wait: SlotWait,
+    ) -> Result<LayerResponse, LayerError> {
         let limits = &self.inner.shared.config.limits;
 
         let scheme = req
@@ -373,7 +406,7 @@ impl Layer {
             other => WasiScheme::Other(other.to_owned()),
         };
 
-        let (mut instance, permit, started) = self.checkout().await?;
+        let (mut instance, permit, started) = self.checkout(wait).await?;
         let shared = ExchangeShared::new();
         let (tx, mut rx) = oneshot::channel();
         let (req_res, out_res) = {

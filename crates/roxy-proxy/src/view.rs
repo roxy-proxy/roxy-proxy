@@ -22,8 +22,10 @@ use roxy_http::{Headers, Host, Method, Query, Scheme};
 use roxy_rules::{BodyText, Field, FlowView, Value};
 
 use crate::addrlist::AddressLists;
+use crate::budget::Exhausted;
 use crate::flowlog::TlsInfo;
 use crate::listener::ClientConn;
+use crate::server::Shared;
 use crate::sources::{MetricSource, MetricSourceError, StateSource};
 use crate::watch::Dir;
 
@@ -53,28 +55,36 @@ impl Inspected {
     }
 
     /// A buffered body, decoded by its `content-encoding` for the rules.
-    /// The decoded text may be at most `cap`
-    /// bytes, like the body as sent.
-    pub(crate) fn decode(headers: &Headers, body: &[u8], cap: u64) -> Self {
+    /// The decoded text may be at most `cap` bytes, like the body as sent.
+    /// The decoder's windows are charged to `shared`'s budget while it
+    /// runs; a window the budget cannot cover is [`Exhausted`], which the
+    /// caller fails closed on rather than a fact about the body.
+    pub(crate) fn decode(
+        headers: &Headers,
+        body: &[u8],
+        cap: u64,
+        shared: &Arc<Shared>,
+    ) -> Result<Self, Exhausted> {
         let codings = match coding::content_codings(headers) {
             Ok(c) => c,
             Err(e) => return Self::from_error(e),
         };
         if codings.is_empty() {
-            return Self::Text(String::from_utf8_lossy(body).into());
+            return Ok(Self::Text(String::from_utf8_lossy(body).into()));
         }
-        match coding::decode(&codings, body, cap) {
-            Ok(d) => Self::Text(String::from_utf8_lossy(&d).into()),
+        match coding::decode(&codings, body, cap, shared.window_meter()) {
+            Ok(d) => Ok(Self::Text(String::from_utf8_lossy(&d).into())),
             Err(e) => Self::from_error(e),
         }
     }
 
-    fn from_error(e: DecodeError) -> Self {
-        match e {
+    fn from_error(e: DecodeError) -> Result<Self, Exhausted> {
+        Ok(match e {
             DecodeError::Unsupported(c) => Self::UnsupportedEncoding(c),
             DecodeError::TooLarge { .. } => Self::TooLarge,
+            DecodeError::BudgetExhausted => return Err(Exhausted),
             e @ DecodeError::Invalid { .. } => Self::Undecodable(e.to_string()),
-        }
+        })
     }
 
     fn as_body_text(&self) -> BodyText<'_> {
@@ -386,5 +396,46 @@ impl FlowView for ProxyView<'_> {
         // Exact membership: see `AddressList::contains_exact` for why the
         // broad deny-floor matching is wrong for rules that allow.
         self.lists.get(list).map(|l| l.contains_exact(ip))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use super::*;
+    use crate::testkit::Kit;
+
+    /// Decoding for the rules charges the decoder's window to the budget
+    /// for as long as it runs: a window the budget cannot cover is refused
+    /// before anything is allocated, and one it can is given back with the
+    /// decoder.
+    #[tokio::test]
+    async fn decoding_charges_the_window_and_gives_it_back() {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(b"hello").unwrap();
+        let gz = e.finish().unwrap();
+        let mut headers = Headers::new();
+        headers.append("content-encoding", "gzip").unwrap();
+
+        let kit = Kit::builder()
+            .limits(|l| l.max_buffered_bytes = 16 * 1024)
+            .start()
+            .await;
+        let shared = kit.server.shared().clone();
+        assert!(matches!(
+            Inspected::decode(&headers, &gz, 1 << 20, &shared),
+            Err(Exhausted)
+        ));
+        assert_eq!(shared.buffered(), 0);
+
+        let kit = Kit::builder().start().await;
+        let shared = kit.server.shared().clone();
+        let text = Inspected::decode(&headers, &gz, 1 << 20, &shared).unwrap();
+        assert!(
+            matches!(&text, Inspected::Text(t) if &**t == "hello"),
+            "{text:?}"
+        );
+        assert_eq!(shared.buffered(), 0);
     }
 }

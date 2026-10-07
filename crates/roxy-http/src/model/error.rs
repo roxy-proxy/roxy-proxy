@@ -375,6 +375,10 @@ pub enum BodyError {
     /// ([`crate::coding::decode_body`]).
     #[error("body could not be decoded: {0}")]
     Undecodable(String),
+    /// The buffer budget could not cover the body's decoder
+    /// ([`crate::coding::Meter`]).
+    #[error("buffer budget cannot cover the body's decoder")]
+    BudgetExhausted,
 }
 
 /// Error while writing to (or driving) a client connection. After any of

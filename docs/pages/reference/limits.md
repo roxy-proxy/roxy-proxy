@@ -15,7 +15,7 @@ accept and the upstream connect produces a deny response or a closed socket
 | body too large to inspect, as sent or decoded | deny, `_fail_closed`, `body_too_large_to_inspect` |
 | body to inspect cannot be decoded | deny, `_fail_closed`, `body_decode_failed` or `unsupported_content_encoding` |
 | body to sign over `max_sign_body_bytes` | `413`, `_sign`, `sign_body_too_large` |
-| buffer budget cannot cover the exchange's inspection, signing or WebSocket buffers | deny, `_fail_closed`, `buffer_budget_exhausted`; an observer's copy is cut instead (`observer_lagged`) |
+| buffer budget cannot cover the exchange's inspection, decoding, signing or WebSocket buffers | deny, `_fail_closed`, `buffer_budget_exhausted`; an observer's copy is cut instead (`observer_lagged`), an endpoint call refused, a body decoded for a layer failed |
 | body or header limit exceeded mid-stream | close both sides |
 | request trailers without `http.allow_request_trailers`, or a forbidden field in a trailer section | request: `400` and close, or a stream reset, `parse_error` reason `trailers`; response: body cut, `response_error` ([trailers](/reference/http#trailers)) |
 | upstream DNS, connect or TLS failure | `502`, `upstream_error` |
@@ -111,17 +111,25 @@ Tightening one trades those idle connections for cut exchanges; raise
 
 ### Buffer budget
 
-`max_buffered_bytes` bounds the inspection, signing, WebSocket and observer
-buffers in aggregate. An exchange reserves before it fills a buffer; a
-reservation the budget cannot cover fails at once, with no waiting and no
-eviction (`503`, `_fail_closed`, `buffer_budget_exhausted`).
+`max_buffered_bytes` bounds every buffer roxy holds for an exchange, in
+aggregate. An exchange reserves before it fills a buffer; a reservation the
+budget cannot cover fails at once, with no waiting and no eviction (`503`,
+`_fail_closed`, `buffer_budget_exhausted`). This is the whole list of what
+is charged:
 
 | buffer | reservation |
 |---|---|
-| a body a rule reads (`body.text`, `response.body.text`) | `max_inspect_body_bytes`, or its `content-length` if smaller; nothing for a body known to be empty (no request body, a `HEAD` response, a `1xx`, `204` or `304`). Once buffered, it shrinks to what is held (the body as sent, or its decoded text if larger) and stays until the exchange ends |
+| a body a rule reads (`body.text`, `response.body.text`) | `max_inspect_body_bytes`, or its `content-length` if smaller; nothing for a body known to be empty (no request body, a `HEAD` response, a `1xx`, `204` or `304`). Once buffered, it shrinks to what is held (the body as sent with its trailers, or its decoded text if larger) and stays until the exchange ends. A body over the cap holds only what was read before that was known: nothing when its `content-length` said so, the prefix read when it was found out mid-stream |
+| a content decoder | each decoder's window, charged before the decoder is created: 32 KiB for `gzip` or `deflate`, the window a `br` stream's first byte declares (1 KiB to 16 MiB), 8 MiB for `zstd` (the largest window accepted, which each frame may use). Stacked codings add up. Held while the decoder runs: for the rule's decision on an inspected body, for the whole body when it is decoded for the addon stack (`http.decode_for_addons`). A window the budget cannot cover fails closed before it is allocated |
 | a request body hashed for `sign: aws_sigv4` | its `content-length` (at most `max_sign_body_bytes`) up front; a chunked body reserves chunk by chunk up to that cap and is refused at the chunk the budget cannot cover. Held until the exchange ends. `unsigned_payload: true` reserves nothing ([signing AWS requests](/reference/secrets#signing-aws-requests)) |
+| an endpoint call's request body | what the guest sends, frame by frame as it is read (at most 16 MiB), held until the call's last attempt is answered since a retry resends it. A body the budget cannot cover refuses the call ([host services](/reference/host-services#endpoints-endpoints)) |
 | a WebSocket whose messages rules read | twice `max_ws_message_bytes` at the upgrade, held for the session. Reading bodies but not messages holds nothing for a WebSocket |
-| an observer's copy | the bytes queued and not yet read, frame by frame, given back as the observer reads them (or drops the copy). A copy whose next frame would overrun the budget is cut (`observer_lagged`, `reason: buffer_budget_exhausted`): the budget bounds how far behind observers are in total, not how many exchanges are observed |
+| an observer's copy | the bytes queued and not yet read, frame by frame, given back as the observer reads them (or drops the copy). A copy whose next frame would overrun the budget is cut (`observer_lagged`, `reason: buffer_budget_exhausted`): the budget bounds how far behind observers are in total, not how many exchanges are observed. A copy whose observer gets no instance within its `first_byte_timeout` is dropped the same way (`reason: no_instance`), so a busy observer cannot pin budget that enforce flows need |
+
+Bytes in flight on a transport are bounded per connection rather than by
+the budget: an HTTP/2 connection's receive window ([connections](/reference/limits#connections)),
+the 256 KiB credit each body of a [service layer](/reference/service-layers)
+stream has, and the codec's parse buffers (`max_header_bytes`).
 
 Budget ÷ cap is how many exchanges can hold a buffer at once (defaults:
 1024 bodies of unknown length under inspection, 32 WebSockets with message

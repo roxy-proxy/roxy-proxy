@@ -63,7 +63,7 @@ produces a `request` event:
 | `ws_message` | a WebSocket message a rule denied, or one sampled by `log.flow.ws_message_every` ([WebSockets](/reference/websockets#message-rules)) |
 | `log` | a rule's `log` action |
 | `layer_error`, `layer_record`, `endpoint_call` | [addons](/design/addon-model) |
-| `observer_lagged` | an observe-mode addon's copy of a stream was cut; `reason` is `observer_behind` (it fell `max_observer_lag_bytes` behind) or `buffer_budget_exhausted` (the [buffer budget](/reference/limits#limits) could not cover the copy) |
+| `observer_lagged` | an observe-mode addon's copy of a stream was cut; `reason` is `observer_behind` (it fell `max_observer_lag_bytes` behind), `buffer_budget_exhausted` (the [buffer budget](/reference/limits#limits) could not cover the copy) or `no_instance` (no instance of the layer came free within its `first_byte_timeout`) |
 | `connect` | a CONNECT, when `log.flow.connection_events` is on or it was refused |
 | `connection_refused` | a connection cap was hit ([limits](/reference/limits#connections)) |
 | `config_loaded`, `config_reloaded`, `config_reload_failed` | startup and [reload](/guides/operations#reload) |

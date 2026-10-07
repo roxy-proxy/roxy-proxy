@@ -287,7 +287,7 @@ the edge of the stack and forwarded decoded
 |---|---|
 | `gzip`, `x-gzip` | RFC 1952; several members in a row are one body |
 | `deflate` | zlib format (RFC 1950), as RFC 9110 defines it; raw deflate is refused |
-| `br` | RFC 7932 |
+| `br` | RFC 7932, the window the stream declares (up to 16 MiB) |
 | `zstd` | RFC 8878, window at most 8 MiB (RFC 9659) |
 
 - Stacked codings are undone in reverse order; `identity` is ignored; at
@@ -296,8 +296,9 @@ the edge of the stack and forwarded decoded
 - Decoding is strict: truncated data, a bad checksum, or bytes after the
   end of the stream make the body undecodable.
 - Decoders work in bounded steps (a highly compressed body costs time, not
-  memory). The decoded size counts against the same cap as the body as
-  sent.
+  memory); each decoder's window is charged to the
+  [buffer budget](/reference/limits#buffer-budget) before it is allocated.
+  The decoded size counts against the same cap as the body as sent.
 
 `http.strip_accept_encoding` (default false) removes `accept-encoding` from
 every request as roxy reads it, so origins answer uncompressed. Addons,

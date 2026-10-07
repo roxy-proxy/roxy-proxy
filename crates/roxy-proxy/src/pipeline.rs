@@ -41,8 +41,8 @@ use roxy_rules::{
 };
 use ulid::Ulid;
 
-use crate::body::{Collected, collect_prefix, collect_prefix_metered};
-use crate::budget::{self, BufferLease};
+use crate::body::{Collected, collect_prefix};
+use crate::budget::{self, BufferLease, Exhausted};
 use crate::capture::Tap;
 use crate::flowlog::{
     ClientInfo, DecisionKind, DstInfo, FlowEvent, RequestInfo, ResponseInfo, Stage, Timing, TlsInfo,
@@ -292,15 +292,9 @@ pub(crate) enum ResponseVerdict {
 /// Body access a step needs from the client connection: buffering while
 /// the codec keeps pumping the client's request body.
 pub(crate) trait BodyIo: Send {
+    /// [`collect_prefix`], with `meter` asked after each frame whether the
+    /// bytes held so far may be kept.
     fn collect<'a>(
-        &'a mut self,
-        body: &'a mut Body,
-        cap: u64,
-    ) -> CollectFuture<'a, Result<Collected, DriveError>>;
-
-    /// [`Self::collect`] with a meter asked after each frame whether the
-    /// bytes held so far may be kept ([`collect_prefix_metered`]).
-    fn collect_metered<'a>(
         &'a mut self,
         body: &'a mut Body,
         cap: u64,
@@ -313,17 +307,9 @@ impl BodyIo for ServerConn<ClientIo> {
         &'a mut self,
         body: &'a mut Body,
         cap: u64,
-    ) -> CollectFuture<'a, Result<Collected, DriveError>> {
-        Box::pin(self.drive(collect_prefix(body, cap)))
-    }
-
-    fn collect_metered<'a>(
-        &'a mut self,
-        body: &'a mut Body,
-        cap: u64,
         meter: &'a mut (dyn FnMut(u64) -> bool + Send),
     ) -> CollectFuture<'a, Result<Collected, DriveError>> {
-        Box::pin(self.drive(collect_prefix_metered(body, cap, meter)))
+        Box::pin(self.drive(collect_prefix(body, cap, meter)))
     }
 }
 
@@ -939,7 +925,8 @@ pub(crate) fn body_failure(e: &BodyError) -> ParseError {
         | BodyError::Abandoned
         | BodyError::Upstream(_)
         | BodyError::Stopped
-        | BodyError::Undecodable(_) => ParseError::new(Reason::UnexpectedEof, e.to_string()),
+        | BodyError::Undecodable(_)
+        | BodyError::BudgetExhausted => ParseError::new(Reason::UnexpectedEof, e.to_string()),
     }
 }
 
@@ -967,18 +954,26 @@ async fn inspect_request_body(
     let Some(mut lease) = reserve_decoded_inspection(cx, &req.headers, &req.body, cap) else {
         return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
     };
-    let inspected = match io.collect(&mut req.body, cap).await {
+    let shared = cx.shared.clone();
+    let mut meter = |held: u64| shared.grow_buffer(&mut lease, held);
+    let inspected = match io.collect(&mut req.body, cap, &mut meter).await {
         Err(e) => return Verdict::Close(e),
         Ok(Collected::Failed(e)) => return Verdict::Close(body_failure(&e).into()),
-        Ok(Collected::Complete(b)) => {
+        Ok(Collected::Complete { data, held }) => {
             if let Some(f) = cx.facts.request.as_mut() {
-                f.body_size = Some(b.len() as u64);
+                f.body_size = Some(data.len() as u64);
             }
-            let inspected = Inspected::decode(&req.headers, &b, cap);
-            lease.shrink_to(buffered_bytes(&b, &inspected));
+            let inspected = match Inspected::decode(&req.headers, &data, cap, &cx.shared) {
+                Ok(i) => i,
+                Err(Exhausted) => return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED)),
+            };
+            lease.shrink_to(buffered_bytes(held, &inspected));
             inspected
         }
-        Ok(Collected::TooLarge) => Inspected::TooLarge,
+        Ok(Collected::TooLarge { held }) => {
+            lease.shrink_to(held);
+            Inspected::TooLarge
+        }
         Ok(Collected::BudgetExhausted) => {
             return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
         }
@@ -1022,15 +1017,16 @@ fn reserve_decoded_inspection(
 }
 
 /// What a completely buffered body holds for the rest of the exchange: the
-/// bytes as sent (they go on to be forwarded) and, if `content-encoding`
-/// was decoded, the text the facts carry, which can be larger.
-fn buffered_bytes(sent: &Bytes, inspected: &Inspected) -> u64 {
+/// bytes as sent with their trailers (they go on to be forwarded) and, if
+/// `content-encoding` was decoded, the text the facts carry, which can be
+/// larger.
+fn buffered_bytes(held: u64, inspected: &Inspected) -> u64 {
     let text = if let Inspected::Text(t) = inspected {
-        t.len()
+        t.len() as u64
     } else {
         0
     };
-    sent.len().max(text) as u64
+    held.max(text)
 }
 
 /// The head decision and its effects.
@@ -1129,16 +1125,18 @@ async fn sign_request(cx: &mut FlowCx, mut req: CanonicalRequest, io: &mut dyn B
         };
         let shared = cx.shared.clone();
         let mut meter = |held: u64| shared.grow_buffer(&mut lease, held);
-        buffered = match io.collect_metered(&mut req.body, cap, &mut meter).await {
+        buffered = match io.collect(&mut req.body, cap, &mut meter).await {
             Err(e) => return Verdict::Close(e),
             Ok(Collected::Failed(e)) => return Verdict::Close(body_failure(&e).into()),
-            Ok(Collected::TooLarge) => return Verdict::Deny(Refusal::sign_body_too_large()),
+            Ok(Collected::TooLarge { .. }) => return Verdict::Deny(Refusal::sign_body_too_large()),
             Ok(Collected::BudgetExhausted) => {
                 return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
             }
-            Ok(Collected::Complete(b)) => b,
+            Ok(Collected::Complete { data, held }) => {
+                lease.shrink_to(held);
+                data
+            }
         };
-        lease.shrink_to(buffered.len() as u64);
         cx.buffers.push(lease);
         if let Some(f) = cx.facts.request.as_mut() {
             f.body_size = Some(buffered.len() as u64);
@@ -1343,7 +1341,9 @@ async fn inspect_response_body(
     let Some(mut lease) = reserve_decoded_inspection(cx, &res.headers, &res.body, cap) else {
         return ResponseVerdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
     };
-    let inspected = match io.collect(&mut res.body, cap).await {
+    let shared = cx.shared.clone();
+    let mut meter = |held: u64| shared.grow_buffer(&mut lease, held);
+    let inspected = match io.collect(&mut res.body, cap, &mut meter).await {
         Err(e) => return ResponseVerdict::Close(e),
         Ok(Collected::Failed(e)) => {
             tracing::info!(flow = %cx.flow, error = %e, "upstream response body failed");
@@ -1352,15 +1352,23 @@ async fn inspect_response_body(
                 "upstream_body_failed",
             ));
         }
-        Ok(Collected::Complete(b)) => {
+        Ok(Collected::Complete { data, held }) => {
             if let Some(f) = cx.facts.response.as_mut() {
-                f.body_size = Some(b.len() as u64);
+                f.body_size = Some(data.len() as u64);
             }
-            let inspected = Inspected::decode(&res.headers, &b, cap);
-            lease.shrink_to(buffered_bytes(&b, &inspected));
+            let inspected = match Inspected::decode(&res.headers, &data, cap, &cx.shared) {
+                Ok(i) => i,
+                Err(Exhausted) => {
+                    return ResponseVerdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
+                }
+            };
+            lease.shrink_to(buffered_bytes(held, &inspected));
             inspected
         }
-        Ok(Collected::TooLarge) => Inspected::TooLarge,
+        Ok(Collected::TooLarge { held }) => {
+            lease.shrink_to(held);
+            Inspected::TooLarge
+        }
         Ok(Collected::BudgetExhausted) => {
             return ResponseVerdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
         }

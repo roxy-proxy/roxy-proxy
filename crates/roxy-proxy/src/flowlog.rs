@@ -247,8 +247,9 @@ pub enum FlowEvent<'a> {
         layer: String,
         /// `request` or `response`.
         direction: String,
-        /// `observer_behind` (the copy outgrew `max_observer_lag_bytes`) or
-        /// `buffer_budget_exhausted` (the budget could not cover a copy).
+        /// `observer_behind` (the copy outgrew `max_observer_lag_bytes`),
+        /// `buffer_budget_exhausted` (the budget could not cover a copy) or
+        /// `no_instance` (no instance came free within `first_byte_timeout`).
         reason: String,
     },
     /// The upstream address policy refused every connection for the flow:
