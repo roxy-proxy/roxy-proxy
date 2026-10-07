@@ -187,5 +187,5 @@ pub use policy::{
 };
 pub use state::{StateFull, StateSource, StateStore};
 pub use template::{Part, TemplateError, expand, parse_template};
-pub use types::{Field, Reads, Type};
+pub use types::{Field, Reads, Type, Watched};
 pub use view::{BodyText, FlowView, MapView, Value};

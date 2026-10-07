@@ -12,6 +12,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
+use crate::types::Watched;
+
 // ----- expressions ----------------------------------------------------------
 
 /// An uncompiled DSL expression.
@@ -579,10 +581,36 @@ pub enum MetricCount {
 }
 
 impl MetricCount {
+    /// The watched value a read of this metric carries: a byte metric grows
+    /// as this exchange streams, so a `deny` reading it is re-checked as
+    /// bytes arrive. `None` for a count that does not change while an
+    /// exchange streams.
+    pub fn watched(&self) -> Option<Watched> {
+        match self {
+            Self::RequestBytes => Some(Watched::MetricRequestBytes),
+            Self::ResponseBytes => Some(Watched::MetricResponseBytes),
+            Self::Requests | Self::Errors | Self::Denied | Self::Unique(_) => None,
+        }
+    }
+
     /// Whether this metric grows as bytes stream (and so is *watched* by deny
     /// rules that read it).
     pub fn counts_bytes(&self) -> bool {
-        matches!(self, Self::RequestBytes | Self::ResponseBytes)
+        self.watched().is_some()
+    }
+}
+
+/// The config form: `requests`, `request_bytes`, `unique(host)`, ...
+impl fmt::Display for MetricCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Requests => f.write_str("requests"),
+            Self::RequestBytes => f.write_str("request_bytes"),
+            Self::ResponseBytes => f.write_str("response_bytes"),
+            Self::Errors => f.write_str("errors"),
+            Self::Denied => f.write_str("denied"),
+            Self::Unique(field) => write!(f, "unique({field})"),
+        }
     }
 }
 

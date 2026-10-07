@@ -11,7 +11,7 @@ use roxy_http::Host;
 
 use super::{
     CAction, CompiledRule, Condition, MetricDef, PolicyInput, RuleKind, RuleShape, SignSpec,
-    WatchAction, is_header_value, metric_reads,
+    WatchAction, is_header_value,
 };
 use crate::compile::{Env, Needs, Pred, ROperand, build_shared_regex, compile};
 use crate::config::{
@@ -27,7 +27,7 @@ use crate::lexer::is_ident;
 use crate::template::{
     Part, SECRET_PLACES, literal, mentions_secret, parse_template, secret_names,
 };
-use crate::types::{Access, Field, Reads, is_token};
+use crate::types::{Access, Field, Reads, Watched, is_token};
 
 impl Condition {
     /// Compiles `src`. `path` locates it in diagnostics (`addons[0].when`).
@@ -151,13 +151,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
 
     fn expr(&mut self, rule: Option<&RuleId>, path: String, src: &str) -> Option<(Pred, Needs)> {
         let input = self.input;
-        let metric = |id: &str| {
-            input
-                .metrics
-                .iter()
-                .find(|m| m.id == id)
-                .map(|m| metric_reads(&m.count))
-        };
+        let metric = |id: &str| input.metrics.iter().find(|m| m.id == id).map(|m| &m.count);
         let result = compile(
             src,
             &Env {
@@ -1057,20 +1051,20 @@ impl RuleShape {
     /// takes part in the head decision and is re-checked as this exchange
     /// adds bytes; anything else is decided at the head.
     fn classify(needs: &Needs, rule: &RuleConfig) -> Self {
-        let fields = needs.reads.minus(Reads::METRICS);
-        let metrics = needs.reads.minus(Reads::WATCHED_FIELDS);
+        let fields = needs.reads.retain(Watched::is_field);
+        let metrics = needs.reads.minus(fields);
         let denies = rule.then.0.iter().any(|a| matches!(a, Action::Deny(_)));
         let (kind, triggers, watches) = if !fields.is_empty() {
             (
                 RuleKind::Watching,
                 needs.reads,
-                needs.watched_names(Reads::ALL),
+                needs.watched_names(needs.reads),
             )
         } else if denies && !metrics.is_empty() {
             (
                 RuleKind::HeadAndWatching,
                 metrics,
-                needs.watched_names(Reads::METRICS),
+                needs.watched_names(metrics),
             )
         } else {
             (RuleKind::Head, Reads::NONE, Vec::new())

@@ -13,7 +13,7 @@ use crate::config::{MetricConfig, MetricCount, RuleConfig};
 use crate::diag::{Diagnostic, RuleId};
 use crate::eval::{Decision, Deny, Effect, WatchEffect};
 use crate::template::Part;
-use crate::types::{Field, Reads};
+use crate::types::{Field, Reads, Watched};
 
 /// Everything [`Policy::compile`] needs from the config.
 #[derive(Debug, Clone, Copy)]
@@ -289,9 +289,7 @@ impl Policy {
         let watch_triggers = watching
             .iter()
             .fold(Reads::NONE, |acc, &i| acc | rules[i].shape.triggers);
-        let byte_metrics = metrics
-            .iter()
-            .fold(Reads::NONE, |acc, m| acc | metric_reads(&m.count));
+        let byte_metrics = metrics.iter().filter_map(|m| m.count.watched()).collect();
         Ok(Policy {
             rules,
             head,
@@ -335,7 +333,7 @@ impl Policy {
     pub fn reads_ws(&self) -> bool {
         self.rules
             .iter()
-            .any(|r| r.shape.fields.intersects(Reads::WS))
+            .any(|r| r.shape.fields.contains(Watched::Ws))
     }
 
     /// Rule ids in config order.
@@ -363,17 +361,5 @@ impl Policy {
     /// Number of rules.
     pub fn rule_count(&self) -> usize {
         self.rules.len()
-    }
-}
-
-/// The watched bits a read of a metric counting `count` carries.
-fn metric_reads(count: &MetricCount) -> Reads {
-    match count {
-        MetricCount::RequestBytes => Reads::METRIC_REQUEST_BYTES,
-        MetricCount::ResponseBytes => Reads::METRIC_RESPONSE_BYTES,
-        MetricCount::Requests
-        | MetricCount::Errors
-        | MetricCount::Denied
-        | MetricCount::Unique(_) => Reads::NONE,
     }
 }

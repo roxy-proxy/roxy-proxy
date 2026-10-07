@@ -5,7 +5,7 @@ mod common;
 use common::{compile, try_compile};
 use roxy_rules::{
     Deny, DenyStatus, EvalContext, FailClosedReason, Field, LogLevel, MapView, Reads, RuleKind,
-    WatchEffect,
+    Type, WatchEffect,
 };
 
 const ALL: Reads = Reads::ALL;
@@ -49,6 +49,40 @@ fn classification() {
     let head_only = compile("", "- { id: a, then: allow }");
     assert!(!head_only.watches(ALL));
     assert_eq!(head_only.byte_metrics(), Reads::NONE);
+}
+
+/// Classification follows the catalogue: for every field, a rule reading
+/// it watches exactly when `Field::watched` says so, and is re-checked by
+/// exactly that value. A field added to the catalogue is covered without a
+/// case here.
+#[test]
+fn every_field_classifies_by_its_own_metadata() {
+    for f in Field::ALL {
+        let literal = match f.ty() {
+            Type::Int => "1",
+            Type::Str => "\"x\"",
+            Type::Ip => "10.0.0.1",
+            Type::Bool => "true",
+            Type::StrList => unreachable!("no scalar field is a list"),
+        };
+        let p = compile(
+            "",
+            &format!("- {{ id: r, when: {f} == {literal}, then: deny }}"),
+        );
+        let info = &p.rule_info()[0];
+        let reads = Reads::from(f.watched());
+        let want = if reads.is_empty() {
+            RuleKind::Head
+        } else {
+            RuleKind::Watching
+        };
+        assert_eq!(info.kind, want, "{f}");
+        assert_eq!(info.triggers, reads, "{f}");
+        assert_eq!(f.is_head(), reads.is_empty(), "{f}");
+        if !reads.is_empty() {
+            assert_eq!(info.watches, [f.name()], "{f}");
+        }
+    }
 }
 
 #[test]

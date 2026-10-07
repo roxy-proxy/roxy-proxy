@@ -28,8 +28,9 @@ use ipnet::{IpNet, Ipv4Net};
 use regex::{Regex, RegexBuilder};
 
 use crate::ast::{Expr, Lit, LitNode, Node, Op, Operand};
+use crate::config::MetricCount;
 use crate::diag::{ExprError, Span};
-use crate::types::{Access, Field, Reads, Type, resolve};
+use crate::types::{Access, Field, Reads, Type, Watched, resolve};
 
 /// Compiled-program size limit for one regex (bytes). A hostile or careless
 /// pattern such as `\w{1000}{1000}` fails to compile instead of using
@@ -41,10 +42,8 @@ const REGEX_NEST_LIMIT: u32 = 64;
 
 /// Compilation environment for one expression.
 pub(crate) struct Env<'a> {
-    /// `Some(reads)` for a defined metric: the watched bits a read of it
-    /// carries ([`Reads::METRIC_REQUEST_BYTES`] / `..._RESPONSE_BYTES` for
-    /// byte metrics, empty otherwise). `None` = undefined.
-    pub metric: &'a dyn Fn(&str) -> Option<Reads>,
+    /// What a defined metric counts; `None` = undefined.
+    pub metric: &'a dyn Fn(&str) -> Option<&'a MetricCount>,
     pub list_exists: &'a dyn Fn(&str) -> bool,
 }
 
@@ -56,28 +55,27 @@ pub(crate) struct Needs {
     pub response_body: bool,
     /// Watched fields and byte metrics read.
     pub reads: Reads,
-    /// The watched values read, each with the bit it carries and its name
-    /// as written (`body.bytes`, `metric.egress (request_bytes)`), in order
-    /// of first appearance.
-    watched: Vec<(Reads, String)>,
+    /// The watched values read, each with its name as written (`body.bytes`,
+    /// `metric.egress (request_bytes)`), in order of first appearance.
+    watched: Vec<(Watched, String)>,
     /// The tags read (`tag["x"]`), in order of first appearance.
     pub tags: Vec<Box<str>>,
 }
 
 impl Needs {
-    fn add_watched(&mut self, reads: Reads, name: String) {
-        self.reads |= reads;
+    fn add_watched(&mut self, w: Watched, name: String) {
+        self.reads |= Reads::of(w);
         if !self.watched.iter().any(|(_, n)| *n == name) {
-            self.watched.push((reads, name));
+            self.watched.push((w, name));
         }
     }
 
-    /// Names of the watched values whose bits intersect `mask`, as written,
-    /// for messages and `roxy check`.
+    /// Names of the watched values in `mask`, as written, for messages and
+    /// `roxy check`.
     pub(crate) fn watched_names(&self, mask: Reads) -> Vec<String> {
         self.watched
             .iter()
-            .filter(|(r, _)| r.intersects(mask))
+            .filter(|(w, _)| mask.contains(*w))
             .map(|(_, n)| n.clone())
             .collect()
     }
@@ -554,16 +552,10 @@ impl Compiler<'_, '_> {
                     | Access::Tag(_)
                     | Access::Metric(_) => {}
                 }
-                let (reads, name) = match &access {
-                    Access::Metric(id) => {
-                        let r = metric(id).unwrap_or_default();
-                        let what = if r == Reads::METRIC_REQUEST_BYTES {
-                            "request_bytes"
-                        } else {
-                            "response_bytes"
-                        };
-                        (r, format!("metric.{id} ({what})"))
-                    }
+                let watched = match &access {
+                    Access::Metric(id) => metric(id).and_then(|count| {
+                        Some((count.watched()?, format!("metric.{id} ({count})")))
+                    }),
                     a @ (Access::Scalar(_)
                     | Access::Header(_)
                     | Access::HeaderAll(_)
@@ -573,10 +565,10 @@ impl Compiler<'_, '_> {
                     | Access::State(_)
                     | Access::Tag(_)
                     | Access::BodyText
-                    | Access::RespBodyText) => (a.reads(), a.display_name()),
+                    | Access::RespBodyText) => a.watched().map(|w| (w, a.display_name())),
                 };
-                if !reads.is_empty() {
-                    self.needs.add_watched(reads, name);
+                if let Some((w, name)) = watched {
+                    self.needs.add_watched(w, name);
                 }
                 Ok(Typed::Field(access, f.span))
             }
