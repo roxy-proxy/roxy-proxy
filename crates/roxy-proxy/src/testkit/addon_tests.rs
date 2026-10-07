@@ -1491,6 +1491,50 @@ async fn endpoint_credentials_never_reach_the_layer() {
     assert!(!serde_json::to_string(&calls).unwrap().contains(SECRET));
 }
 
+/// An endpoint's headers all come from the secret generation of the
+/// exchange making the call: a swap reaches the next exchange's call with
+/// both values replaced, never one.
+#[tokio::test]
+async fn endpoint_credentials_follow_a_secret_swap_together() {
+    let kit = Kit::builder()
+        .secret("akid", "AKID1")
+        .secret("sk", "SK1")
+        .addon(
+            AddonDef::test_layer("t")
+                .caps(&[roxy_wasm::Capability::Endpoints])
+                .endpoint(
+                    "monitor",
+                    "https://up.test/monitor",
+                    &[
+                        ("x-key-id", "${secret:akid}"),
+                        ("authorization", "Bearer ${secret:sk}"),
+                    ],
+                    true,
+                ),
+        )
+        .start()
+        .await;
+    let a = cap(&kit, "endpoint").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    kit.server.handle().swap_secrets(
+        [
+            ("akid".to_owned(), "AKID2".to_owned()),
+            ("sk".to_owned(), "SK2".to_owned()),
+        ]
+        .into(),
+    );
+    let a = cap(&kit, "endpoint").await;
+    assert_eq!(a.status, 200, "{a:?}");
+
+    let seen = kit.upstream.wait_seen(2).await;
+    let calls: Vec<_> = seen.iter().filter(|s| s.path == "/monitor").collect();
+    assert_eq!(calls.len(), 2, "{seen:#?}");
+    assert_eq!(calls[0].headers["x-key-id"], "AKID1");
+    assert_eq!(calls[0].headers["authorization"], "Bearer SK1");
+    assert_eq!(calls[1].headers["x-key-id"], "AKID2");
+    assert_eq!(calls[1].headers["authorization"], "Bearer SK2");
+}
+
 /// `path: prefix` appends the layer's path and query under the configured
 /// path, with dot segments and percent-encodings normalised first.
 #[tokio::test]

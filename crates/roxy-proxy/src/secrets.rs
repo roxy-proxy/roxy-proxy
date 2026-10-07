@@ -93,11 +93,6 @@ impl SecretStore {
         self.state.load_full()
     }
 
-    /// The value of secret `name`, as of now.
-    pub(crate) fn get(&self, name: &str) -> Option<String> {
-        self.state.load().get(name)
-    }
-
     /// The current redactor: the redacted header names plus the current
     /// secret values and those the last swap replaced.
     pub(crate) fn redactor(&self) -> Arc<Redactor> {
@@ -144,17 +139,17 @@ mod tests {
     #[test]
     fn swap_reads_new_values_and_redacts_the_replaced_ones() {
         let store = SecretStore::new(map(&[("k", "old-value")]), Redactor::new());
-        assert_eq!(store.get("k").as_deref(), Some("old-value"));
+        assert_eq!(store.load().get("k").as_deref(), Some("old-value"));
 
         store.swap(map(&[("k", "new-value")]));
-        assert_eq!(store.get("k").as_deref(), Some("new-value"));
+        assert_eq!(store.load().get("k").as_deref(), Some("new-value"));
         let r = store.redactor();
         assert_eq!(r.redact_str("x old-value y"), "x [REDACTED] y");
         assert_eq!(r.redact_str("x new-value y"), "x [REDACTED] y");
 
         // Two swaps on: the first generation is no longer in flight.
         store.swap(map(&[]));
-        assert_eq!(store.get("k"), None);
+        assert_eq!(store.load().get("k"), None);
         let r = store.redactor();
         assert_eq!(r.redact_str("new-value"), "[REDACTED]");
         assert_eq!(r.redact_str("old-value"), "old-value");
@@ -171,7 +166,7 @@ mod tests {
         store.swap(map(&[("akid", "AKID3"), ("sk", "SK3")]));
         assert_eq!(generation.get("sk").as_deref(), Some("SK1"));
         assert_eq!(generation.redactor().redact_str("SK1"), "[REDACTED]");
-        assert_eq!(store.get("sk").as_deref(), Some("SK3"));
+        assert_eq!(store.load().get("sk").as_deref(), Some("SK3"));
         assert_eq!(store.redactor().redact_str("SK1"), "SK1");
     }
 

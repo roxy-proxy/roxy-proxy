@@ -17,6 +17,7 @@ use roxy_wasm::{EndpointError, LayerRequest, LayerResponse};
 
 use super::{AddonSpec, EndpointPath, EndpointSpec, StackFlow};
 use crate::flowlog::FlowEvent;
+use crate::secrets::Secrets;
 use crate::upstream::{ConnectError, Protocols, classify};
 
 /// Largest request body an endpoint call carries (it is buffered so a retry
@@ -43,12 +44,32 @@ const DROPPED: &[&str] = &[
     "content-length",
 ];
 
-/// `value` with its `${secret:name}` references expanded from the live
-/// secret store; `None` if one is missing or the value does not parse
-/// (validation refuses such a config, so this is a missing secret).
-pub(super) fn expand(value: &str, secret: impl Fn(&str) -> Option<String>) -> Option<String> {
+/// `value` with its `${secret:name}` references expanded by `secret`;
+/// `None` if one is missing or the value does not parse (validation
+/// refuses such a config, so this is a missing secret).
+fn expand(value: &str, secret: impl Fn(&str) -> Option<String>) -> Option<String> {
     let parts = roxy_rules::parse_template(value).ok()?;
     roxy_rules::expand(&parts, secret)
+}
+
+/// `spec`'s headers with their secrets resolved from `secrets`, the
+/// exchange's generation: every header of a call comes from one map, so a
+/// swap landing between two of them cannot pair a key id with another
+/// generation's key. `Err` names the header whose secret is not loaded or
+/// whose value is not a header value.
+pub(super) fn credentials(
+    spec: &EndpointSpec,
+    secrets: &Secrets,
+) -> Result<Vec<(HeaderName, HeaderValue)>, String> {
+    spec.headers
+        .iter()
+        .map(|(n, v)| {
+            let v = expand(v, |name| secrets.get(name))
+                .ok_or_else(|| format!("endpoint header {n}: secret not loaded"))?;
+            let v = HeaderValue::from_str(&v).map_err(|_| format!("endpoint header {n}"))?;
+            Ok((n.clone(), v))
+        })
+        .collect()
 }
 
 /// The URL for a call. `fixed`: the endpoint's URL as configured. `prefix`:
@@ -153,7 +174,7 @@ pub(crate) async fn call(
         layer: addon.name.clone(),
         endpoint: name.to_owned(),
         method: method.to_string(),
-        path: st.snap.secrets.redactor().redact_str(&path).into_owned(),
+        path: st.secrets().redactor().redact_str(&path).into_owned(),
         status,
         attempts,
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -190,11 +211,8 @@ async fn attempt_all(
             headers.append(n.clone(), v.clone());
         }
     }
-    for (n, v) in &spec.headers {
-        let v = expand(v, |name| st.snap.secrets.get(name))
-            .ok_or_else(|| fail(format!("endpoint header {n}: secret not loaded")))?;
-        let v = HeaderValue::from_str(&v).map_err(|_| fail(format!("endpoint header {n}")))?;
-        headers.insert(n.clone(), v);
+    for (n, v) in credentials(spec, st.secrets()).map_err(fail)? {
+        headers.insert(n, v);
     }
     let host = HeaderValue::from_str(&authority.to_host_header(scheme))
         .map_err(|_| fail("endpoint host".into()))?;
@@ -278,7 +296,11 @@ pub(crate) async fn notify(st: &StackFlow, addon: &AddonSpec, name: &str, json: 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::flowlog::Redactor;
+    use crate::secrets::SecretStore;
 
     fn spec(url: &str, path: EndpointPath) -> EndpointSpec {
         EndpointSpec {
@@ -384,6 +406,44 @@ mod tests {
         for req in ["/", "/score?q=1", "/admin", "/?admin=1"] {
             assert_eq!(t(req), "https://api.example.com/v1/messages", "{req}");
         }
+    }
+
+    /// Every header of a call resolves from the generation the exchange
+    /// loaded; a swap after that load, before or between the headers, is
+    /// invisible to the call and only reaches the next exchange.
+    #[test]
+    fn credentials_come_from_one_generation() {
+        let generation = |n: u8| {
+            HashMap::from([
+                ("akid".to_owned(), format!("AKID{n}")),
+                ("sk".to_owned(), format!("SK{n}")),
+            ])
+        };
+        let store = SecretStore::new(generation(1), Redactor::new());
+        let mut spec = spec("https://api.example.com/v1", EndpointPath::Fixed);
+        spec.headers = vec![
+            ("x-key-id".parse().unwrap(), "${secret:akid}".to_owned()),
+            (
+                "authorization".parse().unwrap(),
+                "Bearer ${secret:sk}".to_owned(),
+            ),
+        ];
+
+        let exchange = store.load();
+        store.swap(generation(2));
+        let got = credentials(&spec, &exchange).unwrap();
+        assert_eq!(got[0].1, "AKID1");
+        assert_eq!(got[1].1, "Bearer SK1");
+
+        let next = credentials(&spec, &store.load()).unwrap();
+        assert_eq!(next[0].1, "AKID2");
+        assert_eq!(next[1].1, "Bearer SK2");
+
+        store.swap(HashMap::new());
+        assert_eq!(
+            credentials(&spec, &store.load()).unwrap_err(),
+            "endpoint header x-key-id: secret not loaded"
+        );
     }
 
     #[test]

@@ -188,13 +188,8 @@ pub(super) fn handshake_request(
         .into_client_request()
         .map_err(|e| ServiceError::Connect(e.to_string()))?;
     let h = request.headers_mut();
-    for (n, v) in &spec.headers {
-        let v = endpoint::expand(v, |name| st.snap.secrets.get(name)).ok_or_else(|| {
-            ServiceError::Connect(format!("endpoint header {n}: secret not loaded"))
-        })?;
-        let v = HeaderValue::from_str(&v)
-            .map_err(|_| ServiceError::Connect(format!("endpoint header {n}")))?;
-        h.insert(n.clone(), v);
+    for (n, v) in endpoint::credentials(spec, st.secrets()).map_err(ServiceError::Connect)? {
+        h.insert(n, v);
     }
     h.insert(
         http::header::SEC_WEBSOCKET_PROTOCOL,
