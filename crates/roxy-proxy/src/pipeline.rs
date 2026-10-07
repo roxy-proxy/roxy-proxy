@@ -455,7 +455,12 @@ impl FlowMeta {
     }
 
     pub(crate) fn metric_error(&self, stage: Stage, e: &MetricSourceError) {
-        tracing::warn!(flow = %self.flow, stage = stage.as_str(), error = %e, "metric recording failed; failing closed");
+        let detail = self
+            .secrets()
+            .redactor()
+            .redact_str(&e.to_string())
+            .into_owned();
+        tracing::warn!(flow = %self.flow, stage = stage.as_str(), error = %detail, "metric recording failed; failing closed");
         let ts = chrono::Utc::now();
         if matches!(e, MetricSourceError::TableFull(_)) {
             self.shared.sink.emit(&FlowEvent::MetricTableFull {
@@ -463,7 +468,7 @@ impl FlowMeta {
                 flow: self.flow.to_string(),
                 conn: self.conn_id(),
                 stage,
-                detail: e.to_string(),
+                detail,
             });
         } else {
             self.shared.sink.emit(&FlowEvent::PolicyInputUnavailable {
@@ -471,7 +476,7 @@ impl FlowMeta {
                 flow: self.flow.to_string(),
                 conn: self.conn_id(),
                 stage,
-                reason: format!("{}: {e}", e.code()),
+                reason: format!("{}: {detail}", e.code()),
             });
         }
     }

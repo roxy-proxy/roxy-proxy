@@ -1251,6 +1251,39 @@ mod tests {
         );
     }
 
+    /// A metric source's detail can quote the series key, which a rule may
+    /// build from request data.
+    #[tokio::test]
+    async fn a_metric_error_is_redacted_in_the_operational_log_too() {
+        use crate::flowlog::Stage;
+        use crate::sources::MetricSourceError;
+        let secret = "sk-live-123";
+        let kit = Kit::builder()
+            .secret("k", secret)
+            .addon(AddonDef::test_layer("a"))
+            .start()
+            .await;
+        let (_st, cx) = test_flow(&kit);
+        let e = MetricSourceError::KeyUnavailable(format!("key token={secret}"));
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            cx.metric_error(Stage::Head, &e);
+        });
+        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("metric recording failed"), "{logged}");
+        assert!(!logged.contains(secret), "{logged}");
+        assert!(logged.contains(REDACTED), "{logged}");
+        let errs = kit.events("policy_input_unavailable", 1).await;
+        assert_eq!(
+            errs[0]["reason"],
+            format!("{}: metric key unavailable: key token={REDACTED}", e.code())
+        );
+    }
+
     /// A request body that failed in the core closes the connection as a
     /// client's fault, unless a layer's own failure explains the exchange.
     #[tokio::test]

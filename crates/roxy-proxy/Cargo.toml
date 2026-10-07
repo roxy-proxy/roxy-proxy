@@ -21,8 +21,7 @@ h2 = "0.4.19"
 http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.5"
-# Exact: `upstream::hyper_never_sent` matches one of hyper's error messages.
-hyper = { version = "=1.11.1", features = ["client", "server", "http1", "http2"] }
+hyper = { version = "1.11.1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1.21", features = ["client-legacy", "tokio", "http1", "http2"] }
 ring.workspace = true
 ipnet.workspace = true

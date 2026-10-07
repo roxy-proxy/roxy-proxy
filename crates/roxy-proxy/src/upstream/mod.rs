@@ -665,8 +665,9 @@ fn never_reached_origin(err: &ClientError) -> bool {
 /// Whether hyper never sent the request: it was cancelled before dispatch,
 /// or its dispatcher went away with it queued. hyper has no predicate for
 /// the second (`Kind::User(User::DispatchGone)` is private, and `is_user`
-/// covers unrelated misuse too), so the message is matched; the hyper
-/// version is pinned exactly, and a test pins the message.
+/// covers unrelated misuse too), so the message is matched;
+/// `a_request_dropped_with_its_dispatcher_was_never_sent` fails if a hyper
+/// bump rewords it.
 fn hyper_never_sent(h: &hyper::Error) -> bool {
     h.is_canceled() || h.to_string() == "dispatch task is gone"
 }
