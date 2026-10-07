@@ -31,7 +31,7 @@ use http::StatusCode;
 use roxy_http::h1::ServerConn;
 use roxy_http::url::{normalize_path, normalize_query};
 use roxy_http::{
-    Authority, Body, BodyError, CanonicalRequest, CanonicalResponse, DriveError, Method,
+    Authority, Body, BodyError, CanonicalRequest, CanonicalResponse, DriveError, Headers, Method,
     ParseError, Query, Reason, Scheme, status_forbids_body,
 };
 use roxy_rules::{
@@ -944,7 +944,7 @@ async fn inspect_request_body(
         return Verdict::Continue(req);
     }
     let cap = cx.snap.limits.max_inspect_body_bytes;
-    let Some(mut lease) = reserve_inspection(cx, &req.body, cap) else {
+    let Some(mut lease) = reserve_decoded_inspection(cx, &req.headers, &req.body, cap) else {
         return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
     };
     let inspected = match io.collect(&mut req.body, cap).await {
@@ -976,11 +976,29 @@ fn known_empty(body: &Body) -> bool {
     body.known_length() == Some(0) || http_body::Body::is_end_stream(body)
 }
 
-/// Reserves the budget an inspected body can need: its declared length
+/// Reserves the budget a body held as sent can need: its declared length
 /// when the framing gives one, else the whole cap.
 fn reserve_inspection(cx: &FlowCx, body: &Body, cap: u64) -> Option<BufferLease> {
     let bytes = body.known_length().map_or(cap, |n| n.min(cap));
     cx.shared.reserve_buffer(bytes)
+}
+
+/// Reserves the budget a body inspected by the rules can need. The facts
+/// hold the body decoded by its `content-encoding`, which can be any size
+/// up to the cap whatever length the framing declares, so an encoded body
+/// reserves the whole cap.
+fn reserve_decoded_inspection(
+    cx: &FlowCx,
+    headers: &Headers,
+    body: &Body,
+    cap: u64,
+) -> Option<BufferLease> {
+    let encoded = roxy_http::coding::content_codings(headers).is_ok_and(|c| !c.is_empty());
+    if encoded {
+        cx.shared.reserve_buffer(cap)
+    } else {
+        reserve_inspection(cx, body, cap)
+    }
 }
 
 /// What a completely buffered body holds for the rest of the exchange: the
@@ -1298,7 +1316,7 @@ async fn inspect_response_body(
         return ResponseVerdict::Continue(res);
     }
     let cap = cx.snap.limits.max_inspect_body_bytes;
-    let Some(mut lease) = reserve_inspection(cx, &res.body, cap) else {
+    let Some(mut lease) = reserve_decoded_inspection(cx, &res.headers, &res.body, cap) else {
         return ResponseVerdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
     };
     let inspected = match io.collect(&mut res.body, cap).await {

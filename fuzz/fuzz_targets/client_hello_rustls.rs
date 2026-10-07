@@ -26,7 +26,12 @@ struct RecordSni(Mutex<Option<Option<String>>>);
 
 impl ResolvesServerCert for RecordSni {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        *self.0.lock().unwrap() = Some(hello.server_name().map(str::to_owned));
+        // rustls keeps a trailing dot; roxy's canonical host drops it.
+        *self.0.lock().unwrap() = Some(
+            hello
+                .server_name()
+                .map(|n| n.strip_suffix('.').unwrap_or(n).to_owned()),
+        );
         None
     }
 }

@@ -67,7 +67,10 @@ negotiates `h2`. HTTP/1.1 cannot carry them without naming them in a
 `Trailer` header up front, and roxy does not know the names until the body
 ends, so a request that carries trailers to an HTTP/1.1 origin fails with
 the `trailers` reason (`400` and the connection closed on HTTP/1.1, a
-stream reset on HTTP/2) before the origin sees it complete.
+stream reset on HTTP/2) before the origin sees it complete. The refusal
+applies while any HTTP/1.1 connection to that origin is open or pooled
+(hyper keeps idle connections for about 90 s), including one opened for a
+request that was held to HTTP/1.1.
 
 ## Canonical request
 

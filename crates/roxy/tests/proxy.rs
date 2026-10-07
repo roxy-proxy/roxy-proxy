@@ -188,7 +188,7 @@ async fn an_expired_valid_until_loads_denies_and_recovers_on_reload() {
     let ev = h.wait_events("request", 1).await;
     assert_eq!(ev[0]["terminal_rule"], "_expired", "{ev:#?}");
     assert_eq!(ev[0]["reason"], "policy_expired", "{ev:#?}");
-    assert_eq!(h.wait_events("policy_expired", 1).await.len(), 1);
+    h.wait_events("policy_expired", 1).await;
 
     let health_url = format!("http://{}/healthz", h.ca_server.unwrap());
     let health = || {

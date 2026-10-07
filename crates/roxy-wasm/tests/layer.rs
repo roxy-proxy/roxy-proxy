@@ -299,7 +299,9 @@ async fn failures_after_the_head_cut_the_body() {
 /// Tags live on the host, outside `max_memory`, so the host caps them: a
 /// guest that keeps tagging after its head is out is failed at the cap,
 /// and its body cut, rather than growing the host's memory until the
-/// client gives up.
+/// client gives up. The cap here is the mock host's (`MOCK_TAG_CAP`); this
+/// pins the guest-side failure, and roxy-proxy's tests pin the production
+/// cap.
 #[tokio::test]
 async fn looping_on_add_tag_after_the_head_fails_at_the_cap() {
     let rt = runtime();

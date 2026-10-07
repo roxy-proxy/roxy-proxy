@@ -494,6 +494,9 @@ impl<'de> Deserialize<'de> for StringPairs {
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<StringPairs, A::Error> {
                 let mut out: Vec<(String, String)> = Vec::new();
                 while let Some(k) = map.next_key::<String>()? {
+                    if out.iter().any(|(seen, _)| *seen == k) {
+                        return Err(de::Error::custom(format!("duplicate key `{k}`")));
+                    }
                     let v = map.next_value::<String>()?;
                     out.push((k, v));
                 }
@@ -730,6 +733,11 @@ mod tests {
             ("[]", "at least one action"),
             ("~", "at least one action"),
             ("{ set_header: [a] }", "then.set_header"),
+            (
+                "{ set_header: { x-env: a, x-env: b } }",
+                "duplicate key `x-env`",
+            ),
+            ("{ set_query: { q: a, q: b } }", "duplicate key `q`"),
             ("{ capture: everything }", "then.capture"),
             ("{ allow: { upgrade: h2c } }", "then.allow"),
             ("{ allow: { inspect: true } }", "then.allow"),

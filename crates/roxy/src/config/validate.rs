@@ -388,11 +388,20 @@ impl Config {
                 format!("at most {MAX_ENDPOINT_RETRIES}"),
             ));
         }
+        let mut header_names = HashSet::new();
         for (h, v) in &e.headers {
             if http::HeaderName::from_bytes(h.as_bytes()).is_err() {
                 d.push(Diagnostic::new(
                     format!("{path}.headers.{h}"),
                     "invalid header name",
+                ));
+            }
+            // Header names are case-insensitive, so a map keyed on the
+            // spelling can still name one twice.
+            if !header_names.insert(h.to_ascii_lowercase()) {
+                d.push(Diagnostic::new(
+                    format!("{path}.headers.{h}"),
+                    format!("duplicate key `{h}` (header names are case-insensitive)"),
                 ));
             }
             match parse_template(v) {
@@ -479,17 +488,32 @@ impl Config {
 }
 
 impl Config {
+    /// `static_hosts` names are what the proxy's host parser accepts, and
+    /// CIDRs are networks (no host bits), as in address lists and rule
+    /// literals.
     fn validate_upstream(&self, d: &mut Vec<Diagnostic>) {
         for name in self.upstream.dns.static_hosts.keys() {
-            let norm = name.trim_end_matches('.').to_ascii_lowercase();
             if !matches!(
-                roxy_http::url::parse_host(norm.as_bytes()),
+                roxy_http::url::parse_host(name.as_bytes()),
                 Ok(roxy_http::Host::Dns(_))
             ) {
                 d.push(Diagnostic::new(
                     format!("upstream.dns.static_hosts.{name}"),
                     "must be a DNS host name (A-labels)",
                 ));
+            }
+        }
+        for (field, nets) in [
+            ("deny_cidrs", &self.upstream.deny_cidrs),
+            ("allow_cidrs", &self.upstream.allow_cidrs),
+        ] {
+            for (i, net) in nets.iter().enumerate() {
+                if net.trunc() != *net {
+                    d.push(Diagnostic::new(
+                        format!("upstream.{field}[{i}]"),
+                        format!("has host bits set (did you mean {}?)", net.trunc()),
+                    ));
+                }
             }
         }
     }

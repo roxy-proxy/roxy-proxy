@@ -16,8 +16,8 @@ use crate::view::ProxyView;
 pub(crate) struct StackHost {
     pub(crate) st: Arc<StackFlow>,
     pub(crate) index: usize,
-    /// Observe mode: effects other than records are not taken, and `next`
-    /// returns the copy of the real response.
+    /// Observe mode: effects on the flow (`next`, `add-tag`) are not taken,
+    /// and `next` returns the copy of the real response.
     pub(crate) observer: Option<super::tee::ObserverNext>,
 }
 

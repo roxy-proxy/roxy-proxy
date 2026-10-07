@@ -9,6 +9,10 @@ use roxy_rules::StateStore;
 
 use super::StateLimits;
 
+/// Longest key a layer may store. The store outlives the exchange, and
+/// `max_value_bytes` says nothing about keys.
+pub(crate) const MAX_STATE_KEY_BYTES: usize = 1024;
+
 /// Every addon's store, by addon name. Each is a [`StateStore`]: sharded,
 /// bounded by the addon's `max_entries` with no early eviction (a write of
 /// a new key when full fails), and purged when full at most every 100 ms,
@@ -34,6 +38,12 @@ impl LayerStates {
         value: &str,
         ttl: Option<Duration>,
     ) -> Result<(), String> {
+        if key.len() > MAX_STATE_KEY_BYTES {
+            return Err(format!(
+                "key is {} bytes; the limit is {MAX_STATE_KEY_BYTES}",
+                key.len()
+            ));
+        }
         if value.len() > limits.max_value_bytes {
             return Err(format!(
                 "value is {} bytes; the limit is {}",
@@ -104,6 +114,9 @@ mod tests {
         assert!(s.put("a", &limits, "k1", "11", None).is_ok());
         assert!(s.put("b", &limits, "k3", "3", None).is_ok());
         assert!(s.put("a", &limits, "k1", "12345", None).is_err());
+        let long = "k".repeat(MAX_STATE_KEY_BYTES + 1);
+        assert!(s.put("a", &limits, &long, "1", None).is_err());
+        assert_eq!(s.get("a", &long), None);
         assert_eq!(s.get("a", "k1").as_deref(), Some("11"));
         assert_eq!(s.get("b", "k1"), None);
         // Expired entries make room.

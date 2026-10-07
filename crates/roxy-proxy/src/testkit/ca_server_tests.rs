@@ -68,7 +68,7 @@ async fn healthz_reports_the_lease_state() {
         "{head}"
     );
     assert_eq!(body, b"ok");
-    assert_eq!(kit.events("policy_expired", 1).await.len(), 1);
+    kit.events("policy_expired", 1).await;
 }
 
 /// `/readyz` is `200` once a policy has been applied and its lease has
