@@ -49,7 +49,7 @@ An `http` listener is spoken to as the server: the client sends
 `GET /v1/messages HTTP/1.1` with `Host: anthropic.gw.example.com`, as it
 would to the origin, and the rules decide where the request goes. This is
 the mode for a gateway behind a TLS-terminating load balancer
-([gateway](/deploy/gateway)).
+([HTTP gateway](/deploy/gateway)).
 
 ```yaml
 listeners:

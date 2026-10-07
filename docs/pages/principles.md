@@ -4,6 +4,12 @@ roxy is a security boundary for outbound HTTP. These principles decide
 every behaviour described in the other pages; where a page says "fails
 closed" or "deny wins", this is why.
 
+There is one threat model for both ways of deploying roxy. What roxy
+prevents, it prevents for traffic that reaches it, in a
+[sandbox](/deploy/containment) and in a [gateway](/deploy/gateway) alike.
+Whether all of a workload's traffic reaches roxy is a property of the
+network, and only the sandbox use case claims it.
+
 ## Threat model
 
 **Attacker:** the client. It controls every byte it sends to roxy, may run
@@ -29,15 +35,17 @@ so the client sees one clean wire form.
   addons;
 - learning anything useful from a deny beyond the rule id.
 
-**roxy does not try to prevent** timing or DNS side channels from the
-workload (block DNS egress at the network layer; roxy resolves names
-itself), compromise of an upstream the rules already allow, or compromise of
-the host running roxy.
+**roxy does not try to prevent** traffic that never reaches it, timing or
+DNS side channels from the workload (block DNS egress at the network layer;
+roxy resolves names itself), compromise of an upstream the rules already
+allow, or compromise of the host running roxy.
 
-Containment comes from the network: the workload must have no route out
-except through roxy ([deployment](/deploy/overview)).
 roxy decides what passes through it; it cannot stop traffic that never
-reaches it.
+reaches it. In the sandbox use case containment comes from the network: the
+workload must have no route out except through roxy
+([sandbox containment](/deploy/containment)). A gateway makes no such
+claim. It governs the requests its clients send to it, and the clients keep
+whatever other routes they have ([HTTP gateway](/deploy/gateway)).
 
 ## Fail closed
 
