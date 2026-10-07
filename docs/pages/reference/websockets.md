@@ -24,6 +24,13 @@ holds the upstream side, so a failed upgrade is an error response, never a
 | the upstream answers anything other than `101` | relayed as it is |
 | a `101` with a wrong `Sec-WebSocket-Accept`, or accepting an extension when none may be negotiated ([below](/reference/websockets#extensions)) | `502`, `upstream_error`, reason `protocol_error` |
 
+Through an `http_proxy` listener a `ws://` URL means a `CONNECT` tunnel
+with a plaintext upgrade inside it, which roxy refuses unless
+`http.allow_plain_in_connect` is on (the tunnel is closed, `parse_error`
+reason `non_http_in_connect`; [CONNECT](/reference/http#connect)). Use
+`wss://`. On an `http` listener the upgrade arrives as plain HTTP and
+needs nothing.
+
 If no rule reads a `ws.*` field, roxy splices bytes: no frame parsing,
 re-masking or reassembly; subprotocols and extensions pass end to end. If
 any rule reads `ws.*`, every message is checked

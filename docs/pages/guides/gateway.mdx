@@ -102,5 +102,10 @@ below see the tag, so a per-user quota is another addon.
   (`tls_on_http_listener`). Keep the hop from the load balancer to roxy on a
   network you trust, since it carries the clients' requests in the clear.
   Clients trust the load balancer's certificate; roxy's CA plays no part.
+- **In-cluster upstreams are private addresses.** The address floor denies
+  RFC 1918 and the other private ranges by default, so a rule that forwards
+  to a service on the cluster network needs `private_ok: true` on its
+  `allow`: `then: { allow: { private_ok: true } }`
+  ([address floor](/reference/address-lists#address-floor)).
 - **Health checks** come from `ca_server` as usual
   ([health](/guides/operations#health)).
