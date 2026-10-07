@@ -245,7 +245,8 @@ fn to_wasi_error(err: &BodyError, dir: Dir) -> WasiError {
         | BodyError::Invalid(_)
         | BodyError::Upstream(_)
         | BodyError::Stopped
-        | BodyError::Undecodable(_)) => WasiError::InternalError(Some(other.to_string())),
+        | BodyError::Undecodable(_)
+        | BodyError::BudgetExhausted) => WasiError::InternalError(Some(other.to_string())),
     }
 }
 

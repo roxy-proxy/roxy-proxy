@@ -44,7 +44,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::addr::PrivateAddrs;
-use crate::body::{Collected, collect_prefix, collect_prefix_metered};
+use crate::body::{Collected, collect_prefix};
 use crate::exchange::{Front, Outcome, bad_upgrade_refusal, refusal_response};
 use crate::flowlog::{DecisionKind, FlowEvent, FlowSink};
 use crate::pipeline::{BodyIo, CollectFuture, Decider, FlowCx, FlowMeta, Refusal, RefusalKind};
@@ -735,6 +735,7 @@ fn error_kind(e: &StackError) -> String {
         LayerError::Host(_) => "host".into(),
         LayerError::Init(_) => "init".into(),
         LayerError::Instantiate(_) => "instantiate".into(),
+        LayerError::NoInstance => "no_instance".into(),
         LayerError::Cancelled => "cancelled".into(),
     }
 }
@@ -954,7 +955,7 @@ pub(crate) fn enter(
         // Layers see bodies decoded; a flow no layer runs on is left as
         // the client sent it.
         if st.snap.http.decode_for_addons && !st.request_decoded.swap(true, Ordering::SeqCst) {
-            decode::request(&mut req, st.snap.limits.max_request_body_bytes);
+            decode::request(&mut req, st.snap.limits.max_request_body_bytes, &st.shared);
         }
         if addon.mode == AddonMode::Observe {
             return tee::observe(st, index, req).await;
@@ -1013,17 +1014,9 @@ impl BodyIo for Detached {
         &'a mut self,
         body: &'a mut Body,
         cap: u64,
-    ) -> CollectFuture<'a, Result<Collected, roxy_http::DriveError>> {
-        Box::pin(async move { Ok(collect_prefix(body, cap).await) })
-    }
-
-    fn collect_metered<'a>(
-        &'a mut self,
-        body: &'a mut Body,
-        cap: u64,
         meter: &'a mut (dyn FnMut(u64) -> bool + Send),
     ) -> CollectFuture<'a, Result<Collected, roxy_http::DriveError>> {
-        Box::pin(async move { Ok(collect_prefix_metered(body, cap, meter).await) })
+        Box::pin(async move { Ok(collect_prefix(body, cap, meter).await) })
     }
 }
 
@@ -1089,7 +1082,7 @@ async fn core(
             // A flow no layer ran on gets the response as the origin sent
             // it.
             if snap.http.decode_for_addons && st.any_ran() {
-                decode::response(&mut res, snap.limits.max_response_body_bytes);
+                decode::response(&mut res, snap.limits.max_response_body_bytes, &st.shared);
             }
             Ok(to_layer_response(res))
         }

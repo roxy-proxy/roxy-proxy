@@ -5,7 +5,10 @@
 //! bytes and [`Decoder::read`] produces at most as many decoded bytes as the
 //! caller asks for. Memory is bounded by the read size and the coding's
 //! window, never by the compression ratio, so a decompression bomb costs
-//! CPU, not memory.
+//! CPU, not memory. The windows are the client's to size (a brotli stream
+//! declares up to 16 MiB), so each stage charges its window to the
+//! caller's [`Meter`] before it is created, and a charge the meter refuses
+//! fails the body.
 //!
 //! Decoding is strict. A truncated stream, a bad checksum, or any bytes
 //! after the end of the stream are errors, so nothing can hide behind the
@@ -32,6 +35,19 @@ pub const MAX_CODINGS: usize = 4;
 /// The largest zstd window accepted (RFC 9659: HTTP encoders must not use
 /// more, and decoders may refuse it).
 const ZSTD_MAX_WINDOW: u64 = 8 << 20;
+
+/// The deflate window (RFC 1951): what a gzip or deflate stage holds.
+const FLATE_WINDOW: u64 = 32 << 10;
+
+/// Asked, before a decoder allocates, whether it may hold `bytes` in all:
+/// the sum of its stages' windows so far. `false` fails the body with
+/// [`DecodeError::BudgetExhausted`] before anything is allocated.
+pub type Meter<'a> = Box<dyn FnMut(u64) -> bool + Send + 'a>;
+
+/// A [`Meter`] that allows everything, for callers with no budget.
+pub fn unmetered<'a>() -> Meter<'a> {
+    Box::new(|_| true)
+}
 
 /// A gzip header this long without being complete is refused. A header is
 /// 10 bytes plus an optional extra field (at most 64 KiB) and name and
@@ -103,6 +119,9 @@ pub enum DecodeError {
         /// The limit that was exceeded.
         limit: u64,
     },
+    /// The [`Meter`] refused a stage's window.
+    #[error("buffer budget cannot cover the decoder's window")]
+    BudgetExhausted,
 }
 
 /// The codings in `headers`' `content-encoding` fields, in the order they
@@ -134,9 +153,15 @@ pub fn content_codings(headers: &Headers) -> Result<Vec<Coding>, DecodeError> {
 }
 
 /// Decodes all of `input`, which was encoded with `codings` in that order.
-/// The decoded body may be at most `limit` bytes.
-pub fn decode(codings: &[Coding], input: &[u8], limit: u64) -> Result<Vec<u8>, DecodeError> {
-    let mut d = Decoder::new(codings, limit);
+/// The decoded body may be at most `limit` bytes; the stages' windows are
+/// charged to `meter`.
+pub fn decode(
+    codings: &[Coding],
+    input: &[u8],
+    limit: u64,
+    meter: Meter<'_>,
+) -> Result<Vec<u8>, DecodeError> {
+    let mut d = Decoder::new(codings, limit, meter);
     d.feed(input);
     d.finish();
     let mut out = Vec::new();
@@ -156,12 +181,13 @@ pub fn decode(codings: &[Coding], input: &[u8], limit: u64) -> Result<Vec<u8>, D
 /// so a decompression bomb is paced by the reader like any other body.
 /// More than `limit` decoded bytes fails the body with
 /// [`BodyError::TooLarge`]; data that does not decode fails it with
-/// [`BodyError::Undecodable`]. Trailers follow the decoded data.
-pub fn decode_body(body: Body, codings: &[Coding], limit: u64) -> Body {
+/// [`BodyError::Undecodable`]; a window `meter` refuses fails it with
+/// [`BodyError::BudgetExhausted`]. Trailers follow the decoded data.
+pub fn decode_body(body: Body, codings: &[Coding], limit: u64, meter: Meter<'static>) -> Body {
     Body::wrap_native(
         DecodedBody {
             inner: body,
-            dec: Decoder::new(codings, limit),
+            dec: Decoder::new(codings, limit, meter),
             buf: vec![0u8; FRAME_CHUNK].into_boxed_slice(),
             inner_done: false,
             trailers: None,
@@ -174,7 +200,7 @@ pub fn decode_body(body: Body, codings: &[Coding], limit: u64) -> Body {
 
 struct DecodedBody {
     inner: Body,
-    dec: Decoder,
+    dec: Decoder<'static>,
     buf: Box<[u8]>,
     inner_done: bool,
     trailers: Option<HeaderMap>,
@@ -205,6 +231,7 @@ impl http_body::Body for DecodedBody {
                     this.done = true;
                     let e = match e {
                         DecodeError::TooLarge { limit } => BodyError::TooLarge { limit },
+                        DecodeError::BudgetExhausted => BodyError::BudgetExhausted,
                         e @ (DecodeError::Unsupported(_) | DecodeError::Invalid { .. }) => {
                             BodyError::Undecodable(e.to_string())
                         }
@@ -239,9 +266,9 @@ impl http_body::Body for DecodedBody {
 }
 
 /// A streaming decoder for a stack of codings.
-pub struct Decoder {
+pub struct Decoder<'m> {
     /// `stages[0]` decodes the input as received: the coding applied last.
-    stages: Vec<Box<dyn Stage>>,
+    stages: Vec<Slot>,
     /// Encoded bytes queued for each stage.
     pending: Vec<Pending>,
     limit: u64,
@@ -251,36 +278,30 @@ pub struct Decoder {
     /// Any input was fed at all. An empty body is empty whatever its
     /// declared coding, as clients decode it.
     fed: bool,
+    /// The windows charged so far, and who they are charged to.
+    held: u64,
+    meter: Meter<'m>,
 }
 
-impl std::fmt::Debug for Decoder {
+impl std::fmt::Debug for Decoder<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Decoder")
             .field(
                 "codings",
-                &self.stages.iter().map(|s| s.coding()).collect::<Vec<_>>(),
+                &self.stages.iter().map(Slot::coding).collect::<Vec<_>>(),
             )
             .field("produced", &self.produced)
+            .field("held", &self.held)
             .finish_non_exhaustive()
     }
 }
 
-impl Decoder {
+impl<'m> Decoder<'m> {
     /// A decoder for a body encoded with `codings` (in the order applied)
-    /// whose decoded size may be at most `limit` bytes.
-    pub fn new(codings: &[Coding], limit: u64) -> Self {
-        let stages: Vec<Box<dyn Stage>> = codings
-            .iter()
-            .rev()
-            .map(|c| -> Box<dyn Stage> {
-                match c {
-                    Coding::Gzip => Box::new(Gzip::new()),
-                    Coding::Deflate => Box::new(Zlib::new()),
-                    Coding::Br => Box::new(Brotli::new()),
-                    Coding::Zstd => Box::new(Zstd::new()),
-                }
-            })
-            .collect();
+    /// whose decoded size may be at most `limit` bytes and whose windows
+    /// are charged to `meter`.
+    pub fn new(codings: &[Coding], limit: u64, meter: Meter<'m>) -> Self {
+        let stages: Vec<Slot> = codings.iter().rev().map(|c| Slot::Waiting(*c)).collect();
         // With no codings, `pending[0]` holds the bytes passing through.
         let pending = (0..stages.len().max(1))
             .map(|_| Pending::default())
@@ -292,6 +313,8 @@ impl Decoder {
             produced: 0,
             ended: false,
             fed: false,
+            held: 0,
+            meter,
         }
     }
 
@@ -334,7 +357,17 @@ impl Decoder {
     /// Fills `buf` from stage `i`, pulling input from the stages before it.
     fn pull(&mut self, i: usize, buf: &mut [u8]) -> Result<usize, DecodeError> {
         loop {
-            let stage = &mut self.stages[i];
+            self.start(i)?;
+            let Slot::Running(stage) = &mut self.stages[i] else {
+                // Not enough of the stream yet to size the window.
+                let Some(upstream) = i.checked_sub(1) else {
+                    return Ok(0);
+                };
+                if self.pull_into(upstream, i)? == 0 {
+                    return Ok(0);
+                }
+                continue;
+            };
             let (used, made) = stage
                 .step(self.pending[i].as_slice(), buf)
                 .map_err(|detail| DecodeError::Invalid {
@@ -352,19 +385,45 @@ impl Decoder {
             let Some(upstream) = i.checked_sub(1) else {
                 return Ok(0);
             };
-            let mut tmp = vec![0u8; STAGE_CHUNK];
-            let n = self.pull(upstream, &mut tmp)?;
-            if n == 0 {
+            if self.pull_into(upstream, i)? == 0 {
                 return Ok(0);
             }
-            self.pending[i].push(&tmp[..n]);
         }
+    }
+
+    /// Pulls one chunk from stage `from` into stage `to`'s queue.
+    fn pull_into(&mut self, from: usize, to: usize) -> Result<usize, DecodeError> {
+        let mut tmp = vec![0u8; STAGE_CHUNK];
+        let n = self.pull(from, &mut tmp)?;
+        self.pending[to].push(&tmp[..n]);
+        Ok(n)
+    }
+
+    /// Starts stage `i` once its queue shows enough of its stream to size
+    /// its window and the meter covers that window; it stays waiting while
+    /// more of the stream is needed first (a stream that ends before that
+    /// is truncated, as [`Self::check_complete`] reports).
+    fn start(&mut self, i: usize) -> Result<(), DecodeError> {
+        let Slot::Waiting(coding) = self.stages[i] else {
+            return Ok(());
+        };
+        let Some(window) = window(coding, self.pending[i].as_slice()) else {
+            return Ok(());
+        };
+        let held = self.held.saturating_add(window);
+        if !(self.meter)(held) {
+            return Err(DecodeError::BudgetExhausted);
+        }
+        self.held = held;
+        self.stages[i] = Slot::Running(stage_for(coding));
+        Ok(())
     }
 
     /// After the input has ended and nothing more decodes: every stage must
     /// be at the end of a stream with nothing left over.
     fn check_complete(&self) -> Result<(), DecodeError> {
         for (stage, pending) in self.stages.iter().zip(&self.pending) {
+            // A stage still waiting for its window never saw a whole stream.
             let detail = if !stage.is_done() {
                 "truncated stream"
             } else if !pending.as_slice().is_empty() {
@@ -417,6 +476,69 @@ impl Pending {
             self.start = 0;
         }
         self.buf.extend_from_slice(b);
+    }
+}
+
+/// A stage: waiting for enough of its stream to size and charge its
+/// window, or decoding.
+enum Slot {
+    Waiting(Coding),
+    Running(Box<dyn Stage>),
+}
+
+impl Slot {
+    fn coding(&self) -> Coding {
+        match self {
+            Self::Waiting(c) => *c,
+            Self::Running(s) => s.coding(),
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        match self {
+            Self::Waiting(_) => false,
+            Self::Running(s) => s.is_done(),
+        }
+    }
+}
+
+fn stage_for(coding: Coding) -> Box<dyn Stage> {
+    match coding {
+        Coding::Gzip => Box::new(Gzip::new()),
+        Coding::Deflate => Box::new(Zlib::new()),
+        Coding::Br => Box::new(Brotli::new()),
+        Coding::Zstd => Box::new(Zstd::new()),
+    }
+}
+
+/// The memory a `coding` stage holds for a stream that starts with
+/// `head`, known before the stage exists: the flate window; the ring
+/// buffer brotli sizes from the window bits in its first byte; or the
+/// largest zstd window accepted, which every frame of the stream may
+/// declare. `None` until `head` has the byte that says.
+fn window(coding: Coding, head: &[u8]) -> Option<u64> {
+    match coding {
+        Coding::Gzip | Coding::Deflate => Some(FLATE_WINDOW),
+        Coding::Br => head.first().map(|&b| 1u64 << brotli_window_bits(b)),
+        Coding::Zstd => Some(ZSTD_MAX_WINDOW),
+    }
+}
+
+/// WBITS from the first byte of a brotli stream (RFC 7932 §9.1), least
+/// significant bit first: 10 to 24. The large-window prefix, which the
+/// decoder refuses, reads as the largest standard window.
+#[expect(clippy::arithmetic_side_effects, reason = "n is at most 7")]
+fn brotli_window_bits(b: u8) -> u32 {
+    if b & 1 == 0 {
+        return 16;
+    }
+    match u32::from(b >> 1) & 7 {
+        0 => match u32::from(b >> 4) & 7 {
+            0 => 17,
+            1 => 24,
+            n => 8 + n,
+        },
+        n => 17 + n,
     }
 }
 
@@ -878,6 +1000,31 @@ mod tests {
 
     const ALL: [Coding; 4] = [Coding::Gzip, Coding::Deflate, Coding::Br, Coding::Zstd];
 
+    /// [`super::decode`] with no budget.
+    fn decode(codings: &[Coding], input: &[u8], limit: u64) -> Result<Vec<u8>, DecodeError> {
+        super::decode(codings, input, limit, unmetered())
+    }
+
+    /// [`super::decode`] with a meter that records what it was asked for
+    /// and refuses once the total passes `cap`.
+    fn decode_metered(
+        codings: &[Coding],
+        input: &[u8],
+        cap: u64,
+    ) -> (Result<Vec<u8>, DecodeError>, Vec<u64>) {
+        let mut asked = Vec::new();
+        let r = super::decode(
+            codings,
+            input,
+            u64::MAX,
+            Box::new(|held| {
+                asked.push(held);
+                held <= cap
+            }),
+        );
+        (r, asked)
+    }
+
     #[expect(
         clippy::arithmetic_side_effects,
         reason = "20_000 * 7919 fits in a u32"
@@ -899,7 +1046,7 @@ mod tests {
         chunk: usize,
         read: usize,
     ) -> Result<Vec<u8>, DecodeError> {
-        let mut d = Decoder::new(codings, u64::MAX);
+        let mut d = Decoder::new(codings, u64::MAX, unmetered());
         let mut out = Vec::new();
         let mut buf = vec![0u8; read];
         for piece in input.chunks(chunk) {
@@ -1001,7 +1148,7 @@ mod tests {
     fn a_read_never_returns_more_than_asked() {
         let bomb = vec![b'a'; 4 << 20];
         for c in ALL {
-            let mut d = Decoder::new(&[c], u64::MAX);
+            let mut d = Decoder::new(&[c], u64::MAX, unmetered());
             d.feed(&encode(c, &bomb));
             d.finish();
             let mut buf = [0u8; 100];
@@ -1150,6 +1297,90 @@ mod tests {
         );
     }
 
+    /// Each stage charges its window to the meter before it exists:
+    /// brotli the window its first byte declares, zstd the largest window
+    /// accepted, gzip and deflate the flate window; stacked codings add
+    /// up. A charge the meter refuses fails the decode before a byte is
+    /// decoded, and the meter is never asked for more once it has refused.
+    #[test]
+    fn stages_charge_their_windows_before_decoding() {
+        let body = sample();
+        let (r, asked) = decode_metered(&[Coding::Gzip], &gzip(&body), u64::MAX);
+        assert_eq!(r.unwrap(), body);
+        assert_eq!(asked, vec![FLATE_WINDOW]);
+        let (r, asked) = decode_metered(&[Coding::Zstd], &zstd(&body), u64::MAX);
+        assert_eq!(r.unwrap(), body);
+        assert_eq!(asked, vec![ZSTD_MAX_WINDOW]);
+        let enc = br(&body);
+        let declared = 1u64 << brotli_window_bits(enc[0]);
+        let (r, asked) = decode_metered(&[Coding::Br], &enc, u64::MAX);
+        assert_eq!(r.unwrap(), body);
+        assert_eq!(asked, vec![declared]);
+        // The stage applied last is charged first; the inner one once the
+        // outer has produced its first byte.
+        let (r, asked) = decode_metered(&[Coding::Br, Coding::Gzip], &gzip(&enc), u64::MAX);
+        assert_eq!(r.unwrap(), body);
+        assert_eq!(asked, vec![FLATE_WINDOW, FLATE_WINDOW + declared]);
+
+        // A 1 KiB body whose first byte declares WBITS 24 costs 16 MiB.
+        let mut bomb = vec![0x0f];
+        bomb.extend(std::iter::repeat_n(0u8, 1023));
+        let (r, asked) = decode_metered(&[Coding::Br], &bomb, 8 << 20);
+        assert_eq!(r.unwrap_err(), DecodeError::BudgetExhausted);
+        assert_eq!(asked, vec![1 << 24]);
+        let (r, asked) = decode_metered(&[Coding::Br, Coding::Br], &bomb, 1 << 24);
+        assert!(r.is_err(), "{r:?}");
+        assert_eq!(asked, vec![1 << 24], "no charge after a refusal");
+    }
+
+    /// RFC 7932 §9.1: the window bits are the first 1 to 7 bits of the
+    /// stream.
+    #[test]
+    fn brotli_window_bits_follow_the_spec() {
+        assert_eq!(brotli_window_bits(0b0000_0000), 16);
+        assert_eq!(brotli_window_bits(0b1111_1110), 16, "only bit 0 counts");
+        for n in 1..=7u8 {
+            assert_eq!(brotli_window_bits(1 | n << 1), 17 + u32::from(n));
+        }
+        assert_eq!(brotli_window_bits(0b0000_0001), 17);
+        for n in 2..=7u8 {
+            assert_eq!(brotli_window_bits(1 | n << 4), 8 + u32::from(n));
+        }
+        assert_eq!(brotli_window_bits(0b0001_0001), 24, "large window reads as the maximum");
+        for wbits in [16u32, 18, 22, 24] {
+            let mut p = brotli::enc::BrotliEncoderParams::default();
+            p.lgwin = i32::try_from(wbits).unwrap();
+            let mut out = Vec::new();
+            brotli::BrotliCompress(&mut &sample()[..], &mut out, &p).unwrap();
+            assert!(brotli_window_bits(out[0]) <= wbits, "lgwin {wbits}: {}", out[0]);
+        }
+    }
+
+    /// A streaming body charges the same way, and ends with its own error
+    /// when the meter refuses.
+    #[tokio::test]
+    async fn a_decoded_body_fails_when_the_meter_refuses() {
+        let enc = br(&sample());
+        let body = decode_body(
+            Body::from_bytes(enc.clone()),
+            &[Coding::Br],
+            u64::MAX,
+            Box::new(|_| false),
+        );
+        let (frames, end) = drain(body).await;
+        assert!(frames.is_empty(), "{frames:?}");
+        assert_eq!(end.unwrap_err(), BodyError::BudgetExhausted);
+        let body = decode_body(
+            Body::from_bytes(enc),
+            &[Coding::Br],
+            u64::MAX,
+            Box::new(|held| held <= 1 << 24),
+        );
+        let (frames, end) = drain(body).await;
+        end.unwrap();
+        assert_eq!(frames.concat(), sample());
+    }
+
     #[test]
     fn zstd_windows_over_8_mib_are_refused() {
         // Frame header: magic, FHD 0 (window descriptor present, no
@@ -1194,7 +1425,7 @@ mod tests {
             tx.ready().await.unwrap();
             tx.try_finish().unwrap();
         });
-        let (frames, end) = drain(decode_body(inner, &[Coding::Gzip], u64::MAX)).await;
+        let (frames, end) = drain(decode_body(inner, &[Coding::Gzip], u64::MAX, unmetered())).await;
         end.unwrap();
         assert!(frames.iter().all(|f| f.len() <= FRAME_CHUNK));
         assert_eq!(frames.concat(), body);
@@ -1204,11 +1435,11 @@ mod tests {
     async fn a_decoded_body_fails_rather_than_ending_short() {
         let mut enc = gzip(b"payload");
         enc.truncate(enc.len() - 1);
-        let (_, end) = drain(decode_body(Body::from_bytes(enc), &[Coding::Gzip], 100)).await;
+        let (_, end) = drain(decode_body(Body::from_bytes(enc), &[Coding::Gzip], 100, unmetered())).await;
         assert!(matches!(end, Err(BodyError::Undecodable(_))), "{end:?}");
 
         let enc = gzip(&vec![0u8; 1 << 20]);
-        let (_, end) = drain(decode_body(Body::from_bytes(enc), &[Coding::Gzip], 1000)).await;
+        let (_, end) = drain(decode_body(Body::from_bytes(enc), &[Coding::Gzip], 1000, unmetered())).await;
         assert_eq!(end, Err(BodyError::TooLarge { limit: 1000 }));
     }
 

@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
+use http::HeaderMap;
 use http_body::{Frame, SizeHint};
 use ring::digest::{Context as Digest, SHA256};
 use roxy_http::{Body, BodyError, ParseError, Reason};
@@ -262,16 +263,18 @@ impl http_body::Body for Chain {
     }
 }
 
-/// Result of [`collect_prefix`].
+/// Result of [`collect_prefix`]. `held` is what the rebuilt body keeps in
+/// memory: the data buffered plus the trailers' names and values.
 #[derive(Debug)]
 pub(crate) enum Collected {
-    /// The whole body, at most `cap` bytes. The original body is now an
-    /// equivalent in-memory body: these bytes, then any trailers it ended
-    /// with.
-    Complete(Bytes),
+    /// The whole body, at most `cap` bytes of data. The original body is
+    /// now an equivalent in-memory body: these bytes, then any trailers it
+    /// ended with.
+    Complete { data: Bytes, held: u64 },
     /// More than `cap` bytes. Nothing was lost: the original body was
-    /// replaced by the bytes read so far chained with the unread rest.
-    TooLarge,
+    /// replaced by the `held` bytes read so far chained with the unread
+    /// rest; `held` is 0 for a body whose declared length said so.
+    TooLarge { held: u64 },
     /// The meter refused to cover the bytes read so far. Nothing was lost,
     /// as for `TooLarge`.
     BudgetExhausted,
@@ -280,17 +283,19 @@ pub(crate) enum Collected {
     Failed(BodyError),
 }
 
-/// Buffers up to `cap` bytes of `body` for inspection, replacing
-/// `*body` with a stream that yields exactly the same bytes downstream.
-/// Never pre-allocates from a declared length.
-pub(crate) async fn collect_prefix(body: &mut Body, cap: u64) -> Collected {
-    collect_prefix_metered(body, cap, &mut |_| true).await
+/// Bytes a trailer section holds: its names and values.
+pub(crate) fn header_bytes(h: &HeaderMap) -> u64 {
+    h.iter()
+        .map(|(n, v)| (n.as_str().len() + v.len()) as u64)
+        .sum()
 }
 
-/// [`collect_prefix`] with `meter` asked, after each data frame, whether
-/// the bytes held so far may be kept; `false` stops with
-/// [`Collected::BudgetExhausted`].
-pub(crate) async fn collect_prefix_metered(
+/// Buffers up to `cap` bytes of `body` for inspection, replacing
+/// `*body` with a stream that yields exactly the same bytes downstream.
+/// Never pre-allocates from a declared length. `meter` is asked, after
+/// each frame, whether the bytes held so far (data and trailers) may be
+/// kept; `false` stops with [`Collected::BudgetExhausted`].
+pub(crate) async fn collect_prefix(
     body: &mut Body,
     cap: u64,
     meter: &mut (dyn FnMut(u64) -> bool + Send),
@@ -298,48 +303,57 @@ pub(crate) async fn collect_prefix_metered(
     let declared = body.known_length();
     if declared.is_some_and(|n| n > cap) {
         // Known to be too large: do not touch the stream at all.
-        return Collected::TooLarge;
+        return Collected::TooLarge { held: 0 };
     }
     let mut buf = BytesMut::new();
-    let mut trailers = None;
+    let mut trailers: Option<HeaderMap> = None;
     loop {
         let frame = poll_fn(|cx| http_body::Body::poll_frame(Pin::new(&mut *body), cx)).await;
+        let held = |buf: &BytesMut, trailers: &Option<HeaderMap>| {
+            (buf.len() as u64).saturating_add(trailers.as_ref().map_or(0, header_bytes))
+        };
         match frame {
             None => {
-                let b = buf.freeze();
-                *body = Body::from_parts(b.clone(), trailers);
-                return Collected::Complete(b);
+                let held = held(&buf, &trailers);
+                let data = buf.freeze();
+                *body = Body::from_parts(data.clone(), trailers);
+                return Collected::Complete { data, held };
             }
             Some(Err(e)) => {
                 *body = Body::wrap_native(ErrorBody(Some(e.clone())), u64::MAX, None);
                 return Collected::Failed(e);
             }
-            Some(Ok(f)) => match f.into_data() {
-                Err(f) => trailers = f.into_trailers().ok().or(trailers),
-                Ok(d) => {
-                    buf.extend_from_slice(&d);
-                    let held = buf.len() as u64;
-                    let stop = if held > cap {
-                        Some(Collected::TooLarge)
-                    } else if !meter(held) {
-                        Some(Collected::BudgetExhausted)
-                    } else {
-                        None
-                    };
-                    if let Some(stop) = stop {
-                        let rest = std::mem::take(body);
-                        *body = Body::wrap_native(
-                            Chain {
-                                prefix: Some(buf.freeze()),
-                                rest,
-                            },
-                            u64::MAX,
-                            declared,
-                        );
-                        return stop;
+            Some(Ok(f)) => {
+                let stop = match f.into_data() {
+                    Err(f) => {
+                        trailers = f.into_trailers().ok().or(trailers);
+                        (!meter(held(&buf, &trailers))).then_some(Collected::BudgetExhausted)
                     }
+                    Ok(d) => {
+                        buf.extend_from_slice(&d);
+                        let held = held(&buf, &trailers);
+                        if buf.len() as u64 > cap {
+                            Some(Collected::TooLarge { held })
+                        } else if !meter(held) {
+                            Some(Collected::BudgetExhausted)
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(stop) = stop {
+                    let rest = std::mem::take(body);
+                    *body = Body::wrap_native(
+                        Chain {
+                            prefix: Some(buf.freeze()),
+                            rest,
+                        },
+                        u64::MAX,
+                        declared,
+                    );
+                    return stop;
                 }
-            },
+            }
         }
     }
 }
@@ -474,10 +488,49 @@ mod tests {
         assert_eq!(t.sha256_hex(), None);
     }
 
+    /// [`collect_prefix`] with no budget.
+    async fn collect(body: &mut Body, cap: u64) -> Collected {
+        collect_prefix(body, cap, &mut |_| true).await
+    }
+
     #[tokio::test]
     async fn collects_small_body() {
         let mut b = Body::from_bytes("abc");
-        assert!(matches!(collect_prefix(&mut b, 10).await, Collected::Complete(x) if x == "abc"));
+        assert!(matches!(
+            collect(&mut b, 10).await,
+            Collected::Complete { data, held: 3 } if data == "abc"
+        ));
+        assert_eq!(drain(b).await.unwrap(), b"abc");
+    }
+
+    /// The meter sees everything the rebuilt body will hold, trailers
+    /// included, and a refusal at the trailers stops the collection with
+    /// nothing lost.
+    #[tokio::test]
+    async fn the_meter_is_charged_for_data_and_trailers() {
+        let with_trailers = || async {
+            let (mut tx, b) = Body::channel(1 << 20, None);
+            tx.send_data(Bytes::from_static(b"abc")).await.unwrap();
+            let mut t = http::HeaderMap::new();
+            t.insert("grpc-status", http::HeaderValue::from_static("0"));
+            tx.send_trailers(t).await.unwrap();
+            tx.finish().await.unwrap();
+            b
+        };
+        let mut b = with_trailers().await;
+        let mut asked = Vec::new();
+        let c = collect_prefix(&mut b, 10, &mut |held| {
+            asked.push(held);
+            true
+        })
+        .await;
+        let trailer = "grpc-status".len() as u64 + 1;
+        assert_eq!(asked, vec![3, 3 + trailer]);
+        assert!(matches!(c, Collected::Complete { held, .. } if held == 3 + trailer), "{c:?}");
+
+        let mut b = with_trailers().await;
+        let c = collect_prefix(&mut b, 10, &mut |held| held <= 3).await;
+        assert!(matches!(c, Collected::BudgetExhausted), "{c:?}");
         assert_eq!(drain(b).await.unwrap(), b"abc");
     }
 
@@ -490,7 +543,10 @@ mod tests {
         t.insert("grpc-status", http::HeaderValue::from_static("0"));
         tx.send_trailers(t).await.unwrap();
         tx.finish().await.unwrap();
-        assert!(matches!(collect_prefix(&mut b, 10).await, Collected::Complete(x) if x == "abc"));
+        assert!(matches!(
+            collect(&mut b, 10).await,
+            Collected::Complete { data, .. } if data == "abc"
+        ));
         assert_eq!(b.as_bytes().unwrap(), "abc");
         let mut frames = Vec::new();
         while let Some(f) = poll_fn(|cx| http_body::Body::poll_frame(Pin::new(&mut b), cx)).await {
@@ -513,8 +569,8 @@ mod tests {
             tx.try_finish().unwrap();
         });
         assert!(matches!(
-            collect_prefix(&mut b, 15).await,
-            Collected::TooLarge
+            collect(&mut b, 15).await,
+            Collected::TooLarge { held: 20 }
         ));
         assert_eq!(drain(b).await.unwrap().len(), 40);
     }
@@ -523,8 +579,8 @@ mod tests {
     async fn declared_too_large_untouched() {
         let mut b = Body::from_bytes(vec![0u8; 100]);
         assert!(matches!(
-            collect_prefix(&mut b, 10).await,
-            Collected::TooLarge
+            collect(&mut b, 10).await,
+            Collected::TooLarge { held: 0 }
         ));
         assert_eq!(drain(b).await.unwrap().len(), 100);
     }

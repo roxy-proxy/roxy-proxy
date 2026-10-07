@@ -22,7 +22,9 @@ use roxy_http::{Headers, Host, Method, Query, Scheme};
 use roxy_rules::{BodyText, Field, FlowView, Value};
 
 use crate::addrlist::AddressLists;
+use crate::budget::Exhausted;
 use crate::flowlog::TlsInfo;
+use crate::server::Shared;
 use crate::listener::ClientConn;
 use crate::sources::{MetricSource, MetricSourceError, StateSource};
 use crate::watch::Dir;
@@ -53,28 +55,36 @@ impl Inspected {
     }
 
     /// A buffered body, decoded by its `content-encoding` for the rules.
-    /// The decoded text may be at most `cap`
-    /// bytes, like the body as sent.
-    pub(crate) fn decode(headers: &Headers, body: &[u8], cap: u64) -> Self {
+    /// The decoded text may be at most `cap` bytes, like the body as sent.
+    /// The decoder's windows are charged to `shared`'s budget while it
+    /// runs; a window the budget cannot cover is [`Exhausted`], which the
+    /// caller fails closed on rather than a fact about the body.
+    pub(crate) fn decode(
+        headers: &Headers,
+        body: &[u8],
+        cap: u64,
+        shared: &Arc<Shared>,
+    ) -> Result<Self, Exhausted> {
         let codings = match coding::content_codings(headers) {
             Ok(c) => c,
             Err(e) => return Self::from_error(e),
         };
         if codings.is_empty() {
-            return Self::Text(String::from_utf8_lossy(body).into());
+            return Ok(Self::Text(String::from_utf8_lossy(body).into()));
         }
-        match coding::decode(&codings, body, cap) {
-            Ok(d) => Self::Text(String::from_utf8_lossy(&d).into()),
+        match coding::decode(&codings, body, cap, shared.window_meter()) {
+            Ok(d) => Ok(Self::Text(String::from_utf8_lossy(&d).into())),
             Err(e) => Self::from_error(e),
         }
     }
 
-    fn from_error(e: DecodeError) -> Self {
-        match e {
+    fn from_error(e: DecodeError) -> Result<Self, Exhausted> {
+        Ok(match e {
             DecodeError::Unsupported(c) => Self::UnsupportedEncoding(c),
             DecodeError::TooLarge { .. } => Self::TooLarge,
+            DecodeError::BudgetExhausted => return Err(Exhausted),
             e @ DecodeError::Invalid { .. } => Self::Undecodable(e.to_string()),
-        }
+        })
     }
 
     fn as_body_text(&self) -> BodyText<'_> {

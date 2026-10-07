@@ -46,7 +46,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, Sleep, sleep, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::body::{Collected, collect_prefix, collect_prefix_metered};
+use crate::body::{Collected, collect_prefix};
 use crate::conn::ConnLimits;
 use crate::exchange::{
     Answer, Front, Outcome, WriteFailure, process, record_client_failure, record_client_gone,
@@ -565,26 +565,11 @@ impl BodyIo for H2Front {
         &'a mut self,
         body: &'a mut Body,
         cap: u64,
-    ) -> CollectFuture<'a, Result<Collected, DriveError>> {
-        Box::pin(async move {
-            self.continue_once()?;
-            let c = collect_prefix(body, cap).await;
-            if let Some(e) = self.fail.get() {
-                return Err(e.into());
-            }
-            Ok(c)
-        })
-    }
-
-    fn collect_metered<'a>(
-        &'a mut self,
-        body: &'a mut Body,
-        cap: u64,
         meter: &'a mut (dyn FnMut(u64) -> bool + Send),
     ) -> CollectFuture<'a, Result<Collected, DriveError>> {
         Box::pin(async move {
             self.continue_once()?;
-            let c = collect_prefix_metered(body, cap, meter).await;
+            let c = collect_prefix(body, cap, meter).await;
             if let Some(e) = self.fail.get() {
                 return Err(e.into());
             }

@@ -22,5 +22,5 @@ pub use host::{
     EndpointError, FlowInfo, HostError, LayerHost, LayerRequest, LayerResponse, LogLevel,
     Principal, TagError,
 };
-pub use runtime::{Layer, WasmRuntime};
+pub use runtime::{Layer, SlotWait, WasmRuntime};
 pub use state::{MAX_FIELDS_BYTES, MAX_MESSAGE_BYTES};

@@ -217,6 +217,17 @@ impl Shared {
         lease.grow_to(cap, bytes)
     }
 
+    /// A content decoder's meter: a lease that grows to the windows the
+    /// decoder charges and lives as long as the decoder does. Refuses
+    /// everything when the budget is already over its cap.
+    pub(crate) fn window_meter(self: &Arc<Self>) -> roxy_http::coding::Meter<'static> {
+        let Some(mut lease) = self.reserve_buffer(0) else {
+            return Box::new(|_| false);
+        };
+        let shared = self.clone();
+        Box::new(move |held| shared.grow_buffer(&mut lease, held))
+    }
+
     /// Bytes of the buffer budget reserved right now.
     #[cfg(test)]
     pub(crate) fn buffered(&self) -> u64 {

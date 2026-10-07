@@ -8,10 +8,12 @@
 //! logged; the real traffic never waits. The bytes a copy has queued are
 //! charged to the buffer budget frame by frame, as they queue, and given
 //! back as the observer reads them; a copy whose next frame the budget
-//! cannot cover is cut the same way. This is deliberately lossy: the
-//! observer is not the audit log, which keeps its own backpressure. An
-//! observer that drops its copy is not lagging: the rest is simply not
-//! copied.
+//! cannot cover is cut the same way. So is a copy whose observer gets no
+//! instance within its `first_byte_timeout`, since a copy waiting on an
+//! instance holds budget that enforce flows need. This is deliberately
+//! lossy: the observer is not the audit log, which keeps its own
+//! backpressure. An observer that drops its copy is not lagging: the rest
+//! is simply not copied.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -23,7 +25,7 @@ use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::BodyExt as _;
 use roxy_http::{Body, BodyError};
-use roxy_wasm::{HostError, LayerRequest, LayerResponse};
+use roxy_wasm::{HostError, LayerError, LayerRequest, LayerResponse, SlotWait};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -35,6 +37,9 @@ use crate::watch::Dir;
 
 /// The copy outgrew `max_observer_lag_bytes`.
 const BEHIND: &str = "observer_behind";
+
+/// No instance of the observer came free within its `first_byte_timeout`.
+const NO_INSTANCE: &str = "no_instance";
 
 /// What an observer's `next` returns: the copy of the real response.
 pub(crate) struct ObserverNext {
@@ -351,7 +356,8 @@ pub(crate) async fn observe(
 ) -> Result<LayerResponse, HostError> {
     let addon = st.snap.addons[index].clone();
     let (parts, body) = req.into_parts();
-    let (real_body, copy_body, cut) = tee(&st, body, lag(&st, &addon.name, Dir::Request));
+    let request_lag = lag(&st, &addon.name, Dir::Request);
+    let (real_body, copy_body, cut) = tee(&st, body, request_lag.clone());
     let mut copy_req = http::Request::new(copy_body);
     copy_req.extensions_mut().insert(cut);
     *copy_req.method_mut() = parts.method.clone();
@@ -391,8 +397,15 @@ pub(crate) async fn observe(
         index,
         observer: Some(next),
     });
+    let wait = SlotWait::Within(layer.limits().first_byte_timeout);
     tokio::spawn(async move {
-        let result = match layer.handle(host, copy_req).await {
+        let result = match layer.handle_waiting(host, copy_req, wait).await {
+            // The copy went with the request: its queued frames are back in
+            // the budget, and the real exchange never waited.
+            Err(LayerError::NoInstance) => {
+                request_lag.report(NO_INSTANCE);
+                return;
+            }
             Ok(resp) => {
                 // Whatever it answers is discarded, but read to the end so
                 // the layer's own failures surface.

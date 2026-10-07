@@ -13,6 +13,11 @@
 //! frame by frame for what it has queued, since a copy that cannot grow is
 //! simply cut. Nothing is evicted and nobody waits: a reservation the
 //! budget cannot cover fails at once.
+//!
+//! Every buffer the host holds for an exchange goes through a lease: the
+//! collectors in `body` and the content decoders take a meter that grows
+//! one, so what counts against the budget is whatever reaches a lease,
+//! not a list kept elsewhere.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,13 +26,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// cover.
 pub(crate) const EXHAUSTED: &str = "buffer_budget_exhausted";
 
+/// The budget could not cover a reservation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Exhausted;
+
 /// Bytes reserved across the process.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct BufferBudget {
     used: AtomicU64,
 }
 
 /// A reservation; released on drop.
+#[derive(Debug)]
 pub(crate) struct BufferLease {
     budget: Arc<BufferBudget>,
     bytes: u64,
