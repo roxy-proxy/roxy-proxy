@@ -11,7 +11,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _};
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{Kit, streaming_body};
+use super::{AddonDef, Kit, streaming_body};
 use crate::addons::AddonMode;
 use crate::addons::service::testing::{addon, reload};
 
@@ -25,6 +25,17 @@ const BODY_RULES: &str = r#"
 "#;
 
 const ALLOW: &str = r#"
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+
+/// Reads the body only on one path, so an over-cap body elsewhere is
+/// forwarded rather than failed closed.
+const BODY_RULES_ON_SECRET_PATH: &str = r#"
+- id: no-secret-out
+  when: host == "up.test" and path == "/secret" and body.text contains "SECRET"
+  then: deny
 - id: up
   when: host == "up.test"
   then: allow
@@ -164,6 +175,116 @@ async fn bodiless_requests_reserve_nothing() {
         assert_eq!(a.text(), "chunk0;chunk1;");
     }
     until_buffered(&kit, 0).await;
+}
+
+/// A body declared larger than the cap is never buffered, so it holds none
+/// of the budget however long its exchange lasts: the lease taken at the
+/// head goes back once the body is known to be too large. An upload of
+/// unknown length that turns out too large holds exactly the prefix it
+/// chained, the frame that overshot included.
+#[tokio::test]
+async fn an_over_cap_body_holds_only_what_it_chained() {
+    let kit = Kit::builder()
+        .rules(BODY_RULES_ON_SECRET_PATH)
+        .limits(|l| {
+            l.max_inspect_body_bytes = CAP;
+            l.max_buffered_bytes = 2 * CAP;
+        })
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let declared = usize::try_from(2 * CAP).unwrap();
+    let req = c
+        .request(
+            "POST",
+            "/drip?n=2&ms=2000",
+            &[("content-length", &declared.to_string())],
+        )
+        .body(roxy_http::Body::from_bytes(vec![b'x'; declared]))
+        .unwrap();
+    let answer = c.start(req);
+    until_seen(&kit, 1).await;
+    assert_eq!(kit.server.shared().buffered(), 0);
+
+    let (mut tx, body) = streaming_body();
+    let mut c2 = kit.h1().await;
+    let req = c2
+        .request("POST", "/drip?n=2&ms=2000", &[])
+        .body(body)
+        .unwrap();
+    let answer2 = c2.start(req);
+    let chunk = Bytes::from(vec![b'x'; usize::try_from(CAP).unwrap()]);
+    tx.send_data(chunk.clone()).await.unwrap();
+    tx.send_data(chunk).await.unwrap();
+    until_seen(&kit, 2).await;
+    // The codec frames the upload its own way, so the overshoot is one
+    // codec frame past the cap, whatever the client sent.
+    let held = kit.server.shared().buffered();
+    assert!(
+        (CAP + 1..=2 * CAP).contains(&held),
+        "{held} held for the chained prefix"
+    );
+    tx.finish().await.unwrap();
+
+    for a in [answer, answer2] {
+        let a = a.await.unwrap().unwrap();
+        assert_eq!(a.status, 200, "{a:?}");
+    }
+    until_buffered(&kit, 0).await;
+}
+
+/// An observer whose instances are all busy waits at most its
+/// `first_byte_timeout` for one; then its copy is dropped, giving back
+/// what it had queued, and `observer_lagged` says `no_instance`. The real
+/// exchange never waits.
+#[tokio::test]
+async fn an_observer_without_an_instance_gives_its_copy_back_within_the_bound() {
+    use http_body_util::BodyExt as _;
+    let kit = Kit::builder()
+        .rules(ALLOW)
+        .addon(AddonDef::test_layer("o").observe().limits(|l| {
+            l.max_instances = 1;
+            l.first_byte_timeout = Duration::from_millis(300);
+        }))
+        .start()
+        .await;
+    // The only instance relays a response that drips for a minute.
+    let mut c = kit.h1().await;
+    let req = c
+        .request("GET", "/drip?n=1000&ms=50", &[("x-test-o", "pass")])
+        .body(roxy_http::Body::empty())
+        .unwrap();
+    let mut res = c.send(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(res.body_mut().frame().await.unwrap().is_ok());
+
+    let (mut tx, body) = streaming_body();
+    let mut c2 = kit.h1().await;
+    let req = c2
+        .request("POST", "/x", &[("x-test-o", "pass")])
+        .body(body)
+        .unwrap();
+    let answer = c2.start(req);
+    tx.send_data(Bytes::from(vec![b'x'; 1024])).await.unwrap();
+    let queued = tokio::time::timeout(Duration::from_secs(10), async {
+        while kit.server.shared().buffered() < 1024 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(queued.is_ok(), "the copy queued nothing");
+    let lagged = kit.events("observer_lagged", 1).await;
+    assert_eq!(lagged[0]["layer"], "o", "{lagged:#?}");
+    assert_eq!(lagged[0]["direction"], "request");
+    assert_eq!(lagged[0]["reason"], "no_instance");
+    until_buffered(&kit, 0).await;
+
+    tx.finish().await.unwrap();
+    let a = answer.await.unwrap().unwrap();
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["body_len"], 1024);
+    c.kill();
+    drop(res);
 }
 
 /// A body with a declared length reserves that length, not the cap: three

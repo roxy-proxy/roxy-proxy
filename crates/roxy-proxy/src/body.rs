@@ -293,8 +293,9 @@ pub(crate) fn header_bytes(h: &HeaderMap) -> u64 {
 /// Buffers up to `cap` bytes of `body` for inspection, replacing
 /// `*body` with a stream that yields exactly the same bytes downstream.
 /// Never pre-allocates from a declared length. `meter` is asked, after
-/// each frame, whether the bytes held so far (data and trailers) may be
-/// kept; `false` stops with [`Collected::BudgetExhausted`].
+/// each frame and before the cap is judged, whether the bytes held so far
+/// (data and trailers) may be kept, so what is chained on `TooLarge` is
+/// covered too; `false` stops with [`Collected::BudgetExhausted`].
 pub(crate) async fn collect_prefix(
     body: &mut Body,
     cap: u64,
@@ -332,10 +333,10 @@ pub(crate) async fn collect_prefix(
                     Ok(d) => {
                         buf.extend_from_slice(&d);
                         let held = held(&buf, &trailers);
-                        if buf.len() as u64 > cap {
-                            Some(Collected::TooLarge { held })
-                        } else if !meter(held) {
+                        if !meter(held) {
                             Some(Collected::BudgetExhausted)
+                        } else if buf.len() as u64 > cap {
+                            Some(Collected::TooLarge { held })
                         } else {
                             None
                         }
@@ -526,7 +527,10 @@ mod tests {
         .await;
         let trailer = "grpc-status".len() as u64 + 1;
         assert_eq!(asked, vec![3, 3 + trailer]);
-        assert!(matches!(c, Collected::Complete { held, .. } if held == 3 + trailer), "{c:?}");
+        assert!(
+            matches!(c, Collected::Complete { held, .. } if held == 3 + trailer),
+            "{c:?}"
+        );
 
         let mut b = with_trailers().await;
         let c = collect_prefix(&mut b, 10, &mut |held| held <= 3).await;

@@ -24,8 +24,8 @@ use roxy_rules::{BodyText, Field, FlowView, Value};
 use crate::addrlist::AddressLists;
 use crate::budget::Exhausted;
 use crate::flowlog::TlsInfo;
-use crate::server::Shared;
 use crate::listener::ClientConn;
+use crate::server::Shared;
 use crate::sources::{MetricSource, MetricSourceError, StateSource};
 use crate::watch::Dir;
 
@@ -396,5 +396,46 @@ impl FlowView for ProxyView<'_> {
         // Exact membership: see `AddressList::contains_exact` for why the
         // broad deny-floor matching is wrong for rules that allow.
         self.lists.get(list).map(|l| l.contains_exact(ip))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use super::*;
+    use crate::testkit::Kit;
+
+    /// Decoding for the rules charges the decoder's window to the budget
+    /// for as long as it runs: a window the budget cannot cover is refused
+    /// before anything is allocated, and one it can is given back with the
+    /// decoder.
+    #[tokio::test]
+    async fn decoding_charges_the_window_and_gives_it_back() {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(b"hello").unwrap();
+        let gz = e.finish().unwrap();
+        let mut headers = Headers::new();
+        headers.append("content-encoding", "gzip").unwrap();
+
+        let kit = Kit::builder()
+            .limits(|l| l.max_buffered_bytes = 16 * 1024)
+            .start()
+            .await;
+        let shared = kit.server.shared().clone();
+        assert!(matches!(
+            Inspected::decode(&headers, &gz, 1 << 20, &shared),
+            Err(Exhausted)
+        ));
+        assert_eq!(shared.buffered(), 0);
+
+        let kit = Kit::builder().start().await;
+        let shared = kit.server.shared().clone();
+        let text = Inspected::decode(&headers, &gz, 1 << 20, &shared).unwrap();
+        assert!(
+            matches!(&text, Inspected::Text(t) if &**t == "hello"),
+            "{text:?}"
+        );
+        assert_eq!(shared.buffered(), 0);
     }
 }

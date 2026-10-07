@@ -443,3 +443,83 @@ async fn a_skipped_layer_leaves_extensions_alone() {
         "permessage-deflate"
     );
 }
+
+/// A body decoded for the layers charges its decoder's window to the
+/// budget from the first byte until the body is done, so a client's
+/// decoders are bounded like every other buffer; a window the budget
+/// cannot cover fails the exchange closed rather than being allocated.
+#[tokio::test]
+async fn a_decoder_window_is_charged_while_a_layer_reads_the_body() {
+    use std::time::Duration;
+
+    const FLATE_WINDOW: u64 = 32 * 1024;
+    // No rule reads the body, so the window is all the budget sees.
+    const ALLOW: &str = r#"
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+    let text = vec![b'a'; 100 * 1024];
+    let gz = gzip(&text);
+    let kit = Kit::builder()
+        .rules(ALLOW)
+        .addon(AddonDef::test_layer("t"))
+        .start()
+        .await;
+    let (mut tx, body) = roxy_http::Body::channel(u64::MAX, None);
+    let mut c = kit.h1().await;
+    let req = c
+        .request(
+            "POST",
+            "/x",
+            &[("content-encoding", "gzip"), ("x-test-t", "pass")],
+        )
+        .body(body)
+        .unwrap();
+    let answer = c.start(req);
+    tx.send_data(Bytes::copy_from_slice(&gz[..16]))
+        .await
+        .unwrap();
+    let charged = tokio::time::timeout(Duration::from_secs(10), async {
+        while kit.server.shared().buffered() != FLATE_WINDOW {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        charged.is_ok(),
+        "buffered {}",
+        kit.server.shared().buffered()
+    );
+    tx.send_data(Bytes::copy_from_slice(&gz[16..]))
+        .await
+        .unwrap();
+    tx.finish().await.unwrap();
+    let a = answer.await.unwrap().unwrap();
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["body_len"], text.len());
+    let freed = tokio::time::timeout(Duration::from_secs(10), async {
+        while kit.server.shared().buffered() != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(freed.is_ok(), "buffered {}", kit.server.shared().buffered());
+
+    let kit = Kit::builder()
+        .rules(ALLOW)
+        .addon(AddonDef::test_layer("t"))
+        .limits(|l| l.max_buffered_bytes = FLATE_WINDOW - 1)
+        .start()
+        .await;
+    let a = post(
+        &mut kit.h1().await,
+        "/x",
+        &[("content-encoding", "gzip"), ("x-test-t", "pass")],
+        gz,
+    )
+    .await;
+    assert!(a.status >= 500, "{a:?}");
+    assert_eq!(kit.server.shared().buffered(), 0);
+    assert!(kit.upstream.seen().is_empty(), "{:#?}", kit.upstream.seen());
+}

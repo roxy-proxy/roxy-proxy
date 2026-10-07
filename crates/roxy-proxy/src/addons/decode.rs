@@ -40,10 +40,5 @@ fn decode(headers: &mut Headers, body: &mut Body, limit: u64, shared: &Arc<Share
         return;
     }
     headers.remove("content-encoding");
-    *body = coding::decode_body(
-        std::mem::take(body),
-        &codings,
-        limit,
-        shared.window_meter(),
-    );
+    *body = coding::decode_body(std::mem::take(body), &codings, limit, shared.window_meter());
 }

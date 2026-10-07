@@ -533,7 +533,10 @@ mod tests {
 
         let (_tx, body) = Body::channel(u64::MAX, Some(MAX_ENDPOINT_REQUEST_BYTES + 1));
         let err = collect_body(&shared, body).await.unwrap_err();
-        assert!(matches!(&err, EndpointError::Failed(m) if m.contains("over")), "{err:?}");
+        assert!(
+            matches!(&err, EndpointError::Failed(m) if m.contains("over")),
+            "{err:?}"
+        );
         assert_eq!(shared.buffered(), 0);
     }
 

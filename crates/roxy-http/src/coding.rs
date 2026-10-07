@@ -1346,13 +1346,23 @@ mod tests {
         for n in 2..=7u8 {
             assert_eq!(brotli_window_bits(1 | n << 4), 8 + u32::from(n));
         }
-        assert_eq!(brotli_window_bits(0b0001_0001), 24, "large window reads as the maximum");
+        assert_eq!(
+            brotli_window_bits(0b0001_0001),
+            24,
+            "large window reads as the maximum"
+        );
         for wbits in [16u32, 18, 22, 24] {
-            let mut p = brotli::enc::BrotliEncoderParams::default();
-            p.lgwin = i32::try_from(wbits).unwrap();
+            let p = brotli::enc::BrotliEncoderParams {
+                lgwin: i32::try_from(wbits).unwrap(),
+                ..Default::default()
+            };
             let mut out = Vec::new();
             brotli::BrotliCompress(&mut &sample()[..], &mut out, &p).unwrap();
-            assert!(brotli_window_bits(out[0]) <= wbits, "lgwin {wbits}: {}", out[0]);
+            assert!(
+                brotli_window_bits(out[0]) <= wbits,
+                "lgwin {wbits}: {}",
+                out[0]
+            );
         }
     }
 
@@ -1435,11 +1445,23 @@ mod tests {
     async fn a_decoded_body_fails_rather_than_ending_short() {
         let mut enc = gzip(b"payload");
         enc.truncate(enc.len() - 1);
-        let (_, end) = drain(decode_body(Body::from_bytes(enc), &[Coding::Gzip], 100, unmetered())).await;
+        let (_, end) = drain(decode_body(
+            Body::from_bytes(enc),
+            &[Coding::Gzip],
+            100,
+            unmetered(),
+        ))
+        .await;
         assert!(matches!(end, Err(BodyError::Undecodable(_))), "{end:?}");
 
         let enc = gzip(&vec![0u8; 1 << 20]);
-        let (_, end) = drain(decode_body(Body::from_bytes(enc), &[Coding::Gzip], 1000, unmetered())).await;
+        let (_, end) = drain(decode_body(
+            Body::from_bytes(enc),
+            &[Coding::Gzip],
+            1000,
+            unmetered(),
+        ))
+        .await;
         assert_eq!(end, Err(BodyError::TooLarge { limit: 1000 }));
     }
 
