@@ -12,6 +12,7 @@
 //! before any layer does. Any layer failure fails the exchange closed
 //! (invariant 3): a deny before the response head, a cut body after it.
 
+mod attribution;
 mod decode;
 mod endpoint;
 mod host;
@@ -32,17 +33,16 @@ use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::StreamExt as _;
-use futures_util::stream::FuturesUnordered;
 use http::{HeaderName, StatusCode};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use roxy_http::layer::{from_layer_request, to_layer_request, to_layer_response};
 use roxy_http::upstream::from_upstream_response;
 use roxy_http::{Body, BodyError, BodySender, CanonicalRequest, RequestMeta};
-use roxy_wasm::{HostError, LayerError, LayerOutcome, LayerRequest, LayerResponse, TagError};
+use roxy_wasm::{HostError, LayerError, LayerRequest, LayerResponse, TagError};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+use self::attribution::{Attribution, Driven, Fault, Side, attributed};
 use crate::addr::PrivateAddrs;
 use crate::body::{Collected, collect_prefix};
 use crate::exchange::{Front, Outcome, bad_upgrade_refusal, refusal_response};
@@ -236,11 +236,6 @@ struct LayerSlot {
     next: AtomicU8,
     /// The layer ran on this exchange: its `when` and `sample` let it.
     ran: AtomicBool,
-    /// The layer's own outcome, once its handler returned a response: a
-    /// failure after the head shows here first.
-    outcome: Mutex<Option<LayerOutcome>>,
-    /// A service layer failed its stream, which no outcome carries.
-    failed: AtomicBool,
 }
 
 impl LayerSlot {
@@ -369,40 +364,6 @@ impl Loan {
     }
 }
 
-/// Why the exchange is not getting the response it asked for, as recorded
-/// by the layers and the core ahead of the stack's answer. A layer's
-/// failure decides the outcome and its attribution, so it outranks the
-/// other two; within a kind the first recorded wins.
-enum Fault {
-    None,
-    Layer {
-        name: String,
-        err: StackError,
-    },
-    /// The request body failed in the core as a client's would (framing, a
-    /// cut): no layer's doing, so no layer is blamed for it.
-    Client(roxy_http::DriveError),
-    /// The upstream's response body failed before a layer had answered
-    /// with a head of its own: no layer's doing, so the client gets the
-    /// `502` it would if the core had read the body.
-    UpstreamBody,
-}
-
-impl Fault {
-    fn record(&mut self, fault: Fault) {
-        let outranks = matches!(
-            (&*self, &fault),
-            (
-                Fault::None,
-                Fault::Layer { .. } | Fault::Client(_) | Fault::UpstreamBody
-            ) | (Fault::Client(_) | Fault::UpstreamBody, Fault::Layer { .. })
-        );
-        if outranks {
-            *self = fault;
-        }
-    }
-}
-
 /// The relayed WebSocket on its way from the core to the front.
 enum Upgrade {
     None,
@@ -430,9 +391,8 @@ pub(crate) struct StackFlow {
     tags: Mutex<Vec<String>>,
     loan: Loan,
     layers: Box<[LayerSlot]>,
-    fault: Mutex<Fault>,
-    /// The enforce-mode failure has been logged.
-    reported: AtomicBool,
+    /// Who is to blame for the exchange failing, if it does.
+    pub(crate) attribution: Attribution,
     /// A layer asked to close the client connection.
     pub(crate) close: AtomicBool,
     /// The first layer to run has decoded the request for the layers.
@@ -464,8 +424,7 @@ impl StackFlow {
                 .iter()
                 .map(|_| LayerSlot::default())
                 .collect(),
-            fault: Mutex::new(Fault::None),
-            reported: AtomicBool::new(false),
+            attribution: Attribution::new(cx.meta.clone()),
             close: AtomicBool::new(false),
             request_decoded: AtomicBool::new(false),
             upgrade: Mutex::new(Upgrade::None),
@@ -523,100 +482,19 @@ impl StackFlow {
     }
 
     /// Layer `layer` failed the exchange.
-    fn fail(&self, layer: &str, err: impl Into<StackError>) {
-        self.record(Fault::Layer {
+    pub(crate) fn fail(&self, layer: &str, err: impl Into<StackError>) {
+        self.attribution.record(Fault::Layer {
             name: layer.to_owned(),
             err: err.into(),
         });
     }
 
-    fn record(&self, fault: Fault) {
-        lock(&self.fault).record(fault);
-    }
-
-    /// The layer failure that decides the outcome, if a layer failed.
-    fn failure(&self) -> Option<(String, StackError)> {
-        match &*lock(&self.fault) {
-            Fault::Layer { name, err } => Some((name.clone(), err.clone())),
-            Fault::None | Fault::Client(_) | Fault::UpstreamBody => None,
+    /// The layer blamed for the exchange failing, if one is.
+    fn blamed_layer(&self) -> Option<String> {
+        match self.attribution.fault()? {
+            Fault::Layer { name, .. } => Some(name),
+            Fault::Client(_) | Fault::UpstreamBody | Fault::Budget => None,
         }
-    }
-
-    fn take_fault(&self) -> Fault {
-        std::mem::replace(&mut *lock(&self.fault), Fault::None)
-    }
-
-    /// The layer failure behind a body cut after the head: the innermost
-    /// layer whose own outcome failed (an outer layer that reads a cut body
-    /// fails in turn), else the first recorded failure.
-    fn post_head_failure(&self) -> Option<(String, StackError)> {
-        self.innermost_failed(0).or_else(|| self.failure())
-    }
-
-    /// The innermost WASM layer at or below `from` whose own outcome
-    /// failed, if one has.
-    fn innermost_failed(&self, from: usize) -> Option<(String, StackError)> {
-        self.layers
-            .iter()
-            .enumerate()
-            .skip(from)
-            .rev()
-            .find_map(|(i, l)| {
-                let failure = l
-                    .outcome
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .as_ref()
-                    .and_then(LayerOutcome::failure)?;
-                Some((self.snap.addons[i].name.clone(), failure.into()))
-            })
-    }
-
-    /// A response body from below layer `index` failed: the WASM layer
-    /// below whose own outcome failed is at fault, if one is. Records it;
-    /// `None` leaves the failure to whoever produced the body.
-    pub(crate) fn blame_below(&self, index: usize) -> bool {
-        let Some((layer, err)) = self.innermost_failed(index + 1) else {
-            return false;
-        };
-        self.fail(&layer, err);
-        true
-    }
-
-    /// The outcomes of the WASM layers whose handlers returned a response.
-    fn layer_outcomes(&self) -> Vec<LayerOutcome> {
-        self.outcomes_from(0)
-    }
-
-    /// The outcomes of the WASM layers at or below `from` that have
-    /// answered.
-    fn outcomes_from(&self, from: usize) -> Vec<LayerOutcome> {
-        self.layers
-            .iter()
-            .skip(from)
-            .filter_map(|l| {
-                l.outcome
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone()
-            })
-            .collect()
-    }
-
-    /// Service layer `index` failed its stream on its own account.
-    pub(crate) fn service_failed(&self, index: usize) {
-        self.layers[index].failed.store(true, Ordering::SeqCst);
-    }
-
-    /// Whether a layer below `index` failed the exchange after its head,
-    /// once the WASM layers that answered have settled. A service layer's
-    /// failure is recorded before the body it cuts fails, so it is here by
-    /// the time anything above sees the cut.
-    pub(crate) async fn failed_below(&self, index: usize) -> bool {
-        first_failure(self.outcomes_from(index + 1)).await.is_err()
-            || self.layers[index + 1..]
-                .iter()
-                .any(|l| l.failed.load(Ordering::SeqCst))
     }
 
     /// The client asked for a WebSocket, the one upgrade the core relays.
@@ -740,18 +618,16 @@ fn error_kind(e: &StackError) -> String {
     }
 }
 
-pub(crate) fn emit_layer_error(st: &StackFlow, layer: &str, e: &LayerError, mode: AddonMode) {
+pub(crate) fn emit_layer_error(st: &FlowMeta, layer: &str, e: &LayerError, mode: AddonMode) {
     emit_stack_error(st, layer, &StackError::Layer(e.clone()), mode);
 }
 
-/// Logs a layer failure: once per exchange in enforce mode (the first
-/// failure decides the outcome), every time in observe mode.
-pub(crate) fn emit_stack_error(st: &StackFlow, layer: &str, e: &StackError, mode: AddonMode) {
+/// Logs a layer failure. In enforce mode only the exchange's
+/// [`Attribution`] calls this, once; an observer's failures are logged
+/// every time.
+pub(crate) fn emit_stack_error(st: &FlowMeta, layer: &str, e: &StackError, mode: AddonMode) {
     if matches!(e, StackError::Layer(LayerError::Cancelled)) {
         // The client went away; nothing failed.
-        return;
-    }
-    if mode == AddonMode::Enforce && st.reported.swap(true, Ordering::Relaxed) {
         return;
     }
     // Redacted once, for both sinks: a guest's panic message or an
@@ -808,9 +684,13 @@ pub(crate) async fn run<F: Front>(
     } else {
         None
     };
+    req.body = attributed(&st, Side::Client, std::mem::take(&mut req.body));
     st.loan.park(cx);
     let driven = front
-        .drive(enter(st.clone(), 0, to_layer_request(req)))
+        .drive(Driven::new(
+            st.clone(),
+            enter(st.clone(), 0, to_layer_request(req)),
+        ))
         .await;
     let mut cx = st.loan.reclaim().await;
     cx.stack = Some(st.clone());
@@ -828,56 +708,19 @@ fn stack_outcome(
 ) -> Outcome {
     let resp = match driven {
         Err(e) => return Outcome::Close(e),
-        // A layer's failure explains the exchange first; a request body
-        // that failed in the core with no layer at fault closes the
-        // connection as it would without a stack.
-        Ok(Err(_)) => {
-            let (layer, err) = match st.take_fault() {
-                Fault::Layer { name, err } => (name, err),
-                Fault::Client(e) => return Outcome::Close(e),
-                Fault::UpstreamBody => {
-                    return Outcome::Refuse(Refusal::upstream(
-                        StatusCode::BAD_GATEWAY,
-                        "upstream_body_failed",
-                    ));
-                }
-                // Every path that fails a layer records it, so this is a
-                // layer that returned an error without saying why.
-                Fault::None => (st.blamed(), LayerError::NoResponse.into()),
-            };
-            emit_stack_error(st, &layer, &err, AddonMode::Enforce);
-            return Outcome::Refuse(layer_refusal(&layer));
-        }
+        Ok(Err(_)) => return refuse(st),
         Ok(Ok(r)) => r,
     };
     // A layer's answer is a final response; the one `1xx` with a meaning
     // here is the `101` of a relayed upgrade, judged below.
     if resp.status().is_informational() && resp.status() != StatusCode::SWITCHING_PROTOCOLS {
-        let layer = st.blamed();
         let err = LayerError::InvalidResponse(format!("{} is not a final response", resp.status()));
-        emit_layer_error(st, &layer, &err, AddonMode::Enforce);
-        return Outcome::Refuse(layer_refusal(&layer));
+        st.fail(&st.blamed(), err);
+        return refuse(st);
     }
     if let Some(i) = st.answered_by() {
         cx.record.decision = Some(DecisionKind::Answered);
         cx.record.terminal_rule = Some(Decider::Layer(st.snap.addons[i].name.clone()));
-    }
-    // A failure after the head cuts the body (the codec then breaks the
-    // connection); log which layer failed once it is known. Every WASM
-    // layer that ran is awaited: a service layer above it answers with a
-    // fresh response, so the top response's extensions say nothing about
-    // the layers below.
-    let outcomes = st.layer_outcomes();
-    if !outcomes.is_empty() {
-        let st2 = st.clone();
-        tokio::spawn(async move {
-            if let Err(e) = first_failure(outcomes).await {
-                let (layer, err) = st2
-                    .post_head_failure()
-                    .unwrap_or_else(|| (st2.blamed(), e.into()));
-                emit_stack_error(&st2, &layer, &err, AddonMode::Enforce);
-            }
-        });
     }
     let mut resp = resp;
     // A `101`'s body is the upgraded stream for the client, not an HTTP
@@ -902,36 +745,58 @@ fn stack_outcome(
                 relay.bottom,
                 cx.shared.sink.clone(),
             ));
+            // A failure from here on cuts the body (the codec then breaks
+            // the connection) and is logged as it is recorded.
+            st.attribution.head_out();
             return Outcome::Upgrade {
                 res,
                 upstream: relay.upstream,
                 key: relay.key,
             };
         }
-        let layer = st.blamed();
         let err = LayerError::InvalidResponse("101 without an upgrade to relay".into());
-        emit_layer_error(st, &layer, &err, AddonMode::Enforce);
-        return Outcome::Refuse(layer_refusal(&layer));
+        st.fail(&st.blamed(), err);
+        return refuse(st);
     }
     if let Some(relay) = relay {
         // The upstream switched protocols but the stack answered otherwise:
         // no body can carry the relay, so close it and fail closed.
         tokio::spawn(crate::exchange::close_upstream_ws(relay.upstream));
-        let layer = st.blamed();
         let err = LayerError::InvalidResponse(format!("{} over a relayed upgrade", res.status));
-        emit_layer_error(st, &layer, &err, AddonMode::Enforce);
-        return Outcome::Refuse(layer_refusal(&layer));
+        st.fail(&st.blamed(), err);
+        return refuse(st);
     }
+    st.attribution.head_out();
     Outcome::Respond(res)
 }
 
-/// Waits for every layer to finish; the first to fail decides.
-async fn first_failure(outcomes: Vec<LayerOutcome>) -> Result<(), LayerError> {
-    let mut pending: FuturesUnordered<_> = outcomes.into_iter().map(LayerOutcome::wait).collect();
-    while let Some(r) = pending.next().await {
-        r?;
+/// The exchange's refusal before the response head, from the fault
+/// recorded: a layer's failure is logged and refused as its own; a request
+/// body that failed on its way in closes the connection as it would
+/// without a stack; the others are the refusals the core would give.
+fn refuse(st: &Arc<StackFlow>) -> Outcome {
+    let fault = st.attribution.fault().unwrap_or_else(|| {
+        // Every path that fails a layer records it, so this is a layer
+        // that returned an error without saying why.
+        let name = st.blamed();
+        st.fail(&name, LayerError::NoResponse);
+        Fault::Layer {
+            name,
+            err: LayerError::NoResponse.into(),
+        }
+    });
+    match fault {
+        Fault::Layer { name, .. } => {
+            st.attribution.log();
+            Outcome::Refuse(layer_refusal(&name))
+        }
+        Fault::Client(e) => Outcome::Close(e.into()),
+        Fault::UpstreamBody => Outcome::Refuse(Refusal::upstream(
+            StatusCode::BAD_GATEWAY,
+            "upstream_body_failed",
+        )),
+        Fault::Budget => Outcome::Refuse(Refusal::fail_closed(crate::budget::EXHAUSTED)),
     }
-    Ok(())
 }
 
 /// Runs layer `index` on `req`.
@@ -957,7 +822,7 @@ pub(crate) fn enter(
         // Layers see bodies decoded; a flow no layer runs on is left as
         // the client sent it.
         if st.snap.http.decode_for_addons && !st.request_decoded.swap(true, Ordering::SeqCst) {
-            decode::request(&mut req, st.snap.limits.max_request_body_bytes, &st.shared);
+            decode::request(&st, &mut req, st.snap.limits.max_request_body_bytes);
         }
         if addon.mode == AddonMode::Observe {
             return tee::observe(st, index, req).await;
@@ -972,14 +837,9 @@ pub(crate) fn enter(
             observer: None,
         });
         match layer.handle(h, req).await {
-            Ok(r) => {
-                *st.layers[index]
-                    .outcome
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) =
-                    r.extensions().get::<LayerOutcome>().cloned();
-                Ok(r)
-            }
+            Ok(r) => Ok(r),
+            // Recorded as it happened, through the host; an error from
+            // before the exchange had a host (no instance, say) is not.
             Err(e) => {
                 st.fail(&addon.name, e);
                 Err(HostError::new(format!("layer {} failed", addon.name)))
@@ -1081,10 +941,11 @@ async fn core(
     st.set_facts(&cx.facts);
     match outcome {
         Outcome::Respond(mut res) => {
+            res.body = attributed(&st, Side::Upstream, std::mem::take(&mut res.body));
             // A flow no layer ran on gets the response as the origin sent
             // it.
             if snap.http.decode_for_addons && st.any_ran() {
-                decode::response(&mut res, snap.limits.max_response_body_bytes, &st.shared);
+                decode::response(&st, &mut res, snap.limits.max_response_body_bytes);
             }
             Ok(to_layer_response(res))
         }
@@ -1097,11 +958,9 @@ async fn core(
             }
             Ok(to_layer_response(refusal_response(cx, &refusal)))
         }
-        Outcome::Close(e) => {
-            let msg = format!("request body failed: {e}");
-            st.record(Fault::Client(e));
-            Err(HostError::new(msg))
-        }
+        // The body that failed was recorded where it entered the stack
+        // (the client's) or by the layer that produced it.
+        Outcome::Close(e) => Err(HostError::new(format!("request body failed: {e}"))),
         Outcome::Upgrade {
             mut res,
             upstream,
@@ -1231,7 +1090,7 @@ mod tests {
             .with_max_level(tracing::Level::INFO)
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            emit_layer_error(&st, "a", &e, AddonMode::Enforce);
+            emit_layer_error(&st.meta, "a", &e, AddonMode::Enforce);
         });
         let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         assert!(logged.contains("layer failed"), "{logged}");
@@ -1277,33 +1136,83 @@ mod tests {
         );
     }
 
-    /// A request body that failed in the core closes the connection as a
-    /// client's fault, unless a layer's own failure explains the exchange.
+    /// The first fault recorded stands, whoever records next: a client
+    /// body that failed on its way in closes the connection as a client's
+    /// would, and the layer that then fails on the cut body is not blamed;
+    /// a layer that failed first is, and the body its failure cut is not
+    /// the client's.
     #[tokio::test]
-    async fn a_body_failure_in_the_core_is_the_clients_unless_a_layer_failed() {
+    async fn the_first_fault_recorded_stands() {
         let kit = Kit::builder()
             .addon(AddonDef::test_layer("a"))
             .start()
             .await;
-        let (st, mut cx) = test_flow(&kit);
         let fault = || roxy_http::ParseError::new(roxy_http::Reason::BadChunkSize, "zz");
         let failed = || Ok(Err(HostError::new("request body failed")));
 
-        st.record(Fault::Client(fault().into()));
+        let (st, mut cx) = test_flow(&kit);
+        st.attribution.record(Fault::Client(fault()));
+        st.fail("a", LayerError::Trap("boom".into()));
         let out = stack_outcome(&st, &mut cx, failed(), None);
         assert!(
             matches!(&out, Outcome::Close(roxy_http::DriveError::Client(e)) if e.reason == roxy_http::Reason::BadChunkSize),
             "closes as a parse error"
         );
-        assert!(st.failure().is_none(), "no layer is blamed");
+        assert!(st.blamed_layer().is_none(), "no layer is blamed");
 
-        st.record(Fault::Client(fault().into()));
+        let (st, mut cx) = test_flow(&kit);
         st.fail("a", LayerError::Trap("boom".into()));
+        st.attribution.record(Fault::Client(fault()));
         let out = stack_outcome(&st, &mut cx, failed(), None);
         assert!(
             matches!(&out, Outcome::Refuse(r) if r.rule == Some(Decider::Layer("a".into()))),
-            "the layer's failure comes first"
+            "the layer's failure stands"
         );
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["kind"], "trap", "{errs:#?}");
+    }
+
+    /// A layer's fault is logged once, when the exchange can carry it no
+    /// other way: with the refusal before the head, or as recorded once
+    /// the head is out (whether it was recorded before or after the head
+    /// went). A cancelled exchange is nobody's failure and is not logged.
+    #[tokio::test]
+    async fn a_layer_fault_is_logged_once_and_only_once_the_head_cannot_carry_it() {
+        let kit = Kit::builder()
+            .addon(AddonDef::test_layer("a"))
+            .start()
+            .await;
+        let logged = |kit: &Kit| {
+            kit.sink
+                .events()
+                .into_iter()
+                .filter(|e| e["event"] == "layer_error")
+                .count()
+        };
+
+        // Recorded before the head, logged as it goes out, once.
+        let (st, _) = test_flow(&kit);
+        st.fail("a", LayerError::Trap("early".into()));
+        assert_eq!(logged(&kit), 0, "nothing carries it yet");
+        st.attribution.head_out();
+        st.attribution.log();
+        st.fail("a", LayerError::Trap("late".into()));
+        assert_eq!(logged(&kit), 1);
+
+        // Recorded after the head: logged at once.
+        let (st, _) = test_flow(&kit);
+        st.attribution.head_out();
+        st.fail("a", LayerError::NoResponse);
+        assert_eq!(logged(&kit), 2);
+        assert_eq!(kit.sink.events().last().unwrap()["kind"], "no_response");
+
+        // A client that went away: nothing to log, and it shadows what
+        // the layers make of their bodies ending.
+        let (st, _) = test_flow(&kit);
+        st.attribution.head_out();
+        st.fail("a", LayerError::Cancelled);
+        st.fail("a", LayerError::Trap("on the cut".into()));
+        assert_eq!(logged(&kit), 2);
     }
 
     /// A failure is put down to a layer that ran, never to one its `when`
@@ -1327,7 +1236,7 @@ mod tests {
             st.layers[i].ran.store(true, Ordering::SeqCst);
             st.layers[i].set(NextState::Resolved);
         };
-        let blamed = |st: &StackFlow| st.failure().expect("a failure").0;
+        let blamed = |st: &StackFlow| st.blamed_layer().expect("a failure");
 
         // What reaches `c`'s `when` was passed on by `a`, through `b`.
         let (st, _) = test_flow(&kit);
@@ -1371,7 +1280,7 @@ mod tests {
             st.layers[i].ran.store(true, Ordering::SeqCst);
             st.layers[i].set(NextState::Resolved);
         };
-        let blamed = |st: &StackFlow| st.failure().expect("a failure").0;
+        let blamed = |st: &StackFlow| st.blamed_layer().expect("a failure");
 
         let (st, _) = test_flow(&kit);
         ran(&st, 0);

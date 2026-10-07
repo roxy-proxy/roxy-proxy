@@ -407,7 +407,7 @@ impl Layer {
         };
 
         let (mut instance, permit, started) = self.checkout(wait).await?;
-        let shared = ExchangeShared::new();
+        let shared = ExchangeShared::new(host.clone());
         let (tx, mut rx) = oneshot::channel();
         let (req_res, out_res) = {
             let data = instance.store.data_mut();

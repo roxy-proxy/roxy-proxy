@@ -32,6 +32,7 @@ use tokio::time::Instant;
 use wasmtime_wasi_http::Error as WasiError;
 
 use crate::error::LayerError;
+use crate::host::LayerHost;
 
 /// Which way a body flows through the layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,8 +53,9 @@ struct Status {
 
 /// State shared by the exchange driver, the host-call implementations and
 /// the body adapters.
-#[derive(Debug)]
 pub(crate) struct ExchangeShared {
+    /// Told of the first failure as it is recorded.
+    host: Arc<dyn LayerHost>,
     status: watch::Sender<Status>,
     /// `next` is running below the layer: the head clock is paused.
     below: watch::Sender<bool>,
@@ -61,9 +63,18 @@ pub(crate) struct ExchangeShared {
     next_cut: OnceLock<String>,
 }
 
+impl std::fmt::Debug for ExchangeShared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExchangeShared")
+            .field("status", &*self.status.borrow())
+            .finish_non_exhaustive()
+    }
+}
+
 impl ExchangeShared {
-    pub(crate) fn new() -> Arc<Self> {
+    pub(crate) fn new(host: Arc<dyn LayerHost>) -> Arc<Self> {
         Arc::new(Self {
+            host,
             status: watch::Sender::new(Status::default()),
             below: watch::Sender::new(false),
             next_cut: OnceLock::new(),
@@ -128,10 +139,13 @@ impl ExchangeShared {
     }
 
     /// Records a failure. The first one wins; failures after the exchange
-    /// settled are ignored.
+    /// settled are ignored. The host hears of it under the status lock, so
+    /// nothing reading the status can act on the failure before the host
+    /// has it.
     pub(crate) fn fail(&self, err: LayerError) {
         self.status.send_if_modified(|s| {
             if s.failure.is_none() && !s.done {
+                self.host.failed(&err);
                 s.failure = Some(err);
                 true
             } else {
@@ -463,17 +477,66 @@ impl HttpBody for FromGuest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::{
+        EndpointError, FlowInfo, HostError, LayerRequest, LayerResponse, LogLevel, TagError,
+    };
     use http_body_util::BodyExt;
+
+    /// A host that hears of failures and nothing else.
+    struct Deaf;
+
+    #[async_trait::async_trait]
+    impl LayerHost for Deaf {
+        async fn next(&self, _: LayerRequest) -> Result<LayerResponse, HostError> {
+            unreachable!()
+        }
+        async fn endpoint_call(
+            &self,
+            _: &str,
+            _: LayerRequest,
+        ) -> Result<LayerResponse, EndpointError> {
+            unreachable!()
+        }
+        fn flow_info(&self) -> FlowInfo {
+            unreachable!()
+        }
+        fn add_tag(&self, _: String) -> Result<(), TagError> {
+            unreachable!()
+        }
+        fn log(&self, _: LogLevel, _: &str) {}
+        async fn record(&self, _: String, _: String, _: bool) -> Result<(), HostError> {
+            unreachable!()
+        }
+        async fn state_get(&self, _: String) -> Result<Option<String>, HostError> {
+            unreachable!()
+        }
+        async fn state_put(
+            &self,
+            _: String,
+            _: String,
+            _: Option<u64>,
+        ) -> Result<Result<(), String>, HostError> {
+            unreachable!()
+        }
+        async fn metric_get(&self, _: String, _: Vec<String>) -> Result<Option<i64>, HostError> {
+            unreachable!()
+        }
+        fn failed(&self, _: &LayerError) {}
+    }
+
+    fn shared() -> Arc<ExchangeShared> {
+        ExchangeShared::new(Arc::new(Deaf))
+    }
 
     #[tokio::test]
     async fn first_failure_wins_and_settle_freezes() {
-        let s = ExchangeShared::new();
+        let s = shared();
         s.fail(LayerError::NoResponse);
         s.fail(LayerError::Cancelled);
         assert_eq!(s.failure(), Some(LayerError::NoResponse));
         assert_eq!(s.wait_settled().await, Err(LayerError::NoResponse));
 
-        let s = ExchangeShared::new();
+        let s = shared();
         s.settle();
         s.fail(LayerError::Cancelled);
         assert_eq!(s.failure(), None);
@@ -482,7 +545,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_head_clock_stops_while_next_is_below() {
-        let s = ExchangeShared::new();
+        let s = shared();
         let clock = s.head_clock(Duration::from_secs(10));
         tokio::pin!(clock);
         let start = Instant::now();

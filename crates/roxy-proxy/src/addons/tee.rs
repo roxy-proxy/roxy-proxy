@@ -369,8 +369,6 @@ pub(crate) async fn observe(
     let next = ObserverNext {
         rx: Mutex::new(Some(rx)),
     };
-    // Whether the real exchange failed below the observer, once known.
-    let (below_failed, below_outcome) = oneshot::channel();
     let observer_st = st.clone();
     let observer_addon = addon.clone();
     let layer = match &addon.kind {
@@ -382,14 +380,14 @@ pub(crate) async fn observe(
                     super::service::observe(&observer_st, index, &svc, copy_req, &next).await
                 {
                     super::emit_stack_error(
-                        &observer_st,
+                        &observer_st.meta,
                         &observer_addon.name,
                         &super::StackError::Service(e),
                         super::AddonMode::Observe,
                     );
                 }
             });
-            return forward(st, index, &addon.name, real_req, tx, below_failed).await;
+            return forward(st, index, &addon.name, real_req, tx).await;
         }
     };
     let host = Arc::new(super::host::StackHost {
@@ -419,16 +417,16 @@ pub(crate) async fn observe(
             Err(e) => Err(e),
         };
         if let Err(e) = result {
-            // The exchange failing below the observer, at the head or in
-            // the body, ends its copies and its `next` early; what it makes
-            // of that is a consequence, logged against the party at fault,
-            // not as its own failure. A `forward` dropped before the head
-            // is the client gone, which is nobody's failure.
-            if below_outcome.await.unwrap_or(true) || observer_st.failed_below(index).await {
+            // The exchange failing (below the observer, at the head or in
+            // the body; the client's upload; the front giving it up) ends
+            // the observer's copies and its `next` early; what it makes of
+            // that is a consequence, recorded against the party at fault
+            // before the observer could see it, not its own failure.
+            if observer_st.attribution.is_faulted() {
                 return;
             }
             super::emit_layer_error(
-                &observer_st,
+                &observer_st.meta,
                 &observer_addon.name,
                 &e,
                 super::AddonMode::Observe,
@@ -436,7 +434,7 @@ pub(crate) async fn observe(
         }
     });
 
-    forward(st, index, &addon.name, real_req, tx, below_failed).await
+    forward(st, index, &addon.name, real_req, tx).await
 }
 
 /// Reads `body` to its end or first error, holding one frame at a time.
@@ -445,19 +443,15 @@ async fn discard(mut body: Body) {
 }
 
 /// The real exchange below observer `index`; the observer gets a copy of
-/// the response through `tx`, or the failure below. `below_failed` learns
-/// which, first.
+/// the response through `tx`, or the failure below.
 async fn forward(
     st: Arc<StackFlow>,
     index: usize,
     name: &str,
     real_req: LayerRequest,
     tx: oneshot::Sender<Result<LayerResponse, HostError>>,
-    below_failed: oneshot::Sender<bool>,
 ) -> Result<LayerResponse, HostError> {
-    let real = super::below(st.clone(), index, real_req).await;
-    let _ = below_failed.send(real.is_err());
-    match real {
+    match super::below(st.clone(), index, real_req).await {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
             let (real_body, copy_body, cut) = tee(&st, body, lag(&st, name, Dir::Response));

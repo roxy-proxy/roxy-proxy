@@ -51,6 +51,8 @@ pub struct Mock {
     pub entered: tokio::sync::Notify,
     /// How the request body passed to `next` ended (`Upload` mode).
     pub upload: tokio::sync::watch::Sender<Option<Result<Bytes, BodyError>>>,
+    /// What `failed` was told.
+    pub failed: Mutex<Vec<LayerError>>,
     /// The layer's keyed store.
     pub state: Mutex<HashMap<String, String>>,
     /// The flow's tags; `add_tag` refuses past `MOCK_TAG_CAP`.
@@ -70,6 +72,7 @@ impl Mock {
             seen_body: Mutex::new(None),
             entered: tokio::sync::Notify::new(),
             upload: tokio::sync::watch::Sender::new(None),
+            failed: Mutex::new(Vec::new()),
             state: Mutex::new(HashMap::new()),
             tags: Mutex::new(Vec::new()),
         })
@@ -210,6 +213,10 @@ impl LayerHost for Mock {
     async fn metric_get(&self, id: String, key: Vec<String>) -> Result<Option<i64>, HostError> {
         self.call(format!("metric_get {id} {key:?}"));
         Ok(Some(7))
+    }
+
+    fn failed(&self, err: &LayerError) {
+        self.failed.lock().unwrap().push(err.clone());
     }
 }
 

@@ -244,10 +244,13 @@ async fn a_layer_may_buffer_a_body() {
 async fn traps_fail_closed() {
     let rt = runtime();
     let layer = load(&rt, config()).await;
-    let err = exchange(&layer, Mock::echo(), request("trap", Body::empty()))
+    let host = Mock::echo();
+    let err = exchange(&layer, host.clone(), request("trap", Body::empty()))
         .await
         .unwrap_err();
     assert!(matches!(err, LayerError::Trap(_)), "{err:?}");
+    // The host heard of it before `handle` returned it.
+    assert_eq!(host.failed.lock().unwrap().as_slice(), [err]);
 
     let err = exchange(&layer, Mock::echo(), request("no-response", Body::empty()))
         .await
@@ -275,14 +278,18 @@ async fn failures_after_the_head_cut_the_body() {
         ("trap-after-finish", "trap"),
         ("leak", "leak"),
     ] {
+        let host = Mock::echo();
         let resp = layer
-            .handle(Mock::echo(), request(test, Body::empty()))
+            .handle(host.clone(), request(test, Body::empty()))
             .await
             .unwrap_or_else(|e| panic!("{test}: head should be out: {e}"));
         let outcome = resp.extensions().get::<LayerOutcome>().cloned().unwrap();
         let err = collect(resp.into_body()).await.unwrap_err();
         assert_eq!(err, BodyError::Stopped, "{test}");
+        // The body ended on a failure the host already had.
+        let told = host.failed.lock().unwrap().clone();
         let failure = outcome.wait().await.unwrap_err();
+        assert_eq!(told, [failure.clone()], "{test}");
         match check {
             "trap" => assert!(
                 matches!(failure, LayerError::Trap(_)),

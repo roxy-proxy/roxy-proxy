@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use roxy_wasm::{
-    EndpointError, FlowInfo, HostError, LayerHost, LayerRequest, LayerResponse, LogLevel,
-    Principal, TagError, async_trait,
+    EndpointError, FlowInfo, HostError, LayerError, LayerHost, LayerRequest, LayerResponse,
+    LogLevel, Principal, TagError, async_trait,
 };
 
 use super::{AddonSpec, StackFlow, endpoint};
@@ -156,6 +156,14 @@ impl LayerHost for StackHost {
         match shared.metrics.get(&id, &view) {
             Ok(v) => Ok(Some(v)),
             Err(e) => Err(HostError::new(format!("metric {id}: {e}"))),
+        }
+    }
+
+    fn failed(&self, err: &LayerError) {
+        // An observer's failure is its own, logged by the task that runs
+        // it; it is never the exchange's.
+        if self.observer.is_none() {
+            self.st.fail(&self.addon().name, err.clone());
         }
     }
 }
