@@ -76,17 +76,19 @@ pub(super) fn credentials(
 /// the endpoint's URL with the request's normalised path appended (a bare
 /// `/` adds nothing) and the request's query after the endpoint's own.
 ///
-/// A `..` segment is refused in either mode, whether or not it would have
-/// climbed out: a layer that reflects text it inspected into the path must
-/// not be able to express "up" at all, and the refusal is the signal that
-/// it tried. Under `prefix` an encoded slash or backslash is refused too:
-/// roxy keeps it opaque, but an origin that decodes before routing would
-/// read it as a separator, and `..` beside it as a climb.
+/// A segment that starts with `..` is refused in either mode, whether or
+/// not it would have climbed out: a layer that reflects text it inspected
+/// into the path must not be able to express "up" at all, and the refusal
+/// is the signal that it tried. The check is on the segment as an origin
+/// reads it, so `..;params` and `%2e%2e` count. Under `prefix` an encoded
+/// slash or backslash is refused too: roxy keeps it opaque, but an origin
+/// that decodes before routing would read it as a separator, and `..`
+/// beside it as a climb.
 fn target(spec: &EndpointSpec, req: &Uri) -> Result<Uri, EndpointError> {
     let req_path = req.path();
-    if req_path.split('/').any(is_dot_dot) {
+    if req_path.split('/').any(climbs) {
         return Err(EndpointError::PathRefused(format!(
-            "{req_path:?} has a `..` segment"
+            "{req_path:?} has a segment that starts with `..`"
         )));
     }
     if spec.path == EndpointPath::Fixed {
@@ -124,9 +126,21 @@ fn target(spec: &EndpointSpec, req: &Uri) -> Result<Uri, EndpointError> {
         .map_err(|e| EndpointError::Failed(format!("endpoint URL: {e}")))
 }
 
-/// Whether a raw path segment is `..`, allowing for percent-encoded dots.
-fn is_dot_dot(segment: &str) -> bool {
-    segment.to_ascii_lowercase().replace("%2e", ".") == ".."
+/// Whether a raw path segment reads as `..` to an origin: canonicalised
+/// as a path of its own, it starts with two dots. Origins that strip
+/// `;params` before routing (Java servlet containers) resolve `..;x` as
+/// `..`, so the start of the segment is what counts, not the whole of it.
+/// A segment the canonicaliser refuses (a bare `..` climbs above its own
+/// root) is refused too.
+fn climbs(segment: &str) -> bool {
+    let alone = format!("/{segment}");
+    match roxy_http::url::normalize_path(alone.as_bytes()) {
+        Ok(p) => p
+            .as_str()
+            .strip_prefix('/')
+            .is_none_or(|s| s.starts_with("..")),
+        Err(_) => true,
+    }
 }
 
 /// Whether a raw path carries `%2F` or `%5C` in either case.
@@ -357,10 +371,12 @@ mod tests {
         assert_eq!(t("/%7ex?q=%2f"), "https://api.example.com/v1/~x?q=%2F");
     }
 
-    /// `..` is refused outright in both modes, even where it would not have
-    /// left the prefix, and in any percent-encoded spelling. Under `prefix`
-    /// so is a percent-encoded slash or backslash, which an origin that
-    /// decodes before routing would read as a separator.
+    /// A segment starting with `..` is refused outright in both modes, even
+    /// where it would not have left the prefix, in any percent-encoded
+    /// spelling, and with anything after the dots (`..;x` is `..` to an
+    /// origin that strips path parameters). Under `prefix` so is a
+    /// percent-encoded slash or backslash, which an origin that decodes
+    /// before routing would read as a separator.
     #[test]
     fn dot_dot_is_refused() {
         let refused = |mode, req: &str| {
@@ -376,8 +392,19 @@ mod tests {
                 "/a/../../admin",
                 "/%2e%2e/admin",
                 "/.%2E/admin",
+                "/a/..;x/admin",
+                "/a/..;/admin",
+                "/a/%2e%2e;x/admin",
+                "/a/.%2E;jsessionid=1/admin",
+                "/a/...",
+                "/a/..x/admin",
             ] {
                 assert!(refused(mode, req), "{mode:?} {req}");
+            }
+            // Dots that do not start a segment, and path parameters on an
+            // ordinary segment, are not climbs.
+            for req in ["/a/b..", "/a/.hidden", "/a;x/b", "/a/.;x/b"] {
+                assert!(!refused(mode, req), "{mode:?} {req}");
             }
         }
         for req in [

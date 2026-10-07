@@ -27,9 +27,11 @@ The endpoint's `path` setting:
 | `fixed` (default) | the configured URL is the whole target; the request's path and query are ignored |
 | `prefix` | the request's path, normalised (percent-encodings canonicalised, `.` segments removed), is appended under the configured path; its query follows the endpoint's own. A percent-encoded slash or backslash (`%2F`, `%5C`) is refused |
 
-A `..` segment, in any percent-encoded spelling, is refused in both modes:
-the call fails with `HTTP-request-URI-invalid`, nothing is dialled, and the
-`endpoint_call` event records the refusal. Under `prefix`, text a layer
+A segment that starts with `..`, in any percent-encoded spelling and
+whatever follows the dots (`..;x`, which an origin that strips path
+parameters reads as `..`), is refused in both modes: the call fails with
+`HTTP-request-URI-invalid`, nothing is dialled, and the `endpoint_call`
+event records the refusal. Under `prefix`, text a layer
 reflects into the path can pick any route below the configured path, with
 roxy's credential attached.
 
