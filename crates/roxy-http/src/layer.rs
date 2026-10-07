@@ -237,6 +237,11 @@ mod tests {
             ),
             (
                 "https://example.com/",
+                vec![("content-length", "5")],
+                Reason::BadContentLength,
+            ),
+            (
+                "https://example.com/",
                 vec![("proxy-authorization", "Basic x")],
                 Reason::ReservedHeader,
             ),
