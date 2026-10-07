@@ -31,6 +31,9 @@ pub(crate) struct Seen {
     pub addr: SocketAddr,
     pub method: String,
     pub path: String,
+    /// `:authority` over HTTP/2; `None` over HTTP/1.1, whose authority is
+    /// the `host` header.
+    pub authority: Option<String>,
     pub headers: http::HeaderMap,
     pub version: http::Version,
     /// Body bytes received so far.
@@ -278,6 +281,7 @@ impl Upstream {
             addr,
             method: req.method().to_string(),
             path: path.clone(),
+            authority: req.uri().authority().map(ToString::to_string),
             headers: req.headers().clone(),
             version: req.version(),
             body: Vec::new(),

@@ -448,6 +448,53 @@ async fn request_trailers_to_a_plaintext_upstream_are_refused() {
     trailers_refused(&kit, kit.connect(), "http://up.test/t").await;
 }
 
+/// An h2 upstream gets the authority as `:authority` alone: a `host`
+/// header beside it is a duplicate that origins such as nginx reject with
+/// `400`.
+#[tokio::test]
+async fn an_h2_upstream_gets_authority_without_a_host_header() {
+    let kit = Kit::builder().start().await;
+    let mut c = kit.tunnel("up.test", false).await;
+    let a = c.call("GET", "/x", &[("x-a", "1")], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].version, http::Version::HTTP_2);
+    assert_eq!(seen[0].authority.as_deref(), Some("up.test"));
+    assert!(
+        !seen[0].headers.contains_key("host"),
+        "{:?}",
+        seen[0].headers
+    );
+    assert_eq!(seen[0].headers["x-a"], "1");
+}
+
+/// An HTTP/1.1 upstream, TLS or plaintext, gets the canonical authority as
+/// `host`, with a non-default port kept.
+#[tokio::test]
+async fn an_h1_upstream_gets_the_host_header() {
+    let kit = Kit::builder().start().await;
+    kit.upstream.h1_only();
+    let mut c = kit.tunnel("up.test", false).await;
+    assert_eq!(c.call("GET", "/tls", &[], b"").await.status, 200);
+    let mut c = kit.h1().await;
+    assert_eq!(c.call("GET", "/plain", &[], b"").await.status, 200);
+    let req = c
+        .request_to("up.test:8080", "GET", "/port", &[])
+        .body(roxy_http::Body::empty())
+        .unwrap();
+    assert_eq!(Answer::read(c.send(req).await.unwrap()).await.status, 200);
+    let seen = kit.upstream.wait_seen(3).await;
+    for (path, host) in [
+        ("/tls", "up.test"),
+        ("/plain", "up.test"),
+        ("/port", "up.test:8080"),
+    ] {
+        let s = seen.iter().find(|s| s.path == path).unwrap();
+        assert_eq!(s.version, http::Version::HTTP_11, "{path}");
+        assert_eq!(s.headers["host"], host, "{path}");
+    }
+}
+
 /// Over h2 the cap resets the stream, whether crossed while streaming or
 /// declared up front; the connection stays usable.
 #[tokio::test]

@@ -70,8 +70,10 @@ CONNECT host, port-normalised.
 Inside a TLS tunnel, by ALPN (`http.enable_h2`, default true). The `h2`
 crate parses it; the same semantic validation as HTTP/1.1 follows
 ([HTTP/2 requests](/reference/http#http2-requests)). Upstream, roxy offers
-`h2` and `http/1.1` and serialises as whichever the origin negotiates;
-WebSocket upgrades always use HTTP/1.1 ([WebSockets](/reference/websockets)).
+`h2` and `http/1.1` and serialises as whichever the origin negotiates: the
+canonical authority goes out as `host` over HTTP/1.1 and as `:authority`
+alone over HTTP/2, never both. WebSocket upgrades always use HTTP/1.1
+([WebSockets](/reference/websockets)).
 
 Trailers (gRPC and other HTTP/2-only protocols) need `http.allow_trailers`
 and an origin that negotiates `h2`: HTTP/1.1 needs the names in a `Trailer`

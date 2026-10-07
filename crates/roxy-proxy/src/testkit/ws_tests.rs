@@ -208,6 +208,20 @@ async fn protocol_limits_close_with_their_codes() {
     assert_eq!(kit.upstream.ws_received().len(), 1);
 }
 
+/// The upgrade request goes to the upstream over HTTP/1.1 with the
+/// canonical authority as `host`.
+#[tokio::test]
+async fn the_upgrade_request_carries_host() {
+    let kit = with("").start().await;
+    let mut ws = open(&kit, None).await;
+    let back = echo(&mut ws, Message::text("hi")).await;
+    assert_eq!(back.into_text().unwrap().as_str(), "hi");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].version, http::Version::HTTP_11);
+    assert_eq!(seen[0].headers["host"], "up.test", "{:?}", seen[0].headers);
+    assert_eq!(seen[0].headers["upgrade"], "websocket");
+}
+
 /// Extensions are stripped from the offer only when rules read messages.
 #[tokio::test]
 async fn extensions_are_stripped_only_for_message_rules() {

@@ -1206,6 +1206,12 @@ async fn a_redirect_keeping_host_goes_over_http1() {
     assert_eq!(kept.headers["host"], "alias.test");
     let rewritten = seen.iter().find(|s| s.path == "/rewritten").unwrap();
     assert_eq!(rewritten.version, http::Version::HTTP_2);
+    assert_eq!(rewritten.authority.as_deref(), Some("up.test"));
+    assert!(
+        !rewritten.headers.contains_key("host"),
+        "{:?}",
+        rewritten.headers
+    );
 }
 
 /// A request pipelined behind a closing deny is never parsed: the
