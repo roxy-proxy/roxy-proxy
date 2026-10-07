@@ -2,7 +2,8 @@ import { defineConfig } from "vocs/config";
 
 export default defineConfig({
   title: "roxy",
-  description: "A strict, programmable HTTP firewall and egress proxy.",
+  description:
+    "A strict, programmable HTTP firewall: an egress proxy for untrusted workloads, or a gateway in front of the APIs your clients call.",
   // Pages live in docs/pages rather than the default src/pages.
   srcDir: ".",
   // GitHub Pages serves the site from /roxy-proxy/. Local dev overrides it.
@@ -52,11 +53,11 @@ export default defineConfig({
     {
       text: "Deploy",
       items: [
-        { text: "Containing a workload", link: "/deploy/overview" },
+        { text: "Sandbox containment", link: "/deploy/containment" },
+        { text: "HTTP gateway", link: "/deploy/gateway" },
         { text: "Container image", link: "/deploy/docker" },
         { text: "Running without Docker", link: "/deploy/bare-metal" },
         { text: "Node mode", link: "/deploy/node-mode" },
-        { text: "Gateway", link: "/deploy/gateway" },
       ],
     },
     {

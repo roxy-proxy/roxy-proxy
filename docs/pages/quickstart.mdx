@@ -210,10 +210,10 @@ The scripted answers will not make much sense of your prompts, but every call go
 
 ### This is not containment
 
-The client follows `HTTP_PROXY` because it chooses to; any process can ignore it. This quickstart shows what roxy and its addons decide, not a boundary. To contain an agent, run it where its only route out is roxy: see [containing a workload](/deploy/overview).
+The client follows `HTTP_PROXY` because it chooses to; any process can ignore it. This quickstart shows what roxy and its addons decide, not a boundary. To contain an agent, run it where its only route out is roxy: see [sandbox containment](/deploy/containment).
 
 ## Next steps
 
 - **Write an addon.** [Writing addons](/addons/writing) covers the `roxy-addon` SDK the two addons here use.
-- **Contain the agent.** [Containing a workload](/deploy/overview) has the network recipe and a Compose layout.
+- **Contain the agent.** [Sandbox containment](/deploy/containment) has the network recipe and a Compose layout.
 - **Write your own policy.** [How policies work](/policies/overview) explains how rules are evaluated.

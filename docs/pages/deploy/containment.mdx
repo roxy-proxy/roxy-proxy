@@ -1,8 +1,21 @@
-# Containing a workload
+---
+title: "Sandbox containment"
+description: "Run roxy as the only way out of a sandbox: the workload points HTTPS_PROXY at roxy's proxy port, trusts roxy's CA, and the network gives it no other route."
+---
 
-roxy is an explicit proxy, not a transparent gateway. A client's
-`HTTPS_PROXY` only tells well-behaved clients where roxy is. What contains
-a workload is the network: it must have no route out except through roxy.
+import containment from "../../assets/containment.svg";
+
+# Sandbox containment
+
+An untrusted workload runs where its only route out is roxy. It points
+`HTTP_PROXY` and `HTTPS_PROXY` at an `http_proxy` listener and trusts
+roxy's CA. roxy decrypts each request, judges it, injects the credentials
+the workload needs, and logs every decision. Containment comes from the
+network: the proxy variables only tell a well-behaved client where roxy
+is, and the network must leave the workload no other way out.
+
+<img src={containment} alt="A workload inside a sealed sandbox network whose only exit is roxy's proxy port 3128. Requests go from the workload to roxy and on to the allowed upstreams, api.anthropic.com and github.com, with the real key added; responses come back the same way. roxy holds the CA and the secrets, and the workload fetches roxy-ca.pem from port 3130. A direct route out of the sandbox is blocked at the boundary: direct TCP, UDP and DNS have no route." />
+
 The same recipe applies anywhere:
 
 1. **Take away the workload's route out.** Put it in a network namespace,
@@ -10,8 +23,19 @@ The same recipe applies anywhere:
    everything else, including direct TCP, UDP and DNS, at the network layer.
    roxy resolves DNS itself, so the workload needs none.
 2. **Give roxy a route out**, and the workload a route to roxy's proxy port
-   (3128 in the examples). Keep the CA endpoint (3130) reachable from the
-   workload only if it should fetch the CA itself.
+   (an `http_proxy` listener, 3128 in the examples). Keep the CA endpoint
+   (3130) reachable from the workload only if it should fetch the CA
+   itself.
+
+   ```yaml
+   listeners:
+     - name: proxy
+       mode: http_proxy             # the default
+       bind: 0.0.0.0:3128
+   ca_server:
+     bind: 0.0.0.0:3130             # serves /roxy-ca.pem to the workload
+   ```
+
 3. **Point the workload at roxy and make it trust roxy's CA**
    ([CA distribution](/operate/ca-certificates#ca-distribution)):
 
@@ -56,15 +80,14 @@ volumes:
   roxy-ca: {}
 ```
 
-The workload fetches the CA from `http://roxy:3130/roxy-ca.pem` (with
-`ca_server.bind: 0.0.0.0:3130`). A client that ignores the proxy variables,
-or a library that opens its own sockets, gets nowhere: direct connections
-and DNS lookups fail.
+The workload fetches the CA from `http://roxy:3130/roxy-ca.pem`. A client
+that ignores the proxy variables, or a library that opens its own sockets,
+gets nowhere: direct connections and DNS lookups fail.
 
-## Why an explicit proxy
+## Why a proxy port
 
-The explicit proxy keeps the interface roxy exposes to clients as narrow
-as it can be while still being useful:
+An `http_proxy` listener keeps the interface roxy exposes to the workload
+as narrow as it can be while still being useful:
 
 - **One protocol, parsed strictly.** A client can speak HTTP/1.1 or HTTP/2
   to roxy, and nothing else. CONNECT only opens a tunnel that roxy
@@ -79,3 +102,8 @@ as it can be while still being useful:
 - **Nothing is implicit.** A client that bypasses the proxy reaches nothing,
   because the network allows nothing else, and everything that does reach
   roxy is decided by a rule.
+
+An `http` listener serves clients that address roxy as the server
+([HTTP gateway](/deploy/gateway)). That is for traffic sent to roxy on
+purpose, not for containing a workload: the clients keep whatever other
+routes they have.
