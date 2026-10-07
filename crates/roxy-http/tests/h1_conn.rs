@@ -1,7 +1,10 @@
 //! Behavioural tests of `h1::ServerConn`: streaming, backpressure,
 //! 100-continue, caps, timeouts, response framing, CONNECT and upgrades.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -12,7 +15,7 @@ use roxy_http::{
     Body, BodyError, CanonicalRequest, CanonicalResponse, DriveError, HttpFlags, Limits, Reason,
     Scheme, WriteError,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 
 fn tunnel() -> Role {
     Role::Tunnel {
@@ -44,7 +47,9 @@ fn client_fault<T: std::fmt::Debug>(r: Result<T, DriveError>) -> roxy_http::Pars
     }
 }
 
-async fn expect_request(c: &mut ServerConn<DuplexStream>) -> CanonicalRequest {
+async fn expect_request<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    c: &mut ServerConn<IO>,
+) -> CanonicalRequest {
     match c.next_request().await {
         Ok(Some(Incoming::Request(r))) => r,
         other => panic!("expected request, got {other:?}"),
@@ -819,6 +824,170 @@ async fn half_closed_client_gets_a_ready_body_in_full() {
     let (r, (_, body)) = tokio::join!(respond, read_response(&mut client, false));
     r.unwrap();
     assert_eq!(body.len(), 64 * 1024);
+}
+
+/// A stream that counts the writes reaching it, i.e. the syscalls (or TLS
+/// records) a response would cost on a real socket.
+struct CountingIo {
+    inner: DuplexStream,
+    writes: Arc<AtomicUsize>,
+}
+
+impl AsyncRead for CountingIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for CountingIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let r = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(r, Poll::Ready(Ok(n)) if n > 0) {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+        }
+        r
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+async fn counting_conn() -> (DuplexStream, ServerConn<CountingIo>, Arc<AtomicUsize>) {
+    let (mut client, server) = tokio::io::duplex(1 << 16);
+    let writes = Arc::new(AtomicUsize::new(0));
+    let io = CountingIo {
+        inner: server,
+        writes: writes.clone(),
+    };
+    let mut c = ServerConn::new(
+        io,
+        tunnel(),
+        Arc::new(Limits::default()),
+        Arc::new(HttpFlags::default()),
+    );
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    let _ = expect_request(&mut c).await;
+    (client, c, writes)
+}
+
+#[tokio::test]
+async fn ready_body_goes_out_with_the_head_in_one_write() {
+    let (mut client, mut c, writes) = counting_conn().await;
+    let respond = c.respond(ok(Body::from_bytes(Bytes::from_static(b"hello"))));
+    let (r, (_, body)) = tokio::join!(respond, read_response(&mut client, false));
+    r.unwrap();
+    assert_eq!(body, b"hello");
+    assert_eq!(writes.load(Ordering::Relaxed), 1);
+
+    // A chunked body whose frames are already queued is no different.
+    let (mut client, mut c, writes) = counting_conn().await;
+    let (mut tx, body) = Body::channel(1 << 20, None);
+    tx.try_push(Bytes::from_static(b"hel")).unwrap();
+    tx.try_push(Bytes::from_static(b"lo")).unwrap();
+    tx.try_finish().unwrap();
+    let (r, (head, body)) = tokio::join!(c.respond(ok(body)), read_response(&mut client, false));
+    r.unwrap();
+    assert!(head.contains("transfer-encoding: chunked"), "{head}");
+    assert_eq!(body, b"hello");
+    assert_eq!(writes.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn head_is_not_held_back_by_a_pending_body() {
+    let (mut client, mut c, writes) = counting_conn().await;
+    let (mut tx, body) = Body::channel(1 << 20, None);
+    let respond = tokio::spawn(async move { c.respond(ok(body)).await });
+    // Nothing has been produced yet; the head must still arrive. Paused
+    // time makes a writer that waits on the producer hit this timeout.
+    let mut head = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut b = [0u8; 1];
+            assert_eq!(client.read(&mut b).await.unwrap(), 1);
+            head.push(b[0]);
+        }
+    })
+    .await
+    .expect("head flushed before the body is ready");
+    assert_eq!(writes.load(Ordering::Relaxed), 1);
+    tx.send_data(Bytes::from_static(b"late")).await.unwrap();
+    tx.finish().await.unwrap();
+    let mut rest = Vec::new();
+    while !rest.ends_with(b"0\r\n\r\n") {
+        let mut b = [0u8; 64];
+        let n = client.read(&mut b).await.unwrap();
+        assert!(n > 0, "EOF before the body ended");
+        rest.extend_from_slice(&b[..n]);
+    }
+    respond.await.unwrap().unwrap();
+    assert_eq!(rest, b"4\r\nlate\r\n0\r\n\r\n");
+    assert_eq!(writes.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn response_body_idle_timeout_is_per_frame() {
+    let (mut client, mut c) = conn_with(Limits {
+        response_body_idle_timeout: Duration::from_secs(1),
+        ..Limits::default()
+    });
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    let _ = expect_request(&mut c).await;
+    let (mut tx, body) = Body::channel(1 << 20, None);
+    // Each gap is under the limit; only the final stall is over it.
+    let producer = tokio::spawn(async move {
+        for chunk in [&b"a"[..], b"b", b"c"] {
+            tx.send_data(Bytes::copy_from_slice(chunk)).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(700)).await;
+        }
+        std::future::pending::<()>().await;
+        drop(tx);
+    });
+    let drain = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        let mut b = [0u8; 256];
+        while let Ok(n) = client.read(&mut b).await
+            && n > 0
+        {
+            seen.extend_from_slice(&b[..n]);
+        }
+        seen
+    });
+    let started = tokio::time::Instant::now();
+    let r = c.respond(ok(body)).await;
+    assert!(
+        matches!(r, Err(WriteError::Body(BodyError::Timeout))),
+        "{r:?}"
+    );
+    let elapsed = started.elapsed();
+    // A broken connection is left to its owner to drop; the client sees EOF.
+    drop(c);
+    let seen = drain.await.unwrap();
+    assert!(
+        elapsed >= Duration::from_millis(2400) && elapsed < Duration::from_millis(2500),
+        "cut {elapsed:?} after the response started"
+    );
+    let seen = String::from_utf8(seen).unwrap();
+    assert!(seen.ends_with("1\r\nc\r\n"), "{seen}");
+    producer.abort();
 }
 
 #[tokio::test(start_paused = true)]
