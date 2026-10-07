@@ -43,6 +43,8 @@ pub enum NodeError {
     },
     #[error("enrolment rejected by the control plane: {0}")]
     EnrolRejected(String),
+    #[error("enrolment response names node {claimed} but the certificate names {in_cert}")]
+    NodeIdMismatch { claimed: String, in_cert: String },
     #[error("reading the control plane CA bundle {}: {source}", path.display())]
     CaBundle {
         path: PathBuf,
@@ -68,14 +70,16 @@ pub type HandlerFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Applies leases to the proxy. The methods run on the node's lease task,
 /// one at a time.
 pub trait LeaseHandler: Send + Sync {
-    /// Applies `lease`, received at `received_at` (the base of
-    /// `valid_until`). A lease with no change in `change` still moves
-    /// `valid_until`. `Err` keeps the running policy; the error is logged
-    /// and the node reports the old lease id on its next fetch.
+    /// Applies `lease`. `fetched_at` is the node's clock just before the
+    /// fetch was sent, the base of `valid_until`: the time the request took
+    /// counts against the lease, not for it. A lease with no change in
+    /// `change` still moves `valid_until`. `Err` keeps the running policy;
+    /// the error is logged and the node reports the old lease id on its
+    /// next fetch.
     fn apply<'a>(
         &'a self,
         lease: &'a Lease,
-        received_at: DateTime<Utc>,
+        fetched_at: DateTime<Utc>,
         change: Change,
     ) -> HandlerFuture<'a, Result<(), String>>;
 
@@ -141,6 +145,9 @@ pub struct Node {
     identity: Mutex<Option<Arc<Identity>>>,
     current: Mutex<Current>,
     revoked: AtomicBool,
+    /// The running lease's `refresh_after_seconds` was reduced, and the
+    /// warning for it logged.
+    refresh_clamped: AtomicBool,
     started: Instant,
 }
 
@@ -172,6 +179,7 @@ impl Node {
             identity: Mutex::new(None),
             current: Mutex::new(Current::default()),
             revoked: AtomicBool::new(false),
+            refresh_clamped: AtomicBool::new(false),
             started: Instant::now(),
         }))
     }
@@ -217,20 +225,25 @@ impl Node {
         }
         // Revoked: ship what is spooled, then stop.
         self.spool.close();
-        let _ = tokio::time::timeout(self.scaled(Duration::from_secs(30)), shipper).await;
+        let mut shipper = shipper;
+        let _ = tokio::time::timeout(self.scaled(Duration::from_secs(30)), &mut shipper).await;
+        shipper.abort();
         renewer.abort();
         Ok(())
     }
 
-    /// Ships whatever is still spooled, within `grace`.
+    /// Ships whatever is still spooled, within `grace`. The bound holds
+    /// mid-request: an upload still in progress at the deadline is dropped.
     pub async fn drain(&self, grace: Duration) {
         self.spool.close();
-        let deadline = Instant::now() + grace;
-        while self.spool.pending_events() > 0 && Instant::now() < deadline {
-            if !self.ship_once(&mut Stopped::default()).await {
-                break;
+        let _ = tokio::time::timeout(grace, async {
+            while self.spool.pending_events() > 0 {
+                if !self.ship_once(&mut Stopped::default()).await {
+                    break;
+                }
             }
-        }
+        })
+        .await;
     }
 
     async fn establish_identity(&self) -> Result<(), NodeError> {
@@ -262,11 +275,12 @@ impl Node {
         not_after: DateTime<Utc>,
         renew_after: Option<Duration>,
     ) {
-        // Without a stated window, renew at two thirds of what is left.
-        let renew_after = renew_after.unwrap_or_else(|| {
-            let left = (not_after - Utc::now()).to_std().unwrap_or_default();
-            left.mul_f64(2.0 / 3.0)
-        });
+        // Renew no later than two thirds of the way to expiry, whatever
+        // window the server stated, so a failed renewal has time to be
+        // retried.
+        let left = (not_after - Utc::now()).to_std().unwrap_or_default();
+        let latest = left.mul_f64(2.0 / 3.0);
+        let renew_after = renew_after.map_or(latest, |r| r.min(latest));
         *lock(&self.identity) = Some(Arc::new(Identity {
             client,
             node_id,
@@ -309,6 +323,15 @@ impl Node {
                 Err(e) => return Err(NodeError::EnrolRejected(e.to_string())),
             }
         };
+        // The certificate is the identity; the body's `node_id` must agree
+        // with it or the server is confused about who it enrolled.
+        let in_cert = identity::cert_info(&issued.certificate_chain)?.node_id;
+        if in_cert != issued.node_id {
+            return Err(NodeError::NodeIdMismatch {
+                claimed: issued.node_id,
+                in_cert,
+            });
+        }
         let key_pem = key.serialize_pem();
         self.state
             .store_identity(&issued.certificate_chain, &key_pem)?;
@@ -334,35 +357,46 @@ impl Node {
     }
 
     /// Fetches at `refresh_after`, with backoff while the control plane
-    /// cannot be reached; the lease runs down on its own meanwhile. Ends
-    /// on revocation.
+    /// cannot be reached; the lease runs down on its own meanwhile. A
+    /// `401` or `426` is logged when the outcome changes, not on every
+    /// poll. Ends on revocation.
     async fn lease_loop(&self) {
         let mut backoff = Backoff::new();
+        let mut last = FetchOutcome::Lease;
         loop {
             let Some(id) = self.client() else { return };
             let state = self.node_state();
-            let wait = match id.client.fetch_lease(&state).await {
+            let fetched_at = Utc::now();
+            let fetched = id.client.fetch_lease(&state).await;
+            let outcome = FetchOutcome::of(&fetched);
+            let changed = outcome != last;
+            last = outcome;
+            let wait = match fetched {
                 LeaseFetch::Lease(lease) => {
                     backoff.reset();
-                    self.apply(&lease).await
+                    self.apply(&lease, fetched_at).await
                 }
                 LeaseFetch::Revoked => {
                     self.revoke().await;
                     return;
                 }
                 LeaseFetch::Unsupported(e) => {
-                    tracing::error!(
-                        missing = %e.missing.join(","),
-                        message = %e.message,
-                        "control plane will not serve this roxy or protocol version; the lease runs down"
-                    );
+                    if changed {
+                        tracing::error!(
+                            missing = %e.missing.join(","),
+                            message = %e.message,
+                            "control plane will not serve this roxy or protocol version; the lease runs down"
+                        );
+                    }
                     backoff.wait()
                 }
                 LeaseFetch::Unauthorized => {
-                    tracing::error!(
-                        not_after = %id.not_after.to_rfc3339(),
-                        "control plane does not recognise the node certificate; the lease runs down (re-enrolment needs a new token and an empty state dir)"
-                    );
+                    if changed {
+                        tracing::error!(
+                            not_after = %id.not_after.to_rfc3339(),
+                            "control plane does not recognise the node certificate; the lease runs down (re-enrolment needs a new token and an empty state dir)"
+                        );
+                    }
                     backoff.wait()
                 }
                 LeaseFetch::Failed(e) => {
@@ -381,14 +415,26 @@ impl Node {
     }
 
     /// Applies a fetched lease, diffing it against the one the node runs;
-    /// returns how long to wait for the next fetch.
-    async fn apply(&self, lease: &Lease) -> Duration {
-        let received_at = Utc::now();
-        let refresh = Duration::from_secs(
-            lease
-                .refresh_after_seconds
-                .clamp(1, lease.valid_for_seconds.max(1)),
-        );
+    /// returns how long to wait for the next fetch. The poll is never later
+    /// than halfway through the lease, so a fetch that fails has time to
+    /// be retried before the lease runs down.
+    async fn apply(&self, lease: &Lease, fetched_at: DateTime<Utc>) -> Duration {
+        let latest = (lease.valid_for_seconds / 2).max(1);
+        let refresh_after = lease.refresh_after_seconds.clamp(1, latest);
+        if refresh_after < lease.refresh_after_seconds {
+            if !self.refresh_clamped.swap(true, Ordering::AcqRel) {
+                tracing::warn!(
+                    lease_id = %lease.lease_id,
+                    refresh_after_seconds = lease.refresh_after_seconds,
+                    valid_for_seconds = lease.valid_for_seconds,
+                    polling_every = refresh_after,
+                    "lease refresh_after_seconds is not well inside valid_for_seconds; polling at half the lease instead"
+                );
+            }
+        } else {
+            self.refresh_clamped.store(false, Ordering::Release);
+        }
+        let refresh = Duration::from_secs(refresh_after);
         let change = {
             let current = lock(&self.current);
             Change {
@@ -401,7 +447,7 @@ impl Node {
                     .is_some_and(|e| e != lease.state_epoch),
             }
         };
-        let applied = self.handler.apply(lease, received_at, change).await;
+        let applied = self.handler.apply(lease, fetched_at, change).await;
         let mut current = lock(&self.current);
         match applied {
             Ok(()) => {
@@ -430,6 +476,40 @@ impl Node {
         refresh
     }
 
+    /// The stored identity and a CSR for its key, for a renewal. `None`
+    /// (logged) when the state dir no longer yields them: renewal cannot
+    /// proceed and the certificate serves until it expires.
+    fn renewal_request(&self) -> Option<(crate::state::StoredIdentity, String)> {
+        let stored = match self.state.identity() {
+            Ok(Some(stored)) => stored,
+            Ok(None) => {
+                tracing::error!(
+                    dir = %self.state.path().display(),
+                    "node identity missing from the state dir; cannot renew the certificate"
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "node identity in the state dir is unreadable; cannot renew the certificate");
+                return None;
+            }
+        };
+        let key = match identity::load_key(&stored.key_pem) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::error!(error = %e, "node key in the state dir does not parse; cannot renew the certificate");
+                return None;
+            }
+        };
+        match identity::csr_pem(&key) {
+            Ok(csr) => Some((stored, csr)),
+            Err(e) => {
+                tracing::error!(error = %e, "cannot build a certificate request; cannot renew the certificate");
+                None
+            }
+        }
+    }
+
     /// Renews the certificate at its renewal time, retrying with backoff
     /// while the control plane is unavailable and the current one stays in
     /// use. A 4xx is final: the loop ends and the current certificate serves
@@ -442,14 +522,7 @@ impl Node {
                 return false;
             };
             tokio::time::sleep_until(id.renew_at.into()).await;
-            let Some(stored) = self.state.identity().ok().flatten() else {
-                return false;
-            };
-            let Ok(key) = identity::load_key(&stored.key_pem) else {
-                tracing::error!("node key in the state dir no longer parses; cannot renew");
-                return false;
-            };
-            let Ok(csr) = identity::csr_pem(&key) else {
+            let Some((stored, csr)) = self.renewal_request() else {
                 return false;
             };
             match id.client.renew(csr).await {
@@ -543,10 +616,15 @@ impl Node {
                 }
                 continue;
             }
-            if lock(&self.current).lease_id.is_none() && !self.spool.is_closed() {
+            // A batch is tagged with the lease in force; with none there
+            // is nothing to ship, and nothing ever will be once closed.
+            let lease_id = lock(&self.current).lease_id.clone();
+            if lease_id.is_none() {
+                if self.spool.is_closed() {
+                    return;
+                }
                 continue;
             }
-            let lease_id = lock(&self.current).lease_id.clone();
             if stopped.under.is_some() && stopped.under == lease_id {
                 // Shipping resumes with a new lease id; meanwhile the spool
                 // applies `on_high_water`.
@@ -566,16 +644,19 @@ impl Node {
         }
     }
 
-    /// One upload attempt. `true` when a batch was acknowledged.
+    /// One upload attempt. `true` when a batch was acknowledged. Nothing
+    /// is sent before the first lease: a batch quotes the lease in force.
     async fn ship_once(&self, stopped: &mut Stopped) -> bool {
         let Some(id) = self.client() else {
+            return false;
+        };
+        let Some(lease_id) = lock(&self.current).lease_id.clone() else {
             return false;
         };
         let settings = self.spool.settings();
         let Some(batch) = self.spool.batch(settings.batch_max_bytes) else {
             return false;
         };
-        let lease_id = lock(&self.current).lease_id.clone().unwrap_or_default();
         let body = encode_flow_batch(&id.node_id, &lease_id, batch.seq_first, &batch.lines);
         match id.client.ship_flows(&body).await {
             ShipOutcome::Acked(ack) => {
@@ -611,6 +692,29 @@ impl Node {
 #[derive(Debug, Default)]
 struct Stopped {
     under: Option<String>,
+}
+
+/// A lease fetch's outcome, without its payload: what "the outcome changed"
+/// compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchOutcome {
+    Lease,
+    Revoked,
+    Unsupported,
+    Unauthorized,
+    Failed,
+}
+
+impl FetchOutcome {
+    fn of(fetch: &LeaseFetch) -> Self {
+        match fetch {
+            LeaseFetch::Lease(_) => Self::Lease,
+            LeaseFetch::Revoked => Self::Revoked,
+            LeaseFetch::Unsupported(_) => Self::Unsupported,
+            LeaseFetch::Unauthorized => Self::Unauthorized,
+            LeaseFetch::Failed(_) => Self::Failed,
+        }
+    }
 }
 
 /// Exponential backoff with jitter, capped.
@@ -674,6 +778,8 @@ mod tests {
 
     struct Recorder {
         applied: Mutex<Vec<(Lease, DateTime<Utc>, Change)>>,
+        /// The wall clock when each `apply` ran.
+        applied_at: Mutex<Vec<DateTime<Utc>>>,
         revoked: AtomicUsize,
         state: Mutex<PolicyState>,
         fail_next: AtomicBool,
@@ -683,6 +789,7 @@ mod tests {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 applied: Mutex::new(Vec::new()),
+                applied_at: Mutex::new(Vec::new()),
                 revoked: AtomicUsize::new(0),
                 state: Mutex::new(PolicyState::None),
                 fail_next: AtomicBool::new(false),
@@ -702,6 +809,7 @@ mod tests {
                     return Err("config invalid: boom".into());
                 }
                 lock(&self.applied).push((lease.clone(), at, change));
+                lock(&self.applied_at).push(Utc::now());
                 *lock(&self.state) = PolicyState::Loaded;
                 Ok(())
             })
@@ -1207,10 +1315,188 @@ mod tests {
             Reply::json(200, &lease("L1", "version: 1\n", "s1", "e1")),
         );
         let (node, _) = h.node(true);
+        let state = node.state_dir().clone();
         let task = tokio::spawn(node.clone().run());
-        let renewals = h.mock.wait_for("/roxy/v1/renew", 3).await;
+        h.mock.wait_for(LEASE, 1).await;
+        let before = state.identity().unwrap().unwrap().cert_pem;
+        let renewals = h.mock.wait_for("/roxy/v1/renew", 2).await;
         assert!(renewals.iter().all(|r| r.client.as_deref() == Some("n1")));
-        h.mock.wait_for(LEASE, 2).await;
+        assert_eq!(
+            state.identity().unwrap().unwrap().cert_pem,
+            before,
+            "failed attempts leave the stored certificate alone"
+        );
+        h.mock.wait_for("/roxy/v1/renew", 3).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.identity().unwrap().unwrap().cert_pem == before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the third attempt replaces the certificate");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_node_revoked_before_its_first_lease_ships_nothing() {
+        let h = Harness::new().await;
+        h.mock.push("/roxy/v1/enrol", Reply::issue("n1"));
+        h.mock.fallback(LEASE, Reply::status(410));
+        h.mock.fallback(
+            FLOWS,
+            Reply::json(
+                200,
+                &FlowAck {
+                    acked_through: u64::MAX,
+                },
+            ),
+        );
+        let (node, rec) = h.node(true);
+        let spool = node.spool().clone();
+        spool.push(b"{\"event\":\"request\"}");
+        tokio::time::timeout(Duration::from_secs(10), node.clone().run())
+            .await
+            .expect("run ends on revocation")
+            .unwrap();
+        assert_eq!(rec.revoked.load(Ordering::Acquire), 1);
+        assert!(
+            h.mock.requests_to(FLOWS).is_empty(),
+            "a batch quotes a lease id; without one nothing is sent"
+        );
+        assert_eq!(
+            spool.pending_events(),
+            1,
+            "the event stays spooled, not shipped untagged"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_enrolment_whose_certificate_names_another_node_is_refused() {
+        let h = Harness::new().await;
+        h.mock.push(
+            "/roxy/v1/enrol",
+            Reply::IssueMismatched {
+                node_id: "n1".into(),
+                san: "n2".into(),
+            },
+        );
+        let (node, _) = h.node(true);
+        assert!(matches!(
+            node.run().await,
+            Err(NodeError::NodeIdMismatch { claimed, in_cert }) if claimed == "n1" && in_cert == "n2"
+        ));
+        assert!(
+            StateDir::open(&h.dir.path().join("state"))
+                .unwrap()
+                .identity()
+                .unwrap()
+                .is_none(),
+            "nothing is stored"
+        );
+    }
+
+    /// The poll is never later than halfway through the lease, whatever
+    /// `refresh_after_seconds` says.
+    #[tokio::test]
+    async fn refresh_after_is_clamped_to_half_the_lease() {
+        let h = Harness::new().await;
+        let (node, _) = h.node(true);
+        let mut l = lease("L1", "version: 1\n", "s1", "e1");
+        l.valid_for_seconds = 600;
+        l.refresh_after_seconds = 60;
+        assert_eq!(node.apply(&l, Utc::now()).await, Duration::from_secs(60));
+        l.refresh_after_seconds = 600;
+        assert_eq!(node.apply(&l, Utc::now()).await, Duration::from_secs(300));
+        l.refresh_after_seconds = 301;
+        assert_eq!(node.apply(&l, Utc::now()).await, Duration::from_secs(300));
+        l.valid_for_seconds = 1;
+        l.refresh_after_seconds = 1;
+        assert_eq!(node.apply(&l, Utc::now()).await, Duration::from_secs(1));
+    }
+
+    /// `renew_after_seconds` is a hint; the node renews no later than two
+    /// thirds of the way to `not_after`.
+    #[tokio::test]
+    async fn renewal_is_never_later_than_two_thirds_of_the_certificate_lifetime() {
+        let h = Harness::new().await;
+        let (node, _) = h.node(true);
+        let client = || {
+            ControlPlane::unauthenticated(
+                &h.mock.url(),
+                &Trust::default(),
+                NodeInfo {
+                    roxy_version: "test".into(),
+                },
+            )
+            .unwrap()
+        };
+        let not_after = Utc::now() + chrono::Duration::seconds(3000);
+        let scaled = |secs: u64| node.scaled(Duration::from_secs(secs));
+        let renew_in = |node: &Node| {
+            lock(&node.identity)
+                .as_ref()
+                .unwrap()
+                .renew_at
+                .saturating_duration_since(Instant::now())
+        };
+
+        node.install_identity(
+            client(),
+            "n1".into(),
+            not_after,
+            Some(Duration::from_secs(600)),
+        );
+        let within = renew_in(&node);
+        assert!(within <= scaled(600) && within > scaled(590), "{within:?}");
+
+        node.install_identity(
+            client(),
+            "n1".into(),
+            not_after,
+            Some(Duration::from_secs(2900)),
+        );
+        let capped = renew_in(&node);
+        assert!(
+            capped <= scaled(2000) && capped > scaled(1990),
+            "{capped:?}"
+        );
+
+        node.install_identity(client(), "n1".into(), not_after, None);
+        let defaulted = renew_in(&node);
+        assert!(
+            defaulted <= scaled(2000) && defaulted > scaled(1990),
+            "{defaulted:?}"
+        );
+    }
+
+    /// `valid_until` counts from before the fetch was sent, so a slow
+    /// answer shortens the lease rather than extending it.
+    #[tokio::test]
+    async fn valid_until_counts_from_before_the_fetch_was_sent() {
+        let h = Harness::new().await;
+        h.mock.push("/roxy/v1/enrol", Reply::issue("n1"));
+        let l1 = lease("L1", "version: 1\n", "s1", "e1");
+        let delay = Duration::from_secs(1);
+        h.mock.push(
+            LEASE,
+            Reply::Delayed(delay, Box::new(Reply::json(200, &l1))),
+        );
+        h.mock.fallback(LEASE, Reply::json(200, &l1));
+        let (node, rec) = h.node(true);
+        let task = tokio::spawn(node.clone().run());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while lock(&rec.applied).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (_, at, _) = lock(&rec.applied)[0].clone();
+        let applied_at = lock(&rec.applied_at)[0];
+        assert!(
+            (applied_at - at).to_std().unwrap() >= delay,
+            "the base of valid_until precedes the delayed answer by at least the delay"
+        );
         task.abort();
     }
 

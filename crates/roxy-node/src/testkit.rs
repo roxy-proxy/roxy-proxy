@@ -118,6 +118,8 @@ pub enum Reply {
         lifetime_secs: i64,
         renew_after_seconds: u64,
     },
+    /// Sign the CSR for `san` but claim `node_id` in the body.
+    IssueMismatched { node_id: String, san: String },
     /// Close the connection without answering.
     Hangup,
     /// Answer after `delay` (the client times out first when it is long).
@@ -413,6 +415,22 @@ async fn render(
                 certificate_chain: chain,
                 not_after: chrono::Utc::now() + chrono::Duration::seconds(lifetime_secs),
                 renew_after_seconds,
+            };
+            let mut out = Response::new(Full::new(Bytes::from(serde_json::to_vec(&res).unwrap())));
+            out.headers_mut().insert(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("application/json"),
+            );
+            out
+        }
+        Reply::IssueMismatched { node_id, san } => {
+            let body: crate::protocol::CertificateRequest = serde_json::from_slice(&req.body)
+                .unwrap_or_else(|e| panic!("bad certificate request body: {e}"));
+            let res = crate::protocol::CertificateResponse {
+                node_id,
+                certificate_chain: issuer.issue(&body.csr, &san, 3600),
+                not_after: chrono::Utc::now() + chrono::Duration::seconds(3600),
+                renew_after_seconds: 1800,
             };
             let mut out = Response::new(Full::new(Bytes::from(serde_json::to_vec(&res).unwrap())));
             out.headers_mut().insert(

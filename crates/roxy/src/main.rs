@@ -66,8 +66,8 @@ struct RunArgs {
     /// flow counter and interception CA is kept in `--state-dir`.
     #[arg(long, requires = "state_dir", conflicts_with = "config")]
     control_plane: Option<String>,
-    /// Single-use enrolment token, read once on a start with no node
-    /// certificate in the state dir.
+    /// Enrolment token, read once on a start with no node certificate in
+    /// the state dir.
     #[arg(long, requires = "control_plane")]
     enrol_token_file: Option<PathBuf>,
     /// Where the node keeps its certificate and key.

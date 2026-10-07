@@ -370,11 +370,11 @@ impl NodeHandler {
     async fn apply_lease(
         &self,
         lease: &Lease,
-        received_at: DateTime<Utc>,
+        fetched_at: DateTime<Utc>,
         change: Change,
     ) -> Result<(), String> {
         let valid_for = i64::try_from(lease.valid_for_seconds).unwrap_or(i64::MAX);
-        let valid_until = received_at
+        let valid_until = fetched_at
             .checked_add_signed(chrono::Duration::seconds(valid_for))
             .ok_or_else(|| "valid_for_seconds out of range".to_owned())?;
         let mut run = self.running.lock().await;
@@ -510,24 +510,18 @@ impl NodeHandler {
         }
     }
 
-    /// The empty policy, already expired: the running config with no rules
-    /// and no secrets, so every request is denied with `_expired` and
-    /// `/readyz` reports the policy expired, until a restart.
+    /// Denies everything at once. `valid_until` moves into the past and
+    /// the secret map is emptied on the running server; neither needs a
+    /// rebuild, so neither can fail. Expiry is checked before the addons
+    /// and rules, so nothing of the policy runs again and `/readyz`
+    /// reports the policy expired, until a restart.
     async fn revoke_lease(&self) {
         let mut run = self.running.lock().await;
-        let mut config = run.config.clone();
-        config.rules.clear();
-        config.secrets.clear();
         let expired = Utc::now() - chrono::Duration::seconds(1);
-        let result = async {
-            let (policy, update, prepared) = self
-                .build_update(&config, HashMap::new(), Some(expired), false)
-                .await?;
-            self.swap(&config, &policy, update, prepared, false).await
-        }
-        .await;
-        if let Err(e) = result {
-            tracing::error!(error = %e, "could not install the empty policy after revocation");
+        if let Some(server) = self.server.lock().await.as_ref() {
+            let handle = server.handle();
+            handle.extend_valid_until(expired);
+            handle.swap_secrets(HashMap::new());
         }
         run.revoked = true;
         run.secrets.clear();
@@ -563,10 +557,10 @@ impl LeaseHandler for NodeHandler {
     fn apply<'a>(
         &'a self,
         lease: &'a Lease,
-        received_at: DateTime<Utc>,
+        fetched_at: DateTime<Utc>,
         change: Change,
     ) -> HandlerFuture<'a, Result<(), String>> {
-        Box::pin(self.apply_lease(lease, received_at, change))
+        Box::pin(self.apply_lease(lease, fetched_at, change))
     }
 
     fn revoke(&self) -> HandlerFuture<'_, ()> {
@@ -708,17 +702,18 @@ impl NodeRunning {
         }
     }
 
-    /// Stops the node task, drains the spool within [`DRAIN_GRACE`] and
-    /// shuts the server down.
+    /// Stops the node task, shuts the server down (in-flight exchanges get
+    /// `grace`, and their flow events are spooled) and then drains the
+    /// spool within [`DRAIN_GRACE`].
     pub async fn shutdown(self, grace: Duration) {
         self.task.abort();
         let _ = self.task.await;
-        self.node.drain(DRAIN_GRACE).await;
         let server = self.handler.server.lock().await.take();
         if let Some(server) = server {
             let sink = server.handle().sink();
             let capture = server.handle().capture();
             server.shutdown(grace).await;
+            self.node.drain(DRAIN_GRACE).await;
             let _ = tokio::task::spawn_blocking(move || {
                 sink.flush();
                 if let Some(c) = capture {

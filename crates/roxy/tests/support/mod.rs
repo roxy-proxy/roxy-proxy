@@ -673,7 +673,7 @@ log:
     }
 }
 
-fn rustls_pemfile_certs(pem: &str) -> Vec<CertificateDer<'static>> {
+pub(crate) fn rustls_pemfile_certs(pem: &str) -> Vec<CertificateDer<'static>> {
     use rustls::pki_types::pem::PemObject;
     CertificateDer::pem_slice_iter(pem.as_bytes())
         .map(Result::unwrap)

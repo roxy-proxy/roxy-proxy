@@ -18,7 +18,9 @@ use crate::protocol::{
 /// batch is at most `batch_max_bytes`.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Largest response body the client reads before giving up on it.
+/// Largest response body the client reads before giving up on it. The
+/// read stops at the cap, so a response without `Content-Length` cannot
+/// make the node buffer without bound.
 const MAX_BODY: usize = 16 << 20;
 
 #[derive(Debug, thiserror::Error)]
@@ -84,7 +86,7 @@ pub enum CertificateError {
     /// `missing` names what it wants.
     #[error("unsupported: missing {}", .0.missing.join(","))]
     Unsupported(ErrorBody),
-    /// Any other 4xx: the token is spent or invalid, or the certificate is
+    /// Any other 4xx: the token was not accepted, or the certificate is
     /// not recognised. Retrying cannot help.
     #[error("rejected: {0}")]
     Rejected(String),
@@ -317,19 +319,24 @@ fn error_body(body: &[u8]) -> ErrorBody {
 }
 
 async fn send(req: reqwest::RequestBuilder) -> Result<(StatusCode, Vec<u8>), Transient> {
-    let res = req.send().await.map_err(|e| Transient(describe(e)))?;
+    let mut res = req.send().await.map_err(|e| Transient(describe(e)))?;
     let status = res.status();
+    let too_large = || Transient(format!("{status}: response body too large"));
     if res.content_length().is_some_and(|n| n > MAX_BODY as u64) {
-        return Err(Transient(format!("{status}: response body too large")));
+        return Err(too_large());
     }
-    let body = res
-        .bytes()
+    let mut body = Vec::new();
+    while let Some(chunk) = res
+        .chunk()
         .await
-        .map_err(|e| Transient(format!("{status}: reading the body: {}", describe(e))))?;
-    if body.len() > MAX_BODY {
-        return Err(Transient(format!("{status}: response body too large")));
+        .map_err(|e| Transient(format!("{status}: reading the body: {}", describe(e))))?
+    {
+        if body.len() + chunk.len() > MAX_BODY {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
     }
-    Ok((status, body.to_vec()))
+    Ok((status, body))
 }
 
 /// A reqwest error without the URL, which may carry a query string.
@@ -446,7 +453,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn enrol_distinguishes_a_spent_token_from_an_outage() {
+    async fn enrol_distinguishes_a_rejected_token_from_an_outage() {
         let mock = MockServer::start().await;
         let trust = Trust {
             ca_pem: Some(mock.ca.pem.clone()),
@@ -456,7 +463,7 @@ pub(crate) mod tests {
         let csr = crate::identity::csr_pem(&key).unwrap();
         mock.push("/roxy/v1/enrol", Reply::status(401));
         assert!(matches!(
-            anon.enrol("spent", csr.clone()).await,
+            anon.enrol("rejected", csr.clone()).await,
             Err(CertificateError::Rejected(m)) if m.starts_with("401")
         ));
         mock.push("/roxy/v1/enrol", Reply::status(503));
