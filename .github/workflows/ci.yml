@@ -55,8 +55,6 @@ jobs:
       - run: cargo test --workspace --locked
 
   # Every workspace with its own lock file, against the root deny.toml.
-  # fuzz/ is not checked: libfuzzer-sys is NCSA-licensed, which deny.toml
-  # does not allow.
   deny:
     runs-on: ubuntu-24.04
     strategy:
@@ -66,6 +64,7 @@ jobs:
           - Cargo.toml
           - crates/roxy-wasm/test-components/Cargo.toml
           - examples/quickstart/addons/Cargo.toml
+          - fuzz/Cargo.toml
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

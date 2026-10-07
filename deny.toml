@@ -29,6 +29,7 @@ allow = [
     "CDLA-Permissive-2.0",  # webpki-roots: Mozilla root store data
     "Unlicense",
     "MIT-0",  # borrow-or-share, via jsonschema
+    "NCSA",  # libfuzzer-sys, in the fuzz/ workspace
 ]
 confidence-threshold = 0.9
 
