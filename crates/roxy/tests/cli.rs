@@ -858,6 +858,27 @@ fn health_reports_the_reason_body_on_failure() {
     server.join().unwrap();
 }
 
+/// The bootstrap listener flags describe what a node runs before its first
+/// lease; a file-mode run has no bootstrap.
+#[test]
+fn bootstrap_flags_need_control_plane() {
+    for flag in ["--bootstrap-bind", "--bootstrap-ca-server"] {
+        let out = roxy(&[
+            "run",
+            "--config",
+            fixture("minimal.yaml").to_str().unwrap(),
+            flag,
+            "127.0.0.1:0",
+        ]);
+        assert_eq!(out.status.code(), Some(2), "{flag}");
+        assert!(
+            text(&out.stderr).contains("--control-plane"),
+            "{flag}: {}",
+            text(&out.stderr)
+        );
+    }
+}
+
 /// `--ready` picks the default URL's path, so it has no meaning with `--url`.
 #[test]
 fn health_ready_conflicts_with_url() {

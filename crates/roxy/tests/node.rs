@@ -9,11 +9,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use roxy::node::{Bootstrap, NodeOptions, NodeRunning};
+use roxy_node::node::NodeError;
 use roxy_node::protocol::{FlowAck, FlowSettings, Lease, OnHighWater, PolicyState};
 use roxy_node::testkit::{MockServer, Reply};
 use roxy_proxy::MemorySink;
 use serde_json::Value;
 use support::{SECRET, TestCa, Upstream, start_upstream, test_ca};
+use support::{read_head, read_response, rustls_pemfile_certs};
 
 const ENROL: &str = "/roxy/v1/enrol";
 const LEASE: &str = "/roxy/v1/lease";
@@ -412,10 +414,27 @@ async fn a_changed_state_epoch_clears_metric_windows_and_rule_state() {
     h.stop().await;
 }
 
+/// Revocation must hold for any lease, including one whose addon endpoint
+/// headers reference a lease secret (the shape a rules-only rebuild would
+/// refuse to validate).
 #[tokio::test(flavor = "multi_thread")]
 async fn revocation_denies_at_once_and_keeps_health_up() {
     let mut h = NodeHarness::start().await;
-    let config = h.config(0, &rule("up", "host == \"upstream.test\"", ALLOW), "");
+    let addon = format!(
+        "addons:\n  - name: auth\n    kind: service\n    endpoint: svc\n    when: path == \"/never\"\n    \
+         endpoints:\n      svc:\n        url: {}\n        private_ok: true\n        \
+         headers: {{ authorization: \"Bearer ${{secret:lease_token}}\" }}\n",
+        h.https_url("/svc")
+    );
+    let config = h.config(
+        0,
+        &rule(
+            "up",
+            "host == \"upstream.test\"",
+            "[{ set_header: { x-lease: \"${secret:lease_token}\" } }, { allow: { private_ok: true } }]",
+        ),
+        &addon,
+    );
     h.mock.fallback(
         LEASE,
         Reply::json(200, &NodeHarness::lease("L1", &config, "s1", "e1")),
@@ -424,6 +443,7 @@ async fn revocation_denies_at_once_and_keeps_health_up() {
     h.wait_applied("L1").await;
     let proxy = h.proxy_addr().await;
     assert_eq!(h.get(proxy, "/ok").await.0, 200);
+    assert_eq!(h.upstream.seen()[0].header("x-lease"), Some("s1"));
     h.mock.push(LEASE, Reply::status(410));
     tokio::time::timeout(Duration::from_secs(10), async {
         while !h.running().node.is_revoked() {
@@ -432,9 +452,15 @@ async fn revocation_denies_at_once_and_keeps_health_up() {
     })
     .await
     .unwrap();
-    // The handler installs the expired empty policy before the node marks
-    // itself revoked, so the very next request is denied.
+    // The handler expires the policy before the node marks itself revoked,
+    // so the very next request is denied and nothing reaches the upstream.
     assert_eq!(h.get(proxy, "/gone").await, (403, Some("_expired".into())));
+    assert_eq!(h.get(proxy, "/never").await, (403, Some("_expired".into())));
+    assert_eq!(
+        h.upstream.seen().len(),
+        1,
+        "no request carries a secret after revocation"
+    );
     assert_eq!(h.readyz().await, (503, "policy_expired".to_owned()));
     let ca_server = h.running().handler.ca_server_addr().await.unwrap();
     let health = reqwest::Client::builder()
@@ -450,6 +476,94 @@ async fn revocation_denies_at_once_and_keeps_health_up() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(h.mock.requests_to(LEASE).len(), fetches, "polling stopped");
     h.stop().await;
+}
+
+/// Shutdown lets in-flight exchanges finish before the spool closes, so
+/// their flow events still reach the control plane.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_ships_the_flow_events_of_in_flight_exchanges() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut h = NodeHarness::start().await;
+    let config = h.config(0, &rule("up", "host == \"upstream.test\"", ALLOW), "");
+    let mut l1 = NodeHarness::lease("L1", &config, "s1", "e1");
+    // Nothing ships on its own: only the drain at shutdown can.
+    l1.flow.flush_interval_seconds = 3600;
+    h.mock.fallback(LEASE, Reply::json(200, &l1));
+    h.run(true).await;
+    h.wait_applied("L1").await;
+    let proxy = h.proxy_addr().await;
+    assert_eq!(h.get(proxy, "/before").await.0, 200);
+
+    // A request whose body is still arriving when shutdown begins.
+    let authority = format!("upstream.test:{}", h.upstream.https.port());
+    let mut tcp = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    tcp.write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    assert!(read_head(&mut tcp).await.starts_with("HTTP/1.1 200"));
+    let mut roots = rustls::RootCertStore::empty();
+    let ca = std::fs::read_to_string(h.state_dir().join("ca/roxy-ca.pem")).unwrap();
+    for c in rustls_pemfile_certs(&ca) {
+        roots.add(c).unwrap();
+    }
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let mut stream = tokio_rustls::TlsConnector::from(Arc::new(tls))
+        .connect("upstream.test".try_into().unwrap(), tcp)
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST /in-flight HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 10\r\n\r\nfirst"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let running = h.running.take().unwrap();
+    let shutdown = tokio::spawn(running.shutdown(Duration::from_secs(5)));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stream.write_all(b"last!").await.unwrap();
+    let (head, _) = read_response(&mut stream).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    shutdown.await.unwrap();
+
+    let shipped: Vec<Value> = h
+        .mock
+        .requests_to(FLOWS)
+        .iter()
+        .flat_map(|p| p.json()["events"].as_array().unwrap().clone())
+        .collect();
+    assert!(
+        shipped
+            .iter()
+            .any(|e| e["event"] == "request" && e["req"]["path"] == "/in-flight"),
+        "the in-flight exchange's event was shipped: {shipped:?}"
+    );
+    assert_eq!(h.upstream.seen().len(), 2);
+}
+
+/// A node that cannot proceed says so through `failed`, which is what makes
+/// the process exit; until then the bootstrap listeners deny.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_that_cannot_enrol_reports_the_failure() {
+    let mut h = NodeHarness::start().await;
+    h.run(false).await;
+    let mut running = h.running.take().unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(5), running.failed())
+        .await
+        .expect("no identity and no token is fatal");
+    assert!(matches!(err, NodeError::NotEnrolled { .. }), "{err}");
+    assert_eq!(
+        h.get(h.bootstrap_proxy, "/x").await,
+        (403, Some("_default".into()))
+    );
+    running.shutdown(Duration::from_secs(1)).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

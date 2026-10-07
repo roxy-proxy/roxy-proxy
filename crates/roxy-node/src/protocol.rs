@@ -189,7 +189,7 @@ pub fn encode_flow_batch(
 /// `POST /roxy/v1/flows` 200 body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlowAck {
-    /// The highest `seq` stored with no gap before it.
+    /// The highest `seq` the server has stored for this node.
     pub acked_through: u64,
 }
 

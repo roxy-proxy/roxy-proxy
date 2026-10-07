@@ -12,19 +12,26 @@ roxy run --control-plane https://cp.example:8443 \
          --control-plane-ca /etc/roxy/cp-ca.pem
 ```
 
-`--control-plane` and `--config` are mutually exclusive. `roxy run --config`
-is unchanged.
+`--control-plane` and `--config` are mutually exclusive.
 
 ## Flags
 
 | flag | meaning |
 |---|---|
 | `--control-plane URL` | The control plane's `https://` URL. Paths are under `/roxy/v1/`. |
-| `--enrol-token-file PATH` | A single-use enrolment token. Read once, on a start with no node certificate in the state dir. A later start does not need it. |
+| `--enrol-token-file PATH` | The enrolment token. Read once, on a start with no node certificate in the state dir. A later start does not need it. |
 | `--state-dir DIR` | Where the node keeps its certificate and key. Created with mode `0700`. |
 | `--control-plane-ca PATH` | PEM bundle to verify the control plane with. Default: the system roots. |
+| `--bootstrap-bind ADDR` | Where the proxy listens before the first lease. Default `0.0.0.0:3128`. |
+| `--bootstrap-ca-server ADDR` | Where `ca_server` listens before the first lease. Default `0.0.0.0:3130`. |
 | `--interception-ca-cert PATH`, `--interception-ca-key PATH` | An interception CA pair to import into the state dir on a start where it holds none. See [the interception CA](/deploy/node-mode#the-interception-ca). |
 | `--replace-interception-ca` | Replace a stored interception CA that differs from the one given. |
+
+The token is as sensitive as the lease secrets it unlocks: whoever holds a
+token the control plane still accepts can enrol a node and receive the
+fleet's secrets. Whether it is single-use, how long it lives and whether a
+fleet shares one are the control plane's decisions; roxy does not delete
+the token file after enrolment.
 
 ## The state dir
 
@@ -66,14 +73,17 @@ Workloads fetch the CA from `ca_server` as usual
    runs an empty policy: every request is denied with `terminal_rule:
    _default`, `/healthz` answers `200` and `/readyz` answers `503
    no_policy`. Before the first lease those listeners are the bootstrap
-   ones: the proxy on `0.0.0.0:3128` and `ca_server` on `0.0.0.0:3130`.
+   ones: the proxy on `--bootstrap-bind` and `ca_server` on
+   `--bootstrap-ca-server` (by default `0.0.0.0:3128` and `0.0.0.0:3130`).
 2. With no `node.crt` in the state dir the node reads the token, generates
    a key pair and a CSR, and `POST`s `/roxy/v1/enrol`. The certificate and
-   key are written to the state dir. A `401` here means the token is spent
-   or unknown: the node logs it and keeps denying everything until it is
-   restarted with a fresh token. Any other failure is retried with backoff.
-   With a `node.crt` present the token file is not read and nothing is
-   enrolled.
+   key are written to the state dir. A `401` here means the token was not
+   accepted. The node retries with backoff for two minutes, in case the
+   token has not reached every replica of the control plane, then exits
+   non-zero with one error line, so an orchestrator sees a crash loop
+   rather than a node that denies everything for ever. Any other failure is
+   retried with backoff for as long as it lasts. With a `node.crt` present
+   the token file is not read and nothing is enrolled.
 3. The node `POST`s `/roxy/v1/lease` with its certificate and applies the
    lease. The first lease's `listeners`, `ca_server`, `tls`, connection
    limits and log destinations replace the bootstrap ones: the bootstrap
@@ -94,11 +104,12 @@ value, is logged (`lease could not be applied`) and the running policy
 stays. The node then reports the old `lease_id` on its next fetch, which
 is how the control plane learns the lease did not take.
 
-- `valid_for_seconds` becomes the policy's `valid_until`, counted from the
-  moment the response arrived on the node's own clock. Past it, with no
+- `valid_for_seconds` becomes the policy's `valid_until`, counted on the
+  node's own clock from just before the fetch was sent. Past it, with no
   newer lease, every request is denied with `terminal_rule: _expired`
   ([lease](/operate/operations#lease)).
-- `refresh_after_seconds` is when the node polls next.
+- `refresh_after_seconds` is when the node polls next, never later than
+  halfway through `valid_for_seconds`.
 - The node compares `config` and `secrets` with the lease it runs. A
   changed `config` compiles and swaps the policy atomically, as a reload
   does. Changed `secrets` with the same `config` swap the secret map. A
@@ -117,8 +128,8 @@ is how the control plane learns the lease did not take.
 |---|---|
 | `200` | Applies what differs, moves `valid_until`, and polls again after `refresh_after_seconds`. |
 | `410` | Revoked. Installs an empty, already expired policy at once (every request denied with `_expired`, `/readyz` `503 policy_expired`), ships the flow events still spooled, stops polling. `/healthz` stays `200`. Definite: a restart with the same state dir ends the same way. |
-| `401` | The certificate is not recognised. Logged distinctly; the lease runs down. The node never re-enrols, since the token is gone: to re-enrol, empty the state dir and start with a new token. |
-| `426` | The control plane will not serve this `protocol_version` or `roxy_version`. Logged with the `missing` list; the lease runs down. |
+| `401` | The certificate is not recognised. Logged once per outcome change; the lease runs down. The node never re-enrols unasked: to re-enrol, empty the state dir and start with a new token. |
+| `426` | The control plane will not serve this `protocol_version` or `roxy_version`. Logged once per outcome change, with the `missing` list; the lease runs down. |
 | `5xx`, timeout, connection or TLS error | Retried with backoff (1 s doubling to 60 s, with jitter); the lease runs down. Unreachability is not itself a reason to deny; expiry is. |
 
 A lease that runs down denies everything until a lease arrives; the next
@@ -159,8 +170,11 @@ Delivery is at least once: a batch stays spooled until the control plane
 acknowledges it, and a batch re-sent after a failure is deduplicated
 server-side on `(node_id, seq)`. A `507` (quota exhausted) stops shipping
 until a lease with a new `lease_id` arrives; meanwhile `on_high_water`
-applies to what accumulates. Shutdown ships what is still spooled, for up
-to ten seconds.
+applies to what accumulates. A batch the control plane rejects (`400`) is
+logged apart from an outage and retried all the same: it is unshipped
+audit, so it stays spooled and under `hold` traffic stalls until the
+control plane accepts it. Shutdown lets in-flight exchanges finish, then
+ships what is spooled, for up to ten seconds.
 
 Before the first lease the spool runs with `spool` mode, a 1 MiB batch and
 an 8 MiB high water, so a control plane that is slow to answer cannot hold

@@ -4,8 +4,8 @@ info:
   version: "1"
   summary: The contract between a roxy node and its control plane.
   description: |
-    Enrolment authenticates with a single-use bearer token; every other
-    operation authenticates with the node certificate (mutual TLS). The
+    Enrolment authenticates with a bearer token; every other operation
+    authenticates with the node certificate (mutual TLS). The
     listener must accept connections without a client certificate so that
     enrolment can happen, and answer every other operation that arrives
     without one with `401`. Unknown fields in any body are ignored by both
@@ -26,12 +26,16 @@ paths:
   /enrol:
     post:
       operationId: enrol
-      summary: Exchange a single-use enrolment token for a node certificate.
+      summary: Exchange an enrolment token for a node certificate.
       description: |
         The CSR's signature proves the node holds the key. The server takes
         the public key, ignores the CSR's subject and extensions, and issues a
         certificate whose only SAN is the URI `urn:roxy:node:<node_id>`. The
-        token is consumed only by a `200`.
+        token authorises enrolment; its lifetime and reuse policy (single-use,
+        time-limited, shared across an autoscaling group) are the server's to
+        set, and single-use with a short expiry is the recommended default.
+        The node infers nothing from a `200` beyond the certificate it was
+        issued.
       security:
         - enrolmentToken: []
       requestBody:
@@ -42,14 +46,17 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
-          description: The token is unknown, already used or expired. The node cannot recover.
+          description: |
+            The token was not accepted. The node retries with backoff for a
+            bounded window (a new token may not have reached every replica),
+            then exits.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
               example:
                 error: invalid_token
-                message: enrolment token already used
+                message: enrolment token not recognised
         "426":
           $ref: "#/components/responses/Unsupported"
         "5XX":
@@ -119,13 +126,15 @@ paths:
       operationId: flows
       summary: Upload a batch of flow-log events, at least once.
       description: |
-        Events carry a per-node `seq` that increases by one per event and
-        survives restarts. The server deduplicates on `(node_id, seq)` and
-        acknowledges the highest `seq` it has stored; the node drops spooled
-        events at or below it. A gap in a node's sequence is a server-side
-        alert, not an error. The node keeps every batch within the lease's
-        `batch_max_bytes`; a server that refuses a batch within that size is
-        a server error, treated as `5XX`.
+        Events carry a per-node `seq` that increases by one per shipped
+        event and is persisted across restarts. The server deduplicates on
+        `(node_id, seq)` and acknowledges the highest `seq` it has stored; the
+        node drops spooled events at or below it. A restart leaves a gap (the
+        counter is reserved in blocks), as do events while `ship` is false
+        and events dropped under `on_high_water: spool`; a gap within one run
+        is the anomaly, a server-side alert, not an error. The node keeps
+        every batch within the lease's `batch_max_bytes`; a server that
+        refuses a batch within that size is a server error, treated as `5XX`.
       parameters:
         - name: Content-Encoding
           in: header
@@ -151,7 +160,10 @@ paths:
           description: |
             Malformed, `node_id` does not match the certificate (`node_mismatch`),
             `lease_id` was never issued to this node, or events are not
-            consecutive from `seq_first`. Not retried.
+            consecutive from `seq_first`. The node logs it apart from an
+            unavailable server and retries the batch like any other failure:
+            a rejected batch is unshipped audit and stays spooled, so under
+            `on_high_water: hold` traffic stalls until the server accepts it.
           content:
             application/json:
               schema:
@@ -177,7 +189,7 @@ components:
     enrolmentToken:
       type: http
       scheme: bearer
-      description: The single-use enrolment token from the node's bootstrap material.
+      description: The enrolment token from the node's bootstrap material.
     nodeCertificate:
       type: mutualTLS
       description: |
@@ -210,7 +222,8 @@ components:
       description: |
         No client certificate, or one that does not map to a known node. The
         node logs once per outcome change and lets its lease run down. It
-        never re-enrols: the token is gone. A TLS handshake the server rejects
+        never re-enrols on its own: re-enrolment is an operator action (a new
+        token and an empty state dir). A TLS handshake the server rejects
         because of the client certificate is treated the same way.
       content:
         application/json:
@@ -383,19 +396,20 @@ components:
           type: integer
           minimum: 1
           description: |
-            A duration. The node sets `valid_until = now + valid_for_seconds`
-            from its own clock at receipt, so clock skew between node and
-            server cannot shorten or lengthen the lease.
+            A duration. The node sets `valid_until = sent_at + valid_for_seconds`,
+            where `sent_at` is its own clock just before it sent the request,
+            so clock skew between node and server cannot shorten or lengthen
+            the lease, and a slow answer shortens it rather than extending it.
         refresh_after_seconds:
           type: integer
           minimum: 1
-          description: When to poll next, counted the same way; well inside `valid_for_seconds`.
+          description: When to poll next, counted the same way; well inside `valid_for_seconds`. The node polls no later than halfway through the lease whatever the value.
         config:
           type: string
           description: |
-            A complete `roxy.yaml` with no secret values; every `secrets:`
-            entry is sourceless. A change from what the node holds rebuilds
-            the policy.
+            A complete `roxy.yaml` with no secret values: every `secrets:`
+            entry whose value the lease carries is `name: { lease: true }`.
+            A change from what the node holds rebuilds the policy.
         secrets:
           type: object
           description: |

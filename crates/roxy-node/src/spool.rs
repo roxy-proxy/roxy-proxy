@@ -144,6 +144,7 @@ impl Spool {
     }
 
     /// Events dropped in `spool` mode since start.
+    #[cfg(test)]
     pub fn dropped(&self) -> u64 {
         self.dropped_total.load(Ordering::Relaxed)
     }
@@ -229,6 +230,7 @@ impl Spool {
     }
 
     /// Whether traffic is being held.
+    #[cfg(test)]
     pub fn is_holding(&self) -> bool {
         !self.ready()
     }
@@ -295,6 +297,7 @@ impl Spool {
     }
 
     /// The next `seq` that will be assigned.
+    #[cfg(test)]
     pub fn next_seq(&self) -> u64 {
         lock(&self.queue).next_seq
     }

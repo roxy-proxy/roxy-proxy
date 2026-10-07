@@ -66,8 +66,8 @@ struct RunArgs {
     /// flow counter and interception CA is kept in `--state-dir`.
     #[arg(long, requires = "state_dir", conflicts_with = "config")]
     control_plane: Option<String>,
-    /// Single-use enrolment token, read once on a start with no node
-    /// certificate in the state dir.
+    /// Enrolment token, read once on a start with no node certificate in
+    /// the state dir.
     #[arg(long, requires = "control_plane")]
     enrol_token_file: Option<PathBuf>,
     /// Where the node keeps its certificate and key.
@@ -88,6 +88,14 @@ struct RunArgs {
     /// Every workload trusting the old CA breaks.
     #[arg(long, requires = "interception_ca_cert")]
     replace_interception_ca: bool,
+    /// Node mode: where the proxy listens before the first lease
+    /// (default 0.0.0.0:3128).
+    #[arg(long, requires = "control_plane", value_name = "ADDR")]
+    bootstrap_bind: Option<std::net::SocketAddr>,
+    /// Node mode: where `ca_server` listens before the first lease
+    /// (default 0.0.0.0:3130).
+    #[arg(long, requires = "control_plane", value_name = "ADDR")]
+    bootstrap_ca_server: Option<std::net::SocketAddr>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -711,20 +719,30 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `roxy run --control-plane`: node mode. The listeners open at once and
 /// deny everything until the first lease. `SIGHUP` reopens the logs; there
-/// is no file to reload.
+/// is no file to reload. A node that cannot proceed (no identity and no
+/// token, a token the control plane will not accept) exits non-zero, so an
+/// orchestrator sees a crash loop rather than a node denying for ever.
 fn run_node(args: RunArgs) -> anyhow::Result<ExitCode> {
     let control_plane = args.control_plane.expect("clap: --control-plane");
     let state_dir = args.state_dir.expect("clap: --state-dir");
+    let mut bootstrap = roxy::node::Bootstrap::default();
+    if let Some(bind) = args.bootstrap_bind {
+        bootstrap.proxy_bind = bind;
+    }
+    if let Some(bind) = args.bootstrap_ca_server {
+        bootstrap.ca_server_bind = Some(bind);
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("starting tokio runtime")?;
     runtime.block_on(async {
-        let running = roxy::node::start(roxy::node::NodeOptions {
+        let mut running = roxy::node::start(roxy::node::NodeOptions {
             enrol_token_file: args.enrol_token_file,
             control_plane_ca: args.control_plane_ca,
             interception_ca: args.interception_ca_cert.zip(args.interception_ca_key),
             replace_interception_ca: args.replace_interception_ca,
+            bootstrap,
             ..roxy::node::NodeOptions::new(&control_plane, &state_dir)
         })
         .await?;
@@ -748,6 +766,11 @@ fn run_node(args: RunArgs) -> anyhow::Result<ExitCode> {
             let mut hup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
             loop {
                 tokio::select! {
+                    e = running.failed() => {
+                        tracing::error!(error = %e, "node cannot proceed; exiting");
+                        running.shutdown(SHUTDOWN_GRACE).await;
+                        return anyhow::Ok(ExitCode::FAILURE);
+                    }
                     r = tokio::signal::ctrl_c() => break r.context("waiting for ctrl-c")?,
                     _ = term.recv() => break,
                     _ = hup.recv() => {
@@ -758,14 +781,18 @@ fn run_node(args: RunArgs) -> anyhow::Result<ExitCode> {
             }
         }
         #[cfg(not(unix))]
-        tokio::signal::ctrl_c()
-            .await
-            .context("waiting for ctrl-c")?;
+        tokio::select! {
+            e = running.failed() => {
+                tracing::error!(error = %e, "node cannot proceed; exiting");
+                running.shutdown(SHUTDOWN_GRACE).await;
+                return anyhow::Ok(ExitCode::FAILURE);
+            }
+            r = tokio::signal::ctrl_c() => r.context("waiting for ctrl-c")?,
+        }
         tracing::info!("roxy shutting down");
         running.shutdown(SHUTDOWN_GRACE).await;
-        anyhow::Ok(())
-    })?;
-    Ok(ExitCode::SUCCESS)
+        anyhow::Ok(ExitCode::SUCCESS)
+    })
 }
 
 /// Waits for ctrl-c or SIGTERM; on SIGHUP meanwhile, reopens the flow log

@@ -30,9 +30,9 @@ denies everything. The control plane never pushes; the node polls.
 
 ### Bootstrap material
 
-A node is given, out of band: the control plane URL, a single-use
-enrolment token, and optionally a PEM bundle of CA certificates to verify
-the control plane with. Nothing else. The node generates its own key pair
+A node is given, out of band: the control plane URL, an enrolment token,
+and optionally a PEM bundle of CA certificates to verify the control plane
+with. Nothing else. The node generates its own key pair
 and the key never leaves the node.
 
 ### Errors
@@ -40,7 +40,7 @@ and the key never leaves the node.
 Every non-`2xx` response carries an error body:
 
 ```json title="Error"
-{"error": "invalid_token", "message": "enrolment token already used"}
+{"error": "invalid_token", "message": "enrolment token not recognised"}
 ```
 
 `error` is a stable code; `message` is for humans. A `426` adds `missing`
@@ -49,8 +49,8 @@ the status code, not the body.
 
 | status | meaning | node behaviour |
 |---|---|---|
-| `400` | the request was malformed; `error` says how | log; do not retry the same request |
-| `401` | at enrolment: the token is unknown, used or expired. Elsewhere: the certificate is not recognised as a node | enrolment: fail. Elsewhere: log once per outcome change, keep the current lease and let it run down. Never re-enrol: the token is gone |
+| `400` | the request was malformed; `error` says how | log. A flow batch stays spooled and is retried ([flow upload](/reference/node-protocol#flow-upload)); nothing else is re-sent as it was |
+| `401` | at enrolment: the token was not accepted. Elsewhere: the certificate is not recognised as a node | enrolment: retry with backoff for two minutes, then exit non-zero. Elsewhere: log once per outcome change, keep the current lease and let it run down. Never re-enrol unasked: re-enrolment is an operator action |
 | `410` | the node is revoked. Definite and terminal | write an empty policy at once, finish shipping what is spooled, stop polling, keep health up |
 | `426` | the server will not serve this node's `protocol_version` or `roxy_version` | treat as `5xx` for the lease; log the `missing` list distinctly |
 | `507` | flow quota exhausted | stop shipping until a new lease id arrives |
@@ -107,10 +107,13 @@ certificate.
   Once it has passed the node [renews](/reference/node-protocol#renew). It must be well inside the
   certificate lifetime, so that a failed renewal has time to be retried.
 
-The token is consumed by a successful enrolment. A second use, a token the
-server does not know, or an expired token is `401 invalid_token`. A node
-that is handed a used token cannot recover; it logs and keeps denying
-everything.
+The token authorises enrolment. Whether it is single-use, how long it
+lives and whether a fleet shares one are the control plane's decisions;
+single-use with a short expiry is a sensible default. The node infers
+nothing from a `200` beyond the certificate it was issued. A `401` means
+the token was not accepted, nothing more: the node retries with backoff for
+two minutes, in case a new token has not reached every replica of the
+control plane, and then exits non-zero.
 
 The node writes the certificate and key to its state directory. Those are
 the only secrets-adjacent material on disk: a revocable per-node identity.
@@ -171,7 +174,7 @@ it was sent.
   "lease_id": "lease-01J9Z8K3",
   "valid_for_seconds": 900,
   "refresh_after_seconds": 300,
-  "config": "listeners:\n  proxy: 0.0.0.0:8080\nsecrets:\n  github: {}\nrules:\n  - id: github\n    match: {host: api.github.com}\n    action: allow\n",
+  "config": "version: 1\nlisteners:\n  - name: proxy\n    bind: 0.0.0.0:8080\nsecrets:\n  github: { lease: true }\nrules:\n  - id: github\n    when: host == \"api.github.com\"\n    then: [allow]\n",
   "secrets": {
     "github": "ghp_example"
   },
@@ -189,17 +192,19 @@ it was sent.
 - `lease_id` is opaque and changes whenever any other field changes. The
   node reports it on every poll and quotes it in flow batches.
 - `valid_for_seconds` is a duration, not an instant. The node computes
-  `valid_until = now + valid_for_seconds` from its own clock at the moment
-  it receives the response, and writes that as the policy's `valid_until`.
-  The server's clock is never used: a node whose clock is an hour ahead of
+  `valid_until = sent_at + valid_for_seconds` from its own clock, where
+  `sent_at` is the moment just before it sent the request, and writes that
+  as the policy's `valid_until`. A slow answer shortens the lease rather
+  than extending it. The server's clock is never used: a node whose clock is an hour ahead of
   the server's would otherwise expire an hour early, and one an hour behind
   would serve for an hour after the control plane meant it to stop.
 - `refresh_after_seconds` is when to poll next, counted the same way. It
   must leave room for several retries before `valid_for_seconds` runs out;
-  a third of it is a reasonable choice. The node adds jitter.
+  a third of it is a reasonable choice. The node never polls later than
+  halfway through the lease, whatever the value.
 - `config` is a complete `roxy.yaml` as a string, with no secret values in
-  it: every `secrets:` entry is sourceless (`name: {}`), meaning the value
-  comes from the lease.
+  it: every `secrets:` entry the lease supplies is `name: { lease: true }`,
+  meaning the value comes from the lease.
 - `secrets` maps each secret name the config declares to its value, a
   UTF-8 string.
 - The node compares `config` and `secrets` with what it holds. A changed
@@ -260,10 +265,11 @@ compressed, signalled with `Content-Encoding: gzip`.
 ```
 
 - Each event is a [flow log](/operate/flow-log) record with one field
-  added, `seq`: a per-node counter that increases by one per event and is
-  persisted in the state directory, so it keeps increasing across
-  restarts. A batch's events are consecutive, in order, starting at
-  `seq_first`; a server rejects anything else with `400`.
+  added, `seq`: a per-node counter that increases by one per shipped event
+  and is persisted in the state directory in blocks, so it keeps increasing
+  across restarts (a restart skips to the end of the last block). A batch's
+  events are consecutive, in order, starting at `seq_first`; a server
+  rejects anything else with `400`.
 - `node_id` must match the certificate, or the answer is `400
   node_mismatch`. `lease_id` is the lease in force when the batch was
   assembled; the server accepts any lease id it has issued to the node.
@@ -282,12 +288,17 @@ Delivery is at least once. The server stores the batch, deduplicating on
 the node. The node drops spooled events with `seq` at or below
 `acked_through` and keeps the rest for the next batch. A batch the node
 re-sends after a timeout is therefore harmless: the server stores nothing
-new and acknowledges the same point. A gap in a node's sequence is a
-server-side alert, not a protocol error; in `spool` mode a node that
-dropped events will have one.
+new and acknowledges the same point. A gap within one run means events
+were dropped (`spool` mode at the high water): a server-side alert, not a
+protocol error. Restarts and `ship: false` also leave gaps, by design.
 
 Other responses:
 
+- `400`: the batch was rejected (`node_mismatch`, a `lease_id` the server
+  never issued, events not consecutive). The node logs it apart from an
+  outage and retries the batch like any other failure: it is unshipped
+  audit and stays spooled, so under `hold` traffic stalls until the control
+  plane accepts it.
 - `507`: the node's flow quota is exhausted. The node stops shipping, logs
   once, and applies `on_high_water` to what accumulates: `hold` stalls
   traffic when the spool fills, `spool` drops oldest. Shipping resumes when
