@@ -179,8 +179,12 @@ async fn s3_signs_the_payload_hash_or_streams_an_unsigned_payload() {
     assert_eq!(seen[0].body.len(), 4096);
 }
 
+/// A presigned request goes out under its query signature alone: roxy
+/// adds no signature, strips the client's signature headers, and records
+/// the passthrough so the log shows the request left without roxy's
+/// identity.
 #[tokio::test]
-async fn a_presigned_request_is_forwarded_untouched() {
+async fn a_presigned_request_passes_with_its_query_signature_only() {
     let kit = signing("s3", "").start().await;
     let a = kit
         .h1()
@@ -188,25 +192,42 @@ async fn a_presigned_request_is_forwarded_untouched() {
         .call(
             "GET",
             "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=abc123",
-            &[("x-amz-date", "19990101T000000Z")],
+            &[
+                ("authorization", "AWS4-HMAC-SHA256 Credential=CLIENT/x"),
+                ("x-amz-date", "19990101T000000Z"),
+                ("x-amz-security-token", "client-token"),
+                ("x-amz-content-sha256", "deadbeef"),
+                ("x-custom", "kept"),
+            ],
             b"",
         )
         .await;
     assert_eq!(a.status, 200, "{a:?}");
     let seen = kit.upstream.wait_seen(1).await;
-    assert!(
-        !seen[0].headers.contains_key("authorization"),
-        "{:?}",
-        seen[0].headers
-    );
-    assert_eq!(seen[0].headers["x-amz-date"], "19990101T000000Z");
+    for h in [
+        "authorization",
+        "x-amz-date",
+        "x-amz-security-token",
+        "x-amz-content-sha256",
+    ] {
+        assert!(
+            !seen[0].headers.contains_key(h),
+            "{h}: {:?}",
+            seen[0].headers
+        );
+    }
+    assert_eq!(seen[0].headers["x-custom"], "kept");
     assert!(
         seen[0].path.contains("X-Amz-Signature=abc123"),
         "{}",
         seen[0].path
     );
     let ev = kit.request_event().await;
-    assert_eq!(ev["mutations"], serde_json::json!([]), "{ev:#}");
+    assert_eq!(
+        ev["mutations"],
+        serde_json::json!(["sign:presigned"]),
+        "{ev:#}"
+    );
 }
 
 /// A body the hash needs but the cap does not allow is refused with 413,

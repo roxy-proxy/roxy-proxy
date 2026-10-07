@@ -56,8 +56,9 @@ pub(crate) enum SignError {
     UnsignableHeader(String),
 }
 
-/// Whether the query carries a presigned URL's signature, in which case
-/// the request already authenticates itself and is forwarded untouched.
+/// Whether the query carries a presigned URL's signature: the request
+/// authenticates by its query alone, so it is forwarded without roxy's
+/// signature and without the client's signature headers.
 pub(crate) fn is_presigned(query: Option<&Query>) -> bool {
     query.is_some_and(|q| {
         q.pairs()
@@ -77,9 +78,7 @@ pub(crate) fn sign_request(
     spec: &AwsSigV4,
     now: SystemTime,
 ) -> Result<(), SignError> {
-    for name in CLIENT_SIGNATURE_HEADERS {
-        req.headers.remove(name);
-    }
+    strip_client_signature(req);
     let identity = Identity::new(
         Credentials::new(
             spec.access_key_id.as_str(),
@@ -134,6 +133,14 @@ pub(crate) fn sign_request(
         req.headers.insert(h.name(), h.value())?;
     }
     Ok(())
+}
+
+/// Removes the client's own signature fields, so its credentials never
+/// reach AWS under a `sign` rule.
+pub(crate) fn strip_client_signature(req: &mut CanonicalRequest) {
+    for name in CLIENT_SIGNATURE_HEADERS {
+        req.headers.remove(name);
+    }
 }
 
 /// The path in the once-encoded form AWS canonicalises from: every byte

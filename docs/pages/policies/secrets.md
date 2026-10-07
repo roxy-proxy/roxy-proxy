@@ -77,10 +77,14 @@ signing name (`bedrock`, `s3`, `execute-api`, ...), and `s3`, `s3-control`
 and `s3-outposts` use the S3 variant of the algorithm (the path encoded
 once, not normalised, and the payload hash sent as `x-amz-content-sha256`).
 
-A request whose query carries `X-Amz-Signature` is presigned: it
-authenticates itself and is forwarded untouched, with no `sign` mutation
-recorded. Two matching rules that both sign fail the flow closed
-(`sign_conflict`).
+A request whose query carries `X-Amz-Signature` is presigned, and `sign`
+does not cover it: it goes out under the client's query signature, with
+the client's `authorization` and `x-amz-*` signature headers stripped and
+no signature of roxy's. The flow log records `sign:presigned` in
+`mutations` in place of `sign:aws_sigv4`. Such a request reaches AWS as
+whoever signed the URL, so the rule's `host` and `path` conditions are
+what bound where it may go. Two matching rules that both sign fail the
+flow closed (`sign_conflict`).
 
 The payload hash needs the whole body, so a request with a body is
 buffered up to `limits.max_sign_body_bytes` (100 MiB) before it is signed

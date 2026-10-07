@@ -78,6 +78,10 @@ pub(crate) const SIGN_BODY_TOO_LARGE: &str = "sign_body_too_large";
 /// the signature cannot cover.
 pub(crate) const SIGN_HEADER_INVALID: &str = "sign_header_invalid";
 
+/// Flow-log `mutations` entry of a request a `sign` rule matched but that
+/// went out under its own presigned query, roxy's signature withheld.
+pub(crate) const SIGN_PRESIGNED: &str = "sign:presigned";
+
 /// Whether a local answer is a policy decision or a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefusalKind {
@@ -1030,9 +1034,10 @@ fn settle_request_facts(cx: &mut FlowCx, req: &CanonicalRequest) {
 }
 
 /// The `sign` effect, over the request as every other effect left it. A
-/// presigned request (`X-Amz-Signature` in its query) authenticates
-/// itself and goes untouched. The payload hash needs the whole body, so it
-/// is buffered under `limits.max_sign_body_bytes`; a body over that is
+/// presigned request (`X-Amz-Signature` in its query) authenticates by its
+/// query and goes out without roxy's signature, the client's signature
+/// headers stripped. The payload hash needs the whole body, so it is
+/// buffered under `limits.max_sign_body_bytes`; a body over that is
 /// refused with 413 rather than forwarded with a signature AWS would
 /// reject. `unsigned_payload` streams the body instead.
 async fn sign_request(cx: &mut FlowCx, mut req: CanonicalRequest, io: &mut dyn BodyIo) -> Verdict {
@@ -1040,6 +1045,9 @@ async fn sign_request(cx: &mut FlowCx, mut req: CanonicalRequest, io: &mut dyn B
         return Verdict::Continue(req);
     };
     if sign::is_presigned(req.query.as_ref()) {
+        sign::strip_client_signature(&mut req);
+        cx.record.mutations.push(SIGN_PRESIGNED.to_owned());
+        settle_request_facts(cx, &req);
         return Verdict::Continue(req);
     }
     let buffered;
