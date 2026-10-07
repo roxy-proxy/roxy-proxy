@@ -120,6 +120,10 @@ single reservation.
   yet taken by the upstream) sit outside `max_buffered_bytes`: the
   connection's receive window caps them at 4 MiB, so one client IP can hold
   at most `max_connections_per_client` × 4 MiB (1 GiB by default).
+- Upstream connections are bounded by the clients: HTTP/1.1 origins get
+  one connection per concurrent request, HTTP/2 origins at most
+  `upstream.max_h2_connections_per_origin` (4 by default), each with an
+  8 MiB receive window ([upstream](/reference/upstream#connections)).
 - Bounded policy tables (metrics, state, addon state) never evict
   ([never evict](/design/threat-model#never-evict)).
 - The proxy port serves only proxy semantics and `roxy.internal`; health

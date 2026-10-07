@@ -516,6 +516,12 @@ impl Config {
                 }
             }
         }
+        if self.upstream.max_h2_connections_per_origin < 1 {
+            d.push(Diagnostic::new(
+                "upstream.max_h2_connections_per_origin",
+                "must be at least 1",
+            ));
+        }
     }
 
     /// Every `limits.*` count or size has a floor: at zero it would refuse

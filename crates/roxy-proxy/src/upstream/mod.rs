@@ -24,11 +24,14 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use http::Uri;
+use http_body::Body as _;
+use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::{Connected, Connection};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -53,6 +56,8 @@ pub struct UpstreamSettings {
     pub connect_timeout: Duration,
     /// Idle pooled connections are closed after this long.
     pub pool_idle_timeout: Duration,
+    /// HTTP/2 connections the pool may hold to one origin ([`PooledClient`]).
+    pub max_h2_connections_per_origin: usize,
     /// Replaces the TCP dial (after DNS and the address floor, before TLS),
     /// so tests can hand the connector an in-memory upstream.
     #[cfg(test)]
@@ -82,6 +87,7 @@ impl Default for UpstreamSettings {
             address_policy: AddressPolicy::default(),
             connect_timeout: Duration::from_secs(10),
             pool_idle_timeout: Duration::from_secs(90),
+            max_h2_connections_per_origin: 4,
             #[cfg(test)]
             dial: None,
         }
@@ -409,12 +415,160 @@ impl tower_service::Service<Uri> for Connector {
     }
 }
 
-/// The pooled HTTP client type.
-pub(crate) type HttpClient = Client<Connector, Body>;
+/// One hyper client with its pool.
+type HttpClient = Client<Connector, Body>;
 
-/// The pooled clients that share one address-floor setting (`private_ok`
-/// or not), so a connection opened for a `private_ok` flow is never reused
-/// by a flow without it.
+/// hyper-util's client error.
+pub(crate) type ClientError = hyper_util::client::legacy::Error;
+
+/// Receive windows and frame size offered to HTTP/2 origins. The stream
+/// window is hyper's default, stated so it is a choice; the connection
+/// window fits four streams at full window, so bulk downloads multiplexed
+/// on one connection do not throttle each other; a 1 MiB frame lets an
+/// origin that fills frames to the offered size send a body as a few
+/// frames rather than sixty-four 16 KiB ones (each is a trip through the
+/// relay). The windows are fixed rather than adaptive: they are the bound
+/// on what roxy buffers for a stalled client, and a LAN origin would spend
+/// several round trips probing its way up from the default 64 KiB.
+const H2_STREAM_WINDOW: u32 = 2 << 20;
+const H2_CONNECTION_WINDOW: u32 = 8 << 20;
+const H2_MAX_FRAME_SIZE: u32 = 1 << 20;
+
+/// Attempts after the first for a request that never reached the origin.
+const MAX_RETRIES: u32 = 2;
+
+/// The pooled client for one protocol choice: several hyper clients over
+/// one connector. hyper-util carries every request for a
+/// `scheme://authority` on one HTTP/2 connection per client, driven by one
+/// task, so a client per shard lets a busy origin spread over as many
+/// connections (and runtime workers) as there are shards. A request goes
+/// to the shard with the fewest responses outstanding, lowest index first:
+/// a lightly used origin stays on one connection, a busy one spreads over
+/// up to `upstream.max_h2_connections_per_origin`.
+#[derive(Clone)]
+pub(crate) struct PooledClient {
+    shards: Arc<[Shard]>,
+}
+
+struct Shard {
+    client: HttpClient,
+    /// Requests sent whose response head has not arrived.
+    in_flight: AtomicUsize,
+}
+
+/// Counts a request against its shard until the response head arrives or
+/// the request is abandoned.
+struct InFlight<'a>(&'a Shard);
+
+impl<'a> InFlight<'a> {
+    fn start(shard: &'a Shard) -> Self {
+        shard.in_flight.fetch_add(1, Ordering::Relaxed);
+        Self(shard)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// What a bodiless request needs to be sent again.
+struct Head {
+    method: http::Method,
+    uri: Uri,
+    version: http::Version,
+    headers: http::HeaderMap,
+}
+
+impl Head {
+    fn of(req: &http::Request<Body>) -> Self {
+        Self {
+            method: req.method().clone(),
+            uri: req.uri().clone(),
+            version: req.version(),
+            headers: req.headers().clone(),
+        }
+    }
+
+    fn request(&self) -> http::Request<Body> {
+        let mut req = http::Request::new(Body::empty());
+        *req.method_mut() = self.method.clone();
+        *req.uri_mut() = self.uri.clone();
+        *req.version_mut() = self.version;
+        *req.headers_mut() = self.headers.clone();
+        req
+    }
+}
+
+impl PooledClient {
+    fn new(shards: usize, mut client: impl FnMut() -> HttpClient) -> Self {
+        let shards = (0..shards.max(1))
+            .map(|_| Shard {
+                client: client(),
+                in_flight: AtomicUsize::new(0),
+            })
+            .collect();
+        Self { shards }
+    }
+
+    /// Sends `req`, again on another connection when the one it was on
+    /// went away before the origin saw it: an HTTP/2 connection the origin
+    /// closes with `GOAWAY` fails every stream above its last stream id,
+    /// which the origin never processed (RFC 9113 §6.8), and hyper drops
+    /// the requests queued on a connection that closed first. Only a
+    /// request without a body is sent again: hyper consumes the body as it
+    /// streams and nothing holds a copy.
+    pub(crate) fn request(&self, req: http::Request<Body>) -> ResponseFuture {
+        let shards = self.shards.clone();
+        Box::pin(async move {
+            let mut req = req;
+            let head = req.body().is_end_stream().then(|| Head::of(&req));
+            let mut retries = 0;
+            loop {
+                let shard = shards
+                    .iter()
+                    .min_by_key(|s| s.in_flight.load(Ordering::Relaxed))
+                    .expect("at least one shard");
+                let in_flight = InFlight::start(shard);
+                let out = shard.client.request(req).await;
+                drop(in_flight);
+                match (out, &head) {
+                    (Err(e), Some(head)) if retries < MAX_RETRIES && never_reached_origin(&e) => {
+                        retries += 1;
+                        req = head.request();
+                    }
+                    (out, _) => return out,
+                }
+            }
+        })
+    }
+}
+
+/// A [`PooledClient::request`] in progress.
+pub(crate) type ResponseFuture =
+    Pin<Box<dyn Future<Output = Result<http::Response<Incoming>, ClientError>> + Send>>;
+
+/// Whether `err` says the origin never saw the request: the stream was
+/// above the last one a remote `GOAWAY` named, or hyper never sent it.
+fn never_reached_origin(err: &ClientError) -> bool {
+    let mut src: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = src {
+        if let Some(h2) = e.downcast_ref::<h2::Error>() {
+            return h2.is_go_away() && h2.is_remote();
+        }
+        if let Some(h) = e.downcast_ref::<hyper::Error>() {
+            // hyper has no predicate for a request its dispatcher dropped
+            // unsent; the message is its stable description of that case.
+            if h.is_canceled() || h.to_string() == "dispatch task is gone" {
+                return true;
+            }
+        }
+        src = e.source();
+    }
+    false
+}
+
 /// Which protocols a pooled client may negotiate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Protocols {
@@ -426,12 +580,16 @@ pub(crate) enum Protocols {
     Http1Only,
 }
 
+/// The pooled clients that share one address-floor setting (`private_ok`
+/// or not), so a connection opened for a `private_ok` flow is never reused
+/// by a flow without it.
 struct Pools {
     inner: Arc<ConnectorInner>,
     /// ALPN `h2` or `http/1.1`, as the upstream chooses.
-    any: HttpClient,
-    /// ALPN `http/1.1` only.
-    http1: HttpClient,
+    any: PooledClient,
+    /// ALPN `http/1.1` only. One shard: HTTP/1.1 opens a connection per
+    /// concurrent request anyway.
+    http1: PooledClient,
     http1_tls: Arc<ClientConfig>,
 }
 
@@ -467,14 +625,17 @@ impl Upstream {
                 Client::builder(TokioExecutor::new())
                     .pool_timer(TokioTimer::new())
                     .pool_idle_timeout(s.pool_idle_timeout)
+                    .http2_initial_stream_window_size(H2_STREAM_WINDOW)
+                    .http2_initial_connection_window_size(H2_CONNECTION_WINDOW)
+                    .http2_max_frame_size(H2_MAX_FRAME_SIZE)
                     .build(Connector {
                         inner: inner.clone(),
                         tls: tls.clone(),
                     })
             };
             Pools {
-                any: client(tls),
-                http1: client(&http1_tls),
+                any: PooledClient::new(s.max_h2_connections_per_origin, || client(tls)),
+                http1: PooledClient::new(1, || client(&http1_tls)),
                 http1_tls: http1_tls.clone(),
                 inner,
             }
@@ -493,7 +654,7 @@ impl Upstream {
     }
 
     /// The pooled client for a flow.
-    pub(crate) fn client(&self, private: PrivateAddrs, protocols: Protocols) -> &HttpClient {
+    pub(crate) fn client(&self, private: PrivateAddrs, protocols: Protocols) -> &PooledClient {
         let pools = self.pools(private);
         match protocols {
             Protocols::Any => &pools.any,
@@ -556,7 +717,7 @@ impl Upstream {
 /// Classifies a hyper-util client error by walking its source chain:
 /// `Some` for a failure to establish the connection, `None` when the
 /// exchange itself broke (`protocol_error`).
-pub(crate) fn classify(err: &hyper_util::client::legacy::Error) -> Option<ConnectError> {
+pub(crate) fn classify(err: &ClientError) -> Option<ConnectError> {
     let mut src: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(e) = src {
         if let Some(c) = e.downcast_ref::<ConnectError>() {
@@ -569,7 +730,7 @@ pub(crate) fn classify(err: &hyper_util::client::legacy::Error) -> Option<Connec
 }
 
 /// Stable reason for a non-connect client error (the exchange itself broke).
-pub(crate) fn describe(err: &hyper_util::client::legacy::Error) -> String {
+pub(crate) fn describe(err: &ClientError) -> String {
     let mut out = err.to_string();
     let mut src = std::error::Error::source(err);
     while let Some(e) = src {
@@ -652,6 +813,126 @@ mod tests {
     fn tls() -> Arc<ClientConfig> {
         roxy_tls::install_crypto_provider();
         roxy_tls::client_config(&roxy_tls::UpstreamTlsOptions::default()).unwrap()
+    }
+
+    /// An HTTP/2 origin, as raw frames, that answers its first stream
+    /// `200` and meets any later one with `GOAWAY` naming the first as the
+    /// last it processed (what nginx does at `keepalive_requests`).
+    async fn first_stream_only<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(mut s: S) {
+        const SETTINGS: u8 = 0x4;
+        const HEADERS: u8 = 0x1;
+        const GOAWAY: u8 = 0x7;
+        fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+            let mut out = u32::try_from(payload.len()).unwrap().to_be_bytes()[1..].to_vec();
+            out.extend([kind, flags]);
+            out.extend(stream.to_be_bytes());
+            out.extend(payload);
+            out
+        }
+        let mut preface = [0u8; 24];
+        if s.read_exact(&mut preface).await.is_err() {
+            return;
+        }
+        if s.write_all(&frame(SETTINGS, 0, 0, &[])).await.is_err() {
+            return;
+        }
+        loop {
+            let mut head = [0u8; 9];
+            if s.read_exact(&mut head).await.is_err() {
+                return;
+            }
+            let len =
+                (usize::from(head[0]) << 16) | (usize::from(head[1]) << 8) | usize::from(head[2]);
+            let mut payload = vec![0u8; len];
+            if s.read_exact(&mut payload).await.is_err() {
+                return;
+            }
+            let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff;
+            let reply = match (head[3], stream) {
+                (SETTINGS, _) if head[4] & 0x1 == 0 => frame(SETTINGS, 0x1, 0, &[]),
+                // `:status: 200` is static table entry 8; END_HEADERS | END_STREAM.
+                (HEADERS, 1) => frame(HEADERS, 0x4 | 0x1, 1, &[0x88]),
+                // last stream id 1, NO_ERROR
+                (HEADERS, _) => frame(GOAWAY, 0, 0, &[0, 0, 0, 1, 0, 0, 0, 0]),
+                _ => continue,
+            };
+            if s.write_all(&reply).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// An `Upstream` whose dial reaches a fresh [`first_stream_only`]
+    /// origin over TLS with ALPN `h2`, and the addresses it dialled.
+    fn goaway_origin() -> (Upstream, Arc<Mutex<Vec<SocketAddr>>>) {
+        roxy_tls::install_crypto_provider();
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Arc::new(roxy_tls::Ca::generate(dir.path()).unwrap());
+        let minter = Arc::new(roxy_tls::LeafMinter::new(ca, 8).unwrap());
+        let host = roxy_http::url::parse_host(b"go.test").unwrap();
+        let server = roxy_tls::server_config_for(minter, host, true);
+        let client = roxy_tls::client_config(&roxy_tls::UpstreamTlsOptions {
+            extra_roots_pem: vec![dir.path().join(roxy_tls::CA_CERT_FILE)],
+            ..roxy_tls::UpstreamTlsOptions::default()
+        })
+        .unwrap();
+        let (s, dialled) = dialing(&[("go.test", &["93.184.216.34"])], move |_| {
+            let (ours, theirs) = tokio::io::duplex(64 * 1024);
+            let acceptor = tokio_rustls::TlsAcceptor::from(server.clone());
+            tokio::spawn(async move {
+                if let Ok(tls) = acceptor.accept(ours).await {
+                    first_stream_only(tls).await;
+                }
+            });
+            Box::pin(async move { Ok(Box::new(theirs) as BoxIo) })
+        });
+        (Upstream::new(&s, &client).unwrap(), dialled)
+    }
+
+    fn goaway_get() -> http::Request<Body> {
+        http::Request::get("https://go.test/")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// A stream above a remote `GOAWAY`'s last stream id was never
+    /// processed, so a bodiless request on it goes again on a fresh
+    /// connection and the client sees the answer, not a `502`.
+    #[tokio::test]
+    async fn a_request_the_origin_never_saw_is_sent_again_after_goaway() {
+        let (up, dialled) = goaway_origin();
+        let client = up.client(PrivateAddrs::Deny, Protocols::Any);
+        for i in 0..2 {
+            let res = client.request(goaway_get()).await.unwrap();
+            assert_eq!(res.status(), 200, "request {i}");
+        }
+        assert_eq!(
+            dialled.lock().unwrap().len(),
+            2,
+            "the second request reconnected"
+        );
+    }
+
+    /// A request with a body is not sent again: hyper has streamed the
+    /// body and nothing holds a copy. Its error names the `GOAWAY` and is
+    /// not a connect failure, so the exchange answers `protocol_error`.
+    #[tokio::test]
+    async fn a_request_with_a_body_is_not_sent_again_after_goaway() {
+        let (up, dialled) = goaway_origin();
+        let client = up.client(PrivateAddrs::Deny, Protocols::Any);
+        assert_eq!(client.request(goaway_get()).await.unwrap().status(), 200);
+        let req = http::Request::post("https://go.test/")
+            .body(Body::from_bytes(bytes::Bytes::from_static(b"x")))
+            .unwrap();
+        let err = client.request(req).await.unwrap_err();
+        assert!(never_reached_origin(&err), "{}", describe(&err));
+        assert!(classify(&err).is_none(), "{}", describe(&err));
+        assert_eq!(
+            dialled.lock().unwrap().len(),
+            1,
+            "no retry: {}",
+            describe(&err)
+        );
     }
 
     /// A name with several addresses that drop packets fails within one

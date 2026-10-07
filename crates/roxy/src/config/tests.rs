@@ -149,6 +149,7 @@ fn sizes_and_durations_parse() {
     // Unset keys in a partially specified section keep their defaults.
     assert_eq!(cfg.limits.max_headers, 100);
     assert_eq!(cfg.upstream.connect_timeout, Duration::from_secs(2));
+    assert_eq!(cfg.upstream.max_h2_connections_per_origin, 4);
     assert_eq!(cfg.upstream.dns.cache_ttl_cap, Duration::from_secs(3600));
     assert!(matches!(&cfg.upstream.dns.resolver, Resolver::Servers(s) if s.len() == 2));
 }
@@ -421,6 +422,17 @@ fn zero_limits_diagnosed() {
     ))
     .validate()
     .unwrap();
+    let d = diagnostics(&format!(
+        "{BASE}upstream: {{ max_h2_connections_per_origin: 0 }}\n"
+    ));
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].path, "upstream.max_h2_connections_per_origin");
+    assert!(d[0].message.starts_with("must be at least 1"), "{}", d[0]);
+    let cfg = parse(&format!(
+        "{BASE}upstream: {{ max_h2_connections_per_origin: 1 }}\n"
+    ));
+    cfg.validate().unwrap();
+    assert_eq!(cfg.upstream.max_h2_connections_per_origin, 1);
 }
 
 /// Inspection, signing and WebSocket reassembly reserve a whole cap at a

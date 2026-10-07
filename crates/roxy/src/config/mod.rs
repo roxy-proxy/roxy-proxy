@@ -371,6 +371,8 @@ pub struct Upstream {
     pub deny_lists: Vec<String>,
     #[serde(with = "humantime_serde")]
     pub connect_timeout: Duration,
+    /// HTTP/2 connections the pool may hold to one origin.
+    pub max_h2_connections_per_origin: usize,
 }
 
 impl Default for Upstream {
@@ -382,6 +384,7 @@ impl Default for Upstream {
             allow_cidrs: Vec::new(),
             deny_lists: Vec::new(),
             connect_timeout: Duration::from_secs(10),
+            max_h2_connections_per_origin: 4,
         }
     }
 }

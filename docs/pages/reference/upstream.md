@@ -15,6 +15,7 @@ upstream:
   allow_cidrs: []              # exceptions to the private-range floor only
   deny_lists: [blocked]        # names from address_lists
   connect_timeout: 10s         # TCP connect, over all of a name's addresses together; the TLS handshake gets its own
+  max_h2_connections_per_origin: 4   # at least 1
 
 tls:
   upstream:
@@ -41,6 +42,24 @@ rustls with the bundled Mozilla roots (`webpki-roots`), plus `extra_roots`
 under `strict+extra_roots`. Verification is always on. The SNI is the
 canonical host. ALPN offers `h2` and `http/1.1` (only `http/1.1` for
 WebSocket upgrades).
+
+## Connections
+
+Connections to an origin are pooled by scheme and authority and closed
+after 90 s idle. HTTP/1.1 opens one connection per concurrent request.
+HTTP/2 multiplexes: an origin that negotiates `h2` gets up to
+`max_h2_connections_per_origin` connections, each driven by its own task.
+A request goes to the connection with the fewest responses outstanding, so
+a lightly used origin stays on one connection and a busy one spreads
+across the limit. Each connection offers a 2 MiB stream window, an 8 MiB
+connection window and 1 MiB frames.
+
+An origin that closes an HTTP/2 connection with `GOAWAY` (nginx does at
+`keepalive_requests`) fails every stream above the last one it names, which
+it never processed. roxy sends such a request again on another connection,
+up to twice, if it has no body; a request with a body is answered `502`
+(`upstream_error`, reason `protocol_error`), as its body has already
+streamed to the connection.
 
 ## Errors
 

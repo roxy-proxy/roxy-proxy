@@ -105,6 +105,7 @@ impl From<&Config> for UpstreamSettings {
                 deny_lists: Vec::new(),
             },
             connect_timeout: u.connect_timeout,
+            max_h2_connections_per_origin: u.max_h2_connections_per_origin,
             ..UpstreamSettings::default()
         }
     }

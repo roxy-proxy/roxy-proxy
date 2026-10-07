@@ -796,6 +796,41 @@ async fn many_streamed_h2_uploads_share_one_upstream_connection() {
     assert_eq!(kit.upstream.open_connections(), 1, "one pooled connection");
 }
 
+/// Exchanges in flight at the same time to one h2 origin spread over
+/// upstream connections up to `max_h2_connections_per_origin`; at 1 they
+/// share the one connection.
+#[tokio::test]
+async fn concurrent_h2_exchanges_use_up_to_the_connection_limit() {
+    for (limit, connections) in [(4, 2), (1, 1)] {
+        let kit = Kit::builder()
+            .upstream(move |s| s.max_h2_connections_per_origin = limit)
+            .start()
+            .await;
+        let mut c = kit.tunnel("up.test", true).await;
+        let mut pending = Vec::new();
+        let mut senders = Vec::new();
+        for i in 0..2 {
+            let (tx, body) = streaming_body();
+            let req = c.request("POST", &format!("/{i}"), &[]).body(body).unwrap();
+            pending.push(c.start(req));
+            senders.push(tx);
+            kit.upstream.wait_arrived(i + 1).await;
+        }
+        assert_eq!(
+            kit.upstream.open_connections(),
+            connections,
+            "limit {limit}"
+        );
+        for tx in senders {
+            tx.finish().await.unwrap();
+        }
+        for p in pending {
+            let a = p.await.unwrap().unwrap();
+            assert_eq!(a.status, 200, "limit {limit}: {a:?}");
+        }
+    }
+}
+
 // ---- audit backpressure ---------------------------------------------------
 
 /// A flow log that cannot keep up holds traffic back instead of dropping
