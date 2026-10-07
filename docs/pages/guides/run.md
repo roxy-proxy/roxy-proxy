@@ -32,12 +32,12 @@ docker run -d --name roxy \
 | `/var/log/roxy` | Volume, for a config that sets `log.flow.path` (for example `/var/log/roxy/flow.jsonl`). The default config logs flows to stdout. |
 | `capture_dir` | [Capture](/reference/flow-log#capture) is off by default. If you set `capture_dir`, mount a volume there; the root filesystem is read-only. |
 
-Ports, with the default config: `3128` is the proxy listener and `3130` is
+With the default config, `3128` is the proxy listener and `3130` is
 `ca_server` (`/roxy-ca.pem`, `/healthz`, `/readyz`). The image's
-`HEALTHCHECK` runs `roxy health`, a small built-in HTTP probe (there is no
-curl), against `http://127.0.0.1:3130/healthz`. That is liveness. Use
-`roxy health --ready` (`/readyz`) where a check should mean "a policy is in
-force", such as a compose `depends_on` or a Kubernetes readiness probe
+`HEALTHCHECK` runs `roxy health`, a built-in HTTP probe (there is no curl),
+against `http://127.0.0.1:3130/healthz`: liveness. Use `roxy health --ready`
+(`/readyz`) where a check should mean "a policy is in force", such as a
+compose `depends_on` or a Kubernetes readiness probe
 ([health](/guides/operations#health)). A config that moves or removes
 `ca_server` needs `--health-cmd` or `--no-healthcheck`. Other subcommands
 run the same way:
