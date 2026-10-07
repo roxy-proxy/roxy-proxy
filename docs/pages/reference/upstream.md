@@ -15,6 +15,7 @@ upstream:
   allow_cidrs: []              # exceptions to the private-range floor only
   deny_lists: [blocked]        # names from address_lists
   connect_timeout: 10s         # TCP connect, over all of a name's addresses together; then the TLS handshake, within another
+  max_h2_connections_per_origin: 4   # at least 1
 
 tls:
   upstream:
@@ -43,6 +44,25 @@ canonical host. ALPN offers `h2` and `http/1.1` (only `http/1.1` for
 WebSocket upgrades). The handshake has its own `connect_timeout` after the
 TCP connect's: an upstream that accepts the connection but never completes
 TLS fails with `504`, reason `timeout`, message `upstream TLS handshake`.
+
+## Connections
+
+Connections to an origin are pooled by scheme and authority and closed
+after 90 s idle. HTTP/1.1 opens one connection per concurrent request.
+HTTP/2 multiplexes: an origin that negotiates `h2` gets up to
+`max_h2_connections_per_origin` connections, each driven by its own task.
+A request goes to the connection with the fewest exchanges in flight (a
+response body still streaming counts), so a lightly used origin stays on
+one connection and concurrent load spreads evenly across the limit. Each
+connection offers a 2 MiB stream window, an 8 MiB connection window and
+1 MiB frames.
+
+An origin that closes an HTTP/2 connection with `GOAWAY` (nginx does at
+`keepalive_requests`) fails every stream above the last one it names, which
+it never processed. roxy sends such a request again on another connection,
+up to twice, if it has no body; a request with a body is answered `502`
+(`upstream_error`, reason `protocol_error`), as its body has already
+streamed to the connection.
 
 ## Errors
 

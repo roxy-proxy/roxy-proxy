@@ -170,6 +170,22 @@ impl Upstream {
         lock(&self.seen).iter().map(|s| lock(s).clone()).collect()
     }
 
+    /// Waits until `n` requests arrived, their bodies finished or not.
+    pub(crate) async fn wait_arrived(&self, n: usize) {
+        let wait = async {
+            loop {
+                let changed = self.changed.notified();
+                if lock(&self.seen).len() >= n {
+                    return;
+                }
+                changed.await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .unwrap_or_else(|_| panic!("upstream: wanted {n} requests, have {:#?}", self.seen()));
+    }
+
     /// Waits until `n` requests arrived and each body finished or was cut.
     pub(crate) async fn wait_seen(&self, n: usize) -> Vec<Seen> {
         let wait = async {

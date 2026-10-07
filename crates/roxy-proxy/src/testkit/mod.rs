@@ -272,9 +272,23 @@ pub(crate) struct KitBuilder {
     ca_server: bool,
     valid_until: Option<DateTime<Utc>>,
     placeholder_policy: bool,
+    /// Adjusts the connector's settings before the kit starts.
+    upstream: Option<UpstreamTweak>,
 }
 
+type UpstreamTweak = Box<dyn FnOnce(&mut UpstreamSettings) + Send>;
+
 impl KitBuilder {
+    /// Adjusts the upstream connector's settings (pool size, timeouts).
+    #[must_use]
+    pub(crate) fn upstream(
+        mut self,
+        f: impl FnOnce(&mut UpstreamSettings) + Send + 'static,
+    ) -> Self {
+        self.upstream = Some(Box::new(f));
+        self
+    }
+
     /// Opens a capture log that takes every forwarded exchange.
     #[must_use]
     pub(crate) fn capture_all(mut self) -> Self {
@@ -449,7 +463,10 @@ impl KitBuilder {
             addons.push(a.load(&rt, &input).await);
         }
 
-        let settings = upstream_settings(&upstream);
+        let mut settings = upstream_settings(&upstream);
+        if let Some(f) = self.upstream {
+            f(&mut settings);
+        }
         let (limits, flags, http) = (self.limits.clone(), self.flags.clone(), self.http.clone());
         let capture = self
             .capture
@@ -604,6 +621,7 @@ impl Kit {
             ca_server: false,
             valid_until: None,
             placeholder_policy: false,
+            upstream: None,
         }
     }
 

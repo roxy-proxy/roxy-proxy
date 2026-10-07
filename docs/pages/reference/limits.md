@@ -151,6 +151,10 @@ single reservation.
   `max_connections`, so behind a load balancer (one source IP for every
   client) the cap is the fleet's; lower it on a proxy port where each client
   has its own address.
+- Upstream connections are bounded by the clients: HTTP/1.1 origins get
+  one connection per concurrent request, HTTP/2 origins at most
+  `upstream.max_h2_connections_per_origin` (4 by default), each with an
+  8 MiB receive window ([upstream](/reference/upstream#connections)).
 - Bounded policy tables (metrics, state, addon state) never evict
   ([never evict](/design/threat-model#never-evict)).
 - The proxy port serves only proxy semantics and `roxy.internal`; health
