@@ -124,6 +124,13 @@ A violation closes the connection, not just the request, and emits a
 `parse_error` flow event with a stable reason code. The knobs live under
 `http:` and default to strict.
 
+The header and body rules are one implementation, applied to every request
+roxy judges: an HTTP/1.1 head, an HTTP/2 stream, and what a service layer
+passes on. Each path adds only its own wire rules ahead of them (line
+structure for HTTP/1.1, pseudo-headers and connection-specific fields for
+HTTP/2, the fields a layer may not set), so a field list one path refuses
+the others refuse for the same reason.
+
 ### Request line
 
 - The method is a valid `token`.
@@ -149,7 +156,9 @@ A violation closes the connection, not just the request, and emits a
   An HTTP/1.0 absolute-form request may omit it.
 - At most one `Proxy-Authorization`.
 - At most one `Content-Length`, digits only, at most 19 digits; a duplicate
-  is rejected even with equal values.
+  is rejected even with equal values. A non-zero length declared for a body
+  that has already ended (a layer passing `content-length` with an empty
+  body) is `bad_content_length`, not an empty body.
 - `Transfer-Encoding`, if present, is exactly `chunked`: one field, one
   value, no parameters, no other codings; rejected together with
   `Content-Length`.
