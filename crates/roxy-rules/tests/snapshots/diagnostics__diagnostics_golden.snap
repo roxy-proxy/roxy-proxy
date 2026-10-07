@@ -130,7 +130,7 @@ parse: .[0].then: an action is a map with exactly one key, but this one has `set
 rules[0].then[1]: `tag` follows the terminal action `allow` and would never run; move it before `allow`  [rule a]
 
 == unknown action
-parse: .[0].then: unknown action `sethead`; expected one of `allow`, `deny`, `set_header`, `remove_header`, `rewrite_path`, `set_query`, `remove_query`, `redirect`, `tag`, `log`, `set_state`, `capture`, `sign` at line 1 column 18
+parse: .[0].then: unknown action `sethead`; expected one of `allow`, `deny`, `set_header`, `remove_header`, `rewrite_path`, `set_query`, `remove_query`, `redirect`, `tag`, `log`, `set_state`, `capture`, `digest`, `sign` at line 1 column 18
 
 == request mutation in a watching rule
 rules[0].then[0]: `rewrite_path` changes the request, which is already on its way; this rule reads `body.bytes`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation)  [rule a]

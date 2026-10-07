@@ -18,6 +18,18 @@ const SOFT_DENY: &str = r#"
   then: allow
 "#;
 
+const DIGEST_BOTH: &str = r#"
+- id: up
+  when: host == "up.test"
+  then: [{ digest: both }, allow]
+"#;
+
+const DIGEST_REQUEST: &str = r#"
+- id: up
+  when: host == "up.test"
+  then: [{ digest: request }, allow]
+"#;
+
 fn json(b: &[u8]) -> serde_json::Value {
     serde_json::from_slice(b)
         .unwrap_or_else(|e| panic!("not JSON ({e}): {}", String::from_utf8_lossy(b)))
@@ -245,11 +257,11 @@ async fn h2_large_uploads_stream_intact() {
     large_uploads_stream_intact(true).await;
 }
 
-/// The `request` record digests each body as forwarded: a request body
-/// sent whole or in chunks, the echoed response, and the empty body of a
-/// bare GET.
+/// Under `digest: both` the `request` record digests each body as
+/// forwarded: a request body sent whole or in chunks, the echoed response,
+/// and the empty body of a bare GET.
 async fn the_request_record_digests_both_bodies(h2: bool) {
-    let kit = Kit::builder().start().await;
+    let kit = Kit::builder().rules(DIGEST_BOTH).start().await;
     let mut c = h2_or_h1(&kit, h2).await;
     let data: Vec<u8> = (0..100 * 1024u32).map(|i| (i % 241) as u8).collect();
     let req = c
@@ -305,14 +317,37 @@ async fn h2_the_request_record_digests_both_bodies() {
     the_request_record_digests_both_bodies(true).await;
 }
 
-/// A response body the upstream cut short has no digest; the request body,
-/// which completed, keeps its own.
+/// A response body the upstream cut short has no digest even when a rule
+/// asked for one; the request body, which completed, keeps its own.
 #[tokio::test]
 async fn a_cut_response_body_has_no_digest() {
-    let kit = Kit::builder().start().await;
+    let kit = Kit::builder().rules(DIGEST_BOTH).start().await;
     let a = kit.h1().await.call("POST", "/cut", &[], b"abc").await;
     assert_eq!(a.status, 200, "{a:?}");
     assert!(a.body.is_err(), "{a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["req"]["body_sha256"], sha256_hex(b"abc"), "{ev:#}");
+    assert_eq!(ev["res"]["body_bytes"], 3, "{ev:#}");
+    assert!(ev["res"].get("body_sha256").is_none(), "{ev:#}");
+}
+
+/// Bodies are hashed only on the sides a `digest` rule selects: none
+/// without a rule (the byte counts stay), the request alone under
+/// `digest: request`.
+#[tokio::test]
+async fn bodies_are_hashed_only_where_a_digest_rule_asks() {
+    let kit = Kit::builder().start().await;
+    let a = kit.h1().await.call("POST", "/echo", &[], b"abc").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["req"]["body_bytes"], 3, "{ev:#}");
+    assert_eq!(ev["res"]["body_bytes"], 3, "{ev:#}");
+    assert!(ev["req"].get("body_sha256").is_none(), "{ev:#}");
+    assert!(ev["res"].get("body_sha256").is_none(), "{ev:#}");
+
+    let kit = Kit::builder().rules(DIGEST_REQUEST).start().await;
+    let a = kit.h1().await.call("POST", "/echo", &[], b"abc").await;
+    assert_eq!(a.status, 200, "{a:?}");
     let ev = kit.request_event().await;
     assert_eq!(ev["req"]["body_sha256"], sha256_hex(b"abc"), "{ev:#}");
     assert_eq!(ev["res"]["body_bytes"], 3, "{ev:#}");

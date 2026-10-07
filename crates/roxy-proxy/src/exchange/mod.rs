@@ -127,7 +127,7 @@ where
         Answer::Response(res) => (res, None),
         Answer::Refusal(r) => (refusal_response(cx, &r), Some(r)),
     };
-    let (body, tally) = counted(std::mem::take(&mut res.body));
+    let (body, tally) = counted(std::mem::take(&mut res.body), cx.digest.response);
     res.body = body;
     cx.record.response_status = Some(res.status.as_u16());
     cx.record.response_headers_bytes = res.headers.wire_len() as u64;
@@ -769,7 +769,7 @@ async fn plain_upstream<F: Front>(
         let authority = req.authority.to_host_header(req.scheme);
         move || upstream.may_be_h1(private, protocols, &scheme, &authority)
     });
-    let (body, req_tally, sent) = counted_until_sent(body);
+    let (body, req_tally, sent) = counted_until_sent(body, cx.digest.request);
     // Read when the flow is logged, so bytes sent before an abandoned
     // forward, or after the response head, all count.
     cx.request_tally = Some(req_tally.clone());

@@ -15,7 +15,7 @@ use roxy_http::{Body, BodyError, ParseError, Reason};
 use tokio_util::sync::CancellationToken;
 
 /// What a [`counted`] body has let through: the byte count as it grows,
-/// and the SHA-256 of the whole body once it has completed.
+/// and, if asked for, the SHA-256 of the whole body once it has completed.
 #[derive(Debug, Default)]
 pub(crate) struct Tally {
     bytes: AtomicU64,
@@ -29,8 +29,8 @@ impl Tally {
     }
 
     /// Lower-case hex SHA-256 of the body, once it has ended cleanly.
-    /// `None` while it is still flowing, and for good if it failed or was
-    /// dropped before its end.
+    /// `None` while it is still flowing, for good if it failed or was
+    /// dropped before its end, and always for a body not digested.
     pub(crate) fn sha256_hex(&self) -> Option<String> {
         self.sha256.get().map(|d| hex(d))
     }
@@ -47,13 +47,13 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
         })
 }
 
-/// Counts and digests data bytes as they pass through.
+/// Counts, and optionally digests, data bytes as they pass through.
 struct Counted {
     inner: Body,
     tally: Arc<Tally>,
     known: Option<u64>,
-    /// The running digest; taken at the body's end, or discarded when the
-    /// body fails.
+    /// The running digest; `None` for a body nobody asked to hash, taken
+    /// at the body's end, or discarded when the body fails.
     digest: Option<Digest>,
     /// Cancelled once the body has ended, failed or been dropped.
     ended: Option<CancellationToken>,
@@ -134,22 +134,27 @@ impl http_body::Body for Counted {
 }
 
 /// Wraps `body` so the returned tally tracks the data bytes that have
-/// flowed through it, and their digest once it has ended. Framing (known
-/// length) is preserved.
-pub(crate) fn counted(body: Body) -> (Body, Arc<Tally>) {
-    wrap_counted(body, None)
+/// flowed through it and, with `digest`, their SHA-256 once it has ended.
+/// Framing (known length) is preserved. Hashing is not free (software
+/// SHA-256 runs at a few hundred MB/s per core), so it is done only where
+/// a rule asked for the digest.
+pub(crate) fn counted(body: Body, digest: bool) -> (Body, Arc<Tally>) {
+    wrap_counted(body, digest, None)
 }
 
 /// [`counted`], plus a token cancelled once the body is done with: it
 /// ended, failed, or its consumer dropped it (an HTTP client drops a
 /// request body once it has been sent, or never polls an empty one).
-pub(crate) fn counted_until_sent(body: Body) -> (Body, Arc<Tally>, CancellationToken) {
+pub(crate) fn counted_until_sent(
+    body: Body,
+    digest: bool,
+) -> (Body, Arc<Tally>, CancellationToken) {
     let ended = CancellationToken::new();
-    let (body, tally) = wrap_counted(body, Some(ended.clone()));
+    let (body, tally) = wrap_counted(body, digest, Some(ended.clone()));
     (body, tally, ended)
 }
 
-fn wrap_counted(body: Body, ended: Option<CancellationToken>) -> (Body, Arc<Tally>) {
+fn wrap_counted(body: Body, digest: bool, ended: Option<CancellationToken>) -> (Body, Arc<Tally>) {
     let tally = Arc::new(Tally::default());
     let known = body.known_length();
     let body = Body::wrap_native(
@@ -157,7 +162,7 @@ fn wrap_counted(body: Body, ended: Option<CancellationToken>) -> (Body, Arc<Tall
             inner: body,
             tally: tally.clone(),
             known,
-            digest: Some(Digest::new(&SHA256)),
+            digest: digest.then(|| Digest::new(&SHA256)),
             ended,
         },
         u64::MAX,
@@ -369,12 +374,12 @@ mod tests {
 
     #[tokio::test]
     async fn until_sent_fires_at_the_end_or_on_drop() {
-        let (b, c, sent) = counted_until_sent(Body::from_bytes("hello"));
+        let (b, c, sent) = counted_until_sent(Body::from_bytes("hello"), true);
         assert!(!sent.is_cancelled());
         assert_eq!(drain(b).await.unwrap(), b"hello");
         assert!(sent.is_cancelled());
         assert_eq!(c.bytes(), 5);
-        let (b, _, sent) = counted_until_sent(Body::from_bytes("never polled"));
+        let (b, _, sent) = counted_until_sent(Body::from_bytes("never polled"), true);
         drop(b);
         assert!(sent.is_cancelled());
     }
@@ -384,7 +389,7 @@ mod tests {
 
     #[tokio::test]
     async fn counts_and_digests_bytes() {
-        let (b, t) = counted(Body::from_bytes("hello"));
+        let (b, t) = counted(Body::from_bytes("hello"), true);
         assert_eq!(b.known_length(), Some(5));
         assert_eq!(t.sha256_hex(), None, "not before the end");
         assert_eq!(drain(b).await.unwrap(), b"hello");
@@ -395,7 +400,7 @@ mod tests {
     #[tokio::test]
     async fn digest_spans_the_chunks() {
         let (mut tx, b) = Body::channel(1 << 20, None);
-        let (b, t) = counted(b);
+        let (b, t) = counted(b, true);
         tokio::spawn(async move {
             for part in ["he", "l", "lo"] {
                 tx.ready().await.unwrap();
@@ -413,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn declared_length_reached_completes_the_digest() {
         let (mut tx, b) = Body::channel(1 << 20, Some(5));
-        let (mut b, t) = counted(b);
+        let (mut b, t) = counted(b, true);
         for part in ["hel", "lo"] {
             tx.ready().await.unwrap();
             tx.try_push(Bytes::from_static(part.as_bytes())).unwrap();
@@ -427,17 +432,30 @@ mod tests {
 
     #[tokio::test]
     async fn empty_body_has_the_empty_digest_even_unpolled() {
-        let (b, t) = counted(Body::empty());
+        let (b, t) = counted(Body::empty(), true);
         drop(b);
         assert_eq!(t.bytes(), 0);
         assert_eq!(t.sha256_hex().as_deref(), Some(EMPTY_SHA256));
+    }
+
+    /// A body nobody asked to hash is counted and completes normally, but
+    /// never gains a digest.
+    #[tokio::test]
+    async fn undigested_body_counts_without_a_digest() {
+        let (b, t) = counted(Body::from_bytes("hello"), false);
+        assert_eq!(drain(b).await.unwrap(), b"hello");
+        assert_eq!(t.bytes(), 5);
+        assert_eq!(t.sha256_hex(), None);
+        let (b, t) = counted(Body::empty(), false);
+        drop(b);
+        assert_eq!(t.sha256_hex(), None, "not even the empty digest");
     }
 
     #[tokio::test]
     async fn aborted_body_has_no_digest() {
         // Dropped by its consumer mid-stream.
         let (mut tx, b) = Body::channel(1 << 20, None);
-        let (mut b, t) = counted(b);
+        let (mut b, t) = counted(b, true);
         tx.ready().await.unwrap();
         tx.try_push(Bytes::from_static(b"hel")).unwrap();
         let f = poll_fn(|cx| http_body::Body::poll_frame(Pin::new(&mut b), cx)).await;
@@ -447,7 +465,7 @@ mod tests {
         assert_eq!(t.sha256_hex(), None);
         // Failed by its producer.
         let (mut tx, b) = Body::channel(1 << 20, None);
-        let (b, t) = counted(b);
+        let (b, t) = counted(b, true);
         tx.ready().await.unwrap();
         tx.try_push(Bytes::from_static(b"hel")).unwrap();
         drop(tx);

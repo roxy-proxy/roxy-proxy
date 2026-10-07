@@ -1075,6 +1075,7 @@ fn every_effect_kind() {
     - log: { level: warn, message: m }
     - set_state: { key: k, value: v }
     - capture: both
+    - digest: request
     - allow: { upgrade: websocket, private_ok: true }
 "#,
     );
@@ -1098,7 +1099,8 @@ fn every_effect_kind() {
             "redirect",
             "log",
             "set_state",
-            "capture"
+            "capture",
+            "digest"
         ]
     );
     assert_eq!(
@@ -1123,12 +1125,14 @@ fn every_effect_kind() {
         }
     );
     assert_eq!(out.effects[8], Effect::Capture(CaptureTarget::Both));
+    assert_eq!(out.effects[9], Effect::Digest(CaptureTarget::Request));
     let rendered: Vec<String> = out.effects.iter().map(ToString::to_string).collect();
     assert_eq!(rendered[2], "rewrite_path \"/old/(.*)\" -> \"/new/$1\"");
     assert_eq!(
         rendered[5],
         "redirect https://mirror.example.org:8443 (rewrite host)"
     );
+    assert_eq!(rendered[9], "digest request");
 }
 
 #[test]

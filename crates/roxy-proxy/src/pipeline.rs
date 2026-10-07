@@ -507,6 +507,9 @@ pub(crate) struct FlowCx {
     /// `capture` effect at the head, or for every exchange with
     /// `log.capture.all`.
     pub capture: PerDir<bool>,
+    /// Hash this exchange's request / response body for the flow
+    /// record's `body_sha256`: set by a `digest` effect at the head.
+    pub digest: PerDir<bool>,
     /// Capture taps not yet handed to a body adapter (the WebSocket relay
     /// takes them after the `101`).
     pub taps: PerDir<Option<Tap>>,
@@ -625,6 +628,7 @@ impl FlowCx {
             started: Instant::now(),
             watch: None,
             capture: PerDir::default(),
+            digest: PerDir::default(),
             taps: PerDir::default(),
             host_override: None,
             sign: None,
@@ -1291,6 +1295,10 @@ fn apply_request_effect(
             }
             cx.capture.request |= matches!(target, CaptureTarget::Request | CaptureTarget::Both);
             cx.capture.response |= matches!(target, CaptureTarget::Response | CaptureTarget::Both);
+        }
+        Effect::Digest(target) => {
+            cx.digest.request |= matches!(target, CaptureTarget::Request | CaptureTarget::Both);
+            cx.digest.response |= matches!(target, CaptureTarget::Response | CaptureTarget::Both);
         }
         Effect::Sign(spec) => {
             // Two rules signing one request is a policy mistake (which
