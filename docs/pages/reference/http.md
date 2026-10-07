@@ -156,7 +156,7 @@ A violation closes the connection, not just the request, and emits a
   streaming: exceeding it closes the connection mid-stream.
 - The head must arrive within `limits.header_timeout` (10 s) of its first
   byte, whether that byte opened the connection or was pipelined. The body
-  may not stall longer than `limits.body_idle_timeout` (30 s), which also
+  may not stall longer than `limits.body_idle_timeout` (10 m), which also
   bounds how long the client may go without taking the next part of the
   response (on HTTP/2: stream reset with `CANCEL`, `response_error`, reason
   `client_stalled`).
@@ -232,10 +232,10 @@ the response and roxy builds a `CanonicalResponse`:
   frames (HTTP/2). Responses to HEAD, and `1xx`, `204` and `304`, carry no
   body. Empty non-final DATA frames are never sent upstream.
 - `limits.max_response_body_bytes` (1 GiB) caps the body.
-  `limits.response_header_timeout` (60 s) starts once the request body has
+  `limits.response_header_timeout` (15 m) starts once the request body has
   been sent; while it is still being sent, the exchange fails (`504`) only
   if the upstream stops taking it for twice `limits.body_idle_timeout`.
-- The upstream may pause up to `limits.response_body_idle_timeout` (5 m)
+- The upstream may pause up to `limits.response_body_idle_timeout` (30 m)
   between parts of the body; longer ends the exchange (`response_error`,
   reason `response_body_timeout`): close on HTTP/1.1, `CANCEL` on HTTP/2.
 - A client that closes while roxy waits for the next part of the body ends

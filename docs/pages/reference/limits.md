@@ -40,16 +40,16 @@ limits:
   max_url_bytes: 8kb
   max_headers: 100
   max_request_body_bytes: 1gb
-  header_timeout: 10s
-  body_idle_timeout: 30s          # the client's stall: sending its body, or taking the response
-  idle_timeout: 300s              # keep-alive idle; also a relayed WebSocket's idle timeout
+  header_timeout: 10s             # the slowloris guard: a request head must arrive in full
+  body_idle_timeout: 10m          # the client's stall: sending its body, or taking the response
+  idle_timeout: 1h                # keep-alive idle; also a relayed WebSocket's idle timeout
   h2_max_concurrent_streams: 100
   h2_max_header_list_bytes: 64kb
 
   # responses
   max_response_body_bytes: 1gb
-  response_header_timeout: 60s    # from when the request body has been sent; a WebSocket upgrade's whole upstream handshake
-  response_body_idle_timeout: 5m  # the upstream's stall between parts of the response body
+  response_header_timeout: 15m    # from when the request body has been sent; a WebSocket upgrade's whole upstream handshake
+  response_body_idle_timeout: 30m # the upstream's stall between parts of the response body
 
   # buffering
   max_inspect_body_bytes: 1mb     # body.text / response.body.text, and addons' default
@@ -61,7 +61,7 @@ limits:
 
   # connections
   max_connections: 10000
-  max_connections_per_client: 256
+  max_connections_per_client: 10000   # per client IP; equal to max_connections, so off unless lowered
 
   # policy state
   max_metric_keys: 100000
@@ -79,6 +79,26 @@ limits:
 
 Addons have their own limits, and fixed caps on what the host holds for a
 guest ([addon safety limits](/reference/addon-safety)).
+
+### Timeouts
+
+The timeouts are permissive by default: roxy decides what passes, not how
+long a well-behaved exchange may take, and a model call with minutes to its
+first byte, a quiet WebSocket or a stream with long gaps should not hit one
+unless the operator chose it. Only `header_timeout` is tight. Memory is
+bounded by the buffer budget and the per-connection caps, not by the
+timeouts, so a long timeout costs only the idle connection it keeps:
+
+| timeout | a long value holds |
+|---|---|
+| `header_timeout` | a connection slot (one of `max_connections`) and its socket, with no request to show for it |
+| `body_idle_timeout` | a connection slot and the exchange's buffers (its reservations under `max_buffered_bytes`, and up to 4 MiB of HTTP/2 receive window) while the client is silent |
+| `idle_timeout` | a connection slot and its socket between requests, or a relayed WebSocket's two sockets and its reserved message buffers while nothing is sent |
+| `response_header_timeout` | a connection slot, the upstream connection, and the exchange's buffers while the upstream thinks |
+| `response_body_idle_timeout` | the same as above while the upstream pauses mid-body |
+
+Tightening one trades those idle connections for cut exchanges; raise
+`max_connections` instead if idle connections are what runs out.
 
 ### Buffer budget
 
@@ -119,7 +139,10 @@ single reservation.
 - Request bytes in flight on an HTTP/2 connection (sent by the client, not
   yet taken by the upstream) sit outside `max_buffered_bytes`: the
   connection's receive window caps them at 4 MiB, so one client IP can hold
-  at most `max_connections_per_client` × 4 MiB (1 GiB by default).
+  at most `max_connections_per_client` × 4 MiB. The default equals
+  `max_connections`, so behind a load balancer (one source IP for every
+  client) the cap is the fleet's; lower it on a proxy port where each client
+  has its own address.
 - Bounded policy tables (metrics, state, addon state) never evict
   ([never evict](/design/threat-model#never-evict)).
 - The proxy port serves only proxy semantics and `roxy.internal`; health

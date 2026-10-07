@@ -44,12 +44,12 @@ limits:
   max_inspect_body_bytes: 1mb   # only buffered when a rule/addon needs body content
   max_sign_body_bytes: 100mb    # a request body hashed for sign: aws_sigv4
   header_timeout: 10s
-  body_idle_timeout: 30s          # the client's stall: sending its body, taking the response
-  response_body_idle_timeout: 5m  # the upstream's stall between response body chunks
-  response_header_timeout: 60s
-  idle_timeout: 300s            # client keep-alive idle; also the WebSocket relay idle timeout
+  body_idle_timeout: 10m          # the client's stall: sending its body, taking the response
+  response_body_idle_timeout: 30m # the upstream's stall between response body chunks
+  response_header_timeout: 15m
+  idle_timeout: 1h                # client keep-alive idle; also the WebSocket relay idle timeout
   max_connections: 10000
-  max_connections_per_client: 256
+  max_connections_per_client: 10000
   max_metric_keys: 100000
   max_metric_bytes: 256mb         # metric store byte budget; full = deny new keys, never evict
   max_address_list_bytes: 256mb   # largest address list file roxy will load

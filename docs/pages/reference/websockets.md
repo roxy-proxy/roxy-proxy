@@ -37,7 +37,7 @@ any rule reads `ws.*`, every message is checked
 - [Addon layers](/reference/addon-configuration#websockets) sit between the
   client and the relay, so message rules and capture see what the layers
   pass on, not what a layer changes on the way to the client.
-- A relayed WebSocket closes after `limits.idle_timeout` (300 s) with no
+- A relayed WebSocket closes after `limits.idle_timeout` (1 h) with no
   traffic either way.
 - The flow log gets one `ws_open` (naming the `host`) and one `ws_close`
   with `bytes_c2s` and `bytes_s2c`, plus `close_code` and `close_reason`

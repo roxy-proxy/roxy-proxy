@@ -109,9 +109,11 @@ fn minimal_config_uses_defaults() {
     assert_eq!(l.max_observer_lag_bytes.as_u64(), 16 << 20);
     assert_eq!(l.max_buffered_bytes.as_u64(), 1 << 30);
     assert_eq!(l.header_timeout, Duration::from_secs(10));
-    assert_eq!(l.body_idle_timeout, Duration::from_secs(30));
-    assert_eq!(l.response_body_idle_timeout, Duration::from_secs(300));
-    assert_eq!(l.max_connections_per_client, 256);
+    assert_eq!(l.body_idle_timeout, Duration::from_secs(600));
+    assert_eq!(l.response_body_idle_timeout, Duration::from_secs(1800));
+    assert_eq!(l.response_header_timeout, Duration::from_secs(900));
+    assert_eq!(l.idle_timeout, Duration::from_secs(3600));
+    assert_eq!(l.max_connections_per_client, l.max_connections);
     assert_eq!(l.max_metric_keys, 100_000);
     assert_eq!(l.max_metric_bytes.as_u64(), 256 << 20);
     assert_eq!(l.metric_limits(), roxy_rules::MetricLimits::default());

@@ -286,6 +286,9 @@ pub struct Limits {
     pub idle_timeout: Duration,
     /// Global cap on concurrent client connections.
     pub max_connections: usize,
+    /// Cap on concurrent connections from one client IP. Equal to
+    /// `max_connections` by default, so it only bites when lowered: behind a
+    /// load balancer every client arrives from one IP.
     pub max_connections_per_client: usize,
     /// Client-side h2 (when it lands): concurrent streams per connection.
     pub h2_max_concurrent_streams: u32,
@@ -326,12 +329,12 @@ impl Default for Limits {
             max_observer_lag_bytes: ByteSize::b(16 * MIB),
             max_buffered_bytes: ByteSize::b(GIB),
             header_timeout: Duration::from_secs(10),
-            body_idle_timeout: Duration::from_secs(30),
-            response_body_idle_timeout: Duration::from_secs(300),
-            response_header_timeout: Duration::from_secs(60),
-            idle_timeout: Duration::from_secs(300),
+            body_idle_timeout: Duration::from_secs(10 * 60),
+            response_body_idle_timeout: Duration::from_secs(30 * 60),
+            response_header_timeout: Duration::from_secs(15 * 60),
+            idle_timeout: Duration::from_secs(60 * 60),
             max_connections: 10_000,
-            max_connections_per_client: 256,
+            max_connections_per_client: 10_000,
             h2_max_concurrent_streams: 100,
             h2_max_header_list_bytes: ByteSize::b(64 * KIB),
             max_metric_keys: 100_000,
