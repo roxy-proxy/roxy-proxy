@@ -60,6 +60,9 @@ pub enum LeaseFetch {
     Unsupported(ErrorBody),
     /// 401: the certificate is not recognised.
     Unauthorized,
+    /// 400 or another 4xx: the server refused the request itself. Retrying
+    /// cannot help; handled as a 401 is, logged distinctly.
+    Rejected(Transient),
     /// 5xx, timeout, connection error, unreadable body.
     Failed(Transient),
 }
@@ -273,6 +276,7 @@ impl ControlPlane {
             StatusCode::GONE => LeaseFetch::Revoked,
             StatusCode::UPGRADE_REQUIRED => LeaseFetch::Unsupported(error_body(&body)),
             StatusCode::UNAUTHORIZED => LeaseFetch::Unauthorized,
+            s if s.is_client_error() => LeaseFetch::Rejected(Transient::status(s, &body)),
             other => LeaseFetch::Failed(Transient::status(other, &body)),
         }
     }
@@ -530,6 +534,11 @@ pub(crate) mod tests {
         assert!(matches!(
             cp.fetch_lease(&state()).await,
             LeaseFetch::Unauthorized
+        ));
+        mock.push(path, Reply::status(400));
+        assert!(matches!(
+            cp.fetch_lease(&state()).await,
+            LeaseFetch::Rejected(e) if e.to_string().starts_with("400")
         ));
         mock.push(path, Reply::status(500));
         assert!(matches!(

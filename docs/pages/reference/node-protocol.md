@@ -40,10 +40,10 @@ node acts on the status code, not the body.
 
 | status | meaning | node behaviour |
 |---|---|---|
-| `400` | malformed request; `error` says how | log; nothing is re-sent as it was, except a flow batch ([flow upload](/reference/node-protocol#flow-upload)) |
-| `401` | at enrolment: the token was not accepted. Elsewhere: the certificate is not recognised as a node | enrolment: retry with backoff for two minutes (a new token may not have reached every replica), then exit non-zero. Elsewhere: log once per outcome change and let the lease run down. Never re-enrol unasked: re-enrolment is an operator action |
-| `410` | the node is revoked; definite and terminal | write an empty policy at once, finish shipping what is spooled, stop polling, keep `/healthz` up and `/readyz` not ready |
-| `426` | the server will not serve this node's `protocol_version` or `roxy_version` | treat as `5xx` for the lease; log the `missing` list distinctly |
+| `400` | malformed request; `error` says how | log, then as a `401` on the same operation: retrying cannot help. A flow batch is the exception ([flow upload](/reference/node-protocol#flow-upload)) |
+| `401` | at enrolment: the token was not accepted. Elsewhere: the certificate is not recognised as a node | enrolment: retry with backoff for two minutes (a new token may not have reached every replica), then exit non-zero. Renewal: log once and stop renewing. Lease: log once per outcome change, keep polling and let the lease run down. Never re-enrol unasked: re-enrolment is an operator action |
+| `410` | the node is revoked; definite and terminal | at enrolment: exit non-zero at once. Elsewhere: write an empty policy at once, stop polling, keep `/healthz` up and `/readyz` not ready, and offer what is spooled to `/flows` for up to thirty seconds |
+| `426` | the server will not serve this node's `protocol_version` or `roxy_version` | enrolment: exit non-zero at once. Renewal: stop renewing. Lease: treat as `5xx`; log the `missing` list distinctly |
 | `507` | flow quota exhausted | stop shipping until a lease with a new `lease_id` arrives ([flow upload](/reference/node-protocol#flow-upload)) |
 | `5xx`, timeout, connection or TLS error | the control plane is unavailable | retry with backoff; the lease runs down |
 
@@ -101,7 +101,10 @@ the new one on receipt.
 `5xx`, timeout, connection and TLS errors are retried with backoff; `410`
 is terminal; a `401`, `426` or other `4xx` is logged once and ends renewal,
 and the certificate serves until its `not_after`. Once it expires the node
-can no longer fetch leases, its lease runs down, and it denies everything.
+exits non-zero with an error naming the remedy (a new token and an empty
+state dir), as it does on a start whose stored certificate has already
+expired: no control plane recognises the certificate, so nothing short of
+re-enrolment recovers the node.
 
 ## Lease
 
@@ -231,4 +234,5 @@ false` also leave gaps.
 |---|---|
 | `400` (`node_mismatch`, a `lease_id` the server never issued, events not consecutive) | logged apart from an outage; the batch is unshipped audit and stays spooled, so under `hold` traffic stalls until the control plane accepts it |
 | `507` | log once and apply `on_high_water` to what accumulates until a new lease arrives; the control plane is expected to revoke the node or issue it a new lease |
-| `410`, `401`, `5xx` | as in the [errors table](/reference/node-protocol#errors); on `410` the node ships what is spooled before it stops |
+| `410` | shipping stops, and so does the drain that follows a `410` on the lease: a control plane that wants a revoked node's last events keeps accepting its batches |
+| `401`, `5xx` | as in the [errors table](/reference/node-protocol#errors) |

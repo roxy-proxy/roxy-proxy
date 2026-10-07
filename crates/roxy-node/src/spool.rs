@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
+use std::time::Instant;
 
 use crate::protocol::{FlowSettings, OnHighWater};
 
@@ -34,6 +35,7 @@ struct Spooled {
     seq: u64,
     /// One JSON object, `seq` included, no trailing newline.
     line: Vec<u8>,
+    since: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -146,6 +148,12 @@ impl Spool {
         lock(&self.queue).events.len()
     }
 
+    /// When the oldest unacknowledged event was spooled: the start of the
+    /// flush window. `None` when empty.
+    pub fn oldest_since(&self) -> Option<Instant> {
+        lock(&self.queue).events.front().map(|e| e.since)
+    }
+
     /// Events dropped in `spool` mode since start.
     #[cfg(test)]
     pub fn dropped(&self) -> u64 {
@@ -183,7 +191,11 @@ impl Spool {
         }
         tagged.extend_from_slice(rest);
         let len = tagged.len() as u64;
-        q.events.push_back(Spooled { seq, line: tagged });
+        q.events.push_back(Spooled {
+            seq,
+            line: tagged,
+            since: Instant::now(),
+        });
         q.bytes += len;
         if settings.on_high_water == OnHighWater::Spool {
             self.drop_to(&mut q, settings.spool_high_water_bytes);
