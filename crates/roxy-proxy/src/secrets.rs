@@ -26,6 +26,14 @@ pub(crate) struct Secrets {
     redactor: Arc<Redactor>,
 }
 
+impl std::fmt::Debug for Secrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secrets")
+            .field("secrets", &self.values.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Secrets {
     /// The value of secret `name` in this generation.
     pub(crate) fn get(&self, name: &str) -> Option<String> {

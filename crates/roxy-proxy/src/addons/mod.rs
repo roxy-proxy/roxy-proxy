@@ -754,7 +754,14 @@ pub(crate) fn emit_stack_error(st: &StackFlow, layer: &str, e: &StackError, mode
     if mode == AddonMode::Enforce && st.reported.swap(true, Ordering::Relaxed) {
         return;
     }
-    tracing::info!(flow = %st.flow, layer, error = %e, mode = mode.as_str(), "layer failed");
+    // Redacted once, for both sinks: a guest's panic message or an
+    // `InvalidRequest` detail can quote whatever the guest was given.
+    let message = st
+        .secrets()
+        .redactor()
+        .redact_str(&e.to_string())
+        .into_owned();
+    tracing::info!(flow = %st.flow, layer, error = %message, mode = mode.as_str(), "layer failed");
     st.shared.sink.emit(&FlowEvent::LayerError {
         ts: chrono::Utc::now(),
         flow: st.flow.to_string(),
@@ -762,12 +769,7 @@ pub(crate) fn emit_stack_error(st: &StackFlow, layer: &str, e: &StackError, mode
         layer: layer.to_owned(),
         mode: mode.as_str().to_owned(),
         kind: error_kind(e),
-        message: st
-            .snap
-            .secrets
-            .redactor()
-            .redact_str(&e.to_string())
-            .into_owned(),
+        message,
     });
 }
 
@@ -1184,7 +1186,96 @@ pub(crate) fn test_flow(kit: &crate::testkit::Kit) -> (Arc<StackFlow>, FlowCx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flowlog::REDACTED;
     use crate::testkit::{AddonDef, Kit};
+
+    /// A `tracing` writer into a shared buffer.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    /// A layer error is redacted once for both sinks, so a secret a guest
+    /// quotes in its message reaches neither the operational log nor the
+    /// flow log.
+    #[tokio::test]
+    async fn a_layer_error_is_redacted_in_the_operational_log_too() {
+        let secret = "sk-live-123";
+        let kit = Kit::builder()
+            .secret("k", secret)
+            .addon(AddonDef::test_layer("a"))
+            .start()
+            .await;
+        let (st, _cx) = test_flow(&kit);
+        let e = LayerError::InvalidRequest(format!("header x-token: {secret}"));
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            emit_layer_error(&st, "a", &e, AddonMode::Enforce);
+        });
+        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("layer failed"), "{logged}");
+        assert!(!logged.contains(secret), "{logged}");
+        assert!(logged.contains(REDACTED), "{logged}");
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(
+            errs[0]["message"],
+            format!("layer passed an invalid request to `next`: header x-token: {REDACTED}")
+        );
+    }
+
+    /// A metric source's detail can quote the series key, which a rule may
+    /// build from request data.
+    #[tokio::test]
+    async fn a_metric_error_is_redacted_in_the_operational_log_too() {
+        use crate::flowlog::Stage;
+        use crate::sources::MetricSourceError;
+        let secret = "sk-live-123";
+        let kit = Kit::builder()
+            .secret("k", secret)
+            .addon(AddonDef::test_layer("a"))
+            .start()
+            .await;
+        let (_st, cx) = test_flow(&kit);
+        let e = MetricSourceError::KeyUnavailable(format!("key token={secret}"));
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            cx.metric_error(Stage::Head, &e);
+        });
+        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("metric recording failed"), "{logged}");
+        assert!(!logged.contains(secret), "{logged}");
+        assert!(logged.contains(REDACTED), "{logged}");
+        let errs = kit.events("policy_input_unavailable", 1).await;
+        assert_eq!(
+            errs[0]["reason"],
+            format!("{}: metric key unavailable: key token={REDACTED}", e.code())
+        );
+    }
 
     /// A request body that failed in the core closes the connection as a
     /// client's fault, unless a layer's own failure explains the exchange.

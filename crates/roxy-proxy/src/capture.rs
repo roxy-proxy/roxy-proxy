@@ -37,8 +37,10 @@
 //! same body adapters that forward each chunk, after the watching rules
 //! allowed it and before it is handed on.
 //!
-//! Injected secret values are redacted in captured *head* values (the
-//! agent never saw them). Bodies are captured as they are, unredacted.
+//! Every string in a captured *head* passes through the exchange's
+//! redactor, so an injected secret value (which the agent never saw) is
+//! scrubbed wherever it appears. Bodies are captured as they are,
+//! unredacted.
 
 use std::fmt::Write as _;
 use std::io;
@@ -49,7 +51,7 @@ use std::task::{Context, Poll};
 use roxy_http::{CanonicalRequest, CanonicalResponse, Headers};
 use roxy_log::{LogWriter, RotateOptions, RotatingFile, WriterOptions};
 
-use crate::flowlog::Redactor;
+use crate::secrets::Secrets;
 
 /// The capture file's name inside `capture_dir`.
 pub const CAPTURE_FILE: &str = "capture.rxc";
@@ -154,6 +156,9 @@ impl Dir {
 #[derive(Debug)]
 pub(crate) struct Tap {
     log: Arc<CaptureLog>,
+    /// The exchange's secret generation: every head string is redacted
+    /// from it, in [`Tap::head`] and nowhere else.
+    secrets: Arc<Secrets>,
     flow: String,
     dir: Dir,
     seq: u64,
@@ -164,9 +169,10 @@ pub(crate) struct Tap {
 }
 
 impl Tap {
-    pub(crate) fn new(log: Arc<CaptureLog>, flow: &str, dir: Dir) -> Self {
+    pub(crate) fn new(log: Arc<CaptureLog>, secrets: Arc<Secrets>, flow: &str, dir: Dir) -> Self {
         Self {
             log,
+            secrets,
             flow: flow.to_owned(),
             dir,
             seq: 0,
@@ -187,7 +193,7 @@ impl Tap {
     }
 
     /// The canonical request head, as forwarded.
-    pub(crate) fn request_head(&mut self, req: &CanonicalRequest, redactor: &Redactor) {
+    pub(crate) fn request_head(&mut self, req: &CanonicalRequest) {
         let mut url = format!(
             "{}://{}{}",
             req.scheme,
@@ -201,21 +207,24 @@ impl Tap {
         let v = serde_json::json!({
             "method": req.method.as_str(),
             "url": url,
-            "headers": header_pairs(&req.headers, redactor),
+            "headers": header_pairs(&req.headers),
         });
-        self.head(&v);
+        self.head(v);
     }
 
     /// The canonical response head, as sent to the client.
-    pub(crate) fn response_head(&mut self, res: &CanonicalResponse, redactor: &Redactor) {
+    pub(crate) fn response_head(&mut self, res: &CanonicalResponse) {
         let v = serde_json::json!({
             "status": res.status.as_u16(),
-            "headers": header_pairs(&res.headers, redactor),
+            "headers": header_pairs(&res.headers),
         });
-        self.head(&v);
+        self.head(v);
     }
 
-    fn head(&mut self, v: &serde_json::Value) {
+    /// Writes a head record. The one place a head is redacted: whatever a
+    /// head builder puts in `v` is scrubbed here.
+    fn head(&mut self, v: serde_json::Value) {
+        let v = self.secrets.redactor().redact_json(v);
         let seq = self.next_seq();
         self.log.record(
             &self.flow,
@@ -273,18 +282,27 @@ impl Drop for Tap {
     }
 }
 
-fn header_pairs(h: &Headers, redactor: &Redactor) -> Vec<[String; 2]> {
+fn header_pairs(h: &Headers) -> Vec<[String; 2]> {
     h.iter()
         .map(|(n, v)| {
-            let v = String::from_utf8_lossy(v.as_bytes());
-            [n.as_str().to_owned(), redactor.redact_str(&v).into_owned()]
+            [
+                n.as_str().to_owned(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            ]
         })
         .collect()
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::collections::HashMap;
+
+    use roxy_http::url::{parse_authority, parse_origin_form};
+    use roxy_http::{Body, HttpFlags, Limits, Method, RequestMeta, Scheme, TargetForm, Version};
+
     use super::*;
+    use crate::flowlog::{REDACTED, Redactor};
+    use crate::secrets::SecretStore;
 
     /// Parses a capture file into `(header, payload)` records.
     pub(crate) fn parse(bytes: &[u8]) -> Vec<(serde_json::Value, Vec<u8>)> {
@@ -300,6 +318,16 @@ pub(crate) mod tests {
             out.push((head, payload));
         }
         out
+    }
+
+    /// A secret generation holding `values`.
+    fn secrets(values: &[&str]) -> Arc<Secrets> {
+        let values = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (format!("s{i}"), (*v).to_owned()))
+            .collect::<HashMap<_, _>>();
+        SecretStore::new(values, Redactor::new()).load()
     }
 
     fn log(dir: &Path, max_body: u64) -> Arc<CaptureLog> {
@@ -321,15 +349,15 @@ pub(crate) mod tests {
     fn records_round_trip_and_truncate() {
         let dir = tempfile::tempdir().unwrap();
         let log = log(dir.path(), 8);
-        let mut t = Tap::new(log.clone(), "F1", Dir::Request);
+        let mut t = Tap::new(log.clone(), secrets(&[]), "F1", Dir::Request);
         t.data(b"hello");
         t.data(b"\nworld"); // crosses the 8-byte cap
         t.data(b"more");
         t.end(false);
-        let mut r = Tap::new(log.clone(), "F1", Dir::Response);
+        let mut r = Tap::new(log.clone(), secrets(&[]), "F1", Dir::Response);
         r.data(b"partial");
         drop(r); // never ended: aborted
-        drop(Tap::new(log.clone(), "F2", Dir::Request)); // nothing recorded: nothing to end
+        drop(Tap::new(log.clone(), secrets(&[]), "F2", Dir::Request)); // nothing recorded: nothing to end
         assert!(log.flush());
         let recs = parse(&std::fs::read(log.path()).unwrap());
         let kinds: Vec<(&str, &str)> = recs
@@ -358,5 +386,59 @@ pub(crate) mod tests {
             .map(|(h, _)| h["seq"].as_u64().unwrap())
             .collect();
         assert_eq!(seqs, [0, 1, 2, 3]);
+    }
+
+    /// A secret value is scrubbed from a captured head wherever it sits:
+    /// the URL's path and query, and header names and values alike.
+    #[test]
+    fn heads_are_redacted_with_the_exchanges_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = log(dir.path(), 8);
+        let secret = "sk-live-123";
+        let (path, query) =
+            parse_origin_form(format!("/v1/{secret}/x?k={secret}&plain=1").as_bytes()).unwrap();
+        let secret_name = format!("x-{secret}");
+        let raw: Vec<(&[u8], &[u8])> = vec![
+            (b"x-token", secret.as_bytes()),
+            (secret_name.as_bytes(), b"v"),
+        ];
+        let headers =
+            Headers::try_from_raw(raw, &Limits::default(), &HttpFlags::default()).unwrap();
+        let req = CanonicalRequest {
+            method: Method::parse(b"GET").unwrap(),
+            scheme: Scheme::Https,
+            authority: parse_authority(b"api.example.com", 443).unwrap(),
+            path,
+            query,
+            headers,
+            body: Body::empty(),
+            meta: RequestMeta::new(Version::H1_1, TargetForm::Origin),
+        };
+        let mut res = CanonicalResponse::new(http::StatusCode::OK);
+        res.headers.append("x-echo", secret).unwrap();
+
+        let mut up = Tap::new(log.clone(), secrets(&[secret]), "F1", Dir::Request);
+        up.request_head(&req);
+        let mut down = Tap::new(log.clone(), secrets(&[secret]), "F1", Dir::Response);
+        down.response_head(&res);
+        assert!(log.flush());
+
+        let records = parse(&std::fs::read(log.path()).unwrap());
+        assert_eq!(records.len(), 2);
+        for (_, payload) in &records {
+            let text = std::str::from_utf8(payload).unwrap();
+            assert!(!text.contains(secret), "{text}");
+        }
+        let head: serde_json::Value = serde_json::from_slice(&records[0].1).unwrap();
+        assert_eq!(
+            head["url"],
+            format!("https://api.example.com/v1/{REDACTED}/x?k={REDACTED}&plain=1")
+        );
+        assert_eq!(
+            head["headers"],
+            serde_json::json!([["x-token", REDACTED], [format!("x-{REDACTED}"), "v"]])
+        );
+        let head: serde_json::Value = serde_json::from_slice(&records[1].1).unwrap();
+        assert_eq!(head["headers"], serde_json::json!([["x-echo", REDACTED]]));
     }
 }

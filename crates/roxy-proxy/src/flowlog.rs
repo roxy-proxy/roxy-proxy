@@ -839,6 +839,21 @@ impl Redactor {
             self.redact_str(value)
         }
     }
+
+    /// Every string in `v`, object keys included, with secrets scrubbed.
+    pub fn redact_json(&self, v: serde_json::Value) -> serde_json::Value {
+        use serde_json::Value;
+        match v {
+            Value::String(s) => Value::String(self.redact_str(&s).into_owned()),
+            Value::Array(a) => Value::Array(a.into_iter().map(|x| self.redact_json(x)).collect()),
+            Value::Object(o) => Value::Object(
+                o.into_iter()
+                    .map(|(k, x)| (self.redact_str(&k).into_owned(), self.redact_json(x)))
+                    .collect(),
+            ),
+            other @ (Value::Null | Value::Bool(_) | Value::Number(_)) => other,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1116,6 +1131,15 @@ mod tests {
         assert_eq!(r.redact_str("xabcdefx"), "x[REDACTED]x");
         assert_eq!(r.redact_str("aaa"), "[REDACTED]");
         assert_eq!(r.redact_str("é-abcd-é"), "é-[REDACTED]-é");
+    }
+
+    #[test]
+    fn redact_json_scrubs_keys_as_well_as_values() {
+        let mut r = Redactor::new();
+        r.add_secret("hunter2");
+        let v = serde_json::json!({"token hunter2": ["hunter2", {"hunter2": 1}]});
+        let out = r.redact_json(v).to_string();
+        assert!(!out.contains("hunter2"), "{out}");
     }
 
     #[test]

@@ -635,7 +635,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
         ResponseVerdict::Continue(mut res) => {
             let mut down_tap = down_tap;
             if let Some(t) = down_tap.as_mut() {
-                t.response_head(&res, cx.secrets().redactor());
+                t.response_head(&res);
             }
             if let Some((upstream, key)) = upgrade {
                 // The relay takes the taps after the `101`.
@@ -674,7 +674,7 @@ async fn upgrade_upstream(
     }
     // The upgrade request is captured as it leaves, like any other.
     if let Some(t) = up_tap {
-        t.request_head(&req, cx.secrets().redactor());
+        t.request_head(&req);
     }
     let scheme = req.scheme;
     let authority = req.authority.clone();
@@ -749,7 +749,7 @@ async fn plain_upstream<F: Front>(
     // as forwarded nor handed to the upstream.
     let mut up_tap = up_tap;
     if let Some(t) = up_tap.as_mut() {
-        t.request_head(&req, cx.secrets().redactor());
+        t.request_head(&req);
     }
     let body = watched(
         std::mem::take(&mut req.body),
@@ -858,7 +858,9 @@ fn taps(cx: &FlowCx) -> PerDir<Option<Tap>> {
     };
     let all = log.captures_all();
     let flow = cx.flow.to_string();
-    let tap = |on: bool, dir| (on || all).then(|| Tap::new(log.clone(), &flow, dir));
+    let tap = |on: bool, dir| {
+        (on || all).then(|| Tap::new(log.clone(), cx.secrets().clone(), &flow, dir))
+    };
     PerDir {
         request: tap(cx.capture.request, capture::Dir::Request),
         response: tap(cx.capture.response, capture::Dir::Response),

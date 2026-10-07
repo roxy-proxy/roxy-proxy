@@ -70,10 +70,12 @@ produces a `request` event:
 
 ### Redaction
 
-Every injected secret value is scrubbed from any logged string. Values of
-`authorization`, `proxy-authorization`, `cookie`, `set-cookie` and
-`x-api-key` are never logged; `log.redact_headers` adds more. Query values
-are redacted.
+Every injected secret value is scrubbed from any logged string, the
+operational log (`tracing`) included: a string is redacted once, with the
+secret generation the exchange loaded, and that one copy goes to every
+sink. Values of `authorization`, `proxy-authorization`, `cookie`,
+`set-cookie` and `x-api-key` are never logged; `log.redact_headers` adds
+more. Query values are redacted.
 
 ### Writing
 
@@ -92,10 +94,13 @@ The write path never drops a record while roxy runs
   failing destination (disk full, I/O error) holds traffic the same way, and
   is reported.
 - **Rotation** happens at a batch boundary, so a record never spans two
-  files: the file is renamed to `<path>.<UTC timestamp>-<seq>` (names sort
-  in rotation order), a new one is opened, files beyond `max_files` are
-  deleted, and rotated files are optionally gzipped in the background. Only
-  files of that name shape count towards `max_files` or are deleted. A
+  files: the file is renamed to `<path>.<UTC timestamp>-<seq>`, a new one
+  is opened, files beyond `max_files` are deleted (oldest first), and
+  rotated files are optionally gzipped in the background. Names sort in
+  rotation order even across a restart on a clock behind the previous run's:
+  a rotation on a clock behind the newest existing name reuses its stamp
+  with a higher sequence. Only files of that name shape count towards
+  `max_files` or are deleted. A
   failed rotation is a failed write: traffic is held and it is retried.
   `SIGHUP` reopens the file, for external rotation.
 - **Shutdown.** Everything queued is written before exit. A destination
@@ -134,9 +139,10 @@ allowed a chunk. WebSocket relays are captured both ways at the relay next
 to the upstream, not as an addon layer changes them for the client.
 
 Capture is written like the flow log (one writer, batching, rotation,
-backpressure). Injected secret values are scrubbed from captured heads;
-nothing else is: the header-name redaction above is flow-log only, and
-bodies are captured **unredacted**.
+backpressure). Injected secret values are scrubbed from every string of a
+captured head (URL, header names and values); nothing else is: the
+header-name redaction above is flow-log only, and bodies are captured
+**unredacted**.
 
 ```yaml
 capture_dir: /var/lib/roxy/capture   # absent = capture disabled; restart to change

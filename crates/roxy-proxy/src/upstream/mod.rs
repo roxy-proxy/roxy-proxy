@@ -660,16 +660,24 @@ fn never_reached_origin(err: &ClientError) -> bool {
         if let Some(h2) = e.downcast_ref::<h2::Error>() {
             return h2.is_go_away() && h2.is_remote();
         }
-        if let Some(h) = e.downcast_ref::<hyper::Error>() {
-            // hyper has no predicate for a request its dispatcher dropped
-            // unsent; the message is its stable description of that case.
-            if h.is_canceled() || h.to_string() == "dispatch task is gone" {
-                return true;
-            }
+        if e.downcast_ref::<hyper::Error>()
+            .is_some_and(hyper_never_sent)
+        {
+            return true;
         }
         src = e.source();
     }
     false
+}
+
+/// Whether hyper never sent the request: it was cancelled before dispatch,
+/// or its dispatcher went away with it queued. hyper has no predicate for
+/// the second (`Kind::User(User::DispatchGone)` is private, and `is_user`
+/// covers unrelated misuse too), so the message is matched;
+/// `a_request_dropped_with_its_dispatcher_was_never_sent` fails if a hyper
+/// bump rewords it.
+fn hyper_never_sent(h: &hyper::Error) -> bool {
+    h.is_canceled() || h.to_string() == "dispatch task is gone"
 }
 
 /// Which protocols a pooled client may negotiate.
@@ -1027,6 +1035,34 @@ mod tests {
             2,
             "the second request reconnected"
         );
+    }
+
+    /// A request in the dispatcher's hands when the connection task is
+    /// dropped is one hyper never completed sending, and it is not what
+    /// hyper calls cancelled: only the message says so, so a hyper upgrade
+    /// that rewords it fails here.
+    #[tokio::test]
+    async fn a_request_dropped_with_its_dispatcher_was_never_sent() {
+        let (io, _peer) = tokio::io::duplex(64);
+        let (mut tx, conn) = hyper::client::conn::http1::handshake::<_, Body>(TokioIo::new(io))
+            .await
+            .unwrap();
+        let req = http::Request::get("http://x.test/")
+            .body(Body::empty())
+            .unwrap();
+        let pending = tx.send_request(req);
+        // One poll takes the request off the queue; the peer never answers,
+        // so it is still in the dispatcher when the connection is dropped.
+        let mut conn = Box::pin(conn);
+        std::future::poll_fn(|cx| {
+            assert!(conn.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(conn);
+        let err = pending.await.unwrap_err();
+        assert!(!err.is_canceled(), "{err}");
+        assert!(hyper_never_sent(&err), "{err}");
     }
 
     /// A request with a body is not sent again: hyper has streamed the
