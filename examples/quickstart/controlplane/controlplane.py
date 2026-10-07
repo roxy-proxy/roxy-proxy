@@ -7,6 +7,10 @@ CSR with a CA it keeps in DATA_DIR, and serves the lease: the quickstart's
 roxy.yaml with its `env` secrets turned into `lease: true` entries and the
 values taken from this process's environment. Flow batches are printed to
 stdout, one event per line. A node id listed in DATA_DIR/revoked gets 410.
+
+It is not a reference for everything a server should check: the token is
+reusable, a flow batch's `lease_id` is accepted whatever it says, and the
+gunzipped request body is not bounded.
 """
 
 import datetime as dt
@@ -168,7 +172,8 @@ class ControlPlane:
 
     def enrol(self, token, body):
         # The token is reusable: roxy's state dir is tmpfs, so every `compose up`
-        # re-enrols. A real control plane consumes a token on first use.
+        # re-enrols. Reuse policy is the control plane's; single-use is the
+        # usual choice.
         if token is None or not hmac.compare_digest(token.encode(), self.token.encode()):
             raise ApiError(401, "invalid_token", "enrolment token not recognised")
         node_id = "node-" + os.urandom(3).hex()

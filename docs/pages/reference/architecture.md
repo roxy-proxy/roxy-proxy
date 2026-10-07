@@ -56,15 +56,28 @@ The compiled policy (rules, metrics, addons, address lists) is an immutable
 snapshot swapped atomically on reload. An exchange runs to the end on the
 snapshot it started with.
 
+## Node mode
+
+With `--control-plane` the binary has no config file
+([node mode](/deploy/node-mode)). It opens bootstrap listeners that deny
+everything, enrols with the control plane (or loads the certificate it
+stored last time) and polls for a lease: a rendered `roxy.yaml`, the
+secret values it names and how long it is good for
+([node protocol](/reference/node-protocol)). The first lease replaces the
+bootstrap listeners; later ones swap the policy snapshot, the secret map or
+only `valid_until`, as a reload would. Every flow event also goes into an
+in-memory spool, tagged with a per-node sequence number, and is shipped to
+the control plane in batches until acknowledged.
+
 ## Crates
 
 Dependencies point downward. `roxy` depends on `roxy-proxy`, `roxy-http`,
-`roxy-rules`, `roxy-tls` and `roxy-wasm`; `roxy-proxy` on `roxy-http`,
-`roxy-tls`, `roxy-rules`, `roxy-wasm` and `roxy-log`;
+`roxy-rules`, `roxy-tls`, `roxy-wasm` and `roxy-node`; `roxy-proxy` on
+`roxy-http`, `roxy-tls`, `roxy-rules`, `roxy-wasm` and `roxy-log`;
 `roxy-rules`, `roxy-wasm` and `roxy-tls` on `roxy-http`. `roxy-http`,
-`roxy-log` and `roxy-addon` depend on no other roxy crate.
-`roxy-http` and `roxy-rules` do no network I/O, so they can be
-unit-tested and fuzzed directly.
+`roxy-log`, `roxy-addon` and `roxy-node` depend on no other roxy crate;
+`roxy-node-spec` is used only by tests. `roxy-http` and `roxy-rules` do no
+network I/O, so they can be unit-tested and fuzzed directly.
 
 | crate | responsibility |
 |---|---|
@@ -76,6 +89,8 @@ unit-tested and fuzzed directly.
 | `roxy-wasm` | The wasmtime component host for WASM addons: linking, capabilities, budgets, instance pools. |
 | `roxy-log` | Buffered single-writer log destinations: one writer thread, batching, backpressure, rotation, compression. Knows bytes, not events. |
 | `roxy-addon` | SDK for Rust addon authors: generated WIT bindings and wrappers. |
+| `roxy-node` | The node side of the control-plane protocol: enrolment and certificate renewal, the lease loop, the flow spool and shipper. Knows nothing of the proxy; `roxy` applies leases through a handler. |
+| `roxy-node-spec` | The node protocol's OpenAPI document (`spec/node-protocol/v1/openapi.yaml`) with validators for its body schemas, for tests. |
 | `wit/` | The `roxy:addon` WIT package: the language-agnostic contract for addons. |
 
 `unsafe` is forbidden in every crate except the generated bindings modules
