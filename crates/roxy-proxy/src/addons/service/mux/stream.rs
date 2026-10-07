@@ -257,6 +257,7 @@ impl Stream {
             let name = self.name();
             let err = StackError::Service(e.clone());
             self.st.fail(&name, err.clone());
+            self.st.service_failed(self.index);
             Some((name, err))
         } else {
             None

@@ -837,6 +837,39 @@ mod service {
         assert_eq!(errs[0]["kind"], "trap", "{errs:#?}");
     }
 
+    /// A service failing after the response head below an observer cuts the
+    /// real body and the observer's copy with it; the observer's own end is
+    /// a consequence, and the one `layer_error` is the service's.
+    #[tokio::test]
+    async fn a_service_failing_after_the_head_below_an_observer_is_the_one_logged() {
+        let kit = kit(
+            RULES,
+            vec![
+                AddonDef::test_layer("o").observe().spec().await,
+                addon("s", "sever", AddonMode::Enforce, |_| {}),
+            ],
+        )
+        .await;
+        // `sever` passes the response head on and resets the stream on
+        // the first response body bytes.
+        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+        assert_eq!(a.status, 200, "{a:?}");
+        assert!(a.body.is_err(), "the body is cut: {a:?}");
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
+        assert_eq!(errs[0]["kind"], "service:closed", "{errs:#?}");
+        // Best-effort: nothing marks the observer's task ending, so a late
+        // event for it would land after the window.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let errs: Vec<_> = kit
+            .sink
+            .events()
+            .into_iter()
+            .filter(|e| e["event"] == "layer_error")
+            .collect();
+        assert_eq!(errs.len(), 1, "{errs:#?}");
+    }
+
     /// Header values a service passes back are the bytes it was given.
     /// Under `allow_obs_text` that includes obs-text, which a UTF-8 service
     /// protocol must carry without rewriting.
