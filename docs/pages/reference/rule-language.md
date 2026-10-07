@@ -144,5 +144,5 @@ Non-terminal:
 
 The actions are a small closed set on purpose: anything richer is an addon.
 Two words are reserved and rejected with the reason: `call` (addons run
-above the rules, not from one) and `passthrough` (for a transparent
-listener, which roxy does not have: issue #15).
+above the rules, not from one) and `passthrough` (reserved; roxy has no
+transparent listener).

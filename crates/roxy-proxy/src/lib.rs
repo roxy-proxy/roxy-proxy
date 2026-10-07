@@ -8,8 +8,8 @@
 //!   connection caps, the atomically swapped policy snapshot.
 //! - [`secrets`]: the live secret map and its redactor, swapped
 //!   independently of the snapshot.
-//! - [`listener`]: the [`Listener`] trait (the hook for transparent mode, issue #15) and
-//!   [`TcpProxyListener`]; [`ClientConn`].
+//! - [`listener`]: the [`Listener`] trait and [`TcpProxyListener`];
+//!   [`ClientConn`].
 //! - `conn`: the connection state machines (proxy port, CONNECT, sniff,
 //!   TLS termination, tunnels, `roxy.internal`).
 //! - `pipeline`: the core's fixed request and response steps, the

@@ -76,18 +76,10 @@ pub struct RuleConfig {
     pub then: Then,
 }
 
-/// Message for a rule that still sets the removed `phase` key.
-pub const PHASE_REMOVED: &str = "`phase` was removed: rules no longer have phases; each rule runs \
-     when the values it reads are known (head rules at the request head; rules that read \
-     body.bytes, response.* or ws.* watch the rest of the exchange; see https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation). Delete \
-     the `phase` key";
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRule {
     id: String,
-    #[serde(default)]
-    phase: Option<de::IgnoredAny>,
     #[serde(default, deserialize_with = "optional_expr")]
     when: Option<Expr>,
     then: Then,
@@ -96,9 +88,6 @@ struct RawRule {
 impl TryFrom<RawRule> for RuleConfig {
     type Error = String;
     fn try_from(r: RawRule) -> Result<Self, String> {
-        if r.phase.is_some() {
-            return Err(format!("rule {:?}: {PHASE_REMOVED}", r.id));
-        }
         Ok(Self {
             id: r.id,
             when: r.when,
@@ -791,24 +780,16 @@ mod tests {
     }
 
     #[test]
-    fn phase_key_is_rejected_with_a_pointer() {
-        let err =
-            serde_yaml_ng::from_str::<Vec<RuleConfig>>("- { id: r, phase: response, then: deny }")
-                .unwrap_err()
+    fn unknown_rule_keys_are_rejected_by_name() {
+        for (yaml, key) in [
+            ("- { id: r, bogus: 1, then: deny }", "bogus"),
+            ("- { id: r, phase: response, then: deny }", "phase"),
+        ] {
+            let err = serde_yaml_ng::from_str::<Vec<RuleConfig>>(yaml)
+                .expect_err(yaml)
                 .to_string();
-        assert!(err.contains("`phase` was removed"), "{err}");
-        assert!(
-            err.contains("https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation"),
-            "{err}"
-        );
-        let ok: Vec<RuleConfig> =
-            serde_yaml_ng::from_str("- { id: r, when: 'body.bytes > 1', then: deny }").unwrap();
-        assert_eq!(ok[0].id, "r");
-        let unknown =
-            serde_yaml_ng::from_str::<Vec<RuleConfig>>("- { id: r, bogus: 1, then: deny }")
-                .unwrap_err()
-                .to_string();
-        assert!(unknown.contains("bogus"), "{unknown}");
+            assert!(err.contains(key), "{yaml}: {err}");
+        }
     }
 
     #[test]

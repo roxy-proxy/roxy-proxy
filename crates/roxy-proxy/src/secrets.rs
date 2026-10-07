@@ -3,9 +3,10 @@
 //!
 //! The map lives beside the policy snapshot rather than inside it, so a
 //! secrets-only update swaps the map and the redactor without recompiling
-//! rules, rebuilding addons or flushing upstream pools. Exchanges read it
-//! at evaluation time: a request after a swap injects the new value, one
-//! before it the old. The values are never written anywhere; `Debug`
+//! rules, rebuilding addons or flushing upstream pools. An exchange loads
+//! one generation ([`Secrets`]) and resolves every name and redacts every
+//! logged string from it, so a swap landing mid-evaluation cannot mix two
+//! generations' values. The values are never written anywhere; `Debug`
 //! prints only a count.
 
 use std::collections::HashMap;
@@ -15,7 +16,9 @@ use arc_swap::ArcSwap;
 
 use crate::flowlog::Redactor;
 
-struct State {
+/// One generation of the secret map: the values and the redactor that
+/// scrubs them (and the generation before). Immutable once published.
+pub(crate) struct Secrets {
     values: HashMap<String, String>,
     /// The redacted header names, as the policy sets them; secret values
     /// are added on top when the redactor is rebuilt.
@@ -23,10 +26,23 @@ struct State {
     redactor: Arc<Redactor>,
 }
 
+impl Secrets {
+    /// The value of secret `name` in this generation.
+    pub(crate) fn get(&self, name: &str) -> Option<String> {
+        self.values.get(name).cloned()
+    }
+
+    /// The redactor for this generation: the redacted header names plus
+    /// these secret values and those the swap before replaced.
+    pub(crate) fn redactor(&self) -> &Redactor {
+        &self.redactor
+    }
+}
+
 /// Secret values by name, swappable at runtime, plus the redactor that
 /// scrubs them from logged text.
 pub struct SecretStore {
-    state: ArcSwap<State>,
+    state: ArcSwap<Secrets>,
     /// Serialises writers (a swap racing a reload), so neither loses the
     /// other's values; readers never take it.
     write: Mutex<()>,
@@ -62,7 +78,7 @@ impl SecretStore {
     pub(crate) fn new(values: HashMap<String, String>, headers: Redactor) -> Self {
         let redactor = redactor(&headers, &values, &HashMap::new());
         Self {
-            state: ArcSwap::from_pointee(State {
+            state: ArcSwap::from_pointee(Secrets {
                 values,
                 headers,
                 redactor,
@@ -71,9 +87,15 @@ impl SecretStore {
         }
     }
 
+    /// The current generation. An exchange holds the one it loaded for
+    /// as long as it lives.
+    pub(crate) fn load(&self) -> Arc<Secrets> {
+        self.state.load_full()
+    }
+
     /// The value of secret `name`, as of now.
     pub(crate) fn get(&self, name: &str) -> Option<String> {
-        self.state.load().values.get(name).cloned()
+        self.state.load().get(name)
     }
 
     /// The current redactor: the redacted header names plus the current
@@ -87,7 +109,7 @@ impl SecretStore {
         let _w = self.write.lock().unwrap_or_else(PoisonError::into_inner);
         let old = self.state.load();
         let redactor = redactor(&old.headers, &values, &old.values);
-        self.state.store(Arc::new(State {
+        self.state.store(Arc::new(Secrets {
             values,
             headers: old.headers.clone(),
             redactor,
@@ -100,7 +122,7 @@ impl SecretStore {
         let _w = self.write.lock().unwrap_or_else(PoisonError::into_inner);
         let old = self.state.load();
         let redactor = redactor(&headers, &values, &old.values);
-        self.state.store(Arc::new(State {
+        self.state.store(Arc::new(Secrets {
             values,
             headers,
             redactor,
@@ -136,6 +158,21 @@ mod tests {
         let r = store.redactor();
         assert_eq!(r.redact_str("new-value"), "[REDACTED]");
         assert_eq!(r.redact_str("old-value"), "old-value");
+    }
+
+    /// A loaded generation is untouched by later swaps, so a reader
+    /// resolving several names from it sees one consistent map.
+    #[test]
+    fn a_loaded_generation_outlives_a_swap() {
+        let store = SecretStore::new(map(&[("akid", "AKID1"), ("sk", "SK1")]), Redactor::new());
+        let generation = store.load();
+        assert_eq!(generation.get("akid").as_deref(), Some("AKID1"));
+        store.swap(map(&[("akid", "AKID2"), ("sk", "SK2")]));
+        store.swap(map(&[("akid", "AKID3"), ("sk", "SK3")]));
+        assert_eq!(generation.get("sk").as_deref(), Some("SK1"));
+        assert_eq!(generation.redactor().redact_str("SK1"), "[REDACTED]");
+        assert_eq!(store.get("sk").as_deref(), Some("SK3"));
+        assert_eq!(store.redactor().redact_str("SK1"), "SK1");
     }
 
     #[test]

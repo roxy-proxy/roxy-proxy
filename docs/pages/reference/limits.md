@@ -154,8 +154,7 @@ smaller budget admits nothing new until enough of them end).
 
 - A connection over `max_connections` or `max_connections_per_client` (per
   client IP) is accepted and closed at once, with a `connection_refused`
-  event. A DNS-over-TCP connection the caps refuse is closed the same way
-  but noted only in the operational log, not in the flow log.
+  event.
 - Every read is bounded (head size, body size, ClientHello size), and every
   stage has a timeout.
 - Nothing is allocated in proportion to an attacker-supplied number before

@@ -196,6 +196,15 @@ impl Body {
         self.known_length
     }
 
+    /// The whole body, when it is held in memory and not yet polled (one
+    /// built with [`Body::from_bytes`], or buffered by an inspection).
+    pub fn as_bytes(&self) -> Option<&Bytes> {
+        match &self.inner {
+            Inner::Full(b) => b.as_ref(),
+            Inner::Empty | Inner::Channel { .. } | Inner::Boxed { .. } | Inner::Prefixed(_) => None,
+        }
+    }
+
     /// Buffers the whole body (for inspection paths). Fails with
     /// [`BodyError::TooLarge`] as soon as more than `max` bytes arrive.
     /// Trailers are discarded.

@@ -148,9 +148,6 @@ rules[0].then[1]: set_header x-a: value "café" is not a valid header value (vis
 == bad deny status
 rules[0].then[0]: deny status 200 must be a 4xx or 5xx code  [rule a]
 
-== phase key removed
-parse: rule "w": `phase` was removed: rules no longer have phases; each rule runs when the values it reads are known (head rules at the request head; rules that read body.bytes, response.* or ws.* watch the rest of the exchange; see https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation). Delete the `phase` key
-
 == duplicate and reserved ids
 rules[1].id: duplicate rule id "a" (first defined at rules[0])  [rule a]
 rules[2].id: rule id "_default": ids starting with `_` are reserved (`_default`, `_fail_closed`)  [rule _default]

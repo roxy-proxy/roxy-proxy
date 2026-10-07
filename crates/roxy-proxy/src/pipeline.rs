@@ -22,7 +22,7 @@
 use std::fmt::{self, Write as _};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime};
 
 use aws_sigv4::http_request::SignableBody;
@@ -48,6 +48,7 @@ use crate::flowlog::{
 };
 use crate::io::ClientIo;
 use crate::listener::ClientConn;
+use crate::secrets::Secrets;
 use crate::server::{Shared, Snapshot};
 use crate::sign;
 use crate::sources::{MetricSourceError, Sample};
@@ -72,6 +73,10 @@ pub(crate) const SIGN_RULE: &str = "_sign";
 /// Flow-log `reason` of a `_sign` refusal: the body is over
 /// `limits.max_sign_body_bytes`.
 pub(crate) const SIGN_BODY_TOO_LARGE: &str = "sign_body_too_large";
+
+/// Flow-log `reason` of a `_sign` refusal: a request header holds a value
+/// the signature cannot cover.
+pub(crate) const SIGN_HEADER_INVALID: &str = "sign_header_invalid";
 
 /// Whether a local answer is a policy decision or a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +176,20 @@ impl Refusal {
             reason: Some(SIGN_BODY_TOO_LARGE.to_owned()),
             ..Self::deny(
                 StatusCode::PAYLOAD_TOO_LARGE,
+                DEFAULT_DENY_MESSAGE,
+                RuleId::new(SIGN_RULE),
+                true,
+            )
+        }
+    }
+
+    /// 400 `_sign`: a request header cannot be signed, so the request is
+    /// not forwarded. The connection closes: its body may be unread.
+    pub(crate) fn sign_header_invalid() -> Self {
+        Self {
+            reason: Some(SIGN_HEADER_INVALID.to_owned()),
+            ..Self::deny(
+                StatusCode::BAD_REQUEST,
                 DEFAULT_DENY_MESSAGE,
                 RuleId::new(SIGN_RULE),
                 true,
@@ -353,11 +372,19 @@ pub(crate) struct FlowMeta {
     pub flow: Ulid,
     pub client: ClientConn,
     pub tls: Option<TlsInfo>,
+    /// The secret generation this exchange resolves from and redacts
+    /// with: loaded on first use (the head evaluation) and kept for the
+    /// exchange's life, however many swaps happen meanwhile.
+    secrets: OnceLock<Arc<Secrets>>,
 }
 
 impl FlowMeta {
     pub(crate) fn conn_id(&self) -> String {
         self.client.id.to_string()
+    }
+
+    pub(crate) fn secrets(&self) -> &Arc<Secrets> {
+        self.secrets.get_or_init(|| self.snap.secrets.load())
     }
 
     pub(crate) fn input_unavailable(
@@ -385,7 +412,7 @@ impl FlowMeta {
             stage,
             reason: format!(
                 "{code}: {}",
-                self.snap.secrets.redactor().redact_str(&reason.to_string())
+                self.secrets().redactor().redact_str(&reason.to_string())
             ),
         });
     }
@@ -413,12 +440,7 @@ impl FlowMeta {
     }
 
     pub(crate) fn rule_log(&self, stage: Stage, level: LogLevel, message: &str) {
-        let message = self
-            .snap
-            .secrets
-            .redactor()
-            .redact_str(message)
-            .into_owned();
+        let message = self.secrets().redactor().redact_str(message).into_owned();
         match level {
             LogLevel::Trace => tracing::trace!(flow = %self.flow, %message, "rule log"),
             LogLevel::Debug => tracing::debug!(flow = %self.flow, %message, "rule log"),
@@ -560,6 +582,7 @@ impl FlowCx {
                 flow: Ulid::generate(),
                 client,
                 tls,
+                secrets: OnceLock::new(),
             }),
             facts,
             opts: AllowOpts::default(),
@@ -615,7 +638,8 @@ impl FlowCx {
     fn evaluate_head(&mut self) -> (Outcome, Option<Refusal>) {
         let snap = self.snap.clone();
         let shared = self.shared.clone();
-        let secrets = |name: &str| snap.secrets.get(name);
+        let generation = self.meta.secrets().clone();
+        let secrets = |name: &str| generation.get(name);
         let tags = self.record.tags.clone();
         let ctx = EvalContext {
             secrets: &secrets,
@@ -686,7 +710,7 @@ impl FlowCx {
             self.record.request_bytes = t.bytes();
             self.record.request_sha256 = t.sha256_hex();
         }
-        let redactor = self.snap.secrets.redactor();
+        let redactor = self.meta.secrets().redactor();
         let r = self.facts.client_request.as_ref();
         let req = RequestInfo {
             method: r.map(|r| r.method.as_str().to_owned()).unwrap_or_default(),
@@ -1023,6 +1047,10 @@ async fn sign_request(cx: &mut FlowCx, mut req: CanonicalRequest, io: &mut dyn B
         SignableBody::UnsignedPayload
     } else if known_empty(&req.body) {
         SignableBody::Bytes(&[])
+    } else if let Some(b) = req.body.as_bytes() {
+        // Already buffered (inspected for the rules); its lease is held.
+        buffered = b.clone();
+        SignableBody::Bytes(&buffered)
     } else {
         let cap = cx.snap.limits.max_sign_body_bytes;
         let Some(mut lease) = reserve_inspection(cx, &req.body, cap) else {
@@ -1045,8 +1073,13 @@ async fn sign_request(cx: &mut FlowCx, mut req: CanonicalRequest, io: &mut dyn B
         .host_override
         .clone()
         .unwrap_or_else(|| req.authority.to_host_header(req.scheme));
-    if let Err(e) = sign::sign_request(&mut req, &host, body, &spec, SystemTime::now()) {
-        return Verdict::Deny(invalid("sign", &e));
+    match sign::sign_request(&mut req, &host, body, &spec, SystemTime::now()) {
+        Ok(()) => {}
+        Err(e @ sign::SignError::UnsignableHeader(_)) => {
+            tracing::info!(flow = %cx.flow, error = %e, "request cannot be signed; denying");
+            return Verdict::Deny(Refusal::sign_header_invalid());
+        }
+        Err(e) => return Verdict::Deny(invalid("sign", &e)),
     }
     cx.record.mutations.push("sign:aws_sigv4".to_owned());
     settle_request_facts(cx, &req);
@@ -1189,8 +1222,9 @@ fn apply_request_effect(
             cx.capture.response |= matches!(target, CaptureTarget::Response | CaptureTarget::Both);
         }
         Effect::Sign(spec) => {
-            // Two signatures cannot both hold; the pipeline signs once the
-            // other changes have settled.
+            // Two rules signing one request is a policy mistake (which
+            // identity did the author mean?), so it is an error rather
+            // than last-wins.
             if cx.sign.replace(spec).is_some() {
                 return Err(Refusal::fail_closed("sign_conflict"));
             }

@@ -51,7 +51,7 @@ fn signed_headers(authorization: &str) -> &str {
 
 #[tokio::test]
 async fn sign_replaces_the_client_credentials_and_leaves_framing_fields_unsigned() {
-    let kit = signing("bedrock", "").start().await;
+    let kit = signing("bedrock", "").capture_all().start().await;
     let a = kit
         .h1()
         .await
@@ -94,11 +94,50 @@ async fn sign_replaces_the_client_credentials_and_leaves_framing_fields_unsigned
     assert_eq!(ev["decision"], "allow", "{ev:#}");
     let muts = ev["mutations"].as_array().unwrap();
     assert!(muts.contains(&"sign:aws_sigv4".into()), "{ev:#}");
-    let all = serde_json::to_string(&kit.sink.events()).unwrap();
+    // The capture head records the signed request's headers: the key id
+    // and the session token in them are redacted.
+    let flow = ev["flow"].as_str().unwrap();
+    let records = kit.captured();
+    let (_, head) = records
+        .iter()
+        .find(|(h, _)| h["flow"] == flow && h["dir"] == "request" && h["kind"] == "head")
+        .unwrap();
+    let head: serde_json::Value = serde_json::from_slice(head).unwrap();
+    let headers: HashMap<&str, &str> = head["headers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p[0].as_str().unwrap(), p[1].as_str().unwrap()))
+        .collect();
     assert!(
-        !all.contains(SK) && !all.contains(TOKEN),
-        "secret leaked into the flow log"
+        headers["authorization"].starts_with("AWS4-HMAC-SHA256 Credential=[REDACTED]/"),
+        "{head:#}"
     );
+    assert_eq!(headers["x-amz-security-token"], "[REDACTED]", "{head:#}");
+}
+
+/// A header value with obs-text cannot go into the canonical request. The
+/// request is refused rather than forwarded with that header unsigned.
+#[tokio::test]
+async fn an_obs_text_header_is_refused_not_left_unsigned() {
+    let kit = signing("bedrock", "")
+        .flags(|f| f.allow_obs_text = true)
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let req = c
+        .request("POST", "/model/invoke", &[])
+        .header("x-note", http::HeaderValue::from_bytes(b"caf\xe9").unwrap())
+        .body(roxy_http::Body::from_bytes(Bytes::from_static(b"{}")))
+        .unwrap();
+    let a = Answer::read(c.send(req).await.unwrap()).await;
+    assert_eq!(a.status, 400, "{a:?}");
+    assert_eq!(a.headers["x-roxy-rule"], "_sign");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "deny", "{ev:#}");
+    assert_eq!(ev["reason"], "sign_header_invalid", "{ev:#}");
+    assert_eq!(ev["terminal_rule"], "_sign", "{ev:#}");
+    assert!(kit.upstream.seen().is_empty());
 }
 
 /// S3 gets the payload hash as `x-amz-content-sha256`; with
