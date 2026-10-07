@@ -52,7 +52,8 @@ diagnostics, and nothing is partially applied: not the policy, not the
 metric store, and not the compiled addons the next reload reuses. A
 shutdown signal during a reload abandons it and drains the running policy.
 
-Metric series whose definition is unchanged survive a reload. When the new
+Metric series survive a reload when their metric is
+[unchanged](/reference/rate-limits#metrics). When the new
 config keeps every running metric, the rebuilt store goes in before the
 policy swap, so no flow on either side meets a metric its store does not
 know. When a metric is removed or reshaped, the store follows the swap, and

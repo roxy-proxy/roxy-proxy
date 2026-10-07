@@ -2,9 +2,10 @@
 //! [`MetricSource`] / [`StateSource`] traits.
 //!
 //! The metric store is built from the compiled policy's metric definitions,
-//! so it is rebuilt on every successful reload. Series whose definition is
-//! unchanged are carried over ([`MetricStore::carry_over`]) so an unrelated
-//! config edit never resets a rate limit.
+//! so it is rebuilt on every successful reload. Series whose metric has the
+//! same [`roxy_rules::MetricFingerprint`] are carried over
+//! ([`MetricStore::carry_over`]) so an unrelated config edit never resets a
+//! rate limit.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -25,16 +26,6 @@ pub struct ReloadableMetrics {
     defs: Mutex<Vec<MetricDef>>,
 }
 
-/// Whether two definitions keep each other's series: the same shape, so
-/// a value recorded under one reads the same under the other.
-fn same_shape(a: &MetricDef, b: &MetricDef) -> bool {
-    a.id == b.id
-        && a.count == b.count
-        && a.unique == b.unique
-        && a.key == b.key
-        && a.window == b.window
-}
-
 impl ReloadableMetrics {
     /// A store for `policy`'s metric definitions, bounded by `limits`
     /// (`limits.max_metric_keys` and `limits.max_metric_bytes`).
@@ -47,12 +38,17 @@ impl ReloadableMetrics {
 
     /// Whether a store built for `policy` also serves the policy the live
     /// store was built for: every metric it defines is in `policy` with the
-    /// same shape. Then the new store can go in before the policy swap, and
-    /// no flow on either side meets a metric its store does not know.
+    /// same [`roxy_rules::MetricFingerprint`]. Then the new store can go in before the
+    /// policy swap, and no flow on either side meets a metric its store
+    /// does not know.
     pub fn keeps_every_metric(&self, policy: &Policy) -> bool {
         let defs = self.defs.lock().unwrap_or_else(PoisonError::into_inner);
-        defs.iter()
-            .all(|old| policy.metric_defs().iter().any(|new| same_shape(old, new)))
+        defs.iter().all(|old| {
+            policy
+                .metric_defs()
+                .iter()
+                .any(|new| new.fingerprint() == old.fingerprint())
+        })
     }
 
     /// Builds the store for `policy`, copies over every series whose
@@ -255,11 +251,41 @@ mod tests {
         assert_eq!(m.inner.load().max_bytes(), 2 << 20);
     }
 
-    /// Adding a metric, or leaving them alone, keeps every running one;
-    /// removing one or changing its shape does not. Only in the first case
-    /// may the new store go in ahead of the policy swap.
+    /// A reload that changes only a metric's `where` starts it empty: the
+    /// old series counted flows the new filter may exclude. The same edit
+    /// with the `where` left alone carries the series over.
     #[test]
-    fn keeps_every_metric_means_same_shape_for_every_running_metric() {
+    fn install_starts_a_metric_fresh_when_only_its_where_changes() {
+        const FILTERED: &str = "version: 1\nmetrics:\n  - { id: by_path, count: requests, \
+            key: [path], window: 1h, where: method == GET }\n";
+        const NARROWED: &str = "version: 1\nmetrics:\n  - { id: by_path, count: requests, \
+            key: [path], window: 1h, where: method == GET and host == \"a\" }\n";
+        let m = ReloadableMetrics::new(&policy_for(FILTERED), limits(1 << 20));
+        let view = MapView::new()
+            .with_str(Field::Method, "GET")
+            .with_str(Field::Host, "b")
+            .with_str(Field::Path, "/a");
+        let sample = Sample {
+            head: true,
+            ..Sample::default()
+        };
+        m.record(&view, &sample).unwrap();
+        m.record(&view, &sample).unwrap();
+
+        m.install(&policy_for(FILTERED), limits(1 << 20));
+        assert_eq!(m.get("by_path", &view), Ok(2));
+
+        assert!(!m.keeps_every_metric(&policy_for(NARROWED)));
+        m.install(&policy_for(NARROWED), limits(1 << 20));
+        assert_eq!(m.key_count(), 0);
+        assert_eq!(m.get("by_path", &view), Ok(0));
+    }
+
+    /// Adding a metric, or leaving them alone, keeps every running one;
+    /// removing one or changing its fingerprint does not. Only in the first
+    /// case may the new store go in ahead of the policy swap.
+    #[test]
+    fn keeps_every_metric_means_same_fingerprint_for_every_running_metric() {
         let m = ReloadableMetrics::new(&policy(), limits(1 << 20));
         assert!(m.keeps_every_metric(&policy()));
         assert!(m.keeps_every_metric(&policy_for(
@@ -271,6 +297,8 @@ mod tests {
             "version: 1\nmetrics: [{ id: by_path, count: requests, key: [path], window: 2h }]\n",
             "version: 1\nmetrics: [{ id: by_path, count: requests, key: [host], window: 1h }]\n",
             "version: 1\nmetrics: [{ id: by_path, count: errors, key: [path], window: 1h }]\n",
+            "version: 1\nmetrics: [{ id: by_path, count: requests, key: [path], window: 1h, \
+             where: method == GET }]\n",
         ] {
             assert!(!m.keeps_every_metric(&policy_for(changed)), "{changed}");
         }
