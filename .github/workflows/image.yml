@@ -90,9 +90,9 @@ jobs:
           test "$status" = healthy
           size=$(docker image inspect roxy:test --format '{{.Size}}')
           echo "image size: $size bytes"
-          # About a third of it is wasmtime + cranelift (the addon host).
-          # Measured: ~27 MB arm64, ~33 MB amd64. This catches regressions,
-          # not a target.
+          # A regression guard, not a target: the ceiling sits well above the
+          # amd64 image (the larger of the two, about a third of it wasmtime
+          # + cranelift) so only a dependency or build-config change trips it.
           test "$size" -lt 40000000
 
       - name: Scan (Trivy, HIGH/CRITICAL)
