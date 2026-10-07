@@ -19,6 +19,7 @@
 //! verdicts exhaustively with no wildcard arm, so a new variant cannot
 //! silently fall through to forwarding.
 
+use std::borrow::Cow;
 use std::fmt::{self, Write as _};
 use std::future::Future;
 use std::pin::Pin;
@@ -52,7 +53,9 @@ use crate::secrets::Secrets;
 use crate::server::{Shared, Snapshot};
 use crate::sign;
 use crate::sources::{MetricSourceError, Sample};
-use crate::view::{FlowFacts, Inspected, ProxyView, RequestFacts, ResponseFacts, host_text};
+use crate::view::{
+    FlowFacts, Inspected, ProxyView, RequestFacts, ResponseFacts, host_str, host_text,
+};
 use crate::watch::Watch;
 
 /// The boxed future of [`BodyIo::collect`].
@@ -100,12 +103,19 @@ pub(crate) enum Decider {
     Layer(String),
 }
 
+impl Decider {
+    /// The rendered form: the rule id, or `layer:<name>`.
+    pub(crate) fn name(&self) -> Cow<'_, str> {
+        match self {
+            Decider::Rule(id) => Cow::Borrowed(id.as_str()),
+            Decider::Layer(name) => Cow::Owned(format!("layer:{name}")),
+        }
+    }
+}
+
 impl fmt::Display for Decider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Decider::Rule(id) => write!(f, "{id}"),
-            Decider::Layer(name) => write!(f, "layer:{name}"),
-        }
+        f.write_str(&self.name())
     }
 }
 
@@ -734,51 +744,53 @@ impl FlowCx {
         }
         let redactor = self.meta.secrets().redactor();
         let r = self.facts.client_request.as_ref();
+        let record = &self.record;
         let req = RequestInfo {
-            method: r.map(|r| r.method.as_str().to_owned()).unwrap_or_default(),
-            host: r.map(|r| host_text(&r.host)).unwrap_or_default(),
-            port: r.map_or(0, |r| r.port),
-            path: r
-                .map(|r| redactor.redact_str(&r.path).into_owned())
+            method: r
+                .map(|r| Cow::Borrowed(r.method.as_str()))
                 .unwrap_or_default(),
+            host: r.map(|r| host_str(&r.host)).unwrap_or_default(),
+            port: r.map_or(0, |r| r.port),
+            path: r.map(|r| redactor.redact_str(&r.path)).unwrap_or_default(),
             query: r
                 .and_then(|r| r.query.as_ref())
-                .map(|q| redactor.redact_str(&redact_query(q)).into_owned()),
+                .map(|q| Cow::Owned(redactor.redact_str(&redact_query(q)).into_owned())),
             headers_bytes: r.map_or(0, |r| r.head_bytes as u64),
-            body_bytes: self.record.request_bytes,
-            body_sha256: self.record.request_sha256.clone(),
+            body_bytes: record.request_bytes,
+            body_sha256: record.request_sha256.as_deref().map(Cow::Borrowed),
             content_type: r
                 .and_then(|r| r.headers.get("content-type"))
-                .map(|v| redactor.redact_header("content-type", v).into_owned()),
+                .map(|v| redactor.redact_header("content-type", v)),
         };
-        let res = self.record.response_status.map(|status| ResponseInfo {
+        let res = record.response_status.map(|status| ResponseInfo {
             status,
-            headers_bytes: self.record.response_headers_bytes,
-            body_bytes: self.record.response_bytes,
-            body_sha256: self.record.response_sha256.clone(),
+            headers_bytes: record.response_headers_bytes,
+            body_bytes: record.response_bytes,
+            body_sha256: record.response_sha256.as_deref().map(Cow::Borrowed),
         });
+        let (mut flow_id, mut conn_id) = ([0; ulid::ULID_LEN], [0; ulid::ULID_LEN]);
         self.shared.sink.emit(&FlowEvent::Request {
             ts: chrono::Utc::now(),
-            flow: self.flow.to_string(),
-            conn: self.conn_id(),
-            listener: self.meta.client.listener.name.clone(),
+            flow: Cow::Borrowed(self.flow.array_to_str(&mut flow_id)),
+            conn: Cow::Borrowed(self.meta.client.id.array_to_str(&mut conn_id)),
+            listener: Cow::Borrowed(&self.meta.client.listener.name),
             client: client_info(&self.meta.client),
-            tls: self.meta.tls.clone(),
+            tls: self.meta.tls.as_ref().map(Cow::Borrowed),
             req,
             res,
-            decision: self.record.decision.unwrap_or(DecisionKind::Deny),
-            rules: rule_names(&self.record.rules),
-            tags: self.record.tags.clone(),
-            mutations: self.record.mutations.clone(),
-            addons: self.record.addons.clone(),
+            decision: record.decision.unwrap_or(DecisionKind::Deny),
+            rules: Cow::Borrowed(&record.rules),
+            tags: Cow::Borrowed(&record.tags),
+            mutations: Cow::Borrowed(&record.mutations),
+            addons: Cow::Borrowed(&record.addons),
             timing: Timing {
                 total_ms: ms(self.started.elapsed()),
                 upstream_connect_ms: None,
-                upstream_ttfb_ms: self.record.ttfb_ms,
+                upstream_ttfb_ms: record.ttfb_ms,
             },
-            terminal_rule: self.record.terminal_rule.as_ref().map(ToString::to_string),
-            reason: self.record.reason.clone(),
-            stage: self.record.stage,
+            terminal_rule: record.terminal_rule.as_ref().map(Decider::name),
+            reason: record.reason.as_deref().map(Cow::Borrowed),
+            stage: record.stage,
         });
     }
 

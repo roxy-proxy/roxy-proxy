@@ -65,7 +65,7 @@ impl GatedSink {
 }
 
 impl FlowSink for GatedSink {
-    fn emit(&self, event: &FlowEvent) {
+    fn emit(&self, event: &FlowEvent<'_>) {
         self.inner.emit(event);
     }
 

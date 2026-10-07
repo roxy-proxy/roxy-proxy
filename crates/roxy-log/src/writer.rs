@@ -144,18 +144,42 @@ impl LogWriter {
         if bytes.is_empty() {
             return;
         }
+        let Ok(()) = self.append_with(|buf| {
+            buf.extend_from_slice(bytes);
+            Ok::<(), std::convert::Infallible>(())
+        });
+    }
+
+    /// [`LogWriter::append`] for a record produced straight into the
+    /// buffer: `fill` appends it to `buf` and must not touch what is
+    /// already there. It runs under the writer's lock, so it should only
+    /// serialise, not block. If it fails (or panics) nothing is queued.
+    pub fn append_with<E>(
+        &self,
+        fill: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
+    ) -> Result<(), E> {
         let mut st = lock(&self.core.state);
         let before = st.buf.len();
-        st.buf.extend_from_slice(bytes);
+        let mut record = Rollback {
+            buf: &mut st.buf,
+            start: before,
+            keep: false,
+        };
+        fill(record.buf)?;
+        record.keep = true;
+        drop(record);
         let after = st.buf.len();
-        self.core.pending.fetch_add(bytes.len(), Ordering::AcqRel);
+        self.core
+            .pending
+            .fetch_add(after - before, Ordering::AcqRel);
         drop(st);
         // The writer is woken by the first record of a batch and when the
         // batch gets large; between those it is already due to run.
         let batch = self.core.batch_bytes();
-        if before == 0 || (before < batch && after >= batch) {
+        if after > before && (before == 0 || (before < batch && after >= batch)) {
             self.core.work.notify_one();
         }
+        Ok(())
     }
 
     /// `Ready` while the writer keeps up (unwritten bytes below the high
@@ -225,6 +249,22 @@ impl Drop for LogWriter {
         self.core.work.notify_one();
         if let Some(t) = lock(&self.thread).take() {
             let _ = t.join();
+        }
+    }
+}
+
+/// Truncates a half-written record unless `keep` is set, so a failed or
+/// panicking producer never leaves part of one in the buffer.
+struct Rollback<'a> {
+    buf: &'a mut Vec<u8>,
+    start: usize,
+    keep: bool,
+}
+
+impl Drop for Rollback<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            self.buf.truncate(self.start);
         }
     }
 }

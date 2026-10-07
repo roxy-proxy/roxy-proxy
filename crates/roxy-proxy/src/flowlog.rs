@@ -19,8 +19,10 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 
 use roxy_log::{LogWriter, RotateOptions, RotatingFile, Stream, WriterOptions};
+use roxy_rules::RuleId;
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
 
 /// Replacement text for redacted values.
@@ -41,12 +43,16 @@ pub const DEFAULT_REDACTED_HEADERS: &[&str] = &[
 // ---------------------------------------------------------------------------
 
 /// One flow-log record. Serialised as `{"ts":..., "event":"<variant>", ...}`.
+///
+/// `Request` is emitted once per exchange and borrows its strings from the
+/// flow, so building it allocates nothing; the other variants are rare and
+/// own theirs.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 // Events are built and emitted immediately, never stored in bulk, so the
 // size of the `Request` variant does not matter.
 #[allow(clippy::large_enum_variant)]
-pub enum FlowEvent {
+pub enum FlowEvent<'a> {
     /// The configuration was loaded at startup.
     ConfigLoaded {
         #[serde(serialize_with = "ser_ts")]
@@ -90,27 +96,28 @@ pub enum FlowEvent {
     Request {
         #[serde(serialize_with = "ser_ts")]
         ts: DateTime<Utc>,
-        flow: String,
-        conn: String,
-        listener: String,
+        flow: Cow<'a, str>,
+        conn: Cow<'a, str>,
+        listener: Cow<'a, str>,
         client: ClientInfo,
-        tls: Option<TlsInfo>,
-        req: RequestInfo,
-        res: Option<ResponseInfo>,
+        tls: Option<Cow<'a, TlsInfo>>,
+        req: RequestInfo<'a>,
+        res: Option<ResponseInfo<'a>>,
         decision: DecisionKind,
-        rules: Vec<String>,
-        tags: Vec<String>,
-        mutations: Vec<String>,
-        addons: Vec<String>,
+        #[serde(serialize_with = "ser_rule_ids")]
+        rules: Cow<'a, [RuleId]>,
+        tags: Cow<'a, [String]>,
+        mutations: Cow<'a, [String]>,
+        addons: Cow<'a, [String]>,
         timing: Timing,
         /// The rule that decided (`_default`, `_fail_closed`,
         /// `_address_policy`, … for built-in decisions).
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        terminal_rule: Option<String>,
+        terminal_rule: Option<Cow<'a, str>>,
         /// Stable reason code for a deny or failure (`body_too_large_to_inspect`,
         /// `effect_invalid`, `timeout`, …).
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
+        reason: Option<Cow<'a, str>>,
         /// Where the terminal decision was made: `head` for the forwarding
         /// decision, or the stage at which a watching rule stopped the
         /// exchange. Absent when no decision was reached.
@@ -341,31 +348,31 @@ pub struct TlsInfo {
 
 /// Request summary (never the body).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RequestInfo {
-    pub method: String,
-    pub host: String,
+pub struct RequestInfo<'a> {
+    pub method: Cow<'a, str>,
+    pub host: Cow<'a, str>,
     pub port: u16,
-    pub path: String,
-    pub query: Option<String>,
+    pub path: Cow<'a, str>,
+    pub query: Option<Cow<'a, str>>,
     pub headers_bytes: u64,
     pub body_bytes: u64,
     /// Lower-case hex SHA-256 of the body as forwarded; absent when the
     /// exchange ended before the body did.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub body_sha256: Option<String>,
-    pub content_type: Option<String>,
+    pub body_sha256: Option<Cow<'a, str>>,
+    pub content_type: Option<Cow<'a, str>>,
 }
 
 /// Response summary (never the body).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ResponseInfo {
+pub struct ResponseInfo<'a> {
     pub status: u16,
     pub headers_bytes: u64,
     pub body_bytes: u64,
     /// Lower-case hex SHA-256 of the body as sent; absent when the
     /// exchange ended before the body did.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub body_sha256: Option<String>,
+    pub body_sha256: Option<Cow<'a, str>>,
 }
 
 /// Timings in milliseconds; `None` where the stage did not happen.
@@ -417,12 +424,19 @@ pub enum DecisionKind {
     Answered,
 }
 
-impl FlowEvent {
+impl FlowEvent<'_> {
     /// Serialise to a single JSON line, including the trailing `\n`.
     pub fn to_json_line(&self) -> serde_json::Result<Vec<u8>> {
-        let mut buf = serde_json::to_vec(self)?;
-        buf.push(b'\n');
+        let mut buf = Vec::new();
+        self.write_json_line(&mut buf)?;
         Ok(buf)
+    }
+
+    /// Appends the JSON line, trailing `\n` included, to `buf`.
+    pub fn write_json_line(&self, buf: &mut Vec<u8>) -> serde_json::Result<()> {
+        serde_json::to_writer(&mut *buf, self)?;
+        buf.push(b'\n');
+        Ok(())
     }
 }
 
@@ -433,6 +447,15 @@ fn ser_ts<S: Serializer>(ts: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&ts.to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
+/// Rule ids as a list of their names.
+fn ser_rule_ids<S: Serializer>(rules: &[RuleId], s: S) -> Result<S::Ok, S::Error> {
+    let mut seq = s.serialize_seq(Some(rules.len()))?;
+    for r in rules {
+        seq.serialize_element(r.as_str())?;
+    }
+    seq.end()
+}
+
 // ---------------------------------------------------------------------------
 // Sinks
 // ---------------------------------------------------------------------------
@@ -441,7 +464,7 @@ fn ser_ts<S: Serializer>(ts: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
 /// I/O. A sink that writes somewhere slow buffers and exerts backpressure
 /// through [`FlowSink::poll_ready`] instead of dropping events.
 pub trait FlowSink: Send + Sync {
-    fn emit(&self, event: &FlowEvent);
+    fn emit(&self, event: &FlowEvent<'_>);
 
     /// `Pending` while the sink is behind (or failing); traffic producers
     /// wait on it before doing more work, so the backlog cannot grow
@@ -471,14 +494,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn encode(event: &FlowEvent) -> Option<Vec<u8>> {
-    match event.to_json_line() {
-        Ok(line) => Some(line),
-        Err(error) => {
-            tracing::warn!(%error, "flow log: failed to serialise event");
-            None
-        }
-    }
+fn serialise_failed(error: &serde_json::Error) {
+    tracing::warn!(%error, "flow log: failed to serialise event");
 }
 
 /// JSON lines through a [`LogWriter`]: one writer thread, batched writes,
@@ -512,9 +529,9 @@ impl BufferedSink {
 }
 
 impl FlowSink for BufferedSink {
-    fn emit(&self, event: &FlowEvent) {
-        if let Some(line) = encode(event) {
-            self.writer.append(&line);
+    fn emit(&self, event: &FlowEvent<'_>) {
+        if let Err(error) = self.writer.append_with(|buf| event.write_json_line(buf)) {
+            serialise_failed(&error);
         }
     }
 
@@ -546,7 +563,7 @@ impl StdoutSink {
 }
 
 impl FlowSink for StdoutSink {
-    fn emit(&self, event: &FlowEvent) {
+    fn emit(&self, event: &FlowEvent<'_>) {
         self.0.emit(event);
     }
 
@@ -588,7 +605,7 @@ impl FileSink {
 }
 
 impl FlowSink for FileSink {
-    fn emit(&self, event: &FlowEvent) {
+    fn emit(&self, event: &FlowEvent<'_>) {
         self.inner.emit(event);
     }
 
@@ -630,7 +647,7 @@ impl MultiSink {
 }
 
 impl FlowSink for MultiSink {
-    fn emit(&self, event: &FlowEvent) {
+    fn emit(&self, event: &FlowEvent<'_>) {
         for sink in &self.sinks {
             sink.emit(event);
         }
@@ -717,13 +734,13 @@ impl MemorySink {
 }
 
 impl FlowSink for MemorySink {
-    fn emit(&self, event: &FlowEvent) {
+    fn emit(&self, event: &FlowEvent<'_>) {
         match serde_json::to_value(event) {
             Ok(v) => {
                 lock(&self.events).push(v);
                 self.emitted.notify_waiters();
             }
-            Err(error) => tracing::warn!(%error, "flow log: failed to serialise event"),
+            Err(error) => serialise_failed(&error),
         }
     }
 }
@@ -856,8 +873,11 @@ mod tests {
     }
 
     impl<W: Write + Send> FlowSink for WriterSink<W> {
-        fn emit(&self, event: &FlowEvent) {
-            let Some(line) = encode(event) else { return };
+        fn emit(&self, event: &FlowEvent<'_>) {
+            let line = match event.to_json_line() {
+                Ok(line) => line,
+                Err(error) => return serialise_failed(&error),
+            };
             let mut w = lock(&self.writer);
             if let Err(error) = w.write_all(&line).and_then(|()| w.flush()) {
                 tracing::warn!(sink = self.name, %error, "flow log: write failed; event dropped");
@@ -872,7 +892,7 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    fn sample_request() -> FlowEvent {
+    fn sample_request() -> FlowEvent<'static> {
         FlowEvent::Request {
             ts: ts(),
             flow: "01J9FLOW".into(),
@@ -882,11 +902,11 @@ mod tests {
                 ip: "10.0.0.7".parse().unwrap(),
                 port: 51234,
             },
-            tls: Some(TlsInfo {
+            tls: Some(Cow::Owned(TlsInfo {
                 sni: Some("api.github.com".into()),
                 alpn: Some("h2".into()),
                 version: Some("1.3".into()),
-            }),
+            })),
             req: RequestInfo {
                 method: "POST".into(),
                 host: "api.github.com".into(),
@@ -907,10 +927,10 @@ mod tests {
                 body_sha256: None,
             }),
             decision: DecisionKind::Allow,
-            rules: vec!["openai-key".into(), "github-writes".into()],
-            tags: vec!["billing".into()],
-            mutations: vec!["set_header:authorization".into()],
-            addons: vec!["pii-scan".into()],
+            rules: vec![RuleId::new("openai-key"), RuleId::new("github-writes")].into(),
+            tags: vec!["billing".into()].into(),
+            mutations: vec!["set_header:authorization".into()].into(),
+            addons: vec!["pii-scan".into()].into(),
             timing: Timing {
                 total_ms: 412,
                 upstream_connect_ms: Some(38),
@@ -1014,7 +1034,7 @@ mod tests {
     fn multi_sink_fans_out() {
         struct Shared(Arc<MemorySink>);
         impl FlowSink for Shared {
-            fn emit(&self, event: &FlowEvent) {
+            fn emit(&self, event: &FlowEvent<'_>) {
                 self.0.emit(event);
             }
         }
@@ -1042,7 +1062,7 @@ mod tests {
             polls: Arc<AtomicUsize>,
         }
         impl FlowSink for Gated {
-            fn emit(&self, _: &FlowEvent) {}
+            fn emit(&self, _: &FlowEvent<'_>) {}
             fn poll_ready(&self, _: &mut Context<'_>) -> Poll<()> {
                 self.polls.fetch_add(1, Ordering::SeqCst);
                 if self.ready.load(Ordering::SeqCst) {

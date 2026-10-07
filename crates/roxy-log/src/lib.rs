@@ -3,8 +3,9 @@
 //! # Guarantees
 //!
 //! - **Appending never does I/O.** [`LogWriter::append`] copies bytes into a
-//!   shared buffer under a short lock and wakes the writer. Callers on any
-//!   core never touch the destination and never wait for the disk.
+//!   shared buffer under a short lock ([`LogWriter::append_with`] serialises
+//!   straight into it) and wakes the writer. Callers on any core never touch
+//!   the destination and never wait for the disk.
 //! - **One writer thread** owns each destination. Woken by the first record
 //!   of a batch, it waits [`WriterOptions::linger`] for more, then swaps the
 //!   whole buffer out and writes it in one go: a burst is one write, and
