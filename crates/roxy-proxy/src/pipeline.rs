@@ -379,6 +379,9 @@ pub(crate) struct FlowRecord {
     pub response_status: Option<u16>,
     pub response_headers_bytes: u64,
     pub ttfb_ms: Option<u64>,
+    /// How long opening the upstream connection took; `None` when a pooled
+    /// connection was reused (or nothing was dialled).
+    pub upstream_connect_ms: Option<u64>,
     /// Where the terminal decision was made.
     pub stage: Option<Stage>,
     /// The addons the exchange went through.
@@ -562,7 +565,7 @@ pub(crate) fn client_info(c: &ClientConn) -> ClientInfo {
     }
 }
 
-fn ms(d: std::time::Duration) -> u64 {
+pub(crate) fn ms(d: std::time::Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
@@ -773,7 +776,7 @@ impl FlowCx {
             addons: self.record.addons.clone(),
             timing: Timing {
                 total_ms: ms(self.started.elapsed()),
-                upstream_connect_ms: None,
+                upstream_connect_ms: self.record.upstream_connect_ms,
                 upstream_ttfb_ms: self.record.ttfb_ms,
             },
             terminal_rule: self.record.terminal_rule.as_ref().map(ToString::to_string),
