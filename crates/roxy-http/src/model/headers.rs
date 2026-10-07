@@ -584,12 +584,18 @@ mod tests {
         let freed = Arc::new(AtomicBool::new(false));
         let buf = Bytes::from_owner(Buffer(b"x-a: hello\r\n".to_vec(), freed.clone()));
         let mut m = HeaderMap::new();
-        m.insert("x-a", HeaderValue::from_maybe_shared(buf.slice(5..10)).unwrap());
+        m.insert(
+            "x-a",
+            HeaderValue::from_maybe_shared(buf.slice(5..10)).unwrap(),
+        );
         drop(buf);
         let h = Headers::from_header_map_lenient(&m);
         drop(m);
         assert_eq!(h.get("x-a"), Some("hello"));
-        assert!(freed.load(Ordering::Relaxed), "the source buffer is still referenced");
+        assert!(
+            freed.load(Ordering::Relaxed),
+            "the source buffer is still referenced"
+        );
     }
 
     #[test]
