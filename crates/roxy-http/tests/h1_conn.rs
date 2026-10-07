@@ -940,6 +940,24 @@ async fn head_is_not_held_back_by_a_pending_body() {
     assert_eq!(writes.load(Ordering::Relaxed), 2);
 }
 
+#[tokio::test]
+async fn a_body_failing_on_its_first_frame_still_delivers_the_head() {
+    let (mut client, mut c, _) = counting_conn().await;
+    let (tx, body) = Body::channel(1 << 20, None);
+    tx.abort(BodyError::Incomplete);
+    let r = c.respond(ok(body)).await;
+    assert!(
+        matches!(r, Err(WriteError::Body(BodyError::Incomplete))),
+        "{r:?}"
+    );
+    drop(c);
+    let mut seen = Vec::new();
+    client.read_to_end(&mut seen).await.unwrap();
+    let seen = String::from_utf8(seen).unwrap();
+    assert!(seen.starts_with("HTTP/1.1 200 OK\r\n"), "{seen}");
+    assert!(seen.ends_with("\r\n\r\n"), "cut before any chunk: {seen}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn response_body_idle_timeout_is_per_frame() {
     let (mut client, mut c) = conn_with(Limits {

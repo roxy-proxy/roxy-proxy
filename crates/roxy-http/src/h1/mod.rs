@@ -501,20 +501,41 @@ fn poll_body_once(
 async fn write_message<W: AsyncWrite + Unpin>(
     w: &mut W,
     head: BytesMut,
-    mut body: Body,
+    body: Body,
     framing: OutFraming,
     (idle, body_idle): (Duration, Duration),
     client_closed: &AtomicBool,
 ) -> Result<(), WriteError> {
     write_timed(w, &[&head], idle).await?;
+    if matches!(framing, OutFraming::Empty | OutFraming::Head(_)) {
+        return flush_timed(w, idle).await;
+    }
+    match write_body(w, body, framing, (idle, body_idle), client_closed).await {
+        Ok(()) => flush_timed(w, idle).await,
+        // The head is committed once written: a body that fails still lets
+        // the client see it, and the data before the failure, as a cut body.
+        Err(e @ WriteError::Body(_)) => {
+            let _ = flush_timed(w, idle).await;
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn write_body<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    mut body: Body,
+    framing: OutFraming,
+    (idle, body_idle): (Duration, Duration),
+    client_closed: &AtomicBool,
+) -> Result<(), WriteError> {
     let mut sent: u64 = 0;
     let expected = match framing {
-        OutFraming::Empty | OutFraming::Head(_) => {
-            flush_timed(w, idle).await?;
-            return Ok(());
-        }
         OutFraming::Length(n) => Some(n),
-        OutFraming::Chunked | OutFraming::CloseDelimited => None,
+        OutFraming::Empty
+        | OutFraming::Head(_)
+        | OutFraming::Chunked
+        | OutFraming::CloseDelimited => None,
     };
     // One timer for the whole body, re-armed each time a frame is waited on.
     let mut stall = std::pin::pin!(tokio::time::sleep(body_idle));
@@ -572,7 +593,7 @@ async fn write_message<W: AsyncWrite + Unpin>(
     if framing == OutFraming::Chunked {
         write_timed(w, &[b"0\r\n\r\n"], idle).await?;
     }
-    flush_timed(w, idle).await
+    Ok(())
 }
 
 /// A strict HTTP/1.1 server connection over any byte stream.
