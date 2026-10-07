@@ -266,6 +266,9 @@ pub(crate) enum Collected {
     /// More than `cap` bytes. Nothing was lost: the original body was
     /// replaced by the bytes read so far chained with the unread rest.
     TooLarge,
+    /// The meter refused to cover the bytes read so far. Nothing was lost,
+    /// as for `TooLarge`.
+    BudgetExhausted,
     /// The body failed (client went away, framing error, cap). The body is
     /// now an error body; the flow must not be forwarded.
     Failed(BodyError),
@@ -275,6 +278,17 @@ pub(crate) enum Collected {
 /// `*body` with a stream that yields exactly the same bytes downstream.
 /// Never pre-allocates from a declared length.
 pub(crate) async fn collect_prefix(body: &mut Body, cap: u64) -> Collected {
+    collect_prefix_metered(body, cap, &mut |_| true).await
+}
+
+/// [`collect_prefix`] with `meter` asked, after each data frame, whether
+/// the bytes held so far may be kept; `false` stops with
+/// [`Collected::BudgetExhausted`].
+pub(crate) async fn collect_prefix_metered(
+    body: &mut Body,
+    cap: u64,
+    meter: &mut (dyn FnMut(u64) -> bool + Send),
+) -> Collected {
     let declared = body.known_length();
     if declared.is_some_and(|n| n > cap) {
         // Known to be too large: do not touch the stream at all.
@@ -298,7 +312,15 @@ pub(crate) async fn collect_prefix(body: &mut Body, cap: u64) -> Collected {
                 // only accepts them with `http.allow_trailers`.
                 if let Ok(d) = f.into_data() {
                     buf.extend_from_slice(&d);
-                    if buf.len() as u64 > cap {
+                    let held = buf.len() as u64;
+                    let stop = if held > cap {
+                        Some(Collected::TooLarge)
+                    } else if !meter(held) {
+                        Some(Collected::BudgetExhausted)
+                    } else {
+                        None
+                    };
+                    if let Some(stop) = stop {
                         let rest = std::mem::take(body);
                         *body = Body::wrap_native(
                             Chain {
@@ -308,7 +330,7 @@ pub(crate) async fn collect_prefix(body: &mut Body, cap: u64) -> Collected {
                             u64::MAX,
                             declared,
                         );
-                        return Collected::TooLarge;
+                        return stop;
                     }
                 }
             }

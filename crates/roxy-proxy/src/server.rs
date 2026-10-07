@@ -210,6 +210,13 @@ impl Shared {
         self.buffers.reserve(cap, bytes)
     }
 
+    /// Grows `lease` to `bytes` within the budget; `false` leaves it as it
+    /// was.
+    pub(crate) fn grow_buffer(&self, lease: &mut BufferLease, bytes: u64) -> bool {
+        let cap = self.snapshot().limits.max_buffered_bytes;
+        lease.grow_to(cap, bytes)
+    }
+
     /// Bytes of the buffer budget reserved right now.
     #[cfg(test)]
     pub(crate) fn buffered(&self) -> u64 {

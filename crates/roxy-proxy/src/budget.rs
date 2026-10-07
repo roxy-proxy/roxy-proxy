@@ -7,9 +7,12 @@
 //! exchanges. Inspection and reassembly reserve their cap in full before
 //! they fill the buffer and hold it until the exchange ends: they fail
 //! closed when they cannot reserve, so they must not find out part-way.
-//! An observer's copy is charged frame by frame for what it has queued,
-//! since a copy that cannot grow is simply cut. Nothing is evicted and
-//! nobody waits: a reservation the budget cannot cover fails at once.
+//! A chunked body buffered for signing grows its reservation as it is
+//! read, since its size is unknown and the cap is large; it fails closed
+//! at the frame the budget cannot cover. An observer's copy is charged
+//! frame by frame for what it has queued, since a copy that cannot grow is
+//! simply cut. Nothing is evicted and nobody waits: a reservation the
+//! budget cannot cover fails at once.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,19 +36,24 @@ pub(crate) struct BufferLease {
 impl BufferBudget {
     /// Reserves `bytes` if that keeps the total within `cap`.
     pub(crate) fn reserve(self: &Arc<Self>, cap: u64, bytes: u64) -> Option<BufferLease> {
+        self.add(cap, bytes).then(|| BufferLease {
+            budget: self.clone(),
+            bytes,
+        })
+    }
+
+    /// Adds `bytes` to the total if that keeps it within `cap`.
+    fn add(&self, cap: u64, bytes: u64) -> bool {
         let mut used = self.used.load(Ordering::Relaxed);
         loop {
-            let after = used.checked_add(bytes).filter(|n| *n <= cap)?;
+            let Some(after) = used.checked_add(bytes).filter(|n| *n <= cap) else {
+                return false;
+            };
             match self
                 .used
                 .compare_exchange_weak(used, after, Ordering::AcqRel, Ordering::Relaxed)
             {
-                Ok(_) => {
-                    return Some(BufferLease {
-                        budget: self.clone(),
-                        bytes,
-                    });
-                }
+                Ok(_) => return true,
                 Err(now) => used = now,
             }
         }
@@ -59,9 +67,23 @@ impl BufferBudget {
 }
 
 impl BufferLease {
+    /// Grows the reservation to `bytes` if that keeps the total within
+    /// `cap`; a `bytes` no larger than the reservation is a no-op. On
+    /// `false` the lease is as it was.
+    pub(crate) fn grow_to(&mut self, cap: u64, bytes: u64) -> bool {
+        let Some(extra) = bytes.checked_sub(self.bytes).filter(|n| *n > 0) else {
+            return true;
+        };
+        if self.budget.add(cap, extra) {
+            self.bytes = bytes;
+            return true;
+        }
+        false
+    }
+
     /// Gives back all but `bytes` of the reservation, once what the lease
     /// covers is known to be no larger than that. A larger `bytes` is a
-    /// no-op: a lease never grows.
+    /// no-op.
     pub(crate) fn shrink_to(&mut self, bytes: u64) {
         if bytes < self.bytes {
             self.budget
@@ -81,6 +103,22 @@ impl Drop for BufferLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lease_grows_within_the_cap_and_keeps_its_size_when_it_cannot() {
+        let b = Arc::new(BufferBudget::default());
+        let mut lease = b.reserve(10, 0).unwrap();
+        assert!(lease.grow_to(10, 4));
+        assert!(lease.grow_to(10, 2), "shrinking is a no-op");
+        assert_eq!(b.used(), 4);
+        let _other = b.reserve(10, 4).unwrap();
+        assert!(!lease.grow_to(10, 7));
+        assert_eq!(b.used(), 8);
+        assert!(lease.grow_to(10, 6));
+        assert_eq!(b.used(), 10);
+        drop(lease);
+        assert_eq!(b.used(), 4);
+    }
 
     #[test]
     fn reservations_fill_the_cap_and_free_it_on_drop() {

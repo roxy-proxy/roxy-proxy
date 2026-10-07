@@ -268,6 +268,66 @@ async fn a_body_over_max_sign_body_bytes_is_refused_with_413() {
     assert!(kit.upstream.seen().is_empty());
 }
 
+/// Waits until the buffer budget holds exactly `bytes`.
+async fn wait_buffered(kit: &Kit, bytes: u64) {
+    let shared = kit.server.shared();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while shared.buffered() != bytes {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("budget holds {} bytes, not {bytes}", shared.buffered()));
+}
+
+/// A chunked body being hashed holds only the bytes read so far, not the
+/// signing cap; one the budget cannot cover part-way fails closed.
+#[tokio::test]
+async fn a_chunked_signed_body_reserves_only_what_it_has_read() {
+    let kit = signing("bedrock", "")
+        .limits(|l| l.max_sign_body_bytes = 1 << 20)
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let (mut tx, body) = streaming_body();
+    let req = c.request("POST", "/chunked", &[]).body(body).unwrap();
+    let pending = c.start(req);
+    tx.ready().await.unwrap();
+    tx.try_push(Bytes::from(vec![b'a'; 512])).unwrap();
+    wait_buffered(&kit, 512).await;
+    tx.ready().await.unwrap();
+    tx.try_push(Bytes::from(vec![b'b'; 256])).unwrap();
+    wait_buffered(&kit, 768).await;
+    tx.finish().await.unwrap();
+    let a = pending.await.unwrap().unwrap();
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].body.len(), 768);
+    assert!(seen[0].headers.contains_key("authorization"));
+
+    let kit = signing("bedrock", "")
+        .limits(|l| {
+            l.max_sign_body_bytes = 1 << 20;
+            l.max_buffered_bytes = 1024;
+        })
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let (mut tx, body) = streaming_body();
+    let req = c.request("POST", "/chunked", &[]).body(body).unwrap();
+    let pending = c.start(req);
+    for _ in 0..4 {
+        tx.ready().await.unwrap();
+        tx.try_push(Bytes::from(vec![b'c'; 512])).unwrap();
+    }
+    let a = pending.await.unwrap().unwrap();
+    assert_eq!(a.status, 503, "{a:?}");
+    assert_eq!(a.headers["x-roxy-rule"], "_fail_closed");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["reason"], "buffer_budget_exhausted", "{ev:#}");
+    assert!(kit.upstream.seen().is_empty());
+}
+
 #[tokio::test]
 async fn a_missing_credential_secret_fails_closed() {
     let kit = signing("bedrock", "").start().await;

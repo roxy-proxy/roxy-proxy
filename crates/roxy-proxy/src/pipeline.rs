@@ -40,7 +40,7 @@ use roxy_rules::{
 };
 use ulid::Ulid;
 
-use crate::body::{Collected, collect_prefix};
+use crate::body::{Collected, collect_prefix, collect_prefix_metered};
 use crate::budget::{self, BufferLease};
 use crate::capture::Tap;
 use crate::flowlog::{
@@ -287,6 +287,15 @@ pub(crate) trait BodyIo: Send {
         body: &'a mut Body,
         cap: u64,
     ) -> CollectFuture<'a, Result<Collected, DriveError>>;
+
+    /// [`Self::collect`] with a meter asked after each frame whether the
+    /// bytes held so far may be kept ([`collect_prefix_metered`]).
+    fn collect_metered<'a>(
+        &'a mut self,
+        body: &'a mut Body,
+        cap: u64,
+        meter: &'a mut (dyn FnMut(u64) -> bool + Send),
+    ) -> CollectFuture<'a, Result<Collected, DriveError>>;
 }
 
 impl BodyIo for ServerConn<ClientIo> {
@@ -296,6 +305,15 @@ impl BodyIo for ServerConn<ClientIo> {
         cap: u64,
     ) -> CollectFuture<'a, Result<Collected, DriveError>> {
         Box::pin(self.drive(collect_prefix(body, cap)))
+    }
+
+    fn collect_metered<'a>(
+        &'a mut self,
+        body: &'a mut Body,
+        cap: u64,
+        meter: &'a mut (dyn FnMut(u64) -> bool + Send),
+    ) -> CollectFuture<'a, Result<Collected, DriveError>> {
+        Box::pin(self.drive(collect_prefix_metered(body, cap, meter)))
     }
 }
 
@@ -941,6 +959,9 @@ async fn inspect_request_body(
             inspected
         }
         Ok(Collected::TooLarge) => Inspected::TooLarge,
+        Ok(Collected::BudgetExhausted) => {
+            return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
+        }
     };
     cx.buffers.push(lease);
     if let Some(f) = cx.facts.request.as_mut() {
@@ -1060,14 +1081,23 @@ async fn sign_request(cx: &mut FlowCx, mut req: CanonicalRequest, io: &mut dyn B
         buffered = b.clone();
         SignableBody::Bytes(&buffered)
     } else {
+        // A declared length is reserved up front; a chunked body grows its
+        // reservation as it is read, since the cap is far above the usual
+        // body and reserving it whole would starve other exchanges.
         let cap = cx.snap.limits.max_sign_body_bytes;
-        let Some(mut lease) = reserve_inspection(cx, &req.body, cap) else {
+        let declared = req.body.known_length().map_or(0, |n| n.min(cap));
+        let Some(mut lease) = cx.shared.reserve_buffer(declared) else {
             return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
         };
-        buffered = match io.collect(&mut req.body, cap).await {
+        let shared = cx.shared.clone();
+        let mut meter = |held: u64| shared.grow_buffer(&mut lease, held);
+        buffered = match io.collect_metered(&mut req.body, cap, &mut meter).await {
             Err(e) => return Verdict::Close(e),
             Ok(Collected::Failed(e)) => return Verdict::Close(body_failure(&e).into()),
             Ok(Collected::TooLarge) => return Verdict::Deny(Refusal::sign_body_too_large()),
+            Ok(Collected::BudgetExhausted) => {
+                return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
+            }
             Ok(Collected::Complete(b)) => b,
         };
         lease.shrink_to(buffered.len() as u64);
@@ -1289,6 +1319,9 @@ async fn inspect_response_body(
             inspected
         }
         Ok(Collected::TooLarge) => Inspected::TooLarge,
+        Ok(Collected::BudgetExhausted) => {
+            return ResponseVerdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
+        }
     };
     cx.buffers.push(lease);
     if let Some(f) = cx.facts.response.as_mut() {
