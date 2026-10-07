@@ -75,13 +75,30 @@ canonical authority goes out as `host` over HTTP/1.1 and as `:authority`
 alone over HTTP/2, never both. WebSocket upgrades always use HTTP/1.1
 ([WebSockets](/reference/websockets)).
 
-Trailers (gRPC and other HTTP/2-only protocols) need `http.allow_trailers`
-and an origin that negotiates `h2`: HTTP/1.1 needs the names in a `Trailer`
-header before the body. Trailers to an HTTP/1.1 origin fail with reason
-`trailers` (`400` and close on HTTP/1.1, a stream reset on HTTP/2) before
-the origin sees the request complete, for as long as any HTTP/1.1
-connection to that origin is open or pooled (hyper keeps idle connections
-about 90 s), including one opened for a request held to HTTP/1.1.
+### Trailers
+
+Two settings, one per direction. `http.allow_response_trailers` (default
+true) forwards an origin's response trailers to the client, as HTTP/2
+trailers or as the trailer section of a chunked HTTP/1.1 response (a
+response with a declared length cannot carry them). gRPC, which puts the
+call's outcome in `grpc-status`, works by default.
+`http.allow_request_trailers` (default false) accepts trailers on requests,
+HTTP/2 trailers or a chunked trailer section; without it a request that
+carries them is refused with reason `trailers`. Request trailers arrive
+after the rules have decided, so they stay opt-in. In either direction a
+trailer section may not carry framing, routing, authentication or
+`content-*` fields (`authorization`, `cookie`, `set-cookie`, `range`,
+`max-forwards`, `cache-control`, every hop-by-hop name): on a request that
+is a rejection, on a response the body is cut before the client sees it
+complete.
+
+Request trailers reach an origin only over `h2`: HTTP/1.1 needs the names
+in a `Trailer` header before the body. Trailers to an HTTP/1.1 origin fail
+with reason `trailers` (`400` and close on HTTP/1.1, a stream reset on
+HTTP/2) before the origin sees the request complete, for as long as any
+HTTP/1.1 connection to that origin is open or pooled (hyper keeps idle
+connections about 90 s), including one opened for a request held to
+HTTP/1.1.
 
 ## Canonical request
 
@@ -150,8 +167,9 @@ A violation closes the connection, not just the request, and emits a
 ### Body
 
 - Chunk sizes are hex, at most 16 digits. Chunk extensions need
-  `http.allow_chunk_extensions`; trailers need `http.allow_trailers` and an
-  `h2` origin ([above](/reference/http#http2)). The final CRLF is enforced.
+  `http.allow_chunk_extensions`; trailers need `http.allow_request_trailers`
+  and an `h2` origin ([trailers](/reference/http#trailers)). The final CRLF
+  is enforced.
 - At most `limits.max_request_body_bytes` (1 GiB), enforced while
   streaming: exceeding it closes the connection mid-stream.
 - The head must arrive within `limits.header_timeout` (10 s) of its first
@@ -229,8 +247,10 @@ the response and roxy builds a `CanonicalResponse`:
   `WWW-Authenticate` stay separate fields.
 - Hop-by-hop fields are stripped and the framing regenerated:
   `content-length` when known, otherwise clean chunked (HTTP/1.1) or DATA
-  frames (HTTP/2). Responses to HEAD, and `1xx`, `204` and `304`, carry no
-  body. Empty non-final DATA frames are never sent upstream.
+  frames (HTTP/2), with the origin's trailers after the body
+  ([trailers](/reference/http#trailers)). Responses to HEAD, and `1xx`,
+  `204` and `304`, carry no body. Empty non-final DATA frames are never
+  sent upstream.
 - `limits.max_response_body_bytes` (1 GiB) caps the body.
   `limits.response_header_timeout` (15 m) starts once the request body has
   been sent; while it is still being sent, the exchange fails (`504`) only

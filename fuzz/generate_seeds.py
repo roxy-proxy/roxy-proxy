@@ -61,7 +61,7 @@ def unescape(s: str) -> bytes:
 
 FLAG_BITS = {
     "allow_http10": 1,
-    "allow_trailers": 2,
+    "allow_request_trailers": 2,
     "allow_chunk_extensions": 4,
     "allow_obs_text": 8,
     "allow_body_on_get": 16,

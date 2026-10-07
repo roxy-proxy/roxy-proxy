@@ -309,7 +309,7 @@ pub(crate) async fn collect_prefix_metered(
             }
             Some(Ok(f)) => {
                 // Trailers are dropped, as `Body::collect_up_to` does; roxy
-                // only accepts them with `http.allow_trailers`.
+                // only accepts them with `http.allow_request_trailers`.
                 if let Ok(d) = f.into_data() {
                     buf.extend_from_slice(&d);
                     let held = buf.len() as u64;

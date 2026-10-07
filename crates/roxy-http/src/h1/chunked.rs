@@ -130,7 +130,7 @@ impl ChunkedDecoder {
                     [b'\n', ..] => return reject(Reason::BareLf, "bare LF ending chunked body"),
                     [b'\r', _, ..] => return reject(Reason::BareCr, "bare CR ending chunked body"),
                     _ => {
-                        if !self.flags.allow_trailers {
+                        if !self.flags.allow_request_trailers {
                             return reject(Reason::Trailers, "trailer section present");
                         }
                         let Some(map) = self.trailers(buf)? else {
@@ -336,7 +336,7 @@ mod tests {
     fn allowed_extensions_and_trailers() {
         let f = HttpFlags {
             allow_chunk_extensions: true,
-            allow_trailers: true,
+            allow_request_trailers: true,
             ..HttpFlags::default()
         };
         let (body, t, _) = run(b"5;a=b\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n", &f).unwrap();
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn trailer_section_limits() {
         let f = HttpFlags {
-            allow_trailers: true,
+            allow_request_trailers: true,
             ..HttpFlags::default()
         };
         let small = Limits {

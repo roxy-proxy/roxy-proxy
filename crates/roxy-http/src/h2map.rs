@@ -15,7 +15,7 @@ use http::{HeaderValue, Version as HttpVersion};
 use crate::chars::trim_ows;
 use crate::model::{
     Authority, Body, CanonicalRequest, CanonicalResponse, Headers, HttpFlags, Limits, Method,
-    ParseError, Reason, RequestMeta, Scheme, TargetForm, Version, is_forbidden_trailer,
+    ParseError, Reason, RequestMeta, Scheme, TargetForm, Version, check_trailer_fields,
     parse_content_length, plan_body, reject, status_forbids_body,
 };
 use crate::url;
@@ -200,27 +200,19 @@ pub fn from_h2_parts(
 }
 
 /// Validates an h2 request trailer section. Any trailer section is a
-/// rejection unless `http.allow_trailers`; with it, the same field rules as
-/// the h1 chunked decoder apply: framing, routing, authentication and
-/// content metadata are refused, and values go through the header
+/// rejection unless `http.allow_request_trailers`; with it, the same field
+/// rules as the h1 chunked decoder apply: framing, routing, authentication
+/// and content metadata are refused, and values go through the header
 /// validator.
 pub fn validate_h2_trailers(
     trailers: &http::HeaderMap,
     limits: &Limits,
     flags: &HttpFlags,
 ) -> Result<http::HeaderMap, ParseError> {
-    if !flags.allow_trailers {
+    if !flags.allow_request_trailers {
         return reject(Reason::Trailers, "trailer section present");
     }
-    if trailers.len() > limits.max_headers {
-        return reject(Reason::TooManyHeaders, "too many trailer fields");
-    }
-    for name in trailers.keys() {
-        let n = name.as_str();
-        if is_forbidden_trailer(n) {
-            return reject(Reason::Trailers, format!("{n} not allowed in trailers"));
-        }
-    }
+    check_trailer_fields(trailers, limits)?;
     let raw: Vec<(&[u8], &[u8])> = trailers
         .iter()
         .map(|(n, v)| (n.as_str().as_bytes(), v.as_bytes()))
@@ -605,7 +597,7 @@ mod tests {
     #[test]
     fn trailers_validated() {
         let flags = HttpFlags {
-            allow_trailers: true,
+            allow_request_trailers: true,
             ..HttpFlags::default()
         };
         let mut t = http::HeaderMap::new();

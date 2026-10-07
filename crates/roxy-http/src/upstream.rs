@@ -11,7 +11,7 @@
 //!   hyper sends clean `chunked` with no extensions;
 //! - never both.
 //!
-//! Request trailers (`http.allow_trailers`) reach the upstream only over
+//! Request trailers (`http.allow_request_trailers`) reach the upstream only over
 //! HTTP/2. hyper's HTTP/1.1 encoder writes trailers only for the names a
 //! `trailer` header announces, and roxy cannot announce them: the names
 //! are not known until the body ends. Over HTTP/1.1 a body's trailers are

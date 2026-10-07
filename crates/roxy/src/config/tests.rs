@@ -96,6 +96,8 @@ fn minimal_config_uses_defaults() {
     assert_eq!(cfg.tls.leaf_cache_size, 10_000);
     assert_eq!(cfg.tls.upstream.verify, UpstreamVerify::Strict);
     assert!(!cfg.http.allow_http10);
+    assert!(!cfg.http.allow_request_trailers);
+    assert!(cfg.http.allow_response_trailers);
     assert!(cfg.http.enable_h2);
     let l = &cfg.limits;
     assert_eq!(l.max_header_bytes.as_u64(), 64 * 1024);
@@ -544,6 +546,16 @@ fn secret_in_watching_rule_diagnosed() {
         d[0].message.contains("decided at the request head"),
         "{d:?}"
     );
+}
+
+/// Trailers are two settings, one per direction; the single flag is not a
+/// field.
+#[test]
+fn allow_trailers_is_an_unknown_field() {
+    let yaml = format!("{BASE}http: {{ allow_trailers: true }}\n");
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = describe_parse_error(&yaml, &err);
+    assert!(msg.contains("unknown field `allow_trailers`"), "{msg}");
 }
 
 #[test]

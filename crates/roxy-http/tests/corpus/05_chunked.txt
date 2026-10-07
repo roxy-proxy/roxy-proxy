@@ -113,7 +113,7 @@ Transfer-Encoding: chunked\r\n
 5\r\nhello\r\n0\r\nX-Checksum: 1\r\n\r\n
 
 === trailers_smuggle_content_length
-flags: allow_trailers
+flags: allow_request_trailers
 expect: body-error trailers
 ---
 POST http://example.com/ HTTP/1.1\r\n
@@ -123,7 +123,7 @@ Transfer-Encoding: chunked\r\n
 5\r\nhello\r\n0\r\nContent-Length: 50\r\n\r\n
 
 === trailers_allowed
-flags: allow_trailers
+flags: allow_request_trailers
 expect: request POST http://example.com:80/ body=hello
 expect: request GET http://example.com:80/next
 ---

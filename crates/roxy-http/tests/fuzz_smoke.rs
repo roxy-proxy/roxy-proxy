@@ -107,10 +107,11 @@ proptest! {
     fn head_parser_never_panics(input in http_bytes(), cfg in any::<u8>()) {
         let flags = HttpFlags {
             allow_http10: cfg & 1 != 0,
-            allow_trailers: cfg & 2 != 0,
+            allow_request_trailers: cfg & 2 != 0,
             allow_chunk_extensions: cfg & 4 != 0,
             allow_obs_text: cfg & 8 != 0,
             allow_body_on_get: cfg & 16 != 0,
+            ..HttpFlags::default()
         };
         let limits = Limits { max_header_bytes: 512, max_url_bytes: 128, max_headers: 8, ..Limits::default() };
         let role = match (cfg >> 5) & 3 {
@@ -135,7 +136,7 @@ proptest! {
     #[test]
     fn chunked_split_independent(input in http_bytes(), cfg in any::<u8>()) {
         let flags = HttpFlags {
-            allow_trailers: cfg & 1 != 0,
+            allow_request_trailers: cfg & 1 != 0,
             allow_chunk_extensions: cfg & 2 != 0,
             ..HttpFlags::default()
         };

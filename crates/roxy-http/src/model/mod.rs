@@ -16,7 +16,8 @@ pub use error::{BodyError, DriveError, ParseError, Reason, WriteError};
 pub(crate) use framing::{parse_content_length, plan_body};
 pub(crate) use headers::parse_field_line;
 pub use headers::{
-    Headers, RESERVED, connection_tokens, is_forbidden_trailer, is_reserved, requested_upgrade,
+    Headers, RESERVED, check_trailer_fields, connection_tokens, is_forbidden_trailer, is_reserved,
+    requested_upgrade, validate_response_trailers,
 };
 pub use limits::{HttpFlags, Limits};
 pub use message::{

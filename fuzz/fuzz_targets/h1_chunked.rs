@@ -50,7 +50,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let flags = HttpFlags {
-        allow_trailers: cfg & 1 != 0,
+        allow_request_trailers: cfg & 1 != 0,
         allow_chunk_extensions: cfg & 2 != 0,
         ..HttpFlags::default()
     };

@@ -6,7 +6,7 @@
 //! === case_name
 //! # comment
 //! role: proxy | origin | tunnel <http|https> <host:port>
-//! flags: allow_http10 allow_trailers ...
+//! flags: allow_http10 allow_request_trailers ...
 //! limits: max_headers=5 max_header_bytes=300 ...
 //! expect: request <METHOD> <url> [body=<escaped>] [hdr:<name>=<value>] [nohdr:<name>]
 //! expect: origin <METHOD> <url>          (origin-form on the proxy port)
@@ -190,7 +190,7 @@ fn parse_cases(file: &str, text: &str) -> Vec<Case> {
                     for f in v.split_whitespace() {
                         match f {
                             "allow_http10" => case.flags.allow_http10 = true,
-                            "allow_trailers" => case.flags.allow_trailers = true,
+                            "allow_request_trailers" => case.flags.allow_request_trailers = true,
                             "allow_chunk_extensions" => case.flags.allow_chunk_extensions = true,
                             "allow_obs_text" => case.flags.allow_obs_text = true,
                             "allow_body_on_get" => case.flags.allow_body_on_get = true,

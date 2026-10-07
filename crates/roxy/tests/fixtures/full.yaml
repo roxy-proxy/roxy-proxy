@@ -28,7 +28,8 @@ tls:
 
 http:
   allow_http10: false
-  allow_trailers: false
+  allow_request_trailers: false
+  allow_response_trailers: true  # gRPC puts the call's outcome in response trailers
   allow_chunk_extensions: false
   allow_plain_in_connect: false
   enable_h2: true             # client-side HTTP/2 via ALPN h2 (default true; false = http/1.1 only)

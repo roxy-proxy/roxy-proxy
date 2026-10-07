@@ -276,6 +276,10 @@ impl Upstream {
     ///   status to its `x-echo-status` (default `200`);
     /// * `/trailers`: reads the body, answers `200` with an empty body
     ///   followed by the trailer `x-checksum: none`;
+    /// * `/grpc`: reads the body, answers `200 application/grpc` with the
+    ///   body `hello` of undeclared length and the trailers
+    ///   `grpc-status: 0`, `grpc-message: OK`; with `x-forbidden-trailer`
+    ///   on the request, `set-cookie: a=b` as well;
     /// * `/drip?n=<n>&ms=<ms>`: `n` chunks, `ms` apart, without reading the
     ///   body;
     /// * `/cut`: reads the body, answers `200` declaring 10 bytes of body,
@@ -365,6 +369,10 @@ impl Upstream {
                 .header("content-length", "10")
                 .body(cut())
                 .unwrap();
+        }
+        if path == "/grpc" {
+            let forbidden = lock(&entry).headers.contains_key("x-forbidden-trailer");
+            return grpc(forbidden);
         }
         if path == "/trailers" {
             let mut trailers = http::HeaderMap::new();
@@ -506,6 +514,25 @@ fn drip(path: &str) -> http::Response<Body> {
         Some((Ok::<_, Infallible>(frame), i + 1))
     });
     http::Response::new(BoxBody::new(http_body_util::StreamBody::new(chunks)))
+}
+
+/// The `/grpc` answer: a body of undeclared length, then the call's outcome
+/// in trailers (and a forbidden trailer field, when asked).
+fn grpc(forbidden: bool) -> http::Response<Body> {
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+    trailers.insert("grpc-message", http::HeaderValue::from_static("OK"));
+    if forbidden {
+        trailers.insert("set-cookie", http::HeaderValue::from_static("a=b"));
+    }
+    let frames = futures_util::stream::iter([
+        Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from_static(b"hello"))),
+        Ok(hyper::body::Frame::trailers(trailers)),
+    ]);
+    http::Response::builder()
+        .header("content-type", "application/grpc")
+        .body(BoxBody::new(http_body_util::StreamBody::new(frames)))
+        .unwrap()
 }
 
 /// The `/echo` answer: `body`, with the requested status and coding.
