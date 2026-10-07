@@ -548,7 +548,8 @@ fn listener_mode_defaults_to_http_proxy() {
     let omitted = parse(BASE);
     assert_eq!(omitted.listeners[0].mode, ListenerMode::HttpProxy);
 
-    let named = parse("version: 1\nlisteners: [{ name: p, mode: http_proxy, bind: 127.0.0.1:1 }]\n");
+    let named =
+        parse("version: 1\nlisteners: [{ name: p, mode: http_proxy, bind: 127.0.0.1:1 }]\n");
     assert_eq!(named.listeners[0].mode, ListenerMode::HttpProxy);
 
     let yaml = "version: 1\nlisteners: [{ name: p, mode: explicit, bind: 127.0.0.1:1 }]\n";
