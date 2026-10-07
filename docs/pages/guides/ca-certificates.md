@@ -50,13 +50,15 @@ is a fatal startup error, and `roxy ca init` refuses to run.
 
 ## Startup checks
 
-Every CA, provided or generated, is checked at startup. It must be a CA
-certificate (`CA:TRUE`), allow `keyCertSign` if it has a key usage
-extension, be within its validity period, and match its key. Each
-intermediate must be a CA within its validity period whose key signed the
-certificate before it. Any failure stops roxy.
+Every CA, provided or generated, is checked at startup, and by `roxy
+check`, which loads it the same way. It must be a CA certificate
+(`CA:TRUE`), allow `keyCertSign` if it has a key usage extension, be within
+its validity period, and match its key. Each intermediate must be a CA
+within its validity period whose key signed the certificate before it. Any
+failure stops roxy.
 
-Two conditions are warnings, not errors:
+Two conditions are warnings, not errors; startup logs them and `check`
+prints them as `warning:` lines:
 
 - The key file is readable by its group or by others. Make it mode 0600.
 - The CA expires within seven days. Leaves normally last seven days; one

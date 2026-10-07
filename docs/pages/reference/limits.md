@@ -63,7 +63,7 @@ limits:
 
   # connections
   max_connections: 10000
-  max_connections_per_client: 10000   # per client IP; equal to max_connections, so off unless lowered
+  max_connections_per_client: 10000   # per client IP; omitted, it is max_connections, so off unless lowered
 
   # policy state
   max_metric_keys: 100000
@@ -148,8 +148,8 @@ single reservation.
 - Request bytes in flight on an HTTP/2 connection (sent by the client, not
   yet taken by the upstream) sit outside `max_buffered_bytes`: the
   connection's receive window caps them at 4 MiB, so one client IP can hold
-  at most `max_connections_per_client` × 4 MiB. The default equals
-  `max_connections`, so behind a load balancer (one source IP for every
+  at most `max_connections_per_client` × 4 MiB. Omitted, it is whatever
+  `max_connections` is, so behind a load balancer (one source IP for every
   client) the cap is the fleet's; lower it on a proxy port where each client
   has its own address.
 - Upstream connections are bounded by the clients: HTTP/1.1 origins get

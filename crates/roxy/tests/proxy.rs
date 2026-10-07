@@ -169,6 +169,32 @@ async fn hot_reload_swaps_policy_and_keeps_it_on_failure() {
     h.stop().await;
 }
 
+/// `upstream.dns` is read once, at start: a reload that moves a
+/// `static_hosts` entry keeps the running resolver (and warns), so the name
+/// still resolves to the upstream it did at start.
+#[tokio::test(flavor = "multi_thread")]
+async fn hot_reload_keeps_the_running_resolver() {
+    let h = Harness::start(ALLOW_UPSTREAM).await;
+    let c = h.client();
+    let url = h.http_url("/dns");
+    assert_eq!(c.get(&url).send().await.unwrap().status(), 200);
+
+    let rendered = h.render(&Opts {
+        rules: ALLOW_UPSTREAM,
+        ..Opts::default()
+    });
+    let moved = rendered.replace("upstream.test: 127.0.0.1", "upstream.test: 127.0.0.9");
+    assert_ne!(moved, rendered);
+    std::fs::write(&h.config_path, moved).unwrap();
+    h.wait_events("config_reloaded", 1).await;
+    assert_eq!(
+        c.get(&url).send().await.unwrap().status(),
+        200,
+        "the running resolver answers, not the file's"
+    );
+    h.stop().await;
+}
+
 /// A config already past `valid_until` loads and denies everything with
 /// `_expired`; `roxy health` stays healthy and says so; a reload that moves
 /// the lease into the future lets traffic through again.

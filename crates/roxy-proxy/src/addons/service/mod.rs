@@ -540,7 +540,7 @@ pub(crate) mod testing {
     use crate::addons::{AddonImpl, AddonMode, AddonSpec, EndpointSpec, StateLimits};
     use crate::config::PolicyUpdate;
     use crate::flowlog::Redactor;
-    use crate::testkit::{DOWN_IP, Kit, PRIVATE_IP, UP_IP};
+    use crate::testkit::Kit;
     use crate::upstream::{TestDial, UpstreamSettings};
 
     /// The port the in-test service answers on (`up.test`).
@@ -625,19 +625,10 @@ pub(crate) mod testing {
             address_lists: &none,
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
-        let mut upstream = UpstreamSettings::default();
-        upstream.dns.servers = Some(vec!["127.0.0.1:9".parse().unwrap()]);
-        for (name, ip) in [
-            ("up.test", UP_IP),
-            ("private.test", PRIVATE_IP),
-            ("down.test", DOWN_IP),
-        ] {
-            upstream
-                .dns
-                .static_hosts
-                .insert(name.to_owned(), vec![ip.parse().unwrap()]);
-        }
-        upstream.connect_timeout = Duration::from_secs(5);
+        let mut upstream = UpstreamSettings {
+            connect_timeout: Duration::from_secs(5),
+            ..UpstreamSettings::default()
+        };
         let up = kit.upstream.clone();
         upstream.dial = Some(TestDial(Arc::new(move |addr| {
             let up = up.clone();

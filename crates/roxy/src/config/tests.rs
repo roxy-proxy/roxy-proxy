@@ -115,7 +115,8 @@ fn minimal_config_uses_defaults() {
     assert_eq!(l.response_body_idle_timeout, Duration::from_mins(30));
     assert_eq!(l.response_header_timeout, Duration::from_mins(15));
     assert_eq!(l.idle_timeout, Duration::from_hours(1));
-    assert_eq!(l.max_connections_per_client, l.max_connections);
+    assert_eq!(l.max_connections_per_client, None);
+    assert_eq!(cfg.startup().per_client_cap(), l.max_connections);
     assert_eq!(l.max_metric_keys, 100_000);
     assert_eq!(l.max_metric_bytes.as_u64(), 256 << 20);
     assert_eq!(l.metric_limits(), roxy_rules::MetricLimits::default());
@@ -1121,4 +1122,111 @@ fn addon_when_and_sample_diagnosed() {
         assert_eq!(d[0].path, path, "{bad}");
         assert!(d[0].to_string().contains(says), "{bad}: {}", d[0]);
     }
+}
+
+/// An absent `max_connections_per_client` follows `max_connections`, so
+/// raising the global cap alone raises the per-client one; a value given
+/// stands whatever `max_connections` is.
+#[test]
+fn per_client_cap_follows_max_connections_unless_set() {
+    let raised = parse(&format!("{BASE}limits: {{ max_connections: 50000 }}\n"));
+    raised.validate().unwrap();
+    assert_eq!(raised.startup().per_client_cap(), 50_000);
+
+    let lowered = parse(&format!(
+        "{BASE}limits: {{ max_connections: 50000, max_connections_per_client: 200 }}\n"
+    ));
+    assert_eq!(lowered.startup().per_client_cap(), 200);
+    let above = parse(&format!(
+        "{BASE}limits: {{ max_connections: 10, max_connections_per_client: 200 }}\n"
+    ));
+    assert_eq!(above.startup().per_client_cap(), 200);
+}
+
+/// The restart-only changes from `running` to `new`; a second pass over
+/// the result finds none, since every one was put back.
+fn restart(running: &str, new: &str) -> Vec<&'static str> {
+    let running = parse(running).startup();
+    let mut new = parse(new);
+    let changed = new.keep_startup(&running);
+    assert!(new.keep_startup(&running).is_empty(), "kept");
+    assert_eq!(new.startup(), running);
+    changed
+}
+
+#[test]
+fn listeners_need_a_restart() {
+    let base = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:443 }]\n";
+    let moved = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:8443 }]\n";
+    let renamed = "version: 1\nlisteners: [{ name: q, bind: 127.0.0.1:8443 }]\n";
+    assert_eq!(restart(base, moved), ["listeners"]);
+    assert_eq!(restart(moved, renamed), ["listeners"]);
+}
+
+/// Every setting the server reads once, at start, is kept on reload and
+/// named by its config path; the rest of the same sections reload.
+#[test]
+fn startup_only_settings_need_a_restart() {
+    for (yaml, field) in [
+        ("tls: { ca_dir: /tmp/elsewhere }", "tls.ca_dir"),
+        ("tls: { leaf_cache_size: 5 }", "tls.leaf_cache_size"),
+        (
+            "tls: { upstream: { min_version: \"1.3\" } }",
+            "tls.upstream",
+        ),
+        ("ca_server: { bind: 127.0.0.1:3130 }", "ca_server"),
+        (
+            "upstream: { dns: { static_hosts: { a.test: 10.0.0.1 } } }",
+            "upstream.dns",
+        ),
+        ("upstream: { dns: { cache_ttl_cap: 5s } }", "upstream.dns"),
+        ("limits: { max_connections: 5 }", "limits.max_connections"),
+        (
+            "limits: { max_connections_per_client: 5 }",
+            "limits.max_connections_per_client",
+        ),
+        (
+            "limits: { max_state_entries: 5 }",
+            "limits.max_state_entries",
+        ),
+        (
+            "limits: { max_capture_body_bytes: 1mb }",
+            "limits.max_capture_body_bytes",
+        ),
+        ("log: { flow: { path: /tmp/x.jsonl } }", "log.flow"),
+        ("log: { capture: { all: true } }", "log.capture"),
+        ("log: { capture: { max_file_bytes: 1mb } }", "log.capture"),
+        ("capture_dir: /tmp/c", "capture_dir"),
+    ] {
+        assert_eq!(restart(BASE, &format!("{BASE}{yaml}\n")), [field], "{yaml}");
+    }
+    let provided = format!("{BASE}tls: {{ ca_cert: /tmp/a.pem, ca_key: /tmp/a.key }}\n");
+    assert_eq!(restart(BASE, &provided), ["tls.ca_cert", "tls.ca_key"]);
+    assert_eq!(
+        restart(
+            BASE,
+            &format!(
+                "{BASE}http: {{ allow_http10: true, enable_h2: false }}\n\
+                 limits: {{ max_headers: 5, max_header_bytes: 8kb }}\n\
+                 tls: {{ require_sni_match: false }}\n\
+                 upstream: {{ deny_private_ranges: false, connect_timeout: 3s }}\n\
+                 log: {{ redact_headers: [x-a] }}\n"
+            )
+        ),
+        Vec::<&str>::new()
+    );
+}
+
+/// The operations guide lists the restart-only settings by hand; the list
+/// is the type's.
+#[test]
+fn docs_list_the_restart_only_settings() {
+    let doc = include_str!("../../../../docs/pages/guides/operations.md");
+    let section = doc
+        .split("### Restart-only settings")
+        .nth(1)
+        .and_then(|rest| rest.trim_start().split("\n\n").next())
+        .expect("a restart-only settings section");
+    let listed: Vec<&str> = section.split('`').skip(1).step_by(2).collect();
+    assert_eq!(listed, Startup::NAMES, "{section}");
 }

@@ -18,16 +18,13 @@ use roxy_node::node::{Change, HandlerFuture, LeaseHandler, Node, NodeConfig, Nod
 use roxy_node::protocol::{Lease, PolicyState, sha256_hex};
 use roxy_node::spool::Spool;
 use roxy_node::state::StateDir;
-use roxy_proxy::{FlowEvent, FlowSink, PolicyUpdate, RuntimeConfig, Server};
+use roxy_proxy::{FlowEvent, FlowSink, PolicyUpdate, Server};
 use roxy_rules::Policy;
-use roxy_tls::{CA_CERT_FILE, CA_KEY_FILE, Ca, CaError, LeafMinter};
+use roxy_tls::{CA_CERT_FILE, CA_KEY_FILE, Ca, CaError};
 
 use crate::addons::AddonLoader;
 use crate::config::{Config, SecretSource};
-use crate::run::{
-    build_capture, build_sink, keep_restart_only, listener_specs, load_ca,
-    policy_update_with_secrets,
-};
+use crate::run::{Opened, build_sink, load_ca, policy_update_with_secrets, runtime_config};
 use crate::secrets::Secrets;
 use crate::stores::{BuiltinState, ReloadableMetrics};
 
@@ -289,11 +286,11 @@ impl NodeHandler {
         update: PolicyUpdate,
         placeholder: bool,
     ) -> anyhow::Result<Server> {
-        let ca = Arc::new(load_ca(config)?);
-        let minter = Arc::new(LeafMinter::new(ca.clone(), config.tls.leaf_cache_size)?);
+        let startup = config.startup();
+        let ca = Arc::new(load_ca(&startup)?);
         let local = match &self.local_sink {
             Some(s) => s.clone(),
-            None => build_sink(config)?,
+            None => build_sink(&startup)?,
         };
         let sink: Arc<dyn FlowSink> = Arc::new(ShipSink {
             local,
@@ -307,26 +304,15 @@ impl NodeHandler {
             metrics: config.metrics.len(),
             addons: config.addons.len(),
         });
-        let state = Arc::new(BuiltinState::new(config.limits.max_state_entries));
+        let state = Arc::new(BuiltinState::new(startup.max_state_entries));
         *lock(&self.state) = state.clone();
-        let rt = RuntimeConfig {
-            listeners: listener_specs(config)?,
-            ca_server: config.ca_server.as_ref().map(|c| c.bind),
+        let opened = Opened {
             ca,
-            minter,
-            upstream_tls: config.into(),
-            max_connections: config.limits.max_connections,
-            max_connections_per_client: config.limits.max_connections_per_client,
-            connection_events: config.log.flow.connection_events,
-            ws_message_every: config.log.flow.ws_message_every,
             sink,
-            capture: build_capture(config)?,
             metrics: self.metrics.clone(),
             state,
-            policy: update,
-            placeholder_policy: placeholder,
         };
-        Ok(Server::start(rt).await?)
+        Ok(Server::start(runtime_config(&startup, opened, update, placeholder)?).await?)
     }
 
     /// Swaps `update` into the running server, rebuilding the metric
@@ -389,7 +375,7 @@ impl NodeHandler {
         // that, restart-only settings keep their running values, as on a
         // file reload.
         let restart = if run.leased {
-            for field in keep_restart_only(&run.config, &mut config) {
+            for field in config.keep_startup(&run.config.startup()) {
                 tracing::warn!(
                     field,
                     "lease changes a setting that takes effect at startup; the running value is kept until a restart"
@@ -398,7 +384,7 @@ impl NodeHandler {
             false
         } else {
             let mut probe = config.clone();
-            !keep_restart_only(&run.config, &mut probe).is_empty()
+            !probe.keep_startup(&run.config.startup()).is_empty()
         };
         let secrets = resolve_secrets(&config, lease)?;
         let (policy, update, prepared) = self

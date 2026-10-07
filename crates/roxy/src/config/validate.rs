@@ -534,9 +534,11 @@ impl Config {
             ("max_header_bytes", l.max_header_bytes.as_u64(), 1),
             ("max_url_bytes", l.max_url_bytes.as_u64(), 1),
             ("max_connections", l.max_connections as u64, 1),
+            // Absent, the per-client cap is `max_connections`, whose floor
+            // covers it.
             (
                 "max_connections_per_client",
-                l.max_connections_per_client as u64,
+                l.max_connections_per_client.unwrap_or(1) as u64,
                 1,
             ),
             (
