@@ -41,7 +41,7 @@ repo root, then `ROXY_IMAGE=roxy:local docker compose up --build`).
 | [`compose.yaml`](compose.yaml) | roxy in node mode with the addons, the control plane, the three mock services, the sentinel, Inspect View, the traffic and the one-off client |
 | [`compose.standalone.yaml`](compose.standalone.yaml) | an override that runs roxy from `roxy.yaml` instead, without the control plane |
 | [`roxy.yaml`](roxy.yaml) | the policy: the three addons in order, and a rule that lets the client reach the model and puts the API key on the request. The control plane serves it as the lease |
-| [`controlplane/`](controlplane/) | the control plane: enrolment, mTLS, the lease, revocation (`revoked` in its data dir) and flow uploads, in one Python file. Run outside compose it needs `ENROL_TOKEN` or `ENROL_TOKEN_FILE`, `MODEL_API_KEY`, `ROXY_CONFIG`, `CA_OUT`, `LEASE_VALID_SECONDS` and `NODE_CERT_SECONDS` set |
+| [`controlplane/`](controlplane/) | the control plane: enrolment, mTLS, the lease, revocation (`revoked` in its data dir) and flow uploads, in one Python file. Run outside compose it needs `ENROL_TOKEN_FILE`, `MODEL_API_KEY`, `ROXY_CONFIG`, `CA_OUT`, `LEASE_VALID_SECONDS` and `NODE_CERT_SECONDS` set |
 | [`addons/auth-gate`](addons/auth-gate/src/lib.rs) | the auth gate: `x-roxy-auth` to the auth service, verdict cached in the layer's state, `user:<name>` tag |
 | [`addons/token-quota`](addons/token-quota/src/lib.rs) | the quota: a check before the call, a report of the usage the response carried after it |
 | [`addons/Dockerfile`](addons/Dockerfile) | builds both addons for `wasm32-wasip2` and puts them in roxy's image |

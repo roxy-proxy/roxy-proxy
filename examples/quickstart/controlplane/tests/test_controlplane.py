@@ -59,7 +59,14 @@ def enrol_body(csr, protocol_version=1):
 def cp(tmp_path):
     config = tmp_path / "roxy.yaml"
     config.write_text(ROXY_YAML)
-    env = {"ENROL_TOKEN": "tok", "MODEL_API_KEY": "k1", "LEASE_VALID_SECONDS": "20", "NODE_CERT_SECONDS": "600"}
+    token_file = tmp_path / "enrol-token"
+    token_file.write_text("tok\n")
+    env = {
+        "ENROL_TOKEN_FILE": str(token_file),
+        "MODEL_API_KEY": "k1",
+        "LEASE_VALID_SECONDS": "20",
+        "NODE_CERT_SECONDS": "600",
+    }
     return ControlPlane(tmp_path / "data", config, env)
 
 

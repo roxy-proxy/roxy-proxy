@@ -2,8 +2,8 @@
 (spec/node-protocol/v1/openapi.yaml), enough to run the quickstart's roxy
 in node mode.
 
-It enrols a node against the fixed token in ENROL_TOKEN_FILE (or
-ENROL_TOKEN), signing the node's CSR with a CA it keeps in DATA_DIR, and
+It enrols a node against the fixed token read from the file named by
+ENROL_TOKEN_FILE, signing the node's CSR with a CA it keeps in DATA_DIR, and
 serves the lease: the quickstart's roxy.yaml with its `env` secrets turned
 into `lease: true` entries and the values taken from this process's
 environment. Flow batches are printed to stdout, one event per line. A node
@@ -164,9 +164,8 @@ class ControlPlane:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.config_path = Path(config_path)
         self.environ = environ
-        # The token: a file (a compose secret) or the environment.
-        token_file = environ.get("ENROL_TOKEN_FILE")
-        self.token = Path(token_file).read_text().strip() if token_file else environ["ENROL_TOKEN"]
+        # The token comes from a file (a compose secret), never the environment.
+        self.token = Path(environ["ENROL_TOKEN_FILE"]).read_text().strip()
         self.lease_valid = int(environ["LEASE_VALID_SECONDS"])
         self.cert_lifetime = dt.timedelta(seconds=int(environ["NODE_CERT_SECONDS"]))
         self.ca = Ca(self.data_dir)
