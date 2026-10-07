@@ -6,7 +6,9 @@
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use super::{AddonDef, Answer, Kit};
+use bytes::Bytes;
+
+use super::{AddonDef, Answer, Kit, streaming_body};
 use crate::addons::EndpointPath;
 
 const RULES: &str = r#"
@@ -39,6 +41,22 @@ fn strs(v: &serde_json::Value) -> Vec<String> {
         .iter()
         .map(|x| x.as_str().unwrap().to_owned())
         .collect()
+}
+
+/// No `layer_error` was logged.
+fn no_layer_error(kit: &Kit) {
+    let events = kit.sink.events();
+    assert!(
+        events.iter().all(|e| e["event"] != "layer_error"),
+        "{events:#?}"
+    );
+}
+
+fn gzip(b: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(b).unwrap();
+    e.finish().unwrap()
 }
 
 #[tokio::test]
@@ -196,6 +214,97 @@ async fn an_inner_layer_failing_after_the_head_is_the_one_blamed() {
     let errs = kit.events("layer_error", 1).await;
     // `a` may fail too (it reads the cut body), but `b` failed first.
     assert!(errs.iter().any(|e| e["layer"] == "b"), "{errs:#?}");
+}
+
+/// A client upload that breaks is the client's fault through a WASM layer
+/// as without one. Before the response head the connection closes on the
+/// parse error; after it the body is cut. Either way the layer that fails
+/// on the broken body it was given is not blamed, and nothing is logged
+/// against it.
+#[tokio::test]
+async fn a_client_upload_failing_mid_body_is_not_the_layers_fault() {
+    // Before the head: the upstream answers only once the body is in.
+    let kit = stack(&named(&["a"])).await;
+    let (out, eof) = kit
+        .raw(
+            b"POST http://up.test/x HTTP/1.1\r\nhost: up.test\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\nzz\r\n",
+        )
+        .await;
+    assert!(eof);
+    assert!(out.starts_with("HTTP/1.1 400"), "{out}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["reason"], "bad_chunk_size", "{ev:#}");
+    no_layer_error(&kit);
+
+    // After the head: the upstream answers at once and keeps its body
+    // coming, so the layer is still relaying both streams when the upload
+    // stalls past `body_idle_timeout` under it. Over HTTP/2 the response
+    // stream stays up on a request body failure, so the layer, not the
+    // front, is the first to act on it.
+    let kit = Kit::builder()
+        .rules(RULES)
+        .addon(AddonDef::test_layer("a"))
+        .limits(|l| l.body_idle_timeout = std::time::Duration::from_millis(300))
+        .start()
+        .await;
+    let mut c = kit.tunnel("up.test", true).await;
+    let (mut tx, body) = streaming_body();
+    let req = c
+        .request(
+            "POST",
+            "/early-drip?n=50&ms=100",
+            &[("content-length", "10")],
+        )
+        .body(body)
+        .unwrap();
+    let answer = c.start(req);
+    tx.send_data(Bytes::from_static(b"hello")).await.unwrap();
+    let a = answer.await.unwrap().unwrap();
+    assert_eq!(a.status, 200, "{a:?}");
+    assert!(a.body.is_err(), "the body is cut: {a:?}");
+    let ev = kit.request_event().await;
+    assert_ne!(ev["terminal_rule"], "layer:a", "{ev:#}");
+    // Best-effort: nothing marks the layer's task ending, so a `layer_error`
+    // for its trap on the cut body would land just after the request event.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    no_layer_error(&kit);
+}
+
+/// A decoder window the buffer budget cannot cover fails the exchange
+/// closed as the budget's refusal, through a WASM layer and a service
+/// layer alike: the layer that fails on a body it was never given is not
+/// blamed.
+#[tokio::test]
+async fn a_decoder_window_the_budget_cannot_cover_is_the_budgets_refusal() {
+    use crate::addons::AddonMode;
+    use crate::addons::service::testing::{addon, reload};
+    // Under the 32 KiB window gzip charges on its first byte.
+    let budget = |b: super::KitBuilder| b.limits(|l| l.max_buffered_bytes = 1024);
+    let wasm = budget(Kit::builder().rules(RULES))
+        .addon(AddonDef::test_layer("a"))
+        .start()
+        .await;
+    let service = budget(Kit::builder().rules(RULES)).start().await;
+    reload(
+        &service,
+        RULES,
+        &[],
+        vec![addon("s", "pass", AddonMode::Enforce, |_| {})],
+    );
+    for (kind, kit) in [("wasm", wasm), ("service", service)] {
+        let mut c = kit.h1().await;
+        let req = c
+            .request("POST", "/x", &[("content-encoding", "gzip")])
+            .body(roxy_http::Body::from_bytes(gzip(b"hello")))
+            .unwrap();
+        let a = Answer::read(c.send(req).await.unwrap()).await;
+        assert_eq!(a.status, 503, "{kind}: {a:?}");
+        let ev = kit.request_event().await;
+        assert_eq!(ev["terminal_rule"], "_fail_closed", "{kind}: {ev:#}");
+        assert_eq!(ev["reason"], "buffer_budget_exhausted", "{kind}: {ev:#}");
+        no_layer_error(&kit);
+        assert!(kit.upstream.seen().is_empty(), "{kind}");
+    }
 }
 
 #[tokio::test]
@@ -796,7 +905,7 @@ mod service {
 
     use bytes::Bytes;
 
-    use super::{RULES, strs};
+    use super::{RULES, no_layer_error, strs};
     use crate::addons::AddonMode;
     use crate::addons::service::ServiceSpec;
     use crate::addons::service::testing::{addon, kit, only_when, reload};
@@ -1038,15 +1147,6 @@ mod service {
             assert_eq!(resets[0].0, u32::try_from(stream).unwrap(), "{resets:?}");
             assert_eq!(resets[0].1, "the client went away", "{client}");
         }
-    }
-
-    /// No `layer_error` was logged.
-    fn no_layer_error(kit: &Kit) {
-        let events = kit.sink.events();
-        assert!(
-            events.iter().all(|e| e["event"] != "layer_error"),
-            "{events:#?}"
-        );
     }
 
     /// A client upload that breaks mid-body is the client's fault through a

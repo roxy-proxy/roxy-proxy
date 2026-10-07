@@ -289,7 +289,7 @@ async fn failures_after_the_head_cut_the_body() {
         // The body ended on a failure the host already had.
         let told = host.failed.lock().unwrap().clone();
         let failure = outcome.wait().await.unwrap_err();
-        assert_eq!(told, [failure.clone()], "{test}");
+        assert_eq!(told.as_slice(), std::slice::from_ref(&failure), "{test}");
         match check {
             "trap" => assert!(
                 matches!(failure, LayerError::Trap(_)),

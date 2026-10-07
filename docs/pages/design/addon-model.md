@@ -54,6 +54,33 @@ the stream rather than in it.
    is already out. There is no "on error, pass"; observe mode is the one
    safe way to run a layer whose failures must not matter.
 
+## Who is blamed
+
+When an exchange fails, one party is blamed, and the first fault recorded
+stands. Every party records its own fault before anything downstream of it
+can fail on it: a layer as it fails, before its bodies end; a body where it
+enters the stack, before a layer reads it; the front as it gives the
+exchange up. So what a layer makes of a body or a `next` that ended on
+someone else's failure is a consequence, never a second fault.
+
+- A layer's own failure (a trap, an exceeded budget, an invalid head, a
+  service that broke its stream) is the layer's: `503` with
+  `terminal_rule: layer:<name>` before the response head, a cut body after
+  it, and one `layer_error` event either way. A failure found below the
+  layer that caused it (a passed-on request that does not validate, say) is
+  put down to the nearest enforcing layer above.
+- A client upload that breaks is the client's, as without a stack: the
+  connection closes on the parse error before the head, the body is cut
+  after it, and no `layer_error` is logged however many layers fail on the
+  cut body.
+- An upstream response body that fails before any layer has answered with
+  a head of its own is the upstream's: `502`, `reason: upstream_body_failed`.
+- A body the [buffer budget](/reference/limits#limits) cannot cover on its
+  way to a layer (a decoder's window) fails closed as the budget's:
+  `reason: buffer_budget_exhausted`.
+- An observer is never blamed, and a client that gives up is nobody's
+  failure: nothing is logged.
+
 ## One exchange, one `next`
 
 A layer calls `next` at most once per exchange; a second call traps. The

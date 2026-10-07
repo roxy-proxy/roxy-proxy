@@ -109,10 +109,8 @@ either way       {"type":"credit","dir":"request"|"response","bytes":n}  flow co
   cuts the body after it; a body cut short never reaches the upstream or
   the client as complete. `layer_error.kind` is `service:connect`,
   `service:protocol`, `service:timeout` or `service:closed`.
-- **A body that fails on its way to the service is not its failure.** A
-  client upload that breaks closes the connection as it would without the
-  layer; an upstream response body that fails before the service's second
-  head gets a `502` (`upstream_body_failed`). Neither logs a `layer_error`.
+- **A body that fails on its way to the service is not its failure**, and
+  logs no `layer_error` ([who is blamed](/design/addon-model#who-is-blamed)).
 - **One stream's failure is its own**: a violation resets that stream
   only. Broken framing fails the whole connection: a text frame that is not
   a JSON object with a valid `stream`, a binary frame shorter than its

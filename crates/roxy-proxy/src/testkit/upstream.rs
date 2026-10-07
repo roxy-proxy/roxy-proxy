@@ -350,9 +350,9 @@ impl Upstream {
         let echo_status = req.headers().get("x-echo-status").cloned();
         let read = self.clone().read_body(entry.clone(), req.into_body());
 
-        if path == "/early" {
+        if path == "/early" || path.starts_with("/early-drip?") {
             tokio::spawn(read);
-            return http::Response::new(full(b"early".as_slice()));
+            return early(&path);
         }
         let Some(body_len) = read.await else {
             return http::Response::builder()
@@ -495,6 +495,17 @@ fn cut() -> Body {
 }
 
 /// `n` chunks `chunk<i>;`, `ms` apart, from `/drip?n=..&ms=..`.
+/// `/early`: answered before the upload is in. `/early-drip?n=&ms=`: the
+/// same, with a body that keeps coming (as `drip`) while the upload is
+/// still being read.
+fn early(path: &str) -> http::Response<Body> {
+    if path == "/early" {
+        http::Response::new(full(b"early".as_slice()))
+    } else {
+        drip(path)
+    }
+}
+
 fn drip(path: &str) -> http::Response<Body> {
     let query = path.split_once('?').map_or("", |(_, q)| q);
     let arg = |k: &str| {

@@ -490,6 +490,7 @@ impl StackFlow {
     }
 
     /// The layer blamed for the exchange failing, if one is.
+    #[cfg(test)]
     fn blamed_layer(&self) -> Option<String> {
         match self.attribution.fault()? {
             Fault::Layer { name, .. } => Some(name),
