@@ -301,6 +301,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             window: m.window,
             max_keys: m.max_keys,
             filter,
+            filter_src: m.where_.as_ref().map(|w| w.as_str().to_owned()),
         }
     }
 

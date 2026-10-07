@@ -717,9 +717,9 @@ impl MetricStore {
         removed
     }
 
-    /// Reload retention: copy series from `previous` for metric ids
-    /// whose definition has the same `count`, `unique`, `key` and `window`;
-    /// every other metric starts empty. Carried series are kept even
+    /// Reload retention: copy series from `previous` for every metric
+    /// whose [`MetricDef::fingerprint`] is unchanged; every other metric
+    /// starts empty. Carried series are kept even
     /// beyond this store's `max_keys` or the metric's (new keys are then
     /// refused until enough expire), but *not* beyond its byte budget: a
     /// series whose charge does not fit is skipped and counted in

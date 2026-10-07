@@ -465,6 +465,8 @@ fn carry_over_keeps_identical_definitions() {
 - { id: rewindowed, count: requests, window: 60s }
 - { id: rekeyed, count: requests }
 - { id: recounted, count: requests }
+- { id: refiltered, count: requests, where: client.ip in 10.0.0.0/8 }
+- { id: rebounded, count: requests, max_keys: 10 }
 - { id: gone, count: requests }",
         100,
         &c,
@@ -486,6 +488,8 @@ fn carry_over_keeps_identical_definitions() {
 - { id: rewindowed, count: requests, window: 30s }
 - { id: rekeyed, count: requests, key: [client.ip] }
 - { id: recounted, count: request_bytes }
+- { id: refiltered, count: requests, where: client.ip in 10.0.0.0/16 }
+- { id: rebounded, count: requests, max_keys: 20 }
 - { id: fresh, count: requests }",
         100,
         &c,
@@ -493,15 +497,16 @@ fn carry_over_keeps_identical_definitions() {
     assert_eq!(
         new.carry_over(&old),
         CarryOverReport {
-            carried: 2,
+            carried: 3,
             skipped_budget: 0
         }
     );
-    assert_eq!(new.key_count(), 2);
+    assert_eq!(new.key_count(), 3);
     let v = client(1);
     assert_eq!(new.get("same", &v), Ok(5));
     assert_eq!(new.get("cum", &v), Ok(5));
-    for id in ["rewindowed", "rekeyed", "recounted", "fresh"] {
+    assert_eq!(new.get("rebounded", &v), Ok(5));
+    for id in ["rewindowed", "rekeyed", "recounted", "refiltered", "fresh"] {
         assert_eq!(new.get(id, &v), Ok(0), "{id}");
     }
     // The carried window still expires on schedule (recorded at old t = 0,

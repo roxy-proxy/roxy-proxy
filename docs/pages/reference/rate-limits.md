@@ -50,8 +50,10 @@ metrics:
   `metric_table_full`); a byte metric that cannot record a chunk mid-stream
   stops the exchange the same way. Series are reclaimed only once their
   window has fully expired.
-- **Reload.** Series whose definition (`count`, `key`, `window`) is
-  unchanged carry over; others are dropped silently. Carried series may
+- **Reload.** A metric keeps its series when its `id`, `count`, `where`,
+  `key` and `window` are unchanged (`where` compared as written); any other
+  change to it starts it empty, and a removed metric's series are dropped
+  silently. Changing only `max_keys` carries over. Carried series may
   exceed a lowered `max_metric_keys` or `max_keys` until they expire (new
   series refused meanwhile), but never the byte budget: a series that does
   not fit is dropped with a warning.

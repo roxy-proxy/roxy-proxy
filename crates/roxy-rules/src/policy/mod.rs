@@ -43,24 +43,44 @@ pub struct MetricDef {
     /// Series this metric alone may hold; `None` = the store's shared limit.
     pub max_keys: Option<usize>,
     filter: Option<Pred>,
+    /// The `where` as written, for [`MetricDef::fingerprint`].
+    filter_src: Option<String>,
 }
 
-/// The parts of a [`MetricDef`] that determine what its series mean.
-/// Two definitions with equal fingerprints can share series across a
-/// reload.
+/// The identity of a metric across reloads: everything that decides which
+/// flows a series counts and what its value means. Two definitions with
+/// equal fingerprints keep each other's series; any other difference starts
+/// the metric empty, since a count built under one definition would be
+/// wrong under the other.
+///
+/// * `id`: how rules name the metric.
+/// * `count`: what is counted (and, for `unique(..)`, of which field).
+/// * `filter`: the `where` source. A narrowed filter must not inherit
+///   counts from flows it excludes, or `metric.x >= N` denies on stale
+///   totals. Compared as text, so a rewrite of an equivalent expression
+///   also starts fresh (the fail-closed direction).
+/// * `key`: which flows share a series.
+/// * `window`: how long a recorded event counts.
+///
+/// `max_keys` is deliberately absent: it bounds how many series exist, not
+/// what any of them means, and carried series may exceed a lowered bound
+/// until they expire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MetricFingerprint<'a> {
+pub struct MetricFingerprint<'a> {
+    id: &'a str,
     count: &'a MetricCount,
-    unique: Option<Field>,
+    filter: Option<&'a str>,
     key: &'a [Field],
     window: Option<Duration>,
 }
 
 impl MetricDef {
-    pub(crate) fn fingerprint(&self) -> MetricFingerprint<'_> {
+    /// See [`MetricFingerprint`].
+    pub fn fingerprint(&self) -> MetricFingerprint<'_> {
         MetricFingerprint {
+            id: &self.id,
             count: &self.count,
-            unique: self.unique,
+            filter: self.filter_src.as_deref(),
             key: &self.key,
             window: self.window,
         }

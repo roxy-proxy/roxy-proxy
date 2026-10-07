@@ -182,7 +182,9 @@ pub use metrics::{
 };
 #[doc(hidden)]
 pub use parser::parse;
-pub use policy::{Condition, MetricDef, Policy, PolicyInput, RuleInfo, RuleKind, WatchState};
+pub use policy::{
+    Condition, MetricDef, MetricFingerprint, Policy, PolicyInput, RuleInfo, RuleKind, WatchState,
+};
 pub use state::{StateFull, StateSource, StateStore};
 pub use template::{Part, TemplateError, expand, parse_template};
 pub use types::{Field, Reads, Type};
