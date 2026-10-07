@@ -31,7 +31,7 @@ docker compose up --build --attach traffic
 
 The first run builds the images, which takes a few minutes. Eight containers start; only the last one's output is shown (Ctrl-C stops them):
 
-- **controlplane**: enrols roxy, serves [`roxy.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/roxy.yaml) and the model's API key as a one-minute lease, and prints every flow event roxy ships to it.
+- **controlplane**: enrols roxy, serves [`roxy.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/roxy.yaml) and the model's API key as a one-minute lease, and prints the flow events roxy ships.
 - **roxy**: the proxy on `127.0.0.1:3128`, with the two addons at `/etc/roxy/addons/`. It has no config file; it runs the policy it leases.
 - **fake-model**: answers `POST /v1/messages` from [`responses.json`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/mocks/responses.json), one entry per call in order, streamed or whole, with the `usage` the real API sends. It refuses a request without the API key, which only roxy has.
 - **auth-service**: `alice-secret` is alice and `bob-secret` is bob.
@@ -42,7 +42,7 @@ The first run builds the images, which takes a few minutes. Eight containers sta
 
 ### Watch the traffic
 
-Each client is the Anthropic SDK, pointed at the model through roxy, with its credential in an `x-roxy-auth` header; each call is one streamed `POST /v1/messages`. The scripted responses go by: a greeting, a `Bash` tool call that runs `ls -la`, then one that runs `curl`, which comes back as
+Each client is the Anthropic SDK, pointed at the model through roxy, with its credential in an `x-roxy-auth` header; each call is one streamed `POST /v1/messages`. The scripted responses go by: a greeting, a `Bash` tool call running `ls -la`, then one running `curl`, which comes back as
 
 ```
 traffic-1  | [alice #2] I will fetch that page for you. roxy's sentinel blocked a Bash tool call (denylist match: 'curl').

@@ -1,8 +1,8 @@
 # Node mode
 
-In node mode roxy has no config file. It enrols with a control plane, pulls
-its policy and secrets from there as a lease, and ships its flow log back.
-The control plane is any server that implements the
+In node mode roxy has no config file: it enrols with a control plane,
+leases its policy and secrets from it, and ships its flow log back. The
+control plane is any server that implements the
 [node protocol](/reference/node-protocol).
 
 ```sh
@@ -40,9 +40,9 @@ roxy does not delete the token file after enrolment.
 | `flow.seq` | The flow `seq` counter, reserved in blocks of 1024. A restart continues after the last block. |
 | `ca/` | The interception CA, as `tls.ca_dir` holds it in file mode. |
 
-Nothing else is written. The rendered config and the secret values stay in
-memory, so a copy of the state dir gives an attacker a revocable node
-identity and nothing else.
+Nothing else is written: the rendered config and the secret values stay in
+memory, so a copy of the state dir is a revocable node identity and nothing
+else.
 
 ### The interception CA
 
@@ -56,9 +56,9 @@ config are ignored with a warning.
   state dir holds no CA: the pair is imported (key `0600`) and used. A later
   start without the flags uses the stored pair; it is never regenerated.
 - The flags name a pair different from the stored one: roxy refuses to
-  start and prints both fingerprints. Workloads already trust the stored
-  CA, so replacing it is explicit: delete `roxy-ca.pem` and `roxy-ca.key`
-  from `<state-dir>/ca`, or pass `--replace-interception-ca`.
+  start and prints both fingerprints, since workloads already trust the
+  stored CA. To replace it, delete `roxy-ca.pem` and `roxy-ca.key` from
+  `<state-dir>/ca`, or pass `--replace-interception-ca`.
 - A stored pair that does not parse is fatal, as in file mode.
 
 Workloads fetch the CA from `ca_server` as usual
@@ -85,12 +85,12 @@ Workloads fetch the CA from `ca_server` as usual
 
 ## The lease
 
-Every poll answers with the whole lease, and a lease is applied in full or
-not at all. The rendered config goes through the same validation as
-`roxy check`; a config it would reject, or a declared secret with no value,
-is logged (`lease could not be applied`) and the running policy stays. The
-node then reports the old `lease_id` on its next fetch, which is how the
-control plane learns the lease did not take.
+Every poll answers with the whole lease, applied in full or not at all.
+The rendered config goes through the same validation as `roxy check`; a
+config it would reject, or a declared secret with no value, is logged
+(`lease could not be applied`) and the running policy stays. The node then
+reports the old `lease_id` on its next fetch, which is how the control
+plane learns the lease did not take.
 
 The fields are in the [lease body](/reference/node-protocol#lease-body).
 `valid_for_seconds` becomes the policy's `valid_until`, on the node's own
@@ -103,10 +103,10 @@ supplies the config's `secrets:` entries that declare `lease: true`; `env`
 and `file` sources are resolved on the node as in file mode, and a name
 with no value from either refuses the lease.
 
-The response codes and what the node does with each are in the
+What the node does with each response code is in the
 [errors table](/reference/node-protocol#errors). A `410` (revoked) installs
 an empty, already expired policy at once, ships what is spooled and stops
-polling, and a restart with the same state dir ends the same way. A `401`,
+polling; a restart with the same state dir ends the same way. A `401`,
 `426` or unreachable control plane lets the lease run down: the node denies
 everything from `valid_until` until the next `200`, which recovers it
 without a restart. It never re-enrols unasked; to re-enrol, empty the state

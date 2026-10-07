@@ -11,15 +11,11 @@ both streams of every exchange it runs on. An addon is either:
   path, which each exchange streams through over a WebSocket
   ([service layer protocol](/reference/service-layers)).
 
-Both sit in the same stack and obey the same invariants.
-
 ## The stack
 
-An exchange passes through an ordered stack of layers. Each layer wraps
-everything below it: it receives the request (head and body stream), may
-pass a request down with `next`, receives the response stream from below,
-and returns a response stream upward. The first layer sees the request
-first and the response last.
+Each layer wraps everything below it: it receives the request (head and
+body stream), may pass a request down with `next`, and returns a response
+stream upward.
 
 ```
                  request ↓                                   ↑ response
@@ -32,16 +28,15 @@ first and the response last.
 ```
 
 Addons always sit above the rules, in the order listed under `addons:`. A
-layer with a `when` runs only on the exchanges it matches, and the rest
-pass it by ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)).
+layer with a `when` runs only on the exchanges it matches
+([choosing exchanges](/reference/addon-configuration#choosing-exchanges)).
 Nothing configurable runs between the rules and the network, so what the
 rules judged is what leaves.
 
-The stack is a pipeline. Every layer runs at once, as its own task, so on
-a long stream each one works on a different chunk at the same time. Each
-chunk passes through the layers in order, and each layer sees what the
-layer above passed on. Observe layers get copies, so they run beside the
-stream rather than in it.
+The stack is a pipeline: every layer runs at once, as its own task, each
+seeing what the layer above passed on, so on a long stream each works on a
+different chunk at the same time. Observe layers get copies and run beside
+the stream rather than in it.
 
 ## Invariants
 
@@ -63,10 +58,10 @@ stream rather than in it.
 
 A layer calls `next` at most once per exchange; a second call traps. The
 stack carries the client's traffic and nothing else: a layer never
-originates requests through the layers below it. Retrying, regenerating or
-replaying is the client's job, and a layer that rejects something answers
-with a response the client can act on. A layer that needs to talk to
-anything else calls a [named endpoint](/reference/host-services#endpoints-endpoints),
+originates requests through the layers below it, so retrying, regenerating
+or replaying is the client's job, and a layer that rejects something
+answers with a response the client can act on. Anything else a layer needs
+to reach is a [named endpoint](/reference/host-services#endpoints-endpoints),
 which goes straight to the connector, never through other layers or the
 rules.
 
@@ -74,16 +69,11 @@ rules.
 
 A layer may read, rewrite, split, delay, inject into or replace either
 stream, chunk by chunk. roxy buffers nothing on a layer's behalf; a layer
-that wants a whole body reads it, within its `max_memory`. Typical
-patterns:
-
-- **Observe:** `next(req)`, then return its response unchanged (or use
-  observe mode).
-- **Rewrite in flight:** wrap a body stream in a transform.
-- **Withhold until cleared:** forward a streamed response's text as it
-  arrives, but hold back parts (say, tool calls) until the layer has judged
-  them.
-- **Deny or answer:** return a response without calling `next`.
+that wants a whole body reads it, within its `max_memory`. The patterns:
+observe (`next(req)`, return its response unchanged), rewrite in flight
+(wrap a body stream in a transform), withhold until cleared (forward a
+streamed response as it arrives but hold back parts, say tool calls, until
+judged), and deny or answer (return a response without calling `next`).
 
 A WebSocket is an exchange like any other, only long-lived: after the
 `101`, the request body carries the client's bytes and the response body
@@ -98,19 +88,17 @@ Layers see bodies decoded, so none needs its own decompressors
 - `mode: observe`: roxy tees both streams to the layer and ignores
   anything it returns except host-service calls such as `record`. The
   layer cannot change or delay traffic, so its failures cannot weaken
-  containment: a trap or missed deadline is logged, not fatal. This is the
-  way to deploy an uncalibrated monitor. `sample` gives it a share of the
-  matching exchanges rather than all of them.
+  containment: a trap or missed deadline is logged, not fatal, which makes
+  it the way to deploy an uncalibrated monitor. `sample` gives it a share
+  of the matching exchanges, and an observer may `record` but cannot tag
+  the flow ([capabilities](/reference/addon-configuration#capabilities)).
 
   Each copy is buffered for the layer, so one that keeps up sees every
   body in full, however large. A copy is cut, and the flow goes on, when
-  the layer falls `limits.max_observer_lag_bytes` behind (16 MiB by
-  default, per direction) or when the
-  [buffer budget](/reference/limits#limits) cannot cover its next frame;
-  either is reported as `observer_lagged` with the `reason`. A request
-  refused or answered below the observer without its body being read ends
-  the copy where the reading stopped, without an error, and the observer
-  sees the refusal from `next`; a copy that fails (the client went away
-  mid-upload) ends with that failure, so the layer can tell the two apart.
-  An observer may `record` but cannot tag the flow
-  ([capabilities](/reference/addon-configuration#capabilities)).
+  the layer falls `limits.max_observer_lag_bytes` behind or the
+  [buffer budget](/reference/limits#limits) cannot cover its next frame
+  (`observer_lagged`, with the `reason`). A request refused or answered
+  below the observer without its body being read ends the copy where the
+  reading stopped, without an error, and the observer sees the refusal
+  from `next`; a copy that fails (the client went away mid-upload) ends
+  with that failure, so the layer can tell the two apart.
