@@ -731,7 +731,6 @@ impl NodeRunning {
             let sink = server.handle().sink();
             let capture = server.handle().capture();
             server.shutdown(grace).await;
-            self.node.drain(DRAIN_GRACE).await;
             let _ = tokio::task::spawn_blocking(move || {
                 sink.flush();
                 if let Some(c) = capture {
@@ -740,6 +739,9 @@ impl NodeRunning {
             })
             .await;
         }
+        // Spool contents are shipped whether or not the bootstrap listeners
+        // came up, so revocation and shutdown events still reach the control plane.
+        self.node.drain(DRAIN_GRACE).await;
     }
 }
 
