@@ -72,10 +72,13 @@ Workloads fetch the CA from `ca_server` as usual
    answers `503 no_policy`.
 2. With no `node.crt` in the state dir the node reads the token, generates
    a key pair and a CSR, and enrols; the certificate and key go to the state
-   dir. A `401` is retried with backoff for two minutes, then the node exits
-   non-zero, so an orchestrator sees a crash loop rather than a node that
-   denies everything for ever. Any other failure is retried for as long as
-   it lasts. With a `node.crt` present the token file is not read.
+   dir. A `401` (or another `4xx`) is retried with backoff for two minutes,
+   then the node exits non-zero, so an orchestrator sees a crash loop rather
+   than a node that denies everything for ever; a `410` or `426` exits at
+   once. An unreachable control plane is retried for as long as the outage
+   lasts. With a `node.crt` present the token file is not read; if that
+   certificate has expired the node exits non-zero too, naming the remedy:
+   a new token and an empty state dir.
 3. The node fetches its lease and applies it. The first lease's
    `listeners`, `ca_server`, `tls`, connection limits and log destinations
    replace the bootstrap ones. Later leases that change one of those
@@ -105,18 +108,23 @@ with no value from either refuses the lease.
 
 What the node does with each response code is in the
 [errors table](/reference/node-protocol#errors). A `410` (revoked) installs
-an empty, already expired policy at once, ships what is spooled and stops
-polling; a restart with the same state dir ends the same way. A `401`,
-`426` or unreachable control plane lets the lease run down: the node denies
-everything from `valid_until` until the next `200`, which recovers it
-without a restart. It never re-enrols unasked; to re-enrol, empty the state
-dir and start with a new token.
+an empty, already expired policy at once, stops polling and offers what is
+spooled to the control plane; a restart with the same state dir ends the
+same way. A `401`, `400`, `426` or unreachable control plane lets the lease
+run down: the node denies everything from `valid_until` until the next
+`200`, which recovers it without a restart. It never re-enrols unasked; to
+re-enrol, empty the state dir and start with a new token. A node whose
+certificate expires exits non-zero, since only re-enrolment can recover it.
 
 ## Flow shipping
 
 Every flow-log event goes to the local `log.flow` destination as usual, and
 into an in-memory spool tagged with a per-node `seq` that the lease's `flow`
 settings say how to ship ([flow upload](/reference/node-protocol#flow-upload)).
+A batch is posted when `batch_max_bytes` of events are waiting or
+`flush_interval_seconds` have passed since the oldest unsent one, whichever
+comes first, so the request rate to the control plane is bounded by the
+interval however busy the proxy is.
 At `spool_high_water_bytes` of unacknowledged events, `on_high_water: hold`
 holds traffic through roxy's flow-log backpressure until the control plane
 acknowledges enough; `spool` drops the oldest and logs once per episode. A

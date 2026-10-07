@@ -52,6 +52,16 @@ pub enum NodeError {
     EnrolRejected(String),
     #[error("enrolment response names node {claimed} but the certificate names {in_cert}")]
     NodeIdMismatch { claimed: String, in_cert: String },
+    #[error(
+        "the node certificate for {node_id} expired at {}; re-enrol with a new token and an empty state dir ({})",
+        not_after.to_rfc3339(),
+        dir.display()
+    )]
+    CertificateExpired {
+        node_id: String,
+        not_after: DateTime<Utc>,
+        dir: PathBuf,
+    },
     #[error("reading the control plane CA bundle {}: {source}", path.display())]
     CaBundle {
         path: PathBuf,
@@ -151,11 +161,11 @@ pub struct Node {
     spool: Arc<Spool>,
     identity: Mutex<Option<Arc<Identity>>>,
     current: Mutex<Current>,
-    /// The shipper, from [`Node::run`] spawning it until [`Node::drain`]
-    /// takes it. Owned here rather than by `run` so a shutdown that aborts
-    /// the node task can still stop it before anything else touches the
-    /// spool.
-    shipper: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The shipper, the one task the node runs outside its own: it must
+    /// outlive an abort of the node task so shutdown can drain. It stays
+    /// here until [`Node::drain`] has seen it end, so a drain cut short by
+    /// an abort leaves it for the next one rather than detaching it.
+    shipper: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     revoked: AtomicBool,
     /// The running lease's `refresh_after_seconds` was reduced, and the
     /// warning for it logged.
@@ -190,7 +200,7 @@ impl Node {
             spool,
             identity: Mutex::new(None),
             current: Mutex::new(Current::default()),
-            shipper: Mutex::new(None),
+            shipper: tokio::sync::Mutex::new(None),
             revoked: AtomicBool::new(false),
             refresh_clamped: AtomicBool::new(false),
             started: Instant::now(),
@@ -224,37 +234,44 @@ impl Node {
     }
 
     /// Enrols (first start) or loads the identity, then runs the lease loop
-    /// and the certificate renewal until revoked or aborted. The shipper it
-    /// starts outlives an abort: [`Node::drain`] stops it.
+    /// and the certificate renewal, in this task, until revoked or aborted.
+    /// The shipper it starts outlives an abort: [`Node::drain`] stops it.
     /// Returns `Err` only for what a retry cannot fix.
     pub async fn run(self: Arc<Self>) -> Result<(), NodeError> {
         self.establish_identity().await?;
-        *lock(&self.shipper) = Some(tokio::spawn(self.clone().ship_loop()));
-        let mut renewer = tokio::spawn(self.clone().renew_loop());
-        tokio::select! {
-            () = self.lease_loop() => {}
+        *self.shipper.lock().await = Some(tokio::spawn(self.clone().ship_loop()));
+        let ended = tokio::select! {
+            r = self.lease_loop() => r,
             // A renewal answered 410 ends the node like a lease fetch does;
             // any other end of the renewer leaves the lease loop running.
-            Ok(true) = &mut renewer => {}
-        }
-        // Revoked: ship what is spooled, then stop.
-        self.drain(self.scaled(Duration::from_secs(30))).await;
-        renewer.abort();
-        Ok(())
+            true = self.renew_loop() => Ok(()),
+        };
+        // Revoked: ship what is spooled, then stop. An error here means the
+        // certificate is unusable, so nothing could ship.
+        let grace = match ended {
+            Ok(()) => self.scaled(Duration::from_secs(30)),
+            Err(_) => Duration::ZERO,
+        };
+        self.drain(grace).await;
+        ended
     }
 
     /// Ships whatever is still spooled, within `grace`, then stops the
     /// shipper. Only the shipper posts, so a batch it has in flight is not
     /// posted a second time. The bound holds mid-request: an upload still in
     /// progress at the deadline is dropped. With no shipper (no identity
-    /// yet, or drained already) nothing could ship.
+    /// yet, or drained already) nothing could ship. Safe to abort: the
+    /// shipper stays owned until a drain runs to its end.
     pub async fn drain(&self, grace: Duration) {
         self.spool.close();
-        let Some(mut shipper) = lock(&self.shipper).take() else {
+        let mut shipper = self.shipper.lock().await;
+        let Some(handle) = shipper.as_mut() else {
             return;
         };
-        let _ = tokio::time::timeout(grace, &mut shipper).await;
-        shipper.abort();
+        if tokio::time::timeout(grace, &mut *handle).await.is_err() {
+            handle.abort();
+        }
+        *shipper = None;
     }
 
     async fn establish_identity(&self) -> Result<(), NodeError> {
@@ -382,13 +399,24 @@ impl Node {
 
     /// Fetches at `refresh_after`, with backoff while the control plane
     /// cannot be reached; the lease runs down on its own meanwhile. A
-    /// `401` or `426` is logged when the outcome changes, not on every
-    /// poll. Ends on revocation.
-    async fn lease_loop(&self) {
+    /// `401`, `426` or other `4xx` is logged when the outcome changes, not
+    /// on every poll. Ends on revocation, or with `Err` once the
+    /// certificate has expired: no server recognises it, so the node exits
+    /// rather than deny for ever.
+    async fn lease_loop(&self) -> Result<(), NodeError> {
         let mut backoff = Backoff::new();
         let mut last = FetchOutcome::Lease;
         loop {
-            let Some(id) = self.client() else { return };
+            let Some(id) = self.client() else {
+                return Ok(());
+            };
+            if id.not_after <= Utc::now() {
+                return Err(NodeError::CertificateExpired {
+                    node_id: id.node_id.clone(),
+                    not_after: id.not_after,
+                    dir: self.state.path().to_path_buf(),
+                });
+            }
             let state = self.node_state();
             let fetched_at = Utc::now();
             let fetched = id.client.fetch_lease(&state).await;
@@ -402,7 +430,7 @@ impl Node {
                 }
                 LeaseFetch::Revoked => {
                     self.revoke().await;
-                    return;
+                    return Ok(());
                 }
                 LeaseFetch::Unsupported(e) => {
                     if changed {
@@ -419,6 +447,15 @@ impl Node {
                         tracing::error!(
                             not_after = %id.not_after.to_rfc3339(),
                             "control plane does not recognise the node certificate; the lease runs down (re-enrolment needs a new token and an empty state dir)"
+                        );
+                    }
+                    backoff.wait()
+                }
+                LeaseFetch::Rejected(e) => {
+                    if changed {
+                        tracing::error!(
+                            error = %e,
+                            "control plane rejected the lease request; the lease runs down while polling continues"
                         );
                     }
                     backoff.wait()
@@ -539,7 +576,7 @@ impl Node {
     /// use. A 4xx is final: the loop ends and the current certificate serves
     /// until `not_after`. Returns `true` if the control plane said the node
     /// is revoked.
-    async fn renew_loop(self: Arc<Self>) -> bool {
+    async fn renew_loop(&self) -> bool {
         let mut backoff = Backoff::new();
         loop {
             let Some(id) = self.client() else {
@@ -620,75 +657,69 @@ impl Node {
         }
     }
 
-    /// Ships batches as they fill or every `flush_interval`, until the
-    /// spool is closed and drained, or the quota is exhausted.
+    /// Posts a batch when `batch_max_bytes` are waiting, when the oldest
+    /// unsent event is `flush_interval_seconds` old, or when the spool is
+    /// closed, whichever comes first. Ends once the spool is closed and
+    /// nothing shippable is left.
     async fn ship_loop(self: Arc<Self>) {
-        let mut stopped = Stopped::default();
+        // The lease under which shipping stopped (507 or 410); the next
+        // lease id resumes it.
+        let mut stopped_under: Option<String> = None;
         let mut backoff = Backoff::new();
         loop {
             let settings = self.spool.settings();
             let flush = self.scaled(Duration::from_secs(settings.flush_interval_seconds.max(1)));
-            let full = self.spool.pending_bytes() >= settings.batch_max_bytes;
-            // Before the first lease there is nothing to tag a batch with.
-            let no_lease = lock(&self.current).lease_id.is_none();
-            if (!full || no_lease) && !self.spool.is_closed() {
-                let _ = tokio::time::timeout(flush, self.spool.pushed.notified()).await;
-            }
-            if self.spool.pending_events() == 0 {
-                if self.spool.is_closed() {
+            let closed = self.spool.is_closed();
+            let Some(since) = self.spool.oldest_since() else {
+                if closed {
                     return;
                 }
+                self.spool.pushed.notified().await;
                 continue;
-            }
-            // A batch is tagged with the lease in force; with none there
-            // is nothing to ship, and nothing ever will be once closed.
+            };
+            // A batch quotes the lease in force: nothing ships before the
+            // first lease, nor under the lease shipping stopped on. A closed
+            // spool sees no new lease; meanwhile `on_high_water` applies.
             let lease_id = lock(&self.current).lease_id.clone();
-            if lease_id.is_none() {
-                if self.spool.is_closed() {
-                    return;
-                }
-                continue;
-            }
-            if stopped.under.is_some() && stopped.under == lease_id {
-                // Shipping resumes with a new lease id, which a closed spool
-                // will not see; meanwhile the spool applies `on_high_water`.
-                if self.spool.is_closed() {
+            if lease_id.is_none() || lease_id == stopped_under {
+                if closed {
                     return;
                 }
                 let _ = tokio::time::timeout(flush, self.spool.pushed.notified()).await;
                 continue;
             }
-            stopped.under = None;
-            if self.ship_once(&mut stopped).await {
-                backoff.reset();
-            } else if stopped.under.is_some() {
-                if self.spool.is_closed() {
-                    return;
-                }
-            } else {
-                tokio::time::sleep(self.scaled(backoff.wait())).await;
+            let full = self.spool.pending_bytes() >= settings.batch_max_bytes;
+            let due_in = flush.saturating_sub(since.elapsed());
+            if !full && !closed && !due_in.is_zero() {
+                let _ = tokio::time::timeout(due_in, self.spool.pushed.notified()).await;
+                continue;
+            }
+            match self.ship_once().await {
+                Shipped::Acked => backoff.reset(),
+                Shipped::Stopped(under) => stopped_under = Some(under),
+                Shipped::Failed => tokio::time::sleep(self.scaled(backoff.wait())).await,
             }
         }
     }
 
-    /// One upload attempt. `true` when a batch was acknowledged. Nothing
-    /// is sent before the first lease: a batch quotes the lease in force.
-    async fn ship_once(&self, stopped: &mut Stopped) -> bool {
+    /// One upload attempt. Nothing is sent before the first lease: a batch
+    /// quotes the lease in force.
+    async fn ship_once(&self) -> Shipped {
         let Some(id) = self.client() else {
-            return false;
+            return Shipped::Failed;
         };
         let Some(lease_id) = lock(&self.current).lease_id.clone() else {
-            return false;
+            return Shipped::Failed;
         };
         let settings = self.spool.settings();
         let Some(batch) = self.spool.batch(settings.batch_max_bytes) else {
-            return false;
+            return Shipped::Failed;
         };
         let body = encode_flow_batch(&id.node_id, &lease_id, batch.seq_first, &batch.lines);
         match id.client.ship_flows(&body).await {
             ShipOutcome::Acked(ack) => {
                 self.spool.ack(ack.acked_through);
-                true
+                Shipped::Acked
             }
             ShipOutcome::QuotaExhausted => {
                 tracing::error!(
@@ -697,15 +728,13 @@ impl Node {
                     on_high_water = ?settings.on_high_water,
                     "control plane flow quota exhausted for this node; flow shipping stops until a new lease"
                 );
-                stopped.under = Some(lease_id);
-                false
+                Shipped::Stopped(lease_id)
             }
             ShipOutcome::Revoked => {
                 tracing::warn!(
                     "control plane refuses flows from a revoked node; flow shipping stops"
                 );
-                stopped.under = Some(lease_id);
-                false
+                Shipped::Stopped(lease_id)
             }
             ShipOutcome::Rejected(e) => {
                 // Unshipped audit is still audit: the batch stays and the
@@ -718,20 +747,24 @@ impl Node {
                     on_high_water = ?settings.on_high_water,
                     "control plane rejected the flow batch; keeping it and retrying"
                 );
-                false
+                Shipped::Failed
             }
             ShipOutcome::Failed(e) => {
                 tracing::warn!(error = %e, spooled_bytes = self.spool.pending_bytes(), "flow upload failed; keeping the batch");
-                false
+                Shipped::Failed
             }
         }
     }
 }
 
-/// The lease under which shipping stopped (507 or 410), if any.
-#[derive(Debug, Default)]
-struct Stopped {
-    under: Option<String>,
+/// How one upload attempt ended.
+#[derive(Debug)]
+enum Shipped {
+    Acked,
+    /// Shipping stopped (507 or 410) under this lease id.
+    Stopped(String),
+    /// The batch stays spooled for a retry after a backoff.
+    Failed,
 }
 
 /// A lease fetch's outcome, without its payload: what "the outcome changed"
@@ -742,6 +775,7 @@ enum FetchOutcome {
     Revoked,
     Unsupported,
     Unauthorized,
+    Rejected,
     Failed,
 }
 
@@ -752,6 +786,7 @@ impl FetchOutcome {
             LeaseFetch::Revoked => Self::Revoked,
             LeaseFetch::Unsupported(_) => Self::Unsupported,
             LeaseFetch::Unauthorized => Self::Unauthorized,
+            LeaseFetch::Rejected(_) => Self::Rejected,
             LeaseFetch::Failed(_) => Self::Failed,
         }
     }
@@ -1163,6 +1198,7 @@ mod tests {
                 },
             ),
         );
+        h.mock.push(LEASE, Reply::status(400));
         h.mock.push(LEASE, Reply::status(500));
         h.mock.push(LEASE, Reply::Hangup);
         let l2 = lease("L2", "version: 1\n", "s1", "e1");
@@ -1170,7 +1206,7 @@ mod tests {
         h.mock.fallback(LEASE, Reply::json(200, &l2));
         let (node, rec) = h.node(true);
         let task = tokio::spawn(node.clone().run());
-        h.mock.wait_for(LEASE, 7).await;
+        h.mock.wait_for(LEASE, 8).await;
         let ids: Vec<_> = lock(&rec.applied)
             .iter()
             .map(|(l, ..)| l.lease_id.clone())
@@ -1279,6 +1315,164 @@ mod tests {
             .map(|r| r.json()["seq_first"].as_u64().unwrap())
             .collect();
         assert_eq!(seq_firsts, [0, 2]);
+    }
+
+    /// The post-revocation drain runs in the node task. Aborting that task
+    /// while the shipper has a post in flight leaves the shipper owned, so
+    /// the shutdown's drain still waits for what is spooled.
+    #[tokio::test]
+    async fn a_drain_cut_short_by_an_abort_is_finished_by_the_next() {
+        let h = Harness::new().await;
+        h.mock.push("/roxy/v1/enrol", Reply::issue("n1"));
+        let mut l = lease("L1", "version: 1\n", "s1", "e1");
+        l.flow.flush_interval_seconds = 1;
+        l.refresh_after_seconds = 1;
+        h.mock.push(LEASE, Reply::json(200, &l));
+        h.mock.fallback(LEASE, Reply::status(410));
+        h.mock.fallback(
+            FLOWS,
+            Reply::Delayed(
+                Duration::from_millis(500),
+                Box::new(Reply::json(
+                    200,
+                    &FlowAck {
+                        acked_through: u64::MAX,
+                    },
+                )),
+            ),
+        );
+        let (node, _) = h.node(true);
+        let spool = node.spool().clone();
+        let task = tokio::spawn(node.clone().run());
+        h.mock.wait_for(LEASE, 1).await;
+        for i in 0..3 {
+            spool.push(format!("{{\"event\":\"request\",\"i\":{i}}}").as_bytes());
+        }
+        h.mock.wait_for(FLOWS, 1).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !spool.is_closed() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("revocation closes the spool and starts the drain");
+        assert!(!task.is_finished(), "the node task is mid-drain");
+        task.abort();
+        let _ = task.await;
+        node.drain(Duration::from_secs(5)).await;
+        assert_eq!(spool.pending_events(), 0, "drained");
+        assert_eq!(
+            h.mock.requests_to(FLOWS).len(),
+            1,
+            "one post, acknowledged once"
+        );
+    }
+
+    /// Events spaced well inside `flush_interval_seconds` travel in one
+    /// batch, posted once the interval has passed since the first.
+    #[tokio::test]
+    async fn events_within_the_flush_interval_ship_as_one_batch() {
+        let h = Harness::new().await;
+        h.mock.push("/roxy/v1/enrol", Reply::issue("n1"));
+        let mut l = lease("L1", "version: 1\n", "s1", "e1");
+        l.flow.flush_interval_seconds = 30;
+        h.mock.fallback(LEASE, Reply::json(200, &l));
+        h.mock.fallback(
+            FLOWS,
+            Reply::json(
+                200,
+                &FlowAck {
+                    acked_through: u64::MAX,
+                },
+            ),
+        );
+        let (node, _) = h.node(true);
+        let spool = node.spool().clone();
+        let task = tokio::spawn(node.clone().run());
+        h.mock.wait_for(LEASE, 1).await;
+        let flush = node.scaled(Duration::from_secs(30));
+        let first_push = Instant::now();
+        for i in 0..3 {
+            spool.push(format!("{{\"i\":{i}}}").as_bytes());
+            tokio::time::sleep(flush / 10).await;
+        }
+        let posts = h.mock.wait_for(FLOWS, 1).await;
+        assert!(
+            first_push.elapsed() >= flush,
+            "posted {:?} after the first event",
+            first_push.elapsed()
+        );
+        assert_eq!(posts[0].json()["events"].as_array().unwrap().len(), 3);
+        tokio::time::sleep(flush).await;
+        assert_eq!(h.mock.requests_to(FLOWS).len(), 1);
+        task.abort();
+    }
+
+    /// A stored certificate past `not_after` cannot be renewed or
+    /// recognised: the node ends with the error that names the remedy,
+    /// before any fetch.
+    #[tokio::test]
+    async fn an_expired_stored_certificate_is_fatal() {
+        let h = Harness::new().await;
+        h.mock.push(
+            "/roxy/v1/enrol",
+            Reply::Issue {
+                node_id: "n1".into(),
+                lifetime_secs: -60,
+                renew_after_seconds: 1,
+            },
+        );
+        h.mock.fallback(LEASE, Reply::status(500));
+        let (node, _) = h.node(true);
+        let err = tokio::time::timeout(Duration::from_secs(5), node.run())
+            .await
+            .expect("ends rather than retrying")
+            .unwrap_err();
+        assert!(
+            matches!(&err, NodeError::CertificateExpired { node_id, .. } if node_id == "n1"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("empty state dir"), "{err}");
+        assert!(h.mock.requests_to(LEASE).is_empty());
+
+        // A restart with the same state dir ends the same way.
+        let (node, _) = h.node(false);
+        assert!(matches!(
+            node.run().await,
+            Err(NodeError::CertificateExpired { .. })
+        ));
+        assert_eq!(h.mock.requests_to("/roxy/v1/enrol").len(), 1);
+    }
+
+    /// A certificate that expires while the node runs, its renewal having
+    /// been refused, ends the node the same way instead of a failing fetch
+    /// on every poll.
+    #[tokio::test]
+    async fn a_certificate_that_expires_while_running_ends_the_node() {
+        let h = Harness::new().await;
+        h.mock.push(
+            "/roxy/v1/enrol",
+            Reply::Issue {
+                node_id: "n1".into(),
+                lifetime_secs: 1,
+                renew_after_seconds: 1,
+            },
+        );
+        h.mock.fallback("/roxy/v1/renew", Reply::status(401));
+        let mut l = lease("L1", "version: 1\n", "s1", "e1");
+        l.refresh_after_seconds = 1;
+        h.mock.fallback(LEASE, Reply::json(200, &l));
+        let (node, rec) = h.node(true);
+        let task = tokio::spawn(node.clone().run());
+        h.mock.wait_for("/roxy/v1/renew", 1).await;
+        let err = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("ends once the certificate has expired")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(err, NodeError::CertificateExpired { .. }), "{err}");
+        assert!(!lock(&rec.applied).is_empty(), "served until expiry");
+        assert_eq!(h.mock.requests_to("/roxy/v1/renew").len(), 1);
     }
 
     #[tokio::test]
