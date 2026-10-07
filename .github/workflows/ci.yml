@@ -54,24 +54,32 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --locked
 
-  # Every workspace with its own lock file, against the root deny.toml.
+  # Every workspace with its own lock file, against the root deny.toml. One
+  # job, not a matrix: the branch rules require a check named `deny`.
   deny:
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        manifest:
-          - Cargo.toml
-          - crates/roxy-wasm/test-components/Cargo.toml
-          - examples/quickstart/addons/Cargo.toml
-          - fuzz/Cargo.toml
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
-          manifest-path: ${{ matrix.manifest }}
+          manifest-path: Cargo.toml
+          arguments: --locked --config deny.toml
+          command: check advisories bans licenses sources
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: crates/roxy-wasm/test-components/Cargo.toml
+          arguments: --locked --config deny.toml
+          command: check advisories bans licenses sources
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: examples/quickstart/addons/Cargo.toml
+          arguments: --locked --config deny.toml
+          command: check advisories bans licenses sources
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: fuzz/Cargo.toml
           arguments: --locked --config deny.toml
           command: check advisories bans licenses sources
 
