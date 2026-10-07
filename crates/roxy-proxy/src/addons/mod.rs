@@ -239,6 +239,8 @@ struct LayerSlot {
     /// The layer's own outcome, once its handler returned a response: a
     /// failure after the head shows here first.
     outcome: Mutex<Option<LayerOutcome>>,
+    /// A service layer failed its stream, which no outcome carries.
+    failed: AtomicBool,
 }
 
 impl LayerSlot {
@@ -601,10 +603,20 @@ impl StackFlow {
             .collect()
     }
 
-    /// Whether a WASM layer below `index` failed the exchange after its
-    /// head, once those that answered have settled.
+    /// Service layer `index` failed its stream on its own account.
+    pub(crate) fn service_failed(&self, index: usize) {
+        self.layers[index].failed.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a layer below `index` failed the exchange after its head,
+    /// once the WASM layers that answered have settled. A service layer's
+    /// failure is recorded before the body it cuts fails, so it is here by
+    /// the time anything above sees the cut.
     pub(crate) async fn failed_below(&self, index: usize) -> bool {
         first_failure(self.outcomes_from(index + 1)).await.is_err()
+            || self.layers[index + 1..]
+                .iter()
+                .any(|l| l.failed.load(Ordering::SeqCst))
     }
 
     /// The client asked for a WebSocket, the one upgrade the core relays.
