@@ -13,9 +13,13 @@ use crate::url::{self, Path, Query};
 /// legal and what `Host` must equal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
-    /// The explicit proxy port: absolute-form and CONNECT (origin-form is
+    /// The HTTP proxy port: absolute-form and CONNECT (origin-form is
     /// surfaced separately for the `roxy.internal` special case).
     ProxyPort,
+    /// An `http` listener, spoken to as the server: origin-form only, with
+    /// the authority taken from each request's `Host` (port 80 implied)
+    /// and scheme `http`.
+    Origin,
     /// Inside a CONNECT tunnel (after TLS termination, or plaintext with
     /// `http.allow_plain_in_connect`): origin-form only, `Host` must equal
     /// `authority`.
@@ -448,6 +452,10 @@ fn resolve_target(
                 Reason::TargetFormMismatch,
                 "only origin-form is accepted inside a tunnel",
             ),
+            Role::Origin => reject(
+                Reason::TargetFormMismatch,
+                "only origin-form is accepted on an http listener",
+            ),
         };
     }
     // Origin-form: `Host` names the target, or must agree with the tunnel.
@@ -456,7 +464,7 @@ fn resolve_target(
     };
     let (path, query) = url::parse_origin_form(target)?;
     let (scheme, authority) = match role {
-        Role::ProxyPort => (
+        Role::ProxyPort | Role::Origin => (
             Scheme::Http,
             url::parse_authority(h, Scheme::Http.default_port())?,
         ),
@@ -576,6 +584,78 @@ mod tests {
         assert_eq!(
             parse("CONNECT http://example.com/ HTTP/1.1\r\n\r\n").unwrap_err(),
             Reason::BadRequestTarget
+        );
+    }
+
+    fn parse_origin(raw: &str) -> Result<Head, Reason> {
+        parse_head(
+            raw.as_bytes(),
+            &Role::Origin,
+            &Limits::default(),
+            &HttpFlags::default(),
+        )
+        .map_err(|e| e.reason)
+    }
+
+    #[test]
+    fn origin_role_takes_the_authority_from_host() {
+        let Head::Request(h) =
+            parse_origin("GET /v1/messages?x=1 HTTP/1.1\r\nHost: Anthropic.GW.example.com\r\n\r\n")
+                .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(h.scheme, Scheme::Http);
+        assert_eq!(h.authority.to_string(), "anthropic.gw.example.com:80");
+        assert_eq!(h.path.as_str(), "/v1/messages");
+        assert_eq!(h.query.unwrap().as_str(), "x=1");
+        assert_eq!(h.meta.target_form, TargetForm::Origin);
+        assert!(!h.headers.contains("host"));
+
+        let Head::Request(h) =
+            parse_origin("GET / HTTP/1.1\r\nHost: gw.example.com:8080\r\n\r\n").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(h.authority.to_string(), "gw.example.com:8080");
+    }
+
+    #[test]
+    fn origin_role_refuses_every_other_target_form() {
+        assert_eq!(
+            parse_origin("GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                .unwrap_err(),
+            Reason::TargetFormMismatch
+        );
+        assert_eq!(
+            parse_origin("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+                .unwrap_err(),
+            Reason::TargetFormMismatch
+        );
+        assert_eq!(
+            parse_origin("OPTIONS * HTTP/1.1\r\nHost: example.com\r\n\r\n").unwrap_err(),
+            Reason::BadRequestTarget
+        );
+    }
+
+    #[test]
+    fn origin_role_requires_a_well_formed_host() {
+        assert_eq!(
+            parse_origin("GET / HTTP/1.1\r\n\r\n").unwrap_err(),
+            Reason::MissingHost
+        );
+        assert_eq!(
+            parse_origin("GET / HTTP/1.1\r\nHost: \r\n\r\n").unwrap_err(),
+            Reason::BadAuthority
+        );
+        assert_eq!(
+            parse_origin("GET / HTTP/1.1\r\nHost: ex ample.com\r\n\r\n").unwrap_err(),
+            Reason::BadAuthority
+        );
+        assert_eq!(
+            parse_origin("GET / HTTP/1.1\r\nHost: a.test\r\nHost: b.test\r\n\r\n")
+                .unwrap_err(),
+            Reason::MultipleHost
         );
     }
 
