@@ -372,7 +372,7 @@ async fn h1_request_body_cap_closes_mid_stream() {
 }
 
 /// A chunked request for `target` with trailers, as the client sends it.
-fn trailered(target: &str) -> Vec<u8> {
+pub(super) fn trailered(target: &str) -> Vec<u8> {
     format!(
         "POST {target} HTTP/1.1\r\nhost: up.test\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nx-checksum: abc\r\n\r\n"
     )
@@ -380,7 +380,9 @@ fn trailered(target: &str) -> Vec<u8> {
 }
 
 /// An HTTP/1.1 client inside a `CONNECT up.test:443` tunnel.
-async fn h1_in_tunnel(kit: &Kit) -> tokio_rustls::client::TlsStream<tokio::io::DuplexStream> {
+pub(super) async fn h1_in_tunnel(
+    kit: &Kit,
+) -> tokio_rustls::client::TlsStream<tokio::io::DuplexStream> {
     let io = kit.connect_tunnel("up.test", 443).await;
     kit.tls_connect(io, "up.test", &[b"http/1.1"])
         .await
@@ -594,6 +596,77 @@ async fn h2_request_trailers_are_reset_by_default() {
     assert_eq!(ev[0]["reason"], "trailers", "{ev:#?}");
     let seen = kit.upstream.seen();
     assert!(seen.iter().all(|s| s.complete != Some(true)), "{seen:#?}");
+}
+
+/// Rules that read the body, so the exchange buffers it in both directions.
+const BODY_RULES: &str = r#"
+- id: no-secret-out
+  when: host == "up.test" and body.text contains "SECRET"
+  then: deny
+- id: no-secret-in
+  when: host == "up.test" and response.body.text contains "SECRET"
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+
+/// A response a rule buffers to read keeps its trailers: the h2 client
+/// gets `grpc-status` after the body, and an h1 client gets the chunked
+/// trailer section.
+#[tokio::test]
+async fn an_inspected_response_keeps_its_trailers() {
+    let kit = Kit::builder().rules(BODY_RULES).start().await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let (parts, body, trailers) = h2_exchange(&send, "GET", "/grpc", &[], b"", None)
+        .await
+        .unwrap();
+    assert_eq!(parts.status, 200);
+    assert_eq!(body, "hello");
+    let trailers = trailers.expect("the trailers are delivered");
+    assert_eq!(trailers["grpc-status"], "0");
+
+    let mut io = h1_in_tunnel(&kit).await;
+    io.write_all(b"GET /grpc HTTP/1.1\r\nhost: up.test\r\nconnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let (out, _) = super::read_to_eof(&mut io).await;
+    let out = String::from_utf8_lossy(&out);
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert!(
+        out.ends_with("\r\n5\r\nhello\r\n0\r\ngrpc-status: 0\r\ngrpc-message: OK\r\n\r\n"),
+        "{out}"
+    );
+}
+
+/// A request a rule buffers to read keeps its trailers on the way to the
+/// h2 upstream.
+#[tokio::test]
+async fn an_inspected_request_keeps_its_trailers() {
+    let kit = Kit::builder()
+        .rules(BODY_RULES)
+        .flags(|f| f.allow_request_trailers = true)
+        .start()
+        .await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let (parts, _, _) = h2_exchange(
+        &send,
+        "POST",
+        "/t",
+        &[],
+        b"abc",
+        Some(trailer("x-checksum", "abc")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(parts.status, 200);
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].body, b"abc");
+    let trailers = seen[0]
+        .trailers
+        .as_ref()
+        .unwrap_or_else(|| panic!("{:?}", seen[0]));
+    assert_eq!(trailers["x-checksum"], "abc");
 }
 
 /// With `http.allow_request_trailers`, the same request passes and its

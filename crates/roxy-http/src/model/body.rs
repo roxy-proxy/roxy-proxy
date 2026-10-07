@@ -28,7 +28,12 @@ enum Msg {
 
 enum Inner {
     Empty,
-    Full(Option<Bytes>),
+    /// A body held in memory: its bytes, then any trailers (boxed, like
+    /// `Prefixed`, so `Body` stays small).
+    Full {
+        data: Option<Bytes>,
+        trailers: Option<Box<HeaderMap>>,
+    },
     Channel {
         rx: mpsc::Receiver<Msg>,
         done: bool,
@@ -66,7 +71,7 @@ impl fmt::Debug for Body {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match &self.inner {
             Inner::Empty => "empty",
-            Inner::Full(_) => "full",
+            Inner::Full { .. } => "full",
             Inner::Channel { .. } => "channel",
             Inner::Boxed { .. } => "boxed",
             Inner::Prefixed(_) => "prefixed",
@@ -95,14 +100,25 @@ impl Body {
 
     /// A body from a single buffer.
     pub fn from_bytes(b: impl Into<Bytes>) -> Self {
-        let b = b.into();
-        let len = len_u64(b.len());
-        if len == 0 {
+        Self::from_parts(b, None)
+    }
+
+    /// A body from a single buffer followed by `trailers`, which it yields
+    /// as its final frame. Without trailers the known length is the
+    /// buffer's; with them it stays undeclared, so the body is framed
+    /// chunked on HTTP/1.1, the only framing that carries trailers.
+    pub fn from_parts(data: impl Into<Bytes>, trailers: Option<HeaderMap>) -> Self {
+        let data = data.into();
+        let len = len_u64(data.len());
+        if len == 0 && trailers.is_none() {
             return Self::empty();
         }
         Self {
-            inner: Inner::Full(Some(b)),
-            known_length: Some(len),
+            known_length: trailers.is_none().then_some(len),
+            inner: Inner::Full {
+                data: (len > 0).then_some(data),
+                trailers: trailers.map(Box::new),
+            },
         }
     }
 
@@ -200,36 +216,58 @@ impl Body {
     /// built with [`Body::from_bytes`], or buffered by an inspection).
     pub fn as_bytes(&self) -> Option<&Bytes> {
         match &self.inner {
-            Inner::Full(b) => b.as_ref(),
+            Inner::Full { data, .. } => data.as_ref(),
             Inner::Empty | Inner::Channel { .. } | Inner::Boxed { .. } | Inner::Prefixed(_) => None,
         }
     }
 
-    /// Buffers the whole body (for inspection paths). Fails with
-    /// [`BodyError::TooLarge`] as soon as more than `max` bytes arrive.
-    /// Trailers are discarded.
-    pub async fn collect_up_to(mut self, max: u64) -> Result<Bytes, BodyError> {
+    /// Buffers the whole body (for inspection paths): its bytes and the
+    /// trailers that followed them. Fails with [`BodyError::TooLarge`] as
+    /// soon as more than `max` bytes arrive.
+    pub async fn collect_up_to(mut self, max: u64) -> Result<Buffered, BodyError> {
         if let Some(n) = self.known_length
             && n > max
         {
             return Err(BodyError::TooLarge { limit: max });
         }
         let mut buf = BytesMut::new();
+        let mut trailers = None;
         loop {
             let frame = poll_fn(|cx| http_body::Body::poll_frame(Pin::new(&mut self), cx)).await;
             match frame {
-                None => return Ok(buf.freeze()),
+                None => {
+                    return Ok(Buffered {
+                        data: buf.freeze(),
+                        trailers,
+                    });
+                }
                 Some(Err(e)) => return Err(e),
-                Some(Ok(f)) => {
-                    if let Ok(d) = f.into_data() {
+                Some(Ok(f)) => match f.into_data() {
+                    Ok(d) => {
                         if len_u64(buf.len()).saturating_add(len_u64(d.len())) > max {
                             return Err(BodyError::TooLarge { limit: max });
                         }
                         buf.extend_from_slice(&d);
                     }
-                }
+                    Err(f) => trailers = f.into_trailers().ok().or(trailers),
+                },
             }
         }
+    }
+}
+
+/// A body buffered whole by [`Body::collect_up_to`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Buffered {
+    pub data: Bytes,
+    /// The trailers the body ended with, if any.
+    pub trailers: Option<HeaderMap>,
+}
+
+impl Buffered {
+    /// A body that yields the data, then the trailers.
+    pub fn into_body(self) -> Body {
+        Body::from_parts(self.data, self.trailers)
     }
 }
 
@@ -322,7 +360,12 @@ impl http_body::Body for Body {
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         match &mut self.inner {
             Inner::Empty => Poll::Ready(None),
-            Inner::Full(b) => Poll::Ready(b.take().map(|b| Ok(Frame::data(b)))),
+            Inner::Full { data, trailers } => Poll::Ready(
+                data.take()
+                    .map(Frame::data)
+                    .or_else(|| trailers.take().map(|t| Frame::trailers(*t)))
+                    .map(Ok),
+            ),
             Inner::Channel { rx, done } => {
                 if *done {
                     return Poll::Ready(None);
@@ -369,8 +412,8 @@ impl http_body::Body for Body {
 
     fn is_end_stream(&self) -> bool {
         match &self.inner {
-            Inner::Empty | Inner::Full(None) => true,
-            Inner::Full(Some(_)) => false,
+            Inner::Empty => true,
+            Inner::Full { data, trailers } => data.is_none() && trailers.is_none(),
             Inner::Channel { done, .. } | Inner::Boxed { done, .. } => *done,
             Inner::Prefixed(p) => p.first.is_none() && p.rest.is_end_stream(),
         }
@@ -605,7 +648,7 @@ mod tests {
             tx.send_data(Bytes::from_static(b"de")).await.unwrap();
             tx.finish().await.unwrap();
         });
-        assert_eq!(body.collect_up_to(100).await.unwrap(), "abcde");
+        assert_eq!(body.collect_up_to(100).await.unwrap().data, "abcde");
         h.await.unwrap();
     }
 
@@ -671,7 +714,7 @@ mod tests {
         );
         let inner = http_body_util::Full::new(Bytes::from_static(b"hello"));
         assert_eq!(
-            Body::wrap(inner, 5).collect_up_to(5).await.unwrap(),
+            Body::wrap(inner, 5).collect_up_to(5).await.unwrap().data,
             "hello"
         );
     }
@@ -718,11 +761,11 @@ mod tests {
         let rest = rest.unwrap();
         assert_eq!(rest.known_length(), Some(7));
         assert_eq!(rest.size_hint().exact(), Some(7));
-        assert_eq!(rest.collect_up_to(100).await.unwrap(), "o world");
+        assert_eq!(rest.collect_up_to(100).await.unwrap().data, "o world");
         // max 0: everything is remainder.
         let (p, rest) = Body::from_bytes("abc").collect_prefix(0).await.unwrap();
         assert!(p.is_empty());
-        assert_eq!(rest.unwrap().collect_up_to(3).await.unwrap(), "abc");
+        assert_eq!(rest.unwrap().collect_up_to(3).await.unwrap().data, "abc");
         // Channel with a declared length, split across frames.
         let (p, rest) = chunked(&[b"ab", b"cd", b"ef"], Some(6))
             .collect_prefix(3)
@@ -731,7 +774,7 @@ mod tests {
         assert_eq!(p, "abc");
         let rest = rest.unwrap();
         assert_eq!(rest.known_length(), Some(3));
-        assert_eq!(rest.collect_up_to(3).await.unwrap(), "def");
+        assert_eq!(rest.collect_up_to(3).await.unwrap().data, "def");
     }
 
     #[tokio::test]
@@ -808,6 +851,64 @@ mod tests {
                 .is_none()
         );
         assert!(rest.is_end_stream());
+    }
+
+    fn trailers_of(name: &'static str, value: &'static str) -> HeaderMap {
+        let mut t = HeaderMap::new();
+        t.insert(name, http::HeaderValue::from_static(value));
+        t
+    }
+
+    /// The frames of `b` as `(data, trailers)`.
+    async fn parts(mut b: Body) -> (Vec<u8>, Option<HeaderMap>) {
+        let mut data = Vec::new();
+        let mut trailers = None;
+        while let Some(f) = poll_fn(|cx| Pin::new(&mut b).poll_frame(cx)).await {
+            match f.unwrap().into_data() {
+                Ok(d) => data.extend_from_slice(&d),
+                Err(f) => {
+                    assert!(trailers.is_none(), "trailers twice");
+                    trailers = f.into_trailers().ok();
+                }
+            }
+        }
+        assert!(b.is_end_stream());
+        (data, trailers)
+    }
+
+    #[tokio::test]
+    async fn from_parts_yields_the_data_then_the_trailers() {
+        let b = Body::from_parts("abc", Some(trailers_of("x-t", "1")));
+        assert_eq!(b.as_bytes().unwrap(), "abc");
+        assert_eq!(b.known_length(), None);
+        assert!(!b.is_end_stream());
+        let (data, t) = parts(b).await;
+        assert_eq!(data, b"abc");
+        assert_eq!(t.unwrap()["x-t"], "1");
+        // No data at all: the trailers alone, still not an empty body.
+        let b = Body::from_parts("", Some(trailers_of("x-t", "2")));
+        assert!(!b.is_end_stream());
+        let (data, t) = parts(b).await;
+        assert_eq!(data, b"");
+        assert_eq!(t.unwrap()["x-t"], "2");
+        // Without trailers it is `from_bytes`.
+        let b = Body::from_parts("abc", None);
+        assert_eq!(b.known_length(), Some(3));
+        assert!(Body::from_parts("", None).is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn collect_up_to_keeps_the_trailers() {
+        let (mut tx, body) = Body::channel(100, None);
+        tx.send_data(Bytes::from_static(b"ab")).await.unwrap();
+        tx.send_trailers(trailers_of("x-t", "1")).await.unwrap();
+        tx.finish().await.unwrap();
+        let buffered = body.collect_up_to(10).await.unwrap();
+        assert_eq!(buffered.data, "ab");
+        assert_eq!(buffered.trailers.as_ref().unwrap()["x-t"], "1");
+        let (data, t) = parts(buffered.into_body()).await;
+        assert_eq!(data, b"ab");
+        assert_eq!(t.unwrap()["x-t"], "1");
     }
 
     #[tokio::test]

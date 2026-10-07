@@ -351,7 +351,7 @@ async fn collect_prefix_on_chunked_request() {
     let (prefix, all) = c
         .drive(async move {
             let (prefix, rest) = body.collect_prefix(7).await.unwrap();
-            let rest = rest.unwrap().collect_up_to(1 << 20).await.unwrap();
+            let rest = rest.unwrap().collect_up_to(1 << 20).await.unwrap().data;
             (prefix, rest)
         })
         .await
@@ -405,7 +405,7 @@ async fn body_streams_before_it_is_complete() {
         .into_data()
         .unwrap();
         got_first_tx.send(()).unwrap();
-        let rest = body.collect_up_to(1 << 20).await.unwrap();
+        let rest = body.collect_up_to(1 << 20).await.unwrap().data;
         (first, rest)
     };
     let client_task = tokio::spawn(async move {
@@ -482,7 +482,12 @@ async fn expect_100_continue_handshake() {
         client
     });
     // Policy allowed: driving the body sends 100 Continue first.
-    let got = c.drive(body.collect_up_to(100)).await.unwrap().unwrap();
+    let got = c
+        .drive(body.collect_up_to(100))
+        .await
+        .unwrap()
+        .unwrap()
+        .data;
     assert_eq!(got, "hello");
     let mut client = client_task.await.unwrap();
     c.respond(ok(Body::empty())).await.unwrap();
@@ -737,7 +742,7 @@ async fn client_close_after_the_upload_ends_drive() {
     let mut req = expect_request(&mut c).await;
     let body = std::mem::take(&mut req.body);
     let upstream = async move {
-        assert_eq!(body.collect_up_to(100).await.unwrap(), "hello");
+        assert_eq!(body.collect_up_to(100).await.unwrap().data, "hello");
         drop(client);
         std::future::pending::<()>().await;
     };

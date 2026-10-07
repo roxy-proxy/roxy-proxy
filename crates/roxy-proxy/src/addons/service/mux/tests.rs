@@ -102,7 +102,7 @@ async fn a_response_head_arrives_while_the_request_body_streams() {
     stream.bytes(Dir::Response, b"down");
     stream.control(In::ResponseEnd);
     assert_eq!(
-        res.into_body().collect_up_to(u64::MAX).await.unwrap(),
+        res.into_body().collect_up_to(u64::MAX).await.unwrap().data,
         &b"down"[..]
     );
     assert!(
@@ -112,7 +112,7 @@ async fn a_response_head_arrives_while_the_request_body_streams() {
     stream.bytes(Dir::Request, b"load");
     stream.control(In::RequestEnd);
     assert_eq!(
-        req.into_body().collect_up_to(u64::MAX).await.unwrap(),
+        req.into_body().collect_up_to(u64::MAX).await.unwrap().data,
         &b"upload"[..]
     );
     assert!(lock(&stream.state).ended());

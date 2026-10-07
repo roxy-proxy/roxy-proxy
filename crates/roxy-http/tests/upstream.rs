@@ -285,7 +285,7 @@ async fn upstream_response_adapted() {
     assert_eq!(names, ["set-cookie", "set-cookie", "content-type"]);
     assert_eq!(canon_res.body.known_length(), None);
     assert_eq!(
-        canon_res.body.collect_up_to(1 << 20).await.unwrap(),
+        canon_res.body.collect_up_to(1 << 20).await.unwrap().data,
         "hello world"
     );
 }

@@ -516,7 +516,7 @@ mod tests {
         let r = post("hell");
         assert_eq!(r.body.known_length(), None);
         assert!(r.meta.expect_continue);
-        assert_eq!(r.body.collect_up_to(100).await.unwrap(), "hell");
+        assert_eq!(r.body.collect_up_to(100).await.unwrap().data, "hell");
         let r = post("hello");
         assert_eq!(
             r.body.collect_up_to(100).await.unwrap_err(),

@@ -335,7 +335,7 @@ async fn check_case<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             .await
                             .map_err(|e| format!("{ctx}: body: {e}"))?
                             .map_err(|e| format!("{ctx}: body: {e}"))?;
-                        if got[..] != unescape(b)[..] {
+                        if got.data[..] != unescape(b)[..] {
                             return Err(format!("{ctx}: body {got:?}"));
                         }
                     } else if let Some(h) = w.strip_prefix("hdr:") {
