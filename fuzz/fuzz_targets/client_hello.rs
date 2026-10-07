@@ -6,7 +6,9 @@
 //!   the results are `NeedMore` until some length, then one constant answer
 //!   (`NotTls`, or the same `Tls(info)`) for every longer prefix. So a
 //!   hello is never accepted or rejected early and then re-judged, and
-//!   bytes after the hello never affect it.
+//!   bytes after the hello never affect it;
+//! - an accepted SNI is printable ASCII of bounded length, as sent: the
+//!   sniffer does no host canonicalisation (that is `parse_host`'s).
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -36,6 +38,7 @@ fuzz_target!(|data: &[u8]| {
     if let Some((_, Sniff::Tls(info))) = &verdict
         && let Some(sni) = &info.sni
     {
-        assert_eq!(sni, &sni.to_ascii_lowercase());
+        assert!(!sni.is_empty() && sni.len() <= 253, "{sni:?}");
+        assert!(sni.bytes().all(|b| (0x21..=0x7e).contains(&b)), "{sni:?}");
     }
 });
