@@ -94,7 +94,8 @@ naming the secret.
 Values live in a store beside the compiled policy. Replacing the map swaps
 the store and rebuilds the redactor without recompiling rules, rebuilding
 addons, flushing upstream pools or a reload event. An exchange resolves
-every name from the generation current at its head evaluation, so a swap
+every name, in its rules and in the `headers` of the endpoint calls its
+addons make, from the generation current at its head evaluation, so a swap
 mid-evaluation cannot pair one credential with another's replacement; an
 exchange under way keeps the generation it injected, and redacts with it,
 however many swaps follow. A name the map lacks is `secret_missing`. Values
