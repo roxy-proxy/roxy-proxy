@@ -17,9 +17,7 @@ limits](/reference/rate-limits#key-cardinality)). The body, message and
 capture caps and the timeouts accept zero, and mean it
 ([resource limits](/reference/limits#limits)).
 
-An optional top-level `valid_until` (RFC 3339) makes the policy a lease
-([lease](/guides/operations#lease)). Each section is described on the
-page the table names.
+Each section is described on the page the table names.
 
 | key | page |
 |---|---|
@@ -28,10 +26,10 @@ page the table names.
 | `upstream` | [upstream](/reference/upstream), [address floor](/reference/address-lists#address-floor) |
 | `address_lists` | [address lists](/reference/address-lists#address-lists) |
 | `limits` | [resource limits](/reference/limits) |
-| `rules` | [how policies work](/design/policy-evaluation), [rule language](/reference/rule-language) |
+| `rules` | [policy evaluation](/design/policy-evaluation), [rule language](/reference/rule-language) |
 | `secrets` | [secrets](/reference/secrets) |
 | `metrics` | [rate limits](/reference/rate-limits) |
-| `addons` | [addons](/design/addon-model) |
+| `addons` | [addon configuration](/reference/addon-configuration) |
 | `log`, `capture_dir` | [flow log](/reference/flow-log) |
 | `valid_until` | [lease](/guides/operations#lease) |
 

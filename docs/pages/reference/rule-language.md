@@ -2,9 +2,8 @@
 
 ## Expressions
 
-Readable, small and statically typed, with no user-defined functions (that
-is what addons are for) and linear-time matching (the `regex` crate, no
-backtracking).
+Small and statically typed, with no user-defined functions and linear-time
+matching (the `regex` crate, no backtracking).
 
 ```
 expr        := or
@@ -142,10 +141,9 @@ Non-terminal:
 | `capture: request \| response \| both` | head rules | Tees the exchange, as forwarded, to the [capture log](/reference/flow-log#capture). |
 | `sign: { aws_sigv4: { service, region, access_key_id, secret_access_key, session_token?, unsigned_payload? } }` | head rules | Signs the forwarded request with AWS Signature Version 4, after every other head effect; the credentials may use `${secret:name}` ([signing AWS requests](/reference/secrets#signing-aws-requests)). |
 
-The actions are a small closed set on purpose: anything richer is an addon.
-Two words are reserved and rejected with the reason: `call` (addons run
-above the rules, not from one) and `passthrough` (reserved; roxy has no
-transparent listener).
+Anything richer than these actions is an addon. Two words are rejected
+with a reason naming why: `call` (addons run above the rules, not from one)
+and `passthrough` (roxy has no transparent listener).
 
 ## Body rules
 

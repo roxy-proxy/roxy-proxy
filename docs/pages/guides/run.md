@@ -1,4 +1,6 @@
-# Container image
+# Run roxy
+
+## Container image
 
 `ghcr.io/roxy-proxy/roxy` is built from the `Dockerfile` for `linux/amd64`
 and `linux/arm64`. Tags: `edge` (every push to `main`), and `vX.Y.Z`, `X.Y`
@@ -30,10 +32,10 @@ docker run -d --name roxy \
 | `/var/log/roxy` | Volume, for a config that sets `log.flow.path` (for example `/var/log/roxy/flow.jsonl`). The default config logs flows to stdout. |
 | `capture_dir` | [Capture](/reference/flow-log#capture) is off by default. If you set `capture_dir`, mount a volume there; the root filesystem is read-only. |
 
-Ports, with the default config: `3128` is the proxy listener and `3130` is `ca_server`
-(`/roxy-ca.pem`, `/healthz`, `/readyz`). The image's `HEALTHCHECK` runs
-`roxy health`, a small built-in HTTP probe (there is no curl), against
-`http://127.0.0.1:3130/healthz`. That is liveness: the process is up. Use
+Ports, with the default config: `3128` is the proxy listener and `3130` is
+`ca_server` (`/roxy-ca.pem`, `/healthz`, `/readyz`). The image's
+`HEALTHCHECK` runs `roxy health`, a small built-in HTTP probe (there is no
+curl), against `http://127.0.0.1:3130/healthz`. That is liveness. Use
 `roxy health --ready` (`/readyz`) where a check should mean "a policy is in
 force", such as a compose `depends_on` or a Kubernetes readiness probe
 ([health](/guides/operations#health)). A config that moves or removes
@@ -53,4 +55,33 @@ Verify a published image's signature:
 cosign verify ghcr.io/roxy-proxy/roxy:edge \
   --certificate-identity-regexp '^https://github.com/roxy-proxy/roxy-proxy/\.github/workflows/image\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+## Without the image
+
+Each GitHub release carries prebuilt binaries (static musl builds for
+Linux), or build one:
+
+```sh
+cargo build --release
+B=./target/release/roxy
+
+$B check --config roxy.yaml      # validate; exits 1 with diagnostics
+$B run   --config roxy.yaml      # start; edits to the file hot-reload
+```
+
+A minimal `roxy.yaml`, which allows `GET`/`HEAD` to `example.com` and denies
+everything else:
+
+```yaml
+version: 1
+listeners:
+  - name: proxy
+    bind: 127.0.0.1:3128
+tls:
+  ca_dir: ./ca                 # writable; the CA is generated here
+rules:
+  - id: example
+    when: host == "example.com" and method in [GET, HEAD]
+    then: allow
 ```

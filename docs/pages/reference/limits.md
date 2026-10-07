@@ -1,9 +1,8 @@
 # Resource limits
 
-Containment takes priority over availability. Every limit resolves in the
-closed direction, and there is no code path where an error on the request
-path leads to forwarding: an error anywhere between accept and the upstream
-connect produces a deny response or a closed socket.
+Every limit resolves in the closed direction: an error anywhere between
+accept and the upstream connect produces a deny response or a closed
+socket.
 
 ## Fail-closed outcomes
 

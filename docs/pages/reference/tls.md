@@ -1,8 +1,8 @@
 # TLS
 
 How roxy speaks TLS to clients: the certificates it mints, the handshake
-it offers, and how it checks a tunnel's first bytes. For the CA itself and
-how clients come to trust it, see [managing the CA](/guides/ca-certificates).
+it offers, and how it checks a tunnel's first bytes. The CA itself is in
+[managing the CA](/guides/ca-certificates).
 
 ## Leaf certificates
 
@@ -25,8 +25,7 @@ trailing dot removed), and that form is the leaf cache key: `CONNECT
 Example.COM.:443` with SNI `example.com` names one host and gets one leaf.
 ALPN offers `h2` (with
 `http.enable_h2`) and `http/1.1`. TLS 1.2 and 1.3. Session resumption is
-off (no session storage, no TLS 1.3 tickets): clients behind roxy are
-usually short-lived, and resumption state would be one more thing to bound.
+off: no session storage, no TLS 1.3 tickets.
 
 ## ClientHello sniffing
 

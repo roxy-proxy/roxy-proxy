@@ -1,18 +1,5 @@
 # Architecture
 
-## Node mode
-
-With `--control-plane` the binary has no config file
-([node mode](/guides/node-mode)). It opens bootstrap listeners that deny
-everything, enrols with the control plane (or loads the certificate it
-stored last time) and polls for a lease: a rendered `roxy.yaml`, the
-secret values it names and how long it is good for
-([node protocol](/reference/node-protocol)). The first lease replaces the
-bootstrap listeners; later ones swap the policy snapshot, the secret map or
-only `valid_until`, as a reload would. Every flow event also goes into an
-in-memory spool, tagged with a per-node sequence number, and is shipped to
-the control plane in batches until acknowledged.
-
 ## Crates
 
 Dependencies point downward. `roxy` depends on `roxy-proxy`, `roxy-http`,

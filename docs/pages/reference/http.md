@@ -1,8 +1,7 @@
 # HTTP
 
 How clients talk to roxy, how requests are parsed and canonicalised, and
-what goes to the upstream and back. The parsing lives in `roxy-http`; the
-connection handling in `roxy-proxy`.
+what goes to the upstream and back.
 
 ## Listener modes
 
@@ -124,10 +123,8 @@ request that was held to HTTP/1.1.
 ## Canonical request
 
 The client-facing HTTP/1.1 codec is roxy's own, built on `httparse` for
-tokenising. It does not use hyper's server because hyper resolves
-ambiguities as RFC 9112 allows (for example, chunked wins when both
-`Transfer-Encoding` and `Content-Length` are present), and roxy must reject
-them instead.
+tokenising, so that ambiguities RFC 9112 lets a server resolve (chunked
+winning over `Content-Length`, say) are rejected instead.
 
 ```rust
 pub struct CanonicalRequest {
@@ -332,8 +329,8 @@ received.
   sent.
 
 With addons, roxy also decodes bodies at the edge of the stack, so layers
-see them decoded ([addons](/reference/addon-configuration#content-codings)). This is the one case
-where roxy forwards a body decoded.
+see them decoded; that is the one case where roxy forwards a body decoded
+([content codings for addons](/reference/addon-configuration#content-codings)).
 
 `http.strip_accept_encoding` (default false) removes `accept-encoding` from
 every request as roxy reads it, so origins answer uncompressed. The addons,

@@ -1,8 +1,8 @@
-# Configuring addons
+# Addon configuration
 
-Addons are listed under `addons:`, in the order they wrap the exchange. This
-is a WASM layer with every key; [service layers](/reference/service-layers) take
-a smaller set.
+Addons are listed under `addons:`, in the order they wrap the exchange
+([addon model](/design/addon-model)). This is a WASM layer with every key;
+[service layers](/reference/service-layers) take a smaller set.
 
 ```yaml
 addons:                               # above the rules, in this order
@@ -36,26 +36,22 @@ addons:                               # above the rules, in this order
     config: { reject_at: 0.8 }        # opaque, handed to the layer as JSON
 ```
 
-These limits catch a broken layer; they don't police a slow one
-([safety](/reference/addon-safety)). A layer that judges LLM traffic will usually
-raise `max_memory` (requests resend the whole conversation, and an embedded
-interpreter needs 128–256 MiB) and `first_byte_timeout` if it calls a model
-before answering. Bodies have no clock, so a long generation streams
-through whatever its length.
+The limits catch a broken layer, not a slow one
+([addon safety limits](/reference/addon-safety)). A layer that judges LLM
+traffic will usually raise `max_memory` (requests resend the whole
+conversation, and an embedded interpreter needs 128–256 MiB) and
+`first_byte_timeout` if it calls a model before answering.
 
-`roxy check` refuses what `roxy run` would refuse, or what could never act:
-a zero `max_instances`, `max_memory`, `recycle_above_memory`,
-`first_byte_timeout`, endpoint `timeout`, or service `max_connections` or
-`max_streams`; a `recycle_above_memory` above `max_memory` (an instance
-fails its exchange at `max_memory`, so it would never be recycled); and a
-`path` that does not exist. `recycle_after_exchanges: 0` is accepted and
-recycles an instance after every exchange.
+`roxy check` refuses: a zero `max_instances`, `max_memory`,
+`recycle_above_memory`, `first_byte_timeout`, endpoint `timeout`, or
+service `max_connections` or `max_streams`; a `recycle_above_memory` above
+`max_memory`; and a `path` that does not exist. `recycle_after_exchanges:
+0` recycles an instance after every exchange.
 
 ## Capabilities
 
 A WASM layer runs with no access outside its own streams. `capabilities`
-grants it named [host services](/reference/host-services), each a set of
-calls on the `flow` or `endpoints` import:
+grants it named [host services](/reference/host-services):
 
 | capability | grants |
 |---|---|
@@ -70,13 +66,12 @@ set; a call the layer was not granted traps with `CapabilityDenied` and
 fails the exchange. `flow.current`, `flow.add-tag` and `flow.config` need
 no capability; `flow.add-tag` from an observe layer is refused the same
 way, since a tag steers the `when` of the layers below. There is no
-`secrets` capability: credentials go on an
-endpoint's `headers`, where the layer never sees them.
+`secrets` capability: credentials go on an endpoint's `headers`, where the
+layer never sees them.
 
-Service layers have no capabilities. A service is its own process and
-calls what it needs itself; what roxy gives it is the exchange, the flow's
-identity on `open`, and the endpoint's `headers` on the handshake
-([service layers](/reference/service-layers)).
+Service layers have no capabilities. A service calls what it needs itself;
+roxy gives it the exchange, the flow's identity on `open`, and the
+endpoint's `headers` on the handshake.
 
 ## Choosing exchanges
 
@@ -88,7 +83,7 @@ service session.
 
 - `when` sees the request as it reaches the layer: what the layer above
   passed on, re-validated like any request a layer passes on. A layer above
-  can therefore steer a request into or out of a lower layer's `when`.
+  can steer a request into or out of a lower layer's `when`.
 - It may read head fields, headers, the query, `state[..]`, `metric.<id>`
   and address lists. `body.*`, `response.*` and `ws.*` are config errors:
   a layer owns the body, so nothing reads it first.
@@ -104,8 +99,8 @@ service session.
 
 `sample`, for `mode: observe` only, is the share of matching exchanges the
 layer gets a copy of, in (0, 1]. It is drawn from the flow id, so it is the
-same for a flow however often you ask. An enforcing layer can't be sampled:
-skipping it at random would let traffic past it.
+same for a flow however often you ask. An enforcing layer cannot be
+sampled.
 
 ```yaml
 addons:
@@ -115,8 +110,6 @@ addons:
     when: method == POST
     sample: 0.1                       # one matching exchange in ten
 ```
-
-The flow log's `addons` lists the layers that ran on the exchange.
 
 ## In the proxy
 
@@ -139,16 +132,15 @@ sits in it.
   that left too. They record what the rules decided, not what the client
   got: a layer whose `next` returned the rules' `403` and then answered
   with a `200` of its own is logged with `decision: deny` and
-  `res.status: 200`. The stack cannot tell that answer from the response
-  passed on unchanged, so `res.status` is the record of what left.
+  `res.status: 200`.
 - A layer that answers itself is logged with `decision: answered` and
-  `terminal_rule: layer:<name>`, whatever its status: the status tells a
-  block (`403`) from a served answer (`200`). The answering layer is the
-  outermost one that did not pass on the response from below: it never
-  called `next`, or answered while `next` was pending, failed or dropped.
-  If its request had already left, the forwarded request is abandoned (its
-  body is cut, never ended as if complete), and the record keeps what the
-  rules decided and the bytes sent, with `reason: upstream_aborted`.
+  `terminal_rule: layer:<name>`, whatever its status. The answering layer
+  is the outermost one that did not pass on the response from below: it
+  never called `next`, or answered while `next` was pending, failed or
+  dropped. If its request had already left, the forwarded request is
+  abandoned (its body is cut, never ended as if complete), and the record
+  keeps what the rules decided and the bytes sent, with `reason:
+  upstream_aborted`.
 - A layer failing before the response head denies with `503`,
   `terminal_rule: layer:<name>`, `reason: layer_error`, closes the
   connection, and emits a `layer_error` event whose `kind` is `trap`,
@@ -158,16 +150,11 @@ sits in it.
   `layer_error` follows. A failure found below the layer that caused it
   (a request a layer passed on that does not validate, say) is put down
   to the nearest enforcing layer above: an observer passes nothing on, so
-  it is never the one blamed, and the end of its copy when the exchange
-  fails below it is not logged as its own failure.
+  it is never the one blamed.
 - A layer's answer must be a final response. A `1xx` other than the
   `101` of a relayed upgrade fails closed as `invalid_response`.
 - A layer's response body to the client waits for the flow log like every
   forwarded body ([audit backpressure](/reference/flow-log#writing)).
-- A WebSocket runs through the layers that ran on its upgrade request,
-  outermost first, in their bodies. The relay stays the hop next to the
-  upstream, so byte budgets and
-  [message rules](/reference/websockets#message-rules) see what leaves.
 - Layers compile at config load and are cached across reloads while their
   file and settings are unchanged, so their instance pools stay warm. A
   reload swaps the stack for new exchanges; exchanges in flight finish on
@@ -175,17 +162,17 @@ sits in it.
 
 ## Content codings
 
-Layers see bodies decoded, so none needs its own decompressors. roxy
-decodes on the way into the stack, for a flow some layer runs on: the
-client's request body as the first layer that runs gets it, and the
-response before it reaches the innermost layer. It removes
-`content-encoding` as it does, and the body's length becomes unknown. A
-flow no layer runs on (every `when` skipped it) is not decoded at all.
+Layers see bodies decoded. roxy decodes on the way into the stack, for a
+flow some layer runs on: the client's request body as the first layer that
+runs gets it, and the response before it reaches the innermost layer. It
+removes `content-encoding` as it does, and the body's length becomes
+unknown. A flow no layer runs on (every `when` skipped it) is not decoded
+at all.
 
-- So on a flow a layer runs on, the client gets an uncompressed response
-  and the upstream an uncompressed request body. The origin's response to roxy stays
-  compressed. Nothing re-encodes; a layer that wants a compressed body
-  encodes it itself.
+- On a flow a layer runs on, the client gets an uncompressed response and
+  the upstream an uncompressed request body. The origin's response to roxy
+  stays compressed. Nothing re-encodes; a layer that wants a compressed
+  body encodes it itself.
 - The codings and their strictness are those the rules use
   ([HTTP](/reference/http#content-codings)). Data that does not decode, or a
   decoded body over `limits.max_request_body_bytes` or
@@ -198,7 +185,7 @@ flow no layer runs on (every `when` skipped it) is not decoded at all.
   with `content-range`: part of an encoded body cannot be decoded on its
   own.
 - The rules below the stack read the response before any layer, and decode
-  it for themselves ([rules](/reference/rule-language#body-rules)).
+  it for themselves ([body rules](/reference/rule-language#body-rules)).
 - A layer gets WebSocket messages it can read: no extension
   (`permessage-deflate` above all) is negotiated on a WebSocket a layer
   runs on ([WebSockets](/reference/websockets#extensions)).
@@ -209,31 +196,29 @@ extensions client and upstream agree on.
 
 ## WebSockets
 
-A WebSocket is an exchange like any other, only long-lived, and this
-section applies to both kinds of layer. A layer gets the upgrade request
-in `handle` and passes it on with `next` (a service layer forwards it on
-its stream); the response from below is the `101`. After it, the request
-body carries the client's bytes and the response body the upstream's, for
-as long as the WebSocket is open. A layer reads, rewrites or holds back
-either direction as it would any body, refuses the upgrade by answering
-without `next`, and is left out of the WebSocket entirely when its `when`
-skips the upgrade request. A layer that turns the upstream's `101` into another status
-fails the exchange closed (a `503` from `layer:<name>`), and roxy closes
-the upstream WebSocket. A `101` with no upgrade from below fails closed
-too. Only `Upgrade: websocket` makes a request an upgrade for the layers.
-A request asking for any other upgrade (`h2c`, say) is the ordinary
-request roxy forwards once it strips the upgrade, with its body and the
-usual body cap.
+A layer gets the upgrade request in `handle` and passes it on with `next`
+(a service layer forwards it on its stream); the response from below is
+the `101`. After it, the request body carries the client's bytes and the
+response body the upstream's, for as long as the WebSocket is open. A
+layer reads, rewrites or holds back either direction as it would any
+body, refuses the upgrade by answering without `next`, and is left out of
+the WebSocket entirely when its `when` skips the upgrade request. A layer
+that turns the upstream's `101` into another status fails the exchange
+closed (a `503` from `layer:<name>`), and roxy closes the upstream
+WebSocket. A `101` with no upgrade from below fails closed too. Only
+`Upgrade: websocket` makes a request an upgrade for the layers; a request
+asking for any other upgrade (`h2c`, say) is an ordinary request roxy
+forwards once it strips the upgrade, with its body and the usual body cap.
 
 - The bodies carry raw WebSocket frames. Frames from the client are
   masked, so their payload reads as sent only from the upstream's side.
 - A layer must stream both bodies at once: the request body ends only
   when the client closes, while the response streams all along. The
   `roxy-addon` SDK does this.
-- A transform that holds bytes back until more arrive (to match across
-  chunks, say) stalls an interactive protocol: the peer waits for the
-  held bytes.
-- No clock runs on the bodies ([safety](/reference/addon-safety)): a WebSocket
-  lives as long as the relay's idle timeout allows. When the relay ends,
-  roxy closes the client's connection too, whether or not the layers have
-  ended their bodies; bytes already on their way get a second to arrive.
+- A transform that holds bytes back until more arrive stalls an
+  interactive protocol: the peer waits for the held bytes.
+- No clock runs on the bodies ([safety](/reference/addon-safety)): a
+  WebSocket lives as long as the relay's idle timeout allows. When the
+  relay ends, roxy closes the client's connection too, whether or not the
+  layers have ended their bodies; bytes already on their way get a second
+  to arrive.

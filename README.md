@@ -29,12 +29,13 @@ It fails closed: anything roxy cannot parse, verify or classify is denied.
 - [Quickstart](https://roxy-proxy.github.io/roxy-proxy/quickstart): generated
   traffic through an auth gate, a token quota and an inspect_sentinel sidecar,
   with roxy in node mode leasing its policy from a minimal control plane
-- [Configure policies](https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation),
-  [addons](https://roxy-proxy.github.io/roxy-proxy/design/addon-model) and
-  [reference](https://roxy-proxy.github.io/roxy-proxy/reference/configuration)
-- Deploy it for
+- Guides: deploy it for
   [sandbox containment](https://roxy-proxy.github.io/roxy-proxy/guides/containment)
   or as an [HTTP gateway](https://roxy-proxy.github.io/roxy-proxy/guides/gateway)
+- Design: [how roxy works](https://roxy-proxy.github.io/roxy-proxy/design/how-it-works)
+  and the [threat model](https://roxy-proxy.github.io/roxy-proxy/design/threat-model)
+- [Reference](https://roxy-proxy.github.io/roxy-proxy/reference/configuration),
+  from the config file to the flow log
 
 The site's source is in [`docs/`](docs). Outstanding work is tracked in
 [issues](https://github.com/roxy-proxy/roxy-proxy/issues).

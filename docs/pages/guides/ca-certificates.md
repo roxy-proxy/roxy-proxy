@@ -1,8 +1,9 @@
 # Managing the CA
 
-roxy terminates every TLS tunnel with a leaf certificate minted by its
-CA, so it can inspect all HTTPS. roxy generates that CA, or uses one you
-provide. Clients must trust that CA. This lives in `roxy-tls`.
+On a proxy port roxy terminates every TLS tunnel with a leaf certificate
+minted by its CA, so it can inspect all HTTPS. roxy generates that CA, or
+uses one you provide. Clients must trust it. The certificates roxy mints
+and the handshake it offers are in [TLS](/reference/tls).
 
 ```yaml
 ca_server:
@@ -16,13 +17,13 @@ tls:
   leaf_cache_size: 10000
 ```
 
-## CA
+## Generated CA
 
 On first `roxy run` (or `roxy ca init`) roxy generates an ECDSA P-256 CA:
 10-year validity, `CA:TRUE, pathlen:0`, key usage `keyCertSign, cRLSign`.
 It is written to `tls.ca_dir` as `roxy-ca.pem` and `roxy-ca.key`
 (mode 0600). An existing pair is reused. A corrupt pair is a fatal startup
-error, never silently regenerated, because a new CA breaks the trust every
+error, never silently regenerated, since a new CA breaks the trust every
 client already has. `roxy ca init --force` replaces it deliberately.
 
 To use an existing CA in `ca_dir`, put its certificate and key there as
@@ -47,12 +48,13 @@ config error. `ca_dir` is then not used.
 A provided CA is never generated or replaced. A missing or unusable file
 is a fatal startup error, and `roxy ca init` refuses to run.
 
+## Startup checks
+
 Every CA, provided or generated, is checked at startup. It must be a CA
 certificate (`CA:TRUE`), allow `keyCertSign` if it has a key usage
 extension, be within its validity period, and match its key. Each
 intermediate must be a CA within its validity period whose key signed the
-certificate before it. Any failure stops roxy rather than failing every
-handshake later.
+certificate before it. Any failure stops roxy.
 
 Two conditions are warnings in the log, not errors:
 
@@ -64,7 +66,7 @@ Two conditions are warnings in the log, not errors:
 
 ## CA distribution
 
-The CA certificate, never the key, is available four ways. For a
+The CA certificate, never the key, is available three ways. For a
 provided CA this is the signing CA alone, without intermediates. Clients
 that already trust your organisation's root need nothing from roxy.
 

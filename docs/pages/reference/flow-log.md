@@ -98,9 +98,7 @@ are logged with their values redacted.
 
 ### Writing
 
-The flow log is an audit trail, so the write path never drops a record
-while roxy runs, and is built to scale with cores and traffic (the
-`roxy-log` crate):
+The write path never drops a record while roxy runs:
 
 - **One writer per destination.** Emitters serialise each event on their own
   thread and enqueue the bytes; one writer thread owns the file.

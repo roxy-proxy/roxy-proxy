@@ -1,14 +1,8 @@
-# Principles and threat model
+# Threat model and guarantees
 
-roxy is a security boundary for outbound HTTP. These principles decide
-every behaviour described in the other pages; where a page says "fails
-closed" or "deny wins", this is why.
-
-There is one threat model for both ways of deploying roxy. What roxy
-prevents, it prevents for traffic that reaches it, in a
-[sandbox](/guides/containment) and in a [gateway](/guides/gateway) alike.
-Whether all of a workload's traffic reaches roxy is a property of the
-network, and only the sandbox use case claims it.
+roxy is a security boundary for the HTTP traffic that reaches it. These
+guarantees decide every behaviour described in the other pages; where a
+page says "fails closed" or "deny wins", this is why.
 
 ## Threat model
 
@@ -21,7 +15,8 @@ allow. roxy does not treat upstream responses as adversarial. It applies the
 size and time limits that protect its own resources, and re-frames responses
 so the client sees one clean wire form.
 
-**roxy prevents:**
+**For traffic that reaches it, in a [sandbox](/guides/containment) and a
+[gateway](/guides/gateway) alike, roxy prevents:**
 
 - reaching any destination the rules do not allow, including through
   Host/SNI spoofing, DNS rebinding, redirects to private ranges, CONNECT to
@@ -40,85 +35,81 @@ DNS side channels from the workload (block DNS egress at the network layer;
 roxy resolves names itself), compromise of an upstream the rules already
 allow, or compromise of the host running roxy.
 
-roxy decides what passes through it; it cannot stop traffic that never
-reaches it. In the sandbox use case containment comes from the network: the
-workload must have no route out except through roxy
-([sandbox containment](/guides/containment)). A gateway makes no such
-claim. It governs the requests its clients send to it, and the clients keep
-whatever other routes they have ([HTTP gateway](/guides/gateway)).
+## Which use case claims what
+
+roxy is not a transparent proxy. It decides what passes through it, and it
+cannot stop traffic that never reaches it.
+
+- **Sandbox containment** claims that all of the workload's traffic goes
+  through roxy. That claim is the network's: the workload must have no
+  route out except roxy's proxy port, with direct TCP, UDP and DNS blocked
+  at the boundary ([sandbox containment](/guides/containment)). The proxy
+  variables and the CA only tell a well-behaved client where roxy is.
+- **An HTTP gateway** makes no such claim. It governs the requests its
+  clients send to it, and the clients keep whatever other routes they have
+  ([HTTP gateway](/guides/gateway)).
+
+roxy speaks HTTP/1.1, HTTP/2 and WebSockets to clients. Raw TCP does not
+pass.
 
 ## Fail closed
 
-Anything roxy cannot parse, verify or classify is dropped. An
-empty rule set denies everything, and so does a policy past its
-`valid_until` ([lease](/guides/operations#lease)). A config that fails
-to compile is not loaded, and a failed reload keeps the running policy. An
-addon in `enforce` mode that fails denies the flow; an `observe` addon
-cannot affect traffic, so its failure is logged and the flow goes on.
-A policy input that is unavailable denies the flow rather than making a
-predicate false. Nothing in roxy turns "could not check" into "allowed".
-[Resource limits](/reference/limits#fail-closed-outcomes) lists every case.
+Anything roxy cannot parse, verify or classify is dropped. An empty rule
+set denies everything, and so does a policy past its `valid_until`
+([lease](/guides/operations#lease)). A config that fails to compile is not
+loaded, and a failed reload keeps the running policy. An addon in
+`enforce` mode that fails denies the flow; an `observe` addon cannot
+affect traffic, so its failure is logged and the flow goes on. A policy
+input that is unavailable denies the flow rather than making a predicate
+false. [Resource limits](/reference/limits#fail-closed-outcomes) lists
+every case.
 
 ## Canonical re-serialisation
 
 Requests are parsed into a strict internal model and re-emitted in one
 unambiguous wire form; nothing the client sends reaches the upstream
-byte-for-byte. Ambiguous input (both `Content-Length` and
-`Transfer-Encoding`, duplicate lengths, bare LF, obs-fold, dot segments that
-climb above the root, ...) is rejected rather than resolved. What the rules
-match is exactly what is forwarded. This removes request smuggling,
-header injection and path confusion as classes of attack
-([HTTP](/reference/http)).
-
-After a WebSocket upgrade the connection carries only that WebSocket, so
-there is no later request to smuggle into. roxy splices its bytes unless a
-rule reads messages; then every message is decoded strictly and re-encoded
-in one form ([WebSockets](/reference/websockets#message-rules)).
+byte-for-byte. Ambiguous input is rejected rather than resolved, and what
+the rules match is exactly what is forwarded ([HTTP](/reference/http)).
+After a WebSocket upgrade the connection carries only that WebSocket;
+when a rule reads messages, each is decoded strictly and re-encoded in one
+form ([WebSockets](/reference/websockets#message-rules)).
 
 ## Deny always wins
 
-A rule set is a list of allows and denies that restrict them. Any matching
-deny wins over any matching allow, wherever it sits in the list, and
-nothing can override a deny at any later point in an exchange. Rule order
-orders effects, never decisions: a rule that reads a tag must follow every
-rule that sets it, or the config is rejected. So adding a deny can only
-narrow what
-passes, and a reviewer can read each deny on its own
-([rules](/design/policy-evaluation)).
+Any matching deny wins over any matching allow, wherever it sits in the
+list, and nothing overrides a deny at any later point in an exchange. Rule
+order orders effects, never decisions, so adding a deny can only narrow
+what passes ([policy evaluation](/design/policy-evaluation)).
 
 ## Never evict
 
 Bounded tables (metric series, rule state, addon state) never evict to make
-room. A flow that needs a new entry in a full table is denied instead.
-Eviction would let a client reset its own counter by churning keys, so a
-limit could be escaped by exceeding another one
-([rules](/reference/rate-limits#metrics)).
+room. A flow that needs a new entry in a full table is denied instead, so a
+client cannot reset its own counter by churning keys
+([rate limits](/reference/rate-limits#metrics)).
 
 ## Audit backpressure
 
-The flow log and traffic capture are an audit trail, and they never drop a
-record. When a log falls behind or its disk fails, roxy holds traffic back
-until it catches up: the wait propagates to the network, slowing clients
-rather than losing records ([flow log](/reference/flow-log#writing)).
+The flow log and traffic capture never drop a record. When a log falls
+behind or its disk fails, roxy holds traffic back until it catches up
+([flow log](/reference/flow-log#writing)).
 
 ## The rules judge everything that leaves
 
-The rules evaluate every request that leaves for the network. Addons sit
-above the rules and can reshape traffic freely, but what they pass on is
-re-validated as strictly as a client request and then judged by the rules as
-if the client had sent it. Nothing configurable runs between the rules and
-the network, and the address floor checks the IP actually dialled
-([addons](/design/addon-model)).
+Addons sit above the rules and can reshape traffic freely, but what they
+pass on is re-validated as strictly as a client request and then judged by
+the rules as if the client had sent it. Nothing configurable runs between
+the rules and the network, and the address floor checks the IP actually
+dialled ([addon model](/design/addon-model)).
 
 ## Streams, not messages
 
 An exchange is a request head, a request body stream, a response head and a
-response body stream. Every stage works on those streams. A body is
-buffered only when a rule or addon needs its content, and then only up to a
-cap, and the buffers of all exchanges together stay within one process-wide
-budget ([limits](/reference/limits#limits)). Large uploads and long responses
-stream end to end, and memory use grows with neither body size nor the
-number of clients holding a buffer.
+response body stream. A body is buffered only when a rule or addon needs
+its content, up to a cap, and the buffers of all exchanges together stay
+within one process-wide budget ([limits](/reference/limits#limits)). Memory
+use grows with neither body size nor the number of clients holding a
+buffer.
 
 ## Well-behaved clients work unhindered
 
