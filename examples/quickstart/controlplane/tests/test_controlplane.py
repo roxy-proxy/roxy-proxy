@@ -175,6 +175,18 @@ def test_flows_are_deduplicated_and_acked_through_the_highest_contiguous_seq(cp,
     expect(400, "bad_request", lambda: cp.flows("node-1", gap))
 
 
+def test_private_keys_are_readable_by_the_owner_alone(cp):
+    """The CA key is created here; the server chain is rewritten over a file
+    something else left world-readable."""
+    chain = cp.data_dir / "server.pem"
+    chain.write_bytes(b"stale")
+    chain.chmod(0o644)
+    Server(("127.0.0.1", 0), cp, ["localhost"]).server_close()
+    for name in ("ca.key", "server.pem"):
+        assert (cp.data_dir / name).stat().st_mode & 0o777 == 0o600, name
+    assert (cp.data_dir / "ca.pem").stat().st_mode & 0o444 == 0o444, "the certificate stays readable"
+
+
 def test_over_tls_the_client_certificate_names_the_node(cp, tmp_path):
     server = Server(("127.0.0.1", 0), cp, ["localhost"])
     threading.Thread(target=server.serve_forever, daemon=True).start()
