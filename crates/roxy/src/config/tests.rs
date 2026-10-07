@@ -195,6 +195,7 @@ fn unknown_fields_rejected_everywhere() {
     for bad in [
         "bogus: 1",
         "listeners: [{ name: p, bind: 127.0.0.1:1, colour: red }]",
+        "listeners: [{ name: p, bind: 127.0.0.1:1, auth: { basic: { users_file: /u } } }]",
         "tls: { ca_dirr: /tmp }",
         "tls: { upstream: { verify: strict, extra: 1 } }",
         "http: { allow_http11: true }",
@@ -1016,17 +1017,4 @@ fn addon_when_and_sample_diagnosed() {
         assert_eq!(d[0].path, path, "{bad}");
         assert!(d[0].to_string().contains(says), "{bad}: {}", d[0]);
     }
-}
-
-/// A listener that still configures proxy authentication is refused with a
-/// diagnostic saying so, not an unknown-field parse error.
-#[test]
-fn listener_auth_is_refused_as_removed() {
-    let d = diagnostics(
-        "version: 1\nlisteners:\n  - { name: p, bind: 127.0.0.1:1, \
-         auth: { basic: { users_file: /u } } }\n",
-    );
-    assert_eq!(d.len(), 1, "{d:?}");
-    assert_eq!(d[0].path, "listeners[0].auth");
-    assert!(d[0].message.contains("removed"), "{}", d[0]);
 }

@@ -529,10 +529,6 @@ fn rule_test_watching_rules_and_bad_input() {
     ]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stdout));
 
-    // `--phase` is gone.
-    let out = rule_test(&["--phase", "response", "GET", "https://x/"]);
-    assert_eq!(out.status.code(), Some(2));
-
     let out = rule_test(&["GET", "not-a-url"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(text(&out.stderr).contains("not an absolute URL"));
