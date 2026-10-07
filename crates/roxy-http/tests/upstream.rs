@@ -191,20 +191,26 @@ async fn no_hop_by_hop_and_host_first() {
     assert_eq!(lines[2..], ["accept: */*"]);
 }
 
+/// Absolute form carries the authority in the URI only: the pooled client
+/// adds `host` itself over HTTP/1.1, and over HTTP/2 a `host` next to
+/// `:authority` is a duplicate that origins such as nginx reject.
 #[tokio::test]
 async fn absolute_form_for_pooled_clients() {
+    let mut h = Headers::new();
+    h.insert("x-a", "1").unwrap();
     let req = to_upstream_request(
-        canon(Method::Get, "/a?b", Headers::new(), Body::empty()),
+        canon(Method::Get, "/a?b", h, Body::empty()),
         UriForm::Absolute,
     )
     .unwrap();
     assert_eq!(req.uri().to_string(), "https://example.com:8443/a?b");
-    assert_eq!(req.headers().get("host").unwrap(), "example.com:8443");
+    assert!(!req.headers().contains_key("host"), "{:?}", req.headers());
+    assert_eq!(req.headers()["x-a"], "1");
     let mut c = canon(Method::Get, "/", Headers::new(), Body::empty());
     c.authority.port = 443;
     let req = to_upstream_request(c, UriForm::Absolute).unwrap();
     assert_eq!(req.uri().to_string(), "https://example.com/");
-    assert_eq!(req.headers().get("host").unwrap(), "example.com");
+    assert!(!req.headers().contains_key("host"), "{:?}", req.headers());
 }
 
 /// Client bytes → `ServerConn` → canonical → hyper → upstream bytes, then the

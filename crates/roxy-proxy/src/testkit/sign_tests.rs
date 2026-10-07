@@ -4,9 +4,18 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::time::SystemTime;
 
+use aws_sigv4::http_request::SignableBody;
 use bytes::Bytes;
+use roxy_http::url::{parse_authority, parse_origin_form};
+use roxy_http::{
+    Body, CanonicalRequest, Headers, HttpFlags, Limits, Method, RequestMeta, Scheme, TargetForm,
+    Version,
+};
+use roxy_rules::{AwsSigV4, Credential};
 
+use super::upstream::Seen;
 use super::{Answer, Kit, streaming_body};
 
 const AKID: &str = "AKIDEXAMPLE";
@@ -326,6 +335,83 @@ async fn a_chunked_signed_body_reserves_only_what_it_has_read() {
     let ev = kit.request_event().await;
     assert_eq!(ev["reason"], "buffer_budget_exhausted", "{ev:#}");
     assert!(kit.upstream.seen().is_empty());
+}
+
+/// The `authorization` an upstream would compute for `seen`, taking its
+/// authority from `host`, at the `x-amz-date` roxy signed at.
+fn resign(seen: &Seen, host: &str, spec: &AwsSigV4) -> String {
+    let unsigned = [
+        "authorization",
+        "x-amz-date",
+        "x-amz-security-token",
+        "content-length",
+    ];
+    let raw: Vec<(&[u8], &[u8])> = seen
+        .headers
+        .iter()
+        .filter(|(n, _)| !unsigned.contains(&n.as_str()))
+        .map(|(n, v)| (n.as_str().as_bytes(), v.as_bytes()))
+        .collect();
+    let (path, query) = parse_origin_form(seen.path.as_bytes()).unwrap();
+    let mut req = CanonicalRequest {
+        method: Method::parse(seen.method.as_bytes()).unwrap(),
+        scheme: Scheme::Https,
+        authority: parse_authority(host.as_bytes(), 443).unwrap(),
+        path,
+        query,
+        headers: Headers::try_from_raw(raw, &Limits::default(), &HttpFlags::default()).unwrap(),
+        body: Body::from_bytes(seen.body.clone()),
+        meta: RequestMeta::new(Version::H1_1, TargetForm::Origin),
+    };
+    let date = seen.headers["x-amz-date"].to_str().unwrap();
+    let now: SystemTime = chrono::NaiveDateTime::parse_from_str(date, "%Y%m%dT%H%M%SZ")
+        .unwrap()
+        .and_utc()
+        .into();
+    crate::sign::sign_request(&mut req, host, SignableBody::Bytes(&seen.body), spec, now).unwrap();
+    req.headers.get("authorization").unwrap().to_owned()
+}
+
+/// Over h2 AWS takes `host` from `:authority`, so the signature must cover
+/// the authority roxy sends there: recomputing it from what the upstream
+/// received, with `:authority` as `host`, gives the same `authorization`.
+#[tokio::test]
+async fn an_h2_signature_covers_the_authority() {
+    let kit = signing("bedrock", "").start().await;
+    let mut c = kit.tunnel("up.test", false).await;
+    let a = c
+        .call(
+            "POST",
+            "/model/invoke",
+            &[("content-type", "application/json"), ("x-custom", "1")],
+            br#"{"prompt":"hi"}"#,
+        )
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].version, http::Version::HTTP_2);
+    assert!(
+        !seen[0].headers.contains_key("host"),
+        "{:?}",
+        seen[0].headers
+    );
+    let authority = seen[0].authority.as_deref().unwrap();
+    assert_eq!(authority, "up.test");
+    let auth = seen[0].headers["authorization"].to_str().unwrap();
+    assert_eq!(
+        signed_headers(auth),
+        "content-type;host;x-amz-date;x-amz-security-token;x-custom"
+    );
+    let spec = AwsSigV4 {
+        service: "bedrock".into(),
+        region: "eu-west-2".into(),
+        access_key_id: Credential::new(AKID),
+        secret_access_key: Credential::new(SK),
+        session_token: Some(Credential::new(TOKEN)),
+        unsigned_payload: false,
+    };
+    assert_eq!(resign(&seen[0], authority, &spec), auth);
+    assert_ne!(resign(&seen[0], "other.test", &spec), auth);
 }
 
 #[tokio::test]

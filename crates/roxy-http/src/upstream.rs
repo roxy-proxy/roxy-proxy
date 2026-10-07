@@ -1,8 +1,10 @@
 //! Canonical model ↔ hyper client types.
 //!
 //! hyper serialises what these functions produce. The guarantees:
-//! - `host` is the first header and equals the canonical authority (default
-//!   port omitted);
+//! - the authority goes out once, as the canonical authority (default port
+//!   omitted): in origin form as the first header, `host`; in absolute
+//!   form only in the URI, from which the client writes `host` over
+//!   HTTP/1.1 or `:authority` over HTTP/2 (RFC 9113 §8.3.1: not both);
 //! - no hop-by-hop header can be present (canonical [`Headers`] cannot hold
 //!   them);
 //! - `content-length` is set exactly when the body length is known; otherwise
@@ -29,20 +31,19 @@ use crate::model::{
 /// How the request URI is written into the `http::Request`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UriForm {
-    /// `scheme://authority/path?query`. Use with `hyper_util`'s pooled
-    /// client (which routes on the URI and rewrites to origin-form for
-    /// HTTP/1.1) and with hyper's HTTP/2 client (which derives `:scheme` and
-    /// `:authority` from it).
+    /// `scheme://authority/path?query` and no `host` header. Use with
+    /// `hyper_util`'s pooled client, which routes on the URI and, once it
+    /// knows the connection's protocol, rewrites to origin-form plus `host`
+    /// for HTTP/1.1 or derives `:scheme` and `:authority` for HTTP/2.
     Absolute,
-    /// `/path?query`. Use with hyper's low-level HTTP/1.1
-    /// `client::conn::http1::SendRequest`, which writes the URI verbatim.
+    /// `/path?query` plus `host`. Use with hyper's low-level HTTP/1.1
+    /// `client::conn::http1::SendRequest`, which writes the URI and
+    /// headers verbatim.
     Origin,
 }
 
-/// Builds the upstream request.
-///
-/// The `host` header is always included (first). Over HTTP/2 it equals
-/// `:authority`, which RFC 9113 §8.3.1 permits; callers may drop it there.
+/// Builds the upstream request. Where the authority is written depends on
+/// `form` ([`UriForm`]).
 pub fn to_upstream_request(
     req: CanonicalRequest,
     form: UriForm,
@@ -55,9 +56,11 @@ pub fn to_upstream_request(
     let uri = Uri::try_from(uri_str)
         .map_err(|e| ParseError::new(Reason::BadRequestTarget, format!("uri: {e}")))?;
     let mut headers = HeaderMap::with_capacity(req.headers.len().saturating_add(2));
-    let host_value = HeaderValue::from_str(&host)
-        .map_err(|_| ParseError::new(Reason::BadAuthority, "host header"))?;
-    headers.insert(HOST, host_value);
+    if form == UriForm::Origin {
+        let host_value = HeaderValue::from_str(&host)
+            .map_err(|_| ParseError::new(Reason::BadAuthority, "host header"))?;
+        headers.insert(HOST, host_value);
+    }
     for (n, v) in &req.headers {
         headers.append(n.clone(), v.clone());
     }

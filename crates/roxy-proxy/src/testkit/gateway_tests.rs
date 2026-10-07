@@ -63,7 +63,13 @@ async fn a_redirect_rule_reaches_its_target_with_the_injected_key() {
         443,
         "redirect sets https on the way out"
     );
-    assert_eq!(seen[0].headers["host"], "up.test");
+    assert_eq!(seen[0].version, http::Version::HTTP_2);
+    assert_eq!(seen[0].authority.as_deref(), Some("up.test"));
+    assert!(
+        !seen[0].headers.contains_key("host"),
+        "{:?}",
+        seen[0].headers
+    );
     assert_eq!(seen[0].headers["x-api-key"], SECRET);
     let ev = kit.request_event().await;
     assert_eq!(ev["terminal_rule"], "anthropic");
