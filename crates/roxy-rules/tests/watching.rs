@@ -336,6 +336,10 @@ fn watching_rules_cannot_allow_or_change_the_request() {
             "`capture` is decided at the request head",
         ),
         (
+            "{ id: a, when: 'body.bytes > 1', then: { digest: both } }",
+            "`digest` is decided at the request head",
+        ),
+        (
             "{ id: a, when: 'response.status == 1', then: { set_header: { x: \"${secret:gh}\" } } }",
             "secret references are only allowed in rules decided at the request head",
         ),

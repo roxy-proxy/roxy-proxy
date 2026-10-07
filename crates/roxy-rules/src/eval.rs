@@ -382,7 +382,7 @@ impl AwsSigV4 {
 }
 
 /// A non-terminal action's effect, for the proxy to apply (mutations) or
-/// perform (log, state, capture, addon call), in list order.
+/// perform (log, state, capture, digest, addon call), in list order.
 #[derive(Debug, Clone)]
 pub enum Effect {
     /// Lower-case name.
@@ -420,6 +420,8 @@ pub enum Effect {
         ttl: Option<Duration>,
     },
     Capture(CaptureTarget),
+    /// Record the SHA-256 of the body in the flow record.
+    Digest(CaptureTarget),
     /// Sign the request as it will be forwarded, after every other change.
     Sign(AwsSigV4),
 }
@@ -437,6 +439,7 @@ impl Effect {
             Effect::Log { .. } => "log",
             Effect::SetState { .. } => "set_state",
             Effect::Capture(_) => "capture",
+            Effect::Digest(_) => "digest",
             Effect::Sign(_) => "sign",
         }
     }
@@ -509,7 +512,7 @@ impl PartialEq for Effect {
                     ttl: f,
                 },
             ) => a == d && b == e && c == f,
-            (E::Capture(a), E::Capture(b)) => a == b,
+            (E::Capture(a), E::Capture(b)) | (E::Digest(a), E::Digest(b)) => a == b,
             (E::Sign(a), E::Sign(b)) => a == b,
             _ => false,
         }
@@ -542,6 +545,7 @@ impl fmt::Display for Effect {
             Effect::Log { level, message } => write!(f, "log {}: {message}", level.as_str()),
             Effect::SetState { key, value, ttl } => fmt_set_state(f, key, value, *ttl),
             Effect::Capture(t) => write!(f, "capture {}", t.as_str()),
+            Effect::Digest(t) => write!(f, "digest {}", t.as_str()),
             Effect::Sign(s) => write!(
                 f,
                 "sign aws_sigv4 service={} region={}{}",
@@ -704,6 +708,7 @@ impl PendingState for Vec<Effect> {
             | Effect::Redirect { .. }
             | Effect::Log { .. }
             | Effect::Capture(_)
+            | Effect::Digest(_)
             | Effect::Sign(_) => None,
         })
     }

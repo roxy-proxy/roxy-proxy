@@ -127,6 +127,8 @@ pub enum Action {
     SetState(SetStateArgs),
     /// `capture: request | response | both`
     Capture(CaptureTarget),
+    /// `digest: request | response | both`
+    Digest(CaptureTarget),
     /// `sign: { aws_sigv4: { ... } }`
     Sign(SignArgs),
 }
@@ -146,6 +148,7 @@ impl Action {
         "log",
         "set_state",
         "capture",
+        "digest",
         "sign",
     ];
 
@@ -179,6 +182,7 @@ impl Action {
             Self::Log(_) => "log",
             Self::SetState(_) => "set_state",
             Self::Capture(_) => "capture",
+            Self::Digest(_) => "digest",
             Self::Sign(_) => "sign",
         }
     }
@@ -311,7 +315,7 @@ pub struct SetStateArgs {
     pub ttl: Option<Duration>,
 }
 
-/// What `capture` writes.
+/// The direction(s) a `capture` or `digest` action applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureTarget {
@@ -414,6 +418,7 @@ impl Action {
             "log" => Self::Log(arg!(LogArgs)),
             "set_state" => Self::SetState(arg!(SetStateArgs)),
             "capture" => Self::Capture(arg!(CaptureTarget)),
+            "digest" => Self::Digest(arg!(CaptureTarget)),
             "sign" => Self::Sign(arg!(SignArgs)),
             other => {
                 return Err(de::Error::custom(unknown_action(other)));
@@ -656,6 +661,7 @@ mod tests {
 - log: { message: default-level }
 - set_state: { key: k, value: v, ttl: 5m }
 - capture: both
+- digest: response
 - sign: { aws_sigv4: { service: bedrock, region: eu-west-2, access_key_id: "${secret:akid}", secret_access_key: "${secret:sk}", session_token: "${secret:tok}", unsigned_payload: false } }
 - allow:
 "#,
@@ -679,10 +685,12 @@ mod tests {
                 "log",
                 "set_state",
                 "capture",
+                "digest",
                 "sign",
                 "allow",
             ]
         );
+        assert_eq!(actions[14], Action::Digest(CaptureTarget::Response));
         assert_eq!(
             actions[2],
             Action::SetHeader(vec![
@@ -707,7 +715,7 @@ mod tests {
             })
         );
         assert_eq!(
-            actions[14],
+            actions[15],
             Action::Sign(SignArgs {
                 aws_sigv4: AwsSigV4Args {
                     service: "bedrock".into(),
@@ -739,6 +747,8 @@ mod tests {
             ),
             ("{ set_query: { q: a, q: b } }", "duplicate key `q`"),
             ("{ capture: everything }", "then.capture"),
+            ("{ digest: everything }", "then.digest"),
+            ("digest", "action `digest` needs an argument"),
             ("{ allow: { upgrade: h2c } }", "then.allow"),
             ("{ allow: { inspect: true } }", "then.allow"),
             ("{ sign: { aws_sigv4: { service: s3 } } }", "then.sign"),

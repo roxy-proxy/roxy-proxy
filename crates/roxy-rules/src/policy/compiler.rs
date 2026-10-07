@@ -612,6 +612,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 })]
             }
             Action::Capture(t) => vec![CAction::Effect(Effect::Capture(*t))],
+            Action::Digest(t) => vec![CAction::Effect(Effect::Digest(*t))],
             Action::Sign(s) => self
                 .sign(&s.aws_sigv4, rule, apath)
                 .into_iter()
@@ -671,6 +672,19 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                     format!(
                         "`capture` is decided at the request head, so the whole exchange is \
                          captured from its first byte; {}. Capture in a head rule (e.g. the \
+                         allow that forwards this traffic)",
+                        shape.forwarded_why()
+                    ),
+                );
+                Vec::new()
+            }
+            Action::Digest(_) => {
+                self.push(
+                    rule,
+                    apath,
+                    format!(
+                        "`digest` is decided at the request head, so the whole body is \
+                         hashed from its first byte; {}. Digest in a head rule (e.g. the \
                          allow that forwards this traffic)",
                         shape.forwarded_why()
                     ),
@@ -1193,6 +1207,6 @@ fn non_header_strings(a: &Action) -> Vec<&str> {
         Action::Tag(s) => vec![s],
         Action::Log(l) => vec![&l.message],
         Action::SetState(s) => vec![&s.key, &s.value],
-        Action::Allow(_) | Action::Capture(_) => Vec::new(),
+        Action::Allow(_) | Action::Capture(_) | Action::Digest(_) => Vec::new(),
     }
 }
