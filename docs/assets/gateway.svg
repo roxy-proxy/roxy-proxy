@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="290" viewBox="0 0 800 290" font-family="Inter, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13">
+  <defs>
+    <marker id="req" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"/>
+    </marker>
+    <marker id="res" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5f6b68"/>
+    </marker>
+  </defs>
+
+  <!-- clients -->
+  <rect x="14" y="122" width="104" height="56" rx="12" fill="#f3f5f4" stroke="#cfd4d2"/>
+  <text x="66" y="145" fill="#16201e" font-weight="600" text-anchor="middle">clients</text>
+  <text x="66" y="161" fill="#7e8986" font-size="10" text-anchor="middle">placeholder keys</text>
+
+  <!-- load balancer -->
+  <rect x="150" y="110" width="120" height="80" rx="8" fill="#f3f5f4" stroke="#cfd4d2"/>
+  <text x="210" y="133" fill="#16201e" font-weight="600" text-anchor="middle">load balancer</text>
+  <g fill="#7e8986" font-size="10" text-anchor="middle">
+    <text x="210" y="149">terminates TLS</text>
+    <text x="210" y="163">*.gw.example.com</text>
+    <text x="210" y="177">roxy's client.ip</text>
+  </g>
+
+  <!-- roxy -->
+  <rect x="310" y="60" width="280" height="210" rx="10" fill="#ffffff" stroke="#0f766e" stroke-width="1.5"/>
+  <text x="326" y="81" fill="#0f766e" font-weight="600">roxy</text>
+  <g stroke="#cfd4d2" fill="#f3f5f4">
+    <rect x="326" y="100" width="80" height="120" rx="6"/>
+    <rect x="418" y="100" width="84" height="120" rx="6" stroke-dasharray="4 3"/>
+    <rect x="512" y="100" width="66" height="120" rx="6"/>
+    <rect x="512" y="232" width="66" height="26" rx="6"/>
+  </g>
+  <g fill="#16201e" font-weight="600" text-anchor="middle">
+    <text x="366" y="121">listener</text>
+    <text x="460" y="121">auth</text>
+    <text x="545" y="121">rules</text>
+  </g>
+  <g fill="#7e8986" font-size="11" text-anchor="middle">
+    <text x="366" y="200">mode: http</text>
+    <text x="366" y="213">port 8080</text>
+    <text x="460" y="200">addon</text>
+    <text x="460" y="213">401 if unknown</text>
+    <text x="545" y="200">redirect</text>
+    <text x="545" y="213">set_header</text>
+  </g>
+  <text x="545" y="249" fill="#16201e" font-size="11" font-weight="600" text-anchor="middle">secrets</text>
+  <text x="326" y="249" fill="#7e8986" font-size="11">flow log: one line per request</text>
+
+  <!-- providers -->
+  <g fill="#f3f5f4" stroke="#cfd4d2">
+    <rect x="650" y="92" width="136" height="44" rx="8"/>
+    <rect x="650" y="170" width="136" height="44" rx="8"/>
+  </g>
+  <g fill="#16201e" font-weight="600" text-anchor="middle">
+    <text x="718" y="110">api.anthropic.com</text>
+    <text x="718" y="188">api.openai.com</text>
+  </g>
+  <g fill="#7e8986" font-size="10" text-anchor="middle">
+    <text x="718" y="84">anthropic.gw.example.com</text>
+    <text x="718" y="126">https, x-api-key injected</text>
+    <text x="718" y="162">openai.gw.example.com</text>
+    <text x="718" y="204">https, bearer key injected</text>
+  </g>
+
+  <!-- request and response -->
+  <g fill="none" stroke-width="2" stroke-linejoin="round">
+    <path d="M 118 140 H 148" stroke="#0f766e" marker-end="url(#req)"/>
+    <path d="M 270 140 H 606 V 114 H 648" stroke="#0f766e" marker-end="url(#req)"/>
+    <path d="M 606 140 V 192 H 648" stroke="#0f766e" marker-end="url(#req)"/>
+    <path d="M 650 126 H 624 V 162 H 272" stroke="#5f6b68" marker-end="url(#res)"/>
+    <path d="M 650 204 H 624 V 162" stroke="#5f6b68"/>
+    <path d="M 150 162 H 120" stroke="#5f6b68" marker-end="url(#res)"/>
+  </g>
+  <text x="133" y="133" fill="#0f766e" font-size="10" font-weight="600" text-anchor="middle">https</text>
+  <text x="290" y="133" fill="#0f766e" font-size="10" font-weight="600" text-anchor="middle">http</text>
+</svg>
