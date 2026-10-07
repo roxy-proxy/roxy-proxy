@@ -2,15 +2,15 @@
 (spec/node-protocol/v1/openapi.yaml), enough to run the quickstart's roxy
 in node mode.
 
-It enrols a node against the fixed token in ENROL_TOKEN, signing the node's
-CSR with a CA it keeps in DATA_DIR, and serves the lease: the quickstart's
-roxy.yaml with its `env` secrets turned into `lease: true` entries and the
-values taken from this process's environment. Flow batches are printed to
-stdout, one event per line. A node id listed in DATA_DIR/revoked gets 410.
+It enrols a node against the fixed token in ENROL_TOKEN_FILE (or
+ENROL_TOKEN), signing the node's CSR with a CA it keeps in DATA_DIR, and
+serves the lease: the quickstart's roxy.yaml with its `env` secrets turned
+into `lease: true` entries and the values taken from this process's
+environment. Flow batches are printed to stdout, one event per line. A node
+id listed in DATA_DIR/revoked gets 410.
 
 It is not a reference for everything a server should check: the token is
-reusable, a flow batch's `lease_id` is accepted whatever it says, and the
-gunzipped request body is not bounded.
+reusable and a flow batch's `lease_id` is accepted whatever it says.
 """
 
 import datetime as dt
