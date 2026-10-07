@@ -1,5 +1,6 @@
-//! The policy as a lease: `valid_until` on the snapshot, `_expired` denies
-//! past it, one `policy_expired` event per snapshot, recovery by reload.
+//! The policy as a lease: `valid_until` on the loaded policy, `_expired`
+//! denies past it, one `policy_expired` event per snapshot, recovery by
+//! reload.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,6 +131,61 @@ async fn read_to_close(ws: &mut Ws) -> Option<u16> {
             Some(Err(_)) | None => return None,
         }
     }
+}
+
+/// The lease an open relay is held to is the loaded policy's, not the one
+/// it was accepted under: a reload with an earlier `valid_until` stops it,
+/// and one with a later `valid_until` carries it past the old expiry.
+#[tokio::test]
+async fn an_open_websocket_follows_the_lease_of_the_loaded_policy() {
+    let kit = Kit::builder()
+        .rules(WS_RULES)
+        .valid_until(future())
+        .start()
+        .await;
+    let mut ws = kit.ws("/ws/echo", &[("x-echo", "frames")]).await;
+    ws.send(Message::text("hello")).await.unwrap();
+    let back = tokio::time::timeout(Duration::from_secs(10), ws.next())
+        .await
+        .expect("no echo")
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.into_text().unwrap().as_str(), "hello");
+
+    kit.reload_lease(WS_RULES, Some(past()));
+    ws.send(Message::text("late")).await.unwrap();
+    assert_eq!(read_to_close(&mut ws).await, None);
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "_expired", "{ev:#}");
+    assert_eq!(ev["stage"], "websocket", "{ev:#}");
+    assert_eq!(kit.upstream.ws_received(), vec![b"hello".to_vec()]);
+
+    let lease = Duration::from_millis(600);
+    let kit = Kit::builder()
+        .rules(WS_RULES)
+        .valid_until(Utc::now() + TimeDelta::from_std(lease).unwrap())
+        .start()
+        .await;
+    let mut ws = kit.ws("/ws/echo", &[("x-echo", "frames")]).await;
+    kit.reload_lease(WS_RULES, Some(future()));
+    tokio::time::sleep(lease + Duration::from_millis(200)).await;
+    ws.send(Message::text("after the old expiry"))
+        .await
+        .unwrap();
+    let back = tokio::time::timeout(Duration::from_secs(10), ws.next())
+        .await
+        .expect("no echo")
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.into_text().unwrap().as_str(), "after the old expiry");
+    assert!(
+        kit.sink
+            .events()
+            .iter()
+            .all(|e| e["event"] != "policy_expired"),
+        "{:#?}",
+        kit.sink.events()
+    );
 }
 
 /// A relay opened under a live lease stops at the first message after the

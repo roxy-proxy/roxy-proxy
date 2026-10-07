@@ -623,7 +623,7 @@ impl FlowCx {
     /// recorded as the head decision. Nothing of the policy (the addons
     /// included) runs for it.
     pub(crate) fn expiry_refusal(&mut self) -> Option<Refusal> {
-        if !self.shared.expired(&self.snap) {
+        if !self.shared.expired() {
             return None;
         }
         self.record.stage = Some(Stage::Head);

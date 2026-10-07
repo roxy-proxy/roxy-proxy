@@ -29,7 +29,9 @@ use crate::sources::{MetricSource, StateSource};
 use crate::upstream::Upstream;
 
 /// Everything that a reload swaps, as one unit. Each exchange clones the
-/// `Arc` at its start and finishes under that snapshot.
+/// `Arc` at its start and finishes under that snapshot, except for the
+/// lease: [`Shared::expired`] reads the current snapshot's, so a reload
+/// or an extension reaches exchanges already open.
 pub(crate) struct Snapshot {
     pub policy: Policy,
     /// The lease's end; `None` = no expiry. Read live by [`Shared::expired`]
@@ -159,11 +161,14 @@ impl Shared {
         self.snapshot.load_full()
     }
 
-    /// Whether `snap`'s lease has run out. Checked against the wall clock
-    /// on every exchange and WebSocket message, since `valid_until` is an
-    /// absolute instant and only a reload or an extension brings it back.
-    /// The first check that finds the lease expired logs `policy_expired`.
-    pub(crate) fn expired(&self, snap: &Snapshot) -> bool {
+    /// Whether the lease has run out. The lease is the deployment's, not
+    /// an exchange's: the current snapshot's `valid_until` is what counts,
+    /// checked against the wall clock on every exchange and WebSocket
+    /// message, since it is an absolute instant and only a reload or an
+    /// extension brings it back. The first check that finds the lease
+    /// expired logs `policy_expired`.
+    pub(crate) fn expired(&self) -> bool {
+        let snap = self.snapshot();
         let Some(until) = snap.valid_until.load().as_deref().copied() else {
             return false;
         };
@@ -181,17 +186,12 @@ impl Shared {
         true
     }
 
-    /// Whether the current policy's lease has run out.
-    pub(crate) fn policy_expired(&self) -> bool {
-        self.expired(&self.snapshot())
-    }
-
     /// The current policy's state, for `/readyz`.
     pub(crate) fn policy_state(&self) -> PolicyState {
         let snap = self.snapshot();
         if snap.placeholder {
             PolicyState::Missing
-        } else if self.expired(&snap) {
+        } else if self.expired() {
             PolicyState::Expired
         } else {
             PolicyState::Loaded

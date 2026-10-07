@@ -51,11 +51,7 @@ fn route(req: &Request<Incoming>, shared: &Shared) -> Response<Full<Bytes>> {
         (true, "/roxy-ca.pem") => reply(StatusCode::OK, PEM_CONTENT_TYPE, shared.ca.cert_pem()),
         (true, "/healthz") => {
             let mut res = reply(StatusCode::OK, "text/plain", "ok");
-            let state = if shared.policy_expired() {
-                "expired"
-            } else {
-                "valid"
-            };
+            let state = if shared.expired() { "expired" } else { "valid" };
             res.headers_mut()
                 .insert(POLICY_HEADER, http::HeaderValue::from_static(state));
             res

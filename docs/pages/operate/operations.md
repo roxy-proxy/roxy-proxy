@@ -100,7 +100,10 @@ is denied with `terminal_rule: _expired` and reason `policy_expired`,
 before the rules and the addons run, and an open WebSocket relay stops at
 its next message. The check is a wall-clock comparison on each exchange:
 `valid_until` is an absolute instant, so the host's clock is what it is
-measured against. The first exchange that finds the policy expired logs
+measured against. The instant checked is the loaded policy's, whichever
+policy an exchange began under: a reload or an extension that moves it
+later keeps open relays going, and one that moves it earlier stops them
+at their next message. The first exchange that finds the policy expired logs
 one `policy_expired` event; later ones are ordinary `_expired` denies.
 
 An expired policy is a policy, not a fault. The listeners stay up,
