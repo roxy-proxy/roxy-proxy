@@ -68,8 +68,9 @@ POSTs the record to the layer's `audit_endpoint`.
 
 `flow.metric-get(id, [])` reads a metric for this flow's own key (the key
 fields evaluated on the request that left the addon stack); explicit key
-values are refused. A key with no entry reads `0`; an unknown id, or a key
-field the request does not have, fails the exchange. `flow.log` writes to roxy's operational log with the
+values are refused. A key with no entry reads `none` (a rule reads the same
+key as 0); an unknown id, or a key field the request does not have, fails
+the exchange. `flow.log` writes to roxy's operational log with the
 flow id and layer name.
 
 There is no way to terminate or quarantine a client: a layer denies the

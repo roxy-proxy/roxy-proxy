@@ -1267,8 +1267,8 @@ impl MetricSource for StoreMetrics {
         &self,
         id: &str,
         view: &dyn roxy_rules::FlowView,
-    ) -> Result<i64, crate::sources::MetricSourceError> {
-        self.store.get(id, view).map_err(Into::into)
+    ) -> Result<Option<i64>, crate::sources::MetricSourceError> {
+        self.store.lookup(id, view).map_err(Into::into)
     }
 
     fn record(

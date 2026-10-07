@@ -153,9 +153,9 @@ impl LayerHost for StackHost {
             &*shared.state,
             &self.st.snap.address_lists,
         );
-        match shared.metrics.get(&id, &view) {
-            Ok(v) => Ok(Some(v)),
-            Err(e) => Err(HostError::new(format!("metric {id}: {e}"))),
-        }
+        shared
+            .metrics
+            .get(&id, &view)
+            .map_err(|e| HostError::new(format!("metric {id}: {e}")))
     }
 }

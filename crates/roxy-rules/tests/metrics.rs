@@ -73,6 +73,24 @@ fn is_send_sync_and_object_safe() {
     assert_eq!(s.get("r", &MapView::new()), Ok(1));
 }
 
+/// `lookup` tells a key with no series from one that counted nothing;
+/// `get` reads both as 0, as a rule does.
+#[test]
+fn lookup_is_none_until_the_key_is_recorded() {
+    let c = TestClock::new();
+    let s = store_with("- { id: per, count: requests, key: [client.ip] }", 10, &c);
+    assert_eq!(s.lookup("per", &client(1)), Ok(None));
+    assert_eq!(s.get("per", &client(1)), Ok(0));
+    assert_eq!(s.key_count(), 0, "a read admits nothing");
+    rec(&s, &client(1));
+    assert_eq!(s.lookup("per", &client(1)), Ok(Some(1)));
+    assert_eq!(s.lookup("per", &client(2)), Ok(None));
+    assert_eq!(
+        s.lookup("nope", &client(1)),
+        Err(MetricError::Unknown("nope".to_owned()))
+    );
+}
+
 #[test]
 fn count_kinds() {
     let c = TestClock::new();

@@ -171,6 +171,37 @@ async fn metric_keys_follow_the_request_that_left() {
     );
 }
 
+/// `metric-get` on a key the store has no series for is `none`, not 0:
+/// a metric whose `where` excludes the flow never records its key.
+#[tokio::test]
+async fn metric_get_is_none_for_a_key_with_no_entry() {
+    let kit = Kit::builder()
+        .metric_defs("- { id: by_host, count: requests, key: [host], where: 'method == POST' }")
+        .addon(AddonDef {
+            caps: vec![roxy_wasm::Capability::Metrics],
+            ..AddonDef::test_layer("a")
+        })
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let headers = [("x-test-a", "elsewhere-then-metric"), ("x-to", "up.test")];
+    let get = c.call("GET", "/m", &headers, b"").await;
+    assert_eq!(get.status, 200, "{get:?}");
+    assert_eq!(
+        get.text(),
+        "None",
+        "a GET is not counted, so its key has no entry"
+    );
+    let post = c.call("POST", "/m", &headers, b"").await;
+    assert_eq!(post.text(), "Some(1)");
+    let get = c.call("GET", "/m", &headers, b"").await;
+    assert_eq!(
+        get.text(),
+        "Some(1)",
+        "the key exists once any flow recorded it"
+    );
+}
+
 #[tokio::test]
 async fn an_inner_layer_failing_after_the_head_cuts_the_body() {
     let kit = stack(&named(&["a", "b"])).await;

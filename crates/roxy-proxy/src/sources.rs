@@ -91,9 +91,10 @@ impl MetricSourceError {
 
 /// Metric values as seen by a flow, and the counting side.
 pub trait MetricSource: Send + Sync {
-    /// `Ok(value)` for the metric as seen by this flow (0 for a fresh key).
+    /// `Ok(Some(value))` for the metric as seen by this flow; `Ok(None)`
+    /// when this flow's key has no series (a rule reads that as 0).
     /// `Err` → the flow fails closed.
-    fn get(&self, id: &str, view: &dyn FlowView) -> Result<i64, MetricSourceError>;
+    fn get(&self, id: &str, view: &dyn FlowView) -> Result<Option<i64>, MetricSourceError>;
     /// Called once the head step has settled (so denied flows count too), per
     /// streamed chunk and at the end. `Err` → the exchange fails closed.
     fn record(&self, view: &dyn FlowView, sample: &Sample) -> Result<(), MetricSourceError>;
@@ -119,7 +120,7 @@ pub trait StateSource: Send + Sync {
 pub struct UnavailableMetrics;
 
 impl MetricSource for UnavailableMetrics {
-    fn get(&self, id: &str, _view: &dyn FlowView) -> Result<i64, MetricSourceError> {
+    fn get(&self, id: &str, _view: &dyn FlowView) -> Result<Option<i64>, MetricSourceError> {
         Err(MetricSourceError::Unknown(format!(
             "no metric store (metric `{id}`)"
         )))

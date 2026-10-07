@@ -482,11 +482,15 @@ struct StubMetrics {
 }
 
 impl MetricSource for StubMetrics {
-    fn get(&self, id: &str, _view: &dyn roxy_rules::FlowView) -> Result<i64, MetricSourceError> {
+    fn get(
+        &self,
+        id: &str,
+        _view: &dyn roxy_rules::FlowView,
+    ) -> Result<Option<i64>, MetricSourceError> {
         match self.mode.load(Ordering::Relaxed) {
             1 => Err(MetricSourceError::Unknown(format!("{id}: store offline"))),
             2 => Err(MetricSourceError::TableFull(id.to_owned())),
-            _ => Ok(0),
+            _ => Ok(None),
         }
     }
 

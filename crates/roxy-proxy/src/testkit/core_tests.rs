@@ -1015,8 +1015,8 @@ impl crate::sources::MetricSource for Recording {
         &self,
         _id: &str,
         _view: &dyn roxy_rules::FlowView,
-    ) -> Result<i64, crate::sources::MetricSourceError> {
-        Ok(0)
+    ) -> Result<Option<i64>, crate::sources::MetricSourceError> {
+        Ok(None)
     }
 
     fn record(
