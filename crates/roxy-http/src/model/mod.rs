@@ -3,7 +3,7 @@
 mod authority;
 mod body;
 mod error;
-mod framing;
+mod fields;
 mod headers;
 mod limits;
 mod message;
@@ -13,7 +13,7 @@ pub use authority::{Authority, Host, Scheme};
 pub use body::{Body, BodySender, Buffered, CHANNEL_DEPTH};
 pub(crate) use error::reject;
 pub use error::{BodyError, DriveError, ParseError, Reason, WriteError};
-pub(crate) use framing::{parse_content_length, plan_body};
+pub(crate) use fields::{BodyHint, BodyPlan, RequestFields, check_host, parse_content_length};
 pub(crate) use headers::parse_field_line;
 pub use headers::{
     Headers, RESERVED, check_trailer_fields, connection_tokens, is_forbidden_trailer, is_reserved,

@@ -8,10 +8,9 @@
 //! cannot express the protocol version, the target form, the upgrade or
 //! the time the head arrived, and those stay the client's.
 
-use crate::chars::trim_ows;
 use crate::model::{
-    Body, CanonicalRequest, CanonicalResponse, Headers, HttpFlags, Limits, Method, ParseError,
-    Reason, RequestMeta, Scheme, is_reserved, parse_content_length, plan_body, reject,
+    Body, BodyHint, CanonicalRequest, CanonicalResponse, HttpFlags, Limits, Method, ParseError,
+    Reason, RequestFields, RequestMeta, Scheme, check_host, is_reserved, reject,
 };
 use crate::url;
 
@@ -88,47 +87,32 @@ pub fn from_layer_request(
     if head_bytes > limits.max_header_bytes {
         return reject(Reason::HeadTooLarge, format!("head is {head_bytes} bytes"));
     }
-    let mut content_length: Option<u64> = None;
-    let mut host_seen = false;
-    let mut rest: Vec<(&[u8], &[u8])> = Vec::new();
-    for (name, value) in &parts.headers {
-        let n = name.as_str();
-        let v = trim_ows(value.as_bytes());
-        match n {
-            // `host` and `content-length` are reserved too, but a layer
-            // states them as part of the request rather than owning them:
-            // they are checked against the URI and the body, then dropped.
-            "host" => {
-                if host_seen {
-                    return reject(Reason::MultipleHost, "multiple host fields");
-                }
-                host_seen = true;
-                if url::parse_authority(v, scheme.default_port())? != authority {
-                    return reject(Reason::HostMismatch, "host does not match the URI");
-                }
-            }
-            "content-length" => {
-                if content_length.is_some() {
-                    return reject(Reason::DuplicateContentLength, "multiple content-length");
-                }
-                content_length = Some(parse_content_length(v)?);
-            }
-            _ if is_reserved(n) => {
-                return reject(Reason::ReservedHeader, format!("{n} set by a layer"));
-            }
-            _ => rest.push((name.as_str().as_bytes(), value.as_bytes())),
-        }
+    // `host` and `content-length` are reserved too, but a layer states them
+    // as part of the request rather than owning them: they are checked
+    // against the URI and the body, then dropped.
+    if let Some(n) = parts
+        .headers
+        .keys()
+        .map(http::HeaderName::as_str)
+        .find(|n| is_reserved(n) && !matches!(*n, "host" | "content-length"))
+    {
+        return reject(Reason::ReservedHeader, format!("{n} set by a layer"));
     }
-    let headers = Headers::try_from_raw(rest.iter().copied(), limits, flags)?;
-
-    let plan = plan_body(
-        &method,
-        content_length.or(body.known_length()),
-        http_body::Body::is_end_stream(&body),
-        limits,
-        flags,
-    )?;
-    let body = Body::wrap_native(body, plan.cap, plan.known);
+    let raw: Vec<(&[u8], &[u8])> = parts
+        .headers
+        .iter()
+        .map(|(n, v)| (n.as_str().as_bytes(), v.as_bytes()))
+        .collect();
+    let hint = BodyHint::Stream {
+        ended: http_body::Body::is_end_stream(&body),
+        known_length: body.known_length(),
+    };
+    let fields = RequestFields::from_raw(&raw, &method, meta.version, hint, limits, flags)?;
+    if let Some(h) = fields.host {
+        check_host(h, &authority, scheme.default_port(), "the URI")?;
+    }
+    let headers = fields.headers;
+    let body = Body::wrap_native(body, fields.body.cap, fields.body.known);
 
     Ok(CanonicalRequest {
         method,

@@ -14,9 +14,9 @@ use http::{HeaderValue, Version as HttpVersion};
 
 use crate::chars::trim_ows;
 use crate::model::{
-    Authority, Body, CanonicalRequest, CanonicalResponse, Headers, HttpFlags, Limits, Method,
-    ParseError, Reason, RequestMeta, Scheme, TargetForm, Version, check_trailer_fields,
-    parse_content_length, plan_body, reject, status_forbids_body,
+    Authority, Body, BodyHint, CanonicalRequest, CanonicalResponse, Headers, HttpFlags, Limits,
+    Method, ParseError, Reason, RequestFields, RequestMeta, Scheme, TargetForm, Version,
+    check_host, check_trailer_fields, reject, status_forbids_body,
 };
 use crate::url;
 
@@ -122,49 +122,21 @@ pub fn from_h2_parts(
     let (authority, path, query) = target_from_uri(&parts.uri, expected_authority, limits)?;
 
     let list_size = header_list_size(&parts.headers, limits)?;
-    let mut meta = RequestMeta::new(Version::H2, TargetForm::H2);
-    meta.head_bytes = list_size;
-    let mut content_length: Option<u64> = None;
-    let mut host_seen = false;
-    let mut expect = false;
     let mut cookies: Vec<&[u8]> = Vec::new();
     let mut rest: Vec<(&[u8], &[u8])> = Vec::new();
     for (name, value) in &parts.headers {
         let n = name.as_str();
-        let v = trim_ows(value.as_bytes());
         if CONNECTION_SPECIFIC.contains(&n) {
             return reject(Reason::H2ConnectionHeader, format!("{n} in an h2 request"));
         }
         match n {
             "te" => {
-                if !v.eq_ignore_ascii_case(b"trailers") {
+                if !trim_ows(value.as_bytes()).eq_ignore_ascii_case(b"trailers") {
                     return reject(Reason::H2BadTe, "te other than trailers");
                 }
             }
-            "host" => {
-                if host_seen {
-                    return reject(Reason::MultipleHost, "multiple host fields");
-                }
-                host_seen = true;
-                let h = url::parse_authority(v, Scheme::Https.default_port())?;
-                if h != authority {
-                    return reject(Reason::HostMismatch, "host does not match :authority");
-                }
-            }
-            "content-length" => {
-                if content_length.is_some() {
-                    return reject(Reason::DuplicateContentLength, "multiple content-length");
-                }
-                content_length = Some(parse_content_length(v)?);
-            }
-            "expect" => {
-                if expect || !v.eq_ignore_ascii_case(b"100-continue") {
-                    return reject(Reason::BadExpect, "unsupported expectation");
-                }
-                expect = true;
-            }
-            "cookie" => cookies.push(v),
-            _ => rest.push((name.as_str().as_bytes(), value.as_bytes())),
+            "cookie" => cookies.push(trim_ows(value.as_bytes())),
+            _ => rest.push((n.as_bytes(), value.as_bytes())),
         }
     }
     // RFC 9113 §8.2.3: split cookie fields are re-joined for HTTP/1.1
@@ -173,19 +145,20 @@ pub fn from_h2_parts(
     if !cookies.is_empty() {
         rest.push((b"cookie", &joined_cookie));
     }
-    let headers = Headers::try_from_raw(rest.iter().copied(), limits, flags)?;
-
-    // END_STREAM on the HEADERS frame: the body is known to be empty (the
-    // `h2` crate already refused a non-zero `content-length` with it).
-    let plan = plan_body(
-        &method,
-        content_length,
-        http_body::Body::is_end_stream(&body),
-        limits,
-        flags,
-    )?;
-    let body = Body::wrap_with_length(body, plan.cap, plan.known);
-    meta.expect_continue = expect && plan.known != Some(0);
+    // END_STREAM on the HEADERS frame: the body is known to be empty.
+    let hint = BodyHint::Stream {
+        ended: http_body::Body::is_end_stream(&body),
+        known_length: None,
+    };
+    let fields = RequestFields::from_raw(&rest, &method, Version::H2, hint, limits, flags)?;
+    if let Some(h) = fields.host {
+        check_host(h, &authority, Scheme::Https.default_port(), ":authority")?;
+    }
+    let headers = fields.headers;
+    let body = Body::wrap_with_length(body, fields.body.cap, fields.body.known);
+    let mut meta = RequestMeta::new(Version::H2, TargetForm::H2);
+    meta.head_bytes = list_size;
+    meta.expect_continue = fields.expect_continue;
 
     Ok(CanonicalRequest {
         method,

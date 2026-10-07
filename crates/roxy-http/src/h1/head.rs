@@ -3,9 +3,8 @@
 
 use crate::chars::trim_ows;
 use crate::model::{
-    Authority, Headers, HttpFlags, Limits, Method, ParseError, Reason, RequestMeta, Scheme,
-    TargetForm, Version, connection_tokens, parse_content_length, parse_field_line, reject,
-    requested_upgrade,
+    Authority, BodyHint, BodyPlan, Headers, HttpFlags, Limits, Method, ParseError, Reason,
+    RequestFields, RequestMeta, Scheme, TargetForm, Version, check_host, parse_field_line, reject,
 };
 use crate::url::{self, Path, Query};
 
@@ -74,7 +73,7 @@ pub enum Head {
         authority: Authority,
         /// Canonical headers.
         headers: Headers,
-        /// Metadata (`proxy_authorization` is here).
+        /// Metadata.
         meta: RequestMeta,
     },
 }
@@ -279,121 +278,6 @@ fn tokenise(head: &[u8]) -> Result<(Method, &[u8], Vec<(&[u8], &[u8])>), ParseEr
     Ok((method, target, raw))
 }
 
-/// Values of every field named `name`, in order.
-fn all<'a>(raw: &[(&'a [u8], &'a [u8])], name: &str) -> Vec<&'a [u8]> {
-    raw.iter()
-        .filter(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
-        .map(|(_, v)| *v)
-        .collect()
-}
-
-/// Body framing from `Content-Length` / `Transfer-Encoding`, with the body
-/// policy applied: one `Content-Length` or exactly `chunked`, never both;
-/// no body on a bodiless method; a declared length within the cap.
-fn request_framing(
-    raw: &[(&[u8], &[u8])],
-    method: &Method,
-    version: Version,
-    limits: &Limits,
-    flags: &HttpFlags,
-) -> Result<Framing, ParseError> {
-    let cls = all(raw, "content-length");
-    let tes = all(raw, "transfer-encoding");
-    if !cls.is_empty() && !tes.is_empty() {
-        return reject(Reason::ClAndTe, "both content-length and transfer-encoding");
-    }
-    if cls.len() > 1 {
-        return reject(
-            Reason::DuplicateContentLength,
-            "multiple content-length fields",
-        );
-    }
-    let framing = if let Some(cl) = cls.first() {
-        match parse_content_length(cl)? {
-            0 => Framing::None,
-            n => Framing::Length(n),
-        }
-    } else if let Some(te) = tes.first() {
-        if tes.len() > 1 || !te.eq_ignore_ascii_case(b"chunked") {
-            return reject(
-                Reason::BadTransferEncoding,
-                format!(
-                    "transfer-encoding {:?}",
-                    tes.iter()
-                        .map(|t| String::from_utf8_lossy(t))
-                        .collect::<Vec<_>>()
-                ),
-            );
-        }
-        if version == Version::H1_0 {
-            return reject(
-                Reason::BadTransferEncoding,
-                "chunked in an HTTP/1.0 request",
-            );
-        }
-        Framing::Chunked
-    } else {
-        Framing::None
-    };
-    if framing != Framing::None && !method.allows_body(flags.allow_body_on_get) {
-        return reject(Reason::BodyOnBodiless, format!("body on {method} request"));
-    }
-    if let Framing::Length(n) = framing
-        && n > limits.max_request_body_bytes
-    {
-        return reject(Reason::BodyTooLarge, format!("content-length {n}"));
-    }
-    Ok(framing)
-}
-
-/// Metadata from the hop-by-hop fields: `Expect`, `Connection` and
-/// `Upgrade`.
-fn hop_by_hop_meta(
-    raw: &[(&[u8], &[u8])],
-    version: Version,
-    framing: Framing,
-    head_bytes: usize,
-) -> Result<RequestMeta, ParseError> {
-    let mut meta = RequestMeta::new(version, TargetForm::Origin);
-    meta.head_bytes = head_bytes;
-    let expects = all(raw, "expect");
-    if !expects.is_empty() {
-        if expects.len() > 1 || !expects[0].eq_ignore_ascii_case(b"100-continue") {
-            return reject(Reason::BadExpect, "unsupported expectation");
-        }
-        meta.expect_continue = version == Version::H1_1 && framing != Framing::None;
-    }
-    let conn = connection_tokens(all(raw, "connection"))?;
-    // roxy never keeps an HTTP/1.0 connection alive, whatever `Connection`
-    // says, so the flag is simply true for every 1.0 request.
-    meta.close = version == Version::H1_0 || conn.iter().any(|t| t == "close");
-    meta.upgrade = requested_upgrade(&conn, all(raw, "upgrade"));
-    Ok(meta)
-}
-
-/// The single `Host` value, if any.
-fn single_host<'a>(raw: &[(&'a [u8], &'a [u8])]) -> Result<Option<&'a [u8]>, ParseError> {
-    let hosts = all(raw, "host");
-    if hosts.len() > 1 {
-        return reject(Reason::MultipleHost, "multiple host fields");
-    }
-    Ok(hosts.first().copied())
-}
-
-/// `Host` must name `authority` (with `default_port` implied) when present.
-fn check_host(
-    host: &[u8],
-    authority: &Authority,
-    default_port: u16,
-    what: &str,
-) -> Result<(), ParseError> {
-    let ha = url::parse_authority(host, default_port)?;
-    if ha != *authority {
-        return reject(Reason::HostMismatch, format!("host does not match {what}"));
-    }
-    Ok(())
-}
-
 /// The CONNECT target: authority-form on the proxy port, agreeing with
 /// `Host` when one is sent.
 fn connect_target(
@@ -485,10 +369,23 @@ pub fn parse_head(
 ) -> Result<Head, ParseError> {
     let version = check_raw_head(head, limits, flags)?;
     let (method, target, raw) = tokenise(head)?;
-    let framing = request_framing(&raw, &method, version, limits, flags)?;
-    let mut meta = hop_by_hop_meta(&raw, version, framing, head.len())?;
-    let host = single_host(&raw)?;
-    let headers = Headers::try_from_raw(raw.iter().copied(), limits, flags)?;
+    let fields = RequestFields::from_raw(&raw, &method, version, BodyHint::Framed, limits, flags)?;
+    let framing = match fields.body {
+        BodyPlan { chunked: true, .. } => Framing::Chunked,
+        BodyPlan { known: Some(n), .. } if n > 0 => Framing::Length(n),
+        // Without a framing field an HTTP/1.x request has no body
+        // (RFC 9112 §6.3).
+        BodyPlan { .. } => Framing::None,
+    };
+    let mut meta = RequestMeta::new(version, TargetForm::Origin);
+    meta.head_bytes = head.len();
+    meta.expect_continue = fields.expect_continue;
+    // roxy never keeps an HTTP/1.0 connection alive, whatever `Connection`
+    // says, so the flag is simply true for every 1.0 request.
+    meta.close = version == Version::H1_0 || fields.connection.iter().any(|t| t == "close");
+    meta.upgrade = fields.upgrade;
+    let host = fields.host;
+    let headers = fields.headers;
 
     if method == Method::Connect {
         let authority = connect_target(target, host, role)?;
