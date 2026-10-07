@@ -35,9 +35,9 @@ The first run builds the images, which takes a few minutes. Eight containers sta
 - **roxy**: the proxy on `127.0.0.1:3128`, with the two addons at `/etc/roxy/addons/`. It has no config file; it runs the policy it leases.
 - **fake-model**: answers `POST /v1/messages` from [`responses.json`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/mocks/responses.json), one entry per call in order, streamed or whole, with the `usage` the real API sends. It refuses a request without the API key, which only roxy has.
 - **auth-service**: `alice-secret` is alice and `bob-secret` is bob.
-- **quota-board**: the quota service, with a live page on `127.0.0.1:8090`. Each user has a bucket of 600 tokens that refills at five a second.
+- **quota-board**: the quota service. Each user has a bucket of 600 tokens that refills at five a second.
 - **sentinel**: the inspect_sentinel sidecar, on a network with no route out.
-- **inspect-view**: Inspect's log viewer on `127.0.0.1:7575`.
+- **inspect-view**: Inspect's log viewer.
 - **traffic**: the clients. Alice calls every six seconds, bob every twenty, and mallory, whose credential is unknown, every thirty.
 
 ### Watch the traffic
@@ -62,7 +62,7 @@ traffic-1  | [alice #8] 429 RateLimitError: token bucket empty (600 tokens, refi
 
 ### Watch the quota board
 
-Open [http://127.0.0.1:8090](http://127.0.0.1:8090): each user's bucket, live, with the last five minutes of levels. The quota is per user, and the user is whoever the auth gate said. To make a call of your own, from another terminal:
+Open [http://127.0.0.1:8090](http://127.0.0.1:8090): each user's bucket, live, with the last five minutes of levels. The quota is per user, and the user is whoever the auth gate said. To make a call of your own:
 
 ```sh
 docker compose run --rm client --user bob
@@ -76,8 +76,6 @@ Open [http://127.0.0.1:7575](http://127.0.0.1:7575). Each client is a sample, gr
 <img src={inspectView} alt="Inspect View: a curl tool call, and the sentinel's rejection under it" />
 
 ### Read roxy's flow log
-
-From another terminal:
 
 ```sh
 docker compose logs roxy

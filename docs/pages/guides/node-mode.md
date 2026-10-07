@@ -24,7 +24,7 @@ roxy run --control-plane https://cp.example:8443 \
 | `--control-plane-ca PATH` | PEM bundle to verify the control plane with. Default: the system roots. |
 | `--bootstrap-bind ADDR` | Where the proxy listens before the first lease. Default `0.0.0.0:3128`. |
 | `--bootstrap-ca-server ADDR` | Where `ca_server` listens before the first lease. Default `0.0.0.0:3130`. |
-| `--interception-ca-cert PATH`, `--interception-ca-key PATH` | An interception CA pair to import into the state dir on a start where it holds none ([the interception CA](/guides/node-mode#the-interception-ca)). |
+| `--interception-ca-cert PATH`, `--interception-ca-key PATH` | An interception CA pair to import ([the interception CA](/guides/node-mode#the-interception-ca)). |
 | `--replace-interception-ca` | Replace a stored interception CA that differs from the one given. |
 
 A token the control plane still accepts enrols a node and unlocks the

@@ -99,6 +99,5 @@ below see the tag, so a per-user quota is another addon.
   (`tls_on_http_listener`). Keep the hop from the load balancer to roxy on a
   network you trust, since it carries the clients' requests in the clear.
   Clients trust the load balancer's certificate; roxy's CA plays no part.
-- **Health checks** come from `ca_server` as usual: `/healthz` says the
-  process is up, `/readyz` that a policy is in force
+- **Health checks** come from `ca_server` as usual
   ([health](/guides/operations#health)).
