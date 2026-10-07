@@ -89,39 +89,126 @@ pub enum Field {
     WsText,
 }
 
-/// A set of values that become known (or change) after the forwarding
-/// decision: what a rule reads beyond the request head, and
-/// what an event during an exchange changed. A bit mask, so the per-chunk
-/// test "does any watching rule care about this?" is one `and`.
+/// One value that becomes known (or changes) after the forwarding
+/// decision. Each variant answers what it is (a field of the flow or a
+/// byte metric) and when it is fixed; the [`Reads`] groups and names derive
+/// from those answers, so a new watched value is declared here and nowhere
+/// else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Watched {
+    /// `body.bytes`.
+    BodyBytes,
+    /// `response.status`, `response.header[...]`, `response.body.size`.
+    ResponseHead,
+    /// `response.body.bytes`.
+    ResponseBodyBytes,
+    /// `response.body.text` (buffered before the response head is sent).
+    ResponseBodyText,
+    /// `ws.*` (per WebSocket message).
+    Ws,
+    /// A metric counting `request_bytes`, which this exchange adds to as
+    /// the request body (or WebSocket client bytes) stream.
+    MetricRequestBytes,
+    /// A metric counting `response_bytes`.
+    MetricResponseBytes,
+}
+
+impl Watched {
+    pub const ALL: [Watched; 7] = [
+        Self::BodyBytes,
+        Self::ResponseHead,
+        Self::ResponseBodyBytes,
+        Self::ResponseBodyText,
+        Self::Ws,
+        Self::MetricRequestBytes,
+        Self::MetricResponseBytes,
+    ];
+
+    /// The name used in messages and `roxy check`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::BodyBytes => "body.bytes",
+            Self::ResponseHead => "response head",
+            Self::ResponseBodyBytes => "response.body.bytes",
+            Self::ResponseBodyText => "response.body.text",
+            Self::Ws => "ws.*",
+            Self::MetricRequestBytes => "request_bytes metric",
+            Self::MetricResponseBytes => "response_bytes metric",
+        }
+    }
+
+    /// A field of the flow, as opposed to a byte metric. A byte metric's
+    /// value is known at the head, so only a field makes the rule reading
+    /// it a watching rule.
+    pub const fn is_field(self) -> bool {
+        !matches!(self, Self::MetricRequestBytes | Self::MetricResponseBytes)
+    }
+
+    /// Known before the response head is sent to the client, so a rule
+    /// reading only such values can still change the response head.
+    pub const fn before_response_sent(self) -> bool {
+        matches!(self, Self::ResponseHead | Self::ResponseBodyText)
+    }
+
+    const fn bit(self) -> u16 {
+        1 << (self as u16)
+    }
+}
+
+impl fmt::Display for Watched {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// A set of [`Watched`] values: what a rule reads beyond the request head,
+/// or what an event during an exchange changed. A bit mask, so the
+/// per-chunk test "does any watching rule care about this?" is one `and`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Reads(u16);
 
+/// The set of every [`Watched`] value for which `$pred` holds.
+macro_rules! derived {
+    (|$w:ident| $pred:expr) => {{
+        let mut bits = 0;
+        let mut i = 0;
+        while i < Watched::ALL.len() {
+            let $w = Watched::ALL[i];
+            if $pred {
+                bits |= $w.bit();
+            }
+            i += 1;
+        }
+        Reads(bits)
+    }};
+}
+
 impl Reads {
     pub const NONE: Reads = Reads(0);
-    /// `body.bytes`.
-    pub const BODY_BYTES: Reads = Reads(1);
-    /// `response.status`, `response.header[...]`, `response.body.size`.
-    pub const RESPONSE_HEAD: Reads = Reads(1 << 1);
-    /// `response.body.bytes`.
-    pub const RESPONSE_BODY_BYTES: Reads = Reads(1 << 2);
-    /// `response.body.text` (buffered before the response head is sent).
-    pub const RESPONSE_BODY_TEXT: Reads = Reads(1 << 3);
-    /// `ws.*` (per WebSocket message).
-    pub const WS: Reads = Reads(1 << 4);
-    /// A metric counting `request_bytes`, which this exchange adds to as
-    /// the request body (or WebSocket client bytes) stream.
-    pub const METRIC_REQUEST_BYTES: Reads = Reads(1 << 5);
-    /// A metric counting `response_bytes`.
-    pub const METRIC_RESPONSE_BYTES: Reads = Reads(1 << 6);
+    pub const BODY_BYTES: Reads = Reads::of(Watched::BodyBytes);
+    pub const RESPONSE_HEAD: Reads = Reads::of(Watched::ResponseHead);
+    pub const RESPONSE_BODY_BYTES: Reads = Reads::of(Watched::ResponseBodyBytes);
+    pub const RESPONSE_BODY_TEXT: Reads = Reads::of(Watched::ResponseBodyText);
+    pub const WS: Reads = Reads::of(Watched::Ws);
+    pub const METRIC_REQUEST_BYTES: Reads = Reads::of(Watched::MetricRequestBytes);
+    pub const METRIC_RESPONSE_BYTES: Reads = Reads::of(Watched::MetricResponseBytes);
 
     /// Every watched *field* (not metrics).
-    pub const WATCHED_FIELDS: Reads = Reads(0b1_1111);
-    /// Both byte-metric bits.
-    pub const METRICS: Reads = Reads(0b110_0000);
+    pub const WATCHED_FIELDS: Reads = derived!(|w| w.is_field());
+    /// Both byte metrics.
+    pub const METRICS: Reads = derived!(|w| !w.is_field());
     /// Everything: every watched field and both byte metrics.
-    pub const ALL: Reads = Reads(0b111_1111);
+    pub const ALL: Reads = derived!(|_w| true);
     /// Values known before the response head is sent to the client.
-    pub const BEFORE_RESPONSE_SENT: Reads = Reads(0b1010);
+    pub const BEFORE_RESPONSE_SENT: Reads = derived!(|w| w.before_response_sent());
+
+    pub const fn of(w: Watched) -> Reads {
+        Reads(w.bit())
+    }
+
+    pub const fn contains(self, w: Watched) -> bool {
+        self.0 & w.bit() != 0
+    }
 
     #[must_use]
     pub const fn union(self, other: Reads) -> Reads {
@@ -146,21 +233,39 @@ impl Reads {
         Reads(self.0 & !other.0)
     }
 
-    /// Names of the set bits, for messages and `roxy check`.
+    /// The members of `self` for which `keep` holds.
+    #[must_use]
+    pub fn retain(self, keep: impl Fn(Watched) -> bool) -> Reads {
+        self.iter().filter(|w| keep(*w)).collect()
+    }
+
+    /// The members, in [`Watched::ALL`] order.
+    pub fn iter(self) -> impl Iterator<Item = Watched> {
+        Watched::ALL.into_iter().filter(move |w| self.contains(*w))
+    }
+
+    /// Names of the members, for messages and `roxy check`.
     pub fn names(self) -> Vec<&'static str> {
-        [
-            (Self::BODY_BYTES, "body.bytes"),
-            (Self::RESPONSE_HEAD, "response head"),
-            (Self::RESPONSE_BODY_BYTES, "response.body.bytes"),
-            (Self::RESPONSE_BODY_TEXT, "response.body.text"),
-            (Self::WS, "ws.*"),
-            (Self::METRIC_REQUEST_BYTES, "request_bytes metric"),
-            (Self::METRIC_RESPONSE_BYTES, "response_bytes metric"),
-        ]
-        .into_iter()
-        .filter(|(b, _)| self.intersects(*b))
-        .map(|(_, n)| n)
-        .collect()
+        self.iter().map(Watched::name).collect()
+    }
+}
+
+impl From<Watched> for Reads {
+    fn from(w: Watched) -> Reads {
+        Reads::of(w)
+    }
+}
+
+impl From<Option<Watched>> for Reads {
+    fn from(w: Option<Watched>) -> Reads {
+        w.map_or(Reads::NONE, Reads::of)
+    }
+}
+
+impl FromIterator<Watched> for Reads {
+    fn from_iter<I: IntoIterator<Item = Watched>>(iter: I) -> Reads {
+        iter.into_iter()
+            .fold(Reads::NONE, |acc, w| acc | Reads::of(w))
     }
 }
 
@@ -284,13 +389,13 @@ impl Field {
         matches!(self, Self::Host | Self::TlsSni | Self::Scheme)
     }
 
-    /// The watched values this field reads; empty for a head field.
-    pub fn reads(self) -> Reads {
+    /// The watched value this field reads; `None` for a head field.
+    pub fn watched(self) -> Option<Watched> {
         match self {
-            Self::BodyBytes => Reads::BODY_BYTES,
-            Self::ResponseStatus | Self::ResponseBodySize => Reads::RESPONSE_HEAD,
-            Self::ResponseBodyBytes => Reads::RESPONSE_BODY_BYTES,
-            Self::WsDirection | Self::WsOpcode | Self::WsSize | Self::WsText => Reads::WS,
+            Self::BodyBytes => Some(Watched::BodyBytes),
+            Self::ResponseStatus | Self::ResponseBodySize => Some(Watched::ResponseHead),
+            Self::ResponseBodyBytes => Some(Watched::ResponseBodyBytes),
+            Self::WsDirection | Self::WsOpcode | Self::WsSize | Self::WsText => Some(Watched::Ws),
             Self::ClientIp
             | Self::ClientPort
             | Self::ListenerName
@@ -304,13 +409,13 @@ impl Field {
             | Self::Path
             | Self::Url
             | Self::QueryRaw
-            | Self::BodySize => Reads::NONE,
+            | Self::BodySize => None,
         }
     }
 
     /// Whether the field is known when the forwarding decision is made.
     pub fn is_head(self) -> bool {
-        self.reads().is_empty()
+        self.watched().is_none()
     }
 }
 
@@ -396,21 +501,23 @@ impl Access {
         }
     }
 
-    /// Watched values read by this access. Metrics are classified by the
-    /// policy compiler (it knows what each metric counts), so they read
-    /// [`Reads::NONE`] here.
-    pub(crate) fn reads(&self) -> Reads {
+    /// The watched value this access reads; `None` for a head value. A
+    /// metric's depends on what it counts ([`MetricCount::watched`]), which
+    /// the compiler looks up.
+    ///
+    /// [`MetricCount::watched`]: crate::config::MetricCount::watched
+    pub(crate) fn watched(&self) -> Option<Watched> {
         match self {
-            Self::Scalar(f) => f.reads(),
-            Self::RespHeader(_) | Self::RespHeaderAll(_) => Reads::RESPONSE_HEAD,
-            Self::RespBodyText => Reads::RESPONSE_BODY_TEXT,
+            Self::Scalar(f) => f.watched(),
+            Self::RespHeader(_) | Self::RespHeaderAll(_) => Some(Watched::ResponseHead),
+            Self::RespBodyText => Some(Watched::ResponseBodyText),
             Self::Header(_)
             | Self::HeaderAll(_)
             | Self::BodyText
             | Self::Query(_)
             | Self::State(_)
             | Self::Tag(_)
-            | Self::Metric(_) => Reads::NONE,
+            | Self::Metric(_) => None,
         }
     }
 }
@@ -612,16 +719,35 @@ mod tests {
     fn head_and_watched() {
         assert!(Field::Host.is_head());
         assert!(Field::BodySize.is_head());
-        assert_eq!(Field::BodyBytes.reads(), Reads::BODY_BYTES);
-        assert_eq!(Field::ResponseStatus.reads(), Reads::RESPONSE_HEAD);
-        assert_eq!(Field::ResponseBodyBytes.reads(), Reads::RESPONSE_BODY_BYTES);
-        assert_eq!(Field::WsText.reads(), Reads::WS);
-        assert_eq!(Access::RespBodyText.reads(), Reads::RESPONSE_BODY_TEXT);
-        assert!(Access::BodyText.reads().is_empty());
+        assert_eq!(Field::BodyBytes.watched(), Some(Watched::BodyBytes));
+        assert_eq!(Field::ResponseStatus.watched(), Some(Watched::ResponseHead));
+        assert_eq!(
+            Field::ResponseBodyBytes.watched(),
+            Some(Watched::ResponseBodyBytes)
+        );
+        assert_eq!(Field::WsText.watched(), Some(Watched::Ws));
+        assert_eq!(
+            Access::RespBodyText.watched(),
+            Some(Watched::ResponseBodyText)
+        );
+        assert_eq!(Access::BodyText.watched(), None);
         let r = Reads::BODY_BYTES | Reads::METRIC_REQUEST_BYTES;
         assert!(r.intersects(Reads::METRICS));
         assert!(Reads::BODY_BYTES.is_subset(r));
         assert_eq!(r.names(), ["body.bytes", "request_bytes metric"]);
+        assert_eq!(r.retain(Watched::is_field), Reads::BODY_BYTES);
+    }
+
+    /// The groups partition `Watched::ALL` by its own predicates, and every
+    /// member has a distinct bit and name.
+    #[test]
+    fn groups_derive_from_watched() {
+        assert_eq!(Reads::WATCHED_FIELDS | Reads::METRICS, Reads::ALL);
+        assert!(!Reads::WATCHED_FIELDS.intersects(Reads::METRICS));
+        assert!(Reads::BEFORE_RESPONSE_SENT.is_subset(Reads::WATCHED_FIELDS));
+        assert_eq!(Reads::ALL.iter().count(), Watched::ALL.len());
+        let names: std::collections::HashSet<&str> = Reads::ALL.names().into_iter().collect();
+        assert_eq!(names.len(), Watched::ALL.len());
     }
 
     #[test]
