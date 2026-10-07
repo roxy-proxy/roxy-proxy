@@ -1,7 +1,7 @@
 # Upstream
 
 How roxy reaches the origin: its own DNS, the
-[address floor](/policies/address-lists) that every connection passes, and
+[address floor](/reference/address-lists) that every connection passes, and
 upstream TLS. The connector lives in
 `roxy-proxy::upstream`.
 

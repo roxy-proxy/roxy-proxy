@@ -61,14 +61,14 @@ fields become known later, so rules that read them watch.
 | `header["name"]`, `header.all["name"]` | string, list | head |
 | `body.size` | int: declared length, `null` if undeclared (chunked) | head |
 | `body.text` | string: the buffered body, up to the cap | head |
-| `metric.<id>` | int | head; a `deny` reading a byte metric also watches it ([rate limits](/policies/rate-limits#metrics)) |
+| `metric.<id>` | int | head; a `deny` reading a byte metric also watches it ([rate limits](/reference/rate-limits#metrics)) |
 | `state["key"]`, `tag["name"]` | string, bool | head |
 | `body.bytes` | int: request body bytes so far | watched |
 | `response.status`, `response.header["name"]`, `response.header.all["name"]` | int, string, list | watched |
 | `response.body.size` | int: declared length, `null` if undeclared | watched |
 | `response.body.text` | string: the buffered response body | watched |
 | `response.body.bytes` | int: response body bytes so far | watched |
-| `ws.direction`, `ws.opcode`, `ws.size`, `ws.text` | string, int, int, string: the WebSocket message being checked | watched, per message ([WebSockets](/policies/websockets#message-rules)) |
+| `ws.direction`, `ws.opcode`, `ws.size`, `ws.text` | string, int, int, string: the WebSocket message being checked | watched, per message ([WebSockets](/reference/websockets#message-rules)) |
 
 `path` is the normalised path ([HTTP](/reference/http#url-normalisation)), so a
 rule matches exactly what is forwarded. A policy with any rule that reads
@@ -98,7 +98,7 @@ rule or addon sets it, so `tag["x"] == null` is always false.
 present: `body.size != null and body.size > 10mb`. `null` may only appear
 in `x == null` or `x != null`. A metric keyed on a field that can be `null`
 must carry the same guard in its `where`
-([rate limits](/policies/rate-limits#metrics)).
+([rate limits](/reference/rate-limits#metrics)).
 
 ## Actions
 
@@ -124,8 +124,8 @@ Terminal:
 
 | action | where | effect |
 |---|---|---|
-| `allow` | head rules | Forward. `allow: { upgrade: websocket }` also permits a WebSocket upgrade; `private_ok: true` lets this flow reach private addresses ([address floor](/policies/address-lists#address-floor)). |
-| `deny` | all rules | `deny: { status, message, close }`. Status defaults to 403 and must be 4xx or 5xx. At the head: refuse ([deny responses](/reference/http#deny-responses)); the connection is closed afterwards unless `close: false`. Watching: stop the exchange, as in [evaluation](/policies/overview#evaluation). On a WebSocket: close both sides (with a `1008` close frame when rules read messages, [WebSockets](/policies/websockets#message-rules)). |
+| `allow` | head rules | Forward. `allow: { upgrade: websocket }` also permits a WebSocket upgrade; `private_ok: true` lets this flow reach private addresses ([address floor](/reference/address-lists#address-floor)). |
+| `deny` | all rules | `deny: { status, message, close }`. Status defaults to 403 and must be 4xx or 5xx. At the head: refuse ([deny responses](/reference/http#deny-responses)); the connection is closed afterwards unless `close: false`. Watching: stop the exchange, as in [evaluation](/design/policy-evaluation#evaluation). On a WebSocket: close both sides (with a `1008` close frame when rules read messages, [WebSockets](/reference/websockets#message-rules)). |
 
 Non-terminal:
 
@@ -138,11 +138,33 @@ Non-terminal:
 | `redirect: { host, port, scheme?, rewrite_host? }` | head rules | Change the upstream target. `host` follows the same rules as a request's host: a DNS name, a dotted-quad IPv4 address or a bracketed IPv6 address (`[::1]`). Anything else, and port `0`, is a config error. The address floor and deny lists check the new target's IPs. `Host` is unchanged unless `rewrite_host: true`; while it is unchanged, the request goes upstream over HTTP/1.1, because HTTP/2 needs `:authority` and `host` to agree. |
 | `tag: name` | all | Sets `tag["name"]` for later rules, addons and the log. |
 | `log: { level, message }` | all | Emits a `log` flow event. |
-| `set_state: { key, value, ttl? }` | all | Writes the [state store](/policies/rate-limits#state). |
-| `capture: request \| response \| both` | head rules | Tees the exchange, as forwarded, to the [capture log](/operate/flow-log#capture). |
-| `sign: { aws_sigv4: { service, region, access_key_id, secret_access_key, session_token?, unsigned_payload? } }` | head rules | Signs the forwarded request with AWS Signature Version 4, after every other head effect; the credentials may use `${secret:name}` ([signing AWS requests](/policies/secrets#signing-aws-requests)). |
+| `set_state: { key, value, ttl? }` | all | Writes the [state store](/reference/rate-limits#state). |
+| `capture: request \| response \| both` | head rules | Tees the exchange, as forwarded, to the [capture log](/reference/flow-log#capture). |
+| `sign: { aws_sigv4: { service, region, access_key_id, secret_access_key, session_token?, unsigned_payload? } }` | head rules | Signs the forwarded request with AWS Signature Version 4, after every other head effect; the credentials may use `${secret:name}` ([signing AWS requests](/reference/secrets#signing-aws-requests)). |
 
 The actions are a small closed set on purpose: anything richer is an addon.
 Two words are reserved and rejected with the reason: `call` (addons run
 above the rules, not from one) and `passthrough` (reserved; roxy has no
 transparent listener).
+
+## Body rules
+
+`body.text` and `response.body.text` are the only fields that buffer. If
+any rule reads `body.text`, roxy collects every request body up to
+`limits.max_inspect_body_bytes` (1 MiB) before the head decision, evaluates,
+then streams the bytes on; `response.body.text` does the same for every
+response body. A body over the cap is **unavailable**, and a rule that
+reads it **fails closed** (`_fail_closed`, reason
+`body_too_large_to_inspect`). Raise the cap to inspect larger bodies, or
+scope the rule (`body.size != null and body.size < 1mb and ...`) so it
+short-circuits before reading the text: that avoids the fail-closed, not
+the buffering. A policy with no rule reading a body never buffers.
+
+The text is the body decoded by its `content-encoding` (`gzip`, `deflate`,
+`br`, `zstd`, stacked or not; [HTTP](/reference/http#content-codings)), then read
+as lossy UTF-8. Decoding is for the rules only: the bytes forwarded are the
+bytes received. The cap applies to the decoded text too, so a small body
+that inflates past it fails closed with `body_too_large_to_inspect`. A body
+that cannot be decoded fails closed as well: `body_decode_failed` for
+corrupt or truncated data or bytes after the end of the stream,
+`unsupported_content_encoding` for a coding roxy does not know.

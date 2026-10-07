@@ -24,7 +24,7 @@ roxy run --control-plane https://cp.example:8443 \
 | `--control-plane-ca PATH` | PEM bundle to verify the control plane with. Default: the system roots. |
 | `--bootstrap-bind ADDR` | Where the proxy listens before the first lease. Default `0.0.0.0:3128`. |
 | `--bootstrap-ca-server ADDR` | Where `ca_server` listens before the first lease. Default `0.0.0.0:3130`. |
-| `--interception-ca-cert PATH`, `--interception-ca-key PATH` | An interception CA pair to import into the state dir on a start where it holds none. See [the interception CA](/deploy/node-mode#the-interception-ca). |
+| `--interception-ca-cert PATH`, `--interception-ca-key PATH` | An interception CA pair to import into the state dir on a start where it holds none. See [the interception CA](/guides/node-mode#the-interception-ca). |
 | `--replace-interception-ca` | Replace a stored interception CA that differs from the one given. |
 
 The token is as sensitive as the lease secrets it unlocks: whoever holds a
@@ -65,7 +65,7 @@ ignored with a warning.
 - A stored pair that does not parse is fatal, as in file mode.
 
 Workloads fetch the CA from `ca_server` as usual
-([CA distribution](/operate/ca-certificates#ca-distribution)).
+([CA distribution](/guides/ca-certificates#ca-distribution)).
 
 ## Startup
 
@@ -107,7 +107,7 @@ is how the control plane learns the lease did not take.
 - `valid_for_seconds` becomes the policy's `valid_until`, counted on the
   node's own clock from just before the fetch was sent. Past it, with no
   newer lease, every request is denied with `terminal_rule: _expired`
-  ([lease](/operate/operations#lease)).
+  ([lease](/guides/operations#lease)).
 - `refresh_after_seconds` is when the node polls next, never later than
   halfway through `valid_for_seconds`.
 - The node compares `config` and `secrets` with the lease it runs. A
@@ -185,5 +185,5 @@ traffic.
 `SIGHUP` reopens the local log destinations; there is no file to reload.
 `SIGTERM` or ctrl-c shuts down as in file mode. `/healthz` and `/readyz` on
 the lease's `ca_server` behave as described in
-[operations](/operate/operations): ready means an unexpired lease is in
+[operations](/guides/operations): ready means an unexpired lease is in
 force.

@@ -60,7 +60,7 @@ metrics:
   reason `metric_table_full`). A byte metric that
   cannot record a chunk mid-stream stops the exchange the same way.
   Series are reclaimed only once their window has fully expired
-  ([never evict](/principles#never-evict)).
+  ([never evict](/design/threat-model#never-evict)).
 - **Reload.** Series whose metric definition (`count`, `key`, `window`) is
   unchanged carry over; series of a changed or removed metric are dropped
   without comment. Carried series may exceed a lowered `max_metric_keys`
@@ -109,4 +109,4 @@ denies the flow that tried with `503`, `_fail_closed`, reason
 `state_unavailable`. State is shared across flows, so reading it is
 order-dependent by design: `state["key"]` sees what earlier flows wrote,
 and, within one flow, the `set_state` of rules above the reader. Addons
-have their own, separate store ([addons](/addons/host-services)).
+have their own, separate store ([addons](/reference/host-services)).

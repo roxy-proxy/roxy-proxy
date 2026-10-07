@@ -76,4 +76,4 @@ curl -s -x http://<proxy> http://roxy.internal/roxy-ca.pem        # through the 
 
 The `ca_server` listener is separate from the proxy port so it can be
 firewalled differently. It also serves the `/healthz` and `/readyz` probes
-([health](/operate/operations#health)).
+([health](/guides/operations#health)).

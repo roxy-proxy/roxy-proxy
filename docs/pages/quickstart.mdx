@@ -8,7 +8,7 @@ import stack from "../assets/quickstart-stack.svg";
 
 # Quickstart
 
-Run clients through roxy with three controls on every model call: a WASM addon that authenticates the client with a central auth service, a WASM addon that holds each user to a token quota kept by a quota service, and an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar that blocks tool calls matching a denylist. roxy runs in [node mode](/deploy/node-mode): it leases its policy and the model's API key from a minimal control plane and ships its flow log back. The model is a scripted stand-in and the traffic is generated, so the stack needs no API key and no route out: start it and watch. The setup is [`examples/quickstart`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/quickstart) in the roxy repo.
+Run clients through roxy with three controls on every model call: a WASM addon that authenticates the client with a central auth service, a WASM addon that holds each user to a token quota kept by a quota service, and an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar that blocks tool calls matching a denylist. roxy runs in [node mode](/guides/node-mode): it leases its policy and the model's API key from a minimal control plane and ships its flow log back. The model is a scripted stand-in and the traffic is generated, so the stack needs no API key and no route out: start it and watch. The setup is [`examples/quickstart`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/quickstart) in the roxy repo.
 
 ## Prerequisites
 
@@ -87,7 +87,7 @@ From another terminal:
 docker compose logs roxy
 ```
 
-roxy's flow log has a line for every request, with the rule it matched, the addons it went through in order (`"addons":["auth-gate","token-quota","sentinel"]`), the `user:alice` tag the auth gate set, and the `set_header:x-api-key` mutation the rule made. Each addon's own events are there too: `endpoint_call` for every call to the auth service and the quota board, and `layer_record` for the verdicts and the usage reports. To keep whole requests and responses too, turn on [capture](/operate/flow-log#capture).
+roxy's flow log has a line for every request, with the rule it matched, the addons it went through in order (`"addons":["auth-gate","token-quota","sentinel"]`), the `user:alice` tag the auth gate set, and the `set_header:x-api-key` mutation the rule made. Each addon's own events are there too: `endpoint_call` for every call to the auth service and the quota board, and `layer_record` for the verdicts and the usage reports. To keep whole requests and responses too, turn on [capture](/reference/flow-log#capture).
 
 The same events reach the control plane in batches a few seconds later; `docker compose logs controlplane` shows each one prefixed with the node's id.
 
@@ -119,7 +119,7 @@ docker compose down -v
 
 ### Three layers above the rules
 
-An exchange passes through the [addons](/addons/overview) in the order `roxy.yaml` lists them, and then the rules. Each addon wraps everything below it.
+An exchange passes through the [addons](/design/addon-model) in the order `roxy.yaml` lists them, and then the rules. Each addon wraps everything below it.
 
 <img src={stack} alt="A model call from the client passes through the auth gate, the token quota and the sentinel, then the rules and the connector, to the fake model; each layer calls its own service, and the flow log records the exchange" />
 
@@ -161,17 +161,17 @@ rules:
 
 The full policy is [`roxy.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/roxy.yaml).
 
-**The auth gate** ([`addons/auth-gate`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/addons/auth-gate/src/lib.rs)) reads the client's credential from `x-roxy-auth` and asks the auth service who it belongs to, through a [named endpoint](/addons/host-services#endpoints-endpoints): the layer says `auth`, roxy picks the URL. It caches the answer in the layer's [state store](/addons/host-services#state-state) under a hash of the credential, so the store never holds the credential itself, then tags the flow `user:alice`, strips the header and passes the request on. A missing or refused credential is answered with a `401` here; the request never leaves. The tag is how one layer hands an identity to the next: roxy's own notion of a principal is the client IP, listener and SNI, and a layer below sees the tags of the layers above.
+**The auth gate** ([`addons/auth-gate`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/addons/auth-gate/src/lib.rs)) reads the client's credential from `x-roxy-auth` and asks the auth service who it belongs to, through a [named endpoint](/reference/host-services#endpoints-endpoints): the layer says `auth`, roxy picks the URL. It caches the answer in the layer's [state store](/reference/host-services#state-state) under a hash of the credential, so the store never holds the credential itself, then tags the flow `user:alice`, strips the header and passes the request on. A missing or refused credential is answered with a `401` here; the request never leaves. The tag is how one layer hands an identity to the next: roxy's own notion of a principal is the client IP, listener and SNI, and a layer below sees the tags of the layers above.
 
-Putting a secret in a header and having roxy swap it for the real one is the simple case, and the rule does that for the API key with `set_header` and a [secret](/policies/secrets). The auth gate is for when authentication takes a round trip: here a lookup of a fixed string, in a real deployment the validation of a signed token.
+Putting a secret in a header and having roxy swap it for the real one is the simple case, and the rule does that for the API key with `set_header` and a [secret](/reference/secrets). The auth gate is for when authentication takes a round trip: here a lookup of a fixed string, in a real deployment the validation of a signed token.
 
 **The token quota** ([`addons/token-quota`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/addons/token-quota/src/lib.rs)) runs only on model calls. Before the call leaves it asks the quota board whether the user's bucket holds anything; the user is the `user:` tag if a layer above set one, else the client IP, so the layer also works alone. A refusal is answered with a `429` and a `retry-after`, in the shape the Anthropic SDK expects. Otherwise it passes the call on and reads the response as it streams through: `input_tokens` from `message_start`, the running `output_tokens` from `message_delta`, changing nothing. When the stream ends, or is cut off, it reports what it has read, and the board takes them out of the bucket. A call's usage is only known once its response has arrived, so the check is whether the bucket holds anything, not whether it holds enough: a user can overrun by one call, the bucket goes into debt, and the next call waits for the refill. Both calls to the board are endpoints.
 
-**The sentinel** is a [service layer](/addons/service-layers): an out-of-process addon that each exchange streams through over a WebSocket. For each model response it turns every tool call into an inspect_sentinel `BeforeToolCall` step and runs the configured sentinel on it. It sits below the quota layer, so what the quota layer meters is what the client got. Whatever any layer passes on, roxy's rules judge again, and the rules decide by host: the model and nothing else.
+**The sentinel** is a [service layer](/reference/service-layers): an out-of-process addon that each exchange streams through over a WebSocket. For each model response it turns every tool call into an inspect_sentinel `BeforeToolCall` step and runs the configured sentinel on it. It sits below the quota layer, so what the quota layer meters is what the client got. Whatever any layer passes on, roxy's rules judge again, and the rules decide by host: the model and nothing else.
 
 ### roxy runs in node mode
 
-In [node mode](/deploy/node-mode) roxy has no config file. It enrols once with a token, keeps the certificate it is given in its state dir, and from then on polls the control plane for its lease: the whole `roxy.yaml`, the secret values the file declares as `lease: true`, and how to ship the flow log. The control plane here is [`controlplane/controlplane.py`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/controlplane/controlplane.py), the server side of the [node protocol](/reference/node-protocol) in one file: it signs the node's CSR with a CA it keeps, checks the node certificate on every other request, reads `roxy.yaml` and turns `model_key: { env: MODEL_API_KEY }` into a lease secret with the value from its own environment, and prints the flow batches it is sent. Its enrolment token stays valid across restarts, because roxy's state dir is tmpfs and every `docker compose up` re-enrols; a real control plane consumes a token on first use. The `lease_id` is a hash of the config and the secrets, so editing `roxy.yaml` changes the lease and roxy applies it on its next poll; nothing is restarted.
+In [node mode](/guides/node-mode) roxy has no config file. It enrols once with a token, keeps the certificate it is given in its state dir, and from then on polls the control plane for its lease: the whole `roxy.yaml`, the secret values the file declares as `lease: true`, and how to ship the flow log. The control plane here is [`controlplane/controlplane.py`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/controlplane/controlplane.py), the server side of the [node protocol](/reference/node-protocol) in one file: it signs the node's CSR with a CA it keeps, checks the node certificate on every other request, reads `roxy.yaml` and turns `model_key: { env: MODEL_API_KEY }` into a lease secret with the value from its own environment, and prints the flow batches it is sent. Its enrolment token stays valid across restarts, because roxy's state dir is tmpfs and every `docker compose up` re-enrols; a real control plane consumes a token on first use. The `lease_id` is a hash of the config and the secrets, so editing `roxy.yaml` changes the lease and roxy applies it on its next poll; nothing is restarted.
 
 To run roxy from the file instead, with no control plane, add the standalone override:
 
@@ -210,10 +210,10 @@ The scripted answers will not make much sense of your prompts, but every call go
 
 ### This is not containment
 
-The client follows `HTTP_PROXY` because it chooses to; any process can ignore it. This quickstart shows what roxy and its addons decide, not a boundary. To contain an agent, run it where its only route out is roxy: see [sandbox containment](/deploy/containment).
+The client follows `HTTP_PROXY` because it chooses to; any process can ignore it. This quickstart shows what roxy and its addons decide, not a boundary. To contain an agent, run it where its only route out is roxy: see [sandbox containment](/guides/containment).
 
 ## Next steps
 
-- **Write an addon.** [Writing addons](/addons/writing) covers the `roxy-addon` SDK the two addons here use.
-- **Contain the agent.** [Sandbox containment](/deploy/containment) has the network recipe and a Compose layout.
-- **Write your own policy.** [How policies work](/policies/overview) explains how rules are evaluated.
+- **Write an addon.** [Writing addons](/guides/writing-addons) covers the `roxy-addon` SDK the two addons here use.
+- **Contain the agent.** [Sandbox containment](/guides/containment) has the network recipe and a Compose layout.
+- **Write your own policy.** [How policies work](/design/policy-evaluation) explains how rules are evaluated.

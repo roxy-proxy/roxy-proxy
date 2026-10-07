@@ -6,7 +6,7 @@ closed" or "deny wins", this is why.
 
 There is one threat model for both ways of deploying roxy. What roxy
 prevents, it prevents for traffic that reaches it, in a
-[sandbox](/deploy/containment) and in a [gateway](/deploy/gateway) alike.
+[sandbox](/guides/containment) and in a [gateway](/guides/gateway) alike.
 Whether all of a workload's traffic reaches roxy is a property of the
 network, and only the sandbox use case claims it.
 
@@ -43,15 +43,15 @@ allow, or compromise of the host running roxy.
 roxy decides what passes through it; it cannot stop traffic that never
 reaches it. In the sandbox use case containment comes from the network: the
 workload must have no route out except through roxy
-([sandbox containment](/deploy/containment)). A gateway makes no such
+([sandbox containment](/guides/containment)). A gateway makes no such
 claim. It governs the requests its clients send to it, and the clients keep
-whatever other routes they have ([HTTP gateway](/deploy/gateway)).
+whatever other routes they have ([HTTP gateway](/guides/gateway)).
 
 ## Fail closed
 
 Anything roxy cannot parse, verify or classify is dropped. An
 empty rule set denies everything, and so does a policy past its
-`valid_until` ([lease](/operate/operations#lease)). A config that fails
+`valid_until` ([lease](/guides/operations#lease)). A config that fails
 to compile is not loaded, and a failed reload keeps the running policy. An
 addon in `enforce` mode that fails denies the flow; an `observe` addon
 cannot affect traffic, so its failure is logged and the flow goes on.
@@ -73,7 +73,7 @@ header injection and path confusion as classes of attack
 After a WebSocket upgrade the connection carries only that WebSocket, so
 there is no later request to smuggle into. roxy splices its bytes unless a
 rule reads messages; then every message is decoded strictly and re-encoded
-in one form ([WebSockets](/policies/websockets#message-rules)).
+in one form ([WebSockets](/reference/websockets#message-rules)).
 
 ## Deny always wins
 
@@ -84,7 +84,7 @@ orders effects, never decisions: a rule that reads a tag must follow every
 rule that sets it, or the config is rejected. So adding a deny can only
 narrow what
 passes, and a reviewer can read each deny on its own
-([rules](/policies/overview)).
+([rules](/design/policy-evaluation)).
 
 ## Never evict
 
@@ -92,14 +92,14 @@ Bounded tables (metric series, rule state, addon state) never evict to make
 room. A flow that needs a new entry in a full table is denied instead.
 Eviction would let a client reset its own counter by churning keys, so a
 limit could be escaped by exceeding another one
-([rules](/policies/rate-limits#metrics)).
+([rules](/reference/rate-limits#metrics)).
 
 ## Audit backpressure
 
 The flow log and traffic capture are an audit trail, and they never drop a
 record. When a log falls behind or its disk fails, roxy holds traffic back
 until it catches up: the wait propagates to the network, slowing clients
-rather than losing records ([flow log](/operate/flow-log#writing)).
+rather than losing records ([flow log](/reference/flow-log#writing)).
 
 ## The rules judge everything that leaves
 
@@ -108,7 +108,7 @@ above the rules and can reshape traffic freely, but what they pass on is
 re-validated as strictly as a client request and then judged by the rules as
 if the client had sent it. Nothing configurable runs between the rules and
 the network, and the address floor checks the IP actually dialled
-([addons](/addons/overview)).
+([addons](/design/addon-model)).
 
 ## Streams, not messages
 

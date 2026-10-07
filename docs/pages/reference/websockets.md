@@ -32,14 +32,14 @@ not a `101` followed by a close:
 - an upstream that answers anything other than `101` has its answer
   relayed as it is, like any response;
 - a `101` with a wrong `Sec-WebSocket-Accept`, or one that accepts an
-  extension when none may be negotiated ([below](/policies/websockets#extensions)), is `502`,
+  extension when none may be negotiated ([below](/reference/websockets#extensions)), is `502`,
   `upstream_error` with reason `protocol_error`.
 
 How it relays depends on the policy. If no rule reads a `ws.*` field, roxy
 splices bytes: no frame parsing, re-masking or reassembly. Subprotocols
 work exactly as negotiated end to end, and so do extensions unless
-something must read the messages ([below](/policies/websockets#extensions)). If any rule reads
-`ws.*`, roxy checks every message ([message rules](/policies/websockets#message-rules)).
+something must read the messages ([below](/reference/websockets#extensions)). If any rule reads
+`ws.*`, roxy checks every message ([message rules](/reference/websockets#message-rules)).
 
 Either way:
 
@@ -49,8 +49,8 @@ Either way:
   could land inside a half-relayed frame. With message rules, both sides get
   a `1008` close frame first.
 - Each chunk waits for the flow log like any forwarded body
-  ([audit backpressure](/operate/flow-log#writing)), and capture records both
-  directions as relayed. Through [addon layers](/addons/overview#websockets)
+  ([audit backpressure](/reference/flow-log#writing)), and capture records both
+  directions as relayed. Through [addon layers](/reference/addon-configuration#websockets)
   the relay is the hop next to the upstream, so capture records its bytes,
   not what a layer changes on the way to the client.
 - A relayed WebSocket closes after `limits.idle_timeout` (300 s) with no
@@ -62,7 +62,7 @@ Either way:
   `res.status: 101` and the relayed byte totals as its request and
   response `body_bytes`.
 - Addon layers carry the WebSocket in their bodies, between the client
-  and the relay ([addons](/addons/overview#websockets)), so message rules
+  and the relay ([addons](/reference/addon-configuration#websockets)), so message rules
   see what the layers pass on.
 
 ## Extensions
@@ -74,11 +74,11 @@ messages, roxy makes sure no extension is negotiated: it removes
 a `101` that accepts an extension anyway. Every WebSocket server must work
 without extensions, so this costs only compression. roxy does this when:
 
-- a rule reads `ws.*` ([message rules](/policies/websockets#message-rules)); or
+- a rule reads `ws.*` ([message rules](/reference/websockets#message-rules)); or
 - an addon layer runs on the upgrade request (its `when` matched) and
   `http.decode_for_addons` is on (the default), so the layer gets readable
   messages
-  ([addons](/addons/overview#content-codings)).
+  ([addons](/reference/addon-configuration#content-codings)).
 
 Otherwise the client's offer and the upstream's answer pass through
 untouched.
@@ -86,7 +86,7 @@ untouched.
 ## Message rules
 
 Rules that read `ws.direction`, `ws.opcode`, `ws.size` or `ws.text` are
-watching rules ([evaluation](/policies/overview)), checked on every
+watching rules ([evaluation](/design/policy-evaluation)), checked on every
 message after the `101`:
 
 ```yaml
@@ -131,7 +131,7 @@ per WebSocket, the first time it matches.
 
 With message rules, roxy:
 
-- makes sure no extension is negotiated ([above](/policies/websockets#extensions)), so every message stays
+- makes sure no extension is negotiated ([above](/reference/websockets#extensions)), so every message stays
   readable;
 - decodes each direction strictly (RFC 6455 §5). RSV bits must be zero,
   opcodes must be known, client frames must be masked and server frames

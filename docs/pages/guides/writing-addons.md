@@ -33,7 +33,7 @@ roxy_addon::export!(RedactTokens);
 - `flow::*` and `call_endpoint` wrap the host services. A panic traps, and
   the host fails the exchange closed.
 - WebSockets need nothing extra: the request and response bodies carry
-  them ([WebSockets](/addons/overview#websockets)).
+  them ([WebSockets](/reference/addon-configuration#websockets)).
 - The crate carries a copy of `wit/` so it can be published; a test keeps
   the copy in sync.
 
@@ -42,7 +42,7 @@ Any language that targets the component model works against the WIT. Go
 per-call cost. Python in WASM (`componentize-py`) bundles an interpreter:
 tens of MiB, 128–256 MiB of memory, pure-Python dependencies only; give it
 raised budgets. Python with native dependencies, or anything else out of
-process, is a [service layer](/addons/service-layers).
+process, is a [service layer](/reference/service-layers).
 
 roxy-wasm's test component
 [`redact`](https://github.com/roxy-proxy/roxy-proxy/tree/main/crates/roxy-wasm/test-components/redact) is a streaming

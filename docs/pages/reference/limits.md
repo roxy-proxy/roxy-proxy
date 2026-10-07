@@ -25,7 +25,7 @@ connect produces a deny response or a closed socket.
 | config reload fails | keep the old policy |
 | connection cap | refuse the new connection |
 | flow log or capture behind, or its disk failing | hold traffic until it catches up; never drop records |
-| WebSocket message that breaks the protocol or is over `max_ws_message_bytes`, when rules read messages | close both sides with `1002`, `1007` or `1009` ([WebSockets](/policies/websockets#message-rules)) |
+| WebSocket message that breaks the protocol or is over `max_ws_message_bytes`, when rules read messages | close both sides with `1002`, `1007` or `1009` ([WebSockets](/reference/websockets#message-rules)) |
 
 The reason codes above are flow-log values. A deny response carries the
 status, the rule id and the flow id, never the reason
@@ -86,12 +86,12 @@ on HTTP/1.1 the connection closes so the client cannot take the body for
 complete, on HTTP/2 the stream is reset with `CANCEL`.
 
 Addons have their own limits, and fixed caps on what the host holds for a
-guest ([addon safety](/addons/safety)). `max_ws_message_bytes` applies
+guest ([addon safety](/reference/addon-safety)). `max_ws_message_bytes` applies
 only when rules read WebSocket messages
-([WebSockets](/policies/websockets#message-rules)); a message over it
+([WebSockets](/reference/websockets#message-rules)); a message over it
 closes both sides with `1009`. `max_observer_lag_bytes` is how many bytes
 of its copy an observe-mode addon may leave unread, per direction, before
-the copy is cut ([addon modes](/addons/overview#modes)).
+the copy is cut ([addon modes](/design/addon-model#modes)).
 
 `max_buffered_bytes` bounds those buffers in aggregate; each is
 bounded per exchange, and without it the only bound on exchanges is the
@@ -112,7 +112,7 @@ eviction: the exchange fails closed (`503`, `_fail_closed`,
   reserves what it has read, chunk by chunk, up to that cap, and is refused
   (`buffer_budget_exhausted`) at the chunk the budget cannot cover. Either
   way the reservation is held until the exchange ends
-  ([signing AWS requests](/policies/secrets#signing-aws-requests)). With
+  ([signing AWS requests](/reference/secrets#signing-aws-requests)). With
   `unsigned_payload: true` the body streams and reserves nothing.
 - A WebSocket whose messages rules read reserves twice
   `max_ws_message_bytes` at the upgrade and holds it for the session. A
@@ -166,7 +166,7 @@ smaller budget admits nothing new until enough of them end).
   hold at most `max_connections_per_client` × 4 MiB (1 GiB by default).
 - Bounded policy tables (metrics, state, addon state) never evict
   to make room: a flow that needs a new entry in a full table is denied
-  ([never evict](/principles#never-evict)).
+  ([never evict](/design/threat-model#never-evict)).
 - The proxy port serves only proxy semantics and `roxy.internal`. Health
   and CA download live on the separate `ca_server` listener, so they can be
   firewalled differently.

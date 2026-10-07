@@ -2,7 +2,7 @@
 
 How roxy speaks TLS to clients: the certificates it mints, the handshake
 it offers, and how it checks a tunnel's first bytes. For the CA itself and
-how clients come to trust it, see [managing the CA](/operate/ca-certificates).
+how clients come to trust it, see [managing the CA](/guides/ca-certificates).
 
 ## Leaf certificates
 

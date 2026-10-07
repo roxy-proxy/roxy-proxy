@@ -24,7 +24,7 @@ produces a `request` event:
 - `req.body_bytes` and `res.body_bytes` count the body bytes roxy
   forwarded in each direction; `req.body_sha256` and `res.body_sha256` are
   the lower-case hex SHA-256 of those same bytes, so a record can be tied
-  to a [capture](/operate/flow-log#capture) or to what the other end received. Each digest
+  to a [capture](/reference/flow-log#capture) or to what the other end received. Each digest
   is present once its body completed, and absent when the exchange ended
   before the body did (a cut body, a watching stop, a client that went
   away). An empty body has the digest of the empty string. A relayed
@@ -41,11 +41,11 @@ produces a `request` event:
   `effect_invalid`, `unsupported_effect`, `state_unavailable`,
   `capture_unavailable`, `sign_conflict`, `watch_missing` or
   `watch_stopped`. With `_address_policy` it is `address_policy`; with
-  `_expired` it is `policy_expired` ([lease](/operate/operations#lease));
+  `_expired` it is `policy_expired` ([lease](/guides/operations#lease));
   with `_sign` it is `sign_body_too_large` or `sign_header_invalid`
-  ([signing AWS requests](/policies/secrets#signing-aws-requests)); with
+  ([signing AWS requests](/reference/secrets#signing-aws-requests)); with
   `_websocket` it is `ws_bad_handshake`
-  ([WebSockets](/policies/websockets)); with `layer:<name>` it is
+  ([WebSockets](/reference/websockets)); with `layer:<name>` it is
   `layer_error`. An upstream failure carries the `upstream_error` reason
   (`timeout`, `connect_failed`, ...; [upstream](/reference/upstream#errors)).
   An exchange roxy could not finish has `aborted` (its connection ended, or
@@ -59,12 +59,12 @@ produces a `request` event:
   `response_head`, `response_body`, `websocket`.
 - `addons` lists the addon layers that ran on the exchange, outermost
   first. A layer skipped by its `when` or `sample` is not in it
-  ([choosing exchanges](/addons/configuration#choosing-exchanges)).
+  ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)).
 - `decision` is `allow` or `deny`, or `answered` when an addon layer
-  answered itself ([addons](/addons/overview#in-the-proxy)).
+  answered itself ([addons](/reference/addon-configuration#in-the-proxy)).
 - When an addon changed the request, `rules`, `decision` and
   `terminal_rule` describe the request that left, and `req` still describes
-  what the client sent ([addons](/addons/overview#in-the-proxy)). They are
+  what the client sent ([addons](/reference/addon-configuration#in-the-proxy)). They are
   the rules' decision on that request, not a description of the response:
   `res.status` is what the client got, which a layer above the rules may
   have replaced after `next` returned.
@@ -76,18 +76,18 @@ produces a `request` event:
 | `request` | every exchange |
 | `response_error` | the response could not be written after the request was allowed; `reason` is `client_gone` (the client stopped reading or went away), `client_stalled` (an HTTP/2 client left its flow-control window shut for `limits.body_idle_timeout`), `response_body_timeout` (the upstream paused mid-body for longer than `limits.response_body_idle_timeout`), `response_write_failed` (for example, a body limit mid-stream) or `continue_write_failed` (roxy's own `100 Continue` could not be written) |
 | `parse_error` | the client sent something roxy refused to parse; `reason` is a stable code |
-| `upstream_error`, `upstream_denied` | [upstream](/reference/upstream#errors) failures and address-floor hits; `upstream_denied.reason` is `private_range:<class>`, `deny_cidrs` or `list:<name>` ([address floor](/policies/address-lists#address-floor)) |
+| `upstream_error`, `upstream_denied` | [upstream](/reference/upstream#errors) failures and address-floor hits; `upstream_denied.reason` is `private_range:<class>`, `deny_cidrs` or `list:<name>` ([address floor](/reference/address-lists#address-floor)) |
 | `policy_input_unavailable`, `metric_table_full` | a flow failed closed for want of an input |
-| `policy_expired` | the policy's `valid_until` passed; once per loaded policy, with `valid_until` ([lease](/operate/operations#lease)) |
-| `upgrade_stripped` | an upgrade was not allowed, so the request went upstream as plain HTTP ([WebSockets](/policies/websockets)) |
+| `policy_expired` | the policy's `valid_until` passed; once per loaded policy, with `valid_until` ([lease](/guides/operations#lease)) |
+| `upgrade_stripped` | an upgrade was not allowed, so the request went upstream as plain HTTP ([WebSockets](/reference/websockets)) |
 | `ws_open`, `ws_close` | a relayed WebSocket, with byte counts; `ws_close` has `close_code` and `close_reason` when roxy ended it |
-| `ws_message` | a WebSocket message a rule denied, or one sampled by `log.flow.ws_message_every` ([WebSockets](/policies/websockets#message-rules)) |
+| `ws_message` | a WebSocket message a rule denied, or one sampled by `log.flow.ws_message_every` ([WebSockets](/reference/websockets#message-rules)) |
 | `log` | a rule's `log` action |
-| `layer_error`, `layer_record`, `endpoint_call` | [addons](/addons/overview) |
+| `layer_error`, `layer_record`, `endpoint_call` | [addons](/design/addon-model) |
 | `observer_lagged` | an observe-mode addon's copy of a stream was cut; `reason` is `observer_behind` (it fell `max_observer_lag_bytes` behind) or `buffer_budget_exhausted` (the [buffer budget](/reference/limits#limits) could not cover the copy) |
 | `connect` | a CONNECT, when `log.flow.connection_events` is on or it was refused |
 | `connection_refused` | a connection cap was hit ([limits](/reference/limits#connections)) |
-| `config_loaded`, `config_reloaded`, `config_reload_failed` | startup and [reload](/operate/operations#reload) |
+| `config_loaded`, `config_reloaded`, `config_reload_failed` | startup and [reload](/guides/operations#reload) |
 
 ### Redaction
 

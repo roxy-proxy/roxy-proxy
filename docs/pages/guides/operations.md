@@ -4,11 +4,11 @@
 
 - **Reload:** edit the config, list files or addon files, or send
   `SIGHUP`. A bad config is rejected and the running one stays
-  ([reload](/operate/operations#reload)). Some settings need a restart;
-  [reload](/operate/operations#reload) lists them.
+  ([reload](/guides/operations#reload)). Some settings need a restart;
+  [reload](/guides/operations#reload) lists them.
 - **Lease:** a config with `valid_until` denies everything once that
   instant passes, until a reload replaces it
-  ([lease](/operate/operations#lease)).
+  ([lease](/guides/operations#lease)).
 - **Logs:** the flow log goes to stdout or `log.flow.path`; roxy's own logs
   go to stderr (`--log-format json|pretty`, `--log-level` or `RUST_LOG`).
   `SIGHUP` also reopens log files.
@@ -16,7 +16,7 @@
   ([limits](/reference/limits#connections)).
 - **Health:** `ca_server` serves `/healthz` (alive) and `/readyz` (a
   policy is in force); `roxy health [--ready]` probes them
-  ([health](/operate/operations#health)).
+  ([health](/guides/operations#health)).
 
 ## Health
 
@@ -25,7 +25,7 @@ The `ca_server` listener answers two probes, both plain HTTP `GET`:
 | path | `200` when | otherwise |
 |---|---|---|
 | `/healthz` | the process is up and accepting connections | no answer |
-| `/readyz` | a policy has been applied and its lease has not run out | `503` with a one-word reason: `no_policy` (nothing applied yet) or `policy_expired` ([lease](/operate/operations#lease)) |
+| `/readyz` | a policy has been applied and its lease has not run out | `503` with a one-word reason: `no_policy` (nothing applied yet) or `policy_expired` ([lease](/guides/operations#lease)) |
 
 Liveness is for restarting a stuck process. Readiness is for routing: a
 roxy that has no policy in force should not receive traffic, and a
@@ -109,11 +109,11 @@ one `policy_expired` event; later ones are ordinary `_expired` denies.
 An expired policy is a policy, not a fault. The listeners stay up,
 `/healthz` keeps answering `200` and says `x-roxy-policy: expired` (it
 says `valid` otherwise), and `roxy health` prints `ok (policy expired)`;
-`/readyz` answers `503 policy_expired` ([health](/operate/operations#health)).
+`/readyz` answers `503 policy_expired` ([health](/guides/operations#health)).
 A document already past its `valid_until` loads and denies rather than
 failing to start, so a stale lease on disk fails closed. `roxy check`
 prints `valid until:` and warns when the instant has passed. In
-[node mode](/deploy/node-mode) the control plane's lease sets it.
+[node mode](/guides/node-mode) the control plane's lease sets it.
 
 The way back is a reload: a config whose `valid_until` is later, or
 absent, is swapped in like any other and traffic resumes under it. There

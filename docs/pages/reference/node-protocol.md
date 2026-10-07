@@ -264,7 +264,7 @@ compressed, signalled with `Content-Encoding: gzip`.
 }
 ```
 
-- Each event is a [flow log](/operate/flow-log) record with one field
+- Each event is a [flow log](/reference/flow-log) record with one field
   added, `seq`: a per-node counter that increases by one per shipped event
   and is persisted in the state directory in blocks, so it keeps increasing
   across restarts (a restart skips to the end of the last block). A batch's

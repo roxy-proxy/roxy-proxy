@@ -37,7 +37,7 @@ The same recipe applies anywhere:
    ```
 
 3. **Point the workload at roxy and make it trust roxy's CA**
-   ([CA distribution](/operate/ca-certificates#ca-distribution)):
+   ([CA distribution](/guides/ca-certificates#ca-distribution)):
 
    ```sh
    export HTTP_PROXY=http://<proxy> HTTPS_PROXY=http://<proxy>
@@ -104,6 +104,6 @@ as narrow as it can be while still being useful:
   roxy is decided by a rule.
 
 An `http` listener serves clients that address roxy as the server
-([HTTP gateway](/deploy/gateway)). That is for traffic sent to roxy on
+([HTTP gateway](/guides/gateway)). That is for traffic sent to roxy on
 purpose, not for containing a workload: the clients keep whatever other
 routes they have.

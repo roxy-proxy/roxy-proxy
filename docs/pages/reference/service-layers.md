@@ -176,7 +176,7 @@ stream. Control messages are not counted.
   prefix or with an unknown direction byte, or a stream id roxy never
   opened. Every exchange on it then fails closed (`service:protocol`), and
   roxy closes it.
-- **[Observe mode](/addons/overview#modes)** uses the same streams: the
+- **[Observe mode](/design/addon-model#modes)** uses the same streams: the
   service gets the same messages for copies of both directions, and
   whatever it sends back other than `credit` and `reset` is ignored. The
   stream ends after roxy's `response_end` (or a `reset`); a copy that is
@@ -188,7 +188,7 @@ stream. Control messages are not counted.
   own answers; sending past its credit is a protocol violation, as on any
   stream.
 - **WebSockets** run through the stream as the [addon
-  overview](/addons/overview#websockets) describes for every layer. The
+  overview](/reference/addon-configuration#websockets) describes for every layer. The
   service gets the upgrade request and forwards it; the `101` from below
   arrives as roxy's `response` head, and the service answers it with a
   `101` of its own (the one status outside 200–599 it may send, and only
