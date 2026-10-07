@@ -11,6 +11,12 @@ from typing import Any
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
+MAX_BODY = 8 * 1024 * 1024
+
+
+class BodyTooLarge(Exception):
+    pass
+
 
 class JsonHandler(BaseHTTPRequestHandler):
     """Dispatches to `do_<METHOD>_<route>` methods; see the subclasses."""
@@ -18,6 +24,7 @@ class JsonHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "mock/0"
     log = logging.getLogger("mock")
+    timeout = 30  # a client that stops mid-request is dropped rather than held
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
         self.log.info("%s %s", self.address_string(), format % args)
@@ -28,14 +35,21 @@ class JsonHandler(BaseHTTPRequestHandler):
         if "chunked" in (self.headers.get("transfer-encoding") or "").lower():
             body = b""
             while True:
-                size = int(self.rfile.readline().split(b";", 1)[0].strip() or b"0", 16)
+                line = self.rfile.readline(32).split(b";", 1)[0].strip()
+                if not line or any(c not in b"0123456789abcdefABCDEF" for c in line):
+                    raise ValueError(f"bad chunk size line {line!r}")
+                size = int(line, 16)
                 if size == 0:
                     while self.rfile.readline() not in (b"\r\n", b"\n", b""):
                         pass  # trailers
                     return body
+                if len(body) + size > MAX_BODY:
+                    raise BodyTooLarge
                 body += self.rfile.read(size)
                 self.rfile.readline()  # the CRLF after the chunk
         length = int(self.headers.get("content-length") or 0)
+        if length > MAX_BODY:
+            raise BodyTooLarge
         return self.rfile.read(length) if length else b""
 
     def read_json(self) -> Any:
@@ -69,8 +83,15 @@ class JsonHandler(BaseHTTPRequestHandler):
         handler = getattr(self, name, None)
         if handler is None:
             self.send_error_json(404, "not_found_error", f"no route for {method} {self.path}")
-        else:
+            return
+        try:
             handler()
+        except BodyTooLarge:
+            self.send_error_json(413, "request_too_large", f"body exceeds {MAX_BODY} bytes")
+            self.close_connection = True
+        except ValueError as e:
+            self.send_error_json(400, "invalid_request_error", str(e))
+            self.close_connection = True
 
 
 def serve(handler: type[JsonHandler], default_port: int) -> None:

@@ -59,7 +59,14 @@ def enrol_body(csr, protocol_version=1):
 def cp(tmp_path):
     config = tmp_path / "roxy.yaml"
     config.write_text(ROXY_YAML)
-    env = {"ENROL_TOKEN": "tok", "MODEL_API_KEY": "k1", "LEASE_VALID_SECONDS": "20"}
+    token_file = tmp_path / "enrol-token"
+    token_file.write_text("tok\n")
+    env = {
+        "ENROL_TOKEN_FILE": str(token_file),
+        "MODEL_API_KEY": "k1",
+        "LEASE_VALID_SECONDS": "20",
+        "NODE_CERT_SECONDS": "600",
+    }
     return ControlPlane(tmp_path / "data", config, env)
 
 
@@ -151,14 +158,17 @@ def batch(node_id, first, count, lease_id="lease-x"):
     return b
 
 
-def test_flows_are_deduplicated_and_acked_through_the_highest_seq(cp, capsys):
+def test_flows_are_deduplicated_and_acked_through_the_highest_contiguous_seq(cp, capsys):
     ack = cp.flows("node-1", batch("node-1", 10, 3))
     valid("FlowAck", ack)
     assert ack == {"acked_through": 12}
     assert cp.flows("node-1", batch("node-1", 10, 3)) == {"acked_through": 12}
     assert cp.flows("node-1", batch("node-1", 12, 2)) == {"acked_through": 13}
+    # A batch past a gap is stored but the ack stays below the gap until it is filled.
+    assert cp.flows("node-1", batch("node-1", 20, 2)) == {"acked_through": 13}
+    assert cp.flows("node-1", batch("node-1", 14, 6)) == {"acked_through": 21}
     lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith("node-1 ")]
-    assert [json.loads(l.split(" ", 1)[1])["seq"] for l in lines] == [10, 11, 12, 13]
+    assert [json.loads(l.split(" ", 1)[1])["seq"] for l in lines] == [10, 11, 12, 13, 20, 21, *range(14, 20)]
     expect(400, "node_mismatch", lambda: cp.flows("node-1", batch("node-2", 1, 1)))
     gap = batch("node-1", 20, 2)
     gap["events"][1]["seq"] = 22
@@ -172,7 +182,7 @@ def test_over_tls_the_client_certificate_names_the_node(cp, tmp_path):
     trust = ssl.create_default_context(cadata=cp.ca.pem.decode())
 
     def post(path, body, ctx):
-        conn = http.client.HTTPSConnection("localhost", port, context=ctx)
+        conn = http.client.HTTPSConnection("localhost", port, context=ctx, timeout=5)
         conn.request("POST", path, json.dumps(body), {"content-type": "application/json"})
         res = conn.getresponse()
         return res.status, json.loads(res.read())

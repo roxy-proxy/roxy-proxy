@@ -45,10 +45,11 @@ services:
       - --state-dir=/var/lib/roxy/node
       - --control-plane-ca=/shared/cp-ca.pem
     secrets: [enrol-token]
+    # The node certificate, key and interception CA: a fresh enrolment each
+    # start rather than a volume, owned by roxy's non-root user.
+    tmpfs:
+      - /var/lib/roxy/node:uid=65532,gid=65532,mode=0700
     volumes:
-      # The node certificate, key and interception CA. A fresh enrolment
-      # each start rather than a volume. Writable by roxy's non-root user.
-      - { type: tmpfs, target: /var/lib/roxy/node, tmpfs: { mode: 0o1777 } }
       - cp-shared:/shared:ro               # the control plane's CA certificate
     ports:
       - "127.0.0.1:3128:3128"              # the proxy
@@ -77,8 +78,9 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    secrets: [enrol-token]                 # the token roxy enrols with, from the same file
     environment:
-      ENROL_TOKEN: quickstart-enrol-token  # what ./controlplane/enrol-token holds
+      ENROL_TOKEN_FILE: /run/secrets/enrol-token
       MODEL_API_KEY: fake-model-key        # the secret in the lease; the client never has it
       ROXY_CONFIG: /etc/roxy/roxy.yaml
       CA_OUT: /shared/cp-ca.pem

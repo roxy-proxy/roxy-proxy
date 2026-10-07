@@ -3,6 +3,7 @@ import json
 from typing import Any
 
 import pytest
+from inspect_ai.event import SentinelEvent
 
 from fake_roxy import FakeRoxy, stray_tasks
 from inspect_log import InspectLog
@@ -121,7 +122,7 @@ async def test_pings_continue_while_the_sentinel_judges(sidecar: Sidecar, monkey
     roxy, verdict = await held_and_judging(sidecar, monkeypatch)
     while not roxy.ws.sent.empty():
         roxy.ws.sent.get_nowait()
-    for _ in range(3):
+    for _ in range(3):  # three pings in a row, nothing else between them
         assert await roxy.ws.next_sent(timeout=1.0) == b"\x00\x00\x00\x01\x01" + PING
     verdict.set()
     while (m := await roxy.ws.next_sent()) == b"\x00\x00\x00\x01\x01" + PING:
@@ -146,7 +147,7 @@ async def test_an_unknown_block_type_is_refused(sidecar: Sidecar) -> None:
     roxy.open(1, url=MESSAGES_URL)
     roxy.ws.body(1, body.encode())
     roxy.ws.control(1, "request_end")
-    for _ in range(3):
+    for _ in range(3):  # the forwarded request: head, body, request_end
         await roxy.ws.next_sent()
     response = {
         "id": "msg_1",
@@ -199,7 +200,7 @@ async def test_verdicts_stay_with_their_session(sidecar: Sidecar) -> None:
         roxy.open(stream, url=MESSAGES_URL, headers=[["x-claude-code-session-id", sid]])
         roxy.ws.body(stream, body.encode())
         roxy.ws.control(stream, "request_end")
-        for _ in range(3):
+        for _ in range(3):  # the forwarded request: head, body, request_end
             await roxy.ws.next_sent()
         roxy.ws.control(stream, "response", status=200, headers=[["content-type", "application/json"]])
         roxy.ws.body(stream, json.dumps(response).encode(), RESPONSE)
@@ -209,5 +210,5 @@ async def test_verdicts_stay_with_their_session(sidecar: Sidecar) -> None:
     samples = sidecar.inspect_log._samples  # noqa: SLF001
     assert sorted(samples) == ["s1", "s2"]
     for sample in samples.values():
-        verdicts = [e for e in sample.events if type(e).__name__ == "SentinelEvent"]
+        verdicts = [e for e in sample.events if isinstance(e, SentinelEvent)]
         assert len(verdicts) == 1, sample.id

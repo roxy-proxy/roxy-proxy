@@ -1,9 +1,10 @@
 # The quickstart policy. The client may reach the scripted model and nothing
 # else, and every model call goes through three addons first: the auth gate
 # (who is this?), the token quota (may they still spend?) and the sentinel
-# (is every tool call in the response allowed?). Validate with:
-#   docker run --rm -v ./roxy.yaml:/etc/roxy/roxy.yaml:ro ghcr.io/roxy-proxy/roxy:edge \
-#     check --config /etc/roxy/roxy.yaml
+# (is every tool call in the response allowed?). Validate it in the
+# quickstart's roxy image, which holds the addons the file names:
+#   docker compose -f compose.yaml -f compose.standalone.yaml \
+#     run --rm --no-deps roxy check --config /etc/roxy/roxy.yaml
 #
 # The control plane (./controlplane) serves this file as roxy's lease, with
 # each `env` secret below turned into `{ lease: true }` and its value taken

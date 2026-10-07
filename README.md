@@ -26,8 +26,9 @@ It fails closed: anything roxy cannot parse, verify or classify is denied.
 
 **[roxy-proxy.github.io/roxy-proxy](https://roxy-proxy.github.io/roxy-proxy/)**
 
-- [Quickstart](https://roxy-proxy.github.io/roxy-proxy/quickstart): Claude
-  Code behind roxy and an inspect_sentinel sidecar, in about five minutes
+- [Quickstart](https://roxy-proxy.github.io/roxy-proxy/quickstart): generated
+  traffic through an auth gate, a token quota and an inspect_sentinel sidecar,
+  with roxy in node mode leasing its policy from a minimal control plane
 - [Configure policies](https://roxy-proxy.github.io/roxy-proxy/policies/overview),
   [addons](https://roxy-proxy.github.io/roxy-proxy/addons/overview),
   [deploy](https://roxy-proxy.github.io/roxy-proxy/deploy/overview) and

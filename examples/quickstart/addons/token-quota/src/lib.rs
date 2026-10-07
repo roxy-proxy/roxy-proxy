@@ -31,6 +31,9 @@ use serde_json::Value;
 const MAX_REPLY: usize = 64 * 1024;
 /// A non-streamed model response is read whole to find its `usage`.
 const MAX_RESPONSE: usize = 8 * 1024 * 1024;
+/// The longest SSE line kept while waiting for its end; a stream without
+/// newlines is passed through unread rather than buffered.
+const MAX_LINE: usize = 1024 * 1024;
 
 #[derive(Deserialize)]
 struct Allowance {
@@ -195,7 +198,9 @@ impl Usage {
 }
 
 /// Reads the usage out of an SSE stream as it passes, unchanged, and
-/// reports it when the stream ends.
+/// reports it when the stream is done with. The report is made on drop, so
+/// a stream the client or the model cut short is charged for what it had
+/// reported by then.
 pub struct UsageMeter {
     user: String,
     usage: Usage,
@@ -209,6 +214,15 @@ impl UsageMeter {
             user,
             usage: Usage::default(),
             partial: Vec::new(),
+        }
+    }
+
+    /// Reads whatever the tail holds, so a final line without a newline
+    /// counts.
+    fn flush_tail(&mut self) {
+        let tail = std::mem::take(&mut self.partial);
+        if !tail.is_empty() {
+            self.line(&tail);
         }
     }
 
@@ -232,17 +246,17 @@ impl ChunkTransform for UsageMeter {
             self.line(line);
             rest = &rest[nl + 1..];
         }
-        self.partial = rest.to_vec();
+        if rest.len() <= MAX_LINE {
+            self.partial = rest.to_vec();
+        }
         chunk
     }
+}
 
-    fn finish(&mut self) -> Vec<u8> {
-        let tail = std::mem::take(&mut self.partial);
-        if !tail.is_empty() {
-            self.line(&tail);
-        }
+impl Drop for UsageMeter {
+    fn drop(&mut self) {
+        self.flush_tail();
         report(&self.user, self.usage);
-        Vec::new()
     }
 }
 
@@ -267,11 +281,11 @@ data: {\"type\":\"message_stop\"}\n\n";
         for c in STREAM.chunks(size) {
             out.extend(m.chunk(c.to_vec()));
         }
-        let tail = std::mem::take(&mut m.partial);
-        if !tail.is_empty() {
-            m.line(&tail);
-        }
-        (m.usage, out)
+        m.flush_tail();
+        let usage = m.usage;
+        // Dropping the meter would report to an endpoint no test has.
+        std::mem::forget(m);
+        (usage, out)
     }
 
     #[test]
@@ -330,5 +344,15 @@ data: {\"type\":\"message_stop\"}\n\n";
         m.chunk(b"event: ping\ndata: {\"type\":\"ping\"}\n\n: comment\ndata: not json\n".to_vec());
         assert_eq!(m.usage, Usage::default());
         assert_eq!(m.partial, b"");
+        std::mem::forget(m);
+    }
+
+    #[test]
+    fn an_endless_line_is_passed_through_but_not_kept() {
+        let mut m = UsageMeter::new("alice".into());
+        let chunk = vec![b'x'; MAX_LINE + 1];
+        assert_eq!(m.chunk(chunk.clone()), chunk);
+        assert_eq!(m.partial, b"");
+        std::mem::forget(m);
     }
 }

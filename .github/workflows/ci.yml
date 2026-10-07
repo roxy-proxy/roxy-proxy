@@ -40,7 +40,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     runs-on: ubuntu-24.04
@@ -52,8 +52,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --workspace
+      - run: cargo test --workspace --locked
 
+  # Every workspace with its own lock file, against the root deny.toml. One
+  # job, not a matrix: the branch rules require a check named `deny`.
   deny:
     runs-on: ubuntu-24.04
     steps:
@@ -62,6 +64,23 @@ jobs:
           persist-credentials: false
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
+          manifest-path: Cargo.toml
+          arguments: --locked --config deny.toml
+          command: check advisories bans licenses sources
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: crates/roxy-wasm/test-components/Cargo.toml
+          arguments: --locked --config deny.toml
+          command: check advisories bans licenses sources
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: examples/quickstart/addons/Cargo.toml
+          arguments: --locked --config deny.toml
+          command: check advisories bans licenses sources
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: fuzz/Cargo.toml
+          arguments: --locked --config deny.toml
           command: check advisories bans licenses sources
 
   # roxy-wasm's test components live in their own workspace and are checked

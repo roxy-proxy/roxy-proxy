@@ -24,7 +24,7 @@
   },
   {
     "content": [
-      {"type": "text", "text": "Here is a longer answer, to use up more of the quota. roxy sits between this client and the model: the auth gate checked who you are, the token quota layer asked whether you may still spend, the sentinel judged any tool call in this response, and the rules decided whether the request could leave at all. The quota board shows what each user has used in the current window, and resets it when the window ends."}
+      {"type": "text", "text": "Here is a longer answer, to use up more of the quota. roxy sits between this client and the model: the auth gate checked who you are, the token quota layer asked whether you may still spend, the sentinel judged any tool call in this response, and the rules decided whether the request could leave at all. The quota board shows each user's bucket: every response takes its tokens out, and the bucket refills at a steady rate."}
     ],
     "stop_reason": "end_turn",
     "output_tokens": 124

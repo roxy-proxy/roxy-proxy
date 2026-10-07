@@ -24,10 +24,10 @@ from __future__ import annotations
 import json
 import logging
 import math
-from collections import deque
 import os
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
