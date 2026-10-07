@@ -1,6 +1,6 @@
 # Operations
 
-## Operations
+## At a glance
 
 - **Reload:** edit the config, list files or addon files, or send
   `SIGHUP`. A bad config is rejected and the running one stays
@@ -49,7 +49,7 @@ reason on stderr.
 
 ## Reload
 
-`roxy check <config>` runs the part of startup that opens no socket and
+`roxy check --config <file>` runs the part of startup that opens no socket and
 writes no file: parse, validate, compile the rules and the WASM addons, load
 the address lists, load a provided CA (`tls.ca_cert`, `tls.ca_key`), read
 `tls.upstream.extra_roots` and build the resolver. Diagnostics carry the

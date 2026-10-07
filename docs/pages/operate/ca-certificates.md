@@ -6,7 +6,7 @@ provide. Clients must trust that CA. This lives in `roxy-tls`.
 
 ```yaml
 ca_server:
-  bind: 0.0.0.0:3130           # plain HTTP: /roxy-ca.pem and /healthz; absent = off
+  bind: 0.0.0.0:3130           # plain HTTP: /roxy-ca.pem, /healthz and /readyz; absent = off
 
 tls:
   ca_dir: /var/lib/roxy/ca     # roxy-ca.pem + roxy-ca.key, generated if absent
