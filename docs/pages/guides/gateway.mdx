@@ -73,11 +73,11 @@ provider expects and what lets the upstream connection use HTTP/2
 ([`redirect`](/reference/rule-language#actions)). Bedrock wants a
 signature rather than a key: `sign` covers the request as it is forwarded,
 after the `redirect`, so the signature is over the host AWS sees
-([signing AWS requests](/policies/secrets#signing-aws-requests)).
+([signing AWS requests](/reference/secrets#signing-aws-requests)).
 
 From here an exchange is the same as on a proxy port. Rate limits, body
 rules, addons, the address floor and the flow log all apply
-([how policies work](/policies/overview)).
+([how roxy works](/design/how-it-works)).
 
 ## Authenticating clients
 
@@ -96,9 +96,8 @@ tag, so a per-user quota is another addon.
 ## What to know
 
 - **This is not containment.** The listener serves whoever reaches it, and
-  the clients may have other routes out. A gateway governs the traffic
-  sent to it and nothing else. Containing a workload is a network property
-  ([sandbox containment](/deploy/containment)).
+  the clients may have other routes out
+  ([threat model](/design/threat-model#which-use-case-claims-what)).
 - **`client.ip` is the load balancer's address.** Rules and the flow log
   see the connection roxy accepted, not the original client. roxy reads no
   forwarded-for header.
@@ -109,4 +108,4 @@ tag, so a per-user quota is another addon.
   Clients trust the load balancer's certificate; roxy's CA plays no part.
 - **Health checks** come from `ca_server` as usual: `/healthz` says the
   process is up, `/readyz` that a policy is in force
-  ([health](/operate/operations#health)).
+  ([health](/guides/operations#health)).

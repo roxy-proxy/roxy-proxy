@@ -1,8 +1,7 @@
 # HTTP
 
 How clients talk to roxy, how requests are parsed and canonicalised, and
-what goes to the upstream and back. The parsing lives in `roxy-http`; the
-connection handling in `roxy-proxy`.
+what goes to the upstream and back.
 
 ## Listener modes
 
@@ -37,7 +36,7 @@ On the proxy port:
 - **CONNECT** opens a tunnel that roxy inspects ([below](/reference/http#connect)).
 - **Origin-form requests** (`GET /path`) are rejected, except to the host
   `roxy.internal`, which serves the CA certificate at `/roxy-ca.pem`
-  ([TLS](/operate/ca-certificates#ca-distribution)). Anything else there is `404`.
+  ([TLS](/guides/ca-certificates#ca-distribution)). Anything else there is `404`.
 
 roxy does not authenticate clients: a client is who its network position
 says it is, which rules see as `listener.name` and `client.ip`. A
@@ -49,7 +48,7 @@ An `http` listener is spoken to as the server: the client sends
 `GET /v1/messages HTTP/1.1` with `Host: anthropic.gw.example.com`, as it
 would to the origin, and the rules decide where the request goes. This is
 the mode for a gateway behind a TLS-terminating load balancer
-([HTTP gateway](/deploy/gateway)).
+([HTTP gateway](/guides/gateway)).
 
 ```yaml
 listeners:
@@ -108,7 +107,7 @@ spec, followed by the same semantic validation as HTTP/1.1
 ([HTTP/2 requests](/reference/http#http2-requests)). Upstream, roxy offers `h2` and
 `http/1.1` and serialises each request as whichever the origin negotiates;
 the canonical model is version-agnostic. WebSocket upgrades always use
-HTTP/1.1 ([WebSockets](/policies/websockets)).
+HTTP/1.1 ([WebSockets](/reference/websockets)).
 
 gRPC and other HTTP/2-only protocols need trailers: set
 `http.allow_trailers`. Request trailers are forwarded only when the origin
@@ -124,10 +123,8 @@ request that was held to HTTP/1.1.
 ## Canonical request
 
 The client-facing HTTP/1.1 codec is roxy's own, built on `httparse` for
-tokenising. It does not use hyper's server because hyper resolves
-ambiguities as RFC 9112 allows (for example, chunked wins when both
-`Transfer-Encoding` and `Content-Length` are present), and roxy must reject
-them instead.
+tokenising, so that ambiguities RFC 9112 lets a server resolve (chunked
+winning over `Content-Length`, say) are rejected instead.
 
 ```rust
 pub struct CanonicalRequest {
@@ -311,7 +308,7 @@ resource limits. hyper parses the response and roxy builds a
 
 roxy decodes `content-encoding` to inspect a body, never to forward it:
 `body.text` and `response.body.text` see the decoded text
-([rules](/policies/body-rules)), and the bytes forwarded are the bytes
+([rules](/reference/rule-language#body-rules)), and the bytes forwarded are the bytes
 received.
 
 | coding | format |
@@ -332,8 +329,8 @@ received.
   sent.
 
 With addons, roxy also decodes bodies at the edge of the stack, so layers
-see them decoded ([addons](/addons/overview#content-codings)). This is the one case
-where roxy forwards a body decoded.
+see them decoded; that is the one case where roxy forwards a body decoded
+([content codings for addons](/reference/addon-configuration#content-codings)).
 
 `http.strip_accept_encoding` (default false) removes `accept-encoding` from
 every request as roxy reads it, so origins answer uncompressed. The addons,

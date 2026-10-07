@@ -12,11 +12,11 @@ An untrusted workload runs where its only route out is roxy. It points
 roxy's CA. roxy decrypts each request, judges it, injects the credentials
 the workload needs, and logs every decision. Containment comes from the
 network: the proxy variables only tell a well-behaved client where roxy
-is, and the network must leave the workload no other way out.
+is ([threat model](/design/threat-model#which-use-case-claims-what)).
 
 <img src={containment} alt="A workload inside a sealed sandbox network whose only exit is roxy's proxy port 3128. Requests go from the workload to roxy and on to the allowed upstreams, api.anthropic.com and github.com, with the real key added; responses come back the same way. roxy holds the CA and the secrets, and the workload fetches roxy-ca.pem from port 3130. A direct route out of the sandbox is blocked at the boundary: direct TCP, UDP and DNS have no route." />
 
-The same recipe applies anywhere:
+## The recipe
 
 1. **Take away the workload's route out.** Put it in a network namespace,
    VM or container network whose only reachable host is roxy. Block
@@ -37,7 +37,7 @@ The same recipe applies anywhere:
    ```
 
 3. **Point the workload at roxy and make it trust roxy's CA**
-   ([CA distribution](/operate/ca-certificates#ca-distribution)):
+   ([CA distribution](/guides/ca-certificates#ca-distribution)):
 
    ```sh
    export HTTP_PROXY=http://<proxy> HTTPS_PROXY=http://<proxy>
@@ -51,9 +51,11 @@ The same recipe applies anywhere:
    Adding the certificate to the system trust store also works. Do not put
    external hosts in `NO_PROXY`.
 
-With Docker Compose, the workload sits only on an `internal: true` network,
-which has no route out and no outside DNS, and roxy is the only container on
-both that network and one with a route out:
+## With Docker Compose
+
+The workload sits only on an `internal: true` network, which has no route
+out and no outside DNS, and roxy is the only container on both that
+network and one with a route out:
 
 ```yaml
 services:
@@ -86,24 +88,20 @@ gets nowhere: direct connections and DNS lookups fail.
 
 ## Why a proxy port
 
-An `http_proxy` listener keeps the interface roxy exposes to the workload
-as narrow as it can be while still being useful:
+An `http_proxy` listener is the narrowest interface roxy can offer a
+workload:
 
-- **One protocol, parsed strictly.** A client can speak HTTP/1.1 or HTTP/2
-  to roxy, and nothing else. CONNECT only opens a tunnel that roxy
-  intercepts as TLS (or, if allowed, plain HTTP); raw TCP never passes. A
-  TCP gateway forwards every protocol, so it either relays bytes it cannot
-  judge or has to understand all of them.
+- **One protocol, parsed strictly.** A client speaks HTTP/1.1 or HTTP/2 to
+  roxy and nothing else. CONNECT only opens a tunnel that roxy intercepts
+  as TLS (or, if allowed, plain HTTP); raw TCP never passes.
 - **Destinations are names, not addresses.** Each request names its
   destination in a form roxy parses itself: the absolute URI, the CONNECT
-  authority, and an SNI that must match it. The rules judge that name; roxy
-  resolves it and checks the IP it actually dials. There is no
-  original-destination address to spoof or race.
-- **Nothing is implicit.** A client that bypasses the proxy reaches nothing,
-  because the network allows nothing else, and everything that does reach
-  roxy is decided by a rule.
+  authority, and an SNI that must match it. The rules judge that name;
+  roxy resolves it and checks the IP it actually dials.
+- **Nothing is implicit.** A client that bypasses the proxy reaches
+  nothing, because the network allows nothing else, and everything that
+  does reach roxy is decided by a rule.
 
 An `http` listener serves clients that address roxy as the server
-([HTTP gateway](/deploy/gateway)). That is for traffic sent to roxy on
-purpose, not for containing a workload: the clients keep whatever other
-routes they have.
+([HTTP gateway](/guides/gateway)). It is for traffic sent to roxy on
+purpose, not for containing a workload.

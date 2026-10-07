@@ -63,7 +63,7 @@ rules[0].when:1:9: unterminated string  [rule a]
     |         ^^^^^^^^^^^^^^^
 
 == allow in a watching rule
-rules[0].then[0]: `allow` is only possible in rules decided at the request head; this rule reads `response.status`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation). Write the allow as a head rule and this rule as a `deny`  [rule a]
+rules[0].then[0]: `allow` is only possible in rules decided at the request head; this rule reads `response.status`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation). Write the allow as a head rule and this rule as a `deny`  [rule a]
 
 == connect-time fields are gone
 rules[0].when:1:1: unknown field `dst.port`  [rule a]
@@ -98,7 +98,7 @@ rules[0].then[0]: reference to undefined secret "missing" (define it under `secr
 rules[0].then[0]: sign aws_sigv4: `secret_access_key` must not be empty  [rule a]
 
 == sign in a watching rule
-rules[0].then[0]: `sign` changes the request, which is already on its way; this rule reads `response.status`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation)  [rule a]
+rules[0].then[0]: `sign` changes the request, which is already on its way; this rule reads `response.status`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation)  [rule a]
 
 == passthrough is reserved
 parse: .[0].then: `passthrough` is reserved for a transparent listener, which roxy does not have (issue #15) at line 1 column 18
@@ -133,10 +133,10 @@ rules[0].then[1]: `tag` follows the terminal action `allow` and would never run;
 parse: .[0].then: unknown action `sethead`; expected one of `allow`, `deny`, `set_header`, `remove_header`, `rewrite_path`, `set_query`, `remove_query`, `redirect`, `tag`, `log`, `set_state`, `capture`, `sign` at line 1 column 18
 
 == request mutation in a watching rule
-rules[0].then[0]: `rewrite_path` changes the request, which is already on its way; this rule reads `body.bytes`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation)  [rule a]
+rules[0].then[0]: `rewrite_path` changes the request, which is already on its way; this rule reads `body.bytes`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation)  [rule a]
 
 == request header change in a watching rule
-rules[0].then[0]: `set_header` in this rule would change the request, which is already on its way; this rule reads `body.bytes`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation). (In a rule that reads response values it changes the response.)  [rule a]
+rules[0].then[0]: `set_header` in this rule would change the request, which is already on its way; this rule reads `body.bytes`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation). (In a rule that reads response values it changes the response.)  [rule a]
 
 == response header change that could fire after the head is sent
 rules[0].then[0]: `remove_header` changes the response head, so every value the rule reads must be known before the response head is sent; this rule also reads response.body.bytes, which can change after that  [rule a]
@@ -179,10 +179,10 @@ rules[0].when:1:18: reference to undefined address list `@nope` (define it under
     |                  ^^^^^
 
 == nullable metric key without a guard
-metrics[0].key[1]: `tls.sni` can be null, and a null key field denies the flow; guard it with `where: tls.sni != null` (or `tls.sni != null and ...`) so that such flows are not counted (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)
-metrics[1].count: `body.size` can be null, and a null unique() field denies the flow; guard it with `where: body.size != null` (or `body.size != null and ...`) so that such flows are not counted (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)
-metrics[2].key[0]: `query.raw` can be null, and a null key field denies the flow; guard it with `where: query.raw != null` (or `query.raw != null and ...`) so that such flows are not counted (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)
-metrics[3].key[0]: `tls.alpn` can be null, and a null key field denies the flow; guard it with `where: tls.alpn != null` (or `tls.alpn != null and ...`) so that such flows are not counted (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)
+metrics[0].key[1]: `tls.sni` can be null, and a null key field denies the flow; guard it with `where: tls.sni != null` (or `tls.sni != null and ...`) so that such flows are not counted (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)
+metrics[1].count: `body.size` can be null, and a null unique() field denies the flow; guard it with `where: body.size != null` (or `body.size != null and ...`) so that such flows are not counted (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)
+metrics[2].key[0]: `query.raw` can be null, and a null key field denies the flow; guard it with `where: query.raw != null` (or `query.raw != null and ...`) so that such flows are not counted (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)
+metrics[3].key[0]: `tls.alpn` can be null, and a null key field denies the flow; guard it with `where: tls.alpn != null` (or `tls.alpn != null and ...`) so that such flows are not counted (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)
 
 == bad metrics
 metrics[0].id: invalid metric id "bad-id": must match [A-Za-z_][A-Za-z0-9_]* so it can be used as metric.<id>
@@ -193,6 +193,6 @@ metrics[1].where:1:1: unknown field `dst.port`
     | dst.port == 1
     | ^^^^^^^^
 metrics[2].count: unknown unique() field `nope`; metric fields must be scalar fields such as client.ip, host, tls.sni
-metrics[3].where: a metric's `where` may only read head fields, because whether an exchange counts is decided at the request head; it reads `response.status` (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)
-metrics[3].key[0]: `body.bytes` is known only after forwarding; metric key fields must be head fields (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)
-metrics[4].count: `response.status` is known only after forwarding; metric unique() fields must be head fields (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)
+metrics[3].where: a metric's `where` may only read head fields, because whether an exchange counts is decided at the request head; it reads `response.status` (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)
+metrics[3].key[0]: `body.bytes` is known only after forwarding; metric key fields must be head fields (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)
+metrics[4].count: `response.status` is known only after forwarding; metric unique() fields must be head fields (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)

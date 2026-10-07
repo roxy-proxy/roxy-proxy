@@ -13,27 +13,25 @@ fail every metric and state rule closed: `max_headers`, `max_header_bytes`,
 `max_metric_bytes`, `max_state_entries`, `max_observer_lag_bytes` and
 `max_address_list_bytes`. A metric's own `max_keys` is refused at zero the
 same way, and may not exceed `limits.max_metric_keys` ([rate
-limits](/policies/rate-limits#key-cardinality)). The body, message and
+limits](/reference/rate-limits#key-cardinality)). The body, message and
 capture caps and the timeouts accept zero, and mean it
 ([resource limits](/reference/limits#limits)).
 
-An optional top-level `valid_until` (RFC 3339) makes the policy a lease
-([lease](/operate/operations#lease)). Each section is described on the
-page the table names.
+Each section is described on the page the table names.
 
 | key | page |
 |---|---|
 | `listeners`, `http` | [HTTP](/reference/http) |
-| `ca_server`, `tls` | [managing the CA](/operate/ca-certificates), [TLS](/reference/tls) |
-| `upstream` | [upstream](/reference/upstream), [address floor](/policies/address-lists#address-floor) |
-| `address_lists` | [address lists](/policies/address-lists#address-lists) |
+| `ca_server`, `tls` | [managing the CA](/guides/ca-certificates), [TLS](/reference/tls) |
+| `upstream` | [upstream](/reference/upstream), [address floor](/reference/address-lists#address-floor) |
+| `address_lists` | [address lists](/reference/address-lists#address-lists) |
 | `limits` | [resource limits](/reference/limits) |
-| `rules` | [how policies work](/policies/overview), [rule language](/reference/rule-language) |
-| `secrets` | [secrets](/policies/secrets) |
-| `metrics` | [rate limits](/policies/rate-limits) |
-| `addons` | [addons](/addons/overview) |
-| `log`, `capture_dir` | [flow log](/operate/flow-log) |
-| `valid_until` | [lease](/operate/operations#lease) |
+| `rules` | [policy evaluation](/design/policy-evaluation), [rule language](/reference/rule-language) |
+| `secrets` | [secrets](/reference/secrets) |
+| `metrics` | [rate limits](/reference/rate-limits) |
+| `addons` | [addon configuration](/reference/addon-configuration) |
+| `log`, `capture_dir` | [flow log](/reference/flow-log) |
+| `valid_until` | [lease](/guides/operations#lease) |
 
 ```yaml
 version: 1

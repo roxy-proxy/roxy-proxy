@@ -210,7 +210,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                         "`{name}` is chosen by the client, so without a `where` this metric \
                          holds one series per value the client sends, up to its `max_keys`; \
                          bound it (`where: host under \"example.com\"`) or lower `max_keys` \
-                         (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#key-cardinality)"
+                         (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#key-cardinality)"
                     ),
                 ));
             }
@@ -326,7 +326,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             format!(
                 "`{f}` can be null, and a null {what} field denies the flow; guard it with \
                  `where: {f} != null` (or `{f} != null and ...`) so that such flows are not \
-                 counted (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)"
+                 counted (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)"
             ),
         );
         None
@@ -342,7 +342,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                     at,
                     format!(
                         "`{f}` is known only after forwarding; metric {what} fields must be \
-                         head fields (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)"
+                         head fields (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)"
                     ),
                 );
                 None
@@ -374,7 +374,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 format!(
                     "a metric's `where` may only read head fields, because whether an \
                      exchange counts is decided at the request head; it reads {} \
-                     (https://roxy-proxy.github.io/roxy-proxy/policies/rate-limits#metrics)",
+                     (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)",
                     quoted(&needs.watched_names(Reads::WATCHED_FIELDS))
                 ),
             );
@@ -1074,7 +1074,7 @@ impl RuleShape {
     fn forwarded_why(&self) -> String {
         format!(
             "this rule reads {}, which is known only after the request was forwarded \
-             (https://roxy-proxy.github.io/roxy-proxy/policies/overview#evaluation)",
+             (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation)",
             self.watched()
         )
     }

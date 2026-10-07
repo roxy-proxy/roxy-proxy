@@ -4,9 +4,9 @@ The protocol between a roxy node and its control plane. A node is a roxy
 process started in node mode; a control plane is any server that implements
 these four operations. The contract is the OpenAPI document at
 [`spec/node-protocol/v1/openapi.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/spec/node-protocol/v1/openapi.yaml):
-every operation, header, status code and body schema. This page explains
-it. The example bodies here are checked against the document's schemas in
-CI, and each is titled with the schema it satisfies.
+every operation, header, status code and body schema. The example bodies
+here are checked against the document's schemas in CI, and each is titled
+with the schema it satisfies.
 
 The flow is: a node enrols once with a bootstrap token and receives a
 certificate; from then on it authenticates with that certificate, polls for
@@ -109,11 +109,10 @@ certificate.
 
 The token authorises enrolment. Whether it is single-use, how long it
 lives and whether a fleet shares one are the control plane's decisions;
-single-use with a short expiry is a sensible default. The node infers
-nothing from a `200` beyond the certificate it was issued. A `401` means
-the token was not accepted, nothing more: the node retries with backoff for
-two minutes, in case a new token has not reached every replica of the
-control plane, and then exits non-zero.
+single-use with a short expiry is a sensible default. A `401` means the
+token was not accepted: the node retries with backoff for two minutes, in
+case a new token has not reached every replica of the control plane, and
+then exits non-zero.
 
 The node writes the certificate and key to its state directory. Those are
 the only secrets-adjacent material on disk: a revocable per-node identity.
@@ -159,8 +158,7 @@ The server answers:
 
 - `200` with the full lease, on every poll. The node compares `config` and
   `secrets` with what it holds and applies only what differs; a lease that
-  changes neither only moves `valid_until`. A lease is small and the poll
-  is infrequent, so there is no conditional fetch.
+  changes neither only moves `valid_until`. There is no conditional fetch.
 - `410`, `401`, `426`, `5xx` as in the [errors table](/reference/node-protocol#errors).
 
 The server may use the reported `roxy_version` to refuse a node it will not
@@ -222,8 +220,8 @@ it was sent.
   off; the other fields are still required. `on_high_water` is `hold`
   (apply roxy's backpressure to traffic when the spool is full) or `spool`
   (drop the oldest spooled events, logging once).
-- `interception_ca` is reserved for a later version. A v1 server must not
-  send it; a v1 node ignores it.
+- `interception_ca` is reserved. A v1 server must not send it; a v1 node
+  ignores it.
 
 A lease is applied in full or not at all. A `config` that `roxy check`
 would reject, or a `secrets` map missing a name the config declares, is
@@ -264,7 +262,7 @@ compressed, signalled with `Content-Encoding: gzip`.
 }
 ```
 
-- Each event is a [flow log](/operate/flow-log) record with one field
+- Each event is a [flow log](/reference/flow-log) record with one field
   added, `seq`: a per-node counter that increases by one per shipped event
   and is persisted in the state directory in blocks, so it keeps increasing
   across restarts (a restart skips to the end of the last block). A batch's
@@ -334,10 +332,3 @@ Other responses:
 Had the control plane been unreachable at step 3 instead, the node would
 have retried with backoff and kept serving until its `valid_until`, then
 denied everything until a lease arrived.
-
-## Not in v1
-
-Conditional fetch: every poll returns the full lease and the node diffs it
-locally. Secrets with their own expiry: the server re-leases before a
-credential expires. Capture body upload: `capture_dir` stays local. Per-node
-interception CA issuance: `interception_ca` is reserved for it.

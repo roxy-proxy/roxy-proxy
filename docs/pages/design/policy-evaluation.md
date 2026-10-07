@@ -1,8 +1,10 @@
-# How policies work
+# Policy evaluation
 
 The policy decides what roxy forwards, what it denies, and what it changes
-on the way. It is a list of rules in the config file. Anything no rule
-allows is denied:
+on the way. It is a list of rules in the config file. Each rule has an
+`id`, a `when` condition in the [rule language](/reference/rule-language),
+and a `then` with one or more [actions](/reference/rule-language#actions).
+Anything no rule allows is denied:
 
 ```yaml
 rules:
@@ -14,11 +16,6 @@ rules:
     when: path starts_with "/admin"
     then: deny
 ```
-
-Each rule has an `id`, a `when` condition in the
-[rule language](/reference/rule-language), and a `then` with one or more
-[actions](/reference/rule-language#actions). This page covers how roxy
-evaluates them. The engine lives in `roxy-rules`.
 
 ## Evaluation
 
@@ -51,9 +48,9 @@ runs follows from what it reads.
 3. **Only head rules can `allow`.** A rule that reads a watched field cannot
    allow, cannot change the request (`set_header` on the request,
    `rewrite_path`, `redirect`, ...) and cannot `capture`: the request is
-   already on its way, so all three are compile errors. It can deny, and add effects that still make
-   sense: `log`, `tag`, `set_state`, and header changes on a response that
-   has not been sent yet.
+   already on its way, so all three are compile errors. It can deny, and
+   add effects that still make sense: `log`, `tag`, `set_state`, and header
+   changes on a response that has not been sent yet.
 4. **A watching rule's non-terminal effects apply once**, the first time it
    matches.
 5. **Order matters for effects, not decisions.** Rules are evaluated top to
@@ -75,12 +72,12 @@ runs follows from what it reads.
    tag no rule sets (from an addon).
 
 `roxy check` and `roxy rule test` report whether each rule is decided at the
-head or watches. There is no `phase` key and there are no connect-time
-rules.
+head or watches.
 
 **Unavailable inputs fail closed.** If evaluating a rule needs a metric
 value, an address-list lookup or a secret and it is unavailable (store
 overloaded, table full, list failed to load), the flow is denied with
 `503`, `terminal_rule: _fail_closed`, and a
 `policy_input_unavailable` event. A field that is simply absent, like an
-unsent header, is not unavailable: it is `null`.
+unsent header, is not unavailable: it is `null`
+([missing values](/reference/rule-language#missing-values-null)).

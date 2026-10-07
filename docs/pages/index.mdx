@@ -4,101 +4,36 @@ description: "roxy is a strict, programmable HTTP firewall: an egress proxy for 
 ---
 
 import exchange from "../assets/exchange.svg";
+import containment from "../assets/containment.svg";
+import gateway from "../assets/gateway.svg";
 
 # Overview
 
-roxy is a strict, programmable HTTP firewall. Every request and response streams through a pipeline you compose: addons that can rewrite, withhold, answer or block, then rules that judge exactly what they pass on. Run it as an egress proxy for a workload you don't trust, or as a gateway in front of the APIs your clients call.
-
-## Two ways to deploy it
-
-**[Sandbox containment](/deploy/containment).** An untrusted workload has no route out except through roxy. It points `HTTPS_PROXY` at roxy's proxy port and trusts roxy's CA; roxy decrypts each request, judges it, injects the credentials the workload needs so the workload never sees them, and logs every decision. The network does the containing; roxy decides what gets out.
-
-**[HTTP gateway](/deploy/gateway).** Clients address roxy directly, as `anthropic.gw.example.com` behind a load balancer that terminates TLS. Rules route each request by host and inject the real API keys, so clients hold placeholders. Rate limits, body rules and the flow log apply as usual, and client authentication is an addon. It governs the traffic sent to it; it is not containment.
-
-Both run the same engine. An exchange is a request and its response, and every exchange takes the same path: roxy parses it, the addons see it, the rules judge it, and the connector dials the upstream. The response comes back the same way in reverse.
-
 <img src={exchange} alt="An exchange through roxy: TLS decryption, then an addon stack (here a service addon and a WASM addon), then the rules, then the upstream connector with its address floor; the response returns the same way; every stage writes to the flow log" />
 
-## Decrypt
+roxy is a strict, programmable HTTP firewall. Every request and response streams through a pipeline you compose: addons that can rewrite, withhold, answer or block, then rules that judge exactly what they pass on. Run it as an egress proxy for a workload you don't trust, or as a gateway in front of the APIs your clients call.
 
-On a proxy port roxy terminates TLS with certificates from its own CA; on an `http` listener TLS ends at the load balancer in front. Either way roxy parses each request into one canonical form, which is what it sends upstream. Ambiguous input is rejected, not guessed at. Request smuggling and header injection don't reach the upstream, and what the rules and addons see is exactly what is forwarded ([HTTP](/reference/http)).
+Every exchange takes the same path: roxy parses it, the addons see it, the rules judge it, and the connector dials the upstream ([how roxy works](/design/how-it-works)). It fails closed: anything roxy cannot parse, verify or classify is denied.
 
-## Addons
+## Use cases
 
-Logic that needs to understand the traffic goes in an addon: an external service that the traffic streams through, or a WASM component that runs in process. An addon owns both streams of the exchanges it chooses. It can rewrite, withhold, answer or block. Here a sentinel runs as a sidecar and holds each of an agent's model calls until it has judged it, and a second addon gets a copy of one write in ten for an external audit service:
+**Sandbox containment.** An untrusted workload has no route out except through roxy. It points `HTTPS_PROXY` at roxy's proxy port and trusts roxy's CA; roxy decrypts each request, judges it, injects the credentials the workload never sees, and logs every decision. The network does the containing; roxy decides what gets out ([sandbox containment](/guides/containment)).
 
-```yaml
-addons:                                    # above the rules, outermost first
-  - name: sentinel                         # a sidecar the exchange streams through
-    kind: service
-    when: host == "api.anthropic.com" and path starts_with "/v1/messages"
-    endpoint: sidecar
-    endpoints:
-      sidecar: { url: "http://sentinel:9000/", private_ok: true }
-    limits:
-      first_byte_timeout: 120s             # how long it has to decide before roxy denies
+<img src={containment} alt="A workload inside a sealed sandbox network whose only exit is roxy's proxy port 3128. Requests go from the workload to roxy and on to the allowed upstreams, api.anthropic.com and github.com, with the real key added; responses come back the same way. roxy holds the CA and the secrets, and the workload fetches roxy-ca.pem from port 3130. A direct route out of the sandbox is blocked at the boundary: direct TCP, UDP and DNS have no route." />
 
-  - name: audit-tap                        # sent a copy; can't change or delay traffic
-    kind: service
-    mode: observe
-    when: method in [POST, PUT, PATCH, DELETE]
-    sample: 0.1
-    endpoint: tap
-    endpoints:
-      tap: { url: "https://audit.internal/roxy", private_ok: true }
-```
+**HTTP gateway.** Clients address roxy directly, as `anthropic.gw.example.com` behind a load balancer that terminates TLS. Rules route each request by host and inject the real API keys, so clients hold placeholders; client authentication is an addon. It governs the traffic sent to it; it is not containment ([HTTP gateway](/guides/gateway)).
 
-Whatever `sentinel` passes on is still judged by the rules. If it fails, the flow is denied. [Addons](/addons/overview) covers the model, [service layers](/addons/service-layers) the protocol, and [writing one](/addons/writing) the WASM SDK.
-
-## Rules
-
-The rules are a list of allows plus the denies that restrict them, in one YAML file. A matching deny always wins, and anything no rule allows is denied. Rules read the request head, and they can keep watching the bodies and the response as they stream. Metrics give you rate limits and byte budgets.
-
-```yaml
-secrets:
-  openai: { env: OPENAI_API_KEY }
-
-rules:
-  - id: github-reads
-    when: host under "github.com" and method in [GET, HEAD]
-    then: allow
-
-  - id: openai
-    when: host == "api.openai.com" and path starts_with "/v1/" and method == POST
-    then:
-      - set_header: { authorization: "Bearer ${secret:openai}" }   # the client never sees the key
-      - allow
-
-  - id: upload-cap                         # watches the body as it streams
-    when: host == "api.openai.com" and body.bytes > 10mb
-    then: { deny: { status: 413 } }
-```
-
-You can try a policy without sending traffic:
-
-```sh
-roxy rule test --config roxy.yaml POST https://api.openai.com/v1/responses
-```
-
-The full language is in [rules](/reference/rule-language). Past the rules, the connector resolves the host itself and checks the address it actually dials, so a name that resolves somewhere private is refused ([address floor](/policies/address-lists#address-floor)).
-
-## Log
-
-Every stage writes to the flow log: one JSON line per exchange, naming the rule that decided, the addons that ran and what changed. The log never drops a record. When it falls behind, traffic waits ([flow log](/operate/flow-log)).
-
-It fails closed. If roxy can't parse, verify or classify something, it denies it. A broken config is not loaded, a failing addon denies the flow, and a missing metric or secret denies rather than allows.
+<img src={gateway} alt="An example gateway. Clients send HTTPS requests to a load balancer that terminates TLS and forwards plain HTTP to roxy's http listener on port 8080. Inside roxy the request streams through an auth service addon, which asks an auth service over a WebSocket who the client is and gets back allow, user=alice, or answers 401 if the caller is unknown. Then the rules route by host and inject roxy's own secrets: requests for anthropic.gw.example.com go on over HTTPS to api.anthropic.com with x-api-key added from roxy's secrets, and requests for openai.gw.example.com to api.openai.com with a bearer key added the same way. Responses return by the same path." />
 
 ## Try it
 
-If you want a demo, run the [quickstart](/quickstart). It sends generated traffic through roxy with an auth gate, a per-user token quota and an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar that blocks tool calls matching a denylist, with roxy in node mode leasing its policy from a minimal control plane. Nothing in it needs an API key.
+The [quickstart](/quickstart) sends generated traffic through roxy with an auth gate, a per-user token quota and an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar, with roxy in node mode leasing its policy from a minimal control plane. Nothing in it needs an API key.
 
-If you want to deploy it, start with [sandbox containment](/deploy/containment) or [HTTP gateway](/deploy/gateway). The [container image](/deploy/docker), [running without Docker](/deploy/bare-metal) and [node mode](/deploy/node-mode) apply to both.
+## Where next
 
-## What roxy is not
-
-roxy is not a transparent proxy. It decides what passes through it, and it can't stop traffic that never reaches it. To contain a workload, the network has to give it no route out except through roxy; [sandbox containment](/deploy/containment) gives the recipe. An [HTTP gateway](/deploy/gateway) governs only the traffic sent to it.
-
-roxy speaks HTTP/1.1, HTTP/2 and WebSockets to clients. Raw TCP doesn't pass. The [principles](/principles) page sets out the threat model: what roxy prevents and what it doesn't try to prevent.
+- **Guides:** deploying roxy for [containment](/guides/containment) or as a [gateway](/guides/gateway), [running](/guides/run) and [operating](/guides/operations) it, [testing a policy](/guides/testing-a-policy), [writing addons](/guides/writing-addons).
+- **Design:** [how roxy works](/design/how-it-works), the [threat model](/design/threat-model), [policy evaluation](/design/policy-evaluation), the [addon model](/design/addon-model).
+- **Reference:** every setting and behaviour, from the [configuration file](/reference/configuration) to the [flow log](/reference/flow-log).
 
 ## Open source
 

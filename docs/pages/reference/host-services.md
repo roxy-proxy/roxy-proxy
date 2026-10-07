@@ -1,11 +1,10 @@
 # Host services
 
-Host services are for WASM layers; a service layer calls what it needs
-itself. Everything a layer can do outside its own streams is on this list,
+Everything a WASM layer can do outside its own streams is on this list,
 and each item is a capability granted in config
-([capabilities](/addons/configuration#capabilities)). The caps on what the
-host holds for a layer (tags, `fields`, `log` and `record` payloads) are in
-[addon safety](/addons/safety).
+([capabilities](/reference/addon-configuration#capabilities)). The caps on
+what the host holds for a layer (tags, `fields`, `log` and `record`
+payloads) are in [addon safety limits](/reference/addon-safety).
 
 ## Endpoints (`endpoints`)
 
