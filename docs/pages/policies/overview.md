@@ -34,8 +34,9 @@ runs follows from what it reads.
    rule allows, it is allowed. Otherwise it is denied, with rule id
    `_default`; an empty rule set denies everything. To let traffic through
    while you find out what a workload reaches, say so with a rule:
-   `{ id: discover, when: host != null, then: allow }`. Rule order does not affect the decision. A rule that reads a
-   value not yet known is skipped here, not treated as false.
+   `{ id: discover, when: host != null, then: allow }`. Rule order does
+   not affect the decision. A rule that reads a value not yet known is
+   skipped here, not treated as false.
 2. **After that, rules watch.** For the rest of the exchange, two kinds of
    rule are re-checked whenever a value they read becomes known or changes:
    rules that read a *watched* field ([fields](/reference/rule-language#fields)), and `deny` rules
@@ -56,22 +57,22 @@ runs follows from what it reads.
 4. **A watching rule's non-terminal effects apply once**, the first time it
    matches.
 5. **Order matters for effects, not decisions.** Rules are evaluated top to
-   bottom, so a `tag` set by one rule is visible to the rules below it. A
-   rule that reads a tag must come after every rule that sets it (a head
-   rule above it, or, for a watching rule, any head rule); otherwise the
-   config is rejected, since moving a rule would change what it sees. A
-   tag set by a watching rule can be read by no other rule: watching rules
-   fire when the values they read arrive, not in list order, so whether
-   the tag was visible would depend on timing. A rule may read its own
-   tag, and a tag no rule sets (from an addon). If
-   the request is allowed, the effects of every matching rule apply in list
-   order; if two set the same header, the later wins. If it is denied, or a
-   change to it fails (which denies it with `_fail_closed`, reason
-   `effect_invalid`), the `log` and
-   `set_state` effects of the matching rules still apply, and the request's
-   metric samples count it as denied. Allow options
-   (`upgrade`, `private_ok`) come from the first matching allow only. The
-   flow log names the first matching deny (or allow) as `terminal_rule`.
+   bottom. If the request is allowed, the effects of every matching rule
+   apply in list order; if two set the same header, the later wins. If it
+   is denied, or a change to it fails (which denies it with
+   `_fail_closed`, reason `effect_invalid`), the `log` and `set_state`
+   effects of the matching rules still apply, and the request's metric
+   samples count it as denied. Allow options (`upgrade`, `private_ok`)
+   come from the first matching allow only. The flow log names the first
+   matching deny (or allow) as `terminal_rule`.
+6. **A tag is visible to the rules below the rule that set it.** A rule
+   that reads a tag must come after every rule that sets it (a head rule
+   above it, or, for a watching rule, any head rule); otherwise the config
+   is rejected, since moving a rule would change what it sees. A tag set
+   by a watching rule can be read by no other rule: watching rules fire
+   when the values they read arrive, not in list order, so whether the tag
+   was visible would depend on timing. A rule may read its own tag, and a
+   tag no rule sets (from an addon).
 
 `roxy check` and `roxy rule test` report whether each rule is decided at the
 head or watches. There is no `phase` key and there are no connect-time

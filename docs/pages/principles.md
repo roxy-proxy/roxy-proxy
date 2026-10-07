@@ -47,10 +47,9 @@ empty rule set denies everything, and so does a policy past its
 to compile is not loaded, and a failed reload keeps the running policy. An
 addon in `enforce` mode that fails denies the flow; an `observe` addon
 cannot affect traffic, so its failure is logged and the flow goes on.
-A policy input that is unavailable (a full metric table, a list that failed
-to load, a missing secret, a body too large to inspect) denies the flow
-rather than making a predicate false. Nothing in roxy turns "could not
-check" into "allowed". [Resource limits](/reference/limits) lists every case.
+A policy input that is unavailable denies the flow rather than making a
+predicate false. Nothing in roxy turns "could not check" into "allowed".
+[Resource limits](/reference/limits#fail-closed-outcomes) lists every case.
 
 ## Canonical re-serialisation
 

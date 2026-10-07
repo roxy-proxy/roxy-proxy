@@ -176,20 +176,16 @@ stream. Control messages are not counted.
   prefix or with an unknown direction byte, or a stream id roxy never
   opened. Every exchange on it then fails closed (`service:protocol`), and
   roxy closes it.
-- **Observe mode** uses the same streams: the service gets the same
-  messages for copies of both directions, and whatever it sends back other
-  than `credit` and `reset` is ignored. The stream ends after roxy's
-  `response_end` (or a `reset`). It cannot change or delay traffic; its
-  failures are logged only. The real exchange never waits for an observer:
-  roxy buffers each copy for the service, and a stream with more than
-  `limits.max_observer_lag_bytes` of copy unread, or whose copy's next
-  frame the buffer budget cannot cover, is cut and reset on its own
-  (`observer_lagged`). Waiting for credit is falling behind, so a
-  service that wants every copy in full grants extra credit as an observe
-  stream opens (`roxy_layer.py` grants 16 MiB to each body). Body bytes
-  the service sends on an observe stream are discarded, and credited back
-  in steps of 64 KiB as they are, so the service never waits on its own
-  answers; sending past its credit is a protocol violation, as on any
+- **[Observe mode](/addons/overview#modes)** uses the same streams: the
+  service gets the same messages for copies of both directions, and
+  whatever it sends back other than `credit` and `reset` is ignored. The
+  stream ends after roxy's `response_end` (or a `reset`); a copy that is
+  cut (`observer_lagged`) is reset. Waiting for credit is falling behind,
+  so a service that wants every copy in full grants extra credit as an
+  observe stream opens (`roxy_layer.py` grants 16 MiB to each body). Body
+  bytes the service sends on an observe stream are discarded, and credited
+  back in steps of 64 KiB as they are, so the service never waits on its
+  own answers; sending past its credit is a protocol violation, as on any
   stream.
 - **WebSockets** run through the stream as the [addon
   overview](/addons/overview#websockets) describes for every layer. The

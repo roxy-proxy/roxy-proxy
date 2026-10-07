@@ -59,8 +59,8 @@ metrics:
   a new series when any of these is exhausted is denied (`_fail_closed`,
   reason `metric_table_full`). A byte metric that
   cannot record a chunk mid-stream stops the exchange the same way.
-  Evicting would let a client reset its own counter by varying the key.
-  Series are reclaimed only once their window has fully expired.
+  Series are reclaimed only once their window has fully expired
+  ([never evict](/principles#never-evict)).
 - **Reload.** Series whose metric definition (`count`, `key`, `window`) is
   unchanged carry over; series of a changed or removed metric are dropped
   without comment. Carried series may exceed a lowered `max_metric_keys`
@@ -106,8 +106,7 @@ new series in that metric alone and not in every other.
 one hour when the rule gives none; `ttl: 0` is a compile error. At most
 `limits.max_state_entries` (100 000) live entries; a new key when full
 denies the flow that tried with `503`, `_fail_closed`, reason
-`state_unavailable`.
-State is shared across flows, so reading it is order-dependent by design:
-`state["key"]` sees what earlier flows wrote, and, within one flow, the
-`set_state` of rules above the reader.
-Addons have their own, separate store ([addons](/addons/host-services)).
+`state_unavailable`. State is shared across flows, so reading it is
+order-dependent by design: `state["key"]` sees what earlier flows wrote,
+and, within one flow, the `set_state` of rules above the reader. Addons
+have their own, separate store ([addons](/addons/host-services)).

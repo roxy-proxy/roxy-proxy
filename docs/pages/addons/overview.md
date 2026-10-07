@@ -33,9 +33,7 @@ first and the response last.
 A layer with a `when` runs only on the exchanges it matches, and the rest
 pass it by ([choosing exchanges](/addons/configuration#choosing-exchanges)).
 Nothing configurable runs between the rules and the network, so what the
-rules judged is what leaves. There is no setting or rule action that
-places an addon anywhere else: either would make it ambiguous what the rules
-enforced.
+rules judged is what leaves.
 
 The stack is a pipeline. Every layer runs at once, as its own task, so on
 a long stream each one works on a different chunk at the same time. But
@@ -58,7 +56,7 @@ so they run beside the stream rather than in it.
    invalid head denies the flow, or cuts the exchange if the response head
    is already out. There is no "on error, pass"; observe mode is the one
    safe way to run a layer whose failures must not matter. `sample` gives
-  it a share of the matching exchanges rather than all of them.
+   it a share of the matching exchanges rather than all of them.
 
 ## One exchange, one `next`
 
@@ -142,7 +140,6 @@ flow no layer runs on (every `when` skipped it) is not decoded at all.
   own.
 - The rules below the stack read the response before any layer, and decode
   it for themselves ([rules](/policies/body-rules)).
-
 - A layer gets WebSocket messages it can read: no extension
   (`permessage-deflate` above all) is negotiated on a WebSocket a layer
   runs on ([WebSockets](/policies/websockets#extensions)).
@@ -156,25 +153,23 @@ extensions client and upstream agree on.
 - `mode: enforce` (default): the layer is in the path and its decisions
   take effect.
 - `mode: observe`: roxy tees both streams to the layer and ignores
-  anything it returns except host-service calls such as `record`. A layer
-  that keeps up sees every body in full, however large: each copy is
-  buffered for it, and `limits.max_observer_lag_bytes` (16 MiB by default,
-  per direction) is how far behind the real exchange it may fall before
-  its copy is cut. What a copy has queued is charged to
-  `limits.max_buffered_bytes` as it queues and given back as the layer
-  reads it, and a copy whose next frame the budget cannot cover is cut
-  the same way. A request refused or answered below the observer without
-  its body being read (a deny at the head, say) ends the copy where the
-  reading stopped, without an error: the observer sees the refusal from
-  `next`. A copy that fails (the client went away mid-upload) ends with
-  that failure, so the layer can tell the two apart. The layer cannot
-  change or delay traffic, so its failures cannot weaken containment: a
-  trap or missed deadline is logged, not fatal, and a cut copy is reported
-  (`observer_lagged`, with the `reason`) rather than stalling the flow.
-  Nor can it tag the flow: a tag steers the `when` of every layer below,
-  so `flow.add-tag` from an observer is refused like a call without its
-  capability, and the attempt is logged. An observer may `record`; it may
-  not tag. This is the way to deploy an uncalibrated monitor.
+  anything it returns except host-service calls such as `record`. The
+  layer cannot change or delay traffic, so its failures cannot weaken
+  containment: a trap or missed deadline is logged, not fatal. This is the
+  way to deploy an uncalibrated monitor.
+
+  Each copy is buffered for the layer, so one that keeps up sees every
+  body in full, however large. A copy is cut, and the flow goes on, when
+  the layer falls `limits.max_observer_lag_bytes` behind (16 MiB by
+  default, per direction) or when the [buffer
+  budget](/reference/limits#limits) cannot cover its next frame; either is
+  reported as `observer_lagged` with the `reason`. A request refused or
+  answered below the observer without its body being read ends the copy
+  where the reading stopped, without an error, and the observer sees the
+  refusal from `next`; a copy that fails (the client went away mid-upload)
+  ends with that failure, so the layer can tell the two apart. An observer
+  may `record` but cannot tag the flow
+  ([capabilities](/addons/configuration#capabilities)).
 
 ## In the proxy
 

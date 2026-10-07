@@ -30,8 +30,8 @@ produces a `request` event:
   away). An empty body has the digest of the empty string. A relayed
   WebSocket has byte counts but no digests.
 - `terminal_rule` is what decided: a rule id, or `_default`,
-  `_fail_closed`, `_address_policy`, `_expired`, `_sign` or `layer:<name>`
-  for built-in decisions.
+  `_fail_closed`, `_address_policy`, `_expired`, `_sign`, `_websocket` or
+  `layer:<name>` for built-in decisions.
 - `reason` is a stable code when the exchange failed closed or failed.
   With `terminal_rule: _fail_closed` it is one of: `metric_unavailable`,
   `metric_key_unavailable`, `metric_table_full`,
@@ -44,7 +44,9 @@ produces a `request` event:
   `_expired` it is `policy_expired` ([lease](/operate/operations#lease));
   with `_sign` it is `sign_body_too_large`
   ([signing AWS requests](/policies/secrets#signing-aws-requests)); with
-  `layer:<name>` it is `layer_error`. An upstream failure carries the `upstream_error` reason
+  `_websocket` it is `ws_bad_handshake`
+  ([WebSockets](/policies/websockets)); with `layer:<name>` it is
+  `layer_error`. An upstream failure carries the `upstream_error` reason
   (`timeout`, `connect_failed`, ...; [upstream](/reference/upstream#errors)).
   An exchange roxy could not finish has `aborted` (its connection ended, or
   the server stopped, while it was in flight); one an addon layer dropped

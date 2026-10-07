@@ -24,5 +24,5 @@ rules:
     then: allow
 ```
 
-Each GitHub
-release carries prebuilt binaries (static musl builds for Linux).
+Each GitHub release carries prebuilt binaries (static musl builds for
+Linux).

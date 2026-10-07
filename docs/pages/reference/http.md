@@ -26,14 +26,14 @@ On the proxy port:
   ([TLS](/operate/ca-certificates#ca-distribution)). Anything else there is `404`.
 
 roxy does not authenticate clients: a client is who its network position
-says it is, which rules see as `listener.name` and `client.ip`. A `Proxy-Authorization` header is hop-by-hop and dropped, never
-forwarded.
+says it is, which rules see as `listener.name` and `client.ip`. A
+`Proxy-Authorization` header is hop-by-hop and dropped, never forwarded.
 
 ## CONNECT
 
-A CONNECT gets `200 Connection Established`. There
-are no connect-time rules: every allow or deny decision is made on the
-requests inside the tunnel. roxy then peeks the tunnel's first bytes:
+A CONNECT gets `200 Connection Established`. Every allow or deny decision
+is made on the requests inside the tunnel. roxy then peeks the tunnel's
+first bytes:
 
 - **A TLS ClientHello:** roxy reads the SNI and ALPN
   ([ClientHello sniffing](/reference/tls#clienthello-sniffing)). The SNI must name

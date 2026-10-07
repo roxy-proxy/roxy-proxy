@@ -25,8 +25,7 @@ would refuse (a non-ASCII host, a path that climbs above the root, a
 `Host` that does not match the URL) exits 1 with the same reason code.
 Metrics you do not pass are 0, and `--metric id=unavailable` exercises
 the fail-closed path; a `--metric` for an id the config does not define
-gets a warning. `--client-ip`, `--user`, `--header` and `--body`
-set the request; `--chunked` makes `body.size` (and
+gets a warning. `--client-ip`, `--header` and `--body` set the request; `--chunked` makes `body.size` (and
 `header["content-length"]`) `null`, as for a chunked body that has not
 been buffered. `--state key=value` seeds the state store and `--tag name`
 sets a tag before the rules run.
