@@ -71,7 +71,7 @@ pub(crate) async fn serve_http(stream: BoxIo, client: ClientConn, shared: Arc<Sh
     let cl = ConnLimits::current(&shared);
     let mut io = ClientIo(stream);
     let mut buf = BytesMut::new();
-    let first = tokio::time::timeout(cl.limits.header_timeout, async {
+    let starts_tls = async {
         loop {
             buf.reserve(4096);
             match io.read_buf(&mut buf).await {
@@ -86,8 +86,11 @@ pub(crate) async fn serve_http(stream: BoxIo, client: ClientConn, shared: Arc<Sh
                 Sniff::NeedMore | Sniff::Tls(_) => return Some(true),
             }
         }
-    })
-    .await;
+    };
+    let first = tokio::select! {
+        r = tokio::time::timeout(cl.limits.header_timeout, starts_tls) => r,
+        () = shared.stop.cancelled() => return,
+    };
     match first {
         Ok(Some(false)) => {}
         Ok(Some(true)) => {
