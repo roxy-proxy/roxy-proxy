@@ -31,7 +31,7 @@ runs follows from what it reads.
    rule allows, it is allowed; otherwise it is denied with rule id
    `_default`, so an empty rule set denies everything. To let traffic
    through while you find out what a workload reaches, say so with a rule:
-   `{ id: discover, when: host != null, then: allow }`. Rule order does
+   `{ id: discover, then: allow }` (no `when` matches everything). Rule order does
    not affect the decision. A rule that reads a value not yet known is
    skipped here, not treated as false.
 2. **After that, rules watch.** For the rest of the exchange, two kinds of

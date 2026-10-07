@@ -31,7 +31,7 @@ Failure:
   cancelled exchange is a `LayerError`: a deny, or a cut exchange after the
   response head.
 - **A client that gives up cancels the exchange.** The guest is stopped,
-  its instance discarded, the slot freed. Logged as cancelled, not failed.
+  its instance discarded, the slot freed. No `layer_error` is logged.
 - **No clean end for a failed body.** A guest body ends with an error once
   its exchange has failed; a response body holds its end until the handler
   returns, so a trap after the last byte still cuts it.

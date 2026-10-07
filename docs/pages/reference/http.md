@@ -62,8 +62,8 @@ requests inside the tunnel. The tunnel's first bytes must be:
   false).
 
 Anything else is closed; raw TCP never passes. Inside a tunnel, requests
-are origin-form and their `Host` (or `:authority`) must match the SNI /
-CONNECT host, port-normalised.
+are origin-form and their `Host` (or `:authority`) must match the CONNECT
+host, port-normalised, whatever the SNI said.
 
 ## HTTP/2
 
@@ -133,7 +133,7 @@ the others refuse for the same reason.
 
 ### Request line
 
-- The method is a valid `token`.
+- The method is a `token` of at most 32 bytes.
 - The target form fits the context: absolute-form on the proxy port,
   origin-form in a tunnel or on an `http` listener, authority-form only for
   CONNECT on the proxy port.
@@ -152,9 +152,8 @@ the others refuse for the same reason.
   `http.allow_obs_text`.
 - At most `limits.max_headers` (100) fields.
 - Exactly one `Host`, matching the URI authority (absolute-form) or the
-  SNI / CONNECT host (tunnel); on an `http` listener it names the target.
-  An HTTP/1.0 absolute-form request may omit it.
-- At most one `Proxy-Authorization`.
+  CONNECT host (tunnel); on an `http` listener it names the target. An
+  HTTP/1.0 absolute-form request may omit it.
 - At most one `Content-Length`, digits only, at most 19 digits; a duplicate
   is rejected even with equal values. A non-zero length declared for a body
   that has already ended (a layer passing `content-length` with an empty
@@ -162,8 +161,11 @@ the others refuse for the same reason.
 - `Transfer-Encoding`, if present, is exactly `chunked`: one field, one
   value, no parameters, no other codings; rejected together with
   `Content-Length`.
-- GET, HEAD, DELETE, OPTIONS, CONNECT and TRACE with a non-empty body need
-  `http.allow_body_on_get`.
+- GET, HEAD, DELETE, OPTIONS and TRACE carry a body only with
+  `http.allow_body_on_get`: without it, `Transfer-Encoding: chunked` or a
+  `Content-Length` above zero on those methods is rejected
+  (`body_on_bodiless_method`), whatever the body turns out to hold. CONNECT
+  never carries a body.
 - `Expect` may only be `100-continue`; anything else gets `417`. roxy sends
   `100 Continue` once the rules allow the request; when a rule reads the
   request body it goes out before the body is judged, and a deny follows
@@ -176,14 +178,16 @@ the others refuse for the same reason.
 ### Body
 
 - Chunk sizes are hex, at most 16 digits. Chunk extensions need
-  `http.allow_chunk_extensions`; trailers need `http.allow_request_trailers`
+  `http.allow_chunk_extensions`, and with them the whole chunk-size line is
+  at most 4096 bytes; trailers need `http.allow_request_trailers`
   and an `h2` origin ([trailers](/reference/http#trailers)). The final CRLF
   is enforced.
 - At most `limits.max_request_body_bytes` (1 GiB), enforced while
   streaming: exceeding it closes the connection mid-stream.
-- The head must arrive within `limits.header_timeout` (10 s) of its first
-  byte, whether that byte opened the connection or was pipelined. The body
-  may not stall longer than `limits.body_idle_timeout` (10 m), which also
+- The first request head on a connection must arrive within
+  `limits.header_timeout` (10 s) of the connection, or tunnel, opening;
+  every later head within `header_timeout` of its first byte, pipelined
+  bytes included. The body may not stall longer than `limits.body_idle_timeout` (10 m), which also
   bounds how long the client may go without taking the next part of the
   response (on HTTP/2: stream reset with `CANCEL`, `response_error`, reason
   `client_stalled`).
@@ -197,9 +201,11 @@ the others refuse for the same reason.
 - Connection-specific headers (`connection`, `keep-alive`,
   `transfer-encoding`, `upgrade`, `proxy-connection`) reset the stream
   (RFC 9113 §8.2.2). `te` is accepted only as `trailers`.
-- `:path` goes through the same normaliser and `limits.max_url_bytes` cap.
-  `:authority` must equal the SNI; a `host` header, if present, must equal
-  `:authority`.
+- `:path` goes through the same normaliser and `limits.max_url_bytes` cap
+  once the `h2` crate has accepted it: a raw space, backtick, `<` or `>` in
+  `:path` resets the stream before roxy sees it, with no `parse_error`
+  event. `:authority` must equal the CONNECT authority; a `host` header, if
+  present, must equal `:authority`.
 - `limits.h2_max_concurrent_streams` and `limits.h2_max_header_list_bytes`
   cap streams per connection and header bytes per stream.
   CONTINUATION-flood and rapid-reset defences come from the `h2` crate.

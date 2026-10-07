@@ -83,7 +83,7 @@ docker compose logs roxy
 
 One line per request: the rule it matched, the addons it went through in order (`"addons":["auth-gate","token-quota","sentinel"]`), the `user:alice` tag the auth gate set, and the `set_header:x-api-key` mutation the rule made. The addons' own events are there too: `endpoint_call` for every call to the auth service and the quota board, `layer_record` for the verdicts and usage reports. [Capture](/reference/flow-log#capture) keeps whole requests and responses as well.
 
-The same events reach the control plane in batches a few seconds later; `docker compose logs controlplane` shows each one prefixed with the node's id.
+The same events reach the control plane in batches, within the lease's five-second flush interval; `docker compose logs controlplane` shows each one prefixed with the node's id.
 
 ### Let the lease run down
 

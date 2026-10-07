@@ -19,7 +19,7 @@ holds the upstream side, so a failed upgrade is an error response, never a
 
 | failure | result |
 |---|---|
-| the client's upgrade is not a valid handshake (not `GET`, not HTTP/1.1, a body, `Sec-WebSocket-Version` other than 13, a missing or repeated `Sec-WebSocket-Key`) | `400`, `terminal_rule: _websocket`, reason `ws_bad_handshake` |
+| the client's upgrade is not a valid handshake (not `GET`, not HTTP/1.1, a body, `Sec-WebSocket-Version` other than 13, a `Sec-WebSocket-Key` missing, repeated or not the base64 of 16 bytes) | `400`, `terminal_rule: _websocket`, reason `ws_bad_handshake` |
 | `response_header_timeout` runs out | `504` |
 | the upstream answers anything other than `101` | relayed as it is |
 | a `101` with a wrong `Sec-WebSocket-Accept`, or accepting an extension when none may be negotiated ([below](/reference/websockets#extensions)) | `502`, `upstream_error`, reason `protocol_error` |

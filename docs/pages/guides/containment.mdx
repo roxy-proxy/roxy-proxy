@@ -54,8 +54,8 @@ is ([threat model](/design/threat-model#which-use-case-claims-what)).
 ## With Docker Compose
 
 The workload sits only on an `internal: true` network, which has no route
-out and no outside DNS; roxy alone is on both it and a network with a route
-out:
+out (Docker's embedded DNS still resolves service names on it); roxy alone
+is on both it and a network with a route out:
 
 ```yaml
 services:
@@ -84,7 +84,7 @@ volumes:
 
 The workload fetches the CA from `http://roxy:3130/roxy-ca.pem`. A client
 that ignores the proxy variables, or a library that opens its own sockets,
-gets nowhere: direct connections and DNS lookups fail.
+gets nowhere: there is no route out, whatever a name resolves to.
 
 Other services on the Compose network resolve to private addresses, which
 the address floor denies by default. A rule that lets the workload reach

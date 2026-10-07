@@ -74,7 +74,7 @@ limits:
 
 | limit | on overrun |
 |---|---|
-| `body_idle_timeout` | the request is cut (`parse_error`, `body_timeout`) or the response is cut (`response_error`, `client_gone`) |
+| `body_idle_timeout` | the request is cut (`parse_error`, `body_timeout`) or the response is cut (`response_error`; `client_gone` on HTTP/1.1, `client_stalled` on HTTP/2) |
 | `response_body_idle_timeout` | the exchange ends (`response_error`, `response_body_timeout`): the connection closes on HTTP/1.1, the stream is reset with `CANCEL` on HTTP/2 |
 | `max_ws_message_bytes` | both sides close with `1009`; applies only when rules read messages ([WebSockets](/reference/websockets#message-rules)) |
 | `max_observer_lag_bytes` | the observer's copy is cut ([addon modes](/design/addon-model#modes)) |
@@ -119,7 +119,7 @@ is charged:
 
 | buffer | reservation |
 |---|---|
-| a body a rule reads (`body.text`, `response.body.text`) | `max_inspect_body_bytes`, or its `content-length` if smaller; nothing for a body known to be empty (no request body, a `HEAD` response, a `1xx`, `204` or `304`). Once buffered, it shrinks to what is held (the body as sent with its trailers, or its decoded text if larger) and stays until the exchange ends. A body over the cap holds only what was read before that was known: nothing when its `content-length` said so, the prefix read when it was found out mid-stream |
+| a body a rule reads (`body.text`, `response.body.text`) | `max_inspect_body_bytes`, or its `content-length` if smaller; a body with a `content-encoding` reserves the whole cap, whatever its length, since its decoded size is not known until it is; nothing for a body known to be empty (no request body, a `HEAD` response, a `1xx`, `204` or `304`). Once buffered, it shrinks to what is held (the body as sent with its trailers, or its decoded text if larger) and stays until the exchange ends. A body over the cap holds only what was read before that was known: nothing when its `content-length` said so, the prefix read when it was found out mid-stream |
 | a content decoder | each decoder's window, charged before the decoder is created: 32 KiB for `gzip` or `deflate`, the window a `br` stream's first byte declares (1 KiB to 16 MiB), 8 MiB for `zstd` (the largest window accepted, which each frame may use). Stacked codings add up. Held while the decoder runs: for the rule's decision on an inspected body, for the whole body when it is decoded for the addon stack (`http.decode_for_addons`). A window the budget cannot cover fails closed before it is allocated |
 | a request body hashed for `sign: aws_sigv4` | its `content-length` (at most `max_sign_body_bytes`) up front; a chunked body reserves chunk by chunk up to that cap and is refused at the chunk the budget cannot cover. Held until the exchange ends. `unsigned_payload: true` reserves nothing ([signing AWS requests](/reference/secrets#signing-aws-requests)) |
 | an endpoint call's request body | what the guest sends, frame by frame as it is read (at most 16 MiB), held until the call's last attempt is answered since a retry resends it. A body the budget cannot cover refuses the call ([host services](/reference/host-services#endpoints-endpoints)) |
