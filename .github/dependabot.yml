@@ -20,6 +20,18 @@ updates:
     groups:
       cargo:
         patterns: ["*"]
+  # The quickstart's Python services, each with its own requirements files.
+  - package-ecosystem: pip
+    directories:
+      - /examples/quickstart/controlplane
+      - /examples/quickstart/mocks
+      - /examples/quickstart/sentinel
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      pip-minor-patch:
+        update-types: [minor, patch]
   - package-ecosystem: npm
     directory: /docs
     schedule:

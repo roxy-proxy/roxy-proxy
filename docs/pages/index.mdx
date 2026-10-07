@@ -84,7 +84,7 @@ It fails closed. If roxy can't parse, verify or classify something, it denies it
 
 ## Try it
 
-If you want a demo, run the [quickstart](/quickstart). It puts Claude Code behind roxy and an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar that blocks tool calls matching a denylist, in about five minutes.
+If you want a demo, run the [quickstart](/quickstart). It sends generated traffic through roxy with an auth gate, a per-user token quota and an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar that blocks tool calls matching a denylist, with roxy in node mode leasing its policy from a minimal control plane. Nothing in it needs an API key.
 
 If you want to deploy it, read [deployment](/deploy/overview). It covers containing a workload, the hardened container image and running without Docker.
 

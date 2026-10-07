@@ -1,0 +1,4 @@
+# What the tests need on top of requirements.txt:
+#   pip install -r requirements.txt -r requirements-test.txt && pytest
+pytest==9.1.1
+jsonschema==4.26.0
