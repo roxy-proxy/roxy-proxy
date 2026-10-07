@@ -72,6 +72,9 @@ pub enum ShipOutcome {
     QuotaExhausted,
     /// 410: the node is revoked.
     Revoked,
+    /// 400 or another 4xx: the server refused the batch itself. Retried
+    /// like a failure (the batch is unshipped audit), logged distinctly.
+    Rejected(Transient),
     /// Anything else, including a 413 for a batch within the stated size.
     Failed(Transient),
 }
@@ -301,6 +304,14 @@ impl ControlPlane {
             },
             StatusCode::INSUFFICIENT_STORAGE => ShipOutcome::QuotaExhausted,
             StatusCode::GONE => ShipOutcome::Revoked,
+            // A 413 within the stated size and a 401 are the server's
+            // problem, not the batch's.
+            s if s.is_client_error()
+                && s != StatusCode::PAYLOAD_TOO_LARGE
+                && s != StatusCode::UNAUTHORIZED =>
+            {
+                ShipOutcome::Rejected(Transient::status(s, &body))
+            }
             other => ShipOutcome::Failed(Transient::status(other, &body)),
         }
     }
@@ -633,6 +644,23 @@ pub(crate) mod tests {
         assert!(matches!(cp.ship_flows(&body).await, ShipOutcome::Revoked));
         mock.push(path, Reply::status(502));
         assert!(matches!(cp.ship_flows(&body).await, ShipOutcome::Failed(_)));
+        mock.push(
+            path,
+            Reply::Status {
+                status: 400,
+                headers: vec![],
+                body: br#"{"error":"bad_request","message":"lease_id was never issued"}"#.to_vec(),
+            },
+        );
+        assert!(matches!(
+            cp.ship_flows(&body).await,
+            ShipOutcome::Rejected(e) if e.to_string().contains("lease_id was never issued")
+        ));
+        mock.push(path, Reply::status(401));
+        assert!(
+            matches!(cp.ship_flows(&body).await, ShipOutcome::Failed(_)),
+            "401 is the certificate's standing, not the batch's"
+        );
     }
 
     /// Every body the client sends, and the lease it parses, match the

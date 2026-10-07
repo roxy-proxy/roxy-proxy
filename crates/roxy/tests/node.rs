@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use roxy::node::{Bootstrap, NodeOptions, NodeRunning};
+use roxy_node::node::NodeError;
 use roxy_node::protocol::{FlowAck, FlowSettings, Lease, OnHighWater, PolicyState};
 use roxy_node::testkit::{MockServer, Reply};
 use roxy_proxy::MemorySink;
@@ -545,6 +546,24 @@ async fn shutdown_ships_the_flow_events_of_in_flight_exchanges() {
         "the in-flight exchange's event was shipped: {shipped:?}"
     );
     assert_eq!(h.upstream.seen().len(), 2);
+}
+
+/// A node that cannot proceed says so through `failed`, which is what makes
+/// the process exit; until then the bootstrap listeners deny.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_that_cannot_enrol_reports_the_failure() {
+    let mut h = NodeHarness::start().await;
+    h.run(false).await;
+    let mut running = h.running.take().unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(5), running.failed())
+        .await
+        .expect("no identity and no token is fatal");
+    assert!(matches!(err, NodeError::NotEnrolled { .. }), "{err}");
+    assert_eq!(
+        h.get(h.bootstrap_proxy, "/x").await,
+        (403, Some("_default".into()))
+    );
+    running.shutdown(Duration::from_secs(1)).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

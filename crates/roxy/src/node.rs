@@ -682,7 +682,8 @@ fn bootstrap_config(bootstrap: &Bootstrap, state_dir: &StateDir) -> anyhow::Resu
 pub struct NodeRunning {
     pub handler: Arc<NodeHandler>,
     pub node: Arc<Node>,
-    task: tokio::task::JoinHandle<Result<(), NodeError>>,
+    /// `None` once [`NodeRunning::failed`] has taken its result.
+    task: Option<tokio::task::JoinHandle<Result<(), NodeError>>>,
 }
 
 impl std::fmt::Debug for NodeRunning {
@@ -702,12 +703,29 @@ impl NodeRunning {
         }
     }
 
+    /// Resolves when the node task ends with an error it cannot retry
+    /// past (no identity and no token, a token the control plane will not
+    /// accept, ...). A node that ends by revocation keeps serving its
+    /// denials and health, so this never resolves for it.
+    pub async fn failed(&mut self) -> NodeError {
+        if let Some(task) = self.task.as_mut() {
+            let result = task.await;
+            self.task = None;
+            if let Ok(Err(e)) = result {
+                return e;
+            }
+        }
+        std::future::pending().await
+    }
+
     /// Stops the node task, shuts the server down (in-flight exchanges get
     /// `grace`, and their flow events are spooled) and then drains the
     /// spool within [`DRAIN_GRACE`].
     pub async fn shutdown(self, grace: Duration) {
-        self.task.abort();
-        let _ = self.task.await;
+        if let Some(task) = self.task {
+            task.abort();
+            let _ = task.await;
+        }
         let server = self.handler.server.lock().await.take();
         if let Some(server) = server {
             let sink = server.handle().sink();
@@ -784,18 +802,11 @@ pub async fn start(opts: NodeOptions) -> anyhow::Result<NodeRunning> {
         state_dir = %state_dir.path().display(),
         "node mode: listeners open and denying everything until the first lease"
     );
-    let n = node.clone();
-    let task = tokio::spawn(async move {
-        let result = n.run().await;
-        if let Err(e) = &result {
-            tracing::error!(error = %e, "node cannot proceed; denying everything until a restart");
-        }
-        result
-    });
+    let task = tokio::spawn(node.clone().run());
     Ok(NodeRunning {
         handler,
         node,
-        task,
+        task: Some(task),
     })
 }
 

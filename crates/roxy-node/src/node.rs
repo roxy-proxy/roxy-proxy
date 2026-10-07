@@ -25,6 +25,11 @@ use crate::state::{StateDir, StateError};
 const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 const BACKOFF_CAP: Duration = Duration::from_secs(60);
 
+/// How long enrolment keeps retrying a token the control plane does not
+/// accept before giving up: a freshly issued token may not have reached
+/// every replica yet.
+pub const ENROL_REJECTED_WINDOW: Duration = Duration::from_secs(120);
+
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
     #[error(transparent)]
@@ -41,7 +46,9 @@ pub enum NodeError {
         #[source]
         source: std::io::Error,
     },
-    #[error("enrolment rejected by the control plane: {0}")]
+    #[error(
+        "the control plane did not accept the enrolment token within {ENROL_REJECTED_WINDOW:?}: {0}"
+    )]
     EnrolRejected(String),
     #[error("enrolment response names node {claimed} but the certificate names {in_cert}")]
     NodeIdMismatch { claimed: String, in_cert: String },
@@ -290,7 +297,9 @@ impl Node {
     }
 
     /// Enrols with the token, storing the identity. Also returns the
-    /// renewal window the server stated.
+    /// renewal window the server stated. Outages are retried for as long as
+    /// they last; a token the control plane does not accept is retried for
+    /// [`ENROL_REJECTED_WINDOW`], then fatal.
     async fn enrol(&self) -> Result<(crate::state::StoredIdentity, Option<Duration>), NodeError> {
         let Some(token_path) = &self.config.enrol_token_file else {
             return Err(NodeError::NotEnrolled {
@@ -308,6 +317,7 @@ impl Node {
         )?;
         let key = identity::generate_key()?;
         let mut backoff = Backoff::new();
+        let mut rejected_since: Option<Instant> = None;
         let issued = loop {
             let csr = identity::csr_pem(&key)?;
             match anon.enrol(&token, csr).await {
@@ -318,7 +328,17 @@ impl Node {
                     tokio::time::sleep(self.scaled(wait)).await;
                 }
                 Err(CertificateError::Rejected(why)) => {
-                    return Err(NodeError::EnrolRejected(why));
+                    let since = *rejected_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= self.scaled(ENROL_REJECTED_WINDOW) {
+                        return Err(NodeError::EnrolRejected(why));
+                    }
+                    let wait = backoff.wait();
+                    tracing::warn!(
+                        error = %why,
+                        retry_in = ?wait,
+                        "control plane did not accept the enrolment token; retrying"
+                    );
+                    tokio::time::sleep(self.scaled(wait)).await;
                 }
                 Err(e) => return Err(NodeError::EnrolRejected(e.to_string())),
             }
@@ -680,6 +700,19 @@ impl Node {
                 stopped.under = Some(lease_id);
                 false
             }
+            ShipOutcome::Rejected(e) => {
+                // Unshipped audit is still audit: the batch stays and the
+                // spool's `on_high_water` applies while it does.
+                tracing::error!(
+                    error = %e,
+                    lease_id = %lease_id,
+                    seq_first = batch.seq_first,
+                    spooled_bytes = self.spool.pending_bytes(),
+                    on_high_water = ?settings.on_high_water,
+                    "control plane rejected the flow batch; keeping it and retrying"
+                );
+                false
+            }
             ShipOutcome::Failed(e) => {
                 tracing::warn!(error = %e, spooled_bytes = self.spool.pending_bytes(), "flow upload failed; keeping the batch");
                 false
@@ -940,9 +973,23 @@ mod tests {
             node.run().await,
             Err(NodeError::NotEnrolled { .. })
         ));
-        h.mock.push("/roxy/v1/enrol", Reply::status(401));
+        // A token the control plane does not accept is retried for the
+        // window, then fatal: the process exits rather than denying for ever.
+        h.mock.fallback("/roxy/v1/enrol", Reply::status(401));
         let (node, _) = h.node(true);
-        assert!(matches!(node.run().await, Err(NodeError::EnrolRejected(_))));
+        let started = Instant::now();
+        let window = node.scaled(ENROL_REJECTED_WINDOW);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(10), node.run())
+                .await
+                .expect("gives up after the window"),
+            Err(NodeError::EnrolRejected(_))
+        ));
+        assert!(started.elapsed() >= window, "{:?}", started.elapsed());
+        assert!(
+            h.mock.requests_to("/roxy/v1/enrol").len() > 1,
+            "the token is retried before the node gives up"
+        );
         assert!(
             StateDir::open(&h.dir.path().join("state"))
                 .unwrap()
@@ -1144,6 +1191,7 @@ mod tests {
         h.mock
             .push(FLOWS, Reply::json(200, &FlowAck { acked_through: 1 }));
         h.mock.push(FLOWS, Reply::status(503));
+        h.mock.push(FLOWS, Reply::status(400));
         h.mock
             .push(FLOWS, Reply::json(200, &FlowAck { acked_through: 2 }));
         let (node, _) = h.node(true);
@@ -1153,7 +1201,7 @@ mod tests {
         for i in 0..3 {
             spool.push(format!("{{\"event\":\"request\",\"i\":{i}}}").as_bytes());
         }
-        let posts = h.mock.wait_for(FLOWS, 3).await;
+        let posts = h.mock.wait_for(FLOWS, 4).await;
         let first = posts[0].json();
         assert_eq!(first["node_id"], "n1");
         assert_eq!(first["lease_id"], "L1");
@@ -1161,9 +1209,11 @@ mod tests {
         assert_eq!(first["events"].as_array().unwrap().len(), 2);
         assert_eq!(first["events"][1]["seq"], 1);
         assert_eq!(first["events"][1]["i"], 1);
-        // After the 503 the same batch (seq 2) is retried: at-least-once.
+        // After the 503, and again after the 400, the same batch (seq 2) is
+        // retried: at-least-once, and a rejected batch is still unshipped.
         assert_eq!(posts[1].json()["seq_first"], 2);
         assert_eq!(posts[2].json()["seq_first"], 2);
+        assert_eq!(posts[3].json()["seq_first"], 2);
         tokio::time::timeout(Duration::from_secs(5), async {
             while spool.pending_events() > 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
