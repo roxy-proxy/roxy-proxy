@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Runs the quickstart stack and checks it end to end: roxy denies everything
-# until its first lease, each control fires in the traffic's log (the quota's
-# 429 for alice, the auth gate's 401 for mallory, the sentinel's blocked tool
-# call), the control plane receives the flow log, and a lease that runs down
-# denies everything until the control plane is back. CI runs this
+# until its first lease, a host no rule allows is denied, each control fires
+# in the traffic's log (the quota's 429 for alice, the auth gate's 401 for
+# mallory, the sentinel's blocked tool call), the control plane receives the
+# flow log, a layer whose service is gone fails the call closed, a lease that
+# runs down denies everything until the control plane is back, and the
+# standalone override runs the same policy from the file. CI runs this
 # (.github/workflows/quickstart.yml); it takes a few minutes the first time.
 #   ./smoke.sh            # builds, checks, tears down
 #   KEEP=1 ./smoke.sh     # leaves the stack running
@@ -33,12 +35,20 @@ wait_readyz() {
     done
 }
 
-# The status and x-roxy-rule of a model call through the proxy.
+# The status and x-roxy-rule of a POST through the proxy to `$1` (the model
+# by default), with any further arguments passed to curl.
 proxied() {
-    curl -s -m 5 -o /dev/null -D - -x http://127.0.0.1:3128 -X POST \
-        http://fake-model:8080/v1/messages \
+    local url=${1:-http://fake-model:8080/v1/messages}
+    shift || true
+    curl -s -m 20 -o /dev/null -D - -x http://127.0.0.1:3128 -X POST "$@" "$url" \
         | awk 'NR==1 {s=$2} tolower($1)=="x-roxy-rule:" {r=$2} END {printf "%s %s\n", s, r}' | tr -d '\r'
 }
+
+# `proxied` as a client the auth gate knows.
+as_alice() { proxied "${1:-}" -H 'x-roxy-auth: alice-secret'; }
+
+# Fails unless `$1` (a proxied result) matches the regex `$2`.
+expect() { [[ $1 =~ $2 ]] || fail "proxied request answered '$1', wanted /$2/"; }
 
 docker compose build
 if [[ -z "${KEEP:-}" ]]; then
@@ -56,6 +66,10 @@ echo "smoke: no policy before the first lease"
 docker compose up -d --wait
 wait_readyz "200 ready" 5
 echo "smoke: lease applied"
+
+# No rule allows any host but the model, so the default deny answers.
+expect "$(as_alice http://example.com/)" '^403 _default$'
+echo "smoke: default deny"
 
 wanted=(
     '^\[alice #[0-9]+\] 429 RateLimitError: token bucket empty'
@@ -91,6 +105,12 @@ shipped=$(docker compose logs --no-log-prefix controlplane)
 grep -qE '^node-[0-9a-f]+ \{.*"event":"request"' <<<"$shipped" \
     || fail "no flow event on the control plane's stdout"
 
+# A layer that cannot reach its service fails the call closed, not open.
+docker compose stop quota-board
+expect "$(as_alice)" '^503 '
+docker compose start quota-board
+echo "smoke: fail closed without the quota board"
+
 # With the control plane gone the lease runs down and roxy denies everything.
 docker compose stop controlplane
 wait_readyz "503 policy_expired" $((LEASE_VALID_SECONDS + 30))
@@ -105,4 +125,11 @@ wait_readyz "200 ready" 120
 got=$(proxied)
 [[ $got != "403 _expired" ]] || fail "proxied request still '_expired' after recovery"
 echo "smoke: lease recovered"
+
+# The standalone override: the same policy from the file, with the secret
+# from roxy's own environment and no control plane.
+docker compose -f compose.yaml -f compose.standalone.yaml up -d --wait
+wait_readyz "200 ready" 30
+expect "$(as_alice)" '^200 model-api$'
+echo "smoke: standalone"
 echo "smoke: ok"

@@ -9,7 +9,8 @@ services:
       MODEL_API_KEY: fake-model-key
     volumes:
       - ./roxy.yaml:/etc/roxy/roxy.yaml:ro
-      - { type: tmpfs, target: /var/lib/roxy/ca, tmpfs: { mode: 0o1777 } }
+    tmpfs:
+      - /var/lib/roxy/ca:uid=65532,gid=65532,mode=0700
     depends_on:
       controlplane: !reset null
   controlplane:

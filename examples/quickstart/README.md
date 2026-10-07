@@ -30,12 +30,18 @@ from `roxy.yaml` directly, with no control plane:
 docker compose -f compose.yaml -f compose.standalone.yaml up --build --attach traffic
 ```
 
+roxy's image is `ROXY_IMAGE` (default `ghcr.io/roxy-proxy/roxy:edge`) with
+the addons added. The addons build against the `crates/roxy-addon` in this
+checkout, so the image should be a roxy from the same tree: `edge` on `main`,
+or an image you built from the checkout (`docker build -t roxy:local .` at the
+repo root, then `ROXY_IMAGE=roxy:local docker compose up --build`).
+
 | file | what it is |
 |---|---|
 | [`compose.yaml`](compose.yaml) | roxy in node mode with the addons, the control plane, the three mock services, the sentinel, Inspect View, the traffic and the one-off client |
 | [`compose.standalone.yaml`](compose.standalone.yaml) | an override that runs roxy from `roxy.yaml` instead, without the control plane |
 | [`roxy.yaml`](roxy.yaml) | the policy: the three addons in order, and a rule that lets the client reach the model and puts the API key on the request. The control plane serves it as the lease |
-| [`controlplane/`](controlplane/) | the control plane: enrolment, mTLS, the lease, revocation (`revoked` in its data dir) and flow uploads, in one Python file |
+| [`controlplane/`](controlplane/) | the control plane: enrolment, mTLS, the lease, revocation (`revoked` in its data dir) and flow uploads, in one Python file. Run outside compose it needs `ENROL_TOKEN` or `ENROL_TOKEN_FILE`, `MODEL_API_KEY`, `ROXY_CONFIG`, `CA_OUT`, `LEASE_VALID_SECONDS` and `NODE_CERT_SECONDS` set |
 | [`addons/auth-gate`](addons/auth-gate/src/lib.rs) | the auth gate: `x-roxy-auth` to the auth service, verdict cached in the layer's state, `user:<name>` tag |
 | [`addons/token-quota`](addons/token-quota/src/lib.rs) | the quota: a check before the call, a report of the usage the response carried after it |
 | [`addons/Dockerfile`](addons/Dockerfile) | builds both addons for `wasm32-wasip2` and puts them in roxy's image |
@@ -45,7 +51,9 @@ docker compose -f compose.yaml -f compose.standalone.yaml up --build --attach tr
 | [`mocks/traffic.py`](mocks/traffic.py) | the traffic: a call every few seconds for each user in `TRAFFIC_SCHEDULE` |
 | [`mocks/chat.py`](mocks/chat.py) | the client the traffic uses: the Anthropic SDK through roxy, as a named user |
 | [`sentinel/`](sentinel/) | the sentinel sidecar, a service layer; `SENTINEL_DENY` sets its regex |
-| [`smoke.sh`](smoke.sh) | runs the stack, waits for each control to fire in the traffic's log, and checks the lease running down and recovering |
+| [`smoke.sh`](smoke.sh) | runs the stack, waits for each control to fire in the traffic's log, and checks the default deny, a layer failing closed, the lease running down and recovering, and the standalone override |
 
 The sentinel sidecar's and the control plane's own tests run with `pytest`
-in `sentinel/` and `controlplane/`; the addons' with `cargo test` in `addons/`.
+in `sentinel/` and `controlplane/`, each after
+`pip install -r requirements.txt -r requirements-test.txt`; the addons' with
+`cargo test` in `addons/`.

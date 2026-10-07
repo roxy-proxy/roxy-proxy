@@ -5,7 +5,7 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 cd "$here"
-cargo build --release --target wasm32-wasip2
+cargo build --release --locked --target wasm32-wasip2
 mkdir -p ../tests/fixtures
 for c in redact test_layer; do
     cp "target/wasm32-wasip2/release/$c.wasm" "../tests/fixtures/$c.wasm"

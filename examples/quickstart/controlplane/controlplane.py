@@ -14,7 +14,6 @@ gunzipped request body is not bounded.
 """
 
 import datetime as dt
-import gzip
 import hashlib
 import hmac
 import json
@@ -22,6 +21,7 @@ import os
 import ssl
 import sys
 import threading
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -33,6 +33,9 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 NODE_URI_PREFIX = "urn:roxy:node:"
 PROTOCOL_VERSION = 1
+# A request body, on the wire and once inflated. The lease sets
+# batch_max_bytes well below this; the rest of the protocol's bodies are small.
+MAX_BODY = 1024 * 1024
 
 
 class ApiError(Exception):
@@ -161,12 +164,15 @@ class ControlPlane:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.config_path = Path(config_path)
         self.environ = environ
-        self.token = environ["ENROL_TOKEN"]
-        self.lease_valid = int(environ.get("LEASE_VALID_SECONDS", "60"))
-        self.cert_lifetime = dt.timedelta(seconds=int(environ.get("NODE_CERT_SECONDS", "600")))
+        # The token: a file (a compose secret) or the environment.
+        token_file = environ.get("ENROL_TOKEN_FILE")
+        self.token = Path(token_file).read_text().strip() if token_file else environ["ENROL_TOKEN"]
+        self.lease_valid = int(environ["LEASE_VALID_SECONDS"])
+        self.cert_lifetime = dt.timedelta(seconds=int(environ["NODE_CERT_SECONDS"]))
         self.ca = Ca(self.data_dir)
         self.lock = threading.Lock()
         self.seen = {}  # node id -> set of flow seqs stored
+        self.acked = {}  # node id -> highest seq with no gap below it since the first batch
 
     # -- enrolment and renewal --
 
@@ -266,12 +272,21 @@ class ControlPlane:
                 if event["seq"] not in seen:
                     seen.add(event["seq"])
                     print(f"{node_id} {json.dumps(event, separators=(',', ':'))}", flush=True)
-            return {"acked_through": max(seen)}
+            # A batch that arrives ahead of a missing one is kept but not
+            # acknowledged, so the node re-sends from the gap. The server
+            # does not know where a node's numbering began, so the first
+            # batch it sees from a node sets the baseline.
+            acked = self.acked.get(node_id, batch["seq_first"] - 1)
+            while acked + 1 in seen:
+                acked += 1
+            self.acked[node_id] = acked
+            return {"acked_through": acked}
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "roxy-quickstart-controlplane"
+    timeout = 30  # a connection that stops sending is dropped rather than held
 
     def setup(self):
         super().setup()
@@ -312,9 +327,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def read_json(self):
         length = int(self.headers.get("content-length") or 0)
+        if length > MAX_BODY:
+            raise ApiError(413, "too_large", f"body exceeds {MAX_BODY} bytes")
         raw = self.rfile.read(length)
         if self.headers.get("content-encoding") == "gzip":
-            raw = gzip.decompress(raw)
+            inflate = zlib.decompressobj(zlib.MAX_WBITS | 16)
+            raw = inflate.decompress(raw, MAX_BODY + 1)
+            if len(raw) > MAX_BODY or inflate.unconsumed_tail:
+                raise ApiError(413, "too_large", f"body inflates past {MAX_BODY} bytes")
         try:
             body = json.loads(raw)
         except ValueError as e:
