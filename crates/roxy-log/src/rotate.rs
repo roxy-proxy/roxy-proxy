@@ -27,8 +27,8 @@ pub struct RotateOptions {
 /// An append-only file that rotates by size: when it reaches
 /// [`RotateOptions::max_file_bytes`] at a batch boundary it is renamed to
 /// `<path>.<UTC timestamp>-<seq>` (e.g. `flow.jsonl.20261003T184200.123Z-0000`) and a
-/// new file is opened at `path`. Rotated files sort by name in rotation
-/// order.
+/// new file is opened at `path`. Rotated names are strictly increasing, across
+/// restarts and clock steps included, so sorting them is rotation order.
 ///
 /// Rotation and reopen errors are returned to the writer, which holds
 /// traffic and retries; nothing written is ever lost. If the rename succeeds
@@ -40,7 +40,8 @@ pub struct RotatingFile {
     file: File,
     size: u64,
     opts: RotateOptions,
-    /// Stamp and sequence of the last rotated name.
+    /// Stamp and sequence of the last rotated name: the newest one found
+    /// next to the file at open, then each name this file produces.
     last: Option<(String, u32)>,
     /// A rotation that renamed the file but could not open the new one:
     /// the renamed file, still to be compressed and pruned.
@@ -62,12 +63,17 @@ impl RotatingFile {
     pub fn open(path: &Path, opts: RotateOptions) -> io::Result<Self> {
         let file = open_append(path)?;
         let size = file.metadata()?.len();
+        let pruner = Pruner::new(path);
+        let last = pruner
+            .rotated()
+            .pop()
+            .and_then(|k| pruner.parse(&k).map(|(stamp, seq)| (stamp.to_owned(), seq)));
         Ok(Self {
             path: path.to_path_buf(),
             file,
             size,
             opts,
-            last: None,
+            last,
             pending: None,
             #[cfg(test)]
             fail_rotations: Arc::default(),
@@ -80,34 +86,20 @@ impl RotatingFile {
         &self.path
     }
 
-    fn file_name(&self) -> String {
-        self.path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    }
-
-    fn dir(&self) -> PathBuf {
-        match self.path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-            _ => PathBuf::from("."),
-        }
-    }
-
     /// The next rotated name: `<name>.<UTC stamp>-<seq>`. Names are
-    /// strictly increasing within a process (if the clock steps back, the
-    /// previous stamp is reused with a higher sequence), so sorting by name
-    /// is rotation order, and a name freed by pruning is never reused out of
-    /// order. Names that exist already (plain or compressed, e.g. from an
-    /// earlier run) are skipped.
+    /// strictly increasing: if the clock is behind the last name (a step
+    /// back, or a restart on a clock behind the previous run's), that
+    /// stamp is reused with a higher sequence. So sorting by name is
+    /// rotation order, and a name freed by pruning is never reused out of
+    /// order. Names that exist already (plain or compressed) are skipped.
     fn rotated_name(&mut self) -> PathBuf {
         let now = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
         let (stamp, mut seq) = match &self.last {
             Some((last, seq)) if *last >= now => (last.clone(), seq + 1),
             _ => (now, 0),
         };
-        let dir = self.dir();
-        let file = self.file_name();
+        let dir = dir_of(&self.path);
+        let file = file_name_of(&self.path);
         loop {
             let n = format!("{file}.{stamp}-{seq:04}");
             if !dir.join(&n).exists() && !dir.join(format!("{n}.gz")).exists() {
@@ -165,7 +157,7 @@ impl RotatingFile {
         tracing::info!(path = %self.path.display(), rotated = %target.display(), "log file rotated");
         if self.opts.compress {
             let keep = self.opts.max_files;
-            let me = self.clone_for_prune();
+            let me = Pruner::new(&self.path);
             std::thread::Builder::new()
                 .name("roxy-log-gzip".into())
                 .spawn(move || {
@@ -175,34 +167,41 @@ impl RotatingFile {
                     me.prune(keep);
                 })?;
         } else {
-            self.clone_for_prune().prune(self.opts.max_files);
+            Pruner::new(&self.path).prune(self.opts.max_files);
         }
         Ok(())
     }
+}
 
-    fn clone_for_prune(&self) -> Pruner {
-        Pruner {
-            dir: self.dir(),
-            prefix: format!("{}.", self.file_name()),
-        }
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn dir_of(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
     }
 }
 
-/// Deletes the oldest rotated files beyond `max_files`.
+/// The rotated files next to a log, and deletion of the oldest beyond
+/// `max_files`.
 struct Pruner {
     dir: PathBuf,
     prefix: String,
 }
 
-/// Whether `rest` (a name with the `<file>.` prefix removed) is a rotated
-/// name, `<UTC stamp>-<seq>` with an optional `.gz`. Anything else next to
-/// the log (`.bak`, another destination, an archive being written) is not
-/// roxy's to count or delete.
-fn is_rotated_suffix(rest: &str) -> bool {
+/// The `<UTC stamp>` and `<seq>` of `rest`, a rotated name with the
+/// `<file>.` prefix removed and an optional `.gz`; `None` for any other
+/// shape. Anything else next to the log (`.bak`, another destination, an
+/// archive being written) is not roxy's to count or delete.
+fn parse_rotated_suffix(rest: &str) -> Option<(&str, u32)> {
     let rest = rest.strip_suffix(".gz").unwrap_or(rest);
     let b = rest.as_bytes();
     // 20261003T184200.123Z-0000 (the sequence grows past four digits)
-    b.len() >= 25
+    let shaped = b.len() >= 25
         && b[..8].iter().all(u8::is_ascii_digit)
         && b[8] == b'T'
         && b[9..15].iter().all(u8::is_ascii_digit)
@@ -210,25 +209,48 @@ fn is_rotated_suffix(rest: &str) -> bool {
         && b[16..19].iter().all(u8::is_ascii_digit)
         && b[19] == b'Z'
         && b[20] == b'-'
-        && b[21..].iter().all(u8::is_ascii_digit)
+        && b[21..].iter().all(u8::is_ascii_digit);
+    if !shaped {
+        return None;
+    }
+    Some((&rest[..20], rest[21..].parse().ok()?))
 }
 
 impl Pruner {
-    fn prune(&self, max_files: Option<usize>) {
-        let Some(max) = max_files else { return };
+    fn new(path: &Path) -> Self {
+        Self {
+            dir: dir_of(path),
+            prefix: format!("{}.", file_name_of(path)),
+        }
+    }
+
+    /// The stamp and sequence of `name` if it is one of this log's rotated
+    /// files.
+    fn parse<'a>(&self, name: &'a str) -> Option<(&'a str, u32)> {
+        name.strip_prefix(&self.prefix)
+            .and_then(parse_rotated_suffix)
+    }
+
+    /// This log's rotated files in rotation order, keyed without `.gz` so
+    /// a file being compressed (both forms present) counts once.
+    fn rotated(&self) -> Vec<String> {
         let Ok(entries) = fs::read_dir(&self.dir) else {
-            return;
+            return Vec::new();
         };
-        // Rotated files, keyed without `.gz` so a file being compressed
-        // (both forms present) counts once.
         let mut keys: Vec<String> = entries
             .filter_map(Result::ok)
             .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| n.strip_prefix(&self.prefix).is_some_and(is_rotated_suffix))
+            .filter(|n| self.parse(n).is_some())
             .map(|n| n.strip_suffix(".gz").map(str::to_owned).unwrap_or(n))
             .collect();
-        keys.sort();
+        keys.sort_by_cached_key(|k| self.parse(k).map(|(stamp, seq)| (stamp.to_owned(), seq)));
         keys.dedup();
+        keys
+    }
+
+    fn prune(&self, max_files: Option<usize>) {
+        let Some(max) = max_files else { return };
+        let keys = self.rotated();
         let excess = keys.len().saturating_sub(max);
         for key in &keys[..excess] {
             for name in [key.clone(), format!("{key}.gz")] {
@@ -534,11 +556,82 @@ mod tests {
             .iter()
             .filter(|p| {
                 let n = p.file_name().unwrap().to_string_lossy();
-                is_rotated_suffix(&n["flow.jsonl.".len()..])
+                parse_rotated_suffix(&n["flow.jsonl.".len()..]).is_some()
             })
             .map(|p| read(p).trim().to_owned())
             .collect();
         assert_eq!(kept, ["record 3", "record 4"]);
+    }
+
+    /// A restart on a clock behind the previous run's: rotation carries on
+    /// from the newest name on disk, so the new files sort after the old
+    /// ones and pruning removes the oldest, not the newest.
+    #[test]
+    fn rotation_after_a_backwards_clock_step_prunes_the_oldest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flow.jsonl");
+        // The previous run's clock was a century ahead of this one's.
+        let stamp = "21260101T000000.000Z";
+        for seq in 0..2 {
+            fs::write(
+                dir.path().join(format!("flow.jsonl.{stamp}-{seq:04}")),
+                format!("old {seq}\n"),
+            )
+            .unwrap();
+        }
+        let dest = RotatingFile::open(
+            &path,
+            RotateOptions {
+                max_file_bytes: Some(1),
+                max_files: Some(3),
+                compress: false,
+            },
+        )
+        .unwrap();
+        let w = LogWriter::spawn("t", dest, opts(1 << 20)).unwrap();
+        for i in 0..3 {
+            w.append(format!("record {i}\n").as_bytes());
+            assert!(w.flush());
+        }
+        let files = rotated(dir.path(), "flow.jsonl");
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                format!("flow.jsonl.{stamp}-0002"),
+                format!("flow.jsonl.{stamp}-0003"),
+                format!("flow.jsonl.{stamp}-0004"),
+            ],
+            "new names continue the newest existing one"
+        );
+        let kept: Vec<String> = files.iter().map(|p| read(p).trim().to_owned()).collect();
+        assert_eq!(kept, ["record 0", "record 1", "record 2"]);
+    }
+
+    /// Names sort by sequence as a number: `-10000` comes after `-9999`.
+    #[test]
+    fn rotation_order_is_numeric_in_the_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = "20260101T000000.000Z";
+        for seq in [10000, 9999, 123] {
+            fs::write(
+                dir.path().join(format!("flow.jsonl.{stamp}-{seq:04}")),
+                b"x",
+            )
+            .unwrap();
+        }
+        let pruner = Pruner::new(&dir.path().join("flow.jsonl"));
+        assert_eq!(
+            pruner.rotated(),
+            [
+                format!("flow.jsonl.{stamp}-0123"),
+                format!("flow.jsonl.{stamp}-9999"),
+                format!("flow.jsonl.{stamp}-10000"),
+            ]
+        );
     }
 
     #[test]

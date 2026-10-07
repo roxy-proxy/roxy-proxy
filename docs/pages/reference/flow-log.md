@@ -92,10 +92,13 @@ The write path never drops a record while roxy runs
   failing destination (disk full, I/O error) holds traffic the same way, and
   is reported.
 - **Rotation** happens at a batch boundary, so a record never spans two
-  files: the file is renamed to `<path>.<UTC timestamp>-<seq>` (names sort
-  in rotation order), a new one is opened, files beyond `max_files` are
-  deleted, and rotated files are optionally gzipped in the background. Only
-  files of that name shape count towards `max_files` or are deleted. A
+  files: the file is renamed to `<path>.<UTC timestamp>-<seq>`, a new one
+  is opened, files beyond `max_files` are deleted (oldest first), and
+  rotated files are optionally gzipped in the background. Names sort in
+  rotation order even across a restart on a clock behind the previous run's:
+  a rotation on a clock behind the newest existing name reuses its stamp
+  with a higher sequence. Only files of that name shape count towards
+  `max_files` or are deleted. A
   failed rotation is a failed write: traffic is held and it is retried.
   `SIGHUP` reopens the file, for external rotation.
 - **Shutdown.** Everything queued is written before exit. A destination
