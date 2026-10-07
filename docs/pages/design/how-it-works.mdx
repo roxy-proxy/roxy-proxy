@@ -1,31 +1,16 @@
+---
+title: "How roxy works"
+description: "One exchange through roxy: decrypt and parse, the addon stack, the rules, the connector, and the response back up the same path, with every stage and every exit written to the flow log."
+---
+
+import howItWorks from "../../assets/how-it-works.svg";
+
 # How roxy works
 
+<img src={howItWorks} alt="One exchange through roxy, top to bottom. The client's request enters roxy and passes through four stages: decrypt and parse (CONNECT, TLS, strict parse into the canonical request, and the lease check), the addon stack (enforce layers in order, with observers beside them on a copy), the rules (deny wins; effects: secrets, headers, redirect, sign) and connect (DNS, address floor, upstream TLS), then reaches the upstream. The response returns up the same stages: re-framed by the connector, watched by the rules, seen by the addons, and canonically re-serialised to the client. Each stage has an exit branching to the right: a parse failure is refused with parse_error, an expired policy denies with _expired, an addon can answer the client directly or deny with layer:name, the rules deny with the rule id, and the address floor denies with _address_policy. A flow-log strip down the right edge is fed by every stage and every exit: one record per exchange, never dropped." />
+
 An exchange is one request and its response. Every exchange takes the same
-path, whichever way roxy is deployed:
-
-```
-  client ──TCP──▶  listener: HTTP proxy (mode: http_proxy)
-                     ▼
-                   CONNECT: first bytes must be a TLS ClientHello
-                     ▼      whose SNI matches the CONNECT host (the defaults:
-                            http.allow_plain_in_connect, tls.require_sni_match)
-                   TLS termination (leaf minted by roxy's CA), ALPN h1 | h2
-                     ▼
-                   strict parse → CanonicalRequest   ◀── or plain origin-form
-                     ▼                                   requests (mode: http)
-                     ▼
-                   addons (in config order)
-                     ▼
-                   rules: the head decision (forward or deny)
-                     ▼
-                   upstream connector: own DNS, address floor, rustls, h1 | h2
-                     ▼
-                   watching rules (body bytes, response, byte metrics)
-                     ▼
-                   addons (in reverse order), then re-serialised to the client
-
-                   flow log ◀── every stage emits events
-```
+path, whichever way roxy is deployed.
 
 ## Decrypt and parse
 
