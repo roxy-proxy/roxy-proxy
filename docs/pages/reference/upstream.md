@@ -49,10 +49,11 @@ Connections to an origin are pooled by scheme and authority and closed
 after 90 s idle. HTTP/1.1 opens one connection per concurrent request.
 HTTP/2 multiplexes: an origin that negotiates `h2` gets up to
 `max_h2_connections_per_origin` connections, each driven by its own task.
-A request goes to the connection with the fewest responses outstanding, so
-a lightly used origin stays on one connection and a busy one spreads
-across the limit. Each connection offers a 2 MiB stream window, an 8 MiB
-connection window and 1 MiB frames.
+A request goes to the connection with the fewest exchanges in flight (a
+response body still streaming counts), so a lightly used origin stays on
+one connection and concurrent load spreads evenly across the limit. Each
+connection offers a 2 MiB stream window, an 8 MiB connection window and
+1 MiB frames.
 
 An origin that closes an HTTP/2 connection with `GOAWAY` (nginx does at
 `keepalive_requests`) fails every stream above the last one it names, which

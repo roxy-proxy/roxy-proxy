@@ -33,7 +33,7 @@ use crate::pipeline::{
     request_steps, response_steps,
 };
 use crate::server::Shared;
-use crate::upstream::{ConnectError, Protocols, classify, describe};
+use crate::upstream::{ConnectError, Protocols, UpstreamBody, classify, describe};
 use crate::view::host_text;
 use crate::watch::{Dir, Watch, watched};
 
@@ -499,7 +499,7 @@ fn protocol_refusal(cx: &FlowCx, host: &str, port: u16, message: String) -> Refu
 
 /// What the upstream step produced.
 enum Upstreamed {
-    Response(http::Response<hyper::body::Incoming>),
+    Response(http::Response<UpstreamBody>),
     /// A `101` for an allowed WebSocket upgrade, with the upgraded
     /// upstream connection.
     Upgrade {
@@ -626,7 +626,9 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
     cx.record.ttfb_ms = Some(u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX));
     let (res, upgrade) = match upstreamed {
         Upstreamed::Response(res) => (res, None),
-        Upstreamed::Upgrade { res, upstream, key } => (res, Some((upstream, key))),
+        Upstreamed::Upgrade { res, upstream, key } => {
+            (res.map(UpstreamBody::untracked), Some((upstream, key)))
+        }
     };
     let res = from_upstream_response(res, &cx.snap.limits);
     match response_steps(cx, res, front).await {
@@ -722,7 +724,7 @@ async fn upgrade_upstream(
             "upgrade request failed".into(),
         ))),
         Ok(Ok((res, Some(upstream)))) => Ok(Upstreamed::Upgrade { res, upstream, key }),
-        Ok(Ok((res, None))) => Ok(Upstreamed::Response(res)),
+        Ok(Ok((res, None))) => Ok(Upstreamed::Response(res.map(UpstreamBody::untracked))),
     }
 }
 

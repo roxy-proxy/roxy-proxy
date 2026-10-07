@@ -29,8 +29,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use bytes::Bytes;
 use http::Uri;
-use http_body::Body as _;
+use http_body::{Body as _, Frame, SizeHint};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::{Connected, Connection};
@@ -441,10 +442,8 @@ const MAX_RETRIES: u32 = 2;
 /// one connector. hyper-util carries every request for a
 /// `scheme://authority` on one HTTP/2 connection per client, driven by one
 /// task, so a client per shard lets a busy origin spread over as many
-/// connections (and runtime workers) as there are shards. A request goes
-/// to the shard with the fewest responses outstanding, lowest index first:
-/// a lightly used origin stays on one connection, a busy one spreads over
-/// up to `upstream.max_h2_connections_per_origin`.
+/// connections (and runtime workers) as there are shards, up to
+/// `upstream.max_h2_connections_per_origin`. See [`pick`] for the choice.
 #[derive(Clone)]
 pub(crate) struct PooledClient {
     shards: Arc<[Shard]>,
@@ -452,24 +451,77 @@ pub(crate) struct PooledClient {
 
 struct Shard {
     client: HttpClient,
-    /// Requests sent whose response head has not arrived.
+    /// Exchanges on this shard: sent, and the response body not yet ended.
     in_flight: AtomicUsize,
 }
 
-/// Counts a request against its shard until the response head arrives or
-/// the request is abandoned.
-struct InFlight<'a>(&'a Shard);
+/// Counts an exchange against its shard from the request going out until
+/// the response body ends or is dropped, or the request fails.
+struct InFlight {
+    shards: Arc<[Shard]>,
+    index: usize,
+}
 
-impl<'a> InFlight<'a> {
-    fn start(shard: &'a Shard) -> Self {
-        shard.in_flight.fetch_add(1, Ordering::Relaxed);
-        Self(shard)
+impl InFlight {
+    fn start(shards: Arc<[Shard]>, index: usize) -> Self {
+        shards[index].in_flight.fetch_add(1, Ordering::Relaxed);
+        Self { shards, index }
     }
 }
 
-impl Drop for InFlight<'_> {
+impl Drop for InFlight {
     fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+        self.shards[self.index]
+            .in_flight
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A pooled response body, counted against its shard until it ends (so a
+/// client's next request, sent once it has the whole response, finds the
+/// shard free) or is dropped.
+pub(crate) struct UpstreamBody {
+    inner: Incoming,
+    in_flight: Option<InFlight>,
+}
+
+impl UpstreamBody {
+    /// A body from a connection outside the pool (an upgrade's).
+    pub(crate) fn untracked(inner: Incoming) -> Self {
+        Self {
+            inner,
+            in_flight: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for UpstreamBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl http_body::Body for UpstreamBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+        let r = Pin::new(&mut self.inner).poll_frame(cx);
+        if matches!(r, Poll::Ready(None | Some(Err(_)))) {
+            self.in_flight = None;
+        }
+        r
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -526,19 +578,22 @@ impl PooledClient {
             let head = req.body().is_end_stream().then(|| Head::of(&req));
             let mut retries = 0;
             loop {
-                let shard = shards
-                    .iter()
-                    .min_by_key(|s| s.in_flight.load(Ordering::Relaxed))
-                    .expect("at least one shard");
-                let in_flight = InFlight::start(shard);
-                let out = shard.client.request(req).await;
-                drop(in_flight);
-                match (out, &head) {
-                    (Err(e), Some(head)) if retries < MAX_RETRIES && never_reached_origin(&e) => {
-                        retries += 1;
-                        req = head.request();
+                let index = pick(&shards);
+                let in_flight = InFlight::start(shards.clone(), index);
+                match shards[index].client.request(req).await {
+                    Ok(res) => {
+                        return Ok(res.map(|inner| UpstreamBody {
+                            inner,
+                            in_flight: Some(in_flight),
+                        }));
                     }
-                    (out, _) => return out,
+                    Err(e) => match &head {
+                        Some(head) if retries < MAX_RETRIES && never_reached_origin(&e) => {
+                            retries += 1;
+                            req = head.request();
+                        }
+                        _ => return Err(e),
+                    },
                 }
             }
         })
@@ -547,7 +602,21 @@ impl PooledClient {
 
 /// A [`PooledClient::request`] in progress.
 pub(crate) type ResponseFuture =
-    Pin<Box<dyn Future<Output = Result<http::Response<Incoming>, ClientError>> + Send>>;
+    Pin<Box<dyn Future<Output = Result<http::Response<UpstreamBody>, ClientError>> + Send>>;
+
+/// The shard for a request: the one with the fewest exchanges in flight,
+/// the lowest index among equals. Requests one after another all land on
+/// the first shard, so a lightly used origin keeps a single connection;
+/// requests in flight at the same time take distinct shards up to the
+/// limit, and spread evenly beyond it.
+fn pick(shards: &[Shard]) -> usize {
+    shards
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, s)| s.in_flight.load(Ordering::Relaxed))
+        .map(|(i, _)| i)
+        .expect("at least one shard")
+}
 
 /// Whether `err` says the origin never saw the request: the stream was
 /// above the last one a remote `GOAWAY` named, or hyper never sent it.
