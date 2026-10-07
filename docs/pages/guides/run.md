@@ -3,8 +3,17 @@
 ## Container image
 
 `ghcr.io/roxy-proxy/roxy` is built from the `Dockerfile` for `linux/amd64`
-and `linux/arm64`. Tags: `edge` (every push to `main`), and `vX.Y.Z`, `X.Y`
-and `latest` for releases ([RELEASING.md](https://github.com/roxy-proxy/roxy-proxy/blob/main/RELEASING.md)).
+and `linux/arm64`.
+
+| tag | what |
+|---|---|
+| `latest` | The newest release. What an untagged `ghcr.io/roxy-proxy/roxy` pulls. |
+| `vX.Y.Z` | That release. Pin this for a reproducible deployment. |
+| `X.Y` | The newest patch release of that minor. |
+| `edge` | Every push to `main`. May break. Kubernetes only re-pulls `:latest` and untagged images by default, so a deployment tracking `edge` needs `imagePullPolicy: Always`. |
+
+Releases are tagged as in
+[RELEASING.md](https://github.com/roxy-proxy/roxy-proxy/blob/main/RELEASING.md).
 
 - A static musl binary on `gcr.io/distroless/static-debian12:nonroot`. No
   shell, no package manager.
@@ -22,7 +31,7 @@ docker run -d --name roxy \
   -v roxy-ca:/var/lib/roxy/ca \
   -v ./roxy.yaml:/etc/roxy/roxy.yaml:ro \
   -p 3128:3128 -p 3130:3130 \
-  ghcr.io/roxy-proxy/roxy:edge
+  ghcr.io/roxy-proxy/roxy:latest
 ```
 
 | path | what |
@@ -43,16 +52,16 @@ compose `depends_on` or a Kubernetes readiness probe
 run the same way:
 
 ```sh
-docker run --rm -v ./roxy.yaml:/etc/roxy/roxy.yaml:ro ghcr.io/roxy-proxy/roxy:edge \
+docker run --rm -v ./roxy.yaml:/etc/roxy/roxy.yaml:ro ghcr.io/roxy-proxy/roxy:latest \
   check --config /etc/roxy/roxy.yaml
-docker run --rm -v roxy-ca:/var/lib/roxy/ca ghcr.io/roxy-proxy/roxy:edge \
+docker run --rm -v roxy-ca:/var/lib/roxy/ca ghcr.io/roxy-proxy/roxy:latest \
   ca export --config /etc/roxy/roxy.yaml > roxy-ca.pem
 ```
 
 Verify a published image's signature:
 
 ```sh
-cosign verify ghcr.io/roxy-proxy/roxy:edge \
+cosign verify ghcr.io/roxy-proxy/roxy:latest \
   --certificate-identity-regexp '^https://github.com/roxy-proxy/roxy-proxy/\.github/workflows/image\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
