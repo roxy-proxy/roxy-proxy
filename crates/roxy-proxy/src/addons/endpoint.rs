@@ -203,7 +203,7 @@ async fn attempt_all(
         return Err((EndpointError::Timeout, 0));
     };
     let _permit = permit.map_err(|e| fail(format!("endpoint calls: {e}")))?;
-    let body = body.map_err(|e| fail(format!("request body: {e}")))?;
+    let body = body.map_err(|e| fail(format!("request body: {e}")))?.data;
 
     let mut headers = http::HeaderMap::new();
     for (n, v) in &parts.headers {

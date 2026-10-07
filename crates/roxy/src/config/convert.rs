@@ -47,7 +47,8 @@ impl From<&Config> for HttpFlags {
         let h = &c.http;
         HttpFlags {
             allow_http10: h.allow_http10,
-            allow_trailers: h.allow_trailers,
+            allow_request_trailers: h.allow_request_trailers,
+            allow_response_trailers: h.allow_response_trailers,
             allow_chunk_extensions: h.allow_chunk_extensions,
             allow_obs_text: h.allow_obs_text,
             allow_body_on_get: h.allow_body_on_get,

@@ -60,7 +60,7 @@ use crate::len_u64;
 use crate::model::{
     Authority, Body, BodyError, BodySender, CanonicalRequest, CanonicalResponse, DriveError,
     Headers, HttpFlags, Limits, ParseError, Reason, RequestMeta, TargetForm, Version, WriteError,
-    status_forbids_body,
+    status_forbids_body, validate_response_trailers,
 };
 
 /// Read size per socket read.
@@ -490,10 +490,22 @@ fn poll_body_once(
     }
 }
 
+/// How a response body is written: its framing, how long each write to
+/// the client may take (`idle`), how long the body may take to yield its
+/// next frame (`body_idle`), and the flags and limits that decide whether
+/// trailers go out.
+struct WriteOpts<'a> {
+    framing: OutFraming,
+    idle: Duration,
+    body_idle: Duration,
+    limits: &'a Limits,
+    flags: &'a HttpFlags,
+}
+
 /// Writes a response head and body. Bodies are streamed frame by frame:
-/// each write to the client must progress within `idle`, and the body must
-/// yield its next frame within `body_idle`. Once `client_closed` is set,
-/// waiting for a frame fails instead.
+/// each write to the client must progress within `opts.idle`, and the body
+/// must yield its next frame within `opts.body_idle`. Once `client_closed`
+/// is set, waiting for a frame fails instead.
 ///
 /// Output is buffered by `w` and flushed only when the body has nothing
 /// ready, so a response whose body is already in hand goes out in one
@@ -502,15 +514,15 @@ async fn write_message<W: AsyncWrite + Unpin>(
     w: &mut W,
     head: BytesMut,
     body: Body,
-    framing: OutFraming,
-    (idle, body_idle): (Duration, Duration),
+    opts: &WriteOpts<'_>,
     client_closed: &AtomicBool,
 ) -> Result<(), WriteError> {
+    let idle = opts.idle;
     write_timed(w, &[&head], idle).await?;
-    if matches!(framing, OutFraming::Empty | OutFraming::Head(_)) {
+    if matches!(opts.framing, OutFraming::Empty | OutFraming::Head(_)) {
         return flush_timed(w, idle).await;
     }
-    match write_body(w, body, framing, (idle, body_idle), client_closed).await {
+    match write_body(w, body, opts, client_closed).await {
         Ok(()) => flush_timed(w, idle).await,
         // The head is committed once written: a body that fails still lets
         // the client see it, and the data before the failure, as a cut body.
@@ -525,10 +537,15 @@ async fn write_message<W: AsyncWrite + Unpin>(
 async fn write_body<W: AsyncWrite + Unpin>(
     w: &mut W,
     mut body: Body,
-    framing: OutFraming,
-    (idle, body_idle): (Duration, Duration),
+    opts: &WriteOpts<'_>,
     client_closed: &AtomicBool,
 ) -> Result<(), WriteError> {
+    let WriteOpts {
+        framing,
+        idle,
+        body_idle,
+        ..
+    } = *opts;
     let mut sent: u64 = 0;
     let expected = match framing {
         OutFraming::Length(n) => Some(n),
@@ -561,9 +578,23 @@ async fn write_body<W: AsyncWrite + Unpin>(
         };
         let Some(frame) = frame else { break };
         let frame = frame.map_err(WriteError::Body)?;
-        let Ok(data) = frame.into_data() else {
-            // Trailers are never sent to h1 clients.
-            continue;
+        let data = match frame.into_data() {
+            Ok(data) => data,
+            // Only chunked framing can carry trailers: with a declared
+            // length the body is complete without them.
+            Err(_) if framing != OutFraming::Chunked => continue,
+            Err(frame) => {
+                let Ok(trailers) = frame.into_trailers() else {
+                    continue;
+                };
+                let checked = validate_response_trailers(&trailers, opts.limits, opts.flags)
+                    .map_err(|e| WriteError::Body(BodyError::Invalid(e)))?;
+                if let Some(t) = checked {
+                    write_timed(w, &[&chunked_trailers(&t)], idle).await?;
+                    return Ok(());
+                }
+                continue;
+            }
         };
         if data.is_empty() {
             continue;
@@ -594,6 +625,19 @@ async fn write_body<W: AsyncWrite + Unpin>(
         write_timed(w, &[b"0\r\n\r\n"], idle).await?;
     }
     Ok(())
+}
+
+/// The last chunk of a chunked body with its trailer section.
+fn chunked_trailers(trailers: &HeaderMap) -> BytesMut {
+    let mut out = BytesMut::from(&b"0\r\n"[..]);
+    for (n, v) in trailers {
+        out.extend_from_slice(n.as_str().as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out
 }
 
 /// A strict HTTP/1.1 server connection over any byte stream.
@@ -972,14 +1016,17 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         let close =
             ex.close || res.meta.close || self.r.abandoned || framing == OutFraming::CloseDelimited;
         let head = response_head(res.status, &res.headers, &[], framing, close, None);
-        let idle = (
-            self.limits.body_idle_timeout,
-            self.limits.response_body_idle_timeout,
-        );
+        let opts = WriteOpts {
+            framing,
+            idle: self.limits.body_idle_timeout,
+            body_idle: self.limits.response_body_idle_timeout,
+            limits: &self.limits,
+            flags: &self.flags,
+        };
 
         let client_closed = AtomicBool::new(false);
         let result = {
-            let write = write_message(&mut self.w, head, res.body, framing, idle, &client_closed);
+            let write = write_message(&mut self.w, head, res.body, &opts, &client_closed);
             let mut write = std::pin::pin!(write);
             let mut write_done = false;
             let mut watch_done = false;
@@ -1085,12 +1132,18 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         };
         let head = response_head(status, headers, extra, framing, true, None);
         let idle = self.limits.body_idle_timeout;
+        let opts = WriteOpts {
+            framing,
+            idle,
+            body_idle: idle,
+            limits: &self.limits,
+            flags: &self.flags,
+        };
         let r = write_message(
             &mut self.w,
             head,
             Body::from_bytes(body),
-            framing,
-            (idle, idle),
+            &opts,
             &AtomicBool::new(false),
         )
         .await;

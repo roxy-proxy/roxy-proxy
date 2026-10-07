@@ -199,13 +199,17 @@ pub enum TlsVersion {
 
 /// Strictness knobs for client-side HTTP parsing. All default to the
 /// strict setting (`enable_h2` defaults to true: it is a capability, and the
-/// h2 path is as strict as h1), plus how roxy handles content codings.
+/// h2 path is as strict as h1; `allow_response_trailers` defaults to true:
+/// response trailers come from the origin and get past no rule), plus how
+/// roxy handles content codings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Http {
     pub allow_http10: bool,
-    pub allow_trailers: bool,
+    pub allow_request_trailers: bool,
+    /// Default true.
+    pub allow_response_trailers: bool,
     pub allow_chunk_extensions: bool,
     pub allow_plain_in_connect: bool,
     pub allow_obs_text: bool,
@@ -223,7 +227,8 @@ impl Default for Http {
     fn default() -> Self {
         Self {
             allow_http10: false,
-            allow_trailers: false,
+            allow_request_trailers: false,
+            allow_response_trailers: true,
             allow_chunk_extensions: false,
             allow_plain_in_connect: false,
             allow_obs_text: false,

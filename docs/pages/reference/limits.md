@@ -17,6 +17,7 @@ accept and the upstream connect produces a deny response or a closed socket
 | body to sign over `max_sign_body_bytes` | `413`, `_sign`, `sign_body_too_large` |
 | buffer budget cannot cover the exchange's inspection, signing or WebSocket buffers | deny, `_fail_closed`, `buffer_budget_exhausted`; an observer's copy is cut instead (`observer_lagged`) |
 | body or header limit exceeded mid-stream | close both sides |
+| request trailers without `http.allow_request_trailers`, or a forbidden field in a trailer section | request: `400` and close, or a stream reset, `parse_error` reason `trailers`; response: body cut, `response_error` ([trailers](/reference/http#trailers)) |
 | upstream DNS, connect or TLS failure | `502`, `upstream_error` |
 | upstream connect, TLS handshake or response-header timeout | `504`, `upstream_error`, reason `timeout` |
 | address floor | `403`, `_address_policy` |

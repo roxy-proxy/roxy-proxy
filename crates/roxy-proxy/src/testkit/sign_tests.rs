@@ -14,6 +14,7 @@ use roxy_http::{
     Version,
 };
 use roxy_rules::{AwsSigV4, Credential};
+use tokio::io::AsyncWriteExt as _;
 
 use super::upstream::Seen;
 use super::{Answer, Kit, streaming_body};
@@ -375,6 +376,42 @@ fn resign(seen: &Seen, host: &str, spec: &AwsSigV4) -> String {
 /// Over h2 AWS takes `host` from `:authority`, so the signature must cover
 /// the authority roxy sends there: recomputing it from what the upstream
 /// received, with `:authority` as `host`, gives the same `authorization`.
+/// A chunked request with trailers is buffered for the payload hash and
+/// goes on signed, with its trailers after the body: the signature covers
+/// the head and the body, not the trailers.
+#[tokio::test]
+async fn a_signed_request_keeps_its_trailers() {
+    let kit = signing("s3", "")
+        .flags(|f| f.allow_request_trailers = true)
+        .start()
+        .await;
+    let mut io = super::http_tests::h1_in_tunnel(&kit).await;
+    io.write_all(&super::http_tests::trailered("/model/invoke"))
+        .await
+        .unwrap();
+    let (head, _) = super::read_response(&mut io).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].version, http::Version::HTTP_2);
+    assert_eq!(seen[0].body, b"abc");
+    let auth = seen[0].headers["authorization"].to_str().unwrap();
+    assert!(
+        auth.starts_with(&format!("AWS4-HMAC-SHA256 Credential={AKID}/")),
+        "{auth}"
+    );
+    assert_eq!(
+        seen[0].headers["x-amz-content-sha256"],
+        super::sha256_hex(b"abc"),
+        "{:?}",
+        seen[0].headers
+    );
+    let trailers = seen[0]
+        .trailers
+        .as_ref()
+        .unwrap_or_else(|| panic!("{:?}", seen[0]));
+    assert_eq!(trailers["x-checksum"], "abc");
+}
+
 #[tokio::test]
 async fn an_h2_signature_covers_the_authority() {
     let kit = signing("bedrock", "").start().await;

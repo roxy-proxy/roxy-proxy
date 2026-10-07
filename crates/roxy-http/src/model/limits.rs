@@ -77,21 +77,40 @@ impl Default for Limits {
 }
 
 /// The `http.*` strictness flags the codec reads. Every one defaults to
-/// the strict setting (off).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// the strict setting (off), except `allow_response_trailers`: response
+/// trailers come from the origin and get past no rule, and gRPC puts the
+/// call's outcome in them.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct HttpFlags {
     /// Accept `HTTP/1.0` request lines.
     pub allow_http10: bool,
-    /// Accept chunked trailer sections. They are forwarded to an HTTP/2
-    /// upstream; a request that carries them to an HTTP/1.1 upstream is
-    /// refused, since HTTP/1.1 cannot carry them without naming them up
-    /// front.
-    pub allow_trailers: bool,
+    /// Accept a trailer section on a request (HTTP/2 trailers, or a
+    /// chunked trailer section). They are forwarded to an HTTP/2 upstream;
+    /// a request that carries them to an HTTP/1.1 upstream is refused,
+    /// since HTTP/1.1 cannot carry them without naming them up front.
+    pub allow_request_trailers: bool,
+    /// Forward response trailers to the client: as HTTP/2 trailers, or as
+    /// a chunked trailer section where the response is chunked. Default
+    /// true.
+    pub allow_response_trailers: bool,
     /// Accept (and discard) chunk extensions.
     pub allow_chunk_extensions: bool,
     /// Accept obs-text (bytes `0x80..=0xFF`) in header values.
     pub allow_obs_text: bool,
     /// Accept a body on GET/HEAD/DELETE/OPTIONS/TRACE.
     pub allow_body_on_get: bool,
+}
+
+impl Default for HttpFlags {
+    fn default() -> Self {
+        Self {
+            allow_http10: false,
+            allow_request_trailers: false,
+            allow_response_trailers: true,
+            allow_chunk_extensions: false,
+            allow_obs_text: false,
+            allow_body_on_get: false,
+        }
+    }
 }

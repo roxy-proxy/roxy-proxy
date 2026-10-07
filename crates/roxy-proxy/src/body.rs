@@ -266,7 +266,8 @@ impl http_body::Body for Chain {
 #[derive(Debug)]
 pub(crate) enum Collected {
     /// The whole body, at most `cap` bytes. The original body is now an
-    /// equivalent `Body::from_bytes`.
+    /// equivalent in-memory body: these bytes, then any trailers it ended
+    /// with.
     Complete(Bytes),
     /// More than `cap` bytes. Nothing was lost: the original body was
     /// replaced by the bytes read so far chained with the unread rest.
@@ -300,22 +301,22 @@ pub(crate) async fn collect_prefix_metered(
         return Collected::TooLarge;
     }
     let mut buf = BytesMut::new();
+    let mut trailers = None;
     loop {
         let frame = poll_fn(|cx| http_body::Body::poll_frame(Pin::new(&mut *body), cx)).await;
         match frame {
             None => {
                 let b = buf.freeze();
-                *body = Body::from_bytes(b.clone());
+                *body = Body::from_parts(b.clone(), trailers);
                 return Collected::Complete(b);
             }
             Some(Err(e)) => {
                 *body = Body::wrap_native(ErrorBody(Some(e.clone())), u64::MAX, None);
                 return Collected::Failed(e);
             }
-            Some(Ok(f)) => {
-                // Trailers are dropped, as `Body::collect_up_to` does; roxy
-                // only accepts them with `http.allow_trailers`.
-                if let Ok(d) = f.into_data() {
+            Some(Ok(f)) => match f.into_data() {
+                Err(f) => trailers = f.into_trailers().ok().or(trailers),
+                Ok(d) => {
                     buf.extend_from_slice(&d);
                     let held = buf.len() as u64;
                     let stop = if held > cap {
@@ -338,7 +339,7 @@ pub(crate) async fn collect_prefix_metered(
                         return stop;
                     }
                 }
-            }
+            },
         }
     }
 }
@@ -478,6 +479,26 @@ mod tests {
         let mut b = Body::from_bytes("abc");
         assert!(matches!(collect_prefix(&mut b, 10).await, Collected::Complete(x) if x == "abc"));
         assert_eq!(drain(b).await.unwrap(), b"abc");
+    }
+
+    /// The rebuilt body ends with the trailers the original did.
+    #[tokio::test]
+    async fn collected_body_keeps_its_trailers() {
+        let (mut tx, mut b) = Body::channel(1 << 20, None);
+        tx.send_data(Bytes::from_static(b"abc")).await.unwrap();
+        let mut t = http::HeaderMap::new();
+        t.insert("grpc-status", http::HeaderValue::from_static("0"));
+        tx.send_trailers(t).await.unwrap();
+        tx.finish().await.unwrap();
+        assert!(matches!(collect_prefix(&mut b, 10).await, Collected::Complete(x) if x == "abc"));
+        assert_eq!(b.as_bytes().unwrap(), "abc");
+        let mut frames = Vec::new();
+        while let Some(f) = poll_fn(|cx| http_body::Body::poll_frame(Pin::new(&mut b), cx)).await {
+            frames.push(f.unwrap());
+        }
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert_eq!(frames[0].data_ref().unwrap(), "abc");
+        assert_eq!(frames[1].trailers_ref().unwrap()["grpc-status"], "0");
     }
 
     #[tokio::test]

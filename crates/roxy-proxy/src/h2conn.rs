@@ -40,7 +40,7 @@ use http_body::Frame;
 use roxy_http::h2map::{from_h2_parts, to_h2_response, validate_h2_trailers};
 use roxy_http::{
     Authority, Body, BodyError, CanonicalResponse, DriveError, HttpFlags, Limits, Method,
-    ParseError, Reason, WriteError, is_reserved, status_forbids_body,
+    ParseError, Reason, WriteError, status_forbids_body, validate_response_trailers,
 };
 use tokio::task::JoinSet;
 use tokio::time::{Instant, Sleep, sleep, sleep_until, timeout};
@@ -279,7 +279,8 @@ async fn serve_stream(
         method: &method,
         idle: limits.body_idle_timeout,
         body_idle: limits.response_body_idle_timeout,
-        allow_trailers: flags.allow_trailers,
+        limits,
+        flags,
     };
     let answer = match outcome {
         Outcome::Respond(res) => Answer::Response(res),
@@ -316,18 +317,19 @@ async fn serve_stream(
 
 /// Response-writing parameters for one stream: the client's flow-control
 /// window must open within `idle`, the body must yield its next frame
-/// within `body_idle`.
+/// within `body_idle`; `flags` and `limits` decide whether trailers go out.
 struct Out<'a> {
     method: &'a Method,
     idle: Duration,
     body_idle: Duration,
-    allow_trailers: bool,
+    limits: &'a Limits,
+    flags: &'a HttpFlags,
 }
 
 /// Writes `res` on the stream: head, then the body as DATA frames within
 /// the peer's flow-control window, then trailers (only with
-/// `http.allow_trailers`). A body that fails resets the stream, so the
-/// client never sees a truncated body as complete.
+/// `http.allow_response_trailers`). A body that fails resets the stream, so
+/// the client never sees a truncated body as complete.
 async fn write_response(
     respond: &mut SendResponse<Bytes>,
     res: CanonicalResponse,
@@ -341,7 +343,7 @@ async fn write_response(
     let bodiless = status_forbids_body(res.status)
         || *out.method == Method::Head
         || (res.body.known_length() == Some(0)
-            && (!out.allow_trailers || http_body::Body::is_end_stream(&res.body)));
+            && (!out.flags.allow_response_trailers || http_body::Body::is_end_stream(&res.body)));
     let mut body = res.body;
     if bodiless {
         respond
@@ -465,15 +467,15 @@ async fn stream_body(
                 }
             }
             Err(frame) => {
-                if let Ok(trailers) = frame.into_trailers()
-                    && out.allow_trailers
-                {
-                    let mut t = http::HeaderMap::new();
-                    for (n, v) in &trailers {
-                        if !is_reserved(n.as_str()) {
-                            t.append(n.clone(), v.clone());
-                        }
-                    }
+                let Ok(trailers) = frame.into_trailers() else {
+                    continue;
+                };
+                // A forbidden field fails the body: the stream is reset
+                // rather than ended with trailers the client may merge into
+                // the headers.
+                let checked = validate_response_trailers(&trailers, out.limits, out.flags)
+                    .map_err(|e| WriteFailure::Io(format!("response trailers: {e}")))?;
+                if let Some(t) = checked {
                     send.send_trailers(t).map_err(|e| stream_error(&e))?;
                     return Ok(());
                 }
@@ -631,7 +633,8 @@ impl Front for H2Front {
 /// released as each DATA frame is handed on (so the client can only get as
 /// far ahead as the windows allow: backpressure), the stream must make
 /// progress within `body_idle_timeout` of the consumer waiting for it, and
-/// trailers are refused unless `http.allow_trailers` (then validated).
+/// trailers are refused unless `http.allow_request_trailers` (then
+/// validated).
 ///
 /// The idle deadline is armed when a poll finds nothing and cleared by the
 /// frame that ends the wait, so the time roxy itself spends before reading

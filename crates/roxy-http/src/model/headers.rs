@@ -43,7 +43,7 @@ pub struct Headers {
     entries: Vec<(HeaderName, HeaderValue)>,
 }
 
-/// Trailer fields never accepted even with `http.allow_trailers`: fields
+/// Trailer fields never accepted even where trailers are allowed: fields
 /// that frame, route or authenticate the message, or describe the content a
 /// recipient has already started processing (RFC 9110 §6.5.1), plus every
 /// [`RESERVED`] name.
@@ -59,6 +59,39 @@ const FORBIDDEN_TRAILERS: &[&str] = &[
 /// Whether `name` (lower-case) may not appear in a trailer section.
 pub fn is_forbidden_trailer(name: &str) -> bool {
     is_reserved(name) || FORBIDDEN_TRAILERS.contains(&name) || name.starts_with("content-")
+}
+
+/// The field rules every allowed trailer section meets: at most
+/// `limits.max_headers` fields, none of them forbidden.
+pub fn check_trailer_fields(trailers: &HeaderMap, limits: &Limits) -> Result<(), ParseError> {
+    if trailers.len() > limits.max_headers {
+        return reject(Reason::TooManyHeaders, "too many trailer fields");
+    }
+    for name in trailers.keys() {
+        let n = name.as_str();
+        if is_forbidden_trailer(n) {
+            return reject(Reason::Trailers, format!("{n} not allowed in trailers"));
+        }
+    }
+    Ok(())
+}
+
+/// Validates a response trailer section as it is about to be written to
+/// the client. `Ok(None)` when `http.allow_response_trailers` is off: the
+/// trailers are dropped and the body ends after its data. With it, the
+/// field rules of [`check_trailer_fields`] apply; a section that breaks
+/// them fails the body, so the client never sees it complete. Values are
+/// hyper's, already valid (obs-text allowed, as for response headers).
+pub fn validate_response_trailers(
+    trailers: &HeaderMap,
+    limits: &Limits,
+    flags: &HttpFlags,
+) -> Result<Option<HeaderMap>, ParseError> {
+    if !flags.allow_response_trailers {
+        return Ok(None);
+    }
+    check_trailer_fields(trailers, limits)?;
+    Ok(Some(trailers.clone()))
 }
 
 fn check_name(name: &[u8]) -> Result<(), ParseError> {

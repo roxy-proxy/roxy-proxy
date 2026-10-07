@@ -8,10 +8,11 @@ use roxy_http::{HttpFlags, Limits, Scheme, TargetForm, Version};
 pub fn flags(cfg: u8) -> HttpFlags {
     HttpFlags {
         allow_http10: cfg & 1 != 0,
-        allow_trailers: cfg & 2 != 0,
+        allow_request_trailers: cfg & 2 != 0,
         allow_chunk_extensions: cfg & 4 != 0,
         allow_obs_text: cfg & 8 != 0,
         allow_body_on_get: cfg & 16 != 0,
+        ..HttpFlags::default()
     }
 }
 

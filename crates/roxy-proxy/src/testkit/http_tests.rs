@@ -407,7 +407,7 @@ async fn h1_request_body_cap_closes_mid_stream() {
 }
 
 /// A chunked request for `target` with trailers, as the client sends it.
-fn trailered(target: &str) -> Vec<u8> {
+pub(super) fn trailered(target: &str) -> Vec<u8> {
     format!(
         "POST {target} HTTP/1.1\r\nhost: up.test\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nx-checksum: abc\r\n\r\n"
     )
@@ -415,19 +415,21 @@ fn trailered(target: &str) -> Vec<u8> {
 }
 
 /// An HTTP/1.1 client inside a `CONNECT up.test:443` tunnel.
-async fn h1_in_tunnel(kit: &Kit) -> tokio_rustls::client::TlsStream<tokio::io::DuplexStream> {
+pub(super) async fn h1_in_tunnel(
+    kit: &Kit,
+) -> tokio_rustls::client::TlsStream<tokio::io::DuplexStream> {
     let io = kit.connect_tunnel("up.test", 443).await;
     kit.tls_connect(io, "up.test", &[b"http/1.1"])
         .await
         .unwrap()
 }
 
-/// With `http.allow_trailers`, the trailers of a chunked request reach an
-/// h2 upstream as trailers.
+/// With `http.allow_request_trailers`, the trailers of a chunked request
+/// reach an h2 upstream as trailers.
 #[tokio::test]
 async fn request_trailers_reach_an_h2_upstream() {
     let kit = Kit::builder()
-        .flags(|f| f.allow_trailers = true)
+        .flags(|f| f.allow_request_trailers = true)
         .start()
         .await;
     let mut io = h1_in_tunnel(&kit).await;
@@ -465,7 +467,7 @@ where
 #[tokio::test]
 async fn request_trailers_to_an_h1_tls_upstream_are_refused() {
     let kit = Kit::builder()
-        .flags(|f| f.allow_trailers = true)
+        .flags(|f| f.allow_request_trailers = true)
         .start()
         .await;
     kit.upstream.h1_only();
@@ -477,10 +479,259 @@ async fn request_trailers_to_an_h1_tls_upstream_are_refused() {
 #[tokio::test]
 async fn request_trailers_to_a_plaintext_upstream_are_refused() {
     let kit = Kit::builder()
-        .flags(|f| f.allow_trailers = true)
+        .flags(|f| f.allow_request_trailers = true)
         .start()
         .await;
     trailers_refused(&kit, kit.connect(), "http://up.test/t").await;
+}
+
+/// One h2 exchange with `up.test`, read whole: the response head, body and
+/// trailers. The request body and trailers go out as given.
+pub(super) async fn h2_exchange(
+    send: &h2::client::SendRequest<Bytes>,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+    trailers: Option<http::HeaderMap>,
+) -> Result<(http::response::Parts, Bytes, Option<http::HeaderMap>), h2::Error> {
+    let mut b = http::Request::builder()
+        .method(method)
+        .uri(format!("https://up.test{path}"));
+    for (n, v) in headers {
+        b = b.header(*n, *v);
+    }
+    let req = b.body(()).unwrap();
+    let mut ready = send.clone().ready().await?;
+    let end = body.is_empty() && trailers.is_none();
+    let (resp, mut stream) = ready.send_request(req, end)?;
+    if !end {
+        stream.send_data(Bytes::copy_from_slice(body), trailers.is_none())?;
+        if let Some(t) = trailers {
+            stream.send_trailers(t)?;
+        }
+    }
+    let resp = tokio::time::timeout(Duration::from_secs(10), resp)
+        .await
+        .expect("timed out waiting for an h2 response")?;
+    let (parts, mut body) = resp.into_parts();
+    let mut out = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk?;
+        let _ = body.flow_control().release_capacity(chunk.len());
+        out.extend_from_slice(&chunk);
+    }
+    let trailers = tokio::time::timeout(Duration::from_secs(10), body.trailers())
+        .await
+        .expect("timed out waiting for h2 trailers")?;
+    Ok((parts, Bytes::from(out), trailers))
+}
+
+fn trailer(name: &'static str, value: &'static str) -> http::HeaderMap {
+    let mut t = http::HeaderMap::new();
+    t.insert(name, http::HeaderValue::from_static(value));
+    t
+}
+
+/// A gRPC-shaped response (the call's outcome in `grpc-status`) reaches an
+/// h2 client with its trailers under the default flags.
+#[tokio::test]
+async fn grpc_response_trailers_reach_an_h2_client_by_default() {
+    let kit = Kit::builder().start().await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let (parts, body, trailers) = h2_exchange(&send, "POST", "/grpc", &[], b"req", None)
+        .await
+        .unwrap();
+    assert_eq!(parts.status, 200);
+    assert_eq!(parts.headers["content-type"], "application/grpc");
+    assert!(!parts.headers.contains_key("content-length"));
+    assert_eq!(body, "hello");
+    let trailers = trailers.expect("the trailers are delivered");
+    assert_eq!(trailers["grpc-status"], "0");
+    assert_eq!(trailers["grpc-message"], "OK");
+}
+
+/// With `http.allow_response_trailers: false` the body ends after its
+/// data and the client sees no trailers.
+#[tokio::test]
+async fn response_trailers_are_dropped_when_not_allowed() {
+    let kit = Kit::builder()
+        .flags(|f| f.allow_response_trailers = false)
+        .start()
+        .await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let (parts, body, trailers) = h2_exchange(&send, "GET", "/grpc", &[], b"", None)
+        .await
+        .unwrap();
+    assert_eq!(parts.status, 200);
+    assert_eq!(body, "hello");
+    assert_eq!(trailers, None);
+}
+
+/// A response trailer section with a forbidden field (one that frames,
+/// routes or authenticates the message) fails the body: the stream is
+/// reset, so the client never sees the response complete.
+#[tokio::test]
+async fn a_forbidden_response_trailer_resets_the_stream() {
+    let kit = Kit::builder().start().await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let err = h2_exchange(
+        &send,
+        "GET",
+        "/grpc",
+        &[("x-forbidden-trailer", "1")],
+        b"",
+        None,
+    )
+    .await
+    .expect_err("the stream is reset before the trailers");
+    assert!(err.is_reset(), "{err}");
+    let ev = kit.events("response_error", 1).await;
+    assert_eq!(ev[0]["reason"], "response_write_failed", "{ev:#?}");
+}
+
+/// On HTTP/1.1 the trailers of a chunked response go out as its trailer
+/// section, under the default flags.
+#[tokio::test]
+async fn response_trailers_reach_an_h1_client_as_chunked_trailers() {
+    let kit = Kit::builder().start().await;
+    let mut io = h1_in_tunnel(&kit).await;
+    io.write_all(b"GET /grpc HTTP/1.1\r\nhost: up.test\r\nconnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let (out, _) = super::read_to_eof(&mut io).await;
+    let out = String::from_utf8_lossy(&out);
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert!(out.contains("\r\ntransfer-encoding: chunked\r\n"), "{out}");
+    assert!(
+        out.ends_with("\r\n5\r\nhello\r\n0\r\ngrpc-status: 0\r\ngrpc-message: OK\r\n\r\n"),
+        "{out}"
+    );
+}
+
+/// An h2 request that carries trailers is reset under the default flags
+/// (`parse_error`, reason `trailers`); the upstream never sees the body
+/// complete.
+#[tokio::test]
+async fn h2_request_trailers_are_reset_by_default() {
+    let kit = Kit::builder().start().await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let err = h2_exchange(
+        &send,
+        "POST",
+        "/t",
+        &[],
+        b"abc",
+        Some(trailer("x-checksum", "abc")),
+    )
+    .await
+    .expect_err("the stream is reset");
+    assert!(err.is_reset(), "{err}");
+    let ev = kit.events("parse_error", 1).await;
+    assert_eq!(ev[0]["reason"], "trailers", "{ev:#?}");
+    let seen = kit.upstream.seen();
+    assert!(seen.iter().all(|s| s.complete != Some(true)), "{seen:#?}");
+}
+
+/// Rules that read the body, so the exchange buffers it in both directions.
+const BODY_RULES: &str = r#"
+- id: no-secret-out
+  when: host == "up.test" and body.text contains "SECRET"
+  then: deny
+- id: no-secret-in
+  when: host == "up.test" and response.body.text contains "SECRET"
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+
+/// A response a rule buffers to read keeps its trailers: the h2 client
+/// gets `grpc-status` after the body, and an h1 client gets the chunked
+/// trailer section.
+#[tokio::test]
+async fn an_inspected_response_keeps_its_trailers() {
+    let kit = Kit::builder().rules(BODY_RULES).start().await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let (parts, body, trailers) = h2_exchange(&send, "GET", "/grpc", &[], b"", None)
+        .await
+        .unwrap();
+    assert_eq!(parts.status, 200);
+    assert_eq!(body, "hello");
+    let trailers = trailers.expect("the trailers are delivered");
+    assert_eq!(trailers["grpc-status"], "0");
+
+    let mut io = h1_in_tunnel(&kit).await;
+    io.write_all(b"GET /grpc HTTP/1.1\r\nhost: up.test\r\nconnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let (out, _) = super::read_to_eof(&mut io).await;
+    let out = String::from_utf8_lossy(&out);
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    assert!(
+        out.ends_with("\r\n5\r\nhello\r\n0\r\ngrpc-status: 0\r\ngrpc-message: OK\r\n\r\n"),
+        "{out}"
+    );
+}
+
+/// A request a rule buffers to read keeps its trailers on the way to the
+/// h2 upstream.
+#[tokio::test]
+async fn an_inspected_request_keeps_its_trailers() {
+    let kit = Kit::builder()
+        .rules(BODY_RULES)
+        .flags(|f| f.allow_request_trailers = true)
+        .start()
+        .await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let (parts, _, _) = h2_exchange(
+        &send,
+        "POST",
+        "/t",
+        &[],
+        b"abc",
+        Some(trailer("x-checksum", "abc")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(parts.status, 200);
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].body, b"abc");
+    let trailers = seen[0]
+        .trailers
+        .as_ref()
+        .unwrap_or_else(|| panic!("{:?}", seen[0]));
+    assert_eq!(trailers["x-checksum"], "abc");
+}
+
+/// With `http.allow_request_trailers`, the same request passes and its
+/// trailers reach the h2 upstream.
+#[tokio::test]
+async fn h2_request_trailers_pass_when_allowed() {
+    let kit = Kit::builder()
+        .flags(|f| f.allow_request_trailers = true)
+        .start()
+        .await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let (parts, _, _) = h2_exchange(
+        &send,
+        "POST",
+        "/t",
+        &[],
+        b"abc",
+        Some(trailer("x-checksum", "abc")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(parts.status, 200);
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].version, http::Version::HTTP_2);
+    assert_eq!(seen[0].body, b"abc");
+    let trailers = seen[0]
+        .trailers
+        .as_ref()
+        .unwrap_or_else(|| panic!("{:?}", seen[0]));
+    assert_eq!(trailers["x-checksum"], "abc");
 }
 
 /// An h2 upstream gets the authority as `:authority` alone: a `host`
@@ -640,14 +891,11 @@ async fn h2_first_stream_must_arrive_within_header_timeout() {
         .unwrap();
 }
 
-/// With `http.allow_trailers`, a response of `content-length: 0` that ends
-/// with trailers delivers them on h2.
+/// A response of `content-length: 0` that ends with trailers delivers them
+/// on h2 under the default flags.
 #[tokio::test]
 async fn h2_response_trailers_follow_an_empty_body() {
-    let kit = Kit::builder()
-        .flags(|f| f.allow_trailers = true)
-        .start()
-        .await;
+    let kit = Kit::builder().start().await;
     let (send, _conn) = super::h2_client(&kit).await;
     let req = http::Request::get("https://up.test/trailers")
         .body(())
