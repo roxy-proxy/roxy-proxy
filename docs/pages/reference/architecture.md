@@ -8,7 +8,7 @@ Dependencies point downward. `roxy` depends on `roxy-proxy`, `roxy-http`,
 `roxy-rules`, `roxy-wasm` and `roxy-tls` on `roxy-http`. `roxy-http`,
 `roxy-log`, `roxy-addon` and `roxy-node` depend on no other roxy crate;
 `roxy-node-spec` is used only by tests. `roxy-http` and `roxy-rules` do no
-network I/O, so they can be unit-tested and fuzzed directly.
+network I/O, so they are unit-tested and fuzzed directly.
 
 | crate | responsibility |
 |---|---|
@@ -26,7 +26,7 @@ network I/O, so they can be unit-tested and fuzzed directly.
 
 `unsafe` is forbidden in every crate except the generated bindings modules
 of `roxy-wasm` and `roxy-addon` (`wit-bindgen` and `wasmtime::bindgen!`
-output), which allow it.
+output).
 
 ## Glossary
 
