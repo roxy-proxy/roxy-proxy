@@ -279,10 +279,22 @@ fn null_comparison(
         ));
     }
     match field {
-        Typed::Field(a, _) => Ok(Some(Pred::IsNull {
-            op: ROperand::Get(a.clone()),
-            negate: op == Op::Ne,
-        })),
+        Typed::Field(a, span) => {
+            if let Some(why) = a.never_null() {
+                return Err(ExprError::new(
+                    *span,
+                    format!(
+                        "`{}` is never null ({why}), so comparing it with `null` is always the \
+                         same answer; remove it",
+                        a.display_name()
+                    ),
+                ));
+            }
+            Ok(Some(Pred::IsNull {
+                op: ROperand::Get(a.clone()),
+                negate: op == Op::Ne,
+            }))
+        }
         Typed::Lit(lit) => Err(ExprError::new(
             lit.span,
             format!(
@@ -1039,6 +1051,13 @@ fn under_suffix(span: Span, domain: &str) -> Result<Box<str>, ExprError> {
                 "write the domain without a leading dot: `under {:?}`",
                 d.trim_start_matches('.')
             ),
+        ));
+    }
+    // Hosts arrive without empty labels, so a domain with one never matches.
+    if d.split('.').any(str::is_empty) {
+        return Err(ExprError::new(
+            span,
+            format!("domain {domain:?} has an empty label (`..`), which no host has"),
         ));
     }
     Ok(d.to_ascii_lowercase().into())

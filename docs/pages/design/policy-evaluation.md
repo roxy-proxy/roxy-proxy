@@ -56,21 +56,25 @@ runs follows from what it reads.
    matches.
 5. **Order matters for effects, not decisions.** Rules are evaluated top to
    bottom. If the request is allowed, the effects of every matching rule
-   apply in list order; if two set the same header, the later wins. If it
-   is denied, or a change to it fails (which denies it with
-   `_fail_closed`, reason `effect_invalid`), the `log` and `set_state`
-   effects of the matching rules still apply, and the request's metric
-   samples count it as denied. Allow options (`upgrade`, `private_ok`)
-   come from the first matching allow only. The flow log names the first
-   matching deny (or allow) as `terminal_rule`.
+   apply in list order; if two set the same header, the later wins. A deny
+   does not cut evaluation short, at the head or while watching: every
+   rule the pass checks still runs. If the request is denied, or a change
+   to it fails (which denies it with `_fail_closed`, reason
+   `effect_invalid`), the `log` and `set_state` effects of the matching
+   rules still apply, and the request's metric samples count it as denied.
+   Allow options (`upgrade`, `private_ok`) come from the first matching
+   allow only. The flow log names the first matching deny (or allow) as
+   `terminal_rule`.
 6. **A tag is visible to the rules below the rule that set it.** A rule
    that reads a tag must come after every rule that sets it (a head rule
    above it, or, for a watching rule, any head rule); otherwise the config
    is rejected, since moving a rule would change what it sees. A tag set
    by a watching rule can be read by no other rule: watching rules fire
    when the values they read arrive, not in list order, so whether the tag
-   was visible would depend on timing. A rule may read its own tag, and a
-   tag no rule sets (from an addon).
+   was visible would depend on timing. A deny that reads a byte metric can
+   fire while watching too, so a watching rule cannot read its tag; a head
+   rule below it can. A rule may read its own tag, and a tag no rule sets
+   (from an addon).
 
 `roxy check` and `roxy rule test` report whether each rule is decided at the
 head or watches.
@@ -78,6 +82,8 @@ head or watches.
 **Unavailable inputs fail closed.** If a rule needs a metric value, an
 address-list lookup or a secret and it is unavailable (store overloaded,
 table full, list failed to load), the flow is denied with `503`,
-`terminal_rule: _fail_closed`, and a `policy_input_unavailable` event. A
-field that is simply absent, like an unsent header, is not unavailable: it
-is `null` ([missing values](/reference/rule-language#missing-values-null)).
+`terminal_rule: _fail_closed`, and a `policy_input_unavailable` event. So
+is a field whose value is not of its documented type (reason `wrong_type`):
+that is a bug in roxy, and a predicate over it has no answer. A field that
+is simply absent, like an unsent header, is not unavailable: it is `null`
+([missing values](/reference/rule-language#missing-values-null)).

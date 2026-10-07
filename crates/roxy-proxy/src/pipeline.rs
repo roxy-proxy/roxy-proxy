@@ -923,6 +923,7 @@ pub(crate) fn fail_closed_code(
         FailClosedReason::UnsupportedContentEncoding { .. } => "unsupported_content_encoding",
         FailClosedReason::BodyDecodeFailed { .. } => "body_decode_failed",
         FailClosedReason::MissingValue(_) => "missing_value",
+        FailClosedReason::WrongType { .. } => "wrong_type",
     }
 }
 

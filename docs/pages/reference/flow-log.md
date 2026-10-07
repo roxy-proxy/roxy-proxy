@@ -36,7 +36,7 @@ produces a `request` event:
 
 | `terminal_rule` | `reason` |
 |---|---|
-| `_fail_closed` | `metric_unavailable`, `metric_key_unavailable`, `metric_table_full`, `address_list_unavailable`, `secret_missing`, `secret_invalid`, `body_too_large_to_inspect`, `body_unavailable`, `buffer_budget_exhausted`, `unsupported_content_encoding`, `body_decode_failed`, `missing_value`, `effect_invalid`, `unsupported_effect`, `state_unavailable`, `capture_unavailable`, `sign_conflict`, `watch_missing`, `watch_stopped` |
+| `_fail_closed` | `metric_unavailable`, `metric_key_unavailable`, `metric_table_full`, `address_list_unavailable`, `secret_missing`, `secret_invalid`, `body_too_large_to_inspect`, `body_unavailable`, `buffer_budget_exhausted`, `unsupported_content_encoding`, `body_decode_failed`, `missing_value`, `wrong_type`, `effect_invalid`, `unsupported_effect`, `state_unavailable`, `capture_unavailable`, `sign_conflict`, `watch_missing`, `watch_stopped` |
 | `_address_policy` | `address_policy` |
 | `_expired` | `policy_expired` ([lease](/guides/operations#lease)) |
 | `_sign` | `sign_body_too_large`, `sign_header_invalid` ([signing AWS requests](/reference/secrets#signing-aws-requests)) |

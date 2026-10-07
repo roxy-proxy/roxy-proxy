@@ -322,6 +322,43 @@ async fn a_response_rule_replaces_an_upstream_5xx() {
     assert_eq!(ev["terminal_rule"], "hide-5xx");
 }
 
+/// A watching deny stops the exchange without cutting the pass short: a
+/// watching rule below it that the same event triggers still runs, and its
+/// `log` effect reaches the flow log, as a head deny's would.
+#[tokio::test]
+async fn a_watching_deny_keeps_the_log_of_the_rule_below_it() {
+    let kit = Kit::builder()
+        .rules(
+            r#"
+- id: up
+  when: host == "up.test"
+  then: allow
+- id: hide-5xx
+  when: response.status >= 500
+  then: { deny: { status: 502, message: "upstream failure hidden" } }
+- id: note-5xx
+  when: response.status >= 500
+  then: { log: { level: warn, message: "upstream 5xx" } }
+"#,
+        )
+        .start()
+        .await;
+    let a = kit
+        .h1()
+        .await
+        .call("GET", "/echo", &[("x-echo-status", "500")], b"")
+        .await;
+    assert_eq!(a.status, 502, "{a:?}");
+    assert_eq!(a.headers["x-roxy-rule"], "hide-5xx");
+    let log = kit.events("log", 1).await;
+    assert_eq!(log[0]["message"], "upstream 5xx", "{log:#?}");
+    assert_eq!(log[0]["stage"], "response_head", "{log:#?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "hide-5xx", "{ev:#}");
+    let rules = ev["rules"].as_array().unwrap();
+    assert!(rules.contains(&"note-5xx".into()), "{ev:#}");
+}
+
 // ---- the address floor and address lists ----------------------------------
 
 /// Without `private_ok` the floor refuses a private address however it is

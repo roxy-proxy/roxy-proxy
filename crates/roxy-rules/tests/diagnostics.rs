@@ -26,6 +26,16 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: a, when: 'host under 443', then: allow }",
     ),
     (
+        "under with an empty label",
+        "",
+        "- { id: a, when: 'host under \"example.com..\"', then: allow }\n- { id: b, when: 'host under \"a..b\"', then: allow }",
+    ),
+    (
+        "null compared with a field that is never null",
+        METRICS,
+        "- { id: a, when: 'tag[\"x\"] == null', then: allow }\n- { id: b, when: 'metric.writes != null', then: allow }\n- { id: c, when: 'null != body.text', then: allow }",
+    ),
+    (
         "ordering on strings",
         "",
         "- { id: a, when: 'path < 5', then: allow }",
@@ -106,6 +116,16 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: a, then: { log: { message: \"${secret:gh}\" } } }",
     ),
     (
+        "secret in a when expression",
+        "",
+        "- { id: a, when: 'header[\"authorization\"] == \"Bearer ${secret:gh}\"', then: allow }\n- { id: b, when: 'state[\"${secret:gh}\"] == \"x\"', then: allow }\n- { id: c, when: 'path in [\"/a\", \"${secret:nope\"]', then: allow }",
+    ),
+    (
+        "secret in a metric where",
+        "- { id: t, count: requests, where: 'path == \"${secret:gh}\"' }",
+        "[]",
+    ),
+    (
         "sign unsigned_payload outside S3",
         "",
         "- { id: a, then: [{ sign: { aws_sigv4: { service: bedrock, region: eu-west-2, access_key_id: \"${secret:openai}\", secret_access_key: \"${secret:gh}\", unsigned_payload: true } } }, allow] }",
@@ -144,6 +164,11 @@ const CASES: &[(&str, &str, &str)] = &[
         "tag read by a watching rule but set by a watching rule above it",
         "",
         "- { id: big, when: 'body.bytes > 10', then: [{ tag: big }] }\n- { id: cap, when: 'tag[\"big\"] and response.body.bytes > 1mb', then: deny }",
+    ),
+    (
+        "tag read by a watching rule but set by a deny watching a byte metric",
+        METRICS,
+        "- { id: budget, when: 'metric.egress > 1mb', then: [{ tag: over }, deny] }\n- { id: note, when: 'tag[\"over\"] and response.body.bytes > 0', then: { log: { message: over } } }",
     ),
     (
         "rewrite_path group references",

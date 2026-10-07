@@ -24,7 +24,9 @@ use crate::eval::{
     Effect, SetHeaderValue, WatchEffect,
 };
 use crate::lexer::is_ident;
-use crate::template::{Part, literal, mentions_secret, parse_template, secret_names};
+use crate::template::{
+    Part, SECRET_PLACES, literal, mentions_secret, parse_template, secret_names,
+};
 use crate::types::{Access, Field, Reads, is_token};
 
 impl Condition {
@@ -458,10 +460,11 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
     /// head, sits above it. Head rules run in list order, so what the
     /// reader sees is then fixed by the config. A watching setter fires
     /// when the values it reads arrive, not in list order, so whether its
-    /// tag is visible would depend on timing. (A deny that watches a byte
-    /// metric counts as head: if it fires later, the exchange stops.) A tag
-    /// no rule sets can only come from an addon, before any rule runs; a
-    /// rule's own tags are set after its own check wherever it sits.
+    /// tag is visible would depend on timing; that includes a deny that
+    /// watches a byte metric, whose tag a watching reader could see only
+    /// when both fire in the same pass. A tag no rule sets can only come
+    /// from an addon, before any rule runs; a rule's own tags are set after
+    /// its own check wherever it sits.
     fn tag_order(&mut self, rules: &[CompiledRule], tag_reads: &[Vec<Box<str>>]) {
         let input = self.input;
         let sets = |i: usize, tag: &str| {
@@ -477,14 +480,21 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                     .filter(|&s| sets(s, tag))
                     .filter_map(|s| {
                         let id = &input.rules[s].id;
+                        let (setter, reader) = (rules[s].shape.kind, rules[r].shape.kind);
                         if s == r {
                             None
-                        } else if !rules[s].shape.kind.at_head() {
+                        } else if !setter.at_head() {
                             Some(format!(
                                 "rules[{s}] ({id:?}), a watching rule, which fires when the \
                                  values it reads arrive rather than in list order"
                             ))
-                        } else if s > r && rules[r].shape.kind.at_head() {
+                        } else if setter.watches() && reader.watches() {
+                            Some(format!(
+                                "rules[{s}] ({id:?}), a deny watching a byte metric, which can \
+                                 fire while this rule watches, when the values it reads arrive \
+                                 rather than in list order"
+                            ))
+                        } else if s > r && reader.at_head() {
                             Some(format!("rules[{s}] ({id:?}), below this rule"))
                         } else {
                             None
@@ -741,14 +751,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             } else {
                 format!("in `{}`", action.name())
             };
-            self.push(
-                rule,
-                apath,
-                format!(
-                    "secret references are only allowed in `set_header` values and the \
-                     credentials of `sign`, not {where_}"
-                ),
-            );
+            self.push(rule, apath, format!("{SECRET_PLACES}, not {where_}"));
         }
     }
 

@@ -375,6 +375,27 @@ impl Access {
         matches!(self, Self::Scalar(f) if f.case_insensitive())
     }
 
+    /// Why this value is never `null`, for an access that always has one:
+    /// the view answers, or the flow fails closed. `None` where `null` is a
+    /// possible value (an unsent header, an unset state key, a scalar field
+    /// the flow does not have).
+    pub(crate) fn never_null(&self) -> Option<&'static str> {
+        match self {
+            Self::Tag(_) => Some("false until set"),
+            Self::Metric(_) => Some("an unavailable metric fails the flow closed"),
+            Self::BodyText | Self::RespBodyText => {
+                Some("an unavailable body fails the flow closed")
+            }
+            Self::Scalar(_)
+            | Self::Header(_)
+            | Self::HeaderAll(_)
+            | Self::RespHeader(_)
+            | Self::RespHeaderAll(_)
+            | Self::Query(_)
+            | Self::State(_) => None,
+        }
+    }
+
     /// Watched values read by this access. Metrics are classified by the
     /// policy compiler (it knows what each metric counts), so they read
     /// [`Reads::NONE`] here.
