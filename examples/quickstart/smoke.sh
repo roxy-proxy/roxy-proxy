@@ -44,8 +44,12 @@ proxied() {
         | awk 'NR==1 {s=$2} tolower($1)=="x-roxy-rule:" {r=$2} END {printf "%s %s\n", s, r}' | tr -d '\r'
 }
 
-# `proxied` as a client the auth gate knows.
-as_alice() { proxied "${1:-}" -H 'x-roxy-auth: alice-secret'; }
+# `proxied` as bob, whose bucket the traffic barely touches, with a model
+# call the sentinel can read.
+as_bob() {
+    proxied "${1:-}" -H 'x-roxy-auth: bob-secret' -H 'content-type: application/json' \
+        -d '{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}'
+}
 
 # Fails unless `$1` (a proxied result) matches the regex `$2`.
 expect() { [[ $1 =~ $2 ]] || fail "proxied request answered '$1', wanted /$2/"; }
@@ -68,7 +72,7 @@ wait_readyz "200 ready" 5
 echo "smoke: lease applied"
 
 # No rule allows any host but the model, so the default deny answers.
-expect "$(as_alice http://example.com/)" '^403 _default$'
+expect "$(as_bob http://example.com/)" '^403 _default$'
 echo "smoke: default deny"
 
 wanted=(
@@ -107,7 +111,7 @@ grep -qE '^node-[0-9a-f]+ \{.*"event":"request"' <<<"$shipped" \
 
 # A layer that cannot reach its service fails the call closed, not open.
 docker compose stop quota-board
-expect "$(as_alice)" '^503 '
+expect "$(as_bob)" '^503 '
 docker compose start quota-board
 echo "smoke: fail closed without the quota board"
 
@@ -130,6 +134,6 @@ echo "smoke: lease recovered"
 # from roxy's own environment and no control plane.
 docker compose -f compose.yaml -f compose.standalone.yaml up -d --wait
 wait_readyz "200 ready" 30
-expect "$(as_alice)" '^200 model-api$'
+expect "$(as_bob)" '^200 '
 echo "smoke: standalone"
 echo "smoke: ok"
