@@ -121,11 +121,11 @@ pub(super) async fn splice_websocket(
             return None;
         }
     }
-    let (c2s, s2c) = splice(client_io, upstream, idle, &watch, taps).await;
+    let (c2s, s2c, closed) = splice(client_io, upstream, idle, &watch, taps).await;
     let r = Relayed {
         c2s: c2s + c2s_extra,
         s2c,
-        closed: None,
+        closed,
     };
     close_spliced(spliced).await;
     finish_websocket(&mut cx, r);
@@ -166,7 +166,7 @@ struct Relay<'a> {
 
 async fn pump<R, W>(
     mut r: R,
-    mut w: W,
+    w: &mut W,
     n: Arc<std::sync::atomic::AtomicU64>,
     last: Arc<std::sync::atomic::AtomicU64>,
     base: Instant,
@@ -219,31 +219,33 @@ async fn pump<R, W>(
 }
 
 /// Copies bytes both ways until either side closes, nothing moves for
-/// `idle`, or a watching rule stops the exchange (then both sides are
-/// dropped, i.e. closed: the relay is byte-level, so a close frame could
-/// land inside a half-written frame). Returns (client→server,
-/// server→client) byte counts.
+/// `idle` (then both sides get a `1001` close frame: after that long a
+/// silence no frame is half-written), or a watching rule stops the
+/// exchange (then both sides are dropped, i.e. closed: the relay is
+/// byte-level, so a close frame could land inside a half-written frame).
+/// Returns (client→server, server→client) byte counts and the close roxy
+/// sent, if any.
 async fn splice(
     client: impl Io,
     upstream: impl Io,
     idle: Duration,
     watch: &Watch,
     taps: PerDir<Option<Tap>>,
-) -> (u64, u64) {
+) -> (u64, u64, Option<FrameError>) {
     use std::sync::atomic::AtomicU64;
     let base = Instant::now();
     let last = Arc::new(AtomicU64::new(0));
     let c2s = Arc::new(AtomicU64::new(0));
     let s2c = Arc::new(AtomicU64::new(0));
-    let (cr, cw) = tokio::io::split(client);
-    let (ur, uw) = tokio::io::split(upstream);
+    let (cr, mut cw) = tokio::io::split(client);
+    let (ur, mut uw) = tokio::io::split(upstream);
     let PerDir {
         request: up_tap,
         response: down_tap,
     } = taps;
     let a = pump(
         cr,
-        uw,
+        &mut uw,
         c2s.clone(),
         last.clone(),
         base,
@@ -255,7 +257,7 @@ async fn splice(
     );
     let b = pump(
         ur,
-        cw,
+        &mut cw,
         s2c.clone(),
         last.clone(),
         base,
@@ -265,15 +267,31 @@ async fn splice(
             tap: down_tap,
         },
     );
-    tokio::select! {
-        () = async { tokio::join!(a, b); } => {}
-        () = idle_watchdog(&last, base, idle) => {}
+    let closed = tokio::select! {
+        () = async { tokio::join!(a, b); } => None,
+        () = idle_watchdog(&last, base, idle) => {
+            let mut to_up = FrameOut::new(&mut uw, Some(Masks::new()));
+            let mut to_client = FrameOut::new(&mut cw, None);
+            tokio::join!(to_up.close(IDLE.code), to_client.close(IDLE.code));
+            Some(IDLE)
+        }
         () = watch.cancelled() => {
             tracing::debug!("websocket relay stopped by policy");
+            None
         }
-    }
-    (c2s.load(Ordering::Relaxed), s2c.load(Ordering::Relaxed))
+    };
+    (
+        c2s.load(Ordering::Relaxed),
+        s2c.load(Ordering::Relaxed),
+        closed,
+    )
 }
+
+/// The close both sides get when nothing has moved for `limits.idle_timeout`.
+const IDLE: FrameError = FrameError {
+    code: close::GOING_AWAY,
+    detail: "idle timeout",
+};
 
 /// Resolves once nothing has moved through a relay for `idle`. `last` is
 /// the time of the latest write, in milliseconds since `base`.
@@ -408,6 +426,9 @@ enum End {
     Broken,
     /// A rule denied a message, or the exchange was stopped.
     Stopped,
+    /// Nothing moved either way for the idle timeout (the relay's end, not
+    /// one direction's).
+    Idle,
     /// The sender broke the protocol.
     Protocol(FrameError),
 }
@@ -511,8 +532,9 @@ struct Relayed {
 /// decoded into whole messages, each message is checked by the rules
 /// reading `ws.*` and then re-encoded as one frame, masked with roxy's own
 /// key toward the upstream. Runs until both sides close, nothing moves for
-/// `idle`, a message breaks the protocol (both sides get its close code) or
-/// a rule stops the exchange (both sides get `1008`).
+/// `idle` (both sides get `1001`), a message breaks the protocol (both
+/// sides get its close code) or a rule stops the exchange (both sides get
+/// `1008`).
 async fn relay_messages(
     client: impl Io,
     upstream: impl Io,
@@ -567,12 +589,14 @@ async fn relay_messages(
             let e = tokio::select! {
                 e = &mut a, if !a_done => { a_done = true; e }
                 e = &mut b, if !b_done => { b_done = true; e }
-                () = &mut watchdog => break End::Broken,
+                () = &mut watchdog => break End::Idle,
                 () = watch.cancelled() => break End::Stopped,
             };
             match e {
                 End::Eof if !(a_done && b_done) => {}
-                e @ (End::Eof | End::Broken | End::Stopped | End::Protocol(_)) => break e,
+                e @ (End::Eof | End::Broken | End::Stopped | End::Idle | End::Protocol(_)) => {
+                    break e;
+                }
             }
         }
     };
@@ -582,6 +606,7 @@ async fn relay_messages(
             detail: "denied by policy",
         }),
         End::Protocol(e) => Some(e),
+        End::Idle => Some(IDLE),
         End::Eof | End::Broken => None,
     };
     match &closed {

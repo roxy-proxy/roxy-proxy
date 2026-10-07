@@ -37,8 +37,9 @@ any rule reads `ws.*`, every message is checked
 - [Addon layers](/reference/addon-configuration#websockets) sit between the
   client and the relay, so message rules and capture see what the layers
   pass on, not what a layer changes on the way to the client.
-- A relayed WebSocket closes after `limits.idle_timeout` (300 s) with no
-  traffic either way.
+- A relayed WebSocket with no traffic either way for `limits.idle_timeout`
+  (300 s) is closed with a `1001` close frame to both sides (`close_reason`
+  `idle timeout`).
 - The flow log gets one `ws_open` (naming the `host`) and one `ws_close`
   with `bytes_c2s` and `bytes_s2c`, plus `close_code` and `close_reason`
   when roxy ended it with a close frame. The exchange's `request` event
