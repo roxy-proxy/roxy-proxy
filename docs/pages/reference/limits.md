@@ -18,7 +18,7 @@ accept and the upstream connect produces a deny response or a closed socket
 | buffer budget cannot cover the exchange's inspection, signing or WebSocket buffers | deny, `_fail_closed`, `buffer_budget_exhausted`; an observer's copy is cut instead (`observer_lagged`) |
 | body or header limit exceeded mid-stream | close both sides |
 | upstream DNS, connect or TLS failure | `502`, `upstream_error` |
-| upstream connect or response-header timeout | `504`, `upstream_error`, reason `timeout` |
+| upstream connect, TLS handshake or response-header timeout | `504`, `upstream_error`, reason `timeout` |
 | address floor | `403`, `_address_policy` |
 | addon trap, budget exceeded or invalid output (enforce mode) | deny, `layer_error`; observe-mode addons only log |
 | config reload fails | keep the old policy |
@@ -26,7 +26,8 @@ accept and the upstream connect produces a deny response or a closed socket
 | flow log or capture behind, or its disk failing | hold traffic until it catches up; never drop records |
 | WebSocket message that breaks the protocol or is over `max_ws_message_bytes`, when rules read messages | close both sides with `1002`, `1007` or `1009` ([WebSockets](/reference/websockets#message-rules)) |
 
-The reason codes appear in the flow log only, never in the deny response
+The policy reason codes appear in the flow log only, never in the deny
+response; a parse error's code is also in its `400` body
 ([deny responses](/reference/http#deny-responses)).
 
 ## Limits
@@ -76,6 +77,13 @@ limits:
 | `response_body_idle_timeout` | the exchange ends (`response_error`, `response_body_timeout`): the connection closes on HTTP/1.1, the stream is reset with `CANCEL` on HTTP/2 |
 | `max_ws_message_bytes` | both sides close with `1009`; applies only when rules read messages ([WebSockets](/reference/websockets#message-rules)) |
 | `max_observer_lag_bytes` | the observer's copy is cut ([addon modes](/design/addon-model#modes)) |
+
+The upstream dial is timed by `upstream.connect_timeout` (10 s), not a
+`limits` key: once for the TCP connect over all of a name's addresses and
+once more for the TLS handshake, so an upstream that accepts the connection
+but never completes TLS is cut after a second `connect_timeout` (`504`,
+`upstream_error`, reason `timeout`, message `upstream TLS handshake`;
+[upstream](/reference/upstream#upstream-tls)).
 
 Addons have their own limits, and fixed caps on what the host holds for a
 guest ([addon safety limits](/reference/addon-safety)).
