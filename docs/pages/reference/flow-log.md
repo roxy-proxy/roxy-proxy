@@ -70,10 +70,12 @@ produces a `request` event:
 
 ### Redaction
 
-Every injected secret value is scrubbed from any logged string. Values of
-`authorization`, `proxy-authorization`, `cookie`, `set-cookie` and
-`x-api-key` are never logged; `log.redact_headers` adds more. Query values
-are redacted.
+Every injected secret value is scrubbed from any logged string, the
+operational log (`tracing`) included: a string is redacted once, with the
+secret generation the exchange loaded, and that one copy goes to every
+sink. Values of `authorization`, `proxy-authorization`, `cookie`,
+`set-cookie` and `x-api-key` are never logged; `log.redact_headers` adds
+more. Query values are redacted.
 
 ### Writing
 
@@ -137,9 +139,10 @@ allowed a chunk. WebSocket relays are captured both ways at the relay next
 to the upstream, not as an addon layer changes them for the client.
 
 Capture is written like the flow log (one writer, batching, rotation,
-backpressure). Injected secret values are scrubbed from captured heads;
-nothing else is: the header-name redaction above is flow-log only, and
-bodies are captured **unredacted**.
+backpressure). Injected secret values are scrubbed from every string of a
+captured head (URL, header names and values); nothing else is: the
+header-name redaction above is flow-log only, and bodies are captured
+**unredacted**.
 
 ```yaml
 capture_dir: /var/lib/roxy/capture   # absent = capture disabled; restart to change

@@ -439,16 +439,18 @@ impl FlowMeta {
                 detail: e.to_string(),
             });
         }
+        let reason = self
+            .secrets()
+            .redactor()
+            .redact_str(&reason.to_string())
+            .into_owned();
         tracing::warn!(flow = %self.flow, stage = stage.as_str(), code, %reason, "policy input unavailable; failing closed");
         self.shared.sink.emit(&FlowEvent::PolicyInputUnavailable {
             ts,
             flow: self.flow.to_string(),
             conn: self.conn_id(),
             stage,
-            reason: format!(
-                "{code}: {}",
-                self.secrets().redactor().redact_str(&reason.to_string())
-            ),
+            reason: format!("{code}: {reason}"),
         });
     }
 
