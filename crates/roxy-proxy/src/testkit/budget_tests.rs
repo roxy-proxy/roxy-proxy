@@ -200,6 +200,45 @@ async fn a_declared_length_reserves_only_that_much() {
     until_buffered(&kit, 0).await;
 }
 
+/// An encoded body is held decoded for the rest of the exchange, and can
+/// decode to anything up to the cap: a small declared length does not
+/// bound what the exchange holds, so the budget charges the decoded size.
+#[tokio::test]
+async fn an_encoded_body_is_charged_at_its_decoded_size() {
+    use std::io::Write as _;
+    let kit = Kit::builder()
+        .rules(BODY_RULES)
+        .limits(|l| {
+            l.max_inspect_body_bytes = CAP;
+            l.max_buffered_bytes = 2 * CAP;
+        })
+        .start()
+        .await;
+    let text = vec![b'a'; 32 * 1024];
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(&text).unwrap();
+    let gz = e.finish().unwrap();
+    assert!(gz.len() < 1024, "{} bytes compressed", gz.len());
+    let mut c = kit.h1().await;
+    let req = c
+        .request(
+            "POST",
+            "/drip?n=2&ms=2000",
+            &[
+                ("content-length", &gz.len().to_string()),
+                ("content-encoding", "gzip"),
+            ],
+        )
+        .body(roxy_http::Body::from_bytes(Bytes::from(gz)))
+        .unwrap();
+    let answer = c.start(req);
+    until_seen(&kit, 1).await;
+    assert_eq!(kit.server.shared().buffered(), text.len() as u64);
+    let a = answer.await.unwrap().unwrap();
+    assert_eq!(a.status, 200, "{a:?}");
+    until_buffered(&kit, 0).await;
+}
+
 /// A WebSocket under a body-reading policy is a bodiless GET answered with
 /// a `101`: it holds none of the budget for the life of the session.
 #[tokio::test]
