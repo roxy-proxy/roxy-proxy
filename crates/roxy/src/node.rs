@@ -720,7 +720,8 @@ impl NodeRunning {
 
     /// Stops the node task, shuts the server down (in-flight exchanges get
     /// `grace`, and their flow events are spooled) and then drains the
-    /// spool within [`DRAIN_GRACE`].
+    /// spool within [`DRAIN_GRACE`]. The shipper outlives the node task and
+    /// does the draining, so a batch it has in flight is shipped once.
     pub async fn shutdown(self, grace: Duration) {
         if let Some(task) = self.task {
             task.abort();

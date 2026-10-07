@@ -151,6 +151,11 @@ pub struct Node {
     spool: Arc<Spool>,
     identity: Mutex<Option<Arc<Identity>>>,
     current: Mutex<Current>,
+    /// The shipper, from [`Node::run`] spawning it until [`Node::drain`]
+    /// takes it. Owned here rather than by `run` so a shutdown that aborts
+    /// the node task can still stop it before anything else touches the
+    /// spool.
+    shipper: Mutex<Option<tokio::task::JoinHandle<()>>>,
     revoked: AtomicBool,
     /// The running lease's `refresh_after_seconds` was reduced, and the
     /// warning for it logged.
@@ -185,6 +190,7 @@ impl Node {
             spool,
             identity: Mutex::new(None),
             current: Mutex::new(Current::default()),
+            shipper: Mutex::new(None),
             revoked: AtomicBool::new(false),
             refresh_clamped: AtomicBool::new(false),
             started: Instant::now(),
@@ -217,12 +223,13 @@ impl Node {
         lock(&self.identity).clone()
     }
 
-    /// Enrols (first start) or loads the identity, then runs the lease loop,
-    /// the certificate renewal and the shipper until revoked or aborted.
+    /// Enrols (first start) or loads the identity, then runs the lease loop
+    /// and the certificate renewal until revoked or aborted. The shipper it
+    /// starts outlives an abort: [`Node::drain`] stops it.
     /// Returns `Err` only for what a retry cannot fix.
     pub async fn run(self: Arc<Self>) -> Result<(), NodeError> {
         self.establish_identity().await?;
-        let shipper = tokio::spawn(self.clone().ship_loop());
+        *lock(&self.shipper) = Some(tokio::spawn(self.clone().ship_loop()));
         let mut renewer = tokio::spawn(self.clone().renew_loop());
         tokio::select! {
             () = self.lease_loop() => {}
@@ -231,26 +238,23 @@ impl Node {
             Ok(true) = &mut renewer => {}
         }
         // Revoked: ship what is spooled, then stop.
-        self.spool.close();
-        let mut shipper = shipper;
-        let _ = tokio::time::timeout(self.scaled(Duration::from_secs(30)), &mut shipper).await;
-        shipper.abort();
+        self.drain(self.scaled(Duration::from_secs(30))).await;
         renewer.abort();
         Ok(())
     }
 
-    /// Ships whatever is still spooled, within `grace`. The bound holds
-    /// mid-request: an upload still in progress at the deadline is dropped.
+    /// Ships whatever is still spooled, within `grace`, then stops the
+    /// shipper. Only the shipper posts, so a batch it has in flight is not
+    /// posted a second time. The bound holds mid-request: an upload still in
+    /// progress at the deadline is dropped. With no shipper (no identity
+    /// yet, or drained already) nothing could ship.
     pub async fn drain(&self, grace: Duration) {
         self.spool.close();
-        let _ = tokio::time::timeout(grace, async {
-            while self.spool.pending_events() > 0 {
-                if !self.ship_once(&mut Stopped::default()).await {
-                    break;
-                }
-            }
-        })
-        .await;
+        let Some(mut shipper) = lock(&self.shipper).take() else {
+            return;
+        };
+        let _ = tokio::time::timeout(grace, &mut shipper).await;
+        shipper.abort();
     }
 
     async fn establish_identity(&self) -> Result<(), NodeError> {
@@ -646,8 +650,11 @@ impl Node {
                 continue;
             }
             if stopped.under.is_some() && stopped.under == lease_id {
-                // Shipping resumes with a new lease id; meanwhile the spool
-                // applies `on_high_water`.
+                // Shipping resumes with a new lease id, which a closed spool
+                // will not see; meanwhile the spool applies `on_high_water`.
+                if self.spool.is_closed() {
+                    return;
+                }
                 let _ = tokio::time::timeout(flush, self.spool.pushed.notified()).await;
                 continue;
             }
@@ -1222,6 +1229,56 @@ mod tests {
         .await
         .unwrap();
         task.abort();
+    }
+
+    /// Shutdown aborts the node task and then drains. The shipper is the
+    /// only poster throughout, so a batch it has in flight when the task is
+    /// aborted is acknowledged once, not re-posted by the drain.
+    #[tokio::test]
+    async fn drain_after_an_abort_ships_each_batch_once() {
+        let h = Harness::new().await;
+        h.mock.push("/roxy/v1/enrol", Reply::issue("n1"));
+        let mut l = lease("L1", "version: 1\n", "s1", "e1");
+        // Two events of the shape pushed below per batch; three make two.
+        l.flow.batch_max_bytes = 70;
+        l.flow.flush_interval_seconds = 1;
+        h.mock.fallback(LEASE, Reply::json(200, &l));
+        // The first batch is held mid-flight while the shutdown happens.
+        h.mock.push(
+            FLOWS,
+            Reply::Delayed(
+                Duration::from_millis(500),
+                Box::new(Reply::json(200, &FlowAck { acked_through: 1 })),
+            ),
+        );
+        h.mock.fallback(
+            FLOWS,
+            Reply::json(
+                200,
+                &FlowAck {
+                    acked_through: u64::MAX,
+                },
+            ),
+        );
+        let (node, _) = h.node(true);
+        let spool = node.spool().clone();
+        let task = tokio::spawn(node.clone().run());
+        h.mock.wait_for(LEASE, 1).await;
+        for i in 0..3 {
+            spool.push(format!("{{\"event\":\"request\",\"i\":{i}}}").as_bytes());
+        }
+        h.mock.wait_for(FLOWS, 1).await;
+        task.abort();
+        let _ = task.await;
+        node.drain(Duration::from_secs(5)).await;
+        assert_eq!(spool.pending_events(), 0, "drained");
+        let seq_firsts: Vec<_> = h
+            .mock
+            .requests_to(FLOWS)
+            .iter()
+            .map(|r| r.json()["seq_first"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seq_firsts, [0, 2]);
     }
 
     #[tokio::test]

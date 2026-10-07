@@ -124,10 +124,13 @@ impl Spool {
         self.pushed.notify_one();
     }
 
-    /// Stops spooling new events. Already spooled ones stay for draining.
+    /// Stops spooling new events. Already spooled ones stay for draining,
+    /// and the shipper is woken so the drain starts without waiting out a
+    /// flush interval.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.wake();
+        self.pushed.notify_one();
     }
 
     pub fn is_closed(&self) -> bool {
