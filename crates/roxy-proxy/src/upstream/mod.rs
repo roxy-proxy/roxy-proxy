@@ -24,9 +24,10 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http::Uri;
 use hyper_util::client::legacy::Client;
@@ -163,10 +164,30 @@ impl AsyncWrite for MaybeTls {
     }
 }
 
+/// How the connection a response arrived on was opened. hyper puts it on
+/// every response's extensions; the first exchange over the connection is
+/// the one that paid for the dial.
+#[derive(Debug, Clone)]
+pub(crate) struct ConnectInfo {
+    dial: Duration,
+    fresh: Arc<AtomicBool>,
+}
+
+impl ConnectInfo {
+    /// The time the dial took (DNS, TCP and TLS), the first time asked;
+    /// `None` after that, the connection being reused.
+    pub(crate) fn take_dial(&self) -> Option<Duration> {
+        self.fresh
+            .swap(false, Ordering::AcqRel)
+            .then_some(self.dial)
+    }
+}
+
 /// The connection type handed to hyper.
 pub(crate) struct UpstreamIo {
     io: TokioIo<MaybeTls>,
     h2: bool,
+    info: ConnectInfo,
     /// Counted in [`H1Open`] for as long as hyper holds the connection.
     _h1: Option<H1Guard>,
 }
@@ -249,7 +270,7 @@ impl hyper::rt::Write for UpstreamIo {
 
 impl Connection for UpstreamIo {
     fn connected(&self) -> Connected {
-        let c = Connected::new();
+        let c = Connected::new().extra(self.info.clone());
         if self.h2 { c.negotiated_h2() } else { c }
     }
 }
@@ -391,7 +412,12 @@ impl tower_service::Service<Uri> for Connector {
             };
             let host = host_of(&uri)?;
             let port = uri.port_u16().unwrap_or(scheme.default_port());
+            let dialled = Instant::now();
             let io = inner.connect(scheme, &host, port, &tls).await?;
+            let info = ConnectInfo {
+                dial: dialled.elapsed(),
+                fresh: Arc::new(AtomicBool::new(true)),
+            };
             let h2 = match &io {
                 MaybeTls::Tls(t) => t.get_ref().1.alpn_protocol() == Some(b"h2".as_slice()),
                 MaybeTls::Plain(_) => false,
@@ -403,6 +429,7 @@ impl tower_service::Service<Uri> for Connector {
             Ok(UpstreamIo {
                 io: TokioIo::new(io),
                 h2,
+                info,
                 _h1: (!h2).then(|| inner.h1_open.open(key)),
             })
         })

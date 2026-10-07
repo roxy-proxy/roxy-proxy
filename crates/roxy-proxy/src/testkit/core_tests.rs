@@ -48,6 +48,31 @@ async fn an_allowed_request_is_forwarded_and_logged() {
     assert_eq!(ev["res"]["status"], 200);
 }
 
+/// `timing.upstream_connect_ms` is the dial the exchange paid for: the
+/// first request to an origin records it, the next over the pooled
+/// connection records `null`.
+#[tokio::test]
+async fn upstream_connect_time_is_logged_for_the_dialling_request_only() {
+    let kit = kit().await;
+    let mut c = kit.h1().await;
+    let a = c.call("GET", "/one", &[], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let b = c.call("GET", "/two", &[], b"").await;
+    assert_eq!(b.status, 200, "{b:?}");
+    assert_eq!(kit.upstream.open_connections(), 1, "pooled");
+    let evs = kit.events("request", 2).await;
+    assert!(
+        evs[0]["timing"]["upstream_connect_ms"].is_u64(),
+        "{:#}",
+        evs[0]
+    );
+    assert!(
+        evs[1]["timing"]["upstream_connect_ms"].is_null(),
+        "{:#}",
+        evs[1]
+    );
+}
+
 #[tokio::test]
 async fn the_default_denies_and_nothing_leaves() {
     let kit = kit().await;

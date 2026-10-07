@@ -86,6 +86,13 @@ The workload fetches the CA from `http://roxy:3130/roxy-ca.pem`. A client
 that ignores the proxy variables, or a library that opens its own sockets,
 gets nowhere: direct connections and DNS lookups fail.
 
+Other services on the Compose network resolve to private addresses, which
+the address floor denies by default. A rule that lets the workload reach
+one needs `private_ok: true` on its `allow`, for example
+`then: { allow: { private_ok: true } }`
+([address floor](/reference/address-lists#address-floor)); rules for
+public upstreams need nothing.
+
 ## Why a proxy port
 
 An `http_proxy` listener is the narrowest interface roxy can offer a

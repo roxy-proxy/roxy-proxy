@@ -25,6 +25,8 @@ produces a `request` event:
 |---|---|
 | `req.body_bytes`, `res.body_bytes` | body bytes roxy forwarded in each direction |
 | `req.body_sha256`, `res.body_sha256` | lower-case hex SHA-256 of those bytes; present once the body completed, absent if the exchange ended first (a cut body, a watching stop, a client that left). An empty body has the empty-string digest; a relayed WebSocket has counts but no digests |
+| `timing.upstream_connect_ms` | how long opening the upstream connection took (DNS, TCP and TLS); `null` when the request reused a pooled connection, or none was opened |
+| `timing.upstream_ttfb_ms` | from the forwarding decision to the upstream's response head |
 | `decision` | `allow`, `deny`, or `answered` when an addon layer answered itself |
 | `terminal_rule` | what decided: a rule id, or `_default`, `_fail_closed`, `_address_policy`, `_expired`, `_sign`, `_websocket` or `layer:<name>` |
 | `stage` | `head`, or where a watching rule stopped the exchange: `request_body`, `response_head`, `response_body`, `websocket` |

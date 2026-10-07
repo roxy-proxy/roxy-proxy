@@ -332,6 +332,47 @@ async fn a_byte_budget_closes_the_relay() {
     assert!(close[0]["bytes_s2c"].as_u64().unwrap() <= 50 * 1024 + 64);
 }
 
+/// A WebSocket silent for `idle_timeout` ends with a `1001` close frame on
+/// both sides, not a bare EOF, whether roxy splices bytes or relays
+/// messages. The flow log carries the close.
+async fn idle_closes_both_sides_with_1001(more: &str) {
+    let kit = with(more)
+        .limits(|l| l.idle_timeout = Duration::from_millis(300))
+        .start()
+        .await;
+    let mut ws = open(&kit, None).await;
+    let back = echo(&mut ws, Message::text("hi")).await;
+    assert_eq!(back.into_text().unwrap().as_str(), "hi");
+    let (got, code) = read_to_close(&mut ws).await;
+    assert!(got.is_empty(), "{got:?}");
+    assert_eq!(code, Some(1001));
+    kit.upstream.wait_ws_closed(1).await;
+    assert_eq!(kit.upstream.ws_close_codes(), vec![Some(1001)]);
+    let close = kit.events("ws_close", 1).await;
+    assert_eq!(close[0]["close_code"], 1001, "{:#}", close[0]);
+    assert_eq!(close[0]["close_reason"], "idle timeout");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "allow", "{ev:#}");
+    assert!(ev["reason"].is_null(), "{ev:#}");
+}
+
+#[tokio::test]
+async fn an_idle_byte_splice_closes_both_sides_with_1001() {
+    idle_closes_both_sides_with_1001("").await;
+}
+
+#[tokio::test]
+async fn an_idle_message_relay_closes_both_sides_with_1001() {
+    idle_closes_both_sides_with_1001(
+        r#"
+- id: read-messages
+  when: ws.direction == "c2s" and ws.size > 1mb
+  then: deny
+"#,
+    )
+    .await;
+}
+
 /// Without `upgrade: websocket` on the allow, the upgrade is stripped and
 /// an ordinary request goes out.
 #[tokio::test]
