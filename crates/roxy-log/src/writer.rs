@@ -20,6 +20,11 @@ pub struct WriterOptions {
     /// Longest [`LogWriter::flush`] waits, and how long a failing
     /// destination may hold up shutdown.
     pub flush_timeout: Duration,
+    /// How long the writer waits for more records after the first one of
+    /// a batch, so that one write carries a burst. A flush, reopen or
+    /// shutdown cuts the wait short, as does a batch reaching
+    /// `high_water / 64` bytes.
+    pub linger: Duration,
 }
 
 /// Default [`WriterOptions::high_water`]: 8 MiB.
@@ -31,6 +36,7 @@ impl Default for WriterOptions {
             high_water: DEFAULT_HIGH_WATER,
             retry_interval: Duration::from_millis(500),
             flush_timeout: Duration::from_secs(10),
+            linger: Duration::from_millis(2),
         }
     }
 }
@@ -67,6 +73,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Core {
+    /// Unwritten bytes at which the writer stops lingering and the next
+    /// `append` wakes it.
+    fn batch_bytes(&self) -> usize {
+        self.opts.high_water / 64
+    }
+
     fn ready(&self) -> bool {
         !self.failing.load(Ordering::Acquire)
             && self.pending.load(Ordering::Acquire) < self.opts.high_water
@@ -132,11 +144,42 @@ impl LogWriter {
         if bytes.is_empty() {
             return;
         }
+        let Ok(()) = self.append_with(|buf| {
+            buf.extend_from_slice(bytes);
+            Ok::<(), std::convert::Infallible>(())
+        });
+    }
+
+    /// [`LogWriter::append`] for a record produced straight into the
+    /// buffer: `fill` appends it to `buf` and must not touch what is
+    /// already there. It runs under the writer's lock, so it should only
+    /// serialise, not block. If it fails (or panics) nothing is queued.
+    pub fn append_with<E>(
+        &self,
+        fill: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
+    ) -> Result<(), E> {
         let mut st = lock(&self.core.state);
-        st.buf.extend_from_slice(bytes);
-        self.core.pending.fetch_add(bytes.len(), Ordering::AcqRel);
+        let before = st.buf.len();
+        let mut record = Rollback {
+            buf: &mut st.buf,
+            start: before,
+            keep: false,
+        };
+        fill(record.buf)?;
+        record.keep = true;
+        drop(record);
+        let after = st.buf.len();
+        self.core
+            .pending
+            .fetch_add(after - before, Ordering::AcqRel);
         drop(st);
-        self.core.work.notify_one();
+        // The writer is woken by the first record of a batch and when the
+        // batch gets large; between those it is already due to run.
+        let batch = self.core.batch_bytes();
+        if after > before && (before == 0 || (before < batch && after >= batch)) {
+            self.core.work.notify_one();
+        }
+        Ok(())
     }
 
     /// `Ready` while the writer keeps up (unwritten bytes below the high
@@ -210,6 +253,22 @@ impl Drop for LogWriter {
     }
 }
 
+/// Truncates a half-written record unless `keep` is set, so a failed or
+/// panicking producer never leaves part of one in the buffer.
+struct Rollback<'a> {
+    buf: &'a mut Vec<u8>,
+    start: usize,
+    keep: bool,
+}
+
+impl Drop for Rollback<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            self.buf.truncate(self.start);
+        }
+    }
+}
+
 /// The writer thread.
 fn run<D: Destination>(core: &Core, mut dest: D) {
     // If this thread dies, producers must not proceed as if logging worked.
@@ -224,11 +283,26 @@ fn run<D: Destination>(core: &Core, mut dest: D) {
     }
     let _dead = Dead(core);
     let mut batch: Vec<u8> = Vec::new();
+    let urgent = |st: &State| st.closing || st.reopen || st.written != st.requested;
     loop {
         let (generation, closing, reopen) = {
             let mut st = lock(&core.state);
-            while st.buf.is_empty() && !st.closing && !st.reopen && st.written == st.requested {
+            while st.buf.is_empty() && !urgent(&st) {
                 st = core.work.wait(st).unwrap_or_else(PoisonError::into_inner);
+            }
+            // Linger so one write carries a burst, unless the batch is
+            // already large or something more pressing is wanted.
+            let deadline = Instant::now() + core.opts.linger;
+            while st.buf.len() < core.batch_bytes() && !urgent(&st) {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                st = core
+                    .work
+                    .wait_timeout(st, deadline - now)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
             }
             // Swap, keeping the old allocation for the next batch.
             std::mem::swap(&mut st.buf, &mut batch);
@@ -359,6 +433,7 @@ pub(crate) mod tests {
             high_water,
             retry_interval: Duration::from_millis(5),
             flush_timeout: Duration::from_secs(5),
+            linger: Duration::from_millis(2),
         }
     }
 
@@ -375,6 +450,83 @@ pub(crate) mod tests {
         assert!(w.flush());
         assert_eq!(g.written(), want);
         assert_eq!(w.pending(), 0);
+    }
+
+    /// Counts batches: every [`Destination::end_batch`] is one write to the
+    /// underlying file.
+    #[derive(Clone, Default)]
+    struct Batches {
+        out: Arc<Mutex<Vec<u8>>>,
+        batches: Arc<AtomicUsize>,
+    }
+
+    impl Destination for Batches {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            lock(&self.out).extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn end_batch(&mut self) -> io::Result<()> {
+            self.batches.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_burst_of_records_is_one_write_in_order() {
+        let d = Batches::default();
+        let w = LogWriter::spawn(
+            "t",
+            d.clone(),
+            WriterOptions {
+                linger: Duration::from_secs(1),
+                ..opts(1 << 20)
+            },
+        )
+        .unwrap();
+        let n = 200;
+        let mut want = Vec::new();
+        for i in 0..n {
+            let line = format!("record {i}\n");
+            want.extend_from_slice(line.as_bytes());
+            w.append(line.as_bytes());
+        }
+        // A flush cuts the linger short: the batch is written now.
+        assert!(w.flush());
+        assert_eq!(*lock(&d.out), want);
+        assert_eq!(
+            d.batches.load(Ordering::SeqCst),
+            1,
+            "a burst within the linger is one batch"
+        );
+    }
+
+    #[test]
+    fn a_lone_record_is_written_within_the_linger() {
+        let d = Batches::default();
+        let linger = Duration::from_millis(2);
+        let w = LogWriter::spawn(
+            "t",
+            d.clone(),
+            WriterOptions {
+                linger,
+                ..opts(1 << 20)
+            },
+        )
+        .unwrap();
+        let start = Instant::now();
+        w.append(b"only one\n");
+        // Generous for a loaded CI machine; the failure this pins is a
+        // record that waits for the next one, a flush or shutdown.
+        let bound = linger * 50;
+        while lock(&d.out).is_empty() {
+            assert!(
+                start.elapsed() < bound,
+                "record not written within {bound:?}"
+            );
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        assert_eq!(*lock(&d.out), b"only one\n");
+        assert_eq!(d.batches.load(Ordering::SeqCst), 1);
     }
 
     #[test]
