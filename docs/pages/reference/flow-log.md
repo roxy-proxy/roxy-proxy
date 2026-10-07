@@ -80,7 +80,9 @@ The write path never drops a record while roxy runs
 
 - **One writer per destination.** Emitters serialise each event on their
   own thread and enqueue the bytes; one writer thread owns the file and
-  writes everything queued in one batch.
+  writes everything queued in one batch. The writer waits a moment for
+  more records before each write, so a burst is one write and a record is
+  written within a couple of milliseconds of being emitted.
 - **Backpressure.** Emitting never blocks or drops. Once unwritten bytes
   pass `log.flow.high_water` (8 MiB) the log reports not ready and every
   traffic producer waits for it: each new client connection, exchange and

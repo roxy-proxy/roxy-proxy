@@ -5,10 +5,12 @@
 //! - **Appending never does I/O.** [`LogWriter::append`] copies bytes into a
 //!   shared buffer under a short lock and wakes the writer. Callers on any
 //!   core never touch the destination and never wait for the disk.
-//! - **One writer thread** owns each destination. It swaps the whole buffer
-//!   out and writes it in one go, so under load each write carries every
-//!   record queued since the last one: throughput follows disk bandwidth,
-//!   not event rate. At low load each record goes out as it arrives.
+//! - **One writer thread** owns each destination. Woken by the first record
+//!   of a batch, it waits [`WriterOptions::linger`] for more, then swaps the
+//!   whole buffer out and writes it in one go: a burst is one write, and
+//!   under load each write carries every record queued since the last one,
+//!   so throughput follows disk bandwidth, not event rate. At low load each
+//!   record goes out within a couple of milliseconds.
 //! - **Backpressure, never loss.** Bytes appended but not yet written are
 //!   counted. Once they reach [`WriterOptions::high_water`], or the
 //!   destination is failing, [`LogWriter::poll_ready`] is `Pending` until
