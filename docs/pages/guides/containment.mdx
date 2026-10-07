@@ -54,8 +54,8 @@ is ([threat model](/design/threat-model#which-use-case-claims-what)).
 ## With Docker Compose
 
 The workload sits only on an `internal: true` network, which has no route
-out and no outside DNS, and roxy is the only container on both that
-network and one with a route out:
+out and no outside DNS; roxy alone is on both it and a network with a route
+out:
 
 ```yaml
 services:
@@ -89,19 +89,9 @@ gets nowhere: direct connections and DNS lookups fail.
 ## Why a proxy port
 
 An `http_proxy` listener is the narrowest interface roxy can offer a
-workload:
-
-- **One protocol, parsed strictly.** A client speaks HTTP/1.1 or HTTP/2 to
-  roxy and nothing else. CONNECT only opens a tunnel that roxy intercepts
-  as TLS (or, if allowed, plain HTTP); raw TCP never passes.
-- **Destinations are names, not addresses.** Each request names its
-  destination in a form roxy parses itself: the absolute URI, the CONNECT
-  authority, and an SNI that must match it. The rules judge that name;
-  roxy resolves it and checks the IP it actually dials.
-- **Nothing is implicit.** A client that bypasses the proxy reaches
-  nothing, because the network allows nothing else, and everything that
-  does reach roxy is decided by a rule.
-
-An `http` listener serves clients that address roxy as the server
-([HTTP gateway](/guides/gateway)). It is for traffic sent to roxy on
-purpose, not for containing a workload.
+workload: HTTP/1.1 or HTTP/2 and nothing else, with CONNECT opening only a
+tunnel roxy intercepts (raw TCP never passes), and every destination a name
+roxy parses itself, judges in the rules, resolves and checks the IP of
+([HTTP](/reference/http)). An `http` listener is for traffic sent to roxy
+on purpose ([HTTP gateway](/guides/gateway)), not for containing a
+workload.

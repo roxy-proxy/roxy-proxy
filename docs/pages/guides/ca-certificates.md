@@ -1,9 +1,9 @@
 # Managing the CA
 
 On a proxy port roxy terminates every TLS tunnel with a leaf certificate
-minted by its CA, so it can inspect all HTTPS. roxy generates that CA, or
-uses one you provide. Clients must trust it. The certificates roxy mints
-and the handshake it offers are in [TLS](/reference/tls).
+minted by its CA. roxy generates that CA, or uses one you provide, and
+clients must trust it. The certificates roxy mints and the handshake it
+offers are in [TLS](/reference/tls).
 
 ```yaml
 ca_server:
@@ -24,17 +24,17 @@ On first `roxy run` (or `roxy ca init`) roxy generates an ECDSA P-256 CA:
 It is written to `tls.ca_dir` as `roxy-ca.pem` and `roxy-ca.key`
 (mode 0600). An existing pair is reused. A corrupt pair is a fatal startup
 error, never silently regenerated, since a new CA breaks the trust every
-client already has. `roxy ca init --force` replaces it deliberately.
+client already has; `roxy ca init --force` replaces it deliberately.
 
 To use an existing CA in `ca_dir`, put its certificate and key there as
-`roxy-ca.pem` and `roxy-ca.key`. The checks below apply.
+`roxy-ca.pem` and `roxy-ca.key`. The startup checks below apply.
 
 ## Provided CA
 
-Set `tls.ca_cert` and `tls.ca_key` to use a CA you already have, for
-example a sub-CA issued by your organisation's root or a Kubernetes `tls`
-secret mounted read-only. The two keys go together; setting only one is a
-config error. `ca_dir` is then not used.
+Set `tls.ca_cert` and `tls.ca_key` to use a CA you already have, such as a
+sub-CA issued by your organisation's root or a Kubernetes `tls` secret
+mounted read-only. Setting only one is a config error. `ca_dir` is then not
+used.
 
 - `ca_cert` is PEM. The first certificate is the CA that signs leaves.
   Any further certificates are its intermediates, in order up to but not
@@ -56,7 +56,7 @@ extension, be within its validity period, and match its key. Each
 intermediate must be a CA within its validity period whose key signed the
 certificate before it. Any failure stops roxy.
 
-Two conditions are warnings in the log, not errors:
+Two conditions are warnings, not errors:
 
 - The key file is readable by its group or by others. Make it mode 0600.
 - The CA expires within seven days. Leaves normally last seven days; one
@@ -67,7 +67,7 @@ Two conditions are warnings in the log, not errors:
 ## CA distribution
 
 The CA certificate, never the key, is available three ways. For a
-provided CA this is the signing CA alone, without intermediates. Clients
+provided CA this is the signing CA alone, without intermediates; clients
 that already trust your organisation's root need nothing from roxy.
 
 ```sh

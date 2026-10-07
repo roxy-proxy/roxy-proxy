@@ -1,9 +1,9 @@
 # Policy evaluation
 
 The policy decides what roxy forwards, what it denies, and what it changes
-on the way. It is a list of rules in the config file. Each rule has an
-`id`, a `when` condition in the [rule language](/reference/rule-language),
-and a `then` with one or more [actions](/reference/rule-language#actions).
+on the way. It is a list of rules in the config file, each with an `id`, a
+`when` condition in the [rule language](/reference/rule-language) and a
+`then` with one or more [actions](/reference/rule-language#actions).
 Anything no rule allows is denied:
 
 ```yaml
@@ -27,30 +27,31 @@ runs follows from what it reads.
 
 1. **The forwarding decision is made at the request head, and deny wins.**
    roxy evaluates every rule whose values are known at that point. If any
-   matching rule denies, the request is denied. Otherwise, if any matching
-   rule allows, it is allowed. Otherwise it is denied, with rule id
-   `_default`; an empty rule set denies everything. To let traffic through
-   while you find out what a workload reaches, say so with a rule:
+   matching rule denies, the request is denied; otherwise, if any matching
+   rule allows, it is allowed; otherwise it is denied with rule id
+   `_default`, so an empty rule set denies everything. To let traffic
+   through while you find out what a workload reaches, say so with a rule:
    `{ id: discover, when: host != null, then: allow }`. Rule order does
    not affect the decision. A rule that reads a value not yet known is
    skipped here, not treated as false.
 2. **After that, rules watch.** For the rest of the exchange, two kinds of
    rule are re-checked whenever a value they read becomes known or changes:
-   rules that read a *watched* field ([fields](/reference/rule-language#fields)), and `deny` rules
-   that read a byte metric (`count: request_bytes` or `response_bytes`),
-   which this exchange adds to as bytes stream. A deny reading a
-   `requests`, `denied`, `errors` or `unique` metric is decided at the head
-   only: re-checking it after this exchange's own count would deny the 30th
-   request of a `>= 30` limit instead of the 31st. If a watching deny
-   matches, roxy stops the exchange: an error response if the response has
-   not started, otherwise HTTP/1.1 breaks the connection without finishing
-   the body and HTTP/2 resets the stream. Nothing overrides a deny.
+   rules that read a *watched* field ([fields](/reference/rule-language#fields)),
+   and `deny` rules that read a byte metric (`count: request_bytes` or
+   `response_bytes`), which this exchange adds to as bytes stream. A deny
+   reading a `requests`, `denied`, `errors` or `unique` metric is decided at
+   the head only: re-checking it after this exchange's own count would deny
+   the 30th request of a `>= 30` limit instead of the 31st. If a watching
+   deny matches, roxy stops the exchange: an error response if the response
+   has not started, otherwise HTTP/1.1 breaks the connection without
+   finishing the body and HTTP/2 resets the stream. Nothing overrides a
+   deny.
 3. **Only head rules can `allow`.** A rule that reads a watched field cannot
-   allow, cannot change the request (`set_header` on the request,
-   `rewrite_path`, `redirect`, ...) and cannot `capture`: the request is
-   already on its way, so all three are compile errors. It can deny, and
-   add effects that still make sense: `log`, `tag`, `set_state`, and header
-   changes on a response that has not been sent yet.
+   allow, change the request (`set_header` on the request, `rewrite_path`,
+   `redirect`, ...) or `capture`: the request is already on its way, so all
+   three are compile errors. It can deny, and add effects that still make
+   sense: `log`, `tag`, `set_state`, and header changes on a response that
+   has not been sent yet.
 4. **A watching rule's non-terminal effects apply once**, the first time it
    matches.
 5. **Order matters for effects, not decisions.** Rules are evaluated top to
@@ -74,10 +75,9 @@ runs follows from what it reads.
 `roxy check` and `roxy rule test` report whether each rule is decided at the
 head or watches.
 
-**Unavailable inputs fail closed.** If evaluating a rule needs a metric
-value, an address-list lookup or a secret and it is unavailable (store
-overloaded, table full, list failed to load), the flow is denied with
-`503`, `terminal_rule: _fail_closed`, and a
-`policy_input_unavailable` event. A field that is simply absent, like an
-unsent header, is not unavailable: it is `null`
-([missing values](/reference/rule-language#missing-values-null)).
+**Unavailable inputs fail closed.** If a rule needs a metric value, an
+address-list lookup or a secret and it is unavailable (store overloaded,
+table full, list failed to load), the flow is denied with `503`,
+`terminal_rule: _fail_closed`, and a `policy_input_unavailable` event. A
+field that is simply absent, like an unsent header, is not unavailable: it
+is `null` ([missing values](/reference/rule-language#missing-values-null)).

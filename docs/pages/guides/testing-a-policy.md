@@ -14,11 +14,11 @@ roxy rule test --config roxy.yaml --metric github_writes=30 POST https://api.git
 `roxy rule test` evaluates a synthetic request with no network I/O and
 prints the matching rules, the effects and the decision. It exits 0 on
 allow and 3 on deny. The request arrives on the config's first listener,
-which sets `listener.name`. See `roxy rule test --help` for every flag.
+which sets `listener.name`. `roxy rule test --help` lists every flag.
 
 ## What the rules see
 
-The rules see the canonical request, as they do in `roxy run`:
+The canonical request, as in `roxy run`:
 
 - The URL is parsed and normalised by the proxy's own parser
   (`https://H.example./a/%2e/b/../c` is `host == "h.example"` and

@@ -1,8 +1,8 @@
 # Threat model and guarantees
 
 roxy is a security boundary for the HTTP traffic that reaches it. These
-guarantees decide every behaviour described in the other pages; where a
-page says "fails closed" or "deny wins", this is why.
+guarantees decide every behaviour on the other pages; where a page says
+"fails closed" or "deny wins", this is why.
 
 ## Threat model
 
@@ -11,9 +11,9 @@ arbitrary code, and may have root inside its own container or VM.
 
 **Trusted:** the host, roxy's binary and config, the secrets roxy holds, the
 public CA trust store used to verify upstreams, and the upstreams the rules
-allow. roxy does not treat upstream responses as adversarial. It applies the
-size and time limits that protect its own resources, and re-frames responses
-so the client sees one clean wire form.
+allow. Upstream responses are not treated as adversarial; roxy applies the
+size and time limits that protect its own resources and re-frames them so
+the client sees one clean wire form.
 
 **For traffic that reaches it, in a [sandbox](/guides/containment) and a
 [gateway](/guides/gateway) alike, roxy prevents:**
@@ -37,7 +37,7 @@ allow, or compromise of the host running roxy.
 
 ## Which use case claims what
 
-roxy is not a transparent proxy. It decides what passes through it, and it
+roxy is not a transparent proxy: it decides what passes through it and
 cannot stop traffic that never reaches it.
 
 - **Sandbox containment** claims that all of the workload's traffic goes
@@ -46,7 +46,7 @@ cannot stop traffic that never reaches it.
   at the boundary ([sandbox containment](/guides/containment)). The proxy
   variables and the CA only tell a well-behaved client where roxy is.
 - **An HTTP gateway** makes no such claim. It governs the requests its
-  clients send to it, and the clients keep whatever other routes they have
+  clients send to it; the clients keep whatever other routes they have
   ([HTTP gateway](/guides/gateway)).
 
 roxy speaks HTTP/1.1, HTTP/2 and WebSockets to clients. Raw TCP does not
@@ -59,8 +59,8 @@ set denies everything, and so does a policy past its `valid_until`
 ([lease](/guides/operations#lease)). A config that fails to compile is not
 loaded, and a failed reload keeps the running policy. An addon in
 `enforce` mode that fails denies the flow; an `observe` addon cannot
-affect traffic, so its failure is logged and the flow goes on. A policy
-input that is unavailable denies the flow rather than making a predicate
+affect traffic, so its failure is logged and the flow goes on. An
+unavailable policy input denies the flow rather than making a predicate
 false. [Resource limits](/reference/limits#fail-closed-outcomes) lists
 every case.
 
@@ -77,9 +77,9 @@ form ([WebSockets](/reference/websockets#message-rules)).
 ## Deny always wins
 
 Any matching deny wins over any matching allow, wherever it sits in the
-list, and nothing overrides a deny at any later point in an exchange. Rule
-order orders effects, never decisions, so adding a deny can only narrow
-what passes ([policy evaluation](/design/policy-evaluation)).
+list, and nothing overrides a deny later in an exchange. Rule order orders
+effects, never decisions, so adding a deny can only narrow what passes
+([policy evaluation](/design/policy-evaluation)).
 
 ## Never evict
 
@@ -97,9 +97,9 @@ behind or its disk fails, roxy holds traffic back until it catches up
 ## The rules judge everything that leaves
 
 Addons sit above the rules and can reshape traffic freely, but what they
-pass on is re-validated as strictly as a client request and then judged by
-the rules as if the client had sent it. Nothing configurable runs between
-the rules and the network, and the address floor checks the IP actually
+pass on is re-validated as strictly as a client request and judged by the
+rules as if the client had sent it. Nothing configurable runs between the
+rules and the network, and the address floor checks the IP actually
 dialled ([addon model](/design/addon-model)).
 
 ## Streams, not messages
