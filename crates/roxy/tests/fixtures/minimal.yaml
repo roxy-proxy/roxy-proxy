@@ -1,4 +1,4 @@
-# A minimal configuration, for the config and CLI tests: one explicit-proxy
+# A minimal configuration, for the config and CLI tests: one HTTP-proxy
 # listener and one allow rule.
 # Everything else uses the defaults. Any request
 # not matched by a rule is denied.

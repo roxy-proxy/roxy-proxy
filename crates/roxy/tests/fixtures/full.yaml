@@ -4,7 +4,7 @@ version: 1
 
 listeners:
   - name: proxy
-    mode: explicit
+    mode: http_proxy
     bind: 0.0.0.0:3128
   # Deferred (issue #15). Shape reserved so configs do not change when it lands:
   # - name: tproxy

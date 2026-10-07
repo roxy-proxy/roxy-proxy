@@ -94,8 +94,9 @@ pub struct Listener {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ListenerMode {
+    /// An HTTP proxy: absolute-form requests and CONNECT.
     #[default]
-    Explicit,
+    HttpProxy,
     /// Parsed so the config shape is stable, but rejected by validation:
     /// roxy has no transparent mode.
     Transparent,

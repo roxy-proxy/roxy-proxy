@@ -1,4 +1,4 @@
-//! The connection state machines: the explicit proxy
+//! The connection state machines: the HTTP proxy
 //! (proxy-port requests, CONNECT → sniff → TLS
 //! termination or plaintext tunnel), and the request loop inside a tunnel.
 
@@ -57,7 +57,7 @@ impl ConnLimits {
     }
 }
 
-pub(crate) async fn serve_explicit(stream: BoxIo, client: ClientConn, shared: Arc<Shared>) {
+pub(crate) async fn serve_http_proxy(stream: BoxIo, client: ClientConn, shared: Arc<Shared>) {
     let cl = ConnLimits::current(&shared);
     let conn = cl.codec(ClientIo(stream), BytesMut::new(), Role::ProxyPort);
     Box::pin(proxy_port_loop(conn, client, shared, cl)).await;

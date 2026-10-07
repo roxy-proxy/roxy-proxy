@@ -3,7 +3,7 @@
 ## Exchange
 
 ```
-  client ──TCP──▶  listener: explicit proxy
+  client ──TCP──▶  listener: HTTP proxy (mode: http_proxy)
                      ▼
                    CONNECT: first bytes must be a TLS ClientHello
                      ▼      whose SNI matches the CONNECT host (the defaults:
@@ -26,7 +26,7 @@
 ```
 
 A client connection is accepted by a listener and, after CONNECT (on an
-explicit listener) and TLS termination, carries a sequence of exchanges (HTTP/1.1 keep-alive) or
+`http_proxy` listener) and TLS termination, carries a sequence of exchanges (HTTP/1.1 keep-alive) or
 concurrent ones (HTTP/2 streams). Both fronts feed one transport-agnostic
 exchange core (`roxy-proxy`'s `exchange` module):
 

@@ -4,15 +4,16 @@ How clients talk to roxy, how requests are parsed and canonicalised, and
 what goes to the upstream and back. The parsing lives in `roxy-http`; the
 connection handling in `roxy-proxy`.
 
-## Explicit proxy
+## HTTP proxy
 
 Clients set `HTTP_PROXY` / `HTTPS_PROXY` and speak HTTP/1.1 to an
-explicit listener.
+`http_proxy` listener: the HTTP proxy mode, taking absolute-form requests
+and CONNECT.
 
 ```yaml
 listeners:
   - name: proxy                # rules can match listener.name
-    mode: explicit             # the default, and the only mode
+    mode: http_proxy           # the default
     bind: 0.0.0.0:3128
 ```
 

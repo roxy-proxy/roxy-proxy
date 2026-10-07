@@ -32,7 +32,7 @@ fn full_config_parses_and_validates() {
     let cfg = parse(&fixture("full.yaml"));
     cfg.validate().unwrap();
     assert_eq!(cfg.listeners.len(), 1);
-    assert_eq!(cfg.listeners[0].mode, ListenerMode::Explicit);
+    assert_eq!(cfg.listeners[0].mode, ListenerMode::HttpProxy);
     assert_eq!(cfg.ca_server.as_ref().unwrap().bind.port(), 3130);
     assert_eq!(cfg.tls.upstream.min_version, TlsVersion::Tls12);
     assert!(cfg.http.enable_h2);
@@ -541,6 +541,21 @@ fn default_key_is_rejected() {
         let msg = describe_parse_error(&yaml, &err);
         assert!(msg.contains("unknown field `default`"), "{msg}");
     }
+}
+
+#[test]
+fn listener_mode_defaults_to_http_proxy() {
+    let omitted = parse(BASE);
+    assert_eq!(omitted.listeners[0].mode, ListenerMode::HttpProxy);
+
+    let named =
+        parse("version: 1\nlisteners: [{ name: p, mode: http_proxy, bind: 127.0.0.1:1 }]\n");
+    assert_eq!(named.listeners[0].mode, ListenerMode::HttpProxy);
+
+    let yaml = "version: 1\nlisteners: [{ name: p, mode: explicit, bind: 127.0.0.1:1 }]\n";
+    let err = Config::from_yaml(yaml).unwrap_err();
+    let msg = describe_parse_error(yaml, &err);
+    assert!(msg.contains("unknown variant `explicit`"), "{msg}");
 }
 
 #[test]

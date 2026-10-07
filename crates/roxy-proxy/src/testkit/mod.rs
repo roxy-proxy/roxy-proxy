@@ -4,7 +4,7 @@
 //! overrides, the real address floor and real upstream TLS).
 //!
 //! ```text
-//!   test client ──duplex──▶ conn::serve_explicit ─▶ … ─▶ Connector ──TestDial──▶ scripted upstream
+//!   test client ──duplex──▶ conn::serve_http_proxy ─▶ … ─▶ Connector ──TestDial──▶ scripted upstream
 //! ```
 //!
 //! * Names: `up.test` resolves to a public test address, `private.test` to a
@@ -633,7 +633,7 @@ impl Kit {
             peer: "192.0.2.7:40000".parse().unwrap(),
             original_dst: None,
         };
-        self.spawn_conn(crate::conn::serve_explicit(
+        self.spawn_conn(crate::conn::serve_http_proxy(
             server,
             conn,
             self.server.shared().clone(),
@@ -655,7 +655,7 @@ impl Kit {
             peer: "192.0.2.7:40000".parse().unwrap(),
             original_dst: None,
         };
-        self.spawn_conn(crate::conn::serve_explicit(
+        self.spawn_conn(crate::conn::serve_http_proxy(
             Box::new(server),
             conn,
             self.server.shared().clone(),
