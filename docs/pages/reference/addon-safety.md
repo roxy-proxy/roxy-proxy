@@ -1,9 +1,8 @@
-# Addon safety
+# Addon safety limits
 
-An addon's limits protect roxy and catch an addon that is broken. They
-don't police how fast it is: a slow addon makes its exchanges slow, never
-denied, and how fast it runs is its author's business. Nothing passes a
-slow layer unchecked while it works, so this keeps traffic fail-closed.
+An addon's limits protect roxy and catch an addon that is broken. They do
+not police how fast it is: a slow addon makes its exchanges slow, never
+denied.
 
 - **A deadline to the response head.** `first_byte_timeout` (default 30s)
   bounds the layer's own time to set its response head. Starting an

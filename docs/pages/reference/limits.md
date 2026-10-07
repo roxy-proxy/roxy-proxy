@@ -85,7 +85,7 @@ on HTTP/1.1 the connection closes so the client cannot take the body for
 complete, on HTTP/2 the stream is reset with `CANCEL`.
 
 Addons have their own limits, and fixed caps on what the host holds for a
-guest ([addon safety](/reference/addon-safety)). `max_ws_message_bytes` applies
+guest ([addon safety limits](/reference/addon-safety)). `max_ws_message_bytes` applies
 only when rules read WebSocket messages
 ([WebSockets](/reference/websockets#message-rules)); a message over it
 closes both sides with `1009`. `max_observer_lag_bytes` is how many bytes

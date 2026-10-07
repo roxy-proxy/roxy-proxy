@@ -1,12 +1,11 @@
-# Service layers
+# Service layer protocol
 
 A `kind: service` layer is an external service in the network path, at its
 position in the stack exactly as a WASM layer is. The request streams into
 it as it arrives; it streams back the request to forward, which roxy passes
 down the stack; the response from below streams into it, and it streams back
 the response the client gets. It may pass bytes through untouched, rewrite
-them, hold them back, answer itself, or deny. This runs out-of-process logic
-(Python with any dependencies, say) with no WASM toolchain.
+them, hold them back, answer itself, or deny.
 
 ```yaml
 addons:
