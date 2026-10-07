@@ -23,6 +23,11 @@ use crate::upstream::{ConnectError, Protocols, classify};
 /// can resend it).
 const MAX_ENDPOINT_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Endpoint calls one exchange has in flight at once; the rest wait their
+/// turn. With [`MAX_ENDPOINT_REQUEST_BYTES`] this bounds what a guest's
+/// calls can have roxy hold for it.
+pub(super) const MAX_ENDPOINT_CALLS_IN_FLIGHT: usize = 8;
+
 /// Request fields the addon may not set on an endpoint call: hop-by-hop and
 /// framing fields roxy owns.
 const DROPPED: &[&str] = &[
@@ -53,7 +58,9 @@ pub(super) fn expand(value: &str, secret: impl Fn(&str) -> Option<String>) -> Op
 /// A `..` segment is refused in either mode, whether or not it would have
 /// climbed out: a layer that reflects text it inspected into the path must
 /// not be able to express "up" at all, and the refusal is the signal that
-/// it tried.
+/// it tried. Under `prefix` an encoded slash or backslash is refused too:
+/// roxy keeps it opaque, but an origin that decodes before routing would
+/// read it as a separator, and `..` beside it as a climb.
 fn target(spec: &EndpointSpec, req: &Uri) -> Result<Uri, EndpointError> {
     let req_path = req.path();
     if req_path.split('/').any(is_dot_dot) {
@@ -63,6 +70,11 @@ fn target(spec: &EndpointSpec, req: &Uri) -> Result<Uri, EndpointError> {
     }
     if spec.path == EndpointPath::Fixed {
         return Ok(spec.url.clone());
+    }
+    if has_encoded_separator(req_path) {
+        return Err(EndpointError::PathRefused(format!(
+            "{req_path:?} has a percent-encoded slash or backslash"
+        )));
     }
     let normalised = roxy_http::url::normalize_path(req_path.as_bytes())
         .map_err(|e| EndpointError::PathRefused(e.to_string()))?;
@@ -94,6 +106,12 @@ fn target(spec: &EndpointSpec, req: &Uri) -> Result<Uri, EndpointError> {
 /// Whether a raw path segment is `..`, allowing for percent-encoded dots.
 fn is_dot_dot(segment: &str) -> bool {
     segment.to_ascii_lowercase().replace("%2e", ".") == ".."
+}
+
+/// Whether a raw path carries `%2F` or `%5C` in either case.
+fn has_encoded_separator(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("%2f") || lower.contains("%5c")
 }
 
 pub(super) fn authority_of(uri: &Uri) -> Result<(Scheme, Authority), String> {
@@ -153,10 +171,18 @@ async fn attempt_all(
     let uri = target(spec, req.uri()).map_err(|e| (e, 0))?;
     let (scheme, authority) = authority_of(&uri).map_err(fail)?;
     let (parts, body) = req.into_parts();
-    let body = body
-        .collect_up_to(MAX_ENDPOINT_REQUEST_BYTES)
-        .await
-        .map_err(|e| fail(format!("request body: {e}")))?;
+    // The guest drives the body, so reading it is under the timeout like
+    // the attempt itself; the permit holds the exchange's in-flight cap.
+    let admitted = tokio::time::timeout(spec.timeout, async {
+        let permit = st.endpoint_calls.acquire().await;
+        (permit, body.collect_up_to(MAX_ENDPOINT_REQUEST_BYTES).await)
+    })
+    .await;
+    let Ok((permit, body)) = admitted else {
+        return Err((EndpointError::Timeout, 0));
+    };
+    let _permit = permit.map_err(|e| fail(format!("endpoint calls: {e}")))?;
+    let body = body.map_err(|e| fail(format!("request body: {e}")))?;
 
     let mut headers = http::HeaderMap::new();
     for (n, v) in &parts.headers {
@@ -310,9 +336,17 @@ mod tests {
     }
 
     /// `..` is refused outright in both modes, even where it would not have
-    /// left the prefix, and in any percent-encoded spelling.
+    /// left the prefix, and in any percent-encoded spelling. Under `prefix`
+    /// so is a percent-encoded slash or backslash, which an origin that
+    /// decodes before routing would read as a separator.
     #[test]
     fn dot_dot_is_refused() {
+        let refused = |mode, req: &str| {
+            matches!(
+                join(mode, "https://api.example.com/v1", req),
+                Err(EndpointError::PathRefused(_))
+            )
+        };
         for mode in [EndpointPath::Fixed, EndpointPath::Prefix] {
             for req in [
                 "/../admin",
@@ -321,14 +355,18 @@ mod tests {
                 "/%2e%2e/admin",
                 "/.%2E/admin",
             ] {
-                assert!(
-                    matches!(
-                        join(mode, "https://api.example.com/v1", req),
-                        Err(EndpointError::PathRefused(_))
-                    ),
-                    "{mode:?} {req}"
-                );
+                assert!(refused(mode, req), "{mode:?} {req}");
             }
+        }
+        for req in [
+            "/a%2F..%2Fadmin",
+            "/a%2f..%2fadmin",
+            "/a%5C..%5Cadmin",
+            "/a%5c..%5cadmin",
+            "/a%2Fb",
+        ] {
+            assert!(refused(EndpointPath::Prefix, req), "{req}");
+            assert!(!refused(EndpointPath::Fixed, req), "{req}");
         }
     }
 

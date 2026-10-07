@@ -406,10 +406,12 @@ pub(crate) async fn observe(
             Err(e) => Err(e),
         };
         if let Err(e) = result {
-            // The exchange failing below the observer ends its copies and
-            // its `next` early; what it makes of that is a consequence,
-            // logged against the party at fault, not as its own failure.
-            if below_outcome.await.unwrap_or(false) {
+            // The exchange failing below the observer, at the head or in
+            // the body, ends its copies and its `next` early; what it makes
+            // of that is a consequence, logged against the party at fault,
+            // not as its own failure. A `forward` dropped before the head
+            // is the client gone, which is nobody's failure.
+            if below_outcome.await.unwrap_or(true) || observer_st.failed_below(index).await {
                 return;
             }
             super::emit_layer_error(

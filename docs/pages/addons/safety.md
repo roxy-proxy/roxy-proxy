@@ -34,7 +34,10 @@ slow layer unchecked while it works, so this keeps traffic fail-closed.
   flow holds at most 64 tags, and 4 KiB of them together, across all its
   layers (`budget:tags`). A `flow.log` message, or a `flow.record` kind and
   document together, is at most 64 KiB (`budget:message`). A call past a
-  cap fails the exchange closed, like any other budget. These caps are not
+  cap fails the exchange closed, like any other budget. An endpoint call's
+  request body is at most 16 MiB, read within the endpoint's timeout, and
+  an exchange has at most 8 calls in flight at once; a state key is at most
+  1 KiB. Those refuse the call, not the exchange. These caps are not
   configurable.
 - **Instances.** `max_instances` (default 1024) caps the live instances,
   and so the layer's concurrent exchanges and, with `max_memory`, its

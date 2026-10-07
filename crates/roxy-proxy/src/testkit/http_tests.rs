@@ -200,19 +200,6 @@ async fn a_mismatched_sni_in_a_tunnel_closes() {
     assert_eq!(ev[0]["reason"], "sni_mismatch");
 }
 
-/// The SNI check and the leaf cache key use the same canonical host: a
-/// CONNECT host that differs from the SNI only in case and a trailing dot
-/// is accepted, and the warm-up and the handshake share one leaf.
-#[tokio::test]
-async fn sni_and_connect_host_are_compared_canonically() {
-    let kit = Kit::builder().start().await;
-    let io = kit.connect_tunnel("UP.TEST.", 443).await;
-    kit.tls_connect(io, "up.test", &[b"http/1.1"])
-        .await
-        .unwrap();
-    assert_eq!(kit.minter.cached(), 1);
-}
-
 // ---- bodies ---------------------------------------------------------------
 
 /// Bodies arrive whole, with and without a declared length, on h1 and h2.
@@ -537,11 +524,14 @@ async fn a_slow_upload_outlasts_the_response_header_timeout() {
 
 /// An h2 connection owes its first stream within `header_timeout`, as an
 /// h1 tunnel owes its first request head; between requests it may idle
-/// for `idle_timeout`.
+/// for `idle_timeout`, which is the one that closes it.
 #[tokio::test]
 async fn h2_first_stream_must_arrive_within_header_timeout() {
     let kit = Kit::builder()
-        .limits(|l| l.header_timeout = Duration::from_millis(500))
+        .limits(|l| {
+            l.header_timeout = Duration::from_millis(300);
+            l.idle_timeout = Duration::from_millis(1000);
+        })
         .start()
         .await;
     let (_send, conn) = super::h2_client(&kit).await;
@@ -551,16 +541,21 @@ async fn h2_first_stream_must_arrive_within_header_timeout() {
         .unwrap()
         .unwrap();
 
-    let (send, _conn) = super::h2_client(&kit).await;
+    let (send, conn) = super::h2_client(&kit).await;
     let (parts, _) = super::h2_get(&send, "https://up.test/first", &[])
         .await
         .unwrap();
     assert_eq!(parts.status, 200);
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
     let (parts, _) = super::h2_get(&send, "https://up.test/second", &[])
         .await
-        .expect("a gap between requests is bounded by idle_timeout");
+        .expect("a gap past header_timeout but within idle_timeout is fine");
     assert_eq!(parts.status, 200);
+    tokio::time::timeout(Duration::from_secs(5), conn)
+        .await
+        .expect("the connection closes once idle for idle_timeout")
+        .unwrap()
+        .unwrap();
 }
 
 /// With `http.allow_trailers`, a response of `content-length: 0` that ends
@@ -948,7 +943,8 @@ async fn h2_a_closing_deny_lets_a_stream_mid_upload_finish() {
 // ---- CONNECT and SNI ---------------------------------------------------------
 
 /// The CONNECT host and the SNI are compared as names: case and a trailing
-/// dot do not make them differ, and the request's `Host` is held to the
+/// dot do not make them differ, the warm-up and the handshake share one
+/// leaf under that name, and the request's `Host` is held to the
 /// normalised CONNECT host.
 #[tokio::test]
 async fn a_tunnel_host_is_normalised_before_the_sni_check() {
@@ -958,6 +954,7 @@ async fn a_tunnel_host_is_normalised_before_the_sni_check() {
         .tls_connect(io, "up.test", &[b"http/1.1"])
         .await
         .expect("the SNI names the CONNECT host");
+    assert_eq!(kit.minter.cached(), 1);
     tls.write_all(b"GET /n HTTP/1.1\r\nhost: up.test\r\n\r\n")
         .await
         .unwrap();

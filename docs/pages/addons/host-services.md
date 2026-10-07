@@ -15,7 +15,9 @@ the timeout and retries, and enforces the address floor and deny lists.
 The layer cannot express a destination, and credentials never enter the
 layer. Calls never pass through the layer stack, so a monitor's own model
 call cannot recurse through it. The request body is buffered (up to 16 MiB)
-so a retry can resend it; retries back off from 100 ms. An unknown name, a
+so a retry can resend it, and reading it counts against the timeout; retries
+back off from 100 ms. One exchange has at most 8 calls in flight at once;
+further calls wait for a permit, also within the timeout. An unknown name, a
 denied address, a refused path, a timeout and a failure reach the layer as
 distinct `error-code`s. Each call emits an `endpoint_call` flow event.
 
@@ -26,7 +28,9 @@ setting:
   request's path and query are ignored.
 - `prefix`: the request's path is normalised (percent-encodings
   canonicalised, `.` segments removed) and appended under the configured
-  path; its query follows the endpoint's own.
+  path; its query follows the endpoint's own. A path with a percent-encoded
+  slash or backslash (`%2F`, `%5C`) is refused: an origin that decodes
+  before routing would read it as a separator.
 
 A path with a `..` segment, in any percent-encoded spelling, is refused in
 both modes, whether or not it would have resolved inside the prefix. The
@@ -43,9 +47,9 @@ expose. Endpoint responses go back to the layer, not through the rules.
 ## State (`state`)
 
 `flow.state-get` / `flow.state-put`: a JSON-value store namespaced per
-layer, with per-entry TTL, a value size cap and an entry cap. A miss returns
-`none`. A write when full returns an error and the layer decides; nothing is
-evicted.
+layer, with per-entry TTL, a value size cap and an entry cap. A key is at
+most 1 KiB. A miss returns `none`. A write when full, or with a longer key,
+returns an error and the layer decides; nothing is evicted.
 
 Each layer's store is separate, so a full or busy store in one layer does
 not slow another. Expired entries read as absent straight away. When a new

@@ -436,6 +436,8 @@ pub(crate) struct StackFlow {
     /// The first layer to run has decoded the request for the layers.
     request_decoded: AtomicBool,
     upgrade: Mutex<Upgrade>,
+    /// Permits for the exchange's endpoint calls in flight.
+    endpoint_calls: tokio::sync::Semaphore,
 }
 
 impl std::ops::Deref for StackFlow {
@@ -465,6 +467,7 @@ impl StackFlow {
             close: AtomicBool::new(false),
             request_decoded: AtomicBool::new(false),
             upgrade: Mutex::new(Upgrade::None),
+            endpoint_calls: tokio::sync::Semaphore::new(endpoint::MAX_ENDPOINT_CALLS_IN_FLIGHT),
         }
     }
 
@@ -580,8 +583,15 @@ impl StackFlow {
 
     /// The outcomes of the WASM layers whose handlers returned a response.
     fn layer_outcomes(&self) -> Vec<LayerOutcome> {
+        self.outcomes_from(0)
+    }
+
+    /// The outcomes of the WASM layers at or below `from` that have
+    /// answered.
+    fn outcomes_from(&self, from: usize) -> Vec<LayerOutcome> {
         self.layers
             .iter()
+            .skip(from)
             .filter_map(|l| {
                 l.outcome
                     .lock()
@@ -589,6 +599,12 @@ impl StackFlow {
                     .clone()
             })
             .collect()
+    }
+
+    /// Whether a WASM layer below `index` failed the exchange after its
+    /// head, once those that answered have settled.
+    pub(crate) async fn failed_below(&self, index: usize) -> bool {
+        first_failure(self.outcomes_from(index + 1)).await.is_err()
     }
 
     /// The client asked for a WebSocket, the one upgrade the core relays.

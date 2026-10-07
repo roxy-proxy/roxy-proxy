@@ -252,6 +252,47 @@ async fn a_failure_below_an_observer_is_not_logged_as_the_observers() {
     assert_eq!(errs[0]["layer"], "b", "{errs:#?}");
     assert_eq!(errs[0]["mode"], "enforce");
     // The observer's own end would be logged just after the enforcer's.
+    // Nothing marks the observer's task ending, so this check is
+    // best-effort: a late event lands after the window.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let errs: Vec<_> = kit
+        .sink
+        .events()
+        .into_iter()
+        .filter(|e| e["event"] == "layer_error")
+        .collect();
+    assert_eq!(errs.len(), 1, "{errs:#?}");
+}
+
+/// An enforcer failing below an observer after the head cuts the real
+/// body and the observer's copy with it; the observer's own end is a
+/// consequence, and the one `layer_error` is the enforcer's.
+#[tokio::test]
+async fn an_enforcer_failing_after_the_head_below_an_observer_is_the_one_logged() {
+    let kit = stack(&[
+        AddonDef::test_layer("o").observe(),
+        AddonDef::test_layer("b"),
+    ])
+    .await;
+    // The delay lets the head reach the client before the trap; a trap
+    // that lands first takes the `503` path instead, and the test fails
+    // on the status rather than passing for the wrong reason.
+    let a = kit
+        .h1()
+        .await
+        .call(
+            "GET",
+            "/x",
+            &[("x-test-b", "trap-after-head"), ("x-delay-ms", "1000")],
+            b"",
+        )
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert!(a.body.is_err(), "the body is cut: {a:?}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["layer"], "b", "{errs:#?}");
+    assert_eq!(errs[0]["kind"], "trap", "{errs:#?}");
+    // Best-effort, as above: nothing marks the observer's task ending.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let errs: Vec<_> = kit
         .sink
@@ -307,7 +348,8 @@ async fn an_observer_above_a_deny_sees_its_copy_end_cleanly() {
     assert_eq!(reqs[1]["terminal_rule"], "layer:b", "{reqs:#?}");
 
     // The observer's trap, had its copy failed, would be logged after the
-    // request.
+    // request. Nothing marks the observer's task ending, so this check is
+    // best-effort.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let errs: Vec<_> = kit
         .sink
@@ -735,6 +777,8 @@ async fn an_observer_that_drops_its_copy_is_not_lagging() {
     let a = answer.await.unwrap().unwrap();
     assert_eq!(a.status, 200, "{a:?}");
     assert_eq!(a.json()["body_len"], 4);
+    // A lag report is emitted while the body streams, before the request
+    // event, so once that is here the absence is settled.
     kit.request_event().await;
     let lagged: Vec<_> = kit
         .sink
@@ -773,13 +817,16 @@ mod service {
             ],
         )
         .await;
+        // The delay lets the head reach the client through the service
+        // before the trap; a trap that lands first takes the `503` path
+        // (the test below), and this one fails on the status.
         let a = kit
             .h1()
             .await
             .call(
                 "GET",
                 "/x",
-                &[("x-test-w", "trap-after-head"), ("x-delay-ms", "300")],
+                &[("x-test-w", "trap-after-head"), ("x-delay-ms", "1000")],
                 b"",
             )
             .await;

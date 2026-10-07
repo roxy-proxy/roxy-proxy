@@ -603,7 +603,7 @@ async fn an_upstream_failure_leaves_the_connection_open(h2: bool) {
         assert_eq!(a.status, 502, "{a:?}");
         assert!(a.headers.get("connection").is_none(), "{a:?}");
     }
-    assert_eq!(kit.events("upstream_error", 2).await.len(), 2);
+    kit.events("upstream_error", 2).await;
 }
 
 #[tokio::test]
@@ -1225,7 +1225,9 @@ async fn a_request_pipelined_behind_a_closing_deny_is_discarded() {
     assert_eq!(out.matches("HTTP/1.1 ").count(), 1, "{out}");
     let ev = kit.events("request", 1).await;
     assert_eq!(ev[0]["req"]["path"], "/denied-close", "{ev:#?}");
-    // Nothing for the second request, now or later.
+    // Nothing for the second request, now or later. The connection has
+    // closed (`eof`), but the sink is written after the fact, so this
+    // check is best-effort.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let events = kit.sink.events();
     assert_eq!(
