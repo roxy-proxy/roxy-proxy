@@ -125,7 +125,17 @@ impl Body {
     /// A channel-backed body. The sender enforces `max_bytes` and (if given)
     /// `known_length`. At most [`CHANNEL_DEPTH`] frames are in flight.
     pub fn channel(max_bytes: u64, known_length: Option<u64>) -> (BodySender, Body) {
-        let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
+        Self::channel_with_depth(CHANNEL_DEPTH, max_bytes, known_length)
+    }
+
+    /// [`Body::channel`] with at most `depth` frames in flight before the
+    /// sender waits (a producer whose buffering must stay small).
+    pub fn channel_with_depth(
+        depth: usize,
+        max_bytes: u64,
+        known_length: Option<u64>,
+    ) -> (BodySender, Body) {
+        let (tx, rx) = mpsc::channel(depth);
         (
             BodySender {
                 tx,

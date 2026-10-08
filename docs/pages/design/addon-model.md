@@ -6,7 +6,8 @@ both streams of every exchange it runs on. An addon is either:
 
 - **a WASM layer** (`kind: wasm`): a WebAssembly component run in-process by
   `roxy-wasm`, written against the `roxy:addon` WIT package
-  ([`wit/addon.wit`](https://github.com/roxy-proxy/roxy-proxy/blob/main/wit/addon.wit)); or
+  ([`wit/addon.wit`](https://github.com/roxy-proxy/roxy-proxy/blob/main/wit/addon.wit)),
+  which hands each head over as one record and each body as a stream; or
 - **a service layer** (`kind: service`): an external service in the network
   path, which each exchange streams through over a WebSocket
   ([service layer protocol](/reference/service-layers)).

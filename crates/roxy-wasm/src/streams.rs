@@ -29,6 +29,11 @@ use crate::exchange::ExchangeShared;
 
 /// Most bytes one `write` to a guest-produced body may carry: one frame.
 const WRITE_CHUNK: usize = 64 * 1024;
+/// Frames of a guest-produced body in flight to its reader before the
+/// guest's writes wait: a chunk or two, so what the host holds for a guest
+/// body stays small and a guest writing ahead of a slow reader blocks on
+/// the reader's progress.
+const OUTPUT_DEPTH: usize = 2;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -336,7 +341,7 @@ impl Streams {
         produced: Produced,
         shared: Arc<ExchangeShared>,
     ) -> wasmtime::Result<(Resource<DynOutputStream>, Body)> {
-        let (tx, body) = Body::channel(u64::MAX, None);
+        let (tx, body) = Body::channel_with_depth(OUTPUT_DEPTH, u64::MAX, None);
         let state = Arc::new(Mutex::new(OutputState {
             sender: Some(tx),
             produced,
@@ -350,7 +355,7 @@ impl Streams {
     }
 
     /// Takes the sender behind an `output-stream` this exchange handed out,
-    /// so dropping the guest's handle no longer cuts the body. `None` for a
+    /// so that dropping the guest's handle leaves the body alone. `None` for a
     /// stream that is not one of those.
     pub(crate) fn take_output(&mut self, res: &Resource<DynOutputStream>) -> Option<BodySender> {
         let state = self.outputs.remove(&res.rep())?;

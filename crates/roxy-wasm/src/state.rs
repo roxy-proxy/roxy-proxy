@@ -430,7 +430,7 @@ impl chain::Host for StoreState {
         *resp.status_mut() = status;
         *resp.headers_mut() = headers;
         // The receiver is gone only once the exchange has failed or been
-        // cancelled, and then the answer no longer matters.
+        // cancelled; an answer to a failed exchange is discarded.
         let _ = answer.send(resp);
         Ok(out)
     }
