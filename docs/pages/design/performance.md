@@ -18,10 +18,21 @@ figures coincide. Envoy's CONNECT seat is a TCP tunnel that does not decrypt
 and is not in that table: its 16,800 requests per core at 1 KiB against
 roxy's 9,100 is the cost of terminating and re-originating TLS.
 
-A no-op addon is not free. A [WASM layer](/design/addon-model) that forwards
-everything unchanged costs about half of the throughput at every size: each
-exchange and each body frame crosses the guest boundary on the way down and
-on the way up ([#403](https://github.com/roxy-proxy/roxy-proxy/issues/403)).
+A no-op addon is not free. A [WASM layer](/design/addon-model) built with
+the SDK that forwards everything unchanged costs 37% to 48% of the
+throughput (table below). The cost is the number of calls the guest makes
+into the host: about 60 for a 1 KiB exchange, each roughly a microsecond of
+component-model bookkeeping before roxy's own code runs. The WASI HTTP types
+read and write a head a field at a time, waiting for a response takes a
+subscribe, a block and a drop, and every resource is released by a call of
+its own. The SDK keeps bodies and header lists out of that count: a body
+the layer does not touch is moved from stream to stream by the host without
+entering guest memory, and a head the layer does not change goes back as
+the host's own copy (copying one header field into the guest and back costs
+about 2 µs). The calls that remain are the shape of the WIT
+([#403](https://github.com/roxy-proxy/roxy-proxy/issues/403),
+[#319](https://github.com/roxy-proxy/roxy-proxy/issues/319)).
+
 A Python [service layer](/reference/service-layers) that does the same is
 bound by its own single core at about 2,400 requests per second, with roxy
 at 1.2 to 1.4 cores; that is the floor for an asyncio sidecar, not the cost
@@ -54,14 +65,17 @@ of the protocol.
 
 | seat | no addons req/s | no-op WASM layer req/s | no-op service layer req/s | sidecar cores |
 |---|---|---|---|---|
-| gateway, 1 KiB, 64 clients | 38,275 | 18,326 (-52%) | 2,402 (-94%) | 1.00 |
-| gateway, 1 KiB, 256 clients | 42,084 | 18,533 (-56%) | 2,357 (-94%) | 1.00 |
-| gateway, 64 KiB, 64 clients | 14,480 | 7,208 (-50%) | 1,050 (-93%) | 1.00 |
-| gateway, 1 MiB, 64 clients | 1,497 | 689 (-54%) | 71 (-95%) | 1.00 |
-| forward proxy, 1 KiB, 64 clients | 36,216 | 17,496 (-52%) | 2,333 (-94%) | 1.00 |
-| forward proxy, 1 KiB, 256 clients | 35,743 | 15,301 (-57%) | 2,169 (-94%) | 1.00 |
-| forward proxy, 64 KiB, 64 clients | 22,510 | 12,014 (-47%) | 1,195 (-95%) | 0.80 |
-| forward proxy, 1 MiB, 64 clients | 4,756 | 1,721 (-64%) | 240 (-95%) | 1.00 |
+| gateway, 1 KiB, 64 clients | 40,555 | 21,446 (-47%) | 2,402 (-94%) | 1.00 |
+| gateway, 64 KiB, 64 clients | 13,936 | 8,561 (-39%) | 1,050 (-93%) | 1.00 |
+| gateway, 1 MiB, 64 clients | 1,546 | 843 (-45%) | 71 (-95%) | 1.00 |
+| forward proxy, 1 KiB, 64 clients | 38,043 | 21,155 (-44%) | 2,333 (-94%) | 1.00 |
+| forward proxy, 64 KiB, 64 clients | 23,184 | 14,564 (-37%) | 1,195 (-95%) | 0.80 |
+| forward proxy, 1 MiB, 64 clients | 4,638 | 2,392 (-48%) | 240 (-95%) | 1.00 |
+
+roxy is at four cores in every row of this table, so the WASM column is
+CPU per exchange. The service column is from the 2026-10-07 run below, and
+the 1 KiB rows at 256 clients from that run (not re-taken) were 42,084 and
+35,743 req/s with no addons and 2,357 and 2,169 with the service layer.
 
 ## What is not measured
 
@@ -92,7 +106,10 @@ roxy is `ghcr.io/roxy-proxy/roxy:edge` at
 (commit `8adb52f`): one rule allowing the upstream (`private_ok: true`), no
 body rules, no digest, no addons unless the row says so, flow log on a tmpfs.
 Envoy is v1.33 with `--concurrency 4`; mitmproxy is 12.2.3 (`mitmdump` with
-`stream_large_bodies=1`). The host was shared with other builds: a row whose
+`stream_large_bodies=1`). The no-addon and no-op WASM rows were re-taken on
+2026-10-08 with a local release build of the same roxy (glibc, not the
+image) and a no-op layer built with the SDK at that commit, in the same
+harness and seats; its no-addon rows are within 6% of the image's. The host was shared with other builds: a row whose
 host-wide busy time on the proxy's cores exceeded the proxy's own CPU by more
 than 0.1 core was re-run; the service rows show that gap on every attempt
 without it moving the result.
