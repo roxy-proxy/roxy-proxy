@@ -1,4 +1,4 @@
-//! The addon ayer stack.
+//! The addon layer stack.
 //!
 //! ```text
 //!   front ─▶ addon 0 ─▶ … ─▶ addon n-1 ─▶ core (rules ↓ / ↑, address floor, connector)

@@ -178,7 +178,10 @@ impl HttpBody for Spliced {
         while let Some(own) = &mut self.own {
             match ready!(Pin::new(own).poll_frame(cx)) {
                 None => self.own = None,
-                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                Some(Err(e)) => {
+                    self.own = None;
+                    return Poll::Ready(Some(Err(e)));
+                }
                 Some(Ok(_)) => {
                     let name = self.st.snap.addons[self.index].name.clone();
                     self.st
