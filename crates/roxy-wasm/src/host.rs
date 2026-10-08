@@ -4,6 +4,8 @@ use std::net::IpAddr;
 
 use roxy_http::Body;
 
+use crate::error::LayerError;
+
 /// A request passing through a layer: the head as an [`http::Request`]
 /// with an absolute URI (scheme and authority set), and a streaming
 /// [`Body`].
@@ -175,4 +177,12 @@ pub trait LayerHost: Send + Sync + 'static {
 
     /// Read a metric (capability `metrics`).
     async fn metric_get(&self, id: String, key: Vec<String>) -> Result<Option<i64>, HostError>;
+
+    /// The exchange failed with `err`. Called once, before the failure can
+    /// be seen anywhere else: before [`crate::Layer::handle`] returns it,
+    /// before a body the layer produced ends on it, before the
+    /// [`crate::LayerOutcome`] reports it. So a host that attributes
+    /// failures has this one recorded by the time anything downstream fails
+    /// on it. Must not call back into the layer.
+    fn failed(&self, err: &LayerError);
 }

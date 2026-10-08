@@ -251,17 +251,11 @@ impl Stream {
         // Recorded before anything learns of the end: the exchange may
         // finish on a body aborted here (the core failing on the request
         // the service forwarded, say) before any answer is read.
-        let blame = if let Unanswered::Service(e) = &e
+        if let Unanswered::Service(e) = &e
             && self.mode == AddonMode::Enforce
         {
-            let name = self.name();
-            let err = StackError::Service(e.clone());
-            self.st.fail(&name, err.clone());
-            self.st.service_failed(self.index);
-            Some((name, err))
-        } else {
-            None
-        };
+            self.st.fail(&self.name(), StackError::Service(e.clone()));
+        }
         for inbox in ending.inboxes.into_iter().flatten() {
             inbox.abort(&e);
         }
@@ -269,21 +263,10 @@ impl Stream {
             Pending::First(tx) => {
                 let _ = tx.send(Err(e));
             }
-            Pending::Second(tx) if !tx.is_closed() => {
+            Pending::Second(tx) => {
                 let _ = tx.send(Err(e));
             }
-            Pending::Second(_) | Pending::None => {
-                if let Some((name, err)) = blame {
-                    // The head has gone on: the failure is logged here,
-                    // since no answer carries it.
-                    super::super::super::emit_stack_error(
-                        &self.st,
-                        &name,
-                        &err,
-                        AddonMode::Enforce,
-                    );
-                }
-            }
+            Pending::None => {}
         }
     }
 

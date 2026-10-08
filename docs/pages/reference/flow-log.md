@@ -62,7 +62,8 @@ produces a `request` event:
 | `ws_open`, `ws_close` | a relayed WebSocket, with byte counts; `ws_close` has `close_code` and `close_reason` when roxy ended it |
 | `ws_message` | a WebSocket message a rule denied, or one sampled by `log.flow.ws_message_every` ([WebSockets](/reference/websockets#message-rules)) |
 | `log` | a rule's `log` action |
-| `layer_error`, `layer_record`, `endpoint_call` | [addons](/design/addon-model) |
+| `layer_error` | an addon layer failed; `kind` is `trap`, `budget:<limit>`, `capability:<name>`, `invalid_request`, `invalid_response`, `no_response`, `service:<code>`, `when:<code>`, ... In enforce mode it names the one layer blamed for the exchange ([who is blamed](/design/addon-model#who-is-blamed)), once; a client's broken upload, an upstream body or the buffer budget failing a layer logs none. In observe mode every failure of the observer's own is logged |
+| `layer_record`, `endpoint_call` | [addons](/design/addon-model) |
 | `observer_lagged` | an observe-mode addon's copy of a stream was cut; `reason` is `observer_behind` (it fell `max_observer_lag_bytes` behind), `buffer_budget_exhausted` (the [buffer budget](/reference/limits#limits) could not cover the copy) or `no_instance` (no instance of the layer came free within its `first_byte_timeout`) |
 | `connect` | a CONNECT, when `log.flow.connection_events` is on. A tunnel closed at its first bytes (`sni_mismatch`, `bad_sni`, neither TLS nor HTTP) is a `parse_error` |
 | `connection_refused` | a connection cap was hit ([limits](/reference/limits#connections)) |

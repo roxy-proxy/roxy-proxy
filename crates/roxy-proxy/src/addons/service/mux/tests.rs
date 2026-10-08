@@ -176,26 +176,29 @@ async fn bytes_of_a_body_without_a_head_fail_the_stream() {
 
 /// A body that fails on its way to the service ends the stream without
 /// blaming the service: the pending answer says which body failed, and
-/// the exchange takes a request body's failure as the client's.
+/// the fault is whoever handed the body to the stack, recorded as the
+/// pump read the failure.
 #[tokio::test]
 async fn a_body_failing_on_its_way_to_the_service_is_not_its_failure() {
+    use crate::addons::attribution::{Fault, Side, attributed};
     let (stream, answers, _kit) = lone_stream().await;
     let (tx, body) = Body::channel(u64::MAX, None);
     tx.abort(BodyError::Incomplete);
+    let body = attributed(&stream.st, Side::Client, body);
     assert!(!stream.pump_body(Dir::Request, body).await);
+    assert!(
+        matches!(stream.st.attribution.fault(), Some(Fault::Client(_))),
+        "the client is at fault, not the service"
+    );
     let lost = answers.first.await.unwrap().err().expect("no answer");
     assert!(
         matches!(lost, Unanswered::Body(Dir::Request, BodyError::Incomplete)),
         "{lost:?}"
     );
     assert!(matches!(
-        super::super::unanswered(&stream.st, 0, lost),
+        super::super::unanswered(lost),
         super::super::Fail::Below(_)
     ));
-    assert!(
-        matches!(stream.st.take_fault(), crate::addons::Fault::Client(_)),
-        "the client is at fault, not the service"
-    );
 }
 
 /// A connection that failed keeps its place in the pool while streams

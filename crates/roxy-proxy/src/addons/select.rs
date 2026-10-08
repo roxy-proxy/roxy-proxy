@@ -61,7 +61,7 @@ pub(super) fn selects(
                 return Err(err);
             }
             // An observer cannot affect traffic, so neither can its `when`.
-            emit_stack_error(st, &addon.name, &err, AddonMode::Observe);
+            emit_stack_error(&st.meta, &addon.name, &err, AddonMode::Observe);
             Ok((false, join_upgrade_stream(to_layer_request(creq), stream)))
         }
     }
