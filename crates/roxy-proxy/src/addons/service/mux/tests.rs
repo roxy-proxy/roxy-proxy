@@ -243,13 +243,16 @@ async fn streams_spread_across_connections() {
         max_streams: 2,
         retired: AtomicBool::new(false),
     });
-    let a = pool.reserve().await;
-    let b = pool.reserve().await;
-    assert!(!Arc::ptr_eq(&a.link, &b.link), "a second connection opens");
-    let c = pool.reserve().await;
-    let d = pool.reserve().await;
+    let first = pool.reserve().await;
+    let second = pool.reserve().await;
     assert!(
-        !Arc::ptr_eq(&c.link, &d.link),
+        !Arc::ptr_eq(&first.link, &second.link),
+        "a second connection opens"
+    );
+    let third = pool.reserve().await;
+    let fourth = pool.reserve().await;
+    assert!(
+        !Arc::ptr_eq(&third.link, &fourth.link),
         "the connection with fewer streams takes the next"
     );
     assert!(
@@ -258,10 +261,10 @@ async fn streams_spread_across_connections() {
             .is_err(),
         "every connection is full"
     );
-    let freed = a.link.clone();
-    drop(a);
-    let e = pool.reserve().await;
-    assert!(Arc::ptr_eq(&e.link, &freed), "the place a stream freed");
+    let freed = first.link.clone();
+    drop(first);
+    let fifth = pool.reserve().await;
+    assert!(Arc::ptr_eq(&fifth.link, &freed), "the place a stream freed");
     assert!(lock(&pool.entries).iter().all(|e| e.reserved == 2));
 }
 
