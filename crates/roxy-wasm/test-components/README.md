@@ -6,7 +6,7 @@ Small `roxy:addon` components used by `crates/roxy-wasm/tests/`.
   also relay full duplex, deny, answer itself (at once, after reading part of
   the body, or after forwarding part of it to `next`), rewrite, loop, hog
   memory, tag without end, build an oversized `fields`, log or record an
-  oversized payload, call `next` twice, hold its bodies open, trap at various points,
+  oversized payload, call `next` twice, hold its bodies open or either head, trap at various points,
   leak a body and call every host service. The request's `x-test` header picks the behaviour. A
   layer configured with `{"name": "a"}` reads `x-test-a` first, tags flows it
   passes on `via:a` (unless configured `"tag": false`) and appends `a` to the

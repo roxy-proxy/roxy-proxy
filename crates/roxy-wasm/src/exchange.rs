@@ -28,7 +28,6 @@ use http_body::{Body as HttpBody, Frame, SizeHint};
 use roxy_http::{Body, BodyError};
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
-use tokio::time::Instant;
 use wasmtime_wasi_http::Error as WasiError;
 
 use crate::error::LayerError;
@@ -57,8 +56,9 @@ pub(crate) struct ExchangeShared {
     /// Told of the first failure as it is recorded.
     host: Arc<dyn LayerHost>,
     status: watch::Sender<Status>,
-    /// `next` is running below the layer: the head clock is paused.
-    below: watch::Sender<bool>,
+    /// Odd while `next` runs below the layer, so the head clock is stopped;
+    /// each return of `next` makes it even again.
+    below: watch::Sender<u64>,
     /// Why the request body passed to `next` was cut, if it was.
     next_cut: OnceLock<String>,
 }
@@ -76,38 +76,52 @@ impl ExchangeShared {
         Arc::new(Self {
             host,
             status: watch::Sender::new(Status::default()),
-            below: watch::Sender::new(false),
+            below: watch::Sender::new(0),
             next_cut: OnceLock::new(),
         })
     }
 
-    /// `next` started (`true`) or returned its response head (`false`).
-    pub(crate) fn set_below(&self, below: bool) {
-        self.below.send_replace(below);
+    /// `next` started: the layer's time stops.
+    pub(crate) fn next_started(&self) {
+        self.below.send_modify(|n| *n += 1);
     }
 
-    /// Resolves once the layer has run for `limit` of its own time: the
-    /// clock stops while `next` is below it. Drop it once the layer's
-    /// response head is set.
-    pub(crate) fn head_clock(&self, limit: Duration) -> impl Future<Output = ()> + Send + 'static {
+    /// `next` returned its response head (or the guest abandoned it): the
+    /// layer's time runs again, with a whole budget for the response head.
+    pub(crate) fn next_returned(&self) {
+        self.below.send_modify(|n| *n += 1);
+    }
+
+    /// Resolves once the layer has held a head for `limit` of its own time:
+    /// the request head from the clock's start, less the `used` already
+    /// spent on it (starting the instance), and the response head from the
+    /// moment `next` returns. The clock does not run while `next` is below
+    /// the layer. Drop it once the layer's response head is set.
+    pub(crate) fn head_clock(
+        &self,
+        limit: Duration,
+        used: Duration,
+    ) -> impl Future<Output = ()> + Send + 'static {
         let mut below = self.below.subscribe();
         async move {
-            let mut left = limit;
+            let mut left = limit.saturating_sub(used);
             loop {
                 // The sender lives as long as the exchange; gone, nothing
                 // is left to time.
-                if below.wait_for(|b| !*b).await.is_err() {
+                if below.wait_for(|n| n % 2 == 0).await.is_err() {
                     return std::future::pending().await;
                 }
-                let started = Instant::now();
-                let went_below = async { below.wait_for(|b| *b).await.is_ok() };
+                // Any change means `next` ran: it may have started and
+                // returned between two looks, so a change restarts the
+                // clock whether or not `next` is still below.
+                let changed = async { below.changed().await.is_ok() };
                 tokio::select! {
                     () = tokio::time::sleep(left) => return,
-                    ok = went_below => {
+                    ok = changed => {
                         if !ok {
                             return std::future::pending().await;
                         }
-                        left = left.saturating_sub(started.elapsed());
+                        left = limit;
                     }
                 }
             }
@@ -481,6 +495,7 @@ mod tests {
         EndpointError, FlowInfo, HostError, LayerRequest, LayerResponse, LogLevel, TagError,
     };
     use http_body_util::BodyExt;
+    use tokio::time::Instant;
 
     /// A host that hears of failures and nothing else.
     struct Deaf;
@@ -543,22 +558,53 @@ mod tests {
         assert_eq!(s.outcome().wait().await, Ok(()));
     }
 
+    /// Each head gets the whole limit: time below is not counted, and the
+    /// request-phase hold does not eat into the response-phase one.
     #[tokio::test(start_paused = true)]
-    async fn the_head_clock_stops_while_next_is_below() {
+    async fn the_head_clock_restarts_when_next_returns() {
         let s = shared();
-        let clock = s.head_clock(Duration::from_secs(10));
+        let clock = s.head_clock(Duration::from_secs(10), Duration::from_secs(2));
         tokio::pin!(clock);
         let start = Instant::now();
         let s2 = s.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(4)).await;
-            s2.set_below(true);
+            tokio::time::sleep(Duration::from_secs(7)).await;
+            s2.next_started();
             tokio::time::sleep(Duration::from_secs(100)).await;
-            s2.set_below(false);
+            s2.next_returned();
         });
         clock.await;
-        // 4s before `next`, 100s below (not counted), then the last 6s.
-        assert_eq!(start.elapsed().as_secs(), 110);
+        // 2s of instance start and 7s before `next` leave 1s of the first
+        // budget; 100s below (not counted); then the full 10s again.
+        assert_eq!(start.elapsed().as_secs(), 117);
+    }
+
+    /// A `next` that returns before the clock has seen it start still
+    /// restarts the clock.
+    #[tokio::test(start_paused = true)]
+    async fn an_instant_next_restarts_the_head_clock() {
+        let s = shared();
+        let clock = s.head_clock(Duration::from_secs(10), Duration::ZERO);
+        tokio::pin!(clock);
+        let start = Instant::now();
+        let s2 = s.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(7)).await;
+            s2.next_started();
+            s2.next_returned();
+        });
+        clock.await;
+        assert_eq!(start.elapsed().as_secs(), 17);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_head_clock_expires_before_next() {
+        let s = shared();
+        let clock = s.head_clock(Duration::from_secs(10), Duration::from_secs(2));
+        tokio::pin!(clock);
+        let start = Instant::now();
+        clock.await;
+        assert_eq!(start.elapsed().as_secs(), 8);
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ use crate::host::HostError;
 pub enum Budget {
     /// `max_memory`: linear memory would grow past the cap.
     Memory,
-    /// `first_byte_timeout`: no response head in time.
+    /// `first_byte_timeout`: a head held past the limit.
     FirstByte,
     /// The flow holds as many tags, or as many bytes of them, as it may.
     Tags,

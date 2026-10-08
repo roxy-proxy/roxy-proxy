@@ -443,8 +443,7 @@ impl Layer {
         });
 
         let settled = shared.wait_settled();
-        let head_clock =
-            shared.head_clock(limits.first_byte_timeout.saturating_sub(started.elapsed()));
+        let head_clock = shared.head_clock(limits.first_byte_timeout, started.elapsed());
         // The answer is polled first, but the guest can answer and return
         // between that poll and the next branch's, so a settle or an
         // expired clock winning does not mean no answer came: each reads

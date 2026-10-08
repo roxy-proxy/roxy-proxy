@@ -178,6 +178,58 @@ async fn the_head_deadline_excludes_time_below() {
     assert_eq!(body, "slow");
 }
 
+/// A request holding the request head, calling `next`, then holding the
+/// response head, each for most of the limit.
+fn held_heads(before_next: Duration, after_next: Duration) -> roxy_wasm::LayerRequest {
+    let mut req = request("buffer", Body::from_bytes("held"));
+    for (name, d) in [
+        ("x-delay-request-ms", before_next),
+        ("x-delay-response-ms", after_next),
+    ] {
+        req.headers_mut()
+            .insert(name, d.as_millis().to_string().parse().unwrap());
+    }
+    req
+}
+
+/// Each head has the whole limit to itself: holding the request head for
+/// most of it leaves the response head its own.
+#[tokio::test]
+async fn each_head_gets_the_whole_deadline() {
+    let rt = runtime();
+    let mut cfg = config();
+    cfg.limits.first_byte_timeout = Duration::from_secs(1);
+    let layer = load(&rt, cfg).await;
+    let hold = Duration::from_millis(800);
+    let (status, body) = exchange(&layer, Mock::echo(), held_heads(hold, hold))
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "held");
+}
+
+/// Overrunning either head's hold alone fails the exchange closed.
+#[tokio::test]
+async fn overrunning_either_head_fails_closed() {
+    let rt = runtime();
+    let mut cfg = config();
+    cfg.limits.first_byte_timeout = Duration::from_millis(300);
+    let layer = load(&rt, cfg).await;
+    let over = Duration::from_millis(1500);
+    for (before, after) in [(over, Duration::ZERO), (Duration::ZERO, over)] {
+        let start = std::time::Instant::now();
+        let err = exchange(&layer, Mock::echo(), held_heads(before, after))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            LayerError::BudgetExceeded(Budget::FirstByte),
+            "before {before:?}, after {after:?}"
+        );
+        assert!(start.elapsed() < over, "before {before:?}, after {after:?}");
+    }
+}
+
 /// A guest computing for a long time is slow, not failed: nothing
 /// limits CPU between host calls, and the guest still yields.
 #[tokio::test]

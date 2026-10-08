@@ -92,7 +92,7 @@ exchanges slow, never denied. Each is optional.
 
 | key | kind | default | what it bounds |
 |---|---|---|---|
-| `first_byte_timeout` | both | `30s` | the layer's own time to its response head: starting an instance, its work, endpoint calls and reading the client's body count; time `next` spends below it does not. Overrun fails closed, `budget:first_byte_timeout`. On a service layer it bounds getting a stream and each of the service's heads. An observer that gets no instance within it loses its copy (`observer_lagged`, `no_instance`) |
+| `first_byte_timeout` | both | `30s` | how long a layer may hold a head, request or response, before passing it on or answering: its own time only (starting an instance, its work, endpoint calls, reading the body it was given), never time `next` spends below it. Overrun fails closed, `budget:first_byte_timeout`. On a service layer, getting a stream counts against the request head's budget. An observer that gets no instance within it loses its copy (`observer_lagged`, `no_instance`) |
 | `max_memory` | wasm | `64mb` | linear memory per instance, summed over the instance's memories; table growth and the host resource table (4096 live resources) are capped too. What a layer holds of a body lives here. An interpreter in WASM (Python) needs 128–256 MiB |
 | `max_instances` | wasm | `1024` | live instances, so concurrent exchanges and, with `max_memory`, the layer's memory. An enforce exchange that finds none free waits without a deadline; an observer waits `first_byte_timeout`. Instances start on demand |
 | `recycle_after_exchanges` | wasm | `10000` | an instance is replaced after this many exchanges; `0` replaces it after every exchange |
