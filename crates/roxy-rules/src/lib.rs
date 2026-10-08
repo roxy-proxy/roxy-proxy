@@ -5,8 +5,8 @@
 //! ordered rule list with its head/watching classification and typed
 //! actions, and the immutable [`Policy`] snapshot that the proxy swaps
 //! atomically on reload. It also provides the in-process stores behind
-//! `metric.<id>` and `state["k"]`: [`MetricStore`] and [`StateStore`],
-//! exposed to the proxy as [`MetricSource`] and [`StateSource`].
+//! `metric.<id>` and `state["k"]`: [`MetricStore`] and [`StateStore`]
+//! (the latter exposed to the proxy as [`StateSource`]).
 //!
 //! This crate performs no network I/O and does not depend on the HTTP model:
 //! the proxy exposes a flow through the [`FlowView`] trait.
@@ -178,7 +178,7 @@ pub use eval::{
 };
 pub use metrics::{
     CarryOverReport, Clock, DEFAULT_MAX_METRIC_BYTES, DEFAULT_MAX_METRIC_KEYS, MetricError,
-    MetricLimits, MetricSnapshot, MetricSource, MetricStore, Sample,
+    MetricLimits, MetricSnapshot, MetricStore, Sample,
 };
 #[doc(hidden)]
 pub use parser::parse;

@@ -155,13 +155,6 @@ pub struct CarryOverReport {
     pub skipped_budget: usize,
 }
 
-/// The proxy-facing interface to a metric store (the adapter behind
-/// [`FlowView::metric`] and the post-decision `record` call).
-pub trait MetricSource: Send + Sync {
-    fn get(&self, id: &str, view: &dyn FlowView) -> Result<i64, MetricError>;
-    fn record(&self, view: &dyn FlowView, sample: &Sample) -> Result<(), MetricError>;
-}
-
 /// What one exchange contributed since its last [`MetricStore::record`].
 /// An exchange records several samples over its life:
 ///
@@ -801,16 +794,6 @@ impl MetricStore {
         }
         out.sort_by(|a, b| (&a.id, &a.key).cmp(&(&b.id, &b.key)));
         out
-    }
-}
-
-impl MetricSource for MetricStore {
-    fn get(&self, id: &str, view: &dyn FlowView) -> Result<i64, MetricError> {
-        MetricStore::get(self, id, view)
-    }
-
-    fn record(&self, view: &dyn FlowView, sample: &Sample) -> Result<(), MetricError> {
-        MetricStore::record(self, view, sample)
     }
 }
 

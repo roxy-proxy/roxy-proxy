@@ -11,7 +11,7 @@ use common::compile;
 use proptest::prelude::*;
 use roxy_rules::{
     CarryOverReport, Clock, EvalContext, FailClosedReason, Field, MapView, MetricError,
-    MetricSnapshot, MetricSource, MetricStore, Sample, Value,
+    MetricSnapshot, MetricStore, Sample, Value,
 };
 
 /// A manually advanced clock.
@@ -64,13 +64,9 @@ fn rec(s: &MetricStore, v: &MapView) {
 }
 
 #[test]
-fn is_send_sync_and_object_safe() {
+fn is_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<MetricStore>();
-    let c = TestClock::new();
-    let s: Arc<dyn MetricSource> = Arc::new(store_with("- { id: r, count: requests }", 10, &c));
-    s.record(&MapView::new(), &REQ).unwrap();
-    assert_eq!(s.get("r", &MapView::new()), Ok(1));
 }
 
 /// `lookup` tells a key with no series from one that counted nothing;
