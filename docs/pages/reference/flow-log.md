@@ -47,13 +47,14 @@ produces a `request` event:
 | an addon layer dropped the exchange after the rules had forwarded it | `upstream_aborted` |
 | the client went away | `client_gone` |
 | an HTTP/2 client stopped taking the response | `client_stalled` |
+| the response body was cut after its head went out | why it was cut, when roxy knows: `buffer_budget_exhausted` (a decoder window the [buffer budget](/reference/limits#limits) could not cover), `upstream_body_failed` (the upstream's body failed into an addon layer), `layer_error` (a layer failed; the `layer_error` event names it), or the client's `parse_error` reason when its request body was rejected while the response was being written; otherwise `response_write_failed` |
 
 ### Events
 
 | event | when |
 |---|---|
 | `request` | every exchange |
-| `response_error` | the response could not be written after the request was allowed; `reason` is `client_gone` (the client stopped reading or left), `client_stalled` (an HTTP/2 client kept its flow-control window shut for `limits.body_idle_timeout`), `response_body_timeout` (the upstream paused mid-body past `limits.response_body_idle_timeout`), `response_write_failed` (for example a body limit mid-stream) or `continue_write_failed` (roxy's `100 Continue` could not be written) |
+| `response_error` | the response could not be written after the request was allowed; `reason` is `client_gone` (the client stopped reading or left), `client_stalled` (an HTTP/2 client kept its flow-control window shut for `limits.body_idle_timeout`), `response_body_timeout` (the upstream paused mid-body past `limits.response_body_idle_timeout`), the code for a body cut after its head (the last row of the `reason` table above; `response_write_failed` when the cause is not known) or `continue_write_failed` (roxy's `100 Continue` could not be written) |
 | `parse_error` | the client sent something roxy refused to parse; `reason` is a stable code |
 | `upstream_error`, `upstream_denied` | [upstream](/reference/upstream#errors) failures and address-floor hits; `upstream_denied.reason` is `private_range:<class>`, `deny_cidrs` or `list:<name>` ([address floor](/reference/address-lists#address-floor)) |
 | `policy_input_unavailable`, `metric_table_full` | a flow failed closed for want of an input |

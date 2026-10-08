@@ -372,7 +372,7 @@ async fn write_response(
             tracing::debug!("client flow-control window stalled; resetting the stream");
             send.send_reset(h2::Reason::CANCEL);
         }
-        Err(WriteFailure::Io(e)) => {
+        Err(e @ (WriteFailure::Io(_) | WriteFailure::Request(_))) => {
             tracing::debug!(error = %e, "h2 response body failed; resetting the stream");
             send.send_reset(h2::Reason::INTERNAL_ERROR);
         }

@@ -38,6 +38,20 @@ pub(crate) enum Fault {
     Budget,
 }
 
+impl Fault {
+    /// The flow log's code for the fault: the `reason` of the refusal it
+    /// gets before the head, and of the `request` event when it cuts the
+    /// body after it.
+    pub(crate) fn reason(&self) -> &str {
+        match self {
+            Fault::Layer { .. } => "layer_error",
+            Fault::Client(e) => e.reason.as_str(),
+            Fault::UpstreamBody => "upstream_body_failed",
+            Fault::Budget => crate::budget::EXHAUSTED,
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     fault: Option<Fault>,

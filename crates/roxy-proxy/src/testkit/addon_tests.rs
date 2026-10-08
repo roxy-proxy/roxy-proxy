@@ -338,6 +338,32 @@ async fn a_decoder_window_the_budget_cannot_cover_is_the_budgets_refusal() {
     }
 }
 
+/// The same refusal on a response body the layer streams through cuts the
+/// body after the head, and the `request` event says why: the budget's
+/// code, not a bare write failure.
+#[tokio::test]
+async fn a_decoder_window_the_budget_cannot_cover_after_the_head_names_the_budget() {
+    let kit = Kit::builder()
+        .rules(RULES)
+        .addon(AddonDef::test_layer("a"))
+        .limits(|l| l.max_buffered_bytes = 1024)
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let req = c
+        .request("POST", "/echo", &[("x-echo-encoding", "gzip")])
+        .body(roxy_http::Body::from_bytes(gzip(b"hello")))
+        .unwrap();
+    let a = Answer::read(c.send(req).await.unwrap()).await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert!(a.body.is_err(), "the body is cut: {a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["reason"], "buffer_budget_exhausted", "{ev:#}");
+    let errs = kit.events("response_error", 1).await;
+    assert_eq!(errs[0]["reason"], "buffer_budget_exhausted", "{errs:#?}");
+    no_layer_error(&kit);
+}
+
 #[tokio::test]
 async fn an_observer_cannot_block_but_an_enforcer_below_it_can() {
     let kit = stack(&[

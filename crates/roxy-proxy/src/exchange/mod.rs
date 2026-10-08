@@ -68,6 +68,10 @@ pub(crate) enum WriteFailure {
     /// The upstream sent no response-body frame for
     /// `response_body_idle_timeout`; the front cut the body.
     UpstreamStalled,
+    /// The client's request body was rejected (framing, a limit, a
+    /// timeout) while the response was being written; the front cut the
+    /// body.
+    Request(ParseError),
     /// Anything else: the upstream body failed mid-stream, a stalled or
     /// broken write.
     Io(String),
@@ -79,6 +83,7 @@ impl std::fmt::Display for WriteFailure {
             Self::Stopped => f.write_str("stopped by policy"),
             Self::ClientStalled => f.write_str("client flow-control window stalled"),
             Self::UpstreamStalled => f.write_str("response body idle timeout"),
+            Self::Request(e) => write!(f, "{e}"),
             Self::ClientGone(s) | Self::Io(s) => f.write_str(s),
         }
     }
@@ -90,9 +95,8 @@ impl From<WriteError> for WriteFailure {
             WriteError::Io(e) => Self::ClientGone(e.to_string()),
             WriteError::Body(BodyError::Stopped) => Self::Stopped,
             WriteError::Body(BodyError::Timeout) => Self::UpstreamStalled,
-            e @ (WriteError::Body(_) | WriteError::Request(_) | WriteError::State(_)) => {
-                Self::Io(e.to_string())
-            }
+            WriteError::Request(e) => Self::Request(e),
+            e @ (WriteError::Body(_) | WriteError::State(_)) => Self::Io(e.to_string()),
         }
     }
 }
@@ -140,16 +144,28 @@ where
     // failure of its own.
     let failure = match r {
         Ok(()) | Err(WriteFailure::Stopped) => None,
-        Err(e @ WriteFailure::ClientGone(_)) => Some(("client_gone", e)),
-        Err(e @ WriteFailure::ClientStalled) => Some(("client_stalled", e)),
-        Err(e @ WriteFailure::UpstreamStalled) => Some(("response_body_timeout", e)),
-        Err(e @ WriteFailure::Io(_)) => Some(("response_write_failed", e)),
+        Err(e @ WriteFailure::ClientGone(_)) => Some(("client_gone".to_owned(), e)),
+        Err(e @ WriteFailure::ClientStalled) => Some(("client_stalled".to_owned(), e)),
+        Err(e @ WriteFailure::UpstreamStalled) => Some(("response_body_timeout".to_owned(), e)),
+        Err(WriteFailure::Request(e)) => {
+            Some((e.reason.as_str().to_owned(), WriteFailure::Request(e)))
+        }
+        // A body that failed into the addon stack was recorded there as
+        // whoever's fault it was, before the cut reached the front.
+        Err(e @ WriteFailure::Io(_)) => {
+            let reason = cx
+                .stack
+                .as_ref()
+                .and_then(|st| st.fault_reason())
+                .unwrap_or_else(|| "response_write_failed".to_owned());
+            Some((reason, e))
+        }
     };
     if stop.is_none()
         && let Some((reason, e)) = failure
     {
-        emit_response_error(cx, reason, &e);
-        cx.record.reason.get_or_insert_with(|| reason.to_owned());
+        emit_response_error(cx, &reason, &e);
+        cx.record.reason.get_or_insert(reason);
     }
     // One source for both fronts: `refusal_response` sets `res.meta.close`
     // from the same field.
@@ -251,6 +267,7 @@ pub(crate) fn record_continue_failure(cx: &mut FlowCx, e: WriteError) {
         WriteFailure::Stopped
         | WriteFailure::ClientStalled
         | WriteFailure::UpstreamStalled
+        | WriteFailure::Request(_)
         | WriteFailure::Io(_) => "continue_write_failed",
     };
     emit_response_error(cx, reason, &e);

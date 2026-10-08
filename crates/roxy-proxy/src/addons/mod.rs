@@ -489,6 +489,12 @@ impl StackFlow {
         });
     }
 
+    /// The flow log's code for the fault that cut the exchange's response
+    /// body after its head was out, if one is recorded.
+    pub(crate) fn fault_reason(&self) -> Option<String> {
+        self.attribution.fault().map(|f| f.reason().to_owned())
+    }
+
     /// The layer blamed for the exchange failing, if one is.
     #[cfg(test)]
     fn blamed_layer(&self) -> Option<String> {
@@ -786,17 +792,16 @@ fn refuse(st: &Arc<StackFlow>) -> Outcome {
             err: LayerError::NoResponse.into(),
         }
     });
-    match fault {
+    match &fault {
         Fault::Layer { name, .. } => {
             st.attribution.log();
-            Outcome::Refuse(layer_refusal(&name))
+            Outcome::Refuse(layer_refusal(name))
         }
-        Fault::Client(e) => Outcome::Close(e.into()),
-        Fault::UpstreamBody => Outcome::Refuse(Refusal::upstream(
-            StatusCode::BAD_GATEWAY,
-            "upstream_body_failed",
-        )),
-        Fault::Budget => Outcome::Refuse(Refusal::fail_closed(crate::budget::EXHAUSTED)),
+        Fault::Client(e) => Outcome::Close(e.clone().into()),
+        Fault::UpstreamBody => {
+            Outcome::Refuse(Refusal::upstream(StatusCode::BAD_GATEWAY, fault.reason()))
+        }
+        Fault::Budget => Outcome::Refuse(Refusal::fail_closed(fault.reason())),
     }
 }
 
