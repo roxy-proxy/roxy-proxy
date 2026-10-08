@@ -77,7 +77,9 @@ logic of a layer can be unit-tested natively.
 ## What a layer can do
 
 - **Streams.** [`Request`] and [`Response`] carry a [`Body`]: a pull-based
-  sequence of chunks read from roxy only as the layer consumes it.
+  sequence of chunks read from roxy only as the layer consumes it. A body
+  the layer passes on without reading or transforming it never enters the
+  guest: roxy moves it from stream to stream itself.
   - `transform` rewrites it chunk by chunk.
   - `pipe` runs it through a stateful [`ChunkTransform`] that can hold
     bytes back, for example to withhold part of a stream until it has been

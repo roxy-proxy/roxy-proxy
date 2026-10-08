@@ -1,4 +1,4 @@
-//! Writing a request body to the layer below while its response is read.
+//! Writing a body to the host while the layer waits on something else.
 //!
 //! The layer below may start answering before it has read the whole
 //! request (an echo, an early error, a streaming transform), and the host
@@ -7,38 +7,68 @@
 //! so the request body is pumped *alongside* everything else the layer
 //! waits on: the response head in [`crate::Next::run`], and then each read
 //! of the response body.
+//!
+//! A body the layer hands on untouched (a host stream it neither read nor
+//! transformed) never enters the guest: the host moves it from the input
+//! stream to the output stream with `splice`, one call per chunk and no
+//! copy into linear memory. Anything else (in-memory bodies, transforms) is
+//! pulled a chunk at a time and written.
 
 use crate::bindings::wasi::http::types::OutgoingBody;
 use crate::bindings::wasi::io::poll::Pollable;
-use crate::bindings::wasi::io::streams::OutputStream;
-use crate::body::Body;
+use crate::bindings::wasi::io::streams::{OutputStream, StreamError};
+use crate::body::{Body, Incoming, Pull, READ_CHUNK};
 
-/// The rest of a request body, on its way down.
+/// Where the bytes come from.
+enum Source {
+    /// A host stream passed on as is: spliced host-side.
+    Stream(Incoming),
+    /// Chunks produced in the guest.
+    Guest(Body),
+}
+
+/// The rest of a body, on its way to the host.
 pub(crate) struct RequestPump {
-    /// Bytes taken from `source` and not yet written.
+    source: Source,
+    /// A guest chunk taken from the source and not yet written.
     pending: Vec<u8>,
-    source: Body,
     /// Dropped before `out` when the body is finished.
     stream: Option<OutputStream>,
     out: Option<OutgoingBody>,
+}
+
+/// What one attempt at moving bytes found.
+enum Act {
+    /// Progress was made; try again.
+    Again,
+    /// Blocked until this is ready.
+    Wait(Pollable),
+    /// The source ended.
+    Finish,
+    /// The reader is gone.
+    Abandon,
+    /// The sink takes this many bytes of `pending`.
+    Write(u64),
 }
 
 /// What a pump is waiting for.
 pub(crate) enum Wait {
     /// Nothing: it is finished.
     Done,
-    /// It can make progress now without waiting.
-    Ready,
     /// It can make progress once this is ready.
     On(Pollable),
 }
 
 impl RequestPump {
-    pub(crate) fn new(out: OutgoingBody, source: Body) -> Self {
+    pub(crate) fn new(out: OutgoingBody, body: Body) -> Self {
         let stream = out.write().ok();
+        let source = match body.into_passthrough() {
+            Ok(incoming) => Source::Stream(incoming),
+            Err(body) => Source::Guest(body),
+        };
         Self {
-            pending: Vec::new(),
             source,
+            pending: Vec::new(),
             stream,
             out: Some(out),
         }
@@ -48,68 +78,143 @@ impl RequestPump {
         self.out.is_none()
     }
 
-    /// What the pump needs before it can make progress.
-    pub(crate) fn wait(&self) -> Wait {
-        let Some(stream) = &self.stream else {
-            return Wait::Done;
-        };
-        if self.pending.is_empty() {
-            // Needs the next chunk of the source.
-            match self.source.pollable() {
-                Some(p) => Wait::On(p),
-                None => Wait::Ready,
-            }
-        } else {
-            Wait::On(stream.subscribe())
-        }
-    }
-
-    /// Makes what progress it can: pulls a chunk from the source if none is
-    /// pending, and writes as much as the stream accepts. Blocks only on
-    /// the source.
+    /// Makes what progress it can without waiting on the host, then says
+    /// what it needs next. Blocks only on a source that cannot report its
+    /// own readiness (a body with a pump of its own, which this one cannot
+    /// drive).
     ///
     /// A source that fails panics: the body must not be finished as if it
     /// were complete, and the host fails the exchange closed when a layer
     /// traps. A reader that goes away (the layer below answered without
     /// reading the rest) ends the pump quietly.
-    pub(crate) fn advance(&mut self) {
-        let Some(stream) = &self.stream else { return };
-        if self.pending.is_empty() {
-            match self.source.next() {
-                Some(Ok(chunk)) => self.pending = chunk,
-                Some(Err(e)) => panic!("request body source failed: {e}"),
-                None => {
+    pub(crate) fn step(&mut self) -> Wait {
+        loop {
+            match self.act(false) {
+                Act::Again => {}
+                Act::Wait(p) => return Wait::On(p),
+                Act::Finish => {
                     self.finish();
-                    return;
+                    return Wait::Done;
                 }
-            }
-        }
-        match stream.check_write() {
-            Ok(0) => {}
-            Ok(n) => {
-                let n = usize::try_from(n)
-                    .unwrap_or(usize::MAX)
-                    .min(self.pending.len());
-                if stream.write(&self.pending[..n]).is_err() || stream.flush().is_err() {
+                Act::Abandon => {
                     self.abandon();
-                    return;
+                    return Wait::Done;
                 }
-                self.pending.drain(..n);
+                Act::Write(permit) => {
+                    if !self.write_pending(permit) {
+                        return Wait::Done;
+                    }
+                }
             }
-            Err(_) => self.abandon(),
         }
     }
 
     /// Runs the pump to the end, blocking.
     pub(crate) fn drain(&mut self) {
-        while !self.is_done() {
-            match self.wait() {
-                Wait::Done => break,
-                Wait::Ready => {}
-                Wait::On(p) => p.block(),
+        loop {
+            match self.act(true) {
+                Act::Again => {}
+                Act::Wait(p) => p.block(),
+                Act::Finish => return self.finish(),
+                Act::Abandon => return self.abandon(),
+                Act::Write(permit) => {
+                    if !self.write_pending(permit) {
+                        return;
+                    }
+                }
             }
-            self.advance();
         }
+    }
+
+    /// One attempt at moving bytes. `blocking` waits for the host where
+    /// it otherwise reports what to wait on.
+    fn act(&mut self, blocking: bool) -> Act {
+        let Some(stream) = &self.stream else {
+            return Act::Finish;
+        };
+        match &mut self.source {
+            Source::Stream(incoming) => {
+                let Some(input) = incoming.input() else {
+                    return Act::Finish;
+                };
+                let moved = if blocking {
+                    stream.blocking_splice(input, READ_CHUNK)
+                } else {
+                    stream.splice(input, READ_CHUNK)
+                };
+                match moved {
+                    // Nothing moved: the sink is full, or the source has
+                    // nothing yet.
+                    Ok(0) => match stream.check_write() {
+                        Ok(0) => Act::Wait(stream.subscribe()),
+                        Ok(_) => Act::Wait(input.subscribe()),
+                        Err(_) => Act::Abandon,
+                    },
+                    Ok(_) => Act::Again,
+                    // The source ended, or the reader is gone (finishing a
+                    // body nobody reads is harmless).
+                    Err(StreamError::Closed) => Act::Finish,
+                    Err(StreamError::LastOperationFailed(e)) => {
+                        panic!("request body source failed: {}", e.to_debug_string())
+                    }
+                }
+            }
+            Source::Guest(body) => {
+                if self.pending.is_empty() {
+                    let pulled = if blocking {
+                        match body.next() {
+                            Some(Ok(chunk)) => Pull::Chunk(chunk),
+                            Some(Err(e)) => Pull::Failed(e),
+                            None => Pull::End,
+                        }
+                    } else {
+                        body.try_next()
+                    };
+                    match pulled {
+                        Pull::Chunk(chunk) => self.pending = chunk,
+                        Pull::End => return Act::Finish,
+                        Pull::Failed(e) => panic!("request body source failed: {e}"),
+                        Pull::NotReady => {
+                            return match body.pollable() {
+                                Some(p) => Act::Wait(p),
+                                // A source with a pump of its own cannot
+                                // say when it is ready: block on it.
+                                None => match body.next() {
+                                    Some(Ok(chunk)) => {
+                                        self.pending = chunk;
+                                        Act::Again
+                                    }
+                                    Some(Err(e)) => panic!("request body source failed: {e}"),
+                                    None => Act::Finish,
+                                },
+                            };
+                        }
+                    }
+                }
+                match stream.check_write() {
+                    Ok(0) => Act::Wait(stream.subscribe()),
+                    Ok(permit) => Act::Write(permit),
+                    Err(_) => Act::Abandon,
+                }
+            }
+        }
+    }
+
+    /// Writes up to `permit` bytes of `pending`. `false` once the reader is
+    /// gone.
+    fn write_pending(&mut self, permit: u64) -> bool {
+        let Some(stream) = &self.stream else {
+            return false;
+        };
+        let n = usize::try_from(permit)
+            .unwrap_or(usize::MAX)
+            .min(self.pending.len());
+        if stream.write(&self.pending[..n]).is_err() || stream.flush().is_err() {
+            self.abandon();
+            return false;
+        }
+        self.pending.drain(..n);
+        true
     }
 
     fn finish(&mut self) {

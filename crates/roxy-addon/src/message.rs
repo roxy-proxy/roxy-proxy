@@ -1,6 +1,7 @@
 //! Requests, responses and headers, and the plumbing that moves them to and
 //! from the host.
 
+use std::cell::OnceCell;
 use std::fmt;
 
 use crate::bindings::roxy::addon::{chain, endpoints};
@@ -12,9 +13,10 @@ use crate::bindings::wasi::io::poll::poll;
 use crate::body::{Body, Parent};
 use crate::pump::{RequestPump, Wait};
 
-/// Header names the SDK never forwards: hop-by-hop fields the host's WASI
-/// HTTP implementation refuses, and `content-length`, which roxy derives
-/// from the body (a transformed body changes length).
+/// Header names the SDK never forwards from a list the layer built:
+/// hop-by-hop fields the host's WASI HTTP implementation refuses, and
+/// `content-length`, which roxy derives from the body (a transformed body
+/// changes length). A head from roxy carries none of them.
 const DROPPED_HEADERS: &[&str] = &[
     "connection",
     "keep-alive",
@@ -29,19 +31,41 @@ const DROPPED_HEADERS: &[&str] = &[
 
 /// Ordered header fields. Names are compared case-insensitively and stored
 /// lower-case; repeated fields stay separate.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Headers(Vec<(String, Vec<u8>)>);
+///
+/// A head the layer passes on unchanged goes back to the host as the
+/// host's own copy; the list is read into the guest only once something
+/// looks at it.
+pub struct Headers {
+    /// The host's copy, valid while nothing has changed the list.
+    fields: Option<Fields>,
+    list: OnceCell<Vec<(String, Vec<u8>)>>,
+}
 
 impl Headers {
     /// No headers.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            fields: None,
+            list: OnceCell::from(Vec::new()),
+        }
+    }
+
+    fn list(&self) -> &[(String, Vec<u8>)] {
+        self.list
+            .get_or_init(|| self.fields.as_ref().map_or_else(Vec::new, Fields::entries))
+    }
+
+    /// The list for changing; the host's copy no longer matches it.
+    fn list_mut(&mut self) -> &mut Vec<(String, Vec<u8>)> {
+        self.list();
+        self.fields = None;
+        self.list.get_mut().expect("initialised above")
     }
 
     /// The first value of `name`, if any.
     pub fn get(&self, name: &str) -> Option<&[u8]> {
         let name = name.to_ascii_lowercase();
-        self.0
+        self.list()
             .iter()
             .find(|(n, _)| *n == name)
             .map(|(_, v)| v.as_slice())
@@ -55,7 +79,7 @@ impl Headers {
     /// Every value of `name`.
     pub fn get_all(&self, name: &str) -> impl Iterator<Item = &[u8]> {
         let name = name.to_ascii_lowercase();
-        self.0
+        self.list()
             .iter()
             .filter(move |(n, _)| *n == name)
             .map(|(_, v)| v.as_slice())
@@ -69,32 +93,72 @@ impl Headers {
 
     /// Adds a value for `name`.
     pub fn append(&mut self, name: &str, value: impl Into<Vec<u8>>) {
-        self.0.push((name.to_ascii_lowercase(), value.into()));
+        self.list_mut()
+            .push((name.to_ascii_lowercase(), value.into()));
     }
 
     /// Removes every value of `name`.
     pub fn remove(&mut self, name: &str) {
         let name = name.to_ascii_lowercase();
-        self.0.retain(|(n, _)| *n != name);
+        self.list_mut().retain(|(n, _)| *n != name);
     }
 
     /// Iterates `(name, value)` pairs in order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &[u8])> {
-        self.0.iter().map(|(n, v)| (n.as_str(), v.as_slice()))
+        self.list().iter().map(|(n, v)| (n.as_str(), v.as_slice()))
     }
 
+    /// The head of an incoming message. `fields` is a child of the message
+    /// and cannot outlive it, so the host copies it.
     fn from_fields(fields: &Fields) -> Self {
-        Self(fields.entries())
+        Self {
+            fields: Some(fields.clone()),
+            list: OnceCell::new(),
+        }
     }
 
-    fn to_fields(&self) -> Fields {
+    /// The head for an outgoing message: the host's copy if the list is as
+    /// the host sent it, else the list, less the fields the host owns.
+    fn into_fields(self) -> Fields {
+        if let Some(fields) = self.fields {
+            return fields;
+        }
         let entries: Vec<(String, Vec<u8>)> = self
-            .0
+            .list()
             .iter()
             .filter(|(n, _)| !DROPPED_HEADERS.contains(&n.as_str()))
             .cloned()
             .collect();
         Fields::from_list(&entries).expect("header fields rejected by the host")
+    }
+}
+
+impl Default for Headers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for Headers {
+    fn clone(&self) -> Self {
+        Self {
+            fields: None,
+            list: OnceCell::from(self.list().to_vec()),
+        }
+    }
+}
+
+impl PartialEq for Headers {
+    fn eq(&self, other: &Self) -> bool {
+        self.list() == other.list()
+    }
+}
+
+impl Eq for Headers {}
+
+impl fmt::Debug for Headers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.list()).finish()
     }
 }
 
@@ -180,7 +244,7 @@ impl Request {
 
     /// Builds the outgoing head, returning it with the body still to write.
     fn into_outgoing(self) -> (OutgoingRequest, Body) {
-        let out = OutgoingRequest::new(self.headers.to_fields());
+        let out = OutgoingRequest::new(self.headers.into_fields());
         out.set_method(&method_value(&self.method))
             .expect("method rejected by the host");
         if let Some(s) = &self.scheme {
@@ -326,19 +390,11 @@ pub(crate) fn send(
         if let Some(result) = future.get() {
             break result.expect("response taken once").map_err(Error)?;
         }
-        let head = future.subscribe();
-        match pump.wait() {
-            Wait::Done => head.block(),
-            Wait::Ready => {
-                drop(head);
-                pump.advance();
-            }
+        match pump.step() {
+            Wait::Done => future.subscribe().block(),
             Wait::On(writable) => {
-                let ready = poll(&[&head, &writable]);
-                drop((head, writable));
-                if ready.contains(&1) {
-                    pump.advance();
-                }
+                let head = future.subscribe();
+                poll(&[&head, &writable]);
             }
         }
     };
@@ -362,7 +418,7 @@ fn write_body(out: OutgoingBody, body: Body) {
 
 /// Sends `resp` to the client through `out`.
 pub(crate) fn respond(out: ResponseOutparam, resp: Response) {
-    let outgoing = OutgoingResponse::new(resp.headers.to_fields());
+    let outgoing = OutgoingResponse::new(resp.headers.into_fields());
     outgoing
         .set_status_code(resp.status)
         .expect("status rejected by the host");
