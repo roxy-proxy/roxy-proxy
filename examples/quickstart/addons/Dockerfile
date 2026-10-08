@@ -12,7 +12,7 @@ ARG ROXY_IMAGE=ghcr.io/roxy-proxy/roxy:edge
 FROM rust:1.99-alpine3.22@sha256:d0486f70555afb827c0cafecb4052d6139e1bc7b3f7170c79307884c6af32e90 AS build
 RUN apk add --no-cache musl-dev && rustup target add wasm32-wasip2
 WORKDIR /src
-# roxy-addon takes its version and lints from the root workspace, so the
+# roxy-addon takes its edition, licence and lints from the root workspace, so the
 # whole tree comes along; .dockerignore keeps target/ and the docs out.
 COPY . .
 WORKDIR /src/examples/quickstart/addons

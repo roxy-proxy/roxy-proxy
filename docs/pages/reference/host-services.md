@@ -8,7 +8,7 @@ each (payload sizes, calls in flight, key length) are in
 
 ## Endpoints (`endpoints`)
 
-`endpoints.call(name, request)`: roxy resolves the name to the configured
+`endpoints.call(name, head, body)`: roxy resolves the name to the configured
 URL, attaches the endpoint's headers (replacing any the layer set), applies
 the timeout, and enforces the address floor and deny lists. The
 layer cannot name a destination and never sees the credentials. Calls do not
@@ -18,7 +18,9 @@ through it; the response goes back to the layer, not through the rules. Each cal
 - The request body is buffered before the call (at most 16 MiB), and
   reading it counts against the timeout.
 - An unknown name, a denied address, a refused path, a timeout and a
-  failure reach the layer as distinct `error-code`s.
+  failure reach the layer as distinct `error` variants
+  (`destination-not-found`, `destination-denied`, `request-uri-invalid`,
+  `timeout`, `internal`), through the `pending-response` the call returns.
 
 The endpoint's `path` setting:
 
@@ -30,7 +32,7 @@ The endpoint's `path` setting:
 A segment that starts with `..`, in any percent-encoded spelling and
 whatever follows the dots (`..;x`, which an origin that strips path
 parameters reads as `..`), is refused in both modes: the call fails with
-`HTTP-request-URI-invalid`, nothing is dialled, and the `endpoint_call`
+`request-uri-invalid`, nothing is dialled, and the `endpoint_call`
 event records the refusal. Under `prefix`, text a layer
 reflects into the path can pick any route below the configured path, with
 roxy's credential attached.

@@ -1,47 +1,131 @@
 /// roxy addon layers.
 ///
 /// A layer is a component that sits in an exchange's layer stack above the
-/// rules. It receives each request through `wasi:http/incoming-handler`,
-/// may pass a request down the stack once with `chain.next`, and answers
-/// through the `response-outparam` it was given. Heads and bodies use the
-/// WASI 0.2 HTTP types; bodies are streams in both directions.
+/// rules. It receives each request through `handler.handle` as one
+/// `request-head` record and a body stream, may pass a request down the
+/// stack once with `chain.next`, and answers with `chain.respond`. Heads
+/// cross the boundary as records, one per direction; bodies are
+/// `wasi:io/streams` in both directions.
 ///
 /// Everything a layer can do outside its own streams is in `endpoints` and
 /// `flow`, and each of those calls is a capability granted per layer in
 /// roxy's config. A call the layer was not granted traps; the import is
 /// always linked, so one binary runs under different grants.
-package roxy:addon@0.1.0;
+package roxy:addon@0.2.0;
 
-/// The layers below this one.
+/// Heads, bodies and the response a call will produce.
+interface types {
+  use wasi:io/streams@0.2.12.{input-stream, output-stream};
+  use wasi:io/poll@0.2.12.{pollable};
+
+  /// Header fields in order, names lower-case. The host refuses `host`,
+  /// `content-length` (the body carries its length), framing and
+  /// hop-by-hop names: an invalid head fails the exchange closed. A head
+  /// over 128 KiB in all fails it too (`budget:fields`).
+  type headers = list<tuple<string, list<u8>>>;
+
+  record request-head {
+    /// Method, e.g. `POST`.
+    method: string,
+    /// `http` or `https`; `none` in a request passed to `next` means the
+    /// exchange's own.
+    scheme: option<string>,
+    /// `host[:port]`; `none` in a request passed to `next` means the
+    /// exchange's own.
+    authority: option<string>,
+    /// Path and query, e.g. `/v1/messages?beta=true`.
+    path-with-query: string,
+    headers: headers,
+  }
+
+  record response-head {
+    status: u16,
+    headers: headers,
+  }
+
+  /// A body the layer hands to the host.
+  variant body {
+    empty,
+    /// One piece, no stream; at most 1 MiB (`budget:body`). A larger body
+    /// is a `stream`.
+    bytes(list<u8>),
+    /// A stream the host gave this layer (its request body, or a response
+    /// body from `next` or `call`), moved host-side without entering the
+    /// guest. Any other stream fails the exchange closed.
+    passthrough(input-stream),
+    /// Written by the layer through the `output-stream` the call returns.
+    /// It must be ended with `finish`; dropped unfinished it is cut, never
+    /// ended as complete.
+    %stream,
+  }
+
+  /// Ends a `stream` body as complete. The stream must be one a `next`,
+  /// `respond` or `call` returned; any other fails the exchange closed.
+  finish: func(body: output-stream);
+
+  /// Why `next` or `call` could not produce a response.
+  variant error {
+    /// No endpoint of that name is configured for this layer.
+    destination-not-found,
+    /// The endpoint's address is denied by the address floor or deny
+    /// lists.
+    destination-denied,
+    /// The request's path cannot go under the endpoint's URL (a `..`
+    /// segment, or one that does not parse).
+    request-uri-invalid,
+    /// The endpoint did not answer within its timeout.
+    timeout,
+    /// Anything else, with a message.
+    internal(option<string>),
+  }
+
+  /// The response to a `next` or `call`, once it arrives. Dropping it
+  /// before `get` or `wait` abandons the request: its body is cut.
+  resource pending-response {
+    /// Ready once the response head has arrived (or the call failed).
+    subscribe: func() -> pollable;
+    /// The response, if it has arrived. `some` is returned once; the body
+    /// stream is the layer's to read, pass through or drop.
+    get: func() -> option<result<tuple<response-head, input-stream>, error>>;
+    /// Block and take the response in one call.
+    wait: static func(this: pending-response) -> result<tuple<response-head, input-stream>, error>;
+  }
+}
+
+/// The layers below this one, and the answer to the client.
 interface chain {
-  use wasi:http/types@0.2.12.{outgoing-request, future-incoming-response, error-code};
+  use types.{request-head, response-head, body, pending-response, error};
+  use wasi:io/streams@0.2.12.{output-stream};
 
-  /// Pass this exchange's request to the layers below (and, through the
-  /// rules, to the network). Callable at most once per exchange: a second
-  /// call traps. The request is validated by roxy's canonical model as if a
-  /// client had sent it; an invalid head fails the exchange closed.
-  ///
-  /// The request body is streamed: write it to the request's
-  /// `outgoing-body` after calling `next` (or before; the stream applies
-  /// backpressure either way) and `finish` it. The response arrives through
-  /// the returned future, and its body is streamed too.
-  next: func(req: outgoing-request) -> result<future-incoming-response, error-code>;
+  /// Pass a request to the layers below (and, through the rules, to the
+  /// network). Callable at most once per exchange: a second call traps.
+  /// The request is validated by roxy's canonical model as if a client had
+  /// sent it; an invalid head fails the exchange closed. Returns the
+  /// `output-stream` to write the body to when `body` is `stream`; the
+  /// stream applies backpressure, so write it while waiting on the
+  /// response.
+  next: func(head: request-head, body: body) -> result<tuple<pending-response, option<output-stream>>, error>;
+
+  /// Answer the client. Callable once per exchange, before `handle`
+  /// returns; a second call fails the exchange closed. Returns the
+  /// `output-stream` to write the body to when `body` is `stream`.
+  respond: func(head: response-head, body: body) -> option<output-stream>;
 }
 
 /// Named outbound calls (capability `endpoints`).
 interface endpoints {
-  use wasi:http/types@0.2.12.{outgoing-request, future-incoming-response, error-code};
+  use types.{request-head, body, pending-response, error};
+  use wasi:io/streams@0.2.12.{output-stream};
 
-  /// Call the endpoint configured under `name`. The request's scheme and
+  /// Call the endpoint configured under `name`. The head's scheme and
   /// authority are ignored. Its path and query are appended under the
   /// endpoint's URL only if the endpoint is configured `path: prefix`, and
-  /// a `..` segment is refused (`error-code.HTTP-request-URI-invalid`);
-  /// under `path: fixed` they are ignored. roxy attaches the endpoint's
-  /// credentials, applies its timeout and retry policy and the address
-  /// floor. The call goes straight to the connector: it never passes
-  /// through other layers or the rules. An unknown name returns
-  /// `error-code.destination-not-found`.
-  call: func(name: string, req: outgoing-request) -> result<future-incoming-response, error-code>;
+  /// a `..` segment is refused (`request-uri-invalid`); under `path: fixed`
+  /// they are ignored. roxy attaches the endpoint's credentials, applies
+  /// its timeout and the address floor. The call goes
+  /// straight to the connector: it never passes through other layers or
+  /// the rules. An unknown name resolves to `destination-not-found`.
+  call: func(name: string, head: request-head, body: body) -> result<tuple<pending-response, option<output-stream>>, error>;
 }
 
 /// The current flow, and roxy's host services.
@@ -97,6 +181,18 @@ interface flow {
   metric-get: func(id: string, key: list<string>) -> option<s64>;
 }
 
+/// One exchange.
+interface handler {
+  use types.{request-head};
+  use wasi:io/streams@0.2.12.{input-stream};
+
+  /// Handle one exchange. The layer answers with `chain.respond` and
+  /// returns once its response body is finished. Returning without
+  /// `respond`, or still holding a host resource (an unfinished body),
+  /// fails the exchange closed. Trailers on `body` are dropped.
+  handle: func(req: request-head, body: input-stream);
+}
+
 /// Instance start-up.
 interface init {
   /// Called once per instance, before its first exchange. An error fails
@@ -124,13 +220,12 @@ world layer {
   import wasi:cli/stdout@0.2.12;
   import wasi:cli/stderr@0.2.12;
   import wasi:cli/stdin@0.2.12;
-  import wasi:http/types@0.2.12;
 
+  import types;
   import chain;
   import endpoints;
   import flow;
 
-  export wasi:http/incoming-handler@0.2.12;
+  export handler;
   export init;
 }
-

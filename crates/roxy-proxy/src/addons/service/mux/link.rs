@@ -266,25 +266,46 @@ pub(super) async fn dial(
 }
 
 /// Owns the socket's write half. Control messages go first, but a reset
-/// never overtakes its stream's `open` ([`Wire`]). The socket closes once
-/// every data sender is gone, or on a close.
+/// never overtakes its stream's `open` ([`Wire`]). Everything queued is
+/// written in one flush: the socket is shared by every stream on the
+/// connection, and a flush per message costs a system call per message.
+/// The socket closes once every data sender is gone, or on a close.
 pub(super) async fn write(
     mut sink: SplitSink<Ws, Message>,
     mut data: mpsc::Receiver<Queued>,
     mut ctl: mpsc::UnboundedReceiver<Message>,
 ) {
     loop {
-        let m = tokio::select! {
+        let mut next = tokio::select! {
             biased;
-            Some(m) = ctl.recv() => m,
+            Some(m) = ctl.recv() => Some(m),
             m = data.recv() => match m {
-                Some(q) if q.wire.write(q.open) => q.msg,
-                Some(_) => continue,
+                Some(q) => q.wire.write(q.open).then_some(q.msg),
                 None => break,
             },
         };
-        let close = matches!(m, Message::Close(_));
-        if sink.send(m).await.is_err() || close {
+        let mut queued = 0;
+        loop {
+            if let Some(m) = next.take() {
+                let close = matches!(m, Message::Close(_));
+                if sink.feed(m).await.is_err() || close {
+                    let _ = sink.flush().await;
+                    return;
+                }
+                queued += 1;
+            }
+            if queued >= WRITE_QUEUE {
+                break;
+            }
+            next = match ctl.try_recv() {
+                Ok(m) => Some(m),
+                Err(_) => match data.try_recv() {
+                    Ok(q) => q.wire.write(q.open).then_some(q.msg),
+                    Err(_) => break,
+                },
+            };
+        }
+        if sink.flush().await.is_err() {
             return;
         }
     }

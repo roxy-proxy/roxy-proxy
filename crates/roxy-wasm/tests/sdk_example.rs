@@ -157,10 +157,36 @@ async fn untouched_bodies_stream_both_ways_at_once() {
     assert_eq!(collect(client_body).await.unwrap(), "done");
 }
 
-/// A request body that fails while the layer is passing it on fails the
+/// A request body that fails while the layer passes it on untouched (moved
+/// host-side, with the layer still waiting on the response) fails the
 /// exchange closed: the body handed down is never finished as if complete.
 #[tokio::test]
 async fn a_failing_untouched_request_body_fails_closed() {
+    let layer = passthrough().await;
+    let host = Mock::new(NextMode::Upload);
+    let (mut client_tx, client_body) = Body::channel(u64::MAX, None);
+    let handle = tokio::spawn({
+        let layer = layer.clone();
+        let host = host.clone();
+        async move { exchange(&layer, host, post(client_body)).await }
+    });
+    host.entered.notified().await;
+    client_tx.send_data(Bytes::from("partial")).await.unwrap();
+    client_tx.abort(BodyError::Incomplete);
+
+    let outcome = handle.await.unwrap();
+    assert!(
+        matches!(outcome, Err(LayerError::InvalidRequest(_))),
+        "{outcome:?}"
+    );
+    assert_eq!(host.upload_ended().await, Err(BodyError::Stopped));
+}
+
+/// The same failure once the layer below has answered (without reading the
+/// body to its end): the layer's answer stands, and the body it passed on
+/// is cut at the upstream rather than ended as complete.
+#[tokio::test]
+async fn a_failing_untouched_request_body_is_cut_after_the_answer() {
     let layer = passthrough().await;
     let (seen_tx, seen_rx) = oneshot::channel();
     let host = Mock::new(NextMode::Capture(Mutex::new(Some((
@@ -187,6 +213,10 @@ async fn a_failing_untouched_request_body_fails_closed() {
     );
     client_tx.abort(BodyError::Incomplete);
 
-    assert!(matches!(handle.await.unwrap(), Err(LayerError::Trap(_))));
-    assert!(upstream_body.frame().await.unwrap().is_err());
+    let (status, body) = handle.await.unwrap().unwrap();
+    assert_eq!((status.as_u16(), body.as_ref()), (200, b"ok".as_slice()));
+    assert_eq!(
+        collect(upstream_body).await.unwrap_err(),
+        BodyError::Stopped
+    );
 }

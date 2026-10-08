@@ -780,6 +780,7 @@ pub async fn start(opts: NodeOptions) -> anyhow::Result<NodeRunning> {
                 roxy_version: env!("CARGO_PKG_VERSION").to_owned(),
             },
             time_scale: opts.time_scale,
+            clock: roxy_node::node::Clock::default(),
         },
         handler.clone(),
     )?;

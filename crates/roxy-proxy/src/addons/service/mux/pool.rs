@@ -100,8 +100,13 @@ impl Drop for Reservation {
 }
 
 impl Pool {
-    /// A place on a connection with room, opening a new entry when every
-    /// open one is full and the pool is not; else waits for one to free.
+    /// A place on a connection: an idle one if there is one, else a new
+    /// one while the pool has fewer than `max_connections`, else the one
+    /// with the fewest streams that has room; waits for one to free when
+    /// every connection is full. Concurrent streams spread across
+    /// connections because each connection is one reader and one writer
+    /// on each side: a service that handles a connection on one task gets
+    /// one core per connection.
     pub(super) async fn reserve(self: &Arc<Self>) -> Reservation {
         loop {
             let freed = self.freed.notified();
@@ -110,21 +115,25 @@ impl Pool {
             {
                 let mut entries = lock(&self.entries);
                 entries.retain(|e| e.reserved > 0 || !e.closed());
-                let pick = if let Some(e) = entries
+                let full = entries.len() >= self.max_connections;
+                let least = entries
                     .iter_mut()
-                    .find(|e| !e.closed() && e.reserved < self.max_streams)
-                {
-                    e.reserved += 1;
-                    Some(e.link.clone())
-                } else if entries.len() < self.max_connections {
-                    let link = Arc::new(OnceCell::new());
-                    entries.push(Entry {
-                        link: link.clone(),
-                        reserved: 1,
-                    });
-                    Some(link)
-                } else {
-                    None
+                    .filter(|e| !e.closed() && e.reserved < self.max_streams)
+                    .min_by_key(|e| e.reserved);
+                let pick = match least {
+                    Some(e) if e.reserved == 0 || full => {
+                        e.reserved += 1;
+                        Some(e.link.clone())
+                    }
+                    _ if !full => {
+                        let link = Arc::new(OnceCell::new());
+                        entries.push(Entry {
+                            link: link.clone(),
+                            reserved: 1,
+                        });
+                        Some(link)
+                    }
+                    _ => None,
                 };
                 if let Some(link) = pick {
                     return Reservation {
