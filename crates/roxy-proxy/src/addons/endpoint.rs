@@ -2,12 +2,12 @@
 //!
 //! roxy resolves the name to a URL, attaches the endpoint's headers
 //! (credentials from secrets, never visible to the addon), applies the
-//! timeout and retries, and enforces the address floor and deny lists. The
+//! timeout, and enforces the address floor and deny lists. The
 //! call goes straight to the connector: it never passes through the layer
 //! stack or the rules.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 use http::header::{CONTENT_LENGTH, HOST};
@@ -24,8 +24,9 @@ use crate::secrets::Secrets;
 use crate::server::Shared;
 use crate::upstream::{ConnectError, Protocols, classify};
 
-/// Largest request body an endpoint call carries (it is buffered so a retry
-/// can resend it, and charged to the buffer budget for as long as it is).
+/// Largest request body an endpoint call carries (it is buffered, charged
+/// to the buffer budget, so the guest's body is read under the timeout and
+/// the call is bounded).
 const MAX_ENDPOINT_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Endpoint calls one exchange has in flight at once; the rest wait their
@@ -180,10 +181,10 @@ pub(crate) async fn call(
         .uri()
         .path_and_query()
         .map_or_else(|| "/".to_owned(), |p| p.as_str().to_owned());
-    let result = attempt_all(st, spec, req).await;
-    let (status, attempts, error) = match &result {
-        Ok((r, n)) => (Some(r.status().as_u16()), *n, None),
-        Err((e, n)) => (None, *n, Some(e.to_string())),
+    let result = attempt(st, spec, req).await;
+    let (status, error) = match &result {
+        Ok(r) => (Some(r.status().as_u16()), None),
+        Err(e) => (None, Some(e.to_string())),
     };
     st.shared.sink.emit(&FlowEvent::EndpointCall {
         ts: chrono::Utc::now(),
@@ -194,20 +195,19 @@ pub(crate) async fn call(
         method: method.to_string(),
         path: st.secrets().redactor().redact_str(&path).into_owned(),
         status,
-        attempts,
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         error,
     });
-    result.map(|(r, _)| r).map_err(|(e, _)| e)
+    result
 }
 
-async fn attempt_all(
+async fn attempt(
     st: &StackFlow,
     spec: &EndpointSpec,
     req: LayerRequest,
-) -> Result<(LayerResponse, u32), (EndpointError, u32)> {
-    let fail = |e: String| (EndpointError::Failed(e), 0);
-    let uri = target(spec, req.uri()).map_err(|e| (e, 0))?;
+) -> Result<LayerResponse, EndpointError> {
+    let fail = |e: String| EndpointError::Failed(e);
+    let uri = target(spec, req.uri())?;
     let (scheme, authority) = authority_of(&uri).map_err(fail)?;
     let (parts, body) = req.into_parts();
     // The guest drives the body, so reading it is under the timeout like
@@ -218,10 +218,10 @@ async fn attempt_all(
     })
     .await;
     let Ok((permit, body)) = admitted else {
-        return Err((EndpointError::Timeout, 0));
+        return Err(EndpointError::Timeout);
     };
     let _permit = permit.map_err(|e| fail(format!("endpoint calls: {e}")))?;
-    let (body, _lease) = body.map_err(|e| (e, 0))?;
+    let (body, _lease) = body?;
 
     let mut headers = http::HeaderMap::new();
     for (n, v) in &parts.headers {
@@ -239,50 +239,33 @@ async fn attempt_all(
         headers.insert(CONTENT_LENGTH, HeaderValue::from(body.len()));
     }
 
-    // The connector runs the address floor on the address it dials; a
-    // denied one fails the first attempt.
+    // The connector runs the address floor on the address it dials.
     let upstream = st.snap.upstream.clone();
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        let last = attempt > spec.retries;
-        let mut r = http::Request::new(Body::from_bytes(Bytes::clone(&body)));
-        *r.method_mut() = parts.method.clone();
-        *r.uri_mut() = uri.clone();
-        *r.headers_mut() = headers.clone();
-        let sent = tokio::time::timeout(
-            spec.timeout,
-            upstream.client(spec.private, Protocols::Any).request(r),
-        )
-        .await;
-        let err = match sent {
-            Ok(Ok(res)) => {
-                let retryable = matches!(res.status().as_u16(), 502..=504);
-                if retryable && !last {
-                    EndpointError::Failed(format!("status {}", res.status()))
-                } else {
-                    let res = from_upstream_response(res, &st.snap.limits);
-                    return Ok((roxy_http::layer::to_layer_response(res), attempt));
-                }
-            }
-            Ok(Err(e)) => match classify(&e) {
-                Some(ce @ ConnectError::Denied(_)) => return Err((connect_error(&ce), attempt)),
-                Some(ce) => connect_error(&ce),
-                None => EndpointError::Failed(crate::upstream::describe(&e)),
-            },
-            Err(_) => EndpointError::Timeout,
-        };
-        if last {
-            return Err((err, attempt));
+    let mut r = http::Request::new(Body::from_bytes(body));
+    *r.method_mut() = parts.method;
+    *r.uri_mut() = uri;
+    *r.headers_mut() = headers;
+    let sent = tokio::time::timeout(
+        spec.timeout,
+        upstream.client(spec.private, Protocols::Any).request(r),
+    )
+    .await;
+    match sent {
+        Ok(Ok(res)) => {
+            let res = from_upstream_response(res, &st.snap.limits);
+            Ok(roxy_http::layer::to_layer_response(res))
         }
-        let backoff = Duration::from_millis(100) * 2u32.saturating_pow(attempt - 1);
-        tokio::time::sleep(backoff.min(Duration::from_secs(2))).await;
+        Ok(Err(e)) => Err(match classify(&e) {
+            Some(ce) => connect_error(&ce),
+            None => EndpointError::Failed(crate::upstream::describe(&e)),
+        }),
+        Err(_) => Err(EndpointError::Timeout),
     }
 }
 
 /// Buffers the guest's request body whole, charged to the budget by the
-/// returned lease for as long as the attempts need it. Trailers are not
-/// sent and not kept.
+/// returned lease for as long as the call needs it. Trailers are not sent
+/// and not kept.
 async fn collect_body(
     shared: &Arc<Shared>,
     mut body: Body,
@@ -316,30 +299,11 @@ fn connect_error(e: &ConnectError) -> EndpointError {
     }
 }
 
-/// POSTs `json` to endpoint `name` of `addon` (audit and terminate
-/// notifications). Failures are logged.
-pub(crate) async fn notify(st: &StackFlow, addon: &AddonSpec, name: &str, json: serde_json::Value) {
-    let mut req = http::Request::new(Body::from_bytes(json.to_string()));
-    *req.method_mut() = http::Method::POST;
-    *req.uri_mut() = Uri::from_static("/");
-    req.headers_mut().insert(
-        HeaderName::from_static("content-type"),
-        HeaderValue::from_static("application/json"),
-    );
-    match call(st, addon, name, req).await {
-        Ok(res) if res.status().is_success() => {}
-        Ok(res) => {
-            tracing::warn!(layer = addon.name, endpoint = name, status = %res.status(), "notification refused");
-        }
-        Err(e) => {
-            tracing::warn!(layer = addon.name, endpoint = name, error = %e, "notification failed");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    use std::time::Duration;
 
     use super::*;
     use crate::flowlog::Redactor;
@@ -351,7 +315,6 @@ mod tests {
             path,
             headers: Vec::new(),
             timeout: Duration::from_secs(1),
-            retries: 0,
             private: crate::addr::PrivateAddrs::Deny,
         }
     }

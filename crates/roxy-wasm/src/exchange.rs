@@ -504,7 +504,7 @@ mod tests {
             unreachable!()
         }
         fn log(&self, _: LogLevel, _: &str) {}
-        async fn record(&self, _: String, _: String, _: bool) -> Result<(), HostError> {
+        async fn record(&self, _: String, _: String) -> Result<(), HostError> {
             unreachable!()
         }
         async fn state_get(&self, _: String) -> Result<Option<String>, HostError> {

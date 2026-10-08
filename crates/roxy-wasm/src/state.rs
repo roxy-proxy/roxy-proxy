@@ -466,11 +466,11 @@ impl flow::Host for StoreState {
         Ok(())
     }
 
-    async fn record(&mut self, kind: String, json: String, audit: bool) -> wasmtime::Result<()> {
+    async fn record(&mut self, kind: String, json: String) -> wasmtime::Result<()> {
         self.require(Capability::Record, "flow.record")?;
         self.check_message(kind.len().saturating_add(json.len()))?;
         let host = self.host("flow.record")?;
-        host.record(kind, json, audit)
+        host.record(kind, json)
             .await
             .map_err(|e| self.host_failed(e))
     }

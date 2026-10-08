@@ -40,10 +40,10 @@ pub fn log(level: LogLevel, msg: &str) {
 }
 
 /// Writes a structured event to the flow log (capability `record`). `json`
-/// must be a JSON value. `audit` also sends it to the audit endpoint. Waits
-/// if the log is behind; records are never dropped.
-pub fn record(kind: &str, json: &str, audit: bool) {
-    raw::record(kind, json, audit);
+/// must be a JSON value. Waits if the log is behind; records are never
+/// dropped.
+pub fn record(kind: &str, json: &str) {
+    raw::record(kind, json);
 }
 
 /// Reads a JSON value from the layer's keyed store (capability `state`).

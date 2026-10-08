@@ -1,9 +1,9 @@
 //! Service layers: an external service in the network path.
 //!
-//! Each exchange is a stream (`roxy.layer.v3`) on one of a few pooled
+//! Each exchange is a stream (`roxy.layer.v4`) on one of a few pooled
 //! WebSocket connections to the layer's named endpoint ([`mux`]). roxy
 //! streams the request into it as it arrives; the service streams back
-//! the request to forward (or answers itself, or denies); roxy forwards
+//! the request to forward (or answers itself); roxy forwards
 //! that down the stack, streams the response it gets back into the
 //! stream, and the service streams back the response to give the client:
 //!
@@ -12,9 +12,8 @@
 //! service → roxy   {"type":"request", …} bytes… request_end    forward this request
 //!                  {"type":"response", status, headers} bytes… response_end
 //!                                                              answer (instead of forwarding)
-//!                  {"type":"deny", status?, message?}          refuse
 //! roxy → service   {"type":"response", status, headers}  bytes…  response_end
-//! service → roxy   {"type":"response", …} bytes… response_end | {"type":"deny", …}
+//! service → roxy   {"type":"response", …} bytes… response_end
 //! ```
 //!
 //! The request and response bodies are independent: a response head goes
@@ -45,7 +44,7 @@ use tokio::sync::oneshot::error::TryRecvError;
 use tokio::time::Instant as TokioInstant;
 
 use super::tee::CopyCut;
-use super::{AddonMode, StackError, StackFlow};
+use super::{AddonMode, StackError, StackFlow, Subscription};
 use crate::watch::Dir;
 
 pub(crate) use mux::Pools;
@@ -111,6 +110,22 @@ impl ServiceError {
     }
 }
 
+/// What the service will be sent of each direction (`head` or `full`).
+#[derive(Serialize)]
+struct SubscribeOut {
+    request: &'static str,
+    response: &'static str,
+}
+
+impl From<Subscription> for SubscribeOut {
+    fn from(s: Subscription) -> Self {
+        SubscribeOut {
+            request: s.request.as_str(),
+            response: s.response.as_str(),
+        }
+    }
+}
+
 /// roxy → service (each sent with its stream id).
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -120,6 +135,7 @@ enum Out {
         conn: String,
         layer: String,
         mode: &'static str,
+        subscribe: SubscribeOut,
         client_ip: String,
         listener: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -163,12 +179,6 @@ enum In {
         headers: Vec<(String, String)>,
     },
     ResponseEnd,
-    Deny {
-        #[serde(default)]
-        status: Option<u16>,
-        #[serde(default)]
-        message: Option<String>,
-    },
     Credit {
         dir: Dir,
         bytes: u64,
@@ -231,28 +241,6 @@ fn declared_length(h: &HeaderMap) -> Result<Option<u64>, ServiceError> {
         (Some(n), None) => Ok(Some(n)),
         _ => Err(ServiceError::Protocol("invalid content-length".into())),
     }
-}
-
-/// The answer a `deny` stands for.
-fn deny_response(
-    status: Option<u16>,
-    message: Option<String>,
-) -> Result<LayerResponse, ServiceError> {
-    let status = status.unwrap_or(403);
-    if !(400..=599).contains(&status) {
-        return Err(ServiceError::Protocol(format!(
-            "deny status {status} is not 4xx or 5xx"
-        )));
-    }
-    let msg = message.unwrap_or_else(|| "request blocked".to_owned());
-    let mut r = http::Response::new(Body::from_bytes(format!("{}\n", msg.trim_end())));
-    *r.status_mut() =
-        http::StatusCode::from_u16(status).map_err(|e| ServiceError::Protocol(e.to_string()))?;
-    r.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    Ok(r)
 }
 
 /// Runs enforce-mode service layer `index` on `req`.
@@ -526,7 +514,9 @@ pub(crate) mod testing {
     use roxy_rules::{Policy, PolicyInput, RuleConfig};
 
     use super::ServiceSpec;
-    use crate::addons::{AddonImpl, AddonMode, AddonSpec, EndpointSpec, StateLimits};
+    use crate::addons::{
+        AddonImpl, AddonMode, AddonSpec, EndpointSpec, Part, StateLimits, Subscription,
+    };
     use crate::config::PolicyUpdate;
     use crate::flowlog::Redactor;
     use crate::testkit::Kit;
@@ -557,7 +547,6 @@ pub(crate) mod testing {
             path: crate::addons::EndpointPath::Fixed,
             headers: Vec::new(),
             timeout: Duration::from_secs(10),
-            retries: 0,
             private: crate::addr::PrivateAddrs::Deny,
         };
         Arc::new(AddonSpec {
@@ -566,10 +555,21 @@ pub(crate) mod testing {
             kind: AddonImpl::Service(svc),
             endpoints: HashMap::from([("svc".to_owned(), endpoint)]),
             state: StateLimits::default(),
-            audit_endpoint: None,
             when: None,
             sample: None,
+            subscribe: Subscription::default(),
         })
+    }
+
+    /// `addon`, subscribed to `request` and `response`.
+    pub(crate) fn subscribed(
+        mut addon: Arc<AddonSpec>,
+        request: Part,
+        response: Part,
+    ) -> Arc<AddonSpec> {
+        Arc::get_mut(&mut addon).expect("a fresh addon").subscribe =
+            Subscription { request, response };
+        addon
     }
 
     /// `addon`, run only on requests `when` matches.

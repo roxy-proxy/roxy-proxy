@@ -148,12 +148,18 @@ fn endpoints(a: &Addon) -> anyhow::Result<HashMap<String, EndpointSpec>> {
                     },
                     headers,
                     timeout: e.timeout.unwrap_or(DEFAULT_ENDPOINT_TIMEOUT),
-                    retries: e.retries,
                     private: PrivateAddrs::from_private_ok(e.private_ok),
                 },
             ))
         })
         .collect()
+}
+
+fn part(p: crate::config::Part) -> roxy_proxy::addons::Part {
+    match p {
+        crate::config::Part::Head => roxy_proxy::addons::Part::Head,
+        crate::config::Part::Full => roxy_proxy::addons::Part::Full,
+    }
 }
 
 fn state_limits(a: &Addon) -> StateLimits {
@@ -212,9 +218,12 @@ impl AddonLoader {
                 kind,
                 endpoints: endpoints(a)?,
                 state: state_limits(a),
-                audit_endpoint: a.audit_endpoint.clone(),
                 when,
                 sample: a.sample,
+                subscribe: roxy_proxy::addons::Subscription {
+                    request: part(a.subscribe.request),
+                    response: part(a.subscribe.response),
+                },
             }));
         }
         Ok(PreparedAddons { specs, layers })

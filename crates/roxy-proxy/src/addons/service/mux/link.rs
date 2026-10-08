@@ -27,7 +27,7 @@ use crate::upstream::MaybeTls;
 use crate::watch::Dir;
 
 /// The WebSocket subprotocol a service must accept.
-pub const SUBPROTOCOL: &str = "roxy.layer.v3";
+pub const SUBPROTOCOL: &str = "roxy.layer.v4";
 
 /// Largest control message or body frame accepted from a service.
 pub(super) const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -243,7 +243,6 @@ pub(super) async fn dial(
         method: "GET".to_owned(),
         path: spec.url.path().to_owned(),
         status: result.is_ok().then_some(101),
-        attempts: 1,
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         error: result.as_ref().err().map(ToString::to_string),
     });

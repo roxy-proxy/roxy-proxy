@@ -4,19 +4,19 @@ Everything a WASM layer can do outside its own streams, each a capability
 granted in config
 ([capabilities](/reference/addon-configuration#capabilities)). The caps on
 each (payload sizes, calls in flight, key length) are in
-[addon safety limits](/reference/addon-safety).
+[fixed caps](/reference/addon-configuration#fixed-caps).
 
 ## Endpoints (`endpoints`)
 
 `endpoints.call(name, request)`: roxy resolves the name to the configured
 URL, attaches the endpoint's headers (replacing any the layer set), applies
-the timeout and retries, and enforces the address floor and deny lists. The
+the timeout, and enforces the address floor and deny lists. The
 layer cannot name a destination and never sees the credentials. Calls do not
 pass through the layer stack, so a monitor's own model call cannot recurse
 through it; the response goes back to the layer, not through the rules. Each call emits an `endpoint_call` flow event.
 
-- The request body is buffered so a retry can resend it; reading it counts
-  against the timeout. Retries back off from 100 ms.
+- The request body is buffered before the call (at most 16 MiB), and
+  reading it counts against the timeout.
 - An unknown name, a denied address, a refused path, a timeout and a
   failure reach the layer as distinct `error-code`s.
 
@@ -57,12 +57,11 @@ on these, not on client-supplied session headers.
 
 ## Record (`record`)
 
-`flow.record(kind, json, audit)` writes a `layer_record` event to the flow
+`flow.record(kind, json)` writes a `layer_record` event to the flow
 log with the flow id, layer name and timestamp. `kind` and every string
 value in the document pass through the secret redactor; a document that
 is not JSON fails the exchange. The call
-waits while the flow log is behind and is never dropped. `audit: true` also
-POSTs the record to the layer's `audit_endpoint`.
+waits while the flow log is behind and is never dropped.
 
 ## Metrics and log (`metrics`, `log`)
 

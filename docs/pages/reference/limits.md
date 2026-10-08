@@ -87,7 +87,7 @@ but never completes TLS is cut after a second `connect_timeout` (`504`,
 [upstream](/reference/upstream#upstream-tls)).
 
 Addons have their own limits, and fixed caps on what the host holds for a
-guest ([addon safety limits](/reference/addon-safety)).
+guest ([addon limits](/reference/addon-configuration#limits)).
 
 ### Timeouts
 

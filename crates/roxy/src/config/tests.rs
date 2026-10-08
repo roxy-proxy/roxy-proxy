@@ -975,7 +975,7 @@ fn service_addons_validate() {
 
     let d = diagnostics(&format!(
         "{BASE}addons:\n  - name: s\n    kind: service\n    endpoint: nope\n    \
-         capabilities: [log]\n    config: {{ a: 1 }}\n    \
+         capabilities: [log]\n    config: {{ a: 1 }}\n    state: {{ max_entries: 5 }}\n    \
          limits: {{ max_memory: 1mb, max_connections: 0, max_streams: 0, first_byte_timeout: 0s }}\n    \
          endpoints:\n      svc: {{ url: \"http://127.0.0.1:9000/\" }}\n  \
          - name: w\n    path: {wasm}\n    limits: {{ first_byte_timeout: 0s, max_connections: 2 }}\n"
@@ -985,6 +985,7 @@ fn service_addons_validate() {
         "addons[0].endpoint",
         "addons[0].capabilities",
         "addons[0].config",
+        "addons[0].state",
         "addons[0].limits.max_memory",
         "addons[0].limits.max_connections",
         "addons[0].limits.max_streams",
@@ -1038,11 +1039,6 @@ fn addon_limits_check_matches_run() {
             "addons[0].endpoints.e.timeout",
             "positive",
         ),
-        (
-            "endpoints: { e: { url: \"https://x.test/\", retries: 10 } }",
-            "addons[0].endpoints.e.retries",
-            "at most 9",
-        ),
     ] {
         let d = diagnostics(&format!(
             "{BASE}addons: [{{ name: a, path: {wasm}, {bad} }}]\n"
@@ -1056,7 +1052,6 @@ fn addon_limits_check_matches_run() {
     for ok in [
         "limits: { max_memory: 256mb, recycle_above_memory: 256mb }",
         "limits: { max_memory: 16mb }",
-        "endpoints: { e: { url: \"https://x.test/\", retries: 9 } }",
     ] {
         parse(&format!(
             "{BASE}addons: [{{ name: a, path: {wasm}, {ok} }}]\n"
@@ -1085,6 +1080,36 @@ fn addon_when_and_sample() {
     let conditions = cfg.validate().unwrap().addon_conditions;
     assert_eq!(cfg.addons[1].sample, Some(0.25));
     assert!(conditions.iter().all(Option::is_some));
+}
+
+/// `subscribe` names what a layer sees of each direction; it defaults to
+/// everything, and takes nothing but `head` or `full`.
+#[test]
+fn addon_subscribe_parses_and_defaults_to_full() {
+    use super::Part;
+    let (_dir, wasm) = wasm_file();
+    let cfg = parse(&format!(
+        "{BASE}addons:\n  \
+         - {{ name: a, path: {wasm}, subscribe: {{ request: head }} }}\n  \
+         - {{ name: b, path: {wasm} }}\n"
+    ));
+    cfg.validate().unwrap();
+    assert_eq!(cfg.addons[0].subscribe.request, Part::Head);
+    assert_eq!(cfg.addons[0].subscribe.response, Part::Full);
+    assert_eq!(cfg.addons[1].subscribe.request, Part::Full);
+    assert_eq!(cfg.addons[1].subscribe.response, Part::Full);
+    for bad in [
+        "subscribe: { request: none }",
+        "subscribe: { body: full }",
+        "subscribe: head",
+    ] {
+        let err = Config::from_yaml(&format!(
+            "{BASE}addons: [{{ name: a, path: {wasm}, {bad} }}]\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("subscribe"), "{bad}: {err}");
+    }
 }
 
 #[test]

@@ -221,8 +221,6 @@ pub enum FlowEvent<'a> {
         kind: String,
         /// The addon's JSON, with secrets redacted.
         data: serde_json::Value,
-        /// Also sent to the addon's `audit_endpoint`.
-        audit: bool,
     },
     /// An addon called a named endpoint.
     EndpointCall {
@@ -235,7 +233,6 @@ pub enum FlowEvent<'a> {
         method: String,
         path: String,
         status: Option<u16>,
-        attempts: u32,
         duration_ms: u64,
         error: Option<String>,
     },

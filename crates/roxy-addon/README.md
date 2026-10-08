@@ -100,7 +100,7 @@ logic of a layer can be unit-tested natively.
 
 A layer handles one exchange at a time per instance. roxy runs several
 instances, recycles them, and holds each to a memory cap and a deadline to
-its response head ([addon safety](https://roxy-proxy.github.io/roxy-proxy/reference/addon-safety)).
+its response head ([addon safety](https://roxy-proxy.github.io/roxy-proxy/reference/addon-configuration#limits)).
 
 A WebSocket reaches a layer as an ordinary exchange: after the `101`, the
 request body carries the client's bytes and the response body the

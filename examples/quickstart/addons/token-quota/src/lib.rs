@@ -62,7 +62,6 @@ impl Layer for TokenQuota {
                     "available": allowance.available, "capacity": allowance.capacity,
                 })
                 .to_string(),
-                false,
             );
             return over_quota(&allowance);
         }
@@ -128,7 +127,7 @@ fn report(user: &str, usage: Usage) {
         .with_body(json.to_string());
     let resp = call_endpoint("quota-report", req).expect("quota service unreachable");
     assert_eq!(resp.status, 200, "quota service answered {}", resp.status);
-    flow::record("quota", &json.to_string(), false);
+    flow::record("quota", &json.to_string());
 }
 
 /// An Anthropic-shaped rate-limit error, so SDK clients raise their usual

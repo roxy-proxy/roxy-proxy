@@ -965,7 +965,7 @@ mod service {
     use super::{RULES, no_layer_error, strs};
     use crate::addons::AddonMode;
     use crate::addons::service::ServiceSpec;
-    use crate::addons::service::testing::{addon, kit, only_when, reload};
+    use crate::addons::service::testing::{addon, kit, only_when, reload, subscribed};
     use crate::testkit::upstream::service::SLOW;
     use crate::testkit::{AddonDef, Answer, Kit, streaming_body};
     use roxy_http::Body;
@@ -1477,6 +1477,72 @@ mod service {
             "the secret is nowhere in the capture"
         );
     }
+
+    /// A service subscribed to the heads only is sent each head with its
+    /// end and no bytes, is told so on `open`, and the bodies go through
+    /// it untouched; an observer so subscribed holds no copy, so one that
+    /// never reads is not lagging.
+    #[tokio::test]
+    async fn a_head_only_service_gets_heads_and_the_bodies_bypass_it() {
+        use crate::addons::Part;
+        let kit = Kit::builder()
+            .rules(RULES)
+            .limits(|l| l.max_observer_lag_bytes = 64 * 1024)
+            .start()
+            .await;
+        reload(
+            &kit,
+            RULES,
+            &[],
+            vec![
+                subscribed(
+                    addon("o", "hoard", AddonMode::Observe, |_| {}),
+                    Part::Head,
+                    Part::Head,
+                ),
+                subscribed(
+                    addon("s", "pass", AddonMode::Enforce, |_| {}),
+                    Part::Head,
+                    Part::Full,
+                ),
+            ],
+        );
+        let mut c = kit.h1().await;
+        let (mut tx, body) = streaming_body();
+        let req = c.request("POST", "/x", &[]).body(body).unwrap();
+        let answer = c.start(req);
+        let chunk = Bytes::from(vec![b'x'; 16 * 1024]);
+        let chunks = 40;
+        for _ in 0..chunks {
+            tx.send_data(chunk.clone()).await.unwrap();
+        }
+        tx.finish().await.unwrap();
+        let a: Answer = answer.await.unwrap().unwrap();
+        assert_eq!(a.status, 200, "{a:?}");
+        assert_eq!(a.json()["body_len"], chunks * chunk.len());
+        let opens = kit.upstream.service().until_opened(2).await;
+        let by_layer = |name: &str| {
+            opens
+                .iter()
+                .find(|o| o["layer"] == name)
+                .unwrap_or_else(|| panic!("{name} in {opens:#?}"))
+                .clone()
+        };
+        assert_eq!(by_layer("o")["subscribe"]["request"], "head");
+        assert_eq!(by_layer("o")["subscribe"]["response"], "head");
+        assert_eq!(by_layer("s")["subscribe"]["request"], "head");
+        assert_eq!(by_layer("s")["subscribe"]["response"], "full");
+        let ev = kit.request_event().await;
+        assert_eq!(strs(&ev["addons"]), ["o", "s"], "{ev:#}");
+        let lagged: Vec<_> = kit
+            .sink
+            .events()
+            .into_iter()
+            .filter(|e| e["event"] == "observer_lagged")
+            .collect();
+        assert!(lagged.is_empty(), "{lagged:#?}");
+        no_layer_error(&kit);
+    }
 }
 
 // ---- one layer: effects, limits, capabilities -----------------------------
@@ -1791,18 +1857,13 @@ async fn endpoints_respect_the_address_floor() {
 }
 
 /// A record's `kind` is the guest's string as much as its document: a
-/// secret in it is redacted in the flow log and in the audit POST.
+/// secret in it is redacted in the flow log.
 #[tokio::test]
 async fn a_record_kind_is_redacted_like_its_document() {
     use roxy_wasm::Capability;
     let kit = Kit::builder()
         .secret("tok", "verdict")
-        .addon(
-            AddonDef::test_layer("t")
-                .caps(&[Capability::Record])
-                .endpoint("audit", "https://up.test/audit", &[], true)
-                .audit_endpoint("audit"),
-        )
+        .addon(AddonDef::test_layer("t").caps(&[Capability::Record]))
         .start()
         .await;
     let a = cap(&kit, "record").await;
@@ -1810,15 +1871,6 @@ async fn a_record_kind_is_redacted_like_its_document() {
     let r = kit.events("layer_record", 1).await;
     assert_eq!(r[0]["kind"], "[REDACTED]", "{r:#?}");
     assert_eq!(r[0]["data"]["score"], 0.9);
-    let seen = kit.upstream.wait_seen(1).await;
-    let post = seen
-        .iter()
-        .find(|s| s.path == "/audit")
-        .unwrap_or_else(|| panic!("{seen:#?}"));
-    let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
-    assert_eq!(body["kind"], "[REDACTED]", "{body:#}");
-    assert_eq!(body["layer"], "t");
-    assert_eq!(body["data"]["score"], 0.9);
 }
 
 /// `record` and `state` work with their capabilities; a call without its
@@ -1832,7 +1884,6 @@ async fn records_and_state_reach_the_flow_log() {
     let r = kit.events("layer_record", 1).await;
     assert_eq!(r[0]["kind"], "verdict");
     assert_eq!(r[0]["data"]["score"], 0.9);
-    assert_eq!(r[0]["audit"], true);
 
     let a = cap(&kit, "state").await;
     assert_eq!(a.text(), "Ok(()) Some(\"{\\\"n\\\":1}\")", "{a:?}");
@@ -1841,4 +1892,242 @@ async fn records_and_state_reach_the_flow_log() {
     assert_eq!(a.status, 503, "{a:?}");
     let errs = kit.events("layer_error", 1).await;
     assert_eq!(errs[0]["kind"], "capability:metrics");
+}
+
+// ---- subscriptions --------------------------------------------------------
+
+/// A layer subscribed to a head only is given an empty body without
+/// framing, and the body it did not see goes on past it: to the upstream
+/// with its length, and to the client. The layer's head still takes effect.
+#[tokio::test]
+async fn a_head_only_layer_sees_no_body_and_the_bodies_go_through() {
+    use crate::addons::Part;
+    for (request, response, saw_request, saw_response_body) in [
+        (Part::Head, Part::Head, "0", false),
+        (Part::Head, Part::Full, "0", true),
+        (Part::Full, Part::Head, "12", false),
+        (Part::Full, Part::Full, "12", true),
+    ] {
+        let kit = one(AddonDef::test_layer("t").subscribe(request, response)).await;
+        let a = kit
+            .h1()
+            .await
+            .call("POST", "/x", &[("x-test-t", "probe")], b"twelve bytes")
+            .await;
+        assert_eq!(a.status, 200, "{request:?}/{response:?}: {a:?}");
+        assert_eq!(a.json()["body_len"], 12, "{request:?}/{response:?}");
+        assert_eq!(a.json()["via"], "t", "{request:?}/{response:?}");
+        let saw_response = a.headers["x-saw-response"].to_str().unwrap();
+        if saw_response_body {
+            assert_ne!(saw_response, "0", "{request:?}/{response:?}");
+        } else {
+            assert_eq!(saw_response, "0", "{request:?}/{response:?}");
+        }
+        let seen = kit.upstream.wait_seen(1).await;
+        assert_eq!(
+            seen[0].headers["x-saw-request"], saw_request,
+            "{request:?}/{response:?}"
+        );
+        // A bypassed body keeps its framing; one the layer streamed is its
+        // own, of unknown length.
+        if request == Part::Head {
+            assert_eq!(
+                seen[0].headers["content-length"], "12",
+                "{request:?}/{response:?}"
+            );
+        }
+        assert_eq!(seen[0].complete, Some(true));
+        no_layer_error(&kit);
+    }
+}
+
+/// A layer that passes on bytes of a body it is not subscribed to fails
+/// the exchange closed as its own: before the response head a refusal,
+/// after it a cut body.
+#[tokio::test]
+async fn bytes_on_an_unsubscribed_body_fail_the_layer() {
+    use crate::addons::Part;
+    let kit = one(AddonDef::test_layer("t").subscribe(Part::Head, Part::Full)).await;
+    let a = kit
+        .h1()
+        .await
+        .call("POST", "/x", &[("x-test-t", "inject-request")], b"original")
+        .await;
+    assert_eq!(a.status, 503, "{a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "layer:t", "{ev:#}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["kind"], "unsubscribed:request", "{errs:#?}");
+    assert!(
+        kit.upstream.seen().iter().all(|s| s.complete != Some(true)),
+        "nothing complete reached the upstream"
+    );
+
+    let kit = one(AddonDef::test_layer("t").subscribe(Part::Full, Part::Head)).await;
+    let a = kit
+        .h1()
+        .await
+        .call(
+            "POST",
+            "/x",
+            &[("x-test-t", "inject-response")],
+            b"original",
+        )
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert!(a.body.is_err(), "the body is cut: {a:?}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["kind"], "unsubscribed:response", "{errs:#?}");
+}
+
+/// A head-only layer that answers itself answers whole: there is no body
+/// from below to splice onto its own. The client's body, which the layer
+/// never took, is dropped like one a layer left unread: a large upload
+/// does not hold the connection.
+#[tokio::test]
+async fn a_head_only_layer_may_still_answer_itself() {
+    use crate::addons::Part;
+    let kit = one(AddonDef::test_layer("t").subscribe(Part::Head, Part::Head)).await;
+    let mut c = kit.h1().await;
+    let req = c
+        .request("POST", "/x", &[("x-test-t", "deny")])
+        .body(roxy_http::Body::from_bytes(vec![b'x'; 4 << 20]))
+        .unwrap();
+    let a = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        Answer::read(c.send(req).await.unwrap()),
+    )
+    .await
+    .expect("answered without waiting on the body");
+    assert_eq!(a.status, 403, "{a:?}");
+    assert_eq!(a.text(), "denied by layer");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "answered", "{ev:#}");
+    assert!(kit.upstream.seen().is_empty());
+    no_layer_error(&kit);
+}
+
+/// A response head-only layer that answers with another status has
+/// answered itself: its body stands and the body from below is dropped,
+/// where the same status passes the response on with the head edited.
+#[tokio::test]
+async fn a_head_only_layer_refuses_at_the_response_head_by_changing_the_status() {
+    use crate::addons::Part;
+    let kit = one(AddonDef::test_layer("t").subscribe(Part::Full, Part::Head)).await;
+    let mut c = kit.h1().await;
+    let a = c
+        .call(
+            "GET",
+            "/x",
+            &[("x-test-t", "pass"), ("x-status", "451")],
+            b"",
+        )
+        .await;
+    assert_eq!(a.status, 451, "{a:?}");
+    assert_eq!(a.text(), "", "the body from below is dropped: {a:?}");
+    let a = c.call("GET", "/x", &[("x-test-t", "pass")], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(
+        a.json()["via"],
+        "t",
+        "the head went through, with the body: {a:?}"
+    );
+    no_layer_error(&kit);
+}
+
+/// An observer subscribed to the heads only holds no copy of either body:
+/// a body far past the lag budget is not reported, and the heads still
+/// reach it.
+#[tokio::test]
+async fn a_head_only_observer_costs_no_copy() {
+    use crate::addons::Part;
+    use roxy_wasm::Capability;
+    let kit = Kit::builder()
+        .rules(RULES)
+        .limits(|l| l.max_observer_lag_bytes = 1024)
+        .addon(
+            AddonDef::test_layer("o")
+                .observe()
+                .caps(&[Capability::Record])
+                .subscribe(Part::Head, Part::Head),
+        )
+        .start()
+        .await;
+    let body = vec![b'x'; 256 * 1024];
+    let mut c = kit.h1().await;
+    let req = c
+        .request(
+            "POST",
+            "/x",
+            &[("x-test-o", "probe"), ("x-probe-record", "1")],
+        )
+        .body(roxy_http::Body::from_bytes(body.clone()))
+        .unwrap();
+    let a = Answer::read(c.send(req).await.unwrap()).await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["body_len"], body.len());
+    let r = kit.events("layer_record", 1).await;
+    assert_eq!(r[0]["data"]["request"], 0, "{r:#?}");
+    assert_eq!(r[0]["data"]["response"], 0, "{r:#?}");
+    kit.request_event().await;
+    let lagged: Vec<_> = kit
+        .sink
+        .events()
+        .into_iter()
+        .filter(|e| e["event"] == "observer_lagged")
+        .collect();
+    assert!(lagged.is_empty(), "{lagged:#?}");
+    no_layer_error(&kit);
+}
+
+/// A body no layer is subscribed to is not decoded: the upstream gets the
+/// client's bytes with their `content-encoding`, where a layer that reads
+/// the body gets it decoded and the upstream the decoded bytes.
+#[tokio::test]
+async fn an_unsubscribed_body_is_not_decoded() {
+    use crate::addons::Part;
+    let gz = gzip(b"hello");
+    for (request, upstream_body, encoded) in [
+        (Part::Head, gz.clone(), true),
+        (Part::Full, b"hello".to_vec(), false),
+    ] {
+        let kit = one(AddonDef::test_layer("t").subscribe(request, Part::Head)).await;
+        let mut c = kit.h1().await;
+        let req = c
+            .request("POST", "/x", &[("content-encoding", "gzip")])
+            .body(roxy_http::Body::from_bytes(gz.clone()))
+            .unwrap();
+        let a = Answer::read(c.send(req).await.unwrap()).await;
+        assert_eq!(a.status, 200, "{request:?}: {a:?}");
+        let seen = kit.upstream.wait_seen(1).await;
+        assert_eq!(seen[0].body, upstream_body, "{request:?}");
+        assert_eq!(
+            seen[0].headers.contains_key("content-encoding"),
+            encoded,
+            "{request:?}: {:?}",
+            seen[0].headers
+        );
+    }
+}
+
+/// A head-only layer on an upgrade sees the upgrade and the `101`; the
+/// WebSocket's bytes bypass it, so it is not in the byte path.
+#[tokio::test]
+async fn a_head_only_layer_stays_out_of_a_websockets_bytes() {
+    use crate::addons::Part;
+    let kit = stack(&[
+        AddonDef::test_layer("a").subscribe(Part::Head, Part::Head),
+        AddonDef::test_layer("b"),
+    ])
+    .await;
+    let (status, io) = kit.websocket("/ws", &[("x-upper", "1")]).await;
+    assert_eq!(status, 101);
+    let mut io = io.unwrap();
+    // `a` would upper-case too; only `b` is in the byte path.
+    assert_eq!(echo(&mut io, b"hello").await, b"HELLO");
+    drop(io);
+    let ev = kit.request_event().await;
+    assert_eq!(strs(&ev["addons"]), ["a", "b"], "{ev:#}");
+    let tags = strs(&ev["tags"]);
+    assert!(tags.iter().any(|t| t == "via:a"), "{tags:?}");
 }

@@ -99,6 +99,10 @@ pub enum LayerError {
     /// response body was dropped before the layer finished).
     #[error("exchange cancelled")]
     Cancelled,
+    /// The layer passed on bytes of a body it is not subscribed to (the
+    /// direction named).
+    #[error("layer passed on a {0} body it is not subscribed to")]
+    Unsubscribed(&'static str),
 }
 
 impl LayerError {

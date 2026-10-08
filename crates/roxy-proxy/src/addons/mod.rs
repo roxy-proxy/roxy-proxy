@@ -19,10 +19,12 @@ mod host;
 mod select;
 pub mod service;
 pub(crate) mod store;
+mod subscribe;
 mod tee;
 mod ws;
 
 pub use service::{ServiceError, ServiceSpec};
+pub use subscribe::{Part, Subscription};
 pub(crate) use ws::{SplicedClient, splice_client, ws_without_extensions};
 
 use std::collections::HashMap;
@@ -85,14 +87,14 @@ pub struct AddonSpec {
     pub endpoints: HashMap<String, EndpointSpec>,
     /// The addon's keyed store.
     pub state: StateLimits,
-    /// Endpoint that also receives `record(.., audit: true)` events.
-    pub audit_endpoint: Option<String>,
     /// `when`: the layer runs only on requests this matches, as they reach
     /// it; the others go straight to the layer below.
     pub when: Option<roxy_rules::Condition>,
     /// `sample` (observe mode only): the share of matching exchanges the
     /// layer gets a copy of.
     pub sample: Option<f64>,
+    /// Which parts of the exchange the layer sees; the rest bypass it.
+    pub subscribe: Subscription,
 }
 
 /// What runs a layer.
@@ -167,10 +169,8 @@ pub struct EndpointSpec {
     pub path: EndpointPath,
     /// Headers roxy attaches; values may contain `${secret:name}`.
     pub headers: Vec<(HeaderName, String)>,
-    /// Per attempt, until the response head.
+    /// Until the response head.
     pub timeout: Duration,
-    /// Extra attempts after a connection failure or a 502/503/504.
-    pub retries: u32,
     /// Whether the endpoint may be on a private address.
     pub private: PrivateAddrs,
 }
@@ -236,6 +236,8 @@ struct LayerSlot {
     next: AtomicU8,
     /// The layer ran on this exchange: its `when` and `sample` let it.
     ran: AtomicBool,
+    /// Bodies bypassing the layer (enforce mode, head-only subscription).
+    bypass: Mutex<subscribe::Bypass>,
 }
 
 impl LayerSlot {
@@ -461,9 +463,23 @@ impl StackFlow {
             .clone()
     }
 
-    /// Some layer ran on the flow (its `when` and `sample` let it).
-    fn any_ran(&self) -> bool {
-        self.layers.iter().any(|l| l.ran.load(Ordering::SeqCst))
+    /// The layers that ran, with their subscriptions.
+    fn ran(&self) -> impl Iterator<Item = Subscription> + '_ {
+        self.layers
+            .iter()
+            .zip(self.snap.addons.iter())
+            .filter(|(l, _)| l.ran.load(Ordering::SeqCst))
+            .map(|(_, a)| a.subscribe)
+    }
+
+    /// A layer that ran is subscribed to the body in `dir`.
+    fn body_subscribed(&self, dir: crate::watch::Dir) -> bool {
+        self.ran().any(|s| s.part(dir) == Part::Full)
+    }
+
+    /// A layer that ran reads at least one body.
+    fn reads_bytes(&self) -> bool {
+        self.ran().any(Subscription::reads_bytes)
     }
 
     /// Adds a tag, unless the flow already has it or is at
@@ -622,6 +638,7 @@ fn error_kind(e: &StackError) -> String {
         LayerError::Instantiate(_) => "instantiate".into(),
         LayerError::NoInstance => "no_instance".into(),
         LayerError::Cancelled => "cancelled".into(),
+        LayerError::Unsubscribed(dir) => format!("unsubscribed:{dir}"),
     }
 }
 
@@ -825,32 +842,40 @@ pub(crate) fn enter(
         st.layers[index].ran.store(true, Ordering::SeqCst);
         st.layers[index].set(NextState::Entered);
         let mut req = req;
-        // Layers see bodies decoded; a flow no layer runs on is left as
-        // the client sent it.
-        if st.snap.http.decode_for_addons && !st.request_decoded.swap(true, Ordering::SeqCst) {
+        // Layers see bodies decoded, from the first layer subscribed to the
+        // body; a body no layer reads is left as the client sent it.
+        if st.snap.http.decode_for_addons
+            && addon.subscribe.request == Part::Full
+            && !st.request_decoded.swap(true, Ordering::SeqCst)
+        {
             decode::request(&st, &mut req, st.snap.limits.max_request_body_bytes);
         }
         if addon.mode == AddonMode::Observe {
             return tee::observe(st, index, req).await;
         }
-        let layer = match &addon.kind {
-            AddonImpl::Wasm(l) => l,
-            AddonImpl::Service(svc) => return service::handle(st, index, svc, req).await,
-        };
-        let h = Arc::new(host::StackHost {
-            st: st.clone(),
-            index,
-            observer: None,
-        });
-        match layer.handle(h, req).await {
-            Ok(r) => Ok(r),
-            // Recorded as it happened, through the host; an error from
-            // before the exchange had a host (no instance, say) is not.
-            Err(e) => {
-                st.fail(&addon.name, e);
-                Err(HostError::new(format!("layer {} failed", addon.name)))
+        let req = subscribe::detach_request(&st, index, req);
+        let res = match &addon.kind {
+            AddonImpl::Wasm(layer) => {
+                let h = Arc::new(host::StackHost {
+                    st: st.clone(),
+                    index,
+                    observer: None,
+                });
+                match layer.handle(h, req).await {
+                    Ok(r) => Ok(r),
+                    // Recorded as it happened, through the host; an error
+                    // from before the exchange had a host (no instance,
+                    // say) is not.
+                    Err(e) => {
+                        st.fail(&addon.name, e);
+                        Err(HostError::new(format!("layer {} failed", addon.name)))
+                    }
+                }
             }
-        }
+            AddonImpl::Service(svc) => service::handle(st.clone(), index, svc, req).await,
+        };
+        subscribe::release_request(&st, index);
+        res.map(|r| subscribe::reattach_response(&st, index, r))
     })
 }
 
@@ -861,15 +886,23 @@ pub(crate) fn below(
     req: LayerRequest,
 ) -> BoxFuture<Result<LayerResponse, HostError>> {
     let guard = NextGuard::new(st.clone(), index);
+    let req = subscribe::reattach_request(&st, index, req);
     let fut = if index + 1 < st.snap.addons.len() {
-        enter(st, index + 1, req)
+        enter(st.clone(), index + 1, req)
     } else {
-        Box::pin(core(st, index, req))
+        Box::pin(core(st.clone(), index, req))
     };
     Box::pin(async move {
         let r = fut.await;
         guard.settle(r.is_ok());
-        r
+        // A skipped layer, or an observer, passes the response on whole;
+        // an enforce layer subscribed to the head gets only that.
+        let enforcing = st.layers[index].ran.load(Ordering::SeqCst)
+            && st.snap.addons[index].mode == AddonMode::Enforce;
+        match r {
+            Ok(res) if enforcing => Ok(subscribe::detach_response(&st, index, res)),
+            other => other,
+        }
     })
 }
 
@@ -927,7 +960,7 @@ async fn core(
         return Err(HostError::new("the flow already reached the core"));
     };
     let cx = lease.cx();
-    cx.layer_ran = st.any_ran();
+    cx.layer_reads_bytes = st.reads_bytes();
     cx.facts.request = Some(crate::pipeline::request_facts(&creq));
     st.set_facts(&cx.facts);
     let mut front = Detached;
@@ -948,9 +981,8 @@ async fn core(
     match outcome {
         Outcome::Respond(mut res) => {
             res.body = attributed(&st, Side::Upstream, std::mem::take(&mut res.body));
-            // A flow no layer ran on gets the response as the origin sent
-            // it.
-            if snap.http.decode_for_addons && st.any_ran() {
+            // A response body no layer reads goes up as the origin sent it.
+            if snap.http.decode_for_addons && st.body_subscribed(crate::watch::Dir::Response) {
                 decode::response(&st, &mut res, snap.limits.max_response_body_bytes);
             }
             Ok(to_layer_response(res))

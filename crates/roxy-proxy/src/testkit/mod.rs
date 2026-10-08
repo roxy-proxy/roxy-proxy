@@ -72,7 +72,9 @@ pub(crate) use h2raw::{H2_GOAWAY, H2_HEADERS, H2_RST_STREAM, h2_client, h2_get, 
 pub(crate) use upstream::{Seen, Upstream};
 
 use crate::Server;
-use crate::addons::{AddonMode, AddonSpec, EndpointPath, EndpointSpec, StateLimits};
+use crate::addons::{
+    AddonMode, AddonSpec, EndpointPath, EndpointSpec, Part, StateLimits, Subscription,
+};
 use crate::addr::PrivateAddrs;
 use crate::addrlist::{AddressList, AddressLists};
 use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
@@ -114,8 +116,7 @@ pub(crate) struct AddonDef {
     pub when: Option<String>,
     pub sample: Option<f64>,
     pub endpoints: HashMap<String, EndpointSpec>,
-    /// The endpoint `record(.., audit: true)` POSTs to.
-    pub audit_endpoint: Option<String>,
+    pub subscribe: Subscription,
 }
 
 impl AddonDef {
@@ -131,8 +132,15 @@ impl AddonDef {
             when: None,
             sample: None,
             endpoints: HashMap::new(),
-            audit_endpoint: None,
+            subscribe: Subscription::default(),
         }
+    }
+
+    /// Subscribes the layer to `request` and `response`.
+    #[must_use]
+    pub(crate) fn subscribe(mut self, request: Part, response: Part) -> Self {
+        self.subscribe = Subscription { request, response };
+        self
     }
 
     #[must_use]
@@ -167,17 +175,9 @@ impl AddonDef {
                     .map(|(n, v)| (n.parse().unwrap(), (*v).to_owned()))
                     .collect(),
                 timeout: Duration::from_secs(5),
-                retries: 0,
                 private: PrivateAddrs::from_private_ok(private_ok),
             },
         );
-        self
-    }
-
-    /// Audit records go to endpoint `name`.
-    #[must_use]
-    pub(crate) fn audit_endpoint(mut self, name: &str) -> Self {
-        self.audit_endpoint = Some(name.to_owned());
         self
     }
 
@@ -248,9 +248,9 @@ impl AddonDef {
             kind: crate::addons::AddonImpl::Wasm(layer),
             endpoints: self.endpoints,
             state: StateLimits::default(),
-            audit_endpoint: self.audit_endpoint,
             when,
             sample: self.sample,
+            subscribe: self.subscribe,
         })
     }
 }

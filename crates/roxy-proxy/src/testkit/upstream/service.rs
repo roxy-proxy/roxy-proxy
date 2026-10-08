@@ -1,4 +1,4 @@
-//! An in-test `roxy.layer.v3` service behind the scripted upstream: a
+//! An in-test `roxy.layer.v4` service behind the scripted upstream: a
 //! WebSocket handshake carrying the subprotocol is served here, on any
 //! port. The connection's behaviour is picked by the handshake's path:
 //!

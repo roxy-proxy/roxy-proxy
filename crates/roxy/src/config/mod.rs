@@ -566,7 +566,7 @@ impl TryFrom<RawCapability> for Capability {
 }
 
 /// A named outbound endpoint. The addon names it; roxy resolves the
-/// URL, attaches the headers, applies the timeout and retries, and enforces
+/// URL, attaches the headers, applies the timeout, and enforces
 /// the address floor and deny lists. Endpoint calls never pass through the
 /// layer stack or the rules.
 #[derive(Debug, Clone, Deserialize)]
@@ -582,13 +582,9 @@ pub struct Endpoint {
     /// any the addon set.
     #[serde(default, deserialize_with = "units::unique_map")]
     pub headers: BTreeMap<String, String>,
-    /// Per attempt, until the response head (default 30s).
+    /// Until the response head (default 30s).
     #[serde(default, with = "humantime_serde")]
     pub timeout: Option<Duration>,
-    /// Extra attempts after a connection failure or a 502/503/504 (default 0,
-    /// at most 9).
-    #[serde(default)]
-    pub retries: u32,
     /// Allow private, loopback and link-local addresses (default false).
     #[serde(default)]
     pub private_ok: bool,
@@ -649,6 +645,25 @@ pub enum AddonMode {
     Observe,
 }
 
+/// How much of one direction of the exchange a layer sees.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Part {
+    /// The head only; the body bypasses the layer.
+    Head,
+    /// The head and the body.
+    #[default]
+    Full,
+}
+
+/// A layer's subscription to each direction of the exchange.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Subscribe {
+    pub request: Part,
+    pub response: Part,
+}
+
 /// Per-addon limits. They protect roxy and catch a broken addon; they
 /// don't police how fast it is. Each has a default when absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -679,9 +694,8 @@ pub struct AddonLimits {
     pub max_instances: Option<u64>,
 }
 
-/// One `addons:` entry. There is no hook list: an addon has one
-/// entry point (`handle`) and an optional `tunnel` export discovered at
-/// load time.
+/// One `addons:` entry. There is no hook list: an addon has one entry
+/// point (`handle`) and subscribes to the parts of the exchange it needs.
 ///
 /// Addons always sit above the built-in rules, in the order listed: the
 /// first addon sees the request first and the response last.
@@ -707,6 +721,9 @@ pub struct Addon {
     /// gets a copy of, in (0, 1].
     #[serde(default)]
     pub sample: Option<f64>,
+    /// Which parts of the exchange the layer sees; the rest bypass it.
+    #[serde(default)]
+    pub subscribe: Subscribe,
     /// Opaque config passed to the addon as JSON.
     #[serde(default)]
     pub config: serde_yaml_ng::Value,
@@ -720,10 +737,6 @@ pub struct Addon {
     /// The addon's keyed store.
     #[serde(default)]
     pub state: AddonState,
-    /// An endpoint (of this addon) that also receives `record(.., audit:
-    /// true)` events.
-    #[serde(default)]
-    pub audit_endpoint: Option<String>,
 }
 
 // ----- log ------------------------------------------------------------------

@@ -60,7 +60,7 @@ impl Layer for AuthGate {
             (parse_user(&json), true)
         } else {
             let Some(user) = introspect(&token) else {
-                flow::record("auth", r#"{"result":"refused"}"#, false);
+                flow::record("auth", r#"{"result":"refused"}"#);
                 return unauthenticated("credential refused by the auth service");
             };
             // A full store refuses the write; the verdict still stands for
@@ -72,7 +72,6 @@ impl Layer for AuthGate {
         flow::record(
             "auth",
             &serde_json::json!({"result": "ok", "user": user, "cached": cached}).to_string(),
-            false,
         );
         req.headers.remove(HEADER);
         next.run(req)

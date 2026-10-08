@@ -180,10 +180,10 @@ pub(crate) fn splice_client(
 }
 
 /// Whether a WebSocket must be relayed with no extension negotiated, so
-/// every message stays readable: message rules check them, or a layer
-/// that ran on the upgrade request reads its bytes.
-pub(crate) fn ws_without_extensions(snap: &Snapshot, layer_ran: bool) -> bool {
-    snap.policy.reads_ws() || (snap.http.decode_for_addons && layer_ran)
+/// every message stays readable: message rules check them, or a layer on
+/// the upgrade request reads its bytes.
+pub(crate) fn ws_without_extensions(snap: &Snapshot, layer_reads_bytes: bool) -> bool {
+    snap.policy.reads_ws() || (snap.http.decode_for_addons && layer_reads_bytes)
 }
 
 /// For an upgrade request, takes its body (the stream after the `101`)

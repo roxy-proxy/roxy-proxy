@@ -53,7 +53,7 @@ pub(super) struct StreamState {
 /// besides the bodies it is sending.
 pub(super) enum Phase {
     /// Enforce: the request head is on its way, and the service owes its
-    /// first answer (a request to forward, a response, or a deny).
+    /// first answer (a request to forward or a response).
     AwaitingFirst {
         first: oneshot::Sender<Result<First, Unanswered>>,
         second: oneshot::Sender<Result<LayerResponse, Unanswered>>,
@@ -456,11 +456,7 @@ impl Stream {
                 );
                 return self.fail(ServiceError::Closed(why), Reset::Skip);
             }
-            In::Request { .. }
-            | In::RequestEnd
-            | In::Response { .. }
-            | In::ResponseEnd
-            | In::Deny { .. } => {
+            In::Request { .. } | In::RequestEnd | In::Response { .. } | In::ResponseEnd => {
                 // An observer's answers are ignored.
                 if self.mode == AddonMode::Observe {
                     return;
@@ -551,13 +547,6 @@ impl Stream {
                 s.answered(r, "response")?;
                 s.res.inbox = Some(self.feed(body_tx, Dir::Response));
                 Ok(())
-            }
-            In::Deny { status, message } => {
-                let r = super::super::deny_response(status, message)?;
-                // Tagged before the answer goes, so the flow's record has it.
-                // A flow at its tag cap loses the label; the deny stands.
-                let _ = self.st.add_tag(format!("{}:deny", self.name()));
-                s.answered(r, "deny")
             }
             // Handled by `control`.
             In::Credit { .. } | In::Reset { .. } => Ok(()),
@@ -675,7 +664,7 @@ pub(crate) async fn open(
         stream
     };
     let opening = Opening(Some(&stream));
-    if !stream.send(&open_message(st, &addon.name, mode)).await {
+    if !stream.send(&open_message(st, index, mode)).await {
         drop(opening);
         return Err(ServiceError::Closed("the connection closed".into()));
     }
@@ -685,12 +674,14 @@ pub(crate) async fn open(
 
 /// The `open` message: who the client is and where the exchange is, so
 /// the service can key its state on (flow, layer).
-pub(super) fn open_message(st: &StackFlow, layer: &str, mode: AddonMode) -> Out {
+pub(super) fn open_message(st: &StackFlow, index: usize, mode: AddonMode) -> Out {
+    let addon = &st.snap.addons[index];
     Out::Open {
         flow: st.flow.to_string(),
         conn: st.client.id.to_string(),
-        layer: layer.to_owned(),
+        layer: addon.name.clone(),
         mode: mode.as_str(),
+        subscribe: addon.subscribe.into(),
         client_ip: st.client.peer.ip().to_string(),
         listener: st.client.listener.name.clone(),
         sni: st.tls.as_ref().and_then(|t| t.sni.clone()),
@@ -773,7 +764,7 @@ mod tests {
         ));
     }
 
-    /// A request may only come as the first answer, and a response or deny
+    /// A request may only come as the first answer, and a response
     /// only as an answer that is owed: the second is not once the first
     /// answered instead of forwarding.
     #[test]
@@ -786,7 +777,7 @@ mod tests {
         assert!(s.forwarded().is_err());
 
         let (mut s, (first, mut second)) = enforce();
-        s.answered(response(), "deny").unwrap();
+        s.answered(response(), "response").unwrap();
         assert!(matches!(first.blocking_recv(), Ok(Ok(First::Answer(_)))));
         assert!(second.try_recv().is_err(), "no second answer follows");
         assert!(s.answered(response(), "response").is_err());

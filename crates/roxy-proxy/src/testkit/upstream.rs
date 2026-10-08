@@ -284,7 +284,7 @@ impl Upstream {
     ///   body;
     /// * `/cut`: reads the body, answers `200` declaring 10 bytes of body,
     ///   sends 3 and breaks the connection;
-    /// * a `roxy.layer.v3` handshake: the in-test service layer endpoint
+    /// * a `roxy.layer.v4` handshake: the in-test service layer endpoint
     ///   ([`service`]);
     /// * a WebSocket upgrade: `101`, then echoes bytes; with
     ///   `x-echo: once`, echoes the first read and closes; with

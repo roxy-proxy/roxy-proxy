@@ -4,8 +4,8 @@ A `kind: service` layer is an external service at its position in the stack
 exactly as a WASM layer is ([addon model](/design/addon-model)). The
 request streams into it and it streams back the request to forward; the
 response from below streams into it and it streams back the response the
-client gets. It may pass bytes through, rewrite or hold them, answer
-itself, or deny.
+client gets. It may pass bytes through, rewrite or hold them, or answer
+itself.
 
 ```yaml
 addons:
@@ -21,7 +21,7 @@ addons:
       max_streams: 100                  # exchanges at once per connection (default 100)
 ```
 
-`path`, `capabilities`, `config`, `audit_endpoint` and the WASM limits are
+`path`, `capabilities`, `config`, `state` and the WASM limits are
 refused on a service layer; `max_connections` and `max_streams` are refused
 on a WASM layer, and at zero.
 
@@ -30,7 +30,7 @@ on a WASM layer, and at zero.
 Long-lived WebSocket connections to each endpoint, each carrying many
 exchanges as **streams**.
 
-- Subprotocol `roxy.layer.v3`; a service that does not accept it fails the
+- Subprotocol `roxy.layer.v4`; a service that does not accept it fails the
   handshake.
 - The URL is the endpoint's (`http` → `ws`, `https` → `wss`, with the
   upstream's certificate verification), dialled through the connector (the
@@ -58,11 +58,17 @@ A stream opens with an `open` message from roxy:
 
 ```json
 {"type":"open","stream":7,"flow":"01J…","conn":"01J…","layer":"sentinel",
- "mode":"enforce","client_ip":"10.0.0.5","listener":"proxy",
+ "mode":"enforce","subscribe":{"request":"full","response":"head"},
+ "client_ip":"10.0.0.5","listener":"proxy",
  "sni":"api.example.com","tags":["a","b"]}
 ```
 
-`sni` is left out when there is none. The pair (`flow`, `layer`) is unique
+`sni` is left out when there is none. `subscribe` is the layer's
+[subscription](/reference/addon-configuration#what-a-layer-sees): for a
+direction it names `head`, roxy sends the head and its end with no bytes
+between, and the service answers the same way; bytes the service sends for
+that body fail the exchange closed (`unsubscribed:<direction>`), and the
+body the service did not see goes on with the head it passed on. The pair (`flow`, `layer`) is unique
 and stable (two layers using the same endpoint in one flow get separate
 streams with different `layer`s), so a service can key its state on it.
 
@@ -75,11 +81,9 @@ service → roxy   one of:
                    {"type":"request",…}  bytes…  {"type":"request_end"}     forward this request (`next`)
                    {"type":"response","status":…,"headers":[…]}  bytes…  {"type":"response_end"}
                                                                           answer instead; nothing is forwarded
-                   {"type":"deny","status":403,"message":"…"}             refuse (status 4xx/5xx, both optional)
 then, if it forwarded:
 roxy → service   {"type":"response","status":…,"headers":[…]}  bytes…  {"type":"response_end"}
 service → roxy   {"type":"response",…}  bytes…  {"type":"response_end"}   the client's response
-                 or {"type":"deny",…}
 either way       {"type":"credit","dir":"request"|"response","bytes":n}  flow control (below)
                  {"type":"reset","message":"…"}                           abandon the stream
 ```
@@ -88,9 +92,8 @@ either way       {"type":"credit","dir":"request"|"response","bytes":n}  flow co
 |---|---|
 | heads | `url` is absolute; `headers` are end-to-end fields as a WASM layer sees them (no hop-by-hop or framing fields). `content-length` is present when the length is known; one the service sends is enforced: more or fewer bytes than declared is a protocol violation |
 | header values | byte strings: each byte is the code point of the same value (ISO-8859-1), so obs-text bytes (`http.allow_obs_text`) read as Latin-1 and go back as the same bytes. A code point above U+00FF is a protocol violation |
-| order | within each body, from each side: head, bytes, end; bytes before their head or after their end are a protocol violation. The two bodies are independent, and so are the two sides: roxy sends its `response` head as soon as the layer below answers, even while the client's body is still arriving; a service may send its `response` (or `deny`) while still forwarding the request body, and may start forwarding before the client's body has ended |
-| end | a stream ends when the service has sent its last message: the `response_end` of the client's response (or a `deny`), and the `request_end` of the forwarded request if it was still sending that. roxy sends nothing more on it after that. Either side may end a stream early with `reset`; roxy resets when the client goes away, a deadline passes or the service broke the protocol, and sends nothing after the `reset`. A stream roxy gives up before its `open` has gone out is dropped without a `reset`. A service that resets an enforce stream fails that exchange closed. Each side ignores messages for a stream it has ended; roxy still credits back body bytes among them |
-| deny | tags the flow `<layer>:deny`, from the same tag budget as WASM layers (64 tags, 4 KiB; [addon safety](/reference/addon-safety)); a flow at the cap loses the label and the deny stands |
+| order | within each body, from each side: head, bytes, end; bytes before their head or after their end are a protocol violation. The two bodies are independent, and so are the two sides: roxy sends its `response` head as soon as the layer below answers, even while the client's body is still arriving; a service may send its `response` while still forwarding the request body, and may start forwarding before the client's body has ended |
+| end | a stream ends when the service has sent its last message: the `response_end` of the client's response, and the `request_end` of the forwarded request if it was still sending that. roxy sends nothing more on it after that. Either side may end a stream early with `reset`; roxy resets when the client goes away, a deadline passes or the service broke the protocol, and sends nothing after the `reset`. A stream roxy gives up before its `open` has gone out is dropped without a `reset`. A service that resets an enforce stream fails that exchange closed. Each side ignores messages for a stream it has ended; roxy still credits back body bytes among them |
 | flow control | per stream and per body, each way. Each body of a stream starts with 256 KiB of credit each way; the receiver grants more with `credit` as it consumes, and the sender may have no more bytes of that body outstanding than granted. roxy grants in steps of 64 KiB as the layer below (or the client) reads. Sending past credit is a protocol violation. Control messages are not counted |
 
 ## Semantics

@@ -517,9 +517,9 @@ pub(crate) struct FlowCx {
     /// The addon stack this exchange went through (set once the stack has
     /// handed the flow back), folded into the record when it is logged.
     pub stack: Option<Arc<crate::addons::StackFlow>>,
-    /// An addon layer ran on this request: on an upgrade, it is in the
-    /// WebSocket's byte path.
-    pub layer_ran: bool,
+    /// An addon layer that ran on this request reads a body: on an upgrade,
+    /// it is in the WebSocket's byte path.
+    pub layer_reads_bytes: bool,
     /// The exchange's share of the buffer budget, held until it ends: the
     /// buffered body text stays with the facts for as long as the flow.
     pub buffers: Vec<BufferLease>,
@@ -627,7 +627,7 @@ impl FlowCx {
             sign: None,
             request_tally: None,
             stack: None,
-            layer_ran: false,
+            layer_reads_bytes: false,
             buffers: Vec::new(),
             logged: false,
         }

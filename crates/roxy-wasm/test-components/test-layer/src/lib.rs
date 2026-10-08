@@ -145,7 +145,13 @@ fn respond(out: ResponseOutparam, status: u16, body: &[u8]) {
 /// A copy of the incoming request, ready for `next`. A named layer appends
 /// its name to `x-via` and tags the flow `via:<name>`.
 fn forward_head(req: &IncomingRequest) -> OutgoingRequest {
+    forward_head_with(req, Vec::new())
+}
+
+/// [`forward_head`] with `extra` headers added.
+fn forward_head_with(req: &IncomingRequest, extra: Vec<(String, Vec<u8>)>) -> OutgoingRequest {
     let mut entries = req.headers().entries();
+    entries.extend(extra);
     if let Some(n) = name() {
         if tags() {
             flow::add_tag(&format!("via:{n}"));
@@ -464,7 +470,7 @@ fn call_capability(req: &IncomingRequest) -> String {
             "ok".to_owned()
         }
         "record" => {
-            flow::record("verdict", "{\"score\":0.9}", true);
+            flow::record("verdict", "{\"score\":0.9}");
             "ok".to_owned()
         }
         "state" => {
@@ -532,7 +538,7 @@ impl Handler for Layer {
         if let Some(n) = test.strip_prefix("record:") {
             // Record one document of about `n` bytes, then answer.
             let n: usize = n.parse().expect("size");
-            flow::record("big", &format!("{{\"s\":\"{}\"}}", "r".repeat(n)), false);
+            flow::record("big", &format!("{{\"s\":\"{}\"}}", "r".repeat(n)));
             respond(out, 200, b"recorded");
             return;
         }
@@ -741,6 +747,97 @@ impl Handler for Layer {
                 drop(resp);
                 let got = flow::metric_get("by_host", &[]);
                 respond(out, 200, format!("{got:?}").as_bytes());
+            }
+            "probe" => {
+                // Report how much of each body reached this layer:
+                // `x-saw-request` on the forwarded request, `x-saw-response`
+                // on the response, and (with `x-probe-record`) a `probe`
+                // record with both.
+                let record = header(&req, "x-probe-record").is_some();
+                let in_body = req.consume().expect("consume");
+                let request = read_all(in_body);
+                let saw_request = request.len();
+                let r = forward_head_with(
+                    &req,
+                    vec![(
+                        "x-saw-request".to_owned(),
+                        saw_request.to_string().into_bytes(),
+                    )],
+                );
+                let b = r.body().expect("body");
+                let fut = chain::next(r).expect("next");
+                {
+                    let s = b.write().expect("write");
+                    write_all(&s, &request);
+                }
+                OutgoingBody::finish(b, None).expect("finish");
+                drop(req);
+                let resp = await_response(fut);
+                let body = read_all(resp.consume().expect("consume"));
+                let mut entries = resp.headers().entries();
+                entries.push((
+                    "x-saw-response".to_owned(),
+                    body.len().to_string().into_bytes(),
+                ));
+                if record {
+                    flow::record(
+                        "probe",
+                        &format!("{{\"request\":{saw_request},\"response\":{}}}", body.len()),
+                    );
+                }
+                let mine = OutgoingResponse::new(Fields::from_list(&entries).expect("headers"));
+                mine.set_status_code(resp.status()).expect("status");
+                drop(resp);
+                let mine_body = mine.body().expect("body");
+                ResponseOutparam::set(out, Ok(mine));
+                {
+                    let stream = mine_body.write().expect("write");
+                    write_all(&stream, &body);
+                }
+                OutgoingBody::finish(mine_body, None).expect("finish");
+            }
+            "inject-request" => {
+                // Pass the head on with a body of this layer's own.
+                let r = forward_head(&req);
+                let b = r.body().expect("body");
+                let fut = chain::next(r).expect("next");
+                {
+                    let s = b.write().expect("write");
+                    let _ = s.blocking_write_and_flush(b"injected");
+                }
+                let _ = OutgoingBody::finish(b, None);
+                drop(req);
+                answer_with(await_response(fut), out, false);
+            }
+            "inject-response" => {
+                // Pass the request on, then answer with the response's head
+                // over a body of this layer's own.
+                let r = forward_head(&req);
+                let b = r.body().expect("body");
+                let in_body = req.consume().expect("consume");
+                let fut = chain::next(r).expect("next");
+                {
+                    let input = in_body.stream().expect("stream");
+                    let output = b.write().expect("write");
+                    pump(&input, &output, false);
+                }
+                OutgoingBody::finish(b, None).expect("finish");
+                drop(in_body);
+                drop(req);
+                let resp = await_response(fut);
+                let mine = OutgoingResponse::new(
+                    Fields::from_list(&resp.headers().entries()).expect("headers"),
+                );
+                mine.set_status_code(resp.status()).expect("status");
+                drop(read_all(resp.consume().expect("consume")));
+                drop(resp);
+                let mine_body = mine.body().expect("body");
+                ResponseOutparam::set(out, Ok(mine));
+                {
+                    let stream = mine_body.write().expect("write");
+                    write_all(&stream, b"injected");
+                }
+                OutgoingBody::finish(mine_body, None).expect("finish");
             }
             "invalid-next" => {
                 let r = forward_head(&req);

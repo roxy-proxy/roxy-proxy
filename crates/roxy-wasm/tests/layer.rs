@@ -493,7 +493,7 @@ async fn capabilities_gate_host_services() {
             "record",
             Capability::Record,
             "ok",
-            "record verdict {\"score\":0.9} true",
+            "record verdict {\"score\":0.9}",
         ),
         (
             "state",

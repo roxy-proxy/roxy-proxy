@@ -70,7 +70,6 @@ export default defineConfig({
         { text: "Addon configuration", link: "/reference/addon-configuration" },
         { text: "Service layer protocol", link: "/reference/service-layers" },
         { text: "Host services", link: "/reference/host-services" },
-        { text: "Addon safety limits", link: "/reference/addon-safety" },
         { text: "Flow log and capture", link: "/reference/flow-log" },
         { text: "Node protocol", link: "/reference/node-protocol" },
         { text: "Architecture", link: "/reference/architecture" },

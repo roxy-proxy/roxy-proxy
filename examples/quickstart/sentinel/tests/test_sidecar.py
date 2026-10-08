@@ -163,8 +163,9 @@ async def test_an_unknown_block_type_is_refused(sidecar: Sidecar) -> None:
     roxy.ws.body(1, json.dumps(response).encode(), RESPONSE)
     roxy.ws.control(1, "response_end")
     denied = await roxy.ws.next_sent()
-    assert denied["type"] == "deny" and denied["status"] == 403
-    assert denied["message"].startswith("the sentinel could not read this model exchange")
+    assert denied["type"] == "response" and denied["status"] == 403
+    body = await roxy.ws.next_sent()
+    assert body[5:].startswith(b"the sentinel could not read this model exchange")
 
 
 async def test_an_unknown_block_type_in_a_stream_is_refused(sidecar: Sidecar) -> None:

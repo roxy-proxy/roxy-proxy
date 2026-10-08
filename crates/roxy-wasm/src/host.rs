@@ -160,7 +160,7 @@ pub trait LayerHost: Send + Sync + 'static {
     /// Write a structured event to the flow log (capability `record`).
     /// `json` is what the guest passed; the host validates it. Must not
     /// drop the record: wait if the log is behind, or fail.
-    async fn record(&self, kind: String, json: String, audit: bool) -> Result<(), HostError>;
+    async fn record(&self, kind: String, json: String) -> Result<(), HostError>;
 
     /// Read the layer's keyed store (capability `state`).
     async fn state_get(&self, key: String) -> Result<Option<String>, HostError>;

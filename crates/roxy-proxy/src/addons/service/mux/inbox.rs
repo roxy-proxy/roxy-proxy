@@ -87,7 +87,7 @@ pub(super) async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodyS
 /// The consumer of the `dir` body went away, `n` bytes it was sent unread.
 pub(super) fn consumer_gone(stream: &Stream, inbox: &Inbox, dir: Dir, n: u64) {
     if dir == Dir::Request {
-        // A deny below, say: the rest is read and dropped, and the service
+        // A refusal below, say: the rest is read and dropped, and the service
         // still owes the response.
         let rest = {
             let mut q = lock(&inbox.q);

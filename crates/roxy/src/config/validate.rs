@@ -268,14 +268,6 @@ impl Config {
             for (name, e) in &a.endpoints {
                 self.validate_endpoint(&format!("{path}.endpoints.{name}"), name, e, d);
             }
-            if let Some(n) = &a.audit_endpoint
-                && !a.endpoints.contains_key(n)
-            {
-                d.push(Diagnostic::new(
-                    format!("{path}.audit_endpoint"),
-                    format!("{n:?} is not one of this addon's `endpoints`"),
-                ));
-            }
         }
     }
 
@@ -312,10 +304,10 @@ impl Config {
                 "`config` is passed to WASM addons; configure the service itself",
             );
         }
-        if a.audit_endpoint.is_some() {
+        if a.state != super::AddonState::default() {
             refuse(
-                "audit_endpoint",
-                "`audit_endpoint` is for `kind: wasm` addons",
+                "state",
+                "`state` is a WASM addon's store; a service keeps its own",
             );
         }
         let l = &a.limits;
@@ -380,12 +372,6 @@ impl Config {
             d.push(Diagnostic::new(
                 format!("{path}.timeout"),
                 "must be positive",
-            ));
-        }
-        if e.retries > MAX_ENDPOINT_RETRIES {
-            d.push(Diagnostic::new(
-                format!("{path}.retries"),
-                format!("at most {MAX_ENDPOINT_RETRIES}"),
             ));
         }
         let mut header_names = HashSet::new();
@@ -690,11 +676,6 @@ impl Config {
 /// Upper bound on `limits.max_metric_bytes`: well past any sensible
 /// budget, so a unit typo (`256gb` for `256mb`) is caught at load.
 const MAX_METRIC_BYTES_CEILING: u64 = 64 << 30;
-
-/// Upper bound on an endpoint's `retries`: each attempt may run for its
-/// whole `timeout`, so the cap bounds how long one endpoint call can hold a
-/// layer.
-const MAX_ENDPOINT_RETRIES: u32 = 9;
 
 fn is_list_name(s: &str) -> bool {
     let mut b = s.bytes();
