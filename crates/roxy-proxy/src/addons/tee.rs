@@ -29,7 +29,7 @@ use roxy_wasm::{HostError, LayerError, LayerRequest, LayerResponse, SlotWait};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use super::StackFlow;
+use super::{AddonSpec, Part, StackFlow};
 use crate::budget::{self, BufferLease};
 use crate::flowlog::FlowEvent;
 use crate::server::Shared;
@@ -280,6 +280,31 @@ impl HttpBody for Tee {
     }
 }
 
+/// The observer's copy of `body`: a [`tee`] when the layer is subscribed to
+/// it, nothing when it is not (no copy, no budget, no lag to report).
+fn copy_for(
+    st: &StackFlow,
+    addon: &AddonSpec,
+    dir: Dir,
+    body: Body,
+    lag: Arc<Lag>,
+) -> (Body, Body, CopyCut) {
+    match addon.subscribe.part(dir) {
+        Part::Full => tee(st, body, lag),
+        Part::Head => (body, Body::empty(), CopyCut(CancellationToken::new())),
+    }
+}
+
+/// The head of the observer's copy: without the body's framing when the
+/// layer is not subscribed to the body.
+fn copy_headers(addon: &AddonSpec, dir: Dir, headers: &http::HeaderMap) -> http::HeaderMap {
+    let mut copy = headers.clone();
+    if addon.subscribe.part(dir) == Part::Head {
+        super::subscribe::head_only(&mut copy);
+    }
+    copy
+}
+
 /// Splits `body` into the real body (unchanged, never delayed) and a
 /// best-effort copy buffered up to `lag_bytes`, charged to the buffer
 /// budget as it queues.
@@ -357,12 +382,13 @@ pub(crate) async fn observe(
     let addon = st.snap.addons[index].clone();
     let (parts, body) = req.into_parts();
     let request_lag = lag(&st, &addon.name, Dir::Request);
-    let (real_body, copy_body, cut) = tee(&st, body, request_lag.clone());
+    let (real_body, copy_body, cut) =
+        copy_for(&st, &addon, Dir::Request, body, request_lag.clone());
     let mut copy_req = http::Request::new(copy_body);
     copy_req.extensions_mut().insert(cut);
     *copy_req.method_mut() = parts.method.clone();
     *copy_req.uri_mut() = parts.uri.clone();
-    *copy_req.headers_mut() = parts.headers.clone();
+    *copy_req.headers_mut() = copy_headers(&addon, Dir::Request, &parts.headers);
     let real_req = http::Request::from_parts(parts, real_body);
 
     let (tx, rx) = oneshot::channel();
@@ -387,7 +413,7 @@ pub(crate) async fn observe(
                     );
                 }
             });
-            return forward(st, index, &addon.name, real_req, tx).await;
+            return forward(st, index, &addon, real_req, tx).await;
         }
     };
     let host = Arc::new(super::host::StackHost {
@@ -434,7 +460,7 @@ pub(crate) async fn observe(
         }
     });
 
-    forward(st, index, &addon.name, real_req, tx).await
+    forward(st, index, &addon, real_req, tx).await
 }
 
 /// Reads `body` to its end or first error, holding one frame at a time.
@@ -447,18 +473,19 @@ async fn discard(mut body: Body) {
 async fn forward(
     st: Arc<StackFlow>,
     index: usize,
-    name: &str,
+    addon: &AddonSpec,
     real_req: LayerRequest,
     tx: oneshot::Sender<Result<LayerResponse, HostError>>,
 ) -> Result<LayerResponse, HostError> {
     match super::below(st.clone(), index, real_req).await {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
-            let (real_body, copy_body, cut) = tee(&st, body, lag(&st, name, Dir::Response));
+            let lag = lag(&st, &addon.name, Dir::Response);
+            let (real_body, copy_body, cut) = copy_for(&st, addon, Dir::Response, body, lag);
             let mut copy = http::Response::new(copy_body);
             copy.extensions_mut().insert(cut);
             *copy.status_mut() = parts.status;
-            *copy.headers_mut() = parts.headers.clone();
+            *copy.headers_mut() = copy_headers(addon, Dir::Response, &parts.headers);
             let _ = tx.send(Ok(copy));
             Ok(http::Response::from_parts(parts, real_body))
         }

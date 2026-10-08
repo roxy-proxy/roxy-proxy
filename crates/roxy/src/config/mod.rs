@@ -649,6 +649,25 @@ pub enum AddonMode {
     Observe,
 }
 
+/// How much of one direction of the exchange a layer sees.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Part {
+    /// The head only; the body bypasses the layer.
+    Head,
+    /// The head and the body.
+    #[default]
+    Full,
+}
+
+/// A layer's subscription to each direction of the exchange.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Subscribe {
+    pub request: Part,
+    pub response: Part,
+}
+
 /// Per-addon limits. They protect roxy and catch a broken addon; they
 /// don't police how fast it is. Each has a default when absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -679,9 +698,8 @@ pub struct AddonLimits {
     pub max_instances: Option<u64>,
 }
 
-/// One `addons:` entry. There is no hook list: an addon has one
-/// entry point (`handle`) and an optional `tunnel` export discovered at
-/// load time.
+/// One `addons:` entry. There is no hook list: an addon has one entry
+/// point (`handle`) and subscribes to the parts of the exchange it needs.
 ///
 /// Addons always sit above the built-in rules, in the order listed: the
 /// first addon sees the request first and the response last.
@@ -707,6 +725,9 @@ pub struct Addon {
     /// gets a copy of, in (0, 1].
     #[serde(default)]
     pub sample: Option<f64>,
+    /// Which parts of the exchange the layer sees; the rest bypass it.
+    #[serde(default)]
+    pub subscribe: Subscribe,
     /// Opaque config passed to the addon as JSON.
     #[serde(default)]
     pub config: serde_yaml_ng::Value,

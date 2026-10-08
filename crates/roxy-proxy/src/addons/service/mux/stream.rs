@@ -675,7 +675,7 @@ pub(crate) async fn open(
         stream
     };
     let opening = Opening(Some(&stream));
-    if !stream.send(&open_message(st, &addon.name, mode)).await {
+    if !stream.send(&open_message(st, index, mode)).await {
         drop(opening);
         return Err(ServiceError::Closed("the connection closed".into()));
     }
@@ -685,12 +685,14 @@ pub(crate) async fn open(
 
 /// The `open` message: who the client is and where the exchange is, so
 /// the service can key its state on (flow, layer).
-pub(super) fn open_message(st: &StackFlow, layer: &str, mode: AddonMode) -> Out {
+pub(super) fn open_message(st: &StackFlow, index: usize, mode: AddonMode) -> Out {
+    let addon = &st.snap.addons[index];
     Out::Open {
         flow: st.flow.to_string(),
         conn: st.client.id.to_string(),
-        layer: layer.to_owned(),
+        layer: addon.name.clone(),
         mode: mode.as_str(),
+        subscribe: addon.subscribe.into(),
         client_ip: st.client.peer.ip().to_string(),
         listener: st.client.listener.name.clone(),
         sni: st.tls.as_ref().and_then(|t| t.sni.clone()),

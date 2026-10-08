@@ -45,7 +45,7 @@ use tokio::sync::oneshot::error::TryRecvError;
 use tokio::time::Instant as TokioInstant;
 
 use super::tee::CopyCut;
-use super::{AddonMode, StackError, StackFlow};
+use super::{AddonMode, StackError, StackFlow, Subscription};
 use crate::watch::Dir;
 
 pub(crate) use mux::Pools;
@@ -111,6 +111,22 @@ impl ServiceError {
     }
 }
 
+/// What the service will be sent of each direction (`head` or `full`).
+#[derive(Serialize)]
+struct SubscribeOut {
+    request: &'static str,
+    response: &'static str,
+}
+
+impl From<Subscription> for SubscribeOut {
+    fn from(s: Subscription) -> Self {
+        SubscribeOut {
+            request: s.request.as_str(),
+            response: s.response.as_str(),
+        }
+    }
+}
+
 /// roxy → service (each sent with its stream id).
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -120,6 +136,7 @@ enum Out {
         conn: String,
         layer: String,
         mode: &'static str,
+        subscribe: SubscribeOut,
         client_ip: String,
         listener: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -526,7 +543,9 @@ pub(crate) mod testing {
     use roxy_rules::{Policy, PolicyInput, RuleConfig};
 
     use super::ServiceSpec;
-    use crate::addons::{AddonImpl, AddonMode, AddonSpec, EndpointSpec, StateLimits};
+    use crate::addons::{
+        AddonImpl, AddonMode, AddonSpec, EndpointSpec, Part, StateLimits, Subscription,
+    };
     use crate::config::PolicyUpdate;
     use crate::flowlog::Redactor;
     use crate::testkit::Kit;
@@ -568,7 +587,19 @@ pub(crate) mod testing {
             state: StateLimits::default(),
             when: None,
             sample: None,
+            subscribe: Subscription::default(),
         })
+    }
+
+    /// `addon`, subscribed to `request` and `response`.
+    pub(crate) fn subscribed(
+        mut addon: Arc<AddonSpec>,
+        request: Part,
+        response: Part,
+    ) -> Arc<AddonSpec> {
+        Arc::get_mut(&mut addon).expect("a fresh addon").subscribe =
+            Subscription { request, response };
+        addon
     }
 
     /// `addon`, run only on requests `when` matches.

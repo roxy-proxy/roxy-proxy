@@ -156,6 +156,13 @@ fn endpoints(a: &Addon) -> anyhow::Result<HashMap<String, EndpointSpec>> {
         .collect()
 }
 
+fn part(p: crate::config::Part) -> roxy_proxy::addons::Part {
+    match p {
+        crate::config::Part::Head => roxy_proxy::addons::Part::Head,
+        crate::config::Part::Full => roxy_proxy::addons::Part::Full,
+    }
+}
+
 fn state_limits(a: &Addon) -> StateLimits {
     let d = StateLimits::default();
     StateLimits {
@@ -214,6 +221,10 @@ impl AddonLoader {
                 state: state_limits(a),
                 when,
                 sample: a.sample,
+                subscribe: roxy_proxy::addons::Subscription {
+                    request: part(a.subscribe.request),
+                    response: part(a.subscribe.response),
+                },
             }));
         }
         Ok(PreparedAddons { specs, layers })

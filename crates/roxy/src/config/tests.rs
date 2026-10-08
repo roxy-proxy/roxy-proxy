@@ -1087,6 +1087,36 @@ fn addon_when_and_sample() {
     assert!(conditions.iter().all(Option::is_some));
 }
 
+/// `subscribe` names what a layer sees of each direction; it defaults to
+/// everything, and takes nothing but `head` or `full`.
+#[test]
+fn addon_subscribe_parses_and_defaults_to_full() {
+    use super::Part;
+    let (_dir, wasm) = wasm_file();
+    let cfg = parse(&format!(
+        "{BASE}addons:\n  \
+         - {{ name: a, path: {wasm}, subscribe: {{ request: head }} }}\n  \
+         - {{ name: b, path: {wasm} }}\n"
+    ));
+    cfg.validate().unwrap();
+    assert_eq!(cfg.addons[0].subscribe.request, Part::Head);
+    assert_eq!(cfg.addons[0].subscribe.response, Part::Full);
+    assert_eq!(cfg.addons[1].subscribe.request, Part::Full);
+    assert_eq!(cfg.addons[1].subscribe.response, Part::Full);
+    for bad in [
+        "subscribe: { request: none }",
+        "subscribe: { body: full }",
+        "subscribe: head",
+    ] {
+        let err = Config::from_yaml(&format!(
+            "{BASE}addons: [{{ name: a, path: {wasm}, {bad} }}]\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("subscribe"), "{bad}: {err}");
+    }
+}
+
 #[test]
 fn addon_when_and_sample_diagnosed() {
     let (_dir, wasm) = wasm_file();

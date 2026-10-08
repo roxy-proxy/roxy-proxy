@@ -72,7 +72,9 @@ pub(crate) use h2raw::{H2_GOAWAY, H2_HEADERS, H2_RST_STREAM, h2_client, h2_get, 
 pub(crate) use upstream::{Seen, Upstream};
 
 use crate::Server;
-use crate::addons::{AddonMode, AddonSpec, EndpointPath, EndpointSpec, StateLimits};
+use crate::addons::{
+    AddonMode, AddonSpec, EndpointPath, EndpointSpec, Part, StateLimits, Subscription,
+};
 use crate::addr::PrivateAddrs;
 use crate::addrlist::{AddressList, AddressLists};
 use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
@@ -114,6 +116,7 @@ pub(crate) struct AddonDef {
     pub when: Option<String>,
     pub sample: Option<f64>,
     pub endpoints: HashMap<String, EndpointSpec>,
+    pub subscribe: Subscription,
 }
 
 impl AddonDef {
@@ -129,7 +132,15 @@ impl AddonDef {
             when: None,
             sample: None,
             endpoints: HashMap::new(),
+            subscribe: Subscription::default(),
         }
+    }
+
+    /// Subscribes the layer to `request` and `response`.
+    #[must_use]
+    pub(crate) fn subscribe(mut self, request: Part, response: Part) -> Self {
+        self.subscribe = Subscription { request, response };
+        self
     }
 
     #[must_use]
@@ -240,6 +251,7 @@ impl AddonDef {
             state: StateLimits::default(),
             when,
             sample: self.sample,
+            subscribe: self.subscribe,
         })
     }
 }

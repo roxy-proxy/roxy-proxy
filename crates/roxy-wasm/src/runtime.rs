@@ -284,7 +284,8 @@ impl Layer {
                         | LayerError::Init(_)
                         | LayerError::Instantiate(_)
                         | LayerError::NoInstance
-                        | LayerError::Cancelled) => other,
+                        | LayerError::Cancelled
+                        | LayerError::Unsubscribed(_)) => other,
                     }
                 })?;
                 let handler = inner

@@ -667,7 +667,7 @@ async fn upgrade_upstream(
     let (host, port) = (host_text(&req.authority.host), req.authority.port);
     let key = validate_upgrade_request(&req)
         .map_err(|e| Failed::Refuse(bad_upgrade_refusal(e.reason)))?;
-    if crate::addons::ws_without_extensions(&cx.snap, cx.layer_ran) {
+    if crate::addons::ws_without_extensions(&cx.snap, cx.layer_reads_bytes) {
         // Messages are read, by the rules or by addon layers, so no
         // extension (permessage-deflate above all) may be negotiated.
         req.headers.remove("sec-websocket-extensions");

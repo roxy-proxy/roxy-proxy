@@ -35,7 +35,7 @@ pub(super) async fn splice_websocket(
 ) -> Next {
     let parse = cx.snap.policy.reads_ws();
     let checked = validate_upgrade_response(&res, key).and_then(|()| {
-        if crate::addons::ws_without_extensions(&cx.snap, cx.layer_ran) {
+        if crate::addons::ws_without_extensions(&cx.snap, cx.layer_reads_bytes) {
             validate_no_extensions(&res)
         } else {
             Ok(())
