@@ -75,5 +75,5 @@ fails the load. Each exchange checks an instance out of the layer's pool
 for its whole duration; instances are replaced after
 `recycle_after_exchanges` or above `recycle_above_memory`, and one that
 failed in any way is discarded, never reused
-([addon safety limits](/reference/addon-safety),
+([limits](/reference/addon-configuration#limits),
 [configuration](/reference/addon-configuration)).

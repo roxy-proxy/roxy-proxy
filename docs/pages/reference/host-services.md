@@ -4,7 +4,7 @@ Everything a WASM layer can do outside its own streams, each a capability
 granted in config
 ([capabilities](/reference/addon-configuration#capabilities)). The caps on
 each (payload sizes, calls in flight, key length) are in
-[addon safety limits](/reference/addon-safety).
+[fixed caps](/reference/addon-configuration#fixed-caps).
 
 ## Endpoints (`endpoints`)
 

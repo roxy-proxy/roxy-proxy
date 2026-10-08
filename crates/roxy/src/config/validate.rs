@@ -304,6 +304,12 @@ impl Config {
                 "`config` is passed to WASM addons; configure the service itself",
             );
         }
+        if a.state != super::AddonState::default() {
+            refuse(
+                "state",
+                "`state` is a WASM addon's store; a service keeps its own",
+            );
+        }
         let l = &a.limits;
         for (field, set) in [
             ("max_memory", l.max_memory.is_some()),

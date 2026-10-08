@@ -92,15 +92,24 @@ to reach is a [named endpoint](/reference/host-services#endpoints-endpoints),
 which goes straight to the connector, never through other layers or the
 rules.
 
-## Full access to both streams
+## A layer takes what it subscribes to
 
-A layer may read, rewrite, split, delay, inject into or replace either
-stream, chunk by chunk. roxy buffers nothing on a layer's behalf; a layer
-that wants a whole body reads it, within its `max_memory`. The patterns:
+A layer subscribes to each direction in config: the head and the body
+(`full`, the default) or the head only. Of a direction it has in full, a
+layer may read, rewrite, split, delay, inject into or replace the stream,
+chunk by chunk. roxy buffers nothing on a layer's behalf; a layer that
+wants a whole body reads it, within its `max_memory`. The patterns:
 observe (`next(req)`, return its response unchanged), rewrite in flight
 (wrap a body stream in a transform), withhold until cleared (forward a
 streamed response as it arrives but hold back parts, say tool calls, until
 judged), and deny or answer (return a response without calling `next`).
+
+A body a layer is not subscribed to bypasses it, as if the layer had
+passed it on untouched: the layer sees the head with an empty body and
+decides at the head, and roxy splices the body onto what it passes on. An
+enforce layer still denies or rewrites at the head; an observer that wants
+heads only costs no body copies
+([what a layer sees](/reference/addon-configuration#what-a-layer-sees)).
 
 A WebSocket is an exchange like any other, only long-lived: after the
 `101`, the request body carries the client's bytes and the response body
@@ -120,8 +129,8 @@ Layers see bodies decoded, so none needs its own decompressors
   of the matching exchanges, and an observer may `record` but cannot tag
   the flow ([capabilities](/reference/addon-configuration#capabilities)).
 
-  Each copy is buffered for the layer, so one that keeps up sees every
-  body in full, however large. A copy is cut, and the flow goes on, when
+  Each copy of a body the layer is subscribed to is buffered for it, so
+  one that keeps up sees every body in full, however large. A copy is cut, and the flow goes on, when
   the layer falls `limits.max_observer_lag_bytes` behind, the
   [buffer budget](/reference/limits#limits) cannot cover its next frame,
   or no instance of the layer comes free within its `first_byte_timeout`

@@ -58,11 +58,17 @@ A stream opens with an `open` message from roxy:
 
 ```json
 {"type":"open","stream":7,"flow":"01J…","conn":"01J…","layer":"sentinel",
- "mode":"enforce","client_ip":"10.0.0.5","listener":"proxy",
+ "mode":"enforce","subscribe":{"request":"full","response":"head"},
+ "client_ip":"10.0.0.5","listener":"proxy",
  "sni":"api.example.com","tags":["a","b"]}
 ```
 
-`sni` is left out when there is none. The pair (`flow`, `layer`) is unique
+`sni` is left out when there is none. `subscribe` is the layer's
+[subscription](/reference/addon-configuration#what-a-layer-sees): for a
+direction it names `head`, roxy sends the head and its end with no bytes
+between, and the service answers the same way; bytes the service sends for
+that body fail the exchange closed (`unsubscribed:<direction>`), and the
+body the service did not see goes on with the head it passed on. The pair (`flow`, `layer`) is unique
 and stable (two layers using the same endpoint in one flow get separate
 streams with different `layer`s), so a service can key its state on it.
 

@@ -175,7 +175,6 @@ addons:
     #     url: https://classifier.internal:8443/v1/score
     #     headers: { authorization: "Bearer ${secret:classifier}" }
     #     timeout: 2s
-    #     retries: 1
     #     private_ok: true
   # An external service in the network path: each exchange is a
   # stream on a pooled WebSocket connection (roxy.layer.v4).
