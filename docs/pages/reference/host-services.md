@@ -10,13 +10,13 @@ each (payload sizes, calls in flight, key length) are in
 
 `endpoints.call(name, request)`: roxy resolves the name to the configured
 URL, attaches the endpoint's headers (replacing any the layer set), applies
-the timeout and retries, and enforces the address floor and deny lists. The
+the timeout, and enforces the address floor and deny lists. The
 layer cannot name a destination and never sees the credentials. Calls do not
 pass through the layer stack, so a monitor's own model call cannot recurse
 through it; the response goes back to the layer, not through the rules. Each call emits an `endpoint_call` flow event.
 
-- The request body is buffered so a retry can resend it; reading it counts
-  against the timeout. Retries back off from 100 ms.
+- The request body is buffered before the call (at most 16 MiB), and
+  reading it counts against the timeout.
 - An unknown name, a denied address, a refused path, a timeout and a
   failure reach the layer as distinct `error-code`s.
 

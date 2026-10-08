@@ -148,7 +148,6 @@ fn endpoints(a: &Addon) -> anyhow::Result<HashMap<String, EndpointSpec>> {
                     },
                     headers,
                     timeout: e.timeout.unwrap_or(DEFAULT_ENDPOINT_TIMEOUT),
-                    retries: e.retries,
                     private: PrivateAddrs::from_private_ok(e.private_ok),
                 },
             ))

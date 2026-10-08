@@ -368,12 +368,6 @@ impl Config {
                 "must be positive",
             ));
         }
-        if e.retries > MAX_ENDPOINT_RETRIES {
-            d.push(Diagnostic::new(
-                format!("{path}.retries"),
-                format!("at most {MAX_ENDPOINT_RETRIES}"),
-            ));
-        }
         let mut header_names = HashSet::new();
         for (h, v) in &e.headers {
             if http::HeaderName::from_bytes(h.as_bytes()).is_err() {
@@ -676,11 +670,6 @@ impl Config {
 /// Upper bound on `limits.max_metric_bytes`: well past any sensible
 /// budget, so a unit typo (`256gb` for `256mb`) is caught at load.
 const MAX_METRIC_BYTES_CEILING: u64 = 64 << 30;
-
-/// Upper bound on an endpoint's `retries`: each attempt may run for its
-/// whole `timeout`, so the cap bounds how long one endpoint call can hold a
-/// layer.
-const MAX_ENDPOINT_RETRIES: u32 = 9;
 
 fn is_list_name(s: &str) -> bool {
     let mut b = s.bytes();

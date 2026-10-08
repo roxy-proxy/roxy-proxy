@@ -17,8 +17,7 @@ addons:
       monitor-model:
         url: https://api.anthropic.com/v1/messages
         headers: { x-api-key: "${secret:monitor_key}" }   # attached by roxy, never seen by the layer
-        timeout: 10s                  # per attempt, to the response head (default 30s)
-        retries: 2                    # after a connection failure or 502/503/504 (default 0, at most 9)
+        timeout: 10s                  # to the response head (default 30s)
       threat-intel:
         url: https://ti.internal:8443/score
         path: prefix                  # the layer's path goes under the URL (default fixed: the URL is the whole target)

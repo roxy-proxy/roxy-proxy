@@ -169,10 +169,8 @@ pub struct EndpointSpec {
     pub path: EndpointPath,
     /// Headers roxy attaches; values may contain `${secret:name}`.
     pub headers: Vec<(HeaderName, String)>,
-    /// Per attempt, until the response head.
+    /// Until the response head.
     pub timeout: Duration,
-    /// Extra attempts after a connection failure or a 502/503/504.
-    pub retries: u32,
     /// Whether the endpoint may be on a private address.
     pub private: PrivateAddrs,
 }

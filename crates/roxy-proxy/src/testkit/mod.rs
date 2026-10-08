@@ -175,7 +175,6 @@ impl AddonDef {
                     .map(|(n, v)| (n.parse().unwrap(), (*v).to_owned()))
                     .collect(),
                 timeout: Duration::from_secs(5),
-                retries: 0,
                 private: PrivateAddrs::from_private_ok(private_ok),
             },
         );

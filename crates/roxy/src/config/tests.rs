@@ -1038,11 +1038,6 @@ fn addon_limits_check_matches_run() {
             "addons[0].endpoints.e.timeout",
             "positive",
         ),
-        (
-            "endpoints: { e: { url: \"https://x.test/\", retries: 10 } }",
-            "addons[0].endpoints.e.retries",
-            "at most 9",
-        ),
     ] {
         let d = diagnostics(&format!(
             "{BASE}addons: [{{ name: a, path: {wasm}, {bad} }}]\n"
@@ -1056,7 +1051,6 @@ fn addon_limits_check_matches_run() {
     for ok in [
         "limits: { max_memory: 256mb, recycle_above_memory: 256mb }",
         "limits: { max_memory: 16mb }",
-        "endpoints: { e: { url: \"https://x.test/\", retries: 9 } }",
     ] {
         parse(&format!(
             "{BASE}addons: [{{ name: a, path: {wasm}, {ok} }}]\n"

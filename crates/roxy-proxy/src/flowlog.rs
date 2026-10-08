@@ -233,7 +233,6 @@ pub enum FlowEvent<'a> {
         method: String,
         path: String,
         status: Option<u16>,
-        attempts: u32,
         duration_ms: u64,
         error: Option<String>,
     },

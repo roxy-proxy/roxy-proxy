@@ -547,7 +547,6 @@ pub(crate) mod testing {
             path: crate::addons::EndpointPath::Fixed,
             headers: Vec::new(),
             timeout: Duration::from_secs(10),
-            retries: 0,
             private: crate::addr::PrivateAddrs::Deny,
         };
         Arc::new(AddonSpec {

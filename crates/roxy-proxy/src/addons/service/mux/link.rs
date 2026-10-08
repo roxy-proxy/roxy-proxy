@@ -243,7 +243,6 @@ pub(super) async fn dial(
         method: "GET".to_owned(),
         path: spec.url.path().to_owned(),
         status: result.is_ok().then_some(101),
-        attempts: 1,
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         error: result.as_ref().err().map(ToString::to_string),
     });
