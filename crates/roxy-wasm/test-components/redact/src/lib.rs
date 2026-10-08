@@ -48,6 +48,10 @@ impl Layer for Redact {
     }
 
     fn handle(&mut self, req: Request, next: Next) -> Response {
+        // With nothing to redact the bodies pass through untouched.
+        if self.needles.is_empty() {
+            return next.run(req);
+        }
         let req = req.map_body(|b| b.pipe(self.redactor()));
         let resp = next.run(req);
         resp.map_body(|b| b.pipe(self.redactor()))

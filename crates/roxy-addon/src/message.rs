@@ -326,19 +326,11 @@ pub(crate) fn send(
         if let Some(result) = future.get() {
             break result.expect("response taken once").map_err(Error)?;
         }
-        let head = future.subscribe();
-        match pump.wait() {
-            Wait::Done => head.block(),
-            Wait::Ready => {
-                drop(head);
-                pump.advance();
-            }
+        match pump.step() {
+            Wait::Done => future.subscribe().block(),
             Wait::On(writable) => {
-                let ready = poll(&[&head, &writable]);
-                drop((head, writable));
-                if ready.contains(&1) {
-                    pump.advance();
-                }
+                let head = future.subscribe();
+                poll(&[&head, &writable]);
             }
         }
     };

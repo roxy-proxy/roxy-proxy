@@ -4,7 +4,8 @@
 //! from the host stream: a chunk is read from the host only when the body
 //! is pulled, so a layer that transforms chunk by chunk holds at most one
 //! chunk at a time. Nothing is buffered unless the layer asks for it with
-//! [`Body::read_to_end`].
+//! [`Body::read_to_end`]. A host body the layer passes on without reading
+//! or transforming it is moved host-side and never enters the guest.
 
 use std::fmt;
 
@@ -15,6 +16,15 @@ use crate::pump::{RequestPump, Wait};
 
 /// Largest chunk read from the host at once.
 pub(crate) const READ_CHUNK: u64 = 64 * 1024;
+
+/// What a non-blocking pull found.
+pub(crate) enum Pull {
+    Chunk(Vec<u8>),
+    End,
+    Failed(BodyError),
+    /// Nothing yet; wait on [`Body::pollable`].
+    NotReady,
+}
 
 /// Why a body could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,10 +101,53 @@ impl Incoming {
         }
     }
 
+    /// The host stream, while open.
+    pub(crate) fn input(&self) -> Option<&InputStream> {
+        self.stream.as_ref()
+    }
+
+    /// Takes what the host has ready, without waiting.
+    fn try_next_chunk(&mut self) -> Pull {
+        let Some(stream) = self.stream.as_ref() else {
+            return Pull::End;
+        };
+        match stream.read(READ_CHUNK) {
+            Ok(chunk) if chunk.is_empty() => Pull::NotReady,
+            Ok(chunk) => Pull::Chunk(chunk),
+            Err(StreamError::Closed) => {
+                self.close();
+                Pull::End
+            }
+            Err(StreamError::LastOperationFailed(e)) => {
+                let msg = e.to_debug_string();
+                self.close();
+                Pull::Failed(BodyError::Stream(msg))
+            }
+        }
+    }
+
     fn next_chunk(&mut self) -> Option<Result<Vec<u8>, BodyError>> {
         loop {
+            if self.pump.is_some() {
+                // Pumping the request body meanwhile: take what is here,
+                // else advance the pump and wait on both.
+                match self.try_next_chunk() {
+                    Pull::Chunk(chunk) => return Some(Ok(chunk)),
+                    Pull::End => return None,
+                    Pull::Failed(e) => return Some(Err(e)),
+                    Pull::NotReady => {}
+                }
+                match self.pump.as_mut().expect("pump").step() {
+                    Wait::Done => self.pump = None,
+                    Wait::On(writable) => {
+                        let readable = self.stream.as_ref()?.subscribe();
+                        poll(&[&readable, &writable]);
+                    }
+                }
+                continue;
+            }
             let stream = self.stream.as_ref()?;
-            match stream.read(READ_CHUNK) {
+            match stream.blocking_read(READ_CHUNK) {
                 Ok(chunk) if chunk.is_empty() => {}
                 Ok(chunk) => return Some(Ok(chunk)),
                 Err(StreamError::Closed) => {
@@ -105,26 +158,6 @@ impl Incoming {
                     let msg = e.to_debug_string();
                     self.close();
                     return Some(Err(BodyError::Stream(msg)));
-                }
-            }
-            // Nothing to read yet: wait for data, pumping the request body
-            // meanwhile.
-            let readable = stream.subscribe();
-            match self.pump.as_deref().map(RequestPump::wait) {
-                None | Some(Wait::Done) => {
-                    self.pump = None;
-                    readable.block();
-                }
-                Some(Wait::Ready) => {
-                    drop(readable);
-                    self.pump.as_mut().expect("pump").advance();
-                }
-                Some(Wait::On(writable)) => {
-                    let ready = poll(&[&readable, &writable]);
-                    drop((readable, writable));
-                    if ready.contains(&1) {
-                        self.pump.as_mut().expect("pump").advance();
-                    }
                 }
             }
         }
@@ -239,6 +272,71 @@ impl Body {
     pub(crate) fn incoming(body: IncomingBody, parent: Parent, pump: Option<RequestPump>) -> Self {
         Self {
             inner: Inner::Incoming(Incoming::new(body, parent, pump)),
+        }
+    }
+
+    /// A host body untouched so far, for moving on host-side; otherwise
+    /// the body back. A stream still pumping a request of its own stays a
+    /// guest body: the pump needs driving as it is read.
+    pub(crate) fn into_passthrough(self) -> Result<Incoming, Body> {
+        match self.inner {
+            Inner::Incoming(i) if i.pump.is_none() => Ok(i),
+            inner => Err(Body { inner }),
+        }
+    }
+
+    /// Takes the next chunk if one is ready without waiting on the host.
+    pub(crate) fn try_next(&mut self) -> Pull {
+        loop {
+            match &mut self.inner {
+                Inner::Empty => return Pull::End,
+                Inner::Bytes(b) => {
+                    return match b.take().filter(|b| !b.is_empty()) {
+                        Some(b) => Pull::Chunk(b),
+                        None => Pull::End,
+                    };
+                }
+                Inner::Incoming(i) => return i.try_next_chunk(),
+                Inner::Chunks(c) => {
+                    return match c.next() {
+                        Some(Ok(chunk)) => Pull::Chunk(chunk),
+                        Some(Err(e)) => Pull::Failed(e),
+                        None => Pull::End,
+                    };
+                }
+                Inner::Piped {
+                    source,
+                    transform,
+                    finished,
+                } => {
+                    if *finished {
+                        return Pull::End;
+                    }
+                    match source.try_next() {
+                        Pull::Chunk(chunk) => {
+                            let out = transform.chunk(chunk);
+                            if !out.is_empty() {
+                                return Pull::Chunk(out);
+                            }
+                            // Held back entirely; pull the next chunk.
+                        }
+                        Pull::End => {
+                            *finished = true;
+                            let out = transform.finish();
+                            return if out.is_empty() {
+                                Pull::End
+                            } else {
+                                Pull::Chunk(out)
+                            };
+                        }
+                        Pull::Failed(e) => {
+                            *finished = true;
+                            return Pull::Failed(e);
+                        }
+                        Pull::NotReady => return Pull::NotReady,
+                    }
+                }
+            }
         }
     }
 

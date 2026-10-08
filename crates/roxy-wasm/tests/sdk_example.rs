@@ -2,22 +2,35 @@
 //! `test-components/build.sh`) under the real host with a mock `LayerHost`: the SDK
 //! and the host agree on the WIT contract.
 
+use std::sync::Mutex;
+
 use bytes::Bytes;
-use http::Request;
+use http::{Request, Response};
 use http_body_util::BodyExt;
-use roxy_http::Body;
-use roxy_wasm::{Layer, LayerConfig, WasmRuntime};
+use roxy_http::{Body, BodyError};
+use roxy_wasm::{Layer, LayerConfig, LayerError, WasmRuntime};
+use tokio::sync::oneshot;
 
 mod common;
-use common::{Mock, collect};
+use common::{Mock, NextMode, collect, exchange};
 
 const REDACT: &[u8] = include_bytes!("fixtures/redact.wasm");
 
-async fn redact() -> Layer {
+async fn load(config: &str) -> Layer {
     let rt = WasmRuntime::new().unwrap();
     let mut cfg = LayerConfig::new("redact");
-    cfg.config_json = r#"{"needles": ["sk-live-1234"], "replacement": "[x]"}"#.into();
+    cfg.config_json = config.into();
     Layer::load(&rt, REDACT.to_vec(), cfg).await.unwrap()
+}
+
+async fn redact() -> Layer {
+    load(r#"{"needles": ["sk-live-1234"], "replacement": "[x]"}"#).await
+}
+
+/// Nothing to redact: the layer passes both bodies on untouched, which the
+/// SDK moves host-side without reading them into the guest.
+async fn passthrough() -> Layer {
+    load(r#"{"needles": []}"#).await
 }
 
 fn post(body: Body) -> roxy_wasm::LayerRequest {
@@ -100,4 +113,80 @@ async fn request_and_response_stream_concurrently() {
     let out = collect(resp.into_body()).await.unwrap();
     sender.await.unwrap();
     assert_eq!(out, "0123456789abcdef-[x]-".repeat(35_000));
+}
+
+/// A body passed on untouched still streams in both directions at once:
+/// each client chunk reaches the layer below while the client is still
+/// sending, and the response flows back while the request body is open.
+#[tokio::test]
+async fn untouched_bodies_stream_both_ways_at_once() {
+    let layer = passthrough().await;
+    let (mut up_tx, up_body) = Body::channel(u64::MAX, None);
+    let (seen_tx, seen_rx) = oneshot::channel();
+    let host = Mock::new(NextMode::Capture(Mutex::new(Some((
+        seen_tx,
+        Response::new(up_body),
+    )))));
+    let (mut client_tx, client_body) = Body::channel(u64::MAX, None);
+    let handle = tokio::spawn({
+        let layer = layer.clone();
+        let host = host.clone();
+        async move { layer.handle(host, post(client_body)).await }
+    });
+
+    let mut upstream_body = seen_rx.await.unwrap().into_body();
+    client_tx.send_data(Bytes::from("first ")).await.unwrap();
+    let frame = upstream_body.frame().await.unwrap().unwrap();
+    assert_eq!(frame.into_data().unwrap(), "first ");
+
+    // The response starts while the request body is still open.
+    let resp = handle.await.unwrap().unwrap();
+    let mut client_body = resp.into_body();
+    up_tx.send_data(Bytes::from("pong ")).await.unwrap();
+    let frame = client_body.frame().await.unwrap().unwrap();
+    assert_eq!(frame.into_data().unwrap(), "pong ");
+
+    client_tx.send_data(Bytes::from("second")).await.unwrap();
+    let frame = upstream_body.frame().await.unwrap().unwrap();
+    assert_eq!(frame.into_data().unwrap(), "second");
+    client_tx.finish().await.unwrap();
+    assert!(upstream_body.frame().await.is_none());
+
+    up_tx.send_data(Bytes::from("done")).await.unwrap();
+    up_tx.finish().await.unwrap();
+    assert_eq!(collect(client_body).await.unwrap(), "done");
+}
+
+/// A request body that fails while the layer is passing it on fails the
+/// exchange closed: the body handed down is never finished as if complete.
+#[tokio::test]
+async fn a_failing_untouched_request_body_fails_closed() {
+    let layer = passthrough().await;
+    let (seen_tx, seen_rx) = oneshot::channel();
+    let host = Mock::new(NextMode::Capture(Mutex::new(Some((
+        seen_tx,
+        Response::new(Body::from_bytes("ok")),
+    )))));
+    let (mut client_tx, client_body) = Body::channel(u64::MAX, None);
+    let handle = tokio::spawn({
+        let layer = layer.clone();
+        let host = host.clone();
+        async move { exchange(&layer, host, post(client_body)).await }
+    });
+    let mut upstream_body = seen_rx.await.unwrap().into_body();
+    client_tx.send_data(Bytes::from("partial")).await.unwrap();
+    assert_eq!(
+        upstream_body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap(),
+        "partial"
+    );
+    client_tx.abort(BodyError::Incomplete);
+
+    assert!(matches!(handle.await.unwrap(), Err(LayerError::Trap(_))));
+    assert!(upstream_body.frame().await.unwrap().is_err());
 }
