@@ -14,7 +14,7 @@
 
 use crate::bindings::roxy::addon::types;
 use crate::bindings::wasi::io::poll::Pollable;
-use crate::bindings::wasi::io::streams::OutputStream;
+use crate::bindings::wasi::io::streams::{OutputStream, StreamError};
 use crate::body::{Body, Pull};
 
 /// The rest of a body, on its way to the host.
@@ -159,9 +159,15 @@ impl RequestPump {
         let n = usize::try_from(permit)
             .unwrap_or(usize::MAX)
             .min(self.pending.len());
-        if stream.write(&self.pending[..n]).is_err() {
-            self.finish();
-            return false;
+        match stream.write(&self.pending[..n]) {
+            Ok(()) => {}
+            // The reader is gone: nothing more of this body will be read.
+            Err(StreamError::Closed) => {
+                self.finish();
+                return false;
+            }
+            // A body never ends as complete short of its bytes.
+            Err(e) => panic!("write failed: {e:?}"),
         }
         self.pending.drain(..n);
         true

@@ -46,7 +46,8 @@ interface types {
   /// A body the layer hands to the host.
   variant body {
     empty,
-    /// One piece, no stream.
+    /// One piece, no stream; at most 1 MiB (`budget:body`). A larger body
+    /// is a `stream`.
     bytes(list<u8>),
     /// A stream the host gave this layer (its request body, or a response
     /// body from `next` or `call`), moved host-side without entering the
@@ -121,7 +122,7 @@ interface endpoints {
   /// endpoint's URL only if the endpoint is configured `path: prefix`, and
   /// a `..` segment is refused (`request-uri-invalid`); under `path: fixed`
   /// they are ignored. roxy attaches the endpoint's credentials, applies
-  /// its timeout and retry policy and the address floor. The call goes
+  /// its timeout and the address floor. The call goes
   /// straight to the connector: it never passes through other layers or
   /// the rules. An unknown name resolves to `destination-not-found`.
   call: func(name: string, head: request-head, body: body) -> result<tuple<pending-response, option<output-stream>>, error>;

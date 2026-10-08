@@ -16,6 +16,9 @@ include = ["src/**", "wit/**", "README.md"]
 [dependencies]
 wit-bindgen = { version = "0.62.0", default-features = false, features = ["macros", "realloc", "std"] }
 
+[dev-dependencies]
+roxy-http = { path = "../roxy-http" }
+
 # Same lints as the workspace, except that `unsafe_code` is `deny` rather than
 # `forbid`: the code wit-bindgen generates contains `unsafe` blocks, so the
 # generated `bindings` module allows it.

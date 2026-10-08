@@ -136,6 +136,17 @@ mod tests {
 
     /// The crate carries its own copy of the WIT package (so it can be
     /// published); it must match the workspace's.
+    /// The names the SDK drops from a head it passes on are exactly the
+    /// names the host refuses from a layer.
+    #[test]
+    fn dropped_headers_are_the_hosts_reserved_names() {
+        let mut ours = crate::message::DROPPED_HEADERS.to_vec();
+        ours.sort_unstable();
+        let mut hosts = roxy_http::model::RESERVED.to_vec();
+        hosts.sort_unstable();
+        assert_eq!(ours, hosts);
+    }
+
     #[test]
     fn wit_matches_workspace() {
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));

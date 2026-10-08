@@ -179,6 +179,12 @@ impl OutputStream for GuestOutput {
         let Some(tx) = s.sender.as_mut() else {
             return Err(StreamError::Closed);
         };
+        if tx.is_closed() {
+            return Err(StreamError::Closed);
+        }
+        if tx.capacity() == 0 {
+            return Err(StreamError::trap("write exceeded the permit"));
+        }
         match tx.try_push(bytes) {
             Ok(()) => Ok(()),
             Err(BodyError::Closed) => Err(StreamError::Closed),
@@ -355,15 +361,19 @@ impl Streams {
     }
 
     /// Takes the sender behind an `output-stream` this exchange handed out,
-    /// so that dropping the guest's handle leaves the body alone. `None` for a
-    /// stream that is not one of those.
-    pub(crate) fn take_output(&mut self, res: &Resource<DynOutputStream>) -> Option<BodySender> {
+    /// so that dropping the guest's handle leaves the body alone, and which
+    /// body it was. `None` for a stream that is not one of those; a sender
+    /// of `None` for one already finished.
+    pub(crate) fn take_output(
+        &mut self,
+        res: &Resource<DynOutputStream>,
+    ) -> Option<(Option<BodySender>, Produced)> {
         let state = self.outputs.remove(&res.rep())?;
         let mut s = lock(&state);
         if s.gone {
-            return None;
+            return Some((None, s.produced));
         }
         s.gone = true;
-        s.sender.take()
+        Some((s.sender.take(), s.produced))
     }
 }

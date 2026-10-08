@@ -115,6 +115,7 @@ What the host holds for a guest outside `max_memory`, not configurable:
 | a head a guest hands the host (`next`, `respond`, `call`) | 128 KiB: method, scheme, authority, path and query, and every header name and value together | `budget:fields`: fails the exchange |
 | a flow's tags, across all its layers | 64 tags, 4 KiB together | `budget:tags`: fails the exchange |
 | a `flow.log` message, or a `flow.record` kind and document together | 64 KiB | `budget:message`: fails the exchange |
+| a whole body handed over in one piece (`body.bytes`) | 1 MiB; a larger body is streamed | `budget:body`: fails the exchange |
 | an endpoint call's request body | 16 MiB, read within the endpoint's timeout and charged to the [buffer budget](/reference/limits#buffer-budget) while the call runs | refuses the call |
 | endpoint calls in flight per exchange | 8; further calls wait for a permit, within the timeout | refuses the call |
 | a state key | 1 KiB | refuses the call |

@@ -295,6 +295,9 @@ impl FromGuest {
         cancel: Option<Arc<CancelGuard>>,
     ) -> Body {
         let settled: Settled = Box::pin(shared.wait_settled());
+        // A body whose end is held until the handler returns cannot promise
+        // a length: framed by length, a whole body would reach the client
+        // complete before a trap after it could cut it.
         let known_length = inner.known_length();
         let body = FromGuest {
             inner,

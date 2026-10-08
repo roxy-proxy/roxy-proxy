@@ -27,6 +27,10 @@ const MAX_TABLE_ELEMENTS: usize = 100_000;
 /// Longest `flow.log` message, and longest `flow.record` document (kind and
 /// JSON together), in bytes.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+/// Most bytes in a whole body the guest hands the host in one piece
+/// (`body.bytes`); a larger body is streamed. Held host-side until read,
+/// outside the guest's `max_memory`.
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// The layer, as every instance of it sees it.
 #[derive(Debug)]
@@ -198,7 +202,12 @@ impl StoreState {
         let ex = exchange.as_mut().expect("in an exchange");
         match body {
             types::Body::Empty => Ok((Body::empty(), None)),
-            types::Body::Bytes(b) => Ok((Body::from_bytes(b), None)),
+            types::Body::Bytes(b) => {
+                if b.len() > MAX_BODY_BYTES {
+                    return Err(LayerError::BudgetExceeded(Budget::Body));
+                }
+                Ok((Body::from_bytes(b), None))
+            }
             types::Body::Passthrough(stream) => {
                 let moved = ex.streams.take_input(&stream);
                 // The guest's handle is spent either way.
@@ -219,6 +228,18 @@ impl StoreState {
                     .map_err(|e| invalid(produced, e.to_string()))?;
                 Ok((body, Some(out)))
             }
+        }
+    }
+
+    /// Spends a body the guest handed to a call that did not take it: a
+    /// `passthrough` handle is the host's from the call on, so it leaves the
+    /// table and its body is dropped.
+    fn discard_body(&mut self, body: types::Body) {
+        if let types::Body::Passthrough(stream) = body {
+            if let Some(ex) = self.exchange.as_mut() {
+                drop(ex.streams.take_input(&stream));
+            }
+            let _ = self.table.delete(stream);
         }
     }
 
@@ -300,15 +321,21 @@ type Call = Result<(Resource<PendingResponse>, Option<Resource<DynOutputStream>>
 #[allow(clippy::unused_async_trait_impl)]
 impl types::Host for StoreState {
     async fn finish(&mut self, body: Resource<DynOutputStream>) -> wasmtime::Result<()> {
-        let sender = self
+        let taken = self
             .exchange_mut("types.finish")?
             .streams
             .take_output(&body);
         self.table.delete(body)?;
-        let Some(sender) = sender else {
-            return Err(self.fail(LayerError::InvalidRequest(
-                "finish of a stream this exchange did not hand out".to_owned(),
-            )));
+        let sender = match taken {
+            Some((Some(sender), _)) => sender,
+            Some((None, produced)) => {
+                return Err(self.fail(invalid(produced, "finish of a finished body".to_owned())));
+            }
+            None => {
+                return Err(self.fail(LayerError::InvalidRequest(
+                    "finish of a stream this exchange did not hand out".to_owned(),
+                )));
+            }
         };
         // The end queues behind the frames already written. Waiting for
         // room here would wait on the reader, which may be this very guest
@@ -423,9 +450,19 @@ impl chain::Host for StoreState {
         };
         let (status, headers) = head::response_from_guest(head)
             .map_err(|e| self.fail(head_error(e, Produced::Response)))?;
+        let produced_here = matches!(body, types::Body::Bytes(_) | types::Body::Stream);
         let (body, out) = self
             .body_from_guest(body, Produced::Response)
             .map_err(|e| self.fail(e))?;
+        // A body the guest produces has its end held until the handler
+        // returns, so it cannot promise a length: framed by length, a whole
+        // body would reach the client complete before a trap after it could
+        // cut it. A body passed through keeps the length its origin gave.
+        let body = if produced_here {
+            Body::wrap_native(body, u64::MAX, None)
+        } else {
+            body
+        };
         let mut resp = http::Response::new(body);
         *resp.status_mut() = status;
         *resp.headers_mut() = headers;
@@ -452,7 +489,10 @@ impl endpoints::Host for StoreState {
 
         let (method, uri, headers) = match head::request_from_guest(head, None) {
             Ok(parsed) => parsed,
-            Err(HeadError::InvalidPath(_)) => return Ok(Err(types::Error::RequestUriInvalid)),
+            Err(HeadError::InvalidPath(_)) => {
+                self.discard_body(body);
+                return Ok(Err(types::Error::RequestUriInvalid));
+            }
             Err(e) => return Err(self.fail(head_error(e, Produced::Endpoint))),
         };
         let (body, out) = self

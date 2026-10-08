@@ -2937,6 +2937,7 @@ dependencies = [
 name = "roxy-addon"
 version = "0.2.0"
 dependencies = [
+ "roxy-http",
  "wit-bindgen 0.62.0",
 ]
 

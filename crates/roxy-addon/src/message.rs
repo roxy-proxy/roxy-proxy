@@ -15,7 +15,7 @@ use crate::pump::{RequestPump, Wait};
 /// from the body, which a transform may change in length; `host` from the
 /// authority), which the host refuses. A head from roxy carries none of
 /// them.
-const DROPPED_HEADERS: &[&str] = &[
+pub(crate) const DROPPED_HEADERS: &[&str] = &[
     "connection",
     "content-length",
     "expect",

@@ -26,4 +26,4 @@ pub use host::{
     Principal, TagError,
 };
 pub use runtime::{Layer, SlotWait, WasmRuntime};
-pub use state::MAX_MESSAGE_BYTES;
+pub use state::{MAX_BODY_BYTES, MAX_MESSAGE_BYTES};

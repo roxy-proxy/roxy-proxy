@@ -22,6 +22,9 @@ pub enum Budget {
     /// A `flow.log` message or `flow.record` document is over
     /// [`crate::MAX_MESSAGE_BYTES`].
     Message,
+    /// A whole body the guest handed the host (`body.bytes`) is over
+    /// [`crate::MAX_BODY_BYTES`].
+    Body,
 }
 
 impl Budget {
@@ -33,6 +36,7 @@ impl Budget {
             Budget::Tags => "tags",
             Budget::Fields => "fields",
             Budget::Message => "message",
+            Budget::Body => "body",
         }
     }
 }

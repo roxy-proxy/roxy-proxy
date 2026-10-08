@@ -618,6 +618,30 @@ impl Handler for Layer {
                 respond(200, b"complete");
                 panic!("layer panics after its response");
             }
+            "endpoint-bad-path" => {
+                // A refused path is an error the layer recovers from; the
+                // body it handed the call is spent either way.
+                let r = RequestHead {
+                    method: "GET".to_owned(),
+                    scheme: None,
+                    authority: None,
+                    path_with_query: "/a b".to_owned(),
+                    headers: Vec::new(),
+                };
+                match endpoints::call("monitor", &r, Body::Passthrough(body)) {
+                    Err(types::Error::RequestUriInvalid) => respond(200, b"recovered"),
+                    Err(e) => respond(500, format!("{e:?}").as_bytes()),
+                    Ok(_) => respond(500, b"accepted a bad path"),
+                }
+            }
+            "big-bytes" => {
+                // A whole body past what the host holds for a guest.
+                let n: usize = header(&req, "x-bytes")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2 << 20);
+                drop(body);
+                respond(200, &vec![b'b'; n]);
+            }
             "rewrite" => {
                 // Pass a new request (to another path, with a new body).
                 let mut r = forward_head(&req);
