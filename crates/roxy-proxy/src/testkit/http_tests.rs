@@ -590,6 +590,31 @@ async fn a_forbidden_response_trailer_resets_the_stream() {
     assert_eq!(ev[0]["reason"], "response_write_failed", "{ev:#?}");
 }
 
+/// A request body the codec rejects while the response is already being
+/// written is the client's failure: the body is cut and the exchange is
+/// logged under the parse reason, not as a write failure of roxy's.
+#[tokio::test]
+async fn a_request_body_rejected_mid_response_is_logged_as_the_clients() {
+    let kit = Kit::builder().start().await;
+    let mut io = kit.connect();
+    io.write_all(
+        b"POST http://up.test/early HTTP/1.1\r\nhost: up.test\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n",
+    )
+    .await
+    .unwrap();
+    let (head, _) = read_response(&mut io).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    io.write_all(b"zz\r\n").await.unwrap();
+    let mut rest = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut io, &mut rest)
+        .await
+        .unwrap();
+    let ev = kit.request_event().await;
+    assert_eq!(ev["reason"], "bad_chunk_size", "{ev:#}");
+    let errs = kit.events("response_error", 1).await;
+    assert_eq!(errs[0]["reason"], "bad_chunk_size", "{errs:#?}");
+}
+
 /// On HTTP/1.1 the trailers of a chunked response go out as its trailer
 /// section, under the default flags.
 #[tokio::test]
