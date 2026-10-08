@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use crate::bindings::wasi::http::types::{IncomingBody, IncomingRequest, IncomingResponse};
+use crate::bindings::roxy::addon::types;
 use crate::bindings::wasi::io::poll::{Pollable, poll};
 use crate::bindings::wasi::io::streams::{InputStream, StreamError};
 use crate::pump::{RequestPump, Wait};
@@ -69,41 +69,21 @@ impl<F: FnMut(Vec<u8>) -> Vec<u8>> ChunkTransform for FnTransform<F> {
     }
 }
 
-/// The host resource a streamed body belongs to. Kept alive until the body
-/// is done with: a body must be dropped before the request or response it
-/// came from.
-// Never read: held only so the parent is dropped after the body.
-#[allow(dead_code)]
-pub(crate) enum Parent {
-    Request(IncomingRequest),
-    Response(IncomingResponse),
-}
-
-/// A body streamed from the host. Field order is drop order: the stream,
-/// then the body, then its parent.
+/// A body streamed from the host.
 pub(crate) struct Incoming {
+    /// The host's stream, while open.
     stream: Option<InputStream>,
-    body: Option<IncomingBody>,
-    parent: Option<Parent>,
     /// For a response: the rest of its request's body, written while this
     /// body is read (see [`crate::pump`]).
     pump: Option<Box<RequestPump>>,
 }
 
 impl Incoming {
-    pub(crate) fn new(body: IncomingBody, parent: Parent, pump: Option<RequestPump>) -> Self {
-        let stream = body.stream().ok();
+    pub(crate) fn new(stream: InputStream, pump: Option<RequestPump>) -> Self {
         Self {
-            stream,
-            body: Some(body),
-            parent: Some(parent),
+            stream: Some(stream),
             pump: pump.filter(|p| !p.is_done()).map(Box::new),
         }
-    }
-
-    /// The host stream, while open.
-    pub(crate) fn input(&self) -> Option<&InputStream> {
-        self.stream.as_ref()
     }
 
     /// Takes what the host has ready, without waiting.
@@ -168,8 +148,6 @@ impl Incoming {
             pump.drain();
         }
         self.stream = None;
-        self.body = None;
-        self.parent = None;
     }
 
     fn pollable(&self) -> Option<Pollable> {
@@ -269,19 +247,27 @@ impl Body {
         }
     }
 
-    pub(crate) fn incoming(body: IncomingBody, parent: Parent, pump: Option<RequestPump>) -> Self {
+    pub(crate) fn incoming(stream: InputStream, pump: Option<RequestPump>) -> Self {
         Self {
-            inner: Inner::Incoming(Incoming::new(body, parent, pump)),
+            inner: Inner::Incoming(Incoming::new(stream, pump)),
         }
     }
 
-    /// A host body untouched so far, for moving on host-side; otherwise
-    /// the body back. A stream still pumping a request of its own stays a
-    /// guest body: the pump needs driving as it is read.
-    pub(crate) fn into_passthrough(self) -> Result<Incoming, Body> {
+    /// The body as the host takes it. A host body untouched so far is moved
+    /// host-side (`passthrough`); a small in-memory body goes whole; anything
+    /// else (a transform, a stream still pumping a request of its own, which
+    /// needs driving as it is read) is written chunk by chunk, and comes
+    /// back here as the source for the pump.
+    pub(crate) fn into_wire(self) -> (types::Body, Option<Body>) {
         match self.inner {
-            Inner::Incoming(i) if i.pump.is_none() => Ok(i),
-            inner => Err(Body { inner }),
+            Inner::Empty | Inner::Bytes(None) => (types::Body::Empty, None),
+            Inner::Bytes(Some(b)) if b.is_empty() => (types::Body::Empty, None),
+            Inner::Bytes(Some(b)) => (types::Body::Bytes(b), None),
+            Inner::Incoming(i) if i.pump.is_none() => match i.stream {
+                Some(stream) => (types::Body::Passthrough(stream), None),
+                None => (types::Body::Empty, None),
+            },
+            inner => (types::Body::Stream, Some(Body { inner })),
         }
     }
 

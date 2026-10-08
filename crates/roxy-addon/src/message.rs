@@ -1,71 +1,52 @@
 //! Requests, responses and headers, and the plumbing that moves them to and
 //! from the host.
 
-use std::cell::OnceCell;
 use std::fmt;
 
+use crate::bindings::roxy::addon::types::{self, PendingResponse, RequestHead, ResponseHead};
 use crate::bindings::roxy::addon::{chain, endpoints};
-use crate::bindings::wasi::http::types::{
-    ErrorCode, Fields, FutureIncomingResponse, IncomingRequest, IncomingResponse,
-    Method as WMethod, OutgoingBody, OutgoingRequest, OutgoingResponse, ResponseOutparam, Scheme,
-};
 use crate::bindings::wasi::io::poll::poll;
-use crate::body::{Body, Parent};
+use crate::bindings::wasi::io::streams::{InputStream, OutputStream};
+use crate::body::Body;
 use crate::pump::{RequestPump, Wait};
 
-/// Header names the SDK never forwards from a list the layer built:
-/// hop-by-hop fields the host's WASI HTTP implementation refuses, and
-/// `content-length`, which roxy derives from the body (a transformed body
-/// changes length). A head from roxy carries none of them.
+/// Header names the SDK never forwards from a list the layer built: the
+/// hop-by-hop, framing and routing fields roxy owns (`content-length` comes
+/// from the body, which a transform may change in length; `host` from the
+/// authority), which the host refuses. A head from roxy carries none of
+/// them.
 const DROPPED_HEADERS: &[&str] = &[
     "connection",
+    "content-length",
+    "expect",
+    "host",
     "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
     "proxy-connection",
+    "te",
+    "trailer",
     "transfer-encoding",
     "upgrade",
-    "host",
-    "http2-settings",
-    "te",
-    "content-length",
 ];
 
 /// Ordered header fields. Names are compared case-insensitively and stored
 /// lower-case; repeated fields stay separate.
-///
-/// A head the layer passes on unchanged goes back to the host as the
-/// host's own copy; the list is read into the guest only once something
-/// looks at it.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Headers {
-    /// The host's copy, valid while nothing has changed the list.
-    fields: Option<Fields>,
-    list: OnceCell<Vec<(String, Vec<u8>)>>,
+    list: Vec<(String, Vec<u8>)>,
 }
 
 impl Headers {
     /// No headers.
     pub fn new() -> Self {
-        Self {
-            fields: None,
-            list: OnceCell::from(Vec::new()),
-        }
-    }
-
-    fn list(&self) -> &[(String, Vec<u8>)] {
-        self.list
-            .get_or_init(|| self.fields.as_ref().map_or_else(Vec::new, Fields::entries))
-    }
-
-    /// The list for changing; the host's copy no longer matches it.
-    fn list_mut(&mut self) -> &mut Vec<(String, Vec<u8>)> {
-        self.list();
-        self.fields = None;
-        self.list.get_mut().expect("initialised above")
+        Self::default()
     }
 
     /// The first value of `name`, if any.
     pub fn get(&self, name: &str) -> Option<&[u8]> {
         let name = name.to_ascii_lowercase();
-        self.list()
+        self.list
             .iter()
             .find(|(n, _)| *n == name)
             .map(|(_, v)| v.as_slice())
@@ -79,7 +60,7 @@ impl Headers {
     /// Every value of `name`.
     pub fn get_all(&self, name: &str) -> impl Iterator<Item = &[u8]> {
         let name = name.to_ascii_lowercase();
-        self.list()
+        self.list
             .iter()
             .filter(move |(n, _)| *n == name)
             .map(|(_, v)| v.as_slice())
@@ -93,72 +74,36 @@ impl Headers {
 
     /// Adds a value for `name`.
     pub fn append(&mut self, name: &str, value: impl Into<Vec<u8>>) {
-        self.list_mut()
-            .push((name.to_ascii_lowercase(), value.into()));
+        self.list.push((name.to_ascii_lowercase(), value.into()));
     }
 
     /// Removes every value of `name`.
     pub fn remove(&mut self, name: &str) {
         let name = name.to_ascii_lowercase();
-        self.list_mut().retain(|(n, _)| *n != name);
+        self.list.retain(|(n, _)| *n != name);
     }
 
     /// Iterates `(name, value)` pairs in order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &[u8])> {
-        self.list().iter().map(|(n, v)| (n.as_str(), v.as_slice()))
+        self.list.iter().map(|(n, v)| (n.as_str(), v.as_slice()))
     }
 
-    /// The head of an incoming message. `fields` is a child of the message
-    /// and cannot outlive it, so the host copies it.
-    fn from_fields(fields: &Fields) -> Self {
-        Self {
-            fields: Some(fields.clone()),
-            list: OnceCell::new(),
-        }
+    /// The head of a message from the host, whose names are lower-case.
+    fn from_wire(list: Vec<(String, Vec<u8>)>) -> Self {
+        Self { list }
     }
 
-    /// The head for an outgoing message: the host's copy if the list is as
-    /// the host sent it, else the list, less the fields the host owns.
-    fn into_fields(self) -> Fields {
-        if let Some(fields) = self.fields {
-            return fields;
-        }
-        let entries: Vec<(String, Vec<u8>)> = self
-            .list()
-            .iter()
-            .filter(|(n, _)| !DROPPED_HEADERS.contains(&n.as_str()))
-            .cloned()
-            .collect();
-        Fields::from_list(&entries).expect("header fields rejected by the host")
+    /// The list for a message to the host, less the fields the host owns.
+    fn into_wire(self) -> Vec<(String, Vec<u8>)> {
+        let mut list = self.list;
+        list.retain(|(n, _)| !DROPPED_HEADERS.contains(&n.as_str()));
+        list
     }
 }
-
-impl Default for Headers {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Clone for Headers {
-    fn clone(&self) -> Self {
-        Self {
-            fields: None,
-            list: OnceCell::from(self.list().to_vec()),
-        }
-    }
-}
-
-impl PartialEq for Headers {
-    fn eq(&self, other: &Self) -> bool {
-        self.list() == other.list()
-    }
-}
-
-impl Eq for Headers {}
 
 impl fmt::Debug for Headers {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.list()).finish()
+        f.debug_list().entries(&self.list).finish()
     }
 }
 
@@ -222,42 +167,29 @@ impl Request {
         self
     }
 
-    pub(crate) fn from_incoming(req: IncomingRequest) -> Self {
-        let method = method_name(&req.method());
-        let scheme = req.scheme().map(|s| scheme_name(&s));
-        let authority = req.authority();
-        let path_with_query = req.path_with_query().unwrap_or_else(|| "/".to_owned());
-        let headers = Headers::from_fields(&req.headers());
-        let body = match req.consume() {
-            Ok(body) => Body::incoming(body, Parent::Request(req), None),
-            Err(()) => Body::empty(),
-        };
+    pub(crate) fn from_wire(head: RequestHead, body: InputStream) -> Self {
         Self {
-            method,
-            scheme,
-            authority,
-            path_with_query,
-            headers,
-            body,
+            method: head.method,
+            scheme: head.scheme,
+            authority: head.authority,
+            path_with_query: head.path_with_query,
+            headers: Headers::from_wire(head.headers),
+            body: Body::incoming(body, None),
         }
     }
 
-    /// Builds the outgoing head, returning it with the body still to write.
-    fn into_outgoing(self) -> (OutgoingRequest, Body) {
-        let out = OutgoingRequest::new(self.headers.into_fields());
-        out.set_method(&method_value(&self.method))
-            .expect("method rejected by the host");
-        if let Some(s) = &self.scheme {
-            out.set_scheme(Some(&scheme_value(s)))
-                .expect("scheme rejected by the host");
-        }
-        if let Some(a) = &self.authority {
-            out.set_authority(Some(a))
-                .expect("authority rejected by the host");
-        }
-        out.set_path_with_query(Some(&self.path_with_query))
-            .expect("path rejected by the host");
-        (out, self.body)
+    /// The head and body as the host takes them, and the body left to pump
+    /// if the host did not take it whole.
+    fn into_wire(self) -> (RequestHead, types::Body, Option<Body>) {
+        let head = RequestHead {
+            method: self.method,
+            scheme: self.scheme,
+            authority: self.authority,
+            path_with_query: self.path_with_query,
+            headers: self.headers.into_wire(),
+        };
+        let (body, rest) = self.body.into_wire();
+        (head, body, rest)
     }
 }
 
@@ -317,31 +249,64 @@ impl Response {
         self
     }
 
-    fn from_incoming(resp: IncomingResponse, pump: RequestPump) -> Self {
-        let status = resp.status();
-        let headers = Headers::from_fields(&resp.headers());
-        let body = if let Ok(body) = resp.consume() {
-            Body::incoming(body, Parent::Response(resp), Some(pump))
-        } else {
-            let mut pump = pump;
-            pump.drain();
-            Body::empty()
-        };
+    /// A response from the host, with the pump for the rest of its
+    /// request's body.
+    fn from_wire((head, body): (ResponseHead, InputStream), pump: RequestPump) -> Self {
         Self {
-            status,
-            headers,
-            body,
+            status: head.status,
+            headers: Headers::from_wire(head.headers),
+            body: Body::incoming(body, Some(pump)),
+        }
+    }
+
+    fn into_wire(self) -> (ResponseHead, types::Body, Option<Body>) {
+        let head = ResponseHead {
+            status: self.status,
+            headers: self.headers.into_wire(),
+        };
+        let (body, rest) = self.body.into_wire();
+        (head, body, rest)
+    }
+}
+
+/// Why a call through [`Next`] or [`call_endpoint`] failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Error {
+    /// No endpoint of that name is configured for this layer.
+    DestinationNotFound,
+    /// The endpoint's address is denied by roxy's address floor or deny
+    /// lists.
+    DestinationDenied,
+    /// The request's path cannot go under the endpoint's URL.
+    RequestUriInvalid,
+    /// The endpoint did not answer within its timeout.
+    Timeout,
+    /// Anything else, with a message when the host has one.
+    Internal(Option<String>),
+}
+
+impl From<types::Error> for Error {
+    fn from(e: types::Error) -> Self {
+        match e {
+            types::Error::DestinationNotFound => Error::DestinationNotFound,
+            types::Error::DestinationDenied => Error::DestinationDenied,
+            types::Error::RequestUriInvalid => Error::RequestUriInvalid,
+            types::Error::Timeout => Error::Timeout,
+            types::Error::Internal(msg) => Error::Internal(msg),
         }
     }
 }
 
-/// Why a call through [`Next`] or [`crate::endpoints`] failed.
-#[derive(Debug, Clone)]
-pub struct Error(pub ErrorCode);
-
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self.0)
+        match self {
+            Error::DestinationNotFound => f.write_str("destination not found"),
+            Error::DestinationDenied => f.write_str("destination denied"),
+            Error::RequestUriInvalid => f.write_str("request URI invalid"),
+            Error::Timeout => f.write_str("timed out"),
+            Error::Internal(Some(msg)) => write!(f, "internal error: {msg}"),
+            Error::Internal(None) => f.write_str("internal error"),
+        }
     }
 }
 
@@ -375,31 +340,35 @@ impl Next {
     }
 }
 
+/// The result of `chain.next` or `endpoints.call`: the response to come,
+/// and the stream to write the body to when the host did not take it whole.
+type Call = Result<(PendingResponse, Option<OutputStream>), types::Error>;
+
 /// Sends a request through `call` (`chain::next` or an endpoint) and
 /// returns the response once its head arrives. The request body is written
 /// while waiting, and the rest of it while the response body is read.
 pub(crate) fn send(
     req: Request,
-    call: impl FnOnce(OutgoingRequest) -> Result<FutureIncomingResponse, ErrorCode>,
+    call: impl FnOnce(&RequestHead, types::Body) -> Call,
 ) -> Result<Response, Error> {
-    let (out, body) = req.into_outgoing();
-    let out_body = out.body().expect("request body already taken");
-    let future = call(out).map_err(Error)?;
-    let mut pump = RequestPump::new(out_body, body);
-    let resp = loop {
-        if let Some(result) = future.get() {
-            break result.expect("response taken once").map_err(Error)?;
-        }
+    let (head, body, rest) = req.into_wire();
+    let (pending, out) = call(&head, body)?;
+    let mut pump = RequestPump::new(out, rest.unwrap_or_default());
+    let answer = loop {
         match pump.step() {
-            Wait::Done => future.subscribe().block(),
+            // Nothing left to write: one call takes the response.
+            Wait::Done => break PendingResponse::wait(pending)?,
             Wait::On(writable) => {
-                let head = future.subscribe();
-                poll(&[&head, &writable]);
+                let ready = pending.subscribe();
+                poll(&[&ready, &writable]);
+                drop(ready);
+                if let Some(result) = pending.get() {
+                    break result?;
+                }
             }
         }
     };
-    drop(future);
-    Ok(Response::from_incoming(resp, pump))
+    Ok(Response::from_wire(answer, pump))
 }
 
 /// Calls the endpoint configured under `name` (capability `endpoints`).
@@ -407,70 +376,15 @@ pub(crate) fn send(
 /// the endpoint is configured `path: prefix`: roxy picks the destination
 /// and attaches the credentials.
 pub fn call_endpoint(name: &str, req: Request) -> Result<Response, Error> {
-    send(req, |out| endpoints::call(name, out))
+    send(req, |head, body| endpoints::call(name, head, body))
 }
 
-/// Writes `body` to `out` and finishes it (the response to the client).
-fn write_body(out: OutgoingBody, body: Body) {
-    let mut pump = RequestPump::new(out, body);
-    pump.drain();
-}
-
-/// Sends `resp` to the client through `out`.
-pub(crate) fn respond(out: ResponseOutparam, resp: Response) {
-    let outgoing = OutgoingResponse::new(resp.headers.into_fields());
-    outgoing
-        .set_status_code(resp.status)
-        .expect("status rejected by the host");
-    let body = outgoing.body().expect("response body already taken");
-    ResponseOutparam::set(out, Ok(outgoing));
-    write_body(body, resp.body);
-}
-
-fn method_name(m: &WMethod) -> String {
-    match m {
-        WMethod::Get => "GET",
-        WMethod::Head => "HEAD",
-        WMethod::Post => "POST",
-        WMethod::Put => "PUT",
-        WMethod::Delete => "DELETE",
-        WMethod::Connect => "CONNECT",
-        WMethod::Options => "OPTIONS",
-        WMethod::Trace => "TRACE",
-        WMethod::Patch => "PATCH",
-        WMethod::Other(o) => o,
-    }
-    .to_owned()
-}
-
-fn method_value(m: &str) -> WMethod {
-    match m {
-        "GET" => WMethod::Get,
-        "HEAD" => WMethod::Head,
-        "POST" => WMethod::Post,
-        "PUT" => WMethod::Put,
-        "DELETE" => WMethod::Delete,
-        "CONNECT" => WMethod::Connect,
-        "OPTIONS" => WMethod::Options,
-        "TRACE" => WMethod::Trace,
-        "PATCH" => WMethod::Patch,
-        other => WMethod::Other(other.to_owned()),
-    }
-}
-
-fn scheme_name(s: &Scheme) -> String {
-    match s {
-        Scheme::Http => "http".to_owned(),
-        Scheme::Https => "https".to_owned(),
-        Scheme::Other(o) => o.clone(),
-    }
-}
-
-fn scheme_value(s: &str) -> Scheme {
-    match s {
-        "http" => Scheme::Http,
-        "https" => Scheme::Https,
-        other => Scheme::Other(other.to_owned()),
+/// Answers the client with `resp`, writing its body to the end.
+pub(crate) fn respond(response: Response) {
+    let (head, body, rest) = response.into_wire();
+    let out = chain::respond(&head, body);
+    if let Some(rest) = rest {
+        RequestPump::new(out, rest).drain();
     }
 }
 
@@ -494,16 +408,18 @@ mod tests {
     }
 
     #[test]
+    fn fields_the_host_owns_are_not_sent() {
+        let mut h = Headers::new();
+        h.set("Content-Length", "5");
+        h.set("Host", "x");
+        h.set("x-keep", "1");
+        assert_eq!(h.into_wire(), vec![("x-keep".to_owned(), b"1".to_vec())]);
+    }
+
+    #[test]
     fn request_path() {
         let r = Request::new("GET", "/v1/messages?beta=true");
         assert_eq!(r.path(), "/v1/messages");
         assert_eq!(Request::new("GET", "/x").path(), "/x");
-    }
-
-    #[test]
-    fn methods_round_trip() {
-        for m in ["GET", "POST", "PATCH", "PURGE"] {
-            assert_eq!(method_name(&method_value(m)), m);
-        }
     }
 }

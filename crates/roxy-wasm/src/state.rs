@@ -1,38 +1,28 @@
-//! The data in each instance's `Store`: WASI contexts, the memory limiter,
-//! and the implementations of the `roxy:addon` imports.
+//! The data in each instance's `Store`: the WASI context, the memory
+//! limiter, and the implementations of the `roxy:addon` imports.
 
 use std::sync::Arc;
 
-use http::uri::{PathAndQuery, Scheme};
-use http::{HeaderMap, Uri};
-use http_body_util::BodyExt;
+use http::uri::{Authority, Scheme};
+use roxy_http::Body;
+use tokio::sync::oneshot;
 use wasmtime::component::{Resource, ResourceTable};
+use wasmtime_wasi::p2::{DynInputStream, DynOutputStream, DynPollable};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
-use wasmtime_wasi_http::p2::bindings::http::types::{
-    ErrorCode, Method as WasiMethod, Scheme as WasiScheme,
-};
-use wasmtime_wasi_http::p2::body::HyperIncomingBody;
-use wasmtime_wasi_http::p2::types::{HostFutureIncomingResponse, HostOutgoingRequest};
-use wasmtime_wasi_http::{
-    Error as WasiError, WasiBody, WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks, WasiHttpView,
-};
 
-use crate::bindings::roxy::addon::{chain, endpoints, flow};
+use crate::bindings::roxy::addon::{chain, endpoints, flow, types};
 use crate::config::{Capability, LayerConfig};
 use crate::error::{Budget, LayerError};
-use crate::exchange::{Dir, ExchangeShared, FromGuest, IntoGuest};
+use crate::exchange::{ExchangeShared, FromGuest};
+use crate::head::{self, HeadError};
 use crate::host::{EndpointError, LayerHost, LogLevel, TagError};
+use crate::streams::{Answer, PendingResponse, Produced, Streams};
 
-/// Most resources (requests, bodies, streams, fields) a guest may hold at
-/// once. Each costs host memory outside the guest's `max_memory`.
+/// Most resources (streams, pollables, pending responses) a guest may hold
+/// at once. Each costs host memory outside the guest's `max_memory`.
 const MAX_RESOURCES: usize = 4096;
 /// Most elements a guest table may grow to.
 const MAX_TABLE_ELEMENTS: usize = 100_000;
-/// Most bytes of names and values (with wasi-http's per-entry accounting)
-/// in one `fields` a guest builds. With [`MAX_RESOURCES`] this bounds what
-/// the host holds in headers for an instance. Twice the default
-/// `max_header_bytes`, so a head roxy accepts can be copied and added to.
-pub const MAX_FIELDS_BYTES: usize = 128 * 1024;
 /// Longest `flow.log` message, and longest `flow.record` document (kind and
 /// JSON together), in bytes.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
@@ -49,9 +39,13 @@ pub(crate) struct ExchangeCtx {
     pub(crate) shared: Arc<ExchangeShared>,
     pub(crate) next_called: bool,
     /// The exchange's scheme and authority, the defaults for a request the
-    /// guest builds without them.
+    /// guest passes to `next` without them.
     pub(crate) scheme: Scheme,
-    pub(crate) authority: String,
+    pub(crate) authority: Authority,
+    /// Takes the guest's answer (`respond`); `None` once it has answered.
+    pub(crate) answer: Option<oneshot::Sender<http::Response<Body>>>,
+    /// The streams handed to the guest so far.
+    pub(crate) streams: Streams,
 }
 
 /// Linear-memory accounting for one instance (`max_memory`).
@@ -95,36 +89,9 @@ impl wasmtime::ResourceLimiter for Limiter {
     }
 }
 
-/// `wasi:http/outgoing-handler` is never linked into a layer, so this is
-/// never called; it exists because the hooks trait requires it.
-struct NoOutgoing;
-
-impl WasiHttpHooks for NoOutgoing {
-    fn send_request(
-        &mut self,
-        _request: http::Request<WasiBody>,
-        _options: Option<wasmtime_wasi_http::RequestOptions>,
-        _fut: Box<dyn Future<Output = Result<(), WasiError>> + Send>,
-    ) -> Box<
-        dyn Future<
-                Output = Result<
-                    (
-                        http::Response<WasiBody>,
-                        Box<dyn Future<Output = Result<(), WasiError>> + Send>,
-                    ),
-                    WasiError,
-                >,
-            > + Send,
-    > {
-        Box::new(async { Err(WasiError::HttpRequestDenied) })
-    }
-}
-
 pub(crate) struct StoreState {
     wasi: WasiCtx,
-    http: WasiHttpCtx,
     pub(crate) table: ResourceTable,
-    hooks: NoOutgoing,
     pub(crate) layer: Arc<LayerShared>,
     pub(crate) limiter: Limiter,
     pub(crate) exchange: Option<ExchangeCtx>,
@@ -142,14 +109,10 @@ impl StoreState {
             .build();
         let mut table = ResourceTable::new();
         table.set_max_capacity(MAX_RESOURCES);
-        let mut http = WasiHttpCtx::new();
-        http.set_field_size_limit(MAX_FIELDS_BYTES);
         let max_memory = layer.config.limits.max_memory;
         Self {
             wasi,
-            http,
             table,
-            hooks: NoOutgoing,
             layer,
             limiter: Limiter {
                 max_memory,
@@ -173,6 +136,12 @@ impl StoreState {
     fn exchange(&self, import: &'static str) -> wasmtime::Result<&ExchangeCtx> {
         self.exchange
             .as_ref()
+            .ok_or_else(|| wasmtime::Error::new(LayerError::OutsideExchange(import)))
+    }
+
+    fn exchange_mut(&mut self, import: &'static str) -> wasmtime::Result<&mut ExchangeCtx> {
+        self.exchange
+            .as_mut()
             .ok_or_else(|| wasmtime::Error::new(LayerError::OutsideExchange(import)))
     }
 
@@ -203,6 +172,85 @@ impl StoreState {
         }
         Ok(())
     }
+
+    /// The body the guest handed over, as the proxy's; for `stream`, also
+    /// the `output-stream` the guest writes it through.
+    fn body_from_guest(
+        &mut self,
+        body: types::Body,
+        produced: Produced,
+    ) -> Result<(Body, Option<Resource<DynOutputStream>>), LayerError> {
+        let Self {
+            table, exchange, ..
+        } = self;
+        let ex = exchange.as_mut().expect("in an exchange");
+        match body {
+            types::Body::Empty => Ok((Body::empty(), None)),
+            types::Body::Bytes(b) => Ok((Body::from_bytes(b), None)),
+            types::Body::Passthrough(stream) => {
+                let moved = ex.streams.take_input(&stream);
+                // The guest's handle is spent either way.
+                table
+                    .delete(stream)
+                    .map_err(|e| invalid(produced, e.to_string()))?;
+                moved.map(|b| (b, None)).ok_or_else(|| {
+                    invalid(
+                        produced,
+                        "passthrough of a stream this exchange did not hand out".to_owned(),
+                    )
+                })
+            }
+            types::Body::Stream => {
+                let (out, body) = ex
+                    .streams
+                    .output(table, produced, ex.shared.clone())
+                    .map_err(|e| invalid(produced, e.to_string()))?;
+                Ok((body, Some(out)))
+            }
+        }
+    }
+
+    /// A resolved `next` or endpoint call, as the guest takes it: the head
+    /// and a stream for the body.
+    fn answer_into_guest(
+        &mut self,
+        answer: Answer,
+    ) -> wasmtime::Result<Result<(types::ResponseHead, Resource<DynInputStream>), types::Error>>
+    {
+        let resp = match answer {
+            Ok(resp) => resp,
+            Err(e) => return Ok(Err(e)),
+        };
+        let (parts, body) = resp.into_parts();
+        let head = head::response_into_guest(&parts);
+        let Self {
+            table, exchange, ..
+        } = self;
+        let ex = exchange
+            .as_mut()
+            .ok_or_else(|| wasmtime::Error::new(LayerError::OutsideExchange("pending-response")))?;
+        let stream = ex.streams.input(table, body)?;
+        Ok(Ok((head, stream)))
+    }
+}
+
+/// An unusable guest head or body, named for the message it was part of.
+fn invalid(produced: Produced, msg: String) -> LayerError {
+    match produced {
+        Produced::Response => LayerError::InvalidResponse(msg),
+        Produced::Next | Produced::Endpoint => LayerError::InvalidRequest(msg),
+    }
+}
+
+fn head_error(err: HeadError, produced: Produced) -> LayerError {
+    match err {
+        HeadError::TooLarge => LayerError::BudgetExceeded(Budget::Fields),
+        HeadError::Invalid(msg) | HeadError::InvalidPath(msg) => invalid(produced, msg),
+    }
+}
+
+fn internal(msg: &str) -> types::Error {
+    types::Error::Internal(Some(msg.to_owned()))
 }
 
 impl WasiView for StoreState {
@@ -210,63 +258,6 @@ impl WasiView for StoreState {
         WasiCtxView {
             ctx: &mut self.wasi,
             table: &mut self.table,
-        }
-    }
-}
-
-impl WasiHttpView for StoreState {
-    fn http(&mut self) -> WasiHttpCtxView<'_> {
-        WasiHttpCtxView {
-            ctx: &mut self.http,
-            table: &mut self.table,
-            hooks: &mut self.hooks,
-        }
-    }
-}
-
-fn method(m: WasiMethod) -> Result<http::Method, String> {
-    m.try_into().map_err(|e| format!("invalid method: {e}"))
-}
-
-fn scheme(s: WasiScheme) -> Result<Scheme, String> {
-    match s {
-        WasiScheme::Http => Ok(Scheme::HTTP),
-        WasiScheme::Https => Ok(Scheme::HTTPS),
-        WasiScheme::Other(o) => Err(format!("unsupported scheme {o:?}")),
-    }
-}
-
-/// Takes the head and body of a guest-built request.
-fn take_request(
-    req: HostOutgoingRequest,
-) -> Result<(http::request::Builder, Option<WasiBody>, RequestTarget), String> {
-    let method = method(req.method)?;
-    let target = RequestTarget {
-        scheme: req.scheme.map(scheme).transpose()?,
-        authority: req.authority,
-        path_with_query: req.path_with_query,
-    };
-    let headers: HeaderMap = req.headers.into();
-    let mut builder = http::Request::builder().method(method);
-    if let Some(h) = builder.headers_mut() {
-        *h = headers;
-    }
-    Ok((builder, req.body, target))
-}
-
-struct RequestTarget {
-    scheme: Option<Scheme>,
-    authority: Option<String>,
-    path_with_query: Option<String>,
-}
-
-impl RequestTarget {
-    fn path(&self) -> Result<PathAndQuery, String> {
-        match self.path_with_query.as_deref() {
-            None | Some("") => Ok(PathAndQuery::from_static("/")),
-            Some(p) => p
-                .parse::<PathAndQuery>()
-                .map_err(|e| format!("invalid path {p:?}: {e}")),
         }
     }
 }
@@ -288,14 +279,74 @@ impl Drop for Below {
     }
 }
 
-fn response_into_guest(
-    resp: http::Response<roxy_http::Body>,
-) -> (
-    http::Response<HyperIncomingBody>,
-    wasmtime_wasi::runtime::AbortOnDropJoinHandle<()>,
-) {
-    let resp = resp.map(|b| IntoGuest::new(b, Dir::Response).boxed_unsync());
-    (resp, wasmtime_wasi::runtime::spawn(async {}))
+type Call = Result<(Resource<PendingResponse>, Option<Resource<DynOutputStream>>), types::Error>;
+
+// Every import is bound `async` (one bindgen default); some need no await.
+#[allow(clippy::unused_async_trait_impl)]
+impl types::Host for StoreState {
+    async fn finish(&mut self, body: Resource<DynOutputStream>) -> wasmtime::Result<()> {
+        let sender = self
+            .exchange_mut("types.finish")?
+            .streams
+            .take_output(&body);
+        self.table.delete(body)?;
+        let Some(sender) = sender else {
+            return Err(self.fail(LayerError::InvalidRequest(
+                "finish of a stream this exchange did not hand out".to_owned(),
+            )));
+        };
+        // The end queues behind the frames already written. Waiting for
+        // room here would wait on the reader, which may be this very guest
+        // (reading the response), and deadlock; finishing a body nobody
+        // reads any more is harmless.
+        tokio::spawn(async move {
+            let _ = sender.finish().await;
+        });
+        Ok(())
+    }
+}
+
+// Every import is bound `async` (one bindgen default); some need no await.
+#[allow(clippy::unused_async_trait_impl)]
+impl types::HostPendingResponse for StoreState {
+    async fn subscribe(
+        &mut self,
+        this: Resource<PendingResponse>,
+    ) -> wasmtime::Result<Resource<DynPollable>> {
+        wasmtime_wasi::p2::subscribe(&mut self.table, this)
+    }
+
+    async fn get(
+        &mut self,
+        this: Resource<PendingResponse>,
+    ) -> wasmtime::Result<
+        Option<Result<(types::ResponseHead, Resource<DynInputStream>), types::Error>>,
+    > {
+        let answer = match self.table.get_mut(&this)?.poll_take() {
+            Ok(None) => return Ok(None),
+            Ok(Some(answer)) => answer,
+            Err(()) => return Err(wasmtime::format_err!("pending-response already taken")),
+        };
+        self.answer_into_guest(answer).map(Some)
+    }
+
+    async fn wait(
+        &mut self,
+        this: Resource<PendingResponse>,
+    ) -> wasmtime::Result<Result<(types::ResponseHead, Resource<DynInputStream>), types::Error>>
+    {
+        let pending = self.table.delete(this)?;
+        let answer = pending
+            .wait()
+            .await
+            .map_err(|()| wasmtime::format_err!("pending-response already taken"))?;
+        self.answer_into_guest(answer)
+    }
+
+    async fn drop(&mut self, this: Resource<PendingResponse>) -> wasmtime::Result<()> {
+        self.table.delete(this)?;
+        Ok(())
+    }
 }
 
 // Every import is bound `async` (one bindgen default); some need no await.
@@ -303,65 +354,70 @@ fn response_into_guest(
 impl chain::Host for StoreState {
     async fn next(
         &mut self,
-        req: Resource<HostOutgoingRequest>,
-    ) -> wasmtime::Result<Result<Resource<HostFutureIncomingResponse>, ErrorCode>> {
-        let ex = self
-            .exchange
-            .as_mut()
-            .ok_or_else(|| wasmtime::Error::new(LayerError::OutsideExchange("chain.next")))?;
-        if ex.next_called {
-            return Err(wasmtime::Error::new(LayerError::NextCalledTwice));
-        }
-        ex.next_called = true;
-        let host = ex.host.clone();
-        let shared = ex.shared.clone();
-        let default_scheme = ex.scheme.clone();
-        let default_authority = ex.authority.clone();
-
-        let req = self.table.delete(req)?;
-        let built = take_request(req).and_then(|(builder, body, target)| {
-            let uri = Uri::builder()
-                .scheme(target.scheme.clone().unwrap_or(default_scheme))
-                .authority(target.authority.clone().unwrap_or(default_authority))
-                .path_and_query(target.path()?)
-                .build()
-                .map_err(|e| format!("invalid URI: {e}"))?;
-            let body = match body {
-                Some(b) => FromGuest::next_request(b, shared.clone()),
-                None => roxy_http::Body::empty(),
-            };
-            builder
-                .uri(uri)
-                .body(body)
-                .map_err(|e| format!("invalid request: {e}"))
-        });
-        let request = match built {
-            Ok(r) => r,
-            Err(msg) => {
-                let err = LayerError::InvalidRequest(msg);
-                shared.fail(err.clone());
-                return Err(wasmtime::Error::new(err));
+        head: types::RequestHead,
+        body: types::Body,
+    ) -> wasmtime::Result<Call> {
+        let (host, shared, parsed) = {
+            let ex = self.exchange_mut("chain.next")?;
+            if ex.next_called {
+                return Err(wasmtime::Error::new(LayerError::NextCalledTwice));
             }
+            ex.next_called = true;
+            let parsed = head::request_from_guest(head, Some((&ex.scheme, &ex.authority)));
+            (ex.host.clone(), ex.shared.clone(), parsed)
         };
+        let (method, uri, headers) =
+            parsed.map_err(|e| self.fail(head_error(e, Produced::Next)))?;
+        let (body, out) = self
+            .body_from_guest(body, Produced::Next)
+            .map_err(|e| self.fail(e))?;
+        let mut request = http::Request::new(FromGuest::next_request(body, shared.clone()));
+        *request.method_mut() = method;
+        *request.uri_mut() = uri;
+        *request.headers_mut() = headers;
 
         let fut = wasmtime_wasi::runtime::spawn(async move {
             let below = Below::enter(shared.clone());
             let resp = host.next(request).await;
             drop(below);
             if shared.check_next().is_err() {
-                return Err(WasiError::InternalError(Some("next failed".to_owned())));
+                return Err(internal("next failed"));
             }
             match resp {
-                Ok(resp) => Ok(response_into_guest(resp)),
+                Ok(resp) => Ok(resp),
                 Err(e) => {
                     shared.fail(LayerError::Host(e));
-                    Err(WasiError::InternalError(Some("next failed".to_owned())))
+                    Err(internal("next failed"))
                 }
             }
         });
-        Ok(Ok(self
-            .table
-            .push(HostFutureIncomingResponse::Pending(fut))?))
+        let pending = self.table.push(PendingResponse::new(fut))?;
+        Ok(Ok((pending, out)))
+    }
+
+    async fn respond(
+        &mut self,
+        head: types::ResponseHead,
+        body: types::Body,
+    ) -> wasmtime::Result<Option<Resource<DynOutputStream>>> {
+        let answer = self.exchange_mut("chain.respond")?.answer.take();
+        let Some(answer) = answer else {
+            return Err(self.fail(LayerError::InvalidResponse(
+                "respond called twice".to_owned(),
+            )));
+        };
+        let (status, headers) = head::response_from_guest(head)
+            .map_err(|e| self.fail(head_error(e, Produced::Response)))?;
+        let (body, out) = self
+            .body_from_guest(body, Produced::Response)
+            .map_err(|e| self.fail(e))?;
+        let mut resp = http::Response::new(body);
+        *resp.status_mut() = status;
+        *resp.headers_mut() = headers;
+        // The receiver is gone only once the exchange has failed or been
+        // cancelled, and then the answer no longer matters.
+        let _ = answer.send(resp);
+        Ok(out)
     }
 }
 
@@ -371,41 +427,39 @@ impl endpoints::Host for StoreState {
     async fn call(
         &mut self,
         name: String,
-        req: Resource<HostOutgoingRequest>,
-    ) -> wasmtime::Result<Result<Resource<HostFutureIncomingResponse>, ErrorCode>> {
+        head: types::RequestHead,
+        body: types::Body,
+    ) -> wasmtime::Result<Call> {
         self.require(Capability::Endpoints, "endpoints.call")?;
         let ex = self.exchange("endpoints.call")?;
         let host = ex.host.clone();
         let shared = ex.shared.clone();
 
-        let req = self.table.delete(req)?;
-        let built = take_request(req).and_then(|(builder, body, target)| {
-            let body = match body {
-                Some(b) => FromGuest::endpoint_request(b, shared.clone()),
-                None => roxy_http::Body::empty(),
-            };
-            builder
-                .uri(Uri::from(target.path()?))
-                .body(body)
-                .map_err(|e| format!("invalid request: {e}"))
-        });
-        let Ok(request) = built else {
-            return Ok(Err(ErrorCode::HttpRequestUriInvalid));
+        let (method, uri, headers) = match head::request_from_guest(head, None) {
+            Ok(parsed) => parsed,
+            Err(HeadError::InvalidPath(_)) => return Ok(Err(types::Error::RequestUriInvalid)),
+            Err(e) => return Err(self.fail(head_error(e, Produced::Endpoint))),
         };
+        let (body, out) = self
+            .body_from_guest(body, Produced::Endpoint)
+            .map_err(|e| self.fail(e))?;
+        let mut request = http::Request::new(FromGuest::endpoint_request(body, shared));
+        *request.method_mut() = method;
+        *request.uri_mut() = uri;
+        *request.headers_mut() = headers;
 
         let fut = wasmtime_wasi::runtime::spawn(async move {
             match host.endpoint_call(&name, request).await {
-                Ok(resp) => Ok(response_into_guest(resp)),
-                Err(EndpointError::NotFound) => Err(WasiError::DestinationNotFound),
-                Err(EndpointError::Denied) => Err(WasiError::DestinationIpProhibited),
-                Err(EndpointError::PathRefused(_)) => Err(WasiError::HttpRequestUriInvalid),
-                Err(EndpointError::Timeout) => Err(WasiError::ConnectionTimeout),
-                Err(e) => Err(WasiError::InternalError(Some(e.to_string()))),
+                Ok(resp) => Ok(resp),
+                Err(EndpointError::NotFound) => Err(types::Error::DestinationNotFound),
+                Err(EndpointError::Denied) => Err(types::Error::DestinationDenied),
+                Err(EndpointError::PathRefused(_)) => Err(types::Error::RequestUriInvalid),
+                Err(EndpointError::Timeout) => Err(types::Error::Timeout),
+                Err(e @ EndpointError::Failed(_)) => Err(internal(&e.to_string())),
             }
         });
-        Ok(Ok(self
-            .table
-            .push(HostFutureIncomingResponse::Pending(fut))?))
+        let pending = self.table.push(PendingResponse::new(fut))?;
+        Ok(Ok((pending, out)))
     }
 }
 

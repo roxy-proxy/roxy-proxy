@@ -74,9 +74,10 @@ thread_local! {
 /// Used by [`export!`]; not part of the API.
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::bindings::exports::roxy::addon::handler::Guest as HandlerGuest;
     pub use crate::bindings::exports::roxy::addon::init::Guest as InitGuest;
-    pub use crate::bindings::exports::wasi::http::incoming_handler::Guest as HandlerGuest;
-    pub use crate::bindings::wasi::http::types::{IncomingRequest, ResponseOutparam};
+    pub use crate::bindings::roxy::addon::types::RequestHead;
+    pub use crate::bindings::wasi::io::streams::InputStream;
 
     use super::{LAYER, Layer, Next, Request, message};
 
@@ -86,8 +87,8 @@ pub mod __private {
         Ok(())
     }
 
-    pub fn handle<L: Layer>(req: IncomingRequest, out: ResponseOutparam) {
-        let req = Request::from_incoming(req);
+    pub fn handle<L: Layer>(head: RequestHead, body: InputStream) {
+        let req = Request::from_wire(head, body);
         let resp = LAYER.with(|l| {
             let mut slot = l.borrow_mut();
             let layer = slot
@@ -96,7 +97,7 @@ pub mod __private {
                 .expect("layer not initialised");
             layer.handle(req, Next::new())
         });
-        message::respond(out, resp);
+        message::respond(resp);
     }
 }
 
@@ -115,10 +116,10 @@ macro_rules! export {
 
         impl $crate::__private::HandlerGuest for __RoxyAddonExport {
             fn handle(
-                req: $crate::__private::IncomingRequest,
-                out: $crate::__private::ResponseOutparam,
+                req: $crate::__private::RequestHead,
+                body: $crate::__private::InputStream,
             ) {
-                $crate::__private::handle::<$layer>(req, out)
+                $crate::__private::handle::<$layer>(req, body)
             }
         }
 

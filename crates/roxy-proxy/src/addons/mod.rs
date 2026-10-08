@@ -631,7 +631,6 @@ fn error_kind(e: &StackError) -> String {
         LayerError::OutsideExchange(_) => "outside_exchange".into(),
         LayerError::InvalidRequest(_) => "invalid_request".into(),
         LayerError::NoResponse => "no_response".into(),
-        LayerError::ErrorResponse(_) => "error_response".into(),
         LayerError::InvalidResponse(_) => "invalid_response".into(),
         LayerError::Host(_) => "host".into(),
         LayerError::Init(_) => "init".into(),
