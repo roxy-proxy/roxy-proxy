@@ -1,7 +1,7 @@
 //! The engine, loaded layers, their instance pools and the exchange
 //! driver.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
@@ -86,10 +86,13 @@ impl WasmRuntime {
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| e.to_string())?;
         // Every roxy:addon import is linked whatever the grants; a call
         // without its capability traps.
-        types::add_to_linker::<_, Me>(&mut linker, |s| s).map_err(|e| e.to_string())?;
-        chain::add_to_linker::<_, Me>(&mut linker, |s| s).map_err(|e| e.to_string())?;
-        endpoints::add_to_linker::<_, Me>(&mut linker, |s| s).map_err(|e| e.to_string())?;
-        flow::add_to_linker::<_, Me>(&mut linker, |s| s).map_err(|e| e.to_string())?;
+        types::add_to_linker::<_, Me>(&mut linker, StoreState::called)
+            .map_err(|e| e.to_string())?;
+        chain::add_to_linker::<_, Me>(&mut linker, StoreState::called)
+            .map_err(|e| e.to_string())?;
+        endpoints::add_to_linker::<_, Me>(&mut linker, StoreState::called)
+            .map_err(|e| e.to_string())?;
+        flow::add_to_linker::<_, Me>(&mut linker, StoreState::called).map_err(|e| e.to_string())?;
         Ok(linker)
     }
 }
@@ -109,6 +112,9 @@ struct LayerInner {
     init: init::GuestIndices,
     idle: Mutex<Vec<Instance>>,
     slots: Arc<Semaphore>,
+    /// Calls from the guest into the host (every import, resource drops
+    /// included), across every instance: what the interface shape costs.
+    host_calls: Arc<AtomicU64>,
 }
 
 impl LayerInner {
@@ -221,6 +227,7 @@ impl Layer {
             init,
             idle: Mutex::new(Vec::new()),
             slots: Arc::new(Semaphore::new(max_instances)),
+            host_calls: Arc::new(AtomicU64::new(0)),
         });
         let layer = Layer { inner };
         let deadline = Instant::now() + layer.inner.shared.config.limits.first_byte_timeout;
@@ -250,9 +257,18 @@ impl Layer {
         self.inner.idle().len()
     }
 
+    /// Calls the layer's guests have made into the host so far: every
+    /// import, resource drops included. The cost of the interface shape.
+    pub fn host_calls(&self) -> u64 {
+        self.inner.host_calls.load(Ordering::Relaxed)
+    }
+
     async fn instantiate(&self, deadline: Instant) -> Result<Instance, LayerError> {
         let inner = &self.inner;
-        let mut store = Store::new(&inner.runtime.engine, StoreState::new(inner.shared.clone()));
+        let mut store = Store::new(
+            &inner.runtime.engine,
+            StoreState::new(inner.shared.clone(), inner.host_calls.clone()),
+        );
         store.limiter(|s| &mut s.limiter);
         store.epoch_deadline_callback(epoch_yield);
         store.set_epoch_deadline(1);

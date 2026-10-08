@@ -2,6 +2,7 @@
 //! limiter, and the implementations of the `roxy:addon` imports.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use http::uri::{Authority, Scheme};
 use roxy_http::Body;
@@ -95,10 +96,13 @@ pub(crate) struct StoreState {
     pub(crate) layer: Arc<LayerShared>,
     pub(crate) limiter: Limiter,
     pub(crate) exchange: Option<ExchangeCtx>,
+    /// Counted once per import call, in the getter every binding goes
+    /// through to reach this state.
+    host_calls: Arc<AtomicU64>,
 }
 
 impl StoreState {
-    pub(crate) fn new(layer: Arc<LayerShared>) -> Self {
+    pub(crate) fn new(layer: Arc<LayerShared>, host_calls: Arc<AtomicU64>) -> Self {
         // No preopens, no environment, no arguments, stdio closed, every
         // socket address denied and name lookup off: the WASI imports a
         // stock toolchain links are present but reach nothing.
@@ -119,7 +123,15 @@ impl StoreState {
                 total_memory: 0,
             },
             exchange: None,
+            host_calls,
         }
+    }
+
+    /// The getter the `roxy:addon` bindings reach the state through: one
+    /// call per import.
+    pub(crate) fn called(&mut self) -> &mut Self {
+        self.host_calls.fetch_add(1, Ordering::Relaxed);
+        self
     }
 
     fn require(&self, cap: Capability, import: &'static str) -> wasmtime::Result<()> {
@@ -254,7 +266,10 @@ fn internal(msg: &str) -> types::Error {
 }
 
 impl WasiView for StoreState {
+    /// The getter the WASI bindings reach the state through: one call per
+    /// import.
     fn ctx(&mut self) -> WasiCtxView<'_> {
+        self.host_calls.fetch_add(1, Ordering::Relaxed);
         WasiCtxView {
             ctx: &mut self.wasi,
             table: &mut self.table,

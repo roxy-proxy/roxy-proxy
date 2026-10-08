@@ -1136,7 +1136,7 @@ mod tests {
         let errs = kit.events("layer_error", 1).await;
         assert_eq!(
             errs[0]["message"],
-            format!("layer passed an invalid request to `next`: header x-token: {REDACTED}")
+            format!("layer passed an invalid request: header x-token: {REDACTED}")
         );
     }
 

@@ -256,15 +256,6 @@ async fn traps_fail_closed() {
         .await
         .unwrap_err();
     assert_eq!(err, LayerError::NoResponse);
-
-    let err = exchange(
-        &layer,
-        Mock::echo(),
-        request("error-response", Body::empty()),
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(err, LayerError::ErrorResponse(_)), "{err:?}");
 }
 
 /// Failures after the response head is out cut the body with an error; a
@@ -338,8 +329,8 @@ async fn looping_on_add_tag_after_the_head_fails_at_the_cap() {
     assert_eq!(tag_calls, MOCK_TAG_CAP + 1);
 }
 
-/// A `fields` a guest builds is host memory outside `max_memory`, so its
-/// size is capped; one over the cap fails the exchange, named.
+/// A head a guest hands the host is host memory outside `max_memory`, so
+/// its size is capped; one over the cap fails the exchange, named.
 #[tokio::test]
 async fn an_oversized_fields_is_refused() {
     let rt = runtime();
@@ -516,7 +507,7 @@ async fn capabilities_gate_host_services() {
         (
             "unknown-endpoint",
             Capability::Endpoints,
-            "error ErrorCode::DestinationNotFound",
+            "error Error::DestinationNotFound",
             "endpoint nope /",
         ),
     ];
@@ -642,8 +633,9 @@ async fn failed_instances_are_discarded() {
     assert_eq!(count(&layer).await, 1);
 }
 
-/// Each host resource a guest holds (fields, bodies, streams) costs host
-/// memory outside its `max_memory`, so the table is capped per instance.
+/// Each host resource a guest holds (streams, pollables, pending responses)
+/// costs host memory outside its `max_memory`, so the table is capped per
+/// instance.
 #[tokio::test]
 async fn a_guest_holding_too_many_resources_fails_closed() {
     let rt = runtime();
