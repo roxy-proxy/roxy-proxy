@@ -287,11 +287,14 @@ fn copy_for(
     addon: &AddonSpec,
     dir: Dir,
     body: Body,
-    lag: Arc<Lag>,
-) -> (Body, Body, CopyCut) {
+) -> (Body, Body, Arc<Lag>, CopyCut) {
+    let lag = lag(st, &addon.name, dir);
     match addon.subscribe.part(dir) {
-        Part::Full => tee(st, body, lag),
-        Part::Head => (body, Body::empty(), CopyCut(CancellationToken::new())),
+        Part::Full => {
+            let (real, copy, cut) = tee(st, body, lag.clone());
+            (real, copy, lag, cut)
+        }
+        Part::Head => (body, Body::empty(), lag, CopyCut(CancellationToken::new())),
     }
 }
 
@@ -381,9 +384,7 @@ pub(crate) async fn observe(
 ) -> Result<LayerResponse, HostError> {
     let addon = st.snap.addons[index].clone();
     let (parts, body) = req.into_parts();
-    let request_lag = lag(&st, &addon.name, Dir::Request);
-    let (real_body, copy_body, cut) =
-        copy_for(&st, &addon, Dir::Request, body, request_lag.clone());
+    let (real_body, copy_body, request_lag, cut) = copy_for(&st, &addon, Dir::Request, body);
     let mut copy_req = http::Request::new(copy_body);
     copy_req.extensions_mut().insert(cut);
     *copy_req.method_mut() = parts.method.clone();
@@ -480,8 +481,7 @@ async fn forward(
     match super::below(st.clone(), index, real_req).await {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
-            let lag = lag(&st, &addon.name, Dir::Response);
-            let (real_body, copy_body, cut) = copy_for(&st, addon, Dir::Response, body, lag);
+            let (real_body, copy_body, _lag, cut) = copy_for(&st, addon, Dir::Response, body);
             let mut copy = http::Response::new(copy_body);
             copy.extensions_mut().insert(cut);
             *copy.status_mut() = parts.status;

@@ -169,13 +169,16 @@ the framing roxy knows.
 - An enforce layer can still deny, rewrite or answer at a head it is
   subscribed to; the bodies stream past it at no cost in copies or
   buffering.
+- A response head-only layer answers with the status it was given to pass
+  the response on with its head edited; the body from below follows. Any
+  other status is an answer of the layer's own: its body stands and the
+  body from below is dropped, so a layer can refuse at the response head.
+  A layer that answers without `next` resolving answers whole too, since
+  there is no body from below.
 - A layer that passes on bytes of a body it is not subscribed to fails the
   exchange closed: a `503` before the response head, a cut body after it,
   `layer_error` with `kind: unsubscribed:request` or
-  `unsubscribed:response`. To answer with a body of its own in place of
-  the response from below, a layer subscribes to the response in `full`.
-  A layer that answers without `next` resolving answers whole, since there
-  is no body from below.
+  `unsubscribed:response`.
 - A head-only observer gets copies of the heads and no copy of the body,
   so neither the lag budget nor the buffer budget is touched for it.
 - The rules are not affected: they judge the request that leaves the

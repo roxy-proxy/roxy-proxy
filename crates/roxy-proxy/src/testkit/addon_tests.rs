@@ -1955,21 +1955,57 @@ async fn bytes_on_an_unsubscribed_body_fail_the_layer() {
 }
 
 /// A head-only layer that answers itself answers whole: there is no body
-/// from below to splice onto its own.
+/// from below to splice onto its own. The client's body, which the layer
+/// never took, is dropped like one a layer left unread: a large upload
+/// does not hold the connection.
 #[tokio::test]
 async fn a_head_only_layer_may_still_answer_itself() {
     use crate::addons::Part;
     let kit = one(AddonDef::test_layer("t").subscribe(Part::Head, Part::Head)).await;
-    let a = kit
-        .h1()
-        .await
-        .call("POST", "/x", &[("x-test-t", "deny")], b"payload")
-        .await;
+    let mut c = kit.h1().await;
+    let req = c
+        .request("POST", "/x", &[("x-test-t", "deny")])
+        .body(roxy_http::Body::from_bytes(vec![b'x'; 4 << 20]))
+        .unwrap();
+    let a = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        Answer::read(c.send(req).await.unwrap()),
+    )
+    .await
+    .expect("answered without waiting on the body");
     assert_eq!(a.status, 403, "{a:?}");
     assert_eq!(a.text(), "denied by layer");
     let ev = kit.request_event().await;
     assert_eq!(ev["decision"], "answered", "{ev:#}");
     assert!(kit.upstream.seen().is_empty());
+    no_layer_error(&kit);
+}
+
+/// A response head-only layer that answers with another status has
+/// answered itself: its body stands and the body from below is dropped,
+/// where the same status passes the response on with the head edited.
+#[tokio::test]
+async fn a_head_only_layer_refuses_at_the_response_head_by_changing_the_status() {
+    use crate::addons::Part;
+    let kit = one(AddonDef::test_layer("t").subscribe(Part::Full, Part::Head)).await;
+    let mut c = kit.h1().await;
+    let a = c
+        .call(
+            "GET",
+            "/x",
+            &[("x-test-t", "pass"), ("x-status", "451")],
+            b"",
+        )
+        .await;
+    assert_eq!(a.status, 451, "{a:?}");
+    assert_eq!(a.text(), "", "the body from below is dropped: {a:?}");
+    let a = c.call("GET", "/x", &[("x-test-t", "pass")], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(
+        a.json()["via"],
+        "t",
+        "the head went through, with the body: {a:?}"
+    );
     no_layer_error(&kit);
 }
 

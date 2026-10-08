@@ -869,6 +869,7 @@ pub(crate) fn enter(
             }
             AddonImpl::Service(svc) => service::handle(st.clone(), index, svc, req).await,
         };
+        subscribe::release_request(&st, index);
         res.map(|r| subscribe::reattach_response(&st, index, r))
     })
 }

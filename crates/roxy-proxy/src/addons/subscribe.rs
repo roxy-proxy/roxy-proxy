@@ -64,16 +64,8 @@ impl Subscription {
 #[derive(Default)]
 pub(super) struct Bypass {
     request: Option<Body>,
-    response: Option<Body>,
-}
-
-impl Bypass {
-    fn slot(&mut self, dir: Dir) -> &mut Option<Body> {
-        match dir {
-            Dir::Request => &mut self.request,
-            Dir::Response => &mut self.response,
-        }
-    }
+    /// The response from below: its status, and its body.
+    response: Option<(http::StatusCode, Body)>,
 }
 
 /// The head as a layer not subscribed to the body sees it: the body's
@@ -94,7 +86,7 @@ pub(super) fn detach_request(
     }
     let body = std::mem::take(req.body_mut());
     head_only(req.headers_mut());
-    *lock(&st.layers[index].bypass).slot(Dir::Request) = Some(body);
+    lock(&st.layers[index].bypass).request = Some(body);
     req
 }
 
@@ -105,10 +97,17 @@ pub(super) fn reattach_request(
     index: usize,
     req: LayerRequest,
 ) -> LayerRequest {
-    let Some(body) = lock(&st.layers[index].bypass).slot(Dir::Request).take() else {
+    let Some(body) = lock(&st.layers[index].bypass).request.take() else {
         return req;
     };
     req.map(|own| splice(st, index, Dir::Request, own, body))
+}
+
+/// Drops a request body still parked at layer `index` once the layer has
+/// answered: it never passed the head on, so the body goes the way of one
+/// a layer dropped unread.
+pub(super) fn release_request(st: &Arc<StackFlow>, index: usize) {
+    drop(lock(&st.layers[index].bypass).request.take());
 }
 
 /// Takes the response body away from enforce layer `index` when it is
@@ -123,25 +122,33 @@ pub(super) fn detach_response(
     }
     let body = std::mem::take(res.body_mut());
     head_only(res.headers_mut());
-    *lock(&st.layers[index].bypass).slot(Dir::Response) = Some(body);
+    lock(&st.layers[index].bypass).response = Some((res.status(), body));
     res
 }
 
 /// Splices the response body that bypassed layer `index` onto the response
-/// it answered with. A layer that answered without `next` resolving has no
-/// bypassed body: its answer is whole.
+/// it answered with, when that is the response from below with its head
+/// edited: the same status. A different status is an answer of the layer's
+/// own, whole, and the body from below is dropped. A layer that answered
+/// without `next` resolving has no bypassed body: its answer is whole.
 pub(super) fn reattach_response(
     st: &Arc<StackFlow>,
     index: usize,
     res: LayerResponse,
 ) -> LayerResponse {
-    let Some(body) = lock(&st.layers[index].bypass).slot(Dir::Response).take() else {
+    let Some((status, body)) = lock(&st.layers[index].bypass).response.take() else {
         return res;
     };
+    if res.status() != status {
+        return res;
+    }
     res.map(|own| splice(st, index, Dir::Response, own, body))
 }
 
 fn splice(st: &Arc<StackFlow>, index: usize, dir: Dir, own: Body, bypassed: Body) -> Body {
+    if own.is_end_stream() {
+        return bypassed;
+    }
     let known = bypassed.known_length();
     Body::wrap_native(
         Spliced {
@@ -156,9 +163,9 @@ fn splice(st: &Arc<StackFlow>, index: usize, dir: Dir, own: Body, bypassed: Body
     )
 }
 
-/// The bypassed body after the layer's own, which must end without a
-/// frame: the layer is not subscribed to this body, so bytes from it are
-/// its failure.
+/// The bypassed body after the layer's own, which must end without a byte
+/// or a trailer: the layer is not subscribed to this body, so anything it
+/// passes on for it is its failure.
 struct Spliced {
     st: Arc<StackFlow>,
     index: usize,
@@ -182,6 +189,7 @@ impl HttpBody for Spliced {
                     self.own = None;
                     return Poll::Ready(Some(Err(e)));
                 }
+                Some(Ok(f)) if f.data_ref().is_some_and(Bytes::is_empty) => {}
                 Some(Ok(_)) => {
                     let name = self.st.snap.addons[self.index].name.clone();
                     self.st
