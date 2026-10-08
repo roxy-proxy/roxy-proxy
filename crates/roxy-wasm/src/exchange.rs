@@ -1,34 +1,29 @@
-//! Per-exchange shared state and the body adapters between the proxy's
-//! [`Body`] and the guest's `wasi:http` bodies.
+//! Per-exchange shared state and the adapter that hands a guest-produced
+//! body to the proxy.
 //!
-//! The adapters are where "fail closed" meets streaming:
-//!
-//! * A body coming *out of* the guest (the request it passes to `next`, the
-//!   response it answers with) never ends cleanly once the exchange has
-//!   failed. `wasmtime-wasi-http` ends a guest body cleanly when its sender
-//!   is dropped, which is also what happens when the store is dropped after
-//!   a trap; the adapter checks the exchange status first, and the driver
-//!   always records the failure before it drops the store. A response body
-//!   additionally holds its end until the guest's handler has returned, so
-//!   a trap after the last byte still fails it.
-//! * The request body passed to `next` that the guest leaves unfinished is
-//!   always cut. It fails the exchange only if the guest is still waiting on
-//!   `next`'s response: a guest that dropped the response future (or already
-//!   has the response) has abandoned the forwarded request, and may answer
-//!   itself. See [`ExchangeShared::cut_next`].
+//! The adapter is where "fail closed" meets streaming. A body coming out of
+//! the guest (the request it passes to `next`, the response it answers with)
+//! never ends cleanly once the exchange has failed: the adapter checks the
+//! exchange status before every frame, and the driver always records a
+//! failure before it drops the store. A response body additionally holds
+//! its end until the guest's handler has returned, so a trap after the last
+//! byte still fails it. The request body passed to `next` that the guest
+//! leaves unfinished is always cut; it fails the exchange only if the guest
+//! is still waiting on `next`'s response (a guest that dropped the pending
+//! response, or already has the response, has abandoned the forwarded
+//! request and may answer itself; see [`ExchangeShared::cut_next`]).
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body::{Body as HttpBody, Frame, SizeHint};
+use http_body::{Body as HttpBody, Frame};
 use roxy_http::{Body, BodyError};
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
-use wasmtime_wasi_http::Error as WasiError;
 
 use crate::error::LayerError;
 use crate::host::LayerHost;
@@ -256,91 +251,12 @@ impl Drop for CancelGuard {
     }
 }
 
-fn to_wasi_error(err: &BodyError, dir: Dir) -> WasiError {
-    match err {
-        BodyError::TooLarge { limit } => match dir {
-            Dir::Request => WasiError::HttpRequestBodySize(Some(*limit)),
-            Dir::Response => WasiError::HttpResponseBodySize(Some(*limit)),
-        },
-        BodyError::Timeout => WasiError::ConnectionReadTimeout,
-        BodyError::Incomplete => match dir {
-            Dir::Request => WasiError::ConnectionTerminated,
-            Dir::Response => WasiError::HttpResponseIncomplete,
-        },
-        other @ (BodyError::LengthMismatch
-        | BodyError::Closed
-        | BodyError::Abandoned
-        | BodyError::Invalid(_)
-        | BodyError::Upstream(_)
-        | BodyError::Stopped
-        | BodyError::Undecodable(_)
-        | BodyError::BudgetExhausted) => WasiError::InternalError(Some(other.to_string())),
-    }
-}
-
-/// A proxy [`Body`] handed into the guest (the request it handles, the
-/// response `next` returned, an endpoint response).
-pub(crate) struct IntoGuest {
-    inner: Body,
-    dir: Dir,
-    failed: bool,
-}
-
-impl IntoGuest {
-    pub(crate) fn new(inner: Body, dir: Dir) -> Self {
-        Self {
-            inner,
-            dir,
-            failed: false,
-        }
-    }
-}
-
-impl HttpBody for IntoGuest {
-    type Data = Bytes;
-    type Error = WasiError;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, WasiError>>> {
-        if self.failed {
-            return Poll::Ready(None);
-        }
-        let this = &mut *self;
-        match ready!(Pin::new(&mut this.inner).poll_frame(cx)) {
-            Some(Ok(frame)) => Poll::Ready(Some(Ok(frame))),
-            // An observer's copy whose real body the stack dropped unread
-            // ends where the reading stopped. Nobody is at fault, and the
-            // guest learns what became of the request from `next`.
-            Some(Err(BodyError::Abandoned)) => {
-                this.failed = true;
-                Poll::Ready(None)
-            }
-            Some(Err(e)) => {
-                this.failed = true;
-                Poll::Ready(Some(Err(to_wasi_error(&e, this.dir))))
-            }
-            None => Poll::Ready(None),
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.failed || self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-type GuestBody = wasmtime_wasi_http::p2::body::HyperOutgoingBody;
 type Settled = Pin<Box<dyn Future<Output = Result<(), LayerError>> + Send>>;
 
 /// A body produced by the guest, handed to the proxy.
 #[allow(clippy::struct_excessive_bools)] // independent poll-state flags
 pub(crate) struct FromGuest {
-    inner: GuestBody,
+    inner: Body,
     shared: Arc<ExchangeShared>,
     /// The exchange's own request or response; `None` for an endpoint
     /// request. Decides how a broken stream is reported.
@@ -359,18 +275,18 @@ pub(crate) struct FromGuest {
 
 impl FromGuest {
     /// The request body the guest passed to `next`.
-    pub(crate) fn next_request(inner: GuestBody, shared: Arc<ExchangeShared>) -> Body {
+    pub(crate) fn next_request(inner: Body, shared: Arc<ExchangeShared>) -> Body {
         Self::build(inner, shared, Some(Dir::Request), true, false, None)
     }
 
     /// The request body the guest passed to an endpoint.
-    pub(crate) fn endpoint_request(inner: GuestBody, shared: Arc<ExchangeShared>) -> Body {
+    pub(crate) fn endpoint_request(inner: Body, shared: Arc<ExchangeShared>) -> Body {
         Self::build(inner, shared, None, false, false, None)
     }
 
     /// The response body the guest answered with.
     pub(crate) fn response(
-        inner: GuestBody,
+        inner: Body,
         shared: Arc<ExchangeShared>,
         cancel: Arc<CancelGuard>,
     ) -> Body {
@@ -385,7 +301,7 @@ impl FromGuest {
     }
 
     fn build(
-        inner: GuestBody,
+        inner: Body,
         shared: Arc<ExchangeShared>,
         dir: Option<Dir>,
         next: bool,
@@ -393,6 +309,7 @@ impl FromGuest {
         cancel: Option<Arc<CancelGuard>>,
     ) -> Body {
         let settled: Settled = Box::pin(shared.wait_settled());
+        let known_length = inner.known_length();
         let body = FromGuest {
             inner,
             shared,
@@ -405,7 +322,7 @@ impl FromGuest {
             finished: false,
             _cancel: cancel,
         };
-        Body::wrap_native(body, u64::MAX, None)
+        Body::wrap_native(body, u64::MAX, known_length)
     }
 
     fn fail_frame(&mut self) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
@@ -432,6 +349,13 @@ impl HttpBody for FromGuest {
         if !this.inner_done {
             match Pin::new(&mut this.inner).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => return Poll::Ready(Some(Ok(frame))),
+                // An observer's copy the stack dropped unread, passed
+                // through: it ends where the reading stopped, at nobody's
+                // fault.
+                Poll::Ready(Some(Err(BodyError::Abandoned))) => {
+                    this.finished = true;
+                    return Poll::Ready(None);
+                }
                 Poll::Ready(Some(Err(e))) => {
                     let msg = format!("body stream failed: {e}");
                     if this.next {
@@ -445,8 +369,8 @@ impl HttpBody for FromGuest {
                     return this.fail_frame();
                 }
                 Poll::Ready(None) => {
-                    // A sender dropped by a failed (or failing) store also
-                    // ends here; re-check after the inner end.
+                    // Re-check after the inner end: the failure may have
+                    // landed while the last frame was in flight.
                     if this.shared.failure().is_some() {
                         return this.fail_frame();
                     }
@@ -494,7 +418,6 @@ mod tests {
     use crate::host::{
         EndpointError, FlowInfo, HostError, LayerRequest, LayerResponse, LogLevel, TagError,
     };
-    use http_body_util::BodyExt;
     use tokio::time::Instant;
 
     /// A host that hears of failures and nothing else.
@@ -605,25 +528,5 @@ mod tests {
         let start = Instant::now();
         clock.await;
         assert_eq!(start.elapsed().as_secs(), 8);
-    }
-
-    #[tokio::test]
-    async fn into_guest_passes_errors_on() {
-        let (tx, body) = Body::channel(u64::MAX, None);
-        tx.abort(BodyError::Incomplete);
-        let body = IntoGuest::new(body, Dir::Request);
-        assert!(body.collect().await.is_err());
-    }
-
-    /// A body abandoned by its consumer ends for the guest where it stood,
-    /// with the bytes that did flow; a body that failed does not.
-    #[tokio::test]
-    async fn into_guest_ends_an_abandoned_body_cleanly() {
-        let (mut tx, body) = Body::channel(u64::MAX, Some(4));
-        tx.send_data(Bytes::from_static(b"ab")).await.unwrap();
-        tx.abort(BodyError::Abandoned);
-        let body = IntoGuest::new(body, Dir::Request);
-        let got = body.collect().await.unwrap().to_bytes();
-        assert_eq!(got, Bytes::from_static(b"ab"));
     }
 }

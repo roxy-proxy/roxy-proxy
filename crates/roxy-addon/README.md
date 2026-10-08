@@ -51,7 +51,7 @@ fn replace(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
 crate-type = ["cdylib"]
 
 [dependencies]
-roxy-addon = "0.1"
+roxy-addon = "0.2"
 ```
 
 ```sh
@@ -73,6 +73,10 @@ addons:
 
 On other targets the crate builds too (imports panic if called), so the
 logic of a layer can be unit-tested natively.
+
+`roxy-addon` 0.2 targets `roxy:addon@0.2.0`. A component built with 0.1
+does not load on a roxy serving 0.2.0 (its imports differ); rebuild it
+against 0.2, which keeps the API below.
 
 ## What a layer can do
 

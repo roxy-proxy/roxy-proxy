@@ -17,11 +17,14 @@ pub enum Budget {
     FirstByte,
     /// The flow holds as many tags, or as many bytes of them, as it may.
     Tags,
-    /// A `fields` the guest built would grow past [`crate::MAX_FIELDS_BYTES`].
+    /// A head the guest handed the host is over [`crate::MAX_FIELDS_BYTES`].
     Fields,
     /// A `flow.log` message or `flow.record` document is over
     /// [`crate::MAX_MESSAGE_BYTES`].
     Message,
+    /// A whole body the guest handed the host (`body.bytes`) is over
+    /// [`crate::MAX_BODY_BYTES`].
+    Body,
 }
 
 impl Budget {
@@ -33,6 +36,7 @@ impl Budget {
             Budget::Tags => "tags",
             Budget::Fields => "fields",
             Budget::Message => "message",
+            Budget::Body => "body",
         }
     }
 }
@@ -69,17 +73,16 @@ pub enum LayerError {
     /// (during `init`).
     #[error("layer called `{0}` outside an exchange")]
     OutsideExchange(&'static str),
-    /// The request the guest passed to `next` could not be built (bad
-    /// method, scheme, authority or path).
-    #[error("layer passed an invalid request to `next`: {0}")]
+    /// The request the guest passed to `next` or an endpoint could not be
+    /// used (bad method, scheme, authority, path or header; a body stream
+    /// that is not the host's; a body left unfinished).
+    #[error("layer passed an invalid request: {0}")]
     InvalidRequest(String),
-    /// The guest's handler returned without setting a response.
+    /// The guest's handler returned without answering.
     #[error("layer returned without a response")]
     NoResponse,
-    /// The guest set an error instead of a response.
-    #[error("layer answered with an error: {0}")]
-    ErrorResponse(String),
-    /// The response the guest set could not be used.
+    /// The response the guest answered with could not be used (bad status
+    /// or header; a second answer; a body left unfinished).
     #[error("layer answered with an invalid response: {0}")]
     InvalidResponse(String),
     /// A host service failed; failing closed.
@@ -128,9 +131,8 @@ pub enum LoadError {
         /// Compiler message.
         message: String,
     },
-    /// The component imports something roxy does not provide (for
-    /// example `wasi:http/outgoing-handler`), or its imports have the
-    /// wrong types.
+    /// The component imports something roxy does not provide (`wasi:http`,
+    /// say), or its imports have the wrong types.
     #[error("layer `{layer}`: link failed: {message}")]
     Link {
         /// Layer name.
@@ -138,7 +140,7 @@ pub enum LoadError {
         /// Linker message.
         message: String,
     },
-    /// A required export is missing (`wasi:http/incoming-handler`,
+    /// A required export is missing (`roxy:addon/handler`,
     /// `roxy:addon/init`).
     #[error("layer `{layer}`: missing export: {message}")]
     MissingExport {

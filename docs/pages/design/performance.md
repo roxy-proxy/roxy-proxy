@@ -19,19 +19,20 @@ and is not in that table: its 16,800 requests per core at 1 KiB against
 roxy's 9,100 is the cost of terminating and re-originating TLS.
 
 A no-op addon is not free. A [WASM layer](/design/addon-model) built with
-the SDK that forwards everything unchanged costs 37% to 48% of the
-throughput (table below). The cost is the number of calls the guest makes
-into the host: about 60 for a 1 KiB exchange, each roughly a microsecond of
-component-model bookkeeping before roxy's own code runs. The WASI HTTP types
-read and write a head a field at a time, waiting for a response takes a
-subscribe, a block and a drop, and every resource is released by a call of
-its own. The SDK keeps bodies and header lists out of that count: a body
-the layer does not touch is moved from stream to stream by the host without
-entering guest memory, and a head the layer does not change goes back as
-the host's own copy (copying one header field into the guest and back costs
-about 2 µs). The calls that remain are the shape of the WIT
+the SDK that forwards everything unchanged cost 37% to 48% of the
+throughput in the table below. The cost is the number of calls the guest
+makes into the host, each roughly a microsecond of component-model
+bookkeeping before roxy's own code runs, and those rows were taken against
+`roxy:addon@0.1.0`, whose WASI HTTP types read and write a head a field at
+a time: about 60 calls for a 1 KiB exchange. `roxy:addon@0.2.0` hands each
+head over as one record and each untouched body as a stream the host moves
+itself, so the same no-op layer makes 3 calls per exchange (`next`, `wait`,
+`respond`), a layer that answers without `next` makes 2, and one that
+transforms both bodies in the guest makes about 15 for a small exchange
+(`crates/roxy-wasm/tests/host_calls.rs` counts them). The no-op rows below
+have not been re-taken on the new interface
 ([#403](https://github.com/roxy-proxy/roxy-proxy/issues/403),
-[#319](https://github.com/roxy-proxy/roxy-proxy/issues/319)).
+[#421](https://github.com/roxy-proxy/roxy-proxy/issues/421)).
 
 A Python [service layer](/reference/service-layers) that does the same is
 bound by its own single core at about 2,400 requests per second, with roxy

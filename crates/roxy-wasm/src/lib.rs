@@ -10,17 +10,20 @@ mod bindings;
 mod config;
 mod error;
 mod exchange;
+mod head;
 mod host;
 mod runtime;
 mod state;
+mod streams;
 
 pub use async_trait::async_trait;
 pub use config::{Capabilities, Capability, LayerConfig, LayerLimits};
 pub use error::{Budget, LayerError, LoadError};
 pub use exchange::LayerOutcome;
+pub use head::MAX_FIELDS_BYTES;
 pub use host::{
     EndpointError, FlowInfo, HostError, LayerHost, LayerRequest, LayerResponse, LogLevel,
     Principal, TagError,
 };
 pub use runtime::{Layer, SlotWait, WasmRuntime};
-pub use state::{MAX_FIELDS_BYTES, MAX_MESSAGE_BYTES};
+pub use state::{MAX_BODY_BYTES, MAX_MESSAGE_BYTES};

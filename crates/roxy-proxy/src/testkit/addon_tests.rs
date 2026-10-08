@@ -1894,6 +1894,72 @@ async fn records_and_state_reach_the_flow_log() {
     assert_eq!(errs[0]["kind"], "capability:metrics");
 }
 
+// ---- guest bodies ---------------------------------------------------------
+
+/// A layer that traps after answering with a whole body still has the
+/// body cut on the wire: its end is held until the handler returns, so the
+/// client never gets a complete response from a layer that then failed.
+#[tokio::test]
+async fn a_trap_after_a_whole_answer_still_cuts_it() {
+    let kit = one(AddonDef::test_layer("t")).await;
+    let a = kit
+        .h1()
+        .await
+        .call("GET", "/x", &[("x-test-t", "trap-after-finish")], b"")
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert!(a.body.is_err(), "the body is cut: {a:?}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["kind"], "trap", "{errs:#?}");
+}
+
+/// A whole body over the host's cap fails the exchange as the budget's;
+/// one under it goes through.
+#[tokio::test]
+async fn a_whole_body_is_capped() {
+    let kit = one(AddonDef::test_layer("t")).await;
+    let mut c = kit.h1().await;
+    let a = c
+        .call(
+            "GET",
+            "/x",
+            &[("x-test-t", "big-bytes"), ("x-bytes", "65536")],
+            b"",
+        )
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.body.as_ref().map(bytes::Bytes::len), Ok(65536), "{a:?}");
+    let a = c.call("GET", "/x", &[("x-test-t", "big-bytes")], b"").await;
+    assert_eq!(a.status, 503, "{a:?}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["kind"], "budget:body", "{errs:#?}");
+}
+
+/// An endpoint call refused for its path hands the error to the layer,
+/// which goes on; the body it passed to the call is spent, not left to fail
+/// the exchange when the handler returns.
+#[tokio::test]
+async fn a_refused_endpoint_path_spends_the_body_it_was_given() {
+    use roxy_wasm::Capability;
+    let kit = one(AddonDef::test_layer("t")
+        .caps(&[Capability::Endpoints])
+        .endpoint("monitor", "https://up.test/score", &[], false))
+    .await;
+    let a = kit
+        .h1()
+        .await
+        .call(
+            "POST",
+            "/x",
+            &[("x-test-t", "endpoint-bad-path")],
+            b"payload",
+        )
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.text(), "recovered");
+    no_layer_error(&kit);
+}
+
 // ---- subscriptions --------------------------------------------------------
 
 /// A layer subscribed to a head only is given an empty body without

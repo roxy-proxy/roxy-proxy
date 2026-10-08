@@ -93,7 +93,7 @@ exchanges slow, never denied. Each is optional.
 | key | kind | default | what it bounds |
 |---|---|---|---|
 | `first_byte_timeout` | both | `30s` | how long a layer may hold a head, request or response, before passing it on or answering: its own time only (starting an instance, its work, endpoint calls, reading the body it was given), never time `next` spends below it. Overrun fails closed, `budget:first_byte_timeout`. On a service layer, getting a stream counts against the request head's budget. An observer that gets no instance within it loses its copy (`observer_lagged`, `no_instance`) |
-| `max_memory` | wasm | `64mb` | linear memory per instance, summed over the instance's memories; table growth and the host resource table (4096 live resources) are capped too. What a layer holds of a body lives here. An interpreter in WASM (Python) needs 128–256 MiB |
+| `max_memory` | wasm | `64mb` | linear memory per instance, summed over the instance's memories; table growth and the host resource table (4096 live resources: body streams, pollables, pending responses) are capped too. What a layer holds of a body lives here. An interpreter in WASM (Python) needs 128–256 MiB |
 | `max_instances` | wasm | `1024` | live instances, so concurrent exchanges and, with `max_memory`, the layer's memory. An enforce exchange that finds none free waits without a deadline; an observer waits `first_byte_timeout`. Instances start on demand |
 | `recycle_after_exchanges` | wasm | `10000` | an instance is replaced after this many exchanges; `0` replaces it after every exchange |
 | `recycle_above_memory` | wasm | three quarters of `max_memory` | an instance whose memory passed this is replaced after its exchange. At most `max_memory` |
@@ -112,9 +112,10 @@ What the host holds for a guest outside `max_memory`, not configurable:
 
 | cap | value | on overrun |
 |---|---|---|
-| a `fields` a guest builds | 128 KiB of names and values | `budget:fields`: fails the exchange |
+| a head a guest hands the host (`next`, `respond`, `call`) | 128 KiB: method, scheme, authority, path and query, and every header name and value together | `budget:fields`: fails the exchange |
 | a flow's tags, across all its layers | 64 tags, 4 KiB together | `budget:tags`: fails the exchange |
 | a `flow.log` message, or a `flow.record` kind and document together | 64 KiB | `budget:message`: fails the exchange |
+| a whole body handed over in one piece (`body.bytes`) | 1 MiB; a larger body is streamed | `budget:body`: fails the exchange |
 | an endpoint call's request body | 16 MiB, read within the endpoint's timeout and charged to the [buffer budget](/reference/limits#buffer-budget) while the call runs | refuses the call |
 | endpoint calls in flight per exchange | 8; further calls wait for a permit, within the timeout | refuses the call |
 | a state key | 1 KiB | refuses the call |
@@ -219,10 +220,11 @@ the client's request body into the first layer, and the last layer's
 response.
 
 - What a layer passes on is re-validated as strictly as a client request:
-  an absolute `http(s)` URI, `host` (if present) matching it,
-  `content-length` checked against the body, hop-by-hop and framing fields
-  refused, the workload's limits applied. `chain.next` fills in the scheme
-  and authority from the exchange when the layer leaves them unset.
+  an absolute `http(s)` URI; `host`, `content-length`, hop-by-hop and
+  framing fields refused at the boundary (roxy derives them, and the body
+  carries its own length); the workload's limits applied. `chain.next`
+  fills in the scheme and authority from the exchange when the layer
+  leaves them unset.
 - A layer's answer must be a final response; a `1xx` other than the `101`
   of a relayed upgrade fails closed as `invalid_response`.
 - A layer's response body to the client waits for the flow log like every
@@ -296,21 +298,26 @@ body.
 
 ### Failure
 
-- **Every failure is closed.** A trap, an exceeded budget, a second `next`,
-  a missing capability, a host failure, an unbuildable request, an error or
-  missing response, bytes on an unsubscribed body, a handler that returns
-  still holding resources, or a cancelled exchange is a `LayerError`: a
-  deny, or a cut exchange after the response head.
+- **Every failure is closed.** A trap, an exceeded budget, a second `next`
+  or `respond`, a missing capability, a host failure, a head the host
+  refuses, a body stream that is not the host's, a missing response, bytes
+  on an unsubscribed body, a handler that returns still holding a resource
+  (an unfinished body, a pending response), or a cancelled exchange is a
+  `LayerError`: a deny, or a cut exchange after the response head.
 - **A client that gives up cancels the exchange.** The guest is stopped,
   its instance discarded, the slot freed. No `layer_error` is logged.
 - **No clean end for a failed body.** A guest body ends with an error once
   its exchange has failed; a response body holds its end until the handler
-  returns, so a trap after the last byte still cuts it.
+  returns, so a trap after the last byte still cuts it. A streamed body is
+  complete only through `finish`: dropped unfinished, it is cut, and a
+  response body dropped unfinished fails the exchange.
 - **An abandoned request is cut, not failed.** A request body passed to
   `next` that the guest drops without `finish` is cut at the upstream. If
   the guest is still waiting on `next`'s response, the layer has failed
-  (`invalid_request`); if it has dropped the response future or already has
-  the response, it may answer itself and its answer stands.
+  (`invalid_request`); if it has dropped the pending response or already
+  has the response, it may answer itself and its answer stands. A body the
+  guest passed through that fails behind it (the client gave up) is cut the
+  same way.
 - **An instance that failed is discarded**, never reused.
 - Layers see canonical heads and body streams, never wire bytes, and have
   no filesystem, sockets or environment: all their I/O is `next`,

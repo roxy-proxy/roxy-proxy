@@ -15,12 +15,10 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-use exports::wasi::http::incoming_handler::Guest as Handler;
+use exports::roxy::addon::handler::Guest as Handler;
+use roxy::addon::types::{self, Body, PendingResponse, RequestHead, ResponseHead};
 use roxy::addon::{chain, endpoints, flow};
-use wasi::http::types::{
-    Fields, IncomingBody, IncomingRequest, IncomingResponse, OutgoingBody, OutgoingRequest,
-    OutgoingResponse, ResponseOutparam,
-};
+use wasi::io::poll::Pollable;
 use wasi::io::streams::{InputStream, OutputStream, StreamError};
 
 struct Layer;
@@ -30,11 +28,14 @@ static EXCHANGES: AtomicU64 = AtomicU64::new(0);
 /// Memory deliberately kept alive across exchanges (`x-test: grow`).
 static mut HELD: Vec<Vec<u8>> = Vec::new();
 
-fn header(req: &IncomingRequest, name: &str) -> Option<String> {
-    req.headers()
-        .get(name)
-        .first()
-        .map(|v| String::from_utf8_lossy(v).into_owned())
+/// A response from below: its head and body stream.
+type Answer = (ResponseHead, InputStream);
+
+fn header(req: &RequestHead, name: &str) -> Option<String> {
+    req.headers
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
 }
 
 /// The `name` from this layer's config, if any (`{"name": "a"}`).
@@ -52,7 +53,7 @@ fn tags() -> bool {
 }
 
 /// The behaviour for this exchange: `x-test-<name>`, else `x-test`.
-fn test_for(req: &IncomingRequest) -> String {
+fn test_for(req: &RequestHead) -> String {
     name()
         .and_then(|n| header(req, &format!("x-test-{n}")))
         .or_else(|| header(req, "x-test"))
@@ -60,7 +61,7 @@ fn test_for(req: &IncomingRequest) -> String {
 }
 
 /// `x-read-bytes` (default 1): how much body to read before answering.
-fn read_bytes(req: &IncomingRequest) -> u64 {
+fn read_bytes(req: &RequestHead) -> u64 {
     header(req, "x-read-bytes")
         .and_then(|v| v.parse().ok())
         .unwrap_or(1)
@@ -77,6 +78,10 @@ fn read_at_least(input: &InputStream, n: u64) -> Vec<u8> {
         }
     }
     got
+}
+
+fn read_all(input: &InputStream) -> Vec<u8> {
+    read_at_least(input, u64::MAX)
 }
 
 fn write_all(out: &OutputStream, bytes: &[u8]) {
@@ -114,43 +119,30 @@ fn pump(input: &InputStream, out: &OutputStream, upper: bool) {
     }
 }
 
-fn read_all(body: IncomingBody) -> Vec<u8> {
-    let mut all = Vec::new();
-    {
-        let input = body.stream().expect("stream");
-        loop {
-            match input.blocking_read(64 * 1024) {
-                Ok(chunk) => all.extend_from_slice(&chunk),
-                Err(StreamError::Closed) => break,
-                Err(e) => panic!("read failed: {e:?}"),
-            }
-        }
-    }
-    drop(body);
-    all
+fn head(status: u16, headers: Vec<(String, Vec<u8>)>) -> ResponseHead {
+    ResponseHead { status, headers }
 }
 
-fn respond(out: ResponseOutparam, status: u16, body: &[u8]) {
-    let resp = OutgoingResponse::new(Fields::new());
-    resp.set_status_code(status).expect("status");
-    let resp_body = resp.body().expect("body");
-    ResponseOutparam::set(out, Ok(resp));
-    {
-        let stream = resp_body.write().expect("write");
-        write_all(&stream, body);
-    }
-    OutgoingBody::finish(resp_body, None).expect("finish");
+/// Answers with `body` in one piece.
+fn respond(status: u16, body: &[u8]) {
+    let out = chain::respond(&head(status, Vec::new()), Body::Bytes(body.to_vec()));
+    assert!(out.is_none(), "no stream for a whole body");
 }
 
-/// A copy of the incoming request, ready for `next`. A named layer appends
+/// Answers with a streamed body, returning the stream to write it to.
+fn respond_streaming(head: &ResponseHead) -> OutputStream {
+    chain::respond(head, Body::Stream).expect("stream")
+}
+
+/// A copy of the incoming head, ready for `next`. A named layer appends
 /// its name to `x-via` and tags the flow `via:<name>`.
-fn forward_head(req: &IncomingRequest) -> OutgoingRequest {
+fn forward_head(req: &RequestHead) -> RequestHead {
     forward_head_with(req, Vec::new())
 }
 
 /// [`forward_head`] with `extra` headers added.
-fn forward_head_with(req: &IncomingRequest, extra: Vec<(String, Vec<u8>)>) -> OutgoingRequest {
-    let mut entries = req.headers().entries();
+fn forward_head_with(req: &RequestHead, extra: Vec<(String, Vec<u8>)>) -> RequestHead {
+    let mut entries = req.headers.clone();
     entries.extend(extra);
     if let Some(n) = name() {
         if tags() {
@@ -165,45 +157,37 @@ fn forward_head_with(req: &IncomingRequest, extra: Vec<(String, Vec<u8>)>) -> Ou
         };
         entries.push(("x-via".to_owned(), via.into_bytes()));
     }
-    let headers = Fields::from_list(&entries).expect("headers");
-    let out = OutgoingRequest::new(headers);
-    out.set_method(&req.method()).expect("method");
-    out.set_scheme(req.scheme().as_ref()).expect("scheme");
-    out.set_authority(req.authority().as_deref())
-        .expect("authority");
-    out.set_path_with_query(req.path_with_query().as_deref())
-        .expect("path");
-    out
-}
-
-fn await_response(fut: wasi::http::types::FutureIncomingResponse) -> IncomingResponse {
-    fut.subscribe().block();
-    fut.get().expect("ready").expect("once").expect("response")
-}
-
-/// Streams `resp` back to the client through `out`.
-fn answer_with(resp: IncomingResponse, out: ResponseOutparam, upper: bool) {
-    let headers = Fields::from_list(&resp.headers().entries()).expect("headers");
-    let mine = OutgoingResponse::new(headers);
-    mine.set_status_code(resp.status()).expect("status");
-    let mine_body = mine.body().expect("body");
-    ResponseOutparam::set(out, Ok(mine));
-    {
-        let body = resp.consume().expect("consume");
-        {
-            let input = body.stream().expect("stream");
-            let output = mine_body.write().expect("write");
-            pump(&input, &output, upper);
-        }
-        drop(body);
+    RequestHead {
+        method: req.method.clone(),
+        scheme: req.scheme.clone(),
+        authority: req.authority.clone(),
+        path_with_query: req.path_with_query.clone(),
+        headers: entries,
     }
-    drop(resp);
-    OutgoingBody::finish(mine_body, None).expect("finish");
+}
+
+/// Passes `head` down with a body the layer will write, returning the
+/// response to come and the stream to write to.
+fn next_streaming(head: &RequestHead) -> (PendingResponse, OutputStream) {
+    let (pending, out) = chain::next(head, Body::Stream).expect("next");
+    (pending, out.expect("stream"))
+}
+
+fn await_response(pending: PendingResponse) -> Answer {
+    PendingResponse::wait(pending).expect("response")
+}
+
+/// Streams `resp` back to the client.
+fn answer_with((below, body): Answer, upper: bool) {
+    let out = respond_streaming(&below);
+    pump(&body, &out, upper);
+    drop(body);
+    types::finish(out);
 }
 
 /// Blocks for the `x-<name>-ms` of the request, if set: the layer's own
 /// time, held against its head clock.
-fn hold(req: &IncomingRequest, name: &str) {
+fn hold(req: &RequestHead, name: &str) {
     if let Some(ms) = header(req, &format!("x-{name}-ms")).and_then(|v| v.parse::<u64>().ok()) {
         wasi::clocks::monotonic_clock::subscribe_duration(ms * 1_000_000).block();
     }
@@ -211,51 +195,31 @@ fn hold(req: &IncomingRequest, name: &str) {
 
 /// The default: pass the exchange through, streaming both bodies, chunk by
 /// chunk (upper-cased when `x-upper` is set). With `x-hold`, neither body
-/// it passes on is ever ended. Unbuffered, the response from below goes
-/// out with `x-status` as its status, if set. `x-delay-request-ms` holds
-/// the request head before `next`; buffered, `x-delay-response-ms` holds
-/// the response head after it.
-fn pass(req: IncomingRequest, out: ResponseOutparam, buffer_first: bool) {
-    let upper = header(&req, "x-upper").is_some();
+/// it passes on is ended until the client's request body goes away.
+/// Unbuffered, the response from below goes out with `x-status` as its
+/// status, if set. `x-delay-request-ms` holds the request head before
+/// `next`; buffered, `x-delay-response-ms` holds the response head after it.
+fn pass(req: &RequestHead, body: InputStream, buffer_first: bool) {
+    let upper = header(req, "x-upper").is_some();
     let tweaks = Tweaks {
         upper,
-        hold: header(&req, "x-hold").is_some(),
-        status: header(&req, "x-status").map(|v| v.parse().expect("x-status")),
+        hold: header(req, "x-hold").is_some(),
+        status: header(req, "x-status").map(|v| v.parse().expect("x-status")),
     };
-    let next_req = forward_head(&req);
-    let next_body = next_req.body().expect("body");
-    let in_body = req.consume().expect("consume");
-
-    let buffered = buffer_first.then(|| {
-        let stream = in_body.stream().expect("stream");
-        let mut all = Vec::new();
-        loop {
-            match stream.blocking_read(64 * 1024) {
-                Ok(c) => all.extend_from_slice(&c),
-                Err(StreamError::Closed) => break,
-                Err(e) => panic!("read failed: {e:?}"),
-            }
-        }
-        all
-    });
-
-    hold(&req, "delay-request");
-    let fut = chain::next(next_req).expect("next");
+    let next_head = forward_head(req);
+    let buffered = buffer_first.then(|| read_all(&body));
+    hold(req, "delay-request");
+    let (pending, next_out) = next_streaming(&next_head);
     let Some(all) = buffered else {
-        duplex(req, in_body, next_body, fut, out, tweaks);
+        duplex(body, next_out, pending, tweaks);
         return;
     };
-    {
-        let output = next_body.write().expect("write");
-        write_all(&output, &all);
-    }
-    OutgoingBody::finish(next_body, None).expect("finish");
-    drop(in_body);
-
-    let resp = await_response(fut);
-    hold(&req, "delay-response");
-    drop(req);
-    answer_with(resp, out, upper);
+    write_all(&next_out, &all);
+    types::finish(next_out);
+    drop(body);
+    let resp = await_response(pending);
+    hold(req, "delay-response");
+    answer_with(resp, upper);
 }
 
 /// What `pass` does to the exchange besides passing it on, from the
@@ -271,11 +235,9 @@ struct Tweaks {
 /// for the other to end. A WebSocket's request body only ends when the
 /// client closes, while its response streams all along.
 fn duplex(
-    req: IncomingRequest,
-    in_body: IncomingBody,
-    next_body: OutgoingBody,
-    fut: wasi::http::types::FutureIncomingResponse,
-    out: ResponseOutparam,
+    req_in: InputStream,
+    req_out: OutputStream,
+    pending: PendingResponse,
     Tweaks {
         upper,
         hold,
@@ -288,14 +250,10 @@ fn duplex(
         }
         c
     };
-    let req_in = in_body.stream().expect("stream");
-    let mut req_out = Some(next_body.write().expect("write"));
-    let mut next_body = Some(next_body);
+    let mut req_out = Some(req_out);
     let mut req_open = true;
-    let mut out = Some(out);
-    // The response from below, once it has arrived, and our own.
-    let mut resp: Option<(IncomingResponse, IncomingBody, OutgoingBody)> = None;
-    let mut resp_streams: Option<(InputStream, OutputStream)> = None;
+    // The response from below and our own, once it has arrived.
+    let mut resp: Option<(InputStream, OutputStream)> = None;
     loop {
         if req_open {
             match req_in.read(64 * 1024) {
@@ -304,8 +262,7 @@ fn duplex(
                         // The layer below is done with the request body
                         // (a refused request); stop relaying it.
                         req_open = false;
-                        drop(req_out.take());
-                        drop(next_body.take());
+                        types::finish(req_out.take().expect("open"));
                     }
                 }
                 Ok(_) => {}
@@ -318,31 +275,22 @@ fn duplex(
                     // The client's body ended: end the one below, so a
                     // peer waiting for it (an echo) can end its response.
                     req_open = false;
-                    drop(req_out.take());
-                    if let Some(b) = next_body.take() {
-                        let _ = OutgoingBody::finish(b, None);
-                    }
+                    types::finish(req_out.take().expect("open"));
                 }
             }
         }
         if resp.is_none()
-            && let Some(r) = fut.get()
+            && let Some(r) = pending.get()
         {
-            let below = r.expect("once").expect("response");
-            let headers = Fields::from_list(&below.headers().entries()).expect("headers");
-            let mine = OutgoingResponse::new(headers);
-            mine.set_status_code(status.unwrap_or(below.status()))
-                .expect("status");
-            let mine_body = mine.body().expect("body");
-            ResponseOutparam::set(out.take().expect("one answer"), Ok(mine));
-            let body = below.consume().expect("consume");
-            let input = body.stream().expect("stream");
-            let output = mine_body.write().expect("write");
-            resp_streams = Some((input, output));
-            resp = Some((below, body, mine_body));
+            let (mut below, body) = r.expect("response");
+            if let Some(s) = status {
+                below.status = s;
+            }
+            let out = respond_streaming(&below);
+            resp = Some((body, out));
         }
         let mut resp_open = resp.is_none();
-        if let Some((input, output)) = &resp_streams {
+        if let Some((input, output)) = &resp {
             match input.read(64 * 1024) {
                 Ok(c) => {
                     resp_open = true;
@@ -356,74 +304,64 @@ fn duplex(
                 Err(StreamError::Closed) => {}
             }
         }
-        if !resp_open && resp_streams.is_some() {
+        if !resp_open && resp.is_some() {
             // The response from below ended: end ours.
-            drop(resp_streams.take());
-            let (below, body, mine_body) = resp.take().expect("response");
-            drop(body);
-            drop(below);
+            let (input, output) = resp.take().expect("response");
+            drop(input);
             if hold {
                 // Keep both bodies open until the client's request body
                 // goes away.
                 while req_open && req_in.blocking_read(64 * 1024).is_ok() {}
-                drop(req_out);
                 drop(req_in);
-                drop(next_body);
-                drop(in_body);
-                drop(req);
-                drop(mine_body);
+                if let Some(o) = req_out.take() {
+                    types::finish(o);
+                }
+                types::finish(output);
                 return;
             }
-            OutgoingBody::finish(mine_body, None).expect("finish");
+            types::finish(output);
             break;
         }
-        let mut wait = Vec::new();
+        let mut wait: Vec<Pollable> = Vec::new();
         if req_open {
             wait.push(req_in.subscribe());
         }
-        match &resp_streams {
+        match &resp {
             Some((input, _)) => wait.push(input.subscribe()),
-            None => wait.push(fut.subscribe()),
+            None => wait.push(pending.subscribe()),
         }
-        let refs: Vec<&wasi::io::poll::Pollable> = wait.iter().collect();
+        let refs: Vec<&Pollable> = wait.iter().collect();
         wasi::io::poll::poll(&refs);
     }
     // Close the request direction too, however far it got.
-    drop(req_out);
     drop(req_in);
-    if let Some(b) = next_body {
-        let _ = OutgoingBody::finish(b, None);
+    if let Some(o) = req_out.take() {
+        types::finish(o);
     }
-    drop(in_body);
-    drop(req);
+    drop(pending);
 }
 
-/// Like `pass`, but full duplex: it streams the request body into `next`
-/// while watching for the response, so a response from below (an inner
-/// layer or the upstream answering early) is relayed at once, abandoning
-/// the rest of the request body.
-fn relay(req: IncomingRequest, out: ResponseOutparam) {
-    let next_req = forward_head(&req);
-    let next_body = next_req.body().expect("body");
-    let in_body = req.consume().expect("consume");
-    let fut = chain::next(next_req).expect("next");
+/// Like `pass`, but it streams the request body into `next` while watching
+/// for the response, so a response from below (an inner layer or the
+/// upstream answering early) is relayed at once, abandoning the rest of
+/// the request body.
+fn relay(req: &RequestHead, body: InputStream) {
+    let (pending, output) = next_streaming(&forward_head(req));
     let mut early = None;
     {
-        let input = in_body.stream().expect("stream");
-        let output = next_body.write().expect("write");
-        let mut pending: Vec<u8> = Vec::new();
+        let mut pending_bytes: Vec<u8> = Vec::new();
         let mut input_open = true;
         loop {
-            if let Some(r) = fut.get() {
+            if let Some(r) = pending.get() {
                 early = Some(r);
                 break;
             }
-            if pending.is_empty() && !input_open {
+            if pending_bytes.is_empty() && !input_open {
                 break;
             }
-            let mut pollables = vec![fut.subscribe()];
-            if pending.is_empty() {
-                pollables.push(input.subscribe());
+            let mut pollables = vec![pending.subscribe()];
+            if pending_bytes.is_empty() {
+                pollables.push(body.subscribe());
             } else {
                 pollables.push(output.subscribe());
             }
@@ -431,9 +369,9 @@ fn relay(req: IncomingRequest, out: ResponseOutparam) {
             wasi::io::poll::poll(&refs);
             drop(refs);
             drop(pollables);
-            if pending.is_empty() {
-                match input.read(64 * 1024) {
-                    Ok(chunk) => pending = chunk,
+            if pending_bytes.is_empty() {
+                match body.read(64 * 1024) {
+                    Ok(chunk) => pending_bytes = chunk,
                     Err(StreamError::Closed) => input_open = false,
                     // The request body broke (the client or an outer layer
                     // gave up): abandon the exchange.
@@ -442,29 +380,28 @@ fn relay(req: IncomingRequest, out: ResponseOutparam) {
             } else {
                 let n = output.check_write().expect("check_write") as usize;
                 if n > 0 {
-                    let k = n.min(pending.len());
-                    output.write(&pending[..k]).expect("write");
-                    pending.drain(..k);
+                    let k = n.min(pending_bytes.len());
+                    output.write(&pending_bytes[..k]).expect("write");
+                    pending_bytes.drain(..k);
                 }
             }
         }
     }
     let resp = if let Some(r) = early {
         // Answered before the body was all sent: abandon the rest.
-        drop(next_body);
-        drop(in_body);
-        drop(req);
-        r.expect("once").expect("response")
+        drop(output);
+        drop(body);
+        drop(pending);
+        r.expect("response")
     } else {
-        OutgoingBody::finish(next_body, None).expect("finish");
-        drop(in_body);
-        drop(req);
-        await_response(fut)
+        types::finish(output);
+        drop(body);
+        await_response(pending)
     };
-    answer_with(resp, out, false);
+    answer_with(resp, false);
 }
 
-fn call_capability(req: &IncomingRequest) -> String {
+fn call_capability(req: &RequestHead) -> String {
     match header(req, "x-cap").as_deref().unwrap_or("") {
         "current" => {
             let info = flow::current();
@@ -497,25 +434,34 @@ fn call_capability(req: &IncomingRequest) -> String {
         ),
         "endpoint" => {
             let path = header(req, "x-cap-path").unwrap_or_else(|| "/score?q=1".to_owned());
-            let r = OutgoingRequest::new(Fields::new());
-            r.set_path_with_query(Some(&path)).expect("path");
-            match endpoints::call("monitor", r) {
-                Ok(fut) => {
-                    let resp = await_response(fut);
-                    let status = resp.status();
-                    let body = read_all(resp.consume().expect("consume"));
-                    drop(resp);
-                    format!("{status} {}", String::from_utf8_lossy(&body))
+            let r = RequestHead {
+                method: "GET".to_owned(),
+                scheme: None,
+                authority: None,
+                path_with_query: path,
+                headers: Vec::new(),
+            };
+            match endpoints::call("monitor", &r, Body::Empty) {
+                Ok((pending, _)) => {
+                    let (below, body) = await_response(pending);
+                    let bytes = read_all(&body);
+                    format!("{} {}", below.status, String::from_utf8_lossy(&bytes))
                 }
                 Err(e) => format!("error {e:?}"),
             }
         }
         "unknown-endpoint" => {
-            let r = OutgoingRequest::new(Fields::new());
-            match endpoints::call("nope", r) {
-                Ok(fut) => {
-                    fut.subscribe().block();
-                    match fut.get().expect("ready").expect("once") {
+            let r = RequestHead {
+                method: "GET".to_owned(),
+                scheme: None,
+                authority: None,
+                path_with_query: "/".to_owned(),
+                headers: Vec::new(),
+            };
+            match endpoints::call("nope", &r, Body::Empty) {
+                Ok((pending, _)) => {
+                    pending.subscribe().block();
+                    match pending.get().expect("ready") {
                         Ok(_) => "ok".to_owned(),
                         Err(e) => format!("error {e:?}"),
                     }
@@ -528,118 +474,94 @@ fn call_capability(req: &IncomingRequest) -> String {
 }
 
 impl Handler for Layer {
-    fn handle(req: IncomingRequest, out: ResponseOutparam) {
+    fn handle(req: RequestHead, body: InputStream) {
         let n = EXCHANGES.fetch_add(1, Ordering::Relaxed) + 1;
         let test = test_for(&req);
         if let Some(n) = test.strip_prefix("fields:") {
-            // Build a `fields` holding one value of `n` bytes, then answer.
-            // Past the host's cap on a `fields` this traps instead.
+            // Answer with a head holding one value of `n` bytes. Past the
+            // host's cap on a head this traps instead.
             let n: usize = n.parse().expect("size");
-            let f = Fields::new();
-            f.append("x-big", &vec![b'a'; n]).expect("append");
-            respond(out, 200, b"fields ok");
-            drop(f);
+            let big = head(200, vec![("x-big".to_owned(), vec![b'a'; n])]);
+            let out = chain::respond(&big, Body::Bytes(b"fields ok".to_vec()));
+            assert!(out.is_none());
             return;
         }
         if let Some(n) = test.strip_prefix("log:") {
             // Log one message of `n` bytes, then answer.
             let n: usize = n.parse().expect("size");
             flow::log(flow::LogLevel::Info, &"m".repeat(n));
-            respond(out, 200, b"logged");
+            respond(200, b"logged");
             return;
         }
         if let Some(n) = test.strip_prefix("record:") {
             // Record one document of about `n` bytes, then answer.
             let n: usize = n.parse().expect("size");
             flow::record("big", &format!("{{\"s\":\"{}\"}}", "r".repeat(n)));
-            respond(out, 200, b"recorded");
+            respond(200, b"recorded");
             return;
         }
         if let Some(n) = test.strip_prefix("hoard:") {
             // Hold `n` host resources at once, then answer. Past the host's
             // per-instance cap this traps instead of answering.
             let n: usize = n.parse().expect("count");
-            let held: Vec<Fields> = (0..n).map(|_| Fields::new()).collect();
-            respond(out, 200, b"hoarded");
+            let held: Vec<Pollable> = (0..n)
+                .map(|_| wasi::clocks::monotonic_clock::subscribe_duration(1_000_000_000))
+                .collect();
+            respond(200, b"hoarded");
             drop(held);
             return;
         }
         match test.as_str() {
-            "pass" => pass(req, out, false),
-            "relay" => relay(req, out),
-            "buffer" => pass(req, out, true),
-            "deny" => respond(out, 403, b"denied by layer"),
+            "pass" => pass(&req, body, false),
+            "relay" => relay(&req, body),
+            "buffer" => pass(&req, body, true),
+            "deny" => respond(403, b"denied by layer"),
             "answer" => {
                 let who = name().unwrap_or_default();
-                respond(out, 200, format!("answered by {who}").as_bytes());
+                respond(200, format!("answered by {who}").as_bytes());
             }
             "read-then-answer" => {
                 // Answer after `x-read-bytes` of the body, without `next`.
                 let n = read_bytes(&req);
-                let body = req.consume().expect("consume");
-                let got = {
-                    let input = body.stream().expect("stream");
-                    read_at_least(&input, n)
-                };
+                let got = read_at_least(&body, n);
                 let who = name().unwrap_or_default();
                 respond(
-                    out,
                     200,
                     format!("answered by {who} after {} bytes", got.len()).as_bytes(),
                 );
-                drop(body);
             }
             "next-then-answer" => {
                 // Pass the request on, stream `x-read-bytes` of its body
                 // into `next`, then abandon it and answer locally.
                 let n = read_bytes(&req);
-                let next_req = forward_head(&req);
-                let next_body = next_req.body().expect("body");
-                let in_body = req.consume().expect("consume");
-                let fut = chain::next(next_req).expect("next");
-                let sent = {
-                    let input = in_body.stream().expect("stream");
-                    let output = next_body.write().expect("write");
-                    let got = read_at_least(&input, n);
-                    write_all(&output, &got);
-                    got.len()
-                };
-                drop(fut);
-                drop(next_body);
+                let (pending, output) = next_streaming(&forward_head(&req));
+                let got = read_at_least(&body, n);
+                write_all(&output, &got);
+                drop(pending);
+                drop(output);
                 let who = name().unwrap_or_default();
                 respond(
-                    out,
                     200,
-                    format!("answered by {who} after forwarding {sent} bytes").as_bytes(),
+                    format!("answered by {who} after forwarding {} bytes", got.len()).as_bytes(),
                 );
-                drop(in_body);
             }
             "cut-then-await" => {
                 // Stream `x-read-bytes` of the body into `next`, leave it
                 // unfinished while still waiting on the response, then
                 // answer whatever `next` gives back.
                 let n = read_bytes(&req);
-                let next_req = forward_head(&req);
-                let next_body = next_req.body().expect("body");
-                let in_body = req.consume().expect("consume");
-                let fut = chain::next(next_req).expect("next");
-                {
-                    let input = in_body.stream().expect("stream");
-                    let output = next_body.write().expect("write");
-                    write_all(&output, &read_at_least(&input, n));
+                let (pending, output) = next_streaming(&forward_head(&req));
+                write_all(&output, &read_at_least(&body, n));
+                drop(output);
+                match PendingResponse::wait(pending) {
+                    Ok(resp) => answer_with(resp, false),
+                    Err(_) => respond(200, b"answered after next failed"),
                 }
-                drop(next_body);
-                fut.subscribe().block();
-                match fut.get().expect("ready").expect("once") {
-                    Ok(resp) => answer_with(resp, out, false),
-                    Err(_) => respond(out, 200, b"answered after next failed"),
-                }
-                drop(in_body);
             }
-            "count" => respond(out, 200, n.to_string().as_bytes()),
+            "count" => respond(200, n.to_string().as_bytes()),
             "caps" => {
-                let body = call_capability(&req);
-                respond(out, 200, body.as_bytes());
+                let answer = call_capability(&req);
+                respond(200, answer.as_bytes());
             }
             "loop" => {
                 let mut i: u64 = 0;
@@ -663,41 +585,26 @@ impl Handler for Layer {
                 unsafe {
                     HELD.push(vec![1u8; 8 << 20]);
                 }
-                respond(out, 200, b"grown");
+                respond(200, b"grown");
             }
             "next-twice" => {
-                let first = chain::next(forward_head(&req)).expect("next");
-                let _second = chain::next(forward_head(&req));
+                let first = chain::next(&forward_head(&req), Body::Empty).expect("next");
+                let _second = chain::next(&forward_head(&req), Body::Empty);
                 drop(first);
-                respond(out, 200, b"unreachable");
+                respond(200, b"unreachable");
             }
             "trap" => panic!("layer panics"),
-            "no-response" => drop(out),
-            "error-response" => ResponseOutparam::set(
-                out,
-                Err(wasi::http::types::ErrorCode::InternalError(Some(
-                    "layer says no".to_owned(),
-                ))),
-            ),
+            "no-response" => {}
             "leak" => {
                 // Answer, write part of the body, and return without
                 // finishing it.
-                let resp = OutgoingResponse::new(Fields::new());
-                let body = resp.body().expect("body");
-                ResponseOutparam::set(out, Ok(resp));
-                let stream = body.write().expect("write");
-                write_all(&stream, b"partial");
-                std::mem::forget(stream);
-                std::mem::forget(body);
+                let out = respond_streaming(&head(200, Vec::new()));
+                write_all(&out, b"partial");
+                std::mem::forget(out);
             }
             "trap-after-head" => {
-                let resp = OutgoingResponse::new(Fields::new());
-                let body = resp.body().expect("body");
-                ResponseOutparam::set(out, Ok(resp));
-                {
-                    let stream = body.write().expect("write");
-                    write_all(&stream, b"partial");
-                }
+                let out = respond_streaming(&head(200, Vec::new()));
+                write_all(&out, b"partial");
                 // `x-delay-ms` holds the cut back so the head lands first.
                 hold(&req, "delay");
                 panic!("layer panics mid-body");
@@ -709,13 +616,8 @@ impl Handler for Layer {
                 let len: usize = header(&req, "x-tag-len")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(2);
-                let resp = OutgoingResponse::new(Fields::new());
-                let body = resp.body().expect("body");
-                ResponseOutparam::set(out, Ok(resp));
-                {
-                    let stream = body.write().expect("write");
-                    write_all(&stream, b"partial");
-                }
+                let out = respond_streaming(&head(200, Vec::new()));
+                write_all(&out, b"partial");
                 let mut i: u64 = 0;
                 loop {
                     flow::add_tag(&format!("{i:0>len$}"));
@@ -723,41 +625,59 @@ impl Handler for Layer {
                 }
             }
             "trap-after-finish" => {
-                respond(out, 200, b"complete");
+                respond(200, b"complete");
                 panic!("layer panics after its response");
+            }
+            "endpoint-bad-path" => {
+                // A refused path is an error the layer recovers from; the
+                // body it handed the call is spent either way.
+                let r = RequestHead {
+                    method: "GET".to_owned(),
+                    scheme: None,
+                    authority: None,
+                    path_with_query: "/a b".to_owned(),
+                    headers: Vec::new(),
+                };
+                match endpoints::call("monitor", &r, Body::Passthrough(body)) {
+                    Err(types::Error::RequestUriInvalid) => respond(200, b"recovered"),
+                    Err(e) => respond(500, format!("{e:?}").as_bytes()),
+                    Ok(_) => respond(500, b"accepted a bad path"),
+                }
+            }
+            "big-bytes" => {
+                // A whole body past what the host holds for a guest.
+                let n: usize = header(&req, "x-bytes")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(2 << 20);
+                drop(body);
+                respond(200, &vec![b'b'; n]);
             }
             "rewrite" => {
                 // Pass a new request (to another path, with a new body).
-                let r = forward_head(&req);
-                r.set_path_with_query(Some("/rewritten")).expect("path");
-                let b = r.body().expect("body");
-                let fut = chain::next(r).expect("next");
-                {
-                    // The rules may refuse the request at its head and drop
-                    // its body before it is written: not an error here.
-                    let s = b.write().expect("write");
-                    let _ = s.blocking_write_and_flush(b"replaced");
-                }
-                let _ = OutgoingBody::finish(b, None);
-                drop(req);
-                answer_with(await_response(fut), out, false);
+                let mut r = forward_head(&req);
+                r.path_with_query = "/rewritten".to_owned();
+                let (pending, out) = next_streaming(&r);
+                // The rules may refuse the request at its head and drop
+                // its body before it is written: not an error here.
+                let _ = out.blocking_write_and_flush(b"replaced");
+                types::finish(out);
+                drop(body);
+                answer_with(await_response(pending), false);
             }
             "elsewhere-then-metric" => {
                 // Send the request (bodiless) to `x-to`'s host, wait for the
                 // response, then answer with this flow's `requests` metric
                 // as `metric-get` sees it.
-                let r = forward_head(&req);
-                let to = header(&req, "x-to").expect("x-to");
-                r.set_authority(Some(&to)).expect("authority");
-                let b = r.body().expect("body");
-                let fut = chain::next(r).expect("next");
-                OutgoingBody::finish(b, None).expect("finish");
-                drop(req);
-                let resp = await_response(fut);
-                drop(read_all(resp.consume().expect("consume")));
-                drop(resp);
+                let mut r = forward_head(&req);
+                r.authority = Some(header(&req, "x-to").expect("x-to"));
+                let (pending, out) = chain::next(&r, Body::Empty).expect("next");
+                assert!(out.is_none());
+                drop(body);
+                let (_, below) = await_response(pending);
+                drop(read_all(&below));
+                drop(below);
                 let got = flow::metric_get("by_host", &[]);
-                respond(out, 200, format!("{got:?}").as_bytes());
+                respond(200, format!("{got:?}").as_bytes());
             }
             "probe" => {
                 // Report how much of each body reached this layer:
@@ -765,8 +685,8 @@ impl Handler for Layer {
                 // on the response, and (with `x-probe-record`) a `probe`
                 // record with both.
                 let record = header(&req, "x-probe-record").is_some();
-                let in_body = req.consume().expect("consume");
-                let request = read_all(in_body);
+                let request = read_all(&body);
+                drop(body);
                 let saw_request = request.len();
                 let r = forward_head_with(
                     &req,
@@ -775,91 +695,54 @@ impl Handler for Layer {
                         saw_request.to_string().into_bytes(),
                     )],
                 );
-                let b = r.body().expect("body");
-                let fut = chain::next(r).expect("next");
-                {
-                    let s = b.write().expect("write");
-                    write_all(&s, &request);
-                }
-                OutgoingBody::finish(b, None).expect("finish");
-                drop(req);
-                let resp = await_response(fut);
-                let body = read_all(resp.consume().expect("consume"));
-                let mut entries = resp.headers().entries();
-                entries.push((
+                let (pending, out) = chain::next(&r, Body::Bytes(request)).expect("next");
+                assert!(out.is_none());
+                let (mut below, below_body) = await_response(pending);
+                let bytes = read_all(&below_body);
+                drop(below_body);
+                below.headers.push((
                     "x-saw-response".to_owned(),
-                    body.len().to_string().into_bytes(),
+                    bytes.len().to_string().into_bytes(),
                 ));
                 if record {
                     flow::record(
                         "probe",
-                        &format!("{{\"request\":{saw_request},\"response\":{}}}", body.len()),
+                        &format!("{{\"request\":{saw_request},\"response\":{}}}", bytes.len()),
                     );
                 }
-                let mine = OutgoingResponse::new(Fields::from_list(&entries).expect("headers"));
-                mine.set_status_code(resp.status()).expect("status");
-                drop(resp);
-                let mine_body = mine.body().expect("body");
-                ResponseOutparam::set(out, Ok(mine));
-                {
-                    let stream = mine_body.write().expect("write");
-                    write_all(&stream, &body);
-                }
-                OutgoingBody::finish(mine_body, None).expect("finish");
+                let out = chain::respond(&below, Body::Bytes(bytes));
+                assert!(out.is_none());
             }
             "inject-request" => {
                 // Pass the head on with a body of this layer's own.
-                let r = forward_head(&req);
-                let b = r.body().expect("body");
-                let fut = chain::next(r).expect("next");
-                {
-                    let s = b.write().expect("write");
-                    let _ = s.blocking_write_and_flush(b"injected");
-                }
-                let _ = OutgoingBody::finish(b, None);
-                drop(req);
-                answer_with(await_response(fut), out, false);
+                let (pending, out) = next_streaming(&forward_head(&req));
+                let _ = out.blocking_write_and_flush(b"injected");
+                types::finish(out);
+                drop(body);
+                answer_with(await_response(pending), false);
             }
             "inject-response" => {
                 // Pass the request on, then answer with the response's head
                 // over a body of this layer's own.
-                let r = forward_head(&req);
-                let b = r.body().expect("body");
-                let in_body = req.consume().expect("consume");
-                let fut = chain::next(r).expect("next");
-                {
-                    let input = in_body.stream().expect("stream");
-                    let output = b.write().expect("write");
-                    pump(&input, &output, false);
-                }
-                OutgoingBody::finish(b, None).expect("finish");
-                drop(in_body);
-                drop(req);
-                let resp = await_response(fut);
-                let mine = OutgoingResponse::new(
-                    Fields::from_list(&resp.headers().entries()).expect("headers"),
-                );
-                mine.set_status_code(resp.status()).expect("status");
-                drop(read_all(resp.consume().expect("consume")));
-                drop(resp);
-                let mine_body = mine.body().expect("body");
-                ResponseOutparam::set(out, Ok(mine));
-                {
-                    let stream = mine_body.write().expect("write");
-                    write_all(&stream, b"injected");
-                }
-                OutgoingBody::finish(mine_body, None).expect("finish");
+                let (pending, out) = next_streaming(&forward_head(&req));
+                pump(&body, &out, false);
+                types::finish(out);
+                drop(body);
+                let (below, below_body) = await_response(pending);
+                drop(read_all(&below_body));
+                drop(below_body);
+                let out = respond_streaming(&below);
+                write_all(&out, b"injected");
+                types::finish(out);
             }
             "invalid-next" => {
-                let r = forward_head(&req);
-                // wasi-http validates most of the head in its setters;
-                // a scheme roxy does not speak gets through to `next`.
-                r.set_scheme(Some(&wasi::http::types::Scheme::Other("ftp".to_owned())))
-                    .expect("scheme");
-                let _ = chain::next(r);
-                respond(out, 200, b"unreachable");
+                // A scheme roxy does not speak: the host refuses the head.
+                let mut r = forward_head(&req);
+                r.scheme = Some("ftp".to_owned());
+                let _ = chain::next(&r, Body::Empty);
+                respond(200, b"unreachable");
             }
-            other => respond(out, 400, format!("unknown test {other:?}").as_bytes()),
+            other => respond(400, format!("unknown test {other:?}").as_bytes()),
         }
     }
 }

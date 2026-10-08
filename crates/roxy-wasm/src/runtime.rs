@@ -1,7 +1,7 @@
 //! The engine, loaded layers, their instance pools and the exchange
 //! driver.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
@@ -10,17 +10,18 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, timeout, timeout_at};
 use wasmtime::component::{Component, InstancePre, Linker, Resource};
 use wasmtime::{Config, Engine, Store, StoreContextMut};
-use wasmtime_wasi_http::p2::bindings::http::types::Scheme as WasiScheme;
-use wasmtime_wasi_http::{FieldMapError, WasiHttpView};
+use wasmtime_wasi::p2::DynInputStream;
 
-use crate::bindings::exports::roxy::addon::init;
-use crate::bindings::exports::wasi::http::incoming_handler;
-use crate::bindings::roxy::addon::{chain, endpoints, flow};
+use crate::bindings::exports::roxy::addon::{handler, init};
+use crate::bindings::roxy::addon::types::RequestHead;
+use crate::bindings::roxy::addon::{chain, endpoints, flow, types};
 use crate::config::{LayerConfig, LayerLimits};
 use crate::error::{Budget, LayerError, LoadError};
-use crate::exchange::{CancelGuard, Dir, ExchangeShared, FromGuest, IntoGuest};
+use crate::exchange::{CancelGuard, ExchangeShared, FromGuest};
+use crate::head;
 use crate::host::{LayerHost, LayerRequest, LayerResponse};
 use crate::state::{ExchangeCtx, LayerShared, StoreState};
+use crate::streams::Streams;
 
 /// Epoch tick: a running guest yields to the async runtime once per tick,
 /// so a busy layer cannot hog a worker thread, and cancelling its exchange
@@ -80,20 +81,18 @@ impl WasmRuntime {
     fn linker(&self) -> Result<Linker<StoreState>, String> {
         type Me = wasmtime::component::HasSelf<StoreState>;
         let mut linker = Linker::new(&self.engine);
-        // All of WASI 0.2 except the outbound HTTP client, inert (see
-        // `StoreState::new`), so stock toolchain output links.
+        // All of WASI 0.2 (no HTTP), inert (see `StoreState::new`), so
+        // stock toolchain output links.
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(|e| e.to_string())?;
-        let options = wasmtime_wasi_http::p2::bindings::LinkOptions::default();
-        wasmtime_wasi_http::p2::bindings::http::types::add_to_linker::<
-            _,
-            wasmtime_wasi_http::WasiHttp,
-        >(&mut linker, &options.into(), StoreState::http)
-        .map_err(|e| e.to_string())?;
         // Every roxy:addon import is linked whatever the grants; a call
         // without its capability traps.
-        chain::add_to_linker::<_, Me>(&mut linker, |s| s).map_err(|e| e.to_string())?;
-        endpoints::add_to_linker::<_, Me>(&mut linker, |s| s).map_err(|e| e.to_string())?;
-        flow::add_to_linker::<_, Me>(&mut linker, |s| s).map_err(|e| e.to_string())?;
+        types::add_to_linker::<_, Me>(&mut linker, StoreState::called)
+            .map_err(|e| e.to_string())?;
+        chain::add_to_linker::<_, Me>(&mut linker, StoreState::called)
+            .map_err(|e| e.to_string())?;
+        endpoints::add_to_linker::<_, Me>(&mut linker, StoreState::called)
+            .map_err(|e| e.to_string())?;
+        flow::add_to_linker::<_, Me>(&mut linker, StoreState::called).map_err(|e| e.to_string())?;
         Ok(linker)
     }
 }
@@ -101,7 +100,7 @@ impl WasmRuntime {
 /// One live instance of a layer.
 struct Instance {
     store: Store<StoreState>,
-    handler: incoming_handler::Guest,
+    handler: handler::Guest,
     exchanges: u64,
 }
 
@@ -109,10 +108,13 @@ struct LayerInner {
     runtime: WasmRuntime,
     shared: Arc<LayerShared>,
     pre: InstancePre<StoreState>,
-    handler: incoming_handler::GuestIndices,
+    handler: handler::GuestIndices,
     init: init::GuestIndices,
     idle: Mutex<Vec<Instance>>,
     slots: Arc<Semaphore>,
+    /// Calls from the guest into the host (every import, resource drops
+    /// included), across every instance: what the interface shape costs.
+    host_calls: Arc<AtomicU64>,
 }
 
 impl LayerInner {
@@ -155,12 +157,6 @@ impl std::fmt::Debug for Layer {
 fn classify(err: &wasmtime::Error) -> LayerError {
     if let Some(e) = err.downcast_ref::<LayerError>() {
         return e.clone();
-    }
-    // wasi-http traps a `fields` that would grow past the size limit.
-    if let Some(FieldMapError::TotalSizeTooBig | FieldMapError::TooManyFields) =
-        err.downcast_ref::<FieldMapError>()
-    {
-        return LayerError::BudgetExceeded(Budget::Fields);
     }
     LayerError::Trap(format!("{err:#}"))
 }
@@ -219,7 +215,7 @@ impl Layer {
             layer: layer.clone(),
             message: format!("{e:#}"),
         };
-        let handler = incoming_handler::GuestIndices::new(&pre).map_err(missing)?;
+        let handler = handler::GuestIndices::new(&pre).map_err(missing)?;
         let init = init::GuestIndices::new(&pre).map_err(missing)?;
 
         let max_instances = config.limits.max_instances;
@@ -231,6 +227,7 @@ impl Layer {
             init,
             idle: Mutex::new(Vec::new()),
             slots: Arc::new(Semaphore::new(max_instances)),
+            host_calls: Arc::new(AtomicU64::new(0)),
         });
         let layer = Layer { inner };
         let deadline = Instant::now() + layer.inner.shared.config.limits.first_byte_timeout;
@@ -260,9 +257,18 @@ impl Layer {
         self.inner.idle().len()
     }
 
+    /// Calls the layer's guests have made into the host so far: every
+    /// import, resource drops included. The cost of the interface shape.
+    pub fn host_calls(&self) -> u64 {
+        self.inner.host_calls.load(Ordering::Relaxed)
+    }
+
     async fn instantiate(&self, deadline: Instant) -> Result<Instance, LayerError> {
         let inner = &self.inner;
-        let mut store = Store::new(&inner.runtime.engine, StoreState::new(inner.shared.clone()));
+        let mut store = Store::new(
+            &inner.runtime.engine,
+            StoreState::new(inner.shared.clone(), inner.host_calls.clone()),
+        );
         store.limiter(|s| &mut s.limiter);
         store.epoch_deadline_callback(epoch_yield);
         store.set_epoch_deadline(1);
@@ -278,7 +284,6 @@ impl Layer {
                         | LayerError::OutsideExchange(_)
                         | LayerError::InvalidRequest(_)
                         | LayerError::NoResponse
-                        | LayerError::ErrorResponse(_)
                         | LayerError::InvalidResponse(_)
                         | LayerError::Host(_)
                         | LayerError::Init(_)
@@ -399,35 +404,30 @@ impl Layer {
         let authority = req
             .uri()
             .authority()
-            .map(ToString::to_string)
+            .cloned()
             .ok_or_else(|| LayerError::InvalidRequest("request URI has no authority".into()))?;
-        let wasi_scheme = match scheme.as_str() {
-            "http" => WasiScheme::Http,
-            "https" => WasiScheme::Https,
-            other => WasiScheme::Other(other.to_owned()),
-        };
 
         let (mut instance, permit, started) = self.checkout(wait).await?;
         let shared = ExchangeShared::new(host.clone());
         let (tx, mut rx) = oneshot::channel();
-        let (req_res, out_res) = {
+        let (parts, body) = req.into_parts();
+        let head = head::request_into_guest(&parts);
+        let body_res = {
             let data = instance.store.data_mut();
+            let mut streams = Streams::default();
+            let body_res = streams
+                .input(&mut data.table, body)
+                .map_err(|e| LayerError::Instantiate(format!("{e:#}")))?;
             data.exchange = Some(ExchangeCtx {
                 host,
                 shared: shared.clone(),
                 next_called: false,
                 scheme,
                 authority,
+                answer: Some(tx),
+                streams,
             });
-            let req = req.map(|b| IntoGuest::new(b, Dir::Request));
-            let mut http = data.http();
-            let req_res = http
-                .new_incoming_request(wasi_scheme, req)
-                .map_err(|e| LayerError::InvalidRequest(format!("{e:#}")))?;
-            let out_res = http
-                .new_response_outparam(tx)
-                .map_err(|e| LayerError::Instantiate(format!("{e:#}")))?;
-            (req_res, out_res)
+            body_res
         };
 
         let run = ExchangeRun {
@@ -436,7 +436,7 @@ impl Layer {
             instance: Some(instance),
             _permit: permit,
         };
-        let driver = tokio::spawn(run.drive(req_res, out_res));
+        let driver = tokio::spawn(run.drive(head, body_res));
         let cancel = Arc::new(CancelGuard {
             abort: driver.abort_handle(),
             shared: shared.clone(),
@@ -453,8 +453,8 @@ impl Layer {
             answer = &mut rx => answer,
             outcome = settled => match outcome {
                 Err(e) => return Err(e),
-                // The handler returned cleanly, so whatever it set is in
-                // the channel (or the sender went with the outparam).
+                // The handler returned cleanly, so whatever it answered is
+                // in the channel (or the sender went with the exchange).
                 Ok(()) => rx.await,
             },
             () = head_clock => {
@@ -469,19 +469,14 @@ impl Layer {
             }
         };
         match answer {
-            Ok(Ok(resp)) => {
+            Ok(resp) => {
                 let outcome = shared.outcome();
                 let mut resp = resp.map(|b| FromGuest::response(b, shared.clone(), cancel));
                 resp.extensions_mut().insert(outcome);
                 Ok(resp)
             }
-            Ok(Err(code)) => {
-                let err = LayerError::ErrorResponse(format!("{code:?}"));
-                shared.fail(err.clone());
-                Err(err)
-            }
-            // The outparam was dropped: the handler returned without a
-            // response, or the instance was torn down.
+            // The sender was dropped: the handler returned without
+            // answering, or the instance was torn down.
             Err(_) => Err(shared
                 .wait_settled()
                 .await
@@ -543,14 +538,12 @@ impl ExchangeRun {
         }
     }
 
-    async fn drive(
-        mut self,
-        req: Resource<wasmtime_wasi_http::p2::types::HostIncomingRequest>,
-        out: Resource<wasmtime_wasi_http::p2::types::HostResponseOutparam>,
-    ) {
+    async fn drive(mut self, head: RequestHead, body: Resource<DynInputStream>) {
         let failure = self.shared.wait_failure();
         let instance = self.instance.as_mut().expect("instance present");
-        let call = instance.handler.call_handle(&mut instance.store, req, out);
+        let call = instance
+            .handler
+            .call_handle(&mut instance.store, &head, body);
         let result = tokio::select! {
             biased;
             err = failure => Err(err),
