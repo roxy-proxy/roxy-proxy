@@ -231,9 +231,10 @@ async fn a_failed_connection_counts_until_its_streams_end() {
     assert!(fresh.link.get().is_none(), "a new connection");
 }
 
-/// Streams spread across the pool's connections: each opens a new one
-/// while the pool has room for it, then the one with the fewest streams
-/// takes the next, and a full connection is passed over for one with room.
+/// Concurrent streams spread across the pool's connections: a stream
+/// opens a new one while the pool has room and none is idle, then the one
+/// with the fewest streams takes the next, and a full connection is passed
+/// over for one with room.
 #[tokio::test]
 async fn streams_spread_across_connections() {
     let pool = Arc::new(Pool {
