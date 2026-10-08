@@ -2935,8 +2935,9 @@ dependencies = [
 
 [[package]]
 name = "roxy-addon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "roxy-http",
  "wit-bindgen 0.62.0",
 ]
 
@@ -3112,7 +3113,6 @@ dependencies = [
  "tracing",
  "wasmtime",
  "wasmtime-wasi",
- "wasmtime-wasi-http",
 ]
 
 [[package]]
@@ -4410,27 +4410,6 @@ dependencies = [
  "wasmtime-wasi-io",
  "windows-sys 0.61.2",
  "winx",
-]
-
-[[package]]
-name = "wasmtime-wasi-http"
-version = "49.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f4cd327c70de1309b0c04d49df3633a2ffeae9b29b526d421320b565e198175"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "pin-project-lite",
- "tokio",
- "tracing",
- "wasmtime",
- "wasmtime-wasi",
- "wasmtime-wasi-io",
 ]
 
 [[package]]

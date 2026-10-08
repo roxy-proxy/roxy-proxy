@@ -631,7 +631,6 @@ fn error_kind(e: &StackError) -> String {
         LayerError::OutsideExchange(_) => "outside_exchange".into(),
         LayerError::InvalidRequest(_) => "invalid_request".into(),
         LayerError::NoResponse => "no_response".into(),
-        LayerError::ErrorResponse(_) => "error_response".into(),
         LayerError::InvalidResponse(_) => "invalid_response".into(),
         LayerError::Host(_) => "host".into(),
         LayerError::Init(_) => "init".into(),
@@ -1137,7 +1136,7 @@ mod tests {
         let errs = kit.events("layer_error", 1).await;
         assert_eq!(
             errs[0]["message"],
-            format!("layer passed an invalid request to `next`: header x-token: {REDACTED}")
+            format!("layer passed an invalid request: header x-token: {REDACTED}")
         );
     }
 

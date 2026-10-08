@@ -1,7 +1,7 @@
 //! Streaming bodies with size caps.
 
 use std::fmt;
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
@@ -125,7 +125,17 @@ impl Body {
     /// A channel-backed body. The sender enforces `max_bytes` and (if given)
     /// `known_length`. At most [`CHANNEL_DEPTH`] frames are in flight.
     pub fn channel(max_bytes: u64, known_length: Option<u64>) -> (BodySender, Body) {
-        let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
+        Self::channel_with_depth(CHANNEL_DEPTH, max_bytes, known_length)
+    }
+
+    /// [`Body::channel`] with at most `depth` frames in flight before the
+    /// sender waits (a producer whose buffering must stay small).
+    pub fn channel_with_depth(
+        depth: usize,
+        max_bytes: u64,
+        known_length: Option<u64>,
+    ) -> (BodySender, Body) {
+        let (tx, rx) = mpsc::channel(depth);
         (
             BodySender {
                 tx,
@@ -340,8 +350,9 @@ impl Body {
     }
 
     /// `first` then the rest of `self`, which has already yielded `taken`
-    /// data bytes.
-    fn prefixed(self, first: Option<Frame<Bytes>>, taken: u64) -> Body {
+    /// data bytes (so the known length, if any, shrinks by `taken`).
+    #[must_use]
+    pub fn prefixed(self, first: Option<Frame<Bytes>>, taken: u64) -> Body {
         let known_length = self.known_length.map(|k| k.saturating_sub(taken));
         Body {
             inner: Inner::Prefixed(Box::new(Prefixed { first, rest: self })),
@@ -515,6 +526,20 @@ impl BodySender {
     /// Waits until the consumer has dropped the body. Cancel-safe.
     pub async fn closed(&self) {
         self.tx.closed().await;
+    }
+
+    /// Frames that can be pushed right now without blocking.
+    pub fn capacity(&self) -> usize {
+        self.tx.capacity()
+    }
+
+    /// Resolves once a frame can be pushed, or the consumer is gone. Borrows
+    /// nothing, so it can be awaited while the sender is held elsewhere.
+    pub fn ready_shared(&self) -> impl Future<Output = ()> + Send + 'static {
+        let tx = self.tx.clone();
+        async move {
+            let _ = tx.reserve_owned().await;
+        }
     }
 
     /// Waits until a frame can be pushed without blocking. Cancel-safe.
