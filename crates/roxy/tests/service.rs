@@ -664,6 +664,9 @@ fn addon(name: &str, url: &str, extra: &str) -> String {
     )
 }
 
+/// A pool of one connection, for tests of streams sharing a connection.
+const ONE_CONNECTION: &str = "    limits: { max_connections: 1 }\n";
+
 /// roxy with one service layer `s` at `path` on the in-test service.
 async fn start(path: &str, extra: &str, rules: &str) -> (Harness, Arc<SvcState>) {
     let (addr, st) = start_service().await;
@@ -903,10 +906,11 @@ async fn observe_mode_cannot_block() {
     }
 }
 
-/// Concurrent exchanges share one connection, as separate streams.
+/// Concurrent exchanges on a pool of one connection are separate streams
+/// on it.
 #[tokio::test(flavor = "multi_thread")]
 async fn exchanges_share_a_connection() {
-    let (h, st) = start("/echo", "", ALLOW_UPSTREAM).await;
+    let (h, st) = start("/echo", ONE_CONNECTION, ALLOW_UPSTREAM).await;
     let c = h.client();
     let reqs = (0..8).map(|i| {
         let c = c.clone();
@@ -960,13 +964,17 @@ async fn the_pool_grows_to_its_cap_then_waits() {
     h.stop().await;
 }
 
-/// Two layers using the same endpoint in one flow: one connection, two
-/// streams, told apart by (flow, layer).
+/// Two layers using the same endpoint in one flow: two streams, told
+/// apart by (flow, layer), on one connection when the pool has one.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_layers_on_one_endpoint_get_separate_streams() {
     let (addr, st) = start_service().await;
     let url = format!("http://{addr}/echo");
-    let addons = format!("addons:\n{}{}", addon("s", &url, ""), addon("t", &url, ""));
+    let addons = format!(
+        "addons:\n{}{}",
+        addon("s", &url, ONE_CONNECTION),
+        addon("t", &url, ONE_CONNECTION)
+    );
     let h = Harness::start_with(Opts {
         rules: ALLOW_UPSTREAM,
         extra: &addons,
@@ -1002,7 +1010,7 @@ async fn two_layers_on_one_endpoint_get_separate_streams() {
 /// others on the connection carry on, and the connection stays.
 #[tokio::test(flavor = "multi_thread")]
 async fn one_streams_failure_leaves_the_others() {
-    let (h, st) = start("/mixed", "", ALLOW_UPSTREAM).await;
+    let (h, st) = start("/mixed", ONE_CONNECTION, ALLOW_UPSTREAM).await;
     let c = h.client();
     let held = tokio::spawn({
         let c = c.clone();
@@ -1034,7 +1042,7 @@ async fn one_streams_failure_leaves_the_others() {
 /// exchange gets a new connection.
 #[tokio::test(flavor = "multi_thread")]
 async fn losing_the_connection_fails_its_exchanges() {
-    let (h, st) = start("/mixed", "", ALLOW_UPSTREAM).await;
+    let (h, st) = start("/mixed", ONE_CONNECTION, ALLOW_UPSTREAM).await;
     let c = h.client();
     let held = tokio::spawn({
         let c = c.clone();
@@ -1059,7 +1067,7 @@ async fn losing_the_connection_fails_its_exchanges() {
 /// A client that gives up resets its stream, not the connection.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_that_gives_up_resets_its_stream() {
-    let (h, st) = start("/mixed", "", ALLOW_UPSTREAM).await;
+    let (h, st) = start("/mixed", ONE_CONNECTION, ALLOW_UPSTREAM).await;
     let c = h.client();
     let url = h.https_url("/hang");
     let gives_up = tokio::spawn(async move { c.get(url).send().await });
@@ -1079,7 +1087,7 @@ async fn a_client_that_gives_up_resets_its_stream() {
 /// credit; another stream on the connection is not held up behind it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slow_body_does_not_hold_up_others() {
-    let (h, st) = start("/mixed", "", ALLOW_UPSTREAM).await;
+    let (h, st) = start("/mixed", ONE_CONNECTION, ALLOW_UPSTREAM).await;
     let c = h.client();
     let big = c.get(h.https_url("/big")).send().await.unwrap();
     assert_eq!(big.status(), 200);
@@ -1181,7 +1189,7 @@ async fn a_wss_endpoint_needs_private_ok_for_a_private_address() {
 /// exchange it has, then closes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rotated_secret_reaches_new_streams_and_old_connections_drain() {
-    let (h, st) = start("/mixed", "", ALLOW_UPSTREAM).await;
+    let (h, st) = start("/mixed", ONE_CONNECTION, ALLOW_UPSTREAM).await;
     let c = h.client();
     let held = tokio::spawn({
         let c = c.clone();
