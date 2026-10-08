@@ -21,7 +21,7 @@ addons:
       max_streams: 100                  # exchanges at once per connection (default 100)
 ```
 
-`path`, `capabilities`, `config`, `audit_endpoint` and the WASM limits are
+`path`, `capabilities`, `config` and the WASM limits are
 refused on a service layer; `max_connections` and `max_streams` are refused
 on a WASM layer, and at zero.
 

@@ -85,8 +85,6 @@ pub struct AddonSpec {
     pub endpoints: HashMap<String, EndpointSpec>,
     /// The addon's keyed store.
     pub state: StateLimits,
-    /// Endpoint that also receives `record(.., audit: true)` events.
-    pub audit_endpoint: Option<String>,
     /// `when`: the layer runs only on requests this matches, as they reach
     /// it; the others go straight to the layer below.
     pub when: Option<roxy_rules::Condition>,

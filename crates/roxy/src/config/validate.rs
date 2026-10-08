@@ -268,14 +268,6 @@ impl Config {
             for (name, e) in &a.endpoints {
                 self.validate_endpoint(&format!("{path}.endpoints.{name}"), name, e, d);
             }
-            if let Some(n) = &a.audit_endpoint
-                && !a.endpoints.contains_key(n)
-            {
-                d.push(Diagnostic::new(
-                    format!("{path}.audit_endpoint"),
-                    format!("{n:?} is not one of this addon's `endpoints`"),
-                ));
-            }
         }
     }
 
@@ -310,12 +302,6 @@ impl Config {
             refuse(
                 "config",
                 "`config` is passed to WASM addons; configure the service itself",
-            );
-        }
-        if a.audit_endpoint.is_some() {
-            refuse(
-                "audit_endpoint",
-                "`audit_endpoint` is for `kind: wasm` addons",
             );
         }
         let l = &a.limits;

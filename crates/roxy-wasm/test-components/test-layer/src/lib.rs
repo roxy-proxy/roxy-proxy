@@ -464,7 +464,7 @@ fn call_capability(req: &IncomingRequest) -> String {
             "ok".to_owned()
         }
         "record" => {
-            flow::record("verdict", "{\"score\":0.9}", true);
+            flow::record("verdict", "{\"score\":0.9}");
             "ok".to_owned()
         }
         "state" => {
@@ -532,7 +532,7 @@ impl Handler for Layer {
         if let Some(n) = test.strip_prefix("record:") {
             // Record one document of about `n` bytes, then answer.
             let n: usize = n.parse().expect("size");
-            flow::record("big", &format!("{{\"s\":\"{}\"}}", "r".repeat(n)), false);
+            flow::record("big", &format!("{{\"s\":\"{}\"}}", "r".repeat(n)));
             respond(out, 200, b"recorded");
             return;
         }

@@ -13,7 +13,6 @@ addons:
     when: host == "api.anthropic.com" and path starts_with "/v1/messages"   # default: every exchange
     sample: 0.1                       # observe only: share of matching exchanges copied, in (0, 1]
     capabilities: [state, record, endpoints]   # also: metrics, log
-    audit_endpoint: audit-sink        # also receives record(.., audit: true)
     endpoints:                        # named, not URLs
       monitor-model:
         url: https://api.anthropic.com/v1/messages
@@ -52,7 +51,7 @@ named [host services](/reference/host-services):
 |---|---|
 | `endpoints` | `endpoints.call`: outbound calls to the layer's named `endpoints`, with roxy attaching the headers |
 | `state` | `flow.state-get`, `flow.state-put`: the layer's keyed store, sized by `state` |
-| `record` | `flow.record`: structured events in the flow log, and `audit_endpoint` |
+| `record` | `flow.record`: structured events in the flow log |
 | `metrics` | `flow.metric-get`: read a metric for this flow's key |
 | `log` | `flow.log`: roxy's operational log |
 

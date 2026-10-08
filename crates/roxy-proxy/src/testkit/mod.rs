@@ -114,8 +114,6 @@ pub(crate) struct AddonDef {
     pub when: Option<String>,
     pub sample: Option<f64>,
     pub endpoints: HashMap<String, EndpointSpec>,
-    /// The endpoint `record(.., audit: true)` POSTs to.
-    pub audit_endpoint: Option<String>,
 }
 
 impl AddonDef {
@@ -131,7 +129,6 @@ impl AddonDef {
             when: None,
             sample: None,
             endpoints: HashMap::new(),
-            audit_endpoint: None,
         }
     }
 
@@ -171,13 +168,6 @@ impl AddonDef {
                 private: PrivateAddrs::from_private_ok(private_ok),
             },
         );
-        self
-    }
-
-    /// Audit records go to endpoint `name`.
-    #[must_use]
-    pub(crate) fn audit_endpoint(mut self, name: &str) -> Self {
-        self.audit_endpoint = Some(name.to_owned());
         self
     }
 
@@ -248,7 +238,6 @@ impl AddonDef {
             kind: crate::addons::AddonImpl::Wasm(layer),
             endpoints: self.endpoints,
             state: StateLimits::default(),
-            audit_endpoint: self.audit_endpoint,
             when,
             sample: self.sample,
         })

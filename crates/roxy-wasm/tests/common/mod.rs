@@ -189,8 +189,8 @@ impl LayerHost for Mock {
         self.call(format!("log {level:?} {msg}"));
     }
 
-    async fn record(&self, kind: String, json: String, audit: bool) -> Result<(), HostError> {
-        self.call(format!("record {kind} {json} {audit}"));
+    async fn record(&self, kind: String, json: String) -> Result<(), HostError> {
+        self.call(format!("record {kind} {json}"));
         Ok(())
     }
 

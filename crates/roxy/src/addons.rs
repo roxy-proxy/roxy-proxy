@@ -212,7 +212,6 @@ impl AddonLoader {
                 kind,
                 endpoints: endpoints(a)?,
                 state: state_limits(a),
-                audit_endpoint: a.audit_endpoint.clone(),
                 when,
                 sample: a.sample,
             }));

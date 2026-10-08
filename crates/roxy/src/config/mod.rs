@@ -720,10 +720,6 @@ pub struct Addon {
     /// The addon's keyed store.
     #[serde(default)]
     pub state: AddonState,
-    /// An endpoint (of this addon) that also receives `record(.., audit:
-    /// true)` events.
-    #[serde(default)]
-    pub audit_endpoint: Option<String>,
 }
 
 // ----- log ------------------------------------------------------------------

@@ -316,27 +316,6 @@ fn connect_error(e: &ConnectError) -> EndpointError {
     }
 }
 
-/// POSTs `json` to endpoint `name` of `addon` (audit and terminate
-/// notifications). Failures are logged.
-pub(crate) async fn notify(st: &StackFlow, addon: &AddonSpec, name: &str, json: serde_json::Value) {
-    let mut req = http::Request::new(Body::from_bytes(json.to_string()));
-    *req.method_mut() = http::Method::POST;
-    *req.uri_mut() = Uri::from_static("/");
-    req.headers_mut().insert(
-        HeaderName::from_static("content-type"),
-        HeaderValue::from_static("application/json"),
-    );
-    match call(st, addon, name, req).await {
-        Ok(res) if res.status().is_success() => {}
-        Ok(res) => {
-            tracing::warn!(layer = addon.name, endpoint = name, status = %res.status(), "notification refused");
-        }
-        Err(e) => {
-            tracing::warn!(layer = addon.name, endpoint = name, error = %e, "notification failed");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

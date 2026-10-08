@@ -87,14 +87,14 @@ impl LayerHost for StackHost {
         }
     }
 
-    async fn record(&self, kind: String, json: String, audit: bool) -> Result<(), HostError> {
+    async fn record(&self, kind: String, json: String) -> Result<(), HostError> {
         let data: serde_json::Value = serde_json::from_str(&json)
             .map_err(|e| HostError::new(format!("record {kind:?}: not JSON: {e}")))?;
         let addon = self.addon().clone();
         // Never dropped: wait for the flow log like any other audit record.
         sink_ready(&*self.st.shared.sink).await;
         // `kind` is the guest's string too: both go through this exchange's
-        // redactor before reaching the flow log or the audit endpoint.
+        // redactor before reaching the flow log.
         let redactor = self.st.secrets().redactor();
         let kind = redactor.redact_str(&kind).into_owned();
         let data = redactor.redact_json(data);
@@ -103,20 +103,9 @@ impl LayerHost for StackHost {
             flow: self.st.flow.to_string(),
             conn: self.st.client.id.to_string(),
             layer: addon.name.clone(),
-            kind: kind.clone(),
-            data: data.clone(),
-            audit,
+            kind,
+            data,
         });
-        if audit && let Some(name) = addon.audit_endpoint.clone() {
-            let st = self.st.clone();
-            let body = serde_json::json!({
-                "flow": st.flow.to_string(),
-                "layer": addon.name,
-                "kind": kind,
-                "data": data,
-            });
-            tokio::spawn(async move { endpoint::notify(&st, &addon, &name, body).await });
-        }
         Ok(())
     }
 

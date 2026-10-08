@@ -566,7 +566,6 @@ pub(crate) mod testing {
             kind: AddonImpl::Service(svc),
             endpoints: HashMap::from([("svc".to_owned(), endpoint)]),
             state: StateLimits::default(),
-            audit_endpoint: None,
             when: None,
             sample: None,
         })
