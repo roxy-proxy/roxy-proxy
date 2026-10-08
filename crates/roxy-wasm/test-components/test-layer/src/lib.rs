@@ -759,7 +759,10 @@ impl Handler for Layer {
                 let saw_request = request.len();
                 let r = forward_head_with(
                     &req,
-                    vec![("x-saw-request".to_owned(), saw_request.to_string().into_bytes())],
+                    vec![(
+                        "x-saw-request".to_owned(),
+                        saw_request.to_string().into_bytes(),
+                    )],
                 );
                 let b = r.body().expect("body");
                 let fut = chain::next(r).expect("next");
