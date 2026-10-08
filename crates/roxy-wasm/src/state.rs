@@ -298,20 +298,21 @@ impl WasiView for StoreState {
     }
 }
 
-/// Pauses the exchange's head clock while `next` runs below the layer,
-/// until it returns or the guest abandons it.
+/// Stops the exchange's head clock while `next` runs below the layer; it
+/// restarts, with a whole budget for the response head, when `next`
+/// returns or the guest abandons it.
 struct Below(Arc<ExchangeShared>);
 
 impl Below {
     fn enter(shared: Arc<ExchangeShared>) -> Self {
-        shared.set_below(true);
+        shared.next_started();
         Self(shared)
     }
 }
 
 impl Drop for Below {
     fn drop(&mut self) {
-        self.0.set_below(false);
+        self.0.next_returned();
     }
 }
 

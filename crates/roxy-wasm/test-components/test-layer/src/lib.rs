@@ -185,11 +185,20 @@ fn answer_with((below, body): Answer, upper: bool) {
     types::finish(out);
 }
 
+/// Blocks for the `x-<name>-ms` of the request, if set: the layer's own
+/// time, held against its head clock.
+fn hold(req: &RequestHead, name: &str) {
+    if let Some(ms) = header(req, &format!("x-{name}-ms")).and_then(|v| v.parse::<u64>().ok()) {
+        wasi::clocks::monotonic_clock::subscribe_duration(ms * 1_000_000).block();
+    }
+}
+
 /// The default: pass the exchange through, streaming both bodies, chunk by
 /// chunk (upper-cased when `x-upper` is set). With `x-hold`, neither body
 /// it passes on is ended until the client's request body goes away.
 /// Unbuffered, the response from below goes out with `x-status` as its
-/// status, if set.
+/// status, if set. `x-delay-request-ms` holds the request head before
+/// `next`; buffered, `x-delay-response-ms` holds the response head after it.
 fn pass(req: &RequestHead, body: InputStream, buffer_first: bool) {
     let upper = header(req, "x-upper").is_some();
     let tweaks = Tweaks {
@@ -199,6 +208,7 @@ fn pass(req: &RequestHead, body: InputStream, buffer_first: bool) {
     };
     let next_head = forward_head(req);
     let buffered = buffer_first.then(|| read_all(&body));
+    hold(req, "delay-request");
     let (pending, next_out) = next_streaming(&next_head);
     let Some(all) = buffered else {
         duplex(body, next_out, pending, tweaks);
@@ -207,7 +217,9 @@ fn pass(req: &RequestHead, body: InputStream, buffer_first: bool) {
     write_all(&next_out, &all);
     types::finish(next_out);
     drop(body);
-    answer_with(await_response(pending), upper);
+    let resp = await_response(pending);
+    hold(req, "delay-response");
+    answer_with(resp, upper);
 }
 
 /// What `pass` does to the exchange besides passing it on, from the
@@ -594,9 +606,7 @@ impl Handler for Layer {
                 let out = respond_streaming(&head(200, Vec::new()));
                 write_all(&out, b"partial");
                 // `x-delay-ms` holds the cut back so the head lands first.
-                if let Some(ms) = header(&req, "x-delay-ms").and_then(|v| v.parse::<u64>().ok()) {
-                    wasi::clocks::monotonic_clock::subscribe_duration(ms * 1_000_000).block();
-                }
+                hold(&req, "delay");
                 panic!("layer panics mid-body");
             }
             "tags-after-head" => {

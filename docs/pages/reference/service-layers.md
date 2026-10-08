@@ -105,10 +105,10 @@ either way       {"type":"credit","dir":"request"|"response","bytes":n}  flow co
 - **The forwarded request** gets the same checks as a WASM layer's `next`:
   re-validated as strictly as a client request, then judged by the rules.
   The service's response is handled as a WASM layer's.
-- **Deadlines.** `first_byte_timeout` bounds getting a stream and each of
-  the service's heads: its first answer from roxy's `request` head, its
-  second from roxy's `response` head (not from the end of the response
-  body). A stream has no overall clock.
+- **Deadlines.** `first_byte_timeout` bounds getting a stream, then each
+  of the service's heads, as it does a WASM layer's: its first answer from
+  roxy's `request` head, its second from roxy's `response` head (not from
+  the end of the response body). A stream has no overall clock.
 - **Failure is closed** in enforce mode: a failed connection or handshake,
   a protocol violation (bad JSON, a message out of order, bytes of a body
   that is not open, an invalid head, a broken length, bytes past the
