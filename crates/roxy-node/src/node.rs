@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -120,6 +120,29 @@ pub struct NodeConfig {
     /// production; tests shrink it.
     #[doc(hidden)]
     pub time_scale: f64,
+    /// The wall clock certificate validity is judged by. The system clock
+    /// in production; tests move it, since a certificate's `not_after` is
+    /// wall time that `time_scale` cannot shrink.
+    #[doc(hidden)]
+    pub clock: Clock,
+}
+
+/// The system clock plus a skew. Clones share the skew.
+#[derive(Debug, Clone, Default)]
+pub struct Clock {
+    skew: Arc<AtomicI64>,
+}
+
+impl Clock {
+    pub fn now(&self) -> DateTime<Utc> {
+        Utc::now() + chrono::Duration::seconds(self.skew.load(Ordering::Relaxed))
+    }
+
+    /// Moves the clock forward by `by`, for every clone.
+    #[doc(hidden)]
+    pub fn advance(&self, by: chrono::Duration) {
+        self.skew.fetch_add(by.num_seconds(), Ordering::Relaxed);
+    }
 }
 
 /// The lease the node runs: what the next one is compared with.
@@ -306,7 +329,9 @@ impl Node {
         // Renew no later than two thirds of the way to expiry, whatever
         // window the server stated, so a failed renewal has time to be
         // retried.
-        let left = (not_after - Utc::now()).to_std().unwrap_or_default();
+        let left = (not_after - self.config.clock.now())
+            .to_std()
+            .unwrap_or_default();
         let latest = left.mul_f64(2.0 / 3.0);
         let renew_after = renew_after.map_or(latest, |r| r.min(latest));
         *lock(&self.identity) = Some(Arc::new(Identity {
@@ -410,7 +435,7 @@ impl Node {
             let Some(id) = self.client() else {
                 return Ok(());
             };
-            if id.not_after <= Utc::now() {
+            if id.not_after <= self.config.clock.now() {
                 return Err(NodeError::CertificateExpired {
                     node_id: id.node_id.clone(),
                     not_after: id.not_after,
@@ -418,7 +443,7 @@ impl Node {
                 });
             }
             let state = self.node_state();
-            let fetched_at = Utc::now();
+            let fetched_at = self.config.clock.now();
             let fetched = id.client.fetch_lease(&state).await;
             let outcome = FetchOutcome::of(&fetched);
             let changed = outcome != last;
@@ -915,6 +940,7 @@ mod tests {
         mock: MockServer,
         dir: tempfile::TempDir,
         token: PathBuf,
+        clock: Clock,
     }
 
     impl Harness {
@@ -923,7 +949,12 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let token = dir.path().join("token");
             std::fs::write(&token, "tok-1\n").unwrap();
-            Self { mock, dir, token }
+            Self {
+                mock,
+                dir,
+                token,
+                clock: Clock::default(),
+            }
         }
 
         fn config(&self, with_token: bool) -> NodeConfig {
@@ -938,6 +969,7 @@ mod tests {
                     roxy_version: "test".into(),
                 },
                 time_scale: 0.01,
+                clock: self.clock.clone(),
             }
         }
 
@@ -1454,7 +1486,7 @@ mod tests {
             "/roxy/v1/enrol",
             Reply::Issue {
                 node_id: "n1".into(),
-                lifetime_secs: 1,
+                lifetime_secs: 3600,
                 renew_after_seconds: 1,
             },
         );
@@ -1465,13 +1497,18 @@ mod tests {
         let (node, rec) = h.node(true);
         let task = tokio::spawn(node.clone().run());
         h.mock.wait_for("/roxy/v1/renew", 1).await;
+        h.mock.wait_for(LEASE, 2).await;
+        assert!(
+            !lock(&rec.applied).is_empty(),
+            "served while the certificate is valid"
+        );
+        h.clock.advance(chrono::Duration::seconds(3601));
         let err = tokio::time::timeout(Duration::from_secs(10), task)
             .await
             .expect("ends once the certificate has expired")
             .unwrap()
             .unwrap_err();
         assert!(matches!(err, NodeError::CertificateExpired { .. }), "{err}");
-        assert!(!lock(&rec.applied).is_empty(), "served until expiry");
         assert_eq!(h.mock.requests_to("/roxy/v1/renew").len(), 1);
     }
 
