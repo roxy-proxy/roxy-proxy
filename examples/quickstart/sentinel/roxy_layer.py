@@ -1,4 +1,4 @@
-"""The service side of roxy's service layers (`roxy.layer.v3`).
+"""The service side of roxy's service layers (`roxy.layer.v4`).
 
 roxy keeps a few WebSocket connections open to the service and carries
 each exchange as a stream on one of them. Text frames are JSON control
@@ -9,10 +9,9 @@ body), then body bytes:
     roxy -> service   open (the exchange's metadata), then the request:
                       head, body bytes, request_end
     service -> roxy   the request to forward (head, bytes, request_end),
-                      or a response of its own, or a deny
+                      or a response of its own
     roxy -> service   the response from below: head, bytes, response_end
-    service -> roxy   the response for the client (head, bytes, response_end),
-                      or a deny
+    service -> roxy   the response for the client (head, bytes, response_end)
 
 The request and response bodies of a stream are independent: roxy sends
 its `response` head as soon as the layer below answers, even while the
@@ -60,7 +59,7 @@ from typing import Any
 
 from websockets.asyncio.server import ServerConnection, serve as ws_serve
 
-SUBPROTOCOL = "roxy.layer.v3"
+SUBPROTOCOL = "roxy.layer.v4"
 
 # The direction byte of a binary frame, and the `dir` of a credit message.
 REQUEST = 0
@@ -410,14 +409,6 @@ class Exchange:
             }
         )
         await self._send_body(RESPONSE, body)
-
-    async def deny(self, status: int = 403, message: str | None = None) -> None:
-        """Refuse: before `forward` the request is never sent; after it, the
-        response is replaced. `status` is 4xx or 5xx."""
-        msg: dict[str, Any] = {"type": "deny", "status": status}
-        if message is not None:
-            msg["message"] = message
-        await self._send(msg)
 
 
 Handler = Callable[[Exchange], Awaitable[None]]

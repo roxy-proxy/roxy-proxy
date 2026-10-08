@@ -1,9 +1,9 @@
 //! Service layers: an external service in the network path.
 //!
-//! Each exchange is a stream (`roxy.layer.v3`) on one of a few pooled
+//! Each exchange is a stream (`roxy.layer.v4`) on one of a few pooled
 //! WebSocket connections to the layer's named endpoint ([`mux`]). roxy
 //! streams the request into it as it arrives; the service streams back
-//! the request to forward (or answers itself, or denies); roxy forwards
+//! the request to forward (or answers itself); roxy forwards
 //! that down the stack, streams the response it gets back into the
 //! stream, and the service streams back the response to give the client:
 //!
@@ -12,9 +12,8 @@
 //! service → roxy   {"type":"request", …} bytes… request_end    forward this request
 //!                  {"type":"response", status, headers} bytes… response_end
 //!                                                              answer (instead of forwarding)
-//!                  {"type":"deny", status?, message?}          refuse
 //! roxy → service   {"type":"response", status, headers}  bytes…  response_end
-//! service → roxy   {"type":"response", …} bytes… response_end | {"type":"deny", …}
+//! service → roxy   {"type":"response", …} bytes… response_end
 //! ```
 //!
 //! The request and response bodies are independent: a response head goes
@@ -180,12 +179,6 @@ enum In {
         headers: Vec<(String, String)>,
     },
     ResponseEnd,
-    Deny {
-        #[serde(default)]
-        status: Option<u16>,
-        #[serde(default)]
-        message: Option<String>,
-    },
     Credit {
         dir: Dir,
         bytes: u64,
@@ -248,28 +241,6 @@ fn declared_length(h: &HeaderMap) -> Result<Option<u64>, ServiceError> {
         (Some(n), None) => Ok(Some(n)),
         _ => Err(ServiceError::Protocol("invalid content-length".into())),
     }
-}
-
-/// The answer a `deny` stands for.
-fn deny_response(
-    status: Option<u16>,
-    message: Option<String>,
-) -> Result<LayerResponse, ServiceError> {
-    let status = status.unwrap_or(403);
-    if !(400..=599).contains(&status) {
-        return Err(ServiceError::Protocol(format!(
-            "deny status {status} is not 4xx or 5xx"
-        )));
-    }
-    let msg = message.unwrap_or_else(|| "request blocked".to_owned());
-    let mut r = http::Response::new(Body::from_bytes(format!("{}\n", msg.trim_end())));
-    *r.status_mut() =
-        http::StatusCode::from_u16(status).map_err(|e| ServiceError::Protocol(e.to_string()))?;
-    r.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    Ok(r)
 }
 
 /// Runs enforce-mode service layer `index` on `req`.

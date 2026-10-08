@@ -1,6 +1,6 @@
 """inspect_sentinel at the network boundary: a roxy service layer.
 
-Every exchange streams through this sidecar (roxy.layer.v3). For an
+Every exchange streams through this sidecar (roxy.layer.v4). For an
 Anthropic Messages call (`POST .../v1/messages`) it forwards the request,
 reads the model's response, turns each tool call in it into an
 inspect_sentinel `BeforeToolCall` step, and runs the configured sentinel on
@@ -287,6 +287,12 @@ def is_model_call(req: Request) -> bool:
     return req.method == "POST" and req.url.split("?", 1)[0].endswith("/v1/messages")
 
 
+def refusal(message: str) -> tuple[Response, bytes]:
+    """A 403 carrying `message` as plain text."""
+    body = f"{message}\n".encode()
+    return with_length(Response(403, [("content-type", "text/plain; charset=utf-8")]), len(body)), body
+
+
 def with_length(res: Response, length: int) -> Response:
     headers = [(n, v) for n, v in res.headers if n.lower() != "content-length"]
     return Response(res.status, [*headers, ("content-length", str(length))])
@@ -336,7 +342,7 @@ class Sidecar:
             out = json.dumps(reply).encode()
             await ex.respond(with_length(res, len(out)), out)
         else:
-            await ex.deny(403, verdict.message)
+            await ex.respond(*refusal(verdict.message))
 
     async def judged_stream(self, ex: Exchange, body: bytes, res: Response) -> AsyncIterator[bytes]:
         """A streamed response, judged before the agent sees any content:

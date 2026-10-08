@@ -27,7 +27,7 @@ use crate::upstream::MaybeTls;
 use crate::watch::Dir;
 
 /// The WebSocket subprotocol a service must accept.
-pub const SUBPROTOCOL: &str = "roxy.layer.v3";
+pub const SUBPROTOCOL: &str = "roxy.layer.v4";
 
 /// Largest control message or body frame accepted from a service.
 pub(super) const MAX_FRAME: usize = 16 * 1024 * 1024;

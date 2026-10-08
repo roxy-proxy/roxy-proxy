@@ -1,6 +1,6 @@
 //! End-to-end tests of service layers: `roxy run` with `kind: service`
 //! addons whose exchanges stream through an in-test service over
-//! `roxy.layer.v3`. The service's behaviour is picked by its URL path (one
+//! `roxy.layer.v4`. The service's behaviour is picked by its URL path (one
 //! per connection), and for `/mixed` by the request's path (per stream).
 
 mod support;
@@ -282,15 +282,12 @@ async fn session(path: &str, mut s: Sess) {
             )
             .await;
         }
-        "/deny" => {
-            let _ = s.recv().await;
-            s.send(json!({"type": "deny", "status": 451, "message": "the service said no"}));
-        }
-        "/deny-response" => {
+        "/replace-response" => {
             let (head, body) = whole(&mut s).await;
             send_whole(&s, Dir::Request, head, &body).await;
             let _ = whole(&mut s).await;
-            s.send(json!({"type": "deny", "message": "not this answer"}));
+            let head = json!({"type": "response", "status": 403, "headers": []});
+            send_whole(&s, Dir::Response, head, b"not this answer\n").await;
         }
         "/respond" => {
             let _ = s.recv().await;
@@ -437,7 +434,7 @@ where
         let mut conns = state.connections.lock().unwrap();
         if path != "/no-protocol" {
             res.headers_mut()
-                .insert("sec-websocket-protocol", "roxy.layer.v3".parse().unwrap());
+                .insert("sec-websocket-protocol", "roxy.layer.v4".parse().unwrap());
         }
         *record.lock().unwrap() = (path, conns.len());
         conns.push(
@@ -780,33 +777,8 @@ async fn a_rewrite_is_applied_and_judged_by_the_rules() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_deny_is_honoured() {
-    let (h, _) = start("/deny", "", ALLOW_UPSTREAM).await;
-    let res = h
-        .client()
-        .post(h.https_url("/x"))
-        .body("x")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), 451);
-    assert_eq!(res.text().await.unwrap(), "the service said no\n");
-    assert!(h.upstream.seen().is_empty());
-    let ev = h.wait_events("request", 1).await;
-    // The service answered; its status says it was a refusal.
-    assert_eq!(ev[0]["decision"], "answered");
-    assert_eq!(ev[0]["terminal_rule"], "layer:s");
-    assert!(
-        ev[0]["tags"].as_array().unwrap().contains(&"s:deny".into()),
-        "{}",
-        ev[0]
-    );
-    h.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn the_service_can_deny_the_response_or_answer_itself() {
-    let (h, _) = start("/deny-response", "", ALLOW_UPSTREAM).await;
+async fn the_service_can_replace_the_response_or_answer_itself() {
+    let (h, _) = start("/replace-response", "", ALLOW_UPSTREAM).await;
     let res = h.client().get(h.https_url("/x")).send().await.unwrap();
     assert_eq!(res.status(), 403);
     assert_eq!(res.text().await.unwrap(), "not this answer\n");
@@ -908,7 +880,7 @@ async fn a_dropped_connection_fails_closed() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn observe_mode_cannot_block() {
-    for path in ["/deny", "/garbage", "/no-protocol"] {
+    for path in ["/respond", "/garbage", "/no-protocol"] {
         let (h, st) = start(path, "    mode: observe\n", ALLOW_UPSTREAM).await;
         let res = h
             .client()

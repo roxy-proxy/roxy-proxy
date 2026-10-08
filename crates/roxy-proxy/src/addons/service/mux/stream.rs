@@ -53,7 +53,7 @@ pub(super) struct StreamState {
 /// besides the bodies it is sending.
 pub(super) enum Phase {
     /// Enforce: the request head is on its way, and the service owes its
-    /// first answer (a request to forward, a response, or a deny).
+    /// first answer (a request to forward or a response).
     AwaitingFirst {
         first: oneshot::Sender<Result<First, Unanswered>>,
         second: oneshot::Sender<Result<LayerResponse, Unanswered>>,
@@ -456,11 +456,7 @@ impl Stream {
                 );
                 return self.fail(ServiceError::Closed(why), Reset::Skip);
             }
-            In::Request { .. }
-            | In::RequestEnd
-            | In::Response { .. }
-            | In::ResponseEnd
-            | In::Deny { .. } => {
+            In::Request { .. } | In::RequestEnd | In::Response { .. } | In::ResponseEnd => {
                 // An observer's answers are ignored.
                 if self.mode == AddonMode::Observe {
                     return;
@@ -551,13 +547,6 @@ impl Stream {
                 s.answered(r, "response")?;
                 s.res.inbox = Some(self.feed(body_tx, Dir::Response));
                 Ok(())
-            }
-            In::Deny { status, message } => {
-                let r = super::super::deny_response(status, message)?;
-                // Tagged before the answer goes, so the flow's record has it.
-                // A flow at its tag cap loses the label; the deny stands.
-                let _ = self.st.add_tag(format!("{}:deny", self.name()));
-                s.answered(r, "deny")
             }
             // Handled by `control`.
             In::Credit { .. } | In::Reset { .. } => Ok(()),
@@ -775,7 +764,7 @@ mod tests {
         ));
     }
 
-    /// A request may only come as the first answer, and a response or deny
+    /// A request may only come as the first answer, and a response
     /// only as an answer that is owed: the second is not once the first
     /// answered instead of forwarding.
     #[test]
@@ -788,7 +777,7 @@ mod tests {
         assert!(s.forwarded().is_err());
 
         let (mut s, (first, mut second)) = enforce();
-        s.answered(response(), "deny").unwrap();
+        s.answered(response(), "response").unwrap();
         assert!(matches!(first.blocking_recv(), Ok(Ok(First::Answer(_)))));
         assert!(second.try_recv().is_err(), "no second answer follows");
         assert!(s.answered(response(), "response").is_err());
