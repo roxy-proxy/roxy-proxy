@@ -100,8 +100,11 @@ impl Drop for Reservation {
 }
 
 impl Pool {
-    /// A place on a connection with room, opening a new entry when every
-    /// open one is full and the pool is not; else waits for one to free.
+    /// A place on a connection: a new one while the pool has fewer than
+    /// `max_connections`, else the one with the fewest streams that has
+    /// room; waits for one to free when every connection is full. Each
+    /// connection is one reader and one writer on each side, so streams
+    /// are spread across connections rather than packed onto one.
     pub(super) async fn reserve(self: &Arc<Self>) -> Reservation {
         loop {
             let freed = self.freed.notified();
@@ -110,19 +113,20 @@ impl Pool {
             {
                 let mut entries = lock(&self.entries);
                 entries.retain(|e| e.reserved > 0 || !e.closed());
-                let pick = if let Some(e) = entries
-                    .iter_mut()
-                    .find(|e| !e.closed() && e.reserved < self.max_streams)
-                {
-                    e.reserved += 1;
-                    Some(e.link.clone())
-                } else if entries.len() < self.max_connections {
+                let pick = if entries.len() < self.max_connections {
                     let link = Arc::new(OnceCell::new());
                     entries.push(Entry {
                         link: link.clone(),
                         reserved: 1,
                     });
                     Some(link)
+                } else if let Some(e) = entries
+                    .iter_mut()
+                    .filter(|e| !e.closed() && e.reserved < self.max_streams)
+                    .min_by_key(|e| e.reserved)
+                {
+                    e.reserved += 1;
+                    Some(e.link.clone())
                 } else {
                     None
                 };

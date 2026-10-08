@@ -231,6 +231,40 @@ async fn a_failed_connection_counts_until_its_streams_end() {
     assert!(fresh.link.get().is_none(), "a new connection");
 }
 
+/// Streams spread across the pool's connections: each opens a new one
+/// while the pool has room for it, then the one with the fewest streams
+/// takes the next, and a full connection is passed over for one with room.
+#[tokio::test]
+async fn streams_spread_across_connections() {
+    let pool = Arc::new(Pool {
+        entries: Mutex::new(Vec::new()),
+        freed: Notify::new(),
+        max_connections: 2,
+        max_streams: 2,
+        retired: AtomicBool::new(false),
+    });
+    let a = pool.reserve().await;
+    let b = pool.reserve().await;
+    assert!(!Arc::ptr_eq(&a.link, &b.link), "a second connection opens");
+    let c = pool.reserve().await;
+    let d = pool.reserve().await;
+    assert!(
+        !Arc::ptr_eq(&c.link, &d.link),
+        "the connection with fewer streams takes the next"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), pool.reserve())
+            .await
+            .is_err(),
+        "every connection is full"
+    );
+    let freed = a.link.clone();
+    drop(a);
+    let e = pool.reserve().await;
+    assert!(Arc::ptr_eq(&e.link, &freed), "the place a stream freed");
+    assert!(lock(&pool.entries).iter().all(|e| e.reserved == 2));
+}
+
 /// Fills the data queue of `stream`'s connection with body frames of
 /// its own, until the writer is stalled on a socket nobody reads and
 /// the queue stays full.

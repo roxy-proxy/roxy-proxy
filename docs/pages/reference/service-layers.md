@@ -37,12 +37,15 @@ exchanges as **streams**.
   address floor and deny lists apply), never through other layers or the
   rules. The handshake carries the endpoint's `headers`. Each connection is
   an `endpoint_call` event against the flow whose exchange opened it.
-- **Pooling.** A new exchange takes a stream on an open connection; roxy
-  opens another only when every open one has `max_streams` streams, up to
-  `max_connections`, after which the exchange waits for a free stream
-  within `first_byte_timeout`. Idle connections stay open. A connection
-  that closes or fails fails its in-flight exchanges closed; later
-  exchanges go to another connection.
+- **Pooling.** A new exchange opens a connection while the endpoint has
+  fewer than `max_connections`; after that it takes a stream on the
+  connection with the fewest, and once every connection has `max_streams`
+  streams it waits for a free one within `first_byte_timeout`. Streams
+  are spread this way because each connection is one reader and one
+  writer on each side: a service that handles each connection on one
+  task gets one core per connection. Idle connections stay open. A
+  connection that closes or fails fails its in-flight exchanges closed;
+  later exchanges go to another connection.
 - **Reload.** New exchanges get new connections, dialled under the new
   policy and secrets. Old connections take no new streams: an idle one
   closes at once, a busy one when its last exchange ends.
