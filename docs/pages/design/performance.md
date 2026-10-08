@@ -46,6 +46,16 @@ No run uses [body rules](/reference/rule-language#body-rules),
 digest costs about one core per 400 MB/s on a CPU without SHA-NI, which is
 why it is opt-in.
 
+The 64 KiB and 1 MiB gateway figures also depend on where roxy's upstream
+connections land. roxy opens up to four HTTP/2 connections to an origin
+([`max_h2_connections_per_origin`](/reference/upstream#connections)), and
+the test server, nginx with a `reuseport` listener, gives each connection to
+a worker by hash. With the four on three of nginx's four workers, roxy is
+the limit; with them on two, both workers are saturated and the same build
+moves a third fewer bytes with roxy and nginx both under-used. A gateway row
+is only compared with another from the same placement
+([#432](https://github.com/roxy-proxy/roxy-proxy/issues/432)).
+
 These figures come from one machine, measured against Envoy and mitmproxy
 and with a do-nothing addon of each kind; the detail and the open work on
 the fixed cost are in [#403](https://github.com/roxy-proxy/roxy-proxy/issues/403) and
