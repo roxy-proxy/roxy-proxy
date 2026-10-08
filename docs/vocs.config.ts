@@ -51,6 +51,7 @@ export default defineConfig({
         { text: "Threat model and guarantees", link: "/design/threat-model" },
         { text: "Policy evaluation", link: "/design/policy-evaluation" },
         { text: "Addon model", link: "/design/addon-model" },
+        { text: "Performance", link: "/design/performance" },
       ],
     },
     {
