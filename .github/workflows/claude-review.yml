@@ -62,10 +62,11 @@ jobs:
 
             Provide detailed feedback using inline comments for specific issues.
             Use top-level comments for general observations or praise. If there
-            are no blocking issues, run
-            `gh pr review --approve --body "<short summary>"`.
+            are no blocking issues, run exactly:
+            gh pr review ${{ github.event.pull_request.number }} --approve --body "<short summary>"
+
 
           # Tools for comprehensive PR review
           claude_args: |
             --model claude-opus-5-5
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review --approve:*)"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review ${{ github.event.pull_request.number }} --approve:*)"
