@@ -98,7 +98,8 @@ pub(super) struct LinkShared {
     /// fact: credit goes back in batches of a quarter window, so a stream
     /// queues a few credit messages per body and one reset, however small
     /// the service's frames, and the service cannot send more to earn
-    /// more until the socket takes them.
+    /// more until the socket takes them. Nothing is queued for a stream
+    /// that has ended: its frames are dropped uncredited.
     pub(super) ctl: mpsc::UnboundedSender<Message>,
 }
 
@@ -322,28 +323,7 @@ pub(super) async fn read(shared: Arc<LinkShared>, mut ws: SplitStream<Ws>) {
                 break ServiceError::Closed("the service closed the connection".into());
             }
             Some(Err(e)) => break ServiceError::Closed(e.to_string()),
-            Some(Ok(Message::Binary(b))) => {
-                if b.len() < 5 {
-                    break framing("a binary frame shorter than its stream id and direction");
-                }
-                let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-                let Some(dir) = dir_of(b[4]) else {
-                    break framing("a binary frame with an unknown direction");
-                };
-                route(&shared, id).map(|s| match s {
-                    Some(s) => s.bytes(dir, &b[5..]),
-                    // Ignored, and credited back, so a service still
-                    // sending when the stream ended is never stalled.
-                    None if b.len() > 5 => shared.send_ctl(
-                        id,
-                        &Out::Credit {
-                            dir,
-                            bytes: (b.len() - 5) as u64,
-                        },
-                    ),
-                    None => {}
-                })
-            }
+            Some(Ok(Message::Binary(b))) => binary_frame(&shared, &b),
             Some(Ok(Message::Text(t))) => {
                 let Ok(serde_json::Value::Object(v)) = serde_json::from_str(t.as_str()) else {
                     break framing("a text frame that is not a JSON object");
@@ -377,6 +357,26 @@ pub(super) async fn read(shared: Arc<LinkShared>, mut ws: SplitStream<Ws>) {
         }
     };
     shared.fail(&err);
+}
+
+/// Hands a binary frame to its stream. Bytes for a stream that has ended
+/// are dropped without credit: the service has nothing left to send on
+/// it, so nothing it sends there can earn more.
+pub(super) fn binary_frame(shared: &LinkShared, b: &[u8]) -> Result<(), ServiceError> {
+    let framing = |what: &str| ServiceError::Protocol(what.to_owned());
+    if b.len() < 5 {
+        return Err(framing(
+            "a binary frame shorter than its stream id and direction",
+        ));
+    }
+    let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    let Some(dir) = dir_of(b[4]) else {
+        return Err(framing("a binary frame with an unknown direction"));
+    };
+    if let Some(s) = route(shared, id)? {
+        s.bytes(dir, &b[5..]);
+    }
+    Ok(())
 }
 
 /// The open stream `id`; `None` for one that has ended (a message that

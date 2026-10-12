@@ -9,7 +9,7 @@ use roxy_http::{Body, BodyError};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use super::link::{Link, LinkShared, LinkState, Queued, binary};
+use super::link::{Link, LinkShared, LinkState, Queued, binary, binary_frame};
 use super::lock;
 use super::pool::Pool;
 use super::stream::{Answers, MAX_BODY_FRAME, Phase, Stream, StreamState, open};
@@ -367,4 +367,28 @@ async fn an_open_given_up_mid_send_releases_its_place() {
     assert_eq!(lock(&pool.entries)[0].reserved, 1);
     let place = tokio::time::timeout(Duration::from_millis(100), pool.reserve()).await;
     assert!(place.is_ok(), "the given-up stream's place is free");
+}
+
+/// Body frames for a stream that has ended queue nothing on the
+/// connection, however many arrive, and do not fail it.
+#[tokio::test]
+async fn frames_on_an_ended_stream_queue_nothing() {
+    let (ctl, mut ctl_rx) = mpsc::unbounded_channel();
+    let shared = LinkShared {
+        streams: Mutex::new(LinkState {
+            open: HashMap::new(),
+            next_id: 2,
+            failed: false,
+        }),
+        ctl,
+    };
+    let frame = binary(1, Dir::Request, b"x");
+    for _ in 0..10_000 {
+        binary_frame(&shared, &frame.clone().into_data()).unwrap();
+    }
+    assert!(
+        matches!(ctl_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        "nothing queued for an ended stream"
+    );
+    assert!(!lock(&shared.streams).failed);
 }
