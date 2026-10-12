@@ -915,8 +915,9 @@ impl BodyIo for Detached {
         body: &'a mut Body,
         cap: u64,
         meter: &'a mut (dyn FnMut(u64) -> bool + Send),
+        idle: Option<Duration>,
     ) -> CollectFuture<'a, Result<Collected, roxy_http::DriveError>> {
-        Box::pin(async move { Ok(collect_prefix(body, cap, meter).await) })
+        Box::pin(async move { Ok(collect_prefix(body, cap, meter, idle).await) })
     }
 }
 

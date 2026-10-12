@@ -272,7 +272,9 @@ the response and roxy builds a `CanonicalResponse`:
   if the upstream stops taking it for twice `limits.body_idle_timeout`.
 - The upstream may pause up to `limits.response_body_idle_timeout` (30 m)
   between parts of the body; longer ends the exchange (`response_error`,
-  reason `response_body_timeout`): close on HTTP/1.1, `CANCEL` on HTTP/2.
+  reason `response_body_timeout`): close on HTTP/1.1, `CANCEL` on HTTP/2,
+  or a `504` while rules are still reading the body and nothing has been
+  sent.
 - A client that closes while roxy waits for the next part of the body ends
   the exchange at once on both versions: the body is dropped, releasing the
   upstream and any service streams; a part already there is still written.

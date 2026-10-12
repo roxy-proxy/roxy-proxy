@@ -281,7 +281,7 @@ impl Upstream {
     ///   `grpc-status: 0`, `grpc-message: OK`; with `x-forbidden-trailer`
     ///   on the request, `set-cookie: a=b` as well;
     /// * `/drip?n=<n>&ms=<ms>`: `n` chunks, `ms` apart, without reading the
-    ///   body;
+    ///   body; `&first=<ms>` sets the wait before the first chunk;
     /// * `/cut`: reads the body, answers `200` declaring 10 bytes of body,
     ///   sends 3 and breaks the connection;
     /// * a `roxy.layer.v4` handshake: the in-test service layer endpoint
@@ -516,11 +516,16 @@ fn drip(path: &str) -> http::Response<Body> {
             .unwrap_or(0)
     };
     let (n, ms) = (arg("n"), arg("ms"));
+    let first = if query.split('&').any(|kv| kv.starts_with("first=")) {
+        arg("first")
+    } else {
+        ms
+    };
     let chunks = futures_util::stream::unfold(0, move |i| async move {
         if i == n {
             return None;
         }
-        tokio::time::sleep(Duration::from_millis(ms)).await;
+        tokio::time::sleep(Duration::from_millis(if i == 0 { first } else { ms })).await;
         let frame = hyper::body::Frame::data(Bytes::from(format!("chunk{i};")));
         Some((Ok::<_, Infallible>(frame), i + 1))
     });

@@ -183,7 +183,7 @@ where
     Sent { failed, close }
 }
 
-fn emit_response_error(cx: &FlowCx, reason: &str, e: &dyn std::fmt::Display) {
+pub(crate) fn emit_response_error(cx: &FlowCx, reason: &str, e: &dyn std::fmt::Display) {
     cx.shared.sink.emit(&FlowEvent::ResponseError {
         ts: chrono::Utc::now(),
         flow: cx.flow.to_string(),
