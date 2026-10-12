@@ -610,6 +610,49 @@ async fn capabilities_gate_host_services() {
     }
 }
 
+/// A call made while the exchange has its permitted calls in flight waits
+/// in `endpoints.call`, before the host takes its body: however many calls
+/// a guest makes without reading them, the host holds at most a permit's
+/// worth of bodies.
+#[tokio::test]
+async fn endpoint_bodies_wait_for_a_permit() {
+    let rt = runtime();
+    let mut cfg = config();
+    cfg.capabilities = Capabilities::all();
+    let layer = load(&rt, cfg).await;
+    let host = Mock::echo();
+    let count = 3 * MOCK_ENDPOINT_CALLS;
+
+    let mut flood = tokio::spawn({
+        let (layer, host) = (layer.clone(), host.clone());
+        async move {
+            let mut req = request("caps", Body::empty());
+            req.headers_mut()
+                .insert("x-cap", "endpoint-flood".parse().unwrap());
+            req.headers_mut()
+                .insert("x-cap-count", count.to_string().parse().unwrap());
+            exchange(&layer, host, req).await
+        }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut flood)
+            .await
+            .is_err(),
+        "the exchange answered while its calls were parked"
+    );
+    let parked = host
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("endpoint park"))
+        .count();
+    assert_eq!(parked, MOCK_ENDPOINT_CALLS);
+
+    host.unpark.send_replace(true);
+    let (status, body) = flood.await.unwrap().unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, format!("flooded {count}"));
+}
+
 #[tokio::test]
 async fn flow_basics_need_no_capability() {
     let rt = runtime();

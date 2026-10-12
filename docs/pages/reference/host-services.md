@@ -15,6 +15,9 @@ layer cannot name a destination and never sees the credentials. Calls do not
 pass through the layer stack, so a monitor's own model call cannot recurse
 through it; the response goes back to the layer, not through the rules. Each call emits an `endpoint_call` flow event.
 
+- An exchange has at most 8 calls in flight. A further `endpoints.call`
+  waits for one of them to be answered before it returns, and before roxy
+  takes the call's body: a waiting call holds nothing.
 - The request body is buffered before the call (at most 16 MiB), and
   reading it counts against the timeout.
 - An unknown name, a denied address, a refused path, a timeout and a

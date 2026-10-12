@@ -23,6 +23,11 @@ pub type LayerRequest = http::Request<Body>;
 /// re-validated by the host the same way.
 pub type LayerResponse = http::Response<Body>;
 
+/// A slot among the endpoint calls the host lets one exchange have in
+/// flight. Held from before the host takes a call's body until the call
+/// is answered.
+pub type EndpointPermit = tokio::sync::OwnedSemaphorePermit;
+
 /// The client as roxy established it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
@@ -133,6 +138,12 @@ pub trait LayerHost: Send + Sync + 'static {
     /// it arrives. A denial is a response, not an error. `Err` fails the
     /// exchange closed (for example, the request does not validate).
     async fn next(&self, req: LayerRequest) -> Result<LayerResponse, HostError>;
+
+    /// A slot for one endpoint call, taken before the call's body leaves
+    /// the guest: `endpoints.call` waits here while the exchange has as
+    /// many calls in flight as the host allows, so a waiting call holds
+    /// nothing.
+    async fn endpoint_permit(&self) -> Result<EndpointPermit, EndpointError>;
 
     /// Call the named endpoint (capability `endpoints`). The request's
     /// URI holds only the path and query the guest asked for; the host

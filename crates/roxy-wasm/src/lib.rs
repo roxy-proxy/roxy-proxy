@@ -22,8 +22,8 @@ pub use error::{Budget, LayerError, LoadError};
 pub use exchange::LayerOutcome;
 pub use head::MAX_FIELDS_BYTES;
 pub use host::{
-    EndpointError, FlowInfo, HostError, LayerHost, LayerRequest, LayerResponse, LogLevel,
-    Principal, TagError,
+    EndpointError, EndpointPermit, FlowInfo, HostError, LayerHost, LayerRequest, LayerResponse,
+    LogLevel, Principal, TagError,
 };
 pub use runtime::{Layer, SlotWait, WasmRuntime};
 pub use state::{MAX_BODY_BYTES, MAX_MESSAGE_BYTES};

@@ -24,14 +24,14 @@ use crate::secrets::Secrets;
 use crate::server::Shared;
 use crate::upstream::{ConnectError, Protocols, classify};
 
-/// Largest request body an endpoint call carries (it is buffered, charged
-/// to the buffer budget, so the guest's body is read under the timeout and
-/// the call is bounded).
+/// Largest request body an endpoint call carries. It is buffered, charged
+/// to the buffer budget, and read under the timeout.
 const MAX_ENDPOINT_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Endpoint calls one exchange has in flight at once; the rest wait their
-/// turn. With [`MAX_ENDPOINT_REQUEST_BYTES`] this bounds what a guest's
-/// calls can have roxy hold for it.
+/// Endpoint calls one exchange has in flight at once. The guest waits for a
+/// permit in `endpoints.call`, before the host takes the call's body, so
+/// with [`MAX_ENDPOINT_REQUEST_BYTES`] this bounds what an exchange's calls
+/// can have roxy hold for it.
 pub(super) const MAX_ENDPOINT_CALLS_IN_FLIGHT: usize = 8;
 
 /// Request fields the addon may not set on an endpoint call: hop-by-hop and
@@ -211,16 +211,10 @@ async fn attempt(
     let (scheme, authority) = authority_of(&uri).map_err(fail)?;
     let (parts, body) = req.into_parts();
     // The guest drives the body, so reading it is under the timeout like
-    // the attempt itself; the permit holds the exchange's in-flight cap.
-    let admitted = tokio::time::timeout(spec.timeout, async {
-        let permit = st.endpoint_calls.acquire().await;
-        (permit, collect_body(&st.shared, body).await)
-    })
-    .await;
-    let Ok((permit, body)) = admitted else {
+    // the attempt itself.
+    let Ok(body) = tokio::time::timeout(spec.timeout, collect_body(&st.shared, body)).await else {
         return Err(EndpointError::Timeout);
     };
-    let _permit = permit.map_err(|e| fail(format!("endpoint calls: {e}")))?;
     let (body, _lease) = body?;
 
     let mut headers = http::HeaderMap::new();
