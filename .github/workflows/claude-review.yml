@@ -25,6 +25,7 @@ jobs:
         with:
           anthropic_federation_rule_id: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
           anthropic_organization_id: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
           # Enable progress tracking
           track_progress: true
@@ -63,7 +64,8 @@ jobs:
 
             Provide detailed feedback using inline comments for specific issues.
             Use top-level comments for general observations or praise. If there
-            are no blocking issues, approve the pull request.
+            are no blocking issues, run
+            `gh pr review --approve --body "<short summary>"`.
 
           # Tools for comprehensive PR review
           claude_args: |
