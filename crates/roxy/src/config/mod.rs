@@ -708,7 +708,7 @@ pub struct Addon {
     #[serde(default)]
     pub subscribe: Subscribe,
     /// Opaque config passed to the addon as JSON.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "units::json")]
     pub config: serde_json::Value,
     #[serde(default)]
     pub capabilities: Vec<Capability>,

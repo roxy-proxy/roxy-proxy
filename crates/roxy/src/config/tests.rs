@@ -1228,3 +1228,23 @@ fn addon_config_is_json() {
         serde_json::json!({ "1": "a", "on": "yes", "n": 2, "l": ["x"] })
     );
 }
+
+/// Keys that become the same string are a repeated key, at any depth.
+#[test]
+fn addon_config_keys_collide_as_strings() {
+    for (c, key) in [
+        ("{ 1: a, \"1\": b }", "1"),
+        ("{ x: { true: a, \"true\": b } }", "true"),
+        ("[{ 2: a, \"2\": b }]", "2"),
+    ] {
+        let err = Config::from_yaml(&format!(
+            "{BASE}addons: [{{ name: a, path: /a.wasm, config: {c} }}]\n"
+        ))
+        .expect_err(c)
+        .to_string();
+        assert!(
+            err.contains(&format!("duplicate key `{key}`")),
+            "{c}: {err}"
+        );
+    }
+}
