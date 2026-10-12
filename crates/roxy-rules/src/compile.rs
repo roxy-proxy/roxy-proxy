@@ -10,8 +10,8 @@
 //!   head ([`Needs::reads`]), which decides whether its rule is a head rule
 //!   or a watching rule.
 //! * `like` is a full-match glob where only `*` (any run, including `/`)
-//!   and `?` (one character) are special; it compiles to a `globset`
-//!   matcher.
+//!   and `?` (one character) are special; it compiles to a regex with the
+//!   same limits as `matches`.
 //! * `matches` is a full-match regex: the pattern is compiled as
 //!   `^(?:pattern)$` with bounded program and DFA sizes.
 //! * `under "x"` is `host == "x" or host ends_with ".x"`, ASCII
@@ -23,7 +23,6 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use globset::{GlobBuilder, GlobMatcher};
 use ipnet::{IpNet, Ipv4Net};
 use regex::{Regex, RegexBuilder};
 
@@ -39,6 +38,10 @@ pub const REGEX_SIZE_LIMIT: usize = 1 << 20;
 /// Lazy-DFA cache limit per regex (bytes).
 pub const REGEX_DFA_SIZE_LIMIT: usize = 2 << 20;
 const REGEX_NEST_LIMIT: u32 = 64;
+/// Longest `like` pattern, in bytes: far longer than any host or path glob,
+/// and small enough that every pattern fits [`REGEX_SIZE_LIMIT`] (`?` and
+/// `*` each cost about 1 KiB of compiled regex).
+pub const MAX_GLOB_BYTES: usize = 1024;
 
 /// Compilation environment for one expression.
 pub(crate) struct Env<'a> {
@@ -179,7 +182,7 @@ pub(crate) enum Pred {
     },
     Glob {
         lhs: ROperand,
-        glob: GlobMatcher,
+        glob: Regex,
     },
     Regex {
         lhs: ROperand,
@@ -394,27 +397,28 @@ fn regex_error(e: &regex::Error) -> String {
 }
 
 /// Build a full-match glob in which only `*` and `?` are special.
-fn build_glob(span: Span, pattern: &str, case_insensitive: bool) -> Result<GlobMatcher, ExprError> {
-    let mut glob = String::with_capacity(pattern.len() + 8);
+fn build_glob(span: Span, pattern: &str, case_insensitive: bool) -> Result<Regex, ExprError> {
+    if pattern.len() > MAX_GLOB_BYTES {
+        return Err(ExprError::new(
+            span,
+            format!("pattern is longer than {MAX_GLOB_BYTES} bytes"),
+        ));
+    }
+    // `(?s)` so `*` and `?` span every character, newline included.
+    let mut re = String::with_capacity(pattern.len() + 8);
+    re.push_str("(?s)");
     let mut prev_star = false;
     let mut buf = [0u8; 4];
     for c in pattern.chars() {
         match c {
-            // `**` has path-component meaning in globset; `*` already spans
-            // `/` here, so runs of stars collapse to one.
             '*' if prev_star => {}
-            '*' | '?' => glob.push(c),
-            _ => glob.push_str(&globset::escape(c.encode_utf8(&mut buf))),
+            '*' => re.push_str(".*"),
+            '?' => re.push('.'),
+            _ => re.push_str(&regex::escape(c.encode_utf8(&mut buf))),
         }
         prev_star = c == '*';
     }
-    GlobBuilder::new(&glob)
-        .literal_separator(false)
-        .backslash_escape(false)
-        .case_insensitive(case_insensitive)
-        .build()
-        .map(|g| g.compile_matcher())
-        .map_err(|e| ExprError::new(span, format!("invalid pattern: {e}")))
+    anchored_regex(&re, case_insensitive).map_err(|e| ExprError::new(span, regex_error(&e)))
 }
 
 /// An operand after field resolution, before lowering.

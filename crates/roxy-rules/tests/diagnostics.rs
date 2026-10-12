@@ -321,3 +321,25 @@ proptest! {
         let _ = try_compile(METRICS, &rules);
     }
 }
+
+/// A `like` pattern is bounded at compile time, below what the regex size
+/// limit admits for the costliest globs (`?` and `*` on a case-insensitive
+/// field), so every pattern within the bound compiles.
+#[test]
+fn like_pattern_length_is_bounded() {
+    let rule = |pat: &str| format!("- id: a\n  when: 'host like \"{pat}\"'\n  then: allow\n");
+    let over = rule(&"k".repeat(roxy_rules::MAX_GLOB_BYTES + 1));
+    let diags = try_compile("", &over).expect_err("oversize pattern");
+    assert_eq!(diags.len(), 1);
+    assert!(
+        diags[0].starts_with("rules[0].when:1:11: pattern is longer than"),
+        "{}",
+        diags[0]
+    );
+    for at_bound in [
+        "?".repeat(roxy_rules::MAX_GLOB_BYTES),
+        "*k".repeat(roxy_rules::MAX_GLOB_BYTES / 2),
+    ] {
+        try_compile("", &rule(&at_bound)).unwrap_or_else(|d| panic!("{}", d.join("\n")));
+    }
+}

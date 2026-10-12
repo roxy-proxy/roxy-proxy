@@ -40,7 +40,7 @@ method      := [A-Z][A-Z_]*                       ; HTTP method names only
   exact: method `get` is forwarded as an extension method, may carry a
   body, and matches neither `method == GET` nor `method in [GET, HEAD]`.
 - Compile errors: type mismatch (`host under 443`), a regex that does not
-  compile, a bad CIDR mask, `metric.foo` with no such metric, an undefined
+  compile, a `like` pattern longer than 1 KiB, a bad CIDR mask, `metric.foo` with no such metric, an undefined
   `@list`, a `${secret:name}` placeholder in a string (it would compare
   against its own text; [secrets](/reference/secrets)), and a predicate
   that can never match: `under` with an empty label (`"a..b"`,
