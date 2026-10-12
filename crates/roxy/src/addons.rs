@@ -88,7 +88,7 @@ fn usize_of(n: u64) -> usize {
     usize::try_from(n).unwrap_or(usize::MAX)
 }
 
-fn layer_config(a: &Addon, max_headers: usize) -> anyhow::Result<LayerConfig> {
+fn layer_config(a: &Addon, max_headers: usize) -> LayerConfig {
     let d = LayerLimits::default();
     let l = &a.limits;
     let max_memory = l.max_memory.map_or(d.max_memory, |b| b.as_u64());
@@ -110,15 +110,14 @@ fn layer_config(a: &Addon, max_headers: usize) -> anyhow::Result<LayerConfig> {
             "addon limits differ from the defaults"
         );
     }
-    let config_json = serde_json::to_string(&a.config)
-        .with_context(|| format!("addon {}: `config` is not representable as JSON", a.name))?;
-    Ok(LayerConfig {
+    let config_json = a.config.to_string();
+    LayerConfig {
         name: a.name.clone(),
         capabilities: capabilities(&a.capabilities),
         limits,
         max_headers,
         config_json,
-    })
+    }
 }
 
 fn endpoints(a: &Addon) -> anyhow::Result<HashMap<String, EndpointSpec>> {
@@ -258,7 +257,7 @@ impl AddonLoader {
             .ok_or_else(|| anyhow!("addon {}: no `path`", a.name))?;
         let bytes = std::fs::read(path)
             .with_context(|| format!("addon {}: reading {}", a.name, path.display()))?;
-        let lc = layer_config(a, max_headers)?;
+        let lc = layer_config(a, max_headers);
         let key = {
             let mut h = DefaultHasher::new();
             bytes.hash(&mut h);
@@ -362,7 +361,6 @@ mod tests {
         );
         let recycle = |i: usize| {
             layer_config(&c.addons[i], c.limits.max_headers)
-                .unwrap()
                 .limits
                 .recycle_above_memory
         };

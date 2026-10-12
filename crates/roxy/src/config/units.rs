@@ -207,6 +207,77 @@ where
     d.deserialize_map(Vis(PhantomData))
 }
 
+/// Any value, read as JSON. Map keys become strings, and two keys that
+/// become the same string (`1` and `"1"`) are an error, as any repeated key
+/// is: `serde_json`'s own map would keep the last.
+pub(super) fn json<'de, D: Deserializer<'de>>(d: D) -> Result<serde_json::Value, D::Error> {
+    Json::deserialize(d).map(|j| j.0)
+}
+
+struct Json(serde_json::Value);
+
+impl<'de> Deserialize<'de> for Json {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(JsonVisitor)
+    }
+}
+
+struct JsonVisitor;
+
+impl<'de> Visitor<'de> for JsonVisitor {
+    type Value = Json;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a value representable as JSON")
+    }
+    fn visit_bool<E>(self, v: bool) -> Result<Json, E> {
+        Ok(Json(v.into()))
+    }
+    fn visit_i64<E>(self, v: i64) -> Result<Json, E> {
+        Ok(Json(v.into()))
+    }
+    fn visit_u64<E>(self, v: u64) -> Result<Json, E> {
+        Ok(Json(v.into()))
+    }
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<Json, E> {
+        serde_json::Number::from_f64(v)
+            .map(|n| Json(n.into()))
+            .ok_or_else(|| E::custom(format!("{v} is not representable as JSON")))
+    }
+    fn visit_str<E>(self, v: &str) -> Result<Json, E> {
+        Ok(Json(v.into()))
+    }
+    fn visit_string<E>(self, v: String) -> Result<Json, E> {
+        Ok(Json(v.into()))
+    }
+    fn visit_unit<E>(self) -> Result<Json, E> {
+        Ok(Json(serde_json::Value::Null))
+    }
+    fn visit_none<E>(self) -> Result<Json, E> {
+        Ok(Json(serde_json::Value::Null))
+    }
+    fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Json, D::Error> {
+        Json::deserialize(d)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Json, A::Error> {
+        let mut out = Vec::new();
+        while let Some(Json(v)) = seq.next_element()? {
+            out.push(v);
+        }
+        Ok(Json(out.into()))
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Json, A::Error> {
+        let mut out = serde_json::Map::new();
+        while let Some(k) = map.next_key::<String>()? {
+            if out.contains_key(&k) {
+                return Err(de::Error::custom(format!("duplicate key `{k}`")));
+            }
+            let Json(v) = map.next_value()?;
+            out.insert(k, v);
+        }
+        Ok(Json(out.into()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

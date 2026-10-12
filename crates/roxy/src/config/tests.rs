@@ -1215,3 +1215,49 @@ fn docs_list_the_restart_only_settings() {
     let listed: Vec<&str> = section.split('`').skip(1).step_by(2).collect();
     assert_eq!(listed, Startup::NAMES, "{section}");
 }
+
+/// An addon's `config` is read as JSON: a map key is its text, `yes` is a
+/// string, and numbers and lists keep their type.
+#[test]
+fn addon_config_is_json() {
+    let cfg = parse(&format!(
+        "{BASE}addons: [{{ name: a, path: /a.wasm, config: {{ 1: a, on: yes, n: 2, l: [x] }} }}]\n"
+    ));
+    assert_eq!(
+        cfg.addons[0].config,
+        serde_json::json!({ "1": "a", "on": "yes", "n": 2, "l": ["x"] })
+    );
+}
+
+/// Keys that become the same string are a repeated key, at any depth.
+#[test]
+fn addon_config_keys_collide_as_strings() {
+    for (c, key) in [
+        ("{ 1: a, \"1\": b }", "1"),
+        ("{ x: { true: a, \"true\": b } }", "true"),
+        ("[{ 2: a, \"2\": b }]", "2"),
+    ] {
+        let err = Config::from_yaml(&format!(
+            "{BASE}addons: [{{ name: a, path: /a.wasm, config: {c} }}]\n"
+        ))
+        .expect_err(c)
+        .to_string();
+        assert!(
+            err.contains(&format!("duplicate key `{key}`")),
+            "{c}: {err}"
+        );
+    }
+}
+
+/// A float JSON cannot hold is refused, not passed on as `null`.
+#[test]
+fn addon_config_refuses_non_finite_floats() {
+    for c in ["{ r: .nan }", "{ r: .inf }", "[-.inf]"] {
+        let err = Config::from_yaml(&format!(
+            "{BASE}addons: [{{ name: a, path: /a.wasm, config: {c} }}]\n"
+        ))
+        .expect_err(c)
+        .to_string();
+        assert!(err.contains("is not a finite number"), "{c}: {err}");
+    }
+}

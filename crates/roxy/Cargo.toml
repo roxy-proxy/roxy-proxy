@@ -30,7 +30,6 @@ roxy-proxy.workspace = true
 roxy-rules.workspace = true
 roxy-tls.workspace = true
 serde.workspace = true
-serde_yaml_ng.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tracing.workspace = true

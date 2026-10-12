@@ -10,11 +10,6 @@ version = 2
 unmaintained = "all"
 unsound = "all"
 yanked = "deny"
-ignore = [
-    # unsafe-libyaml, the only dependency of serde_yaml_ng. Replacing the YAML
-    # parser is tracked in #454.
-    "RUSTSEC-2024-0449",
-]
 
 [licenses]
 version = 2

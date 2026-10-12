@@ -9,7 +9,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use roxy_rules::{Field, MapView, MetricConfig, MetricStore, Policy, PolicyInput, Sample, Value};
 
 fn store(metrics_yaml: &str) -> MetricStore {
-    let metrics: Vec<MetricConfig> = serde_yaml_ng::from_str(metrics_yaml).unwrap();
+    let metrics: Vec<MetricConfig> = roxy_rules::yaml::from_str(metrics_yaml).unwrap();
     let none = HashSet::new();
     let policy = Policy::compile(&PolicyInput {
         rules: &[],

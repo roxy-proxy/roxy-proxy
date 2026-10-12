@@ -17,10 +17,10 @@ pub(crate) fn try_compile(metrics_yaml: &str, rules_yaml: &str) -> Result<Policy
     let metrics: Vec<MetricConfig> = if metrics_yaml.trim().is_empty() {
         Vec::new()
     } else {
-        serde_yaml_ng::from_str(metrics_yaml).map_err(|e| vec![format!("parse: {e}")])?
+        roxy_rules::yaml::from_str(metrics_yaml).map_err(|e| vec![format!("parse: {e}")])?
     };
     let rules: Vec<RuleConfig> =
-        serde_yaml_ng::from_str(rules_yaml).map_err(|e| vec![format!("parse: {e}")])?;
+        roxy_rules::yaml::from_str(rules_yaml).map_err(|e| vec![format!("parse: {e}")])?;
     let secrets = secret_names();
     let lists: HashSet<String> = ["internal", "blocked"]
         .into_iter()

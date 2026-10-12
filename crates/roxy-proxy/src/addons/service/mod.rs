@@ -595,7 +595,7 @@ pub(crate) mod testing {
         secrets: &[(&str, &str)],
         addons: Vec<Arc<AddonSpec>>,
     ) {
-        let rules: Vec<RuleConfig> = serde_yaml_ng::from_str(rules).unwrap();
+        let rules: Vec<RuleConfig> = roxy_rules::yaml::from_str(rules).unwrap();
         let none = std::collections::HashSet::new();
         let secret_names = secrets.iter().map(|(n, _)| (*n).to_owned()).collect();
         let input = PolicyInput {

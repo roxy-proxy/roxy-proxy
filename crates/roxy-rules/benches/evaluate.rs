@@ -42,10 +42,11 @@ fn rules_yaml() -> String {
 }
 
 fn policy() -> Policy {
-    let rules: Vec<RuleConfig> = serde_yaml_ng::from_str(&rules_yaml()).unwrap();
-    let metrics: Vec<roxy_rules::MetricConfig> =
-        serde_yaml_ng::from_str("[{ id: writes, count: requests, key: [client.ip], window: 1m }]")
-            .unwrap();
+    let rules: Vec<RuleConfig> = roxy_rules::yaml::from_str(&rules_yaml()).unwrap();
+    let metrics: Vec<roxy_rules::MetricConfig> = roxy_rules::yaml::from_str(
+        "[{ id: writes, count: requests, key: [client.ip], window: 1m }]",
+    )
+    .unwrap();
     let none = HashSet::new();
     Policy::compile(&PolicyInput {
         rules: &rules,

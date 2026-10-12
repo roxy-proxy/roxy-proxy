@@ -41,7 +41,7 @@ impl TestClock {
 }
 
 fn compile(metrics_yaml: &str) -> Policy {
-    let metrics: Vec<MetricConfig> = serde_yaml_ng::from_str(metrics_yaml).unwrap();
+    let metrics: Vec<MetricConfig> = crate::yaml::from_str(metrics_yaml).unwrap();
     let none = HashSet::new();
     Policy::compile(&PolicyInput {
         rules: &[],
