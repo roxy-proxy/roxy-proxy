@@ -1253,9 +1253,11 @@ fn addon_config_keys_collide_as_strings() {
 #[test]
 fn addon_config_refuses_non_finite_floats() {
     for c in ["{ r: .nan }", "{ r: .inf }", "[-.inf]"] {
-        Config::from_yaml(&format!(
+        let err = Config::from_yaml(&format!(
             "{BASE}addons: [{{ name: a, path: /a.wasm, config: {c} }}]\n"
         ))
-        .expect_err(c);
+        .expect_err(c)
+        .to_string();
+        assert!(err.contains("is not a finite number"), "{c}: {err}");
     }
 }
