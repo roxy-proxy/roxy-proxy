@@ -759,7 +759,10 @@ fn literal_set(
             let set = items
                 .iter()
                 .map(|item| match &item.lit {
-                    Lit::Str(s) => Ok(s.as_str().into()),
+                    Lit::Str(s) => {
+                        check_host_literal(&l, s, item.span, HostPos::Whole)?;
+                        Ok(s.as_str().into())
+                    }
                     Lit::Method(m) if method => Ok(m.as_str().into()),
                     Lit::Method(m) => Err(method_literal_error(item.span, m)),
                     Lit::Int(..)
@@ -849,6 +852,15 @@ fn equality(
             ),
         ));
     }
+    for (field, lit) in [(&l, &r), (&r, &l)] {
+        if let Typed::Lit(LitNode {
+            lit: Lit::Str(s),
+            span,
+        }) = lit
+        {
+            check_host_literal(field, s, *span, HostPos::Whole)?;
+        }
+    }
     Ok(Pred::Eq {
         ci: l.ci() || r.ci(),
         lhs: lower(l),
@@ -903,6 +915,17 @@ fn string_op(
             ),
         ));
     }
+    if let Typed::Lit(LitNode {
+        lit: Lit::Str(s),
+        span,
+    }) = &r
+    {
+        let pos = match op {
+            StrOp::EndsWith => HostPos::Tail,
+            StrOp::StartsWith | StrOp::Contains => HostPos::Inside,
+        };
+        check_host_literal(&l, s, *span, pos)?;
+    }
     Ok(Pred::Str {
         ci: l.ci() || r.ci(),
         lhs: lower(l),
@@ -941,10 +964,13 @@ fn pattern(
     };
     let ci = l.ci();
     match op {
-        PatternOp::Like => Ok(Pred::Glob {
-            glob: build_glob(*rspan, pattern, ci)?,
-            lhs: lower(l),
-        }),
+        PatternOp::Like => {
+            check_host_literal(&l, pattern, *rspan, HostPos::Tail)?;
+            Ok(Pred::Glob {
+                glob: build_glob(*rspan, pattern, ci)?,
+                lhs: lower(l),
+            })
+        }
         PatternOp::Matches => Ok(Pred::Regex {
             re: build_regex(*rspan, pattern, ci)?,
             lhs: lower(l),
@@ -956,6 +982,7 @@ fn pattern(
                     "`under` needs a single host name on the left, not a list",
                 ));
             }
+            check_host_literal(&l, pattern, *rspan, HostPos::Inside)?;
             Ok(Pred::Under {
                 suffix: under_suffix(*rspan, pattern)?,
                 lhs: lower(l),
@@ -1026,6 +1053,64 @@ fn check_method_literal(this: &Typed<'_>, other: &Typed<'_>) -> Result<(), ExprE
         && !other.is_method_field()
     {
         return Err(method_literal_error(*span, m));
+    }
+    Ok(())
+}
+
+/// Where a string literal sits against the host it is compared with:
+/// `Whole` (`==`, `in`) and `Tail` (`ends_with`, `like`) end the host, so
+/// a trailing dot there never matches; `Inside` (`starts_with`,
+/// `contains`, `under`) may legitimately end with a dot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostPos {
+    Whole,
+    Tail,
+    Inside,
+}
+
+/// Rejects a literal that no `host` or `tls.sni` can match: hosts arrive
+/// as ASCII A-labels, without a trailing dot, and IPv6 without brackets.
+/// Case is not checked, as host comparisons are case-insensitive. Regexes
+/// (`matches`) are not checked: dots and brackets are syntax there.
+fn check_host_literal(
+    field: &Typed<'_>,
+    lit: &str,
+    span: Span,
+    pos: HostPos,
+) -> Result<(), ExprError> {
+    let Typed::Field(access @ Access::Scalar(Field::Host | Field::TlsSni), _) = field else {
+        return Ok(());
+    };
+    let name = access.display_name();
+    if !lit.is_ascii() {
+        return Err(ExprError::new(
+            span,
+            format!(
+                "`{name}` is ASCII (internationalised labels arrive as A-labels), so {lit:?} \
+                 never matches; write the `xn--` form"
+            ),
+        ));
+    }
+    if lit.contains(['[', ']']) {
+        let hint = lit
+            .strip_prefix('[')
+            .and_then(|l| l.strip_suffix(']'))
+            .map_or_else(String::new, |bare| format!("; write {bare:?}"));
+        return Err(ExprError::new(
+            span,
+            format!(
+                "`{name}` never has brackets (an IPv6 host is bare), so {lit:?} never matches{hint}"
+            ),
+        ));
+    }
+    if pos != HostPos::Inside && lit.ends_with('.') {
+        return Err(ExprError::new(
+            span,
+            format!(
+                "`{name}` never has a trailing dot, so {lit:?} never matches; write {:?}",
+                lit.trim_end_matches('.')
+            ),
+        ));
     }
     Ok(())
 }

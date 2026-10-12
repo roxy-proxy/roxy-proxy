@@ -25,6 +25,35 @@ rules[1].when:1:12: domain "a..b" has an empty label (`..`), which no host has  
     | host under "a..b"
     |            ^^^^^^
 
+== host literal that can never match
+rules[0].when:1:9: `host` never has a trailing dot, so "evil.example." never matches; write "evil.example"  [rule a]
+    | host == "evil.example."
+    |         ^^^^^^^^^^^^^^^
+rules[1].when:1:24: `host` never has a trailing dot, so "evil.example." never matches; write "evil.example"  [rule b]
+    | host in ["ok.example", "evil.example."]
+    |                        ^^^^^^^^^^^^^^^
+rules[2].when:1:11: `host` never has a trailing dot, so "*.example.com." never matches; write "*.example.com"  [rule c]
+    | host like "*.example.com."
+    |           ^^^^^^^^^^^^^^^^
+rules[3].when:1:9: `host` is ASCII (internationalised labels arrive as A-labels), so "bücher.example" never matches; write the `xn--` form  [rule d]
+    | host == "bücher.example"
+    |         ^^^^^^^^^^^^^^^^
+rules[4].when:1:9: `host` never has brackets (an IPv6 host is bare), so "[::1]" never matches; write "::1"  [rule e]
+    | host == "[::1]"
+    |         ^^^^^^^
+rules[5].when:1:1: `host` never has a trailing dot, so "evil.example." never matches; write "evil.example"  [rule f]
+    | "evil.example." != host
+    | ^^^^^^^^^^^^^^^
+rules[6].when:1:16: `host` never has a trailing dot, so ".example." never matches; write ".example"  [rule g]
+    | host ends_with ".example."
+    |                ^^^^^^^^^^^
+rules[7].when:1:21: `tls.sni` never has brackets (an IPv6 host is bare), so "[fe80" never matches  [rule h]
+    | tls.sni starts_with "[fe80"
+    |                     ^^^^^^^
+rules[8].when:1:12: `host` is ASCII (internationalised labels arrive as A-labels), so "café.example" never matches; write the `xn--` form  [rule i]
+    | host under "café.example"
+    |            ^^^^^^^^^^^^^^
+
 == null compared with a field that is never null
 rules[0].when:1:1: `tag["x"]` is never null (false until set), so comparing it with `null` is always the same answer; remove it  [rule a]
     | tag["x"] == null
