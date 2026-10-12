@@ -10,6 +10,9 @@ on:
 jobs:
   review-with-tracking:
     runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_FEDERATION_RULE_ID: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
+      ANTHROPIC_ORGANIZATION_ID: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
     permissions:
       contents: read
       pull-requests: write
