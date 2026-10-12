@@ -94,7 +94,7 @@ either way       {"type":"credit","dir":"request"|"response","bytes":n}  flow co
 
 | rule | detail |
 |---|---|
-| heads | `url` is absolute; `headers` are end-to-end fields as a WASM layer sees them (no hop-by-hop or framing fields). `content-length` is present when the length is known; one the service sends is enforced: more or fewer bytes than declared is a protocol violation |
+| heads | `url` is absolute; `headers` are end-to-end fields as a WASM layer sees them (no hop-by-hop or framing fields). `content-length` is present when the length is known and not zero; one the service sends is enforced: more or fewer bytes than declared is a protocol violation |
 | header values | byte strings: each byte is the code point of the same value (ISO-8859-1), so obs-text bytes (`http.allow_obs_text`) read as Latin-1 and go back as the same bytes. A code point above U+00FF is a protocol violation |
 | order | within each body, from each side: head, bytes, end; bytes before their head or after their end are a protocol violation. The two bodies are independent, and so are the two sides: roxy sends its `response` head as soon as the layer below answers, even while the client's body is still arriving; a service may send its `response` while still forwarding the request body, and may start forwarding before the client's body has ended |
 | end | a stream ends when the service has sent its last message: the `response_end` of the client's response, and the `request_end` of the forwarded request if it was still sending that. roxy sends nothing more on it after that. Either side may end a stream early with `reset`; roxy resets when the client goes away, a deadline passes or the service broke the protocol, and sends nothing after the `reset`. A stream roxy gives up before its `open` has gone out is dropped without a `reset`. A service that resets an enforce stream fails that exchange closed. Each side ignores messages for a stream it has ended; roxy still credits back body bytes among them |
@@ -108,7 +108,13 @@ either way       {"type":"credit","dir":"request"|"response","bytes":n}  flow co
 - **Deadlines.** `first_byte_timeout` bounds getting a stream, then each
   of the service's heads, as it does a WASM layer's: its first answer from
   roxy's `request` head, its second from roxy's `response` head (not from
-  the end of the response body). A stream has no overall clock.
+  the end of the response body). A stream has no overall clock, and no
+  clock runs while roxy waits on the layers below: a service that has
+  forwarded the request head and holds back its body keeps the upstream
+  waiting for as long as it likes.
+- **A `response` sent while the forwarded request is still below** waits
+  for the response from below, and is discarded if the stack below fails:
+  the exchange fails with that failure, not with the service's answer.
 - **Failure is closed** in enforce mode: a failed connection or handshake,
   a protocol violation (bad JSON, a message out of order, bytes of a body
   that is not open, an invalid head, a broken length, bytes past the
@@ -126,8 +132,9 @@ either way       {"type":"credit","dir":"request"|"response","bytes":n}  flow co
   never opened. Every exchange on it fails closed (`service:protocol`) and
   roxy closes it.
 - **[Observe mode](/design/addon-model#modes)** uses the same streams: the
-  service gets copies of both directions, and whatever it sends back other
-  than `credit` and `reset` is ignored. The stream ends after roxy's
+  service gets copies of both directions; `credit` is honoured, `reset`
+  ends the stream and is logged (`layer_error`, `service:closed`), and
+  every other message is ignored. The stream ends after roxy's
   `response_end` (or a `reset`); a cut copy (`observer_lagged`) is reset.
   Waiting for credit is falling behind, so grant extra credit as an observe
   stream opens (`roxy_layer.py` grants 16 MiB per body). Body bytes the

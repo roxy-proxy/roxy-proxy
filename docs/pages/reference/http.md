@@ -113,8 +113,8 @@ pub struct CanonicalRequest {
     pub path: Path,            // normalised, see below
     pub query: Option<Query>,  // validated raw bytes, parsed pairs for matching
     pub headers: Headers,      // lowercase names, ordered, validated, hop-by-hop removed
-    pub body: Body,            // Empty | Sized | Chunked stream, caps enforced
-    pub meta: RequestMeta,     // client version, ids, timestamps
+    pub body: Body,            // a stream; its known length, if any, decides upstream framing
+    pub meta: RequestMeta,     // client version, receipt time, head size, target form, expect/upgrade
 }
 ```
 
@@ -171,8 +171,9 @@ the others refuse for the same reason.
   request body it goes out before the body is judged, and a deny follows
   the body.
 - Hop-by-hop fields (`Connection` and every field it names, `Keep-Alive`,
-  `Proxy-Connection`, `Proxy-Authorization`, `TE`, `Trailer`,
-  `Transfer-Encoding`, `Upgrade`) are consumed and never forwarded.
+  `Proxy-Connection`, `Proxy-Authorization`, `Proxy-Authenticate`, `TE`,
+  `Trailer`, `Transfer-Encoding`, `Upgrade`) are consumed and never
+  forwarded.
   `Upgrade` is honoured only for a WebSocket a rule allows.
 
 ### Body
@@ -185,9 +186,12 @@ the others refuse for the same reason.
 - At most `limits.max_request_body_bytes` (1 GiB), enforced while
   streaming: exceeding it closes the connection mid-stream.
 - The first request head on a connection must arrive within
-  `limits.header_timeout` (10 s) of the connection, or tunnel, opening;
-  every later head within `header_timeout` of its first byte, pipelined
-  bytes included. The body may not stall longer than `limits.body_idle_timeout` (10 m), which also
+  `limits.header_timeout` (10 s) of the connection opening; every later
+  head within `header_timeout` of its first byte, pipelined bytes included.
+  In a tunnel each step gets its own `header_timeout`: the CONNECT head,
+  the first bytes that say whether the tunnel carries TLS, the client TLS
+  handshake, then the first request head (on HTTP/2, the handshake and
+  then the first stream). The body may not stall longer than `limits.body_idle_timeout` (10 m), which also
   bounds how long the client may go without taking the next part of the
   response (on HTTP/2: stream reset with `CANCEL`, `response_error`, reason
   `client_stalled`).
@@ -355,5 +359,8 @@ on HTTP/2 the stream is reset instead.
 A rule sets the status and message with `deny: { status: 451, message:
 "..." }`. After a deny the connection is closed (`connection: close` on
 HTTP/1.1, `GOAWAY` on HTTP/2) unless the rule says `deny: { close: false
-}`; roxy does not read the rest of a refused request body. After an
-upstream failure (`502`, `504`) the connection stays open on both versions.
+}`. On HTTP/1.1 a kept-alive connection discards up to 1 MiB of the
+refused body before the next request, and is closed instead beyond that; a
+closing response lingers for up to 1 s, discarding up to 1 MiB, so the
+client reads the response rather than a reset. After an upstream failure
+(`502`, `504`) the connection stays open on both versions.

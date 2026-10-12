@@ -8,7 +8,7 @@ use roxy_rules::template::{parse_template, secret_names};
 use roxy_rules::{Condition, Diagnostic, Policy, PolicyInput};
 use std::collections::{HashMap, HashSet};
 
-use super::{AddressListSource, CONFIG_VERSION, Config, ListenerMode, UpstreamVerify};
+use super::{AddressListSource, CONFIG_VERSION, Config, UpstreamVerify};
 
 /// What compiling a valid config produces. Built once by
 /// [`Config::validate`] and handed on, so the run path, `roxy check` and
@@ -126,7 +126,6 @@ impl Config {
                     format!("bind address {} is already used by {first}", l.bind),
                 ));
             }
-            validate_listener_mode(l, &path, d);
         }
         if let Some(ca) = &self.ca_server
             && ca.bind.port() != 0
@@ -720,29 +719,5 @@ fn validate_wasm_limits(path: &str, l: &super::AddonLimits, d: &mut Vec<Diagnost
                 bytesize::ByteSize::b(max_memory)
             ),
         ));
-    }
-}
-
-/// The checks that depend on a listener's mode.
-fn validate_listener_mode(l: &super::Listener, path: &str, d: &mut Vec<Diagnostic>) {
-    if l.mode != ListenerMode::Transparent {
-        for (field, set) in [
-            ("allow_passthrough", l.allow_passthrough.is_some()),
-            ("upstream_target", l.upstream_target.is_some()),
-        ] {
-            if set {
-                d.push(Diagnostic::new(
-                    format!("{path}.{field}"),
-                    "only valid on transparent listeners",
-                ));
-            }
-        }
-    }
-    match l.mode {
-        ListenerMode::HttpProxy | ListenerMode::Http => {}
-        ListenerMode::Transparent => d.push(Diagnostic::new(
-            format!("{path}.mode"),
-            "there are no transparent listeners; use `http_proxy`",
-        )),
     }
 }

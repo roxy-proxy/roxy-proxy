@@ -41,7 +41,8 @@ used.
   including the root. roxy sends them after the CA in every handshake, so
   clients that trust only the root can build the chain.
 - `ca_key` is the CA's private key as unencrypted PKCS#8 PEM
-  (`BEGIN PRIVATE KEY`). ECDSA P-256 and P-384, Ed25519 and RSA keys work.
+  (`BEGIN PRIVATE KEY`). ECDSA P-256 is the key type roxy generates and
+  tests; P-384, Ed25519 and RSA keys load but are untested.
   Convert a SEC1 or PKCS#1 key with
   `openssl pkcs8 -topk8 -nocrypt -in ca.key -out ca-pkcs8.key`.
 
