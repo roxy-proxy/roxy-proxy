@@ -76,11 +76,9 @@ the PR (`fuzz/README.md`).
 
 The Claude PR review reads this section. Check, in this order:
 
-1. **Security boundary.** Does the change weaken a design principle in
-   `docs/pages/design/threat-model.md` (fail closed, canonical
-   re-serialisation, deny always wins, never evict, audit backpressure,
-   streams not messages)? An error path that lets a request through, or a
-   parser that forwards bytes it did not re-serialise, is blocking.
+1. **Security boundary.** Read `docs/pages/design/threat-model.md` and
+   check the change against it. Weakening one of its principles is
+   blocking.
 2. **Correctness.** Parser and rule-engine edge cases, limits, and
    behaviour on malformed or partial input.
 3. **Tests.** A behaviour change has a test; a parser or rule-engine fix has
