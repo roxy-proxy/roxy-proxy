@@ -154,4 +154,27 @@ mod tests {
         let doc: Doc = from_str("a: &x { on: true }\nb: *x").unwrap();
         assert!(doc.a.unwrap().on && doc.b.unwrap().on);
     }
+
+    /// A stream of documents is refused, not read up to the first one: what
+    /// roxy applies is all of what a reader sees.
+    #[test]
+    fn one_document_only() {
+        assert!(from_str::<Doc>("a: { on: true }\n---\nb: { on: true }\n").is_err());
+        assert!(from_str::<Doc>("---\na: { on: true }\n...\n").is_ok());
+    }
+
+    /// Aliases are expanded within a budget, so a billion-laughs document
+    /// is refused instead of exhausting memory.
+    #[test]
+    fn alias_bomb_is_refused() {
+        let mut yaml = String::from("l0: &l0 [x, x, x, x, x, x, x, x, x, x]\n");
+        for i in 1..=9 {
+            let prev = format!("*l{}", i - 1);
+            let items = vec![prev.as_str(); 10].join(", ");
+            yaml.push_str(&format!("l{i}: &l{i} [{items}]\n"));
+        }
+        let e = from_str::<serde::de::IgnoredAny>(&yaml).expect_err("alias bomb");
+        let e = e.to_string();
+        assert!(e.contains("budget breached"), "{e}");
+    }
 }
