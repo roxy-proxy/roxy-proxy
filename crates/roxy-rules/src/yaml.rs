@@ -164,6 +164,15 @@ mod tests {
         assert!(from_str::<Doc>("---\na: { on: true }\n...\n").is_ok());
     }
 
+    /// Nesting is bounded, so a deep document is an error, not a stack
+    /// overflow.
+    #[test]
+    fn deep_nesting_is_refused() {
+        let yaml = format!("{}{}", "[".repeat(5000), "]".repeat(5000));
+        let e = from_str::<serde::de::IgnoredAny>(&yaml).expect_err("deep nesting");
+        assert!(e.to_string().contains("recursion limit exceeded"), "{e}");
+    }
+
     /// Aliases are expanded within a budget, so a billion-laughs document
     /// is refused instead of exhausting memory.
     #[test]
