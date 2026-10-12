@@ -61,7 +61,9 @@ type BoxedBody = Pin<Box<dyn http_body::Body<Data = Bytes, Error = BodyError> + 
 ///
 /// A body that ends before it is complete (producer dropped, cap exceeded,
 /// length mismatch) always yields an error as its last frame; it never ends
-/// cleanly, so a truncated body cannot be forwarded as if it were whole.
+/// cleanly, so a truncated body cannot be forwarded as if it were whole
+/// (except on the wire to an HTTP/1.0 client, where a close-delimited body
+/// has no way to signal the cut).
 pub struct Body {
     inner: Inner,
     known_length: Option<u64>,

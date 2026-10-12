@@ -515,13 +515,16 @@ impl ExchangeRun {
             // Anything the guest still holds when its handler returns was
             // never finished (an unfinished body would otherwise end
             // cleanly when the store is reused or dropped).
-            if instance.store.data().table.is_empty() {
-                Ok(())
-            } else {
+            let data = instance.store.data();
+            if !data.table.is_empty() {
                 Err(LayerError::InvalidResponse(
                     "handler returned while still holding resources (an unfinished body?)"
                         .to_owned(),
                 ))
+            } else if data.exchange.as_ref().is_some_and(|e| e.answer.is_some()) {
+                Err(LayerError::NoResponse)
+            } else {
+                Ok(())
             }
         });
         if let Err(e) = result {

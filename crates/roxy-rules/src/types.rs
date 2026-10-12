@@ -766,7 +766,7 @@ mod tests {
                 .unwrap_err()
                 .contains("invalid header name")
         );
-        // Connect-time fields are gone (they return with transparent mode).
+        // There are no connect-time fields.
         assert!(res("dst.host").unwrap_err().contains("unknown field"));
         assert!(res("dst.ip").unwrap_err().contains("unknown field"));
     }

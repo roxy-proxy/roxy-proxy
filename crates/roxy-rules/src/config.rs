@@ -164,8 +164,7 @@ impl Action {
         ),
         (
             "passthrough",
-            "`passthrough` is reserved for a transparent listener, which roxy does not have \
-             (issue #15)",
+            "`passthrough` is reserved: roxy has no transparent listener",
         ),
     ];
 
@@ -800,15 +799,15 @@ mod tests {
         for (yaml, want) in [
             (
                 "passthrough",
-                "`passthrough` is reserved for a transparent listener",
+                "`passthrough` is reserved: roxy has no transparent listener",
             ),
             (
                 "{ passthrough: ~ }",
-                "`passthrough` is reserved for a transparent listener",
+                "`passthrough` is reserved: roxy has no transparent listener",
             ),
             (
                 "[tag: x, passthrough]",
-                "`passthrough` is reserved for a transparent listener",
+                "`passthrough` is reserved: roxy has no transparent listener",
             ),
             (
                 "{ call: scan }",

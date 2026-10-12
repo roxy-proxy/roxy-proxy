@@ -114,7 +114,8 @@
 //!   methods are case-sensitive: `get` is not `GET`. Header names in
 //!   `header["X-Y"]` are lower-cased at compile time.
 //! * **Operators.** `like` is a full-match glob (`*` any run including `/`,
-//!   `?` one char, nothing else special). `matches` is a full-match regex
+//!   `?` one char, nothing else special), at most [`MAX_GLOB_BYTES`] long.
+//!   `matches` is a full-match regex
 //!   (`^(?:…)$`) compiled with [`REGEX_SIZE_LIMIT`]. `under "x"` is
 //!   `host == "x" or host ends_with ".x"`, case-insensitive, ignoring a
 //!   trailing dot. `in` takes a literal list of the left operand's type, or
@@ -164,7 +165,7 @@ pub mod template;
 mod types;
 mod view;
 
-pub use compile::{REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
+pub use compile::{MAX_GLOB_BYTES, REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
 pub use config::{
     Action, AllowArgs, AwsSigV4Args, CaptureTarget, DenyArgs, Expr, LogArgs, LogLevel,
     MetricConfig, MetricCount, RedirectArgs, RewritePathArgs, RuleConfig, Scheme, SetStateArgs,

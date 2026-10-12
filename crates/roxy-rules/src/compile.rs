@@ -10,8 +10,8 @@
 //!   head ([`Needs::reads`]), which decides whether its rule is a head rule
 //!   or a watching rule.
 //! * `like` is a full-match glob where only `*` (any run, including `/`)
-//!   and `?` (one character) are special; it compiles to a `globset`
-//!   matcher.
+//!   and `?` (one character) are special; it compiles to a regex with the
+//!   same limits as `matches`.
 //! * `matches` is a full-match regex: the pattern is compiled as
 //!   `^(?:pattern)$` with bounded program and DFA sizes.
 //! * `under "x"` is `host == "x" or host ends_with ".x"`, ASCII
@@ -23,7 +23,6 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use globset::{GlobBuilder, GlobMatcher};
 use ipnet::{IpNet, Ipv4Net};
 use regex::{Regex, RegexBuilder};
 
@@ -39,6 +38,10 @@ pub const REGEX_SIZE_LIMIT: usize = 1 << 20;
 /// Lazy-DFA cache limit per regex (bytes).
 pub const REGEX_DFA_SIZE_LIMIT: usize = 2 << 20;
 const REGEX_NEST_LIMIT: u32 = 64;
+/// Longest `like` pattern, in bytes: far longer than any host or path glob,
+/// and small enough that every pattern fits [`REGEX_SIZE_LIMIT`] (`?` and
+/// `*` each cost about 1 KiB of compiled regex).
+pub const MAX_GLOB_BYTES: usize = 1024;
 
 /// Compilation environment for one expression.
 pub(crate) struct Env<'a> {
@@ -179,7 +182,7 @@ pub(crate) enum Pred {
     },
     Glob {
         lhs: ROperand,
-        glob: GlobMatcher,
+        glob: Regex,
     },
     Regex {
         lhs: ROperand,
@@ -394,27 +397,28 @@ fn regex_error(e: &regex::Error) -> String {
 }
 
 /// Build a full-match glob in which only `*` and `?` are special.
-fn build_glob(span: Span, pattern: &str, case_insensitive: bool) -> Result<GlobMatcher, ExprError> {
-    let mut glob = String::with_capacity(pattern.len() + 8);
+fn build_glob(span: Span, pattern: &str, case_insensitive: bool) -> Result<Regex, ExprError> {
+    if pattern.len() > MAX_GLOB_BYTES {
+        return Err(ExprError::new(
+            span,
+            format!("pattern is longer than {MAX_GLOB_BYTES} bytes"),
+        ));
+    }
+    // `(?s)` so `*` and `?` span every character, newline included.
+    let mut re = String::with_capacity(pattern.len() + 8);
+    re.push_str("(?s)");
     let mut prev_star = false;
     let mut buf = [0u8; 4];
     for c in pattern.chars() {
         match c {
-            // `**` has path-component meaning in globset; `*` already spans
-            // `/` here, so runs of stars collapse to one.
             '*' if prev_star => {}
-            '*' | '?' => glob.push(c),
-            _ => glob.push_str(&globset::escape(c.encode_utf8(&mut buf))),
+            '*' => re.push_str(".*"),
+            '?' => re.push('.'),
+            _ => re.push_str(&regex::escape(c.encode_utf8(&mut buf))),
         }
         prev_star = c == '*';
     }
-    GlobBuilder::new(&glob)
-        .literal_separator(false)
-        .backslash_escape(false)
-        .case_insensitive(case_insensitive)
-        .build()
-        .map(|g| g.compile_matcher())
-        .map_err(|e| ExprError::new(span, format!("invalid pattern: {e}")))
+    anchored_regex(&re, case_insensitive).map_err(|e| ExprError::new(span, regex_error(&e)))
 }
 
 /// An operand after field resolution, before lowering.
@@ -759,7 +763,10 @@ fn literal_set(
             let set = items
                 .iter()
                 .map(|item| match &item.lit {
-                    Lit::Str(s) => Ok(s.as_str().into()),
+                    Lit::Str(s) => {
+                        check_host_literal(&l, s, item.span, HostPos::Whole)?;
+                        Ok(s.as_str().into())
+                    }
                     Lit::Method(m) if method => Ok(m.as_str().into()),
                     Lit::Method(m) => Err(method_literal_error(item.span, m)),
                     Lit::Int(..)
@@ -849,6 +856,15 @@ fn equality(
             ),
         ));
     }
+    for (field, lit) in [(&l, &r), (&r, &l)] {
+        if let Typed::Lit(LitNode {
+            lit: Lit::Str(s),
+            span,
+        }) = lit
+        {
+            check_host_literal(field, s, *span, HostPos::Whole)?;
+        }
+    }
     Ok(Pred::Eq {
         ci: l.ci() || r.ci(),
         lhs: lower(l),
@@ -903,6 +919,17 @@ fn string_op(
             ),
         ));
     }
+    if let Typed::Lit(LitNode {
+        lit: Lit::Str(s),
+        span,
+    }) = &r
+    {
+        let pos = match op {
+            StrOp::EndsWith => HostPos::Tail,
+            StrOp::StartsWith | StrOp::Contains => HostPos::Inside,
+        };
+        check_host_literal(&l, s, *span, pos)?;
+    }
     Ok(Pred::Str {
         ci: l.ci() || r.ci(),
         lhs: lower(l),
@@ -941,10 +968,13 @@ fn pattern(
     };
     let ci = l.ci();
     match op {
-        PatternOp::Like => Ok(Pred::Glob {
-            glob: build_glob(*rspan, pattern, ci)?,
-            lhs: lower(l),
-        }),
+        PatternOp::Like => {
+            check_host_literal(&l, pattern, *rspan, HostPos::Tail)?;
+            Ok(Pred::Glob {
+                glob: build_glob(*rspan, pattern, ci)?,
+                lhs: lower(l),
+            })
+        }
         PatternOp::Matches => Ok(Pred::Regex {
             re: build_regex(*rspan, pattern, ci)?,
             lhs: lower(l),
@@ -956,6 +986,7 @@ fn pattern(
                     "`under` needs a single host name on the left, not a list",
                 ));
             }
+            check_host_literal(&l, pattern, *rspan, HostPos::Inside)?;
             Ok(Pred::Under {
                 suffix: under_suffix(*rspan, pattern)?,
                 lhs: lower(l),
@@ -1026,6 +1057,64 @@ fn check_method_literal(this: &Typed<'_>, other: &Typed<'_>) -> Result<(), ExprE
         && !other.is_method_field()
     {
         return Err(method_literal_error(*span, m));
+    }
+    Ok(())
+}
+
+/// Where a string literal sits against the host it is compared with:
+/// `Whole` (`==`, `in`) and `Tail` (`ends_with`, `like`) end the host, so
+/// a trailing dot there never matches; `Inside` (`starts_with`,
+/// `contains`, `under`) may legitimately end with a dot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostPos {
+    Whole,
+    Tail,
+    Inside,
+}
+
+/// Rejects a literal that no `host` or `tls.sni` can match: hosts arrive
+/// as ASCII A-labels, without a trailing dot, and IPv6 without brackets.
+/// Case is not checked, as host comparisons are case-insensitive. Regexes
+/// (`matches`) are not checked: dots and brackets are syntax there.
+fn check_host_literal(
+    field: &Typed<'_>,
+    lit: &str,
+    span: Span,
+    pos: HostPos,
+) -> Result<(), ExprError> {
+    let Typed::Field(access @ Access::Scalar(Field::Host | Field::TlsSni), _) = field else {
+        return Ok(());
+    };
+    let name = access.display_name();
+    if !lit.is_ascii() {
+        return Err(ExprError::new(
+            span,
+            format!(
+                "`{name}` is ASCII (internationalised labels arrive as A-labels), so {lit:?} \
+                 never matches; write the `xn--` form"
+            ),
+        ));
+    }
+    if lit.contains(['[', ']']) {
+        let hint = lit
+            .strip_prefix('[')
+            .and_then(|l| l.strip_suffix(']'))
+            .map_or_else(String::new, |bare| format!("; write {bare:?}"));
+        return Err(ExprError::new(
+            span,
+            format!(
+                "`{name}` never has brackets (an IPv6 host is bare), so {lit:?} never matches{hint}"
+            ),
+        ));
+    }
+    if pos != HostPos::Inside && lit.ends_with('.') {
+        return Err(ExprError::new(
+            span,
+            format!(
+                "`{name}` never has a trailing dot, so {lit:?} never matches; write {:?}",
+                lit.trim_end_matches('.')
+            ),
+        ));
     }
     Ok(())
 }

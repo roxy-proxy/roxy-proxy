@@ -517,6 +517,49 @@ impl Handler for Layer {
             assert!(out.is_none());
             return;
         }
+        if let Some(rest) = test.strip_prefix("headers:") {
+            // Hand the host a head of `n` header fields through `respond`,
+            // `next` or `call`, then answer. Past `max_headers` this traps
+            // instead.
+            let (entry, n) = rest.split_once(':').expect("entry:count");
+            let n: usize = n.parse().expect("count");
+            let many: Vec<(String, Vec<u8>)> =
+                (0..n).map(|_| ("x-many".to_owned(), Vec::new())).collect();
+            drop(body);
+            match entry {
+                "respond" => {
+                    let out = chain::respond(&head(200, many), Body::Bytes(b"headers ok".to_vec()));
+                    assert!(out.is_none());
+                }
+                "next" => {
+                    let mut r = forward_head(&req);
+                    r.headers = many;
+                    let (pending, out) = chain::next(&r, Body::Empty).expect("next");
+                    assert!(out.is_none());
+                    let (_, below) = await_response(pending);
+                    drop(read_all(&below));
+                    drop(below);
+                    respond(200, b"headers ok");
+                }
+                "call" => {
+                    let r = RequestHead {
+                        method: "GET".to_owned(),
+                        scheme: None,
+                        authority: None,
+                        path_with_query: "/score".to_owned(),
+                        headers: many,
+                    };
+                    let (pending, out) = endpoints::call("monitor", &r, Body::Empty).expect("call");
+                    assert!(out.is_none());
+                    let (_, below) = await_response(pending);
+                    drop(read_all(&below));
+                    drop(below);
+                    respond(200, b"headers ok");
+                }
+                other => respond(400, format!("unknown entry {other:?}").as_bytes()),
+            }
+            return;
+        }
         if let Some(n) = test.strip_prefix("log:") {
             // Log one message of `n` bytes, then answer.
             let n: usize = n.parse().expect("size");

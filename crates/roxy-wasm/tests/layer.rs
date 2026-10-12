@@ -304,10 +304,12 @@ async fn traps_fail_closed() {
     // The host heard of it before `handle` returned it.
     assert_eq!(host.failed.lock().unwrap().as_slice(), [err]);
 
-    let err = exchange(&layer, Mock::echo(), request("no-response", Body::empty()))
+    let host = Mock::echo();
+    let err = exchange(&layer, host.clone(), request("no-response", Body::empty()))
         .await
         .unwrap_err();
     assert_eq!(err, LayerError::NoResponse);
+    assert_eq!(host.failed.lock().unwrap().as_slice(), [err]);
 }
 
 /// Failures after the response head is out cut the body with an error; a
@@ -400,6 +402,64 @@ async fn an_oversized_fields_is_refused() {
         .await
         .unwrap_err();
     assert_eq!(err, LayerError::BudgetExceeded(Budget::Fields));
+}
+
+/// A head a guest hands the host is held to `max_headers`, like any head
+/// roxy parses. One with more fields fails the exchange closed, named for
+/// the message it was part of, before anything below the layer sees it.
+#[tokio::test]
+async fn too_many_header_fields_are_refused() {
+    let rt = runtime();
+    let mut cfg = config();
+    cfg.capabilities = Capabilities::NONE.with(Capability::Endpoints);
+    cfg.max_headers = 8;
+    let layer = load(&rt, cfg).await;
+    for entry in ["respond", "next", "call"] {
+        let host = Mock::echo();
+        let under = format!("headers:{entry}:8");
+        let (status, body) = exchange(&layer, host.clone(), request(&under, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            (status, body.as_ref()),
+            (StatusCode::OK, b"headers ok".as_slice()),
+            "{entry}"
+        );
+        if entry == "next" {
+            let seen = host.seen.lock().unwrap().clone().unwrap();
+            assert_eq!(seen.headers.len(), 8);
+        }
+
+        let host = Mock::echo();
+        let over = format!("headers:{entry}:9");
+        let err = exchange(&layer, host.clone(), request(&over, Body::empty()))
+            .await
+            .unwrap_err();
+        let msg = "9 header fields, more than max_headers (8)".to_owned();
+        let expected = if entry == "respond" {
+            LayerError::InvalidResponse(msg)
+        } else {
+            LayerError::InvalidRequest(msg)
+        };
+        assert_eq!(err, expected, "{entry}");
+        assert_eq!(host.next_calls.load(Ordering::SeqCst), 0, "{entry}");
+        assert!(host.calls().is_empty(), "{entry}: {:?}", host.calls());
+    }
+
+    // A list longer than an `http` header map can hold at all is refused
+    // the same way, under the default `max_headers`.
+    let layer = load(&rt, config()).await;
+    let err = exchange(
+        &layer,
+        Mock::echo(),
+        request("headers:respond:32768", Body::empty()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        LayerError::InvalidResponse("32768 header fields, more than max_headers (100)".to_owned())
+    );
 }
 
 /// `flow.log` messages and `flow.record` documents are held by the host, so
@@ -721,11 +781,13 @@ async fn failed_instances_are_discarded() {
     cfg.limits.max_instances = 1;
     let layer = load(&rt, cfg).await;
     assert_eq!(count(&layer).await, 1);
-    assert_eq!(count(&layer).await, 2);
-    exchange(&layer, Mock::echo(), request("trap", Body::empty()))
-        .await
-        .unwrap_err();
-    assert_eq!(count(&layer).await, 1);
+    for test in ["trap", "no-response"] {
+        assert_eq!(count(&layer).await, 2, "{test}");
+        exchange(&layer, Mock::echo(), request(test, Body::empty()))
+            .await
+            .unwrap_err();
+        assert_eq!(count(&layer).await, 1, "{test}");
+    }
 }
 
 /// Each host resource a guest holds (streams, pollables, pending responses)

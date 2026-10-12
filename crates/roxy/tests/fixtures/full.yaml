@@ -6,12 +6,6 @@ listeners:
   - name: proxy
     mode: http_proxy
     bind: 0.0.0.0:3128
-  # Deferred (issue #15). Shape reserved so configs do not change when it lands:
-  # - name: tproxy
-  #   mode: transparent
-  #   bind: 0.0.0.0:3129
-  #   allow_passthrough: false
-  #   upstream_target: resolve   # resolve | original_dst | require_match
 
 ca_server:
   bind: 0.0.0.0:3130           # plain HTTP, serves /roxy-ca.pem and /healthz

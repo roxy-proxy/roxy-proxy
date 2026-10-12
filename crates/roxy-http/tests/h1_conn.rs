@@ -24,15 +24,24 @@ fn tunnel() -> Role {
     }
 }
 
-fn conn_with(limits: Limits) -> (DuplexStream, ServerConn<DuplexStream>) {
+fn conn_with_flags(limits: Limits, flags: HttpFlags) -> (DuplexStream, ServerConn<DuplexStream>) {
     let (client, server) = tokio::io::duplex(1 << 16);
-    let conn = ServerConn::new(
-        server,
-        tunnel(),
-        Arc::new(limits),
-        Arc::new(HttpFlags::default()),
-    );
+    let conn = ServerConn::new(server, tunnel(), Arc::new(limits), Arc::new(flags));
     (client, conn)
+}
+
+fn conn_with(limits: Limits) -> (DuplexStream, ServerConn<DuplexStream>) {
+    conn_with_flags(limits, HttpFlags::default())
+}
+
+fn http10_conn() -> (DuplexStream, ServerConn<DuplexStream>) {
+    conn_with_flags(
+        Limits::default(),
+        HttpFlags {
+            allow_http10: true,
+            ..HttpFlags::default()
+        },
+    )
 }
 
 fn conn() -> (DuplexStream, ServerConn<DuplexStream>) {
@@ -337,6 +346,65 @@ async fn without_meta_close_connection_stays_open() {
     let (head, _) = read_response(&mut client, false).await;
     assert!(!head.contains("connection"), "{head}");
     assert_eq!(expect_request(&mut c).await.path.as_str(), "/b");
+}
+
+/// An unknown-length body to an HTTP/1.0 client is close-delimited: raw
+/// bytes, no chunking, and the connection closes after it.
+#[tokio::test]
+async fn http10_unknown_length_response_is_close_delimited() {
+    let (mut client, mut c) = http10_conn();
+    client
+        .write_all(b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    let _ = expect_request(&mut c).await;
+    let (mut tx, body) = Body::channel(1 << 20, None);
+    let server = tokio::spawn(async move {
+        c.respond(ok(body)).await.unwrap();
+        assert!(c.is_closed());
+        assert!(c.next_request().await.unwrap().is_none());
+    });
+    tx.send_data(Bytes::from_static(b"abc")).await.unwrap();
+    tx.send_data(Bytes::from_static(b"defgh")).await.unwrap();
+    tx.finish().await.unwrap();
+    let (head, body) = read_response(&mut client, false).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(!head.contains("transfer-encoding"), "{head}");
+    assert!(!head.contains("content-length"), "{head}");
+    assert!(head.contains("\r\nconnection: close\r\n"), "{head}");
+    // `read_response` reads to EOF when neither framing header is present,
+    // so the body is exactly the bytes sent, with nothing chunk-encoded.
+    assert_eq!(body, b"abcdefgh");
+    drop(client);
+    server.await.unwrap();
+}
+
+/// An HTTP/1.0 client asking for keep-alive still gets one response and
+/// then EOF; a pipelined second request is never answered.
+#[tokio::test]
+async fn http10_keep_alive_is_refused_on_the_wire() {
+    let (mut client, mut c) = http10_conn();
+    client
+        .write_all(b"GET /a HTTP/1.0\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\nGET /b HTTP/1.0\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n")
+        .await
+        .unwrap();
+    let req = expect_request(&mut c).await;
+    assert_eq!(req.path.as_str(), "/a");
+    let server = tokio::spawn(async move {
+        c.respond(ok(Body::from_bytes("bye"))).await.unwrap();
+        assert!(c.is_closed());
+        assert!(c.next_request().await.unwrap().is_none());
+    });
+    let (head, body) = read_response(&mut client, false).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(head.contains("\r\nconnection: close\r\n"), "{head}");
+    assert!(!head.contains("keep-alive"), "{head}");
+    assert_eq!(body, b"bye");
+    let mut rest = Vec::new();
+    client.read_to_end(&mut rest).await.unwrap();
+    assert!(rest.is_empty(), "EOF after the response: {rest:?}");
+    drop(client);
+    server.await.unwrap();
 }
 
 #[tokio::test]

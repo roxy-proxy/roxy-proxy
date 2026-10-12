@@ -24,7 +24,7 @@ use std::fmt::{self, Write as _};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use aws_sigv4::http_request::SignableBody;
 use bytes::Bytes;
@@ -44,6 +44,7 @@ use ulid::Ulid;
 use crate::body::{Collected, collect_prefix};
 use crate::budget::{self, BufferLease, Exhausted};
 use crate::capture::Tap;
+use crate::exchange::{WriteFailure, emit_response_error};
 use crate::flowlog::{
     ClientInfo, DecisionKind, DstInfo, FlowEvent, RequestInfo, ResponseInfo, Stage, Timing, TlsInfo,
 };
@@ -293,12 +294,14 @@ pub(crate) enum ResponseVerdict {
 /// the codec keeps pumping the client's request body.
 pub(crate) trait BodyIo: Send {
     /// [`collect_prefix`], with `meter` asked after each frame whether the
-    /// bytes held so far may be kept.
+    /// bytes held so far may be kept and `idle` bounding the wait for each
+    /// frame.
     fn collect<'a>(
         &'a mut self,
         body: &'a mut Body,
         cap: u64,
         meter: &'a mut (dyn FnMut(u64) -> bool + Send),
+        idle: Option<Duration>,
     ) -> CollectFuture<'a, Result<Collected, DriveError>>;
 }
 
@@ -308,8 +311,9 @@ impl BodyIo for ServerConn<ClientIo> {
         body: &'a mut Body,
         cap: u64,
         meter: &'a mut (dyn FnMut(u64) -> bool + Send),
+        idle: Option<Duration>,
     ) -> CollectFuture<'a, Result<Collected, DriveError>> {
-        Box::pin(self.drive(collect_prefix(body, cap, meter)))
+        Box::pin(self.drive(collect_prefix(body, cap, meter, idle)))
     }
 }
 
@@ -955,7 +959,7 @@ async fn inspect_request_body(
     };
     let shared = cx.shared.clone();
     let mut meter = |held: u64| shared.grow_buffer(&mut lease, held);
-    let inspected = match io.collect(&mut req.body, cap, &mut meter).await {
+    let inspected = match io.collect(&mut req.body, cap, &mut meter, None).await {
         Err(e) => return Verdict::Close(e),
         Ok(Collected::Failed(e)) => return Verdict::Close(body_failure(&e).into()),
         Ok(Collected::Complete { data, held }) => {
@@ -1124,7 +1128,7 @@ async fn sign_request(cx: &mut FlowCx, mut req: CanonicalRequest, io: &mut dyn B
         };
         let shared = cx.shared.clone();
         let mut meter = |held: u64| shared.grow_buffer(&mut lease, held);
-        buffered = match io.collect(&mut req.body, cap, &mut meter).await {
+        buffered = match io.collect(&mut req.body, cap, &mut meter, None).await {
             Err(e) => return Verdict::Close(e),
             Ok(Collected::Failed(e)) => return Verdict::Close(body_failure(&e).into()),
             Ok(Collected::TooLarge { .. }) => return Verdict::Deny(Refusal::sign_body_too_large()),
@@ -1342,8 +1346,20 @@ async fn inspect_response_body(
     };
     let shared = cx.shared.clone();
     let mut meter = |held: u64| shared.grow_buffer(&mut lease, held);
-    let inspected = match io.collect(&mut res.body, cap, &mut meter).await {
+    let idle = Some(cx.snap.limits.response_body_idle_timeout);
+    let inspected = match io.collect(&mut res.body, cap, &mut meter, idle).await {
         Err(e) => return ResponseVerdict::Close(e),
+        // The same stall the front would cut mid-body, caught before the
+        // head went out: the client gets an answer instead of a cut.
+        Ok(Collected::Failed(BodyError::Timeout)) => {
+            let e = WriteFailure::UpstreamStalled;
+            tracing::info!(flow = %cx.flow, error = %e, "upstream response body stalled");
+            emit_response_error(cx, "response_body_timeout", &e);
+            return ResponseVerdict::Deny(Refusal::upstream(
+                StatusCode::GATEWAY_TIMEOUT,
+                "response_body_timeout",
+            ));
+        }
         Ok(Collected::Failed(e)) => {
             tracing::info!(flow = %cx.flow, error = %e, "upstream response body failed");
             return ResponseVerdict::Deny(Refusal::upstream(

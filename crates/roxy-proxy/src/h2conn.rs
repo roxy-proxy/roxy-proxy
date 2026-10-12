@@ -566,10 +566,11 @@ impl BodyIo for H2Front {
         body: &'a mut Body,
         cap: u64,
         meter: &'a mut (dyn FnMut(u64) -> bool + Send),
+        idle: Option<Duration>,
     ) -> CollectFuture<'a, Result<Collected, DriveError>> {
         Box::pin(async move {
             self.continue_once()?;
-            let c = collect_prefix(body, cap, meter).await;
+            let c = collect_prefix(body, cap, meter, idle).await;
             if let Some(e) = self.fail.get() {
                 return Err(e.into());
             }

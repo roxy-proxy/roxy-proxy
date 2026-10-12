@@ -107,9 +107,10 @@ and `file` sources are resolved on the node as in file mode, and a name
 with no value from either refuses the lease.
 
 What the node does with each response code is in the
-[errors table](/reference/node-protocol#errors). A `410` (revoked) installs
-an empty, already expired policy at once, stops polling and offers what is
-spooled to the control plane; a restart with the same state dir ends the
+[errors table](/reference/node-protocol#errors). A `410` (revoked) expires
+the lease at once (the policy stays loaded with its `valid_until` in the
+past, so every request is denied, and the secrets are cleared), stops
+polling and offers what is spooled to the control plane; a restart with the same state dir ends the
 same way. A `401`, `400`, `426` or unreachable control plane lets the lease
 run down: the node denies everything from `valid_until` until the next
 `200`, which recovers it without a restart. It never re-enrols unasked; to

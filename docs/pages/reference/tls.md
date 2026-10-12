@@ -23,6 +23,8 @@ entries, minted on the blocking pool for the name the handshake will serve
 - ALPN offers `h2` (with `http.enable_h2`) and `http/1.1`.
 - TLS 1.2 and 1.3. No session resumption: no session storage, no TLS 1.3
   tickets.
+- The handshake must complete within `limits.header_timeout`
+  (`tls_handshake_timeout`).
 
 ## ClientHello sniffing
 

@@ -95,7 +95,7 @@ pub enum TagError {
 }
 
 /// Why an endpoint call failed. Returned to the guest as a
-/// `wasi:http/types.error-code`; the guest decides what to do (it is not
+/// `roxy:addon/types.error`; the guest decides what to do (it is not
 /// fatal to the exchange).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EndpointError {

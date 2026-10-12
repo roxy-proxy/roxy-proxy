@@ -65,6 +65,52 @@ pub(crate) struct Upstream {
     ws_close_codes: Mutex<Vec<Option<u16>>>,
     /// Offer only `http/1.1` in ALPN.
     h1_only: AtomicBool,
+    /// roxy's writes on every dialled connection fail; its reads go on.
+    writes_fail: AtomicBool,
+}
+
+/// A dialled connection as roxy sees it: reads come through whatever
+/// happens; a write fails once the upstream's `writes_fail` is set.
+struct Dialled {
+    io: tokio::io::DuplexStream,
+    up: Arc<Upstream>,
+}
+
+impl tokio::io::AsyncRead for Dialled {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Dialled {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.up.writes_fail.load(Ordering::SeqCst) {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
+        std::pin::Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.io).poll_shutdown(cx)
+    }
 }
 
 /// Counts one dialled connection as open until it is dropped.
@@ -93,12 +139,20 @@ impl Upstream {
             ws_closed: AtomicUsize::new(0),
             ws_close_codes: Mutex::new(Vec::new()),
             h1_only: AtomicBool::new(false),
+            writes_fail: AtomicBool::new(false),
         })
     }
 
     /// Makes connections from here on negotiate HTTP/1.1 only.
     pub(crate) fn h1_only(&self) {
         self.h1_only.store(true, Ordering::SeqCst);
+    }
+
+    /// From here on roxy's writes fail on every connection it dialled,
+    /// while what the upstream sends still reaches it: a peer whose read
+    /// side has gone and whose write side has not.
+    pub(crate) fn fail_writes(&self) {
+        self.writes_fail.store(true, Ordering::SeqCst);
     }
 
     /// The data messages the framed WebSocket echo (`x-echo: frames`)
@@ -227,7 +281,10 @@ impl Upstream {
             me.serve(addr, ours).await;
             drop(open);
         });
-        Ok(Box::new(theirs))
+        Ok(Box::new(Dialled {
+            io: theirs,
+            up: self.clone(),
+        }))
     }
 
     async fn serve(self: Arc<Self>, addr: SocketAddr, io: tokio::io::DuplexStream) {
@@ -281,7 +338,7 @@ impl Upstream {
     ///   `grpc-status: 0`, `grpc-message: OK`; with `x-forbidden-trailer`
     ///   on the request, `set-cookie: a=b` as well;
     /// * `/drip?n=<n>&ms=<ms>`: `n` chunks, `ms` apart, without reading the
-    ///   body;
+    ///   body; `&first=<ms>` sets the wait before the first chunk;
     /// * `/cut`: reads the body, answers `200` declaring 10 bytes of body,
     ///   sends 3 and breaks the connection;
     /// * a `roxy.layer.v4` handshake: the in-test service layer endpoint
@@ -516,11 +573,16 @@ fn drip(path: &str) -> http::Response<Body> {
             .unwrap_or(0)
     };
     let (n, ms) = (arg("n"), arg("ms"));
+    let first = if query.split('&').any(|kv| kv.starts_with("first=")) {
+        arg("first")
+    } else {
+        ms
+    };
     let chunks = futures_util::stream::unfold(0, move |i| async move {
         if i == n {
             return None;
         }
-        tokio::time::sleep(Duration::from_millis(ms)).await;
+        tokio::time::sleep(Duration::from_millis(if i == 0 { first } else { ms })).await;
         let frame = hyper::body::Frame::data(Bytes::from(format!("chunk{i};")));
         Some((Ok::<_, Infallible>(frame), i + 1))
     });
