@@ -54,7 +54,7 @@ key; `roxy check` refuses a key on the other kind.
 | `subscribe.request` | both | `head`, `full` | `full` | what the layer sees of the request: the head only, or the head and the body ([what a layer sees](/reference/addon-configuration#what-a-layer-sees)) |
 | `subscribe.response` | both | `head`, `full` | `full` | the same for the response |
 | `capabilities` | wasm | list of `endpoints`, `state`, `record`, `metrics`, `log` | none | the [host services](/reference/host-services) the layer may call ([capabilities](/reference/addon-configuration#capabilities)) |
-| `config` | wasm | any YAML value | `null` | handed to the layer as a JSON document through `flow.config`; roxy does not read it |
+| `config` | wasm | any YAML value | `null` | handed to the layer as a JSON document through `flow.config`; roxy does not read it. Map keys become strings (`1: a` is `{"1": "a"}`) |
 | `endpoints` | both | map of name to [endpoint](/reference/addon-configuration#endpoints) | none | named outbound targets. A WASM layer calls them with `endpoints.call`; a service layer's `endpoint` names one of them |
 | `state` | wasm | [store limits](/reference/addon-configuration#state) | defaults below | the layer's keyed store (`state-get`, `state-put`) |
 | `limits` | both | [limits](/reference/addon-configuration#limits) | defaults below | what the layer may cost roxy |

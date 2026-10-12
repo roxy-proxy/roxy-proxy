@@ -1215,3 +1215,16 @@ fn docs_list_the_restart_only_settings() {
     let listed: Vec<&str> = section.split('`').skip(1).step_by(2).collect();
     assert_eq!(listed, Startup::NAMES, "{section}");
 }
+
+/// An addon's `config` is read as JSON: a map key is its text, `yes` is a
+/// string, and numbers and lists keep their type.
+#[test]
+fn addon_config_is_json() {
+    let cfg = parse(&format!(
+        "{BASE}addons: [{{ name: a, path: /a.wasm, config: {{ 1: a, on: yes, n: 2, l: [x] }} }}]\n"
+    ));
+    assert_eq!(
+        cfg.addons[0].config,
+        serde_json::json!({ "1": "a", "on": "yes", "n": 2, "l": ["x"] })
+    );
+}
