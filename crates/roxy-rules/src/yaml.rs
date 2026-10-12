@@ -100,6 +100,7 @@ impl serde_saphyr::MessageFormatter for Messages {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fmt::Write as _;
 
     use serde::Deserialize;
 
@@ -170,8 +171,8 @@ mod tests {
         let mut yaml = String::from("l0: &l0 [x, x, x, x, x, x, x, x, x, x]\n");
         for i in 1..=9 {
             let prev = format!("*l{}", i - 1);
-            let items = vec![prev.as_str(); 10].join(", ");
-            yaml.push_str(&format!("l{i}: &l{i} [{items}]\n"));
+            let items = [prev.as_str(); 10].join(", ");
+            writeln!(yaml, "l{i}: &l{i} [{items}]").unwrap();
         }
         let e = from_str::<serde::de::IgnoredAny>(&yaml).expect_err("alias bomb");
         let e = e.to_string();
