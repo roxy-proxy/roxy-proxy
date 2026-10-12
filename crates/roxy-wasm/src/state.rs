@@ -107,9 +107,10 @@ pub(crate) struct StoreState {
 
 impl StoreState {
     pub(crate) fn new(layer: Arc<LayerShared>, host_calls: Arc<AtomicU64>) -> Self {
-        // No preopens, no environment, no arguments, stdio closed, every
-        // socket address denied and name lookup off: the WASI imports a
-        // stock toolchain links are present but reach nothing.
+        // No preopens, no environment, no arguments, stdin closed, stdout
+        // and stderr discarded, every socket address denied and name lookup
+        // off: the WASI imports a stock toolchain links are present but
+        // reach nothing.
         let wasi = WasiCtx::builder()
             .allow_tcp(false)
             .allow_udp(false)
@@ -444,7 +445,11 @@ impl chain::Host for StoreState {
                 }
             }
         });
-        let pending = self.table.push(PendingResponse::new(fut))?;
+        let Self {
+            table, exchange, ..
+        } = self;
+        let ex = exchange.as_mut().expect("in an exchange");
+        let pending = ex.streams.pending(table, fut)?;
         Ok(Ok((pending, out)))
     }
 
@@ -534,7 +539,11 @@ impl endpoints::Host for StoreState {
                 .await
                 .map_err(endpoint_error)
         });
-        let pending = self.table.push(PendingResponse::new(fut))?;
+        let Self {
+            table, exchange, ..
+        } = self;
+        let ex = exchange.as_mut().expect("in an exchange");
+        let pending = ex.streams.pending(table, fut)?;
         Ok(Ok((pending, out)))
     }
 }

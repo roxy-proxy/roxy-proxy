@@ -305,8 +305,8 @@ body.
 - **Every failure is closed.** A trap, an exceeded budget, a second `next`
   or `respond`, a missing capability, a host failure, a head the host
   refuses, a body stream that is not the host's, a missing response, bytes
-  on an unsubscribed body, a handler that returns still holding a resource
-  (an unfinished body, a pending response), or a cancelled exchange is a
+  on an unsubscribed body, a handler that returns still holding a body
+  stream or a pending response, or a cancelled exchange is a
   `LayerError`: a deny, or a cut exchange after the response head.
 - **A client that gives up cancels the exchange.** The guest is stopped,
   its instance discarded, the slot freed. No `layer_error` is logged.

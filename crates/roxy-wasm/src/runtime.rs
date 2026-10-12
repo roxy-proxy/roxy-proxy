@@ -512,16 +512,18 @@ impl ExchangeRun {
     fn finish(&mut self, result: Result<(), LayerError>) {
         let mut instance = self.instance.take().expect("instance present");
         let result = result.and_then(|()| {
-            // Anything the guest still holds when its handler returns was
-            // never finished (an unfinished body would otherwise end
-            // cleanly when the store is reused or dropped).
+            // A stream or pending response the guest still holds when its
+            // handler returns was never finished (an unfinished body would
+            // otherwise end cleanly when the store is reused or dropped).
+            // Its WASI handles (stdio, pollables) are its own to keep.
             let data = instance.store.data();
-            if !data.table.is_empty() {
+            let ex = data.exchange.as_ref();
+            if ex.is_some_and(|e| e.streams.held()) {
                 Err(LayerError::InvalidResponse(
-                    "handler returned while still holding resources (an unfinished body?)"
+                    "handler returned while still holding a body stream or pending response"
                         .to_owned(),
                 ))
-            } else if data.exchange.as_ref().is_some_and(|e| e.answer.is_some()) {
+            } else if ex.is_some_and(|e| e.answer.is_some()) {
                 Err(LayerError::NoResponse)
             } else {
                 Ok(())

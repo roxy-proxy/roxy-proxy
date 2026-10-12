@@ -78,9 +78,11 @@ boundary in one call. Bodies are plain `wasi:io/streams` (vendored at
   128 KiB. A refused head fails the exchange closed. Trailers on a body are
   dropped in both directions.
 - The host links the rest of WASI 0.2 inertly: an empty environment, no
-  arguments, no preopened directories, stdio closed, TCP, UDP and name
-  lookup off, every socket address denied. Stock toolchains whose standard
-  library imports more than it uses still load, and still reach nothing.
+  arguments, no preopened directories, stdin closed, TCP, UDP and name
+  lookup off, every socket address denied. Anything a guest writes to
+  stdout or stderr is discarded; use `flow.log` to be heard. Stock
+  toolchains whose standard library imports more than it uses still load,
+  and still reach nothing.
 - `wasi:http` is not provided, so a component that imports it fails to
   link. Outbound calls go through `endpoints`.
 - During `init` there is no exchange: `config` works, `log` goes to roxy's
