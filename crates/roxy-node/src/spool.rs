@@ -8,12 +8,13 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::protocol::{FlowSettings, OnHighWater};
 
-/// How many `seq` values are reserved (persisted) at a time. A restart
-/// skips to the end of the last block, so the gap is at most this.
+/// How many `seq` values a reservation covers. The spool keeps between one
+/// and two blocks reserved ahead of `next_seq`, so a restart skips at most
+/// two blocks.
 pub const SEQ_BLOCK: u64 = 1024;
 
 /// Settings before the first lease: spool, bounded, never hold traffic
@@ -44,7 +45,8 @@ struct Queue {
     bytes: u64,
     /// The next `seq` to assign.
     next_seq: u64,
-    /// `seq` values below this are persisted as used.
+    /// `seq` values below this are persisted as used. Only
+    /// [`Spool::reserve`] raises it, after the write is durable.
     reserved_through: u64,
 }
 
@@ -76,6 +78,11 @@ pub struct Spool {
     /// Shipping has ended (quota exhausted, or revoked and drained): new
     /// events are not spooled.
     closed: AtomicBool,
+    /// Set while events are tagged past the persisted mark, so that is
+    /// logged once per episode.
+    unreserved: AtomicBool,
+    /// Wakes [`reserve_loop`] when less than a block is reserved ahead.
+    reserve_wanted: tokio::sync::Notify,
     persist: SeqStore,
 }
 
@@ -90,7 +97,8 @@ impl std::fmt::Debug for Spool {
 
 impl Spool {
     /// A spool whose first `seq` is `first_seq` (the end of the last
-    /// reserved block), persisting reservations through `persist`.
+    /// reservation), persisting reservations through `persist`. Nothing is
+    /// reserved yet: call [`Spool::reserve`] before the first push.
     pub fn new(first_seq: u64, persist: SeqStore) -> Self {
         Self {
             queue: Mutex::new(Queue {
@@ -105,6 +113,8 @@ impl Spool {
             dropping: AtomicBool::new(false),
             dropped_total: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            unreserved: AtomicBool::new(false),
+            reserve_wanted: tokio::sync::Notify::new(),
             persist,
         }
     }
@@ -133,6 +143,7 @@ impl Spool {
         self.closed.store(true, Ordering::Release);
         self.wake();
         self.pushed.notify_one();
+        self.reserve_wanted.notify_one();
     }
 
     pub fn is_closed(&self) -> bool {
@@ -161,8 +172,9 @@ impl Spool {
     }
 
     /// Spools one flow-log line (a JSON object, with or without the
-    /// trailing newline), tagging it with the next `seq`. Never blocks;
-    /// over the high water it holds (`hold`) through [`Spool::poll_ready`]
+    /// trailing newline), tagging it with the next `seq`. Never blocks and
+    /// never touches the disk: reservations are [`reserve_loop`]'s job.
+    /// Over the high water it holds (`hold`) through [`Spool::poll_ready`]
     /// or drops the oldest (`spool`).
     pub fn push(&self, line: &[u8]) {
         let settings = self.settings();
@@ -177,12 +189,17 @@ impl Spool {
         let mut q = lock(&self.queue);
         let seq = q.next_seq;
         q.next_seq += 1;
-        if q.next_seq > q.reserved_through {
-            let through = q.next_seq + SEQ_BLOCK;
-            if let Err(e) = (self.persist)(through) {
-                tracing::error!(error = %e, "flow spool: cannot persist the sequence counter; a restart may reuse sequence numbers");
-            }
-            q.reserved_through = through;
+        if q.next_seq + SEQ_BLOCK > q.reserved_through {
+            self.reserve_wanted.notify_one();
+        }
+        // Rather than wait on the disk, the event is spooled past the
+        // persisted mark; only a restart before the reservation lands can
+        // reuse its `seq`.
+        if q.next_seq > q.reserved_through && !self.unreserved.swap(true, Ordering::AcqRel) {
+            tracing::error!(
+                reserved_through = q.reserved_through,
+                "flow spool: sequence numbers are being used before they are persisted; a restart now may reuse them"
+            );
         }
         let mut tagged = Vec::with_capacity(line.len() + 24);
         tagged.extend_from_slice(format!("{{\"seq\":{seq}").as_bytes());
@@ -311,10 +328,59 @@ impl Spool {
         self.wake();
     }
 
+    /// Persists a reservation of two blocks past `next_seq` unless at
+    /// least one block is already reserved ahead. Blocks on the disk, so
+    /// it runs before traffic starts or on a blocking thread, never on the
+    /// emit path. The spool lock is not held while it writes.
+    pub fn reserve(&self) -> Result<(), String> {
+        let through = {
+            let q = lock(&self.queue);
+            if q.next_seq + SEQ_BLOCK <= q.reserved_through {
+                return Ok(());
+            }
+            q.next_seq + 2 * SEQ_BLOCK
+        };
+        (self.persist)(through)?;
+        let mut q = lock(&self.queue);
+        q.reserved_through = q.reserved_through.max(through);
+        if q.next_seq <= q.reserved_through {
+            self.unreserved.store(false, Ordering::Release);
+        }
+        Ok(())
+    }
+
     /// The next `seq` that will be assigned.
     #[cfg(test)]
     pub fn next_seq(&self) -> u64 {
         lock(&self.queue).next_seq
+    }
+
+    /// The persisted mark.
+    #[cfg(test)]
+    pub fn reserved_through(&self) -> u64 {
+        lock(&self.queue).reserved_through
+    }
+}
+
+/// Keeps `seq` values reserved ahead of the spool, persisting on a blocking
+/// thread whenever a push finds less than a block left. A failed write is
+/// logged and retried after `retry`; until one lands, events keep being
+/// spooled past the mark. Ends once the spool is closed.
+pub async fn reserve_loop(spool: std::sync::Arc<Spool>, retry: Duration) {
+    loop {
+        spool.reserve_wanted.notified().await;
+        if spool.is_closed() {
+            return;
+        }
+        let s = spool.clone();
+        let result = tokio::task::spawn_blocking(move || s.reserve())
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+        if let Err(e) = result {
+            tracing::error!(error = %e, "flow spool: cannot persist the sequence counter; retrying");
+            tokio::time::sleep(retry).await;
+            spool.reserve_wanted.notify_one();
+        }
     }
 }
 
@@ -335,6 +401,7 @@ mod tests {
                 Ok(())
             }),
         );
+        spool.reserve().unwrap();
         (spool, persisted)
     }
 
@@ -362,14 +429,79 @@ mod tests {
         assert_eq!((b.seq_first, b.seq_last), (2048, 2049));
         assert_eq!(b.lines[0], b"{\"seq\":2048,\"event\":\"a\"}");
         assert_eq!(b.lines[1], b"{\"seq\":2049}");
-        // The first push past the reserved mark reserves the next block.
-        assert_eq!(persisted.load(Ordering::Relaxed), 2049 + SEQ_BLOCK);
+        assert_eq!(persisted.load(Ordering::Relaxed), 2048 + 2 * SEQ_BLOCK);
         s.ack(2048);
         assert_eq!(s.pending_events(), 1);
         assert_eq!(s.batch(1 << 20).unwrap().seq_first, 2049);
         s.ack(5000);
         assert!(s.batch(1 << 20).is_none());
         assert_eq!(s.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn push_never_persists_and_reserve_keeps_a_block_ahead() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let c = calls.clone();
+        let s = Spool::new(
+            0,
+            Box::new(move |_| {
+                c.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }),
+        );
+        s.reserve().unwrap();
+        assert_eq!(
+            (calls.load(Ordering::Relaxed), s.reserved_through()),
+            (1, 2 * SEQ_BLOCK)
+        );
+        s.reserve().unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "two blocks ahead: nothing to do"
+        );
+        // Past the reservation without a reserver: still spooled, still
+        // contiguous, and the disk is never touched from a push.
+        for _ in 0..3 * SEQ_BLOCK {
+            s.push(b"{}");
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(s.pending_events() as u64, 3 * SEQ_BLOCK);
+        s.reserve().unwrap();
+        assert_eq!(s.reserved_through(), 5 * SEQ_BLOCK);
+    }
+
+    #[test]
+    fn a_failed_reservation_keeps_the_old_mark() {
+        let s = Spool::new(7, Box::new(|_| Err("disk full".into())));
+        assert_eq!(s.reserve(), Err("disk full".into()));
+        assert_eq!(s.reserved_through(), 7);
+        s.push(b"{}");
+        assert_eq!(s.next_seq(), 8, "spooling goes on");
+    }
+
+    #[tokio::test]
+    async fn the_reserve_loop_tops_up_when_a_push_finds_less_than_a_block() {
+        let (s, persisted) = spool(0);
+        let s = Arc::new(s);
+        let task = tokio::spawn(reserve_loop(s.clone(), Duration::from_millis(10)));
+        for _ in 0..=SEQ_BLOCK {
+            s.push(b"{}");
+        }
+        let want = SEQ_BLOCK + 1 + 2 * SEQ_BLOCK;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while s.reserved_through() != want {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reserver persisted the next reservation");
+        assert_eq!(persisted.load(Ordering::Relaxed), want);
+        s.close();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("closing the spool ends the reserver")
+            .unwrap();
     }
 
     #[test]
