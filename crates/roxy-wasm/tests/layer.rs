@@ -304,10 +304,12 @@ async fn traps_fail_closed() {
     // The host heard of it before `handle` returned it.
     assert_eq!(host.failed.lock().unwrap().as_slice(), [err]);
 
-    let err = exchange(&layer, Mock::echo(), request("no-response", Body::empty()))
+    let host = Mock::echo();
+    let err = exchange(&layer, host.clone(), request("no-response", Body::empty()))
         .await
         .unwrap_err();
     assert_eq!(err, LayerError::NoResponse);
+    assert_eq!(host.failed.lock().unwrap().as_slice(), [err]);
 }
 
 /// Failures after the response head is out cut the body with an error; a
@@ -678,11 +680,13 @@ async fn failed_instances_are_discarded() {
     cfg.limits.max_instances = 1;
     let layer = load(&rt, cfg).await;
     assert_eq!(count(&layer).await, 1);
-    assert_eq!(count(&layer).await, 2);
-    exchange(&layer, Mock::echo(), request("trap", Body::empty()))
-        .await
-        .unwrap_err();
-    assert_eq!(count(&layer).await, 1);
+    for test in ["trap", "no-response"] {
+        assert_eq!(count(&layer).await, 2, "{test}");
+        exchange(&layer, Mock::echo(), request(test, Body::empty()))
+            .await
+            .unwrap_err();
+        assert_eq!(count(&layer).await, 1, "{test}");
+    }
 }
 
 /// Each host resource a guest holds (streams, pollables, pending responses)
