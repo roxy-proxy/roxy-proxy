@@ -31,6 +31,11 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: a, when: 'host under \"example.com..\"', then: allow }\n- { id: b, when: 'host under \"a..b\"', then: allow }",
     ),
     (
+        "host literal that can never match",
+        "",
+        "- { id: a, when: 'host == \"evil.example.\"', then: deny }\n- { id: b, when: 'host in [\"ok.example\", \"evil.example.\"]', then: deny }\n- { id: c, when: 'host like \"*.example.com.\"', then: deny }\n- { id: d, when: 'host == \"b\u{fc}cher.example\"', then: deny }\n- { id: e, when: 'host == \"[::1]\"', then: deny }\n- { id: f, when: '\"evil.example.\" != host', then: deny }\n- { id: g, when: 'host ends_with \".example.\"', then: deny }\n- { id: h, when: 'tls.sni starts_with \"[fe80\"', then: deny }\n- { id: i, when: 'host under \"caf\u{e9}.example\"', then: deny }",
+    ),
+    (
         "null compared with a field that is never null",
         METRICS,
         "- { id: a, when: 'tag[\"x\"] == null', then: allow }\n- { id: b, when: 'metric.writes != null', then: allow }\n- { id: c, when: 'null != body.text', then: allow }",
@@ -276,6 +281,32 @@ fn diagnostics_golden() {
         out.push('\n');
     }
     insta::assert_snapshot!("diagnostics_golden", out);
+}
+
+/// Host literals in the forms hosts are delivered in compile, as do
+/// literals that only look wrong out of position: a dot can end a
+/// `starts_with` prefix, a `like` pattern can end in `*`, and case is
+/// irrelevant.
+#[test]
+fn well_formed_host_literals_compile() {
+    for expr in [
+        "host == \"evil.example\"",
+        "host == \"API.GitHub.com\"",
+        "host == \"10.0.0.1\"",
+        "host == \"::1\"",
+        "host in [\"xn--bcher-kva.example\", \"2001:db8::1\"]",
+        "host like \"*.example.*\"",
+        "host like \"api.?\"",
+        "host starts_with \"api.\"",
+        "host contains \".internal.\"",
+        "host under \"example.com.\"",
+        "host matches \"\\\\[::1\\\\]\"",
+        "path == \"/a.\"",
+        "header[\"x-host\"] == \"[::1]\"",
+    ] {
+        let rules = format!("- id: a\n  when: '{expr}'\n  then: allow\n");
+        common::compile("", &rules);
+    }
 }
 
 /// `roxy check` advice, not a compile error: a metric keyed on a field the

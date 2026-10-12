@@ -44,7 +44,10 @@ method      := [A-Z][A-Z_]*                       ; HTTP method names only
   `@list`, a `${secret:name}` placeholder in a string (it would compare
   against its own text; [secrets](/reference/secrets)), and a predicate
   that can never match: `under` with an empty label (`"a..b"`,
-  `"example.com.."`), or `null` compared with a value that is never `null`
+  `"example.com.."`), a `host` or `tls.sni` literal with a trailing dot
+  (`host == "evil.example."`, `host like "*.example.com."`), non-ASCII
+  characters or brackets (`"[::1]"`) ([fields](/reference/rule-language#fields)),
+  or `null` compared with a value that is never `null`
   ([missing values](/reference/rule-language#missing-values-null)). `in`
   takes a list of the operand's type, a CIDR, or an `@list` for ip fields.
 
@@ -72,9 +75,13 @@ fields watch.
 | `response.body.bytes` | int: response body bytes so far | watched |
 | `ws.direction`, `ws.opcode`, `ws.size`, `ws.text` | string, int, int, string: the WebSocket message being checked | watched, per message ([WebSockets](/reference/websockets#message-rules)) |
 
-`path` is normalised ([HTTP](/reference/http#url-normalisation)). Any rule
-reading `ws.*` makes roxy decode every WebSocket message and strip
-WebSocket extensions.
+`path` is normalised ([HTTP](/reference/http#url-normalisation)). `host`
+and `tls.sni` are the name as roxy delivers it: lower-case, without a
+trailing dot, internationalised labels in A-label (`xn--`) form, and an IP
+literal as the bare address (`10.0.0.1`, `::1`; never `[::1]`). A string
+literal compared with them in another form never matches and is a compile
+error. Any rule reading `ws.*` makes roxy decode every WebSocket message
+and strip WebSocket extensions.
 
 ### Missing values (`null`)
 
