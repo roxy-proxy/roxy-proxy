@@ -7,6 +7,9 @@ on:
 
 jobs:
   review:
+    # Drafts are skipped; marking a PR ready fires ready_for_review, and
+    # later pushes to a ready PR still get reviewed via synchronize.
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     permissions:
       contents: read
