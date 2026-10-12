@@ -74,6 +74,7 @@ version. To move it, change every place it lives in one PR:
 - `rust-toolchain.toml` (`channel`)
 - `Dockerfile` (the `rust:` build image and its digest)
 - `.github/workflows/release.yml` (`RUSTUP_TOOLCHAIN`)
+- `.github/workflows/ci.yml` and `quickstart.yml` (every `toolchain:` input)
 - `.github/workflows/fuzz.yml` (`NIGHTLY`, a dated nightly)
 
 Then run `crates/roxy-wasm/test-components/build.sh` and commit the
