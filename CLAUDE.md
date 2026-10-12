@@ -71,3 +71,24 @@ the PR (`fuzz/README.md`).
 - A change that alters behaviour updates the matching docs page in the same
   PR.
 - Write plainly: short sentences, concrete statements, British spelling.
+
+## Reviewing a pull request
+
+The Claude PR review reads this section. Check, in this order:
+
+1. **Security boundary.** Read `docs/pages/design/threat-model.md` and
+   check the change against it. Weakening one of its principles is
+   blocking.
+2. **Correctness.** Parser and rule-engine edge cases, limits, and
+   behaviour on malformed or partial input.
+3. **Tests.** A behaviour change has a test; a parser or rule-engine fix has
+   a regression test.
+4. **Docs.** A behaviour change updates the matching page under `docs/` in
+   the same PR. `README.md` stays a short overview. Docs describe current
+   behaviour only, with no roadmap prose.
+5. **Fit.** Naming, comment density and error style match the surrounding
+   code. Comments explain why and don't link to docs pages.
+
+Lint, formatting and warnings are CI's job, so don't comment on them. Raise
+out-of-scope problems as a suggested follow-up issue rather than asking the
+PR to grow. Say which findings block and which are optional.
