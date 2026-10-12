@@ -278,7 +278,9 @@ fn invalid(produced: Produced, msg: String) -> LayerError {
 fn head_error(err: HeadError, produced: Produced) -> LayerError {
     match err {
         HeadError::TooLarge => LayerError::BudgetExceeded(Budget::Fields),
-        HeadError::Invalid(msg) | HeadError::InvalidPath(msg) => invalid(produced, msg),
+        HeadError::Invalid(msg) | HeadError::InvalidPath(msg) | HeadError::TooMany(msg) => {
+            invalid(produced, msg)
+        }
     }
 }
 
@@ -400,13 +402,15 @@ impl chain::Host for StoreState {
         head: types::RequestHead,
         body: types::Body,
     ) -> wasmtime::Result<Call> {
+        let max_headers = self.layer.config.max_headers;
         let (host, shared, parsed) = {
             let ex = self.exchange_mut("chain.next")?;
             if ex.next_called {
                 return Err(wasmtime::Error::new(LayerError::NextCalledTwice));
             }
             ex.next_called = true;
-            let parsed = head::request_from_guest(head, Some((&ex.scheme, &ex.authority)));
+            let parsed =
+                head::request_from_guest(head, Some((&ex.scheme, &ex.authority)), max_headers);
             (ex.host.clone(), ex.shared.clone(), parsed)
         };
         let (method, uri, headers) =
@@ -449,7 +453,7 @@ impl chain::Host for StoreState {
                 "respond called twice".to_owned(),
             )));
         };
-        let (status, headers) = head::response_from_guest(head)
+        let (status, headers) = head::response_from_guest(head, self.layer.config.max_headers)
             .map_err(|e| self.fail(head_error(e, Produced::Response)))?;
         let produced_here = matches!(body, types::Body::Bytes(_) | types::Body::Stream);
         let (body, out) = self
@@ -488,7 +492,8 @@ impl endpoints::Host for StoreState {
         let host = ex.host.clone();
         let shared = ex.shared.clone();
 
-        let (method, uri, headers) = match head::request_from_guest(head, None) {
+        let max_headers = self.layer.config.max_headers;
+        let (method, uri, headers) = match head::request_from_guest(head, None, max_headers) {
             Ok(parsed) => parsed,
             Err(HeadError::InvalidPath(_)) => {
                 self.discard_body(body);

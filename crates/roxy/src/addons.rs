@@ -88,7 +88,7 @@ fn usize_of(n: u64) -> usize {
     usize::try_from(n).unwrap_or(usize::MAX)
 }
 
-fn layer_config(a: &Addon) -> anyhow::Result<LayerConfig> {
+fn layer_config(a: &Addon, max_headers: usize) -> anyhow::Result<LayerConfig> {
     let d = LayerLimits::default();
     let l = &a.limits;
     let max_memory = l.max_memory.map_or(d.max_memory, |b| b.as_u64());
@@ -116,6 +116,7 @@ fn layer_config(a: &Addon) -> anyhow::Result<LayerConfig> {
         name: a.name.clone(),
         capabilities: capabilities(&a.capabilities),
         limits,
+        max_headers,
         config_json,
     })
 }
@@ -205,7 +206,7 @@ impl AddonLoader {
             let kind = if a.kind == AddonKind::Service {
                 AddonImpl::Service(service(a)?)
             } else {
-                let (key, layer) = self.wasm(a).await?;
+                let (key, layer) = self.wasm(a, config.limits.max_headers).await?;
                 layers.insert(a.name.clone(), (key, layer.clone()));
                 AddonImpl::Wasm(layer)
             };
@@ -250,14 +251,14 @@ impl AddonLoader {
     }
 
     /// Compiles (or reuses) a WASM addon's layer, with its cache key.
-    async fn wasm(&self, a: &Addon) -> anyhow::Result<(u64, Layer)> {
+    async fn wasm(&self, a: &Addon, max_headers: usize) -> anyhow::Result<(u64, Layer)> {
         let path = a
             .path
             .as_ref()
             .ok_or_else(|| anyhow!("addon {}: no `path`", a.name))?;
         let bytes = std::fs::read(path)
             .with_context(|| format!("addon {}: reading {}", a.name, path.display()))?;
-        let lc = layer_config(a)?;
+        let lc = layer_config(a, max_headers)?;
         let key = {
             let mut h = DefaultHasher::new();
             bytes.hash(&mut h);
@@ -360,7 +361,7 @@ mod tests {
              - { name: c, path: WASM }\n",
         );
         let recycle = |i: usize| {
-            layer_config(&c.addons[i])
+            layer_config(&c.addons[i], c.limits.max_headers)
                 .unwrap()
                 .limits
                 .recycle_above_memory

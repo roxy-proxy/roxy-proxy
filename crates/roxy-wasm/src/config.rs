@@ -148,6 +148,10 @@ pub struct LayerConfig {
     pub capabilities: Capabilities,
     /// Budgets.
     pub limits: LayerLimits,
+    /// `limits.max_headers`: most header fields in a head the layer hands
+    /// the host (`next`, `respond`, `call`), the count roxy holds any head
+    /// to. The host refuses a longer list before lowering it.
+    pub max_headers: usize,
     /// The layer's `config:` value as a JSON document, returned by
     /// `flow.config`. Opaque to roxy.
     pub config_json: String,
@@ -160,6 +164,7 @@ impl LayerConfig {
             name: name.into(),
             capabilities: Capabilities::NONE,
             limits: LayerLimits::default(),
+            max_headers: roxy_http::Limits::default().max_headers,
             config_json: "null".to_owned(),
         }
     }

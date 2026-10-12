@@ -237,6 +237,7 @@ impl AddonDef {
                 name: self.name.clone(),
                 capabilities: self.caps.into_iter().collect(),
                 limits: self.limits,
+                max_headers: Limits::default().max_headers,
                 config_json: self.config.to_string(),
             },
         )
