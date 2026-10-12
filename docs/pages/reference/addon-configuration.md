@@ -113,6 +113,7 @@ What the host holds for a guest outside `max_memory`, not configurable:
 | cap | value | on overrun |
 |---|---|---|
 | a head a guest hands the host (`next`, `respond`, `call`) | 128 KiB: method, scheme, authority, path and query, and every header name and value together | `budget:fields`: fails the exchange |
+| header fields in a head a guest hands the host | [`limits.max_headers`](/reference/limits#limits), the count every head roxy parses is held to | `invalid_request` or `invalid_response`: fails the exchange |
 | a flow's tags, across all its layers | 64 tags, 4 KiB together | `budget:tags`: fails the exchange |
 | a `flow.log` message, or a `flow.record` kind and document together | 64 KiB | `budget:message`: fails the exchange |
 | a whole body handed over in one piece (`body.bytes`) | 1 MiB; a larger body is streamed | `budget:body`: fails the exchange |

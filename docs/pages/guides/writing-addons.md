@@ -72,10 +72,11 @@ boundary in one call. Bodies are plain `wasi:io/streams` (vendored at
   `get` to wait alongside other work, or `wait` to block and take the
   response head and body stream in one call.
 - The host validates every head it is handed: names and values must parse,
-  `host`, `content-length`, hop-by-hop and framing fields are refused (roxy
-  derives them; the body carries its own length), and the whole record
-  must fit in 128 KiB. A refused head fails the exchange closed. Trailers
-  on a body are dropped in both directions.
+  there may be no more than `limits.max_headers` of them, `host`,
+  `content-length`, hop-by-hop and framing fields are refused (roxy derives
+  them; the body carries its own length), and the whole record must fit in
+  128 KiB. A refused head fails the exchange closed. Trailers on a body are
+  dropped in both directions.
 - The host links the rest of WASI 0.2 inertly: an empty environment, no
   arguments, no preopened directories, stdio closed, TCP, UDP and name
   lookup off, every socket address denied. Stock toolchains whose standard

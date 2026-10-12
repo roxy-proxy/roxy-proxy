@@ -197,10 +197,13 @@ mod tests {
     #[test]
     fn defaults_fill_a_relative_head_and_names_are_lower_cased() {
         let (scheme, authority) = defaults();
-        let (method, uri, headers) =
-            request_from_guest(head(vec![("X-Mixed", b"v")]), Some((&scheme, &authority)), MAX)
-                .ok()
-                .unwrap();
+        let (method, uri, headers) = request_from_guest(
+            head(vec![("X-Mixed", b"v")]),
+            Some((&scheme, &authority)),
+            MAX,
+        )
+        .ok()
+        .unwrap();
         assert_eq!(method, Method::GET);
         assert_eq!(uri.to_string(), "https://api.example.com/x?y=1");
         assert_eq!(headers["x-mixed"], "v");
@@ -216,9 +219,10 @@ mod tests {
             "upgrade",
             "transfer-encoding",
         ] {
-            let err = request_from_guest(head(vec![(name, b"v")]), Some((&scheme, &authority)), MAX)
-                .err()
-                .unwrap();
+            let err =
+                request_from_guest(head(vec![(name, b"v")]), Some((&scheme, &authority)), MAX)
+                    .err()
+                    .unwrap();
             assert!(
                 matches!(err, HeadError::Invalid(m) if m.contains(name)),
                 "{name}"
