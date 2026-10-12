@@ -47,7 +47,6 @@ with targets for:
 - the h2 → canonical mapping;
 - the URL normaliser (idempotent, no dot segments survive);
 - the ClientHello sniffer (verdicts never change as more bytes arrive);
-- the DNS query parser;
 - the WebSocket frame decoder;
 - the rule lexer, parser and compiler;
 - policy evaluation (making an input unavailable either changes nothing or

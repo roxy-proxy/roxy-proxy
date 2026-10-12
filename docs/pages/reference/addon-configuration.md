@@ -71,7 +71,7 @@ apply, and each call is an `endpoint_call` flow event.
 | `url` | `http(s)://host[:port][/path]` | required | the target. With `path: fixed` it is the whole target; with `path: prefix` the layer's path and query go under it |
 | `path` | `fixed`, `prefix` | `fixed` | what the layer's request path contributes. `prefix` normalises the layer's path and refuses `..` |
 | `headers` | map of header to value | none | attached by roxy, replacing any the layer set. Values may use `${secret:name}` ([secrets](/reference/secrets)) |
-| `timeout` | duration, positive | `30s` | from the call to the response head; reading the layer's request body counts |
+| `timeout` | duration, positive | `30s` | from the call to the response head; reading the layer's request body counts. Not applied to a service layer's connection to its endpoint, which `first_byte_timeout` bounds along with getting a stream |
 | `private_ok` | bool | `false` | the endpoint may be on a private, loopback or link-local address |
 
 ### `state`
@@ -92,7 +92,7 @@ exchanges slow, never denied. Each is optional.
 
 | key | kind | default | what it bounds |
 |---|---|---|---|
-| `first_byte_timeout` | both | `30s` | how long a layer may hold a head, request or response, before passing it on or answering: its own time only (starting an instance, its work, endpoint calls, reading the body it was given), never time `next` spends below it. Overrun fails closed, `budget:first_byte_timeout`. On a service layer, getting a stream counts against the request head's budget. An observer that gets no instance within it loses its copy (`observer_lagged`, `no_instance`) |
+| `first_byte_timeout` | both | `30s` | how long a layer may hold a head, request or response, before passing it on or answering: its own time only (starting an instance, its work, endpoint calls, reading the body it was given), never time `next` spends below it. Overrun fails closed, `budget:first_byte_timeout`. A service layer gets one budget to obtain a stream and a fresh one from each head. It bounds the layer's own time, not the exchange's: a layer that forwards a head and holds back the body keeps the upstream waiting for as long as it likes, with no clock running ([service layers](/reference/service-layers#semantics)). An observer that gets no instance within it loses its copy (`observer_lagged`, `no_instance`) |
 | `max_memory` | wasm | `64mb` | linear memory per instance, summed over the instance's memories; table growth and the host resource table (4096 live resources: body streams, pollables, pending responses) are capped too. What a layer holds of a body lives here. An interpreter in WASM (Python) needs 128–256 MiB |
 | `max_instances` | wasm | `1024` | live instances, so concurrent exchanges and, with `max_memory`, the layer's memory. An enforce exchange that finds none free waits without a deadline; an observer waits `first_byte_timeout`. Instances start on demand |
 | `recycle_after_exchanges` | wasm | `10000` | an instance is replaced after this many exchanges; `0` replaces it after every exchange |
@@ -148,8 +148,9 @@ named [host services](/reference/host-services):
 Every import is linked whatever is granted (one binary runs under any
 set); an ungranted call traps with `CapabilityDenied` and fails the
 exchange. `flow.current`, `flow.add-tag` and `flow.config` need no
-capability; `flow.add-tag` from an observe layer is refused the same way,
-since a tag steers the `when` of the layers below. There is no `secrets`
+capability; `flow.add-tag` from an observe layer fails the exchange too,
+as a host refusal (`layer_error` with `kind: host`), since a tag steers the
+`when` of the layers below. There is no `secrets`
 capability: credentials go on an endpoint's `headers`.
 
 Service layers have no capabilities: a service gets the exchange, the
@@ -220,9 +221,11 @@ the client's request body into the first layer, and the last layer's
 response.
 
 - What a layer passes on is re-validated as strictly as a client request:
-  an absolute `http(s)` URI; `host`, `content-length`, hop-by-hop and
-  framing fields refused at the boundary (roxy derives them, and the body
-  carries its own length); the workload's limits applied. `chain.next`
+  an absolute `http(s)` URI; `host`, hop-by-hop and framing fields refused
+  at the boundary (roxy derives them); the workload's limits applied. A
+  WASM layer may not set `content-length` either (the body carries its own
+  length); a service layer may, and the body it sends is held to it
+  ([service layers](/reference/service-layers#frames)). `chain.next`
   fills in the scheme and authority from the exchange when the layer
   leaves them unset.
 - A layer's answer must be a final response; a `1xx` other than the `101`
@@ -307,8 +310,10 @@ body.
 - **A client that gives up cancels the exchange.** The guest is stopped,
   its instance discarded, the slot freed. No `layer_error` is logged.
 - **No clean end for a failed body.** A guest body ends with an error once
-  its exchange has failed; a response body holds its end until the handler
-  returns, so a trap after the last byte still cuts it. A streamed body is
+  its exchange has failed; a response body the guest produces (`bytes` or a
+  stream) holds its end until the handler returns, so a trap after the last
+  byte still cuts it. An empty body, or a passed-through body of known
+  length, goes out with `content-length` and is complete once sent. A streamed body is
   complete only through `finish`: dropped unfinished, it is cut, and a
   response body dropped unfinished fails the exchange.
 - **An abandoned request is cut, not failed.** A request body passed to
@@ -318,7 +323,7 @@ body.
   has the response, it may answer itself and its answer stands. A body the
   guest passed through that fails behind it (the client gave up) is cut the
   same way.
-- **An instance that failed is discarded**, never reused.
+- **An instance that failed its exchange is discarded**, never reused.
 - Layers see canonical heads and body streams, never wire bytes, and have
   no filesystem, sockets or environment: all their I/O is `next`,
   `endpoints` and `flow`.

@@ -51,8 +51,11 @@ fn replace(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
 crate-type = ["cdylib"]
 
 [dependencies]
-roxy-addon = "0.2"
+roxy-addon = { git = "https://github.com/roxy-proxy/roxy-proxy" }
 ```
+
+The crate is not published to crates.io; depend on it from the repository
+(pin a `rev` or `tag` to hold a version).
 
 ```sh
 rustup target add wasm32-wasip2

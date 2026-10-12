@@ -42,7 +42,7 @@ limits:
   max_url_bytes: 8kb
   max_headers: 100
   max_request_body_bytes: 1gb
-  header_timeout: 10s             # the slowloris guard: a request head must arrive in full
+  header_timeout: 10s             # the slowloris guard: each step before a request head (CONNECT, TLS handshake, the head itself)
   body_idle_timeout: 10m          # the client's stall: sending its body, or taking the response
   idle_timeout: 1h                # keep-alive idle; also a relayed WebSocket's idle timeout
   h2_max_concurrent_streams: 100
@@ -122,7 +122,7 @@ is charged:
 | a body a rule reads (`body.text`, `response.body.text`) | `max_inspect_body_bytes`, or its `content-length` if smaller; a body with a `content-encoding` reserves the whole cap, whatever its length, since its decoded size is not known until it is; nothing for a body known to be empty (no request body, a `HEAD` response, a `1xx`, `204` or `304`). Once buffered, it shrinks to what is held (the body as sent with its trailers, or its decoded text if larger) and stays until the exchange ends. A body over the cap holds only what was read before that was known: nothing when its `content-length` said so, the prefix read when it was found out mid-stream |
 | a content decoder | each decoder's window, charged before the decoder is created: 32 KiB for `gzip` or `deflate`, the window a `br` stream's first byte declares (1 KiB to 16 MiB), 8 MiB for `zstd` (the largest window accepted, which each frame may use). Stacked codings add up. Held while the decoder runs: for the rule's decision on an inspected body, for the whole body when it is decoded for the addon stack (`http.decode_for_addons`). A window the budget cannot cover fails closed before it is allocated |
 | a request body hashed for `sign: aws_sigv4` | its `content-length` (at most `max_sign_body_bytes`) up front; a chunked body reserves chunk by chunk up to that cap and is refused at the chunk the budget cannot cover. Held until the exchange ends. `unsigned_payload: true` reserves nothing ([signing AWS requests](/reference/secrets#signing-aws-requests)) |
-| an endpoint call's request body | what the guest sends, frame by frame as it is read (at most 16 MiB), held until the call's last attempt is answered since a retry resends it. A body the budget cannot cover refuses the call ([host services](/reference/host-services#endpoints-endpoints)) |
+| an endpoint call's request body | what the guest sends, frame by frame as it is read (at most 16 MiB), held until the call is answered. A body the budget cannot cover refuses the call ([host services](/reference/host-services#endpoints-endpoints)) |
 | a WebSocket whose messages rules read | twice `max_ws_message_bytes` at the upgrade, held for the session. Reading bodies but not messages holds nothing for a WebSocket |
 | an observer's copy | the bytes queued and not yet read, frame by frame, given back as the observer reads them (or drops the copy). A copy whose next frame would overrun the budget is cut (`observer_lagged`, `reason: buffer_budget_exhausted`): the budget bounds how far behind observers are in total, not how many exchanges are observed. A copy whose observer gets no instance within its `first_byte_timeout` is dropped the same way (`reason: no_instance`), so a busy observer cannot pin budget that enforce flows need |
 
@@ -140,7 +140,7 @@ single reservation.
 
 | setting | takes effect |
 |---|---|
-| `max_header_bytes`, `max_url_bytes`, `max_headers`, `max_request_body_bytes`, `header_timeout`, `body_idle_timeout`, `response_body_idle_timeout`, `idle_timeout`, the `h2_*` limits, the `http.*` flags | fixed when a connection is accepted; new connections only |
+| `max_header_bytes`, `max_url_bytes`, `max_headers`, `max_request_body_bytes`, `header_timeout`, `body_idle_timeout`, `response_body_idle_timeout`, `idle_timeout`, the `h2_*` limits, the `http.*` flags | fixed when a connection is accepted; new connections only. A relayed WebSocket takes `idle_timeout` from its exchange's snapshot instead |
 | `max_inspect_body_bytes`, `max_sign_body_bytes`, `max_response_body_bytes`, `response_header_timeout`, the WebSocket limits, `max_observer_lag_bytes`, the policy itself | per exchange, from the snapshot the exchange starts under, on old connections too |
 | `max_buffered_bytes` | process-wide: each reservation is checked against the value in force at that moment; reservations already held stay as they are |
 

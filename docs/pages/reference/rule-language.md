@@ -23,7 +23,7 @@ OP          := "==" | "!=" | "<" | "<=" | ">" | ">="
              | "like"        ; glob, full match ( * ? )
              | "matches"     ; regex, full match
              | "under"       ; host == X or host ends_with "." + X
-literal     := string | number [unit] | bool | list | cidr | @list | method | "null"
+literal     := string | number [unit] | bool | list | ip | cidr | @list | method | "null"
 list        := "[" literal ("," literal)* "]"
 unit        := kb | mb | gb | ms | s | m | h      ; sizes are 1024-based
 method      := [A-Z][A-Z_]*                       ; HTTP method names only

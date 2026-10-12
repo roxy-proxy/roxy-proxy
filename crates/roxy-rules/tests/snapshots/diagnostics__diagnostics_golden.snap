@@ -136,7 +136,7 @@ rules[0].then[0]: sign aws_sigv4: `secret_access_key` must not be empty  [rule a
 rules[0].then[0]: `sign` changes the request, which is already on its way; this rule reads `response.status`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation)  [rule a]
 
 == passthrough is reserved
-parse: .[0].then: `passthrough` is reserved for a transparent listener, which roxy does not have (issue #15) at line 1 column 18
+parse: .[0].then: `passthrough` is reserved: roxy has no transparent listener at line 1 column 18
 
 == call is reserved
 parse: .[0].then[0]: `call` is reserved: addons run above the rules, in config order, not from a rule at line 1 column 19

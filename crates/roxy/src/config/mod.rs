@@ -83,12 +83,6 @@ pub struct Listener {
     #[serde(default)]
     pub mode: ListenerMode,
     pub bind: SocketAddr,
-    /// Transparent listeners only; rejected by `roxy check`.
-    #[serde(default)]
-    pub allow_passthrough: Option<bool>,
-    /// Transparent listeners only; rejected by `roxy check`.
-    #[serde(default)]
-    pub upstream_target: Option<UpstreamTarget>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -100,17 +94,6 @@ pub enum ListenerMode {
     /// Plain HTTP spoken to roxy as the server: origin-form requests, the
     /// target from each request's `Host`.
     Http,
-    /// Parsed so the config shape is stable, but rejected by validation:
-    /// roxy has no transparent mode.
-    Transparent,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UpstreamTarget {
-    Resolve,
-    OriginalDst,
-    RequireMatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -303,7 +286,7 @@ pub struct Limits {
     /// balancer every client arrives from one IP
     /// ([`Startup::per_client_cap`]).
     pub max_connections_per_client: Option<usize>,
-    /// Client-side h2 (when it lands): concurrent streams per connection.
+    /// Client-side h2: concurrent streams per connection.
     pub h2_max_concurrent_streams: u32,
     /// Client-side h2: header list size cap per stream.
     #[serde(deserialize_with = "units::size")]
