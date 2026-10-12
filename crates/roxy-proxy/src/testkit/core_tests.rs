@@ -337,6 +337,56 @@ async fn h1_a_stalled_response_is_cut_off() {
     assert_stalled_response_logged(&kit).await;
 }
 
+/// With a rule reading the response body, the stall happens while roxy is
+/// still collecting the body, before the head reached the client: the
+/// exchange ends with the same reason, answered with a `504`. The
+/// half-read upstream leg is given up: an HTTP/1.1 connection is dropped
+/// (an HTTP/2 upstream loses only the stream and stays pooled).
+async fn a_stalled_response_under_inspection_is_cut_off(h2: bool) {
+    const RULES: &str = r#"
+- id: secret
+  when: host == "up.test" and response.body.text contains "SECRET"
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+    let kit = stalled_response_kit().rules(RULES).start().await;
+    let mut c = if h2 {
+        kit.tunnel("up.test", true).await
+    } else {
+        kit.h1().await
+    };
+    let a = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        c.call("GET", "/drip?n=2&ms=60000&first=0", &[], b""),
+    )
+    .await
+    .expect("the stall is cut off");
+    assert_eq!(a.status, 504, "{a:?}");
+    let err = kit.events("response_error", 1).await;
+    assert_eq!(err[0]["reason"], "response_body_timeout", "{err:#?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["reason"], "response_body_timeout", "{ev:#}");
+    assert_eq!(ev["res"]["status"], 504, "{ev:#}");
+    if !h2 {
+        kit.upstream.wait_open(0).await;
+    }
+    // The client connection is intact: the next exchange goes through.
+    let b = c.call("GET", "/one", &[], b"").await;
+    assert_eq!(b.status, 200, "{b:?}");
+}
+
+#[tokio::test]
+async fn h1_a_stalled_response_under_inspection_is_cut_off() {
+    a_stalled_response_under_inspection_is_cut_off(false).await;
+}
+
+#[tokio::test]
+async fn h2_a_stalled_response_under_inspection_is_cut_off() {
+    a_stalled_response_under_inspection_is_cut_off(true).await;
+}
+
 /// On h2 the stream is reset with `CANCEL`: the upstream stalled, roxy did
 /// not fail.
 #[tokio::test]
