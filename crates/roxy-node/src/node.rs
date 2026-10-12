@@ -18,7 +18,7 @@ use crate::client::{
 };
 use crate::identity::{self, IdentityError};
 use crate::protocol::{Lease, NodeState, PROTOCOL_VERSION, PolicyState, encode_flow_batch};
-use crate::spool::Spool;
+use crate::spool::{Spool, reserve_loop};
 use crate::state::{StateDir, StateError};
 
 /// Backoff for a failed lease fetch, certificate call or flow upload.
@@ -38,6 +38,8 @@ pub enum NodeError {
     Identity(#[from] IdentityError),
     #[error(transparent)]
     Client(#[from] ClientError),
+    #[error("cannot persist the flow sequence counter: {0}")]
+    SeqReserve(String),
     #[error("no node identity in {} and no enrolment token file given", dir.display())]
     NotEnrolled { dir: PathBuf },
     #[error("reading the enrolment token {}: {source}", path.display())]
@@ -216,6 +218,9 @@ impl Node {
             first_seq,
             Box::new(move |n| persist_to.store_seq(n).map_err(|e| e.to_string())),
         ));
+        // The first reservation, before any traffic: a state dir that
+        // cannot hold the counter fails here, not on the emit path.
+        spool.reserve().map_err(NodeError::SeqReserve)?;
         Ok(Arc::new(Self {
             config,
             state,
@@ -261,6 +266,11 @@ impl Node {
     /// The shipper it starts outlives an abort: [`Node::drain`] stops it.
     /// Returns `Err` only for what a retry cannot fix.
     pub async fn run(self: Arc<Self>) -> Result<(), NodeError> {
+        // Detached: it holds only the spool, and ends when a drain closes it.
+        tokio::spawn(reserve_loop(
+            self.spool.clone(),
+            self.scaled(Duration::from_secs(1)),
+        ));
         self.establish_identity().await?;
         *self.shipper.lock().await = Some(tokio::spawn(self.clone().ship_loop()));
         let ended = tokio::select! {

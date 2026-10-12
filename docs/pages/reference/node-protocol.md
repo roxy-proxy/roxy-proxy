@@ -212,7 +212,7 @@ compressed, signalled with `Content-Encoding: gzip`.
 | `node_id` | must match the certificate, or the answer is `400 node_mismatch` |
 | `lease_id` | the lease in force when the batch was assembled; any lease id issued to the node is accepted |
 | `seq_first` | the `seq` of the first event; events are consecutive and in order from it, or the server answers `400` |
-| `events` | [flow log](/reference/flow-log) records with `seq` added: a per-node counter that increases by one per shipped event, persisted in the state directory in blocks so it keeps increasing across restarts (a restart skips to the end of the last block) |
+| `events` | [flow log](/reference/flow-log) records with `seq` added: a per-node counter that increases by one per shipped event, persisted in the state directory in blocks so it keeps increasing across restarts (a restart skips to the end of the last reservation, at most two blocks of 1024) |
 
 A batch is at most the lease's `batch_max_bytes` (the JSON before
 compression); the node flushes when that is reached or
