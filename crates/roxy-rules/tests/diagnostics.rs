@@ -313,7 +313,7 @@ fn well_formed_host_literals_compile() {
 /// client picks freely needs a `where` to bound its series.
 #[test]
 fn client_chosen_key_without_where_warns() {
-    let metrics: Vec<roxy_rules::MetricConfig> = serde_yaml_ng::from_str(
+    let metrics: Vec<roxy_rules::MetricConfig> = roxy_rules::yaml::from_str(
         "- { id: a, count: requests, key: [host] }
 - { id: b, count: requests, key: [client.ip, path] }
 - { id: c, count: unique(url) }

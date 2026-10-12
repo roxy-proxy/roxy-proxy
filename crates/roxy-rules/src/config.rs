@@ -652,7 +652,7 @@ mod tests {
 
     fn then(yaml: &str) -> Result<Vec<Action>, String> {
         let yaml = format!("then: {}", yaml.replace('\n', "\n  "));
-        serde_yaml_ng::from_str::<Wrapper>(&yaml)
+        crate::yaml::from_str::<Wrapper>(&yaml)
             .map(|w| w.then.0)
             .map_err(|e| e.to_string())
     }
@@ -830,7 +830,7 @@ mod tests {
             ("- { id: r, bogus: 1, then: deny }", "bogus"),
             ("- { id: r, phase: response, then: deny }", "phase"),
         ] {
-            let err = serde_yaml_ng::from_str::<Vec<RuleConfig>>(yaml)
+            let err = crate::yaml::from_str::<Vec<RuleConfig>>(yaml)
                 .expect_err(yaml)
                 .to_string();
             assert!(err.contains(key), "{yaml}: {err}");
@@ -844,25 +844,25 @@ mod tests {
             "- { id: r, when: null, then: deny }",
             "- id: r\n  when:\n  then: deny\n",
         ] {
-            let err = serde_yaml_ng::from_str::<Vec<RuleConfig>>(yaml)
+            let err = crate::yaml::from_str::<Vec<RuleConfig>>(yaml)
                 .expect_err(yaml)
                 .to_string();
             assert!(err.contains("must not be null"), "{yaml}: {err}");
         }
         let err =
-            serde_yaml_ng::from_str::<Vec<MetricConfig>>("- { id: m, count: requests, where: ~ }")
+            crate::yaml::from_str::<Vec<MetricConfig>>("- { id: m, count: requests, where: ~ }")
                 .unwrap_err()
                 .to_string();
         assert!(err.contains("must not be null"), "{err}");
-        let omitted: Vec<RuleConfig> = serde_yaml_ng::from_str("- { id: r, then: deny }").unwrap();
+        let omitted: Vec<RuleConfig> = crate::yaml::from_str("- { id: r, then: deny }").unwrap();
         assert_eq!(omitted[0].when, None);
     }
 
     #[test]
     fn metric_count() {
-        let c: MetricCount = serde_yaml_ng::from_str("unique(host)").unwrap();
+        let c: MetricCount = crate::yaml::from_str("unique(host)").unwrap();
         assert_eq!(c, MetricCount::Unique("host".into()));
-        assert!(serde_yaml_ng::from_str::<MetricCount>("unique()").is_err());
+        assert!(crate::yaml::from_str::<MetricCount>("unique()").is_err());
         assert!(MetricCount::ResponseBytes.counts_bytes());
         assert!(!MetricCount::Requests.counts_bytes());
     }

@@ -23,10 +23,10 @@ use chrono::{DateTime, Utc};
 use ipnet::IpNet;
 use serde::Deserialize;
 
-pub use roxy_rules::Diagnostic;
 pub use roxy_rules::config::{
     Action, Expr, MetricConfig as Metric, MetricCount, RuleConfig as Rule, Then,
 };
+pub use roxy_rules::{Diagnostic, yaml};
 pub use units::Resolver;
 pub use validate::Compiled;
 
@@ -709,7 +709,7 @@ pub struct Addon {
     pub subscribe: Subscribe,
     /// Opaque config passed to the addon as JSON.
     #[serde(default)]
-    pub config: serde_yaml_ng::Value,
+    pub config: serde_json::Value,
     #[serde(default)]
     pub capabilities: Vec<Capability>,
     #[serde(default)]
@@ -899,8 +899,8 @@ impl Startup {
 impl Config {
     /// Parse a config from YAML text. Structural errors only; call
     /// [`Config::validate`] afterwards.
-    pub fn from_yaml(text: &str) -> Result<Self, serde_yaml_ng::Error> {
-        serde_yaml_ng::from_str(text)
+    pub fn from_yaml(text: &str) -> Result<Self, yaml::Error> {
+        yaml::from_str(text)
     }
 
     /// Read and parse a config file.
@@ -916,14 +916,15 @@ impl Config {
 /// Render a structural parse error. Errors inside `rules[N]` get the rule's
 /// id appended (`... (rule "github-reads")`), since the deserialiser only
 /// knows the YAML path.
-pub fn describe_parse_error(text: &str, err: &serde_yaml_ng::Error) -> String {
+pub fn describe_parse_error(text: &str, err: &yaml::Error) -> String {
     let msg = err.to_string();
-    let index = msg
+    let index = err
+        .path()
         .strip_prefix("rules[")
         .and_then(|rest| rest.split_once(']'))
         .and_then(|(n, _)| n.parse::<usize>().ok());
     let id = index.and_then(|i| {
-        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(text).ok()?;
+        let doc: serde_json::Value = yaml::from_str(text).ok()?;
         Some(doc.get("rules")?.get(i)?.get("id")?.as_str()?.to_owned())
     });
     match id {

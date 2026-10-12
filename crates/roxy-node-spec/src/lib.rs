@@ -16,7 +16,7 @@ pub const OPENAPI_META_SCHEMA: &str = include_str!("../schemas/openapi-3.1-2022-
 /// The document parsed to JSON.
 pub fn document() -> &'static Value {
     static DOC: OnceLock<Value> = OnceLock::new();
-    DOC.get_or_init(|| serde_yaml_ng::from_str(OPENAPI_YAML).expect("openapi.yaml parses"))
+    DOC.get_or_init(|| serde_saphyr::from_str(OPENAPI_YAML).expect("openapi.yaml parses"))
 }
 
 /// A validator for `#/components/schemas/<name>`. Built by wrapping the whole

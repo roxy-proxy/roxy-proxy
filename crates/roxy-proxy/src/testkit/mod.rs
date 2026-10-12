@@ -448,11 +448,11 @@ impl KitBuilder {
         let sink = Arc::new(MemorySink::new());
         let upstream = Upstream::new(minter.clone());
 
-        let rules: Vec<RuleConfig> = serde_yaml_ng::from_str(&self.rules).unwrap();
+        let rules: Vec<RuleConfig> = roxy_rules::yaml::from_str(&self.rules).unwrap();
         let metric_defs: Vec<roxy_rules::MetricConfig> = if self.metric_defs.is_empty() {
             Vec::new()
         } else {
-            serde_yaml_ng::from_str(&self.metric_defs).unwrap()
+            roxy_rules::yaml::from_str(&self.metric_defs).unwrap()
         };
         let base = PolicyBase::new(self.secrets, &self.address_lists, self.deny_lists);
         let secret_names = base.secrets.keys().cloned().collect();
@@ -866,7 +866,7 @@ impl Kit {
 
     /// [`Self::reload`] with a `valid_until` on the new policy.
     pub(crate) fn reload_lease(&self, rules: &str, valid_until: Option<DateTime<Utc>>) {
-        let rules: Vec<RuleConfig> = serde_yaml_ng::from_str(rules).unwrap();
+        let rules: Vec<RuleConfig> = roxy_rules::yaml::from_str(rules).unwrap();
         let secret_names = self.base.secrets.keys().cloned().collect();
         let list_names = self.base.address_lists.keys().cloned().collect();
         let input = PolicyInput {

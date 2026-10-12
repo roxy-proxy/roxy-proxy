@@ -20,6 +20,9 @@ table names.
 - Strict parsing: an unknown key anywhere, or a key repeated in one map (a
   setting, a secret, a `static_hosts` name, an endpoint header, an addon
   endpoint), is an error naming the key, not a last-wins override.
+- YAML 1.2: only `true` and `false` are booleans, so `yes`, `no`, `on` and
+  `off` are refused where a boolean is expected. Merge keys (`<<`) and tags
+  roxy does not know (`!reset`) are errors. Anchors and aliases work.
 - Relative paths (`ca_dir`, `ca_cert`, `ca_key`, secret, list and addon
   files, log and capture paths) resolve against the working directory.
 - `roxy check` refuses zero for the `limits` that would otherwise refuse

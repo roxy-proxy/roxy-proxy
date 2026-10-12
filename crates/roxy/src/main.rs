@@ -525,7 +525,7 @@ fn check(path: &Path) -> ExitCode {
     let config = match Config::from_yaml(&text) {
         Ok(c) => c,
         Err(e) => {
-            // serde_yaml_ng prefixes errors with the YAML path when it has one
+            // Parse errors are prefixed with the YAML path when it has one
             // (`rules[0]: unknown field ...`), giving `<file>:<yaml path>: <msg>`.
             let msg = roxy::config::describe_parse_error(&text, &e);
             let has_path = msg

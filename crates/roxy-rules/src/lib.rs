@@ -19,7 +19,7 @@
 //!     EvalContext, Field, MapView, Policy, PolicyInput, Reads, RuleConfig,
 //! };
 //!
-//! let rules: Vec<RuleConfig> = serde_yaml_ng::from_str(r#"
+//! let rules: Vec<RuleConfig> = roxy_rules::yaml::from_str(r#"
 //! - id: github-reads
 //!   when: host under "github.com" and method in [GET, HEAD]
 //!   then: allow
@@ -164,6 +164,7 @@ mod state;
 pub mod template;
 mod types;
 mod view;
+pub mod yaml;
 
 pub use compile::{MAX_GLOB_BYTES, REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
 pub use config::{

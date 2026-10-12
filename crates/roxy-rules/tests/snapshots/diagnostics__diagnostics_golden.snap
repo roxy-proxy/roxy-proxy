@@ -165,10 +165,10 @@ rules[0].then[0]: sign aws_sigv4: `secret_access_key` must not be empty  [rule a
 rules[0].then[0]: `sign` changes the request, which is already on its way; this rule reads `response.status`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation)  [rule a]
 
 == passthrough is reserved
-parse: .[0].then: `passthrough` is reserved: roxy has no transparent listener at line 1 column 18
+parse: [0].then: `passthrough` is reserved: roxy has no transparent listener at line 1, column 18
 
 == call is reserved
-parse: .[0].then[0]: `call` is reserved: addons run above the rules, in config order, not from a rule at line 1 column 19
+parse: [0].then[0]: `call` is reserved: addons run above the rules, in config order, not from a rule at line 1, column 19
 
 == tag read above the rule that sets it
 rules[0].when: reads `tag["risky"]`, which is set too late to be seen here, by rules[1] ("mark"), below this rule; a rule sees only the tags set before it is checked  [rule read]
@@ -191,13 +191,13 @@ rules[0].then[0]: rewrite_path `to`: `$1a` refers to a group `match` does not ha
 metrics[0].where: a metric's `where` cannot read tags: tags are set by rules and addons on each flow, and whether a flow counts is decided without them; it reads `tag["billing"]`
 
 == multi-key action map
-parse: .[0].then: an action is a map with exactly one key, but this one has `set_header` and `allow`; write each action as its own list item at line 1 column 18
+parse: [0].then: an action is a map with exactly one key, but this one has `set_header` and `allow`; write each action as its own list item at line 1, column 18
 
 == terminal action followed by another
 rules[0].then[1]: `tag` follows the terminal action `allow` and would never run; move it before `allow`  [rule a]
 
 == unknown action
-parse: .[0].then: unknown action `sethead`; expected one of `allow`, `deny`, `set_header`, `remove_header`, `rewrite_path`, `set_query`, `remove_query`, `redirect`, `tag`, `log`, `set_state`, `capture`, `digest`, `sign` at line 1 column 18
+parse: [0].then: unknown action `sethead`; expected one of `allow`, `deny`, `set_header`, `remove_header`, `rewrite_path`, `set_query`, `remove_query`, `redirect`, `tag`, `log`, `set_state`, `capture`, `digest`, `sign` at line 1, column 18
 
 == request mutation in a watching rule
 rules[0].then[0]: `rewrite_path` changes the request, which is already on its way; this rule reads `body.bytes`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation)  [rule a]
