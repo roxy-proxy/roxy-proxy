@@ -139,7 +139,11 @@ the others refuse for the same reason.
   CONNECT on the proxy port.
 - The version is exactly `HTTP/1.1`. `HTTP/1.0` needs `http.allow_http10`
   and its connection closes after the response whatever `Connection` says;
-  `HTTP/0.9` is never accepted.
+  `HTTP/0.9` is never accepted. A response of unknown length to an HTTP/1.0
+  client is close-delimited: the body ends when roxy closes the connection.
+  If the upstream body is cut short (upstream error, size cap, timeout,
+  forbidden trailer) roxy closes the connection all the same, so the client
+  cannot tell a cut body from a complete one. roxy still logs the failure.
 - Lines end in CRLF; a bare LF or CR anywhere in the head is rejected.
 - Head at most `limits.max_header_bytes` (64 KiB); URL at most
   `limits.max_url_bytes` (8 KiB).
