@@ -1248,3 +1248,14 @@ fn addon_config_keys_collide_as_strings() {
         );
     }
 }
+
+/// A float JSON cannot hold is refused, not passed on as `null`.
+#[test]
+fn addon_config_refuses_non_finite_floats() {
+    for c in ["{ r: .nan }", "{ r: .inf }", "[-.inf]"] {
+        Config::from_yaml(&format!(
+            "{BASE}addons: [{{ name: a, path: /a.wasm, config: {c} }}]\n"
+        ))
+        .expect_err(c);
+    }
+}
