@@ -42,7 +42,9 @@ pub struct Error {
 impl Error {
     /// `path` as `serde_path_to_error` spells it. An unknown key is part of
     /// that path, and a key that failed to parse is `?`; the message names
-    /// either, so the path stops at the mapping that holds them.
+    /// either, so the path stops at the mapping that holds them. A key that
+    /// really is `?` reads the same and loses its segment too; the message's
+    /// line and column still place the error.
     fn new(path: &str, inner: serde_saphyr::Error) -> Self {
         let leaf = if let serde_saphyr::Error::SerdeUnknownField { field, .. } = &inner {
             field.as_str()
