@@ -24,7 +24,6 @@ jobs:
         with:
           anthropic_federation_rule_id: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID }}
           anthropic_organization_id: ${{ secrets.ANTHROPIC_ORGANIZATION_ID }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
 
           use_sticky_comment: true
 
