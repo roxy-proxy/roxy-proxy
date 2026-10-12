@@ -1249,14 +1249,29 @@ async fn an_observer_sees_exchanges_through() {
     assert_eq!(st.resets.lock().unwrap().len(), 0);
     h.stop().await;
 
+    // roxy ends an observe stream once both copies are through, and drops
+    // what the service sends after that, so the request body stays open
+    // until the service has sent it all.
     let (h, st) = start("/mixed", "    mode: observe\n", ALLOW_UPSTREAM).await;
-    let res = h.client().get(h.https_url("/flood")).send().await.unwrap();
-    assert_eq!(res.status(), 200);
-    drop(res.bytes().await);
+    let (body_tx, body_rx) = mpsc::unbounded_channel::<Result<Vec<u8>, std::io::Error>>();
+    body_tx.send(Ok(b"x".to_vec())).unwrap();
+    let req = h
+        .client()
+        .post(h.https_url("/flood"))
+        .body(reqwest::Body::wrap_stream(futures_util::stream::unfold(
+            body_rx,
+            |mut rx| async move { rx.recv().await.map(|b| (b, rx)) },
+        )))
+        .send();
+    let res = tokio::spawn(req);
     st.until("the service to send it all", |s| {
         s.echoed.lock().unwrap().len() == 1
     })
     .await;
+    drop(body_tx);
+    let res = res.await.unwrap().unwrap();
+    assert_eq!(res.status(), 200);
+    drop(res.bytes().await);
     assert_eq!(h.events("layer_error").len(), 0);
     h.stop().await;
 }
