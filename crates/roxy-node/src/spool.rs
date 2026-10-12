@@ -84,6 +84,9 @@ pub struct Spool {
     /// Wakes [`reserve_loop`] when less than a block is reserved ahead.
     reserve_wanted: tokio::sync::Notify,
     persist: SeqStore,
+    /// Serialises [`Spool::reserve`], so a slower write can never land a
+    /// lower mark over a newer one.
+    reserving: Mutex<()>,
 }
 
 impl std::fmt::Debug for Spool {
@@ -116,6 +119,7 @@ impl Spool {
             unreserved: AtomicBool::new(false),
             reserve_wanted: tokio::sync::Notify::new(),
             persist,
+            reserving: Mutex::new(()),
         }
     }
 
@@ -333,6 +337,7 @@ impl Spool {
     /// it runs before traffic starts or on a blocking thread, never on the
     /// emit path. The spool lock is not held while it writes.
     pub fn reserve(&self) -> Result<(), String> {
+        let _reserving = lock(&self.reserving);
         let through = {
             let q = lock(&self.queue);
             if q.next_seq + SEQ_BLOCK <= q.reserved_through {
