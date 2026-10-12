@@ -1,6 +1,6 @@
 # roxy
 
-> [!WARNING]
+> [!IMPORTANT]
 > roxy is in early development. Expect frequent breaking changes to config,
 > rules and interfaces.
 
