@@ -297,18 +297,27 @@ impl Stream {
     }
 
     /// Queues a message of the stream for the socket. Nothing is queued
-    /// once the stream has ended.
+    /// once the stream has ended. A connection whose writer has gone fails
+    /// the stream closed at once, however long its reader takes to see
+    /// the end; an `open` is left to its caller, which holds no stream yet.
     pub(super) async fn queue(&self, msg: Message, open: bool) -> bool {
         let q = Queued {
             msg,
             wire: self.wire.clone(),
             open,
         };
-        tokio::select! {
+        let sent = tokio::select! {
             biased;
-            () = self.ended.cancelled() => false,
+            () = self.ended.cancelled() => return false,
             r = self.link.data.send(q) => r.is_ok(),
+        };
+        if !sent && !open {
+            self.fail(
+                ServiceError::Closed("the connection closed".into()),
+                Reset::Skip,
+            );
         }
+        sent
     }
 
     /// Waits for credit to send up to `want` bytes of the `dir` body.
@@ -328,20 +337,21 @@ impl Stream {
     }
 
     /// Streams one message to the service: head, body frames (as credit
-    /// allows), end. False if it did not get it all out.
-    pub(crate) async fn pump(&self, dir: Dir, head: Out, body: Body) -> bool {
+    /// allows), end. Stops at the stream's end, which whatever failed it
+    /// has settled.
+    pub(crate) async fn pump(&self, dir: Dir, head: Out, body: Body) {
         if !self.send(&head).await {
-            return false;
+            return;
         }
         // Nothing to read (and an empty observer copy may never be ended).
         if body.known_length() != Some(0) && !self.pump_body(dir, body).await {
-            return false;
+            return;
         }
         let end = match dir {
             Dir::Request => Out::RequestEnd,
             Dir::Response => Out::ResponseEnd,
         };
-        self.send(&end).await
+        self.send(&end).await;
     }
 
     pub(super) async fn pump_body(&self, dir: Dir, mut body: Body) -> bool {

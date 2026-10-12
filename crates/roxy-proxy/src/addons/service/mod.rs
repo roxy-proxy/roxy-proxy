@@ -456,23 +456,14 @@ pub(super) async fn observe(
 
 /// Pumps an observer's copy, resetting the stream as soon as the copy is
 /// cut: the pump may be waiting for credit, not reading the copy.
-async fn pump_copy(
-    stream: &mux::Stream,
-    dir: Dir,
-    head: Out,
-    body: Body,
-    cut: Option<CopyCut>,
-) -> bool {
+async fn pump_copy(stream: &mux::Stream, dir: Dir, head: Out, body: Body, cut: Option<CopyCut>) {
     let Some(cut) = cut else {
         return stream.pump(dir, head, body).await;
     };
     tokio::select! {
         biased;
-        sent = stream.pump(dir, head, body) => sent,
-        () = cut.cancelled() => {
-            stream.reset("the observer's copy was cut");
-            false
-        }
+        () = stream.pump(dir, head, body) => {}
+        () = cut.cancelled() => stream.reset("the observer's copy was cut"),
     }
 }
 
