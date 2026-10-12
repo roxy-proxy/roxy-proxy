@@ -962,13 +962,47 @@ mod service {
 
     use bytes::Bytes;
 
-    use super::{RULES, no_layer_error, strs};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::{RULES, echo, no_layer_error, strs};
     use crate::addons::AddonMode;
     use crate::addons::service::ServiceSpec;
     use crate::addons::service::testing::{addon, kit, only_when, reload, subscribed};
     use crate::testkit::upstream::service::SLOW;
     use crate::testkit::{AddonDef, Answer, Kit, streaming_body};
     use roxy_http::Body;
+
+    /// Rules that read the request body, so the core consumes what the
+    /// service forwards before anything reaches the upstream.
+    const READS_BODY: &str = r#"
+- id: secret
+  when: host == "up.test" and body.text contains "SECRET"
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+
+    /// The stream id of an `open` message.
+    fn stream_id(open: &serde_json::Value) -> u32 {
+        u32::try_from(open["stream"].as_u64().unwrap()).unwrap()
+    }
+
+    /// Waits until the service has been sent a reset for stream `id`; its
+    /// message.
+    async fn reset_of(kit: &Kit, id: u32) -> String {
+        let service = kit.upstream.service();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some((_, m)) = service.resets().into_iter().find(|(s, _)| *s == id) {
+                    return m;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("stream {id} is reset: {:?}", service.resets()))
+    }
 
     /// A WASM layer below the service fails after the response head: the
     /// service passes the cut body on, and the flow log names the layer
@@ -1280,14 +1314,6 @@ mod service {
     /// rules read the body, and the core ends on its failure.
     #[tokio::test]
     async fn a_forwarded_body_longer_than_declared_is_the_services_fault() {
-        const READS_BODY: &str = r#"
-- id: secret
-  when: host == "up.test" and body.text contains "SECRET"
-  then: deny
-- id: up
-  when: host == "up.test"
-  then: allow
-"#;
         let kit = kit(
             READS_BODY,
             vec![addon("s", "overlong", AddonMode::Enforce, |_| {})],
@@ -1572,6 +1598,269 @@ mod service {
             .collect();
         assert!(lagged.is_empty(), "{lagged:#?}");
         no_layer_error(&kit);
+    }
+
+    /// A WebSocket through a pass-through service: the upstream's `101`
+    /// reaches the service as roxy's `response` head, with no `request_end`
+    /// before it, the service's `101` upgrades the client, and the bytes of
+    /// both sides then go through the stream.
+    #[tokio::test]
+    async fn a_websocket_is_relayed_through_a_pass_through_service() {
+        let kit = kit(RULES, vec![addon("s", "pass", AddonMode::Enforce, |_| {})]).await;
+        let (status, io) = kit.websocket("/ws", &[]).await;
+        assert_eq!(status, 101);
+        let mut io = io.unwrap();
+        assert_eq!(echo(&mut io, b"hello").await, b"hello");
+        assert_eq!(echo(&mut io, b"again").await, b"again");
+        let service = kit.upstream.service();
+        let stream = stream_id(&service.until_opened(1).await[0]);
+        assert_eq!(service.received_in(stream, "request"), 10);
+        assert_eq!(service.received_in(stream, "response"), 10);
+        let controls = service.controls(stream);
+        let kinds: Vec<&str> = controls
+            .iter()
+            .map(|m| m["type"].as_str().unwrap())
+            .collect();
+        let response = kinds
+            .iter()
+            .position(|k| *k == "response")
+            .unwrap_or_else(|| panic!("a response head in {kinds:?}"));
+        assert_eq!(controls[response]["status"], 101, "{controls:#?}");
+        assert_eq!(kinds[..response], ["open", "request"], "{kinds:?}");
+        drop(io);
+        let close = kit.events("ws_close", 1).await;
+        assert_eq!(close[0]["bytes_c2s"], 10, "{close:#?}");
+        assert_eq!(close[0]["bytes_s2c"], 10, "{close:#?}");
+        no_layer_error(&kit);
+    }
+
+    /// The relayed bytes are the service's to rewrite: what it sends on
+    /// each body is what the other side gets.
+    #[tokio::test]
+    async fn a_service_may_rewrite_the_relayed_bytes() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+        let kit = kit(RULES, vec![addon("s", "shout", AddonMode::Enforce, |_| {})]).await;
+        let mut ws = kit.ws("/ws", &[("x-echo", "frames")]).await;
+        ws.send(Message::text("hello")).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("an echo in time")
+            .unwrap()
+            .unwrap();
+        // Uppercased on the response side only: the upstream got, and
+        // echoed, the client's bytes as sent.
+        assert_eq!(got, Message::text("HELLO"));
+        assert_eq!(kit.upstream.ws_received(), [b"hello"]);
+        ws.close(None).await.unwrap();
+        kit.upstream.wait_ws_closed(1).await;
+        no_layer_error(&kit);
+    }
+
+    /// A service may answer an upgrade like any request: the client gets
+    /// its response and nothing is relayed.
+    #[tokio::test]
+    async fn a_service_may_answer_an_upgrade_itself() {
+        let kit = kit(
+            RULES,
+            vec![addon("s", "refuse", AddonMode::Enforce, |_| {})],
+        )
+        .await;
+        let (status, io) = kit.websocket("/ws", &[]).await;
+        assert_eq!(status, 403);
+        assert!(io.is_none());
+        assert!(kit.upstream.seen().is_empty());
+        let ev = kit.request_event().await;
+        assert_eq!(ev["terminal_rule"], "layer:s", "{ev:#}");
+        assert_eq!(ev["decision"], "answered", "{ev:#}");
+        no_layer_error(&kit);
+    }
+
+    /// The relay's end resets a stream whose bodies have not both ended:
+    /// here the service holds the upstream's side of the WebSocket, so the
+    /// client gets nothing, the relay ends on the idle timeout, and the
+    /// client is closed and the stream reset.
+    #[tokio::test]
+    async fn the_relay_ending_resets_a_stream_with_a_body_still_open() {
+        let kit = Kit::builder()
+            .rules(RULES)
+            .limits(|l| l.idle_timeout = Duration::from_millis(300))
+            .start()
+            .await;
+        reload(
+            &kit,
+            RULES,
+            &[],
+            vec![addon("s", "hold", AddonMode::Enforce, |_| {})],
+        );
+        let (status, io) = kit.websocket("/ws", &[("x-echo", "once")]).await;
+        assert_eq!(status, 101);
+        let mut io = io.unwrap();
+        io.write_all(b"hello").await.unwrap();
+        let service = kit.upstream.service();
+        let stream = stream_id(&service.until_opened(1).await[0]);
+        // The upstream echoed and closed; the service passed the client's
+        // bytes on and holds the upstream's.
+        service.until_received(stream, 10).await;
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), io.read_to_end(&mut rest))
+            .await
+            .expect("EOF in time")
+            .unwrap();
+        assert!(rest.is_empty(), "{rest:?}");
+        reset_of(&kit, stream).await;
+        kit.events("ws_close", 1).await;
+    }
+
+    /// roxy sends no `request_end` before the `101`: a service that holds
+    /// the request until its body has ended never forwards an upgrade, and
+    /// the exchange fails on `first_byte_timeout`. The same service forwards
+    /// an ordinary request once its body has ended.
+    #[tokio::test]
+    async fn a_service_waiting_for_request_end_never_forwards_an_upgrade() {
+        let kit = kit(
+            RULES,
+            vec![addon("s", "patient", AddonMode::Enforce, |s| {
+                s.first_byte_timeout = Duration::from_millis(500);
+            })],
+        )
+        .await;
+        let a = kit.h1().await.call("POST", "/x", &[], b"body").await;
+        assert_eq!(a.status, 200, "{a:?}");
+        assert_eq!(a.json()["body_len"], 4);
+        let started = std::time::Instant::now();
+        let (status, io) = kit.websocket("/ws", &[]).await;
+        assert_eq!(status, 503);
+        assert!(io.is_none());
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "failed in {:?}",
+            started.elapsed()
+        );
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
+        assert_eq!(errs[0]["kind"], "service:timeout", "{errs:#?}");
+        assert!(
+            kit.upstream.seen().iter().all(|s| s.path != "/ws"),
+            "the upgrade never reached the upstream: {:#?}",
+            kit.upstream.seen()
+        );
+    }
+
+    /// The service's second deadline runs from roxy's `response` head, not
+    /// from the end of the response body: a service that forwards and then
+    /// holds the response head fails closed on `first_byte_timeout` while
+    /// the upstream's body is still arriving.
+    #[tokio::test]
+    async fn a_held_response_head_times_out_from_the_response_head() {
+        let kit = kit(
+            RULES,
+            vec![addon("s", "forward", AddonMode::Enforce, |s| {
+                s.first_byte_timeout = Duration::from_millis(700);
+            })],
+        )
+        .await;
+        let started = std::time::Instant::now();
+        // The head at once, the body over 3 s.
+        let a = kit
+            .h1()
+            .await
+            .call("GET", "/drip?n=3&ms=1000", &[], b"")
+            .await;
+        let elapsed = started.elapsed();
+        assert_eq!(a.status, 503, "{a:?}");
+        assert!(
+            elapsed >= Duration::from_millis(700) && elapsed < Duration::from_millis(2500),
+            "failed in {elapsed:?}"
+        );
+        assert_eq!(kit.upstream.seen().len(), 1, "the request was forwarded");
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
+        assert_eq!(errs[0]["kind"], "service:timeout", "{errs:#?}");
+        let ev = kit.request_event().await;
+        assert_eq!(ev["terminal_rule"], "layer:s", "{ev:#}");
+    }
+
+    /// A service that resets an enforce stream before answering fails the
+    /// exchange closed as its own: a `503` against the layer, nothing
+    /// forwarded.
+    #[tokio::test]
+    async fn a_reset_before_the_response_head_fails_the_exchange_closed() {
+        let kit = kit(RULES, vec![addon("s", "abort", AddonMode::Enforce, |_| {})]).await;
+        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+        assert_eq!(a.status, 503, "{a:?}");
+        assert!(kit.upstream.seen().is_empty());
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
+        assert_eq!(errs[0]["kind"], "service:closed", "{errs:#?}");
+        assert!(
+            errs[0]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("aborted")),
+            "{errs:#?}"
+        );
+        let ev = kit.request_event().await;
+        assert_eq!(ev["terminal_rule"], "layer:s", "{ev:#}");
+        assert_eq!(ev["reason"], "layer_error", "{ev:#}");
+    }
+
+    /// A service that ends the request it forwards short of the length it
+    /// declared fails as a protocol violation, logged against it.
+    #[tokio::test]
+    async fn a_forwarded_body_shorter_than_declared_is_the_services_fault() {
+        let kit = kit(
+            READS_BODY,
+            vec![addon("s", "short", AddonMode::Enforce, |_| {})],
+        )
+        .await;
+        let a = kit.h1().await.call("POST", "/x", &[], b"body").await;
+        assert_eq!(a.status, 503, "{a:?}");
+        assert!(kit.upstream.seen().is_empty());
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
+        assert_eq!(errs[0]["kind"], "service:protocol", "{errs:#?}");
+        let ev = kit.request_event().await;
+        assert_eq!(ev["reason"], "layer_error", "{ev:#}");
+    }
+
+    /// An exchange that finds every connection full waits for a stream
+    /// within `first_byte_timeout`, and fails closed when none frees up:
+    /// no stream is opened for it, and the service is not blamed for more
+    /// than the timeout.
+    #[tokio::test]
+    async fn a_pool_full_for_the_whole_first_byte_timeout_fails_closed() {
+        let kit = kit(
+            RULES,
+            vec![addon("s", "hold", AddonMode::Enforce, |s| {
+                s.max_connections = 1;
+                s.max_streams = 1;
+                s.first_byte_timeout = Duration::from_millis(500);
+            })],
+        )
+        .await;
+        // The held response body keeps the one stream busy.
+        let mut busy = kit.h1().await;
+        let req = busy.request("GET", "/x", &[]).body(Body::empty()).unwrap();
+        let held = busy.send(req).await.unwrap();
+        assert_eq!(held.status(), 200);
+        let started = std::time::Instant::now();
+        let a = kit.h1().await.call("GET", "/y", &[], b"").await;
+        let elapsed = started.elapsed();
+        assert_eq!(a.status, 503, "{a:?}");
+        assert!(
+            elapsed >= Duration::from_millis(500) && elapsed < Duration::from_secs(2),
+            "failed in {elapsed:?}"
+        );
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
+        assert_eq!(errs[0]["kind"], "service:timeout", "{errs:#?}");
+        assert_eq!(
+            kit.upstream.service().opens().len(),
+            1,
+            "no stream for the second exchange"
+        );
+        assert_eq!(kit.upstream.seen().len(), 1);
+        drop(held);
     }
 }
 

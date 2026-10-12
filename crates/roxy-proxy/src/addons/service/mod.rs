@@ -517,7 +517,7 @@ pub(crate) mod testing {
     const PORT: u16 = 9000;
 
     /// A service layer whose endpoint is the in-test service's `behaviour`
-    /// (`pass`, `hold`, `hoard`, `talk`, `flood`, `pause`, `slow` or `stall`).
+    /// (one of the `/svc/<behaviour>` paths of `testkit::upstream::service`).
     pub(crate) fn addon(
         name: &str,
         behaviour: &str,
