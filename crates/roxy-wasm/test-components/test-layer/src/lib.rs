@@ -637,6 +637,13 @@ impl Handler for Layer {
                 respond(200, b"unreachable");
             }
             "trap" => panic!("layer panics"),
+            "print" => {
+                // Write to stdout and stderr, then answer as usual.
+                println!("layer stdout");
+                eprintln!("layer stderr");
+                drop(body);
+                respond(200, b"printed");
+            }
             "no-response" => {}
             "leak" => {
                 // Answer, write part of the body, and return without

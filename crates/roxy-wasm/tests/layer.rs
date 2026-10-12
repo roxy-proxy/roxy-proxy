@@ -747,6 +747,26 @@ async fn failed_instances_are_discarded() {
     }
 }
 
+/// A guest that prints keeps a handle to its WASI stdout or stderr stream
+/// across exchanges. Those are the host's streams, not the exchange's, so
+/// holding them is not an unfinished body.
+#[tokio::test]
+async fn printing_to_stdio_is_not_a_failure() {
+    let rt = runtime();
+    let mut cfg = config();
+    cfg.limits.max_instances = 1;
+    let layer = load(&rt, cfg).await;
+    for _ in 0..2 {
+        let (status, body) = exchange(&layer, Mock::echo(), request("print", Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "printed");
+    }
+    // The same instance served both: printing did not get it discarded.
+    assert_eq!(count(&layer).await, 3);
+}
+
 /// Each host resource a guest holds (streams, pollables, pending responses)
 /// costs host memory outside its `max_memory`, so the table is capped per
 /// instance.
