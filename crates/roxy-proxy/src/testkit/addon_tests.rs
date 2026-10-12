@@ -1168,6 +1168,36 @@ mod service {
         }
     }
 
+    /// A connection whose write side has died while its read side is
+    /// still open (the service stopped reading, and roxy has not yet seen
+    /// EOF) fails the exchanges on it closed at once, not when
+    /// `first_byte_timeout` runs out.
+    #[tokio::test]
+    async fn a_dead_write_side_fails_the_exchange_at_once() {
+        let kit = kit(
+            RULES,
+            vec![addon("s", "pass", AddonMode::Enforce, |s| {
+                s.max_connections = 1;
+                s.first_byte_timeout = Duration::from_secs(5);
+            })],
+        )
+        .await;
+        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+        assert_eq!(a.status, 200, "{a:?}");
+        kit.upstream.fail_writes();
+        let started = std::time::Instant::now();
+        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+        assert_eq!(a.status, 503, "{a:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "failed in {:?}",
+            started.elapsed()
+        );
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
+        assert_eq!(errs[0]["kind"], "service:closed", "{errs:#?}");
+    }
+
     /// A client that leaves mid-response resets the stream at once, even
     /// while the service is sending nothing (a long poll, an idle event
     /// stream), so the stream gives up its place on the connection.
