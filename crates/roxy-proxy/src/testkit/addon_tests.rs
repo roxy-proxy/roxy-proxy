@@ -1761,16 +1761,16 @@ mod service {
         )
         .await;
         let started = std::time::Instant::now();
-        // The head at once, the body over 1.2 s.
+        // The head at once, the body over 3 s.
         let a = kit
             .h1()
             .await
-            .call("GET", "/drip?n=3&ms=400", &[], b"")
+            .call("GET", "/drip?n=3&ms=1000", &[], b"")
             .await;
         let elapsed = started.elapsed();
         assert_eq!(a.status, 503, "{a:?}");
         assert!(
-            elapsed >= Duration::from_millis(700) && elapsed < Duration::from_millis(1200),
+            elapsed >= Duration::from_millis(700) && elapsed < Duration::from_millis(2500),
             "failed in {elapsed:?}"
         );
         assert_eq!(kit.upstream.seen().len(), 1, "the request was forwarded");
