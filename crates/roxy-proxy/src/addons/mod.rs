@@ -1111,6 +1111,21 @@ mod tests {
         }
     }
 
+    /// What `f` logs at `level` or above. A second dispatcher is held
+    /// while it runs: with only one, a test on another thread that hits
+    /// the same callsite first caches it as disabled (it asks its own,
+    /// empty, default), and `f` would log nothing.
+    fn capture_logs(level: tracing::Level, f: impl FnOnce()) -> String {
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(level)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(captured.0.lock().unwrap().clone()).unwrap()
+    }
+
     /// A layer error is redacted once for both sinks, so a secret a guest
     /// quotes in its message reaches neither the operational log nor the
     /// flow log.
@@ -1124,15 +1139,9 @@ mod tests {
             .await;
         let (st, _cx) = test_flow(&kit);
         let e = LayerError::InvalidRequest(format!("header x-token: {secret}"));
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
+        let logged = capture_logs(tracing::Level::INFO, || {
             emit_layer_error(&st.meta, "a", &e, AddonMode::Enforce);
         });
-        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         assert!(logged.contains("layer failed"), "{logged}");
         assert!(!logged.contains(secret), "{logged}");
         assert!(logged.contains(REDACTED), "{logged}");
@@ -1157,15 +1166,9 @@ mod tests {
             .await;
         let (_st, cx) = test_flow(&kit);
         let e = MetricSourceError::KeyUnavailable(format!("key token={secret}"));
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
+        let logged = capture_logs(tracing::Level::WARN, || {
             cx.metric_error(Stage::Head, &e);
         });
-        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         assert!(logged.contains("metric recording failed"), "{logged}");
         assert!(!logged.contains(secret), "{logged}");
         assert!(logged.contains(REDACTED), "{logged}");
