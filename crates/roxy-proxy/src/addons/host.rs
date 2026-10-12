@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use roxy_wasm::{
-    EndpointError, FlowInfo, HostError, LayerError, LayerHost, LayerRequest, LayerResponse,
-    LogLevel, Principal, TagError, async_trait,
+    EndpointError, EndpointPermit, FlowInfo, HostError, LayerError, LayerHost, LayerRequest,
+    LayerResponse, LogLevel, Principal, TagError, async_trait,
 };
 
 use super::{AddonSpec, StackFlow, endpoint};
@@ -36,6 +36,15 @@ impl LayerHost for StackHost {
             return obs.response().await;
         }
         super::below(self.st.clone(), self.index, req).await
+    }
+
+    async fn endpoint_permit(&self) -> Result<EndpointPermit, EndpointError> {
+        self.st
+            .endpoint_calls
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| EndpointError::Failed(format!("endpoint calls: {e}")))
     }
 
     async fn endpoint_call(

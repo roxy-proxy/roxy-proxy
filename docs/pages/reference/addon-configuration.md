@@ -118,7 +118,7 @@ What the host holds for a guest outside `max_memory`, not configurable:
 | a `flow.log` message, or a `flow.record` kind and document together | 64 KiB | `budget:message`: fails the exchange |
 | a whole body handed over in one piece (`body.bytes`) | 1 MiB; a larger body is streamed | `budget:body`: fails the exchange |
 | an endpoint call's request body | 16 MiB, read within the endpoint's timeout and charged to the [buffer budget](/reference/limits#buffer-budget) while the call runs | refuses the call |
-| endpoint calls in flight per exchange | 8; further calls wait for a permit, within the timeout | refuses the call |
+| endpoint calls in flight per exchange | 8; a further `endpoints.call` waits, before roxy takes its body, until one is answered | the call waits |
 | a state key | 1 KiB | refuses the call |
 
 ### What `roxy check` refuses

@@ -450,6 +450,37 @@ fn call_capability(req: &RequestHead) -> String {
                 Err(e) => format!("error {e:?}"),
             }
         }
+        "endpoint-flood" => {
+            // `x-cap-count` calls to the `park` endpoint, each with a whole
+            // 1 MiB body, none of them read until all are made.
+            let count: usize = header(req, "x-cap-count")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4);
+            let r = RequestHead {
+                method: "POST".to_owned(),
+                scheme: None,
+                authority: None,
+                path_with_query: "/".to_owned(),
+                headers: Vec::new(),
+            };
+            let pending: Vec<PendingResponse> = (0..count)
+                .map(|_| {
+                    let (pending, _) =
+                        endpoints::call("park", &r, Body::Bytes(vec![b'x'; 1 << 20]))
+                            .expect("call");
+                    pending
+                })
+                .collect();
+            let answered = pending
+                .into_iter()
+                .map(|p| {
+                    let (below, body) = await_response(p);
+                    below.status == 200 && read_all(&body) == b"1048576"
+                })
+                .filter(|ok| *ok)
+                .count();
+            format!("flooded {answered}")
+        }
         "unknown-endpoint" => {
             let r = RequestHead {
                 method: "GET".to_owned(),

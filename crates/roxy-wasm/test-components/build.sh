@@ -5,6 +5,8 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 cd "$here"
+# The copies below come from this directory, whatever the caller's CARGO_TARGET_DIR.
+export CARGO_TARGET_DIR="$here/target"
 # The bytes must not depend on the machine. Cargo hashes the absolute path
 # of a dependency outside the workspace (roxy-addon) into the build, so
 # build through a fixed path; rustc embeds source paths, so remap them.

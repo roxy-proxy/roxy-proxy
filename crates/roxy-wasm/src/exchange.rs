@@ -416,7 +416,8 @@ impl HttpBody for FromGuest {
 mod tests {
     use super::*;
     use crate::host::{
-        EndpointError, FlowInfo, HostError, LayerRequest, LayerResponse, LogLevel, TagError,
+        EndpointError, EndpointPermit, FlowInfo, HostError, LayerRequest, LayerResponse, LogLevel,
+        TagError,
     };
     use tokio::time::Instant;
 
@@ -426,6 +427,9 @@ mod tests {
     #[async_trait::async_trait]
     impl LayerHost for Deaf {
         async fn next(&self, _: LayerRequest) -> Result<LayerResponse, HostError> {
+            unreachable!()
+        }
+        async fn endpoint_permit(&self) -> Result<EndpointPermit, EndpointError> {
             unreachable!()
         }
         async fn endpoint_call(

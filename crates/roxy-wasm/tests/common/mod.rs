@@ -10,10 +10,11 @@ use http::{Method, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use roxy_http::{Body, BodyError};
 use roxy_wasm::{
-    EndpointError, FlowInfo, HostError, Layer, LayerConfig, LayerError, LayerHost, LayerOutcome,
-    LayerRequest, LayerResponse, LogLevel, Principal, TagError, WasmRuntime, async_trait,
+    EndpointError, EndpointPermit, FlowInfo, HostError, Layer, LayerConfig, LayerError, LayerHost,
+    LayerOutcome, LayerRequest, LayerResponse, LogLevel, Principal, TagError, WasmRuntime,
+    async_trait,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot, watch};
 
 pub const TEST_LAYER: &[u8] = include_bytes!("../fixtures/test_layer.wasm");
 
@@ -57,10 +58,17 @@ pub struct Mock {
     pub state: Mutex<HashMap<String, String>>,
     /// The flow's tags; `add_tag` refuses past `MOCK_TAG_CAP`.
     pub tags: Mutex<Vec<String>>,
+    /// Permits for endpoint calls in flight, `MOCK_ENDPOINT_CALLS` of them.
+    pub endpoint_calls: Arc<Semaphore>,
+    /// Set to let calls to the `park` endpoint answer; until then they
+    /// wait, holding their permits.
+    pub unpark: watch::Sender<bool>,
 }
 
 /// How many tags the mock host lets a flow hold.
 pub const MOCK_TAG_CAP: usize = 8;
+/// How many endpoint calls the mock host lets an exchange have in flight.
+pub const MOCK_ENDPOINT_CALLS: usize = 2;
 
 impl Mock {
     pub fn new(mode: NextMode) -> Arc<Self> {
@@ -75,6 +83,8 @@ impl Mock {
             failed: Mutex::new(Vec::new()),
             state: Mutex::new(HashMap::new()),
             tags: Mutex::new(Vec::new()),
+            endpoint_calls: Arc::new(Semaphore::new(MOCK_ENDPOINT_CALLS)),
+            unpark: watch::Sender::new(false),
         })
     }
 
@@ -149,16 +159,30 @@ impl LayerHost for Mock {
         }
     }
 
+    async fn endpoint_permit(&self) -> Result<EndpointPermit, EndpointError> {
+        Ok(self.endpoint_calls.clone().acquire_owned().await.unwrap())
+    }
+
     async fn endpoint_call(
         &self,
         name: &str,
         req: LayerRequest,
     ) -> Result<LayerResponse, EndpointError> {
         self.call(format!("endpoint {name} {}", req.uri()));
-        if name == "monitor" {
-            Ok(Response::new(Body::from_bytes("score=0.1")))
-        } else {
-            Err(EndpointError::NotFound)
+        match name {
+            "monitor" => Ok(Response::new(Body::from_bytes("score=0.1"))),
+            "park" => {
+                let body = collect(req.into_body())
+                    .await
+                    .map_err(|e| EndpointError::Failed(e.to_string()))?;
+                self.unpark
+                    .subscribe()
+                    .wait_for(|open| *open)
+                    .await
+                    .unwrap();
+                Ok(Response::new(Body::from_bytes(body.len().to_string())))
+            }
+            _ => Err(EndpointError::NotFound),
         }
     }
 
