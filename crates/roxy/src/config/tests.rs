@@ -590,37 +590,6 @@ fn listener_mode_http_is_accepted() {
     let cfg = parse("version: 1\nlisteners: [{ name: gw, mode: http, bind: 127.0.0.1:8080 }]\n");
     assert_eq!(cfg.listeners[0].mode, ListenerMode::Http);
     cfg.validate().unwrap();
-
-    // The transparent-only keys are refused on it as on the proxy.
-    let d = diagnostics(
-        "version: 1\nlisteners:\n  - { name: gw, mode: http, bind: 127.0.0.1:8080, \
-         allow_passthrough: true, upstream_target: resolve }\n",
-    );
-    let paths: Vec<&str> = d.iter().map(|d| d.path.as_str()).collect();
-    assert_eq!(
-        paths,
-        [
-            "listeners[0].allow_passthrough",
-            "listeners[0].upstream_target"
-        ],
-        "{d:?}"
-    );
-}
-
-#[test]
-fn transparent_listener_is_rejected() {
-    let d = diagnostics(
-        "version: 1\nlisteners:\n  - name: t\n    mode: transparent\n    bind: 127.0.0.1:1\n    \
-         allow_passthrough: false\n    upstream_target: resolve\n",
-    );
-    assert_eq!(d.len(), 1, "{d:?}");
-    assert_eq!(d[0].path, "listeners[0].mode");
-    assert!(d[0].message.contains("no transparent listeners"));
-
-    let d = diagnostics(
-        "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:1, upstream_target: resolve }]\n",
-    );
-    assert_eq!(d[0].path, "listeners[0].upstream_target");
 }
 
 #[test]
@@ -647,15 +616,6 @@ fn provided_ca_needs_cert_and_key() {
         cfg.tls.provided_ca().unwrap(),
         Some((Path::new("/c.pem"), Path::new("/c.key")))
     );
-}
-
-#[test]
-fn listener_field_diagnostics() {
-    let d = diagnostics(
-        "version: 1\nlisteners:\n  - { name: e, bind: 127.0.0.1:2, upstream_target: resolve }\n",
-    );
-    assert_eq!(d.len(), 1, "{d:?}");
-    assert_eq!(d[0].path, "listeners[0].upstream_target");
 }
 
 #[test]

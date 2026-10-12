@@ -66,7 +66,7 @@ produces a `request` event:
 | `layer_error` | an addon layer failed; `kind` is `trap`, `budget:<limit>`, `capability:<name>`, `invalid_request`, `invalid_response`, `no_response`, `unsubscribed:<direction>`, `service:<code>`, `when:<code>`, ... In enforce mode it names the one layer blamed for the exchange ([who is blamed](/design/addon-model#who-is-blamed)), once; a client's broken upload, an upstream body or the buffer budget failing a layer logs none. In observe mode every failure of the observer's own is logged |
 | `layer_record`, `endpoint_call` | [addons](/design/addon-model) |
 | `observer_lagged` | an observe-mode addon's copy of a stream was cut; `reason` is `observer_behind` (it fell `max_observer_lag_bytes` behind), `buffer_budget_exhausted` (the [buffer budget](/reference/limits#limits) could not cover the copy) or `no_instance` (no instance of the layer came free within its `first_byte_timeout`) |
-| `connect` | a CONNECT, when `log.flow.connection_events` is on. A tunnel closed at its first bytes (`sni_mismatch`, `bad_sni`, neither TLS nor HTTP) is a `parse_error` |
+| `connect` | a CONNECT, when `log.flow.connection_events` is on: `conn`, `listener`, `client` and `dst` (`host`, `port`; `ip` is always `null`), `decision: allow`, `rules: []` and `tls: null`, since no rule runs at CONNECT. A tunnel closed at its first bytes (`sni_mismatch`, `bad_sni`, neither TLS nor HTTP) is a `parse_error` |
 | `connection_refused` | a connection cap was hit ([limits](/reference/limits#connections)) |
 | `config_loaded`, `config_reloaded`, `config_reload_failed` | startup and [reload](/guides/operations#reload) |
 
@@ -122,10 +122,14 @@ log:
     connection_events: false
     ws_message_every: 0             # also log every Nth WebSocket message; 0 = denied only
     high_water: 8mb                 # at least 64kb
-    max_file_bytes: 100mb           # absent = never rotate
-    max_files: 10                   # absent = keep all
+    max_file_bytes: 100mb           # absent = never rotate; at least 4kb
+    max_files: 10                   # absent = keep all; at least 1
     compress: true
 ```
+
+`roxy check` refuses `max_file_bytes`, `max_files` or `compress` without
+`path` (stdout cannot rotate), and `max_files` or `compress` without
+`max_file_bytes`. The same floors apply under `log.capture`.
 
 roxy's own operational logs go to stderr through `tracing`: `--log-format
 json|pretty` and `--log-level` (or `RUST_LOG`).

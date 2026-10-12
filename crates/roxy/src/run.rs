@@ -212,9 +212,6 @@ fn listener_specs(listeners: &[Listener]) -> anyhow::Result<Vec<ListenerSpec>> {
             let mode = match l.mode {
                 ListenerMode::HttpProxy => roxy_proxy::ListenerMode::HttpProxy,
                 ListenerMode::Http => roxy_proxy::ListenerMode::Http,
-                ListenerMode::Transparent => {
-                    anyhow::bail!("listener {:?}: there are no transparent listeners", l.name)
-                }
             };
             Ok(ListenerSpec {
                 name: l.name.clone(),

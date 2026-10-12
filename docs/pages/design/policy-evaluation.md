@@ -62,6 +62,9 @@ runs follows from what it reads.
    to it fails (which denies it with `_fail_closed`, reason
    `effect_invalid`), the `log` and `set_state` effects of the matching
    rules still apply, and the request's metric samples count it as denied.
+   An unavailable input is the exception: it stops head evaluation at that
+   rule, so the rules below it do not run, their `log` and `set_state` do
+   not apply, and `rules` in the flow log lists only the rules above it.
    Allow options (`upgrade`, `private_ok`) come from the first matching
    allow only. The flow log names the first matching deny (or allow) as
    `terminal_rule`.

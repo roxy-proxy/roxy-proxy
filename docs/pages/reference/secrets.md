@@ -26,6 +26,9 @@ rules:
 - At evaluation, a missing secret fails closed (`_fail_closed`, reason
   `secret_missing`); one that is not a valid header value, `secret_invalid`.
 - Injected values are redacted from the flow log and capture heads.
+- A `redirect` in a matching rule sends the request, injected values
+  included, to the redirect target: a secret's `set_header` rule should
+  not match a request another rule redirects elsewhere.
 
 ## Signing AWS requests
 
