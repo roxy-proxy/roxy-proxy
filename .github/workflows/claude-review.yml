@@ -35,6 +35,13 @@ jobs:
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
 
+            This PR may have been reviewed before. First read your earlier
+            review and comments with `gh pr view --comments` and
+            `gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments`.
+            Do not repeat a finding you already raised. If an earlier finding
+            is now fixed, say so in your summary; if it still stands, say so
+            once rather than posting a new inline comment.
+
             Perform a comprehensive code review with the following focus areas:
 
             1. **Code Quality**
@@ -71,4 +78,4 @@ jobs:
           # Tools for comprehensive PR review
           claude_args: |
             --model claude-opus-5-5
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review ${{ github.event.pull_request.number }} --approve:*)"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments:*),Bash(gh pr review ${{ github.event.pull_request.number }} --approve:*)"
