@@ -65,6 +65,21 @@ Each tarball holds a `roxy-<version>-<target>/` directory with `roxy`,
 - **What CI checks.** That the binaries are static, and that
   `roxy --version` prints the release version.
 
+## Bumping the toolchain
+
+CI, the release builds and the container image all use one pinned Rust
+version. To move it, change every place it lives in one PR:
+
+- `Cargo.toml` (`rust-version`)
+- `rust-toolchain.toml` (`channel`)
+- `Dockerfile` (the `rust:` build image and its digest)
+- `.github/workflows/release.yml` (`RUSTUP_TOOLCHAIN`)
+- `.github/workflows/fuzz.yml` (`NIGHTLY`, a dated nightly)
+
+Then run `crates/roxy-wasm/test-components/build.sh` and commit the
+rebuilt fixtures: the compiler version is part of their bytes, and CI
+fails if they differ from a fresh build.
+
 ## Verifying a download
 
 ```sh
