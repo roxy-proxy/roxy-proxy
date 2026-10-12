@@ -401,7 +401,7 @@ pub(crate) struct StackFlow {
     request_decoded: AtomicBool,
     upgrade: Mutex<Upgrade>,
     /// Permits for the exchange's endpoint calls in flight.
-    endpoint_calls: tokio::sync::Semaphore,
+    endpoint_calls: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::ops::Deref for StackFlow {
@@ -430,7 +430,9 @@ impl StackFlow {
             close: AtomicBool::new(false),
             request_decoded: AtomicBool::new(false),
             upgrade: Mutex::new(Upgrade::None),
-            endpoint_calls: tokio::sync::Semaphore::new(endpoint::MAX_ENDPOINT_CALLS_IN_FLIGHT),
+            endpoint_calls: Arc::new(tokio::sync::Semaphore::new(
+                endpoint::MAX_ENDPOINT_CALLS_IN_FLIGHT,
+            )),
         }
     }
 

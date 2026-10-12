@@ -204,9 +204,7 @@ impl StoreState {
         match body {
             types::Body::Empty => Ok((Body::empty(), None)),
             types::Body::Bytes(b) => {
-                if b.len() > MAX_BODY_BYTES {
-                    return Err(LayerError::BudgetExceeded(Budget::Body));
-                }
+                check_body(&b)?;
                 Ok((Body::from_bytes(b), None))
             }
             types::Body::Passthrough(stream) => {
@@ -266,6 +264,14 @@ impl StoreState {
         let stream = ex.streams.input(table, body)?;
         Ok(Ok((head, stream)))
     }
+}
+
+/// Refuses a whole body over [`MAX_BODY_BYTES`].
+fn check_body(b: &[u8]) -> Result<(), LayerError> {
+    if b.len() > MAX_BODY_BYTES {
+        return Err(LayerError::BudgetExceeded(Budget::Body));
+    }
+    Ok(())
 }
 
 /// An unusable guest head or body, named for the message it was part of.
@@ -506,6 +512,19 @@ impl endpoints::Host for StoreState {
             }
             Err(e) => return Err(self.fail(head_error(e, Produced::Endpoint))),
         };
+        // The bindings have copied a `bytes` body out of the guest by now;
+        // one over the cap goes no further, and nothing else of the call is
+        // built until the host has a slot for it.
+        if let types::Body::Bytes(b) = &body {
+            check_body(b).map_err(|e| self.fail(e))?;
+        }
+        let permit = match host.endpoint_permit().await {
+            Ok(permit) => permit,
+            Err(e) => {
+                self.discard_body(body);
+                return Ok(Err(endpoint_error(e)));
+            }
+        };
         let (body, out) = self
             .body_from_guest(body, Produced::Endpoint)
             .map_err(|e| self.fail(e))?;
@@ -515,14 +534,10 @@ impl endpoints::Host for StoreState {
         *request.headers_mut() = headers;
 
         let fut = wasmtime_wasi::runtime::spawn(async move {
-            match host.endpoint_call(&name, request).await {
-                Ok(resp) => Ok(resp),
-                Err(EndpointError::NotFound) => Err(types::Error::DestinationNotFound),
-                Err(EndpointError::Denied) => Err(types::Error::DestinationDenied),
-                Err(EndpointError::PathRefused(_)) => Err(types::Error::RequestUriInvalid),
-                Err(EndpointError::Timeout) => Err(types::Error::Timeout),
-                Err(e @ EndpointError::Failed(_)) => Err(internal(&e.to_string())),
-            }
+            let _permit = permit;
+            host.endpoint_call(&name, request)
+                .await
+                .map_err(endpoint_error)
         });
         let Self {
             table, exchange, ..
@@ -530,6 +545,16 @@ impl endpoints::Host for StoreState {
         let ex = exchange.as_mut().expect("in an exchange");
         let pending = ex.streams.pending(table, fut)?;
         Ok(Ok((pending, out)))
+    }
+}
+
+fn endpoint_error(e: EndpointError) -> types::Error {
+    match e {
+        EndpointError::NotFound => types::Error::DestinationNotFound,
+        EndpointError::Denied => types::Error::DestinationDenied,
+        EndpointError::PathRefused(_) => types::Error::RequestUriInvalid,
+        EndpointError::Timeout => types::Error::Timeout,
+        e @ EndpointError::Failed(_) => internal(&e.to_string()),
     }
 }
 

@@ -13,6 +13,12 @@
 //!   never answers the response;
 //! * `/svc/overlong`: answers each request head by forwarding it with
 //!   `content-length: 3` and 5 bytes of body;
+//! * `/svc/short`: answers each request head by forwarding it with
+//!   `content-length: 5` and 3 bytes of body;
+//! * `/svc/refuse`: answers each request head with a `403` of its own;
+//! * `/svc/abort`: resets each stream on its request head;
+//! * `/svc/patient`: a pass-through that holds the request head and body
+//!   until the `request_end`, then forwards them together;
 //! * `/svc/shout`: a pass-through that uppercases ASCII letters in the
 //!   response body bytes;
 //! * `/svc/sever`: a pass-through that resets the stream on the first
@@ -90,6 +96,8 @@ pub(crate) struct ServiceLog {
     resets: Mutex<Vec<(u32, String)>>,
     /// Resets for a stream that had not been opened.
     unknown_resets: Mutex<Vec<u32>>,
+    /// Every control message, in arrival order.
+    controls: Mutex<Vec<Value>>,
     talked: Mutex<Vec<u32>>,
     /// Body bytes received per stream id, across connections, by
     /// direction byte.
@@ -114,6 +122,15 @@ impl ServiceLog {
     /// Every reset for a stream the service had not seen opened.
     pub(crate) fn unknown_resets(&self) -> Vec<u32> {
         lock(&self.unknown_resets).clone()
+    }
+
+    /// Every control message roxy sent on stream `id`, in arrival order.
+    pub(crate) fn controls(&self, id: u32) -> Vec<Value> {
+        lock(&self.controls)
+            .iter()
+            .filter(|m| m["stream"] == id)
+            .cloned()
+            .collect()
     }
 
     /// Waits until `n` streams have been opened; every `open` so far.
@@ -219,6 +236,8 @@ enum Queued {
 struct Lane {
     credit: u64,
     queue: VecDeque<Queued>,
+    /// Nothing is sent from the queue while set.
+    held: bool,
 }
 
 impl Lane {
@@ -226,6 +245,7 @@ impl Lane {
         Self {
             credit: WINDOW,
             queue: VecDeque::new(),
+            held: false,
         }
     }
 }
@@ -265,6 +285,10 @@ enum Mode {
     Slow,
     Shout,
     Sever,
+    Short,
+    Refuse,
+    Abort,
+    Patient,
 }
 
 impl Mode {
@@ -289,6 +313,14 @@ impl Mode {
             Self::Shout
         } else if path.ends_with("/sever") {
             Self::Sever
+        } else if path.ends_with("/short") {
+            Self::Short
+        } else if path.ends_with("/refuse") {
+            Self::Refuse
+        } else if path.ends_with("/abort") {
+            Self::Abort
+        } else if path.ends_with("/patient") {
+            Self::Patient
         } else {
             Self::Flood
         }
@@ -324,9 +356,17 @@ impl Conn {
     /// Whether body bytes in `dir` are passed on.
     fn passes(&self, dir: u8) -> bool {
         match self.mode {
-            Mode::Pass | Mode::Hoard | Mode::Slow | Mode::Shout | Mode::Sever => true,
+            Mode::Pass | Mode::Hoard | Mode::Slow | Mode::Shout | Mode::Sever | Mode::Patient => {
+                true
+            }
             Mode::Hold | Mode::Forward => dir == REQUEST,
-            Mode::Overlong | Mode::Talk | Mode::Flood | Mode::Pause => false,
+            Mode::Overlong
+            | Mode::Short
+            | Mode::Refuse
+            | Mode::Abort
+            | Mode::Talk
+            | Mode::Flood
+            | Mode::Pause => false,
         }
     }
 
@@ -341,20 +381,27 @@ impl Conn {
             return;
         };
         let kind = v["type"].as_str().unwrap_or_default().to_owned();
+        lock(&self.log.controls).push(v.clone());
         match kind.as_str() {
             "open" => {
                 lock(&self.log.opens).push(v);
-                self.streams.insert(id, Sess::new());
+                let mut sess = Sess::new();
+                sess.lanes[usize::from(REQUEST)].held = self.mode == Mode::Patient;
+                self.streams.insert(id, sess);
                 match self.mode {
                     Mode::Pass
                     | Mode::Hold
                     | Mode::Hoard
                     | Mode::Forward
                     | Mode::Overlong
+                    | Mode::Short
+                    | Mode::Refuse
+                    | Mode::Abort
                     | Mode::Pause
                     | Mode::Slow
                     | Mode::Shout
-                    | Mode::Sever => {}
+                    | Mode::Sever
+                    | Mode::Patient => {}
                     Mode::Talk => {
                         let s = self.streams.get_mut(&id).expect("just opened");
                         s.lanes[usize::from(REQUEST)]
@@ -375,18 +422,18 @@ impl Conn {
                 }
                 self.flush(id, dir);
             }
-            "request" if self.mode == Mode::Overlong => {
+            "request" if self.mode == Mode::Overlong => self.forward_declared(id, &v, 3, b"12345"),
+            "request" if self.mode == Mode::Short => self.forward_declared(id, &v, 5, b"123"),
+            "request" if self.mode == Mode::Refuse => {
                 self.send(text(
                     id,
-                    json!({
-                        "type": "request",
-                        "method": v["method"],
-                        "url": v["url"],
-                        "headers": [["content-length", "3"]],
-                    }),
+                    json!({"type": "response", "status": 403, "headers": []}),
                 ));
-                self.send(binary(id, REQUEST, b"12345"));
-                self.send(text(id, json!({"type": "request_end"})));
+                self.send(text(id, json!({"type": "response_end"})));
+            }
+            "request" if self.mode == Mode::Abort => {
+                self.streams.remove(&id);
+                self.send(text(id, json!({"type": "reset", "message": "aborted"})));
             }
             "reset" => {
                 let msg = v["message"].as_str().unwrap_or_default().to_owned();
@@ -402,11 +449,31 @@ impl Conn {
                 };
                 v.as_object_mut().map(|o| o.remove("stream"));
                 if let Some(s) = self.streams.get_mut(&id) {
-                    s.lanes[usize::from(dir)].queue.push_back(Queued::Ctl(v));
+                    let lane = &mut s.lanes[usize::from(dir)];
+                    lane.queue.push_back(Queued::Ctl(v));
+                    if kind == "request_end" {
+                        lane.held = false;
+                    }
                 }
                 self.flush(id, dir);
             }
         }
+    }
+
+    /// Forwards the request head `v` declaring `length` bytes of body, then
+    /// sends `body` and the end, whatever roxy sends after the head.
+    fn forward_declared(&self, id: u32, v: &Value, length: usize, body: &[u8]) {
+        self.send(text(
+            id,
+            json!({
+                "type": "request",
+                "method": v["method"],
+                "url": v["url"],
+                "headers": [["content-length", length.to_string()]],
+            }),
+        ));
+        self.send(binary(id, REQUEST, body));
+        self.send(text(id, json!({"type": "request_end"})));
     }
 
     fn bytes(&mut self, id: u32, dir: u8, data: &[u8]) {
@@ -447,6 +514,9 @@ impl Conn {
             return;
         };
         let lane = &mut s.lanes[usize::from(dir)];
+        if lane.held {
+            return;
+        }
         let mut out = Vec::new();
         while let Some(q) = lane.queue.pop_front() {
             match q {
