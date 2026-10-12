@@ -235,7 +235,12 @@ pub(crate) type Answer = Result<http::Response<Body>, types::Error>;
 /// The `pending-response` resource. Dropped while pending, the call is
 /// abandoned (its task aborted). Public only because the generated
 /// bindings name it; the crate exports nothing of it.
-pub struct PendingResponse(Pending);
+pub struct PendingResponse {
+    state: Pending,
+    /// A clone of the exchange's [`Streams::pending`], so the exchange can
+    /// count the pending responses still in the table.
+    _held: Arc<()>,
+}
 
 enum Pending {
     Waiting(AbortOnDropJoinHandle<Answer>),
@@ -244,20 +249,16 @@ enum Pending {
 }
 
 impl PendingResponse {
-    pub(crate) fn new(handle: AbortOnDropJoinHandle<Answer>) -> Self {
-        Self(Pending::Waiting(handle))
-    }
-
     /// The answer if it has arrived, without waiting. `Err(())` once it has
     /// been taken.
     pub(crate) fn poll_take(&mut self) -> Result<Option<Answer>, ()> {
-        if let Pending::Waiting(handle) = &mut self.0 {
+        if let Pending::Waiting(handle) = &mut self.state {
             match Pin::new(handle).poll(&mut Context::from_waker(Waker::noop())) {
                 Poll::Pending => return Ok(None),
-                Poll::Ready(answer) => self.0 = Pending::Ready(answer),
+                Poll::Ready(answer) => self.state = Pending::Ready(answer),
             }
         }
-        match std::mem::replace(&mut self.0, Pending::Consumed) {
+        match std::mem::replace(&mut self.state, Pending::Consumed) {
             Pending::Ready(answer) => Ok(Some(answer)),
             Pending::Consumed => Err(()),
             Pending::Waiting(_) => unreachable!("settled above"),
@@ -266,7 +267,7 @@ impl PendingResponse {
 
     /// Waits for the answer. `Err(())` once it has been taken.
     pub(crate) async fn wait(self) -> Result<Answer, ()> {
-        match self.0 {
+        match self.state {
             Pending::Waiting(handle) => Ok(handle.await),
             Pending::Ready(answer) => Ok(answer),
             Pending::Consumed => Err(()),
@@ -277,21 +278,46 @@ impl PendingResponse {
 #[async_trait::async_trait]
 impl Pollable for PendingResponse {
     async fn ready(&mut self) {
-        if let Pending::Waiting(handle) = &mut self.0 {
+        if let Pending::Waiting(handle) = &mut self.state {
             let answer = handle.await;
-            self.0 = Pending::Ready(answer);
+            self.state = Pending::Ready(answer);
         }
     }
 }
 
-/// The streams one exchange has handed its guest, by resource index.
+/// The streams one exchange has handed its guest, by resource index, and
+/// the pending responses it has handed out.
 #[derive(Default)]
 pub(crate) struct Streams {
     inputs: HashMap<u32, Arc<Mutex<InputState>>>,
     outputs: HashMap<u32, Arc<Mutex<OutputState>>>,
+    /// Shared with every `pending-response` in the table, so its strong
+    /// count less this one is how many the guest still holds.
+    pending: Arc<()>,
 }
 
 impl Streams {
+    /// Hands the guest a `pending-response` for `handle`.
+    pub(crate) fn pending(
+        &self,
+        table: &mut ResourceTable,
+        handle: AbortOnDropJoinHandle<Answer>,
+    ) -> wasmtime::Result<Resource<PendingResponse>> {
+        Ok(table.push(PendingResponse {
+            state: Pending::Waiting(handle),
+            _held: self.pending.clone(),
+        })?)
+    }
+
+    /// Whether the guest still holds a stream or pending response this
+    /// exchange handed out. Its other handles (WASI stdio, pollables) are
+    /// not this exchange's.
+    pub(crate) fn held(&self) -> bool {
+        self.inputs.values().any(|s| !lock(s).gone)
+            || self.outputs.values().any(|s| !lock(s).gone)
+            || Arc::strong_count(&self.pending) > 1
+    }
+
     /// Hands `body` to the guest as an `input-stream`.
     pub(crate) fn input(
         &mut self,
