@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -22,13 +22,13 @@ repository = "https://github.com/roxy-proxy/roxy-proxy"
 
 [workspace.dependencies]
 # Internal crates
-roxy-http = { path = "crates/roxy-http", version = "0.1.0" }
-roxy-log = { path = "crates/roxy-log", version = "0.1.0" }
-roxy-node = { path = "crates/roxy-node", version = "0.1.0" }
-roxy-proxy = { path = "crates/roxy-proxy", version = "0.1.0" }
-roxy-rules = { path = "crates/roxy-rules", version = "0.1.0" }
-roxy-tls = { path = "crates/roxy-tls", version = "0.1.0" }
-roxy-wasm = { path = "crates/roxy-wasm", version = "0.1.0" }
+roxy-http = { path = "crates/roxy-http", version = "0.1.1" }
+roxy-log = { path = "crates/roxy-log", version = "0.1.1" }
+roxy-node = { path = "crates/roxy-node", version = "0.1.1" }
+roxy-proxy = { path = "crates/roxy-proxy", version = "0.1.1" }
+roxy-rules = { path = "crates/roxy-rules", version = "0.1.1" }
+roxy-tls = { path = "crates/roxy-tls", version = "0.1.1" }
+roxy-wasm = { path = "crates/roxy-wasm", version = "0.1.1" }
 
 # External crates
 anyhow = "1.0.104"

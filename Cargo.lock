@@ -2873,7 +2873,7 @@ dependencies = [
 
 [[package]]
 name = "roxy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2921,7 +2921,7 @@ dependencies = [
 
 [[package]]
 name = "roxy-http"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.23.1",
  "brotli",
@@ -2945,7 +2945,7 @@ dependencies = [
 
 [[package]]
 name = "roxy-log"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "flate2",
@@ -2955,7 +2955,7 @@ dependencies = [
 
 [[package]]
 name = "roxy-node"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2985,7 +2985,7 @@ dependencies = [
 
 [[package]]
 name = "roxy-node-spec"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "jsonschema",
  "serde_json",
@@ -2994,7 +2994,7 @@ dependencies = [
 
 [[package]]
 name = "roxy-proxy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -3038,7 +3038,7 @@ dependencies = [
 
 [[package]]
 name = "roxy-rules"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "dashmap",
@@ -3057,7 +3057,7 @@ dependencies = [
 
 [[package]]
 name = "roxy-tls"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "lru",
  "pem",
@@ -3076,7 +3076,7 @@ dependencies = [
 
 [[package]]
 name = "roxy-wasm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",
