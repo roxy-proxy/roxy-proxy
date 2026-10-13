@@ -10,8 +10,8 @@ use regex::Regex;
 use roxy_http::Host;
 
 use super::{
-    CAction, CompiledRule, Condition, MetricDef, PolicyInput, RuleKind, RuleShape, SignSpec,
-    WatchAction, is_header_value,
+    CAction, CompiledRule, Condition, InFlightAction, MetricDef, PolicyInput, RuleKind, RuleShape,
+    SignSpec, is_header_value,
 };
 use crate::compile::{Env, Needs, Pred, ROperand, build_shared_regex, compile};
 use crate::config::{
@@ -21,13 +21,13 @@ use crate::config::{
 use crate::diag::{Diagnostic, RuleId};
 use crate::eval::{
     AllowOpts, AwsSigV4, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Deny, DenyStatus,
-    Effect, SetHeaderValue, WatchEffect,
+    Effect, InFlightEffect, SetHeaderValue,
 };
 use crate::lexer::is_ident;
 use crate::template::{
     Part, SECRET_PLACES, literal, mentions_secret, parse_template, secret_names,
 };
-use crate::types::{Access, Field, Reads, Watched, is_token};
+use crate::types::{Access, Field, InFlightValue, Reads, is_token};
 
 impl Condition {
     /// Compiles `src`. `path` locates it in diagnostics (`addons[0].when`).
@@ -40,9 +40,9 @@ impl Condition {
         let Some((pred, needs)) = c.expr(None, path.to_owned(), src) else {
             return Err(c.finish().1);
         };
-        // A byte metric's value is known at the head; only fields are late.
+        // A byte metric's value is known at admission; only fields are late.
         let mut late: Vec<String> = needs
-            .watched_names(Reads::WATCHED_FIELDS)
+            .in_flight_names(Reads::IN_FLIGHT_FIELDS)
             .iter()
             .map(|n| format!("`{n}`"))
             .collect();
@@ -53,7 +53,7 @@ impl Condition {
             return Err(vec![Diagnostic::new(
                 path,
                 format!(
-                    "a condition here may only read head fields, and not `body.text`, because \
+                    "a condition here may only read admission fields, and not `body.text`, because \
                      it is decided before the request body is read; it reads {}",
                     late.join(", ")
                 ),
@@ -330,17 +330,17 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         None
     }
 
-    /// A metric `key` or `unique()` field, which must be a head field.
+    /// A metric `key` or `unique()` field, which must be an admission field.
     fn metric_field(&mut self, name: &str, at: String, what: &str) -> Option<Field> {
         match Field::from_name(name) {
-            Some(f) if f.is_head() => Some(f),
+            Some(f) if f.is_admission() => Some(f),
             Some(f) => {
                 self.push(
                     None,
                     at,
                     format!(
                         "`{f}` is known only after forwarding; metric {what} fields must be \
-                         head fields (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)"
+                         admission fields (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)"
                     ),
                 );
                 None
@@ -359,21 +359,21 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         }
     }
 
-    /// A metric `where`: head fields only, and no tags, so that whether a
-    /// flow counts is fixed at the request head and does not depend on the
+    /// A metric `where`: admission fields only, and no tags, so that whether a
+    /// flow counts is fixed at admission and does not depend on the
     /// rules. A flow is counted outside the rules, where no tag is set, so
     /// a tag read here would always be false.
     fn metric_filter(&mut self, src: &str, at: String) -> Option<Pred> {
         let (pred, needs) = self.expr(None, at.clone(), src)?;
-        if needs.reads.intersects(Reads::WATCHED_FIELDS) {
+        if needs.reads.intersects(Reads::IN_FLIGHT_FIELDS) {
             self.push(
                 None,
                 at,
                 format!(
-                    "a metric's `where` may only read head fields, because whether an \
-                     exchange counts is decided at the request head; it reads {} \
+                    "a metric's `where` may only read admission fields, because whether an \
+                     exchange counts is decided at admission; it reads {} \
                      (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)",
-                    quoted(&needs.watched_names(Reads::WATCHED_FIELDS))
+                    quoted(&needs.in_flight_names(Reads::IN_FLIGHT_FIELDS))
                 ),
             );
             return None;
@@ -437,12 +437,12 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             };
             tag_reads.push(needs.tags.clone());
             let shape = RuleShape::classify(&needs, rule);
-            let (head, watching) = self.actions(rule, &rid, &path, &shape);
+            let (admission, in_flight) = self.actions(rule, &rid, &path, &shape);
             out.push(CompiledRule {
                 id: rid,
                 when,
-                head,
-                watching,
+                admission,
+                in_flight,
                 quarantines: rule.then.0.iter().any(|a| matches!(a, Action::Quarantine)),
                 shape,
             });
@@ -452,12 +452,12 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
     }
 
     /// A rule may read `tag["x"]` only if every rule that can set `x` is
-    /// decided at the head and, for a reader that is itself decided at the
-    /// head, sits above it. Head rules run in list order, so what the
-    /// reader sees is then fixed by the config. A watching setter fires
-    /// when the values it reads arrive, not in list order, so whether its
-    /// tag is visible would depend on timing; that includes a deny that
-    /// watches a byte metric, whose tag a watching reader could see only
+    /// decided at admission and, for a reader that is itself decided at
+    /// admission, sits above it. Admission rules run in list order, so what
+    /// the reader sees is then fixed by the config. An in-flight setter
+    /// fires when the values it reads arrive, not in list order, so whether
+    /// its tag is visible would depend on timing; that includes a deny on a
+    /// byte metric, whose tag an in-flight reader could see only
     /// when both fire in the same pass. A tag no rule sets can only come
     /// from an addon, before any rule runs; a rule's own tags are set after
     /// its own check wherever it sits.
@@ -479,18 +479,18 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                         let (setter, reader) = (rules[s].shape.kind, rules[r].shape.kind);
                         if s == r {
                             None
-                        } else if !setter.at_head() {
+                        } else if !setter.at_admission() {
                             Some(format!(
-                                "rules[{s}] ({id:?}), a watching rule, which fires when the \
+                                "rules[{s}] ({id:?}), an in-flight rule, which fires when the \
                                  values it reads arrive rather than in list order"
                             ))
-                        } else if setter.watches() && reader.watches() {
+                        } else if setter.in_flight() && reader.in_flight() {
                             Some(format!(
-                                "rules[{s}] ({id:?}), a deny watching a byte metric, which can \
-                                 fire while this rule watches, when the values it reads arrive \
+                                "rules[{s}] ({id:?}), a deny on a byte metric, which can fire \
+                                 in flight as this rule does, when the values it reads arrive \
                                  rather than in list order"
                             ))
-                        } else if s > r && reader.at_head() {
+                        } else if s > r && reader.at_admission() {
                             Some(format!("rules[{s}] ({id:?}), below this rule"))
                         } else {
                             None
@@ -512,18 +512,18 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         }
     }
 
-    /// Compile a rule's actions for where it runs: at the head, after
-    /// forwarding, or (a deny watching a byte metric) both.
+    /// Compile a rule's actions for where it runs: at admission, after
+    /// forwarding, or (a deny on a byte metric) both.
     fn actions(
         &mut self,
         rule: &RuleConfig,
         rid: &RuleId,
         path: &str,
         shape: &RuleShape,
-    ) -> (Box<[CAction]>, Box<[WatchAction]>) {
+    ) -> (Box<[CAction]>, Box<[InFlightAction]>) {
         let actions = &rule.then.0;
-        let mut head = Vec::with_capacity(actions.len());
-        let mut watching = Vec::with_capacity(actions.len());
+        let mut admission = Vec::with_capacity(actions.len());
+        let mut in_flight = Vec::with_capacity(actions.len());
         for (j, action) in actions.iter().enumerate() {
             let apath = format!("{path}.then[{j}]");
             if j > 0 && actions[j - 1].is_terminal() {
@@ -540,26 +540,27 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 );
             }
             match shape.kind {
-                RuleKind::Watching => {
-                    if let Some(a) = self.watch_action(shape, action, rid, &apath) {
-                        watching.extend(a);
+                RuleKind::InFlight => {
+                    if let Some(a) = self.in_flight_action(shape, action, rid, &apath) {
+                        in_flight.extend(a);
                     }
                 }
-                RuleKind::Head | RuleKind::HeadAndWatching => {
+                RuleKind::Admission | RuleKind::AdmissionAndInFlight => {
                     let Some(compiled) = self.action(action, rid, &apath) else {
                         continue;
                     };
-                    if shape.kind == RuleKind::HeadAndWatching {
-                        watching.extend(compiled.iter().filter_map(WatchAction::after_forwarding));
+                    if shape.kind == RuleKind::AdmissionAndInFlight {
+                        in_flight
+                            .extend(compiled.iter().filter_map(InFlightAction::after_forwarding));
                     }
-                    head.extend(compiled);
+                    admission.extend(compiled);
                 }
             }
         }
-        (head.into(), watching.into())
+        (admission.into(), in_flight.into())
     }
 
-    /// Check one action of a rule decided at the request head, where every
+    /// Check one action of a rule decided at admission, where every
     /// action is possible; `None` if it has errors (already reported).
     fn action(&mut self, action: &Action, rid: &RuleId, apath: &str) -> Option<Vec<CAction>> {
         let errors_before = self.d.len();
@@ -630,17 +631,17 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         (self.d.len() == errors_before).then_some(out)
     }
 
-    /// Check one action of a rule that reads a watched field, which runs
+    /// Check one action of a rule that reads an in-flight field, which runs
     /// after the request is on its way: it cannot allow or change the
     /// request, and its header changes apply to the response. `None` if it
     /// has errors (already reported).
-    fn watch_action(
+    fn in_flight_action(
         &mut self,
         shape: &RuleShape,
         action: &Action,
         rid: &RuleId,
         apath: &str,
-    ) -> Option<Vec<WatchAction>> {
+    ) -> Option<Vec<InFlightAction>> {
         let errors_before = self.d.len();
         let rule = Some(rid);
         self.secrets_outside_header(action, rule, apath);
@@ -650,8 +651,8 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                     rule,
                     apath,
                     format!(
-                        "`allow` is only possible in rules decided at the request head; {}. \
-                         Write the allow as a head rule and this rule as a `deny`",
+                        "`allow` is only possible in admission rules; {}. \
+                         Write the allow as an admission rule and this rule as a `deny`",
                         shape.forwarded_why()
                     ),
                 );
@@ -678,8 +679,8 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                     rule,
                     apath,
                     format!(
-                        "`capture` is decided at the request head, so the whole exchange is \
-                         captured from its first byte; {}. Capture in a head rule (e.g. the \
+                        "`capture` is decided at admission, so the whole exchange is \
+                         captured from its first byte; {}. Capture in an admission rule (e.g. the \
                          allow that forwards this traffic)",
                         shape.forwarded_why()
                     ),
@@ -691,8 +692,8 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                     rule,
                     apath,
                     format!(
-                        "`digest` is decided at the request head, so the whole body is \
-                         hashed from its first byte; {}. Digest in a head rule (e.g. the \
+                        "`digest` is decided at admission, so the whole body is \
+                         hashed from its first byte; {}. Digest in an admission rule (e.g. the \
                          allow that forwards this traffic)",
                         shape.forwarded_why()
                     ),
@@ -712,22 +713,22 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 names
                     .iter()
                     .filter_map(|n| self.header_name(rule, apath, n))
-                    .map(|n| WatchAction::Effect(WatchEffect::RemoveHeader(n)))
+                    .map(|n| InFlightAction::Effect(InFlightEffect::RemoveHeader(n)))
                     .collect()
             }
-            Action::Deny(d) => vec![WatchAction::Deny(self.deny(d, rule, apath))],
-            Action::Quarantine => vec![WatchAction::Deny(Deny::quarantine())],
+            Action::Deny(d) => vec![InFlightAction::Deny(self.deny(d, rule, apath))],
+            Action::Quarantine => vec![InFlightAction::Deny(Deny::quarantine())],
             Action::Tag(t) => {
                 self.tag(t, rule, apath);
-                vec![WatchAction::Tag(t.clone())]
+                vec![InFlightAction::Tag(t.clone())]
             }
-            Action::Log(l) => vec![WatchAction::Effect(WatchEffect::Log {
+            Action::Log(l) => vec![InFlightAction::Effect(InFlightEffect::Log {
                 level: l.level,
                 message: l.message.clone(),
             })],
             Action::SetState(st) => {
                 self.set_state(st, rule, apath);
-                vec![WatchAction::Effect(WatchEffect::SetState {
+                vec![InFlightAction::Effect(InFlightEffect::SetState {
                     key: st.key.clone(),
                     value: st.value.clone(),
                     ttl: st.ttl,
@@ -800,7 +801,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         }
     }
 
-    /// Request headers, set at the head: a value may carry secrets, which
+    /// Request headers, set at admission: a value may carry secrets, which
     /// are substituted per flow.
     fn set_header(
         &mut self,
@@ -832,7 +833,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         out
     }
 
-    /// Response headers, set by a watching rule: secrets set request
+    /// Response headers, set by an in-flight rule: secrets set request
     /// headers, so a value here is a literal.
     fn response_set_header(
         &mut self,
@@ -840,7 +841,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         pairs: &[(String, String)],
         rule: Option<&RuleId>,
         apath: &str,
-    ) -> Vec<WatchAction> {
+    ) -> Vec<InFlightAction> {
         let mut out = Vec::with_capacity(pairs.len());
         for (name, value) in pairs {
             let Some(name) = self.header_name(rule, apath, name) else {
@@ -855,14 +856,17 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                     rule,
                     apath,
                     format!(
-                        "secret references are only allowed in rules decided at the request \
-                         head (they set request headers); this rule watches {}",
-                        shape.watched()
+                        "secret references are only allowed in admission rules (they set \
+                         request headers); this rule reads {} in flight",
+                        shape.reads_quoted()
                     ),
                 );
                 continue;
             };
-            out.push(WatchAction::Effect(WatchEffect::SetHeader { name, value }));
+            out.push(InFlightAction::Effect(InFlightEffect::SetHeader {
+                name,
+                value,
+            }));
         }
         out
     }
@@ -1050,52 +1054,53 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
 }
 
 impl RuleShape {
-    /// Classify a rule from what its `when` reads. A rule reading a watched
-    /// field watches; a `deny` reading a byte metric and no watched field
-    /// takes part in the head decision and is re-checked as this exchange
-    /// adds bytes; anything else is decided at the head.
+    /// Classify a rule from what its `when` reads. A rule reading an
+    /// in-flight field runs in flight; a `deny` reading a byte metric and no
+    /// in-flight field takes part in the admission decision and is
+    /// re-checked as this exchange adds bytes; anything else is decided at
+    /// admission.
     fn classify(needs: &Needs, rule: &RuleConfig) -> Self {
-        let fields = needs.reads.retain(Watched::is_field);
+        let fields = needs.reads.retain(InFlightValue::is_field);
         let metrics = needs.reads.minus(fields);
         let denies = rule.then.0.iter().any(Action::is_deny);
-        let (kind, triggers, watches) = if !fields.is_empty() {
+        let (kind, triggers, in_flight_reads) = if !fields.is_empty() {
             (
-                RuleKind::Watching,
+                RuleKind::InFlight,
                 needs.reads,
-                needs.watched_names(needs.reads),
+                needs.in_flight_names(needs.reads),
             )
         } else if denies && !metrics.is_empty() {
             (
-                RuleKind::HeadAndWatching,
+                RuleKind::AdmissionAndInFlight,
                 metrics,
-                needs.watched_names(metrics),
+                needs.in_flight_names(metrics),
             )
         } else {
-            (RuleKind::Head, Reads::NONE, Vec::new())
+            (RuleKind::Admission, Reads::NONE, Vec::new())
         };
         Self {
             kind,
             fields,
             triggers,
-            watches,
+            in_flight_reads,
         }
     }
 
-    fn watched(&self) -> String {
-        quoted(&self.watches)
+    fn reads_quoted(&self) -> String {
+        quoted(&self.in_flight_reads)
     }
 
-    /// Why a rule that reads a watched field runs after forwarding, for
+    /// Why a rule that reads an in-flight field runs after forwarding, for
     /// diagnostics about actions it cannot have.
     fn forwarded_why(&self) -> String {
         format!(
             "this rule reads {}, which is known only after the request was forwarded \
              (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation)",
-            self.watched()
+            self.reads_quoted()
         )
     }
 
-    /// Why a watching rule's `set_header` / `remove_header` cannot apply to
+    /// Why an in-flight rule's `set_header` / `remove_header` cannot apply to
     /// the response, if it cannot: everything that can re-check the rule
     /// must be known before the response head is sent (`response.status`,
     /// `response.header[..]`, `response.body.size`, `response.body.text`).

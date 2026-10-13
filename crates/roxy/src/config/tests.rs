@@ -60,15 +60,23 @@ fn full_config_parses_and_validates() {
         .rule_info()
         .into_iter()
         .map(|r| match r.kind {
-            roxy_rules::RuleKind::Head => "head",
-            roxy_rules::RuleKind::Watching => "watching",
-            roxy_rules::RuleKind::HeadAndWatching => "both",
+            roxy_rules::RuleKind::Admission => "admission",
+            roxy_rules::RuleKind::InFlight => "in-flight",
+            roxy_rules::RuleKind::AdmissionAndInFlight => "both",
         })
         .collect();
     assert_eq!(
         kinds,
         [
-            "head", "both", "head", "watching", "head", "head", "head", "head", "watching"
+            "admission",
+            "both",
+            "admission",
+            "in-flight",
+            "admission",
+            "admission",
+            "admission",
+            "admission",
+            "in-flight"
         ]
     );
     assert_eq!(cfg.addons[0].kind, AddonKind::Wasm);
@@ -536,7 +544,7 @@ fn sign_unsigned_payload_outside_s3_diagnosed() {
 }
 
 #[test]
-fn secret_in_watching_rule_diagnosed() {
+fn secret_in_in_flight_rule_diagnosed() {
     let d = diagnostics(&format!(
         "{BASE}secrets: {{ s: {{ env: S }} }}\nrules:\n  - id: a\n    \
          when: response.status == 200\n    \
@@ -544,7 +552,7 @@ fn secret_in_watching_rule_diagnosed() {
     ));
     assert_eq!(d.len(), 1, "{d:?}");
     assert!(
-        d[0].message.contains("decided at the request head"),
+        d[0].message.contains("only allowed in admission rules"),
         "{d:?}"
     );
 }
@@ -1138,7 +1146,7 @@ fn addon_when_and_sample_diagnosed() {
         (
             "when: 'response.status == 200'",
             "addons[0].when",
-            "head fields",
+            "admission fields",
         ),
         (
             "when: 'body.text contains \"x\"'",

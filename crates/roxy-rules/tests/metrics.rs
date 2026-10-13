@@ -50,7 +50,7 @@ fn client(n: u8) -> MapView {
     )
 }
 
-/// A head sample: counts `requests` and `unique`.
+/// An admission sample: counts `requests` and `unique`.
 const REQ: Sample = Sample {
     head: true,
     request_bytes: 0,
@@ -102,7 +102,7 @@ fn count_kinds() {
     );
     let v = MapView::new().with_str(Field::Path, "/a");
     let none = Sample::default();
-    // Head samples: requests, unique (and denied, if the head denied).
+    // Admission samples: requests, unique (and denied, if admission denied).
     s.record(
         &v,
         &Sample {
@@ -570,7 +570,7 @@ fn read_before_record_denies_the_31st() {
         let base = client(1);
         let x = s.get("x", &base).unwrap();
         let flow = base.clone().with_metric("x", x);
-        let out = p.evaluate_head(&flow, &EvalContext::empty());
+        let out = p.evaluate_admission(&flow, &EvalContext::empty());
         let denied = !out.decision.is_allow();
         s.record(&base, &Sample { denied, ..REQ }).unwrap();
         outcomes.push((x, denied, out.terminal_rule.to_string()));

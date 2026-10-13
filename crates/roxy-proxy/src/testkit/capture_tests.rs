@@ -79,7 +79,7 @@ async fn capture_all_records_exactly_what_was_forwarded() {
     assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<_>>());
 }
 
-/// The `capture` action selects exchanges (and directions) at the head;
+/// The `capture` action selects exchanges (and directions) at admission;
 /// here over h2.
 #[tokio::test]
 async fn the_capture_action_selects_exchanges() {

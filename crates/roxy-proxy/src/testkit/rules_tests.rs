@@ -322,11 +322,11 @@ async fn a_response_rule_replaces_an_upstream_5xx() {
     assert_eq!(ev["terminal_rule"], "hide-5xx");
 }
 
-/// A watching deny stops the exchange without cutting the pass short: a
-/// watching rule below it that the same event triggers still runs, and its
+/// An in-flight deny stops the exchange without cutting the pass short: a
+/// in-flight rule below it that the same event triggers still runs, and its
 /// `log` effect reaches the flow log, as a head deny's would.
 #[tokio::test]
-async fn a_watching_deny_keeps_the_log_of_the_rule_below_it() {
+async fn an_in_flight_deny_keeps_the_log_of_the_rule_below_it() {
     let kit = Kit::builder()
         .rules(
             r#"
@@ -657,7 +657,7 @@ async fn upload(kit: &Kit, path: &str) -> Answer {
 }
 
 /// A byte budget (`request_bytes` metric) stops the upload that crosses
-/// it, while it streams, and later requests are denied at the head.
+/// it, while it streams, and later requests are denied at admission.
 #[tokio::test]
 async fn a_byte_budget_stops_the_crossing_upload() {
     let kit = Kit::builder()

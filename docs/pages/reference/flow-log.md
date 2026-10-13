@@ -24,12 +24,12 @@ produces a `request` event:
 | field | meaning |
 |---|---|
 | `req.body_bytes`, `res.body_bytes` | body bytes roxy forwarded in each direction |
-| `req.body_sha256`, `res.body_sha256` | lower-case hex SHA-256 of those bytes, only for the sides a head rule's `digest` action selected ([actions](/reference/rule-language#actions)); present once the body completed, absent if the exchange ended first (a cut body, a watching stop, a client that left). An empty body has the empty-string digest; a relayed WebSocket has counts but no digests. Hashing is opt-in because a digest nobody compares against is wasted work: software SHA-256 costs about one core per 400 MB/s on CPUs without SHA-NI |
+| `req.body_sha256`, `res.body_sha256` | lower-case hex SHA-256 of those bytes, only for the sides an admission rule's `digest` action selected ([actions](/reference/rule-language#actions)); present once the body completed, absent if the exchange ended first (a cut body, an in-flight stop, a client that left). An empty body has the empty-string digest; a relayed WebSocket has counts but no digests. Hashing is opt-in because a digest nobody compares against is wasted work: software SHA-256 costs about one core per 400 MB/s on CPUs without SHA-NI |
 | `timing.upstream_connect_ms` | how long opening the upstream connection took (DNS, TCP and TLS); `null` when the request reused a pooled connection, or none was opened |
 | `timing.upstream_ttfb_ms` | from the forwarding decision to the upstream's response head |
 | `decision` | `allow`, `deny`, or `answered` when an addon layer answered itself |
 | `terminal_rule` | what decided: a rule id, or `_default`, `_fail_closed`, `_address_policy`, `_expired`, `_quarantined`, `_sign`, `_websocket` or `layer:<name>` |
-| `stage` | `head`, or where a watching rule stopped the exchange: `request_body`, `response_head`, `response_body`, `websocket` |
+| `stage` | `head`, or where an in-flight rule stopped the exchange: `request_body`, `response_head`, `response_body`, `websocket` |
 | `addons` | the layers that ran, outermost first; one skipped by its `when` or `sample` is not listed ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)) |
 | `rules`, `decision`, `terminal_rule` with addons | describe the request that left the stack; `req` is what the client sent and `res.status` what it got, which a layer above the rules may have replaced ([addons](/reference/addon-configuration#in-the-proxy)) |
 | `reason` | a stable code when the exchange failed closed or failed, by `terminal_rule`: |
@@ -140,10 +140,10 @@ json|pretty` and `--log-level` (or `RUST_LOG`).
 ## Capture
 
 roxy tees the heads and bodies of exchanges, exactly as forwarded, to
-`<capture_dir>/capture.rxc`: those a head rule selects with `capture:
+`<capture_dir>/capture.rxc`: those an admission rule selects with `capture:
 request | response | both`, or every forwarded exchange with
-`log.capture.all: true`. Capture is decided at the request head and covers
-the exchange from its first byte; the taps sit after the watching rules
+`log.capture.all: true`. Capture is decided at admission and covers
+the exchange from its first byte; the taps sit after the in-flight rules
 allowed a chunk. WebSocket relays are captured both ways at the relay next
 to the upstream, not as an addon layer changes them for the client.
 

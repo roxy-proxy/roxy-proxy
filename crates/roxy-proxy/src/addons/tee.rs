@@ -32,8 +32,8 @@ use tokio_util::sync::CancellationToken;
 use super::{AddonSpec, Part, StackFlow};
 use crate::budget::{self, BufferLease};
 use crate::flowlog::FlowEvent;
+use crate::in_flight::Dir;
 use crate::server::Shared;
-use crate::watch::Dir;
 
 /// The copy outgrew `max_observer_lag_bytes`.
 const BEHIND: &str = "observer_behind";
@@ -103,7 +103,7 @@ enum Msg {
     End,
     /// The copy ends short, with why: the real body's own error, or
     /// [`BodyError::Abandoned`] when the real body was dropped unread
-    /// (refused at the head, say). An observer tells the two apart.
+    /// (refused at admission, say). An observer tells the two apart.
     Cut(BodyError),
 }
 
@@ -444,7 +444,7 @@ pub(crate) async fn observe(
             Err(e) => Err(e),
         };
         if let Err(e) = result {
-            // The exchange failing (below the observer, at the head or in
+            // The exchange failing (below the observer, at admission or in
             // the body; the client's upload; the front giving it up) ends
             // the observer's copies and its `next` early; what it makes of
             // that is a consequence, recorded against the party at fault

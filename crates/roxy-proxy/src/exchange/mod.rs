@@ -26,6 +26,7 @@ use crate::addr::PrivateAddrs;
 use crate::body::{Tally, counted, counted_until_sent, trailers_need_h2};
 use crate::capture::{self, Tap};
 use crate::flowlog::{DecisionKind, FlowEvent};
+use crate::in_flight::{Dir, InFlight, in_flight_body};
 use crate::io::ClientIo;
 use crate::listener::ClientConn;
 use crate::pipeline::{
@@ -35,7 +36,6 @@ use crate::pipeline::{
 use crate::server::Shared;
 use crate::upstream::{ConnectError, ConnectInfo, Protocols, UpstreamBody, classify, describe};
 use crate::view::host_text;
-use crate::watch::{Dir, Watch, watched};
 
 pub(crate) use ws::close_upstream_ws;
 
@@ -57,7 +57,7 @@ pub(crate) async fn respond(mut conn: ServerConn<ClientIo>, res: CanonicalRespon
 /// Why a front could not write a response.
 #[derive(Debug)]
 pub(crate) enum WriteFailure {
-    /// A watching rule stopped the exchange mid-body; the front cut the
+    /// An in-flight rule stopped the exchange mid-body; the front cut the
     /// body (h1 closes the connection, h2 resets the stream).
     Stopped,
     /// The client stopped reading or went away.
@@ -112,7 +112,7 @@ pub(crate) enum Answer {
 pub(crate) struct Sent {
     /// The write failed: the client got nothing, or a cut body.
     pub failed: bool,
-    /// The exchange ends the connection: a closing refusal, or a watching
+    /// The exchange ends the connection: a closing refusal, or an in-flight
     /// stop that closes. The h1 codec sees the same value as
     /// `res.meta.close`; h2 sends GOAWAY on it.
     pub close: bool,
@@ -139,7 +139,7 @@ where
     let failed = r.is_err();
     cx.record.response_bytes = tally.bytes();
     cx.record.response_sha256 = tally.sha256_hex();
-    let stop = cx.watch.as_ref().and_then(|w| w.stopped());
+    let stop = cx.in_flight.as_ref().and_then(|w| w.stopped());
     // Under a stop, the cut body is how the stop is delivered, not a
     // failure of its own.
     let failure = match r {
@@ -221,9 +221,9 @@ pub(crate) fn refusal_response(cx: &mut FlowCx, refusal: &Refusal) -> CanonicalR
 
 /// Final accounting for a refusal whose response has been written.
 pub(crate) fn finish_refusal(cx: &mut FlowCx, refusal: &Refusal) {
-    // Past the forwarding decision (the watcher exists from then on) the
-    // final sample is still due; head denies were recorded at the head.
-    if cx.watch.is_some() {
+    // Past the forwarding decision (the in-flight checker exists from then
+    // on) the final sample is still due; admission denies were recorded then.
+    if cx.in_flight.is_some() {
         cx.record_refusal_sample(refusal);
     }
     cx.emit_request_event();
@@ -546,10 +546,10 @@ impl From<Failed> for Outcome {
     }
 }
 
-/// The stop of a watching rule, as the outcome of an exchange whose
+/// The stop of an in-flight rule, as the outcome of an exchange whose
 /// response has not started (answered with an error response).
-fn stopped_outcome(watch: &Watch) -> Option<Failed> {
-    watch.stopped().map(|s| Failed::Refuse(s.refusal))
+fn stopped_outcome(in_flight: &InFlight) -> Option<Failed> {
+    in_flight.stopped().map(|s| Failed::Refuse(s.refusal))
 }
 
 /// Waits for the upstream's response head.
@@ -598,11 +598,11 @@ pub(crate) fn wants_websocket(meta: &RequestMeta) -> bool {
 
 /// The forwarded exchange: the upstream leg (a plain request, or a
 /// WebSocket upgrade), then the response steps. From here on the request
-/// is on its way: watching rules re-check the exchange as values arrive,
+/// is on its way: in-flight rules re-check the exchange as values arrive,
 /// and what is forwarded is teed to the capture log, heads included.
 async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalRequest) -> Outcome {
-    let watch = Watch::new(cx);
-    cx.watch = Some(watch.clone());
+    let in_flight = InFlight::new(cx);
+    cx.in_flight = Some(in_flight.clone());
     let PerDir {
         request: mut up_tap,
         response: down_tap,
@@ -637,7 +637,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
     let upstreamed = if relay_ws {
         upgrade_upstream(cx, req, up_tap.as_mut()).await
     } else {
-        plain_upstream(front, cx, req, &watch, up_tap.take()).await
+        plain_upstream(front, cx, req, &in_flight, up_tap.take()).await
     };
     let upstreamed = match upstreamed {
         Ok(u) => u,
@@ -666,7 +666,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
                 return Outcome::Upgrade { res, upstream, key };
             }
             let body = std::mem::take(&mut res.body);
-            res.body = watched(body, watch, Dir::Response, down_tap);
+            res.body = in_flight_body(body, in_flight, Dir::Response, down_tap);
             Outcome::Respond(res)
         }
         ResponseVerdict::Deny(r) => Outcome::Refuse(r),
@@ -756,24 +756,24 @@ async fn upgrade_upstream(
 }
 
 /// The upstream leg of an ordinary request through the pooled client,
-/// the request body watched and captured as it streams.
+/// the request body checked in flight and captured as it streams.
 async fn plain_upstream<F: Front>(
     front: &mut F,
     cx: &mut FlowCx,
     mut req: CanonicalRequest,
-    watch: &Arc<Watch>,
+    in_flight: &Arc<InFlight>,
     up_tap: Option<Tap>,
 ) -> Result<Upstreamed, Failed> {
     let (host, port) = (host_text(&req.authority.host), req.authority.port);
-    // Watched first: a chunk that makes a deny match is never counted
+    // Checked first: a chunk that makes a deny match is never counted
     // as forwarded nor handed to the upstream.
     let mut up_tap = up_tap;
     if let Some(t) = up_tap.as_mut() {
         t.request_head(&req);
     }
-    let body = watched(
+    let body = in_flight_body(
         std::mem::take(&mut req.body),
-        watch.clone(),
+        in_flight.clone(),
         Dir::Request,
         up_tap,
     );
@@ -809,7 +809,7 @@ async fn plain_upstream<F: Front>(
     );
     // A stop (from a request body chunk) abandons the upstream request
     // at once instead of waiting for its response.
-    let stopped = watch.cancelled();
+    let stopped = in_flight.cancelled();
     let fut = async move {
         tokio::select! {
             biased;
@@ -818,12 +818,12 @@ async fn plain_upstream<F: Front>(
         }
     };
     let driven = front.drive(fut).await;
-    if let Some(o) = stopped_outcome(watch) {
+    if let Some(o) = stopped_outcome(in_flight) {
         return Err(o);
     }
     match driven {
         Err(e) => Err(Failed::Close(e)),
-        // Unreachable: a cancelled watch returned above. Fail closed.
+        // Unreachable: a cancelled `InFlight` returned above. Fail closed.
         Ok(None) => Err(Failed::Refuse(Refusal::fail_closed("watch_stopped"))),
         Ok(Some(Err(what))) => {
             let e = ConnectError::Timeout(what);

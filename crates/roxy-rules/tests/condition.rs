@@ -96,7 +96,7 @@ fn rejects_late_fields() {
     ] {
         let err = try_condition(src).expect_err(src).join("\n");
         assert!(err.starts_with("addons[0].when: "), "{err}");
-        assert!(err.contains("may only read head fields"), "{err}");
+        assert!(err.contains("may only read admission fields"), "{err}");
         assert!(err.contains(field), "{src}: {err}");
     }
 }

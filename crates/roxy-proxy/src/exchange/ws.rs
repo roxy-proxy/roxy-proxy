@@ -1,8 +1,8 @@
 //! The WebSocket relay, after a `101`: a byte splice when nothing reads
 //! messages, or the message relay when a rule or an addon layer does.
-//! Both are watched (chunks and messages checked before they are
+//! Both are checked in flight (chunks and messages before they are
 //! written), captured, held by audit backpressure, and ended by an idle
-//! timeout or a stop from the watcher.
+//! timeout or an in-flight stop.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,10 +18,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::{Answer, Next, answer, protocol_refusal};
 use crate::capture::Tap;
 use crate::flowlog::FlowEvent;
+use crate::in_flight::{Dir, InFlight};
 use crate::io::{ClientIo, Io};
 use crate::pipeline::{FlowCx, PerDir, Refusal};
 use crate::view::host_text;
-use crate::watch::{Dir, Watch};
 
 /// Finishes an allowed upgrade: checks the upstream's `101`, writes it to
 /// the client and relays until the WebSocket ends. The connection is spent
@@ -92,14 +92,14 @@ pub(super) async fn splice_websocket(
     };
     let mut upstream = TokioIo::new(upgraded);
     let idle = cx.snap.limits.idle_timeout;
-    let Some(watch) = cx.watch.clone() else {
+    let Some(in_flight) = cx.in_flight.clone() else {
         cx.emit_request_event();
         return None;
     };
     let mut taps = std::mem::take(&mut cx.taps);
     if parse {
         let max = cx.snap.limits.max_ws_message_bytes;
-        let r = relay_messages(client_io, upstream, leftover, (idle, max), &watch, taps).await;
+        let r = relay_messages(client_io, upstream, leftover, (idle, max), &in_flight, taps).await;
         close_spliced(spliced).await;
         finish_websocket(&mut cx, r);
         return None;
@@ -108,7 +108,7 @@ pub(super) async fn splice_websocket(
     if !leftover.is_empty() {
         // Bytes that arrived with the upgrade request: checked before they
         // are written, like every other relayed chunk.
-        if watch.on_ws_chunk(Dir::Request, c2s_extra).is_err() {
+        if in_flight.on_ws_chunk(Dir::Request, c2s_extra).is_err() {
             cx.record_final_sample();
             cx.emit_request_event();
             return None;
@@ -121,7 +121,7 @@ pub(super) async fn splice_websocket(
             return None;
         }
     }
-    let (c2s, s2c, closed) = splice(client_io, upstream, idle, &watch, taps).await;
+    let (c2s, s2c, closed) = splice(client_io, upstream, idle, &in_flight, taps).await;
     let r = Relayed {
         c2s: c2s + c2s_extra,
         s2c,
@@ -159,7 +159,7 @@ fn finish_websocket(cx: &mut FlowCx, r: Relayed) {
 
 /// One direction of the WebSocket relay: what checks and records each chunk.
 struct Relay<'a> {
-    watch: &'a Watch,
+    in_flight: &'a InFlight,
     dir: Dir,
     tap: Option<Tap>,
 }
@@ -176,8 +176,8 @@ async fn pump<R, W>(
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut buf = vec![0u8; 16 * 1024];
-    let watch = relay.watch;
-    let sink = watch.sink();
+    let in_flight = relay.in_flight;
+    let sink = in_flight.sink();
     let mut completed = false;
     loop {
         // Audit backpressure: relay only while the flow log
@@ -196,7 +196,7 @@ async fn pump<R, W>(
         };
         // Checked before the write: bytes that make a deny match are never
         // relayed.
-        if watch.on_ws_chunk(relay.dir, k as u64).is_err() {
+        if in_flight.on_ws_chunk(relay.dir, k as u64).is_err() {
             break;
         }
         if let Some(t) = relay.tap.as_mut() {
@@ -220,7 +220,7 @@ async fn pump<R, W>(
 
 /// Copies bytes both ways until either side closes, nothing moves for
 /// `idle` (then both sides get a `1001` close frame: after that long a
-/// silence no frame is half-written), or a watching rule stops the
+/// silence no frame is half-written), or an in-flight rule stops the
 /// exchange (then both sides are dropped, i.e. closed: the relay is
 /// byte-level, so a close frame could land inside a half-written frame).
 /// Returns (client→server, server→client) byte counts and the close roxy
@@ -229,7 +229,7 @@ async fn splice(
     client: impl Io,
     upstream: impl Io,
     idle: Duration,
-    watch: &Watch,
+    in_flight: &InFlight,
     taps: PerDir<Option<Tap>>,
 ) -> (u64, u64, Option<FrameError>) {
     use std::sync::atomic::AtomicU64;
@@ -250,7 +250,7 @@ async fn splice(
         last.clone(),
         base,
         Relay {
-            watch,
+            in_flight,
             dir: Dir::Request,
             tap: up_tap,
         },
@@ -262,7 +262,7 @@ async fn splice(
         last.clone(),
         base,
         Relay {
-            watch,
+            in_flight,
             dir: Dir::Response,
             tap: down_tap,
         },
@@ -275,7 +275,7 @@ async fn splice(
             tokio::join!(to_up.close(IDLE.code), to_client.close(IDLE.code));
             Some(IDLE)
         }
-        () = watch.cancelled() => {
+        () = in_flight.cancelled() => {
             tracing::debug!("websocket relay stopped by policy");
             None
         }
@@ -448,7 +448,7 @@ impl<W: tokio::io::AsyncWrite + Unpin> MessagePump<'_, W> {
     /// Decodes `input`; checks, re-encodes and writes each whole message.
     /// `Some` when this direction must end.
     async fn feed(&mut self, mut input: &[u8]) -> Option<End> {
-        let watch = self.relay.watch;
+        let in_flight = self.relay.in_flight;
         loop {
             let msg = match self.dec.decode(&mut input) {
                 Ok(Some(m)) => m,
@@ -457,7 +457,7 @@ impl<W: tokio::io::AsyncWrite + Unpin> MessagePump<'_, W> {
             };
             // Checked before the write: a message that makes a deny match
             // is never relayed.
-            let (msg, r) = watch.on_ws_message(self.relay.dir, msg);
+            let (msg, r) = in_flight.on_ws_message(self.relay.dir, msg);
             if r.is_err() {
                 return Some(End::Stopped);
             }
@@ -465,7 +465,7 @@ impl<W: tokio::io::AsyncWrite + Unpin> MessagePump<'_, W> {
                 return Some(End::Broken);
             }
             let len = self.out.buf.len() as u64;
-            if watch.on_ws_chunk(self.relay.dir, len).is_err() {
+            if in_flight.on_ws_chunk(self.relay.dir, len).is_err() {
                 return Some(End::Stopped);
             }
             if let Some(t) = self.relay.tap.as_mut() {
@@ -489,7 +489,7 @@ impl<W: tokio::io::AsyncWrite + Unpin> MessagePump<'_, W> {
     /// the upgrade request), then whatever `r` reads. Shuts the write side
     /// down when the sender closes.
     async fn run<R: tokio::io::AsyncRead + Unpin>(mut self, mut r: R, first: Vec<u8>) -> End {
-        let sink = self.relay.watch.sink();
+        let sink = self.relay.in_flight.sink();
         let mut end = None;
         if !first.is_empty() {
             end = self.feed(&first).await;
@@ -540,7 +540,7 @@ async fn relay_messages(
     upstream: impl Io,
     leftover: Vec<u8>,
     (idle, max): (Duration, u64),
-    watch: &Watch,
+    in_flight: &InFlight,
     PerDir {
         request: up_tap,
         response: down_tap,
@@ -559,7 +559,7 @@ async fn relay_messages(
             out: &mut to_up,
             dec: Decoder::new(Peer::Client, max),
             relay: Relay {
-                watch,
+                in_flight,
                 dir: Dir::Request,
                 tap: up_tap,
             },
@@ -572,7 +572,7 @@ async fn relay_messages(
             out: &mut to_client,
             dec: Decoder::new(Peer::Server, max),
             relay: Relay {
-                watch,
+                in_flight,
                 dir: Dir::Response,
                 tap: down_tap,
             },
@@ -590,7 +590,7 @@ async fn relay_messages(
                 e = &mut a, if !a_done => { a_done = true; e }
                 e = &mut b, if !b_done => { b_done = true; e }
                 () = &mut watchdog => break End::Idle,
-                () = watch.cancelled() => break End::Stopped,
+                () = in_flight.cancelled() => break End::Stopped,
             };
             match e {
                 End::Eof if !(a_done && b_done) => {}

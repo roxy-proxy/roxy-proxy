@@ -1,4 +1,4 @@
-//! The request-head rules every entry point applies to its field list once
+//! The request-admission rules every entry point applies to its field list once
 //! the transport has taken what is its own: the h1 codec after tokenising,
 //! the h2 mapping after the pseudo-headers and connection-specific fields,
 //! the layer re-validation after the URI and the fields a layer may not set.

@@ -45,7 +45,7 @@ use tokio::time::Instant as TokioInstant;
 
 use super::tee::CopyCut;
 use super::{AddonMode, StackError, StackFlow, Subscription};
-use crate::watch::Dir;
+use crate::in_flight::Dir;
 
 pub(crate) use mux::Pools;
 pub use mux::SUBPROTOCOL;

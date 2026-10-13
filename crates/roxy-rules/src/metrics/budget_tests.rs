@@ -63,7 +63,7 @@ fn client(n: u8) -> MapView {
     )
 }
 
-/// A head sample: counts `requests` and `unique`.
+/// An admission sample: counts `requests` and `unique`.
 const REQ: Sample = Sample {
     head: true,
     request_bytes: 0,

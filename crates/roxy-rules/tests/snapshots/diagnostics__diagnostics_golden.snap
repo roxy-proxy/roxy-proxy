@@ -131,8 +131,8 @@ rules[0].when:1:9: unterminated string  [rule a]
     | host == "api.github.com
     |         ^^^^^^^^^^^^^^^
 
-== allow in a watching rule
-rules[0].then[0]: `allow` is only possible in rules decided at the request head; this rule reads `response.status`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation). Write the allow as a head rule and this rule as a `deny`  [rule a]
+== allow in an in-flight rule
+rules[0].then[0]: `allow` is only possible in admission rules; this rule reads `response.status`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation). Write the allow as an admission rule and this rule as a `deny`  [rule a]
 
 == connect-time fields are gone
 rules[0].when:1:1: unknown field `dst.port`  [rule a]
@@ -152,8 +152,8 @@ rules[0].when:3:17: `like` needs a quoted glob pattern on the right, found the n
 == unknown secret
 rules[0].then[0]: reference to undefined secret "missing" (define it under `secrets`)  [rule a]
 
-== secret in a watching rule
-rules[0].then[0]: secret references are only allowed in rules decided at the request head (they set request headers); this rule watches `response.status`  [rule a]
+== secret in an in-flight rule
+rules[0].then[0]: secret references are only allowed in admission rules (they set request headers); this rule reads `response.status` in flight  [rule a]
 
 == secret outside set_header
 rules[0].then[0]: secret references are only allowed in `set_header` values and the credentials of `sign`, not in `log`  [rule a]
@@ -182,7 +182,7 @@ rules[0].then[0]: secret references are only allowed in `set_header` values and 
 rules[0].then[0]: reference to undefined secret "missing" (define it under `secrets`)  [rule a]
 rules[0].then[0]: sign aws_sigv4: `secret_access_key` must not be empty  [rule a]
 
-== sign in a watching rule
+== sign in an in-flight rule
 rules[0].then[0]: `sign` changes the request, which is already on its way; this rule reads `response.status`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation)  [rule a]
 
 == passthrough is reserved
@@ -194,14 +194,14 @@ parse: [0].then[0]: `call` is reserved: addons run above the rules, in config or
 == tag read above the rule that sets it
 rules[0].when: reads `tag["risky"]`, which is set too late to be seen here, by rules[1] ("mark"), below this rule; a rule sees only the tags set before it is checked  [rule read]
 
-== tag read at the head but set by a watching rule
-rules[1].when: reads `tag["big"]`, which is set too late to be seen here, by rules[0] ("big"), a watching rule, which fires when the values it reads arrive rather than in list order; a rule sees only the tags set before it is checked  [rule read]
+== tag read at admission but set by an in-flight rule
+rules[1].when: reads `tag["big"]`, which is set too late to be seen here, by rules[0] ("big"), an in-flight rule, which fires when the values it reads arrive rather than in list order; a rule sees only the tags set before it is checked  [rule read]
 
-== tag read by a watching rule but set by a watching rule above it
-rules[1].when: reads `tag["big"]`, which is set too late to be seen here, by rules[0] ("big"), a watching rule, which fires when the values it reads arrive rather than in list order; a rule sees only the tags set before it is checked  [rule cap]
+== tag read by an in-flight rule but set by an in-flight rule above it
+rules[1].when: reads `tag["big"]`, which is set too late to be seen here, by rules[0] ("big"), an in-flight rule, which fires when the values it reads arrive rather than in list order; a rule sees only the tags set before it is checked  [rule cap]
 
-== tag read by a watching rule but set by a deny watching a byte metric
-rules[1].when: reads `tag["over"]`, which is set too late to be seen here, by rules[0] ("budget"), a deny watching a byte metric, which can fire while this rule watches, when the values it reads arrive rather than in list order; a rule sees only the tags set before it is checked  [rule note]
+== tag read by an in-flight rule but set by a deny on a byte metric
+rules[1].when: reads `tag["over"]`, which is set too late to be seen here, by rules[0] ("budget"), a deny on a byte metric, which can fire in flight as this rule does, when the values it reads arrive rather than in list order; a rule sees only the tags set before it is checked  [rule note]
 
 == rewrite_path group references
 rules[0].then[0]: rewrite_path `to`: `$3` refers to a group `match` does not have (1 unnamed group; named: rest)  [rule a]
@@ -220,10 +220,10 @@ rules[0].then[1]: `tag` follows the terminal action `allow` and would never run;
 == unknown action
 parse: [0].then: unknown action `sethead`; expected one of `allow`, `deny`, `quarantine`, `set_header`, `remove_header`, `rewrite_path`, `set_query`, `remove_query`, `redirect`, `tag`, `log`, `set_state`, `capture`, `digest`, `sign` at line 1, column 18
 
-== request mutation in a watching rule
+== request mutation in an in-flight rule
 rules[0].then[0]: `rewrite_path` changes the request, which is already on its way; this rule reads `body.bytes`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation)  [rule a]
 
-== request header change in a watching rule
+== request header change in an in-flight rule
 rules[0].then[0]: `set_header` in this rule would change the request, which is already on its way; this rule reads `body.bytes`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation). (In a rule that reads response values it changes the response.)  [rule a]
 
 == response header change that could fire after the head is sent
@@ -281,6 +281,6 @@ metrics[1].where:1:1: unknown field `dst.port`
     | dst.port == 1
     | ^^^^^^^^
 metrics[2].count: unknown unique() field `nope`; metric fields must be scalar fields such as client.ip, host, tls.sni
-metrics[3].where: a metric's `where` may only read head fields, because whether an exchange counts is decided at the request head; it reads `response.status` (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)
-metrics[3].key[0]: `body.bytes` is known only after forwarding; metric key fields must be head fields (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)
-metrics[4].count: `response.status` is known only after forwarding; metric unique() fields must be head fields (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)
+metrics[3].where: a metric's `where` may only read admission fields, because whether an exchange counts is decided at admission; it reads `response.status` (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)
+metrics[3].key[0]: `body.bytes` is known only after forwarding; metric key fields must be admission fields (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)
+metrics[4].count: `response.status` is known only after forwarding; metric unique() fields must be admission fields (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#metrics)

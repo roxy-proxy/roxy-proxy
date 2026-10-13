@@ -2,7 +2,7 @@
 //!
 //! Responsibilities: the rule-related config types ([`config`]), the
 //! expression DSL (lexer, parser, type-checker, compiler), the one
-//! ordered rule list with its head/watching classification and typed
+//! ordered rule list with its admission/in-flight classification and typed
 //! actions, and the immutable [`Policy`] snapshot that the proxy swaps
 //! atomically on reload. It also provides the in-process stores behind
 //! `metric.<id>` and `state["k"]`: [`MetricStore`] and [`StateStore`]
@@ -34,15 +34,15 @@
 //! let flow = MapView::new()
 //!     .with_str(Field::Host, "api.github.com")
 //!     .with_str(Field::Method, "GET");
-//! // The head decision: `upload-cap` reads `body.bytes`, so it is skipped.
-//! let out = policy.evaluate_head(&flow, &EvalContext::empty());
+//! // Admission: `upload-cap` reads `body.bytes`, so it is skipped.
+//! let out = policy.evaluate_admission(&flow, &EvalContext::empty());
 //! assert!(out.decision.is_allow());
 //! assert_eq!(out.terminal_rule, "github-reads");
-//! // After forwarding: re-check the watching rules as body bytes arrive.
-//! let mut st = policy.watch_state(&out.tags);
+//! // After forwarding: re-check the in-flight rules as body bytes arrive.
+//! let mut st = policy.in_flight_state(&out.tags);
 //! let flow = flow.with_int(Field::BodyBytes, 11 << 20);
 //! let w = policy
-//!     .evaluate_watching(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &flow,)
+//!     .evaluate_in_flight(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &flow)
 //!     .unwrap();
 //! assert!(w.stops());
 //! ```
@@ -50,17 +50,19 @@
 //! # Semantics
 //!
 //! * **One list, two kinds of rule**. Compiling records what each
-//!   rule's `when` reads. A rule that reads only *head* values (known when
-//!   the request head arrives) is a **head rule**. A rule that reads a
-//!   *watched* field (`body.bytes`, `response.*`, `ws.*`) is a **watching
-//!   rule**. A `deny` rule that reads a byte metric (`count: request_bytes`
-//!   or `response_bytes`) and no watched field is both
-//!   ([`RuleKind::HeadAndWatching`]): it takes part in the head decision and
-//!   is re-checked as this exchange adds bytes to that metric. Metrics that
-//!   count `requests`, `denied`, `errors` or `unique(..)` do not change
-//!   while an exchange streams, so reading them does not make a rule watch.
-//! * **The head decision** ([`Policy::evaluate_head`]) evaluates every head
-//!   rule top to bottom (watching rules are skipped, not false). A matching
+//!   rule's `when` reads. A rule that reads only *admission* values (known
+//!   at the forwarding decision) is an **admission rule**. A rule that
+//!   reads an *in-flight* field (`body.bytes`, `response.*`, `ws.*`) is an
+//!   **in-flight rule**. A `deny` rule that reads a byte metric (`count:
+//!   request_bytes` or `response_bytes`) and no in-flight field is both
+//!   ([`RuleKind::AdmissionAndInFlight`]): it takes part in the admission
+//!   decision and is re-checked as this exchange adds bytes to that metric.
+//!   Metrics that count `requests`, `denied`, `errors` or `unique(..)` do
+//!   not change while an exchange streams, so reading them does not put a
+//!   rule in flight.
+//! * **The admission decision** ([`Policy::evaluate_admission`]) evaluates
+//!   every admission rule top to bottom (in-flight rules are skipped, not
+//!   false). A matching
 //!   deny anywhere wins (`terminal_rule` = the first matching deny); else a
 //!   matching allow (the first one; only its `upgrade`/`private_ok` options
 //!   apply); else it is denied, `terminal_rule = "_default"`. Tags
@@ -68,24 +70,24 @@
 //!   every matching rule's effects apply in list order (a later
 //!   `set_header` of the same name wins); if denied, only `log`, `tag` and
 //!   `set_state` remain.
-//! * **Watching** ([`Policy::evaluate_watching`]): after forwarding, the
+//! * **In flight** ([`Policy::evaluate_in_flight`]): after forwarding, the
 //!   proxy reports each change (`changed`, a [`Reads`] mask) and what is
 //!   known so far. Rules whose triggers intersect the change and whose
-//!   watched fields are all known are checked top to bottom; the first
-//!   matching deny stops the exchange. Non-terminal effects of a watching
+//!   in-flight fields are all known are checked top to bottom; the first
+//!   matching deny stops the exchange. Non-terminal effects of an in-flight
 //!   rule apply once, the first time it matches. Each rule's reads are a
-//!   bit mask, so an event no rule watches costs one `and`, and an
+//!   bit mask, so an event no rule triggers on costs one `and`, and an
 //!   evaluation in which nothing matches allocates nothing.
-//! * **Legal actions**. Head rules may use every action; their
-//!   `set_header`/`remove_header` change the request. A watching rule
+//! * **Legal actions**. Admission rules may use every action; their
+//!   `set_header`/`remove_header` change the request. An in-flight rule
 //!   cannot `allow`, `rewrite_path`, `set_query`, `remove_query`,
 //!   `redirect` or use `${secret:..}` (the request is already on its way):
-//!   compile errors. **In a watching rule, `set_header` and
+//!   compile errors. **In an in-flight rule, `set_header` and
 //!   `remove_header` change the response**: they are legal only when the
 //!   rule reads response values and everything that can re-check it is
 //!   known before the response head is sent (`response.status`,
 //!   `response.header[..]`, `response.body.size`, `response.body.text`); a
-//!   watching rule that does not read the response would change the
+//!   in-flight rule that does not read the response would change the
 //!   request, and one that also reads `body.bytes`, `response.body.bytes`
 //!   or a byte metric could match after the head was sent. Both are
 //!   compile errors. There is no explicit target key: the rule's reads
@@ -97,10 +99,10 @@
 //!   list it cannot answer for, a body predicate whose body is too large to
 //!   inspect or not available ([`BodyText`]), a missing value under an
 //!   operator that cannot answer for `null`, or a `set_header` secret that
-//!   is missing or not a valid header value: at the head, the result is
+//!   is missing or not a valid header value: at admission, the result is
 //!   [`Decision::fail_closed`] (503, close), `terminal_rule =
 //!   "_fail_closed"` and [`Outcome::fail_closed_reason`] says why, whatever
-//!   else matched; in a watching evaluation the same stops the exchange.
+//!   else matched; in an in-flight evaluation the same stops the exchange.
 //!   This is never "predicate false". `and`/`or` short-circuit, so only
 //!   inputs actually reached count.
 //! * **Missing values (`null`).** A field the flow does not have
@@ -140,10 +142,10 @@
 //!   [`FlowView::metric`], which must return `Some(0)` for a series with no
 //!   data yet; `None` means unavailable.
 //! * **Metrics**. A metric's `where`, `key` and `unique(..)` may
-//!   only read head fields, so whether an exchange counts, and its series,
-//!   are fixed at the head.
+//!   only read admission fields, so whether an exchange counts, and its series,
+//!   are fixed at admission.
 //! * **Secrets.** `${secret:name}` is only allowed in `set_header` values
-//!   of rules decided at the head and must name a defined secret. A secret
+//!   of admission rules and must name a defined secret. A secret
 //!   missing at evaluation time (or not a valid header value) fails closed.
 #![forbid(unsafe_code)]
 
@@ -175,8 +177,8 @@ pub use config::{
 pub use diag::{Diagnostic, RuleId, Span};
 pub use eval::{
     AllowOpts, AwsSigV4, Credential, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Deny,
-    DenyStatus, Effect, EvalContext, FAIL_CLOSED_STATUS, FailClosedReason, Outcome, SetHeaderValue,
-    WatchEffect, WatchOutcome,
+    DenyStatus, Effect, EvalContext, FAIL_CLOSED_STATUS, FailClosedReason, InFlightEffect,
+    InFlightOutcome, Outcome, SetHeaderValue,
 };
 pub use metrics::{
     CarryOverReport, Clock, DEFAULT_MAX_METRIC_BYTES, DEFAULT_MAX_METRIC_KEYS, MetricError,
@@ -185,9 +187,9 @@ pub use metrics::{
 #[doc(hidden)]
 pub use parser::parse;
 pub use policy::{
-    Condition, MetricDef, MetricFingerprint, Policy, PolicyInput, RuleInfo, RuleKind, WatchState,
+    Condition, InFlightState, MetricDef, MetricFingerprint, Policy, PolicyInput, RuleInfo, RuleKind,
 };
 pub use state::{StateFull, StateSource, StateStore};
 pub use template::{Part, TemplateError, expand, parse_template};
-pub use types::{Field, Reads, Type, Watched};
+pub use types::{Field, InFlightValue, Reads, Type};
 pub use view::{BodyText, FlowView, MapView, Value};

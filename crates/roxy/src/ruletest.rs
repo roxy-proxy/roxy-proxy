@@ -12,8 +12,8 @@ use roxy_proxy::Redactor;
 use roxy_proxy::addr::{AddressDenied, PrivateAddrs};
 use roxy_proxy::addrlist::AddressLists;
 use roxy_rules::{
-    BodyText, Decision, Effect, EvalContext, Field, FlowView, MapView, Outcome, Policy, Reads,
-    RuleId, RuleKind, Value, WatchOutcome,
+    BodyText, Decision, Effect, EvalContext, Field, FlowView, InFlightOutcome, MapView, Outcome,
+    Policy, Reads, RuleId, RuleKind, Value,
 };
 
 use crate::config::Config;
@@ -76,11 +76,11 @@ pub struct TestRequest {
     /// absent, as they are until a chunked body is buffered.
     pub chunked: bool,
     pub client_ip: IpAddr,
-    /// `body.bytes`: request body bytes streamed so far (watching rules).
+    /// `body.bytes`: request body bytes streamed so far (in-flight rules).
     pub body_bytes: Option<u64>,
     /// `response.status`; with it, rules reading the response head run.
     pub response_status: Option<u16>,
-    /// `response.body.bytes` (watching rules).
+    /// `response.body.bytes` (in-flight rules).
     pub response_body_bytes: Option<u64>,
     pub response_headers: Vec<(String, String)>,
     /// A WebSocket message (`ws.*`); with it, rules reading `ws.*` run.
@@ -523,8 +523,8 @@ pub fn apply_address_denial(out: &mut Outcome) {
     out.terminal_rule = RuleId::new("_address_policy");
 }
 
-/// The watched values a dry run supplies, from the command line: which
-/// watching rules can run.
+/// The in-flight values a dry run supplies, from the command line: which
+/// in-flight rules can run.
 pub fn known(req: &TestRequest) -> Reads {
     let mut k = Reads::NONE;
     if req.body_bytes.is_some() {
@@ -546,72 +546,78 @@ pub fn known(req: &TestRequest) -> Reads {
 /// What a dry run decided.
 #[derive(Debug, Clone)]
 pub struct DryRun {
-    /// The head decision.
-    pub head: Outcome,
-    /// The watching rules, re-checked once with the supplied watched values
-    /// (and the given metric values), when the head allowed.
-    pub watching: Option<WatchOutcome>,
+    /// The admission decision.
+    pub admission: Outcome,
+    /// The in-flight rules, re-checked once with the supplied in-flight values
+    /// (and the given metric values), when admission allowed.
+    pub in_flight: Option<InFlightOutcome>,
 }
 
 impl DryRun {
-    /// The final decision: a watching stop overrides the head's allow.
+    /// The final decision: an in-flight stop overrides the admission allow.
     pub fn decision(&self) -> Decision {
-        self.watching
+        self.in_flight
             .as_ref()
             .and_then(|w| w.stop.clone())
-            .map_or_else(|| self.head.decision.clone(), Decision::Deny)
+            .map_or_else(|| self.admission.decision.clone(), Decision::Deny)
     }
 
     pub(crate) fn terminal_rule(&self) -> &RuleId {
-        self.watching
+        self.in_flight
             .as_ref()
             .and_then(|w| w.terminal_rule.as_ref())
-            .unwrap_or(&self.head.terminal_rule)
+            .unwrap_or(&self.admission.terminal_rule)
     }
 
-    /// The rule whose `quarantine` action matched, at the head or while
-    /// watching, if any. A dry run never quarantines anything.
+    /// The rule whose `quarantine` action matched, at admission or in
+    /// flight, if any. A dry run never quarantines anything.
     pub(crate) fn quarantine(&self) -> Option<&RuleId> {
-        self.head
+        self.admission
             .quarantine
             .as_ref()
-            .or_else(|| self.watching.as_ref().and_then(|w| w.quarantine.as_ref()))
+            .or_else(|| self.in_flight.as_ref().and_then(|w| w.quarantine.as_ref()))
     }
 }
 
-/// Evaluate `req`: the head decision, then, if allowed, the watching rules
-/// whose values are `known` (plus deny rules on byte metrics, at the given
-/// metric values). Secrets are not resolved: each `${secret:name}` becomes
-/// the placeholder `[secret:name]`.
+/// Evaluate `req`: the admission decision, then, if allowed, the in-flight
+/// rules whose values are `known` (plus deny rules on byte metrics, at the
+/// given metric values). Secrets are not resolved: each `${secret:name}`
+/// becomes the placeholder `[secret:name]`.
 pub fn run(policy: &Policy, view: &DryRunView, tags: &[String], known: Reads) -> DryRun {
     let placeholder = |name: &str| Some(format!("[secret:{name}]"));
     let ctx = EvalContext {
         secrets: &placeholder,
         initial_tags: tags,
     };
-    let head = policy.evaluate_head(view, &ctx);
-    let watching = head.decision.is_allow().then(|| {
-        let mut st = policy.watch_state(&head.tags);
+    let admission = policy.evaluate_admission(view, &ctx);
+    let in_flight = admission.decision.is_allow().then(|| {
+        let mut st = policy.in_flight_state(&admission.tags);
         let changed = known | Reads::METRICS;
         policy
-            .evaluate_watching(changed, known, &mut st, view)
+            .evaluate_in_flight(changed, known, &mut st, view)
             .unwrap_or_default()
     });
-    DryRun { head, watching }
+    DryRun {
+        admission,
+        in_flight,
+    }
 }
 
-/// Every rule, whether it is decided at the request head or watches, and
-/// what it watches. Shared by `roxy check` and `roxy rule test`.
+/// Every rule, whether it is decided at admission or in flight, and
+/// what puts it in flight. Shared by `roxy check` and `roxy rule test`.
 pub fn classification(policy: &Policy) -> String {
     let info = policy.rule_info();
     let width = info.iter().map(|r| r.id.as_str().len()).max().unwrap_or(0);
     let mut s = String::new();
     for r in &info {
         let kind = match r.kind {
-            RuleKind::Head => "head".to_owned(),
-            RuleKind::Watching => format!("watching: {}", r.watches.join(", ")),
-            RuleKind::HeadAndWatching => {
-                format!("head, then watching: {}", r.watches.join(", "))
+            RuleKind::Admission => "admission".to_owned(),
+            RuleKind::InFlight => format!("in-flight: {}", r.in_flight_reads.join(", ")),
+            RuleKind::AdmissionAndInFlight => {
+                format!(
+                    "admission, then in-flight: {}",
+                    r.in_flight_reads.join(", ")
+                )
             }
         };
         let _ = writeln!(s, "  {:width$}  {kind}", r.id.as_str());
@@ -640,7 +646,7 @@ pub fn report(
     if let Some(m) = metrics {
         let _ = writeln!(s, "metrics:  {m}");
     }
-    let out = &run.head;
+    let out = &run.admission;
     let _ = writeln!(
         s,
         "matched:  {}",
@@ -682,8 +688,8 @@ pub fn report(
         }
         None => {}
     }
-    if let Some(w) = &run.watching {
-        let _ = writeln!(s, "watching:");
+    if let Some(w) = &run.in_flight {
+        let _ = writeln!(s, "in-flight:");
         let _ = writeln!(
             s,
             "  matched:  {}",
@@ -707,7 +713,7 @@ pub fn report(
         let _ = writeln!(s, "quarantine: yes (rule {rule})");
     }
     let reason = run
-        .watching
+        .in_flight
         .as_ref()
         .and_then(|w| w.fail_closed_reason.as_ref())
         .or(out.fail_closed_reason.as_ref());

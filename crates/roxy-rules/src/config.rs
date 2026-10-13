@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
-use crate::types::Watched;
+use crate::types::InFlightValue;
 
 // ----- expressions ----------------------------------------------------------
 
@@ -599,22 +599,22 @@ pub enum MetricCount {
 }
 
 impl MetricCount {
-    /// The watched value a read of this metric carries: a byte metric grows
+    /// The in-flight value a read of this metric carries: a byte metric grows
     /// as this exchange streams, so a `deny` reading it is re-checked as
     /// bytes arrive. `None` for a count that does not change while an
     /// exchange streams.
-    pub fn watched(&self) -> Option<Watched> {
+    pub fn in_flight(&self) -> Option<InFlightValue> {
         match self {
-            Self::RequestBytes => Some(Watched::MetricRequestBytes),
-            Self::ResponseBytes => Some(Watched::MetricResponseBytes),
+            Self::RequestBytes => Some(InFlightValue::MetricRequestBytes),
+            Self::ResponseBytes => Some(InFlightValue::MetricResponseBytes),
             Self::Requests | Self::Errors | Self::Denied | Self::Unique(_) => None,
         }
     }
 
-    /// Whether this metric grows as bytes stream (and so is *watched* by deny
+    /// Whether this metric grows as bytes stream (and so is *in-flight* by deny
     /// rules that read it).
     pub fn counts_bytes(&self) -> bool {
-        self.watched().is_some()
+        self.in_flight().is_some()
     }
 }
 

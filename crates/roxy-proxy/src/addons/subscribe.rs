@@ -16,7 +16,7 @@ use roxy_http::{Body, BodyError};
 use roxy_wasm::{LayerError, LayerRequest, LayerResponse};
 
 use super::{StackFlow, lock};
-use crate::watch::Dir;
+use crate::in_flight::Dir;
 
 /// How much of one direction of the exchange a layer sees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

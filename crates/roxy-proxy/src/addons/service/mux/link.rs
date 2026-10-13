@@ -23,8 +23,8 @@ use super::super::{In, Out, ServiceError};
 use super::lock;
 use super::stream::{Reset, Stream};
 use crate::flowlog::FlowEvent;
+use crate::in_flight::Dir;
 use crate::upstream::MaybeTls;
-use crate::watch::Dir;
 
 /// The WebSocket subprotocol a service must accept.
 pub const SUBPROTOCOL: &str = "roxy.layer.v4";

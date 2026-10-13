@@ -120,7 +120,7 @@ pub enum FlowEvent<'a> {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<Cow<'a, str>>,
         /// Where the terminal decision was made: `head` for the forwarding
-        /// decision, or the stage at which a watching rule stopped the
+        /// decision, or the stage at which an in-flight rule stopped the
         /// exchange. Absent when no decision was reached.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stage: Option<Stage>,
@@ -403,7 +403,7 @@ pub struct Timing {
 }
 
 /// Where in an exchange a decision was made: the forwarding
-/// decision at the request head, or the point at which a watching rule
+/// decision at the request head, or the point at which an in-flight rule
 /// stopped the exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

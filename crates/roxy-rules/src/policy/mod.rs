@@ -1,6 +1,6 @@
 //! The compiled, immutable [`Policy`]: its types and classification. The
-//! head decision and watching evaluation live in [`runtime`]; the compiler
-//! in [`compiler`].
+//! admission decision and in-flight evaluation live in [`runtime`]; the
+//! compiler in [`compiler`].
 
 mod compiler;
 mod runtime;
@@ -11,9 +11,9 @@ use std::time::Duration;
 use crate::compile::Pred;
 use crate::config::{MetricConfig, MetricCount, RuleConfig};
 use crate::diag::{Diagnostic, RuleId};
-use crate::eval::{Decision, Deny, Effect, WatchEffect};
+use crate::eval::{Decision, Deny, Effect, InFlightEffect};
 use crate::template::Part;
-use crate::types::{Field, Reads, Watched};
+use crate::types::{Field, InFlightValue, Reads};
 
 /// Everything [`Policy::compile`] needs from the config.
 #[derive(Debug, Clone, Copy)]
@@ -28,7 +28,7 @@ pub struct PolicyInput<'a> {
 }
 
 /// A compiled metric definition. Counting is the proxy's job; this
-/// carries the shape and the compiled `where` filter, which reads head
+/// carries the shape and the compiled `where` filter, which reads admission
 /// fields only, so whether an exchange counts (and its series key) is
 /// fixed at the request head.
 #[derive(Debug, Clone)]
@@ -87,17 +87,17 @@ impl MetricDef {
     }
 }
 
-/// A standalone condition over head fields, compiled against a policy's
+/// A standalone condition over admission fields, compiled against a policy's
 /// metrics and address lists: an addon's `when`.
 ///
-/// It may not read a watched field, nor `body.text`: whatever it guards
+/// It may not read an in-flight field, nor `body.text`: whatever it guards
 /// owns the body stream, so nothing reads the body before it does.
 #[derive(Debug, Clone)]
 pub struct Condition {
     pred: Pred,
 }
 
-/// An action as it runs at the request head.
+/// An action as it runs at admission.
 #[derive(Debug, Clone)]
 enum CAction {
     Effect(Effect),
@@ -122,28 +122,28 @@ struct SignSpec {
 /// allow and nothing that changes the request; the compiler reports an
 /// action it cannot express here.
 #[derive(Debug, Clone)]
-enum WatchAction {
-    Effect(WatchEffect),
+enum InFlightAction {
+    Effect(InFlightEffect),
     Tag(String),
     Deny(Deny),
 }
 
-impl WatchAction {
-    /// What a head action still does when its rule fires while watching a
-    /// byte metric: the deny, and the effects that apply whatever the
-    /// outcome. Its request changes happened at the head.
+impl InFlightAction {
+    /// What an admission action still does when its rule fires in flight
+    /// on a byte metric: the deny, and the effects that apply whatever the
+    /// outcome. Its request changes happened at admission.
     fn after_forwarding(a: &CAction) -> Option<Self> {
         match a {
             CAction::Terminal(Decision::Deny(d)) => Some(Self::Deny(d.clone())),
             CAction::Tag(t) => Some(Self::Tag(t.clone())),
             CAction::Effect(Effect::Log { level, message }) => {
-                Some(Self::Effect(WatchEffect::Log {
+                Some(Self::Effect(InFlightEffect::Log {
                     level: *level,
                     message: message.clone(),
                 }))
             }
             CAction::Effect(Effect::SetState { key, value, ttl }) => {
-                Some(Self::Effect(WatchEffect::SetState {
+                Some(Self::Effect(InFlightEffect::SetState {
                     key: key.clone(),
                     value: value.clone(),
                     ttl: *ttl,
@@ -160,27 +160,29 @@ impl WatchAction {
 /// When a rule runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleKind {
-    /// Reads only head values: decided at the request head.
-    Head,
-    /// Reads a watched field (`body.bytes`, `response.*`, `ws.*`): skipped
-    /// at the head, checked after forwarding when what it reads is known.
-    Watching,
+    /// Reads only admission values: decided before the request is
+    /// forwarded.
+    Admission,
+    /// Reads an in-flight field (`body.bytes`, `response.*`, `ws.*`):
+    /// skipped at admission, checked after forwarding when what it reads
+    /// is known.
+    InFlight,
     /// A `deny` rule that reads a byte metric (`request_bytes` /
-    /// `response_bytes`) and no watched field: takes part in the head
-    /// decision like a head rule, and is re-checked as this exchange adds
-    /// bytes to the metric.
-    HeadAndWatching,
+    /// `response_bytes`) and no in-flight field: takes part in the
+    /// admission decision like an admission rule, and is re-checked as
+    /// this exchange adds bytes to the metric.
+    AdmissionAndInFlight,
 }
 
 impl RuleKind {
-    /// Whether the rule takes part in the head decision.
-    pub fn at_head(self) -> bool {
-        matches!(self, Self::Head | Self::HeadAndWatching)
+    /// Whether the rule takes part in the admission decision.
+    pub fn at_admission(self) -> bool {
+        matches!(self, Self::Admission | Self::AdmissionAndInFlight)
     }
 
     /// Whether the rule is re-checked after forwarding.
-    pub fn watches(self) -> bool {
-        matches!(self, Self::Watching | Self::HeadAndWatching)
+    pub fn in_flight(self) -> bool {
+        matches!(self, Self::InFlight | Self::AdmissionAndInFlight)
     }
 }
 
@@ -189,11 +191,11 @@ impl RuleKind {
 pub struct RuleInfo {
     pub id: RuleId,
     pub kind: RuleKind,
-    /// What makes it watch: the watched fields and byte metrics it reads,
-    /// as written (`body.bytes`, `metric.egress (request_bytes)`). Empty
-    /// for a head rule.
-    pub watches: Vec<String>,
-    /// Events that re-check it (empty for a head rule).
+    /// What puts it in flight: the in-flight fields and byte metrics it
+    /// reads, as written (`body.bytes`, `metric.egress (request_bytes)`).
+    /// Empty for an admission rule.
+    pub in_flight_reads: Vec<String>,
+    /// Events that re-check it (empty for an admission rule).
     pub triggers: Reads,
 }
 
@@ -203,23 +205,24 @@ pub struct RuleInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuleShape {
     pub kind: RuleKind,
-    /// Watched fields read: the rule is decidable once all are known.
+    /// In-flight fields read: the rule is decidable once all are known.
     pub fields: Reads,
     /// Changes that re-check the rule (fields plus byte metrics).
     pub triggers: Reads,
-    /// What makes it watch, as written; empty for a head rule.
-    pub watches: Vec<String>,
+    /// What puts it in flight, as written; empty for an admission rule.
+    pub in_flight_reads: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 struct CompiledRule {
     id: RuleId,
     when: Option<Pred>,
-    /// Actions when the rule takes part in the head decision; empty for a
-    /// rule that only watches.
-    head: Box<[CAction]>,
-    /// Actions when the rule fires after forwarding; empty for a head rule.
-    watching: Box<[WatchAction]>,
+    /// Actions when the rule takes part in the admission decision; empty
+    /// for a rule that only runs in flight.
+    admission: Box<[CAction]>,
+    /// Actions when the rule fires after forwarding; empty for an
+    /// admission rule.
+    in_flight: Box<[InFlightAction]>,
     /// Has a `quarantine` action: its deny is an ordinary 403 that closes,
     /// and the trip is recorded as soon as the rule matches, so a
     /// fail-closed later in the pass, or in this rule's own earlier
@@ -234,13 +237,14 @@ struct CompiledRule {
 #[derive(Debug, Clone)]
 pub struct Policy {
     rules: Vec<CompiledRule>,
-    /// Indices of rules taking part in the head decision, in list order.
-    head: Box<[usize]>,
-    /// Indices of watching rules, in list order.
-    watching: Box<[usize]>,
-    /// Union of the watching rules' triggers: an event outside it costs one
-    /// mask test.
-    watch_triggers: Reads,
+    /// Indices of rules taking part in the admission decision, in list
+    /// order.
+    admission: Box<[usize]>,
+    /// Indices of in-flight rules, in list order.
+    in_flight: Box<[usize]>,
+    /// Union of the in-flight rules' triggers: an event outside it costs
+    /// one mask test.
+    in_flight_triggers: Reads,
     /// Union of the byte-metric bits of the defined metrics.
     byte_metrics: Reads,
     metrics: Vec<MetricDef>,
@@ -255,20 +259,20 @@ pub(crate) fn is_header_value(s: &str) -> bool {
     s.bytes().all(|b| b == b'\t' || (b' '..=b'~').contains(&b))
 }
 
-/// Per-exchange state of the watching rules: which ones have fired (their
+/// Per-exchange state of the in-flight rules: which ones have fired (their
 /// non-terminal effects apply once) and the tags set so far. Create with
-/// [`Policy::watch_state`] after the head decision.
+/// [`Policy::in_flight_state`] after the admission decision.
 #[derive(Debug, Clone, Default)]
-pub struct WatchState {
+pub struct InFlightState {
     fired: Vec<bool>,
-    /// Tags visible to watching rules: the head's, plus those set by
-    /// watching rules that fired.
+    /// Tags visible to in-flight rules: the admission decision's, plus
+    /// those set by in-flight rules that fired.
     pub tags: Vec<String>,
     stopped: bool,
 }
 
-impl WatchState {
-    /// Whether a watching evaluation has stopped the exchange. Every later
+impl InFlightState {
+    /// Whether an in-flight evaluation has stopped the exchange. Every later
     /// evaluation returns `None`.
     pub fn is_stopped(&self) -> bool {
         self.stopped
@@ -285,21 +289,21 @@ impl Policy {
         if !diagnostics.is_empty() {
             return Err(diagnostics);
         }
-        let head = (0..rules.len())
-            .filter(|&i| rules[i].shape.kind.at_head())
+        let admission = (0..rules.len())
+            .filter(|&i| rules[i].shape.kind.at_admission())
             .collect();
-        let watching: Box<[usize]> = (0..rules.len())
-            .filter(|&i| rules[i].shape.kind.watches())
+        let in_flight: Box<[usize]> = (0..rules.len())
+            .filter(|&i| rules[i].shape.kind.in_flight())
             .collect();
-        let watch_triggers = watching
+        let in_flight_triggers = in_flight
             .iter()
             .fold(Reads::NONE, |acc, &i| acc | rules[i].shape.triggers);
-        let byte_metrics = metrics.iter().filter_map(|m| m.count.watched()).collect();
+        let byte_metrics = metrics.iter().filter_map(|m| m.count.in_flight()).collect();
         Ok(Policy {
             rules,
-            head,
-            watching,
-            watch_triggers,
+            admission,
+            in_flight,
+            in_flight_triggers,
             byte_metrics,
             metrics,
             needs_request_body: needs.request_body,
@@ -338,7 +342,7 @@ impl Policy {
     pub fn reads_ws(&self) -> bool {
         self.rules
             .iter()
-            .any(|r| r.shape.fields.contains(Watched::Ws))
+            .any(|r| r.shape.fields.contains(InFlightValue::Ws))
     }
 
     /// Rule ids in config order.
@@ -353,7 +357,7 @@ impl Policy {
             .map(|r| RuleInfo {
                 id: r.id.clone(),
                 kind: r.shape.kind,
-                watches: r.shape.watches.clone(),
+                in_flight_reads: r.shape.in_flight_reads.clone(),
                 triggers: r.shape.triggers,
             })
             .collect()

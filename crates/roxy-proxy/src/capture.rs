@@ -34,7 +34,7 @@
 //! - `seq` counts records per flow and direction.
 //!
 //! What is captured is what was forwarded: data records are written by the
-//! same body adapters that forward each chunk, after the watching rules
+//! same body adapters that forward each chunk, after the in-flight rules
 //! allowed it and before it is handed on.
 //!
 //! Every string in a captured *head* passes through the exchange's

@@ -475,7 +475,7 @@ impl StackFlow {
     }
 
     /// A layer that ran is subscribed to the body in `dir`.
-    fn body_subscribed(&self, dir: crate::watch::Dir) -> bool {
+    fn body_subscribed(&self, dir: crate::in_flight::Dir) -> bool {
         self.ran().any(|s| s.part(dir) == Part::Full)
     }
 
@@ -984,7 +984,7 @@ async fn core(
         Outcome::Respond(mut res) => {
             res.body = attributed(&st, Side::Upstream, std::mem::take(&mut res.body));
             // A response body no layer reads goes up as the origin sent it.
-            if snap.http.decode_for_addons && st.body_subscribed(crate::watch::Dir::Response) {
+            if snap.http.decode_for_addons && st.body_subscribed(crate::in_flight::Dir::Response) {
                 decode::response(&st, &mut res, snap.limits.max_response_body_bytes);
             }
             Ok(to_layer_response(res))
@@ -993,7 +993,7 @@ async fn core(
             if refusal.close {
                 st.close.store(true, Ordering::Relaxed);
             }
-            if cx.watch.is_some() {
+            if cx.in_flight.is_some() {
                 cx.record_refusal_sample(&refusal);
             }
             Ok(to_layer_response(refusal_response(cx, &refusal)))

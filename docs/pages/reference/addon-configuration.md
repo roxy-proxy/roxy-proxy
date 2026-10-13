@@ -49,7 +49,7 @@ key; `roxy check` refuses a key on the other kind.
 | `path` | wasm | file path | required | the component. It must exist at config load; the layer is compiled then, and cached across reloads while the file and its settings are unchanged |
 | `endpoint` | service | one of this addon's `endpoints` | required | where the service is. The exchange streams through it over pooled WebSocket connections |
 | `mode` | both | `enforce`, `observe` | `enforce` | `enforce`: the layer is in the path and its output is what goes on. `observe`: the layer gets copies and nothing it returns takes effect ([modes](/design/addon-model#modes)) |
-| `when` | both | [rule language](/reference/rule-language) condition over head fields | every exchange | runs the layer only on the exchanges it matches; the rest pass it at no cost ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)) |
+| `when` | both | [rule language](/reference/rule-language) condition over admission fields | every exchange | runs the layer only on the exchanges it matches; the rest pass it at no cost ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)) |
 | `sample` | both, observe only | number in (0, 1] | 1 | the share of matching exchanges the observer gets a copy of, drawn from the flow id |
 | `subscribe.request` | both | `head`, `full` | `full` | what the layer sees of the request: the head only, or the head and the body ([what a layer sees](/reference/addon-configuration#what-a-layer-sees)) |
 | `subscribe.response` | both | `head`, `full` | `full` | the same for the response |
@@ -192,14 +192,14 @@ the framing roxy knows.
 
 ### Choosing exchanges
 
-`when` is a [rule language](/reference/rule-language) condition over head
+`when` is a [rule language](/reference/rule-language) condition over admission
 fields. A layer runs only on the exchanges it matches; the rest pass it at
 no cost (no instance, no body pumping, no service session).
 
 - `when` sees the request as it reaches the layer: what the layer above
   passed on, re-validated. A layer above can steer a request into or out of
   a lower layer's `when`.
-- It may read head fields, headers, the query, `state[..]`, `metric.<id>`
+- It may read admission fields, headers, the query, `state[..]`, `metric.<id>`
   and address lists. `body.*`, `response.*` and `ws.*` are config errors.
 - `tag["x"]` sees tags set by enforce layers above, not the rules' tags
   (the rules run below the stack).
@@ -218,7 +218,7 @@ flow however often it is asked.
 
 The stack sits in the exchange core both fronts share: the front drives
 the client's request body into the first layer, and the last layer's
-`next` runs the rules, the upstream, then the watching rules on the
+`next` runs the rules, the upstream, then the in-flight rules on the
 response.
 
 - What a layer passes on is re-validated as strictly as a client request:

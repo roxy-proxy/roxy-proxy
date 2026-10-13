@@ -8,8 +8,8 @@ use std::time::Duration;
 use common::{METRICS, compile, try_compile};
 use roxy_rules::{
     AllowOpts, CaptureTarget, Decision, Deny, DenyStatus, Effect, EvalContext, FailClosedReason,
-    Field, LogLevel, MapView, Policy, Reads, RuleKind, Scheme, SetHeaderValue, Type, Value,
-    WatchOutcome,
+    Field, InFlightOutcome, LogLevel, MapView, Policy, Reads, RuleKind, Scheme, SetHeaderValue,
+    Type, Value,
 };
 
 fn ip(s: &str) -> Value<'static> {
@@ -42,15 +42,15 @@ fn flow() -> MapView {
         .with_body("{\"token\": \"hunter2\"}")
 }
 
-/// One watching evaluation with every watched value known and changed.
-fn watch(p: &Policy, view: &MapView, ctx: &EvalContext<'_>) -> Option<WatchOutcome> {
-    let mut st = p.watch_state(ctx.initial_tags);
-    p.evaluate_watching(Reads::ALL, Reads::ALL, &mut st, view)
+/// One in-flight evaluation with every in-flight value known and changed.
+fn in_flight(p: &Policy, view: &MapView, ctx: &EvalContext<'_>) -> Option<InFlightOutcome> {
+    let mut st = p.in_flight_state(ctx.initial_tags);
+    p.evaluate_in_flight(Reads::ALL, Reads::ALL, &mut st, view)
 }
 
-/// Does `expr` match `view`? A deny rule reading it is evaluated at the
-/// head, or, if it reads watched values, as a watching rule with every
-/// watched value known.
+/// Does `expr` match `view`? A deny rule reading it is evaluated at
+/// admission, or, if it reads in-flight values, as an in-flight rule with every
+/// in-flight value known.
 fn eval_in(expr: &str, view: &MapView) -> bool {
     let rules = format!(
         "- id: r\n  when: '{}'\n  then: deny\n",
@@ -58,11 +58,11 @@ fn eval_in(expr: &str, view: &MapView) -> bool {
     );
     let p = compile(METRICS, &rules);
     let ctx = EvalContext::empty();
-    if p.rule_info()[0].kind == RuleKind::Watching {
-        watch(&p, view, &ctx)
+    if p.rule_info()[0].kind == RuleKind::InFlight {
+        in_flight(&p, view, &ctx)
             .is_some_and(|o| o.stops() && o.terminal_rule.is_some_and(|r| r == "r"))
     } else {
-        let out = p.evaluate_head(view, &ctx);
+        let out = p.evaluate_admission(view, &ctx);
         out.decision.is_deny() && out.terminal_rule == "r"
     }
 }
@@ -338,7 +338,7 @@ fn null_with_other_operators_fails_closed() {
                 expr.replace('\'', "''")
             ),
         );
-        let out = p.evaluate_head(&MapView::new(), &ctx);
+        let out = p.evaluate_admission(&MapView::new(), &ctx);
         assert_eq!(out.terminal_rule, "_fail_closed", "{expr}");
         assert_eq!(
             out.fail_closed_reason,
@@ -405,7 +405,7 @@ const CHAIN: &str = r#"
 #[test]
 fn deny_wins_and_a_refusal_keeps_only_log_and_state() {
     let p = compile("", CHAIN);
-    let out = p.evaluate_head(&flow(), &EvalContext::empty());
+    let out = p.evaluate_admission(&flow(), &EvalContext::empty());
     assert_eq!(
         out.decision,
         Decision::Deny(Deny {
@@ -416,7 +416,7 @@ fn deny_wins_and_a_refusal_keeps_only_log_and_state() {
     );
     assert_eq!(out.terminal_rule, "writes");
     let matched: Vec<&str> = out.matched.iter().map(roxy_rules::RuleId::as_str).collect();
-    // Every head rule is evaluated; the deny wins although allows follow.
+    // Every admission rule is evaluated; the deny wins although allows follow.
     assert_eq!(
         matched,
         ["tag-github", "header", "writes", "reads", "never"]
@@ -432,7 +432,7 @@ fn deny_wins_and_a_refusal_keeps_only_log_and_state() {
     assert_eq!(out.tags, ["github"]);
 
     let get = flow().with_str(Field::Method, "GET");
-    let out = p.evaluate_head(&get, &EvalContext::empty());
+    let out = p.evaluate_admission(&get, &EvalContext::empty());
     assert_eq!(out.decision, Decision::Allow(AllowOpts::default()));
     assert_eq!(out.terminal_rule, "reads");
     assert_eq!(
@@ -458,11 +458,11 @@ fn default_decisions() {
         .with_str(Field::Host, "example.com")
         .with_str(Field::Method, "GET");
     // `never` has no `when` and matches everything.
-    let out = p.evaluate_head(&other, &EvalContext::empty());
+    let out = p.evaluate_admission(&other, &EvalContext::empty());
     assert_eq!(out.terminal_rule, "never");
 
     let p = compile("", "- { id: only, when: 'host == \"x\"', then: allow }");
-    let out = p.evaluate_head(&other, &EvalContext::empty());
+    let out = p.evaluate_admission(&other, &EvalContext::empty());
     assert_eq!(
         out.decision,
         Decision::Deny(Deny {
@@ -478,7 +478,7 @@ fn default_decisions() {
 
     // An empty policy denies everything, closing the connection.
     let empty = compile("", "[]");
-    let out = empty.evaluate_head(&other, &EvalContext::empty());
+    let out = empty.evaluate_admission(&other, &EvalContext::empty());
     assert_eq!(out.decision, Decision::default_deny());
     assert_eq!(out.terminal_rule, "_default");
 }
@@ -510,12 +510,12 @@ fn deny_wins_and_first_allow_options() {
             .with_str(Field::Host, "www.example.com")
             .with_str(Field::Path, path)
     };
-    let out = p.evaluate_head(&v("/a"), &ctx);
+    let out = p.evaluate_admission(&v("/a"), &ctx);
     assert!(matches!(out.decision, Decision::Deny(Deny { status, .. }) if status == 451));
     assert_eq!(out.terminal_rule, "deny-a");
     let matched: Vec<&str> = out.matched.iter().map(roxy_rules::RuleId::as_str).collect();
     assert_eq!(matched, ["plain", "ws", "deny-a", "deny-a2"]);
-    let out = p.evaluate_head(&v("/b"), &ctx);
+    let out = p.evaluate_admission(&v("/b"), &ctx);
     assert_eq!(out.decision, Decision::Allow(AllowOpts::default()));
     assert_eq!(
         out.terminal_rule, "plain",
@@ -545,7 +545,7 @@ fn deny_close_defaults_and_opt_out() {
 "#,
     );
     let ctx = EvalContext::empty();
-    let close_of = |v: &MapView| match p.evaluate_head(v, &ctx).decision {
+    let close_of = |v: &MapView| match p.evaluate_admission(v, &ctx).decision {
         Decision::Deny(Deny { close, .. }) => Some(close),
         Decision::Allow(_) => None,
     };
@@ -553,7 +553,7 @@ fn deny_close_defaults_and_opt_out() {
     assert_eq!(close_of(&path("/keep")), Some(false));
     assert_eq!(close_of(&path("/bare")), Some(true));
     assert_eq!(close_of(&path("/other")), None);
-    let watch_close = |status| match watch(
+    let in_flight_close = |status| match in_flight(
         &p,
         &MapView::new().with_int(Field::ResponseStatus, status),
         &ctx,
@@ -563,9 +563,9 @@ fn deny_close_defaults_and_opt_out() {
         Some(Deny { close, .. }) => Some(close),
         _ => None,
     };
-    assert_eq!(watch_close(500), Some(true));
-    assert_eq!(watch_close(501), Some(false));
-    assert_eq!(watch_close(200), None);
+    assert_eq!(in_flight_close(500), Some(true));
+    assert_eq!(in_flight_close(501), Some(false));
+    assert_eq!(in_flight_close(200), None);
 }
 
 fn fail_closed(reason: FailClosedReason) -> impl Fn(&roxy_rules::Outcome) {
@@ -591,14 +591,17 @@ fn bodies_fail_closed() {
         "- { id: b, when: 'body.text contains \"secret\"', then: deny }\n- { id: ok, then: allow }",
     );
     let body = |s: &str| MapView::new().with_int(Field::BodySize, 10).with_body(s);
-    assert_eq!(p.evaluate_head(&body("a secret"), &ctx).terminal_rule, "b");
-    assert_eq!(p.evaluate_head(&body(""), &ctx).terminal_rule, "ok");
+    assert_eq!(
+        p.evaluate_admission(&body("a secret"), &ctx).terminal_rule,
+        "b"
+    );
+    assert_eq!(p.evaluate_admission(&body(""), &ctx).terminal_rule, "ok");
     let too_large = body("x").with_body_too_large(false);
     fail_closed(FailClosedReason::BodyTooLargeToInspect("body.text".into()))(
-        &p.evaluate_head(&too_large, &ctx),
+        &p.evaluate_admission(&too_large, &ctx),
     );
     fail_closed(FailClosedReason::BodyUnavailable("body.text".into()))(
-        &p.evaluate_head(&MapView::new(), &ctx),
+        &p.evaluate_admission(&MapView::new(), &ctx),
     );
 
     // Scoping by size first means a large upload is never inspected.
@@ -610,7 +613,7 @@ fn bodies_fail_closed() {
     let big = MapView::new()
         .with_int(Field::BodySize, 5 << 20)
         .with_body_too_large(false);
-    assert_eq!(p.evaluate_head(&big, &ctx).terminal_rule, "ok");
+    assert_eq!(p.evaluate_admission(&big, &ctx).terminal_rule, "ok");
 
     // Response bodies too.
     let p = compile(
@@ -618,7 +621,7 @@ fn bodies_fail_closed() {
         "- { id: r, when: 'response.body.text contains \"x\"', then: deny }",
     );
     let v = MapView::new().with_body_too_large(true);
-    let out = watch(&p, &v, &ctx).expect("stops");
+    let out = in_flight(&p, &v, &ctx).expect("stops");
     assert_eq!(out.stop, Some(Deny::fail_closed()));
     assert_eq!(out.terminal_rule.unwrap(), "_fail_closed");
     assert_eq!(
@@ -654,21 +657,21 @@ fn unavailable_inputs_fail_closed() {
     };
 
     // The metric is reached but unavailable: fail closed, not "false".
-    let out = p.evaluate_head(&base(), &ctx);
+    let out = p.evaluate_admission(&base(), &ctx);
     fail_closed(FailClosedReason::MetricUnavailable("writes".into()))(&out);
     assert_eq!(out.matched, ["first"].map(roxy_rules::RuleId::new));
     assert_eq!(out.tags, ["seen"]);
 
     // Short-circuit: a different host never needs the metric.
     let other = base().with_str(Field::Host, "example.com");
-    let out = p.evaluate_head(&other, &ctx);
+    let out = p.evaluate_admission(&other, &ctx);
     fail_closed(FailClosedReason::AddressListUnavailable("internal".into()))(&out);
 
     // With the metric (0 for a fresh series) and the list available, fine.
     let ok = base()
         .with_metric("writes", 0)
         .with_address_list("internal", vec!["10.0.0.0/8".parse().unwrap()]);
-    let out = p.evaluate_head(&ok, &ctx);
+    let out = p.evaluate_admission(&ok, &ctx);
     assert_eq!(out.terminal_rule, "rest");
     assert_eq!(out.fail_closed_reason, None);
 
@@ -677,13 +680,13 @@ fn unavailable_inputs_fail_closed() {
         METRICS,
         "- { id: n, when: 'not (metric.writes > 5)', then: allow }",
     );
-    let out = p.evaluate_head(&MapView::new(), &ctx);
+    let out = p.evaluate_admission(&MapView::new(), &ctx);
     fail_closed(FailClosedReason::MetricUnavailable("writes".into()))(&out);
     let p = compile(
         "",
         "- { id: n, when: 'client.ip not in @blocked', then: allow }",
     );
-    let out = p.evaluate_head(&base(), &ctx);
+    let out = p.evaluate_admission(&base(), &ctx);
     fail_closed(FailClosedReason::AddressListUnavailable("blocked".into()))(&out);
 
     // Metric filters report the same condition to the proxy.
@@ -701,12 +704,12 @@ fn unavailable_inputs_fail_closed() {
         "",
         "- { id: s, when: 'state[\"k\"] == \"v\"', then: allow }",
     );
-    let out = p.evaluate_head(&MapView::new(), &ctx);
+    let out = p.evaluate_admission(&MapView::new(), &ctx);
     assert_eq!(out.terminal_rule, "_default");
     assert_eq!(out.fail_closed_reason, None);
 }
 
-/// Every head rule is evaluated, so an unavailable input anywhere in the
+/// Every admission rule is evaluated, so an unavailable input anywhere in the
 /// list fails the flow closed even when a deny above it already matched:
 /// the flow log must say `_fail_closed`, not name a deny that masked an
 /// outage.
@@ -724,7 +727,7 @@ fn fail_closed_wins_over_an_earlier_deny() {
 "#,
     );
     let v = MapView::new().with_str(Field::Path, "/admin/x");
-    let out = p.evaluate_head(&v, &EvalContext::empty());
+    let out = p.evaluate_admission(&v, &EvalContext::empty());
     assert_eq!(out.decision, Decision::fail_closed());
     assert_eq!(out.terminal_rule, "_fail_closed");
     assert_eq!(
@@ -733,12 +736,12 @@ fn fail_closed_wins_over_an_earlier_deny() {
     );
     assert_eq!(out.matched, ["block"].map(roxy_rules::RuleId::new));
     // With the metric available the deny stands.
-    let out = p.evaluate_head(&v.with_metric("writes", 0), &EvalContext::empty());
+    let out = p.evaluate_admission(&v.with_metric("writes", 0), &EvalContext::empty());
     assert_eq!(out.terminal_rule, "block");
 }
 
 #[test]
-fn head_and_watching_rules_share_one_list() {
+fn admission_and_in_flight_rules_share_one_list() {
     let p = compile(
         METRICS,
         r"
@@ -759,30 +762,30 @@ fn head_and_watching_rules_share_one_list() {
     assert_eq!(
         kinds,
         [
-            RuleKind::Watching,
-            RuleKind::Head,
-            RuleKind::HeadAndWatching,
-            RuleKind::Head
+            RuleKind::InFlight,
+            RuleKind::Admission,
+            RuleKind::AdmissionAndInFlight,
+            RuleKind::Admission
         ]
     );
     let info = p.rule_info();
-    assert_eq!(info[0].watches, ["response.status"]);
-    assert_eq!(info[2].watches, ["metric.egress (request_bytes)"]);
+    assert_eq!(info[0].in_flight_reads, ["response.status"]);
+    assert_eq!(info[2].in_flight_reads, ["metric.egress (request_bytes)"]);
     assert_eq!(info[2].triggers, Reads::METRIC_REQUEST_BYTES);
     assert!(
-        info[3].watches.is_empty(),
-        "a requests metric does not watch"
+        info[3].in_flight_reads.is_empty(),
+        "a requests metric does not put a rule in flight"
     );
 
-    // At the head the response rule is skipped, not false.
+    // At admission the response rule is skipped, not false.
     let v = MapView::new()
         .with_metric("egress", 0)
         .with_metric("writes", 0);
-    let out = p.evaluate_head(&v, &EvalContext::empty());
+    let out = p.evaluate_admission(&v, &EvalContext::empty());
     assert_eq!(out.terminal_rule, "req");
     // After forwarding, the response rule stops the exchange.
     let res = v.with_int(Field::ResponseStatus, 418);
-    let out = watch(&p, &res, &EvalContext::empty()).unwrap();
+    let out = in_flight(&p, &res, &EvalContext::empty()).unwrap();
     assert_eq!(out.terminal_rule.unwrap(), "r");
     assert!(matches!(out.stop, Some(Deny { status, .. }) if status == 502));
     assert_eq!(p.rule_ids().count(), 4);
@@ -806,7 +809,7 @@ fn tags_chain_and_initial_tags() {
 "#,
     );
     let v = MapView::new();
-    let out = p.evaluate_head(&v, &EvalContext::empty());
+    let out = p.evaluate_admission(&v, &EvalContext::empty());
     assert!(out.decision.is_deny(), "no from-addon tag");
     assert_eq!(out.tags, ["seen"]);
 
@@ -815,7 +818,7 @@ fn tags_chain_and_initial_tags() {
         initial_tags: &initial,
         ..EvalContext::empty()
     };
-    let out = p.evaluate_head(&v, &ctx);
+    let out = p.evaluate_admission(&v, &ctx);
     assert_eq!(out.terminal_rule, "c");
     assert_eq!(out.tags, ["from-addon", "seen", "both"]);
 
@@ -825,13 +828,14 @@ fn tags_chain_and_initial_tags() {
         initial_tags: &initial,
         ..EvalContext::empty()
     };
-    let out = p.evaluate_head(&v, &ctx);
+    let out = p.evaluate_admission(&v, &ctx);
     assert_eq!(out.matched, Vec::<roxy_rules::RuleId>::new());
     assert_eq!(out.tags, ["seen"]);
 }
 
-/// A rule may read a tag set by head rules above it, or (a watching rule)
-/// by any head rule, or its own; nothing about these depends on order.
+/// A rule may read a tag set by admission rules above it, or (an in-flight
+/// rule) by any admission rule, or its own; nothing about these depends on
+/// order.
 #[test]
 fn tags_read_after_every_setter_compile() {
     compile(
@@ -869,7 +873,7 @@ fn set_state_is_visible_later_in_the_chain() {
 "#,
     );
     // The view says lockdown; the earlier set_state wins within the chain.
-    let out = p.evaluate_head(&flow(), &EvalContext::empty());
+    let out = p.evaluate_admission(&flow(), &EvalContext::empty());
     assert_eq!(out.terminal_rule, "t");
     assert_eq!(
         out.effects,
@@ -905,7 +909,7 @@ fn secrets_are_substituted() {
         secrets: &lookup,
         initial_tags: &[],
     };
-    let out = p.evaluate_head(&openai(), &ctx);
+    let out = p.evaluate_admission(&openai(), &ctx);
     assert!(out.decision.is_allow());
     assert_eq!(
         out.effects,
@@ -939,7 +943,7 @@ fn secret_values_are_redacted_when_printed() {
         secrets: &lookup,
         initial_tags: &[],
     };
-    let out = p.evaluate_head(&openai(), &ctx);
+    let out = p.evaluate_admission(&openai(), &ctx);
     assert!(out.decision.is_allow());
     let displayed: Vec<String> = out.effects.iter().map(ToString::to_string).collect();
     for text in [format!("{out:?}"), displayed.join("\n")] {
@@ -962,7 +966,7 @@ fn missing_secret_fails_closed() {
         secrets: &only_openai,
         initial_tags: &[],
     };
-    let out = p.evaluate_head(&openai(), &ctx);
+    let out = p.evaluate_admission(&openai(), &ctx);
     fail_closed(FailClosedReason::SecretMissing("gh".into()))(&out);
     assert_eq!(out.matched, ["openai"].map(roxy_rules::RuleId::new));
     // Failing closed refuses the request: no header effects survive.
@@ -975,7 +979,7 @@ fn missing_secret_fails_closed() {
         secrets: &crlf,
         initial_tags: &[],
     };
-    let out = p.evaluate_head(&openai(), &ctx);
+    let out = p.evaluate_admission(&openai(), &ctx);
     fail_closed(FailClosedReason::SecretInvalid("openai".into()))(&out);
     assert!(
         out.effects
@@ -1016,7 +1020,7 @@ fn sign_resolves_credentials_without_printing_them() {
         secrets: &lookup,
         initial_tags: &[],
     };
-    let out = p.evaluate_head(&bedrock(), &ctx);
+    let out = p.evaluate_admission(&bedrock(), &ctx);
     assert!(out.decision.is_allow());
     let [Effect::Sign(s)] = out.effects.as_slice() else {
         panic!("{:?}", out.effects);
@@ -1055,7 +1059,7 @@ fn sign_with_a_missing_secret_fails_closed() {
         secrets: &only_openai,
         initial_tags: &[],
     };
-    let out = p.evaluate_head(&bedrock(), &ctx);
+    let out = p.evaluate_admission(&bedrock(), &ctx);
     fail_closed(FailClosedReason::SecretMissing("gh".into()))(&out);
     assert_eq!(out.effects, []);
 }
@@ -1080,7 +1084,7 @@ fn every_effect_kind() {
     - allow: { upgrade: websocket, private_ok: true }
 "#,
     );
-    let out = p.evaluate_head(&MapView::new(), &EvalContext::empty());
+    let out = p.evaluate_admission(&MapView::new(), &EvalContext::empty());
     assert_eq!(
         out.decision,
         Decision::Allow(AllowOpts {
@@ -1224,15 +1228,21 @@ fn guarded_size_rule() {
          - { id: ok, then: allow }",
     );
     let sized = |n: i64| MapView::new().with_int(Field::BodySize, n);
-    assert_eq!(p.evaluate_head(&sized(20 << 20), &ctx).terminal_rule, "big");
-    assert_eq!(p.evaluate_head(&sized(10), &ctx).terminal_rule, "ok");
-    assert_eq!(p.evaluate_head(&MapView::new(), &ctx).terminal_rule, "ok");
+    assert_eq!(
+        p.evaluate_admission(&sized(20 << 20), &ctx).terminal_rule,
+        "big"
+    );
+    assert_eq!(p.evaluate_admission(&sized(10), &ctx).terminal_rule, "ok");
+    assert_eq!(
+        p.evaluate_admission(&MapView::new(), &ctx).terminal_rule,
+        "ok"
+    );
 
     let unguarded = compile(
         "",
         "- { id: big, when: 'body.size > 10mb', then: deny }\n- { id: ok, then: allow }",
     );
-    let out = unguarded.evaluate_head(&MapView::new(), &ctx);
+    let out = unguarded.evaluate_admission(&MapView::new(), &ctx);
     assert_eq!(out.terminal_rule, "_fail_closed");
 }
 
@@ -1268,7 +1278,7 @@ fn a_value_of_the_wrong_type_fails_closed() {
                 expr.replace('\'', "''")
             ),
         );
-        let out = p.evaluate_head(&view, &ctx);
+        let out = p.evaluate_admission(&view, &ctx);
         assert_eq!(out.decision, Decision::fail_closed(), "{expr}");
         assert_eq!(out.terminal_rule, "_fail_closed", "{expr}");
         assert_eq!(
@@ -1286,7 +1296,7 @@ fn a_value_of_the_wrong_type_fails_closed() {
         "",
         "- { id: r, when: 'body.size == null', then: deny }\n- { id: ok, then: allow }",
     )
-    .evaluate_head(&MapView::new(), &ctx);
+    .evaluate_admission(&MapView::new(), &ctx);
     assert_eq!(out.terminal_rule, "r");
 }
 
@@ -1356,17 +1366,17 @@ fn quarantine_refuses_and_is_reported_whatever_the_terminal_rule() {
     );
     let ctx = EvalContext::empty();
     let path = |s: &str| MapView::new().with_str(Field::Path, s);
-    let out = p.evaluate_head(&path("/a"), &ctx);
+    let out = p.evaluate_admission(&path("/a"), &ctx);
     assert!(matches!(out.decision, Decision::Deny(Deny { status, .. }) if status == 451));
     assert_eq!(out.terminal_rule, "plain", "the first deny still decides");
     assert_eq!(out.quarantine.unwrap(), "trip");
 
-    let out = p.evaluate_head(&path("/ab"), &ctx);
+    let out = p.evaluate_admission(&path("/ab"), &ctx);
     assert_eq!(out.decision, Decision::Deny(Deny::quarantine()));
     assert_eq!(out.terminal_rule, "trip");
     assert_eq!(out.quarantine.unwrap(), "trip");
 
-    let out = p.evaluate_head(&path("/b"), &ctx);
+    let out = p.evaluate_admission(&path("/b"), &ctx);
     assert!(out.decision.is_allow());
     assert_eq!(out.quarantine, None);
 }
@@ -1389,10 +1399,10 @@ fn a_matched_quarantine_survives_a_fail_closed() {
     );
     let ctx = EvalContext::empty();
     let path = |s: &str| MapView::new().with_str(Field::Path, s);
-    let out = p.evaluate_head(&path("/a"), &ctx);
+    let out = p.evaluate_admission(&path("/a"), &ctx);
     fail_closed(FailClosedReason::MetricUnavailable("writes".into()))(&out);
     assert_eq!(out.quarantine.unwrap(), "trip");
-    let out = p.evaluate_head(&path("/b"), &ctx);
+    let out = p.evaluate_admission(&path("/b"), &ctx);
     assert_eq!(
         out.quarantine, None,
         "a rule that did not match trips nothing"
@@ -1405,7 +1415,7 @@ fn a_matched_quarantine_survives_a_fail_closed() {
   then: [{ set_header: { x-k: "${secret:openai}" } }, quarantine]
 "#,
     );
-    let out = p.evaluate_head(&MapView::new(), &ctx);
+    let out = p.evaluate_admission(&MapView::new(), &ctx);
     fail_closed(FailClosedReason::SecretMissing("openai".into()))(&out);
     assert_eq!(out.quarantine.unwrap(), "trip");
 }

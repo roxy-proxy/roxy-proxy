@@ -309,7 +309,7 @@ async fn serve_stream(
         write_response(&mut respond, res, &out)
     })
     .await;
-    // A closing deny, or a watching stop that closes, ends the connection:
+    // A closing deny, or an in-flight stop that closes, ends the connection:
     // GOAWAY once the stream is written.
     if sent.close {
         ccx.closing.cancel();

@@ -193,11 +193,11 @@ struct RuleTestArgs {
     /// are absent, as they are before a chunked body is buffered.
     #[arg(long)]
     chunked: bool,
-    /// `body.bytes`: request body bytes streamed so far. Runs the watching
+    /// `body.bytes`: request body bytes streamed so far. Runs the in-flight
     /// rules that read it.
     #[arg(long)]
     body_bytes: Option<u64>,
-    /// `response.status`. Runs the watching rules that read the response
+    /// `response.status`. Runs the in-flight rules that read the response
     /// head (`response.status`, `response.header[..]`).
     #[arg(long)]
     response_status: Option<u16>,
@@ -208,7 +208,7 @@ struct RuleTestArgs {
     #[arg(short = 'R', long = "response-header")]
     response_headers: Vec<String>,
     /// `ws.text`: a WebSocket text message. Any `--ws-*` flag runs the
-    /// watching rules that read `ws.*`.
+    /// in-flight rules that read `ws.*`.
     #[arg(long)]
     ws_text: Option<String>,
     /// `ws.opcode`: 1 text (the default with `--ws-text`), 2 binary (the
@@ -445,10 +445,10 @@ fn rule_test(args: &RuleTestArgs) -> anyhow::Result<ExitCode> {
         eprintln!("roxy rule test: warning: {w}");
     }
     let mut run = ruletest::run(&policy, &view, &req.tags, ruletest::known(&req));
-    let address = ruletest::address_check(&config, &view, &run.head);
+    let address = ruletest::address_check(&config, &view, &run.admission);
     if matches!(address, Some(Err(_))) {
-        ruletest::apply_address_denial(&mut run.head);
-        run.watching = None;
+        ruletest::apply_address_denial(&mut run.admission);
+        run.in_flight = None;
     }
     // Secrets are never resolved here, so the redactor has none registered;
     // effect text still goes through it so a future change cannot leak.
