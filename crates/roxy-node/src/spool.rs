@@ -78,8 +78,8 @@ pub struct Spool {
     /// Shipping has ended (quota exhausted, or revoked and drained): new
     /// events are not spooled.
     closed: AtomicBool,
-    /// Set while events are tagged past the persisted mark, so that is
-    /// logged once per episode.
+    /// Set while events are tagged past the persisted mark: logged once
+    /// per episode, and reported to the control plane on each lease poll.
     unreserved: AtomicBool,
     /// Wakes [`reserve_loop`] when less than a block is reserved ahead.
     reserve_wanted: tokio::sync::Notify,
@@ -167,6 +167,12 @@ impl Spool {
     /// flush window. `None` when empty.
     pub fn oldest_since(&self) -> Option<Instant> {
         lock(&self.queue).events.front().map(|e| e.since)
+    }
+
+    /// Whether events are being tagged with `seq` values past the persisted
+    /// mark, so a restart now may reuse them.
+    pub fn seq_unreserved(&self) -> bool {
+        self.unreserved.load(Ordering::Acquire)
     }
 
     /// Events dropped in `spool` mode since start.
@@ -483,6 +489,76 @@ mod tests {
         assert_eq!(s.reserved_through(), 7);
         s.push(b"{}");
         assert_eq!(s.next_seq(), 8, "spooling goes on");
+    }
+
+    #[test]
+    fn seq_unreserved_is_set_while_a_reservation_fails_and_cleared_once_one_lands() {
+        let failing = Arc::new(AtomicBool::new(false));
+        let f = failing.clone();
+        let s = Spool::new(
+            0,
+            Box::new(move |_| {
+                if f.load(Ordering::Relaxed) {
+                    Err("disk full".into())
+                } else {
+                    Ok(())
+                }
+            }),
+        );
+        s.reserve().unwrap();
+        for _ in 0..2 * SEQ_BLOCK {
+            s.push(b"{}");
+        }
+        assert!(!s.seq_unreserved(), "up to the mark is still reserved");
+        failing.store(true, Ordering::Relaxed);
+        s.push(b"{}");
+        assert!(s.seq_unreserved(), "one past the mark");
+        assert!(s.reserve().is_err());
+        assert!(s.seq_unreserved(), "a failed write changes nothing");
+        failing.store(false, Ordering::Relaxed);
+        s.reserve().unwrap();
+        assert!(!s.seq_unreserved());
+        assert_eq!(s.reserved_through(), 2 * SEQ_BLOCK + 1 + 2 * SEQ_BLOCK);
+    }
+
+    #[test]
+    fn seq_unreserved_stays_set_when_pushes_outrun_a_write_in_flight() {
+        let blocking = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let (b, g) = (blocking.clone(), gate.clone());
+        let s = Arc::new(Spool::new(
+            0,
+            Box::new(move |_| {
+                if b.load(Ordering::Relaxed) {
+                    g.wait();
+                    g.wait();
+                }
+                Ok(())
+            }),
+        ));
+        s.reserve().unwrap();
+        for _ in 0..=2 * SEQ_BLOCK {
+            s.push(b"{}");
+        }
+        assert!(s.seq_unreserved());
+        // A write for 2049 + 2 * SEQ_BLOCK is in flight; pushes pass it.
+        blocking.store(true, Ordering::Relaxed);
+        let writer = std::thread::spawn({
+            let s = s.clone();
+            move || s.reserve()
+        });
+        gate.wait();
+        for _ in 0..=2 * SEQ_BLOCK {
+            s.push(b"{}");
+        }
+        gate.wait();
+        writer.join().unwrap().unwrap();
+        assert_eq!(s.reserved_through(), 2 * SEQ_BLOCK + 1 + 2 * SEQ_BLOCK);
+        assert!(s.next_seq() > s.reserved_through());
+        assert!(s.seq_unreserved(), "the write landed behind next_seq");
+        blocking.store(false, Ordering::Relaxed);
+        s.reserve().unwrap();
+        assert!(!s.seq_unreserved());
     }
 
     #[tokio::test]

@@ -108,7 +108,8 @@ def test_renew_keeps_the_node_id(cp):
 
 
 STATE = {"lease_id": None, "roxy_version": "0.0.0", "protocol_version": 1,
-         "uptime_seconds": 0, "policy_state": "none", "spooled_bytes": 0}
+         "uptime_seconds": 0, "policy_state": "none", "spooled_bytes": 0,
+         "seq_unreserved": False}
 
 
 def test_lease_carries_the_config_with_secrets_moved_into_the_map(cp):
@@ -148,7 +149,15 @@ def test_a_revoked_node_gets_410_everywhere(cp):
 def test_a_malformed_node_state_is_400(cp):
     expect(400, "bad_request", lambda: cp.lease("node-1", {**STATE, "policy_state": "gone"}))
     expect(400, "bad_request", lambda: cp.lease("node-1", {k: v for k, v in STATE.items() if k != "lease_id"}))
+    expect(400, "bad_request", lambda: cp.lease("node-1", {**STATE, "seq_unreserved": "yes"}))
     expect(426, "unsupported", lambda: cp.lease("node-1", {**STATE, "protocol_version": 2}))
+
+
+def test_an_unreserved_seq_is_warned_about_and_an_older_node_may_omit_it(cp, capsys):
+    valid("Lease", cp.lease("node-1", {**STATE, "seq_unreserved": True}))
+    assert "node-1 is using flow seq values" in capsys.readouterr().err
+    valid("Lease", cp.lease("node-2", {k: v for k, v in STATE.items() if k != "seq_unreserved"}))
+    assert capsys.readouterr().err == ""
 
 
 def batch(node_id, first, count, lease_id="lease-x"):

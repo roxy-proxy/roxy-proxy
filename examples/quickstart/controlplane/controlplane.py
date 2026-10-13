@@ -232,6 +232,12 @@ class ControlPlane:
         for field in ("lease_id", "uptime_seconds", "spooled_bytes"):
             if field not in body:
                 raise ApiError(400, "bad_request", f"{field} is required")
+        # Absent from nodes that predate the field.
+        if not isinstance(body.get("seq_unreserved", False), bool):
+            raise ApiError(400, "bad_request", "seq_unreserved must be a boolean")
+        if body.get("seq_unreserved"):
+            print(f"{node_id} is using flow seq values it has not persisted; a restart may reuse them",
+                  file=sys.stderr, flush=True)
         config, secrets = self.policy()
         digest = hashlib.sha256(config.encode() + json.dumps(secrets, sort_keys=True).encode()).hexdigest()
         return {
