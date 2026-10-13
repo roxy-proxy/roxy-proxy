@@ -59,6 +59,18 @@ rules[9].when:1:9: `host` carries an IPv4-mapped address as the IPv4 address it 
 rules[10].when:1:10: `host` carries an IPv4-mapped address as the IPv4 address it embeds, so "::FFFF:203.0.113.7" never matches; write "203.0.113.7"  [rule k]
     | host in ["::FFFF:203.0.113.7", "ok.example"]
     |          ^^^^^^^^^^^^^^^^^^^^
+rules[11].when:1:18: `host` carries an IPv4-mapped address as the IPv4 address it embeds, so "::ffff:10." never matches; write "10."  [rule l]
+    | host starts_with "::ffff:10."
+    |                  ^^^^^^^^^^^^
+rules[12].when:1:11: `host` carries an IPv4-mapped address as the IPv4 address it embeds, so "::ffff:*" never matches; write "*"  [rule m]
+    | host like "::ffff:*"
+    |           ^^^^^^^^^^
+rules[13].when:1:9: `host` never has brackets (an IPv6 host is bare), so "[::ffff:93.184.216.34]" never matches; write "93.184.216.34"  [rule n]
+    | host == "[::ffff:93.184.216.34]"
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^
+rules[14].when:1:9: `host` carries an IPv4-mapped address as the IPv4 address it embeds, so "0:0:0:0:0:ffff:93.184.216.34" never matches; write "93.184.216.34"  [rule o]
+    | host == "0:0:0:0:0:ffff:93.184.216.34"
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 == null compared with a field that is never null
 rules[0].when:1:1: `tag["x"]` is never null (false until set), so comparing it with `null` is always the same answer; remove it  [rule a]
