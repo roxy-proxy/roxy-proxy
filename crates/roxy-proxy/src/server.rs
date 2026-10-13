@@ -84,7 +84,7 @@ pub(crate) enum PolicyState {
 /// per-client cap is small because each connection serves one response
 /// and closes, and it keeps one client address from filling the total
 /// (unless the total is lower still).
-const CA_SERVER_MAX_CONNECTIONS_PER_CLIENT: usize = 16;
+pub(crate) const CA_SERVER_MAX_CONNECTIONS_PER_CLIENT: usize = 16;
 
 /// Per-client and global connection counting.
 struct ConnCaps {

@@ -1,9 +1,12 @@
 //! The plain-HTTP CA endpoint (`ca_server.bind`).
 
+use std::time::Duration;
+
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpStream;
 
 use super::{Kit, read_response, read_to_eof};
+use crate::server::CA_SERVER_MAX_CONNECTIONS_PER_CLIENT;
 
 async fn fetch(kit: &Kit, request: &str) -> (String, Vec<u8>, bool) {
     let mut io = TcpStream::connect(kit.ca_server_addr()).await.unwrap();
@@ -113,4 +116,40 @@ async fn readiness_follows_the_applied_policy_and_liveness_does_not() {
     let (head, body, _) = fetch(&kit, readyz).await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     assert_eq!(body, b"ready");
+}
+
+/// One client address holds at most `CA_SERVER_MAX_CONNECTIONS_PER_CLIENT`
+/// connections to the listener, however far the proxy's cap is from full:
+/// the next is accepted and closed with nothing sent, and the slot comes
+/// back when a held connection closes. The accept loop takes a slot before
+/// its next accept, so the connection opened last is the one refused.
+#[tokio::test]
+async fn one_client_address_is_capped_on_the_ca_server() {
+    let kit = Kit::builder().ca_server().start().await;
+    let probe = b"GET /healthz HTTP/1.1\r\nhost: roxy\r\n\r\n";
+    let mut held = Vec::new();
+    for _ in 0..CA_SERVER_MAX_CONNECTIONS_PER_CLIENT {
+        held.push(TcpStream::connect(kit.ca_server_addr()).await.unwrap());
+    }
+    let mut io = TcpStream::connect(kit.ca_server_addr()).await.unwrap();
+    let _ = io.write_all(probe).await;
+    let (out, eof) = read_to_eof(&mut io).await;
+    assert!(eof && out.is_empty(), "{}", String::from_utf8_lossy(&out));
+
+    drop(held.pop());
+    let mut answer = String::new();
+    for _ in 0..100 {
+        let mut io = TcpStream::connect(kit.ca_server_addr()).await.unwrap();
+        io.write_all(probe).await.unwrap();
+        let (out, _) = read_to_eof(&mut io).await;
+        if !out.is_empty() {
+            answer = String::from_utf8_lossy(&out).into_owned();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        answer.starts_with("HTTP/1.1 200"),
+        "a slot never freed: {answer}"
+    );
 }
