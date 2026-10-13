@@ -1104,7 +1104,7 @@ mod tests {
             panic!("nothing answers");
         };
         assert!(matches!(err, ConnectError::Timeout(_)), "{err:?}");
-        assert_eq!(took, s.connect_timeout, "one timeout per address");
+        assert_eq!(took, s.connect_timeout, "the addresses share one timeout");
         let order: Vec<String> = dialled
             .lock()
             .unwrap()

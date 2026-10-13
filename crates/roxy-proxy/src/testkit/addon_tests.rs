@@ -1221,7 +1221,7 @@ mod service {
         kit.upstream.fail_writes();
         let (a, took) = timed(async { kit.h1().await.call("GET", "/x", &[], b"").await }).await;
         assert_eq!(a.status, 503, "{a:?}");
-        assert_eq!(took, Duration::ZERO, "failed on a deadline, not at once");
+        assert_eq!(took, Duration::ZERO, "fails at once, before any deadline");
         let errs = kit.events("layer_error", 1).await;
         assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
         assert_eq!(errs[0]["kind"], "service:closed", "{errs:#?}");
@@ -1729,7 +1729,7 @@ mod service {
         assert_eq!(
             took,
             Duration::from_millis(500),
-            "failed on another deadline"
+            "fails on first_byte_timeout"
         );
         let errs = kit.events("layer_error", 1).await;
         assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
@@ -1766,7 +1766,7 @@ mod service {
         assert_eq!(
             took,
             Duration::from_millis(700),
-            "failed on another deadline, or after the body"
+            "fails on first_byte_timeout from the response head"
         );
         assert_eq!(kit.upstream.seen().len(), 1, "the request was forwarded");
         let errs = kit.events("layer_error", 1).await;
@@ -1843,7 +1843,7 @@ mod service {
         assert_eq!(
             took,
             Duration::from_millis(500),
-            "failed on another deadline"
+            "fails on first_byte_timeout"
         );
         let errs = kit.events("layer_error", 1).await;
         assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
