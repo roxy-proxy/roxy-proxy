@@ -39,7 +39,7 @@
     <text x="315" y="158">lease still valid</text>
     <text x="315" y="184">response: canonical re-serialisation to the client</text>
     <text x="315" y="420">deny wins · effects: secrets, headers, redirect, sign</text>
-    <text x="315" y="438">response: watching rules on the head and bodies</text>
+    <text x="315" y="438">response: in-flight rules on the head and bodies</text>
     <text x="315" y="544">DNS · address floor · upstream TLS</text>
     <text x="315" y="562">response: re-framed, streamed back up the stack</text>
   </g>

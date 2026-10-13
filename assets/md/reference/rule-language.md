@@ -58,27 +58,29 @@ method      := [A-Z][A-Z_]*                       ; HTTP method names only
 
 ### Fields
 
-*Head* fields are known at the forwarding decision; rules reading *watched*
-fields watch.
+*Admission* fields are known at the forwarding decision; a rule reading only
+them is an admission rule. *In-flight* fields become known or change after the
+request is forwarded; a rule reading one is re-checked in flight
+([evaluation](/design/policy-evaluation#evaluation)).
 
 | field | type | known |
 |---|---|---|
-| `client.ip`, `client.port` | ip, int | head |
-| `listener.name` | string | head |
-| `tls.sni`, `tls.alpn`, `tls.version` | string | head |
-| `method`, `scheme`, `host`, `port`, `path`, `url` | string / int | head |
-| `query["k"]`, `query.raw` | string | head |
-| `header["name"]`, `header.all["name"]` | string, list | head |
-| `body.size` | int: declared length, `null` if undeclared (chunked) | head |
-| `body.text` | string: the buffered body, up to the cap | head |
-| `metric.<id>` | int | head; a `deny` reading a byte metric also watches it ([rate limits](/reference/rate-limits#metrics)) |
-| `state["key"]`, `tag["name"]` | string, bool | head |
-| `body.bytes` | int: request body bytes so far | watched |
-| `response.status`, `response.header["name"]`, `response.header.all["name"]` | int, string, list | watched |
-| `response.body.size` | int: declared length, `null` if undeclared | watched |
-| `response.body.text` | string: the buffered response body | watched |
-| `response.body.bytes` | int: response body bytes so far | watched |
-| `ws.direction`, `ws.opcode`, `ws.size`, `ws.text` | string, int, int, string: the WebSocket message being checked | watched, per message ([WebSockets](/reference/websockets#message-rules)) |
+| `client.ip`, `client.port` | ip, int | admission |
+| `listener.name` | string | admission |
+| `tls.sni`, `tls.alpn`, `tls.version` | string | admission |
+| `method`, `scheme`, `host`, `port`, `path`, `url` | string / int | admission |
+| `query["k"]`, `query.raw` | string | admission |
+| `header["name"]`, `header.all["name"]` | string, list | admission |
+| `body.size` | int: declared length, `null` if undeclared (chunked) | admission |
+| `body.text` | string: the buffered body, up to the cap | admission |
+| `metric.<id>` | int | admission; a `deny` reading a byte metric is also re-checked in flight ([rate limits](/reference/rate-limits#metrics)) |
+| `state["key"]`, `tag["name"]` | string, bool | admission |
+| `body.bytes` | int: request body bytes so far | in-flight |
+| `response.status`, `response.header["name"]`, `response.header.all["name"]` | int, string, list | in-flight |
+| `response.body.size` | int: declared length, `null` if undeclared | in-flight |
+| `response.body.text` | string: the buffered response body | in-flight |
+| `response.body.bytes` | int: response body bytes so far | in-flight |
+| `ws.direction`, `ws.opcode`, `ws.size`, `ws.text` | string, int, int, string: the WebSocket message being checked | in-flight, per message ([WebSockets](/reference/websockets#message-rules)) |
 
 `path` is normalised ([HTTP](/reference/http#url-normalisation)). `host`
 and `tls.sni` are the name as roxy delivers it: lower-case, without a
@@ -146,25 +148,25 @@ Terminal:
 
 | action | where | effect |
 |---|---|---|
-| `allow` | head rules | Forward. `upgrade: websocket` permits a WebSocket upgrade; `private_ok: true` lets the flow reach private addresses ([address floor](/reference/address-lists#address-floor)). |
-| `deny` | all rules | `deny: { status, message, close }`; status 403 by default, 4xx or 5xx. At the head: refuse ([deny responses](/reference/http#deny-responses)) and close unless `close: false`. Watching: stop the exchange ([evaluation](/design/policy-evaluation#evaluation)). On a WebSocket: close both sides, with a `1008` frame when rules read messages ([WebSockets](/reference/websockets#message-rules)). |
+| `allow` | admission rules | Forward. `upgrade: websocket` permits a WebSocket upgrade; `private_ok: true` lets the flow reach private addresses ([address floor](/reference/address-lists#address-floor)). |
+| `deny` | all rules | `deny: { status, message, close }`; status 403 by default, 4xx or 5xx. At admission: refuse ([deny responses](/reference/http#deny-responses)) and close unless `close: false`. In flight: stop the exchange ([evaluation](/design/policy-evaluation#evaluation)). On a WebSocket: close both sides, with a `1008` frame when rules read messages ([WebSockets](/reference/websockets#message-rules)). |
 | `quarantine` | all rules | A bare word, no argument. A `deny` with status 403 that closes, plus: the whole proxy is [quarantined](/guides/operations#quarantine), refusing every later exchange until released from outside. Any matching `quarantine` trips it, whichever deny decided the exchange, a fail-closed included. Needs `--state-dir`. |
 
 Non-terminal:
 
 | action | where | effect |
 |---|---|---|
-| `set_header: { name: value }` | request: head rules; response: watching rules | Set or replace. Request values may use `${secret:name}`; an invalid value denies the flow. A response rule may read only values known before the response head is sent (`response.status`, `response.header[..]`, `response.body.size`, `response.body.text`); `body.bytes`, `response.body.bytes`, `ws.*` or a byte metric is a compile error. |
+| `set_header: { name: value }` | request: admission rules; response: in-flight rules | Set or replace. Request values may use `${secret:name}`; an invalid value denies the flow. A response rule may read only values known before the response head is sent (`response.status`, `response.header[..]`, `response.body.size`, `response.body.text`); `body.bytes`, `response.body.bytes`, `ws.*` or a byte metric is a compile error. |
 | `remove_header: [names]` | as `set_header` | |
-| `rewrite_path: { match, to }` | head rules | Anchored regex (as `matches`), `$1` / `${name}` groups; `to` must start with `/`; result re-normalised. |
-| `set_query: { k: v }`, `remove_query: [k]` | head rules | |
-| `redirect: { host, port, scheme?, rewrite_host? }` | head rules | Change the upstream target. `host`: DNS name, dotted-quad IPv4 or bracketed IPv6 (`[::1]`); anything else, or port `0`, is a config error. The new IPs pass the address floor and deny lists. `Host` is unchanged unless `rewrite_host: true`, and while unchanged the request goes upstream over HTTP/1.1 (HTTP/2 needs `:authority` and `host` to agree). |
+| `rewrite_path: { match, to }` | admission rules | Anchored regex (as `matches`), `$1` / `${name}` groups; `to` must start with `/`; result re-normalised. |
+| `set_query: { k: v }`, `remove_query: [k]` | admission rules | |
+| `redirect: { host, port, scheme?, rewrite_host? }` | admission rules | Change the upstream target. `host`: DNS name, dotted-quad IPv4 or bracketed IPv6 (`[::1]`); anything else, or port `0`, is a config error. The new IPs pass the address floor and deny lists. `Host` is unchanged unless `rewrite_host: true`, and while unchanged the request goes upstream over HTTP/1.1 (HTTP/2 needs `:authority` and `host` to agree). |
 | `tag: name` | all | Sets `tag["name"]` for later rules, addons and the log. |
 | `log: { level, message }` | all | Emits a `log` flow event. |
 | `set_state: { key, value, ttl? }` | all | Writes the [state store](/reference/rate-limits#state). |
-| `capture: request \| response \| both` | head rules | Tees the exchange, as forwarded, to the [capture log](/reference/flow-log#capture). |
-| `digest: request \| response \| both` | head rules | Hashes the selected bodies, as forwarded, into the flow record's [`body_sha256`](/reference/flow-log#flow-log). Nothing is hashed without it. |
-| `sign: { aws_sigv4: { service, region, access_key_id, secret_access_key, session_token?, unsigned_payload? } }` | head rules | AWS Signature Version 4 over the forwarded request, after every other head effect ([signing AWS requests](/reference/secrets#signing-aws-requests)). |
+| `capture: request \| response \| both` | admission rules | Tees the exchange, as forwarded, to the [capture log](/reference/flow-log#capture). |
+| `digest: request \| response \| both` | admission rules | Hashes the selected bodies, as forwarded, into the flow record's [`body_sha256`](/reference/flow-log#flow-log). Nothing is hashed without it. |
+| `sign: { aws_sigv4: { service, region, access_key_id, secret_access_key, session_token?, unsigned_payload? } }` | admission rules | AWS Signature Version 4 over the forwarded request, after every other admission effect ([signing AWS requests](/reference/secrets#signing-aws-requests)). |
 
 Anything richer is an addon. `call` and `passthrough` are rejected with a
 reason naming why.
@@ -173,7 +175,7 @@ reason naming why.
 
 `body.text` and `response.body.text` are the only fields that buffer. If
 any rule reads `body.text`, roxy collects every request body up to
-`limits.max_inspect_body_bytes` (1 MiB) before the head decision, then
+`limits.max_inspect_body_bytes` (1 MiB) before the admission decision, then
 streams it on; `response.body.text` likewise for every response body. A
 body over the cap is unavailable: a rule reading it fails closed
 (`_fail_closed`, reason `body_too_large_to_inspect`). Raise the cap, or

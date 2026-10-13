@@ -11,8 +11,8 @@ Defined once, compared in rules (`metric.<id> >= 30`).
 metrics:
   - id: <string>
     count: requests | request_bytes | response_bytes | errors | denied | unique(<field>)
-    where: <expr>        # head values only, no tags: whether this exchange counts
-    key: [<field>, ...]  # scalar head fields only; omitted = one global series
+    where: <expr>        # admission values only, no tags: whether it counts
+    key: [<field>, ...]  # scalar admission fields; omitted = one global series
     window: <duration>   # omitted = cumulative since start; 0 is a compile error
     max_keys: <n>        # series this metric alone may hold; omitted = limits.max_metric_keys
 ```
@@ -21,10 +21,10 @@ metrics:
   store keeps 60 complete buckets plus the current partial one, so a value
   may include events up to one bucket older than the window: a limit trips
   slightly early, never late. `unique` is a HyperLogLog sketch per bucket.
-* **`where`** may read head fields, `header[..]`, `query[..]`,
+* **`where`** may read admission fields, `header[..]`, `query[..]`,
   `state[..]`, `body.text` and metrics; not `tag[..]` (counted outside the
   rules, a tag would always read false). **`key`** and the `unique(..)`
-  field take scalar head fields only (`client.ip`, `host`, `tls.sni`, ...),
+  field take scalar admission fields only (`client.ip`, `host`, `tls.sni`, ...),
   not `header[..]` or other indexed values. Anything else is a compile
   error.
 * **Nullable keys.** A flow whose key field is `null` is denied
@@ -37,10 +37,10 @@ metrics:
 * **When counts move.** `requests` and `denied` are read before the
   forwarding decision and incremented after it (denied flows count), so
   `metric.x >= 30` denies the 31st request. `request_bytes` and
-  `response_bytes` grow as bytes stream: a deny reading them watches and
-  stops the exchange that crosses the limit; a chunk is counted before it
-  is checked, so a budget overcounts by at most one chunk. `errors` count
-  when the exchange ends.
+  `response_bytes` grow as bytes stream: a deny reading them is re-checked
+  in flight and stops the exchange that crosses the limit; a chunk is
+  counted before it is checked, so a budget overcounts by at most one
+  chunk. `errors` count when the exchange ends.
 * **Bounds** ([never evict](/design/threat-model#never-evict)):
   `limits.max_metric_keys` (100 000) series across all metrics; each
   metric's `max_keys` (at most the shared limit, its default); and,

@@ -73,7 +73,7 @@ rules:
     when: metric.github_writes >= 30
     then: { deny: { status: 429 } }
 
-  - id: upload-cap               # reads body.bytes, so it watches the upload
+  - id: upload-cap               # reads body.bytes: re-checked in flight
     when: host == "api.openai.com" and body.bytes > 10mb
     then: { deny: { status: 413 } }
 ```

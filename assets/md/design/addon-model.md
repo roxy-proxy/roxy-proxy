@@ -23,7 +23,7 @@ stream upward.
  fixed   ┌─ CONNECT gate (SNI must match) ───────────────────────────────┐
  config  ├─ addon: first listed                                          │
  config  ├─ addon: second listed                                         │
- fixed   ├─ rules                  (head decision ↓ / watching ↑)        │
+ fixed   ├─ rules                  (admission ↓ / in flight ↑)           │
  fixed   ├─ address floor + deny lists (on the IP actually dialled)      │
  fixed   └─ connector ──▶ origin ────────────────────────────────────────┘
 ```
@@ -44,7 +44,7 @@ the stream rather than in it.
 1. **The rules evaluate every request that leaves.** An addon can reshape
    traffic freely; its output is re-validated by the canonical model and
    then judged by the rules exactly as if the client had sent it. On the
-   way back, the watching rules see the upstream's response before any
+   way back, the in-flight rules see the upstream's response before any
    addon does.
 2. **Every layer is held to the workload's limits.** Whatever a layer passes
    on is treated as if a client sent it: header limits, body caps, idle
@@ -107,8 +107,8 @@ judged), and deny or answer (return a response without calling `next`).
 
 A body a layer is not subscribed to bypasses it, as if the layer had
 passed it on untouched: the layer sees the head with an empty body and
-decides at the head, and roxy splices the body onto what it passes on. An
-enforce layer still denies or rewrites at the head; an observer that wants
+decides at admission, and roxy splices the body onto what it passes on. An
+enforce layer still denies or rewrites at admission; an observer that wants
 heads only costs no body copies
 ([what a layer sees](/reference/addon-configuration#what-a-layer-sees)).
 

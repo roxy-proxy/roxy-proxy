@@ -34,9 +34,9 @@ output).
 * **Exchange / flow:** one request and its response (or one WebSocket
   session) within a client connection. Each has a ULID.
 * **Canonical:** roxy's validated, normalised, version-agnostic HTTP model.
-* **Head rule / watching rule:** decided at the request head (can allow or
-  deny) versus reading values known only later (can only deny or add
-  effects).
+* **Admission rule / in-flight rule:** decided before the request is
+  forwarded (can allow or deny) versus re-checked as the exchange streams,
+  reading values known only then (can only deny or add effects).
 * **Policy:** a compiled, immutable snapshot of the config, swapped
   atomically on reload.
 * **Layer:** one addon in the stack.

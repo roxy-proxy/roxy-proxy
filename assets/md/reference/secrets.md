@@ -1,6 +1,6 @@
 # Secrets
 
-`secrets:` maps names to sources. `${secret:name}` in a head rule's
+`secrets:` maps names to sources. `${secret:name}` in an admission rule's
 `set_header` value or `sign` credentials, or an addon endpoint's `headers`,
 injects the value; the client holds only a placeholder. A reference
 anywhere else is a compile error.
@@ -32,7 +32,7 @@ rules:
 
 ## Signing AWS requests
 
-`sign: { aws_sigv4: ... }`, a head-rule action, signs the forwarded request
+`sign: { aws_sigv4: ... }`, an admission-rule action, signs the forwarded request
 with AWS Signature Version 4, so a client holding placeholder credentials
 reaches AWS with a real signature. Credential fields take `${secret:name}` as
 `set_header` does; `session_token` is optional.
@@ -57,7 +57,7 @@ rules:
       - allow
 ```
 
-* **Signed:** the request as forwarded, after every other head effect
+* **Signed:** the request as forwarded, after every other admission effect
   (`set_header`, `rewrite_path`, `redirect`, ...) whatever `sign`'s
   position in `then`. The client's `authorization`, `x-amz-date`,
   `x-amz-security-token` and `x-amz-content-sha256` are removed first.
@@ -97,7 +97,7 @@ Values live in a store beside the compiled policy. Replacing the map swaps
 the store and rebuilds the redactor without recompiling rules, rebuilding
 addons, flushing upstream pools or a reload event. An exchange resolves
 every name, in its rules and in the `headers` of the endpoint calls its
-addons make, from the generation current at its head evaluation, so a swap
+addons make, from the generation current at its admission evaluation, so a swap
 mid-evaluation cannot pair one credential with another's replacement; an
 exchange under way keeps the generation it injected, and redacts with it,
 however many swaps follow. A name the map lacks is `secret_missing`. Values

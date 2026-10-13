@@ -1010,7 +1010,7 @@ The canonical request, as in `roxy run`:
 | `--metric id=value` | a metric's value; unset metrics are 0, `--metric id=unavailable` exercises the fail-closed path, and an id the config does not define gets a warning |
 | `--state key=value` | an entry in the state store |
 | `--tag name` | a tag, before the rules run |
-| `--body-bytes`, `--response-body-bytes` | the byte counts, running the watching rules that read them |
+| `--body-bytes`, `--response-body-bytes` | the byte counts, running the in-flight rules that read them |
 | `--response-status`, `--response-header` | the response head, running the rules that read it (`--response-header` on its own runs nothing) |
 | `--ws-text`, `--ws-opcode`, `--ws-size`, `--ws-direction` | one WebSocket message, running the rules that read `ws.*` |
 
@@ -1126,7 +1126,7 @@ failed in any way is discarded, never reused
 
 # How roxy works
 
-<img src={howItWorks} alt="One exchange through roxy, top to bottom. The client's request enters roxy and passes through four stages: decrypt and parse (CONNECT, TLS, strict parse into the canonical request, and the lease check), the addon stack (enforce layers in order, with observers beside them on a copy), the rules (deny wins; effects: secrets, headers, redirect, sign) and connect (DNS, address floor, upstream TLS), then reaches the upstream. The response returns up the same stages: re-framed by the connector, watched by the rules, seen by the addons, and canonically re-serialised to the client. Each stage has an exit branching to the right: a parse failure is refused with parse_error, an expired policy denies with _expired, an addon can answer the client directly or deny with layer:name, the rules deny with the rule id, and the address floor denies with _address_policy. A flow-log strip down the right edge is fed by every stage and every exit: one record per exchange, never dropped." />
+<img src={howItWorks} alt="One exchange through roxy, top to bottom. The client's request enters roxy and passes through four stages: decrypt and parse (CONNECT, TLS, strict parse into the canonical request, and the lease check), the addon stack (enforce layers in order, with observers beside them on a copy), the rules (deny wins; effects: secrets, headers, redirect, sign) and connect (DNS, address floor, upstream TLS), then reaches the upstream. The response returns up the same stages: re-framed by the connector, re-checked by the rules, seen by the addons, and canonically re-serialised to the client. Each stage has an exit branching to the right: a parse failure is refused with parse_error, an expired policy denies with _expired, an addon can answer the client directly or deny with layer:name, the rules deny with the rule id, and the address floor denies with _address_policy. A flow-log strip down the right edge is fed by every stage and every exit: one record per exchange, never dropped." />
 
 An exchange is one request and its response. Every exchange takes the same
 path, whichever way roxy is deployed.
@@ -1165,10 +1165,10 @@ the rules judge that as if the client had sent it
 
 The rules are a list of allows plus the denies that restrict them, in one
 YAML file. A matching deny always wins, and anything no rule allows is
-denied. The forwarding decision is made at the request head; rules that
-read the bodies or the response keep watching as they stream, and can
-still stop the exchange. Metrics give rate limits and byte budgets
-([policy evaluation](/design/policy-evaluation)).
+denied. The forwarding decision is made before the request goes upstream;
+rules that read the bodies or the response are re-checked in flight as they
+stream, and can still stop the exchange. Metrics give rate limits and byte
+budgets ([policy evaluation](/design/policy-evaluation)).
 
 ```yaml
 secrets:
@@ -1185,13 +1185,13 @@ rules:
       - set_header: { authorization: "Bearer ${secret:openai}" }   # the client never sees the key
       - allow
 
-  - id: upload-cap                         # watches the body as it streams
+  - id: upload-cap                         # re-checked as the body streams
     when: host == "api.openai.com" and body.bytes > 10mb
     then: { deny: { status: 413 } }
 ```
 
 The request steps run in a fixed order: a bounded body buffer only when a
-rule reads `body.text`, then the head decision and its effects. The only
+rule reads `body.text`, then the admission decision and its effects. The only
 verdict that leads to the upstream is `Continue`; every error maps to a
 deny or a close. The steps are not an extension point: extensions are
 addons, above them.
@@ -1208,8 +1208,8 @@ does ([upstream](/reference/upstream),
 
 When the response head arrives, the response steps run: a bounded buffer
 of the response body only when a rule reads `response.body.text`, then the
-watching rules, which may still stop the exchange or change the head. As
-body bytes stream the watcher re-checks those rules, records byte metrics,
+in-flight rules, which may still stop the exchange or change the head. As
+body bytes stream roxy re-checks those rules, records byte metrics,
 and holds each chunk until the flow log is ready. The response is re-framed
 for the client and passes back up the addon stack.
 
@@ -1390,53 +1390,54 @@ runs follows from what it reads.
    puts the proxy into [quarantine](/guides/operations#quarantine): a
    matching one trips it whichever deny decided the request, a fail-closed
    included, and from the next exchange on nothing here runs at all.
-2. **After that, rules watch.** For the rest of the exchange, two kinds of
-   rule are re-checked whenever a value they read becomes known or changes:
-   rules that read a *watched* field ([fields](/reference/rule-language#fields)),
-   and `deny` rules that read a byte metric (`count: request_bytes` or
-   `response_bytes`), which this exchange adds to as bytes stream. A deny
-   reading a `requests`, `denied`, `errors` or `unique` metric is decided at
-   the head only: re-checking it after this exchange's own count would deny
-   the 30th request of a `>= 30` limit instead of the 31st. If a watching
-   deny matches, roxy stops the exchange: an error response if the response
-   has not started, otherwise HTTP/1.1 breaks the connection without
-   finishing the body and HTTP/2 resets the stream. Nothing overrides a
-   deny.
-3. **Only head rules can `allow`.** A rule that reads a watched field cannot
-   allow, change the request (`set_header` on the request, `rewrite_path`,
-   `redirect`, ...), `capture` or `digest`: the request is already on its
-   way, so each is a compile error. It can deny or quarantine, and add
-   effects that still make sense: `log`, `tag`, `set_state`, and header
-   changes on a response that has not been sent yet.
-4. **A watching rule's non-terminal effects apply once**, the first time it
+2. **After that, rules run in flight.** For the rest of the exchange, two
+   kinds of rule are re-checked whenever a value they read becomes known or
+   changes: rules that read an *in-flight* field
+   ([fields](/reference/rule-language#fields)), and `deny` rules that read a
+   byte metric (`count: request_bytes` or `response_bytes`), which this
+   exchange adds to as bytes stream. A deny reading a `requests`, `denied`,
+   `errors` or `unique` metric is decided at admission only: re-checking it
+   after this exchange's own count would deny the 30th request of a `>= 30`
+   limit instead of the 31st. If an in-flight deny matches, roxy stops the
+   exchange: an error response if the response has not started, otherwise
+   HTTP/1.1 breaks the connection without finishing the body and HTTP/2
+   resets the stream. Nothing overrides a deny.
+3. **Only admission rules can `allow`.** A rule that reads an in-flight
+   field cannot allow, change the request (`set_header` on the request,
+   `rewrite_path`, `redirect`, ...), `capture` or `digest`: the request is
+   already on its way, so each is a compile error. It can deny or
+   quarantine, and add effects that still make sense: `log`, `tag`,
+   `set_state`, and header changes on a response that has not been sent
+   yet.
+4. **An in-flight rule's non-terminal effects apply once**, the first time it
    matches.
 5. **Order matters for effects, not decisions.** Rules are evaluated top to
    bottom. If the request is allowed, the effects of every matching rule
    apply in list order; if two set the same header, the later wins. A deny
-   does not cut evaluation short, at the head or while watching: every
+   does not cut evaluation short, at admission or in flight: every
    rule the pass checks still runs. If the request is denied, or a change
    to it fails (which denies it with `_fail_closed`, reason
    `effect_invalid`), the `log` and `set_state` effects of the matching
    rules still apply, and the request's metric samples count it as denied.
-   An unavailable input is the exception: it stops head evaluation at that
+   An unavailable input is the exception: it stops admission evaluation at that
    rule, so the rules below it do not run, their `log` and `set_state` do
    not apply, and `rules` in the flow log lists only the rules above it.
    Allow options (`upgrade`, `private_ok`) come from the first matching
    allow only. The flow log names the first matching deny (or allow) as
    `terminal_rule`.
 6. **A tag is visible to the rules below the rule that set it.** A rule
-   that reads a tag must come after every rule that sets it (a head rule
-   above it, or, for a watching rule, any head rule); otherwise the config
-   is rejected, since moving a rule would change what it sees. A tag set
-   by a watching rule can be read by no other rule: watching rules fire
-   when the values they read arrive, not in list order, so whether the tag
-   was visible would depend on timing. A deny that reads a byte metric can
-   fire while watching too, so a watching rule cannot read its tag; a head
-   rule below it can. A rule may read its own tag, and a tag no rule sets
-   (from an addon).
+   that reads a tag must come after every rule that sets it (an admission
+   rule above it, or, for an in-flight rule, any admission rule); otherwise
+   the config is rejected, since moving a rule would change what it sees. A
+   tag set by an in-flight rule can be read by no other rule: in-flight
+   rules fire when the values they read arrive, not in list order, so
+   whether the tag was visible would depend on timing. A deny that reads a
+   byte metric can fire in flight too, so an in-flight rule cannot read its
+   tag; an admission rule below it can. A rule may read its own tag, and a
+   tag no rule sets (from an addon).
 
-`roxy check` and `roxy rule test` report whether each rule is decided at the
-head or watches.
+`roxy check` and `roxy rule test` report whether each rule is decided at
+admission or in flight.
 
 **Unavailable inputs fail closed.** If a rule needs a metric value, an
 address-list lookup or a secret and it is unavailable (store overloaded,
@@ -1472,7 +1473,7 @@ stream upward.
  fixed   ┌─ CONNECT gate (SNI must match) ───────────────────────────────┐
  config  ├─ addon: first listed                                          │
  config  ├─ addon: second listed                                         │
- fixed   ├─ rules                  (head decision ↓ / watching ↑)        │
+ fixed   ├─ rules                  (admission ↓ / in flight ↑)           │
  fixed   ├─ address floor + deny lists (on the IP actually dialled)      │
  fixed   └─ connector ──▶ origin ────────────────────────────────────────┘
 ```
@@ -1493,7 +1494,7 @@ the stream rather than in it.
 1. **The rules evaluate every request that leaves.** An addon can reshape
    traffic freely; its output is re-validated by the canonical model and
    then judged by the rules exactly as if the client had sent it. On the
-   way back, the watching rules see the upstream's response before any
+   way back, the in-flight rules see the upstream's response before any
    addon does.
 2. **Every layer is held to the workload's limits.** Whatever a layer passes
    on is treated as if a client sent it: header limits, body caps, idle
@@ -1556,8 +1557,8 @@ judged), and deny or answer (return a response without calling `next`).
 
 A body a layer is not subscribed to bypasses it, as if the layer had
 passed it on untouched: the layer sees the head with an empty body and
-decides at the head, and roxy splices the body onto what it passes on. An
-enforce layer still denies or rewrites at the head; an observer that wants
+decides at admission, and roxy splices the body onto what it passes on. An
+enforce layer still denies or rewrites at admission; an observer that wants
 heads only costs no body copies
 ([what a layer sees](/reference/addon-configuration#what-a-layer-sees)).
 
@@ -1718,7 +1719,7 @@ rules:
     when: metric.github_writes >= 30
     then: { deny: { status: 429 } }
 
-  - id: upload-cap               # reads body.bytes, so it watches the upload
+  - id: upload-cap               # reads body.bytes: re-checked in flight
     when: host == "api.openai.com" and body.bytes > 10mb
     then: { deny: { status: 413 } }
 ```
@@ -1783,27 +1784,29 @@ method      := [A-Z][A-Z_]*                       ; HTTP method names only
 
 ### Fields
 
-*Head* fields are known at the forwarding decision; rules reading *watched*
-fields watch.
+*Admission* fields are known at the forwarding decision; a rule reading only
+them is an admission rule. *In-flight* fields become known or change after the
+request is forwarded; a rule reading one is re-checked in flight
+([evaluation](/design/policy-evaluation#evaluation)).
 
 | field | type | known |
 |---|---|---|
-| `client.ip`, `client.port` | ip, int | head |
-| `listener.name` | string | head |
-| `tls.sni`, `tls.alpn`, `tls.version` | string | head |
-| `method`, `scheme`, `host`, `port`, `path`, `url` | string / int | head |
-| `query["k"]`, `query.raw` | string | head |
-| `header["name"]`, `header.all["name"]` | string, list | head |
-| `body.size` | int: declared length, `null` if undeclared (chunked) | head |
-| `body.text` | string: the buffered body, up to the cap | head |
-| `metric.<id>` | int | head; a `deny` reading a byte metric also watches it ([rate limits](/reference/rate-limits#metrics)) |
-| `state["key"]`, `tag["name"]` | string, bool | head |
-| `body.bytes` | int: request body bytes so far | watched |
-| `response.status`, `response.header["name"]`, `response.header.all["name"]` | int, string, list | watched |
-| `response.body.size` | int: declared length, `null` if undeclared | watched |
-| `response.body.text` | string: the buffered response body | watched |
-| `response.body.bytes` | int: response body bytes so far | watched |
-| `ws.direction`, `ws.opcode`, `ws.size`, `ws.text` | string, int, int, string: the WebSocket message being checked | watched, per message ([WebSockets](/reference/websockets#message-rules)) |
+| `client.ip`, `client.port` | ip, int | admission |
+| `listener.name` | string | admission |
+| `tls.sni`, `tls.alpn`, `tls.version` | string | admission |
+| `method`, `scheme`, `host`, `port`, `path`, `url` | string / int | admission |
+| `query["k"]`, `query.raw` | string | admission |
+| `header["name"]`, `header.all["name"]` | string, list | admission |
+| `body.size` | int: declared length, `null` if undeclared (chunked) | admission |
+| `body.text` | string: the buffered body, up to the cap | admission |
+| `metric.<id>` | int | admission; a `deny` reading a byte metric is also re-checked in flight ([rate limits](/reference/rate-limits#metrics)) |
+| `state["key"]`, `tag["name"]` | string, bool | admission |
+| `body.bytes` | int: request body bytes so far | in-flight |
+| `response.status`, `response.header["name"]`, `response.header.all["name"]` | int, string, list | in-flight |
+| `response.body.size` | int: declared length, `null` if undeclared | in-flight |
+| `response.body.text` | string: the buffered response body | in-flight |
+| `response.body.bytes` | int: response body bytes so far | in-flight |
+| `ws.direction`, `ws.opcode`, `ws.size`, `ws.text` | string, int, int, string: the WebSocket message being checked | in-flight, per message ([WebSockets](/reference/websockets#message-rules)) |
 
 `path` is normalised ([HTTP](/reference/http#url-normalisation)). `host`
 and `tls.sni` are the name as roxy delivers it: lower-case, without a
@@ -1871,25 +1874,25 @@ Terminal:
 
 | action | where | effect |
 |---|---|---|
-| `allow` | head rules | Forward. `upgrade: websocket` permits a WebSocket upgrade; `private_ok: true` lets the flow reach private addresses ([address floor](/reference/address-lists#address-floor)). |
-| `deny` | all rules | `deny: { status, message, close }`; status 403 by default, 4xx or 5xx. At the head: refuse ([deny responses](/reference/http#deny-responses)) and close unless `close: false`. Watching: stop the exchange ([evaluation](/design/policy-evaluation#evaluation)). On a WebSocket: close both sides, with a `1008` frame when rules read messages ([WebSockets](/reference/websockets#message-rules)). |
+| `allow` | admission rules | Forward. `upgrade: websocket` permits a WebSocket upgrade; `private_ok: true` lets the flow reach private addresses ([address floor](/reference/address-lists#address-floor)). |
+| `deny` | all rules | `deny: { status, message, close }`; status 403 by default, 4xx or 5xx. At admission: refuse ([deny responses](/reference/http#deny-responses)) and close unless `close: false`. In flight: stop the exchange ([evaluation](/design/policy-evaluation#evaluation)). On a WebSocket: close both sides, with a `1008` frame when rules read messages ([WebSockets](/reference/websockets#message-rules)). |
 | `quarantine` | all rules | A bare word, no argument. A `deny` with status 403 that closes, plus: the whole proxy is [quarantined](/guides/operations#quarantine), refusing every later exchange until released from outside. Any matching `quarantine` trips it, whichever deny decided the exchange, a fail-closed included. Needs `--state-dir`. |
 
 Non-terminal:
 
 | action | where | effect |
 |---|---|---|
-| `set_header: { name: value }` | request: head rules; response: watching rules | Set or replace. Request values may use `${secret:name}`; an invalid value denies the flow. A response rule may read only values known before the response head is sent (`response.status`, `response.header[..]`, `response.body.size`, `response.body.text`); `body.bytes`, `response.body.bytes`, `ws.*` or a byte metric is a compile error. |
+| `set_header: { name: value }` | request: admission rules; response: in-flight rules | Set or replace. Request values may use `${secret:name}`; an invalid value denies the flow. A response rule may read only values known before the response head is sent (`response.status`, `response.header[..]`, `response.body.size`, `response.body.text`); `body.bytes`, `response.body.bytes`, `ws.*` or a byte metric is a compile error. |
 | `remove_header: [names]` | as `set_header` | |
-| `rewrite_path: { match, to }` | head rules | Anchored regex (as `matches`), `$1` / `${name}` groups; `to` must start with `/`; result re-normalised. |
-| `set_query: { k: v }`, `remove_query: [k]` | head rules | |
-| `redirect: { host, port, scheme?, rewrite_host? }` | head rules | Change the upstream target. `host`: DNS name, dotted-quad IPv4 or bracketed IPv6 (`[::1]`); anything else, or port `0`, is a config error. The new IPs pass the address floor and deny lists. `Host` is unchanged unless `rewrite_host: true`, and while unchanged the request goes upstream over HTTP/1.1 (HTTP/2 needs `:authority` and `host` to agree). |
+| `rewrite_path: { match, to }` | admission rules | Anchored regex (as `matches`), `$1` / `${name}` groups; `to` must start with `/`; result re-normalised. |
+| `set_query: { k: v }`, `remove_query: [k]` | admission rules | |
+| `redirect: { host, port, scheme?, rewrite_host? }` | admission rules | Change the upstream target. `host`: DNS name, dotted-quad IPv4 or bracketed IPv6 (`[::1]`); anything else, or port `0`, is a config error. The new IPs pass the address floor and deny lists. `Host` is unchanged unless `rewrite_host: true`, and while unchanged the request goes upstream over HTTP/1.1 (HTTP/2 needs `:authority` and `host` to agree). |
 | `tag: name` | all | Sets `tag["name"]` for later rules, addons and the log. |
 | `log: { level, message }` | all | Emits a `log` flow event. |
 | `set_state: { key, value, ttl? }` | all | Writes the [state store](/reference/rate-limits#state). |
-| `capture: request \| response \| both` | head rules | Tees the exchange, as forwarded, to the [capture log](/reference/flow-log#capture). |
-| `digest: request \| response \| both` | head rules | Hashes the selected bodies, as forwarded, into the flow record's [`body_sha256`](/reference/flow-log#flow-log). Nothing is hashed without it. |
-| `sign: { aws_sigv4: { service, region, access_key_id, secret_access_key, session_token?, unsigned_payload? } }` | head rules | AWS Signature Version 4 over the forwarded request, after every other head effect ([signing AWS requests](/reference/secrets#signing-aws-requests)). |
+| `capture: request \| response \| both` | admission rules | Tees the exchange, as forwarded, to the [capture log](/reference/flow-log#capture). |
+| `digest: request \| response \| both` | admission rules | Hashes the selected bodies, as forwarded, into the flow record's [`body_sha256`](/reference/flow-log#flow-log). Nothing is hashed without it. |
+| `sign: { aws_sigv4: { service, region, access_key_id, secret_access_key, session_token?, unsigned_payload? } }` | admission rules | AWS Signature Version 4 over the forwarded request, after every other admission effect ([signing AWS requests](/reference/secrets#signing-aws-requests)). |
 
 Anything richer is an addon. `call` and `passthrough` are rejected with a
 reason naming why.
@@ -1898,7 +1901,7 @@ reason naming why.
 
 `body.text` and `response.body.text` are the only fields that buffer. If
 any rule reads `body.text`, roxy collects every request body up to
-`limits.max_inspect_body_bytes` (1 MiB) before the head decision, then
+`limits.max_inspect_body_bytes` (1 MiB) before the admission decision, then
 streams it on; `response.body.text` likewise for every response body. A
 body over the cap is unavailable: a rule reading it fails closed
 (`_fail_closed`, reason `body_too_large_to_inspect`). Raise the cap, or
@@ -1915,7 +1918,7 @@ truncated, or bytes after the end of the stream) or
 
 # Secrets
 
-`secrets:` maps names to sources. `${secret:name}` in a head rule's
+`secrets:` maps names to sources. `${secret:name}` in an admission rule's
 `set_header` value or `sign` credentials, or an addon endpoint's `headers`,
 injects the value; the client holds only a placeholder. A reference
 anywhere else is a compile error.
@@ -1947,7 +1950,7 @@ rules:
 
 ## Signing AWS requests
 
-`sign: { aws_sigv4: ... }`, a head-rule action, signs the forwarded request
+`sign: { aws_sigv4: ... }`, an admission-rule action, signs the forwarded request
 with AWS Signature Version 4, so a client holding placeholder credentials
 reaches AWS with a real signature. Credential fields take `${secret:name}` as
 `set_header` does; `session_token` is optional.
@@ -1972,7 +1975,7 @@ rules:
       - allow
 ```
 
-* **Signed:** the request as forwarded, after every other head effect
+* **Signed:** the request as forwarded, after every other admission effect
   (`set_header`, `rewrite_path`, `redirect`, ...) whatever `sign`'s
   position in `then`. The client's `authorization`, `x-amz-date`,
   `x-amz-security-token` and `x-amz-content-sha256` are removed first.
@@ -2012,7 +2015,7 @@ Values live in a store beside the compiled policy. Replacing the map swaps
 the store and rebuilds the redactor without recompiling rules, rebuilding
 addons, flushing upstream pools or a reload event. An exchange resolves
 every name, in its rules and in the `headers` of the endpoint calls its
-addons make, from the generation current at its head evaluation, so a swap
+addons make, from the generation current at its admission evaluation, so a swap
 mid-evaluation cannot pair one credential with another's replacement; an
 exchange under way keeps the generation it injected, and redacts with it,
 however many swaps follow. A name the map lacks is `secret_missing`. Values
@@ -2032,8 +2035,8 @@ Defined once, compared in rules (`metric.<id> >= 30`).
 metrics:
   - id: <string>
     count: requests | request_bytes | response_bytes | errors | denied | unique(<field>)
-    where: <expr>        # head values only, no tags: whether this exchange counts
-    key: [<field>, ...]  # scalar head fields only; omitted = one global series
+    where: <expr>        # admission values only, no tags: whether it counts
+    key: [<field>, ...]  # scalar admission fields; omitted = one global series
     window: <duration>   # omitted = cumulative since start; 0 is a compile error
     max_keys: <n>        # series this metric alone may hold; omitted = limits.max_metric_keys
 ```
@@ -2042,10 +2045,10 @@ metrics:
   store keeps 60 complete buckets plus the current partial one, so a value
   may include events up to one bucket older than the window: a limit trips
   slightly early, never late. `unique` is a HyperLogLog sketch per bucket.
-* **`where`** may read head fields, `header[..]`, `query[..]`,
+* **`where`** may read admission fields, `header[..]`, `query[..]`,
   `state[..]`, `body.text` and metrics; not `tag[..]` (counted outside the
   rules, a tag would always read false). **`key`** and the `unique(..)`
-  field take scalar head fields only (`client.ip`, `host`, `tls.sni`, ...),
+  field take scalar admission fields only (`client.ip`, `host`, `tls.sni`, ...),
   not `header[..]` or other indexed values. Anything else is a compile
   error.
 * **Nullable keys.** A flow whose key field is `null` is denied
@@ -2058,10 +2061,10 @@ metrics:
 * **When counts move.** `requests` and `denied` are read before the
   forwarding decision and incremented after it (denied flows count), so
   `metric.x >= 30` denies the 31st request. `request_bytes` and
-  `response_bytes` grow as bytes stream: a deny reading them watches and
-  stops the exchange that crosses the limit; a chunk is counted before it
-  is checked, so a budget overcounts by at most one chunk. `errors` count
-  when the exchange ends.
+  `response_bytes` grow as bytes stream: a deny reading them is re-checked
+  in flight and stops the exchange that crosses the limit; a chunk is
+  counted before it is checked, so a budget overcounts by at most one
+  chunk. `errors` count when the exchange ends.
 * **Bounds** ([never evict](/design/threat-model#never-evict)):
   `limits.max_metric_keys` (100 000) series across all metrics; each
   metric's `max_keys` (at most the shared limit, its default); and,
@@ -2277,7 +2280,7 @@ client's offer and the upstream's answer pass through untouched.
 
 ## Message rules
 
-Rules that read `ws.*` are watching rules
+Rules that read `ws.*` are in-flight rules
 ([evaluation](/design/policy-evaluation)), checked on every message after
 the `101`:
 
@@ -2307,7 +2310,7 @@ messages: `ws.opcode == 2` denies binary messages, while `ws.opcode != 1`
 also denies every ping.
 
 A matching deny closes both sides with `1008`. A rule cannot drop or edit a
-single message (that is for addons). A watching rule's `log`, `tag` and
+single message (that is for addons). An in-flight rule's `log`, `tag` and
 `set_state` effects apply once per WebSocket, the first time it matches.
 
 ### Parsing
@@ -3074,7 +3077,7 @@ key; `roxy check` refuses a key on the other kind.
 | `path` | wasm | file path | required | the component. It must exist at config load; the layer is compiled then, and cached across reloads while the file and its settings are unchanged |
 | `endpoint` | service | one of this addon's `endpoints` | required | where the service is. The exchange streams through it over pooled WebSocket connections |
 | `mode` | both | `enforce`, `observe` | `enforce` | `enforce`: the layer is in the path and its output is what goes on. `observe`: the layer gets copies and nothing it returns takes effect ([modes](/design/addon-model#modes)) |
-| `when` | both | [rule language](/reference/rule-language) condition over head fields | every exchange | runs the layer only on the exchanges it matches; the rest pass it at no cost ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)) |
+| `when` | both | [rule language](/reference/rule-language) condition over admission fields | every exchange | runs the layer only on the exchanges it matches; the rest pass it at no cost ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)) |
 | `sample` | both, observe only | number in (0, 1] | 1 | the share of matching exchanges the observer gets a copy of, drawn from the flow id |
 | `subscribe.request` | both | `head`, `full` | `full` | what the layer sees of the request: the head only, or the head and the body ([what a layer sees](/reference/addon-configuration#what-a-layer-sees)) |
 | `subscribe.response` | both | `head`, `full` | `full` | the same for the response |
@@ -3208,14 +3211,14 @@ the framing roxy knows.
 
 ### Choosing exchanges
 
-`when` is a [rule language](/reference/rule-language) condition over head
+`when` is a [rule language](/reference/rule-language) condition over admission
 fields. A layer runs only on the exchanges it matches; the rest pass it at
 no cost (no instance, no body pumping, no service session).
 
 * `when` sees the request as it reaches the layer: what the layer above
   passed on, re-validated. A layer above can steer a request into or out of
   a lower layer's `when`.
-* It may read head fields, headers, the query, `state[..]`, `metric.<id>`
+* It may read admission fields, headers, the query, `state[..]`, `metric.<id>`
   and address lists. `body.*`, `response.*` and `ws.*` are config errors.
 * `tag["x"]` sees tags set by enforce layers above, not the rules' tags
   (the rules run below the stack).
@@ -3234,7 +3237,7 @@ flow however often it is asked.
 
 The stack sits in the exchange core both fronts share: the front drives
 the client's request body into the first layer, and the last layer's
-`next` runs the rules, the upstream, then the watching rules on the
+`next` runs the rules, the upstream, then the in-flight rules on the
 response.
 
 * What a layer passes on is re-validated as strictly as a client request:
@@ -3617,12 +3620,12 @@ produces a `request` event:
 | field | meaning |
 |---|---|
 | `req.body_bytes`, `res.body_bytes` | body bytes roxy forwarded in each direction |
-| `req.body_sha256`, `res.body_sha256` | lower-case hex SHA-256 of those bytes, only for the sides a head rule's `digest` action selected ([actions](/reference/rule-language#actions)); present once the body completed, absent if the exchange ended first (a cut body, a watching stop, a client that left). An empty body has the empty-string digest; a relayed WebSocket has counts but no digests. Hashing is opt-in because a digest nobody compares against is wasted work: software SHA-256 costs about one core per 400 MB/s on CPUs without SHA-NI |
+| `req.body_sha256`, `res.body_sha256` | lower-case hex SHA-256 of those bytes, only for the sides an admission rule's `digest` action selected ([actions](/reference/rule-language#actions)); present once the body completed, absent if the exchange ended first (a cut body, an in-flight stop, a client that left). An empty body has the empty-string digest; a relayed WebSocket has counts but no digests. Hashing is opt-in because a digest nobody compares against is wasted work: software SHA-256 costs about one core per 400 MB/s on CPUs without SHA-NI |
 | `timing.upstream_connect_ms` | how long opening the upstream connection took (DNS, TCP and TLS); `null` when the request reused a pooled connection, or none was opened |
 | `timing.upstream_ttfb_ms` | from the forwarding decision to the upstream's response head |
 | `decision` | `allow`, `deny`, or `answered` when an addon layer answered itself |
 | `terminal_rule` | what decided: a rule id, or `_default`, `_fail_closed`, `_address_policy`, `_expired`, `_quarantined`, `_sign`, `_websocket` or `layer:<name>` |
-| `stage` | `head`, or where a watching rule stopped the exchange: `request_body`, `response_head`, `response_body`, `websocket` |
+| `stage` | `head`, or where an in-flight rule stopped the exchange: `request_body`, `response_head`, `response_body`, `websocket` |
 | `addons` | the layers that ran, outermost first; one skipped by its `when` or `sample` is not listed ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)) |
 | `rules`, `decision`, `terminal_rule` with addons | describe the request that left the stack; `req` is what the client sent and `res.status` what it got, which a layer above the rules may have replaced ([addons](/reference/addon-configuration#in-the-proxy)) |
 | `reason` | a stable code when the exchange failed closed or failed, by `terminal_rule`: |
@@ -3733,10 +3736,10 @@ json|pretty` and `--log-level` (or `RUST_LOG`).
 ## Capture
 
 roxy tees the heads and bodies of exchanges, exactly as forwarded, to
-`<capture_dir>/capture.rxc`: those a head rule selects with `capture:
+`<capture_dir>/capture.rxc`: those an admission rule selects with `capture:
 request | response | both`, or every forwarded exchange with
-`log.capture.all: true`. Capture is decided at the request head and covers
-the exchange from its first byte; the taps sit after the watching rules
+`log.capture.all: true`. Capture is decided at admission and covers
+the exchange from its first byte; the taps sit after the in-flight rules
 allowed a chunk. WebSocket relays are captured both ways at the relay next
 to the upstream, not as an addon layer changes them for the client.
 
@@ -4079,9 +4082,9 @@ output).
 * **Exchange / flow:** one request and its response (or one WebSocket
   session) within a client connection. Each has a ULID.
 * **Canonical:** roxy's validated, normalised, version-agnostic HTTP model.
-* **Head rule / watching rule:** decided at the request head (can allow or
-  deny) versus reading values known only later (can only deny or add
-  effects).
+* **Admission rule / in-flight rule:** decided before the request is
+  forwarded (can allow or deny) versus re-checked as the exchange streams,
+  reading values known only then (can only deny or add effects).
 * **Policy:** a compiled, immutable snapshot of the config, swapped
   atomically on reload.
 * **Layer:** one addon in the stack.

@@ -40,6 +40,6 @@ The canonical request, as in `roxy run`:
 | `--metric id=value` | a metric's value; unset metrics are 0, `--metric id=unavailable` exercises the fail-closed path, and an id the config does not define gets a warning |
 | `--state key=value` | an entry in the state store |
 | `--tag name` | a tag, before the rules run |
-| `--body-bytes`, `--response-body-bytes` | the byte counts, running the watching rules that read them |
+| `--body-bytes`, `--response-body-bytes` | the byte counts, running the in-flight rules that read them |
 | `--response-status`, `--response-header` | the response head, running the rules that read it (`--response-header` on its own runs nothing) |
 | `--ws-text`, `--ws-opcode`, `--ws-size`, `--ws-direction` | one WebSocket message, running the rules that read `ws.*` |

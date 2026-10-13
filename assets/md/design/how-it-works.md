@@ -1,6 +1,6 @@
 # How roxy works
 
-<img src={howItWorks} alt="One exchange through roxy, top to bottom. The client's request enters roxy and passes through four stages: decrypt and parse (CONNECT, TLS, strict parse into the canonical request, and the lease check), the addon stack (enforce layers in order, with observers beside them on a copy), the rules (deny wins; effects: secrets, headers, redirect, sign) and connect (DNS, address floor, upstream TLS), then reaches the upstream. The response returns up the same stages: re-framed by the connector, watched by the rules, seen by the addons, and canonically re-serialised to the client. Each stage has an exit branching to the right: a parse failure is refused with parse_error, an expired policy denies with _expired, an addon can answer the client directly or deny with layer:name, the rules deny with the rule id, and the address floor denies with _address_policy. A flow-log strip down the right edge is fed by every stage and every exit: one record per exchange, never dropped." />
+<img src={howItWorks} alt="One exchange through roxy, top to bottom. The client's request enters roxy and passes through four stages: decrypt and parse (CONNECT, TLS, strict parse into the canonical request, and the lease check), the addon stack (enforce layers in order, with observers beside them on a copy), the rules (deny wins; effects: secrets, headers, redirect, sign) and connect (DNS, address floor, upstream TLS), then reaches the upstream. The response returns up the same stages: re-framed by the connector, re-checked by the rules, seen by the addons, and canonically re-serialised to the client. Each stage has an exit branching to the right: a parse failure is refused with parse_error, an expired policy denies with _expired, an addon can answer the client directly or deny with layer:name, the rules deny with the rule id, and the address floor denies with _address_policy. A flow-log strip down the right edge is fed by every stage and every exit: one record per exchange, never dropped." />
 
 An exchange is one request and its response. Every exchange takes the same
 path, whichever way roxy is deployed.
@@ -39,10 +39,10 @@ the rules judge that as if the client had sent it
 
 The rules are a list of allows plus the denies that restrict them, in one
 YAML file. A matching deny always wins, and anything no rule allows is
-denied. The forwarding decision is made at the request head; rules that
-read the bodies or the response keep watching as they stream, and can
-still stop the exchange. Metrics give rate limits and byte budgets
-([policy evaluation](/design/policy-evaluation)).
+denied. The forwarding decision is made before the request goes upstream;
+rules that read the bodies or the response are re-checked in flight as they
+stream, and can still stop the exchange. Metrics give rate limits and byte
+budgets ([policy evaluation](/design/policy-evaluation)).
 
 ```yaml
 secrets:
@@ -59,13 +59,13 @@ rules:
       - set_header: { authorization: "Bearer ${secret:openai}" }   # the client never sees the key
       - allow
 
-  - id: upload-cap                         # watches the body as it streams
+  - id: upload-cap                         # re-checked as the body streams
     when: host == "api.openai.com" and body.bytes > 10mb
     then: { deny: { status: 413 } }
 ```
 
 The request steps run in a fixed order: a bounded body buffer only when a
-rule reads `body.text`, then the head decision and its effects. The only
+rule reads `body.text`, then the admission decision and its effects. The only
 verdict that leads to the upstream is `Continue`; every error maps to a
 deny or a close. The steps are not an extension point: extensions are
 addons, above them.
@@ -82,8 +82,8 @@ does ([upstream](/reference/upstream),
 
 When the response head arrives, the response steps run: a bounded buffer
 of the response body only when a rule reads `response.body.text`, then the
-watching rules, which may still stop the exchange or change the head. As
-body bytes stream the watcher re-checks those rules, records byte metrics,
+in-flight rules, which may still stop the exchange or change the head. As
+body bytes stream roxy re-checks those rules, records byte metrics,
 and holds each chunk until the flow log is ready. The response is re-framed
 for the client and passes back up the addon stack.
 
