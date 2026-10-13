@@ -3,9 +3,11 @@
 //! is ever written here; secrets and the rendered config stay in memory.
 //! A roxy run from a config file uses the same layout for the marker alone.
 //!
-//! Every file in it is written by [`write_atomic`], the one place that knows
-//! how to replace a file so that a crash at any point leaves either the old
-//! file or the new one, with the mode asked for.
+//! Every file this dir replaces (identity, flow sequence, marker) goes
+//! through [`write_atomic`], the one place that knows how to replace a file
+//! so that a crash at any point leaves either the old file or the new one,
+//! with the mode asked for. The CA dir's files are created once and never
+//! replaced, so `roxy-tls` writes them exclusively instead.
 
 use std::ffi::OsString;
 use std::io;
