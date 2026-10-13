@@ -89,6 +89,24 @@ The Claude PR review reads this section. Check, in this order:
 5. **Fit.** Naming, comment density and error style match the surrounding
    code. Comments explain why and don't link to docs pages.
 
+Confirming that the PR does what its description says is not a review. For
+each change, try to construct the case it gets wrong:
+
+- **Read the text the change produces, not just that it exists.** For a
+  diagnostic, error message or docs passage, check the advice works for
+  every case it is shown for. A remediation that fits one field in a list
+  of five is a bug. A caveat about `deny` that applies equally to `allow`
+  is incomplete.
+- **Check enumerations are complete.** A list of fields, encodings or
+  guards should cover the whole class: raw and encoded forms, both
+  directions of a rule, every field with the same property.
+- **Find the other copies.** A changed list, limit, message or contract is
+  usually stated in more than one place: a private and a public doc
+  comment, a docs page, a test asserting the message. Grep for the old
+  wording and check every hit.
+
 Lint, formatting and warnings are CI's job, so don't comment on them. Raise
 out-of-scope problems as a suggested follow-up issue rather than asking the
-PR to grow. Say which findings block and which are optional.
+PR to grow. Say which findings block and which are optional. If another
+reviewer has posted findings, say for each one whether you agree, and why
+if you don't.

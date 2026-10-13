@@ -42,7 +42,11 @@ jobs:
             once rather than posting a new inline comment.
 
             Review the PR against the "Reviewing a pull request" section of
-            CLAUDE.md, which sets this repo's priorities.
+            CLAUDE.md, which sets this repo's priorities. Approve only after
+            you have looked for a counter-example yourself and found none;
+            agreeing with the PR description is not that. If Copilot or
+            another reviewer has posted findings, evaluate each one and say
+            whether you agree.
 
             Provide detailed feedback using inline comments for specific issues.
             Use top-level comments for general observations or praise. 
