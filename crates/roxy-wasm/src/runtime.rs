@@ -78,6 +78,26 @@ impl WasmRuntime {
         })
     }
 
+    /// Compiles `wasm` (a component) on the blocking thread pool. `layer`
+    /// names the layer in errors.
+    pub async fn compile(&self, layer: &str, wasm: Vec<u8>) -> Result<CompiledLayer, LoadError> {
+        let engine = self.engine.clone();
+        let component = tokio::task::spawn_blocking(move || Component::new(&engine, &wasm))
+            .await
+            .map_err(|e| LoadError::Compile {
+                layer: layer.to_owned(),
+                message: e.to_string(),
+            })?
+            .map_err(|e| LoadError::Compile {
+                layer: layer.to_owned(),
+                message: format!("{e:#}"),
+            })?;
+        Ok(CompiledLayer {
+            runtime: self.clone(),
+            component,
+        })
+    }
+
     fn linker(&self) -> Result<Linker<StoreState>, String> {
         type Me = wasmtime::component::HasSelf<StoreState>;
         let mut linker = Linker::new(&self.engine);
@@ -168,42 +188,57 @@ fn epoch_yield(_: StoreContextMut<'_, StoreState>) -> wasmtime::Result<wasmtime:
     Ok(wasmtime::UpdateDeadline::Yield(1))
 }
 
+/// A compiled component, bound to the engine that compiled it. Cheap to
+/// clone: layers started from clones share the compiled code, so a blob
+/// loaded under several configs costs one compile.
+#[derive(Clone)]
+pub struct CompiledLayer {
+    runtime: WasmRuntime,
+    component: Component,
+}
+
+impl std::fmt::Debug for CompiledLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledLayer").finish_non_exhaustive()
+    }
+}
+
+/// Rejects limits a layer cannot run under.
+fn check_limits(config: &LayerConfig) -> Result<(), LoadError> {
+    let limits = &config.limits;
+    let message = if limits.max_instances == 0 {
+        "max_instances must be at least 1"
+    } else if limits.first_byte_timeout.is_zero() {
+        "first_byte_timeout must be positive"
+    } else {
+        return Ok(());
+    };
+    Err(LoadError::Limits {
+        layer: config.name.clone(),
+        message: message.to_owned(),
+    })
+}
+
 impl Layer {
     /// Compiles `wasm` (a component) and starts one instance, running its
     /// `init`, so a bad layer fails the config load rather than the first
-    /// exchange. Compilation runs on the blocking thread pool.
+    /// exchange: [`WasmRuntime::compile`] then [`Layer::start`].
     pub async fn load(
         runtime: &WasmRuntime,
         wasm: Vec<u8>,
         config: LayerConfig,
     ) -> Result<Layer, LoadError> {
+        check_limits(&config)?;
+        let compiled = runtime.compile(&config.name, wasm).await?;
+        Self::start(compiled, config).await
+    }
+
+    /// Links `compiled` against the host and starts one instance, running
+    /// its `init`.
+    pub async fn start(compiled: CompiledLayer, config: LayerConfig) -> Result<Layer, LoadError> {
+        check_limits(&config)?;
         let layer = config.name.clone();
-        let limits = &config.limits;
-        if limits.max_instances == 0 {
-            return Err(LoadError::Limits {
-                layer,
-                message: "max_instances must be at least 1".to_owned(),
-            });
-        }
-        if limits.first_byte_timeout.is_zero() {
-            return Err(LoadError::Limits {
-                layer,
-                message: "first_byte_timeout must be positive".to_owned(),
-            });
-        }
-
-        let engine = runtime.engine.clone();
-        let component = tokio::task::spawn_blocking(move || Component::new(&engine, &wasm))
-            .await
-            .map_err(|e| LoadError::Compile {
-                layer: layer.clone(),
-                message: e.to_string(),
-            })?
-            .map_err(|e| LoadError::Compile {
-                layer: layer.clone(),
-                message: format!("{e:#}"),
-            })?;
-
+        let CompiledLayer { runtime, component } = compiled;
         let linker = runtime.linker().map_err(LoadError::Engine)?;
         let pre = linker
             .instantiate_pre(&component)
@@ -220,7 +255,7 @@ impl Layer {
 
         let max_instances = config.limits.max_instances;
         let inner = Arc::new(LayerInner {
-            runtime: runtime.clone(),
+            runtime,
             shared: Arc::new(LayerShared { config }),
             pre,
             handler,
