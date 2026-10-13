@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="680" viewBox="0 0 800 680" font-family="Inter, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13">
+  <defs>
+    <marker id="req" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"/>
+    </marker>
+    <marker id="res" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5f6b68"/>
+    </marker>
+    <marker id="thin" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7e8986"/>
+    </marker>
+  </defs>
+
+  <!-- client and upstream -->
+  <rect x="215" y="14" width="200" height="36" rx="18" fill="#f3f5f4" stroke="#cfd4d2"/>
+  <text x="315" y="37" fill="#16201e" font-weight="600" text-anchor="middle">client</text>
+  <rect x="215" y="618" width="200" height="36" rx="18" fill="#f3f5f4" stroke="#cfd4d2"/>
+  <text x="315" y="641" fill="#16201e" font-weight="600" text-anchor="middle">upstream</text>
+
+  <!-- roxy -->
+  <rect x="116" y="70" width="398" height="528" rx="10" fill="#ffffff" stroke="#0f766e" stroke-width="1.5"/>
+  <text x="130" y="88" fill="#0f766e" font-weight="600">roxy</text>
+
+  <!-- stages -->
+  <g stroke="#cfd4d2" fill="#f3f5f4">
+    <rect x="130" y="100" width="370" height="96" rx="6"/>
+    <rect x="130" y="236" width="370" height="104" rx="6"/>
+    <rect x="130" y="380" width="370" height="84" rx="6"/>
+    <rect x="130" y="504" width="370" height="84" rx="6"/>
+  </g>
+  <g fill="#16201e" font-weight="600" text-anchor="middle">
+    <text x="315" y="122">decrypt and parse</text>
+    <text x="315" y="256">addons</text>
+    <text x="315" y="402">rules</text>
+    <text x="315" y="526">connect</text>
+  </g>
+  <g fill="#7e8986" font-size="11" text-anchor="middle">
+    <text x="315" y="140">CONNECT · TLS · strict parse → canonical request</text>
+    <text x="315" y="158">lease still valid</text>
+    <text x="315" y="184">response: canonical re-serialisation to the client</text>
+    <text x="315" y="420">deny wins · effects: secrets, headers, redirect, sign</text>
+    <text x="315" y="438">response: watching rules on the head and bodies</text>
+    <text x="315" y="544">DNS · address floor · upstream TLS</text>
+    <text x="315" y="562">response: re-framed, streamed back up the stack</text>
+  </g>
+
+  <!-- addon stack: enforce layers in the path, observers beside it on a copy -->
+  <rect x="146" y="268" width="274" height="58" rx="6" fill="#ffffff" stroke="#cfd4d2"/>
+  <text x="283" y="291" fill="#16201e" font-weight="600" font-size="12" text-anchor="middle">enforce layers, in order</text>
+  <text x="283" y="308" fill="#7e8986" font-size="11" text-anchor="middle">rewrite · withhold · answer · block</text>
+  <rect x="432" y="268" width="54" height="58" rx="6" fill="#ffffff" stroke="#cfd4d2" stroke-dasharray="4 3"/>
+  <text x="459" y="292" fill="#16201e" font-weight="600" font-size="11" text-anchor="middle">observer</text>
+  <text x="459" y="307" fill="#7e8986" font-size="10" text-anchor="middle">a copy</text>
+  <line x1="420" y1="297" x2="430" y2="297" stroke="#7e8986" stroke-dasharray="3 3" marker-end="url(#thin)"/>
+
+  <!-- request down, response up -->
+  <g fill="none" stroke-width="2" stroke-linejoin="round">
+    <g stroke="#0f766e" marker-end="url(#req)">
+      <path d="M 235 50 V 98"/>
+      <path d="M 235 196 V 234"/>
+      <path d="M 235 340 V 378"/>
+      <path d="M 235 464 V 502"/>
+      <path d="M 235 588 V 616"/>
+    </g>
+    <g stroke="#5f6b68" marker-end="url(#res)">
+      <path d="M 395 618 V 590"/>
+      <path d="M 395 504 V 466"/>
+      <path d="M 395 380 V 342"/>
+      <path d="M 395 236 V 198"/>
+      <path d="M 395 100 V 52"/>
+    </g>
+  </g>
+  <text x="229" y="67" fill="#0f766e" font-size="11" font-weight="600" text-anchor="end">request</text>
+  <text x="401" y="67" fill="#5f6b68" font-size="11" font-weight="600">response</text>
+
+  <!-- exits: each a branch to the right -->
+  <g fill="none" stroke="#5f6b68" stroke-width="2" marker-end="url(#res)">
+    <path d="M 500 122 H 546"/>
+    <path d="M 500 158 H 546"/>
+    <path d="M 500 256 H 546"/>
+    <path d="M 500 297 H 546"/>
+    <path d="M 500 402 H 546"/>
+    <path d="M 500 526 H 546"/>
+  </g>
+  <g fill="#ffffff" stroke="#5f6b68">
+    <rect x="548" y="108" width="192" height="28" rx="6"/>
+    <rect x="548" y="144" width="192" height="28" rx="6"/>
+    <rect x="548" y="242" width="192" height="28" rx="6"/>
+    <rect x="548" y="283" width="192" height="28" rx="6"/>
+    <rect x="548" y="388" width="192" height="28" rx="6"/>
+    <rect x="548" y="512" width="192" height="28" rx="6"/>
+  </g>
+  <g fill="#5f6b68" font-size="11" text-anchor="middle">
+    <text x="644" y="126">parse fails → refused (parse_error)</text>
+    <text x="644" y="162">expired → deny (_expired)</text>
+    <text x="644" y="260">answers → response to the client</text>
+    <text x="644" y="301">denies → deny (layer:name)</text>
+    <text x="644" y="406">denies → deny (rule id)</text>
+    <text x="644" y="530" font-size="10">address floor → deny (_address_policy)</text>
+  </g>
+
+  <!-- flow log: every stage and every exit feeds it -->
+  <g stroke="#cfd4d2" stroke-dasharray="3 3">
+    <line x1="500" y1="186" x2="752" y2="186"/>
+    <line x1="500" y1="330" x2="752" y2="330"/>
+    <line x1="500" y1="454" x2="752" y2="454"/>
+    <line x1="500" y1="578" x2="752" y2="578"/>
+    <line x1="740" y1="122" x2="752" y2="122"/>
+    <line x1="740" y1="158" x2="752" y2="158"/>
+    <line x1="740" y1="256" x2="752" y2="256"/>
+    <line x1="740" y1="297" x2="752" y2="297"/>
+    <line x1="740" y1="402" x2="752" y2="402"/>
+    <line x1="740" y1="526" x2="752" y2="526"/>
+  </g>
+  <rect x="752" y="100" width="36" height="488" rx="19" fill="#f8f9f8" stroke="#e6e8e7"/>
+  <text transform="translate(774 344) rotate(-90)" fill="#3d4846" text-anchor="middle">flow log: one record per exchange, never dropped</text>
+</svg>

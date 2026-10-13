@@ -1,0 +1,109 @@
+# HTTP gateway
+
+An `http` listener lets roxy stand in for an origin. Clients send ordinary
+requests to a name that resolves to roxy, and per-host rules decide where
+each one goes and what to add. The example here is an LLM gateway: clients
+hold placeholder keys, roxy holds the real ones and injects them on the way
+out, and an addon says who is calling.
+
+<img src={gateway} alt="An example gateway. Clients send HTTPS requests to a load balancer that terminates TLS and forwards plain HTTP to roxy's http listener on port 8080. Inside roxy the request streams through an auth service addon, which asks an auth service over a WebSocket who the client is and gets back allow, user=alice, or answers 401 if the caller is unknown. Then the rules route by host and inject roxy's own secrets: requests for anthropic.gw.example.com go on over HTTPS to api.anthropic.com with x-api-key added from roxy's secrets, and requests for openai.gw.example.com to api.openai.com with a bearer key added the same way. Responses return by the same path." />
+
+## The pattern
+
+`*.gw.example.com` points at a load balancer, which terminates TLS and
+forwards plain HTTP to roxy. roxy sees each request with scheme `http` and
+the `Host` the client sent. One rule per subdomain `redirect`s the request
+to its provider over `https` and `set_header`s the real key in place of
+whatever the client sent; anything no rule matches is denied.
+
+```yaml
+version: 1
+
+listeners:
+  - name: gateway
+    mode: http
+    bind: 0.0.0.0:8080
+
+secrets:
+  anthropic: { env: ANTHROPIC_API_KEY }
+  openai:    { env: OPENAI_API_KEY }
+  aws_akid:  { env: AWS_ACCESS_KEY_ID }
+  aws_sk:    { env: AWS_SECRET_ACCESS_KEY }
+
+rules:
+  - id: anthropic
+    when: listener.name == "gateway" and host == "anthropic.gw.example.com" and path starts_with "/v1/"
+    then:
+      - redirect: { host: api.anthropic.com, port: 443, scheme: https, rewrite_host: true }
+      - set_header: { x-api-key: "${secret:anthropic}" }
+      - allow
+
+  - id: openai
+    when: listener.name == "gateway" and host == "openai.gw.example.com" and path starts_with "/v1/"
+    then:
+      - redirect: { host: api.openai.com, port: 443, scheme: https, rewrite_host: true }
+      - set_header: { authorization: "Bearer ${secret:openai}" }
+      - allow
+
+  - id: bedrock
+    when: listener.name == "gateway" and host == "bedrock.gw.example.com" and path starts_with "/model/"
+    then:
+      - redirect: { host: bedrock-runtime.eu-west-2.amazonaws.com, port: 443, scheme: https, rewrite_host: true }
+      - sign:
+          aws_sigv4:
+            service: bedrock
+            region: eu-west-2
+            access_key_id: "${secret:aws_akid}"
+            secret_access_key: "${secret:aws_sk}"
+      - allow
+```
+
+`rewrite_host: true` sends the provider's name in `Host`, which the
+provider expects and which lets the upstream connection use HTTP/2
+([`redirect`](/reference/rule-language#actions)). Bedrock wants a
+signature rather than a key: `sign` covers the request as forwarded, after
+the `redirect`, so the signature is over the host AWS sees
+([signing AWS requests](/reference/secrets#signing-aws-requests)).
+
+From here an exchange is the same as on a proxy port: rate limits, body
+rules, addons, the address floor and the flow log all apply
+([how roxy works](/design/how-it-works)).
+
+## Authenticating clients
+
+The listener adds no authentication: a client is whoever reaches it, and
+the rules see that as `listener.name` and `client.ip`. Authenticate at the
+load balancer, or with an addon on the listener that checks a credential,
+tags the flow `user:<name>` and strips the header, as the quickstart's auth
+gate does ([what just happened](/quickstart#what-just-happened)). The API
+key still comes from roxy's secrets, injected by the rule, and the layers
+below see the tag, so a per-user quota is another addon.
+
+## What to know
+
+* **This is not containment.** The listener serves whoever reaches it, and
+  the clients may have other routes out
+  ([threat model](/design/threat-model#which-use-case-claims-what)).
+* **`client.ip` is the load balancer's address.** Rules and the flow log
+  see the connection roxy accepted, not the original client. roxy reads no
+  forwarded-for header. Every client therefore shares one source IP, so
+  `limits.max_connections_per_client` caps the whole gateway: leave it
+  unset (it follows `max_connections`) or raise it with the fleet
+  ([limits](/reference/limits#connections)).
+* **TLS stays in front.** roxy does not terminate TLS on an `http`
+  listener; a client that starts a handshake is closed
+  (`tls_on_http_listener`). Keep the hop from the load balancer to roxy on a
+  network you trust, since it carries the clients' requests in the clear.
+  Clients trust the load balancer's certificate; roxy's CA plays no part.
+* **In-cluster upstreams are private addresses.** The address floor denies
+  RFC 1918 and the other private ranges by default, so a rule that forwards
+  to a service on the cluster network needs `private_ok: true` on its
+  `allow`: `then: { allow: { private_ok: true } }`
+  ([address floor](/reference/address-lists#address-floor)).
+* **Health checks** come from `ca_server` as usual
+  ([health](/guides/operations#health)).
+* **Leave `quarantine_on` off.** A
+  [quarantine](/guides/operations#quarantine) shuts the whole process, so
+  on a gateway one client's malformed requests would refuse every other
+  client until an operator intervened. The same goes for the `quarantine`
+  action in a gateway's rules.
