@@ -764,7 +764,7 @@ impl FlowCx {
         (out, refusal)
     }
 
-    /// Records the exchange's head metric sample, once the admission step's
+    /// Records the exchange's admission metric sample, once the admission step's
     /// outcome is settled (`denied`).
     fn record_admission_sample(&self, denied: bool) -> Result<(), MetricSourceError> {
         let view = ProxyView::new(
