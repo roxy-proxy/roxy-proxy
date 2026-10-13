@@ -123,7 +123,8 @@ pub struct LayerLimits {
     /// Instances of this layer alive at once, which is also the number of
     /// exchanges it runs concurrently (each exchange holds an instance
     /// until it ends). With `max_memory`, it bounds the layer's memory. An
-    /// exchange that finds none free waits for one, without a deadline.
+    /// exchange that finds none free waits `first_byte_timeout` for one,
+    /// then fails closed.
     pub max_instances: usize,
 }
 

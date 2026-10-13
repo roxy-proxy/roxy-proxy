@@ -25,7 +25,7 @@ use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::BodyExt as _;
 use roxy_http::{Body, BodyError};
-use roxy_wasm::{HostError, LayerError, LayerRequest, LayerResponse, SlotWait};
+use roxy_wasm::{HostError, LayerError, LayerRequest, LayerResponse};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -422,9 +422,8 @@ pub(crate) async fn observe(
         index,
         observer: Some(next),
     });
-    let wait = SlotWait::Within(layer.limits().first_byte_timeout);
     tokio::spawn(async move {
-        let result = match layer.handle_waiting(host, copy_req, wait).await {
+        let result = match layer.handle(host, copy_req).await {
             // The copy went with the request: its queued frames are back in
             // the budget, and the real exchange never waited.
             Err(LayerError::NoInstance) => {

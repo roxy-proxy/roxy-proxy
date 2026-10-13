@@ -145,17 +145,6 @@ impl LayerInner {
     }
 }
 
-/// How long an exchange may wait for a free instance when all
-/// `max_instances` are busy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlotWait {
-    /// Until one is free: the exchange is slow, never refused.
-    Unbounded,
-    /// At most this long; past it the exchange fails with
-    /// [`LayerError::NoInstance`].
-    Within(Duration),
-}
-
 /// A compiled layer with its instance pool. Cheap to clone; clones share
 /// the pool.
 #[derive(Clone)]
@@ -353,27 +342,22 @@ impl Layer {
     }
 
     /// Takes an idle instance or starts a new one, once a slot is free.
-    /// Waiting for a slot is bounded only by `wait`; starting an instance
-    /// must finish within `first_byte_timeout`, and counts towards it.
-    /// Returns when the head clock started.
-    async fn checkout(
-        &self,
-        wait: SlotWait,
-    ) -> Result<(Instance, OwnedSemaphorePermit, Instant), LayerError> {
-        let acquire = self.inner.slots.clone().acquire_owned();
-        let permit = match wait {
-            SlotWait::Unbounded => acquire.await,
-            SlotWait::Within(d) => timeout(d, acquire)
-                .await
-                .map_err(|_| LayerError::NoInstance)?,
-        }
-        .map_err(|_| LayerError::Cancelled)?;
+    /// The wait for a slot has its own `first_byte_timeout`, so the
+    /// exchanges holding every instance cannot queue the layer's other
+    /// clients behind them indefinitely; starting an instance must then
+    /// finish within a fresh one, which the head clock continues. Returns
+    /// when the head clock started.
+    async fn checkout(&self) -> Result<(Instance, OwnedSemaphorePermit, Instant), LayerError> {
+        let limit = self.inner.shared.config.limits.first_byte_timeout;
+        let permit = timeout(limit, self.inner.slots.clone().acquire_owned())
+            .await
+            .map_err(|_| LayerError::NoInstance)?
+            .map_err(|_| LayerError::Cancelled)?;
         let started = Instant::now();
         let idle = self.inner.idle().pop();
         let instance = if let Some(i) = idle {
             i
         } else {
-            let limit = self.inner.shared.config.limits.first_byte_timeout;
             self.instantiate(started + limit).await?
         };
         Ok((instance, permit, started))
@@ -410,24 +394,16 @@ impl Layer {
     /// in the response's extensions reports why. Any `Err` here must be
     /// turned into a deny (invariant 3).
     ///
+    /// When all `max_instances` are busy the exchange waits at most
+    /// `first_byte_timeout` for one; past that it fails with
+    /// [`LayerError::NoInstance`] before the layer has seen it.
+    ///
     /// Dropping the future, or the response body before it ends, cancels
     /// the exchange and discards the instance.
     pub async fn handle(
         &self,
         host: Arc<dyn LayerHost>,
         req: LayerRequest,
-    ) -> Result<LayerResponse, LayerError> {
-        self.handle_waiting(host, req, SlotWait::Unbounded).await
-    }
-
-    /// [`Self::handle`], waiting at most `wait` for a free instance when
-    /// all `max_instances` are busy; past that the exchange fails with
-    /// [`LayerError::NoInstance`] before the layer has seen it.
-    pub async fn handle_waiting(
-        &self,
-        host: Arc<dyn LayerHost>,
-        req: LayerRequest,
-        wait: SlotWait,
     ) -> Result<LayerResponse, LayerError> {
         let limits = &self.inner.shared.config.limits;
 
@@ -442,7 +418,7 @@ impl Layer {
             .cloned()
             .ok_or_else(|| LayerError::InvalidRequest("request URI has no authority".into()))?;
 
-        let (mut instance, permit, started) = self.checkout(wait).await?;
+        let (mut instance, permit, started) = self.checkout().await?;
         let shared = ExchangeShared::new(host.clone());
         let (tx, mut rx) = oneshot::channel();
         let (parts, body) = req.into_parts();

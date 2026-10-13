@@ -22,7 +22,7 @@ accept and the upstream connect produces a deny response or a closed socket
 | upstream DNS, connect or TLS failure | `502`, `upstream_error` |
 | upstream connect, TLS handshake or response-header timeout | `504`, `upstream_error`, reason `timeout` |
 | address floor | `403`, `_address_policy` |
-| addon trap, budget exceeded or invalid output (enforce mode) | deny, `layer_error`; observe-mode addons only log |
+| addon trap, budget exceeded, invalid output, or no instance free within `first_byte_timeout` (enforce mode) | deny, `layer_error`; observe-mode addons only log |
 | config reload fails | keep the old policy |
 | connection cap | refuse the new connection |
 | flow log or capture behind, or its disk failing | hold traffic until it catches up; never drop records |
