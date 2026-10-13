@@ -1073,9 +1073,10 @@ enum HostPos {
 }
 
 /// Rejects a literal that no `host` or `tls.sni` can match: hosts arrive
-/// as ASCII A-labels, without a trailing dot, and IPv6 without brackets.
-/// Case is not checked, as host comparisons are case-insensitive. Regexes
-/// (`matches`) are not checked: dots and brackets are syntax there.
+/// as ASCII A-labels, without a trailing dot, IPv6 without brackets, and
+/// an IPv4-mapped IPv6 address as the IPv4 address it embeds. Case is not
+/// checked, as host comparisons are case-insensitive. Regexes (`matches`)
+/// are not checked: dots and brackets are syntax there.
 fn check_host_literal(
     field: &Typed<'_>,
     lit: &str,
@@ -1113,6 +1114,18 @@ fn check_host_literal(
             format!(
                 "`{name}` never has a trailing dot, so {lit:?} never matches; write {:?}",
                 lit.trim_end_matches('.')
+            ),
+        ));
+    }
+    if pos == HostPos::Whole
+        && let Ok(std::net::IpAddr::V6(v6)) = lit.parse::<std::net::IpAddr>()
+        && let Some(v4) = v6.to_ipv4_mapped()
+    {
+        return Err(ExprError::new(
+            span,
+            format!(
+                "`{name}` carries an IPv4-mapped address as the IPv4 address it embeds, so \
+                 {lit:?} never matches; write \"{v4}\""
             ),
         ));
     }

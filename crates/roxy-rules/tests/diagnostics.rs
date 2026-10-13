@@ -33,7 +33,7 @@ const CASES: &[(&str, &str, &str)] = &[
     (
         "host literal that can never match",
         "",
-        "- { id: a, when: 'host == \"evil.example.\"', then: deny }\n- { id: b, when: 'host in [\"ok.example\", \"evil.example.\"]', then: deny }\n- { id: c, when: 'host like \"*.example.com.\"', then: deny }\n- { id: d, when: 'host == \"b\u{fc}cher.example\"', then: deny }\n- { id: e, when: 'host == \"[::1]\"', then: deny }\n- { id: f, when: '\"evil.example.\" != host', then: deny }\n- { id: g, when: 'host ends_with \".example.\"', then: deny }\n- { id: h, when: 'tls.sni starts_with \"[fe80\"', then: deny }\n- { id: i, when: 'host under \"caf\u{e9}.example\"', then: deny }",
+        "- { id: a, when: 'host == \"evil.example.\"', then: deny }\n- { id: b, when: 'host in [\"ok.example\", \"evil.example.\"]', then: deny }\n- { id: c, when: 'host like \"*.example.com.\"', then: deny }\n- { id: d, when: 'host == \"b\u{fc}cher.example\"', then: deny }\n- { id: e, when: 'host == \"[::1]\"', then: deny }\n- { id: f, when: '\"evil.example.\" != host', then: deny }\n- { id: g, when: 'host ends_with \".example.\"', then: deny }\n- { id: h, when: 'tls.sni starts_with \"[fe80\"', then: deny }\n- { id: i, when: 'host under \"caf\u{e9}.example\"', then: deny }\n- { id: j, when: 'host == \"::ffff:93.184.216.34\"', then: deny }\n- { id: k, when: 'host in [\"::FFFF:203.0.113.7\", \"ok.example\"]', then: deny }",
     ),
     (
         "null compared with a field that is never null",

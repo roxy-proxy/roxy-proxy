@@ -408,10 +408,8 @@ async fn a_deny_list_is_a_floor_private_ok_does_not_bypass() {
         .await;
     assert_eq!(a.status, 403, "{a:?}");
     let ev = kit.events("upstream_denied", 4).await;
-    for (e, host) in ev
-        .iter()
-        .zip(["up.test", UP_IP, &format!("::ffff:{UP_IP}"), "up.test"])
-    {
+    // The mapped spelling is parsed as the IPv4 address it embeds.
+    for (e, host) in ev.iter().zip(["up.test", UP_IP, UP_IP, "up.test"]) {
         assert_eq!(e["list"], "blocked", "{e}");
         assert_eq!(e["reason"], "list:blocked", "{e}");
         assert_eq!(e["matched_cidr"], format!("{UP_IP}/32"), "{e}");
@@ -427,6 +425,32 @@ async fn a_deny_list_is_a_floor_private_ok_does_not_bypass() {
         kit.upstream.seen().is_empty(),
         "nothing reached the upstream"
     );
+}
+
+/// A `deny` on an IPv4 literal host also catches the IPv4-mapped IPv6
+/// spelling of the same address: the host is parsed as the IPv4 address,
+/// so the rule, the flow log and the dial all see one form.
+#[tokio::test]
+async fn a_deny_on_an_ipv4_host_catches_its_mapped_spelling() {
+    let kit = Kit::builder()
+        .rules(&format!(
+            "- id: bad-ip\n  when: host == \"{UP_IP}\"\n  then: {{ deny: {{ status: 451 }} }}\n\
+             - id: rest\n  when: port in [80, 443]\n  then: allow\n"
+        ))
+        .start()
+        .await;
+    for host in [
+        UP_IP.to_owned(),
+        format!("[::ffff:{UP_IP}]"),
+        format!("[::FFFF:{UP_IP}]"),
+    ] {
+        let a = get(&kit, &host, "/").await;
+        assert_eq!(a.status, 451, "{host}: {a:?}");
+        assert_eq!(a.headers["x-roxy-rule"], "bad-ip", "{host}");
+    }
+    let ev = kit.events("request", 3).await;
+    assert!(ev.iter().all(|e| e["req"]["host"] == UP_IP), "{ev:#?}");
+    assert!(kit.upstream.seen().is_empty());
 }
 
 /// `client.ip in @list` and `not in @list` use the loaded lists; an IPv4

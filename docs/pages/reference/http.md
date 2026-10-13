@@ -158,6 +158,10 @@ the others refuse for the same reason.
 - Exactly one `Host`, matching the URI authority (absolute-form) or the
   CONNECT host (tunnel); on an `http` listener it names the target. An
   HTTP/1.0 absolute-form request may omit it.
+- A host is a DNS name of A-labels, a strict dotted-quad IPv4 literal or a
+  bracketed IPv6 literal. An IPv4-mapped IPv6 literal (`[::ffff:a.b.c.d]`)
+  is the IPv4 address it embeds and is parsed, matched, logged and
+  forwarded as `a.b.c.d`.
 - At most one `Content-Length`, digits only, at most 19 digits; a duplicate
   is rejected even with equal values. A non-zero length declared for a body
   that has already ended (a layer passing `content-length` with an empty
