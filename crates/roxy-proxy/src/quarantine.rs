@@ -87,7 +87,9 @@ impl TripCounter {
     pub(crate) fn new(threshold: ParseErrorThreshold) -> Self {
         Self {
             threshold,
-            hits: Mutex::new(VecDeque::with_capacity(threshold.count as usize)),
+            // Grows to `count` as hits arrive; `count` is unbounded in the
+            // config, so nothing is reserved up front.
+            hits: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -224,15 +226,17 @@ impl QuarantineState {
             cause,
         });
         self.active.store(Some(fresh.clone()));
-        let persisted = match &self.marker {
-            Some(path) => write_marker(path, &fresh),
-            None => Ok(()),
-        };
+        // The cut starts now, not after the marker write: a stalled disk
+        // must not let open connections carry on past the grace.
         let token = {
             let mut cut = self.cut.lock().unwrap_or_else(PoisonError::into_inner);
             std::mem::replace(&mut *cut, CancellationToken::new())
         };
         token.cancel();
+        let persisted = match &self.marker {
+            Some(path) => write_marker(path, &fresh),
+            None => Ok(()),
+        };
         Trip {
             record: fresh,
             tripped: true,
@@ -296,8 +300,11 @@ fn write_marker(path: &Path, record: &QuarantineRecord) -> io::Result<()> {
 /// Removes the marker; a marker already gone counts as removed.
 fn remove_marker(path: &Path) -> io::Result<()> {
     match std::fs::remove_file(path) {
+        // An unlink whose directory sync failed last time is retried
+        // here as the sync alone, so a release is durable before it is
+        // reported.
         Ok(()) => sync_dir(path),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => sync_dir(path),
         Err(e) => Err(e),
     }
 }
