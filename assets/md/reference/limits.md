@@ -147,9 +147,11 @@ single reservation.
 
 ## Connections
 
-* A connection over `max_connections` or `max_connections_per_client` (per
-  client IP) is accepted and closed at once, with a `connection_refused`
-  event. The `ca_server` listener counts separately, `max_connections` in
+* A connection over `max_connections` or `max_connections_per_client` is
+  accepted and closed at once, with a `connection_refused` event. The
+  per-client cap counts TCP peers: it is applied when the connection is
+  accepted, before any `X-Forwarded-For` is read, so a listener's
+  `forwarded_for` does not change what it counts. The `ca_server` listener counts separately, `max_connections` in
   total with no per-client cap, and logs its refusals to roxy's own log
   rather than the flow log. A client that fills it starves the health
   probes, so that port should not be reachable by untrusted clients.
@@ -162,8 +164,8 @@ single reservation.
   connection's receive window caps them at 4 MiB, so one client IP can hold
   at most `max_connections_per_client` × 4 MiB. Omitted, it is whatever
   `max_connections` is, so behind a load balancer (one source IP for every
-  client) the cap is the fleet's; lower it on a proxy port where each client
-  has its own address.
+  client, whatever `forwarded_for` resolves) the cap is the fleet's; lower
+  it on a proxy port where each client has its own address.
 * Upstream connections are bounded by the clients: HTTP/1.1 origins get
   one connection per concurrent request, HTTP/2 origins at most
   `upstream.max_h2_connections_per_origin` (4 by default), each with an

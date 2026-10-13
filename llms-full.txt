@@ -375,6 +375,7 @@ listeners:
   - name: gateway
     mode: http
     bind: 0.0.0.0:8080
+    forwarded_for: { trusted_hops: 1 }   # one load balancer in front
 
 secrets:
   anthropic: { env: ANTHROPIC_API_KEY }
@@ -436,11 +437,18 @@ below see the tag, so a per-user quota is another addon.
 * **This is not containment.** The listener serves whoever reaches it, and
   the clients may have other routes out
   ([threat model](/design/threat-model#which-use-case-claims-what)).
-* **`client.ip` is the load balancer's address.** Rules and the flow log
-  see the connection roxy accepted, not the original client. roxy reads no
-  forwarded-for header. Every client therefore shares one source IP, so
-  `limits.max_connections_per_client` caps the whole gateway: leave it
-  unset (it follows `max_connections`) or raise it with the fleet
+* **Say how many proxies are in front.** `forwarded_for.trusted_hops` is
+  the number of proxies between the clients and roxy, each appending to
+  `X-Forwarded-For`; with it, `client.ip` in rules, rate limits and the
+  flow log is the client the load balancer saw, and a request the header
+  does not account for is refused
+  ([HTTP](/reference/http#clients-behind-a-load-balancer)). Without it,
+  `client.ip` is the load balancer's address and every client shares one.
+  Only the load balancer may reach the listener; a client that can connect
+  directly chooses its own `client.ip`.
+  `limits.max_connections_per_client` counts the connection's peer either
+  way, so it caps the whole gateway: leave it unset (it follows
+  `max_connections`) or raise it with the fleet
   ([limits](/reference/limits#connections)).
 * **TLS stays in front.** roxy does not terminate TLS on an `http`
   listener; a client that starts a handshake is closed
@@ -1240,8 +1248,13 @@ guarantees decide every behaviour on the other pages; where a page says
 arbitrary code, and may have root inside its own container or VM.
 
 **Trusted:** the host, roxy's binary and config, the secrets roxy holds, the
-public CA trust store used to verify upstreams, and the upstreams the rules
-allow. Upstream responses are not treated as adversarial; roxy applies the
+public CA trust store used to verify upstreams, the upstreams the rules
+allow, and the proxies a listener's `forwarded_for` counts: the trusted
+hops of `X-Forwarded-For` are taken as written, so a client's identity is
+only as good as the load balancer that appended it, and the network must
+let only those proxies reach the listener. A hop that is missing or is not
+an address refuses the request rather than falling back to the peer
+([HTTP](/reference/http#clients-behind-a-load-balancer)). Upstream responses are not treated as adversarial; roxy applies the
 size and time limits that protect its own resources and re-frames them so
 the client sees one clean wire form.
 
@@ -1791,7 +1804,7 @@ request is forwarded; a rule reading one is re-checked in flight
 
 | field | type | known |
 |---|---|---|
-| `client.ip`, `client.port` | ip, int | admission |
+| `client.ip` | ip | admission |
 | `listener.name` | string | admission |
 | `tls.sni`, `tls.alpn`, `tls.version` | string | admission |
 | `method`, `scheme`, `host`, `port`, `path`, `url` | string / int | admission |
@@ -1808,6 +1821,9 @@ request is forwarded; a rule reading one is re-checked in flight
 | `response.body.bytes` | int: response body bytes so far | in-flight |
 | `ws.direction`, `ws.opcode`, `ws.size`, `ws.text` | string, int, int, string: the WebSocket message being checked | in-flight, per message ([WebSockets](/reference/websockets#message-rules)) |
 
+`client.ip` is the client as roxy establishes it: the TCP peer, or on a
+listener with `forwarded_for` the client `X-Forwarded-For` names at the
+trusted hop ([HTTP](/reference/http#clients-behind-a-load-balancer)).
 `path` is normalised ([HTTP](/reference/http#url-normalisation)). `host`
 and `tls.sni` are the name as roxy delivers it: lower-case, without a
 trailing dot, internationalised labels in A-label (`xn--`) form, and an IP
@@ -2084,8 +2100,8 @@ metrics:
 
 ### Key cardinality
 
-`host`, `path`, `url`, `query.raw` and `client.port` are chosen by the
-client per request, and denied flows count, so a metric keyed on one with
+`host`, `path`, `url` and `query.raw` are chosen by the client per
+request, and denied flows count, so a metric keyed on one with
 no `where` fills with as many series as the client sends, without one
 request being allowed; then every flow needing a new series is denied
 (`metric_table_full`) until series expire. Bound the key with a finite
@@ -2100,10 +2116,12 @@ metrics:
     window: 1m
 ```
 
-`client.ip` is bounded by who can reach the proxy. `roxy check` warns when a
-metric keys on any of the five fields above with no `where`. `host under
+`client.ip` is bounded by who can reach the proxy; behind a load balancer
+it is each client's own address only with the listener's `forwarded_for`
+([HTTP](/reference/http#clients-behind-a-load-balancer)). `roxy check` warns when a
+metric keys on any of the four fields above with no `where`. `host under
 "github.com"` does not bound `host`: subdomains are client-chosen too. For
-`path`, `url`, `query.raw` and `client.port` a `where` on `host` limits
+`path`, `url` and `query.raw` a `where` on `host` limits
 whose values count, not how many; give such a metric a `where` that
 enumerates the values it keys on, or its own `max_keys` so filling it
 refuses new series in that metric alone. `unique(..)` fields are not keys:
@@ -2362,6 +2380,11 @@ listeners:
     bind: 0.0.0.0:3128
     quarantine_on:             # optional; off when absent
       parse_errors: { count: 20, window: 1m }
+  - name: gateway
+    mode: http
+    bind: 0.0.0.0:8080
+    forwarded_for:             # optional; without it X-Forwarded-For is ignored
+      trusted_hops: 1          # the proxies in front of roxy: here, one load balancer
 ```
 
 `quarantine_on.parse_errors` puts the whole process into
@@ -2369,6 +2392,9 @@ listeners:
 `count` parse errors within `window` (`count` at least 1, `window` a whole
 number of seconds, at least `1s`). It counts a client sending what roxy will not parse, not one that
 is slow or leaves. Setting it needs `roxy run --state-dir`.
+
+`forwarded_for.trusted_hops` (at least 1; `mode: http` only) names the
+client from `X-Forwarded-For` ([below](/reference/http#clients-behind-a-load-balancer)).
 
 ## HTTP proxy
 
@@ -2396,6 +2422,47 @@ For a gateway behind a TLS-terminating load balancer
   HTTP; `redirect` with `scheme: https` sends it on over TLS.
 * `roxy.internal` is a host like any other.
 * A TLS handshake is closed at the record header (`tls_on_http_listener`).
+
+### Clients behind a load balancer
+
+Without `forwarded_for`, `client.ip` is the TCP peer: behind a load
+balancer, the load balancer. With `forwarded_for.trusted_hops: N`, each of
+the N proxies in front of roxy is taken to append the address it accepted
+the connection from to `X-Forwarded-For`, so the client is the Nth entry
+from the right of the header (every `X-Forwarded-For` line joined in
+order). Entries to its left are the client's own and are never read.
+
+* That address is `client.ip` in rules, metric keys and the flow log, and
+  the addon principal's `client_ip`: roxy has one notion of the client.
+  The flow log keeps the TCP peer as `client.peer` for forensics
+  ([flow log](/reference/flow-log#flow-log)).
+* Each request is resolved on its own: a kept-alive connection from a load
+  balancer carries many clients.
+* A request with fewer entries than hops, a trusted entry that is not a
+  bare IPv4 or IPv6 address (a port, brackets, a zone, `unknown`, an
+  obfuscated identifier), or a header over 4 KiB in all is refused as a
+  request roxy cannot parse: `400`, reason `forwarded_for_invalid`, the
+  connection closed, counted by `quarantine_on.parse_errors`. It is never
+  attributed to the peer: a bypassed or misconfigured load balancer must
+  neither let a client choose its address nor fold every client into one.
+* An IPv4-mapped IPv6 entry (`::ffff:a.b.c.d`) is the IPv4 address it
+  embeds, as a host literal is.
+* The header goes upstream as received; roxy neither appends the peer nor
+  strips it.
+* `limits.max_connections_per_client` is applied when the connection is
+  accepted, before any header, so it counts the peer
+  ([limits](/reference/limits#connections)).
+
+A hop count says how the header was built; it does not prove a connection
+came through those proxies. A client that can reach the listener directly
+can write N well-formed entries and choose its `client.ip`, so the
+listener must be reachable only from the trusted proxies, which is the
+network's claim to make (a security group, a private subnet), as
+containment is ([threat model](/design/threat-model#which-use-case-claims-what)).
+
+The setting is refused on an `http_proxy` listener: the requests inside a
+CONNECT tunnel carry whatever `X-Forwarded-For` the client wrote, and no
+proxy in front of roxy can add to them.
 
 ## CONNECT
 
@@ -2530,6 +2597,9 @@ the others refuse for the same reason.
   `100 Continue` once the rules allow the request; when a rule reads the
   request body it goes out before the body is judged, and a deny follows
   the body.
+* On a listener with `forwarded_for`, `X-Forwarded-For` must name the
+  client at the trusted hop
+  (`forwarded_for_invalid`; [clients behind a load balancer](/reference/http#clients-behind-a-load-balancer)).
 * Hop-by-hop fields (`Connection` and every field it names, `Keep-Alive`,
   `Proxy-Connection`, `Proxy-Authorization`, `Proxy-Authenticate`, `TE`,
   `Trailer`, `Transfer-Encoding`, `Upgrade`) are consumed and never
@@ -2995,9 +3065,11 @@ single reservation.
 
 ## Connections
 
-* A connection over `max_connections` or `max_connections_per_client` (per
-  client IP) is accepted and closed at once, with a `connection_refused`
-  event. The `ca_server` listener counts separately, `max_connections` in
+* A connection over `max_connections` or `max_connections_per_client` is
+  accepted and closed at once, with a `connection_refused` event. The
+  per-client cap counts TCP peers: it is applied when the connection is
+  accepted, before any `X-Forwarded-For` is read, so a listener's
+  `forwarded_for` does not change what it counts. The `ca_server` listener counts separately, `max_connections` in
   total with no per-client cap, and logs its refusals to roxy's own log
   rather than the flow log. A client that fills it starves the health
   probes, so that port should not be reachable by untrusted clients.
@@ -3010,8 +3082,8 @@ single reservation.
   connection's receive window caps them at 4 MiB, so one client IP can hold
   at most `max_connections_per_client` × 4 MiB. Omitted, it is whatever
   `max_connections` is, so behind a load balancer (one source IP for every
-  client) the cap is the fleet's; lower it on a proxy port where each client
-  has its own address.
+  client, whatever `forwarded_for` resolves) the cap is the fleet's; lower
+  it on a proxy port where each client has its own address.
 * Upstream connections are bounded by the clients: HTTP/1.1 origins get
   one connection per concurrent request, HTTP/2 origins at most
   `upstream.max_h2_connections_per_origin` (4 by default), each with an
@@ -3418,7 +3490,9 @@ A stream opens with an `open` message from roxy:
  "sni":"api.example.com","tags":["a","b"]}
 ```
 
-`sni` is left out when there is none. `subscribe` is the layer's
+`client_ip` is `client.ip` as the rules see it
+([fields](/reference/rule-language#fields)). `sni` is left out when there is
+none. `subscribe` is the layer's
 [subscription](/reference/addon-configuration#what-a-layer-sees): for a
 direction it names `head`, roxy sends the head and its end with no bytes
 between, and the service answers the same way; bytes the service sends for
@@ -3603,7 +3677,7 @@ produces a `request` event:
 
 ```json
 {"ts":"2026-10-03T10:12:00.123Z","event":"request","flow":"01J9…","conn":"01J9…",
- "listener":"proxy","client":{"ip":"10.0.0.7","port":51234},
+ "listener":"proxy","client":{"ip":"10.0.0.7","peer":{"ip":"10.0.0.7","port":51234}},
  "tls":{"sni":"api.github.com","alpn":"h2","version":"1.3"},
  "req":{"method":"POST","host":"api.github.com","port":443,"path":"/repos/x/y/issues",
         "query":null,"headers_bytes":812,"body_bytes":1032,
@@ -3619,6 +3693,7 @@ produces a `request` event:
 
 | field | meaning |
 |---|---|
+| `client.ip`, `client.peer` | the client as the rules see it, and the TCP peer (`ip`, `port`) the request arrived from. They differ only on a listener with `forwarded_for`, where `client.ip` is read from `X-Forwarded-For` ([HTTP](/reference/http#clients-behind-a-load-balancer)); an event with no request behind it (`parse_error`, `connect`, `connection_refused`) has the peer as `client.ip` |
 | `req.body_bytes`, `res.body_bytes` | body bytes roxy forwarded in each direction |
 | `req.body_sha256`, `res.body_sha256` | lower-case hex SHA-256 of those bytes, only for the sides an admission rule's `digest` action selected ([actions](/reference/rule-language#actions)); present once the body completed, absent if the exchange ended first (a cut body, an in-flight stop, a client that left). An empty body has the empty-string digest; a relayed WebSocket has counts but no digests. Hashing is opt-in because a digest nobody compares against is wasted work: software SHA-256 costs about one core per 400 MB/s on CPUs without SHA-NI |
 | `timing.upstream_connect_ms` | how long opening the upstream connection took (DNS, TCP and TLS); `null` when the request reused a pooled connection, or none was opened |

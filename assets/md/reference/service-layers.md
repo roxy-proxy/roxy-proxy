@@ -67,7 +67,9 @@ A stream opens with an `open` message from roxy:
  "sni":"api.example.com","tags":["a","b"]}
 ```
 
-`sni` is left out when there is none. `subscribe` is the layer's
+`client_ip` is `client.ip` as the rules see it
+([fields](/reference/rule-language#fields)). `sni` is left out when there is
+none. `subscribe` is the layer's
 [subscription](/reference/addon-configuration#what-a-layer-sees): for a
 direction it names `head`, roxy sends the head and its end with no bytes
 between, and the service answers the same way; bytes the service sends for
