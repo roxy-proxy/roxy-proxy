@@ -331,7 +331,6 @@ components:
         - uptime_seconds
         - policy_state
         - spooled_bytes
-        - seq_unreserved
       properties:
         lease_id:
           type: [string, "null"]
@@ -359,7 +358,8 @@ components:
           description: >-
             Events are being tagged with `seq` values past the node's
             persisted reservation, so a restart may reuse them and the
-            reused events would be dropped as duplicates.
+            reused events would be dropped as duplicates. Absent from a
+            node that predates the field.
 
     SecretValue:
       type: string

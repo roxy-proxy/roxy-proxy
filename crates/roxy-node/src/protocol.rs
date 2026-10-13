@@ -58,7 +58,8 @@ pub struct NodeState {
     /// Events are being tagged with `seq` values past the persisted
     /// reservation, because a `flow.seq` write is failing or lagging: a
     /// restart now may reuse them, and the server's `(node_id, seq)`
-    /// deduplication would drop the reused ones.
+    /// deduplication would drop the reused ones. Optional on the wire, so
+    /// a control plane can tell an older node from one reporting `false`.
     pub seq_unreserved: bool,
 }
 

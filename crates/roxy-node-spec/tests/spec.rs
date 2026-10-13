@@ -209,12 +209,12 @@ fn node_state_policy_state_is_an_enum_and_only_lease_id_may_be_null() {
 }
 
 #[test]
-fn node_state_seq_unreserved_is_a_required_boolean() {
+fn node_state_seq_unreserved_is_a_boolean_and_an_older_node_may_omit_it() {
     let mut state = page_example("NodeState");
     state["seq_unreserved"] = json!("yes");
     assert!(validate("NodeState", &state).is_err());
     state.as_object_mut().unwrap().remove("seq_unreserved");
-    assert!(validate("NodeState", &state).is_err());
+    assert!(validate("NodeState", &state).is_ok());
 }
 
 #[test]
