@@ -926,7 +926,8 @@ fn string_op(
     {
         let pos = match op {
             StrOp::EndsWith => HostPos::Tail,
-            StrOp::StartsWith | StrOp::Contains => HostPos::Inside,
+            StrOp::StartsWith => HostPos::Head,
+            StrOp::Contains => HostPos::Inside,
         };
         check_host_literal(&l, s, *span, pos)?;
     }
@@ -969,7 +970,7 @@ fn pattern(
     let ci = l.ci();
     match op {
         PatternOp::Like => {
-            check_host_literal(&l, pattern, *rspan, HostPos::Tail)?;
+            check_host_literal(&l, pattern, *rspan, HostPos::Glob)?;
             Ok(Pred::Glob {
                 glob: build_glob(*rspan, pattern, ci)?,
                 lhs: lower(l),
@@ -1061,21 +1062,26 @@ fn check_method_literal(this: &Typed<'_>, other: &Typed<'_>) -> Result<(), ExprE
     Ok(())
 }
 
-/// Where a string literal sits against the host it is compared with:
-/// `Whole` (`==`, `in`) and `Tail` (`ends_with`, `like`) end the host, so
-/// a trailing dot there never matches; `Inside` (`starts_with`,
-/// `contains`, `under`) may legitimately end with a dot.
+/// Where a string literal sits against the host it is compared with.
+/// `Whole` (`==`, `in`), `Tail` (`ends_with`) and `Glob` (`like`) end the
+/// host, so a trailing dot there never matches; `Head` (`starts_with`)
+/// and `Inside` (`contains`, `under`) may legitimately end with a dot.
+/// `Whole`, `Head` and `Glob` start the host, so an IPv4-mapped prefix
+/// there never matches.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HostPos {
     Whole,
+    Head,
     Tail,
+    Glob,
     Inside,
 }
 
 /// Rejects a literal that no `host` or `tls.sni` can match: hosts arrive
-/// as ASCII A-labels, without a trailing dot, and IPv6 without brackets.
-/// Case is not checked, as host comparisons are case-insensitive. Regexes
-/// (`matches`) are not checked: dots and brackets are syntax there.
+/// as ASCII A-labels, without a trailing dot, IPv6 without brackets, and
+/// an IPv4-mapped IPv6 address as the IPv4 address it embeds. Case is not
+/// checked, as host comparisons are case-insensitive. Regexes (`matches`)
+/// are not checked: dots and brackets are syntax there.
 fn check_host_literal(
     field: &Typed<'_>,
     lit: &str,
@@ -1096,10 +1102,15 @@ fn check_host_literal(
         ));
     }
     if lit.contains(['[', ']']) {
+        // The bare form is the remedy, unless it is itself an IPv4-mapped
+        // address, which arrives as the IPv4 address.
         let hint = lit
             .strip_prefix('[')
             .and_then(|l| l.strip_suffix(']'))
-            .map_or_else(String::new, |bare| format!("; write {bare:?}"));
+            .map_or_else(String::new, |bare| {
+                let bare = mapped_v4(bare).map_or_else(|| bare.to_owned(), |v4| v4.to_string());
+                format!("; write {bare:?}")
+            });
         return Err(ExprError::new(
             span,
             format!(
@@ -1107,7 +1118,7 @@ fn check_host_literal(
             ),
         ));
     }
-    if pos != HostPos::Inside && lit.ends_with('.') {
+    if matches!(pos, HostPos::Whole | HostPos::Tail | HostPos::Glob) && lit.ends_with('.') {
         return Err(ExprError::new(
             span,
             format!(
@@ -1116,7 +1127,43 @@ fn check_host_literal(
             ),
         ));
     }
+    // A mapped address arrives as the IPv4 address it embeds, so neither
+    // the whole literal nor a prefix of it in mapped form ever matches. A
+    // host never starts with `::ffff:` in any other case: that spelling
+    // is the mapped block. Elsewhere in a host (`1::ffff:2`) it is plain
+    // IPv6 and no claim is made.
+    let anchored = matches!(pos, HostPos::Whole | HostPos::Head | HostPos::Glob);
+    let whole = mapped_v4(lit);
+    let prefixed = lit
+        .get(..MAPPED_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(MAPPED_PREFIX));
+    if anchored && (whole.is_some() || prefixed) {
+        // A complete address, in any spelling, has an IPv4 form to write;
+        // a partial prefix only has the rest of itself.
+        let hint = whole.map_or_else(
+            || lit[MAPPED_PREFIX.len()..].to_owned(),
+            |v4| v4.to_string(),
+        );
+        return Err(ExprError::new(
+            span,
+            format!(
+                "`{name}` carries an IPv4-mapped address as the IPv4 address it embeds, so \
+                 {lit:?} never matches; write {hint:?}"
+            ),
+        ));
+    }
     Ok(())
+}
+
+/// How an IPv4-mapped IPv6 address starts when written out.
+const MAPPED_PREFIX: &str = "::ffff:";
+
+/// The IPv4 address an IPv4-mapped IPv6 literal embeds, in any spelling.
+fn mapped_v4(s: &str) -> Option<std::net::Ipv4Addr> {
+    match s.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => v6.to_ipv4_mapped(),
+        _ => None,
+    }
 }
 
 /// The suffix `under` tests, from the domain written at `span`.
