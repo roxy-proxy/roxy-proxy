@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 
 use crate::Destination;
 
+/// Where a [`LogWriter`] reads the time for its deadlines (`linger`,
+/// `flush_timeout`). Tests inject one they move by hand.
+pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
 /// Tuning for a [`LogWriter`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriterOptions {
@@ -66,6 +70,7 @@ struct Core {
     /// Producers waiting for readiness.
     waiters: Mutex<Vec<Waker>>,
     opts: WriterOptions,
+    clock: Clock,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -116,6 +121,17 @@ impl LogWriter {
         dest: D,
         opts: WriterOptions,
     ) -> io::Result<Self> {
+        Self::spawn_with_clock(name, dest, opts, Arc::new(Instant::now))
+    }
+
+    /// [`Self::spawn`] with deadlines read from `clock`. The wait between
+    /// retries is real time whatever the clock says.
+    pub fn spawn_with_clock<D: Destination>(
+        name: &'static str,
+        dest: D,
+        opts: WriterOptions,
+        clock: Clock,
+    ) -> io::Result<Self> {
         let core = Arc::new(Core {
             name,
             state: Mutex::new(State::default()),
@@ -125,6 +141,7 @@ impl LogWriter {
             failing: AtomicBool::new(false),
             waiters: Mutex::new(Vec::new()),
             opts,
+            clock,
         });
         let c = core.clone();
         let thread = std::thread::Builder::new()
@@ -226,9 +243,9 @@ impl LogWriter {
         st.requested += 1;
         let target = st.requested;
         core.work.notify_one();
-        let deadline = Instant::now() + core.opts.flush_timeout;
+        let deadline = (core.clock)() + core.opts.flush_timeout;
         while st.written < target {
-            let now = Instant::now();
+            let now = (core.clock)();
             if now >= deadline {
                 tracing::warn!(sink = core.name, "log flush timed out");
                 return false;
@@ -292,9 +309,9 @@ fn run<D: Destination>(core: &Core, mut dest: D) {
             }
             // Linger so one write carries a burst, unless the batch is
             // already large or something more pressing is wanted.
-            let deadline = Instant::now() + core.opts.linger;
+            let deadline = (core.clock)() + core.opts.linger;
             while st.buf.len() < core.batch_bytes() && !urgent(&st) {
-                let now = Instant::now();
+                let now = (core.clock)();
                 if now >= deadline {
                     break;
                 }
@@ -357,8 +374,8 @@ fn retry(core: &Core, what: &str, mut op: impl FnMut() -> io::Result<()>) {
                 if !core.failing.swap(true, Ordering::AcqRel) {
                     tracing::error!(sink = core.name, what, %error, "log destination failing; holding traffic and retrying");
                 }
-                let since = *first_failure.get_or_insert_with(Instant::now);
-                if lock(&core.state).closing && since.elapsed() >= core.opts.flush_timeout {
+                let since = *first_failure.get_or_insert_with(|| (core.clock)());
+                if lock(&core.state).closing && (core.clock)() - since >= core.opts.flush_timeout {
                     tracing::error!(sink = core.name, what, %error, "log destination still failing at shutdown; giving up");
                     return;
                 }
@@ -373,6 +390,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::Stream;
     use std::io::Write;
+    use std::sync::atomic::AtomicU64;
     use std::sync::mpsc;
     use std::task::Wake;
 
@@ -434,6 +452,52 @@ pub(crate) mod tests {
             retry_interval: Duration::from_millis(5),
             flush_timeout: Duration::from_secs(5),
             linger: Duration::from_millis(2),
+        }
+    }
+
+    /// Polls `done` until it holds. The bound is for liveness only: a
+    /// test that reaches it has hung, not run slowly.
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+
+    /// A clock moved by hand. It counts its reads, which is how a test
+    /// tells that the writer has taken a deadline from it.
+    #[derive(Clone)]
+    struct TestClock {
+        base: Instant,
+        offset_ns: Arc<AtomicU64>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl TestClock {
+        fn new() -> Self {
+            Self {
+                base: Instant::now(),
+                offset_ns: Arc::default(),
+                reads: Arc::default(),
+            }
+        }
+
+        fn advance(&self, d: Duration) {
+            self.offset_ns
+                .fetch_add(u64::try_from(d.as_nanos()).unwrap(), Ordering::SeqCst);
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+
+        fn clock(&self) -> Clock {
+            let this = self.clone();
+            Arc::new(move || {
+                this.reads.fetch_add(1, Ordering::SeqCst);
+                this.base + Duration::from_nanos(this.offset_ns.load(Ordering::SeqCst))
+            })
         }
     }
 
@@ -500,31 +564,36 @@ pub(crate) mod tests {
         );
     }
 
+    /// A lone record does not wait for the next one, a flush or shutdown:
+    /// it is written once the linger has passed, and not before.
     #[test]
-    fn a_lone_record_is_written_within_the_linger() {
+    fn a_lone_record_is_written_when_the_linger_passes() {
         let d = Batches::default();
+        let clock = TestClock::new();
         let linger = Duration::from_millis(2);
-        let w = LogWriter::spawn(
+        let w = LogWriter::spawn_with_clock(
             "t",
             d.clone(),
             WriterOptions {
                 linger,
                 ..opts(1 << 20)
             },
+            clock.clock(),
         )
         .unwrap();
-        let start = Instant::now();
         w.append(b"only one\n");
-        // Generous for a loaded CI machine; the failure this pins is a
-        // record that waits for the next one, a flush or shutdown.
-        let bound = linger * 50;
-        while lock(&d.out).is_empty() {
-            assert!(
-                start.elapsed() < bound,
-                "record not written within {bound:?}"
-            );
-            std::thread::sleep(Duration::from_micros(200));
-        }
+        // The deadline is taken from the clock when the record arrives, so
+        // the clock may only move once the writer has read it.
+        wait_until("writer never started its linger", || clock.reads() >= 1);
+        clock.advance(linger / 2);
+        // The writer re-reads the clock every `linger / 2` of real time
+        // while it waits, so a few of those is enough to catch an early write.
+        std::thread::sleep(linger * 5);
+        assert!(lock(&d.out).is_empty(), "written before the linger passed");
+        clock.advance(linger / 2);
+        wait_until("record not written when the linger passed", || {
+            !lock(&d.out).is_empty()
+        });
         assert_eq!(*lock(&d.out), b"only one\n");
         assert_eq!(d.batches.load(Ordering::SeqCst), 1);
     }
@@ -592,11 +661,9 @@ pub(crate) mod tests {
         let waker = Waker::from(Arc::new(Flag(tx)));
         let mut cx = Context::from_waker(&waker);
         // The writer notices the failure: readiness goes Pending.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while w.poll_ready(&mut cx).is_ready() {
-            assert!(Instant::now() < deadline, "failure never held traffic");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        wait_until("failure never held traffic", || {
+            w.poll_ready(&mut cx).is_pending()
+        });
         g.fail.store(false, Ordering::Release);
         rx.recv_timeout(Duration::from_secs(5))
             .expect("woken on recovery");
@@ -624,14 +691,9 @@ pub(crate) mod tests {
         let mut cx = Context::from_waker(&waker);
         assert!(w.poll_ready(&mut cx).is_ready());
         w.append(b"audit record\n");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while w.poll_ready(&mut cx).is_ready() {
-            assert!(
-                Instant::now() < deadline,
-                "a dead writer never held traffic"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        wait_until("a dead writer never held traffic", || {
+            w.poll_ready(&mut cx).is_pending()
+        });
         assert!(w.is_holding());
         std::thread::sleep(Duration::from_millis(20));
         assert!(

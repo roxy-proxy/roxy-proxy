@@ -44,7 +44,7 @@ mod writer;
 use std::io::{self, Write};
 
 pub use rotate::{RotateOptions, RotatingFile};
-pub use writer::{DEFAULT_HIGH_WATER, LogWriter, WriterOptions};
+pub use writer::{Clock, DEFAULT_HIGH_WATER, LogWriter, WriterOptions};
 
 /// Where a [`LogWriter`] puts bytes. Driven only by the writer thread.
 pub trait Destination: Send + 'static {
