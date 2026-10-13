@@ -25,7 +25,8 @@ const MAX_BYTES: usize = 4096;
 /// attributed to anyone.
 pub(crate) fn client_ip(headers: &Headers, hops: NonZeroUsize) -> Result<IpAddr, ParseError> {
     let values: Vec<_> = headers.get_all_text("x-forwarded-for").collect();
-    let bytes = values.iter().map(|v| v.len() + 1).sum::<usize>();
+    // The combined list: the lines, with a separator between each pair.
+    let bytes = values.iter().map(|v| v.len()).sum::<usize>() + values.len().saturating_sub(1);
     if bytes > MAX_BYTES {
         return Err(invalid(format!(
             "x-forwarded-for is {bytes} bytes, over {MAX_BYTES}"

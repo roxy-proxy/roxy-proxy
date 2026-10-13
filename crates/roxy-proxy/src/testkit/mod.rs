@@ -31,7 +31,6 @@ mod coding_tests;
 #[cfg(test)]
 mod core_tests;
 #[cfg(test)]
-#[cfg(test)]
 mod early_tests;
 #[cfg(test)]
 mod forwarded_tests;
