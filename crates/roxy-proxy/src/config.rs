@@ -31,7 +31,9 @@ pub struct ListenerSpec {
     /// within the window quarantine the process. `None`: never.
     pub quarantine_on: Option<ParseErrorThreshold>,
     /// `forwarded_for`: trust this many proxies' `X-Forwarded-For` entries.
-    /// `None`: the header is ignored.
+    /// `None`: the header is ignored. Only valid with `ListenerMode::Http`:
+    /// inside a CONNECT tunnel the header is the client's own. Callers
+    /// enforce this; the `roxy` binary does so in config validation.
     pub forwarded_for: Option<ForwardedFor>,
 }
 

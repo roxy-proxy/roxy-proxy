@@ -99,6 +99,8 @@ below see the tag, so a per-user quota is another addon.
   does not account for is refused
   ([HTTP](/reference/http#clients-behind-a-load-balancer)). Without it,
   `client.ip` is the load balancer's address and every client shares one.
+  Only the load balancer may reach the listener; a client that can connect
+  directly chooses its own `client.ip`.
   `limits.max_connections_per_client` counts the connection's peer either
   way, so it caps the whole gateway: leave it unset (it follows
   `max_connections`) or raise it with the fleet
