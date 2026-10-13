@@ -1,4 +1,4 @@
-//! An in-test `roxy.layer.v4` service behind the scripted upstream: a
+//! An in-test `roxy.layer.v5` service behind the scripted upstream: a
 //! WebSocket handshake carrying the subprotocol is served here, on any
 //! port. The connection's behaviour is picked by the handshake's path:
 //!
@@ -289,12 +289,19 @@ enum Mode {
     Refuse,
     Abort,
     Patient,
+    /// Passes through, after calling every host service on `open`.
+    Host,
 }
+
+/// What the `host` behaviour writes to the state store, under `svc`.
+pub(crate) const HOST_STATE_VALUE: &str = "from-service";
 
 impl Mode {
     fn of(path: &str) -> Self {
         if path.ends_with("/pass") {
             Self::Pass
+        } else if path.ends_with("/host") {
+            Self::Host
         } else if path.ends_with("/hold") {
             Self::Hold
         } else if path.ends_with("/hoard") {
@@ -356,9 +363,13 @@ impl Conn {
     /// Whether body bytes in `dir` are passed on.
     fn passes(&self, dir: u8) -> bool {
         match self.mode {
-            Mode::Pass | Mode::Hoard | Mode::Slow | Mode::Shout | Mode::Sever | Mode::Patient => {
-                true
-            }
+            Mode::Pass
+            | Mode::Hoard
+            | Mode::Slow
+            | Mode::Shout
+            | Mode::Sever
+            | Mode::Patient
+            | Mode::Host => true,
             Mode::Hold | Mode::Forward => dir == REQUEST,
             Mode::Overlong
             | Mode::Short
@@ -402,6 +413,17 @@ impl Conn {
                     | Mode::Shout
                     | Mode::Sever
                     | Mode::Patient => {}
+                    Mode::Host => {
+                        for m in [
+                            json!({"type": "log", "level": "info", "message": "hello from the service"}),
+                            json!({"type": "record", "kind": "verdict", "data": {"score": 0.9}}),
+                            json!({"type": "add_tag", "tag": "svc-tag"}),
+                            json!({"type": "state_put", "id": 1, "key": "svc", "value": HOST_STATE_VALUE}),
+                            json!({"type": "state_get", "id": 2, "key": "svc"}),
+                        ] {
+                            self.send(text(id, m));
+                        }
+                    }
                     Mode::Talk => {
                         let s = self.streams.get_mut(&id).expect("just opened");
                         s.lanes[usize::from(REQUEST)]

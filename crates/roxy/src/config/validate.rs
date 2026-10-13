@@ -324,18 +324,6 @@ impl Config {
         if a.path.is_some() {
             refuse("path", "`path` is for `kind: wasm` addons");
         }
-        if !a.capabilities.is_empty() {
-            refuse(
-                "capabilities",
-                "a service layer gets no host services: it calls what it needs itself",
-            );
-        }
-        if !a.config.is_null() {
-            refuse(
-                "config",
-                "`config` is passed to WASM addons; configure the service itself",
-            );
-        }
         let l = &a.limits;
         for (field, set) in [
             ("max_memory", l.max_memory.is_some()),

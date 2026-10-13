@@ -453,6 +453,11 @@ impl Stream {
 
     /// A control message from the service.
     pub(super) fn control(self: &Arc<Self>, m: In) {
+        if m.is_host_call() {
+            let s = self.clone();
+            tokio::spawn(async move { s.host_call(m).await });
+            return;
+        }
         match m {
             In::Credit { dir, bytes } => {
                 lock(&self.state).lane(dir).window.granted(bytes);
@@ -472,6 +477,12 @@ impl Stream {
                     return;
                 }
             }
+            In::Log { .. }
+            | In::Record { .. }
+            | In::AddTag { .. }
+            | In::StateGet { .. }
+            | In::StatePut { .. }
+            | In::MetricGet { .. } => return,
         }
         let mut s = lock(&self.state);
         let result = self.answer(&mut s, m);
@@ -559,7 +570,31 @@ impl Stream {
                 Ok(())
             }
             // Handled by `control`.
-            In::Credit { .. } | In::Reset { .. } => Ok(()),
+            In::Credit { .. }
+            | In::Reset { .. }
+            | In::Log { .. }
+            | In::Record { .. }
+            | In::AddTag { .. }
+            | In::StateGet { .. }
+            | In::StatePut { .. }
+            | In::MetricGet { .. } => Ok(()),
+        }
+    }
+
+    /// A host-service call from the service, answered with a `result`
+    /// when it named an `id`. A failure fails the stream, so the exchange,
+    /// as it would a WASM layer's.
+    async fn host_call(self: Arc<Self>, m: In) {
+        match super::super::host::call(&self.st, self.index, m).await {
+            Ok(Some((id, result))) => {
+                let (value, error) = match result {
+                    Ok(v) => (Some(v), None),
+                    Err(e) => (None, Some(e)),
+                };
+                self.send(&Out::Result { id, value, error }).await;
+            }
+            Ok(None) => {}
+            Err(e) => self.fail(ServiceError::Layer(e), Reset::Send),
         }
     }
 
@@ -696,6 +731,12 @@ pub(super) fn open_message(st: &StackFlow, index: usize, mode: AddonMode) -> Out
         listener: st.client.listener.name.clone(),
         sni: st.tls.as_ref().and_then(|t| t.sni.clone()),
         tags: st.tags(),
+        capabilities: roxy_wasm::Capability::ALL
+            .into_iter()
+            .filter(|c| addon.capabilities.contains(*c))
+            .map(roxy_wasm::Capability::name)
+            .collect(),
+        config: addon.config.clone(),
     }
 }
 

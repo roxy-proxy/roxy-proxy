@@ -8,7 +8,7 @@ use roxy_wasm::{
     LayerResponse, LogLevel, Principal, TagError, async_trait,
 };
 
-use super::{AddonSpec, StackFlow, endpoint};
+use super::{AddonMode, AddonSpec, StackFlow, endpoint};
 use crate::flowlog::{FlowEvent, sink_ready};
 use crate::view::ProxyView;
 
@@ -49,6 +49,12 @@ pub(crate) struct StackHost {
 impl StackHost {
     fn addon(&self) -> &Arc<AddonSpec> {
         &self.st.snap.addons[self.index]
+    }
+
+    /// Whether the layer observes: it may read, but nothing it does may
+    /// steer traffic.
+    fn observing(&self) -> bool {
+        self.addon().mode == AddonMode::Observe
     }
 }
 
@@ -95,7 +101,7 @@ impl LayerHost for StackHost {
     }
 
     fn add_tag(&self, tag: String) -> Result<(), TagError> {
-        if self.observer.is_some() {
+        if self.observing() {
             // A tag steers the `when` of every layer below, so it is an
             // effect on traffic, which an observer must not have.
             let layer = &self.addon().name;
@@ -153,7 +159,7 @@ impl LayerHost for StackHost {
         value: String,
         ttl_ms: Option<u64>,
     ) -> Result<Result<(), String>, HostError> {
-        if self.observer.is_some() {
+        if self.observing() {
             // The store steers the rules of every flow, so a write is an
             // effect on traffic, which an observer must not have.
             let layer = &self.addon().name;

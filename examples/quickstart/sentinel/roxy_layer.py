@@ -1,4 +1,4 @@
-"""The service side of roxy's service layers (`roxy.layer.v4`).
+"""The service side of roxy's service layers (`roxy.layer.v5`).
 
 roxy keeps a few WebSocket connections open to the service and carries
 each exchange as a stream on one of them. Text frames are JSON control
@@ -59,7 +59,7 @@ from typing import Any
 
 from websockets.asyncio.server import ServerConnection, serve as ws_serve
 
-SUBPROTOCOL = "roxy.layer.v4"
+SUBPROTOCOL = "roxy.layer.v5"
 
 # The direction byte of a binary frame, and the `dir` of a credit message.
 REQUEST = 0
@@ -120,6 +120,11 @@ class ProtocolError(Exception):
     """roxy sent something out of order, or reset the stream."""
 
 
+class HostError(Exception):
+    """roxy refused a host-service call for what was passed (a key or
+    value over its cap); the exchange goes on."""
+
+
 class _Conn:
     """One connection from roxy: its streams, and the way out."""
 
@@ -171,6 +176,10 @@ class _Conn:
             lane = s.lane(_DIRS[msg["dir"]])
             lane.credit += int(msg["bytes"])
             lane.more_credit.set()
+        elif kind == "result":
+            fut = s.pending.pop(msg["id"], None)
+            if fut is not None and not fut.done():
+                fut.set_result(msg)
         elif kind == "reset":
             self.streams.pop(sid, None)
             s.task.cancel()
@@ -197,6 +206,26 @@ class _Stream:
         self.flow = flow
         self.lanes = {REQUEST: _Lane(), RESPONSE: _Lane()}
         self.task: asyncio.Task[None]
+        # Host-service calls awaiting their `result`, by call id.
+        self.pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self._next_call = 0
+
+    async def call(self, msg: dict[str, Any]) -> Any:
+        """Sends a host-service call that gets a `result` and returns its
+        value, raising `HostError` on a refusal."""
+        self._next_call += 1
+        cid = self._next_call
+        msg["id"] = cid
+        fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self.pending[cid] = fut
+        try:
+            await self.conn.send(self.id, msg)
+            result = await fut
+        finally:
+            self.pending.pop(cid, None)
+        if result.get("error") is not None:
+            raise HostError(result["error"])
+        return result.get("value")
 
     def lane(self, direction: int) -> _Lane:
         return self.lanes[direction]
@@ -281,8 +310,8 @@ class Exchange:
         """The client's request head, as it reached this layer."""
         self.flow: dict[str, Any] = stream.flow
         """The stream's `open` metadata: flow, conn, layer, mode (`enforce`
-        or `observe`), client_ip, listener, sni, tags. The pair
-        (flow, layer) is unique to this exchange."""
+        or `observe`), client_ip, listener, sni, tags, capabilities and
+        config. The pair (flow, layer) is unique to this exchange."""
         self._body_read = False
         self._response_read = False
         # The forwarded request body still going out, if `forward` returned
@@ -293,6 +322,43 @@ class Exchange:
     def observing(self) -> bool:
         """roxy sends copies and ignores the answers (`mode: observe`)."""
         return self.flow.get("mode") == "observe"
+
+    @property
+    def config(self) -> Any:
+        """The layer's `config:` value from roxy's configuration."""
+        return self.flow.get("config")
+
+    # Host services, each behind a capability granted in roxy's config
+    # (`capabilities: [log, record, state, metrics]`). A call without its
+    # capability, or a failure in roxy, fails the exchange: roxy resets the
+    # stream. `add_tag` needs no capability but is refused in observe mode.
+
+    async def log(self, level: str, message: str) -> None:
+        """Writes to roxy's operational log (`trace` to `error`)."""
+        await self._send({"type": "log", "level": level, "message": message})
+
+    async def record(self, kind: str, data: Any) -> None:
+        """Writes a `layer_record` event to the flow log."""
+        await self._send({"type": "record", "kind": kind, "data": data})
+
+    async def add_tag(self, tag: str) -> None:
+        """Tags the flow for the layers below and the flow log."""
+        await self._send({"type": "add_tag", "tag": tag})
+
+    async def state_get(self, key: str) -> str | None:
+        """Reads the state store the rules read as `state["key"]`."""
+        return await self._s.call({"type": "state_get", "key": key})
+
+    async def state_put(self, key: str, value: str, ttl_ms: int | None = None) -> None:
+        """Writes the state store; a rule matches the value as written."""
+        msg: dict[str, Any] = {"type": "state_put", "key": key, "value": value}
+        if ttl_ms is not None:
+            msg["ttl_ms"] = ttl_ms
+        await self._s.call(msg)
+
+    async def metric_get(self, metric: str) -> int | None:
+        """Reads a metric for this flow's own key."""
+        return await self._s.call({"type": "metric_get", "metric": metric})
 
     async def _body(self, direction: int) -> AsyncIterator[bytes]:
         end = f"{_DIR_NAMES[direction]}_end"

@@ -1022,8 +1022,6 @@ fn service_addons_validate() {
     let paths: Vec<&str> = d.iter().map(|d| d.path.as_str()).collect();
     for p in [
         "addons[0].endpoint",
-        "addons[0].capabilities",
-        "addons[0].config",
         "addons[0].limits.max_memory",
         "addons[0].limits.max_connections",
         "addons[0].limits.max_streams",

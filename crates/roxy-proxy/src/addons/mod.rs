@@ -84,6 +84,10 @@ pub struct AddonSpec {
     pub kind: AddonImpl,
     /// Named endpoints, by name.
     pub endpoints: HashMap<String, EndpointSpec>,
+    /// The host services the layer may call.
+    pub capabilities: roxy_wasm::Capabilities,
+    /// `config`: the document the layer reads, whatever its kind.
+    pub config: serde_json::Value,
     /// `when`: the layer runs only on requests this matches, as they reach
     /// it; the others go straight to the layer below.
     pub when: Option<roxy_rules::Condition>,
@@ -592,7 +596,7 @@ impl StackFlow {
 /// A stable code for a layer failure, for the flow log.
 fn error_kind(e: &StackError) -> String {
     let e = match e {
-        StackError::Layer(e) => e,
+        StackError::Layer(e) | StackError::Service(ServiceError::Layer(e)) => e,
         StackError::Service(e) => return e.kind().to_owned(),
         StackError::Condition { code, .. } => return format!("when:{code}"),
     };
