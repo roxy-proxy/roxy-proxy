@@ -314,9 +314,9 @@ impl Headers {
 
     /// First value of `name` as text, obs-text included: each byte is the
     /// char of the same code point (ISO-8859-1), so the text is exactly the
-    /// bytes forwarded and a rule matching it judges what leaves. For
-    /// values that decide how a body is read use [`Headers::get`], whose
-    /// `None` for obs-text is the safe answer there.
+    /// bytes forwarded and a rule matching it judges what leaves. A caller
+    /// that must tell an unreadable value from an absent one, or needs the
+    /// bytes themselves, uses [`Headers::get_raw`].
     pub fn get_text(&self, name: &str) -> Option<Cow<'_, str>> {
         self.get_raw(name).map(text)
     }
