@@ -24,14 +24,21 @@ const MAX_BYTES: usize = 4096;
 /// not the configured one, so the request is refused rather than
 /// attributed to anyone.
 pub(crate) fn client_ip(headers: &Headers, hops: NonZeroUsize) -> Result<IpAddr, ParseError> {
-    let values: Vec<_> = headers.get_all_text("x-forwarded-for").collect();
-    // The combined list: the lines, with a separator between each pair.
-    let bytes = values.iter().map(|v| v.len()).sum::<usize>() + values.len().saturating_sub(1);
+    // The combined list as received: the lines, with a separator between
+    // each pair. Measured on the raw values, since the text form widens
+    // obs-text bytes.
+    let lines = headers.get_all_raw("x-forwarded-for").count();
+    let bytes = headers
+        .get_all_raw("x-forwarded-for")
+        .map(http::HeaderValue::len)
+        .sum::<usize>()
+        + lines.saturating_sub(1);
     if bytes > MAX_BYTES {
         return Err(invalid(format!(
             "x-forwarded-for is {bytes} bytes, over {MAX_BYTES}"
         )));
     }
+    let values: Vec<_> = headers.get_all_text("x-forwarded-for").collect();
     let trusted = values
         .iter()
         .rev()
@@ -166,6 +173,26 @@ mod tests {
         let padding = "1.1.1.1, ".repeat(MAX_BYTES / 16);
         assert_eq!(
             resolve(&[&format!("{padding}203.0.113.9")], 1).unwrap(),
+            ip("203.0.113.9")
+        );
+    }
+
+    /// The cap is on the bytes received: an obs-text byte in an ignored
+    /// entry counts once, not as the two bytes of its text form.
+    #[test]
+    fn the_cap_counts_obs_text_bytes_once() {
+        let client = b", 203.0.113.9";
+        let mut raw = vec![0xffu8; MAX_BYTES - client.len()];
+        raw.extend_from_slice(client);
+        assert_eq!(raw.len(), MAX_BYTES);
+        let mut map = http::HeaderMap::new();
+        map.append(
+            "x-forwarded-for",
+            http::HeaderValue::from_bytes(&raw).unwrap(),
+        );
+        let h = Headers::from_header_map_lenient(&map);
+        assert_eq!(
+            client_ip(&h, NonZeroUsize::new(1).unwrap()).unwrap(),
             ip("203.0.113.9")
         );
     }
