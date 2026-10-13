@@ -969,7 +969,7 @@ mod service {
     use crate::addons::service::ServiceSpec;
     use crate::addons::service::testing::{addon, kit, only_when, reload, subscribed};
     use crate::testkit::upstream::service::SLOW;
-    use crate::testkit::{AddonDef, Answer, Kit, streaming_body};
+    use crate::testkit::{AddonDef, Answer, Kit, streaming_body, timed};
     use roxy_http::Body;
 
     /// Rules that read the request body, so the core consumes what the
@@ -1206,7 +1206,7 @@ mod service {
     /// still open (the service stopped reading, and roxy has not yet seen
     /// EOF) fails the exchanges on it closed at once, not when
     /// `first_byte_timeout` runs out.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_dead_write_side_fails_the_exchange_at_once() {
         let kit = kit(
             RULES,
@@ -1219,14 +1219,9 @@ mod service {
         let a = kit.h1().await.call("GET", "/x", &[], b"").await;
         assert_eq!(a.status, 200, "{a:?}");
         kit.upstream.fail_writes();
-        let started = std::time::Instant::now();
-        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+        let (a, took) = timed(async { kit.h1().await.call("GET", "/x", &[], b"").await }).await;
         assert_eq!(a.status, 503, "{a:?}");
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "failed in {:?}",
-            started.elapsed()
-        );
+        assert_eq!(took, Duration::ZERO, "failed on a deadline, not at once");
         let errs = kit.events("layer_error", 1).await;
         assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
         assert_eq!(errs[0]["kind"], "service:closed", "{errs:#?}");
@@ -1716,7 +1711,7 @@ mod service {
     /// the request until its body has ended never forwards an upgrade, and
     /// the exchange fails on `first_byte_timeout`. The same service forwards
     /// an ordinary request once its body has ended.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_service_waiting_for_request_end_never_forwards_an_upgrade() {
         let kit = kit(
             RULES,
@@ -1728,14 +1723,13 @@ mod service {
         let a = kit.h1().await.call("POST", "/x", &[], b"body").await;
         assert_eq!(a.status, 200, "{a:?}");
         assert_eq!(a.json()["body_len"], 4);
-        let started = std::time::Instant::now();
-        let (status, io) = kit.websocket("/ws", &[]).await;
+        let ((status, io), took) = timed(kit.websocket("/ws", &[])).await;
         assert_eq!(status, 503);
         assert!(io.is_none());
-        assert!(
-            started.elapsed() >= Duration::from_millis(500),
-            "failed in {:?}",
-            started.elapsed()
+        assert_eq!(
+            took,
+            Duration::from_millis(500),
+            "failed on another deadline"
         );
         let errs = kit.events("layer_error", 1).await;
         assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
@@ -1751,7 +1745,7 @@ mod service {
     /// from the end of the response body: a service that forwards and then
     /// holds the response head fails closed on `first_byte_timeout` while
     /// the upstream's body is still arriving.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_held_response_head_times_out_from_the_response_head() {
         let kit = kit(
             RULES,
@@ -1760,18 +1754,19 @@ mod service {
             })],
         )
         .await;
-        let started = std::time::Instant::now();
         // The head at once, the body over 3 s.
-        let a = kit
-            .h1()
-            .await
-            .call("GET", "/drip?n=3&ms=1000", &[], b"")
-            .await;
-        let elapsed = started.elapsed();
+        let (a, took) = timed(async {
+            kit.h1()
+                .await
+                .call("GET", "/drip?n=3&ms=1000", &[], b"")
+                .await
+        })
+        .await;
         assert_eq!(a.status, 503, "{a:?}");
-        assert!(
-            elapsed >= Duration::from_millis(700) && elapsed < Duration::from_millis(2500),
-            "failed in {elapsed:?}"
+        assert_eq!(
+            took,
+            Duration::from_millis(700),
+            "failed on another deadline, or after the body"
         );
         assert_eq!(kit.upstream.seen().len(), 1, "the request was forwarded");
         let errs = kit.events("layer_error", 1).await;
@@ -1827,7 +1822,7 @@ mod service {
     /// within `first_byte_timeout`, and fails closed when none frees up:
     /// no stream is opened for it, and the service is not blamed for more
     /// than the timeout.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_pool_full_for_the_whole_first_byte_timeout_fails_closed() {
         let kit = kit(
             RULES,
@@ -1843,13 +1838,12 @@ mod service {
         let req = busy.request("GET", "/x", &[]).body(Body::empty()).unwrap();
         let held = busy.send(req).await.unwrap();
         assert_eq!(held.status(), 200);
-        let started = std::time::Instant::now();
-        let a = kit.h1().await.call("GET", "/y", &[], b"").await;
-        let elapsed = started.elapsed();
+        let (a, took) = timed(async { kit.h1().await.call("GET", "/y", &[], b"").await }).await;
         assert_eq!(a.status, 503, "{a:?}");
-        assert!(
-            elapsed >= Duration::from_millis(500) && elapsed < Duration::from_secs(2),
-            "failed in {elapsed:?}"
+        assert_eq!(
+            took,
+            Duration::from_millis(500),
+            "failed on another deadline"
         );
         let errs = kit.events("layer_error", 1).await;
         assert_eq!(errs[0]["layer"], "s", "{errs:#?}");

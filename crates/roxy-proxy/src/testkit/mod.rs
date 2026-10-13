@@ -1299,6 +1299,16 @@ pub(crate) fn streaming_body() -> (BodySender, Body) {
     Body::channel(u64::MAX, None)
 }
 
+/// `f`'s result and the virtual time it took. Under a paused clock
+/// (`#[tokio::test(start_paused = true)]`) time passes only when a timer
+/// fires, so the duration names the deadline that ended the wait, with
+/// nothing in it from the machine the test ran on.
+pub(crate) async fn timed<T>(f: impl Future<Output = T>) -> (T, Duration) {
+    let started = tokio::time::Instant::now();
+    let out = f.await;
+    (out, started.elapsed())
+}
+
 /// What the flow log's `body_sha256` of `data` should read.
 pub(crate) fn sha256_hex(data: &[u8]) -> String {
     crate::body::hex(ring::digest::digest(&ring::digest::SHA256, data).as_ref())
