@@ -163,9 +163,12 @@ fn splice(st: &Arc<StackFlow>, index: usize, dir: Dir, own: Body, bypassed: Body
     )
 }
 
-/// The bypassed body after the layer's own, which must end without a byte
-/// or a trailer: the layer is not subscribed to this body, so anything it
-/// passes on for it is its failure.
+/// The bypassed body alongside the layer's own, which must end without a
+/// byte or a trailer: the layer is not subscribed to this body, so anything
+/// it passes on for it is its failure. The own body never holds the
+/// bypassed bytes back (a guest body's end waits for the handler to return,
+/// which on a WebSocket is the life of the socket), but the whole ends only
+/// once it has: no body completes cleanly before the exchange has settled.
 struct Spliced {
     st: Arc<StackFlow>,
     index: usize,
@@ -174,14 +177,10 @@ struct Spliced {
     bypassed: Body,
 }
 
-impl HttpBody for Spliced {
-    type Data = Bytes;
-    type Error = BodyError;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+impl Spliced {
+    /// Polls the layer's own body for what it must not carry. Pending is
+    /// not a reason to wait: the bypassed body is polled next.
+    fn poll_own(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         while let Some(own) = &mut self.own {
             match ready!(Pin::new(own).poll_frame(cx)) {
                 None => self.own = None,
@@ -199,7 +198,28 @@ impl HttpBody for Spliced {
                 }
             }
         }
-        Pin::new(&mut self.bypassed).poll_frame(cx)
+        Poll::Ready(None)
+    }
+}
+
+impl HttpBody for Spliced {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        let this = &mut *self;
+        if let Poll::Ready(Some(r)) = this.poll_own(cx) {
+            return Poll::Ready(Some(r));
+        }
+        match ready!(Pin::new(&mut this.bypassed).poll_frame(cx)) {
+            // The bypassed body has ended; the end waits for the own body,
+            // whose poll above registered the waker.
+            None if this.own.is_some() => Poll::Pending,
+            frame => Poll::Ready(frame),
+        }
     }
 
     fn is_end_stream(&self) -> bool {

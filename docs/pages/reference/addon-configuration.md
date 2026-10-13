@@ -268,8 +268,9 @@ A layer gets the upgrade request in `handle` and passes it on with `next`
 response body the upstream's for as long as the WebSocket is open. A layer
 reads, rewrites or holds back either direction as any body, refuses the
 upgrade by answering without `next`, and is left out of the WebSocket when
-its `when` skips the upgrade request or its subscription leaves out the
-body.
+its `when` skips the upgrade request. A subscription to one body puts the
+layer in that direction only: the other's bytes flow past it, however long
+its handler lives on relaying the direction it is in.
 
 - A layer that turns the upstream's `101` into another status fails the
   exchange closed (`503` from `layer:<name>`) and roxy closes the upstream
