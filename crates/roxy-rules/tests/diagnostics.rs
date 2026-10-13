@@ -318,7 +318,9 @@ fn client_chosen_key_without_where_warns() {
 - { id: b, count: requests, key: [client.ip, path] }
 - { id: c, count: unique(url) }
 - { id: d, count: requests, key: [path], where: 'host under \"example.com\"' }
-- { id: e, count: unique(query.raw), where: 'query.raw != null' }",
+- { id: e, count: unique(query.raw), where: 'query.raw != null' }
+- { id: f, count: requests, key: [client.ip, client.port] }
+- { id: g, count: requests, key: [host, client.port], where: 'host under \"example.com\"' }",
     )
     .unwrap();
     let warnings: Vec<String> = Policy::metric_warnings(&metrics)
@@ -328,8 +330,10 @@ fn client_chosen_key_without_where_warns() {
     assert_eq!(
         warnings,
         [
+            "metrics[0].key[0]: `host` is chosen by the client",
             "metrics[1].key[1]: `path` is chosen by the client",
             "metrics[2].count: `url` is chosen by the client",
+            "metrics[5].key[1]: `client.port` is chosen by the client",
         ]
     );
 }

@@ -75,12 +75,12 @@ metrics:
     window: 1m
 ```
 
-`client.ip` is bounded by who can reach the proxy; `host` by a `where` like
-this. `path`, `url` and `query.raw` have no such bound (a `where` on `host`
-limits whose paths count, not how many): `roxy check` warns when a metric
-keys on one, or counts `unique(..)` of one, with no `where`. Give such a
-metric its own `max_keys`, so filling it refuses new series in that metric
-alone.
+`client.ip` is bounded by who can reach the proxy. `roxy check` warns when a
+metric keys on any of the five fields above, or counts `unique(..)` of one,
+with no `where`. A `where` like this bounds `host`; the others have no such
+bound (a `where` on `host` limits whose paths and ports count, not how
+many), so give such a metric its own `max_keys`, so filling it refuses new
+series in that metric alone.
 
 ## State
 
