@@ -491,6 +491,36 @@ mod tests {
         assert_eq!(s.next_seq(), 8, "spooling goes on");
     }
 
+    #[test]
+    fn seq_unreserved_is_set_while_a_reservation_fails_and_cleared_once_one_lands() {
+        let failing = Arc::new(AtomicBool::new(false));
+        let f = failing.clone();
+        let s = Spool::new(
+            0,
+            Box::new(move |_| {
+                if f.load(Ordering::Relaxed) {
+                    Err("disk full".into())
+                } else {
+                    Ok(())
+                }
+            }),
+        );
+        s.reserve().unwrap();
+        for _ in 0..2 * SEQ_BLOCK {
+            s.push(b"{}");
+        }
+        assert!(!s.seq_unreserved(), "up to the mark is still reserved");
+        failing.store(true, Ordering::Relaxed);
+        s.push(b"{}");
+        assert!(s.seq_unreserved(), "one past the mark");
+        assert!(s.reserve().is_err());
+        assert!(s.seq_unreserved(), "a failed write changes nothing");
+        failing.store(false, Ordering::Relaxed);
+        s.reserve().unwrap();
+        assert!(!s.seq_unreserved());
+        assert_eq!(s.reserved_through(), 2 * SEQ_BLOCK + 1 + 2 * SEQ_BLOCK);
+    }
+
     #[tokio::test]
     async fn the_reserve_loop_tops_up_when_a_push_finds_less_than_a_block() {
         let (s, persisted) = spool(0);

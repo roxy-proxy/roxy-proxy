@@ -995,6 +995,19 @@ mod tests {
     const FLOWS: &str = "/roxy/v1/flows";
 
     #[tokio::test]
+    async fn the_lease_poll_body_reports_seq_used_past_the_reservation() {
+        let h = Harness::new().await;
+        let (node, _) = h.node(true);
+        // No reserver running: pushes outrun the startup reservation.
+        for _ in 0..=2 * crate::spool::SEQ_BLOCK {
+            node.spool().push(b"{}");
+        }
+        assert!(node.node_state().seq_unreserved);
+        node.spool().reserve().unwrap();
+        assert!(!node.node_state().seq_unreserved);
+    }
+
+    #[tokio::test]
     async fn first_start_enrols_and_a_restart_reuses_the_identity() {
         let h = Harness::new().await;
         h.mock.push("/roxy/v1/enrol", Reply::issue("n1"));

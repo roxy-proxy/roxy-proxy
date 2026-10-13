@@ -37,7 +37,7 @@ roxy does not delete the token file after enrolment.
 |---|---|
 | `node.crt` | The node certificate chain, PEM. Its URI SAN `urn:roxy:node:<id>` is the node id. |
 | `node.key` | The node's PKCS#8 key, mode `0600`. Generated on the node; never sent anywhere. |
-| `flow.seq` | The flow `seq` counter, reserved ahead in blocks of 1024 by a background task, never on the request path. A restart continues after the last reservation. If it cannot be written at startup, the node does not start. If a later write fails, roxy logs it, keeps shipping and retries; a restart before a write lands may reuse `seq` values. |
+| `flow.seq` | The flow `seq` counter, reserved ahead in blocks of 1024 by a background task, never on the request path. A restart continues after the last reservation. If it cannot be written at startup, the node does not start. If a later write fails, roxy logs it, keeps shipping and retries, and reports `seq_unreserved: true` on each lease poll until a write lands; a restart before then may reuse `seq` values. |
 | `ca/` | The interception CA, as `tls.ca_dir` holds it in file mode. |
 
 Nothing else is written: the rendered config and the secret values stay in
