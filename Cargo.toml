@@ -7,6 +7,7 @@ members = [
     "crates/roxy-node",
     "crates/roxy-proxy",
     "crates/roxy-rules",
+    "crates/roxy-state",
     "crates/roxy-tls",
     "crates/roxy-wasm",
     "crates/roxy-addon",
@@ -27,6 +28,7 @@ roxy-log = { path = "crates/roxy-log", version = "0.1.1" }
 roxy-node = { path = "crates/roxy-node", version = "0.1.1" }
 roxy-proxy = { path = "crates/roxy-proxy", version = "0.1.1" }
 roxy-rules = { path = "crates/roxy-rules", version = "0.1.1" }
+roxy-state = { path = "crates/roxy-state", version = "0.1.1" }
 roxy-tls = { path = "crates/roxy-tls", version = "0.1.1" }
 roxy-wasm = { path = "crates/roxy-wasm", version = "0.1.1" }
 

@@ -51,8 +51,8 @@ the PR (`fuzz/README.md`).
 - Crates live in `crates/`: `roxy` (the binary), `roxy-http`, `roxy-proxy`,
   `roxy-rules`, `roxy-tls`, `roxy-log`, `roxy-wasm` (the addon host),
   `roxy-addon` (the addon SDK), `roxy-node` (the node side of the
-  control-plane protocol) and `roxy-node-spec` (its OpenAPI document, for
-  tests).
+  control-plane protocol), `roxy-node-spec` (its OpenAPI document, for
+  tests) and `roxy-state` (the state dir and its atomic file writer).
 - roxy is a security boundary. The design principles (fail closed, deny
   always wins, canonical re-serialisation, ...) are not negotiable for
   convenience: if a change weakens one, raise it on the issue first.

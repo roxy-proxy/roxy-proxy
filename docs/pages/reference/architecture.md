@@ -4,10 +4,10 @@
 
 Dependencies point downward: `roxy` → `roxy-proxy`, `roxy-http`,
 `roxy-rules`, `roxy-tls`, `roxy-wasm`, `roxy-node`; `roxy-proxy` →
-`roxy-http`, `roxy-tls`, `roxy-rules`, `roxy-wasm`, `roxy-log`;
-`roxy-rules`, `roxy-wasm`, `roxy-tls` → `roxy-http`. `roxy-http`,
-`roxy-log`, `roxy-addon` and `roxy-node` depend on no other roxy crate;
-`roxy-node-spec` is tests-only. `roxy-http` and `roxy-rules` do no network
+`roxy-http`, `roxy-tls`, `roxy-rules`, `roxy-wasm`, `roxy-log`,
+`roxy-state`; `roxy-rules`, `roxy-wasm`, `roxy-tls` → `roxy-http`;
+`roxy-node` → `roxy-state`. `roxy-http`, `roxy-log`, `roxy-addon` and
+`roxy-state` depend on no other roxy crate; `roxy-node-spec` is tests-only. `roxy-http` and `roxy-rules` do no network
 I/O and are unit-tested and fuzzed directly.
 
 | crate | responsibility |
@@ -21,6 +21,7 @@ I/O and are unit-tested and fuzzed directly.
 | `roxy-log` | Buffered single-writer log destinations: one writer thread, batching, backpressure, rotation, compression. Knows bytes, not events. |
 | `roxy-addon` | SDK for Rust addon authors: generated WIT bindings and wrappers. |
 | `roxy-node` | Node side of the control-plane protocol: enrolment and renewal, lease loop, flow spool and shipper. Knows nothing of the proxy; `roxy` applies leases through a handler. |
+| `roxy-state` | The state dir: its layout (node identity, flow sequence, CA dir, quarantine marker) and the atomic writer every file in it, including the marker, goes through. |
 | `roxy-node-spec` | The node protocol's OpenAPI document (`spec/node-protocol/v1/openapi.yaml`) with validators for its body schemas, for tests. |
 | `wit/` | The `roxy:addon` WIT package: the language-agnostic addon contract. |
 

@@ -28,6 +28,7 @@ ipnet.workspace = true
 roxy-http.workspace = true
 roxy-log.workspace = true
 roxy-rules.workspace = true
+roxy-state.workspace = true
 roxy-tls.workspace = true
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "tls12", "std", "logging"] }
 serde.workspace = true

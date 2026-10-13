@@ -1,0 +1,17 @@
+[package]
+name = "roxy-state"
+description = "roxy's state dir: the node identity, flow sequence, CA dir and quarantine marker, written atomically"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

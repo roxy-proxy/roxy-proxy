@@ -7,6 +7,6 @@ pub mod identity;
 pub mod node;
 pub mod protocol;
 pub mod spool;
-pub mod state;
+pub use roxy_state as state;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
