@@ -387,6 +387,7 @@ pub(crate) mod tests {
             uptime_seconds: 42,
             policy_state: PolicyState::Loaded,
             spooled_bytes: 7,
+            seq_unreserved: false,
         }
     }
 
@@ -462,6 +463,7 @@ pub(crate) mod tests {
         assert_eq!(reported["protocol_version"], 1);
         assert_eq!(reported["policy_state"], "loaded");
         assert_eq!(reported["spooled_bytes"], 7);
+        assert_eq!(reported["seq_unreserved"], false);
         assert_eq!(reported["uptime_seconds"], 42);
         assert!(reported.get("features").is_none());
         assert!(reported.get("config_hash").is_none());

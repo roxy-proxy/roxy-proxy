@@ -55,6 +55,11 @@ pub struct NodeState {
     pub policy_state: PolicyState,
     /// Flow-log bytes accepted but not yet acknowledged.
     pub spooled_bytes: u64,
+    /// Events are being tagged with `seq` values past the persisted
+    /// reservation, because a `flow.seq` write is failing or lagging: a
+    /// restart now may reuse them, and the server's `(node_id, seq)`
+    /// deduplication would drop the reused ones.
+    pub seq_unreserved: bool,
 }
 
 /// The node's view of its own policy.

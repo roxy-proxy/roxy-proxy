@@ -118,7 +118,8 @@ state:
   "protocol_version": 1,
   "uptime_seconds": 86400,
   "policy_state": "loaded",
-  "spooled_bytes": 0
+  "spooled_bytes": 0,
+  "seq_unreserved": false
 }
 ```
 
@@ -128,6 +129,7 @@ state:
 | `roxy_version` | the node's release; the server may refuse to serve it with `426` |
 | `policy_state` | `none` (no lease yet), `loaded` (a lease is in force) or `expired` (the lease ran down, or the node is revoked) |
 | `spooled_bytes` | flow-log data accepted but not yet acknowledged |
+| `seq_unreserved` | `true` while events are being tagged with `seq` values past the node's persisted reservation, because a `flow.seq` write is failing or has not caught up. A restart in that state may reuse those `seq` values, and the server would drop the reused events as duplicates; a node reporting `true` for long needs its state directory looked at |
 
 The server answers `200` with the full lease on every poll (no conditional
 fetch), or `410`, `401`, `426`, `5xx` as in the

@@ -429,6 +429,7 @@ impl Node {
             uptime_seconds: self.started.elapsed().as_secs(),
             policy_state: self.handler.policy_state(),
             spooled_bytes: self.spool.pending_bytes(),
+            seq_unreserved: self.spool.seq_unreserved(),
         }
     }
 

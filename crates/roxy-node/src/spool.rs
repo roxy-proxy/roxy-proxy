@@ -78,8 +78,8 @@ pub struct Spool {
     /// Shipping has ended (quota exhausted, or revoked and drained): new
     /// events are not spooled.
     closed: AtomicBool,
-    /// Set while events are tagged past the persisted mark, so that is
-    /// logged once per episode.
+    /// Set while events are tagged past the persisted mark: logged once
+    /// per episode, and reported to the control plane on each lease poll.
     unreserved: AtomicBool,
     /// Wakes [`reserve_loop`] when less than a block is reserved ahead.
     reserve_wanted: tokio::sync::Notify,
@@ -167,6 +167,12 @@ impl Spool {
     /// flush window. `None` when empty.
     pub fn oldest_since(&self) -> Option<Instant> {
         lock(&self.queue).events.front().map(|e| e.since)
+    }
+
+    /// Whether events are being tagged with `seq` values past the persisted
+    /// mark, so a restart now may reuse them.
+    pub fn seq_unreserved(&self) -> bool {
+        self.unreserved.load(Ordering::Acquire)
     }
 
     /// Events dropped in `spool` mode since start.

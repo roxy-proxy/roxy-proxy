@@ -331,6 +331,7 @@ components:
         - uptime_seconds
         - policy_state
         - spooled_bytes
+        - seq_unreserved
       properties:
         lease_id:
           type: [string, "null"]
@@ -353,6 +354,12 @@ components:
           type: integer
           minimum: 0
           description: Flow-log bytes accepted but not yet acknowledged.
+        seq_unreserved:
+          type: boolean
+          description: >-
+            Events are being tagged with `seq` values past the node's
+            persisted reservation, so a restart may reuse them and the
+            reused events would be dropped as duplicates.
 
     SecretValue:
       type: string
