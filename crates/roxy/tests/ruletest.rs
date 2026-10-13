@@ -131,3 +131,28 @@ fn a_metric_the_config_does_not_define_gets_a_warning() {
         "{stderr}"
     );
 }
+
+/// The dry run reads an obs-text header value as the proxy does, one char
+/// per byte: `é` given in UTF-8 is the two characters `Ã©`, and a rule
+/// written that way matches it.
+#[test]
+fn obs_text_headers_are_matched_one_char_per_byte() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("roxy.yaml");
+    std::fs::write(
+        &cfg,
+        "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:0 }]\nhttp: { allow_obs_text: true }\n\
+         rules:\n  - { id: latin1, when: 'header[\"x-note\"] == \"caf\u{c3}\u{a9}\"', then: deny }\n  \
+         - { id: ok, then: allow }\n",
+    )
+    .unwrap();
+    let cfg = cfg.to_str().unwrap();
+    let (code, stdout, stderr) = rule_test(
+        cfg,
+        &["-H", "x-note: caf\u{e9}", "GET", "https://h.example/"],
+    );
+    assert_eq!(code, Some(3), "{stdout}{stderr}");
+    assert!(stdout.contains("rule:     latin1"), "{stdout}");
+    let (code, stdout, _) = rule_test(cfg, &["-H", "x-note: plain", "GET", "https://h.example/"]);
+    assert_eq!(code, Some(0), "{stdout}");
+}

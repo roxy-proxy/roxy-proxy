@@ -1,5 +1,7 @@
 //! Validated, ordered header fields.
 
+use std::borrow::Cow;
+
 use http::{HeaderMap, HeaderName, HeaderValue};
 
 use super::error::{ParseError, Reason, reject};
@@ -132,6 +134,15 @@ fn validate_name(name: &[u8]) -> Result<HeaderName, ParseError> {
 /// `v` in an allocation of its own. hyper parses a response head as slices
 /// of the connection's read buffer, so a value kept past the exchange (an
 /// HPACK table entry, say) would otherwise pin that whole buffer.
+/// A value as text: borrowed when it is visible ASCII, else one char per
+/// byte (ISO-8859-1).
+fn text(v: &HeaderValue) -> Cow<'_, str> {
+    match v.to_str() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(v.as_bytes().iter().map(|&b| char::from(b)).collect()),
+    }
+}
+
 fn owned(v: &HeaderValue) -> HeaderValue {
     HeaderValue::from_bytes(v.as_bytes()).unwrap_or_else(|_| v.clone())
 }
@@ -299,6 +310,27 @@ impl Headers {
     /// body is read, say) uses [`Headers::get_raw`].
     pub fn get(&self, name: &str) -> Option<&str> {
         self.get_raw(name).and_then(|v| v.to_str().ok())
+    }
+
+    /// First value of `name` as text, obs-text included: each byte is the
+    /// char of the same code point (ISO-8859-1), so the text is exactly the
+    /// bytes forwarded and a rule matching it judges what leaves. A caller
+    /// that must tell an unreadable value from an absent one, or needs the
+    /// bytes themselves, uses [`Headers::get_raw`].
+    pub fn get_text(&self, name: &str) -> Option<Cow<'_, str>> {
+        self.get_raw(name).map(text)
+    }
+
+    /// All values of `name` as text, in order, obs-text included
+    /// ([`Headers::get_text`]).
+    pub fn get_all_text<'a, 'n>(
+        &'a self,
+        name: &'n str,
+    ) -> impl Iterator<Item = Cow<'a, str>> + use<'a, 'n> {
+        self.entries
+            .iter()
+            .filter(move |(n, _)| n.as_str().eq_ignore_ascii_case(name))
+            .map(|(_, v)| text(v))
     }
 
     /// First value of `name`.
@@ -484,9 +516,26 @@ mod tests {
             allow_obs_text: true,
             ..HttpFlags::default()
         };
-        let h = Headers::try_from_raw([(&b"x"[..], &b"caf\xc3\xa9"[..])], &l, &obs).unwrap();
+        let h = Headers::try_from_raw(
+            [
+                (&b"x"[..], &b"caf\xc3\xa9"[..]),
+                (b"x", b"caf\xe9"),
+                (b"y", b"plain"),
+            ],
+            &l,
+            &obs,
+        )
+        .unwrap();
         assert_eq!(h.get_raw("x").unwrap().as_bytes(), b"caf\xc3\xa9");
         assert_eq!(h.get("x"), None);
+        // Text is one char per byte, so what a rule matches is what is
+        // forwarded: UTF-8 on the wire is two chars, Latin-1 is one.
+        assert_eq!(h.get_text("x").as_deref(), Some("caf\u{c3}\u{a9}"));
+        assert_eq!(
+            h.get_all_text("x").collect::<Vec<_>>(),
+            ["caf\u{c3}\u{a9}", "caf\u{e9}"]
+        );
+        assert!(matches!(h.get_text("y"), Some(Cow::Borrowed("plain"))));
         let e = Headers::try_from_raw([(&b"a b"[..], &b"1"[..])], &l, &f).unwrap_err();
         assert_eq!(e.reason, Reason::InvalidHeaderName);
         let e = Headers::try_from_raw([(&b"\xc3\xa9"[..], &b"1"[..])], &l, &f).unwrap_err();

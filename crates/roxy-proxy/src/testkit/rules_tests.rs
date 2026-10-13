@@ -718,3 +718,55 @@ async fn a_name_with_a_private_address_among_its_answers_is_denied() {
         UP_IP
     );
 }
+
+/// `GET /` to `up.test` with one raw header value.
+async fn send(kit: &Kit, name: &str, value: &[u8]) -> Answer {
+    let mut c = kit.h1().await;
+    let req = c
+        .request("GET", "/", &[])
+        .header(name, http::HeaderValue::from_bytes(value).unwrap())
+        .body(roxy_http::Body::empty())
+        .unwrap();
+    Answer::read(c.send(req).await.unwrap()).await
+}
+
+/// Under `allow_obs_text` the rules read a header value as the bytes that
+/// are forwarded, one char per byte: an obs-text byte cannot hide a value
+/// from a deny, and a Latin-1 literal matches the Latin-1 byte.
+#[tokio::test]
+async fn obs_text_header_values_are_matched_as_forwarded() {
+    let kit = Kit::builder()
+        .flags(|f| f.allow_obs_text = true)
+        .rules(
+            r#"
+- id: exfil
+  when: header["x-exfil"] != null and header["x-exfil"] contains "token123"
+  then: { deny: { status: 451 } }
+- id: latin1
+  when: header["x-note"] == "café"
+  then: { deny: { status: 418 } }
+- id: up
+  when: host == "up.test"
+  then: allow
+"#,
+        )
+        .start()
+        .await;
+    let a = send(&kit, "x-exfil", b"token123\xff").await;
+    assert_eq!(a.status, 451, "{a:?}");
+    assert_eq!(a.headers["x-roxy-rule"], "exfil");
+    let a = send(&kit, "x-note", b"caf\xe9").await;
+    assert_eq!(a.status, 418, "{a:?}");
+    assert_eq!(a.headers["x-roxy-rule"], "latin1");
+    // UTF-8 on the wire is two Latin-1 chars, so the literal does not
+    // match; the value goes upstream unchanged.
+    let a = send(&kit, "x-note", b"caf\xc3\xa9").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].headers["x-note"].as_bytes(), b"caf\xc3\xa9");
+    let events = kit.events("request", 3).await;
+    assert!(
+        events.iter().all(|e| e["reason"] != "missing_value"),
+        "{events:#?}"
+    );
+}

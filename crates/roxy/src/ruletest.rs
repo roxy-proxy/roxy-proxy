@@ -413,10 +413,11 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(DryRunView, Vec
             v = v.with_query(&k, &val);
         }
     }
+    // As the proxy reads them: one char per byte, so an obs-text value is
+    // matched, not dropped.
     for (n, val) in head.headers.iter() {
-        if let Ok(val) = val.to_str() {
-            v = v.with_header(n.as_str(), val);
-        }
+        let text: String = val.as_bytes().iter().map(|&b| char::from(b)).collect();
+        v = v.with_header(n.as_str(), &text);
     }
     // The body text is inspectable whether or not it is chunked; the dry
     // run has no response body, so `response.body.text` is empty too.
