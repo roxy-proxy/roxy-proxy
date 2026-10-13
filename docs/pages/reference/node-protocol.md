@@ -78,13 +78,13 @@ node acts on the status code, not the body.
 | `node_id` | chosen by the server: 1 to 128 characters from `A-Z a-z 0-9 . _ -`; stable for the life of the node |
 | `token` | the node token: 1 to 512 bytes of RFC 6750 `b64token` text (`A-Z a-z 0-9 - . _ ~ + /`, then any number of `=`), opaque to the node, which stores it and presents it unchanged as `Authorization: Bearer` on every later request. Its lifetime and storage (hashed at rest is recommended) are the server's decisions |
 | `not_after` | when the server stops accepting the token, RFC 3339 in UTC |
-| `renew_after_seconds` | counted from receipt; once passed, the node [renews](/reference/node-protocol#renew). Well inside the token lifetime, so a failed renewal can be retried. The node renews no later than two thirds of the way to `not_after` whatever the value, and does not check the schema's minimum: `0` makes it renew again as soon as each renewal succeeds |
+| `renew_after_seconds` | counted from receipt; once passed, the node [renews](/reference/node-protocol#renew). Well inside the token lifetime, so a failed renewal can be retried. Whatever the value, the node renews no later than two thirds of the way to `not_after` and no sooner than one second after receipt; it does not check the schema's minimum, so `0` renews once a second |
 
 The enrolment token's lifetime and reuse (single-use, shared across a
 fleet) are the control plane's decisions; single-use with a short expiry
 is recommended. The node writes the node token, with its `node_id` and
-`not_after`, to its state directory (mode `0600`): the only secret on disk,
-and a revocable per-node identity.
+`not_after`, to its state directory (mode `0600`): the only credential the
+protocol puts on disk, and a revocable per-node identity.
 
 ## Renew
 

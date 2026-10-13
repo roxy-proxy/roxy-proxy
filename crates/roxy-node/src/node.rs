@@ -31,6 +31,9 @@ const BACKOFF_CAP: Duration = Duration::from_secs(60);
 /// accept before giving up: a freshly issued token may not have reached
 /// every replica yet.
 pub const ENROL_REJECTED_WINDOW: Duration = Duration::from_secs(120);
+/// The least time between receiving a token and renewing it, so a server
+/// stating a renewal window of zero cannot have the node renew in a loop.
+const RENEW_FLOOR: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
@@ -356,12 +359,14 @@ impl Node {
     ) {
         // Renew no later than two thirds of the way to expiry, whatever
         // window the server stated, so a failed renewal has time to be
-        // retried.
+        // retried, and no sooner than the floor.
         let left = (not_after - self.config.clock.now())
             .to_std()
             .unwrap_or_default();
         let latest = left.mul_f64(2.0 / 3.0);
-        let renew_after = renew_after.map_or(latest, |r| r.min(latest));
+        let renew_after = renew_after
+            .map_or(latest, |r| r.min(latest))
+            .max(RENEW_FLOOR);
         *lock(&self.credential) = Some(Arc::new(Credential {
             client,
             node_id,
@@ -1994,9 +1999,10 @@ mod tests {
     }
 
     /// `renew_after_seconds` is a hint; the node renews no later than two
-    /// thirds of the way to `not_after`.
+    /// thirds of the way to `not_after` and no sooner than a second after
+    /// receipt, so a window of zero does not renew in a loop.
     #[tokio::test]
-    async fn renewal_is_never_later_than_two_thirds_of_the_token_lifetime() {
+    async fn renewal_is_between_one_second_and_two_thirds_of_the_token_lifetime() {
         let h = Harness::new().await;
         let (node, _) = h.node(true);
         let client = || {
@@ -2046,6 +2052,22 @@ mod tests {
         assert!(
             defaulted <= scaled(2000) && defaulted > scaled(1990),
             "{defaulted:?}"
+        );
+
+        node.install_credential(client(), "n1".into(), not_after, Some(Duration::ZERO));
+        let floored = renew_in(&node);
+        assert!(
+            floored <= scaled(1) && floored > scaled(1).mul_f64(0.9),
+            "{floored:?}"
+        );
+
+        // An already-expired token: the cap is zero and the floor still holds.
+        let expired = Utc::now() - chrono::Duration::seconds(1);
+        node.install_credential(client(), "n1".into(), expired, Some(Duration::ZERO));
+        let floored = renew_in(&node);
+        assert!(
+            floored <= scaled(1) && floored > scaled(1).mul_f64(0.9),
+            "{floored:?}"
         );
     }
 

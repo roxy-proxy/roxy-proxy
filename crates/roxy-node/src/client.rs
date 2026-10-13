@@ -141,10 +141,11 @@ pub struct ControlPlane {
     base: Url,
     http: reqwest::Client,
     info: NodeInfo,
-    /// The node tokens this client has held that have not expired, each
-    /// with its `not_after`, the last one active; empty before enrolment.
-    /// Earlier ones stay until they expire because the server still
-    /// accepts them, so a response that echoes one is redacted too.
+    /// The active node token, last, and the one it replaced while that is
+    /// unexpired, each with its `not_after`; empty before enrolment. The
+    /// server still accepts the previous token and may echo it, so it is
+    /// redacted too. Nothing older is held: a server only echoes the token
+    /// the request carried, and the set must not grow with renewals.
     tokens: Vec<(String, DateTime<Utc>)>,
 }
 
@@ -204,13 +205,18 @@ impl ControlPlane {
     }
 
     /// The same client presenting `token`, good until `not_after`, as the
-    /// node token. Tokens the server no longer accepts are let go here.
+    /// node token. The token it replaces is kept for redaction while it is
+    /// unexpired; anything older is let go.
     #[must_use]
     pub fn with_token(&self, token: &str, not_after: DateTime<Utc>) -> Self {
         let now = Utc::now();
         let mut next = self.clone();
-        next.tokens.retain(|(_, expiry)| *expiry > now);
-        next.tokens.push((token.to_owned(), not_after));
+        let previous = self.tokens.last().filter(|(_, expiry)| *expiry > now);
+        next.tokens = previous
+            .cloned()
+            .into_iter()
+            .chain(std::iter::once((token.to_owned(), not_after)))
+            .collect();
         next
     }
 
@@ -476,10 +482,11 @@ pub(crate) mod tests {
         Utc::now() + chrono::Duration::hours(1)
     }
 
-    /// Expired tokens leave the redaction set; the active one never does,
-    /// and a token that is a prefix of another is still wholly redacted.
+    /// The redaction set is the active token and its unexpired predecessor,
+    /// never more; the active one stays whether or not it has expired, and
+    /// a token that is a prefix of another is still wholly redacted.
     #[test]
-    fn held_tokens_are_kept_until_they_expire_and_redacted_longest_first() {
+    fn held_tokens_are_the_active_one_and_its_predecessor_redacted_longest_first() {
         let cp = ControlPlane::new("https://cp.example", &Trust::default(), info()).unwrap();
         assert_eq!(cp.secrets(), Vec::<&str>::new());
         let yesterday = Utc::now() - chrono::Duration::days(1);
@@ -498,6 +505,12 @@ pub(crate) mod tests {
             "[redacted] and [redacted] and [redacted]ef"
         );
         assert_eq!(excerpt(b"  abcd\n", &cp.secrets()), "[redacted]");
+        let cp = cp.with_token("wxyz", in_an_hour());
+        assert_eq!(
+            cp.secrets(),
+            ["abcd", "wxyz"],
+            "a renewal lets go of the token before the one it replaces"
+        );
     }
 
     #[tokio::test]
