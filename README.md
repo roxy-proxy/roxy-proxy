@@ -11,7 +11,7 @@ workloads, or a gateway in front of the APIs your clients call.
   forwards exactly that, so smuggling and header injection never reach the
   upstream. As a proxy it terminates TLS with its own CA.
 - **Rules.** A YAML policy in a small, typed rule language. Deny always wins,
-  anything no rule allows is denied, and rules can keep watching bodies as
+  anything no rule allows is denied, and rules can keep checking bodies as
   they stream. Metrics give rate limits and byte budgets, and secret
   injection means clients only hold placeholders.
 - **Addons.** WASM components or external services that every exchange
