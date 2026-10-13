@@ -37,53 +37,54 @@ runs follows from what it reads.
    puts the proxy into [quarantine](/guides/operations#quarantine): a
    matching one trips it whichever deny decided the request, a fail-closed
    included, and from the next exchange on nothing here runs at all.
-2. **After that, rules watch.** For the rest of the exchange, two kinds of
-   rule are re-checked whenever a value they read becomes known or changes:
-   rules that read a *watched* field ([fields](/reference/rule-language#fields)),
-   and `deny` rules that read a byte metric (`count: request_bytes` or
-   `response_bytes`), which this exchange adds to as bytes stream. A deny
-   reading a `requests`, `denied`, `errors` or `unique` metric is decided at
-   the head only: re-checking it after this exchange's own count would deny
-   the 30th request of a `>= 30` limit instead of the 31st. If a watching
-   deny matches, roxy stops the exchange: an error response if the response
-   has not started, otherwise HTTP/1.1 breaks the connection without
-   finishing the body and HTTP/2 resets the stream. Nothing overrides a
-   deny.
-3. **Only head rules can `allow`.** A rule that reads a watched field cannot
-   allow, change the request (`set_header` on the request, `rewrite_path`,
-   `redirect`, ...), `capture` or `digest`: the request is already on its
-   way, so each is a compile error. It can deny or quarantine, and add
-   effects that still make sense: `log`, `tag`, `set_state`, and header
-   changes on a response that has not been sent yet.
-4. **A watching rule's non-terminal effects apply once**, the first time it
+2. **After that, rules run in flight.** For the rest of the exchange, two
+   kinds of rule are re-checked whenever a value they read becomes known or
+   changes: rules that read an *in-flight* field
+   ([fields](/reference/rule-language#fields)), and `deny` rules that read a
+   byte metric (`count: request_bytes` or `response_bytes`), which this
+   exchange adds to as bytes stream. A deny reading a `requests`, `denied`,
+   `errors` or `unique` metric is decided at admission only: re-checking it
+   after this exchange's own count would deny the 30th request of a `>= 30`
+   limit instead of the 31st. If an in-flight deny matches, roxy stops the
+   exchange: an error response if the response has not started, otherwise
+   HTTP/1.1 breaks the connection without finishing the body and HTTP/2
+   resets the stream. Nothing overrides a deny.
+3. **Only admission rules can `allow`.** A rule that reads an in-flight
+   field cannot allow, change the request (`set_header` on the request,
+   `rewrite_path`, `redirect`, ...), `capture` or `digest`: the request is
+   already on its way, so each is a compile error. It can deny or
+   quarantine, and add effects that still make sense: `log`, `tag`,
+   `set_state`, and header changes on a response that has not been sent
+   yet.
+4. **An in-flight rule's non-terminal effects apply once**, the first time it
    matches.
 5. **Order matters for effects, not decisions.** Rules are evaluated top to
    bottom. If the request is allowed, the effects of every matching rule
    apply in list order; if two set the same header, the later wins. A deny
-   does not cut evaluation short, at the head or while watching: every
+   does not cut evaluation short, at admission or in flight: every
    rule the pass checks still runs. If the request is denied, or a change
    to it fails (which denies it with `_fail_closed`, reason
    `effect_invalid`), the `log` and `set_state` effects of the matching
    rules still apply, and the request's metric samples count it as denied.
-   An unavailable input is the exception: it stops head evaluation at that
+   An unavailable input is the exception: it stops admission evaluation at that
    rule, so the rules below it do not run, their `log` and `set_state` do
    not apply, and `rules` in the flow log lists only the rules above it.
    Allow options (`upgrade`, `private_ok`) come from the first matching
    allow only. The flow log names the first matching deny (or allow) as
    `terminal_rule`.
 6. **A tag is visible to the rules below the rule that set it.** A rule
-   that reads a tag must come after every rule that sets it (a head rule
-   above it, or, for a watching rule, any head rule); otherwise the config
-   is rejected, since moving a rule would change what it sees. A tag set
-   by a watching rule can be read by no other rule: watching rules fire
-   when the values they read arrive, not in list order, so whether the tag
-   was visible would depend on timing. A deny that reads a byte metric can
-   fire while watching too, so a watching rule cannot read its tag; a head
-   rule below it can. A rule may read its own tag, and a tag no rule sets
-   (from an addon).
+   that reads a tag must come after every rule that sets it (an admission
+   rule above it, or, for an in-flight rule, any admission rule); otherwise
+   the config is rejected, since moving a rule would change what it sees. A
+   tag set by an in-flight rule can be read by no other rule: in-flight
+   rules fire when the values they read arrive, not in list order, so
+   whether the tag was visible would depend on timing. A deny that reads a
+   byte metric can fire in flight too, so an in-flight rule cannot read its
+   tag; an admission rule below it can. A rule may read its own tag, and a
+   tag no rule sets (from an addon).
 
-`roxy check` and `roxy rule test` report whether each rule is decided at the
-head or watches.
+`roxy check` and `roxy rule test` report whether each rule is decided at
+admission or in flight.
 
 **Unavailable inputs fail closed.** If a rule needs a metric value, an
 address-list lookup or a secret and it is unavailable (store overloaded,

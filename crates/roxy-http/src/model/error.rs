@@ -367,7 +367,7 @@ pub enum BodyError {
     /// The upstream body stream failed.
     #[error("upstream body error: {0}")]
     Upstream(String),
-    /// The exchange was stopped by policy (a watching rule matched, or its
+    /// The exchange was stopped by policy (an in-flight rule matched, or its
     /// evaluation failed closed). The body is cut where it stood.
     #[error("stopped by policy")]
     Stopped,

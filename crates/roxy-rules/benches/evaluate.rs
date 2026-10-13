@@ -76,29 +76,29 @@ fn bench(c: &mut Criterion) {
     let allowed = request("api.github.com");
     let denied = request("evil.example.net");
     assert_eq!(
-        p.evaluate_head(&allowed, &ctx).terminal_rule,
+        p.evaluate_admission(&allowed, &ctx).terminal_rule,
         "github-reads"
     );
-    assert!(p.evaluate_head(&denied, &ctx).decision.is_deny());
+    assert!(p.evaluate_admission(&denied, &ctx).decision.is_deny());
 
     c.bench_function("evaluate_100_rules_last_matches", |b| {
-        b.iter(|| p.evaluate_head(black_box(&allowed), &ctx));
+        b.iter(|| p.evaluate_admission(black_box(&allowed), &ctx));
     });
     c.bench_function("evaluate_100_rules_default_deny", |b| {
-        b.iter(|| p.evaluate_head(black_box(&denied), &ctx));
+        b.iter(|| p.evaluate_admission(black_box(&denied), &ctx));
     });
 
-    // The per-chunk path: a request body chunk re-checks the one watching
+    // The per-chunk path: a request body chunk re-checks the one in-flight
     // rule, which does not match (no allocation).
-    let mut st = p.watch_state(&[]);
+    let mut st = p.in_flight_state(&[]);
     let chunk = allowed.clone().with_int(Field::BodyBytes, 1 << 20);
     assert!(
-        p.evaluate_watching(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &chunk,)
+        p.evaluate_in_flight(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &chunk,)
             .is_none()
     );
-    c.bench_function("watching_body_chunk_no_match", |b| {
+    c.bench_function("in_flight_body_chunk_no_match", |b| {
         b.iter(|| {
-            p.evaluate_watching(
+            p.evaluate_in_flight(
                 Reads::BODY_BYTES,
                 Reads::BODY_BYTES,
                 &mut st,
@@ -106,10 +106,10 @@ fn bench(c: &mut Criterion) {
             )
         });
     });
-    // An event no rule watches: one mask test.
-    c.bench_function("watching_unwatched_event", |b| {
+    // An event no rule triggers on: one mask test.
+    c.bench_function("in_flight_untriggered_event", |b| {
         b.iter(|| {
-            p.evaluate_watching(
+            p.evaluate_in_flight(
                 black_box(Reads::RESPONSE_BODY_BYTES),
                 Reads::ALL,
                 &mut st,

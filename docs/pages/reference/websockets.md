@@ -69,7 +69,7 @@ client's offer and the upstream's answer pass through untouched.
 
 ## Message rules
 
-Rules that read `ws.*` are watching rules
+Rules that read `ws.*` are in-flight rules
 ([evaluation](/design/policy-evaluation)), checked on every message after
 the `101`:
 
@@ -99,7 +99,7 @@ messages: `ws.opcode == 2` denies binary messages, while `ws.opcode != 1`
 also denies every ping.
 
 A matching deny closes both sides with `1008`. A rule cannot drop or edit a
-single message (that is for addons). A watching rule's `log`, `tag` and
+single message (that is for addons). An in-flight rule's `log`, `tag` and
 `set_state` effects apply once per WebSocket, the first time it matches.
 
 ### Parsing

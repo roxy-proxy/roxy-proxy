@@ -32,7 +32,7 @@ fn post(host: &str, path: &str) -> MapView {
 }
 
 #[test]
-fn matches_head_fields() {
+fn matches_admission_fields() {
     let c =
         condition(r#"host under "anthropic.com" and method == POST and path starts_with "/v1/""#);
     assert_eq!(
@@ -67,7 +67,7 @@ fn reads_metrics_and_state() {
 }
 
 #[test]
-fn byte_metrics_are_read_at_the_head() {
+fn byte_metrics_are_read_at_admission() {
     let c = condition("metric.egress > 1mb");
     assert_eq!(
         c.matches(&MapView::new().with_metric("egress", 0), &[]),
@@ -96,7 +96,7 @@ fn rejects_late_fields() {
     ] {
         let err = try_condition(src).expect_err(src).join("\n");
         assert!(err.starts_with("addons[0].when: "), "{err}");
-        assert!(err.contains("may only read head fields"), "{err}");
+        assert!(err.contains("may only read admission fields"), "{err}");
         assert!(err.contains(field), "{src}: {err}");
     }
 }

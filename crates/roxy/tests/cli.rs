@@ -36,18 +36,21 @@ fn check_configs_pass() {
         );
         assert!(text(&out.stdout).contains(": OK"));
     }
-    // `check` says which rules are decided at the head and which watch.
+    // `check` says which rules are decided at admission and which in flight.
     let out = roxy(&["check", "--config", fixture("full.yaml").to_str().unwrap()]);
     let stdout = text(&out.stdout);
     assert!(stdout.contains("\nrules:\n"), "{stdout}");
-    assert!(stdout.contains("  github-reads      head\n"), "{stdout}");
     assert!(
-        stdout.contains("  upload-cap        watching: body.bytes\n"),
+        stdout.contains("  github-reads      admission\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  upload-cap        in-flight: body.bytes\n"),
         "{stdout}"
     );
     assert!(
         stdout.contains(
-            "  egress-budget     head, then watching: metric.egress_bytes (request_bytes)\n"
+            "  egress-budget     admission, then in-flight: metric.egress_bytes (request_bytes)\n"
         ),
         "{stdout}"
     );
@@ -531,18 +534,18 @@ fn rule_test_shows_secret_placeholders() {
 }
 
 #[test]
-fn rule_test_watching_rules_and_bad_input() {
+fn rule_test_in_flight_rules_and_bad_input() {
     // A response value runs the rules that read it; this one only logs.
     let out = rule_test(&["--response-status", "503", "GET", "https://api.github.com/"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let stdout = text(&out.stdout);
     assert!(
-        stdout.contains("  log-upstream-5xx  watching: response.status\n"),
+        stdout.contains("  log-upstream-5xx  in-flight: response.status\n"),
         "{stdout}"
     );
     assert!(
         stdout.contains(
-            "watching:\n  matched:  log-upstream-5xx\n  - log warn: upstream 5xx\n  stops:    no\n"
+            "in-flight:\n  matched:  log-upstream-5xx\n  - log warn: upstream 5xx\n  stops:    no\n"
         ),
         "{stdout}"
     );
@@ -567,7 +570,7 @@ fn rule_test_watching_rules_and_bad_input() {
         "{stdout}"
     );
     assert!(stdout.contains("rule:     upload-cap"), "{stdout}");
-    // Under the cap: allowed by the head rule.
+    // Under the cap: allowed by the admission rule.
     let out = rule_test(&[
         "--body-bytes",
         "1000",

@@ -13,9 +13,9 @@
 //! - `conn`: the connection state machines (proxy port, CONNECT, sniff,
 //!   TLS termination, tunnels, `roxy.internal`).
 //! - `pipeline`: the core's fixed request and response steps, the
-//!   `Verdict` they return (consumed exhaustively), the head decision and
+//!   `Verdict` they return (consumed exhaustively), the admission decision and
 //!   its effects, the per-flow context.
-//! - `watch`: the per-exchange watcher: watching rules re-checked as body
+//! - `in_flight`: the per-exchange in-flight checker: rules re-checked as body
 //!   bytes stream, at the response head and in the WebSocket relay, and
 //!   byte metrics recorded as they stream.
 //! - `exchange`: the transport-agnostic exchange core (`process`: request
@@ -46,6 +46,7 @@ mod conn;
 mod exchange;
 pub mod flowlog;
 mod h2conn;
+mod in_flight;
 pub mod io;
 pub mod listener;
 mod pipeline;
@@ -58,7 +59,6 @@ pub mod sources;
 mod testkit;
 pub mod upstream;
 mod view;
-mod watch;
 
 pub use addrlist::{AddressList, AddressLists, ListError};
 pub use ca_server::{PEM_CONTENT_TYPE, POLICY_HEADER};

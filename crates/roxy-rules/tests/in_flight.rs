@@ -1,11 +1,11 @@
-//! Watching evaluation: rules re-checked after forwarding.
+//! In-flight evaluation: rules re-checked after forwarding.
 
 mod common;
 
 use common::{compile, try_compile};
 use roxy_rules::{
-    Decision, Deny, DenyStatus, EvalContext, FailClosedReason, Field, LogLevel, MapView, Reads,
-    RuleKind, Type, WatchEffect,
+    Decision, Deny, DenyStatus, EvalContext, FailClosedReason, Field, InFlightEffect, LogLevel,
+    MapView, Reads, RuleKind, Type,
 };
 
 const ALL: Reads = Reads::ALL;
@@ -34,27 +34,27 @@ fn classification() {
     assert_eq!(
         kinds,
         [
-            RuleKind::Head,
-            RuleKind::Watching,
-            RuleKind::Watching,
-            RuleKind::Watching,
-            RuleKind::Watching,
+            RuleKind::Admission,
+            RuleKind::InFlight,
+            RuleKind::InFlight,
+            RuleKind::InFlight,
+            RuleKind::InFlight,
         ]
     );
-    assert!(p.watches(Reads::BODY_BYTES));
-    assert!(p.watches(Reads::RESPONSE_HEAD));
-    assert!(!p.watches(Reads::WS));
+    assert!(p.triggers_on(Reads::BODY_BYTES));
+    assert!(p.triggers_on(Reads::RESPONSE_HEAD));
+    assert!(!p.triggers_on(Reads::WS));
     assert!(!p.reads_ws());
-    // A policy without watching rules watches nothing.
-    let head_only = compile("", "- { id: a, then: allow }");
-    assert!(!head_only.watches(ALL));
-    assert_eq!(head_only.byte_metrics(), Reads::NONE);
+    // A policy without in-flight rules triggers on nothing.
+    let admission_only = compile("", "- { id: a, then: allow }");
+    assert!(!admission_only.triggers_on(ALL));
+    assert_eq!(admission_only.byte_metrics(), Reads::NONE);
 }
 
 /// Classification follows the catalogue: for every field, a rule reading
-/// it watches exactly when `Field::watched` says so, and is re-checked by
-/// exactly that value. A field added to the catalogue is covered without a
-/// case here.
+/// it runs in flight exactly when `Field::in_flight` says so, and is
+/// re-checked by exactly that value. A field added to the catalogue is
+/// covered without a case here.
 #[test]
 fn every_field_classifies_by_its_own_metadata() {
     for f in Field::ALL {
@@ -70,17 +70,17 @@ fn every_field_classifies_by_its_own_metadata() {
             &format!("- {{ id: r, when: {f} == {literal}, then: deny }}"),
         );
         let info = &p.rule_info()[0];
-        let reads = Reads::from(f.watched());
+        let reads = Reads::from(f.in_flight());
         let want = if reads.is_empty() {
-            RuleKind::Head
+            RuleKind::Admission
         } else {
-            RuleKind::Watching
+            RuleKind::InFlight
         };
         assert_eq!(info.kind, want, "{f}");
         assert_eq!(info.triggers, reads, "{f}");
-        assert_eq!(f.is_head(), reads.is_empty(), "{f}");
+        assert_eq!(f.is_admission(), reads.is_empty(), "{f}");
         if !reads.is_empty() {
-            assert_eq!(info.watches, [f.name()], "{f}");
+            assert_eq!(info.in_flight_reads, [f.name()], "{f}");
         }
     }
 }
@@ -89,40 +89,40 @@ fn every_field_classifies_by_its_own_metadata() {
 fn effects_apply_once_and_a_deny_stops() {
     let p = compile("", POLICY);
     let ctx = EvalContext::empty();
-    let head = p.evaluate_head(&MapView::new(), &ctx);
+    let head = p.evaluate_admission(&MapView::new(), &ctx);
     assert_eq!(head.terminal_rule, "allow-all");
-    let mut st = p.watch_state(&head.tags);
+    let mut st = p.in_flight_state(&head.tags);
     let at = |n: i64| MapView::new().with_int(Field::BodyBytes, n);
     let changed = Reads::BODY_BYTES;
 
     // Nothing matches: `None`.
     assert_eq!(
-        p.evaluate_watching(changed, changed, &mut st, &at(10),),
+        p.evaluate_in_flight(changed, changed, &mut st, &at(10),),
         None
     );
     // Crossing 1 KiB: effects and a tag, once.
     let o = p
-        .evaluate_watching(changed, changed, &mut st, &at(2048))
+        .evaluate_in_flight(changed, changed, &mut st, &at(2048))
         .unwrap();
     assert!(!o.stops());
     assert_eq!(o.matched, ["upload-log"].map(roxy_rules::RuleId::new));
     assert_eq!(o.tags, ["big-upload"]);
     assert_eq!(
         o.effects,
-        [WatchEffect::Log {
+        [InFlightEffect::Log {
             level: LogLevel::Info,
             message: "big upload".into()
         }]
     );
     assert_eq!(st.tags, ["metered", "big-upload"]);
     assert_eq!(
-        p.evaluate_watching(changed, changed, &mut st, &at(4096),),
+        p.evaluate_in_flight(changed, changed, &mut st, &at(4096),),
         None,
-        "a watching rule's effects apply once"
+        "an in-flight rule's effects apply once"
     );
     // Crossing 10 KiB: stop.
     let o = p
-        .evaluate_watching(changed, changed, &mut st, &at(20_000))
+        .evaluate_in_flight(changed, changed, &mut st, &at(20_000))
         .unwrap();
     assert_eq!(
         o.stop,
@@ -135,25 +135,25 @@ fn effects_apply_once_and_a_deny_stops() {
     assert_eq!(o.terminal_rule.unwrap(), "upload-cap");
     assert!(st.is_stopped());
     // After a stop nothing is evaluated again.
-    assert_eq!(p.evaluate_watching(ALL, ALL, &mut st, &at(1 << 30),), None);
+    assert_eq!(p.evaluate_in_flight(ALL, ALL, &mut st, &at(1 << 30),), None);
 }
 
 #[test]
 fn rules_wait_until_everything_they_read_is_known() {
     let p = compile("", POLICY);
-    let mut st = p.watch_state(&["metered".to_owned()]);
+    let mut st = p.in_flight_state(&["metered".to_owned()]);
     let v = MapView::new()
         .with_int(Field::BodyBytes, 10)
         .with_int(Field::ResponseStatus, 500)
         .with_int(Field::ResponseBodyBytes, 2 << 20);
     // A body-bytes event does not re-check response rules.
     assert_eq!(
-        p.evaluate_watching(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &v,),
+        p.evaluate_in_flight(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &v,),
         None
     );
     // Response head known, but `response.body.bytes` is not yet.
     assert_eq!(
-        p.evaluate_watching(
+        p.evaluate_in_flight(
             Reads::RESPONSE_HEAD,
             Reads::BODY_BYTES | Reads::RESPONSE_HEAD,
             &mut st,
@@ -162,7 +162,7 @@ fn rules_wait_until_everything_they_read_is_known() {
         None
     );
     let o = p
-        .evaluate_watching(Reads::RESPONSE_BODY_BYTES, ALL, &mut st, &v)
+        .evaluate_in_flight(Reads::RESPONSE_BODY_BYTES, ALL, &mut st, &v)
         .unwrap();
     assert_eq!(o.terminal_rule.unwrap(), "download-cap");
 }
@@ -170,15 +170,15 @@ fn rules_wait_until_everything_they_read_is_known() {
 #[test]
 fn response_header_effects() {
     let p = compile("", POLICY);
-    let mut st = p.watch_state(&[]);
+    let mut st = p.in_flight_state(&[]);
     let v = MapView::new().with_int(Field::ResponseStatus, 200);
     let o = p
-        .evaluate_watching(Reads::RESPONSE_HEAD, Reads::RESPONSE_HEAD, &mut st, &v)
+        .evaluate_in_flight(Reads::RESPONSE_HEAD, Reads::RESPONSE_HEAD, &mut st, &v)
         .unwrap();
     assert!(!o.stops());
     assert_eq!(
         o.effects,
-        [WatchEffect::SetHeader {
+        [InFlightEffect::SetHeader {
             name: "x-checked".into(),
             value: "1".into()
         }]
@@ -192,9 +192,9 @@ fn errors_stop_the_exchange() {
         "",
         "- { id: a, then: allow }\n- { id: w, when: 'response.body.size > 1mb', then: deny }",
     );
-    let mut st = p.watch_state(&[]);
+    let mut st = p.in_flight_state(&[]);
     let o = p
-        .evaluate_watching(
+        .evaluate_in_flight(
             Reads::RESPONSE_HEAD,
             Reads::RESPONSE_HEAD,
             &mut st,
@@ -209,15 +209,15 @@ fn errors_stop_the_exchange() {
     );
     assert!(st.is_stopped());
 
-    // A non-deny watching rule that fails also stops: errors never let the
+    // A non-deny in-flight rule that fails also stops: errors never let the
     // exchange continue.
     let p = compile(
         "",
         "- { id: w, when: 'response.header[\"x\"] contains \"y\"', then: { log: { level: info, message: m } } }",
     );
-    let mut st = p.watch_state(&[]);
+    let mut st = p.in_flight_state(&[]);
     let o = p
-        .evaluate_watching(ALL, ALL, &mut st, &MapView::new())
+        .evaluate_in_flight(ALL, ALL, &mut st, &MapView::new())
         .unwrap();
     assert!(o.stops());
     assert_eq!(o.effects, [], "no effects from a failed evaluation");
@@ -227,9 +227,9 @@ fn errors_stop_the_exchange() {
         "- { id: egress, count: request_bytes }",
         "- { id: cap, when: 'metric.egress > 1mb', then: deny }",
     );
-    let mut st = p.watch_state(&[]);
+    let mut st = p.in_flight_state(&[]);
     let o = p
-        .evaluate_watching(
+        .evaluate_in_flight(
             Reads::METRIC_REQUEST_BYTES,
             Reads::NONE,
             &mut st,
@@ -242,12 +242,12 @@ fn errors_stop_the_exchange() {
     );
 }
 
-/// A deny reading a byte metric takes part in the head decision and is
+/// A deny reading a byte metric takes part in the admission decision and is
 /// re-checked as this exchange adds bytes. A deny reading a request-count
 /// metric is not re-checked (it would deny the 30th request of a `>= 30`
 /// limit, counting itself).
 #[test]
-fn byte_metric_denies_watch() {
+fn byte_metric_denies_in_flight() {
     let metrics = "- { id: egress, count: request_bytes }\n- { id: n, count: requests }";
     let p = compile(
         metrics,
@@ -263,8 +263,8 @@ fn byte_metric_denies_watch() {
 ",
     );
     let info = p.rule_info();
-    assert_eq!(info[1].kind, RuleKind::HeadAndWatching);
-    assert_eq!(info[2].kind, RuleKind::Head);
+    assert_eq!(info[1].kind, RuleKind::AdmissionAndInFlight);
+    assert_eq!(info[2].kind, RuleKind::Admission);
     assert_eq!(p.byte_metrics(), Reads::METRIC_REQUEST_BYTES);
     let ctx = EvalContext::empty();
     let v = |egress: i64, n: i64| {
@@ -272,19 +272,19 @@ fn byte_metric_denies_watch() {
             .with_metric("egress", egress)
             .with_metric("n", n)
     };
-    // At the head, already over: deny.
+    // At admission, already over: deny.
     assert_eq!(
-        p.evaluate_head(&v(2 << 20, 0), &ctx).terminal_rule,
+        p.evaluate_admission(&v(2 << 20, 0), &ctx).terminal_rule,
         "budget"
     );
-    let head = p.evaluate_head(&v(0, 29), &ctx);
+    let head = p.evaluate_admission(&v(0, 29), &ctx);
     assert_eq!(head.terminal_rule, "ok");
-    let mut st = p.watch_state(&head.tags);
+    let mut st = p.in_flight_state(&head.tags);
     // `n` grew to 30 because of this exchange: not re-checked.
-    assert_eq!(p.evaluate_watching(ALL, ALL, &mut st, &v(1000, 30),), None);
+    assert_eq!(p.evaluate_in_flight(ALL, ALL, &mut st, &v(1000, 30),), None);
     // The upload pushes egress over the budget: stop.
     let o = p
-        .evaluate_watching(
+        .evaluate_in_flight(
             Reads::BODY_BYTES | Reads::METRIC_REQUEST_BYTES,
             Reads::BODY_BYTES,
             &mut st,
@@ -292,20 +292,20 @@ fn byte_metric_denies_watch() {
         )
         .unwrap();
     assert_eq!(o.terminal_rule.unwrap(), "budget");
-    // A non-deny rule reading a byte metric is a head rule.
+    // A non-deny rule reading a byte metric is an admission rule.
     let p = compile(
         metrics,
         "- { id: t, when: 'metric.egress > 1mb', then: { tag: heavy } }",
     );
-    assert_eq!(p.rule_info()[0].kind, RuleKind::Head);
+    assert_eq!(p.rule_info()[0].kind, RuleKind::Admission);
 }
 
-/// Watching rules fire when the values they read arrive, not in list
-/// order, so a tag set by one is visible to another watching rule only by
+/// In-flight rules fire when the values they read arrive, not in list
+/// order, so a tag set by one is visible to another in-flight rule only by
 /// timing: the reader below would see it after a slow upload and not after
 /// a fast one. The compiler rejects the read wherever the setter sits.
 #[test]
-fn watching_rules_cannot_read_tags_set_by_watching_rules() {
+fn in_flight_rules_cannot_read_tags_set_by_in_flight_rules() {
     for rules in [
         r#"
 - id: big
@@ -326,9 +326,9 @@ fn watching_rules_cannot_read_tags_set_by_watching_rules() {
     ] {
         let err = try_compile("", rules).unwrap_err().join("\n");
         assert!(err.contains("reads `tag[\"big\"]`"), "{err}");
-        assert!(err.contains("(\"big\"), a watching rule"), "{err}");
+        assert!(err.contains("(\"big\"), an in-flight rule"), "{err}");
     }
-    // A head setter anywhere in the list is fine for a watching reader.
+    // An admission setter anywhere in the list is fine for an in-flight reader.
     compile(
         "",
         r#"
@@ -343,7 +343,7 @@ fn watching_rules_cannot_read_tags_set_by_watching_rules() {
 }
 
 #[test]
-fn watching_rules_cannot_allow_or_change_the_request() {
+fn in_flight_rules_cannot_allow_or_change_the_request() {
     for (rule, want) in [
         (
             "{ id: a, when: 'body.bytes > 1', then: allow }",
@@ -367,15 +367,15 @@ fn watching_rules_cannot_allow_or_change_the_request() {
         ),
         (
             "{ id: a, when: 'body.bytes > 1', then: { capture: both } }",
-            "`capture` is decided at the request head",
+            "`capture` is decided at admission",
         ),
         (
             "{ id: a, when: 'body.bytes > 1', then: { digest: both } }",
-            "`digest` is decided at the request head",
+            "`digest` is decided at admission",
         ),
         (
             "{ id: a, when: 'response.status == 1', then: { set_header: { x: \"${secret:gh}\" } } }",
-            "secret references are only allowed in rules decided at the request head",
+            "secret references are only allowed in admission rules",
         ),
     ] {
         let err = try_compile("", &format!("- {rule}"))
@@ -383,7 +383,7 @@ fn watching_rules_cannot_allow_or_change_the_request() {
             .join("\n");
         assert!(err.contains(want), "{rule}: {err}");
     }
-    // A response header change in a rule reading only response-head values
+    // A response header change in a rule reading only response-admission values
     // (and the buffered body) is fine.
     compile(
         "",
@@ -391,13 +391,13 @@ fn watching_rules_cannot_allow_or_change_the_request() {
     );
 }
 
-/// A deny watching a byte metric can fire while watching, and a pass runs
-/// every triggered rule even after a deny matched, so a watching reader of
+/// A deny on a byte metric can fire in flight, and a pass runs every
+/// triggered rule even after a deny matched, so an in-flight reader of
 /// its tag would see the tag only when both fire in the same pass. The
-/// compiler rejects that read wherever the reader sits; a head reader below
-/// the setter sees the tag exactly when the setter matched at the head.
+/// compiler rejects that read wherever the reader sits; an admission reader
+/// below the setter sees the tag exactly when the setter matched at admission.
 #[test]
-fn watching_reader_of_a_head_and_watching_setters_tag_is_rejected() {
+fn in_flight_reader_of_an_admission_and_in_flight_setters_tag_is_rejected() {
     let metrics = "- { id: egress, count: request_bytes }";
     let setter = r"
 - id: budget
@@ -416,7 +416,7 @@ fn watching_reader_of_a_head_and_watching_setters_tag_is_rejected() {
     ] {
         let err = try_compile(metrics, &rules).unwrap_err().join("\n");
         assert!(err.contains("reads `tag[\"over\"]`"), "{err}");
-        assert!(err.contains("a deny watching a byte metric"), "{err}");
+        assert!(err.contains("a deny on a byte metric"), "{err}");
     }
     let p = compile(
         metrics,
@@ -424,16 +424,16 @@ fn watching_reader_of_a_head_and_watching_setters_tag_is_rejected() {
             "{setter}- {{ id: note, when: 'tag[\"over\"]', then: {{ log: {{ level: info, message: over }} }} }}\n{tail}"
         ),
     );
-    assert_eq!(p.rule_info()[0].kind, RuleKind::HeadAndWatching);
-    assert_eq!(p.rule_info()[1].kind, RuleKind::Head);
+    assert_eq!(p.rule_info()[0].kind, RuleKind::AdmissionAndInFlight);
+    assert_eq!(p.rule_info()[1].kind, RuleKind::Admission);
 }
 
-/// A watching deny does not cut the pass short: the rules below it that
+/// An in-flight deny does not cut the pass short: the rules below it that
 /// the same event triggers are still checked, and their `log` and
-/// `set_state` effects and tags apply, as they do at the head. The first
+/// `set_state` effects and tags apply, as they do at admission. The first
 /// deny in list order is the terminal rule.
 #[test]
-fn a_watching_deny_keeps_the_effects_of_the_rules_below_it() {
+fn an_in_flight_deny_keeps_the_effects_of_the_rules_below_it() {
     let p = compile(
         "",
         r#"
@@ -453,10 +453,10 @@ fn a_watching_deny_keeps_the_effects_of_the_rules_below_it() {
   then: { deny: { status: 400 } }
 "#,
     );
-    let mut st = p.watch_state(&[]);
+    let mut st = p.in_flight_state(&[]);
     let changed = Reads::BODY_BYTES;
     let o = p
-        .evaluate_watching(
+        .evaluate_in_flight(
             changed,
             changed,
             &mut st,
@@ -480,12 +480,12 @@ fn a_watching_deny_keeps_the_effects_of_the_rules_below_it() {
     assert_eq!(
         o.effects,
         [
-            WatchEffect::SetState {
+            InFlightEffect::SetState {
                 key: "last-big".into(),
                 value: "1".into(),
                 ttl: None,
             },
-            WatchEffect::Log {
+            InFlightEffect::Log {
                 level: LogLevel::Info,
                 message: "big upload".into(),
             },
@@ -493,8 +493,8 @@ fn a_watching_deny_keeps_the_effects_of_the_rules_below_it() {
     );
     assert!(st.is_stopped());
 
-    // An unavailable input below a matching deny fails closed, as at the
-    // head: the log must not name a deny that masked it.
+    // An unavailable input below a matching deny fails closed, as at
+    // admission: the log must not name a deny that masked it.
     let p = compile(
         "",
         r"
@@ -506,9 +506,9 @@ fn a_watching_deny_keeps_the_effects_of_the_rules_below_it() {
   then: deny
 ",
     );
-    let mut st = p.watch_state(&[]);
+    let mut st = p.in_flight_state(&[]);
     let o = p
-        .evaluate_watching(
+        .evaluate_in_flight(
             ALL,
             ALL,
             &mut st,
@@ -524,7 +524,7 @@ fn a_watching_deny_keeps_the_effects_of_the_rules_below_it() {
     assert_eq!(o.matched, ["cap"].map(roxy_rules::RuleId::new));
 }
 
-/// A rule reading two watched fields is checked only once both are known:
+/// A rule reading two in-flight fields is checked only once both are known:
 /// a change to one of them while the other is still unknown is skipped
 /// rather than evaluated against a missing value, and an event the rule
 /// does not read never checks it, however much is known.
@@ -545,21 +545,21 @@ fn a_rule_waits_for_a_field_that_arrives_on_a_later_event() {
             .with_int(Field::BodyBytes, body)
             .with_int(Field::ResponseStatus, 200)
     };
-    let mut st = p.watch_state(&[]);
+    let mut st = p.in_flight_state(&[]);
     // Body bytes known and over the limit, response head not yet: skipped.
     assert_eq!(
-        p.evaluate_watching(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &v(2048)),
+        p.evaluate_in_flight(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &v(2048)),
         None
     );
     assert!(!st.is_stopped());
     // Everything known, but the event is one the rule does not read.
     assert_eq!(
-        p.evaluate_watching(Reads::RESPONSE_BODY_BYTES, ALL, &mut st, &v(2048)),
+        p.evaluate_in_flight(Reads::RESPONSE_BODY_BYTES, ALL, &mut st, &v(2048)),
         None
     );
     // The response head arrives: both fields known, the rule fires.
     let o = p
-        .evaluate_watching(
+        .evaluate_in_flight(
             Reads::RESPONSE_HEAD,
             Reads::BODY_BYTES | Reads::RESPONSE_HEAD,
             &mut st,
@@ -570,9 +570,9 @@ fn a_rule_waits_for_a_field_that_arrives_on_a_later_event() {
 
     // Evaluated false once everything is known, a rule is re-checked when
     // one of its fields changes again.
-    let mut st = p.watch_state(&[]);
+    let mut st = p.in_flight_state(&[]);
     assert_eq!(
-        p.evaluate_watching(
+        p.evaluate_in_flight(
             Reads::RESPONSE_HEAD,
             Reads::BODY_BYTES | Reads::RESPONSE_HEAD,
             &mut st,
@@ -581,7 +581,7 @@ fn a_rule_waits_for_a_field_that_arrives_on_a_later_event() {
         None
     );
     let o = p
-        .evaluate_watching(
+        .evaluate_in_flight(
             Reads::BODY_BYTES,
             Reads::BODY_BYTES | Reads::RESPONSE_HEAD,
             &mut st,
@@ -591,10 +591,10 @@ fn a_rule_waits_for_a_field_that_arrives_on_a_later_event() {
     assert_eq!(o.terminal_rule.unwrap(), "w");
 }
 
-/// A watching `quarantine` that matched is reported even when a rule below
+/// An in-flight `quarantine` that matched is reported even when a rule below
 /// it fails closed in the same pass.
 #[test]
-fn a_matched_watching_quarantine_survives_a_fail_closed() {
+fn a_matched_in_flight_quarantine_survives_a_fail_closed() {
     let p = compile(
         common::METRICS,
         r"
@@ -608,10 +608,10 @@ fn a_matched_watching_quarantine_survives_a_fail_closed() {
   then: deny
 ",
     );
-    let head = p.evaluate_head(&MapView::new(), &EvalContext::empty());
-    let mut st = p.watch_state(&head.tags);
+    let head = p.evaluate_admission(&MapView::new(), &EvalContext::empty());
+    let mut st = p.in_flight_state(&head.tags);
     let o = p
-        .evaluate_watching(
+        .evaluate_in_flight(
             ALL,
             ALL,
             &mut st,
@@ -622,11 +622,11 @@ fn a_matched_watching_quarantine_survives_a_fail_closed() {
     assert_eq!(o.quarantine.unwrap(), "bad-status");
 }
 
-/// A watching `quarantine` stops the exchange like a deny and names its
+/// An in-flight `quarantine` stops the exchange like a deny and names its
 /// rule; one reading a byte metric is re-checked after forwarding as a
 /// `deny` is.
 #[test]
-fn a_watching_quarantine_stops_and_is_reported() {
+fn an_in_flight_quarantine_stops_and_is_reported() {
     let p = compile(
         common::METRICS,
         r"
@@ -643,18 +643,18 @@ fn a_watching_quarantine_stops_and_is_reported() {
     assert_eq!(
         p.rule_info().iter().map(|r| r.kind).collect::<Vec<_>>(),
         [
-            RuleKind::Head,
-            RuleKind::HeadAndWatching,
-            RuleKind::Watching
+            RuleKind::Admission,
+            RuleKind::AdmissionAndInFlight,
+            RuleKind::InFlight
         ]
     );
     let ctx = EvalContext::empty();
-    let head = p.evaluate_head(&MapView::new().with_metric("egress", 0), &ctx);
+    let head = p.evaluate_admission(&MapView::new().with_metric("egress", 0), &ctx);
     assert!(head.decision.is_allow());
     assert_eq!(head.quarantine, None);
-    let mut st = p.watch_state(&head.tags);
+    let mut st = p.in_flight_state(&head.tags);
     let o = p
-        .evaluate_watching(
+        .evaluate_in_flight(
             ALL,
             ALL,
             &mut st,
@@ -667,8 +667,8 @@ fn a_watching_quarantine_stops_and_is_reported() {
     assert_eq!(o.terminal_rule.unwrap(), "bad-status");
     assert_eq!(o.quarantine.unwrap(), "bad-status");
 
-    // The metric rule takes part in the head decision too.
-    let head = p.evaluate_head(&MapView::new().with_metric("egress", 2 << 20), &ctx);
+    // The metric rule takes part in the admission decision too.
+    let head = p.evaluate_admission(&MapView::new().with_metric("egress", 2 << 20), &ctx);
     assert_eq!(head.decision, Decision::Deny(Deny::quarantine()));
     assert_eq!(head.quarantine.unwrap(), "too-much");
 }

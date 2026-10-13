@@ -6,9 +6,9 @@
 //!   `tls.sni` and `scheme`, which compare ASCII case-insensitively (header
 //!   names are lower-cased at compile time). `method` is byte-exact: `get`
 //!   is not `GET`.
-//! * Compiling also records what an expression *reads* beyond the request
-//!   head ([`Needs::reads`]), which decides whether its rule is a head rule
-//!   or a watching rule.
+//! * Compiling also records what an expression *reads* that is not known
+//!   at admission ([`Needs::reads`]), which decides whether its rule is an
+//!   admission rule or an in-flight rule.
 //! * `like` is a full-match glob where only `*` (any run, including `/`)
 //!   and `?` (one character) are special; it compiles to a regex with the
 //!   same limits as `matches`.
@@ -29,7 +29,7 @@ use regex::{Regex, RegexBuilder};
 use crate::ast::{Expr, Lit, LitNode, Node, Op, Operand};
 use crate::config::MetricCount;
 use crate::diag::{ExprError, Span};
-use crate::types::{Access, Field, Reads, Type, Watched, resolve};
+use crate::types::{Access, Field, InFlightValue, Reads, Type, resolve};
 
 /// Compiled-program size limit for one regex (bytes). A hostile or careless
 /// pattern such as `\w{1000}{1000}` fails to compile instead of using
@@ -56,27 +56,27 @@ pub(crate) struct Env<'a> {
 pub(crate) struct Needs {
     pub request_body: bool,
     pub response_body: bool,
-    /// Watched fields and byte metrics read.
+    /// In-flight fields and byte metrics read.
     pub reads: Reads,
-    /// The watched values read, each with its name as written (`body.bytes`,
+    /// The in-flight values read, each with its name as written (`body.bytes`,
     /// `metric.egress (request_bytes)`), in order of first appearance.
-    watched: Vec<(Watched, String)>,
+    in_flight: Vec<(InFlightValue, String)>,
     /// The tags read (`tag["x"]`), in order of first appearance.
     pub tags: Vec<Box<str>>,
 }
 
 impl Needs {
-    fn add_watched(&mut self, w: Watched, name: String) {
+    fn add_in_flight(&mut self, w: InFlightValue, name: String) {
         self.reads |= Reads::of(w);
-        if !self.watched.iter().any(|(_, n)| *n == name) {
-            self.watched.push((w, name));
+        if !self.in_flight.iter().any(|(_, n)| *n == name) {
+            self.in_flight.push((w, name));
         }
     }
 
-    /// Names of the watched values in `mask`, as written, for messages and
+    /// Names of the in-flight values in `mask`, as written, for messages and
     /// `roxy check`.
-    pub(crate) fn watched_names(&self, mask: Reads) -> Vec<String> {
-        self.watched
+    pub(crate) fn in_flight_names(&self, mask: Reads) -> Vec<String> {
+        self.in_flight
             .iter()
             .filter(|(w, _)| mask.contains(*w))
             .map(|(_, n)| n.clone())
@@ -556,9 +556,9 @@ impl Compiler<'_, '_> {
                     | Access::Tag(_)
                     | Access::Metric(_) => {}
                 }
-                let watched = match &access {
+                let in_flight = match &access {
                     Access::Metric(id) => metric(id).and_then(|count| {
-                        Some((count.watched()?, format!("metric.{id} ({count})")))
+                        Some((count.in_flight()?, format!("metric.{id} ({count})")))
                     }),
                     a @ (Access::Scalar(_)
                     | Access::Header(_)
@@ -569,10 +569,10 @@ impl Compiler<'_, '_> {
                     | Access::State(_)
                     | Access::Tag(_)
                     | Access::BodyText
-                    | Access::RespBodyText) => a.watched().map(|w| (w, a.display_name())),
+                    | Access::RespBodyText) => a.in_flight().map(|w| (w, a.display_name())),
                 };
-                if let Some((w, name)) = watched {
-                    self.needs.add_watched(w, name);
+                if let Some((w, name)) = in_flight {
+                    self.needs.add_in_flight(w, name);
                 }
                 Ok(Typed::Field(access, f.span))
             }

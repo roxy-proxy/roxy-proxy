@@ -1,5 +1,5 @@
-//! Field catalogue, static types, and which values are *head* values
-//! (known when the forwarding decision is made) or *watched* values (known
+//! Field catalogue, static types, and which values are *admission* values
+//! (known when the forwarding decision is made) or *in-flight* values (known
 //! later).
 
 use std::fmt::{self, Write as _};
@@ -70,14 +70,14 @@ pub enum Field {
     QueryRaw,
     /// `body.size` (int: declared length; `null` if undeclared)
     BodySize,
-    /// `body.bytes` (int: request body bytes so far; watched)
+    /// `body.bytes` (int: request body bytes so far; in flight)
     BodyBytes,
-    /// `response.status` (int; watched)
+    /// `response.status` (int; in flight)
     ResponseStatus,
     /// `response.body.size` (int: declared length, `null` if undeclared;
-    /// watched)
+    /// in flight)
     ResponseBodySize,
-    /// `response.body.bytes` (int: response body bytes so far; watched)
+    /// `response.body.bytes` (int: response body bytes so far; in flight)
     ResponseBodyBytes,
     /// `ws.direction` (string: `c2s` / `s2c`)
     WsDirection,
@@ -92,10 +92,10 @@ pub enum Field {
 /// One value that becomes known (or changes) after the forwarding
 /// decision. Each variant answers what it is (a field of the flow or a
 /// byte metric) and when it is fixed; the [`Reads`] groups and names derive
-/// from those answers, so a new watched value is declared here and nowhere
-/// else.
+/// from those answers, so a new in-flight value is declared here and
+/// nowhere else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Watched {
+pub enum InFlightValue {
     /// `body.bytes`.
     BodyBytes,
     /// `response.status`, `response.header[...]`, `response.body.size`.
@@ -113,8 +113,8 @@ pub enum Watched {
     MetricResponseBytes,
 }
 
-impl Watched {
-    pub const ALL: [Watched; 7] = [
+impl InFlightValue {
+    pub const ALL: [InFlightValue; 7] = [
         Self::BodyBytes,
         Self::ResponseHead,
         Self::ResponseBodyBytes,
@@ -138,8 +138,8 @@ impl Watched {
     }
 
     /// A field of the flow, as opposed to a byte metric. A byte metric's
-    /// value is known at the head, so only a field makes the rule reading
-    /// it a watching rule.
+    /// value is known at admission, so only a field makes the rule reading
+    /// it an in-flight rule.
     pub const fn is_field(self) -> bool {
         !matches!(self, Self::MetricRequestBytes | Self::MetricResponseBytes)
     }
@@ -155,25 +155,25 @@ impl Watched {
     }
 }
 
-impl fmt::Display for Watched {
+impl fmt::Display for InFlightValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
     }
 }
 
-/// A set of [`Watched`] values: what a rule reads beyond the request head,
-/// or what an event during an exchange changed. A bit mask, so the
-/// per-chunk test "does any watching rule care about this?" is one `and`.
+/// A set of [`InFlightValue`] values: what a rule reads that is not known at
+/// admission, or what an event during an exchange changed. A bit mask, so the
+/// per-chunk test "does any in-flight rule care about this?" is one `and`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Reads(u16);
 
-/// The set of every [`Watched`] value for which `$pred` holds.
+/// The set of every [`InFlightValue`] value for which `$pred` holds.
 macro_rules! derived {
     (|$w:ident| $pred:expr) => {{
         let mut bits = 0;
         let mut i = 0;
-        while i < Watched::ALL.len() {
-            let $w = Watched::ALL[i];
+        while i < InFlightValue::ALL.len() {
+            let $w = InFlightValue::ALL[i];
             if $pred {
                 bits |= $w.bit();
             }
@@ -185,28 +185,28 @@ macro_rules! derived {
 
 impl Reads {
     pub const NONE: Reads = Reads(0);
-    pub const BODY_BYTES: Reads = Reads::of(Watched::BodyBytes);
-    pub const RESPONSE_HEAD: Reads = Reads::of(Watched::ResponseHead);
-    pub const RESPONSE_BODY_BYTES: Reads = Reads::of(Watched::ResponseBodyBytes);
-    pub const RESPONSE_BODY_TEXT: Reads = Reads::of(Watched::ResponseBodyText);
-    pub const WS: Reads = Reads::of(Watched::Ws);
-    pub const METRIC_REQUEST_BYTES: Reads = Reads::of(Watched::MetricRequestBytes);
-    pub const METRIC_RESPONSE_BYTES: Reads = Reads::of(Watched::MetricResponseBytes);
+    pub const BODY_BYTES: Reads = Reads::of(InFlightValue::BodyBytes);
+    pub const RESPONSE_HEAD: Reads = Reads::of(InFlightValue::ResponseHead);
+    pub const RESPONSE_BODY_BYTES: Reads = Reads::of(InFlightValue::ResponseBodyBytes);
+    pub const RESPONSE_BODY_TEXT: Reads = Reads::of(InFlightValue::ResponseBodyText);
+    pub const WS: Reads = Reads::of(InFlightValue::Ws);
+    pub const METRIC_REQUEST_BYTES: Reads = Reads::of(InFlightValue::MetricRequestBytes);
+    pub const METRIC_RESPONSE_BYTES: Reads = Reads::of(InFlightValue::MetricResponseBytes);
 
-    /// Every watched *field* (not metrics).
-    pub const WATCHED_FIELDS: Reads = derived!(|w| w.is_field());
+    /// Every in-flight *field* (not metrics).
+    pub const IN_FLIGHT_FIELDS: Reads = derived!(|w| w.is_field());
     /// Both byte metrics.
     pub const METRICS: Reads = derived!(|w| !w.is_field());
-    /// Everything: every watched field and both byte metrics.
+    /// Everything: every in-flight field and both byte metrics.
     pub const ALL: Reads = derived!(|_w| true);
     /// Values known before the response head is sent to the client.
     pub const BEFORE_RESPONSE_SENT: Reads = derived!(|w| w.before_response_sent());
 
-    pub const fn of(w: Watched) -> Reads {
+    pub const fn of(w: InFlightValue) -> Reads {
         Reads(w.bit())
     }
 
-    pub const fn contains(self, w: Watched) -> bool {
+    pub const fn contains(self, w: InFlightValue) -> bool {
         self.0 & w.bit() != 0
     }
 
@@ -235,35 +235,37 @@ impl Reads {
 
     /// The members of `self` for which `keep` holds.
     #[must_use]
-    pub fn retain(self, keep: impl Fn(Watched) -> bool) -> Reads {
+    pub fn retain(self, keep: impl Fn(InFlightValue) -> bool) -> Reads {
         self.iter().filter(|w| keep(*w)).collect()
     }
 
-    /// The members, in [`Watched::ALL`] order.
-    pub fn iter(self) -> impl Iterator<Item = Watched> {
-        Watched::ALL.into_iter().filter(move |w| self.contains(*w))
+    /// The members, in [`InFlightValue::ALL`] order.
+    pub fn iter(self) -> impl Iterator<Item = InFlightValue> {
+        InFlightValue::ALL
+            .into_iter()
+            .filter(move |w| self.contains(*w))
     }
 
     /// Names of the members, for messages and `roxy check`.
     pub fn names(self) -> Vec<&'static str> {
-        self.iter().map(Watched::name).collect()
+        self.iter().map(InFlightValue::name).collect()
     }
 }
 
-impl From<Watched> for Reads {
-    fn from(w: Watched) -> Reads {
+impl From<InFlightValue> for Reads {
+    fn from(w: InFlightValue) -> Reads {
         Reads::of(w)
     }
 }
 
-impl From<Option<Watched>> for Reads {
-    fn from(w: Option<Watched>) -> Reads {
+impl From<Option<InFlightValue>> for Reads {
+    fn from(w: Option<InFlightValue>) -> Reads {
         w.map_or(Reads::NONE, Reads::of)
     }
 }
 
-impl FromIterator<Watched> for Reads {
-    fn from_iter<I: IntoIterator<Item = Watched>>(iter: I) -> Reads {
+impl FromIterator<InFlightValue> for Reads {
+    fn from_iter<I: IntoIterator<Item = InFlightValue>>(iter: I) -> Reads {
         iter.into_iter()
             .fold(Reads::NONE, |acc, w| acc | Reads::of(w))
     }
@@ -389,13 +391,15 @@ impl Field {
         matches!(self, Self::Host | Self::TlsSni | Self::Scheme)
     }
 
-    /// The watched value this field reads; `None` for a head field.
-    pub fn watched(self) -> Option<Watched> {
+    /// The in-flight value this field reads; `None` for an admission field.
+    pub fn in_flight(self) -> Option<InFlightValue> {
         match self {
-            Self::BodyBytes => Some(Watched::BodyBytes),
-            Self::ResponseStatus | Self::ResponseBodySize => Some(Watched::ResponseHead),
-            Self::ResponseBodyBytes => Some(Watched::ResponseBodyBytes),
-            Self::WsDirection | Self::WsOpcode | Self::WsSize | Self::WsText => Some(Watched::Ws),
+            Self::BodyBytes => Some(InFlightValue::BodyBytes),
+            Self::ResponseStatus | Self::ResponseBodySize => Some(InFlightValue::ResponseHead),
+            Self::ResponseBodyBytes => Some(InFlightValue::ResponseBodyBytes),
+            Self::WsDirection | Self::WsOpcode | Self::WsSize | Self::WsText => {
+                Some(InFlightValue::Ws)
+            }
             Self::ClientIp
             | Self::ClientPort
             | Self::ListenerName
@@ -414,8 +418,8 @@ impl Field {
     }
 
     /// Whether the field is known when the forwarding decision is made.
-    pub fn is_head(self) -> bool {
-        self.watched().is_none()
+    pub fn is_admission(self) -> bool {
+        self.in_flight().is_none()
     }
 }
 
@@ -501,16 +505,16 @@ impl Access {
         }
     }
 
-    /// The watched value this access reads; `None` for a head value. A
-    /// metric's depends on what it counts ([`MetricCount::watched`]), which
-    /// the compiler looks up.
+    /// The in-flight value this access reads; `None` for an admission
+    /// value. A metric's depends on what it counts
+    /// ([`MetricCount::in_flight`]), which the compiler looks up.
     ///
-    /// [`MetricCount::watched`]: crate::config::MetricCount::watched
-    pub(crate) fn watched(&self) -> Option<Watched> {
+    /// [`MetricCount::in_flight`]: crate::config::MetricCount::in_flight
+    pub(crate) fn in_flight(&self) -> Option<InFlightValue> {
         match self {
-            Self::Scalar(f) => f.watched(),
-            Self::RespHeader(_) | Self::RespHeaderAll(_) => Some(Watched::ResponseHead),
-            Self::RespBodyText => Some(Watched::ResponseBodyText),
+            Self::Scalar(f) => f.in_flight(),
+            Self::RespHeader(_) | Self::RespHeaderAll(_) => Some(InFlightValue::ResponseHead),
+            Self::RespBodyText => Some(InFlightValue::ResponseBodyText),
             Self::Header(_)
             | Self::HeaderAll(_)
             | Self::BodyText
@@ -716,38 +720,41 @@ mod tests {
     }
 
     #[test]
-    fn head_and_watched() {
-        assert!(Field::Host.is_head());
-        assert!(Field::BodySize.is_head());
-        assert_eq!(Field::BodyBytes.watched(), Some(Watched::BodyBytes));
-        assert_eq!(Field::ResponseStatus.watched(), Some(Watched::ResponseHead));
+    fn admission_and_in_flight() {
+        assert!(Field::Host.is_admission());
+        assert!(Field::BodySize.is_admission());
+        assert_eq!(Field::BodyBytes.in_flight(), Some(InFlightValue::BodyBytes));
         assert_eq!(
-            Field::ResponseBodyBytes.watched(),
-            Some(Watched::ResponseBodyBytes)
+            Field::ResponseStatus.in_flight(),
+            Some(InFlightValue::ResponseHead)
         );
-        assert_eq!(Field::WsText.watched(), Some(Watched::Ws));
         assert_eq!(
-            Access::RespBodyText.watched(),
-            Some(Watched::ResponseBodyText)
+            Field::ResponseBodyBytes.in_flight(),
+            Some(InFlightValue::ResponseBodyBytes)
         );
-        assert_eq!(Access::BodyText.watched(), None);
+        assert_eq!(Field::WsText.in_flight(), Some(InFlightValue::Ws));
+        assert_eq!(
+            Access::RespBodyText.in_flight(),
+            Some(InFlightValue::ResponseBodyText)
+        );
+        assert_eq!(Access::BodyText.in_flight(), None);
         let r = Reads::BODY_BYTES | Reads::METRIC_REQUEST_BYTES;
         assert!(r.intersects(Reads::METRICS));
         assert!(Reads::BODY_BYTES.is_subset(r));
         assert_eq!(r.names(), ["body.bytes", "request_bytes metric"]);
-        assert_eq!(r.retain(Watched::is_field), Reads::BODY_BYTES);
+        assert_eq!(r.retain(InFlightValue::is_field), Reads::BODY_BYTES);
     }
 
-    /// The groups partition `Watched::ALL` by its own predicates, and every
-    /// member has a distinct bit and name.
+    /// The groups partition `InFlightValue::ALL` by its own predicates, and
+    /// every member has a distinct bit and name.
     #[test]
-    fn groups_derive_from_watched() {
-        assert_eq!(Reads::WATCHED_FIELDS | Reads::METRICS, Reads::ALL);
-        assert!(!Reads::WATCHED_FIELDS.intersects(Reads::METRICS));
-        assert!(Reads::BEFORE_RESPONSE_SENT.is_subset(Reads::WATCHED_FIELDS));
-        assert_eq!(Reads::ALL.iter().count(), Watched::ALL.len());
+    fn groups_derive_from_in_flight() {
+        assert_eq!(Reads::IN_FLIGHT_FIELDS | Reads::METRICS, Reads::ALL);
+        assert!(!Reads::IN_FLIGHT_FIELDS.intersects(Reads::METRICS));
+        assert!(Reads::BEFORE_RESPONSE_SENT.is_subset(Reads::IN_FLIGHT_FIELDS));
+        assert_eq!(Reads::ALL.iter().count(), InFlightValue::ALL.len());
         let names: std::collections::HashSet<&str> = Reads::ALL.names().into_iter().collect();
-        assert_eq!(names.len(), Watched::ALL.len());
+        assert_eq!(names.len(), InFlightValue::ALL.len());
     }
 
     #[test]

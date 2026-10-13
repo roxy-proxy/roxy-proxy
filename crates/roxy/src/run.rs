@@ -899,7 +899,7 @@ mod tests {
         let m = reloader.metrics.as_ref().unwrap();
         let view = |p: &str| MapView::new().with_str(Field::Path, p);
         let sample = Sample {
-            head: true,
+            admission: true,
             ..Sample::default()
         };
         for p in ["/a", "/b", "/c"] {

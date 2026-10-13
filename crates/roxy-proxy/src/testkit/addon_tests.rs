@@ -469,7 +469,7 @@ async fn an_enforcer_failing_after_the_head_below_an_observer_is_the_one_logged(
     assert_eq!(errs.len(), 1, "{errs:#?}");
 }
 
-/// A deny at the head, by the rules or by a layer, never reads the request
+/// A deny at admission, by the rules or by a layer, never reads the request
 /// body. The observer above it reads its copy to a clean end and sees the
 /// deny from `next`; nothing is logged against it.
 #[tokio::test]

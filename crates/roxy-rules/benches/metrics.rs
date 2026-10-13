@@ -31,9 +31,9 @@ fn view(i: u32) -> MapView {
         .with_str(Field::Path, "/v1/items")
 }
 
-/// A head sample: counts `requests` and `unique`.
+/// An admission sample: counts `requests` and `unique`.
 const HEAD: Sample = Sample {
-    head: true,
+    admission: true,
     request_bytes: 0,
     response_bytes: 0,
     denied: false,

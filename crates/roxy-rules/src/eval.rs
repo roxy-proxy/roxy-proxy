@@ -1,5 +1,5 @@
 //! Evaluation: predicate plans against a [`FlowView`], and the outcomes of
-//! the head decision and of watching evaluation.
+//! the admission decision and of in-flight evaluation.
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -22,7 +22,7 @@ use crate::view::{BodyText, FlowView, Value};
 #[derive(Clone, Copy)]
 pub struct EvalContext<'a> {
     /// Resolves `${secret:name}` in `set_header` values. Returning `None`
-    /// makes the flow fail closed (see [`crate::Policy::evaluate_head`]).
+    /// makes the flow fail closed (see [`crate::Policy::evaluate_admission`]).
     pub secrets: &'a dyn Fn(&str) -> Option<String>,
     /// Tags already set on the flow (by an addon); visible as `tag["x"]`.
     pub initial_tags: &'a [String],
@@ -60,15 +60,15 @@ pub struct AllowOpts {
     pub private_ok: bool,
 }
 
-/// The head decision.
+/// The admission decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Allow(AllowOpts),
     Deny(Deny),
 }
 
-/// A deny: the head decision refusing the request, or a watching rule
-/// stopping the exchange. The only decision a watching rule can reach.
+/// A deny: the admission decision refusing the request, or an in-flight rule
+/// stopping the exchange. The only decision an in-flight rule can reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Deny {
     pub status: DenyStatus,
@@ -585,8 +585,8 @@ impl fmt::Display for Effect {
 /// forwarded: nothing here changes the request. Header changes apply to the
 /// response; `log` and `set_state` apply whatever the outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WatchEffect {
-    /// Lower-case name; the value is a validated header value (a watching
+pub enum InFlightEffect {
+    /// Lower-case name; the value is a validated header value (an in-flight
     /// rule's `set_header` takes no secrets, so nothing is substituted).
     SetHeader {
         name: String,
@@ -605,25 +605,27 @@ pub enum WatchEffect {
     },
 }
 
-impl WatchEffect {
+impl InFlightEffect {
     /// The action name that produced this effect.
     pub fn kind(&self) -> &'static str {
         match self {
-            WatchEffect::SetHeader { .. } => "set_header",
-            WatchEffect::RemoveHeader(_) => "remove_header",
-            WatchEffect::Log { .. } => "log",
-            WatchEffect::SetState { .. } => "set_state",
+            InFlightEffect::SetHeader { .. } => "set_header",
+            InFlightEffect::RemoveHeader(_) => "remove_header",
+            InFlightEffect::Log { .. } => "log",
+            InFlightEffect::SetState { .. } => "set_state",
         }
     }
 }
 
-impl fmt::Display for WatchEffect {
+impl fmt::Display for InFlightEffect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            WatchEffect::SetHeader { name, value } => write!(f, "set_header {name}: {value}"),
-            WatchEffect::RemoveHeader(n) => write!(f, "remove_header {n}"),
-            WatchEffect::Log { level, message } => write!(f, "log {}: {message}", level.as_str()),
-            WatchEffect::SetState { key, value, ttl } => fmt_set_state(f, key, value, *ttl),
+            InFlightEffect::SetHeader { name, value } => write!(f, "set_header {name}: {value}"),
+            InFlightEffect::RemoveHeader(n) => write!(f, "remove_header {n}"),
+            InFlightEffect::Log { level, message } => {
+                write!(f, "log {}: {message}", level.as_str())
+            }
+            InFlightEffect::SetState { key, value, ttl } => fmt_set_state(f, key, value, *ttl),
         }
     }
 }
@@ -653,11 +655,11 @@ fn anchored_source(re: &Regex) -> &str {
         .unwrap_or(s)
 }
 
-/// Result of the head decision ([`crate::Policy::evaluate_head`]).
+/// Result of the admission decision ([`crate::Policy::evaluate_admission`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Outcome {
     pub decision: Decision,
-    /// Every head rule whose `when` matched, in list order.
+    /// Every admission rule whose `when` matched, in list order.
     pub matched: Vec<RuleId>,
     /// The rule that decided: the first matching deny, else the first
     /// matching allow; `_default` when none matched; `_fail_closed` when a
@@ -677,11 +679,11 @@ pub struct Outcome {
     pub tags: Vec<String>,
 }
 
-/// Result of a watching evaluation ([`crate::Policy::evaluate_watching`])
+/// Result of an in-flight evaluation ([`crate::Policy::evaluate_in_flight`])
 /// in which at least one rule matched or an input failed.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct WatchOutcome {
-    /// `Some` = stop the exchange: a matching watching deny, or
+pub struct InFlightOutcome {
+    /// `Some` = stop the exchange: a matching in-flight deny, or
     /// [`Deny::fail_closed`]. `None` = continue (effects only).
     pub stop: Option<Deny>,
     /// The rule that stopped it (`_fail_closed` for an input failure).
@@ -690,16 +692,16 @@ pub struct WatchOutcome {
     pub fail_closed_reason: Option<FailClosedReason>,
     /// The first rule matching now with a `quarantine` action.
     pub quarantine: Option<RuleId>,
-    /// Watching rules that matched now, in list order.
+    /// In-flight rules that matched now, in list order.
     pub matched: Vec<RuleId>,
     /// Their non-terminal effects, in list order (only `log` and
     /// `set_state` when stopping). Header effects apply to the response.
-    pub effects: Vec<WatchEffect>,
+    pub effects: Vec<InFlightEffect>,
     /// Tags newly set.
     pub tags: Vec<String>,
 }
 
-impl WatchOutcome {
+impl InFlightOutcome {
     /// Whether the exchange must stop.
     pub fn stops(&self) -> bool {
         self.stop.is_some()
@@ -740,14 +742,14 @@ impl PendingState for Vec<Effect> {
     }
 }
 
-impl PendingState for Vec<WatchEffect> {
+impl PendingState for Vec<InFlightEffect> {
     fn pending_state(&self, key: &str) -> Option<&str> {
         self.iter().rev().find_map(|e| match e {
-            WatchEffect::SetState { key: k, value, .. } if k == key => Some(value.as_str()),
-            WatchEffect::SetState { .. }
-            | WatchEffect::SetHeader { .. }
-            | WatchEffect::RemoveHeader(_)
-            | WatchEffect::Log { .. } => None,
+            InFlightEffect::SetState { key: k, value, .. } if k == key => Some(value.as_str()),
+            InFlightEffect::SetState { .. }
+            | InFlightEffect::SetHeader { .. }
+            | InFlightEffect::RemoveHeader(_)
+            | InFlightEffect::Log { .. } => None,
         })
     }
 }

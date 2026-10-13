@@ -1,10 +1,10 @@
 //! The exchange core's fixed steps.
 //!
 //! On the way out, [`request_steps`] buffers the request body (only when a
-//! rule reads `body.text`) and then makes the head decision with its
+//! rule reads `body.text`) and then makes the admission decision with its
 //! effects. On the way back, [`response_steps`] buffers the response body
-//! (only for `response.body.text`) and then checks the watching rules at the
-//! response head ([`crate::watch`]). The upstream exchange between the two
+//! (only for `response.body.text`) and then checks the in-flight rules at the
+//! response head ([`crate::in_flight`]). The upstream exchange between the two
 //! is in [`crate::exchange`]. Extension happens above all of this, in the
 //! addon stack ([`crate::addons`]), not here.
 //!
@@ -48,6 +48,7 @@ use crate::exchange::{WriteFailure, emit_response_error};
 use crate::flowlog::{
     ClientInfo, DecisionKind, DstInfo, FlowEvent, RequestInfo, ResponseInfo, Stage, Timing, TlsInfo,
 };
+use crate::in_flight::InFlight;
 use crate::io::ClientIo;
 use crate::listener::ClientConn;
 use crate::quarantine::QuarantineCause;
@@ -58,7 +59,6 @@ use crate::sources::{MetricSourceError, Sample};
 use crate::view::{
     FlowFacts, Inspected, ProxyView, RequestFacts, ResponseFacts, host_str, host_text,
 };
-use crate::watch::Watch;
 
 /// The boxed future of [`BodyIo::collect`].
 pub(crate) type CollectFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -338,7 +338,7 @@ impl BodyIo for ServerConn<ClientIo> {
     }
 }
 
-/// The request side: inspect the body if a rule needs it, then the head
+/// The request side: inspect the body if a rule needs it, then the admission
 /// decision and its effects, then the signature over the result if a
 /// `sign` effect asked for one.
 pub(crate) async fn request_steps(
@@ -359,7 +359,7 @@ pub(crate) async fn request_steps(
 }
 
 /// The response side: inspect the body if a rule needs it, then the
-/// watching rules at the response head.
+/// in-flight rules at the response head.
 pub(crate) async fn response_steps(
     cx: &mut FlowCx,
     res: CanonicalResponse,
@@ -411,7 +411,7 @@ pub(crate) struct FlowRecord {
 
 /// What identifies a flow and the world it runs in. Shared, read-only,
 /// by everything that logs or evaluates for the flow: the flow context
-/// and the watcher.
+/// and the in-flight checker.
 pub(crate) struct FlowMeta {
     pub shared: Arc<Shared>,
     pub snap: Arc<Snapshot>,
@@ -419,7 +419,7 @@ pub(crate) struct FlowMeta {
     pub client: ClientConn,
     pub tls: Option<TlsInfo>,
     /// The secret generation this exchange resolves from and redacts
-    /// with: loaded on first use (the head evaluation) and kept for the
+    /// with: loaded on first use (the admission evaluation) and kept for the
     /// exchange's life, however many swaps happen meanwhile.
     secrets: OnceLock<Arc<Secrets>>,
 }
@@ -519,21 +519,21 @@ pub(crate) struct FlowCx {
     pub opts: AllowOpts,
     pub record: FlowRecord,
     pub started: Instant,
-    /// The watching rules of this exchange, once it is forwarded.
-    pub watch: Option<Arc<Watch>>,
+    /// The in-flight rules of this exchange, once it is forwarded.
+    pub in_flight: Option<Arc<InFlight>>,
     /// Capture this exchange's request / response: set by a
-    /// `capture` effect at the head, or for every exchange with
+    /// `capture` effect at admission, or for every exchange with
     /// `log.capture.all`.
     pub capture: PerDir<bool>,
     /// Hash this exchange's request / response body for the flow
-    /// record's `body_sha256`: set by a `digest` effect at the head.
+    /// record's `body_sha256`: set by a `digest` effect at admission.
     pub digest: PerDir<bool>,
     /// Capture taps not yet handed to a body adapter (the WebSocket relay
     /// takes them after the `101`).
     pub taps: PerDir<Option<Tap>>,
     /// `Host` to send upstream after a `redirect` without `rewrite_host`.
     pub host_override: Option<String>,
-    /// A `sign` effect of the head decision, applied once every other
+    /// A `sign` effect of the admission decision, applied once every other
     /// request change has settled.
     pub sign: Option<AwsSigV4>,
     /// Request body bytes forwarded so far (and their digest once the
@@ -644,7 +644,7 @@ impl FlowCx {
             opts: AllowOpts::default(),
             record: FlowRecord::default(),
             started: Instant::now(),
-            watch: None,
+            in_flight: None,
             capture: PerDir::default(),
             digest: PerDir::default(),
             taps: PerDir::default(),
@@ -677,35 +677,35 @@ impl FlowCx {
     }
 
     /// The deny every exchange gets once the policy's lease has run out,
-    /// recorded as the head decision. Nothing of the policy (the addons
+    /// recorded as the admission decision. Nothing of the policy (the addons
     /// included) runs for it.
     pub(crate) fn expiry_refusal(&mut self) -> Option<Refusal> {
         if !self.shared.expired() {
             return None;
         }
         self.record.stage = Some(Stage::Head);
-        if let Err(e) = self.record_head_sample(true) {
+        if let Err(e) = self.record_admission_sample(true) {
             self.meta.metric_error(Stage::Head, &e);
         }
         Some(Refusal::expired())
     }
 
     /// The refusal every exchange gets while the process is quarantined,
-    /// recorded as the head decision. Checked before the lease: a
+    /// recorded as the admission decision. Checked before the lease: a
     /// quarantine outlives any policy.
     pub(crate) fn quarantine_refusal(&mut self) -> Option<Refusal> {
         if !self.shared.quarantined() {
             return None;
         }
         self.record.stage = Some(Stage::Head);
-        if let Err(e) = self.record_head_sample(true) {
+        if let Err(e) = self.record_admission_sample(true) {
             self.meta.metric_error(Stage::Head, &e);
         }
         Some(Refusal::quarantined())
     }
 
     /// A matched `quarantine` action puts the process into quarantine,
-    /// whatever else the head decision was.
+    /// whatever else the admission decision was.
     fn trip_quarantine_if_matched(&self, out: &Outcome) {
         if let Some(rule) = &out.quarantine {
             self.shared.trip_quarantine(QuarantineCause::Rule {
@@ -715,9 +715,9 @@ impl FlowCx {
         }
     }
 
-    /// The head decision. Returns the outcome plus a refusal when it
+    /// The admission decision. Returns the outcome plus a refusal when it
     /// denies or an input was unavailable.
-    fn evaluate_head(&mut self) -> (Outcome, Option<Refusal>) {
+    fn evaluate_admission(&mut self) -> (Outcome, Option<Refusal>) {
         let snap = self.snap.clone();
         let shared = self.shared.clone();
         let generation = self.meta.secrets().clone();
@@ -733,7 +733,7 @@ impl FlowCx {
             &*shared.state,
             &snap.address_lists,
         );
-        let out = snap.policy.evaluate_head(&view, &ctx);
+        let out = snap.policy.evaluate_admission(&view, &ctx);
         let metric_err = view.take_metric_error();
         drop(view);
         self.note_outcome(&out);
@@ -764,9 +764,9 @@ impl FlowCx {
         (out, refusal)
     }
 
-    /// Records the exchange's head metric sample, once the head step's
-    /// outcome is settled (`denied`).
-    fn record_head_sample(&self, denied: bool) -> Result<(), MetricSourceError> {
+    /// Records the exchange's admission metric sample, once the admission
+    /// step's outcome is settled (`denied`).
+    fn record_admission_sample(&self, denied: bool) -> Result<(), MetricSourceError> {
         let view = ProxyView::new(
             &self.facts,
             &*self.shared.metrics,
@@ -774,7 +774,7 @@ impl FlowCx {
             &self.snap.address_lists,
         );
         let sample = Sample {
-            head: true,
+            admission: true,
             denied,
             ..Sample::default()
         };
@@ -787,7 +787,7 @@ impl FlowCx {
         if let Some(st) = self.stack.take() {
             st.fold_into(self);
         }
-        self.absorb_watch();
+        self.absorb_in_flight();
         if let Some(t) = &self.request_tally {
             self.record.request_bytes = t.bytes();
             self.record.request_sha256 = t.sha256_hex();
@@ -844,21 +844,23 @@ impl FlowCx {
         });
     }
 
-    /// A watching rule stopped the exchange.
+    /// An in-flight rule stopped the exchange.
     fn stopped(&self) -> bool {
-        self.watch.as_ref().is_some_and(|w| w.stopped().is_some())
+        self.in_flight
+            .as_ref()
+            .is_some_and(|w| w.stopped().is_some())
     }
 
     /// Records the final metric sample of an exchange whose response was
     /// sent (or failed to reach the client, which is not an upstream
-    /// error): `denied` if a watching rule stopped it. Bytes were recorded
+    /// error): `denied` if an in-flight rule stopped it. Bytes were recorded
     /// as they streamed.
     pub(crate) fn record_final_sample(&self) {
         self.final_sample(self.stopped(), false);
     }
 
     /// Records the final metric sample of an exchange refused after the
-    /// forwarding decision: `denied` for a deny (a watching stop, the
+    /// forwarding decision: `denied` for a deny (an in-flight stop, the
     /// address floor, an invalid upgrade), `error` for an upstream failure.
     pub(crate) fn record_refusal_sample(&self, refusal: &Refusal) {
         let denied = refusal.kind == RefusalKind::Deny || self.stopped();
@@ -889,11 +891,11 @@ impl FlowCx {
         }
     }
 
-    /// Folds the watcher's outcome (watching rules that matched, tags,
-    /// response mutations, a stop) into the flow record. Call once the
+    /// Folds the in-flight checker's outcome (in-flight rules that matched,
+    /// tags, response mutations, a stop) into the flow record. Call once the
     /// exchange is over, before logging it.
-    pub(crate) fn absorb_watch(&mut self) {
-        let Some(w) = self.watch.clone() else {
+    pub(crate) fn absorb_in_flight(&mut self) {
+        let Some(w) = self.in_flight.clone() else {
             return;
         };
         let summary = w.summary();
@@ -1078,9 +1080,9 @@ fn buffered_bytes(held: u64, inspected: &Inspected) -> u64 {
     held.max(text)
 }
 
-/// The head decision and its effects.
+/// The admission decision and its effects.
 fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
-    let (out, mut refusal) = cx.evaluate_head();
+    let (out, mut refusal) = cx.evaluate_admission();
     cx.trip_quarantine_if_matched(&out);
     // Request changes apply to an allowed request only (a refused outcome
     // carries none). `log` and `set_state` apply whatever the outcome, in
@@ -1104,8 +1106,8 @@ fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
             refusal.get_or_insert(r);
         }
     }
-    // The head sample counts the outcome as it finally stands.
-    if let Err(e) = cx.record_head_sample(refusal.is_some())
+    // The admission sample counts the outcome as it finally stands.
+    if let Err(e) = cx.record_admission_sample(refusal.is_some())
         && refusal.is_none()
     {
         cx.meta.metric_error(Stage::Head, &e);
@@ -1122,7 +1124,7 @@ fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
     Verdict::Continue(req)
 }
 
-/// The watching rules and the log see the request as it will be
+/// The in-flight rules and the log see the request as it will be
 /// forwarded; what was learnt about the body stays.
 fn settle_request_facts(cx: &mut FlowCx, req: &CanonicalRequest) {
     let body = cx
@@ -1271,7 +1273,7 @@ fn rules_scheme(s: roxy_rules::Scheme) -> Scheme {
     }
 }
 
-/// Applies one effect of the head decision. Any failure denies the
+/// Applies one effect of the admission decision. Any failure denies the
 /// flow.
 fn apply_request_effect(
     cx: &mut FlowCx,
@@ -1454,16 +1456,16 @@ fn response_known_empty(cx: &FlowCx, res: &CanonicalResponse) -> bool {
         || known_empty(&res.body)
 }
 
-/// The watching rules at the response head: they may stop the
+/// The in-flight rules at the response head: they may stop the
 /// exchange (answered with an error response, since nothing has been sent
 /// yet) or change the response head.
 fn response_rules(cx: &mut FlowCx, mut res: CanonicalResponse) -> ResponseVerdict {
-    // Every forwarded exchange has a watcher and response facts;
+    // Every forwarded exchange has an in-flight checker and response facts;
     // never continue without them.
-    let (Some(watch), Some(facts)) = (cx.watch.clone(), cx.facts.response.clone()) else {
+    let (Some(in_flight), Some(facts)) = (cx.in_flight.clone(), cx.facts.response.clone()) else {
         return ResponseVerdict::Deny(Refusal::fail_closed("watch_missing"));
     };
-    match watch.on_response_head(facts, &mut res) {
+    match in_flight.on_response_head(facts, &mut res) {
         Ok(()) => ResponseVerdict::Continue(res),
         Err(stop) => ResponseVerdict::Deny(stop.refusal),
     }

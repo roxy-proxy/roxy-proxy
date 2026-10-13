@@ -140,7 +140,7 @@ pub mod rules {
     use roxy_rules::{MetricConfig, Policy, PolicyInput, RuleConfig};
 
     /// `m0` counts requests per client IP; `m1` counts request bytes (a
-    /// byte metric, so a deny reading it is also a watching rule).
+    /// byte metric, so a deny reading it is also an in-flight rule).
     pub fn metrics() -> Vec<MetricConfig> {
         serde_json::from_value(serde_json::json!([
             { "id": "m0", "count": "requests", "key": ["client.ip"] },

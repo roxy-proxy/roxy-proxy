@@ -86,7 +86,7 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: a, when: 'host == \"api.github.com', then: allow }",
     ),
     (
-        "allow in a watching rule",
+        "allow in an in-flight rule",
         "",
         "- { id: a, when: 'response.status >= 500', then: allow }",
     ),
@@ -111,7 +111,7 @@ const CASES: &[(&str, &str, &str)] = &[
         "- id: a\n  then:\n    - set_header: { authorization: \"Bearer ${secret:openai}\", x-k: \"${secret:missing}\" }\n    - allow\n",
     ),
     (
-        "secret in a watching rule",
+        "secret in an in-flight rule",
         "",
         "- { id: a, when: 'response.status == 500', then: { set_header: { x-k: \"${secret:gh}\" } } }",
     ),
@@ -141,7 +141,7 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: a, then: [{ sign: { aws_sigv4: { service: \"${secret:gh}\", region: eu-west-2, access_key_id: \"${secret:missing}\", secret_access_key: \"\" } } }, allow] }",
     ),
     (
-        "sign in a watching rule",
+        "sign in an in-flight rule",
         "",
         "- { id: a, when: 'response.status == 500', then: { sign: { aws_sigv4: { service: s3, region: us-east-1, access_key_id: \"${secret:openai}\", secret_access_key: \"${secret:gh}\" } } } }",
     ),
@@ -161,17 +161,17 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: read, when: 'tag[\"risky\"]', then: deny }\n- { id: mark, when: 'path starts_with \"/admin\"', then: [{ tag: risky }] }",
     ),
     (
-        "tag read at the head but set by a watching rule",
+        "tag read at admission but set by an in-flight rule",
         "",
         "- { id: big, when: 'body.bytes > 10', then: [{ tag: big }] }\n- { id: read, when: 'tag[\"big\"]', then: deny }",
     ),
     (
-        "tag read by a watching rule but set by a watching rule above it",
+        "tag read by an in-flight rule but set by an in-flight rule above it",
         "",
         "- { id: big, when: 'body.bytes > 10', then: [{ tag: big }] }\n- { id: cap, when: 'tag[\"big\"] and response.body.bytes > 1mb', then: deny }",
     ),
     (
-        "tag read by a watching rule but set by a deny watching a byte metric",
+        "tag read by an in-flight rule but set by a deny on a byte metric",
         METRICS,
         "- { id: budget, when: 'metric.egress > 1mb', then: [{ tag: over }, deny] }\n- { id: note, when: 'tag[\"over\"] and response.body.bytes > 0', then: { log: { message: over } } }",
     ),
@@ -201,12 +201,12 @@ const CASES: &[(&str, &str, &str)] = &[
         "- { id: a, then: { sethead: { x: y } } }",
     ),
     (
-        "request mutation in a watching rule",
+        "request mutation in an in-flight rule",
         "",
         "- { id: a, when: 'body.bytes > 1mb', then: { rewrite_path: { match: \"/a\", to: \"/b\" } } }",
     ),
     (
-        "request header change in a watching rule",
+        "request header change in an in-flight rule",
         "",
         "- { id: a, when: 'body.bytes > 1mb', then: { set_header: { x-a: b } } }",
     ),

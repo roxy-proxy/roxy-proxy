@@ -14,11 +14,11 @@ use roxy_rules::FlowView;
 /// What one exchange contributed since its last sample, reported to
 /// [`MetricSource::record`]. An exchange reports:
 ///
-/// * one `head` sample right after the forwarding decision (counts
-///   `requests` and `unique`, and `denied` if the head denied);
+/// * one `admission` sample right after the forwarding decision (counts
+///   `requests` and `unique`, and `denied` if admission denied);
 /// * one sample per forwarded body chunk (`request_bytes` or
 ///   `response_bytes`), so byte metrics grow while the exchange streams;
-/// * one final sample (`error`, and `denied` if a watching rule stopped
+/// * one final sample (`error`, and `denied` if an in-flight rule stopped
 ///   the exchange).
 ///
 /// Invariant: summing `request_bytes` over every sample of an exchange
@@ -28,13 +28,13 @@ use roxy_rules::FlowView;
 /// `response_bytes`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Sample {
-    /// The exchange's head sample.
-    pub head: bool,
+    /// The exchange's admission sample.
+    pub admission: bool,
     /// Request-body bytes not reported by an earlier sample.
     pub request_bytes: u64,
     /// Response-body bytes not reported by an earlier sample.
     pub response_bytes: u64,
-    /// The exchange was denied (at the head, or stopped by a watching rule).
+    /// The exchange was denied (at admission, or stopped by an in-flight rule).
     pub denied: bool,
     /// The upstream exchange failed (connect, TLS, DNS, timeout, protocol).
     pub error: bool,
@@ -95,8 +95,9 @@ pub trait MetricSource: Send + Sync {
     /// when this flow's key has no series (a rule reads that as 0).
     /// `Err` → the flow fails closed.
     fn get(&self, id: &str, view: &dyn FlowView) -> Result<Option<i64>, MetricSourceError>;
-    /// Called once the head step has settled (so denied flows count too), per
-    /// streamed chunk and at the end. `Err` → the exchange fails closed.
+    /// Called once the admission step has settled (so denied flows count
+    /// too), per streamed chunk and at the end. `Err` → the exchange fails
+    /// closed.
     fn record(&self, view: &dyn FlowView, sample: &Sample) -> Result<(), MetricSourceError>;
 }
 

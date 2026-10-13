@@ -4,7 +4,7 @@
 //! operators, literals, `and`/`or`/`not`), so most of them compile and the
 //! fuzzer spends its time in the evaluator.
 //!
-//! Invariants, for the head decision:
+//! Invariants, for the admission decision:
 //! - a fail-closed outcome (`_fail_closed`, with a reason) is never an
 //!   allow, and the reason is set exactly when the terminal rule is
 //!   `_fail_closed`;
@@ -192,7 +192,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let ctx = EvalContext::empty();
     let full = view(&flow);
-    let base = policy.evaluate_head(&full, &ctx);
+    let base = policy.evaluate_admission(&full, &ctx);
     check(&base);
 
     let mut degraded = Vec::new();
@@ -213,7 +213,7 @@ fuzz_target!(|data: &[u8]| {
     degraded.push(("address list unavailable".to_owned(), v));
 
     for (what, v) in &degraded {
-        let out = policy.evaluate_head(v, &ctx);
+        let out = policy.evaluate_admission(v, &ctx);
         check(&out);
         assert!(
             out == base || out.fail_closed_reason.is_some(),

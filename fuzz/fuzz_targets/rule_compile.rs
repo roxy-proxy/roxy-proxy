@@ -4,9 +4,9 @@
 //! Invariants:
 //! - nothing panics, for any expression text, as an `allow` or a `deny`
 //!   rule, and as a metric's `where` filter;
-//! - a policy that compiles can be evaluated (head and watching) on an
+//! - a policy that compiles can be evaluated (at admission and in flight) on an
 //!   empty and on a populated flow without panicking, and a fail-closed
-//!   head outcome is never an allow.
+//!   admission outcome is never an allow.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -19,7 +19,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let _ = roxy_rules::parse(src);
 
-    // As a metric filter (head fields only; anything else is an error).
+    // As a metric filter (admission fields only; anything else is an error).
     let rules: Vec<roxy_rules::RuleConfig> = Vec::new();
     if let Ok(metrics) = serde_json::from_value::<Vec<roxy_rules::MetricConfig>>(json!([
         { "id": "f", "count": "requests", "where": src }
@@ -56,12 +56,12 @@ fuzz_target!(|data: &[u8]| {
             continue;
         };
         for view in [&MapView::new(), &populated] {
-            let out = policy.evaluate_head(view, &EvalContext::empty());
+            let out = policy.evaluate_admission(view, &EvalContext::empty());
             if out.fail_closed_reason.is_some() {
                 assert!(!out.decision.is_allow(), "fail-closed allow: {out:?}");
             }
-            let mut st = policy.watch_state(&out.tags);
-            let _ = policy.evaluate_watching(Reads::ALL, Reads::ALL, &mut st, view);
+            let mut st = policy.in_flight_state(&out.tags);
+            let _ = policy.evaluate_in_flight(Reads::ALL, Reads::ALL, &mut st, view);
         }
     }
 });

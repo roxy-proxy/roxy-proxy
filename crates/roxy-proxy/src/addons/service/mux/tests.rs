@@ -16,8 +16,8 @@ use super::stream::{Answers, MAX_BODY_FRAME, Phase, Stream, StreamState, open};
 use crate::addons::service::testing;
 use crate::addons::service::{First, In, Unanswered};
 use crate::addons::{AddonImpl, AddonMode};
+use crate::in_flight::Dir;
 use crate::testkit::ALLOW_UP;
-use crate::watch::Dir;
 
 /// A link whose connection has failed, with nothing behind it.
 fn failed_link() -> Arc<Link> {

@@ -16,7 +16,7 @@ use super::link::{Link, Message, Queued, Wire, binary, dial, text};
 use super::lock;
 use super::pool::{Pool, PoolKey, Reservation};
 use super::window::Window;
-use crate::watch::Dir;
+use crate::in_flight::Dir;
 
 /// Largest body frame roxy sends, so streams share the socket fairly.
 pub(super) const MAX_BODY_FRAME: usize = 64 * 1024;

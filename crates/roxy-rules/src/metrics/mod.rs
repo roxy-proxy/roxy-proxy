@@ -158,23 +158,23 @@ pub struct CarryOverReport {
 /// What one exchange contributed since its last [`MetricStore::record`].
 /// An exchange records several samples over its life:
 ///
-/// * one with `head` set, right after the forwarding decision: it counts
-///   `requests` and `unique(..)` (and `denied` if the head decision
+/// * one with `admission` set, right after the forwarding decision: it counts
+///   `requests` and `unique(..)` (and `denied` if the admission decision
 ///   denied);
 /// * one per streamed chunk, carrying that chunk's `request_bytes` or
 ///   `response_bytes`, so a byte metric grows while the exchange streams;
-/// * one at the end with `error` (and `denied`, if a watching rule stopped
+/// * one at the end with `error` (and `denied`, if an in-flight rule stopped
 ///   the exchange).
 ///
 /// A sample whose contribution to a metric is zero does not touch it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Sample {
-    /// This is the exchange's head sample: count `requests` and
+    /// This is the exchange's admission sample: count `requests` and
     /// `unique(..)`. Exactly one sample per exchange sets it.
-    pub head: bool,
+    pub admission: bool,
     pub request_bytes: u64,
     pub response_bytes: u64,
-    /// The exchange was denied (at the head, or stopped by a watching
+    /// The exchange was denied (at admission, or stopped by an in-flight
     /// rule). Set on at most one sample per exchange.
     pub denied: bool,
     /// The exchange ended in an error (upstream failure, 5xx from roxy).
@@ -400,7 +400,7 @@ impl Metric {
     /// nothing for metrics that do not count bytes.
     fn counts(&self, sample: &Sample) -> bool {
         match self.def.count {
-            MetricCount::Requests | MetricCount::Unique(_) => sample.head,
+            MetricCount::Requests | MetricCount::Unique(_) => sample.admission,
             MetricCount::RequestBytes => sample.request_bytes > 0,
             MetricCount::ResponseBytes => sample.response_bytes > 0,
             MetricCount::Errors => sample.error,
@@ -570,7 +570,7 @@ impl MetricStore {
         }
         let key = m.key(view)?;
         let delta = match &m.def.count {
-            MetricCount::Requests => Delta::Add(u64::from(sample.head)),
+            MetricCount::Requests => Delta::Add(u64::from(sample.admission)),
             MetricCount::RequestBytes => Delta::Add(sample.request_bytes),
             MetricCount::ResponseBytes => Delta::Add(sample.response_bytes),
             MetricCount::Errors => Delta::Add(u64::from(sample.error)),

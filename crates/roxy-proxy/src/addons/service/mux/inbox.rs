@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::{ServiceError, Unanswered};
 use super::lock;
 use super::stream::{Reset, Stream};
-use crate::watch::Dir;
+use crate::in_flight::Dir;
 
 /// Bytes for one body, between the reader and that body's feeder. At most
 /// the body's credit is ever here.

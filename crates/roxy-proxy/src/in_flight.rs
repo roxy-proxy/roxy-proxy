@@ -1,29 +1,30 @@
-//! The per-exchange watcher: after the forwarding
-//! decision, watching rules are re-checked as values become known or
+//! The per-exchange in-flight checker: after the forwarding
+//! decision, in-flight rules are re-checked as values become known or
 //! change, and byte metrics grow as bytes stream.
 //!
 //! # Where it runs
 //!
-//! - **Request body chunks.** [`watched`] wraps the request body on its way
-//!   upstream. Each data frame is counted, added to `request_bytes` metrics
-//!   and checked against the watching rules **before** it is yielded, so a
+//! - **Request body chunks.** [`in_flight_body`] wraps the request body on
+//!   its way upstream. Each data frame is counted, added to `request_bytes`
+//!   metrics and checked against the in-flight rules **before** it is
+//!   yielded, so a
 //!   chunk that makes a deny match is never forwarded.
-//! - **Response head.** [`Watch::on_response_head`] runs before the head is
+//! - **Response head.** [`InFlight::on_response_head`] runs before the head is
 //!   written to the client: a stop is answered with roxy's error response,
 //!   and header effects of matching rules change the response.
 //! - **Response body chunks.** The same adapter on the response body; a stop
 //!   ends the body with [`BodyError::Stopped`], so the h1 front end breaks
 //!   the connection without a terminating chunk and the h2 front end
 //!   resets the stream.
-//! - **WebSocket relay.** [`Watch::on_ws_chunk`] before each write, and
-//!   [`Watch::on_ws_message`] before each message when rules read `ws.*`.
+//! - **WebSocket relay.** [`InFlight::on_ws_chunk`] before each write, and
+//!   [`InFlight::on_ws_message`] before each message when rules read `ws.*`.
 //!
 //! # Fail closed
 //!
-//! A stop is sticky: once [`Watch::stopped`] is `Some`, every later chunk in
-//! either direction is refused and [`Watch::cancelled`] resolves, so the
+//! A stop is sticky: once [`InFlight::stopped`] is `Some`, every later chunk in
+//! either direction is refused and [`InFlight::cancelled`] resolves, so the
 //! exchange driver abandons a pending upstream request. Any error in
-//! watching evaluation (an unavailable metric, a missing value under an
+//! in-flight evaluation (an unavailable metric, a missing value under an
 //! operator that cannot answer for it, a failed metric record, a state store
 //! that refuses a write, an effect that cannot run) stops the exchange; no
 //! error lets it continue.
@@ -31,9 +32,9 @@
 //! # Cost
 //!
 //! Whether a chunk needs anything is decided once per exchange from the
-//! policy's masks. When no rule watches a direction and no metric counts
-//! its bytes, a chunk costs two atomic loads (the stop flag and the flow
-//! log's readiness) and no lock; a WebSocket chunk under a policy with
+//! policy's masks. When no in-flight rule reads a direction and no metric
+//! counts its bytes, a chunk costs two atomic loads (the stop flag and the
+//! flow log's readiness) and no lock; a WebSocket chunk under a policy with
 //! `valid_until` adds a clock read.
 //!
 //! # Audit backpressure
@@ -51,7 +52,7 @@ use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use roxy_http::ws::frame::Message;
 use roxy_http::{Body, BodyError, CanonicalResponse};
-use roxy_rules::{Deny, Reads, RuleId, WatchEffect, WatchState};
+use roxy_rules::{Deny, InFlightEffect, InFlightState, Reads, RuleId};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
@@ -61,14 +62,15 @@ use crate::pipeline::{FlowCx, FlowMeta, Refusal, fail_closed_code, rule_names, s
 use crate::sources::Sample;
 use crate::view::{FlowFacts, ProxyView, ResponseFacts, WsFacts};
 
-/// Why and where a watching rule stopped the exchange.
+/// Why and where an in-flight rule stopped the exchange.
 #[derive(Debug, Clone)]
 pub(crate) struct Stopped {
     pub refusal: Refusal,
     pub stage: Stage,
 }
 
-/// What the flow log needs from the watcher at the end of an exchange.
+/// What the flow log needs from the in-flight checker at the end of an
+/// exchange.
 #[derive(Debug, Default)]
 pub(crate) struct Summary {
     pub rules: Vec<RuleId>,
@@ -105,10 +107,10 @@ impl Dir {
     }
 }
 
-/// The watching state of one exchange. Shared (`Arc`) between the request
+/// The in-flight state of one exchange. Shared (`Arc`) between the request
 /// body adapter (polled by the upstream connection), the response path and
 /// the exchange driver.
-pub(crate) struct Watch {
+pub(crate) struct InFlight {
     meta: Arc<FlowMeta>,
     stop: CancellationToken,
     /// Request chunks need evaluation or metric recording.
@@ -121,8 +123,8 @@ pub(crate) struct Watch {
 struct Inner {
     meta: Arc<FlowMeta>,
     facts: FlowFacts,
-    st: WatchState,
-    /// Watched fields known so far.
+    st: InFlightState,
+    /// In-flight fields known so far.
     known: Reads,
     stopped: Option<Stopped>,
     rules: Vec<RuleId>,
@@ -131,24 +133,24 @@ struct Inner {
     ws_messages: u64,
 }
 
-impl std::fmt::Debug for Watch {
+impl std::fmt::Debug for InFlight {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Watch")
+        f.debug_struct("InFlight")
             .field("stopped", &self.stop.is_cancelled())
             .finish_non_exhaustive()
     }
 }
 
-impl Watch {
-    /// The watcher for an exchange about to be forwarded: `body.bytes` is
-    /// known (0) from now on.
+impl InFlight {
+    /// The in-flight checker for an exchange about to be forwarded:
+    /// `body.bytes` is known (0) from now on.
     pub(crate) fn new(cx: &FlowCx) -> Arc<Self> {
         let policy = &cx.snap.policy;
         let bm = policy.byte_metrics();
-        let request_chunks = policy.watches(Reads::BODY_BYTES | Reads::METRIC_REQUEST_BYTES)
+        let request_chunks = policy.triggers_on(Reads::BODY_BYTES | Reads::METRIC_REQUEST_BYTES)
             || bm.intersects(Reads::METRIC_REQUEST_BYTES);
         let response_chunks = policy
-            .watches(Reads::RESPONSE_BODY_BYTES | Reads::METRIC_RESPONSE_BYTES)
+            .triggers_on(Reads::RESPONSE_BODY_BYTES | Reads::METRIC_RESPONSE_BYTES)
             || bm.intersects(Reads::METRIC_RESPONSE_BYTES);
         let mut facts = cx.facts.clone();
         facts.request_body_bytes = Some(0);
@@ -160,7 +162,7 @@ impl Watch {
             inner: Mutex::new(Inner {
                 meta: cx.meta.clone(),
                 facts,
-                st: policy.watch_state(&cx.record.tags),
+                st: policy.in_flight_state(&cx.record.tags),
                 known: Reads::BODY_BYTES,
                 stopped: None,
                 rules: Vec::new(),
@@ -174,7 +176,7 @@ impl Watch {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The stop, if a watching rule (or an error) stopped the exchange.
+    /// The stop, if an in-flight rule (or an error) stopped the exchange.
     pub(crate) fn stopped(&self) -> Option<Stopped> {
         if !self.stop.is_cancelled() {
             return None;
@@ -192,7 +194,7 @@ impl Watch {
         self.stop.clone().cancelled_owned()
     }
 
-    /// Rules, tags and response mutations of the watching rules, and the
+    /// Rules, tags and response mutations of the in-flight rules, and the
     /// stop. Mutations are drained (call once).
     pub(crate) fn summary(&self) -> Summary {
         let mut g = self.lock();
@@ -238,18 +240,18 @@ impl Watch {
                 break;
             }
             let applied = match e {
-                WatchEffect::SetHeader { name, value } => res
+                InFlightEffect::SetHeader { name, value } => res
                     .headers
                     .insert(&name, &value)
                     .map(|()| format!("response.set_header:{name}"))
                     .map_err(|e| e.to_string()),
-                WatchEffect::RemoveHeader(name) => {
+                InFlightEffect::RemoveHeader(name) => {
                     res.headers.remove(&name);
                     Ok(format!("response.remove_header:{name}"))
                 }
                 // `evaluate` returns header effects only; never continue
                 // on anything else.
-                other @ (WatchEffect::Log { .. } | WatchEffect::SetState { .. }) => {
+                other @ (InFlightEffect::Log { .. } | InFlightEffect::SetState { .. }) => {
                     Err(format!("unexpected effect {}", other.kind()))
                 }
             };
@@ -381,7 +383,7 @@ impl Inner {
         }
     }
 
-    /// A relay outlives the head decision, so the quarantine and the lease
+    /// A relay outlives the admission decision, so the quarantine and the lease
     /// are re-checked before each write: the exchange stops with
     /// `_quarantined` or `_expired`.
     fn stop_if_expired(&mut self, stage: Stage) {
@@ -393,7 +395,7 @@ impl Inner {
     }
 
     /// Records `n` bytes in byte metrics (if any count this direction),
-    /// then re-checks the rules watching `changed` (plus the metric bit).
+    /// then re-checks the rules `changed` triggers (plus the metric bit).
     /// Recording first is what lets a budget rule stop the chunk that
     /// crosses it: the chunk counts, and is then refused.
     fn bytes(&mut self, dir: Dir, n: u64, mut changed: Reads, stage: Stage) {
@@ -438,13 +440,13 @@ impl Inner {
         }
     }
 
-    /// Re-checks the watching rules after `changed`. Applies `log`, `tag`
+    /// Re-checks the in-flight rules after `changed`. Applies `log`, `tag`
     /// and `set_state` effects, records a stop, and returns the header
     /// effects for the caller to apply to the response.
-    fn evaluate(&mut self, changed: Reads, stage: Stage) -> Vec<WatchEffect> {
+    fn evaluate(&mut self, changed: Reads, stage: Stage) -> Vec<InFlightEffect> {
         let meta = self.meta.clone();
         let FlowMeta { shared, snap, .. } = &*meta;
-        if !snap.policy.watches(changed) {
+        if !snap.policy.triggers_on(changed) {
             return Vec::new();
         }
         let view = ProxyView::new(
@@ -455,7 +457,7 @@ impl Inner {
         );
         let out = snap
             .policy
-            .evaluate_watching(changed, self.known, &mut self.st, &view);
+            .evaluate_in_flight(changed, self.known, &mut self.st, &view);
         let metric_err = view.take_metric_error();
         drop(view);
         let Some(o) = out else {
@@ -475,13 +477,13 @@ impl Inner {
         let mut headers = Vec::new();
         for e in o.effects {
             match e {
-                WatchEffect::Log { level, message } => meta.rule_log(stage, level, &message),
-                WatchEffect::SetState { key, value, ttl } => {
+                InFlightEffect::Log { level, message } => meta.rule_log(stage, level, &message),
+                InFlightEffect::SetState { key, value, ttl } => {
                     if shared.state.set(&key, &value, ttl).is_err() {
                         self.stop_with(Refusal::fail_closed("state_unavailable"), stage);
                     }
                 }
-                e @ (WatchEffect::SetHeader { .. } | WatchEffect::RemoveHeader(_)) => {
+                e @ (InFlightEffect::SetHeader { .. } | InFlightEffect::RemoveHeader(_)) => {
                     headers.push(e);
                 }
             }
@@ -501,7 +503,7 @@ impl Inner {
                     .terminal_rule
                     .clone()
                     .unwrap_or_else(|| RuleId::new(RuleId::FAIL_CLOSED));
-                tracing::info!(flow = %meta.flow, %rule, stage = stage.as_str(), "watching rule stopped the exchange");
+                tracing::info!(flow = %meta.flow, %rule, stage = stage.as_str(), "in-flight rule stopped the exchange");
                 Refusal::deny(status_code(status), &message, rule, close)
             };
             // A stop's own refusal takes precedence over an effect failure
@@ -513,17 +515,22 @@ impl Inner {
     }
 }
 
-/// Wraps a body so each data frame passes [`Watch::on_body_chunk`] before
+/// Wraps a body so each data frame passes [`InFlight::on_body_chunk`] before
 /// it is yielded. Framing (known length) is preserved; a stop ends the body
 /// with [`BodyError::Stopped`] and the frame that caused it is dropped.
-pub(crate) fn watched(body: Body, watch: Arc<Watch>, dir: Dir, tap: Option<Tap>) -> Body {
+pub(crate) fn in_flight_body(
+    body: Body,
+    in_flight: Arc<InFlight>,
+    dir: Dir,
+    tap: Option<Tap>,
+) -> Body {
     let known = body.known_length();
-    let cancelled = Box::pin(watch.cancelled());
-    let sink = watch.sink();
+    let cancelled = Box::pin(in_flight.cancelled());
+    let sink = in_flight.sink();
     Body::wrap_native(
-        Watched {
+        InFlightBody {
             inner: body,
-            watch,
+            in_flight,
             dir,
             cancelled,
             sink,
@@ -535,9 +542,9 @@ pub(crate) fn watched(body: Body, watch: Arc<Watch>, dir: Dir, tap: Option<Tap>)
     )
 }
 
-struct Watched {
+struct InFlightBody {
     inner: Body,
-    watch: Arc<Watch>,
+    in_flight: Arc<InFlight>,
     dir: Dir,
     cancelled: Pin<Box<WaitForCancellationFutureOwned>>,
     /// Audit backpressure: no chunk moves while the flow log is
@@ -548,7 +555,7 @@ struct Watched {
     done: bool,
 }
 
-impl Watched {
+impl InFlightBody {
     /// Ends the body with [`BodyError::Stopped`]; the capture tap (if any)
     /// records an aborted end.
     fn stop(&mut self) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
@@ -558,7 +565,7 @@ impl Watched {
     }
 }
 
-impl http_body::Body for Watched {
+impl http_body::Body for InFlightBody {
     type Data = Bytes;
     type Error = BodyError;
 
@@ -569,7 +576,7 @@ impl http_body::Body for Watched {
         if self.done {
             return Poll::Ready(None);
         }
-        if self.watch.stop.is_cancelled() {
+        if self.in_flight.stop.is_cancelled() {
             return self.stop();
         }
         let capture_behind = self
@@ -602,7 +609,11 @@ impl http_body::Body for Watched {
                 if let Some(d) = frame.data_ref()
                     && !d.is_empty()
                 {
-                    if self.watch.on_body_chunk(self.dir, d.len() as u64).is_err() {
+                    if self
+                        .in_flight
+                        .on_body_chunk(self.dir, d.len() as u64)
+                        .is_err()
+                    {
                         return self.stop();
                     }
                     if let Some(t) = self.tap.as_mut() {

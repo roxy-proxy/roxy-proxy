@@ -1,13 +1,14 @@
-//! The head decision and watching evaluation over a compiled [`Policy`],
+//! The admission decision and in-flight evaluation over a compiled [`Policy`],
 //! plus the runtime side of [`MetricDef`] and [`Condition`].
 
 use super::{
-    CAction, Condition, MetricDef, Part, Policy, SignSpec, WatchAction, WatchState, is_header_value,
+    CAction, Condition, InFlightAction, InFlightState, MetricDef, Part, Policy, SignSpec,
+    is_header_value,
 };
 use crate::diag::RuleId;
 use crate::eval::{
-    AwsSigV4, Credential, Decision, Deny, Effect, EvalContext, FailClosedReason, Outcome,
-    PendingState, Scope, SetHeaderValue, WatchEffect, WatchOutcome,
+    AwsSigV4, Credential, Decision, Deny, Effect, EvalContext, FailClosedReason, InFlightEffect,
+    InFlightOutcome, Outcome, PendingState, Scope, SetHeaderValue,
 };
 use crate::types::Reads;
 use crate::view::FlowView;
@@ -38,16 +39,22 @@ fn refused_effects(effects: &mut Vec<Effect>) {
 }
 
 /// Keep only the effects that still apply when the exchange is stopped.
-fn stopped_effects(effects: &mut Vec<WatchEffect>) {
-    effects.retain(|e| matches!(e, WatchEffect::Log { .. } | WatchEffect::SetState { .. }));
+fn stopped_effects(effects: &mut Vec<InFlightEffect>) {
+    effects.retain(|e| {
+        matches!(
+            e,
+            InFlightEffect::Log { .. } | InFlightEffect::SetState { .. }
+        )
+    });
 }
 
 impl Policy {
-    /// The head decision: the forwarding decision at the request
-    /// head.
+    /// The admission decision: the forwarding decision, made before the
+    /// request goes upstream.
     ///
-    /// Every rule that takes part in it ([`RuleKind::at_head`]) is
-    /// evaluated, top to bottom; rules that read a watched value are
+    /// Every rule that takes part in it
+    /// ([`RuleKind::at_admission`](super::RuleKind::at_admission)) is
+    /// evaluated, top to bottom; rules that read an in-flight value are
     /// skipped (not false). The decision does not depend on order:
     ///
     /// * if any matching rule denies, the request is denied
@@ -63,7 +70,7 @@ impl Policy {
     /// allowed; when it is denied only `log` and `set_state` remain (tags
     /// are in [`Outcome::tags`]).
     ///
-    /// Fail closed: if evaluating *any* head rule reaches a metric
+    /// Fail closed: if evaluating *any* admission rule reaches a metric
     /// the view reports unavailable, an address list it cannot answer for,
     /// a missing value under an operator that cannot answer for `null`, an
     /// uninspectable body, or a `set_header` secret that cannot be resolved,
@@ -72,14 +79,14 @@ impl Policy {
     ///
     /// Allocation: nothing is allocated for rules that do not match, except
     /// what the view itself returns (e.g. `header.all`).
-    pub fn evaluate_head(&self, view: &dyn FlowView, ctx: &EvalContext<'_>) -> Outcome {
+    pub fn evaluate_admission(&self, view: &dyn FlowView, ctx: &EvalContext<'_>) -> Outcome {
         let mut tags: Vec<String> = ctx.initial_tags.to_vec();
         let mut effects: Vec<Effect> = Vec::new();
         let mut matched: Vec<RuleId> = Vec::new();
         let mut deny: Option<(usize, Decision)> = None;
         let mut allow: Option<(usize, &Decision)> = None;
         let mut quarantine: Option<RuleId> = None;
-        for &i in &self.head {
+        for &i in &self.admission {
             let rule = &self.rules[i];
             let hit = match &rule.when {
                 None => Ok(true),
@@ -94,7 +101,7 @@ impl Policy {
             if rule.quarantines {
                 quarantine.get_or_insert_with(|| rule.id.clone());
             }
-            for action in &rule.head {
+            for action in &rule.admission {
                 match action {
                     CAction::Effect(e) => effects.push(e.clone()),
                     CAction::Tag(t) => {
@@ -166,34 +173,34 @@ impl Policy {
         }
     }
 
-    /// Per-exchange watching state, starting from the tags the head
+    /// Per-exchange in-flight state, starting from the tags the admission
     /// decision produced.
-    pub fn watch_state(&self, head_tags: &[String]) -> WatchState {
-        WatchState {
-            fired: vec![false; self.watching.len()],
-            tags: head_tags.to_vec(),
+    pub fn in_flight_state(&self, admission_tags: &[String]) -> InFlightState {
+        InFlightState {
+            fired: vec![false; self.in_flight.len()],
+            tags: admission_tags.to_vec(),
             stopped: false,
         }
     }
 
-    /// Whether an event changing `changed` can re-check any watching rule.
+    /// Whether an event changing `changed` can re-check any in-flight rule.
     /// One mask test; callers use it to skip per-chunk work entirely.
-    pub fn watches(&self, changed: Reads) -> bool {
-        self.watch_triggers.intersects(changed)
+    pub fn triggers_on(&self, changed: Reads) -> bool {
+        self.in_flight_triggers.intersects(changed)
     }
 
-    /// Re-check the watching rules after a value changed.
+    /// Re-check the in-flight rules after a value changed.
     ///
     /// `changed` is what just became known or changed (e.g.
     /// [`Reads::BODY_BYTES`] for a request body chunk, plus
     /// [`Reads::METRIC_REQUEST_BYTES`] if this exchange's bytes were just
-    /// added to such a metric); `known` is every watched field known so far
+    /// added to such a metric); `known` is every in-flight field known so far
     /// (a rule is only checked once everything it reads is known). Rules
     /// whose triggers intersect `changed` are checked top to bottom, every
-    /// one of them even after a deny matched, as at the head: the `log` and
+    /// one of them even after a deny matched, as at admission: the `log` and
     /// `set_state` effects of every matching rule apply, the first matching
     /// deny in list order is the terminal rule, and an unavailable input
-    /// anywhere in the pass fails closed over a deny. A watching rule's
+    /// anywhere in the pass fails closed over a deny. An in-flight rule's
     /// non-terminal effects apply once, the first time it matches; it is not
     /// checked again after that.
     ///
@@ -202,19 +209,19 @@ impl Policy {
     /// exchange must stop: a matching deny, or any fail-closed input (an
     /// error never lets the exchange continue). After a stop every call
     /// returns `None`.
-    pub fn evaluate_watching(
+    pub fn evaluate_in_flight(
         &self,
         changed: Reads,
         known: Reads,
-        st: &mut WatchState,
+        st: &mut InFlightState,
         view: &dyn FlowView,
-    ) -> Option<WatchOutcome> {
-        if st.stopped || !self.watch_triggers.intersects(changed) {
+    ) -> Option<InFlightOutcome> {
+        if st.stopped || !self.in_flight_triggers.intersects(changed) {
             return None;
         }
-        let mut out: Option<WatchOutcome> = None;
+        let mut out: Option<InFlightOutcome> = None;
         let mut deny: Option<(RuleId, Deny)> = None;
-        for (k, &i) in self.watching.iter().enumerate() {
+        for (k, &i) in self.in_flight.iter().enumerate() {
             let rule = &self.rules[i];
             if st.fired[k]
                 || !rule.shape.triggers.intersects(changed)
@@ -231,25 +238,25 @@ impl Policy {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(reason) => {
-                    return Some(self.watch_stop(st, out, None, Some(reason)));
+                    return Some(self.in_flight_stop(st, out, None, Some(reason)));
                 }
             }
-            let o = out.get_or_insert_with(WatchOutcome::default);
+            let o = out.get_or_insert_with(InFlightOutcome::default);
             st.fired[k] = true;
             o.matched.push(rule.id.clone());
             if rule.quarantines {
                 o.quarantine.get_or_insert_with(|| rule.id.clone());
             }
-            for action in &rule.watching {
+            for action in &rule.in_flight {
                 match action {
-                    WatchAction::Effect(e) => o.effects.push(e.clone()),
-                    WatchAction::Tag(t) => {
+                    InFlightAction::Effect(e) => o.effects.push(e.clone()),
+                    InFlightAction::Tag(t) => {
                         if !st.tags.contains(t) {
                             st.tags.push(t.clone());
                             o.tags.push(t.clone());
                         }
                     }
-                    WatchAction::Deny(d) => {
+                    InFlightAction::Deny(d) => {
                         if deny.is_none() {
                             deny = Some((rule.id.clone(), d.clone()));
                         }
@@ -258,18 +265,18 @@ impl Policy {
             }
         }
         if deny.is_some() {
-            return Some(self.watch_stop(st, out, deny, None));
+            return Some(self.in_flight_stop(st, out, deny, None));
         }
         out.filter(|o| !o.matched.is_empty())
     }
 
-    fn watch_stop(
+    fn in_flight_stop(
         &self,
-        st: &mut WatchState,
-        o: Option<WatchOutcome>,
+        st: &mut InFlightState,
+        o: Option<InFlightOutcome>,
         deny: Option<(RuleId, Deny)>,
         reason: Option<FailClosedReason>,
-    ) -> WatchOutcome {
+    ) -> InFlightOutcome {
         st.stopped = true;
         let mut o = o.unwrap_or_default();
         stopped_effects(&mut o.effects);

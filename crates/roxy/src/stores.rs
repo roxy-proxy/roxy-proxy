@@ -99,7 +99,7 @@ impl MetricSource for ReloadableMetrics {
 
     fn record(&self, view: &dyn FlowView, sample: &Sample) -> Result<(), MetricSourceError> {
         let s = roxy_rules::Sample {
-            head: sample.head,
+            admission: sample.admission,
             request_bytes: sample.request_bytes,
             response_bytes: sample.response_bytes,
             denied: sample.denied,
@@ -170,7 +170,7 @@ mod tests {
 
     fn record(m: &ReloadableMetrics, path: &str) -> Result<(), MetricSourceError> {
         let sample = Sample {
-            head: true,
+            admission: true,
             ..Sample::default()
         };
         m.record(&MapView::new().with_str(Field::Path, path), &sample)
@@ -266,7 +266,7 @@ mod tests {
             .with_str(Field::Host, "b")
             .with_str(Field::Path, "/a");
         let sample = Sample {
-            head: true,
+            admission: true,
             ..Sample::default()
         };
         m.record(&view, &sample).unwrap();

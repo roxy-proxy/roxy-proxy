@@ -1,4 +1,4 @@
-//! The exchange core without addons: decisions, watching stops, upstream
+//! The exchange core without addons: decisions, in-flight stops, upstream
 //! errors and the address floor, as the client, the upstream and the flow
 //! log see them.
 
@@ -90,7 +90,7 @@ async fn the_default_denies_and_nothing_leaves() {
 }
 
 #[tokio::test]
-async fn a_deny_rule_wins_at_the_head() {
+async fn a_deny_rule_wins_at_admission() {
     let kit = kit().await;
     let a = kit.h1().await.call("GET", "/admin/users", &[], b"").await;
     assert_eq!(a.status, 403, "{a:?}");
@@ -100,7 +100,7 @@ async fn a_deny_rule_wins_at_the_head() {
     assert!(kit.upstream.seen().is_empty());
 }
 
-async fn a_watching_rule_stops_an_upload_mid_body(h2: bool) {
+async fn an_in_flight_rule_stops_an_upload_mid_body(h2: bool) {
     let kit = kit().await;
     let mut c = if h2 {
         kit.tunnel("up.test", true).await
@@ -130,19 +130,19 @@ async fn a_watching_rule_stops_an_upload_mid_body(h2: bool) {
 }
 
 #[tokio::test]
-async fn h1_a_watching_rule_stops_an_upload_mid_body() {
-    a_watching_rule_stops_an_upload_mid_body(false).await;
+async fn h1_an_in_flight_rule_stops_an_upload_mid_body() {
+    an_in_flight_rule_stops_an_upload_mid_body(false).await;
 }
 
 #[tokio::test]
-async fn h2_a_watching_rule_stops_an_upload_mid_body() {
-    a_watching_rule_stops_an_upload_mid_body(true).await;
+async fn h2_an_in_flight_rule_stops_an_upload_mid_body() {
+    an_in_flight_rule_stops_an_upload_mid_body(true).await;
 }
 
-/// A watching rule stopping the response mid-body cuts it: the h1 body
+/// An in-flight rule stopping the response mid-body cuts it: the h1 body
 /// ends without its terminating chunk and the connection closes, the h2
 /// stream is reset. Either way the client cannot take it for complete.
-async fn a_watching_rule_stops_a_response_mid_body(h2: bool) {
+async fn an_in_flight_rule_stops_a_response_mid_body(h2: bool) {
     let kit = Kit::builder()
         .rules(
             r#"
@@ -188,13 +188,13 @@ async fn a_watching_rule_stops_a_response_mid_body(h2: bool) {
 }
 
 #[tokio::test]
-async fn h1_a_watching_rule_stops_a_response_mid_body() {
-    a_watching_rule_stops_a_response_mid_body(false).await;
+async fn h1_an_in_flight_rule_stops_a_response_mid_body() {
+    an_in_flight_rule_stops_a_response_mid_body(false).await;
 }
 
 #[tokio::test]
-async fn h2_a_watching_rule_stops_a_response_mid_body() {
-    a_watching_rule_stops_a_response_mid_body(true).await;
+async fn h2_an_in_flight_rule_stops_a_response_mid_body() {
+    an_in_flight_rule_stops_a_response_mid_body(true).await;
 }
 
 /// An upstream that takes the request but never answers is a `504` once
@@ -843,7 +843,7 @@ async fn plaintext_in_connect_in_pieces_is_still_http() {
 }
 
 /// Roxy's own time before it reads the request body (here a slow
-/// `set_state` at the head) does not count against the client's
+/// `set_state` at admission) does not count against the client's
 /// `body_idle_timeout` on h2.
 #[tokio::test(flavor = "multi_thread")]
 async fn h2_body_idle_timeout_runs_from_when_the_body_is_read() {
@@ -1109,10 +1109,10 @@ async fn recording_kit(rules: &str) -> (Kit, std::sync::Arc<Recording>) {
     (kit, rec)
 }
 
-/// A refused head decision still applies the `log` and `set_state` of the
+/// A refused admission decision still applies the `log` and `set_state` of the
 /// rules that matched, and counts as denied.
 #[tokio::test]
-async fn a_head_deny_still_logs_and_writes_state() {
+async fn an_admission_deny_still_logs_and_writes_state() {
     let (kit, rec) = recording_kit(
         r#"
 - id: no-admin
@@ -1133,10 +1133,10 @@ async fn a_head_deny_still_logs_and_writes_state() {
         Some("1")
     );
     let samples = rec.samples.lock().unwrap().clone();
-    assert!(samples[0].head && samples[0].denied, "{samples:?}");
+    assert!(samples[0].admission && samples[0].denied, "{samples:?}");
 }
 
-/// An allowed request whose change fails is refused, and its head sample
+/// An allowed request whose change fails is refused, and its admission sample
 /// counts it as denied, not allowed.
 #[tokio::test]
 async fn a_failing_effect_counts_as_denied() {
@@ -1154,21 +1154,21 @@ async fn a_failing_effect_counts_as_denied() {
     assert!(kit.upstream.seen().is_empty());
     let samples = rec.samples.lock().unwrap().clone();
     assert_eq!(samples.len(), 1, "{samples:?}");
-    assert!(samples[0].head && samples[0].denied, "{samples:?}");
+    assert!(samples[0].admission && samples[0].denied, "{samples:?}");
 }
 
-/// The samples after the head sample.
+/// The samples after the admission sample.
 fn final_samples(rec: &Recording) -> Vec<crate::sources::Sample> {
     rec.samples
         .lock()
         .unwrap()
         .iter()
         .copied()
-        .filter(|s| !s.head)
+        .filter(|s| !s.admission)
         .collect()
 }
 
-/// A deny after the forwarding decision that is not a watching stop (the
+/// A deny after the forwarding decision that is not an in-flight stop (the
 /// address floor at preflight) still counts as denied in its final sample.
 #[tokio::test]
 async fn an_address_floor_deny_counts_as_denied() {
@@ -1201,7 +1201,7 @@ async fn an_upstream_failure_counts_as_an_error() {
 }
 
 #[tokio::test]
-async fn a_watching_stop_counts_as_denied() {
+async fn an_in_flight_stop_counts_as_denied() {
     let (kit, rec) = recording_kit(RULES).await;
     let mut c = kit.h1().await;
     let (mut tx, body) = streaming_body();

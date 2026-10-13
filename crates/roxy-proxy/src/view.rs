@@ -1,8 +1,8 @@
 //! The flow as the rule engine sees it ([`FlowView`]).
 //!
 //! [`FlowFacts`] is an owned summary of the flow (the request head is
-//! cloned, never the body), so the same view can be used for the head
-//! decision, watching rules (with the byte counts so far), metric
+//! cloned, never the body), so the same view can be used for the admission
+//! decision, in-flight rules (with the byte counts so far), metric
 //! recording, and the flow log.
 //!
 //! Field contract (`roxy_rules::Field`): hosts lower-case without a
@@ -24,10 +24,10 @@ use roxy_rules::{BodyText, Field, FlowView, Value};
 use crate::addrlist::AddressLists;
 use crate::budget::Exhausted;
 use crate::flowlog::TlsInfo;
+use crate::in_flight::Dir;
 use crate::listener::ClientConn;
 use crate::server::Shared;
 use crate::sources::{MetricSource, MetricSourceError, StateSource};
-use crate::watch::Dir;
 
 /// An inspected (buffered) body.
 #[derive(Debug, Clone, Default)]
@@ -36,8 +36,8 @@ pub(crate) enum Inspected {
     #[default]
     NotBuffered,
     /// Buffered and decoded (lossy UTF-8). Shared: the facts are cloned
-    /// into the watcher and the addon stack, and the text can be as large
-    /// as `limits.max_inspect_body_bytes`.
+    /// into the in-flight checker and the addon stack, and the text can be
+    /// as large as `limits.max_inspect_body_bytes`.
     Text(Arc<str>),
     /// Larger than `limits.max_inspect_body_bytes`, as sent or decoded.
     TooLarge,
@@ -138,12 +138,12 @@ pub(crate) struct FlowFacts {
     /// What the client sent: the flow log's `req`.
     pub client_request: Option<RequestFacts>,
     /// The request the rules judge: what left the addon stack (the client's
-    /// request when there is none), then, after the head decision, as it is
-    /// forwarded. Metric keys come from it.
+    /// request when there is none), then, after the admission decision, as
+    /// it is forwarded. Metric keys come from it.
     pub request: Option<RequestFacts>,
     pub response: Option<ResponseFacts>,
     /// `body.bytes`: request body bytes forwarded so far; `None` before
-    /// forwarding (a head rule never reads it).
+    /// forwarding (an admission rule never reads it).
     pub request_body_bytes: Option<u64>,
     /// `response.body.bytes`: response body bytes sent so far; `None`
     /// before the response head.
