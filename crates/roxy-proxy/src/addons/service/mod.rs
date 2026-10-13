@@ -209,8 +209,20 @@ fn pairs(h: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-fn header_map(pairs: &[(String, String)]) -> Result<HeaderMap, ServiceError> {
-    let mut h = HeaderMap::new();
+/// Builds the head's map, holding the count to `max_headers` like every
+/// head roxy parses. The count is checked before anything is allocated,
+/// and the map is grown fallibly: past its own capacity `HeaderMap`
+/// panics on `append`, which would take the connection's reader with it.
+fn header_map(pairs: &[(String, String)], max_headers: usize) -> Result<HeaderMap, ServiceError> {
+    let count = pairs.len();
+    if count > max_headers {
+        return Err(ServiceError::Protocol(format!(
+            "{count} header fields, more than max_headers ({max_headers})"
+        )));
+    }
+    let too_many =
+        |_| ServiceError::Protocol(format!("{count} header fields, more than a head holds"));
+    let mut h = HeaderMap::try_with_capacity(count).map_err(too_many)?;
     for (n, v) in pairs {
         let name = HeaderName::from_bytes(n.as_bytes())
             .map_err(|_| ServiceError::Protocol(format!("invalid header name {n:?}")))?;
@@ -220,7 +232,7 @@ fn header_map(pairs: &[(String, String)]) -> Result<HeaderMap, ServiceError> {
             .map(|c| u8::try_from(u32::from(c)).map_err(|_| invalid()))
             .collect::<Result<_, _>>()?;
         let value = HeaderValue::from_bytes(&bytes).map_err(|_| invalid())?;
-        h.append(name, value);
+        h.try_append(name, value).map_err(too_many)?;
     }
     Ok(h)
 }
@@ -486,10 +498,21 @@ mod tests {
         h.insert("x-obs", HeaderValue::from_bytes(raw).unwrap());
         let sent = pairs(&h);
         assert_eq!(sent, [("x-obs".to_owned(), "caf\u{e9} \u{ff}".to_owned())]);
-        let back = header_map(&sent).unwrap();
+        let back = header_map(&sent, 100).unwrap();
         assert_eq!(back["x-obs"].as_bytes(), raw);
         let wide = [("x-obs".to_owned(), "\u{100}".to_owned())];
-        assert!(header_map(&wide).is_err());
+        assert!(header_map(&wide, 100).is_err());
+    }
+
+    /// A `max_headers` above what a `HeaderMap` holds (2^15 fields) does
+    /// not reopen the panic: the map's own limit is an error too.
+    #[test]
+    fn a_head_past_the_maps_capacity_is_an_error_not_a_panic() {
+        let pairs: Vec<_> = (0..=1 << 15)
+            .map(|i| (format!("x-{i}"), "v".to_owned()))
+            .collect();
+        let e = header_map(&pairs, usize::MAX).unwrap_err();
+        assert!(e.to_string().contains("more than a head holds"), "{e}");
     }
 }
 

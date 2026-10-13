@@ -154,6 +154,45 @@ async fn an_invalid_request_head_fails_the_first_answer() {
     assert_eq!(e.kind(), "service:protocol", "{e}");
 }
 
+fn fields(n: usize) -> Vec<(String, String)> {
+    (0..n).map(|i| (format!("x-{i}"), "v".to_owned())).collect()
+}
+
+/// A service head is held to `limits.max_headers` like any head roxy
+/// parses: one field over is the service's protocol error, on either
+/// head, and the stream ends rather than the connection's reader.
+#[tokio::test]
+async fn a_head_with_more_than_max_headers_fields_fails_the_stream() {
+    let (stream, answers, _kit) = lone_stream().await;
+    stream.control(In::Request {
+        method: "GET".to_owned(),
+        url: "http://up.test/".to_owned(),
+        headers: fields(101),
+    });
+    assert!(lock(&stream.state).ended());
+    let Err(Unanswered::Service(e)) = answers.first.await.expect("the first answer is told") else {
+        panic!("the request is not forwarded");
+    };
+    assert_eq!(e.kind(), "service:protocol", "{e}");
+    assert_eq!(
+        e.to_string(),
+        "service protocol violation: 101 header fields, more than max_headers (100)"
+    );
+
+    let (stream, answers, _kit) = lone_stream().await;
+    stream.control(request_head());
+    let First::Forward(_req) = answers.first.await.unwrap().unwrap() else {
+        panic!("the request is forwarded");
+    };
+    stream.control(In::Response {
+        status: 200,
+        headers: fields(101),
+    });
+    assert!(lock(&stream.state).ended());
+    let e = answers.second.await.unwrap().unwrap_err();
+    assert!(e.to_string().contains("max_headers (100)"), "{e}");
+}
+
 /// Bytes are owed to a head in their own direction: response bytes
 /// while only the request body is being fed fail the stream.
 #[tokio::test]
