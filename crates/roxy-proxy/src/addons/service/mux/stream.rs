@@ -514,7 +514,7 @@ impl Stream {
                 let uri: http::Uri = url
                     .parse()
                     .map_err(|_| ServiceError::Protocol(format!("invalid url {url:?}")))?;
-                let headers = super::super::header_map(&headers)?;
+                let headers = super::super::header_map(&headers, limits.max_headers)?;
                 let declared = super::super::declared_length(&headers)?;
                 let first = s.forwarded()?;
                 // On an upgrade the forwarded body is the client's side of
@@ -544,7 +544,7 @@ impl Stream {
                 }
                 let status = http::StatusCode::from_u16(status)
                     .map_err(|e| ServiceError::Protocol(e.to_string()))?;
-                let headers = super::super::header_map(&headers)?;
+                let headers = super::super::header_map(&headers, limits.max_headers)?;
                 let cap = if upgrade {
                     u64::MAX
                 } else {
