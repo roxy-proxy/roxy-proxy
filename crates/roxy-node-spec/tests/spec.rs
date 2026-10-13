@@ -195,6 +195,45 @@ fn enrol_request_pins_protocol_version_one() {
     assert!(validate("EnrolRequest", &req).is_err());
 }
 
+/// The enrol body carries only the versions; a server may ignore more,
+/// but nothing it needs is optional.
+#[test]
+fn enrol_request_needs_both_versions_and_no_more() {
+    let req = page_example("EnrolRequest");
+    assert_eq!(
+        req.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["protocol_version", "roxy_version"]
+    );
+    let mut missing = req.clone();
+    missing.as_object_mut().unwrap().remove("roxy_version");
+    assert!(validate("EnrolRequest", &missing).is_err());
+    let mut empty = req;
+    empty["roxy_version"] = json!("");
+    assert!(validate("EnrolRequest", &empty).is_err());
+}
+
+/// The node token is required and must fit an `Authorization` header
+/// unchanged: visible ASCII, 1 to 512 bytes.
+#[test]
+fn enrol_response_token_is_required_and_header_safe() {
+    let res = page_example("EnrolResponse");
+    assert!(res.get("certificate_chain").is_none());
+    let mut missing = res.clone();
+    missing.as_object_mut().unwrap().remove("token");
+    assert!(validate("EnrolResponse", &missing).is_err());
+    for bad in ["", "with space", "tab\tin", "ünïcode", &"x".repeat(513)] {
+        let mut r = res.clone();
+        r["token"] = json!(bad);
+        assert!(validate("EnrolResponse", &r).is_err(), "{bad:?}");
+    }
+    let mut longest = res.clone();
+    longest["token"] = json!("x".repeat(512));
+    assert!(validate("EnrolResponse", &longest).is_ok());
+    let mut not_a_time = res;
+    not_a_time["not_after"] = json!("soon");
+    assert!(validate("EnrolResponse", &not_a_time).is_err());
+}
+
 #[test]
 fn node_state_policy_state_is_an_enum_and_only_lease_id_may_be_null() {
     let mut state = page_example("NodeState");

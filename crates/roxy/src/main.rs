@@ -67,18 +67,18 @@ struct RunArgs {
     #[arg(long, short = 'c')]
     config: Option<PathBuf>,
     /// Node mode: the control plane's `https://` URL. The config and
-    /// secrets come from its lease; nothing but the node certificate, key,
-    /// flow counter, interception CA and quarantine marker is kept in
+    /// secrets come from its lease; nothing but the node token, flow
+    /// counter, interception CA and quarantine marker is kept in
     /// `--state-dir`.
     #[arg(long, requires = "state_dir", conflicts_with = "config")]
     control_plane: Option<String>,
-    /// Enrolment token, read once on a start with no node certificate in
-    /// the state dir.
+    /// Enrolment token, read once on a start with no node token in the
+    /// state dir.
     #[arg(long, requires = "control_plane")]
     enrol_token_file: Option<PathBuf>,
     /// Where roxy keeps what must survive a restart: the quarantine marker,
-    /// and in node mode the certificate, key, flow counter and interception
-    /// CA. Required by a config that can quarantine.
+    /// and in node mode the node token, flow counter and interception CA.
+    /// Required by a config that can quarantine.
     #[arg(long)]
     state_dir: Option<PathBuf>,
     /// PEM CA bundle to verify the control plane with (default: system

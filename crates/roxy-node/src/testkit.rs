@@ -1,5 +1,6 @@
-//! Test scaffolding: a CA that issues node certificates from CSRs, and a
-//! scripted control plane over mTLS that records what it was sent.
+//! Test scaffolding: a scripted control plane over TLS that issues node
+//! tokens, authenticates every later request by them, and records what it
+//! was sent.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -7,100 +8,38 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt as _, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use rcgen::{
-    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType, IsCa, Issuer,
-    KeyPair, KeyUsagePurpose, SanType,
-};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rcgen::{CertificateParams, KeyPair, SanType};
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-
-use crate::identity::NODE_ID_URI_PREFIX;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A CA for the control plane's server certificate and the node
-/// certificates it issues.
-pub struct TestCa {
-    pub pem: String,
-    der: CertificateDer<'static>,
-    issuer: Issuer<'static, KeyPair>,
-}
-
-impl Default for TestCa {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TestCa {
-    pub fn new() -> Self {
-        let mut params = CertificateParams::default();
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        params.key_usages = vec![
-            KeyUsagePurpose::KeyCertSign,
-            KeyUsagePurpose::DigitalSignature,
-        ];
-        params
-            .distinguished_name
-            .push(DnType::CommonName, "roxy test control plane CA");
-        let key = KeyPair::generate().unwrap();
-        let cert = params.self_signed(&key).unwrap();
-        Self {
-            pem: cert.pem(),
-            der: cert.der().clone(),
-            issuer: Issuer::new(params, key),
-        }
-    }
-
-    /// Signs `csr_pem` as a node certificate for `node_id`, valid for
-    /// `lifetime_secs`.
-    pub fn issue(&self, csr_pem: &str, node_id: &str, lifetime_secs: i64) -> String {
-        let mut csr = CertificateSigningRequestParams::from_pem(csr_pem).unwrap();
-        let uri = format!("{NODE_ID_URI_PREFIX}{node_id}");
-        csr.params.subject_alt_names = vec![SanType::URI(uri.as_str().try_into().unwrap())];
-        csr.params.not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(1);
-        csr.params.not_after =
-            time::OffsetDateTime::now_utc() + time::Duration::seconds(lifetime_secs);
-        csr.signed_by(&self.issuer).unwrap().pem()
-    }
-
-    pub fn issue_without_node_id(&self, csr_pem: &str) -> String {
-        let csr = CertificateSigningRequestParams::from_pem(csr_pem).unwrap();
-        csr.signed_by(&self.issuer).unwrap().pem()
-    }
-
-    /// A server config for `127.0.0.1` that asks for, but does not
-    /// require, a client certificate chaining to this CA.
-    fn server_config(&self) -> Arc<rustls::ServerConfig> {
-        let mut params = CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
-        params
-            .subject_alt_names
-            .push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
-        let key = KeyPair::generate().unwrap();
-        let cert = params.signed_by(&key, &self.issuer).unwrap();
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(self.der.clone()).unwrap();
-        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-            .allow_unauthenticated()
-            .build()
-            .unwrap();
-        let config = rustls::ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(
-                vec![cert.der().clone()],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-            )
-            .unwrap();
-        Arc::new(config)
-    }
+/// A self-signed server certificate for `127.0.0.1`, which is also what
+/// the node pins as the control plane's root.
+fn server_config() -> (String, Arc<rustls::ServerConfig>) {
+    let mut params = CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+    params
+        .subject_alt_names
+        .push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
+    let key = KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key).unwrap();
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        )
+        .unwrap();
+    (cert.pem(), Arc::new(config))
 }
 
 /// One scripted answer.
@@ -112,14 +51,12 @@ pub enum Reply {
         headers: Vec<(String, String)>,
         body: Vec<u8>,
     },
-    /// Sign the CSR in the request as `node_id`, valid `lifetime_secs`.
+    /// Issue a fresh node token for `node_id`, valid `lifetime_secs`.
     Issue {
         node_id: String,
         lifetime_secs: i64,
         renew_after_seconds: u64,
     },
-    /// Sign the CSR for `san` but claim `node_id` in the body.
-    IssueMismatched { node_id: String, san: String },
     /// Close the connection without answering.
     Hangup,
     /// Answer after `delay` (the client times out first when it is long).
@@ -167,7 +104,7 @@ pub struct Recorded {
     pub path: String,
     pub headers: HeaderMap,
     pub body: Vec<u8>,
-    /// The node id from the client certificate, when one was presented.
+    /// The node id of the unexpired node token presented, when one was.
     pub client: Option<String>,
 }
 
@@ -196,6 +133,13 @@ impl Recorded {
     }
 }
 
+/// A node token the mock issued.
+#[derive(Debug, Clone)]
+struct Issued {
+    node_id: String,
+    not_after: DateTime<Utc>,
+}
+
 #[derive(Default)]
 struct Script {
     /// Queued replies by path (`/roxy/v1/lease`, ...).
@@ -203,11 +147,14 @@ struct Script {
     /// The reply for a path whose queue is empty.
     fallback: HashMap<String, Reply>,
     received: Vec<Recorded>,
+    /// Every token issued, in order, each accepted until its own expiry.
+    issued: Vec<(String, Issued)>,
 }
 
 /// The scripted control plane.
 pub struct MockServer {
-    pub ca: Arc<TestCa>,
+    /// The PEM the node verifies the server with.
+    pub trust_pem: String,
     pub addr: SocketAddr,
     script: Arc<Mutex<Script>>,
     received: Arc<tokio::sync::Notify>,
@@ -216,14 +163,14 @@ pub struct MockServer {
 
 impl MockServer {
     pub async fn start() -> Self {
-        let ca = Arc::new(TestCa::new());
-        let acceptor = TlsAcceptor::from(ca.server_config());
+        let (trust_pem, config) = server_config();
+        let acceptor = TlsAcceptor::from(config);
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp.local_addr().unwrap();
         let script: Arc<Mutex<Script>> = Arc::default();
         let received = Arc::new(tokio::sync::Notify::new());
         let (stop, mut stopped) = tokio::sync::watch::channel(false);
-        let (s, n, issuer) = (script.clone(), received.clone(), ca.clone());
+        let (s, n) = (script.clone(), received.clone());
         tokio::spawn(async move {
             loop {
                 let accepted = tokio::select! {
@@ -231,31 +178,14 @@ impl MockServer {
                     _ = stopped.changed() => return,
                 };
                 let Ok((stream, _)) = accepted else { continue };
-                let (acceptor, s, n, issuer) =
-                    (acceptor.clone(), s.clone(), n.clone(), issuer.clone());
+                let (acceptor, s, n) = (acceptor.clone(), s.clone(), n.clone());
                 tokio::spawn(async move {
                     let Ok(tls) = acceptor.accept(stream).await else {
                         return;
                     };
-                    let client = tls
-                        .get_ref()
-                        .1
-                        .peer_certificates()
-                        .and_then(|certs| certs.first())
-                        .and_then(|c| {
-                            let (_, x509) = x509_parser::parse_x509_certificate(c).ok()?;
-                            let san = x509.subject_alternative_name().ok()??;
-                            san.value.general_names.iter().find_map(|g| {
-                                let x509_parser::extensions::GeneralName::URI(u) = g else {
-                                    return None;
-                                };
-                                u.strip_prefix(NODE_ID_URI_PREFIX).map(str::to_owned)
-                            })
-                        });
                     let service = service_fn(move |req: Request<Incoming>| {
-                        let (s, n, client, issuer) =
-                            (s.clone(), n.clone(), client.clone(), issuer.clone());
-                        async move { handle(req, client, &s, &n, &issuer).await }
+                        let (s, n) = (s.clone(), n.clone());
+                        async move { handle(req, &s, &n).await }
                     });
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(TokioIo::new(tls), service)
@@ -264,7 +194,7 @@ impl MockServer {
             }
         });
         Self {
-            ca,
+            trust_pem,
             addr,
             script,
             received,
@@ -301,6 +231,16 @@ impl MockServer {
             .collect()
     }
 
+    /// The tokens issued to `node_id`, oldest first.
+    pub fn tokens_for(&self, node_id: &str) -> Vec<String> {
+        lock(&self.script)
+            .issued
+            .iter()
+            .filter(|(_, i)| i.node_id == node_id)
+            .map(|(t, _)| t.clone())
+            .collect()
+    }
+
     /// Waits until `path` has been requested at least `n` times.
     pub async fn wait_for(&self, path: &str, n: usize) -> Vec<Recorded> {
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -332,14 +272,41 @@ impl Drop for MockServer {
     }
 }
 
+/// The node id named by the request's bearer token, when it is one the
+/// mock issued and it has not expired.
+fn authenticate(script: &Script, headers: &HeaderMap) -> Option<String> {
+    let bearer = headers
+        .get(http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")?;
+    script
+        .issued
+        .iter()
+        .find(|(t, i)| t == bearer && i.not_after > Utc::now())
+        .map(|(_, i)| i.node_id.clone())
+}
+
+fn random_token() -> String {
+    let mut bytes = [0u8; 24];
+    let _ = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes);
+    let mut out = String::with_capacity(4 + 48);
+    out.push_str("nt1-");
+    for b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// `Err` makes hyper drop the connection, which is how `Reply::Hangup`
-/// gives the client a connection error.
+/// gives the client a connection error. Every operation but enrolment is
+/// answered `401` for a token the mock did not issue, whatever the script
+/// says, so a test cannot pass by scripting around authentication.
 async fn handle(
     req: Request<Incoming>,
-    client: Option<String>,
     script: &Mutex<Script>,
     notify: &tokio::sync::Notify,
-    issuer: &TestCa,
 ) -> Result<Response<Full<Bytes>>, Hangup> {
     let (parts, body) = req.into_parts();
     let body = body
@@ -348,26 +315,32 @@ async fn handle(
         .map(|b| b.to_bytes().to_vec())
         .unwrap_or_default();
     let path = parts.uri.path().to_owned();
-    let recorded = Recorded {
-        method: parts.method,
-        path: path.clone(),
-        headers: parts.headers,
-        body,
-        client,
-    };
     let reply = {
         let mut s = lock(script);
-        let reply = s
-            .queued
-            .get_mut(&path)
-            .and_then(VecDeque::pop_front)
-            .or_else(|| s.fallback.get(&path).cloned())
-            .unwrap_or(Reply::status(404));
-        s.received.push(recorded.clone());
-        reply
+        let client = authenticate(&s, &parts.headers);
+        s.received.push(Recorded {
+            method: parts.method,
+            path: path.clone(),
+            headers: parts.headers,
+            body,
+            client: client.clone(),
+        });
+        if client.is_none() && path != "/roxy/v1/enrol" {
+            Reply::Status {
+                status: 401,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: br#"{"error":"unrecognised","message":"node token not recognised"}"#.to_vec(),
+            }
+        } else {
+            s.queued
+                .get_mut(&path)
+                .and_then(VecDeque::pop_front)
+                .or_else(|| s.fallback.get(&path).cloned())
+                .unwrap_or(Reply::status(404))
+        }
     };
     notify.notify_waiters();
-    render(reply, &recorded, issuer).await
+    render(reply, script).await
 }
 
 #[derive(Debug)]
@@ -381,11 +354,7 @@ impl std::fmt::Display for Hangup {
 
 impl std::error::Error for Hangup {}
 
-async fn render(
-    reply: Reply,
-    req: &Recorded,
-    issuer: &TestCa,
-) -> Result<Response<Full<Bytes>>, Hangup> {
+async fn render(reply: Reply, script: &Mutex<Script>) -> Result<Response<Full<Bytes>>, Hangup> {
     Ok(match reply {
         Reply::Status {
             status,
@@ -407,30 +376,20 @@ async fn render(
             lifetime_secs,
             renew_after_seconds,
         } => {
-            let body: crate::protocol::CertificateRequest = serde_json::from_slice(&req.body)
-                .unwrap_or_else(|e| panic!("bad certificate request body: {e}"));
-            let chain = issuer.issue(&body.csr, &node_id, lifetime_secs);
-            let res = crate::protocol::CertificateResponse {
+            let token = random_token();
+            let not_after = Utc::now() + chrono::Duration::seconds(lifetime_secs);
+            lock(script).issued.push((
+                token.clone(),
+                Issued {
+                    node_id: node_id.clone(),
+                    not_after,
+                },
+            ));
+            let res = crate::protocol::EnrolResponse {
                 node_id,
-                certificate_chain: chain,
-                not_after: chrono::Utc::now() + chrono::Duration::seconds(lifetime_secs),
+                token,
+                not_after,
                 renew_after_seconds,
-            };
-            let mut out = Response::new(Full::new(Bytes::from(serde_json::to_vec(&res).unwrap())));
-            out.headers_mut().insert(
-                http::header::CONTENT_TYPE,
-                http::HeaderValue::from_static("application/json"),
-            );
-            out
-        }
-        Reply::IssueMismatched { node_id, san } => {
-            let body: crate::protocol::CertificateRequest = serde_json::from_slice(&req.body)
-                .unwrap_or_else(|e| panic!("bad certificate request body: {e}"));
-            let res = crate::protocol::CertificateResponse {
-                node_id,
-                certificate_chain: issuer.issue(&body.csr, &san, 3600),
-                not_after: chrono::Utc::now() + chrono::Duration::seconds(3600),
-                renew_after_seconds: 1800,
             };
             let mut out = Response::new(Full::new(Bytes::from(serde_json::to_vec(&res).unwrap())));
             out.headers_mut().insert(
@@ -442,7 +401,7 @@ async fn render(
         Reply::Hangup => return Err(Hangup),
         Reply::Delayed(d, inner) => {
             tokio::time::sleep(d).await;
-            return Box::pin(render(*inner, req, issuer)).await;
+            return Box::pin(render(*inner, script)).await;
         }
     })
 }

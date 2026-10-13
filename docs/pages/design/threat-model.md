@@ -52,6 +52,24 @@ cannot stop traffic that never reaches it.
 roxy speaks HTTP/1.1, HTTP/2 and WebSockets to clients. Raw TCP does not
 pass.
 
+## Node identity
+
+In [node mode](/guides/node-mode) the node is a bearer token the control
+plane issued at enrolment, kept in the state dir (mode `0600`) and
+presented inside the server's TLS on every request. What it protects
+against is a host that was never enrolled, or one the operator has cut
+off: the control plane accepts leases, flow batches and renewals only
+from tokens it issued, each token expires and is renewed, and revocation
+(`410`) is per node and immediate. The node never re-enrols on its own,
+so a lost token is a stopped node, not a new one.
+
+It does not protect against the host roxy runs on: whatever can read the
+state dir holds the node's identity, as it would hold any credential kept
+there, and the host is already trusted. Nor does it bind the token to a
+connection; a token read from the node can be replayed from elsewhere
+until it expires or the node is revoked, which is why the control plane
+should store tokens hashed and keep their lifetime short.
+
 ## Fail closed
 
 Anything roxy cannot parse, verify or classify is dropped. An empty rule

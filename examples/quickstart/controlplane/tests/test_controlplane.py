@@ -1,7 +1,8 @@
 """The control plane's answers match the node protocol's schemas and the
-decisions the quickstart relies on: enrolment issues a certificate naming
-the node, the lease carries roxy.yaml with its secrets moved into the map,
-a revoked node gets 410, and flow batches are deduplicated."""
+decisions the quickstart relies on: enrolment issues a node token, the
+token authenticates every later request, the lease carries roxy.yaml with
+its secrets moved into the map, a revoked node gets 410, and flow batches
+are deduplicated."""
 
 import http.client
 import json
@@ -13,10 +14,6 @@ from pathlib import Path
 import jsonschema
 import pytest
 import yaml
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from controlplane import ApiError, ControlPlane, Server  # noqa: E402
@@ -34,25 +31,13 @@ secrets:
 rules: []
 """
 
+ENROL_BODY = {"roxy_version": "0.0.0-test", "protocol_version": 1}
+
 
 def valid(schema, body):
     """Asserts `body` validates against `#/components/schemas/<schema>`."""
     root = {"$ref": f"#/components/schemas/{schema}", "components": OPENAPI["components"]}
     jsonschema.Draft202012Validator(root).validate(body)
-
-
-def csr_pem(key=None):
-    key = key or ec.generate_private_key(ec.SECP256R1())
-    csr = (
-        x509.CertificateSigningRequestBuilder()
-        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "roxy")]))
-        .sign(key, hashes.SHA256())
-    )
-    return csr.public_bytes(serialization.Encoding.PEM).decode(), key
-
-
-def enrol_body(csr, protocol_version=1):
-    return {"csr": csr, "roxy_version": "0.0.0-test", "protocol_version": protocol_version}
 
 
 @pytest.fixture
@@ -65,7 +50,7 @@ def cp(tmp_path):
         "ENROL_TOKEN_FILE": str(token_file),
         "MODEL_API_KEY": "k1",
         "LEASE_VALID_SECONDS": "20",
-        "NODE_CERT_SECONDS": "600",
+        "NODE_TOKEN_SECONDS": "600",
     }
     return ControlPlane(tmp_path / "data", config, env)
 
@@ -77,34 +62,47 @@ def expect(status, code, fn):
     valid("Error", e.value.body)
 
 
-def test_enrol_issues_a_certificate_naming_the_node(cp):
-    csr, key = csr_pem()
-    res = cp.enrol("tok", enrol_body(csr))
+def test_enrol_issues_a_token_that_names_the_node(cp):
+    valid("EnrolRequest", ENROL_BODY)
+    res = cp.enrol("tok", ENROL_BODY)
     valid("EnrolResponse", res)
-    cert = x509.load_pem_x509_certificate(res["certificate_chain"].encode())
-    san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-    assert san.get_values_for_type(x509.UniformResourceIdentifier) == [f"urn:roxy:node:{res['node_id']}"]
-    assert cert.public_key() == key.public_key()
+    assert cp.tokens.node_id(res["token"]) == res["node_id"]
     assert res["renew_after_seconds"] < 600
+    assert cp.tokens.node_id("nt1_" + "0" * 64) is None
+    assert cp.tokens.node_id(None) is None
 
 
-def test_enrol_refuses_a_wrong_token_a_forged_csr_and_an_unknown_protocol(cp):
-    csr, _ = csr_pem()
-    expect(401, "invalid_token", lambda: cp.enrol("nope", enrol_body(csr)))
-    expect(401, "invalid_token", lambda: cp.enrol(None, enrol_body(csr)))
-    # A CSR whose key was swapped after signing no longer proves possession.
-    forged = csr.replace("REQUEST-----\n", "REQUEST-----\nA", 1)
-    expect(400, "bad_csr", lambda: cp.enrol("tok", enrol_body(forged)))
-    expect(426, "unsupported", lambda: cp.enrol("tok", enrol_body(csr, protocol_version=2)))
+def test_enrol_refuses_a_wrong_token_and_an_unknown_protocol(cp):
+    expect(401, "invalid_token", lambda: cp.enrol("nope", ENROL_BODY))
+    expect(401, "invalid_token", lambda: cp.enrol(None, ENROL_BODY))
+    expect(426, "unsupported", lambda: cp.enrol("tok", {**ENROL_BODY, "protocol_version": 2}))
+    expect(400, "bad_request", lambda: cp.enrol("tok", {"protocol_version": 1}))
 
 
-def test_renew_keeps_the_node_id(cp):
-    csr, _ = csr_pem()
-    first = cp.enrol("tok", enrol_body(csr))
-    again = cp.renew(first["node_id"], enrol_body(csr_pem()[0]))
+def test_renew_keeps_the_node_id_and_the_old_token_until_it_expires(cp):
+    first = cp.enrol("tok", ENROL_BODY)
+    again = cp.renew(first["node_id"], ENROL_BODY)
     valid("EnrolResponse", again)
     assert again["node_id"] == first["node_id"]
-    assert again["certificate_chain"] != first["certificate_chain"]
+    assert again["token"] != first["token"]
+    assert cp.tokens.node_id(first["token"]) == first["node_id"]
+    assert cp.tokens.node_id(again["token"]) == first["node_id"]
+
+
+def test_tokens_are_kept_hashed_and_survive_a_restart(cp, tmp_path):
+    res = cp.enrol("tok", ENROL_BODY)
+    stored = (cp.data_dir / "tokens.json").read_text()
+    assert res["token"] not in stored
+    assert res["node_id"] in stored
+    assert (cp.data_dir / "tokens.json").stat().st_mode & 0o777 == 0o600
+    restarted = ControlPlane(cp.data_dir, cp.config_path, cp.environ)
+    assert restarted.tokens.node_id(res["token"]) == res["node_id"]
+
+
+def test_an_expired_token_is_not_recognised(cp):
+    short = ControlPlane(cp.data_dir, cp.config_path, {**cp.environ, "NODE_TOKEN_SECONDS": "-1"})
+    res = short.enrol("tok", ENROL_BODY)
+    assert short.tokens.node_id(res["token"]) is None
 
 
 STATE = {"lease_id": None, "roxy_version": "0.0.0", "protocol_version": 1,
@@ -141,7 +139,7 @@ def test_a_revoked_node_gets_410_everywhere(cp):
     cp.lease("node-1", state)
     (cp.data_dir / "revoked").write_text("node-0\nnode-1\n")
     expect(410, "revoked", lambda: cp.lease("node-1", state))
-    expect(410, "revoked", lambda: cp.renew("node-1", enrol_body(csr_pem()[0])))
+    expect(410, "revoked", lambda: cp.renew("node-1", ENROL_BODY))
     expect(410, "revoked", lambda: cp.flows("node-1", batch("node-1", 1, 1)))
     cp.lease("node-2", state)
 
@@ -184,52 +182,59 @@ def test_flows_are_deduplicated_and_acked_through_the_highest_contiguous_seq(cp,
     expect(400, "bad_request", lambda: cp.flows("node-1", gap))
 
 
-def test_private_keys_are_readable_by_the_owner_alone(cp):
-    """The CA key is created here; the server chain is rewritten over a file
-    something else left world-readable."""
+def test_the_server_key_is_readable_by_the_owner_alone_and_kept_across_restarts(cp):
+    """The key is rewritten over a file something else left world-readable;
+    a second server in the same data dir presents the same certificate."""
     chain = cp.data_dir / "server.pem"
     chain.write_bytes(b"stale")
     chain.chmod(0o644)
-    Server(("127.0.0.1", 0), cp, ["localhost"]).server_close()
-    for name in ("ca.key", "server.pem"):
-        assert (cp.data_dir / name).stat().st_mode & 0o777 == 0o600, name
-    assert (cp.data_dir / "ca.pem").stat().st_mode & 0o444 == 0o444, "the certificate stays readable"
+    chain.unlink()
+    first = Server(("127.0.0.1", 0), cp, ["localhost"])
+    first.server_close()
+    assert chain.stat().st_mode & 0o777 == 0o600
+    second = Server(("127.0.0.1", 0), cp, ["localhost"])
+    second.server_close()
+    assert second.certificate_pem == first.certificate_pem
 
 
-def test_over_tls_the_client_certificate_names_the_node(cp, tmp_path):
+def test_over_tls_the_bearer_token_names_the_node(cp):
     server = Server(("127.0.0.1", 0), cp, ["localhost"])
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
-    trust = ssl.create_default_context(cadata=cp.ca.pem.decode())
+    trust = ssl.create_default_context(cadata=server.certificate_pem.decode())
 
-    def post(path, body, ctx):
-        conn = http.client.HTTPSConnection("localhost", port, context=ctx, timeout=5)
-        conn.request("POST", path, json.dumps(body), {"content-type": "application/json"})
+    def post(path, body, token=None):
+        headers = {"content-type": "application/json"}
+        if token is not None:
+            headers["authorization"] = f"Bearer {token}"
+        conn = http.client.HTTPSConnection("localhost", port, context=trust, timeout=5)
+        conn.request("POST", path, json.dumps(body), headers)
         res = conn.getresponse()
         return res.status, json.loads(res.read())
 
     state = STATE
-    status, err = post("/roxy/v1/lease", state, trust)
+    status, err = post("/roxy/v1/lease", state)
     assert (status, err["error"]) == (401, "unrecognised")
     valid("Error", err)
+    status, err = post("/roxy/v1/lease", state, token="nt1_" + "0" * 64)
+    assert (status, err["error"]) == (401, "unrecognised")
 
-    csr, key = csr_pem()
-    status, enrolled = post("/roxy/v1/enrol", enrol_body(csr), trust)
-    assert status == 401, "no bearer token"
-    conn = http.client.HTTPSConnection("localhost", port, context=trust)
-    conn.request("POST", "/roxy/v1/enrol", json.dumps(enrol_body(csr)), {"authorization": "Bearer tok"})
-    res = conn.getresponse()
-    assert res.status == 200
-    enrolled = json.loads(res.read())
+    status, err = post("/roxy/v1/enrol", ENROL_BODY)
+    assert (status, err["error"]) == (401, "invalid_token"), "no bearer token"
+    status, enrolled = post("/roxy/v1/enrol", ENROL_BODY, token="tok")
+    assert status == 200
+    valid("EnrolResponse", enrolled)
 
-    (tmp_path / "node.pem").write_text(enrolled["certificate_chain"] + key.private_bytes(
-        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
-    ).decode())
-    with_cert = ssl.create_default_context(cadata=cp.ca.pem.decode())
-    with_cert.load_cert_chain(tmp_path / "node.pem")
-    status, lease = post("/roxy/v1/lease", state, with_cert)
+    status, lease = post("/roxy/v1/lease", state, token=enrolled["token"])
     assert status == 200
     valid("Lease", lease)
-    status, ack = post("/roxy/v1/flows", batch(enrolled["node_id"], 1, 1, lease["lease_id"]), with_cert)
+    status, ack = post("/roxy/v1/flows", batch(enrolled["node_id"], 1, 1, lease["lease_id"]), token=enrolled["token"])
     assert (status, ack) == (200, {"acked_through": 1})
+    status, renewed = post("/roxy/v1/renew", ENROL_BODY, token=enrolled["token"])
+    assert status == 200
+    assert renewed["node_id"] == enrolled["node_id"]
+    status, _ = post("/roxy/v1/lease", state, token=renewed["token"])
+    assert status == 200
+    status, _ = post("/roxy/v1/lease", state, token=enrolled["token"])
+    assert status == 200, "the old token serves until its own expiry"
     server.shutdown()

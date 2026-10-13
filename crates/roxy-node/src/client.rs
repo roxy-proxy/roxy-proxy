@@ -1,21 +1,21 @@
-//! The HTTP client for `/roxy/v1/`: a bearer token for enrolment, the node
-//! certificate (mTLS) for everything after. Each call classifies the
-//! response into what the node does about it; the caller never sees a raw
-//! status.
+//! The HTTP client for `/roxy/v1/`: the bootstrap token for enrolment, the
+//! node token for everything after, each as `Authorization: Bearer` inside
+//! the server's TLS. Each call classifies the response into what the node
+//! does about it; the caller never sees a raw status.
 
 use std::io::Write as _;
 use std::time::Duration;
 
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE};
-use reqwest::{Identity, StatusCode, Url};
+use reqwest::{StatusCode, Url};
 
 use crate::protocol::{
-    CertificateRequest, CertificateResponse, ErrorBody, FlowAck, Lease, NodeState, PREFIX,
-    PROTOCOL_VERSION,
+    EnrolRequest, EnrolResponse, ErrorBody, FlowAck, Lease, NodeState, PREFIX, PROTOCOL_VERSION,
 };
+use crate::token::NodeToken;
 
-/// Per-request timeout. Lease and certificate calls are small; a flow
-/// batch is at most `batch_max_bytes`.
+/// Per-request timeout. Lease and token calls are small; a flow batch is
+/// at most `batch_max_bytes`.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Largest response body the client reads before giving up on it. The
@@ -29,8 +29,6 @@ pub enum ClientError {
     Url(String),
     #[error("control plane CA bundle: {0}")]
     Ca(String),
-    #[error("node certificate or key: {0}")]
-    Identity(String),
     #[error("building the HTTP client: {0}")]
     Build(String),
 }
@@ -58,7 +56,7 @@ pub enum LeaseFetch {
     /// 426: the server will not serve this protocol or roxy version;
     /// `missing` names what it wants.
     Unsupported(ErrorBody),
-    /// 401: the certificate is not recognised.
+    /// 401: the node token is not recognised.
     Unauthorized,
     /// 400 or another 4xx: the server refused the request itself. Retrying
     /// cannot help; handled as a 401 is, logged distinctly.
@@ -84,7 +82,7 @@ pub enum ShipOutcome {
 
 /// How an enrolment or renewal failed.
 #[derive(Debug, thiserror::Error)]
-pub enum CertificateError {
+pub enum EnrolError {
     /// 410: the node is revoked. Definite and terminal.
     #[error("revoked")]
     Revoked,
@@ -92,8 +90,7 @@ pub enum CertificateError {
     /// `missing` names what it wants.
     #[error("unsupported: missing {}", .0.missing.join(","))]
     Unsupported(ErrorBody),
-    /// Any other 4xx: the token was not accepted, or the certificate is
-    /// not recognised. Retrying cannot help.
+    /// Any other 4xx: the token was not accepted. Retrying cannot help.
     #[error("rejected: {0}")]
     Rejected(String),
     #[error("{0}")]
@@ -114,12 +111,26 @@ pub struct Trust {
     pub ca_pem: Option<String>,
 }
 
-/// A client for one control plane.
-#[derive(Debug, Clone)]
+/// A client for one control plane. Clones share the connection pool, so
+/// swapping the token on renewal does not reconnect.
+#[derive(Clone)]
 pub struct ControlPlane {
     base: Url,
     http: reqwest::Client,
     info: NodeInfo,
+    /// The node token; `None` before enrolment.
+    token: Option<String>,
+}
+
+/// Never prints the token.
+impl std::fmt::Debug for ControlPlane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlane")
+            .field("base", &self.base.as_str())
+            .field("info", &self.info)
+            .field("has_token", &self.token.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 fn builder(trust: &Trust, info: &NodeInfo) -> Result<reqwest::ClientBuilder, ClientError> {
@@ -154,38 +165,25 @@ fn parse_base(url: &str) -> Result<Url, ClientError> {
 }
 
 impl ControlPlane {
-    /// A client with no identity, for enrolment.
-    pub fn unauthenticated(url: &str, trust: &Trust, info: NodeInfo) -> Result<Self, ClientError> {
+    /// A client with no node token, for enrolment.
+    pub fn new(url: &str, trust: &Trust, info: NodeInfo) -> Result<Self, ClientError> {
         Ok(Self {
             base: parse_base(url)?,
             http: builder(trust, &info)?
                 .build()
                 .map_err(|e| ClientError::Build(e.to_string()))?,
             info,
+            token: None,
         })
     }
 
-    /// A client presenting the node certificate.
-    pub fn with_identity(
-        url: &str,
-        trust: &Trust,
-        info: NodeInfo,
-        cert_pem: &str,
-        key_pem: &str,
-    ) -> Result<Self, ClientError> {
-        let mut pem = cert_pem.as_bytes().to_vec();
-        pem.push(b'\n');
-        pem.extend_from_slice(key_pem.as_bytes());
-        let identity =
-            Identity::from_pem(&pem).map_err(|e| ClientError::Identity(e.to_string()))?;
-        Ok(Self {
-            base: parse_base(url)?,
-            http: builder(trust, &info)?
-                .identity(identity)
-                .build()
-                .map_err(|e| ClientError::Build(e.to_string()))?,
-            info,
-        })
+    /// The same client presenting `token` as the node token.
+    #[must_use]
+    pub fn with_token(&self, token: &str) -> Self {
+        Self {
+            token: Some(token.to_owned()),
+            ..self.clone()
+        }
     }
 
     pub fn info(&self) -> &NodeInfo {
@@ -199,9 +197,17 @@ impl ControlPlane {
         url
     }
 
-    fn certificate_request(&self, csr_pem: String) -> Vec<u8> {
-        serde_json::to_vec(&CertificateRequest {
-            csr: csr_pem,
+    /// A request under the node token.
+    fn authenticated(&self, name: &str) -> reqwest::RequestBuilder {
+        let req = self.http.post(self.endpoint(name));
+        match &self.token {
+            Some(token) => req.bearer_auth(token),
+            None => req,
+        }
+    }
+
+    fn enrol_request(&self) -> Vec<u8> {
+        serde_json::to_vec(&EnrolRequest {
             roxy_version: self.info.roxy_version.clone(),
             protocol_version: PROTOCOL_VERSION,
         })
@@ -209,59 +215,51 @@ impl ControlPlane {
     }
 
     /// `POST /enrol` with the bootstrap token.
-    pub async fn enrol(
-        &self,
-        token: &str,
-        csr_pem: String,
-    ) -> Result<CertificateResponse, CertificateError> {
+    pub async fn enrol(&self, token: &str) -> Result<EnrolResponse, EnrolError> {
         let req = self
             .http
             .post(self.endpoint("enrol"))
             .bearer_auth(token.trim())
             .header(CONTENT_TYPE, "application/json")
-            .body(self.certificate_request(csr_pem));
-        self.certificate_call(req).await
+            .body(self.enrol_request());
+        Self::enrol_call(req).await
     }
 
-    /// `POST /renew` under the current certificate.
-    pub async fn renew(&self, csr_pem: String) -> Result<CertificateResponse, CertificateError> {
+    /// `POST /renew` under the current node token.
+    pub async fn renew(&self) -> Result<EnrolResponse, EnrolError> {
         let req = self
-            .http
-            .post(self.endpoint("renew"))
+            .authenticated("renew")
             .header(CONTENT_TYPE, "application/json")
-            .body(self.certificate_request(csr_pem));
-        self.certificate_call(req).await
+            .body(self.enrol_request());
+        Self::enrol_call(req).await
     }
 
-    async fn certificate_call(
-        &self,
-        req: reqwest::RequestBuilder,
-    ) -> Result<CertificateResponse, CertificateError> {
-        let (status, body) = send(req).await.map_err(CertificateError::Failed)?;
+    async fn enrol_call(req: reqwest::RequestBuilder) -> Result<EnrolResponse, EnrolError> {
+        let (status, body) = send(req).await.map_err(EnrolError::Failed)?;
         if status.is_success() {
-            return serde_json::from_slice(&body).map_err(|e| {
-                CertificateError::Failed(Transient(format!("certificate response: {e}")))
-            });
+            let res: EnrolResponse = serde_json::from_slice(&body)
+                .map_err(|e| EnrolError::Failed(Transient(format!("enrol response: {e}"))))?;
+            // A token the header cannot carry is the server's bug, not a
+            // reason to give up on it.
+            NodeToken::from_response(&res)
+                .map_err(|e| EnrolError::Failed(Transient(format!("enrol response: {e}"))))?;
+            return Ok(res);
         }
         match status {
-            StatusCode::GONE => Err(CertificateError::Revoked),
-            StatusCode::UPGRADE_REQUIRED => Err(CertificateError::Unsupported(error_body(&body))),
+            StatusCode::GONE => Err(EnrolError::Revoked),
+            StatusCode::UPGRADE_REQUIRED => Err(EnrolError::Unsupported(error_body(&body))),
             s if s.is_client_error() => {
                 let text = String::from_utf8_lossy(&body[..body.len().min(200)]);
-                Err(CertificateError::Rejected(format!(
-                    "{status}: {}",
-                    text.trim()
-                )))
+                Err(EnrolError::Rejected(format!("{status}: {}", text.trim())))
             }
-            _ => Err(CertificateError::Failed(Transient::status(status, &body))),
+            _ => Err(EnrolError::Failed(Transient::status(status, &body))),
         }
     }
 
     /// `POST /lease`, reporting `state`.
     pub async fn fetch_lease(&self, state: &NodeState) -> LeaseFetch {
         let req = self
-            .http
-            .post(self.endpoint("lease"))
+            .authenticated("lease")
             .header(CONTENT_TYPE, "application/json")
             .body(serde_json::to_vec(state).unwrap_or_default());
         let (status, body) = match send(req).await {
@@ -292,8 +290,7 @@ impl ControlPlane {
             Err(e) => return ShipOutcome::Failed(Transient(format!("gzip: {e}"))),
         };
         let req = self
-            .http
-            .post(self.endpoint("flows"))
+            .authenticated("flows")
             .header(CONTENT_TYPE, "application/json")
             .header(CONTENT_ENCODING, "gzip")
             .body(body);
@@ -412,45 +409,34 @@ pub(crate) mod tests {
         }
     }
 
-    async fn enrolled(mock: &MockServer) -> (ControlPlane, String) {
+    fn anon(mock: &MockServer) -> ControlPlane {
         let trust = Trust {
-            ca_pem: Some(mock.ca.pem.clone()),
+            ca_pem: Some(mock.trust_pem.clone()),
         };
-        let anon = ControlPlane::unauthenticated(&mock.url(), &trust, info()).unwrap();
-        let key = crate::identity::generate_key().unwrap();
-        let csr = crate::identity::csr_pem(&key).unwrap();
+        ControlPlane::new(&mock.url(), &trust, info()).unwrap()
+    }
+
+    async fn enrolled(mock: &MockServer) -> (ControlPlane, EnrolResponse) {
+        let anon = anon(mock);
         mock.push("/roxy/v1/enrol", Reply::issue("node-1"));
-        let res = anon.enrol("tok", csr).await.unwrap();
+        let res = anon.enrol("tok").await.unwrap();
         assert_eq!(res.node_id, "node-1");
-        let cp = ControlPlane::with_identity(
-            &mock.url(),
-            &trust,
-            info(),
-            &res.certificate_chain,
-            &key.serialize_pem(),
-        )
-        .unwrap();
-        (cp, res.certificate_chain)
+        (anon.with_token(&res.token), res)
     }
 
     #[tokio::test]
-    async fn enrol_sends_the_token_and_the_csr_and_the_cert_authenticates_after() {
+    async fn enrol_sends_the_bootstrap_token_and_the_node_token_authenticates_after() {
         let mock = MockServer::start().await;
-        let (cp, _) = enrolled(&mock).await;
+        let (cp, res) = enrolled(&mock).await;
         let enrol = &mock.requests_to("/roxy/v1/enrol")[0];
         assert_eq!(enrol.header("authorization"), Some("Bearer tok"));
-        assert_eq!(enrol.client, None, "no client certificate yet");
+        assert_eq!(enrol.client, None, "the bootstrap token names no node");
         let body = enrol.json();
-        assert!(
-            body["csr"]
-                .as_str()
-                .unwrap()
-                .contains("CERTIFICATE REQUEST")
-        );
         assert_eq!(body["protocol_version"], 1);
         assert_eq!(body["roxy_version"], "0.1.0-test");
-        assert!(body.get("features").is_none());
+        assert!(body.get("csr").is_none());
         assert_eq!(enrol.header("user-agent"), Some("roxy/0.1.0-test"));
+        assert_eq!(mock.tokens_for("node-1"), std::slice::from_ref(&res.token));
 
         mock.push("/roxy/v1/lease", Reply::json(200, &lease("L2")));
         assert!(matches!(
@@ -459,7 +445,11 @@ pub(crate) mod tests {
         ));
         let fetch = &mock.requests_to("/roxy/v1/lease")[0];
         assert_eq!(fetch.method, http::Method::POST);
-        assert_eq!(fetch.client.as_deref(), Some("node-1"), "mTLS identity");
+        assert_eq!(
+            fetch.header("authorization"),
+            Some(format!("Bearer {}", res.token).as_str())
+        );
+        assert_eq!(fetch.client.as_deref(), Some("node-1"));
         let reported = fetch.json();
         assert_eq!(reported["lease_id"], "L1");
         assert_eq!(reported["protocol_version"], 1);
@@ -469,32 +459,83 @@ pub(crate) mod tests {
         assert_eq!(reported["uptime_seconds"], 42);
         assert!(reported.get("features").is_none());
         assert!(reported.get("config_hash").is_none());
+
+        let text = format!("{cp:?}");
+        assert!(!text.contains(&res.token), "{text}");
+        assert!(text.contains("has_token: true"));
+    }
+
+    /// The mock answers 401 itself to a token it never issued, so a client
+    /// test cannot pass by scripting around authentication.
+    #[tokio::test]
+    async fn a_token_the_server_did_not_issue_is_unauthorized() {
+        let mock = MockServer::start().await;
+        let (cp, _) = enrolled(&mock).await;
+        mock.fallback("/roxy/v1/lease", Reply::json(200, &lease("L2")));
+        let forged = cp.with_token("not-issued");
+        assert!(matches!(
+            forged.fetch_lease(&state()).await,
+            LeaseFetch::Unauthorized
+        ));
+        assert!(matches!(
+            anon(&mock).fetch_lease(&state()).await,
+            LeaseFetch::Unauthorized
+        ));
+        assert!(matches!(
+            cp.fetch_lease(&state()).await,
+            LeaseFetch::Lease(_)
+        ));
+        assert_eq!(mock.requests_to("/roxy/v1/lease")[0].client, None);
     }
 
     #[tokio::test]
     async fn enrol_distinguishes_a_rejected_token_from_an_outage() {
         let mock = MockServer::start().await;
-        let trust = Trust {
-            ca_pem: Some(mock.ca.pem.clone()),
-        };
-        let anon = ControlPlane::unauthenticated(&mock.url(), &trust, info()).unwrap();
-        let key = crate::identity::generate_key().unwrap();
-        let csr = crate::identity::csr_pem(&key).unwrap();
+        let anon = anon(&mock);
         mock.push("/roxy/v1/enrol", Reply::status(401));
         assert!(matches!(
-            anon.enrol("rejected", csr.clone()).await,
-            Err(CertificateError::Rejected(m)) if m.starts_with("401")
+            anon.enrol("rejected").await,
+            Err(EnrolError::Rejected(m)) if m.starts_with("401")
         ));
         mock.push("/roxy/v1/enrol", Reply::status(503));
         assert!(matches!(
-            anon.enrol("tok", csr.clone()).await,
-            Err(CertificateError::Failed(_))
+            anon.enrol("tok").await,
+            Err(EnrolError::Failed(_))
         ));
         mock.push("/roxy/v1/enrol", Reply::Hangup);
         assert!(matches!(
-            anon.enrol("tok", csr).await,
-            Err(CertificateError::Failed(_))
+            anon.enrol("tok").await,
+            Err(EnrolError::Failed(_))
         ));
+    }
+
+    /// A token the header cannot carry, or a body without one, is a
+    /// server fault: retried, never stored.
+    #[tokio::test]
+    async fn a_malformed_enrol_response_is_a_transient_failure() {
+        let mock = MockServer::start().await;
+        let anon = anon(&mock);
+        for body in [
+            r#"{"node_id":"n1","token":"has space","not_after":"2026-11-05T10:12:00Z","renew_after_seconds":1}"#,
+            r#"{"node_id":"n1","token":"","not_after":"2026-11-05T10:12:00Z","renew_after_seconds":1}"#,
+            r#"{"node_id":"n1","certificate_chain":"-----BEGIN CERTIFICATE-----","not_after":"2026-11-05T10:12:00Z","renew_after_seconds":1}"#,
+        ] {
+            mock.push(
+                "/roxy/v1/enrol",
+                Reply::Status {
+                    status: 200,
+                    headers: vec![],
+                    body: body.as_bytes().to_vec(),
+                },
+            );
+            assert!(
+                matches!(
+                    anon.enrol("tok").await,
+                    Err(EnrolError::Failed(e)) if e.to_string().starts_with("enrol response")
+                ),
+                "{body}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -571,32 +612,59 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_unknown_server_certificate_is_a_transient_failure() {
         let mock = MockServer::start().await;
-        let other = crate::testkit::TestCa::new();
+        let other = MockServer::start().await;
         let trust = Trust {
-            ca_pem: Some(other.pem),
+            ca_pem: Some(other.trust_pem.clone()),
         };
-        let anon = ControlPlane::unauthenticated(&mock.url(), &trust, info()).unwrap();
-        let key = crate::identity::generate_key().unwrap();
-        let csr = crate::identity::csr_pem(&key).unwrap();
+        let anon = ControlPlane::new(&mock.url(), &trust, info()).unwrap();
         mock.push("/roxy/v1/enrol", Reply::issue("node-1"));
         assert!(matches!(
-            anon.enrol("tok", csr).await,
-            Err(CertificateError::Failed(_))
+            anon.enrol("tok").await,
+            Err(EnrolError::Failed(_))
         ));
         assert!(mock.requests_to("/roxy/v1/enrol").is_empty());
+    }
+
+    /// Renewal answers a fresh token; the server keeps accepting the old
+    /// one until its own expiry, so the client may switch at its leisure.
+    #[tokio::test]
+    async fn renew_returns_a_fresh_token_and_the_old_one_still_works() {
+        let mock = MockServer::start().await;
+        let (cp, first) = enrolled(&mock).await;
+        mock.push("/roxy/v1/renew", Reply::issue("node-1"));
+        let second = cp.renew().await.unwrap();
+        let renew = &mock.requests_to("/roxy/v1/renew")[0];
+        assert_eq!(renew.client.as_deref(), Some("node-1"));
+        assert_eq!(renew.json()["protocol_version"], 1);
+        assert_eq!(second.node_id, "node-1");
+        assert_ne!(second.token, first.token);
+        assert_eq!(
+            mock.tokens_for("node-1"),
+            [first.token.clone(), second.token.clone()]
+        );
+        mock.fallback("/roxy/v1/lease", Reply::json(200, &lease("L2")));
+        assert!(matches!(
+            cp.with_token(&second.token).fetch_lease(&state()).await,
+            LeaseFetch::Lease(_)
+        ));
+        assert!(matches!(
+            cp.fetch_lease(&state()).await,
+            LeaseFetch::Lease(_)
+        ));
+        assert!(
+            mock.requests_to("/roxy/v1/lease")
+                .iter()
+                .all(|r| r.client.as_deref() == Some("node-1"))
+        );
     }
 
     #[tokio::test]
     async fn renew_distinguishes_the_terminal_statuses() {
         let mock = MockServer::start().await;
         let (cp, _) = enrolled(&mock).await;
-        let csr = crate::identity::csr_pem(&crate::identity::generate_key().unwrap()).unwrap();
         let path = "/roxy/v1/renew";
         mock.push(path, Reply::status(410));
-        assert!(matches!(
-            cp.renew(csr.clone()).await,
-            Err(CertificateError::Revoked)
-        ));
+        assert!(matches!(cp.renew().await, Err(EnrolError::Revoked)));
         mock.push(
             path,
             Reply::json(
@@ -609,19 +677,16 @@ pub(crate) mod tests {
             ),
         );
         assert!(matches!(
-            cp.renew(csr.clone()).await,
-            Err(CertificateError::Unsupported(e)) if e.missing == ["roxy_version:0.2.0"]
+            cp.renew().await,
+            Err(EnrolError::Unsupported(e)) if e.missing == ["roxy_version:0.2.0"]
         ));
         mock.push(path, Reply::status(401));
         assert!(matches!(
-            cp.renew(csr.clone()).await,
-            Err(CertificateError::Rejected(m)) if m.starts_with("401")
+            cp.renew().await,
+            Err(EnrolError::Rejected(m)) if m.starts_with("401")
         ));
         mock.push(path, Reply::status(503));
-        assert!(matches!(
-            cp.renew(csr).await,
-            Err(CertificateError::Failed(_))
-        ));
+        assert!(matches!(cp.renew().await, Err(EnrolError::Failed(_))));
     }
 
     #[tokio::test]
@@ -672,18 +737,19 @@ pub(crate) mod tests {
         mock.push(path, Reply::status(401));
         assert!(
             matches!(cp.ship_flows(&body).await, ShipOutcome::Failed(_)),
-            "401 is the certificate's standing, not the batch's"
+            "401 is the token's standing, not the batch's"
         );
     }
 
-    /// Every body the client sends, and the lease it parses, match the
+    /// Every body the client sends, and the bodies it parses, match the
     /// published contract's component schemas.
     #[tokio::test]
     async fn bodies_match_the_openapi_contract() {
         let mock = MockServer::start().await;
-        let (cp, _) = enrolled(&mock).await;
+        let (cp, res) = enrolled(&mock).await;
         let enrol = mock.requests_to("/roxy/v1/enrol")[0].json();
         roxy_node_spec::validate("EnrolRequest", &enrol).unwrap();
+        roxy_node_spec::validate("EnrolResponse", &serde_json::to_value(&res).unwrap()).unwrap();
 
         mock.push("/roxy/v1/lease", Reply::json(200, &lease("L2")));
         cp.fetch_lease(&state()).await;
@@ -719,21 +785,21 @@ pub(crate) mod tests {
     fn the_control_plane_must_be_https_and_the_prefix_follows_the_base_path() {
         let trust = Trust::default();
         assert!(matches!(
-            ControlPlane::unauthenticated("http://cp.example", &trust, info()),
+            ControlPlane::new("http://cp.example", &trust, info()),
             Err(ClientError::Url(_))
         ));
-        let cp = ControlPlane::unauthenticated("https://cp.example/base/", &trust, info()).unwrap();
+        let cp = ControlPlane::new("https://cp.example/base/", &trust, info()).unwrap();
         assert_eq!(
             cp.endpoint("lease").as_str(),
             "https://cp.example/base/roxy/v1/lease"
         );
-        let cp = ControlPlane::unauthenticated("https://cp.example", &trust, info()).unwrap();
+        let cp = ControlPlane::new("https://cp.example", &trust, info()).unwrap();
         assert_eq!(
             cp.endpoint("enrol").as_str(),
             "https://cp.example/roxy/v1/enrol"
         );
         assert!(matches!(
-            ControlPlane::unauthenticated(
+            ControlPlane::new(
                 "https://cp.example",
                 &Trust {
                     ca_pem: Some("garbage".into()),

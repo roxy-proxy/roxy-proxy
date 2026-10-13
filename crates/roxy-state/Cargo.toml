@@ -1,6 +1,6 @@
 [package]
 name = "roxy-state"
-description = "roxy's state dir: the node identity, flow sequence, CA dir and quarantine marker, written atomically"
+description = "roxy's state dir: the node token, flow sequence, CA dir and quarantine marker, written atomically"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

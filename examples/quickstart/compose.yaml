@@ -45,12 +45,12 @@ services:
       - --state-dir=/var/lib/roxy/node
       - --control-plane-ca=/shared/cp-ca.pem
     secrets: [enrol-token]
-    # The node certificate, key and interception CA: a fresh enrolment each
-    # start rather than a volume, owned by roxy's non-root user.
+    # The node token and interception CA: a fresh enrolment each start
+    # rather than a volume, owned by roxy's non-root user.
     tmpfs:
       - /var/lib/roxy/node:uid=65532,gid=65532,mode=0700
     volumes:
-      - cp-shared:/shared:ro               # the control plane's CA certificate
+      - cp-shared:/shared:ro               # the control plane's certificate
     ports:
       - "127.0.0.1:3128:3128"              # the proxy
       - "127.0.0.1:3130:3130"              # the CA certificate
@@ -85,10 +85,10 @@ services:
       ROXY_CONFIG: /etc/roxy/roxy.yaml
       CA_OUT: /shared/cp-ca.pem
       LEASE_VALID_SECONDS: ${LEASE_VALID_SECONDS:-60}
-      NODE_CERT_SECONDS: ${NODE_CERT_SECONDS:-600}  # the node certificate's lifetime; renewed halfway
+      NODE_TOKEN_SECONDS: ${NODE_TOKEN_SECONDS:-600}  # the node token's lifetime; renewed halfway
     volumes:
       - ./roxy.yaml:/etc/roxy/roxy.yaml:ro
-      - cp-data:/data                      # CA, server certificate, `revoked`
+      - cp-data:/data                      # server certificate, node tokens, `revoked`
       - cp-shared:/shared
     networks: [lab]
 
