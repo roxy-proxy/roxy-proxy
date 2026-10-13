@@ -310,7 +310,8 @@ fn well_formed_host_literals_compile() {
 }
 
 /// `roxy check` advice, not a compile error: a metric keyed on a field the
-/// client picks freely needs a `where` to bound its series.
+/// client picks freely needs a `where` to bound its series. `unique(..)`
+/// fields feed a sketch inside a series, so they never warn.
 #[test]
 fn client_chosen_key_without_where_warns() {
     let metrics: Vec<roxy_rules::MetricConfig> = roxy_rules::yaml::from_str(
@@ -318,9 +319,9 @@ fn client_chosen_key_without_where_warns() {
 - { id: b, count: requests, key: [client.ip, path] }
 - { id: c, count: unique(url) }
 - { id: d, count: requests, key: [path], where: 'host under \"example.com\"' }
-- { id: e, count: unique(query.raw), where: 'query.raw != null' }
+- { id: e, count: unique(query.raw), key: [client.ip] }
 - { id: f, count: requests, key: [client.ip, client.port] }
-- { id: g, count: requests, key: [host, client.port], where: 'host under \"example.com\"' }",
+- { id: g, count: requests, key: [host, client.port], where: 'host in [\"example.com\"]' }",
     )
     .unwrap();
     let warnings = Policy::metric_warnings(&metrics);
@@ -333,16 +334,15 @@ fn client_chosen_key_without_where_warns() {
         [
             "metrics[0].key[0]: `host` is chosen by the client",
             "metrics[1].key[1]: `path` is chosen by the client",
-            "metrics[2].count: `url` is chosen by the client",
             "metrics[5].key[1]: `client.port` is chosen by the client",
         ]
     );
-    // Only `host` is bounded by a `where` on host; the advice must not send
-    // operators to a filter that silences the warning without removing the risk.
-    assert!(warnings[0].message.contains("`where: host under"));
+    // `under` admits every subdomain, so the host advice must name a finite
+    // filter; for the other fields a host filter does not bound the key at all.
+    assert!(warnings[0].message.contains("`where: host in ["));
     for d in &warnings[1..] {
         assert!(
-            !d.message.contains("host under") && d.message.contains("not how many"),
+            !d.message.contains("host in [") && d.message.contains("not how many"),
             "{}",
             d.message
         );

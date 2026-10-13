@@ -176,14 +176,17 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
     /// Advice that does not stop a policy compiling: a metric keyed on a
     /// field the client chooses freely (`host`, `path`, `url`, `query.raw`,
     /// `client.port`) holds as many series as the client cares to send unless
-    /// a `where` bounds it, and denied flows count too.
+    /// a `where` bounds it, and denied flows count too. `unique(..)` fields
+    /// feed a sketch inside a series rather than naming one, so they are exempt.
     pub(super) fn metric_warnings(metrics: &[MetricConfig]) -> Vec<Diagnostic> {
-        // A `where` on `host` bounds `host` itself; for the other fields it
-        // only chooses whose values count, not how many, so the advice differs.
+        // `under` admits every subdomain, so only a finite host filter bounds
+        // `host`; for the other fields a `where` on `host` chooses whose values
+        // count, not how many.
         let advice = |name: &str| match Field::from_name(name) {
-            Some(Field::Host) => {
-                Some("bound it (`where: host under \"example.com\"`) or lower `max_keys`")
-            }
+            Some(Field::Host) => Some(
+                "bound it with a finite filter (`where: host in [\"api.example.com\"]`; \
+                 `under` admits every subdomain) or lower `max_keys`",
+            ),
             Some(Field::Path | Field::Url | Field::QueryRaw | Field::ClientPort) => Some(
                 "a `where` on `host` limits whose values count, not how many, so give \
                  this metric a `where` that enumerates the values it keys on, or lower its \
@@ -196,27 +199,12 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             if m.where_.is_some() {
                 continue;
             }
-            let keys = m
-                .key
-                .iter()
-                .enumerate()
-                .map(|(j, k)| (format!("metrics[{i}].key[{j}]"), k.as_str()));
-            let unique = match &m.count {
-                MetricCount::Unique(f) => Some((format!("metrics[{i}].count"), f.as_str())),
-                MetricCount::Requests
-                | MetricCount::RequestBytes
-                | MetricCount::ResponseBytes
-                | MetricCount::Errors
-                | MetricCount::Denied => None,
-            };
-            for (at, name, advice) in keys
-                .chain(unique)
-                .filter_map(|(at, n)| advice(n).map(|advice| (at, n, advice)))
-            {
+            for (j, k) in m.key.iter().enumerate() {
+                let Some(advice) = advice(k) else { continue };
                 out.push(Diagnostic::new(
-                    at,
+                    format!("metrics[{i}].key[{j}]"),
                     format!(
-                        "`{name}` is chosen by the client, so without a `where` this metric \
+                        "`{k}` is chosen by the client, so without a `where` this metric \
                          holds one series per value the client sends, up to its `max_keys`; \
                          {advice} \
                          (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#key-cardinality)"

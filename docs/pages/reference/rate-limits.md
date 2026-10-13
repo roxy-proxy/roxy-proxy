@@ -64,23 +64,26 @@ metrics:
 client per request, and denied flows count, so a metric keyed on one with
 no `where` fills with as many series as the client sends, without one
 request being allowed; then every flow needing a new series is denied
-(`metric_table_full`) until series expire. Bound the key with `where`:
+(`metric_table_full`) until series expire. Bound the key with a finite
+`where`:
 
 ```yaml
 metrics:
   - id: github_requests
     count: requests
-    where: host under "github.com"
+    where: host in ["api.github.com", "github.com"]
     key: [host]
     window: 1m
 ```
 
 `client.ip` is bounded by who can reach the proxy. `roxy check` warns when a
-metric keys on any of the five fields above, or counts `unique(..)` of one,
-with no `where`. A `where` like this bounds `host`; the others have no such
-bound (a `where` on `host` limits whose paths and ports count, not how
-many), so give such a metric its own `max_keys`: filling it then refuses
-new series in that metric alone.
+metric keys on any of the five fields above with no `where`. `host under
+"github.com"` does not bound `host`: subdomains are client-chosen too. For
+`path`, `url`, `query.raw` and `client.port` a `where` on `host` limits
+whose values count, not how many; give such a metric a `where` that
+enumerates the values it keys on, or its own `max_keys` so filling it
+refuses new series in that metric alone. `unique(..)` fields are not keys:
+they feed a bounded sketch inside a series and create none.
 
 ## State
 
