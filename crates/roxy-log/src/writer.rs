@@ -495,8 +495,11 @@ pub(crate) mod tests {
         fn clock(&self) -> Clock {
             let this = self.clone();
             Arc::new(move || {
+                let now = this.base + Duration::from_nanos(this.offset_ns.load(Ordering::SeqCst));
+                // Counted only once the instant is fixed: a reader that saw
+                // the count and advanced the clock must not move this read.
                 this.reads.fetch_add(1, Ordering::SeqCst);
-                this.base + Duration::from_nanos(this.offset_ns.load(Ordering::SeqCst))
+                now
             })
         }
     }
