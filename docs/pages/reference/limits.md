@@ -150,7 +150,8 @@ single reservation.
   client IP) is accepted and closed at once, with a `connection_refused`
   event. The `ca_server` listener counts separately, `max_connections` in
   total with no per-client cap, and logs its refusals to roxy's own log
-  rather than the flow log.
+  rather than the flow log. A client that fills it starves the health
+  probes, so that port should not be reachable by untrusted clients.
 - Every read is bounded (head size, body size, ClientHello size) and every
   stage has a timeout. Nothing is allocated in proportion to an
   attacker-supplied number before it is validated (`content-length: 10^18`
