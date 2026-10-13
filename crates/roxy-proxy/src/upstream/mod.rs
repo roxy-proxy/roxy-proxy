@@ -863,6 +863,7 @@ mod tests {
 
     use super::*;
     use crate::addrlist::AddressList;
+    use crate::testkit::timed;
 
     /// Answers `200` to every HTTP/1.1 request on `s`, keeping it open.
     async fn answer_ok<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(mut s: S) {
@@ -1090,7 +1091,7 @@ mod tests {
     /// A name with several addresses that drop packets fails within one
     /// `connect_timeout`, not one per address; the families are tried
     /// alternately, the resolver's first family first.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn unroutable_addresses_share_one_connect_timeout() {
         let ips = ["93.184.216.1", "93.184.216.2", "2606:4700::1"];
         let (mut s, dns, dialled) =
@@ -1098,19 +1099,12 @@ mod tests {
         s.connect_timeout = Duration::from_millis(300);
         let up = Upstream::new(&s, &dns, &tls());
         let authority = Authority::new(Host::Dns("many.test".into()), 80);
-        let started = std::time::Instant::now();
-        let Err(err) = up
-            .connect_h1(Scheme::Http, &authority, PrivateAddrs::Deny)
-            .await
-        else {
+        let (r, took) = timed(up.connect_h1(Scheme::Http, &authority, PrivateAddrs::Deny)).await;
+        let Err(err) = r else {
             panic!("nothing answers");
         };
         assert!(matches!(err, ConnectError::Timeout(_)), "{err:?}");
-        assert!(
-            started.elapsed() < Duration::from_millis(600),
-            "{:?}",
-            started.elapsed()
-        );
+        assert_eq!(took, s.connect_timeout, "the addresses share one timeout");
         let order: Vec<String> = dialled
             .lock()
             .unwrap()
