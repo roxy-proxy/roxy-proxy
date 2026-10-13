@@ -521,6 +521,46 @@ mod tests {
         assert_eq!(s.reserved_through(), 2 * SEQ_BLOCK + 1 + 2 * SEQ_BLOCK);
     }
 
+    #[test]
+    fn seq_unreserved_stays_set_when_pushes_outrun_a_write_in_flight() {
+        let blocking = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let (b, g) = (blocking.clone(), gate.clone());
+        let s = Arc::new(Spool::new(
+            0,
+            Box::new(move |_| {
+                if b.load(Ordering::Relaxed) {
+                    g.wait();
+                    g.wait();
+                }
+                Ok(())
+            }),
+        ));
+        s.reserve().unwrap();
+        for _ in 0..=2 * SEQ_BLOCK {
+            s.push(b"{}");
+        }
+        assert!(s.seq_unreserved());
+        // A write for 2049 + 2 * SEQ_BLOCK is in flight; pushes pass it.
+        blocking.store(true, Ordering::Relaxed);
+        let writer = std::thread::spawn({
+            let s = s.clone();
+            move || s.reserve()
+        });
+        gate.wait();
+        for _ in 0..=2 * SEQ_BLOCK {
+            s.push(b"{}");
+        }
+        gate.wait();
+        writer.join().unwrap().unwrap();
+        assert_eq!(s.reserved_through(), 2 * SEQ_BLOCK + 1 + 2 * SEQ_BLOCK);
+        assert!(s.next_seq() > s.reserved_through());
+        assert!(s.seq_unreserved(), "the write landed behind next_seq");
+        blocking.store(false, Ordering::Relaxed);
+        s.reserve().unwrap();
+        assert!(!s.seq_unreserved());
+    }
+
     #[tokio::test]
     async fn the_reserve_loop_tops_up_when_a_push_finds_less_than_a_block() {
         let (s, persisted) = spool(0);

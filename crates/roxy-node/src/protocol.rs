@@ -58,8 +58,9 @@ pub struct NodeState {
     /// Events are being tagged with `seq` values past the persisted
     /// reservation, because a `flow.seq` write is failing or lagging: a
     /// restart now may reuse them, and the server's `(node_id, seq)`
-    /// deduplication would drop the reused ones. Optional on the wire, so
-    /// a control plane can tell an older node from one reporting `false`.
+    /// deduplication would drop the reused ones. Always sent; nodes that
+    /// predate the field leave it out.
+    #[serde(default)]
     pub seq_unreserved: bool,
 }
 
@@ -214,6 +215,16 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_node_state_without_seq_unreserved_parses_as_false() {
+        let state: NodeState = serde_json::from_str(
+            r#"{"lease_id":null,"roxy_version":"0.1.1","protocol_version":1,
+                "uptime_seconds":0,"policy_state":"none","spooled_bytes":0}"#,
+        )
+        .unwrap();
+        assert!(!state.seq_unreserved);
+    }
+
     use super::*;
 
     #[test]
