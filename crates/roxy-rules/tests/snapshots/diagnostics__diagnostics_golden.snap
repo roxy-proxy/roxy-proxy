@@ -71,6 +71,9 @@ rules[13].when:1:9: `host` never has brackets (an IPv6 host is bare), so "[::fff
 rules[14].when:1:9: `host` carries an IPv4-mapped address as the IPv4 address it embeds, so "0:0:0:0:0:ffff:93.184.216.34" never matches; write "93.184.216.34"  [rule o]
     | host == "0:0:0:0:0:ffff:93.184.216.34"
     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+rules[15].when:1:18: `host` carries an IPv4-mapped address as the IPv4 address it embeds, so "::ffff:a00:1" never matches; write "10.0.0.1"  [rule p]
+    | host starts_with "::ffff:a00:1"
+    |                  ^^^^^^^^^^^^^^
 
 == null compared with a field that is never null
 rules[0].when:1:1: `tag["x"]` is never null (false until set), so comparing it with `null` is always the same answer; remove it  [rule a]

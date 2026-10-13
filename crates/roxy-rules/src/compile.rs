@@ -1132,12 +1132,14 @@ fn check_host_literal(
     // host never starts with `::ffff:` in any other case: that spelling
     // is the mapped block. Elsewhere in a host (`1::ffff:2`) it is plain
     // IPv6 and no claim is made.
-    let whole = (pos == HostPos::Whole).then(|| mapped_v4(lit)).flatten();
-    let prefixed = matches!(pos, HostPos::Whole | HostPos::Head | HostPos::Glob)
-        && lit
-            .get(..MAPPED_PREFIX.len())
-            .is_some_and(|p| p.eq_ignore_ascii_case(MAPPED_PREFIX));
-    if whole.is_some() || prefixed {
+    let anchored = matches!(pos, HostPos::Whole | HostPos::Head | HostPos::Glob);
+    let whole = mapped_v4(lit);
+    let prefixed = lit
+        .get(..MAPPED_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(MAPPED_PREFIX));
+    if anchored && (whole.is_some() || prefixed) {
+        // A complete address, in any spelling, has an IPv4 form to write;
+        // a partial prefix only has the rest of itself.
         let hint = whole.map_or_else(
             || lit[MAPPED_PREFIX.len()..].to_owned(),
             |v4| v4.to_string(),
