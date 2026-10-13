@@ -126,8 +126,8 @@ restarts, and the client cannot talk its way out.
 Two things trip it:
 
 - a rule's `quarantine` action ([actions](/reference/rule-language#actions)):
-  the matching exchange is refused by that rule, and the proxy is
-  quarantined;
+  the exchange is refused, by whichever deny wins, and the proxy is
+  quarantined, even if a rule below it fails closed;
 - a listener's `quarantine_on.parse_errors` threshold
   ([listeners](/reference/http#listener-modes)): that many `parse_error`
   events on the listener within the window, counting every reason except
@@ -154,8 +154,10 @@ a listener) needs `roxy run --state-dir DIR`: roxy refuses to start, or to
 reload into such a config, without it. The trip writes `DIR/quarantine`
 (the incident as JSON, mode `0600`), and a start that finds the file starts
 quarantined, logging the `quarantined` event again with `restored: true`.
-The in-memory state changes before the file is written, so a write failure
-leaves the process quarantined until it restarts; it is logged as an error.
+The in-memory state changes before the file is written. A write failure is
+logged as an error and leaves the process quarantined; whether a restart
+starts quarantined then depends on whether the file landed before the
+failure, so check for `DIR/quarantine` before restarting.
 
 Lifting it is never the proxy's own doing. From a config file: stop roxy,
 remove `DIR/quarantine`, start it again. A reload does not lift it, and a

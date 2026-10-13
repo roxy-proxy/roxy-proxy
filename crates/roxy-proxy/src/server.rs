@@ -238,7 +238,8 @@ impl Shared {
                 id = %record.id,
                 cause = ?record.cause,
                 error = %e,
-                "quarantined, but the marker could not be written: the quarantine will not survive a restart"
+                marker = ?self.quarantine.marker(),
+                "quarantined, but writing the marker failed: whether a restart starts quarantined depends on whether the file landed; check it before restarting"
             ),
         }
         self.emit_quarantined(record, false);

@@ -75,6 +75,25 @@ pub(crate) fn counts_as_probe(reason: &str) -> bool {
     !NOT_A_PROBE.contains(&reason)
 }
 
+/// The reason for a TLS or h2 handshake that did not complete: `protocol`
+/// when the client sent something roxy would not accept, the transport's
+/// own reason when it left or reset instead, which is no probe. Both
+/// libraries report a departure as an I/O error (rustls wraps its protocol
+/// errors as `InvalidData`).
+pub(crate) fn handshake_reason(protocol: &'static str, io: Option<&io::Error>) -> &'static str {
+    match io.map(io::Error::kind) {
+        Some(io::ErrorKind::UnexpectedEof) => "unexpected_eof",
+        Some(
+            io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::TimedOut,
+        ) => "io_error",
+        _ => protocol,
+    }
+}
+
 /// The sliding count behind one listener's threshold. Keeps at most
 /// `count` instants, so its memory is fixed by the config.
 #[derive(Debug)]
@@ -288,6 +307,13 @@ fn write_marker(path: &Path, record: &QuarantineRecord) -> io::Result<()> {
         opts.mode(0o600);
     }
     let mut file = opts.open(&tmp)?;
+    #[cfg(unix)]
+    {
+        // `mode` only applies to a file this call creates; a leftover
+        // temporary from an earlier run keeps its old bits otherwise.
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     let mut bytes = serde_json::to_vec_pretty(record).map_err(io::Error::other)?;
     bytes.push(b'\n');
     file.write_all(&bytes)?;
@@ -425,6 +451,37 @@ mod tests {
             window: Duration::from_secs(10),
         });
         assert!(c.note(t0));
+    }
+
+    #[test]
+    fn a_handshake_the_client_left_is_not_a_probe() {
+        let io = |k| io::Error::new(k, "x");
+        assert_eq!(
+            handshake_reason(
+                "tls_handshake_failed",
+                Some(&io(io::ErrorKind::UnexpectedEof))
+            ),
+            "unexpected_eof"
+        );
+        assert_eq!(
+            handshake_reason(
+                "h2_handshake_failed",
+                Some(&io(io::ErrorKind::ConnectionReset))
+            ),
+            "io_error"
+        );
+        // rustls reports a bad ClientHello as `InvalidData`.
+        assert_eq!(
+            handshake_reason(
+                "tls_handshake_failed",
+                Some(&io(io::ErrorKind::InvalidData))
+            ),
+            "tls_handshake_failed"
+        );
+        assert_eq!(
+            handshake_reason("h2_handshake_failed", None),
+            "h2_handshake_failed"
+        );
     }
 
     #[test]

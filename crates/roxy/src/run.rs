@@ -1003,6 +1003,33 @@ mod tests {
         running.shutdown(Duration::ZERO).await;
     }
 
+    /// Without `--state-dir`, a reload into a config that can quarantine is
+    /// refused like a start would be, and the running policy stays.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_into_a_quarantining_config_needs_the_state_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = format!(
+            "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:0 }}]\ntls: {{ ca_dir: {:?} }}\n",
+            dir.path().join("ca")
+        );
+        let (path, running, sink) = start_in(dir.path(), &base, false).await;
+        std::fs::write(
+            &path,
+            format!("{base}rules: [{{ id: q, then: quarantine }}]\n"),
+        )
+        .unwrap();
+        assert!(!running.reloader.reload().await);
+        let failed = events(&sink, "config_reload_failed");
+        assert!(
+            failed[0]["diagnostics"]
+                .to_string()
+                .contains("needs --state-dir"),
+            "{failed:?}"
+        );
+        assert!(!running.reloader.last.lock().await.uses_quarantine());
+        running.shutdown(Duration::ZERO).await;
+    }
+
     /// Every reload started by `SIGHUP` and still pending at shutdown is
     /// abandoned, including one queued behind another.
     #[tokio::test(flavor = "multi_thread")]

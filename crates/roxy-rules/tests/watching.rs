@@ -591,6 +591,37 @@ fn a_rule_waits_for_a_field_that_arrives_on_a_later_event() {
     assert_eq!(o.terminal_rule.unwrap(), "w");
 }
 
+/// A watching `quarantine` that matched is reported even when a rule below
+/// it fails closed in the same pass.
+#[test]
+fn a_matched_watching_quarantine_survives_a_fail_closed() {
+    let p = compile(
+        common::METRICS,
+        r"
+- id: allow-all
+  then: allow
+- id: bad-status
+  when: response.status == 500
+  then: quarantine
+- id: too-much
+  when: response.status == 500 and metric.egress > 1mb
+  then: deny
+",
+    );
+    let head = p.evaluate_head(&MapView::new(), &EvalContext::empty());
+    let mut st = p.watch_state(&head.tags);
+    let o = p
+        .evaluate_watching(
+            ALL,
+            ALL,
+            &mut st,
+            &MapView::new().with_int(Field::ResponseStatus, 500),
+        )
+        .unwrap();
+    assert_eq!(o.stop, Some(Deny::fail_closed()));
+    assert_eq!(o.quarantine.unwrap(), "bad-status");
+}
+
 /// A watching `quarantine` stops the exchange like a deny and names its
 /// rule; one reading a byte metric is re-checked after forwarding as a
 /// `deny` is.

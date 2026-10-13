@@ -35,8 +35,8 @@ runs follows from what it reads.
    not affect the decision. A rule that reads a value not yet known is
    skipped here, not treated as false. `quarantine` is a deny that also
    puts the proxy into [quarantine](/guides/operations#quarantine): a
-   matching one trips it whichever deny decided the request, and from the
-   next exchange on nothing here runs at all.
+   matching one trips it whichever deny decided the request, a fail-closed
+   included, and from the next exchange on nothing here runs at all.
 2. **After that, rules watch.** For the rest of the exchange, two kinds of
    rule are re-checked whenever a value they read becomes known or changes:
    rules that read a *watched* field ([fields](/reference/rule-language#fields)),

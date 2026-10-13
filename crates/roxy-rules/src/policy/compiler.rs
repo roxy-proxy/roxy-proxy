@@ -443,6 +443,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 when,
                 head,
                 watching,
+                quarantines: rule.then.0.iter().any(|a| matches!(a, Action::Quarantine)),
                 shape,
             });
         }
@@ -567,7 +568,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         let out = match action {
             Action::Allow(a) => vec![CAction::Terminal(allow(a))],
             Action::Deny(d) => vec![CAction::Terminal(Decision::Deny(self.deny(d, rule, apath)))],
-            Action::Quarantine => vec![CAction::Quarantine(Deny::quarantine())],
+            Action::Quarantine => vec![CAction::Terminal(Decision::Deny(Deny::quarantine()))],
             Action::SetHeader(pairs) => self.set_header(pairs, rule, apath),
             Action::RemoveHeader(names) => names
                 .iter()
@@ -715,7 +716,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                     .collect()
             }
             Action::Deny(d) => vec![WatchAction::Deny(self.deny(d, rule, apath))],
-            Action::Quarantine => vec![WatchAction::Quarantine(Deny::quarantine())],
+            Action::Quarantine => vec![WatchAction::Deny(Deny::quarantine())],
             Action::Tag(t) => {
                 self.tag(t, rule, apath);
                 vec![WatchAction::Tag(t.clone())]

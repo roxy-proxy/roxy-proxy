@@ -1371,6 +1371,45 @@ fn quarantine_refuses_and_is_reported_whatever_the_terminal_rule() {
     assert_eq!(out.quarantine, None);
 }
 
+/// A matched `quarantine` survives a fail-closed: the exchange is refused
+/// as `_fail_closed`, and the process still trips. Whether the failure is a
+/// rule below it or the quarantine rule's own earlier action.
+#[test]
+fn a_matched_quarantine_survives_a_fail_closed() {
+    let p = compile(
+        METRICS,
+        r#"
+- id: trip
+  when: path starts_with "/a"
+  then: quarantine
+- id: limit
+  when: metric.writes >= 30
+  then: deny
+"#,
+    );
+    let ctx = EvalContext::empty();
+    let path = |s: &str| MapView::new().with_str(Field::Path, s);
+    let out = p.evaluate_head(&path("/a"), &ctx);
+    fail_closed(FailClosedReason::MetricUnavailable("writes".into()))(&out);
+    assert_eq!(out.quarantine.unwrap(), "trip");
+    let out = p.evaluate_head(&path("/b"), &ctx);
+    assert_eq!(
+        out.quarantine, None,
+        "a rule that did not match trips nothing"
+    );
+
+    let p = compile(
+        "",
+        r#"
+- id: trip
+  then: [{ set_header: { x-k: "${secret:openai}" } }, quarantine]
+"#,
+    );
+    let out = p.evaluate_head(&MapView::new(), &ctx);
+    fail_closed(FailClosedReason::SecretMissing("openai".into()))(&out);
+    assert_eq!(out.quarantine.unwrap(), "trip");
+}
+
 #[test]
 fn quarantine_after_a_terminal_action_is_an_error() {
     let err = try_compile("", "- id: r\n  then: [deny, quarantine]\n").unwrap_err();

@@ -88,9 +88,12 @@ impl Policy {
             match hit {
                 Ok(true) => {}
                 Ok(false) => continue,
-                Err(reason) => return self.fail(reason, matched, effects, tags),
+                Err(reason) => return self.fail(reason, matched, effects, tags, quarantine),
             }
             matched.push(rule.id.clone());
+            if rule.quarantines {
+                quarantine.get_or_insert_with(|| rule.id.clone());
+            }
             for action in &rule.head {
                 match action {
                     CAction::Effect(e) => effects.push(e.clone()),
@@ -104,21 +107,21 @@ impl Policy {
                             name: name.clone(),
                             value,
                         }),
-                        Err(reason) => return self.fail(reason, matched, effects, tags),
+                        Err(reason) => {
+                            return self.fail(reason, matched, effects, tags, quarantine);
+                        }
                     },
                     CAction::Sign(spec) => match resolve_sign(spec, ctx) {
                         Ok(s) => effects.push(Effect::Sign(s)),
-                        Err(reason) => return self.fail(reason, matched, effects, tags),
+                        Err(reason) => {
+                            return self.fail(reason, matched, effects, tags, quarantine);
+                        }
                     },
                     CAction::Terminal(d @ Decision::Allow(_)) => {
                         allow.get_or_insert((i, d));
                     }
                     CAction::Terminal(d @ Decision::Deny(_)) => {
                         deny.get_or_insert_with(|| (i, d.clone()));
-                    }
-                    CAction::Quarantine(d) => {
-                        quarantine.get_or_insert_with(|| rule.id.clone());
-                        deny.get_or_insert_with(|| (i, Decision::Deny(d.clone())));
                     }
                 }
             }
@@ -149,6 +152,7 @@ impl Policy {
         matched: Vec<RuleId>,
         mut effects: Vec<Effect>,
         tags: Vec<String>,
+        quarantine: Option<RuleId>,
     ) -> Outcome {
         refused_effects(&mut effects);
         Outcome {
@@ -156,7 +160,7 @@ impl Policy {
             matched,
             terminal_rule: self.fail_closed_id.clone(),
             fail_closed_reason: Some(reason),
-            quarantine: None,
+            quarantine,
             effects,
             tags,
         }
@@ -233,6 +237,9 @@ impl Policy {
             let o = out.get_or_insert_with(WatchOutcome::default);
             st.fired[k] = true;
             o.matched.push(rule.id.clone());
+            if rule.quarantines {
+                o.quarantine.get_or_insert_with(|| rule.id.clone());
+            }
             for action in &rule.watching {
                 match action {
                     WatchAction::Effect(e) => o.effects.push(e.clone()),
@@ -243,12 +250,6 @@ impl Policy {
                         }
                     }
                     WatchAction::Deny(d) => {
-                        if deny.is_none() {
-                            deny = Some((rule.id.clone(), d.clone()));
-                        }
-                    }
-                    WatchAction::Quarantine(d) => {
-                        o.quarantine.get_or_insert_with(|| rule.id.clone());
                         if deny.is_none() {
                             deny = Some((rule.id.clone(), d.clone()));
                         }
