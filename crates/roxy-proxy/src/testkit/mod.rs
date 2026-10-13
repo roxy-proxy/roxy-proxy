@@ -1378,7 +1378,7 @@ impl MetricSource for StoreMetrics {
     ) -> Result<(), crate::sources::MetricSourceError> {
         self.samples.lock().unwrap().push(*sample);
         let s = roxy_rules::Sample {
-            head: sample.head,
+            admission: sample.admission,
             request_bytes: sample.request_bytes,
             response_bytes: sample.response_bytes,
             denied: sample.denied,

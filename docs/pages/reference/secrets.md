@@ -32,7 +32,7 @@ rules:
 
 ## Signing AWS requests
 
-`sign: { aws_sigv4: ... }`, a head-rule action, signs the forwarded request
+`sign: { aws_sigv4: ... }`, an admission-rule action, signs the forwarded request
 with AWS Signature Version 4, so a client holding placeholder credentials
 reaches AWS with a real signature. Credential fields take `${secret:name}` as
 `set_header` does; `session_token` is optional.

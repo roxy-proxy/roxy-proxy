@@ -14,8 +14,8 @@ use roxy_rules::FlowView;
 /// What one exchange contributed since its last sample, reported to
 /// [`MetricSource::record`]. An exchange reports:
 ///
-/// * one `head` sample right after the forwarding decision (counts
-///   `requests` and `unique`, and `denied` if the head denied);
+/// * one `admission` sample right after the forwarding decision (counts
+///   `requests` and `unique`, and `denied` if admission denied);
 /// * one sample per forwarded body chunk (`request_bytes` or
 ///   `response_bytes`), so byte metrics grow while the exchange streams;
 /// * one final sample (`error`, and `denied` if an in-flight rule stopped
@@ -29,7 +29,7 @@ use roxy_rules::FlowView;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Sample {
     /// The exchange's admission sample.
-    pub head: bool,
+    pub admission: bool,
     /// Request-body bytes not reported by an earlier sample.
     pub request_bytes: u64,
     /// Response-body bytes not reported by an earlier sample.

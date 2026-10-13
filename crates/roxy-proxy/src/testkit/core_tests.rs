@@ -1133,7 +1133,7 @@ async fn a_head_deny_still_logs_and_writes_state() {
         Some("1")
     );
     let samples = rec.samples.lock().unwrap().clone();
-    assert!(samples[0].head && samples[0].denied, "{samples:?}");
+    assert!(samples[0].admission && samples[0].denied, "{samples:?}");
 }
 
 /// An allowed request whose change fails is refused, and its admission sample
@@ -1154,7 +1154,7 @@ async fn a_failing_effect_counts_as_denied() {
     assert!(kit.upstream.seen().is_empty());
     let samples = rec.samples.lock().unwrap().clone();
     assert_eq!(samples.len(), 1, "{samples:?}");
-    assert!(samples[0].head && samples[0].denied, "{samples:?}");
+    assert!(samples[0].admission && samples[0].denied, "{samples:?}");
 }
 
 /// The samples after the admission sample.
@@ -1164,7 +1164,7 @@ fn final_samples(rec: &Recording) -> Vec<crate::sources::Sample> {
         .unwrap()
         .iter()
         .copied()
-        .filter(|s| !s.head)
+        .filter(|s| !s.admission)
         .collect()
 }
 

@@ -49,10 +49,11 @@ fn stopped_effects(effects: &mut Vec<InFlightEffect>) {
 }
 
 impl Policy {
-    /// The admission decision: the forwarding decision at the request
-    /// head.
+    /// The admission decision: the forwarding decision, made before the
+    /// request goes upstream.
     ///
-    /// Every rule that takes part in it ([`RuleKind::at_head`]) is
+    /// Every rule that takes part in it
+    /// ([`RuleKind::at_admission`](super::RuleKind::at_admission)) is
     /// evaluated, top to bottom; rules that read an in-flight value are
     /// skipped (not false). The decision does not depend on order:
     ///

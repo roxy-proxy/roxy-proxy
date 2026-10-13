@@ -684,7 +684,7 @@ impl FlowCx {
             return None;
         }
         self.record.stage = Some(Stage::Head);
-        if let Err(e) = self.record_head_sample(true) {
+        if let Err(e) = self.record_admission_sample(true) {
             self.meta.metric_error(Stage::Head, &e);
         }
         Some(Refusal::expired())
@@ -698,7 +698,7 @@ impl FlowCx {
             return None;
         }
         self.record.stage = Some(Stage::Head);
-        if let Err(e) = self.record_head_sample(true) {
+        if let Err(e) = self.record_admission_sample(true) {
             self.meta.metric_error(Stage::Head, &e);
         }
         Some(Refusal::quarantined())
@@ -766,7 +766,7 @@ impl FlowCx {
 
     /// Records the exchange's head metric sample, once the admission step's
     /// outcome is settled (`denied`).
-    fn record_head_sample(&self, denied: bool) -> Result<(), MetricSourceError> {
+    fn record_admission_sample(&self, denied: bool) -> Result<(), MetricSourceError> {
         let view = ProxyView::new(
             &self.facts,
             &*self.shared.metrics,
@@ -774,7 +774,7 @@ impl FlowCx {
             &self.snap.address_lists,
         );
         let sample = Sample {
-            head: true,
+            admission: true,
             denied,
             ..Sample::default()
         };
@@ -787,7 +787,7 @@ impl FlowCx {
         if let Some(st) = self.stack.take() {
             st.fold_into(self);
         }
-        self.absorb_watch();
+        self.absorb_in_flight();
         if let Some(t) = &self.request_tally {
             self.record.request_bytes = t.bytes();
             self.record.request_sha256 = t.sha256_hex();
@@ -894,7 +894,7 @@ impl FlowCx {
     /// Folds the in-flight checker's outcome (in-flight rules that matched,
     /// tags, response mutations, a stop) into the flow record. Call once the
     /// exchange is over, before logging it.
-    pub(crate) fn absorb_watch(&mut self) {
+    pub(crate) fn absorb_in_flight(&mut self) {
         let Some(w) = self.in_flight.clone() else {
             return;
         };
@@ -1107,7 +1107,7 @@ fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
         }
     }
     // The admission sample counts the outcome as it finally stands.
-    if let Err(e) = cx.record_head_sample(refusal.is_some())
+    if let Err(e) = cx.record_admission_sample(refusal.is_some())
         && refusal.is_none()
     {
         cx.meta.metric_error(Stage::Head, &e);

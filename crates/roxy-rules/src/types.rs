@@ -1,4 +1,4 @@
-//! Field catalogue, static types, and which values are *head* values
+//! Field catalogue, static types, and which values are *admission* values
 //! (known when the forwarding decision is made) or *in-flight* values (known
 //! later).
 
