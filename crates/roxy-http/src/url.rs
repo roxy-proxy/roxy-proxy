@@ -376,6 +376,10 @@ fn parse_port(p: &[u8]) -> Result<u16, ParseError> {
 /// whose last label is numeric or `0x`-hex is treated as an IPv4 attempt
 /// (WHATWG semantics; `127.1`, `0x7f000001` resolve to loopback with
 /// `inet_aton`) and rejected unless it is a strict dotted quad.
+///
+/// An IPv4-mapped IPv6 literal (`[::ffff:a.b.c.d]`) is the IPv4 address
+/// `a.b.c.d`: the kernel dials it over IPv4, so it is parsed as
+/// [`Host::Ipv4`] and the rules, the flow log and the dial all see one form.
 pub fn parse_host(raw: &[u8]) -> Result<Host, ParseError> {
     if raw.iter().any(|&b| b >= 0x80) {
         return reject(Reason::NonAscii, "non-ASCII host (A-labels required)");
@@ -384,7 +388,10 @@ pub fn parse_host(raw: &[u8]) -> Result<Host, ParseError> {
         let s = std::str::from_utf8(inner).unwrap_or("");
         return s
             .parse::<Ipv6Addr>()
-            .map(Host::Ipv6)
+            .map(|ip| match ip.to_ipv4_mapped() {
+                Some(v4) => Host::Ipv4(v4),
+                None => Host::Ipv6(ip),
+            })
             .map_err(|_| ParseError::new(Reason::BadAuthority, "invalid IPv6 literal"));
     }
     let raw = raw.strip_suffix(b".").unwrap_or(raw);
@@ -535,6 +542,25 @@ mod tests {
         assert_eq!(
             parse_authority(b"10.0.0.1", 80).unwrap().host,
             Host::Ipv4(Ipv4Addr::new(10, 0, 0, 1))
+        );
+        // An IPv4-mapped literal is the IPv4 address it embeds, so a rule on
+        // the dotted quad sees both spellings; other v6 forms stay v6.
+        for mapped in [
+            &b"[::ffff:10.0.0.1]"[..],
+            b"[::FFFF:10.0.0.1]",
+            b"[::ffff:a00:1]",
+        ] {
+            assert_eq!(
+                parse_authority(mapped, 80).unwrap().to_string(),
+                "10.0.0.1:80",
+                "{}",
+                String::from_utf8_lossy(mapped)
+            );
+        }
+        assert_eq!(
+            parse_authority(b"[::10.0.0.1]", 80).unwrap().host,
+            Host::Ipv6("::10.0.0.1".parse().unwrap()),
+            "an IPv4-compatible literal is dialled as IPv6, so it stays IPv6"
         );
         assert_eq!(
             parse_authority(b"xn--bcher-kva.example", 443)

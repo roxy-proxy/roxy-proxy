@@ -36,7 +36,11 @@ method      := [A-Z][A-Z_]*                       ; HTTP method names only
 - Comparison is byte-exact, except: `host`, `tls.sni` and `scheme` operands
   compare ASCII case-insensitively under every operator (`like`, `matches`,
   `in` included); `under` is case-insensitive whatever its left operand;
-  `header["X-Y"]` names are case-insensitive, values not. `method` is
+  `header["X-Y"]` names are case-insensitive, values not. A header value
+  with obs-text (bytes `0x80` and up, under `http.allow_obs_text`) reads as
+  one character per byte (ISO-8859-1), so the text a rule matches is the
+  bytes roxy forwards: the byte `0xE9` reads as `é`, while `é` sent in
+  UTF-8 (`0xC3 0xA9`) reads as the two characters `Ã©`. `method` is
   exact: method `get` is forwarded as an extension method, may carry a
   body, and matches neither `method == GET` nor `method in [GET, HEAD]`.
 - Compile errors: type mismatch (`host under 443`), a regex that does not
@@ -46,7 +50,8 @@ method      := [A-Z][A-Z_]*                       ; HTTP method names only
   that can never match: `under` with an empty label (`"a..b"`,
   `"example.com.."`), a `host` or `tls.sni` literal with a trailing dot
   (`host == "evil.example."`, `host like "*.example.com."`), non-ASCII
-  characters or brackets (`"[::1]"`) ([fields](/reference/rule-language#fields)),
+  characters, brackets (`"[::1]"`) or an IPv4-mapped address
+  (`"::ffff:10.0.0.1"`) ([fields](/reference/rule-language#fields)),
   or `null` compared with a value that is never `null`
   ([missing values](/reference/rule-language#missing-values-null)). `in`
   takes a list of the operand's type, a CIDR, or an `@list` for ip fields.
@@ -78,9 +83,10 @@ fields watch.
 `path` is normalised ([HTTP](/reference/http#url-normalisation)). `host`
 and `tls.sni` are the name as roxy delivers it: lower-case, without a
 trailing dot, internationalised labels in A-label (`xn--`) form, and an IP
-literal as the bare address (`10.0.0.1`, `::1`; never `[::1]`). A string
-literal compared with them in another form never matches and is a compile
-error. Any rule reading `ws.*` makes roxy decode every WebSocket message
+literal as the bare address (`10.0.0.1`, `::1`; never `[::1]`), with an
+IPv4-mapped IPv6 literal (`[::ffff:10.0.0.1]`) delivered as the IPv4 address
+it embeds, since that is what gets dialled. A string literal compared with
+them in another form never matches and is a compile error. Any rule reading `ws.*` makes roxy decode every WebSocket message
 and strip WebSocket extensions.
 
 The normalised `path` is what roxy forwards, but an upstream may change it

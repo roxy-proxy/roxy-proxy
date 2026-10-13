@@ -175,12 +175,11 @@ fn s(v: Option<&String>) -> Value<'_> {
     v.map_or(Value::Absent, |s| Value::Str(Cow::Borrowed(s)))
 }
 
+/// Every value of `name` as the rules see it: the text of the bytes that
+/// are forwarded, obs-text read as Latin-1, so an unreadable byte cannot
+/// hide a value from a predicate.
 fn all_values<'h>(h: &'h Headers, name: &str) -> Vec<Cow<'h, str>> {
-    h.iter()
-        .filter(|(n, _)| n.as_str() == name)
-        .filter_map(|(_, v)| v.to_str().ok())
-        .map(Cow::Borrowed)
-        .collect()
+    h.get_all_text(name).collect()
 }
 
 fn int(n: u64) -> Value<'static> {
@@ -310,7 +309,7 @@ impl FlowView for ProxyView<'_> {
         if let Synthetic::Value(v) = r.synthetic_header(name) {
             return v.map(Cow::Owned);
         }
-        r.headers.get(name).map(Cow::Borrowed)
+        r.headers.get_text(name)
     }
 
     fn header_all(&self, name: &str) -> Vec<Cow<'_, str>> {
@@ -328,7 +327,7 @@ impl FlowView for ProxyView<'_> {
         if name == "content-length" {
             return r.body_size.map(|n| Cow::Owned(n.to_string()));
         }
-        r.headers.get(name).map(Cow::Borrowed)
+        r.headers.get_text(name)
     }
 
     fn response_header_all(&self, name: &str) -> Vec<Cow<'_, str>> {
