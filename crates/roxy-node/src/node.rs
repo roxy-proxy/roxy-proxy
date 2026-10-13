@@ -335,7 +335,9 @@ impl Node {
             }
             None => self.enrol().await?,
         };
-        let client = self.anonymous_client()?.with_token(&stored.token);
+        let client = self
+            .anonymous_client()?
+            .with_token(&stored.token, stored.not_after);
         tracing::info!(
             node_id = %stored.node_id,
             not_after = %stored.not_after.to_rfc3339(),
@@ -599,7 +601,7 @@ impl Node {
                             }
                             tracing::info!(not_after = %stored.not_after.to_rfc3339(), "node token renewed");
                             self.install_credential(
-                                id.client.with_token(&stored.token),
+                                id.client.with_token(&stored.token, stored.not_after),
                                 stored.node_id,
                                 stored.not_after,
                                 Some(Duration::from_secs(issued.renew_after_seconds)),
@@ -1832,7 +1834,7 @@ mod tests {
         // The old token is still accepted until its own not_after.
         let old = ControlPlane::new(&h.mock.url(), &h.config(false).trust, h.config(false).info)
             .unwrap()
-            .with_token(&before.token);
+            .with_token(&before.token, before.not_after);
         assert!(matches!(
             old.fetch_lease(&node.node_state()).await,
             LeaseFetch::Lease(_)
@@ -2006,7 +2008,7 @@ mod tests {
                 },
             )
             .unwrap()
-            .with_token("t")
+            .with_token("t", Utc::now() + chrono::Duration::seconds(3000))
         };
         let not_after = Utc::now() + chrono::Duration::seconds(3000);
         let scaled = |secs: u64| node.scaled(Duration::from_secs(secs));

@@ -119,7 +119,7 @@ class Tokens:
         return hashlib.sha256(token.encode()).hexdigest()
 
     def issue(self, node_id, lifetime):
-        token = "nt1_" + secrets.token_hex(32)
+        token = "nt1-" + secrets.token_hex(32)
         not_after = utcnow() + lifetime
         with self.lock:
             self.issued = {d: t for d, t in self.issued.items()

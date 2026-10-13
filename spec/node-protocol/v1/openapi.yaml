@@ -297,11 +297,13 @@ components:
 
     NodeToken:
       type: string
-      pattern: "^[\\x21-\\x7E]{1,512}$"
+      pattern: "^[A-Za-z0-9\\-._~+/]+=*$"
+      maxLength: 512
       description: |
-        Opaque to the node: 1 to 512 bytes of printable ASCII without
-        spaces, so it travels in an `Authorization` header unchanged. The
-        server decides its shape, its lifetime, and how it is stored.
+        Opaque to the node: 1 to 512 bytes of RFC 6750 `b64token` text
+        (`A-Z a-z 0-9 - . _ ~ + /`, then any number of `=`), so every
+        `Authorization: Bearer` parser between node and server carries it
+        unchanged. The server decides its lifetime and how it is stored.
 
     EnrolResponse:
       type: object

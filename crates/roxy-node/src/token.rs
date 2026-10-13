@@ -7,15 +7,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::protocol::EnrolResponse;
 
-/// The token a server accepts: 1 to 512 bytes of visible ASCII, which is
-/// also what fits in an `Authorization` header unchanged.
+/// The longest token a server may issue.
 pub const MAX_TOKEN_BYTES: usize = 512;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TokenError {
     #[error("the node token record does not parse: {0}")]
     Invalid(#[from] serde_json::Error),
-    #[error("the node token is not 1 to {MAX_TOKEN_BYTES} bytes of printable ASCII")]
+    #[error(
+        "the node token is not 1 to {MAX_TOKEN_BYTES} bytes of bearer token text (A-Z a-z 0-9 - . _ ~ + / and trailing =)"
+    )]
     Shape,
 }
 
@@ -63,9 +64,15 @@ impl NodeToken {
     }
 }
 
+/// RFC 6750's `b64token`: what every `Authorization: Bearer` parser on the
+/// way to the server accepts, and text JSON never escapes.
 fn check_shape(token: &str) -> Result<(), TokenError> {
-    let visible_ascii = token.bytes().all(|b| (0x21..=0x7e).contains(&b));
-    if token.is_empty() || token.len() > MAX_TOKEN_BYTES || !visible_ascii {
+    let body = token.trim_end_matches('=');
+    let token68 = !body.is_empty()
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~+/".contains(&b));
+    if !token68 || token.len() > MAX_TOKEN_BYTES {
         return Err(TokenError::Shape);
     }
     Ok(())
@@ -100,7 +107,19 @@ mod tests {
 
     #[test]
     fn a_token_the_header_cannot_carry_is_refused() {
-        for bad in ["", "with space", "tab\there", "ünïcode", "\u{7f}"] {
+        for bad in [
+            "",
+            "=",
+            "with space",
+            "tab\there",
+            "ünïcode",
+            "\u{7f}",
+            "quo\"te",
+            "back\\slash",
+            "a,b",
+            "a:b",
+            "a=b",
+        ] {
             assert!(
                 matches!(
                     NodeToken::from_response(&response(bad)),
@@ -109,8 +128,13 @@ mod tests {
                 "{bad:?}"
             );
         }
+        for good in ["a", "nt1-9f86d081", "a-._~+/Z9", "abc==", &"x".repeat(512)] {
+            assert!(
+                NodeToken::from_response(&response(good)).is_ok(),
+                "{good:?}"
+            );
+        }
         assert!(NodeToken::from_response(&response(&"x".repeat(513))).is_err());
-        assert!(NodeToken::from_response(&response(&"x".repeat(512))).is_ok());
         assert!(matches!(
             NodeToken::parse(r#"{"node_id":"n1","token":"","not_after":"2026-11-05T10:12:00Z"}"#),
             Err(TokenError::Shape)

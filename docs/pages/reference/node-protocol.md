@@ -67,7 +67,7 @@ node acts on the status code, not the body.
 ```json title="EnrolResponse"
 {
   "node_id": "node-7f3a9c",
-  "token": "nt1_9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "token": "nt1-9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
   "not_after": "2026-11-05T10:12:00Z",
   "renew_after_seconds": 1296000
 }
@@ -76,7 +76,7 @@ node acts on the status code, not the body.
 | field | meaning |
 |---|---|
 | `node_id` | chosen by the server: 1 to 128 characters from `A-Z a-z 0-9 . _ -`; stable for the life of the node |
-| `token` | the node token: 1 to 512 bytes of printable ASCII without spaces, opaque to the node, which stores it and presents it unchanged as `Authorization: Bearer` on every later request. Its shape, lifetime and storage (hashed at rest is recommended) are the server's decisions |
+| `token` | the node token: 1 to 512 bytes of RFC 6750 `b64token` text (`A-Z a-z 0-9 - . _ ~ + /`, then any number of `=`), opaque to the node, which stores it and presents it unchanged as `Authorization: Bearer` on every later request. Its lifetime and storage (hashed at rest is recommended) are the server's decisions |
 | `not_after` | when the server stops accepting the token, RFC 3339 in UTC |
 | `renew_after_seconds` | counted from receipt; once passed, the node [renews](/reference/node-protocol#renew). Well inside the token lifetime, so a failed renewal can be retried. The node renews no later than two thirds of the way to `not_after` whatever the value, and does not check the schema's minimum: `0` makes it renew again as soon as each renewal succeeds |
 

@@ -68,7 +68,7 @@ def test_enrol_issues_a_token_that_names_the_node(cp):
     valid("EnrolResponse", res)
     assert cp.tokens.node_id(res["token"]) == res["node_id"]
     assert res["renew_after_seconds"] < 600
-    assert cp.tokens.node_id("nt1_" + "0" * 64) is None
+    assert cp.tokens.node_id("nt1-" + "0" * 64) is None
     assert cp.tokens.node_id(None) is None
 
 
@@ -230,7 +230,7 @@ def test_over_tls_the_bearer_token_names_the_node(cp):
     status, err = post("/roxy/v1/lease", state)
     assert (status, err["error"]) == (401, "unrecognised")
     valid("Error", err)
-    status, err = post("/roxy/v1/lease", state, token="nt1_" + "0" * 64)
+    status, err = post("/roxy/v1/lease", state, token="nt1-" + "0" * 64)
     assert (status, err["error"]) == (401, "unrecognised")
 
     status, err = post("/roxy/v1/enrol", ENROL_BODY)

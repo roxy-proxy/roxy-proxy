@@ -6,6 +6,7 @@
 use std::io::Write as _;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use reqwest::{StatusCode, Url};
 
@@ -55,9 +56,14 @@ fn excerpt(body: &[u8], secrets: &[&str]) -> String {
     text[..cut].trim().to_owned()
 }
 
+/// Longest first, so a token that is a prefix of another cannot leave the
+/// longer one's tail behind. Tokens are token68 text, which JSON never
+/// escapes, so a plain substring match finds an echoed one.
 fn redact(text: &str, secrets: &[&str]) -> String {
+    let mut secrets: Vec<&str> = secrets.iter().copied().filter(|s| !s.is_empty()).collect();
+    secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
     let mut out = text.to_owned();
-    for secret in secrets.iter().filter(|s| !s.is_empty()) {
+    for secret in secrets {
         out = out.replace(secret, "[redacted]");
     }
     out
@@ -135,11 +141,11 @@ pub struct ControlPlane {
     base: Url,
     http: reqwest::Client,
     info: NodeInfo,
-    /// Every node token this client has held, the last one active; empty
-    /// before enrolment. Earlier ones stay because the server still accepts
-    /// them until they expire, so a response that echoes one is redacted
-    /// too.
-    tokens: Vec<String>,
+    /// The node tokens this client has held that have not expired, each
+    /// with its `not_after`, the last one active; empty before enrolment.
+    /// Earlier ones stay until they expire because the server still
+    /// accepts them, so a response that echoes one is redacted too.
+    tokens: Vec<(String, DateTime<Utc>)>,
 }
 
 /// Never prints the token.
@@ -197,11 +203,14 @@ impl ControlPlane {
         })
     }
 
-    /// The same client presenting `token` as the node token.
+    /// The same client presenting `token`, good until `not_after`, as the
+    /// node token. Tokens the server no longer accepts are let go here.
     #[must_use]
-    pub fn with_token(&self, token: &str) -> Self {
+    pub fn with_token(&self, token: &str, not_after: DateTime<Utc>) -> Self {
+        let now = Utc::now();
         let mut next = self.clone();
-        next.tokens.push(token.to_owned());
+        next.tokens.retain(|(_, expiry)| *expiry > now);
+        next.tokens.push((token.to_owned(), not_after));
         next
     }
 
@@ -212,7 +221,7 @@ impl ControlPlane {
     /// The credentials to redact from anything a response says: every
     /// token the server may still recognise.
     fn secrets(&self) -> Vec<&str> {
-        self.tokens.iter().map(String::as_str).collect()
+        self.tokens.iter().map(|(t, _)| t.as_str()).collect()
     }
 
     fn endpoint(&self, name: &str) -> Url {
@@ -226,7 +235,7 @@ impl ControlPlane {
     fn authenticated(&self, name: &str) -> reqwest::RequestBuilder {
         let req = self.http.post(self.endpoint(name));
         match self.tokens.last() {
-            Some(token) => req.bearer_auth(token),
+            Some((token, _)) => req.bearer_auth(token),
             None => req,
         }
     }
@@ -460,7 +469,35 @@ pub(crate) mod tests {
         mock.push("/roxy/v1/enrol", Reply::issue("node-1"));
         let res = anon.enrol("tok").await.unwrap();
         assert_eq!(res.node_id, "node-1");
-        (anon.with_token(&res.token), res)
+        (anon.with_token(&res.token, res.not_after), res)
+    }
+
+    fn in_an_hour() -> DateTime<Utc> {
+        Utc::now() + chrono::Duration::hours(1)
+    }
+
+    /// Expired tokens leave the redaction set; the active one never does,
+    /// and a token that is a prefix of another is still wholly redacted.
+    #[test]
+    fn held_tokens_are_kept_until_they_expire_and_redacted_longest_first() {
+        let cp = ControlPlane::new("https://cp.example", &Trust::default(), info()).unwrap();
+        assert_eq!(cp.secrets(), Vec::<&str>::new());
+        let yesterday = Utc::now() - chrono::Duration::days(1);
+        let cp = cp.with_token("old", yesterday);
+        assert_eq!(
+            cp.secrets(),
+            ["old"],
+            "the active token stays, expired or not"
+        );
+        let cp = cp.with_token("ab", in_an_hour());
+        assert_eq!(cp.secrets(), ["ab"], "a renewal lets the expired one go");
+        let cp = cp.with_token("abcd", in_an_hour());
+        assert_eq!(cp.secrets(), ["ab", "abcd"]);
+        assert_eq!(
+            redact("abcd and ab and abcdef", &cp.secrets()),
+            "[redacted] and [redacted] and [redacted]ef"
+        );
+        assert_eq!(excerpt(b"  abcd\n", &cp.secrets()), "[redacted]");
     }
 
     #[tokio::test]
@@ -511,7 +548,7 @@ pub(crate) mod tests {
         let mock = MockServer::start().await;
         let (cp, _) = enrolled(&mock).await;
         mock.fallback("/roxy/v1/lease", Reply::json(200, &lease("L2")));
-        let forged = cp.with_token("not-issued");
+        let forged = cp.with_token("not-issued", in_an_hour());
         assert!(matches!(
             forged.fetch_lease(&state()).await,
             LeaseFetch::Unauthorized
@@ -746,7 +783,9 @@ pub(crate) mod tests {
         );
         mock.fallback("/roxy/v1/lease", Reply::json(200, &lease("L2")));
         assert!(matches!(
-            cp.with_token(&second.token).fetch_lease(&state()).await,
+            cp.with_token(&second.token, second.not_after)
+                .fetch_lease(&state())
+                .await,
             LeaseFetch::Lease(_)
         ));
         assert!(matches!(

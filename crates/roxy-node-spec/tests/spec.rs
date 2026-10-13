@@ -212,8 +212,8 @@ fn enrol_request_needs_both_versions_and_no_more() {
     assert!(validate("EnrolRequest", &empty).is_err());
 }
 
-/// The node token is required and must fit an `Authorization` header
-/// unchanged: visible ASCII, 1 to 512 bytes.
+/// The node token is required and must be RFC 6750 `b64token` text of at
+/// most 512 bytes, so a bearer parser on the way carries it unchanged.
 #[test]
 fn enrol_response_token_is_required_and_header_safe() {
     let res = page_example("EnrolResponse");
@@ -221,14 +221,28 @@ fn enrol_response_token_is_required_and_header_safe() {
     let mut missing = res.clone();
     missing.as_object_mut().unwrap().remove("token");
     assert!(validate("EnrolResponse", &missing).is_err());
-    for bad in ["", "with space", "tab\tin", "ünïcode", &"x".repeat(513)] {
+    for bad in [
+        "",
+        "=",
+        "with space",
+        "tab\tin",
+        "ünïcode",
+        "quo\"te",
+        "back\\slash",
+        "a,b",
+        "a:b",
+        "a=b",
+        &"x".repeat(513),
+    ] {
         let mut r = res.clone();
         r["token"] = json!(bad);
         assert!(validate("EnrolResponse", &r).is_err(), "{bad:?}");
     }
-    let mut longest = res.clone();
-    longest["token"] = json!("x".repeat(512));
-    assert!(validate("EnrolResponse", &longest).is_ok());
+    for good in ["a", "a-._~+/Z9", "abc==", &"x".repeat(512)] {
+        let mut r = res.clone();
+        r["token"] = json!(good);
+        assert!(validate("EnrolResponse", &r).is_ok(), "{good:?}");
+    }
     let mut not_a_time = res;
     not_a_time["not_after"] = json!("soon");
     assert!(validate("EnrolResponse", &not_a_time).is_err());
