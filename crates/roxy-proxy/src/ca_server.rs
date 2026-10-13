@@ -18,7 +18,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::TcpListener;
 
-use crate::server::{PolicyState, Shared, conn_slot};
+use crate::server::{PolicyState, Shared, ca_conn_slot};
 
 /// `content-type` of the CA certificate.
 pub const PEM_CONTENT_TYPE: &str = "application/x-pem-file";
@@ -71,9 +71,13 @@ pub(crate) async fn serve(tcp: TcpListener, shared: Arc<Shared>) {
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
-        let Some(slot) = conn_slot(&shared, peer.ip()) else {
-            drop(stream);
-            continue;
+        let slot = match ca_conn_slot(&shared, peer.ip()) {
+            Ok(slot) => slot,
+            Err(reason) => {
+                drop(stream);
+                tracing::info!(peer = %peer, reason, "ca_server connection refused");
+                continue;
+            }
         };
         let s = shared.clone();
         let header_timeout = shared.snapshot().limits.header_timeout;

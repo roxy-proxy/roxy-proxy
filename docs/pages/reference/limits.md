@@ -62,7 +62,7 @@ limits:
   max_buffered_bytes: 1gb         # all of the above together, across the process
 
   # connections
-  max_connections: 10000
+  max_connections: 10000              # to the proxy listeners; ca_server has its own cap of the same size
   max_connections_per_client: 10000   # per client IP; omitted, it is max_connections, so off unless lowered
 
   # policy state
@@ -100,7 +100,7 @@ timeouts, so a long timeout costs only the idle connection it keeps:
 
 | timeout | a long value holds |
 |---|---|
-| `header_timeout` | a connection slot (one of `max_connections`) and its socket, with no request to show for it |
+| `header_timeout` | a connection slot (one of `max_connections`, or of the `ca_server` cap) and its socket, with no request to show for it |
 | `body_idle_timeout` | a connection slot and the exchange's buffers (its reservations under `max_buffered_bytes`, and up to 4 MiB of HTTP/2 receive window) while the client is silent |
 | `idle_timeout` | a connection slot and its socket between requests, or a relayed WebSocket's two sockets and its reserved message buffers while nothing is sent |
 | `response_header_timeout` | a connection slot, the upstream connection, and the exchange's buffers while the upstream thinks |
@@ -148,7 +148,10 @@ single reservation.
 
 - A connection over `max_connections` or `max_connections_per_client` (per
   client IP) is accepted and closed at once, with a `connection_refused`
-  event.
+  event. The `ca_server` listener counts separately, `max_connections` in
+  total with no per-client cap, and logs its refusals to roxy's own log
+  rather than the flow log. A client that fills it starves the health
+  probes, so that port should not be reachable by untrusted clients.
 - Every read is bounded (head size, body size, ClientHello size) and every
   stage has a timeout. Nothing is allocated in proportion to an
   attacker-supplied number before it is validated (`content-length: 10^18`
@@ -167,7 +170,9 @@ single reservation.
 - Bounded policy tables (metrics, state, addon state) never evict
   ([never evict](/design/threat-model#never-evict)).
 - The proxy port serves only proxy semantics and `roxy.internal`; health
-  and CA download live on the separate `ca_server` listener.
+  and CA download live on the separate `ca_server` listener, with a cap of
+  its own, so the two hold at most 2 × `max_connections` connection slots
+  between them.
 - A panic in a connection task closes that connection only.
 - On `SIGTERM` or Ctrl-C roxy stops accepting, drains exchanges in flight
   for up to 10 seconds, and flushes the flow log and capture before

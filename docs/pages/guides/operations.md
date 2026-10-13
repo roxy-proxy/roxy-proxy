@@ -20,6 +20,13 @@ probe, and `/healthz` for a liveness probe or a container `HEALTHCHECK`.
 Readiness reads the policy the proxy is evaluating against, so a reload
 with a later lease makes it ready without a restart.
 
+The `ca_server` listener has its own connection cap, separate from the
+proxy's: `limits.max_connections` in total, with no per-client cap. A
+client that fills the proxy's cap does not stop the probes answering, but
+one that fills the `ca_server` cap does, so keep that port reachable only
+from the workloads that fetch the CA and from the probe. Refused
+`ca_server` connections are logged in roxy's own log, not the flow log.
+
 An empty policy is ready: it is a deny-all that someone applied, so a
 quarantined roxy stays in rotation and its refusals are audited. From a
 config file a policy is always applied at startup, so `no_policy` is only

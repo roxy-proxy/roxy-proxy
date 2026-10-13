@@ -332,6 +332,43 @@ async fn per_client_connection_cap() {
     h.stop().await;
 }
 
+/// The `ca_server` listener has its own connection cap, so a client that
+/// fills `max_connections` on the proxy port cannot starve the liveness
+/// probe into a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn health_answers_while_the_proxy_connection_cap_is_full() {
+    let h = Harness::start_with(Opts {
+        rules: ALLOW_UPSTREAM,
+        limits: "max_connections: 1",
+        ..Opts::default()
+    })
+    .await;
+    let port = h.upstream.http.port();
+    let mut held = TcpStream::connect(h.proxy).await.unwrap();
+    held.write_all(
+        format!(
+            "GET http://upstream.test:{port}/ok HTTP/1.1\r\nHost: upstream.test:{port}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut status_line = [0u8; 12];
+    held.read_exact(&mut status_line).await.unwrap();
+    assert_eq!(&status_line, b"HTTP/1.1 200");
+    let (out, eof) = raw(h.proxy, b"GET / HTTP/1.1\r\nHost: upstream.test\r\n\r\n").await;
+    assert!(eof && out.is_empty(), "the proxy cap is full: {out}");
+    let ev = h.wait_events("connection_refused", 1).await;
+    assert_eq!(ev[0]["reason"], "max_connections");
+
+    let ca = h.ca_server.unwrap();
+    let (out, eof) = raw(ca, b"GET /healthz HTTP/1.1\r\nHost: roxy\r\n\r\n").await;
+    assert!(eof);
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    drop(held);
+    h.stop().await;
+}
+
 const RATE_LIMITED: &str = r#"
   - id: burst
     when: host == "upstream.test" and metric.hits >= 3

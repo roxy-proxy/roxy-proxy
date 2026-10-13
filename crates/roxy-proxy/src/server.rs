@@ -150,6 +150,7 @@ pub(crate) struct Shared {
     /// snapshot's `max_buffered_bytes`.
     buffers: Arc<BufferBudget>,
     caps: Arc<ConnCaps>,
+    ca_caps: Arc<ConnCaps>,
     /// Stop accepting; idle connections end.
     pub stop: CancellationToken,
     /// Grace period over: drop everything.
@@ -491,6 +492,14 @@ impl Server {
                 max_per_client: cfg.max_connections_per_client.max(1),
                 state: Mutex::new((0, HashMap::new())),
             }),
+            // Counted apart from the proxy's connections, so a client filling
+            // `max_connections` cannot starve `/healthz` into a restart. No
+            // per-client cap: behind a load balancer every client is one IP.
+            ca_caps: Arc::new(ConnCaps {
+                max: cfg.max_connections.max(1),
+                max_per_client: cfg.max_connections.max(1),
+                state: Mutex::new((0, HashMap::new())),
+            }),
             stop: CancellationToken::new(),
             kill: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -635,9 +644,15 @@ async fn accept_loop(listener: Arc<dyn Listener>, shared: Arc<Shared>) {
     }
 }
 
-/// Acquires a connection slot for a CA-server connection.
+/// Acquires a proxy connection slot outside the accept loop (the testkit).
+#[cfg(test)]
 pub(crate) fn conn_slot(shared: &Shared, ip: IpAddr) -> Option<ConnSlot> {
     shared.caps.acquire(ip).ok()
+}
+
+/// Acquires a slot from the `ca_server` listener's own cap.
+pub(crate) fn ca_conn_slot(shared: &Shared, ip: IpAddr) -> Result<ConnSlot, &'static str> {
+    shared.ca_caps.acquire(ip)
 }
 
 #[cfg(test)]

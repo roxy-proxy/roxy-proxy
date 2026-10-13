@@ -279,9 +279,10 @@ pub struct Limits {
     /// the idle timeout of a relayed WebSocket.
     #[serde(with = "humantime_serde")]
     pub idle_timeout: Duration,
-    /// Global cap on concurrent client connections.
+    /// Cap on concurrent client connections to the proxy listeners. The
+    /// `ca_server` listener counts separately, with the same total.
     pub max_connections: usize,
-    /// Cap on concurrent connections from one client IP. Absent means
+    /// Cap on concurrent proxy connections from one client IP. Absent means
     /// `max_connections`, so it only bites when lowered: behind a load
     /// balancer every client arrives from one IP
     /// ([`Startup::per_client_cap`]).
