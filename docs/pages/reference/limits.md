@@ -171,7 +171,8 @@ single reservation.
   ([never evict](/design/threat-model#never-evict)).
 - The proxy port serves only proxy semantics and `roxy.internal`; health
   and CA download live on the separate `ca_server` listener, with a cap of
-  its own, so client sockets open at once are at most 2 × `max_connections`.
+  its own, so the two hold at most 2 × `max_connections` connection slots
+  between them.
 - A panic in a connection task closes that connection only.
 - On `SIGTERM` or Ctrl-C roxy stops accepting, drains exchanges in flight
   for up to 10 seconds, and flushes the flow log and capture before
