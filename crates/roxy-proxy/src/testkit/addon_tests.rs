@@ -2716,3 +2716,30 @@ async fn a_head_only_layer_stays_out_of_a_websockets_bytes() {
     let tags = strs(&ev["tags"]);
     assert!(tags.iter().any(|t| t == "via:a"), "{tags:?}");
 }
+
+/// A layer subscribed to one body of an upgrade is in that direction's
+/// byte path and out of the other's: the bytes it is not subscribed to
+/// flow past it while its handler lives on with the socket, relaying the
+/// body it is subscribed to (`x-keep-request`, as the SDK does).
+#[tokio::test]
+async fn a_layer_subscribed_to_one_body_is_in_one_direction_of_a_websocket() {
+    use crate::addons::Part;
+    for (request, response) in [(Part::Full, Part::Head), (Part::Head, Part::Full)] {
+        let kit = stack(&[AddonDef::test_layer("t").subscribe(request, response)]).await;
+        let (status, io) = kit
+            .websocket("/ws", &[("x-upper", "1"), ("x-keep-request", "1")])
+            .await;
+        assert_eq!(status, 101, "{request:?}/{response:?}");
+        let mut io = io.unwrap();
+        for msg in [&b"hello"[..], b"again"] {
+            assert_eq!(
+                echo(&mut io, msg).await,
+                msg.to_ascii_uppercase(),
+                "{request:?}/{response:?}"
+            );
+        }
+        drop(io);
+        kit.events("ws_close", 1).await;
+        no_layer_error(&kit);
+    }
+}
