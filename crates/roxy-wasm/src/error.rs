@@ -94,9 +94,8 @@ pub enum LayerError {
     /// A fresh instance could not be created.
     #[error("layer instantiation failed: {0}")]
     Instantiate(String),
-    /// Every instance was busy for as long as the caller would wait
-    /// ([`crate::SlotWait::Within`]).
-    #[error("no layer instance free within the wait")]
+    /// Every instance was busy for a whole `first_byte_timeout`.
+    #[error("no layer instance free within first_byte_timeout")]
     NoInstance,
     /// The exchange was abandoned by its caller (the request future or the
     /// response body was dropped before the layer finished).

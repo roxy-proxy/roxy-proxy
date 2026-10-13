@@ -75,13 +75,16 @@ apply, and each call is an `endpoint_call` flow event.
 ### `limits`
 
 Limits catch a broken layer, not a slow one: a slow layer makes its
-exchanges slow, never denied. Each is optional.
+exchanges slow, not denied, with one exception. Exchanges that keep every
+instance busy past `first_byte_timeout` cost the exchanges queued behind
+them, which are denied rather than wait (`max_instances` below). Each is
+optional.
 
 | key | kind | default | what it bounds |
 |---|---|---|---|
-| `first_byte_timeout` | both | `30s` | how long a layer may hold a head, request or response, before passing it on or answering: its own time only (starting an instance, its work, endpoint calls, reading the body it was given), never time `next` spends below it. Overrun fails closed, `budget:first_byte_timeout`. A service layer gets one budget to obtain a stream and a fresh one from each head. It bounds the layer's own time, not the exchange's: a layer that forwards a head and holds back the body keeps the upstream waiting for as long as it likes, with no clock running ([service layers](/reference/service-layers#semantics)). An observer that gets no instance within it loses its copy (`observer_lagged`, `no_instance`) |
+| `first_byte_timeout` | both | `30s` | how long a layer may hold a head, request or response, before passing it on or answering: its own time only (starting an instance, its work, endpoint calls, reading the body it was given), never time `next` spends below it. Overrun fails closed, `budget:first_byte_timeout`. A service layer gets one budget to obtain a stream and a fresh one from each head. It bounds the layer's own time, not the exchange's: a layer that forwards a head and holds back the body keeps the upstream waiting for as long as it likes, with no clock running ([service layers](/reference/service-layers#semantics)). It also bounds the wait for an instance when all `max_instances` are busy, on its own: an enforce exchange that gets none within it is denied (`layer_error`, `no_instance`); an observer loses its copy (`observer_lagged`, `no_instance`) |
 | `max_memory` | wasm | `64mb` | linear memory per instance, summed over the instance's memories; table growth and the host resource table (4096 live resources: body streams, pollables, pending responses) are capped too. What a layer holds of a body lives here. An interpreter in WASM (Python) needs 128–256 MiB |
-| `max_instances` | wasm | `1024` | live instances, so concurrent exchanges and, with `max_memory`, the layer's memory. An enforce exchange that finds none free waits without a deadline; an observer waits `first_byte_timeout`. Instances start on demand |
+| `max_instances` | wasm | `1024` | live instances, so concurrent exchanges and, with `max_memory`, the layer's memory. An exchange that finds none free waits `first_byte_timeout` for one, then fails closed (`no_instance`), so the clients holding every instance cannot queue the rest indefinitely. Instances start on demand |
 | `recycle_after_exchanges` | wasm | `10000` | an instance is replaced after this many exchanges; `0` replaces it after every exchange |
 | `recycle_above_memory` | wasm | three quarters of `max_memory` | an instance whose memory passed this is replaced after its exchange. At most `max_memory` |
 | `max_connections` | service | `4` | WebSocket connections to the endpoint |

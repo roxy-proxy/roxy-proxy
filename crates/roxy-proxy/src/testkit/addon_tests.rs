@@ -2025,6 +2025,47 @@ async fn a_client_giving_up_frees_the_instance() {
     assert_eq!(a.status, 200, "{a:?}");
 }
 
+/// A client holding every instance cannot starve the layer: an exchange
+/// that gets no instance within `first_byte_timeout` is denied,
+/// `layer_error` kind `no_instance`, rather than queued for as long as the
+/// holder likes.
+#[tokio::test]
+async fn an_exchange_without_an_instance_is_denied_within_the_bound() {
+    use http_body_util::BodyExt as _;
+    let kit = one(AddonDef::test_layer("t").limits(|l| {
+        l.max_instances = 1;
+        l.first_byte_timeout = std::time::Duration::from_millis(300);
+    }))
+    .await;
+    // The only instance relays a response that drips for a minute.
+    let mut c = kit.h1().await;
+    let req = c
+        .request("GET", "/drip?n=1000&ms=50", &[])
+        .body(roxy_http::Body::empty())
+        .unwrap();
+    let mut res = c.send(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(res.body_mut().frame().await.unwrap().is_ok());
+
+    let a = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        kit.h1().await.call("GET", "/starved", &[], b""),
+    )
+    .await
+    .expect("the exchange waited past the bound");
+    assert_eq!(a.status, 503, "{a:?}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["layer"], "t", "{errs:#?}");
+    assert_eq!(errs[0]["kind"], "no_instance");
+    assert_eq!(errs[0]["mode"], "enforce");
+    assert!(
+        !kit.upstream.seen().iter().any(|r| r.path == "/starved"),
+        "a denied exchange reached the upstream"
+    );
+    c.kill();
+    drop(res);
+}
+
 /// An observer that overruns its head deadline is logged, and the real
 /// exchange goes through.
 #[tokio::test]
