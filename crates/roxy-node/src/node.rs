@@ -1403,15 +1403,38 @@ mod tests {
         let spool = node.spool().clone();
         let task = tokio::spawn(node.clone().run());
         h.mock.wait_for(LEASE, 1).await;
+        // A server that echoes the credential back, in a plain body and in
+        // an error message the node logs by field.
+        let first = h.mock.tokens_for("n1")[0].clone();
+        h.mock.push(
+            LEASE,
+            Reply::Status {
+                status: 400,
+                headers: vec![],
+                body: format!("no lease for {first}").into_bytes(),
+            },
+        );
+        h.mock.push(
+            LEASE,
+            Reply::json(
+                426,
+                &crate::protocol::ErrorBody {
+                    error: "unsupported".into(),
+                    message: format!("{first} is too old"),
+                    missing: vec![format!("roxy_version:{first}")],
+                },
+            ),
+        );
         spool.push(b"{\"event\":\"request\"}");
         h.mock.wait_for(RENEW, 3).await;
-        h.mock.wait_for(LEASE, 4).await;
+        h.mock.wait_for(LEASE, 6).await;
         h.mock.wait_for(FLOWS, 2).await;
         task.abort();
         let _ = task.await;
         let text = logs.text();
         assert!(text.contains("enrolled with the control plane"), "{text}");
         assert!(text.contains("node token renewed"), "{text}");
+        assert!(text.contains("[redacted] is too old"), "{text}");
         let tokens = h.mock.tokens_for("n1");
         assert_eq!(tokens.len(), 2);
         for token in tokens.iter().chain([&"tok-1".to_owned()]) {

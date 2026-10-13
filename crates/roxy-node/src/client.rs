@@ -40,10 +40,27 @@ pub enum ClientError {
 pub struct Transient(String);
 
 impl Transient {
-    fn status(status: StatusCode, body: &[u8]) -> Self {
-        let text = String::from_utf8_lossy(&body[..body.len().min(200)]);
-        Self(format!("{status}: {}", text.trim()))
+    fn status(status: StatusCode, body: &[u8], secrets: &[&str]) -> Self {
+        Self(format!("{status}: {}", excerpt(body, secrets)))
     }
+}
+
+/// Up to 200 characters of a response body with every credential the
+/// request carried replaced, so an error that quotes a body echoing the
+/// token cannot put it in the log. Replaced before the cut, so a prefix
+/// of a token cannot survive it either.
+fn excerpt(body: &[u8], secrets: &[&str]) -> String {
+    let text = redact(&String::from_utf8_lossy(body), secrets);
+    let cut = text.char_indices().nth(200).map_or(text.len(), |(i, _)| i);
+    text[..cut].trim().to_owned()
+}
+
+fn redact(text: &str, secrets: &[&str]) -> String {
+    let mut out = text.to_owned();
+    for secret in secrets.iter().filter(|s| !s.is_empty()) {
+        out = out.replace(secret, "[redacted]");
+    }
+    out
 }
 
 /// What a lease fetch came back with.
@@ -118,8 +135,11 @@ pub struct ControlPlane {
     base: Url,
     http: reqwest::Client,
     info: NodeInfo,
-    /// The node token; `None` before enrolment.
-    token: Option<String>,
+    /// Every node token this client has held, the last one active; empty
+    /// before enrolment. Earlier ones stay because the server still accepts
+    /// them until they expire, so a response that echoes one is redacted
+    /// too.
+    tokens: Vec<String>,
 }
 
 /// Never prints the token.
@@ -128,7 +148,7 @@ impl std::fmt::Debug for ControlPlane {
         f.debug_struct("ControlPlane")
             .field("base", &self.base.as_str())
             .field("info", &self.info)
-            .field("has_token", &self.token.is_some())
+            .field("has_token", &!self.tokens.is_empty())
             .finish_non_exhaustive()
     }
 }
@@ -173,21 +193,26 @@ impl ControlPlane {
                 .build()
                 .map_err(|e| ClientError::Build(e.to_string()))?,
             info,
-            token: None,
+            tokens: Vec::new(),
         })
     }
 
     /// The same client presenting `token` as the node token.
     #[must_use]
     pub fn with_token(&self, token: &str) -> Self {
-        Self {
-            token: Some(token.to_owned()),
-            ..self.clone()
-        }
+        let mut next = self.clone();
+        next.tokens.push(token.to_owned());
+        next
     }
 
     pub fn info(&self) -> &NodeInfo {
         &self.info
+    }
+
+    /// The credentials to redact from anything a response says: every
+    /// token the server may still recognise.
+    fn secrets(&self) -> Vec<&str> {
+        self.tokens.iter().map(String::as_str).collect()
     }
 
     fn endpoint(&self, name: &str) -> Url {
@@ -200,7 +225,7 @@ impl ControlPlane {
     /// A request under the node token.
     fn authenticated(&self, name: &str) -> reqwest::RequestBuilder {
         let req = self.http.post(self.endpoint(name));
-        match &self.token {
+        match self.tokens.last() {
             Some(token) => req.bearer_auth(token),
             None => req,
         }
@@ -216,13 +241,14 @@ impl ControlPlane {
 
     /// `POST /enrol` with the bootstrap token.
     pub async fn enrol(&self, token: &str) -> Result<EnrolResponse, EnrolError> {
+        let token = token.trim();
         let req = self
             .http
             .post(self.endpoint("enrol"))
-            .bearer_auth(token.trim())
+            .bearer_auth(token)
             .header(CONTENT_TYPE, "application/json")
             .body(self.enrol_request());
-        Self::enrol_call(req).await
+        Self::enrol_call(req, &[token]).await
     }
 
     /// `POST /renew` under the current node token.
@@ -231,10 +257,13 @@ impl ControlPlane {
             .authenticated("renew")
             .header(CONTENT_TYPE, "application/json")
             .body(self.enrol_request());
-        Self::enrol_call(req).await
+        Self::enrol_call(req, &self.secrets()).await
     }
 
-    async fn enrol_call(req: reqwest::RequestBuilder) -> Result<EnrolResponse, EnrolError> {
+    async fn enrol_call(
+        req: reqwest::RequestBuilder,
+        secrets: &[&str],
+    ) -> Result<EnrolResponse, EnrolError> {
         let (status, body) = send(req).await.map_err(EnrolError::Failed)?;
         if status.is_success() {
             let res: EnrolResponse = serde_json::from_slice(&body)
@@ -247,12 +276,16 @@ impl ControlPlane {
         }
         match status {
             StatusCode::GONE => Err(EnrolError::Revoked),
-            StatusCode::UPGRADE_REQUIRED => Err(EnrolError::Unsupported(error_body(&body))),
-            s if s.is_client_error() => {
-                let text = String::from_utf8_lossy(&body[..body.len().min(200)]);
-                Err(EnrolError::Rejected(format!("{status}: {}", text.trim())))
+            StatusCode::UPGRADE_REQUIRED => {
+                Err(EnrolError::Unsupported(error_body(&body, secrets)))
             }
-            _ => Err(EnrolError::Failed(Transient::status(status, &body))),
+            s if s.is_client_error() => Err(EnrolError::Rejected(format!(
+                "{status}: {}",
+                excerpt(&body, secrets)
+            ))),
+            _ => Err(EnrolError::Failed(Transient::status(
+                status, &body, secrets,
+            ))),
         }
     }
 
@@ -266,16 +299,17 @@ impl ControlPlane {
             Ok(r) => r,
             Err(e) => return LeaseFetch::Failed(e),
         };
+        let secrets = self.secrets();
         match status {
             StatusCode::OK => match serde_json::from_slice::<Lease>(&body) {
                 Ok(lease) => LeaseFetch::Lease(Box::new(lease)),
                 Err(e) => LeaseFetch::Failed(Transient(format!("lease body: {e}"))),
             },
             StatusCode::GONE => LeaseFetch::Revoked,
-            StatusCode::UPGRADE_REQUIRED => LeaseFetch::Unsupported(error_body(&body)),
+            StatusCode::UPGRADE_REQUIRED => LeaseFetch::Unsupported(error_body(&body, &secrets)),
             StatusCode::UNAUTHORIZED => LeaseFetch::Unauthorized,
-            s if s.is_client_error() => LeaseFetch::Rejected(Transient::status(s, &body)),
-            other => LeaseFetch::Failed(Transient::status(other, &body)),
+            s if s.is_client_error() => LeaseFetch::Rejected(Transient::status(s, &body, &secrets)),
+            other => LeaseFetch::Failed(Transient::status(other, &body, &secrets)),
         }
     }
 
@@ -298,6 +332,7 @@ impl ControlPlane {
             Ok(r) => r,
             Err(e) => return ShipOutcome::Failed(e),
         };
+        let secrets = self.secrets();
         match status {
             StatusCode::OK => match serde_json::from_slice::<FlowAck>(&body) {
                 Ok(ack) => ShipOutcome::Acked(ack),
@@ -311,23 +346,27 @@ impl ControlPlane {
                 && s != StatusCode::PAYLOAD_TOO_LARGE
                 && s != StatusCode::UNAUTHORIZED =>
             {
-                ShipOutcome::Rejected(Transient::status(s, &body))
+                ShipOutcome::Rejected(Transient::status(s, &body, &secrets))
             }
-            other => ShipOutcome::Failed(Transient::status(other, &body)),
+            other => ShipOutcome::Failed(Transient::status(other, &body, &secrets)),
         }
     }
 }
 
 /// The error body of a non-2xx response, or a stand-in built from the
-/// raw text when it is not one.
-fn error_body(body: &[u8]) -> ErrorBody {
-    serde_json::from_slice(body).unwrap_or_else(|_| ErrorBody {
+/// raw text when it is not one. Its strings are logged, so `secrets` are
+/// replaced in them as in any other excerpt.
+fn error_body(body: &[u8], secrets: &[&str]) -> ErrorBody {
+    let parsed: ErrorBody = serde_json::from_slice(body).unwrap_or_else(|_| ErrorBody {
         error: "unknown".into(),
-        message: String::from_utf8_lossy(&body[..body.len().min(200)])
-            .trim()
-            .to_owned(),
+        message: excerpt(body, secrets),
         missing: Vec::new(),
-    })
+    });
+    ErrorBody {
+        error: redact(&parsed.error, secrets),
+        message: redact(&parsed.message, secrets),
+        missing: parsed.missing.iter().map(|m| redact(m, secrets)).collect(),
+    }
 }
 
 async fn send(req: reqwest::RequestBuilder) -> Result<(StatusCode, Vec<u8>), Transient> {
@@ -536,6 +575,69 @@ pub(crate) mod tests {
                 "{body}"
             );
         }
+    }
+
+    /// A server that echoes the credential it was shown, in a body or an
+    /// error message, does not get it into the node's diagnostics.
+    #[tokio::test]
+    async fn response_diagnostics_never_quote_a_token() {
+        let mock = MockServer::start().await;
+        let anon = anon(&mock);
+        let boot = "boot-7f3a9c";
+        mock.push(
+            "/roxy/v1/enrol",
+            Reply::Status {
+                status: 401,
+                headers: vec![],
+                body: format!(
+                    "{{\"error\":\"invalid_token\",\"message\":\"{boot} is not a token\"}}"
+                )
+                .into_bytes(),
+            },
+        );
+        let err = anon.enrol(boot).await.unwrap_err().to_string();
+        assert!(!err.contains(boot), "{err}");
+        assert!(err.contains("[redacted] is not a token"), "{err}");
+
+        let (cp, res) = enrolled(&mock).await;
+        let token = res.token.as_str();
+        let echo = |status: u16, text: &str| Reply::Status {
+            status,
+            headers: vec![],
+            body: text.replace("TOKEN", token).into_bytes(),
+        };
+        mock.push("/roxy/v1/lease", echo(400, "no lease for TOKEN"));
+        let LeaseFetch::Rejected(e) = cp.fetch_lease(&state()).await else {
+            panic!("400 is a rejection");
+        };
+        assert!(!e.to_string().contains(token), "{e}");
+        mock.push(
+            "/roxy/v1/lease",
+            echo(
+                426,
+                r#"{"error":"unsupported","message":"TOKEN too old","missing":["roxy_version:TOKEN"]}"#,
+            ),
+        );
+        let LeaseFetch::Unsupported(e) = cp.fetch_lease(&state()).await else {
+            panic!("426 is unsupported");
+        };
+        assert!(!format!("{e:?}").contains(token), "{e:?}");
+        assert_eq!(e.message, "[redacted] too old");
+        mock.push("/roxy/v1/lease", echo(503, "TOKEN"));
+        let LeaseFetch::Failed(e) = cp.fetch_lease(&state()).await else {
+            panic!("503 is a failure");
+        };
+        assert!(!e.to_string().contains(token), "{e}");
+        // A body long enough to be cut still loses the whole token.
+        let padded = format!("{}TOKEN{}", "x".repeat(190), "y".repeat(300));
+        mock.push("/roxy/v1/renew", echo(400, &padded));
+        let err = cp.renew().await.unwrap_err().to_string();
+        assert!(!err.contains(&token[..8]), "{err}");
+        mock.push("/roxy/v1/flows", echo(400, "batch for TOKEN"));
+        let ShipOutcome::Rejected(e) = cp.ship_flows(b"{}").await else {
+            panic!("400 is a rejection");
+        };
+        assert!(!e.to_string().contains(token), "{e}");
     }
 
     #[tokio::test]

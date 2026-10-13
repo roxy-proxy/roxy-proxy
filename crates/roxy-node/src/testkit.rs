@@ -289,7 +289,8 @@ fn authenticate(script: &Script, headers: &HeaderMap) -> Option<String> {
 
 fn random_token() -> String {
     let mut bytes = [0u8; 24];
-    let _ = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes);
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes)
+        .expect("system randomness");
     let mut out = String::with_capacity(4 + 48);
     out.push_str("nt1-");
     for b in bytes {
