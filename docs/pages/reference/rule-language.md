@@ -90,7 +90,8 @@ is therefore fragile: `/a/..%2Fsecret` does not start with `/secret`, yet an
 upstream that decodes `%2F` first serves `/a/../secret`. An `allow` keyed on
 a prefix has the same gap. Allow exact paths, or a prefix together with a
 guard against the forms the upstream reinterprets (`not path contains "%2F"`,
-`"//"`, `";"`), and treat a path `deny` as defence in depth
+likewise `"%5C"`, `"//"` and `";"`; hex is upper-cased before matching, so
+one case suffices), and treat a path `deny` as defence in depth
 ([URL normalisation](/reference/http#url-normalisation)).
 
 ### Missing values (`null`)
