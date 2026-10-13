@@ -60,8 +60,8 @@ metrics:
 
 ### Key cardinality
 
-`host`, `path`, `url`, `query.raw` and `client.port` are chosen by the
-client per request, and denied flows count, so a metric keyed on one with
+`host`, `path`, `url` and `query.raw` are chosen by the client per
+request, and denied flows count, so a metric keyed on one with
 no `where` fills with as many series as the client sends, without one
 request being allowed; then every flow needing a new series is denied
 (`metric_table_full`) until series expire. Bound the key with a finite
@@ -76,13 +76,12 @@ metrics:
     window: 1m
 ```
 
-`client.ip` and `client.peer_ip` are bounded by who can reach the proxy;
-behind a load balancer, `client.ip` is each client's own address only with
-the listener's `forwarded_for`
+`client.ip` is bounded by who can reach the proxy; behind a load balancer
+it is each client's own address only with the listener's `forwarded_for`
 ([HTTP](/reference/http#clients-behind-a-load-balancer)). `roxy check` warns when a
-metric keys on any of the five fields above with no `where`. `host under
+metric keys on any of the four fields above with no `where`. `host under
 "github.com"` does not bound `host`: subdomains are client-chosen too. For
-`path`, `url`, `query.raw` and `client.port` a `where` on `host` limits
+`path`, `url` and `query.raw` a `where` on `host` limits
 whose values count, not how many; give such a metric a `where` that
 enumerates the values it keys on, or its own `max_keys` so filling it
 refuses new series in that metric alone. `unique(..)` fields are not keys:

@@ -7,7 +7,7 @@ produces a `request` event:
 
 ```json
 {"ts":"2026-10-03T10:12:00.123Z","event":"request","flow":"01J9…","conn":"01J9…",
- "listener":"proxy","client":{"ip":"10.0.0.7","port":51234,"peer_ip":"10.0.0.7"},
+ "listener":"proxy","client":{"ip":"10.0.0.7","peer":{"ip":"10.0.0.7","port":51234}},
  "tls":{"sni":"api.github.com","alpn":"h2","version":"1.3"},
  "req":{"method":"POST","host":"api.github.com","port":443,"path":"/repos/x/y/issues",
         "query":null,"headers_bytes":812,"body_bytes":1032,
@@ -23,7 +23,7 @@ produces a `request` event:
 
 | field | meaning |
 |---|---|
-| `client.ip`, `client.peer_ip`, `client.port` | the client as the rules see it, the TCP peer, and the peer's port. They differ only on a listener with `forwarded_for`, where `ip` is read from `X-Forwarded-For` ([HTTP](/reference/http#clients-behind-a-load-balancer)); an event with no request behind it (`parse_error`, `connect`, `connection_refused`) has the peer as `ip` |
+| `client.ip`, `client.peer` | the client as the rules see it, and the TCP peer (`ip`, `port`) the request arrived from. They differ only on a listener with `forwarded_for`, where `client.ip` is read from `X-Forwarded-For` ([HTTP](/reference/http#clients-behind-a-load-balancer)); an event with no request behind it (`parse_error`, `connect`, `connection_refused`) has the peer as `client.ip` |
 | `req.body_bytes`, `res.body_bytes` | body bytes roxy forwarded in each direction |
 | `req.body_sha256`, `res.body_sha256` | lower-case hex SHA-256 of those bytes, only for the sides an admission rule's `digest` action selected ([actions](/reference/rule-language#actions)); present once the body completed, absent if the exchange ended first (a cut body, an in-flight stop, a client that left). An empty body has the empty-string digest; a relayed WebSocket has counts but no digests. Hashing is opt-in because a digest nobody compares against is wasted work: software SHA-256 costs about one core per 400 MB/s on CPUs without SHA-NI |
 | `timing.upstream_connect_ms` | how long opening the upstream connection took (DNS, TCP and TLS); `null` when the request reused a pooled connection, or none was opened |

@@ -27,7 +27,6 @@ fn flow() -> MapView {
         .with_str(Field::Url, "https://api.github.com/repos/a/b/issues?page=2")
         .with_str(Field::QueryRaw, "page=2")
         .with(Field::ClientIp, ip("10.1.2.3"))
-        .with_int(Field::ClientPort, 50_000)
         .with_str(Field::ListenerName, "proxy")
         .with_str(Field::TlsSni, "api.github.com")
         .with_str(Field::TlsVersion, "1.3")
@@ -1257,7 +1256,7 @@ fn a_value_of_the_wrong_type_fails_closed() {
         .with(Field::Host, Value::Int(7))
         .with(Field::ClientIp, Value::str("10.0.0.1"))
         .with(Field::Path, Value::Bool(true))
-        .with(Field::ClientPort, Value::Ip("::1".parse().unwrap()));
+        .with(Field::Port, Value::Ip("::1".parse().unwrap()));
     for (expr, field, expected, found) in [
         ("body.size > 10mb", "body.size", Type::Int, Type::Str),
         ("body.size == 10", "body.size", Type::Int, Type::Str),
@@ -1269,7 +1268,7 @@ fn a_value_of_the_wrong_type_fails_closed() {
         ("client.ip in @internal", "client.ip", Type::Ip, Type::Str),
         ("path contains \"a\"", "path", Type::Str, Type::Bool),
         ("path matches \".*\"", "path", Type::Str, Type::Bool),
-        ("client.port < 1024", "client.port", Type::Int, Type::Ip),
+        ("port < 1024", "port", Type::Int, Type::Ip),
     ] {
         let p = compile(
             "",

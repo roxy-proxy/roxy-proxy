@@ -47,7 +47,8 @@ use crate::budget::{self, BufferLease, Exhausted};
 use crate::capture::Tap;
 use crate::exchange::{WriteFailure, emit_response_error};
 use crate::flowlog::{
-    ClientInfo, DecisionKind, DstInfo, FlowEvent, RequestInfo, ResponseInfo, Stage, Timing, TlsInfo,
+    ClientInfo, DecisionKind, DstInfo, FlowEvent, PeerInfo, RequestInfo, ResponseInfo, Stage,
+    Timing, TlsInfo,
 };
 use crate::in_flight::InFlight;
 use crate::io::ClientIo;
@@ -607,8 +608,10 @@ pub(crate) fn client_info(c: &ClientConn) -> ClientInfo {
 fn client_info_as(c: &ClientConn, ip: IpAddr) -> ClientInfo {
     ClientInfo {
         ip,
-        port: c.peer.port(),
-        peer_ip: c.peer.ip(),
+        peer: PeerInfo {
+            ip: c.peer.ip(),
+            port: c.peer.port(),
+        },
     }
 }
 

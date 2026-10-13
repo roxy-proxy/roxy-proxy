@@ -325,8 +325,8 @@ fn client_chosen_key_without_where_warns() {
 - { id: c, count: unique(url) }
 - { id: d, count: requests, key: [path], where: 'host under \"example.com\"' }
 - { id: e, count: unique(query.raw), key: [client.ip] }
-- { id: f, count: requests, key: [client.ip, client.port] }
-- { id: g, count: requests, key: [host, client.port], where: 'host in [\"example.com\"]' }",
+- { id: f, count: requests, key: [client.ip, url] }
+- { id: g, count: requests, key: [host, path], where: 'host in [\"example.com\"]' }",
     )
     .unwrap();
     let warnings = Policy::metric_warnings(&metrics);
@@ -339,7 +339,7 @@ fn client_chosen_key_without_where_warns() {
         [
             "metrics[0].key[0]: `host` is chosen by the client",
             "metrics[1].key[1]: `path` is chosen by the client",
-            "metrics[5].key[1]: `client.port` is chosen by the client",
+            "metrics[5].key[1]: `url` is chosen by the client",
         ]
     );
     // `under` admits every subdomain, so the host advice must name a finite

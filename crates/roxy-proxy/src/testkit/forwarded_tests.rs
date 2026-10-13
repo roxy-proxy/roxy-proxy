@@ -8,14 +8,13 @@ use super::{Answer, Client, Kit};
 /// it plays the load balancer.
 const LB: &str = "192.0.2.7";
 
-/// Denies one client by its resolved address, and allows `up.test` only
-/// for connections that came through the load balancer.
+/// Denies one client by its resolved address.
 const RULES: &str = r#"
 - id: banned
   when: client.ip == 198.51.100.1
   then: deny
 - id: up
-  when: host == "up.test" and client.peer_ip == 192.0.2.7
+  when: host == "up.test"
   then: allow
 "#;
 
@@ -50,10 +49,10 @@ async fn the_client_is_the_trusted_hop_resolved_per_request() {
 
     let ev = kit.events("request", 2).await;
     assert_eq!(ev[0]["client"]["ip"], "203.0.113.9", "{:#}", ev[0]);
-    assert_eq!(ev[0]["client"]["peer_ip"], LB);
-    assert_eq!(ev[0]["client"]["port"], 40000);
+    assert_eq!(ev[0]["client"]["peer"]["ip"], LB);
+    assert_eq!(ev[0]["client"]["peer"]["port"], 40000);
     assert_eq!(ev[1]["client"]["ip"], "198.51.100.1", "{:#}", ev[1]);
-    assert_eq!(ev[1]["client"]["peer_ip"], LB);
+    assert_eq!(ev[1]["client"]["peer"]["ip"], LB);
 }
 
 /// Two trusted hops: the client is the second entry from the right, with
@@ -110,7 +109,7 @@ async fn a_header_that_does_not_name_the_client_is_refused() {
     for e in &ev {
         assert_eq!(e["reason"], "forwarded_for_invalid", "{e:#}");
         assert_eq!(e["client"]["ip"], LB, "{e:#}");
-        assert_eq!(e["client"]["peer_ip"], LB, "{e:#}");
+        assert_eq!(e["client"]["peer"]["ip"], LB, "{e:#}");
     }
     assert!(kit.upstream.seen().is_empty());
     assert!(
@@ -158,5 +157,5 @@ async fn without_forwarded_for_the_header_is_ignored() {
     assert_eq!(seen[0].headers["x-forwarded-for"], "198.51.100.1");
     let ev = kit.request_event().await;
     assert_eq!(ev["client"]["ip"], LB, "{ev:#}");
-    assert_eq!(ev["client"]["peer_ip"], LB);
+    assert_eq!(ev["client"]["peer"]["ip"], LB);
 }

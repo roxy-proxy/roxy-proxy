@@ -263,8 +263,6 @@ impl FlowView for ProxyView<'_> {
         let tls = fa.tls.as_ref();
         match f {
             Field::ClientIp => Value::Ip(fa.client_ip),
-            Field::ClientPeerIp => Value::Ip(fa.client.peer.ip()),
-            Field::ClientPort => Value::Int(i64::from(fa.client.peer.port())),
             Field::ListenerName => Value::Str(Cow::Borrowed(&fa.client.listener.name)),
             Field::TlsSni => s(tls.and_then(|t| t.sni.as_ref())),
             Field::TlsAlpn => s(tls.and_then(|t| t.alpn.as_ref())),

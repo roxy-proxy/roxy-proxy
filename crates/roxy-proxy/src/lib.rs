@@ -68,8 +68,8 @@ pub use config::{HttpBehaviour, ListenerSpec, PolicyUpdate, RuntimeConfig};
 pub use conn::INTERNAL_HOST;
 pub use flowlog::{
     BufferedSink, ClientInfo, DEFAULT_REDACTED_HEADERS, DecisionKind, DstInfo, FileSink, FlowEvent,
-    FlowSink, MemorySink, MultiSink, REDACTED, Redactor, RequestInfo, ResponseInfo, Stage,
-    StdoutSink, Timing, TlsInfo,
+    FlowSink, MemorySink, MultiSink, PeerInfo, REDACTED, Redactor, RequestInfo, ResponseInfo,
+    Stage, StdoutSink, Timing, TlsInfo,
 };
 pub use listener::{
     ClientConn, ForwardedFor, Listener, ListenerInfo, ListenerMode, TcpProxyListener,

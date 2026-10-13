@@ -65,7 +65,7 @@ request is forwarded; a rule reading one is re-checked in flight
 
 | field | type | known |
 |---|---|---|
-| `client.ip`, `client.peer_ip`, `client.port` | ip, ip, int | admission |
+| `client.ip` | ip | admission |
 | `listener.name` | string | admission |
 | `tls.sni`, `tls.alpn`, `tls.version` | string | admission |
 | `method`, `scheme`, `host`, `port`, `path`, `url` | string / int | admission |
@@ -82,12 +82,10 @@ request is forwarded; a rule reading one is re-checked in flight
 | `response.body.bytes` | int: response body bytes so far | in-flight |
 | `ws.direction`, `ws.opcode`, `ws.size`, `ws.text` | string, int, int, string: the WebSocket message being checked | in-flight, per message ([WebSockets](/reference/websockets#message-rules)) |
 
-`client.ip` is the TCP peer, or on a listener with `forwarded_for` the
-client that `X-Forwarded-For` names at the trusted hop
-([HTTP](/reference/http#clients-behind-a-load-balancer)). `client.peer_ip`
-is always the peer, so a rule can require that the connection came through
-the load balancer (`client.peer_ip in @lb`); `client.port` is the peer's
-port. `path` is normalised ([HTTP](/reference/http#url-normalisation)). `host`
+`client.ip` is the client as roxy establishes it: the TCP peer, or on a
+listener with `forwarded_for` the client `X-Forwarded-For` names at the
+trusted hop ([HTTP](/reference/http#clients-behind-a-load-balancer)).
+`path` is normalised ([HTTP](/reference/http#url-normalisation)). `host`
 and `tls.sni` are the name as roxy delivers it: lower-case, without a
 trailing dot, internationalised labels in A-label (`xn--`) form, and an IP
 literal as the bare address (`10.0.0.1`, `::1`; never `[::1]`), with an

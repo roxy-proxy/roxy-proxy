@@ -37,7 +37,7 @@ const STR_FIELDS: &[&str] = &[
     "state[\"k\"]",
     "body.text",
 ];
-const INT_FIELDS: &[&str] = &["port", "client.port", "body.size", "metric.m0", "metric.m1"];
+const INT_FIELDS: &[&str] = &["port", "body.size", "metric.m0", "metric.m1"];
 const STR_OPS: &[&str] = &[
     "==",
     "!=",

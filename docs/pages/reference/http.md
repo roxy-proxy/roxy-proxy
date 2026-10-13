@@ -73,9 +73,9 @@ from the right of the header (every `X-Forwarded-For` line joined in
 order). Entries to its left are the client's own and are never read.
 
 - That address is `client.ip` in rules, metric keys and the flow log, and
-  the addon principal's `client_ip`. The peer stays `client.peer_ip`, so a
-  rule can require the connection came from the load balancer
-  (`client.peer_ip in @lb`); `client.port` is the peer's.
+  the addon principal's `client_ip`: roxy has one notion of the client.
+  The flow log keeps the TCP peer as `client.peer` for forensics
+  ([flow log](/reference/flow-log#flow-log)).
 - Each request is resolved on its own: a kept-alive connection from a load
   balancer carries many clients.
 - A request with fewer entries than hops, a trusted entry that is not a
