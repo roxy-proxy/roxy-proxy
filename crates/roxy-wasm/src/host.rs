@@ -177,8 +177,8 @@ pub trait LayerHost: Send + Sync + 'static {
     async fn state_get(&self, key: String) -> Result<Option<String>, HostError>;
 
     /// Write the state store (capability `state`). `Ok(Err(msg))` is a
-    /// refusal the guest sees (store full, key or value too long); `Err`
-    /// fails the exchange closed.
+    /// refusal of what the guest passed (key or value too long); `Err`
+    /// fails the exchange closed (a full store, an observer writing).
     async fn state_put(
         &self,
         key: String,

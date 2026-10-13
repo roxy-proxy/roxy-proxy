@@ -171,8 +171,10 @@ interface flow {
   /// rules' `state[..]` and `set_state` use. A miss is `none`.
   state-get: func(key: string) -> option<string>;
   /// Write a key of the state store (capability `state`), for `ttl-ms` or
-  /// the store's default. Fails with a message when the store is full or
-  /// the key or value is too long; nothing is evicted.
+  /// the store's default. Fails with a message when the key or value is
+  /// too long. A full store fails the exchange, as it does a rule's
+  /// `set_state`; nothing is evicted. Only an enforce layer may write:
+  /// from an observer it fails the exchange.
   state-put: func(key: string, value: string, ttl-ms: option<u64>) -> result<_, string>;
   /// Read a metric (capability `metrics`) for this flow's own key, the
   /// metric's key fields evaluated on the request that left the stack. The

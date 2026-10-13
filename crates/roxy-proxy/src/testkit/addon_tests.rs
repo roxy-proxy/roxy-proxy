@@ -1877,6 +1877,24 @@ async fn one(def: AddonDef) -> Kit {
 #[derive(Default)]
 struct MemState(std::sync::Mutex<std::collections::HashMap<String, String>>);
 
+/// A state store with no room for a new key.
+struct FullState;
+
+impl crate::sources::StateSource for FullState {
+    fn get(&self, _key: &str) -> Option<String> {
+        None
+    }
+
+    fn set(
+        &self,
+        _key: &str,
+        _value: &str,
+        _ttl: Option<std::time::Duration>,
+    ) -> Result<(), crate::sources::StateFull> {
+        Err(crate::sources::StateFull)
+    }
+}
+
 impl crate::sources::StateSource for MemState {
     fn get(&self, key: &str) -> Option<String> {
         self.0.lock().unwrap().get(key).cloned()
@@ -2232,7 +2250,7 @@ async fn records_and_state_reach_the_flow_log() {
     assert_eq!(r[0]["data"]["score"], 0.9);
 
     let a = cap(&kit, "state").await;
-    assert_eq!(a.text(), "Ok(()) Some(\"{\\\"n\\\":1}\")", "{a:?}");
+    assert_eq!(a.text(), "Ok(()) Some(\"from-layer\")", "{a:?}");
 
     let a = cap(&kit, "metric").await;
     assert_eq!(a.status, 503, "{a:?}");
@@ -2252,8 +2270,7 @@ async fn layer_state_is_the_rules_state() {
         .rules(
             r#"
 - id: marked
-  when: >-
-    state["k"] == "{\"n\":1}"
+  when: state["k"] == "from-layer"
   then: deny
 - id: mark
   when: path == "/mark"
@@ -2269,7 +2286,7 @@ async fn layer_state_is_the_rules_state() {
     assert_eq!(a.status, 200, "{a:?}");
 
     let a = cap(&kit, "state").await;
-    assert_eq!(a.text(), "Ok(()) Some(\"{\\\"n\\\":1}\")", "{a:?}");
+    assert_eq!(a.text(), "Ok(()) Some(\"from-layer\")", "{a:?}");
 
     let a = kit.h1().await.call("GET", "/after", &[], b"").await;
     assert_eq!(a.status, 403, "{a:?}");
@@ -2309,6 +2326,56 @@ async fn layer_state_is_the_rules_state() {
         )
         .await;
     assert_eq!(a.text(), "Some(\"from-rule\")", "{a:?}");
+}
+
+/// An observer's `state-put` is refused: the store steers every flow's
+/// rules, so a write is an effect on traffic. The refusal is the observer's
+/// failure, and the key stays unwritten.
+#[tokio::test]
+async fn an_observer_cannot_write_state() {
+    use roxy_wasm::Capability;
+    let kit = Kit::builder()
+        .addon(
+            AddonDef::test_layer("monitor")
+                .observe()
+                .caps(&[Capability::State]),
+        )
+        .addon(AddonDef::test_layer("t").caps(&[Capability::State]))
+        .state(std::sync::Arc::new(MemState::default()))
+        .start()
+        .await;
+    let a = kit
+        .h1()
+        .await
+        .call(
+            "GET",
+            "/x",
+            &[("x-test-monitor", "caps"), ("x-cap", "state")],
+            b"",
+        )
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["layer"], "monitor", "{errs:#?}");
+    assert_eq!(errs[0]["mode"], "observe");
+    let a = cap(&kit, "state-get").await;
+    assert_eq!(a.text(), "None", "{a:?}");
+}
+
+/// A full store fails the exchange closed, as it does a rule's `set_state`:
+/// the guest never sees it as an error it can ignore.
+#[tokio::test]
+async fn a_full_state_store_fails_the_exchange() {
+    use roxy_wasm::Capability;
+    let kit = Kit::builder()
+        .addon(AddonDef::test_layer("t").caps(&[Capability::State]))
+        .state(std::sync::Arc::new(FullState))
+        .start()
+        .await;
+    let a = cap(&kit, "state").await;
+    assert_eq!(a.status, 503, "{a:?}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["kind"], "host", "{errs:#?}");
 }
 
 // ---- guest bodies ---------------------------------------------------------

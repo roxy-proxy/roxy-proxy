@@ -559,6 +559,18 @@ fn allow_trailers_is_an_unknown_field() {
     assert!(msg.contains("unknown field `allow_trailers`"), "{msg}");
 }
 
+/// Addons have no store of their own: `state-put` writes the rules' state,
+/// sized by `limits.max_state_entries`.
+#[test]
+fn addon_state_is_an_unknown_field() {
+    let (_dir, wasm) = wasm_file();
+    let yaml =
+        format!("{BASE}addons:\n  - name: w\n    path: {wasm}\n    state: {{ max_entries: 5 }}\n");
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = describe_parse_error(&yaml, &err);
+    assert!(msg.contains("unknown field `state`"), "{msg}");
+}
+
 #[test]
 fn default_key_is_rejected() {
     // Nothing opens an empty rule set: a policy that allows says so in a rule.

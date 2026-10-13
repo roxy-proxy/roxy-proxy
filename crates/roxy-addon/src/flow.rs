@@ -55,8 +55,9 @@ pub fn state_get(key: &str) -> Option<String> {
 
 /// Writes a key of the state store (capability `state`), for `ttl` or the
 /// store's default. A rule matches the value as written, so `yes` for
-/// `state["k"] == "yes"`. Fails when the store is full or the key or value
-/// too long; nothing is evicted.
+/// `state["k"] == "yes"`. Fails when the key or value is too long. A full
+/// store fails the exchange, as it does a rule's `set_state`; nothing is
+/// evicted. Only an enforce layer may write.
 pub fn state_put(key: &str, value: &str, ttl: Option<Duration>) -> Result<(), String> {
     raw::state_put(key, value, ttl_ms(ttl))
 }

@@ -47,9 +47,12 @@ the rules read as `state["key"]` and write with `set_state`. A key a layer
 writes is the key a rule reads, so a layer can leave a mark for a rule to
 deny on, and read what a rule left. Values are strings; a layer that wants
 `state["k"] == "yes"` to match writes `yes`. A `state-put` without a TTL
-gets the store's default (one hour). A miss returns `none`. A write when
-full, or with a key over 1 KiB or a value over 64 KiB, returns an error;
-nothing is evicted. The store survives a reload, under
+gets the store's default (one hour). A miss returns `none`. A key over
+1 KiB or a value over 64 KiB returns an error to the layer. A write when
+the store is full fails the exchange closed, as it does a rule's
+`set_state`; nothing is evicted. Only an enforce layer may write: a
+`state-put` from an observer fails the exchange, like `add-tag`, since the
+store steers every flow's rules. The store survives a reload, under
 `limits.max_state_entries`.
 
 ## Identity
