@@ -650,10 +650,11 @@ fn quarantine_on_floors() {
     );
 }
 
-/// A config can quarantine through either a listener threshold or a
-/// `quarantine` action; a `deny` is not enough.
+/// A config can quarantine through a listener threshold, a `quarantine`
+/// action or an addon granted `quarantine`; a `deny` or another capability
+/// is not enough.
 #[test]
-fn uses_quarantine_sees_both_triggers() {
+fn uses_quarantine_sees_every_trigger() {
     assert!(!parse(BASE).uses_quarantine());
     assert!(!parse(&format!("{BASE}rules: [{{ id: r, then: deny }}]\n")).uses_quarantine());
     assert!(
@@ -669,6 +670,15 @@ fn uses_quarantine_sees_both_triggers() {
         )
         .uses_quarantine()
     );
+    let (_dir, wasm) = wasm_file();
+    let with_cap = |caps: &str| {
+        parse(&format!(
+            "{BASE}addons:\n  - name: w\n    path: {wasm}\n    capabilities: [{caps}]\n"
+        ))
+        .uses_quarantine()
+    };
+    assert!(!with_cap("log"));
+    assert!(with_cap("log, quarantine"));
 }
 
 #[test]

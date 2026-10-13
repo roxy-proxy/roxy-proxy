@@ -545,6 +545,8 @@ pub enum Capability {
     Metrics,
     /// roxy's operational log.
     Log,
+    /// Put the whole proxy into quarantine.
+    Quarantine,
 }
 
 /// YAML names of [`Capability`], plus `secrets`, which gets a pointed
@@ -558,6 +560,7 @@ enum RawCapability {
     Record,
     Metrics,
     Log,
+    Quarantine,
     Secrets,
 }
 
@@ -570,6 +573,7 @@ impl TryFrom<RawCapability> for Capability {
             RawCapability::Record => Self::Record,
             RawCapability::Metrics => Self::Metrics,
             RawCapability::Log => Self::Log,
+            RawCapability::Quarantine => Self::Quarantine,
             RawCapability::Secrets => {
                 return Err(
                     "the `secrets` capability is not provided: put credentials on an \
@@ -830,9 +834,10 @@ impl Config {
                 .any(|a| matches!(a, Action::Capture(_)))
     }
 
-    /// Whether anything can quarantine the process: a `quarantine` action
-    /// or a listener's `quarantine_on`. Such a config needs a state dir to
-    /// keep the quarantine across restarts.
+    /// Whether anything can quarantine the process: a `quarantine` action,
+    /// a listener's `quarantine_on` or an addon holding the `quarantine`
+    /// capability. Such a config needs a state dir to keep the quarantine
+    /// across restarts.
     pub fn uses_quarantine(&self) -> bool {
         self.listeners.iter().any(|l| l.quarantine_on.is_some())
             || self
@@ -840,6 +845,10 @@ impl Config {
                 .iter()
                 .flat_map(|r| r.then.0.iter())
                 .any(|a| matches!(a, Action::Quarantine))
+            || self
+                .addons
+                .iter()
+                .any(|a| a.capabilities.contains(&Capability::Quarantine))
     }
 }
 

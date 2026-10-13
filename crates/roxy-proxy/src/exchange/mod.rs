@@ -403,12 +403,22 @@ pub(crate) async fn process<F: Front>(
     if let Some(refusal) = cx.expiry_refusal() {
         return (cx, Outcome::Refuse(refusal));
     }
-    if cx.snap.addons.is_empty() {
+    let (mut cx, outcome) = if cx.snap.addons.is_empty() {
         let outcome = core(front, &mut cx, req).await;
         (cx, outcome)
     } else {
         crate::addons::run(front, cx, req).await
-    }
+    };
+    // A layer may have quarantined the process while it held the exchange:
+    // whatever it answered, the client gets the refusal.
+    let outcome = match outcome {
+        Outcome::Respond(_) | Outcome::Upgrade { .. } => match cx.quarantine_refusal() {
+            Some(refusal) => Outcome::Refuse(refusal),
+            None => outcome,
+        },
+        Outcome::Refuse(_) | Outcome::Close(_) => outcome,
+    };
+    (cx, outcome)
 }
 
 /// The exchange below the addons: the request steps (the rules) → upstream →

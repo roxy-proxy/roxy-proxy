@@ -463,6 +463,9 @@ mod tests {
         async fn metric_get(&self, _: String, _: Vec<String>) -> Result<Option<i64>, HostError> {
             unreachable!()
         }
+        fn quarantine(&self) -> Result<(), HostError> {
+            unreachable!()
+        }
         fn failed(&self, _: &LayerError) {}
     }
 

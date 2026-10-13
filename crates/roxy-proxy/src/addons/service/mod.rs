@@ -238,6 +238,9 @@ enum In {
         id: u64,
         metric: String,
     },
+    Quarantine {
+        id: u64,
+    },
 }
 
 impl In {
@@ -250,7 +253,8 @@ impl In {
             | In::AddTag { id, .. }
             | In::StateGet { id, .. }
             | In::StatePut { id, .. }
-            | In::MetricGet { id, .. } => Some(*id),
+            | In::MetricGet { id, .. }
+            | In::Quarantine { id } => Some(*id),
             In::Request { .. }
             | In::RequestEnd
             | In::Response { .. }

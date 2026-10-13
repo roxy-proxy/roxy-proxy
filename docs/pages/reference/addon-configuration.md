@@ -52,7 +52,7 @@ key; `roxy check` refuses a key on the other kind.
 | `sample` | both, observe only | number in (0, 1] | 1 | the share of matching exchanges the observer gets a copy of, drawn from the flow id |
 | `subscribe.request` | both | `head`, `full` | `full` | what the layer sees of the request: the head only, or the head and the body ([what a layer sees](/reference/addon-configuration#what-a-layer-sees)) |
 | `subscribe.response` | both | `head`, `full` | `full` | the same for the response |
-| `capabilities` | both | list of `endpoints`, `state`, `record`, `metrics`, `log` | none | the [host services](/reference/host-services) the layer may call ([capabilities](/reference/addon-configuration#capabilities)); `endpoints` does nothing for a service layer, which calls what it needs itself |
+| `capabilities` | both | list of `endpoints`, `state`, `record`, `metrics`, `log`, `quarantine` | none | the [host services](/reference/host-services) the layer may call ([capabilities](/reference/addon-configuration#capabilities)); `endpoints` does nothing for a service layer, which calls what it needs itself |
 | `config` | both | any YAML value | `null` | handed to the layer as a JSON document, through `flow.config` or the `open` message; roxy does not read it. Map keys become strings (`1: a` is `{"1": "a"}`) |
 | `endpoints` | both | map of name to [endpoint](/reference/addon-configuration#endpoints) | none | named outbound targets. A WASM layer calls them with `endpoints.call`; a service layer's `endpoint` names one of them |
 | `limits` | both | [limits](/reference/addon-configuration#limits) | defaults below | what the layer may cost roxy |
@@ -136,6 +136,7 @@ and a service layer sends as messages:
 | `record` | `flow.record`: structured events in the flow log |
 | `metrics` | `flow.metric-get`: read a metric for this flow's key |
 | `log` | `flow.log`: roxy's operational log |
+| `quarantine` | `flow.quarantine`: put the whole proxy into [quarantine](/guides/operations#quarantine); enforce only |
 
 Every import is linked whatever is granted (one binary runs under any
 set); an ungranted call traps with `CapabilityDenied` and fails the

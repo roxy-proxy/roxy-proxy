@@ -585,7 +585,7 @@ async fn capabilities_gate_host_services() {
     let rt = runtime();
     // Each gated call, the capability it needs, and what it returns once
     // granted.
-    let cases: [(&str, Capability, &str, &str); 6] = [
+    let cases: [(&str, Capability, &str, &str); 7] = [
         (
             "log",
             Capability::Log,
@@ -610,6 +610,7 @@ async fn capabilities_gate_host_services() {
             "Some(7)",
             "metric_get requests [\"10.0.0.1\"]",
         ),
+        ("quarantine", Capability::Quarantine, "ok", "quarantine"),
         (
             "endpoint",
             Capability::Endpoints,

@@ -1123,6 +1123,11 @@ fn buffered_bytes(held: u64, inspected: &Inspected) -> u64 {
 
 /// The admission decision and its effects.
 fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
+    // A layer above may have quarantined the process while it held the
+    // request; nothing of a quarantined exchange is forwarded.
+    if let Some(refusal) = cx.quarantine_refusal() {
+        return Verdict::Deny(refusal);
+    }
     let (out, mut refusal) = cx.evaluate_admission();
     cx.trip_quarantine_if_matched(&out);
     // Request changes apply to an allowed request only (a refused outcome

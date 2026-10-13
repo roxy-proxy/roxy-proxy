@@ -452,6 +452,10 @@ fn call_capability(req: &RequestHead) -> String {
             "{:?}",
             flow::metric_get("requests", &["10.0.0.1".to_owned()])
         ),
+        "quarantine" => {
+            flow::quarantine();
+            "ok".to_owned()
+        }
         "endpoint" => {
             let path = header(req, "x-cap-path").unwrap_or_else(|| "/score?q=1".to_owned());
             let r = RequestHead {

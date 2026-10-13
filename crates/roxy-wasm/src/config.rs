@@ -20,16 +20,19 @@ pub enum Capability {
     Metrics,
     /// `flow.log`: roxy's operational log.
     Log,
+    /// `flow.quarantine`: put the whole proxy into quarantine.
+    Quarantine,
 }
 
 impl Capability {
     /// Every capability.
-    pub const ALL: [Capability; 5] = [
+    pub const ALL: [Capability; 6] = [
         Capability::Endpoints,
         Capability::State,
         Capability::Record,
         Capability::Metrics,
         Capability::Log,
+        Capability::Quarantine,
     ];
 
     /// The name used in config (`capabilities: [state, record]`).
@@ -40,6 +43,7 @@ impl Capability {
             Capability::Record => "record",
             Capability::Metrics => "metrics",
             Capability::Log => "log",
+            Capability::Quarantine => "quarantine",
         }
     }
 

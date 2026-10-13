@@ -128,6 +128,7 @@ the service passed.
 | `{"type":"state_get","id":n,"key":"…"}` | `state` | `{"type":"result","id":n,"value":"…"}` (`null` for a miss) |
 | `{"type":"state_put","id":n,"key":"…","value":"…","ttl_ms":n?}` | `state`; enforce only | `{"type":"result","id":n,"value":null}`, or `"error"` for a key or value over its cap |
 | `{"type":"metric_get","id":n,"metric":"…"}` | `metrics` | `{"type":"result","id":n,"value":n}` (`null` for a key with no entry) |
+| `{"type":"quarantine","id":n}` | `quarantine`; enforce only | `{"type":"result","id":n,"value":null}`; the exchange, and every one after it, is refused `_quarantined` |
 
 A call may be sent at any point while the stream is open, including
 part-way through a body. Calls run in order, one at a time per stream,
@@ -149,7 +150,8 @@ a `record` the flow log cannot take fails the exchange (`layer_error`, kind
 the stream; the `result` `error` is only for what the service passed.
 roxy's own record of a call names its `id` as `call`: on the
 `layer_record` a `record` writes, on the `layer_error` a failed call
-causes, and on the operational log line a `log` writes. `endpoints.call`
+causes, on the operational log line a `log` writes, and on the cause of
+the `quarantined` event a `quarantine` trips. `endpoints.call`
 has no message: a service calls what it needs itself.
 
 ## Semantics

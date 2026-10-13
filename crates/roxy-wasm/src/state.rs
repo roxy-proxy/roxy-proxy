@@ -650,4 +650,10 @@ impl flow::Host for StoreState {
             .await
             .map_err(|e| self.host_failed(e))
     }
+
+    async fn quarantine(&mut self) -> wasmtime::Result<()> {
+        self.require(Capability::Quarantine, "flow.quarantine")?;
+        let host = self.host("flow.quarantine")?;
+        host.quarantine().map_err(|e| self.host_failed(e))
+    }
 }

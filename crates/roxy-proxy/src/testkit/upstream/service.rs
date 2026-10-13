@@ -296,6 +296,9 @@ enum Mode {
     /// through once every call is answered, as a service whose writes
     /// must be visible to the exchange does.
     Host,
+    /// Calls `quarantine` (call id 1) on `open`, then passes through once
+    /// it is answered.
+    Quarantine,
 }
 
 /// What the `host` behaviour writes to the state store, under `svc`.
@@ -333,6 +336,8 @@ impl Mode {
             Self::Abort
         } else if path.ends_with("/patient") {
             Self::Patient
+        } else if path.ends_with("/quarantine") {
+            Self::Quarantine
         } else {
             Self::Flood
         }
@@ -374,7 +379,8 @@ impl Conn {
             | Mode::Shout
             | Mode::Sever
             | Mode::Patient
-            | Mode::Host => true,
+            | Mode::Host
+            | Mode::Quarantine => true,
             Mode::Hold | Mode::Forward => dir == REQUEST,
             Mode::Overlong
             | Mode::Short
@@ -401,48 +407,7 @@ impl Conn {
         match kind.as_str() {
             "open" => {
                 lock(&self.log.opens).push(v);
-                let mut sess = Sess::new();
-                sess.lanes[usize::from(REQUEST)].held = self.mode == Mode::Patient;
-                self.streams.insert(id, sess);
-                match self.mode {
-                    Mode::Pass
-                    | Mode::Hold
-                    | Mode::Hoard
-                    | Mode::Forward
-                    | Mode::Overlong
-                    | Mode::Short
-                    | Mode::Refuse
-                    | Mode::Abort
-                    | Mode::Pause
-                    | Mode::Slow
-                    | Mode::Shout
-                    | Mode::Sever
-                    | Mode::Patient => {}
-                    Mode::Host => {
-                        let calls = [
-                            json!({"type": "log", "id": 1, "level": "info", "message": "hello from the service"}),
-                            json!({"type": "record", "id": 2, "kind": "verdict", "data": {"score": 0.9}}),
-                            json!({"type": "add_tag", "id": 3, "tag": "svc-tag"}),
-                            json!({"type": "state_put", "id": 4, "key": "svc", "value": HOST_STATE_VALUE}),
-                            json!({"type": "state_get", "id": 5, "key": "svc"}),
-                            json!({"type": "metric_get", "id": 6, "metric": "by_host"}),
-                        ];
-                        let s = self.streams.get_mut(&id).expect("just opened");
-                        s.calls_waiting = calls.len();
-                        s.lanes[usize::from(REQUEST)].held = true;
-                        for m in calls {
-                            self.send(text(id, m));
-                        }
-                    }
-                    Mode::Talk => {
-                        let s = self.streams.get_mut(&id).expect("just opened");
-                        s.lanes[usize::from(REQUEST)]
-                            .queue
-                            .push_back(Queued::Bytes(Bytes::from(vec![0x5au8; TALK_BYTES])));
-                        self.flush(id, REQUEST);
-                    }
-                    Mode::Flood => self.send(binary(id, REQUEST, &vec![0x5au8; FLOOD_BYTES])),
-                }
+                self.opened(id);
             }
             "credit" => {
                 let n = v["bytes"].as_u64().unwrap_or(0);
@@ -490,6 +455,61 @@ impl Conn {
                 }
                 self.flush(id, dir);
             }
+        }
+    }
+
+    /// Stream `id` opened: what the behaviour does before roxy's request.
+    fn opened(&mut self, id: u32) {
+        let mut sess = Sess::new();
+        sess.lanes[usize::from(REQUEST)].held = self.mode == Mode::Patient;
+        self.streams.insert(id, sess);
+        match self.mode {
+            Mode::Pass
+            | Mode::Hold
+            | Mode::Hoard
+            | Mode::Forward
+            | Mode::Overlong
+            | Mode::Short
+            | Mode::Refuse
+            | Mode::Abort
+            | Mode::Pause
+            | Mode::Slow
+            | Mode::Shout
+            | Mode::Sever
+            | Mode::Patient => {}
+            Mode::Host => self.call_host(
+                id,
+                vec![
+                    json!({"type": "log", "id": 1, "level": "info", "message": "hello from the service"}),
+                    json!({"type": "record", "id": 2, "kind": "verdict", "data": {"score": 0.9}}),
+                    json!({"type": "add_tag", "id": 3, "tag": "svc-tag"}),
+                    json!({"type": "state_put", "id": 4, "key": "svc", "value": HOST_STATE_VALUE}),
+                    json!({"type": "state_get", "id": 5, "key": "svc"}),
+                    json!({"type": "metric_get", "id": 6, "metric": "by_host"}),
+                ],
+            ),
+            Mode::Quarantine => {
+                self.call_host(id, vec![json!({"type": "quarantine", "id": 1})]);
+            }
+            Mode::Talk => {
+                let s = self.streams.get_mut(&id).expect("just opened");
+                s.lanes[usize::from(REQUEST)]
+                    .queue
+                    .push_back(Queued::Bytes(Bytes::from(vec![0x5au8; TALK_BYTES])));
+                self.flush(id, REQUEST);
+            }
+            Mode::Flood => self.send(binary(id, REQUEST, &vec![0x5au8; FLOOD_BYTES])),
+        }
+    }
+
+    /// Sends host-service `calls` on stream `id`, holding the request
+    /// until every one is answered.
+    fn call_host(&mut self, id: u32, calls: Vec<Value>) {
+        let s = self.streams.get_mut(&id).expect("just opened");
+        s.calls_waiting = calls.len();
+        s.lanes[usize::from(REQUEST)].held = true;
+        for m in calls {
+            self.send(text(id, m));
         }
     }
 

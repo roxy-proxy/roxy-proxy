@@ -420,6 +420,22 @@ components:
                 window_seconds:
                   type: integer
                   minimum: 1
+            - type: object
+              description: An addon layer called `flow.quarantine`.
+              required: [kind, layer, flow]
+              properties:
+                kind:
+                  const: layer
+                layer:
+                  type: string
+                  minLength: 1
+                flow:
+                  type: string
+                  minLength: 1
+                call:
+                  type: integer
+                  minimum: 0
+                  description: A service layer's id for the call that tripped it.
 
     LeaseQuarantine:
       type: object
