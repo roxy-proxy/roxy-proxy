@@ -226,6 +226,21 @@ fn listener_specs(listeners: &[Listener]) -> anyhow::Result<Vec<ListenerSpec>> {
                 ListenerMode::HttpProxy => roxy_proxy::ListenerMode::HttpProxy,
                 ListenerMode::Http => roxy_proxy::ListenerMode::Http,
             };
+            let forwarded_for = l
+                .forwarded_for
+                .map(|f| {
+                    usize::try_from(f.trusted_hops)
+                        .ok()
+                        .and_then(std::num::NonZeroUsize::new)
+                        .map(|trusted_hops| roxy_proxy::ForwardedFor { trusted_hops })
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "listener {:?}: forwarded_for.trusted_hops must be at least 1",
+                                l.name
+                            )
+                        })
+                })
+                .transpose()?;
             Ok(ListenerSpec {
                 name: l.name.clone(),
                 mode,
@@ -234,6 +249,7 @@ fn listener_specs(listeners: &[Listener]) -> anyhow::Result<Vec<ListenerSpec>> {
                     count: q.parse_errors.count,
                     window: q.parse_errors.window,
                 }),
+                forwarded_for,
             })
         })
         .collect()

@@ -30,6 +30,7 @@ listeners:
   - name: gateway
     mode: http
     bind: 0.0.0.0:8080
+    forwarded_for: { trusted_hops: 1 }   # one load balancer in front
 
 secrets:
   anthropic: { env: ANTHROPIC_API_KEY }
@@ -91,11 +92,16 @@ below see the tag, so a per-user quota is another addon.
 - **This is not containment.** The listener serves whoever reaches it, and
   the clients may have other routes out
   ([threat model](/design/threat-model#which-use-case-claims-what)).
-- **`client.ip` is the load balancer's address.** Rules and the flow log
-  see the connection roxy accepted, not the original client. roxy reads no
-  forwarded-for header. Every client therefore shares one source IP, so
-  `limits.max_connections_per_client` caps the whole gateway: leave it
-  unset (it follows `max_connections`) or raise it with the fleet
+- **Say how many proxies are in front.** `forwarded_for.trusted_hops` is
+  the number of proxies between the clients and roxy, each appending to
+  `X-Forwarded-For`; with it, `client.ip` in rules, rate limits and the
+  flow log is the client the load balancer saw, and a request the header
+  does not account for is refused
+  ([HTTP](/reference/http#clients-behind-a-load-balancer)). Without it,
+  `client.ip` is the load balancer's address and every client shares one.
+  `limits.max_connections_per_client` counts the connection's peer either
+  way, so it caps the whole gateway: leave it unset (it follows
+  `max_connections`) or raise it with the fleet
   ([limits](/reference/limits#connections)).
 - **TLS stays in front.** roxy does not terminate TLS on an `http`
   listener; a client that starts a handshake is closed

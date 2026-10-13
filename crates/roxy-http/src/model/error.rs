@@ -66,6 +66,10 @@ pub enum Reason {
     BadAuthority,
     /// h2 `:authority` does not equal the SNI / tunnel authority.
     AuthorityMismatch,
+    /// `X-Forwarded-For` on a listener that trusts forwarding proxies has
+    /// fewer entries than trusted hops, an entry that is not a bare IP
+    /// address, or is over the length cap.
+    ForwardedForInvalid,
     // ----- framing -----
     /// More than one `Content-Length` field (even with equal values).
     DuplicateContentLength,
@@ -158,6 +162,7 @@ impl Reason {
         Reason::HostMismatch,
         Reason::BadAuthority,
         Reason::AuthorityMismatch,
+        Reason::ForwardedForInvalid,
         Reason::DuplicateContentLength,
         Reason::BadContentLength,
         Reason::BadTransferEncoding,
@@ -212,6 +217,7 @@ impl Reason {
             Reason::HostMismatch => "host_mismatch",
             Reason::BadAuthority => "bad_authority",
             Reason::AuthorityMismatch => "authority_mismatch",
+            Reason::ForwardedForInvalid => "forwarded_for_invalid",
             Reason::DuplicateContentLength => "duplicate_content_length",
             Reason::BadContentLength => "bad_content_length",
             Reason::BadTransferEncoding => "bad_transfer_encoding",
@@ -277,6 +283,7 @@ impl Reason {
             | Reason::HostMismatch
             | Reason::BadAuthority
             | Reason::AuthorityMismatch
+            | Reason::ForwardedForInvalid
             | Reason::DuplicateContentLength
             | Reason::BadContentLength
             | Reason::BadTransferEncoding

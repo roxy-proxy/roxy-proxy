@@ -379,6 +379,7 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(DryRunView, Vec
     let listener = config.listeners.first();
     let mut v = MapView::new()
         .with(Field::ClientIp, Value::Ip(req.client_ip))
+        .with(Field::ClientPeerIp, Value::Ip(req.client_ip))
         .with_str(
             Field::ListenerName,
             listener.map_or("proxy", |l| l.name.as_str()),

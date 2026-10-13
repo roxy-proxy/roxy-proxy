@@ -1339,3 +1339,33 @@ fn addon_config_refuses_non_finite_floats() {
         assert!(err.contains("is not a finite number"), "{c}: {err}");
     }
 }
+
+/// `forwarded_for` needs at least one hop and a listener whose requests all
+/// come through a proxy: inside a CONNECT tunnel the header is the client's.
+#[test]
+fn forwarded_for_validated() {
+    let cfg = parse(
+        "version: 1\nlisteners: [{ name: gw, mode: http, bind: 127.0.0.1:1, \
+         forwarded_for: { trusted_hops: 2 } }]\n",
+    );
+    cfg.validate().unwrap();
+    assert_eq!(cfg.listeners[0].forwarded_for.unwrap().trusted_hops, 2);
+    assert_eq!(parse(BASE).listeners[0].forwarded_for, None);
+
+    let d = diagnostics(
+        "version: 1\nlisteners: [{ name: gw, mode: http, bind: 127.0.0.1:1, \
+         forwarded_for: { trusted_hops: 0 } }]\n",
+    );
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(
+        d[0].to_string(),
+        "listeners[0].forwarded_for.trusted_hops: must be at least 1"
+    );
+
+    let d = diagnostics(
+        "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:1, \
+         forwarded_for: { trusted_hops: 1 } }]\n",
+    );
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].path, "listeners[0].forwarded_for");
+}

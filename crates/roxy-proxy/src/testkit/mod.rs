@@ -33,6 +33,8 @@ mod core_tests;
 #[cfg(test)]
 #[cfg(test)]
 mod early_tests;
+#[cfg(test)]
+mod forwarded_tests;
 mod gate;
 #[cfg(test)]
 mod gateway_tests;
@@ -79,7 +81,7 @@ use crate::addr::PrivateAddrs;
 use crate::addrlist::{AddressList, AddressLists};
 use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowSink, MemorySink, Redactor};
-use crate::listener::{ClientConn, ListenerInfo, ListenerMode};
+use crate::listener::{ClientConn, ForwardedFor, ListenerInfo, ListenerMode};
 use crate::quarantine::QuarantineState;
 use crate::sources::{MetricSource, Sample, StateSource, UnavailableMetrics, UnavailableState};
 use crate::upstream::{DnsSettings, TestDial, UpstreamSettings};
@@ -310,6 +312,8 @@ pub(crate) struct KitBuilder {
     quarantine_dir: Option<std::path::PathBuf>,
     /// A parse-error threshold on the kit's listener (`main`).
     quarantine_on: Option<crate::quarantine::ParseErrorThreshold>,
+    /// `forwarded_for` on the kit's `http` listener (`gateway`).
+    forwarded_for: Option<ForwardedFor>,
 }
 
 type UpstreamTweak = Box<dyn FnOnce(&mut UpstreamSettings) + Send>;
@@ -403,6 +407,16 @@ impl KitBuilder {
     #[must_use]
     pub(crate) fn quarantine_dir(mut self, dir: &std::path::Path) -> Self {
         self.quarantine_dir = Some(dir.to_path_buf());
+        self
+    }
+
+    /// Trusts `hops` proxies' `X-Forwarded-For` entries on the `gateway`
+    /// listener.
+    #[must_use]
+    pub(crate) fn forwarded_for(mut self, hops: usize) -> Self {
+        self.forwarded_for = Some(ForwardedFor {
+            trusted_hops: std::num::NonZeroUsize::new(hops).expect("at least one hop"),
+        });
         self
     }
 
@@ -570,6 +584,10 @@ impl KitBuilder {
             minter,
             capture,
             samples,
+            gateway: Arc::new(ListenerInfo {
+                forwarded_for: self.forwarded_for,
+                ..listener_info(ListenerMode::Http)
+            }),
             ca_file: dir.path().join(roxy_tls::CA_CERT_FILE),
             limits,
             flags,
@@ -599,25 +617,37 @@ fn quarantine_config(
                 mode: ListenerMode::HttpProxy,
                 bind: "127.0.0.1:0".parse().unwrap(),
                 quarantine_on: Some(t),
+                forwarded_for: None,
             }]
         })
         .unwrap_or_default();
     (quarantine, listeners)
 }
 
-/// The test client's connection, as the accept loop would describe it:
-/// listener `main` for the proxy, `gateway` for the `http` listener.
-pub(crate) fn client_conn(mode: ListenerMode) -> ClientConn {
+/// The kit's listener in `mode`: `main` for the proxy, `gateway` for the
+/// `http` listener.
+fn listener_info(mode: ListenerMode) -> ListenerInfo {
     let name = match mode {
         ListenerMode::HttpProxy => "main",
         ListenerMode::Http => "gateway",
     };
+    ListenerInfo {
+        name: name.to_owned(),
+        mode,
+        forwarded_for: None,
+    }
+}
+
+/// The test client's connection, as the accept loop would describe it.
+pub(crate) fn client_conn(mode: ListenerMode) -> ClientConn {
+    client_conn_on(Arc::new(listener_info(mode)))
+}
+
+/// [`client_conn`] on a given listener.
+pub(crate) fn client_conn_on(listener: Arc<ListenerInfo>) -> ClientConn {
     ClientConn {
         id: Ulid::generate(),
-        listener: Arc::new(ListenerInfo {
-            name: name.to_owned(),
-            mode,
-        }),
+        listener,
         peer: "192.0.2.7:40000".parse().unwrap(),
         original_dst: None,
     }
@@ -703,6 +733,8 @@ pub(crate) struct Kit {
     /// [`KitBuilder::metric_defs`] fills; empty with an explicit
     /// [`KitBuilder::metrics`]).
     pub samples: Arc<Mutex<Vec<Sample>>>,
+    /// The `http` listener the kit's gateway clients connect to.
+    gateway: Arc<ListenerInfo>,
     ca_file: std::path::PathBuf,
     pub(crate) limits: Limits,
     pub(crate) flags: HttpFlags,
@@ -740,6 +772,7 @@ impl Kit {
             upstream: None,
             quarantine_dir: None,
             quarantine_on: None,
+            forwarded_for: None,
         }
     }
 
@@ -793,7 +826,7 @@ impl Kit {
         let (client, server) = tokio::io::duplex(64 * 1024);
         self.spawn_conn(crate::conn::serve_http(
             Box::new(server),
-            client_conn(ListenerMode::Http),
+            client_conn_on(self.gateway.clone()),
             self.server.shared().clone(),
         ));
         client

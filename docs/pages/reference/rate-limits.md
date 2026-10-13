@@ -76,7 +76,10 @@ metrics:
     window: 1m
 ```
 
-`client.ip` is bounded by who can reach the proxy. `roxy check` warns when a
+`client.ip` and `client.peer_ip` are bounded by who can reach the proxy;
+behind a load balancer, `client.ip` is each client's own address only with
+the listener's `forwarded_for`
+([HTTP](/reference/http#clients-behind-a-load-balancer)). `roxy check` warns when a
 metric keys on any of the five fields above with no `where`. `host under
 "github.com"` does not bound `host`: subdomains are client-chosen too. For
 `path`, `url`, `query.raw` and `client.port` a `where` on `host` limits

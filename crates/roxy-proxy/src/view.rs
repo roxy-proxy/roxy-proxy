@@ -134,6 +134,8 @@ pub(crate) struct WsFacts {
 #[derive(Debug, Clone)]
 pub(crate) struct FlowFacts {
     pub client: ClientConn,
+    /// `client.ip`: the TCP peer, or the client `forwarded_for` resolved.
+    pub client_ip: IpAddr,
     pub tls: Option<TlsInfo>,
     /// What the client sent: the flow log's `req`.
     pub client_request: Option<RequestFacts>,
@@ -260,7 +262,8 @@ impl FlowView for ProxyView<'_> {
         let res = fa.response.as_ref();
         let tls = fa.tls.as_ref();
         match f {
-            Field::ClientIp => Value::Ip(fa.client.peer.ip()),
+            Field::ClientIp => Value::Ip(fa.client_ip),
+            Field::ClientPeerIp => Value::Ip(fa.client.peer.ip()),
             Field::ClientPort => Value::Int(i64::from(fa.client.peer.port())),
             Field::ListenerName => Value::Str(Cow::Borrowed(&fa.client.listener.name)),
             Field::TlsSni => s(tls.and_then(|t| t.sni.as_ref())),

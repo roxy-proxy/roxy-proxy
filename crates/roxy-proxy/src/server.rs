@@ -642,7 +642,7 @@ impl Server {
         let mut bound: Vec<Arc<dyn Listener>> = Vec::new();
         let mut addrs = Vec::new();
         for spec in &cfg.listeners {
-            let l = TcpProxyListener::bind(&spec.name, spec.mode, spec.bind)
+            let l = TcpProxyListener::bind(spec.info(), spec.bind)
                 .await
                 .map_err(|e| {
                     StartError(format!(

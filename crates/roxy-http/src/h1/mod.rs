@@ -164,6 +164,7 @@ fn body_error_for(e: &ParseError, limits: &Limits) -> BodyError {
         | Reason::HostMismatch
         | Reason::BadAuthority
         | Reason::AuthorityMismatch
+        | Reason::ForwardedForInvalid
         | Reason::DuplicateContentLength
         | Reason::BadContentLength
         | Reason::BadTransferEncoding

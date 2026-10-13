@@ -45,6 +45,7 @@ pub mod config;
 mod conn;
 mod exchange;
 pub mod flowlog;
+mod forwarded;
 mod h2conn;
 mod in_flight;
 pub mod io;
@@ -70,7 +71,9 @@ pub use flowlog::{
     FlowSink, MemorySink, MultiSink, REDACTED, Redactor, RequestInfo, ResponseInfo, Stage,
     StdoutSink, Timing, TlsInfo,
 };
-pub use listener::{ClientConn, Listener, ListenerInfo, ListenerMode, TcpProxyListener};
+pub use listener::{
+    ClientConn, ForwardedFor, Listener, ListenerInfo, ListenerMode, TcpProxyListener,
+};
 pub use quarantine::{ParseErrorThreshold, QuarantineCause, QuarantineRecord, QuarantineState};
 pub use server::{PreparedReload, Server, ServerHandle, StartError};
 pub use sources::{

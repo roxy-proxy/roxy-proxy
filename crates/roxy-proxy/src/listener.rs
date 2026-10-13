@@ -7,6 +7,7 @@
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -23,6 +24,15 @@ pub enum ListenerMode {
     Http,
 }
 
+/// `listeners[].forwarded_for`: the proxies in front of the listener whose
+/// `X-Forwarded-For` entries are trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardedFor {
+    /// How many proxies appended to `X-Forwarded-For` before roxy; the
+    /// client is the entry this many from the right.
+    pub trusted_hops: NonZeroUsize,
+}
+
 /// Static description of a listener.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenerInfo {
@@ -30,6 +40,8 @@ pub struct ListenerInfo {
     pub name: String,
     /// `listener.mode`.
     pub mode: ListenerMode,
+    /// `None`: `X-Forwarded-For` is ignored and the client is the TCP peer.
+    pub forwarded_for: Option<ForwardedFor>,
 }
 
 /// One accepted client connection.
@@ -68,13 +80,10 @@ pub struct TcpProxyListener {
 
 impl TcpProxyListener {
     /// Binds a listener on `addr`.
-    pub async fn bind(name: &str, mode: ListenerMode, addr: SocketAddr) -> io::Result<Self> {
+    pub async fn bind(info: ListenerInfo, addr: SocketAddr) -> io::Result<Self> {
         let tcp = TcpListener::bind(addr).await?;
         Ok(Self {
-            info: Arc::new(ListenerInfo {
-                name: name.to_owned(),
-                mode,
-            }),
+            info: Arc::new(info),
             tcp,
         })
     }
