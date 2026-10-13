@@ -149,9 +149,8 @@ single reservation.
 - A connection over `max_connections` or `max_connections_per_client` (per
   client IP) is accepted and closed at once, with a `connection_refused`
   event. The `ca_server` listener counts separately, `max_connections` in
-  total and 16 per client IP (or the total, if lower), and logs its
-  refusals to roxy's own log rather than the flow log, with `reason`
-  `max_connections` or `ca_server_per_client`.
+  total with no per-client cap, and logs its refusals to roxy's own log
+  rather than the flow log.
 - Every read is bounded (head size, body size, ClientHello size) and every
   stage has a timeout. Nothing is allocated in proportion to an
   attacker-supplied number before it is validated (`content-length: 10^18`

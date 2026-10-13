@@ -78,14 +78,6 @@ pub(crate) enum PolicyState {
     Expired,
 }
 
-/// Per-client cap on the `ca_server` listener. The listener counts its
-/// connections apart from the proxy's, so a client filling
-/// `max_connections` cannot starve `/healthz` into a restart; the
-/// per-client cap is small because each connection serves one response
-/// and closes, and it keeps one client address from filling the total
-/// (unless the total is lower still).
-pub(crate) const CA_SERVER_MAX_CONNECTIONS_PER_CLIENT: usize = 16;
-
 /// Per-client and global connection counting.
 struct ConnCaps {
     max: usize,
@@ -500,9 +492,12 @@ impl Server {
                 max_per_client: cfg.max_connections_per_client.max(1),
                 state: Mutex::new((0, HashMap::new())),
             }),
+            // Counted apart from the proxy's connections, so a client filling
+            // `max_connections` cannot starve `/healthz` into a restart. No
+            // per-client cap: behind a load balancer every client is one IP.
             ca_caps: Arc::new(ConnCaps {
                 max: cfg.max_connections.max(1),
-                max_per_client: CA_SERVER_MAX_CONNECTIONS_PER_CLIENT,
+                max_per_client: cfg.max_connections.max(1),
                 state: Mutex::new((0, HashMap::new())),
             }),
             stop: CancellationToken::new(),
@@ -655,14 +650,9 @@ pub(crate) fn conn_slot(shared: &Shared, ip: IpAddr) -> Option<ConnSlot> {
     shared.caps.acquire(ip).ok()
 }
 
-/// Acquires a slot from the `ca_server` listener's own cap. The per-client
-/// refusal is named for this listener, since `limits.max_connections_per_client`
-/// does not apply to it.
+/// Acquires a slot from the `ca_server` listener's own cap.
 pub(crate) fn ca_conn_slot(shared: &Shared, ip: IpAddr) -> Result<ConnSlot, &'static str> {
-    shared.ca_caps.acquire(ip).map_err(|reason| match reason {
-        "max_connections_per_client" => "ca_server_per_client",
-        other => other,
-    })
+    shared.ca_caps.acquire(ip)
 }
 
 #[cfg(test)]

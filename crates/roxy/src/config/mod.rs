@@ -280,8 +280,7 @@ pub struct Limits {
     #[serde(with = "humantime_serde")]
     pub idle_timeout: Duration,
     /// Cap on concurrent client connections to the proxy listeners. The
-    /// `ca_server` listener counts separately, with the same total and a
-    /// fixed per-IP cap.
+    /// `ca_server` listener counts separately, with the same total.
     pub max_connections: usize,
     /// Cap on concurrent proxy connections from one client IP. Absent means
     /// `max_connections`, so it only bites when lowered: behind a load
