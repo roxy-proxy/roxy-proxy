@@ -88,7 +88,10 @@ Nothing is evicted: a write when full fails and the layer decides.
 ### `limits`
 
 Limits catch a broken layer, not a slow one: a slow layer makes its
-exchanges slow, never denied. Each is optional.
+exchanges slow, not denied, with one exception. Exchanges that keep every
+instance busy past `first_byte_timeout` cost the exchanges queued behind
+them, which are denied rather than wait (`max_instances` below). Each is
+optional.
 
 | key | kind | default | what it bounds |
 |---|---|---|---|

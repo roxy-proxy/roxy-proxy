@@ -104,7 +104,10 @@ const MIB: u64 = 1024 * 1024;
 
 /// Limits for one layer. They protect roxy and catch a layer that is
 /// broken; they do not police how fast a layer is. A slow layer makes its
-/// exchanges slow, and a client that gives up cancels them.
+/// exchanges slow, and a client that gives up cancels them. The one
+/// exception is saturation: exchanges that keep every instance busy past
+/// `first_byte_timeout` cost the exchanges queued behind them, which fail
+/// closed rather than wait.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayerLimits {
     /// Linear memory per instance, summed over the instance's memories.
