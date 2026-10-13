@@ -20,7 +20,7 @@ roxy run --control-plane https://cp.example:8443 \
 |---|---|
 | `--control-plane URL` | The control plane's `https://` URL. Paths are under `/roxy/v1/`. |
 | `--enrol-token-file PATH` | The enrolment token. Read once, on a start with no node certificate in the state dir. A later start does not need it. |
-| `--state-dir DIR` | Where the node keeps its certificate and key. Created with mode `0700`. |
+| `--state-dir DIR` | Where the node keeps its certificate, key and the other files below. Created with mode `0700`. |
 | `--control-plane-ca PATH` | PEM bundle to verify the control plane with. Default: the system roots. |
 | `--bootstrap-bind ADDR` | Where the proxy listens before the first lease. Default `0.0.0.0:3128`. |
 | `--bootstrap-ca-server ADDR` | Where `ca_server` listens before the first lease. Default `0.0.0.0:3130`. |
@@ -39,10 +39,11 @@ roxy does not delete the token file after enrolment.
 | `node.key` | The node's PKCS#8 key, mode `0600`. Generated on the node; never sent anywhere. |
 | `flow.seq` | The flow `seq` counter, reserved ahead in blocks of 1024 by a background task, never on the request path. A restart continues after the last reservation. If it cannot be written at startup, the node does not start. If a later write fails, roxy logs it, keeps shipping and retries; once events outrun the last reservation it reports `seq_unreserved: true` on each lease poll until a reservation catches up, and a restart before then may reuse `seq` values. |
 | `ca/` | The interception CA, as `tls.ca_dir` holds it in file mode. |
+| `quarantine` | Present while the node is [quarantined](/guides/operations#quarantine): the incident as JSON, mode `0600`. Written when the quarantine trips and removed when the control plane releases it; a node that starts with it present starts quarantined. A `--state-dir` given to `roxy run --config` holds this file alone. |
 
 Nothing else is written: the rendered config and the secret values stay in
-memory, so a copy of the state dir is a revocable node identity and nothing
-else.
+memory, so a copy of the state dir is a revocable node identity, plus
+whether the node was quarantined, and nothing else.
 
 ### The interception CA
 
@@ -105,6 +106,14 @@ clears every rule `set_state` entry and metric window first. `secrets`
 supplies the config's `secrets:` entries that declare `lease: true`; `env`
 and `file` sources are resolved on the node as in file mode, and a name
 with no value from either refuses the lease.
+
+A [quarantined](/guides/operations#quarantine) node keeps polling and keeps
+applying leases, so its policy is current the moment the quarantine lifts;
+it reports the incident in `quarantine` on every poll, and lifts it when the
+lease's `quarantine.release` names that incident's id
+([lease body](/reference/node-protocol#lease-body)). Nothing on the node
+lifts it otherwise: not a reload, not a restart with the marker still in
+the state dir.
 
 What the node does with each response code is in the
 [errors table](/reference/node-protocol#errors). A `410` (revoked) expires

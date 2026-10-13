@@ -68,15 +68,18 @@ struct RunArgs {
     config: Option<PathBuf>,
     /// Node mode: the control plane's `https://` URL. The config and
     /// secrets come from its lease; nothing but the node certificate, key,
-    /// flow counter and interception CA is kept in `--state-dir`.
+    /// flow counter, interception CA and quarantine marker is kept in
+    /// `--state-dir`.
     #[arg(long, requires = "state_dir", conflicts_with = "config")]
     control_plane: Option<String>,
     /// Enrolment token, read once on a start with no node certificate in
     /// the state dir.
     #[arg(long, requires = "control_plane")]
     enrol_token_file: Option<PathBuf>,
-    /// Where the node keeps its certificate and key.
-    #[arg(long, requires = "control_plane")]
+    /// Where roxy keeps what must survive a restart: the quarantine marker,
+    /// and in node mode the certificate, key, flow counter and interception
+    /// CA. Required by a config that can quarantine.
+    #[arg(long)]
     state_dir: Option<PathBuf>,
     /// PEM CA bundle to verify the control plane with (default: system
     /// roots).
@@ -252,7 +255,7 @@ fn main() -> ExitCode {
 fn dispatch(command: Command) -> anyhow::Result<ExitCode> {
     match command {
         Command::Run(args) => match args.config {
-            Some(path) => run(&path),
+            Some(path) => run(&path, args.state_dir),
             None => run_node(args),
         },
         Command::Check(args) => Ok(check(&args.config)),
@@ -352,16 +355,16 @@ fn health(url: &str, timeout: Duration) -> anyhow::Result<ExitCode> {
         (Some("HTTP/1.1" | "HTTP/1.0"), Some("200"))
     );
     if healthy {
-        let expired = String::from_utf8_lossy(&head).lines().any(|l| {
-            l.split_once(':').is_some_and(|(k, v)| {
-                k.eq_ignore_ascii_case(roxy_proxy::POLICY_HEADER)
-                    && v.trim().eq_ignore_ascii_case("expired")
-            })
+        let head = String::from_utf8_lossy(&head);
+        let policy = head.lines().find_map(|l| {
+            l.split_once(':')
+                .filter(|(k, _)| k.eq_ignore_ascii_case(roxy_proxy::POLICY_HEADER))
+                .map(|(_, v)| v.trim().to_ascii_lowercase())
         });
-        if expired {
-            println!("ok (policy expired)");
-        } else {
-            println!("ok");
+        match policy.as_deref() {
+            Some("expired") => println!("ok (policy expired)"),
+            Some("quarantined") => println!("ok (quarantined)"),
+            _ => println!("ok"),
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -689,7 +692,7 @@ fn ca_export(path: &Path, der: bool) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn run(path: &Path) -> anyhow::Result<ExitCode> {
+fn run(path: &Path, state_dir: Option<PathBuf>) -> anyhow::Result<ExitCode> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -699,6 +702,7 @@ fn run(path: &Path) -> anyhow::Result<ExitCode> {
             path,
             roxy::run::StartOptions {
                 watch: true,
+                state_dir,
                 ..Default::default()
             },
         )

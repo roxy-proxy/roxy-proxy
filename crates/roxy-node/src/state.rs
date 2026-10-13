@@ -1,6 +1,7 @@
-//! The state dir: the node certificate and key, the flow sequence counter
-//! and the interception CA's directory. Nothing else is ever written here;
-//! secrets and the rendered config stay in memory.
+//! The state dir: the node certificate and key, the flow sequence counter,
+//! the interception CA's directory and the quarantine marker. Nothing else
+//! is ever written here; secrets and the rendered config stay in memory.
+//! A roxy run from a config file uses the same layout for the marker alone.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,9 @@ pub const KEY_FILE: &str = "node.key";
 pub const SEQ_FILE: &str = "flow.seq";
 /// Where the interception CA lives (`tls.ca_dir`).
 pub const CA_DIR: &str = "ca";
+/// The quarantine marker: present, with the incident as JSON, while the
+/// process is quarantined. Written and removed by the proxy.
+pub const QUARANTINE_FILE: &str = "quarantine";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
@@ -81,6 +85,11 @@ impl StateDir {
     /// `tls.ca_dir` for a node.
     pub fn ca_dir(&self) -> PathBuf {
         self.root.join(CA_DIR)
+    }
+
+    /// The quarantine marker's path.
+    pub fn quarantine_marker(&self) -> PathBuf {
+        self.file(QUARANTINE_FILE)
     }
 
     fn file(&self, name: &str) -> PathBuf {

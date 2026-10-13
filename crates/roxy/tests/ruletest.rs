@@ -156,3 +156,33 @@ fn obs_text_headers_are_matched_one_char_per_byte() {
     let (code, stdout, _) = rule_test(cfg, &["-H", "x-note: plain", "GET", "https://h.example/"]);
     assert_eq!(code, Some(0), "{stdout}");
 }
+
+/// A dry run reports a matching `quarantine` as a deny that would also
+/// quarantine the proxy, and quarantines nothing itself: the config needs
+/// no state dir and no marker is written.
+#[test]
+fn a_matching_quarantine_is_reported_and_trips_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("roxy.yaml");
+    std::fs::write(
+        &cfg,
+        "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:0 }]\nrules:\n  \
+         - { id: exfil, when: 'path == \"/exfil\"', then: quarantine }\n  \
+         - { id: ok, then: allow }\n",
+    )
+    .unwrap();
+    let cfg = cfg.to_str().unwrap();
+    let (code, stdout, stderr) = rule_test(cfg, &["GET", "https://h.example/exfil"]);
+    assert_eq!(code, Some(3), "{stdout}{stderr}");
+    assert!(stdout.contains("decision: deny 403"), "{stdout}");
+    assert!(stdout.contains("rule:     exfil"), "{stdout}");
+    assert!(stdout.contains("quarantine: yes (rule exfil)"), "{stdout}");
+    let (code, stdout, _) = rule_test(cfg, &["GET", "https://h.example/ok"]);
+    assert_eq!(code, Some(0), "{stdout}");
+    assert!(!stdout.contains("quarantine:"), "{stdout}");
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "only the config is in the dir"
+    );
+}

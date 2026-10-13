@@ -83,6 +83,25 @@ pub struct Listener {
     #[serde(default)]
     pub mode: ListenerMode,
     pub bind: SocketAddr,
+    /// What on this listener quarantines the process. Absent = nothing.
+    #[serde(default)]
+    pub quarantine_on: Option<QuarantineOn>,
+}
+
+/// `listeners[].quarantine_on`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuarantineOn {
+    /// This many parse errors within the window.
+    pub parse_errors: ParseErrorsThreshold,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParseErrorsThreshold {
+    pub count: u32,
+    #[serde(with = "humantime_serde")]
+    pub window: Duration,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -815,6 +834,18 @@ impl Config {
                 .iter()
                 .flat_map(|r| r.then.0.iter())
                 .any(|a| matches!(a, Action::Capture(_)))
+    }
+
+    /// Whether anything can quarantine the process: a `quarantine` action
+    /// or a listener's `quarantine_on`. Such a config needs a state dir to
+    /// keep the quarantine across restarts.
+    pub fn uses_quarantine(&self) -> bool {
+        self.listeners.iter().any(|l| l.quarantine_on.is_some())
+            || self
+                .rules
+                .iter()
+                .flat_map(|r| r.then.0.iter())
+                .any(|a| matches!(a, Action::Quarantine))
     }
 }
 

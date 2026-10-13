@@ -13,7 +13,7 @@ The `ca_server` listener answers two probes, both plain HTTP `GET`:
 | path | `200` when | otherwise |
 |---|---|---|
 | `/healthz` | the process is up and accepting connections | no answer |
-| `/readyz` | a policy has been applied and its lease has not run out | `503` with a one-word reason: `no_policy` (nothing applied yet) or `policy_expired` ([lease](/guides/operations#lease)) |
+| `/readyz` | a policy has been applied, its lease has not run out and the process is not quarantined | `503` with a one-word reason: `quarantined` ([quarantine](/guides/operations#quarantine)), `no_policy` (nothing applied yet) or `policy_expired` ([lease](/guides/operations#lease)) |
 
 Use `/readyz` for a compose `depends_on` wait or a Kubernetes readiness
 probe, and `/healthz` for a liveness probe or a container `HEALTHCHECK`.
@@ -27,10 +27,10 @@ one that fills the `ca_server` cap does, so keep that port reachable only
 from the workloads that fetch the CA and from the probe. Refused
 `ca_server` connections are logged in roxy's own log, not the flow log.
 
-An empty policy is ready: it is a deny-all that someone applied, so a
-quarantined roxy stays in rotation and its refusals are audited. From a
-config file a policy is always applied at startup, so `no_policy` is only
-seen by a node waiting for its first lease.
+An empty policy is ready: it is a deny-all that someone applied, so a roxy
+told to refuse everything stays in rotation and its refusals are audited.
+From a config file a policy is always applied at startup, so `no_policy` is
+only seen by a node waiting for its first lease.
 
 `roxy health` is the probe for images without a shell or curl: it `GET`s
 `http://127.0.0.1:3130/healthz` (`--ready`: `/readyz`; `--url` names
@@ -106,8 +106,8 @@ message. The first exchange that finds the policy expired logs one
 
 An expired policy is a policy, not a fault. The listeners stay up,
 `/healthz` keeps answering `200` with `x-roxy-policy: expired` (`valid`
-otherwise), `roxy health` prints `ok (policy expired)`, and `/readyz`
-answers `503 policy_expired`. A document already past its `valid_until`
+otherwise, `quarantined` under a quarantine), `roxy health` prints `ok
+(policy expired)`, and `/readyz` answers `503 policy_expired`. A document already past its `valid_until`
 loads and denies rather than failing to start. `roxy check` prints `valid
 until:` and warns when the instant has passed. In
 [node mode](/guides/node-mode) the control plane's lease sets it.
@@ -115,3 +115,52 @@ until:` and warns when the instant has passed. In
 The way back is a reload: a config whose `valid_until` is later, or
 absent, is swapped in like any other. There is no fallback policy: a policy
 that must not expire has no `valid_until`.
+
+## Quarantine
+
+A quarantine is roxy refusing every exchange, whatever the policy says,
+until something outside the process lifts it. It is for a workload that has
+shown itself hostile: once tripped, the proxy stays shut across reloads and
+restarts, and the client cannot talk its way out.
+
+Two things trip it:
+
+- a rule's `quarantine` action ([actions](/reference/rule-language#actions)):
+  the exchange is refused, by whichever deny wins, and the proxy is
+  quarantined, even if a rule below it fails closed;
+- a listener's `quarantine_on.parse_errors` threshold
+  ([listeners](/reference/http#listener-modes)): that many `parse_error`
+  events on the listener within the window, counting every reason except
+  timeouts (`header_timeout`, `body_timeout`, `tunnel_timeout`,
+  `tls_handshake_timeout`, `h2_handshake_timeout`), a client that left
+  (`unexpected_eof`, `io_error`) and roxy's own failures
+  (`connect_write_failed`, `leaf_mint_failed`, `invalid_state`). Off unless
+  set; set it on a sandbox's listener, not a gateway's, where one client
+  would shut the proxy for every other.
+
+While quarantined, every request is refused with `403`, `terminal_rule:
+_quarantined` and reason `quarantined`, before the addons and the rules, and
+before the lease is checked. An open WebSocket relay stops at its next
+message. Connections open at the trip have one second to finish, then they
+are closed, so a stream in flight carries little further; the exchange that
+tripped it uses that second to write its own refusal. The trip is logged
+once as a `quarantined` event with the incident id, when it tripped and why
+([flow log](/reference/flow-log#events)). `/healthz` stays `200` with
+`x-roxy-policy: quarantined`, `roxy health` prints `ok (quarantined)`, and
+`/readyz` answers `503 quarantined`. CA distribution keeps working.
+
+A config that can quarantine (a `quarantine` action, or `quarantine_on` on
+a listener) needs `roxy run --state-dir DIR`: roxy refuses to start, or to
+reload into such a config, without it. The trip writes `DIR/quarantine`
+(the incident as JSON, mode `0600`), and a start that finds the file starts
+quarantined, logging the `quarantined` event again with `restored: true`.
+The in-memory state changes before the file is written. A write failure is
+logged as an error and leaves the process quarantined; whether a restart
+starts quarantined then depends on whether the file landed before the
+failure, so check for `DIR/quarantine` before restarting.
+
+Lifting it is never the proxy's own doing. From a config file: stop roxy,
+remove `DIR/quarantine`, start it again. A reload does not lift it, and a
+restart with the file in place does not either. In [node
+mode](/guides/node-mode#the-lease) the control plane releases it by naming
+the incident id in its lease, and the node logs `quarantine_released`.

@@ -47,6 +47,7 @@ fuzz_target!(|data: &[u8]| {
     for then in [
         json!("allow"),
         json!("deny"),
+        json!("quarantine"),
         json!([{ "tag": "t0" }, "allow"]),
     ] {
         let Some(policy) =

@@ -15,10 +15,10 @@ use anyhow::{Context as _, anyhow, bail};
 use chrono::{DateTime, Utc};
 use roxy_node::client::{NodeInfo, Trust};
 use roxy_node::node::{Change, HandlerFuture, LeaseHandler, Node, NodeConfig, NodeError};
-use roxy_node::protocol::{Lease, PolicyState, sha256_hex};
+use roxy_node::protocol::{Lease, PolicyState, QuarantineReport, sha256_hex};
 use roxy_node::spool::Spool;
 use roxy_node::state::StateDir;
-use roxy_proxy::{FlowEvent, FlowSink, PolicyUpdate, Server};
+use roxy_proxy::{FlowEvent, FlowSink, PolicyUpdate, QuarantineState, Server};
 use roxy_rules::Policy;
 use roxy_tls::{CA_CERT_FILE, CA_KEY_FILE, Ca, CaError};
 
@@ -157,6 +157,9 @@ pub struct NodeHandler {
     addons: Arc<AddonLoader>,
     metrics: Arc<ReloadableMetrics>,
     state: Mutex<Arc<BuiltinState>>,
+    /// The quarantine, loaded from the state dir once and shared by every
+    /// server this handler starts.
+    quarantine: Arc<QuarantineState>,
     server: tokio::sync::Mutex<Option<Server>>,
     running: tokio::sync::Mutex<RunningPolicy>,
     /// For `policy_state` without taking the async lock.
@@ -311,6 +314,7 @@ impl NodeHandler {
             sink,
             metrics: self.metrics.clone(),
             state,
+            quarantine: self.quarantine.clone(),
         };
         Ok(Server::start(runtime_config(&startup, opened, update, placeholder)?).await?)
     }
@@ -429,7 +433,37 @@ impl NodeHandler {
             revoked: false,
         };
         self.summarise(&run);
+        self.apply_release(lease).await;
         Ok(())
+    }
+
+    /// Lifts the quarantine when the lease's `quarantine.release` names the
+    /// incident in force. Ids that do not are ignored, so a lease decided
+    /// before a later trip lifts nothing. A marker that cannot be removed
+    /// is logged, and the node stays quarantined and keeps reporting it.
+    async fn apply_release(&self, lease: &Lease) {
+        let Some(active) = self.quarantine.active() else {
+            return;
+        };
+        let Some(q) = &lease.quarantine else {
+            return;
+        };
+        if !q.release.iter().any(|id| *id == active.id) {
+            return;
+        }
+        let server = self.server.lock().await;
+        let Some(server) = server.as_ref() else {
+            return;
+        };
+        match server.handle().release_quarantine(&active.id) {
+            Ok(true) => {
+                tracing::info!(lease_id = %lease.lease_id, id = %active.id, "quarantine released by the control plane");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::error!(lease_id = %lease.lease_id, id = %active.id, error = %e, "quarantine release failed; the node stays quarantined");
+            }
+        }
     }
 
     /// A lease whose config is the one running: the lease moves forward
@@ -472,6 +506,7 @@ impl NodeHandler {
         );
         run.valid_until = Some(valid_until);
         self.summarise(run);
+        self.apply_release(lease).await;
         Ok(())
     }
 
@@ -562,6 +597,15 @@ impl LeaseHandler for NodeHandler {
         } else {
             PolicyState::None
         }
+    }
+
+    fn quarantine(&self) -> Option<QuarantineReport> {
+        let record = self.quarantine.active()?;
+        Some(QuarantineReport {
+            id: record.id.clone(),
+            since: record.since,
+            cause: serde_json::to_value(&record.cause).unwrap_or(serde_json::Value::Null),
+        })
     }
 }
 
@@ -749,6 +793,8 @@ pub async fn start(opts: NodeOptions) -> anyhow::Result<NodeRunning> {
     let compiled = config
         .validate()
         .map_err(|d| anyhow!("bootstrap config: {d:?}"))?;
+    let quarantine = QuarantineState::load(&state_dir.quarantine_marker())
+        .context("reading the quarantine marker in the state dir")?;
     let handler = Arc::new(NodeHandler {
         state_dir: state_dir.clone(),
         spool: OnceLock::new(),
@@ -759,6 +805,7 @@ pub async fn start(opts: NodeOptions) -> anyhow::Result<NodeRunning> {
             config.limits.metric_limits(),
         )),
         state: Mutex::new(Arc::new(BuiltinState::new(config.limits.max_state_entries))),
+        quarantine: Arc::new(quarantine),
         server: tokio::sync::Mutex::new(None),
         running: tokio::sync::Mutex::new(RunningPolicy {
             config: config.clone(),
@@ -900,6 +947,7 @@ mod tests {
                 spool_high_water_bytes: 1,
                 on_high_water: OnHighWater::Spool,
             },
+            quarantine: None,
             interception_ca: None,
         };
         let map = resolve_secrets(&config, &lease).unwrap();

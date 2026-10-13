@@ -443,6 +443,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 when,
                 head,
                 watching,
+                quarantines: rule.then.0.iter().any(|a| matches!(a, Action::Quarantine)),
                 shape,
             });
         }
@@ -567,6 +568,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         let out = match action {
             Action::Allow(a) => vec![CAction::Terminal(allow(a))],
             Action::Deny(d) => vec![CAction::Terminal(Decision::Deny(self.deny(d, rule, apath)))],
+            Action::Quarantine => vec![CAction::Terminal(Decision::Deny(Deny::quarantine()))],
             Action::SetHeader(pairs) => self.set_header(pairs, rule, apath),
             Action::RemoveHeader(names) => names
                 .iter()
@@ -714,6 +716,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                     .collect()
             }
             Action::Deny(d) => vec![WatchAction::Deny(self.deny(d, rule, apath))],
+            Action::Quarantine => vec![WatchAction::Deny(Deny::quarantine())],
             Action::Tag(t) => {
                 self.tag(t, rule, apath);
                 vec![WatchAction::Tag(t.clone())]
@@ -1054,7 +1057,7 @@ impl RuleShape {
     fn classify(needs: &Needs, rule: &RuleConfig) -> Self {
         let fields = needs.reads.retain(Watched::is_field);
         let metrics = needs.reads.minus(fields);
-        let denies = rule.then.0.iter().any(|a| matches!(a, Action::Deny(_)));
+        let denies = rule.then.0.iter().any(Action::is_deny);
         let (kind, triggers, watches) = if !fields.is_empty() {
             (
                 RuleKind::Watching,
@@ -1206,6 +1209,8 @@ fn non_header_strings(a: &Action) -> Vec<&str> {
         Action::Tag(s) => vec![s],
         Action::Log(l) => vec![&l.message],
         Action::SetState(s) => vec![&s.key, &s.value],
-        Action::Allow(_) | Action::Capture(_) | Action::Digest(_) => Vec::new(),
+        Action::Allow(_) | Action::Quarantine | Action::Capture(_) | Action::Digest(_) => {
+            Vec::new()
+        }
     }
 }

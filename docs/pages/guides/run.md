@@ -79,6 +79,10 @@ $B check --config roxy.yaml      # validate; exits 1 with diagnostics
 $B run   --config roxy.yaml      # start; edits to the file hot-reload
 ```
 
+`run` takes `--state-dir DIR` for what must survive a restart; a config
+that can [quarantine](/guides/operations#quarantine) the process requires
+it.
+
 A minimal `roxy.yaml`, which allows `GET`/`HEAD` to `example.com` and denies
 everything else:
 

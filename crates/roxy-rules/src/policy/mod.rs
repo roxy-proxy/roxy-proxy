@@ -220,6 +220,11 @@ struct CompiledRule {
     head: Box<[CAction]>,
     /// Actions when the rule fires after forwarding; empty for a head rule.
     watching: Box<[WatchAction]>,
+    /// Has a `quarantine` action: its deny is an ordinary 403 that closes,
+    /// and the trip is recorded as soon as the rule matches, so a
+    /// fail-closed later in the pass, or in this rule's own earlier
+    /// actions, still trips the process.
+    quarantines: bool,
     shape: RuleShape,
 }
 

@@ -5,7 +5,7 @@ use tokio::net::TcpStream;
 
 use super::{Kit, read_response, read_to_eof};
 
-async fn fetch(kit: &Kit, request: &str) -> (String, Vec<u8>, bool) {
+pub(super) async fn fetch(kit: &Kit, request: &str) -> (String, Vec<u8>, bool) {
     let mut io = TcpStream::connect(kit.ca_server_addr()).await.unwrap();
     io.write_all(request.as_bytes()).await.unwrap();
     let (head, body) = read_response(&mut io).await;

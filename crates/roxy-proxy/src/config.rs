@@ -17,6 +17,7 @@ use roxy_tls::{Ca, LeafMinter, UpstreamTlsOptions};
 use crate::addrlist::AddressLists;
 use crate::flowlog::{FlowSink, Redactor};
 use crate::listener::ListenerMode;
+use crate::quarantine::{ParseErrorThreshold, QuarantineState};
 use crate::sources::{MetricSource, StateSource};
 use crate::upstream::{DnsSettings, UpstreamSettings};
 
@@ -26,11 +27,17 @@ pub struct ListenerSpec {
     pub name: String,
     pub mode: ListenerMode,
     pub bind: SocketAddr,
+    /// `quarantine_on.parse_errors`: this many parse errors on the listener
+    /// within the window quarantine the process. `None`: never.
+    pub quarantine_on: Option<ParseErrorThreshold>,
 }
 
 /// Fixed server configuration.
 pub struct RuntimeConfig {
     pub listeners: Vec<ListenerSpec>,
+    /// The process-wide quarantine, loaded from the state dir before the
+    /// server starts and shared by every server the process starts.
+    pub quarantine: Arc<QuarantineState>,
     /// Plain-HTTP CA download + health endpoint.
     pub ca_server: Option<SocketAddr>,
     pub ca: Arc<Ca>,

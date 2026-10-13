@@ -121,7 +121,8 @@ pub(crate) async fn serve<IO: Io>(
     let mut conn: Connection<IO, Bytes> = match timeout(limits.header_timeout, handshake).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
-            shared.emit_parse_reason(&client, None, "h2_handshake_failed", Some(&e.to_string()));
+            let reason = crate::quarantine::handshake_reason("h2_handshake_failed", e.get_io());
+            shared.emit_parse_reason(&client, None, reason, Some(&e.to_string()));
             return;
         }
         Err(_) => {

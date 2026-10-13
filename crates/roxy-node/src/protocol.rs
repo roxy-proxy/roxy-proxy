@@ -62,6 +62,31 @@ pub struct NodeState {
     /// predate the field leave it out.
     #[serde(default)]
     pub seq_unreserved: bool,
+    /// The quarantine in force, or `null`. Always sent; nodes that predate
+    /// the field leave it out.
+    #[serde(default)]
+    pub quarantine: Option<QuarantineReport>,
+}
+
+/// A node's quarantine, as reported on every lease poll. The lease's
+/// `quarantine.release` names `id` to lift it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantineReport {
+    /// Minted by the node per incident.
+    pub id: String,
+    pub since: DateTime<Utc>,
+    /// What tripped it: `{"kind": "rule", ...}` or `{"kind": "threshold",
+    /// ...}`, as the proxy's `quarantined` flow event carries it.
+    pub cause: serde_json::Value,
+}
+
+/// The lease's `quarantine` object.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseQuarantine {
+    /// Incident ids the control plane has released. The node lifts its
+    /// quarantine when the active id is among them; other ids are ignored.
+    #[serde(default)]
+    pub release: Vec<String>,
 }
 
 /// The node's view of its own policy.
@@ -107,6 +132,10 @@ pub struct Lease {
     /// Opaque. A change clears rule state and metric windows.
     pub state_epoch: String,
     pub flow: FlowSettings,
+    /// Releases of the node's quarantine. Orthogonal to the policy: the
+    /// rest of the lease applies whether or not the node is quarantined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantine: Option<LeaseQuarantine>,
     /// Reserved for per-node interception CA issuance; carried, not read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interception_ca: Option<serde_json::Value>,
@@ -123,6 +152,7 @@ impl std::fmt::Debug for Lease {
             .field("secrets", &self.secrets.len())
             .field("state_epoch", &self.state_epoch)
             .field("flow", &self.flow)
+            .field("quarantine", &self.quarantine)
             .field("interception_ca", &self.interception_ca.is_some())
             .finish()
     }

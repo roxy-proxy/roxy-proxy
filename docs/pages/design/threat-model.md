@@ -61,7 +61,9 @@ loaded, and a failed reload keeps the running policy. An addon in
 `enforce` mode that fails denies the flow; an `observe` addon cannot
 affect traffic, so its failure is logged and the flow goes on. An
 unavailable policy input denies the flow rather than making a predicate
-false. [Resource limits](/reference/limits#fail-closed-outcomes) lists
+false. A [quarantine](/guides/operations#quarantine), once tripped, denies
+everything across reloads and restarts until lifted from outside the
+process. [Resource limits](/reference/limits#fail-closed-outcomes) lists
 every case.
 
 ## Canonical re-serialisation

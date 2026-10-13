@@ -265,6 +265,26 @@ pub enum FlowEvent<'a> {
         list: Option<String>,
         matched_cidr: Option<String>,
     },
+    /// The process went into quarantine, or started in one: every exchange
+    /// is refused with `_quarantined` until it is released.
+    Quarantined {
+        #[serde(serialize_with = "ser_ts")]
+        ts: DateTime<Utc>,
+        /// The incident id a release must name.
+        id: String,
+        #[serde(serialize_with = "ser_ts")]
+        since: DateTime<Utc>,
+        cause: crate::quarantine::QuarantineCause,
+        /// The quarantine was read back from the state dir at startup
+        /// rather than tripped now.
+        restored: bool,
+    },
+    /// The control plane released the quarantine named by `id`.
+    QuarantineReleased {
+        #[serde(serialize_with = "ser_ts")]
+        ts: DateTime<Utc>,
+        id: String,
+    },
     /// A new connection was accepted and immediately closed.
     ConnectionRefused {
         #[serde(serialize_with = "ser_ts")]

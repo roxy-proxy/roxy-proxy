@@ -17,7 +17,9 @@ use crate::client::{
     CertificateError, ClientError, ControlPlane, LeaseFetch, NodeInfo, ShipOutcome, Trust,
 };
 use crate::identity::{self, IdentityError};
-use crate::protocol::{Lease, NodeState, PROTOCOL_VERSION, PolicyState, encode_flow_batch};
+use crate::protocol::{
+    Lease, NodeState, PROTOCOL_VERSION, PolicyState, QuarantineReport, encode_flow_batch,
+};
 use crate::spool::{Spool, reserve_loop};
 use crate::state::{StateDir, StateError};
 
@@ -107,6 +109,9 @@ pub trait LeaseHandler: Send + Sync {
 
     /// What the proxy is running, for the lease fetch body.
     fn policy_state(&self) -> PolicyState;
+
+    /// The proxy's quarantine, for the lease fetch body.
+    fn quarantine(&self) -> Option<QuarantineReport>;
 }
 
 /// How to reach the control plane and where the node keeps its state.
@@ -430,6 +435,7 @@ impl Node {
             policy_state: self.handler.policy_state(),
             spooled_bytes: self.spool.pending_bytes(),
             seq_unreserved: self.spool.seq_unreserved(),
+            quarantine: self.handler.quarantine(),
         }
     }
 
@@ -934,6 +940,10 @@ mod tests {
 
         fn policy_state(&self) -> PolicyState {
             *lock(&self.state)
+        }
+
+        fn quarantine(&self) -> Option<QuarantineReport> {
+            None
         }
     }
 

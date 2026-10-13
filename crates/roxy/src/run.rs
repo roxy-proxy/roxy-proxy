@@ -10,9 +10,11 @@ use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
+use roxy_node::state::StateDir;
 use roxy_proxy::{
-    CaptureLog, FileSink, FlowEvent, FlowSink, ListenerSpec, MetricSource, PolicyUpdate, Redactor,
-    RuntimeConfig, Server, ServerHandle, StateSource, StdoutSink,
+    CaptureLog, FileSink, FlowEvent, FlowSink, ListenerSpec, MetricSource, ParseErrorThreshold,
+    PolicyUpdate, QuarantineState, Redactor, RuntimeConfig, Server, ServerHandle, StateSource,
+    StdoutSink,
 };
 use roxy_rules::Policy;
 use roxy_tls::{Ca, LeafMinter};
@@ -178,12 +180,23 @@ pub struct StartOptions {
     pub state: Option<Arc<dyn StateSource>>,
     /// Watch the config file for changes.
     pub watch: bool,
+    /// `--state-dir`: where the quarantine marker lives. Required by a
+    /// config that can quarantine ([`Config::uses_quarantine`]).
+    pub state_dir: Option<PathBuf>,
 }
+
+/// Why a config cannot run without `--state-dir`.
+const NEEDS_STATE_DIR: &str = "the config can quarantine the process (a `quarantine` action or a \
+                               listener's `quarantine_on`), which needs --state-dir so the \
+                               quarantine survives a restart";
 
 /// Reloads the config from disk into a running server.
 pub struct Reloader {
     path: PathBuf,
     handle: ServerHandle,
+    /// Whether a state dir was given, so a reload that starts using
+    /// quarantine without one is refused like a start would be.
+    has_state_dir: bool,
     /// The running config. Held for the whole of a reload, so reloads
     /// (watcher and `SIGHUP`) never interleave.
     last: tokio::sync::Mutex<Config>,
@@ -217,6 +230,10 @@ fn listener_specs(listeners: &[Listener]) -> anyhow::Result<Vec<ListenerSpec>> {
                 name: l.name.clone(),
                 mode,
                 bind: l.bind,
+                quarantine_on: l.quarantine_on.as_ref().map(|q| ParseErrorThreshold {
+                    count: q.parse_errors.count,
+                    window: q.parse_errors.window,
+                }),
             })
         })
         .collect()
@@ -229,6 +246,25 @@ pub struct Opened {
     pub sink: Arc<dyn FlowSink>,
     pub metrics: Arc<dyn MetricSource>,
     pub state: Arc<dyn StateSource>,
+    pub quarantine: Arc<QuarantineState>,
+}
+
+/// Opens the quarantine state: the marker in `state_dir`, or an in-memory
+/// state when there is none, which a config that can quarantine refuses.
+pub fn open_quarantine(
+    config: &Config,
+    state_dir: Option<&Path>,
+) -> anyhow::Result<Arc<QuarantineState>> {
+    let Some(dir) = state_dir else {
+        if config.uses_quarantine() {
+            return Err(anyhow!("{NEEDS_STATE_DIR}"));
+        }
+        return Ok(Arc::new(QuarantineState::in_memory()));
+    };
+    let dir = StateDir::open(dir)?;
+    let state = QuarantineState::load(&dir.quarantine_marker())
+        .context("reading the quarantine marker in --state-dir")?;
+    Ok(Arc::new(state))
 }
 
 /// The server's fixed configuration: the restart-only settings, read from
@@ -244,6 +280,7 @@ pub fn runtime_config(
     Ok(RuntimeConfig {
         placeholder_policy,
         listeners: listener_specs(&startup.listeners)?,
+        quarantine: opened.quarantine,
         ca_server: startup.ca_server.as_ref().map(|c| c.bind),
         ca: opened.ca,
         minter,
@@ -359,6 +396,9 @@ impl Reloader {
 
     fn load(&self, running: &Config) -> Result<(Config, Compiled, Vec<&'static str>), Vec<String>> {
         let mut config = Config::load(&self.path).map_err(|e| vec![format!("{e:#}")])?;
+        if !self.has_state_dir && config.uses_quarantine() {
+            return Err(vec![format!("{}: {NEEDS_STATE_DIR}", self.path.display())]);
+        }
         // Track the new file's files even if this attempt fails, so fixing
         // (or creating) a broken one triggers the next reload, and the
         // running policy's, which stay in use until an attempt succeeds.
@@ -659,16 +699,19 @@ pub async fn start(path: &Path, opts: StartOptions) -> anyhow::Result<Running> {
     let state = opts
         .state
         .unwrap_or_else(|| Arc::new(crate::stores::BuiltinState::new(startup.max_state_entries)));
+    let quarantine = open_quarantine(&config, opts.state_dir.as_deref())?;
     let opened = Opened {
         ca,
         sink,
         metrics: metric_source,
         state,
+        quarantine,
     };
     let server = Server::start(runtime_config(&startup, opened, update, false)?).await?;
     let reloader = Arc::new(Reloader {
         path: path.to_path_buf(),
         handle: server.handle(),
+        has_state_dir: opts.state_dir.is_some(),
         last: tokio::sync::Mutex::new(config.clone()),
         metrics: builtin_metrics,
         watch: OnceLock::new(),
@@ -957,6 +1000,33 @@ mod tests {
 
         std::fs::write(&list, "192.0.2.0/24\n198.51.100.0/24\n").unwrap();
         wait_events(&sink, "config_reload_failed", 2).await;
+        running.shutdown(Duration::ZERO).await;
+    }
+
+    /// Without `--state-dir`, a reload into a config that can quarantine is
+    /// refused like a start would be, and the running policy stays.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reload_into_a_quarantining_config_needs_the_state_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = format!(
+            "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:0 }}]\ntls: {{ ca_dir: {:?} }}\n",
+            dir.path().join("ca")
+        );
+        let (path, running, sink) = start_in(dir.path(), &base, false).await;
+        std::fs::write(
+            &path,
+            format!("{base}rules: [{{ id: q, then: quarantine }}]\n"),
+        )
+        .unwrap();
+        assert!(!running.reloader.reload().await);
+        let failed = events(&sink, "config_reload_failed");
+        assert!(
+            failed[0]["diagnostics"]
+                .to_string()
+                .contains("needs --state-dir"),
+            "{failed:?}"
+        );
+        assert!(!running.reloader.last.lock().await.uses_quarantine());
         running.shutdown(Duration::ZERO).await;
     }
 

@@ -568,6 +568,15 @@ impl DryRun {
             .and_then(|w| w.terminal_rule.as_ref())
             .unwrap_or(&self.head.terminal_rule)
     }
+
+    /// The rule whose `quarantine` action matched, at the head or while
+    /// watching, if any. A dry run never quarantines anything.
+    pub(crate) fn quarantine(&self) -> Option<&RuleId> {
+        self.head
+            .quarantine
+            .as_ref()
+            .or_else(|| self.watching.as_ref().and_then(|w| w.quarantine.as_ref()))
+    }
 }
 
 /// Evaluate `req`: the head decision, then, if allowed, the watching rules
@@ -694,6 +703,9 @@ pub fn report(
     }
     let _ = writeln!(s, "decision: {}", run.decision());
     let _ = writeln!(s, "rule:     {}", run.terminal_rule());
+    if let Some(rule) = run.quarantine() {
+        let _ = writeln!(s, "quarantine: yes (rule {rule})");
+    }
     let reason = run
         .watching
         .as_ref()

@@ -128,7 +128,7 @@ needs the same guard in its `where` ([rate limits](/reference/rate-limits#metric
 ## Actions
 
 `then` is required: one action, or a list with at most one terminal action
-(`allow` or `deny`), last. An action is a bare word or a single-key map of
+(`allow`, `deny` or `quarantine`), last. An action is a bare word or a single-key map of
 name to argument; a multi-key map, an unknown action, a wrong-shaped
 argument or anything after a terminal action is a compile error.
 
@@ -148,6 +148,7 @@ Terminal:
 |---|---|---|
 | `allow` | head rules | Forward. `upgrade: websocket` permits a WebSocket upgrade; `private_ok: true` lets the flow reach private addresses ([address floor](/reference/address-lists#address-floor)). |
 | `deny` | all rules | `deny: { status, message, close }`; status 403 by default, 4xx or 5xx. At the head: refuse ([deny responses](/reference/http#deny-responses)) and close unless `close: false`. Watching: stop the exchange ([evaluation](/design/policy-evaluation#evaluation)). On a WebSocket: close both sides, with a `1008` frame when rules read messages ([WebSockets](/reference/websockets#message-rules)). |
+| `quarantine` | all rules | A bare word, no argument. A `deny` with status 403 that closes, plus: the whole proxy is [quarantined](/guides/operations#quarantine), refusing every later exchange until released from outside. Any matching `quarantine` trips it, whichever deny decided the exchange, a fail-closed included. Needs `--state-dir`. |
 
 Non-terminal:
 

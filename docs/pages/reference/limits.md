@@ -8,6 +8,7 @@ accept and the upstream connect produces a deny response or a closed socket
 
 | condition | result |
 |---|---|
+| the process is quarantined | `403`, `_quarantined`, close ([quarantine](/guides/operations#quarantine)) |
 | parse or canonicalisation error | close the connection (`400` if a response can still be written), `parse_error` |
 | a rule denies | deny response, then close |
 | policy input unavailable (metric store, address list, secret) | `503`, `_fail_closed` |

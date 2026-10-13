@@ -24,6 +24,7 @@ use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowEvent, FlowSink, Redactor};
 use crate::listener::{ClientConn, Listener, ListenerMode, TcpProxyListener};
 use crate::pipeline::client_info;
+use crate::quarantine::{QuarantineCause, QuarantineRecord, QuarantineState, TripCounter};
 use crate::secrets::SecretStore;
 use crate::sources::{MetricSource, StateSource};
 use crate::upstream::{Dns, Upstream};
@@ -76,6 +77,9 @@ pub(crate) enum PolicyState {
     /// The policy's lease has run out. Denies everything until a reload
     /// brings a later lease.
     Expired,
+    /// The process is quarantined. Denies everything, whatever the
+    /// policy, until the quarantine is released.
+    Quarantined,
 }
 
 /// Per-client and global connection counting.
@@ -146,6 +150,10 @@ pub(crate) struct Shared {
     pub ws_message_every: u64,
     /// Each addon's keyed store, by addon name; survives reloads.
     pub layer_state: crate::addons::store::LayerStates,
+    /// The process-wide quarantine; outlives this server.
+    pub quarantine: Arc<QuarantineState>,
+    /// Each listener's parse-error threshold counter, by listener name.
+    parse_error_trips: HashMap<String, TripCounter>,
     /// Bytes reserved for per-exchange buffers, against the current
     /// snapshot's `max_buffered_bytes`.
     buffers: Arc<BufferBudget>,
@@ -189,15 +197,96 @@ impl Shared {
         true
     }
 
-    /// The current policy's state, for `/readyz`.
+    /// The current policy's state, for `/readyz`. A quarantine comes first:
+    /// it refuses everything whatever the policy says.
     pub(crate) fn policy_state(&self) -> PolicyState {
         let snap = self.snapshot();
-        if snap.placeholder {
+        if self.quarantined() {
+            PolicyState::Quarantined
+        } else if snap.placeholder {
             PolicyState::Missing
         } else if self.expired() {
             PolicyState::Expired
         } else {
             PolicyState::Loaded
+        }
+    }
+
+    /// Whether the process is quarantined. Read on every exchange and
+    /// WebSocket message, like the lease.
+    pub(crate) fn quarantined(&self) -> bool {
+        self.quarantine.is_active()
+    }
+
+    /// Puts the process into quarantine for `cause`, unless it already is.
+    /// Logs the trip, and cuts the connections open at this moment after
+    /// [`CUT_GRACE`]; the exchange that tripped it has that long to write
+    /// its refusal.
+    pub(crate) fn trip_quarantine(&self, cause: QuarantineCause) {
+        let trip = self.quarantine.trip(cause);
+        if !trip.tripped {
+            return;
+        }
+        let record = &trip.record;
+        match &trip.persisted {
+            Ok(()) => tracing::error!(
+                id = %record.id,
+                cause = ?record.cause,
+                "quarantined; refusing every exchange until released"
+            ),
+            Err(e) => tracing::error!(
+                id = %record.id,
+                cause = ?record.cause,
+                error = %e,
+                marker = ?self.quarantine.marker(),
+                "quarantined, but writing the marker failed: whether a restart starts quarantined depends on whether the file landed; check it before restarting"
+            ),
+        }
+        self.emit_quarantined(record, false);
+    }
+
+    /// Logs a quarantine read back from the state dir, once per process.
+    fn announce_restored_quarantine(&self) {
+        if let Some(record) = self.quarantine.active()
+            && self.quarantine.take_announce()
+        {
+            tracing::error!(
+                id = %record.id,
+                since = %record.since.to_rfc3339(),
+                cause = ?record.cause,
+                "starting quarantined; refusing every exchange until released"
+            );
+            self.emit_quarantined(&record, true);
+        }
+    }
+
+    fn emit_quarantined(&self, record: &QuarantineRecord, restored: bool) {
+        self.sink.emit(&FlowEvent::Quarantined {
+            ts: Utc::now(),
+            id: record.id.clone(),
+            since: record.since,
+            cause: record.cause.clone(),
+            restored,
+        });
+    }
+
+    /// Counts a parse error towards the listener's threshold, tripping
+    /// the quarantine when it is reached.
+    fn note_parse_error(&self, c: &ClientConn, reason: &str) {
+        if !crate::quarantine::counts_as_probe(reason) {
+            return;
+        }
+        let Some(counter) = self.parse_error_trips.get(&c.listener.name) else {
+            return;
+        };
+        if counter.note(std::time::Instant::now()) {
+            let t = counter.threshold();
+            self.trip_quarantine(QuarantineCause::Threshold {
+                listener: c.listener.name.clone(),
+                counter: crate::quarantine::PARSE_ERRORS.to_owned(),
+                count: t.count,
+                window_seconds: t.window.as_secs(),
+            });
         }
     }
 
@@ -262,6 +351,7 @@ impl Shared {
             reason: reason.to_owned(),
             detail,
         });
+        self.note_parse_error(c, reason);
     }
 
     /// Spawns a connection task holding `slot` until it ends. The task is
@@ -273,13 +363,40 @@ impl Shared {
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let kill = self.kill.clone();
+        let cut = self.quarantine.cut_token();
         self.tasks.spawn(async move {
             let _slot = slot;
             tokio::select! {
                 () = fut => {}
                 () = kill.cancelled() => {}
+                () = cut_after_grace(cut, kill.clone()) => {}
             }
         });
+    }
+}
+
+/// One parse-error counter per listener with a `quarantine_on`.
+fn trip_counters(listeners: &[crate::config::ListenerSpec]) -> HashMap<String, TripCounter> {
+    listeners
+        .iter()
+        .filter_map(|l| {
+            l.quarantine_on
+                .map(|t| (l.name.clone(), TripCounter::new(t)))
+        })
+        .collect()
+}
+
+/// How long a connection open when the quarantine trips has to finish on
+/// its own. Long enough for the exchange that tripped it to write its
+/// refusal; short enough that a stream in flight carries little more.
+pub(crate) const CUT_GRACE: Duration = Duration::from_secs(1);
+
+/// Resolves [`CUT_GRACE`] after a quarantine trip, or at the kill switch.
+async fn cut_after_grace(cut: CancellationToken, kill: CancellationToken) {
+    cut.cancelled().await;
+    tokio::select! {
+        () = tokio::time::sleep(CUT_GRACE) => {}
+        () = kill.cancelled() => {}
     }
 }
 
@@ -423,6 +540,27 @@ impl ServerHandle {
         self.shared.secrets.swap(secrets);
     }
 
+    /// The quarantine in force, if any.
+    pub fn quarantine(&self) -> Option<Arc<QuarantineRecord>> {
+        self.shared.quarantine.active()
+    }
+
+    /// Releases the quarantine if `id` names the incident in force, and
+    /// logs the release. `Ok(false)`: `id` is not the active incident, so
+    /// nothing changed. `Err`: the marker could not be removed, and the
+    /// process stays quarantined.
+    pub fn release_quarantine(&self, id: &str) -> std::io::Result<bool> {
+        let released = self.shared.quarantine.release(id)?;
+        if released {
+            tracing::warn!(id, "quarantine released");
+            self.shared.sink.emit(&FlowEvent::QuarantineReleased {
+                ts: Utc::now(),
+                id: id.to_owned(),
+            });
+        }
+        Ok(released)
+    }
+
     /// Identifies the current snapshot: two calls return the same value
     /// only if no reload swapped it between them. For tests of the paths
     /// that must not rebuild.
@@ -472,6 +610,7 @@ impl Server {
         ));
         let mut snap = build_snapshot(policy, &dns, &upstream_tls, &secrets).map_err(StartError)?;
         snap.placeholder = cfg.placeholder_policy;
+        let parse_error_trips = trip_counters(&cfg.listeners);
         let shared = Arc::new(Shared {
             snapshot: ArcSwap::from_pointee(snap),
             secrets,
@@ -486,6 +625,8 @@ impl Server {
             connection_events: cfg.connection_events,
             ws_message_every: cfg.ws_message_every,
             layer_state: crate::addons::store::LayerStates::default(),
+            quarantine: cfg.quarantine,
+            parse_error_trips,
             buffers: Arc::new(BufferBudget::default()),
             caps: Arc::new(ConnCaps {
                 max: cfg.max_connections.max(1),
@@ -542,6 +683,7 @@ impl Server {
         for (name, addr) in &addrs {
             tracing::info!(listener = %name, %addr, "listening");
         }
+        shared.announce_restored_quarantine();
         Ok(Server {
             shared,
             listeners: addrs,

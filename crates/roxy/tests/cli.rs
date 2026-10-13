@@ -950,47 +950,56 @@ fn health_ready_conflicts_with_url() {
 /// End to end: `roxy health` against a running roxy's `ca_server`. With
 /// an expired lease the proxy is alive but not ready; a reload with a
 /// later one makes it ready without a restart.
-#[test]
-fn health_probes_a_running_roxy() {
-    let dir = tempfile::tempdir().unwrap();
-    let free = || {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-    };
-    let (proxy, ca) = (free(), free());
-    let cfg = dir.path().join("roxy.yaml");
-    let base = format!(
-        "version: 1\nlisteners: [{{ name: p, bind: \"{proxy}\" }}]\n\
-         ca_server: {{ bind: \"{ca}\" }}\ntls: {{ ca_dir: {:?} }}\n",
-        dir.path().join("ca").to_str().unwrap()
-    );
-    std::fs::write(&cfg, format!("{base}valid_until: 2000-01-01T00:00:00Z\n")).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_roxy"))
-        .args([
-            "--log-level",
-            "warn",
-            "run",
-            "--config",
-            cfg.to_str().unwrap(),
-        ])
+/// A free local address.
+fn free_addr() -> std::net::SocketAddr {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+/// `roxy run` in the background, its output discarded.
+fn spawn_run(args: &[&str]) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_roxy"))
+        .args(["--log-level", "warn", "run"])
+        .args(args)
         .env_remove("RUST_LOG")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .unwrap();
+        .unwrap()
+}
+
+/// Whether `roxy health --url` succeeds within about five seconds.
+fn probe_until_ok(url: &str) -> bool {
+    for _ in 0..100 {
+        if roxy(&["health", "--url", url]).status.success() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+/// A listener config with a CA server on `ca`, the CA under `dir`.
+fn health_config(dir: &Path, proxy: std::net::SocketAddr, ca: std::net::SocketAddr) -> String {
+    format!(
+        "version: 1\nlisteners: [{{ name: p, bind: \"{proxy}\" }}]\n\
+         ca_server: {{ bind: \"{ca}\" }}\ntls: {{ ca_dir: {:?} }}\n",
+        dir.join("ca").to_str().unwrap()
+    )
+}
+
+#[test]
+fn health_probes_a_running_roxy() {
+    let dir = tempfile::tempdir().unwrap();
+    let (proxy, ca) = (free_addr(), free_addr());
+    let cfg = dir.path().join("roxy.yaml");
+    let base = health_config(dir.path(), proxy, ca);
+    std::fs::write(&cfg, format!("{base}valid_until: 2000-01-01T00:00:00Z\n")).unwrap();
+    let mut child = spawn_run(&["--config", cfg.to_str().unwrap()]);
     let url = format!("http://{ca}/healthz");
     let ready_url = format!("http://{ca}/readyz");
-    let probe_until_ok = |url: &str| {
-        for _ in 0..100 {
-            if roxy(&["health", "--url", url]).status.success() {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        false
-    };
     let healthy = probe_until_ok(&url);
     let not_ready = healthy.then(|| roxy(&["health", "--url", &ready_url]));
     if healthy {
@@ -1010,4 +1019,74 @@ fn health_probes_a_running_roxy() {
     assert!(ready, "roxy never reported ready at {ready_url}");
     let out = roxy(&["health", "--url", &url]);
     assert_eq!(out.status.code(), Some(1), "a stopped roxy is unhealthy");
+}
+
+/// A start that finds a quarantine marker in `--state-dir` starts
+/// quarantined and says so: `health` prints it, and `readyz` refuses with
+/// the reason.
+#[test]
+fn health_reports_a_restored_quarantine() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::write(
+        state.join("quarantine"),
+        r#"{"id":"01TEST","since":"2026-10-13T12:00:00Z","cause":{"kind":"rule","rule":"exfil","flow":"f1"}}"#,
+    )
+    .unwrap();
+    let (proxy, ca) = (free_addr(), free_addr());
+    let cfg = dir.path().join("roxy.yaml");
+    std::fs::write(&cfg, health_config(dir.path(), proxy, ca)).unwrap();
+    let mut child = spawn_run(&[
+        "--config",
+        cfg.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+    ]);
+    let url = format!("http://{ca}/healthz");
+    let healthy = probe_until_ok(&url);
+    let health = roxy(&["health", "--url", &url]);
+    let ready = roxy(&["health", "--url", &format!("http://{ca}/readyz")]);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(healthy, "roxy never reported healthy at {url}");
+    assert_eq!(text(&health.stdout).trim(), "ok (quarantined)");
+    assert_eq!(ready.status.code(), Some(1), "quarantined: not ready");
+    assert!(
+        text(&ready.stderr).contains("quarantined"),
+        "{}",
+        text(&ready.stderr)
+    );
+}
+
+/// A config that can quarantine passes `check` (the state dir is a `run`
+/// concern) but does not `run` without `--state-dir`, since a quarantine
+/// that a restart forgets is no quarantine.
+#[test]
+fn a_config_that_can_quarantine_needs_a_state_dir_to_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("roxy.yaml");
+    for config in [
+        "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:0, quarantine_on: { parse_errors: \
+         { count: 3, window: 1m } } }]\ntls: { ca_dir: CA }\n",
+        "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:0 }]\ntls: { ca_dir: CA }\n\
+         rules: [{ id: r, then: quarantine }]\n",
+    ] {
+        let config = config.replace("CA", dir.path().join("ca").to_str().unwrap());
+        std::fs::write(&cfg, &config).unwrap();
+        let out = roxy(&["check", "--config", cfg.to_str().unwrap()]);
+        assert!(out.status.success(), "{config}: {}", text(&out.stderr));
+        let out = roxy(&["run", "--config", cfg.to_str().unwrap()]);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{config}: {}",
+            text(&out.stderr)
+        );
+        assert!(
+            text(&out.stderr).contains("needs --state-dir"),
+            "{config}: {}",
+            text(&out.stderr)
+        );
+    }
 }

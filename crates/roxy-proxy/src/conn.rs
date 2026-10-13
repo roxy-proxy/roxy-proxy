@@ -352,7 +352,8 @@ async fn terminate_tls(
     let tls = match tokio::time::timeout(cl.limits.header_timeout, accept).await {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
-            shared.emit_parse_reason(&client, None, "tls_handshake_failed", Some(&e.to_string()));
+            let reason = crate::quarantine::handshake_reason("tls_handshake_failed", Some(&e));
+            shared.emit_parse_reason(&client, None, reason, Some(&e.to_string()));
             return;
         }
         Err(_) => {

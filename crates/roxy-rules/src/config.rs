@@ -109,6 +109,9 @@ pub enum Action {
     Allow(AllowArgs),
     /// Terminal. Bare `deny` or `deny: { status, message, close }`.
     Deny(DenyArgs),
+    /// Terminal. Bare `quarantine`: a 403 deny that closes the connection
+    /// and puts the whole proxy into quarantine.
+    Quarantine,
     /// `set_header: { name: value, ... }`, in YAML order.
     SetHeader(Vec<(String, String)>),
     /// `remove_header: [names]`
@@ -140,6 +143,7 @@ impl Action {
     pub const NAMES: &'static [&'static str] = &[
         "allow",
         "deny",
+        "quarantine",
         "set_header",
         "remove_header",
         "rewrite_path",
@@ -173,6 +177,7 @@ impl Action {
         match self {
             Self::Allow(_) => "allow",
             Self::Deny(_) => "deny",
+            Self::Quarantine => "quarantine",
             Self::SetHeader(_) => "set_header",
             Self::RemoveHeader(_) => "remove_header",
             Self::RewritePath(_) => "rewrite_path",
@@ -190,7 +195,12 @@ impl Action {
 
     /// Whether this action is terminal (decides the rule's outcome).
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Allow(_) | Self::Deny(_))
+        matches!(self, Self::Allow(_) | Self::Deny(_) | Self::Quarantine)
+    }
+
+    /// Whether this action refuses the request (`deny` or `quarantine`).
+    pub fn is_deny(&self) -> bool {
+        matches!(self, Self::Deny(_) | Self::Quarantine)
     }
 }
 
@@ -378,14 +388,15 @@ fn unknown_action(name: &str) -> String {
 }
 
 impl Action {
-    /// A bare-word action (`allow`, `deny`).
+    /// A bare-word action (`allow`, `deny`, `quarantine`).
     fn from_word<E: de::Error>(word: &str) -> Result<Self, E> {
         match word {
             "allow" => Ok(Self::Allow(AllowArgs::default())),
             "deny" => Ok(Self::Deny(DenyArgs::default())),
+            "quarantine" => Ok(Self::Quarantine),
             other if Action::NAMES.contains(&other) => Err(E::custom(format!(
-                "action `{other}` needs an argument (write `{other}: ...`); only `allow` and \
-                 `deny` may be bare words"
+                "action `{other}` needs an argument (write `{other}: ...`); only `allow`, \
+                 `deny` and `quarantine` may be bare words"
             ))),
             other => Err(E::custom(unknown_action(other))),
         }
@@ -409,6 +420,12 @@ impl Action {
         let action = match name.as_str() {
             "allow" => Self::Allow(arg!(Option<AllowArgs>).unwrap_or_default()),
             "deny" => Self::Deny(arg!(Option<DenyArgs>).unwrap_or_default()),
+            "quarantine" => {
+                let _ = arg!(de::IgnoredAny);
+                return Err(de::Error::custom(
+                    "`quarantine` takes no argument; write the bare word",
+                ));
+            }
             "set_header" => Self::SetHeader(arg!(StringPairs).0),
             "remove_header" => Self::RemoveHeader(arg!(StringList).0),
             "rewrite_path" => Self::RewritePath(arg!(RewritePathArgs)),
@@ -441,7 +458,9 @@ impl<'de> Deserialize<'de> for Action {
         impl<'de> Visitor<'de> for V {
             type Value = Action;
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("an action: a bare word (`allow`, `deny`) or a single-key map")
+                f.write_str(
+                    "an action: a bare word (`allow`, `deny`, `quarantine`) or a single-key map",
+                )
             }
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Action, E> {
                 Action::from_word(v)
@@ -664,6 +683,8 @@ mod tests {
             [Action::Allow(AllowArgs::default())]
         );
         assert_eq!(then("deny").unwrap(), [Action::Deny(DenyArgs::default())]);
+        assert_eq!(then("quarantine").unwrap(), [Action::Quarantine]);
+        assert_eq!(then("[tag: x, quarantine]").unwrap()[1], Action::Quarantine);
         assert_eq!(
             then("[tag: x, allow]").unwrap(),
             [Action::Tag("x".into()), Action::Allow(AllowArgs::default())]
@@ -764,6 +785,11 @@ mod tests {
             ("tag", "action `tag` needs an argument"),
             ("{ deny: { stauts: 1 } }", "then.deny"),
             ("{ deny: {}, allow: {} }", "has `deny` and `allow`"),
+            (
+                "{ quarantine: { status: 451 } }",
+                "`quarantine` takes no argument",
+            ),
+            ("{ quarantine: ~ }", "`quarantine` takes no argument"),
             ("{}", "empty map is not an action"),
             ("[]", "at least one action"),
             ("~", "at least one action"),

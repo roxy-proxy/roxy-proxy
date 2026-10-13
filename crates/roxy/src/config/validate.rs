@@ -126,6 +126,23 @@ impl Config {
                     format!("bind address {} is already used by {first}", l.bind),
                 ));
             }
+            if let Some(q) = &l.quarantine_on {
+                if q.parse_errors.count == 0 {
+                    d.push(Diagnostic::new(
+                        format!("{path}.quarantine_on.parse_errors.count"),
+                        "must be at least 1",
+                    ));
+                }
+                // The window is reported in whole seconds wherever the
+                // incident is recorded, so it is accepted in whole seconds.
+                let window = q.parse_errors.window;
+                if window.is_zero() || window.subsec_nanos() != 0 {
+                    d.push(Diagnostic::new(
+                        format!("{path}.quarantine_on.parse_errors.window"),
+                        "must be a whole number of seconds, at least 1s",
+                    ));
+                }
+            }
         }
         if let Some(ca) = &self.ca_server
             && ca.bind.port() != 0

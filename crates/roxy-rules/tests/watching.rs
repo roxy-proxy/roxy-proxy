@@ -4,8 +4,8 @@ mod common;
 
 use common::{compile, try_compile};
 use roxy_rules::{
-    Deny, DenyStatus, EvalContext, FailClosedReason, Field, LogLevel, MapView, Reads, RuleKind,
-    Type, WatchEffect,
+    Decision, Deny, DenyStatus, EvalContext, FailClosedReason, Field, LogLevel, MapView, Reads,
+    RuleKind, Type, WatchEffect,
 };
 
 const ALL: Reads = Reads::ALL;
@@ -589,4 +589,86 @@ fn a_rule_waits_for_a_field_that_arrives_on_a_later_event() {
         )
         .unwrap();
     assert_eq!(o.terminal_rule.unwrap(), "w");
+}
+
+/// A watching `quarantine` that matched is reported even when a rule below
+/// it fails closed in the same pass.
+#[test]
+fn a_matched_watching_quarantine_survives_a_fail_closed() {
+    let p = compile(
+        common::METRICS,
+        r"
+- id: allow-all
+  then: allow
+- id: bad-status
+  when: response.status == 500
+  then: quarantine
+- id: too-much
+  when: response.status == 500 and metric.egress > 1mb
+  then: deny
+",
+    );
+    let head = p.evaluate_head(&MapView::new(), &EvalContext::empty());
+    let mut st = p.watch_state(&head.tags);
+    let o = p
+        .evaluate_watching(
+            ALL,
+            ALL,
+            &mut st,
+            &MapView::new().with_int(Field::ResponseStatus, 500),
+        )
+        .unwrap();
+    assert_eq!(o.stop, Some(Deny::fail_closed()));
+    assert_eq!(o.quarantine.unwrap(), "bad-status");
+}
+
+/// A watching `quarantine` stops the exchange like a deny and names its
+/// rule; one reading a byte metric is re-checked after forwarding as a
+/// `deny` is.
+#[test]
+fn a_watching_quarantine_stops_and_is_reported() {
+    let p = compile(
+        common::METRICS,
+        r"
+- id: allow-all
+  then: allow
+- id: too-much
+  when: metric.egress > 1mb
+  then: quarantine
+- id: bad-status
+  when: response.status == 500
+  then: quarantine
+",
+    );
+    assert_eq!(
+        p.rule_info().iter().map(|r| r.kind).collect::<Vec<_>>(),
+        [
+            RuleKind::Head,
+            RuleKind::HeadAndWatching,
+            RuleKind::Watching
+        ]
+    );
+    let ctx = EvalContext::empty();
+    let head = p.evaluate_head(&MapView::new().with_metric("egress", 0), &ctx);
+    assert!(head.decision.is_allow());
+    assert_eq!(head.quarantine, None);
+    let mut st = p.watch_state(&head.tags);
+    let o = p
+        .evaluate_watching(
+            ALL,
+            ALL,
+            &mut st,
+            &MapView::new()
+                .with_metric("egress", 0)
+                .with_int(Field::ResponseStatus, 500),
+        )
+        .unwrap();
+    assert_eq!(o.stop, Some(Deny::quarantine()));
+    assert_eq!(o.terminal_rule.unwrap(), "bad-status");
+    assert_eq!(o.quarantine.unwrap(), "bad-status");
+
+    // The metric rule takes part in the head decision too.
+    let head = p.evaluate_head(&MapView::new().with_metric("egress", 2 << 20), &ctx);
+    assert_eq!(head.decision, Decision::Deny(Deny::quarantine()));
+    assert_eq!(head.quarantine.unwrap(), "too-much");
 }

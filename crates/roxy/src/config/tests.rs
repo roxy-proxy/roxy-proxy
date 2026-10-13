@@ -592,6 +592,65 @@ fn listener_mode_http_is_accepted() {
     cfg.validate().unwrap();
 }
 
+/// `quarantine_on.parse_errors` needs a count of at least one and a window
+/// longer than zero: either at zero would quarantine on the first error,
+/// or never.
+#[test]
+fn quarantine_on_floors() {
+    let with = |count: &str, window: &str| {
+        format!(
+            "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:1, quarantine_on: {{ \
+             parse_errors: {{ count: {count}, window: {window} }} }} }}]\n"
+        )
+    };
+    let cfg = parse(&with("20", "1m"));
+    cfg.validate().unwrap();
+    let q = cfg.listeners[0].quarantine_on.as_ref().unwrap();
+    assert_eq!(q.parse_errors.count, 20);
+    assert_eq!(q.parse_errors.window, Duration::from_secs(60));
+
+    let d = diagnostics(&with("0", "1m"));
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].path, "listeners[0].quarantine_on.parse_errors.count");
+    for window in ["0s", "500ms", "1500ms"] {
+        let d = diagnostics(&with("1", window));
+        assert_eq!(d.len(), 1, "{window}: {d:?}");
+        assert_eq!(
+            d[0].path, "listeners[0].quarantine_on.parse_errors.window",
+            "{window}"
+        );
+    }
+
+    let yaml =
+        "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:1, quarantine_on: { denies: 3 } }]\n";
+    let err = Config::from_yaml(yaml).unwrap_err();
+    assert!(
+        describe_parse_error(yaml, &err).contains("unknown field `denies`"),
+        "{err}"
+    );
+}
+
+/// A config can quarantine through either a listener threshold or a
+/// `quarantine` action; a `deny` is not enough.
+#[test]
+fn uses_quarantine_sees_both_triggers() {
+    assert!(!parse(BASE).uses_quarantine());
+    assert!(!parse(&format!("{BASE}rules: [{{ id: r, then: deny }}]\n")).uses_quarantine());
+    assert!(
+        parse(&format!(
+            "{BASE}rules: [{{ id: r, then: [{{ tag: t }}, quarantine] }}]\n"
+        ))
+        .uses_quarantine()
+    );
+    assert!(
+        parse(
+            "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:1, quarantine_on: { \
+             parse_errors: { count: 1, window: 1s } } }]\n"
+        )
+        .uses_quarantine()
+    );
+}
+
 #[test]
 fn provided_ca_needs_cert_and_key() {
     let base = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:3128 }]\n";

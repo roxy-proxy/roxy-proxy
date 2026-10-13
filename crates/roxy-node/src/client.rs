@@ -388,6 +388,7 @@ pub(crate) mod tests {
             policy_state: PolicyState::Loaded,
             spooled_bytes: 7,
             seq_unreserved: false,
+            quarantine: None,
         }
     }
 
@@ -406,6 +407,7 @@ pub(crate) mod tests {
                 spool_high_water_bytes: 8 << 20,
                 on_high_water: OnHighWater::Spool,
             },
+            quarantine: None,
             interception_ca: None,
         }
     }
