@@ -21,13 +21,14 @@ Readiness reads the policy the proxy is evaluating against, so a reload
 with a later lease makes it ready without a restart.
 
 The `ca_server` listener has its own connection cap, separate from the
-proxy's: `limits.max_connections` in total and 16 per client IP. A client
-that fills the proxy's cap does not stop the probes answering, and one
-client address cannot fill the `ca_server` cap either. The per-IP cap
-cannot tell a probe from a client on the same address, so a workload that
-shares roxy's network namespace can hold the loopback slots `roxy health`
-connects through. Refused `ca_server` connections are logged with their
-reason in roxy's own log, not the flow log.
+proxy's: `limits.max_connections` in total and 16 per client IP (or the
+total, if lower). A client that fills the proxy's cap does not stop the
+probes answering, and one client address cannot fill the `ca_server` cap
+unless it is the total that is reached first. The per-IP cap cannot tell a
+probe from a client on the same address, so a workload that shares roxy's
+network namespace can hold the loopback slots `roxy health` connects
+through. Refused `ca_server` connections are logged in roxy's own log, not
+the flow log, with `reason` `max_connections` or `ca_server_per_client`.
 
 An empty policy is ready: it is a deny-all that someone applied, so a
 quarantined roxy stays in rotation and its refusals are audited. From a

@@ -82,7 +82,8 @@ pub(crate) enum PolicyState {
 /// connections apart from the proxy's, so a client filling
 /// `max_connections` cannot starve `/healthz` into a restart; the
 /// per-client cap is small because each connection serves one response
-/// and closes, and it keeps one client address from filling the total.
+/// and closes, and it keeps one client address from filling the total
+/// (unless the total is lower still).
 const CA_SERVER_MAX_CONNECTIONS_PER_CLIENT: usize = 16;
 
 /// Per-client and global connection counting.
@@ -654,9 +655,14 @@ pub(crate) fn conn_slot(shared: &Shared, ip: IpAddr) -> Option<ConnSlot> {
     shared.caps.acquire(ip).ok()
 }
 
-/// Acquires a slot from the `ca_server` listener's own cap.
+/// Acquires a slot from the `ca_server` listener's own cap. The per-client
+/// refusal is named for this listener, since `limits.max_connections_per_client`
+/// does not apply to it.
 pub(crate) fn ca_conn_slot(shared: &Shared, ip: IpAddr) -> Result<ConnSlot, &'static str> {
-    shared.ca_caps.acquire(ip)
+    shared.ca_caps.acquire(ip).map_err(|reason| match reason {
+        "max_connections_per_client" => "ca_server_per_client",
+        other => other,
+    })
 }
 
 #[cfg(test)]
