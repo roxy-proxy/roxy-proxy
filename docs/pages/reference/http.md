@@ -24,8 +24,8 @@ listeners:
 
 `quarantine_on.parse_errors` puts the whole process into
 [quarantine](/guides/operations#quarantine) once the listener has logged
-`count` parse errors within `window` (`count` at least 1, `window` longer
-than 0). It counts a client sending what roxy will not parse, not one that
+`count` parse errors within `window` (`count` at least 1, `window` a whole
+number of seconds, at least `1s`). It counts a client sending what roxy will not parse, not one that
 is slow or leaves. Setting it needs `roxy run --state-dir`.
 
 ## HTTP proxy

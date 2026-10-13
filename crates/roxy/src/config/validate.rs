@@ -133,10 +133,13 @@ impl Config {
                         "must be at least 1",
                     ));
                 }
-                if q.parse_errors.window.is_zero() {
+                // The window is reported in whole seconds wherever the
+                // incident is recorded, so it is accepted in whole seconds.
+                let window = q.parse_errors.window;
+                if window.is_zero() || window.subsec_nanos() != 0 {
                     d.push(Diagnostic::new(
                         format!("{path}.quarantine_on.parse_errors.window"),
-                        "must be longer than 0",
+                        "must be a whole number of seconds, at least 1s",
                     ));
                 }
             }

@@ -421,12 +421,10 @@ impl Action {
             "allow" => Self::Allow(arg!(Option<AllowArgs>).unwrap_or_default()),
             "deny" => Self::Deny(arg!(Option<DenyArgs>).unwrap_or_default()),
             "quarantine" => {
-                if arg!(Option<de::IgnoredAny>).is_some() {
-                    return Err(de::Error::custom(
-                        "`quarantine` takes no argument; write the bare word",
-                    ));
-                }
-                Self::Quarantine
+                let _ = arg!(de::IgnoredAny);
+                return Err(de::Error::custom(
+                    "`quarantine` takes no argument; write the bare word",
+                ));
             }
             "set_header" => Self::SetHeader(arg!(StringPairs).0),
             "remove_header" => Self::RemoveHeader(arg!(StringList).0),
@@ -791,6 +789,7 @@ mod tests {
                 "{ quarantine: { status: 451 } }",
                 "`quarantine` takes no argument",
             ),
+            ("{ quarantine: ~ }", "`quarantine` takes no argument"),
             ("{}", "empty map is not an action"),
             ("[]", "at least one action"),
             ("~", "at least one action"),

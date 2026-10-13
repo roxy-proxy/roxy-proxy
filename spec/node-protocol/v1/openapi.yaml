@@ -384,16 +384,40 @@ components:
           type: string
           format: date-time
         cause:
-          type: object
           description: >-
             What tripped it, as the node's `quarantined` flow event carries
-            it. `kind` is `rule` (with `rule` and `flow`) or `threshold`
-            (with `listener`, `counter`, `count` and `window_seconds`).
-          required: [kind]
-          properties:
-            kind:
-              type: string
-              enum: [rule, threshold]
+            it.
+          oneOf:
+            - type: object
+              description: A rule's `quarantine` action matched.
+              required: [kind, rule, flow]
+              properties:
+                kind:
+                  const: rule
+                rule:
+                  type: string
+                  minLength: 1
+                flow:
+                  type: string
+                  minLength: 1
+            - type: object
+              description: A listener's parse-error threshold was reached.
+              required: [kind, listener, counter, count, window_seconds]
+              properties:
+                kind:
+                  const: threshold
+                listener:
+                  type: string
+                  minLength: 1
+                counter:
+                  type: string
+                  enum: [parse_errors]
+                count:
+                  type: integer
+                  minimum: 1
+                window_seconds:
+                  type: integer
+                  minimum: 1
 
     LeaseQuarantine:
       type: object

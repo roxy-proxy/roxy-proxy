@@ -136,6 +136,10 @@ pub struct QuarantineState {
     /// replaced at once, so connections accepted afterwards (which the gate
     /// refuses) are not cut by the same trip.
     cut: Mutex<CancellationToken>,
+    /// Held for the whole of a trip or a release, memory and marker
+    /// together, so a release cannot slip between a trip's record and its
+    /// marker write and leave the two disagreeing.
+    transition: Mutex<()>,
     /// A restored quarantine is logged by the first server to start.
     announced: AtomicBool,
 }
@@ -175,6 +179,7 @@ impl QuarantineState {
             active: ArcSwapOption::from_pointee(active),
             marker,
             cut: Mutex::new(CancellationToken::new()),
+            transition: Mutex::new(()),
             announced: AtomicBool::new(false),
         }
     }
@@ -202,21 +207,23 @@ impl QuarantineState {
     /// changes first, so the gate refuses the next exchange whether or not
     /// the marker can be written.
     pub(crate) fn trip(&self, cause: QuarantineCause) -> Trip {
+        let _transition = self
+            .transition
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(existing) = self.active.load_full() {
+            return Trip {
+                record: existing,
+                tripped: false,
+                persisted: Ok(()),
+            };
+        }
         let fresh = Arc::new(QuarantineRecord {
             id: format!("q-{}", Ulid::generate()),
             since: Utc::now(),
             cause,
         });
-        let before = self
-            .active
-            .compare_and_swap(&None::<Arc<QuarantineRecord>>, Some(fresh.clone()));
-        if let Some(existing) = &*before {
-            return Trip {
-                record: existing.clone(),
-                tripped: false,
-                persisted: Ok(()),
-            };
-        }
+        self.active.store(Some(fresh.clone()));
         let persisted = match &self.marker {
             Some(path) => write_marker(path, &fresh),
             None => Ok(()),
@@ -237,6 +244,10 @@ impl QuarantineState {
     /// goes first, so a failure leaves the process quarantined. `Ok(false)`
     /// when `id` is not the active incident.
     pub fn release(&self, id: &str) -> io::Result<bool> {
+        let _transition = self
+            .transition
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let Some(active) = self.active.load_full() else {
             return Ok(false);
         };
@@ -244,14 +255,11 @@ impl QuarantineState {
             return Ok(false);
         }
         if let Some(path) = &self.marker {
-            match std::fs::remove_file(path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
-            }
+            remove_marker(path)
+                .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
         }
-        let before = self.active.compare_and_swap(&Some(active.clone()), None);
-        Ok(before.as_ref().is_some_and(|b| Arc::ptr_eq(b, &active)))
+        self.active.store(None);
+        Ok(true)
     }
 
     /// The token the connections accepted now are cut by.
@@ -282,11 +290,24 @@ fn write_marker(path: &Path, record: &QuarantineRecord) -> io::Result<()> {
     file.sync_all()?;
     drop(file);
     std::fs::rename(&tmp, path)?;
-    if let Some(dir) = path.parent() {
-        // The rename is durable once the directory is.
-        std::fs::File::open(dir)?.sync_all()?;
+    sync_dir(path)
+}
+
+/// Removes the marker; a marker already gone counts as removed.
+fn remove_marker(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => sync_dir(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
-    Ok(())
+}
+
+/// A rename or unlink is durable once the directory holding it is.
+fn sync_dir(path: &Path) -> io::Result<()> {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => std::fs::File::open(dir)?.sync_all(),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]

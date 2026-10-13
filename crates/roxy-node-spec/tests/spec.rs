@@ -226,6 +226,18 @@ fn node_state_quarantine_is_a_report_or_null() {
     assert!(validate("NodeState", &state).is_ok());
     state["quarantine"]["cause"]["kind"] = json!("mood");
     assert!(validate("NodeState", &state).is_err());
+    state["quarantine"]["cause"] = json!({"kind": "rule"});
+    assert!(
+        validate("NodeState", &state).is_err(),
+        "a rule cause names the rule"
+    );
+    state["quarantine"]["cause"] = json!({
+        "kind": "threshold", "listener": "proxy", "counter": "parse_errors",
+        "count": 20, "window_seconds": 60,
+    });
+    assert!(validate("NodeState", &state).is_ok());
+    state["quarantine"]["cause"]["window_seconds"] = json!(0);
+    assert!(validate("NodeState", &state).is_err());
     state["quarantine"] = json!({"id": "q-1"});
     assert!(validate("NodeState", &state).is_err());
     state["quarantine"] = json!("q-1");

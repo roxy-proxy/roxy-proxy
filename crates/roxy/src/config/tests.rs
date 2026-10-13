@@ -612,9 +612,14 @@ fn quarantine_on_floors() {
     let d = diagnostics(&with("0", "1m"));
     assert_eq!(d.len(), 1, "{d:?}");
     assert_eq!(d[0].path, "listeners[0].quarantine_on.parse_errors.count");
-    let d = diagnostics(&with("1", "0s"));
-    assert_eq!(d.len(), 1, "{d:?}");
-    assert_eq!(d[0].path, "listeners[0].quarantine_on.parse_errors.window");
+    for window in ["0s", "500ms", "1500ms"] {
+        let d = diagnostics(&with("1", window));
+        assert_eq!(d.len(), 1, "{window}: {d:?}");
+        assert_eq!(
+            d[0].path, "listeners[0].quarantine_on.parse_errors.window",
+            "{window}"
+        );
+    }
 
     let yaml =
         "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:1, quarantine_on: { denies: 3 } }]\n";
