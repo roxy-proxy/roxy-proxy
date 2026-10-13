@@ -300,7 +300,7 @@ impl Node {
     /// Ships whatever is still spooled, within `grace`, then stops the
     /// shipper. Only the shipper posts, so a batch it has in flight is not
     /// posted a second time. The bound holds mid-request: an upload still in
-    /// progress at the deadline is dropped. With no shipper (no identity
+    /// progress at the deadline is dropped. With no shipper (no token
     /// yet, or drained already) nothing could ship. Safe to abort: the
     /// shipper stays owned until a drain runs to its end.
     pub async fn drain(&self, grace: Duration) {

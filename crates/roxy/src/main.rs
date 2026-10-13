@@ -731,9 +731,10 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `roxy run --control-plane`: node mode. The listeners open at once and
 /// deny everything until the first lease. `SIGHUP` reopens the logs; there
-/// is no file to reload. A node that cannot proceed (no identity and no
-/// token, a token the control plane will not accept) exits non-zero, so an
-/// orchestrator sees a crash loop rather than a node denying for ever.
+/// is no file to reload. A node that cannot proceed (no node token and no
+/// enrolment token, a token the control plane will not accept) exits
+/// non-zero, so an orchestrator sees a crash loop rather than a node
+/// denying for ever.
 fn run_node(args: RunArgs) -> anyhow::Result<ExitCode> {
     let control_plane = args.control_plane.expect("clap: --control-plane");
     let state_dir = args.state_dir.expect("clap: --state-dir");
