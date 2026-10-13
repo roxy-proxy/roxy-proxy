@@ -13,9 +13,10 @@ arbitrary code, and may have root inside its own container or VM.
 public CA trust store used to verify upstreams, the upstreams the rules
 allow, and the proxies a listener's `forwarded_for` counts: the trusted
 hops of `X-Forwarded-For` are taken as written, so a client's identity is
-only as good as the load balancer that appended it. A hop that is missing
-or is not an address refuses the request rather than falling back to the
-peer ([HTTP](/reference/http#clients-behind-a-load-balancer)). Upstream responses are not treated as adversarial; roxy applies the
+only as good as the load balancer that appended it, and the network must
+let only those proxies reach the listener. A hop that is missing or is not
+an address refuses the request rather than falling back to the peer
+([HTTP](/reference/http#clients-behind-a-load-balancer)). Upstream responses are not treated as adversarial; roxy applies the
 size and time limits that protect its own resources and re-frames them so
 the client sees one clean wire form.
 

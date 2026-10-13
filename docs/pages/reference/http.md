@@ -93,6 +93,13 @@ order). Entries to its left are the client's own and are never read.
   accepted, before any header, so it counts the peer
   ([limits](/reference/limits#connections)).
 
+A hop count says how the header was built; it does not prove a connection
+came through those proxies. A client that can reach the listener directly
+can write N well-formed entries and choose its `client.ip`, so the
+listener must be reachable only from the trusted proxies, which is the
+network's claim to make (a security group, a private subnet), as
+containment is ([threat model](/design/threat-model#which-use-case-claims-what)).
+
 The setting is refused on an `http_proxy` listener: the requests inside a
 CONNECT tunnel carry whatever `X-Forwarded-For` the client wrote, and no
 proxy in front of roxy can add to them.
