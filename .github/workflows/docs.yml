@@ -93,6 +93,21 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: node scripts/publish.mjs "$REF_TYPE" "$REF_NAME" ../site
 
+      # The root was built before this release existed, so its version menu
+      # does not list it: rebuild the root from main too.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.ref_type == 'tag' && steps.publish.outputs.published == 'true'
+        with:
+          ref: main
+          path: main
+          persist-credentials: false
+      - name: Rebuild the root from main
+        if: github.ref_type == 'tag' && steps.publish.outputs.published == 'true'
+        working-directory: main/docs
+        run: |
+          npm ci
+          node scripts/publish.mjs branch main ../../site
+
       - name: Push the site
         if: steps.publish.outputs.published == 'true'
         working-directory: site
