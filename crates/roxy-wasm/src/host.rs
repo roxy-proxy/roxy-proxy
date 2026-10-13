@@ -173,16 +173,16 @@ pub trait LayerHost: Send + Sync + 'static {
     /// drop the record: wait if the log is behind, or fail.
     async fn record(&self, kind: String, json: String) -> Result<(), HostError>;
 
-    /// Read the layer's keyed store (capability `state`).
+    /// Read the state store (capability `state`).
     async fn state_get(&self, key: String) -> Result<Option<String>, HostError>;
 
-    /// Write the layer's keyed store (capability `state`). `Ok(Err(msg))`
-    /// is a refusal the guest sees (store full, value too large); `Err`
+    /// Write the state store (capability `state`). `Ok(Err(msg))` is a
+    /// refusal the guest sees (store full, key or value too long); `Err`
     /// fails the exchange closed.
     async fn state_put(
         &self,
         key: String,
-        json: String,
+        value: String,
         ttl_ms: Option<u64>,
     ) -> Result<Result<(), String>, HostError>;
 

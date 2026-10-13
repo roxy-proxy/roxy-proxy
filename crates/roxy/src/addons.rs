@@ -13,9 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use roxy_proxy::addons::{
-    AddonImpl, AddonSpec, EndpointPath, EndpointSpec, ServiceSpec, StateLimits,
-};
+use roxy_proxy::addons::{AddonImpl, AddonSpec, EndpointPath, EndpointSpec, ServiceSpec};
 use roxy_proxy::addr::PrivateAddrs;
 use roxy_rules::Condition;
 use roxy_wasm::{
@@ -162,18 +160,6 @@ fn part(p: crate::config::Part) -> roxy_proxy::addons::Part {
     }
 }
 
-fn state_limits(a: &Addon) -> StateLimits {
-    let d = StateLimits::default();
-    StateLimits {
-        max_entries: a.state.max_entries.map_or(d.max_entries, usize_of),
-        max_value_bytes: a
-            .state
-            .max_value_bytes
-            .map_or(d.max_value_bytes, |b| usize_of(b.as_u64())),
-        default_ttl: a.state.default_ttl.unwrap_or(d.default_ttl),
-    }
-}
-
 /// The addons of one config, compiled but not yet the loader's: the
 /// layers it keeps across reloads change only once the policy swap they
 /// belong to has succeeded.
@@ -217,7 +203,6 @@ impl AddonLoader {
                 },
                 kind,
                 endpoints: endpoints(a)?,
-                state: state_limits(a),
                 when,
                 sample: a.sample,
                 subscribe: roxy_proxy::addons::Subscription {

@@ -2213,6 +2213,38 @@ async fn records_and_state_reach_the_flow_log() {
     assert_eq!(errs[0]["kind"], "capability:metrics");
 }
 
+/// A layer's `state-put` writes the store the rules read: a rule keyed on
+/// the value denies the next exchange, and a `set_state` by a rule is what
+/// the layer's `state-get` returns.
+#[tokio::test]
+async fn layer_state_is_the_rules_state() {
+    use roxy_wasm::Capability;
+    let kit = Kit::builder()
+        .addon(AddonDef::test_layer("t").caps(&[Capability::State]))
+        .rules(
+            r#"
+- id: marked
+  when: state["k"] == '{"n":1}'
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#,
+        )
+        .start()
+        .await;
+    let a = kit.h1().await.call("GET", "/before", &[], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+
+    let a = cap(&kit, "state").await;
+    assert_eq!(a.text(), "Ok(()) Some(\"{\\\"n\\\":1}\")", "{a:?}");
+
+    let a = kit.h1().await.call("GET", "/after", &[], b"").await;
+    assert_eq!(a.status, 403, "{a:?}");
+    let ev = kit.events("flow", 3).await;
+    assert_eq!(ev[2]["terminal_rule"], "marked", "{ev:#?}");
+}
+
 // ---- guest bodies ---------------------------------------------------------
 
 /// A layer that traps after answering with a whole body still has the

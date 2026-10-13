@@ -12,6 +12,12 @@ use super::{AddonSpec, StackFlow, endpoint};
 use crate::flowlog::{FlowEvent, sink_ready};
 use crate::view::ProxyView;
 
+/// Longest key and value a layer may write to the state store. The store
+/// is the rules' own and outlives the exchange; a rule's keys and values
+/// come from config, a guest's from anywhere.
+pub(crate) const MAX_STATE_KEY_BYTES: usize = 1024;
+pub(crate) const MAX_STATE_VALUE_BYTES: usize = 64 * 1024;
+
 /// Layer `index` of an exchange's stack.
 pub(crate) struct StackHost {
     pub(crate) st: Arc<StackFlow>,
@@ -119,26 +125,33 @@ impl LayerHost for StackHost {
     }
 
     async fn state_get(&self, key: String) -> Result<Option<String>, HostError> {
-        Ok(self.st.shared.layer_state.get(&self.addon().name, &key))
+        Ok(self.st.shared.state.get(&key))
     }
 
     async fn state_put(
         &self,
         key: String,
-        json: String,
+        value: String,
         ttl_ms: Option<u64>,
     ) -> Result<Result<(), String>, HostError> {
-        if serde_json::from_str::<serde_json::Value>(&json).is_err() {
-            return Ok(Err("value is not JSON".to_owned()));
+        if key.len() > MAX_STATE_KEY_BYTES {
+            return Ok(Err(format!(
+                "key is {} bytes; the limit is {MAX_STATE_KEY_BYTES}",
+                key.len()
+            )));
         }
-        let addon = self.addon();
-        Ok(self.st.shared.layer_state.put(
-            &addon.name,
-            &addon.state,
-            &key,
-            &json,
-            ttl_ms.map(Duration::from_millis),
-        ))
+        if value.len() > MAX_STATE_VALUE_BYTES {
+            return Ok(Err(format!(
+                "value is {} bytes; the limit is {MAX_STATE_VALUE_BYTES}",
+                value.len()
+            )));
+        }
+        Ok(self
+            .st
+            .shared
+            .state
+            .set(&key, &value, ttl_ms.map(Duration::from_millis))
+            .map_err(|e| e.to_string()))
     }
 
     async fn metric_get(&self, id: String, key: Vec<String>) -> Result<Option<i64>, HostError> {

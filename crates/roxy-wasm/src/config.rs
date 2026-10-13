@@ -12,7 +12,7 @@ use std::time::Duration;
 pub enum Capability {
     /// `endpoints.call`: named outbound calls.
     Endpoints,
-    /// `flow.state-get` / `flow.state-put`: the layer's keyed store.
+    /// `flow.state-get` / `flow.state-put`: the state store.
     State,
     /// `flow.record`: structured events in the flow log.
     Record,

@@ -226,11 +226,11 @@ impl LayerHost for Mock {
     async fn state_put(
         &self,
         key: String,
-        json: String,
+        value: String,
         ttl_ms: Option<u64>,
     ) -> Result<Result<(), String>, HostError> {
-        self.call(format!("state_put {key} {json} {ttl_ms:?}"));
-        self.state.lock().unwrap().insert(key, json);
+        self.call(format!("state_put {key} {value} {ttl_ms:?}"));
+        self.state.lock().unwrap().insert(key, value);
         Ok(Ok(()))
     }
 

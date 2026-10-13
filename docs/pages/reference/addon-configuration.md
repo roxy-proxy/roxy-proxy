@@ -22,7 +22,6 @@ addons:
         url: https://ti.internal:8443/score
         path: prefix
         private_ok: true
-    state: { max_entries: 100000, max_value_bytes: 64kb, default_ttl: 6h }
     limits: { max_memory: 128mb, first_byte_timeout: 30s }
     config: { reject_at: 0.8 }
 
@@ -56,7 +55,6 @@ key; `roxy check` refuses a key on the other kind.
 | `capabilities` | wasm | list of `endpoints`, `state`, `record`, `metrics`, `log` | none | the [host services](/reference/host-services) the layer may call ([capabilities](/reference/addon-configuration#capabilities)) |
 | `config` | wasm | any YAML value | `null` | handed to the layer as a JSON document through `flow.config`; roxy does not read it. Map keys become strings (`1: a` is `{"1": "a"}`) |
 | `endpoints` | both | map of name to [endpoint](/reference/addon-configuration#endpoints) | none | named outbound targets. A WASM layer calls them with `endpoints.call`; a service layer's `endpoint` names one of them |
-| `state` | wasm | [store limits](/reference/addon-configuration#state) | defaults below | the layer's keyed store (`state-get`, `state-put`) |
 | `limits` | both | [limits](/reference/addon-configuration#limits) | defaults below | what the layer may cost roxy |
 
 ### `endpoints`
@@ -73,17 +71,6 @@ apply, and each call is an `endpoint_call` flow event.
 | `headers` | map of header to value | none | attached by roxy, replacing any the layer set. Values may use `${secret:name}` ([secrets](/reference/secrets)) |
 | `timeout` | duration, positive | `30s` | from the call to the response head; reading the layer's request body counts. Not applied to a service layer's connection to its endpoint, which `first_byte_timeout` bounds along with getting a stream |
 | `private_ok` | bool | `false` | the endpoint may be on a private, loopback or link-local address |
-
-### `state`
-
-The store takes JSON values under string keys, per layer, in memory.
-Nothing is evicted: a write when full fails and the layer decides.
-
-| key | values | default | what it does |
-|---|---|---|---|
-| `max_entries` | count | `100000` | most live entries |
-| `max_value_bytes` | size | `64kb` | largest value |
-| `default_ttl` | duration | `6h` | TTL for a `state-put` that gives none |
 
 ### `limits`
 
@@ -119,13 +106,13 @@ What the host holds for a guest outside `max_memory`, not configurable:
 | a whole body handed over in one piece (`body.bytes`) | 1 MiB; a larger body is streamed | `budget:body`: fails the exchange |
 | an endpoint call's request body | 16 MiB, read within the endpoint's timeout and charged to the [buffer budget](/reference/limits#buffer-budget) while the call runs | refuses the call |
 | endpoint calls in flight per exchange | 8; a further `endpoints.call` waits, before roxy takes its body, until one is answered | the call waits |
-| a state key | 1 KiB | refuses the call |
+| a state key, a state value | 1 KiB, 64 KiB | refuses the call |
 
 ### What `roxy check` refuses
 
 A missing `path` or one that does not exist; `endpoint` not among the
 addon's `endpoints`; a key of the other kind (`path`, `capabilities`,
-`config`, `state` and the WASM limits on a service layer; `endpoint`,
+`config` and the WASM limits on a service layer; `endpoint`,
 `max_connections` and `max_streams` on a WASM layer); `sample` on an
 enforcing layer, or outside (0, 1]; a zero `max_instances`, `max_memory`,
 `recycle_above_memory`, `first_byte_timeout`, endpoint `timeout`,
@@ -141,7 +128,7 @@ named [host services](/reference/host-services):
 | capability | grants |
 |---|---|
 | `endpoints` | `endpoints.call`: outbound calls to the layer's named `endpoints`, with roxy attaching the headers |
-| `state` | `flow.state-get`, `flow.state-put`: the layer's keyed store, sized by `state` |
+| `state` | `flow.state-get`, `flow.state-put`: the [state store](/reference/rate-limits#state) the rules use |
 | `record` | `flow.record`: structured events in the flow log |
 | `metrics` | `flow.metric-get`: read a metric for this flow's key |
 | `log` | `flow.log`: roxy's operational log |

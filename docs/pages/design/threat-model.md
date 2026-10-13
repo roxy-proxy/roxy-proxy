@@ -85,7 +85,7 @@ effects, never decisions, so adding a deny can only narrow what passes
 
 ## Never evict
 
-Bounded tables (metric series, rule state, addon state) never evict to make
+Bounded tables (metric series, the state store) never evict to make
 room. A flow that needs a new entry in a full table is denied instead, so a
 client cannot reset its own counter by churning keys
 ([rate limits](/reference/rate-limits#metrics)).

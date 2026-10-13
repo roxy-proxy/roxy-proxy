@@ -607,22 +607,6 @@ pub enum EndpointPath {
     Prefix,
 }
 
-/// An addon's keyed store. Nothing is evicted: a write when full
-/// fails and the addon decides.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct AddonState {
-    /// Most live entries (default 100 000).
-    #[serde(deserialize_with = "units::opt_count")]
-    pub max_entries: Option<u64>,
-    /// Largest value (default 64 KiB).
-    #[serde(deserialize_with = "units::opt_size")]
-    pub max_value_bytes: Option<ByteSize>,
-    /// TTL for writes that give none (default 6h).
-    #[serde(with = "humantime_serde")]
-    pub default_ttl: Option<Duration>,
-}
-
 /// How an addon is implemented.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -737,9 +721,6 @@ pub struct Addon {
     /// Named endpoints this addon may call.
     #[serde(default, deserialize_with = "units::unique_map")]
     pub endpoints: BTreeMap<String, Endpoint>,
-    /// The addon's keyed store.
-    #[serde(default)]
-    pub state: AddonState,
 }
 
 // ----- log ------------------------------------------------------------------
