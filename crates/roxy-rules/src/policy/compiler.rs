@@ -174,12 +174,17 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
     }
 
     /// Advice that does not stop a policy compiling: a metric keyed on a
-    /// field the client chooses freely (`path`, `url`, `query.raw`) holds as
-    /// many series as the client cares to send unless a `where` bounds it.
+    /// field the client chooses freely (`host`, `path`, `url`, `query.raw`,
+    /// `client.port`) holds as many series as the client cares to send unless
+    /// a `where` bounds it, and denied flows count too.
     pub(super) fn metric_warnings(metrics: &[MetricConfig]) -> Vec<Diagnostic> {
         let unbounded = |name: &str| {
-            Field::from_name(name)
-                .is_some_and(|f| matches!(f, Field::Path | Field::Url | Field::QueryRaw))
+            Field::from_name(name).is_some_and(|f| {
+                matches!(
+                    f,
+                    Field::Host | Field::Path | Field::Url | Field::QueryRaw | Field::ClientPort
+                )
+            })
         };
         let mut out = Vec::new();
         for (i, m) in metrics.iter().enumerate() {
