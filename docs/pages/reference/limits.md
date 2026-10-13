@@ -167,7 +167,10 @@ single reservation.
 - Bounded policy tables (metrics, state, addon state) never evict
   ([never evict](/design/threat-model#never-evict)).
 - The proxy port serves only proxy semantics and `roxy.internal`; health
-  and CA download live on the separate `ca_server` listener.
+  and CA download live on the separate `ca_server` listener, which has its
+  own fixed cap (64 connections, 16 per client IP) outside
+  `max_connections`, so filling the proxy's cap does not starve the
+  liveness probe.
 - A panic in a connection task closes that connection only.
 - On `SIGTERM` or Ctrl-C roxy stops accepting, drains exchanges in flight
   for up to 10 seconds, and flushes the flow log and capture before
