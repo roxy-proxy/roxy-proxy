@@ -229,9 +229,12 @@ class ControlPlane:
         self.check_version(body)
         if body.get("policy_state") not in ("none", "loaded", "expired"):
             raise ApiError(400, "bad_request", "policy_state must be none, loaded or expired")
-        for field in ("lease_id", "uptime_seconds", "spooled_bytes"):
+        for field in ("lease_id", "uptime_seconds", "spooled_bytes", "seq_unreserved"):
             if field not in body:
                 raise ApiError(400, "bad_request", f"{field} is required")
+        if body["seq_unreserved"]:
+            print(f"{node_id} is using flow seq values it has not persisted; a restart may reuse them",
+                  file=sys.stderr, flush=True)
         config, secrets = self.policy()
         digest = hashlib.sha256(config.encode() + json.dumps(secrets, sort_keys=True).encode()).hexdigest()
         return {

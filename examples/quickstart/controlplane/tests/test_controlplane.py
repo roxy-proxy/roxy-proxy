@@ -108,7 +108,8 @@ def test_renew_keeps_the_node_id(cp):
 
 
 STATE = {"lease_id": None, "roxy_version": "0.0.0", "protocol_version": 1,
-         "uptime_seconds": 0, "policy_state": "none", "spooled_bytes": 0}
+         "uptime_seconds": 0, "policy_state": "none", "spooled_bytes": 0,
+         "seq_unreserved": False}
 
 
 def test_lease_carries_the_config_with_secrets_moved_into_the_map(cp):
