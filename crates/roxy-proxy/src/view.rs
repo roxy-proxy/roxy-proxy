@@ -1,7 +1,7 @@
 //! The flow as the rule engine sees it ([`FlowView`]).
 //!
 //! [`FlowFacts`] is an owned summary of the flow (the request head is
-//! cloned, never the body), so the same view can be used for the head
+//! cloned, never the body), so the same view can be used for the admission
 //! decision, in-flight rules (with the byte counts so far), metric
 //! recording, and the flow log.
 //!

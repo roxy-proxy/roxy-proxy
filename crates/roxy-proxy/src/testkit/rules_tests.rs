@@ -322,9 +322,9 @@ async fn a_response_rule_replaces_an_upstream_5xx() {
     assert_eq!(ev["terminal_rule"], "hide-5xx");
 }
 
-/// An in-flight deny stops the exchange without cutting the pass short: a
+/// An in-flight deny stops the exchange without cutting the pass short: an
 /// in-flight rule below it that the same event triggers still runs, and its
-/// `log` effect reaches the flow log, as a head deny's would.
+/// `log` effect reaches the flow log, as an admission deny's would.
 #[tokio::test]
 async fn an_in_flight_deny_keeps_the_log_of_the_rule_below_it() {
     let kit = Kit::builder()

@@ -90,7 +90,7 @@ async fn the_default_denies_and_nothing_leaves() {
 }
 
 #[tokio::test]
-async fn a_deny_rule_wins_at_the_head() {
+async fn a_deny_rule_wins_at_admission() {
     let kit = kit().await;
     let a = kit.h1().await.call("GET", "/admin/users", &[], b"").await;
     assert_eq!(a.status, 403, "{a:?}");
@@ -130,12 +130,12 @@ async fn an_in_flight_rule_stops_an_upload_mid_body(h2: bool) {
 }
 
 #[tokio::test]
-async fn h1_a_watching_rule_stops_an_upload_mid_body() {
+async fn h1_an_in_flight_rule_stops_an_upload_mid_body() {
     an_in_flight_rule_stops_an_upload_mid_body(false).await;
 }
 
 #[tokio::test]
-async fn h2_a_watching_rule_stops_an_upload_mid_body() {
+async fn h2_an_in_flight_rule_stops_an_upload_mid_body() {
     an_in_flight_rule_stops_an_upload_mid_body(true).await;
 }
 
@@ -188,12 +188,12 @@ async fn an_in_flight_rule_stops_a_response_mid_body(h2: bool) {
 }
 
 #[tokio::test]
-async fn h1_a_watching_rule_stops_a_response_mid_body() {
+async fn h1_an_in_flight_rule_stops_a_response_mid_body() {
     an_in_flight_rule_stops_a_response_mid_body(false).await;
 }
 
 #[tokio::test]
-async fn h2_a_watching_rule_stops_a_response_mid_body() {
+async fn h2_an_in_flight_rule_stops_a_response_mid_body() {
     an_in_flight_rule_stops_a_response_mid_body(true).await;
 }
 
@@ -1112,7 +1112,7 @@ async fn recording_kit(rules: &str) -> (Kit, std::sync::Arc<Recording>) {
 /// A refused admission decision still applies the `log` and `set_state` of the
 /// rules that matched, and counts as denied.
 #[tokio::test]
-async fn a_head_deny_still_logs_and_writes_state() {
+async fn an_admission_deny_still_logs_and_writes_state() {
     let (kit, rec) = recording_kit(
         r#"
 - id: no-admin

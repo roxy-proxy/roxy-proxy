@@ -86,7 +86,7 @@
 //!   `remove_header` change the response**: they are legal only when the
 //!   rule reads response values and everything that can re-check it is
 //!   known before the response head is sent (`response.status`,
-//!   `response.header[..]`, `response.body.size`, `response.body.text`); a
+//!   `response.header[..]`, `response.body.size`, `response.body.text`); an
 //!   in-flight rule that does not read the response would change the
 //!   request, and one that also reads `body.bytes`, `response.body.bytes`
 //!   or a byte metric could match after the head was sent. Both are

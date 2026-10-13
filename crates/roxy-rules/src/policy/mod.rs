@@ -30,7 +30,7 @@ pub struct PolicyInput<'a> {
 /// A compiled metric definition. Counting is the proxy's job; this
 /// carries the shape and the compiled `where` filter, which reads admission
 /// fields only, so whether an exchange counts (and its series key) is
-/// fixed at the request head.
+/// fixed at admission.
 #[derive(Debug, Clone)]
 pub struct MetricDef {
     pub id: String,
