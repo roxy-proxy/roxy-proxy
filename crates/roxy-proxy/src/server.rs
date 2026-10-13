@@ -78,11 +78,11 @@ pub(crate) enum PolicyState {
     Expired,
 }
 
-/// Connections the `ca_server` listener holds at once, and per client IP.
-/// Fixed and separate from `limits.max_connections` so that a client
-/// filling the proxy's cap cannot starve `/healthz` into a restart; small
-/// because each connection serves one short response and then closes.
-const CA_SERVER_MAX_CONNECTIONS: usize = 64;
+/// Per-client cap on the `ca_server` listener. The listener counts its
+/// connections apart from the proxy's, so a client filling
+/// `max_connections` cannot starve `/healthz` into a restart; the
+/// per-client cap is small because each connection serves one response
+/// and closes, and it keeps one client address from filling the total.
 const CA_SERVER_MAX_CONNECTIONS_PER_CLIENT: usize = 16;
 
 /// Per-client and global connection counting.
@@ -500,7 +500,7 @@ impl Server {
                 state: Mutex::new((0, HashMap::new())),
             }),
             ca_caps: Arc::new(ConnCaps {
-                max: CA_SERVER_MAX_CONNECTIONS,
+                max: cfg.max_connections.max(1),
                 max_per_client: CA_SERVER_MAX_CONNECTIONS_PER_CLIENT,
                 state: Mutex::new((0, HashMap::new())),
             }),
@@ -648,10 +648,15 @@ async fn accept_loop(listener: Arc<dyn Listener>, shared: Arc<Shared>) {
     }
 }
 
-/// Acquires a connection slot for a CA-server connection, from the
-/// listener's own cap rather than the proxy's.
+/// Acquires a proxy connection slot outside the accept loop (the testkit).
+#[cfg(test)]
 pub(crate) fn conn_slot(shared: &Shared, ip: IpAddr) -> Option<ConnSlot> {
-    shared.ca_caps.acquire(ip).ok()
+    shared.caps.acquire(ip).ok()
+}
+
+/// Acquires a slot from the `ca_server` listener's own cap.
+pub(crate) fn ca_conn_slot(shared: &Shared, ip: IpAddr) -> Result<ConnSlot, &'static str> {
+    shared.ca_caps.acquire(ip)
 }
 
 #[cfg(test)]
