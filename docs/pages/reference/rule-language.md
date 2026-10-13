@@ -83,6 +83,18 @@ literal compared with them in another form never matches and is a compile
 error. Any rule reading `ws.*` makes roxy decode every WebSocket message
 and strip WebSocket extensions.
 
+The normalised `path` is what roxy forwards, but an upstream may change it
+again before resolving it: decode `%2F` to `/`, merge empty segments
+(`//admin`), strip `;params`, or fold case. A `deny` keyed on a path prefix
+is therefore fragile: `/a/..%2Fsecret` does not start with `/secret`, yet an
+upstream that decodes `%2F` first serves `/a/../secret`. An `allow` keyed on
+a prefix has the same gap. Allow exact paths, or a prefix together with a
+guard against every form the upstream reinterprets, raw or encoded
+(`not path contains "%2F"`, likewise `"%5C"`, `"//"`, `";"` and `"%3B"`; hex
+is upper-cased before matching, so one case suffices), and treat a path
+`deny` as defence in depth
+([URL normalisation](/reference/http#url-normalisation)).
+
 ### Missing values (`null`)
 
 An absent value is `null`: an unsent header or query parameter, an unset
