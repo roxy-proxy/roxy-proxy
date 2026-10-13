@@ -22,6 +22,7 @@
 use std::borrow::Cow;
 use std::fmt::{self, Write as _};
 use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -46,7 +47,8 @@ use crate::budget::{self, BufferLease, Exhausted};
 use crate::capture::Tap;
 use crate::exchange::{WriteFailure, emit_response_error};
 use crate::flowlog::{
-    ClientInfo, DecisionKind, DstInfo, FlowEvent, RequestInfo, ResponseInfo, Stage, Timing, TlsInfo,
+    ClientInfo, DecisionKind, DstInfo, FlowEvent, PeerInfo, RequestInfo, ResponseInfo, Stage,
+    Timing, TlsInfo,
 };
 use crate::in_flight::InFlight;
 use crate::io::ClientIo;
@@ -417,6 +419,9 @@ pub(crate) struct FlowMeta {
     pub snap: Arc<Snapshot>,
     pub flow: Ulid,
     pub client: ClientConn,
+    /// `client.ip`: the TCP peer, or the client `forwarded_for` resolved
+    /// from `X-Forwarded-For`. The one client identity of the exchange.
+    pub client_ip: IpAddr,
     pub tls: Option<TlsInfo>,
     /// The secret generation this exchange resolves from and redacts
     /// with: loaded on first use (the admission evaluation) and kept for the
@@ -427,6 +432,10 @@ pub(crate) struct FlowMeta {
 impl FlowMeta {
     pub(crate) fn conn_id(&self) -> String {
         self.client.id.to_string()
+    }
+
+    pub(crate) fn client_info(&self) -> ClientInfo {
+        client_info_as(&self.client, self.client_ip)
     }
 
     pub(crate) fn secrets(&self) -> &Arc<Secrets> {
@@ -589,10 +598,20 @@ pub(crate) fn request_facts(req: &CanonicalRequest) -> RequestFacts {
     }
 }
 
+/// `client` for an event with no exchange (a refused connection, a
+/// CONNECT, a head that did not parse): nothing has named a client but the
+/// TCP peer.
 pub(crate) fn client_info(c: &ClientConn) -> ClientInfo {
+    client_info_as(c, c.peer.ip())
+}
+
+fn client_info_as(c: &ClientConn, ip: IpAddr) -> ClientInfo {
     ClientInfo {
-        ip: c.peer.ip(),
-        port: c.peer.port(),
+        ip,
+        peer: PeerInfo {
+            ip: c.peer.ip(),
+            port: c.peer.port(),
+        },
     }
 }
 
@@ -620,9 +639,16 @@ impl FlowCx {
         client: ClientConn,
         tls: Option<TlsInfo>,
         req: &CanonicalRequest,
-    ) -> Self {
+    ) -> Result<Self, ParseError> {
+        // Identity first: the rules, metric keys and the flow log all key
+        // on it, so an exchange whose client cannot be named never starts.
+        let client_ip = match client.listener.forwarded_for {
+            Some(f) => crate::forwarded::client_ip(&req.headers, f.trusted_hops)?,
+            None => client.peer.ip(),
+        };
         let facts = FlowFacts {
             client: client.clone(),
+            client_ip,
             tls: tls.clone(),
             client_request: Some(request_facts(req)),
             request: Some(request_facts(req)),
@@ -631,12 +657,13 @@ impl FlowCx {
             response_body_bytes: None,
             ws: None,
         };
-        Self {
+        Ok(Self {
             meta: Arc::new(FlowMeta {
                 shared,
                 snap,
                 flow: Ulid::generate(),
                 client,
+                client_ip,
                 tls,
                 secrets: OnceLock::new(),
             }),
@@ -655,7 +682,7 @@ impl FlowCx {
             layer_reads_bytes: false,
             buffers: Vec::new(),
             logged: false,
-        }
+        })
     }
 
     fn note_outcome(&mut self, out: &Outcome) {
@@ -824,7 +851,7 @@ impl FlowCx {
             flow: Cow::Borrowed(self.flow.array_to_str(&mut flow_id)),
             conn: Cow::Borrowed(self.meta.client.id.array_to_str(&mut conn_id)),
             listener: Cow::Borrowed(&self.meta.client.listener.name),
-            client: client_info(&self.meta.client),
+            client: self.meta.client_info(),
             tls: self.meta.tls.as_ref().map(Cow::Borrowed),
             req,
             res,

@@ -16,7 +16,7 @@ use roxy_tls::{Ca, LeafMinter, UpstreamTlsOptions};
 
 use crate::addrlist::AddressLists;
 use crate::flowlog::{FlowSink, Redactor};
-use crate::listener::ListenerMode;
+use crate::listener::{ForwardedFor, ListenerInfo, ListenerMode};
 use crate::quarantine::{ParseErrorThreshold, QuarantineState};
 use crate::sources::{MetricSource, StateSource};
 use crate::upstream::{DnsSettings, UpstreamSettings};
@@ -30,6 +30,21 @@ pub struct ListenerSpec {
     /// `quarantine_on.parse_errors`: this many parse errors on the listener
     /// within the window quarantine the process. `None`: never.
     pub quarantine_on: Option<ParseErrorThreshold>,
+    /// `forwarded_for`: trust this many proxies' `X-Forwarded-For` entries.
+    /// `None`: the header is ignored. Only valid with `ListenerMode::Http`:
+    /// inside a CONNECT tunnel the header is the client's own. Callers
+    /// enforce this; the `roxy` binary does so in config validation.
+    pub forwarded_for: Option<ForwardedFor>,
+}
+
+impl ListenerSpec {
+    pub(crate) fn info(&self) -> ListenerInfo {
+        ListenerInfo {
+            name: self.name.clone(),
+            mode: self.mode,
+            forwarded_for: self.forwarded_for,
+        }
+    }
 }
 
 /// Fixed server configuration.

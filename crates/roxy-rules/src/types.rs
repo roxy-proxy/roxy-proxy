@@ -42,10 +42,8 @@ impl fmt::Display for Type {
 /// methods are case-sensitive: `get` is not `GET`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Field {
-    /// `client.ip` (ip)
+    /// `client.ip` (ip): the client as the proxy establishes it
     ClientIp,
-    /// `client.port` (int)
-    ClientPort,
     /// `listener.name` (string)
     ListenerName,
     /// `tls.sni` (string)
@@ -285,9 +283,8 @@ impl std::ops::BitOrAssign for Reads {
 }
 
 impl Field {
-    pub const ALL: [Field; 22] = [
+    pub const ALL: [Field; 21] = [
         Self::ClientIp,
-        Self::ClientPort,
         Self::ListenerName,
         Self::TlsSni,
         Self::TlsAlpn,
@@ -314,7 +311,6 @@ impl Field {
     pub fn name(self) -> &'static str {
         match self {
             Self::ClientIp => "client.ip",
-            Self::ClientPort => "client.port",
             Self::ListenerName => "listener.name",
             Self::TlsSni => "tls.sni",
             Self::TlsAlpn => "tls.alpn",
@@ -345,8 +341,7 @@ impl Field {
     pub fn ty(self) -> Type {
         match self {
             Self::ClientIp => Type::Ip,
-            Self::ClientPort
-            | Self::Port
+            Self::Port
             | Self::BodySize
             | Self::BodyBytes
             | Self::ResponseStatus
@@ -401,7 +396,6 @@ impl Field {
                 Some(InFlightValue::Ws)
             }
             Self::ClientIp
-            | Self::ClientPort
             | Self::ListenerName
             | Self::TlsSni
             | Self::TlsAlpn

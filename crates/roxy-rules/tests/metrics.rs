@@ -664,12 +664,12 @@ proptest! {
     #[test]
     fn windowed_requests_match_reference(ops in proptest::collection::vec(op(), 1..200)) {
         let c = TestClock::new();
-        let s = store_with("- { id: w, count: requests, key: [client.port], window: 6s }", 10, &c);
+        let s = store_with("- { id: w, count: requests, key: [port], window: 6s }", 10, &c);
         let d: u64 = 6_000_000_000;
         let w: u64 = 100_000_000;
         let mut now: u64 = 0;
         let mut events: Vec<(u64, u8)> = Vec::new();
-        let port = |k: u8| MapView::new().with_int(Field::ClientPort, i64::from(k));
+        let port = |k: u8| MapView::new().with_int(Field::Port, i64::from(k));
         for op in ops {
             match op {
                 Op::Record(k) => {

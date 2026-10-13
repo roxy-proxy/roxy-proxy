@@ -86,6 +86,19 @@ pub struct Listener {
     /// What on this listener quarantines the process. Absent = nothing.
     #[serde(default)]
     pub quarantine_on: Option<QuarantineOn>,
+    /// The proxies in front of this listener whose `X-Forwarded-For`
+    /// entries name the client. Absent = the header is ignored.
+    #[serde(default)]
+    pub forwarded_for: Option<ForwardedFor>,
+}
+
+/// `listeners[].forwarded_for`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardedFor {
+    /// How many proxies append to `X-Forwarded-For` before roxy; the
+    /// client is the entry this many from the right.
+    pub trusted_hops: u32,
 }
 
 /// `listeners[].quarantine_on`.

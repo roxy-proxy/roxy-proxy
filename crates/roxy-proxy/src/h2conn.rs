@@ -260,13 +260,20 @@ async fn serve_stream(
         known,
     );
     let method = req.method.clone();
-    let cx = FlowCx::new(
+    let cx = match FlowCx::new(
         ccx.shared.clone(),
         snap,
         ccx.client.clone(),
         Some(ccx.tls.clone()),
         &req,
-    );
+    ) {
+        Ok(cx) => cx,
+        Err(e) => {
+            ccx.shared.emit_parse_error(&ccx.client, None, &e);
+            respond.send_reset(h2::Reason::PROTOCOL_ERROR);
+            return;
+        }
+    };
     let mut front = H2Front {
         respond,
         fail,

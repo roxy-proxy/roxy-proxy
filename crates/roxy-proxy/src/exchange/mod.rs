@@ -440,7 +440,14 @@ pub(crate) async fn run(
     shared: &Arc<Shared>,
 ) -> Next {
     let snap = shared.snapshot();
-    let cx = FlowCx::new(shared.clone(), snap, client, tls, &req);
+    let cx = match FlowCx::new(shared.clone(), snap, client.clone(), tls, &req) {
+        Ok(cx) => cx,
+        Err(e) => {
+            drop(req);
+            close_on_parse_error(conn, None, &client, shared, &e).await;
+            return None;
+        }
+    };
     let (cx, outcome) = process(&mut conn, cx, req).await;
     match outcome {
         Outcome::Respond(res) => answer(conn, cx, Answer::Response(res)).await,

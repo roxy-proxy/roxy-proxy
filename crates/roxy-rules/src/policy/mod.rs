@@ -315,7 +315,7 @@ impl Policy {
 
     /// Problems worth reporting that do not stop `metrics` compiling, for
     /// `roxy check`: a key field the client chooses freely (`host`, `path`,
-    /// `url`, `query.raw`, `client.port`) on a metric with no `where`.
+    /// `url`, `query.raw`) on a metric with no `where`.
     pub fn metric_warnings(metrics: &[MetricConfig]) -> Vec<Diagnostic> {
         compiler::PolicyCompiler::metric_warnings(metrics)
     }

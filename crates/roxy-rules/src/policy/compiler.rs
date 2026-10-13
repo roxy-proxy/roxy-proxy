@@ -174,8 +174,8 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
     }
 
     /// Advice that does not stop a policy compiling: a metric keyed on a
-    /// field the client chooses freely (`host`, `path`, `url`, `query.raw`,
-    /// `client.port`) holds as many series as the client cares to send unless
+    /// field the client chooses freely (`host`, `path`, `url`, `query.raw`)
+    /// holds as many series as the client cares to send unless
     /// a `where` bounds it, and denied flows count too. `unique(..)` fields
     /// feed a sketch inside a series rather than naming one, so they are exempt.
     pub(super) fn metric_warnings(metrics: &[MetricConfig]) -> Vec<Diagnostic> {
@@ -187,7 +187,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 "bound it with a finite filter (`where: host in [\"api.example.com\"]`; \
                  `under` admits every subdomain) or lower `max_keys`",
             ),
-            Some(Field::Path | Field::Url | Field::QueryRaw | Field::ClientPort) => Some(
+            Some(Field::Path | Field::Url | Field::QueryRaw) => Some(
                 "a `where` on `host` limits whose values count, not how many, so give \
                  this metric a `where` that enumerates the values it keys on, or lower its \
                  `max_keys`",

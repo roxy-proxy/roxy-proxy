@@ -345,6 +345,16 @@ pub enum FlowEvent<'a> {
 /// The client side of a connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ClientInfo {
+    /// The client as the rules see it (`client.ip`).
+    pub ip: IpAddr,
+    /// The TCP peer the request arrived from. Its address is `ip` unless
+    /// the listener resolved the client from `X-Forwarded-For`.
+    pub peer: PeerInfo,
+}
+
+/// A TCP peer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PeerInfo {
     pub ip: IpAddr,
     pub port: u16,
 }
@@ -934,7 +944,10 @@ mod tests {
             listener: "proxy".into(),
             client: ClientInfo {
                 ip: "10.0.0.7".parse().unwrap(),
-                port: 51234,
+                peer: PeerInfo {
+                    ip: "10.0.0.7".parse().unwrap(),
+                    port: 51234,
+                },
             },
             tls: Some(Cow::Owned(TlsInfo {
                 sni: Some("api.github.com".into()),

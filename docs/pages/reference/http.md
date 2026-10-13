@@ -20,6 +20,11 @@ listeners:
     bind: 0.0.0.0:3128
     quarantine_on:             # optional; off when absent
       parse_errors: { count: 20, window: 1m }
+  - name: gateway
+    mode: http
+    bind: 0.0.0.0:8080
+    forwarded_for:             # optional; without it X-Forwarded-For is ignored
+      trusted_hops: 1          # the proxies in front of roxy: here, one load balancer
 ```
 
 `quarantine_on.parse_errors` puts the whole process into
@@ -27,6 +32,9 @@ listeners:
 `count` parse errors within `window` (`count` at least 1, `window` a whole
 number of seconds, at least `1s`). It counts a client sending what roxy will not parse, not one that
 is slow or leaves. Setting it needs `roxy run --state-dir`.
+
+`forwarded_for.trusted_hops` (at least 1; `mode: http` only) names the
+client from `X-Forwarded-For` ([below](/reference/http#clients-behind-a-load-balancer)).
 
 ## HTTP proxy
 
@@ -54,6 +62,47 @@ For a gateway behind a TLS-terminating load balancer
   HTTP; `redirect` with `scheme: https` sends it on over TLS.
 - `roxy.internal` is a host like any other.
 - A TLS handshake is closed at the record header (`tls_on_http_listener`).
+
+### Clients behind a load balancer
+
+Without `forwarded_for`, `client.ip` is the TCP peer: behind a load
+balancer, the load balancer. With `forwarded_for.trusted_hops: N`, each of
+the N proxies in front of roxy is taken to append the address it accepted
+the connection from to `X-Forwarded-For`, so the client is the Nth entry
+from the right of the header (every `X-Forwarded-For` line joined in
+order). Entries to its left are the client's own and are never read.
+
+- That address is `client.ip` in rules, metric keys and the flow log, and
+  the addon principal's `client_ip`: roxy has one notion of the client.
+  The flow log keeps the TCP peer as `client.peer` for forensics
+  ([flow log](/reference/flow-log#flow-log)).
+- Each request is resolved on its own: a kept-alive connection from a load
+  balancer carries many clients.
+- A request with fewer entries than hops, a trusted entry that is not a
+  bare IPv4 or IPv6 address (a port, brackets, a zone, `unknown`, an
+  obfuscated identifier), or a header over 4 KiB in all is refused as a
+  request roxy cannot parse: `400`, reason `forwarded_for_invalid`, the
+  connection closed, counted by `quarantine_on.parse_errors`. It is never
+  attributed to the peer: a bypassed or misconfigured load balancer must
+  neither let a client choose its address nor fold every client into one.
+- An IPv4-mapped IPv6 entry (`::ffff:a.b.c.d`) is the IPv4 address it
+  embeds, as a host literal is.
+- The header goes upstream as received; roxy neither appends the peer nor
+  strips it.
+- `limits.max_connections_per_client` is applied when the connection is
+  accepted, before any header, so it counts the peer
+  ([limits](/reference/limits#connections)).
+
+A hop count says how the header was built; it does not prove a connection
+came through those proxies. A client that can reach the listener directly
+can write N well-formed entries and choose its `client.ip`, so the
+listener must be reachable only from the trusted proxies, which is the
+network's claim to make (a security group, a private subnet), as
+containment is ([threat model](/design/threat-model#which-use-case-claims-what)).
+
+The setting is refused on an `http_proxy` listener: the requests inside a
+CONNECT tunnel carry whatever `X-Forwarded-For` the client wrote, and no
+proxy in front of roxy can add to them.
 
 ## CONNECT
 
@@ -188,6 +237,9 @@ the others refuse for the same reason.
   `100 Continue` once the rules allow the request; when a rule reads the
   request body it goes out before the body is judged, and a deny follows
   the body.
+- On a listener with `forwarded_for`, `X-Forwarded-For` must name the
+  client at the trusted hop
+  (`forwarded_for_invalid`; [clients behind a load balancer](/reference/http#clients-behind-a-load-balancer)).
 - Hop-by-hop fields (`Connection` and every field it names, `Keep-Alive`,
   `Proxy-Connection`, `Proxy-Authorization`, `Proxy-Authenticate`, `TE`,
   `Trailer`, `Transfer-Encoding`, `Upgrade`) are consumed and never

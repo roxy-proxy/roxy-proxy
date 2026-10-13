@@ -692,7 +692,7 @@ pub(super) fn open_message(st: &StackFlow, index: usize, mode: AddonMode) -> Out
         layer: addon.name.clone(),
         mode: mode.as_str(),
         subscribe: addon.subscribe.into(),
-        client_ip: st.client.peer.ip().to_string(),
+        client_ip: st.client_ip.to_string(),
         listener: st.client.listener.name.clone(),
         sni: st.tls.as_ref().and_then(|t| t.sni.clone()),
         tags: st.tags(),

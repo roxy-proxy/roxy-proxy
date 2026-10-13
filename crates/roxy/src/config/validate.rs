@@ -8,7 +8,7 @@ use roxy_rules::template::{parse_template, secret_names};
 use roxy_rules::{Condition, Diagnostic, Policy, PolicyInput};
 use std::collections::{HashMap, HashSet};
 
-use super::{AddressListSource, CONFIG_VERSION, Config, UpstreamVerify};
+use super::{AddressListSource, CONFIG_VERSION, Config, ListenerMode, UpstreamVerify};
 
 /// What compiling a valid config produces. Built once by
 /// [`Config::validate`] and handed on, so the run path, `roxy check` and
@@ -140,6 +140,22 @@ impl Config {
                     d.push(Diagnostic::new(
                         format!("{path}.quarantine_on.parse_errors.window"),
                         "must be a whole number of seconds, at least 1s",
+                    ));
+                }
+            }
+            if let Some(f) = &l.forwarded_for {
+                if f.trusted_hops == 0 {
+                    d.push(Diagnostic::new(
+                        format!("{path}.forwarded_for.trusted_hops"),
+                        "must be at least 1",
+                    ));
+                }
+                // Inside a CONNECT tunnel the header comes from the client,
+                // not from a proxy in front of roxy.
+                if l.mode != ListenerMode::Http {
+                    d.push(Diagnostic::new(
+                        format!("{path}.forwarded_for"),
+                        "needs `mode: http`: a proxy cannot add X-Forwarded-For inside a CONNECT tunnel",
                     ));
                 }
             }
