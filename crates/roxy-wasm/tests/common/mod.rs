@@ -54,7 +54,7 @@ pub struct Mock {
     pub upload: tokio::sync::watch::Sender<Option<Result<Bytes, BodyError>>>,
     /// What `failed` was told.
     pub failed: Mutex<Vec<LayerError>>,
-    /// The layer's keyed store.
+    /// The state store.
     pub state: Mutex<HashMap<String, String>>,
     /// The flow's tags; `add_tag` refuses past `MOCK_TAG_CAP`.
     pub tags: Mutex<Vec<String>>,

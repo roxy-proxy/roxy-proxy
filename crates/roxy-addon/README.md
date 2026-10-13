@@ -98,7 +98,8 @@ against 0.2, which keeps the API below.
 - **Host services** in [`flow`], each behind a capability granted in roxy's
   config:
   - `record` writes structured audit events to the flow log;
-  - `state_get` and `state_put` read and write a keyed store with TTLs;
+  - `state_get` and `state_put` read and write the state store the rules
+    use, with TTLs;
   - `metric_get` reads a metric;
   - `log` writes to roxy's operational log.
 - **Named endpoints.** [`call_endpoint`] calls an endpoint configured in

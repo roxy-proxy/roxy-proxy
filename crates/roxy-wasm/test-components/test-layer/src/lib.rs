@@ -428,6 +428,10 @@ fn call_capability(req: &RequestHead) -> String {
             let got = flow::state_get("k");
             format!("{put:?} {got:?}")
         }
+        "state-get" => {
+            let key = header(req, "x-cap-key").unwrap_or_else(|| "k".to_owned());
+            format!("{:?}", flow::state_get(&key))
+        }
         "metric" => format!(
             "{:?}",
             flow::metric_get("requests", &["10.0.0.1".to_owned()])

@@ -524,7 +524,7 @@ impl TryFrom<RawAddressList> for AddressList {
 pub enum Capability {
     /// Named outbound calls (`endpoints:`).
     Endpoints,
-    /// The addon's keyed store.
+    /// The state store the rules use.
     State,
     /// Structured events in the flow log (and the audit endpoint).
     Record,

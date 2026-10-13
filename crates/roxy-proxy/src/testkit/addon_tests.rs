@@ -1873,6 +1873,29 @@ async fn one(def: AddonDef) -> Kit {
     Kit::builder().addon(def).start().await
 }
 
+/// A state store that keeps what it is given.
+#[derive(Default)]
+struct MemState(std::sync::Mutex<std::collections::HashMap<String, String>>);
+
+impl crate::sources::StateSource for MemState {
+    fn get(&self, key: &str) -> Option<String> {
+        self.0.lock().unwrap().get(key).cloned()
+    }
+
+    fn set(
+        &self,
+        key: &str,
+        value: &str,
+        _ttl: Option<std::time::Duration>,
+    ) -> Result<(), crate::sources::StateFull> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), value.to_owned());
+        Ok(())
+    }
+}
+
 /// `x-test-t: caps` with `x-cap`.
 async fn cap(kit: &Kit, cap: &str) -> super::Answer {
     kit.h1()
@@ -2197,7 +2220,11 @@ async fn a_record_kind_is_redacted_like_its_document() {
 #[tokio::test]
 async fn records_and_state_reach_the_flow_log() {
     use roxy_wasm::Capability;
-    let kit = one(AddonDef::test_layer("t").caps(&[Capability::Record, Capability::State])).await;
+    let kit = Kit::builder()
+        .addon(AddonDef::test_layer("t").caps(&[Capability::Record, Capability::State]))
+        .state(std::sync::Arc::new(MemState::default()))
+        .start()
+        .await;
     let a = cap(&kit, "record").await;
     assert_eq!(a.text(), "ok", "{a:?}");
     let r = kit.events("layer_record", 1).await;
@@ -2221,11 +2248,16 @@ async fn layer_state_is_the_rules_state() {
     use roxy_wasm::Capability;
     let kit = Kit::builder()
         .addon(AddonDef::test_layer("t").caps(&[Capability::State]))
+        .state(std::sync::Arc::new(MemState::default()))
         .rules(
             r#"
 - id: marked
-  when: state["k"] == '{"n":1}'
+  when: >-
+    state["k"] == "{\"n\":1}"
   then: deny
+- id: mark
+  when: path == "/mark"
+  then: [{ set_state: { key: r, value: from-rule } }, deny]
 - id: up
   when: host == "up.test"
   then: allow
@@ -2241,8 +2273,42 @@ async fn layer_state_is_the_rules_state() {
 
     let a = kit.h1().await.call("GET", "/after", &[], b"").await;
     assert_eq!(a.status, 403, "{a:?}");
-    let ev = kit.events("flow", 3).await;
+    let ev = kit.events("request", 3).await;
     assert_eq!(ev[2]["terminal_rule"], "marked", "{ev:#?}");
+
+    // The other way: a rule's set_state is what the layer reads.
+    let a = kit
+        .h1()
+        .await
+        .call(
+            "GET",
+            "/mark",
+            &[
+                ("x-test-t", "caps"),
+                ("x-cap", "state-get"),
+                ("x-cap-key", "r"),
+            ],
+            b"",
+        )
+        .await;
+    assert_eq!(a.text(), "None", "{a:?}");
+    let a = kit.h1().await.call("GET", "/mark", &[], b"").await;
+    assert_eq!(a.status, 403, "{a:?}");
+    let a = kit
+        .h1()
+        .await
+        .call(
+            "GET",
+            "/x",
+            &[
+                ("x-test-t", "caps"),
+                ("x-cap", "state-get"),
+                ("x-cap-key", "r"),
+            ],
+            b"",
+        )
+        .await;
+    assert_eq!(a.text(), "Some(\"from-rule\")", "{a:?}");
 }
 
 // ---- guest bodies ---------------------------------------------------------
