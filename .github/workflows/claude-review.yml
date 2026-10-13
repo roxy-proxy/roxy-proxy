@@ -1,6 +1,5 @@
 name: PR Review
 
-
 on:
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
@@ -46,10 +45,14 @@ jobs:
             CLAUDE.md, which sets this repo's priorities.
 
             Provide detailed feedback using inline comments for specific issues.
-            Use top-level comments for general observations or praise. If there
-            are no blocking issues, run exactly:
+            Use top-level comments for general observations or praise. 
+            
+            If there are no blocking issues, and you are confident in your assessment of
+            the PR, run exactly:
             gh pr review ${{ github.event.pull_request.number }} --approve --body "<short summary>"
 
+            If a PR is too large or complex for you to have high confidence in your opinion,
+            then you should offer whatever insight you can via comments, without approving.
 
           # Tools for comprehensive PR review
           claude_args: |
