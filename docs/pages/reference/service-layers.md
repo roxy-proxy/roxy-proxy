@@ -115,8 +115,8 @@ layer has by message, each behind the same capability granted in the
 layer's `capabilities`, and answered by the same host: a call means the
 same, is refused for the same reasons and fails the exchange with the same
 `layer_error.kind`, whichever kind of layer makes it. A call may be sent at
-any point while the stream is open, and runs beside the stream: it does not
-wait for, or hold up, the bodies.
+any point while the stream is open; it neither waits for nor holds up the
+bodies.
 
 | service → roxy | capability | roxy → service |
 |---|---|---|
@@ -127,8 +127,10 @@ wait for, or hold up, the bodies.
 | `{"type":"state_put","id":n,"key":"…","value":"…","ttl_ms":n?}` | `state`; enforce only | `{"type":"result","id":n,"value":null}`, or `"error"` for a key or value over its cap |
 | `{"type":"metric_get","id":n,"metric":"…"}` | `metrics` | `{"type":"result","id":n,"value":n}` (`null` for a key with no entry) |
 
-`id` is the service's, any integer, echoed in the `result`; replies may
-come in any order. A call on a stream that has ended is dropped. A call without its capability, a `log` message or
+`id` is the service's, any integer, echoed in the `result`. Calls run in
+order, one at a time per stream, beside the bodies; at most 64 may be
+waiting, and more is a protocol violation. A call on a stream that has
+ended is dropped. A call without its capability, a `log` message or
 `record` document over 64 KiB, an `add_tag` or `state_put` from an observer,
 a full state store or a `record` the flow log cannot take fails the exchange
 (`layer_error`, kind `capability:<name>`, `budget:message`, `budget:tags`

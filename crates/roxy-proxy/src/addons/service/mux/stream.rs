@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use roxy_http::{Body, BodyError, BodySender};
 use roxy_wasm::LayerResponse;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::super::super::{AddonMode, StackError, StackFlow};
@@ -20,6 +20,11 @@ use crate::in_flight::Dir;
 
 /// Largest body frame roxy sends, so streams share the socket fairly.
 pub(super) const MAX_BODY_FRAME: usize = 64 * 1024;
+
+/// Most host-service calls a stream may have waiting. They run in order on
+/// one task per stream, so a service that sends faster than the host
+/// answers is bounded here rather than by memory.
+pub(crate) const MAX_HOST_CALLS_WAITING: usize = 64;
 
 /// The service's answers to an enforce stream, in protocol order.
 pub(crate) struct Answers {
@@ -39,6 +44,8 @@ pub(crate) struct Stream {
     /// Wakes whatever is sending or waiting on the stream once it ended.
     pub(super) ended: CancellationToken,
     pub(super) wire: Arc<Wire>,
+    /// Host-service calls waiting for the stream's worker, once it has one.
+    pub(super) calls: Mutex<Option<mpsc::Sender<In>>>,
 }
 
 pub(super) struct StreamState {
@@ -454,9 +461,7 @@ impl Stream {
     /// A control message from the service.
     pub(super) fn control(self: &Arc<Self>, m: In) {
         if m.is_host_call() {
-            let s = self.clone();
-            tokio::spawn(async move { s.host_call(m).await });
-            return;
+            return self.queue_host_call(m);
         }
         match m {
             In::Credit { dir, bytes } => {
@@ -581,20 +586,51 @@ impl Stream {
         }
     }
 
-    /// A host-service call from the service, answered with a `result`
-    /// when it named an `id`. A failure fails the stream, so the exchange,
-    /// as it would a WASM layer's.
-    async fn host_call(self: Arc<Self>, m: In) {
-        match super::super::host::call(&self.st, self.index, m).await {
-            Ok(Some((id, result))) => {
-                let (value, error) = match result {
-                    Ok(v) => (Some(v), None),
-                    Err(e) => (None, Some(e)),
-                };
-                self.send(&Out::Result { id, value, error }).await;
+    /// Hands a host-service call to the stream's worker, started on the
+    /// first call. The queue is bounded: a service with more than
+    /// [`MAX_HOST_CALLS_WAITING`] unanswered has broken the protocol.
+    fn queue_host_call(self: &Arc<Self>, m: In) {
+        let mut calls = lock(&self.calls);
+        let tx = calls.get_or_insert_with(|| {
+            let (tx, rx) = mpsc::channel(MAX_HOST_CALLS_WAITING);
+            tokio::spawn(self.clone().host_calls(rx));
+            tx
+        });
+        // A worker gone with the stream (`Closed`) drops the call.
+        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(m) {
+            drop(calls);
+            self.fail(
+                ServiceError::Protocol(format!(
+                    "more than {MAX_HOST_CALLS_WAITING} host calls waiting"
+                )),
+                Reset::Send,
+            );
+        }
+    }
+
+    /// The stream's host-service worker: each call in turn, answered with
+    /// a `result` when it named an `id`, until the stream ends. A failure
+    /// fails the stream, so the exchange, as it would a WASM layer's.
+    async fn host_calls(self: Arc<Self>, mut rx: mpsc::Receiver<In>) {
+        loop {
+            let m = tokio::select! {
+                () = self.ended.cancelled() => return,
+                m = rx.recv() => match m {
+                    Some(m) => m,
+                    None => return,
+                },
+            };
+            match super::super::host::call(&self.st, self.index, m).await {
+                Ok(Some((id, result))) => {
+                    let (value, error) = match result {
+                        Ok(v) => (Some(v), None),
+                        Err(e) => (None, Some(e)),
+                    };
+                    self.send(&Out::Result { id, value, error }).await;
+                }
+                Ok(None) => {}
+                Err(e) => return self.fail(ServiceError::Layer(e), Reset::Send),
             }
-            Ok(None) => {}
-            Err(e) => self.fail(ServiceError::Layer(e), Reset::Send),
         }
     }
 
@@ -704,6 +740,7 @@ pub(crate) async fn open(
             more_credit: Notify::new(),
             ended: CancellationToken::new(),
             wire: Arc::default(),
+            calls: Mutex::new(None),
         });
         s.open.insert(id, stream.clone());
         stream

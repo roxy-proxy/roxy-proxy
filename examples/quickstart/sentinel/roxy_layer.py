@@ -154,10 +154,11 @@ class _Conn:
                 msg = json.loads(m)
                 self._control(msg)
         finally:
-            tasks = [s.task for s in self.streams.values()]
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            streams = list(self.streams.values())
+            for s in streams:
+                s.fail_calls(ProtocolError("the connection closed"))
+                s.task.cancel()
+            await asyncio.gather(*(s.task for s in streams), return_exceptions=True)
 
     def _control(self, msg: dict[str, Any]) -> None:
         sid = msg["stream"]
@@ -182,6 +183,7 @@ class _Conn:
                 fut.set_result(msg)
         elif kind == "reset":
             self.streams.pop(sid, None)
+            s.fail_calls(ProtocolError("roxy reset the stream"))
             s.task.cancel()
         else:
             s.inbox(_DIR_OF_MESSAGE.get(kind, REQUEST)).put_nowait(msg)
@@ -210,9 +212,18 @@ class _Stream:
         self.pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._next_call = 0
 
+    def fail_calls(self, exc: Exception) -> None:
+        """Unblocks every call still waiting for its `result`: the stream
+        is gone, so none is coming."""
+        for fut in self.pending.values():
+            if not fut.done():
+                fut.set_exception(exc)
+        self.pending.clear()
+
     async def call(self, msg: dict[str, Any]) -> Any:
         """Sends a host-service call that gets a `result` and returns its
-        value, raising `HostError` on a refusal."""
+        value, raising `HostError` on a refusal and `ProtocolError` if the
+        stream ends first."""
         self._next_call += 1
         cid = self._next_call
         msg["id"] = cid
