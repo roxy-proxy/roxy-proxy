@@ -153,7 +153,9 @@ the others refuse for the same reason.
 - Names are `token`s, no whitespace before the colon, no obs-fold.
 - Values are visible ASCII, SP and HTAB, surrounding whitespace stripped.
   CR, LF, NUL and other controls are rejected; non-ASCII needs
-  `http.allow_obs_text`.
+  `http.allow_obs_text`, under which the rules read each such byte as the
+  ISO-8859-1 character of the same value
+  ([comparison](/reference/rule-language#expressions)).
 - At most `limits.max_headers` (100) fields.
 - Exactly one `Host`, matching the URI authority (absolute-form) or the
   CONNECT host (tunnel); on an `http` listener it names the target. An

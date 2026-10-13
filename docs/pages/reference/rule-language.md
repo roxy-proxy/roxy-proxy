@@ -36,7 +36,11 @@ method      := [A-Z][A-Z_]*                       ; HTTP method names only
 - Comparison is byte-exact, except: `host`, `tls.sni` and `scheme` operands
   compare ASCII case-insensitively under every operator (`like`, `matches`,
   `in` included); `under` is case-insensitive whatever its left operand;
-  `header["X-Y"]` names are case-insensitive, values not. `method` is
+  `header["X-Y"]` names are case-insensitive, values not. A header value
+  with obs-text (bytes `0x80` and up, under `http.allow_obs_text`) reads as
+  one character per byte (ISO-8859-1), so the text a rule matches is the
+  bytes roxy forwards: the byte `0xE9` reads as `é`, while `é` sent in
+  UTF-8 (`0xC3 0xA9`) reads as the two characters `Ã©`. `method` is
   exact: method `get` is forwarded as an extension method, may carry a
   body, and matches neither `method == GET` nor `method in [GET, HEAD]`.
 - Compile errors: type mismatch (`host under 443`), a regex that does not
