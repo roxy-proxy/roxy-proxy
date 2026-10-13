@@ -247,8 +247,11 @@ impl Shared {
         reason: &str,
         detail: Option<&str>,
     ) {
-        tracing::debug!(conn = %c.id, reason, detail, "client protocol error");
+        // Redacted once, for both sinks: a detail string can quote what the
+        // client sent.
         let redactor = self.secrets.redactor();
+        let detail = detail.map(|d| redactor.redact_str(d).into_owned());
+        tracing::debug!(conn = %c.id, reason, detail, "client protocol error");
         self.sink.emit(&FlowEvent::ParseError {
             ts: chrono::Utc::now(),
             conn: c.id.to_string(),
@@ -256,7 +259,7 @@ impl Shared {
             listener: c.listener.name.clone(),
             client: client_info(c),
             reason: reason.to_owned(),
-            detail: detail.map(|d| redactor.redact_str(d).into_owned()),
+            detail,
         });
     }
 
@@ -635,4 +638,30 @@ async fn accept_loop(listener: Arc<dyn Listener>, shared: Arc<Shared>) {
 /// Acquires a connection slot for a CA-server connection.
 pub(crate) fn conn_slot(shared: &Shared, ip: IpAddr) -> Option<ConnSlot> {
     shared.caps.acquire(ip).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::flowlog::REDACTED;
+    use crate::listener::ListenerMode;
+    use crate::testkit::{Kit, capture_logs, client_conn};
+
+    /// A parse-error detail is redacted once for both sinks, so a secret
+    /// it quotes reaches neither the operational log nor the flow log.
+    #[tokio::test]
+    async fn a_parse_error_detail_is_redacted_in_the_operational_log_too() {
+        let secret = "sk-live-123";
+        let kit = Kit::builder().secret("k", secret).start().await;
+        let shared = kit.server.shared();
+        let client = client_conn(ListenerMode::HttpProxy);
+        let detail = format!("sni {secret}");
+        let logged = capture_logs(tracing::Level::DEBUG, || {
+            shared.emit_parse_reason(&client, None, "bad_sni", Some(&detail));
+        });
+        assert!(logged.contains("client protocol error"), "{logged}");
+        assert!(!logged.contains(secret), "{logged}");
+        assert!(logged.contains(REDACTED), "{logged}");
+        let ev = kit.events("parse_error", 1).await;
+        assert_eq!(ev[0]["detail"], format!("sni {REDACTED}"));
+    }
 }

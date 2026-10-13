@@ -1086,45 +1086,7 @@ pub(crate) fn test_flow(kit: &crate::testkit::Kit) -> (Arc<StackFlow>, FlowCx) {
 mod tests {
     use super::*;
     use crate::flowlog::REDACTED;
-    use crate::testkit::{AddonDef, Kit};
-
-    /// A `tracing` writer into a shared buffer.
-    #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self {
-            self.clone()
-        }
-    }
-
-    /// What `f` logs at `level` or above. A second dispatcher is held
-    /// while it runs: with only one, a test on another thread that hits
-    /// the same callsite first caches it as disabled (it asks its own,
-    /// empty, default), and `f` would log nothing.
-    fn capture_logs(level: tracing::Level, f: impl FnOnce()) -> String {
-        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(level)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        String::from_utf8(captured.0.lock().unwrap().clone()).unwrap()
-    }
+    use crate::testkit::{AddonDef, Kit, capture_logs};
 
     /// A layer error is redacted once for both sinks, so a secret a guest
     /// quotes in its message reaches neither the operational log nor the
