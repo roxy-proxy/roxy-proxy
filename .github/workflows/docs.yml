@@ -1,10 +1,14 @@
 name: Docs
 
 # Builds the documentation site and checks its links on every pull request
-# that touches docs/; publishes it to GitHub Pages from main.
+# that touches docs/. Publishes it to GitHub Pages from main (at the site
+# root) and from every release tag vX.Y.Z (under /vX.Y/). A Pages deploy
+# replaces the whole site, so the gh-pages branch keeps every version: each
+# publish refreshes its own directory there, then deploys the branch.
 on:
   push:
     branches: [main]
+    tags: ["v*"]
     paths: ["docs/**", ".github/workflows/docs.yml", "**/*.md"]
   pull_request:
     paths: ["docs/**", ".github/workflows/docs.yml", "**/*.md"]
@@ -14,12 +18,15 @@ on:
 permissions:
   contents: read
 
+# Publishes share one group so two of them never update the branch or the
+# site at once; checks are per ref.
 concurrency:
-  group: docs-${{ github.ref }}
-  cancel-in-progress: true
+  group: docs-${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'publish' || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
   build:
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -34,16 +41,97 @@ jobs:
           cache: npm
           cache-dependency-path: docs/package-lock.json
       - run: npm ci
+      - run: npm test
       - run: npm run check-links
       - run: npm run build
-      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+
+  publish:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # push to gh-pages
+    outputs:
+      published: ${{ steps.publish.outputs.published }}
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: docs/dist/public
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run check-links
+
+      # The branch is created by the first publish, so this cannot be
+      # actions/checkout, which fails on a missing ref.
+      - name: Check out the site (gh-pages)
+        working-directory: .
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git init -q site
+          cd site
+          git config http.https://github.com/.extraheader \
+            "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          if git fetch -q --depth 1 origin gh-pages; then
+            git checkout -q -B gh-pages FETCH_HEAD
+          else
+            echo "no gh-pages branch yet; it is created by this run"
+            git checkout -q --orphan gh-pages
+          fi
+
+      - id: publish
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: node scripts/publish.mjs "$REF_TYPE" "$REF_NAME" ../site
+
+      # The root was built before this release existed, so its version menu
+      # does not list it: rebuild the root from main too.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.ref_type == 'tag' && steps.publish.outputs.published == 'true'
+        with:
+          ref: main
+          path: main
+          persist-credentials: false
+      - name: Rebuild the root from main
+        if: github.ref_type == 'tag' && steps.publish.outputs.published == 'true'
+        working-directory: main/docs
+        run: |
+          npm ci
+          node scripts/publish.mjs branch main ../../site
+
+      - name: Push the site
+        if: steps.publish.outputs.published == 'true'
+        working-directory: site
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "site unchanged"
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -q -m "Publish docs for $REF_NAME ($GITHUB_SHA)"
+          git push -q origin gh-pages
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: steps.publish.outputs.published == 'true'
+        with:
+          path: site
 
   deploy:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    needs: build
+    needs: publish
+    if: needs.publish.outputs.published == 'true'
     runs-on: ubuntu-24.04
     permissions:
       pages: write

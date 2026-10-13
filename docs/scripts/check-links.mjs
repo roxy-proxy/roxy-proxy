@@ -7,11 +7,11 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import GithubSlugger from "github-slugger";
+import { siteUrl as site } from "./publish.mjs";
 
 const docs = fileURLToPath(new URL("..", import.meta.url));
 const pagesDir = join(docs, "pages");
 const repo = join(docs, "..");
-const site = "https://roxy-proxy.github.io/roxy-proxy";
 
 function walk(dir) {
   return readdirSync(dir).flatMap((name) => {

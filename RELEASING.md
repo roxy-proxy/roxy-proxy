@@ -1,13 +1,18 @@
 # Releasing roxy
 
 A release is a `vX.Y.Z` tag on `main` whose version equals
-`workspace.package.version` in `Cargo.toml`. Pushing the tag runs two
+`workspace.package.version` in `Cargo.toml`. Pushing the tag runs three
 workflows:
 
 - **`release.yml`** builds the binaries, checks them and publishes a GitHub
   release with generated notes.
 - **`image.yml`** publishes `ghcr.io/roxy-proxy/roxy:vX.Y.Z`, `:X.Y` and
   `:latest` ([run roxy](https://roxy-proxy.github.io/roxy-proxy/guides/run)).
+- **`docs.yml`** publishes the tag's docs under `/vX.Y/` on the
+  [docs site](https://roxy-proxy.github.io/roxy-proxy), next to main's at
+  the site root, and adds `vX.Y` to the version menu. A later `vX.Y.Z` tag
+  replaces that directory. The site lives on the `gh-pages` branch, one
+  directory per version; a pre-release tag is not published.
 
 ## Steps
 

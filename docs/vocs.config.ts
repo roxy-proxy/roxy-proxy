@@ -1,6 +1,25 @@
 import { defineConfig } from "vocs/config";
+import { siteUrl } from "./scripts/publish.mjs";
+
+// The publish script sets these: which version this build is ("edge" for
+// main, else "vX.Y") and every version on the site. Each version is a
+// separate build, so the links are absolute.
+const version = process.env.ROXY_DOCS_VERSION ?? "edge";
+const versions = (process.env.ROXY_DOCS_VERSIONS ?? "").split(" ").filter(Boolean);
+const topNav = versions.length
+  ? [
+      {
+        text: version,
+        items: [
+          { text: "edge", link: `${siteUrl}/` },
+          ...versions.map((v) => ({ text: v, link: `${siteUrl}/${v}/` })),
+        ],
+      },
+    ]
+  : undefined;
 
 export default defineConfig({
+  topNav,
   title: "roxy",
   description:
     "A strict, programmable HTTP firewall: an egress proxy for untrusted workloads, or a gateway in front of the APIs your clients call.",
