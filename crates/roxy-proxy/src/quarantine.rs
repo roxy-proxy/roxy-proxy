@@ -294,33 +294,12 @@ impl QuarantineState {
     }
 }
 
-/// Writes the record through a temporary file and a rename, mode 0600, so
-/// a crash leaves either the old marker or the new one.
+/// Writes the record to the marker, mode 0600, so a crash leaves either the
+/// old marker or the new one.
 fn write_marker(path: &Path, record: &QuarantineRecord) -> io::Result<()> {
-    use std::io::Write as _;
-    let tmp = path.with_extension("tmp");
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(&tmp)?;
-    #[cfg(unix)]
-    {
-        // `mode` only applies to a file this call creates; a leftover
-        // temporary from an earlier run keeps its old bits otherwise.
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
     let mut bytes = serde_json::to_vec_pretty(record).map_err(io::Error::other)?;
     bytes.push(b'\n');
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, path)?;
-    sync_dir(path)
+    roxy_state::write_atomic(path, &bytes, 0o600)
 }
 
 /// Removes the marker; a marker already gone counts as removed.
@@ -329,17 +308,9 @@ fn remove_marker(path: &Path) -> io::Result<()> {
         // An unlink whose directory sync failed last time is retried
         // here as the sync alone, so a release is durable before it is
         // reported.
-        Ok(()) => sync_dir(path),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => sync_dir(path),
+        Ok(()) => roxy_state::sync_parent(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => roxy_state::sync_parent(path),
         Err(e) => Err(e),
-    }
-}
-
-/// A rename or unlink is durable once the directory holding it is.
-fn sync_dir(path: &Path) -> io::Result<()> {
-    match path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => std::fs::File::open(dir)?.sync_all(),
-        _ => Ok(()),
     }
 }
 

@@ -2,7 +2,14 @@
 //! the interception CA's directory and the quarantine marker. Nothing else
 //! is ever written here; secrets and the rendered config stay in memory.
 //! A roxy run from a config file uses the same layout for the marker alone.
+//!
+//! Every file this dir replaces (identity, flow sequence, marker) goes
+//! through [`write_atomic`], the one place that knows how to replace a file
+//! so that a crash at any point leaves either the old file or the new one,
+//! with the mode asked for. The CA dir's files are created once and never
+//! replaced, so `roxy-tls` writes them exclusively instead.
 
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -154,42 +161,59 @@ impl StateDir {
         }
     }
 
-    /// Writes through a temporary file and a rename, so a reader never sees
-    /// a partial file and a crash leaves the old one.
-    fn write(
-        &self,
-        name: &str,
-        contents: &[u8],
-        #[allow(unused)] mode: u32,
-    ) -> Result<(), StateError> {
-        use std::io::Write as _;
+    fn write(&self, name: &str, contents: &[u8], mode: u32) -> Result<(), StateError> {
         let path = self.file(name);
-        let tmp = self.file(&format!(".{name}.tmp"));
-        let io_err = |source| StateError::Io {
-            path: path.clone(),
-            source,
-        };
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            opts.mode(mode);
+        match write_atomic(&path, contents, mode) {
+            Ok(()) => Ok(()),
+            Err(source) => Err(StateError::Io { path, source }),
         }
-        let mut file = opts.open(&tmp).map_err(io_err)?;
-        #[cfg(unix)]
-        {
-            // `mode` only applies to a file this call creates; a leftover
-            // temporary from an earlier run keeps its old bits otherwise.
-            use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(std::fs::Permissions::from_mode(mode))
-                .map_err(io_err)?;
-        }
-        file.write_all(contents).map_err(io_err)?;
-        file.sync_all().map_err(io_err)?;
-        drop(file);
-        std::fs::rename(&tmp, &path).map_err(io_err)
     }
+}
+
+/// Writes `contents` to `path` with `mode` through a temporary file in the
+/// same directory and a rename, so a reader sees the old file or the new one
+/// and never a partial one. The file and then its directory are synced, so
+/// the new file is durable when this returns.
+pub fn write_atomic(path: &Path, contents: &[u8], #[allow(unused)] mode: u32) -> io::Result<()> {
+    use std::io::Write as _;
+    let tmp = temp_path(path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(mode);
+    }
+    let mut file = opts.open(&tmp)?;
+    #[cfg(unix)]
+    {
+        // `mode` only applies to a file this call creates; a leftover
+        // temporary from an earlier run keeps its old bits otherwise.
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)?;
+    sync_parent(path)
+}
+
+/// A rename or unlink is durable once the directory holding it is.
+pub fn sync_parent(path: &Path) -> io::Result<()> {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => std::fs::File::open(dir)?.sync_all(),
+        _ => Ok(()),
+    }
+}
+
+/// `.name.tmp` beside `path`: in the same directory, so the rename is one
+/// filesystem operation.
+fn temp_path(path: &Path) -> PathBuf {
+    let mut name = OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(".tmp");
+    path.with_file_name(name)
 }
 
 #[cfg(test)]
@@ -256,5 +280,37 @@ mod tests {
         assert_eq!(state.load_seq().unwrap(), 4096);
         std::fs::write(dir.path().join(SEQ_FILE), "lots\n").unwrap();
         assert!(matches!(state.load_seq(), Err(StateError::BadSeq { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reused_temporary_is_made_private_before_it_is_written() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.key");
+        let tmp = temp_path(&path);
+        std::fs::write(&tmp, "stale").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic(&path, b"KEY", 0o600).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"KEY");
+        assert_eq!(mode(&path), 0o600);
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn the_target_keeps_its_old_contents_until_the_new_file_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flow.seq");
+        std::fs::write(&path, "old").unwrap();
+        // A temporary that cannot be opened fails the write before the
+        // rename; the target must not have been touched on the way.
+        let tmp = temp_path(&path);
+        std::fs::create_dir(&tmp).unwrap();
+        write_atomic(&path, b"new", 0o644).unwrap_err();
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        std::fs::remove_dir(&tmp).unwrap();
+        write_atomic(&path, b"new", 0o644).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert!(!tmp.exists());
     }
 }

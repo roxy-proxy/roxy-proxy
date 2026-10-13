@@ -3005,6 +3005,7 @@ dependencies = [
  "ring",
  "roxy-node",
  "roxy-node-spec",
+ "roxy-state",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -3053,6 +3054,7 @@ dependencies = [
  "roxy-http",
  "roxy-log",
  "roxy-rules",
+ "roxy-state",
  "roxy-tls",
  "roxy-wasm",
  "rustls",
@@ -3088,6 +3090,14 @@ dependencies = [
  "serde_path_to_error",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "roxy-state"
+version = "0.1.1"
+dependencies = [
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
