@@ -215,6 +215,8 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn a_node_state_without_seq_unreserved_parses_as_false() {
         let state: NodeState = serde_json::from_str(
@@ -224,8 +226,6 @@ mod tests {
         .unwrap();
         assert!(!state.seq_unreserved);
     }
-
-    use super::*;
 
     #[test]
     fn sha256_fingerprint_form() {
