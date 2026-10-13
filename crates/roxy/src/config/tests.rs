@@ -559,6 +559,18 @@ fn allow_trailers_is_an_unknown_field() {
     assert!(msg.contains("unknown field `allow_trailers`"), "{msg}");
 }
 
+/// Addons have no store of their own: `state-put` writes the rules' state,
+/// sized by `limits.max_state_entries`.
+#[test]
+fn addon_state_is_an_unknown_field() {
+    let (_dir, wasm) = wasm_file();
+    let yaml =
+        format!("{BASE}addons:\n  - name: w\n    path: {wasm}\n    state: {{ max_entries: 5 }}\n");
+    let err = Config::from_yaml(&yaml).unwrap_err();
+    let msg = describe_parse_error(&yaml, &err);
+    assert!(msg.contains("unknown field `state`"), "{msg}");
+}
+
 #[test]
 fn default_key_is_rejected() {
     // Nothing opens an empty rule set: a policy that allows says so in a rule.
@@ -994,7 +1006,7 @@ fn service_addons_validate() {
 
     let d = diagnostics(&format!(
         "{BASE}addons:\n  - name: s\n    kind: service\n    endpoint: nope\n    \
-         capabilities: [log]\n    config: {{ a: 1 }}\n    state: {{ max_entries: 5 }}\n    \
+         capabilities: [log]\n    config: {{ a: 1 }}\n    \
          limits: {{ max_memory: 1mb, max_connections: 0, max_streams: 0, first_byte_timeout: 0s }}\n    \
          endpoints:\n      svc: {{ url: \"http://127.0.0.1:9000/\" }}\n  \
          - name: w\n    path: {wasm}\n    limits: {{ first_byte_timeout: 0s, max_connections: 2 }}\n"
@@ -1004,7 +1016,6 @@ fn service_addons_validate() {
         "addons[0].endpoint",
         "addons[0].capabilities",
         "addons[0].config",
-        "addons[0].state",
         "addons[0].limits.max_memory",
         "addons[0].limits.max_connections",
         "addons[0].limits.max_streams",

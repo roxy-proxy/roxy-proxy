@@ -74,9 +74,7 @@ pub(crate) use h2raw::{H2_GOAWAY, H2_HEADERS, H2_RST_STREAM, h2_client, h2_get, 
 pub(crate) use upstream::{Seen, Upstream};
 
 use crate::Server;
-use crate::addons::{
-    AddonMode, AddonSpec, EndpointPath, EndpointSpec, Part, StateLimits, Subscription,
-};
+use crate::addons::{AddonMode, AddonSpec, EndpointPath, EndpointSpec, Part, Subscription};
 use crate::addr::PrivateAddrs;
 use crate::addrlist::{AddressList, AddressLists};
 use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
@@ -272,7 +270,6 @@ impl AddonDef {
             mode: self.mode,
             kind: crate::addons::AddonImpl::Wasm(layer),
             endpoints: self.endpoints,
-            state: StateLimits::default(),
             when,
             sample: self.sample,
             subscribe: self.subscribe,

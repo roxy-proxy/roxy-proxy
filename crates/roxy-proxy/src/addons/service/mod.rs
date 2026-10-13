@@ -528,9 +528,7 @@ pub(crate) mod testing {
     use roxy_rules::{Policy, PolicyInput, RuleConfig};
 
     use super::ServiceSpec;
-    use crate::addons::{
-        AddonImpl, AddonMode, AddonSpec, EndpointSpec, Part, StateLimits, Subscription,
-    };
+    use crate::addons::{AddonImpl, AddonMode, AddonSpec, EndpointSpec, Part, Subscription};
     use crate::config::PolicyUpdate;
     use crate::flowlog::Redactor;
     use crate::testkit::Kit;
@@ -568,7 +566,6 @@ pub(crate) mod testing {
             mode,
             kind: AddonImpl::Service(svc),
             endpoints: HashMap::from([("svc".to_owned(), endpoint)]),
-            state: StateLimits::default(),
             when: None,
             sample: None,
             subscribe: Subscription::default(),

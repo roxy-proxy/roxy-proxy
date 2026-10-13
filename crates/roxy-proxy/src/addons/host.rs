@@ -12,6 +12,31 @@ use super::{AddonSpec, StackFlow, endpoint};
 use crate::flowlog::{FlowEvent, sink_ready};
 use crate::view::ProxyView;
 
+/// Longest key and value a layer may write to the state store. The store
+/// is the rules' own and outlives the exchange; a rule's keys and values
+/// come from config, a guest's from anywhere.
+pub(crate) const MAX_STATE_KEY_BYTES: usize = 1024;
+pub(crate) const MAX_STATE_VALUE_BYTES: usize = 64 * 1024;
+
+/// Why a `state-put` is refused for what the guest passed, if it is. This
+/// is the guest's own error to handle; what the store does with an
+/// admissible write is the host's.
+fn state_write_refusal(key: &str, value: &str) -> Option<String> {
+    if key.len() > MAX_STATE_KEY_BYTES {
+        return Some(format!(
+            "key is {} bytes; the limit is {MAX_STATE_KEY_BYTES}",
+            key.len()
+        ));
+    }
+    if value.len() > MAX_STATE_VALUE_BYTES {
+        return Some(format!(
+            "value is {} bytes; the limit is {MAX_STATE_VALUE_BYTES}",
+            value.len()
+        ));
+    }
+    None
+}
+
 /// Layer `index` of an exchange's stack.
 pub(crate) struct StackHost {
     pub(crate) st: Arc<StackFlow>,
@@ -119,26 +144,41 @@ impl LayerHost for StackHost {
     }
 
     async fn state_get(&self, key: String) -> Result<Option<String>, HostError> {
-        Ok(self.st.shared.layer_state.get(&self.addon().name, &key))
+        Ok(self.st.shared.state.get(&key))
     }
 
     async fn state_put(
         &self,
         key: String,
-        json: String,
+        value: String,
         ttl_ms: Option<u64>,
     ) -> Result<Result<(), String>, HostError> {
-        if serde_json::from_str::<serde_json::Value>(&json).is_err() {
-            return Ok(Err("value is not JSON".to_owned()));
+        if self.observer.is_some() {
+            // The store steers the rules of every flow, so a write is an
+            // effect on traffic, which an observer must not have.
+            let layer = &self.addon().name;
+            let flow = self.st.flow.to_string();
+            tracing::warn!(
+                layer,
+                flow,
+                key,
+                "observer called `flow.state-put`: refused"
+            );
+            return Err(HostError::new(
+                "layer called `flow.state-put` in observe mode: an observer cannot write state",
+            ));
         }
-        let addon = self.addon();
-        Ok(self.st.shared.layer_state.put(
-            &addon.name,
-            &addon.state,
-            &key,
-            &json,
-            ttl_ms.map(Duration::from_millis),
-        ))
+        if let Some(why) = state_write_refusal(&key, &value) {
+            return Ok(Err(why));
+        }
+        // A full store denies a rule's `set_state`; a layer's write is no
+        // different, and the guest must not be able to shrug it off.
+        self.st
+            .shared
+            .state
+            .set(&key, &value, ttl_ms.map(Duration::from_millis))
+            .map_err(|e| HostError::new(e.to_string()))?;
+        Ok(Ok(()))
     }
 
     async fn metric_get(&self, id: String, key: Vec<String>) -> Result<Option<i64>, HostError> {
@@ -167,5 +207,20 @@ impl LayerHost for StackHost {
         if self.observer.is_none() {
             self.st.fail(&self.addon().name, err.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_writes_are_capped_at_the_byte() {
+        let k = |n| "k".repeat(n);
+        let v = |n| "v".repeat(n);
+        assert_eq!(state_write_refusal(&k(MAX_STATE_KEY_BYTES), ""), None);
+        assert!(state_write_refusal(&k(MAX_STATE_KEY_BYTES + 1), "").is_some());
+        assert_eq!(state_write_refusal("k", &v(MAX_STATE_VALUE_BYTES)), None);
+        assert!(state_write_refusal("k", &v(MAX_STATE_VALUE_BYTES + 1)).is_some());
     }
 }

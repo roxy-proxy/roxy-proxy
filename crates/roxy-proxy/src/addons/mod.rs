@@ -18,7 +18,6 @@ mod endpoint;
 mod host;
 mod select;
 pub mod service;
-pub(crate) mod store;
 mod subscribe;
 mod tee;
 mod ws;
@@ -85,8 +84,6 @@ pub struct AddonSpec {
     pub kind: AddonImpl,
     /// Named endpoints, by name.
     pub endpoints: HashMap<String, EndpointSpec>,
-    /// The addon's keyed store.
-    pub state: StateLimits,
     /// `when`: the layer runs only on requests this matches, as they reach
     /// it; the others go straight to the layer below.
     pub when: Option<roxy_rules::Condition>,
@@ -173,24 +170,6 @@ pub struct EndpointSpec {
     pub timeout: Duration,
     /// Whether the endpoint may be on a private address.
     pub private: PrivateAddrs,
-}
-
-/// An addon's keyed store limits.
-#[derive(Debug, Clone)]
-pub struct StateLimits {
-    pub max_entries: usize,
-    pub max_value_bytes: usize,
-    pub default_ttl: Duration,
-}
-
-impl Default for StateLimits {
-    fn default() -> Self {
-        Self {
-            max_entries: 100_000,
-            max_value_bytes: 64 * 1024,
-            default_ttl: Duration::from_hours(6),
-        }
-    }
 }
 
 /// Most tags a flow holds, and most bytes of them together. Tags are

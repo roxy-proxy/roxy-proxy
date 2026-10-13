@@ -424,9 +424,13 @@ fn call_capability(req: &RequestHead) -> String {
             "ok".to_owned()
         }
         "state" => {
-            let put = flow::state_put("k", "{\"n\":1}", None);
+            let put = flow::state_put("k", "from-layer", None);
             let got = flow::state_get("k");
             format!("{put:?} {got:?}")
+        }
+        "state-get" => {
+            let key = header(req, "x-cap-key").unwrap_or_else(|| "k".to_owned());
+            format!("{:?}", flow::state_get(&key))
         }
         "metric" => format!(
             "{:?}",

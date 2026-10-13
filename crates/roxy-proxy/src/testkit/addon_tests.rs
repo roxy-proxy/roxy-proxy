@@ -1873,6 +1873,47 @@ async fn one(def: AddonDef) -> Kit {
     Kit::builder().addon(def).start().await
 }
 
+/// A state store that keeps what it is given.
+#[derive(Default)]
+struct MemState(std::sync::Mutex<std::collections::HashMap<String, String>>);
+
+/// A state store with no room for a new key.
+struct FullState;
+
+impl crate::sources::StateSource for FullState {
+    fn get(&self, _key: &str) -> Option<String> {
+        None
+    }
+
+    fn set(
+        &self,
+        _key: &str,
+        _value: &str,
+        _ttl: Option<std::time::Duration>,
+    ) -> Result<(), crate::sources::StateFull> {
+        Err(crate::sources::StateFull)
+    }
+}
+
+impl crate::sources::StateSource for MemState {
+    fn get(&self, key: &str) -> Option<String> {
+        self.0.lock().unwrap().get(key).cloned()
+    }
+
+    fn set(
+        &self,
+        key: &str,
+        value: &str,
+        _ttl: Option<std::time::Duration>,
+    ) -> Result<(), crate::sources::StateFull> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), value.to_owned());
+        Ok(())
+    }
+}
+
 /// `x-test-t: caps` with `x-cap`.
 async fn cap(kit: &Kit, cap: &str) -> super::Answer {
     kit.h1()
@@ -2197,7 +2238,11 @@ async fn a_record_kind_is_redacted_like_its_document() {
 #[tokio::test]
 async fn records_and_state_reach_the_flow_log() {
     use roxy_wasm::Capability;
-    let kit = one(AddonDef::test_layer("t").caps(&[Capability::Record, Capability::State])).await;
+    let kit = Kit::builder()
+        .addon(AddonDef::test_layer("t").caps(&[Capability::Record, Capability::State]))
+        .state(std::sync::Arc::new(MemState::default()))
+        .start()
+        .await;
     let a = cap(&kit, "record").await;
     assert_eq!(a.text(), "ok", "{a:?}");
     let r = kit.events("layer_record", 1).await;
@@ -2205,12 +2250,132 @@ async fn records_and_state_reach_the_flow_log() {
     assert_eq!(r[0]["data"]["score"], 0.9);
 
     let a = cap(&kit, "state").await;
-    assert_eq!(a.text(), "Ok(()) Some(\"{\\\"n\\\":1}\")", "{a:?}");
+    assert_eq!(a.text(), "Ok(()) Some(\"from-layer\")", "{a:?}");
 
     let a = cap(&kit, "metric").await;
     assert_eq!(a.status, 503, "{a:?}");
     let errs = kit.events("layer_error", 1).await;
     assert_eq!(errs[0]["kind"], "capability:metrics");
+}
+
+/// A layer's `state-put` writes the store the rules read: a rule keyed on
+/// the value denies the next exchange, and a `set_state` by a rule is what
+/// the layer's `state-get` returns.
+#[tokio::test]
+async fn layer_state_is_the_rules_state() {
+    use roxy_wasm::Capability;
+    let kit = Kit::builder()
+        .addon(AddonDef::test_layer("t").caps(&[Capability::State]))
+        .state(std::sync::Arc::new(MemState::default()))
+        .rules(
+            r#"
+- id: marked
+  when: state["k"] == "from-layer"
+  then: deny
+- id: mark
+  when: path == "/mark"
+  then: [{ set_state: { key: r, value: from-rule } }, deny]
+- id: up
+  when: host == "up.test"
+  then: allow
+"#,
+        )
+        .start()
+        .await;
+    let a = kit.h1().await.call("GET", "/before", &[], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+
+    let a = cap(&kit, "state").await;
+    assert_eq!(a.text(), "Ok(()) Some(\"from-layer\")", "{a:?}");
+
+    let a = kit.h1().await.call("GET", "/after", &[], b"").await;
+    assert_eq!(a.status, 403, "{a:?}");
+    let ev = kit.events("request", 3).await;
+    assert_eq!(ev[2]["terminal_rule"], "marked", "{ev:#?}");
+
+    // The other way: a rule's set_state is what the layer reads.
+    let a = kit
+        .h1()
+        .await
+        .call(
+            "GET",
+            "/mark",
+            &[
+                ("x-test-t", "caps"),
+                ("x-cap", "state-get"),
+                ("x-cap-key", "r"),
+            ],
+            b"",
+        )
+        .await;
+    assert_eq!(a.text(), "None", "{a:?}");
+    let a = kit.h1().await.call("GET", "/mark", &[], b"").await;
+    assert_eq!(a.status, 403, "{a:?}");
+    let a = kit
+        .h1()
+        .await
+        .call(
+            "GET",
+            "/x",
+            &[
+                ("x-test-t", "caps"),
+                ("x-cap", "state-get"),
+                ("x-cap-key", "r"),
+            ],
+            b"",
+        )
+        .await;
+    assert_eq!(a.text(), "Some(\"from-rule\")", "{a:?}");
+}
+
+/// An observer's `state-put` is refused: the store steers every flow's
+/// rules, so a write is an effect on traffic. The refusal is the observer's
+/// failure, and the key stays unwritten.
+#[tokio::test]
+async fn an_observer_cannot_write_state() {
+    use roxy_wasm::Capability;
+    let kit = Kit::builder()
+        .addon(
+            AddonDef::test_layer("monitor")
+                .observe()
+                .caps(&[Capability::State]),
+        )
+        .addon(AddonDef::test_layer("t").caps(&[Capability::State]))
+        .state(std::sync::Arc::new(MemState::default()))
+        .start()
+        .await;
+    let a = kit
+        .h1()
+        .await
+        .call(
+            "GET",
+            "/x",
+            &[("x-test-monitor", "caps"), ("x-cap", "state")],
+            b"",
+        )
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["layer"], "monitor", "{errs:#?}");
+    assert_eq!(errs[0]["mode"], "observe");
+    let a = cap(&kit, "state-get").await;
+    assert_eq!(a.text(), "None", "{a:?}");
+}
+
+/// A full store fails the exchange closed, as it does a rule's `set_state`:
+/// the guest never sees it as an error it can ignore.
+#[tokio::test]
+async fn a_full_state_store_fails_the_exchange() {
+    use roxy_wasm::Capability;
+    let kit = Kit::builder()
+        .addon(AddonDef::test_layer("t").caps(&[Capability::State]))
+        .state(std::sync::Arc::new(FullState))
+        .start()
+        .await;
+    let a = cap(&kit, "state").await;
+    assert_eq!(a.status, 503, "{a:?}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["kind"], "host", "{errs:#?}");
 }
 
 // ---- guest bodies ---------------------------------------------------------

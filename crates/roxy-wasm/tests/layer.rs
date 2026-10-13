@@ -601,8 +601,8 @@ async fn capabilities_gate_host_services() {
         (
             "state",
             Capability::State,
-            "Ok(()) Some(\"{\\\"n\\\":1}\")",
-            "state_put k {\"n\":1} None",
+            "Ok(()) Some(\"from-layer\")",
+            "state_put k from-layer None",
         ),
         (
             "metric",

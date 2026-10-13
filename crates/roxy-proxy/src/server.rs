@@ -148,8 +148,6 @@ pub(crate) struct Shared {
     /// `log.flow.ws_message_every`: log every Nth checked WebSocket message
     /// (0: only denied ones).
     pub ws_message_every: u64,
-    /// Each addon's keyed store, by addon name; survives reloads.
-    pub layer_state: crate::addons::store::LayerStates,
     /// The process-wide quarantine; outlives this server.
     pub quarantine: Arc<QuarantineState>,
     /// Each listener's parse-error threshold counter, by listener name.
@@ -500,9 +498,6 @@ impl ServerHandle {
         self.shared
             .secrets
             .replace(prepared.secrets, prepared.redactor);
-        self.shared
-            .layer_state
-            .configure(snap.addons.iter().map(|a| (a.name.as_str(), &a.state)));
         let old = self.shared.snapshot.swap(Arc::new(snap));
         old.services.retire();
     }
@@ -624,7 +619,6 @@ impl Server {
             dns,
             connection_events: cfg.connection_events,
             ws_message_every: cfg.ws_message_every,
-            layer_state: crate::addons::store::LayerStates::default(),
             quarantine: cfg.quarantine,
             parse_error_trips,
             buffers: Arc::new(BufferBudget::default()),

@@ -633,12 +633,12 @@ impl flow::Host for StoreState {
     async fn state_put(
         &mut self,
         key: String,
-        json: String,
+        value: String,
         ttl_ms: Option<u64>,
     ) -> wasmtime::Result<Result<(), String>> {
         self.require(Capability::State, "flow.state-put")?;
         let host = self.host("flow.state-put")?;
-        host.state_put(key, json, ttl_ms)
+        host.state_put(key, value, ttl_ms)
             .await
             .map_err(|e| self.host_failed(e))
     }

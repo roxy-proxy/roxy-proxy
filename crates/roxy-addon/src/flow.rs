@@ -46,16 +46,20 @@ pub fn record(kind: &str, json: &str) {
     raw::record(kind, json);
 }
 
-/// Reads a JSON value from the layer's keyed store (capability `state`).
-/// `None` means no history: treat it as a fresh start.
+/// Reads a key of the state store (capability `state`): the store the
+/// rules read as `state["key"]` and write with `set_state`. `None` means
+/// no history: treat it as a fresh start.
 pub fn state_get(key: &str) -> Option<String> {
     raw::state_get(key)
 }
 
-/// Writes a JSON value to the layer's keyed store (capability `state`).
-/// Fails when the store is full or the value too large; nothing is evicted.
-pub fn state_put(key: &str, json: &str, ttl: Option<Duration>) -> Result<(), String> {
-    raw::state_put(key, json, ttl_ms(ttl))
+/// Writes a key of the state store (capability `state`), for `ttl` or the
+/// store's default. A rule matches the value as written, so `yes` for
+/// `state["k"] == "yes"`. Fails when the key or value is too long. A full
+/// store fails the exchange, as it does a rule's `set_state`; nothing is
+/// evicted. Only an enforce layer may write.
+pub fn state_put(key: &str, value: &str, ttl: Option<Duration>) -> Result<(), String> {
+    raw::state_put(key, value, ttl_ms(ttl))
 }
 
 /// Reads a metric (capability `metrics`) by id and key-field values.

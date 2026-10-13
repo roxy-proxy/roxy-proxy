@@ -94,5 +94,5 @@ writes, and at most every 100 ms when a new key meets a full table); a new
 key when full denies the flow (`503`, `_fail_closed`, reason
 `state_unavailable`). State is shared across flows, so reads are
 order-dependent: `state["key"]` sees what earlier flows wrote and, within
-a flow, the `set_state` of rules above the reader. Addons have a separate
-store ([host services](/reference/host-services#state-state)).
+a flow, the `set_state` of rules above the reader. A WASM layer reads and
+writes the same store ([host services](/reference/host-services#state-state)).

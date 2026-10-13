@@ -168,7 +168,7 @@ single reservation.
   one connection per concurrent request, HTTP/2 origins at most
   `upstream.max_h2_connections_per_origin` (4 by default), each with an
   8 MiB receive window ([upstream](/reference/upstream#connections)).
-- Bounded policy tables (metrics, state, addon state) never evict
+- Bounded policy tables (metrics, state) never evict
   ([never evict](/design/threat-model#never-evict)).
 - The proxy port serves only proxy semantics and `roxy.internal`; health
   and CA download live on the separate `ca_server` listener, with a cap of

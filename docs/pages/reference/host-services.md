@@ -42,17 +42,18 @@ roxy's credential attached.
 
 ## State (`state`)
 
-`flow.state-get` / `flow.state-put`: a JSON-value store namespaced per
-layer, with per-entry TTL, a value size cap and an entry cap. A miss returns
-`none`. A write when full, or with an over-long key, returns an error;
-nothing is evicted. Expired entries read as absent at once; when a new key
-meets a full store, expired entries are purged at most every 100 ms.
-
-The store survives a reload. A changed `state.max_entries` or
-`state.default_ttl` applies to the live store: entries keep their expiry,
-and a lower cap evicts nothing but refuses new keys until enough expire. The
-store of an addon a reload removes is dropped; an addon added back later
-starts empty.
+`flow.state-get` / `flow.state-put`: the [state store](/reference/rate-limits#state)
+the rules read as `state["key"]` and write with `set_state`. A key a layer
+writes is the key a rule reads, so a layer can leave a mark for a rule to
+deny on, and read what a rule left. Values are strings; a layer that wants
+`state["k"] == "yes"` to match writes `yes`. A `state-put` without a TTL
+gets the store's default (one hour). A miss returns `none`. A key over
+1 KiB or a value over 64 KiB returns an error to the layer. A write when
+the store is full fails the exchange closed, as it does a rule's
+`set_state`; nothing is evicted. Only an enforce layer may write: a
+`state-put` from an observer fails the exchange, like `add-tag`, since the
+store steers every flow's rules. The store survives a reload, under
+`limits.max_state_entries`.
 
 ## Identity
 
