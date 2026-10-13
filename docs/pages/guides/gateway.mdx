@@ -109,3 +109,8 @@ below see the tag, so a per-user quota is another addon.
   ([address floor](/reference/address-lists#address-floor)).
 - **Health checks** come from `ca_server` as usual
   ([health](/guides/operations#health)).
+- **Leave `quarantine_on` off.** A
+  [quarantine](/guides/operations#quarantine) shuts the whole process, so
+  on a gateway one client's malformed requests would refuse every other
+  client until an operator intervened. The same goes for the `quarantine`
+  action in a gateway's rules.

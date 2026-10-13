@@ -354,7 +354,7 @@ impl Watch {
             Dir::Request => self.request_chunks,
             Dir::Response => self.response_chunks,
         };
-        if !needed && !self.meta.shared.expired() {
+        if !needed && !self.meta.shared.quarantined() && !self.meta.shared.expired() {
             return self.check();
         }
         let mut g = self.lock();
@@ -381,11 +381,13 @@ impl Inner {
         }
     }
 
-    /// A relay outlives the head decision, so the lease is re-checked
-    /// before each write: once it has run out the exchange stops with
-    /// `_expired`.
+    /// A relay outlives the head decision, so the quarantine and the lease
+    /// are re-checked before each write: the exchange stops with
+    /// `_quarantined` or `_expired`.
     fn stop_if_expired(&mut self, stage: Stage) {
-        if self.meta.shared.expired() {
+        if self.meta.shared.quarantined() {
+            self.stop_with(Refusal::quarantined(), stage);
+        } else if self.meta.shared.expired() {
             self.stop_with(Refusal::expired(), stage);
         }
     }
@@ -459,6 +461,12 @@ impl Inner {
         let Some(o) = out else {
             return Vec::new();
         };
+        if let Some(rule) = &o.quarantine {
+            shared.trip_quarantine(crate::quarantine::QuarantineCause::Rule {
+                rule: rule.to_string(),
+                flow: meta.flow.to_string(),
+            });
+        }
         for r in &o.matched {
             if !self.rules.contains(r) {
                 self.rules.push(r.clone());

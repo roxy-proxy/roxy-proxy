@@ -28,7 +28,7 @@ produces a `request` event:
 | `timing.upstream_connect_ms` | how long opening the upstream connection took (DNS, TCP and TLS); `null` when the request reused a pooled connection, or none was opened |
 | `timing.upstream_ttfb_ms` | from the forwarding decision to the upstream's response head |
 | `decision` | `allow`, `deny`, or `answered` when an addon layer answered itself |
-| `terminal_rule` | what decided: a rule id, or `_default`, `_fail_closed`, `_address_policy`, `_expired`, `_sign`, `_websocket` or `layer:<name>` |
+| `terminal_rule` | what decided: a rule id, or `_default`, `_fail_closed`, `_address_policy`, `_expired`, `_quarantined`, `_sign`, `_websocket` or `layer:<name>` |
 | `stage` | `head`, or where a watching rule stopped the exchange: `request_body`, `response_head`, `response_body`, `websocket` |
 | `addons` | the layers that ran, outermost first; one skipped by its `when` or `sample` is not listed ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)) |
 | `rules`, `decision`, `terminal_rule` with addons | describe the request that left the stack; `req` is what the client sent and `res.status` what it got, which a layer above the rules may have replaced ([addons](/reference/addon-configuration#in-the-proxy)) |
@@ -39,6 +39,7 @@ produces a `request` event:
 | `_fail_closed` | `metric_unavailable`, `metric_key_unavailable`, `metric_table_full`, `address_list_unavailable`, `secret_missing`, `secret_invalid`, `body_too_large_to_inspect`, `body_unavailable`, `buffer_budget_exhausted`, `unsupported_content_encoding`, `body_decode_failed`, `missing_value`, `wrong_type`, `effect_invalid`, `unsupported_effect`, `state_unavailable`, `capture_unavailable`, `sign_conflict`, `watch_missing`, `watch_stopped` |
 | `_address_policy` | `address_policy` |
 | `_expired` | `policy_expired` ([lease](/guides/operations#lease)) |
+| `_quarantined` | `quarantined` ([quarantine](/guides/operations#quarantine)) |
 | `_sign` | `sign_body_too_large`, `sign_header_invalid` ([signing AWS requests](/reference/secrets#signing-aws-requests)) |
 | `_websocket` | `ws_bad_handshake` ([WebSockets](/reference/websockets)) |
 | `layer:<name>` | `layer_error` |
@@ -59,6 +60,8 @@ produces a `request` event:
 | `upstream_error`, `upstream_denied` | [upstream](/reference/upstream#errors) failures and address-floor hits; `upstream_denied.reason` is `private_range:<class>`, `deny_cidrs` or `list:<name>` ([address floor](/reference/address-lists#address-floor)) |
 | `policy_input_unavailable`, `metric_table_full` | a flow failed closed for want of an input |
 | `policy_expired` | the policy's `valid_until` passed; once per loaded policy, with `valid_until` ([lease](/guides/operations#lease)) |
+| `quarantined` | the process went into [quarantine](/guides/operations#quarantine), or started in one (`restored: true`): `id` (the incident a release must name), `since`, and `cause`, which is `{"kind": "rule", "rule", "flow"}` or `{"kind": "threshold", "listener", "counter": "parse_errors", "count", "window_seconds"}` |
+| `quarantine_released` | the control plane released the quarantine named by `id` ([node mode](/guides/node-mode#the-lease)) |
 | `upgrade_stripped` | an upgrade was not allowed, so the request went upstream as plain HTTP ([WebSockets](/reference/websockets)) |
 | `ws_open`, `ws_close` | a relayed WebSocket, with byte counts; `ws_close` has `close_code` and `close_reason` when roxy ended it |
 | `ws_message` | a WebSocket message a rule denied, or one sampled by `log.flow.ws_message_every` ([WebSockets](/reference/websockets#message-rules)) |

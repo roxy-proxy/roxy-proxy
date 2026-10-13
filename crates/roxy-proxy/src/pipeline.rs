@@ -50,6 +50,7 @@ use crate::flowlog::{
 };
 use crate::io::ClientIo;
 use crate::listener::ClientConn;
+use crate::quarantine::QuarantineCause;
 use crate::secrets::Secrets;
 use crate::server::{Shared, Snapshot};
 use crate::sign;
@@ -70,6 +71,12 @@ pub(crate) const EXPIRED_RULE: &str = "_expired";
 
 /// Flow-log `reason` of an `_expired` deny.
 pub(crate) const EXPIRED_REASON: &str = "policy_expired";
+
+/// Rule id used for refusals while the process is quarantined.
+pub(crate) const QUARANTINED_RULE: &str = "_quarantined";
+
+/// Flow-log `reason` of a `_quarantined` refusal.
+pub(crate) const QUARANTINED_REASON: &str = "quarantined";
 
 /// Rule id used for the refusal of a request `sign` cannot hash.
 pub(crate) const SIGN_RULE: &str = "_sign";
@@ -180,6 +187,20 @@ impl Refusal {
                 DEFAULT_DENY_MESSAGE,
                 RuleId::new(EXPIRED_RULE),
                 false,
+            )
+        }
+    }
+
+    /// 403 `_quarantined`, closing the connection: the process is
+    /// quarantined.
+    pub(crate) fn quarantined() -> Self {
+        Self {
+            reason: Some(QUARANTINED_REASON.to_owned()),
+            ..Self::deny(
+                status_code(roxy_rules::DEFAULT_DENY_STATUS),
+                DEFAULT_DENY_MESSAGE,
+                RuleId::new(QUARANTINED_RULE),
+                true,
             )
         }
     }
@@ -669,6 +690,31 @@ impl FlowCx {
         Some(Refusal::expired())
     }
 
+    /// The refusal every exchange gets while the process is quarantined,
+    /// recorded as the head decision. Checked before the lease: a
+    /// quarantine outlives any policy.
+    pub(crate) fn quarantine_refusal(&mut self) -> Option<Refusal> {
+        if !self.shared.quarantined() {
+            return None;
+        }
+        self.record.stage = Some(Stage::Head);
+        if let Err(e) = self.record_head_sample(true) {
+            self.meta.metric_error(Stage::Head, &e);
+        }
+        Some(Refusal::quarantined())
+    }
+
+    /// A matched `quarantine` action puts the process into quarantine,
+    /// whatever else the head decision was.
+    fn trip_quarantine_if_matched(&self, out: &Outcome) {
+        if let Some(rule) = &out.quarantine {
+            self.shared.trip_quarantine(QuarantineCause::Rule {
+                rule: rule.to_string(),
+                flow: self.flow.to_string(),
+            });
+        }
+    }
+
     /// The head decision. Returns the outcome plus a refusal when it
     /// denies or an input was unavailable.
     fn evaluate_head(&mut self) -> (Outcome, Option<Refusal>) {
@@ -1035,6 +1081,7 @@ fn buffered_bytes(held: u64, inspected: &Inspected) -> u64 {
 /// The head decision and its effects.
 fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
     let (out, mut refusal) = cx.evaluate_head();
+    cx.trip_quarantine_if_matched(&out);
     // Request changes apply to an allowed request only (a refused outcome
     // carries none). `log` and `set_state` apply whatever the outcome, in
     // rule order, once the request changes are settled, so a failing change

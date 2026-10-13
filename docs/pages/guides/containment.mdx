@@ -51,6 +51,26 @@ is ([threat model](/design/threat-model#which-use-case-claims-what)).
    Adding the certificate to the system trust store also works. Do not put
    external hosts in `NO_PROXY`.
 
+4. **Decide what shuts the proxy for good.** A workload that probes roxy
+   with malformed requests, or reaches for something a rule marks as
+   beyond the pale, can be [quarantined](/guides/operations#quarantine):
+   every exchange refused until an operator, or the control plane, lets it
+   out. Set `quarantine_on` on the listener and use the `quarantine` action
+   in the rules that should trip it, and run roxy with `--state-dir` so the
+   quarantine survives a restart:
+
+   ```yaml
+   listeners:
+     - name: proxy
+       bind: 0.0.0.0:3128
+       quarantine_on:
+         parse_errors: { count: 20, window: 1m }
+   rules:
+     - id: exfil
+       when: host == "api.anthropic.com" and body.text contains "BEGIN PRIVATE KEY"
+       then: quarantine
+   ```
+
 ## With Docker Compose
 
 The workload sits only on an `internal: true` network, which has no route

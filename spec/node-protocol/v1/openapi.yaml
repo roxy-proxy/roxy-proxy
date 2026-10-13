@@ -360,6 +360,57 @@ components:
             persisted reservation, so a restart may reuse them and the
             reused events would be dropped as duplicates. Absent from a
             node that predates the field.
+        quarantine:
+          oneOf:
+            - $ref: "#/components/schemas/QuarantineReport"
+            - type: "null"
+          description: >-
+            The quarantine in force, or null. Absent from a node that
+            predates the field.
+
+    QuarantineReport:
+      type: object
+      description: >-
+        A node's quarantine: every exchange is refused until the lease's
+        `quarantine.release` names `id`, or an operator removes the marker
+        from the state dir before a restart.
+      required: [id, since, cause]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          description: Minted by the node per incident.
+        since:
+          type: string
+          format: date-time
+        cause:
+          type: object
+          description: >-
+            What tripped it, as the node's `quarantined` flow event carries
+            it. `kind` is `rule` (with `rule` and `flow`) or `threshold`
+            (with `listener`, `counter`, `count` and `window_seconds`).
+          required: [kind]
+          properties:
+            kind:
+              type: string
+              enum: [rule, threshold]
+
+    LeaseQuarantine:
+      type: object
+      description: >-
+        Releases of the node's quarantine. Orthogonal to the policy: the
+        rest of the lease applies whether or not the node is quarantined.
+      properties:
+        release:
+          type: array
+          items:
+            type: string
+            minLength: 1
+          description: >-
+            Incident ids the control plane has released. The node lifts its
+            quarantine when the id it reports is among them; any other id
+            is ignored, so a release decided before a later trip lifts
+            nothing. Ids may stay listed indefinitely.
 
     SecretValue:
       type: string
@@ -443,6 +494,8 @@ components:
             lease. The first lease sets it without clearing anything.
         flow:
           $ref: "#/components/schemas/FlowSettings"
+        quarantine:
+          $ref: "#/components/schemas/LeaseQuarantine"
         interception_ca:
           description: Reserved; a v1 server does not send it and a v1 node ignores it.
           not: {}

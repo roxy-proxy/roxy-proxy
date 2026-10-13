@@ -101,10 +101,15 @@ pub struct Condition {
 #[derive(Debug, Clone)]
 enum CAction {
     Effect(Effect),
-    SetHeader { name: String, parts: Vec<Part> },
+    SetHeader {
+        name: String,
+        parts: Vec<Part>,
+    },
     Sign(SignSpec),
     Tag(String),
     Terminal(Decision),
+    /// `quarantine`: the deny it serves, plus the proxy-wide trip.
+    Quarantine(Deny),
 }
 
 /// `sign: aws_sigv4` before its credentials are resolved.
@@ -126,6 +131,7 @@ enum WatchAction {
     Effect(WatchEffect),
     Tag(String),
     Deny(Deny),
+    Quarantine(Deny),
 }
 
 impl WatchAction {
@@ -135,6 +141,7 @@ impl WatchAction {
     fn after_forwarding(a: &CAction) -> Option<Self> {
         match a {
             CAction::Terminal(Decision::Deny(d)) => Some(Self::Deny(d.clone())),
+            CAction::Quarantine(d) => Some(Self::Quarantine(d.clone())),
             CAction::Tag(t) => Some(Self::Tag(t.clone())),
             CAction::Effect(Effect::Log { level, message }) => {
                 Some(Self::Effect(WatchEffect::Log {

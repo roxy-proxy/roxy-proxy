@@ -41,6 +41,7 @@ fn readiness(shared: &Shared) -> Response<Full<Bytes>> {
         PolicyState::Loaded => (StatusCode::OK, "ready"),
         PolicyState::Missing => (StatusCode::SERVICE_UNAVAILABLE, "no_policy"),
         PolicyState::Expired => (StatusCode::SERVICE_UNAVAILABLE, "policy_expired"),
+        PolicyState::Quarantined => (StatusCode::SERVICE_UNAVAILABLE, "quarantined"),
     };
     reply(status, "text/plain", body)
 }
@@ -51,7 +52,13 @@ fn route(req: &Request<Incoming>, shared: &Shared) -> Response<Full<Bytes>> {
         (true, "/roxy-ca.pem") => reply(StatusCode::OK, PEM_CONTENT_TYPE, shared.ca.cert_pem()),
         (true, "/healthz") => {
             let mut res = reply(StatusCode::OK, "text/plain", "ok");
-            let state = if shared.expired() { "expired" } else { "valid" };
+            let state = if shared.quarantined() {
+                "quarantined"
+            } else if shared.expired() {
+                "expired"
+            } else {
+                "valid"
+            };
             res.headers_mut()
                 .insert(POLICY_HEADER, http::HeaderValue::from_static(state));
             res

@@ -137,6 +137,11 @@ impl Decision {
 }
 
 impl Deny {
+    /// The deny a `quarantine` action serves: 403, closing the connection.
+    pub fn quarantine() -> Self {
+        Self::default_deny()
+    }
+
     /// The deny when no rule decides: 403, closing the connection.
     pub fn default_deny() -> Self {
         Self {
@@ -660,6 +665,10 @@ pub struct Outcome {
     pub terminal_rule: RuleId,
     /// Set exactly when `terminal_rule` is `_fail_closed`.
     pub fail_closed_reason: Option<FailClosedReason>,
+    /// The first matching rule with a `quarantine` action, whatever
+    /// `terminal_rule` is: a quarantine anywhere puts the proxy into
+    /// quarantine, as a deny anywhere refuses the request.
+    pub quarantine: Option<RuleId>,
     /// Effects of non-terminal actions of matched rules, in list order.
     /// When the decision is not an allow, only `log` and `set_state`
     /// remain.
@@ -679,6 +688,8 @@ pub struct WatchOutcome {
     pub terminal_rule: Option<RuleId>,
     /// Set when the stop is a fail-closed one.
     pub fail_closed_reason: Option<FailClosedReason>,
+    /// The first rule matching now with a `quarantine` action.
+    pub quarantine: Option<RuleId>,
     /// Watching rules that matched now, in list order.
     pub matched: Vec<RuleId>,
     /// Their non-terminal effects, in list order (only `log` and

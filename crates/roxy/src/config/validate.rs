@@ -126,6 +126,20 @@ impl Config {
                     format!("bind address {} is already used by {first}", l.bind),
                 ));
             }
+            if let Some(q) = &l.quarantine_on {
+                if q.parse_errors.count == 0 {
+                    d.push(Diagnostic::new(
+                        format!("{path}.quarantine_on.parse_errors.count"),
+                        "must be at least 1",
+                    ));
+                }
+                if q.parse_errors.window.is_zero() {
+                    d.push(Diagnostic::new(
+                        format!("{path}.quarantine_on.parse_errors.window"),
+                        "must be longer than 0",
+                    ));
+                }
+            }
         }
         if let Some(ca) = &self.ca_server
             && ca.bind.port() != 0

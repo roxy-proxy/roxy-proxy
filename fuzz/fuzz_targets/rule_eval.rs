@@ -99,11 +99,12 @@ fn expr(u: &mut Unstructured<'_>, depth: u8) -> Result<String> {
 }
 
 fn then(u: &mut Unstructured<'_>) -> Result<serde_json::Value> {
-    Ok(match u.int_in_range(0..=4)? {
+    Ok(match u.int_in_range(0..=5)? {
         0 => json!("allow"),
         1 => json!("deny"),
         2 => json!({ "deny": { "status": 429 } }),
         3 => json!([{ "tag": "t0" }]),
+        4 => json!("quarantine"),
         _ => json!([{ "tag": "t0" }, "allow"]),
     })
 }

@@ -144,6 +144,7 @@ impl NodeHarness {
                 spool_high_water_bytes: 8 << 20,
                 on_high_water: OnHighWater::Spool,
             },
+            quarantine: None,
             interception_ca: None,
         }
     }
@@ -729,5 +730,112 @@ async fn a_first_lease_whose_listeners_cannot_bind_leaves_the_bootstrap_listener
     drop(held);
     assert_eq!(h.readyz().await, (200, "ready".to_owned()));
     assert_eq!(h.get(h.proxy_addr().await, "/late").await, (200, None));
+    h.stop().await;
+}
+
+/// A node that trips a quarantine reports the incident on every poll and
+/// refuses everything, through leases and a restart, until a lease names
+/// that incident in `quarantine.release`; a release naming another id does
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quarantined_node_is_released_only_by_its_incident_id() {
+    let mut h = NodeHarness::start().await;
+    let rules = [
+        rule("exfil", "path == \"/exfil\"", "quarantine"),
+        rule("up", "host == \"upstream.test\"", ALLOW),
+    ]
+    .concat();
+    let config = h.config(0, &rules, "");
+    let l1 = NodeHarness::lease("L1", &config, "s1", "e1");
+    h.mock.fallback(LEASE, Reply::json(200, &l1));
+    h.run(true).await;
+    h.wait_applied("L1").await;
+    let proxy = h.proxy_addr().await;
+    assert_eq!(h.get(proxy, "/a").await, (200, None));
+
+    assert_eq!(h.get(proxy, "/exfil").await, (403, Some("exfil".into())));
+    assert_eq!(h.get(proxy, "/b").await, (403, Some("_quarantined".into())));
+    assert_eq!(h.readyz().await, (503, "quarantined".to_owned()));
+    let tripped = h
+        .sink
+        .wait_for("quarantined", 1, Duration::from_secs(10))
+        .await
+        .remove(0);
+    let id = tripped["id"].as_str().unwrap().to_owned();
+    assert!(h.state_dir().join("quarantine").is_file());
+
+    // The next poll carries the report; the lease keeps applying.
+    let so_far = h.mock.requests_to(LEASE).len();
+    let reported = h
+        .mock
+        .wait_for(LEASE, so_far + 1)
+        .await
+        .pop()
+        .unwrap()
+        .node_state();
+    let report = reported.quarantine.expect("quarantine reported");
+    assert_eq!(report.id, id);
+    assert_eq!(report.cause["kind"], "rule");
+    assert_eq!(report.cause["rule"], "exfil");
+    assert_eq!(reported.policy_state, PolicyState::Loaded);
+
+    // A release naming another incident lifts nothing, nor does a new
+    // lease by itself.
+    let mut l2 = NodeHarness::lease("L2", &config, "s1", "e1");
+    l2.quarantine = Some(roxy_node::protocol::LeaseQuarantine {
+        release: vec!["q-other".into()],
+    });
+    h.mock.fallback(LEASE, Reply::json(200, &l2));
+    h.wait_applied("L2").await;
+    assert_eq!(h.get(proxy, "/c").await, (403, Some("_quarantined".into())));
+
+    // The quarantine survives a restart on the same state dir. The new
+    // process polls once with no lease and once reporting L2; the old
+    // process's reports of L2 must not count as the new one's.
+    h.stop().await;
+    let so_far = h.mock.requests_to(LEASE).len();
+    h.run(false).await;
+    let polls = h.mock.wait_for(LEASE, so_far + 2).await;
+    assert_eq!(
+        polls.last().unwrap().node_state().lease_id.as_deref(),
+        Some("L2")
+    );
+    let proxy = h.proxy_addr().await;
+    assert_eq!(h.readyz().await, (503, "quarantined".to_owned()));
+    assert_eq!(h.get(proxy, "/d").await, (403, Some("_quarantined".into())));
+    let restored = h
+        .sink
+        .wait_for("quarantined", 2, Duration::from_secs(10))
+        .await
+        .pop()
+        .unwrap();
+    assert_eq!(restored["id"], id, "{restored:#}");
+    assert_eq!(restored["restored"], true, "{restored:#}");
+
+    // Naming the incident releases it; the marker goes and traffic flows.
+    let mut l3 = NodeHarness::lease("L3", &config, "s1", "e1");
+    l3.quarantine = Some(roxy_node::protocol::LeaseQuarantine {
+        release: vec!["q-other".into(), id.clone()],
+    });
+    h.mock.fallback(LEASE, Reply::json(200, &l3));
+    h.wait_applied("L3").await;
+    let released = h
+        .sink
+        .wait_for("quarantine_released", 1, Duration::from_secs(10))
+        .await
+        .remove(0);
+    assert_eq!(released["id"], id, "{released:#}");
+    assert!(!h.state_dir().join("quarantine").exists());
+    assert_eq!(h.readyz().await, (200, "ready".to_owned()));
+    assert_eq!(h.get(proxy, "/e").await, (200, None));
+    let so_far = h.mock.requests_to(LEASE).len();
+    let clear = h
+        .mock
+        .wait_for(LEASE, so_far + 1)
+        .await
+        .pop()
+        .unwrap()
+        .node_state();
+    assert_eq!(clear.quarantine, None);
     h.stop().await;
 }

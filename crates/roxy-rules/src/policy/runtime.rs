@@ -76,8 +76,9 @@ impl Policy {
         let mut tags: Vec<String> = ctx.initial_tags.to_vec();
         let mut effects: Vec<Effect> = Vec::new();
         let mut matched: Vec<RuleId> = Vec::new();
-        let mut deny: Option<(usize, &Decision)> = None;
+        let mut deny: Option<(usize, Decision)> = None;
         let mut allow: Option<(usize, &Decision)> = None;
+        let mut quarantine: Option<RuleId> = None;
         for &i in &self.head {
             let rule = &self.rules[i];
             let hit = match &rule.when {
@@ -113,14 +114,19 @@ impl Policy {
                         allow.get_or_insert((i, d));
                     }
                     CAction::Terminal(d @ Decision::Deny(_)) => {
-                        deny.get_or_insert((i, d));
+                        deny.get_or_insert_with(|| (i, d.clone()));
+                    }
+                    CAction::Quarantine(d) => {
+                        quarantine.get_or_insert_with(|| rule.id.clone());
+                        deny.get_or_insert_with(|| (i, Decision::Deny(d.clone())));
                     }
                 }
             }
         }
         let (decision, terminal_rule) = match (deny, allow) {
             // Deny wins; otherwise the first matching allow.
-            (Some((i, d)), _) | (None, Some((i, d))) => (d.clone(), self.rules[i].id.clone()),
+            (Some((i, d)), _) => (d, self.rules[i].id.clone()),
+            (None, Some((i, d))) => (d.clone(), self.rules[i].id.clone()),
             (None, None) => (Decision::default_deny(), self.default_id.clone()),
         };
         if !decision.is_allow() {
@@ -131,6 +137,7 @@ impl Policy {
             matched,
             terminal_rule,
             fail_closed_reason: None,
+            quarantine,
             effects,
             tags,
         }
@@ -149,6 +156,7 @@ impl Policy {
             matched,
             terminal_rule: self.fail_closed_id.clone(),
             fail_closed_reason: Some(reason),
+            quarantine: None,
             effects,
             tags,
         }
@@ -235,6 +243,12 @@ impl Policy {
                         }
                     }
                     WatchAction::Deny(d) => {
+                        if deny.is_none() {
+                            deny = Some((rule.id.clone(), d.clone()));
+                        }
+                    }
+                    WatchAction::Quarantine(d) => {
+                        o.quarantine.get_or_insert_with(|| rule.id.clone());
                         if deny.is_none() {
                             deny = Some((rule.id.clone(), d.clone()));
                         }

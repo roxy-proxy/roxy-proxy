@@ -18,7 +18,15 @@ listeners:
   - name: proxy
     mode: http_proxy           # the default
     bind: 0.0.0.0:3128
+    quarantine_on:             # optional; off when absent
+      parse_errors: { count: 20, window: 1m }
 ```
+
+`quarantine_on.parse_errors` puts the whole process into
+[quarantine](/guides/operations#quarantine) once the listener has logged
+`count` parse errors within `window` (`count` at least 1, `window` longer
+than 0). It counts a client sending what roxy will not parse, not one that
+is slow or leaves. Setting it needs `roxy run --state-dir`.
 
 ## HTTP proxy
 
@@ -337,6 +345,7 @@ Every refusal roxy originates has this body:
 | refusal | status | `rule` |
 |---|---|---|
 | a rule denies | `403`, or the rule's `deny.status` | the rule id |
+| the process is quarantined | `403` | `_quarantined` |
 | address floor | `403` | `_address_policy` |
 | unavailable policy input | `503` | `_fail_closed` |
 | failed addon layer | `503` | `layer:<name>` |

@@ -1011,3 +1011,35 @@ fn health_probes_a_running_roxy() {
     let out = roxy(&["health", "--url", &url]);
     assert_eq!(out.status.code(), Some(1), "a stopped roxy is unhealthy");
 }
+
+/// A config that can quarantine passes `check` (the state dir is a `run`
+/// concern) but does not `run` without `--state-dir`, since a quarantine
+/// that a restart forgets is no quarantine.
+#[test]
+fn a_config_that_can_quarantine_needs_a_state_dir_to_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("roxy.yaml");
+    for config in [
+        "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:0, quarantine_on: { parse_errors: \
+         { count: 3, window: 1m } } }]\ntls: { ca_dir: CA }\n",
+        "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:0 }]\ntls: { ca_dir: CA }\n\
+         rules: [{ id: r, then: quarantine }]\n",
+    ] {
+        let config = config.replace("CA", dir.path().join("ca").to_str().unwrap());
+        std::fs::write(&cfg, &config).unwrap();
+        let out = roxy(&["check", "--config", cfg.to_str().unwrap()]);
+        assert!(out.status.success(), "{config}: {}", text(&out.stderr));
+        let out = roxy(&["run", "--config", cfg.to_str().unwrap()]);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{config}: {}",
+            text(&out.stderr)
+        );
+        assert!(
+            text(&out.stderr).contains("needs --state-dir"),
+            "{config}: {}",
+            text(&out.stderr)
+        );
+    }
+}

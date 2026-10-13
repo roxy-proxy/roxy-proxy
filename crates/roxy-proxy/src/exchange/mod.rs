@@ -397,6 +397,9 @@ pub(crate) async fn process<F: Front>(
             f.headers.remove("accept-encoding");
         }
     }
+    if let Some(refusal) = cx.quarantine_refusal() {
+        return (cx, Outcome::Refuse(refusal));
+    }
     if let Some(refusal) = cx.expiry_refusal() {
         return (cx, Outcome::Refuse(refusal));
     }

@@ -33,7 +33,10 @@ runs follows from what it reads.
    through while you find out what a workload reaches, say so with a rule:
    `{ id: discover, then: allow }` (no `when` matches everything). Rule order does
    not affect the decision. A rule that reads a value not yet known is
-   skipped here, not treated as false.
+   skipped here, not treated as false. `quarantine` is a deny that also
+   puts the proxy into [quarantine](/guides/operations#quarantine): a
+   matching one trips it whichever deny decided the request, and from the
+   next exchange on nothing here runs at all.
 2. **After that, rules watch.** For the rest of the exchange, two kinds of
    rule are re-checked whenever a value they read becomes known or changes:
    rules that read a *watched* field ([fields](/reference/rule-language#fields)),
@@ -49,9 +52,9 @@ runs follows from what it reads.
 3. **Only head rules can `allow`.** A rule that reads a watched field cannot
    allow, change the request (`set_header` on the request, `rewrite_path`,
    `redirect`, ...), `capture` or `digest`: the request is already on its
-   way, so each is a compile error. It can deny, and add effects that
-   still make sense: `log`, `tag`, `set_state`, and header changes on a
-   response that has not been sent yet.
+   way, so each is a compile error. It can deny or quarantine, and add
+   effects that still make sense: `log`, `tag`, `set_state`, and header
+   changes on a response that has not been sent yet.
 4. **A watching rule's non-terminal effects apply once**, the first time it
    matches.
 5. **Order matters for effects, not decisions.** Rules are evaluated top to

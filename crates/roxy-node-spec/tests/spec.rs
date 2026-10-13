@@ -217,6 +217,37 @@ fn node_state_seq_unreserved_is_a_boolean_and_an_older_node_may_omit_it() {
     assert!(validate("NodeState", &state).is_ok());
 }
 
+/// A node reports `quarantine` as the report object or `null`; the report
+/// needs its id, time and a cause of a known kind.
+#[test]
+fn node_state_quarantine_is_a_report_or_null() {
+    let mut state = page_example("NodeState");
+    state["quarantine"] = page_example("QuarantineReport");
+    assert!(validate("NodeState", &state).is_ok());
+    state["quarantine"]["cause"]["kind"] = json!("mood");
+    assert!(validate("NodeState", &state).is_err());
+    state["quarantine"] = json!({"id": "q-1"});
+    assert!(validate("NodeState", &state).is_err());
+    state["quarantine"] = json!("q-1");
+    assert!(validate("NodeState", &state).is_err());
+    state.as_object_mut().unwrap().remove("quarantine");
+    assert!(validate("NodeState", &state).is_ok());
+}
+
+/// `quarantine.release` is a list of ids, and the whole object is optional.
+#[test]
+fn lease_quarantine_release_is_a_list_of_ids() {
+    let mut lease = page_example("Lease");
+    lease["quarantine"]["release"] = json!("q-1");
+    assert!(validate("Lease", &lease).is_err());
+    lease["quarantine"]["release"] = json!([""]);
+    assert!(validate("Lease", &lease).is_err());
+    lease["quarantine"] = json!({"release": []});
+    assert!(validate("Lease", &lease).is_ok());
+    lease.as_object_mut().unwrap().remove("quarantine");
+    assert!(validate("Lease", &lease).is_ok());
+}
+
 #[test]
 fn flow_batch_needs_events_with_seq() {
     let mut batch = page_example("FlowBatch");

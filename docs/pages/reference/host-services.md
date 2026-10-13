@@ -77,5 +77,6 @@ key as 0); an unknown id, or a key field the request does not have, fails
 the exchange. `flow.log` writes to roxy's operational log with the
 flow id and layer name.
 
-There is no way to terminate or quarantine a client: a layer denies the
-exchange and reports through `record` or an endpoint.
+A layer cannot terminate a client or quarantine the proxy: it denies the
+exchange and reports through `record` or an endpoint. Quarantine is a rule
+action ([quarantine](/guides/operations#quarantine)).

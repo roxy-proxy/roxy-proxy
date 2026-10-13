@@ -119,7 +119,8 @@ state:
   "uptime_seconds": 86400,
   "policy_state": "loaded",
   "spooled_bytes": 0,
-  "seq_unreserved": false
+  "seq_unreserved": false,
+  "quarantine": null
 }
 ```
 
@@ -127,9 +128,24 @@ state:
 |---|---|
 | `lease_id` | the lease the node holds; `null` before the first. Lets the server notice a node that did not apply what it was sent |
 | `roxy_version` | the node's release; the server may refuse to serve it with `426` |
-| `policy_state` | `none` (no lease yet), `loaded` (a lease is in force) or `expired` (the lease ran down, or the node is revoked) |
+| `policy_state` | `none` (no lease yet), `loaded` (a lease is in force) or `expired` (the lease ran down, or the node is revoked). A quarantine does not change it: the lease is still applied, and `quarantine` says the node refuses everything regardless |
 | `spooled_bytes` | flow-log data accepted but not yet acknowledged |
 | `seq_unreserved` | `true` while events are being tagged with `seq` values past the node's persisted reservation, because a `flow.seq` write is failing or has not caught up. A restart in that state may reuse those `seq` values, and the server would drop the reused events as duplicates; a node reporting `true` for long needs its state directory looked at. Absent from a node that predates the field |
+| `quarantine` | the [quarantine](/guides/operations#quarantine) in force, or `null`. Absent from a node that predates the field |
+
+```json title="QuarantineReport"
+{
+  "id": "q-01J9ZB7QX4R2M8K3N5P6T7V8W9",
+  "since": "2026-10-13T09:14:02Z",
+  "cause": {"kind": "rule", "rule": "exfil-guard", "flow": "01J9ZB7P"}
+}
+```
+
+| field | meaning |
+|---|---|
+| `id` | minted by the node per incident; what a release names |
+| `since` | when it tripped, on the node's clock |
+| `cause` | what tripped it, as the node's `quarantined` flow event carries it: `kind: rule` with the `rule` id and the `flow`, or `kind: threshold` with the `listener`, the `counter` (`parse_errors`), its `count` and `window_seconds` ([flow log](/reference/flow-log#events)) |
 
 The server answers `200` with the full lease on every poll (no conditional
 fetch), or `410`, `401`, `426`, `5xx` as in the
@@ -153,6 +169,9 @@ fetch), or `410`, `401`, `426`, `5xx` as in the
     "flush_interval_seconds": 5,
     "spool_high_water_bytes": 67108864,
     "on_high_water": "hold"
+  },
+  "quarantine": {
+    "release": ["q-01J9ZB7QX4R2M8K3N5P6T7V8W9"]
   }
 }
 ```
@@ -164,8 +183,9 @@ fetch), or `410`, `401`, `426`, `5xx` as in the
 | `refresh_after_seconds` | when to poll next, counted the same way; leave room for several retries before `valid_for_seconds` runs out (a third of it is reasonable). The node never polls later than halfway through the lease |
 | `config` | a complete `roxy.yaml` as a string, with no secret values: every `secrets:` entry the lease supplies is `name: { lease: true }` |
 | `secrets` | each secret name the config declares, to its value, a UTF-8 string. The node reads a missing map as empty, which refuses the lease if the config declares any `lease: true` secret |
-| `state_epoch` | opaque. When it differs from the previous lease's, the node clears every rule `set_state` entry and every metric window before applying the lease (how a control plane lifts a quarantine a rule tripped locally); unchanged, state survives a config change. The first lease sets it without clearing anything |
+| `state_epoch` | opaque. When it differs from the previous lease's, the node clears every rule `set_state` entry and every metric window before applying the lease (how a control plane lifts a lockout a rule imposed with `set_state`); unchanged, state survives a config change. The first lease sets it without clearing anything |
 | `flow` | [flow upload](/reference/node-protocol#flow-upload) settings. `ship: false` turns shipping off; the other fields are still required. `on_high_water` is `hold` (apply roxy's backpressure to traffic when the spool is full) or `spool` (drop the oldest spooled events, logging once) |
+| `quarantine` | releases of the node's [quarantine](/guides/operations#quarantine). `release` lists incident ids the control plane has released; the node lifts its quarantine when the `quarantine.id` it reports is among them, and ignores any other id, so a release decided before a later trip lifts nothing. Ids may stay listed indefinitely. Orthogonal to the policy: the rest of the lease is applied whether or not the node is quarantined, so the policy is current the moment the quarantine lifts. Optional; a server that has released nothing leaves it out |
 | `interception_ca` | reserved; a v1 server does not send it and a v1 node ignores it (the node accepts any value here, whatever the schema says) |
 
 The node applies only what differs from what it holds: a changed `config`

@@ -42,6 +42,8 @@ mod http_tests;
 #[cfg(test)]
 mod lease_tests;
 #[cfg(test)]
+mod quarantine_tests;
+#[cfg(test)]
 mod rules_tests;
 #[cfg(test)]
 mod sign_tests;
@@ -80,6 +82,7 @@ use crate::addrlist::{AddressList, AddressLists};
 use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
 use crate::flowlog::{FlowSink, MemorySink, Redactor};
 use crate::listener::{ClientConn, ListenerInfo, ListenerMode};
+use crate::quarantine::QuarantineState;
 use crate::sources::{MetricSource, Sample, StateSource, UnavailableMetrics, UnavailableState};
 use crate::upstream::{DnsSettings, TestDial, UpstreamSettings};
 
@@ -285,6 +288,10 @@ pub(crate) struct KitBuilder {
     placeholder_policy: bool,
     /// Adjusts the connector's settings before the kit starts.
     upstream: Option<UpstreamTweak>,
+    /// A state dir whose `quarantine` marker the kit loads and writes.
+    quarantine_dir: Option<std::path::PathBuf>,
+    /// A parse-error threshold on the kit's listener (`main`).
+    quarantine_on: Option<crate::quarantine::ParseErrorThreshold>,
 }
 
 type UpstreamTweak = Box<dyn FnOnce(&mut UpstreamSettings) + Send>;
@@ -370,6 +377,22 @@ impl KitBuilder {
     #[must_use]
     pub(crate) fn placeholder_policy(mut self) -> Self {
         self.placeholder_policy = true;
+        self
+    }
+
+    /// Keeps the quarantine marker in `dir`, so a quarantine survives into
+    /// a later kit built on the same dir.
+    #[must_use]
+    pub(crate) fn quarantine_dir(mut self, dir: &std::path::Path) -> Self {
+        self.quarantine_dir = Some(dir.to_path_buf());
+        self
+    }
+
+    /// `count` parse errors within `window` on the kit's listener
+    /// quarantine the process.
+    #[must_use]
+    pub(crate) fn quarantine_on(mut self, count: u32, window: Duration) -> Self {
+        self.quarantine_on = Some(crate::quarantine::ParseErrorThreshold { count, window });
         self
     }
 
@@ -486,9 +509,11 @@ impl KitBuilder {
             Some(gate) => Arc::new(gate::GatedSink::new(sink.clone(), gate.clone())),
             None => sink.clone(),
         };
+        let (quarantine, listeners) = quarantine_config(self.quarantine_dir, self.quarantine_on);
         let server = Server::start(RuntimeConfig {
             placeholder_policy: self.placeholder_policy,
-            listeners: Vec::new(),
+            listeners,
+            quarantine,
             ca_server: self.ca_server.then(|| "127.0.0.1:0".parse().unwrap()),
             ca: ca.clone(),
             minter: minter.clone(),
@@ -537,6 +562,30 @@ impl KitBuilder {
             _dir: dir,
         }
     }
+}
+
+/// The kit's quarantine state and the listeners the config needs for it.
+/// The kit serves its clients as listener `main` (see [`client_conn`]), so
+/// a threshold on it needs a listener of that name in the config.
+fn quarantine_config(
+    dir: Option<std::path::PathBuf>,
+    threshold: Option<crate::quarantine::ParseErrorThreshold>,
+) -> (Arc<QuarantineState>, Vec<crate::config::ListenerSpec>) {
+    let quarantine = match dir {
+        Some(dir) => Arc::new(QuarantineState::load(&dir.join("quarantine")).unwrap()),
+        None => Arc::new(QuarantineState::in_memory()),
+    };
+    let listeners = threshold
+        .map(|t| {
+            vec![crate::config::ListenerSpec {
+                name: "main".into(),
+                mode: ListenerMode::HttpProxy,
+                bind: "127.0.0.1:0".parse().unwrap(),
+                quarantine_on: Some(t),
+            }]
+        })
+        .unwrap_or_default();
+    (quarantine, listeners)
 }
 
 /// The test client's connection, as the accept loop would describe it:
@@ -672,6 +721,8 @@ impl Kit {
             valid_until: None,
             placeholder_policy: false,
             upstream: None,
+            quarantine_dir: None,
+            quarantine_on: None,
         }
     }
 

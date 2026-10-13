@@ -49,6 +49,7 @@ mod h2conn;
 pub mod io;
 pub mod listener;
 mod pipeline;
+pub mod quarantine;
 pub mod secrets;
 pub mod server;
 mod sign;
@@ -70,6 +71,7 @@ pub use flowlog::{
     StdoutSink, Timing, TlsInfo,
 };
 pub use listener::{ClientConn, Listener, ListenerInfo, ListenerMode, TcpProxyListener};
+pub use quarantine::{ParseErrorThreshold, QuarantineCause, QuarantineRecord, QuarantineState};
 pub use server::{PreparedReload, Server, ServerHandle, StartError};
 pub use sources::{
     MetricSource, MetricSourceError, Sample, StateFull, StateSource, UnavailableMetrics,
