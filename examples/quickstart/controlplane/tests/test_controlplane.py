@@ -183,18 +183,32 @@ def test_flows_are_deduplicated_and_acked_through_the_highest_contiguous_seq(cp,
 
 
 def test_the_server_key_is_readable_by_the_owner_alone_and_kept_across_restarts(cp):
-    """The key is rewritten over a file something else left world-readable;
-    a second server in the same data dir presents the same certificate."""
+    """A second server in the same data dir presents the same certificate,
+    and takes the key file back to owner-only if something else left it
+    world-readable."""
     chain = cp.data_dir / "server.pem"
-    chain.write_bytes(b"stale")
-    chain.chmod(0o644)
-    chain.unlink()
     first = Server(("127.0.0.1", 0), cp, ["localhost"])
     first.server_close()
     assert chain.stat().st_mode & 0o777 == 0o600
+    chain.chmod(0o644)
     second = Server(("127.0.0.1", 0), cp, ["localhost"])
     second.server_close()
     assert second.certificate_pem == first.certificate_pem
+    assert chain.stat().st_mode & 0o777 == 0o600
+    assert not list(cp.data_dir.glob(".*.tmp"))
+
+
+def test_an_interrupted_token_write_leaves_the_old_file_intact(cp, monkeypatch):
+    """A token store that cannot be completed leaves the last good one in
+    place, so a restart still recognises every node enrolled before it."""
+    first = cp.enrol("tok", ENROL_BODY)
+    before = (cp.data_dir / "tokens.json").read_bytes()
+    monkeypatch.setattr("controlplane.os.replace", lambda *a: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(OSError):
+        cp.enrol("tok", ENROL_BODY)
+    assert (cp.data_dir / "tokens.json").read_bytes() == before
+    restarted = ControlPlane(cp.data_dir, cp.config_path, cp.environ)
+    assert restarted.tokens.node_id(first["token"]) == first["node_id"]
 
 
 def test_over_tls_the_bearer_token_names_the_node(cp):

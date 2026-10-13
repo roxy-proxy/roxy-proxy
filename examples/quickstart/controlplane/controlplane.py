@@ -60,11 +60,18 @@ def rfc3339(when):
 
 def write_private(path, data):
     """Writes secret material readable by its owner alone, from creation on,
-    whatever the umask or the mode of a file already there."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    whatever the umask or the mode of a file already there. The write goes
+    through a temporary file in the same directory and a rename, so a crash
+    leaves the old file or the new one, never a partial one."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     os.fchmod(fd, 0o600)
     with open(fd, "wb") as f:
         f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def server_certificate(path, hostnames):
@@ -72,6 +79,7 @@ def server_certificate(path, hostnames):
     `path`, created on first use and kept so a restart presents the same
     certificate roxy was told to trust. Returns the certificate's PEM."""
     if path.exists():
+        os.chmod(path, 0o600)
         return x509.load_pem_x509_certificate(path.read_bytes()).public_bytes(serialization.Encoding.PEM)
     key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostnames[0])])
