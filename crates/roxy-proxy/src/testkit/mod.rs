@@ -50,7 +50,7 @@ mod upstream;
 mod ws_tests;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -103,6 +103,29 @@ pub(crate) const ALLOW_UP: &str = r#"
 /// The roxy-wasm test layer (`crates/roxy-wasm/test-components`).
 pub(crate) const TEST_LAYER: &[u8] =
     include_bytes!("../../../roxy-wasm/tests/fixtures/test_layer.wasm");
+
+/// The wasm runtime every kit shares, and each blob compiled on it once.
+/// A wasmtime compile costs far more than the rest of a kit, so the kits
+/// start their layers from a shared compile rather than each paying for
+/// one. The lock is held across the compile so concurrent first users of
+/// a blob wait for it instead of compiling it again.
+static WASM_RUNTIME: LazyLock<roxy_wasm::WasmRuntime> =
+    LazyLock::new(|| roxy_wasm::WasmRuntime::new().unwrap());
+static COMPILED: LazyLock<tokio::sync::Mutex<HashMap<&'static [u8], roxy_wasm::CompiledLayer>>> =
+    LazyLock::new(Default::default);
+
+async fn compiled(name: &str, wasm: &'static [u8]) -> roxy_wasm::CompiledLayer {
+    let mut cache = COMPILED.lock().await;
+    if let Some(c) = cache.get(wasm) {
+        return c.clone();
+    }
+    let c = WASM_RUNTIME
+        .compile(name, wasm.to_vec())
+        .await
+        .expect("compiling the addon layer");
+    cache.insert(wasm, c.clone());
+    c
+}
 
 /// One addon of the stack under test.
 #[derive(Clone)]
@@ -221,18 +244,16 @@ impl AddonDef {
             secret_names: &none,
             address_lists: &none,
         };
-        let rt = roxy_wasm::WasmRuntime::new().unwrap();
-        self.load(&rt, &input).await
+        self.load(&input).await
     }
 
-    async fn load(self, rt: &roxy_wasm::WasmRuntime, input: &PolicyInput<'_>) -> Arc<AddonSpec> {
+    async fn load(self, input: &PolicyInput<'_>) -> Arc<AddonSpec> {
         let when = self.when.as_deref().map(|w| {
             roxy_rules::Condition::compile(input, &format!("{}.when", self.name), w)
                 .unwrap_or_else(|d| panic!("when: {d:?}"))
         });
-        let layer = roxy_wasm::Layer::load(
-            rt,
-            self.wasm.to_vec(),
+        let layer = roxy_wasm::Layer::start(
+            compiled(&self.name, self.wasm).await,
             roxy_wasm::LayerConfig {
                 name: self.name.clone(),
                 capabilities: self.caps.into_iter().collect(),
@@ -468,10 +489,9 @@ impl KitBuilder {
         let samples = Arc::new(Mutex::new(Vec::new()));
         let metrics = metric_source(self.metrics, &policy, self.metric_limits, samples.clone());
 
-        let rt = roxy_wasm::WasmRuntime::new().unwrap();
         let mut addons = Vec::new();
         for a in self.addons {
-            addons.push(a.load(&rt, &input).await);
+            addons.push(a.load(&input).await);
         }
 
         let (mut settings, dns) = upstream_settings(&upstream);
