@@ -178,13 +178,18 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
     /// `client.port`) holds as many series as the client cares to send unless
     /// a `where` bounds it, and denied flows count too.
     pub(super) fn metric_warnings(metrics: &[MetricConfig]) -> Vec<Diagnostic> {
-        let unbounded = |name: &str| {
-            Field::from_name(name).is_some_and(|f| {
-                matches!(
-                    f,
-                    Field::Host | Field::Path | Field::Url | Field::QueryRaw | Field::ClientPort
-                )
-            })
+        // A `where` on `host` bounds `host` itself; for the other fields it
+        // only chooses whose values count, not how many, so the advice differs.
+        let advice = |name: &str| match Field::from_name(name) {
+            Some(Field::Host) => {
+                Some("bound it (`where: host under \"example.com\"`) or lower `max_keys`")
+            }
+            Some(Field::Path | Field::Url | Field::QueryRaw | Field::ClientPort) => Some(
+                "a `where` on `host` limits whose values count, not how many, so give \
+                 this metric a `where` that enumerates the values it keys on, or lower its \
+                 `max_keys`",
+            ),
+            _ => None,
         };
         let mut out = Vec::new();
         for (i, m) in metrics.iter().enumerate() {
@@ -204,13 +209,16 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 | MetricCount::Errors
                 | MetricCount::Denied => None,
             };
-            for (at, name) in keys.chain(unique).filter(|(_, n)| unbounded(n)) {
+            for (at, name, advice) in keys
+                .chain(unique)
+                .filter_map(|(at, n)| advice(n).map(|advice| (at, n, advice)))
+            {
                 out.push(Diagnostic::new(
                     at,
                     format!(
                         "`{name}` is chosen by the client, so without a `where` this metric \
                          holds one series per value the client sends, up to its `max_keys`; \
-                         bound it (`where: host under \"example.com\"`) or lower `max_keys` \
+                         {advice} \
                          (https://roxy-proxy.github.io/roxy-proxy/reference/rate-limits#key-cardinality)"
                     ),
                 ));

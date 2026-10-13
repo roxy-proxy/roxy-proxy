@@ -323,12 +323,13 @@ fn client_chosen_key_without_where_warns() {
 - { id: g, count: requests, key: [host, client.port], where: 'host under \"example.com\"' }",
     )
     .unwrap();
-    let warnings: Vec<String> = Policy::metric_warnings(&metrics)
+    let warnings = Policy::metric_warnings(&metrics);
+    let heads: Vec<String> = warnings
         .iter()
         .map(|d| format!("{}: {}", d.path, d.message.split(',').next().unwrap()))
         .collect();
     assert_eq!(
-        warnings,
+        heads,
         [
             "metrics[0].key[0]: `host` is chosen by the client",
             "metrics[1].key[1]: `path` is chosen by the client",
@@ -336,6 +337,16 @@ fn client_chosen_key_without_where_warns() {
             "metrics[5].key[1]: `client.port` is chosen by the client",
         ]
     );
+    // Only `host` is bounded by a `where` on host; the advice must not send
+    // operators to a filter that silences the warning without removing the risk.
+    assert!(warnings[0].message.contains("`where: host under"));
+    for d in &warnings[1..] {
+        assert!(
+            !d.message.contains("host under") && d.message.contains("not how many"),
+            "{}",
+            d.message
+        );
+    }
 }
 
 proptest! {

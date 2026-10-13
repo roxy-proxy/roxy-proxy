@@ -79,8 +79,8 @@ metrics:
 metric keys on any of the five fields above, or counts `unique(..)` of one,
 with no `where`. A `where` like this bounds `host`; the others have no such
 bound (a `where` on `host` limits whose paths and ports count, not how
-many), so give such a metric its own `max_keys`, so filling it refuses new
-series in that metric alone.
+many), so give such a metric its own `max_keys`: filling it then refuses
+new series in that metric alone.
 
 ## State
 
