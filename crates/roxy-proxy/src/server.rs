@@ -78,6 +78,13 @@ pub(crate) enum PolicyState {
     Expired,
 }
 
+/// Connections the `ca_server` listener holds at once, and per client IP.
+/// Fixed and separate from `limits.max_connections` so that a client
+/// filling the proxy's cap cannot starve `/healthz` into a restart; small
+/// because each connection serves one short response and then closes.
+const CA_SERVER_MAX_CONNECTIONS: usize = 64;
+const CA_SERVER_MAX_CONNECTIONS_PER_CLIENT: usize = 16;
+
 /// Per-client and global connection counting.
 struct ConnCaps {
     max: usize,
@@ -150,6 +157,7 @@ pub(crate) struct Shared {
     /// snapshot's `max_buffered_bytes`.
     buffers: Arc<BufferBudget>,
     caps: Arc<ConnCaps>,
+    ca_caps: Arc<ConnCaps>,
     /// Stop accepting; idle connections end.
     pub stop: CancellationToken,
     /// Grace period over: drop everything.
@@ -491,6 +499,11 @@ impl Server {
                 max_per_client: cfg.max_connections_per_client.max(1),
                 state: Mutex::new((0, HashMap::new())),
             }),
+            ca_caps: Arc::new(ConnCaps {
+                max: CA_SERVER_MAX_CONNECTIONS,
+                max_per_client: CA_SERVER_MAX_CONNECTIONS_PER_CLIENT,
+                state: Mutex::new((0, HashMap::new())),
+            }),
             stop: CancellationToken::new(),
             kill: CancellationToken::new(),
             tasks: TaskTracker::new(),
@@ -635,9 +648,10 @@ async fn accept_loop(listener: Arc<dyn Listener>, shared: Arc<Shared>) {
     }
 }
 
-/// Acquires a connection slot for a CA-server connection.
+/// Acquires a connection slot for a CA-server connection, from the
+/// listener's own cap rather than the proxy's.
 pub(crate) fn conn_slot(shared: &Shared, ip: IpAddr) -> Option<ConnSlot> {
-    shared.caps.acquire(ip).ok()
+    shared.ca_caps.acquire(ip).ok()
 }
 
 #[cfg(test)]
