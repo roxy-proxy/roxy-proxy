@@ -51,7 +51,7 @@ repo root, then `ROXY_IMAGE=roxy:local docker compose up --build`).
 | [`mocks/traffic.py`](mocks/traffic.py) | the traffic: a call every few seconds for each user in `TRAFFIC_SCHEDULE` |
 | [`mocks/chat.py`](mocks/chat.py) | the client the traffic uses: the Anthropic SDK through roxy, as a named user |
 | [`sentinel/`](sentinel/) | the sentinel sidecar, a service layer; `SENTINEL_DENY` sets its regex |
-| [`smoke.sh`](smoke.sh) | runs the stack, waits for each control to fire in the traffic's log, and checks the default deny, a layer failing closed, the lease running down and recovering, and the standalone override |
+| [`smoke.sh`](smoke.sh) | runs the stack, waits for each control to fire in the traffic's log, and checks the default deny, the node token renewing, a layer failing closed, the lease running down and recovering, a revoked node denying everything, and the standalone override |
 
 The sentinel sidecar's and the control plane's own tests run with `pytest`
 in `sentinel/` and `controlplane/`, each after

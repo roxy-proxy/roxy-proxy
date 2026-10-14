@@ -114,16 +114,6 @@ pub enum PolicyState {
     Expired,
 }
 
-impl PolicyState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Loaded => "loaded",
-            Self::Expired => "expired",
-        }
-    }
-}
-
 /// `POST /roxy/v1/lease` 200 body. Every poll carries the whole lease; the
 /// node compares `config` and `secrets` with what it holds.
 #[derive(Clone, Serialize, Deserialize)]
@@ -242,19 +232,6 @@ pub struct FlowAck {
     pub acked_through: u64,
 }
 
-/// `sha256:<hex>` of `bytes`: the fingerprint form roxy logs certificates
-/// in.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
-    let mut out = String::with_capacity(7 + 64);
-    out.push_str("sha256:");
-    for b in digest.as_ref() {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{b:02x}");
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,14 +256,6 @@ mod tests {
         assert!(!text.contains("hunter2"), "{text}");
         assert!(text.contains("node_id: \"n1\""));
         assert_eq!(res.token, "hunter2");
-    }
-
-    #[test]
-    fn sha256_fingerprint_form() {
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
     }
 
     #[test]

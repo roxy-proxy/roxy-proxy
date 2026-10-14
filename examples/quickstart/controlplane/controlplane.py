@@ -72,6 +72,12 @@ def write_private(path, data):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    # The rename is durable only once the directory entry is.
+    dfd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
 
 
 def server_certificate(path, hostnames):

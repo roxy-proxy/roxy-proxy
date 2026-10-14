@@ -2928,6 +2928,7 @@ dependencies = [
  "notify",
  "rcgen",
  "reqwest",
+ "ring",
  "roxy-http",
  "roxy-node",
  "roxy-proxy",

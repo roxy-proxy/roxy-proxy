@@ -127,9 +127,11 @@ whose token expires exits non-zero, since only re-enrolment can recover it.
 
 The node renews its token at the `renew_after_seconds` the control plane
 stated, and no later than two thirds of the way to its `not_after`
-([renew](/reference/node-protocol#renew)). A renewal the control plane
-refuses is logged once and not retried; the current token serves until it
-expires.
+([renew](/reference/node-protocol#renew)). A renewal answered `401` is
+retried with backoff, as an outage is: the replica answering may not yet
+know the token the last renewal issued. One the control plane refuses
+otherwise (`426`, `400`) is logged once and not retried; the current token
+serves until it expires.
 
 ## Flow shipping
 

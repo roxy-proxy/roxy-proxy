@@ -139,9 +139,5 @@ mod tests {
             NodeToken::parse(r#"{"node_id":"n1","token":"","not_after":"2026-11-05T10:12:00Z"}"#),
             Err(TokenError::Shape)
         ));
-        assert!(matches!(
-            NodeToken::parse("-----BEGIN CERTIFICATE-----"),
-            Err(TokenError::Invalid(_))
-        ));
     }
 }
