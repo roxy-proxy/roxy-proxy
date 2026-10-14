@@ -136,7 +136,8 @@ beside the bodies: they neither wait for nor hold up the heads and bytes,
 and roxy promises no order between a call and the heads or bytes the
 service sends after it. The service orders it: it awaits the `result`
 before sending whatever the effect must precede, be that the request, the
-response or the rest of a body. Today a call's tag or state write is seen
+response or the rest of a body
+([ordering across layers](/design/addon-model#ordering-across-layers)). Today a call's tag or state write is seen
 by this exchange's admission rules only if it lands before the request is
 forwarded, and by later exchanges always; in-flight rules do not yet read
 tag or state values ([#509](https://github.com/roxy-proxy/roxy-proxy/issues/509)).
