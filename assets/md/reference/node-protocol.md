@@ -7,9 +7,9 @@ is
 the example bodies here are checked against its schemas in CI and titled
 with the schema each satisfies.
 
-A node enrols once with a bootstrap token and receives a certificate, then
+A node enrols once with a bootstrap token and receives a node token, then
 authenticates with it to poll for its lease, ship its flow log and renew
-the certificate. The lease is the whole policy: a rendered `roxy.yaml`, the
+the token. The lease is the whole policy: a rendered `roxy.yaml`, the
 secret values it names, and how long it is good for. An expired lease
 denies everything. The control plane never pushes; the node polls.
 
@@ -18,14 +18,15 @@ denies everything. The control plane never pushes; the node polls.
 * HTTP/1.1 or HTTP/2 over TLS; all paths start with `/roxy/v1/`. Bodies
   are JSON, `Content-Type: application/json`; unknown fields are ignored by
   both sides. The node's `User-Agent` is `roxy/<roxy_version>`.
-* Enrolment authenticates with a bearer token; every other request with
-  the node certificate (mutual TLS). The listener must accept connections
-  without a client certificate, and answer any request other than enrolment
-  that arrives without one with `401`.
+* Every request carries `Authorization: Bearer <token>`: the enrolment
+  token at enrolment, the node token everywhere else. The node presents no
+  client certificate, so the control plane can sit behind any TLS
+  terminator; a token only ever travels inside the server's TLS. A request
+  other than enrolment whose token the server does not recognise is
+  answered `401`.
 * Bootstrap material, given out of band: the control plane URL, an
   enrolment token, and optionally a PEM bundle of CA certificates to verify
-  the control plane with (otherwise the system roots). The node generates
-  its own key pair; the key never leaves the node.
+  the control plane with (otherwise the system roots).
 
 ### Errors
 
@@ -41,24 +42,18 @@ node acts on the status code, not the body.
 | status | meaning | node behaviour |
 |---|---|---|
 | `400` | malformed request; `error` says how | log, then as a `401` on the same operation: retrying cannot help. A flow batch is the exception ([flow upload](/reference/node-protocol#flow-upload)) |
-| `401` | at enrolment: the token was not accepted. Elsewhere: the certificate is not recognised as a node | enrolment: retry with backoff for two minutes (a new token may not have reached every replica), then exit non-zero. Renewal: log once and stop renewing. Lease: log once per outcome change, keep polling and let the lease run down. Never re-enrol unasked: re-enrolment is an operator action |
+| `401` | at enrolment: the token was not accepted. Elsewhere: the node token is not recognised (never issued, expired or forgotten) | enrolment: retry with backoff for two minutes (a new token may not have reached every replica), then exit non-zero. Renewal: log once and stop renewing. Lease: log once per outcome change, keep polling and let the lease run down. Never re-enrol unasked: re-enrolment is an operator action |
 | `410` | the node is revoked; definite and terminal | at enrolment: exit non-zero at once. Elsewhere: expire the lease at once (deny everything, clear the secrets), stop polling, keep `/healthz` up and `/readyz` not ready, and offer what is spooled to `/flows` for up to thirty seconds |
 | `426` | the server will not serve this node's `protocol_version` or `roxy_version` | enrolment: exit non-zero at once. Renewal: stop renewing. Lease: treat as `5xx`; log the `missing` list distinctly |
 | `507` | flow quota exhausted | stop shipping until a lease with a new `lease_id` arrives ([flow upload](/reference/node-protocol#flow-upload)) |
 | `5xx`, timeout, connection or TLS error | the control plane is unavailable | retry with backoff; the lease runs down |
 
-A TLS handshake the server rejects because of the client certificate is a
-TLS error, not a `401`: the node cannot tell it from any other handshake
-failure.
-
 ## Enrol
 
-`POST /roxy/v1/enrol` with `Authorization: Bearer <token>` and no client
-certificate.
+`POST /roxy/v1/enrol` with `Authorization: Bearer <enrolment token>`.
 
 ```json title="EnrolRequest"
 {
-  "csr": "-----BEGIN CERTIFICATE REQUEST-----\nMIH...\n-----END CERTIFICATE REQUEST-----\n",
   "roxy_version": "0.1.0",
   "protocol_version": 1
 }
@@ -66,14 +61,13 @@ certificate.
 
 | field | meaning |
 |---|---|
-| `csr` | PEM `CERTIFICATE REQUEST` for an ECDSA P-256 or Ed25519 key. The server verifies the signature, takes the public key, and ignores the subject and any requested extensions |
 | `roxy_version` | the node's roxy release; a server may refuse one below its floor with `426` |
 | `protocol_version` | `1`; a server that does not speak it answers `426` with `missing: ["protocol_version:1"]` |
 
 ```json title="EnrolResponse"
 {
   "node_id": "node-7f3a9c",
-  "certificate_chain": "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----\n",
+  "token": "nt1-9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
   "not_after": "2026-11-05T10:12:00Z",
   "renew_after_seconds": 1296000
 }
@@ -82,34 +76,36 @@ certificate.
 | field | meaning |
 |---|---|
 | `node_id` | chosen by the server: 1 to 128 characters from `A-Z a-z 0-9 . _ -`; stable for the life of the node |
-| `certificate_chain` | PEM: the node certificate first, then any intermediates up to but not including the control plane's node CA root. The node certificate's only SAN is the URI `urn:roxy:node:<node_id>`. The node presents the whole chain as its client certificate |
-| `not_after` | the certificate's expiry, RFC 3339 in UTC, as in the certificate |
-| `renew_after_seconds` | counted from receipt; once passed, the node [renews](/reference/node-protocol#renew). Well inside the certificate lifetime, so a failed renewal can be retried. The node renews no later than two thirds of the way to `not_after` whatever the value, and does not check the schema's minimum: `0` makes it renew again as soon as each renewal succeeds |
+| `token` | the node token: 1 to 512 bytes of RFC 6750 `b64token` text (`A-Z a-z 0-9 - . _ ~ + /`, then any number of `=`), opaque to the node, which stores it and presents it unchanged as `Authorization: Bearer` on every later request. Its lifetime and storage (hashed at rest is recommended) are the server's decisions |
+| `not_after` | when the server stops accepting the token, RFC 3339 in UTC |
+| `renew_after_seconds` | counted from receipt; once passed, the node [renews](/reference/node-protocol#renew). Well inside the token lifetime, so a failed renewal can be retried. Whatever the value, the node renews no later than two thirds of the way to `not_after` and no sooner than one second after receipt; it does not check the schema's minimum, so `0` renews once a second |
 
-The token's lifetime and reuse (single-use, shared across a fleet) are the
-control plane's decisions; single-use with a short expiry is recommended.
-The node writes the certificate and key to its state directory: the only
-secrets-adjacent material on disk, and a revocable per-node identity.
+The enrolment token's lifetime and reuse (single-use, shared across a
+fleet) are the control plane's decisions; single-use with a short expiry
+is recommended. The node writes the node token, with its `node_id` and
+`not_after`, to its state directory (mode `0600`): the only credential the
+protocol puts on disk, and a revocable per-node identity.
 
 ## Renew
 
-`POST /roxy/v1/renew` with the node certificate and the enrol body; the
-response has the enrolment response's shape, with `node_id` unchanged. The
-old certificate stays valid until its own `not_after`; the node switches to
-the new one on receipt.
+`POST /roxy/v1/renew` with the node token and the enrol body; the response
+has the enrolment response's shape, with `node_id` unchanged and a fresh
+`token`. The server keeps accepting the old token until its own
+`not_after`, so a renewal that has reached one replica but not another
+cannot lock the node out; the node switches to the new token on receipt
+and replaces the one in its state directory.
 
 `5xx`, timeout, connection and TLS errors are retried with backoff; `410`
 is terminal; a `401`, `426` or other `4xx` is logged once and ends renewal,
-and the certificate serves until its `not_after`. Once it expires the node
-exits non-zero with an error naming the remedy (a new token and an empty
-state dir), as it does on a start whose stored certificate has already
-expired: no control plane recognises the certificate, so nothing short of
+and the token serves until its `not_after`. Once it expires the node exits
+non-zero with an error naming the remedy (a new enrolment token and an
+empty state dir), as it does on a start whose stored token has already
+expired: no control plane recognises the token, so nothing short of
 re-enrolment recovers the node.
 
 ## Lease
 
-`POST /roxy/v1/lease` with the node certificate. The body is the node's
-state:
+`POST /roxy/v1/lease` with the node token. The body is the node's state:
 
 ```json title="NodeState"
 {
@@ -214,7 +210,7 @@ and the `lease_id` on its next poll shows the server it was not applied.
 
 ## Flow upload
 
-`POST /roxy/v1/flows` with the node certificate. The body may be gzip
+`POST /roxy/v1/flows` with the node token. The body may be gzip
 compressed, signalled with `Content-Encoding: gzip`.
 
 ```json title="FlowBatch"
@@ -231,7 +227,7 @@ compressed, signalled with `Content-Encoding: gzip`.
 
 | field | meaning |
 |---|---|
-| `node_id` | must match the certificate, or the answer is `400 node_mismatch` |
+| `node_id` | must match the node the token names, or the answer is `400 node_mismatch` |
 | `lease_id` | the lease in force when the batch was assembled; any lease id issued to the node is accepted |
 | `seq_first` | the `seq` of the first event; events are consecutive and in order from it, or the server answers `400` |
 | `events` | [flow log](/reference/flow-log) records with `seq` added: a per-node counter that increases by one per shipped event, persisted in the state directory in blocks so it keeps increasing across restarts (a restart skips to the end of the last reservation, at most two blocks of 1024) |

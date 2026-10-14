@@ -19,8 +19,8 @@ roxy run --control-plane https://cp.example:8443 \
 | flag | meaning |
 |---|---|
 | `--control-plane URL` | The control plane's `https://` URL. Paths are under `/roxy/v1/`. |
-| `--enrol-token-file PATH` | The enrolment token. Read once, on a start with no node certificate in the state dir. A later start does not need it. |
-| `--state-dir DIR` | Where the node keeps its certificate, key and the other files below. Created with mode `0700`. |
+| `--enrol-token-file PATH` | The enrolment token. Read once, on a start with no node token in the state dir. A later start does not need it. |
+| `--state-dir DIR` | Where the node keeps its token and the other files below. Created with mode `0700`. |
 | `--control-plane-ca PATH` | PEM bundle to verify the control plane with. Default: the system roots. |
 | `--bootstrap-bind ADDR` | Where the proxy listens before the first lease. Default `0.0.0.0:3128`. |
 | `--bootstrap-ca-server ADDR` | Where `ca_server` listens before the first lease. Default `0.0.0.0:3130`. |
@@ -35,8 +35,7 @@ roxy does not delete the token file after enrolment.
 
 | file | contents |
 |---|---|
-| `node.crt` | The node certificate chain, PEM. Its URI SAN `urn:roxy:node:<id>` is the node id. |
-| `node.key` | The node's PKCS#8 key, mode `0600`. Generated on the node; never sent anywhere. |
+| `node.token` | The node token with its `node_id` and `not_after`, as one JSON object, mode `0600`. Replaced on each renewal. |
 | `flow.seq` | The flow `seq` counter, reserved ahead in blocks of 1024 by a background task, never on the request path. A restart continues after the last reservation. If it cannot be written at startup, the node does not start. If a later write fails, roxy logs it, keeps shipping and retries; once events outrun the last reservation it reports `seq_unreserved: true` on each lease poll until a reservation catches up, and a restart before then may reuse `seq` values. |
 | `ca/` | The interception CA, as `tls.ca_dir` holds it in file mode. |
 | `quarantine` | Present while the node is [quarantined](/guides/operations#quarantine): the incident as JSON, mode `0600`. Written when the quarantine trips and removed when the control plane releases it; a node that starts with it present starts quarantined. A `--state-dir` given to `roxy run --config` holds this file alone. |
@@ -71,15 +70,15 @@ Workloads fetch the CA from `ca_server` as usual
    `--bootstrap-ca-server`, with an empty policy: every request is denied
    with `terminal_rule: _default`, `/healthz` answers `200` and `/readyz`
    answers `503 no_policy`.
-2. With no `node.crt` in the state dir the node reads the token, generates
-   a key pair and a CSR, and enrols; the certificate and key go to the state
-   dir. A `401` (or another `4xx`) is retried with backoff for two minutes,
-   then the node exits non-zero, so an orchestrator sees a crash loop rather
-   than a node that denies everything for ever; a `410` or `426` exits at
-   once. An unreachable control plane is retried for as long as the outage
-   lasts. With a `node.crt` present the token file is not read; if that
-   certificate has expired the node exits non-zero too, naming the remedy:
-   a new token and an empty state dir.
+2. With no `node.token` in the state dir the node reads the enrolment
+   token and enrols; the node token goes to the state dir. A `401` (or
+   another `4xx`) is retried with backoff for two minutes, then the node
+   exits non-zero, so an orchestrator sees a crash loop rather than a node
+   that denies everything for ever; a `410` or `426` exits at once. An
+   unreachable control plane is retried for as long as the outage lasts.
+   With a `node.token` present the enrolment token file is not read; if the
+   stored token has expired the node exits non-zero too, naming the remedy:
+   a new enrolment token and an empty state dir.
 3. The node fetches its lease and applies it. The first lease's
    `listeners`, `ca_server`, `tls`, connection limits and log destinations
    replace the bootstrap ones. Later leases that change one of those
@@ -123,8 +122,14 @@ polling and offers what is spooled to the control plane; a restart with the same
 same way. A `401`, `400`, `426` or unreachable control plane lets the lease
 run down: the node denies everything from `valid_until` until the next
 `200`, which recovers it without a restart. It never re-enrols unasked; to
-re-enrol, empty the state dir and start with a new token. A node whose
-certificate expires exits non-zero, since only re-enrolment can recover it.
+re-enrol, empty the state dir and start with a new enrolment token. A node
+whose token expires exits non-zero, since only re-enrolment can recover it.
+
+The node renews its token at the `renew_after_seconds` the control plane
+stated, and no later than two thirds of the way to its `not_after`
+([renew](/reference/node-protocol#renew)). A renewal the control plane
+refuses is logged once and not retried; the current token serves until it
+expires.
 
 ## Flow shipping
 
