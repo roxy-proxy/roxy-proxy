@@ -53,8 +53,10 @@ Two things come out of a layer, and roxy orders only one of them.
 The exchange's bytes form a pipeline. A head or a chunk reaches layer B
 only after layer A has sent it on, and A may hold, rewrite or drop it on
 the way: what B reads is what A passed, in the order A passed it, and the
-rules admit the request the last layer forwarded. This holds in both
-directions and for both kinds of layer.
+rules admit the request the last layer forwarded. The response is the same
+pipeline the other way up: the rules see the upstream's bytes first, then
+B, and A gets a chunk only after B has passed it. This holds for both kinds
+of layer.
 
 Host-service effects are not in that pipeline. `add_tag`, `state_put`,
 `record` and `quarantine` go to the host beside the bytes, not down the
@@ -68,7 +70,7 @@ the layer continues, so it has that order by construction; a service layer
 sends the call as a message and awaits the `result` itself
 ([host services on a stream](/reference/service-layers#host-services)).
 
-<img src={layerOrdering} alt="Two enforce layers, A and B, in roxy's request path, left to right, then the rules. The client's head (a solid line) and body bytes (a dashed line) run through A, then B, then to the rules; the gap between A and B is labelled: a chunk reaches B only after A sends it. Part-way through the body, A calls state_put, drawn as an arrow down to a host services strip along the bottom with a result arrow back up, and the note awaits result, then sends on; A's body line is broken at that point. In B, on the chunk that followed, a state_get arrow goes down to the strip and a result comes back, with the note on that chunk: sees A's write. A dotted line between the two calls says no order between these. The strip reads host services (add_tag, state_put, state_get, record, quarantine, and more): beside the pipeline. Under it: each layer's calls run on their own worker, so A's put lands before B's get only because A awaited its result; a write for this exchange's admission lands before the request is forwarded; any other is seen by the next rule that reads it, in flight or on a later exchange." />
+<img src={layerOrdering} alt="Two enforce layers, A and B, in roxy's request path, left to right, then the rules. The client's head (a solid line) and body bytes (a dashed line) run through A, then B, then to the rules; the gap between A and B is labelled: a chunk reaches B only after A sends it. Part-way through the body, A calls state_put, drawn as an arrow down to a host services strip along the bottom with a result arrow back up, and the note awaits result, then sends on; A's body line is broken at that point. In B, on the chunk that followed, a state_get arrow goes down to the strip and a result comes back, with the note on that chunk: sees A's write. A dotted line between the two calls says ordered only by A's await. The strip reads host services (add_tag, state_put, state_get, record, quarantine, and more): beside the pipeline. Under it: each layer's calls run on their own worker, so A's put lands before B's get only because A awaited its result; a write for this exchange's admission lands before the request is forwarded; any other is seen by the next rule that reads it, in flight or on a later exchange." />
 
 So, to make an effect visible:
 
