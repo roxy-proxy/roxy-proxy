@@ -14,7 +14,7 @@ tls:
   # ca_cert: /etc/roxy/ca/tls.crt  # a provided CA instead; set both or neither
   # ca_key: /etc/roxy/ca/tls.key
   require_sni_match: true
-  leaf_cache_size: 10000
+  leaf_cache_size: 10000       # at least 1
 ```
 
 ## Generated CA

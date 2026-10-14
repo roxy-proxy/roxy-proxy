@@ -4,7 +4,7 @@
 
 use bytes::Bytes;
 
-use super::{Answer, Kit, streaming_body};
+use super::{Answer, Kit, MemState, streaming_body};
 
 const RULES: &str = r#"
 - id: no-admin
@@ -1057,7 +1057,7 @@ async fn a_closing_deny_does_not_drain_the_upload() {
 #[derive(Default)]
 struct Recording {
     samples: std::sync::Mutex<Vec<crate::sources::Sample>>,
-    state: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    state: MemState,
 }
 
 impl crate::sources::MetricSource for Recording {
@@ -1081,20 +1081,16 @@ impl crate::sources::MetricSource for Recording {
 
 impl crate::sources::StateSource for Recording {
     fn get(&self, key: &str) -> Option<String> {
-        self.state.lock().unwrap().get(key).cloned()
+        self.state.get(key)
     }
 
     fn set(
         &self,
         key: &str,
         value: &str,
-        _ttl: Option<std::time::Duration>,
+        ttl: Option<std::time::Duration>,
     ) -> Result<(), crate::sources::StateFull> {
-        self.state
-            .lock()
-            .unwrap()
-            .insert(key.to_owned(), value.to_owned());
-        Ok(())
+        self.state.set(key, value, ttl)
     }
 }
 
@@ -1129,7 +1125,7 @@ async fn an_admission_deny_still_logs_and_writes_state() {
     let log = kit.events("log", 1).await;
     assert_eq!(log[0]["message"], "admin blocked", "{log:#?}");
     assert_eq!(
-        rec.state.lock().unwrap().get("seen").map(String::as_str),
+        crate::sources::StateSource::get(&*rec, "seen").as_deref(),
         Some("1")
     );
     let samples = rec.samples.lock().unwrap().clone();

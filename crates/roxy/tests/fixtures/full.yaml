@@ -160,7 +160,7 @@ addons:
     path: ../roxy-wasm/tests/fixtures/redact.wasm   # relative to the crate, where the tests run
     mode: enforce                # enforce (failures fail closed) | observe (tee, log only)
     config: { needles: ["sk-live-"], replacement: "[redacted]" }
-    capabilities: [log]          # endpoints, state, record, metrics, log
+    capabilities: [log]          # endpoints, state, record, metrics, log, quarantine
     limits:                      # each optional
       max_memory: 64mb
       first_byte_timeout: 30s    # to the layer's response head; bodies have no clock
