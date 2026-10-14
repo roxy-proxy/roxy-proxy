@@ -82,7 +82,9 @@ So, to make an effect visible:
   forwarded `request` head;
 - **otherwise**, a tag or state write is seen by the next rule that reads
   it, an in-flight re-check of this exchange or a later exchange's
-  admission. A write never reopens a decision already made
+  admission. The write does not itself trigger a re-check: a rule runs
+  when a value it watches changes, and reads the tag or key then. A write
+  never reopens a decision already made
   ([policy evaluation](/design/policy-evaluation#evaluation)).
 
 ## Invariants
