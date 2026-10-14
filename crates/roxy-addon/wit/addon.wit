@@ -8,10 +8,11 @@
 /// `wasi:io/streams` in both directions.
 ///
 /// Everything a layer can do outside its own streams is in `endpoints` and
-/// `flow`, and each of those calls is a capability granted per layer in
-/// roxy's config. A call the layer was not granted traps; the import is
-/// always linked, so one binary runs under different grants.
-package roxy:addon@0.2.0;
+/// `flow`. Apart from `flow.current`, `flow.add-tag` and `flow.config`,
+/// each of those calls is a capability granted per layer in roxy's config.
+/// A call the layer was not granted traps; the import is always linked, so
+/// one binary runs under different grants.
+package roxy:addon@0.2.1;
 
 /// Heads, bodies and the response a call will produce.
 interface types {
@@ -155,8 +156,10 @@ interface flow {
 
   /// The current flow. Always available.
   current: func() -> flow-info;
-  /// Add a tag to the flow's log record. Needs no capability, but only
-  /// an enforce layer may tag: from an observer it fails the exchange.
+  /// Tag the flow: the rules' `tag[..]` and the layers' `when` that run
+  /// after this call read it, as do `current` and the flow log. Needs no
+  /// capability, but only an enforce layer may tag: from an observer it
+  /// fails the exchange.
   add-tag: func(tag: string);
   /// The layer's `config:` value as a JSON document. Always available.
   config: func() -> string;

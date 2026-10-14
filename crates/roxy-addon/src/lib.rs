@@ -134,8 +134,6 @@ macro_rules! export {
 mod tests {
     use std::path::Path;
 
-    /// The crate carries its own copy of the WIT package (so it can be
-    /// published); it must match the workspace's.
     /// The names the SDK drops from a head it passes on are exactly the
     /// names the host refuses from a layer.
     #[test]
@@ -147,6 +145,8 @@ mod tests {
         assert_eq!(ours, hosts);
     }
 
+    /// The crate carries its own copy of the WIT package (so it can be
+    /// published); it must match the workspace's.
     #[test]
     fn wit_matches_workspace() {
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));

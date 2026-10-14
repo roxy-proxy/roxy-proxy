@@ -217,6 +217,8 @@ impl Layer {
         wasm: Vec<u8>,
         config: LayerConfig,
     ) -> Result<Layer, LoadError> {
+        // `start` checks too, but a compile is too expensive to spend on a
+        // config that cannot run.
         check_limits(&config)?;
         let compiled = runtime.compile(&config.name, wasm).await?;
         Self::start(compiled, config).await

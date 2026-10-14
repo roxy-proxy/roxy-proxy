@@ -77,9 +77,9 @@ addons:
 On other targets the crate builds too (imports panic if called), so the
 logic of a layer can be unit-tested natively.
 
-`roxy-addon` 0.2 targets `roxy:addon@0.2.0`. A component built with 0.1
-does not load on a roxy serving 0.2.0 (its imports differ); rebuild it
-against 0.2, which keeps the API below.
+`roxy-addon` 0.2 targets `roxy:addon@0.2.1`. A component built against an
+earlier 0.2.x still loads; one built with 0.1 does not (its imports
+differ); rebuild it against 0.2, which keeps the API below.
 
 ## What a layer can do
 
