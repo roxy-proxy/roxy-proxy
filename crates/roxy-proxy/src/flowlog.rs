@@ -210,6 +210,9 @@ pub enum FlowEvent<'a> {
         /// ...
         kind: String,
         message: String,
+        /// The service layer's id for the host-service call that failed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        call: Option<u64>,
     },
     /// A structured event an addon recorded (`flow.record`).
     LayerRecord {
@@ -218,6 +221,9 @@ pub enum FlowEvent<'a> {
         flow: String,
         conn: String,
         layer: String,
+        /// The service layer's id for the call that recorded it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        call: Option<u64>,
         kind: String,
         /// The addon's JSON, with secrets redacted.
         data: serde_json::Value,

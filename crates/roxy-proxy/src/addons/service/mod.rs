@@ -83,11 +83,15 @@ pub enum ServiceError {
     /// mid-exchange.
     #[error("service stream lost: {0}")]
     Closed(String),
-    /// A host service the service called failed, or it called one it was
+    /// Host-service call `call` failed, or called a service the layer was
     /// not granted: the same failures a WASM layer's host calls have, with
     /// the same flow-log kinds.
-    #[error(transparent)]
-    Layer(#[from] LayerError),
+    #[error("{err}")]
+    Layer {
+        call: u64,
+        #[source]
+        err: LayerError,
+    },
 }
 
 /// Why the service's answer will not come.
@@ -113,7 +117,7 @@ impl ServiceError {
             ServiceError::Protocol(_) => "service:protocol",
             ServiceError::Closed(_) => "service:closed",
             // Reported under the layer error's own kind (`error_kind`).
-            ServiceError::Layer(_) => "host",
+            ServiceError::Layer { .. } => "host",
         }
     }
 }
@@ -158,7 +162,7 @@ enum Out {
         headers: Vec<(String, String)>,
     },
     RequestEnd,
-    /// The answer to a host-service call the service gave an `id`.
+    /// The answer to a host-service call, by the `id` the service gave it.
     Result {
         id: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -206,14 +210,17 @@ enum In {
         message: Option<String>,
     },
     Log {
+        id: u64,
         level: LogLevelIn,
         message: String,
     },
     Record {
+        id: u64,
         kind: String,
         data: serde_json::Value,
     },
     AddTag {
+        id: u64,
         tag: String,
     },
     StateGet {
@@ -234,17 +241,23 @@ enum In {
 }
 
 impl In {
-    /// A host-service call, run beside the stream rather than in it.
-    fn is_host_call(&self) -> bool {
-        matches!(
-            self,
-            In::Log { .. }
-                | In::Record { .. }
-                | In::AddTag { .. }
-                | In::StateGet { .. }
-                | In::StatePut { .. }
-                | In::MetricGet { .. }
-        )
+    /// The service's id for the message when it is a host-service call,
+    /// run beside the stream rather than in it.
+    fn call_id(&self) -> Option<u64> {
+        match self {
+            In::Log { id, .. }
+            | In::Record { id, .. }
+            | In::AddTag { id, .. }
+            | In::StateGet { id, .. }
+            | In::StatePut { id, .. }
+            | In::MetricGet { id, .. } => Some(*id),
+            In::Request { .. }
+            | In::RequestEnd
+            | In::Response { .. }
+            | In::ResponseEnd
+            | In::Credit { .. }
+            | In::Reset { .. } => None,
+        }
     }
 }
 

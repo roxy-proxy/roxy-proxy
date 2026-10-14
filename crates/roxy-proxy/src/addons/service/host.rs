@@ -12,18 +12,23 @@ use super::In;
 use crate::addons::StackFlow;
 use crate::addons::host::StackHost;
 
-/// What a call gives back to the service: the `id` it named and its value
-/// (`null` for a call with none), or the refusal the service sees. A call
-/// with no `id` answers nothing.
-pub(super) type Reply = Option<(u64, Result<Value, String>)>;
+/// What a call gives back to the service: its value (`null` for a call
+/// with none), or the refusal of what the service passed.
+pub(super) type Reply = Result<Value, String>;
 
-/// Runs `call` for layer `index` of `st`. `Err` fails the exchange, as the
-/// same failure would a WASM layer's.
-pub(super) async fn call(st: &Arc<StackFlow>, index: usize, call: In) -> Result<Reply, LayerError> {
+/// Runs `call`, the service's call `id`, for layer `index` of `st`. `Err`
+/// fails the exchange, as the same failure would a WASM layer's.
+pub(super) async fn call(
+    st: &Arc<StackFlow>,
+    index: usize,
+    id: u64,
+    call: In,
+) -> Result<Reply, LayerError> {
     let host = StackHost {
         st: st.clone(),
         index,
         observer: None,
+        call: Some(id),
     };
     let caps = st.snap.addons[index].capabilities;
     let require = |cap: Capability, import: &'static str| {
@@ -47,51 +52,49 @@ pub(super) async fn call(st: &Arc<StackFlow>, index: usize, call: In) -> Result<
         In::Log {
             level,
             message: msg,
+            ..
         } => {
             require(Capability::Log, "flow.log")?;
             message(msg.len())?;
             host.log(level.into(), &msg);
-            Ok(None)
+            Ok(Ok(Value::Null))
         }
-        In::Record { kind, data } => {
+        In::Record { kind, data, .. } => {
             require(Capability::Record, "flow.record")?;
             let json = data.to_string();
             message(kind.len().saturating_add(json.len()))?;
             host.record(kind, json).await?;
-            Ok(None)
+            Ok(Ok(Value::Null))
         }
-        In::AddTag { tag } => {
+        In::AddTag { tag, .. } => {
             host.add_tag(tag).map_err(|e| match e {
                 TagError::Full => LayerError::BudgetExceeded(Budget::Tags),
                 TagError::Host(e) => LayerError::Host(e),
             })?;
-            Ok(None)
+            Ok(Ok(Value::Null))
         }
-        In::StateGet { id, key } => {
+        In::StateGet { key, .. } => {
             require(Capability::State, "flow.state-get")?;
             let value = host.state_get(key).await?;
-            Ok(Some((id, Ok(value.map_or(Value::Null, Value::String)))))
+            Ok(Ok(value.map_or(Value::Null, Value::String)))
         }
         In::StatePut {
-            id,
-            key,
-            value,
-            ttl_ms,
+            key, value, ttl_ms, ..
         } => {
             require(Capability::State, "flow.state-put")?;
             let result = host.state_put(key, value, ttl_ms).await?;
-            Ok(Some((id, result.map(|()| Value::Null))))
+            Ok(result.map(|()| Value::Null))
         }
-        In::MetricGet { id, metric } => {
+        In::MetricGet { metric, .. } => {
             require(Capability::Metrics, "flow.metric-get")?;
             let value = host.metric_get(metric, Vec::new()).await?;
-            Ok(Some((id, Ok(value.map_or(Value::Null, Value::from)))))
+            Ok(Ok(value.map_or(Value::Null, Value::from)))
         }
         In::Request { .. }
         | In::RequestEnd
         | In::Response { .. }
         | In::ResponseEnd
         | In::Credit { .. }
-        | In::Reset { .. } => Ok(None),
+        | In::Reset { .. } => Ok(Ok(Value::Null)),
     }
 }

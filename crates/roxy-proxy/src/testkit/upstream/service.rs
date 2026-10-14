@@ -253,12 +253,15 @@ impl Lane {
 /// One stream: a lane per body direction, indexed by direction byte.
 struct Sess {
     lanes: [Lane; 2],
+    /// Host-service calls not yet answered with a `result`.
+    calls_waiting: usize,
 }
 
 impl Sess {
     fn new() -> Self {
         Self {
             lanes: [Lane::new(), Lane::new()],
+            calls_waiting: 0,
         }
     }
 }
@@ -289,7 +292,9 @@ enum Mode {
     Refuse,
     Abort,
     Patient,
-    /// Passes through, after calling every host service on `open`.
+    /// Calls every host service on `open` (call ids 1 to 6), then passes
+    /// through once every call is answered, as a service whose writes
+    /// must be visible to the exchange does.
     Host,
 }
 
@@ -414,13 +419,18 @@ impl Conn {
                     | Mode::Sever
                     | Mode::Patient => {}
                     Mode::Host => {
-                        for m in [
-                            json!({"type": "log", "level": "info", "message": "hello from the service"}),
-                            json!({"type": "record", "kind": "verdict", "data": {"score": 0.9}}),
-                            json!({"type": "add_tag", "tag": "svc-tag"}),
-                            json!({"type": "state_put", "id": 1, "key": "svc", "value": HOST_STATE_VALUE}),
-                            json!({"type": "state_get", "id": 2, "key": "svc"}),
-                        ] {
+                        let calls = [
+                            json!({"type": "log", "id": 1, "level": "info", "message": "hello from the service"}),
+                            json!({"type": "record", "id": 2, "kind": "verdict", "data": {"score": 0.9}}),
+                            json!({"type": "add_tag", "id": 3, "tag": "svc-tag"}),
+                            json!({"type": "state_put", "id": 4, "key": "svc", "value": HOST_STATE_VALUE}),
+                            json!({"type": "state_get", "id": 5, "key": "svc"}),
+                            json!({"type": "metric_get", "id": 6, "metric": "by_host"}),
+                        ];
+                        let s = self.streams.get_mut(&id).expect("just opened");
+                        s.calls_waiting = calls.len();
+                        s.lanes[usize::from(REQUEST)].held = true;
+                        for m in calls {
                             self.send(text(id, m));
                         }
                     }
@@ -444,6 +454,7 @@ impl Conn {
                 }
                 self.flush(id, dir);
             }
+            "result" => self.answered(id),
             "request" if self.mode == Mode::Overlong => self.forward_declared(id, &v, 3, b"12345"),
             "request" if self.mode == Mode::Short => self.forward_declared(id, &v, 5, b"123"),
             "request" if self.mode == Mode::Refuse => {
@@ -473,12 +484,25 @@ impl Conn {
                 if let Some(s) = self.streams.get_mut(&id) {
                     let lane = &mut s.lanes[usize::from(dir)];
                     lane.queue.push_back(Queued::Ctl(v));
-                    if kind == "request_end" {
+                    if kind == "request_end" && self.mode == Mode::Patient {
                         lane.held = false;
                     }
                 }
                 self.flush(id, dir);
             }
+        }
+    }
+
+    /// A host-service call on stream `id` was answered; the last one lets
+    /// the held request go.
+    fn answered(&mut self, id: u32) {
+        let Some(s) = self.streams.get_mut(&id).filter(|s| s.calls_waiting > 0) else {
+            return;
+        };
+        s.calls_waiting -= 1;
+        if s.calls_waiting == 0 {
+            s.lanes[usize::from(REQUEST)].held = false;
+            self.flush(id, REQUEST);
         }
     }
 

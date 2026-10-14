@@ -132,15 +132,20 @@ class _Conn:
         self.ws = ws
         self.handler = handler
         self.streams: dict[int, _Stream] = {}
-        self._send_lock = asyncio.Lock()
+        # Serialises what goes out, and with it each stream's view of
+        # whether its last message has gone.
+        self.lock = asyncio.Lock()
 
     async def send(self, stream: int, msg: dict[str, Any]) -> None:
+        async with self.lock:
+            await self.send_unlocked(stream, msg)
+
+    async def send_unlocked(self, stream: int, msg: dict[str, Any]) -> None:
         msg["stream"] = stream
-        async with self._send_lock:
-            await self.ws.send(json.dumps(msg))
+        await self.ws.send(json.dumps(msg))
 
     async def send_bytes(self, stream: int, direction: int, data: bytes) -> None:
-        async with self._send_lock:
+        async with self.lock:
             await self.ws.send(stream.to_bytes(4, "big") + bytes([direction]) + data)
 
     async def run(self) -> None:
@@ -166,8 +171,9 @@ class _Conn:
         if kind == "open":
             flow = {k: v for k, v in msg.items() if k not in ("type", "stream")}
             s = _Stream(self, sid, flow)
+            s.observe = flow.get("mode") == "observe"
             self.streams[sid] = s
-            s.task = asyncio.create_task(s.run(observe=flow.get("mode") == "observe"))
+            s.task = asyncio.create_task(s.run(observe=s.observe))
             return
         s = self.streams.get(sid)
         if s is None:
@@ -186,6 +192,8 @@ class _Conn:
             s.fail_calls(ProtocolError("roxy reset the stream"))
             s.task.cancel()
         else:
+            if s.observe and kind in ("request_end", "response_end"):
+                s.roxy_ended(_DIR_OF_MESSAGE[kind])
             s.inbox(_DIR_OF_MESSAGE.get(kind, REQUEST)).put_nowait(msg)
 
 
@@ -211,6 +219,16 @@ class _Stream:
         # Host-service calls awaiting their `result`, by call id.
         self.pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._next_call = 0
+        self.observe = False
+        # A `request` was forwarded, so a `request_end` is owed.
+        self.forwarded = False
+        self._ends_sent = {REQUEST: False, RESPONSE: False}
+        # roxy's ends, on an observe stream.
+        self._ends_read = {REQUEST: False, RESPONSE: False}
+        # Nothing more may be sent: this side's last message has gone, or
+        # roxy's has on an observe stream. roxy drops a call sent after
+        # that and never answers it.
+        self.ended = False
 
     def fail_calls(self, exc: Exception) -> None:
         """Unblocks every call still waiting for its `result`: the stream
@@ -220,17 +238,40 @@ class _Stream:
                 fut.set_exception(exc)
         self.pending.clear()
 
+    async def send(self, msg: dict[str, Any], *, host: bool = False, end: int | None = None) -> None:
+        """Sends `msg` on the stream, under the connection's lock, so a
+        host-service call (`host`) either goes before this side's last
+        message or is refused (`ProtocolError`), never after it. `end` is
+        the direction whose end `msg` is."""
+        async with self.conn.lock:
+            if host and self.ended:
+                raise ProtocolError("the stream has ended: a call now would be dropped")
+            await self.conn.send_unlocked(self.id, msg)
+            if end is not None:
+                self._ends_sent[end] = True
+                if self._ends_sent[RESPONSE] and (not self.forwarded or self._ends_sent[REQUEST]):
+                    self.ended = True
+
+    def roxy_ended(self, direction: int) -> None:
+        """One of roxy's ends on an observe stream. Its second ends the
+        stream: every result roxy will send came before it, so a call
+        still waiting was dropped."""
+        self._ends_read[direction] = True
+        if self._ends_read[REQUEST] and self._ends_read[RESPONSE]:
+            self.ended = True
+            self.fail_calls(ProtocolError("roxy ended the stream"))
+
     async def call(self, msg: dict[str, Any]) -> Any:
-        """Sends a host-service call that gets a `result` and returns its
-        value, raising `HostError` on a refusal and `ProtocolError` if the
-        stream ends first."""
+        """Sends a host-service call and returns the value of its `result`,
+        raising `HostError` on a refusal and `ProtocolError` if the stream
+        has ended or ends first."""
         self._next_call += 1
         cid = self._next_call
         msg["id"] = cid
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self.pending[cid] = fut
         try:
-            await self.conn.send(self.id, msg)
+            await self.send(msg, host=True)
             result = await fut
         finally:
             self.pending.pop(cid, None)
@@ -340,28 +381,36 @@ class Exchange:
         return self.flow.get("config")
 
     # Host services, each behind a capability granted in roxy's config
-    # (`capabilities: [log, record, state, metrics]`). A call without its
-    # capability, or a failure in roxy, fails the exchange: roxy resets the
-    # stream. `add_tag` needs no capability but is refused in observe mode.
+    # (`capabilities: [log, record, state, metrics]`). Each returns once
+    # roxy has answered it. A call without its capability, or a failure in
+    # roxy, fails the exchange: roxy resets the stream. `add_tag` needs no
+    # capability but is refused in observe mode.
+    #
+    # Calls run beside the bodies, and roxy promises no order between a
+    # call and what the handler sends after it: an effect that must be
+    # visible to this exchange (a `state_put` the rules read, an `add_tag`
+    # the layers below see) is awaited before `forward` or `respond`.
 
     async def log(self, level: str, message: str) -> None:
         """Writes to roxy's operational log (`trace` to `error`)."""
-        await self._send({"type": "log", "level": level, "message": message})
+        await self._s.call({"type": "log", "level": level, "message": message})
 
     async def record(self, kind: str, data: Any) -> None:
         """Writes a `layer_record` event to the flow log."""
-        await self._send({"type": "record", "kind": kind, "data": data})
+        await self._s.call({"type": "record", "kind": kind, "data": data})
 
     async def add_tag(self, tag: str) -> None:
-        """Tags the flow for the layers below and the flow log."""
-        await self._send({"type": "add_tag", "tag": tag})
+        """Tags the flow for the layers below and the flow log. Await it
+        before `forward` for the layers below to see the tag."""
+        await self._s.call({"type": "add_tag", "tag": tag})
 
     async def state_get(self, key: str) -> str | None:
         """Reads the state store the rules read as `state["key"]`."""
         return await self._s.call({"type": "state_get", "key": key})
 
     async def state_put(self, key: str, value: str, ttl_ms: int | None = None) -> None:
-        """Writes the state store; a rule matches the value as written."""
+        """Writes the state store; a rule matches the value as written.
+        Await it before `forward` for this exchange's rules to read it."""
         msg: dict[str, Any] = {"type": "state_put", "key": key, "value": value}
         if ttl_ms is not None:
             msg["ttl_ms"] = ttl_ms
@@ -394,7 +443,7 @@ class Exchange:
         return b"".join([c async for c in self.body()])
 
     async def _send(self, msg: dict[str, Any]) -> None:
-        await self._s.conn.send(self._s.id, msg)
+        await self._s.send(msg)
 
     async def _send_body(self, direction: int, body: Body) -> None:
         if isinstance(body, bytes):
@@ -404,7 +453,7 @@ class Exchange:
             async for chunk in body:
                 if chunk:
                     await self._s.send_bytes(direction, chunk)
-        await self._send({"type": f"{_DIR_NAMES[direction]}_end"})
+        await self._s.send({"type": f"{_DIR_NAMES[direction]}_end"}, end=direction)
 
     async def _finish_forwarding(self) -> None:
         if self._forwarding is not None:
@@ -430,6 +479,7 @@ class Exchange:
         the background if roxy answers before it has all been sent. roxy
         re-validates the request and its rules judge it; read the response
         body with `response_body()`."""
+        self._s.forwarded = True
         await self._send(
             {
                 "type": "request",

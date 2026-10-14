@@ -421,6 +421,7 @@ pub(crate) async fn observe(
         st: st.clone(),
         index,
         observer: Some(next),
+        call: None,
     });
     tokio::spawn(async move {
         let result = match layer.handle(host, copy_req).await {

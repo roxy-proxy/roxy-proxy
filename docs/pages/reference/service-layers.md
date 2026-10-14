@@ -114,29 +114,39 @@ A service reaches the [host services](/reference/host-services) a WASM
 layer has by message, each behind the same capability granted in the
 layer's `capabilities`, and answered by the same host: a call means the
 same, is refused for the same reasons and fails the exchange with the same
-`layer_error.kind`, whichever kind of layer makes it. A call may be sent at
-any point while the stream is open; it neither waits for nor holds up the
-bodies.
+`layer_error.kind`, whichever kind of layer makes it. Every call carries
+an `id` of the service's choosing (an unsigned 64-bit integer) and is
+answered with a `result` carrying the same `id`: `value` is what the call
+returns (`null` for a call that returns nothing), `error` a refusal of what
+the service passed.
 
 | service → roxy | capability | roxy → service |
 |---|---|---|
-| `{"type":"log","level":"info","message":"…"}` (`trace`, `debug`, `info`, `warn`, `error`) | `log` | nothing |
-| `{"type":"record","kind":"…","data":<json>}` | `record` | nothing |
-| `{"type":"add_tag","tag":"…"}` | none; enforce only | nothing |
+| `{"type":"log","id":n,"level":"info","message":"…"}` (`trace`, `debug`, `info`, `warn`, `error`) | `log` | `{"type":"result","id":n,"value":null}` |
+| `{"type":"record","id":n,"kind":"…","data":<json>}` | `record` | `{"type":"result","id":n,"value":null}` |
+| `{"type":"add_tag","id":n,"tag":"…"}` | none; enforce only | `{"type":"result","id":n,"value":null}` |
 | `{"type":"state_get","id":n,"key":"…"}` | `state` | `{"type":"result","id":n,"value":"…"}` (`null` for a miss) |
 | `{"type":"state_put","id":n,"key":"…","value":"…","ttl_ms":n?}` | `state`; enforce only | `{"type":"result","id":n,"value":null}`, or `"error"` for a key or value over its cap |
 | `{"type":"metric_get","id":n,"metric":"…"}` | `metrics` | `{"type":"result","id":n,"value":n}` (`null` for a key with no entry) |
 
-`id` is the service's, any integer, echoed in the `result`. Calls run in
-order, one at a time per stream, beside the bodies; at most 64 may be
-waiting, and more is a protocol violation. A call on a stream that has
-ended is dropped. A call without its capability, a `log` message or
-`record` document over 64 KiB, an `add_tag` or `state_put` from an observer,
-a full state store or a `record` the flow log cannot take fails the exchange
-(`layer_error`, kind `capability:<name>`, `budget:message`, `budget:tags`
-or `host`) and resets the stream; the `result` `error` is only for what the
-service passed. `endpoints.call` has no message: a service calls what it
-needs itself.
+A call may be sent at any point while the stream is open. Calls run in
+order, one at a time per stream, beside the bodies: they neither wait for
+nor hold up the heads and bytes, and roxy promises no order between a call
+and the service's later messages. A service that needs a call's effect to
+be visible to this exchange (a `state_put` its rules read, an `add_tag` the
+layers below see) awaits the `result` before sending its `request`. At
+most 64 calls may be waiting, and more is a protocol violation. A call on
+a stream that has ended is dropped and never answered.
+
+A call without its capability, a `log` message or `record` document over
+64 KiB, an `add_tag` or `state_put` from an observer, a full state store or
+a `record` the flow log cannot take fails the exchange (`layer_error`, kind
+`capability:<name>`, `budget:message`, `budget:tags` or `host`) and resets
+the stream; the `result` `error` is only for what the service passed.
+roxy's own record of a call names its `id` as `call`: on the
+`layer_record` a `record` writes, on the `layer_error` a failed call
+causes, and on the operational log line a `log` writes. `endpoints.call`
+has no message: a service calls what it needs itself.
 
 ## Semantics
 

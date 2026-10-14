@@ -1007,6 +1007,7 @@ fn service_addons_validate() {
     let (_dir, wasm) = wasm_file();
     let ok = format!(
         "{BASE}addons:\n  - name: s\n    kind: service\n    endpoint: svc\n    \
+         capabilities: [log, state]\n    config: {{ a: 1 }}\n    \
          limits: {{ first_byte_timeout: 2s, max_connections: 2, max_streams: 50 }}\n    \
          endpoints:\n      svc: {{ url: \"http://127.0.0.1:9000/layer\", private_ok: true }}\n"
     );
