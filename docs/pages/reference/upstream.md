@@ -26,7 +26,10 @@ tls:
 
 `deny_cidrs` and `allow_cidrs` entries are stored as address-list entries
 are: an IPv4-mapped entry (`::ffff:203.0.113.0/120`) becomes the IPv4 CIDR
-(`203.0.113.0/24`) and matches the address however a client spells it.
+(`203.0.113.0/24`) and matches the address however a client spells it. An
+entry must be a network: `roxy check` refuses one with host bits set
+(`10.1.2.3/8`) and names the network it would have meant. `static_hosts`
+keys must be DNS host names (A-labels), not IP addresses.
 
 ## DNS
 

@@ -57,7 +57,8 @@ pub(crate) struct Upstream {
     service: Arc<service::ServiceLog>,
     /// Connections roxy dialled that are still open.
     open: AtomicUsize,
-    /// Data messages the framed WebSocket echo received.
+    /// What the WebSocket echoes received: the framed echo's data
+    /// messages, or the byte echo's reads.
     ws_received: Mutex<Vec<Vec<u8>>>,
     /// Framed echo upgrades that have ended, from the upstream's side.
     ws_closed: AtomicUsize,
@@ -155,8 +156,8 @@ impl Upstream {
         self.writes_fail.store(true, Ordering::SeqCst);
     }
 
-    /// The data messages the framed WebSocket echo (`x-echo: frames`)
-    /// received so far.
+    /// What the WebSocket echo has received so far: data messages from
+    /// the framed echo (`x-echo: frames`), reads from the byte echo.
     pub(crate) fn ws_received(&self) -> Vec<Vec<u8>> {
         lock(&self.ws_received).clone()
     }
@@ -387,7 +388,7 @@ impl Upstream {
                 return self.upgrade_and_echo_frames(&mut req, &key);
             }
             let once = echo.is_some_and(|v| v == "once");
-            return upgrade_and_echo(&mut req, &key, once);
+            return self.upgrade_and_echo(&mut req, &key, once);
         }
         if path.starts_with("/drip?") {
             return drip(&path);
@@ -531,6 +532,45 @@ impl Upstream {
             .body(full(Bytes::new()))
             .unwrap()
     }
+
+    /// Answers a WebSocket upgrade with `101` and echoes the upgraded bytes,
+    /// closing after the first read when `once`. With `x-accept-extension`, the
+    /// `101` accepts `permessage-deflate` whether or not it was offered.
+    fn upgrade_and_echo(
+        self: &Arc<Self>,
+        req: &mut http::Request<Incoming>,
+        key: &http::HeaderValue,
+        once: bool,
+    ) -> http::Response<Body> {
+        let accept_ext = req.headers().contains_key("x-accept-extension");
+        let on = hyper::upgrade::on(req);
+        let me = self.clone();
+        tokio::spawn(async move {
+            if let Ok(up) = on.await {
+                let mut up = TokioIo::new(up);
+                let mut buf = vec![0u8; 16 * 1024];
+                while let Ok(n) = up.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    lock(&me.ws_received).push(buf[..n].to_vec());
+                    if up.write_all(&buf[..n]).await.is_err() || once {
+                        break;
+                    }
+                }
+            }
+        });
+        let accept = roxy_http::ws::compute_accept(&String::from_utf8_lossy(key.as_bytes()));
+        let mut res = http::Response::builder()
+            .status(101)
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-accept", accept);
+        if accept_ext {
+            res = res.header("sec-websocket-extensions", "permessage-deflate");
+        }
+        res.body(full(Bytes::new())).unwrap()
+    }
 }
 
 fn full(b: impl Into<Bytes>) -> Body {
@@ -622,37 +662,4 @@ fn echo(
         res = res.header("content-encoding", v);
     }
     res.body(full(body)).unwrap()
-}
-
-/// Answers a WebSocket upgrade with `101` and echoes the upgraded bytes,
-/// closing after the first read when `once`. With `x-accept-extension`, the
-/// `101` accepts `permessage-deflate` whether or not it was offered.
-fn upgrade_and_echo(
-    req: &mut http::Request<Incoming>,
-    key: &http::HeaderValue,
-    once: bool,
-) -> http::Response<Body> {
-    let accept_ext = req.headers().contains_key("x-accept-extension");
-    let on = hyper::upgrade::on(req);
-    tokio::spawn(async move {
-        if let Ok(up) = on.await {
-            let mut up = TokioIo::new(up);
-            let mut buf = vec![0u8; 16 * 1024];
-            while let Ok(n) = up.read(&mut buf).await {
-                if n == 0 || up.write_all(&buf[..n]).await.is_err() || once {
-                    break;
-                }
-            }
-        }
-    });
-    let accept = roxy_http::ws::compute_accept(&String::from_utf8_lossy(key.as_bytes()));
-    let mut res = http::Response::builder()
-        .status(101)
-        .header("connection", "upgrade")
-        .header("upgrade", "websocket")
-        .header("sec-websocket-accept", accept);
-    if accept_ext {
-        res = res.header("sec-websocket-extensions", "permessage-deflate");
-    }
-    res.body(full(Bytes::new())).unwrap()
 }

@@ -12,7 +12,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use roxy_http::BodySender;
 
-use super::{AddonDef, Answer, Client, Kit, streaming_body};
+use super::{AddonDef, Answer, Client, Kit, streaming_body, strs};
 
 const CHUNK: usize = 4096;
 
@@ -52,12 +52,6 @@ async fn answer_mid_upload(
         .expect("the answer arrives while the client is still uploading")
         .unwrap()
         .expect("a response")
-}
-
-fn strs(v: &serde_json::Value) -> Vec<String> {
-    v.as_array()
-        .map(|a| a.iter().map(|x| x.as_str().unwrap().to_owned()).collect())
-        .unwrap_or_default()
 }
 
 // ---- the upstream answering early ---------------------------------------

@@ -1417,6 +1417,47 @@ pub(crate) fn sha256_hex(data: &[u8]) -> String {
     crate::body::hex(ring::digest::digest(&ring::digest::SHA256, data).as_ref())
 }
 
+/// The strings of a JSON array field, such as a flow event's `tags`.
+pub(crate) fn strs(v: &serde_json::Value) -> Vec<String> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// No `layer_error` was logged.
+pub(crate) fn no_layer_error(kit: &Kit) {
+    let events = kit.sink.events();
+    assert!(
+        events.iter().all(|e| e["event"] != "layer_error"),
+        "{events:#?}"
+    );
+}
+
+/// A state store that keeps what it is given.
+#[derive(Default)]
+pub(crate) struct MemState(Mutex<HashMap<String, String>>);
+
+impl crate::sources::StateSource for MemState {
+    fn get(&self, key: &str) -> Option<String> {
+        self.0.lock().unwrap().get(key).cloned()
+    }
+
+    fn set(
+        &self,
+        key: &str,
+        value: &str,
+        _ttl: Option<Duration>,
+    ) -> Result<(), crate::sources::StateFull> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), value.to_owned());
+        Ok(())
+    }
+}
+
 /// A real metric store behind the proxy's metric trait, keeping every
 /// sample it was given for tests to inspect.
 struct StoreMetrics {

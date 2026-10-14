@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use bytes::Bytes;
 
-use super::{AddonDef, Answer, Kit, streaming_body};
+use super::{AddonDef, Answer, Kit, MemState, no_layer_error, streaming_body, strs};
 use crate::addons::EndpointPath;
 
 const RULES: &str = r#"
@@ -33,23 +33,6 @@ async fn stack(layers: &[AddonDef]) -> Kit {
 
 fn named(names: &[&str]) -> Vec<AddonDef> {
     names.iter().map(|n| AddonDef::test_layer(n)).collect()
-}
-
-fn strs(v: &serde_json::Value) -> Vec<String> {
-    v.as_array()
-        .unwrap()
-        .iter()
-        .map(|x| x.as_str().unwrap().to_owned())
-        .collect()
-}
-
-/// No `layer_error` was logged.
-fn no_layer_error(kit: &Kit) {
-    let events = kit.sink.events();
-    assert!(
-        events.iter().all(|e| e["event"] != "layer_error"),
-        "{events:#?}"
-    );
 }
 
 fn gzip(b: &[u8]) -> Vec<u8> {
@@ -1166,11 +1149,11 @@ mod service {
         );
     }
 
-    /// An observing service may log and record, but its tag is refused
-    /// like a WASM observer's: the failure is its own, named by its call,
-    /// the exchange goes on and the flow carries no tag. The response
-    /// drips so the copy outlives the calls: a call on a stream that has
-    /// ended is dropped.
+    /// An observing service's record reaches the flow log, but its tag is
+    /// refused like a WASM observer's: the failure is its own, named by
+    /// its call, the exchange goes on and the flow carries no tag. The
+    /// response drips so the copy outlives the calls: a call on a stream
+    /// that has ended is dropped.
     #[tokio::test]
     async fn an_observing_service_cannot_tag() {
         let kit = kit_with(
@@ -1193,6 +1176,9 @@ mod service {
         assert_eq!(errs[0]["mode"], "observe");
         assert_eq!(errs[0]["kind"], "host");
         assert_eq!(errs[0]["call"], 3, "{errs:#?}");
+        let r = kit.events("layer_record", 1).await;
+        assert_eq!(r[0]["layer"], "s", "{r:#?}");
+        assert_eq!(r[0]["call"], 2, "{r:#?}");
         let ev = kit.request_event().await;
         assert!(super::strs(&ev["tags"]).is_empty(), "{ev:#}");
     }
@@ -2114,10 +2100,6 @@ async fn one(def: AddonDef) -> Kit {
     Kit::builder().addon(def).start().await
 }
 
-/// A state store that keeps what it is given.
-#[derive(Default)]
-struct MemState(std::sync::Mutex<std::collections::HashMap<String, String>>);
-
 /// A state store with no room for a new key.
 struct FullState;
 
@@ -2133,25 +2115,6 @@ impl crate::sources::StateSource for FullState {
         _ttl: Option<std::time::Duration>,
     ) -> Result<(), crate::sources::StateFull> {
         Err(crate::sources::StateFull)
-    }
-}
-
-impl crate::sources::StateSource for MemState {
-    fn get(&self, key: &str) -> Option<String> {
-        self.0.lock().unwrap().get(key).cloned()
-    }
-
-    fn set(
-        &self,
-        key: &str,
-        value: &str,
-        _ttl: Option<std::time::Duration>,
-    ) -> Result<(), crate::sources::StateFull> {
-        self.0
-            .lock()
-            .unwrap()
-            .insert(key.to_owned(), value.to_owned());
-        Ok(())
     }
 }
 
@@ -2275,13 +2238,15 @@ async fn a_client_giving_up_frees_the_instance() {
 /// A client holding every instance cannot starve the layer: an exchange
 /// that gets no instance within `first_byte_timeout` is denied,
 /// `layer_error` kind `no_instance`, rather than queued for as long as the
-/// holder likes.
+/// holder likes. It waits the whole timeout first: an instance freed in
+/// time would have served it.
 #[tokio::test]
 async fn an_exchange_without_an_instance_is_denied_within_the_bound() {
     use http_body_util::BodyExt as _;
+    const FIRST_BYTE: std::time::Duration = std::time::Duration::from_millis(300);
     let kit = one(AddonDef::test_layer("t").limits(|l| {
         l.max_instances = 1;
-        l.first_byte_timeout = std::time::Duration::from_millis(300);
+        l.first_byte_timeout = FIRST_BYTE;
     }))
     .await;
     // The only instance relays a response that drips for a minute.
@@ -2294,13 +2259,17 @@ async fn an_exchange_without_an_instance_is_denied_within_the_bound() {
     assert_eq!(res.status(), 200);
     assert!(res.body_mut().frame().await.unwrap().is_ok());
 
-    let a = tokio::time::timeout(
+    let (a, took) = super::timed(tokio::time::timeout(
         std::time::Duration::from_secs(10),
         kit.h1().await.call("GET", "/starved", &[], b""),
-    )
-    .await
-    .expect("the exchange waited past the bound");
+    ))
+    .await;
+    let a = a.expect("the exchange waited past the bound");
     assert_eq!(a.status, 503, "{a:?}");
+    assert!(
+        took >= FIRST_BYTE,
+        "denied before first_byte_timeout: {took:?}"
+    );
     let errs = kit.events("layer_error", 1).await;
     assert_eq!(errs[0]["layer"], "t", "{errs:#?}");
     assert_eq!(errs[0]["kind"], "no_instance");
@@ -3015,7 +2984,9 @@ async fn a_head_only_layer_stays_out_of_a_websockets_bytes() {
 /// A layer subscribed to one body of an upgrade is in that direction's
 /// byte path and out of the other's: the bytes it is not subscribed to
 /// flow past it while its handler lives on with the socket, relaying the
-/// body it is subscribed to (`x-keep-request`, as the SDK does).
+/// body it is subscribed to (`x-keep-request`, as the SDK does). The
+/// upper-casing tells the directions apart at the upstream: it sees
+/// upper case only when the layer is on the request side.
 #[tokio::test]
 async fn a_layer_subscribed_to_one_body_is_in_one_direction_of_a_websocket() {
     use crate::addons::Part;
@@ -3033,6 +3004,13 @@ async fn a_layer_subscribed_to_one_body_is_in_one_direction_of_a_websocket() {
                 "{request:?}/{response:?}"
             );
         }
+        let at_upstream: Vec<u8> = kit.upstream.ws_received().concat();
+        let expected = if request == Part::Full {
+            b"HELLOAGAIN".to_vec()
+        } else {
+            b"helloagain".to_vec()
+        };
+        assert_eq!(at_upstream, expected, "{request:?}/{response:?}");
         drop(io);
         kit.events("ws_close", 1).await;
         no_layer_error(&kit);

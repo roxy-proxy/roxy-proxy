@@ -209,7 +209,8 @@ async fn read_to_close(ws: &mut Ws) -> Option<u16> {
 
 /// Exchanges open at the trip do not carry on: a WebSocket relay stops at
 /// its next message with `_quarantined`, and a streaming upload's
-/// connection is cut once the grace period is over.
+/// connection is cut once the grace period is over, not before it, since
+/// the grace is what lets the tripping exchange write its refusal.
 #[tokio::test]
 async fn exchanges_in_flight_at_the_trip_are_stopped() {
     let kit = Kit::builder().rules(RULES).start().await;
@@ -231,6 +232,9 @@ async fn exchanges_in_flight_at_the_trip_are_stopped() {
         .unwrap();
     kit.upstream.wait_seen(1).await;
 
+    // The clock starts before the trip, so the span to the cut covers the
+    // whole grace.
+    let before_trip = tokio::time::Instant::now();
     let a = kit.h1().await.call("GET", "/exfil", &[], b"").await;
     assert_eq!(a.status, 403, "{a:?}");
 
@@ -241,6 +245,11 @@ async fn exchanges_in_flight_at_the_trip_are_stopped() {
         .await
         .expect("the upload's connection is cut after the grace")
         .unwrap();
+    assert!(
+        before_trip.elapsed() >= crate::server::CUT_GRACE,
+        "cut before the grace: {:?}",
+        before_trip.elapsed()
+    );
     assert!(
         cut.is_err() || cut.as_ref().is_ok_and(|a| a.body.is_err()),
         "{cut:?}"

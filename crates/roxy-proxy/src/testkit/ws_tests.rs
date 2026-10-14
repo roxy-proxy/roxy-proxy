@@ -567,7 +567,7 @@ mod service {
     use super::{WS_ALLOW, echo, open, read_to_close};
     use crate::addons::AddonMode;
     use crate::addons::service::testing::{addon, kit};
-    use crate::testkit::Kit;
+    use crate::testkit::{Kit, no_layer_error};
 
     /// A masked client frame of `payload` bytes, and the unmasked echo.
     const fn frame_sizes(payload: usize) -> (usize, usize) {
@@ -578,14 +578,6 @@ mod service {
     async fn stream_id(kit: &Kit) -> u32 {
         let opens = kit.upstream.service().until_opened(1).await;
         u32::try_from(opens[0]["stream"].as_u64().unwrap()).unwrap()
-    }
-
-    fn no_layer_error(kit: &Kit) {
-        let events = kit.sink.events();
-        assert!(
-            events.iter().all(|e| e["event"] != "layer_error"),
-            "{events:#?}"
-        );
     }
 
     /// Both directions of a WebSocket go through a pass-through service
