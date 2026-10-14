@@ -21,16 +21,17 @@ addons:
       max_streams: 100                  # exchanges at once per connection (default 100)
 ```
 
-`path`, `capabilities`, `config` and the WASM limits are
-refused on a service layer; `max_connections` and `max_streams` are refused
-on a WASM layer, and at zero.
+`path` and the WASM limits are refused on a service layer;
+`max_connections` and `max_streams` are refused on a WASM layer, and at
+zero. `capabilities` and `config` mean the same for both kinds
+([host services](/reference/host-services)).
 
 ## Transport
 
 Long-lived WebSocket connections to each endpoint, each carrying many
 exchanges as **streams**.
 
-* Subprotocol `roxy.layer.v4`; a service that does not accept it fails the
+* Subprotocol `roxy.layer.v5`; a service that does not accept it fails the
   handshake.
 * The URL is the endpoint's (`http` → `ws`, `https` → `wss`, with the
   upstream's certificate verification), dialled through the connector (the
@@ -64,12 +65,15 @@ A stream opens with an `open` message from roxy:
 {"type":"open","stream":7,"flow":"01J…","conn":"01J…","layer":"sentinel",
  "mode":"enforce","subscribe":{"request":"full","response":"head"},
  "client_ip":"10.0.0.5","listener":"proxy",
- "sni":"api.example.com","tags":["a","b"]}
+ "sni":"api.example.com","tags":["a","b"],
+ "capabilities":["state","record"],"config":{"reject_at":0.8}}
 ```
 
 `client_ip` is `client.ip` as the rules see it
 ([fields](/reference/rule-language#fields)). `sni` is left out when there is
-none. `subscribe` is the layer's
+none. `capabilities` are the layer's grants, and `config` its `config:`
+value, what a WASM layer reads through `flow.config`. `subscribe` is the
+layer's
 [subscription](/reference/addon-configuration#what-a-layer-sees): for a
 direction it names `head`, roxy sends the head and its end with no bytes
 between, and the service answers the same way; bytes the service sends for
@@ -92,6 +96,8 @@ roxy → service   {"type":"response","status":…,"headers":[…]}  bytes…  {
 service → roxy   {"type":"response",…}  bytes…  {"type":"response_end"}   the client's response
 either way       {"type":"credit","dir":"request"|"response","bytes":n}  flow control (below)
                  {"type":"reset","message":"…"}                           abandon the stream
+service → roxy   host-service calls, any time the stream is open (below)
+roxy → service   {"type":"result","id":n,"value":…} or {"type":"result","id":n,"error":"…"}
 ```
 
 | rule | detail |
@@ -101,6 +107,50 @@ either way       {"type":"credit","dir":"request"|"response","bytes":n}  flow co
 | order | within each body, from each side: head, bytes, end; bytes before their head or after their end are a protocol violation. The two bodies are independent, and so are the two sides: roxy sends its `response` head as soon as the layer below answers, even while the client's body is still arriving; a service may send its `response` while still forwarding the request body, and may start forwarding before the client's body has ended |
 | end | a stream ends when the service has sent its last message: the `response_end` of the client's response, and the `request_end` of the forwarded request if it was still sending that. roxy sends nothing more on it after that. Either side may end a stream early with `reset`; roxy resets when the client goes away, a deadline passes or the service broke the protocol, and sends nothing after the `reset`. A stream roxy gives up before its `open` has gone out is dropped without a `reset`. A service that resets an enforce stream fails that exchange closed. Each side ignores messages for a stream it has ended; roxy drops body bytes sent on an ended stream without crediting them back |
 | flow control | per stream and per body, each way. Each body of a stream starts with 256 KiB of credit each way; the receiver grants more with `credit` as it consumes, and the sender may have no more bytes of that body outstanding than granted. roxy grants in steps of 64 KiB as the layer below (or the client) reads. Sending past credit is a protocol violation. Control messages are not counted |
+
+### Host services
+
+A service reaches the [host services](/reference/host-services) a WASM
+layer has by message, each behind the same capability granted in the
+layer's `capabilities`, and answered by the same host: a call means the
+same, is refused for the same reasons and fails the exchange with the same
+`layer_error.kind`, whichever kind of layer makes it. Every call carries
+an `id` of the service's choosing (an unsigned 64-bit integer) and is
+answered with a `result` carrying the same `id`: `value` is what the call
+returns (`null` for a call that returns nothing), `error` a refusal of what
+the service passed.
+
+| service → roxy | capability | roxy → service |
+|---|---|---|
+| `{"type":"log","id":n,"level":"info","message":"…"}` (`trace`, `debug`, `info`, `warn`, `error`) | `log` | `{"type":"result","id":n,"value":null}` |
+| `{"type":"record","id":n,"kind":"…","data":<json>}` | `record` | `{"type":"result","id":n,"value":null}` |
+| `{"type":"add_tag","id":n,"tag":"…"}` | none; enforce only | `{"type":"result","id":n,"value":null}` |
+| `{"type":"state_get","id":n,"key":"…"}` | `state` | `{"type":"result","id":n,"value":"…"}` (`null` for a miss) |
+| `{"type":"state_put","id":n,"key":"…","value":"…","ttl_ms":n?}` | `state`; enforce only | `{"type":"result","id":n,"value":null}`, or `"error"` for a key or value over its cap |
+| `{"type":"metric_get","id":n,"metric":"…"}` | `metrics` | `{"type":"result","id":n,"value":n}` (`null` for a key with no entry) |
+
+A call may be sent at any point while the stream is open, including
+part-way through a body. Calls run in order, one at a time per stream,
+beside the bodies: they neither wait for nor hold up the heads and bytes,
+and roxy promises no order between a call and the heads or bytes the
+service sends after it. The service orders it: it awaits the `result`
+before sending whatever the effect must precede, be that the request, the
+response or the rest of a body. Today a call's tag or state write is seen
+by this exchange's admission rules only if it lands before the request is
+forwarded, and by later exchanges always; in-flight rules do not yet read
+tag or state values ([#509](https://github.com/roxy-proxy/roxy-proxy/issues/509)).
+At most 64 calls may be waiting, and more is a protocol violation. A call
+on a stream that has ended is dropped and never answered.
+
+A call without its capability, a `log` message or `record` document over
+64 KiB, an `add_tag` or `state_put` from an observer, a full state store or
+a `record` the flow log cannot take fails the exchange (`layer_error`, kind
+`capability:<name>`, `budget:message`, `budget:tags` or `host`) and resets
+the stream; the `result` `error` is only for what the service passed.
+roxy's own record of a call names its `id` as `call`: on the
+`layer_record` a `record` writes, on the `layer_error` a failed call
+causes, and on the operational log line a `log` writes. `endpoints.call`
+has no message: a service calls what it needs itself.
 
 ## Semantics
 

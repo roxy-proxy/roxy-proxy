@@ -3176,8 +3176,8 @@ key; `roxy check` refuses a key on the other kind.
 | `sample` | both, observe only | number in (0, 1] | 1 | the share of matching exchanges the observer gets a copy of, drawn from the flow id |
 | `subscribe.request` | both | `head`, `full` | `full` | what the layer sees of the request: the head only, or the head and the body ([what a layer sees](/reference/addon-configuration#what-a-layer-sees)) |
 | `subscribe.response` | both | `head`, `full` | `full` | the same for the response |
-| `capabilities` | wasm | list of `endpoints`, `state`, `record`, `metrics`, `log` | none | the [host services](/reference/host-services) the layer may call ([capabilities](/reference/addon-configuration#capabilities)) |
-| `config` | wasm | any YAML value | `null` | handed to the layer as a JSON document through `flow.config`; roxy does not read it. Map keys become strings (`1: a` is `{"1": "a"}`) |
+| `capabilities` | both | list of `endpoints`, `state`, `record`, `metrics`, `log` | none | the [host services](/reference/host-services) the layer may call ([capabilities](/reference/addon-configuration#capabilities)); `endpoints` does nothing for a service layer, which calls what it needs itself |
+| `config` | both | any YAML value | `null` | handed to the layer as a JSON document, through `flow.config` or the `open` message; roxy does not read it. Map keys become strings (`1: a` is `{"1": "a"}`) |
 | `endpoints` | both | map of name to [endpoint](/reference/addon-configuration#endpoints) | none | named outbound targets. A WASM layer calls them with `endpoints.call`; a service layer's `endpoint` names one of them |
 | `limits` | both | [limits](/reference/addon-configuration#limits) | defaults below | what the layer may cost roxy |
 
@@ -3238,8 +3238,8 @@ What the host holds for a guest outside `max_memory`, not configurable:
 ### What `roxy check` refuses
 
 A missing `path` or one that does not exist; `endpoint` not among the
-addon's `endpoints`; a key of the other kind (`path`, `capabilities`,
-`config` and the WASM limits on a service layer; `endpoint`,
+addon's `endpoints`; a key of the other kind (`path` and the WASM limits
+on a service layer; `endpoint`,
 `max_connections` and `max_streams` on a WASM layer); `sample` on an
 enforcing layer, or outside (0, 1]; a zero `max_instances`, `max_memory`,
 `recycle_above_memory`, `first_byte_timeout`, endpoint `timeout`,
@@ -3249,8 +3249,9 @@ unknown metric or list; a `subscribe` value other than `head` or `full`.
 
 ## Capabilities
 
-A WASM layer has no access outside its own streams. `capabilities` grants it
-named [host services](/reference/host-services):
+A layer has no access outside its own streams. `capabilities` grants it
+named [host services](/reference/host-services), which a WASM layer calls
+and a service layer sends as messages:
 
 | capability | grants |
 |---|---|
@@ -3267,9 +3268,6 @@ capability; `flow.add-tag` from an observe layer fails the exchange too,
 as a host refusal (`layer_error` with `kind: host`), since a tag steers the
 `when` of the layers below. There is no `secrets`
 capability: credentials go on an endpoint's `headers`.
-
-Service layers have no capabilities: a service gets the exchange, the
-flow's identity on `open`, and the endpoint's `headers` on the handshake.
 
 ## Behaviour
 
@@ -3467,16 +3465,17 @@ addons:
       max_streams: 100                  # exchanges at once per connection (default 100)
 ```
 
-`path`, `capabilities`, `config` and the WASM limits are
-refused on a service layer; `max_connections` and `max_streams` are refused
-on a WASM layer, and at zero.
+`path` and the WASM limits are refused on a service layer;
+`max_connections` and `max_streams` are refused on a WASM layer, and at
+zero. `capabilities` and `config` mean the same for both kinds
+([host services](/reference/host-services)).
 
 ## Transport
 
 Long-lived WebSocket connections to each endpoint, each carrying many
 exchanges as **streams**.
 
-* Subprotocol `roxy.layer.v4`; a service that does not accept it fails the
+* Subprotocol `roxy.layer.v5`; a service that does not accept it fails the
   handshake.
 * The URL is the endpoint's (`http` → `ws`, `https` → `wss`, with the
   upstream's certificate verification), dialled through the connector (the
@@ -3510,12 +3509,15 @@ A stream opens with an `open` message from roxy:
 {"type":"open","stream":7,"flow":"01J…","conn":"01J…","layer":"sentinel",
  "mode":"enforce","subscribe":{"request":"full","response":"head"},
  "client_ip":"10.0.0.5","listener":"proxy",
- "sni":"api.example.com","tags":["a","b"]}
+ "sni":"api.example.com","tags":["a","b"],
+ "capabilities":["state","record"],"config":{"reject_at":0.8}}
 ```
 
 `client_ip` is `client.ip` as the rules see it
 ([fields](/reference/rule-language#fields)). `sni` is left out when there is
-none. `subscribe` is the layer's
+none. `capabilities` are the layer's grants, and `config` its `config:`
+value, what a WASM layer reads through `flow.config`. `subscribe` is the
+layer's
 [subscription](/reference/addon-configuration#what-a-layer-sees): for a
 direction it names `head`, roxy sends the head and its end with no bytes
 between, and the service answers the same way; bytes the service sends for
@@ -3538,6 +3540,8 @@ roxy → service   {"type":"response","status":…,"headers":[…]}  bytes…  {
 service → roxy   {"type":"response",…}  bytes…  {"type":"response_end"}   the client's response
 either way       {"type":"credit","dir":"request"|"response","bytes":n}  flow control (below)
                  {"type":"reset","message":"…"}                           abandon the stream
+service → roxy   host-service calls, any time the stream is open (below)
+roxy → service   {"type":"result","id":n,"value":…} or {"type":"result","id":n,"error":"…"}
 ```
 
 | rule | detail |
@@ -3547,6 +3551,50 @@ either way       {"type":"credit","dir":"request"|"response","bytes":n}  flow co
 | order | within each body, from each side: head, bytes, end; bytes before their head or after their end are a protocol violation. The two bodies are independent, and so are the two sides: roxy sends its `response` head as soon as the layer below answers, even while the client's body is still arriving; a service may send its `response` while still forwarding the request body, and may start forwarding before the client's body has ended |
 | end | a stream ends when the service has sent its last message: the `response_end` of the client's response, and the `request_end` of the forwarded request if it was still sending that. roxy sends nothing more on it after that. Either side may end a stream early with `reset`; roxy resets when the client goes away, a deadline passes or the service broke the protocol, and sends nothing after the `reset`. A stream roxy gives up before its `open` has gone out is dropped without a `reset`. A service that resets an enforce stream fails that exchange closed. Each side ignores messages for a stream it has ended; roxy drops body bytes sent on an ended stream without crediting them back |
 | flow control | per stream and per body, each way. Each body of a stream starts with 256 KiB of credit each way; the receiver grants more with `credit` as it consumes, and the sender may have no more bytes of that body outstanding than granted. roxy grants in steps of 64 KiB as the layer below (or the client) reads. Sending past credit is a protocol violation. Control messages are not counted |
+
+### Host services
+
+A service reaches the [host services](/reference/host-services) a WASM
+layer has by message, each behind the same capability granted in the
+layer's `capabilities`, and answered by the same host: a call means the
+same, is refused for the same reasons and fails the exchange with the same
+`layer_error.kind`, whichever kind of layer makes it. Every call carries
+an `id` of the service's choosing (an unsigned 64-bit integer) and is
+answered with a `result` carrying the same `id`: `value` is what the call
+returns (`null` for a call that returns nothing), `error` a refusal of what
+the service passed.
+
+| service → roxy | capability | roxy → service |
+|---|---|---|
+| `{"type":"log","id":n,"level":"info","message":"…"}` (`trace`, `debug`, `info`, `warn`, `error`) | `log` | `{"type":"result","id":n,"value":null}` |
+| `{"type":"record","id":n,"kind":"…","data":<json>}` | `record` | `{"type":"result","id":n,"value":null}` |
+| `{"type":"add_tag","id":n,"tag":"…"}` | none; enforce only | `{"type":"result","id":n,"value":null}` |
+| `{"type":"state_get","id":n,"key":"…"}` | `state` | `{"type":"result","id":n,"value":"…"}` (`null` for a miss) |
+| `{"type":"state_put","id":n,"key":"…","value":"…","ttl_ms":n?}` | `state`; enforce only | `{"type":"result","id":n,"value":null}`, or `"error"` for a key or value over its cap |
+| `{"type":"metric_get","id":n,"metric":"…"}` | `metrics` | `{"type":"result","id":n,"value":n}` (`null` for a key with no entry) |
+
+A call may be sent at any point while the stream is open, including
+part-way through a body. Calls run in order, one at a time per stream,
+beside the bodies: they neither wait for nor hold up the heads and bytes,
+and roxy promises no order between a call and the heads or bytes the
+service sends after it. The service orders it: it awaits the `result`
+before sending whatever the effect must precede, be that the request, the
+response or the rest of a body. Today a call's tag or state write is seen
+by this exchange's admission rules only if it lands before the request is
+forwarded, and by later exchanges always; in-flight rules do not yet read
+tag or state values ([#509](https://github.com/roxy-proxy/roxy-proxy/issues/509)).
+At most 64 calls may be waiting, and more is a protocol violation. A call
+on a stream that has ended is dropped and never answered.
+
+A call without its capability, a `log` message or `record` document over
+64 KiB, an `add_tag` or `state_put` from an observer, a full state store or
+a `record` the flow log cannot take fails the exchange (`layer_error`, kind
+`capability:<name>`, `budget:message`, `budget:tags` or `host`) and resets
+the stream; the `result` `error` is only for what the service passed.
+roxy's own record of a call names its `id` as `call`: on the
+`layer_record` a `record` writes, on the `layer_error` a failed call
+causes, and on the operational log line a `log` writes. `endpoints.call`
+has no message: a service calls what it needs itself.
 
 ## Semantics
 
@@ -3609,9 +3657,14 @@ and resets and hands a handler one exchange at a time.
 
 # Host services
 
-Everything a WASM layer can do outside its own streams, each a capability
+Everything a layer can do outside its own streams, each a capability
 granted in config
-([capabilities](/reference/addon-configuration#capabilities)). The caps on
+([capabilities](/reference/addon-configuration#capabilities)). A WASM
+layer calls them as the `flow` and `endpoints` imports named here; a
+service layer sends the matching messages on its stream
+([service layers](/reference/service-layers#host-services)), except
+`endpoints.call`, which a service does for itself. Both reach one host, so
+a call means the same and fails the same way for either kind. The caps on
 each (payload sizes, calls in flight, key length) are in
 [fixed caps](/reference/addon-configuration#fixed-caps).
 
@@ -3664,11 +3717,13 @@ the store is full fails the exchange closed, as it does a rule's
 store steers every flow's rules. The store survives a reload, under
 `limits.max_state_entries`.
 
-## Identity
+## Identity and config
 
 `flow.current()`: the flow id, connection id, tags, and the principal as
 roxy established it (client IP, listener, TLS SNI). Key per-principal state
-on these, not on client-supplied session headers.
+on these, not on client-supplied session headers. `flow.config()` is the
+layer's `config:` value as a JSON document. A service gets both in its
+`open` message.
 
 ## Record (`record`)
 
@@ -3760,8 +3815,9 @@ produces a `request` event:
 | `ws_open`, `ws_close` | a relayed WebSocket, with byte counts; `ws_close` has `close_code` and `close_reason` when roxy ended it |
 | `ws_message` | a WebSocket message a rule denied, or one sampled by `log.flow.ws_message_every` ([WebSockets](/reference/websockets#message-rules)) |
 | `log` | a rule's `log` action |
-| `layer_error` | an addon layer failed; `kind` is `trap`, `budget:<limit>`, `capability:<name>`, `invalid_request`, `invalid_response`, `no_response`, `no_instance` (none of its `max_instances` came free within `first_byte_timeout`), `unsubscribed:<direction>`, `service:<code>`, `when:<code>`, ... In enforce mode it names the one layer blamed for the exchange ([who is blamed](/design/addon-model#who-is-blamed)), once; a client's broken upload, an upstream body or the buffer budget failing a layer logs none. In observe mode every failure of the observer's own is logged |
-| `layer_record`, `endpoint_call` | [addons](/design/addon-model) |
+| `layer_error` | an addon layer failed; `kind` is `trap`, `budget:<limit>`, `capability:<name>`, `invalid_request`, `invalid_response`, `no_response`, `no_instance` (none of its `max_instances` came free within `first_byte_timeout`), `unsubscribed:<direction>`, `service:<code>`, `when:<code>`, ... In enforce mode it names the one layer blamed for the exchange ([who is blamed](/design/addon-model#who-is-blamed)), once; a client's broken upload, an upstream body or the buffer budget failing a layer logs none. In observe mode every failure of the observer's own is logged. When a [service layer's](/reference/service-layers#host-services) host-service call failed, `call` is the service's id for it |
+| `layer_record` | an addon's `flow.record`; a [service layer's](/reference/service-layers#host-services) carries the service's id for the call as `call` ([addons](/design/addon-model)) |
+| `endpoint_call` | [addons](/design/addon-model) |
 | `observer_lagged` | an observe-mode addon's copy of a stream was cut; `reason` is `observer_behind` (it fell `max_observer_lag_bytes` behind), `buffer_budget_exhausted` (the [buffer budget](/reference/limits#limits) could not cover the copy) or `no_instance` (no instance of the layer came free within its `first_byte_timeout`) |
 | `connect` | a CONNECT, when `log.flow.connection_events` is on: `conn`, `listener`, `client` and `dst` (`host`, `port`; `ip` is always `null`), `decision: allow`, `rules: []` and `tls: null`, since no rule runs at CONNECT. A tunnel closed at its first bytes (`sni_mismatch`, `bad_sni`, neither TLS nor HTTP) is a `parse_error` |
 | `connection_refused` | a connection cap was hit ([limits](/reference/limits#connections)) |
