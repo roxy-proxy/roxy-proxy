@@ -145,6 +145,10 @@ pub(super) fn reattach_response(
     res.map(|own| splice(st, index, Dir::Response, own, body))
 }
 
+/// The bypassed body goes on alone, framed as it came, when the layer's
+/// own body is complete: a service layer's head-only direction always is
+/// (its head and end carry no bytes, and the stream refuses any), a WASM
+/// layer's when `next` was given an empty `bytes` body.
 fn splice(st: &Arc<StackFlow>, index: usize, dir: Dir, own: Body, bypassed: Body) -> Body {
     if own.is_end_stream() {
         return bypassed;

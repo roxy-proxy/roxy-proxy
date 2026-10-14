@@ -1842,6 +1842,83 @@ mod service {
         no_layer_error(&kit);
     }
 
+    /// A head-only direction of a service is a head and an end, complete
+    /// at once, so the body bypassing it keeps the framing it came with: to
+    /// the upstream with the client's `content-length`, to the client with
+    /// the upstream's. Bytes the service sends for that direction fail the
+    /// exchange closed as the service's own.
+    #[tokio::test]
+    async fn a_head_only_service_keeps_the_bypassed_bodies_framing() {
+        use crate::addons::Part;
+        for (request, response) in [
+            (Part::Head, Part::Full),
+            (Part::Full, Part::Head),
+            (Part::Head, Part::Head),
+        ] {
+            let kit = kit(
+                RULES,
+                vec![subscribed(
+                    addon("s", "pass", AddonMode::Enforce, |_| {}),
+                    request,
+                    response,
+                )],
+            )
+            .await;
+            let a = kit
+                .h1()
+                .await
+                .call("POST", "/x", &[], b"twelve bytes")
+                .await;
+            assert_eq!(a.status, 200, "{request:?}/{response:?}: {a:?}");
+            assert_eq!(a.json()["body_len"], 12, "{request:?}/{response:?}");
+            let seen = kit.upstream.wait_seen(1).await;
+            assert_eq!(seen[0].complete, Some(true), "{request:?}/{response:?}");
+            if request == Part::Head {
+                assert_eq!(
+                    seen[0].headers["content-length"], "12",
+                    "{request:?}/{response:?}"
+                );
+                assert!(
+                    !seen[0].headers.contains_key("transfer-encoding"),
+                    "{request:?}/{response:?}: {:?}",
+                    seen[0].headers
+                );
+            }
+            if response == Part::Head {
+                assert!(
+                    a.headers.contains_key("content-length"),
+                    "{request:?}/{response:?}: {a:?}"
+                );
+                assert!(
+                    !a.headers.contains_key("transfer-encoding"),
+                    "{request:?}/{response:?}: {a:?}"
+                );
+            }
+            no_layer_error(&kit);
+        }
+
+        // `overlong` forwards the request head and sends bytes after it.
+        let kit = kit(
+            RULES,
+            vec![subscribed(
+                addon("s", "overlong", AddonMode::Enforce, |_| {}),
+                Part::Head,
+                Part::Full,
+            )],
+        )
+        .await;
+        let a = kit
+            .h1()
+            .await
+            .call("POST", "/x", &[], b"twelve bytes")
+            .await;
+        assert_eq!(a.status, 503, "{a:?}");
+        let ev = kit.request_event().await;
+        assert_eq!(ev["terminal_rule"], "layer:s", "{ev:#}");
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["kind"], "unsubscribed:request", "{errs:#?}");
+    }
+
     /// A WebSocket through a pass-through service: the upstream's `101`
     /// reaches the service as roxy's `response` head, with no `request_end`
     /// before it, the service's `101` upgrades the client, and the bytes of
