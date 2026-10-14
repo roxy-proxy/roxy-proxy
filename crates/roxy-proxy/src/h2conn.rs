@@ -122,11 +122,11 @@ pub(crate) async fn serve<IO: Io>(
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             let reason = crate::quarantine::handshake_reason("h2_handshake_failed", e.get_io());
-            shared.emit_parse_reason(&client, None, reason, Some(&e.to_string()));
+            shared.emit_parse_reason(&client, reason, Some(&e.to_string()));
             return;
         }
         Err(_) => {
-            shared.emit_parse_reason(&client, None, "h2_handshake_timeout", None);
+            shared.emit_parse_reason(&client, "h2_handshake_timeout", None);
             return;
         }
     };
@@ -178,7 +178,6 @@ pub(crate) async fn serve<IO: Io>(
                     if !e.is_io() && !e.is_go_away() {
                         ccx.shared.emit_parse_reason(
                             &ccx.client,
-                            None,
                             "h2_protocol_error",
                             Some(&e.to_string()),
                         );
@@ -296,8 +295,7 @@ async fn serve_stream(
         // The client went away: nothing to answer, nothing to reset.
         Outcome::Close(_) if fail.gone() => return record_client_gone(&mut cx),
         Outcome::Close(DriveError::Client(e)) => {
-            ccx.shared
-                .emit_parse_error(&ccx.client, Some(cx.flow.to_string()), &e);
+            ccx.shared.emit_parse_error(&ccx.client, Some(&cx), &e);
             respond.send_reset(h2::Reason::PROTOCOL_ERROR);
             return record_client_failure(&mut cx, &e, None);
         }

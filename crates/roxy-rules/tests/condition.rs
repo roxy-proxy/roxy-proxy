@@ -1,4 +1,4 @@
-//! Standalone head conditions (`Condition`): an addon's `when`.
+//! Standalone admission conditions (`Condition`): an addon's `when`.
 
 mod common;
 

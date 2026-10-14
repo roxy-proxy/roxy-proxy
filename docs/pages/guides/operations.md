@@ -97,12 +97,12 @@ A top-level `valid_until: <RFC 3339>` makes the loaded policy a lease.
 Until that instant the policy applies as written. From it, every request
 is denied with `terminal_rule: _expired` and reason `policy_expired`,
 before the rules and the addons run, and an open WebSocket relay stops at
-its next message. The check is a wall-clock comparison on each exchange
-against the host's clock, using the loaded policy's instant whichever
-policy the exchange began under: a reload that moves it later keeps open
-relays going, and one that moves it earlier stops them at their next
-message. The first exchange that finds the policy expired logs one
-`policy_expired` event; later ones are ordinary `_expired` denies.
+its next chunk or message. The check is a wall-clock comparison on each
+exchange against the host's clock, using the loaded policy's instant
+whichever policy the exchange began under: a reload that moves it later
+keeps open relays going, and one that moves it earlier stops them at their
+next chunk or message. The first exchange that finds the policy expired
+logs one `policy_expired` event; later ones are ordinary `_expired` denies.
 
 An expired policy is a policy, not a fault. The listeners stay up,
 `/healthz` keeps answering `200` with `x-roxy-policy: expired` (`valid`
@@ -137,24 +137,28 @@ Three things trip it:
   events on the listener within the window, counting every reason except
   timeouts (`header_timeout`, `body_timeout`, `tunnel_timeout`,
   `tls_handshake_timeout`, `h2_handshake_timeout`), a client that left
-  (`unexpected_eof`, `io_error`) and roxy's own failures
-  (`connect_write_failed`, `leaf_mint_failed`, `invalid_state`). Off unless
+  (`unexpected_eof`, `io_error`) or that ended the TLS handshake with an
+  alert (`tls_alert_received`: one that does not trust roxy's CA), and
+  roxy's own failures (`connect_write_failed`, `leaf_mint_failed`,
+  `invalid_state`). Off unless
   set; set it on a sandbox's listener, not a gateway's, where one client
   would shut the proxy for every other.
 
 While quarantined, every request is refused with `403`, `terminal_rule:
 _quarantined` and reason `quarantined`, before the addons and the rules, and
 before the lease is checked. An open WebSocket relay stops at its next
-message. Connections open at the trip have one second to finish, then they
-are closed, so a stream in flight carries little further; the exchange that
-tripped it uses that second to write its own refusal. The trip is logged
-once as a `quarantined` event with the incident id, when it tripped and why
-([flow log](/reference/flow-log#events)). `/healthz` stays `200` with
-`x-roxy-policy: quarantined`, `roxy health` prints `ok (quarantined)`, and
-`/readyz` answers `503 quarantined`. CA distribution keeps working.
+chunk or message. Connections open at the trip have one second to finish,
+then they are closed, so a stream in flight carries little further; the
+exchange that tripped it uses that second to write its own refusal. The
+trip is logged once as a `quarantined` event with the incident id, when it
+tripped and why ([flow log](/reference/flow-log#events)). `/healthz` stays
+`200` with `x-roxy-policy: quarantined`, `roxy health` prints `ok
+(quarantined)`, and `/readyz` answers `503 quarantined`. CA distribution
+keeps working.
 
-A config that can quarantine (a `quarantine` action, or `quarantine_on` on
-a listener) needs `roxy run --state-dir DIR`: roxy refuses to start, or to
+A config that can quarantine (a `quarantine` action, `quarantine_on` on a
+listener, or an addon holding the `quarantine` capability) needs `roxy run
+--state-dir DIR`: roxy refuses to start, or to
 reload into such a config, without it. The trip writes `DIR/quarantine`
 (the incident as JSON, mode `0600`), and a start that finds the file starts
 quarantined, logging the `quarantined` event again with `restored: true`.

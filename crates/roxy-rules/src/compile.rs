@@ -51,7 +51,7 @@ pub(crate) struct Env<'a> {
 }
 
 /// What an expression needs beyond its plan: body buffering, and the
-/// values it reads that are not known at the request head.
+/// values it reads that are not known at admission.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Needs {
     pub request_body: bool,

@@ -284,7 +284,7 @@ pub(crate) async fn close_on_parse_error(
     shared: &Shared,
     e: &ParseError,
 ) {
-    shared.emit_parse_error(client, cx.as_ref().map(|c| c.flow.to_string()), e);
+    shared.emit_parse_error(client, cx.as_ref(), e);
     let _ = conn
         .respond_error_and_close(e.reason.suggested_status(), &e.reason)
         .await;
@@ -403,7 +403,7 @@ pub(crate) async fn process<F: Front>(
     if let Some(refusal) = cx.expiry_refusal() {
         return (cx, Outcome::Refuse(refusal));
     }
-    let (mut cx, outcome) = if cx.snap.addons.is_empty() {
+    let (cx, outcome) = if cx.snap.addons.is_empty() {
         let outcome = core(front, &mut cx, req).await;
         (cx, outcome)
     } else {
@@ -412,8 +412,15 @@ pub(crate) async fn process<F: Front>(
     // A layer may have quarantined the process while it held the exchange:
     // whatever it answered, the client gets the refusal.
     let outcome = match outcome {
-        Outcome::Respond(_) | Outcome::Upgrade { .. } => match cx.quarantine_refusal() {
-            Some(refusal) => Outcome::Refuse(refusal),
+        Outcome::Respond(_) | Outcome::Upgrade { .. } => match cx.late_quarantine_refusal() {
+            Some(refusal) => {
+                if let Outcome::Upgrade { upstream, .. } = outcome {
+                    // Nothing will relay the upgraded upstream: close it
+                    // rather than drop it mid-handshake.
+                    tokio::spawn(close_upstream_ws(upstream));
+                }
+                Outcome::Refuse(refusal)
+            }
             None => outcome,
         },
         Outcome::Refuse(_) | Outcome::Close(_) => outcome,
@@ -841,7 +848,7 @@ async fn plain_upstream<F: Front>(
     match driven {
         Err(e) => Err(Failed::Close(e)),
         // Unreachable: a cancelled `InFlight` returned above. Fail closed.
-        Ok(None) => Err(Failed::Refuse(Refusal::fail_closed("watch_stopped"))),
+        Ok(None) => Err(Failed::Refuse(Refusal::fail_closed("in_flight_stopped"))),
         Ok(Some(Err(what))) => {
             let e = ConnectError::Timeout(what);
             Err(Failed::Refuse(upstream_refusal(cx, &e, &host, port)))

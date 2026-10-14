@@ -145,6 +145,37 @@ async fn rate_limits_key_on_the_resolved_client() {
     assert_eq!(a.status, 200, "another client from the same peer: {a:?}");
 }
 
+/// A request body that fails once the head has made a flow is logged
+/// against the client the flow resolved, as its `request` event is, not
+/// the peer.
+#[tokio::test]
+async fn a_body_failure_names_the_resolved_client() {
+    use tokio::io::AsyncWriteExt as _;
+    let kit = Kit::builder().forwarded_for(1).rules(RULES).start().await;
+    let mut io = kit.connect_http();
+    io.write_all(
+        b"POST / HTTP/1.1\r\nhost: up.test\r\nx-forwarded-for: 203.0.113.9\r\n\
+          transfer-encoding: chunked\r\n\r\n3\r\nabc\r\n",
+    )
+    .await
+    .unwrap();
+    io.write_all(b"zz\r\n").await.unwrap();
+    let (out, eof) = super::read_to_eof(&mut io).await;
+    assert!(eof);
+    assert!(
+        String::from_utf8_lossy(&out).starts_with("HTTP/1.1 400"),
+        "{out:?}"
+    );
+    let ev = kit.events("parse_error", 1).await.remove(0);
+    assert_eq!(ev["reason"], "bad_chunk_size", "{ev:#}");
+    assert!(ev["flow"].is_string(), "{ev:#}");
+    assert_eq!(ev["client"]["ip"], "203.0.113.9", "{ev:#}");
+    assert_eq!(ev["client"]["peer"]["ip"], LB, "{ev:#}");
+    let req = kit.request_event().await;
+    assert_eq!(req["flow"], ev["flow"], "{req:#}");
+    assert_eq!(req["client"]["ip"], "203.0.113.9", "{req:#}");
+}
+
 /// Without `forwarded_for` the header is ignored, as a client could have
 /// written it, and still forwarded as received.
 #[tokio::test]

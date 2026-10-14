@@ -54,7 +54,7 @@ impl Policy {
     ///
     /// Every rule that takes part in it
     /// ([`RuleKind::at_admission`](super::RuleKind::at_admission)) is
-    /// evaluated, top to bottom; rules that read an in-flight value are
+    /// evaluated, top to bottom; rules that read an in-flight field are
     /// skipped (not false). The decision does not depend on order:
     ///
     /// * if any matching rule denies, the request is denied
@@ -233,6 +233,8 @@ impl Policy {
                 continue;
             }
             let pending: &dyn PendingState = out.as_ref().map_or(&(), |o| &o.effects);
+            // An in-flight rule reads something, so it has a `when`; a rule
+            // without one would match, which can only add denies.
             let hit = match &rule.when {
                 None => Ok(true),
                 Some(p) => Scope::new(view, tags, pending).check(p),

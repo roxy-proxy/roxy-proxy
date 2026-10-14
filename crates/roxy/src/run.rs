@@ -186,9 +186,10 @@ pub struct StartOptions {
 }
 
 /// Why a config cannot run without `--state-dir`.
-const NEEDS_STATE_DIR: &str = "the config can quarantine the process (a `quarantine` action or a \
-                               listener's `quarantine_on`), which needs --state-dir so the \
-                               quarantine survives a restart";
+const NEEDS_STATE_DIR: &str = "the config can quarantine the process (a `quarantine` action, a \
+                               listener's `quarantine_on` or an addon with the `quarantine` \
+                               capability), which needs --state-dir so the quarantine survives \
+                               a restart";
 
 /// Reloads the config from disk into a running server.
 pub struct Reloader {

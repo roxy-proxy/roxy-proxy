@@ -740,14 +740,23 @@ impl FlowCx {
     /// recorded as the admission decision. Checked before the lease: a
     /// quarantine outlives any policy.
     pub(crate) fn quarantine_refusal(&mut self) -> Option<Refusal> {
-        if !self.shared.quarantined() {
-            return None;
-        }
+        let refusal = self.quarantined()?;
         self.record.stage = Some(Stage::Head);
         if let Err(e) = self.record_admission_sample(true) {
             self.meta.metric_error(Stage::Head, &e);
         }
-        Some(Refusal::quarantined())
+        Some(refusal)
+    }
+
+    /// The same refusal for an exchange that has been through the addon
+    /// stack: its admission decision, sample and stage included, is already
+    /// recorded and stands.
+    pub(crate) fn late_quarantine_refusal(&self) -> Option<Refusal> {
+        self.quarantined()
+    }
+
+    fn quarantined(&self) -> Option<Refusal> {
+        self.shared.quarantined().then(Refusal::quarantined)
     }
 
     /// A matched `quarantine` action puts the process into quarantine,
@@ -1509,7 +1518,7 @@ fn response_rules(cx: &mut FlowCx, mut res: CanonicalResponse) -> ResponseVerdic
     // Every forwarded exchange has an in-flight checker and response facts;
     // never continue without them.
     let (Some(in_flight), Some(facts)) = (cx.in_flight.clone(), cx.facts.response.clone()) else {
-        return ResponseVerdict::Deny(Refusal::fail_closed("watch_missing"));
+        return ResponseVerdict::Deny(Refusal::fail_closed("in_flight_missing"));
     };
     match in_flight.on_response_head(facts, &mut res) {
         Ok(()) => ResponseVerdict::Continue(res),

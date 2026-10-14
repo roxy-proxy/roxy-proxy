@@ -73,7 +73,7 @@ request is forwarded; a rule reading one is re-checked in flight
 | `header["name"]`, `header.all["name"]` | string, list | admission |
 | `body.size` | int: declared length, `null` if undeclared (chunked) | admission |
 | `body.text` | string: the buffered body, up to the cap | admission |
-| `metric.<id>` | int | admission; a `deny` reading a byte metric is also re-checked in flight ([rate limits](/reference/rate-limits#metrics)) |
+| `metric.<id>` | int | admission; a `deny` or `quarantine` reading a byte metric is also re-checked in flight ([rate limits](/reference/rate-limits#metrics)) |
 | `state["key"]`, `tag["name"]` | string, bool | admission |
 | `body.bytes` | int: request body bytes so far | in-flight |
 | `response.status`, `response.header["name"]`, `response.header.all["name"]` | int, string, list | in-flight |

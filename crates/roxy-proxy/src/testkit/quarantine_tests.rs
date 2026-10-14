@@ -171,6 +171,36 @@ async fn parse_errors_over_the_threshold_quarantine() {
     assert_eq!(a.headers["x-roxy-rule"], "_quarantined");
 }
 
+/// A client that does not trust roxy's CA ends the handshake with an
+/// alert, as a conforming client does: logged `tls_alert_received`, which
+/// the threshold does not count.
+#[tokio::test]
+async fn a_client_rejecting_the_ca_is_not_a_probe() {
+    use std::sync::Arc;
+    let kit = Kit::builder()
+        .quarantine_on(1, Duration::from_secs(60))
+        .start()
+        .await;
+    let io = kit.connect_tunnel("up.test", 443).await;
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(rustls::RootCertStore::empty())
+    .with_no_client_auth();
+    let name = roxy_tls::server_name(&roxy_http::url::parse_host(b"up.test").unwrap());
+    let r = tokio_rustls::TlsConnector::from(Arc::new(cfg))
+        .connect(name, io)
+        .await;
+    assert!(r.is_err(), "the client must reject the leaf");
+    let ev = kit.events("parse_error", 1).await;
+    assert_eq!(ev[0]["reason"], "tls_alert_received", "{:#}", ev[0]);
+    assert!(kit.server.handle().quarantine().is_none());
+    let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+}
+
 /// The quarantine is checked above the addon stack, like the lease: no
 /// layer sees a request while it is in force.
 #[tokio::test]

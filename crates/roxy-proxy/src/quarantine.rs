@@ -73,6 +73,7 @@ const NOT_A_PROBE: &[&str] = &[
     "h2_handshake_timeout",
     "unexpected_eof",
     "io_error",
+    "tls_alert_received",
     "connect_write_failed",
     "leaf_mint_failed",
     "invalid_state",
@@ -87,7 +88,9 @@ pub(crate) fn counts_as_probe(reason: &str) -> bool {
 /// when the client sent something roxy would not accept, the transport's
 /// own reason when it left or reset instead, which is no probe. Both
 /// libraries report a departure as an I/O error (rustls wraps its protocol
-/// errors as `InvalidData`).
+/// errors as `InvalidData`). A TLS alert from the client is no probe
+/// either: a client that does not trust roxy's CA ends the handshake with
+/// one, which is conforming behaviour.
 pub(crate) fn handshake_reason(protocol: &'static str, io: Option<&io::Error>) -> &'static str {
     match io.map(io::Error::kind) {
         Some(io::ErrorKind::UnexpectedEof) => "unexpected_eof",
@@ -98,8 +101,16 @@ pub(crate) fn handshake_reason(protocol: &'static str, io: Option<&io::Error>) -
             | io::ErrorKind::NotConnected
             | io::ErrorKind::TimedOut,
         ) => "io_error",
+        Some(io::ErrorKind::InvalidData) if io.is_some_and(is_tls_alert) => "tls_alert_received",
         _ => protocol,
     }
+}
+
+/// Whether `io` wraps a rustls `AlertReceived`, as tokio-rustls reports one.
+fn is_tls_alert(io: &io::Error) -> bool {
+    io.get_ref()
+        .and_then(|e| e.downcast_ref::<rustls::Error>())
+        .is_some_and(|e| matches!(e, rustls::Error::AlertReceived(_)))
 }
 
 /// The sliding count behind one listener's threshold. Keeps at most
@@ -454,6 +465,26 @@ mod tests {
             handshake_reason(
                 "tls_handshake_failed",
                 Some(&io(io::ErrorKind::InvalidData))
+            ),
+            "tls_handshake_failed"
+        );
+        // So does tokio-rustls a client's alert, which is no probe; another
+        // rustls error under the same kind still is.
+        let rustls_io = |e: rustls::Error| io::Error::new(io::ErrorKind::InvalidData, e);
+        assert_eq!(
+            handshake_reason(
+                "tls_handshake_failed",
+                Some(&rustls_io(rustls::Error::AlertReceived(
+                    rustls::AlertDescription::UnknownCA
+                )))
+            ),
+            "tls_alert_received"
+        );
+        assert!(!counts_as_probe("tls_alert_received"));
+        assert_eq!(
+            handshake_reason(
+                "tls_handshake_failed",
+                Some(&rustls_io(rustls::Error::NoApplicationProtocol))
             ),
             "tls_handshake_failed"
         );

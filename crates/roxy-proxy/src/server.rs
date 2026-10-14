@@ -21,9 +21,9 @@ use crate::addr::canonical;
 use crate::addrlist::AddressLists;
 use crate::budget::{BufferBudget, BufferLease};
 use crate::config::{HttpBehaviour, PolicyUpdate, RuntimeConfig};
-use crate::flowlog::{FlowEvent, FlowSink, Redactor};
+use crate::flowlog::{ClientInfo, FlowEvent, FlowSink, Redactor};
 use crate::listener::{ClientConn, Listener, ListenerMode, TcpProxyListener};
-use crate::pipeline::client_info;
+use crate::pipeline::{FlowCx, client_info};
 use crate::quarantine::{QuarantineCause, QuarantineRecord, QuarantineState, TripCounter};
 use crate::secrets::SecretStore;
 use crate::sources::{MetricSource, StateSource};
@@ -324,14 +324,29 @@ impl Shared {
         self.buffers.used()
     }
 
-    pub(crate) fn emit_parse_error(&self, c: &ClientConn, flow: Option<String>, e: &ParseError) {
-        self.emit_parse_reason(c, flow, e.reason.as_str(), Some(&e.detail));
+    /// A `parse_error` for a request that failed to parse, with the flow
+    /// (`cx`) when the head had already made one: the event then names the
+    /// client the flow's `request` event does, which `forwarded_for` may
+    /// have resolved past the peer.
+    pub(crate) fn emit_parse_error(&self, c: &ClientConn, cx: Option<&FlowCx>, e: &ParseError) {
+        let (flow, client) = match cx {
+            Some(cx) => (Some(cx.flow.to_string()), cx.meta.client_info()),
+            None => (None, client_info(c)),
+        };
+        self.emit_parse_event(c, flow, client, e.reason.as_str(), Some(&e.detail));
     }
 
-    pub(crate) fn emit_parse_reason(
+    /// A `parse_error` with no flow behind it: nothing has named a client
+    /// but the TCP peer.
+    pub(crate) fn emit_parse_reason(&self, c: &ClientConn, reason: &str, detail: Option<&str>) {
+        self.emit_parse_event(c, None, client_info(c), reason, detail);
+    }
+
+    fn emit_parse_event(
         &self,
         c: &ClientConn,
         flow: Option<String>,
+        client: ClientInfo,
         reason: &str,
         detail: Option<&str>,
     ) {
@@ -345,7 +360,7 @@ impl Shared {
             conn: c.id.to_string(),
             flow,
             listener: c.listener.name.clone(),
-            client: client_info(c),
+            client,
             reason: reason.to_owned(),
             detail,
         });
@@ -807,7 +822,7 @@ mod tests {
         let client = client_conn(ListenerMode::HttpProxy);
         let detail = format!("sni {secret}");
         let logged = capture_logs(tracing::Level::DEBUG, || {
-            shared.emit_parse_reason(&client, None, "bad_sni", Some(&detail));
+            shared.emit_parse_reason(&client, "bad_sni", Some(&detail));
         });
         assert!(logged.contains("client protocol error"), "{logged}");
         assert!(!logged.contains(secret), "{logged}");

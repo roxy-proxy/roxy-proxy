@@ -89,10 +89,10 @@ fn every_field_classifies_by_its_own_metadata() {
 fn effects_apply_once_and_a_deny_stops() {
     let p = compile("", POLICY);
     let ctx = EvalContext::empty();
-    let head = p.evaluate_admission(&MapView::new(), &ctx);
-    assert_eq!(head.terminal_rule, "allow-all");
+    let admission = p.evaluate_admission(&MapView::new(), &ctx);
+    assert_eq!(admission.terminal_rule, "allow-all");
     let mut st = p.in_flight_state();
-    let mut tags = head.tags.clone();
+    let mut tags = admission.tags.clone();
     let at = |n: i64| MapView::new().with_int(Field::BodyBytes, n);
     let changed = Reads::BODY_BYTES;
 
@@ -295,10 +295,10 @@ fn byte_metric_denies_in_flight() {
         p.evaluate_admission(&v(2 << 20, 0), &ctx).terminal_rule,
         "budget"
     );
-    let head = p.evaluate_admission(&v(0, 29), &ctx);
-    assert_eq!(head.terminal_rule, "ok");
+    let admission = p.evaluate_admission(&v(0, 29), &ctx);
+    assert_eq!(admission.terminal_rule, "ok");
     let mut st = p.in_flight_state();
-    let mut tags = head.tags.clone();
+    let mut tags = admission.tags.clone();
     // `n` grew to 30 because of this exchange: not re-checked.
     assert_eq!(
         p.evaluate_in_flight(ALL, ALL, &mut st, &mut tags, &v(1000, 30),),
@@ -439,7 +439,10 @@ fn in_flight_reader_of_an_admission_and_in_flight_setters_tag_is_rejected() {
     ] {
         let err = try_compile(metrics, &rules).unwrap_err().join("\n");
         assert!(err.contains("reads `tag[\"over\"]`"), "{err}");
-        assert!(err.contains("a deny on a byte metric"), "{err}");
+        assert!(
+            err.contains("a deny or quarantine on a byte metric"),
+            "{err}"
+        );
     }
     let p = compile(
         metrics,
@@ -652,9 +655,9 @@ fn a_matched_in_flight_quarantine_survives_a_fail_closed() {
   then: deny
 ",
     );
-    let head = p.evaluate_admission(&MapView::new(), &EvalContext::empty());
+    let admission = p.evaluate_admission(&MapView::new(), &EvalContext::empty());
     let mut st = p.in_flight_state();
-    let mut tags = head.tags.clone();
+    let mut tags = admission.tags.clone();
     let o = p
         .evaluate_in_flight(
             ALL,
@@ -695,11 +698,11 @@ fn an_in_flight_quarantine_stops_and_is_reported() {
         ]
     );
     let ctx = EvalContext::empty();
-    let head = p.evaluate_admission(&MapView::new().with_metric("egress", 0), &ctx);
-    assert!(head.decision.is_allow());
-    assert_eq!(head.quarantine, None);
+    let admission = p.evaluate_admission(&MapView::new().with_metric("egress", 0), &ctx);
+    assert!(admission.decision.is_allow());
+    assert_eq!(admission.quarantine, None);
     let mut st = p.in_flight_state();
-    let mut tags = head.tags.clone();
+    let mut tags = admission.tags.clone();
     let o = p
         .evaluate_in_flight(
             ALL,
@@ -716,7 +719,7 @@ fn an_in_flight_quarantine_stops_and_is_reported() {
     assert_eq!(o.quarantine.unwrap(), "bad-status");
 
     // The metric rule takes part in the admission decision too.
-    let head = p.evaluate_admission(&MapView::new().with_metric("egress", 2 << 20), &ctx);
-    assert_eq!(head.decision, Decision::Deny(Deny::quarantine()));
-    assert_eq!(head.quarantine.unwrap(), "too-much");
+    let admission = p.evaluate_admission(&MapView::new().with_metric("egress", 2 << 20), &ctx);
+    assert_eq!(admission.decision, Decision::Deny(Deny::quarantine()));
+    assert_eq!(admission.quarantine.unwrap(), "too-much");
 }
