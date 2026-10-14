@@ -3282,7 +3282,7 @@ optional.
 
 | key | kind | default | what it bounds |
 |---|---|---|---|
-| `first_byte_timeout` | both | `30s` | how long a layer may hold a head, request or response, before passing it on or answering: its own time only (starting an instance, its work, endpoint calls, reading the body it was given), never time `next` spends below it. Overrun fails closed, `budget:first_byte_timeout`. A service layer gets one budget to obtain a stream and a fresh one from each head. It bounds the layer's own time, not the exchange's: a layer that forwards a head and holds back the body keeps the upstream waiting for as long as it likes, with no clock running ([service layers](/reference/service-layers#semantics)). It also bounds the wait for an instance when all `max_instances` are busy, on its own: an enforce exchange that gets none within it is denied (`layer_error`, `no_instance`); an observer loses its copy (`observer_lagged`, `no_instance`) |
+| `first_byte_timeout` | both | `30s` | how long a layer may hold a head, request or response, before passing it on or answering: its own time only (starting an instance, its work, endpoint calls, reading the body it was given), never time `next` spends below it. Overrun fails the layer closed (`budget:first_byte_timeout` for a WASM layer, `service:timeout` for a service layer), and the exchange with it in enforce mode. A service layer gets one budget to obtain a stream and a fresh one from each head; an observing one gets a last from roxy's final message to its own end of the stream. It bounds the layer's own time, not the exchange's: a layer that forwards a head and holds back the body keeps the upstream waiting for as long as it likes, with no clock running ([service layers](/reference/service-layers#semantics)). It also bounds the wait for an instance when all `max_instances` are busy, on its own: an enforce exchange that gets none within it is denied (`layer_error`, `no_instance`); an observer loses its copy (`observer_lagged`, `no_instance`) |
 | `max_memory` | wasm | `64mb` | linear memory per instance, summed over the instance's memories; table growth and the host resource table (4096 live resources: body streams, pollables, pending responses) are capped too. What a layer holds of a body lives here. An interpreter in WASM (Python) needs 128–256 MiB |
 | `max_instances` | wasm | `1024` | live instances, so concurrent exchanges and, with `max_memory`, the layer's memory. An exchange that finds none free waits `first_byte_timeout` for one, then fails closed (`no_instance`), so the clients holding every instance cannot queue the rest indefinitely. Instances start on demand |
 | `recycle_after_exchanges` | wasm | `10000` | an instance is replaced after this many exchanges; `0` replaces it after every exchange |
@@ -3340,11 +3340,12 @@ and a service layer sends as messages:
 
 Every import is linked whatever is granted (one binary runs under any
 set); an ungranted call traps with `CapabilityDenied` and fails the
-exchange. `flow.current`, `flow.add-tag` and `flow.config` need no
-capability; `flow.add-tag` from an observe layer fails the exchange too,
-as a host refusal (`layer_error` with `kind: host`), since a tag steers the
-`when` of the layers below. There is no `secrets`
-capability: credentials go on an endpoint's `headers`.
+layer (the exchange with it, in enforce mode). `flow.current`,
+`flow.add-tag` and `flow.config` need no capability; `flow.add-tag` from
+an observe layer is refused by the host (`layer_error` with `kind: host`:
+the observer fails, the exchange goes on), since a tag steers the `when`
+of the layers below. There is no `secrets` capability: credentials go on
+an endpoint's `headers`.
 
 ## Behaviour
 
@@ -3544,7 +3545,7 @@ addons:
     endpoints:
       sidecar: { url: "http://127.0.0.1:9000/layer", private_ok: true }
     limits:
-      first_byte_timeout: 2s            # to get a stream, then to each of the service's heads (default 30s)
+      first_byte_timeout: 2s            # to get a stream, then to each of the service's heads, or an observer's end (default 30s)
       max_connections: 4                # per endpoint (default 4)
       max_streams: 100                  # exchanges at once per connection (default 100)
 ```
@@ -3644,8 +3645,9 @@ roxy → service   {"type":"result","id":n,"value":…} or {"type":"result","id"
 A service reaches the [host services](/reference/host-services) a WASM
 layer has by message, each behind the same capability granted in the
 layer's `capabilities`, and answered by the same host: a call means the
-same, is refused for the same reasons and fails the exchange with the same
-`layer_error.kind`, whichever kind of layer makes it. Every call carries
+same, is refused for the same reasons and fails the layer with the same
+`layer_error.kind` (and the exchange with it, in enforce mode), whichever
+kind of layer makes it. Every call carries
 an `id` of the service's choosing (an unsigned 64-bit integer) and is
 answered with a `result` carrying the same `id`: `value` is what the call
 returns (`null` for a call that returns nothing), `error` a refusal of what
@@ -3674,14 +3676,21 @@ forwarded; otherwise by the next rule that reads it: for a tag, which
 lives on this exchange, an in-flight re-check of it; for state, which
 persists, that or a later exchange's admission. A write does not itself
 trigger a re-check ([#509](https://github.com/roxy-proxy/roxy-proxy/issues/509)).
-At most 64 calls may be waiting, and more is a protocol violation. A call
-on a stream that has ended is dropped and never answered.
+At most 64 calls may be waiting, and more is a protocol violation. Calls
+the service sent before the stream ended still run once it has (a `record`
+sent just before its `response_end`, say): the effect stands, but the
+`result` is not sent, and one that fails is logged (`layer_error`) without
+stopping the rest; the stream keeps its place on the connection until they
+have run. A call sent on a stream that has ended is dropped and never
+answered.
 
-A call without its capability, a `log` message or `record` document over
-64 KiB, an `add_tag` or `state_put` from an observer, a full state store or
-a `record` the flow log cannot take fails the exchange (`layer_error`, kind
-`capability:<name>`, `budget:message`, `budget:tags` or `host`) and resets
-the stream; the `result` `error` is only for what the service passed.
+A call without its capability, a `log` message or a `record` kind and
+document together over 64 KiB, an `add_tag`, `state_put` or `quarantine`
+from an observer, or a full state store fails the layer (`layer_error`,
+kind `capability:<name>`, `budget:message`, `budget:tags` or `host`) and
+resets the stream: in enforce mode that fails the exchange, in observe
+mode the exchange goes on. The `result` `error` is only for what the
+service passed.
 roxy's own record of a call names its `id` as `call`: on the
 `layer_record` a `record` writes, on the `layer_error` a failed call
 causes, on the operational log line a `log` writes, and on the cause of
@@ -3696,7 +3705,8 @@ has no message: a service calls what it needs itself.
 * **Deadlines.** `first_byte_timeout` bounds getting a stream, then each
   of the service's heads, as it does a WASM layer's: its first answer from
   roxy's `request` head, its second from roxy's `response` head (not from
-  the end of the response body). A stream has no overall clock, and no
+  the end of the response body); on an observe stream, the service's end
+  from roxy's last message. A stream has no overall clock, and no
   clock runs while roxy waits on the layers below: a service that has
   forwarded the request head and holds back its body keeps the upstream
   waiting for as long as it likes.
@@ -3722,9 +3732,15 @@ has no message: a service calls what it needs itself.
   roxy closes it.
 * **[Observe mode](/design/addon-model#modes)** uses the same streams: the
   service gets copies of both directions; `credit` is honoured, `reset`
-  ends the stream and is logged (`layer_error`, `service:closed`), and
-  every other message is ignored. The stream ends after roxy's
-  `response_end` (or a `reset`); a cut copy (`observer_lagged`) is reset.
+  ends the stream and is logged (`layer_error`, `service:closed`),
+  host-service calls run as in enforce mode (less the ones an observer may
+  not make), and the heads, bytes and ends the service sends go nowhere.
+  The stream ends as an enforce stream does, on the service's last
+  message: its `response_end`, and the `request_end` of a request it sent.
+  So a service can read the copies through and then `record` what it saw
+  before ending the stream, as a WASM observer can. From roxy's last
+  message the service has `first_byte_timeout` to end the stream, or roxy
+  fails it (`service:timeout`); a cut copy (`observer_lagged`) is reset.
   Waiting for credit is falling behind, so grant extra credit as an observe
   stream opens (`roxy_layer.py` grants 16 MiB per body). Body bytes the
   service sends on an observe stream are discarded and credited back in
@@ -3806,8 +3822,9 @@ gets the store's default (one hour). A miss returns `none`. A key over
 1 KiB or a value over 64 KiB returns an error to the layer. A write when
 the store is full fails the exchange closed, as it does a rule's
 `set_state`; nothing is evicted. Only an enforce layer may write: a
-`state-put` from an observer fails the exchange, like `add-tag`, since the
-store steers every flow's rules. The store survives a reload, under
+`state-put` from an observer fails the layer (`layer_error`, kind `host`)
+and the exchange goes on, like `add-tag`, since the store steers every
+flow's rules. The store survives a reload, under
 `limits.max_state_entries`.
 
 ## Identity and config
@@ -3843,7 +3860,8 @@ is refused `_quarantined` (nothing of it is forwarded, whatever the layer
 answers), and so is every exchange after it, until an operator or the
 control plane lifts it. It is for what a layer is sure must stop the
 workload; one bad request is denied by answering it. Only an enforce layer
-may call it: from an observer it fails the exchange, like `add-tag`. The
+may call it: from an observer it fails the layer (`layer_error`, kind
+`host`) and the exchange goes on, like `add-tag`. The
 `quarantined` flow event's cause is `kind: layer` with the layer's name and
 the flow. A config whose layers hold the capability needs `roxy run --state-dir`, as one with a `quarantine` rule does. A layer cannot
 terminate a client: it denies the exchange.

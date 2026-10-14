@@ -56,8 +56,9 @@ gets the store's default (one hour). A miss returns `none`. A key over
 1 KiB or a value over 64 KiB returns an error to the layer. A write when
 the store is full fails the exchange closed, as it does a rule's
 `set_state`; nothing is evicted. Only an enforce layer may write: a
-`state-put` from an observer fails the exchange, like `add-tag`, since the
-store steers every flow's rules. The store survives a reload, under
+`state-put` from an observer fails the layer (`layer_error`, kind `host`)
+and the exchange goes on, like `add-tag`, since the store steers every
+flow's rules. The store survives a reload, under
 `limits.max_state_entries`.
 
 ## Identity and config
@@ -93,7 +94,8 @@ is refused `_quarantined` (nothing of it is forwarded, whatever the layer
 answers), and so is every exchange after it, until an operator or the
 control plane lifts it. It is for what a layer is sure must stop the
 workload; one bad request is denied by answering it. Only an enforce layer
-may call it: from an observer it fails the exchange, like `add-tag`. The
+may call it: from an observer it fails the layer (`layer_error`, kind
+`host`) and the exchange goes on, like `add-tag`. The
 `quarantined` flow event's cause is `kind: layer` with the layer's name and
 the flow. A config whose layers hold the capability needs `roxy run --state-dir`, as one with a `quarantine` rule does. A layer cannot
 terminate a client: it denies the exchange.

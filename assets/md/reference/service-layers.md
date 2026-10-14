@@ -16,7 +16,7 @@ addons:
     endpoints:
       sidecar: { url: "http://127.0.0.1:9000/layer", private_ok: true }
     limits:
-      first_byte_timeout: 2s            # to get a stream, then to each of the service's heads (default 30s)
+      first_byte_timeout: 2s            # to get a stream, then to each of the service's heads, or an observer's end (default 30s)
       max_connections: 4                # per endpoint (default 4)
       max_streams: 100                  # exchanges at once per connection (default 100)
 ```
@@ -116,8 +116,9 @@ roxy → service   {"type":"result","id":n,"value":…} or {"type":"result","id"
 A service reaches the [host services](/reference/host-services) a WASM
 layer has by message, each behind the same capability granted in the
 layer's `capabilities`, and answered by the same host: a call means the
-same, is refused for the same reasons and fails the exchange with the same
-`layer_error.kind`, whichever kind of layer makes it. Every call carries
+same, is refused for the same reasons and fails the layer with the same
+`layer_error.kind` (and the exchange with it, in enforce mode), whichever
+kind of layer makes it. Every call carries
 an `id` of the service's choosing (an unsigned 64-bit integer) and is
 answered with a `result` carrying the same `id`: `value` is what the call
 returns (`null` for a call that returns nothing), `error` a refusal of what
@@ -146,14 +147,21 @@ forwarded; otherwise by the next rule that reads it: for a tag, which
 lives on this exchange, an in-flight re-check of it; for state, which
 persists, that or a later exchange's admission. A write does not itself
 trigger a re-check ([#509](https://github.com/roxy-proxy/roxy-proxy/issues/509)).
-At most 64 calls may be waiting, and more is a protocol violation. A call
-on a stream that has ended is dropped and never answered.
+At most 64 calls may be waiting, and more is a protocol violation. Calls
+the service sent before the stream ended still run once it has (a `record`
+sent just before its `response_end`, say): the effect stands, but the
+`result` is not sent, and one that fails is logged (`layer_error`) without
+stopping the rest; the stream keeps its place on the connection until they
+have run. A call sent on a stream that has ended is dropped and never
+answered.
 
-A call without its capability, a `log` message or `record` document over
-64 KiB, an `add_tag` or `state_put` from an observer, a full state store or
-a `record` the flow log cannot take fails the exchange (`layer_error`, kind
-`capability:<name>`, `budget:message`, `budget:tags` or `host`) and resets
-the stream; the `result` `error` is only for what the service passed.
+A call without its capability, a `log` message or a `record` kind and
+document together over 64 KiB, an `add_tag`, `state_put` or `quarantine`
+from an observer, or a full state store fails the layer (`layer_error`,
+kind `capability:<name>`, `budget:message`, `budget:tags` or `host`) and
+resets the stream: in enforce mode that fails the exchange, in observe
+mode the exchange goes on. The `result` `error` is only for what the
+service passed.
 roxy's own record of a call names its `id` as `call`: on the
 `layer_record` a `record` writes, on the `layer_error` a failed call
 causes, on the operational log line a `log` writes, and on the cause of
@@ -168,7 +176,8 @@ has no message: a service calls what it needs itself.
 * **Deadlines.** `first_byte_timeout` bounds getting a stream, then each
   of the service's heads, as it does a WASM layer's: its first answer from
   roxy's `request` head, its second from roxy's `response` head (not from
-  the end of the response body). A stream has no overall clock, and no
+  the end of the response body); on an observe stream, the service's end
+  from roxy's last message. A stream has no overall clock, and no
   clock runs while roxy waits on the layers below: a service that has
   forwarded the request head and holds back its body keeps the upstream
   waiting for as long as it likes.
@@ -194,9 +203,15 @@ has no message: a service calls what it needs itself.
   roxy closes it.
 * **[Observe mode](/design/addon-model#modes)** uses the same streams: the
   service gets copies of both directions; `credit` is honoured, `reset`
-  ends the stream and is logged (`layer_error`, `service:closed`), and
-  every other message is ignored. The stream ends after roxy's
-  `response_end` (or a `reset`); a cut copy (`observer_lagged`) is reset.
+  ends the stream and is logged (`layer_error`, `service:closed`),
+  host-service calls run as in enforce mode (less the ones an observer may
+  not make), and the heads, bytes and ends the service sends go nowhere.
+  The stream ends as an enforce stream does, on the service's last
+  message: its `response_end`, and the `request_end` of a request it sent.
+  So a service can read the copies through and then `record` what it saw
+  before ending the stream, as a WASM observer can. From roxy's last
+  message the service has `first_byte_timeout` to end the stream, or roxy
+  fails it (`service:timeout`); a cut copy (`observer_lagged`) is reset.
   Waiting for credit is falling behind, so grant extra credit as an observe
   stream opens (`roxy_layer.py` grants 16 MiB per body). Body bytes the
   service sends on an observe stream are discarded and credited back in
