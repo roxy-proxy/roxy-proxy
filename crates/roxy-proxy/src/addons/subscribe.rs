@@ -149,7 +149,10 @@ fn splice(st: &Arc<StackFlow>, index: usize, dir: Dir, own: Body, bypassed: Body
     if own.is_end_stream() {
         return bypassed;
     }
-    let known = bypassed.known_length();
+    // The length is unknown while the own body is open, whatever the
+    // bypassed body declared: with a `content-length` the client would have
+    // a complete body once the bypassed bytes were through, and the end
+    // held back for the own body, or its failure, nothing left to cut.
     Body::wrap_native(
         Spliced {
             st: st.clone(),
@@ -159,7 +162,7 @@ fn splice(st: &Arc<StackFlow>, index: usize, dir: Dir, own: Body, bypassed: Body
             bypassed,
         },
         u64::MAX,
-        known,
+        None,
     )
 }
 
@@ -168,7 +171,8 @@ fn splice(st: &Arc<StackFlow>, index: usize, dir: Dir, own: Body, bypassed: Body
 /// it passes on for it is its failure. The own body never holds the
 /// bypassed bytes back (a guest body's end waits for the handler to return,
 /// which on a WebSocket is the life of the socket), but the whole ends only
-/// once it has: no body completes cleanly before the exchange has settled.
+/// once it has, and declares no length: no body completes cleanly before
+/// the exchange has settled.
 struct Spliced {
     st: Arc<StackFlow>,
     index: usize,
@@ -227,6 +231,6 @@ impl HttpBody for Spliced {
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.bypassed.size_hint()
+        SizeHint::default()
     }
 }

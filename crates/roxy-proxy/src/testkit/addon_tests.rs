@@ -2855,6 +2855,12 @@ async fn bytes_on_an_unsubscribed_body_fail_the_layer() {
         )
         .await;
     assert_eq!(a.status, 200, "{a:?}");
+    // The response declares no length while the layer's own body is open:
+    // with the upstream's `content-length` the client would have a complete
+    // body once the bypassed bytes were through, and the failure that
+    // follows nothing to cut.
+    assert!(!a.headers.contains_key("content-length"), "{a:?}");
+    assert_eq!(a.headers["transfer-encoding"], "chunked", "{a:?}");
     assert!(a.body.is_err(), "the body is cut: {a:?}");
     let errs = kit.events("layer_error", 1).await;
     assert_eq!(errs[0]["kind"], "unsubscribed:response", "{errs:#?}");
