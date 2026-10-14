@@ -265,6 +265,12 @@ class _Stream:
             result = await fut
         finally:
             self.pending.pop(cid, None)
+            # The stream may end between registering the call and sending
+            # it: `send` then refuses the call, and the failure already set
+            # on its future is taken here rather than reported by asyncio
+            # as never retrieved.
+            if fut.done() and not fut.cancelled():
+                fut.exception()
         if result.get("error") is not None:
             raise HostError(result["error"])
         return result.get("value")
