@@ -62,8 +62,8 @@ state, so the rest of this section is about enforce layers.
 
 Host-service effects are not in that pipeline. `add_tag`, `state_put`,
 `record` and `quarantine` go to the host beside the bytes, not down the
-stack. Each layer's calls run on their own worker, in the order that layer
-made them, and roxy orders nothing between one layer's call and another
+stack. A layer's calls on an exchange run on their own worker, in the
+order the layer made them, and roxy orders nothing between one layer's call and another
 layer's read: A's `state_put` and B's `state_get` are concurrent unless A
 awaits its `result` before sending the bytes B will read. B cannot read on
 a chunk it has not received, so the await puts A's write ahead of B's
@@ -72,7 +72,7 @@ the layer continues, so it has that order by construction; a service layer
 sends the call as a message and awaits the `result` itself
 ([host services on a stream](/reference/service-layers#host-services)).
 
-<img src={layerOrdering} alt="Two enforce layers, A and B, in roxy's request path, left to right, then the rules. The client's head (a solid line) and body bytes (a dashed line) run through A, then B, then to the rules; the gap between A and B is labelled: a chunk reaches B only after A sends it. Part-way through the body, A calls state_put, drawn as an arrow down to a host services strip along the bottom with a result arrow back up, and the note awaits result, then sends on; A's body line is broken at that point. In B, on the chunk that followed, a state_get arrow goes down to the strip and a result comes back, with the note on that chunk: sees A's write. A dotted line between the two calls says ordered only by A's await. The strip reads host services (add_tag, state_put, state_get, record, quarantine, and more): beside the pipeline. Under it: each layer's calls run on their own worker, so A's put lands before B's get only because A awaited its result; a write for this exchange's admission lands before the request is forwarded; any other is seen by the next rule that reads it, in flight or on a later exchange." />
+<img src={layerOrdering} alt="Two enforce layers, A and B, in roxy's request path, left to right, then the rules. The client's head (a solid line) and body bytes (a dashed line) run through A, then B, then to the rules; the gap between A and B is labelled: a chunk reaches B only after A sends it. Part-way through the body, A calls state_put, drawn as an arrow down to a host services strip along the bottom with a result arrow back up, and the note awaits result, then sends on; A's body line is broken at that point. In B, on the chunk that followed, a state_get arrow goes down to the strip and a result comes back, with the note on that chunk: sees A's write. A dotted line between the two calls says ordered only by A's await. The strip reads host services (add_tag, state_put, state_get, record, quarantine, and more): beside the pipeline. Under it: each layer's calls run on their own worker, so A's put lands before B's get only because A awaited its result; a write for this exchange's admission lands before the request is forwarded; any other is seen by the next rule that reads it: a tag in flight on this exchange, state there or at a later exchange's admission." />
 
 So, to make an effect visible:
 
@@ -82,12 +82,12 @@ So, to make an effect visible:
 - **to this exchange's admission rules**: land it before the request is
   forwarded, so before the layer calls `next` or the service sends its
   forwarded `request` head;
-- **otherwise**, a tag or state write is seen by the next rule that reads
-  it, an in-flight re-check of this exchange or a later exchange's
-  admission. The write does not itself trigger a re-check: a rule runs
-  when a value it watches changes, and reads the tag or key then. A write
-  never reopens a decision already made
-  ([policy evaluation](/design/policy-evaluation#evaluation)).
+- **otherwise**, the write is seen by the next rule that reads it. A tag
+  lives on this exchange, so that is an in-flight re-check of it; state
+  persists, so it is that or a later exchange's admission. The write does
+  not itself trigger a re-check: a rule runs when a value it watches
+  changes, and reads the tag or key then. A write never reopens a decision
+  already made ([policy evaluation](/design/policy-evaluation#evaluation)).
 
 ## Invariants
 
