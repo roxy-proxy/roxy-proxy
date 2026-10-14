@@ -38,11 +38,11 @@ A request is judged at two points. Each layer's `when` is checked on the
 head as it arrives; the rules decide the head once, after the whole stack
 and before anything is forwarded (if a rule reads `body.text`, the body is
 buffered up to the cap first: [body rules](/reference/rule-language#body-rules)),
-then re-check the body as its bytes stream past. A WASM layer may call a host service at any point, including
-mid-body, and roxy orders nothing between the call and the layer's later
-messages, so a layer that needs the effect seen (a tag the rules read, say)
-waits for the result before passing the head on. A write that lands after
-the admission decision never reopens it: a state write is seen by the next
+then re-check the body as its bytes stream past. A WASM layer may call a
+host service at any point, including mid-body; the call returns before the
+layer continues, so a layer that needs the effect seen by the rules (a tag
+they read, say) makes the call before `next`. A write that lands after the
+admission decision never reopens it: a state write is seen by the next
 rule that reads the store, whether an in-flight re-check of this exchange
 or a later exchange's admission, and a tag added then is read by no rule.
 

@@ -133,5 +133,5 @@
 
   <!-- host services -->
   <rect x="140" y="340" width="608" height="30" rx="15" fill="#f8f9f8" stroke="#e6e8e7"/>
-  <text x="444" y="359" fill="#3d4846" font-size="12" text-anchor="middle">host services, callable at any point: log · record · add-tag · state-put · metric-get</text>
+  <text x="444" y="359" fill="#3d4846" font-size="12" text-anchor="middle">host services (log · record · add-tag · state-put · metric-get · …), callable at any point</text>
 </svg>
