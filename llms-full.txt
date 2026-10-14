@@ -855,11 +855,15 @@ until something outside the process lifts it. It is for a workload that has
 shown itself hostile: once tripped, the proxy stays shut across reloads and
 restarts, and the client cannot talk its way out.
 
-Two things trip it:
+Three things trip it:
 
 * a rule's `quarantine` action ([actions](/reference/rule-language#actions)):
   the exchange is refused, by whichever deny wins, and the proxy is
   quarantined, even if a rule below it fails closed;
+* an enforce layer's `flow.quarantine`
+  ([host services](/reference/host-services#quarantine-quarantine)): the
+  exchange it was called on is refused `_quarantined`, and the proxy is
+  quarantined;
 * a listener's `quarantine_on.parse_errors` threshold
   ([listeners](/reference/http#listener-modes)): that many `parse_error`
   events on the listener within the window, counting every reason except
@@ -3176,7 +3180,7 @@ key; `roxy check` refuses a key on the other kind.
 | `sample` | both, observe only | number in (0, 1] | 1 | the share of matching exchanges the observer gets a copy of, drawn from the flow id |
 | `subscribe.request` | both | `head`, `full` | `full` | what the layer sees of the request: the head only, or the head and the body ([what a layer sees](/reference/addon-configuration#what-a-layer-sees)) |
 | `subscribe.response` | both | `head`, `full` | `full` | the same for the response |
-| `capabilities` | both | list of `endpoints`, `state`, `record`, `metrics`, `log` | none | the [host services](/reference/host-services) the layer may call ([capabilities](/reference/addon-configuration#capabilities)); `endpoints` does nothing for a service layer, which calls what it needs itself |
+| `capabilities` | both | list of `endpoints`, `state`, `record`, `metrics`, `log`, `quarantine` | none | the [host services](/reference/host-services) the layer may call ([capabilities](/reference/addon-configuration#capabilities)); `endpoints` does nothing for a service layer, which calls what it needs itself |
 | `config` | both | any YAML value | `null` | handed to the layer as a JSON document, through `flow.config` or the `open` message; roxy does not read it. Map keys become strings (`1: a` is `{"1": "a"}`) |
 | `endpoints` | both | map of name to [endpoint](/reference/addon-configuration#endpoints) | none | named outbound targets. A WASM layer calls them with `endpoints.call`; a service layer's `endpoint` names one of them |
 | `limits` | both | [limits](/reference/addon-configuration#limits) | defaults below | what the layer may cost roxy |
@@ -3260,6 +3264,7 @@ and a service layer sends as messages:
 | `record` | `flow.record`: structured events in the flow log |
 | `metrics` | `flow.metric-get`: read a metric for this flow's key |
 | `log` | `flow.log`: roxy's operational log |
+| `quarantine` | `flow.quarantine`: put the whole proxy into [quarantine](/guides/operations#quarantine); enforce only |
 
 Every import is linked whatever is granted (one binary runs under any
 set); an ungranted call traps with `CapabilityDenied` and fails the
@@ -3572,6 +3577,7 @@ the service passed.
 | `{"type":"state_get","id":n,"key":"…"}` | `state` | `{"type":"result","id":n,"value":"…"}` (`null` for a miss) |
 | `{"type":"state_put","id":n,"key":"…","value":"…","ttl_ms":n?}` | `state`; enforce only | `{"type":"result","id":n,"value":null}`, or `"error"` for a key or value over its cap |
 | `{"type":"metric_get","id":n,"metric":"…"}` | `metrics` | `{"type":"result","id":n,"value":n}` (`null` for a key with no entry) |
+| `{"type":"quarantine","id":n}` | `quarantine`; enforce only | `{"type":"result","id":n,"value":null}`; the exchange, and every one after it, is refused `_quarantined` |
 
 A call may be sent at any point while the stream is open, including
 part-way through a body. Calls run in order, one at a time per stream,
@@ -3593,7 +3599,8 @@ a `record` the flow log cannot take fails the exchange (`layer_error`, kind
 the stream; the `result` `error` is only for what the service passed.
 roxy's own record of a call names its `id` as `call`: on the
 `layer_record` a `record` writes, on the `layer_error` a failed call
-causes, and on the operational log line a `log` writes. `endpoints.call`
+causes, on the operational log line a `log` writes, and on the cause of
+the `quarantined` event a `quarantine` trips. `endpoints.call`
 has no message: a service calls what it needs itself.
 
 ## Semantics
@@ -3742,9 +3749,18 @@ key as 0); an unknown id, or a key field the request does not have, fails
 the exchange. `flow.log` writes to roxy's operational log with the
 flow id and layer name.
 
-A layer cannot terminate a client or quarantine the proxy: it denies the
-exchange and reports through `record` or an endpoint. Quarantine is a rule
-action ([quarantine](/guides/operations#quarantine)).
+## Quarantine (`quarantine`)
+
+`flow.quarantine()` puts the whole proxy into
+[quarantine](/guides/operations#quarantine): the exchange it was called on
+is refused `_quarantined` (nothing of it is forwarded, whatever the layer
+answers), and so is every exchange after it, until an operator or the
+control plane lifts it. It is for what a layer is sure must stop the
+workload; one bad request is denied by answering it. Only an enforce layer
+may call it: from an observer it fails the exchange, like `add-tag`. The
+`quarantined` flow event's cause is `kind: layer` with the layer's name and
+the flow. A config whose layers hold the capability needs `roxy run --state-dir`, as one with a `quarantine` rule does. A layer cannot
+terminate a client: it denies the exchange.
 
 # Flow log and capture
 
@@ -3809,7 +3825,7 @@ produces a `request` event:
 | `upstream_error`, `upstream_denied` | [upstream](/reference/upstream#errors) failures and address-floor hits; `upstream_denied.reason` is `private_range:<class>`, `deny_cidrs` or `list:<name>` ([address floor](/reference/address-lists#address-floor)) |
 | `policy_input_unavailable`, `metric_table_full` | a flow failed closed for want of an input |
 | `policy_expired` | the policy's `valid_until` passed; once per loaded policy, with `valid_until` ([lease](/guides/operations#lease)) |
-| `quarantined` | the process went into [quarantine](/guides/operations#quarantine), or started in one (`restored: true`): `id` (the incident a release must name), `since`, and `cause`, which is `{"kind": "rule", "rule", "flow"}` or `{"kind": "threshold", "listener", "counter": "parse_errors", "count", "window_seconds"}` |
+| `quarantined` | the process went into [quarantine](/guides/operations#quarantine), or started in one (`restored: true`): `id` (the incident a release must name), `since`, and `cause`, which is `{"kind": "rule", "rule", "flow"}`, `{"kind": "threshold", "listener", "counter": "parse_errors", "count", "window_seconds"}` or `{"kind": "layer", "layer", "flow"}` (with `call`, the service's id for the call, when a [service layer](/reference/service-layers#host-services) tripped it) |
 | `quarantine_released` | the control plane released the quarantine named by `id` ([node mode](/guides/node-mode#the-lease)) |
 | `upgrade_stripped` | an upgrade was not allowed, so the request went upstream as plain HTTP ([WebSockets](/reference/websockets)) |
 | `ws_open`, `ws_close` | a relayed WebSocket, with byte counts; `ws_close` has `close_code` and `close_reason` when roxy ended it |
@@ -4082,7 +4098,7 @@ re-enrolment recovers the node.
 |---|---|
 | `id` | minted by the node per incident; what a release names |
 | `since` | when it tripped, on the node's clock |
-| `cause` | what tripped it, as the node's `quarantined` flow event carries it: `kind: rule` with the `rule` id and the `flow`, or `kind: threshold` with the `listener`, the `counter` (`parse_errors`), its `count` and `window_seconds` ([flow log](/reference/flow-log#events)) |
+| `cause` | what tripped it, as the node's `quarantined` flow event carries it: `kind: rule` with the `rule` id and the `flow`, `kind: threshold` with the `listener`, the `counter` (`parse_errors`), its `count` and `window_seconds`, or `kind: layer` with the `layer` name, the `flow` and, when a service layer tripped it, `call`, the service's id for the call ([flow log](/reference/flow-log#events)) |
 
 The server answers `200` with the full lease on every poll (no conditional
 fetch), or `410`, `401`, `426`, `5xx` as in the

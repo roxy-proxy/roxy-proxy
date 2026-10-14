@@ -61,7 +61,7 @@ produces a `request` event:
 | `upstream_error`, `upstream_denied` | [upstream](/reference/upstream#errors) failures and address-floor hits; `upstream_denied.reason` is `private_range:<class>`, `deny_cidrs` or `list:<name>` ([address floor](/reference/address-lists#address-floor)) |
 | `policy_input_unavailable`, `metric_table_full` | a flow failed closed for want of an input |
 | `policy_expired` | the policy's `valid_until` passed; once per loaded policy, with `valid_until` ([lease](/guides/operations#lease)) |
-| `quarantined` | the process went into [quarantine](/guides/operations#quarantine), or started in one (`restored: true`): `id` (the incident a release must name), `since`, and `cause`, which is `{"kind": "rule", "rule", "flow"}` or `{"kind": "threshold", "listener", "counter": "parse_errors", "count", "window_seconds"}` |
+| `quarantined` | the process went into [quarantine](/guides/operations#quarantine), or started in one (`restored: true`): `id` (the incident a release must name), `since`, and `cause`, which is `{"kind": "rule", "rule", "flow"}`, `{"kind": "threshold", "listener", "counter": "parse_errors", "count", "window_seconds"}` or `{"kind": "layer", "layer", "flow"}` (with `call`, the service's id for the call, when a [service layer](/reference/service-layers#host-services) tripped it) |
 | `quarantine_released` | the control plane released the quarantine named by `id` ([node mode](/guides/node-mode#the-lease)) |
 | `upgrade_stripped` | an upgrade was not allowed, so the request went upstream as plain HTTP ([WebSockets](/reference/websockets)) |
 | `ws_open`, `ws_close` | a relayed WebSocket, with byte counts; `ws_close` has `close_code` and `close_reason` when roxy ended it |

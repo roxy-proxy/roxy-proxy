@@ -141,7 +141,7 @@ re-enrolment recovers the node.
 |---|---|
 | `id` | minted by the node per incident; what a release names |
 | `since` | when it tripped, on the node's clock |
-| `cause` | what tripped it, as the node's `quarantined` flow event carries it: `kind: rule` with the `rule` id and the `flow`, or `kind: threshold` with the `listener`, the `counter` (`parse_errors`), its `count` and `window_seconds` ([flow log](/reference/flow-log#events)) |
+| `cause` | what tripped it, as the node's `quarantined` flow event carries it: `kind: rule` with the `rule` id and the `flow`, `kind: threshold` with the `listener`, the `counter` (`parse_errors`), its `count` and `window_seconds`, or `kind: layer` with the `layer` name, the `flow` and, when a service layer tripped it, `call`, the service's id for the call ([flow log](/reference/flow-log#events)) |
 
 The server answers `200` with the full lease on every poll (no conditional
 fetch), or `410`, `401`, `426`, `5xx` as in the
