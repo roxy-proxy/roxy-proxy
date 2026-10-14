@@ -1,6 +1,6 @@
 ---
 title: "Addon model"
-description: "What an addon layer is, how the stack is shaped, the invariants every layer is held to, how the bytes and the host-service effects of one layer are ordered against another's, and what the modes mean."
+description: "What an addon layer is: a stage on the exchange's two lanes. How the stack is shaped, the invariants every layer is held to, how the bytes and the host-service effects of one layer are ordered against another's, and what the modes mean."
 ---
 
 import layerOrdering from "../../assets/layer-ordering.svg";
@@ -9,7 +9,7 @@ import layerOrdering from "../../assets/layer-ordering.svg";
 
 roxy knows HTTP, not any particular application or API. Logic that needs to
 understand the traffic goes in an addon: a layer above the rules that owns
-both streams of every exchange it runs on. An addon is either:
+both lanes of every exchange it runs on. An addon is either:
 
 - **a WASM layer** (`kind: wasm`): a WebAssembly component run in-process by
   `roxy-wasm`, written against the `roxy:addon` WIT package
@@ -19,11 +19,24 @@ both streams of every exchange it runs on. An addon is either:
   path, which each exchange streams through over a WebSocket
   ([service layer protocol](/reference/service-layers)).
 
-## The stack
+## Two lanes
 
-Each layer wraps everything below it: it receives the request (head and
-body stream), may pass a request down with `next`, and returns a response
-stream upward.
+An exchange is two lanes. The request lane flows down from the client
+through the layers to the rules and the connector; the response lane flows
+up from the bottom through the same layers to the client. Each lane is a
+head, bytes and an end, and the lanes carry no HTTP rules of their own:
+what a head or a chunk means is for the edges to say.
+
+A layer sits on both lanes of every exchange it runs on. On either lane it
+may pass what it was given, hold it, rewrite it, or originate its own,
+chunk by chunk, at any time. roxy infers nothing across the lanes: a
+layer's answer on the response lane says nothing about the request lane,
+which runs on below as the layer drives it. A layer that answers and wants
+nothing forwarded forwards nothing; one that answers and forwards has a
+forward that runs to its end. It is each layer's job to keep each lane
+coherent for the layer below it, and the stack's as a whole to keep what
+leaves the proxy valid: one request down, one response up, each well
+formed where it reaches a socket.
 
 ```
                  request ↓                                   ↑ response
@@ -45,6 +58,42 @@ The stack is a pipeline: every layer runs at once, as its own task, each
 seeing what the layer above passed on, so on a long stream each works on a
 different chunk at the same time. Observe layers get copies and run beside
 the stream rather than in it.
+
+## The bottom is a producer
+
+The response lane starts wherever the request lane ends. At the connector
+that is the origin's response. At the rules it is the refusal: a deny, the
+address floor, a fail-closed input. At a layer it is the layer's own answer,
+or the `503` its failure earns. Each enters the response lane at the depth
+it happened and flows up through the layers above like any other response:
+a layer sees the rules' `403` from `next` as it would see a `403` from the
+origin, and may pass it on or reshape it, into a response the client takes
+as success included. Addons are trusted configuration, so that is theirs to
+decide; the request did not leave, and the flow log records the rules'
+verdict whatever the client was given
+([in the proxy](/reference/addon-configuration#in-the-proxy)).
+
+A layer answering without forwarding and the rules refusing are the same
+event at different depths: the request lane ends there, that stage
+produces the response, and nothing below ever sees the request.
+
+A body that stops short below a layer (an in-flight deny cut it, the
+origin's body failed) ends that lane with the failure, not the exchange:
+the layer sees the lane end short of complete and finishes its own lanes
+as it sees fit. Only the client's own request failing ends the exchange
+outright, since nothing can answer a client whose request broke.
+
+## Edges enforce validity
+
+The lanes are opaque. What reaches a socket is not: the request the last
+layer passes on is re-validated as strictly as a client's and judged by the
+rules, and the response the first layer passes up is re-framed as strictly
+as an origin's. A head that cannot go out where it arrives (a second final
+response head, a `101` that relays no upgrade, a declared length the bytes
+do not match, a `1xx` other than a relayed `101`) is the fault of the last
+layer that touched it, and becomes a response on the lane above like any
+other failure. Between the edges a layer may do as it likes with what it
+holds, so long as what leaves it is something the layer below can carry.
 
 ## Ordering across layers
 
@@ -101,9 +150,13 @@ So, to make an effect visible:
    timeouts. A layer cannot pass on `CONNECT`: a tunnel is something the
    client opens at the proxy port, never a request to forward.
 3. **Failure is closed.** A layer that traps, exceeds a budget or returns an
-   invalid head denies the flow, or cuts the exchange if the response head
-   is already out. There is no "on error, pass"; observe mode is the one
-   safe way to run a layer whose failures must not matter.
+   invalid head produces a `503` on the lane above it, which the layers
+   above may reshape but the client gets if none does; after the response
+   head is out, the body is cut. There is no "on error, pass"; observe mode
+   is the one safe way to run a layer whose failures must not matter.
+4. **One forward and one answer per layer.** A layer sends the request lane
+   down at most once and the response lane up exactly once. In which order,
+   and how far apart, is its own affair.
 
 ## Who is blamed
 
@@ -117,15 +170,19 @@ someone else's failure is a consequence, never a second fault.
 - A layer's own failure (a trap, an exceeded budget, an invalid head, a
   service that broke its stream) is the layer's: `503` with
   `terminal_rule: layer:<name>` before the response head, a cut body after
-  it, and one `layer_error` event either way. A failure found below the
-  layer that caused it (a passed-on request that does not validate, say) is
-  put down to the nearest enforcing layer above.
+  it, and one `layer_error` event either way. The `503` travels up the
+  response lane, so a layer above may reshape what the client gets; the
+  record is the refusal's either way. A failure found below the layer that
+  caused it (a passed-on request that does not validate, say) is put down
+  to the nearest enforcing layer above.
 - A client upload that breaks is the client's, as without a stack: the
   connection closes on the parse error before the head, the body is cut
   after it, and no `layer_error` is logged however many layers fail on the
   cut body.
 - An upstream response body that fails before any layer has answered with
   a head of its own is the upstream's: `502`, `reason: upstream_body_failed`.
+  One that fails after that ends the response lane below the layer with the
+  failure; what the client's response makes of it is the layer's.
 - A body the [buffer budget](/reference/limits#limits) cannot cover on its
   way to a layer (a decoder's window) fails closed as the budget's:
   `reason: buffer_budget_exhausted`.
@@ -142,6 +199,16 @@ answers with a response the client can act on. Anything else a layer needs
 to reach is a [named endpoint](/reference/host-services#endpoints-endpoints),
 which goes straight to the connector, never through other layers or the
 rules.
+
+`next` and the layer's answer are the two lanes, and neither waits on the
+other. A layer may answer first and forward after, forward and answer
+before the response from below arrives, or answer and never forward. Its
+answer reaches the client as soon as it is made. A forward it made runs on
+to its end below, and the response from below still arrives for it to read
+or ignore; a layer that abandons its forward (drops the pending response)
+has it cut, never completed. Once the client's response is complete and no
+layer forwarded the request, the rest of the client's upload is dropped
+rather than held for a reader that will never come.
 
 ## A layer takes what it subscribes to
 

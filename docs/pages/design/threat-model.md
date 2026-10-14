@@ -125,7 +125,11 @@ Addons sit above the rules and can reshape traffic freely, but what they
 pass on is re-validated as strictly as a client request and judged by the
 rules as if the client had sent it. Nothing configurable runs between the
 rules and the network, and the address floor checks the IP actually
-dialled ([addon model](/design/addon-model)).
+dialled. A refusal the rules make travels back up through the addons as a
+response, which an addon above may reshape, into one the client takes as
+success included: addons are trusted configuration, the request did not
+leave, and the flow log records the rules' verdict whatever the client was
+given ([addon model](/design/addon-model)).
 
 ## Streams, not messages
 

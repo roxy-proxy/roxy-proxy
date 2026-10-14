@@ -99,17 +99,22 @@ interface chain {
   use wasi:io/streams@0.2.12.{output-stream};
 
   /// Pass a request to the layers below (and, through the rules, to the
-  /// network). Callable at most once per exchange: a second call traps.
-  /// The request is validated by roxy's canonical model as if a client had
-  /// sent it; an invalid head fails the exchange closed. Returns the
+  /// network). Callable at most once per exchange, before or after
+  /// `respond`: a second call traps. The request is validated by roxy's
+  /// canonical model as if a client had sent it; an invalid head fails the
+  /// exchange closed. The response that comes back is whatever the stack
+  /// below produced, the rules' refusal included. Returns the
   /// `output-stream` to write the body to when `body` is `stream`; the
   /// stream applies backpressure, so write it while waiting on the
   /// response.
   next: func(head: request-head, body: body) -> result<tuple<pending-response, option<output-stream>>, error>;
 
   /// Answer the client. Callable once per exchange, before `handle`
-  /// returns; a second call fails the exchange closed. Returns the
-  /// `output-stream` to write the body to when `body` is `stream`.
+  /// returns and whether or not `next` has been called; a second call
+  /// fails the exchange closed. The answer reaches the client at once, and
+  /// says nothing about a request passed to `next`, which runs on to its
+  /// end. Returns the `output-stream` to write the body to when `body` is
+  /// `stream`.
   respond: func(head: response-head, body: body) -> option<output-stream>;
 }
 

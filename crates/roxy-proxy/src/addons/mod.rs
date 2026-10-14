@@ -436,6 +436,11 @@ impl StackFlow {
         self.snip.cancel();
     }
 
+    /// Cancelled when the exchange is torn down.
+    pub(crate) fn ending(&self) -> CancellationToken {
+        self.loan.abandon.clone()
+    }
+
     /// The response the client got is complete. If no layer forwarded the
     /// request, nothing below will read the rest of it: the client's lane
     /// is dropped, so the front drains or closes rather than waits.
@@ -525,12 +530,17 @@ impl StackFlow {
     }
 
     /// The layer blamed for the exchange failing, if one is.
-    #[cfg(test)]
     fn blamed_layer(&self) -> Option<String> {
         match self.attribution.fault()? {
             Fault::Layer { name, .. } => Some(name),
             Fault::Client(_) | Fault::UpstreamBody | Fault::Budget => None,
         }
+    }
+
+    /// The index of the layer blamed for the exchange failing, if one is.
+    fn failed_layer(&self) -> Option<usize> {
+        let name = self.blamed_layer()?;
+        self.snap.addons.iter().position(|a| a.name == name)
     }
 
     /// The client asked for a WebSocket, the one upgrade the core relays.
@@ -815,8 +825,11 @@ fn stack_outcome(
         return refuse(st);
     }
     // Decided now: a layer that answered while its forward was below is
-    // the one that answered, whatever the core returns to it later.
-    let _ = st.answered.set(st.answered_by());
+    // the one that answered, whatever the core returns to it later. A
+    // layer that failed answered nothing: the refusal its failure earned
+    // did, and the record already says so.
+    let answered = st.answered_by().filter(|&i| st.failed_layer() != Some(i));
+    let _ = st.answered.set(answered);
     let mut resp = resp;
     // A `101`'s body is the upgraded stream for the client, not an HTTP
     // body: keep it out of the response model.

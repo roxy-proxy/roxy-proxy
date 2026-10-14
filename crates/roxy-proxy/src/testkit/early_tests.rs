@@ -1,7 +1,8 @@
 //! Answers while the client is still uploading: from the upstream, and
-//! from a layer before calling `next` (nothing leaves) or after (the
-//! forwarded request is abandoned mid-body). Each must reach the client
-//! without waiting for the rest of the upload.
+//! from a layer before calling `next` (nothing leaves), after it (the
+//! forwarded request is abandoned mid-body) or while keeping it (the
+//! forward runs to its end). Each must reach the client without waiting
+//! for the rest of the upload.
 //!
 //! An outer layer relays an early answer from below only if it streams
 //! full duplex (the test layer's `relay`); its sequential `pass` sends the
@@ -13,6 +14,8 @@ use bytes::Bytes;
 use roxy_http::BodySender;
 
 use super::{AddonDef, Answer, Client, Kit, streaming_body, strs};
+use crate::addons::AddonMode;
+use crate::addons::service::testing;
 
 const CHUNK: usize = 4096;
 
@@ -244,4 +247,95 @@ async fn an_outer_layer_answering_after_the_inner_one_forwarded_is_the_one_named
     drop(tx);
     let ev = kit.request_event().await;
     assert_eq!(ev["terminal_rule"], "layer:a", "{ev:#}");
+}
+
+// ---- a layer answering while its forward runs on ----------------------------
+
+/// The head of an upload the layer answers early: the response head
+/// reaches the client while the upload is still open, and the rest of
+/// the response is read once the upload has ended.
+async fn head_mid_upload(
+    c: &mut Client,
+    headers: &[(&str, &str)],
+) -> (BodySender, http::Response<hyper::body::Incoming>) {
+    let (mut tx, body) = streaming_body();
+    let req = c.request("POST", "/upload", headers).body(body).unwrap();
+    let pending = c.send(req);
+    tokio::pin!(pending);
+    for _ in 0..2 {
+        tx.send_data(Bytes::from(vec![b'x'; CHUNK])).await.unwrap();
+    }
+    let res = tokio::time::timeout(Duration::from_secs(10), pending)
+        .await
+        .expect("the head arrives while the client is still uploading")
+        .expect("a response");
+    (tx, res)
+}
+
+/// The answer reaches the client at once and says nothing about the
+/// forward: the layer keeps streaming the upload into `next`, the upstream
+/// gets it whole, and the flow is logged as the layer's answer with what
+/// the rules decided of the forward.
+async fn answer_then_forward(kit: &Kit, mut c: Client, headers: &[(&str, &str)], body: &[u8]) {
+    let (mut tx, res) = head_mid_upload(&mut c, headers).await;
+    assert_eq!(res.status(), 200, "{res:?}");
+    tx.send_data(Bytes::from(vec![b'x'; CHUNK])).await.unwrap();
+    tx.finish().await.unwrap();
+    let a = Answer::read(res).await;
+    assert_eq!(a.body.as_deref().ok(), Some(body), "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].path, "/upload");
+    assert_eq!(seen[0].complete, Some(true), "{:?}", seen[0]);
+    assert_eq!(seen[0].body.len(), 3 * CHUNK);
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "answered", "{ev:#}");
+    assert!(ev["reason"].is_null(), "nothing was abandoned: {ev:#}");
+    assert!(strs(&ev["rules"]).contains(&"up".to_owned()), "{ev:#}");
+}
+
+#[tokio::test]
+async fn h1_a_wasm_layer_answering_before_next_leaves_the_forward_to_complete() {
+    let kit = stack(&["a"]).await;
+    let c = kit.h1().await;
+    answer_then_forward(
+        &kit,
+        c,
+        &[("x-test-a", "answer-then-next")],
+        b"answered before forwarding",
+    )
+    .await;
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "layer:a", "{ev:#}");
+}
+
+#[tokio::test]
+async fn h2_a_wasm_layer_answering_before_next_leaves_the_forward_to_complete() {
+    let kit = stack(&["a"]).await;
+    let c = kit.tunnel("up.test", true).await;
+    answer_then_forward(
+        &kit,
+        c,
+        &[("x-test-a", "answer-then-next")],
+        b"answered before forwarding",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_service_answering_while_it_forwards_leaves_the_forward_to_complete() {
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![testing::addon("s", "early", AddonMode::Enforce, |_| {})],
+    )
+    .await;
+    let c = kit.h1().await;
+    answer_then_forward(&kit, c, &[], b"early").await;
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "layer:s", "{ev:#}");
+    let svc = kit.upstream.service();
+    assert!(
+        svc.resets().is_empty(),
+        "nothing reset the stream: {:?}",
+        svc.resets()
+    );
 }

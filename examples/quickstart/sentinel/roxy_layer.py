@@ -8,17 +8,18 @@ body), then body bytes:
 
     roxy -> service   open (the exchange's metadata), then the request:
                       head, body bytes, request_end
-    service -> roxy   the request to forward (head, bytes, request_end),
-                      or a response of its own
+    service -> roxy   the request to forward, if any (head, bytes, request_end)
     roxy -> service   the response from below: head, bytes, response_end
     service -> roxy   the response for the client (head, bytes, response_end)
 
-The request and response bodies of a stream are independent: roxy sends
-its `response` head as soon as the layer below answers, even while the
-client is still uploading, and the service may do the same. Each body is
-flow-controlled with `credit` messages, and either side may abandon a
-stream with `reset`. This module handles the streams, credit and resets,
-and turns each exchange into one coroutine:
+The two lanes of a stream are independent, each way: roxy sends its
+`response` head as soon as the layer below answers, even while the client
+is still uploading, and the service may answer before, while or without
+forwarding. A body that fails on its way ends its lane with an `error` on
+the end rather than ending the stream. Each body is flow-controlled with
+`credit` messages, and either side may abandon a stream with `reset`.
+This module handles the streams, credit and resets, and turns each
+exchange into one coroutine:
 
     async def handle(ex: Exchange) -> None:
         response = await ex.forward(ex.request, ex.body())
@@ -118,6 +119,11 @@ class Response:
 
 class ProtocolError(Exception):
     """roxy sent something out of order, or reset the stream."""
+
+
+class BodyFailed(Exception):
+    """A body from roxy ended short of complete: its lane carries the
+    failure, the stream goes on. Whatever was read of it is not the whole."""
 
 
 class HostError(Exception):
@@ -438,6 +444,8 @@ class Exchange:
                 continue
             if m.get("type") != end:
                 raise ProtocolError(f"expected {end}, got {m.get('type')}")
+            if m.get("error") is not None:
+                raise BodyFailed(str(m["error"]))
             return
 
     def body(self) -> AsyncIterator[bytes]:
@@ -483,11 +491,12 @@ class Exchange:
             self._forwarding.exception()
 
     async def forward(self, request: Request, body: Body) -> Response:
-        """Pass `request` on down the stack and return the response head
-        from below, as soon as there is one: the body keeps going out in
-        the background if roxy answers before it has all been sent. roxy
-        re-validates the request and its rules judge it; read the response
-        body with `response_body()`."""
+        """Pass `request` on down the stack, once, and return the response
+        head from below, as soon as there is one: the body keeps going out
+        in the background if roxy answers before it has all been sent.
+        roxy re-validates the request and its rules judge it; a refusal
+        comes back as a response like any other. Read the response body
+        with `response_body()`."""
         self._s.forwarded = True
         await self._send(
             {
@@ -534,9 +543,10 @@ class Exchange:
         return b"".join([c async for c in self.response_body()])
 
     async def respond(self, response: Response, body: Body) -> None:
-        """Give the client `response`: after `forward`, the response the
-        client gets; before it, an answer instead of forwarding. It may be
-        sent while the forwarded request body is still going out."""
+        """Give the client `response`, whether or not the exchange has been
+        forwarded, before or after: the client's response is its own lane.
+        An early answer leaves a forward to run to its end; a handler that
+        wants nothing forwarded does not forward."""
         await self._send(
             {
                 "type": "response",

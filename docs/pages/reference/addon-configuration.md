@@ -82,7 +82,7 @@ optional.
 
 | key | kind | default | what it bounds |
 |---|---|---|---|
-| `first_byte_timeout` | both | `30s` | how long a layer may hold a head, request or response, before passing it on or answering: its own time only (starting an instance, its work, endpoint calls, reading the body it was given), never time `next` spends below it. Overrun fails the layer closed (`budget:first_byte_timeout` for a WASM layer, `service:timeout` for a service layer), and the exchange with it in enforce mode. A service layer gets one budget to obtain a stream and a fresh one from each head; an observing one gets a last from roxy's final message to its own end of the stream. It bounds the layer's own time, not the exchange's: a layer that forwards a head and holds back the body keeps the upstream waiting for as long as it likes, with no clock running ([service layers](/reference/service-layers#semantics)). It also bounds the wait for an instance when all `max_instances` are busy, on its own: an enforce exchange that gets none within it is denied (`layer_error`, `no_instance`); an observer loses its copy (`observer_lagged`, `no_instance`) |
+| `first_byte_timeout` | both | `30s` | how long a layer may hold a head, request or response, before passing it on or answering: its own time only (starting an instance, its work, endpoint calls, reading the body it was given), never time `next` spends below it. Overrun fails the layer closed (`budget:first_byte_timeout` for a WASM layer, `service:timeout` for a service layer), and the exchange with it in enforce mode. A service layer gets one budget to obtain a stream and a fresh one from each head roxy sends it, until it has answered; an observing one gets a last from roxy's final message to its own end of the stream. It bounds the layer's own time, not the exchange's: a layer that forwards a head and holds back the body keeps the upstream waiting for as long as it likes, with no clock running ([service layers](/reference/service-layers#semantics)). It also bounds the wait for an instance when all `max_instances` are busy, on its own: an enforce exchange that gets none within it is denied (`layer_error`, `no_instance`); an observer loses its copy (`observer_lagged`, `no_instance`) |
 | `max_memory` | wasm | `64mb` | linear memory per instance, summed over the instance's memories; table growth and the host resource table (4096 live resources: body streams, pollables, pending responses) are capped too. What a layer holds of a body lives here. An interpreter in WASM (Python) needs 128–256 MiB |
 | `max_instances` | wasm | `1024` | live instances, so concurrent exchanges and, with `max_memory`, the layer's memory. An exchange that finds none free waits `first_byte_timeout` for one, then fails closed (`no_instance`), so the clients holding every instance cannot queue the rest indefinitely. Instances start on demand |
 | `recycle_after_exchanges` | wasm | `10000` | an instance is replaced after this many exchanges; `0` replaces it after every exchange |
@@ -216,7 +216,13 @@ flow however often it is asked.
 The stack sits in the exchange core both fronts share: the front drives
 the client's request body into the first layer, and the last layer's
 `next` runs the rules, the upstream, then the in-flight rules on the
-response.
+response. A layer's answer goes to the client as soon as the layer gives
+it, and a request it forwarded runs on below to its end; the flow is
+logged once the core has had its say on that request. Once the response is
+complete and no layer forwarded the request, the rest of the client's
+upload is dropped: on HTTP/1.1 the codec drains or closes as it does after
+a deny ([HTTP](/reference/http#deny-responses)), on HTTP/2 the stream is
+reset with no error.
 
 - What a layer passes on is re-validated as strictly as a client request:
   an absolute `http(s)` URI; `host`, hop-by-hop and framing fields refused
@@ -228,6 +234,11 @@ response.
   leaves them unset.
 - A layer's answer must be a final response; a `1xx` other than the `101`
   of a relayed upgrade fails closed as `invalid_response`.
+- What `next` returns is a response whoever produced it: the upstream's,
+  the rules' refusal, or the `503 layer:<name>` a failure below earned,
+  recorded on the flow as the refusal it is. The layer may pass it on or
+  reshape it; `next` returns an error only when the client's own request
+  failed, and then nothing answers the client.
 - A layer's response body to the client waits for the flow log like every
   forwarded body ([audit backpressure](/reference/flow-log#writing)).
 - Layers compile at config load and are cached across reloads while their
@@ -240,7 +251,7 @@ In the flow log:
 |---|---|
 | `addons` | the layers that ran, in stack order; a layer its `when` or `sample` skipped is not in it |
 | `rules`, `decision`, `terminal_rule` | the rules' decision on the request that left the stack; `req` is what the client sent. Metric keys (for the rules' samples and `metric-get`) also come from the request that left. A layer whose `next` returned the rules' `403` and then answered `200` itself is logged `decision: deny`, `res.status: 200` |
-| `decision: answered`, `terminal_rule: layer:<name>` | a layer answered itself, whatever its status: the outermost layer that did not pass on the response from below (it never called `next`, or answered while `next` was pending, failed or dropped). If its request had already left, the forwarded request is abandoned (its body cut, never ended as complete) and the record keeps what the rules decided and the bytes sent, with `reason: upstream_aborted` |
+| `decision: answered`, `terminal_rule: layer:<name>` | a layer answered itself, whatever its status: the outermost layer that did not pass on the response from below (it never called `next`, or answered while `next` was pending or dropped), decided as it answered. A forward it kept runs to its end, and the record keeps what the rules decided of it; one it dropped is abandoned (its body cut, never ended as complete), with `reason: upstream_aborted`. A layer that failed answered nothing: the refusal its failure earned is the decision, `deny`, whatever a layer above made of it |
 | `503`, `terminal_rule: layer:<name>`, `reason: layer_error` | a layer failed before the response head; the connection is closed and a `layer_error` event follows with `kind` one of `trap`, `budget:<limit>`, `capability:<name>`, `invalid_request`, `invalid_response`, `no_response`, `unsubscribed:<direction>`, ... After the head, the body is cut (HTTP/1.1 breaks the connection, HTTP/2 resets the stream) and `layer_error` follows. Which layer, if any, is one rule ([who is blamed](/design/addon-model#who-is-blamed)) |
 
 ### Content codings

@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use roxy_http::{Body, BodyError, BodySender};
-use roxy_wasm::{LayerHost as _, LayerResponse};
+use roxy_wasm::{LayerHost as _, LayerRequest, LayerResponse};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::super::super::host::StackHost;
 use super::super::super::{AddonMode, Part, StackError, StackFlow, emit_stack_error};
-use super::super::{Call, First, In, Out, ServiceError, ServiceSpec, Unanswered};
+use super::super::{Call, In, Out, ServiceError, ServiceSpec, Unanswered};
 use super::inbox::{Inbox, feeder};
 use super::link::{Link, Message, Queued, Wire, binary, dial, text};
 use super::lock;
@@ -28,10 +28,13 @@ pub(super) const MAX_BODY_FRAME: usize = 64 * 1024;
 /// answers is bounded here rather than by memory.
 pub(crate) const MAX_HOST_CALLS_WAITING: usize = 64;
 
-/// The service's answers to an enforce stream, in protocol order.
+/// What an enforce stream's service sends up, each on its own lane: the
+/// request it forwards, if it forwards one, and the response the client
+/// gets, which it owes. Neither waits on the other.
 pub(crate) struct Answers {
-    pub first: oneshot::Receiver<Result<First, Unanswered>>,
-    pub second: oneshot::Receiver<Result<LayerResponse, Unanswered>>,
+    /// `Err` once the stream has ended without a forward.
+    pub forward: oneshot::Receiver<LayerRequest>,
+    pub answer: oneshot::Receiver<Result<LayerResponse, Unanswered>>,
 }
 
 /// One exchange on a connection.
@@ -66,19 +69,13 @@ pub(super) struct StreamState {
 /// Where the stream is in the protocol: what the service still owes roxy
 /// besides the bodies it is sending.
 pub(super) enum Phase {
-    /// Enforce: the request head is on its way, and the service owes its
-    /// first answer (a request to forward or a response).
-    AwaitingFirst {
-        first: oneshot::Sender<Result<First, Unanswered>>,
-        second: oneshot::Sender<Result<LayerResponse, Unanswered>>,
+    /// Enforce: each head the service may still send, taken as it comes.
+    /// A `request` is one forward, which it need not make; a `response`
+    /// is the answer it owes. Neither orders against the other.
+    Enforce {
+        forward: Option<oneshot::Sender<LayerRequest>>,
+        answer: Option<oneshot::Sender<Result<LayerResponse, Unanswered>>>,
     },
-    /// It forwarded: the response head goes when the stack below answers,
-    /// and the service owes its second answer.
-    AwaitingSecond {
-        second: oneshot::Sender<Result<LayerResponse, Unanswered>>,
-    },
-    /// Answered: only the bodies in flight are owed.
-    Answered,
     /// Observe: nothing the service sends is taken, but its last message
     /// ends the stream as an enforce stream's does: its `response_end`,
     /// and the `request_end` of a request it sent.
@@ -111,11 +108,7 @@ struct Ending {
 
 /// The answer the service still owed when the stream ended, to be told
 /// why it will not come.
-enum Pending {
-    First(oneshot::Sender<Result<First, Unanswered>>),
-    Second(oneshot::Sender<Result<LayerResponse, Unanswered>>),
-    None,
-}
+type Pending = Option<oneshot::Sender<Result<LayerResponse, Unanswered>>>;
 
 impl StreamState {
     pub(super) fn new(phase: Phase, slot: Option<Reservation>) -> Self {
@@ -138,12 +131,13 @@ impl StreamState {
         matches!(self.phase, Phase::Ended { .. })
     }
 
-    /// The service still owes something: an answer, or the end of a body
+    /// The service still owes something: its answer, or the end of a body
     /// it is sending.
     fn waiting(&self) -> bool {
         match &self.phase {
-            Phase::Answered => {
-                self.req.inbox.is_some()
+            Phase::Enforce { answer, .. } => {
+                answer.is_some()
+                    || self.req.inbox.is_some()
                     || self.res.inbox.is_some()
                     || self.req.end_owed
                     || self.res.end_owed
@@ -152,9 +146,7 @@ impl StreamState {
                 forwarding,
                 responded,
             } => *forwarding || !*responded,
-            Phase::AwaitingFirst { .. } | Phase::AwaitingSecond { .. } | Phase::Ended { .. } => {
-                true
-            }
+            Phase::Ended { .. } => true,
         }
     }
 
@@ -171,8 +163,8 @@ impl StreamState {
         };
         match m {
             In::Request { .. } => *forwarding = true,
-            In::RequestEnd => *forwarding = false,
-            In::ResponseEnd => *responded = true,
+            In::RequestEnd { .. } => *forwarding = false,
+            In::ResponseEnd { .. } => *responded = true,
             In::Response { .. } | In::Credit { .. } | In::Reset { .. } | In::Call(_) => {}
         }
     }
@@ -182,9 +174,10 @@ impl StreamState {
     fn end(&mut self, observe_error: Option<ServiceError>) -> Option<Ending> {
         let ended = Phase::Ended { observe_error };
         let pending = match std::mem::replace(&mut self.phase, ended) {
-            Phase::AwaitingFirst { first, .. } => Pending::First(first),
-            Phase::AwaitingSecond { second } => Pending::Second(second),
-            Phase::Answered | Phase::Observing { .. } => Pending::None,
+            // The forward, if none came, is dropped: the exchange learns
+            // there is none.
+            Phase::Enforce { answer, .. } => answer,
+            Phase::Observing { .. } => None,
             Phase::Ended { observe_error } => {
                 self.phase = Phase::Ended { observe_error };
                 return None;
@@ -197,43 +190,42 @@ impl StreamState {
         })
     }
 
-    /// The service's first answer is a request to forward: it now owes the
-    /// second.
-    fn forwarded(&mut self) -> Result<oneshot::Sender<Result<First, Unanswered>>, ServiceError> {
-        match std::mem::replace(&mut self.phase, Phase::Answered) {
-            Phase::AwaitingFirst { first, second } => {
-                self.phase = Phase::AwaitingSecond { second };
-                Ok(first)
-            }
-            other @ (Phase::AwaitingSecond { .. }
-            | Phase::Answered
-            | Phase::Observing { .. }
-            | Phase::Ended { .. }) => {
-                self.phase = other;
+    /// The service forwards a request: once per stream.
+    fn forwarded(&mut self) -> Result<oneshot::Sender<LayerRequest>, ServiceError> {
+        match &mut self.phase {
+            Phase::Enforce { forward, .. } => forward
+                .take()
+                .ok_or_else(|| ServiceError::Protocol("a second request".into())),
+            Phase::Observing { .. } | Phase::Ended { .. } => {
                 Err(ServiceError::Protocol("unexpected request".into()))
             }
         }
     }
 
-    /// Hands a response to whoever is waiting: the first answer (the
-    /// service answers instead of forwarding, so no second follows), or
-    /// the second.
-    fn answered(&mut self, r: LayerResponse, what: &str) -> Result<(), ServiceError> {
-        match std::mem::replace(&mut self.phase, Phase::Answered) {
-            Phase::AwaitingFirst { first, .. } => {
-                let _ = first.send(Ok(First::Answer(r)));
-                Ok(())
-            }
-            Phase::AwaitingSecond { second } => {
-                let _ = second.send(Ok(r));
-                Ok(())
-            }
-            other @ (Phase::Answered | Phase::Observing { .. } | Phase::Ended { .. }) => {
-                self.phase = other;
-                Err(ServiceError::Protocol(format!("unexpected {what}")))
+    /// The service answers: once per stream, whether or not it forwarded,
+    /// before or after.
+    fn answered(&mut self, r: LayerResponse) -> Result<(), ServiceError> {
+        match &mut self.phase {
+            Phase::Enforce { answer, .. } => match answer.take() {
+                Some(tx) => {
+                    let _ = tx.send(Ok(r));
+                    Ok(())
+                }
+                None => Err(ServiceError::Protocol("a second response".into())),
+            },
+            Phase::Observing { .. } | Phase::Ended { .. } => {
+                Err(ServiceError::Protocol("unexpected response".into()))
             }
         }
     }
+}
+
+/// Why a body stopped short of its end on its way to the service.
+pub(super) enum Lost {
+    /// The stream ended under it; whatever ended it has settled.
+    Stream,
+    /// The body itself failed.
+    Body(BodyError),
 }
 
 /// How a stream ends.
@@ -249,9 +241,6 @@ pub(super) enum End<'a> {
     /// service is told, whoever is waiting gets `why`, and nothing is
     /// logged as the service's fault.
     Abandoned(&'a str),
-    /// The body roxy was sending in direction `dir` failed: abandoned, and
-    /// whoever is waiting learns which body failed and how.
-    BodyFailed(Dir, BodyError),
 }
 
 /// Whether failing a stream tells the service (a `reset` message).
@@ -275,7 +264,7 @@ impl Stream {
     pub(super) fn settle(&self, end: End<'_>) -> bool {
         let observe_error = match &end {
             End::Failed { e, .. } if self.mode == AddonMode::Observe => Some(e.clone()),
-            End::Quiet | End::Failed { .. } | End::Abandoned(_) | End::BodyFailed(..) => None,
+            End::Quiet | End::Failed { .. } | End::Abandoned(_) => None,
         };
         let Some(mut ending) = lock(&self.state).end(observe_error) else {
             return false;
@@ -298,10 +287,6 @@ impl Stream {
                 )
             }
             End::Abandoned(why) => (Unanswered::Abandoned(why.to_owned()), Some(why.to_owned())),
-            End::BodyFailed(dir, e) => {
-                let message = format!("the {} body failed", dir.as_str());
-                (Unanswered::Body(dir, e), Some(message))
-            }
         };
         if let Some(message) = reset
             && self.wire.reset()
@@ -319,14 +304,8 @@ impl Stream {
         for inbox in ending.inboxes.into_iter().flatten() {
             inbox.abort(&e);
         }
-        match ending.pending {
-            Pending::First(tx) => {
-                let _ = tx.send(Err(e));
-            }
-            Pending::Second(tx) => {
-                let _ = tx.send(Err(e));
-            }
-            Pending::None => {}
+        if let Some(tx) = ending.pending {
+            let _ = tx.send(Err(e));
         }
         true
     }
@@ -354,10 +333,7 @@ impl Stream {
         }
         match &mut lock(&self.state).phase {
             Phase::Ended { observe_error } => observe_error.take().map_or(Ok(()), Err),
-            Phase::AwaitingFirst { .. }
-            | Phase::AwaitingSecond { .. }
-            | Phase::Answered
-            | Phase::Observing { .. } => Ok(()),
+            Phase::Enforce { .. } | Phase::Observing { .. } => Ok(()),
         }
     }
 
@@ -423,35 +399,39 @@ impl Stream {
     }
 
     /// Streams one message to the service: head, body frames (as credit
-    /// allows), end. Stops at the stream's end, which whatever failed it
-    /// has settled.
+    /// allows), end. A body that fails ends its lane with the failure,
+    /// never as complete; the stream, and the service's own lanes, go on.
+    /// Stops at the stream's end, which whatever ended it has settled.
     pub(crate) async fn pump(&self, dir: Dir, head: Out, body: Body) {
         if !self.send(&head).await {
             return;
         }
         // Nothing to read (and an empty observer copy may never be ended).
-        if body.known_length() != Some(0) && !self.pump_body(dir, body).await {
-            return;
-        }
+        let error = if body.known_length() == Some(0) {
+            None
+        } else {
+            match self.pump_body(dir, body).await {
+                Ok(()) => None,
+                Err(Lost::Stream) => return,
+                Err(Lost::Body(e)) => Some(e.to_string()),
+            }
+        };
         let end = match dir {
-            Dir::Request => Out::RequestEnd,
-            Dir::Response => Out::ResponseEnd,
+            Dir::Request => Out::RequestEnd { error },
+            Dir::Response => Out::ResponseEnd { error },
         };
         self.send(&end).await;
     }
 
-    pub(super) async fn pump_body(&self, dir: Dir, mut body: Body) -> bool {
+    /// Sends `body`'s frames in direction `dir`, as credit allows.
+    pub(super) async fn pump_body(&self, dir: Dir, mut body: Body) -> Result<(), Lost> {
         use http_body::Body as _;
         loop {
             let frame =
                 std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
             let mut d = match frame {
-                None => return true,
-                // A body that fails is not forwarded as complete.
-                Some(Err(e)) => {
-                    self.settle(End::BodyFailed(dir, e));
-                    return false;
-                }
+                None => return Ok(()),
+                Some(Err(e)) => return Err(Lost::Body(e)),
                 Some(Ok(f)) => match f.into_data() {
                     Ok(d) => d,
                     Err(_) => continue,
@@ -459,11 +439,11 @@ impl Stream {
             };
             while !d.is_empty() {
                 let Some(n) = self.take_credit(dir, d.len().min(MAX_BODY_FRAME)).await else {
-                    return false;
+                    return Err(Lost::Stream);
                 };
                 let part = d.split_to(n);
                 if !self.queue(binary(self.id, dir, &part), false).await {
-                    return false;
+                    return Err(Lost::Stream);
                 }
             }
         }
@@ -562,7 +542,10 @@ impl Stream {
                 self.fail(ServiceError::Closed(why), Reset::Skip);
                 return;
             }
-            In::Request { .. } | In::RequestEnd | In::Response { .. } | In::ResponseEnd => {}
+            In::Request { .. }
+            | In::RequestEnd { .. }
+            | In::Response { .. }
+            | In::ResponseEnd { .. } => {}
         }
         let mut s = lock(&self.state);
         let result = match self.mode {
@@ -588,26 +571,8 @@ impl Stream {
     fn answer(self: &Arc<Self>, s: &mut StreamState, m: In) -> Result<(), ServiceError> {
         let limits = &self.st.snap.limits;
         match m {
-            In::RequestEnd | In::ResponseEnd => {
-                let (dir, what) = if matches!(m, In::RequestEnd) {
-                    (Dir::Request, "request_end")
-                } else {
-                    (Dir::Response, "response_end")
-                };
-                let lane = s.lane(dir);
-                match lane.inbox.take() {
-                    Some(inbox) => {
-                        lock(&inbox.q).end = true;
-                        inbox.ready.notify_one();
-                        Ok(())
-                    }
-                    None if lane.end_owed => {
-                        lane.end_owed = false;
-                        Ok(())
-                    }
-                    None => Err(ServiceError::Protocol(format!("unexpected {what}"))),
-                }
-            }
+            In::RequestEnd { error } => Self::lane_end(s, Dir::Request, error),
+            In::ResponseEnd { error } => Self::lane_end(s, Dir::Response, error),
             In::Request {
                 method,
                 url,
@@ -622,7 +587,7 @@ impl Stream {
                     .map_err(|_| ServiceError::Protocol(format!("invalid url {url:?}")))?;
                 let headers = super::super::header_map(&headers, limits.max_headers)?;
                 let declared = super::super::declared_length(&headers)?;
-                let first = s.forwarded()?;
+                let forward = s.forwarded()?;
                 // On an upgrade the forwarded body is the client's side of
                 // the WebSocket, for as long as it is open: no cap.
                 let cap = if self.st.is_upgrade() {
@@ -636,7 +601,7 @@ impl Stream {
                 *r.uri_mut() = uri;
                 *r.headers_mut() = headers;
                 self.expect_body(s, Dir::Request, body_tx);
-                let _ = first.send(Ok(First::Forward(r)));
+                let _ = forward.send(r);
                 Ok(())
             }
             In::Response { status, headers } => {
@@ -661,12 +626,39 @@ impl Stream {
                 let mut r = http::Response::new(body);
                 *r.status_mut() = status;
                 *r.headers_mut() = headers;
-                s.answered(r, "response")?;
+                s.answered(r)?;
                 self.expect_body(s, Dir::Response, body_tx);
                 Ok(())
             }
             // Handled by `control`.
             In::Credit { .. } | In::Reset { .. } | In::Call(_) => Ok(()),
+        }
+    }
+
+    /// The service ended the `dir` lane it was sending. With `error` the
+    /// body is cut where it is, never complete: the service did not finish
+    /// this lane.
+    fn lane_end(s: &mut StreamState, dir: Dir, error: Option<String>) -> Result<(), ServiceError> {
+        let lane = s.lane(dir);
+        match lane.inbox.take() {
+            Some(inbox) => {
+                let mut q = lock(&inbox.q);
+                match error {
+                    Some(why) => q.abort = Some(why),
+                    None => q.end = true,
+                }
+                drop(q);
+                inbox.ready.notify_one();
+                Ok(())
+            }
+            None if lane.end_owed => {
+                lane.end_owed = false;
+                Ok(())
+            }
+            None => Err(ServiceError::Protocol(format!(
+                "unexpected {}_end",
+                dir.as_str()
+            ))),
         }
     }
 
@@ -855,16 +847,16 @@ pub(crate) async fn open(
             },
         ),
         AddonMode::Enforce => {
-            let (first_tx, first_rx) = oneshot::channel();
-            let (second_tx, second_rx) = oneshot::channel();
+            let (forward_tx, forward_rx) = oneshot::channel();
+            let (answer_tx, answer_rx) = oneshot::channel();
             (
                 Some(Answers {
-                    first: first_rx,
-                    second: second_rx,
+                    forward: forward_rx,
+                    answer: answer_rx,
                 }),
-                Phase::AwaitingFirst {
-                    first: first_tx,
-                    second: second_tx,
+                Phase::Enforce {
+                    forward: Some(forward_tx),
+                    answer: Some(answer_tx),
                 },
             )
         }
@@ -936,64 +928,59 @@ mod tests {
     use super::*;
 
     type Receivers = (
-        oneshot::Receiver<Result<First, Unanswered>>,
+        oneshot::Receiver<LayerRequest>,
         oneshot::Receiver<Result<LayerResponse, Unanswered>>,
     );
 
     /// An enforce stream's state as opened, with the exchange's ends of
-    /// its answers.
+    /// its lanes.
     fn enforce() -> (StreamState, Receivers) {
-        let (first_tx, first) = oneshot::channel();
-        let (second_tx, second) = oneshot::channel();
-        let phase = Phase::AwaitingFirst {
-            first: first_tx,
-            second: second_tx,
+        let (forward_tx, forward) = oneshot::channel();
+        let (answer_tx, answer) = oneshot::channel();
+        let phase = Phase::Enforce {
+            forward: Some(forward_tx),
+            answer: Some(answer_tx),
         };
-        (StreamState::new(phase, None), (first, second))
+        (StreamState::new(phase, None), (forward, answer))
     }
 
     fn response() -> LayerResponse {
         http::Response::new(Body::empty())
     }
 
-    /// Ending a stream tells the answer the service owed at that point,
-    /// and nothing when it owed none; a second end is a no-op.
+    fn request() -> LayerRequest {
+        http::Request::new(Body::empty())
+    }
+
+    /// Ending a stream tells the answer the service still owed, and drops
+    /// the forward it never made; a stream that has answered owes nothing,
+    /// whether or not it forwarded. A second end is a no-op.
     #[test]
-    fn the_pending_answer_follows_the_phase() {
-        let (mut s, _answers) = enforce();
+    fn the_owed_answer_is_told_at_the_end() {
+        let (mut s, (forward, mut answer)) = enforce();
         assert!(s.waiting());
-        assert!(matches!(
-            s.end(None),
-            Some(Ending {
-                pending: Pending::First(_),
-                ..
-            })
-        ));
+        let ending = s.end(None).expect("ends once");
+        assert!(ending.pending.is_some(), "the answer was owed");
+        assert!(forward.blocking_recv().is_err(), "no forward came");
+        assert!(answer.try_recv().is_err(), "nothing sent yet");
         assert!(s.ended());
         assert!(s.end(None).is_none());
 
-        let (mut s, _answers) = enforce();
+        let (mut s, _rx) = enforce();
         s.forwarded().unwrap();
-        assert!(s.waiting());
-        assert!(matches!(
-            s.end(None),
-            Some(Ending {
-                pending: Pending::Second(_),
-                ..
-            })
-        ));
+        assert!(s.waiting(), "the answer is still owed");
+        assert!(s.end(None).expect("ends").pending.is_some());
 
-        let (mut s, _answers) = enforce();
+        let (mut s, _rx) = enforce();
         s.forwarded().unwrap();
-        s.answered(response(), "response").unwrap();
+        s.answered(response()).unwrap();
         assert!(!s.waiting());
-        assert!(matches!(
-            s.end(None),
-            Some(Ending {
-                pending: Pending::None,
-                ..
-            })
-        ));
+        assert!(s.end(None).expect("ends").pending.is_none());
+
+        let (mut s, _rx) = enforce();
+        s.answered(response()).unwrap();
+        assert!(!s.waiting(), "an answer without a forward owes nothing");
+        assert!(s.end(None).expect("ends").pending.is_none());
     }
 
     /// An observe stream owes no answer, but ends only on the service's
@@ -1017,15 +1004,9 @@ mod tests {
             headers: Vec::new(),
         });
         assert!(s.waiting(), "a head is not the end");
-        s.observed(&In::ResponseEnd);
+        s.observed(&In::ResponseEnd { error: None });
         assert!(!s.waiting());
-        assert!(matches!(
-            s.end(None),
-            Some(Ending {
-                pending: Pending::None,
-                ..
-            })
-        ));
+        assert!(s.end(None).expect("ends").pending.is_none());
 
         let mut s = observing();
         s.observed(&In::Request {
@@ -1033,30 +1014,33 @@ mod tests {
             url: "http://up.test/".to_owned(),
             headers: Vec::new(),
         });
-        s.observed(&In::ResponseEnd);
+        s.observed(&In::ResponseEnd { error: None });
         assert!(s.waiting(), "the end of the request it sent is owed");
-        s.observed(&In::RequestEnd);
+        s.observed(&In::RequestEnd { error: None });
         assert!(!s.waiting());
     }
 
-    /// A request may only come as the first answer, and a response
-    /// only as an answer that is owed: the second is not once the first
-    /// answered instead of forwarding.
+    /// Each head comes once, in either order: a forward before or after
+    /// the answer, or none at all. A second of either, or a head on an
+    /// ended stream, is a protocol error.
     #[test]
-    fn heads_out_of_order_are_protocol_errors() {
-        let (mut s, _answers) = enforce();
+    fn each_head_comes_once_in_either_order() {
+        let (mut s, (forward, mut answer)) = enforce();
+        s.answered(response()).unwrap();
+        assert!(matches!(answer.try_recv(), Ok(Ok(_))));
+        s.forwarded().unwrap().send(request()).ok().unwrap();
+        assert!(
+            forward.blocking_recv().is_ok(),
+            "a forward after the answer"
+        );
+        assert!(s.forwarded().is_err(), "a second request");
+        assert!(s.answered(response()).is_err(), "a second response");
+
+        let (mut s, _rx) = enforce();
         s.forwarded().unwrap();
         assert!(s.forwarded().is_err(), "a second request");
-        s.answered(response(), "response").unwrap();
-        assert!(s.answered(response(), "response").is_err(), "a third head");
-        assert!(s.forwarded().is_err());
-
-        let (mut s, (first, mut second)) = enforce();
-        s.answered(response(), "response").unwrap();
-        assert!(matches!(first.blocking_recv(), Ok(Ok(First::Answer(_)))));
-        assert!(second.try_recv().is_err(), "no second answer follows");
-        assert!(s.answered(response(), "response").is_err());
-        assert!(!s.waiting());
+        s.answered(response()).unwrap();
+        assert!(s.answered(response()).is_err(), "a second response");
 
         let mut ended = StreamState::new(
             Phase::Ended {
@@ -1065,7 +1049,7 @@ mod tests {
             None,
         );
         assert!(ended.forwarded().is_err());
-        assert!(ended.answered(response(), "response").is_err());
+        assert!(ended.answered(response()).is_err());
         assert!(ended.ended());
     }
 }

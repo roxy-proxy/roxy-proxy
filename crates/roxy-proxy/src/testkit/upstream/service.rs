@@ -19,6 +19,9 @@
 //! * `/svc/abort`: resets each stream on its request head;
 //! * `/svc/patient`: a pass-through that holds the request head and body
 //!   until the `request_end`, then forwards them together;
+//! * `/svc/early`: forwards the request as `/svc/pass` does, and answers
+//!   the client (`200`, body `early`) as soon as it has the request head,
+//!   reading the response from below without passing it on;
 //! * `/svc/shout`: a pass-through that uppercases ASCII letters in the
 //!   response body bytes;
 //! * `/svc/sever`: a pass-through that resets the stream on the first
@@ -33,7 +36,15 @@
 //!   reads and credits everything without answering;
 //! * `/svc/slow`: a pass-through that reads nothing more for [`SLOW`]
 //!   after each `request` head it gets, so it answers [`SLOW`] late;
-//! * `/svc/stall`: completes the handshake and never reads.
+//! * `/svc/stall`: completes the handshake and never reads;
+//! * `/svc/host`: calls every host service as each stream opens, then
+//!   passes through once all are answered;
+//! * `/svc/quarantine`: calls `quarantine` as each stream opens, then
+//!   passes through once it is answered;
+//! * `/svc/late-quarantine`: passes the request through, calls
+//!   `quarantine` on the response head and passes it on once answered;
+//! * `/svc/audit`: a pass-through that calls `record` on roxy's
+//!   `response_end` and sends its own only once the record is answered.
 //!
 //! Every other connection credits roxy back for the bytes it receives.
 
@@ -292,6 +303,11 @@ enum Mode {
     Refuse,
     Abort,
     Patient,
+    /// Answers the client (`200`, body `early`) as soon as roxy's request
+    /// head arrives, then forwards the request as it comes and reads the
+    /// response from below without passing it on: an answer that leaves
+    /// the forward to run to its end.
+    Early,
     /// Calls every host service on `open` (call ids 1 to 6), then passes
     /// through once every call is answered, as a service whose writes
     /// must be visible to the exchange does.
@@ -344,6 +360,8 @@ impl Mode {
             Self::Abort
         } else if path.ends_with("/patient") {
             Self::Patient
+        } else if path.ends_with("/early") {
+            Self::Early
         } else if path.ends_with("/quarantine") {
             Self::Quarantine
         } else if path.ends_with("/late-quarantine") {
@@ -394,7 +412,7 @@ impl Conn {
             | Mode::Quarantine
             | Mode::LateQuarantine
             | Mode::Audit => true,
-            Mode::Hold | Mode::Forward => dir == REQUEST,
+            Mode::Hold | Mode::Forward | Mode::Early => dir == REQUEST,
             Mode::Overlong
             | Mode::Short
             | Mode::Refuse
@@ -445,6 +463,17 @@ impl Conn {
             "request" if self.mode == Mode::Abort => {
                 self.streams.remove(&id);
                 self.send(text(id, json!({"type": "reset", "message": "aborted"})));
+            }
+            "request" if self.mode == Mode::Early => {
+                // The forward goes first: a stream ends on the service's
+                // last message, and an answer with nothing forwarded is it.
+                self.pass_control(id, &kind, v);
+                self.send(text(
+                    id,
+                    json!({"type": "response", "status": 200, "headers": [["content-type", "text/plain"]]}),
+                ));
+                self.send(binary(id, RESPONSE, b"early"));
+                self.send(text(id, json!({"type": "response_end"})));
             }
             "response" if self.mode == Mode::LateQuarantine => {
                 // The head waits behind the call, so roxy sees it only once
@@ -515,6 +544,7 @@ impl Conn {
             | Mode::Shout
             | Mode::Sever
             | Mode::Patient
+            | Mode::Early
             | Mode::LateQuarantine
             | Mode::Audit => {}
             Mode::Host => self.call_host(

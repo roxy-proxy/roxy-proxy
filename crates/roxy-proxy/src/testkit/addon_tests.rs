@@ -2169,6 +2169,27 @@ mod service {
         );
     }
 
+    /// A response body that fails below the service ends the response lane
+    /// with the error and nothing more: the stream is not reset, the
+    /// service passes the cut on, and the client's body is cut as it would
+    /// be without a layer.
+    #[tokio::test]
+    async fn a_body_cut_below_ends_the_lane_and_leaves_the_stream() {
+        let kit = kit(RULES, vec![addon("s", "pass", AddonMode::Enforce, |_| {})]).await;
+        let a = kit.h1().await.call("GET", "/cut", &[], b"").await;
+        assert_eq!(a.status, 200, "{a:?}");
+        assert!(a.body.is_err(), "the cut reaches the client: {a:?}");
+        let svc = kit.upstream.service();
+        let opens = svc.until_opened(1).await;
+        let id = stream_id(&opens[0]);
+        let ended_with_error = svc.controls(id).iter().any(|c| {
+            c["type"] == "response_end" && c["error"].as_str().is_some_and(|e| !e.is_empty())
+        });
+        assert!(ended_with_error, "{:#?}", svc.controls(id));
+        assert!(svc.resets().is_empty(), "{:?}", svc.resets());
+        no_layer_error(&kit);
+    }
+
     /// The service's second deadline runs from roxy's `response` head, not
     /// from the end of the response body: a service that forwards and then
     /// holds the response head fails closed on `first_byte_timeout` while
@@ -3228,4 +3249,54 @@ async fn a_layer_subscribed_to_one_body_is_in_one_direction_of_a_websocket() {
         kit.events("ws_close", 1).await;
         no_layer_error(&kit);
     }
+}
+
+/// A layer below that fails is a response on the lane above it: the same
+/// `503 layer:<name>` the front wrote before, which the layer above passes
+/// on or reshapes. The record keeps the refusal either way: the failure
+/// is logged as the failing layer's, and the decision is the deny, whatever
+/// the client got.
+#[tokio::test]
+async fn a_failure_below_arrives_as_a_response_the_layer_above_may_reshape() {
+    let kit = stack(&named(&["a", "b"])).await;
+    let a = kit
+        .h1()
+        .await
+        .call(
+            "GET",
+            "/x",
+            &[("x-test-a", "pass"), ("x-test-b", "trap")],
+            b"",
+        )
+        .await;
+    assert_eq!(a.status, 503, "{a:?}");
+    assert_eq!(a.headers["x-roxy-rule"], "layer:b");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "deny", "{ev:#}");
+    assert_eq!(ev["terminal_rule"], "layer:b");
+    assert_eq!(ev["reason"], "layer_error");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["layer"], "b", "{errs:#?}");
+    assert_eq!(errs[0]["kind"], "trap");
+
+    let kit = stack(&named(&["a", "b"])).await;
+    let a = kit
+        .h1()
+        .await
+        .call(
+            "GET",
+            "/x",
+            &[
+                ("x-test-a", "pass"),
+                ("x-status", "200"),
+                ("x-test-b", "trap"),
+            ],
+            b"",
+        )
+        .await;
+    assert_eq!(a.status, 200, "a reshaped the refusal: {a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "deny", "{ev:#}");
+    assert_eq!(ev["terminal_rule"], "layer:b");
+    assert_eq!(ev["res"]["status"], 200);
 }

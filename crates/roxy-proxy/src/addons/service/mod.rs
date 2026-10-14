@@ -1,26 +1,27 @@
 //! Service layers: an external service in the network path.
 //!
 //! Each exchange is a stream (`roxy.layer.v5`) on one of a few pooled
-//! WebSocket connections to the layer's named endpoint ([`mux`]). roxy
-//! streams the request into it as it arrives; the service streams back
-//! the request to forward (or answers itself); roxy forwards
-//! that down the stack, streams the response it gets back into the
-//! stream, and the service streams back the response to give the client:
+//! WebSocket connections to the layer's named endpoint ([`mux`]). The
+//! stream carries the exchange's two lanes, each a head, bytes and an
+//! end, each way: roxy streams the request into it as it arrives, and the
+//! response from below once there is one; the service streams back the
+//! request it forwards, if it forwards one, and the response the client
+//! gets, which it owes:
 //!
 //! ```text
 //! roxy → service   open, {"type":"request", method, url, headers}  bytes…  request_end
-//! service → roxy   {"type":"request", …} bytes… request_end    forward this request
-//!                  {"type":"response", status, headers} bytes… response_end
-//!                                                              answer (instead of forwarding)
+//! service → roxy   {"type":"request", …} bytes… request_end          forward this request
 //! roxy → service   {"type":"response", status, headers}  bytes…  response_end
-//! service → roxy   {"type":"response", …} bytes… response_end
+//! service → roxy   {"type":"response", …} bytes… response_end        the client's response
 //! ```
 //!
-//! The request and response bodies are independent: a response head goes
-//! (either way) as soon as there is one, even while the request body is
-//! still streaming. A WebSocket is the same exchange, long-lived: after
-//! the `101` the request body is the client's bytes and the response body
-//! the upstream's, until each side closes.
+//! Nothing orders one lane against the other: the service may answer
+//! before it forwards, while it forwards or without forwarding, and roxy
+//! takes each head as it comes. A body that fails on its way to the
+//! service ends its lane with the error (`"error"` on the end), and the
+//! service's own lanes go on. A WebSocket is the same exchange,
+//! long-lived: after the `101` the request body is the client's bytes and
+//! the response body the upstream's, until each side closes.
 //!
 //! What the service forwards is held to the same checks as a WASM layer's
 //! `next` (re-validated as strictly as a client request, then judged by
@@ -37,11 +38,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::{HeaderMap, HeaderName, HeaderValue};
-use roxy_http::{Body, BodyError};
+use roxy_http::Body;
 use roxy_wasm::{HostError, LayerError, LayerRequest, LayerResponse, LogLevel};
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
+use tokio::sync::{oneshot, watch};
 use tokio::time::Instant as TokioInstant;
 
 use super::tee::CopyCut;
@@ -56,10 +57,11 @@ pub use mux::SUBPROTOCOL;
 pub struct ServiceSpec {
     /// The addon's endpoint the exchange streams through.
     pub endpoint: String,
-    /// Bounds getting a stream, then the service's first head (or
-    /// decision) from sending the request head, and its second from
-    /// sending the response head; on an observe stream, the service's
-    /// end from roxy's last message. Bodies have no clock.
+    /// Bounds getting a stream, then the service's answer: from roxy's
+    /// request head until the service answers or forwards, and again from
+    /// the response head from below until it answers; no clock runs while
+    /// its forward is below. On an observe stream, the service's end from
+    /// roxy's last message. Bodies have no clock.
     pub first_byte_timeout: Duration,
     /// Connections to the endpoint, at most.
     pub max_connections: usize,
@@ -108,9 +110,6 @@ pub(super) enum Unanswered {
     /// roxy gave up on the stream: the service is not at fault.
     #[error("service stream lost: {0}")]
     Abandoned(String),
-    /// The body roxy was streaming to the service failed on its own side.
-    #[error("service stream lost: the {dir} body failed: {e}", dir = .0.as_str(), e = .1)]
-    Body(Dir, BodyError),
 }
 
 impl ServiceError {
@@ -166,7 +165,12 @@ enum Out {
         url: String,
         headers: Vec<(String, String)>,
     },
-    RequestEnd,
+    /// The end of the request lane; `error` when the body failed short of
+    /// it, and is not complete.
+    RequestEnd {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// The answer to a host-service call, by the `id` the service gave it.
     Result {
         id: u64,
@@ -179,7 +183,10 @@ enum Out {
         status: u16,
         headers: Vec<(String, String)>,
     },
-    ResponseEnd,
+    ResponseEnd {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     Credit {
         dir: Dir,
         bytes: u64,
@@ -199,13 +206,21 @@ enum In {
         #[serde(default)]
         headers: Vec<(String, String)>,
     },
-    RequestEnd,
+    /// The end of a lane the service is sending; with `error`, the body
+    /// is cut there rather than complete.
+    RequestEnd {
+        #[serde(default)]
+        error: Option<String>,
+    },
     Response {
         status: u16,
         #[serde(default)]
         headers: Vec<(String, String)>,
     },
-    ResponseEnd,
+    ResponseEnd {
+        #[serde(default)]
+        error: Option<String>,
+    },
     Credit {
         dir: Dir,
         bytes: u64,
@@ -326,12 +341,6 @@ impl From<LogLevelIn> for LogLevel {
             LogLevelIn::Error => LogLevel::Error,
         }
     }
-}
-
-/// The service's first answer: forward a request, or answer the client.
-enum First {
-    Forward(LayerRequest),
-    Answer(LayerResponse),
 }
 
 /// Header values on the wire are bytes, and JSON strings are text: each
@@ -469,74 +478,163 @@ async fn run(
         return Err(ServiceError::Closed("no answers on an enforce stream".into()).into());
     };
     // Until the service has answered, an exchange that ends here (the
-    // client went away, a missed head, a failure below) resets the stream.
+    // client went away, a missed head) resets the stream.
     let guard = Guard(Some(stream.clone()));
 
-    // The service's first clock starts with the request head, however long
+    // The service's clock starts with the request head, however long
     // getting the stream took.
-    let sent = TokioInstant::now();
+    let clock = Clock::new(svc.first_byte_timeout);
     let (parts, body) = req.into_parts();
     let s = stream.clone();
     let head = request_head(&parts, &body);
     tokio::spawn(async move { s.pump(Dir::Request, head, body).await });
+    tokio::spawn(forward(
+        st.clone(),
+        index,
+        stream.clone(),
+        answers.forward,
+        clock.clone(),
+    ));
 
-    let first = answer_by(sent + svc.first_byte_timeout, answers.first)
-        .await?
-        .map_err(unanswered)?;
-    let forward = match first {
-        First::Answer(res) => {
-            guard.disarm();
-            return Ok(res);
-        }
-        First::Forward(r) => r,
-    };
-    let res = super::below(st.clone(), index, forward)
-        .await
-        .map_err(Fail::Below)?;
-    // The response head goes at once, however far the client's upload
-    // has got; the service's second clock starts with it. A `101` goes
-    // the same way: its body is the upstream's side of the WebSocket, and
-    // the request body still streaming is the client's.
-    let sent = TokioInstant::now();
-    let (parts, body) = res.into_parts();
-    let s = stream.clone();
-    let head = response_head(&parts, &body);
-    tokio::spawn(async move { s.pump(Dir::Response, head, body).await });
-    let res = answer_by(sent + svc.first_byte_timeout, answers.second)
-        .await?
-        .map_err(unanswered)?;
+    let res = clock.answer_by(answers.answer).await?.map_err(unanswered)?;
     guard.disarm();
     Ok(res)
 }
 
-/// The exchange's failure when the service's answer will not come. A body
-/// that failed on its way to the service is not its failure: whoever
-/// handed the body to the stack recorded that before the service read it.
+/// The request lane below the service: the request it forwards, if it
+/// forwards one, run through the layers below and the core, and the
+/// response that comes back streamed into the service. Independent of the
+/// service's answer: the forward runs to its end whether the service
+/// answers before, during or after it. The exchange being torn down ends
+/// it; the service's own stream ending does not, the response from below
+/// then has nowhere to go and is dropped as it arrives.
+async fn forward(
+    st: Arc<StackFlow>,
+    index: usize,
+    stream: Arc<mux::Stream>,
+    forward: oneshot::Receiver<LayerRequest>,
+    clock: Clock,
+) {
+    // `Err`: the stream ended without a forward.
+    let Ok(req) = forward.await else {
+        return;
+    };
+    clock.below();
+    let ending = st.ending();
+    let res = tokio::select! {
+        biased;
+        () = ending.cancelled() => Err(()),
+        r = super::below(st.clone(), index, req) => r.map_err(|_| ()),
+    };
+    // Only the client's own failure comes back as an error: the exchange
+    // is closing, and nothing below answers it.
+    let Ok(res) = res else {
+        stream.reset("the exchange ended");
+        return;
+    };
+    // The response head goes at once, however far the client's upload
+    // has got. A `101` goes the same way: its body is the upstream's side
+    // of the WebSocket, and the request body still streaming is the
+    // client's.
+    clock.response_head();
+    let (parts, body) = res.into_parts();
+    let head = response_head(&parts, &body);
+    stream.pump(Dir::Response, head, body).await;
+}
+
+/// The exchange's failure when the service's answer will not come.
 fn unanswered(u: Unanswered) -> Fail {
     match u {
         Unanswered::Service(e) => Fail::Service(e),
         Unanswered::Abandoned(why) => Fail::Below(HostError::new(why)),
-        Unanswered::Body(dir, e) => {
-            Fail::Below(HostError::new(format!("{} body failed: {e}", dir.as_str())))
-        }
     }
 }
 
-/// The service's answer, within `first_byte_timeout`. An answer that lands
-/// as the deadline passes is still an answer: the timeout polls the channel
-/// and then the clock, so it reports elapsed with a value already queued.
-async fn answer_by<T>(
-    deadline: TokioInstant,
-    mut answer: oneshot::Receiver<T>,
-) -> Result<T, ServiceError> {
-    match tokio::time::timeout_at(deadline, &mut answer).await {
-        Ok(Ok(v)) => Ok(v),
-        Ok(Err(_)) => Err(ServiceError::Closed("the stream ended".into())),
-        Err(_) => match answer.try_recv() {
-            Ok(v) => Ok(v),
-            Err(TryRecvError::Closed) => Err(ServiceError::Closed("the stream ended".into())),
-            Err(TryRecvError::Empty) => Err(ServiceError::Timeout("first_byte_timeout")),
-        },
+/// The service's answer clock: `first_byte_timeout` from roxy's request
+/// head, stopped while the service's forward is below, and
+/// `first_byte_timeout` again from the response head from below. The
+/// service's own time, never the time below it.
+#[derive(Clone)]
+struct Clock {
+    limit: Duration,
+    deadline: watch::Sender<Option<TokioInstant>>,
+}
+
+impl Clock {
+    fn new(limit: Duration) -> Self {
+        Self {
+            limit,
+            deadline: watch::Sender::new(Some(TokioInstant::now() + limit)),
+        }
+    }
+
+    /// The service forwarded: no clock runs while the request is below.
+    fn below(&self) {
+        self.deadline.send_replace(None);
+    }
+
+    /// The response from below is on its way to the service: it has the
+    /// whole budget again to answer.
+    fn response_head(&self) {
+        self.deadline
+            .send_replace(Some(TokioInstant::now() + self.limit));
+    }
+
+    /// The service's answer, within the clock. An answer that lands as the
+    /// deadline passes is still an answer: the timeout polls the channel
+    /// and then the clock, so it reports elapsed with a value already
+    /// queued.
+    async fn answer_by<T>(&self, mut answer: oneshot::Receiver<T>) -> Result<T, ServiceError> {
+        let mut deadline = self.deadline.subscribe();
+        loop {
+            let at = *deadline.borrow_and_update();
+            let expiry = async {
+                match at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                biased;
+                r = &mut answer => {
+                    return r.map_err(|_| ServiceError::Closed("the stream ended".into()));
+                }
+                changed = deadline.changed() => {
+                    if changed.is_err() {
+                        // The clock's owner is gone: run out the deadline.
+                        return Self::run_out(at, answer).await;
+                    }
+                }
+                () = expiry => {
+                    return match answer.try_recv() {
+                        Ok(v) => Ok(v),
+                        Err(TryRecvError::Closed) => {
+                            Err(ServiceError::Closed("the stream ended".into()))
+                        }
+                        Err(TryRecvError::Empty) => Err(ServiceError::Timeout("first_byte_timeout")),
+                    };
+                }
+            }
+        }
+    }
+
+    async fn run_out<T>(
+        at: Option<TokioInstant>,
+        mut answer: oneshot::Receiver<T>,
+    ) -> Result<T, ServiceError> {
+        let r = match at {
+            Some(at) => tokio::time::timeout_at(at, &mut answer).await,
+            None => Ok((&mut answer).await),
+        };
+        match r {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(_)) => Err(ServiceError::Closed("the stream ended".into())),
+            Err(_) => match answer.try_recv() {
+                Ok(v) => Ok(v),
+                Err(TryRecvError::Closed) => Err(ServiceError::Closed("the stream ended".into())),
+                Err(TryRecvError::Empty) => Err(ServiceError::Timeout("first_byte_timeout")),
+            },
+        }
     }
 }
 
@@ -683,7 +781,7 @@ mod tests {
         ));
         assert!(matches!(
             parse(json!({"type": "request_end", "id": 1})),
-            Ok(In::RequestEnd)
+            Ok(In::RequestEnd { error: None })
         ));
     }
 
