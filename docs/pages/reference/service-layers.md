@@ -129,14 +129,18 @@ the service passed.
 | `{"type":"state_put","id":n,"key":"…","value":"…","ttl_ms":n?}` | `state`; enforce only | `{"type":"result","id":n,"value":null}`, or `"error"` for a key or value over its cap |
 | `{"type":"metric_get","id":n,"metric":"…"}` | `metrics` | `{"type":"result","id":n,"value":n}` (`null` for a key with no entry) |
 
-A call may be sent at any point while the stream is open. Calls run in
-order, one at a time per stream, beside the bodies: they neither wait for
-nor hold up the heads and bytes, and roxy promises no order between a call
-and the service's later messages. A service that needs a call's effect to
-be visible to this exchange (a `state_put` its rules read, an `add_tag` the
-layers below see) awaits the `result` before sending its `request`. At
-most 64 calls may be waiting, and more is a protocol violation. A call on
-a stream that has ended is dropped and never answered.
+A call may be sent at any point while the stream is open, including
+part-way through a body. Calls run in order, one at a time per stream,
+beside the bodies: they neither wait for nor hold up the heads and bytes,
+and roxy promises no order between a call and the heads or bytes the
+service sends after it. The service orders it: it awaits the `result`
+before sending whatever the effect must precede, be that the request, the
+response or the rest of a body. Today a call's tag or state write is seen
+by this exchange's admission rules only if it lands before the request is
+forwarded, and by later exchanges always; in-flight rules do not yet read
+tag or state values ([#509](https://github.com/roxy-proxy/roxy-proxy/issues/509)).
+At most 64 calls may be waiting, and more is a protocol violation. A call
+on a stream that has ended is dropped and never answered.
 
 A call without its capability, a `log` message or `record` document over
 64 KiB, an `add_tag` or `state_put` from an observer, a full state store or

@@ -386,10 +386,14 @@ class Exchange:
     # roxy, fails the exchange: roxy resets the stream. `add_tag` needs no
     # capability but is refused in observe mode.
     #
+    # A call may be made at any point, including part-way through a body.
     # Calls run beside the bodies, and roxy promises no order between a
-    # call and what the handler sends after it: an effect that must be
-    # visible to this exchange (a `state_put` the rules read, an `add_tag`
-    # the layers below see) is awaited before `forward` or `respond`.
+    # call and the heads or bytes the handler sends after it: the handler
+    # awaits the call before sending whatever its effect must precede
+    # (`forward`, `respond`, or the rest of a body). Today a tag or state
+    # write is seen by this exchange's admission rules only if it lands
+    # before `forward`, and by later exchanges always; in-flight rules do
+    # not yet read tag or state values (#509).
 
     async def log(self, level: str, message: str) -> None:
         """Writes to roxy's operational log (`trace` to `error`)."""
