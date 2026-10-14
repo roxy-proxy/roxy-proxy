@@ -74,7 +74,6 @@ pub(crate) struct Stopped {
 #[derive(Debug, Default)]
 pub(crate) struct Summary {
     pub rules: Vec<RuleId>,
-    pub tags: Vec<String>,
     pub mutations: Vec<String>,
     pub stop: Option<Stopped>,
 }
@@ -162,7 +161,7 @@ impl InFlight {
             inner: Mutex::new(Inner {
                 meta: cx.meta.clone(),
                 facts,
-                st: policy.in_flight_state(&cx.record.tags),
+                st: policy.in_flight_state(),
                 known: Reads::BODY_BYTES,
                 stopped: None,
                 rules: Vec::new(),
@@ -194,13 +193,12 @@ impl InFlight {
         self.stop.clone().cancelled_owned()
     }
 
-    /// Rules, tags and response mutations of the in-flight rules, and the
-    /// stop. Mutations are drained (call once).
+    /// Rules and response mutations of the in-flight rules, and the stop.
+    /// Mutations are drained (call once).
     pub(crate) fn summary(&self) -> Summary {
         let mut g = self.lock();
         Summary {
             rules: g.rules.clone(),
-            tags: g.st.tags.clone(),
             mutations: std::mem::take(&mut g.mutations),
             stop: g.stopped.clone(),
         }
@@ -455,9 +453,11 @@ impl Inner {
             &*shared.state,
             &snap.address_lists,
         );
-        let out = snap
-            .policy
-            .evaluate_in_flight(changed, self.known, &mut self.st, &view);
+        let mut tags = meta.tags_mut();
+        let out =
+            snap.policy
+                .evaluate_in_flight(changed, self.known, &mut self.st, &mut tags, &view);
+        drop(tags);
         let metric_err = view.take_metric_error();
         drop(view);
         let Some(o) = out else {

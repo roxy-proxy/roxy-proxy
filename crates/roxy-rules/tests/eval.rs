@@ -43,8 +43,9 @@ fn flow() -> MapView {
 
 /// One in-flight evaluation with every in-flight value known and changed.
 fn in_flight(p: &Policy, view: &MapView, ctx: &EvalContext<'_>) -> Option<InFlightOutcome> {
-    let mut st = p.in_flight_state(ctx.initial_tags);
-    p.evaluate_in_flight(Reads::ALL, Reads::ALL, &mut st, view)
+    let mut st = p.in_flight_state();
+    let mut tags = ctx.initial_tags.to_vec();
+    p.evaluate_in_flight(Reads::ALL, Reads::ALL, &mut st, &mut tags, view)
 }
 
 /// Does `expr` match `view`? A deny rule reading it is evaluated at

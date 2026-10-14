@@ -173,12 +173,10 @@ impl Policy {
         }
     }
 
-    /// Per-exchange in-flight state, starting from the tags the admission
-    /// decision produced.
-    pub fn in_flight_state(&self, admission_tags: &[String]) -> InFlightState {
+    /// Per-exchange in-flight state.
+    pub fn in_flight_state(&self) -> InFlightState {
         InFlightState {
             fired: vec![false; self.in_flight.len()],
-            tags: admission_tags.to_vec(),
             stopped: false,
         }
     }
@@ -204,6 +202,10 @@ impl Policy {
     /// non-terminal effects apply once, the first time it matches; it is not
     /// checked again after that.
     ///
+    /// `tags` is the flow's tag set, which the caller owns so that whatever
+    /// else tags the flow between two evaluations (an addon, say) is seen by
+    /// the next one: `tag[..]` reads it and a `tag` action adds to it.
+    ///
     /// Returns `None` when nothing matched (no allocation in that case:
     /// the steady-state per-chunk path). `Some` with `stop` set means the
     /// exchange must stop: a matching deny, or any fail-closed input (an
@@ -214,6 +216,7 @@ impl Policy {
         changed: Reads,
         known: Reads,
         st: &mut InFlightState,
+        tags: &mut Vec<String>,
         view: &dyn FlowView,
     ) -> Option<InFlightOutcome> {
         if st.stopped || !self.in_flight_triggers.intersects(changed) {
@@ -232,7 +235,7 @@ impl Policy {
             let pending: &dyn PendingState = out.as_ref().map_or(&(), |o| &o.effects);
             let hit = match &rule.when {
                 None => Ok(true),
-                Some(p) => Scope::new(view, &st.tags, pending).check(p),
+                Some(p) => Scope::new(view, tags, pending).check(p),
             };
             match hit {
                 Ok(true) => {}
@@ -251,8 +254,8 @@ impl Policy {
                 match action {
                     InFlightAction::Effect(e) => o.effects.push(e.clone()),
                     InFlightAction::Tag(t) => {
-                        if !st.tags.contains(t) {
-                            st.tags.push(t.clone());
+                        if !tags.contains(t) {
+                            tags.push(t.clone());
                             o.tags.push(t.clone());
                         }
                     }

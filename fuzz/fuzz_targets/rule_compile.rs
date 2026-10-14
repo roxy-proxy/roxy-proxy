@@ -60,8 +60,9 @@ fuzz_target!(|data: &[u8]| {
             if out.fail_closed_reason.is_some() {
                 assert!(!out.decision.is_allow(), "fail-closed allow: {out:?}");
             }
-            let mut st = policy.in_flight_state(&out.tags);
-            let _ = policy.evaluate_in_flight(Reads::ALL, Reads::ALL, &mut st, view);
+            let mut st = policy.in_flight_state();
+            let mut tags = out.tags;
+            let _ = policy.evaluate_in_flight(Reads::ALL, Reads::ALL, &mut st, &mut tags, view);
         }
     }
 });

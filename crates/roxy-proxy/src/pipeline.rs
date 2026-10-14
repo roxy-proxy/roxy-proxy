@@ -24,7 +24,7 @@ use std::fmt::{self, Write as _};
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use aws_sigv4::http_request::SignableBody;
@@ -389,7 +389,6 @@ pub(crate) struct PerDir<T> {
 #[derive(Debug, Default)]
 pub(crate) struct FlowRecord {
     pub rules: Vec<RuleId>,
-    pub tags: Vec<String>,
     pub mutations: Vec<String>,
     pub terminal_rule: Option<Decider>,
     pub reason: Option<String>,
@@ -411,9 +410,9 @@ pub(crate) struct FlowRecord {
     pub addons: Vec<String>,
 }
 
-/// What identifies a flow and the world it runs in. Shared, read-only,
-/// by everything that logs or evaluates for the flow: the flow context
-/// and the in-flight checker.
+/// What identifies a flow and the world it runs in. Shared by everything
+/// that logs or evaluates for the flow: the flow context, the in-flight
+/// checker and the addon stack.
 pub(crate) struct FlowMeta {
     pub shared: Arc<Shared>,
     pub snap: Arc<Snapshot>,
@@ -427,11 +426,28 @@ pub(crate) struct FlowMeta {
     /// with: loaded on first use (the admission evaluation) and kept for the
     /// exchange's life, however many swaps happen meanwhile.
     secrets: OnceLock<Arc<Secrets>>,
+    /// The flow's tags: the one set the rules' `tag` actions and the
+    /// layers' `add-tag` write to, and `tag[..]`, the layers' `when`,
+    /// `flow.current` and the flow log read. Shared rather than copied
+    /// about so that a tag reaches every reader after the writer, whether
+    /// the writer was a rule or a layer.
+    tags: Mutex<Vec<String>>,
 }
 
 impl FlowMeta {
     pub(crate) fn conn_id(&self) -> String {
         self.client.id.to_string()
+    }
+
+    /// The flow's tags so far.
+    pub(crate) fn tags(&self) -> Vec<String> {
+        self.tags_mut().clone()
+    }
+
+    /// The flow's tags, to read or add to. Hold the guard for no longer
+    /// than one evaluation: a layer's `add-tag` waits on it.
+    pub(crate) fn tags_mut(&self) -> MutexGuard<'_, Vec<String>> {
+        self.tags.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn client_info(&self) -> ClientInfo {
@@ -666,6 +682,7 @@ impl FlowCx {
                 client_ip,
                 tls,
                 secrets: OnceLock::new(),
+                tags: Mutex::new(Vec::new()),
             }),
             facts,
             opts: AllowOpts::default(),
@@ -691,11 +708,13 @@ impl FlowCx {
                 self.record.rules.push(r.clone());
             }
         }
+        let mut tags = self.meta.tags_mut();
         for t in &out.tags {
-            if !self.record.tags.contains(t) {
-                self.record.tags.push(t.clone());
+            if !tags.contains(t) {
+                tags.push(t.clone());
             }
         }
+        drop(tags);
         if !out.terminal_rule.as_str().starts_with('_')
             && !self.record.rules.contains(&out.terminal_rule)
         {
@@ -749,7 +768,7 @@ impl FlowCx {
         let shared = self.shared.clone();
         let generation = self.meta.secrets().clone();
         let secrets = |name: &str| generation.get(name);
-        let tags = self.record.tags.clone();
+        let tags = self.meta.tags();
         let ctx = EvalContext {
             secrets: &secrets,
             initial_tags: &tags,
@@ -857,7 +876,7 @@ impl FlowCx {
             res,
             decision: record.decision.unwrap_or(DecisionKind::Deny),
             rules: Cow::Borrowed(&record.rules),
-            tags: Cow::Borrowed(&record.tags),
+            tags: Cow::Owned(self.meta.tags()),
             mutations: Cow::Borrowed(&record.mutations),
             addons: Cow::Borrowed(&record.addons),
             timing: Timing {
@@ -919,7 +938,7 @@ impl FlowCx {
     }
 
     /// Folds the in-flight checker's outcome (in-flight rules that matched,
-    /// tags, response mutations, a stop) into the flow record. Call once the
+    /// response mutations, a stop) into the flow record. Call once the
     /// exchange is over, before logging it.
     pub(crate) fn absorb_in_flight(&mut self) {
         let Some(w) = self.in_flight.clone() else {
@@ -929,11 +948,6 @@ impl FlowCx {
         for r in summary.rules {
             if !self.record.rules.contains(&r) {
                 self.record.rules.push(r);
-            }
-        }
-        for t in summary.tags {
-            if !self.record.tags.contains(&t) {
-                self.record.tags.push(t);
             }
         }
         self.record.mutations.extend(summary.mutations);

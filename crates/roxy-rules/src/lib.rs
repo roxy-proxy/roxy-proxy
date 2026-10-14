@@ -39,10 +39,11 @@
 //! assert!(out.decision.is_allow());
 //! assert_eq!(out.terminal_rule, "github-reads");
 //! // After forwarding: re-check the in-flight rules as body bytes arrive.
-//! let mut st = policy.in_flight_state(&out.tags);
+//! let mut st = policy.in_flight_state();
+//! let mut tags = out.tags;
 //! let flow = flow.with_int(Field::BodyBytes, 11 << 20);
 //! let w = policy
-//!     .evaluate_in_flight(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &flow)
+//!     .evaluate_in_flight(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &mut tags, &flow)
 //!     .unwrap();
 //! assert!(w.stops());
 //! ```
@@ -136,9 +137,10 @@
 //!   accepted too. Bare `UPPERCASE` identifiers are method literals and only
 //!   valid against `method`.
 //! * **Tags and state.** `tag["t"]` is true if `t` is in
-//!   [`EvalContext::initial_tags`] or a `tag` action of an earlier matching
-//!   rule set it. `state["k"]` sees `set_state` effects of earlier matching
-//!   rules, then [`FlowView::state`]. `metric.<id>` is
+//!   [`EvalContext::initial_tags`] (in flight, the tag set passed to the
+//!   evaluation) or a `tag` action of an earlier matching rule set it.
+//!   `state["k"]` sees `set_state` effects of earlier matching rules, then
+//!   [`FlowView::state`]. `metric.<id>` is
 //!   [`FlowView::metric`], which must return `Some(0)` for a series with no
 //!   data yet; `None` means unavailable.
 //! * **Metrics**. A metric's `where`, `key` and `unique(..)` may

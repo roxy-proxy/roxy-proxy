@@ -90,11 +90,18 @@ fn bench(c: &mut Criterion) {
 
     // The per-chunk path: a request body chunk re-checks the one in-flight
     // rule, which does not match (no allocation).
-    let mut st = p.in_flight_state(&[]);
+    let mut st = p.in_flight_state();
+    let mut tags = Vec::new();
     let chunk = allowed.clone().with_int(Field::BodyBytes, 1 << 20);
     assert!(
-        p.evaluate_in_flight(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &chunk,)
-            .is_none()
+        p.evaluate_in_flight(
+            Reads::BODY_BYTES,
+            Reads::BODY_BYTES,
+            &mut st,
+            &mut tags,
+            &chunk,
+        )
+        .is_none()
     );
     c.bench_function("in_flight_body_chunk_no_match", |b| {
         b.iter(|| {
@@ -102,6 +109,7 @@ fn bench(c: &mut Criterion) {
                 Reads::BODY_BYTES,
                 Reads::BODY_BYTES,
                 &mut st,
+                &mut tags,
                 black_box(&chunk),
             )
         });
@@ -113,6 +121,7 @@ fn bench(c: &mut Criterion) {
                 black_box(Reads::RESPONSE_BODY_BYTES),
                 Reads::ALL,
                 &mut st,
+                &mut tags,
                 &chunk,
             )
         });
