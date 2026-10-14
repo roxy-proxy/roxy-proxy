@@ -2240,7 +2240,7 @@ async fn a_client_giving_up_frees_the_instance() {
 /// `layer_error` kind `no_instance`, rather than queued for as long as the
 /// holder likes. It waits the whole timeout first: an instance freed in
 /// time would have served it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_exchange_without_an_instance_is_denied_within_the_bound() {
     use http_body_util::BodyExt as _;
     const FIRST_BYTE: std::time::Duration = std::time::Duration::from_millis(300);
@@ -2266,10 +2266,7 @@ async fn an_exchange_without_an_instance_is_denied_within_the_bound() {
     .await;
     let a = a.expect("the exchange waited past the bound");
     assert_eq!(a.status, 503, "{a:?}");
-    assert!(
-        took >= FIRST_BYTE,
-        "denied before first_byte_timeout: {took:?}"
-    );
+    assert_eq!(took, FIRST_BYTE, "fails on first_byte_timeout");
     let errs = kit.events("layer_error", 1).await;
     assert_eq!(errs[0]["layer"], "t", "{errs:#?}");
     assert_eq!(errs[0]["kind"], "no_instance");

@@ -233,14 +233,15 @@ async fn exchanges_in_flight_at_the_trip_are_stopped() {
     kit.upstream.wait_seen(1).await;
 
     // The clock starts before the trip, so the span to the cut covers the
-    // whole grace.
+    // whole grace; the WebSocket's part runs alongside, out of that span.
     let before_trip = tokio::time::Instant::now();
     let a = kit.h1().await.call("GET", "/exfil", &[], b"").await;
     assert_eq!(a.status, 403, "{a:?}");
 
-    ws.send(Message::text("late")).await.unwrap();
-    assert_eq!(read_to_close(&mut ws).await, None);
-
+    let late = tokio::spawn(async move {
+        ws.send(Message::text("late")).await.unwrap();
+        read_to_close(&mut ws).await
+    });
     let cut = tokio::time::timeout(crate::server::CUT_GRACE + Duration::from_secs(5), pending)
         .await
         .expect("the upload's connection is cut after the grace")
@@ -250,6 +251,7 @@ async fn exchanges_in_flight_at_the_trip_are_stopped() {
         "cut before the grace: {:?}",
         before_trip.elapsed()
     );
+    assert_eq!(late.await.unwrap(), None);
     assert!(
         cut.is_err() || cut.as_ref().is_ok_and(|a| a.body.is_err()),
         "{cut:?}"
