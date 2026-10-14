@@ -50,12 +50,16 @@ matter of [ordering across layers](/design/addon-model#ordering-across-layers).
 2. **After that, rules run in flight.** For the rest of the exchange, two
    kinds of rule are re-checked whenever a value they read becomes known or
    changes: rules that read an *in-flight* field
-   ([fields](/reference/rule-language#fields)), and `deny` rules that read a
-   byte metric (`count: request_bytes` or `response_bytes`), which this
-   exchange adds to as bytes stream. A deny reading a `requests`, `denied`,
-   `errors` or `unique` metric is decided at admission only: re-checking it
-   after this exchange's own count would deny the 30th request of a `>= 30`
-   limit instead of the 31st. If an in-flight deny matches, roxy stops the
+   ([fields](/reference/rule-language#fields)), and `deny` or `quarantine`
+   rules that read a byte metric (`count: request_bytes` or
+   `response_bytes`), which this exchange adds to as bytes stream. A deny
+   reading a `requests`, `denied`, `errors` or `unique` metric is decided at
+   admission only: re-checking it after this exchange's own count would deny
+   the 30th request of a `>= 30` limit instead of the 31st. `body.bytes` is
+   first checked when the request body's first bytes arrive, so a rule that
+   reads only it never fires for an empty body; `response.body.bytes` is
+   checked at the response head, where it is `0`, and again as the body
+   streams. If an in-flight deny matches, roxy stops the
    exchange: an error response if the response has not started, otherwise
    HTTP/1.1 breaks the connection without finishing the body and HTTP/2
    resets the stream. Nothing overrides a deny.
@@ -88,9 +92,10 @@ matter of [ordering across layers](/design/addon-model#ordering-across-layers).
    the config is rejected, since moving a rule would change what it sees. A
    tag set by an in-flight rule can be read by no other rule: in-flight
    rules fire when the values they read arrive, not in list order, so
-   whether the tag was visible would depend on timing. A deny that reads a
-   byte metric can fire in flight too, so an in-flight rule cannot read its
-   tag; an admission rule below it can. A rule may read its own tag, and a
+   whether the tag was visible would depend on timing. A deny or
+   quarantine that reads a byte metric can fire in flight too, so an
+   in-flight rule cannot read its tag; an admission rule below it can. A
+   rule may read its own tag, and a
    tag no rule sets (from an addon).
 
 `roxy check` and `roxy rule test` report whether each rule is decided at

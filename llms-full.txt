@@ -831,12 +831,12 @@ A top-level `valid_until: <RFC 3339>` makes the loaded policy a lease.
 Until that instant the policy applies as written. From it, every request
 is denied with `terminal_rule: _expired` and reason `policy_expired`,
 before the rules and the addons run, and an open WebSocket relay stops at
-its next message. The check is a wall-clock comparison on each exchange
-against the host's clock, using the loaded policy's instant whichever
-policy the exchange began under: a reload that moves it later keeps open
-relays going, and one that moves it earlier stops them at their next
-message. The first exchange that finds the policy expired logs one
-`policy_expired` event; later ones are ordinary `_expired` denies.
+its next chunk or message. The check is a wall-clock comparison on each
+exchange against the host's clock, using the loaded policy's instant
+whichever policy the exchange began under: a reload that moves it later
+keeps open relays going, and one that moves it earlier stops them at their
+next chunk or message. The first exchange that finds the policy expired
+logs one `policy_expired` event; later ones are ordinary `_expired` denies.
 
 An expired policy is a policy, not a fault. The listeners stay up,
 `/healthz` keeps answering `200` with `x-roxy-policy: expired` (`valid`
@@ -871,23 +871,26 @@ Three things trip it:
   events on the listener within the window, counting every reason except
   timeouts (`header_timeout`, `body_timeout`, `tunnel_timeout`,
   `tls_handshake_timeout`, `h2_handshake_timeout`), a client that left
-  (`unexpected_eof`, `io_error`) and roxy's own failures
-  (`connect_write_failed`, `leaf_mint_failed`, `invalid_state`). Off unless
+  (`unexpected_eof`, `io_error`) or that ended the TLS handshake with an
+  alert of its own (`tls_alert_received`, as a client that does not trust
+  roxy's CA does), and roxy's own failures (`connect_write_failed`,
+  `leaf_mint_failed`, `invalid_state`). Off unless
   set; set it on a sandbox's listener, not a gateway's, where one client
   would shut the proxy for every other.
 
 While quarantined, every request is refused with `403`, `terminal_rule: _quarantined` and reason `quarantined`, before the addons and the rules, and
 before the lease is checked. An open WebSocket relay stops at its next
-message. Connections open at the trip have one second to finish, then they
-are closed, so a stream in flight carries little further; the exchange that
-tripped it uses that second to write its own refusal. The trip is logged
-once as a `quarantined` event with the incident id, when it tripped and why
-([flow log](/reference/flow-log#events)). `/healthz` stays `200` with
-`x-roxy-policy: quarantined`, `roxy health` prints `ok (quarantined)`, and
-`/readyz` answers `503 quarantined`. CA distribution keeps working.
+chunk or message. Connections open at the trip have one second to finish,
+then they are closed, so a stream in flight carries little further; the
+exchange that tripped it uses that second to write its own refusal. The
+trip is logged once as a `quarantined` event with the incident id, when it
+tripped and why ([flow log](/reference/flow-log#events)). `/healthz` stays
+`200` with `x-roxy-policy: quarantined`, `roxy health` prints `ok
+(quarantined)`, and `/readyz` answers `503 quarantined`. CA distribution
+keeps working.
 
-A config that can quarantine (a `quarantine` action, or `quarantine_on` on
-a listener) needs `roxy run --state-dir DIR`: roxy refuses to start, or to
+A config that can quarantine (a `quarantine` action, `quarantine_on` on a
+listener, or an addon holding the `quarantine` capability) needs `roxy run --state-dir DIR`: roxy refuses to start, or to
 reload into such a config, without it. The trip writes `DIR/quarantine`
 (the incident as JSON, mode `0600`), and a start that finds the file starts
 quarantined, logging the `quarantined` event again with `restored: true`.
@@ -1449,12 +1452,16 @@ matter of [ordering across layers](/design/addon-model#ordering-across-layers).
 2. **After that, rules run in flight.** For the rest of the exchange, two
    kinds of rule are re-checked whenever a value they read becomes known or
    changes: rules that read an *in-flight* field
-   ([fields](/reference/rule-language#fields)), and `deny` rules that read a
-   byte metric (`count: request_bytes` or `response_bytes`), which this
-   exchange adds to as bytes stream. A deny reading a `requests`, `denied`,
-   `errors` or `unique` metric is decided at admission only: re-checking it
-   after this exchange's own count would deny the 30th request of a `>= 30`
-   limit instead of the 31st. If an in-flight deny matches, roxy stops the
+   ([fields](/reference/rule-language#fields)), and `deny` or `quarantine`
+   rules that read a byte metric (`count: request_bytes` or
+   `response_bytes`), which this exchange adds to as bytes stream. A deny
+   reading a `requests`, `denied`, `errors` or `unique` metric is decided at
+   admission only: re-checking it after this exchange's own count would deny
+   the 30th request of a `>= 30` limit instead of the 31st. `body.bytes` is
+   first checked when the request body's first bytes arrive, so a rule that
+   reads only it never fires for an empty body; `response.body.bytes` is
+   checked at the response head, where it is `0`, and again as the body
+   streams. If an in-flight deny matches, roxy stops the
    exchange: an error response if the response has not started, otherwise
    HTTP/1.1 breaks the connection without finishing the body and HTTP/2
    resets the stream. Nothing overrides a deny.
@@ -1487,9 +1494,10 @@ matter of [ordering across layers](/design/addon-model#ordering-across-layers).
    the config is rejected, since moving a rule would change what it sees. A
    tag set by an in-flight rule can be read by no other rule: in-flight
    rules fire when the values they read arrive, not in list order, so
-   whether the tag was visible would depend on timing. A deny that reads a
-   byte metric can fire in flight too, so an in-flight rule cannot read its
-   tag; an admission rule below it can. A rule may read its own tag, and a
+   whether the tag was visible would depend on timing. A deny or
+   quarantine that reads a byte metric can fire in flight too, so an
+   in-flight rule cannot read its tag; an admission rule below it can. A
+   rule may read its own tag, and a
    tag no rule sets (from an addon).
 
 `roxy check` and `roxy rule test` report whether each rule is decided at
@@ -1898,7 +1906,7 @@ request is forwarded; a rule reading one is re-checked in flight
 | `header["name"]`, `header.all["name"]` | string, list | admission |
 | `body.size` | int: declared length, `null` if undeclared (chunked) | admission |
 | `body.text` | string: the buffered body, up to the cap | admission |
-| `metric.<id>` | int | admission; a `deny` reading a byte metric is also re-checked in flight ([rate limits](/reference/rate-limits#metrics)) |
+| `metric.<id>` | int | admission; a `deny` or `quarantine` reading a byte metric is also re-checked in flight ([rate limits](/reference/rate-limits#metrics)) |
 | `state["key"]`, `tag["name"]` | string, bool | admission |
 | `body.bytes` | int: request body bytes so far | in-flight |
 | `response.status`, `response.header["name"]`, `response.header.all["name"]` | int, string, list | in-flight |
@@ -2163,10 +2171,10 @@ metrics:
 * **When counts move.** `requests` and `denied` are read before the
   forwarding decision and incremented after it (denied flows count), so
   `metric.x >= 30` denies the 31st request. `request_bytes` and
-  `response_bytes` grow as bytes stream: a deny reading them is re-checked
-  in flight and stops the exchange that crosses the limit; a chunk is
-  counted before it is checked, so a budget overcounts by at most one
-  chunk. `errors` count when the exchange ends.
+  `response_bytes` grow as bytes stream: a deny or quarantine reading them
+  is re-checked in flight and stops the exchange that crosses the limit; a
+  chunk is counted before it is checked, so a budget overcounts by at most
+  one chunk. `errors` count when the exchange ends.
 * **Bounds** ([never evict](/design/threat-model#never-evict)):
   `limits.max_metric_keys` (100 000) series across all metrics; each
   metric's `max_keys` (at most the shared limit, its default); and,
@@ -3865,7 +3873,7 @@ produces a `request` event:
 
 | field | meaning |
 |---|---|
-| `client.ip`, `client.peer` | the client as the rules see it, and the TCP peer (`ip`, `port`) the request arrived from. They differ only on a listener with `forwarded_for`, where `client.ip` is read from `X-Forwarded-For` ([HTTP](/reference/http#clients-behind-a-load-balancer)); an event with no request behind it (`parse_error`, `connect`, `connection_refused`) has the peer as `client.ip` |
+| `client.ip`, `client.peer` | the client as the rules see it, and the TCP peer (`ip`, `port`) the request arrived from. They differ only on a listener with `forwarded_for`, where `client.ip` is read from `X-Forwarded-For` ([HTTP](/reference/http#clients-behind-a-load-balancer)); an event with no request behind it (`connect`, `connection_refused`, and a `parse_error` with no `flow`) has the peer as `client.ip`; a `parse_error` with a `flow` carries the same `client` as that flow's `request` event |
 | `req.body_bytes`, `res.body_bytes` | body bytes roxy forwarded in each direction |
 | `req.body_sha256`, `res.body_sha256` | lower-case hex SHA-256 of those bytes, only for the sides an admission rule's `digest` action selected ([actions](/reference/rule-language#actions)); present once the body completed, absent if the exchange ended first (a cut body, an in-flight stop, a client that left). An empty body has the empty-string digest; a relayed WebSocket has counts but no digests. Hashing is opt-in because a digest nobody compares against is wasted work: software SHA-256 costs about one core per 400 MB/s on CPUs without SHA-NI |
 | `timing.upstream_connect_ms` | how long opening the upstream connection took (DNS, TCP and TLS); `null` when the request reused a pooled connection, or none was opened |
@@ -3879,7 +3887,7 @@ produces a `request` event:
 
 | `terminal_rule` | `reason` |
 |---|---|
-| `_fail_closed` | `metric_unavailable`, `metric_key_unavailable`, `metric_table_full`, `address_list_unavailable`, `secret_missing`, `secret_invalid`, `body_too_large_to_inspect`, `body_unavailable`, `buffer_budget_exhausted`, `unsupported_content_encoding`, `body_decode_failed`, `missing_value`, `wrong_type`, `effect_invalid`, `unsupported_effect`, `state_unavailable`, `capture_unavailable`, `sign_conflict`, `watch_missing`, `watch_stopped` |
+| `_fail_closed` | `metric_unavailable`, `metric_key_unavailable`, `metric_table_full`, `address_list_unavailable`, `secret_missing`, `secret_invalid`, `body_too_large_to_inspect`, `body_unavailable`, `buffer_budget_exhausted`, `unsupported_content_encoding`, `body_decode_failed`, `missing_value`, `wrong_type`, `effect_invalid`, `unsupported_effect`, `state_unavailable`, `capture_unavailable`, `sign_conflict`, `in_flight_missing`, `in_flight_stopped` |
 | `_address_policy` | `address_policy` |
 | `_expired` | `policy_expired` ([lease](/guides/operations#lease)) |
 | `_quarantined` | `quarantined` ([quarantine](/guides/operations#quarantine)) |
