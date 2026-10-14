@@ -58,7 +58,8 @@ pub struct ServiceSpec {
     pub endpoint: String,
     /// Bounds getting a stream, then the service's first head (or
     /// decision) from sending the request head, and its second from
-    /// sending the response head. Bodies have no clock.
+    /// sending the response head; on an observe stream, the service's
+    /// end from roxy's last message. Bodies have no clock.
     pub first_byte_timeout: Duration,
     /// Connections to the endpoint, at most.
     pub max_connections: usize,
