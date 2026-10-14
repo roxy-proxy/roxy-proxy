@@ -1523,11 +1523,11 @@ mod service {
         assert_eq!(kit.upstream.service().resets(), []);
     }
 
-    /// Getting a stream and the service's first answer each have their own
+    /// Getting a stream and the service's answer each have their own
     /// `first_byte_timeout`: an exchange that waited for the only stream
     /// still has all of it for the answer.
     #[tokio::test]
-    async fn waiting_for_a_stream_does_not_shorten_the_first_answer() {
+    async fn waiting_for_a_stream_does_not_shorten_the_answer() {
         let kit = kit(
             RULES,
             vec![addon("s", "slow", AddonMode::Enforce, |s| {
@@ -2167,6 +2167,28 @@ mod service {
             "the upgrade never reached the upstream: {:#?}",
             kit.upstream.seen()
         );
+    }
+
+    /// A service that ends its forwarded request with an error has cut its
+    /// own forward: the cut is its fault, the refusal that earns comes back
+    /// on its response lane, and the client gets it unless the service
+    /// reshapes it.
+    #[tokio::test]
+    async fn a_service_cutting_its_forward_is_refused_as_its_own_failure() {
+        let kit = kit(
+            RULES,
+            vec![addon("s", "cut-forward", AddonMode::Enforce, |_| {})],
+        )
+        .await;
+        let a = kit.h1().await.call("POST", "/x", &[], b"body").await;
+        assert_eq!(a.status, 503, "{a:?}");
+        assert_eq!(a.headers["x-roxy-rule"], "layer:s");
+        let ev = kit.request_event().await;
+        assert_eq!(ev["decision"], "deny", "{ev:#}");
+        assert_eq!(ev["terminal_rule"], "layer:s");
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["kind"], "service:cut", "{errs:#?}");
+        assert!(kit.upstream.seen().is_empty(), "nothing complete left");
     }
 
     /// A response body that fails below the service ends the response lane

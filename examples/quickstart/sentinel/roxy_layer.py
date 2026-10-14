@@ -463,14 +463,20 @@ class Exchange:
         await self._s.send(msg)
 
     async def _send_body(self, direction: int, body: Body) -> None:
+        end: dict[str, Any] = {"type": f"{_DIR_NAMES[direction]}_end"}
         if isinstance(body, bytes):
             if body:
                 await self._s.send_bytes(direction, body)
         else:
-            async for chunk in body:
-                if chunk:
-                    await self._s.send_bytes(direction, chunk)
-        await self._s.send({"type": f"{_DIR_NAMES[direction]}_end"}, end=direction)
+            try:
+                async for chunk in body:
+                    if chunk:
+                        await self._s.send_bytes(direction, chunk)
+            except BodyFailed as e:
+                # A body that failed on its way in is passed on cut, where
+                # it stopped, never as complete.
+                end["error"] = str(e)
+        await self._s.send(end, end=direction)
 
     async def _finish_forwarding(self) -> None:
         if self._forwarding is not None:
@@ -497,6 +503,11 @@ class Exchange:
         roxy re-validates the request and its rules judge it; a refusal
         comes back as a response like any other. Read the response body
         with `response_body()`."""
+        if self._s.ended:
+            # The stream ended on this side's last message: a response
+            # already complete with nothing forwarded. roxy takes nothing
+            # more from it, so forward before the response ends.
+            raise ProtocolError("the stream has ended: forward before the response ends")
         self._s.forwarded = True
         await self._send(
             {
@@ -546,7 +557,11 @@ class Exchange:
         """Give the client `response`, whether or not the exchange has been
         forwarded, before or after: the client's response is its own lane.
         An early answer leaves a forward to run to its end; a handler that
-        wants nothing forwarded does not forward."""
+        wants nothing forwarded does not forward. A handler that means to
+        forward after answering starts the forward before the response body
+        ends, since the stream ends with this side's last message. A body
+        that failed on its way in is relayed cut, with the error on its
+        end."""
         await self._send(
             {
                 "type": "response",

@@ -49,7 +49,8 @@ is a streaming redactor built on `roxy-addon`.
 ## WIT package
 
 [`wit/addon.wit`](https://github.com/roxy-proxy/roxy-proxy/blob/main/wit/addon.wit)
-defines `roxy:addon@0.2.1`. Heads are records of roxy's own: a
+defines `roxy:addon`, unversioned until the contract is declared stable.
+Heads are records of roxy's own: a
 `request-head` (method, scheme, authority, path and query, and the header
 list) and a `response-head` (status and headers), each crossing the guest
 boundary in one call. Bodies are plain `wasi:io/streams` (vendored at
@@ -92,17 +93,10 @@ boundary in one call. Bodies are plain `wasi:io/streams` (vendored at
   own log (the capability still applies), and every other `flow`, `chain`
   or `endpoints` call traps.
 
-An additive change to the package (a new function, say) bumps its patch
-version, and a component built against an earlier 0.2.x still loads; an
-addon that calls a newer function needs a roxy that provides it.
-
-A layer built with `roxy-addon` 0.1 (against `roxy:addon@0.1.0`, which
-used the WASI HTTP types) does not load on a roxy serving 0.2: the import
-set differs, so linking fails at config load with the component's imports
-named. Rebuild it against `roxy-addon` 0.2; the SDK's `Layer`, `Request`,
-`Response`, `Headers`, `Body`, `Next` and `flow` API is unchanged, and
-`Error` is an enum of roxy's own, so code that matched WASI `error-code`
-variants changes.
+The package carries no version: its contract is not yet declared stable,
+and a component is built against the `wit/` of the roxy it runs on. A
+component whose imports do not match fails at config load with the
+component's imports named; rebuild it against the current `roxy-addon`.
 
 ### Instances
 

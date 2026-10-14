@@ -377,3 +377,32 @@ async fn a_deny_of_the_forward_outlives_the_layers_early_answer() {
     assert_eq!(ev["res"]["status"], 200);
     assert!(kit.upstream.seen().is_empty(), "nothing left");
 }
+
+#[tokio::test]
+async fn a_service_answering_before_it_forwards_leaves_the_forward_to_complete() {
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![testing::addon(
+            "s",
+            "answer-first",
+            AddonMode::Enforce,
+            |_| {},
+        )],
+    )
+    .await;
+    let c = kit.h1().await;
+    answer_then_forward(&kit, c, &[], b"early").await;
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "layer:s", "{ev:#}");
+}
+
+#[tokio::test]
+async fn h2_a_service_answering_while_it_forwards_leaves_the_forward_to_complete() {
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![testing::addon("s", "early", AddonMode::Enforce, |_| {})],
+    )
+    .await;
+    let c = kit.tunnel("up.test", true).await;
+    answer_then_forward(&kit, c, &[], b"early").await;
+}

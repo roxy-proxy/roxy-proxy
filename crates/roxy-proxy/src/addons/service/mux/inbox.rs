@@ -44,7 +44,15 @@ pub(super) async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodyS
     loop {
         let (chunk, end, abort) = {
             let mut q = lock(&inbox.q);
-            (q.buf.split().freeze(), q.end, q.abort.take())
+            let chunk = q.buf.split().freeze();
+            // Bytes before an error end reach the consumer first: the
+            // body is cut where the service cut it, not before.
+            let abort = if chunk.is_empty() {
+                q.abort.take()
+            } else {
+                None
+            };
+            (chunk, q.end, abort)
         };
         if let Some(why) = abort {
             tx.abort(BodyError::Upstream(why));

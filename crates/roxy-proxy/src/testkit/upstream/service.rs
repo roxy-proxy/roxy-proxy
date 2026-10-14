@@ -22,6 +22,10 @@
 //! * `/svc/early`: forwards the request as `/svc/pass` does, and answers
 //!   the client (`200`, body `early`) as soon as it has the request head,
 //!   reading the response from below without passing it on;
+//! * `/svc/answer-first`: as `/svc/early`, with the answer's head and body
+//!   on the wire before the forward and its end after;
+//! * `/svc/cut-forward`: forwards each request head, then ends the
+//!   forwarded request with an error, and passes the response on;
 //! * `/svc/shout`: a pass-through that uppercases ASCII letters in the
 //!   response body bytes;
 //! * `/svc/sever`: a pass-through that resets the stream on the first
@@ -308,6 +312,13 @@ enum Mode {
     /// response from below without passing it on: an answer that leaves
     /// the forward to run to its end.
     Early,
+    /// As `Early`, with the answer's head and body sent before the forward
+    /// and its end after: the answer is first on the wire.
+    AnswerFirst,
+    /// Forwards the request head, then ends the forwarded request lane
+    /// with an error, and passes the response from below on: a service
+    /// that cuts its own forward.
+    CutForward,
     /// Calls every host service on `open` (call ids 1 to 6), then passes
     /// through once every call is answered, as a service whose writes
     /// must be visible to the exchange does.
@@ -362,6 +373,10 @@ impl Mode {
             Self::Patient
         } else if path.ends_with("/early") {
             Self::Early
+        } else if path.ends_with("/answer-first") {
+            Self::AnswerFirst
+        } else if path.ends_with("/cut-forward") {
+            Self::CutForward
         } else if path.ends_with("/quarantine") {
             Self::Quarantine
         } else if path.ends_with("/late-quarantine") {
@@ -412,7 +427,8 @@ impl Conn {
             | Mode::Quarantine
             | Mode::LateQuarantine
             | Mode::Audit => true,
-            Mode::Hold | Mode::Forward | Mode::Early => dir == REQUEST,
+            Mode::Hold | Mode::Forward | Mode::Early | Mode::AnswerFirst => dir == REQUEST,
+            Mode::CutForward => dir == RESPONSE,
             Mode::Overlong
             | Mode::Short
             | Mode::Refuse
@@ -474,6 +490,23 @@ impl Conn {
                 ));
                 self.send(binary(id, RESPONSE, b"early"));
                 self.send(text(id, json!({"type": "response_end"})));
+            }
+            "request" if self.mode == Mode::AnswerFirst => {
+                self.send(text(
+                    id,
+                    json!({"type": "response", "status": 200, "headers": [["content-type", "text/plain"]]}),
+                ));
+                self.send(binary(id, RESPONSE, b"early"));
+                self.pass_control(id, &kind, v);
+                self.send(text(id, json!({"type": "response_end"})));
+            }
+            "request" if self.mode == Mode::CutForward => {
+                v.as_object_mut().map(|o| o.remove("stream"));
+                self.send(text(id, v));
+                self.send(text(
+                    id,
+                    json!({"type": "request_end", "error": "cut by the service"}),
+                ));
             }
             "response" if self.mode == Mode::LateQuarantine => {
                 // The head waits behind the call, so roxy sees it only once
@@ -545,6 +578,8 @@ impl Conn {
             | Mode::Sever
             | Mode::Patient
             | Mode::Early
+            | Mode::AnswerFirst
+            | Mode::CutForward
             | Mode::LateQuarantine
             | Mode::Audit => {}
             Mode::Host => self.call_host(

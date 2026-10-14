@@ -17,7 +17,7 @@ addons:
     endpoints:
       sidecar: { url: "http://127.0.0.1:9000/layer", private_ok: true }
     limits:
-      first_byte_timeout: 2s            # to get a stream, then to the service's answer, its forward below excepted; an observer's end (default 30s)
+      first_byte_timeout: 2s            # to get a stream, then to the service's answer, with no clock while its forward is upstream; an observer's end (default 30s)
       max_connections: 4                # per endpoint (default 4)
       max_streams: 100                  # exchanges at once per connection (default 100)
 ```
@@ -107,7 +107,7 @@ roxy → service   {"type":"result","id":n,"value":…} or {"type":"result","id"
 | heads | `url` is absolute; `headers` are end-to-end fields as a WASM layer sees them (no hop-by-hop or framing fields), at most [`limits.max_headers`](/reference/limits#limits) of them in a head the service sends: more is a protocol violation. `content-length` is present when the length is known and not zero; one the service sends is enforced: more or fewer bytes than declared is a protocol violation |
 | header values | byte strings: each byte is the code point of the same value (ISO-8859-1), so obs-text bytes (`http.allow_obs_text`) read as Latin-1 and go back as the same bytes. A code point above U+00FF is a protocol violation |
 | order | within each body, from each side: head, bytes, end; bytes before their head or after their end are a protocol violation. The two lanes are independent, and so are the two sides: roxy sends its `response` head as soon as the layer below answers, even while the client's body is still arriving; the service sends its `request` at most once and its `response` exactly once, in either order or with no `request` at all, and may send either while the other lane is still streaming. A second head of either kind is a protocol violation. Answering says nothing about forwarding: a forward the service has made runs to its end, and a service that wants nothing forwarded forwards nothing |
-| lane errors | an end roxy sends may carry `"error"`: the body it ends stopped short (an in-flight deny cut it, the upstream's body failed, the client gave up). The bytes before it are not the whole; the stream, and the service's own lanes, go on. An end the service sends may carry `"error"` too, and cuts that body where it is rather than completing it |
+| lane errors | an end roxy sends may carry `"error"`: the body it ends stopped short (an in-flight deny cut it, the upstream's body failed, the client gave up). The bytes before it are not the whole; the stream, and the service's own lanes, go on. An end the service sends may carry `"error"` too: it cuts that body where it is rather than completing it, and the cut is the service's fault (`layer_error`, `service:cut`) unless an earlier fault stands, as when it passes on a cut it was sent. An error on the end of a head-only lane, which carries no body to cut, is a protocol violation |
 | end | a stream ends when the service has sent its last message: the `response_end` of the client's response, and the `request_end` of the forwarded request if it was still sending that. A service that means to forward sends its `request` before that last message, since roxy sends nothing more on an ended stream and takes nothing from it. Either side may end a stream early with `reset`; roxy resets when the client goes away, a deadline passes or the service broke the protocol, and sends nothing after the `reset`. A stream roxy gives up before its `open` has gone out is dropped without a `reset`. A service that resets an enforce stream fails that exchange closed. Each side ignores messages for a stream it has ended; roxy drops body bytes sent on an ended stream without crediting them back |
 | flow control | per stream and per body, each way. Each body of a stream starts with 256 KiB of credit each way; the receiver grants more with `credit` as it consumes, and the sender may have no more bytes of that body outstanding than granted. roxy grants in steps of 64 KiB as the layer below (or the client) reads. Sending past credit is a protocol violation. Control messages are not counted |
 
@@ -188,8 +188,9 @@ has no message: a service calls what it needs itself.
 - **An early `response`** goes to the client at once, however far the
   forward below has got, and its body is the client's response from then
   on; the response from below still arrives on the service's lane for it
-  to read or ignore. If the stack below fails after that, the response
-  lane ends with the error and the service's answer stands.
+  to read or ignore. If the stack below fails after that, what arrives is
+  the refusal that failure earned, or the lane ending with the error if its
+  body had started; the service's answer stands either way.
 - **Failure is closed** in enforce mode: a failed connection or handshake,
   a protocol violation (bad JSON, a message out of order, bytes of a body
   that is not open, an invalid head, a broken length, bytes past the
@@ -198,7 +199,8 @@ has no message: a service calls what it needs itself.
   cuts the body after it; a body cut short never reaches the upstream or
   the client as complete. `layer_error.kind` is `service:connect`,
   `service:protocol`, `service:timeout` or `service:closed`; bytes of a
-  head-only body are `unsubscribed:<direction>`.
+  head-only body are `unsubscribed:<direction>`; a lane the service ended
+  with an error is `service:cut`.
 - **A body that fails on its way to the service is not its failure**: its
   lane ends with the error, no `layer_error` is logged, and the stream
   goes on ([who is blamed](/design/addon-model#who-is-blamed)).

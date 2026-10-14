@@ -12,7 +12,7 @@
 /// each of those calls is a capability granted per layer in roxy's config.
 /// A call the layer was not granted traps; the import is always linked, so
 /// one binary runs under different grants.
-package roxy:addon@0.2.1;
+package roxy:addon;
 
 /// Heads, bodies and the response a call will produce.
 interface types {

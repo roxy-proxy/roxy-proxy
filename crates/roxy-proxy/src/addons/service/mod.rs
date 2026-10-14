@@ -90,6 +90,10 @@ pub enum ServiceError {
     /// only.
     #[error("service sent bytes of the {0} body it is not subscribed to")]
     Unsubscribed(&'static str),
+    /// The service ended a lane it was sending short of complete, on
+    /// purpose: the body is cut where it stopped.
+    #[error("service cut the {dir} body: {why}")]
+    Cut { dir: &'static str, why: String },
     /// Host-service call `call` failed, or called a service the layer was
     /// not granted: the same failures a WASM layer's host calls have, with
     /// the same flow-log kinds.
@@ -121,6 +125,7 @@ impl ServiceError {
             ServiceError::Protocol(_) => "service:protocol".into(),
             ServiceError::Closed(_) => "service:closed".into(),
             ServiceError::Unsubscribed(dir) => format!("unsubscribed:{dir}"),
+            ServiceError::Cut { .. } => "service:cut".into(),
             ServiceError::Layer { err, .. } => super::layer_error_kind(err),
         }
     }
@@ -519,6 +524,12 @@ async fn forward(
     let Ok(req) = forward.await else {
         return;
     };
+    // A stream reset as the forward arrived (a missed deadline, the client
+    // gone) has told the service nothing more happens on it.
+    if stream.is_ended() {
+        st.forward_dropped(index);
+        return;
+    }
     clock.below();
     let ending = st.ending();
     let res = tokio::select! {
@@ -529,6 +540,7 @@ async fn forward(
     // Only the client's own failure comes back as an error: the exchange
     // is closing, and nothing below answers it.
     let Ok(res) = res else {
+        st.forward_dropped(index);
         stream.reset("the exchange ended");
         return;
     };

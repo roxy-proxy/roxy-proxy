@@ -222,6 +222,8 @@ struct LayerSlot {
     ran: AtomicBool,
     /// Bodies bypassing the layer (enforce mode, head-only subscription).
     bypass: Mutex<subscribe::Bypass>,
+    /// The layer failed: a forward of its still below is given up.
+    cancel: CancellationToken,
 }
 
 impl LayerSlot {
@@ -244,7 +246,7 @@ struct NextGuard {
 
 impl NextGuard {
     fn new(st: Arc<StackFlow>, index: usize) -> Self {
-        st.layers[index].set(NextState::Pending);
+        st.set_next(index, NextState::Pending);
         Self {
             st,
             index,
@@ -259,14 +261,14 @@ impl NextGuard {
         } else {
             NextState::Failed
         };
-        self.st.layers[self.index].set(s);
+        self.st.set_next(self.index, s);
     }
 }
 
 impl Drop for NextGuard {
     fn drop(&mut self) {
         if !self.settled {
-            self.st.layers[self.index].set(NextState::Abandoned);
+            self.st.set_next(self.index, NextState::Abandoned);
         }
     }
 }
@@ -311,6 +313,9 @@ struct Loan {
     returned: Notify,
     /// The exchange is being torn down: a core still running is stopped.
     abandon: CancellationToken,
+    /// The front took the context back: nothing in the stack sees it
+    /// again.
+    gone: AtomicBool,
 }
 
 impl Loan {
@@ -319,6 +324,7 @@ impl Loan {
             cx: Mutex::new(None),
             returned: Notify::new(),
             abandon: CancellationToken::new(),
+            gone: AtomicBool::new(false),
         }
     }
 
@@ -336,19 +342,28 @@ impl Loan {
         self.returned.notify_one();
     }
 
-    /// Takes the context back once the core has returned it. A core still
-    /// running keeps it: a layer's answer reaching the client says nothing
-    /// about the request it forwarded, which runs to its end below.
-    async fn reclaim(&self) -> FlowCx {
+    /// Takes the context back once the core has returned it, or if it
+    /// never took it. A core still running keeps it. `None` once the front
+    /// has it: it is not coming back.
+    async fn returned(&self) -> Option<FlowCx> {
         loop {
             let notified = self.returned.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            if self.gone.load(Ordering::SeqCst) {
+                return None;
+            }
             if let Some(cx) = self.take() {
-                return cx;
+                return Some(cx);
             }
             notified.await;
         }
+    }
+
+    /// Wakes whoever waits on the context: it came back, or what decides
+    /// whether it is still needed below has changed.
+    fn changed(&self) {
+        self.returned.notify_waiters();
     }
 }
 
@@ -445,23 +460,62 @@ impl StackFlow {
         self.loan.abandon.clone()
     }
 
+    /// Takes the flow context back for the record: once the core has
+    /// returned it, and no forward is still on its way to the core. A
+    /// layer's answer reaching the client says nothing about the request
+    /// it forwarded, which runs to its end below first.
+    async fn reclaim(&self) -> FlowCx {
+        loop {
+            let notified = self.loan.returned.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.forward_pending()
+                && let Some(cx) = self.loan.take()
+            {
+                self.loan.gone.store(true, Ordering::SeqCst);
+                self.loan.changed();
+                return cx;
+            }
+            notified.await;
+        }
+    }
+
+    /// A forward is on its way to the core, or the core is running it.
+    fn forward_pending(&self) -> bool {
+        self.layers.iter().any(|l| l.state() == NextState::Pending)
+    }
+
+    fn set_next(&self, index: usize, state: NextState) {
+        self.layers[index].set(state);
+        self.loan.changed();
+    }
+
     /// The response the client got is complete. If nothing below will
     /// consume the rest of the request, no forward on its way to the core
-    /// and the core never entered, the client's lane is dropped, so the
-    /// front drains or closes rather than waits on a reader that will not
-    /// come. A forward a layer dropped on the way has gone with it.
+    /// and the core never entered, the client's lane is dropped, parked
+    /// bypassed bodies included, so the front drains or closes rather than
+    /// waits on a reader that will not come. A forward a layer dropped on
+    /// the way has gone with it.
     fn response_complete(&self) {
-        let consumed = self.core_entered.load(Ordering::SeqCst)
-            || self.layers.iter().any(|l| l.state() == NextState::Pending);
-        if !consumed {
-            self.snip.cancel();
+        if self.core_entered.load(Ordering::SeqCst) || self.forward_pending() {
+            return;
+        }
+        self.snip.cancel();
+        for index in 0..self.layers.len() {
+            subscribe::release_request(self, index);
         }
     }
 
     /// Layer `index` is forwarding: its request is on its way to the layer
     /// below, before the call that carries it has run.
     pub(crate) fn forwarding(&self, index: usize) {
-        self.layers[index].set(NextState::Pending);
+        self.set_next(index, NextState::Pending);
+    }
+
+    /// Layer `index`'s forward was given up before it reached the layer
+    /// below.
+    pub(crate) fn forward_dropped(&self, index: usize) {
+        self.set_next(index, NextState::Abandoned);
     }
 
     /// The facts `metric-get` reads.
@@ -559,8 +613,13 @@ impl StackFlow {
         crate::exchange::wants_websocket(&self.client_meta)
     }
 
-    /// The core relayed an upgrade; the stack's answer decides its fate.
+    /// The core relayed an upgrade; the stack's answer decides its fate. An
+    /// answer already given carries no relay: the upstream side is closed.
     fn relayed(&self, relay: ws::Relay) {
+        if self.answered.get().is_some() {
+            tokio::spawn(crate::exchange::close_upstream_ws(relay.upstream));
+            return;
+        }
         *lock(&self.upgrade) = Upgrade::Relayed(relay);
     }
 
@@ -753,7 +812,7 @@ impl Reclaim {
         match self {
             Reclaim::Now(cx) => *cx,
             Reclaim::Stack(st) => {
-                let mut cx = st.loan.reclaim().await;
+                let mut cx = st.reclaim().await;
                 st.fold_answer(&mut cx);
                 cx.stack = Some(st);
                 cx
@@ -940,8 +999,9 @@ fn refusal_for_fault(st: &Arc<StackFlow>) -> Result<Refusal, roxy_http::ParseErr
 
 /// The refusal a failure below a layer earns, as a response on that
 /// layer's lane, recorded on the flow as the refusal the front would have
-/// written. `None` when the fault is the client's: the exchange is
-/// closing, and no layer answers it.
+/// written. `None` when the fault is the client's (the exchange is
+/// closing, and no layer answers it), or the record has already left the
+/// stack.
 async fn seeded_refusal(st: &Arc<StackFlow>) -> Option<LayerResponse> {
     let refusal = refusal_for_fault(st).ok()?;
     if refusal.close {
@@ -949,7 +1009,7 @@ async fn seeded_refusal(st: &Arc<StackFlow>) -> Option<LayerResponse> {
     }
     // The core has let go of the context by now: whatever failed below
     // has returned, and with it the lease.
-    let mut cx = st.loan.reclaim().await;
+    let mut cx = st.loan.returned().await?;
     if cx.in_flight.is_some() {
         cx.record_refusal_sample(&refusal);
     }
@@ -1001,7 +1061,8 @@ impl HttpBody for Snipped {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.as_ref().is_none_or(Body::is_end_stream)
+        // Snipped is cut, never complete.
+        self.inner.as_ref().is_some_and(Body::is_end_stream)
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -1080,7 +1141,7 @@ pub(crate) fn enter(
             }
         };
         st.layers[index].ran.store(true, Ordering::SeqCst);
-        st.layers[index].set(NextState::Entered);
+        st.set_next(index, NextState::Entered);
         let mut req = req;
         // Layers see bodies decoded, from the first layer subscribed to the
         // body; a body no layer reads is left as the client sent it.
@@ -1115,7 +1176,10 @@ pub(crate) fn enter(
             }
             AddonImpl::Service(svc) => service::handle(st.clone(), index, svc, req).await,
         };
-        subscribe::release_request(&st, index);
+        // A failed layer's forward does not run on past it.
+        if res.is_err() {
+            st.layers[index].cancel.cancel();
+        }
         res.map(|r| subscribe::reattach_response(&st, index, r))
     })
 }
@@ -1139,7 +1203,13 @@ pub(crate) fn below(
         Box::pin(core(st.clone(), index, req))
     };
     Box::pin(async move {
-        let r = match fut.await {
+        let cancelled = st.layers[index].cancel.clone();
+        let r = tokio::select! {
+            biased;
+            () = cancelled.cancelled() => Err(HostError::new("the layer failed")),
+            r = fut => r,
+        };
+        let r = match r {
             Ok(r) => Ok(r),
             Err(e) => match seeded_refusal(&st).await {
                 Some(res) => Ok(res),

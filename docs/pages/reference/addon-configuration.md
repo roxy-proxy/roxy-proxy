@@ -316,7 +316,9 @@ its handler lives on relaying the direction it is in.
   refuses, a body stream that is not the host's, a missing response, bytes
   on an unsubscribed body, a handler that returns still holding a body
   stream or a pending response, or a cancelled exchange is a
-  `LayerError`: a deny, or a cut exchange after the response head.
+  `LayerError`: a `503` on the lane downstream of the layer before the
+  response head (recorded as a deny, whatever a layer there makes of it),
+  a cut body after it.
 - **A client that gives up cancels the exchange.** The guest is stopped,
   its instance discarded, the slot freed. No `layer_error` is logged.
 - **No clean end for a failed body.** A guest body ends with an error once

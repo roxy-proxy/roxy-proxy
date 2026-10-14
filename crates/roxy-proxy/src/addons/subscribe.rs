@@ -66,6 +66,9 @@ pub(super) struct Bypass {
     request: Option<Body>,
     /// The response from below: its status, and its body.
     response: Option<(http::StatusCode, Body)>,
+    /// The layer has answered: a response from below that arrives after
+    /// this has no head of the layer's to be spliced onto.
+    answered: bool,
 }
 
 /// The head as a layer not subscribed to the body sees it: the body's
@@ -103,15 +106,15 @@ pub(super) fn reattach_request(
     req.map(|own| splice(st, index, Dir::Request, own, body))
 }
 
-/// Drops a request body still parked at layer `index` once the layer has
-/// answered: it never passed the head on, so the body goes the way of one
-/// a layer dropped unread.
-pub(super) fn release_request(st: &Arc<StackFlow>, index: usize) {
+/// Drops a request body still parked at layer `index`: nothing will pass
+/// its head on, so the body goes the way of one a layer dropped unread.
+pub(super) fn release_request(st: &StackFlow, index: usize) {
     drop(lock(&st.layers[index].bypass).request.take());
 }
 
 /// Takes the response body away from enforce layer `index` when it is
-/// subscribed to the head only.
+/// subscribed to the head only. A layer that has already answered gets the
+/// head with no body to park: its answer was whole.
 pub(super) fn detach_response(
     st: &Arc<StackFlow>,
     index: usize,
@@ -122,7 +125,10 @@ pub(super) fn detach_response(
     }
     let body = std::mem::take(res.body_mut());
     head_only(res.headers_mut());
-    lock(&st.layers[index].bypass).response = Some((res.status(), body));
+    let mut bypass = lock(&st.layers[index].bypass);
+    if !bypass.answered {
+        bypass.response = Some((res.status(), body));
+    }
     res
 }
 
@@ -130,13 +136,19 @@ pub(super) fn detach_response(
 /// it answered with, when that is the response from below with its head
 /// edited: the same status. A different status is an answer of the layer's
 /// own, whole, and the body from below is dropped. A layer that answered
-/// without `next` resolving has no bypassed body: its answer is whole.
+/// before the response from below arrived has no bypassed body: its answer
+/// is whole, and a body arriving later is dropped.
 pub(super) fn reattach_response(
     st: &Arc<StackFlow>,
     index: usize,
     res: LayerResponse,
 ) -> LayerResponse {
-    let Some((status, body)) = lock(&st.layers[index].bypass).response.take() else {
+    let parked = {
+        let mut bypass = lock(&st.layers[index].bypass);
+        bypass.answered = true;
+        bypass.response.take()
+    };
+    let Some((status, body)) = parked else {
         return res;
     };
     if res.status() != status {

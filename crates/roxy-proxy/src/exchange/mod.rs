@@ -155,6 +155,9 @@ where
     res.body = body;
     let status = res.status.as_u16();
     let headers_bytes = res.headers.wire_len() as u64;
+    // A refusal that travelled up through the stack as a response carries
+    // its close here, where `Answer::Refusal` carries it in the refusal.
+    let closing = res.meta.close;
     let r = write(res).await;
     let failed = r.is_err();
     let mut cx = match cx {
@@ -206,7 +209,7 @@ where
     // from the same field.
     let close = match &refusal {
         Some(r) => r.close,
-        None => stop.as_ref().is_some_and(|s| s.refusal.close),
+        None => closing || stop.as_ref().is_some_and(|s| s.refusal.close),
     };
     if let Some(r) = &refusal {
         finish_refusal(&mut cx, r);

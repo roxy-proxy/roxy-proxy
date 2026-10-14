@@ -35,7 +35,7 @@ stream.
 
 Logic that needs to understand the traffic goes in an addon: an external
 service that the traffic streams through, or a WASM component that runs
-in process. An addon owns both streams of the exchanges it chooses and can
+in process. An addon owns both lanes of the exchanges it chooses and can
 rewrite, withhold, answer or block. The stack runs outermost first, the
 last addon's `next` runs the rest of the core on what it passed on, and
 the rules judge that as if the client had sent it

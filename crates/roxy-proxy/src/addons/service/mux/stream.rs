@@ -256,6 +256,11 @@ impl Stream {
         self.st.snap.addons[self.index].name.clone()
     }
 
+    /// Nothing more goes on the stream, or comes off it.
+    pub(crate) fn is_ended(&self) -> bool {
+        self.ended.is_cancelled()
+    }
+
     /// Ends the stream, once: nothing more goes on it, its place on the
     /// connection is released, the reader forgets it, and whoever was
     /// waiting on it (a pending answer, the body being fed) learns how it
@@ -571,14 +576,14 @@ impl Stream {
     fn answer(self: &Arc<Self>, s: &mut StreamState, m: In) -> Result<(), ServiceError> {
         let limits = &self.st.snap.limits;
         match m {
-            In::RequestEnd { error } => Self::lane_end(s, Dir::Request, error),
-            In::ResponseEnd { error } => Self::lane_end(s, Dir::Response, error),
+            In::RequestEnd { error } => self.lane_end(s, Dir::Request, error),
+            In::ResponseEnd { error } => self.lane_end(s, Dir::Response, error),
             In::Request {
                 method,
                 url,
                 headers,
             } => {
-                // Parsed before the first answer is taken: a head that fails
+                // Parsed before the forward is taken: a head that fails
                 // leaves the answer owed, so `settle` tells it the error.
                 let method = http::Method::from_bytes(method.as_bytes())
                     .map_err(|_| ServiceError::Protocol(format!("invalid method {method:?}")))?;
@@ -637,12 +642,28 @@ impl Stream {
     }
 
     /// The service ended the `dir` lane it was sending. With `error` the
-    /// body is cut where it is, never complete: the service did not finish
-    /// this lane.
-    fn lane_end(s: &mut StreamState, dir: Dir, error: Option<String>) -> Result<(), ServiceError> {
+    /// body is cut where it is, never complete, and the cut is the
+    /// service's fault unless an earlier one stands (a failure from below
+    /// it is passing on). A head-only lane has no body to cut: an error on
+    /// its end is a protocol violation.
+    fn lane_end(
+        &self,
+        s: &mut StreamState,
+        dir: Dir,
+        error: Option<String>,
+    ) -> Result<(), ServiceError> {
         let lane = s.lane(dir);
         match lane.inbox.take() {
             Some(inbox) => {
+                if let Some(why) = &error {
+                    self.st.fail(
+                        &self.name(),
+                        StackError::Service(ServiceError::Cut {
+                            dir: dir.as_str(),
+                            why: why.clone(),
+                        }),
+                    );
+                }
                 let mut q = lock(&inbox.q);
                 match error {
                     Some(why) => q.abort = Some(why),
@@ -652,10 +673,14 @@ impl Stream {
                 inbox.ready.notify_one();
                 Ok(())
             }
-            None if lane.end_owed => {
+            None if lane.end_owed && error.is_none() => {
                 lane.end_owed = false;
                 Ok(())
             }
+            None if lane.end_owed => Err(ServiceError::Protocol(format!(
+                "an error on the {}_end of a head-only body",
+                dir.as_str()
+            ))),
             None => Err(ServiceError::Protocol(format!(
                 "unexpected {}_end",
                 dir.as_str()
