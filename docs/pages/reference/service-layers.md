@@ -16,7 +16,7 @@ addons:
     endpoints:
       sidecar: { url: "http://127.0.0.1:9000/layer", private_ok: true }
     limits:
-      first_byte_timeout: 2s            # to get a stream, then to each of the service's heads (default 30s)
+      first_byte_timeout: 2s            # to get a stream, then to each of the service's heads, or an observer's end (default 30s)
       max_connections: 4                # per endpoint (default 4)
       max_streams: 100                  # exchanges at once per connection (default 100)
 ```
@@ -175,7 +175,8 @@ has no message: a service calls what it needs itself.
 - **Deadlines.** `first_byte_timeout` bounds getting a stream, then each
   of the service's heads, as it does a WASM layer's: its first answer from
   roxy's `request` head, its second from roxy's `response` head (not from
-  the end of the response body). A stream has no overall clock, and no
+  the end of the response body); on an observe stream, the service's end
+  from roxy's last message. A stream has no overall clock, and no
   clock runs while roxy waits on the layers below: a service that has
   forwarded the request head and holds back its body keeps the upstream
   waiting for as long as it likes.

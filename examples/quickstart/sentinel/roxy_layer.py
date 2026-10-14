@@ -247,6 +247,9 @@ class _Stream:
                 self._ends_sent[end] = True
                 if self._ends_sent[RESPONSE] and (not self.forwarded or self._ends_sent[REQUEST]):
                     self.ended = True
+                    # roxy runs a call sent before the end but cannot answer
+                    # it: whoever awaits one must not wait forever.
+                    self.fail_calls(ProtocolError("the stream has ended: no result will come"))
 
     async def call(self, msg: dict[str, Any]) -> Any:
         """Sends a host-service call and returns the value of its `result`,
@@ -372,8 +375,9 @@ class Exchange:
     # Host services, each behind a capability granted in roxy's config
     # (`capabilities: [log, record, state, metrics]`). Each returns once
     # roxy has answered it. A call without its capability, or a failure in
-    # roxy, fails the exchange: roxy resets the stream. `add_tag` needs no
-    # capability but is refused in observe mode.
+    # roxy, fails the layer: roxy resets the stream, and in enforce mode
+    # the exchange fails with it. `add_tag` needs no capability but is
+    # refused in observe mode, like `state_put` and `quarantine`.
     #
     # A call may be made at any point, including part-way through a body.
     # Calls run beside the bodies, and roxy promises no order between a
