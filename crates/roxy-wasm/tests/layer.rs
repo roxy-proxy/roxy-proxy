@@ -873,6 +873,37 @@ async fn max_instances_bounds_concurrency() {
     assert_eq!(second.await.unwrap(), 2);
 }
 
+/// The wait for a slot is bounded by `first_byte_timeout`: an exchange
+/// that finds every instance busy for that long fails with `NoInstance`
+/// rather than queueing behind them indefinitely.
+#[tokio::test(start_paused = true)]
+async fn waiting_for_a_slot_times_out() {
+    let rt = runtime();
+    let mut cfg = config();
+    cfg.limits.max_instances = 1;
+    cfg.limits.first_byte_timeout = Duration::from_millis(200);
+    let layer = load(&rt, cfg).await;
+
+    let (_up_tx, up_body): (BodySender, Body) = Body::channel(u64::MAX, None);
+    let (seen_tx, seen_rx) = oneshot::channel();
+    let host = Mock::new(NextMode::Capture(Mutex::new(Some((
+        seen_tx,
+        Response::new(up_body),
+    )))));
+    let first = tokio::spawn({
+        let layer = layer.clone();
+        async move { exchange(&layer, host, request("pass", Body::empty())).await }
+    });
+    let _upstream = seen_rx.await.unwrap();
+
+    let err = exchange(&layer, Mock::echo(), request("count", Body::empty()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, LayerError::NoInstance), "{err:?}");
+    // The exchange holding the instance is untouched by the refusal.
+    assert!(!first.is_finished());
+}
+
 /// Bodies have no clock: a stream that outlives the head deadline many
 /// times over goes through whole.
 #[tokio::test]

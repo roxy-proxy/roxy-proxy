@@ -63,9 +63,12 @@ pub fn state_put(key: &str, value: &str, ttl: Option<Duration>) -> Result<(), St
     raw::state_put(key, value, ttl_ms(ttl))
 }
 
-/// Reads a metric (capability `metrics`) by id and key-field values.
-pub fn metric_get(id: &str, key: &[String]) -> Option<i64> {
-    raw::metric_get(id, key)
+/// Reads a metric (capability `metrics`) for this flow's own key: the
+/// metric's key fields evaluated on the request that left the stack. `None`
+/// when the key has no entry (a rule reads the same key as 0). An unknown
+/// id, or a key field the request does not have, fails the exchange.
+pub fn metric_get(id: &str) -> Option<i64> {
+    raw::metric_get(id, &[])
 }
 
 /// Puts the whole proxy into quarantine (capability `quarantine`): every
