@@ -32,7 +32,7 @@ zero. `capabilities` and `config` mean the same for both kinds
 Long-lived WebSocket connections to each endpoint, each carrying many
 exchanges as **streams**.
 
-- Subprotocol `roxy.layer.v5`; a service that does not accept it fails the
+- Subprotocol `roxy.layer.v0`; a service that does not accept it fails the
   handshake.
 - The URL is the endpoint's (`http` → `ws`, `https` → `wss`, with the
   upstream's certificate verification), dialled through the connector (the

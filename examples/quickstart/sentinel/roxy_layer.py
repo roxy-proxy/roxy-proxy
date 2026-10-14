@@ -1,4 +1,4 @@
-"""The service side of roxy's service layers (`roxy.layer.v5`).
+"""The service side of roxy's service layers (`roxy.layer.v0`).
 
 roxy keeps a few WebSocket connections open to the service and carries
 each exchange as a stream on one of them. Text frames are JSON control
@@ -60,7 +60,7 @@ from typing import Any
 
 from websockets.asyncio.server import ServerConnection, serve as ws_serve
 
-SUBPROTOCOL = "roxy.layer.v5"
+SUBPROTOCOL = "roxy.layer.v0"
 
 # The direction byte of a binary frame, and the `dir` of a credit message.
 REQUEST = 0

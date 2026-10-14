@@ -1,6 +1,6 @@
 //! Service layers: an external service in the network path.
 //!
-//! Each exchange is a stream (`roxy.layer.v5`) on one of a few pooled
+//! Each exchange is a stream (`roxy.layer.v0`) on one of a few pooled
 //! WebSocket connections to the layer's named endpoint ([`mux`]). The
 //! stream carries the exchange's two lanes, each a head, bytes and an
 //! end, each way: roxy streams the request into it as it arrives, and the
