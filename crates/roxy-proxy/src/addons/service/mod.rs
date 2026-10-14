@@ -428,7 +428,8 @@ pub(super) async fn handle(
 
 enum Fail {
     Service(ServiceError),
-    /// The stack below failed (already recorded by whoever failed).
+    /// roxy gave the exchange up (the client went away, say), recorded by
+    /// whoever gave it up: not the service's failure.
     Below(HostError),
 }
 
