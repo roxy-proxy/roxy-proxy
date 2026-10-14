@@ -19,6 +19,8 @@
 //! * `/svc/abort`: resets each stream on its request head;
 //! * `/svc/patient`: a pass-through that holds the request head and body
 //!   until the `request_end`, then forwards them together;
+//! * `/svc/no-content`: answers each request head with a `204` and no body,
+//!   forwarding nothing;
 //! * `/svc/early`: forwards the request as `/svc/pass` does, and answers
 //!   the client (`200`, body `early`) as soon as it has the request head,
 //!   reading the response from below without passing it on;
@@ -310,6 +312,9 @@ enum Mode {
     /// response from below without passing it on: an answer that leaves
     /// the forward to run to its end.
     Early,
+    /// Answers each request head with a `204` and nothing else: no body,
+    /// no forward.
+    NoContent,
     /// Forwards the request head, then ends the forwarded request lane
     /// with an error, and passes the response from below on: a service
     /// that cuts its own forward.
@@ -368,6 +373,8 @@ impl Mode {
             Self::Patient
         } else if path.ends_with("/early") {
             Self::Early
+        } else if path.ends_with("/no-content") {
+            Self::NoContent
         } else if path.ends_with("/cut-forward") {
             Self::CutForward
         } else if path.ends_with("/quarantine") {
@@ -425,6 +432,7 @@ impl Conn {
             Mode::Overlong
             | Mode::Short
             | Mode::Refuse
+            | Mode::NoContent
             | Mode::Abort
             | Mode::Talk
             | Mode::Flood
@@ -466,6 +474,13 @@ impl Conn {
                 self.send(text(
                     id,
                     json!({"type": "response", "status": 403, "headers": []}),
+                ));
+                self.send(text(id, json!({"type": "response_end"})));
+            }
+            "request" if self.mode == Mode::NoContent => {
+                self.send(text(
+                    id,
+                    json!({"type": "response", "status": 204, "headers": []}),
                 ));
                 self.send(text(id, json!({"type": "response_end"})));
             }
@@ -562,6 +577,7 @@ impl Conn {
             | Mode::Sever
             | Mode::Patient
             | Mode::Early
+            | Mode::NoContent
             | Mode::CutForward
             | Mode::LateQuarantine
             | Mode::Audit => {}

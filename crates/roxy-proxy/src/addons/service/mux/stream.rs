@@ -51,6 +51,9 @@ pub(crate) struct Stream {
     pub(super) wire: Arc<Wire>,
     /// Host-service calls waiting for the stream's worker, once it has one.
     pub(super) calls: Mutex<Option<mpsc::Sender<Call>>>,
+    /// The stream failed or was given up, as opposed to ending on the
+    /// service's last message.
+    pub(super) broken: AtomicBool,
     /// The stream's place on the connection, kept past its end while the
     /// worker runs the calls queued before it, so what a service leaves
     /// behind on ended streams is bounded by `max_streams` like its open
@@ -256,9 +259,11 @@ impl Stream {
         self.st.snap.addons[self.index].name.clone()
     }
 
-    /// Nothing more goes on the stream, or comes off it.
-    pub(crate) fn is_ended(&self) -> bool {
-        self.ended.is_cancelled()
+    /// The stream failed or was given up: nothing it accepted is acted on.
+    /// A stream that ended on the service's last message is not broken,
+    /// and a forward it accepted still runs.
+    pub(crate) fn is_broken(&self) -> bool {
+        self.broken.load(Ordering::SeqCst)
     }
 
     /// Ends the stream, once: nothing more goes on it, its place on the
@@ -283,19 +288,27 @@ impl Stream {
         lock(&self.link.shared.streams).open.remove(&self.id);
         drop(ending.slot);
         if self.mode == AddonMode::Enforce {
-            // Nothing more comes off the stream: the layer forwards no more.
-            self.st.layer_done(self.index);
+            // Nothing more comes off the stream: the layer forwards no
+            // more, and one that failed gives up a forward still running.
+            match &end {
+                End::Failed { .. } => self.st.layer_failed(self.index),
+                End::Quiet | End::Abandoned(_) => self.st.layer_done(self.index),
+            }
         }
         let (e, reset) = match end {
             End::Quiet => return true,
             End::Failed { e, reset } => {
+                self.broken.store(true, Ordering::SeqCst);
                 let message = e.to_string();
                 (
                     Unanswered::Service(e),
                     (reset == Reset::Send).then_some(message),
                 )
             }
-            End::Abandoned(why) => (Unanswered::Abandoned(why.to_owned()), Some(why.to_owned())),
+            End::Abandoned(why) => {
+                self.broken.store(true, Ordering::SeqCst);
+                (Unanswered::Abandoned(why.to_owned()), Some(why.to_owned()))
+            }
         };
         if let Some(message) = reset
             && self.wire.reset()
@@ -911,6 +924,7 @@ pub(crate) async fn open(
             ended: CancellationToken::new(),
             wire: Arc::default(),
             calls: Mutex::new(None),
+            broken: AtomicBool::new(false),
             draining: Mutex::new(None),
         });
         s.open.insert(id, stream.clone());

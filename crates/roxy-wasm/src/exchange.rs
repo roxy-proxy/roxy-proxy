@@ -234,6 +234,14 @@ impl LayerOutcome {
     }
 }
 
+/// Keeps the guest running after its answer: dropped, with the response
+/// body, before the exchange has settled, the guest is cancelled. Found in
+/// the extensions of every [`crate::LayerResponse`] a layer returns, for a
+/// host that discards the body (a bodiless status) but wants the guest to
+/// finish what it started.
+#[derive(Debug, Clone)]
+pub struct Running(#[allow(dead_code)] pub(crate) Arc<CancelGuard>);
+
 /// Aborts the exchange driver when the caller abandons the exchange (both
 /// the `handle` future and the response body are gone) before it settled.
 #[derive(Debug)]

@@ -14,8 +14,8 @@ use bytes::Bytes;
 use roxy_http::BodySender;
 
 use super::{AddonDef, Answer, Client, Kit, streaming_body, strs};
-use crate::addons::AddonMode;
 use crate::addons::service::testing;
+use crate::addons::{AddonMode, Part};
 
 const CHUNK: usize = 4096;
 
@@ -393,4 +393,56 @@ async fn a_deny_of_the_forward_outlives_the_layers_early_answer() {
     assert_eq!(ev["terminal_rule"], "no-denied");
     assert_eq!(ev["res"]["status"], 200);
     assert!(kit.upstream.seen().is_empty(), "nothing left");
+}
+
+// ---- answers with no body ------------------------------------------------
+
+/// A bodiless answer is complete with its head: the front writes no body
+/// to poll to its end, so the request lane is snipped as the head goes.
+/// On HTTP/2 the client's upload is reset at once rather than left to its
+/// idle timeout.
+#[tokio::test(start_paused = true)]
+async fn h2_a_bodiless_answer_without_a_forward_snips_the_upload_at_once() {
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![testing::subscribed(
+            testing::addon("s", "no-content", AddonMode::Enforce, |_| {}),
+            Part::Head,
+            Part::Full,
+        )],
+    )
+    .await;
+    let mut c = kit.tunnel("up.test", true).await;
+    let (mut tx, pending) = upload(&mut c, &[], 2).await;
+    let a = answer_mid_upload(pending).await;
+    assert_eq!(a.status, 204, "{a:?}");
+    let (cut, took) = super::timed(async {
+        loop {
+            if tx.send_data(Bytes::from(vec![b'x'; CHUNK])).await.is_err() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(cut);
+    assert_eq!(took, Duration::ZERO, "the stream is reset, not timed out");
+    assert!(kit.upstream.seen().is_empty(), "nothing left");
+}
+
+/// A WASM guest that answers with no body and then forwards: the front
+/// writes nothing for the answer, and the guest still runs to its end, so
+/// the forward completes.
+#[tokio::test]
+async fn h2_a_guest_answering_bodiless_still_completes_its_forward() {
+    let kit = stack(&["a"]).await;
+    let mut c = kit.tunnel("up.test", true).await;
+    let (mut tx, pending) = upload(&mut c, &[("x-test-a", "answer-204-then-next")], 1).await;
+    let a = answer_mid_upload(pending).await;
+    assert_eq!(a.status, 204, "{a:?}");
+    tx.send_data(Bytes::from(vec![b'x'; CHUNK])).await.unwrap();
+    tx.finish().await.unwrap();
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].complete, Some(true), "{:?}", seen[0]);
+    assert_eq!(seen[0].body.len(), 2 * CHUNK);
 }

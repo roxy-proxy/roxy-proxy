@@ -82,6 +82,7 @@ async fn lone_stream_of(
         ended: CancellationToken::new(),
         wire: Arc::default(),
         calls: Mutex::new(None),
+        broken: AtomicBool::new(false),
         draining: Mutex::new(None),
     });
     lock(&link.shared.streams).open.insert(1, stream.clone());

@@ -655,6 +655,18 @@ impl Handler for Layer {
                 let (_below, from_below) = await_response(pending);
                 drop(read_all(&from_below));
             }
+            "answer-204-then-next" => {
+                // As `answer-then-next`, with an answer that carries no
+                // body: the host writes nothing for it, and the guest must
+                // still run to the end of its forward.
+                respond(204, b"");
+                let (pending, output) = next_streaming(&forward_head(&req));
+                pump(&body, &output, false);
+                drop(body);
+                types::finish(output);
+                let (_below, from_below) = await_response(pending);
+                drop(read_all(&from_below));
+            }
             "cut-then-await" => {
                 // Stream `x-read-bytes` of the body into `next`, leave it
                 // unfinished while still waiting on the response, then

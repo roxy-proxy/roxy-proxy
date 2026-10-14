@@ -17,7 +17,7 @@ use crate::bindings::roxy::addon::types::RequestHead;
 use crate::bindings::roxy::addon::{chain, endpoints, flow, types};
 use crate::config::{LayerConfig, LayerLimits};
 use crate::error::{Budget, LayerError, LoadError};
-use crate::exchange::{CancelGuard, ExchangeShared, FromGuest};
+use crate::exchange::{CancelGuard, ExchangeShared, FromGuest, Running};
 use crate::head;
 use crate::host::{LayerHost, LayerRequest, LayerResponse};
 use crate::state::{ExchangeCtx, LayerShared, StoreState};
@@ -484,8 +484,10 @@ impl Layer {
         match answer {
             Ok(resp) => {
                 let outcome = shared.outcome();
+                let running = Running(cancel.clone());
                 let mut resp = resp.map(|b| FromGuest::response(b, shared.clone(), cancel));
                 resp.extensions_mut().insert(outcome);
+                resp.extensions_mut().insert(running);
                 Ok(resp)
             }
             // The sender was dropped: the handler returned without

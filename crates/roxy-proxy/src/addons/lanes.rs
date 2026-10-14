@@ -118,6 +118,73 @@ impl HttpBody for Completing {
     }
 }
 
+/// The response from upstream on its way into layer `index`: the record
+/// waits for it to end, or to be dropped.
+pub(super) fn draining(st: &Arc<StackFlow>, index: usize, body: Body) -> Body {
+    if body.is_end_stream() {
+        return body;
+    }
+    st.response_streaming(index, true);
+    let known = body.known_length();
+    Body::wrap_native(
+        Draining {
+            inner: body,
+            st: st.clone(),
+            index,
+            open: true,
+        },
+        u64::MAX,
+        known,
+    )
+}
+
+struct Draining {
+    inner: Body,
+    st: Arc<StackFlow>,
+    index: usize,
+    open: bool,
+}
+
+impl Draining {
+    fn close(&mut self) {
+        if self.open {
+            self.open = false;
+            self.st.response_streaming(self.index, false);
+        }
+    }
+}
+
+impl HttpBody for Draining {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        let this = &mut *self;
+        let frame = ready!(Pin::new(&mut this.inner).poll_frame(cx));
+        if !matches!(frame, Some(Ok(_))) {
+            this.close();
+        }
+        Poll::Ready(frame)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for Draining {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// A layer's response body to the client, sent only while the flow log
 /// keeps up (audit backpressure).
 pub(super) fn gated(body: Body, sink: Arc<dyn FlowSink>) -> Body {

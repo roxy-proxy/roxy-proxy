@@ -19,7 +19,7 @@ mod streams;
 pub use async_trait::async_trait;
 pub use config::{Capabilities, Capability, LayerConfig, LayerLimits};
 pub use error::{Budget, LayerError, LoadError};
-pub use exchange::LayerOutcome;
+pub use exchange::{LayerOutcome, Running};
 pub use head::MAX_FIELDS_BYTES;
 pub use host::{
     EndpointError, EndpointPermit, FlowInfo, HostError, LayerHost, LayerRequest, LayerResponse,

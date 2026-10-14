@@ -218,11 +218,13 @@ the client's request body into the first layer, and the last layer's
 `next` runs the rules, the upstream, then the in-flight rules on the
 response. A layer's answer goes to the client as soon as the layer gives
 it, and a request it forwarded runs on below to its end; the flow is
-logged once the core has had its say on that request. Once the response is
-complete and no layer forwarded the request, the rest of the client's
-upload is dropped: on HTTP/1.1 the codec drains or closes as it does after
-a deny ([HTTP](/reference/http#deny-responses)), on HTTP/2 the stream is
-reset with no error.
+logged once the core has had its say on that request and the response
+from upstream, if there was one, has ended in the layer that took it. Once
+the response is complete (with its head, for a `204`, a `304` or a `HEAD`)
+and no layer that ran can still forward, the rest of the client's upload is
+dropped: on HTTP/1.1 the codec drains or closes as it does after a deny
+([HTTP](/reference/http#deny-responses)), on HTTP/2 the stream is reset
+with no error.
 
 - What a layer passes on is re-validated as strictly as a client request:
   an absolute `http(s)` URI; `host`, hop-by-hop and framing fields refused

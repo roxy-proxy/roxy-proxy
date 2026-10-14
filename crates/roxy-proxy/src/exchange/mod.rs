@@ -194,10 +194,18 @@ where
         cx.record.reason.get_or_insert(reason);
     }
     // One source for both fronts: `refusal_response` sets `res.meta.close`
-    // from the same field.
+    // from the same field. A refusal of a forward made after the response
+    // was written asked through the stack.
     let close = match &refusal {
         Some(r) => r.close,
-        None => closing || stop.as_ref().is_some_and(|s| s.refusal.close),
+        None => {
+            closing
+                || stop.as_ref().is_some_and(|s| s.refusal.close)
+                || cx
+                    .stack
+                    .as_ref()
+                    .is_some_and(|st| st.close.load(std::sync::atomic::Ordering::Relaxed))
+        }
     };
     if let Some(r) = &refusal {
         finish_refusal(&mut cx, r);

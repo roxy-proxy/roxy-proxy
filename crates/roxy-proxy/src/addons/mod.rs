@@ -219,6 +219,8 @@ struct LayerSlot {
     ran: AtomicBool,
     /// An enforce layer that is still running: it may yet forward.
     live: AtomicBool,
+    /// The response from upstream is still streaming into the layer.
+    response_open: AtomicBool,
     /// Bodies bypassing the layer (enforce mode, head-only subscription).
     bypass: Mutex<subscribe::Bypass>,
     /// The layer failed: any forward of its still running is given up.
@@ -296,6 +298,9 @@ pub(crate) struct StackFlow {
     /// layer passes on inherits: a layer cannot express the protocol
     /// version, the target form or an upgrade.
     client_meta: RequestMeta,
+    /// The client's request is a `HEAD`: it gets no response body, whatever
+    /// a layer answers.
+    client_head: bool,
     loan: reclaim::Loan,
     layers: Box<[LayerSlot]>,
     /// Who is to blame for the exchange failing, if it does.
@@ -334,6 +339,7 @@ impl StackFlow {
             meta: cx.meta.clone(),
             facts: Mutex::new(cx.facts.clone()),
             client_meta: req.meta.clone(),
+            client_head: req.method == roxy_http::Method::Head,
             loan: reclaim::Loan::new(),
             layers: cx
                 .snap
@@ -356,11 +362,16 @@ impl StackFlow {
     }
 
     /// Stops whatever the stack still has running: a core forwarding a
-    /// request, the pumps feeding layers. For an exchange the front has
-    /// given up on, or refused; never for one a layer merely answered.
+    /// request, the pumps feeding layers, bodies parked for a forward that
+    /// will not come. For an exchange the front has given up on, or
+    /// refused; never for one a layer merely answered.
     pub(crate) fn tear_down(&self) {
         self.loan.torn_down.cancel();
         self.snip.cancel();
+        for index in 0..self.layers.len() {
+            subscribe::release_request(self, index);
+        }
+        self.loan.changed();
     }
 
     /// Cancelled when the exchange is torn down.
@@ -369,14 +380,15 @@ impl StackFlow {
     }
 
     /// Takes the flow context back for the record: once the core has
-    /// returned it, and nothing in the stack can still forward. A layer's
-    /// answer reaching the client says nothing about the request it
-    /// forwarded, or may yet forward, which runs to its end first.
+    /// returned it, nothing in the stack can still forward, and no response
+    /// from upstream is still streaming into a layer. A layer's answer
+    /// reaching the client says nothing about the request it forwarded, or
+    /// may yet forward, which runs to its end first.
     async fn reclaim(&self) -> FlowCx {
         let cx = self
             .loan
             .wait_until(|loan| {
-                if self.can_forward() {
+                if self.can_forward() || self.response_open() {
                     return None;
                 }
                 loan.take()
@@ -387,13 +399,50 @@ impl StackFlow {
     }
 
     /// A request may still reach the core: a forward is on its way or
-    /// running, or a layer is still alive without having forwarded.
+    /// running, or a layer is still alive without having forwarded. Not
+    /// once the exchange is torn down: the core takes nothing then.
     fn can_forward(&self) -> bool {
+        if self.loan.torn_down.is_cancelled() {
+            return false;
+        }
         self.layers.iter().any(|l| match l.state() {
             NextState::Pending => true,
             NextState::Entered => l.live.load(Ordering::SeqCst),
             NextState::Unentered | NextState::Resolved | NextState::Abandoned => false,
         })
+    }
+
+    /// The response from upstream has started into layer `index`, or has
+    /// ended there (complete, cut or dropped).
+    pub(super) fn response_streaming(&self, index: usize, open: bool) {
+        self.layers[index]
+            .response_open
+            .store(open, Ordering::SeqCst);
+        if !open {
+            self.lanes_changed();
+        }
+    }
+
+    /// A response from upstream is still streaming into some layer.
+    fn response_open(&self) -> bool {
+        !self.loan.torn_down.is_cancelled()
+            && self
+                .layers
+                .iter()
+                .any(|l| l.response_open.load(Ordering::SeqCst))
+    }
+
+    /// Layer `index` is forwarding: a forward of its has been accepted,
+    /// whether or not the call that carries it has run.
+    pub(crate) fn forward_requested(&self, index: usize) -> bool {
+        self.layers[index].state() == NextState::Pending
+    }
+
+    /// Layer `index` failed after answering: any forward of its still
+    /// running is given up, and it forwards nothing more.
+    pub(crate) fn layer_failed(&self, index: usize) {
+        self.layers[index].cancel.cancel();
+        self.layer_done(index);
     }
 
     fn set_next(&self, index: usize, state: NextState) {
@@ -797,6 +846,11 @@ fn stack_outcome(
     let upgraded_body = (resp.status() == http::StatusCode::SWITCHING_PROTOCOLS)
         .then(|| std::mem::take(resp.body_mut()));
     let mut res = from_upstream_response(resp, &st.snap.limits);
+    // A body the front never writes (a bodiless status, a HEAD) ends
+    // nothing: the response is complete with its head.
+    if res.status_forbids_body() || st.client_head {
+        st.response_complete();
+    }
     res.body = lanes::completing(
         st,
         lanes::gated(std::mem::take(&mut res.body), st.shared.sink.clone()),
@@ -947,18 +1001,31 @@ pub(crate) fn enter(
                     call: None,
                 });
                 match layer.handle(h, req).await {
-                    Ok(r) => {
+                    Ok(mut r) => {
                         // The guest runs on after answering, and may still
-                        // forward, until its handler returns.
-                        if let Some(outcome) = r.extensions().get::<roxy_wasm::LayerOutcome>() {
-                            let outcome = outcome.clone();
-                            let st = st.clone();
-                            tokio::spawn(async move {
-                                let _ = outcome.wait().await;
-                                st.layer_done(index);
-                            });
-                        } else {
-                            st.layer_done(index);
+                        // forward, until its handler returns: kept running
+                        // whether or not the front writes its body, and
+                        // cancelled with the exchange.
+                        let running = r.extensions_mut().remove::<roxy_wasm::Running>();
+                        match r.extensions().get::<roxy_wasm::LayerOutcome>().cloned() {
+                            Some(outcome) => {
+                                let st = st.clone();
+                                tokio::spawn(async move {
+                                    let torn_down = st.torn_down();
+                                    let failed = tokio::select! {
+                                        biased;
+                                        r = outcome.wait() => r.is_err(),
+                                        () = torn_down.cancelled() => true,
+                                    };
+                                    drop(running);
+                                    if failed {
+                                        st.layer_failed(index);
+                                    } else {
+                                        st.layer_done(index);
+                                    }
+                                });
+                            }
+                            None => st.layer_done(index),
                         }
                         Ok(r)
                     }
@@ -1051,6 +1118,15 @@ pub(crate) fn below(
         let enforcing = st.layers[index].ran.load(Ordering::SeqCst)
             && st.snap.addons[index].mode == AddonMode::Enforce;
         match r {
+            // A `101`'s body is the relayed socket, open for its life: not
+            // a response the record waits for.
+            Ok(res) if enforcing && res.status() != StatusCode::SWITCHING_PROTOCOLS => {
+                Ok(subscribe::detach_response(
+                    &st,
+                    index,
+                    res.map(|body| lanes::draining(&st, index, body)),
+                ))
+            }
             Ok(res) if enforcing => Ok(subscribe::detach_response(&st, index, res)),
             other => other,
         }

@@ -496,7 +496,10 @@ async fn run(
         clock.clone(),
     ));
 
-    let res = match clock.answer_by(answers.answer).await {
+    let res = match clock
+        .answer_by(answers.answer, || st.forward_requested(index))
+        .await
+    {
         Ok(answer) => answer?,
         // The service's own deadline: it is told which, as for any fault
         // of its own.
@@ -529,8 +532,9 @@ async fn forward(
         return;
     };
     // A stream reset as the forward arrived (a missed deadline, the client
-    // gone) has told the service nothing more happens on it.
-    if stream.is_ended() {
+    // gone) has told the service nothing more happens on it. One that
+    // ended on the service's last message has not: the forward runs.
+    if stream.is_broken() {
         st.forward_dropped(index);
         return;
     }
@@ -588,10 +592,15 @@ impl Clock {
     }
 
     /// The service's answer, within the clock. An answer that lands as the
-    /// deadline passes is still an answer: the timeout polls the channel
-    /// and then the clock, so it reports elapsed with a value already
-    /// queued.
-    async fn answer_by<T>(&self, mut answer: oneshot::Receiver<T>) -> Result<T, ServiceError> {
+    /// deadline passes is still an answer, and so is a forward accepted by
+    /// then (`forwarded`) that the task carrying it has yet to pick up:
+    /// the timeout polls the channel and the stream's state before the
+    /// clock, so it reports elapsed with a value already queued.
+    async fn answer_by<T>(
+        &self,
+        mut answer: oneshot::Receiver<T>,
+        forwarded: impl Fn() -> bool,
+    ) -> Result<T, ServiceError> {
         let mut deadline = self.deadline.subscribe();
         loop {
             let at = *deadline.borrow_and_update();
@@ -609,13 +618,16 @@ impl Clock {
                 // Cannot fail: this clock holds the sender.
                 _ = deadline.changed() => {}
                 () = expiry => {
-                    return match answer.try_recv() {
-                        Ok(v) => Ok(v),
+                    match answer.try_recv() {
+                        Ok(v) => return Ok(v),
                         Err(TryRecvError::Closed) => {
-                            Err(ServiceError::Closed("the stream ended".into()))
+                            return Err(ServiceError::Closed("the stream ended".into()));
                         }
-                        Err(TryRecvError::Empty) => Err(ServiceError::Timeout("first_byte_timeout")),
-                    };
+                        Err(TryRecvError::Empty) if forwarded() => self.stop(),
+                        Err(TryRecvError::Empty) => {
+                            return Err(ServiceError::Timeout("first_byte_timeout"));
+                        }
+                    }
                 }
             }
         }
