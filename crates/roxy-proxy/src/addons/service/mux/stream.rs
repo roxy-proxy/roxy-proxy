@@ -48,6 +48,11 @@ pub(crate) struct Stream {
     pub(super) wire: Arc<Wire>,
     /// Host-service calls waiting for the stream's worker, once it has one.
     pub(super) calls: Mutex<Option<mpsc::Sender<Call>>>,
+    /// The stream's place on the connection, kept past its end while the
+    /// worker runs the calls queued before it, so what a service leaves
+    /// behind on ended streams is bounded by `max_streams` like its open
+    /// ones.
+    pub(super) draining: Mutex<Option<Reservation>>,
 }
 
 pub(super) struct StreamState {
@@ -272,9 +277,14 @@ impl Stream {
             End::Failed { e, .. } if self.mode == AddonMode::Observe => Some(e.clone()),
             End::Quiet | End::Failed { .. } | End::Abandoned(_) | End::BodyFailed(..) => None,
         };
-        let Some(ending) = lock(&self.state).end(observe_error) else {
+        let Some(mut ending) = lock(&self.state).end(observe_error) else {
             return false;
         };
+        // Handed over before the end wakes the worker, which lets the
+        // place go once it has drained.
+        if lock(&self.calls).is_some() {
+            *lock(&self.draining) = ending.slot.take();
+        }
         self.ended.cancel();
         lock(&self.link.shared.streams).open.remove(&self.id);
         drop(ending.slot);
@@ -697,8 +707,14 @@ impl Stream {
     /// results have nowhere to go. A failure on an open stream fails it, so
     /// the exchange, as it would a WASM layer's, and drops the calls behind
     /// it; after the end there is nothing left to fail, so a failing call
-    /// is logged and the rest still run.
-    async fn host_calls(self: Arc<Self>, mut rx: mpsc::Receiver<Call>) {
+    /// is logged and the rest still run. The stream's place on the
+    /// connection goes once the worker is done.
+    async fn host_calls(self: Arc<Self>, rx: mpsc::Receiver<Call>) {
+        self.run_calls(rx).await;
+        drop(lock(&self.draining).take());
+    }
+
+    async fn run_calls(&self, mut rx: mpsc::Receiver<Call>) {
         loop {
             let next = tokio::select! {
                 biased;
@@ -871,6 +887,7 @@ pub(crate) async fn open(
             ended: CancellationToken::new(),
             wire: Arc::default(),
             calls: Mutex::new(None),
+            draining: Mutex::new(None),
         });
         s.open.insert(id, stream.clone());
         stream

@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::link::{Link, LinkShared, LinkState, Queued, binary, binary_frame};
 use super::lock;
-use super::pool::Pool;
+use super::pool::{Pool, Reservation};
 use super::stream::{
     Answers, MAX_BODY_FRAME, MAX_HOST_CALLS_WAITING, Phase, Stream, StreamState, open,
 };
@@ -42,12 +42,19 @@ fn failed_link() -> Arc<Link> {
 /// answers an exchange would wait on. What the stream sends goes
 /// nowhere.
 async fn lone_stream() -> (Arc<Stream>, Answers, crate::testkit::Kit) {
-    lone_stream_of(testing::addon("s", "pass", AddonMode::Enforce, |_| {})).await
+    lone_stream_of(
+        testing::addon("s", "pass", AddonMode::Enforce, |_| {}),
+        None,
+    )
+    .await
 }
 
 /// [`lone_stream`] for the layer `addon`, in its mode (an observe
-/// stream's answers go unused).
-async fn lone_stream_of(addon: Arc<AddonSpec>) -> (Arc<Stream>, Answers, crate::testkit::Kit) {
+/// stream's answers go unused), holding `slot` in a pool if given.
+async fn lone_stream_of(
+    addon: Arc<AddonSpec>,
+    slot: Option<Reservation>,
+) -> (Arc<Stream>, Answers, crate::testkit::Kit) {
     let mode = addon.mode;
     let kit = testing::kit(ALLOW_UP, vec![addon]).await;
     let (st, _cx) = crate::addons::test_flow(&kit);
@@ -70,11 +77,12 @@ async fn lone_stream_of(addon: Arc<AddonSpec>) -> (Arc<Stream>, Answers, crate::
         st,
         index: 0,
         mode,
-        state: Mutex::new(StreamState::new(phase, None)),
+        state: Mutex::new(StreamState::new(phase, slot)),
         more_credit: Notify::new(),
         ended: CancellationToken::new(),
         wire: Arc::default(),
         calls: Mutex::new(None),
+        draining: Mutex::new(None),
     });
     lock(&link.shared.streams).open.insert(1, stream.clone());
     (stream, Answers { first, second }, kit)
@@ -260,7 +268,7 @@ async fn a_call_queued_before_the_end_still_runs() {
         testing::addon("s", "pass", AddonMode::Enforce, |_| {}),
         &[roxy_wasm::Capability::Record],
     );
-    let (stream, _answers, kit) = lone_stream_of(addon).await;
+    let (stream, _answers, kit) = lone_stream_of(addon, None).await;
     stream.control(In::Call(Call::Record {
         id: 7,
         kind: "late".to_owned(),
@@ -273,6 +281,42 @@ async fn a_call_queued_before_the_end_still_runs() {
     assert_eq!(r[0]["call"], 7, "{r:#?}");
 }
 
+/// An ended stream keeps its place on the connection while the calls
+/// queued before its end still run, so what a service leaves behind on
+/// ended streams is bounded like its open ones; the place goes once they
+/// have run. The worker has not run when the stream is reset, so the call
+/// is still queued then.
+#[tokio::test]
+async fn an_ended_stream_keeps_its_place_until_its_calls_have_run() {
+    let pool = Arc::new(Pool {
+        entries: Mutex::new(Vec::new()),
+        freed: Notify::new(),
+        max_connections: 1,
+        max_streams: 1,
+        retired: AtomicBool::new(false),
+    });
+    let slot = pool.reserve().await;
+    let addon = testing::granted(
+        testing::addon("s", "pass", AddonMode::Observe, |_| {}),
+        &[roxy_wasm::Capability::Record],
+    );
+    let (stream, _answers, kit) = lone_stream_of(addon, Some(slot)).await;
+    stream.control(In::Call(Call::Record {
+        id: 1,
+        kind: "late".to_owned(),
+        data: serde_json::json!({}),
+    }));
+    stream.reset("the exchange ended");
+    assert_eq!(
+        lock(&pool.entries)[0].reserved,
+        1,
+        "the place is held while the call waits to run"
+    );
+    kit.events("layer_record", 1).await;
+    let place = tokio::time::timeout(Duration::from_millis(500), pool.reserve()).await;
+    assert!(place.is_ok(), "the place is free once the call has run");
+}
+
 /// A call handed to a stream that has already ended is dropped, with no
 /// worker started for it: the reader may still hold the stream after
 /// another task ended it, and the call crossed the end.
@@ -282,7 +326,7 @@ async fn a_call_after_the_end_is_dropped() {
         testing::addon("s", "pass", AddonMode::Observe, |_| {}),
         &[roxy_wasm::Capability::Record],
     );
-    let (stream, _answers, kit) = lone_stream_of(addon).await;
+    let (stream, _answers, kit) = lone_stream_of(addon, None).await;
     stream.reset("the exchange ended");
     stream.control(In::Call(Call::Record {
         id: 1,
@@ -314,7 +358,7 @@ async fn a_call_failing_after_the_end_is_logged() {
         testing::addon("s", "pass", AddonMode::Observe, |_| {}),
         &[roxy_wasm::Capability::Record],
     );
-    let (stream, _answers, kit) = lone_stream_of(addon).await;
+    let (stream, _answers, kit) = lone_stream_of(addon, None).await;
     stream.control(In::Call(Call::StateGet {
         id: 9,
         key: "k".to_owned(),

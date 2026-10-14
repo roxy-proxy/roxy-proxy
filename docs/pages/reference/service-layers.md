@@ -151,8 +151,9 @@ At most 64 calls may be waiting, and more is a protocol violation. Calls
 the service sent before the stream ended still run once it has (a `record`
 sent just before its `response_end`, say): the effect stands, but the
 `result` is not sent, and one that fails is logged (`layer_error`) without
-stopping the rest. A call sent on a stream that has ended is dropped and
-never answered.
+stopping the rest; the stream keeps its place on the connection until they
+have run. A call sent on a stream that has ended is dropped and never
+answered.
 
 A call without its capability, a `log` message or a `record` kind and
 document together over 64 KiB, an `add_tag`, `state_put` or `quarantine`
