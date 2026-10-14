@@ -8,8 +8,9 @@ How roxy speaks TLS to clients. The CA itself is in
 Minted on demand per host: a DNS SAN, or an IP SAN for IP targets; ECDSA
 P-256; 7-day validity, or until the CA expires if sooner; signed by the CA;
 all leaves share one key pair. Cached in an LRU of `tls.leaf_cache_size`
-entries, minted on the blocking pool for the name the handshake will serve
-(the SNI, or the CONNECT host when the client sends none).
+entries (at least 1; `roxy check` refuses 0), minted on the blocking pool
+for the name the handshake will serve (the SNI, or the CONNECT host when
+the client sends none).
 
 ## Client-facing TLS
 

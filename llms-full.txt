@@ -17,7 +17,7 @@ Sitemap:
 - [How roxy works](/design/how-it-works): One exchange through roxy: decrypt and parse, the addon stack, the rules, the connector, and the response back up the same path, with every stage and every exit written to the flow log.
 - [Threat model and guarantees](/design/threat-model)
 - [Policy evaluation](/design/policy-evaluation): How the rules decide an exchange: one admission decision on the request head, in-flight re-checks as bytes stream, deny wins, and how effects, tags and unavailable inputs behave.
-- [Addon model](/design/addon-model)
+- [Addon model](/design/addon-model): What an addon layer is, how the stack is shaped, the invariants every layer is held to, how the bytes and the host-service effects of one layer are ordered against another's, and what the modes mean.
 - [Performance](/design/performance)
 - [Configuration](/reference/configuration)
 - [Rule language](/reference/rule-language)
@@ -916,7 +916,7 @@ tls:
   # ca_cert: /etc/roxy/ca/tls.crt  # a provided CA instead; set both or neither
   # ca_key: /etc/roxy/ca/tls.key
   require_sni_match: true
-  leaf_cache_size: 10000
+  leaf_cache_size: 10000       # at least 1
 ```
 
 ## Generated CA
@@ -1422,22 +1422,15 @@ bytes, and the metric values this exchange adds to. Rules are **one ordered
 list** of conditions over those values. There are no phases: when a rule
 runs follows from what it reads.
 
-<img src={requestTiming} alt="The request phase of one exchange through roxy, left to right. The client's request head (a solid line) travels first and its body bytes (a dashed line) stream behind it, through layer A (enforce), past layer B (observe, which gets a copy beside the path), through layer C (enforce) and the rules, then on to the upstream. Each layer's when is evaluated on the head as it reaches the layer. Layer C calls state-put mid-body, awaits the result from the host services strip along the bottom, then continues the body. At the rules the admission decision is made once, on the head, after the stack and before anything is forwarded (when a rule reads body.text, the body is buffered first): allow, deny or change the request. As body bytes stream past the rules they are re-checked in flight (body.bytes, byte metrics), which can deny or quarantine but never allow or change the request. A note says that after admission the decision stands: a tag or state write is seen by the next rule that reads it (an in-flight re-check of this exchange, or a later exchange's admission)." />
+<img src={requestTiming} alt="The request phase of one exchange through roxy, left to right. The client's request head (a solid line) travels first and its body bytes (a dashed line) stream behind it, through layer A (enforce), past layer B (observe, which gets a copy beside the path), through layer C (enforce) and the rules, then on to the upstream. Each layer's when is evaluated on the head as it reaches the layer. At the rules the admission decision is made once, on the head, after the stack and before anything is forwarded (when a rule reads body.text, the body is buffered first): allow, deny or change the request. As body bytes stream past the rules they are re-checked in flight (body.bytes, byte metrics), which can deny or quarantine but never allow or change the request." />
 
 A request is judged at two points. Each layer's `when` is checked on the
 head as it arrives; the rules decide the head once, after the whole stack
 and before anything is forwarded (if a rule reads `body.text`, the body is
 buffered up to the cap first: [body rules](/reference/rule-language#body-rules)),
-then re-check the body as its bytes stream past. A layer may call a
-[host service](/reference/host-services) at any point, including mid-body:
-a WASM layer's call returns before it continues, and a service layer awaits
-the `result` before sending whatever the effect must precede
-([host services on a stream](/reference/service-layers#host-services)).
-Either way, a tag or state write reaches the admission rules only if it
-lands before the request is forwarded. A write that lands after the
-admission decision never reopens it: it is seen by the next rule that reads
-the tag or the store, whether an in-flight re-check of this exchange or a
-later exchange's admission.
+then re-check the body as its bytes stream past. When a layer's tag or
+state write becomes visible to the rules, and to the layers below it, is a
+matter of [ordering across layers](/design/addon-model#ordering-across-layers).
 
 1. **The forwarding decision is made at the request head, and deny wins.**
    roxy evaluates every rule whose values are known at that point. If any
@@ -1549,6 +1542,49 @@ The stack is a pipeline: every layer runs at once, as its own task, each
 seeing what the layer above passed on, so on a long stream each works on a
 different chunk at the same time. Observe layers get copies and run beside
 the stream rather than in it.
+
+## Ordering across layers
+
+Two things come out of a layer, and roxy orders only one of them.
+
+The exchange's bytes form a pipeline. A head or a chunk reaches layer B
+only after layer A has sent it on, and A may hold, rewrite or drop it on
+the way: what B reads is what A passed, in the order A passed it, and the
+rules admit the request the last layer forwarded. The response is the same
+pipeline the other way up: the rules see the upstream's bytes first, then
+B, and A gets a chunk only after B has passed it. This holds for enforce
+layers of either kind. An observer is in neither order: it reads a copy
+beside the pipeline, holds nothing up, and can neither tag nor write
+state, so the rest of this section is about enforce layers.
+
+Host-service effects are not in that pipeline. `add_tag`, `state_put`,
+`record` and `quarantine` go to the host beside the bytes, not down the
+stack. A layer's calls on an exchange run on their own worker, in the
+order the layer made them, and roxy orders nothing between one layer's call and another
+layer's read: A's `state_put` and B's `state_get` are concurrent unless A
+awaits its `result` before sending the bytes B will read. B cannot read on
+a chunk it has not received, so the await puts A's write ahead of B's
+read. A WASM layer's call is a synchronous function that returns before
+the layer continues, so it has that order by construction; a service layer
+sends the call as a message and awaits the `result` itself
+([host services on a stream](/reference/service-layers#host-services)).
+
+<img src={layerOrdering} alt="Two enforce layers, A and B, in roxy's request path, left to right, then the rules. The client's head (a solid line) and body bytes (a dashed line) run through A, then B, then to the rules; the gap between A and B is labelled: a chunk reaches B only after A sends it. Part-way through the body, A calls state_put, drawn as an arrow down to a host services strip along the bottom with a result arrow back up, and the note awaits result, then sends on; A's body line is broken at that point. In B, on the chunk that followed, a state_get arrow goes down to the strip and a result comes back, with the note on that chunk: sees A's write. A dotted line between the two calls says ordered only by A's await. The strip reads host services (add_tag, state_put, state_get, record, quarantine, and more): beside the pipeline. Under it: each layer's calls run on their own worker, so A's put lands before B's get only because A awaited its result; a write for this exchange's admission lands before the request is forwarded; any other is seen by the next rule that reads it: a tag in flight on this exchange, state there or at a later exchange's admission." />
+
+So, to make an effect visible:
+
+* **to the layers below**: await the `result` before sending the head or
+  chunk whose handling should see it (a WASM layer's call has returned by
+  the time it sends anything);
+* **to this exchange's admission rules**: land it before the request is
+  forwarded, so before the layer calls `next` or the service sends its
+  forwarded `request` head;
+* **otherwise**, the write is seen by the next rule that reads it. A tag
+  lives on this exchange, so that is an in-flight re-check of it; state
+  persists, so it is that or a later exchange's admission. The write does
+  not itself trigger a re-check: a rule runs when a value it watches
+  changes, and reads the tag or key then. A write never reopens a decision
+  already made ([policy evaluation](/design/policy-evaluation#evaluation)).
 
 ## Invariants
 
@@ -2872,9 +2908,13 @@ tls:
     min_version: "1.2"         # "1.2" | "1.3"
 ```
 
-`deny_cidrs` and `allow_cidrs` entries are stored as address-list entries
-are: an IPv4-mapped entry (`::ffff:203.0.113.0/120`) becomes the IPv4 CIDR
-(`203.0.113.0/24`) and matches the address however a client spells it.
+`deny_cidrs` and `allow_cidrs` entries are normalised like address-list
+entries: an IPv4-mapped entry (`::ffff:203.0.113.0/120`) becomes the IPv4
+CIDR (`203.0.113.0/24`) and matches the address however a client spells
+it. An entry must be a network: `roxy check` refuses one with host bits
+set (`10.1.2.3/8`) and names the network it would have meant.
+`static_hosts` keys are host names as a request carries them (ASCII
+labels, IDNA already converted to A-labels), not IP addresses.
 
 ## DNS
 
@@ -2938,8 +2978,9 @@ How roxy speaks TLS to clients. The CA itself is in
 Minted on demand per host: a DNS SAN, or an IP SAN for IP targets; ECDSA
 P-256; 7-day validity, or until the CA expires if sooner; signed by the CA;
 all leaves share one key pair. Cached in an LRU of `tls.leaf_cache_size`
-entries, minted on the blocking pool for the name the handshake will serve
-(the SNI, or the CONNECT host when the client sends none).
+entries (at least 1; `roxy check` refuses 0), minted on the blocking pool
+for the name the handshake will serve (the SNI, or the CONNECT host when
+the client sends none).
 
 ## Client-facing TLS
 
@@ -3616,10 +3657,13 @@ beside the bodies: they neither wait for nor hold up the heads and bytes,
 and roxy promises no order between a call and the heads or bytes the
 service sends after it. The service orders it: it awaits the `result`
 before sending whatever the effect must precede, be that the request, the
-response or the rest of a body. Today a call's tag or state write is seen
-by this exchange's admission rules only if it lands before the request is
-forwarded, and by later exchanges always; in-flight rules do not yet read
-tag or state values ([#509](https://github.com/roxy-proxy/roxy-proxy/issues/509)).
+response or the rest of a body
+([ordering across layers](/design/addon-model#ordering-across-layers)). A call's tag or state write is seen by
+this exchange's admission rules only if it lands before the request is
+forwarded; otherwise by the next rule that reads it: for a tag, which
+lives on this exchange, an in-flight re-check of it; for state, which
+persists, that or a later exchange's admission. A write does not itself
+trigger a re-check ([#509](https://github.com/roxy-proxy/roxy-proxy/issues/509)).
 At most 64 calls may be waiting, and more is a protocol violation. A call
 on a stream that has ended is dropped and never answered.
 

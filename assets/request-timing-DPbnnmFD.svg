@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="402" viewBox="0 0 880 402" font-family="Inter, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13">
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="302" viewBox="0 0 880 302" font-family="Inter, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13">
   <defs>
     <marker id="req" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"/>
@@ -18,7 +18,7 @@
   <text x="827" y="198" fill="#16201e" font-weight="600" text-anchor="middle">upstream</text>
 
   <!-- roxy -->
-  <rect x="118" y="60" width="650" height="322" rx="10" fill="#ffffff" stroke="#0f766e" stroke-width="1.5"/>
+  <rect x="118" y="60" width="650" height="222" rx="10" fill="#ffffff" stroke="#0f766e" stroke-width="1.5"/>
   <text x="132" y="81" fill="#0f766e" font-weight="600">roxy</text>
 
   <!-- legend: the head travels first, the body streams behind it -->
@@ -73,8 +73,7 @@
     </g>
     <g stroke-dasharray="6 4">
       <path d="M 140 206 H 230"/>
-      <path d="M 360 206 H 456"/>
-      <path d="M 474 206 H 480"/>
+      <path d="M 360 206 H 480"/>
       <path d="M 500 206 H 700"/>
     </g>
   </g>
@@ -93,21 +92,6 @@
     <text x="376" y="168" text-anchor="middle">when</text>
   </g>
 
-  <!-- layer C calls a host service mid-body and waits for the result -->
-  <g stroke="#0f766e" stroke-width="2">
-    <line x1="462" y1="200" x2="462" y2="212"/>
-    <line x1="468" y1="200" x2="468" y2="212"/>
-  </g>
-  <line x1="459" y1="216" x2="459" y2="338" stroke="#0f766e" stroke-width="1.5" marker-end="url(#req)"/>
-  <line x1="471" y1="338" x2="471" y2="216" stroke="#5f6b68" stroke-width="1.5" marker-end="url(#res)"/>
-  <text x="452" y="228" fill="#7e8986" font-size="10" text-anchor="end">state-put</text>
-  <text x="476" y="272" fill="#5f6b68" font-size="10">result</text>
-  <rect x="226" y="276" width="226" height="40" rx="6" fill="#ffffff" stroke="#cfd4d2"/>
-  <g fill="#7e8986" font-size="10" text-anchor="middle">
-    <text x="339" y="292">mid-body: the layer awaits the result,</text>
-    <text x="339" y="306">then continues the body</text>
-  </g>
-
   <!-- the rules: one admission decision on the head, re-checks as the body streams -->
   <path d="M 530 172 L 538 180 L 530 188 L 522 180 Z" fill="#ffffff" stroke="#0f766e" stroke-width="1.5"/>
   <g fill="#0f766e">
@@ -122,16 +106,4 @@
     <text x="600" y="240">body.bytes · byte metrics</text>
     <text x="600" y="252">deny or quarantine; never allow</text>
   </g>
-
-  <!-- a tag or state write after the admission decision -->
-  <rect x="498" y="276" width="258" height="52" rx="6" fill="#ffffff" stroke="#cfd4d2"/>
-  <g fill="#7e8986" font-size="10" text-anchor="middle">
-    <text x="627" y="291">after admission the decision stands: a tag or</text>
-    <text x="627" y="304">state write is seen by the next rule that reads it</text>
-    <text x="627" y="317">(an in-flight re-check, or a later exchange)</text>
-  </g>
-
-  <!-- host services -->
-  <rect x="140" y="340" width="608" height="30" rx="15" fill="#f8f9f8" stroke="#e6e8e7"/>
-  <text x="444" y="359" fill="#3d4846" font-size="12" text-anchor="middle">host services (log · record · add-tag · state-put · metric-get · …), callable at any point</text>
 </svg>

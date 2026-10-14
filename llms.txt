@@ -15,7 +15,7 @@ A strict, programmable HTTP firewall: an egress proxy for untrusted workloads, o
 - [How roxy works](/design/how-it-works): One exchange through roxy: decrypt and parse, the addon stack, the rules, the connector, and the response back up the same path, with every stage and every exit written to the flow log.
 - [Threat model and guarantees](/design/threat-model)
 - [Policy evaluation](/design/policy-evaluation): How the rules decide an exchange: one admission decision on the request head, in-flight re-checks as bytes stream, deny wins, and how effects, tags and unavailable inputs behave.
-- [Addon model](/design/addon-model)
+- [Addon model](/design/addon-model): What an addon layer is, how the stack is shaped, the invariants every layer is held to, how the bytes and the host-service effects of one layer are ordered against another's, and what the modes mean.
 - [Performance](/design/performance)
 - [Configuration](/reference/configuration)
 - [Rule language](/reference/rule-language)
