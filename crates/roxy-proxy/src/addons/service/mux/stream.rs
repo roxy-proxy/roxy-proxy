@@ -343,6 +343,17 @@ impl Stream {
         self.settle(End::Abandoned(why));
     }
 
+    /// The exchange was torn down under the stream: the service is told
+    /// why.
+    pub(crate) fn abandon(&self) {
+        self.reset(self.st.torn_down_why());
+    }
+
+    /// Resolves once the stream has ended, however it did.
+    pub(crate) async fn until_ended(&self) {
+        self.ended.cancelled().await;
+    }
+
     /// An observe stream: roxy sent all it had, and the service has
     /// `within` to send its last message (or a reset) before roxy fails it.
     /// How it ended, if it failed.

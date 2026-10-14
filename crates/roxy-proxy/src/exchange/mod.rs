@@ -153,10 +153,12 @@ where
     let closing = res.meta.close;
     let r = write(res).await;
     let failed = r.is_err();
-    if failed {
-        reclaim.tear_down();
-    } else {
-        reclaim.response_complete();
+    match &r {
+        Err(WriteFailure::ClientGone(_) | WriteFailure::ClientStalled) => {
+            reclaim.tear_down(crate::addons::CLIENT_GONE);
+        }
+        Err(_) => reclaim.tear_down(crate::addons::ENDED),
+        Ok(()) => reclaim.response_complete(),
     }
     let mut cx = Box::new(reclaim.take().await);
     cx.record.response_status = Some(status);
@@ -452,7 +454,7 @@ pub(crate) async fn process<F: Front>(
                 // rather than drop it mid-handshake.
                 tokio::spawn(close_upstream_ws(upstream));
             }
-            reclaim.tear_down();
+            reclaim.tear_down(crate::addons::ENDED);
             let mut cx = reclaim.take().await;
             let refusal = cx
                 .late_quarantine_refusal()

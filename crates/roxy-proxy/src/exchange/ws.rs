@@ -143,6 +143,11 @@ async fn close_spliced(client: Option<crate::addons::SplicedClient>) {
 
 /// Logs the end of a relayed WebSocket and its exchange.
 fn finish_websocket(cx: &mut FlowCx, r: Relayed) {
+    // The relay is over: a layer still holding a side of the socket (a
+    // service's stream with a body open) is told so.
+    if let Some(st) = &cx.stack {
+        st.tear_down(crate::addons::ENDED);
+    }
     cx.shared.sink.emit(&FlowEvent::WsClose {
         ts: chrono::Utc::now(),
         flow: cx.flow.to_string(),

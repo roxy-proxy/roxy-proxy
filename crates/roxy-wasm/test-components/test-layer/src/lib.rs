@@ -667,6 +667,17 @@ impl Handler for Layer {
                 let (_below, from_below) = await_response(pending);
                 drop(read_all(&from_below));
             }
+            "next-then-trap" => {
+                // Forward the whole request, then trap as the response from
+                // below arrives: a failure with a response open at the
+                // layer.
+                let (pending, output) = next_streaming(&forward_head(&req));
+                pump(&body, &output, false);
+                drop(body);
+                types::finish(output);
+                let _below = await_response(pending);
+                panic!("layer panics on the response");
+            }
             "cut-then-await" => {
                 // Stream `x-read-bytes` of the body into `next`, leave it
                 // unfinished while still waiting on the response, then

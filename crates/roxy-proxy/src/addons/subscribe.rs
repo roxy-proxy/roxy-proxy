@@ -109,7 +109,21 @@ pub(super) fn reattach_request(
 /// Drops a request body still parked at layer `index`: nothing will pass
 /// its head on, so the body goes the way of one a layer dropped unread.
 pub(super) fn release_request(st: &StackFlow, index: usize) {
-    drop(lock(&st.layers[index].bypass).request.take());
+    let parked = lock(&st.layers[index].bypass).request.take();
+    drop(parked);
+}
+
+/// Drops whatever is parked at layer `index`, and parks nothing more there:
+/// the layer failed, or the exchange is being torn down, so no answer of
+/// the layer's will take a body back. Dropped outside the lock: a body's
+/// drop tells whoever fed it.
+pub(super) fn release(st: &StackFlow, index: usize) {
+    let parked = {
+        let mut bypass = lock(&st.layers[index].bypass);
+        bypass.answered = true;
+        (bypass.request.take(), bypass.response.take())
+    };
+    drop(parked);
 }
 
 /// Takes the response body away from enforce layer `index` when it is

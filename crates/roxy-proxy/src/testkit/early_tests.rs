@@ -446,3 +446,39 @@ async fn h2_a_guest_answering_bodiless_still_completes_its_forward() {
     assert_eq!(seen[0].complete, Some(true), "{:?}", seen[0]);
     assert_eq!(seen[0].body.len(), 2 * CHUNK);
 }
+
+/// A service that forwards, answers with no body, and ends its answer only
+/// once the response from below has: the front writes nothing for the
+/// answer and drops its body lane while the forward is still running,
+/// which is not the client going away. Nothing resets the stream, the
+/// forward completes, and the stream ends on the service's last message.
+#[tokio::test]
+async fn h2_a_service_answering_bodiless_still_completes_its_forward() {
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![testing::addon(
+            "s",
+            "early-no-content",
+            AddonMode::Enforce,
+            |_| {},
+        )],
+    )
+    .await;
+    let mut c = kit.tunnel("up.test", true).await;
+    let (mut tx, pending) = upload(&mut c, &[], 1).await;
+    let a = answer_mid_upload(pending).await;
+    assert_eq!(a.status, 204, "{a:?}");
+    tx.send_data(Bytes::from(vec![b'x'; CHUNK])).await.unwrap();
+    tx.finish().await.unwrap();
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].complete, Some(true), "{:?}", seen[0]);
+    assert_eq!(seen[0].body.len(), 2 * CHUNK);
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "answered", "{ev:#}");
+    let svc = kit.upstream.service();
+    assert!(
+        svc.resets().is_empty(),
+        "nothing reset the stream: {:?}",
+        svc.resets()
+    );
+}

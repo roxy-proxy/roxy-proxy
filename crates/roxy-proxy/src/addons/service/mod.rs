@@ -488,7 +488,7 @@ async fn run(
     let s = stream.clone();
     let head = request_head(&parts, &body);
     tokio::spawn(async move { s.pump(Dir::Request, head, body).await });
-    tokio::spawn(forward(
+    tokio::spawn(attend(
         st.clone(),
         index,
         stream.clone(),
@@ -513,19 +513,43 @@ async fn run(
     Ok(res)
 }
 
-/// The request lane below the service: the request it forwards, if it
-/// forwards one, run through the layers below and the core, and the
-/// response that comes back streamed into the service. Independent of the
-/// service's answer: the forward runs to its end whether the service
-/// answers before, during or after it. The exchange being torn down ends
-/// it; the service's own stream ending does not, the response from below
-/// then has nowhere to go and is dropped as it arrives.
-async fn forward(
+/// Attends the stream for the life of the exchange: runs the request lane
+/// below the service, then stays until the stream has ended (the service
+/// may hold a body open long after its forward is through). The exchange
+/// being torn down before that resets the stream, whatever the lane is
+/// doing: nothing more happens on it.
+async fn attend(
     st: Arc<StackFlow>,
     index: usize,
     stream: Arc<mux::Stream>,
     forward: oneshot::Receiver<LayerRequest>,
     clock: Clock,
+) {
+    let torn_down = st.torn_down();
+    let lane = async {
+        forward_lane(&st, index, &stream, forward, &clock).await;
+        stream.until_ended().await;
+    };
+    tokio::select! {
+        biased;
+        () = torn_down.cancelled() => stream.abandon(),
+        () = lane => {}
+    }
+}
+
+/// The request lane below the service: the request it forwards, if it
+/// forwards one, run through the layers below and the core, and the
+/// response that comes back streamed into the service. Independent of the
+/// service's answer: the forward runs to its end whether the service
+/// answers before, during or after it. The service's own stream ending
+/// does not end it, the response from below then has nowhere to go and is
+/// dropped as it arrives.
+async fn forward_lane(
+    st: &Arc<StackFlow>,
+    index: usize,
+    stream: &mux::Stream,
+    forward: oneshot::Receiver<LayerRequest>,
+    clock: &Clock,
 ) {
     // `Err`: the stream ended without a forward.
     let Ok(req) = forward.await else {
@@ -539,16 +563,10 @@ async fn forward(
         return;
     }
     clock.stop();
-    let torn_down = st.torn_down();
-    let res = tokio::select! {
-        biased;
-        () = torn_down.cancelled() => Err(()),
-        r = super::below(st.clone(), index, req) => r.map_err(|_| ()),
-    };
-    // Only the client's own failure comes back as an error: the exchange
-    // is closing, and nothing upstream answers it.
-    let Ok(res) = res else {
-        stream.reset("the exchange ended");
+    // Only the client's own failure comes back as an error, and nothing
+    // upstream answers it.
+    let Ok(res) = super::below(st.clone(), index, req).await else {
+        stream.abandon();
         return;
     };
     // The response head goes at once, however far the client's upload
@@ -646,7 +664,7 @@ impl Guard {
 impl Drop for Guard {
     fn drop(&mut self) {
         if let Some(s) = self.0.take() {
-            s.reset("the exchange ended");
+            s.abandon();
         }
     }
 }

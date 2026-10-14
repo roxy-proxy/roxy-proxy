@@ -239,6 +239,12 @@ impl LayerSlot {
 
 /// Marks a layer's `next` pending, and settles it when `next` returns or
 /// is dropped unfinished.
+/// What a service is told when its exchange is torn down: the client is
+/// gone, or the exchange ended for another reason (refused, quarantined,
+/// the relay over).
+pub(crate) const CLIENT_GONE: &str = "the client went away";
+pub(crate) const ENDED: &str = "the exchange ended";
+
 struct NextGuard {
     st: Arc<StackFlow>,
     index: usize,
@@ -320,6 +326,9 @@ pub(crate) struct StackFlow {
     core_entered: AtomicBool,
     /// The client's response is complete.
     response_done: AtomicBool,
+    /// Why the exchange was torn down, for whatever the stack still ran
+    /// (a service's stream is reset with it).
+    torn_down_why: std::sync::OnceLock<&'static str>,
     /// The client's request lane is snipped: the response is complete and
     /// nothing upstream will consume the rest.
     snip: CancellationToken,
@@ -357,6 +366,7 @@ impl StackFlow {
             decided: std::sync::OnceLock::new(),
             core_entered: AtomicBool::new(false),
             response_done: AtomicBool::new(false),
+            torn_down_why: std::sync::OnceLock::new(),
             snip: CancellationToken::new(),
         }
     }
@@ -364,12 +374,14 @@ impl StackFlow {
     /// Stops whatever the stack still has running: a core forwarding a
     /// request, the pumps feeding layers, bodies parked for a forward that
     /// will not come. For an exchange the front has given up on, or
-    /// refused; never for one a layer merely answered.
-    pub(crate) fn tear_down(&self) {
+    /// refused; never for one a layer merely answered. `why` is what a
+    /// service still on the exchange is told.
+    pub(crate) fn tear_down(&self, why: &'static str) {
+        let _ = self.torn_down_why.set(why);
         self.loan.torn_down.cancel();
         self.snip.cancel();
         for index in 0..self.layers.len() {
-            subscribe::release_request(self, index);
+            subscribe::release(self, index);
         }
         self.loan.changed();
     }
@@ -377,6 +389,11 @@ impl StackFlow {
     /// Cancelled when the exchange is torn down.
     pub(crate) fn torn_down(&self) -> CancellationToken {
         self.loan.torn_down.clone()
+    }
+
+    /// Why the exchange ended, once it has been torn down.
+    pub(crate) fn torn_down_why(&self) -> &'static str {
+        self.torn_down_why.get().copied().unwrap_or(ENDED)
     }
 
     /// Takes the flow context back for the record: once the core has
@@ -810,9 +827,9 @@ pub(crate) async fn run<F: Front>(
         .await;
     let outcome = stack_outcome(&st, driven, client_tx);
     if !matches!(outcome, Outcome::Respond(_) | Outcome::Upgrade { .. }) {
-        st.tear_down();
+        st.tear_down(ENDED);
     }
-    (Reclaim::Stack(st), outcome)
+    (Reclaim::stack(st), outcome)
 }
 
 /// What the stack's answer means for the client. `client_tx` feeds the
@@ -1042,9 +1059,12 @@ pub(crate) fn enter(
             AddonImpl::Service(svc) => service::handle(st.clone(), index, svc, req).await,
         };
         if res.is_err() {
-            // A failed layer forwards nothing more, and any forward of its
-            // still running is given up.
+            // A failed layer forwards nothing more, any forward of its
+            // still running is given up, and the bodies parked for it are
+            // dropped: no answer of its will take them, and a response
+            // still open at it would hold the record.
             st.layers[index].cancel.cancel();
+            subscribe::release(&st, index);
         }
         live.handed_over(res.is_ok());
         res.map(|r| subscribe::reattach_response(&st, index, r))
@@ -1112,12 +1132,11 @@ pub(crate) fn below(
                 },
             },
         };
-        guard.settle(r.is_ok());
         // A skipped layer, or an observer, passes the response on whole;
         // an enforce layer subscribed to the head gets only that.
         let enforcing = st.layers[index].ran.load(Ordering::SeqCst)
             && st.snap.addons[index].mode == AddonMode::Enforce;
-        match r {
+        let r = match r {
             // A `101`'s body is the relayed socket, open for its life: not
             // a response the record waits for.
             Ok(res) if enforcing && res.status() != StatusCode::SWITCHING_PROTOCOLS => {
@@ -1129,7 +1148,12 @@ pub(crate) fn below(
             }
             Ok(res) if enforcing => Ok(subscribe::detach_response(&st, index, res)),
             other => other,
-        }
+        };
+        // The response is open at the layer before the forward is marked
+        // resolved: whoever waits on the record never sees the forward
+        // done and no response streaming in between.
+        guard.settle(r.is_ok());
+        r
     })
 }
 
@@ -1307,6 +1331,27 @@ mod tests {
             errs[0]["message"],
             format!("layer passed an invalid request: header x-token: {REDACTED}")
         );
+    }
+
+    /// A front that lets go of the context before taking it (its task
+    /// aborted with the connection) tears the stack down with it; one that
+    /// took it leaves the stack to end as it will.
+    #[tokio::test]
+    async fn a_reclaim_dropped_untaken_tears_the_stack_down() {
+        let kit = Kit::builder()
+            .addon(AddonDef::test_layer("a"))
+            .start()
+            .await;
+        let (st, cx) = test_flow(&kit);
+        st.loan.park(cx);
+        let taken = Reclaim::stack(st.clone()).take().await;
+        assert!(!st.torn_down().is_cancelled());
+        drop(taken);
+
+        let (st, cx) = test_flow(&kit);
+        st.loan.park(cx);
+        drop(Reclaim::stack(st.clone()));
+        assert!(st.torn_down().is_cancelled());
     }
 
     /// A metric source's detail can quote the series key, which a rule may

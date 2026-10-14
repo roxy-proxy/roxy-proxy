@@ -97,18 +97,17 @@ pub(super) async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodyS
     }
 }
 
-/// The consumer of the `dir` body went away, `n` bytes it was sent unread.
+/// The consumer of the `dir` body went away, `n` bytes it was sent unread:
+/// a refusal below the forward, a bodiless answer the front writes no body
+/// for, a layer above dropping the response. The lane is the service's to
+/// end: the rest is read and credited as it arrives, and the stream goes
+/// on. The exchange being torn down is what resets a stream, not a lane
+/// nobody reads.
 pub(super) fn consumer_gone(stream: &Stream, inbox: &Inbox, dir: Dir, n: u64) {
-    if dir == Dir::Request {
-        // A refusal below, say: the rest is read and dropped, and the service
-        // still owes the response.
-        let rest = {
-            let mut q = lock(&inbox.q);
-            q.dropped = true;
-            q.buf.split().len() as u64
-        };
-        stream.grant(dir, n + rest);
-    } else {
-        stream.reset("the client went away");
-    }
+    let rest = {
+        let mut q = lock(&inbox.q);
+        q.dropped = true;
+        q.buf.split().len() as u64
+    };
+    stream.grant(dir, n + rest);
 }

@@ -315,6 +315,10 @@ enum Mode {
     /// Answers each request head with a `204` and nothing else: no body,
     /// no forward.
     NoContent,
+    /// As `early`, with a `204` whose `response_end` waits for the end of
+    /// the response from below: an answer the front writes no body for,
+    /// its lane still open while the forward runs to its end.
+    EarlyNoContent,
     /// Forwards the request head, then ends the forwarded request lane
     /// with an error, and passes the response from below on: a service
     /// that cuts its own forward.
@@ -375,6 +379,8 @@ impl Mode {
             Self::Early
         } else if path.ends_with("/no-content") {
             Self::NoContent
+        } else if path.ends_with("/early-no-content") {
+            Self::EarlyNoContent
         } else if path.ends_with("/cut-forward") {
             Self::CutForward
         } else if path.ends_with("/quarantine") {
@@ -427,7 +433,7 @@ impl Conn {
             | Mode::Quarantine
             | Mode::LateQuarantine
             | Mode::Audit => true,
-            Mode::Hold | Mode::Forward | Mode::Early => dir == REQUEST,
+            Mode::Hold | Mode::Forward | Mode::Early | Mode::EarlyNoContent => dir == REQUEST,
             Mode::CutForward => dir == RESPONSE,
             Mode::Overlong
             | Mode::Short
@@ -497,6 +503,16 @@ impl Conn {
                     json!({"type": "response", "status": 200, "headers": [["content-type", "text/plain"]]}),
                 ));
                 self.send(binary(id, RESPONSE, b"early"));
+                self.send(text(id, json!({"type": "response_end"})));
+            }
+            "request" if self.mode == Mode::EarlyNoContent => {
+                self.pass_control(id, &kind, v);
+                self.send(text(
+                    id,
+                    json!({"type": "response", "status": 204, "headers": []}),
+                ));
+            }
+            "response_end" if self.mode == Mode::EarlyNoContent => {
                 self.send(text(id, json!({"type": "response_end"})));
             }
             "request" if self.mode == Mode::CutForward => {
@@ -578,6 +594,7 @@ impl Conn {
             | Mode::Patient
             | Mode::Early
             | Mode::NoContent
+            | Mode::EarlyNoContent
             | Mode::CutForward
             | Mode::LateQuarantine
             | Mode::Audit => {}

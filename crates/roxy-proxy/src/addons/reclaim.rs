@@ -129,7 +129,24 @@ pub(crate) enum Reclaim {
     /// No stack, or the stack is done with it.
     Now(Box<FlowCx>),
     /// With the stack, whose core may still be running.
-    Stack(Arc<StackFlow>),
+    Stack(Held),
+}
+
+/// A stack the front has yet to take the context from. Dropped before
+/// that (the front gave up on the exchange: its task was aborted with the
+/// connection), it tears the stack down, so nothing the stack still runs
+/// outlives the front that asked for it.
+pub(crate) struct Held {
+    st: Arc<StackFlow>,
+    taken: bool,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if !self.taken {
+            self.st.tear_down(super::CLIENT_GONE);
+        }
+    }
 }
 
 impl Reclaim {
@@ -137,33 +154,39 @@ impl Reclaim {
         Reclaim::Now(Box::new(cx))
     }
 
+    pub(crate) fn stack(st: Arc<StackFlow>) -> Self {
+        Reclaim::Stack(Held { st, taken: false })
+    }
+
     /// The flow context, once the stack has let go of it. A stack that
     /// answered folds its answer into the record.
     pub(crate) async fn take(self) -> FlowCx {
         match self {
             Reclaim::Now(cx) => *cx,
-            Reclaim::Stack(st) => {
-                let mut cx = st.reclaim().await;
-                st.fold_answer(&mut cx);
-                cx.stack = Some(st);
+            Reclaim::Stack(mut held) => {
+                let mut cx = held.st.reclaim().await;
+                held.taken = true;
+                held.st.fold_answer(&mut cx);
+                cx.stack = Some(held.st.clone());
                 cx
             }
         }
     }
 
     /// Stops whatever the stack still has running, so `take` returns as
-    /// soon as the core has let go.
-    pub(crate) fn tear_down(&self) {
-        if let Reclaim::Stack(st) = self {
-            st.tear_down();
+    /// soon as the core has let go. `why` is what a service still on the
+    /// exchange is told.
+    pub(crate) fn tear_down(&self, why: &'static str) {
+        if let Reclaim::Stack(held) = self {
+            held.st.tear_down(why);
         }
     }
 
     /// The response has been written, whether or not its body was polled
     /// to its end.
     pub(crate) fn response_complete(&self) {
-        if let Reclaim::Stack(st) = self {
-            st.response_complete();
+        if let Reclaim::Stack(held) = self {
+            held.st.response_complete();
         }
     }
 
@@ -181,7 +204,7 @@ impl Reclaim {
     pub(crate) fn quarantined(&self) -> bool {
         match self {
             Reclaim::Now(cx) => cx.shared.quarantined(),
-            Reclaim::Stack(st) => st.shared.quarantined(),
+            Reclaim::Stack(held) => held.st.shared.quarantined(),
         }
     }
 }

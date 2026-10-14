@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use bytes::Bytes;
 
 use super::{AddonDef, Answer, Kit, MemState, no_layer_error, streaming_body, strs};
-use crate::addons::EndpointPath;
+use crate::addons::{EndpointPath, Part};
 
 const RULES: &str = r#"
 - id: no-rewritten
@@ -3271,6 +3271,36 @@ async fn a_layer_subscribed_to_one_body_is_in_one_direction_of_a_websocket() {
         kit.events("ws_close", 1).await;
         no_layer_error(&kit);
     }
+}
+
+/// A layer subscribed to the response head that fails once the head from
+/// upstream has reached it: the body parked for it goes with it, so the
+/// response is not left open at a layer that will never answer, and the
+/// record is finished once the refusal is written.
+#[tokio::test]
+async fn a_layer_failing_with_a_response_parked_for_it_lets_the_record_go() {
+    let kit = stack(&[
+        AddonDef::test_layer("a"),
+        AddonDef::test_layer("b").subscribe(Part::Full, Part::Head),
+    ])
+    .await;
+    let a = kit
+        .h1()
+        .await
+        .call(
+            "POST",
+            "/x",
+            &[("x-test-a", "pass"), ("x-test-b", "next-then-trap")],
+            b"hello",
+        )
+        .await;
+    assert_eq!(a.status, 503, "{a:?}");
+    assert_eq!(a.headers["x-roxy-rule"], "layer:b");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "deny", "{ev:#}");
+    assert_eq!(ev["reason"], "layer_error");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["kind"], "trap", "{errs:#?}");
 }
 
 /// A layer upstream that fails is a response on the lane downstream of it:
