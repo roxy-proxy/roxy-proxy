@@ -3319,7 +3319,14 @@ the framing roxy knows.
 * A layer that passes on bytes of a body it is not subscribed to fails the
   exchange closed: a `503` before the response head, a cut body after it,
   `layer_error` with `kind: unsubscribed:request` or
-  `unsubscribed:response`.
+  `unsubscribed:response`. The bypassed body keeps its framing when the
+  layer's own body for that direction is complete as the two are joined,
+  which is always for a service layer (its head-only direction is a head
+  and an end with nothing between) and for a WASM layer when `next` is
+  given an empty `bytes` body; joined to one still open (a WASM layer's
+  streamed `next` body, or any WASM response body, whose end waits for the
+  handler) it goes out without a `content-length`, chunked on HTTP/1.1, so
+  a cut is visible however the bytes interleave.
 * A head-only observer gets copies of the heads and no copy of the body,
   so neither the lag budget nor the buffer budget is touched for it.
 * The rules are not affected: they judge the request that leaves the
@@ -3548,7 +3555,10 @@ layer's
 direction it names `head`, roxy sends the head and its end with no bytes
 between, and the service answers the same way; bytes the service sends for
 that body fail the exchange closed (`unsubscribed:<direction>`), and the
-body the service did not see goes on with the head it passed on. The pair (`flow`, `layer`) is unique
+body the service did not see goes on with the head it passed on, framed as
+it came: its `content-length` is kept, as it is not for a WASM layer whose
+own body is still open ([what a layer
+sees](/reference/addon-configuration#what-a-layer-sees)). The pair (`flow`, `layer`) is unique
 and stable (two layers using the same endpoint in one flow get separate
 streams with different `layer`s), so a service can key its state on it.
 
@@ -3646,7 +3656,8 @@ has no message: a service calls what it needs itself.
   denies the exchange (`503`, `layer:<name>`) before the response head and
   cuts the body after it; a body cut short never reaches the upstream or
   the client as complete. `layer_error.kind` is `service:connect`,
-  `service:protocol`, `service:timeout` or `service:closed`.
+  `service:protocol`, `service:timeout` or `service:closed`; bytes of a
+  head-only body are `unsubscribed:<direction>`.
 * **A body that fails on its way to the service is not its failure**, and
   logs no `layer_error` ([who is blamed](/design/addon-model#who-is-blamed)).
 * **One stream's failure is its own**: a violation resets that stream

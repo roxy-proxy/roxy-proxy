@@ -78,7 +78,10 @@ layer's
 direction it names `head`, roxy sends the head and its end with no bytes
 between, and the service answers the same way; bytes the service sends for
 that body fail the exchange closed (`unsubscribed:<direction>`), and the
-body the service did not see goes on with the head it passed on. The pair (`flow`, `layer`) is unique
+body the service did not see goes on with the head it passed on, framed as
+it came: its `content-length` is kept, as it is not for a WASM layer whose
+own body is still open ([what a layer
+sees](/reference/addon-configuration#what-a-layer-sees)). The pair (`flow`, `layer`) is unique
 and stable (two layers using the same endpoint in one flow get separate
 streams with different `layer`s), so a service can key its state on it.
 
@@ -176,7 +179,8 @@ has no message: a service calls what it needs itself.
   denies the exchange (`503`, `layer:<name>`) before the response head and
   cuts the body after it; a body cut short never reaches the upstream or
   the client as complete. `layer_error.kind` is `service:connect`,
-  `service:protocol`, `service:timeout` or `service:closed`.
+  `service:protocol`, `service:timeout` or `service:closed`; bytes of a
+  head-only body are `unsubscribed:<direction>`.
 * **A body that fails on its way to the service is not its failure**, and
   logs no `layer_error` ([who is blamed](/design/addon-model#who-is-blamed)).
 * **One stream's failure is its own**: a violation resets that stream
