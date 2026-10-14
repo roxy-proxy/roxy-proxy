@@ -12,7 +12,24 @@ workflows:
   [docs site](https://roxy-proxy.github.io/roxy-proxy), next to main's at
   the site root, and adds `vX.Y` to the version menu. A later `vX.Y.Z` tag
   replaces that directory. The site lives on the `gh-pages` branch, one
-  directory per version; a pre-release tag is not published.
+  directory per version; a pre-release tag is not published. The `deploy`
+  job uses the `github-pages` environment, which must allow `v*` tags (see
+  below).
+
+## One-time setup
+
+The `github-pages` environment's deployment policy allows `main` by
+default, so a tag's `docs.yml` run fails at `deploy` until the environment
+also allows `v*` tags. Add the policy under Settings → Environments →
+github-pages → Deployment branches and tags, or with:
+
+```sh
+gh api -X POST repos/roxy-proxy/roxy-proxy/environments/github-pages/deployment-branch-policies \
+  -f name='v*' -f type=tag
+```
+
+If `deploy` fails on a tag, the `publish` job has already updated
+`gh-pages`, so re-run only the failed job: `gh run rerun <id> --failed`.
 
 ## Steps
 
