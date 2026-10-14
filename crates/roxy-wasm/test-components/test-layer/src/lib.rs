@@ -643,6 +643,18 @@ impl Handler for Layer {
                     format!("answered by {who} after forwarding {} bytes", got.len()).as_bytes(),
                 );
             }
+            "answer-then-next" => {
+                // Answer the client at once, then forward the whole request
+                // and read the response from below to its end: the answer
+                // reaches the client first, and the forward still completes.
+                respond(200, b"answered before forwarding");
+                let (pending, output) = next_streaming(&forward_head(&req));
+                pump(&body, &output, false);
+                drop(body);
+                types::finish(output);
+                let (_below, from_below) = await_response(pending);
+                drop(read_all(&from_below));
+            }
             "cut-then-await" => {
                 // Stream `x-read-bytes` of the body into `next`, leave it
                 // unfinished while still waiting on the response, then

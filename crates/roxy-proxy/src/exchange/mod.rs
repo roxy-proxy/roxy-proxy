@@ -22,6 +22,7 @@ use roxy_http::{
 use roxy_rules::RuleId;
 use tokio_util::sync::CancellationToken;
 
+use crate::addons::Reclaim;
 use crate::addr::PrivateAddrs;
 use crate::body::{Tally, counted, counted_until_sent, trailers_need_h2};
 use crate::capture::{self, Tap};
@@ -122,23 +123,50 @@ pub(crate) struct Sent {
 /// accounting around it: the flow record, a `response_error` event if the
 /// write failed, the final metric sample and the `request` event. The
 /// fronts only write bytes.
-pub(crate) async fn send<W, Fut>(cx: &mut FlowCx, answer: Answer, write: W) -> Sent
+///
+/// A response is written before the flow context is taken back: a layer's
+/// answer reaches the client while the request it forwarded is still
+/// below, and the record is finished once the core has returned the
+/// context. A refusal ends the stack first: nothing below it answers.
+pub(crate) async fn send<W, Fut>(reclaim: Reclaim, answer: Answer, write: W) -> (FlowCx, Sent)
 where
     W: FnOnce(CanonicalResponse) -> Fut,
     Fut: std::future::Future<Output = Result<(), WriteFailure>>,
 {
-    let (mut res, refusal) = match answer {
-        Answer::Response(res) => (res, None),
-        Answer::Refusal(r) => (refusal_response(cx, &r), Some(r)),
+    let (cx, mut res, refusal) = match answer {
+        Answer::Response(res) => (Err(reclaim), res, None),
+        Answer::Refusal(r) => {
+            reclaim.tear_down();
+            let mut cx = Box::new(reclaim.take().await);
+            let res = refusal_response(&mut cx, &r);
+            (Ok(cx), res, Some(r))
+        }
     };
-    let (body, tally) = counted(std::mem::take(&mut res.body), cx.digest.response);
+    // Whether the response is digested is the admission decision's to say,
+    // which a core still running has not made: hash it, and keep the hash
+    // if the decision asks for it.
+    let digest = cx.as_ref().is_ok_and(|cx| cx.digest.response) || cx.is_err();
+    let (body, tally) = counted(std::mem::take(&mut res.body), digest);
     res.body = body;
-    cx.record.response_status = Some(res.status.as_u16());
-    cx.record.response_headers_bytes = res.headers.wire_len() as u64;
+    let status = res.status.as_u16();
+    let headers_bytes = res.headers.wire_len() as u64;
     let r = write(res).await;
     let failed = r.is_err();
+    let mut cx = match cx {
+        Ok(cx) => cx,
+        Err(reclaim) => {
+            if failed {
+                reclaim.tear_down();
+            }
+            Box::new(reclaim.take().await)
+        }
+    };
+    cx.record.response_status = Some(status);
+    cx.record.response_headers_bytes = headers_bytes;
     cx.record.response_bytes = tally.bytes();
-    cx.record.response_sha256 = tally.sha256_hex();
+    if cx.digest.response {
+        cx.record.response_sha256 = tally.sha256_hex();
+    }
     let stop = cx.in_flight.as_ref().and_then(|w| w.stopped());
     // Under a stop, the cut body is how the stop is delivered, not a
     // failure of its own.
@@ -164,7 +192,7 @@ where
     if stop.is_none()
         && let Some((reason, e)) = failure
     {
-        emit_response_error(cx, &reason, &e);
+        emit_response_error(&cx, &reason, &e);
         cx.record.reason.get_or_insert(reason);
     }
     // One source for both fronts: `refusal_response` sets `res.meta.close`
@@ -174,13 +202,13 @@ where
         None => stop.as_ref().is_some_and(|s| s.refusal.close),
     };
     if let Some(r) = &refusal {
-        finish_refusal(cx, r);
+        finish_refusal(&mut cx, r);
     } else {
         // A client that stopped reading is not an upstream failure.
         cx.record_final_sample();
         cx.emit_request_event();
     }
-    Sent { failed, close }
+    (*cx, Sent { failed, close })
 }
 
 pub(crate) fn emit_response_error(cx: &FlowCx, reason: &str, e: &dyn std::fmt::Display) {
@@ -230,8 +258,8 @@ pub(crate) fn finish_refusal(cx: &mut FlowCx, refusal: &Refusal) {
 }
 
 /// Writes `answer` on the h1 codec and logs the exchange.
-async fn answer(mut conn: ServerConn<ClientIo>, mut cx: FlowCx, answer: Answer) -> Next {
-    let sent = send(&mut cx, answer, |res| async {
+async fn answer(mut conn: ServerConn<ClientIo>, reclaim: Reclaim, answer: Answer) -> Next {
+    let (_, sent) = send(reclaim, answer, |res| async {
         conn.respond(res).await.map_err(WriteFailure::from)
     })
     .await;
@@ -373,14 +401,14 @@ pub(crate) enum Outcome {
 }
 
 /// The transport-agnostic exchange: request steps → upstream → response
-/// steps. `cx` carries the flow record and comes back with the outcome
-/// (through the addon stack, if there is one); the caller writes the
-/// outcome and emits the flow's `request` event.
+/// steps. `cx` carries the flow record and comes back with the outcome,
+/// through the [`Reclaim`] when the addon stack may still hold it; the
+/// caller writes the outcome and emits the flow's `request` event.
 pub(crate) async fn process<F: Front>(
     front: &mut F,
     mut cx: FlowCx,
     mut req: CanonicalRequest,
-) -> (FlowCx, Outcome) {
+) -> (Reclaim, Outcome) {
     // Audit backpressure: an exchange starts only while the flow
     // log keeps up.
     crate::flowlog::sink_ready(&*cx.shared.sink).await;
@@ -398,34 +426,37 @@ pub(crate) async fn process<F: Front>(
         }
     }
     if let Some(refusal) = cx.quarantine_refusal() {
-        return (cx, Outcome::Refuse(refusal));
+        return (Reclaim::Now(Box::new(cx)), Outcome::Refuse(refusal));
     }
     if let Some(refusal) = cx.expiry_refusal() {
-        return (cx, Outcome::Refuse(refusal));
+        return (Reclaim::Now(Box::new(cx)), Outcome::Refuse(refusal));
     }
-    let (mut cx, outcome) = if cx.snap.addons.is_empty() {
+    let (reclaim, outcome) = if cx.snap.addons.is_empty() {
         let outcome = core(front, &mut cx, req).await;
-        (cx, outcome)
+        (Reclaim::Now(Box::new(cx)), outcome)
     } else {
         crate::addons::run(front, cx, req).await
     };
     // A layer may have quarantined the process while it held the exchange:
     // whatever it answered, the client gets the refusal.
-    let outcome = match outcome {
-        Outcome::Respond(_) | Outcome::Upgrade { .. } => match cx.late_quarantine_refusal() {
-            Some(refusal) => {
-                if let Outcome::Upgrade { upstream, .. } = outcome {
-                    // Nothing will relay the upgraded upstream: close it
-                    // rather than drop it mid-handshake.
-                    tokio::spawn(close_upstream_ws(upstream));
-                }
-                Outcome::Refuse(refusal)
+    match outcome {
+        Outcome::Respond(_) | Outcome::Upgrade { .. } if reclaim.quarantined() => {
+            if let Outcome::Upgrade { upstream, .. } = outcome {
+                // Nothing will relay the upgraded upstream: close it
+                // rather than drop it mid-handshake.
+                tokio::spawn(close_upstream_ws(upstream));
             }
-            None => outcome,
-        },
-        Outcome::Refuse(_) | Outcome::Close(_) => outcome,
-    };
-    (cx, outcome)
+            reclaim.tear_down();
+            let mut cx = reclaim.take().await;
+            let refusal = cx
+                .late_quarantine_refusal()
+                .unwrap_or_else(Refusal::quarantined);
+            (Reclaim::Now(Box::new(cx)), Outcome::Refuse(refusal))
+        }
+        Outcome::Respond(_) | Outcome::Upgrade { .. } | Outcome::Refuse(_) | Outcome::Close(_) => {
+            (reclaim, outcome)
+        }
+    }
 }
 
 /// The exchange below the addons: the request steps (the rules) → upstream →
@@ -465,16 +496,17 @@ pub(crate) async fn run(
             return None;
         }
     };
-    let (cx, outcome) = process(&mut conn, cx, req).await;
+    let (reclaim, outcome) = process(&mut conn, cx, req).await;
     match outcome {
-        Outcome::Respond(res) => answer(conn, cx, Answer::Response(res)).await,
-        Outcome::Refuse(refusal) => answer(conn, cx, Answer::Refusal(refusal)).await,
+        Outcome::Respond(res) => answer(conn, reclaim, Answer::Response(res)).await,
+        Outcome::Refuse(refusal) => answer(conn, reclaim, Answer::Refusal(refusal)).await,
         Outcome::Close(e) => {
-            close_on_drive_error(conn, cx, shared, e).await;
+            reclaim.tear_down();
+            close_on_drive_error(conn, reclaim.take().await, shared, e).await;
             None
         }
         Outcome::Upgrade { res, upstream, key } => {
-            ws::splice_websocket(conn, cx, res, upstream, &key).await
+            ws::splice_websocket(conn, reclaim.take().await, res, upstream, &key).await
         }
     }
 }

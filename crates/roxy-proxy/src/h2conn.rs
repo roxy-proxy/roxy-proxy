@@ -278,7 +278,7 @@ async fn serve_stream(
         fail,
         expect_continue: req.meta.expect_continue,
     };
-    let (mut cx, outcome) = process(&mut front, cx, req).await;
+    let (reclaim, outcome) = process(&mut front, cx, req).await;
     let H2Front {
         mut respond, fail, ..
     } = front;
@@ -292,25 +292,33 @@ async fn serve_stream(
     let answer = match outcome {
         Outcome::Respond(res) => Answer::Response(res),
         Outcome::Refuse(refusal) => Answer::Refusal(refusal),
-        // The client went away: nothing to answer, nothing to reset.
-        Outcome::Close(_) if fail.gone() => return record_client_gone(&mut cx),
-        Outcome::Close(DriveError::Client(e)) => {
-            ccx.shared.emit_parse_error(&ccx.client, Some(&cx), &e);
-            respond.send_reset(h2::Reason::PROTOCOL_ERROR);
-            return record_client_failure(&mut cx, &e, None);
-        }
-        Outcome::Close(DriveError::Write(e)) => {
-            respond.send_reset(h2::Reason::INTERNAL_ERROR);
-            return record_continue_failure(&mut cx, e);
+        Outcome::Close(e) => {
+            reclaim.tear_down();
+            let mut cx = reclaim.take().await;
+            match e {
+                // The client went away: nothing to answer, nothing to reset.
+                _ if fail.gone() => return record_client_gone(&mut cx),
+                DriveError::Client(e) => {
+                    ccx.shared.emit_parse_error(&ccx.client, Some(&cx), &e);
+                    respond.send_reset(h2::Reason::PROTOCOL_ERROR);
+                    return record_client_failure(&mut cx, &e, None);
+                }
+                DriveError::Write(e) => {
+                    respond.send_reset(h2::Reason::INTERNAL_ERROR);
+                    return record_continue_failure(&mut cx, e);
+                }
+            }
         }
         Outcome::Upgrade { .. } => {
             // Unreachable: h2 requests never carry an upgrade. Fail closed.
+            reclaim.tear_down();
+            let mut cx = reclaim.take().await;
             respond.send_reset(h2::Reason::INTERNAL_ERROR);
             let e = ParseError::new(Reason::H2UnsupportedMethod, "upgrade over h2");
             return record_client_failure(&mut cx, &e, None);
         }
     };
-    let sent = send(&mut cx, answer, |res| {
+    let (_, sent) = send(reclaim, answer, |res| {
         write_response(&mut respond, res, &out)
     })
     .await;
