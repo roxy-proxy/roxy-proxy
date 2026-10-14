@@ -1,3 +1,10 @@
+---
+title: "Policy evaluation"
+description: "How the rules decide an exchange: one admission decision on the request head, in-flight re-checks as bytes stream, deny wins, and how effects, tags and unavailable inputs behave."
+---
+
+import requestTiming from "../../assets/request-timing.svg";
+
 # Policy evaluation
 
 The policy decides what roxy forwards, what it denies, and what it changes
@@ -24,6 +31,17 @@ head, request body bytes as they stream, the response head, response body
 bytes, and the metric values this exchange adds to. Rules are **one ordered
 list** of conditions over those values. There are no phases: when a rule
 runs follows from what it reads.
+
+<img src={requestTiming} alt="The request phase of one exchange through roxy, left to right. The client's request head (a solid line) travels first and its body bytes (a dashed line) stream behind it, through layer A (enforce), past layer B (observe, which gets a copy beside the path), through layer C (enforce) and the rules, then on to the upstream. Each layer's when is evaluated on the head as it reaches the layer. Layer C calls state-put mid-body, awaits the result from the host services strip along the bottom, then continues the body. At the rules the admission decision is made once, on the head, after the stack and before anything is forwarded: allow, deny or change the request. As body bytes stream past the rules they are re-checked in flight (body.bytes, byte metrics), which can only deny or quarantine. A note says that a tag or state write after admission is seen by later exchanges, and that in-flight rules read neither." />
+
+A request is judged at two points. Each layer's `when` is checked on the
+head as it arrives; the rules decide the head once, after the whole stack
+and before anything is forwarded, then re-check the body as its bytes
+stream past. A layer may call a host service at any point, including
+mid-body, and roxy orders nothing between the call and the layer's later
+messages, so a layer that needs the effect seen (a tag the rules read, say)
+waits for the result before passing the head on; a write that lands after
+the admission decision is seen by later exchanges only.
 
 1. **The forwarding decision is made at the request head, and deny wins.**
    roxy evaluates every rule whose values are known at that point. If any

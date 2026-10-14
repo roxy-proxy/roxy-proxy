@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="390" viewBox="0 0 880 390" font-family="Inter, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13">
+  <defs>
+    <marker id="req" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"/>
+    </marker>
+    <marker id="res" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5f6b68"/>
+    </marker>
+    <marker id="thin" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7e8986"/>
+    </marker>
+  </defs>
+
+  <!-- client and upstream -->
+  <rect x="14" y="173" width="82" height="40" rx="20" fill="#f3f5f4" stroke="#cfd4d2"/>
+  <text x="55" y="198" fill="#16201e" font-weight="600" text-anchor="middle">client</text>
+  <rect x="786" y="173" width="82" height="40" rx="20" fill="#f3f5f4" stroke="#cfd4d2"/>
+  <text x="827" y="198" fill="#16201e" font-weight="600" text-anchor="middle">upstream</text>
+
+  <!-- roxy -->
+  <rect x="118" y="60" width="650" height="310" rx="10" fill="#ffffff" stroke="#0f766e" stroke-width="1.5"/>
+  <text x="132" y="81" fill="#0f766e" font-weight="600">roxy</text>
+
+  <!-- legend: the head travels first, the body streams behind it -->
+  <g stroke="#0f766e" stroke-width="2">
+    <line x1="470" y1="77" x2="498" y2="77"/>
+    <line x1="614" y1="77" x2="642" y2="77" stroke-dasharray="6 4"/>
+  </g>
+  <g fill="#7e8986" font-size="11">
+    <text x="504" y="81">request head, first</text>
+    <text x="648" y="81">body bytes, behind it</text>
+  </g>
+
+  <!-- stations: enforce layers and the rules in the path -->
+  <g stroke="#cfd4d2" fill="#f3f5f4">
+    <rect x="140" y="100" width="90" height="162" rx="6"/>
+    <rect x="360" y="100" width="120" height="162" rx="6"/>
+    <rect x="500" y="100" width="200" height="162" rx="6"/>
+  </g>
+  <g fill="#16201e" font-weight="600" text-anchor="middle">
+    <text x="185" y="120">layer A</text>
+    <text x="420" y="120">layer C</text>
+    <text x="600" y="120">rules</text>
+  </g>
+  <g fill="#7e8986" font-size="11" text-anchor="middle">
+    <text x="185" y="136">enforce</text>
+    <text x="420" y="136">enforce</text>
+    <text x="600" y="136">deny wins</text>
+  </g>
+
+  <!-- observer beside the path, on a copy -->
+  <rect x="250" y="96" width="90" height="46" rx="6" fill="#ffffff" stroke="#cfd4d2" stroke-dasharray="4 3"/>
+  <text x="295" y="116" fill="#16201e" font-weight="600" font-size="12" text-anchor="middle">layer B</text>
+  <text x="295" y="131" fill="#7e8986" font-size="10" text-anchor="middle">observe, a copy</text>
+  <line x1="295" y1="206" x2="295" y2="145" stroke="#7e8986" stroke-dasharray="3 3" marker-end="url(#thin)"/>
+
+  <!-- the two lanes: head (solid) and body bytes (dashed), client to upstream -->
+  <g fill="none" stroke="#0f766e" stroke-width="2" stroke-linejoin="round">
+    <g marker-end="url(#req)">
+      <path d="M 96 180 H 138"/>
+      <path d="M 230 180 H 358"/>
+      <path d="M 480 180 H 498"/>
+      <path d="M 700 180 H 784"/>
+    </g>
+    <path d="M 140 180 H 230"/>
+    <path d="M 360 180 H 480"/>
+    <path d="M 500 180 H 700"/>
+    <g stroke-dasharray="6 4" marker-end="url(#req)">
+      <path d="M 96 206 H 138"/>
+      <path d="M 230 206 H 358"/>
+      <path d="M 480 206 H 498"/>
+      <path d="M 700 206 H 784"/>
+    </g>
+    <g stroke-dasharray="6 4">
+      <path d="M 140 206 H 230"/>
+      <path d="M 360 206 H 456"/>
+      <path d="M 474 206 H 480"/>
+      <path d="M 500 206 H 700"/>
+    </g>
+  </g>
+  <text x="117" y="166" fill="#0f766e" font-size="11" font-weight="600" text-anchor="middle">request</text>
+  <text x="742" y="168" fill="#7e8986" font-size="10" text-anchor="middle">forwarded</text>
+
+  <!-- each layer's `when`, on the head as it reaches the layer -->
+  <g fill="#0f766e">
+    <circle cx="172" cy="180" r="4"/>
+    <circle cx="295" cy="180" r="4"/>
+    <circle cx="376" cy="180" r="4"/>
+  </g>
+  <g fill="#7e8986" font-size="10">
+    <text x="172" y="168" text-anchor="middle">when</text>
+    <text x="301" y="170">when</text>
+    <text x="376" y="168" text-anchor="middle">when</text>
+  </g>
+
+  <!-- layer C calls a host service mid-body and waits for the result -->
+  <g stroke="#0f766e" stroke-width="2">
+    <line x1="462" y1="200" x2="462" y2="212"/>
+    <line x1="468" y1="200" x2="468" y2="212"/>
+  </g>
+  <line x1="459" y1="216" x2="459" y2="326" stroke="#0f766e" stroke-width="1.5" marker-end="url(#req)"/>
+  <line x1="471" y1="326" x2="471" y2="216" stroke="#5f6b68" stroke-width="1.5" marker-end="url(#res)"/>
+  <text x="452" y="228" fill="#7e8986" font-size="10" text-anchor="end">state-put</text>
+  <text x="478" y="304" fill="#5f6b68" font-size="10">result</text>
+  <rect x="226" y="276" width="226" height="40" rx="6" fill="#ffffff" stroke="#cfd4d2"/>
+  <g fill="#7e8986" font-size="10" text-anchor="middle">
+    <text x="339" y="292">mid-body: the layer awaits the result,</text>
+    <text x="339" y="306">then continues the body</text>
+  </g>
+
+  <!-- the rules: one admission decision on the head, re-checks as the body streams -->
+  <path d="M 530 172 L 538 180 L 530 188 L 522 180 Z" fill="#ffffff" stroke="#0f766e" stroke-width="1.5"/>
+  <g fill="#0f766e">
+    <circle cx="570" cy="206" r="3.5"/>
+    <circle cx="610" cy="206" r="3.5"/>
+    <circle cx="650" cy="206" r="3.5"/>
+  </g>
+  <g fill="#7e8986" font-size="10" text-anchor="middle">
+    <text x="600" y="156">admission, on the head, after the stack:</text>
+    <text x="600" y="168">allow · deny · change the request</text>
+    <text x="600" y="228">in flight, as bytes stream past:</text>
+    <text x="600" y="240">body.bytes · byte metrics</text>
+    <text x="600" y="252">deny or quarantine only</text>
+  </g>
+
+  <!-- a tag or state write after the admission decision -->
+  <rect x="506" y="276" width="248" height="40" rx="6" fill="#ffffff" stroke="#cfd4d2"/>
+  <g fill="#7e8986" font-size="10" text-anchor="middle">
+    <text x="630" y="292">a tag or state write after admission is seen</text>
+    <text x="630" y="306">by later exchanges; in-flight rules read neither</text>
+  </g>
+
+  <!-- host services -->
+  <rect x="140" y="328" width="608" height="30" rx="15" fill="#f8f9f8" stroke="#e6e8e7"/>
+  <text x="444" y="347" fill="#3d4846" font-size="12" text-anchor="middle">host services, callable at any point: log · record · add-tag · state-put · metric-get</text>
+</svg>
