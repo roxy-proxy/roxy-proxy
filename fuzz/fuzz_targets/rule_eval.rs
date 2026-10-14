@@ -170,6 +170,10 @@ fn check(out: &Outcome) {
     if out.terminal_rule.is_default() {
         assert_eq!(out.decision, Decision::default_deny(), "{out:?}");
     }
+    // A matched `quarantine` is a deny, whichever deny decided.
+    if out.quarantine.is_some() {
+        assert!(out.decision.is_deny(), "{out:?}");
+    }
 }
 
 fuzz_target!(|data: &[u8]| {

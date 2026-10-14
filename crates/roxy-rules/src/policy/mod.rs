@@ -167,10 +167,10 @@ pub enum RuleKind {
     /// skipped at admission, checked after forwarding when what it reads
     /// is known.
     InFlight,
-    /// A `deny` rule that reads a byte metric (`request_bytes` /
-    /// `response_bytes`) and no in-flight field: takes part in the
-    /// admission decision like an admission rule, and is re-checked as
-    /// this exchange adds bytes to the metric.
+    /// A `deny` or `quarantine` rule that reads a byte metric
+    /// (`request_bytes` / `response_bytes`) and no in-flight field: takes
+    /// part in the admission decision like an admission rule, and is
+    /// re-checked as this exchange adds bytes to the metric.
     AdmissionAndInFlight,
 }
 

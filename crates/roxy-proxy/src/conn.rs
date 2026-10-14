@@ -94,7 +94,7 @@ pub(crate) async fn serve_http(stream: BoxIo, client: ClientConn, shared: Arc<Sh
     match first {
         Ok(Some(false)) => {}
         Ok(Some(true)) => {
-            shared.emit_parse_reason(&client, None, "tls_on_http_listener", None);
+            shared.emit_parse_reason(&client, "tls_on_http_listener", None);
             return;
         }
         Ok(None) => return,
@@ -203,7 +203,7 @@ async fn handle_connect(
     let (io, buf) = match conn.accept_connect().await {
         Ok(x) => x,
         Err(e) => {
-            shared.emit_parse_reason(&client, None, "connect_write_failed", Some(&e.to_string()));
+            shared.emit_parse_reason(&client, "connect_write_failed", Some(&e.to_string()));
             return;
         }
     };
@@ -220,7 +220,7 @@ async fn handle_connect(
                 // Both sides of the comparison are canonical `Host`s, so case
                 // and a trailing dot on either never count as a mismatch.
                 let Ok(host) = roxy_http::url::parse_host(sni.as_bytes()) else {
-                    shared.emit_parse_reason(&client, None, "bad_sni", Some(sni));
+                    shared.emit_parse_reason(&client, "bad_sni", Some(sni));
                     return;
                 };
                 if host != authority.host {
@@ -228,7 +228,6 @@ async fn handle_connect(
                         let connect_host = host_text(&authority.host);
                         shared.emit_parse_reason(
                             &client,
-                            None,
                             "sni_mismatch",
                             Some(&format!("SNI {sni:?} != CONNECT host {connect_host:?}")),
                         );
@@ -258,7 +257,7 @@ async fn handle_connect(
             request_loop(conn, client, None, shared).await;
         }
         FirstBytes::Http | FirstBytes::Other => {
-            shared.emit_parse_reason(&client, None, "non_http_in_connect", None);
+            shared.emit_parse_reason(&client, "non_http_in_connect", None);
         }
     }
 }
@@ -316,7 +315,7 @@ async fn classify<IO: AsyncRead + Unpin>(
         Ok(Some(c)) => Some((io, buf, c)),
         Ok(None) => None,
         Err(_) => {
-            shared.emit_parse_reason(client, None, "tunnel_timeout", None);
+            shared.emit_parse_reason(client, "tunnel_timeout", None);
             None
         }
     }
@@ -342,7 +341,7 @@ async fn terminate_tls(
         let minter = shared.minter.clone();
         let warmed = tokio::task::spawn_blocking(move || minter.certified_key(&warm_host)).await;
         if !matches!(warmed, Ok(Ok(_))) {
-            shared.emit_parse_reason(&client, None, "leaf_mint_failed", Some(&host));
+            shared.emit_parse_reason(&client, "leaf_mint_failed", Some(&host));
             return;
         }
     }
@@ -353,11 +352,11 @@ async fn terminate_tls(
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
             let reason = crate::quarantine::handshake_reason("tls_handshake_failed", Some(&e));
-            shared.emit_parse_reason(&client, None, reason, Some(&e.to_string()));
+            shared.emit_parse_reason(&client, reason, Some(&e.to_string()));
             return;
         }
         Err(_) => {
-            shared.emit_parse_reason(&client, None, "tls_handshake_timeout", None);
+            shared.emit_parse_reason(&client, "tls_handshake_timeout", None);
             return;
         }
     };

@@ -486,9 +486,9 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                             ))
                         } else if setter.in_flight() && reader.in_flight() {
                             Some(format!(
-                                "rules[{s}] ({id:?}), a deny on a byte metric, which can fire \
-                                 in flight as this rule does, when the values it reads arrive \
-                                 rather than in list order"
+                                "rules[{s}] ({id:?}), a deny or quarantine on a byte metric, \
+                                 which can fire in flight as this rule does, when the values it \
+                                 reads arrive rather than in list order"
                             ))
                         } else if s > r && reader.at_admission() {
                             Some(format!("rules[{s}] ({id:?}), below this rule"))

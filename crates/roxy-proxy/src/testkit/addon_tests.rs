@@ -1216,6 +1216,60 @@ mod service {
         );
     }
 
+    /// A service that quarantines on the response head, after `next`:
+    /// the client gets `_quarantined` in place of the response, and the
+    /// flow keeps the one admission sample and the rules its admission
+    /// recorded.
+    #[tokio::test]
+    async fn a_service_quarantining_after_next_refuses_without_a_second_sample() {
+        let kit = kit_with(
+            RULES,
+            vec![granted(
+                addon("s", "late-quarantine", AddonMode::Enforce, |_| {}),
+                &[Capability::Quarantine],
+            )],
+            |b| b.metric_defs(BY_HOST),
+        )
+        .await;
+        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+        assert_eq!(a.status, 403, "{a:?}");
+        assert_eq!(a.headers["x-roxy-rule"], "_quarantined");
+        let tripped = kit.events("quarantined", 1).await.remove(0);
+        assert_eq!(tripped["cause"]["layer"], "s", "{tripped:#}");
+        assert_eq!(kit.upstream.seen().len(), 1, "the request was forwarded");
+        let ev = kit.request_event().await;
+        assert_eq!(ev["terminal_rule"], "_quarantined", "{ev:#}");
+        assert_eq!(ev["decision"], "deny", "{ev:#}");
+        assert_eq!(ev["rules"], serde_json::json!(["up"]), "{ev:#}");
+        let samples = kit.samples.lock().unwrap();
+        assert_eq!(
+            samples.iter().filter(|s| s.admission).count(),
+            1,
+            "{samples:?}"
+        );
+    }
+
+    /// The same on an upgrade: the relayed upstream WebSocket is closed
+    /// with a `1008`, not dropped mid-handshake.
+    #[tokio::test]
+    async fn a_service_quarantining_on_a_101_closes_the_upstream() {
+        let kit = kit(
+            RULES,
+            vec![granted(
+                addon("s", "late-quarantine", AddonMode::Enforce, |_| {}),
+                &[Capability::Quarantine],
+            )],
+        )
+        .await;
+        let (status, io) = kit.websocket("/ws", &[("x-echo", "frames")]).await;
+        assert_eq!(status, 403);
+        assert!(io.is_none());
+        kit.upstream.wait_ws_closed(1).await;
+        assert_eq!(kit.upstream.ws_close_codes(), vec![Some(1008)]);
+        let ev = kit.request_event().await;
+        assert_eq!(ev["terminal_rule"], "_quarantined", "{ev:#}");
+    }
+
     /// The stream id of an `open` message.
     fn stream_id(open: &serde_json::Value) -> u32 {
         u32::try_from(open["stream"].as_u64().unwrap()).unwrap()
@@ -2620,13 +2674,28 @@ async fn a_layer_can_quarantine_the_proxy_if_granted() {
     assert_eq!(errs[0]["kind"], "host");
     assert!(kit.server.handle().quarantine().is_none());
 
-    let kit = one(AddonDef::test_layer("t").caps(&[Capability::Quarantine])).await;
+    // The probe answers without `next`: the refusal is the exchange's
+    // admission decision, with its sample, as it would be above the stack.
+    let kit = Kit::builder()
+        .addon(AddonDef::test_layer("t").caps(&[Capability::Quarantine]))
+        .metric_defs("- { id: by_host, count: requests, key: [host], window: 1h }")
+        .start()
+        .await;
     let a = cap(&kit, "quarantine").await;
     assert_eq!(a.status, 403, "{a:?}");
     assert_eq!(a.headers["x-roxy-rule"], "_quarantined");
     let tripped = kit.events("quarantined", 1).await.remove(0);
     assert_eq!(tripped["cause"]["kind"], "layer", "{tripped:#}");
     assert_eq!(tripped["cause"]["layer"], "t", "{tripped:#}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "_quarantined", "{ev:#}");
+    assert_eq!(ev["stage"], "head", "{ev:#}");
+    {
+        let samples = kit.samples.lock().unwrap();
+        let admission: Vec<_> = samples.iter().filter(|s| s.admission).collect();
+        assert_eq!(admission.len(), 1, "{samples:?}");
+        assert!(admission[0].denied, "{samples:?}");
+    }
     let a = kit.h1().await.call("GET", "/x", &[], b"").await;
     assert_eq!(a.status, 403, "every exchange after it: {a:?}");
 }

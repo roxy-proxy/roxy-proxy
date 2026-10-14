@@ -37,10 +37,10 @@ metrics:
 - **When counts move.** `requests` and `denied` are read before the
   forwarding decision and incremented after it (denied flows count), so
   `metric.x >= 30` denies the 31st request. `request_bytes` and
-  `response_bytes` grow as bytes stream: a deny reading them is re-checked
-  in flight and stops the exchange that crosses the limit; a chunk is
-  counted before it is checked, so a budget overcounts by at most one
-  chunk. `errors` count when the exchange ends.
+  `response_bytes` grow as bytes stream: a deny or quarantine reading them
+  is re-checked in flight and stops the exchange that crosses the limit; a
+  chunk is counted before it is checked, so a budget overcounts by at most
+  one chunk. `errors` count when the exchange ends.
 - **Bounds** ([never evict](/design/threat-model#never-evict)):
   `limits.max_metric_keys` (100 000) series across all metrics; each
   metric's `max_keys` (at most the shared limit, its default); and,

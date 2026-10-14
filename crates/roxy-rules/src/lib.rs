@@ -54,10 +54,11 @@
 //!   rule's `when` reads. A rule that reads only *admission* values (known
 //!   at the forwarding decision) is an **admission rule**. A rule that
 //!   reads an *in-flight* field (`body.bytes`, `response.*`, `ws.*`) is an
-//!   **in-flight rule**. A `deny` rule that reads a byte metric (`count:
-//!   request_bytes` or `response_bytes`) and no in-flight field is both
-//!   ([`RuleKind::AdmissionAndInFlight`]): it takes part in the admission
-//!   decision and is re-checked as this exchange adds bytes to that metric.
+//!   **in-flight rule**. A `deny` or `quarantine` rule that reads a byte
+//!   metric (`count: request_bytes` or `response_bytes`) and no in-flight
+//!   field is both ([`RuleKind::AdmissionAndInFlight`]): it takes part in
+//!   the admission decision and is re-checked as this exchange adds bytes
+//!   to that metric.
 //!   Metrics that count `requests`, `denied`, `errors` or `unique(..)` do
 //!   not change while an exchange streams, so reading them does not put a
 //!   rule in flight.

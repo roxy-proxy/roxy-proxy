@@ -201,7 +201,7 @@ rules[1].when: reads `tag["big"]`, which is set too late to be seen here, by rul
 rules[1].when: reads `tag["big"]`, which is set too late to be seen here, by rules[0] ("big"), an in-flight rule, which fires when the values it reads arrive rather than in list order; a rule sees only the tags set before it is checked  [rule cap]
 
 == tag read by an in-flight rule but set by a deny on a byte metric
-rules[1].when: reads `tag["over"]`, which is set too late to be seen here, by rules[0] ("budget"), a deny on a byte metric, which can fire in flight as this rule does, when the values it reads arrive rather than in list order; a rule sees only the tags set before it is checked  [rule note]
+rules[1].when: reads `tag["over"]`, which is set too late to be seen here, by rules[0] ("budget"), a deny or quarantine on a byte metric, which can fire in flight as this rule does, when the values it reads arrive rather than in list order; a rule sees only the tags set before it is checked  [rule note]
 
 == rewrite_path group references
 rules[0].then[0]: rewrite_path `to`: `$3` refers to a group `match` does not have (1 unnamed group; named: rest)  [rule a]

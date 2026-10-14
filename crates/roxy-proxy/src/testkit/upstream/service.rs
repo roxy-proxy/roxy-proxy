@@ -299,6 +299,10 @@ enum Mode {
     /// Calls `quarantine` (call id 1) on `open`, then passes through once
     /// it is answered.
     Quarantine,
+    /// Passes the request through, then calls `quarantine` (call id 1) on
+    /// the response head and passes it on once the call is answered: a
+    /// layer that quarantines after `next`.
+    LateQuarantine,
 }
 
 /// What the `host` behaviour writes to the state store, under `svc`.
@@ -338,6 +342,8 @@ impl Mode {
             Self::Patient
         } else if path.ends_with("/quarantine") {
             Self::Quarantine
+        } else if path.ends_with("/late-quarantine") {
+            Self::LateQuarantine
         } else {
             Self::Flood
         }
@@ -380,7 +386,8 @@ impl Conn {
             | Mode::Sever
             | Mode::Patient
             | Mode::Host
-            | Mode::Quarantine => true,
+            | Mode::Quarantine
+            | Mode::LateQuarantine => true,
             Mode::Hold | Mode::Forward => dir == REQUEST,
             Mode::Overlong
             | Mode::Short
@@ -433,6 +440,17 @@ impl Conn {
                 self.streams.remove(&id);
                 self.send(text(id, json!({"type": "reset", "message": "aborted"})));
             }
+            "response" if self.mode == Mode::LateQuarantine => {
+                // The head waits behind the call, so roxy sees it only once
+                // the quarantine is in force.
+                v.as_object_mut().map(|o| o.remove("stream"));
+                if let Some(s) = self.streams.get_mut(&id) {
+                    s.lanes[usize::from(RESPONSE)]
+                        .queue
+                        .push_back(Queued::Ctl(v));
+                }
+                self.call_host(id, RESPONSE, vec![json!({"type": "quarantine", "id": 1})]);
+            }
             "reset" => {
                 let msg = v["message"].as_str().unwrap_or_default().to_owned();
                 lock(&self.log.resets).push((id, msg));
@@ -476,9 +494,11 @@ impl Conn {
             | Mode::Slow
             | Mode::Shout
             | Mode::Sever
-            | Mode::Patient => {}
+            | Mode::Patient
+            | Mode::LateQuarantine => {}
             Mode::Host => self.call_host(
                 id,
+                REQUEST,
                 vec![
                     json!({"type": "log", "id": 1, "level": "info", "message": "hello from the service"}),
                     json!({"type": "record", "id": 2, "kind": "verdict", "data": {"score": 0.9}}),
@@ -489,7 +509,7 @@ impl Conn {
                 ],
             ),
             Mode::Quarantine => {
-                self.call_host(id, vec![json!({"type": "quarantine", "id": 1})]);
+                self.call_host(id, REQUEST, vec![json!({"type": "quarantine", "id": 1})]);
             }
             Mode::Talk => {
                 let s = self.streams.get_mut(&id).expect("just opened");
@@ -502,27 +522,30 @@ impl Conn {
         }
     }
 
-    /// Sends host-service `calls` on stream `id`, holding the request
+    /// Sends host-service `calls` on stream `id`, holding the `dir` lane
     /// until every one is answered.
-    fn call_host(&mut self, id: u32, calls: Vec<Value>) {
-        let s = self.streams.get_mut(&id).expect("just opened");
+    fn call_host(&mut self, id: u32, dir: u8, calls: Vec<Value>) {
+        let s = self.streams.get_mut(&id).expect("an open stream");
         s.calls_waiting = calls.len();
-        s.lanes[usize::from(REQUEST)].held = true;
+        s.lanes[usize::from(dir)].held = true;
         for m in calls {
             self.send(text(id, m));
         }
     }
 
     /// A host-service call on stream `id` was answered; the last one lets
-    /// the held request go.
+    /// the held lane go.
     fn answered(&mut self, id: u32) {
         let Some(s) = self.streams.get_mut(&id).filter(|s| s.calls_waiting > 0) else {
             return;
         };
         s.calls_waiting -= 1;
         if s.calls_waiting == 0 {
-            s.lanes[usize::from(REQUEST)].held = false;
+            for lane in &mut s.lanes {
+                lane.held = false;
+            }
             self.flush(id, REQUEST);
+            self.flush(id, RESPONSE);
         }
     }
 
