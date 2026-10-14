@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::future::poll_fn;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
@@ -134,8 +134,8 @@ impl Drop for GuestInput {
 /// it unfinished means.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Produced {
-    /// The request body passed to `next`: a cut, settled by
-    /// [`ExchangeShared::check_next`].
+    /// The request body passed to `next`: a cut of the forward
+    /// ([`ExchangeShared::cut_next`]).
     Next,
     /// The response body: the exchange fails.
     Response,
@@ -148,13 +148,22 @@ struct OutputState {
     sender: Option<BodySender>,
     produced: Produced,
     shared: Arc<ExchangeShared>,
+    /// The exchange's `pending-response` marker: whether the guest still
+    /// holds one says what cutting a `next` body means.
+    pending: Weak<()>,
     gone: bool,
 }
 
 impl OutputState {
     fn cut(&self, why: &str) {
         match self.produced {
-            Produced::Next => self.shared.cut_next(format!("request body {why}")),
+            // Held by `Streams` and by each `pending-response` the guest
+            // still has: more than one, and the guest still means to read
+            // the response to the request it cut.
+            Produced::Next => self.shared.cut_next(
+                format!("request body {why}"),
+                self.pending.strong_count() > 1,
+            ),
             Produced::Response => self
                 .shared
                 .fail(LayerError::InvalidResponse(format!("response body {why}"))),
@@ -378,6 +387,7 @@ impl Streams {
             sender: Some(tx),
             produced,
             shared,
+            pending: Arc::downgrade(&self.pending),
             gone: false,
         }));
         let stream: DynOutputStream = Box::new(GuestOutput(state.clone()));

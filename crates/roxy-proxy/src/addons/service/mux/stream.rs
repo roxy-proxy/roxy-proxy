@@ -463,12 +463,17 @@ impl Stream {
         self.send(&end).await;
     }
 
-    /// Sends `body`'s frames in direction `dir`, as credit allows.
+    /// Sends `body`'s frames in direction `dir`, as credit allows. The
+    /// stream ending drops the body where it is, a frame still to come
+    /// notwithstanding: nothing reads what it would yield.
     pub(super) async fn pump_body(&self, dir: Dir, mut body: Body) -> Result<(), Lost> {
         use http_body::Body as _;
         loop {
-            let frame =
-                std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
+            let frame = tokio::select! {
+                biased;
+                () = self.ended.cancelled() => return Err(Lost::Stream),
+                f = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)) => f,
+            };
             let mut d = match frame {
                 None => return Ok(()),
                 Some(Err(e)) => return Err(Lost::Body(e)),
@@ -668,6 +673,7 @@ impl Stream {
                 *r.status_mut() = status;
                 *r.headers_mut() = headers;
                 s.answered(r)?;
+                self.st.layer_answered(self.index);
                 self.expect_body(s, Dir::Response, body_tx);
                 Ok(())
             }

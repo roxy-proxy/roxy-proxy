@@ -447,6 +447,40 @@ async fn h2_a_guest_answering_bodiless_still_completes_its_forward() {
     assert_eq!(seen[0].body.len(), 2 * CHUNK);
 }
 
+/// A guest that answered and then cuts its forward short keeps its answer:
+/// the cut fails `next` for the guest, and the client's body is not cut
+/// with it. The record keeps the core's refusal of the cut forward, the
+/// layer's fault, with the status the client got.
+#[tokio::test]
+async fn a_guest_that_answered_keeps_its_answer_when_its_forward_is_cut() {
+    let kit = stack(&["a"]).await;
+    let a = kit
+        .h1()
+        .await
+        .call(
+            "POST",
+            "/upload",
+            &[("x-test-a", "answer-then-cut-next")],
+            b"body",
+        )
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(
+        a.body.as_deref().ok(),
+        Some(b"answered and kept".as_slice()),
+        "{a:?}"
+    );
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "deny", "{ev:#}");
+    assert_eq!(ev["reason"], "layer_error", "{ev:#}");
+    assert_eq!(ev["terminal_rule"], "layer:a", "{ev:#}");
+    assert_eq!(ev["res"]["status"], 200, "{ev:#}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["layer"], "a", "{errs:#?}");
+    assert_eq!(errs[0]["kind"], "invalid_request", "{errs:#?}");
+    assert!(kit.upstream.seen().is_empty(), "nothing complete left");
+}
+
 /// A layer above gives a service up while its forward is upstream whole,
 /// waiting on the head, and answers itself: the service's stream is reset,
 /// and its forward is given up with it, so the record is finished on the

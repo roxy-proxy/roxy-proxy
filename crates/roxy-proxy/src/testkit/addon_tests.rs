@@ -2191,6 +2191,68 @@ mod service {
         assert!(kit.upstream.seen().is_empty(), "nothing complete left");
     }
 
+    /// A service that fails with the response from upstream open at it (its
+    /// clock runs out while the body is idle) takes the body down with its
+    /// stream, so the record is finished on the refusal the layer above
+    /// passes on, not held until the body yields.
+    #[tokio::test(start_paused = true)]
+    async fn a_body_idle_at_a_failed_service_goes_with_its_stream() {
+        let kit = kit(
+            RULES,
+            vec![
+                AddonDef::test_layer("a").spec().await,
+                addon("s", "forward", AddonMode::Enforce, |s| {
+                    s.first_byte_timeout = Duration::from_millis(500);
+                }),
+            ],
+        )
+        .await;
+        let ((a, ev), took) = timed(async {
+            let a = kit
+                .h1()
+                .await
+                .call("GET", "/drip?n=1&first=5000", &[("x-test-a", "pass")], b"")
+                .await;
+            (a, kit.request_event().await)
+        })
+        .await;
+        assert_eq!(a.status, 503, "{a:?}");
+        assert_eq!(a.headers["x-roxy-rule"], "layer:s");
+        assert_eq!(ev["reason"], "layer_error", "{ev:#}");
+        assert!(
+            took < Duration::from_secs(1),
+            "the record is not held for the idle body: {took:?}"
+        );
+    }
+
+    /// The client leaving before the answer (an HTTP/2 connection closed
+    /// with the stream open) tears the stack down: a service holding the
+    /// exchange is reset, however far the layers above have got and
+    /// whether or not its forward is through.
+    #[tokio::test]
+    async fn h2_the_client_leaving_before_the_answer_resets_the_service() {
+        let kit = kit(
+            RULES,
+            vec![
+                AddonDef::test_layer("a").spec().await,
+                addon("s", "hold", AddonMode::Enforce, |_| {}),
+            ],
+        )
+        .await;
+        let mut c = kit.tunnel("up.test", true).await;
+        let req = c
+            .request("GET", "/x", &[("x-test-a", "buffer")])
+            .body(roxy_http::Body::empty())
+            .unwrap();
+        let mut pending = Box::pin(c.send(req));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        let service = kit.upstream.service();
+        let stream = stream_id(&service.until_opened(1).await[0]);
+        drop(pending);
+        drop(c);
+        reset_of(&kit, stream).await;
+    }
+
     /// A response body that fails below the service ends the response lane
     /// with the error and nothing more: the stream is not reset, the
     /// service passes the cut on, and the client's body is cut as it would

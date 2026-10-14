@@ -251,6 +251,12 @@ impl LayerHost for StackHost {
         Ok(())
     }
 
+    fn answered(&self) {
+        if !self.observing() {
+            self.st.layer_answered(self.index);
+        }
+    }
+
     fn failed(&self, err: &LayerError) {
         // An observer's failure is its own, logged by the task that runs
         // it; it is never the exchange's.

@@ -667,6 +667,22 @@ impl Handler for Layer {
                 let (_below, from_below) = await_response(pending);
                 drop(read_all(&from_below));
             }
+            "answer-then-cut-next" => {
+                // Answer first, then forward and cut the forward short
+                // while still waiting on its response: `next` fails for
+                // the guest, and the answer stands.
+                let out = respond_streaming(&head(200, Vec::new()));
+                write_all(&out, b"answered");
+                let (pending, output) = next_streaming(&forward_head(&req));
+                write_all(&output, &read_at_least(&body, 1));
+                drop(output);
+                assert!(
+                    PendingResponse::wait(pending).is_err(),
+                    "a cut forward fails for the guest"
+                );
+                write_all(&out, b" and kept");
+                types::finish(out);
+            }
             "next-then-abandon" => {
                 // Forward the whole request, wait `x-delay-ms` for the
                 // response, then give up on it and answer locally: a

@@ -221,6 +221,10 @@ struct LayerSlot {
     live: AtomicBool,
     /// The response from upstream is still streaming into the layer.
     response_open: AtomicBool,
+    /// The forward's state as the layer answered: whether its answer is
+    /// its own or the response its `next` returned is read then, not when
+    /// the front gets round to it, by when the forward may have resolved.
+    answered: std::sync::OnceLock<NextState>,
     /// Bodies bypassing the layer (enforce mode, head-only subscription).
     bypass: Mutex<subscribe::Bypass>,
     /// The layer failed: any forward of its still running is given up.
@@ -649,14 +653,23 @@ impl StackFlow {
         }
     }
 
-    /// The layer that answered: the outermost one whose `next` did not
-    /// return the response from below (never called, still pending,
-    /// failed or dropped). `None` when every layer entered passed on what
-    /// came from below, so the response is the core's.
+    /// Layer `index` answered: its forward's state now says whether the
+    /// answer is its own.
+    pub(crate) fn layer_answered(&self, index: usize) {
+        let slot = &self.layers[index];
+        let _ = slot.answered.set(slot.state());
+    }
+
+    /// The layer that answered: the outermost one whose `next` had not
+    /// returned the response from below when it answered (never called,
+    /// still pending, dropped), or has not now if it never answered.
+    /// `None` when every layer entered passed on what came from below, so
+    /// the response is the core's.
     fn answered_by(&self) -> Option<usize> {
         self.layers.iter().position(|l| {
+            let state = l.answered.get().copied().unwrap_or_else(|| l.state());
             matches!(
-                l.state(),
+                state,
                 NextState::Entered | NextState::Pending | NextState::Abandoned
             )
         })
@@ -821,6 +834,9 @@ pub(crate) async fn run<F: Front>(
         attributed(&st, Side::Client, std::mem::take(&mut req.body)),
     );
     st.loan.park(cx);
+    // Held from here: a front that gives the exchange up mid-run (its task
+    // aborted with the connection) tears the stack down with it.
+    let reclaim = Reclaim::stack(st.clone());
     let driven = front
         .drive(Driven::new(
             st.clone(),
@@ -828,10 +844,12 @@ pub(crate) async fn run<F: Front>(
         ))
         .await;
     let outcome = stack_outcome(&st, driven, client_tx);
-    if !matches!(outcome, Outcome::Respond(_) | Outcome::Upgrade { .. }) {
-        st.tear_down(ENDED);
+    match &outcome {
+        Outcome::Respond(_) | Outcome::Upgrade { .. } => {}
+        Outcome::Close(roxy_http::DriveError::Client(_)) => st.tear_down(CLIENT_GONE),
+        Outcome::Close(_) | Outcome::Refuse(_) => st.tear_down(ENDED),
     }
-    (Reclaim::stack(st), outcome)
+    (reclaim, outcome)
 }
 
 /// What the stack's answer means for the client. `client_tx` feeds the
@@ -1354,6 +1372,27 @@ mod tests {
         st.loan.park(cx);
         drop(Reclaim::stack(st.clone()));
         assert!(st.torn_down().is_cancelled());
+    }
+
+    /// Which layer answered is read as it answers: a forward that resolves
+    /// between the answer and the front taking it does not turn the answer
+    /// into the response from below.
+    #[tokio::test]
+    async fn the_answering_layer_is_read_when_it_answers() {
+        let kit = Kit::builder()
+            .addon(AddonDef::test_layer("a"))
+            .start()
+            .await;
+        let (st, _cx) = test_flow(&kit);
+        st.set_next(0, NextState::Pending);
+        st.layer_answered(0);
+        st.set_next(0, NextState::Resolved);
+        assert_eq!(st.answered_by(), Some(0));
+
+        let (st, _cx) = test_flow(&kit);
+        st.set_next(0, NextState::Resolved);
+        st.layer_answered(0);
+        assert_eq!(st.answered_by(), None, "the response from below, passed on");
     }
 
     /// A metric source's detail can quote the series key, which a rule may

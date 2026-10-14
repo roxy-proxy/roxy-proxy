@@ -202,4 +202,9 @@ pub trait LayerHost: Send + Sync + 'static {
     /// failures has this one recorded by the time anything downstream fails
     /// on it. Must not call back into the layer.
     fn failed(&self, err: &LayerError);
+
+    /// The guest answered (`respond`): the response head is the layer's,
+    /// whatever its `next` returns before or after. Must not call back
+    /// into the layer.
+    fn answered(&self) {}
 }

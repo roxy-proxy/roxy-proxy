@@ -15,6 +15,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -56,6 +57,8 @@ pub(crate) struct ExchangeShared {
     below: watch::Sender<u64>,
     /// Why the request body passed to `next` was cut, if it was.
     next_cut: OnceLock<String>,
+    /// The guest has answered: its response head is out of its hands.
+    answered: AtomicBool,
 }
 
 impl std::fmt::Debug for ExchangeShared {
@@ -73,6 +76,7 @@ impl ExchangeShared {
             status: watch::Sender::new(Status::default()),
             below: watch::Sender::new(0),
             next_cut: OnceLock::new(),
+            answered: AtomicBool::new(false),
         })
     }
 
@@ -123,26 +127,38 @@ impl ExchangeShared {
         }
     }
 
-    /// The request body passed to `next` was cut. The forwarded body never
-    /// ends cleanly either way; whether the layer failed is decided when
-    /// `next` resolves ([`Self::check_next`]). A guest that dropped the
-    /// response future never sees it resolve: its task is aborted, so the
-    /// cut is an abandonment and the layer's own answer stands.
-    pub(crate) fn cut_next(&self, msg: String) {
-        let _ = self.next_cut.set(msg);
+    /// The guest answered: from here its answer stands whatever becomes of
+    /// its forward.
+    pub(crate) fn answered(&self) {
+        self.answered.store(true, Ordering::SeqCst);
     }
 
-    /// Called as `next` resolves, before the guest can see its result.
-    /// A cut before this point happened while the guest was still waiting
-    /// on the response: the layer failed. A cut after it (the guest has the
-    /// response, or abandoned it) is not a failure.
+    /// The request body passed to `next` was cut: the forwarded body never
+    /// ends cleanly, and `next` fails for the guest if it has yet to
+    /// resolve. A guest that has the response, or dropped the future for
+    /// it, has merely stopped sending, at no fault; one still `holding`
+    /// the future while `next` runs below has cut its own forward, which
+    /// is its fault, recorded now so the refusal it earns below names the
+    /// layer. Having answered, the guest keeps its answer; still to
+    /// answer, it has failed the exchange.
+    pub(crate) fn cut_next(&self, msg: String, holding: bool) {
+        let waiting = holding && *self.below.borrow() % 2 == 1;
+        if self.next_cut.set(msg.clone()).is_err() || !waiting {
+            return;
+        }
+        let err = LayerError::InvalidRequest(msg);
+        if self.answered.load(Ordering::SeqCst) {
+            self.host.failed(&err);
+        } else {
+            self.fail(err);
+        }
+    }
+
+    /// Called as `next` resolves, before the guest can see its result:
+    /// `Err` if the forward was cut.
     pub(crate) fn check_next(&self) -> Result<(), LayerError> {
         match self.next_cut.get() {
-            Some(msg) => {
-                let err = LayerError::InvalidRequest(msg.clone());
-                self.fail(err.clone());
-                Err(err)
-            }
+            Some(msg) => Err(LayerError::InvalidRequest(msg.clone())),
             None => Ok(()),
         }
     }
@@ -367,7 +383,7 @@ impl HttpBody for FromGuest {
                 Poll::Ready(Some(Err(e))) => {
                     let msg = format!("body stream failed: {e}");
                     if this.next {
-                        this.shared.cut_next(msg);
+                        this.shared.cut_next(msg, true);
                     } else {
                         this.shared.fail(match this.dir {
                             Some(Dir::Response) => LayerError::InvalidResponse(msg),

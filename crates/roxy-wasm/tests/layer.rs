@@ -544,6 +544,32 @@ async fn unfinished_next_body_while_awaiting_fails_closed() {
     assert_eq!(host.upload_ended().await, Err(BodyError::Stopped));
 }
 
+/// A guest that has answered and then leaves its `next` body unfinished
+/// while waiting on the response has cut its forward, not failed the
+/// exchange: `next` fails for the guest, the host is told of the fault,
+/// and the answer stands.
+#[tokio::test]
+async fn unfinished_next_body_after_answering_cuts_the_forward_only() {
+    let rt = runtime();
+    let layer = load(&rt, config()).await;
+    let host = Mock::new(NextMode::Upload);
+    let (status, body) = exchange(
+        &layer,
+        host.clone(),
+        request("answer-then-cut-next", Body::from_bytes("partial")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "answered and kept");
+    assert_eq!(host.upload_ended().await, Err(BodyError::Stopped));
+    let failed = host.failed.lock().unwrap().clone();
+    assert!(
+        matches!(failed.as_slice(), [LayerError::InvalidRequest(_)]),
+        "{failed:?}"
+    );
+}
+
 /// A guest that drops `next`'s response future, then the unfinished body,
 /// has abandoned the forwarded request: its own answer stands, and the
 /// forwarded body is cut. The host goes on reading that body after the

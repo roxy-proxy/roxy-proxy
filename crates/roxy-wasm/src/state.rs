@@ -430,8 +430,11 @@ impl chain::Host for StoreState {
         *request.uri_mut() = uri;
         *request.headers_mut() = headers;
 
+        // Entered here, not in the task: the guest may cut the body it just
+        // passed before the task has run, and the cut must find `next`
+        // below.
+        let below = Below::enter(shared.clone());
         let fut = wasmtime_wasi::runtime::spawn(async move {
-            let below = Below::enter(shared.clone());
             let resp = host.next(request).await;
             drop(below);
             if shared.check_next().is_err() {
@@ -482,6 +485,9 @@ impl chain::Host for StoreState {
         let mut resp = http::Response::new(body);
         *resp.status_mut() = status;
         *resp.headers_mut() = headers;
+        let ex = self.exchange("chain.respond")?;
+        ex.shared.answered();
+        ex.host.answered();
         // The receiver is gone only once the exchange has failed or been
         // cancelled; an answer to a failed exchange is discarded.
         let _ = answer.send(resp);
