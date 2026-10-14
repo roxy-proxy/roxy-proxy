@@ -2099,6 +2099,33 @@ mod service {
         no_layer_error(&kit);
     }
 
+    /// An upgrade the stack relayed that roxy then refuses (here the
+    /// buffers its message rules need cannot be had) ends the exchange for
+    /// the stack too: the service's stream is reset, not left carrying a
+    /// socket nothing relays.
+    #[tokio::test]
+    async fn an_upgrade_refused_after_the_stack_relayed_it_resets_the_service() {
+        let rules = format!(
+            "{RULES}
+- id: no-binary
+  when: ws.opcode == 2
+  then: deny
+"
+        );
+        let kit = kit_with(
+            &rules,
+            vec![addon("s", "pass", AddonMode::Enforce, |_| {})],
+            |b| b.limits(|l| l.max_buffered_bytes = l.max_ws_message_bytes),
+        )
+        .await;
+        let (status, io) = kit.websocket("/ws", &[("x-echo", "frames")]).await;
+        assert_eq!(status, 503, "fails closed on the budget");
+        assert!(io.is_none());
+        let service = kit.upstream.service();
+        let stream = stream_id(&service.until_opened(1).await[0]);
+        reset_of(&kit, stream).await;
+    }
+
     /// The relay's end resets a stream whose bodies have not both ended:
     /// here the service holds the upstream's side of the WebSocket, so the
     /// client gets nothing, the relay ends on the idle timeout, and the

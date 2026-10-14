@@ -654,10 +654,19 @@ impl StackFlow {
     }
 
     /// Layer `index` answered: its forward's state now says whether the
-    /// answer is its own.
+    /// answer is its own, and a response from below arriving from here on
+    /// has no head of the layer's to be spliced onto.
     pub(crate) fn layer_answered(&self, index: usize) {
         let slot = &self.layers[index];
         let _ = slot.answered.set(slot.state());
+        subscribe::answered(self, index);
+    }
+
+    /// The front refused the upgrade the stack relayed: the exchange is
+    /// over, and the socket the layers were to carry is dropped unspliced.
+    pub(crate) fn abandon_upgrade(&self) {
+        self.tear_down(ENDED);
+        drop(self.take_ws());
     }
 
     /// The layer that answered: the outermost one whose `next` had not

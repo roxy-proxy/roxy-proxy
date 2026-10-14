@@ -452,7 +452,7 @@ impl chain::Host for StoreState {
             table, exchange, ..
         } = self;
         let ex = exchange.as_mut().expect("in an exchange");
-        let pending = ex.streams.pending(table, fut)?;
+        let pending = ex.streams.pending(table, fut, true)?;
         Ok(Ok((pending, out)))
     }
 
@@ -549,7 +549,7 @@ impl endpoints::Host for StoreState {
             table, exchange, ..
         } = self;
         let ex = exchange.as_mut().expect("in an exchange");
-        let pending = ex.streams.pending(table, fut)?;
+        let pending = ex.streams.pending(table, fut, false)?;
         Ok(Ok((pending, out)))
     }
 }

@@ -672,8 +672,10 @@ impl Stream {
                 let mut r = http::Response::new(body);
                 *r.status_mut() = status;
                 *r.headers_mut() = headers;
-                s.answered(r)?;
+                // Read before the answer is published: whoever takes it
+                // must find the forward as it was when the service answered.
                 self.st.layer_answered(self.index);
+                s.answered(r)?;
                 self.expect_body(s, Dir::Response, body_tx);
                 Ok(())
             }

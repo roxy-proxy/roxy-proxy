@@ -570,6 +570,34 @@ async fn unfinished_next_body_after_answering_cuts_the_forward_only() {
     );
 }
 
+/// An endpoint call's future the guest holds is not a wait on `next`: a
+/// guest that drops `next`'s future and then its unfinished body has
+/// abandoned the forward, at no fault, whatever else it holds.
+#[tokio::test]
+async fn a_held_endpoint_call_does_not_make_an_abandoned_next_a_cut() {
+    let rt = runtime();
+    let mut cfg = config();
+    cfg.capabilities = Capabilities::NONE.with(Capability::Endpoints);
+    let layer = load(&rt, cfg).await;
+    let host = Mock::new(NextMode::Upload);
+    let (mut client_tx, client_body) = Body::channel(u64::MAX, None);
+    let handle = tokio::spawn({
+        let layer = layer.clone();
+        let host = host.clone();
+        async move { exchange(&layer, host, request("endpoint-held-abandon", client_body)).await }
+    });
+    // The guest reads a byte before it abandons `next`, so the host has
+    // the request by then.
+    host.entered.notified().await;
+    client_tx.send_data(Bytes::from("partial")).await.unwrap();
+    let (status, body) = handle.await.unwrap().unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "abandoned with a call held");
+    assert_eq!(host.upload_ended().await, Err(BodyError::Stopped));
+    let failed = host.failed.lock().unwrap().clone();
+    assert!(failed.is_empty(), "{failed:?}");
+}
+
 /// A guest that drops `next`'s response future, then the unfinished body,
 /// has abandoned the forwarded request: its own answer stands, and the
 /// forwarded body is cut. The host goes on reading that body after the

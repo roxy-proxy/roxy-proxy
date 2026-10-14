@@ -126,6 +126,13 @@ pub(super) fn release(st: &StackFlow, index: usize) {
     drop(parked);
 }
 
+/// Layer `index` has answered: a response from below arriving from now on
+/// is not the one its answer passes on, so no body of it is parked. One
+/// parked before stays, for an answer that is the head from below.
+pub(super) fn answered(st: &StackFlow, index: usize) {
+    lock(&st.layers[index].bypass).answered = true;
+}
+
 /// Takes the response body away from enforce layer `index` when it is
 /// subscribed to the head only. A layer that has already answered gets the
 /// head with no body to park: its answer was whole.
@@ -157,11 +164,7 @@ pub(super) fn reattach_response(
     index: usize,
     res: LayerResponse,
 ) -> LayerResponse {
-    let parked = {
-        let mut bypass = lock(&st.layers[index].bypass);
-        bypass.answered = true;
-        bypass.response.take()
-    };
+    let parked = lock(&st.layers[index].bypass).response.take();
     let Some((status, body)) = parked else {
         return res;
     };
@@ -262,5 +265,37 @@ impl HttpBody for Spliced {
 
     fn size_hint(&self) -> SizeHint {
         SizeHint::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::{AddonDef, Kit};
+
+    /// A response from below that arrives after the layer answered is not
+    /// parked for it: the answer was the layer's own, and the body from
+    /// below must not be spliced onto it. One that arrived before stays.
+    #[tokio::test]
+    async fn a_body_from_below_is_not_parked_once_the_layer_has_answered() {
+        let kit = Kit::builder()
+            .addon(AddonDef::test_layer("a").subscribe(Part::Full, Part::Head))
+            .start()
+            .await;
+        let from_below = || {
+            http::Response::builder()
+                .status(200)
+                .body(Body::from_bytes("from below"))
+                .unwrap()
+        };
+        let (st, _cx) = crate::addons::test_flow(&kit);
+        answered(&st, 0);
+        drop(detach_response(&st, 0, from_below()));
+        assert!(lock(&st.layers[0].bypass).response.is_none());
+
+        let (st, _cx) = crate::addons::test_flow(&kit);
+        drop(detach_response(&st, 0, from_below()));
+        answered(&st, 0);
+        assert!(lock(&st.layers[0].bypass).response.is_some());
     }
 }

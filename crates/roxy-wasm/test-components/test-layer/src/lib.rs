@@ -683,6 +683,25 @@ impl Handler for Layer {
                 write_all(&out, b" and kept");
                 types::finish(out);
             }
+            "endpoint-held-abandon" => {
+                // Hold an endpoint call's future, then forward, drop the
+                // pending `next` and cut its body: the held call is no
+                // wait on `next`, so the cut is an abandonment.
+                let park = RequestHead {
+                    method: "POST".to_owned(),
+                    scheme: None,
+                    authority: None,
+                    path_with_query: "/park".to_owned(),
+                    headers: Vec::new(),
+                };
+                let (held, _) = endpoints::call("park", &park, Body::Empty).expect("call");
+                let (pending, output) = next_streaming(&forward_head(&req));
+                write_all(&output, &read_at_least(&body, 1));
+                drop(pending);
+                drop(output);
+                respond(200, b"abandoned with a call held");
+                drop(held);
+            }
             "next-then-abandon" => {
                 // Forward the whole request, wait `x-delay-ms` for the
                 // response, then give up on it and answer locally: a

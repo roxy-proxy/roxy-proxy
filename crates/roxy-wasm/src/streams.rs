@@ -148,8 +148,8 @@ struct OutputState {
     sender: Option<BodySender>,
     produced: Produced,
     shared: Arc<ExchangeShared>,
-    /// The exchange's `pending-response` marker: whether the guest still
-    /// holds one says what cutting a `next` body means.
+    /// The marker `next`'s `pending-response` shares: whether the guest
+    /// still holds it says what cutting a `next` body means.
     pending: Weak<()>,
     gone: bool,
 }
@@ -157,9 +157,9 @@ struct OutputState {
 impl OutputState {
     fn cut(&self, why: &str) {
         match self.produced {
-            // Held by `Streams` and by each `pending-response` the guest
-            // still has: more than one, and the guest still means to read
-            // the response to the request it cut.
+            // Held by `Streams` and by `next`'s `pending-response` while
+            // the guest has it: more than one, and the guest still means
+            // to read the response to the request it cut.
             Produced::Next => self.shared.cut_next(
                 format!("request body {why}"),
                 self.pending.strong_count() > 1,
@@ -300,21 +300,28 @@ impl Pollable for PendingResponse {
 pub(crate) struct Streams {
     inputs: HashMap<u32, Arc<Mutex<InputState>>>,
     outputs: HashMap<u32, Arc<Mutex<OutputState>>>,
-    /// Shared with every `pending-response` in the table, so its strong
-    /// count less this one is how many the guest still holds.
+    /// Shared with every endpoint call's `pending-response` in the table,
+    /// so its strong count less this one is how many the guest still
+    /// holds.
     pending: Arc<()>,
+    /// The same for `next`'s, apart: what the guest holds of its forward
+    /// decides what cutting the forwarded body means.
+    next: Arc<()>,
 }
 
 impl Streams {
-    /// Hands the guest a `pending-response` for `handle`.
+    /// Hands the guest a `pending-response` for `handle`: `next`'s, or an
+    /// endpoint call's.
     pub(crate) fn pending(
         &self,
         table: &mut ResourceTable,
         handle: AbortOnDropJoinHandle<Answer>,
+        of_next: bool,
     ) -> wasmtime::Result<Resource<PendingResponse>> {
+        let held = if of_next { &self.next } else { &self.pending };
         Ok(table.push(PendingResponse {
             state: Pending::Waiting(handle),
-            _held: self.pending.clone(),
+            _held: held.clone(),
         })?)
     }
 
@@ -325,6 +332,7 @@ impl Streams {
         self.inputs.values().any(|s| !lock(s).gone)
             || self.outputs.values().any(|s| !lock(s).gone)
             || Arc::strong_count(&self.pending) > 1
+            || Arc::strong_count(&self.next) > 1
     }
 
     /// Hands `body` to the guest as an `input-stream`.
@@ -387,7 +395,7 @@ impl Streams {
             sender: Some(tx),
             produced,
             shared,
-            pending: Arc::downgrade(&self.pending),
+            pending: Arc::downgrade(&self.next),
             gone: false,
         }));
         let stream: DynOutputStream = Box::new(GuestOutput(state.clone()));
