@@ -804,6 +804,55 @@ async fn when_sees_tags_set_by_layers_above() {
     assert_eq!(a.json()["via"], "a,b");
 }
 
+/// A tag an enforce layer adds is one of the flow's tags: `tag[..]` reads
+/// it in the admission rules and in the in-flight rules, as it would a tag
+/// an earlier rule set, and the flow log lists it once.
+#[tokio::test]
+async fn a_layers_tag_is_read_by_the_rules_below_it() {
+    let kit = Kit::builder()
+        .rules(
+            r#"
+- id: tagged
+  when: tag["via:t"]
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#,
+        )
+        .addon(AddonDef::test_layer("t"))
+        .start()
+        .await;
+    let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+    assert_eq!(a.status, 403, "{a:?}");
+    assert_eq!(a.headers["x-roxy-rule"], "tagged");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "tagged", "{ev:#}");
+    assert_eq!(strs(&ev["tags"]), ["via:t"], "{ev:#}");
+
+    let kit = Kit::builder()
+        .rules(
+            r#"
+- id: up
+  when: host == "up.test"
+  then: allow
+- id: tagged-ok
+  when: tag["via:t"] and response.status == 200
+  then: { deny: { status: 502, message: "tagged" } }
+"#,
+        )
+        .addon(AddonDef::test_layer("t"))
+        .start()
+        .await;
+    let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+    assert_eq!(a.status, 502, "{a:?}");
+    assert_eq!(a.headers["x-roxy-rule"], "tagged-ok");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "tagged-ok", "{ev:#}");
+    assert_eq!(ev["stage"], "response_head", "{ev:#}");
+    assert_eq!(strs(&ev["tags"]), ["via:t"], "{ev:#}");
+}
+
 /// An observer's tag is refused, so it cannot steer a lower layer's `when`:
 /// the gate below stays skipped and the flow carries no such tag. The
 /// refusal is the observer's failure, logged like any other.

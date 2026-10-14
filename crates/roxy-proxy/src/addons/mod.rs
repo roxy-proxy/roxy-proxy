@@ -173,8 +173,9 @@ pub struct EndpointSpec {
 }
 
 /// Most tags a flow holds, and most bytes of them together. Tags are
-/// labels for `when` and the flow log; the host keeps them outside any
-/// layer's `max_memory`, so a guest cannot grow them without end.
+/// labels for the rules' `tag[..]`, the layers' `when` and the flow log;
+/// the host keeps them outside any layer's `max_memory`, so a guest cannot
+/// grow them without end.
 const MAX_TAGS: usize = 64;
 const MAX_TAG_BYTES: usize = 4096;
 
@@ -369,7 +370,6 @@ pub(crate) struct StackFlow {
     /// layer passes on inherits: a layer cannot express the protocol
     /// version, the target form or an upgrade.
     client_meta: RequestMeta,
-    tags: Mutex<Vec<String>>,
     loan: Loan,
     layers: Box<[LayerSlot]>,
     /// Who is to blame for the exchange failing, if it does.
@@ -397,7 +397,6 @@ impl StackFlow {
             meta: cx.meta.clone(),
             facts: Mutex::new(cx.facts.clone()),
             client_meta: req.meta.clone(),
-            tags: Mutex::new(Vec::new()),
             loan: Loan::new(),
             layers: cx
                 .snap
@@ -437,11 +436,9 @@ impl StackFlow {
         })
     }
 
+    /// The flow's tags: the layers' and the rules' alike.
     pub(crate) fn tags(&self) -> Vec<String> {
-        self.tags
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.meta.tags()
     }
 
     /// The layers that ran, with their subscriptions.
@@ -466,7 +463,7 @@ impl StackFlow {
     /// Adds a tag, unless the flow already has it or is at
     /// [`MAX_TAGS`] / [`MAX_TAG_BYTES`].
     pub(crate) fn add_tag(&self, tag: String) -> Result<(), TagError> {
-        let mut t = self.tags.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut t = self.meta.tags_mut();
         if t.contains(&tag) {
             return Ok(());
         }
@@ -579,7 +576,7 @@ impl StackFlow {
     }
 
     /// Folds the stack into the flow record just before its `request`
-    /// event: the layers and the tags they added.
+    /// event: the layers that ran.
     pub(crate) fn fold_into(&self, cx: &mut FlowCx) {
         cx.record.addons = self
             .snap
@@ -589,11 +586,6 @@ impl StackFlow {
             .filter(|(_, l)| l.ran.load(Ordering::SeqCst))
             .map(|(a, _)| a.name.clone())
             .collect();
-        for t in self.tags() {
-            if !cx.record.tags.contains(&t) {
-                cx.record.tags.push(t);
-            }
-        }
     }
 }
 

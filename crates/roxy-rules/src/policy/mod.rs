@@ -260,14 +260,12 @@ pub(crate) fn is_header_value(s: &str) -> bool {
 }
 
 /// Per-exchange state of the in-flight rules: which ones have fired (their
-/// non-terminal effects apply once) and the tags set so far. Create with
-/// [`Policy::in_flight_state`] after the admission decision.
+/// non-terminal effects apply once). Create with
+/// [`Policy::in_flight_state`] after the admission decision. The flow's
+/// tags are not part of it: the caller passes them to each evaluation.
 #[derive(Debug, Clone, Default)]
 pub struct InFlightState {
     fired: Vec<bool>,
-    /// Tags visible to in-flight rules: the admission decision's, plus
-    /// those set by in-flight rules that fired.
-    pub tags: Vec<String>,
     stopped: bool,
 }
 

@@ -591,10 +591,11 @@ pub fn run(policy: &Policy, view: &DryRunView, tags: &[String], known: Reads) ->
     };
     let admission = policy.evaluate_admission(view, &ctx);
     let in_flight = admission.decision.is_allow().then(|| {
-        let mut st = policy.in_flight_state(&admission.tags);
+        let mut st = policy.in_flight_state();
+        let mut tags = admission.tags.clone();
         let changed = known | Reads::METRICS;
         policy
-            .evaluate_in_flight(changed, known, &mut st, view)
+            .evaluate_in_flight(changed, known, &mut st, &mut tags, view)
             .unwrap_or_default()
     });
     DryRun {

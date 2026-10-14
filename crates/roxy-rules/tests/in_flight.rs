@@ -91,18 +91,19 @@ fn effects_apply_once_and_a_deny_stops() {
     let ctx = EvalContext::empty();
     let head = p.evaluate_admission(&MapView::new(), &ctx);
     assert_eq!(head.terminal_rule, "allow-all");
-    let mut st = p.in_flight_state(&head.tags);
+    let mut st = p.in_flight_state();
+    let mut tags = head.tags.clone();
     let at = |n: i64| MapView::new().with_int(Field::BodyBytes, n);
     let changed = Reads::BODY_BYTES;
 
     // Nothing matches: `None`.
     assert_eq!(
-        p.evaluate_in_flight(changed, changed, &mut st, &at(10),),
+        p.evaluate_in_flight(changed, changed, &mut st, &mut tags, &at(10),),
         None
     );
     // Crossing 1 KiB: effects and a tag, once.
     let o = p
-        .evaluate_in_flight(changed, changed, &mut st, &at(2048))
+        .evaluate_in_flight(changed, changed, &mut st, &mut tags, &at(2048))
         .unwrap();
     assert!(!o.stops());
     assert_eq!(o.matched, ["upload-log"].map(roxy_rules::RuleId::new));
@@ -114,15 +115,15 @@ fn effects_apply_once_and_a_deny_stops() {
             message: "big upload".into()
         }]
     );
-    assert_eq!(st.tags, ["metered", "big-upload"]);
+    assert_eq!(tags, ["metered", "big-upload"]);
     assert_eq!(
-        p.evaluate_in_flight(changed, changed, &mut st, &at(4096),),
+        p.evaluate_in_flight(changed, changed, &mut st, &mut tags, &at(4096),),
         None,
         "an in-flight rule's effects apply once"
     );
     // Crossing 10 KiB: stop.
     let o = p
-        .evaluate_in_flight(changed, changed, &mut st, &at(20_000))
+        .evaluate_in_flight(changed, changed, &mut st, &mut tags, &at(20_000))
         .unwrap();
     assert_eq!(
         o.stop,
@@ -135,20 +136,24 @@ fn effects_apply_once_and_a_deny_stops() {
     assert_eq!(o.terminal_rule.unwrap(), "upload-cap");
     assert!(st.is_stopped());
     // After a stop nothing is evaluated again.
-    assert_eq!(p.evaluate_in_flight(ALL, ALL, &mut st, &at(1 << 30),), None);
+    assert_eq!(
+        p.evaluate_in_flight(ALL, ALL, &mut st, &mut tags, &at(1 << 30),),
+        None
+    );
 }
 
 #[test]
 fn rules_wait_until_everything_they_read_is_known() {
     let p = compile("", POLICY);
-    let mut st = p.in_flight_state(&["metered".to_owned()]);
+    let mut st = p.in_flight_state();
+    let mut tags = vec!["metered".to_owned()];
     let v = MapView::new()
         .with_int(Field::BodyBytes, 10)
         .with_int(Field::ResponseStatus, 500)
         .with_int(Field::ResponseBodyBytes, 2 << 20);
     // A body-bytes event does not re-check response rules.
     assert_eq!(
-        p.evaluate_in_flight(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &v,),
+        p.evaluate_in_flight(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &mut tags, &v,),
         None
     );
     // Response head known, but `response.body.bytes` is not yet.
@@ -157,12 +162,13 @@ fn rules_wait_until_everything_they_read_is_known() {
             Reads::RESPONSE_HEAD,
             Reads::BODY_BYTES | Reads::RESPONSE_HEAD,
             &mut st,
+            &mut tags,
             &v,
         ),
         None
     );
     let o = p
-        .evaluate_in_flight(Reads::RESPONSE_BODY_BYTES, ALL, &mut st, &v)
+        .evaluate_in_flight(Reads::RESPONSE_BODY_BYTES, ALL, &mut st, &mut tags, &v)
         .unwrap();
     assert_eq!(o.terminal_rule.unwrap(), "download-cap");
 }
@@ -170,10 +176,17 @@ fn rules_wait_until_everything_they_read_is_known() {
 #[test]
 fn response_header_effects() {
     let p = compile("", POLICY);
-    let mut st = p.in_flight_state(&[]);
+    let mut st = p.in_flight_state();
+    let mut tags = Vec::new();
     let v = MapView::new().with_int(Field::ResponseStatus, 200);
     let o = p
-        .evaluate_in_flight(Reads::RESPONSE_HEAD, Reads::RESPONSE_HEAD, &mut st, &v)
+        .evaluate_in_flight(
+            Reads::RESPONSE_HEAD,
+            Reads::RESPONSE_HEAD,
+            &mut st,
+            &mut tags,
+            &v,
+        )
         .unwrap();
     assert!(!o.stops());
     assert_eq!(
@@ -192,12 +205,14 @@ fn errors_stop_the_exchange() {
         "",
         "- { id: a, then: allow }\n- { id: w, when: 'response.body.size > 1mb', then: deny }",
     );
-    let mut st = p.in_flight_state(&[]);
+    let mut st = p.in_flight_state();
+    let mut tags = Vec::new();
     let o = p
         .evaluate_in_flight(
             Reads::RESPONSE_HEAD,
             Reads::RESPONSE_HEAD,
             &mut st,
+            &mut tags,
             &MapView::new(),
         )
         .unwrap();
@@ -215,9 +230,10 @@ fn errors_stop_the_exchange() {
         "",
         "- { id: w, when: 'response.header[\"x\"] contains \"y\"', then: { log: { level: info, message: m } } }",
     );
-    let mut st = p.in_flight_state(&[]);
+    let mut st = p.in_flight_state();
+    let mut tags = Vec::new();
     let o = p
-        .evaluate_in_flight(ALL, ALL, &mut st, &MapView::new())
+        .evaluate_in_flight(ALL, ALL, &mut st, &mut tags, &MapView::new())
         .unwrap();
     assert!(o.stops());
     assert_eq!(o.effects, [], "no effects from a failed evaluation");
@@ -227,12 +243,14 @@ fn errors_stop_the_exchange() {
         "- { id: egress, count: request_bytes }",
         "- { id: cap, when: 'metric.egress > 1mb', then: deny }",
     );
-    let mut st = p.in_flight_state(&[]);
+    let mut st = p.in_flight_state();
+    let mut tags = Vec::new();
     let o = p
         .evaluate_in_flight(
             Reads::METRIC_REQUEST_BYTES,
             Reads::NONE,
             &mut st,
+            &mut tags,
             &MapView::new(),
         )
         .unwrap();
@@ -279,15 +297,20 @@ fn byte_metric_denies_in_flight() {
     );
     let head = p.evaluate_admission(&v(0, 29), &ctx);
     assert_eq!(head.terminal_rule, "ok");
-    let mut st = p.in_flight_state(&head.tags);
+    let mut st = p.in_flight_state();
+    let mut tags = head.tags.clone();
     // `n` grew to 30 because of this exchange: not re-checked.
-    assert_eq!(p.evaluate_in_flight(ALL, ALL, &mut st, &v(1000, 30),), None);
+    assert_eq!(
+        p.evaluate_in_flight(ALL, ALL, &mut st, &mut tags, &v(1000, 30),),
+        None
+    );
     // The upload pushes egress over the budget: stop.
     let o = p
         .evaluate_in_flight(
             Reads::BODY_BYTES | Reads::METRIC_REQUEST_BYTES,
             Reads::BODY_BYTES,
             &mut st,
+            &mut tags,
             &v(2 << 20, 30),
         )
         .unwrap();
@@ -453,13 +476,15 @@ fn an_in_flight_deny_keeps_the_effects_of_the_rules_below_it() {
   then: { deny: { status: 400 } }
 "#,
     );
-    let mut st = p.in_flight_state(&[]);
+    let mut st = p.in_flight_state();
+    let mut tags = Vec::new();
     let changed = Reads::BODY_BYTES;
     let o = p
         .evaluate_in_flight(
             changed,
             changed,
             &mut st,
+            &mut tags,
             &MapView::new().with_int(Field::BodyBytes, 20_000),
         )
         .unwrap();
@@ -506,12 +531,14 @@ fn an_in_flight_deny_keeps_the_effects_of_the_rules_below_it() {
   then: deny
 ",
     );
-    let mut st = p.in_flight_state(&[]);
+    let mut st = p.in_flight_state();
+    let mut tags = Vec::new();
     let o = p
         .evaluate_in_flight(
             ALL,
             ALL,
             &mut st,
+            &mut tags,
             &MapView::new().with_int(Field::BodyBytes, 20_000),
         )
         .unwrap();
@@ -545,16 +572,29 @@ fn a_rule_waits_for_a_field_that_arrives_on_a_later_event() {
             .with_int(Field::BodyBytes, body)
             .with_int(Field::ResponseStatus, 200)
     };
-    let mut st = p.in_flight_state(&[]);
+    let mut st = p.in_flight_state();
+    let mut tags = Vec::new();
     // Body bytes known and over the limit, response head not yet: skipped.
     assert_eq!(
-        p.evaluate_in_flight(Reads::BODY_BYTES, Reads::BODY_BYTES, &mut st, &v(2048)),
+        p.evaluate_in_flight(
+            Reads::BODY_BYTES,
+            Reads::BODY_BYTES,
+            &mut st,
+            &mut tags,
+            &v(2048)
+        ),
         None
     );
     assert!(!st.is_stopped());
     // Everything known, but the event is one the rule does not read.
     assert_eq!(
-        p.evaluate_in_flight(Reads::RESPONSE_BODY_BYTES, ALL, &mut st, &v(2048)),
+        p.evaluate_in_flight(
+            Reads::RESPONSE_BODY_BYTES,
+            ALL,
+            &mut st,
+            &mut tags,
+            &v(2048)
+        ),
         None
     );
     // The response head arrives: both fields known, the rule fires.
@@ -563,6 +603,7 @@ fn a_rule_waits_for_a_field_that_arrives_on_a_later_event() {
             Reads::RESPONSE_HEAD,
             Reads::BODY_BYTES | Reads::RESPONSE_HEAD,
             &mut st,
+            &mut tags,
             &v(2048),
         )
         .unwrap();
@@ -570,12 +611,14 @@ fn a_rule_waits_for_a_field_that_arrives_on_a_later_event() {
 
     // Evaluated false once everything is known, a rule is re-checked when
     // one of its fields changes again.
-    let mut st = p.in_flight_state(&[]);
+    let mut st = p.in_flight_state();
+    let mut tags = Vec::new();
     assert_eq!(
         p.evaluate_in_flight(
             Reads::RESPONSE_HEAD,
             Reads::BODY_BYTES | Reads::RESPONSE_HEAD,
             &mut st,
+            &mut tags,
             &v(10),
         ),
         None
@@ -585,6 +628,7 @@ fn a_rule_waits_for_a_field_that_arrives_on_a_later_event() {
             Reads::BODY_BYTES,
             Reads::BODY_BYTES | Reads::RESPONSE_HEAD,
             &mut st,
+            &mut tags,
             &v(2048),
         )
         .unwrap();
@@ -609,12 +653,14 @@ fn a_matched_in_flight_quarantine_survives_a_fail_closed() {
 ",
     );
     let head = p.evaluate_admission(&MapView::new(), &EvalContext::empty());
-    let mut st = p.in_flight_state(&head.tags);
+    let mut st = p.in_flight_state();
+    let mut tags = head.tags.clone();
     let o = p
         .evaluate_in_flight(
             ALL,
             ALL,
             &mut st,
+            &mut tags,
             &MapView::new().with_int(Field::ResponseStatus, 500),
         )
         .unwrap();
@@ -652,12 +698,14 @@ fn an_in_flight_quarantine_stops_and_is_reported() {
     let head = p.evaluate_admission(&MapView::new().with_metric("egress", 0), &ctx);
     assert!(head.decision.is_allow());
     assert_eq!(head.quarantine, None);
-    let mut st = p.in_flight_state(&head.tags);
+    let mut st = p.in_flight_state();
+    let mut tags = head.tags.clone();
     let o = p
         .evaluate_in_flight(
             ALL,
             ALL,
             &mut st,
+            &mut tags,
             &MapView::new()
                 .with_metric("egress", 0)
                 .with_int(Field::ResponseStatus, 500),
