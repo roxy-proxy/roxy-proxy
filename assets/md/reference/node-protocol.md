@@ -41,8 +41,8 @@ node acts on the status code, not the body.
 
 | status | meaning | node behaviour |
 |---|---|---|
-| `400` | malformed request; `error` says how | log, then as a `401` on the same operation: retrying cannot help. A flow batch is the exception ([flow upload](/reference/node-protocol#flow-upload)) |
-| `401` | at enrolment: the token was not accepted. Elsewhere: the node token is not recognised (never issued, expired or forgotten) | enrolment: retry with backoff for two minutes (a new token may not have reached every replica), then exit non-zero. Renewal: log once and stop renewing. Lease: log once per outcome change, keep polling and let the lease run down. Never re-enrol unasked: re-enrolment is an operator action |
+| `400` | malformed request; `error` says how | logged apart from a `401`; retrying cannot help. Enrolment: retry with backoff for two minutes, then exit non-zero. Renewal: stop renewing. Lease: log once per outcome change, keep polling and let the lease run down. A flow batch is the exception ([flow upload](/reference/node-protocol#flow-upload)) |
+| `401` | at enrolment: the token was not accepted. Elsewhere: the node token is not recognised (never issued, expired or forgotten) | enrolment: retry with backoff for two minutes (a new token may not have reached every replica), then exit non-zero. Renewal: log once per run of them and retry with backoff under the current token (the replica answering may not yet know the token the last renewal issued). Lease: log once per outcome change, keep polling and let the lease run down. Flows: retry the batch with backoff, as a failure. Never re-enrol unasked: re-enrolment is an operator action |
 | `410` | the node is revoked; definite and terminal | at enrolment: exit non-zero at once. Elsewhere: expire the lease at once (deny everything, clear the secrets), stop polling, keep `/healthz` up and `/readyz` not ready, and offer what is spooled to `/flows` for up to thirty seconds |
 | `426` | the server will not serve this node's `protocol_version` or `roxy_version` | enrolment: exit non-zero at once. Renewal: stop renewing. Lease: treat as `5xx`; log the `missing` list distinctly |
 | `507` | flow quota exhausted | stop shipping until a lease with a new `lease_id` arrives ([flow upload](/reference/node-protocol#flow-upload)) |
@@ -95,11 +95,14 @@ has the enrolment response's shape, with `node_id` unchanged and a fresh
 cannot lock the node out; the node switches to the new token on receipt
 and replaces the one in its state directory.
 
-`5xx`, timeout, connection and TLS errors are retried with backoff; `410`
-is terminal; a `401`, `426` or other `4xx` is logged once and ends renewal,
-and the token serves until its `not_after`. Once it expires the node exits
-non-zero with an error naming the remedy (a new enrolment token and an
-empty state dir), as it does on a start whose stored token has already
+`5xx`, timeout, connection and TLS errors are retried with backoff, and so
+is a `401`: the replica answering may not yet know the token the last
+renewal issued, so the node keeps trying under the token it has, logging
+once per run of them. `410` is terminal; a `426` or other `4xx` is logged
+once and ends renewal, and the token serves until its `not_after`. Once it
+expires the node exits non-zero with an error naming the remedy (a new
+enrolment token and an empty state dir), as it does on a start whose
+stored token has already
 expired: no control plane recognises the token, so nothing short of
 re-enrolment recovers the node.
 
