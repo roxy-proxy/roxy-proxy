@@ -65,6 +65,7 @@ async fn lone_stream() -> (Arc<Stream>, Answers, crate::testkit::Kit) {
         more_credit: Notify::new(),
         ended: CancellationToken::new(),
         wire: Arc::default(),
+        calls: Mutex::new(None),
     });
     lock(&link.shared.streams).open.insert(1, stream.clone());
     (stream, Answers { first, second }, kit)

@@ -254,11 +254,12 @@ impl AddonDef {
             roxy_rules::Condition::compile(input, &format!("{}.when", self.name), w)
                 .unwrap_or_else(|d| panic!("when: {d:?}"))
         });
+        let capabilities: roxy_wasm::Capabilities = self.caps.into_iter().collect();
         let layer = roxy_wasm::Layer::start(
             compiled(&self.name, self.wasm).await,
             roxy_wasm::LayerConfig {
                 name: self.name.clone(),
-                capabilities: self.caps.into_iter().collect(),
+                capabilities,
                 limits: self.limits,
                 max_headers: Limits::default().max_headers,
                 config_json: self.config.to_string(),
@@ -271,6 +272,8 @@ impl AddonDef {
             mode: self.mode,
             kind: crate::addons::AddonImpl::Wasm(layer),
             endpoints: self.endpoints,
+            capabilities,
+            config: self.config,
             when,
             sample: self.sample,
             subscribe: self.subscribe,

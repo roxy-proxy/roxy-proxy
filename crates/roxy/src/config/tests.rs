@@ -1007,6 +1007,7 @@ fn service_addons_validate() {
     let (_dir, wasm) = wasm_file();
     let ok = format!(
         "{BASE}addons:\n  - name: s\n    kind: service\n    endpoint: svc\n    \
+         capabilities: [log, state]\n    config: {{ a: 1 }}\n    \
          limits: {{ first_byte_timeout: 2s, max_connections: 2, max_streams: 50 }}\n    \
          endpoints:\n      svc: {{ url: \"http://127.0.0.1:9000/layer\", private_ok: true }}\n"
     );
@@ -1022,8 +1023,6 @@ fn service_addons_validate() {
     let paths: Vec<&str> = d.iter().map(|d| d.path.as_str()).collect();
     for p in [
         "addons[0].endpoint",
-        "addons[0].capabilities",
-        "addons[0].config",
         "addons[0].limits.max_memory",
         "addons[0].limits.max_connections",
         "addons[0].limits.max_streams",

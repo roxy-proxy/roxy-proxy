@@ -172,7 +172,7 @@ addons:
     #     timeout: 2s
     #     private_ok: true
   # An external service in the network path: each exchange is a
-  # stream on a pooled WebSocket connection (roxy.layer.v4).
+  # stream on a pooled WebSocket connection (roxy.layer.v5).
   # - name: sentinel
   #   kind: service
   #   endpoint: sidecar

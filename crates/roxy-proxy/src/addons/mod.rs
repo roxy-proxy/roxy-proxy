@@ -84,6 +84,10 @@ pub struct AddonSpec {
     pub kind: AddonImpl,
     /// Named endpoints, by name.
     pub endpoints: HashMap<String, EndpointSpec>,
+    /// The host services the layer may call.
+    pub capabilities: roxy_wasm::Capabilities,
+    /// `config`: the document the layer reads, whatever its kind.
+    pub config: serde_json::Value,
     /// `when`: the layer runs only on requests this matches, as they reach
     /// it; the others go straight to the layer below.
     pub when: Option<roxy_rules::Condition>,
@@ -592,7 +596,7 @@ impl StackFlow {
 /// A stable code for a layer failure, for the flow log.
 fn error_kind(e: &StackError) -> String {
     let e = match e {
-        StackError::Layer(e) => e,
+        StackError::Layer(e) | StackError::Service(ServiceError::Layer { err: e, .. }) => e,
         StackError::Service(e) => return e.kind().to_owned(),
         StackError::Condition { code, .. } => return format!("when:{code}"),
     };
@@ -633,7 +637,11 @@ pub(crate) fn emit_stack_error(st: &FlowMeta, layer: &str, e: &StackError, mode:
         .redactor()
         .redact_str(&e.to_string())
         .into_owned();
-    tracing::info!(flow = %st.flow, layer, error = %message, mode = mode.as_str(), "layer failed");
+    let call = match e {
+        StackError::Service(ServiceError::Layer { call, .. }) => Some(*call),
+        StackError::Layer(_) | StackError::Service(_) | StackError::Condition { .. } => None,
+    };
+    tracing::info!(flow = %st.flow, layer, error = %message, mode = mode.as_str(), call, "layer failed");
     st.shared.sink.emit(&FlowEvent::LayerError {
         ts: chrono::Utc::now(),
         flow: st.flow.to_string(),
@@ -642,6 +650,7 @@ pub(crate) fn emit_stack_error(st: &FlowMeta, layer: &str, e: &StackError, mode:
         mode: mode.as_str().to_owned(),
         kind: error_kind(e),
         message,
+        call,
     });
 }
 
@@ -832,6 +841,7 @@ pub(crate) fn enter(
                     st: st.clone(),
                     index,
                     observer: None,
+                    call: None,
                 });
                 match layer.handle(h, req).await {
                     Ok(r) => Ok(r),

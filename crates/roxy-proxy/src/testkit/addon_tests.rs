@@ -1015,11 +1015,17 @@ mod service {
 
     use super::{RULES, echo, no_layer_error, strs};
     use crate::addons::AddonMode;
+    use std::sync::Arc;
+
+    use crate::addons::AddonSpec;
     use crate::addons::service::ServiceSpec;
-    use crate::addons::service::testing::{addon, kit, only_when, reload, subscribed};
-    use crate::testkit::upstream::service::SLOW;
+    use crate::addons::service::testing::{
+        addon, granted, kit, kit_with, only_when, reload, subscribed,
+    };
+    use crate::testkit::upstream::service::{HOST_STATE_VALUE, SLOW};
     use crate::testkit::{AddonDef, Answer, Kit, streaming_body, timed};
     use roxy_http::Body;
+    use roxy_wasm::Capability;
 
     /// Rules that read the request body, so the core consumes what the
     /// service forwards before anything reaches the upstream.
@@ -1031,6 +1037,165 @@ mod service {
   when: host == "up.test"
   then: allow
 "#;
+
+    /// The `config:` a `host` service is given, as it should read it.
+    fn host_config() -> serde_json::Value {
+        serde_json::json!({"reject_at": 0.8, "tags": ["a", "b"], "nested": {"on": true}})
+    }
+
+    /// A service layer `s` with the `host` behaviour, granted `caps` and
+    /// configured with [`host_config`].
+    fn host_service(mode: AddonMode, caps: &[Capability]) -> Arc<AddonSpec> {
+        let mut spec = granted(addon("s", "host", mode, |_| {}), caps);
+        Arc::get_mut(&mut spec).expect("a fresh addon").config = host_config();
+        spec
+    }
+
+    /// Every capability the `host` behaviour's calls need.
+    const HOST_CAPS: [Capability; 4] = [
+        Capability::Log,
+        Capability::Record,
+        Capability::State,
+        Capability::Metrics,
+    ];
+
+    /// The metric the `host` behaviour reads.
+    const BY_HOST: &str = "- { id: by_host, count: requests, key: [host], window: 1h }";
+
+    /// The `result` replies the service was sent on stream `id`, by call id.
+    fn results(kit: &Kit, id: u32) -> std::collections::HashMap<u64, serde_json::Value> {
+        kit.upstream
+            .service()
+            .controls(id)
+            .into_iter()
+            .filter(|m| m["type"] == "result")
+            .map(|m| (m["id"].as_u64().unwrap(), m))
+            .collect()
+    }
+
+    /// A service granted the capabilities uses the host services a WASM
+    /// layer has, through the same host: its `open` names its grants and
+    /// carries its `config` as configured, its record (named by its call
+    /// id) and tag reach the flow log, every call is answered with a
+    /// `result`, and what it writes to the state store before forwarding
+    /// is what the rules read on this very exchange, since it forwards
+    /// only once the write is answered. Its `metric_get` reads the metric
+    /// the rules read: no entry before any flow is counted, the count
+    /// after.
+    #[tokio::test]
+    async fn a_service_uses_the_host_services_it_is_granted() {
+        let kit = kit_with(
+            r#"
+- id: marked
+  when: state["svc"] == "from-service"
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#,
+            vec![host_service(AddonMode::Enforce, &HOST_CAPS)],
+            |b| {
+                b.state(Arc::new(super::MemState::default()))
+                    .metric_defs(BY_HOST)
+            },
+        )
+        .await;
+        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+        assert_eq!(a.status, 403, "the rules read the service's write: {a:?}");
+        assert_eq!(a.headers["x-roxy-rule"], "marked");
+        let open = &kit.upstream.service().until_opened(1).await[0];
+        assert_eq!(
+            super::strs(&open["capabilities"]),
+            ["state", "record", "metrics", "log"],
+            "{open:#}"
+        );
+        assert_eq!(open["config"], host_config(), "{open:#}");
+        let r = kit.events("layer_record", 1).await;
+        assert_eq!(r[0]["layer"], "s", "{r:#?}");
+        assert_eq!(r[0]["call"], 2, "{r:#?}");
+        assert_eq!(r[0]["kind"], "verdict");
+        assert_eq!(r[0]["data"]["score"], 0.9);
+        let ev = kit.request_event().await;
+        assert!(
+            super::strs(&ev["tags"]).iter().any(|t| t == "svc-tag"),
+            "{ev:#}"
+        );
+        let first = results(&kit, stream_id(open));
+        assert_eq!(first.len(), 6, "a result for every call: {first:#?}");
+        for id in [1, 2, 3, 4] {
+            assert_eq!(first[&id]["value"], serde_json::Value::Null, "{first:#?}");
+            assert_eq!(first[&id]["error"], serde_json::Value::Null, "{first:#?}");
+        }
+        assert_eq!(first[&5]["value"], HOST_STATE_VALUE, "{first:#?}");
+        assert_eq!(
+            first[&6]["value"],
+            serde_json::Value::Null,
+            "no flow has been counted yet: {first:#?}"
+        );
+        super::no_layer_error(&kit);
+
+        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+        assert_eq!(a.status, 403, "{a:?}");
+        let open = &kit.upstream.service().until_opened(2).await[1];
+        let second = results(&kit, stream_id(open));
+        assert_eq!(second[&6]["value"], 1, "the first flow: {second:#?}");
+    }
+
+    /// A host service the service was not granted fails the exchange with
+    /// the capability's kind, as it does for a WASM layer, and the
+    /// `layer_error` names the call.
+    #[tokio::test]
+    async fn a_service_without_the_capability_fails_closed() {
+        let kit = kit(
+            READS_BODY,
+            vec![host_service(
+                AddonMode::Enforce,
+                &[Capability::Record, Capability::State, Capability::Metrics],
+            )],
+        )
+        .await;
+        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+        assert_eq!(a.status, 503, "{a:?}");
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
+        assert_eq!(errs[0]["kind"], "capability:log");
+        assert_eq!(errs[0]["call"], 1, "{errs:#?}");
+        assert!(
+            kit.upstream.seen().is_empty(),
+            "nothing reached the upstream"
+        );
+    }
+
+    /// An observing service may log and record, but its tag is refused
+    /// like a WASM observer's: the failure is its own, named by its call,
+    /// the exchange goes on and the flow carries no tag. The response
+    /// drips so the copy outlives the calls: a call on a stream that has
+    /// ended is dropped.
+    #[tokio::test]
+    async fn an_observing_service_cannot_tag() {
+        let kit = kit_with(
+            READS_BODY,
+            vec![host_service(AddonMode::Observe, &HOST_CAPS)],
+            |b| {
+                b.state(Arc::new(super::MemState::default()))
+                    .metric_defs(BY_HOST)
+            },
+        )
+        .await;
+        let a = kit
+            .h1()
+            .await
+            .call("GET", "/drip?n=3&ms=100", &[], b"")
+            .await;
+        assert_eq!(a.status, 200, "{a:?}");
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
+        assert_eq!(errs[0]["mode"], "observe");
+        assert_eq!(errs[0]["kind"], "host");
+        assert_eq!(errs[0]["call"], 3, "{errs:#?}");
+        let ev = kit.request_event().await;
+        assert!(super::strs(&ev["tags"]).is_empty(), "{ev:#}");
+    }
 
     /// The stream id of an `open` message.
     fn stream_id(open: &serde_json::Value) -> u32 {

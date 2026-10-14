@@ -1,8 +1,13 @@
 # Host services
 
-Everything a WASM layer can do outside its own streams, each a capability
+Everything a layer can do outside its own streams, each a capability
 granted in config
-([capabilities](/reference/addon-configuration#capabilities)). The caps on
+([capabilities](/reference/addon-configuration#capabilities)). A WASM
+layer calls them as the `flow` and `endpoints` imports named here; a
+service layer sends the matching messages on its stream
+([service layers](/reference/service-layers#host-services)), except
+`endpoints.call`, which a service does for itself. Both reach one host, so
+a call means the same and fails the same way for either kind. The caps on
 each (payload sizes, calls in flight, key length) are in
 [fixed caps](/reference/addon-configuration#fixed-caps).
 
@@ -55,11 +60,13 @@ the store is full fails the exchange closed, as it does a rule's
 store steers every flow's rules. The store survives a reload, under
 `limits.max_state_entries`.
 
-## Identity
+## Identity and config
 
 `flow.current()`: the flow id, connection id, tags, and the principal as
 roxy established it (client IP, listener, TLS SNI). Key per-principal state
-on these, not on client-supplied session headers.
+on these, not on client-supplied session headers. `flow.config()` is the
+layer's `config:` value as a JSON document. A service gets both in its
+`open` message.
 
 ## Record (`record`)
 

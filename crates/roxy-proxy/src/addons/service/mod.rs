@@ -1,6 +1,6 @@
 //! Service layers: an external service in the network path.
 //!
-//! Each exchange is a stream (`roxy.layer.v4`) on one of a few pooled
+//! Each exchange is a stream (`roxy.layer.v5`) on one of a few pooled
 //! WebSocket connections to the layer's named endpoint ([`mux`]). roxy
 //! streams the request into it as it arrives; the service streams back
 //! the request to forward (or answers itself); roxy forwards
@@ -30,6 +30,7 @@
 //! after it. The connection goes through the connector (address floor,
 //! deny lists) and never through other layers or the rules.
 
+mod host;
 mod mux;
 
 use std::sync::Arc;
@@ -37,7 +38,7 @@ use std::time::Duration;
 
 use http::{HeaderMap, HeaderName, HeaderValue};
 use roxy_http::{Body, BodyError};
-use roxy_wasm::{HostError, LayerRequest, LayerResponse};
+use roxy_wasm::{HostError, LayerError, LayerRequest, LayerResponse, LogLevel};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
@@ -82,6 +83,15 @@ pub enum ServiceError {
     /// mid-exchange.
     #[error("service stream lost: {0}")]
     Closed(String),
+    /// Host-service call `call` failed, or called a service the layer was
+    /// not granted: the same failures a WASM layer's host calls have, with
+    /// the same flow-log kinds.
+    #[error("{err}")]
+    Layer {
+        call: u64,
+        #[source]
+        err: LayerError,
+    },
 }
 
 /// Why the service's answer will not come.
@@ -106,6 +116,8 @@ impl ServiceError {
             ServiceError::Timeout(_) => "service:timeout",
             ServiceError::Protocol(_) => "service:protocol",
             ServiceError::Closed(_) => "service:closed",
+            // Reported under the layer error's own kind (`error_kind`).
+            ServiceError::Layer { .. } => "host",
         }
     }
 }
@@ -141,6 +153,8 @@ enum Out {
         #[serde(skip_serializing_if = "Option::is_none")]
         sni: Option<String>,
         tags: Vec<String>,
+        capabilities: Vec<&'static str>,
+        config: serde_json::Value,
     },
     Request {
         method: String,
@@ -148,6 +162,14 @@ enum Out {
         headers: Vec<(String, String)>,
     },
     RequestEnd,
+    /// The answer to a host-service call, by the `id` the service gave it.
+    Result {
+        id: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        value: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     Response {
         status: u16,
         headers: Vec<(String, String)>,
@@ -187,6 +209,79 @@ enum In {
         #[serde(default)]
         message: Option<String>,
     },
+    Log {
+        id: u64,
+        level: LogLevelIn,
+        message: String,
+    },
+    Record {
+        id: u64,
+        kind: String,
+        data: serde_json::Value,
+    },
+    AddTag {
+        id: u64,
+        tag: String,
+    },
+    StateGet {
+        id: u64,
+        key: String,
+    },
+    StatePut {
+        id: u64,
+        key: String,
+        value: String,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
+    },
+    MetricGet {
+        id: u64,
+        metric: String,
+    },
+}
+
+impl In {
+    /// The service's id for the message when it is a host-service call,
+    /// run beside the stream rather than in it.
+    fn call_id(&self) -> Option<u64> {
+        match self {
+            In::Log { id, .. }
+            | In::Record { id, .. }
+            | In::AddTag { id, .. }
+            | In::StateGet { id, .. }
+            | In::StatePut { id, .. }
+            | In::MetricGet { id, .. } => Some(*id),
+            In::Request { .. }
+            | In::RequestEnd
+            | In::Response { .. }
+            | In::ResponseEnd
+            | In::Credit { .. }
+            | In::Reset { .. } => None,
+        }
+    }
+}
+
+/// `flow.log` levels on the wire.
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum LogLevelIn {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl From<LogLevelIn> for LogLevel {
+    fn from(l: LogLevelIn) -> Self {
+        match l {
+            LogLevelIn::Trace => LogLevel::Trace,
+            LogLevelIn::Debug => LogLevel::Debug,
+            LogLevelIn::Info => LogLevel::Info,
+            LogLevelIn::Warn => LogLevel::Warn,
+            LogLevelIn::Error => LogLevel::Error,
+        }
+    }
 }
 
 /// The service's first answer: forward a request, or answer the client.
@@ -566,10 +661,23 @@ pub(crate) mod testing {
             mode,
             kind: AddonImpl::Service(svc),
             endpoints: HashMap::from([("svc".to_owned(), endpoint)]),
+            capabilities: roxy_wasm::Capabilities::NONE,
+            config: serde_json::Value::Null,
             when: None,
             sample: None,
             subscribe: Subscription::default(),
         })
+    }
+
+    /// `addon`, granted `caps`.
+    pub(crate) fn granted(
+        mut addon: Arc<AddonSpec>,
+        caps: &[roxy_wasm::Capability],
+    ) -> Arc<AddonSpec> {
+        Arc::get_mut(&mut addon)
+            .expect("a fresh addon")
+            .capabilities = caps.iter().copied().collect();
+        addon
     }
 
     /// `addon`, subscribed to `request` and `response`.
@@ -602,7 +710,16 @@ pub(crate) mod testing {
 
     /// A kit running `rules` with the stack `addons`, outermost first.
     pub(crate) async fn kit(rules: &str, addons: Vec<Arc<AddonSpec>>) -> Kit {
-        let kit = Kit::builder().rules(rules).start().await;
+        kit_with(rules, addons, |b| b).await
+    }
+
+    /// [`kit`], with the builder adjusted by `with` first.
+    pub(crate) async fn kit_with(
+        rules: &str,
+        addons: Vec<Arc<AddonSpec>>,
+        with: impl FnOnce(crate::testkit::KitBuilder) -> crate::testkit::KitBuilder,
+    ) -> Kit {
+        let kit = with(Kit::builder().rules(rules)).start().await;
         reload(&kit, rules, &[], addons);
         kit
     }

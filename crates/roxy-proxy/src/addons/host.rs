@@ -8,7 +8,7 @@ use roxy_wasm::{
     LayerResponse, LogLevel, Principal, TagError, async_trait,
 };
 
-use super::{AddonSpec, StackFlow, endpoint};
+use super::{AddonMode, AddonSpec, StackFlow, endpoint};
 use crate::flowlog::{FlowEvent, sink_ready};
 use crate::view::ProxyView;
 
@@ -44,11 +44,21 @@ pub(crate) struct StackHost {
     /// Observe mode: effects on the flow (`next`, `add-tag`) are not taken,
     /// and `next` returns the copy of the real response.
     pub(crate) observer: Option<super::tee::ObserverNext>,
+    /// A service layer's id for the call being run, carried into roxy's
+    /// record of it (`call`) so the two can be matched. A WASM layer's
+    /// imports have none.
+    pub(crate) call: Option<u64>,
 }
 
 impl StackHost {
     fn addon(&self) -> &Arc<AddonSpec> {
         &self.st.snap.addons[self.index]
+    }
+
+    /// Whether the layer observes: it may read, but nothing it does may
+    /// steer traffic.
+    fn observing(&self) -> bool {
+        self.addon().mode == AddonMode::Observe
     }
 }
 
@@ -95,7 +105,7 @@ impl LayerHost for StackHost {
     }
 
     fn add_tag(&self, tag: String) -> Result<(), TagError> {
-        if self.observer.is_some() {
+        if self.observing() {
             // A tag steers the `when` of every layer below, so it is an
             // effect on traffic, which an observer must not have.
             let layer = &self.addon().name;
@@ -112,12 +122,13 @@ impl LayerHost for StackHost {
     fn log(&self, level: LogLevel, msg: &str) {
         let layer = &self.addon().name;
         let flow = self.st.flow.to_string();
+        let call = self.call;
         match level {
-            LogLevel::Trace => tracing::trace!(layer, flow, "{msg}"),
-            LogLevel::Debug => tracing::debug!(layer, flow, "{msg}"),
-            LogLevel::Info => tracing::info!(layer, flow, "{msg}"),
-            LogLevel::Warn => tracing::warn!(layer, flow, "{msg}"),
-            LogLevel::Error => tracing::error!(layer, flow, "{msg}"),
+            LogLevel::Trace => tracing::trace!(layer, flow, call, "{msg}"),
+            LogLevel::Debug => tracing::debug!(layer, flow, call, "{msg}"),
+            LogLevel::Info => tracing::info!(layer, flow, call, "{msg}"),
+            LogLevel::Warn => tracing::warn!(layer, flow, call, "{msg}"),
+            LogLevel::Error => tracing::error!(layer, flow, call, "{msg}"),
         }
     }
 
@@ -137,6 +148,7 @@ impl LayerHost for StackHost {
             flow: self.st.flow.to_string(),
             conn: self.st.client.id.to_string(),
             layer: addon.name.clone(),
+            call: self.call,
             kind,
             data,
         });
@@ -153,7 +165,7 @@ impl LayerHost for StackHost {
         value: String,
         ttl_ms: Option<u64>,
     ) -> Result<Result<(), String>, HostError> {
-        if self.observer.is_some() {
+        if self.observing() {
             // The store steers the rules of every flow, so a write is an
             // effect on traffic, which an observer must not have.
             let layer = &self.addon().name;

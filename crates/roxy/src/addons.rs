@@ -203,6 +203,8 @@ impl AddonLoader {
                 },
                 kind,
                 endpoints: endpoints(a)?,
+                capabilities: capabilities(&a.capabilities),
+                config: a.config.clone(),
                 when,
                 sample: a.sample,
                 subscribe: roxy_proxy::addons::Subscription {

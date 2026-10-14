@@ -52,8 +52,8 @@ key; `roxy check` refuses a key on the other kind.
 | `sample` | both, observe only | number in (0, 1] | 1 | the share of matching exchanges the observer gets a copy of, drawn from the flow id |
 | `subscribe.request` | both | `head`, `full` | `full` | what the layer sees of the request: the head only, or the head and the body ([what a layer sees](/reference/addon-configuration#what-a-layer-sees)) |
 | `subscribe.response` | both | `head`, `full` | `full` | the same for the response |
-| `capabilities` | wasm | list of `endpoints`, `state`, `record`, `metrics`, `log` | none | the [host services](/reference/host-services) the layer may call ([capabilities](/reference/addon-configuration#capabilities)) |
-| `config` | wasm | any YAML value | `null` | handed to the layer as a JSON document through `flow.config`; roxy does not read it. Map keys become strings (`1: a` is `{"1": "a"}`) |
+| `capabilities` | both | list of `endpoints`, `state`, `record`, `metrics`, `log` | none | the [host services](/reference/host-services) the layer may call ([capabilities](/reference/addon-configuration#capabilities)); `endpoints` does nothing for a service layer, which calls what it needs itself |
+| `config` | both | any YAML value | `null` | handed to the layer as a JSON document, through `flow.config` or the `open` message; roxy does not read it. Map keys become strings (`1: a` is `{"1": "a"}`) |
 | `endpoints` | both | map of name to [endpoint](/reference/addon-configuration#endpoints) | none | named outbound targets. A WASM layer calls them with `endpoints.call`; a service layer's `endpoint` names one of them |
 | `limits` | both | [limits](/reference/addon-configuration#limits) | defaults below | what the layer may cost roxy |
 
@@ -114,8 +114,8 @@ What the host holds for a guest outside `max_memory`, not configurable:
 ### What `roxy check` refuses
 
 A missing `path` or one that does not exist; `endpoint` not among the
-addon's `endpoints`; a key of the other kind (`path`, `capabilities`,
-`config` and the WASM limits on a service layer; `endpoint`,
+addon's `endpoints`; a key of the other kind (`path` and the WASM limits
+on a service layer; `endpoint`,
 `max_connections` and `max_streams` on a WASM layer); `sample` on an
 enforcing layer, or outside (0, 1]; a zero `max_instances`, `max_memory`,
 `recycle_above_memory`, `first_byte_timeout`, endpoint `timeout`,
@@ -125,8 +125,9 @@ unknown metric or list; a `subscribe` value other than `head` or `full`.
 
 ## Capabilities
 
-A WASM layer has no access outside its own streams. `capabilities` grants it
-named [host services](/reference/host-services):
+A layer has no access outside its own streams. `capabilities` grants it
+named [host services](/reference/host-services), which a WASM layer calls
+and a service layer sends as messages:
 
 | capability | grants |
 |---|---|
@@ -143,9 +144,6 @@ capability; `flow.add-tag` from an observe layer fails the exchange too,
 as a host refusal (`layer_error` with `kind: host`), since a tag steers the
 `when` of the layers below. There is no `secrets`
 capability: credentials go on an endpoint's `headers`.
-
-Service layers have no capabilities: a service gets the exchange, the
-flow's identity on `open`, and the endpoint's `headers` on the handshake.
 
 ## Behaviour
 
