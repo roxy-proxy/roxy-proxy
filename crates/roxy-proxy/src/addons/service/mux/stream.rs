@@ -3,14 +3,16 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use roxy_http::{Body, BodyError, BodySender};
-use roxy_wasm::LayerResponse;
+use roxy_wasm::{LayerHost as _, LayerResponse};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use super::super::super::{AddonMode, Part, StackError, StackFlow};
-use super::super::{First, In, Out, ServiceError, ServiceSpec, Unanswered};
+use super::super::super::host::StackHost;
+use super::super::super::{AddonMode, Part, StackError, StackFlow, emit_stack_error};
+use super::super::{Call, First, In, Out, ServiceError, ServiceSpec, Unanswered};
 use super::inbox::{Inbox, feeder};
 use super::link::{Link, Message, Queued, Wire, binary, dial, text};
 use super::lock;
@@ -44,9 +46,8 @@ pub(crate) struct Stream {
     /// Wakes whatever is sending or waiting on the stream once it ended.
     pub(super) ended: CancellationToken,
     pub(super) wire: Arc<Wire>,
-    /// Host-service calls waiting for the stream's worker, once it has one,
-    /// each with the service's id for it.
-    pub(super) calls: Mutex<Option<mpsc::Sender<(u64, In)>>>,
+    /// Host-service calls waiting for the stream's worker, once it has one.
+    pub(super) calls: Mutex<Option<mpsc::Sender<Call>>>,
 }
 
 pub(super) struct StreamState {
@@ -71,9 +72,12 @@ pub(super) enum Phase {
     AwaitingSecond {
         second: oneshot::Sender<Result<LayerResponse, Unanswered>>,
     },
-    /// Answered (or observe mode, which is never answered): only the
-    /// bodies in flight are owed.
+    /// Answered: only the bodies in flight are owed.
     Answered,
+    /// Observe: nothing the service sends is taken, but its last message
+    /// ends the stream as an enforce stream's does: its `response_end`,
+    /// and the `request_end` of a request it sent.
+    Observing { forwarding: bool, responded: bool },
     /// Settled: nothing more is sent or delivered on it.
     Ended {
         /// Why an observe stream failed, for its driver to log.
@@ -132,11 +136,40 @@ impl StreamState {
     /// The service still owes something: an answer, or the end of a body
     /// it is sending.
     fn waiting(&self) -> bool {
-        !matches!(self.phase, Phase::Answered)
-            || self.req.inbox.is_some()
-            || self.res.inbox.is_some()
-            || self.req.end_owed
-            || self.res.end_owed
+        match &self.phase {
+            Phase::Answered => {
+                self.req.inbox.is_some()
+                    || self.res.inbox.is_some()
+                    || self.req.end_owed
+                    || self.res.end_owed
+            }
+            Phase::Observing {
+                forwarding,
+                responded,
+            } => *forwarding || !*responded,
+            Phase::AwaitingFirst { .. } | Phase::AwaitingSecond { .. } | Phase::Ended { .. } => {
+                true
+            }
+        }
+    }
+
+    /// An observer's head or end: it goes nowhere, but marks what the
+    /// service still has to send before the stream ends. Anything out of
+    /// order is ignored, like the rest of what an observer sends.
+    fn observed(&mut self, m: &In) {
+        let Phase::Observing {
+            forwarding,
+            responded,
+        } = &mut self.phase
+        else {
+            return;
+        };
+        match m {
+            In::Request { .. } => *forwarding = true,
+            In::RequestEnd => *forwarding = false,
+            In::ResponseEnd => *responded = true,
+            In::Response { .. } | In::Credit { .. } | In::Reset { .. } | In::Call(_) => {}
+        }
     }
 
     /// Ends the stream, once: what was pending goes to the caller to be
@@ -146,7 +179,7 @@ impl StreamState {
         let pending = match std::mem::replace(&mut self.phase, ended) {
             Phase::AwaitingFirst { first, .. } => Pending::First(first),
             Phase::AwaitingSecond { second } => Pending::Second(second),
-            Phase::Answered => Pending::None,
+            Phase::Answered | Phase::Observing { .. } => Pending::None,
             Phase::Ended { observe_error } => {
                 self.phase = Phase::Ended { observe_error };
                 return None;
@@ -167,7 +200,10 @@ impl StreamState {
                 self.phase = Phase::AwaitingSecond { second };
                 Ok(first)
             }
-            other @ (Phase::AwaitingSecond { .. } | Phase::Answered | Phase::Ended { .. }) => {
+            other @ (Phase::AwaitingSecond { .. }
+            | Phase::Answered
+            | Phase::Observing { .. }
+            | Phase::Ended { .. }) => {
                 self.phase = other;
                 Err(ServiceError::Protocol("unexpected request".into()))
             }
@@ -187,7 +223,7 @@ impl StreamState {
                 let _ = second.send(Ok(r));
                 Ok(())
             }
-            other @ (Phase::Answered | Phase::Ended { .. }) => {
+            other @ (Phase::Answered | Phase::Observing { .. } | Phase::Ended { .. }) => {
                 self.phase = other;
                 Err(ServiceError::Protocol(format!("unexpected {what}")))
             }
@@ -229,20 +265,21 @@ impl Stream {
     /// Ends the stream, once: nothing more goes on it, its place on the
     /// connection is released, the reader forgets it, and whoever was
     /// waiting on it (a pending answer, the body being fed) learns how it
-    /// ended.
-    pub(super) fn settle(&self, end: End<'_>) {
+    /// ended. False if it had already ended, in which case `end` is not
+    /// told to anyone.
+    pub(super) fn settle(&self, end: End<'_>) -> bool {
         let observe_error = match &end {
             End::Failed { e, .. } if self.mode == AddonMode::Observe => Some(e.clone()),
             End::Quiet | End::Failed { .. } | End::Abandoned(_) | End::BodyFailed(..) => None,
         };
         let Some(ending) = lock(&self.state).end(observe_error) else {
-            return;
+            return false;
         };
         self.ended.cancel();
         lock(&self.link.shared.streams).open.remove(&self.id);
         drop(ending.slot);
         let (e, reset) = match end {
-            End::Quiet => return,
+            End::Quiet => return true,
             End::Failed { e, reset } => {
                 let message = e.to_string();
                 (
@@ -281,11 +318,13 @@ impl Stream {
             }
             Pending::None => {}
         }
+        true
     }
 
-    /// The service failed this stream.
-    pub(super) fn fail(&self, e: ServiceError, reset: Reset) {
-        self.settle(End::Failed { e, reset });
+    /// The service failed this stream. False if it had already ended, so
+    /// nobody was told.
+    pub(super) fn fail(&self, e: ServiceError, reset: Reset) -> bool {
+        self.settle(End::Failed { e, reset })
     }
 
     /// roxy gives up on the stream.
@@ -293,12 +332,36 @@ impl Stream {
         self.settle(End::Abandoned(why));
     }
 
-    /// An observe stream: roxy sent all it had.
-    pub(crate) fn finish(&self) -> Result<(), ServiceError> {
-        self.settle(End::Quiet);
+    /// An observe stream: roxy sent all it had, and the service has
+    /// `within` to send its last message (or a reset) before roxy fails it.
+    /// How it ended, if it failed.
+    pub(crate) async fn finish(&self, within: Duration) -> Result<(), ServiceError> {
+        if tokio::time::timeout(within, self.ended.cancelled())
+            .await
+            .is_err()
+        {
+            self.fail(ServiceError::Timeout("first_byte_timeout"), Reset::Send);
+        }
         match &mut lock(&self.state).phase {
             Phase::Ended { observe_error } => observe_error.take().map_or(Ok(()), Err),
-            Phase::AwaitingFirst { .. } | Phase::AwaitingSecond { .. } | Phase::Answered => Ok(()),
+            Phase::AwaitingFirst { .. }
+            | Phase::AwaitingSecond { .. }
+            | Phase::Answered
+            | Phase::Observing { .. } => Ok(()),
+        }
+    }
+
+    /// Logs the failure of a host-service call that ran after the stream
+    /// had ended, which `settle` can no longer tell anyone.
+    fn report(&self, e: ServiceError) {
+        match self.mode {
+            AddonMode::Enforce => self.st.fail(&self.name(), StackError::Service(e)),
+            AddonMode::Observe => emit_stack_error(
+                &self.st.meta,
+                &self.name(),
+                &StackError::Service(e),
+                AddonMode::Observe,
+            ),
         }
     }
 
@@ -426,7 +489,8 @@ impl Stream {
             return;
         }
         if self.mode == AddonMode::Enforce && self.head_only(dir) {
-            return self.fail(ServiceError::Unsubscribed(dir.as_str()), Reset::Send);
+            self.fail(ServiceError::Unsubscribed(dir.as_str()), Reset::Send);
+            return;
         }
         let n = b.len() as u64;
         let mut s = lock(&self.state);
@@ -434,23 +498,25 @@ impl Stream {
         let inbox = lane.inbox.clone();
         if inbox.is_none() && self.mode == AddonMode::Enforce {
             drop(s);
-            return self.fail(
+            self.fail(
                 ServiceError::Protocol(format!(
                     "bytes of a {} body that is not open",
                     dir.as_str()
                 )),
                 Reset::Send,
             );
+            return;
         }
         if lane.window.received(n).is_err() {
             drop(s);
-            return self.fail(
+            self.fail(
                 ServiceError::Protocol(format!(
                     "{} body bytes past the body's credit",
                     dir.as_str()
                 )),
                 Reset::Send,
             );
+            return;
         }
         let Some(inbox) = inbox else {
             drop(s);
@@ -471,10 +537,8 @@ impl Stream {
 
     /// A control message from the service.
     pub(super) fn control(self: &Arc<Self>, m: In) {
-        if let Some(id) = m.call_id() {
-            return self.queue_host_call(id, m);
-        }
         match m {
+            In::Call(call) => return self.queue_host_call(call),
             In::Credit { dir, bytes } => {
                 lock(&self.state).lane(dir).window.granted(bytes);
                 self.more_credit.notify_waiters();
@@ -485,29 +549,28 @@ impl Stream {
                     || "the service reset the stream".to_owned(),
                     |m| format!("the service reset the stream: {m}"),
                 );
-                return self.fail(ServiceError::Closed(why), Reset::Skip);
+                self.fail(ServiceError::Closed(why), Reset::Skip);
+                return;
             }
-            In::Request { .. } | In::RequestEnd | In::Response { .. } | In::ResponseEnd => {
-                // An observer's answers are ignored.
-                if self.mode == AddonMode::Observe {
-                    return;
-                }
-            }
-            In::Log { .. }
-            | In::Record { .. }
-            | In::AddTag { .. }
-            | In::StateGet { .. }
-            | In::StatePut { .. }
-            | In::MetricGet { .. }
-            | In::Quarantine { .. } => return,
+            In::Request { .. } | In::RequestEnd | In::Response { .. } | In::ResponseEnd => {}
         }
         let mut s = lock(&self.state);
-        let result = self.answer(&mut s, m);
+        let result = match self.mode {
+            AddonMode::Observe => {
+                s.observed(&m);
+                Ok(())
+            }
+            AddonMode::Enforce => self.answer(&mut s, m),
+        };
         let done = !s.waiting();
         drop(s);
         match result {
-            Err(e) => self.fail(e, Reset::Send),
-            Ok(()) if done => self.settle(End::Quiet),
+            Err(e) => {
+                self.fail(e, Reset::Send);
+            }
+            Ok(()) if done => {
+                self.settle(End::Quiet);
+            }
             Ok(()) => {}
         }
     }
@@ -593,31 +656,31 @@ impl Stream {
                 Ok(())
             }
             // Handled by `control`.
-            In::Credit { .. }
-            | In::Reset { .. }
-            | In::Log { .. }
-            | In::Record { .. }
-            | In::AddTag { .. }
-            | In::StateGet { .. }
-            | In::StatePut { .. }
-            | In::MetricGet { .. }
-            | In::Quarantine { .. } => Ok(()),
+            In::Credit { .. } | In::Reset { .. } | In::Call(_) => Ok(()),
         }
     }
 
-    /// Hands host-service call `id` to the stream's worker, started on the
+    /// Hands a host-service call to the stream's worker, started on the
     /// first call. The queue is bounded: a service with more than
     /// [`MAX_HOST_CALLS_WAITING`] unanswered has broken the protocol.
-    fn queue_host_call(self: &Arc<Self>, id: u64, m: In) {
+    /// Accepted under the state lock, so a call is either queued before
+    /// the stream ends or dropped: the reader may still hold a stream
+    /// another task has just ended.
+    fn queue_host_call(self: &Arc<Self>, call: Call) {
+        let state = lock(&self.state);
+        if state.ended() {
+            return;
+        }
         let mut calls = lock(&self.calls);
         let tx = calls.get_or_insert_with(|| {
             let (tx, rx) = mpsc::channel(MAX_HOST_CALLS_WAITING);
             tokio::spawn(self.clone().host_calls(rx));
             tx
         });
-        // A worker gone with the stream (`Closed`) drops the call.
-        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send((id, m)) {
-            drop(calls);
+        let full = matches!(tx.try_send(call), Err(mpsc::error::TrySendError::Full(_)));
+        drop(calls);
+        drop(state);
+        if full {
             self.fail(
                 ServiceError::Protocol(format!(
                     "more than {MAX_HOST_CALLS_WAITING} host calls waiting"
@@ -628,18 +691,28 @@ impl Stream {
     }
 
     /// The stream's host-service worker: each call in turn, each answered
-    /// with a `result`, until the stream ends. A failure fails the stream,
-    /// so the exchange, as it would a WASM layer's.
-    async fn host_calls(self: Arc<Self>, mut rx: mpsc::Receiver<(u64, In)>) {
+    /// with a `result`. The stream's end stops it taking calls, but what
+    /// was queued before the end still runs: the service sent those calls
+    /// before its last message, so their effects stand, though their
+    /// results have nowhere to go. A failure on an open stream fails it, so
+    /// the exchange, as it would a WASM layer's, and drops the calls behind
+    /// it; after the end there is nothing left to fail, so a failing call
+    /// is logged and the rest still run.
+    async fn host_calls(self: Arc<Self>, mut rx: mpsc::Receiver<Call>) {
         loop {
-            let (id, m) = tokio::select! {
-                () = self.ended.cancelled() => return,
-                m = rx.recv() => match m {
-                    Some(m) => m,
-                    None => return,
-                },
+            let next = tokio::select! {
+                biased;
+                m = rx.recv() => m,
+                () = self.ended.cancelled() => {
+                    rx.close();
+                    rx.recv().await
+                }
             };
-            match super::super::host::call(&self.st, self.index, id, m).await {
+            let Some(call) = next else {
+                return;
+            };
+            let id = call.id();
+            match super::super::host::call(&self.st, self.index, call).await {
                 Ok(result) => {
                     let (value, error) = match result {
                         Ok(v) => (Some(v), None),
@@ -648,7 +721,11 @@ impl Stream {
                     self.send(&Out::Result { id, value, error }).await;
                 }
                 Err(err) => {
-                    return self.fail(ServiceError::Layer { call: id, err }, Reset::Send);
+                    let e = ServiceError::Layer { call: id, err };
+                    if self.fail(e.clone(), Reset::Send) {
+                        return;
+                    }
+                    self.report(e);
                 }
             }
         }
@@ -754,8 +831,13 @@ pub(crate) async fn open(
         .clone();
 
     let (answers, phase) = match mode {
-        // An observer's answers are ignored: nothing is owed but bodies.
-        AddonMode::Observe => (None, Phase::Answered),
+        AddonMode::Observe => (
+            None,
+            Phase::Observing {
+                forwarding: false,
+                responded: false,
+            },
+        ),
         AddonMode::Enforce => {
             let (first_tx, first_rx) = oneshot::channel();
             let (second_tx, second_rx) = oneshot::channel();
@@ -802,20 +884,27 @@ pub(crate) async fn open(
     Ok((stream, answers))
 }
 
-/// The `open` message: who the client is and where the exchange is, so
-/// the service can key its state on (flow, layer).
-pub(super) fn open_message(st: &StackFlow, index: usize, mode: AddonMode) -> Out {
+/// The `open` message: what a WASM layer reads through `flow.current`
+/// and `flow.config`, so the service can key its state on (flow, layer).
+pub(super) fn open_message(st: &Arc<StackFlow>, index: usize, mode: AddonMode) -> Out {
     let addon = &st.snap.addons[index];
+    let info = StackHost {
+        st: st.clone(),
+        index,
+        observer: None,
+        call: None,
+    }
+    .flow_info();
     Out::Open {
-        flow: st.flow.to_string(),
-        conn: st.client.id.to_string(),
+        flow: info.flow_id,
+        conn: info.conn_id,
         layer: addon.name.clone(),
         mode: mode.as_str(),
         subscribe: addon.subscribe.into(),
-        client_ip: st.client_ip.to_string(),
-        listener: st.client.listener.name.clone(),
-        sni: st.tls.as_ref().and_then(|t| t.sni.clone()),
-        tags: st.tags(),
+        client_ip: info.principal.client_ip.to_string(),
+        listener: info.principal.listener,
+        sni: info.principal.tls_sni,
+        tags: info.tags,
         capabilities: roxy_wasm::Capability::ALL
             .into_iter()
             .filter(|c| addon.capabilities.contains(*c))
@@ -888,16 +977,49 @@ mod tests {
                 ..
             })
         ));
+    }
 
-        let mut observe = StreamState::new(Phase::Answered, None);
-        assert!(!observe.waiting());
+    /// An observe stream owes no answer, but ends only on the service's
+    /// last message: its `response_end`, and the `request_end` of a
+    /// request it sent, whichever order they come in.
+    #[test]
+    fn an_observe_stream_ends_on_the_services_last_message() {
+        let observing = || {
+            StreamState::new(
+                Phase::Observing {
+                    forwarding: false,
+                    responded: false,
+                },
+                None,
+            )
+        };
+        let mut s = observing();
+        assert!(s.waiting());
+        s.observed(&In::Response {
+            status: 200,
+            headers: Vec::new(),
+        });
+        assert!(s.waiting(), "a head is not the end");
+        s.observed(&In::ResponseEnd);
+        assert!(!s.waiting());
         assert!(matches!(
-            observe.end(None),
+            s.end(None),
             Some(Ending {
                 pending: Pending::None,
                 ..
             })
         ));
+
+        let mut s = observing();
+        s.observed(&In::Request {
+            method: "GET".to_owned(),
+            url: "http://up.test/".to_owned(),
+            headers: Vec::new(),
+        });
+        s.observed(&In::ResponseEnd);
+        assert!(s.waiting(), "the end of the request it sent is owed");
+        s.observed(&In::RequestEnd);
+        assert!(!s.waiting());
     }
 
     /// A request may only come as the first answer, and a response

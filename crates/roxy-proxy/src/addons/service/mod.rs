@@ -121,8 +121,7 @@ impl ServiceError {
             ServiceError::Protocol(_) => "service:protocol".into(),
             ServiceError::Closed(_) => "service:closed".into(),
             ServiceError::Unsubscribed(dir) => format!("unsubscribed:{dir}"),
-            // Reported under the layer error's own kind (`error_kind`).
-            ServiceError::Layer { .. } => "host".into(),
+            ServiceError::Layer { err, .. } => super::layer_error_kind(err),
         }
     }
 }
@@ -214,6 +213,48 @@ enum In {
         #[serde(default)]
         message: Option<String>,
     },
+    /// A host-service call, run beside the stream rather than in it.
+    #[serde(skip)]
+    Call(Call),
+}
+
+impl In {
+    /// Parses a control message. Its `type` says which kind it is, and
+    /// each kind is parsed on its own so that a bad message is refused
+    /// with what is wrong with it (the missing field, the unknown type),
+    /// which an untagged fallback between the two would not say.
+    fn parse(v: serde_json::Map<String, serde_json::Value>) -> Result<In, String> {
+        let call = v
+            .get("type")
+            .is_some_and(|t| CallType::deserialize(t).is_ok());
+        let v = serde_json::Value::Object(v);
+        let parsed = if call {
+            serde_json::from_value(v).map(In::Call)
+        } else {
+            serde_json::from_value(v)
+        };
+        parsed.map_err(|e| e.to_string())
+    }
+}
+
+/// The `type` of each [`Call`], to tell a call from a stream message.
+#[derive(Deserialize)]
+#[serde(variant_identifier, rename_all = "snake_case")]
+enum CallType {
+    Log,
+    Record,
+    AddTag,
+    StateGet,
+    StatePut,
+    MetricGet,
+    Quarantine,
+}
+
+/// A host-service call: what a WASM layer reaches through an import,
+/// with the service's `id` for it.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Call {
     Log {
         id: u64,
         level: LogLevelIn,
@@ -248,24 +289,17 @@ enum In {
     },
 }
 
-impl In {
-    /// The service's id for the message when it is a host-service call,
-    /// run beside the stream rather than in it.
-    fn call_id(&self) -> Option<u64> {
+impl Call {
+    /// The service's id for the call, which its `result` carries back.
+    fn id(&self) -> u64 {
         match self {
-            In::Log { id, .. }
-            | In::Record { id, .. }
-            | In::AddTag { id, .. }
-            | In::StateGet { id, .. }
-            | In::StatePut { id, .. }
-            | In::MetricGet { id, .. }
-            | In::Quarantine { id } => Some(*id),
-            In::Request { .. }
-            | In::RequestEnd
-            | In::Response { .. }
-            | In::ResponseEnd
-            | In::Credit { .. }
-            | In::Reset { .. } => None,
+            Call::Log { id, .. }
+            | Call::Record { id, .. }
+            | Call::AddTag { id, .. }
+            | Call::StateGet { id, .. }
+            | Call::StatePut { id, .. }
+            | Call::MetricGet { id, .. }
+            | Call::Quarantine { id } => *id,
         }
     }
 }
@@ -523,8 +557,9 @@ impl Drop for Guard {
 }
 
 /// Runs observe-mode service layer `index`: the copies go to the service
-/// on a stream of their own; what it sends back other than credit and
-/// resets is ignored.
+/// on a stream of their own. What it sends back goes nowhere, but its
+/// last message ends the stream as it does an enforce one, so it may read
+/// the copies and then call the host services before ending it.
 pub(super) async fn observe(
     st: &Arc<StackFlow>,
     index: usize,
@@ -567,7 +602,9 @@ pub(super) async fn observe(
         Err(_) => stream.reset("the exchange ended"),
     }
     let _ = request.await;
-    stream.finish()
+    // roxy has sent all it had. The time from here to the service's last
+    // message is its own, bounded as each of its heads is in enforce mode.
+    stream.finish(svc.first_byte_timeout).await
 }
 
 /// Pumps an observer's copy, resetting the stream as soon as the copy is
@@ -589,8 +626,9 @@ async fn drain(body: Body) {
 
 #[cfg(test)]
 mod tests {
-    use super::{header_map, pairs};
+    use super::{Call, In, header_map, pairs};
     use http::{HeaderMap, HeaderValue};
+    use serde_json::json;
 
     /// A header value's bytes above 0x7f reach the service as the code
     /// points of the same value and come back as the same bytes; a code
@@ -606,6 +644,46 @@ mod tests {
         assert_eq!(back["x-obs"].as_bytes(), raw);
         let wide = [("x-obs".to_owned(), "\u{100}".to_owned())];
         assert!(header_map(&wide, 100).is_err());
+    }
+
+    /// A message that does not parse is refused with what is wrong with
+    /// it, whichever kind it is: the field a call or a head is missing, or
+    /// the unknown type. The kind goes by `type` alone: a stray `id` on a
+    /// head changes neither what it is nor what it is told.
+    #[test]
+    fn a_bad_message_is_refused_with_what_is_wrong() {
+        let parse = |v: serde_json::Value| -> Result<In, String> {
+            let serde_json::Value::Object(v) = v else {
+                panic!("an object");
+            };
+            In::parse(v)
+        };
+        let e = parse(json!({"type": "log", "id": 1, "level": "info"}))
+            .err()
+            .unwrap();
+        assert!(e.contains("missing field `message`"), "{e}");
+        let e = parse(json!({"type": "log", "level": "info", "message": "m"}))
+            .err()
+            .unwrap();
+        assert!(e.contains("missing field `id`"), "{e}");
+        let e = parse(json!({"type": "request", "method": "GET"}))
+            .err()
+            .unwrap();
+        assert!(e.contains("missing field `url`"), "{e}");
+        let e = parse(json!({"type": "request", "id": 1, "method": "GET"}))
+            .err()
+            .unwrap();
+        assert!(e.contains("missing field `url`"), "{e}");
+        let e = parse(json!({"type": "frobnicate", "id": 1})).err().unwrap();
+        assert!(e.contains("unknown variant `frobnicate`"), "{e}");
+        assert!(matches!(
+            parse(json!({"type": "log", "id": 1, "level": "info", "message": "m"})),
+            Ok(In::Call(Call::Log { id: 1, .. }))
+        ));
+        assert!(matches!(
+            parse(json!({"type": "request_end", "id": 1})),
+            Ok(In::RequestEnd)
+        ));
     }
 
     /// A `max_headers` above what a `HeaderMap` holds (2^15 fields) does

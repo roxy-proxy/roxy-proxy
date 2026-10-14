@@ -8,7 +8,7 @@ use std::sync::Arc;
 use roxy_wasm::{Budget, Capability, LayerError, LayerHost, MAX_MESSAGE_BYTES, TagError};
 use serde_json::Value;
 
-use super::In;
+use super::Call;
 use crate::addons::StackFlow;
 use crate::addons::host::StackHost;
 
@@ -16,19 +16,19 @@ use crate::addons::host::StackHost;
 /// with none), or the refusal of what the service passed.
 pub(super) type Reply = Result<Value, String>;
 
-/// Runs `call`, the service's call `id`, for layer `index` of `st`. `Err`
-/// fails the exchange, as the same failure would a WASM layer's.
+/// Runs `call` for layer `index` of `st`. `Err` fails the layer, as the
+/// same failure would a WASM layer: its stream is reset, and in enforce
+/// mode the exchange fails with it.
 pub(super) async fn call(
     st: &Arc<StackFlow>,
     index: usize,
-    id: u64,
-    call: In,
+    call: Call,
 ) -> Result<Reply, LayerError> {
     let host = StackHost {
         st: st.clone(),
         index,
         observer: None,
-        call: Some(id),
+        call: Some(call.id()),
     };
     let caps = st.snap.addons[index].capabilities;
     let require = |cap: Capability, import: &'static str| {
@@ -49,7 +49,7 @@ pub(super) async fn call(
         }
     };
     match call {
-        In::Log {
+        Call::Log {
             level,
             message: msg,
             ..
@@ -59,47 +59,41 @@ pub(super) async fn call(
             host.log(level.into(), &msg);
             Ok(Ok(Value::Null))
         }
-        In::Record { kind, data, .. } => {
+        Call::Record { kind, data, .. } => {
             require(Capability::Record, "flow.record")?;
             let json = data.to_string();
             message(kind.len().saturating_add(json.len()))?;
             host.record(kind, json).await?;
             Ok(Ok(Value::Null))
         }
-        In::AddTag { tag, .. } => {
+        Call::AddTag { tag, .. } => {
             host.add_tag(tag).map_err(|e| match e {
                 TagError::Full => LayerError::BudgetExceeded(Budget::Tags),
                 TagError::Host(e) => LayerError::Host(e),
             })?;
             Ok(Ok(Value::Null))
         }
-        In::StateGet { key, .. } => {
+        Call::StateGet { key, .. } => {
             require(Capability::State, "flow.state-get")?;
             let value = host.state_get(key).await?;
             Ok(Ok(value.map_or(Value::Null, Value::String)))
         }
-        In::StatePut {
+        Call::StatePut {
             key, value, ttl_ms, ..
         } => {
             require(Capability::State, "flow.state-put")?;
             let result = host.state_put(key, value, ttl_ms).await?;
             Ok(result.map(|()| Value::Null))
         }
-        In::MetricGet { metric, .. } => {
+        Call::MetricGet { metric, .. } => {
             require(Capability::Metrics, "flow.metric-get")?;
             let value = host.metric_get(metric, Vec::new()).await?;
             Ok(Ok(value.map_or(Value::Null, Value::from)))
         }
-        In::Quarantine { .. } => {
+        Call::Quarantine { .. } => {
             require(Capability::Quarantine, "flow.quarantine")?;
             host.quarantine()?;
             Ok(Ok(Value::Null))
         }
-        In::Request { .. }
-        | In::RequestEnd
-        | In::Response { .. }
-        | In::ResponseEnd
-        | In::Credit { .. }
-        | In::Reset { .. } => Ok(Ok(Value::Null)),
     }
 }

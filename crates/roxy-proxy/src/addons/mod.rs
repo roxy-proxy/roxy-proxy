@@ -595,11 +595,15 @@ impl StackFlow {
 
 /// A stable code for a layer failure, for the flow log.
 fn error_kind(e: &StackError) -> String {
-    let e = match e {
-        StackError::Layer(e) | StackError::Service(ServiceError::Layer { err: e, .. }) => e,
-        StackError::Service(e) => return e.kind(),
-        StackError::Condition { code, .. } => return format!("when:{code}"),
-    };
+    match e {
+        StackError::Layer(e) => layer_error_kind(e),
+        StackError::Service(e) => e.kind(),
+        StackError::Condition { code, .. } => format!("when:{code}"),
+    }
+}
+
+/// A stable code for a [`LayerError`], whichever kind of layer it failed.
+pub(crate) fn layer_error_kind(e: &LayerError) -> String {
     match e {
         LayerError::Trap(_) => "trap".into(),
         LayerError::BudgetExceeded(b) => format!("budget:{b}"),

@@ -41,8 +41,9 @@ fn state_write_refusal(key: &str, value: &str) -> Option<String> {
 pub(crate) struct StackHost {
     pub(crate) st: Arc<StackFlow>,
     pub(crate) index: usize,
-    /// Observe mode: effects on the flow (`next`, `add-tag`) are not taken,
-    /// and `next` returns the copy of the real response.
+    /// A WASM observer's copy of the real response, for its `next`. What
+    /// an observer may do goes by the layer's mode (`observing`), which a
+    /// service observer has without a copy: its `next` is its own stream.
     pub(crate) observer: Option<super::tee::ObserverNext>,
     /// A service layer's id for the call being run, carried into roxy's
     /// record of it (`call`) so the two can be matched. A WASM layer's
@@ -65,10 +66,13 @@ impl StackHost {
 #[async_trait]
 impl LayerHost for StackHost {
     async fn next(&self, req: LayerRequest) -> Result<LayerResponse, HostError> {
-        if let Some(obs) = &self.observer {
+        if self.observing() {
             // An observer's request goes nowhere; it gets the real response.
             drop(req);
-            return obs.response().await;
+            return match &self.observer {
+                Some(obs) => obs.response().await,
+                None => Err(HostError::new("an observing service has no `next`")),
+            };
         }
         super::below(self.st.clone(), self.index, req).await
     }
@@ -110,7 +114,14 @@ impl LayerHost for StackHost {
             // effect on traffic, which an observer must not have.
             let layer = &self.addon().name;
             let flow = self.st.flow.to_string();
-            tracing::warn!(layer, flow, tag, "observer called `flow.add-tag`: refused");
+            let call = self.call;
+            tracing::warn!(
+                layer,
+                flow,
+                call,
+                tag,
+                "observer called `flow.add-tag`: refused"
+            );
             return Err(HostError::new(
                 "layer called `flow.add-tag` in observe mode: an observer cannot tag",
             )
@@ -170,9 +181,11 @@ impl LayerHost for StackHost {
             // effect on traffic, which an observer must not have.
             let layer = &self.addon().name;
             let flow = self.st.flow.to_string();
+            let call = self.call;
             tracing::warn!(
                 layer,
                 flow,
+                call,
                 key,
                 "observer called `flow.state-put`: refused"
             );
@@ -241,7 +254,7 @@ impl LayerHost for StackHost {
     fn failed(&self, err: &LayerError) {
         // An observer's failure is its own, logged by the task that runs
         // it; it is never the exchange's.
-        if self.observer.is_none() {
+        if !self.observing() {
             self.st.fail(&self.addon().name, err.clone());
         }
     }

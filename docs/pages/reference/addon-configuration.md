@@ -141,9 +141,9 @@ and a service layer sends as messages:
 Every import is linked whatever is granted (one binary runs under any
 set); an ungranted call traps with `CapabilityDenied` and fails the
 exchange. `flow.current`, `flow.add-tag` and `flow.config` need no
-capability; `flow.add-tag` from an observe layer fails the exchange too,
-as a host refusal (`layer_error` with `kind: host`), since a tag steers the
-`when` of the layers below. There is no `secrets`
+capability; `flow.add-tag` from an observe layer is refused by the host
+(`layer_error` with `kind: host`: the observer fails, the exchange goes
+on), since a tag steers the `when` of the layers below. There is no `secrets`
 capability: credentials go on an endpoint's `headers`.
 
 ## Behaviour

@@ -1249,9 +1249,9 @@ async fn an_observer_sees_exchanges_through() {
     assert_eq!(st.resets.lock().unwrap().len(), 0);
     h.stop().await;
 
-    // roxy ends an observe stream once both copies are through, and drops
-    // what the service sends after that, so the request body stays open
-    // until the service has sent it all.
+    // An observe stream ends on the service's last message, however far
+    // roxy's copies have got: the client's upload stays open until the
+    // service has sent all it wants to, and nothing is logged against it.
     let (h, st) = start("/mixed", "    mode: observe\n", ALLOW_UPSTREAM).await;
     let (body_tx, body_rx) = mpsc::unbounded_channel::<Result<Vec<u8>, std::io::Error>>();
     body_tx.send(Ok(b"x".to_vec())).unwrap();

@@ -303,6 +303,10 @@ enum Mode {
     /// the response head and passes it on once the call is answered: a
     /// layer that quarantines after `next`.
     LateQuarantine,
+    /// Passes through, and on roxy's `response_end` calls `record` (call
+    /// id 1), sending its own `response_end` only once the call is
+    /// answered: an observer that records what it has read.
+    Audit,
 }
 
 /// What the `host` behaviour writes to the state store, under `svc`.
@@ -344,6 +348,8 @@ impl Mode {
             Self::Quarantine
         } else if path.ends_with("/late-quarantine") {
             Self::LateQuarantine
+        } else if path.ends_with("/audit") {
+            Self::Audit
         } else {
             Self::Flood
         }
@@ -375,7 +381,6 @@ impl Conn {
         let _ = self.tx.send(m);
     }
 
-    /// Whether what roxy sends in direction `dir` comes straight back.
     /// Whether body bytes in `dir` are passed on.
     fn passes(&self, dir: u8) -> bool {
         match self.mode {
@@ -387,7 +392,8 @@ impl Conn {
             | Mode::Patient
             | Mode::Host
             | Mode::Quarantine
-            | Mode::LateQuarantine => true,
+            | Mode::LateQuarantine
+            | Mode::Audit => true,
             Mode::Hold | Mode::Forward => dir == REQUEST,
             Mode::Overlong
             | Mode::Short
@@ -405,7 +411,7 @@ impl Conn {
         self.mode == Mode::Hold || self.passes(dir)
     }
 
-    fn control(&mut self, mut v: Value) {
+    fn control(&mut self, v: Value) {
         let Some(id) = v["stream"].as_u64().and_then(|n| u32::try_from(n).ok()) else {
             return;
         };
@@ -459,21 +465,35 @@ impl Conn {
                 }
             }
             "response_end" if self.mode == Mode::Hold => {}
-            _ => {
-                let Some(dir) = lane_of(&kind).filter(|d| self.passes_head(*d)) else {
-                    return;
-                };
-                v.as_object_mut().map(|o| o.remove("stream"));
-                if let Some(s) = self.streams.get_mut(&id) {
-                    let lane = &mut s.lanes[usize::from(dir)];
-                    lane.queue.push_back(Queued::Ctl(v));
-                    if kind == "request_end" && self.mode == Mode::Patient {
-                        lane.held = false;
-                    }
-                }
-                self.flush(id, dir);
+            "response_end" if self.mode == Mode::Audit => {
+                // The whole response has been read: record it, and end the
+                // stream only once the record is answered.
+                self.call_host(
+                    id,
+                    RESPONSE,
+                    vec![json!({"type": "record", "id": 1, "kind": "audit", "data": {"read": "response"}})],
+                );
+                self.pass_control(id, &kind, v);
+            }
+            _ => self.pass_control(id, &kind, v),
+        }
+    }
+
+    /// Passes a head or end straight back in its own direction, when the
+    /// behaviour passes that direction.
+    fn pass_control(&mut self, id: u32, kind: &str, mut v: Value) {
+        let Some(dir) = lane_of(kind).filter(|d| self.passes_head(*d)) else {
+            return;
+        };
+        v.as_object_mut().map(|o| o.remove("stream"));
+        if let Some(s) = self.streams.get_mut(&id) {
+            let lane = &mut s.lanes[usize::from(dir)];
+            lane.queue.push_back(Queued::Ctl(v));
+            if kind == "request_end" && self.mode == Mode::Patient {
+                lane.held = false;
             }
         }
+        self.flush(id, dir);
     }
 
     /// Stream `id` opened: what the behaviour does before roxy's request.
@@ -495,7 +515,8 @@ impl Conn {
             | Mode::Shout
             | Mode::Sever
             | Mode::Patient
-            | Mode::LateQuarantine => {}
+            | Mode::LateQuarantine
+            | Mode::Audit => {}
             Mode::Host => self.call_host(
                 id,
                 REQUEST,
