@@ -80,14 +80,6 @@ impl Reply {
         }
     }
 
-    #[must_use]
-    pub fn with_header(mut self, name: &str, value: &str) -> Self {
-        if let Self::Status { headers, .. } = &mut self {
-            headers.push((name.to_owned(), value.to_owned()));
-        }
-        self
-    }
-
     pub fn issue(node_id: &str) -> Self {
         Self::Issue {
             node_id: node_id.to_owned(),

@@ -50,7 +50,7 @@ paths:
           description: |
             The token was not accepted. The node retries with backoff for a
             bounded window (a new token may not have reached every replica),
-            then exits. A `410` here is fatal at once.
+            then exits.
           content:
             application/json:
               schema:
@@ -58,6 +58,15 @@ paths:
               example:
                 error: invalid_token
                 message: enrolment token not recognised
+        "410":
+          description: |
+            The server will not enrol with this token: it belongs to a node
+            that has been revoked. Fatal at once; the node exits without
+            retrying.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "426":
           $ref: "#/components/responses/Unsupported"
         "5XX":
@@ -73,9 +82,10 @@ paths:
         accepting the old token until its own `not_after`, so a renewal
         that has reached one replica but not another cannot lock the node
         out; the node switches on receipt. A `5xx` or transport failure is
-        retried with backoff; `410` is terminal; any other `4xx` ends
-        renewal. If the token expires first the node exits: an expired
-        token needs re-enrolment, an operator action.
+        retried with backoff, and so is a `401`: the replica answering may
+        not yet know the token the last renewal issued. `410` is terminal;
+        any other `4xx` ends renewal. If the token expires first the node
+        exits: an expired token needs re-enrolment, an operator action.
       requestBody:
         $ref: "#/components/requestBodies/EnrolRequest"
       responses:
@@ -218,11 +228,11 @@ components:
             $ref: "#/components/schemas/EnrolResponse"
     BadRequest:
       description: |
-        The request was malformed. Retrying cannot help, so the node treats it
-        as it treats a `401` on the same operation, logged distinctly:
-        enrolment retries for the bounded window and then exits, renewal
-        ends, the lease fetch logs once per outcome change and keeps polling
-        while the lease runs down.
+        The request was malformed. Retrying cannot help, and the node logs
+        it apart from an unrecognised token: enrolment retries for the
+        bounded window and then exits, renewal ends and the current token
+        serves until its `not_after`, the lease fetch logs once per outcome
+        change and keeps polling while the lease runs down.
       content:
         application/json:
           schema:
@@ -230,9 +240,14 @@ components:
     Unrecognised:
       description: |
         No node token, or one the server does not recognise: never issued,
-        expired, or forgotten. The node logs once per outcome change and
-        lets its lease run down. It never re-enrols on its own: re-enrolment
-        is an operator action (a new token and an empty state dir).
+        expired, or forgotten. The node never re-enrols on its own
+        (re-enrolment is an operator action: a new token and an empty state
+        dir), and otherwise acts per operation. Lease: log once per outcome
+        change and keep polling while the lease runs down. Renew: log once
+        per outcome change and retry with backoff under the current token,
+        since the replica answering may not yet know the token the last
+        renewal issued. Flows: retry the batch with backoff, as a failure;
+        it stays spooled.
       content:
         application/json:
           schema:

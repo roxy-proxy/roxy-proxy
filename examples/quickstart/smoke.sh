@@ -3,8 +3,9 @@
 # until its first lease, a host no rule allows is denied, each control fires
 # in the traffic's log (the quota's 429 for alice, the auth gate's 401 for
 # mallory, the sentinel's blocked tool call), the control plane receives the
-# flow log, a layer whose service is gone fails the call closed, a lease that
-# runs down denies everything until the control plane is back, and the
+# flow log, the node token is renewed, a layer whose service is gone fails
+# the call closed, a lease that runs down denies everything until the
+# control plane is back, a revoked node denies everything for good, and the
 # standalone override runs the same policy from the file. CI runs this
 # (.github/workflows/quickstart.yml); it takes a few minutes the first time.
 #   ./smoke.sh            # builds, checks, tears down
@@ -14,6 +15,10 @@ cd "$(dirname "$0")"
 
 # A short lease so expiry is quick to observe; the compose default is 60.
 export LEASE_VALID_SECONDS="${LEASE_VALID_SECONDS:-20}"
+# A node token short enough to be renewed (halfway) during the run, and long
+# enough to outlive the control plane's outage below; the compose default is
+# 600.
+export NODE_TOKEN_SECONDS="${NODE_TOKEN_SECONDS:-120}"
 
 fail() { echo "smoke: $*" >&2; exit 1; }
 
@@ -118,6 +123,14 @@ shipped=$(docker compose logs --no-log-prefix controlplane)
 grep -qE '^node-[0-9a-f]+ \{.*"event":"request"' <<<"$shipped" \
     || fail "no flow event on the control plane's stdout"
 
+# The node token is renewed halfway through its lifetime, under the old one.
+deadline=$((SECONDS + NODE_TOKEN_SECONDS))
+until docker compose logs --no-log-prefix roxy | grep -qF 'node token renewed'; do
+    (( SECONDS >= deadline )) && fail "roxy did not log 'node token renewed' within ${NODE_TOKEN_SECONDS}s"
+    sleep 2
+done
+echo "smoke: node token renewed"
+
 # A layer that cannot reach its service fails the call closed, not open.
 docker compose stop quota-board
 expect "$(as_bob)" '^503 '
@@ -138,6 +151,20 @@ wait_readyz "200 ready" 120
 got=$(proxied)
 [[ $got != "403 _expired" ]] || fail "proxied request still '_expired' after recovery"
 echo "smoke: lease recovered"
+
+# Revoking the node: its next poll is answered 410, and roxy expires the
+# lease at once, stops polling and stays up for its health endpoint. The
+# node's state dir is a tmpfs, so a restart enrols afresh under a new id.
+node_id=$(docker compose logs --no-log-prefix controlplane | sed -n 's/^enrolled \(node-[0-9a-f]*\)$/\1/p' | tail -n 1)
+[[ -n $node_id ]] || fail "no enrolment in the control plane's log"
+docker compose exec controlplane sh -c "echo $node_id >> /data/revoked"
+wait_readyz "503 policy_expired" $((LEASE_VALID_SECONDS / 4 + 30))
+expect "$(proxied)" '^403 _expired$'
+docker compose logs --no-log-prefix roxy | grep -qF 'control plane says this node is revoked' \
+    || fail "roxy did not log the revocation"
+healthz=$(curl -s -m 2 -o /dev/null -w '%{http_code}' http://127.0.0.1:3130/healthz)
+[[ $healthz == 200 ]] || fail "/healthz answered '$healthz' after revocation, wanted 200"
+echo "smoke: node revoked"
 
 # The standalone override: the same policy from the file, with the secret
 # from roxy's own environment and no control plane.

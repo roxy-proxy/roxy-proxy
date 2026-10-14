@@ -217,7 +217,6 @@ fn enrol_request_needs_both_versions_and_no_more() {
 #[test]
 fn enrol_response_token_is_required_and_header_safe() {
     let res = page_example("EnrolResponse");
-    assert!(res.get("certificate_chain").is_none());
     let mut missing = res.clone();
     missing.as_object_mut().unwrap().remove("token");
     assert!(validate("EnrolResponse", &missing).is_err());

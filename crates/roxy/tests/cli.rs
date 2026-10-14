@@ -12,6 +12,29 @@ fn roxy(args: &[&str]) -> Output {
         .expect("run roxy")
 }
 
+/// `roxy` with `args`, killed if it has not exited within `timeout`: for a
+/// `run` that must refuse to start, which on regression runs for ever.
+fn roxy_exits_within(args: &[&str], timeout: std::time::Duration) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_roxy"))
+        .args(["--log-format", "json", "--log-level", "warn"])
+        .args(args)
+        .env_remove("RUST_LOG")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run roxy");
+    let deadline = std::time::Instant::now() + timeout;
+    while child.try_wait().expect("poll roxy").is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("roxy {args:?} did not exit within {timeout:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    child.wait_with_output().expect("collect roxy output")
+}
+
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -950,9 +973,6 @@ fn health_ready_conflicts_with_url() {
     );
 }
 
-/// End to end: `roxy health` against a running roxy's `ca_server`. With
-/// an expired lease the proxy is alive but not ready; a reload with a
-/// later one makes it ready without a restart.
 /// A free local address.
 fn free_addr() -> std::net::SocketAddr {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -993,6 +1013,9 @@ fn health_config(dir: &Path, proxy: std::net::SocketAddr, ca: std::net::SocketAd
     )
 }
 
+/// End to end: `roxy health` against a running roxy's `ca_server`. With
+/// an expired lease the proxy is alive but not ready; a reload with a
+/// later one makes it ready without a restart.
 #[test]
 fn health_probes_a_running_roxy() {
     let dir = tempfile::tempdir().unwrap();
@@ -1079,7 +1102,10 @@ fn a_config_that_can_quarantine_needs_a_state_dir_to_run() {
         std::fs::write(&cfg, &config).unwrap();
         let out = roxy(&["check", "--config", cfg.to_str().unwrap()]);
         assert!(out.status.success(), "{config}: {}", text(&out.stderr));
-        let out = roxy(&["run", "--config", cfg.to_str().unwrap()]);
+        let out = roxy_exits_within(
+            &["run", "--config", cfg.to_str().unwrap()],
+            std::time::Duration::from_secs(10),
+        );
         assert_eq!(
             out.status.code(),
             Some(1),

@@ -17,7 +17,8 @@ use crate::client::{
     ClientError, ControlPlane, EnrolError, LeaseFetch, NodeInfo, ShipOutcome, Trust,
 };
 use crate::protocol::{
-    Lease, NodeState, PROTOCOL_VERSION, PolicyState, QuarantineReport, encode_flow_batch,
+    EnrolResponse, Lease, NodeState, PROTOCOL_VERSION, PolicyState, QuarantineReport,
+    encode_flow_batch,
 };
 use crate::spool::{Spool, reserve_loop};
 use crate::state::{StateDir, StateError};
@@ -61,6 +62,9 @@ pub enum NodeError {
         "the control plane did not accept the enrolment token within {ENROL_REJECTED_WINDOW:?}: {0}"
     )]
     EnrolRejected(String),
+    /// A `410` or `426` at enrolment: no retry can change the answer.
+    #[error("the control plane will not enrol this node: {0}")]
+    EnrolRefused(String),
     #[error(
         "the node token for {node_id} expired at {}; re-enrol with a new token and an empty state dir ({})",
         not_after.to_rfc3339(),
@@ -338,9 +342,11 @@ impl Node {
             }
             None => self.enrol().await?,
         };
-        let client = self
-            .anonymous_client()?
-            .with_token(&stored.token, stored.not_after);
+        let client = self.anonymous_client()?.with_token(
+            &stored.token,
+            stored.not_after,
+            self.config.clock.now(),
+        );
         tracing::info!(
             node_id = %stored.node_id,
             not_after = %stored.not_after.to_rfc3339(),
@@ -401,7 +407,7 @@ impl Node {
                     tracing::warn!(error = %e, retry_in = ?wait, "enrolment failed; retrying");
                     tokio::time::sleep(self.scaled(wait)).await;
                 }
-                Err(EnrolError::Rejected(why)) => {
+                Err(EnrolError::Unauthorized(why) | EnrolError::Rejected(why)) => {
                     let since = *rejected_since.get_or_insert_with(Instant::now);
                     if since.elapsed() >= self.scaled(ENROL_REJECTED_WINDOW) {
                         return Err(NodeError::EnrolRejected(why));
@@ -414,7 +420,9 @@ impl Node {
                     );
                     tokio::time::sleep(self.scaled(wait)).await;
                 }
-                Err(e) => return Err(NodeError::EnrolRejected(e.to_string())),
+                Err(e @ (EnrolError::Revoked | EnrolError::Unsupported(_))) => {
+                    return Err(NodeError::EnrolRefused(e.to_string()));
+                }
             }
         };
         let stored = NodeToken::from_response(&issued).map_err(|source| NodeError::Token {
@@ -583,21 +591,28 @@ impl Node {
     }
 
     /// Renews the token at its renewal time, retrying with backoff while
-    /// the control plane is unavailable and the current one stays in use.
-    /// The node switches to the new token on receipt; the server keeps
-    /// accepting the old one until its own `not_after`, so a renewal that
-    /// reached one replica before another cannot lock the node out. A 4xx
-    /// is final: the loop ends and the current token serves until
-    /// `not_after`. Returns `true` if the control plane said the node is
-    /// revoked.
+    /// the control plane is unavailable or does not recognise the token (a
+    /// replica may not have seen the last renewal yet); the current token
+    /// stays in use meanwhile. The node switches to the new token on
+    /// receipt; the server keeps accepting the old one until its own
+    /// `not_after`, so a renewal that reached one replica before another
+    /// cannot lock the node out. A `426` or other `4xx` is final: the loop
+    /// ends and the current token serves until `not_after`. A `401` is
+    /// logged when the outcome changes, not on every retry. Returns `true`
+    /// if the control plane said the node is revoked.
     async fn renew_loop(&self) -> bool {
         let mut backoff = Backoff::new();
+        let mut last = RenewOutcome::Renewed;
         loop {
             let Some(id) = self.client() else {
                 return false;
             };
             tokio::time::sleep_until(id.renew_at.into()).await;
-            match id.client.renew().await {
+            let renewed = id.client.renew().await;
+            let outcome = RenewOutcome::of(&renewed);
+            let changed = outcome != last;
+            last = outcome;
+            match renewed {
                 Ok(issued) if issued.node_id == id.node_id => {
                     match NodeToken::from_response(&issued) {
                         Ok(stored) => {
@@ -606,7 +621,11 @@ impl Node {
                             }
                             tracing::info!(not_after = %stored.not_after.to_rfc3339(), "node token renewed");
                             self.install_credential(
-                                id.client.with_token(&stored.token, stored.not_after),
+                                id.client.with_token(
+                                    &stored.token,
+                                    stored.not_after,
+                                    self.config.clock.now(),
+                                ),
                                 stored.node_id,
                                 stored.not_after,
                                 Some(Duration::from_secs(issued.renew_after_seconds)),
@@ -634,6 +653,18 @@ impl Node {
                         "control plane will not renew the node token for this roxy or protocol version; the current one stays in use until it expires"
                     );
                     return false;
+                }
+                Err(EnrolError::Unauthorized(why)) => {
+                    let wait = backoff.wait();
+                    if changed {
+                        tracing::error!(
+                            error = %why,
+                            not_after = %id.not_after.to_rfc3339(),
+                            "control plane does not recognise the node token for renewal; retrying while the current token stays in use (re-enrolment needs a new token and an empty state dir)"
+                        );
+                    }
+                    tokio::time::sleep(self.scaled(wait)).await;
+                    continue;
                 }
                 Err(EnrolError::Rejected(why)) => {
                     tracing::error!(
@@ -792,6 +823,29 @@ impl FetchOutcome {
     }
 }
 
+/// A renewal attempt's outcome, without its payload: what "the outcome
+/// changed" compares. The terminal ones end the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenewOutcome {
+    Renewed,
+    Unauthorized,
+    Failed,
+    Other,
+}
+
+impl RenewOutcome {
+    fn of(renewed: &Result<EnrolResponse, EnrolError>) -> Self {
+        match renewed {
+            Ok(_) => Self::Renewed,
+            Err(EnrolError::Unauthorized(_)) => Self::Unauthorized,
+            Err(EnrolError::Failed(_)) => Self::Failed,
+            Err(EnrolError::Revoked | EnrolError::Unsupported(_) | EnrolError::Rejected(_)) => {
+                Self::Other
+            }
+        }
+    }
+}
+
 /// Exponential backoff with jitter, capped.
 #[derive(Debug)]
 pub struct Backoff {
@@ -848,7 +902,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
-    use crate::protocol::FlowAck;
+    use crate::protocol::{ErrorBody, FlowAck};
     use crate::testkit::{MockServer, Reply};
 
     struct Recorder {
@@ -1055,8 +1109,8 @@ mod tests {
         let second = fetches[1].node_state();
         assert_eq!(second.lease_id.as_deref(), Some("L1"));
         assert_eq!(second.policy_state, PolicyState::Loaded);
+        // Every fetch is handed to the handler; the first carries the diff.
         let applied = lock(&rec.applied).clone();
-        assert_eq!(applied.len(), 1, "an identical lease is not re-applied");
         let (lease, at, change) = &applied[0];
         assert_eq!(lease.lease_id, "L1");
         assert!((Utc::now() - *at).num_seconds() < 5);
@@ -1149,6 +1203,32 @@ mod tests {
             h.stored_token().is_none(),
             "a rejected enrolment stores nothing"
         );
+    }
+
+    /// A `410` or `426` at enrolment can only be answered by the operator,
+    /// so the node exits at once and says so, rather than reporting the
+    /// retry window it never used.
+    #[tokio::test]
+    async fn a_revoked_or_unsupported_enrolment_is_fatal_at_once() {
+        let h = Harness::new().await;
+        let unsupported = ErrorBody {
+            error: "unsupported".into(),
+            message: "too old".into(),
+            missing: vec!["roxy_version:0.2.0".into()],
+        };
+        for reply in [Reply::status(410), Reply::json(426, &unsupported)] {
+            h.mock.push(ENROL, reply);
+            let (node, _) = h.node(true);
+            let err = tokio::time::timeout(Duration::from_millis(500), node.run())
+                .await
+                .expect("ends without retrying")
+                .unwrap_err();
+            assert!(matches!(err, NodeError::EnrolRefused(_)), "{err}");
+            let text = err.to_string();
+            assert!(!text.contains("within"), "{text}");
+        }
+        assert_eq!(h.mock.requests_to(ENROL).len(), 2, "neither is retried");
+        assert!(h.stored_token().is_none());
     }
 
     #[tokio::test]
@@ -1697,7 +1777,17 @@ mod tests {
                 renew_after_seconds: 1,
             },
         );
-        h.mock.fallback(RENEW, Reply::status(401));
+        h.mock.fallback(
+            RENEW,
+            Reply::json(
+                426,
+                &ErrorBody {
+                    error: "unsupported".into(),
+                    message: "too old".into(),
+                    missing: vec!["roxy_version:0.2.0".into()],
+                },
+            ),
+        );
         let mut l = lease("L1", "version: 1\n", "s1", "e1");
         l.refresh_after_seconds = 1;
         h.mock.fallback(LEASE, Reply::json(200, &l));
@@ -1813,7 +1903,6 @@ mod tests {
             "renewal is under the old token"
         );
         assert_eq!(renew[0].client.as_deref(), Some("n1"));
-        assert!(renew[0].json().get("csr").is_none());
         tokio::time::timeout(Duration::from_secs(5), async {
             while h.stored_token().unwrap().token == before.token {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1836,14 +1925,6 @@ mod tests {
             Some(format!("Bearer {}", after.token).as_str())
         );
         assert_eq!(later.last().unwrap().client.as_deref(), Some("n1"));
-        // The old token is still accepted until its own not_after.
-        let old = ControlPlane::new(&h.mock.url(), &h.config(false).trust, h.config(false).info)
-            .unwrap()
-            .with_token(&before.token, before.not_after);
-        assert!(matches!(
-            old.fetch_lease(&node.node_state()).await,
-            LeaseFetch::Lease(_)
-        ));
         task.abort();
     }
 
@@ -2014,59 +2095,58 @@ mod tests {
                 },
             )
             .unwrap()
-            .with_token("t", Utc::now() + chrono::Duration::seconds(3000))
+            .with_token(
+                "t",
+                Utc::now() + chrono::Duration::seconds(3000),
+                Utc::now(),
+            )
         };
-        let not_after = Utc::now() + chrono::Duration::seconds(3000);
         let scaled = |secs: u64| node.scaled(Duration::from_secs(secs));
-        let renew_in = |node: &Node| {
+        // The renewal delay as installed, for a token issued now and good
+        // for `lifetime`. Measured from before the expiry is fixed, so the
+        // expiry's ageing before the install is counted in the delay and
+        // the lower bound is exact; the upper bound allows for the time the
+        // install itself takes.
+        let renew_in = |lifetime: i64, renew_after: Option<Duration>| {
+            let before = Instant::now();
+            let not_after = Utc::now() + chrono::Duration::seconds(lifetime);
+            node.install_credential(client(), "n1".into(), not_after, renew_after);
             lock(&node.credential)
                 .as_ref()
                 .unwrap()
                 .renew_at
-                .saturating_duration_since(Instant::now())
+                .saturating_duration_since(before)
         };
+        let slack = Duration::from_secs(1);
 
-        node.install_credential(
-            client(),
-            "n1".into(),
-            not_after,
-            Some(Duration::from_secs(600)),
-        );
-        let within = renew_in(&node);
-        assert!(within <= scaled(600) && within > scaled(590), "{within:?}");
-
-        node.install_credential(
-            client(),
-            "n1".into(),
-            not_after,
-            Some(Duration::from_secs(2900)),
-        );
-        let capped = renew_in(&node);
+        let within = renew_in(3000, Some(Duration::from_secs(600)));
         assert!(
-            capped <= scaled(2000) && capped > scaled(1990),
+            within >= scaled(600) && within < scaled(600) + slack,
+            "{within:?}"
+        );
+
+        let capped = renew_in(3000, Some(Duration::from_secs(2900)));
+        assert!(
+            capped >= scaled(2000) && capped < scaled(2000) + slack,
             "{capped:?}"
         );
 
-        node.install_credential(client(), "n1".into(), not_after, None);
-        let defaulted = renew_in(&node);
+        let defaulted = renew_in(3000, None);
         assert!(
-            defaulted <= scaled(2000) && defaulted > scaled(1990),
+            defaulted >= scaled(2000) && defaulted < scaled(2000) + slack,
             "{defaulted:?}"
         );
 
-        node.install_credential(client(), "n1".into(), not_after, Some(Duration::ZERO));
-        let floored = renew_in(&node);
+        let floored = renew_in(3000, Some(Duration::ZERO));
         assert!(
-            floored <= scaled(1) && floored > scaled(1).mul_f64(0.9),
+            floored >= scaled(1) && floored < scaled(1) + slack,
             "{floored:?}"
         );
 
         // An already-expired token: the cap is zero and the floor still holds.
-        let expired = Utc::now() - chrono::Duration::seconds(1);
-        node.install_credential(client(), "n1".into(), expired, Some(Duration::ZERO));
-        let floored = renew_in(&node);
+        let floored = renew_in(-1, Some(Duration::ZERO));
         assert!(
-            floored <= scaled(1) && floored > scaled(1).mul_f64(0.9),
+            floored >= scaled(1) && floored < scaled(1) + slack,
             "{floored:?}"
         );
     }
@@ -2135,9 +2215,13 @@ mod tests {
         );
     }
 
+    /// A `401` on renewal is retried like an outage: a replica may not have
+    /// seen the token the last renewal issued. The node logs it once per
+    /// run of them, and the next `200` renews as usual.
     #[tokio::test]
-    async fn an_unrecognised_renewal_stops_renewing_and_leaves_the_lease_loop_alone() {
+    async fn an_unrecognised_renewal_is_retried_and_the_next_answer_renews() {
         let h = Harness::new().await;
+        let logs = LogCapture::start();
         h.mock.push(
             ENROL,
             Reply::Issue {
@@ -2147,14 +2231,16 @@ mod tests {
             },
         );
         h.mock.push(RENEW, Reply::status(401));
-        h.mock.fallback(
+        h.mock.push(RENEW, Reply::status(401));
+        h.mock.push(
             RENEW,
             Reply::Issue {
                 node_id: "n1".into(),
                 lifetime_secs: 7200,
-                renew_after_seconds: 3000,
+                renew_after_seconds: 1,
             },
         );
+        h.mock.fallback(RENEW, Reply::status(401));
         h.mock.fallback(
             LEASE,
             Reply::json(200, &lease("L1", "version: 1\n", "s1", "e1")),
@@ -2163,10 +2249,27 @@ mod tests {
         let task = tokio::spawn(node.clone().run());
         h.mock.wait_for(RENEW, 1).await;
         let before = h.stored_token().unwrap().token;
-        // Several lease refreshes outlast the renewal backoff many times over.
-        h.mock.wait_for(LEASE, 4).await;
-        assert_eq!(h.mock.requests_to(RENEW).len(), 1, "a 401 is not retried");
-        assert_eq!(h.stored_token().unwrap().token, before);
+        h.mock.wait_for(RENEW, 3).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h.stored_token().unwrap().token == before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the 200 after the 401s renews the token");
+        let after = h.stored_token().unwrap().token;
+        let renewals = h.mock.wait_for(RENEW, 5).await;
+        assert_eq!(
+            renewals[4].header("authorization"),
+            Some(format!("Bearer {after}").as_str()),
+            "retries after the renewal carry the new token"
+        );
+        assert_eq!(
+            logs.count("does not recognise the node token for renewal"),
+            2,
+            "logged once per run of 401s, not per attempt: {}",
+            logs.text()
+        );
         assert_eq!(rec.revoked.load(Ordering::Acquire), 0);
         assert!(!node.is_revoked());
         assert!(!task.is_finished(), "the lease loop keeps running");

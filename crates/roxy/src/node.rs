@@ -15,7 +15,7 @@ use anyhow::{Context as _, anyhow, bail};
 use chrono::{DateTime, Utc};
 use roxy_node::client::{NodeInfo, Trust};
 use roxy_node::node::{Change, HandlerFuture, LeaseHandler, Node, NodeConfig, NodeError};
-use roxy_node::protocol::{Lease, PolicyState, QuarantineReport, sha256_hex};
+use roxy_node::protocol::{Lease, PolicyState, QuarantineReport};
 use roxy_node::spool::Spool;
 use roxy_node::state::StateDir;
 use roxy_proxy::{FlowEvent, FlowSink, PolicyUpdate, QuarantineState, Server};
@@ -609,9 +609,21 @@ impl LeaseHandler for NodeHandler {
     }
 }
 
-/// `sha256:` fingerprint of a CA certificate.
+/// `sha256:<hex>` of a CA certificate's DER: the fingerprint form roxy logs
+/// certificates in.
 fn fingerprint(ca: &Ca) -> String {
     sha256_hex(&ca.cert_der())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut out = String::with_capacity(7 + 64);
+    out.push_str("sha256:");
+    for b in digest.as_ref() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// Puts the interception CA in place before the server starts. The state
@@ -852,6 +864,14 @@ mod tests {
     use super::*;
     use roxy_node::protocol::{FlowSettings, OnHighWater};
     use roxy_proxy::MemorySink;
+
+    #[test]
+    fn sha256_fingerprint_form() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     fn generated(dir: &Path) -> (PathBuf, PathBuf, String) {
         let ca = Ca::generate(dir).unwrap();

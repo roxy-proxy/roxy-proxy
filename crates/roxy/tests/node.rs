@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use roxy::node::{Bootstrap, NodeOptions, NodeRunning};
 use roxy_node::node::NodeError;
-use roxy_node::protocol::{FlowAck, FlowSettings, Lease, OnHighWater, PolicyState};
-use roxy_node::testkit::{MockServer, Reply};
+use roxy_node::protocol::{FlowAck, FlowSettings, Lease, NodeState, OnHighWater, PolicyState};
+use roxy_node::testkit::{MockServer, Recorded, Reply};
 use roxy_node::token::NodeToken;
 use roxy_proxy::MemorySink;
 use serde_json::Value;
@@ -167,6 +167,30 @@ impl NodeHarness {
         })
         .await
         .unwrap_or_else(|_| panic!("lease {lease_id} was never reported as applied"));
+    }
+
+    /// The first lease poll at index `from` or later whose body satisfies
+    /// `pred`, waiting for it to arrive. By index rather than by count: a
+    /// poll the node built before the event under test and the mock
+    /// recorded after it must not pass for the one that followed.
+    async fn wait_poll(&self, from: usize, pred: impl Fn(&NodeState) -> bool) -> NodeState {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let found = self
+                    .mock
+                    .requests_to(LEASE)
+                    .iter()
+                    .skip(from)
+                    .map(Recorded::node_state)
+                    .find(|s| pred(s));
+                if let Some(state) = found {
+                    return state;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a lease poll matching the condition")
     }
 
     async fn proxy_addr(&self) -> SocketAddr {
@@ -782,16 +806,9 @@ async fn a_quarantined_node_is_released_only_by_its_incident_id() {
     let id = tripped["id"].as_str().unwrap().to_owned();
     assert!(h.state_dir().join("quarantine").is_file());
 
-    // The next poll carries the report; the lease keeps applying.
-    let so_far = h.mock.requests_to(LEASE).len();
-    let reported = h
-        .mock
-        .wait_for(LEASE, so_far + 1)
-        .await
-        .pop()
-        .unwrap()
-        .node_state();
-    let report = reported.quarantine.expect("quarantine reported");
+    // The polls carry the report; the lease keeps applying.
+    let reported = h.wait_poll(0, |s| s.quarantine.is_some()).await;
+    let report = reported.quarantine.clone().unwrap();
     assert_eq!(report.id, id);
     assert_eq!(report.cause["kind"], "rule");
     assert_eq!(report.cause["rule"], "exfil");
@@ -846,14 +863,8 @@ async fn a_quarantined_node_is_released_only_by_its_incident_id() {
     assert!(!h.state_dir().join("quarantine").exists());
     assert_eq!(h.readyz().await, (200, "ready".to_owned()));
     assert_eq!(h.get(proxy, "/e").await, (200, None));
-    let so_far = h.mock.requests_to(LEASE).len();
-    let clear = h
-        .mock
-        .wait_for(LEASE, so_far + 1)
-        .await
-        .pop()
-        .unwrap()
-        .node_state();
-    assert_eq!(clear.quarantine, None);
+    let released_at = h.mock.requests_to(LEASE).len();
+    let clear = h.wait_poll(released_at, |s| s.quarantine.is_none()).await;
+    assert_eq!(clear.lease_id.as_deref(), Some("L3"));
     h.stop().await;
 }

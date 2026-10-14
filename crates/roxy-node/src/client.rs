@@ -113,7 +113,12 @@ pub enum EnrolError {
     /// `missing` names what it wants.
     #[error("unsupported: missing {}", .0.missing.join(","))]
     Unsupported(ErrorBody),
-    /// Any other 4xx: the token was not accepted. Retrying cannot help.
+    /// 401: the token was not recognised. Retried: the token a replica
+    /// is shown may be newer than the one it knows of.
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+    /// 400 or another 4xx: the server refused the request itself. Retrying
+    /// cannot help.
     #[error("rejected: {0}")]
     Rejected(String),
     #[error("{0}")]
@@ -206,10 +211,9 @@ impl ControlPlane {
 
     /// The same client presenting `token`, good until `not_after`, as the
     /// node token. The token it replaces is kept for redaction while it is
-    /// unexpired; anything older is let go.
+    /// unexpired at `now`; anything older is let go.
     #[must_use]
-    pub fn with_token(&self, token: &str, not_after: DateTime<Utc>) -> Self {
-        let now = Utc::now();
+    pub fn with_token(&self, token: &str, not_after: DateTime<Utc>, now: DateTime<Utc>) -> Self {
         let mut next = self.clone();
         let previous = self.tokens.last().filter(|(_, expiry)| *expiry > now);
         next.tokens = previous
@@ -218,10 +222,6 @@ impl ControlPlane {
             .chain(std::iter::once((token.to_owned(), not_after)))
             .collect();
         next
-    }
-
-    pub fn info(&self) -> &NodeInfo {
-        &self.info
     }
 
     /// The credentials to redact from anything a response says: every
@@ -294,6 +294,10 @@ impl ControlPlane {
             StatusCode::UPGRADE_REQUIRED => {
                 Err(EnrolError::Unsupported(error_body(&body, secrets)))
             }
+            StatusCode::UNAUTHORIZED => Err(EnrolError::Unauthorized(format!(
+                "{status}: {}",
+                excerpt(&body, secrets)
+            ))),
             s if s.is_client_error() => Err(EnrolError::Rejected(format!(
                 "{status}: {}",
                 excerpt(&body, secrets)
@@ -475,37 +479,45 @@ pub(crate) mod tests {
         mock.push("/roxy/v1/enrol", Reply::issue("node-1"));
         let res = anon.enrol("tok").await.unwrap();
         assert_eq!(res.node_id, "node-1");
-        (anon.with_token(&res.token, res.not_after), res)
+        (anon.with_token(&res.token, res.not_after, Utc::now()), res)
     }
 
     fn in_an_hour() -> DateTime<Utc> {
         Utc::now() + chrono::Duration::hours(1)
     }
 
-    /// The redaction set is the active token and its unexpired predecessor,
-    /// never more; the active one stays whether or not it has expired, and
-    /// a token that is a prefix of another is still wholly redacted.
+    /// The redaction set is the active token and its predecessor while
+    /// that is unexpired on the caller's clock, never more; the active one
+    /// stays whether or not it has expired, and a token that is a prefix
+    /// of another is still wholly redacted.
     #[test]
     fn held_tokens_are_the_active_one_and_its_predecessor_redacted_longest_first() {
         let cp = ControlPlane::new("https://cp.example", &Trust::default(), info()).unwrap();
         assert_eq!(cp.secrets(), Vec::<&str>::new());
-        let yesterday = Utc::now() - chrono::Duration::days(1);
-        let cp = cp.with_token("old", yesterday);
+        let now = Utc::now();
+        let yesterday = now - chrono::Duration::days(1);
+        let cp = cp.with_token("old", yesterday, now);
         assert_eq!(
             cp.secrets(),
             ["old"],
             "the active token stays, expired or not"
         );
-        let cp = cp.with_token("ab", in_an_hour());
+        let cp = cp.with_token("ab", in_an_hour(), now);
         assert_eq!(cp.secrets(), ["ab"], "a renewal lets the expired one go");
-        let cp = cp.with_token("abcd", in_an_hour());
+        let cp = cp.with_token("abcd", in_an_hour(), now);
         assert_eq!(cp.secrets(), ["ab", "abcd"]);
+        assert_eq!(
+            cp.with_token("wxyz", in_an_hour(), now + chrono::Duration::hours(2))
+                .secrets(),
+            ["wxyz"],
+            "expiry is judged on the clock passed in, not the system's"
+        );
         assert_eq!(
             redact("abcd and ab and abcdef", &cp.secrets()),
             "[redacted] and [redacted] and [redacted]ef"
         );
         assert_eq!(excerpt(b"  abcd\n", &cp.secrets()), "[redacted]");
-        let cp = cp.with_token("wxyz", in_an_hour());
+        let cp = cp.with_token("wxyz", in_an_hour(), now);
         assert_eq!(
             cp.secrets(),
             ["abcd", "wxyz"],
@@ -523,7 +535,6 @@ pub(crate) mod tests {
         let body = enrol.json();
         assert_eq!(body["protocol_version"], 1);
         assert_eq!(body["roxy_version"], "0.1.0-test");
-        assert!(body.get("csr").is_none());
         assert_eq!(enrol.header("user-agent"), Some("roxy/0.1.0-test"));
         assert_eq!(mock.tokens_for("node-1"), std::slice::from_ref(&res.token));
 
@@ -561,7 +572,7 @@ pub(crate) mod tests {
         let mock = MockServer::start().await;
         let (cp, _) = enrolled(&mock).await;
         mock.fallback("/roxy/v1/lease", Reply::json(200, &lease("L2")));
-        let forged = cp.with_token("not-issued", in_an_hour());
+        let forged = cp.with_token("not-issued", in_an_hour(), Utc::now());
         assert!(matches!(
             forged.fetch_lease(&state()).await,
             LeaseFetch::Unauthorized
@@ -584,7 +595,12 @@ pub(crate) mod tests {
         mock.push("/roxy/v1/enrol", Reply::status(401));
         assert!(matches!(
             anon.enrol("rejected").await,
-            Err(EnrolError::Rejected(m)) if m.starts_with("401")
+            Err(EnrolError::Unauthorized(m)) if m.starts_with("401")
+        ));
+        mock.push("/roxy/v1/enrol", Reply::status(400));
+        assert!(matches!(
+            anon.enrol("tok").await,
+            Err(EnrolError::Rejected(m)) if m.starts_with("400")
         ));
         mock.push("/roxy/v1/enrol", Reply::status(503));
         assert!(matches!(
@@ -607,7 +623,7 @@ pub(crate) mod tests {
         for body in [
             r#"{"node_id":"n1","token":"has space","not_after":"2026-11-05T10:12:00Z","renew_after_seconds":1}"#,
             r#"{"node_id":"n1","token":"","not_after":"2026-11-05T10:12:00Z","renew_after_seconds":1}"#,
-            r#"{"node_id":"n1","certificate_chain":"-----BEGIN CERTIFICATE-----","not_after":"2026-11-05T10:12:00Z","renew_after_seconds":1}"#,
+            r#"{"node_id":"n1","not_after":"2026-11-05T10:12:00Z","renew_after_seconds":1}"#,
         ] {
             mock.push(
                 "/roxy/v1/enrol",
@@ -777,38 +793,30 @@ pub(crate) mod tests {
         assert!(mock.requests_to("/roxy/v1/enrol").is_empty());
     }
 
-    /// Renewal answers a fresh token; the server keeps accepting the old
-    /// one until its own expiry, so the client may switch at its leisure.
+    /// Renewal is the enrol body under the current node token, and the
+    /// fresh token it answers is what the client presents once switched.
     #[tokio::test]
-    async fn renew_returns_a_fresh_token_and_the_old_one_still_works() {
+    async fn renew_sends_the_enrol_body_under_the_node_token_and_returns_a_fresh_one() {
         let mock = MockServer::start().await;
         let (cp, first) = enrolled(&mock).await;
         mock.push("/roxy/v1/renew", Reply::issue("node-1"));
         let second = cp.renew().await.unwrap();
         let renew = &mock.requests_to("/roxy/v1/renew")[0];
-        assert_eq!(renew.client.as_deref(), Some("node-1"));
+        assert_eq!(
+            renew.header("authorization"),
+            Some(format!("Bearer {}", first.token).as_str())
+        );
         assert_eq!(renew.json()["protocol_version"], 1);
+        assert_eq!(renew.json()["roxy_version"], "0.1.0-test");
         assert_eq!(second.node_id, "node-1");
         assert_ne!(second.token, first.token);
-        assert_eq!(
-            mock.tokens_for("node-1"),
-            [first.token.clone(), second.token.clone()]
-        );
         mock.fallback("/roxy/v1/lease", Reply::json(200, &lease("L2")));
-        assert!(matches!(
-            cp.with_token(&second.token, second.not_after)
-                .fetch_lease(&state())
-                .await,
-            LeaseFetch::Lease(_)
-        ));
-        assert!(matches!(
-            cp.fetch_lease(&state()).await,
-            LeaseFetch::Lease(_)
-        ));
-        assert!(
-            mock.requests_to("/roxy/v1/lease")
-                .iter()
-                .all(|r| r.client.as_deref() == Some("node-1"))
+        cp.with_token(&second.token, second.not_after, Utc::now())
+            .fetch_lease(&state())
+            .await;
+        assert_eq!(
+            mock.requests_to("/roxy/v1/lease")[0].header("authorization"),
+            Some(format!("Bearer {}", second.token).as_str())
         );
     }
 
@@ -837,7 +845,12 @@ pub(crate) mod tests {
         mock.push(path, Reply::status(401));
         assert!(matches!(
             cp.renew().await,
-            Err(EnrolError::Rejected(m)) if m.starts_with("401")
+            Err(EnrolError::Unauthorized(m)) if m.starts_with("401")
+        ));
+        mock.push(path, Reply::status(400));
+        assert!(matches!(
+            cp.renew().await,
+            Err(EnrolError::Rejected(m)) if m.starts_with("400")
         ));
         mock.push(path, Reply::status(503));
         assert!(matches!(cp.renew().await, Err(EnrolError::Failed(_))));
