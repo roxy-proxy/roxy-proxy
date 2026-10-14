@@ -55,8 +55,10 @@ only after layer A has sent it on, and A may hold, rewrite or drop it on
 the way: what B reads is what A passed, in the order A passed it, and the
 rules admit the request the last layer forwarded. The response is the same
 pipeline the other way up: the rules see the upstream's bytes first, then
-B, and A gets a chunk only after B has passed it. This holds for both kinds
-of layer.
+B, and A gets a chunk only after B has passed it. This holds for enforce
+layers of either kind. An observer is in neither order: it reads a copy
+beside the pipeline, holds nothing up, and can neither tag nor write
+state, so the rest of this section is about enforce layers.
 
 Host-service effects are not in that pipeline. `add_tag`, `state_put`,
 `record` and `quarantine` go to the host beside the bytes, not down the
