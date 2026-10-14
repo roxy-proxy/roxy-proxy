@@ -2674,13 +2674,28 @@ async fn a_layer_can_quarantine_the_proxy_if_granted() {
     assert_eq!(errs[0]["kind"], "host");
     assert!(kit.server.handle().quarantine().is_none());
 
-    let kit = one(AddonDef::test_layer("t").caps(&[Capability::Quarantine])).await;
+    // The probe answers without `next`: the refusal is the exchange's
+    // admission decision, with its sample, as it would be above the stack.
+    let kit = Kit::builder()
+        .addon(AddonDef::test_layer("t").caps(&[Capability::Quarantine]))
+        .metric_defs("- { id: by_host, count: requests, key: [host], window: 1h }")
+        .start()
+        .await;
     let a = cap(&kit, "quarantine").await;
     assert_eq!(a.status, 403, "{a:?}");
     assert_eq!(a.headers["x-roxy-rule"], "_quarantined");
     let tripped = kit.events("quarantined", 1).await.remove(0);
     assert_eq!(tripped["cause"]["kind"], "layer", "{tripped:#}");
     assert_eq!(tripped["cause"]["layer"], "t", "{tripped:#}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "_quarantined", "{ev:#}");
+    assert_eq!(ev["stage"], "head", "{ev:#}");
+    {
+        let samples = kit.samples.lock().unwrap();
+        let admission: Vec<_> = samples.iter().filter(|s| s.admission).collect();
+        assert_eq!(admission.len(), 1, "{samples:?}");
+        assert!(admission[0].denied, "{samples:?}");
+    }
     let a = kit.h1().await.call("GET", "/x", &[], b"").await;
     assert_eq!(a.status, 403, "every exchange after it: {a:?}");
 }

@@ -403,7 +403,7 @@ pub(crate) async fn process<F: Front>(
     if let Some(refusal) = cx.expiry_refusal() {
         return (cx, Outcome::Refuse(refusal));
     }
-    let (cx, outcome) = if cx.snap.addons.is_empty() {
+    let (mut cx, outcome) = if cx.snap.addons.is_empty() {
         let outcome = core(front, &mut cx, req).await;
         (cx, outcome)
     } else {

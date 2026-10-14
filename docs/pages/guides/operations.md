@@ -138,9 +138,9 @@ Three things trip it:
   timeouts (`header_timeout`, `body_timeout`, `tunnel_timeout`,
   `tls_handshake_timeout`, `h2_handshake_timeout`), a client that left
   (`unexpected_eof`, `io_error`) or that ended the TLS handshake with an
-  alert (`tls_alert_received`: one that does not trust roxy's CA), and
-  roxy's own failures (`connect_write_failed`, `leaf_mint_failed`,
-  `invalid_state`). Off unless
+  alert of its own (`tls_alert_received`, as a client that does not trust
+  roxy's CA does), and roxy's own failures (`connect_write_failed`,
+  `leaf_mint_failed`, `invalid_state`). Off unless
   set; set it on a sandbox's listener, not a gateway's, where one client
   would shut the proxy for every other.
 

@@ -741,22 +741,32 @@ impl FlowCx {
     /// quarantine outlives any policy.
     pub(crate) fn quarantine_refusal(&mut self) -> Option<Refusal> {
         let refusal = self.quarantined()?;
-        self.record.stage = Some(Stage::Head);
-        if let Err(e) = self.record_admission_sample(true) {
-            self.meta.metric_error(Stage::Head, &e);
-        }
+        self.refused_at_admission();
         Some(refusal)
     }
 
     /// The same refusal for an exchange that has been through the addon
-    /// stack: its admission decision, sample and stage included, is already
-    /// recorded and stands.
-    pub(crate) fn late_quarantine_refusal(&self) -> Option<Refusal> {
-        self.quarantined()
+    /// stack. An admission decision the rules made stands, sample and stage
+    /// included; a stack that answered without `next` left none, and the
+    /// refusal is then the exchange's decision, as above the stack.
+    pub(crate) fn late_quarantine_refusal(&mut self) -> Option<Refusal> {
+        let refusal = self.quarantined()?;
+        if self.record.stage.is_none() {
+            self.refused_at_admission();
+        }
+        Some(refusal)
     }
 
     fn quarantined(&self) -> Option<Refusal> {
         self.shared.quarantined().then(Refusal::quarantined)
+    }
+
+    /// Records a refusal made in place of the admission decision.
+    fn refused_at_admission(&mut self) {
+        self.record.stage = Some(Stage::Head);
+        if let Err(e) = self.record_admission_sample(true) {
+            self.meta.metric_error(Stage::Head, &e);
+        }
     }
 
     /// A matched `quarantine` action puts the process into quarantine,
