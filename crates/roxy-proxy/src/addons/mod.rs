@@ -597,7 +597,7 @@ impl StackFlow {
 fn error_kind(e: &StackError) -> String {
     let e = match e {
         StackError::Layer(e) | StackError::Service(ServiceError::Layer { err: e, .. }) => e,
-        StackError::Service(e) => return e.kind().to_owned(),
+        StackError::Service(e) => return e.kind(),
         StackError::Condition { code, .. } => return format!("when:{code}"),
     };
     match e {

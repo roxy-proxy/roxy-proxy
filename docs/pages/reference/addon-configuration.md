@@ -170,7 +170,14 @@ the framing roxy knows.
 - A layer that passes on bytes of a body it is not subscribed to fails the
   exchange closed: a `503` before the response head, a cut body after it,
   `layer_error` with `kind: unsubscribed:request` or
-  `unsubscribed:response`.
+  `unsubscribed:response`. The bypassed body keeps its framing when the
+  layer's own body for that direction is complete as the two are joined,
+  which is always for a service layer (its head-only direction is a head
+  and an end with nothing between) and for a WASM layer when `next` is
+  given an empty `bytes` body; joined to one still open (a WASM layer's
+  streamed `next` body, or any WASM response body, whose end waits for the
+  handler) it goes out without a `content-length`, chunked on HTTP/1.1, so
+  a cut is visible however the bytes interleave.
 - A head-only observer gets copies of the heads and no copy of the body,
   so neither the lag budget nor the buffer budget is touched for it.
 - The rules are not affected: they judge the request that leaves the

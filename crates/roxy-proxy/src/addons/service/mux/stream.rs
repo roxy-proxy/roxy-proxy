@@ -9,7 +9,7 @@ use roxy_wasm::LayerResponse;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use super::super::super::{AddonMode, StackError, StackFlow};
+use super::super::super::{AddonMode, Part, StackError, StackFlow};
 use super::super::{First, In, Out, ServiceError, ServiceSpec, Unanswered};
 use super::inbox::{Inbox, feeder};
 use super::link::{Link, Message, Queued, Wire, binary, dial, text};
@@ -88,6 +88,9 @@ struct Lane {
     window: Window,
     /// Being fed from the stream: its head arrived and its end has not.
     inbox: Option<Arc<Inbox>>,
+    /// A head-only direction whose head arrived and whose end has not:
+    /// nothing is fed, and the end is still the service's to send.
+    end_owed: bool,
 }
 
 /// What `settle` found when the stream ended: who was waiting on it.
@@ -132,6 +135,8 @@ impl StreamState {
         !matches!(self.phase, Phase::Answered)
             || self.req.inbox.is_some()
             || self.res.inbox.is_some()
+            || self.req.end_owed
+            || self.res.end_owed
     }
 
     /// Ends the stream, once: what was pending goes to the caller to be
@@ -414,9 +419,14 @@ impl Stream {
     /// Bytes of the `dir` body from the service. They count against that
     /// body's window in either mode. An observe stream's are discarded and
     /// credited back as they go: the service never waits on what it sends.
+    /// An enforce stream's for a head-only direction are the layer's
+    /// failure, whenever they come.
     pub(super) fn bytes(self: &Arc<Self>, dir: Dir, b: &[u8]) {
         if b.is_empty() {
             return;
+        }
+        if self.mode == AddonMode::Enforce && self.head_only(dir) {
+            return self.fail(ServiceError::Unsubscribed(dir.as_str()), Reset::Send);
         }
         let n = b.len() as u64;
         let mut s = lock(&self.state);
@@ -511,10 +521,15 @@ impl Stream {
                 } else {
                     (Dir::Response, "response_end")
                 };
-                match s.lane(dir).inbox.take() {
+                let lane = s.lane(dir);
+                match lane.inbox.take() {
                     Some(inbox) => {
                         lock(&inbox.q).end = true;
                         inbox.ready.notify_one();
+                        Ok(())
+                    }
+                    None if lane.end_owed => {
+                        lane.end_owed = false;
                         Ok(())
                     }
                     None => Err(ServiceError::Protocol(format!("unexpected {what}"))),
@@ -542,12 +557,12 @@ impl Stream {
                 } else {
                     limits.max_request_body_bytes
                 };
-                let (body_tx, body) = Body::channel(cap, declared);
+                let (body_tx, body) = self.own_body(Dir::Request, cap, declared);
                 let mut r = http::Request::new(body);
                 *r.method_mut() = method;
                 *r.uri_mut() = uri;
                 *r.headers_mut() = headers;
-                s.req.inbox = Some(self.feed(body_tx, Dir::Request));
+                self.expect_body(s, Dir::Request, body_tx);
                 let _ = first.send(Ok(First::Forward(r)));
                 Ok(())
             }
@@ -568,12 +583,13 @@ impl Stream {
                 } else {
                     limits.max_response_body_bytes
                 };
-                let (body_tx, body) = Body::channel(cap, super::super::declared_length(&headers)?);
+                let declared = super::super::declared_length(&headers)?;
+                let (body_tx, body) = self.own_body(Dir::Response, cap, declared);
                 let mut r = http::Response::new(body);
                 *r.status_mut() = status;
                 *r.headers_mut() = headers;
                 s.answered(r, "response")?;
-                s.res.inbox = Some(self.feed(body_tx, Dir::Response));
+                self.expect_body(s, Dir::Response, body_tx);
                 Ok(())
             }
             // Handled by `control`.
@@ -635,6 +651,34 @@ impl Stream {
                     return self.fail(ServiceError::Layer { call: id, err }, Reset::Send);
                 }
             }
+        }
+    }
+
+    /// Whether the layer is subscribed to the head of `dir` only: that
+    /// body is a head and an end on the stream, with no bytes between.
+    fn head_only(&self, dir: Dir) -> bool {
+        self.st.snap.addons[self.index].subscribe.part(dir) == Part::Head
+    }
+
+    /// The body of a head the service sent in direction `dir`. For a
+    /// head-only direction it is complete with the head, so the body
+    /// bypassing the layer keeps its framing when spliced onto it; the
+    /// service's end for it is owed, and its bytes refused, on the stream.
+    fn own_body(&self, dir: Dir, cap: u64, declared: Option<u64>) -> (Option<BodySender>, Body) {
+        if self.head_only(dir) {
+            return (None, Body::empty());
+        }
+        let (tx, body) = Body::channel(cap, declared);
+        (Some(tx), body)
+    }
+
+    /// What the service still owes of the `dir` body whose head it sent:
+    /// the bytes and the end, fed through `tx`, or the end alone.
+    fn expect_body(self: &Arc<Self>, s: &mut StreamState, dir: Dir, tx: Option<BodySender>) {
+        let lane = s.lane(dir);
+        match tx {
+            Some(tx) => lane.inbox = Some(self.feed(tx, dir)),
+            None => lane.end_owed = true,
         }
     }
 

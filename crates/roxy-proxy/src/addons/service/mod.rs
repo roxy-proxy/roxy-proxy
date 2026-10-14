@@ -83,6 +83,10 @@ pub enum ServiceError {
     /// mid-exchange.
     #[error("service stream lost: {0}")]
     Closed(String),
+    /// The service sent bytes of a body it is subscribed to the head of
+    /// only.
+    #[error("service sent bytes of the {0} body it is not subscribed to")]
+    Unsubscribed(&'static str),
     /// Host-service call `call` failed, or called a service the layer was
     /// not granted: the same failures a WASM layer's host calls have, with
     /// the same flow-log kinds.
@@ -110,14 +114,15 @@ pub(super) enum Unanswered {
 
 impl ServiceError {
     /// A stable code for the flow log (`layer_error.kind`).
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> String {
         match self {
-            ServiceError::Connect(_) => "service:connect",
-            ServiceError::Timeout(_) => "service:timeout",
-            ServiceError::Protocol(_) => "service:protocol",
-            ServiceError::Closed(_) => "service:closed",
+            ServiceError::Connect(_) => "service:connect".into(),
+            ServiceError::Timeout(_) => "service:timeout".into(),
+            ServiceError::Protocol(_) => "service:protocol".into(),
+            ServiceError::Closed(_) => "service:closed".into(),
+            ServiceError::Unsubscribed(dir) => format!("unsubscribed:{dir}"),
             // Reported under the layer error's own kind (`error_kind`).
-            ServiceError::Layer { .. } => "host",
+            ServiceError::Layer { .. } => "host".into(),
         }
     }
 }

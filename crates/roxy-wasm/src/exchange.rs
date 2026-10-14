@@ -408,7 +408,11 @@ impl HttpBody for FromGuest {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.finished
+        // An end that is not held is reached once the inner's is: an empty
+        // `next` body is then complete before its first poll, and the body
+        // bypassing the layer keeps its framing rather than being spliced
+        // onto an own body still counted as open.
+        self.finished || (!self.hold_end && self.inner.is_end_stream())
     }
 }
 
