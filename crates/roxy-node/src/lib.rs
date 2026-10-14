@@ -3,10 +3,10 @@
 //! `roxy` binary applies what the node fetches.
 
 pub mod client;
-pub mod identity;
 pub mod node;
 pub mod protocol;
 pub mod spool;
 pub use roxy_state as state;
 #[cfg(any(test, feature = "testkit"))]
 pub mod testkit;
+pub mod token;

@@ -1,9 +1,9 @@
-//! The state dir: the node certificate and key, the flow sequence counter,
-//! the interception CA's directory and the quarantine marker. Nothing else
-//! is ever written here; secrets and the rendered config stay in memory.
-//! A roxy run from a config file uses the same layout for the marker alone.
+//! The state dir: the node token, the flow sequence counter, the
+//! interception CA's directory and the quarantine marker. Nothing else is
+//! ever written here; secrets and the rendered config stay in memory. A
+//! roxy run from a config file uses the same layout for the marker alone.
 //!
-//! Every file this dir replaces (identity, flow sequence, marker) goes
+//! Every file this dir replaces (token, flow sequence, marker) goes
 //! through [`write_atomic`], the one place that knows how to replace a file
 //! so that a crash at any point leaves either the old file or the new one,
 //! with the mode asked for. The CA dir's files are created once and never
@@ -13,10 +13,8 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// The node certificate chain, PEM.
-pub const CERT_FILE: &str = "node.crt";
-/// The node's PKCS#8 key, PEM, mode 0600.
-pub const KEY_FILE: &str = "node.key";
+/// The node token record, mode 0600.
+pub const TOKEN_FILE: &str = "node.token";
 /// The flow `seq` counter: the highest value reserved so far.
 pub const SEQ_FILE: &str = "flow.seq";
 /// Where the interception CA lives (`tls.ca_dir`).
@@ -33,29 +31,8 @@ pub enum StateError {
         #[source]
         source: io::Error,
     },
-    #[error("state dir {} has {present} but not {missing}; remove it to enrol again", dir.display())]
-    Incomplete {
-        dir: PathBuf,
-        present: &'static str,
-        missing: &'static str,
-    },
     #[error("{}: not a flow sequence number: {text:?}", path.display())]
     BadSeq { path: PathBuf, text: String },
-}
-
-/// A certificate and key read from the state dir.
-#[derive(Clone)]
-pub struct StoredIdentity {
-    pub cert_pem: String,
-    pub key_pem: String,
-}
-
-impl std::fmt::Debug for StoredIdentity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StoredIdentity")
-            .field("cert_pem", &self.cert_pem)
-            .finish_non_exhaustive()
-    }
 }
 
 /// The node's state directory.
@@ -103,38 +80,14 @@ impl StateDir {
         self.root.join(name)
     }
 
-    /// The stored identity: `None` before enrolment. Exactly one of the two
-    /// files present is an error, never a reason to enrol again.
-    pub fn identity(&self) -> Result<Option<StoredIdentity>, StateError> {
-        let cert = self.read_opt(CERT_FILE)?;
-        let key = self.read_opt(KEY_FILE)?;
-        match (cert, key) {
-            (Some(cert_pem), Some(key_pem)) => Ok(Some(StoredIdentity { cert_pem, key_pem })),
-            (None, None) => Ok(None),
-            (Some(_), None) => Err(StateError::Incomplete {
-                dir: self.root.clone(),
-                present: CERT_FILE,
-                missing: KEY_FILE,
-            }),
-            (None, Some(_)) => Err(StateError::Incomplete {
-                dir: self.root.clone(),
-                present: KEY_FILE,
-                missing: CERT_FILE,
-            }),
-        }
+    /// The stored node token record, as written: `None` before enrolment.
+    pub fn node_token(&self) -> Result<Option<String>, StateError> {
+        self.read_opt(TOKEN_FILE)
     }
 
-    /// Writes the key (0600) and then the certificate, so an interrupted
-    /// enrolment leaves a key without a certificate, which `identity`
-    /// reports rather than treating as unenrolled.
-    pub fn store_identity(&self, cert_pem: &str, key_pem: &str) -> Result<(), StateError> {
-        self.write(KEY_FILE, key_pem.as_bytes(), 0o600)?;
-        self.write(CERT_FILE, cert_pem.as_bytes(), 0o644)
-    }
-
-    /// Replaces the certificate after a renewal; the key stays.
-    pub fn store_cert(&self, cert_pem: &str) -> Result<(), StateError> {
-        self.write(CERT_FILE, cert_pem.as_bytes(), 0o644)
+    /// Writes the node token record, readable by the owner alone.
+    pub fn store_node_token(&self, record: &str) -> Result<(), StateError> {
+        self.write(TOKEN_FILE, record.as_bytes(), 0o600)
     }
 
     /// The highest flow `seq` reserved so far; 0 before any was.
@@ -227,48 +180,23 @@ mod tests {
     }
 
     #[test]
-    fn identity_is_stored_with_a_private_key_and_read_back() {
+    fn the_node_token_is_stored_privately_and_read_back() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("state");
         let state = StateDir::open(&root).unwrap();
-        assert!(state.identity().unwrap().is_none());
-        state.store_identity("CERT", "KEY").unwrap();
-        let id = state.identity().unwrap().unwrap();
-        assert_eq!((id.cert_pem.as_str(), id.key_pem.as_str()), ("CERT", "KEY"));
+        assert!(state.node_token().unwrap().is_none());
+        state.store_node_token("TOKEN").unwrap();
+        assert_eq!(state.node_token().unwrap().as_deref(), Some("TOKEN"));
         #[cfg(unix)]
         {
             assert_eq!(mode(&root), 0o700);
-            assert_eq!(mode(&root.join(KEY_FILE)), 0o600);
+            assert_eq!(mode(&root.join(TOKEN_FILE)), 0o600);
         }
-        assert!(!format!("{id:?}").contains("KEY"), "{id:?}");
-        state.store_cert("CERT2").unwrap();
-        assert_eq!(state.identity().unwrap().unwrap().cert_pem, "CERT2");
+        state.store_node_token("TOKEN2").unwrap();
+        assert_eq!(state.node_token().unwrap().as_deref(), Some("TOKEN2"));
+        #[cfg(unix)]
+        assert_eq!(mode(&root.join(TOKEN_FILE)), 0o600);
         assert_eq!(state.ca_dir(), root.join("ca"));
-    }
-
-    #[test]
-    fn a_half_written_identity_is_an_error_not_a_fresh_start() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = StateDir::open(dir.path()).unwrap();
-        std::fs::write(dir.path().join(KEY_FILE), "KEY").unwrap();
-        let err = state.identity().unwrap_err();
-        assert!(matches!(
-            err,
-            StateError::Incomplete {
-                present: KEY_FILE,
-                missing: CERT_FILE,
-                ..
-            }
-        ));
-        std::fs::remove_file(dir.path().join(KEY_FILE)).unwrap();
-        std::fs::write(dir.path().join(CERT_FILE), "CERT").unwrap();
-        assert!(matches!(
-            state.identity(),
-            Err(StateError::Incomplete {
-                present: CERT_FILE,
-                ..
-            })
-        ));
     }
 
     #[test]
@@ -287,12 +215,12 @@ mod tests {
     fn a_reused_temporary_is_made_private_before_it_is_written() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("node.key");
+        let path = dir.path().join("node.token");
         let tmp = temp_path(&path);
         std::fs::write(&tmp, "stale").unwrap();
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_atomic(&path, b"KEY", 0o600).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"KEY");
+        write_atomic(&path, b"TOKEN", 0o600).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"TOKEN");
         assert_eq!(mode(&path), 0o600);
         assert!(!tmp.exists());
     }

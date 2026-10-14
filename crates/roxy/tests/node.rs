@@ -12,6 +12,7 @@ use roxy::node::{Bootstrap, NodeOptions, NodeRunning};
 use roxy_node::node::NodeError;
 use roxy_node::protocol::{FlowAck, FlowSettings, Lease, OnHighWater, PolicyState};
 use roxy_node::testkit::{MockServer, Reply};
+use roxy_node::token::NodeToken;
 use roxy_proxy::MemorySink;
 use serde_json::Value;
 use support::{SECRET, TestCa, Upstream, start_upstream, test_ca};
@@ -48,7 +49,7 @@ impl NodeHarness {
         std::fs::write(dir.path().join("upstream-ca.pem"), &test_ca.pem).unwrap();
         std::fs::write(dir.path().join("token"), SECRET).unwrap();
         std::fs::write(dir.path().join("enrol-token"), "tok-1\n").unwrap();
-        std::fs::write(dir.path().join("cp-ca.pem"), &mock.ca.pem).unwrap();
+        std::fs::write(dir.path().join("cp-ca.pem"), &mock.trust_pem).unwrap();
         let upstream = start_upstream(&test_ca);
         mock.push(ENROL, Reply::issue("n1"));
         mock.fallback(
@@ -238,6 +239,20 @@ fn rule(id: &str, when: &str, then: &str) -> String {
 
 const ALLOW: &str = "{ allow: { private_ok: true } }";
 
+/// The node token in the state dir, checked to be readable by roxy alone.
+fn stored_token(h: &NodeHarness) -> NodeToken {
+    let path = h.state_dir().join("node.token");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the token is readable by roxy alone");
+    }
+    let stored = NodeToken::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(stored.node_id, "n1");
+    stored
+}
+
 fn files_in(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
@@ -333,21 +348,24 @@ async fn a_node_denies_until_its_first_lease_then_serves_it_and_ships_flows() {
         .any(|e| e["event"] == "request" && e["terminal_rule"] == "_default");
     assert!(early_denied, "the local flow log keeps every event too");
 
-    // Nothing but the identity, the counter and the CA touch the disk.
-    assert_eq!(
-        files_in(&h.state_dir()),
-        ["ca", "flow.seq", "node.crt", "node.key"]
-    );
+    // Nothing but the token, the counter and the CA touch the disk.
+    assert_eq!(files_in(&h.state_dir()), ["ca", "flow.seq", "node.token"]);
     assert_eq!(
         files_in(&h.state_dir().join("ca")),
         ["roxy-ca.key", "roxy-ca.pem"]
     );
-    let state_text = std::fs::read_to_string(h.state_dir().join("node.crt")).unwrap();
-    assert!(!state_text.contains(SECRET));
+    let stored = stored_token(&h);
+    assert_eq!(h.mock.tokens_for("n1"), std::slice::from_ref(&stored.token));
+    assert!(!stored.record().contains(SECRET));
+    // The token goes to the control plane and nowhere else: not into the
+    // local flow log.
+    let local = serde_json::to_string(&h.sink.events()).unwrap();
+    assert!(!local.contains(&stored.token));
+    assert!(!local.contains("tok-1"));
 
     h.stop().await;
 
-    // A second start finds the identity and goes straight to the lease.
+    // A second start finds the token and goes straight to the lease.
     h.mock.fallback(
         LEASE,
         Reply::json(200, &NodeHarness::lease("L2", &config, "s1", "e1")),
@@ -558,7 +576,7 @@ async fn a_node_that_cannot_enrol_reports_the_failure() {
     let mut running = h.running.take().unwrap();
     let err = tokio::time::timeout(Duration::from_secs(5), running.failed())
         .await
-        .expect("no identity and no token is fatal");
+        .expect("no node token and no enrolment token is fatal");
     assert!(matches!(err, NodeError::NotEnrolled { .. }), "{err}");
     assert_eq!(
         h.get(h.bootstrap_proxy, "/x").await,

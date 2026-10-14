@@ -2992,7 +2992,6 @@ dependencies = [
 name = "roxy-node"
 version = "0.1.1"
 dependencies = [
- "base64 0.23.1",
  "bytes",
  "chrono",
  "flate2",
@@ -3007,16 +3006,14 @@ dependencies = [
  "roxy-node-spec",
  "roxy-state",
  "rustls",
- "rustls-pki-types",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
- "time",
  "tokio",
  "tokio-rustls",
  "tracing",
- "x509-parser",
+ "tracing-subscriber",
 ]
 
 [[package]]

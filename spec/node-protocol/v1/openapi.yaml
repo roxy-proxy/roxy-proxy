@@ -4,12 +4,13 @@ info:
   version: "1"
   summary: The contract between a roxy node and its control plane.
   description: |
-    Enrolment authenticates with a bearer token; every other operation
-    authenticates with the node certificate (mutual TLS). The
-    listener must accept connections without a client certificate so that
-    enrolment can happen, and answer every other operation that arrives
-    without one with `401`. Unknown fields in any body are ignored by both
-    sides. The prose explanation is `docs/pages/reference/node-protocol.md`.
+    Enrolment authenticates with the bootstrap token as a bearer; every
+    other operation authenticates with the node token the enrolment issued,
+    also as a bearer. Both travel only inside the server's TLS; the node
+    presents no client certificate. A request to any operation but
+    enrolment whose token the server does not recognise is answered `401`.
+    Unknown fields in any body are ignored by both sides. The prose
+    explanation is `docs/pages/reference/node-protocol.md`.
   license:
     name: MIT OR Apache-2.0
 servers:
@@ -20,22 +21,22 @@ servers:
         description: Host and port from the node's bootstrap material.
 
 security:
-  - nodeCertificate: []
+  - nodeToken: []
 
 paths:
   /enrol:
     post:
       operationId: enrol
-      summary: Exchange an enrolment token for a node certificate.
+      summary: Exchange an enrolment token for a node token.
       description: |
-        The CSR's signature proves the node holds the key. The server takes
-        the public key, ignores the CSR's subject and extensions, and issues a
-        certificate whose only SAN is the URI `urn:roxy:node:<node_id>`. The
-        token authorises enrolment; its lifetime and reuse policy (single-use,
-        time-limited, shared across an autoscaling group) are the server's to
-        set, and single-use with a short expiry is the recommended default.
-        The node infers nothing from a `200` beyond the certificate it was
-        issued.
+        The server chooses the node id and mints the node token: an opaque
+        string the node stores and presents unchanged. The enrolment token
+        authorises enrolment; its lifetime and reuse policy (single-use,
+        time-limited, shared across an autoscaling group) are the server's
+        to set, and single-use with a short expiry is the recommended
+        default. So are the node token's lifetime and how it is stored
+        (hashed at rest is the recommended default). The node infers
+        nothing from a `200` beyond the token it was issued.
       security:
         - enrolmentToken: []
       requestBody:
@@ -65,13 +66,16 @@ paths:
   /renew:
     post:
       operationId: renew
-      summary: Replace the node certificate before it expires.
+      summary: Replace the node token before it expires.
       description: |
-        Same body and response as enrolment; `node_id` is unchanged. The old
-        certificate stays valid until its own `not_after`. A `5xx` or
-        transport failure is retried with backoff; `410` is terminal; any
-        other `4xx` ends renewal. If the certificate expires first the node
-        exits: an expired certificate needs re-enrolment, an operator action.
+        Same body and response as enrolment, under the current node token;
+        `node_id` is unchanged and `token` is fresh. The server keeps
+        accepting the old token until its own `not_after`, so a renewal
+        that has reached one replica but not another cannot lock the node
+        out; the node switches on receipt. A `5xx` or transport failure is
+        retried with backoff; `410` is terminal; any other `4xx` ends
+        renewal. If the token expires first the node exits: an expired
+        token needs re-enrolment, an operator action.
       requestBody:
         $ref: "#/components/requestBodies/EnrolRequest"
       responses:
@@ -158,7 +162,7 @@ paths:
                 $ref: "#/components/schemas/FlowAck"
         "400":
           description: |
-            Malformed, `node_id` does not match the certificate (`node_mismatch`),
+            Malformed, `node_id` does not match the token's (`node_mismatch`),
             `lease_id` was never issued to this node, or events are not
             consecutive from `seq_first`. The node logs it apart from an
             unavailable server and retries the batch like any other failure:
@@ -190,12 +194,12 @@ components:
       type: http
       scheme: bearer
       description: The enrolment token from the node's bootstrap material.
-    nodeCertificate:
-      type: mutualTLS
+    nodeToken:
+      type: http
+      scheme: bearer
       description: |
-        The node certificate issued at enrolment, whose URI SAN
-        `urn:roxy:node:<node_id>` names the node. The node presents the whole
-        chain from the enrolment response.
+        The node token from the enrolment or latest renewal response, which
+        names the node on the server's side. Presented unchanged.
 
   requestBodies:
     EnrolRequest:
@@ -207,7 +211,7 @@ components:
 
   responses:
     Enrolled:
-      description: A certificate for the node.
+      description: A node token.
       content:
         application/json:
           schema:
@@ -225,13 +229,10 @@ components:
             $ref: "#/components/schemas/Error"
     Unrecognised:
       description: |
-        No client certificate, or one that does not map to a known node. The
-        node logs once per outcome change and lets its lease run down. It
-        never re-enrols on its own: re-enrolment is an operator action (a new
-        token and an empty state dir). A TLS handshake the server rejects
-        because of the client certificate is not a `401`: the node cannot
-        tell it from any other handshake failure and retries it as a
-        transport error.
+        No node token, or one the server does not recognise: never issued,
+        expired, or forgotten. The node logs once per outcome change and
+        lets its lease run down. It never re-enrols on its own: re-enrolment
+        is an operator action (a new token and an empty state dir).
       content:
         application/json:
           schema:
@@ -285,12 +286,8 @@ components:
     EnrolRequest:
       type: object
       description: Body of enrol and renew.
-      required: [csr, roxy_version, protocol_version]
+      required: [roxy_version, protocol_version]
       properties:
-        csr:
-          type: string
-          description: PEM `CERTIFICATE REQUEST` for an ECDSA P-256 or Ed25519 key, signed by that key.
-          pattern: "^-----BEGIN CERTIFICATE REQUEST-----[\\s\\S]+-----END CERTIFICATE REQUEST-----\\s*$"
         roxy_version:
           type: string
           minLength: 1
@@ -298,28 +295,33 @@ components:
           type: integer
           const: 1
 
+    NodeToken:
+      type: string
+      pattern: "^[A-Za-z0-9\\-._~+/]+=*$"
+      maxLength: 512
+      description: |
+        Opaque to the node: 1 to 512 bytes of RFC 6750 `b64token` text
+        (`A-Z a-z 0-9 - . _ ~ + /`, then any number of `=`), so every
+        `Authorization: Bearer` parser between node and server carries it
+        unchanged. The server decides its lifetime and how it is stored.
+
     EnrolResponse:
       type: object
       description: "`200` body of enrol and renew."
-      required: [node_id, certificate_chain, not_after, renew_after_seconds]
+      required: [node_id, token, not_after, renew_after_seconds]
       properties:
         node_id:
           $ref: "#/components/schemas/NodeId"
-        certificate_chain:
-          type: string
-          description: |
-            PEM: the node certificate first, then intermediates up to but not
-            including the root. The node certificate's only SAN is the URI
-            `urn:roxy:node:<node_id>`.
-          pattern: "^-----BEGIN CERTIFICATE-----[\\s\\S]+-----END CERTIFICATE-----\\s*$"
+        token:
+          $ref: "#/components/schemas/NodeToken"
         not_after:
           type: string
           format: date-time
-          description: The certificate's expiry, RFC 3339 in UTC, as in the certificate.
+          description: When the server stops accepting the token, RFC 3339 in UTC.
         renew_after_seconds:
           type: integer
           minimum: 1
-          description: Seconds after receipt at which the node renews. Well inside the certificate lifetime.
+          description: Seconds after receipt at which the node renews. Well inside the token lifetime.
 
     NodeState:
       type: object

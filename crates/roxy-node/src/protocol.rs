@@ -25,23 +25,34 @@ pub struct ErrorBody {
 
 /// `POST /roxy/v1/enrol` and `POST /roxy/v1/renew` body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CertificateRequest {
-    /// PEM `CERTIFICATE REQUEST`; the key never leaves the node.
-    pub csr: String,
+pub struct EnrolRequest {
     pub roxy_version: String,
     pub protocol_version: u32,
 }
 
 /// Enrol and renew response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CertificateResponse {
+#[derive(Clone, Serialize, Deserialize)]
+pub struct EnrolResponse {
     pub node_id: String,
-    /// PEM: the node certificate first, then any intermediates.
-    pub certificate_chain: String,
+    /// The node token: opaque, 1 to 512 bytes of printable ASCII, sent as
+    /// `Authorization: Bearer` on every later request.
+    pub token: String,
+    /// When the server stops accepting the token.
     pub not_after: DateTime<Utc>,
     /// Seconds after receipt at which the node renews. Relative, so clock
     /// skew between node and server cannot move the renewal.
     pub renew_after_seconds: u64,
+}
+
+/// Never prints the token.
+impl std::fmt::Debug for EnrolResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnrolResponse")
+            .field("node_id", &self.node_id)
+            .field("not_after", &self.not_after)
+            .field("renew_after_seconds", &self.renew_after_seconds)
+            .finish_non_exhaustive()
+    }
 }
 
 /// `POST /roxy/v1/lease` body: what the node is running.
@@ -255,6 +266,18 @@ mod tests {
         )
         .unwrap();
         assert!(!state.seq_unreserved);
+    }
+
+    #[test]
+    fn an_enrol_response_never_debug_prints_its_token() {
+        let res: EnrolResponse = serde_json::from_str(
+            r#"{"node_id":"n1","token":"hunter2","not_after":"2026-11-05T10:12:00Z","renew_after_seconds":1}"#,
+        )
+        .unwrap();
+        let text = format!("{res:?}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("node_id: \"n1\""));
+        assert_eq!(res.token, "hunter2");
     }
 
     #[test]

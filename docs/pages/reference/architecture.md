@@ -21,7 +21,7 @@ I/O and are unit-tested and fuzzed directly.
 | `roxy-log` | Buffered single-writer log destinations: one writer thread, batching, backpressure, rotation, compression. Knows bytes, not events. |
 | `roxy-addon` | SDK for Rust addon authors: generated WIT bindings and wrappers. |
 | `roxy-node` | Node side of the control-plane protocol: enrolment and renewal, lease loop, flow spool and shipper. Knows nothing of the proxy; `roxy` applies leases through a handler. |
-| `roxy-state` | The state dir: its layout (node identity, flow sequence, CA dir, quarantine marker) and the atomic writer the files it replaces (identity, flow sequence, marker) go through. The CA dir's files are created once, never replaced, by `roxy-tls`. |
+| `roxy-state` | The state dir: its layout (node token, flow sequence, CA dir, quarantine marker) and the atomic writer the files it replaces (token, flow sequence, marker) go through. The CA dir's files are created once, never replaced, by `roxy-tls`. |
 | `roxy-node-spec` | The node protocol's OpenAPI document (`spec/node-protocol/v1/openapi.yaml`) with validators for its body schemas, for tests. |
 | `wit/` | The `roxy:addon` WIT package: the language-agnostic addon contract. |
 

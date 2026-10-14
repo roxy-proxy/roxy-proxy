@@ -734,9 +734,9 @@ impl NodeRunning {
     }
 
     /// Resolves when the node task ends with an error it cannot retry
-    /// past (no identity and no token, a token the control plane will not
-    /// accept, ...). A node that ends by revocation keeps serving its
-    /// denials and health, so this never resolves for it.
+    /// past (no node token and no enrolment token, a token the control
+    /// plane will not accept, ...). A node that ends by revocation keeps
+    /// serving its denials and health, so this never resolves for it.
     pub async fn failed(&mut self) -> NodeError {
         if let Some(task) = self.task.as_mut() {
             let result = task.await;
@@ -777,7 +777,7 @@ impl NodeRunning {
 }
 
 /// Starts node mode: the bootstrap listeners first, then the node task,
-/// which enrols (or loads the identity) and fetches leases.
+/// which enrols (or loads the node token) and fetches leases.
 pub async fn start(opts: NodeOptions) -> anyhow::Result<NodeRunning> {
     roxy_tls::install_crypto_provider();
     let state_dir = StateDir::open(&opts.state_dir)?;
