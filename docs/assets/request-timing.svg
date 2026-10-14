@@ -120,7 +120,7 @@
     <text x="600" y="168">allow · deny · change the request</text>
     <text x="600" y="228">in flight, as bytes stream past:</text>
     <text x="600" y="240">body.bytes · byte metrics</text>
-    <text x="600" y="252">deny or quarantine only</text>
+    <text x="600" y="252">deny or quarantine; never allow</text>
   </g>
 
   <!-- a tag or state write after the admission decision -->
