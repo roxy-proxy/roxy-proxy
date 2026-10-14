@@ -158,11 +158,13 @@ pub trait LayerHost: Send + Sync + 'static {
     /// The current flow. Always available.
     fn flow_info(&self) -> FlowInfo;
 
-    /// Add a tag to the flow's log record. Needs no capability, but only
-    /// an enforcing layer may tag: `Err` from an observer fails its
-    /// exchange closed, as a call without its capability would. The host
-    /// caps a flow's tags, in number and in bytes; [`TagError::Full`] fails
-    /// the exchange with [`crate::Budget::Tags`].
+    /// Tag the flow: for the rules' `tag[..]` and the layers' `when` that
+    /// run after this call, for `flow_info`, and for the flow log. Needs no
+    /// capability, but only an enforcing layer may tag: `Err` from an
+    /// observer fails its exchange closed, as a call without its capability
+    /// would. The host caps a flow's tags, in number and in bytes, the
+    /// rules' tags counted; [`TagError::Full`] fails the exchange with
+    /// [`crate::Budget::Tags`].
     fn add_tag(&self, tag: String) -> Result<(), TagError>;
 
     /// Write to the operational log (capability `log`).
