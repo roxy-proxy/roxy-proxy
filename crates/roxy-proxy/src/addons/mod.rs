@@ -172,10 +172,10 @@ pub struct EndpointSpec {
     pub private: PrivateAddrs,
 }
 
-/// Most tags a flow holds, and most bytes of them together. Tags are
-/// labels for the rules' `tag[..]`, the layers' `when` and the flow log;
-/// the host keeps them outside any layer's `max_memory`, so a guest cannot
-/// grow them without end.
+/// Most tags a flow may hold when a layer adds one, and most bytes of
+/// them together; the rules' tags count towards it, though a rule's own
+/// `tag` is never refused. The host keeps the tags outside any layer's
+/// `max_memory`, so a guest cannot grow them without end.
 const MAX_TAGS: usize = 64;
 const MAX_TAG_BYTES: usize = 4096;
 
