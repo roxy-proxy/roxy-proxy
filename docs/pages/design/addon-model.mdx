@@ -1,3 +1,10 @@
+---
+title: "Addon model"
+description: "What an addon layer is, how the stack is shaped, the invariants every layer is held to, how the bytes and the host-service effects of one layer are ordered against another's, and what the modes mean."
+---
+
+import layerOrdering from "../../assets/layer-ordering.svg";
+
 # Addon model
 
 roxy knows HTTP, not any particular application or API. Logic that needs to
@@ -38,6 +45,49 @@ The stack is a pipeline: every layer runs at once, as its own task, each
 seeing what the layer above passed on, so on a long stream each works on a
 different chunk at the same time. Observe layers get copies and run beside
 the stream rather than in it.
+
+## Ordering across layers
+
+Two things come out of a layer, and roxy orders only one of them.
+
+The exchange's bytes form a pipeline. A head or a chunk reaches layer B
+only after layer A has sent it on, and A may hold, rewrite or drop it on
+the way: what B reads is what A passed, in the order A passed it, and the
+rules admit the request the last layer forwarded. The response is the same
+pipeline the other way up: the rules see the upstream's bytes first, then
+B, and A gets a chunk only after B has passed it. This holds for enforce
+layers of either kind. An observer is in neither order: it reads a copy
+beside the pipeline, holds nothing up, and can neither tag nor write
+state, so the rest of this section is about enforce layers.
+
+Host-service effects are not in that pipeline. `add_tag`, `state_put`,
+`record` and `quarantine` go to the host beside the bytes, not down the
+stack. A layer's calls on an exchange run on their own worker, in the
+order the layer made them, and roxy orders nothing between one layer's call and another
+layer's read: A's `state_put` and B's `state_get` are concurrent unless A
+awaits its `result` before sending the bytes B will read. B cannot read on
+a chunk it has not received, so the await puts A's write ahead of B's
+read. A WASM layer's call is a synchronous function that returns before
+the layer continues, so it has that order by construction; a service layer
+sends the call as a message and awaits the `result` itself
+([host services on a stream](/reference/service-layers#host-services)).
+
+<img src={layerOrdering} alt="Two enforce layers, A and B, in roxy's request path, left to right, then the rules. The client's head (a solid line) and body bytes (a dashed line) run through A, then B, then to the rules; the gap between A and B is labelled: a chunk reaches B only after A sends it. Part-way through the body, A calls state_put, drawn as an arrow down to a host services strip along the bottom with a result arrow back up, and the note awaits result, then sends on; A's body line is broken at that point. In B, on the chunk that followed, a state_get arrow goes down to the strip and a result comes back, with the note on that chunk: sees A's write. A dotted line between the two calls says ordered only by A's await. The strip reads host services (add_tag, state_put, state_get, record, quarantine, and more): beside the pipeline. Under it: each layer's calls run on their own worker, so A's put lands before B's get only because A awaited its result; a write for this exchange's admission lands before the request is forwarded; any other is seen by the next rule that reads it: a tag in flight on this exchange, state there or at a later exchange's admission." />
+
+So, to make an effect visible:
+
+- **to the layers below**: await the `result` before sending the head or
+  chunk whose handling should see it (a WASM layer's call has returned by
+  the time it sends anything);
+- **to this exchange's admission rules**: land it before the request is
+  forwarded, so before the layer calls `next` or the service sends its
+  forwarded `request` head;
+- **otherwise**, the write is seen by the next rule that reads it. A tag
+  lives on this exchange, so that is an in-flight re-check of it; state
+  persists, so it is that or a later exchange's admission. The write does
+  not itself trigger a re-check: a rule runs when a value it watches
+  changes, and reads the tag or key then. A write never reopens a decision
+  already made ([policy evaluation](/design/policy-evaluation#evaluation)).
 
 ## Invariants
 
