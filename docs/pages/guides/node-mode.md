@@ -130,8 +130,8 @@ stated, and no later than two thirds of the way to its `not_after`
 ([renew](/reference/node-protocol#renew)). A renewal answered `401` is
 retried with backoff, as an outage is: the replica answering may not yet
 know the token the last renewal issued. One the control plane refuses
-otherwise (`426`, `400`) is logged once and not retried; the current token
-serves until it expires.
+otherwise (`426`, or any `4xx` other than `401` and `410`) is logged once
+and not retried; the current token serves until it expires.
 
 ## Flow shipping
 
