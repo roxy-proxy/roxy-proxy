@@ -337,7 +337,7 @@ pub(super) async fn read(shared: Arc<LinkShared>, mut ws: SplitStream<Ws>) {
                 };
                 route(&shared, id).map(|s| {
                     if let Some(s) = s {
-                        match serde_json::from_value::<In>(serde_json::Value::Object(v)) {
+                        match In::parse(v) {
                             Ok(m) => s.control(m),
                             Err(e) => {
                                 s.fail(

@@ -192,8 +192,6 @@ class _Conn:
             s.fail_calls(ProtocolError("roxy reset the stream"))
             s.task.cancel()
         else:
-            if s.observe and kind in ("request_end", "response_end"):
-                s.roxy_ended(_DIR_OF_MESSAGE[kind])
             s.inbox(_DIR_OF_MESSAGE.get(kind, REQUEST)).put_nowait(msg)
 
 
@@ -223,11 +221,9 @@ class _Stream:
         # A `request` was forwarded, so a `request_end` is owed.
         self.forwarded = False
         self._ends_sent = {REQUEST: False, RESPONSE: False}
-        # roxy's ends, on an observe stream.
-        self._ends_read = {REQUEST: False, RESPONSE: False}
-        # Nothing more may be sent: this side's last message has gone, or
-        # roxy's has on an observe stream. roxy drops a call sent after
-        # that and never answers it.
+        # Nothing more may be sent: this side's last message has gone, which
+        # ends the stream in either mode. roxy drops a call sent after that
+        # and never answers it.
         self.ended = False
 
     def fail_calls(self, exc: Exception) -> None:
@@ -251,15 +247,9 @@ class _Stream:
                 self._ends_sent[end] = True
                 if self._ends_sent[RESPONSE] and (not self.forwarded or self._ends_sent[REQUEST]):
                     self.ended = True
-
-    def roxy_ended(self, direction: int) -> None:
-        """One of roxy's ends on an observe stream. Its second ends the
-        stream: every result roxy will send came before it, so a call
-        still waiting was dropped."""
-        self._ends_read[direction] = True
-        if self._ends_read[REQUEST] and self._ends_read[RESPONSE]:
-            self.ended = True
-            self.fail_calls(ProtocolError("roxy ended the stream"))
+                    # roxy runs a call sent before the end but cannot answer
+                    # it: whoever awaits one must not wait forever.
+                    self.fail_calls(ProtocolError("the stream has ended: no result will come"))
 
     async def call(self, msg: dict[str, Any]) -> Any:
         """Sends a host-service call and returns the value of its `result`,
@@ -275,6 +265,12 @@ class _Stream:
             result = await fut
         finally:
             self.pending.pop(cid, None)
+            # The stream may end between registering the call and sending
+            # it: `send` then refuses the call, and the failure already set
+            # on its future is taken here rather than reported by asyncio
+            # as never retrieved.
+            if fut.done() and not fut.cancelled():
+                fut.exception()
         if result.get("error") is not None:
             raise HostError(result["error"])
         return result.get("value")
@@ -321,9 +317,11 @@ class _Stream:
         finally:
             # Nothing the exchange started outlives it: roxy sends nothing
             # more on a reset stream, so a body still going out would wait
-            # for input or credit forever.
+            # for input or credit forever, and a call the handler left
+            # waiting would never be answered.
             if exchange is not None:
                 await exchange._stop_forwarding()
+            self.fail_calls(ProtocolError("the stream has ended"))
             self.conn.streams.pop(self.id, None)
 
     async def recv(self, direction: int) -> dict[str, Any] | bytes:
@@ -383,17 +381,18 @@ class Exchange:
     # Host services, each behind a capability granted in roxy's config
     # (`capabilities: [log, record, state, metrics]`). Each returns once
     # roxy has answered it. A call without its capability, or a failure in
-    # roxy, fails the exchange: roxy resets the stream. `add_tag` needs no
-    # capability but is refused in observe mode.
+    # roxy, fails the layer: roxy resets the stream, and in enforce mode
+    # the exchange fails with it. `add_tag` needs no capability but is
+    # refused in observe mode, like `state_put` and `quarantine`.
     #
     # A call may be made at any point, including part-way through a body.
     # Calls run beside the bodies, and roxy promises no order between a
     # call and the heads or bytes the handler sends after it: the handler
     # awaits the call before sending whatever its effect must precede
-    # (`forward`, `respond`, or the rest of a body). Today a tag or state
-    # write is seen by this exchange's admission rules only if it lands
-    # before `forward`, and by later exchanges always; in-flight rules do
-    # not yet read tag or state values (#509).
+    # (`forward`, `respond`, or the rest of a body). A tag or state write
+    # is seen by this exchange's admission rules only if it lands before
+    # `forward`, and by later exchanges always; in-flight rules read
+    # neither tags nor state (#509).
 
     async def log(self, level: str, message: str) -> None:
         """Writes to roxy's operational log (`trace` to `error`)."""

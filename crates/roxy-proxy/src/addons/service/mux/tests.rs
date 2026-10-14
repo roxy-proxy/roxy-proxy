@@ -11,11 +11,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::link::{Link, LinkShared, LinkState, Queued, binary, binary_frame};
 use super::lock;
-use super::pool::Pool;
-use super::stream::{Answers, MAX_BODY_FRAME, Phase, Stream, StreamState, open};
+use super::pool::{Pool, Reservation};
+use super::stream::{
+    Answers, MAX_BODY_FRAME, MAX_HOST_CALLS_WAITING, Phase, Stream, StreamState, open,
+};
 use crate::addons::service::testing;
-use crate::addons::service::{First, In, Unanswered};
-use crate::addons::{AddonImpl, AddonMode};
+use crate::addons::service::{Call, First, In, Unanswered};
+use crate::addons::{AddonImpl, AddonMode, AddonSpec};
 use crate::in_flight::Dir;
 use crate::testkit::ALLOW_UP;
 
@@ -40,32 +42,47 @@ fn failed_link() -> Arc<Link> {
 /// answers an exchange would wait on. What the stream sends goes
 /// nowhere.
 async fn lone_stream() -> (Arc<Stream>, Answers, crate::testkit::Kit) {
-    let kit = testing::kit(
-        ALLOW_UP,
-        vec![testing::addon("s", "pass", AddonMode::Enforce, |_| {})],
+    lone_stream_of(
+        testing::addon("s", "pass", AddonMode::Enforce, |_| {}),
+        None,
     )
-    .await;
+    .await
+}
+
+/// [`lone_stream`] for the layer `addon`, in its mode (an observe
+/// stream's answers go unused), holding `slot` in a pool if given.
+async fn lone_stream_of(
+    addon: Arc<AddonSpec>,
+    slot: Option<Reservation>,
+) -> (Arc<Stream>, Answers, crate::testkit::Kit) {
+    let mode = addon.mode;
+    let kit = testing::kit(ALLOW_UP, vec![addon]).await;
     let (st, _cx) = crate::addons::test_flow(&kit);
     let (first_tx, first) = oneshot::channel();
     let (second_tx, second) = oneshot::channel();
+    let phase = match mode {
+        AddonMode::Enforce => Phase::AwaitingFirst {
+            first: first_tx,
+            second: second_tx,
+        },
+        AddonMode::Observe => Phase::Observing {
+            forwarding: false,
+            responded: false,
+        },
+    };
     let link = failed_link();
     let stream = Arc::new(Stream {
         id: 1,
         link: link.clone(),
         st,
         index: 0,
-        mode: AddonMode::Enforce,
-        state: Mutex::new(StreamState::new(
-            Phase::AwaitingFirst {
-                first: first_tx,
-                second: second_tx,
-            },
-            None,
-        )),
+        mode,
+        state: Mutex::new(StreamState::new(phase, slot)),
         more_credit: Notify::new(),
         ended: CancellationToken::new(),
         wire: Arc::default(),
         calls: Mutex::new(None),
+        draining: Mutex::new(None),
     });
     lock(&link.shared.streams).open.insert(1, stream.clone());
     (stream, Answers { first, second }, kit)
@@ -239,6 +256,163 @@ async fn a_body_failing_on_its_way_to_the_service_is_not_its_failure() {
         super::super::unanswered(lost),
         super::super::Fail::Below(_)
     ));
+}
+
+/// A call the service sent before the stream ended still runs once it
+/// has: the record reaches the flow log, named by the call, though its
+/// `result` has nowhere to go. The worker has not run when the stream is
+/// reset, so the call is still queued at the end.
+#[tokio::test]
+async fn a_call_queued_before_the_end_still_runs() {
+    let addon = testing::granted(
+        testing::addon("s", "pass", AddonMode::Enforce, |_| {}),
+        &[roxy_wasm::Capability::Record],
+    );
+    let (stream, _answers, kit) = lone_stream_of(addon, None).await;
+    stream.control(In::Call(Call::Record {
+        id: 7,
+        kind: "late".to_owned(),
+        data: serde_json::json!({"n": 1}),
+    }));
+    stream.reset("the exchange ended");
+    assert!(lock(&stream.state).ended());
+    let r = kit.events("layer_record", 1).await;
+    assert_eq!(r[0]["kind"], "late", "{r:#?}");
+    assert_eq!(r[0]["call"], 7, "{r:#?}");
+}
+
+/// An ended stream keeps its place on the connection while the calls
+/// queued before its end still run, so what a service leaves behind on
+/// ended streams is bounded like its open ones; the place goes once they
+/// have run. The worker has not run when the stream is reset, so the call
+/// is still queued then.
+#[tokio::test]
+async fn an_ended_stream_keeps_its_place_until_its_calls_have_run() {
+    let pool = Arc::new(Pool {
+        entries: Mutex::new(Vec::new()),
+        freed: Notify::new(),
+        max_connections: 1,
+        max_streams: 1,
+        retired: AtomicBool::new(false),
+    });
+    let slot = pool.reserve().await;
+    let addon = testing::granted(
+        testing::addon("s", "pass", AddonMode::Observe, |_| {}),
+        &[roxy_wasm::Capability::Record],
+    );
+    let (stream, _answers, kit) = lone_stream_of(addon, Some(slot)).await;
+    stream.control(In::Call(Call::Record {
+        id: 1,
+        kind: "late".to_owned(),
+        data: serde_json::json!({}),
+    }));
+    stream.reset("the exchange ended");
+    assert_eq!(
+        lock(&pool.entries)[0].reserved,
+        1,
+        "the place is held while the call waits to run"
+    );
+    kit.events("layer_record", 1).await;
+    let place = tokio::time::timeout(Duration::from_millis(500), pool.reserve()).await;
+    assert!(place.is_ok(), "the place is free once the call has run");
+}
+
+/// A call handed to a stream that has already ended is dropped, with no
+/// worker started for it: the reader may still hold the stream after
+/// another task ended it, and the call crossed the end.
+#[tokio::test]
+async fn a_call_after_the_end_is_dropped() {
+    let addon = testing::granted(
+        testing::addon("s", "pass", AddonMode::Observe, |_| {}),
+        &[roxy_wasm::Capability::Record],
+    );
+    let (stream, _answers, kit) = lone_stream_of(addon, None).await;
+    stream.reset("the exchange ended");
+    stream.control(In::Call(Call::Record {
+        id: 1,
+        kind: "late".to_owned(),
+        data: serde_json::json!({}),
+    }));
+    assert!(
+        lock(&stream.calls).is_none(),
+        "no worker for a dropped call"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        kit.sink
+            .events()
+            .iter()
+            .all(|e| e["event"] != "layer_record"),
+        "the call did not run"
+    );
+}
+
+/// A call that fails after the stream has ended is still the layer's
+/// failure, logged once with its call id and the failure's kind: `settle`
+/// has nothing left to tell, so the worker logs it itself, and the calls
+/// queued behind it still run. An observe stream, whose failures are
+/// logged as they come.
+#[tokio::test]
+async fn a_call_failing_after_the_end_is_logged() {
+    let addon = testing::granted(
+        testing::addon("s", "pass", AddonMode::Observe, |_| {}),
+        &[roxy_wasm::Capability::Record],
+    );
+    let (stream, _answers, kit) = lone_stream_of(addon, None).await;
+    stream.control(In::Call(Call::StateGet {
+        id: 9,
+        key: "k".to_owned(),
+    }));
+    stream.control(In::Call(Call::Record {
+        id: 10,
+        kind: "after".to_owned(),
+        data: serde_json::json!({}),
+    }));
+    stream.reset("the exchange ended");
+    assert!(lock(&stream.state).ended());
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
+    assert_eq!(errs[0]["mode"], "observe", "{errs:#?}");
+    assert_eq!(errs[0]["kind"], "capability:state", "{errs:#?}");
+    assert_eq!(errs[0]["call"], 9, "{errs:#?}");
+    let r = kit.events("layer_record", 1).await;
+    assert_eq!(r[0]["call"], 10, "the call behind the failure ran: {r:#?}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let errs: Vec<_> = kit
+        .sink
+        .events()
+        .into_iter()
+        .filter(|e| e["event"] == "layer_error")
+        .collect();
+    assert_eq!(errs.len(), 1, "{errs:#?}");
+}
+
+/// `MAX_HOST_CALLS_WAITING` calls may wait for the stream's worker; one
+/// more is the service's protocol error, and fails the stream.
+#[tokio::test]
+async fn more_calls_waiting_than_the_cap_fail_the_stream() {
+    let (stream, answers, _kit) = lone_stream().await;
+    let get = |id| {
+        In::Call(Call::StateGet {
+            id,
+            key: "k".to_owned(),
+        })
+    };
+    let cap = u64::try_from(MAX_HOST_CALLS_WAITING).unwrap();
+    for id in 1..=cap {
+        stream.control(get(id));
+    }
+    assert!(!lock(&stream.state).ended(), "{cap} calls may wait");
+    stream.control(get(cap + 1));
+    assert!(lock(&stream.state).ended());
+    let Err(Unanswered::Service(e)) = answers.first.await.expect("the first answer is told") else {
+        panic!("the request is not forwarded");
+    };
+    assert_eq!(e.kind(), "service:protocol", "{e}");
+    assert_eq!(
+        e.to_string(),
+        format!("service protocol violation: more than {cap} host calls waiting")
+    );
 }
 
 /// A connection that failed keeps its place in the pool while streams

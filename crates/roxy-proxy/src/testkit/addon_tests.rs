@@ -1151,9 +1151,7 @@ mod service {
 
     /// An observing service's record reaches the flow log, but its tag is
     /// refused like a WASM observer's: the failure is its own, named by
-    /// its call, the exchange goes on and the flow carries no tag. The
-    /// response drips so the copy outlives the calls: a call on a stream
-    /// that has ended is dropped.
+    /// its call, the exchange goes on and the flow carries no tag.
     #[tokio::test]
     async fn an_observing_service_cannot_tag() {
         let kit = kit_with(
@@ -1165,11 +1163,7 @@ mod service {
             },
         )
         .await;
-        let a = kit
-            .h1()
-            .await
-            .call("GET", "/drip?n=3&ms=100", &[], b"")
-            .await;
+        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
         assert_eq!(a.status, 200, "{a:?}");
         let errs = kit.events("layer_error", 1).await;
         assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
@@ -1181,6 +1175,76 @@ mod service {
         assert_eq!(r[0]["call"], 2, "{r:#?}");
         let ev = kit.request_event().await;
         assert!(super::strs(&ev["tags"]).is_empty(), "{ev:#}");
+    }
+
+    /// An observing service reads the whole response and only then
+    /// records what it saw, as a WASM observer can: the stream is still
+    /// open after roxy's `response_end`, so the call runs and is answered,
+    /// and the stream ends on the service's own `response_end`.
+    #[tokio::test]
+    async fn an_observing_service_records_after_reading_the_response() {
+        let kit = kit(
+            READS_BODY,
+            vec![granted(
+                addon("s", "audit", AddonMode::Observe, |_| {}),
+                &[Capability::Record],
+            )],
+        )
+        .await;
+        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+        assert_eq!(a.status, 200, "{a:?}");
+        let r = kit.events("layer_record", 1).await;
+        assert_eq!(r[0]["layer"], "s", "{r:#?}");
+        assert_eq!(r[0]["kind"], "audit", "{r:#?}");
+        assert_eq!(r[0]["call"], 1, "{r:#?}");
+        let open = &kit.upstream.service().until_opened(1).await[0];
+        let id = stream_id(open);
+        let answered = tokio::time::timeout(Duration::from_secs(5), async {
+            while !results(&kit, id).contains_key(&1) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(answered.is_ok(), "the call is answered on the open stream");
+        assert!(
+            kit.upstream.service().resets().is_empty(),
+            "the service ended the stream itself"
+        );
+        super::no_layer_error(&kit);
+    }
+
+    /// An observing service that never ends its stream is failed on its
+    /// own clock, `first_byte_timeout` from roxy's last message: the
+    /// stream is reset, the failure is the observer's own (one
+    /// `layer_error`, `service:timeout`), and the exchange, which never
+    /// waited on it, is untouched.
+    #[tokio::test]
+    async fn an_observing_service_that_never_ends_its_stream_times_out() {
+        let kit = kit(
+            RULES,
+            // `hold` passes the response head back and never its end.
+            vec![addon("s", "hold", AddonMode::Observe, |s| {
+                s.first_byte_timeout = Duration::from_millis(300);
+            })],
+        )
+        .await;
+        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+        assert_eq!(a.status, 200, "{a:?}");
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(errs[0]["layer"], "s", "{errs:#?}");
+        assert_eq!(errs[0]["mode"], "observe");
+        assert_eq!(errs[0]["kind"], "service:timeout", "{errs:#?}");
+        let open = &kit.upstream.service().until_opened(1).await[0];
+        let why = reset_of(&kit, stream_id(open)).await;
+        assert!(why.contains("first_byte_timeout"), "{why}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let errs: Vec<_> = kit
+            .sink
+            .events()
+            .into_iter()
+            .filter(|e| e["event"] == "layer_error")
+            .collect();
+        assert_eq!(errs.len(), 1, "{errs:#?}");
     }
 
     /// A service's `quarantine` trips the process and refuses its own

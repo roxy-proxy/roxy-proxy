@@ -62,7 +62,10 @@ pub(super) async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodyS
                     return consumer_gone(&stream, &inbox, dir, n);
                 }
                 // More than declared, or than the limit.
-                Err(e) => return stream.fail(ServiceError::Protocol(e.to_string()), Reset::Send),
+                Err(e) => {
+                    stream.fail(ServiceError::Protocol(e.to_string()), Reset::Send);
+                    return;
+                }
             }
             continue;
         }
@@ -70,7 +73,9 @@ pub(super) async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut tx: BodyS
             match tx.finish().await {
                 Ok(()) | Err(BodyError::Closed | BodyError::Stopped) => {}
                 // Shorter than declared.
-                Err(e) => stream.fail(ServiceError::Protocol(e.to_string()), Reset::Send),
+                Err(e) => {
+                    stream.fail(ServiceError::Protocol(e.to_string()), Reset::Send);
+                }
             }
             return;
         }
