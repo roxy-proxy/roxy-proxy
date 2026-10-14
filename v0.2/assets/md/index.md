@@ -1,0 +1,31 @@
+# Overview
+
+<img src={exchange} alt="An exchange through roxy: TLS decryption, then an addon stack (here a service addon and a WASM addon), then the rules, then the upstream connector with its address floor; the response returns the same way; every stage writes to the flow log" />
+
+roxy is a strict, programmable HTTP firewall. Every request and response streams through a pipeline you compose: addons that can rewrite, withhold, answer or block, then rules that judge exactly what they pass on. Run it as an egress proxy for a workload you don't trust, or as a gateway in front of the APIs your clients call.
+
+Every exchange takes the same path: roxy parses it, the addons see it, the rules judge it, and the connector dials the upstream ([how roxy works](/design/how-it-works)). It fails closed: anything roxy cannot parse, verify or classify is denied.
+
+## Use cases
+
+**Sandbox containment.** An untrusted workload has no route out except through roxy. It points `HTTPS_PROXY` at roxy's proxy port and trusts roxy's CA; roxy decrypts each request, judges it, injects the credentials the workload never sees, and logs every decision. The network does the containing; roxy decides what gets out ([sandbox containment](/guides/containment)).
+
+<img src={containment} alt="A workload inside a sealed sandbox network whose only exit is roxy's proxy port 3128. Requests go from the workload to roxy and on to the allowed upstreams, api.anthropic.com and github.com, with the real key added; responses come back the same way. roxy holds the CA and the secrets, and the workload fetches roxy-ca.pem from port 3130. A direct route out of the sandbox is blocked at the boundary: direct TCP, UDP and DNS have no route." />
+
+**HTTP gateway.** Clients address roxy directly, as `anthropic.gw.example.com` behind a load balancer that terminates TLS. Rules route each request by host and inject the real API keys, so clients hold placeholders; client authentication is an addon. It governs the traffic sent to it; it is not containment ([HTTP gateway](/guides/gateway)).
+
+<img src={gateway} alt="An example gateway. Clients send HTTPS requests to a load balancer that terminates TLS and forwards plain HTTP to roxy's http listener on port 8080. Inside roxy the request streams through an auth service addon, which asks an auth service over a WebSocket who the client is and gets back allow, user=alice, or answers 401 if the caller is unknown. Then the rules route by host and inject roxy's own secrets: requests for anthropic.gw.example.com go on over HTTPS to api.anthropic.com with x-api-key added from roxy's secrets, and requests for openai.gw.example.com to api.openai.com with a bearer key added the same way. Responses return by the same path." />
+
+## Try it
+
+The [quickstart](/quickstart) sends generated traffic through roxy with an auth gate, a per-user token quota and an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar, with roxy in node mode leasing its policy from a minimal control plane. Nothing in it needs an API key.
+
+## Where next
+
+* **Guides:** [containment](/guides/containment), [gateway](/guides/gateway), [running](/guides/run) and [operating](/guides/operations) roxy, [testing a policy](/guides/testing-a-policy), [writing addons](/guides/writing-addons).
+* **Design:** [how roxy works](/design/how-it-works), the [threat model](/design/threat-model), [policy evaluation](/design/policy-evaluation), the [addon model](/design/addon-model).
+* **Reference:** every setting and behaviour, from the [configuration file](/reference/configuration) to the [flow log](/reference/flow-log).
+
+## Open source
+
+roxy is [open source](https://github.com/roxy-proxy/roxy-proxy), written in Rust, and dual-licensed under Apache 2.0 and MIT. Outstanding work is tracked in [issues](https://github.com/roxy-proxy/roxy-proxy/issues).

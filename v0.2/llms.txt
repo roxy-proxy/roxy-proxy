@@ -1,0 +1,36 @@
+# roxy
+
+A strict, programmable HTTP firewall: an egress proxy for untrusted workloads, or a gateway in front of the APIs your clients call.
+
+- [Overview](/index): roxy is a strict, programmable HTTP firewall: an egress proxy for untrusted workloads, or a gateway in front of the APIs your clients call.
+- [Quickstart](/quickstart): Watch generated traffic go through roxy with an auth gate, a per-user token quota and an inspect_sentinel sidecar, against a scripted model.
+- [Sandbox containment](/guides/containment): Run roxy as the only way out of a sandbox: the workload points HTTPS_PROXY at roxy's proxy port, trusts roxy's CA, and the network gives it no other route.
+- [HTTP gateway](/guides/gateway): Put roxy in front of the APIs your clients call: a load balancer terminates TLS, an http listener takes each request, and rules route it by host and inject the real key.
+- [Run roxy](/guides/run)
+- [Node mode](/guides/node-mode)
+- [Operations](/guides/operations)
+- [Managing the CA](/guides/ca-certificates)
+- [Testing a policy](/guides/testing-a-policy)
+- [Writing addons](/guides/writing-addons)
+- [How roxy works](/design/how-it-works): One exchange through roxy: decrypt and parse, the addon stack, the rules, the connector, and the response back up the same path, with every stage and every exit written to the flow log.
+- [Threat model and guarantees](/design/threat-model)
+- [Policy evaluation](/design/policy-evaluation): How the rules decide an exchange: one admission decision on the request head, in-flight re-checks as bytes stream, deny wins, and how effects, tags and unavailable inputs behave.
+- [Addon model](/design/addon-model): What an addon layer is, how the stack is shaped, the invariants every layer is held to, how the bytes and the host-service effects of one layer are ordered against another's, and what the modes mean.
+- [Performance](/design/performance)
+- [Configuration](/reference/configuration)
+- [Rule language](/reference/rule-language)
+- [Secrets](/reference/secrets)
+- [Rate limits and state](/reference/rate-limits)
+- [Address floor and lists](/reference/address-lists)
+- [WebSockets](/reference/websockets)
+- [HTTP](/reference/http)
+- [Upstream](/reference/upstream)
+- [TLS](/reference/tls)
+- [Resource limits](/reference/limits)
+- [Addon configuration](/reference/addon-configuration)
+- [Service layer protocol](/reference/service-layers)
+- [Host services](/reference/host-services)
+- [Flow log and capture](/reference/flow-log)
+- [Node protocol](/reference/node-protocol)
+- [Architecture](/reference/architecture)
+- [Development](/reference/development)

@@ -1,0 +1,194 @@
+# Rule language
+
+The `when` / `where` expression language and the actions of `then`.
+Evaluation is in [policy evaluation](/design/policy-evaluation).
+
+## Expressions
+
+Statically typed; no user-defined functions; linear-time matching (`regex`
+crate, no backtracking).
+
+```
+expr        := or
+or          := and ( "or" and )*
+and         := not ( "and" not )*
+not         := "not" not | primary
+primary     := "(" expr ")" | comparison | predicate
+comparison  := operand OP operand
+predicate   := field | bool                  ; boolean field, or a literal (`where: true`)
+operand     := field | field "[" string "]" | literal
+OP          := "==" | "!=" | "<" | "<=" | ">" | ">="
+             | "in" | "not in"
+             | "starts_with" | "ends_with" | "contains"
+             | "like"        ; glob, full match ( * ? )
+             | "matches"     ; regex, full match
+             | "under"       ; host == X or host ends_with "." + X
+literal     := string | number [unit] | bool | list | ip | cidr | @list | method | "null"
+list        := "[" literal ("," literal)* "]"
+unit        := kb | mb | gb | ms | s | m | h      ; sizes are 1024-based
+method      := [A-Z][A-Z_]*                       ; HTTP method names only
+```
+
+* A rule without `when` matches every exchange; a metric without `where`
+  counts every one.
+* Strings: double-quoted, `\"` and `\\` escapes. `# ...` comments are
+  allowed in multi-line YAML block scalars.
+* Comparison is byte-exact, except: `host`, `tls.sni` and `scheme` operands
+  compare ASCII case-insensitively under every operator (`like`, `matches`,
+  `in` included); `under` is case-insensitive whatever its left operand;
+  `header["X-Y"]` names are case-insensitive, values not. A header value
+  with obs-text (bytes `0x80` and up, under `http.allow_obs_text`) reads as
+  one character per byte (ISO-8859-1), so the text a rule matches is the
+  bytes roxy forwards: the byte `0xE9` reads as `é`, while `é` sent in
+  UTF-8 (`0xC3 0xA9`) reads as the two characters `Ã©`. `method` is
+  exact: method `get` is forwarded as an extension method, may carry a
+  body, and matches neither `method == GET` nor `method in [GET, HEAD]`.
+* Compile errors: type mismatch (`host under 443`), a regex that does not
+  compile, a `like` pattern longer than 1 KiB, a bad CIDR mask, `metric.foo` with no such metric, an undefined
+  `@list`, a `${secret:name}` placeholder in a string (it would compare
+  against its own text; [secrets](/reference/secrets)), and a predicate
+  that can never match: `under` with an empty label (`"a..b"`,
+  `"example.com.."`), a `host` or `tls.sni` literal with a trailing dot
+  (`host == "evil.example."`, `host like "*.example.com."`), non-ASCII
+  characters, brackets (`"[::1]"`) or an IPv4-mapped address
+  (`"::ffff:10.0.0.1"`) ([fields](/reference/rule-language#fields)),
+  or `null` compared with a value that is never `null`
+  ([missing values](/reference/rule-language#missing-values-null)). `in`
+  takes a list of the operand's type, a CIDR, or an `@list` for ip fields.
+
+### Fields
+
+*Admission* fields are known at the forwarding decision; a rule reading only
+them is an admission rule. *In-flight* fields become known or change after the
+request is forwarded; a rule reading one is re-checked in flight
+([evaluation](/design/policy-evaluation#evaluation)).
+
+| field | type | known |
+|---|---|---|
+| `client.ip` | ip | admission |
+| `listener.name` | string | admission |
+| `tls.sni`, `tls.alpn`, `tls.version` | string | admission |
+| `method`, `scheme`, `host`, `port`, `path`, `url` | string / int | admission |
+| `query["k"]`, `query.raw` | string | admission |
+| `header["name"]`, `header.all["name"]` | string, list | admission |
+| `body.size` | int: declared length, `null` if undeclared (chunked) | admission |
+| `body.text` | string: the buffered body, up to the cap | admission |
+| `metric.<id>` | int | admission; a `deny` or `quarantine` reading a byte metric is also re-checked in flight ([rate limits](/reference/rate-limits#metrics)) |
+| `state["key"]`, `tag["name"]` | string, bool | admission |
+| `body.bytes` | int: request body bytes so far | in-flight |
+| `response.status`, `response.header["name"]`, `response.header.all["name"]` | int, string, list | in-flight |
+| `response.body.size` | int: declared length, `null` if undeclared | in-flight |
+| `response.body.text` | string: the buffered response body | in-flight |
+| `response.body.bytes` | int: response body bytes so far | in-flight |
+| `ws.direction`, `ws.opcode`, `ws.size`, `ws.text` | string, int, int, string: the WebSocket message being checked | in-flight, per message ([WebSockets](/reference/websockets#message-rules)) |
+
+`client.ip` is the client as roxy establishes it: the TCP peer, or on a
+listener with `forwarded_for` the client `X-Forwarded-For` names at the
+trusted hop ([HTTP](/reference/http#clients-behind-a-load-balancer)).
+`path` is normalised ([HTTP](/reference/http#url-normalisation)). `host`
+and `tls.sni` are the name as roxy delivers it: lower-case, without a
+trailing dot, internationalised labels in A-label (`xn--`) form, and an IP
+literal as the bare address (`10.0.0.1`, `::1`; never `[::1]`), with an
+IPv4-mapped IPv6 literal (`[::ffff:10.0.0.1]`) delivered as the IPv4 address
+it embeds, since that is what gets dialled. A string literal compared with
+them in another form never matches and is a compile error. Any rule reading `ws.*` makes roxy decode every WebSocket message
+and strip WebSocket extensions.
+
+The normalised `path` is what roxy forwards, but an upstream may change it
+again before resolving it: decode `%2F` to `/`, merge empty segments
+(`//admin`), strip `;params`, or fold case. A `deny` keyed on a path prefix
+is therefore fragile: `/a/..%2Fsecret` does not start with `/secret`, yet an
+upstream that decodes `%2F` first serves `/a/../secret`. An `allow` keyed on
+a prefix has the same gap. Allow exact paths, or a prefix together with a
+guard against every form the upstream reinterprets, raw or encoded
+(`not path contains "%2F"`, likewise `"%5C"`, `"//"`, `";"` and `"%3B"`; hex
+is upper-cased before matching, so one case suffices), and treat a path
+`deny` as defence in depth
+([URL normalisation](/reference/http#url-normalisation)).
+
+### Missing values (`null`)
+
+An absent value is `null`: an unsent header or query parameter, an unset
+state key, `tls.sni` when none was sent, `body.size` for a chunked body.
+`tag["x"]` is never `null` (`false` until set), nor are `metric.<id>`,
+`body.text` and `response.body.text` (unavailable, they fail closed);
+comparing any of them with `null` is a compile error. `==`, `!=`, `in` and
+`not in` treat `null` as a value; any other operator on it fails closed.
+
+| expression, with `x` missing | result |
+|---|---|
+| `x == null` | true |
+| `x != null` | false |
+| `x == "a"`, `x in [...]` | false |
+| `x != "a"`, `x not in [...]` | true |
+| `x > 10`, `x contains "a"`, `x matches "..."`, `x under "..."`, `x in 10.0.0.0/8`, `x in @list` | fails closed: `_fail_closed`, reason `missing_value`, naming the field |
+
+`and` and `or` short-circuit, and a failure in any branch they reach is
+final: `body.size != null and body.size > 10mb` is safe, `body.size > 1 or
+true` on a chunked body fails closed, so the null test goes first in an
+`or` as well (`body.size == null or body.size > 1`). `null` may appear only
+in `x == null` / `x != null`. A metric keyed on a nullable field
+needs the same guard in its `where` ([rate limits](/reference/rate-limits#metrics)).
+
+## Actions
+
+`then` is required: one action, or a list with at most one terminal action
+(`allow`, `deny` or `quarantine`), last. An action is a bare word or a single-key map of
+name to argument; a multi-key map, an unknown action, a wrong-shaped
+argument or anything after a terminal action is a compile error.
+
+```yaml
+then: allow
+then: { deny: { status: 451, message: "no" } }
+then:
+  - set_header: { authorization: "Bearer ${secret:openai}" }
+  - remove_header: [x-debug]
+  - tag: billing
+  - allow: { upgrade: websocket }
+```
+
+Terminal:
+
+| action | where | effect |
+|---|---|---|
+| `allow` | admission rules | Forward. `upgrade: websocket` permits a WebSocket upgrade; `private_ok: true` lets the flow reach private addresses ([address floor](/reference/address-lists#address-floor)). |
+| `deny` | all rules | `deny: { status, message, close }`; status 403 by default, 4xx or 5xx. At admission: refuse ([deny responses](/reference/http#deny-responses)) and close unless `close: false`. In flight: stop the exchange ([evaluation](/design/policy-evaluation#evaluation)). On a WebSocket: close both sides, with a `1008` frame when rules read messages ([WebSockets](/reference/websockets#message-rules)). |
+| `quarantine` | all rules | A bare word, no argument. A `deny` with status 403 that closes, plus: the whole proxy is [quarantined](/guides/operations#quarantine), refusing every later exchange until released from outside. Any matching `quarantine` trips it, whichever deny decided the exchange, a fail-closed included. Needs `--state-dir`. |
+
+Non-terminal:
+
+| action | where | effect |
+|---|---|---|
+| `set_header: { name: value }` | request: admission rules; response: in-flight rules | Set or replace. Request values may use `${secret:name}`; an invalid value denies the flow. A response rule may read only values known before the response head is sent (`response.status`, `response.header[..]`, `response.body.size`, `response.body.text`); `body.bytes`, `response.body.bytes`, `ws.*` or a byte metric is a compile error. |
+| `remove_header: [names]` | as `set_header` | |
+| `rewrite_path: { match, to }` | admission rules | Anchored regex (as `matches`), `$1` / `${name}` groups; `to` must start with `/`; result re-normalised. |
+| `set_query: { k: v }`, `remove_query: [k]` | admission rules | |
+| `redirect: { host, port, scheme?, rewrite_host? }` | admission rules | Change the upstream target. `host`: DNS name, dotted-quad IPv4 or bracketed IPv6 (`[::1]`); anything else, or port `0`, is a config error. The new IPs pass the address floor and deny lists. `Host` is unchanged unless `rewrite_host: true`, and while unchanged the request goes upstream over HTTP/1.1 (HTTP/2 needs `:authority` and `host` to agree). |
+| `tag: name` | all | Sets `tag["name"]` for later rules, addons and the log. |
+| `log: { level, message }` | all | Emits a `log` flow event. |
+| `set_state: { key, value, ttl? }` | all | Writes the [state store](/reference/rate-limits#state). |
+| `capture: request \| response \| both` | admission rules | Tees the exchange, as forwarded, to the [capture log](/reference/flow-log#capture). |
+| `digest: request \| response \| both` | admission rules | Hashes the selected bodies, as forwarded, into the flow record's [`body_sha256`](/reference/flow-log#flow-log). Nothing is hashed without it. |
+| `sign: { aws_sigv4: { service, region, access_key_id, secret_access_key, session_token?, unsigned_payload? } }` | admission rules | AWS Signature Version 4 over the forwarded request, after every other admission effect ([signing AWS requests](/reference/secrets#signing-aws-requests)). |
+
+Anything richer is an addon. `call` and `passthrough` are rejected with a
+reason naming why.
+
+## Body rules
+
+`body.text` and `response.body.text` are the only fields that buffer. If
+any rule reads `body.text`, roxy collects every request body up to
+`limits.max_inspect_body_bytes` (1 MiB) before the admission decision, then
+streams it on; `response.body.text` likewise for every response body. A
+body over the cap is unavailable: a rule reading it fails closed
+(`_fail_closed`, reason `body_too_large_to_inspect`). Raise the cap, or
+scope the rule (`body.size != null and body.size < 1mb and ...`) so it
+short-circuits before the text; that avoids the fail-closed, not the
+buffering. No body rule, no buffering.
+
+The text is the body decoded by its `content-encoding`
+([content codings](/reference/http#content-codings)), as lossy UTF-8; the
+forwarded bytes are the bytes received. The cap applies to the decoded text
+too. An undecodable body fails closed: `body_decode_failed` (corrupt,
+truncated, or bytes after the end of the stream) or
+`unsupported_content_encoding`.
