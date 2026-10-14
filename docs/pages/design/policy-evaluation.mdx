@@ -32,19 +32,22 @@ bytes, and the metric values this exchange adds to. Rules are **one ordered
 list** of conditions over those values. There are no phases: when a rule
 runs follows from what it reads.
 
-<img src={requestTiming} alt="The request phase of one exchange through roxy, left to right. The client's request head (a solid line) travels first and its body bytes (a dashed line) stream behind it, through layer A (enforce), past layer B (observe, which gets a copy beside the path), through layer C (enforce) and the rules, then on to the upstream. Each layer's when is evaluated on the head as it reaches the layer. Layer C calls state-put mid-body, awaits the result from the host services strip along the bottom, then continues the body. At the rules the admission decision is made once, on the head, after the stack and before anything is forwarded (when a rule reads body.text, the body is buffered first): allow, deny or change the request. As body bytes stream past the rules they are re-checked in flight (body.bytes, byte metrics), which can deny or quarantine but never allow or change the request. A note says that after admission the decision stands: a state write is seen by the next read of the store (an in-flight re-check or a later exchange), and a tag added then is read by no rule." />
+<img src={requestTiming} alt="The request phase of one exchange through roxy, left to right. The client's request head (a solid line) travels first and its body bytes (a dashed line) stream behind it, through layer A (enforce), past layer B (observe, which gets a copy beside the path), through layer C (enforce) and the rules, then on to the upstream. Each layer's when is evaluated on the head as it reaches the layer. Layer C calls state-put mid-body, awaits the result from the host services strip along the bottom, then continues the body. At the rules the admission decision is made once, on the head, after the stack and before anything is forwarded (when a rule reads body.text, the body is buffered first): allow, deny or change the request. As body bytes stream past the rules they are re-checked in flight (body.bytes, byte metrics), which can deny or quarantine but never allow or change the request. A note says that after admission the decision stands: a tag or state write is seen by the next rule that reads it (an in-flight re-check of this exchange, or a later exchange's admission)." />
 
 A request is judged at two points. Each layer's `when` is checked on the
 head as it arrives; the rules decide the head once, after the whole stack
 and before anything is forwarded (if a rule reads `body.text`, the body is
 buffered up to the cap first: [body rules](/reference/rule-language#body-rules)),
-then re-check the body as its bytes stream past. A WASM layer may call a
-host service at any point, including mid-body; the call returns before the
-layer continues, so a layer that needs the effect seen by the rules (a tag
-they read, say) makes the call before `next`. A write that lands after the
-admission decision never reopens it: a state write is seen by the next
-rule that reads the store, whether an in-flight re-check of this exchange
-or a later exchange's admission, and a tag added then is read by no rule.
+then re-check the body as its bytes stream past. A layer may call a
+[host service](/reference/host-services) at any point, including mid-body:
+a WASM layer's call returns before it continues, and a service layer awaits
+the `result` before sending whatever the effect must precede
+([host services on a stream](/reference/service-layers#host-services)).
+Either way, a tag or state write reaches the admission rules only if it
+lands before the request is forwarded. A write that lands after the
+admission decision never reopens it: it is seen by the next rule that reads
+the tag or the store, whether an in-flight re-check of this exchange or a
+later exchange's admission.
 
 1. **The forwarding decision is made at the request head, and deny wins.**
    roxy evaluates every rule whose values are known at that point. If any
