@@ -2101,13 +2101,15 @@ mod tests {
                 Utc::now(),
             )
         };
-        let not_after = Utc::now() + chrono::Duration::seconds(3000);
         let scaled = |secs: u64| node.scaled(Duration::from_secs(secs));
-        // The renewal delay as installed, measured from just before the
-        // install so the lower bound is exact; the upper bound allows for
-        // the time the install itself takes.
-        let renew_in = |renew_after: Option<Duration>| {
+        // The renewal delay as installed, for a token issued now and good
+        // for `lifetime`. Measured from before the expiry is fixed, so the
+        // expiry's ageing before the install is counted in the delay and
+        // the lower bound is exact; the upper bound allows for the time the
+        // install itself takes.
+        let renew_in = |lifetime: i64, renew_after: Option<Duration>| {
             let before = Instant::now();
+            let not_after = Utc::now() + chrono::Duration::seconds(lifetime);
             node.install_credential(client(), "n1".into(), not_after, renew_after);
             lock(&node.credential)
                 .as_ref()
@@ -2117,42 +2119,32 @@ mod tests {
         };
         let slack = Duration::from_secs(1);
 
-        let within = renew_in(Some(Duration::from_secs(600)));
+        let within = renew_in(3000, Some(Duration::from_secs(600)));
         assert!(
             within >= scaled(600) && within < scaled(600) + slack,
             "{within:?}"
         );
 
-        let capped = renew_in(Some(Duration::from_secs(2900)));
+        let capped = renew_in(3000, Some(Duration::from_secs(2900)));
         assert!(
             capped >= scaled(2000) && capped < scaled(2000) + slack,
             "{capped:?}"
         );
 
-        let defaulted = renew_in(None);
+        let defaulted = renew_in(3000, None);
         assert!(
             defaulted >= scaled(2000) && defaulted < scaled(2000) + slack,
             "{defaulted:?}"
         );
 
-        let floored = renew_in(Some(Duration::ZERO));
+        let floored = renew_in(3000, Some(Duration::ZERO));
         assert!(
             floored >= scaled(1) && floored < scaled(1) + slack,
             "{floored:?}"
         );
 
         // An already-expired token: the cap is zero and the floor still holds.
-        let not_after = Utc::now() - chrono::Duration::seconds(1);
-        let renew_in = |renew_after: Option<Duration>| {
-            let before = Instant::now();
-            node.install_credential(client(), "n1".into(), not_after, renew_after);
-            lock(&node.credential)
-                .as_ref()
-                .unwrap()
-                .renew_at
-                .saturating_duration_since(before)
-        };
-        let floored = renew_in(Some(Duration::ZERO));
+        let floored = renew_in(-1, Some(Duration::ZERO));
         assert!(
             floored >= scaled(1) && floored < scaled(1) + slack,
             "{floored:?}"
