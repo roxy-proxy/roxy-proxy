@@ -600,9 +600,9 @@ pub enum MetricCount {
 
 impl MetricCount {
     /// The in-flight value a read of this metric carries: a byte metric grows
-    /// as this exchange streams, so a `deny` reading it is re-checked as
-    /// bytes arrive. `None` for a count that does not change while an
-    /// exchange streams.
+    /// as this exchange streams, so a `deny` or `quarantine` reading it is
+    /// re-checked as bytes arrive. `None` for a count that does not change
+    /// while an exchange streams.
     pub fn in_flight(&self) -> Option<InFlightValue> {
         match self {
             Self::RequestBytes => Some(InFlightValue::MetricRequestBytes),
