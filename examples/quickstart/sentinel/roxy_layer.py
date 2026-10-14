@@ -201,6 +201,11 @@ class _Conn:
             s.inbox(_DIR_OF_MESSAGE.get(kind, REQUEST)).put_nowait(msg)
 
 
+# Put on a lane's inbox when this side's last message has gone: nothing more
+# arrives on the stream, so a receive still waiting must not wait forever.
+_ENDED: Any = object()
+
+
 class _Lane:
     """One body of a stream, each way: what roxy sent of it, and the credit
     for what this side may send."""
@@ -265,8 +270,12 @@ class _Stream:
                 if self._ends_sent[RESPONSE] and (not self.forwarded or self._ends_sent[REQUEST]):
                     self.ended = True
                     # roxy runs a call sent before the end but cannot answer
-                    # it: whoever awaits one must not wait forever.
+                    # it, and sends nothing more on the stream, the response
+                    # to a forward included: whoever awaits either must not
+                    # wait forever.
                     self.fail_calls(ProtocolError("the stream has ended: no result will come"))
+                    for lane in self.lanes.values():
+                        lane.inbox.put_nowait(_ENDED)
 
     async def call(self, msg: dict[str, Any]) -> Any:
         """Sends a host-service call and returns the value of its `result`,
@@ -344,6 +353,10 @@ class _Stream:
     async def recv(self, direction: int) -> dict[str, Any] | bytes:
         lane = self.lanes[direction]
         m = await lane.inbox.get()
+        if m is _ENDED:
+            # Left for the next receive, which must not wait either.
+            lane.inbox.put_nowait(_ENDED)
+            raise ProtocolError("the stream has ended: nothing more arrives on it")
         if isinstance(m, bytes) and m:
             # Credit roxy for what was consumed, a quarter window at a time
             # (or whenever the inbox runs dry), not a message per frame.
@@ -513,7 +526,13 @@ class Exchange:
         in the background if roxy answers before it has all been sent.
         roxy re-validates the request and its rules judge it; a refusal
         comes back as a response like any other. Read the response body
-        with `response_body()`."""
+        with `response_body()`.
+
+        The stream ends on this side's last message: if the answer's end
+        and this forward's `request_end` both go before the head from
+        below arrives, it never does, and this raises `ProtocolError`. A
+        handler that wants the response holds its `response_end` back
+        until it has read it."""
         # Decided and sent as one: a response completing on another task
         # meanwhile would end the stream, and roxy drops a forward sent
         # after that. Forward before the response ends.

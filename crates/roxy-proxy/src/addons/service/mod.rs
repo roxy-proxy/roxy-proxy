@@ -602,6 +602,20 @@ impl Clock {
         self.deadline.send_replace(None);
     }
 
+    /// Stops the clock if `at` is still its deadline: an expiry seen
+    /// against a deadline that `restart` has since replaced (the response
+    /// from upstream came back meanwhile) leaves the new one to run.
+    fn stop_if(&self, at: Option<TokioInstant>) {
+        self.deadline.send_if_modified(|d| {
+            if *d == at {
+                *d = None;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
     /// The response from upstream is on its way to the service: it has the
     /// whole budget again to answer.
     fn restart(&self) {
@@ -641,7 +655,7 @@ impl Clock {
                         Err(TryRecvError::Closed) => {
                             return Err(ServiceError::Closed("the stream ended".into()));
                         }
-                        Err(TryRecvError::Empty) if forwarded() => self.stop(),
+                        Err(TryRecvError::Empty) if forwarded() => self.stop_if(at),
                         Err(TryRecvError::Empty) => {
                             return Err(ServiceError::Timeout("first_byte_timeout"));
                         }
@@ -739,9 +753,31 @@ async fn drain(body: Body) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Call, In, header_map, pairs};
+    use super::{Call, Clock, In, header_map, pairs};
     use http::{HeaderMap, HeaderValue};
     use serde_json::json;
+    use std::time::Duration;
+
+    /// An expiry resolved against a deadline the forward's return has
+    /// since replaced does not stop the fresh one: the service still has
+    /// its clock to answer.
+    #[tokio::test]
+    async fn an_expiry_seen_late_does_not_stop_a_restarted_clock() {
+        let clock = Clock::new(Duration::from_secs(1));
+        let expired = *clock.deadline.borrow();
+        clock.restart();
+        clock.stop_if(expired);
+        assert!(
+            clock.deadline.borrow().is_some(),
+            "the restarted deadline runs"
+        );
+        let current = *clock.deadline.borrow();
+        clock.stop_if(current);
+        assert!(
+            clock.deadline.borrow().is_none(),
+            "the deadline that expired is stopped"
+        );
+    }
 
     /// A header value's bytes above 0x7f reach the service as the code
     /// points of the same value and come back as the same bytes; a code

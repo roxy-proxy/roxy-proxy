@@ -455,9 +455,11 @@ impl StackFlow {
         self.layers[index].state() == NextState::Pending
     }
 
-    /// Layer `index` failed after answering: any forward of its still
-    /// running is given up, and it forwards nothing more.
-    pub(crate) fn layer_failed(&self, index: usize) {
+    /// Layer `index` is gone before its forward ended: it failed, or roxy
+    /// gave it up (the layer above dropped it, the exchange ended). The
+    /// forward is given up with it, nothing of the layer's reads its
+    /// response, and it forwards nothing more.
+    pub(crate) fn layer_gone(&self, index: usize) {
         self.layers[index].cancel.cancel();
         self.layer_done(index);
     }
@@ -1036,7 +1038,7 @@ pub(crate) fn enter(
                                     };
                                     drop(running);
                                     if failed {
-                                        st.layer_failed(index);
+                                        st.layer_gone(index);
                                     } else {
                                         st.layer_done(index);
                                     }

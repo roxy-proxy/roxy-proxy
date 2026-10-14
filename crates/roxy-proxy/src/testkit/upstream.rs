@@ -422,6 +422,9 @@ impl Upstream {
             let body = lock(&entry).body.clone();
             return echo(echo_status.as_ref(), echo_encoding, body);
         }
+        if let Some(query) = path.strip_prefix("/late?") {
+            return late(query).await;
+        }
         if path == "/cut" {
             return http::Response::builder()
                 .header("content-length", "10")
@@ -433,11 +436,7 @@ impl Upstream {
             return grpc(forbidden);
         }
         if path == "/trailers" {
-            let mut trailers = http::HeaderMap::new();
-            trailers.insert("x-checksum", http::HeaderValue::from_static("none"));
-            let body = Full::new(Bytes::new())
-                .with_trailers(async move { Some(Ok::<_, Infallible>(trailers)) });
-            return http::Response::new(body.boxed());
+            return trailers();
         }
         if let Some(code) = path.strip_prefix("/status/") {
             return http::Response::builder()
@@ -571,6 +570,25 @@ impl Upstream {
         }
         res.body(full(Bytes::new())).unwrap()
     }
+}
+
+/// `/trailers`: an empty body with an `x-checksum` trailer.
+fn trailers() -> http::Response<Body> {
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert("x-checksum", http::HeaderValue::from_static("none"));
+    let body =
+        Full::new(Bytes::new()).with_trailers(async move { Some(Ok::<_, Infallible>(trailers)) });
+    http::Response::new(body.boxed())
+}
+
+/// `/late?ms=..`: the head itself waits `ms`, once the upload is in.
+async fn late(query: &str) -> http::Response<Body> {
+    let ms = query
+        .strip_prefix("ms=")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+    http::Response::new(full(b"late".as_slice()))
 }
 
 fn full(b: impl Into<Bytes>) -> Body {

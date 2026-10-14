@@ -287,16 +287,16 @@ impl Stream {
         self.ended.cancel();
         lock(&self.link.shared.streams).open.remove(&self.id);
         drop(ending.slot);
-        if self.mode == AddonMode::Enforce {
-            // Nothing more comes off the stream: the layer forwards no
-            // more, and one that failed gives up a forward still running.
-            match &end {
-                End::Failed { .. } => self.st.layer_failed(self.index),
-                End::Quiet | End::Abandoned(_) => self.st.layer_done(self.index),
-            }
-        }
+        let enforce = self.mode == AddonMode::Enforce;
         let (e, reset) = match end {
-            End::Quiet => return true,
+            // The service's last message: the layer forwards no more, and
+            // a forward of its still running goes on to its end.
+            End::Quiet => {
+                if enforce {
+                    self.st.layer_done(self.index);
+                }
+                return true;
+            }
             End::Failed { e, reset } => {
                 self.broken.store(true, Ordering::SeqCst);
                 let message = e.to_string();
@@ -310,18 +310,25 @@ impl Stream {
                 (Unanswered::Abandoned(why.to_owned()), Some(why.to_owned()))
             }
         };
+        // Recorded before anything learns of the end: the exchange may
+        // finish on a body aborted here (the core failing on the request
+        // the service forwarded, say) before any answer is read, and a
+        // forward given up below must not record its own end as the
+        // first fault.
+        if let Unanswered::Service(e) = &e
+            && enforce
+        {
+            self.st.fail(&self.name(), StackError::Service(e.clone()));
+        }
+        // Failed or given up, nothing of the service's reads what its
+        // forward returns.
+        if enforce {
+            self.st.layer_gone(self.index);
+        }
         if let Some(message) = reset
             && self.wire.reset()
         {
             self.link.shared.send_ctl(self.id, &Out::Reset { message });
-        }
-        // Recorded before anything learns of the end: the exchange may
-        // finish on a body aborted here (the core failing on the request
-        // the service forwarded, say) before any answer is read.
-        if let Unanswered::Service(e) = &e
-            && self.mode == AddonMode::Enforce
-        {
-            self.st.fail(&self.name(), StackError::Service(e.clone()));
         }
         for inbox in ending.inboxes.into_iter().flatten() {
             inbox.abort(&e);

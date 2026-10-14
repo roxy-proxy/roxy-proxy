@@ -74,6 +74,37 @@ async def test_an_upgrade_streams_both_ways_with_no_request_end() -> None:
     assert stray_tasks(roxy.task) == set()
 
 
+async def test_a_forward_awaited_after_the_streams_end_fails() -> None:
+    """A handler that forwards and completes its answer before the head from
+    below arrives has sent its last message: roxy sends nothing more, so the
+    forward raises `ProtocolError` at once rather than waiting for a head
+    that cannot come."""
+    outcome: list[BaseException | None] = []
+    forwarded = asyncio.Event()
+
+    async def answer_while_forwarding(ex: Exchange) -> None:
+        head = asyncio.ensure_future(ex.forward(ex.request, b""))
+        # The forward goes out first, whole; the answer completes behind it.
+        await forwarded.wait()
+        await ex.respond(Response(200, []), b"")
+        try:
+            await head
+            outcome.append(None)
+        except ProtocolError as e:
+            outcome.append(e)
+
+    roxy = FakeRoxy(answer_while_forwarding)
+    roxy.open(1)
+    assert (await roxy.ws.next_sent())["type"] == "request"
+    assert (await roxy.ws.next_sent())["type"] == "request_end"
+    forwarded.set()
+    assert (await roxy.ws.next_sent())["type"] == "response"
+    assert (await roxy.ws.next_sent())["type"] == "response_end"
+    await roxy.until_closed(1)
+    assert outcome and isinstance(outcome[0], ProtocolError), outcome
+    assert stray_tasks(roxy.task) == set()
+
+
 async def test_a_call_awaited_after_the_streams_end_fails() -> None:
     """roxy runs a call sent before the stream's end but cannot answer it:
     a handler that sends its last message and then awaits the call gets a

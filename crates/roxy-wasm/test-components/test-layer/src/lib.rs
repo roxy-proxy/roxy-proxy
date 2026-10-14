@@ -667,6 +667,18 @@ impl Handler for Layer {
                 let (_below, from_below) = await_response(pending);
                 drop(read_all(&from_below));
             }
+            "next-then-abandon" => {
+                // Forward the whole request, wait `x-delay-ms` for the
+                // response, then give up on it and answer locally: a
+                // forward abandoned while it is upstream whole.
+                let (pending, output) = next_streaming(&forward_head(&req));
+                pump(&body, &output, false);
+                drop(body);
+                types::finish(output);
+                hold(&req, "delay");
+                drop(pending);
+                respond(200, b"gave up on the forward");
+            }
             "next-then-trap" => {
                 // Forward the whole request, then trap as the response from
                 // below arrives: a failure with a response open at the

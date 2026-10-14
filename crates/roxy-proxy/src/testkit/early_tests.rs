@@ -447,6 +447,46 @@ async fn h2_a_guest_answering_bodiless_still_completes_its_forward() {
     assert_eq!(seen[0].body.len(), 2 * CHUNK);
 }
 
+/// A layer above gives a service up while its forward is upstream whole,
+/// waiting on the head, and answers itself: the service's stream is reset,
+/// and its forward is given up with it, so the record is finished on the
+/// answer rather than held until an upstream nothing will read answers.
+#[tokio::test(start_paused = true)]
+async fn a_service_given_up_by_the_layer_above_gives_up_its_forward() {
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![
+            AddonDef::test_layer("a").spec().await,
+            testing::addon("s", "forward", AddonMode::Enforce, |_| {}),
+        ],
+    )
+    .await;
+    let ((a, ev), took) = super::timed(async {
+        let a = kit
+            .h1()
+            .await
+            .call(
+                "POST",
+                "/late?ms=5000",
+                &[("x-test-a", "next-then-abandon"), ("x-delay-ms", "200")],
+                b"hello",
+            )
+            .await;
+        (a, kit.request_event().await)
+    })
+    .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(ev["decision"], "answered", "{ev:#}");
+    assert_eq!(ev["terminal_rule"], "layer:a", "{ev:#}");
+    assert!(
+        took < Duration::from_secs(1),
+        "the record is not held for the upstream: {took:?}"
+    );
+    let svc = kit.upstream.service();
+    let resets = svc.resets();
+    assert_eq!(resets.len(), 1, "the service's stream is reset: {resets:?}");
+}
+
 /// A service that forwards, answers with no body, and ends its answer only
 /// once the response from below has: the front writes nothing for the
 /// answer and drops its body lane while the forward is still running,
