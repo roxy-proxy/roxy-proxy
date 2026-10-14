@@ -411,7 +411,7 @@ impl Conn {
         self.mode == Mode::Hold || self.passes(dir)
     }
 
-    fn control(&mut self, v: Value) {
+    fn control(&mut self, mut v: Value) {
         let Some(id) = v["stream"].as_u64().and_then(|n| u32::try_from(n).ok()) else {
             return;
         };
