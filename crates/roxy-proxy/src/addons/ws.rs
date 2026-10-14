@@ -17,7 +17,8 @@ use roxy_http::{Body, BodyError, BodySender, CanonicalResponse};
 use roxy_wasm::LayerRequest;
 use tokio::io::{AsyncRead, ReadBuf};
 
-use super::{StackFlow, gated};
+use super::StackFlow;
+use super::lanes::gated;
 use crate::flowlog::FlowSink;
 use crate::io::BoxIo;
 use crate::server::Snapshot;

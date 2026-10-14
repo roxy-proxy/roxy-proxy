@@ -1627,7 +1627,7 @@ mod service {
                 b"POST http://up.test/x HTTP/1.1\r\nhost: up.test\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\nzz\r\n",
             )
             .await;
-        assert!(eof);
+        assert!(eof, "{out}");
         assert!(out.starts_with("HTTP/1.1 400"), "{out}");
         let errs = kit.events("parse_error", 1).await;
         assert_eq!(errs[0]["reason"], "bad_chunk_size", "{errs:#?}");
@@ -3273,11 +3273,11 @@ async fn a_layer_subscribed_to_one_body_is_in_one_direction_of_a_websocket() {
     }
 }
 
-/// A layer below that fails is a response on the lane above it: the same
-/// `503 layer:<name>` the front wrote before, which the layer above passes
-/// on or reshapes. The record keeps the refusal either way: the failure
-/// is logged as the failing layer's, and the decision is the deny, whatever
-/// the client got.
+/// A layer upstream that fails is a response on the lane downstream of it:
+/// the `503 layer:<name>` roxy writes for a refusal, which the next layer
+/// passes on or reshapes. The record keeps the refusal either way: the
+/// failure is logged as the failing layer's, and the decision is the deny,
+/// whatever the client got.
 #[tokio::test]
 async fn a_failure_below_arrives_as_a_response_the_layer_above_may_reshape() {
     let kit = stack(&named(&["a", "b"])).await;

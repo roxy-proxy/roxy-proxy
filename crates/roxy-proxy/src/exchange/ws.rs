@@ -51,14 +51,14 @@ pub(super) async fn splice_websocket(
             .unwrap_or_default();
         let port = cx.facts.request.as_ref().map_or(0, |r| r.port);
         let r = protocol_refusal(&cx, &host, port, e.to_string());
-        return answer(conn, Reclaim::Now(Box::new(cx)), Answer::Refusal(r)).await;
+        return answer(conn, Reclaim::now(cx), Answer::Refusal(r)).await;
     }
     if parse {
         // Each direction reassembles up to a message's worth.
         let per_direction = cx.snap.limits.max_ws_message_bytes;
         let Some(lease) = cx.shared.reserve_buffer(per_direction.saturating_mul(2)) else {
             let r = Refusal::fail_closed(crate::budget::EXHAUSTED);
-            return answer(conn, Reclaim::Now(Box::new(cx)), Answer::Refusal(r)).await;
+            return answer(conn, Reclaim::now(cx), Answer::Refusal(r)).await;
         };
         cx.buffers.push(lease);
     }

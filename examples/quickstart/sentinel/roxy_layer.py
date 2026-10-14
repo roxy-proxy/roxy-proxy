@@ -240,14 +240,25 @@ class _Stream:
                 fut.set_exception(exc)
         self.pending.clear()
 
-    async def send(self, msg: dict[str, Any], *, host: bool = False, end: int | None = None) -> None:
+    async def send(
+        self,
+        msg: dict[str, Any],
+        *,
+        host: bool = False,
+        forward: bool = False,
+        end: int | None = None,
+    ) -> None:
         """Sends `msg` on the stream, under the connection's lock, so a
-        host-service call (`host`) either goes before this side's last
-        message or is refused (`ProtocolError`), never after it. `end` is
-        the direction whose end `msg` is."""
+        host-service call (`host`) or a forward (`forward`) either goes
+        before this side's last message or is refused (`ProtocolError`),
+        never after it, when roxy would drop it unanswered. `end` is the
+        direction whose end `msg` is."""
         async with self.conn.lock:
-            if host and self.ended:
-                raise ProtocolError("the stream has ended: a call now would be dropped")
+            if (host or forward) and self.ended:
+                what = "a call" if host else "a forward"
+                raise ProtocolError(f"the stream has ended: {what} now would be dropped")
+            if forward:
+                self.forwarded = True
             await self.conn.send_unlocked(self.id, msg)
             if end is not None:
                 self._ends_sent[end] = True
@@ -503,19 +514,17 @@ class Exchange:
         roxy re-validates the request and its rules judge it; a refusal
         comes back as a response like any other. Read the response body
         with `response_body()`."""
-        if self._s.ended:
-            # The stream ended on this side's last message: a response
-            # already complete with nothing forwarded. roxy takes nothing
-            # more from it, so forward before the response ends.
-            raise ProtocolError("the stream has ended: forward before the response ends")
-        self._s.forwarded = True
-        await self._send(
+        # Decided and sent as one: a response completing on another task
+        # meanwhile would end the stream, and roxy drops a forward sent
+        # after that. Forward before the response ends.
+        await self._s.send(
             {
                 "type": "request",
                 "method": request.method,
                 "url": request.url,
                 "headers": request.headers,
-            }
+            },
+            forward=True,
         )
         self._forwarding = asyncio.create_task(self._send_body(REQUEST, body))
         head = asyncio.ensure_future(self._s.recv(RESPONSE))

@@ -1,7 +1,7 @@
 //! Service layers: an external service in the network path.
 //!
-//! Each exchange is a stream (`roxy.layer.v0`) on one of a few pooled
-//! WebSocket connections to the layer's named endpoint ([`mux`]). The
+//! Each exchange is a stream on one of a few pooled WebSocket connections
+//! to the layer's named endpoint ([`mux`]). The
 //! stream carries the exchange's two lanes, each a head, bytes and an
 //! end, each way: roxy streams the request into it as it arrives, and the
 //! response from below once there is one; the service streams back the
@@ -111,9 +111,16 @@ pub(super) enum Unanswered {
     /// The service failed the stream.
     #[error(transparent)]
     Service(ServiceError),
-    /// roxy gave up on the stream: the service is not at fault.
+    /// roxy gave up on the stream (the client went away, say), recorded by
+    /// whoever gave it up: the service is not at fault.
     #[error("service stream lost: {0}")]
     Abandoned(String),
+}
+
+impl From<ServiceError> for Unanswered {
+    fn from(e: ServiceError) -> Self {
+        Unanswered::Service(e)
+    }
 }
 
 impl ServiceError {
@@ -418,24 +425,11 @@ pub(super) async fn handle(
     let name = st.snap.addons[index].name.clone();
     match run(&st, index, svc, req).await {
         Ok(r) => Ok(r),
-        Err(Fail::Below(e)) => Err(e),
-        Err(Fail::Service(e)) => {
+        Err(Unanswered::Abandoned(why)) => Err(HostError::new(why)),
+        Err(Unanswered::Service(e)) => {
             st.fail(&name, StackError::Service(e));
             Err(HostError::new(format!("service layer {name} failed")))
         }
-    }
-}
-
-enum Fail {
-    Service(ServiceError),
-    /// roxy gave the exchange up (the client went away, say), recorded by
-    /// whoever gave it up: not the service's failure.
-    Below(HostError),
-}
-
-impl From<ServiceError> for Fail {
-    fn from(e: ServiceError) -> Self {
-        Fail::Service(e)
     }
 }
 
@@ -473,7 +467,7 @@ async fn run(
     index: usize,
     svc: &ServiceSpec,
     req: LayerRequest,
-) -> Result<LayerResponse, Fail> {
+) -> Result<LayerResponse, Unanswered> {
     let (stream, answers) = tokio::time::timeout(
         svc.first_byte_timeout,
         mux::open(st, index, svc, AddonMode::Enforce),
@@ -502,7 +496,16 @@ async fn run(
         clock.clone(),
     ));
 
-    let res = clock.answer_by(answers.answer).await?.map_err(unanswered)?;
+    let res = match clock.answer_by(answers.answer).await {
+        Ok(answer) => answer?,
+        // The service's own deadline: it is told which, as for any fault
+        // of its own.
+        Err(e) => {
+            stream.fail(e.clone(), mux::Reset::Send);
+            guard.disarm();
+            return Err(e.into());
+        }
+    };
     guard.disarm();
     Ok(res)
 }
@@ -531,17 +534,16 @@ async fn forward(
         st.forward_dropped(index);
         return;
     }
-    clock.below();
-    let ending = st.ending();
+    clock.stop();
+    let torn_down = st.torn_down();
     let res = tokio::select! {
         biased;
-        () = ending.cancelled() => Err(()),
+        () = torn_down.cancelled() => Err(()),
         r = super::below(st.clone(), index, req) => r.map_err(|_| ()),
     };
     // Only the client's own failure comes back as an error: the exchange
-    // is closing, and nothing below answers it.
+    // is closing, and nothing upstream answers it.
     let Ok(res) = res else {
-        st.forward_dropped(index);
         stream.reset("the exchange ended");
         return;
     };
@@ -549,18 +551,10 @@ async fn forward(
     // has got. A `101` goes the same way: its body is the upstream's side
     // of the WebSocket, and the request body still streaming is the
     // client's.
-    clock.response_head();
+    clock.restart();
     let (parts, body) = res.into_parts();
     let head = response_head(&parts, &body);
     stream.pump(Dir::Response, head, body).await;
-}
-
-/// The exchange's failure when the service's answer will not come.
-fn unanswered(u: Unanswered) -> Fail {
-    match u {
-        Unanswered::Service(e) => Fail::Service(e),
-        Unanswered::Abandoned(why) => Fail::Below(HostError::new(why)),
-    }
 }
 
 /// The service's answer clock: `first_byte_timeout` from roxy's request
@@ -581,14 +575,14 @@ impl Clock {
         }
     }
 
-    /// The service forwarded: no clock runs while the request is below.
-    fn below(&self) {
+    /// The service forwarded: no clock runs while the request is upstream.
+    fn stop(&self) {
         self.deadline.send_replace(None);
     }
 
-    /// The response from below is on its way to the service: it has the
+    /// The response from upstream is on its way to the service: it has the
     /// whole budget again to answer.
-    fn response_head(&self) {
+    fn restart(&self) {
         self.deadline
             .send_replace(Some(TokioInstant::now() + self.limit));
     }

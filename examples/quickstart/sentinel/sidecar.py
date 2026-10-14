@@ -78,7 +78,7 @@ from private_api import (
     resolve_sentinel,
     run_sentinel,
 )
-from roxy_layer import Exchange, Request, Response, serve
+from roxy_layer import BodyFailed, Exchange, Request, Response, serve
 
 log = logging.getLogger("sentinel-sidecar")
 
@@ -314,7 +314,14 @@ class Sidecar:
             res = await ex.forward(ex.request, ex.body())
             await ex.respond(res, ex.response_body())
             return
-        body = await ex.read_body()
+        try:
+            body = await ex.read_body()
+        except BodyFailed as e:
+            await ex.respond(
+                Response(400, [("content-type", "text/plain")]),
+                f"request body failed: {e}\n".encode(),
+            )
+            return
         res = await ex.forward(ex.request, body)
         if res.status == 101:
             # An upgrade's response body is the WebSocket: it has no end to
@@ -326,7 +333,14 @@ class Sidecar:
             head = [(n, v) for n, v in res.headers if n.lower() != "content-length"]
             await ex.respond(Response(res.status, head), self.judged_stream(ex, body, res))
             return
-        raw = await ex.read_response_body()
+        try:
+            raw = await ex.read_response_body()
+        except BodyFailed as e:
+            await ex.respond(
+                Response(502, [("content-type", "text/plain")]),
+                f"upstream body failed: {e}\n".encode(),
+            )
+            return
         if res.status != 200 or ex.observing:
             await ex.respond(res, raw)
             if ex.observing and res.status == 200:

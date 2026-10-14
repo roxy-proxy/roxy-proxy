@@ -16,12 +16,15 @@ mod attribution;
 mod decode;
 mod endpoint;
 mod host;
+mod lanes;
+mod reclaim;
 mod select;
 pub mod service;
 mod subscribe;
 mod tee;
 mod ws;
 
+pub(crate) use reclaim::Reclaim;
 pub use service::{ServiceError, ServiceSpec};
 pub use subscribe::{Part, Subscription};
 pub(crate) use ws::{SplicedClient, splice_client, ws_without_extensions};
@@ -30,24 +33,20 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
-use bytes::Bytes;
 use http::{HeaderName, StatusCode};
-use http_body::{Body as HttpBody, Frame, SizeHint};
 use roxy_http::layer::{from_layer_request, to_layer_request, to_layer_response};
 use roxy_http::upstream::from_upstream_response;
-use roxy_http::{Body, BodyError, BodySender, CanonicalRequest, RequestMeta};
+use roxy_http::{Body, BodySender, CanonicalRequest, RequestMeta};
 use roxy_wasm::{HostError, LayerError, LayerRequest, LayerResponse, TagError};
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use self::attribution::{Attribution, Driven, Fault, Side, attributed};
 use crate::addr::PrivateAddrs;
 use crate::body::{Collected, collect_prefix};
 use crate::exchange::{Front, Outcome, bad_upgrade_refusal, refusal_response};
-use crate::flowlog::{DecisionKind, FlowEvent, FlowSink};
+use crate::flowlog::{DecisionKind, FlowEvent};
 use crate::pipeline::{BodyIo, CollectFuture, Decider, FlowCx, FlowMeta, Refusal, RefusalKind};
 use crate::view::FlowFacts;
 
@@ -193,11 +192,10 @@ enum NextState {
     Entered,
     /// `next` called; no response yet.
     Pending,
-    /// `next` returned the response from below.
+    /// `next` returned the response from upstream.
     Resolved,
-    /// `next` failed.
-    Failed,
-    /// The layer dropped `next` before it returned.
+    /// `next` ended without one: the layer dropped it, or the exchange was
+    /// torn down under it.
     Abandoned,
 }
 
@@ -207,8 +205,7 @@ impl NextState {
             1 => Self::Entered,
             2 => Self::Pending,
             3 => Self::Resolved,
-            4 => Self::Failed,
-            5 => Self::Abandoned,
+            4 => Self::Abandoned,
             _ => Self::Unentered,
         }
     }
@@ -220,9 +217,11 @@ struct LayerSlot {
     next: AtomicU8,
     /// The layer ran on this exchange: its `when` and `sample` let it.
     ran: AtomicBool,
+    /// An enforce layer that is still running: it may yet forward.
+    live: AtomicBool,
     /// Bodies bypassing the layer (enforce mode, head-only subscription).
     bypass: Mutex<subscribe::Bypass>,
-    /// The layer failed: a forward of its still below is given up.
+    /// The layer failed: any forward of its still running is given up.
     cancel: CancellationToken,
 }
 
@@ -259,7 +258,7 @@ impl NextGuard {
         let s = if ok {
             NextState::Resolved
         } else {
-            NextState::Failed
+            NextState::Abandoned
         };
         self.st.set_next(self.index, s);
     }
@@ -270,100 +269,6 @@ impl Drop for NextGuard {
         if !self.settled {
             self.st.set_next(self.index, NextState::Abandoned);
         }
-    }
-}
-
-/// The flow's one [`FlowCx`], lent to the core for as long as it runs. It
-/// goes back to the stack however the core ends, dropped mid-flight
-/// included, so nothing the core recorded is lost.
-struct Lease {
-    st: Arc<StackFlow>,
-    cx: Option<FlowCx>,
-    /// The core ran to its outcome.
-    done: bool,
-}
-
-impl Lease {
-    fn cx(&mut self) -> &mut FlowCx {
-        self.cx.as_mut().expect("leased until dropped")
-    }
-}
-
-impl Drop for Lease {
-    fn drop(&mut self) {
-        let Some(mut cx) = self.cx.take() else {
-            return;
-        };
-        if !self.done && cx.record.decision.is_some() {
-            // The rules had decided and the request was on its way.
-            cx.record
-                .reason
-                .get_or_insert_with(|| "upstream_aborted".to_owned());
-        }
-        self.st.loan.give_back(cx);
-    }
-}
-
-/// The flow's [`FlowCx`], parked in the stack while the layers run and lent
-/// to the core (once) while it runs. However the core ends, the context
-/// comes back here, so nothing it recorded is lost.
-struct Loan {
-    cx: Mutex<Option<FlowCx>>,
-    /// The core gave the flow context back.
-    returned: Notify,
-    /// The exchange is being torn down: a core still running is stopped.
-    abandon: CancellationToken,
-    /// The front took the context back: nothing in the stack sees it
-    /// again.
-    gone: AtomicBool,
-}
-
-impl Loan {
-    fn new() -> Self {
-        Self {
-            cx: Mutex::new(None),
-            returned: Notify::new(),
-            abandon: CancellationToken::new(),
-            gone: AtomicBool::new(false),
-        }
-    }
-
-    fn park(&self, cx: FlowCx) {
-        *lock(&self.cx) = Some(cx);
-    }
-
-    /// Takes the context to lend it. `None` if it is already lent.
-    fn take(&self) -> Option<FlowCx> {
-        lock(&self.cx).take()
-    }
-
-    fn give_back(&self, cx: FlowCx) {
-        *lock(&self.cx) = Some(cx);
-        self.returned.notify_one();
-    }
-
-    /// Takes the context back once the core has returned it, or if it
-    /// never took it. A core still running keeps it. `None` once the front
-    /// has it: it is not coming back.
-    async fn returned(&self) -> Option<FlowCx> {
-        loop {
-            let notified = self.returned.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.gone.load(Ordering::SeqCst) {
-                return None;
-            }
-            if let Some(cx) = self.take() {
-                return Some(cx);
-            }
-            notified.await;
-        }
-    }
-
-    /// Wakes whoever waits on the context: it came back, or what decides
-    /// whether it is still needed below has changed.
-    fn changed(&self) {
-        self.returned.notify_waiters();
     }
 }
 
@@ -391,7 +296,7 @@ pub(crate) struct StackFlow {
     /// layer passes on inherits: a layer cannot express the protocol
     /// version, the target form or an upgrade.
     client_meta: RequestMeta,
-    loan: Loan,
+    loan: reclaim::Loan,
     layers: Box<[LayerSlot]>,
     /// Who is to blame for the exchange failing, if it does.
     pub(crate) attribution: Attribution,
@@ -402,14 +307,16 @@ pub(crate) struct StackFlow {
     upgrade: Mutex<Upgrade>,
     /// Permits for the exchange's endpoint calls in flight.
     endpoint_calls: Arc<tokio::sync::Semaphore>,
-    /// The layer whose own response reached the client, decided as it did:
-    /// `Some(None)` when the response was the core's.
-    answered: std::sync::OnceLock<Option<usize>>,
+    /// Whose response reached the client, decided as it did: a layer's
+    /// own, or (`Some(None)`) the core's.
+    decided: std::sync::OnceLock<Option<usize>>,
     /// The request reached the core: the connector is its consumer from
     /// then on.
     core_entered: AtomicBool,
-    /// The client's request lane is dropped: nothing below will consume
-    /// it, and the response is complete.
+    /// The client's response is complete.
+    response_done: AtomicBool,
+    /// The client's request lane is snipped: the response is complete and
+    /// nothing upstream will consume the rest.
     snip: CancellationToken,
 }
 
@@ -427,7 +334,7 @@ impl StackFlow {
             meta: cx.meta.clone(),
             facts: Mutex::new(cx.facts.clone()),
             client_meta: req.meta.clone(),
-            loan: Loan::new(),
+            loan: reclaim::Loan::new(),
             layers: cx
                 .snap
                 .addons
@@ -441,8 +348,9 @@ impl StackFlow {
             endpoint_calls: Arc::new(tokio::sync::Semaphore::new(
                 endpoint::MAX_ENDPOINT_CALLS_IN_FLIGHT,
             )),
-            answered: std::sync::OnceLock::new(),
+            decided: std::sync::OnceLock::new(),
             core_entered: AtomicBool::new(false),
+            response_done: AtomicBool::new(false),
             snip: CancellationToken::new(),
         }
     }
@@ -451,69 +359,92 @@ impl StackFlow {
     /// request, the pumps feeding layers. For an exchange the front has
     /// given up on, or refused; never for one a layer merely answered.
     pub(crate) fn tear_down(&self) {
-        self.loan.abandon.cancel();
+        self.loan.torn_down.cancel();
         self.snip.cancel();
     }
 
     /// Cancelled when the exchange is torn down.
-    pub(crate) fn ending(&self) -> CancellationToken {
-        self.loan.abandon.clone()
+    pub(crate) fn torn_down(&self) -> CancellationToken {
+        self.loan.torn_down.clone()
     }
 
     /// Takes the flow context back for the record: once the core has
-    /// returned it, and no forward is still on its way to the core. A
-    /// layer's answer reaching the client says nothing about the request
-    /// it forwarded, which runs to its end below first.
+    /// returned it, and nothing in the stack can still forward. A layer's
+    /// answer reaching the client says nothing about the request it
+    /// forwarded, or may yet forward, which runs to its end first.
     async fn reclaim(&self) -> FlowCx {
-        loop {
-            let notified = self.loan.returned.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if !self.forward_pending()
-                && let Some(cx) = self.loan.take()
-            {
-                self.loan.gone.store(true, Ordering::SeqCst);
-                self.loan.changed();
-                return cx;
-            }
-            notified.await;
-        }
+        let cx = self
+            .loan
+            .wait_until(|loan| {
+                if self.can_forward() {
+                    return None;
+                }
+                loan.take()
+            })
+            .await;
+        self.loan.taken();
+        cx
     }
 
-    /// A forward is on its way to the core, or the core is running it.
-    fn forward_pending(&self) -> bool {
-        self.layers.iter().any(|l| l.state() == NextState::Pending)
+    /// A request may still reach the core: a forward is on its way or
+    /// running, or a layer is still alive without having forwarded.
+    fn can_forward(&self) -> bool {
+        self.layers.iter().any(|l| match l.state() {
+            NextState::Pending => true,
+            NextState::Entered => l.live.load(Ordering::SeqCst),
+            NextState::Unentered | NextState::Resolved | NextState::Abandoned => false,
+        })
     }
 
     fn set_next(&self, index: usize, state: NextState) {
         self.layers[index].set(state);
-        self.loan.changed();
+        self.lanes_changed();
     }
 
-    /// The response the client got is complete. If nothing below will
-    /// consume the rest of the request, no forward on its way to the core
-    /// and the core never entered, the client's lane is dropped, parked
-    /// bypassed bodies included, so the front drains or closes rather than
-    /// waits on a reader that will not come. A forward a layer dropped on
-    /// the way has gone with it.
+    /// Layer `index` is done: its handler returned, or its stream ended.
+    /// It forwards nothing more.
+    pub(crate) fn layer_done(&self, index: usize) {
+        self.layers[index].live.store(false, Ordering::SeqCst);
+        self.lanes_changed();
+    }
+
+    /// The response the client got is complete.
     fn response_complete(&self) {
-        if self.core_entered.load(Ordering::SeqCst) || self.forward_pending() {
-            return;
-        }
-        self.snip.cancel();
-        for index in 0..self.layers.len() {
-            subscribe::release_request(self, index);
+        self.response_done.store(true, Ordering::SeqCst);
+        self.lanes_changed();
+    }
+
+    /// Something that decides the exchange's end moved: whoever waits on
+    /// the context is woken, and the request lane is snipped once the
+    /// response is complete and nothing upstream will consume the rest of
+    /// it: the core never entered, and nothing can still forward. The
+    /// client's lane is dropped, parked bypassed bodies included, so the
+    /// front drains or closes rather than waits on a reader that will not
+    /// come.
+    fn lanes_changed(&self) {
+        self.loan.changed();
+        if self.response_done.load(Ordering::SeqCst)
+            && !self.core_entered.load(Ordering::SeqCst)
+            && !self.can_forward()
+            && !self.snip.is_cancelled()
+        {
+            self.snip.cancel();
+            for index in 0..self.layers.len() {
+                subscribe::release_request(self, index);
+            }
         }
     }
 
-    /// Layer `index` is forwarding: its request is on its way to the layer
-    /// below, before the call that carries it has run.
+    /// Layer `index` is forwarding: its request is on its way to the next
+    /// layer. Marked here, before the call that carries it runs, so a
+    /// response completing meanwhile neither snips the lane nor lets the
+    /// record go.
     pub(crate) fn forwarding(&self, index: usize) {
         self.set_next(index, NextState::Pending);
     }
 
-    /// Layer `index`'s forward was given up before it reached the layer
-    /// below.
+    /// Layer `index`'s forward was given up before it reached the next
+    /// layer.
     pub(crate) fn forward_dropped(&self, index: usize) {
         self.set_next(index, NextState::Abandoned);
     }
@@ -532,8 +463,8 @@ impl StackFlow {
 
     /// Lends the flow context to the core. `None` if it is already lent
     /// (the core runs at most once per exchange).
-    fn lease(self: &Arc<Self>) -> Option<Lease> {
-        Some(Lease {
+    fn lease(self: &Arc<Self>) -> Option<reclaim::Lease> {
+        Some(reclaim::Lease {
             st: self.clone(),
             cx: Some(self.loan.take()?),
             done: false,
@@ -616,7 +547,7 @@ impl StackFlow {
     /// The core relayed an upgrade; the stack's answer decides its fate. An
     /// answer already given carries no relay: the upstream side is closed.
     fn relayed(&self, relay: ws::Relay) {
-        if self.answered.get().is_some() {
+        if self.decided.get().is_some() {
             tokio::spawn(crate::exchange::close_upstream_ws(relay.upstream));
             return;
         }
@@ -658,7 +589,7 @@ impl StackFlow {
         self.layers.iter().position(|l| {
             matches!(
                 l.state(),
-                NextState::Entered | NextState::Pending | NextState::Failed | NextState::Abandoned
+                NextState::Entered | NextState::Pending | NextState::Abandoned
             )
         })
     }
@@ -697,7 +628,7 @@ impl StackFlow {
         if cx.record.decision == Some(DecisionKind::Deny) {
             return;
         }
-        if let Some(Some(i)) = self.answered.get() {
+        if let Some(Some(i)) = self.decided.get() {
             cx.record.decision = Some(DecisionKind::Answered);
             cx.record.terminal_rule = Some(Decider::Layer(self.snap.addons[*i].name.clone()));
         }
@@ -794,57 +725,6 @@ fn layer_refusal(layer: &str) -> Refusal {
     }
 }
 
-/// The flow's [`FlowCx`] on its way back to the front. The stack lends it
-/// to the core while a forwarded request runs, and the front takes it back
-/// once the core has returned it: a layer's answer reaches the client
-/// first, the record is finished when the exchange has ended.
-pub(crate) enum Reclaim {
-    /// No stack, or the stack is done with it.
-    Now(Box<FlowCx>),
-    /// With the stack, whose core may still be running.
-    Stack(Arc<StackFlow>),
-}
-
-impl Reclaim {
-    /// The flow context, once the core has returned it. A stack that
-    /// answered folds its answer into the record.
-    pub(crate) async fn take(self) -> FlowCx {
-        match self {
-            Reclaim::Now(cx) => *cx,
-            Reclaim::Stack(st) => {
-                let mut cx = st.reclaim().await;
-                st.fold_answer(&mut cx);
-                cx.stack = Some(st);
-                cx
-            }
-        }
-    }
-
-    /// Stops whatever the stack still has running, so `take` returns as
-    /// soon as the core has let go.
-    pub(crate) fn tear_down(&self) {
-        if let Reclaim::Stack(st) = self {
-            st.tear_down();
-        }
-    }
-
-    /// The response has been written, whether or not its body was polled
-    /// to its end.
-    pub(crate) fn response_written(&self) {
-        if let Reclaim::Stack(st) = self {
-            st.response_complete();
-        }
-    }
-
-    /// The process was quarantined while the exchange ran.
-    pub(crate) fn quarantined(&self) -> bool {
-        match self {
-            Reclaim::Now(cx) => cx.shared.quarantined(),
-            Reclaim::Stack(st) => st.shared.quarantined(),
-        }
-    }
-}
-
 /// Runs the exchange through the addon stack. The flow context is parked
 /// in the stack while the layers run, lent to the core if a request
 /// reaches it, and comes back to the front through the [`Reclaim`].
@@ -860,7 +740,7 @@ pub(crate) async fn run<F: Front>(
         // The swap below would hide a body from `validate_upgrade_request`.
         if req.body.known_length() != Some(0) {
             let refusal = bad_upgrade_refusal(roxy_http::Reason::WsBadHandshake);
-            return (Reclaim::Now(Box::new(cx)), Outcome::Refuse(refusal));
+            return (Reclaim::now(cx), Outcome::Refuse(refusal));
         }
         let (tx, body) = Body::channel(u64::MAX, None);
         req.body = body;
@@ -868,7 +748,7 @@ pub(crate) async fn run<F: Front>(
     } else {
         None
     };
-    req.body = snipped(
+    req.body = lanes::snipped(
         &st,
         attributed(&st, Side::Client, std::mem::take(&mut req.body)),
     );
@@ -910,16 +790,16 @@ fn stack_outcome(
     // layer that failed answered nothing: the refusal its failure earned
     // did, and the record already says so.
     let answered = st.answered_by().filter(|&i| st.failed_layer() != Some(i));
-    let _ = st.answered.set(answered);
+    let _ = st.decided.set(answered);
     let mut resp = resp;
     // A `101`'s body is the upgraded stream for the client, not an HTTP
     // body: keep it out of the response model.
     let upgraded_body = (resp.status() == http::StatusCode::SWITCHING_PROTOCOLS)
         .then(|| std::mem::take(resp.body_mut()));
     let mut res = from_upstream_response(resp, &st.snap.limits);
-    res.body = completing(
+    res.body = lanes::completing(
         st,
-        gated(std::mem::take(&mut res.body), st.shared.sink.clone()),
+        lanes::gated(std::mem::take(&mut res.body), st.shared.sink.clone()),
     );
     if st.close.load(Ordering::Relaxed) {
         res.meta.close = true;
@@ -1018,111 +898,6 @@ async fn seeded_refusal(st: &Arc<StackFlow>) -> Option<LayerResponse> {
     Some(to_layer_response(res))
 }
 
-/// The client's request body as it enters the stack: dropped, with the
-/// rest of it unread, once the stack has snipped the lane.
-fn snipped(st: &Arc<StackFlow>, body: Body) -> Body {
-    let known = body.known_length();
-    Body::wrap_native(
-        Snipped {
-            inner: Some(body),
-            snip: Box::pin(st.snip.clone().cancelled_owned()),
-        },
-        u64::MAX,
-        known,
-    )
-}
-
-/// A body dropped where it is when its lane is snipped: the reader sees
-/// it abandoned, never complete.
-struct Snipped {
-    inner: Option<Body>,
-    /// One future for the snip, so its waker stays registered across
-    /// polls that found the inner body pending.
-    snip: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
-}
-
-impl HttpBody for Snipped {
-    type Data = Bytes;
-    type Error = BodyError;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
-        let this = &mut *self;
-        let Some(inner) = &mut this.inner else {
-            return Poll::Ready(Some(Err(BodyError::Abandoned)));
-        };
-        if this.snip.as_mut().poll(cx).is_ready() {
-            this.inner = None;
-            return Poll::Ready(Some(Err(BodyError::Abandoned)));
-        }
-        Pin::new(inner).poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        // Snipped is cut, never complete.
-        self.inner.as_ref().is_some_and(Body::is_end_stream)
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner
-            .as_ref()
-            .map_or_else(SizeHint::default, Body::size_hint)
-    }
-}
-
-/// The response on its way to the client: its end tells the stack the
-/// response is complete. An empty body is complete with its head.
-fn completing(st: &Arc<StackFlow>, body: Body) -> Body {
-    if body.is_end_stream() {
-        st.response_complete();
-        return body;
-    }
-    let known = body.known_length();
-    Body::wrap_native(
-        Completing {
-            inner: body,
-            st: st.clone(),
-            done: false,
-        },
-        u64::MAX,
-        known,
-    )
-}
-
-struct Completing {
-    inner: Body,
-    st: Arc<StackFlow>,
-    done: bool,
-}
-
-impl HttpBody for Completing {
-    type Data = Bytes;
-    type Error = BodyError;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
-        let this = &mut *self;
-        let frame = ready!(Pin::new(&mut this.inner).poll_frame(cx));
-        if !this.done && !matches!(frame, Some(Ok(_))) {
-            this.done = true;
-            this.st.response_complete();
-        }
-        Poll::Ready(frame)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-}
-
 /// Runs layer `index` on `req`.
 pub(crate) fn enter(
     st: Arc<StackFlow>,
@@ -1155,6 +930,14 @@ pub(crate) fn enter(
             return tee::observe(st, index, req).await;
         }
         let req = subscribe::detach_request(&st, index, req);
+        // Live until something says otherwise: the layer's own done signal
+        // once it has one, or this future being dropped before then.
+        st.layers[index].live.store(true, Ordering::SeqCst);
+        let mut live = Live {
+            st: st.clone(),
+            index,
+            armed: true,
+        };
         let res = match &addon.kind {
             AddonImpl::Wasm(layer) => {
                 let h = Arc::new(host::StackHost {
@@ -1164,7 +947,21 @@ pub(crate) fn enter(
                     call: None,
                 });
                 match layer.handle(h, req).await {
-                    Ok(r) => Ok(r),
+                    Ok(r) => {
+                        // The guest runs on after answering, and may still
+                        // forward, until its handler returns.
+                        if let Some(outcome) = r.extensions().get::<roxy_wasm::LayerOutcome>() {
+                            let outcome = outcome.clone();
+                            let st = st.clone();
+                            tokio::spawn(async move {
+                                let _ = outcome.wait().await;
+                                st.layer_done(index);
+                            });
+                        } else {
+                            st.layer_done(index);
+                        }
+                        Ok(r)
+                    }
                     // Recorded as it happened, through the host; an error
                     // from before the exchange had a host (no instance,
                     // say) is not.
@@ -1174,14 +971,46 @@ pub(crate) fn enter(
                     }
                 }
             }
+            // A service's stream ending marks it done.
             AddonImpl::Service(svc) => service::handle(st.clone(), index, svc, req).await,
         };
-        // A failed layer's forward does not run on past it.
         if res.is_err() {
+            // A failed layer forwards nothing more, and any forward of its
+            // still running is given up.
             st.layers[index].cancel.cancel();
         }
+        live.handed_over(res.is_ok());
         res.map(|r| subscribe::reattach_response(&st, index, r))
     })
+}
+
+/// Marks layer `index` done if the layer's future is dropped before the
+/// layer has a done signal of its own: the exchange ended while its stream
+/// was opening, say.
+struct Live {
+    st: Arc<StackFlow>,
+    index: usize,
+    armed: bool,
+}
+
+impl Live {
+    /// The layer answered, and its kind signals its end from here: a WASM
+    /// layer when its handler returns, a service when its stream ends. A
+    /// layer that failed is done now.
+    fn handed_over(&mut self, answered: bool) {
+        self.armed = false;
+        if !answered {
+            self.st.layer_done(self.index);
+        }
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        if self.armed {
+            self.st.layer_done(self.index);
+        }
+    }
 }
 
 /// What layer `index`'s `next` reaches: the next layer, or the core. What
@@ -1206,14 +1035,14 @@ pub(crate) fn below(
         let cancelled = st.layers[index].cancel.clone();
         let r = tokio::select! {
             biased;
+            // The layer failed: nothing reads what its forward returns.
             () = cancelled.cancelled() => Err(HostError::new("the layer failed")),
-            r = fut => r,
-        };
-        let r = match r {
-            Ok(r) => Ok(r),
-            Err(e) => match seeded_refusal(&st).await {
-                Some(res) => Ok(res),
-                None => Err(e),
+            r = fut => match r {
+                Ok(r) => Ok(r),
+                Err(e) => match seeded_refusal(&st).await {
+                    Some(res) => Ok(res),
+                    None => Err(e),
+                },
             },
         };
         guard.settle(r.is_ok());
@@ -1290,7 +1119,7 @@ async fn core(
     let mut front = Detached;
     let outcome = tokio::select! {
         biased;
-        () = st.loan.abandon.cancelled() => None,
+        () = st.loan.torn_down.cancelled() => None,
         o = crate::exchange::core(&mut front, cx, creq) => Some(o),
     };
     let Some(outcome) = outcome else {
@@ -1339,40 +1168,7 @@ async fn core(
     }
 }
 
-/// A layer's response body to the client, sent only while the flow log
-/// keeps up (audit backpressure).
-struct Gated {
-    inner: Body,
-    sink: Arc<dyn FlowSink>,
-}
-
-impl HttpBody for Gated {
-    type Data = Bytes;
-    type Error = BodyError;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
-        ready!(self.sink.poll_ready(cx));
-        Pin::new(&mut self.inner).poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-fn gated(body: Body, sink: Arc<dyn FlowSink>) -> Body {
-    let known = body.known_length();
-    Body::wrap_native(Gated { inner: body, sink }, u64::MAX, known)
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(super) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 

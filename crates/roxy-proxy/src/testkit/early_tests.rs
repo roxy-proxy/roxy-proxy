@@ -251,9 +251,10 @@ async fn an_outer_layer_answering_after_the_inner_one_forwarded_is_the_one_named
 
 // ---- a layer answering while its forward runs on ----------------------------
 
-/// The head of an upload the layer answers early: the response head
-/// reaches the client while the upload is still open, and the rest of
-/// the response is read once the upload has ended.
+/// The head of an upload the layer answers early, with the upload still
+/// open. Unlike [`upload`], the response is not collected: a WASM layer's
+/// response body ends only once its handler returns, which here waits on
+/// the forward, which waits on the rest of the upload.
 async fn head_mid_upload(
     c: &mut Client,
     headers: &[(&str, &str)],
@@ -293,10 +294,13 @@ async fn answer_then_forward(kit: &Kit, mut c: Client, headers: &[(&str, &str)],
     assert!(strs(&ev["rules"]).contains(&"up".to_owned()), "{ev:#}");
 }
 
-#[tokio::test]
-async fn h1_a_wasm_layer_answering_before_next_leaves_the_forward_to_complete() {
+async fn wasm_answers_then_forwards(h2: bool) {
     let kit = stack(&["a"]).await;
-    let c = kit.h1().await;
+    let c = if h2 {
+        kit.tunnel("up.test", true).await
+    } else {
+        kit.h1().await
+    };
     answer_then_forward(
         &kit,
         c,
@@ -309,26 +313,29 @@ async fn h1_a_wasm_layer_answering_before_next_leaves_the_forward_to_complete() 
 }
 
 #[tokio::test]
-async fn h2_a_wasm_layer_answering_before_next_leaves_the_forward_to_complete() {
-    let kit = stack(&["a"]).await;
-    let c = kit.tunnel("up.test", true).await;
-    answer_then_forward(
-        &kit,
-        c,
-        &[("x-test-a", "answer-then-next")],
-        b"answered before forwarding",
-    )
-    .await;
+async fn h1_a_wasm_layer_answering_before_next_leaves_the_forward_to_complete() {
+    wasm_answers_then_forwards(false).await;
 }
 
 #[tokio::test]
-async fn a_service_answering_while_it_forwards_leaves_the_forward_to_complete() {
+async fn h2_a_wasm_layer_answering_before_next_leaves_the_forward_to_complete() {
+    wasm_answers_then_forwards(true).await;
+}
+
+/// A service that forwards and answers at once: the stream's state machine
+/// takes the two heads in either order; here the forward is first on the
+/// wire, as a stream ends on the service's last message.
+async fn service_answers_while_forwarding(h2: bool) {
     let kit = testing::kit(
         super::ALLOW_UP,
         vec![testing::addon("s", "early", AddonMode::Enforce, |_| {})],
     )
     .await;
-    let c = kit.h1().await;
+    let c = if h2 {
+        kit.tunnel("up.test", true).await
+    } else {
+        kit.h1().await
+    };
     answer_then_forward(&kit, c, &[], b"early").await;
     let ev = kit.request_event().await;
     assert_eq!(ev["terminal_rule"], "layer:s", "{ev:#}");
@@ -338,6 +345,16 @@ async fn a_service_answering_while_it_forwards_leaves_the_forward_to_complete() 
         "nothing reset the stream: {:?}",
         svc.resets()
     );
+}
+
+#[tokio::test]
+async fn h1_a_service_answering_while_it_forwards_leaves_the_forward_to_complete() {
+    service_answers_while_forwarding(false).await;
+}
+
+#[tokio::test]
+async fn h2_a_service_answering_while_it_forwards_leaves_the_forward_to_complete() {
+    service_answers_while_forwarding(true).await;
 }
 
 /// The rules' verdict on a forward stands in the record whatever the
@@ -376,33 +393,4 @@ async fn a_deny_of_the_forward_outlives_the_layers_early_answer() {
     assert_eq!(ev["terminal_rule"], "no-denied");
     assert_eq!(ev["res"]["status"], 200);
     assert!(kit.upstream.seen().is_empty(), "nothing left");
-}
-
-#[tokio::test]
-async fn a_service_answering_before_it_forwards_leaves_the_forward_to_complete() {
-    let kit = testing::kit(
-        super::ALLOW_UP,
-        vec![testing::addon(
-            "s",
-            "answer-first",
-            AddonMode::Enforce,
-            |_| {},
-        )],
-    )
-    .await;
-    let c = kit.h1().await;
-    answer_then_forward(&kit, c, &[], b"early").await;
-    let ev = kit.request_event().await;
-    assert_eq!(ev["terminal_rule"], "layer:s", "{ev:#}");
-}
-
-#[tokio::test]
-async fn h2_a_service_answering_while_it_forwards_leaves_the_forward_to_complete() {
-    let kit = testing::kit(
-        super::ALLOW_UP,
-        vec![testing::addon("s", "early", AddonMode::Enforce, |_| {})],
-    )
-    .await;
-    let c = kit.tunnel("up.test", true).await;
-    answer_then_forward(&kit, c, &[], b"early").await;
 }

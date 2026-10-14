@@ -245,7 +245,7 @@ pub(super) enum End<'a> {
 
 /// Whether failing a stream tells the service (a `reset` message).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Reset {
+pub(crate) enum Reset {
     Send,
     /// The connection is gone, or the service already ended the stream.
     Skip,
@@ -282,6 +282,10 @@ impl Stream {
         self.ended.cancel();
         lock(&self.link.shared.streams).open.remove(&self.id);
         drop(ending.slot);
+        if self.mode == AddonMode::Enforce {
+            // Nothing more comes off the stream: the layer forwards no more.
+            self.st.layer_done(self.index);
+        }
         let (e, reset) = match end {
             End::Quiet => return true,
             End::Failed { e, reset } => {
@@ -317,7 +321,7 @@ impl Stream {
 
     /// The service failed this stream. False if it had already ended, so
     /// nobody was told.
-    pub(super) fn fail(&self, e: ServiceError, reset: Reset) -> bool {
+    pub(crate) fn fail(&self, e: ServiceError, reset: Reset) -> bool {
         self.settle(End::Failed { e, reset })
     }
 
@@ -656,11 +660,13 @@ impl Stream {
         match lane.inbox.take() {
             Some(inbox) => {
                 if let Some(why) = &error {
+                    // The service's text, bounded as its reset messages are.
+                    let why: String = why.chars().take(200).collect();
                     self.st.fail(
                         &self.name(),
                         StackError::Service(ServiceError::Cut {
                             dir: dir.as_str(),
-                            why: why.clone(),
+                            why,
                         }),
                     );
                 }

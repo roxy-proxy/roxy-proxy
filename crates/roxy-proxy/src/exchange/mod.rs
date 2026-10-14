@@ -128,49 +128,37 @@ pub(crate) struct Sent {
 /// answer reaches the client while the request it forwarded is still
 /// below, and the record is finished once the core has returned the
 /// context. A refusal ends the stack first: nothing below it answers.
-pub(crate) async fn send<W, Fut>(reclaim: Reclaim, answer: Answer, write: W) -> (FlowCx, Sent)
+pub(crate) async fn send<W, Fut>(reclaim: Reclaim, answer: Answer, write: W) -> Sent
 where
     W: FnOnce(CanonicalResponse) -> Fut,
     Fut: std::future::Future<Output = Result<(), WriteFailure>>,
 {
-    let (cx, mut res, refusal) = match answer {
-        // Without a stack the context is to hand; with one it comes back
-        // once the core has let go, after the response is written.
-        Answer::Response(res) => match reclaim {
-            Reclaim::Now(cx) => (Ok(cx), res, None),
-            stack @ Reclaim::Stack(_) => (Err(stack), res, None),
-        },
+    let (reclaim, mut res, refusal) = match answer {
+        Answer::Response(res) => (reclaim, res, None),
+        // A refusal is roxy's own answer: the stack, if there was one, is
+        // done, and the record is to hand.
         Answer::Refusal(r) => {
-            reclaim.tear_down();
-            let mut cx = Box::new(reclaim.take().await);
+            let mut cx = reclaim.take().await;
             let res = refusal_response(&mut cx, &r);
-            (Ok(cx), res, Some(r))
+            (Reclaim::now(cx), res, Some(r))
         }
     };
-    // Whether the response is digested is the admission decision's to say,
-    // which a core still running has not made: hash it, and keep the hash
-    // if the decision asks for it.
-    let digest = cx.as_ref().is_ok_and(|cx| cx.digest.response) || cx.is_err();
-    let (body, tally) = counted(std::mem::take(&mut res.body), digest);
+    let (body, tally) = counted(std::mem::take(&mut res.body), reclaim.digest_response());
     res.body = body;
     let status = res.status.as_u16();
     let headers_bytes = res.headers.wire_len() as u64;
-    // A refusal that travelled up through the stack as a response carries
-    // its close here, where `Answer::Refusal` carries it in the refusal.
+    // A refusal that travelled downstream through the stack as a response
+    // carries its close here, where `Answer::Refusal` carries it in the
+    // refusal.
     let closing = res.meta.close;
     let r = write(res).await;
     let failed = r.is_err();
-    let mut cx = match cx {
-        Ok(cx) => cx,
-        Err(reclaim) => {
-            if failed {
-                reclaim.tear_down();
-            } else {
-                reclaim.response_written();
-            }
-            Box::new(reclaim.take().await)
-        }
-    };
+    if failed {
+        reclaim.tear_down();
+    } else {
+        reclaim.response_complete();
+    }
+    let mut cx = Box::new(reclaim.take().await);
     cx.record.response_status = Some(status);
     cx.record.response_headers_bytes = headers_bytes;
     cx.record.response_bytes = tally.bytes();
@@ -218,7 +206,7 @@ where
         cx.record_final_sample();
         cx.emit_request_event();
     }
-    (*cx, Sent { failed, close })
+    Sent { failed, close }
 }
 
 pub(crate) fn emit_response_error(cx: &FlowCx, reason: &str, e: &dyn std::fmt::Display) {
@@ -269,7 +257,7 @@ pub(crate) fn finish_refusal(cx: &mut FlowCx, refusal: &Refusal) {
 
 /// Writes `answer` on the h1 codec and logs the exchange.
 async fn answer(mut conn: ServerConn<ClientIo>, reclaim: Reclaim, answer: Answer) -> Next {
-    let (_, sent) = send(reclaim, answer, |res| async {
+    let sent = send(reclaim, answer, |res| async {
         conn.respond(res).await.map_err(WriteFailure::from)
     })
     .await;
@@ -436,14 +424,14 @@ pub(crate) async fn process<F: Front>(
         }
     }
     if let Some(refusal) = cx.quarantine_refusal() {
-        return (Reclaim::Now(Box::new(cx)), Outcome::Refuse(refusal));
+        return (Reclaim::now(cx), Outcome::Refuse(refusal));
     }
     if let Some(refusal) = cx.expiry_refusal() {
-        return (Reclaim::Now(Box::new(cx)), Outcome::Refuse(refusal));
+        return (Reclaim::now(cx), Outcome::Refuse(refusal));
     }
     let (reclaim, outcome) = if cx.snap.addons.is_empty() {
         let outcome = core(front, &mut cx, req).await;
-        (Reclaim::Now(Box::new(cx)), outcome)
+        (Reclaim::now(cx), outcome)
     } else {
         crate::addons::run(front, cx, req).await
     };
@@ -461,7 +449,7 @@ pub(crate) async fn process<F: Front>(
             let refusal = cx
                 .late_quarantine_refusal()
                 .unwrap_or_else(Refusal::quarantined);
-            (Reclaim::Now(Box::new(cx)), Outcome::Refuse(refusal))
+            (Reclaim::now(cx), Outcome::Refuse(refusal))
         }
         Outcome::Respond(_) | Outcome::Upgrade { .. } | Outcome::Refuse(_) | Outcome::Close(_) => {
             (reclaim, outcome)
@@ -511,7 +499,6 @@ pub(crate) async fn run(
         Outcome::Respond(res) => answer(conn, reclaim, Answer::Response(res)).await,
         Outcome::Refuse(refusal) => answer(conn, reclaim, Answer::Refusal(refusal)).await,
         Outcome::Close(e) => {
-            reclaim.tear_down();
             close_on_drive_error(conn, reclaim.take().await, shared, e).await;
             None
         }

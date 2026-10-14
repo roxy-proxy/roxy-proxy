@@ -293,11 +293,12 @@ async fn serve_stream(
         Outcome::Respond(res) => Answer::Response(res),
         Outcome::Refuse(refusal) => Answer::Refusal(refusal),
         Outcome::Close(e) => {
-            reclaim.tear_down();
             let mut cx = reclaim.take().await;
+            // The client went away: nothing to answer, nothing to reset.
+            if fail.gone() {
+                return record_client_gone(&mut cx);
+            }
             match e {
-                // The client went away: nothing to answer, nothing to reset.
-                _ if fail.gone() => return record_client_gone(&mut cx),
                 DriveError::Client(e) => {
                     ccx.shared.emit_parse_error(&ccx.client, Some(&cx), &e);
                     respond.send_reset(h2::Reason::PROTOCOL_ERROR);
@@ -311,14 +312,13 @@ async fn serve_stream(
         }
         Outcome::Upgrade { .. } => {
             // Unreachable: h2 requests never carry an upgrade. Fail closed.
-            reclaim.tear_down();
             let mut cx = reclaim.take().await;
             respond.send_reset(h2::Reason::INTERNAL_ERROR);
             let e = ParseError::new(Reason::H2UnsupportedMethod, "upgrade over h2");
             return record_client_failure(&mut cx, &e, None);
         }
     };
-    let (_, sent) = send(reclaim, answer, |res| {
+    let sent = send(reclaim, answer, |res| {
         write_response(&mut respond, res, &out)
     })
     .await;
