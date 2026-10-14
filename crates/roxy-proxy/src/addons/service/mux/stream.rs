@@ -588,6 +588,7 @@ impl Stream {
                 let headers = super::super::header_map(&headers, limits.max_headers)?;
                 let declared = super::super::declared_length(&headers)?;
                 let forward = s.forwarded()?;
+                self.st.forwarding(self.index);
                 // On an upgrade the forwarded body is the client's side of
                 // the WebSocket, for as long as it is open: no cap.
                 let cap = if self.st.is_upgrade() {

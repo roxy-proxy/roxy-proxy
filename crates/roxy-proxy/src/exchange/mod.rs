@@ -134,7 +134,12 @@ where
     Fut: std::future::Future<Output = Result<(), WriteFailure>>,
 {
     let (cx, mut res, refusal) = match answer {
-        Answer::Response(res) => (Err(reclaim), res, None),
+        // Without a stack the context is to hand; with one it comes back
+        // once the core has let go, after the response is written.
+        Answer::Response(res) => match reclaim {
+            Reclaim::Now(cx) => (Ok(cx), res, None),
+            stack @ Reclaim::Stack(_) => (Err(stack), res, None),
+        },
         Answer::Refusal(r) => {
             reclaim.tear_down();
             let mut cx = Box::new(reclaim.take().await);
@@ -157,6 +162,8 @@ where
         Err(reclaim) => {
             if failed {
                 reclaim.tear_down();
+            } else {
+                reclaim.response_written();
             }
             Box::new(reclaim.take().await)
         }

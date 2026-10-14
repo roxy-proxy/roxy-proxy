@@ -599,12 +599,8 @@ impl Clock {
                 r = &mut answer => {
                     return r.map_err(|_| ServiceError::Closed("the stream ended".into()));
                 }
-                changed = deadline.changed() => {
-                    if changed.is_err() {
-                        // The clock's owner is gone: run out the deadline.
-                        return Self::run_out(at, answer).await;
-                    }
-                }
+                // Cannot fail: this clock holds the sender.
+                _ = deadline.changed() => {}
                 () = expiry => {
                     return match answer.try_recv() {
                         Ok(v) => Ok(v),
@@ -615,25 +611,6 @@ impl Clock {
                     };
                 }
             }
-        }
-    }
-
-    async fn run_out<T>(
-        at: Option<TokioInstant>,
-        mut answer: oneshot::Receiver<T>,
-    ) -> Result<T, ServiceError> {
-        let r = match at {
-            Some(at) => tokio::time::timeout_at(at, &mut answer).await,
-            None => Ok((&mut answer).await),
-        };
-        match r {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(_)) => Err(ServiceError::Closed("the stream ended".into())),
-            Err(_) => match answer.try_recv() {
-                Ok(v) => Ok(v),
-                Err(TryRecvError::Closed) => Err(ServiceError::Closed("the stream ended".into())),
-                Err(TryRecvError::Empty) => Err(ServiceError::Timeout("first_byte_timeout")),
-            },
         }
     }
 }

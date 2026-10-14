@@ -339,3 +339,41 @@ async fn a_service_answering_while_it_forwards_leaves_the_forward_to_complete() 
         svc.resets()
     );
 }
+
+/// The rules' verdict on a forward stands in the record whatever the
+/// client was given: a layer answers `200` early, the request it forwards
+/// is denied, and the flow is logged as that deny with the client's status
+/// beside it.
+#[tokio::test]
+async fn a_deny_of_the_forward_outlives_the_layers_early_answer() {
+    let kit = Kit::builder()
+        .rules(
+            r#"
+- id: up
+  when: host == "up.test"
+  then: allow
+- id: no-denied
+  when: path == "/denied"
+  then: deny
+"#,
+        )
+        .addon(AddonDef::test_layer("a"))
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let (mut tx, body) = streaming_body();
+    let req = c
+        .request("POST", "/denied", &[("x-test-a", "answer-then-next")])
+        .body(body)
+        .unwrap();
+    let pending = c.start(req);
+    tx.send_data(Bytes::from(vec![b'x'; CHUNK])).await.unwrap();
+    tx.finish().await.unwrap();
+    let a = answer_mid_upload(pending).await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "deny", "{ev:#}");
+    assert_eq!(ev["terminal_rule"], "no-denied");
+    assert_eq!(ev["res"]["status"], 200);
+    assert!(kit.upstream.seen().is_empty(), "nothing left");
+}

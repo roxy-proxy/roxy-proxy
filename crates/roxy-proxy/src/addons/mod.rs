@@ -390,8 +390,11 @@ pub(crate) struct StackFlow {
     /// The layer whose own response reached the client, decided as it did:
     /// `Some(None)` when the response was the core's.
     answered: std::sync::OnceLock<Option<usize>>,
-    /// The client's request lane is dropped: no layer forwarded it, and the
-    /// response is complete.
+    /// The request reached the core: the connector is its consumer from
+    /// then on.
+    core_entered: AtomicBool,
+    /// The client's request lane is dropped: nothing below will consume
+    /// it, and the response is complete.
     snip: CancellationToken,
 }
 
@@ -424,6 +427,7 @@ impl StackFlow {
                 endpoint::MAX_ENDPOINT_CALLS_IN_FLIGHT,
             )),
             answered: std::sync::OnceLock::new(),
+            core_entered: AtomicBool::new(false),
             snip: CancellationToken::new(),
         }
     }
@@ -441,17 +445,23 @@ impl StackFlow {
         self.loan.abandon.clone()
     }
 
-    /// The response the client got is complete. If no layer forwarded the
-    /// request, nothing below will read the rest of it: the client's lane
-    /// is dropped, so the front drains or closes rather than waits.
+    /// The response the client got is complete. If nothing below will
+    /// consume the rest of the request, no forward on its way to the core
+    /// and the core never entered, the client's lane is dropped, so the
+    /// front drains or closes rather than waits on a reader that will not
+    /// come. A forward a layer dropped on the way has gone with it.
     fn response_complete(&self) {
-        let forwarded = self
-            .layers
-            .iter()
-            .any(|l| l.state() != NextState::Unentered && l.state() != NextState::Entered);
-        if !forwarded {
+        let consumed = self.core_entered.load(Ordering::SeqCst)
+            || self.layers.iter().any(|l| l.state() == NextState::Pending);
+        if !consumed {
             self.snip.cancel();
         }
+    }
+
+    /// Layer `index` is forwarding: its request is on its way to the layer
+    /// below, before the call that carries it has run.
+    pub(crate) fn forwarding(&self, index: usize) {
+        self.layers[index].set(NextState::Pending);
     }
 
     /// The facts `metric-get` reads.
@@ -621,9 +631,13 @@ impl StackFlow {
     }
 
     /// Folds the stack's answer into the record as the front reclaims the
-    /// flow: a layer's own response is `answered`, by that layer, whatever
-    /// the core decided meanwhile.
+    /// flow: a layer's own response is `answered`, by that layer, unless
+    /// the rules refused the request it forwarded meanwhile. A refusal is
+    /// the verdict whatever the client was given.
     fn fold_answer(&self, cx: &mut FlowCx) {
+        if cx.record.decision == Some(DecisionKind::Deny) {
+            return;
+        }
         if let Some(Some(i)) = self.answered.get() {
             cx.record.decision = Some(DecisionKind::Answered);
             cx.record.terminal_rule = Some(Decider::Layer(self.snap.addons[*i].name.clone()));
@@ -752,6 +766,14 @@ impl Reclaim {
     pub(crate) fn tear_down(&self) {
         if let Reclaim::Stack(st) = self {
             st.tear_down();
+        }
+    }
+
+    /// The response has been written, whether or not its body was polled
+    /// to its end.
+    pub(crate) fn response_written(&self) {
+        if let Reclaim::Stack(st) = self {
+            st.response_complete();
         }
     }
 
@@ -928,6 +950,9 @@ async fn seeded_refusal(st: &Arc<StackFlow>) -> Option<LayerResponse> {
     // The core has let go of the context by now: whatever failed below
     // has returned, and with it the lease.
     let mut cx = st.loan.reclaim().await;
+    if cx.in_flight.is_some() {
+        cx.record_refusal_sample(&refusal);
+    }
     let res = refusal_response(&mut cx, &refusal);
     st.loan.give_back(cx);
     Some(to_layer_response(res))
@@ -940,7 +965,7 @@ fn snipped(st: &Arc<StackFlow>, body: Body) -> Body {
     Body::wrap_native(
         Snipped {
             inner: Some(body),
-            snip: st.snip.clone(),
+            snip: Box::pin(st.snip.clone().cancelled_owned()),
         },
         u64::MAX,
         known,
@@ -951,7 +976,9 @@ fn snipped(st: &Arc<StackFlow>, body: Body) -> Body {
 /// it abandoned, never complete.
 struct Snipped {
     inner: Option<Body>,
-    snip: CancellationToken,
+    /// One future for the snip, so its waker stays registered across
+    /// polls that found the inner body pending.
+    snip: Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
 }
 
 impl HttpBody for Snipped {
@@ -963,15 +990,10 @@ impl HttpBody for Snipped {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         let this = &mut *self;
-        if this.snip.is_cancelled() {
-            this.inner = None;
-        }
         let Some(inner) = &mut this.inner else {
             return Poll::Ready(Some(Err(BodyError::Abandoned)));
         };
-        let snipped = this.snip.cancelled();
-        tokio::pin!(snipped);
-        if snipped.poll(cx).is_ready() {
+        if this.snip.as_mut().poll(cx).is_ready() {
             this.inner = None;
             return Poll::Ready(Some(Err(BodyError::Abandoned)));
         }
@@ -990,8 +1012,12 @@ impl HttpBody for Snipped {
 }
 
 /// The response on its way to the client: its end tells the stack the
-/// response is complete.
+/// response is complete. An empty body is complete with its head.
 fn completing(st: &Arc<StackFlow>, body: Body) -> Body {
+    if body.is_end_stream() {
+        st.response_complete();
+        return body;
+    }
     let known = body.known_length();
     Body::wrap_native(
         Completing {
@@ -1186,6 +1212,7 @@ async fn core(
         st.fail(&layer, LayerError::NextCalledTwice);
         return Err(HostError::new("the flow already reached the core"));
     };
+    st.core_entered.store(true, Ordering::SeqCst);
     let cx = lease.cx();
     cx.layer_reads_bytes = st.reads_bytes();
     cx.facts.request = Some(crate::pipeline::request_facts(&creq));
