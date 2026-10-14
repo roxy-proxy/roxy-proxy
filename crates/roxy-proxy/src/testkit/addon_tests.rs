@@ -1197,6 +1197,39 @@ mod service {
         assert!(super::strs(&ev["tags"]).is_empty(), "{ev:#}");
     }
 
+    /// A service's `quarantine` trips the process and refuses its own
+    /// exchange as `_quarantined`; the cause names the layer and the call,
+    /// and the call is answered.
+    #[tokio::test]
+    async fn a_service_can_quarantine_the_proxy() {
+        let kit = kit(
+            READS_BODY,
+            vec![granted(
+                addon("s", "quarantine", AddonMode::Enforce, |_| {}),
+                &[Capability::Quarantine],
+            )],
+        )
+        .await;
+        let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+        assert_eq!(a.status, 403, "{a:?}");
+        assert_eq!(a.headers["x-roxy-rule"], "_quarantined");
+        let tripped = kit.events("quarantined", 1).await.remove(0);
+        assert_eq!(tripped["cause"]["kind"], "layer", "{tripped:#}");
+        assert_eq!(tripped["cause"]["layer"], "s", "{tripped:#}");
+        assert_eq!(tripped["cause"]["call"], 1, "{tripped:#}");
+        let open = &kit.upstream.service().until_opened(1).await[0];
+        let results = results(&kit, stream_id(open));
+        assert_eq!(
+            results[&1]["error"],
+            serde_json::Value::Null,
+            "{results:#?}"
+        );
+        assert!(
+            kit.upstream.seen().is_empty(),
+            "nothing reached the upstream"
+        );
+    }
+
     /// The stream id of an `open` message.
     fn stream_id(open: &serde_json::Value) -> u32 {
         u32::try_from(open["stream"].as_u64().unwrap()).unwrap()
@@ -2505,6 +2538,54 @@ async fn records_and_state_reach_the_flow_log() {
     assert_eq!(a.status, 503, "{a:?}");
     let errs = kit.events("layer_error", 1).await;
     assert_eq!(errs[0]["kind"], "capability:metrics");
+}
+
+/// `flow.quarantine` trips the process and refuses the calling exchange
+/// as `_quarantined`, with the layer as the cause; without the capability
+/// it fails the exchange and trips nothing; from an observer it is refused
+/// and the exchange goes on.
+#[tokio::test]
+async fn a_layer_can_quarantine_the_proxy_if_granted() {
+    use roxy_wasm::Capability;
+    let kit = one(AddonDef::test_layer("t")).await;
+    let a = cap(&kit, "quarantine").await;
+    assert_eq!(a.status, 503, "{a:?}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["kind"], "capability:quarantine", "{errs:#?}");
+    assert!(kit.server.handle().quarantine().is_none());
+
+    let kit = stack(&[
+        AddonDef::test_layer("monitor")
+            .observe()
+            .caps(&[Capability::Quarantine]),
+        AddonDef::test_layer("t"),
+    ])
+    .await;
+    let a = kit
+        .h1()
+        .await
+        .call(
+            "GET",
+            "/x",
+            &[("x-test-monitor", "caps"), ("x-cap", "quarantine")],
+            b"",
+        )
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let errs = kit.events("layer_error", 1).await;
+    assert_eq!(errs[0]["layer"], "monitor", "{errs:#?}");
+    assert_eq!(errs[0]["kind"], "host");
+    assert!(kit.server.handle().quarantine().is_none());
+
+    let kit = one(AddonDef::test_layer("t").caps(&[Capability::Quarantine])).await;
+    let a = cap(&kit, "quarantine").await;
+    assert_eq!(a.status, 403, "{a:?}");
+    assert_eq!(a.headers["x-roxy-rule"], "_quarantined");
+    let tripped = kit.events("quarantined", 1).await.remove(0);
+    assert_eq!(tripped["cause"]["kind"], "layer", "{tripped:#}");
+    assert_eq!(tripped["cause"]["layer"], "t", "{tripped:#}");
+    let a = kit.h1().await.call("GET", "/x", &[], b"").await;
+    assert_eq!(a.status, 403, "every exchange after it: {a:?}");
 }
 
 /// A layer's `state-put` writes the store the rules read: a rule keyed on

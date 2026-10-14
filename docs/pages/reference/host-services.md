@@ -85,6 +85,16 @@ key as 0); an unknown id, or a key field the request does not have, fails
 the exchange. `flow.log` writes to roxy's operational log with the
 flow id and layer name.
 
-A layer cannot terminate a client or quarantine the proxy: it denies the
-exchange and reports through `record` or an endpoint. Quarantine is a rule
-action ([quarantine](/guides/operations#quarantine)).
+## Quarantine (`quarantine`)
+
+`flow.quarantine()` puts the whole proxy into
+[quarantine](/guides/operations#quarantine): the exchange it was called on
+is refused `_quarantined` (nothing of it is forwarded, whatever the layer
+answers), and so is every exchange after it, until an operator or the
+control plane lifts it. It is for what a layer is sure must stop the
+workload; one bad request is denied by answering it. Only an enforce layer
+may call it: from an observer it fails the exchange, like `add-tag`. The
+`quarantined` flow event's cause is `kind: layer` with the layer's name and
+the flow. A config whose layers hold the capability needs `roxy run
+--state-dir`, as one with a `quarantine` rule does. A layer cannot
+terminate a client: it denies the exchange.

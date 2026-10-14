@@ -25,6 +25,14 @@ use ulid::Ulid;
 pub enum QuarantineCause {
     /// A rule's `quarantine` action matched.
     Rule { rule: String, flow: String },
+    /// An addon layer called `flow.quarantine`; `call` is a service
+    /// layer's id for the call.
+    Layer {
+        layer: String,
+        flow: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<u64>,
+    },
     /// A listener's parse-error threshold was reached.
     Threshold {
         listener: String,

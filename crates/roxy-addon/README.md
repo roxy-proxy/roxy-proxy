@@ -101,6 +101,7 @@ against 0.2, which keeps the API below.
   - `state_get` and `state_put` read and write the state store the rules
     use, with TTLs;
   - `metric_get` reads a metric;
+  - `quarantine` puts the whole proxy into quarantine;
   - `log` writes to roxy's operational log.
 - **Named endpoints.** [`call_endpoint`] calls an endpoint configured in
   roxy by name. roxy attaches its credentials, so the layer never sees

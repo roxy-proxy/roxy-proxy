@@ -71,6 +71,7 @@ fn capabilities(caps: &[Capability]) -> Capabilities {
             Capability::Record => WasmCap::Record,
             Capability::Metrics => WasmCap::Metrics,
             Capability::Log => WasmCap::Log,
+            Capability::Quarantine => WasmCap::Quarantine,
         })
         .collect()
 }

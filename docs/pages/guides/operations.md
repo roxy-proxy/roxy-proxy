@@ -123,11 +123,15 @@ until something outside the process lifts it. It is for a workload that has
 shown itself hostile: once tripped, the proxy stays shut across reloads and
 restarts, and the client cannot talk its way out.
 
-Two things trip it:
+Three things trip it:
 
 - a rule's `quarantine` action ([actions](/reference/rule-language#actions)):
   the exchange is refused, by whichever deny wins, and the proxy is
   quarantined, even if a rule below it fails closed;
+- an enforce layer's `flow.quarantine`
+  ([host services](/reference/host-services#quarantine-quarantine)): the
+  exchange it was called on is refused `_quarantined`, and the proxy is
+  quarantined;
 - a listener's `quarantine_on.parse_errors` threshold
   ([listeners](/reference/http#listener-modes)): that many `parse_error`
   events on the listener within the window, counting every reason except

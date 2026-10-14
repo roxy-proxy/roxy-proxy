@@ -67,3 +67,11 @@ pub fn state_put(key: &str, value: &str, ttl: Option<Duration>) -> Result<(), St
 pub fn metric_get(id: &str, key: &[String]) -> Option<i64> {
     raw::metric_get(id, key)
 }
+
+/// Puts the whole proxy into quarantine (capability `quarantine`): every
+/// exchange from here on, this one included, is refused until an operator
+/// or the control plane lifts it. For what a layer is sure must stop the
+/// workload, not for one bad request, which `respond` refuses on its own.
+pub fn quarantine() {
+    raw::quarantine();
+}

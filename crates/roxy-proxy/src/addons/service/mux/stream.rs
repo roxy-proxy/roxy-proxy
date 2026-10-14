@@ -488,7 +488,8 @@ impl Stream {
             | In::AddTag { .. }
             | In::StateGet { .. }
             | In::StatePut { .. }
-            | In::MetricGet { .. } => return,
+            | In::MetricGet { .. }
+            | In::Quarantine { .. } => return,
         }
         let mut s = lock(&self.state);
         let result = self.answer(&mut s, m);
@@ -583,7 +584,8 @@ impl Stream {
             | In::AddTag { .. }
             | In::StateGet { .. }
             | In::StatePut { .. }
-            | In::MetricGet { .. } => Ok(()),
+            | In::MetricGet { .. }
+            | In::Quarantine { .. } => Ok(()),
         }
     }
 

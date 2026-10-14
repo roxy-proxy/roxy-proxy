@@ -90,6 +90,11 @@ pub(super) async fn call(
             let value = host.metric_get(metric, Vec::new()).await?;
             Ok(Ok(value.map_or(Value::Null, Value::from)))
         }
+        In::Quarantine { .. } => {
+            require(Capability::Quarantine, "flow.quarantine")?;
+            host.quarantine()?;
+            Ok(Ok(Value::Null))
+        }
         In::Request { .. }
         | In::RequestEnd
         | In::Response { .. }

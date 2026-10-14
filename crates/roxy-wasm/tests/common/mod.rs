@@ -239,6 +239,11 @@ impl LayerHost for Mock {
         Ok(Some(7))
     }
 
+    fn quarantine(&self) -> Result<(), HostError> {
+        self.call("quarantine".to_owned());
+        Ok(())
+    }
+
     fn failed(&self, err: &LayerError) {
         self.failed.lock().unwrap().push(err.clone());
     }

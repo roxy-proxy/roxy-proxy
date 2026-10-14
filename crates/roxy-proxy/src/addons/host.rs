@@ -213,6 +213,31 @@ impl LayerHost for StackHost {
             .map_err(|e| HostError::new(format!("metric {id}: {e}")))
     }
 
+    fn quarantine(&self) -> Result<(), HostError> {
+        let layer = &self.addon().name;
+        let flow = self.st.flow.to_string();
+        let call = self.call;
+        if self.observing() {
+            tracing::warn!(
+                layer,
+                flow,
+                call,
+                "observer called `flow.quarantine`: refused"
+            );
+            return Err(HostError::new(
+                "layer called `flow.quarantine` in observe mode: an observer cannot quarantine",
+            ));
+        }
+        self.st
+            .shared
+            .trip_quarantine(crate::quarantine::QuarantineCause::Layer {
+                layer: layer.clone(),
+                flow,
+                call,
+            });
+        Ok(())
+    }
+
     fn failed(&self, err: &LayerError) {
         // An observer's failure is its own, logged by the task that runs
         // it; it is never the exchange's.

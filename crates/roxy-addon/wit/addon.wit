@@ -181,6 +181,11 @@ interface flow {
   /// key list must be empty; a non-empty one is refused. `none` when the
   /// key has no entry.
   metric-get: func(id: string, key: list<string>) -> option<s64>;
+  /// Put the whole proxy into quarantine (capability `quarantine`): every
+  /// exchange from here on, this one included, is refused until an
+  /// operator or the control plane lifts it. Only an enforce layer may:
+  /// from an observer it fails the exchange.
+  quarantine: func();
 }
 
 /// One exchange.

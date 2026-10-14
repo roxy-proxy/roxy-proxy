@@ -424,6 +424,12 @@ class Exchange:
         """Reads a metric for this flow's own key."""
         return await self._s.call({"type": "metric_get", "metric": metric})
 
+    async def quarantine(self) -> None:
+        """Puts the whole proxy into quarantine: every exchange from here
+        on, this one included, is refused until an operator or the control
+        plane lifts it (capability `quarantine`, enforce mode only)."""
+        await self._s.call({"type": "quarantine"})
+
     async def _body(self, direction: int) -> AsyncIterator[bytes]:
         end = f"{_DIR_NAMES[direction]}_end"
         while True:

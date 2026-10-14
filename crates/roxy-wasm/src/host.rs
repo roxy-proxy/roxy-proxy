@@ -191,6 +191,10 @@ pub trait LayerHost: Send + Sync + 'static {
     /// Read a metric (capability `metrics`).
     async fn metric_get(&self, id: String, key: Vec<String>) -> Result<Option<i64>, HostError>;
 
+    /// Put the proxy into quarantine (capability `quarantine`). `Err`
+    /// fails the exchange closed (an observer calling it).
+    fn quarantine(&self) -> Result<(), HostError>;
+
     /// The exchange failed with `err`. Called once, before the failure can
     /// be seen anywhere else: before [`crate::Layer::handle`] returns it,
     /// before a body the layer produced ends on it, before the

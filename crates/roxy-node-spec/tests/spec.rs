@@ -291,6 +291,13 @@ fn node_state_quarantine_is_a_report_or_null() {
     assert!(validate("NodeState", &state).is_ok());
     state["quarantine"]["cause"]["window_seconds"] = json!(0);
     assert!(validate("NodeState", &state).is_err());
+    state["quarantine"]["cause"] = json!({"kind": "layer", "layer": "sentinel", "flow": "01J"});
+    assert!(validate("NodeState", &state).is_ok());
+    state["quarantine"]["cause"] = json!({"kind": "layer", "flow": "01J"});
+    assert!(
+        validate("NodeState", &state).is_err(),
+        "a layer cause names the layer"
+    );
     state["quarantine"] = json!({"id": "q-1"});
     assert!(validate("NodeState", &state).is_err());
     state["quarantine"] = json!("q-1");
