@@ -19,6 +19,62 @@ use crate::addons::{AddonMode, Part};
 
 const CHUNK: usize = 4096;
 
+#[tokio::test]
+async fn h1_reset_during_backpressured_reclamation_releases_service() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let kit = testing::kit_with(
+        super::ALLOW_UP,
+        vec![testing::subscribed(
+            testing::addon("s", "answer-open", AddonMode::Enforce, |s| {
+                s.max_connections = 1;
+                s.max_streams = 1;
+            }),
+            Part::Head,
+            Part::Full,
+        )],
+        |b| {
+            b.limits(|l| {
+                l.max_header_bytes = 512;
+                l.header_timeout = Duration::from_millis(200);
+            })
+        },
+    )
+    .await;
+    let (mut client, reset) = kit.connect_resettable();
+    client
+        .write_all(
+            b"POST http://up.test/x HTTP/1.1\r\nHost: up.test\r\nContent-Length: 2097152\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        head.push(client.read_u8().await.unwrap());
+    }
+    assert!(head.starts_with(b"HTTP/1.1 204"));
+    // The head-only service holds this upload for a possible later forward.
+    // Drive the upload until the codec's bounded channel applies backpressure.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            client.write_all(&vec![b'x'; 2 * 1024 * 1024]),
+        )
+        .await
+        .is_err()
+    );
+    reset.reset();
+    drop(client);
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while kit.upstream.service().resets().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a reset during reclamation must release the service slot");
+    let event = kit.request_event().await;
+    assert_eq!(event["reason"], "header_timeout", "{event:#}");
+}
+
 /// The same boundary contract for both addon backends and HTTP transports:
 /// bypassed data, empty bodies with trailers, suppressed bodies and cuts.
 #[tokio::test]

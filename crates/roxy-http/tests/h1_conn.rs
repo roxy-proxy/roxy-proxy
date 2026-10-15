@@ -161,6 +161,106 @@ fn ok(body: Body) -> CanonicalResponse {
     res
 }
 
+#[tokio::test(start_paused = true)]
+async fn reclamation_detects_disconnect_while_the_upload_consumer_is_blocked() {
+    let (mut client, mut server) = conn_with(Limits {
+        max_header_bytes: 512 * 1024,
+        ..Limits::default()
+    });
+    client
+        .write_all(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1048576\r\n\r\n")
+        .await
+        .unwrap();
+    let _request = expect_request(&mut server).await;
+    server
+        .respond_borrowed(&mut ok(Body::empty()))
+        .await
+        .unwrap();
+    read_response(&mut client, false).await;
+    let upload = tokio::spawn(async move {
+        // More than the body queue holds, but within the read-ahead cap.
+        client.write_all(&vec![b'x'; 256 * 1024]).await.unwrap();
+        drop(client);
+    });
+    tokio::time::timeout(Duration::from_secs(1), server.client_lost())
+        .await
+        .expect("a blocked body queue must not hide EOF")
+        .unwrap();
+    upload.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn reclamation_bounds_a_full_upload_read_ahead_buffer() {
+    let (mut client, mut server) = conn_with(Limits {
+        max_header_bytes: 512,
+        header_timeout: Duration::from_millis(100),
+        body_idle_timeout: Duration::from_secs(10),
+        ..Limits::default()
+    });
+    client
+        .write_all(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1048576\r\n\r\n")
+        .await
+        .unwrap();
+    let request = expect_request(&mut server).await;
+    server
+        .respond_borrowed(&mut ok(Body::empty()))
+        .await
+        .unwrap();
+    read_response(&mut client, false).await;
+    let upload = tokio::spawn(async move {
+        client.write_all(&vec![b'x'; 1024 * 1024]).await.unwrap();
+        client
+    });
+    let start = tokio::time::Instant::now();
+    assert_eq!(
+        server.client_lost().await.unwrap_err().reason,
+        Reason::HeaderTimeout
+    );
+    assert_eq!(start.elapsed(), Duration::from_millis(100));
+    assert!(!upload.is_finished(), "read-ahead must remain bounded");
+    assert!(request.body.collect_up_to(1024 * 1024).await.is_err());
+    upload.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn reclamation_read_ahead_preserves_an_upload_that_resumes_and_its_pipeline() {
+    let (mut client, mut server) = conn_with(Limits {
+        max_header_bytes: 512,
+        header_timeout: Duration::from_secs(1),
+        ..Limits::default()
+    });
+    client
+        .write_all(b"POST /first HTTP/1.1\r\nHost: example.com\r\nContent-Length: 262144\r\n\r\n")
+        .await
+        .unwrap();
+    let request = expect_request(&mut server).await;
+    server
+        .respond_borrowed(&mut ok(Body::empty()))
+        .await
+        .unwrap();
+    read_response(&mut client, false).await;
+    let body: Vec<u8> = (0..=255).cycle().take(256 * 1024).collect();
+    let expected = body.clone();
+    let upload = tokio::spawn(async move {
+        client.write_all(&body).await.unwrap();
+        client
+            .write_all(b"GET /second HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        client
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), server.client_lost())
+            .await
+            .is_err()
+    );
+    let consumer = tokio::spawn(request.body.collect_up_to(1024 * 1024));
+    server.finish_response().await.unwrap();
+    assert_eq!(consumer.await.unwrap().unwrap().data, expected);
+    let _client = upload.await.unwrap();
+    assert_eq!(expect_request(&mut server).await.path.as_str(), "/second");
+}
+
 #[tokio::test]
 async fn response_wire_form() {
     let (mut client, mut c) = conn();

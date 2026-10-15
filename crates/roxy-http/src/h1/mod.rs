@@ -24,8 +24,8 @@
 //!
 //! Invariants:
 //! - Backpressure: at most [`crate::model::CHANNEL_DEPTH`] chunks of at most
-//!   one read buffer each are queued; the socket is not read while the queue
-//!   is full.
+//!   one read buffer each are queued. During reclamation, bounded read-ahead
+//!   also watches for client loss while that queue is full.
 //! - Any timeout, cap overflow, framing violation or EOF mid-body ends the
 //!   body stream with an error (never a clean end), and the connection is
 //!   unusable afterwards.
@@ -230,8 +230,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
     /// Drives the request body to completion (or until the drain limit).
     /// Cancel-safe.
     async fn pump(&mut self) -> Result<(), ParseError> {
-        let r = self.pump_inner().await;
-        r.map_err(|e| self.fail(e))
+        let r = self.pump_inner(false).await;
+        r.map(|_| ()).map_err(|e| self.fail(e))
     }
 
     /// Watches the idle socket so a client that closes while its response
@@ -268,15 +268,30 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
         Ok(!matches!(self.rd.read_buf(&mut self.buf).await, Ok(n) if n > 0))
     }
 
-    async fn pump_inner(&mut self) -> Result<(), ParseError> {
+    /// `true` if a reclamation watch observed client loss before the
+    /// request consumer made room. Pending frames stay in the connection
+    /// when this future is cancelled, as do all bytes read ahead.
+    async fn pump_inner(&mut self, reclaiming: bool) -> Result<bool, ParseError> {
         let idle = self.limits.body_idle_timeout;
         loop {
             let Some(feed) = self.feed.as_mut() else {
-                return Ok(());
+                return Ok(false);
             };
             if feed.pending.is_some() {
                 if let Some(tx) = feed.sender.as_mut() {
-                    match timeout(idle, tx.ready()).await {
+                    let ready = timeout(idle, tx.ready());
+                    let result = if reclaiming {
+                        tokio::select! {
+                            biased;
+                            result = ready => result,
+                            lost = watch_reclamation_input(&mut self.rd, &mut self.buf, &self.limits) => {
+                                return lost.map(|()| true);
+                            }
+                        }
+                    } else {
+                        ready.await
+                    };
+                    match result {
                         Err(_) => {
                             return Err(ParseError::new(
                                 Reason::BodyTimeout,
@@ -311,7 +326,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
                             let _ = tx.try_finish();
                         }
                         self.feed = None;
-                        return Ok(());
+                        return Ok(false);
                     }
                     (None, Pending::Data(b)) => {
                         feed.drained = feed.drained.saturating_add(len_u64(b.len()));
@@ -319,13 +334,13 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
                             tracing::debug!("drain limit reached; connection will close");
                             self.feed = None;
                             self.abandoned = true;
-                            return Ok(());
+                            return Ok(false);
                         }
                     }
                     (None, Pending::Trailers(_)) => {}
                     (None, Pending::Finish) => {
                         self.feed = None;
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
                 continue;
@@ -349,6 +364,43 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
                 Decoded::Done => feed.pending = Some(Pending::Finish),
                 Decoded::NeedMore => self.read_body_bytes().await?,
             }
+        }
+    }
+}
+
+/// Watch the socket while retaining bytes that still belong to the
+/// current upload or a pipelined request. A full buffer must not hide
+/// client loss for the much longer body-idle timeout.
+async fn watch_reclamation_input<R: AsyncRead + Unpin>(
+    rd: &mut R,
+    buffered: &mut BytesMut,
+    limits: &Limits,
+) -> Result<(), ParseError> {
+    loop {
+        if buffered.len() >= limits.max_header_bytes {
+            let until = deadline(limits.header_timeout);
+            if buffered.len() == limits.max_header_bytes {
+                let mut probe = [0];
+                match timeout_at(until, rd.read(&mut probe)).await {
+                    Ok(Ok(0) | Err(_)) => return Ok(()),
+                    Ok(Ok(_)) => buffered.extend_from_slice(&probe),
+                    Err(_) => {}
+                }
+            }
+            tokio::time::sleep_until(until).await;
+            return Err(ParseError::new(
+                Reason::HeaderTimeout,
+                "read-ahead buffer stayed full during exchange reclamation",
+            ));
+        }
+        let mut buf = vec![0; READ_CHUNK];
+        let room = limits
+            .max_header_bytes
+            .saturating_sub(buffered.len())
+            .min(buf.len());
+        match rd.read(&mut buf[..room]).await {
+            Ok(0) | Err(_) => return Ok(()),
+            Ok(n) => buffered.extend_from_slice(&buf[..n]),
         }
     }
 }
@@ -949,7 +1001,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     }
 
     /// Observe client loss while the current exchange reclaims its work.
-    /// Pipelined bytes remain buffered for `next_request`. Further reads
+    /// Upload and pipelined bytes remain buffered for their consumers. Further reads
     /// stop at the request-head limit plus one byte to probe for EOF;
     /// any bytes already read ahead by the codec remain buffered too.
     /// A full buffer bounds reclamation by `header_timeout`: backpressure
@@ -961,34 +1013,12 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     }
 
     async fn watch_reclamation(&mut self) -> Result<(), ParseError> {
-        self.r.pump().await?;
-        loop {
-            if self.r.buf.len() >= self.limits.max_header_bytes {
-                let until = deadline(self.limits.header_timeout);
-                if self.r.buf.len() == self.limits.max_header_bytes {
-                    let mut probe = [0];
-                    match timeout_at(until, self.r.rd.read(&mut probe)).await {
-                        Ok(Ok(0) | Err(_)) => return Ok(()),
-                        Ok(Ok(_)) => self.r.buf.extend_from_slice(&probe),
-                        Err(_) => {}
-                    }
-                }
-                tokio::time::sleep_until(until).await;
-                return Err(ParseError::new(
-                    Reason::HeaderTimeout,
-                    "pipeline buffer stayed full during exchange reclamation",
-                ));
+        match self.r.pump_inner(true).await {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                watch_reclamation_input(&mut self.r.rd, &mut self.r.buf, &self.limits).await
             }
-            let mut buf = vec![0; READ_CHUNK];
-            let room = self
-                .limits
-                .max_header_bytes
-                .saturating_sub(self.r.buf.len())
-                .min(buf.len());
-            match self.r.rd.read(&mut buf[..room]).await {
-                Ok(0) | Err(_) => return Ok(()),
-                Ok(n) => self.r.buf.extend_from_slice(&buf[..n]),
-            }
+            Err(error) => Err(self.r.fail(error)),
         }
     }
 

@@ -154,10 +154,12 @@ frame and shares a 64-message socket queue; body messages are at most
 metadata, allocation overhead, guest memory and external service memory
 are additional: `max_buffered_bytes` is not a process RAM ceiling.
 
-While reclaiming an HTTP/1.1 exchange, further pipeline reads stop at
+While reclaiming an HTTP/1.1 exchange, further reads stop at
 `max_header_bytes`, plus one byte to observe EOF at the boundary; existing
-codec read-ahead is retained too. Once full,
-the exchange must finish within `header_timeout` or the connection closes;
+codec read-ahead is retained too. This watch also runs while an unread
+upload fills its body queue. Once the read-ahead buffer is full,
+the upload consumer must make room or the exchange must finish within
+`header_timeout`, otherwise the connection closes;
 queued bytes cannot disable cancellation indefinitely. Ordinary pipelined
 requests remain buffered until the preceding exchange releases its work.
 
