@@ -2,7 +2,7 @@
 
 Claude Code behind roxy, with a person in the loop: every tool call the
 model returns is held at the proxy and shown on a page in the browser, and
-nothing reaches the agent until someone clicks **Approve** or **Deny**.
+the agent does not get it until someone clicks **Approve** or **Deny**.
 There is no denylist and nothing to configure; the person is the policy.
 
 Under the hood it is the [quickstart](../quickstart/sentinel/)'s
@@ -61,22 +61,26 @@ flow log on stdout.
 Each tool call the model returns is a card: the tool's name, what the model
 said alongside the call, its arguments as JSON, how long it has been
 waiting, a box for a reason, and the two buttons. A response with several
-tool calls in it is several cards, asked one after the other: the second
-appears once the first is approved, and a denial of any one of them denies
-the response. The page polls once a second and the tab title counts what is
-waiting.
+tool calls in it is several cards, each appearing as the model finishes
+writing that call. The page polls once a second and the tab title counts
+what is waiting.
 
-- **Approve**: the response goes to the agent exactly as the model sent it,
+- **Approve**: the tool call goes to the agent exactly as the model sent it,
   and the agent runs the tool.
-- **Deny**: the agent gets an assistant message in the response's place: the
-  model's text, no tool calls, and
+- **Deny**: the agent gets a text block in the tool call's place:
   `A person reviewing this session denied the <tool> tool call: <reason>`.
-  Its stop reason is `end_turn`, so the agent's turn ends and the person at
-  the Claude Code prompt gets to say what to do instead.
+  When every tool call in the response is denied, its stop reason becomes
+  `end_turn`, so the agent's turn ends and the person at the Claude Code
+  prompt gets to say what to do instead.
 
-While a call waits, Claude Code sees a response that has started (its
-`message_start` event) and then a `ping` every ten seconds, which is what
-the API itself sends while a model thinks, so its spinner keeps spinning.
+Claude Code streams its model calls, and the text the model writes streams
+on to it live; only each `tool_use` block waits for the click, with
+everything after it in the response queued behind. While a call waits
+Claude Code sees a `ping` every ten seconds, which is what the API itself
+sends while a model thinks, so its spinner keeps spinning. A response asked
+for whole (no `stream: true`) is held in full and, when denied, replaced by
+an assistant message: the model's text, no tool calls, the note, and
+`end_turn`.
 
 Everything asked and answered is also written as an Inspect eval log
 (`--log-dir`, default `$TMPDIR/roxy-human-approval`) for `inspect view`.

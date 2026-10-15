@@ -1,5 +1,6 @@
-"""The hold: a tool call waits for the page, then goes on as the model sent
-it or is replaced by what the person said."""
+"""The hold: the model's text streams to the agent live; its tool call waits
+for the page, then goes on as the model sent it or is replaced by what the
+person said."""
 
 from __future__ import annotations
 
@@ -48,16 +49,19 @@ MESSAGE_START = sse(
     {"type": "message_start", "message": {**message([], None), "stop_reason": None, "usage": {"input_tokens": 1, "output_tokens": 0}}},
 )
 # The rest of a streamed response: the model says something, then calls Bash.
-REST = (
+TEXT = (
     sse("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
     + sse("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Cleaning up."}})
     + sse("content_block_stop", {"type": "content_block_stop", "index": 0})
-    + sse("content_block_start", {"type": "content_block_start", "index": 1, "content_block": {**TOOL_USE, "input": {}}})
+)
+TOOL_CALL = (
+    sse("content_block_start", {"type": "content_block_start", "index": 1, "content_block": {**TOOL_USE, "input": {}}})
     + sse("content_block_delta", {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": json.dumps(ARGUMENTS)}})
     + sse("content_block_stop", {"type": "content_block_stop", "index": 1})
-    + sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None}, "usage": {"output_tokens": 5}})
-    + sse("message_stop", {"type": "message_stop"})
 )
+ENDING = sse(
+    "message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None}, "usage": {"output_tokens": 5}}
+) + sse("message_stop", {"type": "message_stop"})
 
 
 @pytest.fixture
@@ -69,8 +73,9 @@ async def demo(tmp_path: Any) -> AsyncIterator[tuple[Sidecar, ReviewQueue, TestC
 
 async def model_call(roxy: FakeRoxy, *, stream: bool) -> None:
     """Drives a Messages call through to the model's response, a text block
-    and a Bash tool call: streamed, up to the sidecar holding it after
-    `message_start`; whole, up to the sidecar holding all of it."""
+    and a Bash tool call: streamed, up to the sidecar holding the tool call
+    with the text already sent on; whole, up to the sidecar holding all of
+    it."""
     body = json.dumps({"model": "claude-test", "stream": stream, "messages": [{"role": "user", "content": "clean up"}]})
     roxy.open(1, url=MESSAGES_URL, headers=[["x-claude-code-session-id", "s1"]])
     roxy.ws.body(1, body.encode())
@@ -82,7 +87,8 @@ async def model_call(roxy: FakeRoxy, *, stream: bool) -> None:
         roxy.ws.body(1, MESSAGE_START, RESPONSE)
         assert (await roxy.ws.next_sent())["type"] == "response"
         assert await roxy.ws.next_sent() == FRAME + MESSAGE_START
-        roxy.ws.body(1, REST, RESPONSE)
+        roxy.ws.body(1, TEXT + TOOL_CALL + ENDING, RESPONSE)
+        assert await roxy.ws.next_sent() == FRAME + TEXT  # live, before the tool call is judged
     else:
         roxy.ws.control(1, "response", status=200, headers=[["content-type", "application/json"]])
         response = message([{"type": "text", "text": "Cleaning up."}, TOOL_USE], "tool_use")
@@ -101,10 +107,17 @@ async def card(ui: TestClient) -> dict[str, Any]:
     raise AssertionError("no tool call reached the page")
 
 
-async def until_not_ping(roxy: FakeRoxy) -> dict[str, Any] | bytes:
-    while (m := await roxy.ws.next_sent()) == FRAME + PING:
-        pass
-    return m
+async def rest_of_stream(roxy: FakeRoxy) -> bytes:
+    """Everything the sidecar sends on stream 1 up to its end, pings aside."""
+    out = b""
+    while True:
+        m = await roxy.ws.next_sent()
+        if isinstance(m, dict):
+            assert m["type"] == "response_end"
+            return out
+        assert m[:5] == FRAME
+        if m != FRAME + PING:
+            out += m[5:]
 
 
 async def test_a_tool_call_waits_on_the_page_and_goes_on_when_approved(demo: Any) -> None:
@@ -116,11 +129,10 @@ async def test_a_tool_call_waits_on_the_page_and_goes_on_when_approved(demo: Any
     assert item["arguments"] == ARGUMENTS
     assert item["message"] == "Cleaning up."
     assert item["choices"] == ["approve", "reject"]
-    with pytest.raises(TimeoutError):  # held: the agent has the head and message_start, nothing more
+    with pytest.raises(TimeoutError):  # held: the agent has the text, not the tool call
         await roxy.ws.next_sent(timeout=0.2)
     assert (await ui.post(f"/pending/{item['id']}", json={"decision": "approve"})).status == 200
-    assert await until_not_ping(roxy) == FRAME + REST
-    assert (await roxy.ws.next_sent())["type"] == "response_end"
+    assert await rest_of_stream(roxy) == TOOL_CALL + ENDING
     assert queue.pending() == []
 
 
@@ -131,14 +143,11 @@ async def test_a_denied_tool_call_is_replaced_by_the_reason(demo: Any) -> None:
     item = await card(ui)
     res = await ui.post(f"/pending/{item['id']}", json={"decision": "reject", "reason": "  not in this repo "})
     assert res.status == 200
-    out = await until_not_ping(roxy)
-    assert isinstance(out, bytes) and out[:5] == FRAME
-    text = out[5:].decode()
-    assert "tool_use" not in text
-    assert "Cleaning up." in text  # the model's words stay
-    assert "A person reviewing this session denied the Bash tool call: not in this repo" in text
-    assert '"stop_reason": "end_turn"' in text
-    assert (await roxy.ws.next_sent())["type"] == "response_end"
+    rest = (await rest_of_stream(roxy)).decode()  # the model's words have already gone
+    assert "tool_use" not in rest
+    assert '"index": 1, "content_block": {"type": "text"' in rest
+    assert "A person reviewing this session denied the Bash tool call: not in this repo" in rest
+    assert '"stop_reason": "end_turn"' in rest
 
 
 async def test_a_denial_without_a_reason_still_says_who_denied_it(demo: Any) -> None:
@@ -147,8 +156,7 @@ async def test_a_denial_without_a_reason_still_says_who_denied_it(demo: Any) -> 
     await model_call(roxy, stream=True)
     item = await card(ui)
     await ui.post(f"/pending/{item['id']}", json={"decision": "reject"})
-    out = await until_not_ping(roxy)
-    assert b"A person reviewing this session denied the Bash tool call." in out
+    assert b"A person reviewing this session denied the Bash tool call." in await rest_of_stream(roxy)
 
 
 async def test_pings_flow_while_the_person_decides(demo: Any, monkeypatch: Any) -> None:
@@ -162,7 +170,7 @@ async def test_pings_flow_while_the_person_decides(demo: Any, monkeypatch: Any) 
     for _ in range(3):  # three pings in a row, nothing else between them
         assert await roxy.ws.next_sent(timeout=1.0) == FRAME + PING
     await ui.post(f"/pending/{item['id']}", json={"decision": "approve"})
-    assert await until_not_ping(roxy) == FRAME + REST
+    assert await rest_of_stream(roxy) == TOOL_CALL + ENDING
 
 
 async def test_a_whole_response_is_held_with_nothing_sent(demo: Any) -> None:
@@ -204,4 +212,4 @@ async def test_an_answer_the_person_was_not_offered_or_already_gave_is_refused(d
     assert len(await (await ui.get("/pending")).json()) == 1  # still waiting
     assert (await ui.post(f"/pending/{item['id']}", json={"decision": "approve"})).status == 200
     assert (await ui.post(f"/pending/{item['id']}", json={"decision": "approve"})).status == 404
-    assert await until_not_ping(roxy) == FRAME + REST
+    assert await rest_of_stream(roxy) == TOOL_CALL + ENDING
