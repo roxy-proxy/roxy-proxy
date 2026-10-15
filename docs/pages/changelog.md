@@ -1,10 +1,15 @@
 # Changelog
 
-User-facing changes in each release, newest first. Breaking changes come
-first within a release. Each release's GitHub page lists every merged pull
-request.
+User-facing changes in each release, newest first. Each release has a
+short summary; expand it for the itemised entries, where breaking changes
+come first. Each release's GitHub page lists every merged pull request.
 
 ## Unreleased
+
+Addons can now answer early and hold a request or response for approval, with the request and response lanes of an exchange living independent lives. This is a breaking change for addons: the service protocol is `roxy.layer.v6` and the WASM interface is `roxy:addon@0.3.0`.
+
+<details>
+<summary>Details</summary>
 
 ### Breaking
 
@@ -29,7 +34,14 @@ request.
 
 - rustls 0.23.46 (RUSTSEC-2026-0346 to 0349) and wasmtime 49.0.3 (RUSTSEC-2026-0352 to 0364) ([#557](https://github.com/roxy-proxy/roxy-proxy/pull/557)).
 
+</details>
+
 ## [0.2.0 (2026-10-14)](https://github.com/roxy-proxy/roxy-proxy/releases/tag/v0.2.0)
+
+Quarantine, a bearer-token node protocol, host services for service layers and `X-Forwarded-For` support, plus two security fixes (GHSA-4297-w88p-8xqv, GHSA-pwq9-p79h-pg35). Breaking for control planes, service layers (`roxy.layer.v5`), `client.port` users and the per-addon state store.
+
+<details>
+<summary>Details</summary>
 
 ### Breaking
 
@@ -73,7 +85,14 @@ request.
 - GHSA-pwq9-p79h-pg35: with `http.allow_obs_text: true`, a header value holding a byte of `0x80` or above was invisible to an equality rule but forwarded. Rules now read header values as the bytes that are forwarded, one character per byte ([#507](https://github.com/roxy-proxy/roxy-proxy/pull/507)).
 - YAML is read with `serde-saphyr`; the unmaintained `unsafe-libyaml` (RUSTSEC-2024-0449) is gone ([#482](https://github.com/roxy-proxy/roxy-proxy/pull/482)). `ruzstd` 0.9.1 for RUSTSEC-2026-0344 ([#505](https://github.com/roxy-proxy/roxy-proxy/pull/505)).
 
+</details>
+
 ## [0.1.1 (2026-10-12)](https://github.com/roxy-proxy/roxy-proxy/releases/tag/v0.1.1)
+
+Heads cross the WASM boundary as records and bodies as bare streams (`roxy:addon@0.2.0`), layers subscribe to only the directions they need, and a batch of host hardening fixes. Breaking for WASM components and service layers (`roxy.layer.v4`).
+
+<details>
+<summary>Details</summary>
 
 ### Breaking
 
@@ -106,6 +125,8 @@ request.
 - Body frames on an ended service stream are dropped without crediting, so a misbehaving service cannot grow roxy's memory ([#462](https://github.com/roxy-proxy/roxy-proxy/pull/462)).
 - `response_body_idle_timeout` applies while a response body is collected for inspection; a stalled upstream under a body rule gets a `504` ([#467](https://github.com/roxy-proxy/roxy-proxy/pull/467)).
 - The reference says what the code does where it overclaimed: timeouts, drain and linger limits, the hop-by-hop list, node `410` handling and lease fields ([#457](https://github.com/roxy-proxy/roxy-proxy/pull/457)); HTTP/1.0 close-delimited responses are documented ([#466](https://github.com/roxy-proxy/roxy-proxy/pull/466)).
+
+</details>
 
 ## [0.1.0 (2026-10-08)](https://github.com/roxy-proxy/roxy-proxy/releases/tag/v0.1.0)
 
