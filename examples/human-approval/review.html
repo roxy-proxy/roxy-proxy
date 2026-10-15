@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tool calls awaiting approval</title>
+<style>
+  body { font: 15px/1.4 system-ui, sans-serif; margin: 2rem auto; max-width: 56rem; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.3rem; }
+  .empty { color: #666; }
+  .card { border: 1px solid #ccc; border-radius: 6px; padding: 1rem; margin: 1rem 0; }
+  .head { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
+  .tool { font-weight: 600; font-size: 1.1rem; }
+  .meta { color: #666; font-size: 0.85rem; }
+  .said { margin: 0.75rem 0; white-space: pre-wrap; }
+  pre { background: #f4f4f4; padding: 0.75rem; overflow-x: auto; margin: 0.75rem 0; }
+  .actions { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+  input { flex: 1; min-width: 14rem; padding: 0.4rem; }
+  button { padding: 0.45rem 1rem; border-radius: 4px; border: 1px solid transparent; cursor: pointer; }
+  .approve { background: #1a7f37; color: white; }
+  .deny { background: #b42318; color: white; }
+</style>
+</head>
+<body>
+<h1>Tool calls awaiting approval</h1>
+<div id="list"><p class="empty">Waiting for a tool call…</p></div>
+<script>
+const list = document.getElementById("list");
+const reasons = {};   // what was typed, kept across refreshes
+
+async function answer(id, decision) {
+  const res = await fetch(`/pending/${id}`, {
+    method: "POST",
+    headers: {"content-type": "application/json"},
+    body: JSON.stringify({decision, reason: reasons[id] || ""}),
+  });
+  if (!res.ok) alert(await res.text());
+  delete reasons[id];
+  refresh();
+}
+
+function card(item) {
+  const el = document.createElement("div");
+  el.className = "card";
+  const head = document.createElement("div");
+  head.className = "head";
+  head.innerHTML = `<span class="tool"></span><span class="meta"></span>`;
+  head.querySelector(".tool").textContent = item.tool;
+  head.querySelector(".meta").textContent =
+    `conversation ${item.conversation.slice(0, 8)} · waiting ${item.age_seconds}s`;
+  el.append(head);
+  if (item.message) {
+    const said = document.createElement("div");
+    said.className = "said";
+    said.textContent = item.message;
+    el.append(said);
+  }
+  const args = document.createElement("pre");
+  args.textContent = JSON.stringify(item.arguments, null, 2);
+  el.append(args);
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  const reason = document.createElement("input");
+  reason.placeholder = "reason (optional; the agent reads it if denied)";
+  reason.value = reasons[item.id] || "";
+  reason.oninput = () => { reasons[item.id] = reason.value; };
+  actions.append(reason);
+  for (const [choice, label, cls] of [["approve", "Approve", "approve"], ["reject", "Deny", "deny"]]) {
+    if (!item.choices.includes(choice)) continue;
+    const b = document.createElement("button");
+    b.className = cls;
+    b.textContent = label;
+    b.onclick = () => answer(item.id, choice);
+    actions.append(b);
+  }
+  el.append(actions);
+  return el;
+}
+
+async function refresh() {
+  let items;
+  try { items = await (await fetch("/pending")).json(); } catch { return; }
+  const focused = document.activeElement;
+  if (focused && focused.tagName === "INPUT") return;   // don't rebuild under a typing hand
+  list.replaceChildren(...items.map(card));
+  if (!items.length) list.innerHTML = '<p class="empty">Waiting for a tool call…</p>';
+  document.title = (items.length ? `(${items.length}) ` : "") + "Tool calls awaiting approval";
+}
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
