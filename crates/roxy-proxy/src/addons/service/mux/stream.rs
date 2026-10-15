@@ -66,9 +66,6 @@ pub(crate) struct Stream {
     pub(super) wire: Arc<Wire>,
     /// Host-service calls waiting for the stream's worker, once it has one.
     pub(super) calls: Mutex<Option<mpsc::Sender<Call>>>,
-    /// The stream failed or was given up, as opposed to ending on the
-    /// service's lanes.
-    pub(super) broken: AtomicBool,
     /// The stream's place on the connection, kept past its end while the
     /// worker runs the calls queued before it, so what a service leaves
     /// behind on ended streams is bounded by `max_streams` like its open
@@ -303,7 +300,6 @@ impl Stream {
                 return true;
             }
             End::Failed { e, reset } => {
-                self.broken.store(true, Ordering::SeqCst);
                 // Recorded before anything learns of the end: the exchange
                 // may finish on a body aborted here before any answer is
                 // read. The layer is torn down with it, which cuts what it
@@ -315,10 +311,7 @@ impl Stream {
                 let message = e.to_string();
                 (message.clone(), (reset == Reset::Send).then_some(message))
             }
-            End::Abandoned(why) => {
-                self.broken.store(true, Ordering::SeqCst);
-                (why.to_owned(), Some(why.to_owned()))
-            }
+            End::Abandoned(why) => (why.to_owned(), Some(why.to_owned())),
         };
         if let Some(message) = reset
             && self.wire.reset()
@@ -979,7 +972,6 @@ pub(crate) async fn open(
             held_response,
             wire: Arc::default(),
             calls: Mutex::new(None),
-            broken: AtomicBool::new(false),
             draining: Mutex::new(None),
         });
         s.open.insert(id, stream.clone());

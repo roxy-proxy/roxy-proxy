@@ -213,15 +213,16 @@ flow however often it is asked.
 
 ### In the proxy
 
-The stack sits in the exchange core both fronts share: the front drives
-the client's request body into the first layer, and the last layer's
-`next` runs the rules, the upstream, then the in-flight rules on the
+The stack is a chain of stages joined by lanes
+([addon model](/design/addon-model#lanes-and-the-rules-that-move-them)):
+the client edge (the HTTP/1.1 codec or the HTTP/2 stream) puts the
+client's request on the first lane, each layer runs on its own task, and
+the core edge runs the rules, the upstream, then the in-flight rules on the
 response. A layer's answer goes to the client as soon as the layer gives
-it, and a request it forwarded runs on below to its end; the flow is
-logged once the core has had its say on that request and the response
-from upstream, if there was one, has ended in the layer that took it. Once
-the response is complete (with its head, for a `204`, a `304` or a `HEAD`)
-and no layer that ran can still forward, the rest of the client's upload is
+it; a request it forwarded is carried upstream for as long as the layer
+waits for its response. The flow is logged once every lane is terminal:
+the core has had its say on the request that reached it, and every layer
+is done. Once a layer is done with the client's upload, the rest of it is
 dropped: on HTTP/1.1 the codec drains or closes as it does after a deny
 ([HTTP](/reference/http#deny-responses)), on HTTP/2 the stream is reset
 with no error.
@@ -328,15 +329,15 @@ its handler lives on relaying the direction it is in.
   stream) holds its end until the handler returns, so a trap after the last
   byte still cuts it. An empty body, or a passed-through body of known
   length, goes out with `content-length` and is complete once sent. A streamed body is
-  complete only through `finish`: dropped unfinished, it is cut, and a
-  response body dropped unfinished fails the exchange.
-- **An abandoned request is cut, not failed.** A request body passed to
-  `next` that the guest drops without `finish` is cut at the upstream. If
-  the guest is still waiting on `next`'s response, the layer has failed
-  (`invalid_request`); if it has dropped the pending response or already
-  has the response, it may answer itself and its answer stands. A body the
-  guest passed through that fails behind it (the client gave up) is cut the
-  same way.
+  complete only through `finish`: dropped unfinished, it is cut where it
+  stopped, the layer's own doing (`reason: forward_aborted` or
+  `answer_aborted`), not a failure.
+- **A cut forward gets no response.** A request body passed to `next` that
+  the guest drops without `finish` is cut at the upstream, and nothing
+  comes back for it: `next` fails for the guest (`error.internal`), which
+  may answer itself, and its answer stands. A body the guest passed through
+  that fails behind it (the client gave up) is cut the same way, at the
+  client's fault.
 - **An instance that failed its exchange is discarded**, never reused.
 - Layers see canonical heads and body streams, never wire bytes, and have
   no filesystem, sockets or environment: all their I/O is `next`,
