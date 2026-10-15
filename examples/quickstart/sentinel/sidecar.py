@@ -4,25 +4,25 @@ Every exchange streams through this sidecar (roxy.layer.v6). For an
 Anthropic Messages call (`POST .../v1/messages`) it forwards the request,
 reads the model's response, turns each tool call in it into an
 inspect_sentinel `BeforeToolCall` step, and runs the configured sentinel on
-it before the agent sees the response:
+it before the agent sees the tool call:
 
-    continue   the response goes to the agent unchanged
+    continue   the tool call goes to the agent unchanged
     modify     the tool call's arguments are replaced
-    reject     the response is replaced by an assistant message that keeps
-               the model's text, drops its tool calls and says what was
-               blocked, so the agent's turn ends normally
+    reject     the tool call is dropped and the agent gets a note saying
+               what was blocked in its place; a non-streamed response is
+               replaced whole by an assistant message that keeps the
+               model's text, drops its tool calls and carries the note,
+               so the agent's turn ends normally
     terminate  as reject; the sidecar cannot end the agent itself
     escalate   unresolved at the root: treated as reject (fail closed)
 
 Everything else (other requests, and every non-200 answer) passes through
 untouched, for roxy's rules to decide. A streamed response goes to the
-agent as it arrives (its head, `message_start`, its text and thinking)
-until the first tool call starts. From there the rest is held, with pings
-so the agent's idle deadline is met, until the stream ends and every tool
-call in it is judged: then the held events go on unchanged, or the tool
-calls are replaced by the note and the turn ends. Nothing of a tool call
-reaches the agent before the last one in the message has a verdict, so a
-later rejection never leaves an earlier, approved call behind.
+agent as it arrives, a tool call at a time: its text and thinking stream
+live, and each tool call is held from the start of its block to the end,
+judged as soon as its arguments are complete, then released, rewritten or
+replaced by the note. Later events wait their turn behind a held call, and
+pings keep the agent's idle deadline met while it waits.
 
 Each Claude Code session (its `X-Claude-Code-Session-Id` header), its model
 calls and the sentinel's reports are written as an Inspect eval log for
@@ -50,7 +50,7 @@ import json
 import logging
 import os
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
@@ -89,8 +89,8 @@ log = logging.getLogger("sentinel-sidecar")
 
 MAX_CONVERSATIONS = 10_000
 
-# While a streamed response is held for judging, a ping this often keeps
-# the agent's idle watchdogs from giving up on it.
+# While part of a streamed response is held for judging, a ping this often
+# keeps the agent's idle watchdogs from giving up on it.
 PING_EVERY = 10.0
 PING = b'event: ping\ndata: {"type": "ping"}\n\n'
 
@@ -163,29 +163,124 @@ STREAM_EVENTS = {
     "content_block_stop",
 }
 
+# The blocks that go to the agent as they arrive. Any other block (a tool
+# call, or one this sidecar does not know) is held until it is judged.
+LIVE_BLOCKS = {"text", "thinking", "redacted_thinking"}
+
+
+@dataclasses.dataclass
+class HeldBlock:
+    """A content block held for judging, complete."""
+
+    index: int
+    raw: bytes  # its events, as the upstream sent them
+    block: dict[str, Any]
+    message: dict[str, Any]  # the message so far, this block included
+
+
+@dataclasses.dataclass
+class MessageDelta:
+    """The `message_delta` event, kept apart so its `stop_reason` can be
+    rewritten once every tool call has its verdict."""
+
+    raw: bytes
+    data: dict[str, Any]
+
+
+class HeldStream:
+    """A streamed Messages response on its way to the agent, cut into what
+    goes now and what waits for a verdict.
+
+    Events pass through as they arrive, byte for byte, except a block
+    outside LIVE_BLOCKS: its events are held from `content_block_start` to
+    `content_block_stop`, then come out as one `HeldBlock` for judging. The
+    message is rebuilt as it goes with the Anthropic SDK's decoder and
+    accumulator (beta types: Claude Code calls the beta endpoint); an event
+    the accumulator cannot take raises, and nothing after it passes."""
+
+    def __init__(self) -> None:
+        self._decoder = SSEDecoder()
+        self._buf = b""
+        self._event = b""
+        self._snapshot: Any = None
+        self._json_bufs: dict[int, bytes] = {}
+        self._open: tuple[int, bytes] | None = None  # the held block being read
+        self.started = False  # `message_start` has gone to the agent
+
+    @property
+    def holding(self) -> bool:
+        return self._open is not None
+
+    def feed(self, chunk: bytes) -> list[bytes | HeldBlock | MessageDelta]:
+        """What the chunk completes, in order: events to pass on, blocks
+        to judge and the message's `message_delta`."""
+        items: list[bytes | HeldBlock | MessageDelta] = []
+        self._buf += chunk
+        while (nl := self._buf.find(b"\n")) != -1:
+            line, self._buf = self._buf[: nl + 1], self._buf[nl + 1 :]
+            self._event += line
+            sse = self._decoder.decode(line.rstrip(b"\r\n").decode("utf-8", "replace"))
+            if sse is None:
+                continue
+            event, self._event = self._event, b""
+            item = self._route(event, sse)
+            if isinstance(item, bytes) and items and isinstance(items[-1], bytes):
+                items[-1] += item
+            elif item is not None:
+                items.append(item)
+        return items
+
+    def end(self) -> list[bytes | HeldBlock | MessageDelta]:
+        """What is left when the stream ends: an unterminated last event."""
+        if self._open is not None:
+            raise ValueError(f"the stream ended inside content block {self._open[0]}")
+        rest, self._buf, self._event = self._event + self._buf, b"", b""
+        return [rest] if rest else []
+
+    def _route(self, event: bytes, sse: Any) -> bytes | HeldBlock | MessageDelta | None:
+        data = sse.json() if sse.event in STREAM_EVENTS else None
+        if data is not None:
+            typed = construct_type(type_=BetaRawMessageStreamEvent, value=data)
+            self._snapshot = accumulate_event(typed, self._snapshot, self._json_bufs)
+        if self._open is not None:
+            index, raw = self._open
+            raw += event
+            if sse.event != "content_block_stop" or data["index"] != index:
+                self._open = (index, raw)
+                return None
+            self._open = None
+            message = self.message()
+            return HeldBlock(index, raw, message["content"][index], message)
+        if sse.event == "message_start":
+            self.started = True
+        elif sse.event == "content_block_start" and data["content_block"]["type"] not in LIVE_BLOCKS:
+            self._open = (data["index"], event)
+            return None
+        elif sse.event == "message_delta":
+            return MessageDelta(event, data)
+        return event
+
+    def message(self) -> dict[str, Any]:
+        """The `Message` the stream has carried so far."""
+        if self._snapshot is None:
+            raise ValueError("no message in the stream")
+        return self._snapshot.model_dump(mode="json")
+
 
 def message_from_sse(raw: bytes) -> dict[str, Any]:
-    """Rebuilds a `Message` from its event stream with the Anthropic SDK's
-    accumulator (beta types: Claude Code calls the beta endpoint)."""
-    snapshot = None
-    json_bufs: dict[int, bytes] = {}
-    for sse in SSEDecoder().iter_bytes(iter([raw])):
-        if sse.event == "error":
-            raise ValueError(f"error in the stream: {sse.data}")
-        if sse.event not in STREAM_EVENTS:
-            continue
-        event = construct_type(type_=BetaRawMessageStreamEvent, value=sse.json())
-        snapshot = accumulate_event(event, snapshot, json_bufs)
-    if snapshot is None:
-        raise ValueError("no message in the stream")
-    return snapshot.model_dump(mode="json")
+    """Rebuilds a `Message` from a whole event stream."""
+    stream = HeldStream()
+    stream.feed(raw)
+    stream.end()
+    return stream.message()
 
 
 async def explanation(response: dict[str, Any], output: ModelOutput, note: str) -> dict[str, Any]:
-    """The reply to a refused response: the model's text, without its tool
-    calls or thinking, then what was blocked. Built as an inspect message and
-    converted as inspect's agent bridge answers an agent; its `end_turn`
-    hands the turn back to the person, as an ordinary answer would."""
+    """The reply to a refused non-streamed response: the model's text,
+    without its tool calls or thinking, then what was blocked. Built as an
+    inspect message and converted as inspect's agent bridge answers an
+    agent; its `end_turn` hands the turn back to the person, as an ordinary
+    answer would."""
     said = output.message.text
     message = ChatMessageAssistant(
         content=[*([ContentText(text=said)] if said else []), ContentText(text=note)]
@@ -203,46 +298,41 @@ async def explanation(response: dict[str, Any], output: ModelOutput, note: str) 
     return reply.model_dump(mode="json")
 
 
-def anthropic_to_sse(message: dict[str, Any], *, start: bool = True) -> bytes:
-    """The event stream for a whole `Message` (text blocks only), without
-    its `message_start` event if that was already sent."""
-    events: list[tuple[str, dict[str, Any]]] = []
-    if start:
-        head = {**message, "content": [], "stop_reason": None, "stop_sequence": None}
-        events.append(("message_start", {"type": "message_start", "message": head}))
-    for i, block in enumerate(message["content"]):
-        events += [
-            (
-                "content_block_start",
-                {"type": "content_block_start", "index": i, "content_block": {"type": "text", "text": ""}},
-            ),
-            (
-                "content_block_delta",
-                {"type": "content_block_delta", "index": i, "delta": {"type": "text_delta", "text": block["text"]}},
-            ),
-            ("content_block_stop", {"type": "content_block_stop", "index": i}),
-        ]
-    events += [
-        (
-            "message_delta",
-            {
-                "type": "message_delta",
-                "delta": {"stop_reason": message["stop_reason"], "stop_sequence": None},
-                "usage": {"output_tokens": message.get("usage", {}).get("output_tokens", 0)},
-            },
-        ),
-        ("message_stop", {"type": "message_stop"}),
-    ]
-    return "".join(f"event: {e}\ndata: {json.dumps(d)}\n\n" for e, d in events).encode()
+def sse_bytes(event: str, data: dict[str, Any]) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+def block_to_sse(index: int, block: dict[str, Any]) -> bytes:
+    """The events for one content block. A tool call's arguments go as one
+    delta."""
+    delta: dict[str, Any] | None
+    if block["type"] == "text":
+        opening = {"type": "text", "text": ""}
+        delta = {"type": "text_delta", "text": block["text"]}
+    elif block["type"] == "tool_use":
+        opening = {"type": "tool_use", "id": block["id"], "name": block["name"], "input": {}}
+        delta = {"type": "input_json_delta", "partial_json": json.dumps(block["input"])}
+    else:
+        # The accumulator's dump of a block names every field it knows,
+        # unset ones as null; the API leaves those out.
+        opening, delta = {k: v for k, v in block.items() if v is not None}, None
+    out = sse_bytes("content_block_start", {"type": "content_block_start", "index": index, "content_block": opening})
+    if delta is not None:
+        out += sse_bytes("content_block_delta", {"type": "content_block_delta", "index": index, "delta": delta})
+    return out + sse_bytes("content_block_stop", {"type": "content_block_stop", "index": index})
+
+
+def error_event(message: str) -> bytes:
+    return sse_bytes("error", {"type": "error", "error": {"type": "api_error", "message": message}})
 
 
 class Call:
     """One Messages exchange, as inspect_ai types."""
 
-    def __init__(self, request: dict[str, Any], response: dict[str, Any], streamed: bool) -> None:
+    def __init__(self, request: dict[str, Any], response: dict[str, Any]) -> None:
         self.request = request
         self.response = response
-        self.streamed = streamed
+        self.modified = False
 
     async def input(self) -> list[ChatMessage]:
         return await messages_from_anthropic(
@@ -265,6 +355,7 @@ class Call:
         for block in self.response.get("content", []):
             if block.get("type") == "tool_use" and block.get("id") == call.id:
                 block["input"] = replacement.arguments
+                self.modified = True
 
 
 def session(req: Request) -> str | None:
@@ -288,6 +379,31 @@ class Refusal:
     output: ModelOutput | None = None
 
 
+@dataclasses.dataclass
+class Judging:
+    """The sentinel's view of one exchange, shared by every tool call
+    judged in it."""
+
+    conversation: str
+    input: list[ChatMessage]
+    host_context: HostContext
+
+
+def unreadable(e: Exception) -> Refusal:
+    """A shape the SDK or inspect's converter does not know (a new block
+    type, say) cannot be judged, so it is refused."""
+    first_line = str(e).partition("\n")[0][:200]
+    error = f"{type(e).__name__}: {first_line}"
+    log.warning("unreadable model exchange: %s", error)
+    return Refusal(f"the sentinel could not read this model exchange ({error})")
+
+
+def refused_note(decision: Decision | None, action: str, function: str) -> str:
+    """What the agent reads in a refused tool call's place."""
+    log.info("%s on %s: %s", action, function, decision and decision.explanation)
+    return (decision and decision.message) or f"tool call {function} refused ({action})"
+
+
 def is_model_call(req: Request) -> bool:
     return req.method == "POST" and req.url.split("?", 1)[0].endswith("/v1/messages")
 
@@ -304,6 +420,14 @@ def with_length(res: Response, length: int) -> Response:
 
 
 # ----- the layer --------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class Held:
+    """A held block in the queue to the agent, with its verdict on the way."""
+
+    block: HeldBlock
+    verdict: asyncio.Task[Decision | None]
 
 
 class Sidecar:
@@ -336,7 +460,7 @@ class Sidecar:
         streamed = (res.header("content-type") or "").startswith("text/event-stream")
         if streamed and res.status == 200 and not ex.observing:
             head = [(n, v) for n, v in res.headers if n.lower() != "content-length"]
-            await ex.respond(Response(res.status, head), self.judged_stream(ex, body, res))
+            await ex.respond(Response(res.status, head), self.judged_stream(ex, body))
             return
         try:
             raw = await ex.read_response_body()
@@ -363,85 +487,188 @@ class Sidecar:
         else:
             await ex.respond(*refusal(verdict.message))
 
-    async def judged_stream(self, ex: Exchange, body: bytes, res: Response) -> AsyncIterator[bytes]:
-        """A streamed response, judged before the agent sees any content:
-        its `message_start` passes at once, pings follow while the rest is
-        held and judged, then the rest or, if refused, the explanation."""
-        chunks: list[bytes] = []
+    async def judged_stream(self, ex: Exchange, body: bytes) -> AsyncIterator[bytes]:
+        """A streamed response, judged a tool call at a time. Everything else
+        goes to the agent as it arrives. A tool call is held from the start
+        of its block to the end, judged as soon as its arguments are
+        complete, then released unchanged, emitted with its new arguments,
+        or replaced by a text block carrying the note. Events behind a held
+        call wait their turn, so the agent reads the message in order, and
+        a ping goes whenever it has waited PING_EVERY on a held call. An
+        exchange the sidecar cannot read ends in an `error` event."""
+        chunks: asyncio.Queue[bytes | None] = asyncio.Queue()
 
         async def read() -> None:
-            async for chunk in ex.response_body():
-                chunks.append(chunk)
+            try:
+                async for chunk in ex.response_body():
+                    chunks.put_nowait(chunk)
+            finally:
+                chunks.put_nowait(None)
 
         reader = asyncio.create_task(read())
-        judging: asyncio.Task[None | bytes | Refusal] | None = None
+        getter: asyncio.Task[bytes | None] | None = None
+        stream = HeldStream()
+        queue: deque[bytes | Held | MessageDelta] = deque()
+        verdicts: list[asyncio.Task[Decision | None]] = []
+        judging: Judging | None = None
+        tool_calls = dropped = 0
+        ended = False
         try:
-            sent = 0
+            try:
+                request = json.loads(body)
+                judging = await self.judging(ex, request)
+            except Exception as e:  # noqa: BLE001
+                yield error_event(unreadable(e).message)
+                return
             last = time.monotonic()
             while True:
-                done, _ = await asyncio.wait({reader}, timeout=0.5)
-                if not sent:
-                    raw = b"".join(chunks)
-                    end = raw.find(b"\n\n")
-                    if end != -1:
-                        if b"message_start" in raw[:end]:
-                            sent = end + 2
-                            yield raw[:sent]
+                # Release what has its turn: passed events, judged blocks,
+                # and the message's end once every call has a verdict.
+                while queue:
+                    head = queue[0]
+                    if isinstance(head, bytes):
+                        out = head
+                    elif isinstance(head, MessageDelta):
+                        out = head.raw
+                        if tool_calls and dropped == tool_calls:
+                            data = {**head.data, "delta": {**head.data["delta"], "stop_reason": "end_turn"}}
+                            out = sse_bytes("message_delta", data)
+                    elif head.verdict.done():
+                        try:
+                            decision = head.verdict.result()
+                        except Exception as e:  # noqa: BLE001
+                            yield error_event(unreadable(e).message)
+                            return
+                        out, was_dropped = self.released(head.block, decision)
+                        if decision is not None or head.block.block["type"] == "tool_use":
+                            tool_calls += 1
+                        dropped += was_dropped
+                    else:
+                        break
+                    queue.popleft()
+                    if out:
+                        yield out
+                        last = time.monotonic()
+                if ended and not queue:
+                    break
+                waits: set[asyncio.Task[Any]] = set()
+                if not ended:
+                    getter = getter or asyncio.create_task(chunks.get())
+                    waits.add(getter)
+                if queue and isinstance(queue[0], Held):
+                    waits.add(queue[0].verdict)
+                held = stream.holding or bool(queue)
+                timeout = max(PING_EVERY - (time.monotonic() - last), 0) if held and stream.started else None
+                done, _ = await asyncio.wait(waits, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+                if getter is not None and getter in done:
+                    chunk = getter.result()
+                    getter = None
+                    message = None
+                    try:
+                        if chunk is None:
+                            ended = True
+                            reader.result()
+                            items = stream.end()
+                            message = stream.message()
                         else:
-                            sent = -1  # not the shape we know: hold everything
-                if done:
-                    break
-                if sent > 0 and time.monotonic() - last >= PING_EVERY:
-                    last = time.monotonic()
+                            items = stream.feed(chunk)
+                    except BodyFailed:
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        yield error_event(unreadable(e).message)
+                        return
+                    for item in items:
+                        if isinstance(item, HeldBlock):
+                            verdict = asyncio.create_task(self.judge_block(judging, item))
+                            verdicts.append(verdict)
+                            queue.append(Held(item, verdict))
+                        else:
+                            queue.append(item)
+                    if message is not None:
+                        await self.log_stream(ex, judging, Call(request, message))
+                elif not done:
                     yield PING
-            reader.result()
-            raw = b"".join(chunks)
-            sent = max(sent, 0)
-            # A model-backed sentinel may take a while: keep pinging.
-            judging = asyncio.create_task(self.judge(ex, body, res, raw))
-            while True:
-                wait = PING_EVERY - (time.monotonic() - last)
-                done, _ = await asyncio.wait({judging}, timeout=max(wait, 0))
-                if done:
-                    break
-                if sent:
                     last = time.monotonic()
-                    yield PING
-            verdict = judging.result()
-            if verdict is None or isinstance(verdict, bytes):
-                # Streamed responses are never modified (see judge).
-                yield raw[sent:]
-            elif verdict.call and verdict.output:
-                reply = await explanation(verdict.call.response, verdict.output, verdict.message)
-                yield anthropic_to_sse(reply, start=not sent)
-            else:
-                error = {"type": "error", "error": {"type": "api_error", "message": verdict.message}}
-                yield f"event: error\ndata: {json.dumps(error)}\n\n".encode()
         finally:
             # The handler is cancelled here when roxy resets the stream:
             # the reader would otherwise wait on the response for ever, and
-            # the sentinel's verdict is no longer wanted.
-            tasks = {reader} if judging is None else {reader, judging}
+            # the sentinel's verdicts are no longer wanted.
+            tasks = {reader, *verdicts, *([getter] if getter else [])}
             for t in tasks:
                 t.cancel()
             await asyncio.wait(tasks)
 
-    async def judge(self, ex: Exchange, body: bytes, res: Response, raw: bytes) -> None | bytes | Refusal:
-        """None to pass the response on, new bytes for a modified response,
-        or a refusal."""
-        streamed = (res.header("content-type") or "").startswith("text/event-stream")
+    def released(self, block: HeldBlock, decision: Decision | None) -> tuple[bytes, bool]:
+        """What goes to the agent for a judged block, and whether the block
+        was dropped."""
+        action = decision.action if decision else "continue"
+        if action == "continue":
+            return block.raw, False
+        if action == "modify" and decision and decision.modified:
+            return block_to_sse(block.index, {**block.block, "input": decision.modified.arguments}), False
+        # reject, terminate, an unresolved escalate, or a modify that
+        # cannot be applied: the agent gets the note in the call's place.
+        note = refused_note(decision, action, block.block.get("name", block.block["type"]))
+        return block_to_sse(block.index, {"type": "text", "text": note}), True
+
+    async def judge_block(self, judging: Judging, block: HeldBlock) -> Decision | None:
+        """The verdict on a held block, with the message so far as its
+        context. A block that is not a tool call has nothing to judge, as
+        long as inspect can read it."""
+        output = await model_output_from_anthropic(block.message)
+        tc = next((t for t in output.message.tool_calls or [] if t.id == block.block.get("id")), None)
+        if tc is None:
+            if block.block["type"] == "tool_use":
+                raise ValueError(f"tool call {block.block.get('id')} not read")
+            return None
+        return await self.decide(judging, tc, output.message.text)
+
+    async def log_stream(self, ex: Exchange, judging: Judging, call: Call) -> None:
+        """The Inspect log entry for a streamed call, once it is whole."""
         try:
-            request = json.loads(body)
-            response = message_from_sse(raw) if streamed else json.loads(raw)
-            call = Call(request, response, streamed)
             output = await call.output()
         except Exception as e:  # noqa: BLE001
-            # A shape the SDK or inspect's converter does not know (a new
-            # block type, say) cannot be judged, so it is refused.
-            first_line = str(e).partition("\n")[0][:200]
-            error = f"{type(e).__name__}: {first_line}"
-            log.warning("unreadable model exchange: %s", error)
-            return Refusal(f"the sentinel could not read this model exchange ({error})")
+            log.warning("unreadable model response, not logged: %s", e)
+            return
+        self.log_call(ex, judging, call, output)
+
+    async def judge(self, ex: Exchange, body: bytes, res: Response, raw: bytes) -> None | bytes | Refusal:
+        """A whole response: None to pass it on, new bytes for a modified
+        response, or a refusal."""
+        streamed = (res.header("content-type") or "").startswith("text/event-stream")
+        try:
+            call = Call(json.loads(body), message_from_sse(raw) if streamed else json.loads(raw))
+        except Exception as e:  # noqa: BLE001
+            return unreadable(e)
+        refused = await self.judge_call(ex, call)
+        if refused is not None:
+            return refused
+        return json.dumps(call.response).encode() if call.modified else None
+
+    async def judge_call(self, ex: Exchange, call: Call) -> Refusal | None:
+        """Runs the sentinel on each tool call in a whole response. A
+        modified call's arguments are replaced in `call.response`."""
+        try:
+            output = await call.output()
+        except Exception as e:  # noqa: BLE001
+            return unreadable(e)
+        judging = await self.judging(ex, call.request)
+        self.log_call(ex, judging, call, output)
+        for tc in output.message.tool_calls or []:
+            decision = await self.decide(judging, tc, output.message.text)
+            action = decision.action if decision else "continue"
+            if action == "continue":
+                continue
+            if action == "modify" and decision and decision.modified:
+                call.modify(tc, decision.modified)
+                continue
+            # reject, terminate, an unresolved escalate, or a modify that
+            # cannot be applied: the agent does not get this response.
+            return Refusal(refused_note(decision, action, tc.function), call, output)
+        return None
+
+    async def judging(self, ex: Exchange, request: dict[str, Any]) -> Judging:
+        call = Call(request, {})
         try:
             input = await call.input()
         except Exception as e:  # noqa: BLE001
@@ -455,19 +682,6 @@ class Sidecar:
             # Two sessions can open with the same first message; the
             # session keeps their conversations, and their verdicts, apart.
             conversation = hashlib.sha256(f"{sid}:{conversation}".encode()).hexdigest()[:24]
-        model = f"anthropic/{response.get('model', 'unknown')}"
-        self.inspect_log.model_call(
-            session(ex.request) or conversation,
-            conversation,
-            ex.flow.get("flow"),
-            model,
-            input,
-            output,
-            main=not is_subagent(ex.request),
-        )
-        tool_calls = output.message.tool_calls or []
-        if not tool_calls:
-            return None
         # No eval: a proxy has no task, sample or epoch to give a sentinel.
         context = Context(path="", host=self.host, eval=None)
         host_context = HostContext(
@@ -475,33 +689,29 @@ class Sidecar:
             recorder=InspectRecorder(self.inspect_log),
             store=self.stores.get(conversation),
         )
-        modified = False
-        for tc in tool_calls:
-            step = BeforeToolCall(
-                conversation=conversation,
-                message=output.message.text,
-                call=tc,
-                view=ToolCallView(),
-                input=input,
-                history=input,
-            )
-            decision: Decision | None = await run_sentinel(self.root, host_context, step)
-            action = decision.action if decision else "continue"
-            if action == "continue":
-                continue
-            if action == "modify" and decision and decision.modified and not streamed:
-                call.modify(tc, decision.modified)
-                modified = True
-                continue
-            # reject, terminate, an unresolved escalate, or a modify that
-            # cannot be applied: the agent does not get this response.
-            log.info("%s on %s: %s", action, tc.function, decision and decision.explanation)
-            return Refusal(
-                (decision and decision.message) or f"tool call {tc.function} refused ({action})",
-                call,
-                output,
-            )
-        return json.dumps(call.response).encode() if modified else None
+        return Judging(conversation, input, host_context)
+
+    async def decide(self, judging: Judging, tc: ToolCall, message: str) -> Decision | None:
+        step = BeforeToolCall(
+            conversation=judging.conversation,
+            message=message,
+            call=tc,
+            view=ToolCallView(),
+            input=judging.input,
+            history=judging.input,
+        )
+        return await run_sentinel(self.root, judging.host_context, step)
+
+    def log_call(self, ex: Exchange, judging: Judging, call: Call, output: ModelOutput) -> None:
+        self.inspect_log.model_call(
+            session(ex.request) or judging.conversation,
+            judging.conversation,
+            ex.flow.get("flow"),
+            f"anthropic/{call.response.get('model', 'unknown')}",
+            judging.input,
+            output,
+            main=not is_subagent(ex.request),
+        )
 
 
 def load_sentinel(spec: str) -> Any:
