@@ -510,7 +510,6 @@ class Sidecar:
         stream = HeldStream()
         queue: deque[bytes | Held | MessageDelta] = deque()
         verdicts: list[asyncio.Task[Decision | None]] = []
-        judging: Judging | None = None
         tool_calls = dropped = 0
         ended = False
         try:
