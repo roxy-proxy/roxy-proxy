@@ -61,6 +61,8 @@ Every exchange takes the same path: roxy parses it, the addons see it, the rules
 
 The [quickstart](/quickstart) sends generated traffic through roxy with an auth gate, a per-user token quota and an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar, with roxy in node mode leasing its policy from a minimal control plane. Nothing in it needs an API key.
 
+[`examples/human-approval`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/human-approval) puts a person in the loop instead: Claude Code behind roxy, with every tool call held at the proxy until someone clicks Approve or Deny in the browser.
+
 ## Where next
 
 * **Guides:** [containment](/guides/containment), [gateway](/guides/gateway), [running](/guides/run) and [operating](/guides/operations) roxy, [testing a policy](/guides/testing-a-policy), [writing addons](/guides/writing-addons).
