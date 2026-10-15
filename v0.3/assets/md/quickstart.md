@@ -1,0 +1,160 @@
+# Quickstart
+
+Run clients through roxy with three controls on every model call: a WASM addon that authenticates the client against an auth service, a WASM addon that holds each user to a token quota kept by a quota service, and an [inspect_sentinel](https://github.com/meridianlabs-ai/inspect_sentinel) sidecar that blocks tool calls matching a denylist. roxy runs in [node mode](/guides/node-mode), leasing its policy and the model's API key from a minimal control plane and shipping its flow log back. The model is scripted and the traffic generated, so nothing needs an API key or a route out. The setup is [`examples/quickstart`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/quickstart).
+
+## Prerequisites
+
+* Docker with Docker Compose
+* Git
+
+:::steps
+### Clone the repo
+
+```sh
+git clone https://github.com/roxy-proxy/roxy-proxy.git
+cd roxy-proxy/examples/quickstart
+```
+
+### Start the stack
+
+```sh
+docker compose up --build --attach traffic
+```
+
+The first run builds the images, which takes a few minutes. Eight containers start; only the last one's output is shown (Ctrl-C stops them):
+
+* **controlplane**: enrols roxy, serves [`roxy.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/roxy.yaml) and the model's API key as a one-minute lease, and prints the flow events roxy ships.
+* **roxy**: the proxy on `127.0.0.1:3128`, with the two addons at `/etc/roxy/addons/`. It has no config file; it runs the policy it leases.
+* **fake-model**: answers `POST /v1/messages` from [`responses.json`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/mocks/responses.json), one entry per call in order, streamed or whole, with the `usage` the real API sends. It refuses a request without the API key, which only roxy has.
+* **auth-service**: `alice-secret` is alice and `bob-secret` is bob.
+* **quota-board**: the quota service. Each user has a bucket of 600 tokens that refills at five a second.
+* **sentinel**: the inspect_sentinel sidecar, on a network with no route out.
+* **inspect-view**: Inspect's log viewer.
+* **traffic**: the clients. Alice calls every six seconds, bob every twenty, and mallory, whose credential is unknown, every thirty.
+
+### Watch the traffic
+
+Each client is the Anthropic SDK, pointed at the model through roxy, with its credential in an `x-roxy-auth` header; each call is one streamed `POST /v1/messages`. The scripted responses go by: a greeting, a `Bash` tool call running `ls -la`, then one running `curl`, which comes back as
+
+```
+traffic-1  | [alice #2] I will fetch that page for you. roxy's sentinel blocked a Bash tool call (denylist match: 'curl').
+```
+
+The sentinel took the tool call out before the client saw it and put a note in its place. Mallory is refused by the auth gate:
+
+```
+traffic-1  | [mallory #1] 401 AuthenticationError: credential refused by the auth service
+```
+
+Within the first minute alice drains her bucket, and her calls stop reaching the model until it refills:
+
+```
+traffic-1  | [alice #8] 429 RateLimitError: token bucket empty (600 tokens, refills 5/s); try again in 15s
+```
+
+### Watch the quota board
+
+Open [http://127.0.0.1:8090](http://127.0.0.1\:8090): each user's bucket, live, with the last five minutes of levels. The quota is per user, and the user is whoever the auth gate said. To make a call of your own:
+
+```sh
+docker compose run --rm client --user bob
+docker compose run --rm client --user mallory --secret wrong
+```
+
+### Watch it in Inspect View
+
+Open [http://127.0.0.1:7575](http://127.0.0.1\:7575). Each client is a sample, grouped by the `X-Claude-Code-Session-Id` header it sends; its transcript shows every model call, the tool calls, and the sentinel's verdict under each: `Continued`, or `Rejected` with the reason. Reload the page to see new calls.
+
+<img src={inspectView} alt="Inspect View: a curl tool call, and the sentinel's rejection under it" />
+
+### Read roxy's flow log
+
+```sh
+docker compose logs roxy
+```
+
+One line per request: the rule it matched, the addons it went through in order (`"addons":["auth-gate","token-quota","sentinel"]`), the `user:alice` tag the auth gate set, and the `set_header:x-api-key` mutation the rule made. The addons' own events are there too: `endpoint_call` for every call to the auth service and the quota board, `layer_record` for the verdicts and usage reports. [Capture](/reference/flow-log#capture) keeps whole requests and responses as well.
+
+The same events reach the control plane in batches, within the lease's five-second flush interval; `docker compose logs controlplane` shows each one prefixed with the node's id.
+
+### Let the lease run down
+
+The lease is valid for sixty seconds and refreshed every fifteen. Stop the control plane:
+
+```sh
+docker compose stop controlplane
+```
+
+Within a minute every call fails with a `403` and roxy's `/readyz` answers `503 policy_expired`: an unreachable control plane is not a reason to deny, but an expired lease is. `docker compose start controlplane` brings the next lease and roxy recovers without a restart. To revoke the node instead, add its id (the `enrolled node-...` line in the control plane's log) to the control plane's `revoked` file; the next poll answers `410` and roxy denies everything until it is re-enrolled:
+
+```sh
+docker compose exec controlplane sh -c 'echo node-xxxxxx >> /data/revoked'
+```
+
+### Clean up
+
+Ctrl-C in the terminal running `up`, then:
+
+```sh
+docker compose down -v
+```
+:::
+
+## What just happened
+
+An exchange passes through the [addons](/design/addon-model) in the order [`roxy.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/roxy.yaml) lists them, then the rules; each addon wraps everything below it.
+
+<img src={stack} alt="A model call from the client passes through the auth gate, the token quota and the sentinel, then the rules and the connector, to the fake model; each layer calls its own service, and the flow log records the exchange" />
+
+* **The auth gate** ([`addons/auth-gate`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/addons/auth-gate/src/lib.rs)) reads the credential from `x-roxy-auth`, asks the auth service who it belongs to through a [named endpoint](/reference/host-services#endpoints-endpoints), caches the answer in its [state store](/reference/host-services#state-state) under a hash of the credential, tags the flow `user:alice`, strips the header and passes the request on. A missing or refused credential is answered `401` and never leaves. The tag is how a layer hands an identity to the layers below; the rule injects the API key from a [secret](/reference/secrets).
+* **The token quota** ([`addons/token-quota`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/addons/token-quota/src/lib.rs)) asks the quota board, before a model call leaves, whether the user's bucket holds anything (the user is the `user:` tag, or the client IP without one) and answers `429` with `retry-after` if not. Otherwise it reads `input_tokens` from `message_start` and `output_tokens` from `message_delta` as the response streams, changing nothing, and reports them when the stream ends or is cut off. Usage is known only after the response, so a user can overrun by one call and go into debt.
+* **The sentinel** is a [service layer](/reference/service-layers): an out-of-process addon that each model call streams through over a WebSocket. It turns every tool call in a model response into an inspect_sentinel `BeforeToolCall` step and runs the configured sentinel on it. It sits below the quota layer, so what the quota layer meters is what the client got.
+
+Whatever any layer passes on, the rules judge again, and they allow exactly one request, `POST /v1/messages` on the model host. The rule's condition is the one the quota and the sentinel run on (a YAML anchor in `roxy.yaml`), so a request those layers skip, `/v1/messages/` say, is one the rules deny rather than a model call that went unmetered and unjudged.
+
+### Node mode
+
+roxy enrols once with a token, keeps the node token it is issued in its state dir, and polls the control plane for its lease: the whole `roxy.yaml`, the values of the secrets it declares as `lease: true`, and how to ship the flow log ([node mode](/guides/node-mode)). [`controlplane/controlplane.py`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/controlplane/controlplane.py) is the server side of the [node protocol](/reference/node-protocol) in one file. It turns `model_key: { env: MODEL_API_KEY }` into a lease secret from its own environment, and its `lease_id` is a hash of the config and secrets, so editing `roxy.yaml` changes the lease and roxy applies it on its next poll. Its enrolment token stays valid across restarts, because roxy's state dir is tmpfs and every `docker compose up` re-enrols; a real control plane consumes a token on first use.
+
+To run roxy from the file instead, with no control plane:
+
+```sh
+docker compose -f compose.yaml -f compose.standalone.yaml up --build --attach traffic
+```
+
+### Failure is closed
+
+A layer that cannot do its job (the auth service unreachable, the quota board answering something that is not an allowance, the sentinel unable to read a response) fails the exchange: roxy answers `503` naming the layer and logs a `layer_error`. The quota layer reads a non-streamed response whole to find its `usage`, and one over 8 MiB fails the same way; aborted streams are charged for the usage seen before the abort. Stop the quota board (`docker compose stop quota-board`) to see it.
+
+### The denylist
+
+The sentinel runs `deny_regex` from [`policies.py`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/sentinel/policies.py), which searches `<tool name> <arguments as JSON>` for a regular expression. The default catches `curl`, `wget`, `nc`, `ncat`, `ssh`, `scp`, `rsync` and `rm -rf`. Set your own with `SENTINEL_DENY`:
+
+```sh
+SENTINEL_DENY='\bls\b' docker compose up --attach traffic
+```
+
+Any inspect_sentinel monitor or protocol works in its place: set `SENTINEL` to its `module:attribute`, and for one that asks a model, `SENTINEL_MONITOR_MODEL` and a route out (add the `sentinel` service to the `egress` network). The sidecar is in [`sentinel/`](https://github.com/roxy-proxy/roxy-proxy/tree/main/examples/quickstart/sentinel).
+
+### Using it with a real client
+
+Any HTTP client that honours `HTTP_PROXY` can take the clients' place; the proxy is on `127.0.0.1:3128`. Claude Code, against the scripted model:
+
+```sh
+HTTP_PROXY=http://127.0.0.1:3128 \
+ANTHROPIC_BASE_URL=http://fake-model:8080 \
+ANTHROPIC_API_KEY=placeholder \
+ANTHROPIC_CUSTOM_HEADERS='x-roxy-auth: alice-secret' \
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+claude
+```
+
+To point the stack at the real API, allow `api.anthropic.com` in the rules, set the real key as the `model_key` secret, and trust roxy's CA (`http://127.0.0.1:3130/roxy-ca.pem`) in the client, since roxy then terminates TLS.
+
+The client follows `HTTP_PROXY` because it chooses to; any process can ignore it. To contain an agent, run it where its only route out is roxy ([sandbox containment](/guides/containment)).
+
+## Next steps
+
+* **Write an addon.** [Writing addons](/guides/writing-addons) covers the `roxy-addon` SDK the two addons here use.
+* **Contain the agent.** [Sandbox containment](/guides/containment) has the network recipe and a Compose layout.
+* **Write your own policy.** [Policy evaluation](/design/policy-evaluation) explains how rules are evaluated.
