@@ -48,7 +48,7 @@ Each client is the Anthropic SDK, pointed at the model through roxy, with its cr
 traffic-1  | [alice #2] I will fetch that page for you. roxy's sentinel blocked a Bash tool call (denylist match: 'curl').
 ```
 
-The sentinel took the tool call out before the client saw it and put a note in its place. Mallory is refused by the auth gate:
+The response streams to the client as the model produces it, except its tool calls: the sentinel holds each one from the start of its block to the end, judges it as soon as its arguments are complete, and then lets it through, rewrites its arguments or, as here, drops it and puts a note in its place. Text before and after a tool call streams live; events behind a held call wait their turn, with a `ping` every ten seconds while they do. When every tool call in a response is dropped, its `stop_reason` becomes `end_turn`, so the agent's turn ends as if the model had answered in words. Mallory is refused by the auth gate:
 
 ```
 traffic-1  | [mallory #1] 401 AuthenticationError: credential refused by the auth service

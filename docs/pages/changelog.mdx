@@ -29,6 +29,7 @@ Addons can now answer early and hold a request or response for approval, with th
 - Publishing a second outgoing head on a lane is a layer failure and cuts an answer already in progress ([#558](https://github.com/roxy-proxy/roxy-proxy/pull/558)).
 - A layer that fails while handling a core denial may produce a `503`, but the flow record keeps the original deny rule and reason; the layer fault gets its own event ([#558](https://github.com/roxy-proxy/roxy-proxy/pull/558)).
 - The final flow record for an exchange waits for both lanes' bodies, their validation and every accepted host call to finish ([#558](https://github.com/roxy-proxy/roxy-proxy/pull/558)).
+- The quickstart's sentinel sidecar streams a model response to the agent as it arrives, holding only each tool call's block while the sentinel judges it, instead of the whole response until the stream ends. A rejected call is replaced by its note in place, and `modify` now works on streamed responses ([#563](https://github.com/roxy-proxy/roxy-proxy/pull/563)).
 
 - A body that streams through a layer costs more CPU per byte than it did; the fixed cost of a layer is unchanged. Tracked in [#561](https://github.com/roxy-proxy/roxy-proxy/issues/561).
 

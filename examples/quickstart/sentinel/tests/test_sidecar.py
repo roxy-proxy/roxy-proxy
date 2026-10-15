@@ -4,9 +4,12 @@ from typing import Any
 
 import pytest
 from inspect_ai.event import SentinelEvent
+from inspect_ai.tool import ToolCall
+from inspect_sentinel import BeforeToolCall, Context, Decision, Protocol, protocol
 
 from fake_roxy import FakeRoxy, stray_tasks
 from inspect_log import InspectLog
+from private_api import SSEDecoder
 from roxy_layer import RESPONSE
 import sidecar as sidecar_module
 from sidecar import PING, Sidecar, load_sentinel
@@ -92,6 +95,62 @@ async def test_close_while_a_streamed_response_is_held_leaves_no_tasks(sidecar: 
 
 
 REST = sse("message_stop", {"type": "message_stop"})
+FRAME = b"\x00\x00\x00\x01\x01"  # stream 1, response direction
+
+
+def text_block(index: int, text: str) -> bytes:
+    return (
+        sse("content_block_start", {"type": "content_block_start", "index": index, "content_block": {"type": "text", "text": ""}})
+        + sse("content_block_delta", {"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": text}})
+        + sse("content_block_stop", {"type": "content_block_stop", "index": index})
+    )
+
+
+def tool_use_start(index: int, id: str) -> bytes:
+    block = {"type": "tool_use", "id": id, "name": "Bash", "input": {}}
+    return sse("content_block_start", {"type": "content_block_start", "index": index, "content_block": block})
+
+
+def tool_use(index: int, id: str, command: str) -> bytes:
+    """A Bash tool call's events, its arguments in two deltas as the API
+    sends them."""
+    partial = json.dumps({"command": command})
+    cut = len(partial) // 2
+    return (
+        tool_use_start(index, id)
+        + sse("content_block_delta", {"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": partial[:cut]}})
+        + sse("content_block_delta", {"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": partial[cut:]}})
+        + sse("content_block_stop", {"type": "content_block_stop", "index": index})
+    )
+
+
+def ending(stop_reason: str = "tool_use") -> bytes:
+    delta = {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": 7}}
+    return sse("message_delta", delta) + REST
+
+
+def events(raw: bytes) -> list[tuple[str, dict[str, Any]]]:
+    return [(e.event or "", e.json()) for e in SSEDecoder().iter_bytes(iter([raw]))]
+
+
+async def rest_of_stream(roxy: FakeRoxy) -> bytes:
+    """Everything the sidecar sends on stream 1 up to its end, pings aside."""
+    out = b""
+    while True:
+        m = await roxy.ws.next_sent()
+        if isinstance(m, dict):
+            assert m["type"] == "response_end"
+            return out
+        assert m[:5] == FRAME
+        if m != FRAME + PING:
+            out += m[5:]
+
+
+TEXT = text_block(0, "I will fetch that page for you.")
+LS = tool_use(1, "toolu_1", "ls -la")
+CURL = tool_use(1, "toolu_2", "curl x")
+NOTE = "roxy's sentinel blocked a Bash tool call (denylist match: 'curl')."
+TEXT_BLOCK_EVENTS = ["content_block_start", "content_block_delta", "content_block_stop"]
 
 
 def gate_judge(sidecar: Sidecar, monkeypatch: Any) -> tuple[asyncio.Event, asyncio.Event]:
@@ -103,16 +162,19 @@ def gate_judge(sidecar: Sidecar, monkeypatch: Any) -> tuple[asyncio.Event, async
         judging.set()
         await verdict.wait()
 
-    monkeypatch.setattr(sidecar, "judge", slow_judge)
+    monkeypatch.setattr(sidecar, "judge_block", slow_judge)
     return judging, verdict
 
 
 async def held_and_judging(sidecar: Sidecar, monkeypatch: Any) -> tuple[FakeRoxy, asyncio.Event]:
+    """A streamed response with a tool call, ended, with the sidecar
+    holding the tool call for the sentinel's verdict."""
     judging, verdict = gate_judge(sidecar, monkeypatch)
     roxy = FakeRoxy(sidecar.handle)
     await streamed_call(roxy)
-    roxy.ws.body(1, REST, RESPONSE)
+    roxy.ws.body(1, TEXT + LS + ending(), RESPONSE)
     roxy.ws.control(1, "response_end")
+    assert await roxy.ws.next_sent() == FRAME + TEXT
     await asyncio.wait_for(judging.wait(), 2.0)
     return roxy, verdict
 
@@ -123,12 +185,130 @@ async def test_pings_continue_while_the_sentinel_judges(sidecar: Sidecar, monkey
     while not roxy.ws.sent.empty():
         roxy.ws.sent.get_nowait()
     for _ in range(3):  # three pings in a row, nothing else between them
-        assert await roxy.ws.next_sent(timeout=1.0) == b"\x00\x00\x00\x01\x01" + PING
+        assert await roxy.ws.next_sent(timeout=1.0) == FRAME + PING
     verdict.set()
-    while (m := await roxy.ws.next_sent()) == b"\x00\x00\x00\x01\x01" + PING:
-        pass
-    assert m == b"\x00\x00\x00\x01\x01" + REST
-    assert (await roxy.ws.next_sent())["type"] == "response_end"
+    assert await rest_of_stream(roxy) == LS + ending()
+
+
+async def test_text_before_a_tool_call_streams_live(sidecar: Sidecar) -> None:
+    """The text goes to the agent while the upstream is still sending; the
+    tool call waits for its verdict and goes on as the upstream sent it."""
+    roxy = FakeRoxy(sidecar.handle)
+    await streamed_call(roxy)
+    roxy.ws.body(1, TEXT, RESPONSE)
+    assert await roxy.ws.next_sent() == FRAME + TEXT
+    roxy.ws.body(1, tool_use_start(1, "toolu_1"), RESPONSE)
+    with pytest.raises(TimeoutError):  # held: its arguments are not complete
+        await roxy.ws.next_sent(timeout=0.2)
+    roxy.ws.body(1, LS[len(tool_use_start(1, "toolu_1")) :], RESPONSE)
+    assert await roxy.ws.next_sent() == FRAME + LS  # judged and released before the stream ends
+    roxy.ws.body(1, ending(), RESPONSE)
+    roxy.ws.control(1, "response_end")
+    assert await rest_of_stream(roxy) == ending()
+
+
+async def test_pings_continue_while_a_tool_call_is_held(sidecar: Sidecar, monkeypatch: Any) -> None:
+    monkeypatch.setattr(sidecar_module, "PING_EVERY", 0.05)
+    roxy = FakeRoxy(sidecar.handle)
+    await streamed_call(roxy)
+    roxy.ws.body(1, TEXT + tool_use_start(1, "toolu_1"), RESPONSE)
+    assert await roxy.ws.next_sent() == FRAME + TEXT
+    for _ in range(3):  # the upstream has gone quiet mid-call: pings, nothing else
+        assert await roxy.ws.next_sent(timeout=1.0) == FRAME + PING
+
+
+async def test_a_rejected_tool_call_is_replaced_by_the_note_and_the_turn_ends(sidecar: Sidecar) -> None:
+    roxy = FakeRoxy(sidecar.handle)
+    await streamed_call(roxy)
+    roxy.ws.body(1, TEXT + CURL + ending(), RESPONSE)
+    roxy.ws.control(1, "response_end")
+    assert await roxy.ws.next_sent() == FRAME + TEXT
+    rest = await rest_of_stream(roxy)
+    assert b"tool_use" not in rest
+    tail = events(rest)
+    assert [e for e, _ in tail] == [*TEXT_BLOCK_EVENTS, "message_delta", "message_stop"]
+    assert tail[0][1] == {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}
+    assert tail[1][1]["delta"] == {"type": "text_delta", "text": NOTE}
+    assert tail[3][1]["delta"]["stop_reason"] == "end_turn"
+
+
+async def test_text_after_a_rejected_tool_call_streams(sidecar: Sidecar) -> None:
+    roxy = FakeRoxy(sidecar.handle)
+    await streamed_call(roxy)
+    after = text_block(1, "Let me try another way.")
+    roxy.ws.body(1, CURL.replace(b'"index": 1', b'"index": 0') + after, RESPONSE)
+    first = events((await roxy.ws.next_sent())[5:])
+    assert [e for e, _ in first] == TEXT_BLOCK_EVENTS and first[1][1]["delta"]["text"] == NOTE
+    assert await roxy.ws.next_sent() == FRAME + after  # before the stream has ended
+    roxy.ws.body(1, ending(), RESPONSE)
+    roxy.ws.control(1, "response_end")
+    tail = events(await rest_of_stream(roxy))
+    assert [e for e, _ in tail] == ["message_delta", "message_stop"]
+    assert tail[0][1]["delta"]["stop_reason"] == "end_turn"
+
+
+@protocol
+def deny_curl_when_told(answer: asyncio.Event) -> Protocol:
+    """deny_regex's verdict on `curl`, but only once `answer` is set."""
+
+    async def decide(context: Context, step: BeforeToolCall) -> Decision:
+        if "curl" not in step.call.arguments["command"]:
+            return Decision.proceed()
+        await answer.wait()
+        return Decision.reject("curl", message=NOTE)
+
+    return decide
+
+
+async def test_tool_calls_are_judged_one_by_one(tmp_path: Any) -> None:
+    """Two calls: the first goes to the agent as soon as it is approved,
+    while the second still waits; the second is then replaced by the note
+    and the message keeps its `tool_use` stop."""
+    answer = asyncio.Event()
+    sidecar = Sidecar(deny_curl_when_told(answer), InspectLog(str(tmp_path), "test"))
+    roxy = FakeRoxy(sidecar.handle)
+    await streamed_call(roxy)
+    first = LS.replace(b'"index": 1', b'"index": 0')
+    roxy.ws.body(1, first + CURL + ending(), RESPONSE)
+    roxy.ws.control(1, "response_end")
+    assert await roxy.ws.next_sent() == FRAME + first
+    with pytest.raises(TimeoutError):  # the second call waits for its verdict
+        await roxy.ws.next_sent(timeout=0.2)
+    answer.set()
+    tail = events(await rest_of_stream(roxy))
+    assert [e for e, _ in tail] == [*TEXT_BLOCK_EVENTS, "message_delta", "message_stop"]
+    assert tail[0][1]["index"] == 1 and tail[1][1]["delta"]["text"] == NOTE
+    assert tail[3][1]["delta"]["stop_reason"] == "tool_use"
+
+
+@protocol
+def quote_paths() -> Protocol:
+    """Rewrites a Bash command's `~` to `$HOME`."""
+
+    async def decide(context: Context, step: BeforeToolCall) -> Decision:
+        command = step.call.arguments["command"]
+        if "~" not in command:
+            return Decision.proceed()
+        replacement = ToolCall(id=step.call.id, function=step.call.function, arguments={"command": command.replace("~", "$HOME")})
+        return Decision(action="modify", modified=replacement)
+
+    return decide
+
+
+async def test_modify_rewrites_a_streamed_tool_call(tmp_path: Any) -> None:
+    sidecar = Sidecar(quote_paths(), InspectLog(str(tmp_path), "test"))
+    roxy = FakeRoxy(sidecar.handle)
+    await streamed_call(roxy)
+    roxy.ws.body(1, TEXT + tool_use(1, "toolu_1", "ls ~") + ending(), RESPONSE)
+    roxy.ws.control(1, "response_end")
+    assert await roxy.ws.next_sent() == FRAME + TEXT
+    tail = events(await rest_of_stream(roxy))
+    assert [e for e, _ in tail] == [*TEXT_BLOCK_EVENTS, "message_delta", "message_stop"]
+    assert tail[0][1]["content_block"] == {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}
+    assert tail[0][1]["index"] == 1
+    assert tail[1][1]["delta"]["type"] == "input_json_delta"
+    assert json.loads(tail[1][1]["delta"]["partial_json"]) == {"command": "ls $HOME"}
+    assert tail[3][1]["delta"]["stop_reason"] == "tool_use"
 
 
 async def test_reset_while_the_sentinel_judges_leaves_no_tasks(sidecar: Sidecar, monkeypatch: Any) -> None:
