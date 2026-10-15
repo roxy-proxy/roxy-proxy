@@ -147,6 +147,7 @@ pub(super) fn stack_outcome(
     // A body the front never writes (a bodiless status, a HEAD) is read
     // here instead, so its lane ends as the layer ends it.
     if res.status_forbids_body() || st.client_head {
+        st.draining.store(true, Ordering::SeqCst);
         res.body = drained(std::mem::take(&mut res.body));
     }
     res.body = gated(std::mem::take(&mut res.body), st.shared.sink.clone());

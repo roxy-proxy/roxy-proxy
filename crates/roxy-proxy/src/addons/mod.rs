@@ -254,6 +254,9 @@ pub(crate) struct StackFlow {
     /// The front is splicing the client into a relayed WebSocket: the
     /// record goes with the relay, which ends the exchange.
     upgraded: CancellationToken,
+    /// The client edge reads the response body itself (one the client is
+    /// not sent), so the lane ends as the layer ends it.
+    draining: AtomicBool,
 }
 
 impl std::ops::Deref for StackFlow {
@@ -288,6 +291,7 @@ impl StackFlow {
             )),
             decided: OnceLock::new(),
             upgraded: CancellationToken::new(),
+            draining: AtomicBool::new(false),
         }
     }
 
@@ -322,9 +326,12 @@ impl StackFlow {
         self.chain().layer_torn_down_why(index)
     }
 
-    /// The front has written the response: a body it did not read to its
-    /// end is one it will not read.
+    /// The response has been written: a body the client edge did not read
+    /// to its end, and is not reading, is one it will not read.
     pub(crate) fn response_written(&self) {
+        if self.draining.load(Ordering::SeqCst) {
+            return;
+        }
         let res = LaneId {
             hop: 0,
             dir: Dir::Res,
@@ -352,10 +359,15 @@ impl StackFlow {
         cx
     }
 
-    /// Layer `index` is forwarding: a forward of its has been accepted,
-    /// whether or not the call that carries it has run.
+    /// Layer `index`'s forward is outstanding: accepted (whether or not
+    /// the call that carries it has run) and not yet answered on the lane
+    /// upstream of the layer.
     pub(crate) fn forward_requested(&self, index: usize) -> bool {
-        self.layers[index].forwarded.load(Ordering::SeqCst)
+        let answered = LaneId {
+            hop: index + 1,
+            dir: Dir::Res,
+        };
+        self.layers[index].forwarded.load(Ordering::SeqCst) && !self.chain().has_head(answered)
     }
 
     /// Layer `index` is forwarding: its request is on its way to the next
