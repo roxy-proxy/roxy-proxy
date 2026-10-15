@@ -69,7 +69,7 @@ from inspect_ai.model import (
 )
 from inspect_ai.tool import ToolCall, ToolCallView, ToolInfo
 from inspect_ai.util import Store
-from inspect_sentinel import BeforeToolCall, Context, Decision, HumanAnswer, Step
+from inspect_sentinel import BeforeToolCall, Context, Decision, Host, HumanAnswer, Step
 
 from inspect_log import InspectLog, InspectRecorder
 from private_api import (
@@ -431,9 +431,12 @@ class Held:
 
 
 class Sidecar:
-    def __init__(self, sentinel: Any, inspect_log: InspectLog) -> None:
+    def __init__(self, sentinel: Any, inspect_log: InspectLog, host: Host | None = None) -> None:
         self.root = resolve_sentinel(sentinel)
-        self.host = SidecarHost()
+        # The host is what the sentinel may do to the world: by default a
+        # monitor model and nobody to ask. A caller with a person to ask
+        # (a review queue, say) passes its own.
+        self.host = host or SidecarHost()
         self.stores = Stores()
         self.inspect_log = inspect_log
 

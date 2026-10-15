@@ -1,0 +1,47 @@
+# Every tool call waits for a person. roxy intercepts Claude Code's calls to
+# api.anthropic.com and runs each response through the review layer
+# (approval.py), which holds it until someone clicks Approve or Deny at
+# http://127.0.0.1:8585. Run from the repository root:
+#   roxy run --config examples/human-approval/roxy.yaml
+version: 1
+
+listeners:
+  - name: proxy
+    bind: 127.0.0.1:8080        # HTTPS_PROXY=http://127.0.0.1:8080
+
+ca_server:
+  bind: 127.0.0.1:8081          # http://127.0.0.1:8081/roxy-ca.pem
+
+tls:
+  ca_dir: examples/human-approval/ca   # relative to the working directory; generated on first run
+
+log:
+  flow:
+    connection_events: false    # the flow log goes to stdout
+
+limits:
+  # The layer pings a held stream every 10 seconds, so this never fires
+  # while a person is deciding; it is what would, if the pings stopped.
+  response_body_idle_timeout: 30m
+
+addons:
+  - name: human-approval
+    kind: service
+    when: host == "api.anthropic.com" and method == POST and path starts_with "/v1/messages"
+    endpoint: review
+    endpoints:
+      review: { url: "http://127.0.0.1:9000/", private_ok: true }
+    limits:
+      # A response the agent asked for whole (no `stream: true`) is held
+      # with nothing sent until the person decides: this is how long they
+      # have. A streamed response has already started, so this clock is
+      # met at once and the pings carry the wait.
+      first_byte_timeout: 30m
+
+rules:
+  - id: anthropic
+    when: host == "api.anthropic.com" and port == 443
+    then: allow
+  # Everything else is denied, Claude Code's telemetry included. To let
+  # another model host through, add a rule for it, and widen the layer's
+  # `when` if its responses should be reviewed too.
