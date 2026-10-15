@@ -45,6 +45,85 @@ async fn echo(ws: &mut Ws, m: Message) -> Message {
         .unwrap()
 }
 
+/// Faithful addons preserve a TLS WebSocket through its close handshake.
+#[tokio::test]
+async fn wss_survives_pass_through_wasm_service_and_mixed_stacks() {
+    use crate::addons::AddonMode;
+    use crate::addons::service::testing;
+
+    for inspect_messages in [false, true] {
+        let rules = if inspect_messages {
+            format!("{WS_ALLOW}\n- id: message-limit\n  when: ws.size > 1mb\n  then: deny\n")
+        } else {
+            WS_ALLOW.to_owned()
+        };
+        for (wasm, service) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut addons = Vec::new();
+            if wasm {
+                addons.push(AddonDef::test_layer("a").spec().await);
+            }
+            if service {
+                addons.push(testing::addon("s", "pass", AddonMode::Enforce, |_| {}));
+            }
+            if wasm {
+                addons.push(AddonDef::test_layer("b").spec().await);
+            }
+            let names: Vec<_> = addons.iter().map(|a| a.name.clone()).collect();
+            let kit = testing::kit(&rules, addons).await;
+            // The outer CONNECT and TLS handshake precede the upgrade
+            // that the addons forward. The origin connection uses TLS too.
+            let client = kit.tunnel("up.test", false).await;
+            let (status, io) = kit
+                .websocket_over(client, "/ws/echo", &[("x-echo", "frames")])
+                .await;
+            assert_eq!(status, 101);
+            let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                io.unwrap(),
+                tokio_tungstenite::tungstenite::protocol::Role::Client,
+                None,
+            )
+            .await;
+            assert_eq!(
+                echo(&mut ws, Message::text("hello over TLS")).await,
+                Message::text("hello over TLS")
+            );
+            let binary = Message::binary(vec![0, 1, 127, 128, 255]);
+            assert_eq!(echo(&mut ws, binary.clone()).await, binary);
+            assert_eq!(
+                echo(&mut ws, Message::Ping(vec![1, 2].into())).await,
+                Message::Pong(vec![1, 2].into())
+            );
+            ws.close(None).await.unwrap();
+            let close = tokio::time::timeout(Duration::from_secs(2), ws.next())
+                .await
+                .expect("the close handshake finishes")
+                .expect("a close frame, not bare EOF")
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "close with wasm={wasm}, service={service}, inspect={inspect_messages}: {e}"
+                    )
+                });
+            assert_eq!(close, Message::Close(None));
+            drop(ws);
+            kit.upstream.wait_ws_closed(1).await;
+            let event = kit.request_event().await;
+            assert_eq!(event["res"]["status"], 101, "{event:#}");
+            assert_eq!(event["decision"], "allow", "{event:#}");
+            assert_eq!(event["tls"]["alpn"], "http/1.1", "{event:#}");
+            assert_eq!(event["req"]["port"], 443, "{event:#}");
+            assert_eq!(super::strs(&event["addons"]), names, "{event:#}");
+            let seen = kit.upstream.wait_seen(1).await;
+            assert_eq!(seen[0].addr.port(), 443);
+            assert_eq!(seen[0].version, http::Version::HTTP_11);
+            assert_eq!(
+                kit.upstream.ws_received(),
+                [b"hello over TLS".to_vec(), vec![0, 1, 127, 128, 255]]
+            );
+            super::no_layer_error(&kit);
+        }
+    }
+}
+
 /// Reads until the close frame roxy sends; returns its code. Data
 /// messages before it are returned too.
 async fn read_to_close(ws: &mut Ws) -> (Vec<Message>, Option<u16>) {

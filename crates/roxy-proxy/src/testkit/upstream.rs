@@ -509,7 +509,12 @@ impl Upstream {
             while let Some(Ok(msg)) = ws.next().await {
                 if let Message::Close(c) = &msg {
                     lock(&me.ws_close_codes).push(c.as_ref().map(|c| u16::from(c.code)));
-                    let _ = ws.close(None).await;
+                    // Reading Close queued the reply; sending a second Close
+                    // is refused because the WebSocket is already closing.
+                    let _ = ws.flush().await;
+                    // Tungstenite can report ConnectionClosed after writing
+                    // its reply, before flushing the underlying TLS stream.
+                    let _ = ws.get_mut().flush().await;
                     break;
                 }
                 if msg.is_text() || msg.is_binary() {
