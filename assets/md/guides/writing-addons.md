@@ -28,7 +28,7 @@ roxy_addon::export!(RedactTokens);
 * `Next` is consumed by `run`, so the type system enforces one `next` per
   exchange. `next.run` returns once the response head arrives, while the
   rest of the request body is pumped as the layer reads the response, so a
-  layer below that answers early cannot deadlock against the host's small
+  layer upstream that answers early cannot deadlock against the host's small
   body buffers.
 * `flow::*` and `call_endpoint` wrap the host services. A panic traps, and
   the host fails the exchange closed.
@@ -49,7 +49,8 @@ is a streaming redactor built on `roxy-addon`.
 ## WIT package
 
 [`wit/addon.wit`](https://github.com/roxy-proxy/roxy-proxy/blob/main/wit/addon.wit)
-defines `roxy:addon@0.2.1`. Heads are records of roxy's own: a
+defines the `roxy:addon@0.3.0` package.
+Heads are records of roxy's own: a
 `request-head` (method, scheme, authority, path and query, and the header
 list) and a `response-head` (status and headers), each crossing the guest
 boundary in one call. Bodies are plain `wasi:io/streams` (vendored at
@@ -62,8 +63,13 @@ boundary in one call. Bodies are plain `wasi:io/streams` (vendored at
   (`next`, `respond`), `endpoints`, `flow`, and the WASI clocks, random, io
   and stdio interfaces.
 * A layer answers with `chain.respond(response-head, body)`, once, before
-  `handle` returns; `chain.next(request-head, body)` passes a request down,
-  once. Both take a `body`: `empty`, `bytes` (one piece, no stream),
+  `handle` returns; `chain.next(request-head, body)` passes a request upstream,
+  once. Neither waits on the other: a layer may answer and then forward,
+  forward and answer before the response from upstream arrives, or answer
+  without forwarding; its answer reaches the client as soon as it is made,
+  and a forward it made runs on for as long as it waits for the response
+  (read at least the response head for the forward to be delivered). Both
+  take a `body`: `empty`, `bytes` (one piece, no stream),
   `passthrough` (a stream the host handed this layer, moved host-side
   without entering the guest) or `stream`, for which the call returns the
   `output-stream` to write. A streamed body must be ended with
@@ -75,8 +81,9 @@ boundary in one call. Bodies are plain `wasi:io/streams` (vendored at
   there may be no more than `limits.max_headers` of them, `host`,
   `content-length`, hop-by-hop and framing fields are refused (roxy derives
   them; the body carries its own length), and the whole record must fit in
-  128 KiB. A refused head fails the exchange closed. Trailers on a body are
-  dropped in both directions.
+  128 KiB. A refused head fails the exchange closed. Host-side body
+  passthrough preserves trailers. Guest byte-stream reads and rewrites have
+  no trailer API, so those paths drop them.
 * The host links the rest of WASI 0.2 inertly: an empty environment, no
   arguments, no preopened directories, stdin closed, TCP, UDP and name
   lookup off, every socket address denied. Anything a guest writes to
@@ -89,17 +96,9 @@ boundary in one call. Bodies are plain `wasi:io/streams` (vendored at
   own log (the capability still applies), and every other `flow`, `chain`
   or `endpoints` call traps.
 
-An additive change to the package (a new function, say) bumps its patch
-version, and a component built against an earlier 0.2.x still loads; an
-addon that calls a newer function needs a roxy that provides it.
-
-A layer built with `roxy-addon` 0.1 (against `roxy:addon@0.1.0`, which
-used the WASI HTTP types) does not load on a roxy serving 0.2: the import
-set differs, so linking fails at config load with the component's imports
-named. Rebuild it against `roxy-addon` 0.2; the SDK's `Layer`, `Request`,
-`Response`, `Headers`, `Body`, `Next` and `flow` API is unchanged, and
-`Error` is an enum of roxy's own, so code that matched WASI `error-code`
-variants changes.
+Build a component against the `wit/` of the roxy version it runs on. A
+component whose imports do not match fails at config load with the
+component's imports named; rebuild it against the current `roxy-addon`.
 
 ### Instances
 

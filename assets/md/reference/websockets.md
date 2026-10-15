@@ -28,8 +28,11 @@ Through an `http_proxy` listener a `ws://` URL means a `CONNECT` tunnel
 with a plaintext upgrade inside it, which roxy refuses unless
 `http.allow_plain_in_connect` is on (the tunnel is closed, `parse_error`
 reason `non_http_in_connect`; [CONNECT](/reference/http#connect)). Use
-`wss://`. On an `http` listener the upgrade arrives as plain HTTP and
-needs nothing.
+`wss://`. For WSS, roxy establishes the CONNECT tunnel and terminates TLS
+before processing the HTTP/1.1 upgrade. Addon layers receive that upgrade
+and carry the WebSocket bytes in both directions; the outer CONNECT is
+handled by the listener. On an `http` listener the upgrade arrives as
+plain HTTP and needs nothing.
 
 If no rule reads a `ws.*` field, roxy splices bytes: no frame parsing,
 re-masking or reassembly; subprotocols and extensions pass end to end. If
@@ -53,8 +56,10 @@ any rule reads `ws.*`, every message is checked
   follows, with `res.status: 101` and the relayed byte totals as its
   `body_bytes`.
 
-WebSockets over HTTP/2 (RFC 8441) are not supported; HTTP/2 clients use a
-separate HTTP/1.1 connection.
+WebSockets over HTTP/2 (RFC 8441 extended CONNECT) are not supported;
+clients must use a separate HTTP/1.1 connection for WebSockets. This
+restriction concerns the HTTP version, not TLS: `wss://` over HTTP/1.1 is
+supported, including through addon layers.
 
 ## Extensions
 

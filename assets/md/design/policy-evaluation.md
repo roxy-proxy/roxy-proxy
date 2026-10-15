@@ -32,7 +32,7 @@ head as it arrives; the rules decide the head once, after the whole stack
 and before anything is forwarded (if a rule reads `body.text`, the body is
 buffered up to the cap first: [body rules](/reference/rule-language#body-rules)),
 then re-check the body as its bytes stream past. When a layer's tag or
-state write becomes visible to the rules, and to the layers below it, is a
+state write becomes visible to the rules, and to the layers upstream of it, is a
 matter of [ordering across layers](/design/addon-model#ordering-across-layers).
 
 1. **The forwarding decision is made at the request head, and deny wins.**

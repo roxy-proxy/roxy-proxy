@@ -30,15 +30,18 @@ the client sees one clean wire form.
   the client, through ambiguous framing;
 * exfiltrating real credentials: with secret injection the client only ever
   holds placeholders;
-* exhausting roxy's memory, CPU or file descriptors: slowloris, huge
-  headers, unbounded bodies, cardinality attacks on metric keys, runaway
-  addons;
+* unbounded memory and file-descriptor use from slowloris, huge headers,
+  unbounded bodies and cardinality attacks, within the configured limits;
 * learning anything useful from a deny beyond the rule id.
 
 **roxy does not try to prevent** traffic that never reaches it, timing or
 DNS side channels from the workload (block DNS egress at the network layer;
 roxy resolves names itself), compromise of an upstream the rules already
-allow, or compromise of the host running roxy.
+allow, or compromise of the host running roxy. WASM addons have memory,
+instance and answer-deadline limits. Epoch yielding makes guest code
+cancellable and shares execution time; it is not a total CPU budget. A
+handler that has answered can continue consuming CPU until its exchange is
+cancelled, so addon configuration remains trusted.
 
 ## Which use case claims what
 
@@ -121,11 +124,14 @@ behind or its disk fails, roxy holds traffic back until it catches up
 
 ## The rules judge everything that leaves
 
-Addons sit above the rules and can reshape traffic freely, but what they
+Addons sit downstream of the rules and can reshape traffic freely, but what they
 pass on is re-validated as strictly as a client request and judged by the
 rules as if the client had sent it. Nothing configurable runs between the
 rules and the network, and the address floor checks the IP actually
-dialled ([addon model](/design/addon-model)).
+dialled. A refusal the rules make travels downstream through the addons as a
+response. A downstream addon may reshape it, including into a success
+response: addons are trusted configuration, the request did not leave, and the flow log records the rules' verdict whatever the client was
+given ([addon model](/design/addon-model)).
 
 ## Streams, not messages
 

@@ -17,7 +17,7 @@ Sitemap:
 - [How roxy works](/design/how-it-works): One exchange through roxy: decrypt and parse, the addon stack, the rules, the connector, and the response back up the same path, with every stage and every exit written to the flow log.
 - [Threat model and guarantees](/design/threat-model)
 - [Policy evaluation](/design/policy-evaluation): How the rules decide an exchange: one admission decision on the request head, in-flight re-checks as bytes stream, deny wins, and how effects, tags and unavailable inputs behave.
-- [Addon model](/design/addon-model): What an addon layer is, how the stack is shaped, the invariants every layer is held to, how the bytes and the host-service effects of one layer are ordered against another's, and what the modes mean.
+- [Addon model](/design/addon-model): What an addon layer is: a stage on the exchange's two lanes. How the stack is shaped, the invariants every layer is held to, how the bytes and the host-service effects of one layer are ordered against another's, and what the modes mean.
 - [Performance](/design/performance)
 - [Configuration](/reference/configuration)
 - [Rule language](/reference/rule-language)
@@ -1066,7 +1066,7 @@ roxy_addon::export!(RedactTokens);
 * `Next` is consumed by `run`, so the type system enforces one `next` per
   exchange. `next.run` returns once the response head arrives, while the
   rest of the request body is pumped as the layer reads the response, so a
-  layer below that answers early cannot deadlock against the host's small
+  layer upstream that answers early cannot deadlock against the host's small
   body buffers.
 * `flow::*` and `call_endpoint` wrap the host services. A panic traps, and
   the host fails the exchange closed.
@@ -1087,7 +1087,8 @@ is a streaming redactor built on `roxy-addon`.
 ## WIT package
 
 [`wit/addon.wit`](https://github.com/roxy-proxy/roxy-proxy/blob/main/wit/addon.wit)
-defines `roxy:addon@0.2.1`. Heads are records of roxy's own: a
+defines the `roxy:addon@0.3.0` package.
+Heads are records of roxy's own: a
 `request-head` (method, scheme, authority, path and query, and the header
 list) and a `response-head` (status and headers), each crossing the guest
 boundary in one call. Bodies are plain `wasi:io/streams` (vendored at
@@ -1100,8 +1101,13 @@ boundary in one call. Bodies are plain `wasi:io/streams` (vendored at
   (`next`, `respond`), `endpoints`, `flow`, and the WASI clocks, random, io
   and stdio interfaces.
 * A layer answers with `chain.respond(response-head, body)`, once, before
-  `handle` returns; `chain.next(request-head, body)` passes a request down,
-  once. Both take a `body`: `empty`, `bytes` (one piece, no stream),
+  `handle` returns; `chain.next(request-head, body)` passes a request upstream,
+  once. Neither waits on the other: a layer may answer and then forward,
+  forward and answer before the response from upstream arrives, or answer
+  without forwarding; its answer reaches the client as soon as it is made,
+  and a forward it made runs on for as long as it waits for the response
+  (read at least the response head for the forward to be delivered). Both
+  take a `body`: `empty`, `bytes` (one piece, no stream),
   `passthrough` (a stream the host handed this layer, moved host-side
   without entering the guest) or `stream`, for which the call returns the
   `output-stream` to write. A streamed body must be ended with
@@ -1113,8 +1119,9 @@ boundary in one call. Bodies are plain `wasi:io/streams` (vendored at
   there may be no more than `limits.max_headers` of them, `host`,
   `content-length`, hop-by-hop and framing fields are refused (roxy derives
   them; the body carries its own length), and the whole record must fit in
-  128 KiB. A refused head fails the exchange closed. Trailers on a body are
-  dropped in both directions.
+  128 KiB. A refused head fails the exchange closed. Host-side body
+  passthrough preserves trailers. Guest byte-stream reads and rewrites have
+  no trailer API, so those paths drop them.
 * The host links the rest of WASI 0.2 inertly: an empty environment, no
   arguments, no preopened directories, stdin closed, TCP, UDP and name
   lookup off, every socket address denied. Anything a guest writes to
@@ -1127,17 +1134,9 @@ boundary in one call. Bodies are plain `wasi:io/streams` (vendored at
   own log (the capability still applies), and every other `flow`, `chain`
   or `endpoints` call traps.
 
-An additive change to the package (a new function, say) bumps its patch
-version, and a component built against an earlier 0.2.x still loads; an
-addon that calls a newer function needs a roxy that provides it.
-
-A layer built with `roxy-addon` 0.1 (against `roxy:addon@0.1.0`, which
-used the WASI HTTP types) does not load on a roxy serving 0.2: the import
-set differs, so linking fails at config load with the component's imports
-named. Rebuild it against `roxy-addon` 0.2; the SDK's `Layer`, `Request`,
-`Response`, `Headers`, `Body`, `Next` and `flow` API is unchanged, and
-`Error` is an enum of roxy's own, so code that matched WASI `error-code`
-variants changes.
+Build a component against the `wit/` of the roxy version it runs on. A
+component whose imports do not match fails at config load with the
+component's imports named; rebuild it against the current `roxy-addon`.
 
 ### Instances
 
@@ -1180,10 +1179,12 @@ stream.
 
 Logic that needs to understand the traffic goes in an addon: an external
 service that the traffic streams through, or a WASM component that runs
-in process. An addon owns both streams of the exchanges it chooses and can
-rewrite, withhold, answer or block. The stack runs outermost first, the
-last addon's `next` runs the rest of the core on what it passed on, and
-the rules judge that as if the client had sent it
+in process. An addon owns both lanes of the exchanges it chooses and can
+rewrite, withhold, answer or block. Requests pass through addons in their
+configured order, then reach the core stage. The core validates the final
+request, evaluates the rules, applies destination restrictions and owns
+the upstream connection. The rules judge the forwarded request as if the
+client had sent it
 ([addon model](/design/addon-model),
 [addon configuration](/reference/addon-configuration)).
 
@@ -1220,7 +1221,7 @@ The request steps run in a fixed order: a bounded body buffer only when a
 rule reads `body.text`, then the admission decision and its effects. The only
 verdict that leads to the upstream is `Continue`; every error maps to a
 deny or a close. The steps are not an extension point: extensions are
-addons, above them.
+addons, downstream of them.
 
 ## Connect
 
@@ -1286,15 +1287,18 @@ the client sees one clean wire form.
   the client, through ambiguous framing;
 * exfiltrating real credentials: with secret injection the client only ever
   holds placeholders;
-* exhausting roxy's memory, CPU or file descriptors: slowloris, huge
-  headers, unbounded bodies, cardinality attacks on metric keys, runaway
-  addons;
+* unbounded memory and file-descriptor use from slowloris, huge headers,
+  unbounded bodies and cardinality attacks, within the configured limits;
 * learning anything useful from a deny beyond the rule id.
 
 **roxy does not try to prevent** traffic that never reaches it, timing or
 DNS side channels from the workload (block DNS egress at the network layer;
 roxy resolves names itself), compromise of an upstream the rules already
-allow, or compromise of the host running roxy.
+allow, or compromise of the host running roxy. WASM addons have memory,
+instance and answer-deadline limits. Epoch yielding makes guest code
+cancellable and shares execution time; it is not a total CPU budget. A
+handler that has answered can continue consuming CPU until its exchange is
+cancelled, so addon configuration remains trusted.
 
 ## Which use case claims what
 
@@ -1377,11 +1381,14 @@ behind or its disk fails, roxy holds traffic back until it catches up
 
 ## The rules judge everything that leaves
 
-Addons sit above the rules and can reshape traffic freely, but what they
+Addons sit downstream of the rules and can reshape traffic freely, but what they
 pass on is re-validated as strictly as a client request and judged by the
 rules as if the client had sent it. Nothing configurable runs between the
 rules and the network, and the address floor checks the IP actually
-dialled ([addon model](/design/addon-model)).
+dialled. A refusal the rules make travels downstream through the addons as a
+response. A downstream addon may reshape it, including into a success
+response: addons are trusted configuration, the request did not leave, and the flow log records the rules' verdict whatever the client was
+given ([addon model](/design/addon-model)).
 
 ## Streams, not messages
 
@@ -1434,7 +1441,7 @@ head as it arrives; the rules decide the head once, after the whole stack
 and before anything is forwarded (if a rule reads `body.text`, the body is
 buffered up to the cap first: [body rules](/reference/rule-language#body-rules)),
 then re-check the body as its bytes stream past. When a layer's tag or
-state write becomes visible to the rules, and to the layers below it, is a
+state write becomes visible to the rules, and to the layers upstream of it, is a
 matter of [ordering across layers](/design/addon-model#ordering-across-layers).
 
 1. **The forwarding decision is made at the request head, and deny wins.**
@@ -1515,8 +1522,8 @@ is simply absent, like an unsent header, is not unavailable: it is `null`
 # Addon model
 
 roxy knows HTTP, not any particular application or API. Logic that needs to
-understand the traffic goes in an addon: a layer above the rules that owns
-both streams of every exchange it runs on. An addon is either:
+understand the traffic goes in an addon: a layer downstream of the rules
+that owns both lanes of every exchange it runs on. An addon is either:
 
 * **a WASM layer** (`kind: wasm`): a WebAssembly component run in-process by
   `roxy-wasm`, written against the `roxy:addon` WIT package
@@ -1526,11 +1533,25 @@ both streams of every exchange it runs on. An addon is either:
   path, which each exchange streams through over a WebSocket
   ([service layer protocol](/reference/service-layers)).
 
-## The stack
+## Two lanes
 
-Each layer wraps everything below it: it receives the request (head and
-body stream), may pass a request down with `next`, and returns a response
-stream upward.
+An exchange is two lanes. The request lane flows upstream, from the
+client through the layers to the rules and the connector; the response
+lane flows downstream, from wherever it starts through the same layers to
+the client. Each lane is a head, bytes and an end, and the lanes carry no
+HTTP rules of their own: what a head or a chunk means is for the two ends
+of the proxy, the downstream socket and the upstream connector, to say.
+
+A layer sits on both lanes of every exchange it runs on. On either lane it
+may pass what it was given, hold it, rewrite it, or originate its own,
+chunk by chunk, at any time. roxy infers nothing across the lanes: a
+layer's answer on the response lane says nothing about the request lane,
+which runs on upstream as the layer drives it. A layer that answers and
+wants nothing forwarded forwards nothing; one that answers and forwards
+has a forward that runs on for as long as it waits for the response to it.
+Each layer must keep its output coherent for the next consumer. The
+stack ensures that one valid request reaches the upstream socket and one
+valid response reaches the client socket.
 
 ```
                  request ↓                                   ↑ response
@@ -1542,16 +1563,150 @@ stream upward.
  fixed   └─ connector ──▶ origin ────────────────────────────────────────┘
 ```
 
-Addons always sit above the rules, in the order listed under `addons:`. A
-layer with a `when` runs only on the exchanges it matches
+Addons always sit downstream of the rules, in the order listed under
+`addons:`. A layer with a `when` runs only on the exchanges it matches
 ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)).
 Nothing configurable runs between the rules and the network, so what the
 rules judged is what leaves.
 
 The stack is a pipeline: every layer runs at once, as its own task, each
-seeing what the layer above passed on, so on a long stream each works on a
-different chunk at the same time. Observe layers get copies and run beside
+seeing what the downstream layer passed on. On a long stream each works
+on a different chunk at the same time. Observe layers get copies and run beside
 the stream rather than in it.
+
+## Lanes, and the rules that move them
+
+**Upstream** means toward the origin; **downstream** means toward the client.
+The **client edge** connects the HTTP transport handler to the first pair
+of lanes. The **core stage** is the upstream end of the chain: it validates
+the final forwarded request, evaluates admission and in-flight rules,
+applies destination restrictions through the connector, and owns upstream
+processing through completion, including any WebSocket relay. Addon layers
+run between these two stages.
+
+Between two neighbouring stages (the client edge, each layer, the core
+stage) run two lanes: a request lane, produced by the downstream stage and
+consumed by the upstream one, and a response lane the other way. Each lane
+is shaped like an HTTP/2 stream. Its producer may put on it at most one
+head, then bytes, then trailers once, then either an end (complete) or a
+cut (incomplete, with a reason); its consumer may stop it (read no more).
+A lane that is ended or cut before any head carries nothing: a headless
+request lane is no forward, a headless response lane from a layer is no
+answer. A lane that has ended, been cut or been stopped is terminal and
+never moves again; what a producer puts on a terminal lane is discarded.
+
+The lifecycle rules are:
+
+* **A stage is done** when its driver and body workers have finished.
+  Ending an output lane does not by itself finish the stage: it may still
+  consume its inputs or run host-service calls. Letting go of an unfinished
+  input stops that lane.
+* **A stop on a request lane** tells its producer and nothing else: the
+  upstream stopped reading the forward, and the layer keeps its other
+  lanes.
+* **A stop on an unfinished response lane tears its producer down**: that
+  stage and every stage upstream of it are cancelled. Unfinished outputs
+  are cut and held inputs are released. Cancellation reaches stages even
+  when an intermediate response has already ended. Releasing a completed
+  response alone does not cancel a still-useful forward.
+* **Client cancellation tears down the whole exchange**, independently of
+  which response lanes have ended. HTTP/2 continues watching for stream
+  resets while waiting for the exchange after an early answer. After a
+  WebSocket upgrade, socket read and write failures report cancellation
+  before releasing any lane bodies. A lane-body error alone does not mean
+  the client disappeared; a clean socket half-close still permits the
+  other direction to drain.
+* **A layer that lets go of its response lane without a head** has not
+  answered: that is its `no_response` fault.
+* **A layer that faults** (a trap, a budget, a missed deadline, a lane out
+  of grammar, a reset, an invalid head attributed to it, or no answer) has its fault recorded before it is cancelled. If its response
+  lane has no head, roxy puts the corresponding HTTP error response there
+  for the downstream layers to handle like any other response.
+* **A layer answered** if the response lane it consumes had no head when
+  it put its own head on the lane it produces, decided then and never
+  re-derived. The first fault recorded stands, and a layer's is logged
+  once.
+* **A layer cutting a lane it produces is an abort, not a fault**: the
+  record says `forward_aborted` or `answer_aborted`, and the consumer sees
+  an incomplete body. A headless response cut from an enforcing layer is
+  still its `no_response` fault and generates a refusal.
+* **A producer's end does not acknowledge delivery.** Its queued frames
+  still belong to the consumer until read or discarded. Trailers are held
+  until the clean end and length checks succeed, because HTTP trailers
+  complete the message on the wire. Declared length is a validation
+  property: an unfinished lane uses unknown-length HTTP/1.1 framing so
+  even a cut after the declared bytes cannot look complete. HEAD and
+  bodiless statuses commit at the head; their internal body still runs
+  under the response idle deadline.
+* **The exchange is over** when every lane is terminal, its consumers have
+  finished or abandoned their bodies, and all drivers and enforcing
+  host-service workers have returned. Upstream upload accounting is final
+  before its owner returns. Guest drivers and their spawned `next`, endpoint
+  and body-finish workers, service pumps and upload monitors belong to this
+  barrier even when their parent is cancelled. Cancellation includes their
+  actual destruction, not just an abort request.
+  Both HTTP transports observe client loss through reclamation. The flow
+  record is written after this barrier.
+  WebSockets use the same rule: the core owns the relay and its accounting
+  until it ends, then cancels any remaining layers. The socket reader and
+  writer are included in the completion barrier through their destruction.
+
+Wire completion, exchange completion and connection lifetime are separate.
+An HTTP/1.1 answer can finish while its upload or addon work continues;
+reclamation keeps driving the request and any suppressed response body
+concurrently. Only after reclamation can that connection serve a pipelined
+request, and a late closing refusal still prevents reuse. A full pipeline
+buffer has a [bounded reclamation deadline](/reference/limits#buffer-budget).
+
+Observers are not stages: an observe layer gets copies of both lanes of a
+hop, nothing it produces moves a lane, and the exchange does not wait for
+it. A head-only layer puts its head on a lane and the body of the lane it
+consumes in the same direction goes on with it (for a response, only when
+the status is the same; otherwise the answer is the layer's own, whole).
+The bypassed body and the layer's own output have independent ends. Bytes
+flow without waiting for the layer's end, but lane completion and trailers
+wait for both. This is the same contract for WASM streams and service
+`request_end` / `response_end` messages, even when no bytes are visible to
+the layer or sent on the wire. A head-only service's response end is still
+subject to the response idle deadline after a HEAD or 204 answer.
+
+## Request and response production are independent
+
+A layer may answer before forwarding, while forwarding, or without ever
+forwarding. A response head does not imply that the request lane has ended.
+Responses can originate at any stage: the origin's response through the
+connector, a refusal from the rules or address checks, a layer's own
+answer, or a `503` generated for a failed layer. Each enters the response
+lane at that stage and flows downstream through the layers before it
+like any other response: a layer sees the rules' `403` from `next` as it
+would see a `403` from the origin, and may pass it on or replace it with a successful response. Addons are trusted
+configuration, so that is theirs to decide; the request did not leave, and
+the flow log records the rules' verdict whatever the client was given
+([in the proxy](/reference/addon-configuration#in-the-proxy)).
+
+A layer answering without forwarding and the rules refusing are the same
+event at different stages: the request lane ends there, that stage
+produces the response, and nothing further upstream ever sees the request.
+
+A body that stops short upstream of a layer (an in-flight deny cut it, the
+origin's body failed) ends that lane with the failure, not the exchange:
+the layer sees the lane end short of complete and finishes its own lanes
+as it sees fit. Only the client's own request failing ends the exchange
+outright, since nothing can answer a client whose request broke.
+
+## The two ends of the proxy enforce validity
+
+The lanes are opaque. What reaches a socket is not: the request the last
+layer passes upstream is re-validated as strictly as a client's and judged
+by the rules, and the response the first layer passes downstream is
+re-framed as strictly as an origin's. A head that cannot go out where it
+arrives (a second final response head, a `101` that relays no upgrade, a
+`1xx` other than a relayed `101`) is the fault of the last layer that
+touched it, and becomes a response on the lane downstream of it like any
+other failure; a body that does not match the length its head declared is
+cut, since its head is already out. Between the two ends a layer may do as
+it likes with what it holds, so long as what leaves it is something the
+next layer can carry.
 
 ## Ordering across layers
 
@@ -1561,18 +1716,17 @@ The exchange's bytes form a pipeline. A head or a chunk reaches layer B
 only after layer A has sent it on, and A may hold, rewrite or drop it on
 the way: what B reads is what A passed, in the order A passed it, and the
 rules admit the request the last layer forwarded. The response is the same
-pipeline the other way up: the rules see the upstream's bytes first, then
-B, and A gets a chunk only after B has passed it. This holds for enforce
-layers of either kind. An observer is in neither order: it reads a copy
+pipeline in the downstream direction: the rules see the upstream's bytes
+first, then B, and A gets a chunk only after B has passed it. This holds
+for enforce layers of either kind. An observer is in neither order: it reads a copy
 beside the pipeline, holds nothing up, and can neither tag nor write
 state, so the rest of this section is about enforce layers.
 
 Host-service effects are not in that pipeline. `add_tag`, `state_put`,
-`record` and `quarantine` go to the host beside the bytes, not down the
-stack. A layer's calls on an exchange run on their own worker, in the
-order the layer made them, and roxy orders nothing between one layer's call and another
-layer's read: A's `state_put` and B's `state_get` are concurrent unless A
-awaits its `result` before sending the bytes B will read. B cannot read on
+`record` and `quarantine` run independently of the request and response
+lanes. Each layer has a worker that runs its calls in order. There is no
+implicit ordering between one layer's call and another layer's read:
+A's `state_put` and B's `state_get` are concurrent unless A awaits its `result` before sending the bytes B will read. B cannot read on
 a chunk it has not received, so the await puts A's write ahead of B's
 read. A WASM layer's call is a synchronous function that returns before
 the layer continues, so it has that order by construction; a service layer
@@ -1583,7 +1737,7 @@ sends the call as a message and awaits the `result` itself
 
 So, to make an effect visible:
 
-* **to the layers below**: await the `result` before sending the head or
+* **to the layers upstream**: await the `result` before sending the head or
   chunk whose handling should see it (a WASM layer's call has returned by
   the time it sends anything);
 * **to this exchange's admission rules**: land it before the request is
@@ -1607,32 +1761,52 @@ So, to make an effect visible:
    on is treated as if a client sent it: header limits, body caps, idle
    timeouts. A layer cannot pass on `CONNECT`: a tunnel is something the
    client opens at the proxy port, never a request to forward.
-3. **Failure is closed.** A layer that traps, exceeds a budget or returns an
-   invalid head denies the flow, or cuts the exchange if the response head
-   is already out. There is no "on error, pass"; observe mode is the one
-   safe way to run a layer whose failures must not matter.
+3. **Failure is closed.** A layer that traps, exceeds a budget or passes on
+   an invalid head produces a `503` on the lane downstream of it, which the
+   layers there may reshape but the client gets if none does; after the
+   response head is out, the body is cut. There is no "on error, pass";
+   observe mode is the one safe way to run a layer whose failures must not
+   matter.
+4. **One forward and one answer per layer.** A layer sends the request lane
+   upstream at most once and the response lane downstream exactly once. In
+   which order, and how far apart, is its own affair.
 
 ## Who is blamed
 
 When an exchange fails, one party is blamed, and the first fault recorded
 stands. Every party records its own fault before anything downstream of it
 can fail on it: a layer as it fails, before its bodies end; a body where it
-enters the stack, before a layer reads it; the front as it gives the
-exchange up. So what a layer makes of a body or a `next` that ended on
+enters the stack, before a layer reads it; the transport handler when it
+cancels the exchange. So what a layer makes of a body or a `next` that ended on
 someone else's failure is a consequence, never a second fault.
+
+Final reason selection happens after reclamation, from the facts gathered
+by the adapters. A policy or validation reason already in the record is
+preserved. Otherwise a known fault behind a failed response body takes
+precedence, followed by a deliberate lane abort, observed cancellation,
+a response failure, an upload deadline, and finally upstream abandonment.
+Writing and discarding a response body use the same fault attribution.
+A later drain failure does not turn an already-written HEAD or bodiless
+response into a failed wire write, and discarded bytes are not counted as
+transmitted. A fault recovered by a layer does not by itself fail a
+successfully completed response.
 
 * A layer's own failure (a trap, an exceeded budget, an invalid head, a
   service that broke its stream) is the layer's: `503` with
   `terminal_rule: layer:<name>` before the response head, a cut body after
-  it, and one `layer_error` event either way. A failure found below the
+  it, and one `layer_error` event either way. The `503` travels downstream
+  on the response lane, so a layer there may reshape what the client gets;
+  the record is the refusal's either way. A failure found upstream of the
   layer that caused it (a passed-on request that does not validate, say) is
-  put down to the nearest enforcing layer above.
+  put down to the nearest enforcing layer downstream of it.
 * A client upload that breaks is the client's, as without a stack: the
   connection closes on the parse error before the head, the body is cut
   after it, and no `layer_error` is logged however many layers fail on the
   cut body.
 * An upstream response body that fails before any layer has answered with
   a head of its own is the upstream's: `502`, `reason: upstream_body_failed`.
+  One that fails after that ends the response lane upstream of the layer
+  with the failure; what the client's response makes of it is the layer's.
 * A body the [buffer budget](/reference/limits#limits) cannot cover on its
   way to a layer (a decoder's window) fails closed as the budget's:
   `reason: buffer_budget_exhausted`.
@@ -1643,12 +1817,27 @@ someone else's failure is a consequence, never a second fault.
 
 A layer calls `next` at most once per exchange; a second call traps. The
 stack carries the client's traffic and nothing else: a layer never
-originates requests through the layers below it, so retrying, regenerating
+originates requests through the layers upstream of it, so retrying, regenerating
 or replaying is the client's job, and a layer that rejects something
 answers with a response the client can act on. Anything else a layer needs
 to reach is a [named endpoint](/reference/host-services#endpoints-endpoints),
 which goes straight to the connector, never through other layers or the
 rules.
+
+`next` and the layer's answer are the two lanes, and neither waits on the
+other. A layer may answer first and forward after, forward and answer
+before the response from upstream arrives, or answer and never forward.
+Its answer reaches the client as soon as it is made. A forward is carried
+upstream only while something downstream waits for its response: a layer
+that wants its forward delivered reads at least the response head. A layer
+that stops reading the response (drops the pending response, or returns
+without reading it) has the upstream request cancelled; the forward's body
+is still the layer's to finish or cut. A layer that cuts a lane of its own
+(drops a body unfinished) has aborted it: nothing comes back for a cut
+forward, and the record says `forward_aborted` or `answer_aborted`; that
+is not a failure. A layer that fails is torn down, and everything upstream
+of it with it. Once a layer is done with the client's upload, the rest of
+it is dropped rather than held for a reader that will never come.
 
 ## A layer takes what it subscribes to
 
@@ -1679,7 +1868,7 @@ Layers see bodies decoded, so none needs its own decompressors
 
 * `mode: enforce` (default): the layer is in the path and its decisions
   take effect.
-* `mode: observe`: roxy tees both streams to the layer and ignores
+* `mode: observe`: roxy tees both lanes to the layer and ignores
   anything it returns except host-service calls such as `record`. The
   layer cannot change or delay traffic, so its failures cannot weaken
   containment: a trap or missed deadline is logged, not fatal, which makes
@@ -1693,8 +1882,8 @@ Layers see bodies decoded, so none needs its own decompressors
   [buffer budget](/reference/limits#limits) cannot cover its next frame,
   or no instance of the layer comes free within its `first_byte_timeout`
   (`observer_lagged`, with the `reason`). A request refused or answered
-  below the observer without its body being read ends the copy where the
-  reading stopped, without an error, and the observer sees the refusal
+  upstream of the observer without its body being read ends the copy
+  where reading stopped, without an error, and the observer sees the refusal
   from `next`; a copy that fails (the client went away mid-upload) ends
   with that failure, so the layer can tell the two apart.
 
@@ -2351,8 +2540,11 @@ Through an `http_proxy` listener a `ws://` URL means a `CONNECT` tunnel
 with a plaintext upgrade inside it, which roxy refuses unless
 `http.allow_plain_in_connect` is on (the tunnel is closed, `parse_error`
 reason `non_http_in_connect`; [CONNECT](/reference/http#connect)). Use
-`wss://`. On an `http` listener the upgrade arrives as plain HTTP and
-needs nothing.
+`wss://`. For WSS, roxy establishes the CONNECT tunnel and terminates TLS
+before processing the HTTP/1.1 upgrade. Addon layers receive that upgrade
+and carry the WebSocket bytes in both directions; the outer CONNECT is
+handled by the listener. On an `http` listener the upgrade arrives as
+plain HTTP and needs nothing.
 
 If no rule reads a `ws.*` field, roxy splices bytes: no frame parsing,
 re-masking or reassembly; subprotocols and extensions pass end to end. If
@@ -2376,8 +2568,10 @@ any rule reads `ws.*`, every message is checked
   follows, with `res.status: 101` and the relayed byte totals as its
   `body_bytes`.
 
-WebSockets over HTTP/2 (RFC 8441) are not supported; HTTP/2 clients use a
-separate HTTP/1.1 connection.
+WebSockets over HTTP/2 (RFC 8441 extended CONNECT) are not supported;
+clients must use a separate HTTP/1.1 connection for WebSockets. This
+restriction concerns the HTTP version, not TLS: `wss://` over HTTP/1.1 is
+supported, including through addon layers.
 
 ## Extensions
 
@@ -2585,6 +2779,20 @@ crate parses it; the same semantic validation as HTTP/1.1 follows
 canonical authority goes out as `host` over HTTP/1.1 and as `:authority`
 alone over HTTP/2, never both. WebSocket upgrades always use HTTP/1.1
 ([WebSockets](/reference/websockets)).
+
+### Informational responses
+
+Upstream informational responses such as `103 Early Hints` are not relayed
+to the client, whether or not addons are enabled. The upstream HTTP client
+consumes them and returns the final response. Roxy generates its own
+`100 Continue` when admitting an upload; it does not forward the origin's
+`100`. A WebSocket `101 Switching Protocols` is handled separately as an
+upgrade.
+
+Addon response lanes carry one final head. They cannot publish `103` and
+then a final response. An addon that starts a synthetic `200` streaming
+response has committed that status and those headers; it may subsequently
+use upstream body bytes, but cannot replace the head.
 
 ### Trailers
 
@@ -3127,10 +3335,24 @@ timeouts, so a long timeout costs only the idle connection it keeps:
 Tightening one trades those idle connections for cut exchanges; raise
 `max_connections` instead if idle connections are what runs out.
 
+An upstream may return its response before consuming the whole upload.
+The response can reach the client immediately, but the final flow record
+waits until upload accounting finishes. After that response head, roxy
+checks upload progress every twice `body_idle_timeout`. If no bytes were
+consumed during an interval, roxy cancels the remaining upload and records
+`upstream_body_timeout`, unless another failure already supplies the reason.
+This check runs while response rules and response writing are still in
+progress, including exchanges without addon layers.
+The timeout measures bytes consumed from the forwarded body, not which
+participant caused the delay. It also covers an addon holding the upload
+or an HTTP/1.1 response rule waiting while the client socket is not being
+pumped. It can therefore accompany a successful response status.
+A client cancellation also cancels the upload and releases its buffers.
+
 ### Buffer budget
 
-`max_buffered_bytes` bounds every buffer roxy holds for an exchange, in
-aggregate. An exchange reserves before it fills a buffer; a reservation the
+`max_buffered_bytes` bounds inspection and copy payloads in aggregate.
+An exchange reserves before it fills a charged buffer; a reservation the
 budget cannot cover fails at once, with no waiting and no eviction (`503`,
 `_fail_closed`, `buffer_budget_exhausted`). This is the whole list of what
 is charged:
@@ -3144,10 +3366,34 @@ is charged:
 | a WebSocket whose messages rules read | twice `max_ws_message_bytes` at the upgrade, held for the session. Reading bodies but not messages holds nothing for a WebSocket |
 | an observer's copy | the bytes queued and not yet read, frame by frame, given back as the observer reads them (or drops the copy). A copy whose next frame would overrun the budget is cut (`observer_lagged`, `reason: buffer_budget_exhausted`): the budget bounds how far behind observers are in total, not how many exchanges are observed. A copy whose observer gets no instance within its `first_byte_timeout` is dropped the same way (`reason: no_instance`), so a busy observer cannot pin budget that enforce flows need |
 
-Bytes in flight on a transport are bounded per connection rather than by
-the budget: an HTTP/2 connection's receive window ([connections](/reference/limits#connections)),
-the 256 KiB credit each body of a [service layer](/reference/service-layers)
-stream has, and the codec's parse buffers (`max_header_bytes`).
+Streaming buffers have separate bounds and are outside this budget:
+HTTP/2 receive windows ([connections](/reference/limits#connections)), codec
+parse buffers, depth-two lane channels, WASM output queues (two 64 KiB
+frames), and [service layer](/reference/service-layers) feeder staging.
+A service input can retain two queued lane frames plus its 256 KiB credit
+window; with 256 KiB frames that is 768 KiB of unread payload per body.
+Credit returns when the feeder enqueues a frame, before the final consumer
+reads it. In the other direction, each blocked pump retains one source
+frame and shares a 64-message socket queue; body messages are at most
+64 KiB each. These bounds scale with live streams and layers. Socket buffers,
+metadata, allocation overhead, guest memory and external service memory
+are additional: `max_buffered_bytes` is not a process RAM ceiling.
+
+While reclaiming an HTTP/1.1 exchange, further reads stop at
+`max_header_bytes`, plus one byte to observe EOF at the boundary; existing
+codec read-ahead is retained too. This watch also runs while an unread
+upload fills its body queue. Once the read-ahead buffer is full,
+the upload consumer must make room or the exchange must finish within
+`header_timeout`, otherwise the connection closes;
+queued bytes cannot disable cancellation indefinitely. Ordinary pipelined
+requests remain buffered until the preceding exchange releases its work.
+
+Backpressure still obeys timeout policy. HTTP/1.1 bounds a stalled request
+consumer by `body_idle_timeout`; HTTP/2 arms its request input-idle timer
+when a consumer waits for data. An approval addon holding an unread upload
+can therefore reach the HTTP/1.1 deadline even while sending keepalives.
+After the upstream head, the upload-progress deadline described above
+applies to both transports.
 
 Budget ÷ cap is how many exchanges can hold a buffer at once (defaults:
 1024 bodies of unknown length under inspection, 32 WebSockets with message
@@ -3282,7 +3528,7 @@ optional.
 
 | key | kind | default | what it bounds |
 |---|---|---|---|
-| `first_byte_timeout` | both | `30s` | how long a layer may hold a head, request or response, before passing it on or answering: its own time only (starting an instance, its work, endpoint calls, reading the body it was given), never time `next` spends below it. Overrun fails the layer closed (`budget:first_byte_timeout` for a WASM layer, `service:timeout` for a service layer), and the exchange with it in enforce mode. A service layer gets one budget to obtain a stream and a fresh one from each head; an observing one gets a last from roxy's final message to its own end of the stream. It bounds the layer's own time, not the exchange's: a layer that forwards a head and holds back the body keeps the upstream waiting for as long as it likes, with no clock running ([service layers](/reference/service-layers#semantics)). It also bounds the wait for an instance when all `max_instances` are busy, on its own: an enforce exchange that gets none within it is denied (`layer_error`, `no_instance`); an observer loses its copy (`observer_lagged`, `no_instance`) |
+| `first_byte_timeout` | both | `30s` | how long a layer may hold a head, request or response, before passing it on or answering: its own time only (starting an instance, its work, endpoint calls, reading the body it was given), never time `next` spends waiting for upstream. Overrun fails the layer closed (`budget:first_byte_timeout` for a WASM layer, `service:timeout` for a service layer), and the exchange with it in enforce mode. A service layer gets one budget to obtain a stream and a fresh one when the upstream outcome reaches it, including a headless end, until it has answered; an observing one gets a last from roxy's final message to its own end of the stream. It bounds the layer's own time, not the exchange's: body-idle and upstream timeouts still apply while the answer clock is suspended ([service layers](/reference/service-layers#semantics)). It also bounds the wait for an instance when all `max_instances` are busy, on its own: an enforce exchange that gets none within it is denied (`layer_error`, `no_instance`); an observer loses its copy (`observer_lagged`, `no_instance`) |
 | `max_memory` | wasm | `64mb` | linear memory per instance, summed over the instance's memories; table growth and the host resource table (4096 live resources: body streams, pollables, pending responses) are capped too. What a layer holds of a body lives here. An interpreter in WASM (Python) needs 128–256 MiB |
 | `max_instances` | wasm | `1024` | live instances, so concurrent exchanges and, with `max_memory`, the layer's memory. An exchange that finds none free waits `first_byte_timeout` for one, then fails closed (`no_instance`), so the clients holding every instance cannot queue the rest indefinitely. Instances start on demand |
 | `recycle_after_exchanges` | wasm | `10000` | an instance is replaced after this many exchanges; `0` replaces it after every exchange |
@@ -3290,11 +3536,13 @@ optional.
 | `max_connections` | service | `4` | WebSocket connections to the endpoint |
 | `max_streams` | service | `100` | exchanges at once on one connection; past `max_connections × max_streams` an exchange waits for a free stream within `first_byte_timeout` |
 
-Bodies have no clock: once the head is out, a body streams for as long as
-it takes (a WebSocket for as long as the relay's idle timeout allows); the
-client's and upstream's idle timeouts still apply. CPU has no limit: a
-guest yields to the runtime on a 1 ms engine-wide tick, so it never stalls
-a worker thread and cancellation takes effect within a tick.
+The layer's head deadline stops once it answers. Bodies may stream for
+longer, subject to the client's and upstream's body idle timeouts. The
+client edge applies `response_body_idle_timeout` even when consuming an
+internal body that HEAD or a bodiless status prevents it from sending.
+WebSockets have the relay's idle timeout. There is no total CPU budget:
+a guest yields on an engine-wide 1 ms tick so other tasks can run and
+cancellation can stop it.
 
 ### Fixed caps
 
@@ -3344,7 +3592,7 @@ layer (the exchange with it, in enforce mode). `flow.current`,
 `flow.add-tag` and `flow.config` need no capability; `flow.add-tag` from
 an observe layer is refused by the host (`layer_error` with `kind: host`:
 the observer fails, the exchange goes on), since a tag steers the `when`
-of the layers below. There is no `secrets` capability: credentials go on
+of the layers upstream. There is no `secrets` capability: credentials go on
 an endpoint's `headers`.
 
 ## Behaviour
@@ -3356,29 +3604,24 @@ default) the layer owns that direction: it reads the body, chunk by chunk,
 and what it passes on is the body that goes on. With `head` the layer gets
 the head with an empty body and no `content-length`, and the body bypasses
 it: whatever the layer passes on (the head it gives `next`, or the head it
-answers with) carries the body it did not see, spliced on by roxy, with
-the framing roxy knows.
+answers with) carries the body it did not see, spliced on by roxy.
 
 * An enforce layer can still deny, rewrite or answer at a head it is
   subscribed to; the bodies stream past it at no cost in copies or
   buffering.
 * A response head-only layer answers with the status it was given to pass
-  the response on with its head edited; the body from below follows. Any
+  the response on with its head edited; the body from upstream follows. Any
   other status is an answer of the layer's own: its body stands and the
-  body from below is dropped, so a layer can refuse at the response head.
+  body from upstream is dropped, so a layer can refuse at the response head.
   A layer that answers without `next` resolving answers whole too, since
-  there is no body from below.
+  there is no body from upstream.
 * A layer that passes on bytes of a body it is not subscribed to fails the
   exchange closed: a `503` before the response head, a cut body after it,
   `layer_error` with `kind: unsubscribed:request` or
-  `unsubscribed:response`. The bypassed body keeps its framing when the
-  layer's own body for that direction is complete as the two are joined,
-  which is always for a service layer (its head-only direction is a head
-  and an end with nothing between) and for a WASM layer when `next` is
-  given an empty `bytes` body; joined to one still open (a WASM layer's
-  streamed `next` body, or any WASM response body, whose end waits for the
-  handler) it goes out without a `content-length`, chunked on HTTP/1.1, so
-  a cut is visible however the bytes interleave.
+  `unsubscribed:response`. An open lane has unknown length on the wire,
+  including a bypassed body. HTTP/1.1 uses chunked framing so a later cut
+  remains visible after the last declared byte; any declared length still
+  validates the body.
 * A head-only observer gets copies of the heads and no copy of the body,
   so neither the lag budget nor the buffer budget is touched for it.
 * The rules are not affected: they judge the request that leaves the
@@ -3387,19 +3630,51 @@ the framing roxy knows.
   extensions, only when some layer that runs is subscribed to a body
   ([content codings](/reference/addon-configuration#content-codings), [WebSockets](/reference/addon-configuration#websockets)).
 
+### Streaming protocols
+
+Lanes carry HTTP structure: one head, streaming body bytes, optional
+trailers, then an end or cut. They resemble an HTTP/2 stream's lifecycle;
+they are not HTTP/2 wire streams. Request and response lanes are independent,
+so a layer can answer while it holds a request, or keep answering while it
+holds an upstream response for approval.
+
+| protocol or feature | support and limits |
+|---|---|
+| SSE, NDJSON, streaming JSON, multipart responses and HTTP-based MCP | bodies stream as bytes. Chunk boundaries need not match application messages; a layer editing them must parse the application's framing |
+| gRPC | the lanes support concurrent request and response bodies and trailers such as `grpc-status`. Service layers can receive and send trailers explicitly. The Python helper exposes received trailers but its forwarding methods do not send them. WASM host-side `body.passthrough` preserves trailers, but the WASI byte streams do not expose trailers for reading or rewriting; copying bytes into a new stream does not preserve them. Head-only subscriptions keep the bypassed body's trailers |
+| WebSockets | HTTP/1.1 upgrades are supported; bodies then carry raw WebSocket frames. WebSocket over HTTP/2 extended CONNECT is not enabled |
+| informational heads, including `103 Early Hints` | upstream informational responses are not relayed, with or without addons. Addons cannot publish informational heads before their final head ([HTTP](/reference/http#informational-responses)) |
+| arbitrary upgrades and TCP tunnels | only WebSocket upgrades are adapted into addon lanes. CONNECT on the proxy listener establishes an inspected HTTP/TLS connection, not an arbitrary addon-controlled tunnel |
+| WebTransport, CONNECT-UDP and MASQUE | not supported: datagrams and sessions containing multiple streams need semantics beyond these ordered byte lanes. HTTP/3 is not a supported transport |
+
+For SSE approval, a full-body layer can publish a `200 text/event-stream`
+head and send a start event or comment such as `: approval pending\n\n`.
+It can keep sending comments while it holds the request or buffers selected
+upstream events. Once approved, it forwards the request or writes the
+approved or edited events into its existing response body, then streams
+subsequent events. A refusal after that head is an application event in
+the same response, not a new HTTP status. A second response head fails the
+layer and cuts an answer already in progress.
+
+Keepalive bytes must reach the client within its idle timeout and roxy's
+`response_body_idle_timeout`. They do not extend a client's absolute
+deadline, an endpoint-call timeout, or an upstream timeout. SSE comments
+are valid only for an SSE body; gRPC requires correctly framed gRPC
+messages, and its HTTP/2 PING is connection control rather than body data.
+
 ### Choosing exchanges
 
 `when` is a [rule language](/reference/rule-language) condition over admission
 fields. A layer runs only on the exchanges it matches; the rest pass it at
 no cost (no instance, no body pumping, no service session).
 
-* `when` sees the request as it reaches the layer: what the layer above
-  passed on, re-validated. A layer above can steer a request into or out of
-  a lower layer's `when`.
+* `when` sees the request as it reaches the layer: what the downstream layer
+  passed on, re-validated. A downstream layer can steer a request into or
+  out of an upstream layer's `when`.
 * It may read admission fields, headers, the query, `state[..]`, `metric.<id>`
   and address lists. `body.*`, `response.*` and `ws.*` are config errors.
-* `tag["x"]` sees tags set by enforce layers above, not the rules' tags
-  (the rules run below the stack).
+* `tag["x"]` sees tags set by enforce layers downstream, not the rules' tags
+  (the rules run upstream of the layers).
 * An unavailable input (a metric, an address list, a missing value under an
   operator that cannot answer for `null`) fails the flow closed like a
   layer failure (`503`, `layer_error` with `kind: when:<code>`), never
@@ -3413,10 +3688,27 @@ flow however often it is asked.
 
 ### In the proxy
 
-The stack sits in the exchange core both fronts share: the front drives
-the client's request body into the first layer, and the last layer's
-`next` runs the rules, the upstream, then the in-flight rules on the
-response.
+The stack is a chain of stages joined by lanes
+([addon model](/design/addon-model#lanes-and-the-rules-that-move-them)):
+the client edge adapts the HTTP/1.1 connection or HTTP/2 stream and puts the
+client's request on the first lane, each layer runs on its own task, and
+the core stage validates the forwarded request, evaluates admission and
+in-flight rules, applies destination restrictions, and owns the upstream
+connection and any WebSocket relay. A layer's answer goes to the client
+as soon as the layer gives it; a forwarded request continues upstream
+while the layer waits for its response. The flow is logged once every lane is terminal,
+its body has been read or discarded, and all drivers, input pumps, upload
+monitors and enforcing host-service workers have finished, including
+destruction after cancellation. The transport observes client loss through
+reclamation. Upstream upload accounting completes before the core releases
+the context. Sending an early response does not bypass this barrier. HTTP/1.1 does not accept
+the next request until this work finishes, even if a layer has ended both
+of its lanes but its handler or host-service calls are still running.
+
+Once a layer is done with the client's upload, the rest of it is dropped:
+on HTTP/1.1 the codec drains or closes as it does after a deny
+([HTTP](/reference/http#deny-responses)), on HTTP/2 the stream is reset
+with no error.
 
 * What a layer passes on is re-validated as strictly as a client request:
   an absolute `http(s)` URI; `host`, hop-by-hop and framing fields refused
@@ -3426,8 +3718,14 @@ response.
   ([service layers](/reference/service-layers#frames)). `chain.next`
   fills in the scheme and authority from the exchange when the layer
   leaves them unset.
-* A layer's answer must be a final response; a `1xx` other than the `101`
-  of a relayed upgrade fails closed as `invalid_response`.
+* The response reaching the client edge must be final; a `1xx` other than
+  the `101` of a relayed upgrade fails closed as `invalid_response`.
+* What `next` returns is a response whoever produced it: the upstream's,
+  the rules' refusal, or a `503 layer:<name>` generated for a failure
+  upstream, recorded on the flow as that refusal. The layer may pass it on
+  or reshape it. A cut forward or an upstream lane ending without a head
+  returns an error from `next` without making the layer faulty. A failed
+  client request instead cancels the exchange.
 * A layer's response body to the client waits for the flow log like every
   forwarded body ([audit backpressure](/reference/flow-log#writing)).
 * Layers compile at config load and are cached across reloads while their
@@ -3440,14 +3738,20 @@ In the flow log:
 |---|---|
 | `addons` | the layers that ran, in stack order; a layer its `when` or `sample` skipped is not in it |
 | `rules`, `decision`, `terminal_rule` | the rules' decision on the request that left the stack; `req` is what the client sent. Metric keys (for the rules' samples and `metric-get`) also come from the request that left. A layer whose `next` returned the rules' `403` and then answered `200` itself is logged `decision: deny`, `res.status: 200` |
-| `decision: answered`, `terminal_rule: layer:<name>` | a layer answered itself, whatever its status: the outermost layer that did not pass on the response from below (it never called `next`, or answered while `next` was pending, failed or dropped). If its request had already left, the forwarded request is abandoned (its body cut, never ended as complete) and the record keeps what the rules decided and the bytes sent, with `reason: upstream_aborted` |
+| `decision: answered`, `terminal_rule: layer:<name>` | a layer answered itself, whatever its status: the layer nearest the client whose response lane upstream had no head when its own answer's head landed, decided then. A forward it kept reading the response of runs to its end, and the record keeps what the rules decided of it; one it stopped reading the response of is cancelled upstream, with `reason: upstream_aborted`; a forward it cut itself gets `reason: forward_aborted`. If a layer fails before publishing its answer, the generated refusal is the decision, `deny`, whatever a downstream layer makes of it. If it fails after its answer reaches the client, the answer remains recorded and its body is cut |
 | `503`, `terminal_rule: layer:<name>`, `reason: layer_error` | a layer failed before the response head; the connection is closed and a `layer_error` event follows with `kind` one of `trap`, `budget:<limit>`, `capability:<name>`, `invalid_request`, `invalid_response`, `no_response`, `unsubscribed:<direction>`, ... After the head, the body is cut (HTTP/1.1 breaks the connection, HTTP/2 resets the stream) and `layer_error` follows. Which layer, if any, is one rule ([who is blamed](/design/addon-model#who-is-blamed)) |
+
+If a layer fails while handling a denial the core already made, its generated
+`503` still travels downstream, but the flow record keeps the original deny's
+`terminal_rule` and `reason`. A downstream layer reshaping that response does
+not change the recorded denial. The layer failure has its own `layer_error`
+event.
 
 ### Content codings
 
 On a flow some layer runs on and is subscribed to the body, roxy decodes
 the client's request body as the first such layer gets it and the response
-before it reaches the innermost such layer, removing `content-encoding`;
+before it reaches the first subscribed layer on its way downstream, removing `content-encoding`;
 the body's length becomes unknown. A body no running layer is subscribed
 to is not decoded, and reaches the upstream or the client as sent.
 
@@ -3461,8 +3765,8 @@ to is not decoded, and reaches the upstream or the client as sent.
   also on a flow only an observer runs on.
 * A body in a coding roxy does not know passes through as it is, with its
   `content-encoding`; so does a `206` or any response with `content-range`.
-* The rules below the stack read the response before any layer and decode
-  it for themselves ([body rules](/reference/rule-language#body-rules)).
+* The rules upstream of the layers read the response first and decode it
+  for themselves ([body rules](/reference/rule-language#body-rules)).
 * No extension (`permessage-deflate` above all) is negotiated on a
   WebSocket a body-subscribed layer runs on ([WebSockets](/reference/websockets#extensions)).
 
@@ -3473,7 +3777,7 @@ extensions client and upstream agree on.
 ### WebSockets
 
 A layer gets the upgrade request in `handle` and passes it on with `next`
-(a service layer forwards it on its stream); the response from below is the
+(a service layer forwards it on its stream); the response from upstream is the
 `101`. After it, the request body carries the client's bytes and the
 response body the upstream's for as long as the WebSocket is open. A layer
 reads, rewrites or holds back either direction as any body, refuses the
@@ -3484,7 +3788,7 @@ its handler lives on relaying the direction it is in.
 
 * A layer that turns the upstream's `101` into another status fails the
   exchange closed (`503` from `layer:<name>`) and roxy closes the upstream
-  WebSocket; a `101` with no upgrade from below fails closed too.
+  WebSocket; a `101` with no upgrade from upstream fails closed too.
 * Only `Upgrade: websocket` is an upgrade for the layers. A request asking
   for any other upgrade (`h2c`, say) is an ordinary request roxy forwards
   once it strips the upgrade, with its body and the usual body cap.
@@ -3494,7 +3798,8 @@ its handler lives on relaying the direction it is in.
   the client closes, while the response streams all along (the
   `roxy-addon` SDK does this). Holding bytes back until more arrive stalls
   an interactive protocol.
-* No clock runs on the bodies. When the relay ends, roxy closes the
+* The layer's head deadline does not limit the relayed bodies; the relay's
+  idle timeout still applies. When the relay ends, roxy closes the
   client's connection whether or not the layers have ended their bodies;
   bytes already on their way get a second to arrive.
 
@@ -3505,23 +3810,27 @@ its handler lives on relaying the direction it is in.
   refuses, a body stream that is not the host's, a missing response, bytes
   on an unsubscribed body, a handler that returns still holding a body
   stream or a pending response, or a cancelled exchange is a
-  `LayerError`: a deny, or a cut exchange after the response head.
+  `LayerError`: a `503` on the lane downstream of the layer before the
+  response head (recorded as a deny, whatever a layer there makes of it),
+  a cut body after it.
 * **A client that gives up cancels the exchange.** The guest is stopped,
   its instance discarded, the slot freed. No `layer_error` is logged.
 * **No clean end for a failed body.** A guest body ends with an error once
   its exchange has failed; a response body the guest produces (`bytes` or a
   stream) holds its end until the handler returns, so a trap after the last
-  byte still cuts it. An empty body, or a passed-through body of known
-  length, goes out with `content-length` and is complete once sent. A streamed body is
-  complete only through `finish`: dropped unfinished, it is cut, and a
-  response body dropped unfinished fails the exchange.
-* **An abandoned request is cut, not failed.** A request body passed to
-  `next` that the guest drops without `finish` is cut at the upstream. If
-  the guest is still waiting on `next`'s response, the layer has failed
-  (`invalid_request`); if it has dropped the pending response or already
-  has the response, it may answer itself and its answer stands. A body the
-  guest passed through that fails behind it (the client gave up) is cut the
-  same way.
+  byte still cuts it. An open lane has unknown wire length, even for an
+  empty declared body, until its producer ends cleanly. HEAD and bodiless
+  statuses commit at the head, but their internal bodies must still finish
+  within the body idle timeout. A streamed body is complete only through
+  `finish`: dropped unfinished, it is cut where it
+  stopped, the layer's own doing (`reason: forward_aborted` or
+  `answer_aborted`), not a failure.
+* **A cut forward gets no response.** A request body passed to `next` that
+  the guest drops without `finish` is cut at the upstream, and nothing
+  comes back for it: `next` fails for the guest (`error.internal`), which
+  may answer itself, and its answer stands. A body the guest passed through
+  that fails behind it (the client gave up) is cut the same way, at the
+  client's fault.
 * **An instance that failed its exchange is discarded**, never reused.
 * Layers see canonical heads and body streams, never wire bytes, and have
   no filesystem, sockets or environment: all their I/O is `next`,
@@ -3531,10 +3840,13 @@ its handler lives on relaying the direction it is in.
 
 A `kind: service` layer is an external service at its position in the stack
 exactly as a WASM layer is ([addon model](/design/addon-model)). The
-request streams into it and it streams back the request to forward; the
-response from below streams into it and it streams back the response the
-client gets. It may pass bytes through, rewrite or hold them, or answer
-itself.
+exchange's two lanes stream through it: the request streams into it and it
+streams back the request to forward, if it forwards one; the response from
+upstream streams into it and it streams back the response the client gets.
+It may pass bytes through, rewrite or hold them, or originate its own, on
+either lane, at any time. Each lane each way is shaped like an HTTP/2
+stream: a head, body bytes, trailers, and an end, or a cut; its reader may
+stop it.
 
 ```yaml
 addons:
@@ -3545,7 +3857,7 @@ addons:
     endpoints:
       sidecar: { url: "http://127.0.0.1:9000/layer", private_ok: true }
     limits:
-      first_byte_timeout: 2s            # to get a stream, then to each of the service's heads, or an observer's end (default 30s)
+      first_byte_timeout: 2s            # to get a stream, then to the service's answer, with no clock while its forward is upstream; an observer's end (default 30s)
       max_connections: 4                # per endpoint (default 4)
       max_streams: 100                  # exchanges at once per connection (default 100)
 ```
@@ -3560,7 +3872,7 @@ zero. `capabilities` and `config` mean the same for both kinds
 Long-lived WebSocket connections to each endpoint, each carrying many
 exchanges as **streams**.
 
-* Subprotocol `roxy.layer.v5`; a service that does not accept it fails the
+* Subprotocol `roxy.layer.v6`; a service that does not accept it fails the
   handshake.
 * The URL is the endpoint's (`http` → `ws`, `https` → `wss`, with the
   upstream's certificate verification), dialled through the connector (the
@@ -3607,9 +3919,9 @@ layer's
 direction it names `head`, roxy sends the head and its end with no bytes
 between, and the service answers the same way; bytes the service sends for
 that body fail the exchange closed (`unsubscribed:<direction>`), and the
-body the service did not see goes on with the head it passed on, framed as
-it came: its `content-length` is kept, as it is not for a WASM layer whose
-own body is still open ([what a layer
+body the service did not see goes on with the head it passed on. Declared
+lengths validate bodies; open lanes use unknown wire length so a later cut
+remains visible ([what a layer
 sees](/reference/addon-configuration#what-a-layer-sees)). The pair (`flow`, `layer`) is unique
 and stable (two layers using the same endpoint in one flow get separate
 streams with different `layer`s), so a service can key its state on it.
@@ -3619,26 +3931,48 @@ Every message carries `stream`; it is left out below.
 ```text
 roxy → service   {"type":"open",…}
                  {"type":"request","method":…,"url":…,"headers":[[n,v],…]}  bytes…  {"type":"request_end"}
-service → roxy   one of:
-                   {"type":"request",…}  bytes…  {"type":"request_end"}     forward this request (`next`)
-                   {"type":"response","status":…,"headers":[…]}  bytes…  {"type":"response_end"}
-                                                                          answer instead; nothing is forwarded
-then, if it forwarded:
+service → roxy   {"type":"request",…}  bytes…  {"type":"request_end"}       forward this request (`next`), at most once
+                 {"type":"request_end"} alone                             nothing forwarded
 roxy → service   {"type":"response","status":…,"headers":[…]}  bytes…  {"type":"response_end"}
-service → roxy   {"type":"response",…}  bytes…  {"type":"response_end"}   the client's response
-either way       {"type":"credit","dir":"request"|"response","bytes":n}  flow control (below)
+                                                                          the response from upstream to what it forwarded
+                 {"type":"response_end"} alone, with or without "error"    nothing came back: it forwarded nothing, or its forward was cut
+service → roxy   {"type":"response",…}  bytes…  {"type":"response_end"}   the client's response, exactly once
+either way       {"type":"trailers","dir":"request"|"response","headers":[…]}  a body's trailers, after its bytes
+                 an end may carry "error":"…": a cut, the body stopped short of it
+                 {"type":"stop","dir":"request"|"response"}               the sender reads no more of that body
+                 {"type":"credit","dir":"request"|"response","bytes":n}  flow control (below)
                  {"type":"reset","message":"…"}                           abandon the stream
 service → roxy   host-service calls, any time the stream is open (below)
 roxy → service   {"type":"result","id":n,"value":…} or {"type":"result","id":n,"error":"…"}
 ```
 
+Each direction of the stream is a lane each way. A lane's events, in
+order: at most one head, bytes, at most one `trailers`, then one end. An
+end may come before a head: the lane then carries nothing. A lane whose
+end carries `"error"` is cut: what came before it is not the whole. Trailers
+are delivered to the consumer only after a clean end and successful length
+validation, because sending HTTP trailers completes the message. Declared
+lengths validate bytes; an unfinished lane uses unknown-length framing on
+HTTP/1.1 even when the service supplied `content-length`. Its terminal chunk
+is withheld until the clean end. HEAD and bodiless statuses complete on the
+HTTP head itself; their internal response lanes are still consumed under
+`response_body_idle_timeout`, and a later failure cancels remaining work
+without changing the already-complete HTTP response.
+
 | rule | detail |
 |---|---|
 | heads | `url` is absolute; `headers` are end-to-end fields as a WASM layer sees them (no hop-by-hop or framing fields), at most [`limits.max_headers`](/reference/limits#limits) of them in a head the service sends: more is a protocol violation. `content-length` is present when the length is known and not zero; one the service sends is enforced: more or fewer bytes than declared is a protocol violation |
 | header values | byte strings: each byte is the code point of the same value (ISO-8859-1), so obs-text bytes (`http.allow_obs_text`) read as Latin-1 and go back as the same bytes. A code point above U+00FF is a protocol violation |
-| order | within each body, from each side: head, bytes, end; bytes before their head or after their end are a protocol violation. The two bodies are independent, and so are the two sides: roxy sends its `response` head as soon as the layer below answers, even while the client's body is still arriving; a service may send its `response` while still forwarding the request body, and may start forwarding before the client's body has ended |
-| end | a stream ends when the service has sent its last message: the `response_end` of the client's response, and the `request_end` of the forwarded request if it was still sending that. roxy sends nothing more on it after that. Either side may end a stream early with `reset`; roxy resets when the client goes away, a deadline passes or the service broke the protocol, and sends nothing after the `reset`. A stream roxy gives up before its `open` has gone out is dropped without a `reset`. A service that resets an enforce stream fails that exchange closed. Each side ignores messages for a stream it has ended; roxy drops body bytes sent on an ended stream without crediting them back |
-| flow control | per stream and per body, each way. Each body of a stream starts with 256 KiB of credit each way; the receiver grants more with `credit` as it consumes, and the sender may have no more bytes of that body outstanding than granted. roxy grants in steps of 64 KiB as the layer below (or the client) reads. Sending past credit is a protocol violation. Control messages are not counted |
+| order | on each lane, from each side: head, bytes, trailers, end. Bytes or trailers before their head or after their end, a second head, a second `trailers`, a second end: each is a protocol violation. The two lanes are independent, and so are the two sides: roxy sends its `response` head as soon as the layer upstream answers, even while the client's body is still arriving; the service sends its `request` at most once and its `response` exactly once, in either order, and may send either while the other lane is still streaming. A `request_end` with no `request` before it forwards nothing. Answering says nothing about forwarding, and a service that wants nothing forwarded forwards nothing |
+| cuts | an end that carries `"error"` cuts its lane: the bytes before it are not the whole. From roxy, the body stopped short on its way (an in-flight deny cut it, the upstream's body failed, the client gave up, the service's own forward was cut); the text is for diagnostics only, is not stable, and may be another layer's own. The stream, and the service's own lanes, go on. A `response_end` with `"error"` and no `response` before it says nothing came back for the forward: it was cut. From the service, a cut is its own doing and not a fault: the exchange's record says `forward_aborted` or `answer_aborted`, and what is downstream of the cut lane sees it cut. If the service cuts its response lane without ever providing a head, roxy also records `no_response` and generates a refusal. An error on the end of a head-only lane, which carries no body to cut, is a protocol violation |
+| stop | `stop` says its sender reads no more of that body: the receiver sends no more of it, need not end it, and credits nothing for it. roxy sends `stop` for the request lane when the upstream stops reading the forward. A service that stops the response lane gives the forward up: nothing upstream carries a response nobody waits for, so the upstream request is cancelled. A service that stops the request lane keeps everything else |
+| end | a stream ends when all four lanes are terminal (ended, cut or stopped), output body validation has finished, and every accepted host-service call has queued its result. Ending the service's two output lanes leaves the input lanes available: an early answer can finish before the upstream response arrives. A stopped forward upload does not stop that response. The service must read or stop each input; `stop` on the response input gives up the forward. A service that forwards and never answers is failed by its clock once the upstream outcome arrives. Either side may abandon a stream with `reset`; roxy sends no further lane data after a reset, and a service reset fails an enforce exchange closed. An opening abandoned before `open` went out sends no reset. Valid host calls crossing a retired stream's end receive a `result` error; other messages are ignored and body bytes are not credited |
+| flow control | per stream and per body, each way. Each body of a stream starts with 256 KiB of credit each way; the receiver grants more with `credit` as it consumes, and the sender may have no more bytes of that body outstanding than granted. roxy grants in steps of 64 KiB as its feeder enqueues frames into the bounded lane channel. That channel holds two frames in addition to the credit window: 256 KiB frames can leave 768 KiB of unread payload per body before the final consumer reads. See [buffer bounds](/reference/limits#buffer-budget). Sending past credit is a protocol violation. Control messages are not counted |
+
+A stalled physical WebSocket writer backpressures every stream on that
+connection. Directional credits allow independent progress while the socket
+is writable; the priority control queue can bypass queued data but cannot
+bypass bytes already waiting on the socket.
 
 ### Host services
 
@@ -3651,7 +3985,7 @@ kind of layer makes it. Every call carries
 an `id` of the service's choosing (an unsigned 64-bit integer) and is
 answered with a `result` carrying the same `id`: `value` is what the call
 returns (`null` for a call that returns nothing), `error` a refusal of what
-the service passed.
+the service passed or a call arriving after stream retirement.
 
 | service → roxy | capability | roxy → service |
 |---|---|---|
@@ -3676,54 +4010,91 @@ forwarded; otherwise by the next rule that reads it: for a tag, which
 lives on this exchange, an in-flight re-check of it; for state, which
 persists, that or a later exchange's admission. A write does not itself
 trigger a re-check ([#509](https://github.com/roxy-proxy/roxy-proxy/issues/509)).
-At most 64 calls may be waiting, and more is a protocol violation. Calls
-the service sent before the stream ended still run once it has (a `record`
-sent just before its `response_end`, say): the effect stands, but the
-`result` is not sent, and one that fails is logged (`layer_error`) without
-stopping the rest; the stream keeps its place on the connection until they
-have run. A call sent on a stream that has ended is dropped and never
-answered.
+At most 64 calls may be waiting, and more is a protocol violation. Accepted
+calls keep the stream open until their results have been queued, including
+when all four lanes have finished. To issue a new call, send it before the
+last lane becomes terminal. Calls queued before a reset still run, retain
+the stream's reservation while they run, and are logged if they fail; their
+results have nowhere to go. A valid call arriving after retirement receives
+a `result` error and has no effect. This covers a call crossing roxy's last
+input end on the wire. At most 64 such refusals may wait to be written on a
+connection; exceeding that limit closes the connection.
 
 A call without its capability, a `log` message or a `record` kind and
 document together over 64 KiB, an `add_tag`, `state_put` or `quarantine`
 from an observer, or a full state store fails the layer (`layer_error`,
 kind `capability:<name>`, `budget:message`, `budget:tags` or `host`) and
 resets the stream: in enforce mode that fails the exchange, in observe
-mode the exchange goes on. The `result` `error` is only for what the
-service passed.
+mode the exchange goes on. The `result` `error` reports a refusal of what
+the service passed, or a call arriving after stream retirement.
 roxy's own record of a call names its `id` as `call`: on the
 `layer_record` a `record` writes, on the `layer_error` a failed call
 causes, on the operational log line a `log` writes, and on the cause of
 the `quarantined` event a `quarantine` trips. `endpoints.call`
 has no message: a service calls what it needs itself.
 
+### Migration from v5
+
+`roxy.layer.v6` is incompatible with `roxy.layer.v5` and the experimental
+`roxy.layer.v0`. Update the WebSocket subprotocol on both peers together.
+Each side must handle `stop`, `trailers`, explicit ends in both directions,
+and headless completion. Keep receiving upstream input after both service
+outputs end, and explicitly stop inputs the handler will not consume.
+Outstanding host calls now receive results before normal stream retirement.
+The bundled Python helper implements this contract. Incompatible protocol
+changes use a new subprotocol name so older peers fail at negotiation.
+
+WASM layers use `roxy:addon@0.3.0`; rebuild components with the matching SDK
+and WIT. Components using `roxy:addon@0.2.1` or the experimental unversioned
+package must be rebuilt. Package versions remain part of the interface
+identity for future incompatible changes.
+
 ## Semantics
 
 * **The forwarded request** gets the same checks as a WASM layer's `next`:
   re-validated as strictly as a client request, then judged by the rules.
-  The service's response is handled as a WASM layer's.
-* **Deadlines.** `first_byte_timeout` bounds getting a stream, then each
-  of the service's heads, as it does a WASM layer's: its first answer from
-  roxy's `request` head, its second from roxy's `response` head (not from
-  the end of the response body); on an observe stream, the service's end
-  from roxy's last message. A stream has no overall clock, and no
-  clock runs while roxy waits on the layers below: a service that has
-  forwarded the request head and holds back its body keeps the upstream
-  waiting for as long as it likes.
-* **A `response` sent while the forwarded request is still below** waits
-  for the response from below, and is discarded if the stack below fails:
-  the exchange fails with that failure, not with the service's answer.
+  What comes back on the response lane is whatever the upstream stages
+  produced: the upstream's response, the rules' refusal, or an HTTP error
+  response for a failure upstream. The service may pass on or reshape any
+  of these responses. The service's own response is handled as a WASM layer's.
+* **Deadlines.** `first_byte_timeout` bounds getting a stream, then the
+  service's answer, as it does a WASM layer's: from roxy's `request` head
+  until the service answers or forwards. The clock is suspended while its
+  forward awaits an upstream outcome. A response head or a headless
+  `response_end` restores the whole budget, unless the service has already
+  answered; receiving a head does not wait for the response body to end.
+  An expiry of the original request budget cannot consume or suspend this
+  renewed answer budget.
+  An observer gets that budget from roxy's last message to end its stream. A
+  stream has no overall deadline. Head-only output lanes still require
+  their explicit end: bypassed bytes can flow before it, but completion
+  waits for both the end message and the bypassed body. This includes a
+  HEAD or bodiless response already completed on the client connection.
+  Body-idle and upstream timeouts still
+  apply while the service's answer clock is suspended. The client edge
+  applies `response_body_idle_timeout` even to a HEAD or bodiless response
+  it must discard, and observes client loss through final reclamation.
+* **An early `response`** goes to the client at once, however far the
+  forward upstream has got, and its body is the client's response from then
+  on; the response from upstream still arrives on the service's lane for it
+  to read. If the stack upstream fails after that, what arrives is the
+  HTTP error response for that failure, or the lane ending with the error if its
+  body had started; the service's answer stands either way. The forward
+  runs on only while the service waits for its response (the end rule
+  above).
 * **Failure is closed** in enforce mode: a failed connection or handshake,
   a protocol violation (bad JSON, a message out of order, bytes of a body
   that is not open, an invalid head, a broken length, bytes past the
   credit), a missed deadline, a reset from the service or a lost connection
   denies the exchange (`503`, `layer:<name>`) before the response head and
-  cuts the body after it; a body cut short never reaches the upstream or
-  the client as complete. `layer_error.kind` is `service:connect`,
+  cuts a streaming body after it. A cut body never reaches either peer as
+  complete; HEAD and bodiless responses have already completed at the head. `layer_error.kind` is `service:connect`,
   `service:protocol`, `service:timeout` or `service:closed`; bytes of a
-  head-only body are `unsubscribed:<direction>`.
-* **A body that fails on its way to the service is not its failure**, and
-  logs no `layer_error` ([who is blamed](/design/addon-model#who-is-blamed)).
+  head-only body are `unsubscribed:<direction>`. A `response_end` with no
+  `response` before it is no answer: `no_response`.
+* **A body that fails on its way to the service is not its failure**: its
+  lane ends with the error, no `layer_error` is logged, and the stream
+  goes on ([who is blamed](/design/addon-model#who-is-blamed)).
 * **One stream's failure is its own**: a violation resets that stream
   only. Broken framing fails the whole connection: a text frame that is not
   a JSON object with a valid `stream`, a binary frame shorter than its
@@ -3735,8 +4106,8 @@ has no message: a service calls what it needs itself.
   ends the stream and is logged (`layer_error`, `service:closed`),
   host-service calls run as in enforce mode (less the ones an observer may
   not make), and the heads, bytes and ends the service sends go nowhere.
-  The stream ends as an enforce stream does, on the service's last
-  message: its `response_end`, and the `request_end` of a request it sent.
+  The stream ends after all four lanes and accepted host calls finish, as
+  in enforce mode. A `stop` from the service ends the corresponding copy.
   So a service can read the copies through and then `record` what it saw
   before ending the stream, as a WASM observer can. From roxy's last
   message the service has `first_byte_timeout` to end the stream, or roxy
@@ -3747,11 +4118,12 @@ has no message: a service calls what it needs itself.
   steps of 64 KiB; past credit is still a violation.
 * **WebSockets** run through the stream
   ([addon configuration](/reference/addon-configuration#websockets)). The
-  `101` from below arrives as roxy's `response` head, and the service
-  answers with a `101` of its own (the one status outside 200–599 it may
-  send, and only on a WebSocket upgrade). From then on the request body is
-  the client's bytes and the response body the upstream's, with no length
-  cap on either, until each side closes; the stream holds its place on the
+  `101` from upstream arrives as roxy's `response` head, and the service
+  answers with a `101` of its own. At the client edge, only final statuses
+  200–599 or a `101` for a real upstream upgrade are accepted; intermediate
+  lane heads may be rewritten by a downstream layer before reaching it.
+  After the upgrade, the request body carries the client's bytes and the
+  response body the upstream's, with no length cap on either, until each side closes; the stream holds its place on the
   connection for as long as the WebSocket is open. roxy sends no
   `request_end` before the `101`, so a service that waits for the end of
   the request body never forwards an upgrade and fails on
@@ -3763,6 +4135,22 @@ The [quickstart](/quickstart)'s sidecar,
 [`roxy_layer.py`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/sentinel/roxy_layer.py),
 is the service side of the protocol for asyncio: it handles streams, credit
 and resets and hands a handler one exchange at a time.
+
+The helper rejects a host call with `ProtocolError` if the stream ends while
+the call waits to send. Such an unsent call does not keep the stream open.
+A call already sent keeps its result waiter; if it crosses retirement on
+the wire, roxy's refusal raises `HostError`.
+
+The Python helper exposes received trailers through `trailers` and
+`response_trailers`. Its byte-iterator forwarding helpers do not send
+trailers; a service using those helpers must not assume trailer-preserving
+passthrough.
+
+The Python helper's `Exchange.forward` raises `ForwardEnded` when the upstream
+response lane ends without a head. A handler may catch it and answer locally.
+If it propagates, the helper ends its response lane headless; it does not reset
+the stream. A handler that supplies no answer still gets `no_response`;
+the forward ending is not a service protocol fault.
 
 # Host services
 
@@ -3899,8 +4287,8 @@ produces a `request` event:
 | `decision` | `allow`, `deny`, or `answered` when an addon layer answered itself |
 | `terminal_rule` | what decided: a rule id, or `_default`, `_fail_closed`, `_address_policy`, `_expired`, `_quarantined`, `_sign`, `_websocket` or `layer:<name>` |
 | `stage` | `head`, or where an in-flight rule stopped the exchange: `request_body`, `response_head`, `response_body`, `websocket` |
-| `addons` | the layers that ran, outermost first; one skipped by its `when` or `sample` is not listed ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)) |
-| `rules`, `decision`, `terminal_rule` with addons | describe the request that left the stack; `req` is what the client sent and `res.status` what it got, which a layer above the rules may have replaced ([addons](/reference/addon-configuration#in-the-proxy)) |
+| `addons` | the layers that ran, from downstream to upstream; one skipped by its `when` or `sample` is not listed ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)) |
+| `rules`, `decision`, `terminal_rule` with addons | describe the request that left the stack; `req` is what the client sent and `res.status` what it got, which a layer downstream of the core stage may have replaced ([addons](/reference/addon-configuration#in-the-proxy)) |
 | `reason` | a stable code when the exchange failed closed or failed, by `terminal_rule`: |
 
 | `terminal_rule` | `reason` |
@@ -3915,11 +4303,21 @@ produces a `request` event:
 | an upstream failure | the `upstream_error` reason ([upstream](/reference/upstream#errors)) |
 | roxy could not finish the exchange (its connection ended, or the server stopped, mid-flight) | `aborted` |
 | an addon layer dropped the exchange after the rules had forwarded it | `upstream_aborted` |
+| the upload made no progress after the upstream returned its response head | `upstream_body_timeout` ([upload progress](/reference/limits#timeouts)) |
+| an addon layer cut a lane of its own: the request it was forwarding, or the response it was giving | `forward_aborted`, `answer_aborted` (unless another reason stands) |
 | the client went away | `client_gone` |
+| the HTTP/2 stream failed during cleanup after the response was written, without a client reset or connection loss | `h2_stream_error` |
 | an HTTP/2 client stopped taking the response | `client_stalled` |
 | the response body was cut after its head went out | why it was cut, when roxy knows: `buffer_budget_exhausted` (a decoder window the [buffer budget](/reference/limits#limits) could not cover), `upstream_body_failed` (the upstream's body failed into an addon layer), `layer_error` (a layer failed; the `layer_error` event names it), or the client's `parse_error` reason when its request body was rejected while the response was being written; otherwise `response_write_failed` |
 
 ### Events
+
+A client may reset an HTTP/2 stream after its response was fully written,
+while an upload or addon is still running. roxy cancels that remaining
+work and records `client_gone`, retaining the response status and decision.
+An earlier policy or validation reason takes precedence; the fallback
+`upstream_aborted` is replaced by this observed client cancellation.
+It emits no `response_error` for an already completed response.
 
 | event | when |
 |---|---|
