@@ -18,33 +18,29 @@ in milliseconds rather than hundreds of milliseconds.
 
 ## What an addon costs
 
-An addon is a fixed charge on the throughput roxy would otherwise have,
-before the addon's own work, and a charge per byte on the bodies that
-stream through it. A [WASM layer](/design/addon-model) that forwards
-everything unchanged costs about half of the small-request throughput and
-most of it on large bodies; a [service layer](/reference/service-layers)
-doing the same costs about 60% on small requests and most of it on large
-bodies, plus whatever the sidecar and its network hop add. Most of the
-body cost is common to both kinds and is paid even when the layer leaves
-the body untouched: it is in the lane pipeline between the stages
-([#558](https://github.com/roxy-proxy/roxy-proxy/pull/558)), with the
-service's socket on top.
+An addon is a charge on the throughput roxy would otherwise have, before
+the addon's own work. A [WASM layer](/design/addon-model) or a
+[service layer](/reference/service-layers) that forwards everything
+unchanged costs about half of the small-request throughput, and most of it
+on large bodies: the bytes of a body that streams through a layer cost
+several times what they cost with no addons, even when the layer leaves
+them untouched. A service layer adds whatever the sidecar and its network
+hop cost on top. The per-byte cost is higher than it should be and is being
+looked at in [#561](https://github.com/roxy-proxy/roxy-proxy/issues/561).
 
-| throughput lost to a do-nothing layer, as an egress proxy | 1 KiB | 64 KiB | 1 MiB |
-|---|---|---|---|
-| WASM layer | about 50% | about 70% | about 85% |
-| service layer (sidecar on localhost) | about 60% | about 75% | about 90% |
+| throughput lost to a do-nothing layer, as an egress proxy | 1 KiB | 1 MiB |
+|---|---|---|
+| WASM layer | about half | most of it |
+| service layer (sidecar on localhost) | about 60% | most of it |
 
-In CPU terms, roxy spends about 100 µs on a small exchange with no addons
+In CPU terms, roxy spends under 100 µs on a small exchange with no addons
 and a do-nothing layer of either kind adds roughly another 100 µs: the calls
 into the host for WASM, a dozen messages over a second socket for a service.
 So a layer that does T µs of work per request makes an exchange cost about
 200 + T µs, and four cores give roughly 4,000,000 / (200 + T) requests per
 second: 20,000 with no work, 13,000 at 100 µs, 4,000 at 800 µs. A service
-layer adds the sidecar's own CPU on top. A body through a layer adds about
-3 µs per KiB for WASM and 4.5 µs per KiB for a service, so a 1 MiB response
-through a do-nothing layer costs roxy 4 to 5 ms against about 0.6 ms with
-no addons.
+layer adds the sidecar's own CPU on top. Add a few milliseconds per MiB of
+body that streams through the layer.
 
 ## What is not measured
 
