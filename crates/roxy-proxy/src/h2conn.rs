@@ -308,6 +308,7 @@ async fn serve_stream(
     };
     let mut writer = H2Writer {
         respond: &mut respond,
+        sent: None,
         fail: &fail,
         out: &out,
     };
@@ -355,30 +356,51 @@ struct Out<'a> {
 
 struct H2Writer<'a, 'b> {
     respond: &'a mut h2::server::SendResponse<Bytes>,
+    sent: Option<SendStream<Bytes>>,
     fail: &'a BodyFail,
     out: &'a Out<'b>,
 }
 
 impl crate::exchange::ResponseWriter for H2Writer<'_, '_> {
     async fn write(&mut self, res: CanonicalResponse) -> Result<(), WriteFailure> {
-        write_response(self.respond, res, self.out).await
+        self.sent = Some(write_response(self.respond, res, self.out).await?);
+        Ok(())
     }
 
     async fn reclaim(&mut self, reclaim: crate::addons::Reclaim) -> (FlowCx, Option<WriteFailure>) {
+        // A failed write already cancelled the exchange. In particular,
+        // our own reset must not be mistaken for a subsequent client reset.
+        let Some(sent) = &mut self.sent else {
+            return (reclaim.take().await, None);
+        };
         reclaim
             .take_until(async {
-                tokio::select! {
+                let failure = tokio::select! {
+                    biased;
                     () = self.fail.signal.cancelled() => {
-                        self.fail.get().map_or_else(
-                            || WriteFailure::ClientGone("the HTTP/2 stream closed".to_owned()),
-                            WriteFailure::Request,
-                        )
+                        if self.fail.gone() {
+                            WriteFailure::ClientGone("the HTTP/2 stream closed".to_owned())
+                        } else {
+                            self.fail.get().map_or_else(
+                                || WriteFailure::Io("the HTTP/2 stream failed".to_owned()),
+                                WriteFailure::Request,
+                            )
+                        }
                     }
-                    reset = poll_fn(|cx| self.respond.poll_reset(cx)) => {
-                        self.fail.gone.store(true, Ordering::Relaxed);
-                        WriteFailure::ClientGone(format!("HTTP/2 stream reset: {reset:?}"))
+                    reset = poll_fn(|cx| sent.poll_reset(cx)) => {
+                        match reset {
+                            Ok(reason) => WriteFailure::ClientGone(format!("HTTP/2 stream reset: {reason}")),
+                            Err(error) => stream_error(&error),
+                        }
                     }
-                }
+                };
+                let why = if matches!(failure, WriteFailure::ClientGone(_)) {
+                    self.fail.gone.store(true, Ordering::Relaxed);
+                    crate::addons::CLIENT_GONE
+                } else {
+                    crate::addons::ENDED
+                };
+                (why, failure)
             })
             .await
     }
@@ -392,7 +414,7 @@ async fn write_response(
     respond: &mut SendResponse<Bytes>,
     res: CanonicalResponse,
     out: &Out<'_>,
-) -> Result<(), WriteFailure> {
+) -> Result<SendStream<Bytes>, WriteFailure> {
     let head = to_h2_response(&res, out.method)
         .body(())
         .map_err(|e| WriteFailure::Io(format!("response head: {e}")))?;
@@ -404,10 +426,9 @@ async fn write_response(
             && (!out.flags.allow_response_trailers || http_body::Body::is_end_stream(&res.body)));
     let mut body = res.body;
     if bodiless {
-        respond
+        return respond
             .send_response(head, true)
-            .map_err(|e| stream_error(&e))?;
-        return Ok(());
+            .map_err(|e| stream_error(&e));
     }
     let mut send = respond
         .send_response(head, false)
@@ -437,7 +458,7 @@ async fn write_response(
         // Nobody left to reset.
         Err(WriteFailure::ClientGone(_)) | Ok(()) => {}
     }
-    r
+    r.map(|()| send)
 }
 
 /// A failed stream operation: the client's doing (reset, connection gone)

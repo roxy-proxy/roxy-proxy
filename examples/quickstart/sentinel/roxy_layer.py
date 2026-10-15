@@ -229,7 +229,7 @@ class _Lane:
         # Bytes consumed and not yet credited back to roxy.
         self.unacked = 0
         # roxy reads no more of what this side sends on the lane.
-        self.stopped = False
+        self.stopped = asyncio.Event()
         # Trailers roxy sent after the body's bytes, if any.
         self.trailers: list[tuple[str, str]] | None = None
 
@@ -255,7 +255,7 @@ class _Stream:
 
     def stopped(self, direction: int) -> None:
         lane = self.lanes[direction]
-        lane.stopped = True
+        lane.stopped.set()
         lane.more_credit.set()
         self._lane_done(direction)
 
@@ -398,11 +398,11 @@ class _Stream:
     async def send_bytes(self, direction: int, data: bytes) -> None:
         lane = self.lanes[direction]
         view = memoryview(data)
-        while view and not lane.stopped:
-            while lane.credit <= 0 and not lane.stopped:
+        while view and not lane.stopped.is_set():
+            while lane.credit <= 0 and not lane.stopped.is_set():
                 lane.more_credit.clear()
                 await lane.more_credit.wait()
-            if lane.stopped:
+            if lane.stopped.is_set():
                 return
             n = min(len(view), lane.credit, MAX_BODY_FRAME)
             lane.credit -= n
@@ -474,8 +474,8 @@ class Exchange:
         await self._s.call({"type": "record", "kind": kind, "data": data})
 
     async def add_tag(self, tag: str) -> None:
-        """Tags the flow for the layers below and the flow log. Await it
-        before `forward` for the layers below to see the tag."""
+        """Tags the flow for the upstream layers and the flow log. Await it
+        before `forward` for the upstream layers to see the tag."""
         await self._s.call({"type": "add_tag", "tag": tag})
 
     async def state_get(self, key: str) -> str | None:
@@ -536,17 +536,37 @@ class Exchange:
             if body:
                 await self._s.send_bytes(direction, body)
         else:
-            try:
-                async for chunk in body:
+            lane = self._s.lane(direction)
+            source = aiter(body)
+
+            async def produce() -> None:
+                async for chunk in source:
+                    if lane.stopped.is_set():
+                        return
                     if chunk:
                         await self._s.send_bytes(direction, chunk)
-                    if self._s.lane(direction).stopped:
-                        break
+
+            producer = asyncio.create_task(produce())
+            stopped = asyncio.create_task(lane.stopped.wait())
+            try:
+                # A stop must also interrupt a source waiting for its next
+                # chunk, not only a sender waiting for output credit.
+                await asyncio.wait({producer, stopped}, return_when=asyncio.FIRST_COMPLETED)
+                if not lane.stopped.is_set():
+                    producer.result()
             except BodyFailed as e:
                 # A body that failed on its way in is passed on cut, where
                 # it stopped, never as complete.
                 end["error"] = str(e)
-        if self._s.lane(direction).stopped:
+            finally:
+                for task in (producer, stopped):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(producer, stopped, return_exceptions=True)
+                close = getattr(source, "aclose", None)
+                if close is not None:
+                    await close()
+        if self._s.lane(direction).stopped.is_set():
             # roxy reads no more of this lane: its end is not owed.
             return
         await self._s.send(end, end=direction)
@@ -556,13 +576,13 @@ class Exchange:
             await self._forwarding
 
     def _cancel_forwarding(self) -> None:
-        if self._forwarding is not None:
+        if self._forwarding is not None and not self._forwarding.cancelling():
             self._forwarding.cancel()
 
     async def _stop_forwarding(self) -> None:
         if self._forwarding is None:
             return
-        self._forwarding.cancel()
+        self._cancel_forwarding()
         await asyncio.wait({self._forwarding})
         if not self._forwarding.cancelled():
             # Retrieved, so a send that failed as the socket closed is not
@@ -570,8 +590,8 @@ class Exchange:
             self._forwarding.exception()
 
     async def forward(self, request: Request, body: Body) -> Response:
-        """Pass `request` on down the stack, once, and return the response
-        head from below, as soon as there is one: the body keeps going out
+        """Pass `request` upstream, once, and return the response
+        head from upstream, as soon as there is one: the body keeps going out
         in the background if roxy answers before it has all been sent.
         roxy re-validates the request and its rules judge it; a refusal
         comes back as a response like any other. Read the response body
@@ -620,7 +640,7 @@ class Exchange:
         )
 
     def response_body(self) -> AsyncIterator[bytes]:
-        """The response body from below, as it arrives. Read it once, after
+        """The response body from upstream, as it arrives. Read it once, after
         `forward`."""
         if self._response_read:
             raise ProtocolError("the response body was already read")
@@ -628,7 +648,7 @@ class Exchange:
         return self._body(RESPONSE)
 
     async def read_response_body(self) -> bytes:
-        """The whole response body from below."""
+        """The whole response body from upstream."""
         return b"".join([c async for c in self.response_body()])
 
     async def respond(self, response: Response, body: Body) -> None:

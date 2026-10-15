@@ -80,7 +80,7 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
                 tokio::select! {
                     biased;
                     () = torn_down.cancelled() => {}
-                    complete = delivery.wait(snap.limits.body_idle_timeout.saturating_mul(2)) => {
+                    complete = delivery.wait() => {
                         if !complete {
                             lease.cx().record.reason.get_or_insert_with(|| "upstream_body_timeout".to_owned());
                         }
@@ -169,7 +169,7 @@ async fn relay_upgrade(
     crate::exchange::relay_websocket(lease.cx(), relay_io, upstream, Vec::new(), &torn_down).await;
     // Let a close frame traverse the response lanes before canceling
     // layers that keep their bodies open after the relay ends.
-    client.close(Duration::from_secs(1)).await;
+    client.close(crate::exchange::CLOSE_TIMEOUT).await;
     st.tear_down(super::ENDED);
 }
 
@@ -247,5 +247,39 @@ impl ClientTransport for LaneTransport {
         Fut::Output: Send,
     {
         async move { Ok(fut.await) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn an_upload_deadline_runs_before_response_writing_or_reclamation() {
+        let kit = crate::testkit::Kit::builder()
+            .limits(|l| l.body_idle_timeout = Duration::from_millis(100))
+            .start()
+            .await;
+        let (st, mut cx, _ends) = crate::addons::test_flow(&kit);
+        let (mut upload, body) = Body::channel(u64::MAX, None);
+        let req = http::Request::post("https://up.test/early-drip?n=100&ms=50")
+            .body(body)
+            .unwrap();
+        let req = from_layer_request(req, st.client_meta.clone(), &cx.snap.limits, &cx.snap.flags)
+            .unwrap();
+        let outcome = crate::exchange::core(&mut LaneTransport, &mut cx, req).await;
+        assert!(matches!(outcome, Outcome::Respond(_)));
+        tokio::time::sleep(Duration::from_millis(201)).await;
+        assert!(
+            upload
+                .send_data(bytes::Bytes::from_static(b"too late"))
+                .await
+                .is_err(),
+            "the upload is released while the response is still unwritten"
+        );
+        assert!(!cx.request_delivery.as_ref().unwrap().wait().await);
+        drop(outcome);
+        let cx = crate::addons::Reclaim::now(cx).take().await;
+        assert_eq!(cx.record.reason.as_deref(), Some("upstream_body_timeout"));
     }
 }

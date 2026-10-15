@@ -1,4 +1,7 @@
 import asyncio
+from collections.abc import AsyncIterator
+
+import pytest
 
 from fake_roxy import FakeRoxy, stray_tasks
 from roxy_layer import REQUEST, RESPONSE, WINDOW, Exchange, ProtocolError, Response
@@ -46,6 +49,51 @@ async def test_connection_close_mid_forward_leaves_no_tasks() -> None:
     roxy.ws.close()
     await asyncio.wait_for(roxy.task, 2.0)
     assert stray_tasks() == set()
+
+
+@pytest.mark.parametrize("direction", [REQUEST, RESPONSE])
+@pytest.mark.parametrize("waiting_for_credit", [False, True])
+async def test_stop_closes_a_waiting_body_source(direction: int, waiting_for_credit: bool) -> None:
+    started = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def source() -> AsyncIterator[bytes]:
+        try:
+            started.set()
+            if waiting_for_credit:
+                yield b"x" * (WINDOW + 1)
+            await asyncio.Future()
+            yield b"unreachable"
+        finally:
+            closed.set()
+
+    async def handle(ex: Exchange) -> None:
+        if direction == REQUEST:
+            response = await ex.forward(ex.request, source())
+            await ex.respond(response, b"")
+        else:
+            await ex.respond(Response(200, []), source())
+
+    roxy = FakeRoxy(handle)
+    roxy.open(1)
+    assert (await roxy.ws.next_sent())["type"] == ("request" if direction == REQUEST else "response")
+    await asyncio.wait_for(started.wait(), 2.0)
+    if waiting_for_credit:
+        sent = 0
+        while sent < WINDOW:
+            sent += len(await roxy.ws.next_sent()) - 5
+    if direction == REQUEST:
+        roxy.ws.control(1, "response", status=200, headers=[])
+        assert (await roxy.ws.next_sent())["type"] == "response"
+        assert (await roxy.ws.next_sent())["type"] == "response_end"
+    roxy.ws.control(1, "stop", dir="request" if direction == REQUEST else "response")
+    await asyncio.wait_for(closed.wait(), 2.0)
+    if direction == RESPONSE:
+        assert (await roxy.ws.next_sent())["type"] == "request_end"
+    await roxy.until_closed(1)
+    assert 1 not in roxy.conn.streams
+    assert roxy.ws.sent.empty(), "a stopped lane sends neither bytes nor an end"
+    assert stray_tasks(roxy.task) == set()
 
 
 async def test_an_upgrade_streams_both_ways_with_no_request_end() -> None:

@@ -153,27 +153,30 @@ impl Reclaim {
     /// The flow context, once the stack has let go of it. A stack that
     /// answered folds its answer into the record.
     pub(crate) async fn take(self) -> FlowCx {
-        self.take_until(std::future::pending::<()>()).await.0
+        self.take_until(std::future::pending::<(&'static str, ())>())
+            .await
+            .0
     }
 
     /// Keep observing the client while the exchange finishes. Cancellation
-    /// tears down the drivers, then waits for their final accounting.
-    pub(crate) async fn take_until<F: Future>(self, cancelled: F) -> (FlowCx, Option<F::Output>) {
+    /// tears down the drivers with the supplied reason, then waits for
+    /// their final accounting.
+    pub(crate) async fn take_until<T>(
+        self,
+        cancelled: impl Future<Output = (&'static str, T)>,
+    ) -> (FlowCx, Option<T>) {
         match self {
             Reclaim::Now(mut cx) => {
                 let delivery = cx.request_delivery.take();
                 let wait = async {
                     match &delivery {
-                        Some(d) => {
-                            d.wait(cx.snap.limits.body_idle_timeout.saturating_mul(2))
-                                .await
-                        }
+                        Some(d) => d.wait().await,
                         None => true,
                     }
                 };
                 let (complete, cancellation) = tokio::select! {
                     complete = wait => (complete, None),
-                    reason = cancelled => (true, Some(reason)),
+                    (_, reason) = cancelled => (true, Some(reason)),
                 };
                 drop(delivery);
                 if !complete {
@@ -189,8 +192,8 @@ impl Reclaim {
                     tokio::pin!(take);
                     tokio::select! {
                         cx = &mut take => (cx, None),
-                        reason = cancelled => {
-                            held.st.tear_down(super::CLIENT_GONE);
+                        (why, reason) = cancelled => {
+                            held.st.tear_down(why);
                             (take.await, Some(reason))
                         }
                     }

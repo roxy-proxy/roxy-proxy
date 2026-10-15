@@ -611,12 +611,12 @@ impl Chain {
     pub(crate) fn tear_down(&self, why: &'static str) {
         let _ = self.torn_why.set(why);
         self.torn.cancel();
-        self.stop(
+        self.settle(
             LaneId {
                 hop: 0,
                 dir: Dir::Res,
             },
-            why,
+            LaneState::Stopped,
         );
         self.cut(
             LaneId {
@@ -1088,6 +1088,8 @@ impl HttpBody for Reading {
     }
 
     fn is_end_stream(&self) -> bool {
+        // The producer ending does not mean its buffered frames were checked.
+        // Poll through EOF before allowing a codec to skip this reader.
         self.done.load(Ordering::Acquire) && self.trailers.is_none()
     }
 
@@ -1486,6 +1488,10 @@ mod tests {
                 futures_util::poll!(reader.frame()).is_pending(),
                 "trailers must not commit before the end"
             );
+            assert!(
+                !reader.is_end_stream(),
+                "held trailers still require terminal validation"
+            );
             let finished = writer.finish().await;
             let terminal = reader.frame().await.unwrap();
             if declared == Some(6) {
@@ -1496,6 +1502,48 @@ mod tests {
                 assert_eq!(terminal.unwrap().into_trailers().unwrap()["x-check"], "ok");
                 assert!(reader.frame().await.is_none());
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn unpolled_lane_bodies_preserve_request_framing() {
+        for (whole, declared, expected) in [
+            (true, None, Some(0)),
+            (false, None, None),
+            (false, Some(0), Some(0)),
+        ] {
+            let (_chain, edge, _layers, mut core, _) = chain(0);
+            if whole {
+                edge.req_out.whole(request(), Body::empty());
+            } else {
+                edge.req_out
+                    .head(request(), declared, u64::MAX)
+                    .finish()
+                    .await
+                    .unwrap();
+            }
+            let (Head::Request(mut parts), body) = core.req_in.head().await.unwrap() else {
+                panic!("request head");
+            };
+            parts.method = http::Method::POST;
+            if declared == Some(0) {
+                parts.headers.insert(
+                    http::header::CONTENT_LENGTH,
+                    http::HeaderValue::from_static("0"),
+                );
+            }
+            let req = roxy_http::layer::from_layer_request(
+                http::Request::from_parts(parts, body),
+                roxy_http::RequestMeta::new(
+                    roxy_http::Version::H1_1,
+                    roxy_http::TargetForm::Absolute,
+                ),
+                &roxy_http::Limits::default(),
+                &roxy_http::HttpFlags::default(),
+            )
+            .unwrap();
+            assert_eq!(req.body.known_length(), expected);
+            assert!(req.body.collect_up_to(1).await.unwrap().data.is_empty());
         }
     }
 

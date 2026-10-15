@@ -23,47 +23,86 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct Delivery(Arc<DeliveryState>);
 
 struct DeliveryState {
-    body: std::sync::Mutex<Option<Body>>,
+    upload: std::sync::Mutex<Upload>,
     finished: CancellationToken,
     reader: futures_util::task::AtomicWaker,
-    bytes: AtomicU64,
+}
+
+struct Upload {
+    body: Option<Body>,
+    bytes: u64,
+    timed_out: bool,
 }
 
 impl DeliveryState {
-    fn finish(&self) {
-        // Drop the accounting adapters before publishing completion.
-        drop(
-            self.body
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take(),
-        );
-        self.finished.cancel();
+    fn upload(&self) -> std::sync::MutexGuard<'_, Upload> {
+        self.upload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn finish(&self, timed_out: bool) {
+        self.finish_locked(&mut self.upload(), timed_out);
         self.reader.wake();
+    }
+
+    fn finish_locked(&self, upload: &mut Upload, timed_out: bool) {
+        if let Some(body) = upload.body.take() {
+            // Completion and timeout use the same lock as polling. Neither
+            // can overtake a final frame or publish unfinished accounting.
+            drop(body);
+            upload.timed_out = timed_out;
+            self.finished.cancel();
+        }
+    }
+
+    fn stop_if_stalled(&self, bytes: &mut u64) -> bool {
+        {
+            let mut upload = self.upload();
+            if upload.bytes != *bytes {
+                *bytes = upload.bytes;
+                return false;
+            }
+            self.finish_locked(&mut upload, true);
+        }
+        self.reader.wake();
+        true
     }
 }
 
 impl Delivery {
-    /// Wait for consumption or abandonment, bounded by upload progress.
-    pub(crate) async fn wait(&self, idle: Duration) -> bool {
-        let mut bytes = self.0.bytes.load(Ordering::Relaxed);
-        loop {
-            tokio::select! {
-                biased;
-                () = self.0.finished.cancelled() => return true,
-                () = tokio::time::sleep(idle) => {
-                    let next = self.0.bytes.load(Ordering::Relaxed);
-                    if next == bytes {
-                        return false;
+    /// Start at the upstream response head, independently of response writing.
+    pub(crate) fn start_monitor(&self, idle: Duration) {
+        if self.0.finished.is_cancelled() {
+            return;
+        }
+        let shared = self.0.clone();
+        let mut bytes = shared.upload().bytes;
+        let deadline = Instant::now() + idle;
+        tokio::spawn(async move {
+            let mut deadline = deadline;
+            loop {
+                tokio::select! {
+                    biased;
+                    () = shared.finished.cancelled() => return,
+                    () = tokio::time::sleep_until(deadline) => {
+                        if shared.stop_if_stalled(&mut bytes) {
+                            return;
+                        }
+                        deadline = Instant::now() + idle;
                     }
-                    bytes = next;
                 }
             }
-        }
+        });
+    }
+
+    pub(crate) async fn wait(&self) -> bool {
+        self.0.finished.cancelled().await;
+        !self.0.upload().timed_out
     }
 
     pub(crate) fn cancel(&self) {
-        self.0.finish();
+        self.0.finish(false);
     }
 }
 
@@ -80,7 +119,7 @@ struct DeliveredBody {
 
 impl Drop for DeliveredBody {
     fn drop(&mut self) {
-        self.shared.finish();
+        self.shared.finish(false);
     }
 }
 
@@ -97,29 +136,24 @@ impl http_body::Body for DeliveredBody {
         }
         self.shared.reader.register(cx.waker());
         let result = {
-            let mut body = self
-                .shared
-                .body
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match body.as_mut() {
+            let mut upload = self.shared.upload();
+            let result = match upload.body.as_mut() {
                 Some(body) => Pin::new(body).poll_frame(cx),
                 None => Poll::Ready(Some(Err(BodyError::Stopped))),
-            }
-        };
-        match &result {
-            Poll::Ready(None | Some(Err(_))) => {
-                self.done = true;
-                self.shared.finish();
-            }
-            Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    self.shared
-                        .bytes
-                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+            };
+            match &result {
+                Poll::Ready(None | Some(Err(_))) => self.shared.finish_locked(&mut upload, false),
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Some(data) = frame.data_ref() {
+                        upload.bytes += data.len() as u64;
+                    }
                 }
+                Poll::Pending => {}
             }
-            Poll::Pending => {}
+            result
+        };
+        if matches!(result, Poll::Ready(None | Some(Err(_)))) {
+            self.done = true;
         }
         result
     }
@@ -131,10 +165,13 @@ impl http_body::Body for DeliveredBody {
 pub(crate) fn delivery(body: Body) -> (Body, Delivery) {
     let known = body.known_length();
     let shared = Arc::new(DeliveryState {
-        body: std::sync::Mutex::new(Some(body)),
+        upload: std::sync::Mutex::new(Upload {
+            body: Some(body),
+            bytes: 0,
+            timed_out: false,
+        }),
         finished: CancellationToken::new(),
         reader: futures_util::task::AtomicWaker::new(),
-        bytes: AtomicU64::new(0),
     });
     let reader = DeliveredBody {
         shared: shared.clone(),
@@ -575,7 +612,7 @@ mod tests {
     async fn upload_completion_publishes_final_accounting() {
         let (body, tally) = counted(Body::from_bytes("hello"), true);
         let (body, owner) = delivery(body);
-        let wait = owner.wait(Duration::from_secs(1));
+        let wait = owner.wait();
         tokio::pin!(wait);
         assert!(futures_util::poll!(wait.as_mut()).is_pending());
         assert_eq!(drain(body).await.unwrap(), b"hello");
@@ -586,12 +623,42 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_unpolled_upload_has_a_progress_deadline() {
-        let (body, tally) = counted(Body::from_bytes("unsent"), false);
+        let (body, tally, sent) = counted_until_sent(Body::from_bytes("unsent"), false);
         let (body, owner) = delivery(body);
-        assert!(!owner.wait(Duration::from_millis(100)).await);
+        owner.start_monitor(Duration::from_millis(100));
+        tokio::time::advance(Duration::from_millis(101)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            sent.is_cancelled(),
+            "the deadline runs before reclamation starts"
+        );
+        assert!(!owner.wait().await);
         drop(owner);
         assert!(drain(body).await.is_err());
         assert_eq!(tally.bytes(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_progress_extends_the_deadline_and_completion_cancels_it() {
+        use http_body_util::BodyExt as _;
+
+        let (mut tx, body) = Body::channel(u64::MAX, None);
+        let (mut body, owner) = delivery(body);
+        owner.start_monitor(Duration::from_millis(100));
+        for _ in 0..3 {
+            tx.send_data(Bytes::from_static(b"progress")).await.unwrap();
+            body.frame().await.unwrap().unwrap();
+            tokio::time::sleep(Duration::from_millis(101)).await;
+            assert!(!owner.0.finished.is_cancelled());
+        }
+        tx.finish().await.unwrap();
+        assert!(body.frame().await.is_none());
+        assert!(owner.wait().await);
+        tokio::time::sleep(Duration::from_millis(101)).await;
+        assert!(
+            owner.wait().await,
+            "a later deadline cannot overwrite completion"
+        );
     }
 
     const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";

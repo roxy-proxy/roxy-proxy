@@ -297,6 +297,7 @@ fn lane_of(kind: &str, v: &Value) -> Option<u8> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     AnswerOpen,
+    // Cut the forward and withhold its result to exercise the answer timeout.
     CutWait,
     TrailersCut,
     Pass,

@@ -50,10 +50,16 @@ produces a `request` event:
 | an upstream stopped consuming the upload after returning its response head | `upstream_body_timeout` ([upload progress](/reference/limits#timeouts)) |
 | an addon layer cut a lane of its own: the request it was forwarding, or the response it was giving | `forward_aborted`, `answer_aborted` (unless another reason stands) |
 | the client went away | `client_gone` |
+| the HTTP/2 stream failed during cleanup after the response was written, without a client reset or connection loss | `h2_stream_error` |
 | an HTTP/2 client stopped taking the response | `client_stalled` |
 | the response body was cut after its head went out | why it was cut, when roxy knows: `buffer_budget_exhausted` (a decoder window the [buffer budget](/reference/limits#limits) could not cover), `upstream_body_failed` (the upstream's body failed into an addon layer), `layer_error` (a layer failed; the `layer_error` event names it), or the client's `parse_error` reason when its request body was rejected while the response was being written; otherwise `response_write_failed` |
 
 ### Events
+
+A client may reset an HTTP/2 stream after its response was fully written,
+while an upload or addon is still running. roxy cancels that remaining
+work and records `client_gone`, retaining the response status and decision.
+It emits no `response_error` for an already completed response.
 
 | event | when |
 |---|---|

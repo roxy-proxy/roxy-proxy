@@ -38,7 +38,7 @@ use crate::server::Shared;
 use crate::upstream::{ConnectError, ConnectInfo, Protocols, UpstreamBody, classify, describe};
 use crate::view::host_text;
 
-pub(crate) use ws::{close_upstream_ws, prepare_websocket, relay_websocket};
+pub(crate) use ws::{CLOSE_TIMEOUT, close_upstream_ws, prepare_websocket, relay_websocket};
 
 /// The client connection after an exchange: `None` once it is closed.
 pub(crate) type Next = Option<ServerConn<ClientIo>>;
@@ -150,7 +150,7 @@ pub(crate) async fn send(
     // carries its close here, where `Answer::Refusal` carries it in the
     // refusal.
     let closing = res.meta.close;
-    let mut r = writer.write(res).await;
+    let r = writer.write(res).await;
     match &r {
         Err(WriteFailure::ClientGone(_) | WriteFailure::ClientStalled) => {
             reclaim.tear_down(crate::addons::CLIENT_GONE);
@@ -159,11 +159,24 @@ pub(crate) async fn send(
         Ok(()) => reclaim.response_written(),
     }
     let (cx, cancellation) = writer.reclaim(reclaim).await;
-    if let Some(e) = cancellation {
-        r = r.and(Err(e));
-    }
     let failed = r.is_err();
     let mut cx = Box::new(cx);
+    // The response is complete. A later cancellation ends the remaining
+    // upload or layer work without turning that response into a failed write.
+    if let Some(e) = cancellation {
+        let reason = match e {
+            WriteFailure::ClientGone(_) => "client_gone",
+            WriteFailure::Request(ref error) => {
+                cx.shared.emit_parse_error(&cx.client, Some(&cx), error);
+                error.reason.as_str()
+            }
+            WriteFailure::Stopped
+            | WriteFailure::ClientStalled
+            | WriteFailure::UpstreamStalled
+            | WriteFailure::Io(_) => "h2_stream_error",
+        };
+        cx.record.reason.get_or_insert_with(|| reason.to_owned());
+    }
     cx.record.response_status = Some(status);
     cx.record.response_headers_bytes = headers_bytes;
     cx.record.response_bytes = tally.bytes();
@@ -944,6 +957,9 @@ async fn plain_upstream<F: ClientTransport>(
             }),
         }),
         Ok(Some(Ok(Ok(res)))) => {
+            if let Some(delivery) = &cx.request_delivery {
+                delivery.start_monitor(limits.body_idle_timeout.saturating_mul(2));
+            }
             cx.record.upstream_connect_ms = res
                 .extensions()
                 .get::<ConnectInfo>()

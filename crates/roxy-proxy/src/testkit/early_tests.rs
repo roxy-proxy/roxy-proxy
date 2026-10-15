@@ -47,6 +47,11 @@ async fn h2_reset_after_bodiless_answer_releases_service() {
             .unwrap()
             .unwrap();
         assert_eq!(response.status(), status);
+        // A healthy stream must remain alive while the service is still
+        // working, even though its HTTP response is already complete.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(kit.upstream.service().resets(), []);
+        assert!(kit.sink.events().iter().all(|e| e["event"] != "request"));
         upload.send_reset(h2::Reason::CANCEL);
         let svc = kit.upstream.service();
         tokio::time::timeout(Duration::from_millis(500), async {
@@ -56,6 +61,16 @@ async fn h2_reset_after_bodiless_answer_releases_service() {
         })
         .await
         .expect("RST_STREAM after a bodiless answer must cancel the service stage");
+        let event = kit.request_event().await;
+        assert_eq!(event["res"]["status"], status, "{event:#}");
+        assert_eq!(event["decision"], "answered", "{event:#}");
+        assert_eq!(event["reason"], "client_gone", "{event:#}");
+        assert!(
+            kit.sink
+                .events()
+                .iter()
+                .all(|e| e["event"] != "response_error")
+        );
 
         // Reuse both the HTTP/2 connection and the only service slot.
         let req = http::Request::get("https://up.test/again")
@@ -89,6 +104,8 @@ async fn headless_forward_completion_restarts_answer_timeout() {
         "a completed, cut forward leaves the answer clock disabled forever"
     );
     assert_eq!(result.unwrap().status, 503);
+    let errors = kit.events("layer_error", 1).await;
+    assert_eq!(errors[0]["kind"], "service:timeout", "{errors:#?}");
 }
 
 #[tokio::test]

@@ -866,6 +866,8 @@ impl Stream {
 
     /// Starts feeding the `dir` body from the stream into `body`.
     fn feed(self: &Arc<Self>, dir: Dir, body: super::super::super::chain::LaneBody) {
+        // Observers have no outgoing lane; only enforcing streams reach here.
+        debug_assert_eq!(self.mode, AddonMode::Enforce);
         let inbox = Arc::new(Inbox::default());
         lock(&self.state).lane(dir).inbox = Some(inbox.clone());
         self.st

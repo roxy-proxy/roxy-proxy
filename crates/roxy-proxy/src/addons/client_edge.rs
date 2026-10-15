@@ -133,7 +133,7 @@ pub(super) fn stack_outcome(
     let status = resp.status().as_u16();
     if status != 101 && !(200..=599).contains(&status) {
         let err = LayerError::InvalidResponse(format!("{status} is not a final response"));
-        st.fail(&st.blamed(), err);
+        st.fail(st.response_producer(), err);
         return refuse(st);
     }
     // Attribution was captured when the layer published its response head.
@@ -171,7 +171,10 @@ pub(super) fn stack_outcome(
                     }
                 });
             if let Err(e) = checked {
-                st.fail(&st.blamed(), LayerError::InvalidResponse(e.to_string()));
+                st.fail(
+                    st.response_producer(),
+                    LayerError::InvalidResponse(e.to_string()),
+                );
                 return refuse(st);
             }
             let to_client = upgraded_body.unwrap_or_default();
@@ -183,14 +186,14 @@ pub(super) fn stack_outcome(
             return Outcome::LayeredUpgrade { res, client };
         }
         let err = LayerError::InvalidResponse("101 without an upgrade to relay".into());
-        st.fail(&st.blamed(), err);
+        st.fail(st.response_producer(), err);
         return refuse(st);
     }
     if upgrade.is_some() {
         // The upstream switched protocols but the stack answered otherwise:
         // no body can carry the relay, so close it and fail closed.
         let err = LayerError::InvalidResponse(format!("{} over a relayed upgrade", res.status));
-        st.fail(&st.blamed(), err);
+        st.fail(st.response_producer(), err);
         return refuse(st);
     }
     st.attribution.head_out();

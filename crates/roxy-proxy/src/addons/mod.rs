@@ -473,15 +473,21 @@ impl StackFlow {
         (0..stage).rev().find(|&i| self.enforced(i))
     }
 
-    /// The layer a failure no layer recorded is put down to: the one that
-    /// answered, else the first downstream layer enforcing layer that ran, since what
-    /// the client got came from it.
-    fn blamed(&self) -> String {
-        let i = self
-            .answered_by()
-            .or_else(|| (0..self.layers.len()).find(|&i| self.enforced(i)))
+    /// The last enforcing layer to pass a response towards the client.
+    /// An observer or skipped layer cannot have changed the head.
+    fn response_producer(&self) -> &str {
+        let i = (0..self.layers.len())
+            .find(|&i| self.enforced(i))
             .unwrap_or(0);
-        self.snap.addons[i].name.clone()
+        &self.snap.addons[i].name
+    }
+
+    /// Fallback attribution when a layer failed without recording a fault.
+    fn blamed(&self) -> String {
+        self.answered_by().map_or_else(
+            || self.response_producer().to_owned(),
+            |i| self.snap.addons[i].name.clone(),
+        )
     }
 
     /// Folds the stack's answer into the record as the transport handler reclaims the
@@ -661,7 +667,7 @@ mod tests {
         let _ = layer.req_in.head().await.unwrap();
         let mut forward = layer.req_out.head(request(), None, u64::MAX);
         let (_, upload) = ends.core.req_in.head().await.unwrap();
-        let (_upload, tally) = crate::body::counted(upload, false);
+        let (upload, tally) = crate::body::counted(upload, true);
         cx.request_tally = Some(tally.clone());
         st.loan.park(cx);
         ends.core.res_out.whole(response(), Body::empty());
@@ -680,6 +686,15 @@ mod tests {
             futures_util::poll!(reclaimed.as_mut()).is_pending(),
             "the flow can be logged before the queued upload is counted or checked by in-flight rules"
         );
+        assert_eq!(
+            upload.collect_up_to(u64::MAX).await.unwrap().data,
+            "still buffered"
+        );
+        let cx = tokio::time::timeout(std::time::Duration::from_secs(1), reclaimed)
+            .await
+            .expect("consuming the upload releases reclamation");
+        assert_eq!(cx.request_tally.as_ref().unwrap().bytes(), 14);
+        assert!(cx.request_tally.as_ref().unwrap().sha256_hex().is_some());
     }
 
     fn cut(why: &str) -> client_edge::Arrival {
@@ -995,5 +1010,49 @@ mod tests {
         let errs = kit.events("layer_error", 1).await;
         assert_eq!(errs[0]["kind"], "invalid_response", "{errs:#?}");
         assert_eq!(errs[0]["layer"], "a");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_response_is_blamed_on_its_last_producer() {
+        let kit = Kit::builder()
+            .addon(AddonDef::test_layer("skipped"))
+            .addon(AddonDef::test_layer("observer").observe())
+            .addon(AddonDef::test_layer("rewriter"))
+            .addon(AddonDef::test_layer("answerer"))
+            .start()
+            .await;
+        for status in [103, 101] {
+            let (st, _, mut ends) = test_flow(&kit);
+            let answerer = ends.layers.pop().unwrap();
+            let mut rewriter = ends.layers.pop().unwrap();
+            st.layers[1].ran.store(true, Ordering::SeqCst);
+            for i in [2, 3] {
+                st.layers[i].ran.store(true, Ordering::SeqCst);
+            }
+            answerer.stage.enforcing();
+            rewriter.stage.enforcing();
+            answerer.res_out.whole(
+                Head::Response(http::Response::new(()).into_parts().0),
+                Body::empty(),
+            );
+            let (Head::Response(mut parts), body) = rewriter.res_in.head().await.unwrap() else {
+                panic!("response head");
+            };
+            parts.status = http::StatusCode::from_u16(status).unwrap();
+            rewriter.res_out.whole(Head::Response(parts), body);
+            for mut bypass in ends.layers.into_iter().rev() {
+                let (head, body) = bypass.res_in.head().await.unwrap();
+                bypass.res_out.whole(head, body);
+            }
+            let response = ends.edge.res_in.head().await;
+            assert_eq!(
+                st.answered_by(),
+                Some(3),
+                "the original answer is still attributed to its source"
+            );
+            let out = stack_outcome(&st, Ok(response), None);
+            assert!(matches!(out, Outcome::Refuse(_)));
+            assert_eq!(st.blamed_layer().as_deref(), Some("rewriter"));
+        }
     }
 }

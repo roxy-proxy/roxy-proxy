@@ -354,7 +354,7 @@ async fn idle_watchdog(last: &AtomicU64, base: Instant, idle: Duration) {
 
 /// How long roxy waits to write a close frame, or to shut a side down,
 /// before giving up on a peer that does not read.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Masks for frames toward the upstream, which must be unpredictable
 /// (RFC 6455 §5.3). Drawn from the system RNG, 64 at a time.

@@ -116,6 +116,8 @@ waits until upload accounting finishes. After that response head, roxy
 checks upload progress every twice `body_idle_timeout`. If no bytes were
 consumed during an interval, roxy cancels the remaining upload and records
 `upstream_body_timeout`, unless another failure already supplies the reason.
+This check runs while response rules and response writing are still in
+progress, including exchanges without addon layers.
 A client cancellation also cancels the upload and releases its buffers.
 
 ### Buffer budget
