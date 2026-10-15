@@ -256,27 +256,39 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_upload_after_response_head_records_abandonment() {
-        let kit = crate::testkit::Kit::builder()
-            .addon(crate::testkit::AddonDef::test_layer("a"))
-            .start()
-            .await;
-        let (st, cx, mut ends) = crate::addons::test_flow(&kit);
-        let mut layer = ends.layers.pop().unwrap();
-        layer.stage.enforcing();
-        st.loan.park(cx);
-        let core = st.chain().spawn(run(st.clone(), ends.core));
-        let (_upload, body) = Body::channel(u64::MAX, None);
-        let (parts, body) = http::Request::post("http://up.test/early-drip?n=100&ms=50")
-            .body(body)
-            .unwrap()
-            .into_parts();
-        layer.req_out.whole(Head::Request(parts), body);
-        let (_, response_body) = layer.res_in.head().await.unwrap();
-        drop(response_body);
-        core.await.unwrap();
-        let mut cx = st.loan.returned().await.unwrap();
-        st.fold_into(&mut cx);
-        assert_eq!(cx.record.reason.as_deref(), Some("upstream_aborted"));
+        for (client_gone, earlier_reason, expected) in [
+            (false, None, "upstream_aborted"),
+            (true, None, "client_gone"),
+            (true, Some("policy_failure"), "policy_failure"),
+        ] {
+            let kit = crate::testkit::Kit::builder()
+                .addon(crate::testkit::AddonDef::test_layer("a"))
+                .start()
+                .await;
+            let (st, mut cx, mut ends) = crate::addons::test_flow(&kit);
+            cx.record.reason = earlier_reason.map(str::to_owned);
+            let mut layer = ends.layers.pop().unwrap();
+            layer.stage.enforcing();
+            st.loan.park(cx);
+            let core = st.chain().spawn(run(st.clone(), ends.core));
+            let (_upload, body) = Body::channel(u64::MAX, None);
+            let (parts, body) = http::Request::post("http://up.test/early-drip?n=100&ms=50")
+                .body(body)
+                .unwrap()
+                .into_parts();
+            layer.req_out.whole(Head::Request(parts), body);
+            let (_, response_body) = layer.res_in.head().await.unwrap();
+            drop(response_body);
+            core.await.unwrap();
+            // Abandonment happened first while the layer was still alive.
+            // A subsequent transport cancellation is stronger evidence.
+            if client_gone {
+                st.tear_down(crate::addons::CLIENT_GONE);
+            }
+            let mut cx = st.loan.returned().await.unwrap();
+            st.fold_into(&mut cx);
+            assert_eq!(cx.record.reason.as_deref(), Some(expected));
+        }
     }
 
     #[tokio::test(start_paused = true)]

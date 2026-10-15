@@ -135,9 +135,10 @@ pub enum EndpointError {
 /// of their own here: time waiting for upstream is excluded.
 #[async_trait::async_trait]
 pub trait LayerHost: Send + Sync + 'static {
-    /// Register a guest driver with the exchange's completion barrier.
-    /// The returned task must remain tracked through destruction even if
-    /// the caller drops `Layer::handle` and aborts it.
+    /// Register guest execution or its child-scope cleanup with the
+    /// exchange's completion barrier. Tasks must remain tracked through
+    /// destruction even if the caller drops `Layer::handle`. Dropping a
+    /// returned join handle must not remove the task from that barrier.
     fn spawn_driver(
         &self,
         driver: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,

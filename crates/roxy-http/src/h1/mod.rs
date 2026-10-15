@@ -356,6 +356,11 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Idle,
+    /// The answer is on the wire; the exchange owner is disposing of
+    /// remaining bodies and work before connection reuse or shutdown.
+    Reclaiming {
+        close: bool,
+    },
     AwaitingResponse,
     AwaitingConnect,
     Closed,
@@ -774,7 +779,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         match self.state {
             State::Closed => return Ok(None),
             State::Idle => {}
-            State::AwaitingResponse | State::AwaitingConnect | State::Broken => {
+            State::AwaitingResponse
+            | State::AwaitingConnect
+            | State::Reclaiming { .. }
+            | State::Broken => {
                 return Err(ParseError::new(
                     Reason::InvalidState,
                     "next_request called before the previous exchange finished",
@@ -941,13 +949,35 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     }
 
     /// Observe client loss while the current exchange reclaims its work.
-    /// Pipelined bytes remain buffered for `next_request`. The buffer is
-    /// bounded by the request-head limit; once full, backpressure resumes.
+    /// Pipelined bytes remain buffered for `next_request`. Further reads
+    /// stop at the request-head limit plus one byte to probe for EOF;
+    /// any bytes already read ahead by the codec remain buffered too.
+    /// A full buffer bounds reclamation by `header_timeout`: backpressure
+    /// must not disable cancellation indefinitely, even behind queued data.
     pub async fn client_lost(&mut self) -> Result<(), ParseError> {
+        let result = self.watch_reclamation().await;
+        self.state = State::Broken;
+        result
+    }
+
+    async fn watch_reclamation(&mut self) -> Result<(), ParseError> {
         self.r.pump().await?;
         loop {
             if self.r.buf.len() >= self.limits.max_header_bytes {
-                std::future::pending::<()>().await;
+                let until = deadline(self.limits.header_timeout);
+                if self.r.buf.len() == self.limits.max_header_bytes {
+                    let mut probe = [0];
+                    match timeout_at(until, self.r.rd.read(&mut probe)).await {
+                        Ok(Ok(0) | Err(_)) => return Ok(()),
+                        Ok(Ok(_)) => self.r.buf.extend_from_slice(&probe),
+                        Err(_) => {}
+                    }
+                }
+                tokio::time::sleep_until(until).await;
+                return Err(ParseError::new(
+                    Reason::HeaderTimeout,
+                    "pipeline buffer stayed full during exchange reclamation",
+                ));
             }
             let mut buf = vec![0; READ_CHUNK];
             let room = self
@@ -997,12 +1027,16 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     /// [`ServerConn::send_100_continue`] and [`ServerConn::respond_upgrade`]),
     /// nor 2xx responses to CONNECT (see [`ServerConn::accept_connect`]).
     pub async fn respond(&mut self, mut res: CanonicalResponse) -> Result<(), WriteError> {
-        self.respond_borrowed(&mut res).await
+        self.respond_borrowed(&mut res).await?;
+        drop(res);
+        self.finish_response().await.map_err(WriteError::Request)
     }
 
     /// Write a response while leaving body disposal to the exchange owner.
     /// On a failure it can record the cause before releasing the body; on
-    /// HEAD or a bodiless status it can consume the unwritten remainder.
+    /// HEAD or a bodiless status it can consume the unwritten remainder
+    /// concurrently with `client_lost`, which continues pumping the upload.
+    /// Call `finish_response` after reclamation, before reusing the connection.
     pub async fn respond_borrowed(
         &mut self,
         res: &mut CanonicalResponse,
@@ -1061,20 +1095,13 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         let result = {
             let write = write_message(&mut self.w, head, &mut res.body, &opts, &client_closed);
             let mut write = std::pin::pin!(write);
-            let mut write_done = false;
             let mut watch_done = false;
             loop {
-                if write_done && self.r.feed.is_none() {
-                    break Ok(());
-                }
                 tokio::select! {
-                    r = &mut write, if !write_done => {
-                        if let Err(e) = r { break Err(e); }
-                        write_done = true;
-                    }
+                    r = &mut write => break r,
                     // `write` is polled again on the next pass, so a body
                     // that is waiting for its next frame fails at once.
-                    r = self.r.pump_then_watch(!write_done), if !watch_done => {
+                    r = self.r.pump_then_watch(true), if !watch_done => {
                         match r {
                             Err(e) => break Err(WriteError::Request(e)),
                             Ok(closed) => client_closed.store(closed, Ordering::Relaxed),
@@ -1087,6 +1114,21 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         if let Err(e) = result {
             self.state = State::Broken;
             return Err(e);
+        }
+        self.state = State::Reclaiming { close };
+        Ok(())
+    }
+
+    /// Finish the request feed and apply the connection's close decision
+    /// after the exchange owner has released its bodies. Wire completion
+    /// alone cannot make the connection reusable.
+    pub async fn finish_response(&mut self) -> Result<(), ParseError> {
+        let State::Reclaiming { close } = self.state else {
+            return Ok(());
+        };
+        if let Err(error) = self.r.pump().await {
+            self.state = State::Broken;
+            return Err(error);
         }
         if close || self.r.abandoned {
             self.shutdown().await;

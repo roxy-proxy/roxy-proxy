@@ -659,7 +659,9 @@ async fn answering_after_next_keeps_what_the_rules_decided() {
     )
     .await;
     answer_mid_upload(pending).await;
-    drop(tx);
+    // End the client's upload cleanly. Dropping its source would introduce
+    // an independent malformed upload during transport reclamation.
+    tx.finish().await.unwrap();
     let ev = kit.request_event().await;
     assert_eq!(ev["decision"], "answered", "{ev:#}");
     assert_eq!(ev["terminal_rule"], "layer:a");

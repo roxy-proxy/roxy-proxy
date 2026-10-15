@@ -106,8 +106,8 @@ pub(super) async fn connect_stack(
         Ok((io, leftover)) => client.connect(Box::new(io), leftover.to_vec()),
         Err(e) => {
             tracing::debug!(error = %e, "writing 101 failed");
-            drop(client);
             reclaim.tear_down(crate::addons::CLIENT_GONE);
+            drop(client);
         }
     }
     let mut cx = reclaim.take().await;

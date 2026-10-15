@@ -123,12 +123,21 @@ The lifecycle rules are:
 - **The exchange is over** when every lane is terminal, its consumers have
   finished or abandoned their bodies, and all drivers and enforcing
   host-service workers have returned. Upstream upload accounting is final
-  before its owner returns. Guest drivers, service pumps and upload
-  monitors belong to this barrier even when their parent is cancelled.
+  before its owner returns. Guest drivers and their spawned `next`, endpoint
+  and body-finish workers, service pumps and upload monitors belong to this
+  barrier even when their parent is cancelled. Cancellation includes their
+  actual destruction, not just an abort request.
   Both HTTP transports observe client loss through reclamation. The flow
   record is written after this barrier.
   WebSockets use the same rule: the core owns the relay and its accounting
   until it ends, then cancels any remaining layers.
+
+Wire completion, exchange completion and connection lifetime are separate.
+An HTTP/1.1 answer can finish while its upload or addon work continues;
+reclamation keeps driving the request and any suppressed response body
+concurrently. Only after reclamation can that connection serve a pipelined
+request, and a late closing refusal still prevents reuse. A full pipeline
+buffer has a [bounded reclamation deadline](/reference/limits#buffer-budget).
 
 Observers are not stages: an observe layer gets copies of both lanes of a
 hop, nothing it produces moves a lane, and the exchange does not wait for

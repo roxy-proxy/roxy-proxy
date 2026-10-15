@@ -46,6 +46,7 @@ mod http_tests;
 mod lease_tests;
 #[cfg(test)]
 mod quarantine_tests;
+mod reclamation_tests;
 #[cfg(test)]
 mod rules_tests;
 #[cfg(test)]

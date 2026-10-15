@@ -448,7 +448,15 @@ impl Layer {
             instance: Some(instance),
             _permit: permit,
         };
-        let driver = host.spawn_driver(Box::pin(run.drive(head, body_res)));
+        // Register the parent before starting either task: the cleanup
+        // waiter cannot see an empty scope while the guest can spawn work.
+        let driving = shared.tasks.track_future(run.drive(head, body_res));
+        let tasks = shared.tasks.clone();
+        // This waiter belongs to the host's barrier even if handle itself
+        // is dropped. Aborting a driver or pending call only requests its
+        // cancellation; the scope waits for the actual future destruction.
+        let cleanup = host.spawn_driver(Box::pin(async move { tasks.wait().await }));
+        let driver = host.spawn_driver(Box::pin(driving));
         drop(host);
         let abort = driver.abort_handle();
         // Dropped here before the driver has settled (this future was
@@ -485,6 +493,7 @@ impl Layer {
             driver.abort();
         }
         let _ = driver.await;
+        let _ = cleanup.await;
         drop(cancel);
         outcome
     }
@@ -499,6 +508,7 @@ struct Cancel {
 
 impl Drop for Cancel {
     fn drop(&mut self) {
+        self.shared.cancelled.cancel();
         if self.shared.failure().is_none() {
             self.shared.fail(LayerError::Cancelled);
         }

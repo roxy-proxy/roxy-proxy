@@ -212,6 +212,8 @@ pub(crate) struct Chain {
     /// The first lane a layer cut of its own accord: the record's reason.
     abort: OnceLock<&'static str>,
     cancellation: OnceLock<&'static str>,
+    /// Provisional fallback; a later observed client loss takes precedence.
+    upstream_abandoned: AtomicBool,
 }
 
 /// The client edge's ends: it produces `req[0]` and consumes `res[0]`.
@@ -278,6 +280,7 @@ impl Chain {
             torn_why: OnceLock::new(),
             abort: OnceLock::new(),
             cancellation: OnceLock::new(),
+            upstream_abandoned: AtomicBool::new(false),
         });
         let ends = |dir| -> (Vec<Option<LaneTx>>, Vec<Option<LaneRx>>) {
             (0..=layers)
@@ -421,12 +424,17 @@ impl Chain {
     }
 
     pub(super) fn upstream_abandoned(&self) {
-        let _ = self.cancellation.set("upstream_aborted");
+        self.upstream_abandoned.store(true, Ordering::Relaxed);
     }
 
-    /// The first cancellation of remaining exchange work.
+    /// Observed cancellation, falling back to upstream abandonment only
+    /// when no transport cancellation explains the unfinished work.
     pub(super) fn cancellation_reason(&self) -> Option<&'static str> {
-        self.cancellation.get().copied()
+        self.cancellation.get().copied().or_else(|| {
+            self.upstream_abandoned
+                .load(Ordering::Relaxed)
+                .then_some("upstream_aborted")
+        })
     }
 
     /// The layer whose own answer reached the client, if a layer's did.

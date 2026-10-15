@@ -46,6 +46,11 @@ pub(crate) struct ExchangeShared {
     /// The guest has answered: its response head is out of its hands, and
     /// the head clock has nothing left to time.
     answered: watch::Sender<bool>,
+    /// Guest driver and its children, retained through future destruction.
+    pub(crate) tasks: tokio_util::task::TaskTracker,
+    /// Scope cancellation remains meaningful after the guest has settled:
+    /// a body-finish worker can still be waiting for its consumer.
+    pub(crate) cancelled: tokio_util::sync::CancellationToken,
 }
 
 impl std::fmt::Debug for ExchangeShared {
@@ -58,11 +63,15 @@ impl std::fmt::Debug for ExchangeShared {
 
 impl ExchangeShared {
     pub(crate) fn new(host: Arc<dyn LayerHost>) -> Arc<Self> {
+        let tasks = tokio_util::task::TaskTracker::new();
+        tasks.close();
         Arc::new(Self {
             host,
             status: watch::Sender::new(Status::default()),
             upstream: watch::Sender::new(0),
             answered: watch::Sender::new(false),
+            tasks,
+            cancelled: tokio_util::sync::CancellationToken::new(),
         })
     }
 

@@ -114,8 +114,8 @@ pub(crate) struct Sent {
     /// The write failed: the client got nothing, or a cut body.
     pub failed: bool,
     /// The exchange ends the connection: a closing refusal, or an in-flight
-    /// stop that closes. The h1 codec sees the same value as
-    /// `res.meta.close`; h2 sends GOAWAY on it.
+    /// stop that closes, including one discovered after an early answer.
+    /// HTTP/1.1 must not reuse the connection; HTTP/2 sends GOAWAY.
     pub close: bool,
 }
 
@@ -304,7 +304,7 @@ pub(crate) fn finish_refusal(cx: &mut FlowCx, refusal: &Refusal) {
 /// Writes `answer` on the h1 codec and logs the exchange.
 async fn answer(mut conn: ServerConn<ClientIo>, reclaim: Reclaim, answer: Answer) -> Next {
     let sent = send(reclaim, answer, &mut conn).await;
-    (!sent.failed && !conn.is_closed()).then_some(conn)
+    (!sent.failed && !sent.close && !conn.is_closed()).then_some(conn)
 }
 
 /// Client output and reclamation share a transport owner. HTTP/1.1 pumps
@@ -322,7 +322,7 @@ impl ResponseWriter for ServerConn<ClientIo> {
     }
 
     async fn reclaim(&mut self, reclaim: Reclaim, body: Body) -> (FlowCx, Option<WriteFailure>) {
-        reclaim
+        let (cx, cancellation) = reclaim
             .take_until(body, async {
                 match self.client_lost().await {
                     Ok(()) => (
@@ -332,7 +332,13 @@ impl ResponseWriter for ServerConn<ClientIo> {
                     Err(error) => (crate::addons::ENDED, WriteFailure::Request(error)),
                 }
             })
+            .await;
+        let completion = self
+            .finish_response()
             .await
+            .err()
+            .map(WriteFailure::Request);
+        (cx, cancellation.or(completion))
     }
 }
 

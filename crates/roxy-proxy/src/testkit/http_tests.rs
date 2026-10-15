@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::{Answer, Kit, LogGate, read_response, sha256_hex, streaming_body};
 
@@ -607,29 +607,49 @@ async fn a_forbidden_response_trailer_resets_the_stream() {
     assert_eq!(ev[0]["reason"], "response_write_failed", "{ev:#?}");
 }
 
-/// A request body the codec rejects while the response is already being
-/// written is the client's failure: the body is cut and the exchange is
-/// logged under the parse reason, not as a write failure of roxy's.
+/// A malformed upload always belongs to the client. It cuts an open
+/// response, but cannot turn an already completed response into a write failure.
 #[tokio::test]
 async fn a_request_body_rejected_mid_response_is_logged_as_the_clients() {
-    let kit = Kit::builder().start().await;
-    let mut io = kit.connect();
-    io.write_all(
-        b"POST http://up.test/early HTTP/1.1\r\nhost: up.test\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n",
-    )
-    .await
-    .unwrap();
-    let (head, _) = read_response(&mut io).await;
-    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    io.write_all(b"zz\r\n").await.unwrap();
-    let mut rest = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut io, &mut rest)
-        .await
-        .unwrap();
-    let ev = kit.request_event().await;
-    assert_eq!(ev["reason"], "bad_chunk_size", "{ev:#}");
-    let errs = kit.events("response_error", 1).await;
-    assert_eq!(errs[0]["reason"], "bad_chunk_size", "{errs:#?}");
+    for completed in [false, true] {
+        let kit = Kit::builder().start().await;
+        let mut io = kit.connect();
+        let path = if completed {
+            "/early"
+        } else {
+            "/early-drip?n=100&ms=50"
+        };
+        io.write_all(format!("POST http://up.test{path} HTTP/1.1\r\nhost: up.test\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n").as_bytes()).await.unwrap();
+        let head = if completed {
+            let (head, body) = read_response(&mut io).await;
+            assert_eq!(body, b"early");
+            head
+        } else {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(io.read_u8().await.unwrap());
+            }
+            String::from_utf8(head).unwrap()
+        };
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        io.write_all(b"zz\r\n").await.unwrap();
+        let mut rest = Vec::new();
+        io.read_to_end(&mut rest).await.unwrap();
+        let event = kit.request_event().await;
+        assert_eq!(event["reason"], "bad_chunk_size", "{event:#}");
+        let errors: Vec<_> = kit
+            .sink
+            .events()
+            .into_iter()
+            .filter(|e| e["event"] == "response_error")
+            .collect();
+        if completed {
+            assert!(errors.is_empty(), "{errors:#?}");
+        } else {
+            assert_eq!(errors.len(), 1, "{errors:#?}");
+            assert_eq!(errors[0]["reason"], "bad_chunk_size", "{errors:#?}");
+        }
+    }
 }
 
 /// On HTTP/1.1 the trailers of a chunked response go out as its trailer

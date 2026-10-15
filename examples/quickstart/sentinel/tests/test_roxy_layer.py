@@ -85,8 +85,10 @@ async def test_sse_approval_keeps_the_answer_open_while_holding_an_input(hold: s
 
 
 async def expect_stops(roxy: FakeRoxy, *directions: str) -> None:
-    for direction in directions:
-        assert await roxy.ws.next_sent() == {"type": "stop", "dir": direction, "stream": 1}
+    # Independent inputs can be released in either order.
+    messages = [await roxy.ws.next_sent() for _ in directions]
+    assert all(m["type"] == "stop" and m["stream"] == 1 for m in messages)
+    assert sorted(m["dir"] for m in messages) == sorted(directions)
 
 
 async def started_upload() -> FakeRoxy:

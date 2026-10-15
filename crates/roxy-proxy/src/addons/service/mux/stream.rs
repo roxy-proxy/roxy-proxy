@@ -467,9 +467,17 @@ impl Stream {
     /// lanes, go on. Stops at the stream's end, or when the service reads
     /// no more of it.
     pub(crate) async fn pump(&self, dir: Dir, head: Out, body: Body) {
-        if self.stop_in[dir_index(dir)].is_cancelled() {
-            return;
+        // Include every queue-capacity wait (head, data, trailers and end),
+        // not only source reads and byte-credit waits. Dropping the pump
+        // releases its body before the caller marks this input complete.
+        tokio::select! {
+            biased;
+            () = self.stopped(dir) => {}
+            () = self.pump_inner(dir, head, body) => {}
         }
+    }
+
+    async fn pump_inner(&self, dir: Dir, head: Out, body: Body) {
         if !self.send(&head).await {
             return;
         }

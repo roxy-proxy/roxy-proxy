@@ -289,10 +289,13 @@ class _Stream:
                 lane.inbox.put_nowait(_ENDED)
 
     async def _stop_inputs(self) -> None:
-        for direction, ended in self._ends_received.items():
-            if not ended:
-                await self.conn.send(self.id, {"type": "stop", "dir": _DIR_NAMES[direction]})
-                self._ends_received[direction] = True
+        for direction in self._ends_received:
+            await self._stop_input(direction)
+
+    async def _stop_input(self, direction: int) -> None:
+        if not self._ends_received[direction]:
+            await self.conn.send(self.id, {"type": "stop", "dir": _DIR_NAMES[direction]})
+            self._ends_received[direction] = True
         self._maybe_ended()
 
     def fail_calls(self, exc: Exception) -> None:
@@ -375,6 +378,10 @@ class _Stream:
             )
             exchange = Exchange(self, request)
             await self.conn.handler(exchange)
+            # Nothing reads the response after handler return. Release it
+            # before waiting for an upload that may still need input/credit.
+            # Keep the request input available to that upload until it ends.
+            await self._stop_input(RESPONSE)
             # The request body may still be going out after the handler
             # has answered. A handler that forwarded nothing ends the
             # request lane headless, and releases unread inputs.

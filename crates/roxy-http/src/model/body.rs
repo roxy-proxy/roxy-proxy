@@ -231,7 +231,9 @@ impl Body {
         }
     }
 
-    /// Declared length, when known (`content-length` framing on the wire).
+    /// Length safe to use for wire framing (`content-length`), when known.
+    /// An open lane keeps this unknown until clean completion, even if
+    /// [`Self::checked`] enforces a separate declared validation length.
     pub fn known_length(&self) -> Option<u64> {
         self.known_length
     }

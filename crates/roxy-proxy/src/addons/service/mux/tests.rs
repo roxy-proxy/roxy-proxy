@@ -131,6 +131,206 @@ fn request_head() -> In {
     }
 }
 
+/// A transport whose queue is drained explicitly by the test.
+fn pressure_link(
+    depth: usize,
+) -> (
+    Arc<Link>,
+    mpsc::Receiver<Queued>,
+    mpsc::UnboundedReceiver<super::link::Message>,
+) {
+    let (ctl, controls) = mpsc::unbounded_channel();
+    let (data, queued) = mpsc::channel(depth);
+    (
+        Arc::new(Link {
+            shared: Arc::new(LinkShared {
+                streams: Mutex::new(LinkState {
+                    open: HashMap::new(),
+                    next_id: 2,
+                    failed: false,
+                }),
+                ctl,
+            }),
+            data,
+        }),
+        queued,
+        controls,
+    )
+}
+
+#[tokio::test]
+async fn backpressure_request_stop_releases_a_full_transport_queue() {
+    let (link, mut queued, _controls) = pressure_link(1);
+    let addon = testing::addon("s", "pass", AddonMode::Enforce, |_| {});
+    let (stream, _around, _kit) = lone_stream_on(addon, None, link).await;
+    // The service has already received this stream's open.
+    assert!(stream.wire.write(true));
+    let (mut upload, body) = Body::channel(u64::MAX, None);
+    upload
+        .send_data(bytes::Bytes::from_static(b"body"))
+        .await
+        .unwrap();
+    let mut pump = Box::pin(stream.pump(
+        Dir::Request,
+        super::super::Out::Request {
+            method: "POST".into(),
+            url: "http://up.test/x".into(),
+            headers: vec![],
+        },
+        body,
+    ));
+    // The head fills the socket queue; the body write must wait behind it.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut pump)
+            .await
+            .is_err()
+    );
+    assert_eq!(stream.link.data.capacity(), 0);
+    assert!(!upload.is_closed());
+    stream.control(In::Stop { dir: Dir::Request });
+    let stopped = tokio::time::timeout(Duration::from_millis(100), &mut pump)
+        .await
+        .is_ok();
+    drop(pump);
+    assert!(
+        stopped,
+        "a request stop did not interrupt the full transport queue"
+    );
+    assert!(
+        upload.is_closed(),
+        "the stopped upload still owns its source"
+    );
+    stream.input_done(Dir::Request);
+    assert!(!stream.ended.is_cancelled());
+    // Once socket progress resumes, the other input can still send bytes.
+    queued.recv().await.unwrap();
+    assert!(
+        stream
+            .pump_body(Dir::Response, Body::from_bytes("response"))
+            .await
+            .is_ok()
+    );
+    let response = queued.recv().await.unwrap().msg.into_data();
+    assert_eq!(response[4], 1);
+    assert_eq!(&response[5..], b"response");
+}
+
+#[tokio::test]
+async fn backpressure_service_credit_stalls_and_resumes_after_bounded_prefetch() {
+    use http_body_util::BodyExt as _;
+    let (link, _queued, mut controls) = pressure_link(1);
+    let addon = testing::addon("s", "pass", AddonMode::Enforce, |_| {});
+    let (stream, mut around, _kit) = lone_stream_on(addon, None, link).await;
+    stream.control(In::Response {
+        status: 200,
+        headers: vec![],
+    });
+    let (_, mut body) = around.answer.head().await.unwrap();
+    let window = vec![1u8; usize::try_from(super::window::WINDOW).unwrap()];
+    // Two windows can be credited before the consumer reads anything:
+    // the lane has two frame slots and the feeder coalesces a full window.
+    for _ in 0..2 {
+        stream.bytes(Dir::Response, &window);
+        let m = tokio::time::timeout(Duration::from_secs(1), controls.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let m: serde_json::Value = serde_json::from_str(m.to_text().unwrap()).unwrap();
+        assert_eq!(m["type"], "credit");
+        assert_eq!(m["bytes"], super::window::WINDOW);
+    }
+    stream.bytes(Dir::Response, &window);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), controls.recv())
+            .await
+            .is_err(),
+        "the full lane must withhold further credit"
+    );
+    assert_eq!(
+        body.frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .data_ref()
+            .unwrap()
+            .len(),
+        window.len()
+    );
+    let m = tokio::time::timeout(Duration::from_secs(1), controls.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let m: serde_json::Value = serde_json::from_str(m.to_text().unwrap()).unwrap();
+    assert_eq!(m["type"], "credit");
+    assert_eq!(m["bytes"], super::window::WINDOW);
+    drop(body);
+}
+
+#[tokio::test]
+async fn backpressure_spent_request_credit_preserves_response_and_stop() {
+    use super::stream::Lost;
+    let (link, mut queued, _controls) = pressure_link(super::link::WRITE_QUEUE);
+    let addon = testing::addon("s", "pass", AddonMode::Enforce, |_| {});
+    let (stream, _around, _kit) = lone_stream_on(addon, None, link).await;
+    assert!(stream.wire.write(true));
+    let request_stream = stream.clone();
+    let request = tokio::spawn(async move {
+        request_stream
+            .pump_body(
+                Dir::Request,
+                Body::from_bytes(vec![1; 2 * usize::try_from(super::window::WINDOW).unwrap()]),
+            )
+            .await
+    });
+    let mut bytes = 0;
+    while bytes < usize::try_from(super::window::WINDOW).unwrap() {
+        let message = tokio::time::timeout(Duration::from_secs(1), queued.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        bytes += message.msg.into_data().len() - 5;
+    }
+    assert_eq!(bytes, usize::try_from(super::window::WINDOW).unwrap());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), queued.recv())
+            .await
+            .is_err()
+    );
+    // Spending request credit must leave the response lane free to run.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            stream.pump_body(Dir::Response, Body::from_bytes("response"))
+        )
+        .await
+        .unwrap()
+        .is_ok()
+    );
+    let response = queued.recv().await.unwrap().msg.into_data();
+    assert_eq!(response[4], 1);
+    assert_eq!(&response[5..], b"response");
+    stream.control(In::Credit {
+        dir: Dir::Request,
+        bytes: MAX_BODY_FRAME as u64,
+    });
+    let resumed = tokio::time::timeout(Duration::from_secs(1), queued.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .msg
+        .into_data();
+    assert_eq!(resumed.len() - 5, MAX_BODY_FRAME);
+    stream.control(In::Stop { dir: Dir::Request });
+    let result = tokio::time::timeout(Duration::from_secs(1), request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(result, Err(Lost::Stream)),
+        "a stop wakes a pump waiting for credit"
+    );
+}
+
 #[tokio::test]
 async fn a_stopped_forward_upload_keeps_the_upstream_response_input() {
     let (stream, mut around, _kit) = lone_stream().await;

@@ -26,6 +26,39 @@ fn with(more: &str) -> KitBuilder {
     Kit::builder().rules(&format!("{WS_ALLOW}{more}"))
 }
 
+#[tokio::test]
+async fn failed_upgrade_write_publishes_client_loss_before_releasing_lanes() {
+    use crate::addons::service::testing;
+    use crate::addons::{AddonMode, CLIENT_GONE, Part};
+    use serde_json::json;
+
+    let kit = testing::kit(
+        WS_ALLOW,
+        vec![testing::subscribed(
+            testing::addon("s", "scripted", AddonMode::Enforce, |_| {}),
+            Part::Head,
+            Part::Full,
+        )],
+    )
+    .await;
+    let (mut client, reset) = kit.connect_resettable();
+    client.write_all(b"GET http://up.test/ws/echo HTTP/1.1\r\nHost: up.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+    let mut script = kit.upstream.service().script().await;
+    script.control("open").await;
+    let request = script.control("request").await;
+    script.body(0).await;
+    script.send(request);
+    script.send(json!({"type": "request_end"}));
+    let response = script.control("response").await;
+    assert_eq!(response["status"], 101);
+    // Keep the read pending, but make the impending handshake write fail.
+    reset.reset();
+    script.send(response);
+    let reset = script.control("reset").await;
+    assert_eq!(reset["message"], CLIENT_GONE, "{reset}");
+    kit.request_event().await;
+}
+
 /// Opens `/ws/echo` against the framed echo, offering `extensions` if
 /// given.
 async fn open(kit: &Kit, extensions: Option<&str>) -> Ws {

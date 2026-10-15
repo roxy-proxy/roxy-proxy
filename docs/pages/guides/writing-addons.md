@@ -81,8 +81,9 @@ boundary in one call. Bodies are plain `wasi:io/streams` (vendored at
   there may be no more than `limits.max_headers` of them, `host`,
   `content-length`, hop-by-hop and framing fields are refused (roxy derives
   them; the body carries its own length), and the whole record must fit in
-  128 KiB. A refused head fails the exchange closed. Trailers on a body are
-  dropped in both directions.
+  128 KiB. A refused head fails the exchange closed. Host-side body
+  passthrough preserves trailers. Guest byte-stream reads and rewrites have
+  no trailer API, so those paths drop them.
 - The host links the rest of WASI 0.2 inertly: an empty environment, no
   arguments, no preopened directories, stdin closed, TCP, UDP and name
   lookup off, every socket address denied. Anything a guest writes to

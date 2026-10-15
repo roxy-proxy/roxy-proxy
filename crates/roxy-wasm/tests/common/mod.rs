@@ -66,6 +66,35 @@ pub struct Mock {
     /// Where the layer's answer goes (`respond`), for the exchange in
     /// progress.
     pub answer: Mutex<Option<oneshot::Sender<LayerResponse>>>,
+    pub endpoint_cleanup: Mutex<Option<Arc<CallCleanup>>>,
+    pub next_cleanup: Mutex<Option<Arc<CallCleanup>>>,
+    pub drivers: tokio_util::task::TaskTracker,
+}
+
+#[derive(Default)]
+pub struct CallCleanup {
+    pub started: AtomicUsize,
+    pub dropped: AtomicUsize,
+    pub destroying: AtomicUsize,
+    pub release: std::sync::Mutex<bool>,
+    pub wake: std::sync::Condvar,
+}
+
+struct CallGuard(Arc<CallCleanup>);
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        self.0.destroying.fetch_add(1, Ordering::SeqCst);
+        let release = self.0.release.lock().unwrap();
+        let _result = self
+            .0
+            .wake
+            .wait_timeout_while(release, std::time::Duration::from_secs(3), |released| {
+                !*released
+            })
+            .unwrap();
+        self.0.dropped.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// How many tags the mock host lets a flow hold.
@@ -75,7 +104,10 @@ pub const MOCK_ENDPOINT_CALLS: usize = 2;
 
 impl Mock {
     pub fn new(mode: NextMode) -> Arc<Self> {
+        let drivers = tokio_util::task::TaskTracker::new();
+        drivers.close();
         Arc::new(Self {
+            drivers,
             mode,
             next_calls: AtomicUsize::new(0),
             calls: Mutex::new(Vec::new()),
@@ -89,6 +121,8 @@ impl Mock {
             endpoint_calls: Arc::new(Semaphore::new(MOCK_ENDPOINT_CALLS)),
             unpark: watch::Sender::new(false),
             answer: Mutex::new(None),
+            endpoint_cleanup: Mutex::new(None),
+            next_cleanup: Mutex::new(None),
         })
     }
 
@@ -121,7 +155,18 @@ impl Mock {
 
 #[async_trait]
 impl LayerHost for Mock {
+    fn spawn_driver(
+        &self,
+        driver: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+    ) -> JoinHandle<()> {
+        self.drivers.spawn(driver)
+    }
+
     async fn next(&self, req: LayerRequest) -> Result<Option<LayerResponse>, HostError> {
+        let _guard = self.next_cleanup.lock().unwrap().clone().map(|state| {
+            state.started.fetch_add(1, Ordering::SeqCst);
+            CallGuard(state)
+        });
         self.next_calls.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_one();
         let (parts, body) = req.into_parts();
@@ -191,6 +236,10 @@ impl LayerHost for Mock {
         match name {
             "monitor" => Ok(Response::new(Body::from_bytes("score=0.1"))),
             "park" => {
+                let _guard = self.endpoint_cleanup.lock().unwrap().clone().map(|state| {
+                    state.started.fetch_add(1, Ordering::SeqCst);
+                    CallGuard(state)
+                });
                 let body = collect(req.into_body())
                     .await
                     .map_err(|e| EndpointError::Failed(e.to_string()))?;

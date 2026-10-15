@@ -118,6 +118,43 @@ async fn read_response<R: AsyncRead + Unpin>(r: &mut R, no_body: bool) -> (Strin
     (head, body)
 }
 
+#[tokio::test(start_paused = true)]
+async fn reclamation_preserves_full_pipeline_buffer_until_connection_reuse() {
+    let limit = 512;
+    let (mut client, mut server) = conn_with(Limits {
+        max_header_bytes: limit,
+        header_timeout: Duration::from_secs(1),
+        ..Limits::default()
+    });
+    client
+        .write_all(b"GET /first HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    drop(expect_request(&mut server).await);
+    let mut response = ok(Body::empty());
+    server.respond_borrowed(&mut response).await.unwrap();
+    read_response(&mut client, false).await;
+
+    let mut next = b"GET /second HTTP/1.1\r\nHost: example.com\r\nX-Pad: ".to_vec();
+    let padding = limit - 4 - next.len();
+    next.resize(limit - 4, b'x');
+    next.extend_from_slice(b"\r\n\r\n");
+    client.write_all(&next).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), server.client_lost())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        server.next_request().await.unwrap_err().reason,
+        Reason::InvalidState
+    );
+    server.finish_response().await.unwrap();
+    // The full, valid head survives the reclamation watcher byte-for-byte.
+    let request = expect_request(&mut server).await;
+    assert_eq!(request.headers.get("x-pad").unwrap().len(), padding);
+}
+
 fn ok(body: Body) -> CanonicalResponse {
     let mut res = CanonicalResponse::new(StatusCode::OK);
     res.body = body;

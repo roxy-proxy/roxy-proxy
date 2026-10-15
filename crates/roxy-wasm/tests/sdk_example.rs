@@ -33,6 +33,54 @@ async fn passthrough() -> Layer {
     load(r#"{"needles": []}"#).await
 }
 
+#[tokio::test]
+async fn backpressure_sdk_transform_pauses_source_until_response_is_read() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    let layer = redact().await;
+    let (mut client, body) = Body::channel_with_depth(1, u64::MAX, None);
+    let sent = Arc::new(AtomicUsize::new(0));
+    let count = sent.clone();
+    let mut upload = tokio::spawn(async move {
+        for _ in 0..32 {
+            client
+                .send_data(Bytes::from(vec![b'x'; 64 * 1024]))
+                .await
+                .unwrap();
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+        client.finish().await.unwrap();
+    });
+    let mut started = start(&layer, Mock::echo(), post(body));
+    let response = tokio::time::timeout(Duration::from_secs(5), started.response())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut upload)
+            .await
+            .is_err(),
+        "the entire upload was consumed while the response consumer was paused"
+    );
+    let paused = sent.load(Ordering::SeqCst);
+    assert!(
+        paused > 0 && paused < 32,
+        "source must make some progress and then pause: {paused}"
+    );
+    let data = tokio::time::timeout(Duration::from_secs(5), collect(response.into_body()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(data.len(), 32 * 64 * 1024);
+    assert!(data.iter().all(|b| *b == b'x'));
+    tokio::time::timeout(Duration::from_secs(5), upload)
+        .await
+        .unwrap()
+        .unwrap();
+    started.outcome().await.unwrap();
+}
+
 fn post(body: Body) -> roxy_wasm::LayerRequest {
     Request::builder()
         .method("POST")

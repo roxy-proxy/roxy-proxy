@@ -349,8 +349,16 @@ impl types::Host for StoreState {
         // room here would wait on the reader, which may be this very guest
         // (reading the response), and deadlock; finishing a body nobody
         // reads any more is harmless.
-        tokio::spawn(async move {
-            let _ = sender.finish().await;
+        let shared = &self.exchange("types.finish")?.shared;
+        let failed = shared.wait_failure();
+        let cancelled = shared.cancelled.clone();
+        shared.tasks.spawn(async move {
+            tokio::select! {
+                biased;
+                () = cancelled.cancelled() => {}
+                _ = failed => {}
+                _ = sender.finish() => {}
+            }
         });
         Ok(())
     }
@@ -435,7 +443,8 @@ impl chain::Host for StoreState {
         // Suspend the deadline before spawning: the guest can keep running
         // before the upstream task is first polled.
         let upstream_wait = UpstreamWait::enter(shared.clone());
-        let fut = wasmtime_wasi::runtime::spawn(async move {
+        let tasks = shared.tasks.clone();
+        let fut = wasmtime_wasi::runtime::spawn(tasks.track_future(async move {
             let resp = host.next(request).await;
             drop(upstream_wait);
             match resp {
@@ -449,7 +458,7 @@ impl chain::Host for StoreState {
                     Err(internal("next failed"))
                 }
             }
-        });
+        }));
         let Self {
             table, exchange, ..
         } = self;
@@ -538,17 +547,18 @@ impl endpoints::Host for StoreState {
         let (body, out) = self
             .body_from_guest(body, Produced::Endpoint)
             .map_err(|e| self.fail(e))?;
+        let tasks = shared.tasks.clone();
         let mut request = http::Request::new(FromGuest::endpoint_request(body, shared));
         *request.method_mut() = method;
         *request.uri_mut() = uri;
         *request.headers_mut() = headers;
 
-        let fut = wasmtime_wasi::runtime::spawn(async move {
+        let fut = wasmtime_wasi::runtime::spawn(tasks.track_future(async move {
             let _permit = permit;
             host.endpoint_call(&name, request)
                 .await
                 .map_err(endpoint_error)
-        });
+        }));
         let Self {
             table, exchange, ..
         } = self;

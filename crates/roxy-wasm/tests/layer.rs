@@ -19,6 +19,118 @@ use tokio::sync::{mpsc, oneshot};
 mod common;
 use common::*;
 
+async fn raw_duplex_fixture(chunk_size: usize) {
+    let rt = runtime();
+    let layer = load(&rt, config()).await;
+    let mut req = request("pass", Body::from_bytes(vec![b'x'; chunk_size]));
+    req.headers_mut().insert("x-upper", "1".parse().unwrap());
+    let mut started = start(&layer, Mock::echo(), req);
+    let response = tokio::time::timeout(Duration::from_secs(2), started.response()).await;
+    if response.is_err() {
+        started.abort();
+    }
+    let response = response
+        .expect("the raw duplex fixture must publish the ready response head")
+        .unwrap();
+    let data = tokio::time::timeout(Duration::from_secs(5), collect(response.into_body()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(data.len(), chunk_size);
+    assert!(data.iter().all(|b| *b == b'X'));
+    started.outcome().await.unwrap();
+}
+
+#[tokio::test]
+async fn backpressure_raw_duplex_fixture_handles_a_large_chunk() {
+    raw_duplex_fixture(64 * 1024).await;
+}
+
+#[tokio::test]
+async fn backpressure_raw_duplex_fixture_small_chunk_control() {
+    raw_duplex_fixture(4 * 1024).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn endpoint_children_are_destroyed_before_handle_returns() {
+    let rt = runtime();
+    let mut cfg = config();
+    cfg.capabilities = Capabilities::NONE.with(Capability::Endpoints);
+    cfg.limits.first_byte_timeout = Duration::from_millis(500);
+    let layer = load(&rt, cfg).await;
+    let host = Mock::echo();
+    let cleanup = Arc::new(CallCleanup::default());
+    *host.endpoint_cleanup.lock().unwrap() = Some(cleanup.clone());
+    let mut req = request("caps", Body::empty());
+    req.headers_mut()
+        .insert("x-cap", "endpoint-flood".parse().unwrap());
+    let task = tokio::spawn(async move { layer.handle(host, req).await });
+    wait_for_count(&cleanup.destroying, 2).await;
+    assert!(
+        !task.is_finished(),
+        "handle crossed the destruction barrier"
+    );
+    release_cleanup(&cleanup);
+    let result = task.await.unwrap();
+    assert_eq!(result, Err(LayerError::BudgetExceeded(Budget::FirstByte)));
+    assert_eq!(cleanup.started.load(Ordering::SeqCst), 2);
+    assert_eq!(cleanup.dropped.load(Ordering::SeqCst), 2);
+}
+
+async fn wait_for_count(count: &std::sync::atomic::AtomicUsize, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while count.load(Ordering::SeqCst) < expected {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("host call reached the cleanup gate");
+}
+
+fn release_cleanup(cleanup: &CallCleanup) {
+    *cleanup.release.lock().unwrap() = true;
+    cleanup.wake.notify_all();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_handle_keeps_next_and_endpoint_children_in_the_host_barrier() {
+    for endpoint in [false, true] {
+        let rt = runtime();
+        let mut cfg = config();
+        cfg.capabilities = Capabilities::NONE.with(Capability::Endpoints);
+        let layer = load(&rt, cfg).await;
+        let host = Mock::new(NextMode::SlowEcho(Duration::from_secs(60)));
+        let cleanup = Arc::new(CallCleanup::default());
+        let expected = if endpoint { 2 } else { 1 };
+        let mut req = request(if endpoint { "caps" } else { "pass" }, Body::empty());
+        if endpoint {
+            *host.endpoint_cleanup.lock().unwrap() = Some(cleanup.clone());
+            req.headers_mut()
+                .insert("x-cap", "endpoint-flood".parse().unwrap());
+        } else {
+            *host.next_cleanup.lock().unwrap() = Some(cleanup.clone());
+        }
+        let owned_host = host.clone();
+        let task = tokio::spawn(async move { layer.handle(owned_host, req).await });
+        wait_for_count(&cleanup.started, expected).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        wait_for_count(&cleanup.destroying, expected).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), host.drivers.wait())
+                .await
+                .is_err(),
+            "the host barrier lost a cancelled guest's child"
+        );
+        release_cleanup(&cleanup);
+        tokio::time::timeout(Duration::from_secs(2), host.drivers.wait())
+            .await
+            .unwrap();
+        assert_eq!(cleanup.dropped.load(Ordering::SeqCst), expected);
+        assert_eq!(host.endpoint_calls.available_permits(), MOCK_ENDPOINT_CALLS);
+    }
+}
+
 #[tokio::test]
 async fn handle_failure_waits_for_driver_cleanup() {
     let rt = runtime();
@@ -33,6 +145,33 @@ async fn handle_failure_waits_for_driver_cleanup() {
         live_host.upgrade().is_none(),
         "handle returned while the guest driver still owns the host"
     );
+}
+
+#[tokio::test]
+async fn cancellation_after_guest_return_releases_a_backpressured_finish_worker() {
+    let rt = runtime();
+    let layer = load(&rt, config()).await;
+    let host = Mock::echo();
+    let mut started = start(
+        &layer,
+        host.clone(),
+        request("finish-full-output", Body::empty()),
+    );
+    let response = started.response().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while layer.idle_instances() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // The guest returned, but its full output queue still owns the finish.
+    assert!(!host.drivers.is_empty());
+    started.abort();
+    tokio::time::timeout(Duration::from_secs(2), host.drivers.wait())
+        .await
+        .unwrap();
+    assert!(collect(response.into_body()).await.is_err());
 }
 
 #[tokio::test]
