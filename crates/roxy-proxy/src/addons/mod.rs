@@ -13,6 +13,7 @@
 //! (invariant 3): a deny before the response head, a cut body after it.
 
 mod attribution;
+mod chain;
 mod decode;
 mod endpoint;
 mod host;
