@@ -44,7 +44,7 @@ If `deploy` fails on a tag, the `publish` job has already updated
    `[workspace.dependencies]` to match. Then run `cargo check` so `Cargo.lock`
    picks up the new version.
 
-   In the same PR, move the `Unreleased` section of `docs/pages/changelog.md`
+   In the same PR, move the `Unreleased` section of `docs/pages/changelog.mdx`
    under a new version heading with the date, linked to the release page,
    and write its one- or two-sentence summary:
 

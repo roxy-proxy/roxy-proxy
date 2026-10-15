@@ -69,7 +69,7 @@ the PR (`fuzz/README.md`).
 - Docs describe what roxy does now. No roadmap, "planned" or "deferred"
   prose: unbuilt work lives in issues.
 - A change that alters behaviour updates the matching docs page in the same
-  PR, and adds a line under `Unreleased` in `docs/pages/changelog.md` if a
+  PR, and adds a line under `Unreleased` in `docs/pages/changelog.mdx` if a
   user would notice it.
 - Write plainly: short sentences, concrete statements, British spelling.
 
