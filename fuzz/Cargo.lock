@@ -773,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "roxy-http"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "brotli-decompressor",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "roxy-rules"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dashmap",
  "humantime-serde",
@@ -808,7 +808,7 @@ dependencies = [
 
 [[package]]
 name = "roxy-tls"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "lru",
  "pem",
