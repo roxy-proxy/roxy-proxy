@@ -33,7 +33,7 @@
 //!   put its own head on the lane it produces, decided then.
 //! - A layer cutting a lane it produces is an abort, not a fault.
 //! - The exchange is over when every lane is terminal.
-#![allow(dead_code)] // Nothing drives a chain yet.
+#![allow(dead_code)] // The service and WASM stages drive the body writers.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -95,6 +95,15 @@ pub(crate) enum Headless {
     Ended,
     /// Cut without one.
     Cut(String),
+}
+
+impl std::fmt::Display for Headless {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Headless::Ended => f.write_str("no response"),
+            Headless::Cut(why) => f.write_str(why),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +171,11 @@ struct StageState {
     /// Cancelled when the stage is torn down; its driver stops on it.
     torn: CancellationToken,
     torn_why: OnceLock<&'static str>,
+    /// The layer runs on this exchange in enforce mode: what it puts on
+    /// its lanes is its own, so a headless answer is its `no_response`
+    /// fault and a cut its abort. A skipped layer or an observer passes
+    /// the lanes through as it found them.
+    enforcing: AtomicBool,
     /// For a layer: whether its answer was its own (the lane it consumes
     /// was headless when it answered). Set when it answers.
     answered: OnceLock<bool>,
@@ -173,6 +187,10 @@ pub(crate) struct Chain {
     stages: Box<[StageState]>,
     recorder: Box<dyn Recorder>,
     over: CancellationToken,
+    /// The client edge gave the exchange up: everything upstream of it is
+    /// torn down, for `why`.
+    torn: CancellationToken,
+    torn_why: OnceLock<&'static str>,
     /// The first lane a layer cut of its own accord: the record's reason.
     abort: OnceLock<&'static str>,
 }
@@ -223,6 +241,7 @@ impl Chain {
             .map(|_| StageState {
                 torn: CancellationToken::new(),
                 torn_why: OnceLock::new(),
+                enforcing: AtomicBool::new(false),
                 answered: OnceLock::new(),
             })
             .collect();
@@ -231,6 +250,8 @@ impl Chain {
             stages,
             recorder: Box::new(recorder),
             over: CancellationToken::new(),
+            torn: CancellationToken::new(),
+            torn_why: OnceLock::new(),
             abort: OnceLock::new(),
         });
         let ends = |dir| -> (Vec<Option<LaneTx>>, Vec<Option<LaneRx>>) {
@@ -293,8 +314,57 @@ impl Chain {
         stage >= 1 && stage + 1 < self.stages.len()
     }
 
+    /// Whether `stage`'s lane events are a layer's own.
+    fn enforcing(&self, stage: usize) -> bool {
+        self.is_layer(stage) && self.stages[stage].enforcing.load(Ordering::Acquire)
+    }
+
     pub(crate) fn state(&self, id: LaneId) -> LaneState {
         lock(&self.lane(id).slot).state.clone()
+    }
+
+    /// A head is on `id`.
+    pub(crate) fn has_head(&self, id: LaneId) -> bool {
+        lock(&self.lane(id).slot).head
+    }
+
+    /// Resolves once `id` is terminal.
+    pub(crate) fn settled(&self, id: LaneId) -> WaitForCancellationFutureOwned {
+        self.lane(id).terminal.clone().cancelled_owned()
+    }
+
+    /// Cancelled when the client edge tears the exchange down.
+    pub(crate) fn torn_down(&self) -> CancellationToken {
+        self.torn.clone()
+    }
+
+    /// Why the client edge tore the exchange down, once it has.
+    pub(crate) fn torn_down_why(&self) -> &'static str {
+        self.torn_why.get().copied().unwrap_or(ENDED)
+    }
+
+    /// Cancelled when layer `layer` (its index in `addons:`) is torn down.
+    pub(crate) fn layer_torn_down(&self, layer: usize) -> CancellationToken {
+        self.stages[layer + 1].torn.clone()
+    }
+
+    /// Why layer `layer` was torn down, once it has been.
+    pub(crate) fn layer_torn_down_why(&self, layer: usize) -> &'static str {
+        self.stages[layer + 1]
+            .torn_why
+            .get()
+            .copied()
+            .unwrap_or(ENDED)
+    }
+
+    /// Layer `layer` faults with `err`.
+    pub(crate) fn fail_layer(&self, layer: usize, err: StackError) {
+        self.fail(layer + 1, err);
+    }
+
+    /// Layer `layer` is answering: see [`StageHandle::answering`].
+    pub(crate) fn layer_answering(&self, layer: usize) {
+        self.answering(layer + 1);
     }
 
     /// Every lane is terminal: nothing in the exchange can move again.
@@ -361,8 +431,7 @@ impl Chain {
             slot.head = true;
         }
         if id.dir == Dir::Res && self.is_layer(producer) {
-            let own = !lock(&self.hops[id.hop + 1].res.slot).head;
-            let _ = self.stages[producer].answered.set(own);
+            self.answering(producer);
         }
         let body = if complete {
             body
@@ -375,6 +444,14 @@ impl Chain {
         if complete {
             self.end(id);
         }
+    }
+
+    /// Layer stage `stage` is putting its head on its response lane: its
+    /// answer is its own if the lane it consumes has none yet, decided
+    /// now and never again.
+    fn answering(&self, stage: usize) {
+        let own = !lock(&self.hops[stage].res.slot).head;
+        let _ = self.stages[stage].answered.set(own);
     }
 
     fn end(&self, id: LaneId) {
@@ -390,7 +467,7 @@ impl Chain {
                 return;
             }
         }
-        if id.dir == Dir::Res && self.is_layer(producer) {
+        if id.dir == Dir::Res && self.enforcing(producer) {
             self.fail(producer, LayerError::NoResponse.into());
         } else {
             self.end(id);
@@ -402,12 +479,17 @@ impl Chain {
         if !self.settle(id, LaneState::Cut(why)) {
             return;
         }
-        if abort && self.is_layer(id.producer()) {
+        if abort && self.enforcing(id.producer()) {
             let _ = self.abort.set(match id.dir {
                 Dir::Req => "forward_aborted",
                 Dir::Res => "answer_aborted",
             });
         }
+    }
+
+    /// `id`'s consumer stops it, for `why`.
+    pub(crate) fn release(&self, id: LaneId, why: &'static str) {
+        self.stop(id, why);
     }
 
     /// `id`'s consumer lets go of it before the end.
@@ -491,6 +573,8 @@ impl Chain {
     /// and `req[0]` cut, as when the client is gone or roxy refuses what
     /// the stack produced.
     pub(crate) fn tear_down(&self, why: &'static str) {
+        let _ = self.torn_why.set(why);
+        self.torn.cancel();
         self.stop(
             LaneId {
                 hop: 0,
@@ -544,6 +628,25 @@ impl StageHandle {
     /// is on its lane. A layer's only: the edges cut their own lanes.
     pub(crate) fn fail(&self, err: impl Into<StackError>) {
         self.chain.fail(self.stage, err.into());
+    }
+
+    /// Roxy gives the stage up without a fault of its own: torn down,
+    /// for `why`.
+    pub(crate) fn gone(&self, why: &'static str) {
+        self.chain.tear_down_stage(self.stage, why);
+    }
+
+    /// The layer runs in enforce mode: its lane events are its own.
+    pub(crate) fn enforcing(&self) {
+        self.chain.stages[self.stage]
+            .enforcing
+            .store(true, Ordering::Release);
+    }
+
+    /// The layer is answering: whether its answer is its own is read now,
+    /// where the head it puts on its lane follows.
+    pub(crate) fn answering(&self) {
+        self.chain.answering(self.stage);
     }
 
     /// Cancelled when the stage is torn down.
@@ -790,7 +893,10 @@ impl LaneRx {
 
 impl Drop for LaneRx {
     fn drop(&mut self) {
-        if !self.spent {
+        // The client edge is no task of the chain's: it stops its lane
+        // itself, with the reason the front found (the client gone, a
+        // write failed, an answer refused), never by letting go.
+        if !self.spent && self.lane.consumer() != 0 {
             let why = self.chain.gave_up(self.lane.consumer());
             self.chain.stop(self.lane, why);
         }
@@ -886,7 +992,8 @@ impl HttpBody for Reading {
 
 impl Drop for Reading {
     fn drop(&mut self) {
-        if !self.done.swap(true, Ordering::AcqRel) {
+        // As for `LaneRx`: the client edge stops its own lane.
+        if !self.done.swap(true, Ordering::AcqRel) && self.lane.consumer() != 0 {
             let why = self.chain.gave_up(self.lane.consumer());
             self.chain.stop(self.lane, why);
         }
@@ -930,6 +1037,9 @@ mod tests {
             ..Record::default()
         });
         let (c, e, l, k) = Chain::new(layers, record.clone());
+        for io in &l {
+            io.stage.enforcing();
+        }
         (c, e, l, k, record)
     }
 
@@ -977,11 +1087,14 @@ mod tests {
         assert_eq!(c.state(req(0)), LaneState::Stopped);
         assert_eq!(body.finish().await, Err(BodyError::Closed));
         assert_eq!(c.state(req(0)), LaneState::Stopped);
-        // A whole body let go of unread is a stop.
+        // The edge lets go of a whole body unread: its lane stays open until
+        // the edge says why it stopped reading.
         core.res_out
             .whole(Head::Response(response(200)), Body::from_bytes("x"));
         let (_, b) = edge.res_in.head().await.unwrap();
         drop(b);
+        assert_eq!(c.state(res(0)), LaneState::Open);
+        c.release(res(0), ENDED);
         assert_eq!(c.state(res(0)), LaneState::Stopped);
     }
 
@@ -1142,6 +1255,7 @@ mod tests {
         let record = Arc::new(Record::default());
         let (c, mut edge, mut layers, _core) = Chain::new(1, record);
         let l1 = layers.pop().unwrap();
+        l1.stage.enforcing();
         l1.stage.fail(LayerError::Trap("boom".into()));
         assert_eq!(
             edge.res_in.head().await.unwrap_err(),
@@ -1167,6 +1281,47 @@ mod tests {
         core.res_out.end_headless();
         assert_eq!(c.state(res(0)), LaneState::Ended);
         drop(edge);
+    }
+
+    #[tokio::test]
+    async fn a_layer_that_does_not_run_passes_headless_lanes_through() {
+        let record = Arc::new(Record::default());
+        let (c, mut edge, mut layers, core) = Chain::new(1, record.clone());
+        let l1 = layers.pop().unwrap();
+        drop(core);
+        // Not enforcing: its own ends are nobody's events.
+        l1.res_out.cut_headless("passed on");
+        l1.req_out.end_headless();
+        assert_eq!(c.abort_reason(), None);
+        assert!(lock(&record.faults).is_empty());
+        assert_eq!(
+            edge.res_in.head().await.unwrap_err(),
+            Headless::Cut("passed on".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_decided_as_the_layer_answers_stands_when_its_head_lands() {
+        let (c, _edge, mut layers, core, _) = chain(1);
+        let l1 = layers.pop().unwrap();
+        l1.stage.answering();
+        core.res_out
+            .whole(Head::Response(response(200)), Body::empty());
+        let _a1 = l1.res_out.head(Head::Response(response(403)), None);
+        assert_eq!(l1.stage.answered(), Some(true));
+        assert_eq!(c.answered_by(), Some(0));
+
+        let (c, _edge, mut layers, core, _) = chain(1);
+        let l1 = layers.pop().unwrap();
+        core.res_out
+            .whole(Head::Response(response(200)), Body::empty());
+        l1.stage.answering();
+        let _a1 = l1.res_out.head(Head::Response(response(200)), None);
+        assert_eq!(
+            c.answered_by(),
+            None,
+            "the response from upstream, passed on"
+        );
     }
 
     #[tokio::test]
@@ -1267,6 +1422,7 @@ mod tests {
         let (_, r0) = edge.res_in.head().await.unwrap();
         upstream.send_data(Bytes::from_static(b"a")).await.unwrap();
         drop(r0);
+        c.release(res(0), ENDED);
         assert_eq!(c.state(res(0)), LaneState::Stopped);
         assert_eq!(c.state(res(1)), LaneState::Stopped);
         assert!(l1.stage.torn_down().is_cancelled());

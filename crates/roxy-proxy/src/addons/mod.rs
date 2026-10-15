@@ -1,23 +1,29 @@
 //! The addon layer stack.
 //!
 //! ```text
-//!   front ─▶ addon 0 ─▶ … ─▶ addon n-1 ─▶ core (rules ↓ / ↑, address floor, connector)
+//!   client edge ──req[0]──▶ addon 0 ──req[1]──▶ … ──req[n]──▶ core edge (rules ↓ / ↑, address floor, connector)
+//!               ◀──res[0]──         ◀──res[1]──   …  ◀──res[n]──
 //! ```
 //!
-//! The front (h1 codec or h2 stream) drives the client's request body into
-//! the first layer. Each layer's `next` enters the layer below; the last
-//! one's `next` runs the ordinary exchange core on whatever the layer passed
-//! on, after re-validating it exactly as strictly as a client request
+//! An exchange is a chain of stages joined by lanes (`chain`). The client
+//! edge puts the client's request on the first request lane and waits for
+//! the head on the first response lane. Each layer runs on what reaches it
+//! on its request lane; what it forwards goes on the lane upstream of it,
+//! and what it answers goes on the response lane downstream. The core edge
+//! runs the ordinary exchange core on whatever the last layer passed on,
+//! after re-validating it exactly as strictly as a client request
 //! (invariant 1). On the way back the rules see the upstream's response
 //! before any layer does. Any layer failure fails the exchange closed
 //! (invariant 3): a deny before the response head, a cut body after it.
 
 mod attribution;
 mod chain;
+mod client_edge;
+mod core_edge;
 mod decode;
 mod endpoint;
 mod host;
-mod lanes;
+mod layer;
 mod reclaim;
 mod select;
 pub mod service;
@@ -25,6 +31,8 @@ mod subscribe;
 mod tee;
 mod ws;
 
+pub(crate) use client_edge::run;
+pub(crate) use layer::below;
 pub(crate) use reclaim::Reclaim;
 pub use service::{ServiceError, ServiceSpec};
 pub use subscribe::{Part, Subscription};
@@ -32,23 +40,20 @@ pub(crate) use ws::{SplicedClient, splice_client, ws_without_extensions};
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
-use http::{HeaderName, StatusCode};
-use roxy_http::layer::{from_layer_request, to_layer_request, to_layer_response};
-use roxy_http::upstream::from_upstream_response;
-use roxy_http::{Body, BodySender, CanonicalRequest, RequestMeta};
-use roxy_wasm::{HostError, LayerError, LayerRequest, LayerResponse, TagError};
+use http::HeaderName;
+use roxy_http::{CanonicalRequest, RequestMeta};
+use roxy_wasm::{LayerError, TagError};
 use tokio_util::sync::CancellationToken;
 
-use self::attribution::{Attribution, Driven, Fault, Side, attributed};
+use self::attribution::{Attribution, Fault};
+use self::chain::{Chain, Dir, LaneId};
 use crate::addr::PrivateAddrs;
-use crate::body::{Collected, collect_prefix};
-use crate::exchange::{Front, Outcome, bad_upgrade_refusal, refusal_response};
 use crate::flowlog::{DecisionKind, FlowEvent};
-use crate::pipeline::{BodyIo, CollectFuture, Decider, FlowCx, FlowMeta, Refusal, RefusalKind};
+use crate::pipeline::{Decider, FlowCx, FlowMeta};
 use crate::view::FlowFacts;
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -183,107 +188,25 @@ pub struct EndpointSpec {
 const MAX_TAGS: usize = 64;
 const MAX_TAG_BYTES: usize = 4096;
 
-/// How far one layer of an exchange got with `next`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-enum NextState {
-    /// The exchange never reached this layer.
-    Unentered,
-    /// Entered; `next` not called.
-    Entered,
-    /// `next` called; no response yet.
-    Pending,
-    /// `next` returned the response from upstream.
-    Resolved,
-    /// `next` ended without one: the layer dropped it, or the exchange was
-    /// torn down under it.
-    Abandoned,
-}
-
-impl NextState {
-    fn from_u8(v: u8) -> Self {
-        match v {
-            1 => Self::Entered,
-            2 => Self::Pending,
-            3 => Self::Resolved,
-            4 => Self::Abandoned,
-            _ => Self::Unentered,
-        }
-    }
-}
-
 /// One layer's part in an exchange.
 #[derive(Default)]
 struct LayerSlot {
-    next: AtomicU8,
     /// The layer ran on this exchange: its `when` and `sample` let it.
     ran: AtomicBool,
-    /// An enforce layer that is still running: it may yet forward.
-    live: AtomicBool,
-    /// The response from upstream is still streaming into the layer.
-    response_open: AtomicBool,
-    /// The forward's state as the layer answered: whether its answer is
-    /// its own or the response its `next` returned is read then, not when
-    /// the front gets round to it, by when the forward may have resolved.
-    answered: std::sync::OnceLock<NextState>,
+    /// The layer's forward was accepted, whether or not the call that
+    /// carries it has run: a service's answer clock stops on it.
+    forwarded: AtomicBool,
     /// Bodies bypassing the layer (enforce mode, head-only subscription).
     bypass: Mutex<subscribe::Bypass>,
-    /// The layer failed: any forward of its still running is given up.
-    cancel: CancellationToken,
+    /// The layer's ends of the hop upstream of it, until it forwards.
+    forward: Mutex<Option<layer::Forward>>,
 }
 
-impl LayerSlot {
-    fn state(&self) -> NextState {
-        NextState::from_u8(self.next.load(Ordering::SeqCst))
-    }
-
-    fn set(&self, s: NextState) {
-        self.next.store(s as u8, Ordering::SeqCst);
-    }
-}
-
-/// Marks a layer's `next` pending, and settles it when `next` returns or
-/// is dropped unfinished.
 /// What a service is told when its exchange is torn down: the client is
 /// gone, or the exchange ended for another reason (refused, quarantined,
 /// the relay over).
 pub(crate) const CLIENT_GONE: &str = "the client went away";
 pub(crate) const ENDED: &str = "the exchange ended";
-
-struct NextGuard {
-    st: Arc<StackFlow>,
-    index: usize,
-    settled: bool,
-}
-
-impl NextGuard {
-    fn new(st: Arc<StackFlow>, index: usize) -> Self {
-        st.set_next(index, NextState::Pending);
-        Self {
-            st,
-            index,
-            settled: false,
-        }
-    }
-
-    fn settle(mut self, ok: bool) {
-        self.settled = true;
-        let s = if ok {
-            NextState::Resolved
-        } else {
-            NextState::Abandoned
-        };
-        self.st.set_next(self.index, s);
-    }
-}
-
-impl Drop for NextGuard {
-    fn drop(&mut self) {
-        if !self.settled {
-            self.st.set_next(self.index, NextState::Abandoned);
-        }
-    }
-}
 
 /// The relayed WebSocket on its way from the core to the front.
 enum Upgrade {
@@ -314,6 +237,8 @@ pub(crate) struct StackFlow {
     client_head: bool,
     loan: reclaim::Loan,
     layers: Box<[LayerSlot]>,
+    /// The lanes of the exchange, and the rules that move them.
+    chain: OnceLock<Arc<Chain>>,
     /// Who is to blame for the exchange failing, if it does.
     pub(crate) attribution: Attribution,
     /// A layer asked to close the client connection.
@@ -323,20 +248,12 @@ pub(crate) struct StackFlow {
     upgrade: Mutex<Upgrade>,
     /// Permits for the exchange's endpoint calls in flight.
     endpoint_calls: Arc<tokio::sync::Semaphore>,
-    /// Whose response reached the client, decided as it did: a layer's
-    /// own, or (`Some(None)`) the core's.
-    decided: std::sync::OnceLock<Option<usize>>,
-    /// The request reached the core: the connector is its consumer from
-    /// then on.
-    core_entered: AtomicBool,
-    /// The client's response is complete.
-    response_done: AtomicBool,
-    /// Why the exchange was torn down, for whatever the stack still ran
-    /// (a service's stream is reset with it).
-    torn_down_why: std::sync::OnceLock<&'static str>,
-    /// The client's request lane is snipped: the response is complete and
-    /// nothing upstream will consume the rest.
-    snip: CancellationToken,
+    /// Whose response reached the client, decided as the front took it: a
+    /// layer's own, or (`Some(None)`) the core's.
+    decided: OnceLock<Option<usize>>,
+    /// The front is splicing the client into a relayed WebSocket: the
+    /// record goes with the relay, which ends the exchange.
+    upgraded: CancellationToken,
 }
 
 impl std::ops::Deref for StackFlow {
@@ -361,6 +278,7 @@ impl StackFlow {
                 .iter()
                 .map(|_| LayerSlot::default())
                 .collect(),
+            chain: OnceLock::new(),
             attribution: Attribution::new(cx.meta.clone()),
             close: AtomicBool::new(false),
             request_decoded: AtomicBool::new(false),
@@ -368,158 +286,83 @@ impl StackFlow {
             endpoint_calls: Arc::new(tokio::sync::Semaphore::new(
                 endpoint::MAX_ENDPOINT_CALLS_IN_FLIGHT,
             )),
-            decided: std::sync::OnceLock::new(),
-            core_entered: AtomicBool::new(false),
-            response_done: AtomicBool::new(false),
-            torn_down_why: std::sync::OnceLock::new(),
-            snip: CancellationToken::new(),
+            decided: OnceLock::new(),
+            upgraded: CancellationToken::new(),
         }
     }
 
-    /// Stops whatever the stack still has running: a core forwarding a
-    /// request, the pumps feeding layers, bodies parked for a forward that
-    /// will not come. For an exchange the front has given up on, or
+    fn chain(&self) -> &Arc<Chain> {
+        self.chain.get().expect("the chain is built with the flow")
+    }
+
+    /// Stops whatever the stack still has running: the client edge lets
+    /// go of the response and cuts the request, and every stage upstream
+    /// is torn down in turn. For an exchange the front has given up on, or
     /// refused; never for one a layer merely answered. `why` is what a
     /// service still on the exchange is told.
     pub(crate) fn tear_down(&self, why: &'static str) {
-        let _ = self.torn_down_why.set(why);
-        self.loan.torn_down.cancel();
-        self.snip.cancel();
-        for index in 0..self.layers.len() {
-            subscribe::release(self, index);
-        }
-        self.loan.changed();
+        self.chain().tear_down(why);
     }
 
     /// Cancelled when the exchange is torn down.
+    #[cfg(test)]
     pub(crate) fn torn_down(&self) -> CancellationToken {
-        self.loan.torn_down.clone()
+        self.chain().torn_down()
     }
 
-    /// Why the exchange ended, once it has been torn down.
-    pub(crate) fn torn_down_why(&self) -> &'static str {
-        self.torn_down_why.get().copied().unwrap_or(ENDED)
+    /// Cancelled when layer `index` is torn down: with the exchange, by a
+    /// failure of its own, or by the layer downstream letting go of its
+    /// answer.
+    pub(crate) fn layer_torn_down(&self, index: usize) -> CancellationToken {
+        self.chain().layer_torn_down(index)
     }
 
-    /// Takes the flow context back for the record: once the core has
-    /// returned it, nothing in the stack can still forward, and no response
-    /// from upstream is still streaming into a layer. A layer's answer
-    /// reaching the client says nothing about the request it forwarded, or
-    /// may yet forward, which runs to its end first.
+    /// Why layer `index` was torn down, once it has been.
+    pub(crate) fn layer_torn_down_why(&self, index: usize) -> &'static str {
+        self.chain().layer_torn_down_why(index)
+    }
+
+    /// The front has written the response: a body it did not read to its
+    /// end is one it will not read.
+    pub(crate) fn response_written(&self) {
+        let res = LaneId {
+            hop: 0,
+            dir: Dir::Res,
+        };
+        self.chain().release(res, ENDED);
+    }
+
+    /// Layer `index` failed with `err`: recorded, then torn down.
+    pub(crate) fn layer_failed(&self, index: usize, err: impl Into<StackError>) {
+        self.chain().fail_layer(index, err.into());
+    }
+
+    /// Takes the flow context back for the record: once the exchange is
+    /// over, nothing in the stack can still forward or answer, and the
+    /// core has returned the context with whatever it recorded. A relayed
+    /// WebSocket is the exception: the front runs the relay on the
+    /// context, and the exchange ends with it.
     async fn reclaim(&self) -> FlowCx {
-        let cx = self
-            .loan
-            .wait_until(|loan| {
-                if self.can_forward() || self.response_open() {
-                    return None;
-                }
-                loan.take()
-            })
-            .await;
+        tokio::select! {
+            () = self.chain().until_over() => {}
+            () = self.upgraded.cancelled() => {}
+        }
+        let cx = self.loan.wait_until(reclaim::Loan::take).await;
         self.loan.taken();
         cx
-    }
-
-    /// A request may still reach the core: a forward is on its way or
-    /// running, or a layer is still alive without having forwarded. Not
-    /// once the exchange is torn down: the core takes nothing then.
-    fn can_forward(&self) -> bool {
-        if self.loan.torn_down.is_cancelled() {
-            return false;
-        }
-        self.layers.iter().any(|l| match l.state() {
-            NextState::Pending => true,
-            NextState::Entered => l.live.load(Ordering::SeqCst),
-            NextState::Unentered | NextState::Resolved | NextState::Abandoned => false,
-        })
-    }
-
-    /// The response from upstream has started into layer `index`, or has
-    /// ended there (complete, cut or dropped).
-    pub(super) fn response_streaming(&self, index: usize, open: bool) {
-        self.layers[index]
-            .response_open
-            .store(open, Ordering::SeqCst);
-        if !open {
-            self.lanes_changed();
-        }
-    }
-
-    /// A response from upstream is still streaming into some layer.
-    fn response_open(&self) -> bool {
-        !self.loan.torn_down.is_cancelled()
-            && self
-                .layers
-                .iter()
-                .any(|l| l.response_open.load(Ordering::SeqCst))
     }
 
     /// Layer `index` is forwarding: a forward of its has been accepted,
     /// whether or not the call that carries it has run.
     pub(crate) fn forward_requested(&self, index: usize) -> bool {
-        self.layers[index].state() == NextState::Pending
-    }
-
-    /// Layer `index` is gone before its forward ended: it failed, or roxy
-    /// gave it up (the layer above dropped it, the exchange ended). The
-    /// forward is given up with it, nothing of the layer's reads its
-    /// response, and it forwards nothing more.
-    pub(crate) fn layer_gone(&self, index: usize) {
-        self.layers[index].cancel.cancel();
-        self.layer_done(index);
-    }
-
-    fn set_next(&self, index: usize, state: NextState) {
-        self.layers[index].set(state);
-        self.lanes_changed();
-    }
-
-    /// Layer `index` is done: its handler returned, or its stream ended.
-    /// It forwards nothing more.
-    pub(crate) fn layer_done(&self, index: usize) {
-        self.layers[index].live.store(false, Ordering::SeqCst);
-        self.lanes_changed();
-    }
-
-    /// The response the client got is complete.
-    fn response_complete(&self) {
-        self.response_done.store(true, Ordering::SeqCst);
-        self.lanes_changed();
-    }
-
-    /// Something that decides the exchange's end moved: whoever waits on
-    /// the context is woken, and the request lane is snipped once the
-    /// response is complete and nothing upstream will consume the rest of
-    /// it: the core never entered, and nothing can still forward. The
-    /// client's lane is dropped, parked bypassed bodies included, so the
-    /// front drains or closes rather than waits on a reader that will not
-    /// come.
-    fn lanes_changed(&self) {
-        self.loan.changed();
-        if self.response_done.load(Ordering::SeqCst)
-            && !self.core_entered.load(Ordering::SeqCst)
-            && !self.can_forward()
-            && !self.snip.is_cancelled()
-        {
-            self.snip.cancel();
-            for index in 0..self.layers.len() {
-                subscribe::release_request(self, index);
-            }
-        }
+        self.layers[index].forwarded.load(Ordering::SeqCst)
     }
 
     /// Layer `index` is forwarding: its request is on its way to the next
-    /// layer. Marked here, before the call that carries it runs, so a
-    /// response completing meanwhile neither snips the lane nor lets the
-    /// record go.
+    /// layer. Marked before the call that carries it runs, so the answer
+    /// clock stops as the service forwards.
     pub(crate) fn forwarding(&self, index: usize) {
-        self.set_next(index, NextState::Pending);
-    }
-
-    /// Layer `index`'s forward was given up before it reached the next
-    /// layer.
-    pub(crate) fn forward_dropped(&self, index: usize) {
-        self.set_next(index, NextState::Abandoned);
+        self.layers[index].forwarded.store(true, Ordering::SeqCst);
     }
 
     /// The facts `metric-get` reads.
@@ -618,9 +461,14 @@ impl StackFlow {
     }
 
     /// The core relayed an upgrade; the stack's answer decides its fate. An
-    /// answer already given carries no relay: the upstream side is closed.
+    /// answer already on its way to the client carries no relay: the
+    /// upstream side is closed.
     fn relayed(&self, relay: ws::Relay) {
-        if self.decided.get().is_some() {
+        let answered = LaneId {
+            hop: 0,
+            dir: Dir::Res,
+        };
+        if self.chain().has_head(answered) {
             tokio::spawn(crate::exchange::close_upstream_ws(relay.upstream));
             return;
         }
@@ -641,6 +489,7 @@ impl StackFlow {
     /// The stack answered the `101`: the client side waits for the front.
     fn plumbed(&self, plumbing: ws::WsPlumbing) {
         *lock(&self.upgrade) = Upgrade::Plumbed(plumbing);
+        self.upgraded.cancel();
     }
 
     fn take_ws(&self) -> Option<ws::WsPlumbing> {
@@ -654,12 +503,11 @@ impl StackFlow {
         }
     }
 
-    /// Layer `index` answered: its forward's state now says whether the
-    /// answer is its own, and a response from below arriving from here on
-    /// has no head of the layer's to be spliced onto.
+    /// Layer `index` is answering: whether its answer is its own is read
+    /// now, and a response from upstream arriving from here on has no head
+    /// of the layer's to be spliced onto.
     pub(crate) fn layer_answered(&self, index: usize) {
-        let slot = &self.layers[index];
-        let _ = slot.answered.set(slot.state());
+        self.chain().layer_answering(index);
         subscribe::answered(self, index);
     }
 
@@ -670,19 +518,9 @@ impl StackFlow {
         drop(self.take_ws());
     }
 
-    /// The layer that answered: the outermost one whose `next` had not
-    /// returned the response from below when it answered (never called,
-    /// still pending, dropped), or has not now if it never answered.
-    /// `None` when every layer entered passed on what came from below, so
-    /// the response is the core's.
+    /// The layer whose own answer reached the client, if a layer's did.
     fn answered_by(&self) -> Option<usize> {
-        self.layers.iter().position(|l| {
-            let state = l.answered.get().copied().unwrap_or_else(|| l.state());
-            matches!(
-                state,
-                NextState::Entered | NextState::Pending | NextState::Abandoned
-            )
-        })
+        self.chain().answered_by()
     }
 
     /// Layer `i` ran in enforce mode: what left it is its own. An observer
@@ -804,500 +642,6 @@ pub(crate) fn emit_stack_error(st: &FlowMeta, layer: &str, e: &StackError, mode:
     });
 }
 
-/// 503 `layer:<name>`, `layer_error`; closes.
-fn layer_refusal(layer: &str) -> Refusal {
-    Refusal {
-        kind: RefusalKind::Deny,
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        message: "request blocked: an addon failed".to_owned(),
-        rule: Some(Decider::Layer(layer.to_owned())),
-        close: true,
-        reason: Some("layer_error".to_owned()),
-    }
-}
-
-/// Runs the exchange through the addon stack. The flow context is parked
-/// in the stack while the layers run, lent to the core if a request
-/// reaches it, and comes back to the front through the [`Reclaim`].
-pub(crate) async fn run<F: Front>(
-    front: &mut F,
-    cx: FlowCx,
-    mut req: CanonicalRequest,
-) -> (Reclaim, Outcome) {
-    let st = Arc::new(StackFlow::new(&cx, &req));
-    // A WebSocket is a long-lived exchange: once upgraded, the client's
-    // bytes are the request body and the upstream's the response body.
-    let client_tx = if st.is_upgrade() {
-        // The swap below would hide a body from `validate_upgrade_request`.
-        if req.body.known_length() != Some(0) {
-            let refusal = bad_upgrade_refusal(roxy_http::Reason::WsBadHandshake);
-            return (Reclaim::now(cx), Outcome::Refuse(refusal));
-        }
-        let (tx, body) = Body::channel(u64::MAX, None);
-        req.body = body;
-        Some(tx)
-    } else {
-        None
-    };
-    req.body = lanes::snipped(
-        &st,
-        attributed(&st, Side::Client, std::mem::take(&mut req.body)),
-    );
-    st.loan.park(cx);
-    // Held from here: a front that gives the exchange up mid-run (its task
-    // aborted with the connection) tears the stack down with it.
-    let reclaim = Reclaim::stack(st.clone());
-    let driven = front
-        .drive(Driven::new(
-            st.clone(),
-            enter(st.clone(), 0, to_layer_request(req)),
-        ))
-        .await;
-    let outcome = stack_outcome(&st, driven, client_tx);
-    match &outcome {
-        Outcome::Respond(_) | Outcome::Upgrade { .. } => {}
-        Outcome::Close(roxy_http::DriveError::Client(_)) => st.tear_down(CLIENT_GONE),
-        Outcome::Close(_) | Outcome::Refuse(_) => st.tear_down(ENDED),
-    }
-    (reclaim, outcome)
-}
-
-/// What the stack's answer means for the client. `client_tx` feeds the
-/// client's bytes into the stack after a `101`.
-fn stack_outcome(
-    st: &Arc<StackFlow>,
-    driven: Result<Result<LayerResponse, HostError>, roxy_http::DriveError>,
-    client_tx: Option<BodySender>,
-) -> Outcome {
-    let resp = match driven {
-        Err(e) => return Outcome::Close(e),
-        Ok(Err(_)) => return refuse(st),
-        Ok(Ok(r)) => r,
-    };
-    // A layer's answer is a final response; the one `1xx` with a meaning
-    // here is the `101` of a relayed upgrade, judged below.
-    if resp.status().is_informational() && resp.status() != StatusCode::SWITCHING_PROTOCOLS {
-        let err = LayerError::InvalidResponse(format!("{} is not a final response", resp.status()));
-        st.fail(&st.blamed(), err);
-        return refuse(st);
-    }
-    // Decided now: a layer that answered while its forward was below is
-    // the one that answered, whatever the core returns to it later. A
-    // layer that failed answered nothing: the refusal its failure earned
-    // did, and the record already says so.
-    let answered = st.answered_by().filter(|&i| st.failed_layer() != Some(i));
-    let _ = st.decided.set(answered);
-    let mut resp = resp;
-    // A `101`'s body is the upgraded stream for the client, not an HTTP
-    // body: keep it out of the response model.
-    let upgraded_body = (resp.status() == http::StatusCode::SWITCHING_PROTOCOLS)
-        .then(|| std::mem::take(resp.body_mut()));
-    let mut res = from_upstream_response(resp, &st.snap.limits);
-    // A body the front never writes (a bodiless status, a HEAD) ends
-    // nothing: the response is complete with its head.
-    if res.status_forbids_body() || st.client_head {
-        st.response_complete();
-    }
-    res.body = lanes::completing(
-        st,
-        lanes::gated(std::mem::take(&mut res.body), st.shared.sink.clone()),
-    );
-    if st.close.load(Ordering::Relaxed) {
-        res.meta.close = true;
-    }
-    let relay = st.take_relay();
-    if res.status == http::StatusCode::SWITCHING_PROTOCOLS {
-        if let (Some(relay), Some(client_tx)) = (relay, client_tx) {
-            // A layer cannot express `upgrade: websocket` (hop-by-hop); the
-            // core relayed a real upgrade, so restore it.
-            res.meta.upgrade = Some("websocket".to_owned());
-            let to_client = upgraded_body.unwrap_or_default();
-            st.plumbed(ws::WsPlumbing::new(
-                client_tx,
-                to_client,
-                relay.bottom,
-                st.shared.sink.clone(),
-            ));
-            // A failure from here on cuts the body (the codec then breaks
-            // the connection) and is logged as it is recorded.
-            st.attribution.head_out();
-            return Outcome::Upgrade {
-                res,
-                upstream: relay.upstream,
-                key: relay.key,
-            };
-        }
-        let err = LayerError::InvalidResponse("101 without an upgrade to relay".into());
-        st.fail(&st.blamed(), err);
-        return refuse(st);
-    }
-    if let Some(relay) = relay {
-        // The upstream switched protocols but the stack answered otherwise:
-        // no body can carry the relay, so close it and fail closed.
-        tokio::spawn(crate::exchange::close_upstream_ws(relay.upstream));
-        let err = LayerError::InvalidResponse(format!("{} over a relayed upgrade", res.status));
-        st.fail(&st.blamed(), err);
-        return refuse(st);
-    }
-    st.attribution.head_out();
-    Outcome::Respond(res)
-}
-
-/// The exchange's refusal before the response head, from the fault
-/// recorded: a layer's failure is logged and refused as its own; a request
-/// body that failed on its way in closes the connection as it would
-/// without a stack; the others are the refusals the core would give.
-fn refuse(st: &Arc<StackFlow>) -> Outcome {
-    match refusal_for_fault(st) {
-        Ok(refusal) => Outcome::Refuse(refusal),
-        Err(e) => Outcome::Close(e.into()),
-    }
-}
-
-/// The refusal the fault recorded earns, or the client's own parse error
-/// when the fault is the client's.
-fn refusal_for_fault(st: &Arc<StackFlow>) -> Result<Refusal, roxy_http::ParseError> {
-    let fault = st.attribution.fault().unwrap_or_else(|| {
-        // Every path that fails a layer records it, so this is a layer
-        // that returned an error without saying why.
-        let name = st.blamed();
-        st.fail(&name, LayerError::NoResponse);
-        Fault::Layer {
-            name,
-            err: LayerError::NoResponse.into(),
-        }
-    });
-    match &fault {
-        Fault::Layer { name, .. } => {
-            st.attribution.log();
-            Ok(layer_refusal(name))
-        }
-        Fault::Client(e) => Err(e.clone()),
-        Fault::UpstreamBody => Ok(Refusal::upstream(StatusCode::BAD_GATEWAY, fault.reason())),
-        Fault::Budget => Ok(Refusal::fail_closed(fault.reason())),
-    }
-}
-
-/// The refusal a failure below a layer earns, as a response on that
-/// layer's lane, recorded on the flow as the refusal the front would have
-/// written. `None` when the fault is the client's (the exchange is
-/// closing, and no layer answers it), or the record has already left the
-/// stack.
-async fn seeded_refusal(st: &Arc<StackFlow>) -> Option<LayerResponse> {
-    let refusal = refusal_for_fault(st).ok()?;
-    if refusal.close {
-        st.close.store(true, Ordering::Relaxed);
-    }
-    // The core has let go of the context by now: whatever failed below
-    // has returned, and with it the lease.
-    let mut cx = st.loan.returned().await?;
-    if cx.in_flight.is_some() {
-        cx.record_refusal_sample(&refusal);
-    }
-    let res = refusal_response(&mut cx, &refusal);
-    st.loan.give_back(cx);
-    Some(to_layer_response(res))
-}
-
-/// Runs layer `index` on `req`.
-pub(crate) fn enter(
-    st: Arc<StackFlow>,
-    index: usize,
-    req: LayerRequest,
-) -> BoxFuture<Result<LayerResponse, HostError>> {
-    Box::pin(async move {
-        let addon = st.snap.addons[index].clone();
-        let req = match select::selects(&st, index, &addon, req) {
-            Ok((true, req)) => req,
-            // Skipped: as if the layer passed both directions on unchanged.
-            Ok((false, req)) => return below(st, index, req).await,
-            Err(e) => {
-                st.fail(&addon.name, e);
-                return Err(HostError::new(format!("layer {} failed", addon.name)));
-            }
-        };
-        st.layers[index].ran.store(true, Ordering::SeqCst);
-        st.set_next(index, NextState::Entered);
-        let mut req = req;
-        // Layers see bodies decoded, from the first layer subscribed to the
-        // body; a body no layer reads is left as the client sent it.
-        if st.snap.http.decode_for_addons
-            && addon.subscribe.request == Part::Full
-            && !st.request_decoded.swap(true, Ordering::SeqCst)
-        {
-            decode::request(&st, &mut req, st.snap.limits.max_request_body_bytes);
-        }
-        if addon.mode == AddonMode::Observe {
-            return tee::observe(st, index, req).await;
-        }
-        let req = subscribe::detach_request(&st, index, req);
-        // Live until something says otherwise: the layer's own done signal
-        // once it has one, or this future being dropped before then.
-        st.layers[index].live.store(true, Ordering::SeqCst);
-        let mut live = Live {
-            st: st.clone(),
-            index,
-            armed: true,
-        };
-        let res = match &addon.kind {
-            AddonImpl::Wasm(layer) => {
-                let h = Arc::new(host::StackHost {
-                    st: st.clone(),
-                    index,
-                    observer: None,
-                    call: None,
-                });
-                match layer.handle(h, req).await {
-                    Ok(mut r) => {
-                        // The guest runs on after answering, and may still
-                        // forward, until its handler returns: kept running
-                        // whether or not the front writes its body, and
-                        // cancelled with the exchange.
-                        let running = r.extensions_mut().remove::<roxy_wasm::Running>();
-                        match r.extensions().get::<roxy_wasm::LayerOutcome>().cloned() {
-                            Some(outcome) => {
-                                let st = st.clone();
-                                tokio::spawn(async move {
-                                    let torn_down = st.torn_down();
-                                    let failed = tokio::select! {
-                                        biased;
-                                        r = outcome.wait() => r.is_err(),
-                                        () = torn_down.cancelled() => true,
-                                    };
-                                    drop(running);
-                                    if failed {
-                                        st.layer_gone(index);
-                                    } else {
-                                        st.layer_done(index);
-                                    }
-                                });
-                            }
-                            None => st.layer_done(index),
-                        }
-                        Ok(r)
-                    }
-                    // Recorded as it happened, through the host; an error
-                    // from before the exchange had a host (no instance,
-                    // say) is not.
-                    Err(e) => {
-                        st.fail(&addon.name, e);
-                        Err(HostError::new(format!("layer {} failed", addon.name)))
-                    }
-                }
-            }
-            // A service's stream ending marks it done.
-            AddonImpl::Service(svc) => service::handle(st.clone(), index, svc, req).await,
-        };
-        if res.is_err() {
-            // A failed layer forwards nothing more, any forward of its
-            // still running is given up, and the bodies parked for it are
-            // dropped: no answer of its will take them, and a response
-            // still open at it would hold the record.
-            st.layers[index].cancel.cancel();
-            subscribe::release(&st, index);
-        }
-        live.handed_over(res.is_ok());
-        res.map(|r| subscribe::reattach_response(&st, index, r))
-    })
-}
-
-/// Marks layer `index` done if the layer's future is dropped before the
-/// layer has a done signal of its own: the exchange ended while its stream
-/// was opening, say.
-struct Live {
-    st: Arc<StackFlow>,
-    index: usize,
-    armed: bool,
-}
-
-impl Live {
-    /// The layer answered, and its kind signals its end from here: a WASM
-    /// layer when its handler returns, a service when its stream ends. A
-    /// layer that failed is done now.
-    fn handed_over(&mut self, answered: bool) {
-        self.armed = false;
-        if !answered {
-            self.st.layer_done(self.index);
-        }
-    }
-}
-
-impl Drop for Live {
-    fn drop(&mut self) {
-        if self.armed {
-            self.st.layer_done(self.index);
-        }
-    }
-}
-
-/// What layer `index`'s `next` reaches: the next layer, or the core. What
-/// comes back is a response, whoever produced it: the upstream's, the
-/// rules' refusal, or the refusal a failure below earns, seeded here so
-/// the layers above see it as they would any response. Only the client's
-/// own failure comes back as an error: nothing answers a client whose
-/// request broke.
-pub(crate) fn below(
-    st: Arc<StackFlow>,
-    index: usize,
-    req: LayerRequest,
-) -> BoxFuture<Result<LayerResponse, HostError>> {
-    let guard = NextGuard::new(st.clone(), index);
-    let req = subscribe::reattach_request(&st, index, req);
-    let fut = if index + 1 < st.snap.addons.len() {
-        enter(st.clone(), index + 1, req)
-    } else {
-        Box::pin(core(st.clone(), index, req))
-    };
-    Box::pin(async move {
-        let cancelled = st.layers[index].cancel.clone();
-        let r = tokio::select! {
-            biased;
-            // The layer failed: nothing reads what its forward returns.
-            () = cancelled.cancelled() => Err(HostError::new("the layer failed")),
-            r = fut => match r {
-                Ok(r) => Ok(r),
-                Err(e) => match seeded_refusal(&st).await {
-                    Some(res) => Ok(res),
-                    None => Err(e),
-                },
-            },
-        };
-        // A skipped layer, or an observer, passes the response on whole;
-        // an enforce layer subscribed to the head gets only that.
-        let enforcing = st.layers[index].ran.load(Ordering::SeqCst)
-            && st.snap.addons[index].mode == AddonMode::Enforce;
-        let r = match r {
-            // A `101`'s body is the relayed socket, open for its life: not
-            // a response the record waits for.
-            Ok(res) if enforcing && res.status() != StatusCode::SWITCHING_PROTOCOLS => {
-                Ok(subscribe::detach_response(
-                    &st,
-                    index,
-                    res.map(|body| lanes::draining(&st, index, body)),
-                ))
-            }
-            Ok(res) if enforcing => Ok(subscribe::detach_response(&st, index, res)),
-            other => other,
-        };
-        // The response is open at the layer before the forward is marked
-        // resolved: whoever waits on the record never sees the forward
-        // done and no response streaming in between.
-        guard.settle(r.is_ok());
-        r
-    })
-}
-
-/// The client-side view the core needs when the "client" is the last
-/// layer: its body is a stream from the guest, with no codec to service.
-struct Detached;
-
-impl BodyIo for Detached {
-    fn collect<'a>(
-        &'a mut self,
-        body: &'a mut Body,
-        cap: u64,
-        meter: &'a mut (dyn FnMut(u64) -> bool + Send),
-        idle: Option<Duration>,
-    ) -> CollectFuture<'a, Result<Collected, roxy_http::DriveError>> {
-        Box::pin(async move { Ok(collect_prefix(body, cap, meter, idle).await) })
-    }
-}
-
-impl Front for Detached {
-    #[allow(clippy::manual_async_fn)] // the trait spells out the `Send` bound
-    fn drive<Fut>(
-        &mut self,
-        fut: Fut,
-    ) -> impl Future<Output = Result<Fut::Output, roxy_http::DriveError>> + Send
-    where
-        Fut: Future + Send,
-        Fut::Output: Send,
-    {
-        async move { Ok(fut.await) }
-    }
-}
-
-/// The exchange core on what the last layer (`index`) passed on, with the
-/// flow's own [`FlowCx`]: what the rules judge is the request that left
-/// the stack.
-async fn core(
-    st: Arc<StackFlow>,
-    index: usize,
-    req: LayerRequest,
-) -> Result<LayerResponse, HostError> {
-    let snap = st.snap.clone();
-    let layer = snap.addons[st.passed_on_by(index + 1).unwrap_or(index)]
-        .name
-        .clone();
-    let (req, stream) = ws::split_upgrade_stream(&st, req);
-    let creq = match from_layer_request(req, st.client_meta.clone(), &snap.limits, &snap.flags) {
-        Ok(r) => r,
-        Err(e) => {
-            st.fail(&layer, LayerError::InvalidRequest(e.to_string()));
-            return Err(HostError::new(format!("invalid request: {e}")));
-        }
-    };
-    let Some(mut lease) = st.lease() else {
-        st.fail(&layer, LayerError::NextCalledTwice);
-        return Err(HostError::new("the flow already reached the core"));
-    };
-    st.core_entered.store(true, Ordering::SeqCst);
-    let cx = lease.cx();
-    cx.layer_reads_bytes = st.reads_bytes();
-    cx.facts.request = Some(crate::pipeline::request_facts(&creq));
-    st.set_facts(&cx.facts);
-    let mut front = Detached;
-    let outcome = tokio::select! {
-        biased;
-        () = st.loan.torn_down.cancelled() => None,
-        o = crate::exchange::core(&mut front, cx, creq) => Some(o),
-    };
-    let Some(outcome) = outcome else {
-        // The lease records the abandonment as it goes back.
-        return Err(HostError::new(
-            "the layer answered without the upstream's response",
-        ));
-    };
-    lease.done = true;
-    let cx = lease.cx();
-    st.set_facts(&cx.facts);
-    match outcome {
-        Outcome::Respond(mut res) => {
-            res.body = attributed(&st, Side::Upstream, std::mem::take(&mut res.body));
-            // A response body no layer reads goes up as the origin sent it.
-            if snap.http.decode_for_addons && st.body_subscribed(crate::in_flight::Dir::Response) {
-                decode::response(&st, &mut res, snap.limits.max_response_body_bytes);
-            }
-            Ok(to_layer_response(res))
-        }
-        Outcome::Refuse(refusal) => {
-            if refusal.close {
-                st.close.store(true, Ordering::Relaxed);
-            }
-            if cx.in_flight.is_some() {
-                cx.record_refusal_sample(&refusal);
-            }
-            Ok(to_layer_response(refusal_response(cx, &refusal)))
-        }
-        // The body that failed was recorded where it entered the stack
-        // (the client's) or by the layer that produced it.
-        Outcome::Close(e) => Err(HostError::new(format!("request body failed: {e}"))),
-        Outcome::Upgrade {
-            mut res,
-            upstream,
-            key,
-        } => {
-            st.relayed(ws::Relay::new(
-                upstream,
-                key,
-                stream.unwrap_or_default(),
-                &mut res,
-            ));
-            Ok(to_layer_response(res))
-        }
-    }
-}
-
 pub(super) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -1305,17 +649,27 @@ pub(super) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// A flow through `kit`'s current snapshot, for tests that drive the
 /// stack's parts directly: a `GET http://up.test/` from a client on the
 /// proxy port.
+/// The chain's ends, held so the lanes stay open for as long as a test
+/// wants them.
 #[cfg(test)]
-pub(crate) fn test_flow(kit: &crate::testkit::Kit) -> (Arc<StackFlow>, FlowCx) {
+pub(crate) struct Ends {
+    #[allow(dead_code)]
+    pub(crate) edge: chain::EdgeIo,
+    pub(crate) layers: Vec<chain::LayerIo>,
+    pub(crate) core: chain::CoreIo,
+}
+
+#[cfg(test)]
+pub(crate) fn test_flow(kit: &crate::testkit::Kit) -> (Arc<StackFlow>, FlowCx, Ends) {
     use crate::listener::{ClientConn, ListenerInfo};
     use ulid::Ulid;
     let shared = kit.server.shared().clone();
     let snap = shared.snapshot();
     let req = http::Request::get("http://up.test/")
-        .body(Body::empty())
+        .body(roxy_http::Body::empty())
         .unwrap();
     let meta = RequestMeta::new(roxy_http::Version::H1_1, roxy_http::TargetForm::Absolute);
-    let creq = from_layer_request(req, meta, &snap.limits, &snap.flags).unwrap();
+    let creq = roxy_http::layer::from_layer_request(req, meta, &snap.limits, &snap.flags).unwrap();
     let client = ClientConn {
         id: Ulid::generate(),
         listener: Arc::new(ListenerInfo {
@@ -1328,14 +682,25 @@ pub(crate) fn test_flow(kit: &crate::testkit::Kit) -> (Arc<StackFlow>, FlowCx) {
     };
     let cx = FlowCx::new(shared, snap, client, None, &creq).unwrap();
     let st = Arc::new(StackFlow::new(&cx, &creq));
-    (st, cx)
+    let (chain, edge, layers, core) = client_edge::test_chain(&st);
+    assert!(st.chain.set(chain).is_ok());
+    (st, cx, Ends { edge, layers, core })
 }
 
 #[cfg(test)]
 mod tests {
+    use super::chain::{Head, Headless};
+    use super::client_edge::stack_outcome;
     use super::*;
+    use crate::exchange::Outcome;
     use crate::flowlog::REDACTED;
     use crate::testkit::{AddonDef, Kit, capture_logs};
+    use roxy_http::Body;
+    use roxy_wasm::LayerError;
+
+    fn cut(why: &str) -> client_edge::Arrival {
+        Err(Headless::Cut(why.to_owned()))
+    }
 
     /// A layer error is redacted once for both sinks, so a secret a guest
     /// quotes in its message reaches neither the operational log nor the
@@ -1348,7 +713,7 @@ mod tests {
             .addon(AddonDef::test_layer("a"))
             .start()
             .await;
-        let (st, _cx) = test_flow(&kit);
+        let (st, _cx, _ends) = test_flow(&kit);
         let e = LayerError::InvalidRequest(format!("header x-token: {secret}"));
         let logged = capture_logs(tracing::Level::INFO, || {
             emit_layer_error(&st.meta, "a", &e, AddonMode::Enforce);
@@ -1372,13 +737,15 @@ mod tests {
             .addon(AddonDef::test_layer("a"))
             .start()
             .await;
-        let (st, cx) = test_flow(&kit);
+        let (st, cx, ends) = test_flow(&kit);
         st.loan.park(cx);
+        // The lanes let go of unused: the exchange is over, not torn down.
+        drop(ends);
         let taken = Reclaim::stack(st.clone()).take().await;
         assert!(!st.torn_down().is_cancelled());
         drop(taken);
 
-        let (st, cx) = test_flow(&kit);
+        let (st, cx, _ends) = test_flow(&kit);
         st.loan.park(cx);
         drop(Reclaim::stack(st.clone()));
         assert!(st.torn_down().is_cancelled());
@@ -1393,15 +760,32 @@ mod tests {
             .addon(AddonDef::test_layer("a"))
             .start()
             .await;
-        let (st, _cx) = test_flow(&kit);
-        st.set_next(0, NextState::Pending);
+        let answer = |status: u16| {
+            http::Response::builder()
+                .status(status)
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0
+        };
+        let (st, _cx, mut ends) = test_flow(&kit);
+        let a = ends.layers.pop().unwrap();
+        a.stage.enforcing();
         st.layer_answered(0);
-        st.set_next(0, NextState::Resolved);
+        ends.core
+            .res_out
+            .whole(Head::Response(answer(200)), Body::empty());
+        a.res_out.whole(Head::Response(answer(403)), Body::empty());
         assert_eq!(st.answered_by(), Some(0));
 
-        let (st, _cx) = test_flow(&kit);
-        st.set_next(0, NextState::Resolved);
+        let (st, _cx, mut ends) = test_flow(&kit);
+        let a = ends.layers.pop().unwrap();
+        a.stage.enforcing();
+        ends.core
+            .res_out
+            .whole(Head::Response(answer(200)), Body::empty());
         st.layer_answered(0);
+        a.res_out.whole(Head::Response(answer(200)), Body::empty());
         assert_eq!(st.answered_by(), None, "the response from below, passed on");
     }
 
@@ -1417,7 +801,7 @@ mod tests {
             .addon(AddonDef::test_layer("a"))
             .start()
             .await;
-        let (_st, cx) = test_flow(&kit);
+        let (_st, cx, _ends) = test_flow(&kit);
         let e = MetricSourceError::KeyUnavailable(format!("key token={secret}"));
         let logged = capture_logs(tracing::Level::WARN, || {
             cx.metric_error(Stage::Head, &e);
@@ -1444,9 +828,9 @@ mod tests {
             .start()
             .await;
         let fault = || roxy_http::ParseError::new(roxy_http::Reason::BadChunkSize, "zz");
-        let failed = || Ok(Err(HostError::new("request body failed")));
+        let failed = || Ok(cut("request body failed"));
 
-        let (st, _cx) = test_flow(&kit);
+        let (st, _cx, _ends) = test_flow(&kit);
         st.attribution.record(Fault::Client(fault()));
         st.fail("a", LayerError::Trap("boom".into()));
         let out = stack_outcome(&st, failed(), None);
@@ -1456,7 +840,7 @@ mod tests {
         );
         assert!(st.blamed_layer().is_none(), "no layer is blamed");
 
-        let (st, _cx) = test_flow(&kit);
+        let (st, _cx, _ends) = test_flow(&kit);
         st.fail("a", LayerError::Trap("boom".into()));
         st.attribution.record(Fault::Client(fault()));
         let out = stack_outcome(&st, failed(), None);
@@ -1487,7 +871,7 @@ mod tests {
         };
 
         // Recorded before the head, logged as it goes out, once.
-        let (st, _) = test_flow(&kit);
+        let (st, _, _ends) = test_flow(&kit);
         st.fail("a", LayerError::Trap("early".into()));
         assert_eq!(logged(&kit), 0, "nothing carries it yet");
         st.attribution.head_out();
@@ -1496,7 +880,7 @@ mod tests {
         assert_eq!(logged(&kit), 1);
 
         // Recorded after the head: logged at once.
-        let (st, _) = test_flow(&kit);
+        let (st, _, _ends) = test_flow(&kit);
         st.attribution.head_out();
         st.fail("a", LayerError::NoResponse);
         assert_eq!(logged(&kit), 2);
@@ -1504,7 +888,7 @@ mod tests {
 
         // A client that went away: nothing to log, and it shadows what
         // the layers make of their bodies ending.
-        let (st, _) = test_flow(&kit);
+        let (st, _, _ends) = test_flow(&kit);
         st.attribution.head_out();
         st.fail("a", LayerError::Cancelled);
         st.fail("a", LayerError::Trap("on the cut".into()));
@@ -1528,28 +912,25 @@ mod tests {
                 .body(Body::empty())
                 .unwrap()
         };
-        let ran = |st: &StackFlow, i: usize| {
-            st.layers[i].ran.store(true, Ordering::SeqCst);
-            st.layers[i].set(NextState::Resolved);
-        };
+        let ran = |st: &StackFlow, i: usize| st.layers[i].ran.store(true, Ordering::SeqCst);
         let blamed = |st: &StackFlow| st.blamed_layer().expect("a failure");
 
         // What reaches `c`'s `when` was passed on by `a`, through `b`.
-        let (st, _) = test_flow(&kit);
+        let (st, _, _ends) = test_flow(&kit);
         ran(&st, 0);
         assert!(select::selects(&st, 2, &st.snap.addons[2], invalid()).is_err());
         assert_eq!(blamed(&st), "a");
 
         // Likewise what reaches the core below a skipped last layer.
-        let (st, _) = test_flow(&kit);
+        let (st, _, _ends) = test_flow(&kit);
         ran(&st, 0);
-        assert!(core(st.clone(), 2, invalid()).await.is_err());
+        assert!(core_edge::admit(&st, invalid()).is_none());
         assert_eq!(blamed(&st), "a");
 
         // A failure no layer recorded goes to the outermost that ran.
-        let (st, _cx) = test_flow(&kit);
+        let (st, _cx, _ends) = test_flow(&kit);
         ran(&st, 1);
-        let out = stack_outcome(&st, Ok(Err(HostError::new("x"))), None);
+        let out = stack_outcome(&st, Ok(cut("x")), None);
         assert!(
             matches!(&out, Outcome::Refuse(r) if r.rule == Some(Decider::Layer("b".into()))),
             "blames b"
@@ -1572,29 +953,26 @@ mod tests {
                 .body(Body::empty())
                 .unwrap()
         };
-        let ran = |st: &StackFlow, i: usize| {
-            st.layers[i].ran.store(true, Ordering::SeqCst);
-            st.layers[i].set(NextState::Resolved);
-        };
+        let ran = |st: &StackFlow, i: usize| st.layers[i].ran.store(true, Ordering::SeqCst);
         let blamed = |st: &StackFlow| st.blamed_layer().expect("a failure");
 
-        let (st, _) = test_flow(&kit);
+        let (st, _, _ends) = test_flow(&kit);
         ran(&st, 0);
         ran(&st, 1);
         assert!(select::selects(&st, 2, &st.snap.addons[2], invalid()).is_err());
         assert_eq!(blamed(&st), "a");
 
-        let (st, _) = test_flow(&kit);
+        let (st, _, _ends) = test_flow(&kit);
         ran(&st, 0);
         ran(&st, 1);
-        assert!(core(st.clone(), 2, invalid()).await.is_err());
+        assert!(core_edge::admit(&st, invalid()).is_none());
         assert_eq!(blamed(&st), "a");
 
         // A failure no layer recorded goes past an observer too.
-        let (st, _cx) = test_flow(&kit);
+        let (st, _cx, _ends) = test_flow(&kit);
         ran(&st, 1);
         ran(&st, 2);
-        let out = stack_outcome(&st, Ok(Err(HostError::new("x"))), None);
+        let out = stack_outcome(&st, Ok(cut("x")), None);
         assert!(
             matches!(&out, Outcome::Refuse(r) if r.rule == Some(Decider::Layer("c".into()))),
             "blames c"
@@ -1610,14 +988,14 @@ mod tests {
             .addon(AddonDef::test_layer("a"))
             .start()
             .await;
-        let (st, _cx) = test_flow(&kit);
+        let (st, _cx, _ends) = test_flow(&kit);
         st.layers[0].ran.store(true, Ordering::SeqCst);
-        st.layers[0].set(NextState::Resolved);
-        let resp = http::Response::builder()
-            .status(StatusCode::CONTINUE)
+        let (parts, body) = http::Response::builder()
+            .status(http::StatusCode::CONTINUE)
             .body(Body::empty())
-            .unwrap();
-        let out = stack_outcome(&st, Ok(Ok(resp)), None);
+            .unwrap()
+            .into_parts();
+        let out = stack_outcome(&st, Ok(Ok((Head::Response(parts), body))), None);
         assert!(
             matches!(&out, Outcome::Refuse(r) if r.rule == Some(Decider::Layer("a".into()))),
             "refused as a's"

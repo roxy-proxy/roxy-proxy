@@ -34,8 +34,14 @@ pub(crate) const MAX_HOST_CALLS_WAITING: usize = 64;
 pub(crate) struct Answers {
     /// `Err` once the stream has ended without a forward.
     pub forward: oneshot::Receiver<LayerRequest>,
-    pub answer: oneshot::Receiver<Result<LayerResponse, Unanswered>>,
+    /// The answer went where [`AnswerSink`] puts it, or will not come.
+    pub answer: oneshot::Receiver<Result<(), Unanswered>>,
 }
+
+/// Where the service's answer goes, as its head is parsed: on the layer's
+/// response lane, before the next message of the stream is read, so
+/// nothing the service sends after its answer finds the lane headless.
+pub(crate) type AnswerSink = Box<dyn FnOnce(LayerResponse) + Send>;
 
 /// One exchange on a connection.
 pub(crate) struct Stream {
@@ -77,7 +83,7 @@ pub(super) enum Phase {
     /// is the answer it owes. Neither orders against the other.
     Enforce {
         forward: Option<oneshot::Sender<LayerRequest>>,
-        answer: Option<oneshot::Sender<Result<LayerResponse, Unanswered>>>,
+        answer: Option<(AnswerSink, oneshot::Sender<Result<(), Unanswered>>)>,
     },
     /// Observe: nothing the service sends is taken, but its last message
     /// ends the stream as an enforce stream's does: its `response_end`,
@@ -111,7 +117,7 @@ struct Ending {
 
 /// The answer the service still owed when the stream ended, to be told
 /// why it will not come.
-type Pending = Option<oneshot::Sender<Result<LayerResponse, Unanswered>>>;
+type Pending = Option<oneshot::Sender<Result<(), Unanswered>>>;
 
 impl StreamState {
     pub(super) fn new(phase: Phase, slot: Option<Reservation>) -> Self {
@@ -179,7 +185,7 @@ impl StreamState {
         let pending = match std::mem::replace(&mut self.phase, ended) {
             // The forward, if none came, is dropped: the exchange learns
             // there is none.
-            Phase::Enforce { answer, .. } => answer,
+            Phase::Enforce { answer, .. } => answer.map(|(_, tx)| tx),
             Phase::Observing { .. } => None,
             Phase::Ended { observe_error } => {
                 self.phase = Phase::Ended { observe_error };
@@ -210,8 +216,9 @@ impl StreamState {
     fn answered(&mut self, r: LayerResponse) -> Result<(), ServiceError> {
         match &mut self.phase {
             Phase::Enforce { answer, .. } => match answer.take() {
-                Some(tx) => {
-                    let _ = tx.send(Ok(r));
+                Some((sink, tx)) => {
+                    sink(r);
+                    let _ = tx.send(Ok(()));
                     Ok(())
                 }
                 None => Err(ServiceError::Protocol("a second response".into())),
@@ -291,12 +298,7 @@ impl Stream {
         let (e, reset) = match end {
             // The service's last message: the layer forwards no more, and
             // a forward of its still running goes on to its end.
-            End::Quiet => {
-                if enforce {
-                    self.st.layer_done(self.index);
-                }
-                return true;
-            }
+            End::Quiet => return true,
             End::Failed { e, reset } => {
                 self.broken.store(true, Ordering::SeqCst);
                 let message = e.to_string();
@@ -314,16 +316,13 @@ impl Stream {
         // finish on a body aborted here (the core failing on the request
         // the service forwarded, say) before any answer is read, and a
         // forward given up below must not record its own end as the
-        // first fault.
+        // first fault. The layer is torn down with it: nothing of the
+        // service's reads what its forward returns.
         if let Unanswered::Service(e) = &e
             && enforce
         {
-            self.st.fail(&self.name(), StackError::Service(e.clone()));
-        }
-        // Failed or given up, nothing of the service's reads what its
-        // forward returns.
-        if enforce {
-            self.st.layer_gone(self.index);
+            self.st
+                .layer_failed(self.index, StackError::Service(e.clone()));
         }
         if let Some(message) = reset
             && self.wire.reset()
@@ -350,10 +349,9 @@ impl Stream {
         self.settle(End::Abandoned(why));
     }
 
-    /// The exchange was torn down under the stream: the service is told
-    /// why.
+    /// The layer was torn down under the stream: the service is told why.
     pub(crate) fn abandon(&self) {
-        self.reset(self.st.torn_down_why());
+        self.reset(self.st.layer_torn_down_why(self.index));
     }
 
     /// Resolves once the stream has ended, however it did.
@@ -872,6 +870,7 @@ pub(crate) async fn open(
     index: usize,
     svc: &ServiceSpec,
     mode: AddonMode,
+    sink: Option<AnswerSink>,
 ) -> Result<(Arc<Stream>, Option<Answers>), ServiceError> {
     let addon = &st.snap.addons[index];
     let spec = addon
@@ -918,6 +917,9 @@ pub(crate) async fn open(
             },
         ),
         AddonMode::Enforce => {
+            let sink = sink.ok_or_else(|| {
+                ServiceError::Connect("an enforce stream needs somewhere to answer".into())
+            })?;
             let (forward_tx, forward_rx) = oneshot::channel();
             let (answer_tx, answer_rx) = oneshot::channel();
             (
@@ -927,7 +929,7 @@ pub(crate) async fn open(
                 }),
                 Phase::Enforce {
                     forward: Some(forward_tx),
-                    answer: Some(answer_tx),
+                    answer: Some((sink, answer_tx)),
                 },
             )
         }
@@ -1001,7 +1003,7 @@ mod tests {
 
     type Receivers = (
         oneshot::Receiver<LayerRequest>,
-        oneshot::Receiver<Result<LayerResponse, Unanswered>>,
+        oneshot::Receiver<Result<(), Unanswered>>,
     );
 
     /// An enforce stream's state as opened, with the exchange's ends of
@@ -1011,7 +1013,7 @@ mod tests {
         let (answer_tx, answer) = oneshot::channel();
         let phase = Phase::Enforce {
             forward: Some(forward_tx),
-            answer: Some(answer_tx),
+            answer: Some((Box::new(drop), answer_tx)),
         };
         (StreamState::new(phase, None), (forward, answer))
     }
@@ -1099,7 +1101,7 @@ mod tests {
     fn each_head_comes_once_in_either_order() {
         let (mut s, (forward, mut answer)) = enforce();
         s.answered(response()).unwrap();
-        assert!(matches!(answer.try_recv(), Ok(Ok(_))));
+        assert!(matches!(answer.try_recv(), Ok(Ok(()))));
         s.forwarded().unwrap().send(request()).ok().unwrap();
         assert!(
             forward.blocking_recv().is_ok(),

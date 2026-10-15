@@ -106,13 +106,6 @@ pub(super) fn reattach_request(
     req.map(|own| splice(st, index, Dir::Request, own, body))
 }
 
-/// Drops a request body still parked at layer `index`: nothing will pass
-/// its head on, so the body goes the way of one a layer dropped unread.
-pub(super) fn release_request(st: &StackFlow, index: usize) {
-    let parked = lock(&st.layers[index].bypass).request.take();
-    drop(parked);
-}
-
 /// Drops whatever is parked at layer `index`, and parks nothing more there:
 /// the layer failed, or the exchange is being torn down, so no answer of
 /// the layer's will take a body back. Dropped outside the lock: a body's
@@ -288,12 +281,12 @@ mod tests {
                 .body(Body::from_bytes("from below"))
                 .unwrap()
         };
-        let (st, _cx) = crate::addons::test_flow(&kit);
+        let (st, _cx, _ends) = crate::addons::test_flow(&kit);
         answered(&st, 0);
         drop(detach_response(&st, 0, from_below()));
         assert!(lock(&st.layers[0].bypass).response.is_none());
 
-        let (st, _cx) = crate::addons::test_flow(&kit);
+        let (st, _cx, _ends) = crate::addons::test_flow(&kit);
         drop(detach_response(&st, 0, from_below()));
         answered(&st, 0);
         assert!(lock(&st.layers[0].bypass).response.is_some());

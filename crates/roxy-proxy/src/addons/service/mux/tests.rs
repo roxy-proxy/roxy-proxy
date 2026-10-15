@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use roxy_http::{Body, BodyError};
+use roxy_wasm::LayerResponse;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -41,7 +42,12 @@ fn failed_link() -> Arc<Link> {
 /// An enforce stream on a link with nothing behind it, with the
 /// answers an exchange would wait on. What the stream sends goes
 /// nowhere.
-async fn lone_stream() -> (Arc<Stream>, Answers, crate::testkit::Kit) {
+async fn lone_stream() -> (
+    Arc<Stream>,
+    Answers,
+    oneshot::Receiver<LayerResponse>,
+    crate::testkit::Kit,
+) {
     lone_stream_of(
         testing::addon("s", "pass", AddonMode::Enforce, |_| {}),
         None,
@@ -54,16 +60,27 @@ async fn lone_stream() -> (Arc<Stream>, Answers, crate::testkit::Kit) {
 async fn lone_stream_of(
     addon: Arc<AddonSpec>,
     slot: Option<Reservation>,
-) -> (Arc<Stream>, Answers, crate::testkit::Kit) {
+) -> (
+    Arc<Stream>,
+    Answers,
+    oneshot::Receiver<LayerResponse>,
+    crate::testkit::Kit,
+) {
     let mode = addon.mode;
     let kit = testing::kit(ALLOW_UP, vec![addon]).await;
-    let (st, _cx) = crate::addons::test_flow(&kit);
+    let (st, _cx, _ends) = crate::addons::test_flow(&kit);
     let (forward_tx, forward) = oneshot::channel();
     let (answer_tx, answer) = oneshot::channel();
+    let (response_tx, response) = oneshot::channel();
     let phase = match mode {
         AddonMode::Enforce => Phase::Enforce {
             forward: Some(forward_tx),
-            answer: Some(answer_tx),
+            answer: Some((
+                Box::new(move |res| {
+                    let _ = response_tx.send(res);
+                }),
+                answer_tx,
+            )),
         },
         AddonMode::Observe => Phase::Observing {
             forwarding: false,
@@ -86,7 +103,7 @@ async fn lone_stream_of(
         draining: Mutex::new(None),
     });
     lock(&link.shared.streams).open.insert(1, stream.clone());
-    (stream, Answers { forward, answer }, kit)
+    (stream, Answers { forward, answer }, response, kit)
 }
 
 fn request_head() -> In {
@@ -102,7 +119,7 @@ fn request_head() -> In {
 /// consumer, and the stream ends once both have.
 #[tokio::test]
 async fn a_response_head_arrives_while_the_request_body_streams() {
-    let (stream, answers, _kit) = lone_stream().await;
+    let (stream, answers, response, _kit) = lone_stream().await;
     stream.control(request_head());
     let req = answers.forward.await.expect("the request is forwarded");
     stream.bytes(Dir::Request, b"up");
@@ -110,11 +127,12 @@ async fn a_response_head_arrives_while_the_request_body_streams() {
         status: 200,
         headers: Vec::new(),
     });
-    let res = tokio::time::timeout(Duration::from_millis(100), answers.answer)
+    tokio::time::timeout(Duration::from_millis(100), answers.answer)
         .await
         .expect("the response head is not held behind the request body")
         .unwrap()
         .unwrap();
+    let res = response.await.unwrap();
     assert_eq!(res.status(), 200);
     stream.bytes(Dir::Response, b"down");
     stream.control(In::ResponseEnd { error: None });
@@ -139,7 +157,7 @@ async fn a_response_head_arrives_while_the_request_body_streams() {
 /// exchange it is a protocol violation, like any status below 200.
 #[tokio::test]
 async fn a_101_on_an_exchange_that_is_not_an_upgrade_fails_the_stream() {
-    let (stream, answers, _kit) = lone_stream().await;
+    let (stream, answers, _response, _kit) = lone_stream().await;
     stream.control(request_head());
     let _req = answers.forward.await.expect("the request is forwarded");
     stream.control(In::Response {
@@ -156,7 +174,7 @@ async fn a_101_on_an_exchange_that_is_not_an_upgrade_fails_the_stream() {
 /// forwarded.
 #[tokio::test]
 async fn an_invalid_request_head_fails_the_answer() {
-    let (stream, answers, _kit) = lone_stream().await;
+    let (stream, answers, _response, _kit) = lone_stream().await;
     stream.control(In::Request {
         method: "GET".to_owned(),
         url: "http://up.test/".to_owned(),
@@ -179,7 +197,7 @@ fn fields(n: usize) -> Vec<(String, String)> {
 /// head, and the stream ends rather than the connection's reader.
 #[tokio::test]
 async fn a_head_with_more_than_max_headers_fields_fails_the_stream() {
-    let (stream, answers, _kit) = lone_stream().await;
+    let (stream, answers, _response, _kit) = lone_stream().await;
     stream.control(In::Request {
         method: "GET".to_owned(),
         url: "http://up.test/".to_owned(),
@@ -195,7 +213,7 @@ async fn a_head_with_more_than_max_headers_fields_fails_the_stream() {
         "service protocol violation: 101 header fields, more than max_headers (100)"
     );
 
-    let (stream, answers, _kit) = lone_stream().await;
+    let (stream, answers, _response, _kit) = lone_stream().await;
     stream.control(request_head());
     let _req = answers.forward.await.expect("the request is forwarded");
     stream.control(In::Response {
@@ -211,7 +229,7 @@ async fn a_head_with_more_than_max_headers_fields_fails_the_stream() {
 /// while only the request body is being fed fail the stream.
 #[tokio::test]
 async fn bytes_of_a_body_without_a_head_fail_the_stream() {
-    let (stream, answers, _kit) = lone_stream().await;
+    let (stream, answers, _response, _kit) = lone_stream().await;
     stream.control(request_head());
     let req = answers.forward.await.expect("the request is forwarded");
     stream.bytes(Dir::Response, b"early");
@@ -232,7 +250,7 @@ async fn bytes_of_a_body_without_a_head_fail_the_stream() {
 #[tokio::test]
 async fn a_body_failing_on_its_way_to_the_service_ends_its_lane_only() {
     use crate::addons::attribution::{Fault, Side, attributed};
-    let (stream, mut answers, _kit) = lone_stream().await;
+    let (stream, mut answers, _response, _kit) = lone_stream().await;
     let (tx, body) = Body::channel(u64::MAX, None);
     tx.abort(BodyError::Incomplete);
     let body = attributed(&stream.st, Side::Client, body);
@@ -261,7 +279,7 @@ async fn a_call_queued_before_the_end_still_runs() {
         testing::addon("s", "pass", AddonMode::Enforce, |_| {}),
         &[roxy_wasm::Capability::Record],
     );
-    let (stream, _answers, kit) = lone_stream_of(addon, None).await;
+    let (stream, _answers, _response, kit) = lone_stream_of(addon, None).await;
     stream.control(In::Call(Call::Record {
         id: 7,
         kind: "late".to_owned(),
@@ -293,7 +311,7 @@ async fn an_ended_stream_keeps_its_place_until_its_calls_have_run() {
         testing::addon("s", "pass", AddonMode::Observe, |_| {}),
         &[roxy_wasm::Capability::Record],
     );
-    let (stream, _answers, kit) = lone_stream_of(addon, Some(slot)).await;
+    let (stream, _answers, _response, kit) = lone_stream_of(addon, Some(slot)).await;
     stream.control(In::Call(Call::Record {
         id: 1,
         kind: "late".to_owned(),
@@ -319,7 +337,7 @@ async fn a_call_after_the_end_is_dropped() {
         testing::addon("s", "pass", AddonMode::Observe, |_| {}),
         &[roxy_wasm::Capability::Record],
     );
-    let (stream, _answers, kit) = lone_stream_of(addon, None).await;
+    let (stream, _answers, _response, kit) = lone_stream_of(addon, None).await;
     stream.reset("the exchange ended");
     stream.control(In::Call(Call::Record {
         id: 1,
@@ -351,7 +369,7 @@ async fn a_call_failing_after_the_end_is_logged() {
         testing::addon("s", "pass", AddonMode::Observe, |_| {}),
         &[roxy_wasm::Capability::Record],
     );
-    let (stream, _answers, kit) = lone_stream_of(addon, None).await;
+    let (stream, _answers, _response, kit) = lone_stream_of(addon, None).await;
     stream.control(In::Call(Call::StateGet {
         id: 9,
         key: "k".to_owned(),
@@ -384,7 +402,7 @@ async fn a_call_failing_after_the_end_is_logged() {
 /// more is the service's protocol error, and fails the stream.
 #[tokio::test]
 async fn more_calls_waiting_than_the_cap_fail_the_stream() {
-    let (stream, answers, _kit) = lone_stream().await;
+    let (stream, answers, _response, _kit) = lone_stream().await;
     let get = |id| {
         In::Call(Call::StateGet {
             id,
@@ -507,20 +525,26 @@ async fn a_reset_never_overtakes_its_open() {
         })],
     )
     .await;
-    let (st, _cx) = crate::addons::test_flow(&kit);
+    let (st, _cx, _ends) = crate::addons::test_flow(&kit);
     let snap = st.snap.clone();
     let AddonImpl::Service(svc) = &snap.addons[0].kind else {
         panic!("a service layer");
     };
 
-    let (first, _) = open(&st, 0, svc, AddonMode::Enforce).await.unwrap();
+    let (first, _) = open(&st, 0, svc, AddonMode::Enforce, Some(Box::new(drop)))
+        .await
+        .unwrap();
     // The service reads nothing until its pause is over.
     fill(&first).await;
     // Queued at the back once the writer moves again.
-    let (second, _) = open(&st, 0, svc, AddonMode::Enforce).await.unwrap();
+    let (second, _) = open(&st, 0, svc, AddonMode::Enforce, Some(Box::new(drop)))
+        .await
+        .unwrap();
     second.reset("the exchange ended");
     // Everything before this is on the wire once its `open` is.
-    let (third, _) = open(&st, 0, svc, AddonMode::Enforce).await.unwrap();
+    let (third, _) = open(&st, 0, svc, AddonMode::Enforce, Some(Box::new(drop)))
+        .await
+        .unwrap();
 
     let log = kit.upstream.service();
     let opened = |id: u32| log.opens().iter().any(|o| o["stream"] == id);
@@ -553,18 +577,20 @@ async fn an_open_given_up_mid_send_releases_its_place() {
         })],
     )
     .await;
-    let (st, _cx) = crate::addons::test_flow(&kit);
+    let (st, _cx, _ends) = crate::addons::test_flow(&kit);
     let snap = st.snap.clone();
     let AddonImpl::Service(svc) = &snap.addons[0].kind else {
         panic!("a service layer");
     };
 
-    let (first, _) = open(&st, 0, svc, AddonMode::Enforce).await.unwrap();
+    let (first, _) = open(&st, 0, svc, AddonMode::Enforce, Some(Box::new(drop)))
+        .await
+        .unwrap();
     // The service never reads.
     fill(&first).await;
     let given_up = tokio::time::timeout(
         Duration::from_millis(100),
-        open(&st, 0, svc, AddonMode::Enforce),
+        open(&st, 0, svc, AddonMode::Enforce, Some(Box::new(drop))),
     )
     .await;
     assert!(given_up.is_err(), "the open message cannot go");

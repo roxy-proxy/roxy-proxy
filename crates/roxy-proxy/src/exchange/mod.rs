@@ -158,7 +158,7 @@ where
             reclaim.tear_down(crate::addons::CLIENT_GONE);
         }
         Err(_) => reclaim.tear_down(crate::addons::ENDED),
-        Ok(()) => reclaim.response_complete(),
+        Ok(()) => reclaim.response_written(),
     }
     let mut cx = Box::new(reclaim.take().await);
     cx.record.response_status = Some(status);

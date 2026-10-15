@@ -34,19 +34,21 @@
 mod host;
 mod mux;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use http::{HeaderMap, HeaderName, HeaderValue};
 use roxy_http::Body;
-use roxy_wasm::{HostError, LayerError, LayerRequest, LayerResponse, LogLevel};
+use roxy_wasm::{LayerError, LayerRequest, LayerResponse, LogLevel};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::{oneshot, watch};
+use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
 
+use super::chain::{Head, LaneTx};
 use super::tee::CopyCut;
-use super::{AddonMode, StackError, StackFlow, Subscription};
+use super::{AddonMode, StackFlow, Subscription, lock, subscribe};
 use crate::in_flight::Dir;
 
 pub(crate) use mux::Pools;
@@ -417,20 +419,13 @@ fn declared_length(h: &HeaderMap) -> Result<Option<u64>, ServiceError> {
 
 /// Runs enforce-mode service layer `index` on `req`.
 pub(super) async fn handle(
-    st: Arc<StackFlow>,
+    st: &Arc<StackFlow>,
     index: usize,
     svc: &ServiceSpec,
     req: LayerRequest,
-) -> Result<LayerResponse, HostError> {
-    let name = st.snap.addons[index].name.clone();
-    match run(&st, index, svc, req).await {
-        Ok(r) => Ok(r),
-        Err(Unanswered::Abandoned(why)) => Err(HostError::new(why)),
-        Err(Unanswered::Service(e)) => {
-            st.fail(&name, StackError::Service(e));
-            Err(HostError::new(format!("service layer {name} failed")))
-        }
-    }
+    res_out: Arc<Mutex<Option<LaneTx>>>,
+) -> Result<JoinHandle<()>, Unanswered> {
+    run(st, index, svc, req, res_out).await
 }
 
 /// The head's fields, plus `content-length` when the body's length is
@@ -462,15 +457,28 @@ fn response_head(parts: &http::response::Parts, body: &Body) -> Out {
     }
 }
 
+/// Runs the service until it has answered on `res_out`; the task
+/// returned attends its stream to the end.
 async fn run(
     st: &Arc<StackFlow>,
     index: usize,
     svc: &ServiceSpec,
     req: LayerRequest,
-) -> Result<LayerResponse, Unanswered> {
+    res_out: Arc<Mutex<Option<LaneTx>>>,
+) -> Result<JoinHandle<()>, Unanswered> {
+    let answer_to: mux::AnswerSink = {
+        let st = st.clone();
+        Box::new(move |res: LayerResponse| {
+            if let Some(res_out) = lock(&res_out).take() {
+                let res = subscribe::reattach_response(&st, index, res);
+                let (parts, body) = res.into_parts();
+                res_out.whole(Head::Response(parts), body);
+            }
+        })
+    };
     let (stream, answers) = tokio::time::timeout(
         svc.first_byte_timeout,
-        mux::open(st, index, svc, AddonMode::Enforce),
+        mux::open(st, index, svc, AddonMode::Enforce, Some(answer_to)),
     )
     .await
     .map_err(|_| ServiceError::Timeout("first_byte_timeout"))??;
@@ -488,7 +496,7 @@ async fn run(
     let s = stream.clone();
     let head = request_head(&parts, &body);
     tokio::spawn(async move { s.pump(Dir::Request, head, body).await });
-    tokio::spawn(attend(
+    let attended = tokio::spawn(attend(
         st.clone(),
         index,
         stream.clone(),
@@ -496,7 +504,7 @@ async fn run(
         clock.clone(),
     ));
 
-    let res = match clock
+    match clock
         .answer_by(answers.answer, || st.forward_requested(index))
         .await
     {
@@ -508,14 +516,14 @@ async fn run(
             guard.disarm();
             return Err(e.into());
         }
-    };
+    }
     guard.disarm();
-    Ok(res)
+    Ok(attended)
 }
 
 /// Attends the stream for the life of the exchange: runs the request lane
 /// below the service, then stays until the stream has ended (the service
-/// may hold a body open long after its forward is through). The exchange
+/// may hold a body open long after its forward is through). The layer
 /// being torn down before that resets the stream, whatever the lane is
 /// doing: nothing more happens on it.
 async fn attend(
@@ -525,7 +533,7 @@ async fn attend(
     forward: oneshot::Receiver<LayerRequest>,
     clock: Clock,
 ) {
-    let torn_down = st.torn_down();
+    let torn_down = st.layer_torn_down(index);
     let lane = async {
         forward_lane(&st, index, &stream, forward, &clock).await;
         stream.until_ended().await;
@@ -559,7 +567,6 @@ async fn forward_lane(
     // gone) has told the service nothing more happens on it. One that
     // ended on the service's last message has not: the forward runs.
     if stream.is_broken() {
-        st.forward_dropped(index);
         return;
     }
     clock.stop();
@@ -697,7 +704,7 @@ pub(super) async fn observe(
     let start = TokioInstant::now();
     let opened = tokio::time::timeout_at(
         start + svc.first_byte_timeout,
-        mux::open(st, index, svc, AddonMode::Observe),
+        mux::open(st, index, svc, AddonMode::Observe, None),
     )
     .await
     .unwrap_or(Err(ServiceError::Timeout("first_byte_timeout")));

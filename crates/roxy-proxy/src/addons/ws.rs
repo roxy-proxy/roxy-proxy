@@ -18,7 +18,7 @@ use roxy_wasm::LayerRequest;
 use tokio::io::{AsyncRead, ReadBuf};
 
 use super::StackFlow;
-use super::lanes::gated;
+use super::client_edge::gated;
 use crate::flowlog::FlowSink;
 use crate::io::BoxIo;
 use crate::server::Snapshot;

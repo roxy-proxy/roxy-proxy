@@ -29,6 +29,7 @@ use roxy_wasm::{HostError, LayerError, LayerRequest, LayerResponse};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use super::chain::Headless;
 use super::{AddonSpec, Part, StackFlow};
 use crate::budget::{self, BufferLease};
 use crate::flowlog::FlowEvent;
@@ -381,7 +382,7 @@ pub(crate) async fn observe(
     st: Arc<StackFlow>,
     index: usize,
     req: LayerRequest,
-) -> Result<LayerResponse, HostError> {
+) -> Result<LayerResponse, Headless> {
     let addon = st.snap.addons[index].clone();
     let (parts, body) = req.into_parts();
     let (real_body, copy_body, request_lag, cut) = copy_for(&st, &addon, Dir::Request, body);
@@ -477,8 +478,8 @@ async fn forward(
     addon: &AddonSpec,
     real_req: LayerRequest,
     tx: oneshot::Sender<Result<LayerResponse, HostError>>,
-) -> Result<LayerResponse, HostError> {
-    match super::below(st.clone(), index, real_req).await {
+) -> Result<LayerResponse, Headless> {
+    match super::layer::below_lanes(&st, index, Ok(real_req)).await {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
             let (real_body, copy_body, _lag, cut) = copy_for(&st, addon, Dir::Response, body);
@@ -490,7 +491,7 @@ async fn forward(
             Ok(http::Response::from_parts(parts, real_body))
         }
         Err(e) => {
-            let _ = tx.send(Err(e.clone()));
+            let _ = tx.send(Err(HostError::new(e.to_string())));
             Err(e)
         }
     }

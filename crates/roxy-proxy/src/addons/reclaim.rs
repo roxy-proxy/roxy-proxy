@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Notify;
-use tokio_util::sync::CancellationToken;
 
 use super::{StackFlow, lock};
 use crate::pipeline::FlowCx;
@@ -49,9 +48,6 @@ pub(super) struct Loan {
     /// Something a waiter checks has changed: the context came back, or a
     /// layer's part in the exchange moved on.
     changed: Notify,
-    /// The exchange is being torn down: whatever the stack still runs
-    /// stops.
-    pub(super) torn_down: CancellationToken,
     /// The front took the context back: nothing in the stack sees it
     /// again.
     gone: AtomicBool,
@@ -62,7 +58,6 @@ impl Loan {
         Self {
             cx: std::sync::Mutex::new(None),
             changed: Notify::new(),
-            torn_down: CancellationToken::new(),
             gone: AtomicBool::new(false),
         }
     }
@@ -184,9 +179,9 @@ impl Reclaim {
 
     /// The response has been written, whether or not its body was polled
     /// to its end.
-    pub(crate) fn response_complete(&self) {
+    pub(crate) fn response_written(&self) {
         if let Reclaim::Stack(held) = self {
-            held.st.response_complete();
+            held.st.response_written();
         }
     }
 
