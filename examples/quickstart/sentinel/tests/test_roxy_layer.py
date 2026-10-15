@@ -105,10 +105,11 @@ async def test_a_forward_awaited_after_the_streams_end_fails() -> None:
     assert stray_tasks(roxy.task) == set()
 
 
-async def test_a_call_awaited_after_the_streams_end_fails() -> None:
-    """roxy runs a call sent before the stream's end but cannot answer it:
-    a handler that sends its last message and then awaits the call gets a
-    `ProtocolError` at once rather than waiting forever."""
+async def test_a_call_awaited_after_the_answer_is_still_answered() -> None:
+    """An answer is not the handler's last message: the request lane ends
+    only when the handler returns without forwarding. A call awaited after
+    the answer is answered by roxy as usual, and the stream ends on the
+    `request_end` the module sends for the handler."""
     outcome: list[BaseException | None] = []
 
     async def respond_then_await(ex: Exchange) -> None:
@@ -124,9 +125,12 @@ async def test_a_call_awaited_after_the_streams_end_fails() -> None:
 
     roxy = FakeRoxy(respond_then_await)
     roxy.open(1)
-    assert (await roxy.ws.next_sent())["type"] == "record"
+    record = await roxy.ws.next_sent()
+    assert record["type"] == "record"
     assert (await roxy.ws.next_sent())["type"] == "response"
     assert (await roxy.ws.next_sent())["type"] == "response_end"
+    roxy.ws.control(1, "result", id=record["id"], value=None)
+    assert (await roxy.ws.next_sent())["type"] == "request_end"
     await roxy.until_closed(1)
-    assert outcome and isinstance(outcome[0], ProtocolError), outcome
+    assert outcome == [None], outcome
     assert stray_tasks(roxy.task) == set()
