@@ -105,6 +105,23 @@ async fn a_connect_is_accepted_and_the_request_inside_decided() {
 
 // ---- request framing ------------------------------------------------------
 
+/// A bodiless GET keeps its absent framing when delivered to an HTTP/1 origin.
+#[tokio::test]
+async fn a_bodiless_get_reaches_the_origin_without_framing_headers() {
+    let kit = Kit::builder().start().await;
+    let answer = kit.h1().await.call("GET", "/x", &[], b"").await;
+    assert_eq!(answer.status, 200);
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].version, http::Version::HTTP_11);
+    assert!(
+        !seen[0].headers.contains_key("content-length"),
+        "{:?}",
+        seen[0]
+    );
+    assert!(!seen[0].headers.contains_key("transfer-encoding"));
+    assert_eq!(seen[0].complete, Some(true));
+}
+
 #[tokio::test]
 async fn expect_100_continue_is_answered_then_the_body_forwarded() {
     let kit = Kit::builder().start().await;

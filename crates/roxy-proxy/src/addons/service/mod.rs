@@ -470,7 +470,17 @@ pub(super) async fn run(
         answer,
     } = ends;
     let torn_down = stage.torn_down();
-    let held_request = Arc::new(Mutex::new(None));
+    let subscribe = st.snap.addons[index].subscribe;
+    let (parts, body) = req.into_parts();
+    let head = request_head(&parts, &body);
+    // A service may forward as soon as it sees open. Park the bypassed
+    // body before publishing the stream, so that forward cannot miss it.
+    let (kept, body) = if subscribe.request == Part::Head {
+        (Some(body), Body::empty())
+    } else {
+        (None, body)
+    };
+    let held_request = Arc::new(Mutex::new(kept));
     let held_response = Arc::new(Mutex::new(None));
     // The lanes stay here until the stream takes them: a stream that
     // never opens leaves them to the fault recorded for it.
@@ -500,13 +510,8 @@ pub(super) async fn run(
     // The service's clock starts with the request head, however long
     // getting the stream took.
     let clock = Clock::new(svc.first_byte_timeout);
-    let subscribe = st.snap.addons[index].subscribe;
-    let request = tokio::spawn(pump_request(
-        stream.clone(),
-        req,
-        subscribe.request == Part::Head,
-        held_request,
-    ));
+    let request_stream = stream.clone();
+    let request = tokio::spawn(async move { request_stream.pump(Dir::Request, head, body).await });
     let response = tokio::spawn(pump_response(
         stream.clone(),
         res_in,
@@ -531,27 +536,6 @@ pub(super) async fn run(
     response.abort();
 }
 
-/// Streams `req` to the service on its request lane. For a head-only
-/// subscription the body stays with roxy, to go on with the head the
-/// service forwards.
-async fn pump_request(
-    stream: Arc<mux::Stream>,
-    req: LayerRequest,
-    head_only: bool,
-    kept: Arc<Mutex<Option<Body>>>,
-) {
-    let (parts, body) = req.into_parts();
-    let head = request_head(&parts, &body);
-    if head_only {
-        *lock(&kept) = Some(body);
-        if stream.send(&head).await {
-            stream.send(&Out::RequestEnd { error: None }).await;
-        }
-        return;
-    }
-    stream.pump(Dir::Request, head, body).await;
-}
-
 /// Streams the response from upstream to the service on its response
 /// lane, as soon as it arrives, however far the client's upload has got;
 /// the service's clock restarts with it. A lane that ends without a head
@@ -563,28 +547,35 @@ async fn pump_response(
     kept: Arc<Mutex<Option<(http::StatusCode, Body)>>>,
     clock: Clock,
 ) {
-    match res_in.head().await {
-        Ok((Head::Response(parts), body)) => {
-            clock.restart();
-            let head = response_head(&parts, &body);
-            if head_only {
-                *lock(&kept) = Some((parts.status, body));
-                if stream.send(&head).await {
-                    stream.send(&Out::ResponseEnd { error: None }).await;
+    let pump = async {
+        match res_in.head().await {
+            Ok((Head::Response(parts), body)) => {
+                clock.restart();
+                let head = response_head(&parts, &body);
+                if head_only {
+                    *lock(&kept) = Some((parts.status, body));
+                    if stream.send(&head).await {
+                        stream.send(&Out::ResponseEnd { error: None }).await;
+                    }
+                } else {
+                    stream.pump(Dir::Response, head, body).await;
                 }
-                return;
             }
-            stream.pump(Dir::Response, head, body).await;
+            Ok((Head::Request(_), _)) => unreachable!("a response lane carries responses"),
+            Err(Headless::Ended) => {
+                clock.restart();
+                stream.send(&Out::ResponseEnd { error: None }).await;
+            }
+            Err(Headless::Cut(why)) => {
+                clock.restart();
+                stream.send(&Out::ResponseEnd { error: Some(why) }).await;
+            }
         }
-        Ok((Head::Request(_), _)) => unreachable!("a response lane carries responses"),
-        Err(Headless::Ended) => {
-            clock.restart();
-            stream.send(&Out::ResponseEnd { error: None }).await;
-        }
-        Err(Headless::Cut(why)) => {
-            clock.restart();
-            stream.send(&Out::ResponseEnd { error: Some(why) }).await;
-        }
+    };
+    tokio::select! {
+        biased;
+        () = stream.stopped(Dir::Response) => clock.restart(),
+        () = pump => {}
     }
 }
 
@@ -923,7 +914,7 @@ pub(crate) mod testing {
         addon
     }
 
-    /// A kit running `rules` with the stack `addons`, outermost first.
+    /// A kit running `rules` with the stack `addons`, from downstream to upstream.
     pub(crate) async fn kit(rules: &str, addons: Vec<Arc<AddonSpec>>) -> Kit {
         kit_with(rules, addons, |b| b).await
     }
@@ -940,7 +931,7 @@ pub(crate) mod testing {
     }
 
     /// Reloads `kit` with `rules`, the `secrets` they may use (redacted
-    /// from the logs) and the stack `addons`, outermost first.
+    /// from the logs) and the stack `addons`, from downstream to upstream.
     pub(crate) fn reload(
         kit: &Kit,
         rules: &str,

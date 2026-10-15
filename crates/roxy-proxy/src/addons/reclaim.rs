@@ -175,8 +175,9 @@ impl Reclaim {
                     }
                 };
                 let (complete, cancellation) = tokio::select! {
-                    complete = wait => (complete, None),
+                    biased;
                     (_, reason) = cancelled => (true, Some(reason)),
+                    complete = wait => (complete, None),
                 };
                 drop(delivery);
                 if !complete {
@@ -191,11 +192,12 @@ impl Reclaim {
                     let take = held.st.reclaim();
                     tokio::pin!(take);
                     tokio::select! {
-                        cx = &mut take => (cx, None),
+                        biased;
                         (why, reason) = cancelled => {
                             held.st.tear_down(why);
                             (take.await, Some(reason))
                         }
+                        cx = &mut take => (cx, None),
                     }
                 };
                 held.taken = true;

@@ -57,7 +57,7 @@ pub(crate) struct Snapshot {
     /// Address lists for `ip in @name` (and, resolved into the upstream's
     /// address policy, `upstream.deny_lists`).
     pub address_lists: Arc<AddressLists>,
-    /// The addon stack, outermost first.
+    /// The addon stack, from downstream to upstream.
     pub addons: Arc<[Arc<crate::addons::AddonSpec>]>,
     /// Service layers' connection pools. A reload starts empty ones, so
     /// new exchanges dial under the new policy, and retires

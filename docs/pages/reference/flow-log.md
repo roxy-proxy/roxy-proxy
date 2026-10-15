@@ -31,7 +31,7 @@ produces a `request` event:
 | `decision` | `allow`, `deny`, or `answered` when an addon layer answered itself |
 | `terminal_rule` | what decided: a rule id, or `_default`, `_fail_closed`, `_address_policy`, `_expired`, `_quarantined`, `_sign`, `_websocket` or `layer:<name>` |
 | `stage` | `head`, or where an in-flight rule stopped the exchange: `request_body`, `response_head`, `response_body`, `websocket` |
-| `addons` | the layers that ran, outermost first; one skipped by its `when` or `sample` is not listed ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)) |
+| `addons` | the layers that ran, from downstream to upstream; one skipped by its `when` or `sample` is not listed ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)) |
 | `rules`, `decision`, `terminal_rule` with addons | describe the request that left the stack; `req` is what the client sent and `res.status` what it got, which a layer downstream of the core stage may have replaced ([addons](/reference/addon-configuration#in-the-proxy)) |
 | `reason` | a stable code when the exchange failed closed or failed, by `terminal_rule`: |
 
@@ -47,7 +47,7 @@ produces a `request` event:
 | an upstream failure | the `upstream_error` reason ([upstream](/reference/upstream#errors)) |
 | roxy could not finish the exchange (its connection ended, or the server stopped, mid-flight) | `aborted` |
 | an addon layer dropped the exchange after the rules had forwarded it | `upstream_aborted` |
-| an upstream stopped consuming the upload after returning its response head | `upstream_body_timeout` ([upload progress](/reference/limits#timeouts)) |
+| the upload made no progress after the upstream returned its response head | `upstream_body_timeout` ([upload progress](/reference/limits#timeouts)) |
 | an addon layer cut a lane of its own: the request it was forwarding, or the response it was giving | `forward_aborted`, `answer_aborted` (unless another reason stands) |
 | the client went away | `client_gone` |
 | the HTTP/2 stream failed during cleanup after the response was written, without a client reset or connection loss | `h2_stream_error` |
@@ -59,6 +59,8 @@ produces a `request` event:
 A client may reset an HTTP/2 stream after its response was fully written,
 while an upload or addon is still running. roxy cancels that remaining
 work and records `client_gone`, retaining the response status and decision.
+An earlier policy or validation reason takes precedence; the fallback
+`upstream_aborted` is replaced by this observed client cancellation.
 It emits no `response_error` for an already completed response.
 
 | event | when |

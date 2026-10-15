@@ -124,7 +124,7 @@ async def test_an_upgrade_streams_both_ways_with_no_request_end() -> None:
 
 async def test_a_forward_awaited_after_the_streams_end_fails() -> None:
     """A handler that forwards and completes its answer before the head from
-    below arrives has sent its last message: roxy sends nothing more, so the
+    upstream arrives has sent its last message: roxy sends nothing more, so the
     forward raises `ProtocolError` at once rather than waiting for a head
     that cannot come."""
     outcome: list[BaseException | None] = []
@@ -182,3 +182,19 @@ async def test_a_call_awaited_after_the_answer_is_still_answered() -> None:
     await roxy.until_closed(1)
     assert outcome == [None], outcome
     assert stray_tasks(roxy.task) == set()
+
+
+@pytest.mark.parametrize("error", [None, "upstream cancelled"])
+async def test_headless_forward_ends_without_resetting_the_service(error: str | None) -> None:
+    roxy = await started_upload()
+    roxy.ws.control(1, "response_end", **({"error": error} if error else {}))
+    request_end = await roxy.ws.next_sent()
+    assert request_end["type"] == "request_end"
+    assert request_end["error"]
+    response_end = await roxy.ws.next_sent()
+    assert response_end["type"] == "response_end"
+    assert response_end.get("error") == error
+    await roxy.until_closed(1)
+    assert 1 not in roxy.conn.streams
+    assert stray_tasks(roxy.task) == set()
+    assert roxy.ws.sent.empty()

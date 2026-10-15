@@ -175,7 +175,14 @@ pub(crate) async fn send(
             | WriteFailure::UpstreamStalled
             | WriteFailure::Io(_) => "h2_stream_error",
         };
-        cx.record.reason.get_or_insert_with(|| reason.to_owned());
+        // Lease cancellation supplies a fallback before the transport can
+        // publish its cause. A concrete transport failure takes precedence;
+        // an earlier policy or validation reason still stands.
+        if cx.record.reason.as_deref() == Some("upstream_aborted") {
+            cx.record.reason = Some(reason.to_owned());
+        } else {
+            cx.record.reason.get_or_insert_with(|| reason.to_owned());
+        }
     }
     cx.record.response_status = Some(status);
     cx.record.response_headers_bytes = headers_bytes;

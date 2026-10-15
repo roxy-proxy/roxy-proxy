@@ -77,8 +77,8 @@ addons:
 On other targets the crate builds too (imports panic if called), so the
 logic of a layer can be unit-tested natively.
 
-`roxy-addon` targets the unversioned `roxy:addon` WIT package. The contract
-is not yet stable: build components against the `wit/` shipped with the
+`roxy-addon` targets the unversioned `roxy:addon` WIT package.
+Build components against the `wit/` shipped with the
 roxy version that runs them. Older versioned components may have different
 imports and must be rebuilt against the current SDK.
 

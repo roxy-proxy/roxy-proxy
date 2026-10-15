@@ -118,6 +118,10 @@ consumed during an interval, roxy cancels the remaining upload and records
 `upstream_body_timeout`, unless another failure already supplies the reason.
 This check runs while response rules and response writing are still in
 progress, including exchanges without addon layers.
+The timeout measures bytes consumed from the forwarded body, not which
+participant caused the delay. It also covers an addon holding the upload
+or an HTTP/1.1 response rule waiting while the client socket is not being
+pumped. It can therefore accompany a successful response status.
 A client cancellation also cancels the upload and releases its buffers.
 
 ### Buffer budget

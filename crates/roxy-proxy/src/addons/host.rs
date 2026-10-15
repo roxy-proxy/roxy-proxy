@@ -112,16 +112,18 @@ impl LayerHost for StackHost {
             };
         }
         let subscribe = self.addon().subscribe;
-        let own = req.extensions().get::<GuestBody>().is_some();
         // A head-only layer passes the head on; the body it did not see
         // goes on with it, framed as it came.
         let held = lock(&self.held_request).take();
         let req = match held {
             Some(held) => {
+                let mut req = req;
+                req.extensions_mut().remove::<GuestBody>();
                 req.map(|own| subscribe::splice(&self.st, self.index, Dir::Request, own, held))
             }
             None => req,
         };
+        let own = req.extensions().get::<GuestBody>().is_some();
         match super::layer::forward_lanes(&self.st, self.index, Ok(req), own).await {
             Ok(mut res) => {
                 if subscribe.response == Part::Head {
@@ -149,6 +151,8 @@ impl LayerHost for StackHost {
         let held = lock(&self.held_response).take();
         let res = match held {
             Some((status, body)) if status == res.status() => {
+                let mut res = res;
+                res.extensions_mut().remove::<GuestBody>();
                 res.map(|own| subscribe::splice(&self.st, self.index, Dir::Response, own, body))
             }
             _ => res,

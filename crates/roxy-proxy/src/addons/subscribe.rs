@@ -119,6 +119,11 @@ impl Spliced {
             match ready!(Pin::new(own).poll_frame(cx)) {
                 None => self.own = None,
                 Some(Err(e)) => {
+                    if e != BodyError::Stopped {
+                        self.st
+                            .chain()
+                            .body_aborted(self.index, self.dir, e.to_string());
+                    }
                     self.own = None;
                     return Poll::Ready(Some(Err(e)));
                 }

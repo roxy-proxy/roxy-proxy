@@ -126,9 +126,8 @@ pass on is re-validated as strictly as a client request and judged by the
 rules as if the client had sent it. Nothing configurable runs between the
 rules and the network, and the address floor checks the IP actually
 dialled. A refusal the rules make travels downstream through the addons as a
-response, which a downstream addon may reshape, into one the client takes as
-success included: addons are trusted configuration, the request did not
-leave, and the flow log records the rules' verdict whatever the client was
+response. A downstream addon may reshape it, including into a success
+response: addons are trusted configuration, the request did not leave, and the flow log records the rules' verdict whatever the client was
 given ([addon model](/design/addon-model)).
 
 ## Streams, not messages

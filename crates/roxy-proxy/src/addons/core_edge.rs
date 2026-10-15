@@ -167,7 +167,7 @@ async fn relay_upgrade(
         return;
     };
     crate::exchange::relay_websocket(lease.cx(), relay_io, upstream, Vec::new(), &torn_down).await;
-    // Let a close frame traverse the response lanes before canceling
+    // Let a close frame traverse the response lanes before cancelling
     // layers that keep their bodies open after the relay ends.
     client.close(crate::exchange::CLOSE_TIMEOUT).await;
     st.tear_down(super::ENDED);

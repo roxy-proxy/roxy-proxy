@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use http_body::Body as _;
+
 use roxy_http::{Body, BodyError};
 use roxy_wasm::LayerHost as _;
 use tokio::sync::{Notify, mpsc};
@@ -435,11 +437,14 @@ impl Stream {
     /// lanes, go on. Stops at the stream's end, or when the service reads
     /// no more of it.
     pub(crate) async fn pump(&self, dir: Dir, head: Out, body: Body) {
+        if self.stop_in[dir_index(dir)].is_cancelled() {
+            return;
+        }
         if !self.send(&head).await {
             return;
         }
         // Nothing to read (and an empty observer copy may never be ended).
-        let error = if body.known_length() == Some(0) {
+        let error = if body.is_end_stream() {
             None
         } else {
             match self.pump_body(dir, body).await {
@@ -449,6 +454,10 @@ impl Stream {
             }
         };
         self.send(&end_of(dir, error)).await;
+    }
+
+    pub(crate) async fn stopped(&self, dir: Dir) {
+        self.stop_in[dir_index(dir)].cancelled().await;
     }
 
     /// Sends `body`'s frames in direction `dir`, as credit allows. The
@@ -794,6 +803,8 @@ impl Stream {
             if self.mode == AddonMode::Enforce {
                 self.st.chain().spawn(work);
             } else {
+                // Observers may finish after the real exchange; their
+                // host calls cannot change its decision or final record.
                 tokio::spawn(work);
             }
             tx

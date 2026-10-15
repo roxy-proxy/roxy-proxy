@@ -8,7 +8,9 @@
 //! failure before it drops the store. A response body additionally holds
 //! its end until the guest's handler has returned, so a trap after the last
 //! byte still fails it. A body the guest leaves unfinished is cut where it
-//! stopped; the cut is the guest's own doing, not a failure.
+//! stopped. For a forwarded request or answer, this is the guest's own
+//! abort, not a layer fault. An unfinished endpoint request body does fail
+//! the exchange, because the endpoint call must carry a complete request.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -38,9 +40,9 @@ pub(crate) struct ExchangeShared {
     /// Told of the first failure as it is recorded.
     host: Arc<dyn LayerHost>,
     status: watch::Sender<Status>,
-    /// Odd while `next` runs below the layer, so the head clock is stopped;
+    /// Odd while `next` runs upstream of the layer, so the head clock is stopped;
     /// each return of `next` makes it even again.
-    below: watch::Sender<u64>,
+    upstream: watch::Sender<u64>,
     /// The guest has answered: its response head is out of its hands, and
     /// the head clock has nothing left to time.
     answered: watch::Sender<bool>,
@@ -59,46 +61,46 @@ impl ExchangeShared {
         Arc::new(Self {
             host,
             status: watch::Sender::new(Status::default()),
-            below: watch::Sender::new(0),
+            upstream: watch::Sender::new(0),
             answered: watch::Sender::new(false),
         })
     }
 
     /// `next` started: the layer's time stops.
     pub(crate) fn next_started(&self) {
-        self.below.send_modify(|n| *n += 1);
+        self.upstream.send_modify(|n| *n += 1);
     }
 
     /// `next` returned its response head (or the guest abandoned it): the
     /// layer's time runs again, with a whole budget for the response head.
     pub(crate) fn next_returned(&self) {
-        self.below.send_modify(|n| *n += 1);
+        self.upstream.send_modify(|n| *n += 1);
     }
 
     /// Resolves once the layer has held a head for `limit` of its own time:
     /// the request head from the clock's start, less the `used` already
     /// spent on it (starting the instance), and the response head from the
-    /// moment `next` returns. The clock does not run while `next` is below
-    /// the layer, and stops for good once the layer has answered.
+    /// moment `next` returns. The clock does not run while `next` is upstream
+    /// of the layer, and stops for good once the layer has answered.
     pub(crate) fn head_clock(
         &self,
         limit: Duration,
         used: Duration,
     ) -> impl Future<Output = ()> + Send + 'static {
-        let mut below = self.below.subscribe();
+        let mut upstream = self.upstream.subscribe();
         let mut answered = self.answered.subscribe();
         async move {
             let mut left = limit.saturating_sub(used);
             loop {
                 // The sender lives as long as the exchange; gone, nothing
                 // is left to time.
-                if below.wait_for(|n| n % 2 == 0).await.is_err() {
+                if upstream.wait_for(|n| n % 2 == 0).await.is_err() {
                     return std::future::pending().await;
                 }
                 // Any change means `next` ran: it may have started and
                 // returned between two looks, so a change restarts the
-                // clock whether or not `next` is still below.
-                let changed = async { below.changed().await.is_ok() };
+                // clock whether or not `next` is still upstream.
+                let changed = async { upstream.changed().await.is_ok() };
                 let answered = async { answered.wait_for(|a| *a).await.is_ok() };
                 tokio::select! {
                     _ = answered => return std::future::pending().await,
@@ -397,7 +399,7 @@ mod tests {
         assert_eq!(s.wait_settled().await, Ok(()));
     }
 
-    /// Each head gets the whole limit: time below is not counted, and the
+    /// Each head gets the whole limit: time upstream is not counted, and the
     /// request-phase hold does not eat into the response-phase one.
     #[tokio::test(start_paused = true)]
     async fn the_head_clock_restarts_when_next_returns() {
@@ -414,7 +416,7 @@ mod tests {
         });
         clock.await;
         // 2s of instance start and 7s before `next` leave 1s of the first
-        // budget; 100s below (not counted); then the full 10s again.
+        // budget; 100s upstream (not counted); then the full 10s again.
         assert_eq!(start.elapsed().as_secs(), 117);
     }
 

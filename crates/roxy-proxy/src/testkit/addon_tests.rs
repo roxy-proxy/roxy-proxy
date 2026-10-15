@@ -43,7 +43,7 @@ fn gzip(b: &[u8]) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn layers_run_outermost_first() {
+async fn layers_run_from_downstream_to_upstream() {
     let kit = stack(&named(&["a", "b", "c"])).await;
     let a = kit.h1().await.call("POST", "/x", &[], b"body").await;
     assert_eq!(a.status, 200, "{a:?}");
@@ -113,7 +113,7 @@ async fn a_failure_is_attributed_to_the_layer_that_failed() {
     }
 }
 
-/// The outermost layer answering itself is `answered` and named; nothing
+/// The layer nearest the client answering itself is `answered` and named; nothing
 /// upstream of it runs.
 #[tokio::test]
 async fn an_outer_layer_answering_is_answered() {
@@ -3144,6 +3144,24 @@ async fn a_head_only_layer_sees_no_body_and_the_bodies_go_through() {
             );
         }
         assert_eq!(seen[0].complete, Some(true));
+        no_layer_error(&kit);
+    }
+}
+
+/// Bypassing a guest's body preserves the source of an upstream failure.
+#[tokio::test]
+async fn upstream_body_failure_through_a_head_only_wasm_layer_keeps_its_cause() {
+    use crate::addons::Part;
+    for mode in ["pass", "relay"] {
+        let kit = one(AddonDef::test_layer("t").subscribe(Part::Head, Part::Head)).await;
+        let answer = kit
+            .h1()
+            .await
+            .call("GET", "/cut", &[("x-test-t", mode)], b"")
+            .await;
+        assert!(answer.body.is_err(), "{answer:?}");
+        let event = kit.request_event().await;
+        assert_eq!(event["reason"], "upstream_body_failed", "{event:#}");
         no_layer_error(&kit);
     }
 }

@@ -123,6 +123,18 @@ class Response:
         return next((v for n, v in self.headers if n.lower() == name), None)
 
 
+class ForwardEnded(Exception):
+    """The upstream response lane ended without a head, possibly with an error.
+
+    A handler may catch this and supply its own response. Left uncaught,
+    the helper ends its answer headless, without resetting the service.
+    """
+
+    def __init__(self, error: str | None) -> None:
+        self.error = error
+        super().__init__(error or "the forward ended without a response")
+
+
 class ProtocolError(Exception):
     """roxy sent something out of order, or reset the stream."""
 
@@ -355,6 +367,17 @@ class _Stream:
             await exchange._finish_forwarding()
             if not self.forwarded and not self._ends_sent[REQUEST]:
                 await self.send({"type": "request_end"}, end=REQUEST)
+        except ForwardEnded as e:
+            if exchange is not None:
+                await exchange._stop_forwarding()
+            for direction in (REQUEST, RESPONSE):
+                if not self._ends_sent[direction]:
+                    end: dict[str, Any] = {"type": f"{_DIR_NAMES[direction]}_end"}
+                    if direction == REQUEST:
+                        end["error"] = "the forward ended before the upload completed"
+                    elif e.error is not None:
+                        end["error"] = e.error
+                    await self.send(end, end=direction)
         except asyncio.CancelledError:
             # roxy reset the stream, or the connection went.
             pass
@@ -595,7 +618,8 @@ class Exchange:
         in the background if roxy answers before it has all been sent.
         roxy re-validates the request and its rules judge it; a refusal
         comes back as a response like any other. Read the response body
-        with `response_body()`.
+        with `response_body()`. If the response lane ends without a head,
+        raises `ForwardEnded`; the handler may catch it and answer locally.
 
         The stream ends once both this side's lanes have ended: if the
         answer's end and this forward's `request_end` both go before the
@@ -632,6 +656,8 @@ class Exchange:
             raise
         if isinstance(m, bytes):
             raise ProtocolError("body bytes before the response head")
+        if m.get("type") == "response_end":
+            raise ForwardEnded(m.get("error"))
         if m.get("type") != "response":
             raise ProtocolError(f"expected response, got {m.get('type')}")
         return Response(

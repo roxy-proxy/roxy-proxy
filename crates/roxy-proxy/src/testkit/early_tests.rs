@@ -19,6 +19,163 @@ use crate::addons::{AddonMode, Part};
 
 const CHUNK: usize = 4096;
 
+/// An empty 200 is not complete until its producer ends the lane. The
+/// producer can finish the upload after publishing the response head.
+#[tokio::test]
+async fn h2_empty_success_waits_for_the_forward_to_finish() {
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![testing::addon(
+            "s",
+            "early-empty",
+            AddonMode::Enforce,
+            |_| {},
+        )],
+    )
+    .await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let mut ready = send.ready().await.unwrap();
+    let request = http::Request::post("https://up.test/upload")
+        .body(())
+        .unwrap();
+    let (response, mut upload) = ready.send_request(request, false).unwrap();
+    upload
+        .send_data(Bytes::from_static(b"first"), false)
+        .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(2), response)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-length"], "0");
+    let mut body = response.into_body();
+    assert!(!body.is_end_stream(), "the response lane is still open");
+    upload
+        .send_data(Bytes::from_static(b"second"), true)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(data) = body.data().await {
+            assert!(data.unwrap().is_empty());
+        }
+    })
+    .await
+    .expect("the response ends after forwarding completes");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].body, b"firstsecond");
+    assert_eq!(seen[0].complete, Some(true));
+    let event = kit.request_event().await;
+    assert_eq!(event["decision"], "answered", "{event:#}");
+    assert_eq!(kit.upstream.service().resets(), []);
+}
+
+/// A reset after a complete response still explains why an admitted
+/// forward was cancelled; it is not a failure writing that response.
+#[tokio::test]
+async fn h2_reset_after_an_early_answer_records_the_cause_of_forward_cancellation() {
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![testing::addon(
+            "s",
+            "early-no-content",
+            AddonMode::Enforce,
+            |_| {},
+        )],
+    )
+    .await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let mut ready = send.ready().await.unwrap();
+    let request = http::Request::post("https://up.test/late?ms=5000")
+        .body(())
+        .unwrap();
+    let (response, mut upload) = ready.send_request(request, false).unwrap();
+    upload
+        .send_data(Bytes::from_static(b"partial"), false)
+        .unwrap();
+    assert_eq!(response.await.unwrap().status(), 204);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while kit.upstream.seen().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    upload.send_reset(h2::Reason::CANCEL);
+    let event = kit.request_event().await;
+    assert_eq!(event["res"]["status"], 204, "{event:#}");
+    assert_eq!(event["decision"], "answered", "{event:#}");
+    assert_eq!(event["reason"], "client_gone", "{event:#}");
+    assert!(
+        kit.sink
+            .events()
+            .iter()
+            .all(|e| e["event"] != "response_error")
+    );
+}
+
+/// A service can stop waiting for the upstream response before its head.
+/// Its still-open answer must not keep the abandoned forward running.
+#[tokio::test]
+async fn service_response_stop_cancels_a_forward_waiting_for_its_head() {
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![testing::addon(
+            "s",
+            "stop-response",
+            AddonMode::Enforce,
+            |_| {},
+        )],
+    )
+    .await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let mut ready = send.ready().await.unwrap();
+    let request = http::Request::post("https://up.test/upload")
+        .body(())
+        .unwrap();
+    let (response, mut upload) = ready.send_request(request, false).unwrap();
+    upload
+        .send_data(Bytes::from_static(b"partial"), false)
+        .unwrap();
+    assert_eq!(response.await.unwrap().status(), 204);
+    let seen = tokio::time::timeout(Duration::from_secs(2), kit.upstream.wait_seen(1))
+        .await
+        .expect("stopping the response cancels the incomplete upload");
+    assert_eq!(seen[0].complete, Some(false));
+    assert!(
+        kit.upstream
+            .service()
+            .controls(1)
+            .iter()
+            .all(|e| e["type"] != "response")
+    );
+    upload.send_reset(h2::Reason::CANCEL);
+    kit.request_event().await;
+}
+
+/// The request body is available even when a head-only service forwards
+/// immediately on open, before receiving roxy's request head.
+#[tokio::test]
+async fn a_head_only_service_forwarding_on_open_keeps_the_request_body() {
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![testing::subscribed(
+            testing::addon("s", "forward-on-open", AddonMode::Enforce, |_| {}),
+            Part::Head,
+            Part::Full,
+        )],
+    )
+    .await;
+    let answer = kit
+        .h1()
+        .await
+        .call("POST", "/x", &[], b"bypassed upload")
+        .await;
+    assert_eq!(answer.status, 200, "{answer:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].body, b"bypassed upload");
+    assert_eq!(seen[0].complete, Some(true));
+}
+
+/// A completed bodiless response still leaves the service cancellable.
 #[tokio::test]
 async fn h2_reset_after_bodiless_answer_releases_service() {
     for (method, status) in [("POST", 204), ("HEAD", 200)] {
@@ -87,6 +244,7 @@ async fn h2_reset_after_bodiless_answer_releases_service() {
     }
 }
 
+/// A cut arriving after the original answer deadline starts a fresh deadline.
 #[tokio::test(start_paused = true)]
 async fn headless_forward_completion_restarts_answer_timeout() {
     let kit = testing::kit(
@@ -101,13 +259,14 @@ async fn headless_forward_completion_restarts_answer_timeout() {
         tokio::time::timeout(Duration::from_secs(1), c.call("POST", "/x", &[], b"body")).await;
     assert!(
         result.is_ok(),
-        "a completed, cut forward leaves the answer clock disabled forever"
+        "the service must answer within its renewed deadline after the forward ends"
     );
     assert_eq!(result.unwrap().status, 503);
     let errors = kit.events("layer_error", 1).await;
     assert_eq!(errors[0]["kind"], "service:timeout", "{errors:#?}");
 }
 
+/// Trailers cannot commit success before the producer supplies a clean end.
 #[tokio::test]
 async fn trailers_do_not_turn_a_cut_service_response_into_success() {
     for h2 in [false, true] {
@@ -294,7 +453,7 @@ async fn h2_a_layer_answers_before_next_mid_upload_and_the_connection_lives_on()
 }
 
 #[tokio::test]
-async fn an_inner_layer_answers_before_next_mid_upload_through_the_outer_one() {
+async fn an_upstream_layer_answers_before_next_mid_upload_through_the_downstream_one() {
     let kit = stack(&["a", "b"]).await;
     let mut c = kit.h1().await;
     let (tx, pending) = upload(
@@ -382,7 +541,7 @@ async fn answering_after_next_keeps_what_the_rules_decided() {
 }
 
 #[tokio::test]
-async fn an_outer_layer_answering_after_the_inner_one_forwarded_is_the_one_named() {
+async fn a_downstream_layer_answering_after_the_upstream_one_forwarded_is_the_one_named() {
     let kit = stack(&["a", "b"]).await;
     let mut c = kit.h1().await;
     let (tx, pending) = upload(

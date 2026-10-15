@@ -644,6 +644,71 @@ mod tests {
     use roxy_http::Body;
     use roxy_wasm::LayerError;
 
+    /// The guest's own abort remains visible when its body is combined
+    /// with bytes it never sees.
+    #[tokio::test]
+    async fn a_spliced_guests_own_body_failure_is_still_its_abort() {
+        let kit = Kit::builder()
+            .addon(AddonDef::test_layer("a"))
+            .start()
+            .await;
+        for dir in [
+            crate::in_flight::Dir::Request,
+            crate::in_flight::Dir::Response,
+        ] {
+            let (st, _cx, mut ends) = test_flow(&kit);
+            let layer = ends.layers.pop().unwrap();
+            layer.stage.enforcing();
+            let (sender, own) = Body::channel(u64::MAX, None);
+            sender.abort(roxy_http::BodyError::Incomplete);
+            let body = subscribe::splice(&st, 0, dir, own, Body::empty());
+            let body = match dir {
+                crate::in_flight::Dir::Request => {
+                    layer
+                        .req_out
+                        .whole(Head::Request(http::Request::new(()).into_parts().0), body);
+                    ends.core.req_in.head().await.unwrap().1
+                }
+                crate::in_flight::Dir::Response => {
+                    layer
+                        .res_out
+                        .whole(Head::Response(http::Response::new(()).into_parts().0), body);
+                    ends.edge.res_in.head().await.unwrap().1
+                }
+            };
+            assert!(body.collect_up_to(u64::MAX).await.is_err());
+            let expected = match dir {
+                crate::in_flight::Dir::Request => "forward_aborted",
+                crate::in_flight::Dir::Response => "answer_aborted",
+            };
+            assert_eq!(st.chain().abort_reason(), Some(expected));
+            assert!(!st.attribution.is_faulted());
+        }
+    }
+
+    /// A cancellation already observed in the same wake as completion
+    /// remains part of the final record, with or without addon lanes.
+    #[tokio::test]
+    async fn cancellation_wins_when_reclamation_is_already_ready() {
+        let kit = Kit::builder().start().await;
+        for stack in [false, true] {
+            let (st, cx, ends) = test_flow(&kit);
+            st.tear_down(CLIENT_GONE);
+            drop(ends);
+            let reclaim = if stack {
+                st.loan.park(cx);
+                Reclaim::stack(st)
+            } else {
+                Reclaim::now(cx)
+            };
+            let (_, cancellation) = reclaim
+                .take_until(std::future::ready((CLIENT_GONE, true)))
+                .await;
+            assert_eq!(cancellation, Some(true));
+        }
+    }
+
+    /// Reclamation waits for buffered bytes to be counted and checked.
     #[tokio::test]
     async fn reclamation_waits_for_buffered_upload_consumption() {
         let kit = Kit::builder()
@@ -684,7 +749,7 @@ mod tests {
         tokio::pin!(reclaimed);
         assert!(
             futures_util::poll!(reclaimed.as_mut()).is_pending(),
-            "the flow can be logged before the queued upload is counted or checked by in-flight rules"
+            "the flow waits for the queued upload to be counted and checked"
         );
         assert_eq!(
             upload.collect_up_to(u64::MAX).await.unwrap().data,

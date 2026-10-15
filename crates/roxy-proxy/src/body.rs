@@ -157,6 +157,25 @@ impl http_body::Body for DeliveredBody {
         }
         result
     }
+
+    fn is_end_stream(&self) -> bool {
+        // A cancelled upload must still yield its error when polled.
+        self.done
+            || self
+                .shared
+                .upload()
+                .body
+                .as_ref()
+                .is_some_and(http_body::Body::is_end_stream)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.shared
+            .upload()
+            .body
+            .as_ref()
+            .map_or_else(SizeHint::default, http_body::Body::size_hint)
+    }
 }
 
 /// Retain cancellation and completion ownership when handing a body to

@@ -23,7 +23,7 @@
 //!   forwarding nothing;
 //! * `/svc/early`: forwards the request as `/svc/pass` does, and answers
 //!   the client (`200`, body `early`) as soon as it has the request head,
-//!   reading the response from below without passing it on;
+//!   reading the response from upstream without passing it on;
 //! * `/svc/cut-forward`: forwards each request head, then ends the
 //!   forwarded request with an error, and passes the response on;
 //! * `/svc/shout`: a pass-through that uppercases ASCII letters in the
@@ -327,8 +327,11 @@ enum Mode {
     /// the response from upstream: a bodiless answer on the client transport,
     /// its lane still open while the forward runs to its end.
     EarlyNoContent,
+    EarlyEmpty,
+    StopResponse,
+    ForwardOnOpen,
     /// Forwards the request head, then ends the forwarded request lane
-    /// with an error, and passes the response from below on: a service
+    /// with an error, and passes the response from upstream on: a service
     /// that cuts its own forward.
     CutForward,
     /// Calls every host service on `open` (call ids 1 to 6), then passes
@@ -393,6 +396,12 @@ impl Mode {
             Self::Early
         } else if path.ends_with("/no-content") {
             Self::NoContent
+        } else if path.ends_with("/early-empty") {
+            Self::EarlyEmpty
+        } else if path.ends_with("/stop-response") {
+            Self::StopResponse
+        } else if path.ends_with("/forward-on-open") {
+            Self::ForwardOnOpen
         } else if path.ends_with("/early-no-content") {
             Self::EarlyNoContent
         } else if path.ends_with("/cut-forward") {
@@ -447,8 +456,13 @@ impl Conn {
             | Mode::Quarantine
             | Mode::LateQuarantine
             | Mode::Audit => true,
-            Mode::Hold | Mode::Forward | Mode::Early | Mode::EarlyNoContent => dir == REQUEST,
-            Mode::CutForward => dir == RESPONSE,
+            Mode::Hold
+            | Mode::Forward
+            | Mode::Early
+            | Mode::EarlyNoContent
+            | Mode::EarlyEmpty
+            | Mode::StopResponse => dir == REQUEST,
+            Mode::ForwardOnOpen | Mode::CutForward => dir == RESPONSE,
             Mode::Overlong
             | Mode::Short
             | Mode::Refuse
@@ -490,6 +504,44 @@ impl Conn {
         });
     }
 
+    fn cut_forward(&self, id: u32, mut v: Value) {
+        v.as_object_mut().map(|o| o.remove("stream"));
+        self.send(text(id, v));
+        let end = text(
+            id,
+            json!({"type": "request_end", "error": "cut by the service"}),
+        );
+        if self.mode == Mode::CutWait {
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                let _ = tx.send(end);
+            });
+        } else {
+            self.send(end);
+        }
+    }
+
+    fn answer_empty_while_forwarding(&mut self, id: u32, v: Value) {
+        self.pass_control(id, "request", v);
+        let status = if self.mode == Mode::EarlyEmpty {
+            200
+        } else {
+            204
+        };
+        self.send(text(
+            id,
+            json!({"type": "response", "status": status, "headers": [["content-length", "0"]]}),
+        ));
+        if self.mode == Mode::StopResponse {
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let _ = tx.send(text(id, json!({"type": "stop", "dir": "response"})));
+            });
+        }
+    }
+
     fn control(&mut self, mut v: Value) {
         let Some(id) = v["stream"].as_u64().and_then(|n| u32::try_from(n).ok()) else {
             return;
@@ -505,12 +557,7 @@ impl Conn {
                 ));
             }
             "request" if matches!(self.mode, Mode::CutWait | Mode::CutForward) => {
-                v.as_object_mut().map(|o| o.remove("stream"));
-                self.send(text(id, v));
-                self.send(text(
-                    id,
-                    json!({"type": "request_end", "error": "cut by the service"}),
-                ));
+                self.cut_forward(id, v);
             }
             "request" if self.mode == Mode::TrailersCut => self.cut_after_trailers(id),
             "open" => {
@@ -551,14 +598,15 @@ impl Conn {
             "response" if self.mode == Mode::Early => {
                 self.send(text(id, json!({"type": "response_end"})));
             }
-            "request" if self.mode == Mode::EarlyNoContent => {
-                self.pass_control(id, &kind, v);
-                self.send(text(
-                    id,
-                    json!({"type": "response", "status": 204, "headers": []}),
-                ));
+            "request"
+                if matches!(
+                    self.mode,
+                    Mode::EarlyNoContent | Mode::EarlyEmpty | Mode::StopResponse
+                ) =>
+            {
+                self.answer_empty_while_forwarding(id, v);
             }
-            "response_end" if self.mode == Mode::EarlyNoContent => {
+            "response_end" if matches!(self.mode, Mode::EarlyNoContent | Mode::EarlyEmpty) => {
                 self.send(text(id, json!({"type": "response_end"})));
             }
             "response" if self.mode == Mode::LateQuarantine => {
@@ -656,12 +704,18 @@ impl Conn {
             | Mode::Early
             | Mode::NoContent
             | Mode::EarlyNoContent
+            | Mode::EarlyEmpty
+            | Mode::StopResponse
             | Mode::CutForward
             | Mode::AnswerOpen
             | Mode::CutWait
             | Mode::TrailersCut
             | Mode::LateQuarantine
             | Mode::Audit => {}
+            Mode::ForwardOnOpen => {
+                self.send(text(id, json!({"type": "request", "method": "POST", "url": "http://up.test/x", "headers": []})));
+                self.send(text(id, json!({"type": "request_end"})));
+            }
             Mode::Host => self.call_host(
                 id,
                 REQUEST,

@@ -224,7 +224,9 @@ as soon as the layer gives it; a forwarded request continues upstream
 while the layer waits for its response. The flow is logged once every lane is terminal,
 its body has been read or discarded, and all drivers and enforcing
 host-service workers have finished. Upstream upload accounting completes before the core releases
-the context. Sending an early response does not bypass this barrier.
+the context. Sending an early response does not bypass this barrier. HTTP/1.1 does not accept
+the next request until this work finishes, even if a layer has ended both
+of its lanes but its handler or host-service calls are still running.
 
 Once a layer is done with the client's upload, the rest of it is dropped:
 on HTTP/1.1 the codec drains or closes as it does after a deny
@@ -259,14 +261,14 @@ In the flow log:
 |---|---|
 | `addons` | the layers that ran, in stack order; a layer its `when` or `sample` skipped is not in it |
 | `rules`, `decision`, `terminal_rule` | the rules' decision on the request that left the stack; `req` is what the client sent. Metric keys (for the rules' samples and `metric-get`) also come from the request that left. A layer whose `next` returned the rules' `403` and then answered `200` itself is logged `decision: deny`, `res.status: 200` |
-| `decision: answered`, `terminal_rule: layer:<name>` | a layer answered itself, whatever its status: the layer nearest the client whose response lane upstream had no head when its own answer's head landed, decided then. A forward it kept reading the response of runs to its end, and the record keeps what the rules decided of it; one it stopped reading the response of is cancelled upstream, with `reason: upstream_aborted`; a forward it cut itself gets `reason: forward_aborted`. A layer that failed answered nothing: the refusal generated for its failure is the decision, `deny`, whatever a layer downstream made of it |
+| `decision: answered`, `terminal_rule: layer:<name>` | a layer answered itself, whatever its status: the layer nearest the client whose response lane upstream had no head when its own answer's head landed, decided then. A forward it kept reading the response of runs to its end, and the record keeps what the rules decided of it; one it stopped reading the response of is cancelled upstream, with `reason: upstream_aborted`; a forward it cut itself gets `reason: forward_aborted`. If a layer fails before publishing its answer, the generated refusal is the decision, `deny`, whatever a downstream layer makes of it. If it fails after its answer reaches the client, the answer remains recorded and its body is cut |
 | `503`, `terminal_rule: layer:<name>`, `reason: layer_error` | a layer failed before the response head; the connection is closed and a `layer_error` event follows with `kind` one of `trap`, `budget:<limit>`, `capability:<name>`, `invalid_request`, `invalid_response`, `no_response`, `unsubscribed:<direction>`, ... After the head, the body is cut (HTTP/1.1 breaks the connection, HTTP/2 resets the stream) and `layer_error` follows. Which layer, if any, is one rule ([who is blamed](/design/addon-model#who-is-blamed)) |
 
 ### Content codings
 
 On a flow some layer runs on and is subscribed to the body, roxy decodes
 the client's request body as the first such layer gets it and the response
-before it reaches the innermost such layer, removing `content-encoding`;
+before it reaches the first subscribed layer on its way downstream, removing `content-encoding`;
 the body's length becomes unknown. A body no running layer is subscribed
 to is not decoded, and reaches the upstream or the client as sent.
 

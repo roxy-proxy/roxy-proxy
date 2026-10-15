@@ -422,8 +422,7 @@ async fn write_response(
     // so only a body that has nothing more to yield ends on the HEADERS.
     let bodiless = status_forbids_body(res.status)
         || *out.method == Method::Head
-        || (res.body.known_length() == Some(0)
-            && (!out.flags.allow_response_trailers || http_body::Body::is_end_stream(&res.body)));
+        || (res.body.known_length() == Some(0) && http_body::Body::is_end_stream(&res.body));
     let mut body = res.body;
     if bodiless {
         return respond
