@@ -564,6 +564,7 @@ pub(crate) struct FlowCx {
     /// Request body bytes forwarded so far (and their digest once the
     /// body completed), once the request is on its way.
     pub request_tally: Option<Arc<crate::body::Tally>>,
+    pub request_delivery: Option<crate::body::Delivery>,
     /// The addon stack this exchange went through (set once the stack has
     /// handed the flow back), folded into the record when it is logged.
     pub stack: Option<Arc<crate::addons::StackFlow>>,
@@ -589,6 +590,7 @@ impl std::ops::Deref for FlowCx {
 
 impl Drop for FlowCx {
     fn drop(&mut self) {
+        drop(self.request_delivery.take());
         if !self.logged {
             self.record
                 .reason
@@ -695,6 +697,7 @@ impl FlowCx {
             host_override: None,
             sign: None,
             request_tally: None,
+            request_delivery: None,
             stack: None,
             layer_reads_bytes: false,
             buffers: Vec::new(),
@@ -1463,7 +1466,7 @@ async fn inspect_response_body(
     let idle = Some(cx.snap.limits.response_body_idle_timeout);
     let inspected = match io.collect(&mut res.body, cap, &mut meter, idle).await {
         Err(e) => return ResponseVerdict::Close(e),
-        // The same stall the front would cut mid-body, caught before the
+        // The same stall the transport would cut mid-body, caught before the
         // head went out: the client gets an answer instead of a cut.
         Ok(Collected::Failed(BodyError::Timeout)) => {
             let e = WriteFailure::UpstreamStalled;

@@ -296,6 +296,9 @@ fn lane_of(kind: &str, v: &Value) -> Option<u8> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
+    AnswerOpen,
+    CutWait,
+    TrailersCut,
     Pass,
     Hold,
     Hoard,
@@ -320,7 +323,7 @@ enum Mode {
     /// no forward.
     NoContent,
     /// As `early`, with a `204` whose `response_end` waits for the end of
-    /// the response from below: an answer the front writes no body for,
+    /// the response from upstream: a bodiless answer on the client transport,
     /// its lane still open while the forward runs to its end.
     EarlyNoContent,
     /// Forwards the request head, then ends the forwarded request lane
@@ -349,7 +352,13 @@ pub(crate) const HOST_STATE_VALUE: &str = "from-service";
 
 impl Mode {
     fn of(path: &str) -> Self {
-        if path.ends_with("/pass") {
+        if path.ends_with("/answer-open") {
+            Self::AnswerOpen
+        } else if path.ends_with("/cut-wait") {
+            Self::CutWait
+        } else if path.ends_with("/trailers-cut") {
+            Self::TrailersCut
+        } else if path.ends_with("/pass") {
             Self::Pass
         } else if path.ends_with("/host") {
             Self::Host
@@ -446,7 +455,10 @@ impl Conn {
             | Mode::Abort
             | Mode::Talk
             | Mode::Flood
-            | Mode::Pause => false,
+            | Mode::Pause
+            | Mode::AnswerOpen
+            | Mode::CutWait
+            | Mode::TrailersCut => false,
         }
     }
 
@@ -456,6 +468,27 @@ impl Conn {
         self.mode == Mode::Hold || self.passes(dir)
     }
 
+    fn cut_after_trailers(&self, id: u32) {
+        self.send(text(id, json!({"type": "request_end"})));
+        self.send(text(
+            id,
+            json!({"type": "response", "status": 200, "headers": []}),
+        ));
+        self.send(binary(id, RESPONSE, b"partial"));
+        self.send(text(
+            id,
+            json!({"type": "trailers", "dir": "response", "headers": [["x-check", "trailer"]]}),
+        ));
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let _ = tx.send(text(
+                id,
+                json!({"type": "response_end", "error": "incomplete"}),
+            ));
+        });
+    }
+
     fn control(&mut self, mut v: Value) {
         let Some(id) = v["stream"].as_u64().and_then(|n| u32::try_from(n).ok()) else {
             return;
@@ -463,6 +496,22 @@ impl Conn {
         let kind = v["type"].as_str().unwrap_or_default().to_owned();
         lock(&self.log.controls).push(v.clone());
         match kind.as_str() {
+            "request" if self.mode == Mode::AnswerOpen => {
+                let status = if v["method"] == "HEAD" { 200 } else { 204 };
+                self.send(text(
+                    id,
+                    json!({"type": "response", "status": status, "headers": []}),
+                ));
+            }
+            "request" if matches!(self.mode, Mode::CutWait | Mode::CutForward) => {
+                v.as_object_mut().map(|o| o.remove("stream"));
+                self.send(text(id, v));
+                self.send(text(
+                    id,
+                    json!({"type": "request_end", "error": "cut by the service"}),
+                ));
+            }
+            "request" if self.mode == Mode::TrailersCut => self.cut_after_trailers(id),
             "open" => {
                 lock(&self.log.opens).push(v);
                 self.opened(id);
@@ -510,14 +559,6 @@ impl Conn {
             }
             "response_end" if self.mode == Mode::EarlyNoContent => {
                 self.send(text(id, json!({"type": "response_end"})));
-            }
-            "request" if self.mode == Mode::CutForward => {
-                v.as_object_mut().map(|o| o.remove("stream"));
-                self.send(text(id, v));
-                self.send(text(
-                    id,
-                    json!({"type": "request_end", "error": "cut by the service"}),
-                ));
             }
             "response" if self.mode == Mode::LateQuarantine => {
                 // The head waits behind the call, so roxy sees it only once
@@ -615,6 +656,9 @@ impl Conn {
             | Mode::NoContent
             | Mode::EarlyNoContent
             | Mode::CutForward
+            | Mode::AnswerOpen
+            | Mode::CutWait
+            | Mode::TrailersCut
             | Mode::LateQuarantine
             | Mode::Audit => {}
             Mode::Host => self.call_host(

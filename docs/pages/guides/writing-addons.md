@@ -28,7 +28,7 @@ roxy_addon::export!(RedactTokens);
 - `Next` is consumed by `run`, so the type system enforces one `next` per
   exchange. `next.run` returns once the response head arrives, while the
   rest of the request body is pumped as the layer reads the response, so a
-  layer below that answers early cannot deadlock against the host's small
+  layer upstream that answers early cannot deadlock against the host's small
   body buffers.
 - `flow::*` and `call_endpoint` wrap the host services. A panic traps, and
   the host fails the exchange closed.
@@ -63,7 +63,7 @@ boundary in one call. Bodies are plain `wasi:io/streams` (vendored at
   (`next`, `respond`), `endpoints`, `flow`, and the WASI clocks, random, io
   and stdio interfaces.
 - A layer answers with `chain.respond(response-head, body)`, once, before
-  `handle` returns; `chain.next(request-head, body)` passes a request down,
+  `handle` returns; `chain.next(request-head, body)` passes a request upstream,
   once. Neither waits on the other: a layer may answer and then forward,
   forward and answer before the response from upstream arrives, or answer
   without forwarding; its answer reaches the client as soon as it is made,

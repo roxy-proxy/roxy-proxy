@@ -69,7 +69,7 @@ pub(super) async fn run(st: Arc<StackFlow>, index: usize, io: LayerIo) {
         // Nothing reached the layer: nothing leaves it, and what comes
         // back from upstream for that nothing is passed on.
         Some(Err(headless)) => Some(Entered::Through(
-            below_lanes(&st, index, Err(headless), false).await,
+            forward_lanes(&st, index, Err(headless), false).await,
         )),
     };
     match entered {
@@ -123,7 +123,9 @@ async fn enter(
     let req = match select::selects(st, index, &addon, req) {
         Ok((true, req)) => req,
         // Skipped: as if the layer passed both directions on unchanged.
-        Ok((false, req)) => return Entered::Through(below_lanes(st, index, Ok(req), false).await),
+        Ok((false, req)) => {
+            return Entered::Through(forward_lanes(st, index, Ok(req), false).await);
+        }
         Err(e) => return Entered::Fault(e),
     };
     st.layers[index].ran.store(true, Ordering::SeqCst);
@@ -176,14 +178,14 @@ async fn enter(
 /// What layer `index`'s `next` reaches, on its lanes: the request goes
 /// upstream, and what comes back is the response, whoever produced it: the
 /// upstream's, the rules' refusal, or the refusal a failure upstream
-/// earns, put on the lane for the layers downstream to see as they would
+/// produces, carried to the layers downstream as they would receive
 /// any response. A lane that ends without a head is the one case nothing
 /// answers: the forward was cut, the client's own request failed, or a
 /// stage was torn down. `Err` forwards nothing: the lane upstream is ended
 /// as it was found. `own` says the request's body is the layer's own
 /// making (a guest's stream), so an error in it is the layer's cut rather
 /// than one it passed through.
-pub(super) async fn below_lanes(
+pub(super) async fn forward_lanes(
     st: &Arc<StackFlow>,
     index: usize,
     req: Result<LayerRequest, Headless>,

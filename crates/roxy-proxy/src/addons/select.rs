@@ -11,10 +11,10 @@ use crate::view::ProxyView;
 
 /// Whether layer `index` runs on `req`: its `when` matches the request
 /// as it reaches the layer, and `sample` picks the exchange. The request
-/// comes back for the layer, or for the layer below when it is skipped.
+/// comes back for the layer, or for the next stage upstream when it is skipped.
 ///
 /// A `when` sees the request re-validated as the core would, so a layer
-/// above that passed on something invalid fails here, attributed to it.
+/// downstream that passed on something invalid fails here, attributed to it.
 pub(super) fn selects(
     st: &StackFlow,
     index: usize,
@@ -31,8 +31,8 @@ pub(super) fn selects(
         Err(e) => {
             // A request no layer passed on is the client's, already
             // canonical.
-            let above = &snap.addons[st.passed_on_by(index).unwrap_or(0)].name;
-            st.fail(above, LayerError::InvalidRequest(e.to_string()));
+            let producer = st.passed_on_by(index).unwrap_or(0);
+            st.layer_failed(producer, LayerError::InvalidRequest(e.to_string()));
             return Err(LayerError::InvalidRequest(e.to_string()).into());
         }
     };

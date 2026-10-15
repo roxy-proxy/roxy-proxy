@@ -122,7 +122,7 @@ impl LayerHost for StackHost {
             }
             None => req,
         };
-        match super::layer::below_lanes(&self.st, self.index, Ok(req), own).await {
+        match super::layer::forward_lanes(&self.st, self.index, Ok(req), own).await {
             Ok(mut res) => {
                 if subscribe.response == Part::Head {
                     let body = std::mem::take(res.body_mut());
@@ -195,7 +195,7 @@ impl LayerHost for StackHost {
 
     fn add_tag(&self, tag: String) -> Result<(), TagError> {
         if self.observing() {
-            // A tag steers the `when` of every layer below, so it is an
+            // A tag steers the `when` of every layer upstream, so it is an
             // effect on traffic, which an observer must not have.
             let layer = &self.addon().name;
             let flow = self.st.flow.to_string();

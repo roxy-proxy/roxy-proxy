@@ -110,6 +110,14 @@ timeouts, so a long timeout costs only the idle connection it keeps:
 Tightening one trades those idle connections for cut exchanges; raise
 `max_connections` instead if idle connections are what runs out.
 
+An upstream may return its response before consuming the whole upload.
+The response can reach the client immediately, but the final flow record
+waits until upload accounting finishes. After that response head, roxy
+checks upload progress every twice `body_idle_timeout`. If no bytes were
+consumed during an interval, roxy cancels the remaining upload and records
+`upstream_body_timeout`, unless another failure already supplies the reason.
+A client cancellation also cancels the upload and releases its buffers.
+
 ### Buffer budget
 
 `max_buffered_bytes` bounds every buffer roxy holds for an exchange, in

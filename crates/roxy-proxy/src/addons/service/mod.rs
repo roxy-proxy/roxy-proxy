@@ -64,8 +64,8 @@ pub struct ServiceSpec {
     pub endpoint: String,
     /// Bounds getting a stream, then the service's answer: from roxy's
     /// request head until the service answers or forwards, and again from
-    /// the response head from below until it answers; no clock runs while
-    /// its forward is below. On an observe stream, the service's end from
+    /// an upstream outcome until it answers. The clock is suspended while
+    /// the forward is pending; a headless end restores it too. On an observe stream, the service's end from
     /// roxy's last message. Bodies have no clock.
     pub first_byte_timeout: Duration,
     /// Connections to the endpoint, at most.
@@ -419,7 +419,7 @@ fn declared_length(h: &HeaderMap) -> Result<Option<u64>, ServiceError> {
 /// known (and not zero), so a service that passes the head on keeps it.
 /// roxy checks it against the body the service sends back.
 fn head_fields(h: &HeaderMap, body: &Body) -> Vec<(String, String)> {
-    // Any `content-length` already there (passed on by a layer above) is
+    // Any `content-length` already there (passed on by a downstream layer) is
     // replaced, not repeated.
     let mut out = pairs(h);
     out.retain(|(n, _)| n != "content-length");
@@ -578,9 +578,11 @@ async fn pump_response(
         }
         Ok((Head::Request(_), _)) => unreachable!("a response lane carries responses"),
         Err(Headless::Ended) => {
+            clock.restart();
             stream.send(&Out::ResponseEnd { error: None }).await;
         }
         Err(Headless::Cut(why)) => {
+            clock.restart();
             stream.send(&Out::ResponseEnd { error: Some(why) }).await;
         }
     }

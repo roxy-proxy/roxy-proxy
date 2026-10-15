@@ -306,19 +306,18 @@ impl WasiView for StoreState {
     }
 }
 
-/// Stops the exchange's head clock while `next` runs below the layer; it
-/// restarts, with a whole budget for the response head, when `next`
-/// returns or the guest abandons it.
-struct Below(Arc<ExchangeShared>);
+/// Suspend the layer's answer deadline while its upstream request is
+/// pending. Completion or abandonment restores the layer's full budget.
+struct UpstreamWait(Arc<ExchangeShared>);
 
-impl Below {
+impl UpstreamWait {
     fn enter(shared: Arc<ExchangeShared>) -> Self {
         shared.next_started();
         Self(shared)
     }
 }
 
-impl Drop for Below {
+impl Drop for UpstreamWait {
     fn drop(&mut self) {
         self.0.next_returned();
     }
@@ -433,18 +432,17 @@ impl chain::Host for StoreState {
             request.extensions_mut().insert(GuestBody);
         }
 
-        // Entered here, not in the task: the guest may cut the body it just
-        // passed before the task has run, and the cut must find `next`
-        // below.
-        let below = Below::enter(shared.clone());
+        // Suspend the deadline before spawning: the guest can keep running
+        // before the upstream task is first polled.
+        let upstream_wait = UpstreamWait::enter(shared.clone());
         let fut = wasmtime_wasi::runtime::spawn(async move {
             let resp = host.next(request).await;
-            drop(below);
+            drop(upstream_wait);
             match resp {
                 Ok(Some(resp)) => Ok(resp),
                 // Nothing came back for the forward (it was cut, or
-                // nothing upstream answered): the guest's `next` fails,
-                // and nothing has failed.
+                // nothing upstream answered): return an error to this call
+                // without marking the layer as faulty.
                 Ok(None) => Err(internal("no response")),
                 Err(e) => {
                     shared.fail(LayerError::Host(e));

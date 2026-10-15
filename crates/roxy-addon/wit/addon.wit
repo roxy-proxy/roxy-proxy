@@ -1,9 +1,9 @@
 /// roxy addon layers.
 ///
-/// A layer is a component that sits in an exchange's layer stack above the
-/// rules. It receives each request through `handler.handle` as one
-/// `request-head` record and a body stream, may pass a request down the
-/// stack once with `chain.next`, and answers with `chain.respond`. Heads
+/// A layer is a component downstream of the rules in an exchange's stack.
+/// It receives each request through `handler.handle` as one `request-head`
+/// record and a body stream. It may forward a request upstream once with
+/// `chain.next`, and answers with `chain.respond`. Heads
 /// cross the boundary as records, one per direction; bodies are
 /// `wasi:io/streams` in both directions.
 ///
@@ -95,7 +95,7 @@ interface types {
   }
 }
 
-/// The layers below this one, and the answer to the client.
+/// The stages upstream of this layer, and the answer to the client.
 interface chain {
   use types.{request-head, response-head, body, pending-response, error};
   use wasi:io/streams@0.2.12.{output-stream};

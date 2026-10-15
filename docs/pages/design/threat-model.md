@@ -121,12 +121,12 @@ behind or its disk fails, roxy holds traffic back until it catches up
 
 ## The rules judge everything that leaves
 
-Addons sit above the rules and can reshape traffic freely, but what they
+Addons sit downstream of the rules and can reshape traffic freely, but what they
 pass on is re-validated as strictly as a client request and judged by the
 rules as if the client had sent it. Nothing configurable runs between the
 rules and the network, and the address floor checks the IP actually
-dialled. A refusal the rules make travels back up through the addons as a
-response, which an addon above may reshape, into one the client takes as
+dialled. A refusal the rules make travels downstream through the addons as a
+response, which a downstream addon may reshape, into one the client takes as
 success included: addons are trusted configuration, the request did not
 leave, and the flow log records the rules' verdict whatever the client was
 given ([addon model](/design/addon-model)).

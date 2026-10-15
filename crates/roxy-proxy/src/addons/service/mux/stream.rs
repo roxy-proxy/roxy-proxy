@@ -551,8 +551,7 @@ impl Stream {
         let n = b.len() as u64;
         let mut s = lock(&self.state);
         let lane = s.lane(dir);
-        if self.mode == AddonMode::Enforce && (lane.sent == Sent::Nothing || lane.sent == Sent::End)
-        {
+        if self.mode == AddonMode::Enforce && lane.sent != Sent::Head {
             drop(s);
             self.fail(
                 ServiceError::Protocol(format!(
@@ -791,7 +790,12 @@ impl Stream {
         let mut calls = lock(&self.calls);
         let tx = calls.get_or_insert_with(|| {
             let (tx, rx) = mpsc::channel(MAX_HOST_CALLS_WAITING);
-            tokio::spawn(self.clone().host_calls(rx));
+            let work = self.clone().host_calls(rx);
+            if self.mode == AddonMode::Enforce {
+                self.st.chain().spawn(work);
+            } else {
+                tokio::spawn(work);
+            }
             tx
         });
         let full = matches!(tx.try_send(call), Err(mpsc::error::TrySendError::Full(_)));
@@ -864,7 +868,9 @@ impl Stream {
     fn feed(self: &Arc<Self>, dir: Dir, body: super::super::super::chain::LaneBody) {
         let inbox = Arc::new(Inbox::default());
         lock(&self.state).lane(dir).inbox = Some(inbox.clone());
-        tokio::spawn(feeder(self.clone(), inbox, body, dir));
+        self.st
+            .chain()
+            .spawn(feeder(self.clone(), inbox, body, dir));
     }
 }
 

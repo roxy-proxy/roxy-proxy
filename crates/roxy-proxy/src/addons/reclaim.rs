@@ -1,7 +1,6 @@
-//! The flow's one [`FlowCx`] through an exchange with a stack: parked in
-//! the stack while the layers run, lent to the core while a forwarded
-//! request runs, and taken back by the front for the record once the
-//! exchange has nothing left that could need it.
+//! Keep the flow context available while the core stage processes the
+//! upstream exchange. The HTTP transport handler retrieves it for the final
+//! log only after lane consumers, drivers, and accounting have finished.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,9 +10,8 @@ use tokio::sync::Notify;
 use super::{StackFlow, lock};
 use crate::pipeline::FlowCx;
 
-/// The context, lent to the core for as long as it runs. It goes back to
-/// the stack however the core ends, dropped mid-flight included, so
-/// nothing the core recorded is lost.
+/// Exclusive ownership of the context during core-stage processing. Drop
+/// returns it to the stack, including when that processing is cancelled.
 pub(super) struct Lease {
     pub(super) st: Arc<StackFlow>,
     pub(super) cx: Option<FlowCx>,
@@ -32,6 +30,7 @@ impl Drop for Lease {
         let Some(mut cx) = self.cx.take() else {
             return;
         };
+        drop(cx.request_delivery.take());
         if !self.done && cx.record.decision.is_some() {
             // The rules had decided and the request was on its way.
             cx.record
@@ -48,7 +47,7 @@ pub(super) struct Loan {
     /// Something a waiter checks has changed: the context came back, or a
     /// layer's part in the exchange moved on.
     changed: Notify,
-    /// The front took the context back: nothing in the stack sees it
+    /// The transport handler took the context back: nothing in the stack sees it
     /// again.
     gone: AtomicBool,
 }
@@ -97,7 +96,7 @@ impl Loan {
     }
 
     /// The context, once the core has returned it or if it never took
-    /// it; a core still running keeps it. `None` once the front has it: it
+    /// it; a core still running keeps it. `None` once the transport handler has it: it
     /// is not coming back.
     pub(super) async fn returned(&self) -> Option<FlowCx> {
         self.wait_until(|loan| {
@@ -109,15 +108,15 @@ impl Loan {
         .await
     }
 
-    /// Marks the context as the front's.
+    /// Marks the context as the transport handler's.
     pub(super) fn taken(&self) {
         self.gone.store(true, Ordering::SeqCst);
         self.changed();
     }
 }
 
-/// The flow's [`FlowCx`] on its way back to the front. The stack lends it
-/// to the core while a forwarded request runs, and the front takes it back
+/// The flow's [`FlowCx`] on its way back to the transport handler. The stack lends it
+/// to the core while a forwarded request runs, and the transport handler takes it back
 /// once nothing in the stack can still need it: a layer's answer reaches
 /// the client first, the record is finished when the exchange has ended.
 pub(crate) enum Reclaim {
@@ -127,10 +126,8 @@ pub(crate) enum Reclaim {
     Stack(Held),
 }
 
-/// A stack the front has yet to take the context from. Dropped before
-/// that (the front gave up on the exchange: its task was aborted with the
-/// connection), it tears the stack down, so nothing the stack still runs
-/// outlives the front that asked for it.
+/// Cancel the exchange if its transport task exits before collecting the
+/// final context. This also covers tasks aborted with their connection.
 pub(crate) struct Held {
     st: Arc<StackFlow>,
     taken: bool,
@@ -156,24 +153,66 @@ impl Reclaim {
     /// The flow context, once the stack has let go of it. A stack that
     /// answered folds its answer into the record.
     pub(crate) async fn take(self) -> FlowCx {
+        self.take_until(std::future::pending::<()>()).await.0
+    }
+
+    /// Keep observing the client while the exchange finishes. Cancellation
+    /// tears down the drivers, then waits for their final accounting.
+    pub(crate) async fn take_until<F: Future>(self, cancelled: F) -> (FlowCx, Option<F::Output>) {
         match self {
-            Reclaim::Now(cx) => *cx,
+            Reclaim::Now(mut cx) => {
+                let delivery = cx.request_delivery.take();
+                let wait = async {
+                    match &delivery {
+                        Some(d) => {
+                            d.wait(cx.snap.limits.body_idle_timeout.saturating_mul(2))
+                                .await
+                        }
+                        None => true,
+                    }
+                };
+                let (complete, cancellation) = tokio::select! {
+                    complete = wait => (complete, None),
+                    reason = cancelled => (true, Some(reason)),
+                };
+                drop(delivery);
+                if !complete {
+                    cx.record
+                        .reason
+                        .get_or_insert_with(|| "upstream_body_timeout".to_owned());
+                }
+                (*cx, cancellation)
+            }
             Reclaim::Stack(mut held) => {
-                let mut cx = held.st.reclaim().await;
+                let (mut cx, cancellation) = {
+                    let take = held.st.reclaim();
+                    tokio::pin!(take);
+                    tokio::select! {
+                        cx = &mut take => (cx, None),
+                        reason = cancelled => {
+                            held.st.tear_down(super::CLIENT_GONE);
+                            (take.await, Some(reason))
+                        }
+                    }
+                };
                 held.taken = true;
                 held.st.fold_answer(&mut cx);
                 cx.stack = Some(held.st.clone());
-                cx
+                (cx, cancellation)
             }
         }
     }
 
-    /// Stops whatever the stack still has running, so `take` returns as
-    /// soon as the core has let go. `why` is what a service still on the
-    /// exchange is told.
+    /// Cancel remaining work. Reclamation still waits for body disposal
+    /// and driver completion; services receive `why` as the reset reason.
     pub(crate) fn tear_down(&self, why: &'static str) {
-        if let Reclaim::Stack(held) = self {
-            held.st.tear_down(why);
+        match self {
+            Reclaim::Stack(held) => held.st.tear_down(why),
+            Reclaim::Now(cx) => {
+                if let Some(delivery) = &cx.request_delivery {
+                    delivery.cancel();
+                }
+            }
         }
     }
 

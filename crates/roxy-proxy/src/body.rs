@@ -17,6 +17,132 @@ use roxy_http::{Body, BodyError, ParseError, Reason};
 use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
+/// The upstream HTTP client may retain an upload after returning its
+/// response head. Its exchange keeps this owner until delivery finishes,
+/// or drops it to cancel the upload even if the HTTP client is not polling.
+pub(crate) struct Delivery(Arc<DeliveryState>);
+
+struct DeliveryState {
+    body: std::sync::Mutex<Option<Body>>,
+    finished: CancellationToken,
+    reader: futures_util::task::AtomicWaker,
+    bytes: AtomicU64,
+}
+
+impl DeliveryState {
+    fn finish(&self) {
+        // Drop the accounting adapters before publishing completion.
+        drop(
+            self.body
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+        self.finished.cancel();
+        self.reader.wake();
+    }
+}
+
+impl Delivery {
+    /// Wait for consumption or abandonment, bounded by upload progress.
+    pub(crate) async fn wait(&self, idle: Duration) -> bool {
+        let mut bytes = self.0.bytes.load(Ordering::Relaxed);
+        loop {
+            tokio::select! {
+                biased;
+                () = self.0.finished.cancelled() => return true,
+                () = tokio::time::sleep(idle) => {
+                    let next = self.0.bytes.load(Ordering::Relaxed);
+                    if next == bytes {
+                        return false;
+                    }
+                    bytes = next;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.0.finish();
+    }
+}
+
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+struct DeliveredBody {
+    shared: Arc<DeliveryState>,
+    done: bool,
+}
+
+impl Drop for DeliveredBody {
+    fn drop(&mut self) {
+        self.shared.finish();
+    }
+}
+
+impl http_body::Body for DeliveredBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        self.shared.reader.register(cx.waker());
+        let result = {
+            let mut body = self
+                .shared
+                .body
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match body.as_mut() {
+                Some(body) => Pin::new(body).poll_frame(cx),
+                None => Poll::Ready(Some(Err(BodyError::Stopped))),
+            }
+        };
+        match &result {
+            Poll::Ready(None | Some(Err(_))) => {
+                self.done = true;
+                self.shared.finish();
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    self.shared
+                        .bytes
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                }
+            }
+            Poll::Pending => {}
+        }
+        result
+    }
+}
+
+/// Retain cancellation and completion ownership when handing a body to
+/// the upstream HTTP client. Wrap outside rule checks and accounting so
+/// completion guarantees both have finished.
+pub(crate) fn delivery(body: Body) -> (Body, Delivery) {
+    let known = body.known_length();
+    let shared = Arc::new(DeliveryState {
+        body: std::sync::Mutex::new(Some(body)),
+        finished: CancellationToken::new(),
+        reader: futures_util::task::AtomicWaker::new(),
+        bytes: AtomicU64::new(0),
+    });
+    let reader = DeliveredBody {
+        shared: shared.clone(),
+        done: false,
+    };
+    (Body::wrap_native(reader, u64::MAX, known), Delivery(shared))
+}
+
 /// What a [`counted`] body has let through: the byte count as it grows,
 /// and, if asked for, the SHA-256 of the whole body once it has completed.
 #[derive(Debug, Default)]
@@ -425,6 +551,47 @@ mod tests {
         let (b, _, sent) = counted_until_sent(Body::from_bytes("never polled"), true);
         drop(b);
         assert!(sent.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn upload_owner_cancels_a_retained_unpolled_body() {
+        let (body, tally, sent) = counted_until_sent(Body::from_bytes("unsent"), true);
+        let (body, owner) = delivery(body);
+        drop(owner);
+        assert!(
+            sent.is_cancelled(),
+            "inner accounting adapters were released"
+        );
+        assert_eq!(tally.bytes(), 0);
+        assert!(
+            drain(body).await.is_err(),
+            "a cancelled upload cannot resume later"
+        );
+        assert_eq!(tally.bytes(), 0);
+        assert!(tally.sha256_hex().is_none());
+    }
+
+    #[tokio::test]
+    async fn upload_completion_publishes_final_accounting() {
+        let (body, tally) = counted(Body::from_bytes("hello"), true);
+        let (body, owner) = delivery(body);
+        let wait = owner.wait(Duration::from_secs(1));
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(wait.as_mut()).is_pending());
+        assert_eq!(drain(body).await.unwrap(), b"hello");
+        assert!(wait.await);
+        assert_eq!(tally.bytes(), 5);
+        assert_eq!(tally.sha256_hex().as_deref(), Some(HELLO_SHA256));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unpolled_upload_has_a_progress_deadline() {
+        let (body, tally) = counted(Body::from_bytes("unsent"), false);
+        let (body, owner) = delivery(body);
+        assert!(!owner.wait(Duration::from_millis(100)).await);
+        drop(owner);
+        assert!(drain(body).await.is_err());
+        assert_eq!(tally.bytes(), 0);
     }
 
     const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";

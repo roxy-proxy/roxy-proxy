@@ -39,7 +39,7 @@ fn failed_link() -> Arc<Link> {
 }
 
 /// The lanes around a lone stream's layer: where its forward arrives
-/// (the core edge's end) and where its answer arrives (the client edge's
+/// (the core stage's end) and where its answer arrives (the client edge's
 /// end).
 struct Around {
     forward: LaneRx,
@@ -121,6 +121,35 @@ fn request_head() -> In {
         method: "POST".to_owned(),
         url: "http://up.test/x".to_owned(),
         headers: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn data_after_trailers_is_rejected() {
+    for dir in [Dir::Request, Dir::Response] {
+        for feed_first in [false, true] {
+            let (stream, _around, _kit) = lone_stream().await;
+            stream.control(match dir {
+                Dir::Request => request_head(),
+                Dir::Response => In::Response {
+                    status: 200,
+                    headers: Vec::new(),
+                },
+            });
+            stream.control(In::Trailers {
+                dir,
+                headers: vec![("x-check".to_owned(), "done".to_owned())],
+            });
+            if feed_first {
+                tokio::task::yield_now().await;
+            }
+            stream.bytes(dir, b"after trailers");
+            assert!(
+                lock(&stream.state).ended(),
+                "DATA after trailers was accepted"
+            );
+            assert_eq!(service_fault(&stream).kind(), "service:protocol");
+        }
     }
 }
 

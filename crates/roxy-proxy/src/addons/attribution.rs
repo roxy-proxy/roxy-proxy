@@ -3,7 +3,7 @@
 //!
 //! Every party records its own failure before anything downstream of it
 //! can fail on it: a layer as it fails (before its bodies end), a body
-//! where it enters the stack (before its error reaches a reader), the front
+//! where it enters the stack (before its error reaches a reader), the transport handler
 //! as it gives the exchange up (before the stack sees the drop). So the
 //! first fault recorded is the cause and every later one a consequence,
 //! and nothing weighs one against another: the recorder keeps the first
@@ -27,7 +27,7 @@ pub(crate) enum Fault {
     /// the response head is already out, else with the stack's refusal.
     Layer { name: String, err: StackError },
     /// The client's request body failed on its way in (framing, a cut, a
-    /// timeout), or the front gave the exchange up: the exchange closes as
+    /// timeout), or the transport handler gave the exchange up: the exchange closes as
     /// a client's would without a stack.
     Client(ParseError),
     /// The upstream's response body failed before a layer had answered
@@ -103,7 +103,7 @@ impl Attribution {
         }
     }
 
-    /// Logs the standing layer fault with the stack's refusal, before the
+    /// Logs the first recorded layer fault with the stack's refusal, before the
     /// head.
     pub(crate) fn log(&self) {
         let mut s = super::lock(&self.state);
@@ -190,8 +190,8 @@ pub(crate) fn attributed(st: &Arc<StackFlow>, side: Side, body: Body) -> Body {
     )
 }
 
-/// The stack's answer as the front drives it. Dropped before it resolved
-/// (the front gave the exchange up: the client's body failed, or the
+/// The stack's answer as the transport handler drives it. Dropped before it resolved
+/// (the transport handler gave the exchange up: the client's body failed, or the
 /// client went away), it records that first, so what the layers make of
 /// their bodies and `next` ending is a consequence.
 pub(crate) struct Driven<F> {

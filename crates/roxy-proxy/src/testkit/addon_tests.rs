@@ -114,7 +114,7 @@ async fn a_failure_is_attributed_to_the_layer_that_failed() {
 }
 
 /// The outermost layer answering itself is `answered` and named; nothing
-/// below it runs.
+/// upstream of it runs.
 #[tokio::test]
 async fn an_outer_layer_answering_is_answered() {
     let kit = stack(&named(&["a", "b"])).await;
@@ -254,7 +254,7 @@ async fn a_client_upload_failing_mid_body_is_not_the_layers_fault() {
     // coming, so the layer is still relaying both streams when the upload
     // stalls past `body_idle_timeout` under it. Over HTTP/2 the response
     // stream stays up on a request body failure, so the layer, not the
-    // front, is the first to act on it.
+    // transport, is the first to act on it.
     let kit = Kit::builder()
         .rules(RULES)
         .addon(AddonDef::test_layer("a"))
@@ -380,7 +380,7 @@ async fn an_observer_cannot_block_but_an_enforcer_below_it_can() {
     assert_eq!(reqs[1]["terminal_rule"], "layer:b", "{reqs:#?}");
 }
 
-/// An enforcer failing below an observer ends the observer's `next` too;
+/// An enforcer failing upstream of an observer ends the observer's `next` too;
 /// the one `layer_error` is the enforcer's.
 #[tokio::test]
 async fn a_failure_below_an_observer_is_not_logged_as_the_observers() {
@@ -413,7 +413,7 @@ async fn a_failure_below_an_observer_is_not_logged_as_the_observers() {
     assert_eq!(errs.len(), 1, "{errs:#?}");
 }
 
-/// An enforcer failing below an observer after the head cuts the real
+/// An enforcer failing upstream of an observer after the head cuts the real
 /// body and the observer's copy with it; the observer's own end is a
 /// consequence, and the one `layer_error` is the enforcer's.
 #[tokio::test]
@@ -453,7 +453,7 @@ async fn an_enforcer_failing_after_the_head_below_an_observer_is_the_one_logged(
 }
 
 /// A deny at admission, by the rules or by a layer, never reads the request
-/// body. The observer above it reads its copy to a clean end and sees the
+/// body. The observer downstream of it reads its copy to a clean end and sees the
 /// deny from `next`; nothing is logged against it.
 #[tokio::test]
 async fn an_observer_above_a_deny_sees_its_copy_end_cleanly() {
@@ -730,9 +730,9 @@ async fn a_skipped_layer_passes_an_inner_answer_through() {
 }
 
 /// A `when` sees the request as it reaches the layer: what the layer
-/// above passed on, not what the client sent.
+/// downstream passed on, not what the client sent.
 #[tokio::test]
-async fn when_sees_the_request_the_layer_above_passed_on() {
+async fn when_sees_the_request_the_downstream_layer_passed_on() {
     let kit = stack(&[
         AddonDef::test_layer("a"),
         AddonDef::test_layer("b").when(r#"path == "/rewritten""#),
@@ -750,7 +750,7 @@ async fn when_sees_the_request_the_layer_above_passed_on() {
     assert_eq!(strs(&ev["addons"]), ["a", "b"], "{ev:#}");
 }
 
-/// An observer passes nothing on, so what reaches the layers below it is
+/// An observer passes nothing on, so what reaches the layers upstream of it is
 /// the nearest enforcing layer's: that layer is blamed when its request
 /// does not validate, whether a `when` or the core finds out.
 #[tokio::test]
@@ -837,7 +837,7 @@ async fn a_layers_tag_is_read_by_the_rules_below_it() {
 }
 
 /// An observer's tag is refused, so it cannot steer a lower layer's `when`:
-/// the gate below stays skipped and the flow carries no such tag. The
+/// the gate upstream stays skipped and the flow carries no such tag. The
 /// refusal is the observer's failure, logged like any other.
 #[tokio::test]
 async fn an_observer_cannot_tag_a_flow_past_a_gate_below_it() {
@@ -1355,7 +1355,7 @@ mod service {
         .unwrap_or_else(|_| panic!("stream {id} is reset: {:?}", service.resets()))
     }
 
-    /// A WASM layer below the service fails after the response head: the
+    /// A WASM layer upstream of the service fails after the response head: the
     /// service passes the cut body on, and the flow log names the layer
     /// that failed.
     #[tokio::test]
@@ -1388,7 +1388,7 @@ mod service {
         assert_eq!(errs[0]["kind"], "trap", "{errs:#?}");
     }
 
-    /// A service failing after the response head below an observer cuts the
+    /// A service failing after the response head upstream of an observer cuts the
     /// real body and the observer's copy with it; the observer's own end is
     /// a consequence, and the one `layer_error` is the service's.
     #[tokio::test]
@@ -1460,7 +1460,7 @@ mod service {
         service_header_round_trip(b"caf\xe9").await;
     }
 
-    /// A WASM layer below the service fails before the service has
+    /// A WASM layer upstream of the service fails before the service has
     /// answered the response head: the layer is blamed, not the upstream,
     /// and the client gets the layer's `503`.
     #[tokio::test]
@@ -1656,7 +1656,7 @@ mod service {
 
     /// A service that sends more of the request it forwards than it
     /// declared fails as a protocol violation, logged against it, though
-    /// the exchange is still below the layer when it happens: here the
+    /// the exchange is still upstream of the layer when it happens: here the
     /// rules read the body, and the core ends on its failure.
     #[tokio::test]
     async fn a_forwarded_body_longer_than_declared_is_the_services_fault() {
@@ -2099,12 +2099,10 @@ mod service {
         no_layer_error(&kit);
     }
 
-    /// An upgrade the stack relayed that roxy then refuses (here the
-    /// buffers its message rules need cannot be had) ends the exchange for
-    /// the stack too: the service's stream is reset, not left carrying a
-    /// socket nothing relays.
+    /// The core reserves relay buffers before publishing a `101`. If that
+    /// fails, the service receives a normal refusal and releases its slot.
     #[tokio::test]
-    async fn an_upgrade_refused_after_the_stack_relayed_it_resets_the_service() {
+    async fn an_upgrade_without_relay_buffers_is_refused_before_101() {
         let rules = format!(
             "{RULES}
 - id: no-binary
@@ -2114,7 +2112,10 @@ mod service {
         );
         let kit = kit_with(
             &rules,
-            vec![addon("s", "pass", AddonMode::Enforce, |_| {})],
+            vec![addon("s", "pass", AddonMode::Enforce, |s| {
+                s.max_connections = 1;
+                s.max_streams = 1;
+            })],
             |b| b.limits(|l| l.max_buffered_bytes = l.max_ws_message_bytes),
         )
         .await;
@@ -2123,7 +2124,24 @@ mod service {
         assert!(io.is_none());
         let service = kit.upstream.service();
         let stream = stream_id(&service.until_opened(1).await[0]);
-        reset_of(&kit, stream).await;
+        let controls = service.controls(stream);
+        assert!(
+            controls
+                .iter()
+                .any(|m| m["type"] == "response" && m["status"] == 503),
+            "{controls:?}"
+        );
+        assert!(
+            !controls
+                .iter()
+                .any(|m| m["type"] == "response" && m["status"] == 101),
+            "{controls:?}"
+        );
+        let (status, _) = tokio::time::timeout(Duration::from_secs(5), kit.websocket("/ws", &[]))
+            .await
+            .expect("the first stream released its slot");
+        assert_eq!(status, 503);
+        service.until_opened(2).await;
     }
 
     /// The relay's end resets a stream whose bodies have not both ended:
@@ -2221,7 +2239,7 @@ mod service {
 
     /// A service that fails with the response from upstream open at it (its
     /// clock runs out while the body is idle) takes the body down with its
-    /// stream, so the record is finished on the refusal the layer above
+    /// stream, so the record is finished on the refusal the downstream layer
     /// passes on, not held until the body yields.
     #[tokio::test(start_paused = true)]
     async fn a_body_idle_at_a_failed_service_goes_with_its_stream() {
@@ -2255,7 +2273,7 @@ mod service {
 
     /// The client leaving before the answer (an HTTP/2 connection closed
     /// with the stream open) tears the stack down: a service holding the
-    /// exchange is reset, however far the layers above have got and
+    /// exchange is reset, however far the downstream layers have got and
     /// whether or not its forward is through.
     #[tokio::test]
     async fn h2_the_client_leaving_before_the_answer_resets_the_service() {
@@ -2281,7 +2299,7 @@ mod service {
         reset_of(&kit, stream).await;
     }
 
-    /// A response body that fails below the service ends the response lane
+    /// A response body that fails upstream of the service ends the response lane
     /// with the error and nothing more: the stream is not reset, the
     /// service passes the cut on, and the client's body is cut as it would
     /// be without a layer.
@@ -2423,7 +2441,7 @@ mod service {
 
 const SECRET: &str = "s3cr3t-token-value-0123456789";
 
-/// A single test layer `t` in front of the default rules.
+/// A single test layer `t` downstream of the default rules.
 async fn one(def: AddonDef) -> Kit {
     Kit::builder().addon(def).start().await
 }
@@ -2872,7 +2890,7 @@ async fn a_layer_can_quarantine_the_proxy_if_granted() {
     assert!(kit.server.handle().quarantine().is_none());
 
     // The probe answers without `next`: the refusal is the exchange's
-    // admission decision, with its sample, as it would be above the stack.
+    // admission decision, with its sample, as it would be at the client edge.
     let kit = Kit::builder()
         .addon(AddonDef::test_layer("t").caps(&[Capability::Quarantine]))
         .metric_defs("- { id: by_host, count: requests, key: [host], window: 1h }")
@@ -3176,7 +3194,7 @@ async fn bytes_on_an_unsubscribed_body_fail_the_layer() {
 }
 
 /// A head-only layer that answers itself answers whole: there is no body
-/// from below to splice onto its own. The client's body, which the layer
+/// from upstream to splice onto its own. The client's body, which the layer
 /// never took, is dropped like one a layer left unread: a large upload
 /// does not hold the connection.
 #[tokio::test]
@@ -3203,7 +3221,7 @@ async fn a_head_only_layer_may_still_answer_itself() {
 }
 
 /// A response head-only layer that answers with another status has
-/// answered itself: its body stands and the body from below is dropped,
+/// answered itself: its body stands and the body from upstream is dropped,
 /// where the same status passes the response on with the head edited.
 #[tokio::test]
 async fn a_head_only_layer_refuses_at_the_response_head_by_changing_the_status() {
@@ -3219,7 +3237,7 @@ async fn a_head_only_layer_refuses_at_the_response_head_by_changing_the_status()
         )
         .await;
     assert_eq!(a.status, 451, "{a:?}");
-    assert_eq!(a.text(), "", "the body from below is dropped: {a:?}");
+    assert_eq!(a.text(), "", "the body from upstream is dropped: {a:?}");
     let a = c.call("GET", "/x", &[("x-test-t", "pass")], b"").await;
     assert_eq!(a.status, 200, "{a:?}");
     assert_eq!(

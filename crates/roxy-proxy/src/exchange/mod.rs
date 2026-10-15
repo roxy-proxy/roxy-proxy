@@ -38,7 +38,7 @@ use crate::server::Shared;
 use crate::upstream::{ConnectError, ConnectInfo, Protocols, UpstreamBody, classify, describe};
 use crate::view::host_text;
 
-pub(crate) use ws::close_upstream_ws;
+pub(crate) use ws::{close_upstream_ws, prepare_websocket, relay_websocket};
 
 /// The client connection after an exchange: `None` once it is closed.
 pub(crate) type Next = Option<ServerConn<ClientIo>>;
@@ -55,22 +55,22 @@ pub(crate) async fn respond(mut conn: ServerConn<ClientIo>, res: CanonicalRespon
     Some(conn)
 }
 
-/// Why a front could not write a response.
+/// Why a transport could not write a response.
 #[derive(Debug)]
 pub(crate) enum WriteFailure {
-    /// An in-flight rule stopped the exchange mid-body; the front cut the
+    /// An in-flight rule stopped the exchange mid-body; the transport cut the
     /// body (h1 closes the connection, h2 resets the stream).
     Stopped,
     /// The client stopped reading or went away.
     ClientGone(String),
     /// The client's HTTP/2 flow-control window stayed shut for
-    /// `body_idle_timeout`; the front cut the body.
+    /// `body_idle_timeout`; the transport cut the body.
     ClientStalled,
     /// The upstream sent no response-body frame for
-    /// `response_body_idle_timeout`; the front cut the body.
+    /// `response_body_idle_timeout`; the transport cut the body.
     UpstreamStalled,
     /// The client's request body was rejected (framing, a limit, a
-    /// timeout) while the response was being written; the front cut the
+    /// timeout) while the response was being written; the transport cut the
     /// body.
     Request(ParseError),
     /// Anything else: the upstream body failed mid-stream, a stalled or
@@ -102,7 +102,7 @@ impl From<WriteError> for WriteFailure {
     }
 }
 
-/// What a front writes to end an exchange: the upstream's response (after
+/// What a transport writes to end an exchange: the upstream's response (after
 /// the response steps) or roxy's own answer.
 pub(crate) enum Answer {
     Response(CanonicalResponse),
@@ -119,20 +119,19 @@ pub(crate) struct Sent {
     pub close: bool,
 }
 
-/// Sends `answer` through `write`, the front's wire action, and does the
+/// Sends `answer` through `write`, the transport's wire action, and does the
 /// accounting around it: the flow record, a `response_error` event if the
 /// write failed, the final metric sample and the `request` event. The
-/// fronts only write bytes.
+/// transport handlers write the bytes and observe client cancellation.
 ///
-/// A response is written before the flow context is taken back: a layer's
-/// answer reaches the client while the request it forwarded is still
-/// below, and the record is finished once the core has returned the
-/// context. A refusal ends the stack first: nothing below it answers.
-pub(crate) async fn send<W, Fut>(reclaim: Reclaim, answer: Answer, write: W) -> Sent
-where
-    W: FnOnce(CanonicalResponse) -> Fut,
-    Fut: std::future::Future<Output = Result<(), WriteFailure>>,
-{
+/// A layer's answer can reach the client while its forwarded request is
+/// still running upstream. The final record waits for lane consumers,
+/// drivers and accounting to finish. A refusal cancels the stack first.
+pub(crate) async fn send(
+    reclaim: Reclaim,
+    answer: Answer,
+    writer: &mut impl ResponseWriter,
+) -> Sent {
     let (reclaim, mut res, refusal) = match answer {
         Answer::Response(res) => (reclaim, res, None),
         // A refusal is roxy's own answer: the stack, if there was one, is
@@ -151,8 +150,7 @@ where
     // carries its close here, where `Answer::Refusal` carries it in the
     // refusal.
     let closing = res.meta.close;
-    let r = write(res).await;
-    let failed = r.is_err();
+    let mut r = writer.write(res).await;
     match &r {
         Err(WriteFailure::ClientGone(_) | WriteFailure::ClientStalled) => {
             reclaim.tear_down(crate::addons::CLIENT_GONE);
@@ -160,7 +158,12 @@ where
         Err(_) => reclaim.tear_down(crate::addons::ENDED),
         Ok(()) => reclaim.response_written(),
     }
-    let mut cx = Box::new(reclaim.take().await);
+    let (cx, cancellation) = writer.reclaim(reclaim).await;
+    if let Some(e) = cancellation {
+        r = r.and(Err(e));
+    }
+    let failed = r.is_err();
+    let mut cx = Box::new(cx);
     cx.record.response_status = Some(status);
     cx.record.response_headers_bytes = headers_bytes;
     cx.record.response_bytes = tally.bytes();
@@ -179,7 +182,7 @@ where
             Some((e.reason.as_str().to_owned(), WriteFailure::Request(e)))
         }
         // A body that failed into the addon stack was recorded there as
-        // whoever's fault it was, before the cut reached the front.
+        // whoever's fault it was, before the cut reached the transport.
         Err(e @ WriteFailure::Io(_)) => {
             let reason = cx
                 .stack
@@ -195,7 +198,7 @@ where
         emit_response_error(&cx, &reason, &e);
         cx.record.reason.get_or_insert(reason);
     }
-    // One source for both fronts: `refusal_response` sets `res.meta.close`
+    // One source for both transports: `refusal_response` sets `res.meta.close`
     // from the same field. A refusal of a forward made after the response
     // was written asked through the stack.
     let close = match &refusal {
@@ -267,11 +270,25 @@ pub(crate) fn finish_refusal(cx: &mut FlowCx, refusal: &Refusal) {
 
 /// Writes `answer` on the h1 codec and logs the exchange.
 async fn answer(mut conn: ServerConn<ClientIo>, reclaim: Reclaim, answer: Answer) -> Next {
-    let sent = send(reclaim, answer, |res| async {
-        conn.respond(res).await.map_err(WriteFailure::from)
-    })
-    .await;
+    let sent = send(reclaim, answer, &mut conn).await;
     (!sent.failed && !conn.is_closed()).then_some(conn)
+}
+
+/// Client output and reclamation share a transport owner. HTTP/1.1 pumps
+/// the request body while writing the response. HTTP/2 also watches for
+/// resets during reclamation, after an early response ended on the wire.
+pub(crate) trait ResponseWriter {
+    async fn write(&mut self, res: CanonicalResponse) -> Result<(), WriteFailure>;
+
+    async fn reclaim(&mut self, reclaim: Reclaim) -> (FlowCx, Option<WriteFailure>) {
+        (reclaim.take().await, None)
+    }
+}
+
+impl ResponseWriter for ServerConn<ClientIo> {
+    async fn write(&mut self, res: CanonicalResponse) -> Result<(), WriteFailure> {
+        self.respond(res).await.map_err(WriteFailure::from)
+    }
 }
 
 /// Records a client-side failure (`status` is what the client was told, if
@@ -359,7 +376,7 @@ async fn close_on_drive_error(
 /// The client side of an exchange, as the transport-agnostic core sees it:
 /// body access for the inspecting steps ([`BodyIo`]) plus a way to wait for
 /// the upstream while the client's request body keeps flowing.
-pub(crate) trait Front: BodyIo {
+pub(crate) trait ClientTransport: BodyIo {
     /// Runs `fut` (the upstream request) while the client's request body
     /// keeps flowing into it, answering `100 Continue` first if the client
     /// waits for it. `Err` means the client side ended the exchange (body
@@ -375,7 +392,7 @@ pub(crate) trait Front: BodyIo {
         F::Output: Send;
 }
 
-impl Front for ServerConn<ClientIo> {
+impl ClientTransport for ServerConn<ClientIo> {
     fn drive<F>(
         &mut self,
         fut: F,
@@ -388,10 +405,9 @@ impl Front for ServerConn<ClientIo> {
     }
 }
 
-/// What the transport-agnostic core decided. Each front end (h1 codec, h2
-/// stream) turns this into wire actions. Nothing here forwards: the
-/// upstream exchange has already happened (or was refused) by the time an
-/// outcome exists.
+/// The response or upgrade handoff returned to a transport. An outcome
+/// can arrive while upload or layer work continues; reclamation waits for
+/// that work before the final flow record is written.
 pub(crate) enum Outcome {
     /// Send this response (from the upstream, after the response steps).
     Respond(CanonicalResponse),
@@ -406,14 +422,19 @@ pub(crate) enum Outcome {
         upstream: hyper::upgrade::Upgraded,
         key: WsKey,
     },
+    /// A prepared upgrade whose relay is owned by the core stage.
+    LayeredUpgrade {
+        res: CanonicalResponse,
+        client: crate::addons::WsClient,
+    },
 }
 
 /// The transport-agnostic exchange: request steps → upstream → response
 /// steps. `cx` carries the flow record and comes back with the outcome,
 /// through the [`Reclaim`] when the addon stack may still hold it; the
 /// caller writes the outcome and emits the flow's `request` event.
-pub(crate) async fn process<F: Front>(
-    front: &mut F,
+pub(crate) async fn process<F: ClientTransport>(
+    transport: &mut F,
     mut cx: FlowCx,
     mut req: CanonicalRequest,
 ) -> (Reclaim, Outcome) {
@@ -440,19 +461,25 @@ pub(crate) async fn process<F: Front>(
         return (Reclaim::now(cx), Outcome::Refuse(refusal));
     }
     let (reclaim, outcome) = if cx.snap.addons.is_empty() {
-        let outcome = core(front, &mut cx, req).await;
+        let outcome = core(transport, &mut cx, req).await;
         (Reclaim::now(cx), outcome)
     } else {
-        crate::addons::run(front, cx, req).await
+        crate::addons::run(transport, cx, req).await
     };
     // A layer may have quarantined the process while it held the exchange:
     // whatever it answered, the client gets the refusal.
     match outcome {
-        Outcome::Respond(_) | Outcome::Upgrade { .. } if reclaim.quarantined() => {
-            if let Outcome::Upgrade { upstream, .. } = outcome {
-                // Nothing will relay the upgraded upstream: close it
-                // rather than drop it mid-handshake.
-                tokio::spawn(close_upstream_ws(upstream));
+        Outcome::Respond(_) | Outcome::Upgrade { .. } | Outcome::LayeredUpgrade { .. }
+            if reclaim.quarantined() =>
+        {
+            match outcome {
+                Outcome::Upgrade { upstream, .. } => {
+                    tokio::spawn(close_upstream_ws(upstream));
+                }
+                other @ (Outcome::Respond(_)
+                | Outcome::Refuse(_)
+                | Outcome::Close(_)
+                | Outcome::LayeredUpgrade { .. }) => drop(other),
             }
             reclaim.tear_down(crate::addons::ENDED);
             let mut cx = reclaim.take().await;
@@ -461,30 +488,38 @@ pub(crate) async fn process<F: Front>(
                 .unwrap_or_else(Refusal::quarantined);
             (Reclaim::now(cx), Outcome::Refuse(refusal))
         }
-        Outcome::Respond(_) | Outcome::Upgrade { .. } | Outcome::Refuse(_) | Outcome::Close(_) => {
-            (reclaim, outcome)
-        }
+        Outcome::Respond(_)
+        | Outcome::Upgrade { .. }
+        | Outcome::LayeredUpgrade { .. }
+        | Outcome::Refuse(_)
+        | Outcome::Close(_) => (reclaim, outcome),
     }
 }
 
-/// The exchange below the addons: the request steps (the rules) → upstream →
-/// the response steps. Reached directly when no addon is configured, and from
-/// the last layer's `next` otherwise.
-pub(crate) async fn core<F: Front>(
-    front: &mut F,
+/// The core stage validates policy, connects upstream and checks the
+/// response. It runs directly without addons, or consumes the final
+/// request lane after the enforcing layers.
+pub(crate) async fn core<F: ClientTransport>(
+    transport: &mut F,
     cx: &mut FlowCx,
     req: CanonicalRequest,
 ) -> Outcome {
-    let verdict = request_steps(cx, req, front).await;
+    let verdict = request_steps(cx, req, transport).await;
     // Exhaustive, no wildcard: only `Continue` reaches the upstream.
-    match verdict {
+    let outcome = match verdict {
         Verdict::Continue(req) => {
             cx.record.decision = Some(DecisionKind::Allow);
-            forward(front, cx, req).await
+            forward(transport, cx, req).await
         }
         Verdict::Deny(refusal) => Outcome::Refuse(refusal),
         Verdict::Close(e) => Outcome::Close(e),
+    };
+    if matches!(outcome, Outcome::Refuse(_) | Outcome::Close(_)) {
+        // A refusal has no remaining upload to deliver. Release its
+        // adapters now, even if the HTTP client retains an unpolled body.
+        drop(cx.request_delivery.take());
     }
+    outcome
 }
 
 /// Runs one exchange on the h1 codec.
@@ -514,6 +549,9 @@ pub(crate) async fn run(
         }
         Outcome::Upgrade { res, upstream, key } => {
             ws::splice_websocket(conn, reclaim.take().await, res, upstream, &key).await
+        }
+        Outcome::LayeredUpgrade { res, client } => {
+            ws::connect_stack(conn, reclaim, res, client).await
         }
     }
 }
@@ -663,7 +701,11 @@ pub(crate) fn wants_websocket(meta: &RequestMeta) -> bool {
 /// WebSocket upgrade), then the response steps. From here on the request
 /// is on its way: in-flight rules re-check the exchange as values arrive,
 /// and what is forwarded is teed to the capture log, heads included.
-async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalRequest) -> Outcome {
+async fn forward<F: ClientTransport>(
+    transport: &mut F,
+    cx: &mut FlowCx,
+    mut req: CanonicalRequest,
+) -> Outcome {
     let in_flight = InFlight::new(cx);
     cx.in_flight = Some(in_flight.clone());
     let PerDir {
@@ -700,7 +742,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
     let upstreamed = if relay_ws {
         upgrade_upstream(cx, req, up_tap.as_mut()).await
     } else {
-        plain_upstream(front, cx, req, &in_flight, up_tap.take()).await
+        plain_upstream(transport, cx, req, &in_flight, up_tap.take()).await
     };
     let upstreamed = match upstreamed {
         Ok(u) => u,
@@ -714,7 +756,7 @@ async fn forward<F: Front>(front: &mut F, cx: &mut FlowCx, mut req: CanonicalReq
         }
     };
     let res = from_upstream_response(res, &cx.snap.limits);
-    match response_steps(cx, res, front).await {
+    match response_steps(cx, res, transport).await {
         ResponseVerdict::Continue(mut res) => {
             let mut down_tap = down_tap;
             if let Some(t) = down_tap.as_mut() {
@@ -820,8 +862,8 @@ async fn upgrade_upstream(
 
 /// The upstream leg of an ordinary request through the pooled client,
 /// the request body checked in flight and captured as it streams.
-async fn plain_upstream<F: Front>(
-    front: &mut F,
+async fn plain_upstream<F: ClientTransport>(
+    transport: &mut F,
     cx: &mut FlowCx,
     mut req: CanonicalRequest,
     in_flight: &Arc<InFlight>,
@@ -856,6 +898,8 @@ async fn plain_upstream<F: Front>(
     // Read when the flow is logged, so bytes sent before an abandoned
     // forward, or after the response head, all count.
     cx.request_tally = Some(req_tally.clone());
+    let (body, delivery) = crate::body::delivery(body);
+    cx.request_delivery = Some(delivery);
     req.body = body;
     let mut http_req = to_upstream_request(req, UriForm::Absolute)
         .map_err(|e| Failed::Refuse(protocol_refusal(cx, &host, port, e.to_string())))?;
@@ -880,7 +924,7 @@ async fn plain_upstream<F: Front>(
             r = upstream => Some(r),
         }
     };
-    let driven = front.drive(fut).await;
+    let driven = transport.drive(fut).await;
     if let Some(o) = stopped_outcome(in_flight) {
         return Err(o);
     }

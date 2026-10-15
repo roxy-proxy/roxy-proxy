@@ -1,6 +1,8 @@
 //! roxy's proxy engine: listeners, the connection state
-//! machine, the exchange core, the upstream connector (DNS, SSRF policy,
-//! pool), the WebSocket relay and flow-log emission.
+//! machine, addon stages, upstream processing and flow-log emission.
+//! The core stage validates the forwarded request, evaluates rules,
+//! connects upstream through the address policy, and owns the upstream
+//! upload and any WebSocket relay until completion.
 //!
 //! # Module map
 //!
@@ -12,18 +14,18 @@
 //!   [`ClientConn`].
 //! - `conn`: the connection state machines (proxy port, CONNECT, sniff,
 //!   TLS termination, tunnels, `roxy.internal`).
-//! - `pipeline`: the core's fixed request and response steps, the
+//! - `pipeline`: the core stage's fixed request and response steps, the
 //!   `Verdict` they return (consumed exhaustively), the admission decision and
 //!   its effects, the per-flow context.
 //! - `in_flight`: the per-exchange in-flight checker: rules re-checked as body
 //!   bytes stream, at the response head and in the WebSocket relay, and
 //!   byte metrics recorded as they stream.
-//! - `exchange`: the transport-agnostic exchange core (`process`: request
-//!   steps → upstream → response steps → `Outcome`), the h1 adapter,
-//!   upstream errors.
+//! - `exchange`: starts an exchange through the addon chain or directly
+//!   through the core stage, returns its HTTP outcome, and writes the final
+//!   record after reclamation. Also contains the HTTP/1.1 transport adapter.
 //! - `exchange::ws`: the WebSocket relay after a `101`: the byte splice
 //!   and the message relay.
-//! - `h2conn`: the client-side HTTP/2 front end (ALPN `h2` in a tunnel).
+//! - `h2conn`: the client-side HTTP/2 transport (ALPN `h2` in a tunnel).
 //! - [`upstream`]: resolver, address floor, connector and pooled client.
 //! - [`addr`]: the private-range / CIDR address floor.
 //! - [`addrlist`]: compiled address lists (`upstream.deny_lists`, `@list`).

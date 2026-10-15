@@ -132,19 +132,20 @@ pub enum EndpointError {
 /// whose capability was not granted is never called), calls
 /// [`LayerHost::next`] at most once per exchange, and drops a call's
 /// future when the exchange fails or is cancelled. Calls have no deadline
-/// of their own here: time below the layer is not the layer's.
+/// of their own here: time waiting for upstream is excluded.
 #[async_trait::async_trait]
 pub trait LayerHost: Send + Sync + 'static {
     /// Pass the request to the layers upstream of this one. Called at most
     /// once per exchange.
     ///
     /// The host validates the request through the canonical model and
-    /// runs it up the rest of the stack. Bodies stream in both
+    /// passes it upstream through the remaining stages. Bodies stream in both
     /// directions: the request body is still being produced by the guest
     /// when this is called, and the response body is read by the guest as
     /// it arrives. A denial is a response, not an error. `Ok(None)` means
     /// nothing came back (the forward was cut, or nothing upstream
-    /// answered): the guest's `next` fails and nothing has failed. `Err`
+    /// answered): return an error to this `next` call without marking the
+    /// layer as faulty. `Err`
     /// fails the exchange closed (for example, the request does not
     /// validate). Dropping the returned future (the guest dropped its
     /// `pending-response`) tells the host the layer reads no more of the

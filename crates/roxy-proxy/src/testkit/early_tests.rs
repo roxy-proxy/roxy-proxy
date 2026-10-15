@@ -4,7 +4,7 @@
 //! forward runs to its end). Each must reach the client without waiting
 //! for the rest of the upload.
 //!
-//! An outer layer relays an early answer from below only if it streams
+//! A layer relays an early answer from upstream only if it streams
 //! full duplex (the test layer's `relay`); its sequential `pass` sends the
 //! whole request body before reading the response, as a guest may.
 
@@ -18,6 +18,103 @@ use crate::addons::service::testing;
 use crate::addons::{AddonMode, Part};
 
 const CHUNK: usize = 4096;
+
+#[tokio::test]
+async fn h2_reset_after_bodiless_answer_releases_service() {
+    for (method, status) in [("POST", 204), ("HEAD", 200)] {
+        let kit = testing::kit(
+            super::ALLOW_UP,
+            vec![testing::subscribed(
+                testing::addon("s", "answer-open", AddonMode::Enforce, |s| {
+                    s.max_connections = 1;
+                    s.max_streams = 1;
+                }),
+                Part::Head,
+                Part::Full,
+            )],
+        )
+        .await;
+        let (send, _conn) = super::h2_client(&kit).await;
+        let mut ready = send.ready().await.unwrap();
+        let req = http::Request::builder()
+            .method(method)
+            .uri("https://up.test/upload")
+            .body(())
+            .unwrap();
+        let (response, mut upload) = ready.send_request(req, false).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), status);
+        upload.send_reset(h2::Reason::CANCEL);
+        let svc = kit.upstream.service();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while svc.resets().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("RST_STREAM after a bodiless answer must cancel the service stage");
+
+        // Reuse both the HTTP/2 connection and the only service slot.
+        let req = http::Request::get("https://up.test/again")
+            .body(())
+            .unwrap();
+        let mut ready = ready.ready().await.unwrap();
+        let (response, mut upload) = ready.send_request(req, false).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), 204);
+        upload.send_reset(h2::Reason::CANCEL);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn headless_forward_completion_restarts_answer_timeout() {
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![testing::addon("s", "cut-wait", AddonMode::Enforce, |s| {
+            s.first_byte_timeout = Duration::from_millis(100);
+        })],
+    )
+    .await;
+    let mut c = kit.h1().await;
+    let result =
+        tokio::time::timeout(Duration::from_secs(1), c.call("POST", "/x", &[], b"body")).await;
+    assert!(
+        result.is_ok(),
+        "a completed, cut forward leaves the answer clock disabled forever"
+    );
+    assert_eq!(result.unwrap().status, 503);
+}
+
+#[tokio::test]
+async fn trailers_do_not_turn_a_cut_service_response_into_success() {
+    for h2 in [false, true] {
+        let kit = testing::kit(
+            super::ALLOW_UP,
+            vec![testing::addon(
+                "s",
+                "trailers-cut",
+                AddonMode::Enforce,
+                |_| {},
+            )],
+        )
+        .await;
+        let a = kit
+            .tunnel("up.test", h2)
+            .await
+            .call("GET", "/x", &[], b"")
+            .await;
+        assert!(
+            a.body.is_err(),
+            "response_end(error) was delivered as complete: {a:?}"
+        );
+    }
+}
 
 async fn stack(names: &[&str]) -> Kit {
     let mut b = Kit::builder();
@@ -58,6 +155,45 @@ async fn answer_mid_upload(
 }
 
 // ---- the upstream answering early ---------------------------------------
+
+#[tokio::test]
+async fn refusing_an_early_response_does_not_wait_for_the_upload() {
+    for h2 in [false, true] {
+        let kit = Kit::builder()
+            .rules(
+                r#"
+- id: allow-up
+  when: host == "up.test"
+  then: allow
+- id: refuse-response
+  when: response.status == 200
+  then: deny
+"#,
+            )
+            .start()
+            .await;
+        let mut client = kit.tunnel("up.test", h2).await;
+        let (mut upload, body) = streaming_body();
+        let req = client
+            .request("POST", "/early-drip?n=10&ms=1000", &[])
+            .body(body)
+            .unwrap();
+        let response = client.start(req);
+        upload
+            .send_data(Bytes::from_static(b"started"))
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), response)
+            .await
+            .expect("the refusal must not wait for the remaining upload")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status, 403);
+        let event = kit.request_event().await;
+        assert_eq!(event["terminal_rule"], "refuse-response");
+        drop(upload);
+    }
+}
 
 /// The upstream answers `/early` before reading the body.
 async fn upstream_answers_early(addons: &[&str], h2: bool) {
@@ -397,12 +533,11 @@ async fn a_deny_of_the_forward_outlives_the_layers_early_answer() {
 
 // ---- answers with no body ------------------------------------------------
 
-/// A bodiless answer is complete with its head: the front writes no body
-/// to poll to its end, so the request lane is snipped as the head goes.
-/// On HTTP/2 the client's upload is reset at once rather than left to its
-/// idle timeout.
+/// A service that answers without forwarding releases its held upload
+/// when its stream ends. HTTP/2 resets that upload without waiting for
+/// the body-idle timeout.
 #[tokio::test(start_paused = true)]
-async fn h2_a_bodiless_answer_without_a_forward_snips_the_upload_at_once() {
+async fn h2_a_bodiless_answer_without_a_forward_releases_the_upload_at_once() {
     let kit = testing::kit(
         super::ALLOW_UP,
         vec![testing::subscribed(
@@ -430,7 +565,7 @@ async fn h2_a_bodiless_answer_without_a_forward_snips_the_upload_at_once() {
     assert!(kit.upstream.seen().is_empty(), "nothing left");
 }
 
-/// A WASM guest that answers with no body and then forwards: the front
+/// A WASM guest that answers with no body and then forwards: the transport
 /// writes nothing for the answer, and the guest still runs to its end, so
 /// the forward completes.
 #[tokio::test]
@@ -486,12 +621,11 @@ async fn a_guest_that_answered_keeps_its_answer_when_its_forward_is_cut() {
     assert!(kit.upstream.seen().is_empty(), "nothing complete left");
 }
 
-/// A layer above gives a service up while its forward is upstream whole,
-/// waiting on the head, and answers itself: the service's stream is reset,
-/// and its forward is given up with it, so the record is finished on the
-/// answer rather than held until an upstream nothing will read answers.
+/// A downstream layer answers and abandons a service's pending response.
+/// The service and its upstream request are cancelled, so the final record
+/// does not wait for an upstream response that nobody will read.
 #[tokio::test(start_paused = true)]
-async fn a_service_given_up_by_the_layer_above_gives_up_its_forward() {
+async fn abandoning_a_services_response_cancels_its_forward() {
     let kit = testing::kit(
         super::ALLOW_UP,
         vec![
@@ -527,7 +661,7 @@ async fn a_service_given_up_by_the_layer_above_gives_up_its_forward() {
 }
 
 /// A service that forwards, answers with no body, and ends its answer only
-/// once the response from below has: the front writes nothing for the
+/// once the response from upstream has: the transport writes nothing for the
 /// answer and drops its body lane while the forward is still running,
 /// which is not the client going away. Nothing resets the stream, the
 /// forward completes, and the stream ends on the service's last message.

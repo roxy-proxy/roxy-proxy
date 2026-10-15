@@ -1,20 +1,20 @@
 //! The addon layer stack.
 //!
 //! ```text
-//!   client edge ──req[0]──▶ addon 0 ──req[1]──▶ … ──req[n]──▶ core edge (rules ↓ / ↑, address floor, connector)
+//!   client edge ──req[0]──▶ addon 0 ──req[1]──▶ … ──req[n]──▶ core stage (rules ↓ / ↑, address floor, connector)
 //!               ◀──res[0]──         ◀──res[1]──   …  ◀──res[n]──
 //! ```
 //!
-//! An exchange is a chain of stages joined by lanes (`chain`). The client
-//! edge puts the client's request on the first request lane and waits for
-//! the head on the first response lane. Each layer runs on what reaches it
-//! on its request lane; what it forwards goes on the lane upstream of it,
-//! and what it answers goes on the response lane downstream. The core edge
-//! runs the ordinary exchange core on whatever the last layer passed on,
-//! after re-validating it exactly as strictly as a client request
-//! (invariant 1). On the way back the rules see the upstream's response
-//! before any layer does. Any layer failure fails the exchange closed
-//! (invariant 3): a deny before the response head, a cut body after it.
+//! Upstream means toward the origin; downstream means toward the client.
+//! The client edge adapts the HTTP transport to the first lane pair. Each
+//! layer consumes one request lane and one response lane, and produces the
+//! next request upstream and response downstream independently.
+//!
+//! The core stage is the upstream end of the chain: canonical validation,
+//! admission and in-flight rules, destination restrictions, the connector,
+//! and any WebSocket relay. It owns upstream processing through completion.
+//! Reclamation waits for lane consumers, drivers, and accounting to finish
+//! before returning the context to the transport handler for the final log.
 
 mod attribution;
 mod chain;
@@ -35,7 +35,7 @@ pub(crate) use client_edge::run;
 pub(crate) use reclaim::Reclaim;
 pub use service::{ServiceError, ServiceSpec};
 pub use subscribe::{Part, Subscription};
-pub(crate) use ws::{SplicedClient, splice_client, ws_without_extensions};
+pub(crate) use ws::{WsClient, ws_without_extensions};
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -46,7 +46,6 @@ use std::time::Duration;
 use http::HeaderName;
 use roxy_http::{CanonicalRequest, RequestMeta};
 use roxy_wasm::{LayerError, TagError};
-use tokio_util::sync::CancellationToken;
 
 use self::attribution::{Attribution, Fault};
 use self::chain::{Chain, Dir, LaneId};
@@ -93,7 +92,7 @@ pub struct AddonSpec {
     /// `config`: the document the layer reads, whatever its kind.
     pub config: serde_json::Value,
     /// `when`: the layer runs only on requests this matches, as they reach
-    /// it; the others go straight to the layer below.
+    /// it; the others go straight to the layer upstream.
     pub when: Option<roxy_rules::Condition>,
     /// `sample` (observe mode only): the share of matching exchanges the
     /// layer gets a copy of.
@@ -202,19 +201,9 @@ struct LayerSlot {
 pub(crate) const CLIENT_GONE: &str = "the client went away";
 pub(crate) const ENDED: &str = "the exchange ended";
 
-/// The relayed WebSocket on its way from the core to the front.
-enum Upgrade {
-    None,
-    /// The core answered a `101`: the relay waits for the stack's answer.
-    Relayed(ws::Relay),
-    /// The stack's answer was the `101`: the client side waits for the
-    /// front to splice it in once it has sent the `101`.
-    Plumbed(ws::WsPlumbing),
-}
-
 /// One exchange's trip through the stack, shared by every layer's host.
-/// It holds the flow's [`FlowCx`] while the layers run, lends it to the
-/// core, and hands it back to the front afterwards.
+/// The core stage owns the flow context while upstream work runs. The
+/// transport handler retrieves it after all exchange work has finished.
 pub(crate) struct StackFlow {
     /// What identifies the flow, shared with its [`FlowCx`].
     pub(crate) meta: Arc<FlowMeta>,
@@ -222,9 +211,8 @@ pub(crate) struct StackFlow {
     /// client's until then), for `metric-get`: the same keys the core's
     /// samples use.
     facts: Mutex<FlowFacts>,
-    /// The client's request as the fronts described it, which what a
-    /// layer passes on inherits: a layer cannot express the protocol
-    /// version, the target form or an upgrade.
+    /// Transport metadata inherited by every forwarded request. A layer
+    /// cannot change the protocol version, target form or upgrade type.
     client_meta: RequestMeta,
     /// The client's request is a `HEAD`: it gets no response body, whatever
     /// a layer answers.
@@ -239,15 +227,13 @@ pub(crate) struct StackFlow {
     pub(crate) close: AtomicBool,
     /// The first layer to run has decoded the request for the layers.
     request_decoded: AtomicBool,
-    upgrade: Mutex<Upgrade>,
+    upgrade_tx: Mutex<Option<tokio::sync::oneshot::Sender<ws::Upgrade>>>,
+    upgrade_rx: Mutex<Option<tokio::sync::oneshot::Receiver<ws::Upgrade>>>,
     /// Permits for the exchange's endpoint calls in flight.
     endpoint_calls: Arc<tokio::sync::Semaphore>,
-    /// Whose response reached the client, decided as the front took it: a
+    /// Whose response reached the client, decided when the client edge took it: a
     /// layer's own, or (`Some(None)`) the core's.
-    decided: OnceLock<Option<usize>>,
-    /// The front is splicing the client into a relayed WebSocket: the
-    /// record goes with the relay, which ends the exchange.
-    upgraded: CancellationToken,
+    client_answer: OnceLock<Option<usize>>,
     /// The client edge reads the response body itself (one the client is
     /// not sent), so the lane ends as the layer ends it.
     draining: AtomicBool,
@@ -263,6 +249,7 @@ impl std::ops::Deref for StackFlow {
 
 impl StackFlow {
     fn new(cx: &FlowCx, req: &CanonicalRequest) -> Self {
+        let (upgrade_tx, upgrade_rx) = tokio::sync::oneshot::channel();
         Self {
             meta: cx.meta.clone(),
             facts: Mutex::new(cx.facts.clone()),
@@ -279,12 +266,12 @@ impl StackFlow {
             attribution: Attribution::new(cx.meta.clone()),
             close: AtomicBool::new(false),
             request_decoded: AtomicBool::new(false),
-            upgrade: Mutex::new(Upgrade::None),
+            upgrade_tx: Mutex::new(Some(upgrade_tx)),
+            upgrade_rx: Mutex::new(Some(upgrade_rx)),
             endpoint_calls: Arc::new(tokio::sync::Semaphore::new(
                 endpoint::MAX_ENDPOINT_CALLS_IN_FLIGHT,
             )),
-            decided: OnceLock::new(),
-            upgraded: CancellationToken::new(),
+            client_answer: OnceLock::new(),
             draining: AtomicBool::new(false),
         }
     }
@@ -293,18 +280,16 @@ impl StackFlow {
         self.chain.get().expect("the chain is built with the flow")
     }
 
-    /// Stops whatever the stack still has running: the client edge lets
-    /// go of the response and cuts the request, and every stage upstream
-    /// is torn down in turn. For an exchange the front has given up on, or
-    /// refused; never for one a layer merely answered. `why` is what a
-    /// service still on the exchange is told.
+    /// Cancel the exchange and every stage still running, for example when
+    /// the client disconnects or the transport refuses a response. Sending
+    /// an early answer does not cancel the exchange.
     pub(crate) fn tear_down(&self, why: &'static str) {
         self.chain().tear_down(why);
     }
 
     /// Cancelled when the exchange is torn down.
     #[cfg(test)]
-    pub(crate) fn torn_down(&self) -> CancellationToken {
+    pub(crate) fn torn_down(&self) -> tokio_util::sync::CancellationToken {
         self.chain().torn_down()
     }
 
@@ -336,16 +321,10 @@ impl StackFlow {
         self.chain().fail_layer(index, err.into());
     }
 
-    /// Takes the flow context back for the record: once the exchange is
-    /// over, nothing in the stack can still forward or answer, and the
-    /// core has returned the context with whatever it recorded. A relayed
-    /// WebSocket is the exception: the front runs the relay on the
-    /// context, and the exchange ends with it.
+    /// Return the context after bodies, drivers, and accounting have
+    /// finished. Upgraded exchanges use the same completion barrier as HTTP.
     async fn reclaim(&self) -> FlowCx {
-        tokio::select! {
-            () = self.chain().until_over() => {}
-            () = self.upgraded.cancelled() => {}
-        }
+        self.chain().until_over().await;
         let cx = self.loan.wait_until(reclaim::Loan::take).await;
         self.loan.taken();
         cx
@@ -357,7 +336,10 @@ impl StackFlow {
         let chain = self.chain();
         let hop = index + 1;
         chain.has_head(LaneId { hop, dir: Dir::Req })
-            && !chain.has_head(LaneId { hop, dir: Dir::Res })
+            && matches!(
+                chain.state(LaneId { hop, dir: Dir::Res }),
+                chain::LaneState::Idle
+            )
     }
 
     /// The facts `metric-get` reads.
@@ -450,59 +432,25 @@ impl StackFlow {
     }
 
     /// The client asked for a WebSocket, the one upgrade the core relays.
-    /// The rules below the stack decide whether it is relayed.
+    /// The rules upstream of the layers decide whether it is relayed.
     fn is_upgrade(&self) -> bool {
         crate::exchange::wants_websocket(&self.client_meta)
     }
 
-    /// The core relayed an upgrade; the stack's answer decides its fate. An
-    /// answer already on its way to the client carries no relay: the
-    /// upstream side is closed.
-    fn relayed(&self, relay: ws::Relay) {
-        let answered = LaneId {
-            hop: 0,
-            dir: Dir::Res,
-        };
-        if self.chain().has_head(answered) {
-            tokio::spawn(crate::exchange::close_upstream_ws(relay.upstream));
-            return;
-        }
-        *lock(&self.upgrade) = Upgrade::Relayed(relay);
+    /// Offer the upgrade before publishing its response head. If the client
+    /// edge already chose a response, its receiver is gone and this fails.
+    /// The core retains ownership of the upstream socket in either case.
+    fn offer_upgrade(&self, upgrade: ws::Upgrade) -> Result<(), ws::Upgrade> {
+        lock(&self.upgrade_tx)
+            .take()
+            .expect("one upstream outcome")
+            .send(upgrade)
     }
 
-    fn take_relay(&self) -> Option<ws::Relay> {
-        let mut u = lock(&self.upgrade);
-        match std::mem::replace(&mut *u, Upgrade::None) {
-            Upgrade::Relayed(relay) => Some(relay),
-            other @ (Upgrade::None | Upgrade::Plumbed(_)) => {
-                *u = other;
-                None
-            }
-        }
-    }
-
-    /// The stack answered the `101`: the client side waits for the front.
-    fn plumbed(&self, plumbing: ws::WsPlumbing) {
-        *lock(&self.upgrade) = Upgrade::Plumbed(plumbing);
-        self.upgraded.cancel();
-    }
-
-    fn take_ws(&self) -> Option<ws::WsPlumbing> {
-        let mut u = lock(&self.upgrade);
-        match std::mem::replace(&mut *u, Upgrade::None) {
-            Upgrade::Plumbed(plumbing) => Some(plumbing),
-            other @ (Upgrade::None | Upgrade::Relayed(_)) => {
-                *u = other;
-                None
-            }
-        }
-    }
-
-    /// The front refused the upgrade the stack relayed: the exchange is
-    /// over, and the socket the layers were to carry is dropped unspliced.
-    pub(crate) fn abandon_upgrade(&self) {
-        self.tear_down(ENDED);
-        drop(self.take_ws());
+    /// The metadata belongs to the response the client edge is taking.
+    /// Dropping the receiver also rejects an upgrade offered later.
+    fn take_upgrade(&self) -> Option<ws::Upgrade> {
+        lock(&self.upgrade_rx).take()?.try_recv().ok()
     }
 
     /// The layer whose own answer reached the client, if a layer's did.
@@ -512,21 +460,21 @@ impl StackFlow {
 
     /// Layer `i` ran in enforce mode: what left it is its own. An observer
     /// runs beside the exchange and passes nothing on, so it is never the
-    /// one to blame for what reached the layers below.
+    /// one to blame for what reached the layers upstream.
     fn enforced(&self, i: usize) -> bool {
         self.layers[i].ran.load(Ordering::SeqCst) && self.snap.addons[i].mode == AddonMode::Enforce
     }
 
-    /// The nearest enforcing layer above `below` that ran: the one that
-    /// passed on what reached `below` (a skipped layer or an observer
-    /// passes it on untouched). `None` when the request reaching `below`
+    /// The nearest enforcing layer downstream of `stage` that ran: the one that
+    /// passed on what reached `stage` (a skipped layer or an observer
+    /// passes it on untouched). `None` when the request reaching `stage`
     /// is the client's.
-    fn passed_on_by(&self, below: usize) -> Option<usize> {
-        (0..below).rev().find(|&i| self.enforced(i))
+    fn passed_on_by(&self, stage: usize) -> Option<usize> {
+        (0..stage).rev().find(|&i| self.enforced(i))
     }
 
     /// The layer a failure no layer recorded is put down to: the one that
-    /// answered, else the outermost enforcing layer that ran, since what
+    /// answered, else the first downstream layer enforcing layer that ran, since what
     /// the client got came from it.
     fn blamed(&self) -> String {
         let i = self
@@ -536,7 +484,7 @@ impl StackFlow {
         self.snap.addons[i].name.clone()
     }
 
-    /// Folds the stack's answer into the record as the front reclaims the
+    /// Folds the stack's answer into the record as the transport handler reclaims the
     /// flow: a layer's own response is `answered`, by that layer, unless
     /// the rules refused the request it forwarded meanwhile. A refusal is
     /// the verdict whatever the client was given.
@@ -549,7 +497,7 @@ impl StackFlow {
         if cx.record.decision == Some(DecisionKind::Deny) {
             return;
         }
-        if let Some(Some(i)) = self.decided.get() {
+        if let Some(Some(i)) = self.client_answer.get() {
             cx.record.decision = Some(DecisionKind::Answered);
             cx.record.terminal_rule = Some(Decider::Layer(self.snap.addons[*i].name.clone()));
         }
@@ -690,6 +638,50 @@ mod tests {
     use roxy_http::Body;
     use roxy_wasm::LayerError;
 
+    #[tokio::test]
+    async fn reclamation_waits_for_buffered_upload_consumption() {
+        let kit = Kit::builder()
+            .addon(AddonDef::test_layer("a"))
+            .start()
+            .await;
+        let (st, mut cx, mut ends) = test_flow(&kit);
+        let mut layer = ends.layers.pop().unwrap();
+        layer.stage.enforcing();
+        let request = || {
+            Head::Request(
+                http::Request::post("http://up.test/x")
+                    .body(())
+                    .unwrap()
+                    .into_parts()
+                    .0,
+            )
+        };
+        let response = || Head::Response(http::Response::new(()).into_parts().0);
+        ends.edge.req_out.whole(request(), Body::empty());
+        let _ = layer.req_in.head().await.unwrap();
+        let mut forward = layer.req_out.head(request(), None, u64::MAX);
+        let (_, upload) = ends.core.req_in.head().await.unwrap();
+        let (_upload, tally) = crate::body::counted(upload, false);
+        cx.request_tally = Some(tally.clone());
+        st.loan.park(cx);
+        ends.core.res_out.whole(response(), Body::empty());
+        let (head, body) = layer.res_in.head().await.unwrap();
+        layer.res_out.whole(head, body);
+        let _ = ends.edge.res_in.head().await.unwrap();
+        forward
+            .send_data(bytes::Bytes::from_static(b"still buffered"))
+            .await
+            .unwrap();
+        forward.finish().await.unwrap();
+        assert_eq!(tally.bytes(), 0);
+        let reclaimed = Reclaim::stack(st).take();
+        tokio::pin!(reclaimed);
+        assert!(
+            futures_util::poll!(reclaimed.as_mut()).is_pending(),
+            "the flow can be logged before the queued upload is counted or checked by in-flight rules"
+        );
+    }
+
     fn cut(why: &str) -> client_edge::Arrival {
         Err(Headless::Cut(why.to_owned()))
     }
@@ -720,7 +712,7 @@ mod tests {
         );
     }
 
-    /// A front that lets go of the context before taking it (its task
+    /// A transport handler that lets go of the context before taking it (its task
     /// aborted with the connection) tears the stack down with it; one that
     /// took it leaves the stack to end as it will.
     #[tokio::test]
@@ -891,7 +883,7 @@ mod tests {
 
     /// A failure is put down to a layer that ran, never to one its `when`
     /// skipped: the request a skipped layer passes on is its caller's, and
-    /// the response it passes back is from below.
+    /// the response it passes back is from upstream.
     #[tokio::test]
     async fn blame_skips_layers_that_did_not_run() {
         let skipped = r#"path == "/never""#;
@@ -915,13 +907,19 @@ mod tests {
         assert!(select::selects(&st, 2, &st.snap.addons[2], invalid()).is_err());
         assert_eq!(blamed(&st), "a");
 
-        // Likewise what reaches the core below a skipped last layer.
+        // Likewise what reaches the core upstream of a skipped last layer.
         let (st, _, _ends) = test_flow(&kit);
         ran(&st, 0);
         assert!(core_edge::admit(&st, invalid()).is_none());
         assert_eq!(blamed(&st), "a");
+        assert!(
+            st.layer_torn(0),
+            "the producer of the invalid head is cancelled"
+        );
+        assert!(st.layer_torn(1));
+        assert!(st.layer_torn(2));
 
-        // A failure no layer recorded goes to the outermost that ran.
+        // A failure no layer recorded goes to the first downstream layer that ran.
         let (st, _cx, _ends) = test_flow(&kit);
         ran(&st, 1);
         let out = stack_outcome(&st, Ok(cut("x")), None);
@@ -932,7 +930,7 @@ mod tests {
     }
 
     /// An observer that ran passed nothing on: what reaches the layers
-    /// below it came from the nearest enforcing layer above, which is the
+    /// upstream of it came from the nearest enforcing layer downstream, which is the
     /// one blamed when it does not validate.
     #[tokio::test]
     async fn blame_skips_observers() {

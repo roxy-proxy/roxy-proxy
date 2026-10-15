@@ -1,7 +1,7 @@
 //! The client edge: the stage at the client's end of the chain. It puts
 //! the client's request on the first request lane, waits for the head on
-//! the first response lane, and turns what arrives into the front's
-//! [`Outcome`]; the front writes it.
+//! the first response lane, and returns an [`Outcome`] to the HTTP/1.1
+//! connection handler or HTTP/2 stream handler, which writes the response.
 
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -20,7 +20,7 @@ use roxy_wasm::LayerError;
 use super::attribution::{Driven, Fault, Side, attributed};
 use super::chain::{Chain, Head, Headless, Recorder};
 use super::{BoxFuture, CLIENT_GONE, ENDED, Reclaim, StackError, StackFlow, core_edge, layer, ws};
-use crate::exchange::{Front, Outcome, bad_upgrade_refusal, refusal_response};
+use crate::exchange::{ClientTransport, Outcome, bad_upgrade_refusal, refusal_response};
 use crate::flowlog::FlowSink;
 use crate::pipeline::{Decider, FlowCx, Refusal, RefusalKind};
 
@@ -37,10 +37,10 @@ impl Recorder for Record {
         }
     }
 
-    fn seed(&self, _layer: usize) -> BoxFuture<Option<(http::response::Parts, Body)>> {
+    fn failure_response(&self, _layer: usize) -> BoxFuture<Option<(http::response::Parts, Body)>> {
         let st = self.0.upgrade();
         Box::pin(async move {
-            let res = seeded_refusal(&st?).await?;
+            let res = failure_response(&st?).await?;
             let (parts, body) = roxy_http::layer::to_layer_response(res).into_parts();
             Some((parts, body))
         })
@@ -63,9 +63,9 @@ pub(super) fn test_chain(
 
 /// Runs the exchange through the addon stack. The flow context is parked
 /// in the stack while the layers run, lent to the core if a request
-/// reaches it, and comes back to the front through the [`Reclaim`].
-pub(crate) async fn run<F: Front>(
-    front: &mut F,
+/// reaches it, and comes back to the transport through the [`Reclaim`].
+pub(crate) async fn run<F: ClientTransport>(
+    transport: &mut F,
     cx: FlowCx,
     mut req: CanonicalRequest,
 ) -> (Reclaim, Outcome) {
@@ -88,22 +88,23 @@ pub(crate) async fn run<F: Front>(
     };
     req.body = attributed(&st, Side::Client, std::mem::take(&mut req.body));
     st.loan.park(cx);
-    // Held from here: a front that gives the exchange up mid-run (its task
+    // Held from here: a transport that gives the exchange up mid-run (its task
     // aborted with the connection) tears the stack down with it.
     let reclaim = Reclaim::stack(st.clone());
-    tokio::spawn(core_edge::run(st.clone(), core));
+    st.chain().spawn(core_edge::run(st.clone(), core));
     for (index, io) in layers.into_iter().enumerate() {
-        tokio::spawn(layer::run(st.clone(), index, io));
+        st.chain().spawn(layer::run(st.clone(), index, io));
     }
     let (parts, body) = to_layer_request(req).into_parts();
     edge.req_out.whole(Head::Request(parts), body);
     let mut res_in = edge.res_in;
-    let driven = front
+    let driven = transport
         .drive(Driven::new(st.clone(), async move { res_in.head().await }))
         .await;
     let outcome = stack_outcome(&st, driven, client_tx);
     match &outcome {
-        Outcome::Respond(_) | Outcome::Upgrade { .. } => {}
+        Outcome::Respond(_) | Outcome::LayeredUpgrade { .. } => {}
+        Outcome::Upgrade { .. } => unreachable!("the client edge does not own upstream sockets"),
         Outcome::Close(roxy_http::DriveError::Client(_)) => st.tear_down(CLIENT_GONE),
         Outcome::Close(_) | Outcome::Refuse(_) => st.tear_down(ENDED),
     }
@@ -135,18 +136,17 @@ pub(super) fn stack_outcome(
         st.fail(&st.blamed(), err);
         return refuse(st);
     }
-    // Decided now: a layer that answered while its forward was below is
-    // the one that answered, whatever the core returns to it later. A
-    // layer that failed answered nothing: the refusal its failure earned
-    // did, and the record already says so.
+    // Attribution was captured when the layer published its response head.
+    // A later upstream outcome does not change it. A generated failure
+    // response retains the fault recorded for the layer.
     let answered = st.answered_by().filter(|&i| st.failed_layer() != Some(i));
-    let _ = st.decided.set(answered);
+    let _ = st.client_answer.set(answered);
     // A `101`'s body is the upgraded stream for the client, not an HTTP
     // body: keep it out of the response model.
     let upgraded_body =
         (resp.status() == StatusCode::SWITCHING_PROTOCOLS).then(|| std::mem::take(resp.body_mut()));
     let mut res = from_upstream_response(resp, &st.snap.limits);
-    // A body the front never writes (a bodiless status, a HEAD) is read
+    // A body the transport never writes (a bodiless status, a HEAD) is read
     // here instead, so its lane ends as the layer ends it.
     if res.status_forbids_body() || st.client_head {
         st.draining.store(true, Ordering::SeqCst);
@@ -156,36 +156,39 @@ pub(super) fn stack_outcome(
     if st.close.load(Ordering::Relaxed) {
         res.meta.close = true;
     }
-    let relay = st.take_relay();
+    let upgrade = st.take_upgrade();
     if res.status == StatusCode::SWITCHING_PROTOCOLS {
-        if let (Some(relay), Some(client_tx)) = (relay, client_tx) {
+        if let (Some(upgrade), Some(client_tx)) = (upgrade, client_tx) {
             // A layer cannot express `upgrade: websocket` (hop-by-hop); the
             // core relayed a real upgrade, so restore it.
             res.meta.upgrade = Some("websocket".to_owned());
+            let checked =
+                roxy_http::ws::validate_upgrade_response(&res, &upgrade.key).and_then(|()| {
+                    if ws::ws_without_extensions(&st.snap, st.reads_bytes()) {
+                        roxy_http::ws::validate_no_extensions(&res)
+                    } else {
+                        Ok(())
+                    }
+                });
+            if let Err(e) = checked {
+                st.fail(&st.blamed(), LayerError::InvalidResponse(e.to_string()));
+                return refuse(st);
+            }
             let to_client = upgraded_body.unwrap_or_default();
-            st.plumbed(ws::WsPlumbing::new(
-                client_tx,
-                to_client,
-                relay.bottom,
-                st.shared.sink.clone(),
-            ));
+            let client =
+                ws::WsClient::new(client_tx, to_client, st.shared.sink.clone(), upgrade.start);
             // A failure from here on cuts the body (the codec then breaks
             // the connection) and is logged as it is recorded.
             st.attribution.head_out();
-            return Outcome::Upgrade {
-                res,
-                upstream: relay.upstream,
-                key: relay.key,
-            };
+            return Outcome::LayeredUpgrade { res, client };
         }
         let err = LayerError::InvalidResponse("101 without an upgrade to relay".into());
         st.fail(&st.blamed(), err);
         return refuse(st);
     }
-    if let Some(relay) = relay {
+    if upgrade.is_some() {
         // The upstream switched protocols but the stack answered otherwise:
         // no body can carry the relay, so close it and fail closed.
-        tokio::spawn(crate::exchange::close_upstream_ws(relay.upstream));
         let err = LayerError::InvalidResponse(format!("{} over a relayed upgrade", res.status));
         st.fail(&st.blamed(), err);
         return refuse(st);
@@ -205,7 +208,7 @@ fn refuse(st: &Arc<StackFlow>) -> Outcome {
     }
 }
 
-/// The refusal the fault recorded earns, or the client's own parse error
+/// The HTTP error response for the recorded fault, or the client's parse error
 /// when the fault is the client's.
 pub(super) fn refusal_for_fault(st: &Arc<StackFlow>) -> Result<Refusal, roxy_http::ParseError> {
     let fault = st.attribution.fault().unwrap_or_else(|| {
@@ -241,17 +244,17 @@ fn layer_refusal(layer: &str) -> Refusal {
     }
 }
 
-/// The refusal a layer's failure earns, as the response on its lane,
-/// recorded on the flow as the refusal the front would have written.
+/// Generate the HTTP error response on a failed layer's response lane,
+/// recorded on the flow as the refusal the transport would have written.
 /// `None` when the fault is the client's (the exchange is closing, and no
 /// layer answers it), or the record has already left the stack.
-async fn seeded_refusal(st: &Arc<StackFlow>) -> Option<CanonicalResponse> {
+async fn failure_response(st: &Arc<StackFlow>) -> Option<CanonicalResponse> {
     let refusal = refusal_for_fault(st).ok()?;
     if refusal.close {
         st.close.store(true, Ordering::Relaxed);
     }
-    // The core has let go of the context by now: whatever failed below
-    // has returned, and with it the lease.
+    // Wait for the cancelled core stage to return the context before
+    // recording the refusal.
     let mut cx = st.loan.returned().await?;
     if cx.in_flight.is_some() {
         cx.record_refusal_sample(&refusal);
@@ -261,7 +264,7 @@ async fn seeded_refusal(st: &Arc<StackFlow>) -> Option<CanonicalResponse> {
     Some(res)
 }
 
-/// A body the front will not write, read to its end here so the lane it
+/// A body the transport will not write, read to its end here so the lane it
 /// came on ends as its producer ends it.
 fn drained(mut body: Body) -> Body {
     if body.is_end_stream() {

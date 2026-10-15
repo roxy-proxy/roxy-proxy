@@ -1,10 +1,8 @@
-//! The core edge: the stage at the upstream end of the chain. It takes
-//! what the last layer passed on from the last request lane, re-validates
-//! it exactly as strictly as a client request, runs the exchange core
-//! (rules, address floor, connector, WebSocket relay) on it with the flow's
-//! own [`FlowCx`], and puts what came of it on the last response lane: the
-//! upstream's response, the rules' refusal, or the refusal a failure on
-//! the way earns.
+//! The core stage is the upstream end of the chain. It validates the
+//! forwarded request, evaluates admission and in-flight rules, applies the
+//! address floor through the connector, and owns upstream processing until
+//! completion. That includes upload accounting and the WebSocket relay.
+//! Its response lane carries an upstream response or a local refusal.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -19,10 +17,10 @@ use super::chain::{CoreIo, Head, Headless, LaneState, LaneTx};
 use super::client_edge::refusal_for_fault;
 use super::{StackFlow, decode, ws};
 use crate::body::{Collected, collect_prefix};
-use crate::exchange::{Front, Outcome, refusal_response};
+use crate::exchange::{ClientTransport, Outcome, refusal_response};
 use crate::pipeline::{BodyIo, CollectFuture, Refusal};
 
-/// Runs the core edge on its lanes.
+/// Runs the core stage on its lanes.
 pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
     let CoreIo {
         mut req_in,
@@ -44,7 +42,7 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
         Err(Headless::Cut(why)) => return res_out.cut_headless(why),
     };
     let Some((creq, stream)) = admit(&st, req) else {
-        return refused(&st, res_out).await;
+        return;
     };
     let Some(mut lease) = st.lease() else {
         // The context is lent once per exchange, and the chain carries one
@@ -55,11 +53,11 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
     cx.layer_reads_bytes = st.reads_bytes();
     cx.facts.request = Some(crate::pipeline::request_facts(&creq));
     st.set_facts(&cx.facts);
-    let mut front = Detached;
+    let mut transport = LaneTransport;
     let outcome = tokio::select! {
         biased;
         () = torn_down.cancelled() => None,
-        o = crate::exchange::core(&mut front, cx, creq) => Some(o),
+        o = crate::exchange::core(&mut transport, cx, creq) => Some(o),
     };
     let Some(outcome) = outcome else {
         // The lease records the abandonment as it goes back; the lanes are
@@ -73,12 +71,22 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
     match outcome {
         Outcome::Respond(mut res) => {
             res.body = attributed(&st, Side::Upstream, std::mem::take(&mut res.body));
-            // A response body no layer reads goes up as the origin sent it.
+            // A response body no layer reads passes through unchanged.
             if snap.http.decode_for_addons && st.body_subscribed(crate::in_flight::Dir::Response) {
                 decode::response(&st, &mut res, snap.limits.max_response_body_bytes);
             }
-            drop(lease);
             answer(res_out, res);
+            if let Some(delivery) = lease.cx().request_delivery.take() {
+                tokio::select! {
+                    biased;
+                    () = torn_down.cancelled() => {}
+                    complete = delivery.wait(snap.limits.body_idle_timeout.saturating_mul(2)) => {
+                        if !complete {
+                            lease.cx().record.reason.get_or_insert_with(|| "upstream_body_timeout".to_owned());
+                        }
+                    }
+                }
+            }
         }
         Outcome::Refuse(refusal) => {
             let res = refusal_response(cx, &refusal);
@@ -87,7 +95,7 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
         }
         // The request body failed on its way in. If a fault was recorded
         // for it (the client's broken upload, a layer's failure, the
-        // budget), the refusal that fault earns is the answer. If none was,
+        // budget), the corresponding HTTP error response is the answer. If none was,
         // the lane was cut by a layer of its own accord: nothing answers
         // that, and the response lane is cut as the request lane was.
         Outcome::Close(_) => {
@@ -100,28 +108,69 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
                 refused(&st, res_out).await;
             }
         }
-        Outcome::Upgrade {
-            mut res,
-            upstream,
-            key,
-        } => {
-            st.relayed(ws::Relay::new(
-                upstream,
-                key,
+        Outcome::Upgrade { res, upstream, key } => {
+            relay_upgrade(
+                &st,
+                &stage,
+                lease,
+                res_out,
                 stream.unwrap_or_default(),
-                &mut res,
-            ));
-            let settled = st.chain().settled(res_out.id());
-            answer(res_out, res);
-            drop(lease);
-            // The relay waits for the stack to carry the `101` down; a lane
-            // that ends without that happening leaves it to close here.
-            settled.await;
-            if let Some(relay) = st.take_relay() {
-                tokio::spawn(crate::exchange::close_upstream_ws(relay.upstream));
-            }
+                (res, upstream, key),
+            )
+            .await;
+        }
+        Outcome::LayeredUpgrade { .. } => {
+            unreachable!("the core returns an upstream upgrade, never client plumbing")
         }
     }
+}
+
+/// The core retains the context and both relay endpoints until the
+/// WebSocket closes. The client edge only confirms its handshake.
+async fn relay_upgrade(
+    st: &StackFlow,
+    stage: &super::chain::StageHandle,
+    mut lease: super::reclaim::Lease,
+    res_out: LaneTx,
+    stream: Body,
+    (mut res, upstream, key): (
+        roxy_http::CanonicalResponse,
+        hyper::upgrade::Upgraded,
+        roxy_http::ws::WsKey,
+    ),
+) {
+    let torn_down = stage.torn_down();
+    if let Err(refusal) = crate::exchange::prepare_websocket(lease.cx(), &res, &key) {
+        crate::exchange::close_upstream_ws(upstream).await;
+        let res = refusal_response(lease.cx(), &refusal);
+        drop(stream);
+        drop(lease);
+        refuse(st, res_out, &refusal, res);
+        return;
+    }
+    let relay_io = ws::relay_io(st, stream, &mut res);
+    let (start, started) = tokio::sync::oneshot::channel();
+    if st.offer_upgrade(ws::Upgrade { key, start }).is_err() {
+        stage.cancel(super::ENDED);
+        crate::exchange::close_upstream_ws(upstream).await;
+        return;
+    }
+    answer(res_out, res);
+    let client = tokio::select! {
+        biased;
+        () = torn_down.cancelled() => None,
+        client = started => client.ok(),
+    };
+    let Some(client) = client else {
+        stage.cancel(super::ENDED);
+        crate::exchange::close_upstream_ws(upstream).await;
+        return;
+    };
+    crate::exchange::relay_websocket(lease.cx(), relay_io, upstream, Vec::new(), &torn_down).await;
+    // Let a close frame traverse the response lanes before canceling
+    // layers that keep their bodies open after the relay ends.
+    client.close(Duration::from_secs(1)).await;
+    st.tear_down(super::ENDED);
 }
 
 /// The request the last layer passed on, re-validated as a client's would
@@ -130,12 +179,12 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
 pub(super) fn admit(st: &StackFlow, req: LayerRequest) -> Option<(CanonicalRequest, Option<Body>)> {
     let snap = &st.snap;
     let last = snap.addons.len() - 1;
-    let layer = &snap.addons[st.passed_on_by(last + 1).unwrap_or(last)].name;
+    let layer = st.passed_on_by(last + 1).unwrap_or(last);
     let (req, stream) = ws::split_upgrade_stream(st, req);
     match from_layer_request(req, st.client_meta.clone(), &snap.limits, &snap.flags) {
         Ok(creq) => Some((creq, stream)),
         Err(e) => {
-            st.fail(layer, LayerError::InvalidRequest(e.to_string()));
+            st.layer_failed(layer, LayerError::InvalidRequest(e.to_string()));
             None
         }
     }
@@ -153,9 +202,8 @@ fn refuse(st: &StackFlow, res_out: LaneTx, refusal: &Refusal, res: roxy_http::Ca
     answer(res_out, res);
 }
 
-/// Answers with the refusal the fault recorded earns, recorded on the flow
-/// as the front would have; a fault that is the client's own gets no
-/// answer, the lane is cut.
+/// Return an HTTP error response for the recorded failure. A broken client
+/// request closes the exchange without an answer.
 async fn refused(st: &Arc<StackFlow>, res_out: LaneTx) {
     let refusal = match refusal_for_fault(st) {
         Ok(refusal) => refusal,
@@ -174,9 +222,9 @@ async fn refused(st: &Arc<StackFlow>, res_out: LaneTx) {
 
 /// The client-side view the core needs when the "client" is the last
 /// layer: its body is a stream from the lane, with no codec to service.
-struct Detached;
+struct LaneTransport;
 
-impl BodyIo for Detached {
+impl BodyIo for LaneTransport {
     fn collect<'a>(
         &'a mut self,
         body: &'a mut Body,
@@ -188,7 +236,7 @@ impl BodyIo for Detached {
     }
 }
 
-impl Front for Detached {
+impl ClientTransport for LaneTransport {
     #[allow(clippy::manual_async_fn)] // the trait spells out the `Send` bound
     fn drive<Fut>(
         &mut self,

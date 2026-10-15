@@ -377,7 +377,7 @@ fn lag(st: &StackFlow, layer: &str, direction: Dir) -> Arc<Lag> {
 }
 
 /// Runs observe-mode layer `index`: it gets copies, the real exchange
-/// continues below it untouched.
+/// continues upstream of it untouched.
 pub(crate) async fn observe(
     st: Arc<StackFlow>,
     index: usize,
@@ -436,8 +436,8 @@ pub(crate) async fn observe(
             other => other,
         };
         if let Err(e) = result {
-            // The exchange failing (below the observer, at admission or in
-            // the body; the client's upload; the front giving it up) ends
+            // The exchange failing (upstream of the observer, at admission or in
+            // the body; the client's upload; the transport cancelling it) ends
             // the observer's copies and its `next` early; what it makes of
             // that is a consequence, recorded against the party at fault
             // before the observer could see it, not its own failure.
@@ -461,8 +461,8 @@ pub(super) async fn discard(mut body: Body) {
     while body.frame().await.is_some_and(|f| f.is_ok()) {}
 }
 
-/// The real exchange below observer `index`; the observer gets a copy of
-/// the response through `tx`, or the failure below.
+/// The real exchange upstream of observer `index`; the observer gets a copy of
+/// the response through `tx`, or the failure upstream.
 async fn forward(
     st: Arc<StackFlow>,
     index: usize,
@@ -470,7 +470,7 @@ async fn forward(
     real_req: LayerRequest,
     tx: oneshot::Sender<Result<LayerResponse, HostError>>,
 ) -> Result<LayerResponse, Headless> {
-    match super::layer::below_lanes(&st, index, Ok(real_req), false).await {
+    match super::layer::forward_lanes(&st, index, Ok(real_req), false).await {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
             let (real_body, copy_body, _lag, cut) = copy_for(&st, addon, Dir::Response, body);
