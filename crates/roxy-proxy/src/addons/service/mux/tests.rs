@@ -131,6 +131,109 @@ fn request_head() -> In {
     }
 }
 
+/// A head-only lane has two independent obligations: the service's end
+/// and the bypassed body's end. Neither may hide the other's missing end,
+/// and bypassed bytes must flow before the service ends (as on upgrades).
+#[tokio::test]
+async fn head_only_lanes_join_producer_and_bypass_completion() {
+    use crate::addons::Part;
+    use http_body_util::BodyExt as _;
+
+    for dir in [Dir::Request, Dir::Response] {
+        for producer_first in [false, true] {
+            for with_trailers in [false, true] {
+                let addon = testing::subscribed(
+                    testing::addon("s", "pass", AddonMode::Enforce, |_| {}),
+                    Part::Head,
+                    Part::Head,
+                );
+                let (stream, mut around, _kit) = lone_stream_of(addon, None).await;
+                let (mut bypass, body) = Body::channel(u64::MAX, None);
+                let end = match dir {
+                    Dir::Request => {
+                        *lock(&stream.held_request) = Some(body);
+                        stream.control(request_head());
+                        In::RequestEnd { error: None }
+                    }
+                    Dir::Response => {
+                        *lock(&stream.held_response) = Some((http::StatusCode::OK, body));
+                        stream.control(In::Response {
+                            status: 200,
+                            headers: Vec::new(),
+                        });
+                        In::ResponseEnd { error: None }
+                    }
+                };
+                let (_, mut body) = match dir {
+                    Dir::Request => around.forward.head().await.unwrap(),
+                    Dir::Response => around.answer.head().await.unwrap(),
+                };
+                let mut end = Some(end);
+                if producer_first {
+                    stream.control(end.take().unwrap());
+                }
+                assert!(futures_util::poll!(body.frame()).is_pending());
+                bypass
+                    .send_data(bytes::Bytes::from_static(b"through"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    body.frame().await.unwrap().unwrap().into_data().unwrap(),
+                    "through"
+                );
+                if with_trailers {
+                    let mut trailers = http::HeaderMap::new();
+                    trailers.insert("x-finished", http::HeaderValue::from_static("yes"));
+                    bypass.send_trailers(trailers).await.unwrap();
+                }
+                bypass.finish().await.unwrap();
+                if let Some(end) = end {
+                    assert!(
+                        futures_util::poll!(body.frame()).is_pending(),
+                        "neither EOF nor trailers may commit before the service's end"
+                    );
+                    stream.control(end);
+                }
+                if with_trailers {
+                    let trailers = body
+                        .frame()
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .into_trailers()
+                        .unwrap();
+                    assert_eq!(trailers["x-finished"], "yes");
+                }
+                assert!(body.frame().await.is_none());
+                assert!(stream.st.attribution.fault().is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn head_only_end_errors_still_fail_the_service() {
+    use crate::addons::Part;
+    use http_body_util::BodyExt as _;
+
+    let addon = testing::subscribed(
+        testing::addon("s", "pass", AddonMode::Enforce, |_| {}),
+        Part::Head,
+        Part::Head,
+    );
+    let (stream, mut around, _kit) = lone_stream_of(addon, None).await;
+    stream.control(In::Response {
+        status: 200,
+        headers: Vec::new(),
+    });
+    let (_, mut body) = around.answer.head().await.unwrap();
+    stream.control(In::ResponseEnd {
+        error: Some("cut".to_owned()),
+    });
+    assert!(body.frame().await.unwrap().is_err());
+    assert!(matches!(service_fault(&stream), ServiceError::Protocol(_)));
+}
+
 /// A transport whose queue is drained explicitly by the test.
 fn pressure_link(
     depth: usize,

@@ -543,6 +543,7 @@ pub(crate) struct FlowCx {
     pub facts: FlowFacts,
     pub opts: AllowOpts,
     pub record: FlowRecord,
+    pub completion: crate::exchange::Completion,
     pub started: Instant,
     /// The in-flight rules of this exchange, once it is forwarded.
     pub in_flight: Option<Arc<InFlight>>,
@@ -691,6 +692,7 @@ impl FlowCx {
             facts,
             opts: AllowOpts::default(),
             record: FlowRecord::default(),
+            completion: crate::exchange::Completion::default(),
             started: Instant::now(),
             in_flight: None,
             capture: PerDir::default(),
@@ -861,6 +863,8 @@ impl FlowCx {
         self.logged = true;
         if let Some(st) = self.stack.take() {
             st.fold_into(self);
+        } else if let Some(reason) = self.completion.reason(None) {
+            self.record.reason.get_or_insert(reason);
         }
         self.absorb_in_flight();
         if let Some(t) = &self.request_tally {

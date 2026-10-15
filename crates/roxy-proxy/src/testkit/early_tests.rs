@@ -19,6 +19,228 @@ use crate::addons::{AddonMode, Part};
 
 const CHUNK: usize = 4096;
 
+/// The same boundary contract for both addon backends and HTTP transports:
+/// bypassed data, empty bodies with trailers, suppressed bodies and cuts.
+#[tokio::test]
+async fn head_only_completion_conforms_across_backends_and_transports() {
+    use http_body_util::BodyExt as _;
+    for service in [false, true] {
+        for h2 in [false, true] {
+            for (method, path) in [
+                ("POST", "/x"),
+                ("GET", "/trailers"),
+                ("HEAD", "/status/200"),
+                ("GET", "/cut"),
+            ] {
+                let kit = if service {
+                    testing::kit(
+                        super::ALLOW_UP,
+                        vec![testing::subscribed(
+                            testing::addon("a", "pass", AddonMode::Enforce, |_| {}),
+                            Part::Head,
+                            Part::Head,
+                        )],
+                    )
+                    .await
+                } else {
+                    Kit::builder()
+                        .rules(super::ALLOW_UP)
+                        .addon(AddonDef::test_layer("a").subscribe(Part::Head, Part::Head))
+                        .start()
+                        .await
+                };
+                // Keep the origin on HTTP/2 for its empty-body trailers;
+                // exercise both downstream transports independently.
+                let mut client = kit.tunnel("up.test", h2).await;
+                let data: &[u8] = if method == "POST" {
+                    b"twelve bytes"
+                } else {
+                    b""
+                };
+                let req = client
+                    .request(method, path, &[])
+                    .body(roxy_http::Body::from_bytes(Bytes::from_static(data)))
+                    .unwrap();
+                let (parts, body) = client.send(req).await.unwrap().into_parts();
+                let body = body.collect().await;
+                if path == "/trailers" {
+                    assert_eq!(
+                        body.as_ref().unwrap().trailers().unwrap()["x-checksum"],
+                        "none"
+                    );
+                }
+                let answer = Answer {
+                    status: parts.status.as_u16(),
+                    headers: parts.headers,
+                    body: body
+                        .map(http_body_util::Collected::to_bytes)
+                        .map_err(|e| e.to_string()),
+                };
+                assert_eq!(
+                    answer.status, 200,
+                    "service={service} h2={h2} {method} {path}: {answer:?}"
+                );
+                assert_eq!(
+                    answer.body.is_ok(),
+                    method == "HEAD" || path != "/cut",
+                    "{answer:?}"
+                );
+                if method == "POST" {
+                    assert_eq!(answer.json()["body_len"], 12);
+                }
+                let event = kit.request_event().await;
+                if path == "/cut" {
+                    assert_eq!(event["reason"], "upstream_body_failed", "{event:#}");
+                } else {
+                    assert!(event["reason"].is_null(), "{event:#}");
+                }
+                if method == "HEAD" {
+                    assert_eq!(event["res"]["body_bytes"], 0);
+                }
+                super::no_layer_error(&kit);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn head_only_bodiless_h1_still_requires_a_timed_end() {
+    for (method, status) in [("GET", 204), ("HEAD", 200)] {
+        head_only_bodiless(false, false, method, status).await;
+    }
+}
+
+#[tokio::test]
+async fn head_only_bodiless_h2_still_requires_a_timed_end() {
+    for (method, status) in [("GET", 204), ("HEAD", 200)] {
+        head_only_bodiless(true, false, method, status).await;
+    }
+}
+
+#[tokio::test]
+async fn head_only_bodiless_clean_end_releases_the_exchange() {
+    for h2 in [false, true] {
+        for (method, status) in [("GET", 204), ("HEAD", 200)] {
+            head_only_bodiless(h2, true, method, status).await;
+        }
+    }
+}
+
+async fn head_only_bodiless(h2: bool, clean_end: bool, method: &'static str, status: u16) {
+    use serde_json::json;
+    let kit = testing::kit_with(
+        super::ALLOW_UP,
+        vec![testing::subscribed(
+            testing::addon("s", "scripted", AddonMode::Enforce, |_| {}),
+            Part::Full,
+            Part::Head,
+        )],
+        |b| b.limits(|l| l.response_body_idle_timeout = Duration::from_millis(50)),
+    )
+    .await;
+    let mut client = if h2 {
+        kit.tunnel("up.test", true).await
+    } else {
+        kit.h1().await
+    };
+    let call = tokio::spawn(async move {
+        let answer = client.call(method, "/x", &[], b"").await;
+        (client, answer)
+    });
+    let mut script = kit.upstream.service().script().await;
+    script.control("open").await;
+    script.control("request").await;
+    script.body(0).await;
+    script.send(json!({"type":"request_end"}));
+    script.control("response_end").await;
+    script.send(json!({"type":"response", "status":status, "headers":[]}));
+    if clean_end {
+        script.send(json!({"type":"response_end"}));
+    }
+    let (_client, answer) = call.await.unwrap();
+    assert_eq!(answer.status, status);
+    let event = tokio::time::timeout(Duration::from_secs(2), kit.request_event())
+        .await
+        .expect("head-only response_end is still outstanding and must time out");
+    if clean_end {
+        assert!(event["reason"].is_null(), "{event:#}");
+    } else {
+        assert_eq!(event["reason"], "response_body_timeout", "{event:#}");
+        script.control("reset").await;
+    }
+    assert_eq!(event["res"]["body_bytes"], 0, "{event:#}");
+    assert!(
+        kit.sink
+            .events()
+            .iter()
+            .all(|e| e["event"] != "response_error")
+    );
+}
+
+#[tokio::test]
+async fn response_validation_fault_attribution_is_independent_of_suppression() {
+    for h2 in [false, true] {
+        for (method, status) in [("HEAD", 200), ("GET", 204), ("GET", 200)] {
+            response_validation_fault(h2, method, status).await;
+        }
+    }
+}
+
+async fn response_validation_fault(h2: bool, method: &'static str, status: u16) {
+    use serde_json::json;
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![testing::addon("s", "scripted", AddonMode::Enforce, |_| {})],
+    )
+    .await;
+    let mut client = if h2 {
+        kit.tunnel("up.test", true).await
+    } else {
+        kit.h1().await
+    };
+    let call = tokio::spawn(async move {
+        let answer = client.call(method, "/x", &[], b"").await;
+        (client, answer)
+    });
+    let mut script = kit.upstream.service().script().await;
+    script.control("open").await;
+    script.control("request").await;
+    script.body(0).await;
+    script.send(json!({"type":"request_end"}));
+    script.control("response_end").await;
+    script.send(json!({"type":"response", "status":status, "headers":[["content-length","10"]]}));
+    let suppressed = method == "HEAD" || status == 204;
+    let mut call = Some(call);
+    // A suppressed answer must finish on the wire before the internal
+    // body fails. Keep the client connected through reclamation.
+    let early = if suppressed {
+        Some(call.take().unwrap().await.unwrap())
+    } else {
+        None
+    };
+    script.bytes(1, b"short");
+    script.send(json!({"type":"response_end"}));
+    let (_client, answer) = match early {
+        Some(answer) => answer,
+        None => call.unwrap().await.unwrap(),
+    };
+    assert_eq!(answer.status, status);
+    assert_eq!(answer.body.is_ok(), suppressed, "{answer:?}");
+    let event = kit.request_event().await;
+    let errors = kit.events("layer_error", 1).await;
+    assert_eq!(errors[0]["kind"], "service:protocol");
+    assert_eq!(event["reason"], "layer_error", "{event:#}");
+    if suppressed {
+        assert_eq!(event["res"]["body_bytes"], 0, "{event:#}");
+        assert!(
+            kit.sink
+                .events()
+                .iter()
+                .all(|e| e["event"] != "response_error")
+        );
+    }
+}
+
 #[tokio::test]
 async fn bodiless_response_consumption_obeys_idle_timeout_on_both_transports() {
     for h2 in [false, true] {

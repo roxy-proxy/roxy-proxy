@@ -160,7 +160,12 @@ impl HttpBody for Attributed {
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         let this = &mut *self;
         let frame = ready!(Pin::new(&mut this.inner).poll_frame(cx));
-        if let Some(Err(e)) = &frame {
+        // The transport publishes cancellation before cutting lane bodies.
+        // Errors observed after that are consequences of the client loss,
+        // not a new parse/upstream fault. Any earlier fault still stands.
+        if let Some(Err(e)) = &frame
+            && this.st.cancellation() != Some(super::Cancellation::ClientGone)
+        {
             this.st.attribution.record(this.side.fault(e));
         }
         Poll::Ready(frame)
@@ -227,6 +232,36 @@ impl<F> Drop for Driven<F> {
                 Reason::UnexpectedEof,
                 "the exchange ended before the stack answered",
             )));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http_body_util::BodyExt as _;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_body_errors_do_not_replace_the_observed_cause() {
+        let kit = crate::testkit::Kit::builder().start().await;
+        for side in [Side::Client, Side::Upstream] {
+            for prior_fault in [false, true] {
+                let (st, _cx, _ends) = crate::addons::test_flow(&kit);
+                let (sender, source) = Body::channel(u64::MAX, None);
+                let mut body = attributed(&st, side, source);
+                if prior_fault {
+                    st.fail("s", roxy_wasm::LayerError::NoResponse);
+                }
+                st.tear_down(crate::addons::CLIENT_GONE);
+                sender.abort(BodyError::Incomplete);
+                assert!(body.frame().await.unwrap().is_err());
+                assert_eq!(
+                    st.fault_reason().as_deref(),
+                    prior_fault.then_some("layer_error")
+                );
+                assert_eq!(st.cancellation_reason(), Some("client_gone"));
+            }
         }
     }
 }

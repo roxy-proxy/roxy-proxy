@@ -127,6 +127,23 @@ pub(crate) enum Dir {
     Res,
 }
 
+/// Transport cancellation is stronger evidence than abandonment inferred
+/// from a cancelled upstream worker. Keep the two facts separate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cancellation {
+    ClientGone,
+    UpstreamAbandoned,
+}
+
+impl Cancellation {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::ClientGone => "client_gone",
+            Self::UpstreamAbandoned => "upstream_aborted",
+        }
+    }
+}
+
 /// One lane of one hop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LaneId {
@@ -211,7 +228,7 @@ pub(crate) struct Chain {
     torn_why: OnceLock<&'static str>,
     /// The first lane a layer cut of its own accord: the record's reason.
     abort: OnceLock<&'static str>,
-    cancellation: OnceLock<&'static str>,
+    client_gone: AtomicBool,
     /// Provisional fallback; a later observed client loss takes precedence.
     upstream_abandoned: AtomicBool,
 }
@@ -279,7 +296,7 @@ impl Chain {
             torn: CancellationToken::new(),
             torn_why: OnceLock::new(),
             abort: OnceLock::new(),
-            cancellation: OnceLock::new(),
+            client_gone: AtomicBool::new(false),
             upstream_abandoned: AtomicBool::new(false),
         });
         let ends = |dir| -> (Vec<Option<LaneTx>>, Vec<Option<LaneRx>>) {
@@ -429,12 +446,15 @@ impl Chain {
 
     /// Observed cancellation, falling back to upstream abandonment only
     /// when no transport cancellation explains the unfinished work.
-    pub(super) fn cancellation_reason(&self) -> Option<&'static str> {
-        self.cancellation.get().copied().or_else(|| {
-            self.upstream_abandoned
-                .load(Ordering::Relaxed)
-                .then_some("upstream_aborted")
-        })
+    pub(super) fn cancellation(&self) -> Option<Cancellation> {
+        self.client_gone
+            .load(Ordering::Acquire)
+            .then_some(Cancellation::ClientGone)
+            .or_else(|| {
+                self.upstream_abandoned
+                    .load(Ordering::Relaxed)
+                    .then_some(Cancellation::UpstreamAbandoned)
+            })
     }
 
     /// The layer whose own answer reached the client, if a layer's did.
@@ -683,7 +703,7 @@ impl Chain {
     /// are cut or stopped. Driver cancellation does not depend on either.
     pub(crate) fn tear_down(&self, why: &'static str) {
         if why == super::CLIENT_GONE {
-            let _ = self.cancellation.set("client_gone");
+            self.client_gone.store(true, Ordering::Release);
         }
         let _ = self.torn_why.set(why);
         self.torn.cancel();

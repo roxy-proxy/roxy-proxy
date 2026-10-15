@@ -2,7 +2,10 @@
 //! steps → client, on the h1 codec. A `101` hands the connection to the
 //! relay in [`ws`].
 
+mod completion;
 mod ws;
+
+pub(crate) use completion::Completion;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -187,30 +190,13 @@ pub(crate) async fn send(
     let stop = cx.in_flight.as_ref().and_then(|w| w.stopped());
     // Under a stop, the cut body is how the stop is delivered, not a
     // failure of its own.
-    let failure = match r {
-        Ok(()) | Err(WriteFailure::Stopped) => None,
-        Err(e @ WriteFailure::ClientGone(_)) => Some(("client_gone".to_owned(), e)),
-        Err(e @ WriteFailure::ClientStalled) => Some(("client_stalled".to_owned(), e)),
-        Err(e @ WriteFailure::UpstreamStalled) => Some(("response_body_timeout".to_owned(), e)),
-        Err(WriteFailure::Request(e)) => {
-            Some((e.reason.as_str().to_owned(), WriteFailure::Request(e)))
+    if let Err(e) = r {
+        cx.completion.write_failed(&e);
+        if stop.is_none()
+            && let Some(reason) = cx.completion.response_reason(cx.stack.as_deref())
+        {
+            emit_response_error(&cx, &reason, &e);
         }
-        // A body that failed into the addon stack was recorded there as
-        // whoever's fault it was, before the cut reached the transport.
-        Err(e @ WriteFailure::Io(_)) => {
-            let reason = cx
-                .stack
-                .as_ref()
-                .and_then(|st| st.fault_reason())
-                .unwrap_or_else(|| "response_write_failed".to_owned());
-            Some((reason, e))
-        }
-    };
-    if stop.is_none()
-        && let Some((reason, e)) = failure
-    {
-        emit_response_error(&cx, &reason, &e);
-        cx.record.reason.get_or_insert(reason);
     }
     // One source for both transports: `refusal_response` sets `res.meta.close`
     // from the same field. A refusal of a forward made after the response
@@ -237,22 +223,10 @@ pub(crate) async fn send(
 }
 
 fn record_cancellation(cx: &mut FlowCx, e: &WriteFailure) {
-    let reason = match e {
-        WriteFailure::ClientGone(_) => cx
-            .stack
-            .as_ref()
-            .and_then(|st| st.cancellation_reason())
-            .unwrap_or("client_gone"),
-        WriteFailure::Request(error) => {
-            cx.shared.emit_parse_error(&cx.client, Some(cx), error);
-            error.reason.as_str()
-        }
-        WriteFailure::Stopped => "in_flight_stopped",
-        WriteFailure::ClientStalled => "client_stalled",
-        WriteFailure::UpstreamStalled => "response_body_timeout",
-        WriteFailure::Io(_) => "h2_stream_error",
-    };
-    cx.record.reason.get_or_insert_with(|| reason.to_owned());
+    if let WriteFailure::Request(error) = e {
+        cx.shared.emit_parse_error(&cx.client, Some(cx), error);
+    }
+    cx.completion.cancelled(e);
 }
 
 pub(crate) fn emit_response_error(cx: &FlowCx, reason: &str, e: &dyn std::fmt::Display) {

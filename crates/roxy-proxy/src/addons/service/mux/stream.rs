@@ -17,7 +17,7 @@ use super::super::super::chain::{Head, LaneTx};
 use super::super::super::host::StackHost;
 use super::super::super::{AddonMode, Part, StackError, StackFlow, emit_stack_error};
 use super::super::{Call, In, Out, ServiceError, ServiceSpec};
-use super::inbox::{Inbox, feeder};
+use super::inbox::{Inbox, Output, feeder};
 use super::link::{Link, Message, Queued, Wire, binary, dial, text};
 use super::lock;
 use super::pool::{Pool, PoolKey, Reservation};
@@ -709,7 +709,7 @@ impl Stream {
                     // The body the layer did not see goes on with the head
                     // it passed on; the lane retains its clean-end check.
                     let bound = lock(&self.held_request).take().unwrap_or_default();
-                    out.whole(head, bound);
+                    self.bind(Dir::Request, out, head, bound);
                     return Ok(());
                 }
                 // On an upgrade the forwarded body is the client's side of
@@ -719,7 +719,7 @@ impl Stream {
                 } else {
                     limits.max_request_body_bytes
                 };
-                self.feed(Dir::Request, out.head(head, declared, cap));
+                self.feed(Dir::Request, Output::Lane(out.head(head, declared, cap)));
                 Ok(())
             }
             In::Response { status, headers } => {
@@ -746,7 +746,7 @@ impl Stream {
                         Some((s, body)) if s == status => body,
                         _ => Body::empty(),
                     };
-                    out.whole(head, body);
+                    self.bind(Dir::Response, out, head, body);
                     return Ok(());
                 }
                 // A `101`'s body is the upstream's side of the WebSocket,
@@ -757,7 +757,7 @@ impl Stream {
                 } else {
                     limits.max_response_body_bytes
                 };
-                self.feed(Dir::Response, out.head(head, declared, cap));
+                self.feed(Dir::Response, Output::Lane(out.head(head, declared, cap)));
                 Ok(())
             }
             In::Trailers { dir, headers } => {
@@ -804,6 +804,12 @@ impl Stream {
                 Ok(())
             }
             Ended::Body(Some(inbox)) => {
+                if error.is_some() && self.head_only(dir) {
+                    return Err(ServiceError::Protocol(format!(
+                        "an error on the {}_end of a head-only body",
+                        dir.as_str()
+                    )));
+                }
                 let mut q = lock(&inbox.q);
                 match error {
                     Some(why) => q.abort = Some(why),
@@ -813,8 +819,8 @@ impl Stream {
                 inbox.ready.notify_one();
                 Ok(())
             }
-            // A head-only lane carries no body to cut, and an observe
-            // stream's lanes go nowhere.
+            // A stopped lane has no inbox, and an observe stream's lanes
+            // go nowhere.
             Ended::Body(None) => {
                 if error.is_some() && self.mode == AddonMode::Enforce {
                     return Err(ServiceError::Protocol(format!(
@@ -923,8 +929,18 @@ impl Stream {
         self.st.snap.addons[self.index].subscribe.part(dir) == Part::Head
     }
 
+    /// A subscription changes byte visibility, not the service's explicit
+    /// end obligation. Both bodies flow independently, but must end before
+    /// the enclosing lane can complete (including its trailers).
+    fn bind(self: &Arc<Self>, dir: Dir, out: LaneTx, head: Head, bypassed: Body) {
+        let (end, own) = Body::channel(0, Some(0));
+        let body = super::super::super::subscribe::splice(&self.st, self.index, dir, own, bypassed);
+        self.feed(dir, Output::HeadOnly(end));
+        out.whole(head, body);
+    }
+
     /// Starts feeding the `dir` body from the stream into `body`.
-    fn feed(self: &Arc<Self>, dir: Dir, body: super::super::super::chain::LaneBody) {
+    fn feed(self: &Arc<Self>, dir: Dir, body: Output) {
         // Observers have no outgoing lane; only enforcing streams reach here.
         debug_assert_eq!(self.mode, AddonMode::Enforce);
         let inbox = Arc::new(Inbox::default());

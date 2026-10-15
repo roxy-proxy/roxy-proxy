@@ -223,7 +223,11 @@ identity for future incompatible changes.
   `response_end` restores the whole budget, unless the service has already
   answered; receiving a head does not wait for the response body to end.
   An observer gets that budget from roxy's last message to end its stream. A
-  stream has no overall deadline. Body-idle and upstream timeouts still
+  stream has no overall deadline. Head-only output lanes still require
+  their explicit end: bypassed bytes can flow before it, but completion
+  waits for both the end message and the bypassed body. This includes a
+  HEAD or bodiless response already completed on the client connection.
+  Body-idle and upstream timeouts still
   apply while the service's answer clock is suspended. The client edge
   applies `response_body_idle_timeout` even to a HEAD or bodiless response
   it must discard, and observes client loss through final reclamation.

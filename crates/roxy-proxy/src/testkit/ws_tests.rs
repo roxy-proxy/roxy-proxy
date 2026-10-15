@@ -27,6 +27,96 @@ fn with(more: &str) -> KitBuilder {
 }
 
 #[tokio::test]
+async fn disconnect_after_upgrade_cancels_a_holding_service() {
+    held_upgrade_ends(UpgradeEnd::Disconnect).await;
+}
+
+#[tokio::test]
+async fn a_cut_upgraded_answer_ends_the_exchange_without_claiming_client_loss() {
+    held_upgrade_ends(UpgradeEnd::Cut).await;
+}
+
+#[tokio::test]
+async fn an_upgraded_response_fault_reaches_final_attribution() {
+    held_upgrade_ends(UpgradeEnd::Fault).await;
+}
+
+#[derive(Clone, Copy)]
+enum UpgradeEnd {
+    Disconnect,
+    Cut,
+    Fault,
+}
+
+async fn held_upgrade_ends(end: UpgradeEnd) {
+    use crate::addons::service::testing;
+    use crate::addons::{AddonMode, CLIENT_GONE};
+
+    let kit = testing::kit(
+        WS_ALLOW,
+        vec![testing::addon("s", "scripted", AddonMode::Enforce, |_| {})],
+    )
+    .await;
+    let (mut client, reset) = kit.connect_resettable();
+    client.write_all(b"GET http://up.test/ws/echo HTTP/1.1\r\nHost: up.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+    let mut script = kit.upstream.service().script().await;
+    script.control("open").await;
+    let request = script.control("request").await;
+    script.send(request);
+    let response = script.control("response").await;
+    assert_eq!(response["status"], 101);
+    script.send(response);
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        head.push(client.read_u8().await.unwrap());
+    }
+    assert!(head.starts_with(b"HTTP/1.1 101"));
+    match end {
+        UpgradeEnd::Cut => script.send(serde_json::json!({"type":"response_end", "error":"cut"})),
+        UpgradeEnd::Fault => {
+            script.send(serde_json::json!({"type":"response", "status":101, "headers":[]}));
+        }
+        UpgradeEnd::Disconnect => {
+            reset.reset();
+            drop(client);
+        }
+    }
+    let message = tokio::time::timeout(Duration::from_secs(3), script.control("reset"))
+        .await
+        .expect("a disconnected upgraded client must cancel the service");
+    let expected = match end {
+        UpgradeEnd::Disconnect => {
+            assert_eq!(message["message"], CLIENT_GONE, "{message}");
+            "client_gone"
+        }
+        UpgradeEnd::Cut => {
+            assert_eq!(message["message"], crate::addons::ENDED, "{message}");
+            "answer_aborted"
+        }
+        UpgradeEnd::Fault => {
+            assert!(
+                message["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("second response head"),
+                "{message}"
+            );
+            "layer_error"
+        }
+    };
+    let event = kit.request_event().await;
+    assert_eq!(event["reason"], expected, "{event:#}");
+    if matches!(end, UpgradeEnd::Fault) {
+        assert_eq!(
+            kit.events("layer_error", 1).await[0]["kind"],
+            "service:protocol"
+        );
+    } else {
+        super::no_layer_error(&kit);
+    }
+}
+
+#[tokio::test]
 async fn failed_upgrade_write_publishes_client_loss_before_releasing_lanes() {
     use crate::addons::service::testing;
     use crate::addons::{AddonMode, CLIENT_GONE, Part};

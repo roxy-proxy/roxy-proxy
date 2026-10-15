@@ -233,9 +233,7 @@ impl Reclaim {
                 drop(delivery);
                 cx.tasks.wait().await;
                 if !complete {
-                    cx.record
-                        .reason
-                        .get_or_insert_with(|| "upstream_body_timeout".to_owned());
+                    cx.completion.upload_timed_out = true;
                 }
                 (*cx, cancellation)
             }
@@ -263,14 +261,7 @@ impl Reclaim {
             }
         };
         if let Some(error) = body_error {
-            cx.record.reason.get_or_insert_with(|| {
-                if error == BodyError::Timeout {
-                    "response_body_timeout"
-                } else {
-                    "response_body_failed"
-                }
-                .to_owned()
-            });
+            cx.completion.drained(&error);
         }
         if let Some(guard) = guard {
             guard.complete();

@@ -82,7 +82,7 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
                     () = torn_down.cancelled() => st.chain().upstream_abandoned(),
                     complete = delivery.wait() => {
                         if !complete {
-                            lease.cx().record.reason.get_or_insert_with(|| "upstream_body_timeout".to_owned());
+                            lease.cx().completion.upload_timed_out = true;
                         }
                     }
                 }
@@ -169,7 +169,9 @@ async fn relay_upgrade(
     crate::exchange::relay_websocket(lease.cx(), relay_io, upstream, Vec::new(), &torn_down).await;
     // Let a close frame traverse the response lanes before cancelling
     // layers that keep their bodies open after the relay ends.
-    client.close(crate::exchange::CLOSE_TIMEOUT).await;
+    if let Some(error) = client.close(crate::exchange::CLOSE_TIMEOUT).await {
+        lease.cx().completion.drained(&error);
+    }
     st.tear_down(super::ENDED);
 }
 
@@ -317,6 +319,9 @@ mod tests {
         assert!(!cx.request_delivery.as_ref().unwrap().wait().await);
         drop(outcome);
         let cx = crate::addons::Reclaim::now(cx).take().await;
-        assert_eq!(cx.record.reason.as_deref(), Some("upstream_body_timeout"));
+        assert_eq!(
+            cx.completion.reason(None).as_deref(),
+            Some("upstream_body_timeout")
+        );
     }
 }

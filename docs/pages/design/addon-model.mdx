@@ -97,7 +97,11 @@ The lifecycle rules are:
   response alone does not cancel a still-useful forward.
 - **Client cancellation tears down the whole exchange**, independently of
   which response lanes have ended. HTTP/2 continues watching for stream
-  resets while waiting for the exchange after an early answer.
+  resets while waiting for the exchange after an early answer. After a
+  WebSocket upgrade, socket read and write failures report cancellation
+  before releasing any lane bodies. A lane-body error alone does not mean
+  the client disappeared; a clean socket half-close still permits the
+  other direction to drain.
 - **A layer that lets go of its response lane without a head** has not
   answered: that is its `no_response` fault.
 - **A layer that faults** (a trap, a budget, a missed deadline, a lane out
@@ -130,7 +134,8 @@ The lifecycle rules are:
   Both HTTP transports observe client loss through reclamation. The flow
   record is written after this barrier.
   WebSockets use the same rule: the core owns the relay and its accounting
-  until it ends, then cancels any remaining layers.
+  until it ends, then cancels any remaining layers. The socket reader and
+  writer are included in the completion barrier through their destruction.
 
 Wire completion, exchange completion and connection lifetime are separate.
 An HTTP/1.1 answer can finish while its upload or addon work continues;
@@ -144,6 +149,12 @@ hop, nothing it produces moves a lane, and the exchange does not wait for
 it. A head-only layer puts its head on a lane and the body of the lane it
 consumes in the same direction goes on with it (for a response, only when
 the status is the same; otherwise the answer is the layer's own, whole).
+The bypassed body and the layer's own output have independent ends. Bytes
+flow without waiting for the layer's end, but lane completion and trailers
+wait for both. This is the same contract for WASM streams and service
+`request_end` / `response_end` messages, even when no bytes are visible to
+the layer or sent on the wire. A head-only service's response end is still
+subject to the response idle deadline after a HEAD or 204 answer.
 
 ## Request and response production are independent
 
@@ -254,6 +265,17 @@ can fail on it: a layer as it fails, before its bodies end; a body where it
 enters the stack, before a layer reads it; the transport handler when it
 cancels the exchange. So what a layer makes of a body or a `next` that ended on
 someone else's failure is a consequence, never a second fault.
+
+Final reason selection happens after reclamation, from the facts gathered
+by the adapters. A policy or validation reason already in the record is
+preserved. Otherwise a known fault behind a failed response body takes
+precedence, followed by a deliberate lane abort, observed cancellation,
+a response failure, an upload deadline, and finally upstream abandonment.
+Writing and discarding a response body use the same fault attribution.
+A later drain failure does not turn an already-written HEAD or bodiless
+response into a failed wire write, and discarded bytes are not counted as
+transmitted. A fault recovered by a layer does not by itself fail a
+successfully completed response.
 
 - A layer's own failure (a trap, an exceeded budget, an invalid head, a
   service that broke its stream) is the layer's: `503` with

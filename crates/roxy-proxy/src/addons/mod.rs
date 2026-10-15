@@ -31,6 +31,7 @@ mod subscribe;
 mod tee;
 mod ws;
 
+pub(crate) use chain::Cancellation;
 pub(crate) use client_edge::run;
 pub(crate) use reclaim::Reclaim;
 pub use service::{ServiceError, ServiceSpec};
@@ -391,8 +392,17 @@ impl StackFlow {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn cancellation_reason(&self) -> Option<&'static str> {
-        self.chain().cancellation_reason()
+        self.cancellation().map(Cancellation::reason)
+    }
+
+    pub(crate) fn cancellation(&self) -> Option<Cancellation> {
+        self.chain().cancellation()
+    }
+
+    pub(crate) fn abort_reason(&self) -> Option<&'static str> {
+        self.chain().abort_reason()
     }
 
     /// The flow log's code for the fault that cut the exchange's response
@@ -479,11 +489,6 @@ impl StackFlow {
     /// the rules refused the request it forwarded meanwhile. A refusal is
     /// the verdict whatever the client was given.
     fn fold_answer(&self, cx: &mut FlowCx) {
-        // A lane a layer cut of its own accord: the reason, unless one
-        // stands.
-        if let Some(abort) = self.chain().abort_reason() {
-            cx.record.reason.get_or_insert_with(|| abort.to_owned());
-        }
         if cx.record.decision == Some(DecisionKind::Deny) {
             return;
         }
@@ -496,8 +501,8 @@ impl StackFlow {
     /// Folds the stack into the flow record just before its `request`
     /// event: the layers that ran.
     pub(crate) fn fold_into(&self, cx: &mut FlowCx) {
-        if let Some(reason) = self.chain().cancellation_reason() {
-            cx.record.reason.get_or_insert_with(|| reason.to_owned());
+        if let Some(reason) = cx.completion.reason(Some(self)) {
+            cx.record.reason.get_or_insert(reason);
         }
         cx.record.addons = self
             .snap

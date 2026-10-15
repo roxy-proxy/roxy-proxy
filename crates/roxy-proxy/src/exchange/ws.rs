@@ -102,6 +102,7 @@ pub(super) async fn connect_stack(
     res: CanonicalResponse,
     client: crate::addons::WsClient,
 ) -> Next {
+    let guard = reclaim.cancellation_guard();
     match conn.respond_upgrade(res).await {
         Ok((io, leftover)) => client.connect(Box::new(io), leftover.to_vec()),
         Err(e) => {
@@ -111,6 +112,9 @@ pub(super) async fn connect_stack(
         }
     }
     let mut cx = reclaim.take().await;
+    if let Some(guard) = guard {
+        guard.complete();
+    }
     cx.record_final_sample();
     cx.emit_request_event();
     None

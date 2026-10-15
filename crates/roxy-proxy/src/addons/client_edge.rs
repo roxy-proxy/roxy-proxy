@@ -176,8 +176,13 @@ pub(super) fn stack_outcome(
                 return refuse(st);
             }
             let to_client = upgraded_body.unwrap_or_default();
-            let client =
-                ws::WsClient::new(client_tx, to_client, st.shared.sink.clone(), upgrade.start);
+            let client = ws::WsClient::new(
+                client_tx,
+                to_client,
+                st.shared.sink.clone(),
+                upgrade.start,
+                st.chain().clone(),
+            );
             // A failure from here on cuts the body (the codec then breaks
             // the connection) and is logged as it is recorded.
             st.attribution.head_out();
