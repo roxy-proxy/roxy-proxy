@@ -33,6 +33,7 @@ fn failed_link() -> Arc<Link> {
                 failed: true,
             }),
             ctl,
+            refusals: mpsc::channel(1).0,
         }),
         data,
     })
@@ -253,6 +254,7 @@ fn pressure_link(
                     failed: false,
                 }),
                 ctl,
+                refusals: mpsc::channel(1).0,
             }),
             data,
         }),
@@ -473,15 +475,17 @@ async fn a_headless_forward_end_releases_the_held_upload_before_the_answer_ends(
 #[tokio::test]
 async fn accepted_calls_receive_results_after_all_four_lanes_end() {
     let (ctl, _ctl_rx) = mpsc::unbounded_channel();
+    let (refusals, mut refused) = mpsc::channel(4);
     let (data, mut sent) = mpsc::channel(4);
     let link = Arc::new(Link {
         shared: Arc::new(LinkShared {
             streams: Mutex::new(LinkState {
                 open: HashMap::new(),
-                next_id: 1,
+                next_id: 2,
                 failed: false,
             }),
             ctl,
+            refusals,
         }),
         data,
     });
@@ -512,6 +516,30 @@ async fn accepted_calls_receive_results_after_all_four_lanes_end() {
     assert_eq!(value["id"], 9);
     stream.until_ended().await;
     assert_eq!(kit.events("layer_record", 1).await[0]["kind"], "final");
+
+    // A new call can cross the final input end on the wire. It receives
+    // a refusal, including if the reader routed it just before retirement.
+    for routed in [false, true] {
+        if routed {
+            lock(&stream.link.shared.streams)
+                .open
+                .insert(stream.id, stream.clone());
+        }
+        let serde_json::Value::Object(call) = serde_json::json!({
+            "type": "record", "id": 10, "kind": "too late", "data": {}
+        }) else {
+            unreachable!();
+        };
+        super::link::control_frame(&stream.link.shared, stream.id, call).unwrap();
+        let reply = refused.try_recv().expect("the late call is refused");
+        let value: serde_json::Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+        assert_eq!(value["type"], "result");
+        assert_eq!(value["stream"], stream.id);
+        assert_eq!(value["id"], 10);
+        assert_eq!(value["error"], "the stream has ended");
+        assert!(sent.try_recv().is_err(), "no accepted call's result");
+        lock(&stream.link.shared.streams).open.remove(&stream.id);
+    }
 }
 
 #[tokio::test]
@@ -868,18 +896,18 @@ async fn an_ended_stream_keeps_its_place_until_its_calls_have_run() {
     assert!(place.is_ok(), "the place is free once the call has run");
 }
 
-/// A call handed to a stream that has already ended is dropped, with no
-/// worker started for it: the reader may still hold the stream after
-/// another task ended it, and the call crossed the end.
+/// A call handed to a stream that has already ended is refused, with no
+/// worker started for it. The reader may still hold the stream after
+/// another task ended it, and must learn that it owes a refusal.
 #[tokio::test]
-async fn a_call_after_the_end_is_dropped() {
+async fn a_call_after_the_end_is_not_accepted() {
     let addon = testing::granted(
         testing::addon("s", "pass", AddonMode::Observe, |_| {}),
         &[roxy_wasm::Capability::Record],
     );
     let (stream, _around, kit) = lone_stream_of(addon, None).await;
     stream.reset("the exchange ended");
-    stream.control(In::Call(Call::Record {
+    assert!(!stream.queue_host_call(Call::Record {
         id: 1,
         kind: "late".to_owned(),
         data: serde_json::json!({}),
@@ -1152,6 +1180,7 @@ async fn frames_on_an_ended_stream_queue_nothing() {
             failed: false,
         }),
         ctl,
+        refusals: mpsc::channel(1).0,
     };
     let frame = binary(1, Dir::Request, b"x");
     for _ in 0..10_000 {
@@ -1162,4 +1191,49 @@ async fn frames_on_an_ended_stream_queue_nothing() {
         "nothing queued for an ended stream"
     );
     assert!(!lock(&shared.streams).failed);
+}
+
+/// Late-call replies cannot grow the unbounded credit/reset queue. A
+/// service flooding them fails the connection when their queue fills.
+#[test]
+fn replies_to_calls_on_ended_streams_are_bounded() {
+    let (ctl, mut ctl_rx) = mpsc::unbounded_channel();
+    let (refusals, mut replies) = mpsc::channel(2);
+    let shared = LinkShared {
+        streams: Mutex::new(LinkState {
+            open: HashMap::new(),
+            next_id: 2,
+            failed: false,
+        }),
+        ctl,
+        refusals,
+    };
+    let call = || {
+        let serde_json::Value::Object(v) = serde_json::json!({
+            "type": "quarantine", "id": 3
+        }) else {
+            unreachable!();
+        };
+        v
+    };
+    for _ in 0..2 {
+        super::link::control_frame(&shared, 1, call()).unwrap();
+    }
+    assert!(matches!(
+        super::link::control_frame(&shared, 1, call()),
+        Err(ServiceError::Protocol(_))
+    ));
+    assert!(ctl_rx.try_recv().is_err());
+    for _ in 0..2 {
+        assert!(replies.try_recv().is_ok());
+    }
+    assert!(replies.try_recv().is_err());
+    assert!(
+        matches!(
+            super::link::control_frame(&shared, 2, call()),
+            Err(ServiceError::Protocol(_))
+        ),
+        "a never-opened stream still fails framing"
+    );
+    assert!(replies.try_recv().is_err());
 }

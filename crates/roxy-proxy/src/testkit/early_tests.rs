@@ -672,6 +672,58 @@ async fn headless_forward_completion_restarts_answer_timeout() {
     assert_eq!(errors[0]["kind"], "service:timeout", "{errors:#?}");
 }
 
+/// A call sent after the last lane ended must receive a refusal over the
+/// real socket, without doing its work or closing the pooled connection.
+#[tokio::test]
+async fn a_host_call_crossing_retirement_is_refused_on_the_wire() {
+    use serde_json::json;
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![testing::granted(
+            testing::addon("s", "scripted", AddonMode::Enforce, |s| {
+                s.max_connections = 1;
+                s.max_streams = 1;
+            }),
+            &[roxy_wasm::Capability::Record],
+        )],
+    )
+    .await;
+    let mut client = kit.h1().await;
+    let mut script = None;
+    for completed in 1..=2 {
+        let call = tokio::spawn(async move {
+            let answer = client.call("GET", "/x", &[], b"").await;
+            (client, answer)
+        });
+        if script.is_none() {
+            script = Some(kit.upstream.service().script().await);
+        }
+        let script = script.as_mut().unwrap();
+        script.control("open").await;
+        script.control("request").await;
+        script.body(0).await;
+        script.send(json!({"type": "request_end"}));
+        script.control("response_end").await;
+        script.send(json!({"type": "response", "status": 204, "headers": []}));
+        script.send(json!({"type": "response_end"}));
+        let (returned, answer) = call.await.unwrap();
+        client = returned;
+        assert_eq!(answer.status, 204);
+        // Final logging follows stream retirement and driver completion.
+        kit.events("request", completed).await;
+        script.send(json!({"type": "record", "id": 42, "kind": "too late", "data": {}}));
+        let result = script.control("result").await;
+        assert_eq!(result["id"], 42);
+        assert_eq!(result["error"], "the stream has ended");
+        assert!(
+            kit.sink
+                .events()
+                .iter()
+                .all(|e| e["event"] != "layer_record")
+        );
+    }
+}
+
 /// Trailers cannot commit success before the producer supplies a clean end.
 #[tokio::test]
 async fn trailers_do_not_turn_a_cut_service_response_into_success() {

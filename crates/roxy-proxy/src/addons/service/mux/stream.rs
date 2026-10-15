@@ -641,7 +641,10 @@ impl Stream {
     /// A control message from the service.
     pub(super) fn control(self: &Arc<Self>, m: In) {
         match m {
-            In::Call(call) => return self.queue_host_call(call),
+            In::Call(call) => {
+                self.queue_host_call(call);
+                return;
+            }
             In::Credit { dir, bytes } => {
                 lock(&self.state).lane(dir).window.granted(bytes);
                 self.more_credit.notify_waiters();
@@ -836,13 +839,13 @@ impl Stream {
     /// Hands a host-service call to the stream's worker, started on the
     /// first call. The queue is bounded: a service with more than
     /// [`MAX_HOST_CALLS_WAITING`] unanswered has broken the protocol.
-    /// Accepted under the state lock, so a call is either queued before
-    /// the stream ends or dropped: the reader may still hold a stream
-    /// another task has just ended.
-    fn queue_host_call(self: &Arc<Self>, call: Call) {
+    /// Accepted under the state lock. Returns false if the stream has
+    /// ended, so the reader can refuse the call: it may still hold a
+    /// stream another task has just ended.
+    pub(super) fn queue_host_call(self: &Arc<Self>, call: Call) -> bool {
         let mut state = lock(&self.state);
         if state.ended() {
-            return;
+            return false;
         }
         let mut calls = lock(&self.calls);
         let tx = calls.get_or_insert_with(|| {
@@ -872,6 +875,7 @@ impl Stream {
                 Reset::Send,
             );
         }
+        true
     }
 
     /// The stream's host-service worker: each call in turn, each answered

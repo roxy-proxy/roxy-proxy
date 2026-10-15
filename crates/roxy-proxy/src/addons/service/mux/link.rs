@@ -55,8 +55,8 @@ pub(super) struct Queued {
     pub(super) open: bool,
 }
 
-/// How far a stream has got on the wire. Once it is reset, nothing more
-/// of it is written. A reset before its `open` was written does not tell
+/// How far a stream has got on the wire. Once it is reset, no more of its
+/// queued data is written. A reset before its `open` was written does not tell
 /// the service (the reset would overtake the queued `open`): the service
 /// never hears of the stream.
 #[derive(Default)]
@@ -101,6 +101,9 @@ pub(super) struct LinkShared {
     /// more until the socket takes them. Nothing is queued for a stream
     /// that has ended: its frames are dropped uncredited.
     pub(super) ctl: mpsc::UnboundedSender<Message>,
+    /// Refusals for calls crossing retirement. Unlike credit, a peer can
+    /// solicit these without limit, so they have a separate bounded queue.
+    pub(super) refusals: mpsc::Sender<Message>,
 }
 
 pub(super) struct LinkState {
@@ -119,6 +122,24 @@ impl LinkShared {
 
     pub(super) fn send_ctl(&self, stream: u32, m: &Out) {
         let _ = self.ctl.send(text(stream, m));
+    }
+
+    fn refuse_call(&self, stream: u32, id: u64) -> Result<(), ServiceError> {
+        let result = Out::Result {
+            id,
+            value: None,
+            error: Some("the stream has ended".to_owned()),
+        };
+        self.refusals
+            .try_send(text(stream, &result))
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => ServiceError::Protocol(
+                    "too many calls to ended streams waiting for a reply".to_owned(),
+                ),
+                mpsc::error::TrySendError::Closed(_) => {
+                    ServiceError::Closed("the connection closed".to_owned())
+                }
+            })
     }
 
     /// The connection failed: every stream on it fails, and it closes.
@@ -250,6 +271,7 @@ pub(super) async fn dial(
     let (sink, stream) = result?.split();
     let (data_tx, data_rx) = mpsc::channel(WRITE_QUEUE);
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+    let (refusals_tx, refusals_rx) = mpsc::channel(WRITE_QUEUE);
     let shared = Arc::new(LinkShared {
         streams: Mutex::new(LinkState {
             open: HashMap::new(),
@@ -257,8 +279,9 @@ pub(super) async fn dial(
             failed: false,
         }),
         ctl: ctl_tx,
+        refusals: refusals_tx,
     });
-    tokio::spawn(write(sink, data_rx, ctl_rx));
+    tokio::spawn(write(sink, data_rx, ctl_rx, refusals_rx));
     tokio::spawn(read(shared.clone(), stream));
     Ok(Arc::new(Link {
         shared,
@@ -275,11 +298,13 @@ pub(super) async fn write(
     mut sink: SplitSink<Ws, Message>,
     mut data: mpsc::Receiver<Queued>,
     mut ctl: mpsc::UnboundedReceiver<Message>,
+    mut refusals: mpsc::Receiver<Message>,
 ) {
     loop {
         let mut next = tokio::select! {
             biased;
             Some(m) = ctl.recv() => Some(m),
+            Some(m) = refusals.recv() => Some(m),
             m = data.recv() => match m {
                 Some(q) => q.wire.write(q.open).then_some(q.msg),
                 None => break,
@@ -298,9 +323,9 @@ pub(super) async fn write(
             if queued >= WRITE_QUEUE {
                 break;
             }
-            next = match ctl.try_recv() {
-                Ok(m) => Some(m),
-                Err(_) => match data.try_recv() {
+            next = match ctl.try_recv().ok().or_else(|| refusals.try_recv().ok()) {
+                Some(m) => Some(m),
+                None => match data.try_recv() {
                     Ok(q) => q.wire.write(q.open).then_some(q.msg),
                     Err(_) => break,
                 },
@@ -313,8 +338,9 @@ pub(super) async fn write(
     let _ = sink.close().await;
 }
 
-/// Reads the connection and hands each message to its stream. Only broken
-/// framing (or the socket going) ends it, failing every stream on it.
+/// Reads the connection and hands each message to its stream. Broken
+/// framing, a full late-call refusal queue or socket loss ends it, failing
+/// every stream on it.
 pub(super) async fn read(shared: Arc<LinkShared>, mut ws: SplitStream<Ws>) {
     let framing = |what: &str| ServiceError::Protocol(what.to_owned());
     let err = loop {
@@ -335,19 +361,7 @@ pub(super) async fn read(shared: Arc<LinkShared>, mut ws: SplitStream<Ws>) {
                 else {
                     break framing("a message without a valid `stream`");
                 };
-                route(&shared, id).map(|s| {
-                    if let Some(s) = s {
-                        match In::parse(v) {
-                            Ok(m) => s.control(m),
-                            Err(e) => {
-                                s.fail(
-                                    ServiceError::Protocol(format!("bad message: {e}")),
-                                    Reset::Send,
-                                );
-                            }
-                        }
-                    }
-                })
+                control_frame(&shared, id, v)
             }
             // Ping and pong are answered by the library.
             Some(Ok(_)) => Ok(()),
@@ -357,6 +371,35 @@ pub(super) async fn read(shared: Arc<LinkShared>, mut ws: SplitStream<Ws>) {
         }
     };
     shared.fail(&err);
+}
+
+/// A call crossing retirement needs a refusal: the service cannot tell
+/// whether roxy accepted it before sending the last input end. Other late
+/// messages still go nowhere. A routed stream can also retire before its
+/// call acquires the state lock, so acceptance must be checked there too.
+pub(super) fn control_frame(
+    shared: &LinkShared,
+    id: u32,
+    v: serde_json::Map<String, serde_json::Value>,
+) -> Result<(), ServiceError> {
+    match (route(shared, id)?, In::parse(v)) {
+        (Some(s), Ok(In::Call(call))) => {
+            let call_id = call.id();
+            if !s.queue_host_call(call) {
+                shared.refuse_call(id, call_id)?;
+            }
+        }
+        (None, Ok(In::Call(call))) => shared.refuse_call(id, call.id())?,
+        (Some(s), Ok(m)) => s.control(m),
+        (Some(s), Err(e)) => {
+            s.fail(
+                ServiceError::Protocol(format!("bad message: {e}")),
+                Reset::Send,
+            );
+        }
+        (None, _) => {}
+    }
+    Ok(())
 }
 
 /// Hands a binary frame to its stream. Bytes for a stream that has ended

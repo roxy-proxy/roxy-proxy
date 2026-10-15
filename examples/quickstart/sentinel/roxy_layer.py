@@ -146,7 +146,7 @@ class BodyFailed(Exception):
 
 class HostError(Exception):
     """roxy refused a host-service call for what was passed (a key or
-    value over its cap); the exchange goes on."""
+    value over its cap), or because it arrived after stream retirement."""
 
 
 class _Conn:
@@ -258,7 +258,8 @@ class _Stream:
         self.flow = flow
         self.lanes = {REQUEST: _Lane(), RESPONSE: _Lane()}
         self.task: asyncio.Task[None]
-        # Host-service calls awaiting their `result`, by call id.
+        # Host-service calls being sent or awaiting their `result`, by id.
+        # Calls waiting for the connection lock do not retain the stream.
         self.pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._next_call = 0
         self.observe = False
@@ -310,19 +311,23 @@ class _Stream:
         self,
         msg: dict[str, Any],
         *,
-        host: bool = False,
+        host: asyncio.Future[dict[str, Any]] | None = None,
         forward: bool = False,
         end: int | None = None,
     ) -> None:
         """Sends `msg` on the stream, under the connection's lock, so a
-        host-service call (`host`) or a forward (`forward`) either goes
-        before all four lanes retire or is refused (`ProtocolError`),
-        never after retirement, when roxy would drop it unanswered. `end` is the
-        direction whose end `msg` is."""
+        host-service call (`host` is its result future) or a forward
+        (`forward`) is refused once the stream has ended locally. Register
+        a call only after that check: waiting for the lock cannot keep the
+        stream open. `end` is the direction whose end `msg` is."""
         async with self.conn.lock:
-            if (host or forward) and self.ended:
-                what = "a call" if host else "a forward"
-                raise ProtocolError(f"the stream has ended: {what} now would be dropped")
+            if (host is not None or forward) and (
+                self.ended or self.conn.streams.get(self.id) is not self
+            ):
+                what = "a call" if host is not None else "a forward"
+                raise ProtocolError(f"the stream has ended: cannot send {what}")
+            if host is not None:
+                self.pending[msg["id"]] = host
             if forward:
                 self.forwarded = True
             await self.conn.send_unlocked(self.id, msg)
@@ -337,17 +342,15 @@ class _Stream:
         cid = self._next_call
         msg["id"] = cid
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        self.pending[cid] = fut
         try:
-            await self.send(msg, host=True)
+            await self.send(msg, host=fut)
             result = await fut
         finally:
             self.pending.pop(cid, None)
             self._maybe_ended()
-            # The stream may end between registering the call and sending
-            # it: `send` then refuses the call, and the failure already set
-            # on its future is taken here rather than reported by asyncio
-            # as never retrieved.
+            # A reset can fail the registered future while the socket send
+            # is suspended. Retrieve that failure even if sending also
+            # raises, so asyncio does not report an unobserved exception.
             if fut.done() and not fut.cancelled():
                 fut.exception()
         if result.get("error") is not None:
