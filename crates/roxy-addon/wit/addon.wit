@@ -12,7 +12,7 @@
 /// each of those calls is a capability granted per layer in roxy's config.
 /// A call the layer was not granted traps; the import is always linked, so
 /// one binary runs under different grants.
-package roxy:addon;
+package roxy:addon@0.3.0;
 
 /// Heads, bodies and the response a call will produce.
 interface types {
@@ -207,8 +207,10 @@ interface handler {
   use wasi:io/streams@0.2.12.{input-stream};
 
   /// Handle one exchange. The layer answers with `chain.respond` and
-  /// returns once its response body is finished. Returning without
-  /// `respond`, or still holding a host resource (an unfinished body),
+  /// returns after finishing its output bodies, consuming or releasing
+  /// its input bodies and pending forward, and completing host work.
+  /// Returning without `respond`, or still holding an unfinished body
+  /// or pending response,
   /// fails the exchange closed. Trailers on `body` are dropped.
   handle: func(req: request-head, body: input-stream);
 }

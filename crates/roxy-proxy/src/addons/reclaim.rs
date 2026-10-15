@@ -5,6 +5,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use http_body_util::BodyExt as _;
+use roxy_http::{Body, BodyError};
 use tokio::sync::Notify;
 
 use super::{StackFlow, lock};
@@ -15,8 +17,6 @@ use crate::pipeline::FlowCx;
 pub(super) struct Lease {
     pub(super) st: Arc<StackFlow>,
     pub(super) cx: Option<FlowCx>,
-    /// The core ran to its outcome.
-    pub(super) done: bool,
 }
 
 impl Lease {
@@ -31,12 +31,6 @@ impl Drop for Lease {
             return;
         };
         drop(cx.request_delivery.take());
-        if !self.done && cx.record.decision.is_some() {
-            // The rules had decided and the request was on its way.
-            cx.record
-                .reason
-                .get_or_insert_with(|| "upstream_aborted".to_owned());
-        }
         self.st.loan.give_back(cx);
     }
 }
@@ -141,7 +135,25 @@ impl Drop for Held {
     }
 }
 
+impl Held {
+    pub(crate) fn complete(mut self) {
+        self.taken = true;
+    }
+}
+
 impl Reclaim {
+    /// Keep cancellation ordered before body disposal if the transport's
+    /// future is itself dropped while awaiting the head, writing or reclaiming.
+    pub(crate) fn cancellation_guard(&self) -> Option<Held> {
+        match self {
+            Reclaim::Now(_) => None,
+            Reclaim::Stack(held) => Some(Held {
+                st: held.st.clone(),
+                taken: false,
+            }),
+        }
+    }
+
     pub(crate) fn now(cx: FlowCx) -> Self {
         Reclaim::Now(Box::new(cx))
     }
@@ -153,7 +165,7 @@ impl Reclaim {
     /// The flow context, once the stack has let go of it. A stack that
     /// answered folds its answer into the record.
     pub(crate) async fn take(self) -> FlowCx {
-        self.take_until(std::future::pending::<(&'static str, ())>())
+        self.take_until(Body::empty(), std::future::pending::<(&'static str, ())>())
             .await
             .0
     }
@@ -163,23 +175,63 @@ impl Reclaim {
     /// their final accounting.
     pub(crate) async fn take_until<T>(
         self,
+        mut body: Body,
         cancelled: impl Future<Output = (&'static str, T)>,
     ) -> (FlowCx, Option<T>) {
-        match self {
+        let idle = match &self {
+            Reclaim::Now(cx) => cx.snap.limits.response_body_idle_timeout,
+            Reclaim::Stack(held) => held.st.snap.limits.response_body_idle_timeout,
+        };
+        // This future owns the remaining body. Its caller's guard would
+        // drop after this future, too late to order cancellation here.
+        let guard = self.cancellation_guard();
+        let mut cancelled = std::pin::pin!(cancelled);
+        let drain = async {
+            loop {
+                match tokio::time::timeout(idle, body.frame()).await {
+                    Ok(None) => return None,
+                    Ok(Some(Ok(_))) => {}
+                    Ok(Some(Err(e))) => return Some(e),
+                    Err(_) => return Some(BodyError::Timeout),
+                }
+            }
+        };
+        let (body_error, early_cancel) = tokio::select! {
+            biased;
+            (why, reason) = &mut cancelled => {
+                self.tear_down(why);
+                (None, Some(reason))
+            }
+            error = drain => {
+                if error.is_some() { self.tear_down(super::ENDED); }
+                (error, None)
+            }
+        };
+        // The transport's cause is now published before nested lane readers
+        // are disposed of. This also releases a timed-out bodiless answer.
+        drop(body);
+        let (mut cx, cancellation) = match self {
             Reclaim::Now(mut cx) => {
                 let delivery = cx.request_delivery.take();
-                let wait = async {
-                    match &delivery {
-                        Some(d) => d.wait().await,
-                        None => true,
+                let (complete, cancellation) = {
+                    let wait = async {
+                        match &delivery {
+                            Some(d) => d.wait().await,
+                            None => true,
+                        }
+                    };
+                    if let Some(reason) = early_cancel {
+                        (true, Some(reason))
+                    } else {
+                        tokio::select! {
+                            biased;
+                            (_, reason) = &mut cancelled => (true, Some(reason)),
+                            complete = wait => (complete, None),
+                        }
                     }
                 };
-                let (complete, cancellation) = tokio::select! {
-                    biased;
-                    (_, reason) = cancelled => (true, Some(reason)),
-                    complete = wait => (complete, None),
-                };
                 drop(delivery);
+                cx.tasks.wait().await;
                 if !complete {
                     cx.record
                         .reason
@@ -191,13 +243,17 @@ impl Reclaim {
                 let (mut cx, cancellation) = {
                     let take = held.st.reclaim();
                     tokio::pin!(take);
-                    tokio::select! {
-                        biased;
-                        (why, reason) = cancelled => {
-                            held.st.tear_down(why);
-                            (take.await, Some(reason))
+                    if let Some(reason) = early_cancel {
+                        (take.await, Some(reason))
+                    } else {
+                        tokio::select! {
+                            biased;
+                            (why, reason) = &mut cancelled => {
+                                held.st.tear_down(why);
+                                (take.await, Some(reason))
+                            }
+                            cx = &mut take => (cx, None),
                         }
-                        cx = &mut take => (cx, None),
                     }
                 };
                 held.taken = true;
@@ -205,7 +261,21 @@ impl Reclaim {
                 cx.stack = Some(held.st.clone());
                 (cx, cancellation)
             }
+        };
+        if let Some(error) = body_error {
+            cx.record.reason.get_or_insert_with(|| {
+                if error == BodyError::Timeout {
+                    "response_body_timeout"
+                } else {
+                    "response_body_failed"
+                }
+                .to_owned()
+            });
         }
+        if let Some(guard) = guard {
+            guard.complete();
+        }
+        (cx, cancellation)
     }
 
     /// Cancel remaining work. Reclamation still waits for body disposal
@@ -218,14 +288,6 @@ impl Reclaim {
                     delivery.cancel();
                 }
             }
-        }
-    }
-
-    /// The response has been written, whether or not its body was polled
-    /// to its end.
-    pub(crate) fn response_written(&self) {
-        if let Reclaim::Stack(held) = self {
-            held.st.response_written();
         }
     }
 

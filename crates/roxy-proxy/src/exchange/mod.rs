@@ -150,45 +150,39 @@ pub(crate) async fn send(
     // carries its close here, where `Answer::Refusal` carries it in the
     // refusal.
     let closing = res.meta.close;
-    let r = writer.write(res).await;
+    let guard = reclaim.cancellation_guard();
+    let r = writer.write(&mut res).await;
+    let response_bytes = tally.bytes();
+    let response_sha256 = tally.sha256_hex();
     match &r {
         Err(WriteFailure::ClientGone(_) | WriteFailure::ClientStalled) => {
             reclaim.tear_down(crate::addons::CLIENT_GONE);
         }
         Err(_) => reclaim.tear_down(crate::addons::ENDED),
-        Ok(()) => reclaim.response_written(),
+        Ok(()) => {}
     }
-    let (cx, cancellation) = writer.reclaim(reclaim).await;
+    let body = if r.is_ok() {
+        res.body
+    } else {
+        drop(res.body);
+        Body::empty()
+    };
+    let (cx, cancellation) = writer.reclaim(reclaim, body).await;
+    if let Some(guard) = guard {
+        guard.complete();
+    }
     let failed = r.is_err();
     let mut cx = Box::new(cx);
     // The response is complete. A later cancellation ends the remaining
     // upload or layer work without turning that response into a failed write.
     if let Some(e) = cancellation {
-        let reason = match e {
-            WriteFailure::ClientGone(_) => "client_gone",
-            WriteFailure::Request(ref error) => {
-                cx.shared.emit_parse_error(&cx.client, Some(&cx), error);
-                error.reason.as_str()
-            }
-            WriteFailure::Stopped
-            | WriteFailure::ClientStalled
-            | WriteFailure::UpstreamStalled
-            | WriteFailure::Io(_) => "h2_stream_error",
-        };
-        // Lease cancellation supplies a fallback before the transport can
-        // publish its cause. A concrete transport failure takes precedence;
-        // an earlier policy or validation reason still stands.
-        if cx.record.reason.as_deref() == Some("upstream_aborted") {
-            cx.record.reason = Some(reason.to_owned());
-        } else {
-            cx.record.reason.get_or_insert_with(|| reason.to_owned());
-        }
+        record_cancellation(&mut cx, &e);
     }
     cx.record.response_status = Some(status);
     cx.record.response_headers_bytes = headers_bytes;
-    cx.record.response_bytes = tally.bytes();
+    cx.record.response_bytes = response_bytes;
     if cx.digest.response {
-        cx.record.response_sha256 = tally.sha256_hex();
+        cx.record.response_sha256 = response_sha256;
     }
     let stop = cx.in_flight.as_ref().and_then(|w| w.stopped());
     // Under a stop, the cut body is how the stop is delivered, not a
@@ -240,6 +234,25 @@ pub(crate) async fn send(
         cx.emit_request_event();
     }
     Sent { failed, close }
+}
+
+fn record_cancellation(cx: &mut FlowCx, e: &WriteFailure) {
+    let reason = match e {
+        WriteFailure::ClientGone(_) => cx
+            .stack
+            .as_ref()
+            .and_then(|st| st.cancellation_reason())
+            .unwrap_or("client_gone"),
+        WriteFailure::Request(error) => {
+            cx.shared.emit_parse_error(&cx.client, Some(cx), error);
+            error.reason.as_str()
+        }
+        WriteFailure::Stopped => "in_flight_stopped",
+        WriteFailure::ClientStalled => "client_stalled",
+        WriteFailure::UpstreamStalled => "response_body_timeout",
+        WriteFailure::Io(_) => "h2_stream_error",
+    };
+    cx.record.reason.get_or_insert_with(|| reason.to_owned());
 }
 
 pub(crate) fn emit_response_error(cx: &FlowCx, reason: &str, e: &dyn std::fmt::Display) {
@@ -298,16 +311,28 @@ async fn answer(mut conn: ServerConn<ClientIo>, reclaim: Reclaim, answer: Answer
 /// the request body while writing the response. HTTP/2 also watches for
 /// resets during reclamation, after an early response ended on the wire.
 pub(crate) trait ResponseWriter {
-    async fn write(&mut self, res: CanonicalResponse) -> Result<(), WriteFailure>;
+    async fn write(&mut self, res: &mut CanonicalResponse) -> Result<(), WriteFailure>;
 
-    async fn reclaim(&mut self, reclaim: Reclaim) -> (FlowCx, Option<WriteFailure>) {
-        (reclaim.take().await, None)
-    }
+    async fn reclaim(&mut self, reclaim: Reclaim, body: Body) -> (FlowCx, Option<WriteFailure>);
 }
 
 impl ResponseWriter for ServerConn<ClientIo> {
-    async fn write(&mut self, res: CanonicalResponse) -> Result<(), WriteFailure> {
-        self.respond(res).await.map_err(WriteFailure::from)
+    async fn write(&mut self, res: &mut CanonicalResponse) -> Result<(), WriteFailure> {
+        self.respond_borrowed(res).await.map_err(WriteFailure::from)
+    }
+
+    async fn reclaim(&mut self, reclaim: Reclaim, body: Body) -> (FlowCx, Option<WriteFailure>) {
+        reclaim
+            .take_until(body, async {
+                match self.client_lost().await {
+                    Ok(()) => (
+                        crate::addons::CLIENT_GONE,
+                        WriteFailure::ClientGone("the HTTP/1 client closed".to_owned()),
+                    ),
+                    Err(error) => (crate::addons::ENDED, WriteFailure::Request(error)),
+                }
+            })
+            .await
     }
 }
 
@@ -965,7 +990,7 @@ async fn plain_upstream<F: ClientTransport>(
         }),
         Ok(Some(Ok(Ok(res)))) => {
             if let Some(delivery) = &cx.request_delivery {
-                delivery.start_monitor(limits.body_idle_timeout.saturating_mul(2));
+                delivery.start_monitor(limits.body_idle_timeout.saturating_mul(2), &cx.tasks);
             }
             cx.record.upstream_connect_ms = res
                 .extensions()

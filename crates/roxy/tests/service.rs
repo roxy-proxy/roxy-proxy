@@ -1,6 +1,6 @@
 //! End-to-end tests of service layers: `roxy run` with `kind: service`
 //! addons whose exchanges stream through an in-test service over
-//! `roxy.layer.v0`. The service's behaviour is picked by its URL path (one
+//! `roxy.layer.v6`. The service's behaviour is picked by its URL path (one
 //! per connection), and for `/mixed` by the request's path (per stream).
 
 mod support;
@@ -444,7 +444,7 @@ where
         let mut conns = state.connections.lock().unwrap();
         if path != "/no-protocol" {
             res.headers_mut()
-                .insert("sec-websocket-protocol", "roxy.layer.v0".parse().unwrap());
+                .insert("sec-websocket-protocol", "roxy.layer.v6".parse().unwrap());
         }
         *record.lock().unwrap() = (path, conns.len());
         conns.push(

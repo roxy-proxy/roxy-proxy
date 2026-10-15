@@ -21,7 +21,7 @@
 //! takes each head as it comes. A lane's end may come before its head and
 //! then carries nothing: a headless `request_end` from the service is no
 //! forward, a headless `response_end` is no answer. The stream ends when
-//! the service has ended both its lanes, or roxy has stopped them. A body
+//! all four lanes and accepted host calls have finished. A body
 //! that fails on its way to the service ends its lane with the error, and
 //! the service's own lanes go on. A WebSocket is the same exchange,
 //! long-lived: after the `101` the request body is the client's bytes and
@@ -66,7 +66,8 @@ pub struct ServiceSpec {
     /// request head until the service answers or forwards, and again from
     /// an upstream outcome until it answers. The clock is suspended while
     /// the forward is pending; a headless end restores it too. On an observe stream, the service's end from
-    /// roxy's last message. Bodies have no clock.
+    /// roxy's last message. Response consumption and upstream delivery use
+    /// the exchange's body idle deadlines.
     pub first_byte_timeout: Duration,
     /// Connections to the endpoint, at most.
     pub max_connections: usize,
@@ -511,8 +512,11 @@ pub(super) async fn run(
     // getting the stream took.
     let clock = Clock::new(svc.first_byte_timeout);
     let request_stream = stream.clone();
-    let request = tokio::spawn(async move { request_stream.pump(Dir::Request, head, body).await });
-    let response = tokio::spawn(pump_response(
+    let request = st.chain().spawn(async move {
+        request_stream.pump(Dir::Request, head, body).await;
+        request_stream.input_done(Dir::Request);
+    });
+    let response = st.chain().spawn(pump_response(
         stream.clone(),
         res_in,
         subscribe.response == Part::Head,
@@ -534,6 +538,7 @@ pub(super) async fn run(
     // of, which the layer downstream and the core learn of as a stop.
     request.abort();
     response.abort();
+    let _ = tokio::join!(request, response);
 }
 
 /// Streams the response from upstream to the service on its response
@@ -577,6 +582,7 @@ async fn pump_response(
         () = stream.stopped(Dir::Response) => clock.restart(),
         () = pump => {}
     }
+    stream.input_done(Dir::Response);
 }
 
 /// The service's answer clock: `first_byte_timeout` from roxy's request
@@ -655,8 +661,8 @@ impl Clock {
 
 /// Runs observe-mode service layer `index`: the copies go to the service
 /// on a stream of their own. What it sends back goes nowhere, but it ends
-/// the stream as it does an enforce one, by ending both its lanes, so it
-/// may read the copies and then call the host services before ending it.
+/// the stream as it does an enforce one: both inputs consumed or stopped,
+/// both outputs ended, and accepted host-service calls answered.
 pub(super) async fn observe(
     st: &Arc<StackFlow>,
     index: usize,
@@ -701,6 +707,8 @@ pub(super) async fn observe(
     let _ = request.await;
     // roxy has sent all it had. The time from here to the service's last
     // message is its own, bounded as each of its heads is in enforce mode.
+    stream.input_done(Dir::Request);
+    stream.input_done(Dir::Response);
     stream.finish(svc.first_byte_timeout).await
 }
 

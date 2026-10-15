@@ -214,9 +214,6 @@ pub(crate) struct StackFlow {
     /// Transport metadata inherited by every forwarded request. A layer
     /// cannot change the protocol version, target form or upgrade type.
     client_meta: RequestMeta,
-    /// The client's request is a `HEAD`: it gets no response body, whatever
-    /// a layer answers.
-    client_head: bool,
     loan: reclaim::Loan,
     layers: Box<[LayerSlot]>,
     /// The lanes of the exchange, and the rules that move them.
@@ -234,9 +231,6 @@ pub(crate) struct StackFlow {
     /// Whose response reached the client, decided when the client edge took it: a
     /// layer's own, or (`Some(None)`) the core's.
     client_answer: OnceLock<Option<usize>>,
-    /// The client edge reads the response body itself (one the client is
-    /// not sent), so the lane ends as the layer ends it.
-    draining: AtomicBool,
 }
 
 impl std::ops::Deref for StackFlow {
@@ -254,7 +248,6 @@ impl StackFlow {
             meta: cx.meta.clone(),
             facts: Mutex::new(cx.facts.clone()),
             client_meta: req.meta.clone(),
-            client_head: req.method == roxy_http::Method::Head,
             loan: reclaim::Loan::new(),
             layers: cx
                 .snap
@@ -272,7 +265,6 @@ impl StackFlow {
                 endpoint::MAX_ENDPOINT_CALLS_IN_FLIGHT,
             )),
             client_answer: OnceLock::new(),
-            draining: AtomicBool::new(false),
         }
     }
 
@@ -301,19 +293,6 @@ impl StackFlow {
     /// Why layer `index` was torn down, once it has been.
     pub(crate) fn layer_torn_down_why(&self, index: usize) -> &'static str {
         self.chain().layer_torn_down_why(index)
-    }
-
-    /// The response has been written: a body the client edge did not read
-    /// to its end, and is not reading, is one it will not read.
-    pub(crate) fn response_written(&self) {
-        if self.draining.load(Ordering::SeqCst) {
-            return;
-        }
-        let res = LaneId {
-            hop: 0,
-            dir: Dir::Res,
-        };
-        self.chain().release(res, ENDED);
     }
 
     /// Layer `index` failed with `err`: recorded, then torn down.
@@ -357,10 +336,11 @@ impl StackFlow {
     /// Lends the flow context to the core. `None` if it is already lent
     /// (the core runs at most once per exchange).
     fn lease(self: &Arc<Self>) -> Option<reclaim::Lease> {
+        let mut cx = self.loan.take()?;
+        cx.tasks = self.chain().tasks.clone();
         Some(reclaim::Lease {
             st: self.clone(),
-            cx: Some(self.loan.take()?),
-            done: false,
+            cx: Some(cx),
         })
     }
 
@@ -409,6 +389,10 @@ impl StackFlow {
             name: layer.to_owned(),
             err: err.into(),
         });
+    }
+
+    pub(crate) fn cancellation_reason(&self) -> Option<&'static str> {
+        self.chain().cancellation_reason()
     }
 
     /// The flow log's code for the fault that cut the exchange's response
@@ -512,6 +496,9 @@ impl StackFlow {
     /// Folds the stack into the flow record just before its `request`
     /// event: the layers that ran.
     pub(crate) fn fold_into(&self, cx: &mut FlowCx) {
+        if let Some(reason) = self.chain().cancellation_reason() {
+            cx.record.reason.get_or_insert_with(|| reason.to_owned());
+        }
         cx.record.addons = self
             .snap
             .addons
@@ -644,6 +631,45 @@ mod tests {
     use roxy_http::Body;
     use roxy_wasm::LayerError;
 
+    #[tokio::test]
+    async fn reclamation_joins_a_guest_driver_after_its_handle_is_dropped() {
+        let kit = Kit::builder()
+            .addon(AddonDef::test_layer("a"))
+            .start()
+            .await;
+        let (st, cx, ends) = test_flow(&kit);
+        st.loan.park(cx);
+        let AddonImpl::Wasm(layer) = &st.snap.addons[0].kind else {
+            panic!("a guest")
+        };
+        let host = Arc::new(host::StackHost::silent(st.clone(), 0, None, None));
+        let live_host = Arc::downgrade(&host);
+        let req = http::Request::post("http://up.test/x")
+            .header("x-test", "loop")
+            .body(Body::empty())
+            .unwrap();
+        let mut handling = Box::pin(layer.handle(host, req));
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                assert!(futures_util::poll!(handling.as_mut()).is_pending());
+                if !st.chain().tasks.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(handling);
+        st.tear_down(CLIENT_GONE);
+        drop(ends);
+        let _cx = Reclaim::stack(st.clone()).take().await;
+        assert!(
+            live_host.upgrade().is_none(),
+            "the guest no longer holds its host after reclamation"
+        );
+    }
+
     /// The guest's own abort remains visible when its body is combined
     /// with bytes it never sees.
     #[tokio::test]
@@ -702,10 +728,30 @@ mod tests {
                 Reclaim::now(cx)
             };
             let (_, cancellation) = reclaim
-                .take_until(std::future::ready((CLIENT_GONE, true)))
+                .take_until(Body::empty(), std::future::ready((CLIENT_GONE, true)))
                 .await;
             assert_eq!(cancellation, Some(true));
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_reclamation_records_client_loss_before_disposing_the_body() {
+        let kit = Kit::builder().start().await;
+        let (st, cx, mut ends) = test_flow(&kit);
+        st.loan.park(cx);
+        let _sender = ends.core.res_out.head(
+            Head::Response(http::Response::new(()).into_parts().0),
+            None,
+            u64::MAX,
+        );
+        let (_, body) = ends.edge.res_in.head().await.unwrap();
+        let mut pending = Box::pin(
+            Reclaim::stack(st.clone())
+                .take_until(body, std::future::pending::<(&'static str, ())>()),
+        );
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        drop(pending);
+        assert_eq!(st.cancellation_reason(), Some("client_gone"));
     }
 
     /// Reclamation waits for buffered bytes to be counted and checked.

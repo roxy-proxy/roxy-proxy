@@ -1,4 +1,4 @@
-//! Streams over pooled connections (`roxy.layer.v0`).
+//! Streams over pooled connections (`roxy.layer.v6`).
 //!
 //! Each endpoint has a small pool of WebSocket connections; each exchange
 //! is a stream on one of them. Text frames are JSON with a `stream` field;

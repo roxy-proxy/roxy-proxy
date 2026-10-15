@@ -21,6 +21,8 @@
 #[cfg(test)]
 mod addon_tests;
 #[cfg(test)]
+mod approval_tests;
+#[cfg(test)]
 mod budget_tests;
 #[cfg(test)]
 mod ca_server_tests;

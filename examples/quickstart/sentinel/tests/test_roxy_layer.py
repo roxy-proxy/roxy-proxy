@@ -12,6 +12,83 @@ async def forward_and_answer(ex: Exchange) -> None:
     await ex.respond(res, ex.response_body())
 
 
+@pytest.mark.parametrize("hold", ["request", "response"])
+@pytest.mark.parametrize("decision", ["approve", "edit", "deny"])
+async def test_sse_approval_keeps_the_answer_open_while_holding_an_input(hold: str, decision: str) -> None:
+    approve = asyncio.Event()
+    tool = b'event: tool_call\ndata: {"name":"delete_file"}\n\n'
+    edited = tool.replace(b"delete_file", b"read_file")
+    start = b"event: start\ndata: {}\n\n"
+    keepalive = b": approval pending\n\n"
+    tail = b"event: done\ndata: {}\n\n"
+    denied = b"event: denied\ndata: {}\n\n"
+
+    async def handle(ex: Exchange) -> None:
+        async def output() -> AsyncIterator[bytes]:
+            yield start
+            incoming = ex.response_body()
+            held = None
+            if hold == "response":
+                await ex.forward(ex.request, ex.body())
+                held = await anext(incoming)
+            yield keepalive
+            await approve.wait()
+            if decision == "deny":
+                yield denied
+                return
+            if hold == "request":
+                await ex.forward(ex.request, edited if decision == "edit" else ex.body())
+            else:
+                assert held == tool
+                yield edited if decision == "edit" else held
+            async for chunk in incoming:
+                yield chunk
+
+        await ex.respond(Response(200, [("content-type", "text/event-stream")]), output())
+
+    roxy = FakeRoxy(handle)
+    roxy.open(1)
+    roxy.ws.body(1, tool)
+    roxy.ws.control(1, "request_end")
+    assert (await roxy.ws.next_sent())["type"] == "response"
+    assert await roxy.ws.next_sent() == b"\x00\x00\x00\x01\x01" + start
+
+    async def forwarded(expected: bytes) -> None:
+        assert (await roxy.ws.next_sent())["type"] == "request"
+        assert await roxy.ws.next_sent() == b"\x00\x00\x00\x01\x00" + expected
+        assert (await roxy.ws.next_sent())["type"] == "request_end"
+        roxy.ws.control(1, "response", status=201, headers=[])
+
+    if hold == "response":
+        await forwarded(tool)
+        roxy.ws.body(1, tool, RESPONSE)
+    assert await roxy.ws.next_sent() == b"\x00\x00\x00\x01\x01" + keepalive
+    with pytest.raises(TimeoutError):
+        await roxy.ws.next_sent(timeout=0.01)
+    approve.set()
+    if decision == "deny":
+        assert await roxy.ws.next_sent() == b"\x00\x00\x00\x01\x01" + denied
+    else:
+        if hold == "request":
+            await forwarded(edited if decision == "edit" else tool)
+            roxy.ws.body(1, edited if decision == "edit" else tool, RESPONSE)
+        expected = edited if decision == "edit" else tool
+        assert await roxy.ws.next_sent() == b"\x00\x00\x00\x01\x01" + expected
+        # The approved event has gone out before the next one exists.
+        roxy.ws.body(1, tail, RESPONSE)
+        assert await roxy.ws.next_sent() == b"\x00\x00\x00\x01\x01" + tail
+        roxy.ws.control(1, "response_end")
+    assert (await roxy.ws.next_sent())["type"] == "response_end"
+    await roxy.until_closed(1)
+    assert 1 not in roxy.conn.streams
+    assert stray_tasks(roxy.task) == set()
+
+
+async def expect_stops(roxy: FakeRoxy, *directions: str) -> None:
+    for direction in directions:
+        assert await roxy.ws.next_sent() == {"type": "stop", "dir": direction, "stream": 1}
+
+
 async def started_upload() -> FakeRoxy:
     """An exchange whose request body is going out and has no response yet."""
     roxy = FakeRoxy(forward_and_answer)
@@ -88,6 +165,7 @@ async def test_stop_closes_a_waiting_body_source(direction: int, waiting_for_cre
         assert (await roxy.ws.next_sent())["type"] == "response_end"
     roxy.ws.control(1, "stop", dir="request" if direction == REQUEST else "response")
     await asyncio.wait_for(closed.wait(), 2.0)
+    await expect_stops(roxy, "request", "response")
     if direction == RESPONSE:
         assert (await roxy.ws.next_sent())["type"] == "request_end"
     await roxy.until_closed(1)
@@ -122,11 +200,8 @@ async def test_an_upgrade_streams_both_ways_with_no_request_end() -> None:
     assert stray_tasks(roxy.task) == set()
 
 
-async def test_a_forward_awaited_after_the_streams_end_fails() -> None:
-    """A handler that forwards and completes its answer before the head from
-    upstream arrives has sent its last message: roxy sends nothing more, so the
-    forward raises `ProtocolError` at once rather than waiting for a head
-    that cannot come."""
+async def test_a_completed_answer_keeps_receiving_the_forward() -> None:
+    """Finishing both outputs leaves the upstream input available."""
     outcome: list[BaseException | None] = []
     forwarded = asyncio.Event()
 
@@ -148,8 +223,11 @@ async def test_a_forward_awaited_after_the_streams_end_fails() -> None:
     forwarded.set()
     assert (await roxy.ws.next_sent())["type"] == "response"
     assert (await roxy.ws.next_sent())["type"] == "response_end"
+    assert not roxy.conn.streams[1].ended
+    roxy.ws.control(1, "response", status=204, headers=[])
+    await expect_stops(roxy, "request", "response")
     await roxy.until_closed(1)
-    assert outcome and isinstance(outcome[0], ProtocolError), outcome
+    assert outcome == [None], outcome
     assert stray_tasks(roxy.task) == set()
 
 
@@ -178,6 +256,7 @@ async def test_a_call_awaited_after_the_answer_is_still_answered() -> None:
     assert (await roxy.ws.next_sent())["type"] == "response"
     assert (await roxy.ws.next_sent())["type"] == "response_end"
     roxy.ws.control(1, "result", id=record["id"], value=None)
+    await expect_stops(roxy, "request", "response")
     assert (await roxy.ws.next_sent())["type"] == "request_end"
     await roxy.until_closed(1)
     assert outcome == [None], outcome
@@ -188,6 +267,7 @@ async def test_a_call_awaited_after_the_answer_is_still_answered() -> None:
 async def test_headless_forward_ends_without_resetting_the_service(error: str | None) -> None:
     roxy = await started_upload()
     roxy.ws.control(1, "response_end", **({"error": error} if error else {}))
+    await expect_stops(roxy, "request")
     request_end = await roxy.ws.next_sent()
     assert request_end["type"] == "request_end"
     assert request_end["error"]
@@ -198,3 +278,26 @@ async def test_headless_forward_ends_without_resetting_the_service(error: str | 
     assert 1 not in roxy.conn.streams
     assert stray_tasks(roxy.task) == set()
     assert roxy.ws.sent.empty()
+
+
+async def test_accepted_call_gets_its_result_after_the_handler_finishes() -> None:
+    calls: list[asyncio.Task[object]] = []
+
+    async def handle(ex: Exchange) -> None:
+        calls.append(asyncio.create_task(ex.record("audit", {"n": 1})))
+        await asyncio.sleep(0)
+        await ex.respond(Response(204, []), b"")
+
+    roxy = FakeRoxy(handle)
+    roxy.open(1)
+    record = await roxy.ws.next_sent()
+    assert record["type"] == "record"
+    assert (await roxy.ws.next_sent())["type"] == "response"
+    assert (await roxy.ws.next_sent())["type"] == "response_end"
+    await expect_stops(roxy, "request", "response")
+    assert (await roxy.ws.next_sent())["type"] == "request_end"
+    assert not roxy.conn.streams[1].ended
+    roxy.ws.control(1, "result", id=record["id"], value=None)
+    await roxy.until_closed(1)
+    assert await calls[0] is None
+    assert stray_tasks(roxy.task) == set()

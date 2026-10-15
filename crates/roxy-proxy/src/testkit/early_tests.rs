@@ -19,6 +19,134 @@ use crate::addons::{AddonMode, Part};
 
 const CHUNK: usize = 4096;
 
+#[tokio::test]
+async fn bodiless_response_consumption_obeys_idle_timeout_on_both_transports() {
+    for h2 in [false, true] {
+        for (method, status) in [("GET", 204), ("HEAD", 200)] {
+            let kit = testing::kit_with(
+                super::ALLOW_UP,
+                vec![testing::addon(
+                    "s",
+                    "answer-open",
+                    AddonMode::Enforce,
+                    |_| {},
+                )],
+                |b| b.limits(|l| l.response_body_idle_timeout = Duration::from_millis(50)),
+            )
+            .await;
+            let mut client = if h2 {
+                kit.tunnel("up.test", true).await
+            } else {
+                kit.h1().await
+            };
+            let answer = client.call(method, "/x", &[], b"").await;
+            assert_eq!(answer.status, status);
+            let event = tokio::time::timeout(Duration::from_secs(2), kit.request_event())
+                .await
+                .expect("the internal response lane must reach its idle deadline");
+            assert_eq!(event["reason"], "response_body_timeout", "{event:#}");
+            assert_eq!(
+                event["res"]["body_bytes"], 0,
+                "discarded bytes are not written: {event:#}"
+            );
+            assert_ne!(kit.upstream.service().resets(), Vec::new());
+            assert!(
+                kit.sink
+                    .events()
+                    .iter()
+                    .all(|e| e["event"] != "response_error")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn h1_declared_request_length_does_not_commit_a_later_cut() {
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![testing::addon(
+            "s",
+            "trailers-cut",
+            AddonMode::Enforce,
+            |_| {},
+        )],
+    )
+    .await;
+    kit.upstream.h1_only();
+    let mut client = kit.h1().await;
+    let answer = client.call("GET", "/declared-request-cut", &[], b"").await;
+    assert_eq!(answer.status, 204);
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(
+        seen[0].complete,
+        Some(false),
+        "an aborted upload reached the origin complete: {:?}",
+        seen[0]
+    );
+}
+
+#[tokio::test]
+async fn h1_declared_length_does_not_commit_a_later_cut() {
+    for path in ["/declared-cut", "/declared-empty-cut"] {
+        let kit = testing::kit(
+            super::ALLOW_UP,
+            vec![testing::addon(
+                "s",
+                "trailers-cut",
+                AddonMode::Enforce,
+                |_| {},
+            )],
+        )
+        .await;
+        let mut client = kit.h1().await;
+        let answer = client.call("GET", path, &[], b"").await;
+        let event = kit.request_event().await;
+        assert_eq!(event["reason"], "answer_aborted", "{event:#}");
+        assert!(
+            answer.body.is_err(),
+            "a cut response was accepted as complete: {answer:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn h1_disconnect_after_bodiless_answer_releases_service() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![testing::subscribed(
+            testing::addon("s", "answer-open", AddonMode::Enforce, |s| {
+                s.max_connections = 1;
+                s.max_streams = 1;
+            }),
+            Part::Head,
+            Part::Full,
+        )],
+    )
+    .await;
+    let (mut client, reset) = kit.connect_resettable();
+    client
+        .write_all(b"GET http://up.test/x HTTP/1.1\r\nHost: up.test\r\n\r\n")
+        .await
+        .unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        head.push(client.read_u8().await.unwrap());
+    }
+    assert!(head.starts_with(b"HTTP/1.1 204"));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(kit.upstream.service().resets(), Vec::new());
+    reset.reset();
+    drop(client);
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while kit.upstream.service().resets().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a disconnected HTTP/1 client must release its service slot");
+}
+
 /// An empty 200 is not complete until its producer ends the lane. The
 /// producer can finish the upload after publishing the response head.
 #[tokio::test]
@@ -47,7 +175,7 @@ async fn h2_empty_success_waits_for_the_forward_to_finish() {
         .unwrap()
         .unwrap();
     assert_eq!(response.status(), 200);
-    assert_eq!(response.headers()["content-length"], "0");
+    assert!(!response.headers().contains_key("content-length"));
     let mut body = response.into_body();
     assert!(!body.is_end_stream(), "the response lane is still open");
     upload

@@ -110,15 +110,23 @@ The lifecycle rules are:
   once.
 - **A layer cutting a lane it produces is an abort, not a fault**: the
   record says `forward_aborted` or `answer_aborted`, and the consumer sees
-  an incomplete body.
+  an incomplete body. A headless response cut from an enforcing layer is
+  still its `no_response` fault and generates a refusal.
 - **A producer's end does not acknowledge delivery.** Its queued frames
   still belong to the consumer until read or discarded. Trailers are held
   until the clean end and length checks succeed, because HTTP trailers
-  complete the message on the wire.
+  complete the message on the wire. Declared length is a validation
+  property: an unfinished lane uses unknown-length HTTP/1.1 framing so
+  even a cut after the declared bytes cannot look complete. HEAD and
+  bodiless statuses commit at the head; their internal body still runs
+  under the response idle deadline.
 - **The exchange is over** when every lane is terminal, its consumers have
   finished or abandoned their bodies, and all drivers and enforcing
   host-service workers have returned. Upstream upload accounting is final
-  before its owner returns. The flow record is written after this barrier.
+  before its owner returns. Guest drivers, service pumps and upload
+  monitors belong to this barrier even when their parent is cancelled.
+  Both HTTP transports observe client loss through reclamation. The flow
+  record is written after this barrier.
   WebSockets use the same rule: the core owns the relay and its accounting
   until it ends, then cancels any remaining layers.
 

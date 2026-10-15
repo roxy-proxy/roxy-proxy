@@ -49,7 +49,7 @@ is a streaming redactor built on `roxy-addon`.
 ## WIT package
 
 [`wit/addon.wit`](https://github.com/roxy-proxy/roxy-proxy/blob/main/wit/addon.wit)
-defines the unversioned `roxy:addon` package.
+defines the `roxy:addon@0.3.0` package.
 Heads are records of roxy's own: a
 `request-head` (method, scheme, authority, path and query, and the header
 list) and a `response-head` (status and headers), each crossing the guest

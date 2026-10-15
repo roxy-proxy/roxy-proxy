@@ -30,15 +30,18 @@ the client sees one clean wire form.
   the client, through ambiguous framing;
 - exfiltrating real credentials: with secret injection the client only ever
   holds placeholders;
-- exhausting roxy's memory, CPU or file descriptors: slowloris, huge
-  headers, unbounded bodies, cardinality attacks on metric keys, runaway
-  addons;
+- unbounded memory and file-descriptor use from slowloris, huge headers,
+  unbounded bodies and cardinality attacks, within the configured limits;
 - learning anything useful from a deny beyond the rule id.
 
 **roxy does not try to prevent** traffic that never reaches it, timing or
 DNS side channels from the workload (block DNS egress at the network layer;
 roxy resolves names itself), compromise of an upstream the rules already
-allow, or compromise of the host running roxy.
+allow, or compromise of the host running roxy. WASM addons have memory,
+instance and answer-deadline limits. Epoch yielding makes guest code
+cancellable and shares execution time; it is not a total CPU budget. A
+handler that has answered can continue consuming CPU until its exchange is
+cancelled, so addon configuration remains trusted.
 
 ## Which use case claims what
 

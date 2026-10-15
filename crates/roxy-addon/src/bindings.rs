@@ -5,7 +5,7 @@
 
 wit_bindgen::generate!({
     path: "wit",
-    world: "roxy:addon/layer",
+    world: "roxy:addon/layer@0.3.0",
     generate_all,
     pub_export_macro: true,
     default_bindings_module: "roxy_addon::bindings",

@@ -102,6 +102,17 @@ impl StackHost {
 
 #[async_trait]
 impl LayerHost for StackHost {
+    fn spawn_driver(
+        &self,
+        driver: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+    ) -> tokio::task::JoinHandle<()> {
+        if self.observing() {
+            tokio::spawn(driver)
+        } else {
+            self.st.chain().spawn(driver)
+        }
+    }
+
     async fn next(&self, req: LayerRequest) -> Result<Option<LayerResponse>, HostError> {
         if self.observing() {
             // An observer's request goes nowhere; it gets the real response.
@@ -113,7 +124,7 @@ impl LayerHost for StackHost {
         }
         let subscribe = self.addon().subscribe;
         // A head-only layer passes the head on; the body it did not see
-        // goes on with it, framed as it came.
+        // goes on with it, retaining its validation and clean-end check.
         let held = lock(&self.held_request).take();
         let req = match held {
             Some(held) => {

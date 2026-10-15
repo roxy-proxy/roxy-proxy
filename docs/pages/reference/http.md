@@ -132,6 +132,20 @@ canonical authority goes out as `host` over HTTP/1.1 and as `:authority`
 alone over HTTP/2, never both. WebSocket upgrades always use HTTP/1.1
 ([WebSockets](/reference/websockets)).
 
+### Informational responses
+
+Upstream informational responses such as `103 Early Hints` are not relayed
+to the client, whether or not addons are enabled. The upstream HTTP client
+consumes them and returns the final response. Roxy generates its own
+`100 Continue` when admitting an upload; it does not forward the origin's
+`100`. A WebSocket `101 Switching Protocols` is handled separately as an
+upgrade.
+
+Addon response lanes carry one final head. They cannot publish `103` and
+then a final response. An addon that starts a synthetic `200` streaming
+response has committed that status and those headers; it may subsequently
+use upstream body bytes, but cannot replace the head.
+
 ### Trailers
 
 Two settings, one per direction. `http.allow_response_trailers` (default

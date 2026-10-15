@@ -63,6 +63,14 @@ async fn lone_stream_of(
     addon: Arc<AddonSpec>,
     slot: Option<Reservation>,
 ) -> (Arc<Stream>, Around, crate::testkit::Kit) {
+    lone_stream_on(addon, slot, failed_link()).await
+}
+
+async fn lone_stream_on(
+    addon: Arc<AddonSpec>,
+    slot: Option<Reservation>,
+    link: Arc<Link>,
+) -> (Arc<Stream>, Around, crate::testkit::Kit) {
     let mode = addon.mode;
     let kit = testing::kit(ALLOW_UP, vec![addon]).await;
     let (st, _cx, mut ends) = crate::addons::test_flow(&kit);
@@ -76,7 +84,6 @@ async fn lone_stream_of(
         held_request: Arc::default(),
         held_response: Arc::default(),
     });
-    let link = failed_link();
     let stream = Arc::new(Stream {
         id: 1,
         link: link.clone(),
@@ -125,6 +132,115 @@ fn request_head() -> In {
 }
 
 #[tokio::test]
+async fn a_stopped_forward_upload_keeps_the_upstream_response_input() {
+    let (stream, mut around, _kit) = lone_stream().await;
+    stream.input_done(Dir::Request);
+    stream.control(In::Response {
+        status: 200,
+        headers: Vec::new(),
+    });
+    stream.control(In::ResponseEnd { error: None });
+    let (_, body) = around.answer.head().await.unwrap();
+    body.collect_up_to(u64::MAX).await.unwrap();
+    stream.stop(Dir::Request);
+    assert!(!lock(&stream.state).ended());
+    assert!(!stream.st.layer_torn(0));
+    stream.input_done(Dir::Response);
+    tokio::time::timeout(Duration::from_secs(1), stream.until_ended())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_headless_forward_end_releases_the_held_upload_before_the_answer_ends() {
+    let (stream, _around, _kit) = lone_stream().await;
+    let (upload, body) = Body::channel(u64::MAX, None);
+    *lock(&stream.held_request) = Some(body);
+    stream.control(In::Response {
+        status: 200,
+        headers: Vec::new(),
+    });
+    stream.control(In::RequestEnd { error: None });
+    tokio::time::timeout(Duration::from_secs(1), upload.closed())
+        .await
+        .unwrap();
+    assert!(!lock(&stream.state).ended(), "the answer remains open");
+}
+
+#[tokio::test]
+async fn accepted_calls_receive_results_after_all_four_lanes_end() {
+    let (ctl, _ctl_rx) = mpsc::unbounded_channel();
+    let (data, mut sent) = mpsc::channel(4);
+    let link = Arc::new(Link {
+        shared: Arc::new(LinkShared {
+            streams: Mutex::new(LinkState {
+                open: HashMap::new(),
+                next_id: 1,
+                failed: false,
+            }),
+            ctl,
+        }),
+        data,
+    });
+    let addon = testing::granted(
+        testing::addon("s", "pass", AddonMode::Observe, |_| {}),
+        &[roxy_wasm::Capability::Record],
+    );
+    let (stream, _around, kit) = lone_stream_on(addon, None, link).await;
+    stream.control(In::Call(Call::Record {
+        id: 9,
+        kind: "final".into(),
+        data: serde_json::json!({}),
+    }));
+    stream.input_done(Dir::Request);
+    stream.input_done(Dir::Response);
+    stream.control(In::RequestEnd { error: None });
+    stream.control(In::ResponseEnd { error: None });
+    assert!(
+        !lock(&stream.state).ended(),
+        "the accepted call retains the stream"
+    );
+    let queued = tokio::time::timeout(Duration::from_secs(1), sent.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(queued.msg.to_text().unwrap()).unwrap();
+    assert_eq!(value["type"], "result");
+    assert_eq!(value["id"], 9);
+    stream.until_ended().await;
+    assert_eq!(kit.events("layer_record", 1).await[0]["kind"], "final");
+}
+
+#[tokio::test]
+async fn short_body_after_both_ends_is_a_protocol_fault() {
+    let (stream, mut around, _kit) = lone_stream().await;
+    stream.control(In::Response {
+        status: 200,
+        headers: vec![("content-length".into(), "10".into())],
+    });
+    let (_, body) = around.answer.head().await.unwrap();
+    stream.bytes(Dir::Response, b"short");
+    stream.control(In::RequestEnd { error: None });
+    stream.control(In::ResponseEnd { error: None });
+    assert!(body.collect_up_to(u64::MAX).await.is_err());
+    tokio::task::yield_now().await;
+    assert_eq!(service_fault(&stream).kind(), "service:protocol");
+    assert_eq!(stream.st.chain().abort_reason(), None);
+}
+
+#[tokio::test]
+async fn headless_response_cut_generates_no_response_fault() {
+    let (stream, _around, _kit) = lone_stream().await;
+    stream.control(In::ResponseEnd {
+        error: Some("no answer".into()),
+    });
+    assert!(
+        matches!(stream.st.attribution.fault(), Some(Fault::Layer { .. })),
+        "an enforcing layer with no answer must record no_response at its stage"
+    );
+}
+
+#[tokio::test]
 async fn data_after_trailers_is_rejected() {
     for dir in [Dir::Request, Dir::Response] {
         for feed_first in [false, true] {
@@ -155,10 +271,13 @@ async fn data_after_trailers_is_rejected() {
 
 /// The service's response head is taken while the request body it is
 /// forwarding is still streaming; each body's bytes reach their own
-/// consumer, and the stream ends once both lanes have.
+/// consumer, and the stream ends once both outputs finish, with its
+/// input pumps already complete.
 #[tokio::test]
 async fn a_response_head_arrives_while_the_request_body_streams() {
     let (stream, mut around, _kit) = lone_stream().await;
+    stream.input_done(Dir::Request);
+    stream.input_done(Dir::Response);
     stream.control(request_head());
     let (_, req) = around
         .forward
@@ -207,8 +326,15 @@ async fn a_headless_request_end_is_no_forward() {
         headers: Vec::new(),
     });
     stream.control(In::ResponseEnd { error: None });
-    assert!(lock(&stream.state).ended());
-    assert!(around.answer.head().await.is_ok());
+    let (_, body) = around.answer.head().await.unwrap();
+    body.collect_up_to(u64::MAX).await.unwrap();
+    assert!(
+        !lock(&stream.state).ended(),
+        "input pumps still own their lanes"
+    );
+    stream.input_done(Dir::Request);
+    stream.input_done(Dir::Response);
+    stream.until_ended().await;
 }
 
 /// An end the service sends with an error cuts the lane where it is: an

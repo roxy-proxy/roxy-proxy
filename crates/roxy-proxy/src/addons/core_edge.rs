@@ -60,11 +60,11 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
         o = crate::exchange::core(&mut transport, cx, creq) => Some(o),
     };
     let Some(outcome) = outcome else {
-        // The lease records the abandonment as it goes back; the lanes are
-        // cut by the teardown.
+        if lease.cx().record.decision.is_some() {
+            st.chain().upstream_abandoned();
+        }
         return;
     };
-    lease.done = true;
     let cx = lease.cx();
     st.set_facts(&cx.facts);
     let snap = st.snap.clone();
@@ -79,7 +79,7 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
             if let Some(delivery) = lease.cx().request_delivery.take() {
                 tokio::select! {
                     biased;
-                    () = torn_down.cancelled() => {}
+                    () = torn_down.cancelled() => st.chain().upstream_abandoned(),
                     complete = delivery.wait() => {
                         if !complete {
                             lease.cx().record.reason.get_or_insert_with(|| "upstream_body_timeout".to_owned());
@@ -253,6 +253,31 @@ impl ClientTransport for LaneTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelling_upload_after_response_head_records_abandonment() {
+        let kit = crate::testkit::Kit::builder()
+            .addon(crate::testkit::AddonDef::test_layer("a"))
+            .start()
+            .await;
+        let (st, cx, mut ends) = crate::addons::test_flow(&kit);
+        let mut layer = ends.layers.pop().unwrap();
+        layer.stage.enforcing();
+        st.loan.park(cx);
+        let core = st.chain().spawn(run(st.clone(), ends.core));
+        let (_upload, body) = Body::channel(u64::MAX, None);
+        let (parts, body) = http::Request::post("http://up.test/early-drip?n=100&ms=50")
+            .body(body)
+            .unwrap()
+            .into_parts();
+        layer.req_out.whole(Head::Request(parts), body);
+        let (_, response_body) = layer.res_in.head().await.unwrap();
+        drop(response_body);
+        core.await.unwrap();
+        let mut cx = st.loan.returned().await.unwrap();
+        st.fold_into(&mut cx);
+        assert_eq!(cx.record.reason.as_deref(), Some("upstream_aborted"));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn an_upload_deadline_runs_before_response_writing_or_reclamation() {

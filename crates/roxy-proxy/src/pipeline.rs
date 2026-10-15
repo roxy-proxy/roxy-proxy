@@ -565,6 +565,8 @@ pub(crate) struct FlowCx {
     /// body completed), once the request is on its way.
     pub request_tally: Option<Arc<crate::body::Tally>>,
     pub request_delivery: Option<crate::body::Delivery>,
+    /// Child work retained through final exchange accounting.
+    pub tasks: tokio_util::task::TaskTracker,
     /// The addon stack this exchange went through (set once the stack has
     /// handed the flow back), folded into the record when it is logged.
     pub stack: Option<Arc<crate::addons::StackFlow>>,
@@ -698,6 +700,11 @@ impl FlowCx {
             sign: None,
             request_tally: None,
             request_delivery: None,
+            tasks: {
+                let tasks = tokio_util::task::TaskTracker::new();
+                tasks.close();
+                tasks
+            },
             stack: None,
             layer_reads_bytes: false,
             buffers: Vec::new(),

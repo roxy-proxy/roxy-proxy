@@ -362,30 +362,28 @@ struct H2Writer<'a, 'b> {
 }
 
 impl crate::exchange::ResponseWriter for H2Writer<'_, '_> {
-    async fn write(&mut self, res: CanonicalResponse) -> Result<(), WriteFailure> {
-        self.sent = Some(write_response(self.respond, res, self.out).await?);
+    async fn write(&mut self, res: &mut CanonicalResponse) -> Result<(), WriteFailure> {
+        self.sent = Some(write_response(self.respond, res, self.out, self.fail).await?);
         Ok(())
     }
 
-    async fn reclaim(&mut self, reclaim: crate::addons::Reclaim) -> (FlowCx, Option<WriteFailure>) {
+    async fn reclaim(
+        &mut self,
+        reclaim: crate::addons::Reclaim,
+        body: Body,
+    ) -> (FlowCx, Option<WriteFailure>) {
         // A failed write already cancelled the exchange. In particular,
         // our own reset must not be mistaken for a subsequent client reset.
         let Some(sent) = &mut self.sent else {
+            drop(body);
             return (reclaim.take().await, None);
         };
         reclaim
-            .take_until(async {
+            .take_until(body, async {
                 let failure = tokio::select! {
                     biased;
                     () = self.fail.signal.cancelled() => {
-                        if self.fail.gone() {
-                            WriteFailure::ClientGone("the HTTP/2 stream closed".to_owned())
-                        } else {
-                            self.fail.get().map_or_else(
-                                || WriteFailure::Io("the HTTP/2 stream failed".to_owned()),
-                                WriteFailure::Request,
-                            )
-                        }
+                        request_write_failure(self.fail)
                     }
                     reset = poll_fn(|cx| sent.poll_reset(cx)) => {
                         match reset {
@@ -412,10 +410,11 @@ impl crate::exchange::ResponseWriter for H2Writer<'_, '_> {
 /// the client never sees a truncated body as complete.
 async fn write_response(
     respond: &mut SendResponse<Bytes>,
-    res: CanonicalResponse,
+    res: &mut CanonicalResponse,
     out: &Out<'_>,
+    fail: &BodyFail,
 ) -> Result<SendStream<Bytes>, WriteFailure> {
-    let head = to_h2_response(&res, out.method)
+    let head = to_h2_response(res, out.method)
         .body(())
         .map_err(|e| WriteFailure::Io(format!("response head: {e}")))?;
     // `content-length: 0` may still carry trailers when they are allowed,
@@ -423,7 +422,6 @@ async fn write_response(
     let bodiless = status_forbids_body(res.status)
         || *out.method == Method::Head
         || (res.body.known_length() == Some(0) && http_body::Body::is_end_stream(&res.body));
-    let mut body = res.body;
     if bodiless {
         return respond
             .send_response(head, true)
@@ -432,7 +430,11 @@ async fn write_response(
     let mut send = respond
         .send_response(head, false)
         .map_err(|e| stream_error(&e))?;
-    let r = stream_body(&mut send, &mut body, out).await;
+    let r = tokio::select! {
+        biased;
+        () = fail.signal.cancelled() => Err(request_write_failure(fail)),
+        result = stream_body(&mut send, &mut res.body, out) => result,
+    };
     match &r {
         Err(WriteFailure::Stopped) => {
             tracing::debug!("h2 response stopped by policy; resetting the stream");
@@ -470,6 +472,45 @@ fn stream_error(e: &h2::Error) -> WriteFailure {
     }
 }
 
+fn request_write_failure(fail: &BodyFail) -> WriteFailure {
+    if fail.gone() {
+        WriteFailure::ClientGone("the HTTP/2 stream closed".to_owned())
+    } else {
+        fail.get().map_or_else(
+            || WriteFailure::Io("the HTTP/2 stream failed".to_owned()),
+            WriteFailure::Request,
+        )
+    }
+}
+
+fn poll_response_frame(
+    send: &mut SendStream<Bytes>,
+    body: &mut Body,
+    cx: &mut Context<'_>,
+) -> Poll<Result<Option<Frame<Bytes>>, WriteFailure>> {
+    if let Poll::Ready(reset) = send.poll_reset(cx) {
+        return Poll::Ready(Err(match reset {
+            Ok(reason) => WriteFailure::ClientGone(format!("HTTP/2 stream reset: {reason}")),
+            Err(error) => stream_error(&error),
+        }));
+    }
+    poll_frame(body, cx).map(|frame| {
+        frame.transpose().map_err(|error| match error {
+            BodyError::Stopped => WriteFailure::Stopped,
+            BodyError::Timeout => WriteFailure::UpstreamStalled,
+            error @ (BodyError::TooLarge { .. }
+            | BodyError::LengthMismatch
+            | BodyError::Incomplete
+            | BodyError::Closed
+            | BodyError::Abandoned
+            | BodyError::Invalid(_)
+            | BodyError::Upstream(_)
+            | BodyError::Undecodable(_)
+            | BodyError::BudgetExhausted) => WriteFailure::Io(error.to_string()),
+        })
+    })
+}
+
 fn poll_frame(
     body: &mut Body,
     cx: &mut Context<'_>,
@@ -486,13 +527,13 @@ async fn stream_body(
     // capacity for it) never overlap, so each re-arms it with its own limit.
     let mut stall = std::pin::pin!(sleep(out.body_idle));
     loop {
-        let frame = match poll_fn(|cx| Poll::Ready(poll_frame(body, cx))).await {
-            Poll::Ready(frame) => frame,
+        let frame = match poll_fn(|cx| Poll::Ready(poll_response_frame(send, body, cx))).await {
+            Poll::Ready(frame) => frame?,
             Poll::Pending => {
                 stall.as_mut().reset(Instant::now() + out.body_idle);
                 poll_fn(|cx| {
-                    if let Poll::Ready(f) = poll_frame(body, cx) {
-                        return Poll::Ready(Ok(f));
+                    if let Poll::Ready(f) = poll_response_frame(send, body, cx) {
+                        return Poll::Ready(f);
                     }
                     stall
                         .as_mut()
@@ -502,16 +543,10 @@ async fn stream_body(
                 .await?
             }
         };
-        let frame = match frame {
-            None => {
-                send.send_data(Bytes::new(), true)
-                    .map_err(|e| stream_error(&e))?;
-                return Ok(());
-            }
-            Some(Err(BodyError::Stopped)) => return Err(WriteFailure::Stopped),
-            Some(Err(BodyError::Timeout)) => return Err(WriteFailure::UpstreamStalled),
-            Some(Err(e)) => return Err(WriteFailure::Io(e.to_string())),
-            Some(Ok(f)) => f,
+        let Some(frame) = frame else {
+            send.send_data(Bytes::new(), true)
+                .map_err(|e| stream_error(&e))?;
+            return Ok(());
         };
         match frame.into_data() {
             Ok(mut data) => {

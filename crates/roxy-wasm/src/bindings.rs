@@ -6,7 +6,7 @@
 
 wasmtime::component::bindgen!({
     path: "../../wit",
-    world: "roxy:addon/layer",
+    world: "roxy:addon/layer@0.3.0",
     imports: { default: async | trappable },
     exports: { default: async },
     require_store_data_send: true,
@@ -15,6 +15,6 @@ wasmtime::component::bindgen!({
         "wasi:clocks": wasmtime_wasi::p2::bindings::clocks,
         "wasi:random": wasmtime_wasi::p2::bindings::random,
         "wasi:cli": wasmtime_wasi::p2::bindings::cli,
-        "roxy:addon/types.pending-response": crate::streams::PendingResponse,
+        "roxy:addon/types@0.3.0.pending-response": crate::streams::PendingResponse,
     },
 });

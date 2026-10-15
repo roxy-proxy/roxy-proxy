@@ -20,6 +20,22 @@ mod common;
 use common::*;
 
 #[tokio::test]
+async fn handle_failure_waits_for_driver_cleanup() {
+    let rt = runtime();
+    let mut cfg = config();
+    cfg.limits.first_byte_timeout = Duration::from_millis(100);
+    let layer = load(&rt, cfg).await;
+    let host = Mock::echo();
+    let live_host = Arc::downgrade(&host);
+    let result = layer.handle(host, request("loop", Body::empty())).await;
+    assert_eq!(result, Err(LayerError::BudgetExceeded(Budget::FirstByte)));
+    assert!(
+        live_host.upgrade().is_none(),
+        "handle returned while the guest driver still owns the host"
+    );
+}
+
+#[tokio::test]
 async fn passes_through_and_transforms() {
     let rt = runtime();
     let layer = load(&rt, config()).await;
@@ -955,7 +971,7 @@ async fn waiting_for_a_slot_times_out() {
     assert!(!first.is_finished());
 }
 
-/// Bodies have no clock: a stream that outlives the head deadline many
+/// The head clock does not limit bodies: a stream outliving that deadline many
 /// times over goes through whole.
 #[tokio::test]
 async fn a_long_stream_is_not_cut() {
@@ -1141,4 +1157,101 @@ async fn both_bodies_stream_at_once() {
     }
     client_tx.finish().await.unwrap();
     assert!(body.frame().await.is_none());
+}
+
+async fn sse_approval(hold_response: bool, edit: bool) {
+    const TOOL: &str = "event: tool_call\ndata: delete_file\n\n";
+    let rt = runtime();
+    let mut cfg = config();
+    cfg.capabilities = Capabilities::NONE.with(Capability::Endpoints);
+    let layer = load(&rt, cfg).await;
+    let (mut up_tx, up_body) = Body::channel(u64::MAX, None);
+    let (seen_tx, mut seen_rx) = oneshot::channel();
+    let host = Mock::new(NextMode::Capture(Mutex::new(Some((
+        seen_tx,
+        Response::new(up_body),
+    )))));
+    let mode = if hold_response {
+        "sse-approve-response"
+    } else {
+        "sse-approve-request"
+    };
+    let mut req = request(mode, Body::from_bytes(TOOL));
+    req.headers_mut()
+        .insert("x-read-bytes", TOOL.len().to_string().parse().unwrap());
+    if edit {
+        req.headers_mut()
+            .insert("x-edit-tool", "1".parse().unwrap());
+    }
+    let mut started = start(&layer, host.clone(), req);
+    let mut response = started.response().await.unwrap().into_body();
+    sse_bytes(&mut response, b"event: start\ndata: {}\n\n").await;
+    if hold_response {
+        let forwarded = (&mut seen_rx).await.unwrap();
+        assert_eq!(collect(forwarded.into_body()).await.unwrap(), TOOL);
+        up_tx
+            .send_data(Bytes::from_static(TOOL.as_bytes()))
+            .await
+            .unwrap();
+    }
+    for _ in 0..3 {
+        sse_bytes(&mut response, b": approval pending\n\n").await;
+    }
+    if !hold_response {
+        assert!(
+            matches!(seen_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "the request is held until approval"
+        );
+    }
+    host.unpark.send_replace(true);
+    let expected = if edit {
+        TOOL.replace("delete_file", "read_file")
+    } else {
+        TOOL.to_owned()
+    };
+    if !hold_response {
+        let forwarded = seen_rx.await.unwrap();
+        assert_eq!(collect(forwarded.into_body()).await.unwrap(), expected);
+        up_tx
+            .send_data(Bytes::from(expected.clone()))
+            .await
+            .unwrap();
+    }
+    sse_bytes(&mut response, expected.as_bytes()).await;
+    // The approved chunk arrives before the next upstream chunk exists.
+    up_tx
+        .send_data(Bytes::from_static(b"event: done\ndata: {}\n\n"))
+        .await
+        .unwrap();
+    sse_bytes(&mut response, b"event: done\ndata: {}\n\n").await;
+    up_tx.finish().await.unwrap();
+    assert!(response.frame().await.is_none());
+    started.outcome().await.unwrap();
+}
+
+async fn sse_bytes(body: &mut Body, expected: &[u8]) {
+    let mut bytes = Vec::new();
+    while bytes.len() < expected.len() {
+        let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        bytes.extend_from_slice(frame.data_ref().unwrap());
+    }
+    assert_eq!(bytes, expected);
+}
+
+#[tokio::test]
+async fn sse_keepalives_continue_while_a_guest_holds_a_request_for_approval() {
+    for edit in [false, true] {
+        sse_approval(false, edit).await;
+    }
+}
+
+#[tokio::test]
+async fn sse_keepalives_continue_while_a_guest_holds_a_tool_call_for_approval() {
+    for edit in [false, true] {
+        sse_approval(true, edit).await;
+    }
 }

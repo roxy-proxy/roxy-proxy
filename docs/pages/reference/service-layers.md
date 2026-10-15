@@ -34,7 +34,7 @@ zero. `capabilities` and `config` mean the same for both kinds
 Long-lived WebSocket connections to each endpoint, each carrying many
 exchanges as **streams**.
 
-- Subprotocol `roxy.layer.v0`; a service that does not accept it fails the
+- Subprotocol `roxy.layer.v6`; a service that does not accept it fails the
   handshake.
 - The URL is the endpoint's (`http` → `ws`, `https` → `wss`, with the
   upstream's certificate verification), dialled through the connector (the
@@ -81,9 +81,9 @@ layer's
 direction it names `head`, roxy sends the head and its end with no bytes
 between, and the service answers the same way; bytes the service sends for
 that body fail the exchange closed (`unsubscribed:<direction>`), and the
-body the service did not see goes on with the head it passed on, framed as
-it came: its `content-length` is kept, as it is not for a WASM layer whose
-own body is still open ([what a layer
+body the service did not see goes on with the head it passed on. Declared
+lengths validate bodies; open lanes use unknown wire length so a later cut
+remains visible ([what a layer
 sees](/reference/addon-configuration#what-a-layer-sees)). The pair (`flow`, `layer`) is unique
 and stable (two layers using the same endpoint in one flow get separate
 streams with different `layer`s), so a service can key its state on it.
@@ -113,7 +113,13 @@ order: at most one head, bytes, at most one `trailers`, then one end. An
 end may come before a head: the lane then carries nothing. A lane whose
 end carries `"error"` is cut: what came before it is not the whole. Trailers
 are delivered to the consumer only after a clean end and successful length
-validation, because sending HTTP trailers completes the message.
+validation, because sending HTTP trailers completes the message. Declared
+lengths validate bytes; an unfinished lane uses unknown-length framing on
+HTTP/1.1 even when the service supplied `content-length`. Its terminal chunk
+is withheld until the clean end. HEAD and bodiless statuses complete on the
+HTTP head itself; their internal response lanes are still consumed under
+`response_body_idle_timeout`, and a later failure cancels remaining work
+without changing the already-complete HTTP response.
 
 | rule | detail |
 |---|---|
@@ -122,7 +128,7 @@ validation, because sending HTTP trailers completes the message.
 | order | on each lane, from each side: head, bytes, trailers, end. Bytes or trailers before their head or after their end, a second head, a second `trailers`, a second end: each is a protocol violation. The two lanes are independent, and so are the two sides: roxy sends its `response` head as soon as the layer upstream answers, even while the client's body is still arriving; the service sends its `request` at most once and its `response` exactly once, in either order, and may send either while the other lane is still streaming. A `request_end` with no `request` before it forwards nothing. Answering says nothing about forwarding, and a service that wants nothing forwarded forwards nothing |
 | cuts | an end that carries `"error"` cuts its lane: the bytes before it are not the whole. From roxy, the body stopped short on its way (an in-flight deny cut it, the upstream's body failed, the client gave up, the service's own forward was cut); the text is for diagnostics only, is not stable, and may be another layer's own. The stream, and the service's own lanes, go on. A `response_end` with `"error"` and no `response` before it says nothing came back for the forward: it was cut. From the service, a cut is its own doing and not a fault: the exchange's record says `forward_aborted` or `answer_aborted`, and what is downstream of the cut lane sees it cut. If the service cuts its response lane without ever providing a head, roxy also records `no_response` and generates a refusal. An error on the end of a head-only lane, which carries no body to cut, is a protocol violation |
 | stop | `stop` says its sender reads no more of that body: the receiver sends no more of it, need not end it, and credits nothing for it. roxy sends `stop` for the request lane when the upstream stops reading the forward. A service that stops the response lane gives the forward up: nothing upstream carries a response nobody waits for, so the upstream request is cancelled. A service that stops the request lane keeps everything else |
-| end | a stream ends when the service has ended both its lanes, or roxy has stopped them: the `response_end` of the client's response, and the `request_end` of the request it forwarded or of the forward it never made. Nothing is inferred from a last message. A forward is carried upstream only while the service waits for its response: a service that ends its stream without reading the upstream response gives that forward up. Keeping its request lane open permits forwarding to continue after answering. A service that forwards and never answers is failed by its clock once the response from upstream has reached it. Either side may end a stream early with `reset`; roxy resets a stream only when the layer is torn down (the client went away, the layer downstream let go of its answer, a deadline passed, the service broke the protocol) and sends nothing after the `reset`. A stream roxy gives up before its `open` has gone out is dropped without a `reset`. A service that resets an enforce stream fails that exchange closed. Each side ignores messages for a stream it has ended; roxy drops body bytes sent on an ended stream without crediting them back |
+| end | a stream ends when all four lanes are terminal (ended, cut or stopped), output body validation has finished, and every accepted host-service call has queued its result. Ending the service's two output lanes leaves the input lanes available: an early answer can finish before the upstream response arrives. A stopped forward upload does not stop that response. The service must read or stop each input; `stop` on the response input gives up the forward. A service that forwards and never answers is failed by its clock once the upstream outcome arrives. Either side may abandon a stream with `reset`; roxy sends no further data after a reset, and a service reset fails an enforce exchange closed. An opening abandoned before `open` went out sends no reset. Messages crossing a retired stream's end are ignored; body bytes are not credited |
 | flow control | per stream and per body, each way. Each body of a stream starts with 256 KiB of credit each way; the receiver grants more with `credit` as it consumes, and the sender may have no more bytes of that body outstanding than granted. roxy grants in steps of 64 KiB as the layer upstream (or the client) reads. Sending past credit is a protocol violation. Control messages are not counted |
 
 ### Host services
@@ -161,13 +167,12 @@ forwarded; otherwise by the next rule that reads it: for a tag, which
 lives on this exchange, an in-flight re-check of it; for state, which
 persists, that or a later exchange's admission. A write does not itself
 trigger a re-check ([#509](https://github.com/roxy-proxy/roxy-proxy/issues/509)).
-At most 64 calls may be waiting, and more is a protocol violation. Calls
-the service sent before the stream ended still run once it has (a `record`
-sent just before its `response_end`, say): the effect stands, but the
-`result` is not sent, and one that fails is logged (`layer_error`) without
-stopping the rest; the stream keeps its place on the connection until they
-have run. A call sent on a stream that has ended is dropped and never
-answered.
+At most 64 calls may be waiting, and more is a protocol violation. Accepted
+calls keep the stream open until their results have been queued, including
+when all four lanes have finished. To issue a new call, send it before the
+last lane becomes terminal. Calls queued before a reset still run, retain
+the stream's reservation while they run, and are logged if they fail; their
+results have nowhere to go. A call sent after retirement is ignored.
 
 A call without its capability, a `log` message or a `record` kind and
 document together over 64 KiB, an `add_tag`, `state_put` or `quarantine`
@@ -181,6 +186,22 @@ roxy's own record of a call names its `id` as `call`: on the
 causes, on the operational log line a `log` writes, and on the cause of
 the `quarantined` event a `quarantine` trips. `endpoints.call`
 has no message: a service calls what it needs itself.
+
+### Migration from v5
+
+`roxy.layer.v6` is incompatible with `roxy.layer.v5` and the experimental
+`roxy.layer.v0`. Update the WebSocket subprotocol on both peers together.
+Each side must handle `stop`, `trailers`, explicit ends in both directions,
+and headless completion. Keep receiving upstream input after both service
+outputs end, and explicitly stop inputs the handler will not consume.
+Outstanding host calls now receive results before normal stream retirement.
+The bundled Python helper implements this contract. Incompatible protocol
+changes use a new subprotocol name so older peers fail at negotiation.
+
+WASM layers use `roxy:addon@0.3.0`; rebuild components with the matching SDK
+and WIT. Components using `roxy:addon@0.2.1` or the experimental unversioned
+package must be rebuilt. Package versions remain part of the interface
+identity for future incompatible changes.
 
 ## Semantics
 
@@ -198,7 +219,9 @@ has no message: a service calls what it needs itself.
   answered; receiving a head does not wait for the response body to end.
   An observer gets that budget from roxy's last message to end its stream. A
   stream has no overall deadline. Body-idle and upstream timeouts still
-  apply while the service's answer clock is suspended.
+  apply while the service's answer clock is suspended. The client edge
+  applies `response_body_idle_timeout` even to a HEAD or bodiless response
+  it must discard, and observes client loss through final reclamation.
 - **An early `response`** goes to the client at once, however far the
   forward upstream has got, and its body is the client's response from then
   on; the response from upstream still arrives on the service's lane for it
@@ -212,8 +235,8 @@ has no message: a service calls what it needs itself.
   that is not open, an invalid head, a broken length, bytes past the
   credit), a missed deadline, a reset from the service or a lost connection
   denies the exchange (`503`, `layer:<name>`) before the response head and
-  cuts the body after it; a body cut short never reaches the upstream or
-  the client as complete. `layer_error.kind` is `service:connect`,
+  cuts a streaming body after it. A cut body never reaches either peer as
+  complete; HEAD and bodiless responses have already completed at the head. `layer_error.kind` is `service:connect`,
   `service:protocol`, `service:timeout` or `service:closed`; bytes of a
   head-only body are `unsubscribed:<direction>`. A `response_end` with no
   `response` before it is no answer: `no_response`.
@@ -231,9 +254,8 @@ has no message: a service calls what it needs itself.
   ends the stream and is logged (`layer_error`, `service:closed`),
   host-service calls run as in enforce mode (less the ones an observer may
   not make), and the heads, bytes and ends the service sends go nowhere.
-  The stream ends as an enforce stream does, once the service has ended
-  both its lanes (a `request_end` and a `response_end`, each with or
-  without a head before it); a `stop` from the service ends roxy's copy.
+  The stream ends after all four lanes and accepted host calls finish, as
+  in enforce mode. A `stop` from the service ends the corresponding copy.
   So a service can read the copies through and then `record` what it saw
   before ending the stream, as a WASM observer can. From roxy's last
   message the service has `first_byte_timeout` to end the stream, or roxy

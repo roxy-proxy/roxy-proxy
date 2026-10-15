@@ -180,6 +180,18 @@ impl Body {
         })
     }
 
+    /// Validate a byte limit and declared length without changing the
+    /// body's transport framing. An unknown-length producer can still cut
+    /// after its declared bytes, so validation must not advertise a fixed
+    /// completion boundary to the HTTP writer.
+    #[must_use]
+    pub fn checked(self, max_bytes: u64, declared: Option<u64>) -> Self {
+        let known = self.known_length();
+        let mut body = Self::wrap_native(self, max_bytes, declared);
+        body.known_length = known;
+        body
+    }
+
     /// Like [`Body::wrap_with_length`] for an adapter over a [`Body`]: its
     /// [`BodyError`]s pass through unchanged (so a [`BodyError::Stopped`]
     /// stays recognisable), instead of becoming [`BodyError::Upstream`].

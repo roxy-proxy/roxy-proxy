@@ -11,7 +11,6 @@ use std::task::{Context, Poll, ready};
 use bytes::Bytes;
 use http::StatusCode;
 use http_body::{Body as HttpBody, Frame, SizeHint};
-use http_body_util::BodyExt as _;
 use roxy_http::layer::to_layer_request;
 use roxy_http::upstream::from_upstream_response;
 use roxy_http::{Body, BodyError, BodySender, CanonicalRequest, CanonicalResponse};
@@ -98,8 +97,10 @@ pub(crate) async fn run<F: ClientTransport>(
     let (parts, body) = to_layer_request(req).into_parts();
     edge.req_out.whole(Head::Request(parts), body);
     let mut res_in = edge.res_in;
+    // On task cancellation, publish the cause before dropping the lane.
+    let guard = reclaim.cancellation_guard();
     let driven = transport
-        .drive(Driven::new(st.clone(), async move { res_in.head().await }))
+        .drive(Driven::new(st.clone(), async { res_in.head().await }))
         .await;
     let outcome = stack_outcome(&st, driven, client_tx);
     match &outcome {
@@ -107,6 +108,9 @@ pub(crate) async fn run<F: ClientTransport>(
         Outcome::Upgrade { .. } => unreachable!("the client edge does not own upstream sockets"),
         Outcome::Close(roxy_http::DriveError::Client(_)) => st.tear_down(CLIENT_GONE),
         Outcome::Close(_) | Outcome::Refuse(_) => st.tear_down(ENDED),
+    }
+    if let Some(guard) = guard {
+        guard.complete();
     }
     (reclaim, outcome)
 }
@@ -146,12 +150,6 @@ pub(super) fn stack_outcome(
     let upgraded_body =
         (resp.status() == StatusCode::SWITCHING_PROTOCOLS).then(|| std::mem::take(resp.body_mut()));
     let mut res = from_upstream_response(resp, &st.snap.limits);
-    // A body the transport never writes (a bodiless status, a HEAD) is read
-    // here instead, so its lane ends as the layer ends it.
-    if res.status_forbids_body() || st.client_head {
-        st.draining.store(true, Ordering::SeqCst);
-        res.body = drained(std::mem::take(&mut res.body));
-    }
     res.body = gated(std::mem::take(&mut res.body), st.shared.sink.clone());
     if st.close.load(Ordering::Relaxed) {
         res.meta.close = true;
@@ -205,7 +203,9 @@ pub(super) fn stack_outcome(
 /// body that failed on its way in closes the connection as it would
 /// without a stack; the others are the refusals the core would give.
 fn refuse(st: &Arc<StackFlow>) -> Outcome {
-    match refusal_for_fault(st) {
+    let refusal = refusal_for_fault(st);
+    st.tear_down(ENDED);
+    match refusal {
         Ok(refusal) => Outcome::Refuse(refusal),
         Err(e) => Outcome::Close(e.into()),
     }
@@ -265,16 +265,6 @@ async fn failure_response(st: &Arc<StackFlow>) -> Option<CanonicalResponse> {
     let res = refusal_response(&mut cx, &refusal);
     st.loan.give_back(cx);
     Some(res)
-}
-
-/// A body the transport will not write, read to its end here so the lane it
-/// came on ends as its producer ends it.
-fn drained(mut body: Body) -> Body {
-    if body.is_end_stream() {
-        return body;
-    }
-    tokio::spawn(async move { while body.frame().await.is_some_and(|f| f.is_ok()) {} });
-    Body::empty()
 }
 
 /// A layer's response body to the client, sent only while the flow log

@@ -112,7 +112,7 @@ pub fn from_layer_request(
         check_host(h, &authority, scheme.default_port(), "the URI")?;
     }
     let headers = fields.headers;
-    let body = Body::wrap_native(body, fields.body.cap, fields.body.known);
+    let body = body.checked(fields.body.cap, fields.body.known);
 
     Ok(CanonicalRequest {
         method,

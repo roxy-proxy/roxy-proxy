@@ -1,4 +1,4 @@
-//! An in-test `roxy.layer.v0` service behind the scripted upstream: a
+//! An in-test `roxy.layer.v6` service behind the scripted upstream: a
 //! WebSocket handshake carrying the subprotocol is served here, on any
 //! port. The connection's behaviour is picked by the handshake's path:
 //!
@@ -68,6 +68,9 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 
 use crate::addons::service::SUBPROTOCOL;
 
+mod scripted;
+pub(crate) use scripted::Script;
+
 /// Each body's starting credit, each way.
 const WINDOW: u64 = 256 * 1024;
 
@@ -107,6 +110,7 @@ pub(crate) const SLOW: std::time::Duration = std::time::Duration::from_millis(50
 /// What the service saw, across connections.
 #[derive(Default)]
 pub(crate) struct ServiceLog {
+    scripts: Mutex<VecDeque<Script>>,
     opens: Mutex<Vec<Value>>,
     resets: Mutex<Vec<(u32, String)>>,
     /// Resets for a stream that had not been opened.
@@ -542,6 +546,58 @@ impl Conn {
         }
     }
 
+    fn cut_declared_or_trailers(&mut self, id: u32, v: &Value) {
+        if v["url"]
+            .as_str()
+            .is_some_and(|u| u.ends_with("/declared-request-cut"))
+        {
+            self.send(text(
+                id,
+                json!({"type": "request", "method": "POST", "url": "http://up.test/x",
+                "headers": [["content-length", "7"]]}),
+            ));
+            self.send(binary(id, REQUEST, b"partial"));
+            self.send(text(
+                id,
+                json!({"type": "response", "status": 204, "headers": []}),
+            ));
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let _ = tx.send(text(
+                    id,
+                    json!({"type": "request_end", "error": "incomplete"}),
+                ));
+                let _ = tx.send(text(id, json!({"type": "response_end"})));
+            });
+        } else if v["url"]
+            .as_str()
+            .is_some_and(|u| u.ends_with("/declared-cut") || u.ends_with("/declared-empty-cut"))
+        {
+            let empty = v["url"].as_str().unwrap().ends_with("/declared-empty-cut");
+            let length = if empty { "0" } else { "7" };
+            self.send(text(id, json!({"type": "request_end"})));
+            self.send(text(
+                id,
+                json!({"type": "response", "status": 200,
+                "headers": [["content-length", length]]}),
+            ));
+            if !empty {
+                self.send(binary(id, RESPONSE, b"partial"));
+            }
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let _ = tx.send(text(
+                    id,
+                    json!({"type": "response_end", "error": "incomplete"}),
+                ));
+            });
+        } else {
+            self.cut_after_trailers(id);
+        }
+    }
+
     fn control(&mut self, mut v: Value) {
         let Some(id) = v["stream"].as_u64().and_then(|n| u32::try_from(n).ok()) else {
             return;
@@ -559,7 +615,7 @@ impl Conn {
             "request" if matches!(self.mode, Mode::CutWait | Mode::CutForward) => {
                 self.cut_forward(id, v);
             }
-            "request" if self.mode == Mode::TrailersCut => self.cut_after_trailers(id),
+            "request" if self.mode == Mode::TrailersCut => self.cut_declared_or_trailers(id, &v),
             "open" => {
                 lock(&self.log.opens).push(v);
                 self.opened(id);
@@ -878,6 +934,16 @@ where
             }
         }
     });
+    if path.ends_with("/scripted") {
+        let (incoming, rx) = mpsc::unbounded_channel();
+        lock(&log.scripts).push_back(Script::new(tx, rx));
+        while let Some(Ok(m)) = stream.next().await {
+            if incoming.send(m).is_err() {
+                break;
+            }
+        }
+        return;
+    }
     let mut conn = Conn {
         mode: Mode::of(path),
         tx,

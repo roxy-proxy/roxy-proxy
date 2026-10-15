@@ -77,6 +77,10 @@ pub(crate) struct Stream {
 
 pub(super) struct StreamState {
     lanes: [Lane; 2],
+    /// The two lanes roxy produces have been sent or stopped.
+    inputs_done: [bool; 2],
+    /// Accepted calls retain their stream until their results are queued.
+    pending_calls: usize,
     pub(super) slot: Option<Reservation>,
     /// Settled: nothing more is sent or delivered on it.
     ended: bool,
@@ -98,6 +102,8 @@ struct Lane {
     sent: Sent,
     /// Roxy reads no more of this lane: its end is no longer owed.
     stopped: bool,
+    /// The feeder still owns bytes or validation work.
+    feeding: bool,
 }
 
 /// What the service has sent of a lane, in the lane's order.
@@ -113,7 +119,7 @@ enum Sent {
 impl Lane {
     /// The service has nothing more to send on this lane.
     fn done(&self) -> bool {
-        self.sent == Sent::End || self.stopped
+        (self.sent == Sent::End || self.stopped) && !self.feeding
     }
 }
 
@@ -129,6 +135,8 @@ impl StreamState {
     pub(super) fn new(lanes: Option<Lanes>, slot: Option<Reservation>) -> Self {
         let mut state = Self {
             lanes: [Lane::default(), Lane::default()],
+            inputs_done: [false; 2],
+            pending_calls: 0,
             slot,
             ended: false,
             observe_error: None,
@@ -148,9 +156,11 @@ impl StreamState {
         self.ended
     }
 
-    /// The service still owes the end of a lane.
+    /// Lanes, validators or accepted host calls still own this stream.
     fn waiting(&self) -> bool {
         self.lanes.iter().any(|l| !l.done())
+            || self.inputs_done.iter().any(|done| !done)
+            || self.pending_calls != 0
     }
 
     /// Ends the stream, once: what was pending goes to the caller to be
@@ -251,10 +261,10 @@ pub(super) enum Lost {
 
 /// How a stream ends.
 pub(super) enum End<'a> {
-    /// Nothing to tell anyone: the service ended both its lanes, an
-    /// observe stream sent all it had, or an `open` was given up before
-    /// its message went.
+    /// An `open` was given up before its message went.
     Quiet,
+    /// All four lanes and accepted calls have finished.
+    Complete,
     /// The service failed it. `reset` tells the service, when it has not
     /// already closed or reset the stream itself.
     Failed { e: ServiceError, reset: Reset },
@@ -283,33 +293,42 @@ impl Stream {
     pub(super) fn settle(&self, end: End<'_>) -> bool {
         let observe_error = match &end {
             End::Failed { e, .. } if self.mode == AddonMode::Observe => Some(e.clone()),
-            End::Quiet | End::Failed { .. } | End::Abandoned(_) => None,
+            End::Quiet | End::Complete | End::Failed { .. } | End::Abandoned(_) => None,
         };
-        let Some(mut ending) = lock(&self.state).end(observe_error) else {
+        let ending = {
+            let mut state = lock(&self.state);
+            if matches!(end, End::Complete) && state.waiting() {
+                return false;
+            }
+            state.end(observe_error)
+        };
+        let Some(mut ending) = ending else {
             return false;
         };
+        if let End::Failed { e, .. } = &end
+            && self.mode == AddonMode::Enforce
+        {
+            // Publish attribution before dropping held bodies or waking
+            // pumps, which can otherwise propagate a different teardown.
+            self.st
+                .layer_failed(self.index, StackError::Service(e.clone()));
+        }
         // Handed over before the end wakes the worker, which lets the
         // place go once it has drained.
         if lock(&self.calls).is_some() {
             *lock(&self.draining) = ending.slot.take();
         }
+        drop(lock(&self.held_request).take());
+        drop(lock(&self.held_response).take());
         self.ended.cancel();
         lock(&self.link.shared.streams).open.remove(&self.id);
         drop(ending.slot);
         let (why, reset) = match end {
-            End::Quiet => {
+            End::Quiet | End::Complete => {
                 drop(ending.outs);
                 return true;
             }
             End::Failed { e, reset } => {
-                // Recorded before anything learns of the end: the exchange
-                // may finish on a body aborted here before any answer is
-                // read. The layer is torn down with it, which cuts what it
-                // produced and lets go of what it held.
-                if self.mode == AddonMode::Enforce {
-                    self.st
-                        .layer_failed(self.index, StackError::Service(e.clone()));
-                }
                 let message = e.to_string();
                 (message.clone(), (reset == Reset::Send).then_some(message))
             }
@@ -350,13 +369,24 @@ impl Stream {
         self.answered.clone()
     }
 
+    /// The pump released its input lane, including on a consumer stop.
+    pub(crate) fn input_done(&self, dir: Dir) {
+        lock(&self.state).inputs_done[dir_index(dir)] = true;
+        self.settle(End::Complete);
+    }
+
+    pub(super) fn feeder_done(&self, dir: Dir) {
+        lock(&self.state).lane(dir).feeding = false;
+        self.settle(End::Complete);
+    }
+
     /// Resolves once the stream has ended, however it did.
     pub(crate) async fn until_ended(&self) {
         self.ended.cancelled().await;
     }
 
     /// An observe stream: roxy sent all it had, and the service has
-    /// `within` to end both its lanes (or reset) before roxy fails it.
+    /// `within` to end both outputs and finish accepted calls (or reset).
     /// How it ended, if it failed.
     pub(crate) async fn finish(&self, within: Duration) -> Result<(), ServiceError> {
         if tokio::time::timeout(within, self.ended.cancelled())
@@ -540,7 +570,7 @@ impl Stream {
         };
         self.link.shared.send_ctl(self.id, &Out::Stop { dir });
         if done {
-            self.settle(End::Quiet);
+            self.settle(End::Complete);
         }
     }
 
@@ -634,7 +664,7 @@ impl Stream {
                 self.fail(e, Reset::Send);
             }
             Ok(()) if done => {
-                self.settle(End::Quiet);
+                self.settle(End::Complete);
             }
             Ok(()) => {}
         }
@@ -669,7 +699,7 @@ impl Stream {
                 let head = Head::Request(r.into_parts().0);
                 if self.head_only(Dir::Request) {
                     // The body the layer did not see goes on with the head
-                    // it passed on, framed as it came.
+                    // it passed on; the lane retains its clean-end check.
                     let bound = lock(&self.held_request).take().unwrap_or_default();
                     out.whole(head, bound);
                     return Ok(());
@@ -753,6 +783,10 @@ impl Stream {
         let ended = lock(&self.state).end_lane(dir)?;
         match ended {
             Ended::Headless(out) => {
+                match dir {
+                    Dir::Request => drop(lock(&self.held_request).take()),
+                    Dir::Response => drop(lock(&self.held_response).take()),
+                }
                 if let Some(out) = out {
                     match error {
                         Some(why) => out.cut_headless(why),
@@ -792,7 +826,7 @@ impl Stream {
     /// the stream ends or dropped: the reader may still hold a stream
     /// another task has just ended.
     fn queue_host_call(self: &Arc<Self>, call: Call) {
-        let state = lock(&self.state);
+        let mut state = lock(&self.state);
         if state.ended() {
             return;
         }
@@ -809,7 +843,11 @@ impl Stream {
             }
             tx
         });
-        let full = matches!(tx.try_send(call), Err(mpsc::error::TrySendError::Full(_)));
+        let sent = tx.try_send(call);
+        if sent.is_ok() {
+            state.pending_calls += 1;
+        }
+        let full = matches!(sent, Err(mpsc::error::TrySendError::Full(_)));
         drop(calls);
         drop(state);
         if full {
@@ -824,9 +862,9 @@ impl Stream {
 
     /// The stream's host-service worker: each call in turn, each answered
     /// with a `result`. The stream's end stops it taking calls, but what
-    /// was queued before the end still runs: the service sent those calls
-    /// before its last message, so their effects stand, though their
-    /// results have nowhere to go. A failure on an open stream fails it, so
+    /// was queued before a reset still runs: those effects stand, though
+    /// their results have nowhere to go. Normal retirement waits for every
+    /// result to be queued. A failure on an open stream fails it, so
     /// the exchange, as it would a WASM layer's, and drops the calls behind
     /// it; after the end there is nothing left to fail, so a failing call
     /// is logged and the rest still run. The stream's place on the
@@ -866,6 +904,8 @@ impl Stream {
                     self.report(e);
                 }
             }
+            lock(&self.state).pending_calls -= 1;
+            self.settle(End::Complete);
         }
     }
 
@@ -880,10 +920,19 @@ impl Stream {
         // Observers have no outgoing lane; only enforcing streams reach here.
         debug_assert_eq!(self.mode, AddonMode::Enforce);
         let inbox = Arc::new(Inbox::default());
-        lock(&self.state).lane(dir).inbox = Some(inbox.clone());
-        self.st
-            .chain()
-            .spawn(feeder(self.clone(), inbox, body, dir));
+        {
+            let mut state = lock(&self.state);
+            let lane = state.lane(dir);
+            lane.inbox = Some(inbox.clone());
+            lane.feeding = true;
+        }
+        self.st.chain().spawn({
+            let stream = self.clone();
+            async move {
+                feeder(stream.clone(), inbox, body, dir).await;
+                stream.feeder_done(dir);
+            }
+        });
     }
 }
 
@@ -1037,11 +1086,10 @@ mod tests {
         StreamState::new(None, None)
     }
 
-    /// A stream ends when the service has ended both its lanes, in either
-    /// order, a headless end counting; a lane roxy stopped reading is no
-    /// longer owed. A second end of a lane is a protocol error.
+    /// Output ends and stops settle only those lanes. Input pumps,
+    /// validation and accepted host calls all retain the stage.
     #[test]
-    fn a_stream_ends_when_both_its_lanes_have() {
+    fn a_stream_waits_for_four_lanes_validation_and_calls() {
         let mut s = enforce();
         assert!(s.waiting());
         assert!(matches!(
@@ -1052,12 +1100,24 @@ mod tests {
         assert!(s.end_lane(Dir::Response).is_err(), "a second end");
         s.head(Dir::Request).unwrap();
         assert!(matches!(s.end_lane(Dir::Request), Ok(Ended::Body(None))));
+        assert!(s.waiting(), "both input lanes remain");
+        s.inputs_done[0] = true;
+        assert!(s.waiting(), "the upstream response remains");
+        s.inputs_done[1] = true;
+        s.lanes[0].feeding = true;
+        assert!(s.waiting(), "validation remains");
+        s.lanes[0].feeding = false;
+        s.pending_calls = 1;
+        assert!(s.waiting(), "a host result remains");
+        s.pending_calls = 0;
         assert!(!s.waiting());
 
         let mut s = enforce();
         s.lane(Dir::Request).stopped = true;
         assert!(s.waiting());
         s.end_lane(Dir::Response).unwrap();
+        assert!(s.waiting(), "a stopped upload does not stop either input");
+        s.inputs_done = [true; 2];
         assert!(!s.waiting());
         assert!(s.end(None).is_some());
         assert!(s.end(None).is_none(), "ends once");

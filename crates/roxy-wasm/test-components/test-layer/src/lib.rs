@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 wit_bindgen::generate!({
     path: "../../../../wit",
-    world: "roxy:addon/layer",
+    world: "roxy:addon/layer@0.3.0",
     generate_all,
 });
 
@@ -191,6 +191,57 @@ fn hold(req: &RequestHead, name: &str) {
     if let Some(ms) = header(req, &format!("x-{name}-ms")).and_then(|v| v.parse::<u64>().ok()) {
         wasi::clocks::monotonic_clock::subscribe_duration(ms * 1_000_000).block();
     }
+}
+
+/// Keep the client reading while an external approval holds either input.
+fn sse_approval(req: &RequestHead, body: InputStream, response: bool) {
+    let out = respond_streaming(&head(
+        200,
+        vec![("content-type".to_owned(), b"text/event-stream".to_vec())],
+    ));
+    write_all(&out, b"event: start\ndata: {}\n\n");
+    let input = if response {
+        let (pending, _) = chain::next(&forward_head(req), Body::Passthrough(body)).expect("next");
+        await_response(pending).1
+    } else {
+        body
+    };
+    let held = read_at_least(&input, read_bytes(req));
+    let (approval, _) = endpoints::call("park", req, Body::Empty).expect("approval call");
+    let ready = approval.subscribe();
+    loop {
+        if let Some(result) = approval.get() {
+            drop(result.expect("approval result"));
+            break;
+        }
+        write_all(&out, b": approval pending\n\n");
+        let tick = wasi::clocks::monotonic_clock::subscribe_duration(200_000_000);
+        wasi::io::poll::poll(&[&ready, &tick]);
+    }
+    drop(ready);
+    drop(approval);
+    let held = if header(req, "x-edit-tool").is_some() {
+        String::from_utf8(held)
+            .unwrap()
+            .replace("delete_file", "read_file")
+            .into_bytes()
+    } else {
+        held
+    };
+    if response {
+        write_all(&out, &held);
+        pump(&input, &out, false);
+        drop(input);
+    } else {
+        let (pending, forward) = next_streaming(&forward_head(req));
+        write_all(&forward, &held);
+        pump(&input, &forward, false);
+        drop(input);
+        types::finish(forward);
+        let (_, input) = await_response(pending);
+        pump(&input, &out, false);
+    }
+    types::finish(out);
 }
 
 /// The default: pass the exchange through, streaming both bodies, chunk by
@@ -655,6 +706,8 @@ impl Handler for Layer {
                 let (_below, from_below) = await_response(pending);
                 drop(read_all(&from_below));
             }
+            "sse-approve-request" => sse_approval(&req, body, false),
+            "sse-approve-response" => sse_approval(&req, body, true),
             "answer-204-then-next" => {
                 // As `answer-then-next`, with an answer that carries no
                 // body: the host writes nothing for it, and the guest must

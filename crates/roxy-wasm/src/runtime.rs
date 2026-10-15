@@ -431,7 +431,7 @@ impl Layer {
                 .input(&mut data.table, body)
                 .map_err(|e| LayerError::Instantiate(format!("{e:#}")))?;
             data.exchange = Some(ExchangeCtx {
-                host,
+                host: host.clone(),
                 shared: shared.clone(),
                 next_called: false,
                 scheme,
@@ -448,19 +448,20 @@ impl Layer {
             instance: Some(instance),
             _permit: permit,
         };
-        let driver = tokio::spawn(run.drive(head, body_res));
+        let driver = host.spawn_driver(Box::pin(run.drive(head, body_res)));
+        drop(host);
         let abort = driver.abort_handle();
         // Dropped here before the driver has settled (this future was
         // dropped), the driver is aborted; `ExchangeRun` records the
         // cancellation as it goes.
-        let _cancel = Cancel {
+        let cancel = Cancel {
             abort,
             shared: shared.clone(),
         };
 
         let settled = shared.wait_settled();
         let head_clock = shared.head_clock(limits.first_byte_timeout, started.elapsed());
-        tokio::select! {
+        let outcome = tokio::select! {
             biased;
             outcome = settled => outcome,
             () = head_clock => {
@@ -476,7 +477,16 @@ impl Layer {
                     Err(err)
                 }
             }
+        };
+        // Failure wakes waiters before the driver has released its store.
+        // Join its actual destruction on ordinary returns; the host owns
+        // the same task if this future is cancelled during the join.
+        if outcome.is_err() {
+            driver.abort();
         }
+        let _ = driver.await;
+        drop(cancel);
+        outcome
     }
 }
 

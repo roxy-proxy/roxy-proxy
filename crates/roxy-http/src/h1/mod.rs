@@ -514,7 +514,7 @@ struct WriteOpts<'a> {
 async fn write_message<W: AsyncWrite + Unpin>(
     w: &mut W,
     head: BytesMut,
-    body: Body,
+    body: &mut Body,
     opts: &WriteOpts<'_>,
     client_closed: &AtomicBool,
 ) -> Result<(), WriteError> {
@@ -537,7 +537,7 @@ async fn write_message<W: AsyncWrite + Unpin>(
 
 async fn write_body<W: AsyncWrite + Unpin>(
     w: &mut W,
-    mut body: Body,
+    body: &mut Body,
     opts: &WriteOpts<'_>,
     client_closed: &AtomicBool,
 ) -> Result<(), WriteError> {
@@ -558,7 +558,7 @@ async fn write_body<W: AsyncWrite + Unpin>(
     // One timer for the whole body, re-armed each time a frame is waited on.
     let mut stall = std::pin::pin!(tokio::time::sleep(body_idle));
     loop {
-        let ready = poll_fn(|cx| Poll::Ready(poll_body_once(&mut body, client_closed, cx))).await;
+        let ready = poll_fn(|cx| Poll::Ready(poll_body_once(body, client_closed, cx))).await;
         let frame = match ready {
             Poll::Ready(r) => r?,
             Poll::Pending => {
@@ -566,7 +566,7 @@ async fn write_body<W: AsyncWrite + Unpin>(
                 flush_timed(w, idle).await?;
                 stall.as_mut().reset(deadline(body_idle));
                 poll_fn(|cx| {
-                    if let Poll::Ready(r) = poll_body_once(&mut body, client_closed, cx) {
+                    if let Poll::Ready(r) = poll_body_once(body, client_closed, cx) {
                         return Poll::Ready(r);
                     }
                     stall
@@ -940,6 +940,28 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         }
     }
 
+    /// Observe client loss while the current exchange reclaims its work.
+    /// Pipelined bytes remain buffered for `next_request`. The buffer is
+    /// bounded by the request-head limit; once full, backpressure resumes.
+    pub async fn client_lost(&mut self) -> Result<(), ParseError> {
+        self.r.pump().await?;
+        loop {
+            if self.r.buf.len() >= self.limits.max_header_bytes {
+                std::future::pending::<()>().await;
+            }
+            let mut buf = vec![0; READ_CHUNK];
+            let room = self
+                .limits
+                .max_header_bytes
+                .saturating_sub(self.r.buf.len())
+                .min(buf.len());
+            match self.r.rd.read(&mut buf[..room]).await {
+                Ok(0) | Err(_) => return Ok(()),
+                Ok(n) => self.r.buf.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+
     fn out_framing(res: &CanonicalResponse, ex: &Exchange) -> OutFraming {
         if status_forbids_body(res.status) {
             OutFraming::Empty
@@ -974,7 +996,17 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     /// 1xx responses are not accepted here (see
     /// [`ServerConn::send_100_continue`] and [`ServerConn::respond_upgrade`]),
     /// nor 2xx responses to CONNECT (see [`ServerConn::accept_connect`]).
-    pub async fn respond(&mut self, res: CanonicalResponse) -> Result<(), WriteError> {
+    pub async fn respond(&mut self, mut res: CanonicalResponse) -> Result<(), WriteError> {
+        self.respond_borrowed(&mut res).await
+    }
+
+    /// Write a response while leaving body disposal to the exchange owner.
+    /// On a failure it can record the cause before releasing the body; on
+    /// HEAD or a bodiless status it can consume the unwritten remainder.
+    pub async fn respond_borrowed(
+        &mut self,
+        res: &mut CanonicalResponse,
+    ) -> Result<(), WriteError> {
         if !matches!(self.state, State::AwaitingResponse | State::AwaitingConnect) {
             return Err(WriteError::State("no request awaiting a response"));
         }
@@ -1013,7 +1045,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
             self.r.feed = None;
             self.r.abandoned = true;
         }
-        let framing = Self::out_framing(&res, &ex);
+        let framing = Self::out_framing(res, &ex);
         let close =
             ex.close || res.meta.close || self.r.abandoned || framing == OutFraming::CloseDelimited;
         let head = response_head(res.status, &res.headers, &[], framing, close, None);
@@ -1027,7 +1059,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
 
         let client_closed = AtomicBool::new(false);
         let result = {
-            let write = write_message(&mut self.w, head, res.body, &opts, &client_closed);
+            let write = write_message(&mut self.w, head, &mut res.body, &opts, &client_closed);
             let mut write = std::pin::pin!(write);
             let mut write_done = false;
             let mut watch_done = false;
@@ -1143,7 +1175,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         let r = write_message(
             &mut self.w,
             head,
-            Body::from_bytes(body),
+            &mut Body::from_bytes(body),
             &opts,
             &AtomicBool::new(false),
         )

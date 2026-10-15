@@ -90,11 +90,13 @@ optional.
 | `max_connections` | service | `4` | WebSocket connections to the endpoint |
 | `max_streams` | service | `100` | exchanges at once on one connection; past `max_connections × max_streams` an exchange waits for a free stream within `first_byte_timeout` |
 
-Bodies have no clock: once the head is out, a body streams for as long as
-it takes (a WebSocket for as long as the relay's idle timeout allows); the
-client's and upstream's idle timeouts still apply. CPU has no limit: a
-guest yields to the runtime on a 1 ms engine-wide tick, so it never stalls
-a worker thread and cancellation takes effect within a tick.
+The layer's head deadline stops once it answers. Bodies may stream for
+longer, subject to the client's and upstream's body idle timeouts. The
+client edge applies `response_body_idle_timeout` even when consuming an
+internal body that HEAD or a bodiless status prevents it from sending.
+WebSockets have the relay's idle timeout. There is no total CPU budget:
+a guest yields on an engine-wide 1 ms tick so other tasks can run and
+cancellation can stop it.
 
 ### Fixed caps
 
@@ -156,8 +158,7 @@ default) the layer owns that direction: it reads the body, chunk by chunk,
 and what it passes on is the body that goes on. With `head` the layer gets
 the head with an empty body and no `content-length`, and the body bypasses
 it: whatever the layer passes on (the head it gives `next`, or the head it
-answers with) carries the body it did not see, spliced on by roxy, with
-the framing roxy knows.
+answers with) carries the body it did not see, spliced on by roxy.
 
 - An enforce layer can still deny, rewrite or answer at a head it is
   subscribed to; the bodies stream past it at no cost in copies or
@@ -171,14 +172,10 @@ the framing roxy knows.
 - A layer that passes on bytes of a body it is not subscribed to fails the
   exchange closed: a `503` before the response head, a cut body after it,
   `layer_error` with `kind: unsubscribed:request` or
-  `unsubscribed:response`. The bypassed body keeps its framing when the
-  layer's own body for that direction is complete as the two are joined,
-  which is always for a service layer (its head-only direction is a head
-  and an end with nothing between) and for a WASM layer when `next` is
-  given an empty `bytes` body; joined to one still open (a WASM layer's
-  streamed `next` body, or any WASM response body, whose end waits for the
-  handler) it goes out without a `content-length`, chunked on HTTP/1.1, so
-  a cut is visible however the bytes interleave.
+  `unsubscribed:response`. An open lane has unknown length on the wire,
+  including a bypassed body. HTTP/1.1 uses chunked framing so a later cut
+  remains visible after the last declared byte; any declared length still
+  validates the body.
 - A head-only observer gets copies of the heads and no copy of the body,
   so neither the lag budget nor the buffer budget is touched for it.
 - The rules are not affected: they judge the request that leaves the
@@ -186,6 +183,38 @@ the framing roxy knows.
 - Bodies are decoded for the layers, and a WebSocket relayed without
   extensions, only when some layer that runs is subscribed to a body
   ([content codings](/reference/addon-configuration#content-codings), [WebSockets](/reference/addon-configuration#websockets)).
+
+### Streaming protocols
+
+Lanes carry HTTP structure: one head, streaming body bytes, optional
+trailers, then an end or cut. They resemble an HTTP/2 stream's lifecycle;
+they are not HTTP/2 wire streams. Request and response lanes are independent,
+so a layer can answer while it holds a request, or keep answering while it
+holds an upstream response for approval.
+
+| protocol or feature | support and limits |
+|---|---|
+| SSE, NDJSON, streaming JSON, multipart responses and HTTP-based MCP | bodies stream as bytes. Chunk boundaries need not match application messages; a layer editing them must parse the application's framing |
+| gRPC | the lanes support concurrent request and response bodies and trailers such as `grpc-status`. Service layers can receive and send trailers explicitly. The Python helper exposes received trailers but its forwarding methods do not send them. WASM host-side `body.passthrough` preserves trailers, but the WASI byte streams do not expose trailers for reading or rewriting; copying bytes into a new stream does not preserve them. Head-only subscriptions keep the bypassed body's trailers |
+| WebSockets | HTTP/1.1 upgrades are supported; bodies then carry raw WebSocket frames. WebSocket over HTTP/2 extended CONNECT is not enabled |
+| informational heads, including `103 Early Hints` | upstream informational responses are not relayed, with or without addons. Addons cannot publish informational heads before their final head ([HTTP](/reference/http#informational-responses)) |
+| arbitrary upgrades and TCP tunnels | only WebSocket upgrades are adapted into addon lanes. CONNECT on the proxy listener establishes an inspected HTTP/TLS connection, not an arbitrary addon-controlled tunnel |
+| WebTransport, CONNECT-UDP and MASQUE | not supported: datagrams and sessions containing multiple streams need semantics beyond these ordered byte lanes. HTTP/3 is not a supported transport |
+
+For SSE approval, a full-body layer can publish a `200 text/event-stream`
+head and send a start event or comment such as `: approval pending\n\n`.
+It can keep sending comments while it holds the request or buffers selected
+upstream events. Once approved, it forwards the request or writes the
+approved or edited events into its existing response body, then streams
+subsequent events. A refusal after that head is an application event in
+the same response, not a new HTTP status. A second response head fails the
+layer and cuts an answer already in progress.
+
+Keepalive bytes must reach the client within its idle timeout and roxy's
+`response_body_idle_timeout`. They do not extend a client's absolute
+deadline, an endpoint-call timeout, or an upstream timeout. SSE comments
+are valid only for an SSE body; gRPC requires correctly framed gRPC
+messages, and its HTTP/2 PING is connection control rather than body data.
 
 ### Choosing exchanges
 
@@ -222,8 +251,10 @@ in-flight rules, applies destination restrictions, and owns the upstream
 connection and any WebSocket relay. A layer's answer goes to the client
 as soon as the layer gives it; a forwarded request continues upstream
 while the layer waits for its response. The flow is logged once every lane is terminal,
-its body has been read or discarded, and all drivers and enforcing
-host-service workers have finished. Upstream upload accounting completes before the core releases
+its body has been read or discarded, and all drivers, input pumps, upload
+monitors and enforcing host-service workers have finished, including
+destruction after cancellation. The transport observes client loss through
+reclamation. Upstream upload accounting completes before the core releases
 the context. Sending an early response does not bypass this barrier. HTTP/1.1 does not accept
 the next request until this work finishes, even if a layer has ended both
 of its lanes but its handler or host-service calls are still running.
@@ -315,7 +346,8 @@ its handler lives on relaying the direction it is in.
   the client closes, while the response streams all along (the
   `roxy-addon` SDK does this). Holding bytes back until more arrive stalls
   an interactive protocol.
-- No clock runs on the bodies. When the relay ends, roxy closes the
+- The layer's head deadline does not limit the relayed bodies; the relay's
+  idle timeout still applies. When the relay ends, roxy closes the
   client's connection whether or not the layers have ended their bodies;
   bytes already on their way get a second to arrive.
 
@@ -334,9 +366,11 @@ its handler lives on relaying the direction it is in.
 - **No clean end for a failed body.** A guest body ends with an error once
   its exchange has failed; a response body the guest produces (`bytes` or a
   stream) holds its end until the handler returns, so a trap after the last
-  byte still cuts it. An empty body, or a passed-through body of known
-  length, goes out with `content-length` and is complete once sent. A streamed body is
-  complete only through `finish`: dropped unfinished, it is cut where it
+  byte still cuts it. An open lane has unknown wire length, even for an
+  empty declared body, until its producer ends cleanly. HEAD and bodiless
+  statuses commit at the head, but their internal bodies must still finish
+  within the body idle timeout. A streamed body is complete only through
+  `finish`: dropped unfinished, it is cut where it
   stopped, the layer's own doing (`reason: forward_aborted` or
   `answer_aborted`), not a failure.
 - **A cut forward gets no response.** A request body passed to `next` that

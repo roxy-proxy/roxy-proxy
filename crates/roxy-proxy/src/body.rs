@@ -72,14 +72,14 @@ impl DeliveryState {
 
 impl Delivery {
     /// Start at the upstream response head, independently of response writing.
-    pub(crate) fn start_monitor(&self, idle: Duration) {
+    pub(crate) fn start_monitor(&self, idle: Duration, tasks: &tokio_util::task::TaskTracker) {
         if self.0.finished.is_cancelled() {
             return;
         }
         let shared = self.0.clone();
         let mut bytes = shared.upload().bytes;
         let deadline = Instant::now() + idle;
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut deadline = deadline;
             loop {
                 tokio::select! {
@@ -644,7 +644,10 @@ mod tests {
     async fn an_unpolled_upload_has_a_progress_deadline() {
         let (body, tally, sent) = counted_until_sent(Body::from_bytes("unsent"), false);
         let (body, owner) = delivery(body);
-        owner.start_monitor(Duration::from_millis(100));
+        owner.start_monitor(
+            Duration::from_millis(100),
+            &tokio_util::task::TaskTracker::new(),
+        );
         tokio::time::advance(Duration::from_millis(101)).await;
         tokio::task::yield_now().await;
         assert!(
@@ -663,7 +666,10 @@ mod tests {
 
         let (mut tx, body) = Body::channel(u64::MAX, None);
         let (mut body, owner) = delivery(body);
-        owner.start_monitor(Duration::from_millis(100));
+        owner.start_monitor(
+            Duration::from_millis(100),
+            &tokio_util::task::TaskTracker::new(),
+        );
         for _ in 0..3 {
             tx.send_data(Bytes::from_static(b"progress")).await.unwrap();
             body.frame().await.unwrap().unwrap();

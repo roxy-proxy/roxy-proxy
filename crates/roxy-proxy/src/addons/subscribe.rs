@@ -65,10 +65,11 @@ pub(super) fn head_only(headers: &mut http::HeaderMap) {
     headers.remove(http::header::CONTENT_LENGTH);
 }
 
-/// The bypassed body goes on alone, framed as it came, when the layer's
+/// The bypassed body goes on alone when the layer's
 /// own body is complete: a service layer's head-only direction always is
 /// (its head and end carry no bytes, and the stream refuses any), a WASM
-/// layer's when `next` was given an empty `bytes` body.
+/// layer's when `next` was given an empty `bytes` body. Its enclosing lane
+/// still withholds wire completion until a clean end.
 pub(super) fn splice(
     st: &Arc<StackFlow>,
     index: usize,

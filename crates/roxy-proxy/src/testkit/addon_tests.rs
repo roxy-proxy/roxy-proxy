@@ -1946,13 +1946,10 @@ mod service {
         no_layer_error(&kit);
     }
 
-    /// A head-only direction of a service is a head and an end, complete
-    /// at once, so the body bypassing it keeps the framing it came with: to
-    /// the upstream with the client's `content-length`, to the client with
-    /// the upstream's. Bytes the service sends for that direction fail the
-    /// exchange closed as the service's own.
+    /// Head-only subscriptions preserve bytes while fallible lanes retain
+    /// an explicit wire completion boundary. Unsubscribed bytes fail closed.
     #[tokio::test]
-    async fn a_head_only_service_keeps_the_bypassed_bodies_framing() {
+    async fn a_head_only_service_keeps_bypassed_bodies_and_their_completion_boundary() {
         use crate::addons::Part;
         for (request, response) in [
             (Part::Head, Part::Full),
@@ -1977,27 +1974,9 @@ mod service {
             assert_eq!(a.json()["body_len"], 12, "{request:?}/{response:?}");
             let seen = kit.upstream.wait_seen(1).await;
             assert_eq!(seen[0].complete, Some(true), "{request:?}/{response:?}");
-            if request == Part::Head {
-                assert_eq!(
-                    seen[0].headers["content-length"], "12",
-                    "{request:?}/{response:?}"
-                );
-                assert!(
-                    !seen[0].headers.contains_key("transfer-encoding"),
-                    "{request:?}/{response:?}: {:?}",
-                    seen[0].headers
-                );
-            }
-            if response == Part::Head {
-                assert!(
-                    a.headers.contains_key("content-length"),
-                    "{request:?}/{response:?}: {a:?}"
-                );
-                assert!(
-                    !a.headers.contains_key("transfer-encoding"),
-                    "{request:?}/{response:?}: {a:?}"
-                );
-            }
+            assert!(!seen[0].headers.contains_key("content-length"));
+            assert!(!a.headers.contains_key("content-length"));
+            assert_eq!(a.headers["transfer-encoding"], "chunked");
             no_layer_error(&kit);
         }
 
@@ -3135,14 +3114,8 @@ async fn a_head_only_layer_sees_no_body_and_the_bodies_go_through() {
             seen[0].headers["x-saw-request"], saw_request,
             "{request:?}/{response:?}"
         );
-        // A bypassed body keeps its framing; one the layer streamed is its
-        // own, of unknown length.
-        if request == Part::Head {
-            assert_eq!(
-                seen[0].headers["content-length"], "12",
-                "{request:?}/{response:?}"
-            );
-        }
+        // A bypassed lane can still be cut by its producer.
+        assert!(!seen[0].headers.contains_key("content-length"));
         assert_eq!(seen[0].complete, Some(true));
         no_layer_error(&kit);
     }

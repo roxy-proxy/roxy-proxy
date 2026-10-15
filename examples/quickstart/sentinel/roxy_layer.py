@@ -1,4 +1,4 @@
-"""The service side of roxy's service layers (`roxy.layer.v0`).
+"""The service side of roxy's service layers (`roxy.layer.v6`).
 
 roxy keeps a few WebSocket connections open to the service and carries
 each exchange as a stream on one of them. Text frames are JSON control
@@ -18,9 +18,9 @@ an end (or a cut: an end with `error`):
 The two lanes of a stream are independent, each way: roxy sends its
 `response` head as soon as the layer upstream answers, even while the
 client is still uploading, and the service may answer before, while or
-without forwarding. A stream ends once the service has ended both its
-lanes, so a service that forwards nothing still sends a `request_end`
-(this module does). A body that fails on its way ends its lane with an
+without forwarding. A stream ends after all four lanes and accepted host
+calls finish. A service that forwards nothing still sends `request_end`,
+and stops inputs it will not consume (this module does both). A body that fails on its way ends its lane with an
 `error` on the end rather than ending the stream. The reader of a body may
 `stop` it: after roxy's `stop` for a lane this side sends no more of it.
 Each body is flow-controlled with `credit` messages, and either side may
@@ -66,7 +66,7 @@ from typing import Any
 
 from websockets.asyncio.server import ServerConnection, serve as ws_serve
 
-SUBPROTOCOL = "roxy.layer.v0"
+SUBPROTOCOL = "roxy.layer.v6"
 
 # The direction byte of a binary frame, and the `dir` of a credit message.
 REQUEST = 0
@@ -211,6 +211,7 @@ class _Conn:
             fut = s.pending.pop(msg["id"], None)
             if fut is not None and not fut.done():
                 fut.set_result(msg)
+            s._maybe_ended()
         elif kind == "reset":
             self.streams.pop(sid, None)
             s.fail_calls(ProtocolError("roxy reset the stream"))
@@ -222,11 +223,15 @@ class _Conn:
         elif kind == "trailers":
             s.inbox(_DIRS[msg["dir"]]).put_nowait(msg)
         else:
-            s.inbox(_DIR_OF_MESSAGE.get(kind, REQUEST)).put_nowait(msg)
+            direction = _DIR_OF_MESSAGE.get(kind, REQUEST)
+            s.inbox(direction).put_nowait(msg)
+            if kind in ("request_end", "response_end"):
+                s._ends_received[direction] = True
+                s._maybe_ended()
 
 
-# Put on a lane's inbox when this side's last message has gone: nothing more
-# arrives on the stream, so a receive still waiting must not wait forever.
+# Put after the final queued input once every lane and accepted call is
+# terminal, so a receive beyond the end cannot wait forever.
 _ENDED: Any = object()
 
 
@@ -260,10 +265,10 @@ class _Stream:
         # A `request` was forwarded.
         self.forwarded = False
         self._ends_sent = {REQUEST: False, RESPONSE: False}
-        # Nothing more may be sent: this side has ended (or roxy stopped)
-        # both its lanes, which ends the stream in either mode. roxy drops
-        # a call sent after that and never answers it.
+        self._ends_received = {REQUEST: False, RESPONSE: False}
+        # All four lanes and outstanding results determine retirement.
         self.ended = False
+        self._settled = asyncio.Event()
 
     def stopped(self, direction: int) -> None:
         lane = self.lanes[direction]
@@ -273,14 +278,22 @@ class _Stream:
 
     def _lane_done(self, direction: int) -> None:
         self._ends_sent[direction] = True
-        if all(self._ends_sent.values()) and not self.ended:
+        self._maybe_ended()
+
+    def _maybe_ended(self) -> None:
+        if (all(self._ends_sent.values()) and all(self._ends_received.values())
+                and not self.pending and not self.ended):
             self.ended = True
-            # roxy runs a call sent before the end but cannot answer it, and
-            # sends nothing more on the stream, the response to a forward
-            # included: whoever awaits either must not wait forever.
-            self.fail_calls(ProtocolError("the stream has ended: no result will come"))
+            self._settled.set()
             for lane in self.lanes.values():
                 lane.inbox.put_nowait(_ENDED)
+
+    async def _stop_inputs(self) -> None:
+        for direction, ended in self._ends_received.items():
+            if not ended:
+                await self.conn.send(self.id, {"type": "stop", "dir": _DIR_NAMES[direction]})
+                self._ends_received[direction] = True
+        self._maybe_ended()
 
     def fail_calls(self, exc: Exception) -> None:
         """Unblocks every call still waiting for its `result`: the stream
@@ -300,8 +313,8 @@ class _Stream:
     ) -> None:
         """Sends `msg` on the stream, under the connection's lock, so a
         host-service call (`host`) or a forward (`forward`) either goes
-        before this side's last message or is refused (`ProtocolError`),
-        never after it, when roxy would drop it unanswered. `end` is the
+        before all four lanes retire or is refused (`ProtocolError`),
+        never after retirement, when roxy would drop it unanswered. `end` is the
         direction whose end `msg` is."""
         async with self.conn.lock:
             if (host or forward) and self.ended:
@@ -327,6 +340,7 @@ class _Stream:
             result = await fut
         finally:
             self.pending.pop(cid, None)
+            self._maybe_ended()
             # The stream may end between registering the call and sending
             # it: `send` then refuses the call, and the failure already set
             # on its future is taken here rather than reported by asyncio
@@ -363,13 +377,17 @@ class _Stream:
             await self.conn.handler(exchange)
             # The request body may still be going out after the handler
             # has answered. A handler that forwarded nothing ends the
-            # request lane headless: the stream ends on both lanes' ends.
+            # request lane headless, and releases unread inputs.
             await exchange._finish_forwarding()
-            if not self.forwarded and not self._ends_sent[REQUEST]:
-                await self.send({"type": "request_end"}, end=REQUEST)
+            await self._stop_inputs()
+            for direction in (REQUEST, RESPONSE):
+                if not self._ends_sent[direction]:
+                    await self.send({"type": f"{_DIR_NAMES[direction]}_end"}, end=direction)
+            await self._settled.wait()
         except ForwardEnded as e:
             if exchange is not None:
                 await exchange._stop_forwarding()
+            await self._stop_inputs()
             for direction in (REQUEST, RESPONSE):
                 if not self._ends_sent[direction]:
                     end: dict[str, Any] = {"type": f"{_DIR_NAMES[direction]}_end"}
@@ -378,6 +396,7 @@ class _Stream:
                     elif e.error is not None:
                         end["error"] = e.error
                     await self.send(end, end=direction)
+            await self._settled.wait()
         except asyncio.CancelledError:
             # roxy reset the stream, or the connection went.
             pass
@@ -485,8 +504,8 @@ class Exchange:
     # awaits the call before sending whatever its effect must precede
     # (`forward`, `respond`, or the rest of a body). A tag or state write
     # is seen by this exchange's admission rules only if it lands before
-    # `forward`, and by later exchanges always; in-flight rules read
-    # neither tags nor state (#509).
+    # `forward`; later rule evaluations can read updated tags and state.
+    # A write does not itself trigger an in-flight re-check (#509).
 
     async def log(self, level: str, message: str) -> None:
         """Writes to roxy's operational log (`trace` to `error`)."""
@@ -621,15 +640,9 @@ class Exchange:
         with `response_body()`. If the response lane ends without a head,
         raises `ForwardEnded`; the handler may catch it and answer locally.
 
-        The stream ends once both this side's lanes have ended: if the
-        answer's end and this forward's `request_end` both go before the
-        head from upstream arrives, it never does, and this raises
-        `ProtocolError`. A forward is carried upstream only while this side
-        waits for its response: a handler that wants it delivered reads at
-        least the response head."""
-        # Decided and sent as one: a response completing on another task
-        # meanwhile would end the stream, and roxy drops a forward sent
-        # after that. Forward before the response ends.
+        Completing both outputs leaves the response input available.
+        To keep the forward running, consume its response; returning from
+        the handler stops any inputs it left unfinished."""
         await self._s.send(
             {
                 "type": "request",
@@ -682,9 +695,8 @@ class Exchange:
         forwarded, before or after: the client's response is its own lane.
         An early answer leaves a forward to run on while this side still
         reads its response; a handler that wants nothing forwarded does not
-        forward. A handler that means to forward after answering starts the
-        forward before the response body ends, since the stream ends once
-        both this side's lanes have. A body that failed on its way in is
+        forward. It may finish its answer while still consuming the forward's
+        response. A body that failed on its way in is
         relayed cut, with the error on its end."""
         await self._send(
             {
