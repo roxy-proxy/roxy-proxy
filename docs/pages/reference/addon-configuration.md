@@ -295,6 +295,12 @@ In the flow log:
 | `decision: answered`, `terminal_rule: layer:<name>` | a layer answered itself, whatever its status: the layer nearest the client whose response lane upstream had no head when its own answer's head landed, decided then. A forward it kept reading the response of runs to its end, and the record keeps what the rules decided of it; one it stopped reading the response of is cancelled upstream, with `reason: upstream_aborted`; a forward it cut itself gets `reason: forward_aborted`. If a layer fails before publishing its answer, the generated refusal is the decision, `deny`, whatever a downstream layer makes of it. If it fails after its answer reaches the client, the answer remains recorded and its body is cut |
 | `503`, `terminal_rule: layer:<name>`, `reason: layer_error` | a layer failed before the response head; the connection is closed and a `layer_error` event follows with `kind` one of `trap`, `budget:<limit>`, `capability:<name>`, `invalid_request`, `invalid_response`, `no_response`, `unsubscribed:<direction>`, ... After the head, the body is cut (HTTP/1.1 breaks the connection, HTTP/2 resets the stream) and `layer_error` follows. Which layer, if any, is one rule ([who is blamed](/design/addon-model#who-is-blamed)) |
 
+If a layer fails while handling a denial the core already made, its generated
+`503` still travels downstream, but the flow record keeps the original deny's
+`terminal_rule` and `reason`. A downstream layer reshaping that response does
+not change the recorded denial. The layer failure has its own `layer_error`
+event.
+
 ### Content codings
 
 On a flow some layer runs on and is subscribed to the body, roxy decodes

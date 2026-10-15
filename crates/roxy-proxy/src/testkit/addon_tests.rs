@@ -35,6 +35,35 @@ fn named(names: &[&str]) -> Vec<AddonDef> {
     names.iter().map(|n| AddonDef::test_layer(n)).collect()
 }
 
+async fn deny_survives_a_later_layer_failure(reshape: bool) {
+    let kit = stack(&named(&["a", "b"])).await;
+    let mut headers = vec![("x-test-a", "pass"), ("x-test-b", "next-then-trap")];
+    if reshape {
+        headers.push(("x-status", "200"));
+    }
+    let answer = kit
+        .h1()
+        .await
+        .call("GET", "/rewritten", &headers, b"")
+        .await;
+    assert_eq!(answer.status, if reshape { 200 } else { 503 }, "{answer:?}");
+    assert!(kit.upstream.seen().is_empty());
+    let event = kit.request_event().await;
+    assert_eq!(event["decision"], "deny", "{event:#}");
+    assert_eq!(event["terminal_rule"], "no-rewritten", "{event:#}");
+    assert!(event["reason"].is_null(), "{event:#}");
+}
+
+#[tokio::test]
+async fn admission_deny_attribution_survives_layer_failure() {
+    deny_survives_a_later_layer_failure(false).await;
+}
+
+#[tokio::test]
+async fn admission_deny_attribution_survives_reshaped_layer_failure() {
+    deny_survives_a_later_layer_failure(true).await;
+}
+
 fn gzip(b: &[u8]) -> Vec<u8> {
     use std::io::Write as _;
     let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());

@@ -242,21 +242,26 @@ pub(crate) fn emit_response_error(cx: &FlowCx, reason: &str, e: &dyn std::fmt::D
 /// Records a local refusal on the flow and builds its response. Pair with
 /// [`finish_refusal`] once the response has been written.
 pub(crate) fn refusal_response(cx: &mut FlowCx, refusal: &Refusal) -> CanonicalResponse {
-    match refusal.kind {
-        RefusalKind::Deny => {
-            cx.record.decision = Some(DecisionKind::Deny);
-            if refusal.rule.is_some() {
-                cx.record.terminal_rule.clone_from(&refusal.rule);
+    // A downstream layer can fail while handling the core's refusal.
+    // Its response changes, but the denial that already decided the
+    // request must retain its rule and reason in the audit record.
+    if cx.record.decision != Some(DecisionKind::Deny) {
+        match refusal.kind {
+            RefusalKind::Deny => {
+                cx.record.decision = Some(DecisionKind::Deny);
+                if refusal.rule.is_some() {
+                    cx.record.terminal_rule.clone_from(&refusal.rule);
+                }
+            }
+            RefusalKind::UpstreamError => {
+                if cx.record.decision.is_none() {
+                    cx.record.decision = Some(DecisionKind::Allow);
+                }
             }
         }
-        RefusalKind::UpstreamError => {
-            if cx.record.decision.is_none() {
-                cx.record.decision = Some(DecisionKind::Allow);
-            }
+        if refusal.reason.is_some() {
+            cx.record.reason.clone_from(&refusal.reason);
         }
-    }
-    if refusal.reason.is_some() {
-        cx.record.reason.clone_from(&refusal.reason);
     }
     let res = refusal.response(&cx.flow);
     cx.record.response_status = Some(refusal.status.as_u16());

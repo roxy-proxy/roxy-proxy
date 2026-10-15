@@ -466,3 +466,31 @@ async fn a_missing_credential_secret_fails_closed() {
     assert_eq!(ev["reason"], "secret_missing", "{ev:#}");
     assert!(kit.upstream.seen().is_empty());
 }
+
+#[tokio::test]
+async fn a_layer_trapping_on_a_refusal_preserves_the_policy_failure_reason() {
+    for reshape in [false, true] {
+        let kit = signing("bedrock", "")
+            .addon(super::AddonDef::test_layer("a"))
+            .addon(super::AddonDef::test_layer("b"))
+            .start()
+            .await;
+        kit.server.handle().swap_secrets(HashMap::new());
+        let mut headers = vec![("x-test-a", "pass"), ("x-test-b", "next-then-trap")];
+        if reshape {
+            headers.push(("x-status", "200"));
+        }
+        let answer = kit
+            .h1()
+            .await
+            .call("POST", "/model/invoke", &headers, b"{}")
+            .await;
+        assert_eq!(answer.status, if reshape { 200 } else { 503 }, "{answer:?}");
+        let event = kit.request_event().await;
+        assert_eq!(event["decision"], "deny", "{event:#}");
+        assert_eq!(event["terminal_rule"], "_fail_closed", "{event:#}");
+        assert_eq!(event["reason"], "secret_missing", "{event:#}");
+        assert_eq!(kit.events("layer_error", 1).await[0]["layer"], "b");
+        assert!(kit.upstream.seen().is_empty());
+    }
+}
