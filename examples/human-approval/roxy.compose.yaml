@@ -1,0 +1,35 @@
+# roxy.yaml for compose.yaml: the same policy, with the layer at its service
+# name and the binds and paths a container needs. roxy.yaml explains it.
+version: 1
+
+listeners:
+  - name: proxy
+    bind: 0.0.0.0:8080
+
+ca_server:
+  bind: 0.0.0.0:8081
+
+tls:
+  ca_dir: /var/lib/roxy/ca
+
+log:
+  flow:
+    connection_events: false
+
+limits:
+  response_body_idle_timeout: 30m
+
+addons:
+  - name: human-approval
+    kind: service
+    when: host == "api.anthropic.com" and method == POST and path starts_with "/v1/messages"
+    endpoint: review
+    endpoints:
+      review: { url: "http://review:9000/", private_ok: true }
+    limits:
+      first_byte_timeout: 30m
+
+rules:
+  - id: anthropic
+    when: host == "api.anthropic.com" and port == 443
+    then: allow

@@ -1,0 +1,49 @@
+# Claude Code behind roxy, with a person approving every tool call. roxy
+# runs from roxy.compose.yaml; the review layer (approval.py) is built from
+# ./Dockerfile. Both are published on loopback only.
+#
+#   docker compose up --build -d       # down -v removes the CA and the log too
+#
+# Proxy: http://127.0.0.1:8080    CA: http://127.0.0.1:8081/roxy-ca.pem
+# Review page: http://127.0.0.1:8585
+name: roxy-human-approval
+
+services:
+  roxy:
+    image: ${ROXY_IMAGE:-ghcr.io/roxy-proxy/roxy:0.3}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    command: ["run", "--config", "/etc/roxy/roxy.yaml"]
+    volumes:
+      - ./roxy.compose.yaml:/etc/roxy/roxy.yaml:ro
+      - roxy-ca:/var/lib/roxy/ca           # the CA survives restarts, so Claude Code keeps trusting it
+    ports:
+      - "127.0.0.1:8080:8080"              # the proxy
+      - "127.0.0.1:8081:8081"              # the CA certificate
+    healthcheck:                           # the image's own check probes 3130; this config serves on 8081
+      test: ["CMD", "/roxy", "health", "--url", "http://127.0.0.1:8081/readyz"]
+      interval: 2s
+      retries: 30
+    depends_on:
+      review: { condition: service_healthy }
+
+  # The review layer and its page.
+  review:
+    image: roxy-human-approval-review
+    build:
+      context: ..                          # copies human-approval/ and quickstart/sentinel/
+      dockerfile: human-approval/Dockerfile
+    pull_policy: build
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: [/tmp]
+    volumes:
+      - review-logs:/logs                  # the Inspect log of what was asked and answered
+    ports:
+      - "127.0.0.1:8585:8585"              # the review page
+
+volumes:
+  roxy-ca: {}
+  review-logs: {}

@@ -17,6 +17,7 @@ small review queue as its `ask_human`. The stream handling and the
 | [`review.py`](review.py) | the queue (`ask_human` parks the step on a future) and the three-route page server: `GET /`, `GET /pending`, `POST /pending/{id}` |
 | [`review.html`](review.html) | the page: one card per waiting call, an optional reason, Approve and Deny |
 | [`roxy.yaml`](roxy.yaml) | roxy's policy: the layer on `POST api.anthropic.com/v1/messages`, a rule that lets that host through, everything else denied |
+| [`compose.yaml`](compose.yaml) | the same two processes as containers: roxy from [`roxy.compose.yaml`](roxy.compose.yaml) (the policy with container addresses), the layer built from [`Dockerfile`](Dockerfile) |
 | [`tests/`](tests/) | the hold, the two answers, the pings, a whole response, an exchange that goes away, and the page's refusals |
 
 ## Running it
@@ -55,6 +56,40 @@ a tool: read a file, run a command. Its API key goes through roxy as it is;
 roxy only relays `api.anthropic.com`. Anything else Claude Code reaches for
 (telemetry, update checks) is denied by the rules and shows up in roxy's
 flow log on stdout.
+
+## With Docker
+
+One command, from this directory:
+
+```sh
+cd examples/human-approval
+docker compose up --build -d
+```
+
+That starts roxy (`ghcr.io/roxy-proxy/roxy:0.3`) with the proxy on
+`127.0.0.1:8080` and its CA on `127.0.0.1:8081`, and the review layer with
+its page on `127.0.0.1:8585`. Then, in a shell of your own, point Claude
+Code at it:
+
+```sh
+curl -fsS -o /tmp/roxy-ca.pem http://127.0.0.1:8081/roxy-ca.pem
+export HTTPS_PROXY=http://127.0.0.1:8080 NODE_EXTRA_CA_CERTS=/tmp/roxy-ca.pem
+claude
+```
+
+If something Claude Code runs must reach a host directly (an API key
+helper, say, or other tooling of yours), list it in `NO_PROXY` so it is not
+sent through roxy and denied.
+
+Open <http://127.0.0.1:8585> and carry on as above. roxy's flow log is
+`docker compose logs roxy`.
+
+The CA lives in the `roxy-ca` volume, so it survives `docker compose
+restart` and `down`; `docker compose down -v` removes it, and Claude Code
+must then trust the new one. The Inspect log is in the `review-logs`
+volume, mounted at `/logs` in the `review` container:
+`docker compose cp review:/logs ./logs` copies it out for
+`inspect view --log-dir logs`.
 
 ## What the person sees
 
