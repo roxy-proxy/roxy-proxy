@@ -7,7 +7,7 @@ inspect_sentinel `BeforeToolCall` step, and runs the configured sentinel on
 it before the agent sees the response:
 
     continue   the response goes to the agent unchanged
-    modify     the tool call's arguments are replaced (non-streamed responses)
+    modify     the tool call's arguments are replaced
     reject     the response is replaced by an assistant message that keeps
                the model's text, drops its tool calls and says what was
                blocked, so the agent's turn ends normally
@@ -15,9 +15,14 @@ it before the agent sees the response:
     escalate   unresolved at the root: treated as reject (fail closed)
 
 Everything else (other requests, and every non-200 answer) passes through
-untouched, for roxy's rules to decide. A streamed response starts at once
-(its head and `message_start`), then pings until the rest has arrived and
-been judged, so the agent's first-byte and idle deadlines are met.
+untouched, for roxy's rules to decide. A streamed response goes to the
+agent as it arrives (its head, `message_start`, its text and thinking)
+until the first tool call starts. From there the rest is held, with pings
+so the agent's idle deadline is met, until the stream ends and every tool
+call in it is judged: then the held events go on unchanged, or the tool
+calls are replaced by the note and the turn ends. Nothing of a tool call
+reaches the agent before the last one in the message has a verdict, so a
+later rejection never leaves an earlier, approved call behind.
 
 Each Claude Code session (its `X-Claude-Code-Session-Id` header), its model
 calls and the sentinel's reports are written as an Inspect eval log for
