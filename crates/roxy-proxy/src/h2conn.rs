@@ -49,8 +49,8 @@ use tokio_util::sync::CancellationToken;
 use crate::body::{Collected, collect_prefix};
 use crate::conn::ConnLimits;
 use crate::exchange::{
-    Answer, Front, Outcome, WriteFailure, process, record_client_failure, record_client_gone,
-    record_continue_failure, send,
+    Answer, ClientTransport, Outcome, WriteFailure, process, record_client_failure,
+    record_client_gone, record_continue_failure, send,
 };
 use crate::flowlog::TlsInfo;
 use crate::io::Io;
@@ -273,15 +273,15 @@ async fn serve_stream(
             return;
         }
     };
-    let mut front = H2Front {
+    let mut transport = H2Transport {
         respond,
         fail,
         expect_continue: req.meta.expect_continue,
     };
-    let (mut cx, outcome) = process(&mut front, cx, req).await;
-    let H2Front {
+    let (reclaim, outcome) = process(&mut transport, cx, req).await;
+    let H2Transport {
         mut respond, fail, ..
-    } = front;
+    } = transport;
     let out = Out {
         method: &method,
         idle: limits.body_idle_timeout,
@@ -292,32 +292,54 @@ async fn serve_stream(
     let answer = match outcome {
         Outcome::Respond(res) => Answer::Response(res),
         Outcome::Refuse(refusal) => Answer::Refusal(refusal),
-        // The client went away: nothing to answer, nothing to reset.
-        Outcome::Close(_) if fail.gone() => return record_client_gone(&mut cx),
-        Outcome::Close(DriveError::Client(e)) => {
-            ccx.shared.emit_parse_error(&ccx.client, Some(&cx), &e);
-            respond.send_reset(h2::Reason::PROTOCOL_ERROR);
-            return record_client_failure(&mut cx, &e, None);
+        Outcome::Close(e) => {
+            let mut cx = reclaim.take().await;
+            return record_closed_stream(&mut respond, &fail, &mut cx, e);
         }
-        Outcome::Close(DriveError::Write(e)) => {
-            respond.send_reset(h2::Reason::INTERNAL_ERROR);
-            return record_continue_failure(&mut cx, e);
-        }
-        Outcome::Upgrade { .. } => {
+        upgrade @ (Outcome::Upgrade { .. } | Outcome::LayeredUpgrade { .. }) => {
             // Unreachable: h2 requests never carry an upgrade. Fail closed.
+            reclaim.tear_down(crate::addons::ENDED);
+            drop(upgrade);
+            let mut cx = reclaim.take().await;
             respond.send_reset(h2::Reason::INTERNAL_ERROR);
             let e = ParseError::new(Reason::H2UnsupportedMethod, "upgrade over h2");
             return record_client_failure(&mut cx, &e, None);
         }
     };
-    let sent = send(&mut cx, answer, |res| {
-        write_response(&mut respond, res, &out)
-    })
-    .await;
+    let mut writer = H2Writer {
+        respond: &mut respond,
+        sent: None,
+        fail: &fail,
+        out: &out,
+    };
+    let sent = send(reclaim, answer, &mut writer).await;
     // A closing deny, or an in-flight stop that closes, ends the connection:
     // GOAWAY once the stream is written.
     if sent.close {
         ccx.closing.cancel();
+    }
+}
+
+/// Finish an exchange that could not produce a response on this stream.
+fn record_closed_stream(
+    respond: &mut SendResponse<Bytes>,
+    fail: &BodyFail,
+    cx: &mut FlowCx,
+    error: DriveError,
+) {
+    if fail.gone() {
+        return record_client_gone(cx);
+    }
+    match error {
+        DriveError::Client(e) => {
+            cx.shared.emit_parse_error(&cx.client, Some(cx), &e);
+            respond.send_reset(h2::Reason::PROTOCOL_ERROR);
+            record_client_failure(cx, &e, None);
+        }
+        DriveError::Write(e) => {
+            respond.send_reset(h2::Reason::INTERNAL_ERROR);
+            record_continue_failure(cx, e);
+        }
     }
 }
 
@@ -332,35 +354,87 @@ struct Out<'a> {
     flags: &'a HttpFlags,
 }
 
+struct H2Writer<'a, 'b> {
+    respond: &'a mut h2::server::SendResponse<Bytes>,
+    sent: Option<SendStream<Bytes>>,
+    fail: &'a BodyFail,
+    out: &'a Out<'b>,
+}
+
+impl crate::exchange::ResponseWriter for H2Writer<'_, '_> {
+    async fn write(&mut self, res: &mut CanonicalResponse) -> Result<(), WriteFailure> {
+        self.sent = Some(write_response(self.respond, res, self.out, self.fail).await?);
+        Ok(())
+    }
+
+    async fn reclaim(
+        &mut self,
+        reclaim: crate::addons::Reclaim,
+        body: Body,
+    ) -> (FlowCx, Option<WriteFailure>) {
+        // A failed write already cancelled the exchange. In particular,
+        // our own reset must not be mistaken for a subsequent client reset.
+        let Some(sent) = &mut self.sent else {
+            drop(body);
+            return (reclaim.take().await, None);
+        };
+        reclaim
+            .take_until(body, async {
+                let failure = tokio::select! {
+                    biased;
+                    () = self.fail.signal.cancelled() => {
+                        request_write_failure(self.fail)
+                    }
+                    reset = poll_fn(|cx| sent.poll_reset(cx)) => {
+                        match reset {
+                            Ok(reason) => WriteFailure::ClientGone(format!("HTTP/2 stream reset: {reason}")),
+                            Err(error) => stream_error(&error),
+                        }
+                    }
+                };
+                let why = if matches!(failure, WriteFailure::ClientGone(_)) {
+                    self.fail.gone.store(true, Ordering::Relaxed);
+                    crate::addons::CLIENT_GONE
+                } else {
+                    crate::addons::ENDED
+                };
+                (why, failure)
+            })
+            .await
+    }
+}
+
 /// Writes `res` on the stream: head, then the body as DATA frames within
 /// the peer's flow-control window, then trailers (only with
 /// `http.allow_response_trailers`). A body that fails resets the stream, so
 /// the client never sees a truncated body as complete.
 async fn write_response(
     respond: &mut SendResponse<Bytes>,
-    res: CanonicalResponse,
+    res: &mut CanonicalResponse,
     out: &Out<'_>,
-) -> Result<(), WriteFailure> {
-    let head = to_h2_response(&res, out.method)
+    fail: &BodyFail,
+) -> Result<SendStream<Bytes>, WriteFailure> {
+    let head = to_h2_response(res, out.method)
         .body(())
         .map_err(|e| WriteFailure::Io(format!("response head: {e}")))?;
     // `content-length: 0` may still carry trailers when they are allowed,
     // so only a body that has nothing more to yield ends on the HEADERS.
     let bodiless = status_forbids_body(res.status)
         || *out.method == Method::Head
-        || (res.body.known_length() == Some(0)
-            && (!out.flags.allow_response_trailers || http_body::Body::is_end_stream(&res.body)));
-    let mut body = res.body;
+        || (res.body.known_length() == Some(0) && http_body::Body::is_end_stream(&res.body));
     if bodiless {
-        respond
+        return respond
             .send_response(head, true)
-            .map_err(|e| stream_error(&e))?;
-        return Ok(());
+            .map_err(|e| stream_error(&e));
     }
     let mut send = respond
         .send_response(head, false)
         .map_err(|e| stream_error(&e))?;
-    let r = stream_body(&mut send, &mut body, out).await;
+    let r = tokio::select! {
+        biased;
+        () = fail.signal.cancelled() => Err(request_write_failure(fail)),
+        result = stream_body(&mut send, &mut res.body, out) => result,
+    };
     match &r {
         Err(WriteFailure::Stopped) => {
             tracing::debug!("h2 response stopped by policy; resetting the stream");
@@ -385,7 +459,7 @@ async fn write_response(
         // Nobody left to reset.
         Err(WriteFailure::ClientGone(_)) | Ok(()) => {}
     }
-    r
+    r.map(|()| send)
 }
 
 /// A failed stream operation: the client's doing (reset, connection gone)
@@ -396,6 +470,45 @@ fn stream_error(e: &h2::Error) -> WriteFailure {
     } else {
         WriteFailure::Io(e.to_string())
     }
+}
+
+fn request_write_failure(fail: &BodyFail) -> WriteFailure {
+    if fail.gone() {
+        WriteFailure::ClientGone("the HTTP/2 stream closed".to_owned())
+    } else {
+        fail.get().map_or_else(
+            || WriteFailure::Io("the HTTP/2 stream failed".to_owned()),
+            WriteFailure::Request,
+        )
+    }
+}
+
+fn poll_response_frame(
+    send: &mut SendStream<Bytes>,
+    body: &mut Body,
+    cx: &mut Context<'_>,
+) -> Poll<Result<Option<Frame<Bytes>>, WriteFailure>> {
+    if let Poll::Ready(reset) = send.poll_reset(cx) {
+        return Poll::Ready(Err(match reset {
+            Ok(reason) => WriteFailure::ClientGone(format!("HTTP/2 stream reset: {reason}")),
+            Err(error) => stream_error(&error),
+        }));
+    }
+    poll_frame(body, cx).map(|frame| {
+        frame.transpose().map_err(|error| match error {
+            BodyError::Stopped => WriteFailure::Stopped,
+            BodyError::Timeout => WriteFailure::UpstreamStalled,
+            error @ (BodyError::TooLarge { .. }
+            | BodyError::LengthMismatch
+            | BodyError::Incomplete
+            | BodyError::Closed
+            | BodyError::Abandoned
+            | BodyError::Invalid(_)
+            | BodyError::Upstream(_)
+            | BodyError::Undecodable(_)
+            | BodyError::BudgetExhausted) => WriteFailure::Io(error.to_string()),
+        })
+    })
 }
 
 fn poll_frame(
@@ -414,13 +527,13 @@ async fn stream_body(
     // capacity for it) never overlap, so each re-arms it with its own limit.
     let mut stall = std::pin::pin!(sleep(out.body_idle));
     loop {
-        let frame = match poll_fn(|cx| Poll::Ready(poll_frame(body, cx))).await {
-            Poll::Ready(frame) => frame,
+        let frame = match poll_fn(|cx| Poll::Ready(poll_response_frame(send, body, cx))).await {
+            Poll::Ready(frame) => frame?,
             Poll::Pending => {
                 stall.as_mut().reset(Instant::now() + out.body_idle);
                 poll_fn(|cx| {
-                    if let Poll::Ready(f) = poll_frame(body, cx) {
-                        return Poll::Ready(Ok(f));
+                    if let Poll::Ready(f) = poll_response_frame(send, body, cx) {
+                        return Poll::Ready(f);
                     }
                     stall
                         .as_mut()
@@ -430,16 +543,10 @@ async fn stream_body(
                 .await?
             }
         };
-        let frame = match frame {
-            None => {
-                send.send_data(Bytes::new(), true)
-                    .map_err(|e| stream_error(&e))?;
-                return Ok(());
-            }
-            Some(Err(BodyError::Stopped)) => return Err(WriteFailure::Stopped),
-            Some(Err(BodyError::Timeout)) => return Err(WriteFailure::UpstreamStalled),
-            Some(Err(e)) => return Err(WriteFailure::Io(e.to_string())),
-            Some(Ok(f)) => f,
+        let Some(frame) = frame else {
+            send.send_data(Bytes::new(), true)
+                .map_err(|e| stream_error(&e))?;
+            return Ok(());
         };
         match frame.into_data() {
             Ok(mut data) => {
@@ -493,11 +600,11 @@ async fn stream_body(
 }
 
 // ---------------------------------------------------------------------------
-// The h2 front end of the exchange core
+// The HTTP/2 client transport
 // ---------------------------------------------------------------------------
 
 /// The first client-side failure of a stream, recorded by the body
-/// adapters and the front so the exchange can stop waiting on the upstream
+/// adapters and the transport so the exchange can stop waiting on the upstream
 /// at once.
 #[derive(Default)]
 struct BodyFail {
@@ -543,13 +650,13 @@ impl BodyFail {
     }
 }
 
-struct H2Front {
+struct H2Transport {
     respond: SendResponse<Bytes>,
     fail: Arc<BodyFail>,
     expect_continue: bool,
 }
 
-impl H2Front {
+impl H2Transport {
     /// `100 Continue` once, when the client waits for it.
     fn continue_once(&mut self) -> Result<(), DriveError> {
         if !std::mem::take(&mut self.expect_continue) {
@@ -566,7 +673,7 @@ impl H2Front {
     }
 }
 
-impl BodyIo for H2Front {
+impl BodyIo for H2Transport {
     fn collect<'a>(
         &'a mut self,
         body: &'a mut Body,
@@ -585,7 +692,7 @@ impl BodyIo for H2Front {
     }
 }
 
-impl Front for H2Front {
+impl ClientTransport for H2Transport {
     async fn drive<F>(&mut self, fut: F) -> Result<F::Output, DriveError>
     where
         F: Future + Send,

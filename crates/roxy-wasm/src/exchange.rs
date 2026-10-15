@@ -7,15 +7,14 @@
 //! exchange status before every frame, and the driver always records a
 //! failure before it drops the store. A response body additionally holds
 //! its end until the guest's handler has returned, so a trap after the last
-//! byte still fails it. The request body passed to `next` that the guest
-//! leaves unfinished is always cut; it fails the exchange only if the guest
-//! is still waiting on `next`'s response (a guest that dropped the pending
-//! response, or already has the response, has abandoned the forwarded
-//! request and may answer itself; see [`ExchangeShared::cut_next`]).
+//! byte still fails it. A body the guest leaves unfinished is cut where it
+//! stopped. For a forwarded request or answer, this is the guest's own
+//! abort, not a layer fault. An unfinished endpoint request body does fail
+//! the exchange, because the endpoint call must carry a complete request.
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -23,19 +22,9 @@ use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame};
 use roxy_http::{Body, BodyError};
 use tokio::sync::watch;
-use tokio::task::AbortHandle;
 
 use crate::error::LayerError;
 use crate::host::LayerHost;
-
-/// Which way a body flows through the layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Dir {
-    /// Client → upstream.
-    Request,
-    /// Upstream → client.
-    Response,
-}
 
 #[derive(Debug, Clone, Default)]
 struct Status {
@@ -51,11 +40,17 @@ pub(crate) struct ExchangeShared {
     /// Told of the first failure as it is recorded.
     host: Arc<dyn LayerHost>,
     status: watch::Sender<Status>,
-    /// Odd while `next` runs below the layer, so the head clock is stopped;
+    /// Odd while `next` runs upstream of the layer, so the head clock is stopped;
     /// each return of `next` makes it even again.
-    below: watch::Sender<u64>,
-    /// Why the request body passed to `next` was cut, if it was.
-    next_cut: OnceLock<String>,
+    upstream: watch::Sender<u64>,
+    /// The guest has answered: its response head is out of its hands, and
+    /// the head clock has nothing left to time.
+    answered: watch::Sender<bool>,
+    /// Guest driver and its children, retained through future destruction.
+    pub(crate) tasks: tokio_util::task::TaskTracker,
+    /// Scope cancellation remains meaningful after the guest has settled:
+    /// a body-finish worker can still be waiting for its consumer.
+    pub(crate) cancelled: tokio_util::sync::CancellationToken,
 }
 
 impl std::fmt::Debug for ExchangeShared {
@@ -68,49 +63,56 @@ impl std::fmt::Debug for ExchangeShared {
 
 impl ExchangeShared {
     pub(crate) fn new(host: Arc<dyn LayerHost>) -> Arc<Self> {
+        let tasks = tokio_util::task::TaskTracker::new();
+        tasks.close();
         Arc::new(Self {
             host,
             status: watch::Sender::new(Status::default()),
-            below: watch::Sender::new(0),
-            next_cut: OnceLock::new(),
+            upstream: watch::Sender::new(0),
+            answered: watch::Sender::new(false),
+            tasks,
+            cancelled: tokio_util::sync::CancellationToken::new(),
         })
     }
 
     /// `next` started: the layer's time stops.
     pub(crate) fn next_started(&self) {
-        self.below.send_modify(|n| *n += 1);
+        self.upstream.send_modify(|n| *n += 1);
     }
 
     /// `next` returned its response head (or the guest abandoned it): the
     /// layer's time runs again, with a whole budget for the response head.
     pub(crate) fn next_returned(&self) {
-        self.below.send_modify(|n| *n += 1);
+        self.upstream.send_modify(|n| *n += 1);
     }
 
     /// Resolves once the layer has held a head for `limit` of its own time:
     /// the request head from the clock's start, less the `used` already
     /// spent on it (starting the instance), and the response head from the
-    /// moment `next` returns. The clock does not run while `next` is below
-    /// the layer. Drop it once the layer's response head is set.
+    /// moment `next` returns. The clock does not run while `next` is upstream
+    /// of the layer, and stops for good once the layer has answered.
     pub(crate) fn head_clock(
         &self,
         limit: Duration,
         used: Duration,
     ) -> impl Future<Output = ()> + Send + 'static {
-        let mut below = self.below.subscribe();
+        let mut upstream = self.upstream.subscribe();
+        let mut answered = self.answered.subscribe();
         async move {
             let mut left = limit.saturating_sub(used);
             loop {
                 // The sender lives as long as the exchange; gone, nothing
                 // is left to time.
-                if below.wait_for(|n| n % 2 == 0).await.is_err() {
+                if upstream.wait_for(|n| n % 2 == 0).await.is_err() {
                     return std::future::pending().await;
                 }
                 // Any change means `next` ran: it may have started and
                 // returned between two looks, so a change restarts the
-                // clock whether or not `next` is still below.
-                let changed = async { below.changed().await.is_ok() };
+                // clock whether or not `next` is still upstream.
+                let changed = async { upstream.changed().await.is_ok() };
+                let answered = async { answered.wait_for(|a| *a).await.is_ok() };
                 tokio::select! {
+                    _ = answered => return std::future::pending().await,
                     () = tokio::time::sleep(left) => return,
                     ok = changed => {
                         if !ok {
@@ -123,28 +125,13 @@ impl ExchangeShared {
         }
     }
 
-    /// The request body passed to `next` was cut. The forwarded body never
-    /// ends cleanly either way; whether the layer failed is decided when
-    /// `next` resolves ([`Self::check_next`]). A guest that dropped the
-    /// response future never sees it resolve: its task is aborted, so the
-    /// cut is an abandonment and the layer's own answer stands.
-    pub(crate) fn cut_next(&self, msg: String) {
-        let _ = self.next_cut.set(msg);
+    /// The guest answered.
+    pub(crate) fn answered(&self) {
+        self.answered.send_replace(true);
     }
 
-    /// Called as `next` resolves, before the guest can see its result.
-    /// A cut before this point happened while the guest was still waiting
-    /// on the response: the layer failed. A cut after it (the guest has the
-    /// response, or abandoned it) is not a failure.
-    pub(crate) fn check_next(&self) -> Result<(), LayerError> {
-        match self.next_cut.get() {
-            Some(msg) => {
-                let err = LayerError::InvalidRequest(msg.clone());
-                self.fail(err.clone());
-                Err(err)
-            }
-            None => Ok(()),
-        }
+    pub(crate) fn has_answered(&self) -> bool {
+        *self.answered.borrow()
     }
 
     /// Records a failure. The first one wins; failures after the exchange
@@ -177,11 +164,6 @@ impl ExchangeShared {
         self.status.borrow().failure.clone()
     }
 
-    pub(crate) fn is_settled(&self) -> bool {
-        let s = self.status.borrow();
-        s.done || s.failure.is_some()
-    }
-
     /// Resolves with the first failure.
     pub(crate) fn wait_failure(&self) -> impl Future<Output = LayerError> + Send + 'static {
         let mut rx = self.status.subscribe();
@@ -206,49 +188,6 @@ impl ExchangeShared {
             }
         }
     }
-
-    pub(crate) fn outcome(&self) -> LayerOutcome {
-        LayerOutcome(self.status.subscribe())
-    }
-}
-
-/// The outcome of an exchange, for logging after the response head has
-/// gone out. Found in the extensions of every [`crate::LayerResponse`] a
-/// layer returns.
-#[derive(Debug, Clone)]
-pub struct LayerOutcome(watch::Receiver<Status>);
-
-impl LayerOutcome {
-    /// Waits until the layer has finished the exchange. `Err` is the
-    /// failure that cut the response body.
-    pub async fn wait(mut self) -> Result<(), LayerError> {
-        match self.0.wait_for(|s| s.failure.is_some() || s.done).await {
-            Ok(s) => s.failure.clone().map_or(Ok(()), Err),
-            Err(_) => Err(LayerError::Cancelled),
-        }
-    }
-
-    /// The failure, if one has been recorded yet.
-    pub fn failure(&self) -> Option<LayerError> {
-        self.0.borrow().failure.clone()
-    }
-}
-
-/// Aborts the exchange driver when the caller abandons the exchange (both
-/// the `handle` future and the response body are gone) before it settled.
-#[derive(Debug)]
-pub(crate) struct CancelGuard {
-    pub(crate) abort: AbortHandle,
-    pub(crate) shared: Arc<ExchangeShared>,
-}
-
-impl Drop for CancelGuard {
-    fn drop(&mut self) {
-        if !self.shared.is_settled() {
-            self.shared.fail(LayerError::Cancelled);
-            self.abort.abort();
-        }
-    }
 }
 
 type Settled = Pin<Box<dyn Future<Output = Result<(), LayerError>> + Send>>;
@@ -258,69 +197,45 @@ type Settled = Pin<Box<dyn Future<Output = Result<(), LayerError>> + Send>>;
 pub(crate) struct FromGuest {
     inner: Body,
     shared: Arc<ExchangeShared>,
-    /// The exchange's own request or response; `None` for an endpoint
-    /// request. Decides how a broken stream is reported.
-    dir: Option<Dir>,
-    /// The request body passed to `next`: an inner error is a cut, settled
-    /// by [`ExchangeShared::check_next`], not a failure here.
-    next: bool,
+    /// An endpoint request body: an error in it fails the exchange. The
+    /// exchange's own bodies pass their errors on as the guest's own cut.
+    endpoint: bool,
     /// Hold the end of the body until the exchange settles.
     hold_end: bool,
     settled: Option<Settled>,
     settled_ok: bool,
     inner_done: bool,
     finished: bool,
-    _cancel: Option<Arc<CancelGuard>>,
 }
 
 impl FromGuest {
     /// The request body the guest passed to `next`.
     pub(crate) fn next_request(inner: Body, shared: Arc<ExchangeShared>) -> Body {
-        Self::build(inner, shared, Some(Dir::Request), true, false, None)
+        Self::build(inner, shared, false, false)
     }
 
     /// The request body the guest passed to an endpoint.
     pub(crate) fn endpoint_request(inner: Body, shared: Arc<ExchangeShared>) -> Body {
-        Self::build(inner, shared, None, false, false, None)
+        Self::build(inner, shared, true, false)
     }
 
     /// The response body the guest answered with.
-    pub(crate) fn response(
-        inner: Body,
-        shared: Arc<ExchangeShared>,
-        cancel: Arc<CancelGuard>,
-    ) -> Body {
-        Self::build(
-            inner,
-            shared,
-            Some(Dir::Response),
-            false,
-            true,
-            Some(cancel),
-        )
+    pub(crate) fn response(inner: Body, shared: Arc<ExchangeShared>) -> Body {
+        Self::build(inner, shared, false, true)
     }
 
-    fn build(
-        inner: Body,
-        shared: Arc<ExchangeShared>,
-        dir: Option<Dir>,
-        next: bool,
-        hold_end: bool,
-        cancel: Option<Arc<CancelGuard>>,
-    ) -> Body {
+    fn build(inner: Body, shared: Arc<ExchangeShared>, endpoint: bool, hold_end: bool) -> Body {
         let settled: Settled = Box::pin(shared.wait_settled());
         let known_length = inner.known_length();
         let body = FromGuest {
             inner,
             shared,
-            dir,
-            next,
+            endpoint,
             hold_end,
             settled: Some(settled),
             settled_ok: false,
             inner_done: false,
             finished: false,
-            _cancel: cancel,
         };
         Body::wrap_native(body, u64::MAX, known_length)
     }
@@ -357,16 +272,14 @@ impl HttpBody for FromGuest {
                     return Poll::Ready(None);
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    let msg = format!("body stream failed: {e}");
-                    if this.next {
-                        this.shared.cut_next(msg);
-                    } else {
-                        this.shared.fail(match this.dir {
-                            Some(Dir::Response) => LayerError::InvalidResponse(msg),
-                            _ => LayerError::InvalidRequest(msg),
-                        });
+                    if this.endpoint {
+                        this.shared.fail(LayerError::InvalidRequest(format!(
+                            "body stream failed: {e}"
+                        )));
+                        return this.fail_frame();
                     }
-                    return this.fail_frame();
+                    this.finished = true;
+                    return Poll::Ready(Some(Err(e)));
                 }
                 Poll::Ready(None) => {
                     // Re-check after the inner end: the failure may have
@@ -430,7 +343,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LayerHost for Deaf {
-        async fn next(&self, _: LayerRequest) -> Result<LayerResponse, HostError> {
+        async fn next(&self, _: LayerRequest) -> Result<Option<LayerResponse>, HostError> {
+            unreachable!()
+        }
+        fn respond(&self, _: LayerResponse) {
             unreachable!()
         }
         async fn endpoint_permit(&self) -> Result<EndpointPermit, EndpointError> {
@@ -489,10 +405,10 @@ mod tests {
         s.settle();
         s.fail(LayerError::Cancelled);
         assert_eq!(s.failure(), None);
-        assert_eq!(s.outcome().wait().await, Ok(()));
+        assert_eq!(s.wait_settled().await, Ok(()));
     }
 
-    /// Each head gets the whole limit: time below is not counted, and the
+    /// Each head gets the whole limit: time upstream is not counted, and the
     /// request-phase hold does not eat into the response-phase one.
     #[tokio::test(start_paused = true)]
     async fn the_head_clock_restarts_when_next_returns() {
@@ -509,7 +425,7 @@ mod tests {
         });
         clock.await;
         // 2s of instance start and 7s before `next` leave 1s of the first
-        // budget; 100s below (not counted); then the full 10s again.
+        // budget; 100s upstream (not counted); then the full 10s again.
         assert_eq!(start.elapsed().as_secs(), 117);
     }
 
@@ -539,5 +455,23 @@ mod tests {
         let start = Instant::now();
         clock.await;
         assert_eq!(start.elapsed().as_secs(), 8);
+    }
+
+    /// The clock stops for good once the layer has answered.
+    #[tokio::test(start_paused = true)]
+    async fn the_head_clock_stops_at_the_answer() {
+        let s = shared();
+        let clock = s.head_clock(Duration::from_secs(10), Duration::ZERO);
+        tokio::pin!(clock);
+        let s2 = s.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            s2.answered();
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_secs(60), clock)
+                .await
+                .is_err()
+        );
     }
 }

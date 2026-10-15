@@ -26,6 +26,129 @@ fn with(more: &str) -> KitBuilder {
     Kit::builder().rules(&format!("{WS_ALLOW}{more}"))
 }
 
+#[tokio::test]
+async fn disconnect_after_upgrade_cancels_a_holding_service() {
+    held_upgrade_ends(UpgradeEnd::Disconnect).await;
+}
+
+#[tokio::test]
+async fn a_cut_upgraded_answer_ends_the_exchange_without_claiming_client_loss() {
+    held_upgrade_ends(UpgradeEnd::Cut).await;
+}
+
+#[tokio::test]
+async fn an_upgraded_response_fault_reaches_final_attribution() {
+    held_upgrade_ends(UpgradeEnd::Fault).await;
+}
+
+#[derive(Clone, Copy)]
+enum UpgradeEnd {
+    Disconnect,
+    Cut,
+    Fault,
+}
+
+async fn held_upgrade_ends(end: UpgradeEnd) {
+    use crate::addons::service::testing;
+    use crate::addons::{AddonMode, CLIENT_GONE};
+
+    let kit = testing::kit(
+        WS_ALLOW,
+        vec![testing::addon("s", "scripted", AddonMode::Enforce, |_| {})],
+    )
+    .await;
+    let (mut client, reset) = kit.connect_resettable();
+    client.write_all(b"GET http://up.test/ws/echo HTTP/1.1\r\nHost: up.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+    let mut script = kit.upstream.service().script().await;
+    script.control("open").await;
+    let request = script.control("request").await;
+    script.send(request);
+    let response = script.control("response").await;
+    assert_eq!(response["status"], 101);
+    script.send(response);
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        head.push(client.read_u8().await.unwrap());
+    }
+    assert!(head.starts_with(b"HTTP/1.1 101"));
+    match end {
+        UpgradeEnd::Cut => script.send(serde_json::json!({"type":"response_end", "error":"cut"})),
+        UpgradeEnd::Fault => {
+            script.send(serde_json::json!({"type":"response", "status":101, "headers":[]}));
+        }
+        UpgradeEnd::Disconnect => {
+            reset.reset();
+            drop(client);
+        }
+    }
+    let message = tokio::time::timeout(Duration::from_secs(3), script.control("reset"))
+        .await
+        .expect("a disconnected upgraded client must cancel the service");
+    let expected = match end {
+        UpgradeEnd::Disconnect => {
+            assert_eq!(message["message"], CLIENT_GONE, "{message}");
+            "client_gone"
+        }
+        UpgradeEnd::Cut => {
+            assert_eq!(message["message"], crate::addons::ENDED, "{message}");
+            "answer_aborted"
+        }
+        UpgradeEnd::Fault => {
+            assert!(
+                message["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("second response head"),
+                "{message}"
+            );
+            "layer_error"
+        }
+    };
+    let event = kit.request_event().await;
+    assert_eq!(event["reason"], expected, "{event:#}");
+    if matches!(end, UpgradeEnd::Fault) {
+        assert_eq!(
+            kit.events("layer_error", 1).await[0]["kind"],
+            "service:protocol"
+        );
+    } else {
+        super::no_layer_error(&kit);
+    }
+}
+
+#[tokio::test]
+async fn failed_upgrade_write_publishes_client_loss_before_releasing_lanes() {
+    use crate::addons::service::testing;
+    use crate::addons::{AddonMode, CLIENT_GONE, Part};
+    use serde_json::json;
+
+    let kit = testing::kit(
+        WS_ALLOW,
+        vec![testing::subscribed(
+            testing::addon("s", "scripted", AddonMode::Enforce, |_| {}),
+            Part::Head,
+            Part::Full,
+        )],
+    )
+    .await;
+    let (mut client, reset) = kit.connect_resettable();
+    client.write_all(b"GET http://up.test/ws/echo HTTP/1.1\r\nHost: up.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+    let mut script = kit.upstream.service().script().await;
+    script.control("open").await;
+    let request = script.control("request").await;
+    script.body(0).await;
+    script.send(request);
+    script.send(json!({"type": "request_end"}));
+    let response = script.control("response").await;
+    assert_eq!(response["status"], 101);
+    // Keep the read pending, but make the impending handshake write fail.
+    reset.reset();
+    script.send(response);
+    let reset = script.control("reset").await;
+    assert_eq!(reset["message"], CLIENT_GONE, "{reset}");
+    kit.request_event().await;
+}
+
 /// Opens `/ws/echo` against the framed echo, offering `extensions` if
 /// given.
 async fn open(kit: &Kit, extensions: Option<&str>) -> Ws {
@@ -43,6 +166,85 @@ async fn echo(ws: &mut Ws, m: Message) -> Message {
         .expect("no echo")
         .unwrap()
         .unwrap()
+}
+
+/// Faithful addons preserve a TLS WebSocket through its close handshake.
+#[tokio::test]
+async fn wss_survives_pass_through_wasm_service_and_mixed_stacks() {
+    use crate::addons::AddonMode;
+    use crate::addons::service::testing;
+
+    for inspect_messages in [false, true] {
+        let rules = if inspect_messages {
+            format!("{WS_ALLOW}\n- id: message-limit\n  when: ws.size > 1mb\n  then: deny\n")
+        } else {
+            WS_ALLOW.to_owned()
+        };
+        for (wasm, service) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut addons = Vec::new();
+            if wasm {
+                addons.push(AddonDef::test_layer("a").spec().await);
+            }
+            if service {
+                addons.push(testing::addon("s", "pass", AddonMode::Enforce, |_| {}));
+            }
+            if wasm {
+                addons.push(AddonDef::test_layer("b").spec().await);
+            }
+            let names: Vec<_> = addons.iter().map(|a| a.name.clone()).collect();
+            let kit = testing::kit(&rules, addons).await;
+            // The outer CONNECT and TLS handshake precede the upgrade
+            // that the addons forward. The origin connection uses TLS too.
+            let client = kit.tunnel("up.test", false).await;
+            let (status, io) = kit
+                .websocket_over(client, "/ws/echo", &[("x-echo", "frames")])
+                .await;
+            assert_eq!(status, 101);
+            let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                io.unwrap(),
+                tokio_tungstenite::tungstenite::protocol::Role::Client,
+                None,
+            )
+            .await;
+            assert_eq!(
+                echo(&mut ws, Message::text("hello over TLS")).await,
+                Message::text("hello over TLS")
+            );
+            let binary = Message::binary(vec![0, 1, 127, 128, 255]);
+            assert_eq!(echo(&mut ws, binary.clone()).await, binary);
+            assert_eq!(
+                echo(&mut ws, Message::Ping(vec![1, 2].into())).await,
+                Message::Pong(vec![1, 2].into())
+            );
+            ws.close(None).await.unwrap();
+            let close = tokio::time::timeout(Duration::from_secs(2), ws.next())
+                .await
+                .expect("the close handshake finishes")
+                .expect("a close frame, not bare EOF")
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "close with wasm={wasm}, service={service}, inspect={inspect_messages}: {e}"
+                    )
+                });
+            assert_eq!(close, Message::Close(None));
+            drop(ws);
+            kit.upstream.wait_ws_closed(1).await;
+            let event = kit.request_event().await;
+            assert_eq!(event["res"]["status"], 101, "{event:#}");
+            assert_eq!(event["decision"], "allow", "{event:#}");
+            assert_eq!(event["tls"]["alpn"], "http/1.1", "{event:#}");
+            assert_eq!(event["req"]["port"], 443, "{event:#}");
+            assert_eq!(super::strs(&event["addons"]), names, "{event:#}");
+            let seen = kit.upstream.wait_seen(1).await;
+            assert_eq!(seen[0].addr.port(), 443);
+            assert_eq!(seen[0].version, http::Version::HTTP_11);
+            assert_eq!(
+                kit.upstream.ws_received(),
+                [b"hello over TLS".to_vec(), vec![0, 1, 127, 128, 255]]
+            );
+            super::no_layer_error(&kit);
+        }
+    }
 }
 
 /// Reads until the close frame roxy sends; returns its code. Data

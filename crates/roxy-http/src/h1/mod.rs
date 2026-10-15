@@ -24,8 +24,8 @@
 //!
 //! Invariants:
 //! - Backpressure: at most [`crate::model::CHANNEL_DEPTH`] chunks of at most
-//!   one read buffer each are queued; the socket is not read while the queue
-//!   is full.
+//!   one read buffer each are queued. During reclamation, bounded read-ahead
+//!   also watches for client loss while that queue is full.
 //! - Any timeout, cap overflow, framing violation or EOF mid-body ends the
 //!   body stream with an error (never a clean end), and the connection is
 //!   unusable afterwards.
@@ -230,8 +230,8 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
     /// Drives the request body to completion (or until the drain limit).
     /// Cancel-safe.
     async fn pump(&mut self) -> Result<(), ParseError> {
-        let r = self.pump_inner().await;
-        r.map_err(|e| self.fail(e))
+        let r = self.pump_inner(false).await;
+        r.map(|_| ()).map_err(|e| self.fail(e))
     }
 
     /// Watches the idle socket so a client that closes while its response
@@ -268,15 +268,30 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
         Ok(!matches!(self.rd.read_buf(&mut self.buf).await, Ok(n) if n > 0))
     }
 
-    async fn pump_inner(&mut self) -> Result<(), ParseError> {
+    /// `true` if a reclamation watch observed client loss before the
+    /// request consumer made room. Pending frames stay in the connection
+    /// when this future is cancelled, as do all bytes read ahead.
+    async fn pump_inner(&mut self, reclaiming: bool) -> Result<bool, ParseError> {
         let idle = self.limits.body_idle_timeout;
         loop {
             let Some(feed) = self.feed.as_mut() else {
-                return Ok(());
+                return Ok(false);
             };
             if feed.pending.is_some() {
                 if let Some(tx) = feed.sender.as_mut() {
-                    match timeout(idle, tx.ready()).await {
+                    let ready = timeout(idle, tx.ready());
+                    let result = if reclaiming {
+                        tokio::select! {
+                            biased;
+                            result = ready => result,
+                            lost = watch_reclamation_input(&mut self.rd, &mut self.buf, &self.limits) => {
+                                return lost.map(|()| true);
+                            }
+                        }
+                    } else {
+                        ready.await
+                    };
+                    match result {
                         Err(_) => {
                             return Err(ParseError::new(
                                 Reason::BodyTimeout,
@@ -311,7 +326,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
                             let _ = tx.try_finish();
                         }
                         self.feed = None;
-                        return Ok(());
+                        return Ok(false);
                     }
                     (None, Pending::Data(b)) => {
                         feed.drained = feed.drained.saturating_add(len_u64(b.len()));
@@ -319,13 +334,13 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
                             tracing::debug!("drain limit reached; connection will close");
                             self.feed = None;
                             self.abandoned = true;
-                            return Ok(());
+                            return Ok(false);
                         }
                     }
                     (None, Pending::Trailers(_)) => {}
                     (None, Pending::Finish) => {
                         self.feed = None;
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
                 continue;
@@ -353,9 +368,51 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ReadSide<IO> {
     }
 }
 
+/// Watch the socket while retaining bytes that still belong to the
+/// current upload or a pipelined request. A full buffer must not hide
+/// client loss for the much longer body-idle timeout.
+async fn watch_reclamation_input<R: AsyncRead + Unpin>(
+    rd: &mut R,
+    buffered: &mut BytesMut,
+    limits: &Limits,
+) -> Result<(), ParseError> {
+    loop {
+        if buffered.len() >= limits.max_header_bytes {
+            let until = deadline(limits.header_timeout);
+            if buffered.len() == limits.max_header_bytes {
+                let mut probe = [0];
+                match timeout_at(until, rd.read(&mut probe)).await {
+                    Ok(Ok(0) | Err(_)) => return Ok(()),
+                    Ok(Ok(_)) => buffered.extend_from_slice(&probe),
+                    Err(_) => {}
+                }
+            }
+            tokio::time::sleep_until(until).await;
+            return Err(ParseError::new(
+                Reason::HeaderTimeout,
+                "read-ahead buffer stayed full during exchange reclamation",
+            ));
+        }
+        let mut buf = vec![0; READ_CHUNK];
+        let room = limits
+            .max_header_bytes
+            .saturating_sub(buffered.len())
+            .min(buf.len());
+        match rd.read(&mut buf[..room]).await {
+            Ok(0) | Err(_) => return Ok(()),
+            Ok(n) => buffered.extend_from_slice(&buf[..n]),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Idle,
+    /// The answer is on the wire; the exchange owner is disposing of
+    /// remaining bodies and work before connection reuse or shutdown.
+    Reclaiming {
+        close: bool,
+    },
     AwaitingResponse,
     AwaitingConnect,
     Closed,
@@ -514,7 +571,7 @@ struct WriteOpts<'a> {
 async fn write_message<W: AsyncWrite + Unpin>(
     w: &mut W,
     head: BytesMut,
-    body: Body,
+    body: &mut Body,
     opts: &WriteOpts<'_>,
     client_closed: &AtomicBool,
 ) -> Result<(), WriteError> {
@@ -537,7 +594,7 @@ async fn write_message<W: AsyncWrite + Unpin>(
 
 async fn write_body<W: AsyncWrite + Unpin>(
     w: &mut W,
-    mut body: Body,
+    body: &mut Body,
     opts: &WriteOpts<'_>,
     client_closed: &AtomicBool,
 ) -> Result<(), WriteError> {
@@ -558,7 +615,7 @@ async fn write_body<W: AsyncWrite + Unpin>(
     // One timer for the whole body, re-armed each time a frame is waited on.
     let mut stall = std::pin::pin!(tokio::time::sleep(body_idle));
     loop {
-        let ready = poll_fn(|cx| Poll::Ready(poll_body_once(&mut body, client_closed, cx))).await;
+        let ready = poll_fn(|cx| Poll::Ready(poll_body_once(body, client_closed, cx))).await;
         let frame = match ready {
             Poll::Ready(r) => r?,
             Poll::Pending => {
@@ -566,7 +623,7 @@ async fn write_body<W: AsyncWrite + Unpin>(
                 flush_timed(w, idle).await?;
                 stall.as_mut().reset(deadline(body_idle));
                 poll_fn(|cx| {
-                    if let Poll::Ready(r) = poll_body_once(&mut body, client_closed, cx) {
+                    if let Poll::Ready(r) = poll_body_once(body, client_closed, cx) {
                         return Poll::Ready(r);
                     }
                     stall
@@ -774,7 +831,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         match self.state {
             State::Closed => return Ok(None),
             State::Idle => {}
-            State::AwaitingResponse | State::AwaitingConnect | State::Broken => {
+            State::AwaitingResponse
+            | State::AwaitingConnect
+            | State::Reclaiming { .. }
+            | State::Broken => {
                 return Err(ParseError::new(
                     Reason::InvalidState,
                     "next_request called before the previous exchange finished",
@@ -940,6 +1000,28 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         }
     }
 
+    /// Observe client loss while the current exchange reclaims its work.
+    /// Upload and pipelined bytes remain buffered for their consumers. Further reads
+    /// stop at the request-head limit plus one byte to probe for EOF;
+    /// any bytes already read ahead by the codec remain buffered too.
+    /// A full buffer bounds reclamation by `header_timeout`: backpressure
+    /// must not disable cancellation indefinitely, even behind queued data.
+    pub async fn client_lost(&mut self) -> Result<(), ParseError> {
+        let result = self.watch_reclamation().await;
+        self.state = State::Broken;
+        result
+    }
+
+    async fn watch_reclamation(&mut self) -> Result<(), ParseError> {
+        match self.r.pump_inner(true).await {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                watch_reclamation_input(&mut self.r.rd, &mut self.r.buf, &self.limits).await
+            }
+            Err(error) => Err(self.r.fail(error)),
+        }
+    }
+
     fn out_framing(res: &CanonicalResponse, ex: &Exchange) -> OutFraming {
         if status_forbids_body(res.status) {
             OutFraming::Empty
@@ -974,7 +1056,21 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
     /// 1xx responses are not accepted here (see
     /// [`ServerConn::send_100_continue`] and [`ServerConn::respond_upgrade`]),
     /// nor 2xx responses to CONNECT (see [`ServerConn::accept_connect`]).
-    pub async fn respond(&mut self, res: CanonicalResponse) -> Result<(), WriteError> {
+    pub async fn respond(&mut self, mut res: CanonicalResponse) -> Result<(), WriteError> {
+        self.respond_borrowed(&mut res).await?;
+        drop(res);
+        self.finish_response().await.map_err(WriteError::Request)
+    }
+
+    /// Write a response while leaving body disposal to the exchange owner.
+    /// On a failure it can record the cause before releasing the body; on
+    /// HEAD or a bodiless status it can consume the unwritten remainder
+    /// concurrently with `client_lost`, which continues pumping the upload.
+    /// Call `finish_response` after reclamation, before reusing the connection.
+    pub async fn respond_borrowed(
+        &mut self,
+        res: &mut CanonicalResponse,
+    ) -> Result<(), WriteError> {
         if !matches!(self.state, State::AwaitingResponse | State::AwaitingConnect) {
             return Err(WriteError::State("no request awaiting a response"));
         }
@@ -1013,7 +1109,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
             self.r.feed = None;
             self.r.abandoned = true;
         }
-        let framing = Self::out_framing(&res, &ex);
+        let framing = Self::out_framing(res, &ex);
         let close =
             ex.close || res.meta.close || self.r.abandoned || framing == OutFraming::CloseDelimited;
         let head = response_head(res.status, &res.headers, &[], framing, close, None);
@@ -1027,22 +1123,15 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
 
         let client_closed = AtomicBool::new(false);
         let result = {
-            let write = write_message(&mut self.w, head, res.body, &opts, &client_closed);
+            let write = write_message(&mut self.w, head, &mut res.body, &opts, &client_closed);
             let mut write = std::pin::pin!(write);
-            let mut write_done = false;
             let mut watch_done = false;
             loop {
-                if write_done && self.r.feed.is_none() {
-                    break Ok(());
-                }
                 tokio::select! {
-                    r = &mut write, if !write_done => {
-                        if let Err(e) = r { break Err(e); }
-                        write_done = true;
-                    }
+                    r = &mut write => break r,
                     // `write` is polled again on the next pass, so a body
                     // that is waiting for its next frame fails at once.
-                    r = self.r.pump_then_watch(!write_done), if !watch_done => {
+                    r = self.r.pump_then_watch(true), if !watch_done => {
                         match r {
                             Err(e) => break Err(WriteError::Request(e)),
                             Ok(closed) => client_closed.store(closed, Ordering::Relaxed),
@@ -1055,6 +1144,21 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         if let Err(e) = result {
             self.state = State::Broken;
             return Err(e);
+        }
+        self.state = State::Reclaiming { close };
+        Ok(())
+    }
+
+    /// Finish the request feed and apply the connection's close decision
+    /// after the exchange owner has released its bodies. Wire completion
+    /// alone cannot make the connection reusable.
+    pub async fn finish_response(&mut self) -> Result<(), ParseError> {
+        let State::Reclaiming { close } = self.state else {
+            return Ok(());
+        };
+        if let Err(error) = self.r.pump().await {
+            self.state = State::Broken;
+            return Err(error);
         }
         if close || self.r.abandoned {
             self.shutdown().await;
@@ -1143,7 +1247,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin + Send + 'static> ServerConn<IO> {
         let r = write_message(
             &mut self.w,
             head,
-            Body::from_bytes(body),
+            &mut Body::from_bytes(body),
             &opts,
             &AtomicBool::new(false),
         )

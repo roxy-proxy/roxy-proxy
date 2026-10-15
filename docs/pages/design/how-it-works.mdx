@@ -35,10 +35,12 @@ stream.
 
 Logic that needs to understand the traffic goes in an addon: an external
 service that the traffic streams through, or a WASM component that runs
-in process. An addon owns both streams of the exchanges it chooses and can
-rewrite, withhold, answer or block. The stack runs outermost first, the
-last addon's `next` runs the rest of the core on what it passed on, and
-the rules judge that as if the client had sent it
+in process. An addon owns both lanes of the exchanges it chooses and can
+rewrite, withhold, answer or block. Requests pass through addons in their
+configured order, then reach the core stage. The core validates the final
+request, evaluates the rules, applies destination restrictions and owns
+the upstream connection. The rules judge the forwarded request as if the
+client had sent it
 ([addon model](/design/addon-model),
 [addon configuration](/reference/addon-configuration)).
 
@@ -75,7 +77,7 @@ The request steps run in a fixed order: a bounded body buffer only when a
 rule reads `body.text`, then the admission decision and its effects. The only
 verdict that leads to the upstream is `Continue`; every error maps to a
 deny or a close. The steps are not an extension point: extensions are
-addons, above them.
+addons, downstream of them.
 
 ## Connect
 

@@ -4,12 +4,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use roxy_wasm::{
-    EndpointError, EndpointPermit, FlowInfo, HostError, LayerError, LayerHost, LayerRequest,
-    LayerResponse, LogLevel, Principal, TagError, async_trait,
+    EndpointError, EndpointPermit, FlowInfo, GuestBody, HostError, LayerError, LayerHost,
+    LayerRequest, LayerResponse, LogLevel, Principal, TagError, async_trait,
 };
 
-use super::{AddonMode, AddonSpec, StackFlow, endpoint};
+use std::sync::Mutex;
+
+use roxy_http::Body;
+
+use super::chain::{Head, Headless, LaneTx};
+use super::{AddonMode, AddonSpec, Part, StackFlow, endpoint, lock, subscribe};
 use crate::flowlog::{FlowEvent, sink_ready};
+use crate::in_flight::Dir;
 use crate::view::ProxyView;
 
 /// Longest key and value a layer may write to the state store. The store
@@ -49,6 +55,37 @@ pub(crate) struct StackHost {
     /// record of it (`call`) so the two can be matched. A WASM layer's
     /// imports have none.
     pub(crate) call: Option<u64>,
+    /// Where an enforcing WASM layer's answer goes, until it answers.
+    /// Shared with the layer's stage, which keeps the lane if the layer
+    /// never answers: the lane's end is then the stage's to decide, after
+    /// the layer's own failure is recorded.
+    pub(crate) answer: Arc<Mutex<Option<LaneTx>>>,
+    /// The bodies a head-only layer does not see, to go on with the heads
+    /// it passes on: the request body, and the response body from upstream
+    /// with its status.
+    pub(crate) held_request: Mutex<Option<Body>>,
+    pub(crate) held_response: Mutex<Option<(http::StatusCode, Body)>>,
+}
+
+impl StackHost {
+    /// A host for a layer that answers nowhere: an observer, or a service
+    /// stream's host calls.
+    pub(crate) fn silent(
+        st: Arc<StackFlow>,
+        index: usize,
+        observer: Option<super::tee::ObserverNext>,
+        call: Option<u64>,
+    ) -> Self {
+        Self {
+            st,
+            index,
+            observer,
+            call,
+            answer: Arc::default(),
+            held_request: Mutex::new(None),
+            held_response: Mutex::new(None),
+        }
+    }
 }
 
 impl StackHost {
@@ -65,16 +102,79 @@ impl StackHost {
 
 #[async_trait]
 impl LayerHost for StackHost {
-    async fn next(&self, req: LayerRequest) -> Result<LayerResponse, HostError> {
+    fn spawn_driver(
+        &self,
+        driver: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+    ) -> tokio::task::JoinHandle<()> {
+        if self.observing() {
+            tokio::spawn(driver)
+        } else {
+            self.st.chain().spawn(driver)
+        }
+    }
+
+    async fn next(&self, req: LayerRequest) -> Result<Option<LayerResponse>, HostError> {
         if self.observing() {
             // An observer's request goes nowhere; it gets the real response.
             drop(req);
             return match &self.observer {
-                Some(obs) => obs.response().await,
+                Some(obs) => obs.response().await.map(Some),
                 None => Err(HostError::new("an observing service has no `next`")),
             };
         }
-        super::below(self.st.clone(), self.index, req).await
+        let subscribe = self.addon().subscribe;
+        // A head-only layer passes the head on; the body it did not see
+        // goes on with it, retaining its validation and clean-end check.
+        let held = lock(&self.held_request).take();
+        let req = match held {
+            Some(held) => {
+                let mut req = req;
+                req.extensions_mut().remove::<GuestBody>();
+                req.map(|own| subscribe::splice(&self.st, self.index, Dir::Request, own, held))
+            }
+            None => req,
+        };
+        let own = req.extensions().get::<GuestBody>().is_some();
+        match super::layer::forward_lanes(&self.st, self.index, Ok(req), own).await {
+            Ok(mut res) => {
+                if subscribe.response == Part::Head {
+                    let body = std::mem::take(res.body_mut());
+                    subscribe::head_only(res.headers_mut());
+                    *lock(&self.held_response) = Some((res.status(), body));
+                }
+                Ok(Some(res))
+            }
+            // Nothing came back: the forward was cut, or nothing answered.
+            Err(Headless::Ended | Headless::Cut(_)) => Ok(None),
+        }
+    }
+
+    fn respond(&self, res: LayerResponse) {
+        let Some(answer) = lock(&self.answer).take() else {
+            // An observer's answer goes nowhere; read to its end so the
+            // layer's own failures surface.
+            tokio::spawn(super::tee::discard(res.into_body()));
+            return;
+        };
+        // A head-only layer passing the response from upstream on (the
+        // same status) gets its body back; any other status is an answer
+        // of the layer's own, whole.
+        let held = lock(&self.held_response).take();
+        let res = match held {
+            Some((status, body)) if status == res.status() => {
+                let mut res = res;
+                res.extensions_mut().remove::<GuestBody>();
+                res.map(|own| subscribe::splice(&self.st, self.index, Dir::Response, own, body))
+            }
+            _ => res,
+        };
+        let own = res.extensions().get::<GuestBody>().is_some();
+        let (parts, body) = res.into_parts();
+        if own {
+            answer.produced(Head::Response(parts), body);
+        } else {
+            answer.whole(Head::Response(parts), body);
+        }
     }
 
     async fn endpoint_permit(&self) -> Result<EndpointPermit, EndpointError> {
@@ -110,7 +210,7 @@ impl LayerHost for StackHost {
 
     fn add_tag(&self, tag: String) -> Result<(), TagError> {
         if self.observing() {
-            // A tag steers the `when` of every layer below, so it is an
+            // A tag steers the `when` of every layer upstream, so it is an
             // effect on traffic, which an observer must not have.
             let layer = &self.addon().name;
             let flow = self.st.flow.to_string();

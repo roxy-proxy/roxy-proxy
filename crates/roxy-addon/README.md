@@ -3,10 +3,10 @@
 Write [roxy](https://github.com/roxy-proxy/roxy-proxy) addon layers in Rust.
 
 roxy is a TLS-inspecting HTTP firewall for AI agents. An addon is a
-WebAssembly component that sits in each exchange's layer stack above
-roxy's rules. It gets the request with a streaming body, may pass a request
-down once, and returns a response, whose body also streams. Whatever it
-passes down is still judged by the rules, and any failure (a panic, an
+WebAssembly component that sits in each exchange's layer stack downstream of
+roxy's rules. It gets the request with a streaming body, may forward a request
+upstream once, and returns a response, whose body also streams. Whatever it
+forwards is still judged by the rules, and any failure (a panic, an
 exceeded budget) denies the flow.
 
 ```rust
@@ -77,9 +77,10 @@ addons:
 On other targets the crate builds too (imports panic if called), so the
 logic of a layer can be unit-tested natively.
 
-`roxy-addon` 0.2 targets `roxy:addon@0.2.1`. A component built against an
-earlier 0.2.x still loads; one built with 0.1 does not (its imports
-differ); rebuild it against 0.2, which keeps the API below.
+`roxy-addon` targets the `roxy:addon@0.3.0` WIT package.
+Build components against the `wit/` shipped with the
+roxy version that runs them. Older versioned components may have different
+imports and must be rebuilt against the current SDK.
 
 ## What a layer can do
 

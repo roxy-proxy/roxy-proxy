@@ -1,4 +1,4 @@
-//! An in-test `roxy.layer.v5` service behind the scripted upstream: a
+//! An in-test `roxy.layer.v6` service behind the scripted upstream: a
 //! WebSocket handshake carrying the subprotocol is served here, on any
 //! port. The connection's behaviour is picked by the handshake's path:
 //!
@@ -19,6 +19,13 @@
 //! * `/svc/abort`: resets each stream on its request head;
 //! * `/svc/patient`: a pass-through that holds the request head and body
 //!   until the `request_end`, then forwards them together;
+//! * `/svc/no-content`: answers each request head with a `204` and no body,
+//!   forwarding nothing;
+//! * `/svc/early`: forwards the request as `/svc/pass` does, and answers
+//!   the client (`200`, body `early`) as soon as it has the request head,
+//!   reading the response from upstream without passing it on;
+//! * `/svc/cut-forward`: forwards each request head, then ends the
+//!   forwarded request with an error, and passes the response on;
 //! * `/svc/shout`: a pass-through that uppercases ASCII letters in the
 //!   response body bytes;
 //! * `/svc/sever`: a pass-through that resets the stream on the first
@@ -33,7 +40,15 @@
 //!   reads and credits everything without answering;
 //! * `/svc/slow`: a pass-through that reads nothing more for [`SLOW`]
 //!   after each `request` head it gets, so it answers [`SLOW`] late;
-//! * `/svc/stall`: completes the handshake and never reads.
+//! * `/svc/stall`: completes the handshake and never reads;
+//! * `/svc/host`: calls every host service as each stream opens, then
+//!   passes through once all are answered;
+//! * `/svc/quarantine`: calls `quarantine` as each stream opens, then
+//!   passes through once it is answered;
+//! * `/svc/late-quarantine`: passes the request through, calls
+//!   `quarantine` on the response head and passes it on once answered;
+//! * `/svc/audit`: a pass-through that calls `record` on roxy's
+//!   `response_end` and sends its own only once the record is answered.
 //!
 //! Every other connection credits roxy back for the bytes it receives.
 
@@ -52,6 +67,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::Role;
 
 use crate::addons::service::SUBPROTOCOL;
+
+mod scripted;
+pub(crate) use scripted::Script;
 
 /// Each body's starting credit, each way.
 const WINDOW: u64 = 256 * 1024;
@@ -92,6 +110,7 @@ pub(crate) const SLOW: std::time::Duration = std::time::Duration::from_millis(50
 /// What the service saw, across connections.
 #[derive(Default)]
 pub(crate) struct ServiceLog {
+    scripts: Mutex<VecDeque<Script>>,
     opens: Mutex<Vec<Value>>,
     resets: Mutex<Vec<(u32, String)>>,
     /// Resets for a stream that had not been opened.
@@ -238,6 +257,8 @@ struct Lane {
     queue: VecDeque<Queued>,
     /// Nothing is sent from the queue while set.
     held: bool,
+    /// roxy reads no more of this lane: nothing more is sent on it.
+    stopped: bool,
 }
 
 impl Lane {
@@ -246,6 +267,7 @@ impl Lane {
             credit: WINDOW,
             queue: VecDeque::new(),
             held: false,
+            stopped: false,
         }
     }
 }
@@ -267,16 +289,21 @@ impl Sess {
 }
 
 /// The direction a control message belongs to, for a pass-through.
-fn lane_of(kind: &str) -> Option<u8> {
+fn lane_of(kind: &str, v: &Value) -> Option<u8> {
     match kind {
         "request" | "request_end" => Some(REQUEST),
         "response" | "response_end" => Some(RESPONSE),
+        "trailers" => v["dir"].as_str().and_then(dir_of),
         _ => None,
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
+    AnswerOpen,
+    // Cut the forward and withhold its result to exercise the answer timeout.
+    CutWait,
+    TrailersCut,
     Pass,
     Hold,
     Hoard,
@@ -292,6 +319,25 @@ enum Mode {
     Refuse,
     Abort,
     Patient,
+    /// Answers the client (`200`, body `early`) as soon as roxy's request
+    /// head arrives, then forwards the request as it comes and ends its
+    /// answer once the response head from upstream has arrived, without
+    /// passing it on: an answer that leaves the forward to run to its end.
+    Early,
+    /// Answers each request head with a `204` and nothing else: no body,
+    /// no forward.
+    NoContent,
+    /// As `early`, with a `204` whose `response_end` waits for the end of
+    /// the response from upstream: a bodiless answer on the client transport,
+    /// its lane still open while the forward runs to its end.
+    EarlyNoContent,
+    EarlyEmpty,
+    StopResponse,
+    ForwardOnOpen,
+    /// Forwards the request head, then ends the forwarded request lane
+    /// with an error, and passes the response from upstream on: a service
+    /// that cuts its own forward.
+    CutForward,
     /// Calls every host service on `open` (call ids 1 to 6), then passes
     /// through once every call is answered, as a service whose writes
     /// must be visible to the exchange does.
@@ -314,7 +360,13 @@ pub(crate) const HOST_STATE_VALUE: &str = "from-service";
 
 impl Mode {
     fn of(path: &str) -> Self {
-        if path.ends_with("/pass") {
+        if path.ends_with("/answer-open") {
+            Self::AnswerOpen
+        } else if path.ends_with("/cut-wait") {
+            Self::CutWait
+        } else if path.ends_with("/trailers-cut") {
+            Self::TrailersCut
+        } else if path.ends_with("/pass") {
             Self::Pass
         } else if path.ends_with("/host") {
             Self::Host
@@ -344,6 +396,20 @@ impl Mode {
             Self::Abort
         } else if path.ends_with("/patient") {
             Self::Patient
+        } else if path.ends_with("/early") {
+            Self::Early
+        } else if path.ends_with("/no-content") {
+            Self::NoContent
+        } else if path.ends_with("/early-empty") {
+            Self::EarlyEmpty
+        } else if path.ends_with("/stop-response") {
+            Self::StopResponse
+        } else if path.ends_with("/forward-on-open") {
+            Self::ForwardOnOpen
+        } else if path.ends_with("/early-no-content") {
+            Self::EarlyNoContent
+        } else if path.ends_with("/cut-forward") {
+            Self::CutForward
         } else if path.ends_with("/quarantine") {
             Self::Quarantine
         } else if path.ends_with("/late-quarantine") {
@@ -394,14 +460,24 @@ impl Conn {
             | Mode::Quarantine
             | Mode::LateQuarantine
             | Mode::Audit => true,
-            Mode::Hold | Mode::Forward => dir == REQUEST,
+            Mode::Hold
+            | Mode::Forward
+            | Mode::Early
+            | Mode::EarlyNoContent
+            | Mode::EarlyEmpty
+            | Mode::StopResponse => dir == REQUEST,
+            Mode::ForwardOnOpen | Mode::CutForward => dir == RESPONSE,
             Mode::Overlong
             | Mode::Short
             | Mode::Refuse
+            | Mode::NoContent
             | Mode::Abort
             | Mode::Talk
             | Mode::Flood
-            | Mode::Pause => false,
+            | Mode::Pause
+            | Mode::AnswerOpen
+            | Mode::CutWait
+            | Mode::TrailersCut => false,
         }
     }
 
@@ -411,6 +487,117 @@ impl Conn {
         self.mode == Mode::Hold || self.passes(dir)
     }
 
+    fn cut_after_trailers(&self, id: u32) {
+        self.send(text(id, json!({"type": "request_end"})));
+        self.send(text(
+            id,
+            json!({"type": "response", "status": 200, "headers": []}),
+        ));
+        self.send(binary(id, RESPONSE, b"partial"));
+        self.send(text(
+            id,
+            json!({"type": "trailers", "dir": "response", "headers": [["x-check", "trailer"]]}),
+        ));
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let _ = tx.send(text(
+                id,
+                json!({"type": "response_end", "error": "incomplete"}),
+            ));
+        });
+    }
+
+    fn cut_forward(&self, id: u32, mut v: Value) {
+        v.as_object_mut().map(|o| o.remove("stream"));
+        self.send(text(id, v));
+        let end = text(
+            id,
+            json!({"type": "request_end", "error": "cut by the service"}),
+        );
+        if self.mode == Mode::CutWait {
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                let _ = tx.send(end);
+            });
+        } else {
+            self.send(end);
+        }
+    }
+
+    fn answer_empty_while_forwarding(&mut self, id: u32, v: Value) {
+        self.pass_control(id, "request", v);
+        let status = if self.mode == Mode::EarlyEmpty {
+            200
+        } else {
+            204
+        };
+        self.send(text(
+            id,
+            json!({"type": "response", "status": status, "headers": [["content-length", "0"]]}),
+        ));
+        if self.mode == Mode::StopResponse {
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let _ = tx.send(text(id, json!({"type": "stop", "dir": "response"})));
+            });
+        }
+    }
+
+    fn cut_declared_or_trailers(&mut self, id: u32, v: &Value) {
+        if v["url"]
+            .as_str()
+            .is_some_and(|u| u.ends_with("/declared-request-cut"))
+        {
+            self.send(text(
+                id,
+                json!({"type": "request", "method": "POST", "url": "http://up.test/x",
+                "headers": [["content-length", "7"]]}),
+            ));
+            self.send(binary(id, REQUEST, b"partial"));
+            self.send(text(
+                id,
+                json!({"type": "response", "status": 204, "headers": []}),
+            ));
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let _ = tx.send(text(
+                    id,
+                    json!({"type": "request_end", "error": "incomplete"}),
+                ));
+                let _ = tx.send(text(id, json!({"type": "response_end"})));
+            });
+        } else if v["url"]
+            .as_str()
+            .is_some_and(|u| u.ends_with("/declared-cut") || u.ends_with("/declared-empty-cut"))
+        {
+            let empty = v["url"].as_str().unwrap().ends_with("/declared-empty-cut");
+            let length = if empty { "0" } else { "7" };
+            self.send(text(id, json!({"type": "request_end"})));
+            self.send(text(
+                id,
+                json!({"type": "response", "status": 200,
+                "headers": [["content-length", length]]}),
+            ));
+            if !empty {
+                self.send(binary(id, RESPONSE, b"partial"));
+            }
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let _ = tx.send(text(
+                    id,
+                    json!({"type": "response_end", "error": "incomplete"}),
+                ));
+            });
+        } else {
+            self.cut_after_trailers(id);
+        }
+    }
+
     fn control(&mut self, mut v: Value) {
         let Some(id) = v["stream"].as_u64().and_then(|n| u32::try_from(n).ok()) else {
             return;
@@ -418,6 +605,17 @@ impl Conn {
         let kind = v["type"].as_str().unwrap_or_default().to_owned();
         lock(&self.log.controls).push(v.clone());
         match kind.as_str() {
+            "request" if self.mode == Mode::AnswerOpen => {
+                let status = if v["method"] == "HEAD" { 200 } else { 204 };
+                self.send(text(
+                    id,
+                    json!({"type": "response", "status": status, "headers": []}),
+                ));
+            }
+            "request" if matches!(self.mode, Mode::CutWait | Mode::CutForward) => {
+                self.cut_forward(id, v);
+            }
+            "request" if self.mode == Mode::TrailersCut => self.cut_declared_or_trailers(id, &v),
             "open" => {
                 lock(&self.log.opens).push(v);
                 self.opened(id);
@@ -433,18 +631,39 @@ impl Conn {
                 self.flush(id, dir);
             }
             "result" => self.answered(id),
+            "stop" => self.stopped(id, &v),
             "request" if self.mode == Mode::Overlong => self.forward_declared(id, &v, 3, b"12345"),
             "request" if self.mode == Mode::Short => self.forward_declared(id, &v, 5, b"123"),
-            "request" if self.mode == Mode::Refuse => {
-                self.send(text(
-                    id,
-                    json!({"type": "response", "status": 403, "headers": []}),
-                ));
-                self.send(text(id, json!({"type": "response_end"})));
-            }
+            "request" if self.mode == Mode::Refuse => self.answer_alone(id, 403),
+            "request" if self.mode == Mode::NoContent => self.answer_alone(id, 204),
             "request" if self.mode == Mode::Abort => {
                 self.streams.remove(&id);
                 self.send(text(id, json!({"type": "reset", "message": "aborted"})));
+            }
+            "request" if self.mode == Mode::Early => {
+                self.pass_control(id, &kind, v);
+                self.send(text(
+                    id,
+                    json!({"type": "response", "status": 200, "headers": [["content-type", "text/plain"]]}),
+                ));
+                self.send(binary(id, RESPONSE, b"early"));
+            }
+            // The answer's end waits for the response head from upstream:
+            // a forward is carried only while something waits for its
+            // response.
+            "response" if self.mode == Mode::Early => {
+                self.send(text(id, json!({"type": "response_end"})));
+            }
+            "request"
+                if matches!(
+                    self.mode,
+                    Mode::EarlyNoContent | Mode::EarlyEmpty | Mode::StopResponse
+                ) =>
+            {
+                self.answer_empty_while_forwarding(id, v);
+            }
+            "response_end" if matches!(self.mode, Mode::EarlyNoContent | Mode::EarlyEmpty) => {
+                self.send(text(id, json!({"type": "response_end"})));
             }
             "response" if self.mode == Mode::LateQuarantine => {
                 // The head waits behind the call, so roxy sees it only once
@@ -479,10 +698,33 @@ impl Conn {
         }
     }
 
+    /// roxy reads no more of the `dir` lane: nothing more goes on it.
+    fn stopped(&mut self, id: u32, v: &Value) {
+        let Some(dir) = v["dir"].as_str().and_then(dir_of) else {
+            return;
+        };
+        if let Some(s) = self.streams.get_mut(&id) {
+            let lane = &mut s.lanes[usize::from(dir)];
+            lane.stopped = true;
+            lane.queue.clear();
+        }
+    }
+
+    /// Answers `status` with no body and forwards nothing: the request
+    /// lane ends headless.
+    fn answer_alone(&self, id: u32, status: u16) {
+        self.send(text(
+            id,
+            json!({"type": "response", "status": status, "headers": []}),
+        ));
+        self.send(text(id, json!({"type": "response_end"})));
+        self.send(text(id, json!({"type": "request_end"})));
+    }
+
     /// Passes a head or end straight back in its own direction, when the
     /// behaviour passes that direction.
     fn pass_control(&mut self, id: u32, kind: &str, mut v: Value) {
-        let Some(dir) = lane_of(kind).filter(|d| self.passes_head(*d)) else {
+        let Some(dir) = lane_of(kind, &v).filter(|d| self.passes_head(*d)) else {
             return;
         };
         v.as_object_mut().map(|o| o.remove("stream"));
@@ -515,8 +757,21 @@ impl Conn {
             | Mode::Shout
             | Mode::Sever
             | Mode::Patient
+            | Mode::Early
+            | Mode::NoContent
+            | Mode::EarlyNoContent
+            | Mode::EarlyEmpty
+            | Mode::StopResponse
+            | Mode::CutForward
+            | Mode::AnswerOpen
+            | Mode::CutWait
+            | Mode::TrailersCut
             | Mode::LateQuarantine
             | Mode::Audit => {}
+            Mode::ForwardOnOpen => {
+                self.send(text(id, json!({"type": "request", "method": "POST", "url": "http://up.test/x", "headers": []})));
+                self.send(text(id, json!({"type": "request_end"})));
+            }
             Mode::Host => self.call_host(
                 id,
                 REQUEST,
@@ -624,7 +879,7 @@ impl Conn {
             return;
         };
         let lane = &mut s.lanes[usize::from(dir)];
-        if lane.held {
+        if lane.held || lane.stopped {
             return;
         }
         let mut out = Vec::new();
@@ -679,6 +934,16 @@ where
             }
         }
     });
+    if path.ends_with("/scripted") {
+        let (incoming, rx) = mpsc::unbounded_channel();
+        lock(&log.scripts).push_back(Script::new(tx, rx));
+        while let Some(Ok(m)) = stream.next().await {
+            if incoming.send(m).is_err() {
+                break;
+            }
+        }
+        return;
+    }
     let mut conn = Conn {
         mode: Mode::of(path),
         tx,

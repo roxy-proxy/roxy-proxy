@@ -11,10 +11,10 @@ use http_body_util::BodyExt;
 use roxy_http::{Body, BodyError};
 use roxy_wasm::{
     EndpointError, EndpointPermit, FlowInfo, HostError, Layer, LayerConfig, LayerError, LayerHost,
-    LayerOutcome, LayerRequest, LayerResponse, LogLevel, Principal, TagError, WasmRuntime,
-    async_trait,
+    LayerRequest, LayerResponse, LogLevel, Principal, TagError, WasmRuntime, async_trait,
 };
 use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::task::JoinHandle;
 
 pub const TEST_LAYER: &[u8] = include_bytes!("../fixtures/test_layer.wasm");
 
@@ -63,6 +63,38 @@ pub struct Mock {
     /// Set to let calls to the `park` endpoint answer; until then they
     /// wait, holding their permits.
     pub unpark: watch::Sender<bool>,
+    /// Where the layer's answer goes (`respond`), for the exchange in
+    /// progress.
+    pub answer: Mutex<Option<oneshot::Sender<LayerResponse>>>,
+    pub endpoint_cleanup: Mutex<Option<Arc<CallCleanup>>>,
+    pub next_cleanup: Mutex<Option<Arc<CallCleanup>>>,
+    pub drivers: tokio_util::task::TaskTracker,
+}
+
+#[derive(Default)]
+pub struct CallCleanup {
+    pub started: AtomicUsize,
+    pub dropped: AtomicUsize,
+    pub destroying: AtomicUsize,
+    pub release: std::sync::Mutex<bool>,
+    pub wake: std::sync::Condvar,
+}
+
+struct CallGuard(Arc<CallCleanup>);
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        self.0.destroying.fetch_add(1, Ordering::SeqCst);
+        let release = self.0.release.lock().unwrap();
+        let _result = self
+            .0
+            .wake
+            .wait_timeout_while(release, std::time::Duration::from_secs(3), |released| {
+                !*released
+            })
+            .unwrap();
+        self.0.dropped.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// How many tags the mock host lets a flow hold.
@@ -72,7 +104,10 @@ pub const MOCK_ENDPOINT_CALLS: usize = 2;
 
 impl Mock {
     pub fn new(mode: NextMode) -> Arc<Self> {
+        let drivers = tokio_util::task::TaskTracker::new();
+        drivers.close();
         Arc::new(Self {
+            drivers,
             mode,
             next_calls: AtomicUsize::new(0),
             calls: Mutex::new(Vec::new()),
@@ -85,7 +120,17 @@ impl Mock {
             tags: Mutex::new(Vec::new()),
             endpoint_calls: Arc::new(Semaphore::new(MOCK_ENDPOINT_CALLS)),
             unpark: watch::Sender::new(false),
+            answer: Mutex::new(None),
+            endpoint_cleanup: Mutex::new(None),
+            next_cleanup: Mutex::new(None),
         })
+    }
+
+    /// Arms the host for one exchange's answer.
+    pub fn expect_answer(&self) -> oneshot::Receiver<LayerResponse> {
+        let (tx, rx) = oneshot::channel();
+        *self.answer.lock().unwrap() = Some(tx);
+        rx
     }
 
     pub fn echo() -> Arc<Self> {
@@ -110,12 +155,23 @@ impl Mock {
 
 #[async_trait]
 impl LayerHost for Mock {
-    async fn next(&self, req: LayerRequest) -> Result<LayerResponse, HostError> {
+    fn spawn_driver(
+        &self,
+        driver: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+    ) -> JoinHandle<()> {
+        self.drivers.spawn(driver)
+    }
+
+    async fn next(&self, req: LayerRequest) -> Result<Option<LayerResponse>, HostError> {
+        let _guard = self.next_cleanup.lock().unwrap().clone().map(|state| {
+            state.started.fetch_add(1, Ordering::SeqCst);
+            CallGuard(state)
+        });
         self.next_calls.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_one();
         let (parts, body) = req.into_parts();
         *self.seen.lock().unwrap() = Some(parts.clone());
-        match &self.mode {
+        let resp = match &self.mode {
             NextMode::Echo => Ok(Response::builder()
                 .status(200)
                 .header("x-upstream", "yes")
@@ -153,9 +209,17 @@ impl LayerHost for Mock {
                 });
                 match done.await {
                     Ok(true) => Ok(Response::new(Body::from_bytes("from upstream"))),
-                    _ => Err(HostError::new("upload cut")),
+                    // A forward the guest cut gets no response.
+                    _ => return Ok(None),
                 }
             }
+        };
+        resp.map(Some)
+    }
+
+    fn respond(&self, res: LayerResponse) {
+        if let Some(tx) = self.answer.lock().unwrap().take() {
+            let _ = tx.send(res);
         }
     }
 
@@ -172,6 +236,10 @@ impl LayerHost for Mock {
         match name {
             "monitor" => Ok(Response::new(Body::from_bytes("score=0.1"))),
             "park" => {
+                let _guard = self.endpoint_cleanup.lock().unwrap().clone().map(|state| {
+                    state.started.fetch_add(1, Ordering::SeqCst);
+                    CallGuard(state)
+                });
                 let body = collect(req.into_body())
                     .await
                     .map_err(|e| EndpointError::Failed(e.to_string()))?;
@@ -279,22 +347,168 @@ pub async fn collect(body: Body) -> Result<Bytes, BodyError> {
         .map(http_body_util::Collected::to_bytes)
 }
 
+/// An exchange in progress: the layer runs on a task of its own, and its
+/// answer arrives through the host.
+pub struct Started {
+    answer: Option<oneshot::Receiver<LayerResponse>>,
+    task: JoinHandle<Result<(), LayerError>>,
+    completed: Option<Result<(), LayerError>>,
+}
+
+impl Started {
+    /// The layer's answer, as soon as it gives one; the failure if the
+    /// layer fails first.
+    pub async fn response(&mut self) -> Result<LayerResponse, LayerError> {
+        let Some(answer) = self.answer.as_mut() else {
+            panic!("the answer was taken");
+        };
+        let answered = tokio::select! {
+            biased;
+            res = answer => res.ok(),
+            outcome = &mut self.task => {
+                let outcome = outcome.expect("the layer task does not panic");
+                self.task_finished(outcome)
+            }
+        };
+        self.answer = None;
+        if let Some(res) = answered {
+            return Ok(res);
+        }
+        // The host went with the task: it failed before answering.
+        if self.completed.is_none() {
+            self.completed = Some(
+                (&mut self.task)
+                    .await
+                    .expect("the layer task does not panic"),
+            );
+        }
+        Err(self
+            .completed
+            .as_ref()
+            .unwrap()
+            .clone()
+            .err()
+            .unwrap_or(LayerError::NoResponse))
+    }
+
+    fn task_finished(&mut self, outcome: Result<(), LayerError>) -> Option<LayerResponse> {
+        self.completed = Some(outcome);
+        // The guest can publish and finish between the receiver's pending
+        // poll and the task's ready poll, even in a biased select.
+        self.answer
+            .as_mut()
+            .and_then(|answer| answer.try_recv().ok())
+    }
+
+    /// How the exchange ended, once the handler has returned.
+    pub async fn outcome(self) -> Result<(), LayerError> {
+        match self.completed {
+            Some(outcome) => outcome,
+            None => self.task.await.expect("the layer task does not panic"),
+        }
+    }
+
+    /// Drops the exchange where it is: the layer's task is aborted.
+    pub fn abort(&self) {
+        self.task.abort();
+    }
+}
+
+/// Starts an exchange on a task of its own.
+pub fn start(layer: &Layer, host: Arc<Mock>, req: LayerRequest) -> Started {
+    let answer = host.expect_answer();
+    let layer = layer.clone();
+    let task = tokio::spawn(async move { layer.handle(host, req).await });
+    Started {
+        answer: Some(answer),
+        task,
+        completed: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn started_preserves_an_answer_published_before_task_completion() {
+    for attempt in 0..100_000 {
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            tx.send(Response::new(Body::empty())).unwrap();
+            Ok(())
+        });
+        let mut started = Started {
+            answer: Some(rx),
+            task,
+            completed: None,
+        };
+        let response = started.response().await;
+        assert!(response.is_ok(), "attempt {attempt}: {response:?}");
+        started.outcome().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn started_outcome_can_be_read_after_response_reports_a_failure() {
+    let (tx, rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        drop(tx);
+        Err(LayerError::NoResponse)
+    });
+    let mut started = Started {
+        answer: Some(rx),
+        task,
+        completed: None,
+    };
+    assert!(matches!(
+        started.response().await,
+        Err(LayerError::NoResponse)
+    ));
+    assert!(matches!(
+        started.outcome().await,
+        Err(LayerError::NoResponse)
+    ));
+}
+
+#[tokio::test]
+async fn a_task_finishing_between_polls_preserves_its_queued_answer_and_outcome() {
+    let (tx, mut rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        tx.send(Response::new(Body::empty())).unwrap();
+        Err(LayerError::NoResponse)
+    });
+    // Poll the receiver before letting the task publish and complete.
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    let mut started = Started {
+        answer: Some(rx),
+        task,
+        completed: None,
+    };
+    let outcome = (&mut started.task).await.unwrap();
+    // The task branch must keep both the answer and the handler's failure.
+    assert!(started.task_finished(outcome).is_some());
+    assert!(matches!(
+        started.outcome().await,
+        Err(LayerError::NoResponse)
+    ));
+}
+
 /// Runs a whole exchange, collecting the response body.
 pub async fn exchange(
     layer: &Layer,
     host: Arc<Mock>,
     req: LayerRequest,
 ) -> Result<(StatusCode, Bytes), LayerError> {
-    let resp = layer.handle(host, req).await?;
+    let mut started = start(layer, host, req);
+    let resp = started.response().await?;
     let status = resp.status();
-    let outcome = resp.extensions().get::<LayerOutcome>().cloned().unwrap();
     match collect(resp.into_body()).await {
         Ok(b) => {
-            outcome.wait().await?;
+            started.outcome().await?;
             Ok((status, b))
         }
-        Err(_) => Err(outcome
-            .wait()
+        Err(_) => Err(started
+            .outcome()
             .await
             .expect_err("body failed, so must the outcome")),
     }

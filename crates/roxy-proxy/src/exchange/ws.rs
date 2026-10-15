@@ -14,8 +14,10 @@ use roxy_http::h1::ServerConn;
 use roxy_http::ws::frame::{self, Decoder, FrameError, Opcode, Peer, close};
 use roxy_http::ws::{WsKey, validate_no_extensions, validate_upgrade_response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 use super::{Answer, Next, answer, protocol_refusal};
+use crate::addons::Reclaim;
 use crate::capture::Tap;
 use crate::flowlog::FlowEvent;
 use crate::in_flight::{Dir, InFlight};
@@ -23,20 +25,16 @@ use crate::io::{ClientIo, Io};
 use crate::pipeline::{FlowCx, PerDir, Refusal};
 use crate::view::host_text;
 
-/// Finishes an allowed upgrade: checks the upstream's `101`, writes it to
-/// the client and relays until the WebSocket ends. The connection is spent
-/// either way.
-pub(super) async fn splice_websocket(
-    conn: ServerConn<ClientIo>,
-    mut cx: FlowCx,
-    res: CanonicalResponse,
-    upgraded: hyper::upgrade::Upgraded,
+/// Validate the upgrade and reserve all memory needed by its relay before
+/// publishing a `101` to the client or to the addon layers.
+pub(crate) fn prepare_websocket(
+    cx: &mut FlowCx,
+    res: &CanonicalResponse,
     key: &WsKey,
-) -> Next {
-    let parse = cx.snap.policy.reads_ws();
-    let checked = validate_upgrade_response(&res, key).and_then(|()| {
+) -> Result<(), Refusal> {
+    let checked = validate_upgrade_response(res, key).and_then(|()| {
         if crate::addons::ws_without_extensions(&cx.snap, cx.layer_reads_bytes) {
-            validate_no_extensions(&res)
+            validate_no_extensions(res)
         } else {
             Ok(())
         }
@@ -49,27 +47,89 @@ pub(super) async fn splice_websocket(
             .map(|r| host_text(&r.host))
             .unwrap_or_default();
         let port = cx.facts.request.as_ref().map_or(0, |r| r.port);
-        let r = protocol_refusal(&cx, &host, port, e.to_string());
-        return answer(conn, cx, Answer::Refusal(r)).await;
+        return Err(protocol_refusal(cx, &host, port, e.to_string()));
     }
-    if parse {
-        // Each direction reassembles up to a message's worth.
+    if cx.snap.policy.reads_ws() {
         let per_direction = cx.snap.limits.max_ws_message_bytes;
-        let Some(lease) = cx.shared.reserve_buffer(per_direction.saturating_mul(2)) else {
-            let r = Refusal::fail_closed(crate::budget::EXHAUSTED);
-            return answer(conn, cx, Answer::Refusal(r)).await;
-        };
+        let lease = cx
+            .shared
+            .reserve_buffer(per_direction.saturating_mul(2))
+            .ok_or_else(|| Refusal::fail_closed(crate::budget::EXHAUSTED))?;
         cx.buffers.push(lease);
     }
-    cx.record.response_status = Some(101);
-    let (client_io, leftover) = match conn.respond_upgrade(res).await {
-        Ok(x) => x,
+    Ok(())
+}
+
+/// The direct path when no addons are configured.
+pub(super) async fn splice_websocket(
+    conn: ServerConn<ClientIo>,
+    mut cx: FlowCx,
+    res: CanonicalResponse,
+    upgraded: hyper::upgrade::Upgraded,
+    key: &WsKey,
+) -> Next {
+    if let Err(r) = prepare_websocket(&mut cx, &res, key) {
+        close_upstream_ws(upgraded).await;
+        return answer(conn, Reclaim::now(cx), Answer::Refusal(r)).await;
+    }
+    let (client, leftover) = match conn.respond_upgrade(res).await {
+        Ok(io) => io,
         Err(e) => {
             tracing::debug!(error = %e, "writing 101 failed");
+            close_upstream_ws(upgraded).await;
             cx.emit_request_event();
             return None;
         }
     };
+    relay_websocket(
+        &mut cx,
+        Box::new(client),
+        upgraded,
+        leftover.to_vec(),
+        &CancellationToken::new(),
+    )
+    .await;
+    cx.record_final_sample();
+    cx.emit_request_event();
+    None
+}
+
+/// The transport only writes the handshake and attaches the client to the
+/// first lane pair. The core stage owns the relay through its completion.
+pub(super) async fn connect_stack(
+    conn: ServerConn<ClientIo>,
+    reclaim: Reclaim,
+    res: CanonicalResponse,
+    client: crate::addons::WsClient,
+) -> Next {
+    let guard = reclaim.cancellation_guard();
+    match conn.respond_upgrade(res).await {
+        Ok((io, leftover)) => client.connect(Box::new(io), leftover.to_vec()),
+        Err(e) => {
+            tracing::debug!(error = %e, "writing 101 failed");
+            reclaim.tear_down(crate::addons::CLIENT_GONE);
+            drop(client);
+        }
+    }
+    let mut cx = reclaim.take().await;
+    if let Some(guard) = guard {
+        guard.complete();
+    }
+    cx.record_final_sample();
+    cx.emit_request_event();
+    None
+}
+
+/// Run a prepared relay and record its byte counts and close event. The
+/// caller emits the final request event after the entire exchange ends.
+pub(crate) async fn relay_websocket(
+    cx: &mut FlowCx,
+    client: crate::io::BoxIo,
+    upgraded: hyper::upgrade::Upgraded,
+    leftover: Vec<u8>,
+    cancelled: &CancellationToken,
+) {
+    cx.record.response_status = Some(101);
     let host = cx.facts.request.as_ref().map(|r| host_text(&r.host));
     cx.shared.sink.emit(&FlowEvent::WsOpen {
         ts: chrono::Utc::now(),
@@ -77,84 +137,69 @@ pub(super) async fn splice_websocket(
         conn: cx.conn_id(),
         host,
     });
-    // Through an addon stack, the layers sit between the client and the
-    // relay, carrying the WebSocket as the bodies of its exchange; the bytes
-    // that came with the upgrade request go through them first.
-    let leftover = leftover.to_vec();
-    let mut spliced = None;
-    let (client_io, leftover): (crate::io::BoxIo, Vec<u8>) = match &cx.stack {
-        Some(st) => {
-            let (bottom, client) = crate::addons::splice_client(st, Box::new(client_io), leftover);
-            spliced = Some(client);
-            (bottom, Vec::new())
-        }
-        None => (Box::new(client_io), leftover),
-    };
     let mut upstream = TokioIo::new(upgraded);
     let idle = cx.snap.limits.idle_timeout;
-    let Some(in_flight) = cx.in_flight.clone() else {
-        cx.emit_request_event();
-        return None;
-    };
+    let in_flight = cx
+        .in_flight
+        .clone()
+        .expect("an allowed upgrade has in-flight rules");
     let mut taps = std::mem::take(&mut cx.taps);
-    if parse {
-        let max = cx.snap.limits.max_ws_message_bytes;
-        let r = relay_messages(client_io, upstream, leftover, (idle, max), &in_flight, taps).await;
-        close_spliced(spliced).await;
-        finish_websocket(&mut cx, r);
-        return None;
-    }
-    let c2s_extra = leftover.len() as u64;
-    if !leftover.is_empty() {
-        // Bytes that arrived with the upgrade request: checked before they
-        // are written, like every other relayed chunk.
-        if in_flight.on_ws_chunk(Dir::Request, c2s_extra).is_err() {
-            cx.record_final_sample();
-            cx.emit_request_event();
-            return None;
+    let result = if cx.snap.policy.reads_ws() {
+        relay_messages(
+            client,
+            upstream,
+            leftover,
+            (idle, cx.snap.limits.max_ws_message_bytes),
+            &in_flight,
+            taps,
+            cancelled,
+        )
+        .await
+    } else {
+        let mut extra = Some(0);
+        if !leftover.is_empty() {
+            let count = leftover.len() as u64;
+            if in_flight.on_ws_chunk(Dir::Request, count).is_ok() {
+                if let Some(t) = taps.request.as_mut() {
+                    t.data(&leftover);
+                }
+                let sent = tokio::select! {
+                    () = cancelled.cancelled() => false,
+                    result = tokio::time::timeout(idle, upstream.write_all(&leftover)) => matches!(result, Ok(Ok(()))),
+                };
+                extra = sent.then_some(count);
+            } else {
+                extra = None;
+            }
         }
-        if let Some(t) = taps.request.as_mut() {
-            t.data(&leftover);
+        match extra {
+            Some(extra) => {
+                let (c2s, s2c, closed) =
+                    splice(client, upstream, idle, &in_flight, taps, cancelled).await;
+                Relayed {
+                    c2s: c2s + extra,
+                    s2c,
+                    closed,
+                }
+            }
+            None => Relayed {
+                c2s: 0,
+                s2c: 0,
+                closed: None,
+            },
         }
-        if upstream.write_all(&leftover).await.is_err() {
-            cx.emit_request_event();
-            return None;
-        }
-    }
-    let (c2s, s2c, closed) = splice(client_io, upstream, idle, &in_flight, taps).await;
-    let r = Relayed {
-        c2s: c2s + c2s_extra,
-        s2c,
-        closed,
     };
-    close_spliced(spliced).await;
-    finish_websocket(&mut cx, r);
-    None
-}
-
-/// Through a stack, the relay's end closes the client too: the layers
-/// hold its socket otherwise, for as long as they keep their bodies open.
-async fn close_spliced(client: Option<crate::addons::SplicedClient>) {
-    if let Some(c) = client {
-        c.close(CLOSE_TIMEOUT).await;
-    }
-}
-
-/// Logs the end of a relayed WebSocket and its exchange.
-fn finish_websocket(cx: &mut FlowCx, r: Relayed) {
     cx.shared.sink.emit(&FlowEvent::WsClose {
         ts: chrono::Utc::now(),
         flow: cx.flow.to_string(),
         conn: cx.conn_id(),
-        bytes_c2s: r.c2s,
-        bytes_s2c: r.s2c,
-        close_code: r.closed.as_ref().map(|e| e.code),
-        close_reason: r.closed.map(|e| e.detail.to_owned()),
+        bytes_c2s: result.c2s,
+        bytes_s2c: result.s2c,
+        close_code: result.closed.as_ref().map(|e| e.code),
+        close_reason: result.closed.map(|e| e.detail.to_owned()),
     });
-    cx.record.request_bytes = r.c2s;
-    cx.record.response_bytes = r.s2c;
-    cx.record_final_sample();
-    cx.emit_request_event();
+    cx.record.request_bytes = result.c2s;
+    cx.record.response_bytes = result.s2c;
 }
 
 /// One direction of the WebSocket relay: what checks and records each chunk.
@@ -231,6 +276,7 @@ async fn splice(
     idle: Duration,
     in_flight: &InFlight,
     taps: PerDir<Option<Tap>>,
+    cancelled: &CancellationToken,
 ) -> (u64, u64, Option<FrameError>) {
     use std::sync::atomic::AtomicU64;
     let base = Instant::now();
@@ -268,6 +314,7 @@ async fn splice(
         },
     );
     let closed = tokio::select! {
+        () = cancelled.cancelled() => None,
         () = async { tokio::join!(a, b); } => None,
         () = idle_watchdog(&last, base, idle) => {
             let mut to_up = FrameOut::new(&mut uw, Some(Masks::new()));
@@ -311,7 +358,7 @@ async fn idle_watchdog(last: &AtomicU64, base: Instant, idle: Duration) {
 
 /// How long roxy waits to write a close frame, or to shut a side down,
 /// before giving up on a peer that does not read.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Masks for frames toward the upstream, which must be unpredictable
 /// (RFC 6455 §5.3). Drawn from the system RNG, 64 at a time.
@@ -545,6 +592,7 @@ async fn relay_messages(
         request: up_tap,
         response: down_tap,
     }: PerDir<Option<Tap>>,
+    cancelled: &CancellationToken,
 ) -> Relayed {
     let base = Instant::now();
     let last = AtomicU64::new(0);
@@ -590,6 +638,7 @@ async fn relay_messages(
                 e = &mut a, if !a_done => { a_done = true; e }
                 e = &mut b, if !b_done => { b_done = true; e }
                 () = &mut watchdog => break End::Idle,
+                () = cancelled.cancelled() => break End::Broken,
                 () = in_flight.cancelled() => break End::Stopped,
             };
             match e {

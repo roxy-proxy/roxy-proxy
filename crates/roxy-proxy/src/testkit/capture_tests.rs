@@ -146,6 +146,7 @@ async fn ws_echo(kit: &Kit, headers: &[(&str, &str)]) {
     let back = ws.next().await.unwrap().unwrap();
     assert_eq!(back.into_data().len(), 100_000);
     ws.close(None).await.unwrap();
+    assert!(matches!(ws.next().await, Some(Ok(Message::Close(None)))));
 }
 
 /// Both heads (the upgrade as it left, the 101) and the relayed bytes

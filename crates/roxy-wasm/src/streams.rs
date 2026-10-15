@@ -134,12 +134,13 @@ impl Drop for GuestInput {
 /// it unfinished means.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Produced {
-    /// The request body passed to `next`: a cut, settled by
-    /// [`ExchangeShared::check_next`].
+    /// The request body passed to `next`: dropped unfinished, the forward
+    /// is cut where it stopped, the guest's own doing.
     Next,
-    /// The response body: the exchange fails.
+    /// The response body: dropped unfinished, the answer is cut where it
+    /// stopped, the guest's own doing.
     Response,
-    /// An endpoint request body: the exchange fails.
+    /// An endpoint request body: dropped unfinished, the exchange fails.
     Endpoint,
 }
 
@@ -154,10 +155,7 @@ struct OutputState {
 impl OutputState {
     fn cut(&self, why: &str) {
         match self.produced {
-            Produced::Next => self.shared.cut_next(format!("request body {why}")),
-            Produced::Response => self
-                .shared
-                .fail(LayerError::InvalidResponse(format!("response body {why}"))),
+            Produced::Next | Produced::Response => {}
             Produced::Endpoint => self.shared.fail(LayerError::InvalidRequest(format!(
                 "endpoint request body {why}"
             ))),
@@ -233,8 +231,10 @@ impl Drop for GuestOutput {
 pub(crate) type Answer = Result<http::Response<Body>, types::Error>;
 
 /// The `pending-response` resource. Dropped while pending, the call is
-/// abandoned (its task aborted). Public only because the generated
-/// bindings name it; the crate exports nothing of it.
+/// given up (its task aborted): for `next`, the layer reads no more of
+/// the response lane, and the forward's body stays the layer's to finish.
+/// Public only because the generated bindings name it; the crate exports
+/// nothing of it.
 pub struct PendingResponse {
     state: Pending,
     /// A clone of the exchange's [`Streams::pending`], so the exchange can
@@ -297,7 +297,8 @@ pub(crate) struct Streams {
 }
 
 impl Streams {
-    /// Hands the guest a `pending-response` for `handle`.
+    /// Hands the guest a `pending-response` for `handle`: `next`'s, or an
+    /// endpoint call's.
     pub(crate) fn pending(
         &self,
         table: &mut ResourceTable,

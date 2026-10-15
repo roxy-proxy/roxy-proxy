@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 wit_bindgen::generate!({
     path: "../../../../wit",
-    world: "roxy:addon/layer",
+    world: "roxy:addon/layer@0.3.0",
     generate_all,
 });
 
@@ -193,6 +193,57 @@ fn hold(req: &RequestHead, name: &str) {
     }
 }
 
+/// Keep the client reading while an external approval holds either input.
+fn sse_approval(req: &RequestHead, body: InputStream, response: bool) {
+    let out = respond_streaming(&head(
+        200,
+        vec![("content-type".to_owned(), b"text/event-stream".to_vec())],
+    ));
+    write_all(&out, b"event: start\ndata: {}\n\n");
+    let input = if response {
+        let (pending, _) = chain::next(&forward_head(req), Body::Passthrough(body)).expect("next");
+        await_response(pending).1
+    } else {
+        body
+    };
+    let held = read_at_least(&input, read_bytes(req));
+    let (approval, _) = endpoints::call("park", req, Body::Empty).expect("approval call");
+    let ready = approval.subscribe();
+    loop {
+        if let Some(result) = approval.get() {
+            drop(result.expect("approval result"));
+            break;
+        }
+        write_all(&out, b": approval pending\n\n");
+        let tick = wasi::clocks::monotonic_clock::subscribe_duration(200_000_000);
+        wasi::io::poll::poll(&[&ready, &tick]);
+    }
+    drop(ready);
+    drop(approval);
+    let held = if header(req, "x-edit-tool").is_some() {
+        String::from_utf8(held)
+            .unwrap()
+            .replace("delete_file", "read_file")
+            .into_bytes()
+    } else {
+        held
+    };
+    if response {
+        write_all(&out, &held);
+        pump(&input, &out, false);
+        drop(input);
+    } else {
+        let (pending, forward) = next_streaming(&forward_head(req));
+        write_all(&forward, &held);
+        pump(&input, &forward, false);
+        drop(input);
+        types::finish(forward);
+        let (_, input) = await_response(pending);
+        pump(&input, &out, false);
+    }
+    types::finish(out);
+}
+
 /// The default: pass the exchange through, streaming both bodies, chunk by
 /// chunk (upper-cased when `x-upper` is set). With `x-hold`, neither body
 /// it passes on is ended until the client's request body goes away; with
@@ -234,6 +285,45 @@ struct Tweaks {
     status: Option<u16>,
 }
 
+/// Advance one direction without blocking the guest's other direction.
+/// Keep any unwritten suffix until output capacity becomes available.
+fn copy_ready(
+    input: &InputStream,
+    output: &OutputStream,
+    bytes: &mut Vec<u8>,
+    upper: bool,
+) -> bool {
+    if bytes.is_empty() {
+        match input.read(64 * 1024) {
+            Ok(chunk) => {
+                *bytes = chunk;
+                if upper {
+                    bytes.make_ascii_uppercase();
+                }
+            }
+            Err(StreamError::Closed) => return false,
+            Err(StreamError::LastOperationFailed(e)) => {
+                panic!("body failed: {}", e.to_debug_string())
+            }
+        }
+    }
+    if !bytes.is_empty() {
+        let capacity = match output.check_write() {
+            Ok(n) => n as usize,
+            Err(StreamError::Closed) => return false,
+            Err(StreamError::LastOperationFailed(e)) => {
+                panic!("body write failed: {}", e.to_debug_string())
+            }
+        };
+        let n = capacity.min(bytes.len());
+        if n > 0 {
+            output.write(&bytes[..n]).expect("write");
+            bytes.drain(..n);
+        }
+    }
+    true
+}
+
 /// Streams both bodies at once: the request body into `next` and the
 /// response from below back out, each chunk as it comes, neither waiting
 /// for the other to end. A WebSocket's request body only ends when the
@@ -250,41 +340,24 @@ fn duplex(
         status,
     }: Tweaks,
 ) {
-    let up = |mut c: Vec<u8>| {
-        if upper {
-            c.make_ascii_uppercase();
-        }
-        c
-    };
     let mut req_out = Some(req_out);
     let mut req_open = true;
+    let mut req_bytes = Vec::new();
+    let mut resp_bytes = Vec::new();
     // The response from below and our own, once it has arrived.
     let mut resp: Option<(InputStream, OutputStream)> = None;
     let mut resp_done = false;
     loop {
-        if req_open {
-            match req_in.read(64 * 1024) {
-                Ok(c) if !c.is_empty() => {
-                    if !try_write_all(req_out.as_ref().expect("open"), &up(c)) {
-                        // The layer below is done with the request body
-                        // (a refused request); stop relaying it.
-                        req_open = false;
-                        types::finish(req_out.take().expect("open"));
-                    }
-                }
-                Ok(_) => {}
-                // A broken body is never passed on as if it had ended:
-                // trapping fails the exchange closed.
-                Err(StreamError::LastOperationFailed(e)) => {
-                    panic!("request body failed: {}", e.to_debug_string())
-                }
-                Err(StreamError::Closed) => {
-                    // The client's body ended: end the one below, so a
-                    // peer waiting for it (an echo) can end its response.
-                    req_open = false;
-                    types::finish(req_out.take().expect("open"));
-                }
-            }
+        if req_open
+            && !copy_ready(
+                &req_in,
+                req_out.as_ref().expect("open"),
+                &mut req_bytes,
+                upper,
+            )
+        {
+            req_open = false;
+            types::finish(req_out.take().expect("open"));
         }
         if resp.is_none()
             && !resp_done
@@ -299,18 +372,7 @@ fn duplex(
         }
         let mut resp_open = resp.is_none();
         if let Some((input, output)) = &resp {
-            match input.read(64 * 1024) {
-                Ok(c) => {
-                    resp_open = true;
-                    if !c.is_empty() {
-                        write_all(output, &up(c));
-                    }
-                }
-                Err(StreamError::LastOperationFailed(e)) => {
-                    panic!("response body failed: {}", e.to_debug_string())
-                }
-                Err(StreamError::Closed) => {}
-            }
+            resp_open = copy_ready(input, output, &mut resp_bytes, upper);
         }
         if !resp_open && resp.is_some() {
             // The response from below ended: end ours.
@@ -338,11 +400,19 @@ fn duplex(
         }
         let mut wait: Vec<Pollable> = Vec::new();
         if req_open {
-            wait.push(req_in.subscribe());
+            wait.push(if req_bytes.is_empty() {
+                req_in.subscribe()
+            } else {
+                req_out.as_ref().expect("open").subscribe()
+            });
         }
         if !resp_done {
             match &resp {
-                Some((input, _)) => wait.push(input.subscribe()),
+                Some((input, output)) => wait.push(if resp_bytes.is_empty() {
+                    input.subscribe()
+                } else {
+                    output.subscribe()
+                }),
                 None => wait.push(pending.subscribe()),
             }
         }
@@ -610,6 +680,22 @@ impl Handler for Layer {
             return;
         }
         match test.as_str() {
+            "finish-full-output" => {
+                drop(body);
+                let out = respond_streaming(&head(200, vec![]));
+                for _ in 0..2 {
+                    assert!(out.check_write().unwrap() > 0);
+                    out.write(b"x").unwrap();
+                }
+                types::finish(out);
+            }
+            "answer-request-body" => {
+                let status = header(&req, "x-status").unwrap_or_else(|| "200".to_owned());
+                chain::respond(
+                    &head(status.parse().unwrap(), vec![]),
+                    Body::Passthrough(body),
+                );
+            }
             "pass" => pass(&req, body, false),
             "relay" => relay(&req, body),
             "buffer" => pass(&req, body, true),
@@ -642,6 +728,90 @@ impl Handler for Layer {
                     200,
                     format!("answered by {who} after forwarding {} bytes", got.len()).as_bytes(),
                 );
+            }
+            "answer-then-next" => {
+                // Answer the client at once, then forward the whole request
+                // and read the response from below to its end: the answer
+                // reaches the client first, and the forward still completes.
+                respond(200, b"answered before forwarding");
+                let (pending, output) = next_streaming(&forward_head(&req));
+                pump(&body, &output, false);
+                drop(body);
+                types::finish(output);
+                let (_below, from_below) = await_response(pending);
+                drop(read_all(&from_below));
+            }
+            "sse-approve-request" => sse_approval(&req, body, false),
+            "sse-approve-response" => sse_approval(&req, body, true),
+            "answer-204-then-next" => {
+                // As `answer-then-next`, with an answer that carries no
+                // body: the host writes nothing for it, and the guest must
+                // still run to the end of its forward.
+                respond(204, b"");
+                let (pending, output) = next_streaming(&forward_head(&req));
+                pump(&body, &output, false);
+                drop(body);
+                types::finish(output);
+                let (_below, from_below) = await_response(pending);
+                drop(read_all(&from_below));
+            }
+            "answer-then-cut-next" => {
+                // Answer first, then forward and cut the forward short
+                // while still waiting on its response: `next` fails for
+                // the guest, and the answer stands.
+                let out = respond_streaming(&head(200, Vec::new()));
+                write_all(&out, b"answered");
+                let (pending, output) = next_streaming(&forward_head(&req));
+                write_all(&output, &read_at_least(&body, 1));
+                drop(output);
+                assert!(
+                    PendingResponse::wait(pending).is_err(),
+                    "a cut forward fails for the guest"
+                );
+                write_all(&out, b" and kept");
+                types::finish(out);
+            }
+            "endpoint-held-abandon" => {
+                // Hold an endpoint call's future, then forward, drop the
+                // pending `next` and cut its body: the held call is no
+                // wait on `next`, so the cut is an abandonment.
+                let park = RequestHead {
+                    method: "POST".to_owned(),
+                    scheme: None,
+                    authority: None,
+                    path_with_query: "/park".to_owned(),
+                    headers: Vec::new(),
+                };
+                let (held, _) = endpoints::call("park", &park, Body::Empty).expect("call");
+                let (pending, output) = next_streaming(&forward_head(&req));
+                write_all(&output, &read_at_least(&body, 1));
+                drop(pending);
+                drop(output);
+                respond(200, b"abandoned with a call held");
+                drop(held);
+            }
+            "next-then-abandon" => {
+                // Forward the whole request, wait `x-delay-ms` for the
+                // response, then give up on it and answer locally: a
+                // forward abandoned while it is upstream whole.
+                let (pending, output) = next_streaming(&forward_head(&req));
+                pump(&body, &output, false);
+                drop(body);
+                types::finish(output);
+                hold(&req, "delay");
+                drop(pending);
+                respond(200, b"gave up on the forward");
+            }
+            "next-then-trap" => {
+                // Forward the whole request, then trap as the response from
+                // below arrives: a failure with a response open at the
+                // layer.
+                let (pending, output) = next_streaming(&forward_head(&req));
+                pump(&body, &output, false);
+                drop(body);
+                types::finish(output);
+                let _below = await_response(pending);
+                panic!("layer panics on the response");
             }
             "cut-then-await" => {
                 // Stream `x-read-bytes` of the body into `next`, leave it

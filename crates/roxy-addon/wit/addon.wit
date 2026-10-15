@@ -1,9 +1,9 @@
 /// roxy addon layers.
 ///
-/// A layer is a component that sits in an exchange's layer stack above the
-/// rules. It receives each request through `handler.handle` as one
-/// `request-head` record and a body stream, may pass a request down the
-/// stack once with `chain.next`, and answers with `chain.respond`. Heads
+/// A layer is a component downstream of the rules in an exchange's stack.
+/// It receives each request through `handler.handle` as one `request-head`
+/// record and a body stream. It may forward a request upstream once with
+/// `chain.next`, and answers with `chain.respond`. Heads
 /// cross the boundary as records, one per direction; bodies are
 /// `wasi:io/streams` in both directions.
 ///
@@ -12,7 +12,7 @@
 /// each of those calls is a capability granted per layer in roxy's config.
 /// A call the layer was not granted traps; the import is always linked, so
 /// one binary runs under different grants.
-package roxy:addon@0.2.1;
+package roxy:addon@0.3.0;
 
 /// Heads, bodies and the response a call will produce.
 interface types {
@@ -81,7 +81,9 @@ interface types {
   }
 
   /// The response to a `next` or `call`, once it arrives. Dropping it
-  /// before `get` or `wait` abandons the request: its body is cut.
+  /// before `get` or `wait` stops reading the response: for `next`, the
+  /// upstream request is cancelled, and the forward's body stream stays
+  /// the layer's to finish or drop.
   resource pending-response {
     /// Ready once the response head has arrived (or the call failed).
     subscribe: func() -> pollable;
@@ -93,23 +95,31 @@ interface types {
   }
 }
 
-/// The layers below this one, and the answer to the client.
+/// The stages upstream of this layer, and the answer to the client.
 interface chain {
   use types.{request-head, response-head, body, pending-response, error};
   use wasi:io/streams@0.2.12.{output-stream};
 
-  /// Pass a request to the layers below (and, through the rules, to the
-  /// network). Callable at most once per exchange: a second call traps.
-  /// The request is validated by roxy's canonical model as if a client had
-  /// sent it; an invalid head fails the exchange closed. Returns the
-  /// `output-stream` to write the body to when `body` is `stream`; the
-  /// stream applies backpressure, so write it while waiting on the
-  /// response.
+  /// Pass a request to the layers upstream (and, through the rules, to
+  /// the network). Callable at most once per exchange, before or after
+  /// `respond`: a second call traps. The request is validated by roxy's
+  /// canonical model as if a client had sent it; an invalid head fails the
+  /// exchange closed. The response that comes back is whatever the stack
+  /// upstream produced, the rules' refusal included; `error.internal` if
+  /// nothing came back (the forward's body was dropped unfinished, which
+  /// cuts it). The forward is carried upstream only while this layer
+  /// waits for its response: read at least the response head for it to be
+  /// delivered. Returns the `output-stream` to write the body to when
+  /// `body` is `stream`; the stream applies backpressure, so write it
+  /// while waiting on the response.
   next: func(head: request-head, body: body) -> result<tuple<pending-response, option<output-stream>>, error>;
 
   /// Answer the client. Callable once per exchange, before `handle`
-  /// returns; a second call fails the exchange closed. Returns the
-  /// `output-stream` to write the body to when `body` is `stream`.
+  /// returns and whether or not `next` has been called; a second call
+  /// fails the exchange closed. The answer reaches the client at once, and
+  /// says nothing about a request passed to `next`. Returns the
+  /// `output-stream` to write the body to when `body` is `stream`; dropped
+  /// unfinished, the answer is cut where it stopped.
   respond: func(head: response-head, body: body) -> option<output-stream>;
 }
 
@@ -197,8 +207,10 @@ interface handler {
   use wasi:io/streams@0.2.12.{input-stream};
 
   /// Handle one exchange. The layer answers with `chain.respond` and
-  /// returns once its response body is finished. Returning without
-  /// `respond`, or still holding a host resource (an unfinished body),
+  /// returns after finishing its output bodies, consuming or releasing
+  /// its input bodies and pending forward, and completing host work.
+  /// Returning without `respond`, or still holding an unfinished body
+  /// or pending response,
   /// fails the exchange closed. Trailers on `body` are dropped.
   handle: func(req: request-head, body: input-stream);
 }

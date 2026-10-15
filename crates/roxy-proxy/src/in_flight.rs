@@ -13,8 +13,8 @@
 //!   written to the client: a stop is answered with roxy's error response,
 //!   and header effects of matching rules change the response.
 //! - **Response body chunks.** The same adapter on the response body; a stop
-//!   ends the body with [`BodyError::Stopped`], so the h1 front end breaks
-//!   the connection without a terminating chunk and the h2 front end
+//!   ends the body with [`BodyError::Stopped`], so the HTTP/1.1 transport breaks
+//!   the connection without a terminating chunk and the HTTP/2 transport
 //!   resets the stream.
 //! - **WebSocket relay.** [`InFlight::on_ws_chunk`] before each write, and
 //!   [`InFlight::on_ws_message`] before each message when rules read `ws.*`.

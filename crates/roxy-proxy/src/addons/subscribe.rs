@@ -1,8 +1,8 @@
 //! What a layer subscribes to: the head of each direction, or the head and
 //! the body. A body a layer is not subscribed to bypasses it: the layer gets
 //! the head with an empty body and no `content-length`, and the body goes
-//! on below (or up to the client) spliced onto the head the layer passed
-//! on. Framing is roxy's on a bypassed body, so the layer's head carries
+//! on upstream (or downstream to the client) spliced onto the head the
+//! layer passed on. Framing is roxy's on a bypassed body, so the layer's head carries
 //! none of it; a layer that passes on bytes of a body it is not subscribed
 //! to fails the exchange closed.
 
@@ -13,9 +13,9 @@ use std::task::{Context, Poll, ready};
 use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use roxy_http::{Body, BodyError};
-use roxy_wasm::{LayerError, LayerRequest, LayerResponse};
+use roxy_wasm::LayerError;
 
-use super::{StackFlow, lock};
+use super::StackFlow;
 use crate::in_flight::Dir;
 
 /// How much of one direction of the exchange a layer sees.
@@ -59,97 +59,23 @@ impl Subscription {
     }
 }
 
-/// The bodies bypassing one enforce layer of an exchange, parked between
-/// the layer taking the head and passing one on.
-#[derive(Default)]
-pub(super) struct Bypass {
-    request: Option<Body>,
-    /// The response from below: its status, and its body.
-    response: Option<(http::StatusCode, Body)>,
-}
-
 /// The head as a layer not subscribed to the body sees it: the body's
 /// framing is roxy's, not the layer's to see or state.
 pub(super) fn head_only(headers: &mut http::HeaderMap) {
     headers.remove(http::header::CONTENT_LENGTH);
 }
 
-/// Takes the request body away from enforce layer `index` when it is
-/// subscribed to the head only.
-pub(super) fn detach_request(
+/// Join a layer's own completion with the body it does not see. The own
+/// body is already complete for WASM's empty `bytes`; an open WASM stream
+/// or a service's head-only lane still owes an explicit end. Its enclosing
+/// lane withholds wire completion until both bodies end cleanly.
+pub(super) fn splice(
     st: &Arc<StackFlow>,
     index: usize,
-    mut req: LayerRequest,
-) -> LayerRequest {
-    if st.snap.addons[index].subscribe.request == Part::Full {
-        return req;
-    }
-    let body = std::mem::take(req.body_mut());
-    head_only(req.headers_mut());
-    lock(&st.layers[index].bypass).request = Some(body);
-    req
-}
-
-/// Splices the request body that bypassed layer `index` onto the request
-/// it passed on.
-pub(super) fn reattach_request(
-    st: &Arc<StackFlow>,
-    index: usize,
-    req: LayerRequest,
-) -> LayerRequest {
-    let Some(body) = lock(&st.layers[index].bypass).request.take() else {
-        return req;
-    };
-    req.map(|own| splice(st, index, Dir::Request, own, body))
-}
-
-/// Drops a request body still parked at layer `index` once the layer has
-/// answered: it never passed the head on, so the body goes the way of one
-/// a layer dropped unread.
-pub(super) fn release_request(st: &Arc<StackFlow>, index: usize) {
-    drop(lock(&st.layers[index].bypass).request.take());
-}
-
-/// Takes the response body away from enforce layer `index` when it is
-/// subscribed to the head only.
-pub(super) fn detach_response(
-    st: &Arc<StackFlow>,
-    index: usize,
-    mut res: LayerResponse,
-) -> LayerResponse {
-    if st.snap.addons[index].subscribe.response == Part::Full {
-        return res;
-    }
-    let body = std::mem::take(res.body_mut());
-    head_only(res.headers_mut());
-    lock(&st.layers[index].bypass).response = Some((res.status(), body));
-    res
-}
-
-/// Splices the response body that bypassed layer `index` onto the response
-/// it answered with, when that is the response from below with its head
-/// edited: the same status. A different status is an answer of the layer's
-/// own, whole, and the body from below is dropped. A layer that answered
-/// without `next` resolving has no bypassed body: its answer is whole.
-pub(super) fn reattach_response(
-    st: &Arc<StackFlow>,
-    index: usize,
-    res: LayerResponse,
-) -> LayerResponse {
-    let Some((status, body)) = lock(&st.layers[index].bypass).response.take() else {
-        return res;
-    };
-    if res.status() != status {
-        return res;
-    }
-    res.map(|own| splice(st, index, Dir::Response, own, body))
-}
-
-/// The bypassed body goes on alone, framed as it came, when the layer's
-/// own body is complete: a service layer's head-only direction always is
-/// (its head and end carry no bytes, and the stream refuses any), a WASM
-/// layer's when `next` was given an empty `bytes` body.
-fn splice(st: &Arc<StackFlow>, index: usize, dir: Dir, own: Body, bypassed: Body) -> Body {
+    dir: Dir,
+    own: Body,
+    bypassed: Body,
+) -> Body {
     if own.is_end_stream() {
         return bypassed;
     }
@@ -193,6 +119,11 @@ impl Spliced {
             match ready!(Pin::new(own).poll_frame(cx)) {
                 None => self.own = None,
                 Some(Err(e)) => {
+                    if e != BodyError::Stopped {
+                        self.st
+                            .chain()
+                            .body_aborted(self.index, self.dir, e.to_string());
+                    }
                     self.own = None;
                     return Poll::Ready(Some(Err(e)));
                 }

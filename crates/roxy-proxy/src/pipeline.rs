@@ -543,6 +543,7 @@ pub(crate) struct FlowCx {
     pub facts: FlowFacts,
     pub opts: AllowOpts,
     pub record: FlowRecord,
+    pub completion: crate::exchange::Completion,
     pub started: Instant,
     /// The in-flight rules of this exchange, once it is forwarded.
     pub in_flight: Option<Arc<InFlight>>,
@@ -564,6 +565,9 @@ pub(crate) struct FlowCx {
     /// Request body bytes forwarded so far (and their digest once the
     /// body completed), once the request is on its way.
     pub request_tally: Option<Arc<crate::body::Tally>>,
+    pub request_delivery: Option<crate::body::Delivery>,
+    /// Child work retained through final exchange accounting.
+    pub tasks: tokio_util::task::TaskTracker,
     /// The addon stack this exchange went through (set once the stack has
     /// handed the flow back), folded into the record when it is logged.
     pub stack: Option<Arc<crate::addons::StackFlow>>,
@@ -589,6 +593,7 @@ impl std::ops::Deref for FlowCx {
 
 impl Drop for FlowCx {
     fn drop(&mut self) {
+        drop(self.request_delivery.take());
         if !self.logged {
             self.record
                 .reason
@@ -687,6 +692,7 @@ impl FlowCx {
             facts,
             opts: AllowOpts::default(),
             record: FlowRecord::default(),
+            completion: crate::exchange::Completion::default(),
             started: Instant::now(),
             in_flight: None,
             capture: PerDir::default(),
@@ -695,6 +701,12 @@ impl FlowCx {
             host_override: None,
             sign: None,
             request_tally: None,
+            request_delivery: None,
+            tasks: {
+                let tasks = tokio_util::task::TaskTracker::new();
+                tasks.close();
+                tasks
+            },
             stack: None,
             layer_reads_bytes: false,
             buffers: Vec::new(),
@@ -851,6 +863,8 @@ impl FlowCx {
         self.logged = true;
         if let Some(st) = self.stack.take() {
             st.fold_into(self);
+        } else if let Some(reason) = self.completion.reason(None) {
+            self.record.reason.get_or_insert(reason);
         }
         self.absorb_in_flight();
         if let Some(t) = &self.request_tally {
@@ -1463,7 +1477,7 @@ async fn inspect_response_body(
     let idle = Some(cx.snap.limits.response_body_idle_timeout);
     let inspected = match io.collect(&mut res.body, cap, &mut meter, idle).await {
         Err(e) => return ResponseVerdict::Close(e),
-        // The same stall the front would cut mid-body, caught before the
+        // The same stall the transport would cut mid-body, caught before the
         // head went out: the client gets an answer instead of a cut.
         Ok(Collected::Failed(BodyError::Timeout)) => {
             let e = WriteFailure::UpstreamStalled;

@@ -3,8 +3,8 @@
 //! A WebSocket is a long-lived exchange: once upgraded, the client's bytes
 //! are the request body and the upstream's the response body, and every
 //! layer carries them in its bodies like any other exchange's. The core
-//! relays the real upgrade; the pieces gathered on the way down and up are
-//! spliced to the client once the front has sent the `101`.
+//! stage owns the upstream relay. The transport connects the client socket
+//! to the first lane pair after writing `101`.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,60 +15,48 @@ use bytes::Bytes;
 use roxy_http::ws::WsKey;
 use roxy_http::{Body, BodyError, BodySender, CanonicalResponse};
 use roxy_wasm::LayerRequest;
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::{StackFlow, gated};
+use super::StackFlow;
+use super::chain::Chain;
+use super::client_edge::gated;
 use crate::flowlog::FlowSink;
 use crate::io::BoxIo;
 use crate::server::Snapshot;
 
-/// What the core relayed: the upstream's upgraded connection, and the
-/// relay's client side, which is the bottom of the stack.
-pub(crate) struct Relay {
-    pub(crate) upstream: hyper::upgrade::Upgraded,
-    pub(crate) key: WsKey,
-    /// What the last layer passes on goes in; what the relay gets from the
-    /// upstream comes out.
-    pub(crate) bottom: BoxIo,
+/// Metadata for an upstream upgrade, delivered before its response head.
+/// The relay starts only after the transport writes the client's `101`
+/// and hands ownership of the client I/O tasks to the core stage.
+pub(super) struct Upgrade {
+    pub(super) key: WsKey,
+    pub(super) start: tokio::sync::oneshot::Sender<SplicedClient>,
 }
 
-impl Relay {
-    /// Wires the bottom of the stack: `stream` (what the last layer passed
-    /// on after the head) goes to the relay, and the relay's output becomes
-    /// `res`'s body. One pipe per direction, each end held whole, so a
-    /// close on either side is seen. A failed `stream` reaches the
-    /// relay as a read error, as a broken client connection would.
-    pub(crate) fn new(
-        upstream: hyper::upgrade::Upgraded,
-        key: WsKey,
-        mut stream: Body,
-        res: &mut CanonicalResponse,
-    ) -> Self {
-        let (mut to_relay_w, to_relay_r) = tokio::io::duplex(64 * 1024);
-        let (from_relay_w, from_relay_r) = tokio::io::duplex(64 * 1024);
-        let failed = Arc::new(AtomicBool::new(false));
-        let to_relay_r = FailedAtEof {
-            inner: to_relay_r,
-            failed: failed.clone(),
-        };
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt as _;
-            match copy_body(&mut stream, &mut to_relay_w).await {
-                Ok(()) => {
-                    let _ = to_relay_w.shutdown().await;
-                }
-                // Set before the writer drops, so the relay's read at the
-                // end sees it.
-                Err(()) => failed.store(true, Ordering::Release),
+/// Connect the last request and response bodies to the core's relay.
+/// The upstream socket remains owned by the core stage.
+pub(super) fn relay_io(st: &StackFlow, mut stream: Body, res: &mut CanonicalResponse) -> BoxIo {
+    let (mut to_relay_w, to_relay_r) = tokio::io::duplex(64 * 1024);
+    let (from_relay_w, mut from_relay_r) = tokio::io::duplex(64 * 1024);
+    let failed = Arc::new(AtomicBool::new(false));
+    let to_relay_r = FailedAtEof {
+        inner: to_relay_r,
+        failed: failed.clone(),
+    };
+    st.chain().spawn(async move {
+        use tokio::io::AsyncWriteExt as _;
+        match copy_body(&mut stream, &mut to_relay_w).await {
+            Ok(()) => {
+                let _ = to_relay_w.shutdown().await;
             }
-        });
-        res.body = reader_to_body(from_relay_r);
-        Self {
-            upstream,
-            key,
-            bottom: Box::new(tokio::io::join(to_relay_r, from_relay_w)),
+            Err(_) => failed.store(true, Ordering::Release),
         }
-    }
+    });
+    let (tx, body) = Body::channel(u64::MAX, None);
+    st.chain().spawn(async move {
+        reader_into(Vec::new(), &mut from_relay_r, tx).await;
+    });
+    res.body = body;
+    Box::new(tokio::io::join(to_relay_r, from_relay_w))
 }
 
 /// A pipe's reading end whose end of stream is an error once `failed` is
@@ -99,64 +87,128 @@ impl<R: AsyncRead + Unpin> AsyncRead for FailedAtEof<R> {
     }
 }
 
-/// The client side of an upgraded exchange, ready to splice in once the
-/// front has sent the `101`.
-pub(crate) struct WsPlumbing {
-    /// The client's bytes after the `101` go into the top request body
-    /// through this.
+/// The client edge's WebSocket bodies, connected to the socket after the
+/// transport has written `101`. Dropping this rejects the upstream upgrade.
+pub(crate) struct WsClient {
     client_tx: BodySender,
-    /// The top response body: the bytes for the client.
     to_client: Body,
-    /// The relay's client side, the bottom of the stack.
-    bottom: BoxIo,
     sink: Arc<dyn FlowSink>,
+    start: tokio::sync::oneshot::Sender<SplicedClient>,
+    chain: Arc<Chain>,
 }
 
-impl WsPlumbing {
-    pub(crate) fn new(
+impl WsClient {
+    pub(super) fn new(
         client_tx: BodySender,
         to_client: Body,
-        bottom: BoxIo,
         sink: Arc<dyn FlowSink>,
+        start: tokio::sync::oneshot::Sender<SplicedClient>,
+        chain: Arc<Chain>,
     ) -> Self {
         Self {
             client_tx,
             to_client,
-            bottom,
             sink,
+            start,
+            chain,
         }
     }
 
-    /// Splices the client in: its bytes (those that came with the upgrade
-    /// request first) go into the top request body, and the top response
-    /// body goes to it, waiting for the flow log like any forwarded body.
-    /// Returns the relay's client side, and the client.
-    fn splice(self, client: BoxIo, leftover: Vec<u8>) -> (BoxIo, SplicedClient) {
-        let (cr, cw) = tokio::io::split(client);
+    pub(crate) fn connect(self, client: BoxIo, leftover: Vec<u8>) {
+        // Report transport failure at the I/O boundary, before it becomes
+        // a recoverable lane error or a body is disposed of downstream.
+        let (mut cr, cw) = tokio::io::split(ClientSocket {
+            inner: client,
+            chain: self.chain.clone(),
+        });
         let to_client = gated(self.to_client, self.sink);
+        let chain = self.chain.clone();
         let client = SplicedClient {
-            reader: tokio::spawn(reader_into(leftover, cr, self.client_tx)),
-            writer: tokio::spawn(body_to_writer(to_client, cw)),
+            reader: self.chain.spawn(async move {
+                reader_into(leftover, &mut cr, self.client_tx).await;
+                // A layer can stop consuming its request while holding
+                // its response open. Keep observing the actual transport
+                // after that directional stop, until the relay closes it.
+                let _ = tokio::io::copy(&mut cr, &mut tokio::io::sink()).await;
+            }),
+            writer: self.chain.spawn(body_to_writer(to_client, cw, chain)),
         };
-        (self.bottom, client)
+        let _ = self.start.send(client);
+    }
+}
+
+/// A failed socket reports client loss independently of lane-body errors.
+/// A clean read EOF remains a half-close, allowing the response to drain.
+struct ClientSocket {
+    inner: BoxIo,
+    chain: Arc<Chain>,
+}
+
+impl ClientSocket {
+    fn observed<T>(&self, result: Poll<std::io::Result<T>>) -> Poll<std::io::Result<T>> {
+        if matches!(result, Poll::Ready(Err(_))) {
+            self.chain.tear_down(super::CLIENT_GONE);
+        }
+        result
+    }
+}
+
+impl AsyncRead for ClientSocket {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        self.observed(result)
+    }
+}
+
+impl AsyncWrite for ClientSocket {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(result, Poll::Ready(Ok(0))) && !buf.is_empty() {
+            self.chain.tear_down(super::CLIENT_GONE);
+        }
+        self.observed(result)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let result = Pin::new(&mut self.inner).poll_flush(cx);
+        self.observed(result)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let result = Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.observed(result)
     }
 }
 
 /// The client socket of a WebSocket through the stack, held by the two
-/// tasks that splice it into the top bodies. A layer decides when those
+/// tasks that connect it to the client-edge bodies. A layer decides when those
 /// bodies end, so the socket is closed when the relay ends, not when the
 /// layers let go of it. Dropping it closes the socket at once.
 pub(crate) struct SplicedClient {
     reader: tokio::task::JoinHandle<()>,
-    writer: tokio::task::JoinHandle<()>,
+    writer: tokio::task::JoinHandle<Option<BodyError>>,
 }
 
 impl SplicedClient {
     /// Closes the client once the relay has ended: what the layers still
     /// pass on toward it gets up to `drain` to arrive, then the socket is
     /// dropped.
-    pub(crate) async fn close(mut self, drain: std::time::Duration) {
-        let _ = tokio::time::timeout(drain, &mut self.writer).await;
+    pub(crate) async fn close(mut self, drain: std::time::Duration) -> Option<BodyError> {
+        // Return a failed response body to the core for final attribution.
+        // Socket failure has already reported client loss to the chain.
+        tokio::time::timeout(drain, &mut self.writer)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
     }
 }
 
@@ -165,18 +217,6 @@ impl Drop for SplicedClient {
         self.reader.abort();
         self.writer.abort();
     }
-}
-
-/// Splices the client into an exchange that went through the stack as a
-/// WebSocket, returning the relay's client side, and the client.
-pub(crate) fn splice_client(
-    st: &StackFlow,
-    client: BoxIo,
-    leftover: Vec<u8>,
-) -> (BoxIo, SplicedClient) {
-    st.take_ws()
-        .expect("a stack's upgrade sets its plumbing")
-        .splice(client, leftover)
 }
 
 /// Whether a WebSocket must be relayed with no extension negotiated, so
@@ -210,11 +250,32 @@ pub(super) fn join_upgrade_stream(mut req: LayerRequest, stream: Option<Body>) -
 /// Writes a body's bytes to `w`, then shuts it down. A failed body is not
 /// shut down cleanly: the writer is dropped, and the far side sees the
 /// stream end.
-async fn body_to_writer(mut body: Body, mut w: impl tokio::io::AsyncWrite + Unpin) {
+async fn body_to_writer(
+    mut body: Body,
+    mut w: impl tokio::io::AsyncWrite + Unpin,
+    chain: Arc<Chain>,
+) -> Option<BodyError> {
     use tokio::io::AsyncWriteExt as _;
-    if copy_body(&mut body, &mut w).await.is_ok() {
-        let _ = w.shutdown().await;
+    match copy_body(&mut body, &mut w).await {
+        Ok(()) => {
+            let _ = w.shutdown().await;
+            None
+        }
+        Err(error) => {
+            // As with an HTTP response write, an incomplete answer ends
+            // the exchange. ClientSocket separately reports client loss.
+            chain.tear_down(super::ENDED);
+            match error {
+                CopyFailure::Body(error) => Some(error),
+                CopyFailure::Io => None,
+            }
+        }
     }
+}
+
+enum CopyFailure {
+    Body(BodyError),
+    Io,
 }
 
 /// Writes a body's bytes to `w` until the body ends. `Err` if the body or
@@ -222,28 +283,21 @@ async fn body_to_writer(mut body: Body, mut w: impl tokio::io::AsyncWrite + Unpi
 async fn copy_body(
     body: &mut Body,
     w: &mut (impl tokio::io::AsyncWrite + Unpin),
-) -> Result<(), ()> {
+) -> Result<(), CopyFailure> {
     use http_body_util::BodyExt as _;
     use tokio::io::AsyncWriteExt as _;
     while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|_| ())?;
+        let frame = frame.map_err(CopyFailure::Body)?;
         if let Some(d) = frame.data_ref() {
-            w.write_all(d).await.map_err(|_| ())?;
+            w.write_all(d).await.map_err(|_| CopyFailure::Io)?;
         }
     }
     Ok(())
 }
 
-/// A body read from `r` until its end.
-fn reader_to_body(r: impl tokio::io::AsyncRead + Send + Unpin + 'static) -> Body {
-    let (tx, body) = Body::channel(u64::MAX, None);
-    tokio::spawn(reader_into(Vec::new(), r, tx));
-    body
-}
-
 /// Sends `first`, then what `r` yields, into `tx`; ends the body with the
 /// reader.
-async fn reader_into(first: Vec<u8>, mut r: impl tokio::io::AsyncRead + Unpin, mut tx: BodySender) {
+async fn reader_into(first: Vec<u8>, r: &mut (impl AsyncRead + Unpin), mut tx: BodySender) {
     use tokio::io::AsyncReadExt as _;
     if !first.is_empty() && tx.send_data(Bytes::from(first)).await.is_err() {
         return;
@@ -281,19 +335,77 @@ mod tests {
     use super::*;
     use crate::testkit::{GatedSink, LogGate};
 
+    /// EOF permits a final response; a write failure proves the client is
+    /// gone. Both socket tasks must be destroyed before reclamation ends.
+    #[tokio::test]
+    async fn upgraded_half_close_and_write_failure_have_distinct_outcomes() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let kit = crate::testkit::Kit::builder().start().await;
+        for write_failure in [false, true] {
+            let (st, _cx, _ends) = crate::addons::test_flow(&kit);
+            let (client_tx, _from_client) = Body::channel(u64::MAX, None);
+            let (mut response, to_client) = Body::channel(u64::MAX, None);
+            let (socket, mut peer) = tokio::io::duplex(64);
+            let (start, started) = tokio::sync::oneshot::channel();
+            WsClient::new(
+                client_tx,
+                to_client,
+                st.shared.sink.clone(),
+                start,
+                st.chain().clone(),
+            )
+            .connect(Box::new(socket), Vec::new());
+            let client = started.await.unwrap();
+            peer.shutdown().await.unwrap();
+            if write_failure {
+                drop(peer);
+                response
+                    .send_data(Bytes::from_static(b"reply"))
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), st.chain().torn_down().cancelled())
+                    .await
+                    .unwrap();
+                assert_eq!(st.cancellation_reason(), Some("client_gone"));
+            } else {
+                response
+                    .send_data(Bytes::from_static(b"reply"))
+                    .await
+                    .unwrap();
+                response.finish().await.unwrap();
+                let mut reply = Vec::new();
+                tokio::time::timeout(Duration::from_secs(2), peer.read_to_end(&mut reply))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(reply, b"reply");
+                assert_eq!(st.cancellation_reason(), None);
+            }
+            assert!(client.close(Duration::from_millis(10)).await.is_none());
+            tokio::time::timeout(Duration::from_secs(2), st.chain().tasks.wait())
+                .await
+                .unwrap();
+            assert!(st.chain().tasks.is_empty());
+        }
+    }
+
     /// What the layers send toward the client waits for the flow log, as
     /// the relay's bytes do.
     #[tokio::test]
     async fn bytes_toward_the_client_wait_for_the_flow_log() {
+        let kit = crate::testkit::Kit::builder().start().await;
+        let (st, _cx, _ends) = crate::addons::test_flow(&kit);
         let gate = Arc::new(LogGate::default());
         let sink = Arc::new(GatedSink::new(Arc::default(), gate.clone()));
         let (client_tx, _from_client) = Body::channel(u64::MAX, None);
         let (mut layer_tx, to_client) = Body::channel(u64::MAX, None);
-        let (bottom, _relay) = tokio::io::duplex(64);
         let (client, mut peer) = tokio::io::duplex(64);
-        let plumbing = WsPlumbing::new(client_tx, to_client, Box::new(bottom), sink);
+        let (start, started) = tokio::sync::oneshot::channel();
+        let plumbing = WsClient::new(client_tx, to_client, sink, start, st.chain().clone());
         gate.set_closed(true);
-        let (_bottom, _client) = plumbing.splice(Box::new(client), Vec::new());
+        plumbing.connect(Box::new(client), Vec::new());
+        let _client = started.await.unwrap();
         tokio::spawn(async move {
             let _ = layer_tx.send_data(Bytes::from_static(b"hello")).await;
             std::future::pending::<()>().await;

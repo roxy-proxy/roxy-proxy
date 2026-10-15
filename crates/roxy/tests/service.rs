@@ -1,6 +1,6 @@
 //! End-to-end tests of service layers: `roxy run` with `kind: service`
 //! addons whose exchanges stream through an in-test service over
-//! `roxy.layer.v5`. The service's behaviour is picked by its URL path (one
+//! `roxy.layer.v6`. The service's behaviour is picked by its URL path (one
 //! per connection), and for `/mixed` by the request's path (per stream).
 
 mod support;
@@ -295,6 +295,16 @@ async fn session(path: &str, mut s: Sess) {
                 json!({"type": "response", "status": 200, "headers": [["x-from", "service"]]});
             send_whole(&s, Dir::Response, head, b"made up").await;
         }
+        // Answers before forwarding, and reads the response from upstream
+        // without passing it on: the answer and the forward are independent.
+        "/early" => {
+            let (head, body) = whole(&mut s).await;
+            s.send(json!({"type": "response", "status": 200, "headers": [["x-from", "service"]]}));
+            s.send_bytes(Dir::Response, b"early").await;
+            send_whole(&s, Dir::Request, head, &body).await;
+            let _ = whole(&mut s).await;
+            s.send(json!({"type": "response_end"}));
+        }
         // Broken framing: fails the connection.
         "/garbage" => {
             let _ = s.recv().await;
@@ -434,7 +444,7 @@ where
         let mut conns = state.connections.lock().unwrap();
         if path != "/no-protocol" {
             res.headers_mut()
-                .insert("sec-websocket-protocol", "roxy.layer.v5".parse().unwrap());
+                .insert("sec-websocket-protocol", "roxy.layer.v6".parse().unwrap());
         }
         *record.lock().unwrap() = (path, conns.len());
         conns.push(
@@ -795,6 +805,24 @@ async fn the_service_can_replace_the_response_or_answer_itself() {
     assert_eq!(res.headers()["x-from"], "service");
     assert_eq!(res.text().await.unwrap(), "made up");
     assert!(h.upstream.seen().is_empty());
+    h.stop().await;
+
+    // An answer sent before the forward: the client gets it, and the
+    // forward still reaches the upstream whole.
+    let (h, _) = start("/early", "", ALLOW_UPSTREAM).await;
+    let res = h
+        .client()
+        .post(h.https_url("/x"))
+        .body("payload")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["x-from"], "service");
+    assert_eq!(res.text().await.unwrap(), "early");
+    let seen = h.upstream.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].body_len, 7);
     h.stop().await;
 }
 

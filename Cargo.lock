@@ -3130,6 +3130,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tracing",
  "wasmtime",
  "wasmtime-wasi",

@@ -119,8 +119,9 @@ pub struct LayerLimits {
     pub max_memory: u64,
     /// How long the layer may take to set its response head, once it has
     /// an instance: starting one, and the layer's own work, count; the time
-    /// `next` spends below the layer does not. Exceeding it fails the
-    /// exchange closed. Bodies have no clock.
+    /// `next` spends upstream of the layer does not. Exceeding it fails the
+    /// exchange closed. This head clock does not limit body streaming;
+    /// the proxy's transport and body idle deadlines still apply.
     pub first_byte_timeout: Duration,
     /// Replace an instance after it has served this many exchanges.
     pub recycle_after_exchanges: u64,

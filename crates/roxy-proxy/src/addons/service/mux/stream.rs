@@ -1,19 +1,23 @@
 //! One exchange as a stream on a connection: its lifecycle from `open`
-//! to its end, the answers the service owes, and the bodies pumped to it.
+//! to its end, the two lanes the service produces, and the bodies pumped
+//! to it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use roxy_http::{Body, BodyError, BodySender};
-use roxy_wasm::{LayerHost as _, LayerResponse};
-use tokio::sync::{Notify, mpsc, oneshot};
+use http_body::Body as _;
+
+use roxy_http::{Body, BodyError};
+use roxy_wasm::LayerHost as _;
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use super::super::super::chain::{Head, LaneTx};
 use super::super::super::host::StackHost;
 use super::super::super::{AddonMode, Part, StackError, StackFlow, emit_stack_error};
-use super::super::{Call, First, In, Out, ServiceError, ServiceSpec, Unanswered};
-use super::inbox::{Inbox, feeder};
+use super::super::{Call, In, Out, ServiceError, ServiceSpec};
+use super::inbox::{Inbox, Output, feeder};
 use super::link::{Link, Message, Queued, Wire, binary, dial, text};
 use super::lock;
 use super::pool::{Pool, PoolKey, Reservation};
@@ -28,10 +32,17 @@ pub(super) const MAX_BODY_FRAME: usize = 64 * 1024;
 /// answers is bounded here rather than by memory.
 pub(crate) const MAX_HOST_CALLS_WAITING: usize = 64;
 
-/// The service's answers to an enforce stream, in protocol order.
-pub(crate) struct Answers {
-    pub first: oneshot::Receiver<Result<First, Unanswered>>,
-    pub second: oneshot::Receiver<Result<LayerResponse, Unanswered>>,
+/// The two lanes an enforce stream's service produces, and the bodies
+/// roxy holds back from it for a head-only direction, to go on with the
+/// head it sends in that direction.
+pub(crate) struct Lanes {
+    pub(crate) req: LaneTx,
+    pub(crate) res: LaneTx,
+    /// The request body, when the layer sees the request head only.
+    pub(crate) held_request: Arc<Mutex<Option<Body>>>,
+    /// The response body from upstream with its status, when the layer
+    /// sees the response head only.
+    pub(crate) held_response: Arc<Mutex<Option<(http::StatusCode, Body)>>>,
 }
 
 /// One exchange on a connection.
@@ -45,6 +56,15 @@ pub(crate) struct Stream {
     pub(super) more_credit: Notify,
     /// Wakes whatever is sending or waiting on the stream once it ended.
     pub(super) ended: CancellationToken,
+    /// The service's response head is on its lane.
+    pub(super) answered: CancellationToken,
+    /// The service reads no more of the body roxy sends in each direction
+    /// (its `stop`): what roxy still pumps of it is dropped.
+    pub(super) stop_in: [CancellationToken; 2],
+    /// The bodies roxy holds back for a head-only direction (see
+    /// [`Lanes`]).
+    pub(super) held_request: Arc<Mutex<Option<Body>>>,
+    pub(super) held_response: Arc<Mutex<Option<(http::StatusCode, Body)>>>,
     pub(super) wire: Arc<Wire>,
     /// Host-service calls waiting for the stream's worker, once it has one.
     pub(super) calls: Mutex<Option<mpsc::Sender<Call>>>,
@@ -56,207 +76,206 @@ pub(crate) struct Stream {
 }
 
 pub(super) struct StreamState {
-    phase: Phase,
-    /// The request body and the response body, each on its own.
-    req: Lane,
-    res: Lane,
+    lanes: [Lane; 2],
+    /// The two lanes roxy produces have been sent or stopped.
+    inputs_done: [bool; 2],
+    /// Accepted calls retain their stream until their results are queued.
+    pending_calls: usize,
     pub(super) slot: Option<Reservation>,
-}
-
-/// Where the stream is in the protocol: what the service still owes roxy
-/// besides the bodies it is sending.
-pub(super) enum Phase {
-    /// Enforce: the request head is on its way, and the service owes its
-    /// first answer (a request to forward or a response).
-    AwaitingFirst {
-        first: oneshot::Sender<Result<First, Unanswered>>,
-        second: oneshot::Sender<Result<LayerResponse, Unanswered>>,
-    },
-    /// It forwarded: the response head goes when the stack below answers,
-    /// and the service owes its second answer.
-    AwaitingSecond {
-        second: oneshot::Sender<Result<LayerResponse, Unanswered>>,
-    },
-    /// Answered: only the bodies in flight are owed.
-    Answered,
-    /// Observe: nothing the service sends is taken, but its last message
-    /// ends the stream as an enforce stream's does: its `response_end`,
-    /// and the `request_end` of a request it sent.
-    Observing { forwarding: bool, responded: bool },
     /// Settled: nothing more is sent or delivered on it.
-    Ended {
-        /// Why an observe stream failed, for its driver to log.
-        observe_error: Option<ServiceError>,
-    },
+    ended: bool,
+    /// Why an observe stream failed, for its driver to log.
+    observe_error: Option<ServiceError>,
 }
 
-/// One body of a stream: the credit each way, and what the service is
-/// sending of it.
+/// One direction of a stream: the credit each way, and the lane the
+/// service produces in it.
 #[derive(Default)]
 struct Lane {
     window: Window,
-    /// Being fed from the stream: its head arrived and its end has not.
+    /// Enforce: where the service's head in this direction goes, until it
+    /// has sent one.
+    out: Option<LaneTx>,
+    /// The body of the head it sent, while it is sending it.
     inbox: Option<Arc<Inbox>>,
-    /// A head-only direction whose head arrived and whose end has not:
-    /// nothing is fed, and the end is still the service's to send.
-    end_owed: bool,
+    /// How far the service has got on this lane.
+    sent: Sent,
+    /// Roxy reads no more of this lane: its end is no longer owed.
+    stopped: bool,
+    /// The feeder still owns bytes or validation work.
+    feeding: bool,
+}
+
+/// What the service has sent of a lane, in the lane's order.
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Sent {
+    #[default]
+    Nothing,
+    Head,
+    Trailers,
+    End,
+}
+
+impl Lane {
+    /// The service has nothing more to send on this lane.
+    fn done(&self) -> bool {
+        (self.sent == Sent::End || self.stopped) && !self.feeding
+    }
 }
 
 /// What `settle` found when the stream ended: who was waiting on it.
 struct Ending {
     inboxes: [Option<Arc<Inbox>>; 2],
-    pending: Pending,
+    /// Lanes the service never put a head on, let go of outside the lock.
+    outs: [Option<LaneTx>; 2],
     slot: Option<Reservation>,
 }
 
-/// The answer the service still owed when the stream ended, to be told
-/// why it will not come.
-enum Pending {
-    First(oneshot::Sender<Result<First, Unanswered>>),
-    Second(oneshot::Sender<Result<LayerResponse, Unanswered>>),
-    None,
-}
-
 impl StreamState {
-    pub(super) fn new(phase: Phase, slot: Option<Reservation>) -> Self {
-        Self {
-            phase,
-            req: Lane::default(),
-            res: Lane::default(),
+    pub(super) fn new(lanes: Option<Lanes>, slot: Option<Reservation>) -> Self {
+        let mut state = Self {
+            lanes: [Lane::default(), Lane::default()],
+            inputs_done: [false; 2],
+            pending_calls: 0,
             slot,
+            ended: false,
+            observe_error: None,
+        };
+        if let Some(lanes) = lanes {
+            state.lanes[0].out = Some(lanes.req);
+            state.lanes[1].out = Some(lanes.res);
         }
+        state
     }
 
     fn lane(&mut self, dir: Dir) -> &mut Lane {
-        match dir {
-            Dir::Request => &mut self.req,
-            Dir::Response => &mut self.res,
-        }
+        &mut self.lanes[dir_index(dir)]
     }
 
     pub(super) fn ended(&self) -> bool {
-        matches!(self.phase, Phase::Ended { .. })
+        self.ended
     }
 
-    /// The service still owes something: an answer, or the end of a body
-    /// it is sending.
+    /// Lanes, validators or accepted host calls still own this stream.
     fn waiting(&self) -> bool {
-        match &self.phase {
-            Phase::Answered => {
-                self.req.inbox.is_some()
-                    || self.res.inbox.is_some()
-                    || self.req.end_owed
-                    || self.res.end_owed
-            }
-            Phase::Observing {
-                forwarding,
-                responded,
-            } => *forwarding || !*responded,
-            Phase::AwaitingFirst { .. } | Phase::AwaitingSecond { .. } | Phase::Ended { .. } => {
-                true
-            }
-        }
-    }
-
-    /// An observer's head or end: it goes nowhere, but marks what the
-    /// service still has to send before the stream ends. Anything out of
-    /// order is ignored, like the rest of what an observer sends.
-    fn observed(&mut self, m: &In) {
-        let Phase::Observing {
-            forwarding,
-            responded,
-        } = &mut self.phase
-        else {
-            return;
-        };
-        match m {
-            In::Request { .. } => *forwarding = true,
-            In::RequestEnd => *forwarding = false,
-            In::ResponseEnd => *responded = true,
-            In::Response { .. } | In::Credit { .. } | In::Reset { .. } | In::Call(_) => {}
-        }
+        self.lanes.iter().any(|l| !l.done())
+            || self.inputs_done.iter().any(|done| !done)
+            || self.pending_calls != 0
     }
 
     /// Ends the stream, once: what was pending goes to the caller to be
     /// told. `None` if it had already ended.
     fn end(&mut self, observe_error: Option<ServiceError>) -> Option<Ending> {
-        let ended = Phase::Ended { observe_error };
-        let pending = match std::mem::replace(&mut self.phase, ended) {
-            Phase::AwaitingFirst { first, .. } => Pending::First(first),
-            Phase::AwaitingSecond { second } => Pending::Second(second),
-            Phase::Answered | Phase::Observing { .. } => Pending::None,
-            Phase::Ended { observe_error } => {
-                self.phase = Phase::Ended { observe_error };
-                return None;
-            }
-        };
+        if self.ended {
+            return None;
+        }
+        self.ended = true;
+        self.observe_error = observe_error;
+        let [req, res] = &mut self.lanes;
         Some(Ending {
-            inboxes: [self.req.inbox.take(), self.res.inbox.take()],
-            pending,
+            inboxes: [req.inbox.take(), res.inbox.take()],
+            outs: [req.out.take(), res.out.take()],
             slot: self.slot.take(),
         })
     }
 
-    /// The service's first answer is a request to forward: it now owes the
-    /// second.
-    fn forwarded(&mut self) -> Result<oneshot::Sender<Result<First, Unanswered>>, ServiceError> {
-        match std::mem::replace(&mut self.phase, Phase::Answered) {
-            Phase::AwaitingFirst { first, second } => {
-                self.phase = Phase::AwaitingSecond { second };
-                Ok(first)
+    /// The service sends the head of the `dir` lane: once, before its
+    /// end. The lane it goes on, when the stream carries one.
+    fn head(&mut self, dir: Dir) -> Result<Option<LaneTx>, ServiceError> {
+        let lane = self.lane(dir);
+        match lane.sent {
+            Sent::Nothing => {}
+            Sent::Head | Sent::Trailers => {
+                return Err(ServiceError::Protocol(format!(
+                    "a second {} head",
+                    dir.as_str()
+                )));
             }
-            other @ (Phase::AwaitingSecond { .. }
-            | Phase::Answered
-            | Phase::Observing { .. }
-            | Phase::Ended { .. }) => {
-                self.phase = other;
-                Err(ServiceError::Protocol("unexpected request".into()))
+            Sent::End => {
+                return Err(ServiceError::Protocol(format!(
+                    "a {} head after its end",
+                    dir.as_str()
+                )));
             }
         }
+        lane.sent = Sent::Head;
+        Ok(lane.out.take())
     }
 
-    /// Hands a response to whoever is waiting: the first answer (the
-    /// service answers instead of forwarding, so no second follows), or
-    /// the second.
-    fn answered(&mut self, r: LayerResponse, what: &str) -> Result<(), ServiceError> {
-        match std::mem::replace(&mut self.phase, Phase::Answered) {
-            Phase::AwaitingFirst { first, .. } => {
-                let _ = first.send(Ok(First::Answer(r)));
-                Ok(())
-            }
-            Phase::AwaitingSecond { second } => {
-                let _ = second.send(Ok(r));
-                Ok(())
-            }
-            other @ (Phase::Answered | Phase::Observing { .. } | Phase::Ended { .. }) => {
-                self.phase = other;
-                Err(ServiceError::Protocol(format!("unexpected {what}")))
-            }
+    /// The service sends trailers on the `dir` lane: once, after its head
+    /// and before its end.
+    fn trailers(&mut self, dir: Dir) -> Result<Option<Arc<Inbox>>, ServiceError> {
+        let lane = self.lane(dir);
+        if lane.sent != Sent::Head {
+            return Err(ServiceError::Protocol(format!(
+                "{} trailers out of order",
+                dir.as_str()
+            )));
         }
+        lane.sent = Sent::Trailers;
+        Ok(lane.inbox.clone())
     }
+
+    /// The service ends the `dir` lane: once. What the end moves: the lane
+    /// still headless, or the body being fed.
+    fn end_lane(&mut self, dir: Dir) -> Result<Ended, ServiceError> {
+        let lane = self.lane(dir);
+        if lane.sent == Sent::End {
+            return Err(ServiceError::Protocol(format!(
+                "a second {} end",
+                dir.as_str()
+            )));
+        }
+        let headless = lane.sent == Sent::Nothing;
+        lane.sent = Sent::End;
+        Ok(if headless {
+            Ended::Headless(lane.out.take())
+        } else {
+            Ended::Body(lane.inbox.take())
+        })
+    }
+}
+
+/// What a lane's end from the service moves.
+enum Ended {
+    /// No head came: the lane, to end headless, when the stream carries one.
+    Headless(Option<LaneTx>),
+    /// The body being fed, if the service sends one.
+    Body(Option<Arc<Inbox>>),
+}
+
+fn dir_index(dir: Dir) -> usize {
+    match dir {
+        Dir::Request => 0,
+        Dir::Response => 1,
+    }
+}
+
+/// Why a body stopped short of its end on its way to the service.
+pub(super) enum Lost {
+    /// The stream ended under it, or the service reads no more of it.
+    Stream,
+    /// The body itself failed.
+    Body(BodyError),
 }
 
 /// How a stream ends.
 pub(super) enum End<'a> {
-    /// Nothing to tell anyone: the service's last message arrived, an
-    /// observe stream sent all it had, or an `open` was given up before
-    /// its message went.
+    /// An `open` was given up before its message went.
     Quiet,
+    /// All four lanes and accepted calls have finished.
+    Complete,
     /// The service failed it. `reset` tells the service, when it has not
     /// already closed or reset the stream itself.
     Failed { e: ServiceError, reset: Reset },
-    /// roxy gave up on it (the client went away, a missed deadline): the
-    /// service is told, whoever is waiting gets `why`, and nothing is
-    /// logged as the service's fault.
+    /// roxy gave up on it (the layer was torn down, a missed deadline):
+    /// the service is told, and nothing is logged as its fault.
     Abandoned(&'a str),
-    /// The body roxy was sending in direction `dir` failed: abandoned, and
-    /// whoever is waiting learns which body failed and how.
-    BodyFailed(Dir, BodyError),
 }
 
 /// Whether failing a stream tells the service (a `reset` message).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Reset {
+pub(crate) enum Reset {
     Send,
     /// The connection is gone, or the service already ended the stream.
     Skip,
@@ -269,71 +288,69 @@ impl Stream {
 
     /// Ends the stream, once: nothing more goes on it, its place on the
     /// connection is released, the reader forgets it, and whoever was
-    /// waiting on it (a pending answer, the body being fed) learns how it
-    /// ended. False if it had already ended, in which case `end` is not
-    /// told to anyone.
+    /// waiting on it (a body being fed) learns how it ended. False if it
+    /// had already ended, in which case `end` is not told to anyone.
     pub(super) fn settle(&self, end: End<'_>) -> bool {
         let observe_error = match &end {
             End::Failed { e, .. } if self.mode == AddonMode::Observe => Some(e.clone()),
-            End::Quiet | End::Failed { .. } | End::Abandoned(_) | End::BodyFailed(..) => None,
+            End::Quiet | End::Complete | End::Failed { .. } | End::Abandoned(_) => None,
         };
-        let Some(mut ending) = lock(&self.state).end(observe_error) else {
+        let ending = {
+            let mut state = lock(&self.state);
+            if matches!(end, End::Complete) && state.waiting() {
+                return false;
+            }
+            state.end(observe_error)
+        };
+        let Some(mut ending) = ending else {
             return false;
         };
+        if let End::Failed { e, .. } = &end
+            && self.mode == AddonMode::Enforce
+        {
+            // Publish attribution before dropping held bodies or waking
+            // pumps, which can otherwise propagate a different teardown.
+            self.st
+                .layer_failed(self.index, StackError::Service(e.clone()));
+        }
         // Handed over before the end wakes the worker, which lets the
         // place go once it has drained.
         if lock(&self.calls).is_some() {
             *lock(&self.draining) = ending.slot.take();
         }
+        drop(lock(&self.held_request).take());
+        drop(lock(&self.held_response).take());
         self.ended.cancel();
         lock(&self.link.shared.streams).open.remove(&self.id);
         drop(ending.slot);
-        let (e, reset) = match end {
-            End::Quiet => return true,
+        let (why, reset) = match end {
+            End::Quiet | End::Complete => {
+                drop(ending.outs);
+                return true;
+            }
             End::Failed { e, reset } => {
                 let message = e.to_string();
-                (
-                    Unanswered::Service(e),
-                    (reset == Reset::Send).then_some(message),
-                )
+                (message.clone(), (reset == Reset::Send).then_some(message))
             }
-            End::Abandoned(why) => (Unanswered::Abandoned(why.to_owned()), Some(why.to_owned())),
-            End::BodyFailed(dir, e) => {
-                let message = format!("the {} body failed", dir.as_str());
-                (Unanswered::Body(dir, e), Some(message))
-            }
+            End::Abandoned(why) => (why.to_owned(), Some(why.to_owned())),
         };
         if let Some(message) = reset
             && self.wire.reset()
         {
             self.link.shared.send_ctl(self.id, &Out::Reset { message });
         }
-        // Recorded before anything learns of the end: the exchange may
-        // finish on a body aborted here (the core failing on the request
-        // the service forwarded, say) before any answer is read.
-        if let Unanswered::Service(e) = &e
-            && self.mode == AddonMode::Enforce
-        {
-            self.st.fail(&self.name(), StackError::Service(e.clone()));
-        }
         for inbox in ending.inboxes.into_iter().flatten() {
-            inbox.abort(&e);
+            inbox.abort(why.clone());
         }
-        match ending.pending {
-            Pending::First(tx) => {
-                let _ = tx.send(Err(e));
-            }
-            Pending::Second(tx) => {
-                let _ = tx.send(Err(e));
-            }
-            Pending::None => {}
-        }
+        // The lanes the service never put a head on are the layer's to
+        // settle: cut by its teardown, or ended as nothing.
+        drop(ending.outs);
         true
     }
 
     /// The service failed this stream. False if it had already ended, so
     /// nobody was told.
-    pub(super) fn fail(&self, e: ServiceError, reset: Reset) -> bool {
+    pub(crate) fn fail(&self, e: ServiceError, reset: Reset) -> bool {
         self.settle(End::Failed { e, reset })
     }
 
@@ -342,8 +359,34 @@ impl Stream {
         self.settle(End::Abandoned(why));
     }
 
+    /// The layer was torn down under the stream: the service is told why.
+    pub(crate) fn abandon(&self) {
+        self.reset(self.st.layer_torn_down_why(self.index));
+    }
+
+    /// Cancelled once the service's response head is on its lane.
+    pub(crate) fn answered(&self) -> CancellationToken {
+        self.answered.clone()
+    }
+
+    /// The pump released its input lane, including on a consumer stop.
+    pub(crate) fn input_done(&self, dir: Dir) {
+        lock(&self.state).inputs_done[dir_index(dir)] = true;
+        self.settle(End::Complete);
+    }
+
+    pub(super) fn feeder_done(&self, dir: Dir) {
+        lock(&self.state).lane(dir).feeding = false;
+        self.settle(End::Complete);
+    }
+
+    /// Resolves once the stream has ended, however it did.
+    pub(crate) async fn until_ended(&self) {
+        self.ended.cancelled().await;
+    }
+
     /// An observe stream: roxy sent all it had, and the service has
-    /// `within` to send its last message (or a reset) before roxy fails it.
+    /// `within` to end both outputs and finish accepted calls (or reset).
     /// How it ended, if it failed.
     pub(crate) async fn finish(&self, within: Duration) -> Result<(), ServiceError> {
         if tokio::time::timeout(within, self.ended.cancelled())
@@ -352,13 +395,7 @@ impl Stream {
         {
             self.fail(ServiceError::Timeout("first_byte_timeout"), Reset::Send);
         }
-        match &mut lock(&self.state).phase {
-            Phase::Ended { observe_error } => observe_error.take().map_or(Ok(()), Err),
-            Phase::AwaitingFirst { .. }
-            | Phase::AwaitingSecond { .. }
-            | Phase::Answered
-            | Phase::Observing { .. } => Ok(()),
-        }
+        lock(&self.state).observe_error.take().map_or(Ok(()), Err)
     }
 
     /// Logs the failure of a host-service call that ran after the stream
@@ -377,7 +414,7 @@ impl Stream {
 
     /// Sends a control message in stream order. False once the stream or
     /// the connection is gone.
-    pub(super) async fn send(&self, m: &Out) -> bool {
+    pub(crate) async fn send(&self, m: &Out) -> bool {
         let open = matches!(m, Out::Open { .. });
         self.queue(text(self.id, m), open).await
     }
@@ -407,6 +444,7 @@ impl Stream {
     }
 
     /// Waits for credit to send up to `want` bytes of the `dir` body.
+    /// `None` once the stream ended or the service reads no more of it.
     pub(super) async fn take_credit(&self, dir: Dir, want: usize) -> Option<usize> {
         loop {
             let more = self.more_credit.notified();
@@ -418,52 +456,85 @@ impl Stream {
             tokio::select! {
                 () = more => {}
                 () = self.ended.cancelled() => return None,
+                () = self.stop_in[dir_index(dir)].cancelled() => return None,
             }
         }
     }
 
-    /// Streams one message to the service: head, body frames (as credit
-    /// allows), end. Stops at the stream's end, which whatever failed it
-    /// has settled.
+    /// Streams one lane to the service: head, body frames (as credit
+    /// allows), trailers, end. A body that fails ends its lane with the
+    /// failure, never as complete; the stream, and the service's own
+    /// lanes, go on. Stops at the stream's end, or when the service reads
+    /// no more of it.
     pub(crate) async fn pump(&self, dir: Dir, head: Out, body: Body) {
+        // Include every queue-capacity wait (head, data, trailers and end),
+        // not only source reads and byte-credit waits. Dropping the pump
+        // releases its body before the caller marks this input complete.
+        tokio::select! {
+            biased;
+            () = self.stopped(dir) => {}
+            () = self.pump_inner(dir, head, body) => {}
+        }
+    }
+
+    async fn pump_inner(&self, dir: Dir, head: Out, body: Body) {
         if !self.send(&head).await {
             return;
         }
         // Nothing to read (and an empty observer copy may never be ended).
-        if body.known_length() != Some(0) && !self.pump_body(dir, body).await {
-            return;
-        }
-        let end = match dir {
-            Dir::Request => Out::RequestEnd,
-            Dir::Response => Out::ResponseEnd,
+        let error = if body.is_end_stream() {
+            None
+        } else {
+            match self.pump_body(dir, body).await {
+                Ok(()) => None,
+                Err(Lost::Stream) => return,
+                Err(Lost::Body(e)) => Some(e.to_string()),
+            }
         };
-        self.send(&end).await;
+        self.send(&end_of(dir, error)).await;
     }
 
-    pub(super) async fn pump_body(&self, dir: Dir, mut body: Body) -> bool {
+    pub(crate) async fn stopped(&self, dir: Dir) {
+        self.stop_in[dir_index(dir)].cancelled().await;
+    }
+
+    /// Sends `body`'s frames in direction `dir`, as credit allows. The
+    /// stream ending, or the service's `stop`, drops the body where it
+    /// is, a frame still to come notwithstanding: nothing reads what it
+    /// would yield.
+    pub(super) async fn pump_body(&self, dir: Dir, mut body: Body) -> Result<(), Lost> {
         use http_body::Body as _;
+        let stopped = &self.stop_in[dir_index(dir)];
         loop {
-            let frame =
-                std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
+            let frame = tokio::select! {
+                biased;
+                () = self.ended.cancelled() => return Err(Lost::Stream),
+                () = stopped.cancelled() => return Err(Lost::Stream),
+                f = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)) => f,
+            };
             let mut d = match frame {
-                None => return true,
-                // A body that fails is not forwarded as complete.
-                Some(Err(e)) => {
-                    self.settle(End::BodyFailed(dir, e));
-                    return false;
-                }
+                None => return Ok(()),
+                Some(Err(e)) => return Err(Lost::Body(e)),
                 Some(Ok(f)) => match f.into_data() {
                     Ok(d) => d,
-                    Err(_) => continue,
+                    Err(f) => {
+                        if let Ok(trailers) = f.into_trailers() {
+                            let headers = super::super::pairs(&trailers);
+                            if !self.send(&Out::Trailers { dir, headers }).await {
+                                return Err(Lost::Stream);
+                            }
+                        }
+                        continue;
+                    }
                 },
             };
             while !d.is_empty() {
                 let Some(n) = self.take_credit(dir, d.len().min(MAX_BODY_FRAME)).await else {
-                    return false;
+                    return Err(Lost::Stream);
                 };
                 let part = d.split_to(n);
                 if !self.queue(binary(self.id, dir, &part), false).await {
-                    return false;
+                    return Err(Lost::Stream);
                 }
             }
         }
@@ -489,6 +560,28 @@ impl Stream {
         }
     }
 
+    /// Roxy reads no more of the `dir` lane the service sends: the
+    /// service is told, and the lane's end is no longer owed. Skipped
+    /// while the layer is being torn down: the teardown drops every lane,
+    /// and it resets the stream itself with the reason.
+    pub(super) fn stop(&self, dir: Dir) {
+        if self.st.layer_torn(self.index) {
+            return;
+        }
+        let done = {
+            let mut s = lock(&self.state);
+            if s.ended() {
+                return;
+            }
+            s.lane(dir).stopped = true;
+            !s.waiting()
+        };
+        self.link.shared.send_ctl(self.id, &Out::Stop { dir });
+        if done {
+            self.settle(End::Complete);
+        }
+    }
+
     /// Bytes of the `dir` body from the service. They count against that
     /// body's window in either mode. An observe stream's are discarded and
     /// credited back as they go: the service never waits on what it sends.
@@ -505,8 +598,7 @@ impl Stream {
         let n = b.len() as u64;
         let mut s = lock(&self.state);
         let lane = s.lane(dir);
-        let inbox = lane.inbox.clone();
-        if inbox.is_none() && self.mode == AddonMode::Enforce {
+        if self.mode == AddonMode::Enforce && lane.sent != Sent::Head {
             drop(s);
             self.fail(
                 ServiceError::Protocol(format!(
@@ -528,27 +620,31 @@ impl Stream {
             );
             return;
         }
+        let inbox = lane.inbox.clone();
+        drop(s);
         let Some(inbox) = inbox else {
-            drop(s);
-            self.grant(dir, n);
+            // An observe stream's bytes, or a lane roxy stopped reading.
+            if self.mode == AddonMode::Observe {
+                self.grant(dir, n);
+            }
             return;
         };
-        drop(s);
         let mut q = lock(&inbox.q);
         if q.dropped {
-            drop(q);
-            self.grant(dir, n);
-        } else {
-            q.buf.extend_from_slice(b);
-            drop(q);
-            inbox.ready.notify_one();
+            return;
         }
+        q.buf.extend_from_slice(b);
+        drop(q);
+        inbox.ready.notify_one();
     }
 
     /// A control message from the service.
     pub(super) fn control(self: &Arc<Self>, m: In) {
         match m {
-            In::Call(call) => return self.queue_host_call(call),
+            In::Call(call) => {
+                self.queue_host_call(call);
+                return;
+            }
             In::Credit { dir, bytes } => {
                 lock(&self.state).lane(dir).window.granted(bytes);
                 self.more_credit.notify_waiters();
@@ -562,59 +658,40 @@ impl Stream {
                 self.fail(ServiceError::Closed(why), Reset::Skip);
                 return;
             }
-            In::Request { .. } | In::RequestEnd | In::Response { .. } | In::ResponseEnd => {}
-        }
-        let mut s = lock(&self.state);
-        let result = match self.mode {
-            AddonMode::Observe => {
-                s.observed(&m);
-                Ok(())
+            In::Stop { dir } => {
+                self.stop_in[dir_index(dir)].cancel();
+                return;
             }
-            AddonMode::Enforce => self.answer(&mut s, m),
-        };
-        let done = !s.waiting();
-        drop(s);
+            In::Request { .. }
+            | In::RequestEnd { .. }
+            | In::Response { .. }
+            | In::ResponseEnd { .. }
+            | In::Trailers { .. } => {}
+        }
+        let result = self.lane_event(m);
+        let done = !lock(&self.state).waiting();
         match result {
             Err(e) => {
                 self.fail(e, Reset::Send);
             }
             Ok(()) if done => {
-                self.settle(End::Quiet);
+                self.settle(End::Complete);
             }
             Ok(()) => {}
         }
     }
 
-    fn answer(self: &Arc<Self>, s: &mut StreamState, m: In) -> Result<(), ServiceError> {
+    /// A head, trailers or an end from the service: checked against the
+    /// lane's grammar, and put on the lane the service produces in that
+    /// direction (an observe stream's go nowhere).
+    fn lane_event(self: &Arc<Self>, m: In) -> Result<(), ServiceError> {
         let limits = &self.st.snap.limits;
         match m {
-            In::RequestEnd | In::ResponseEnd => {
-                let (dir, what) = if matches!(m, In::RequestEnd) {
-                    (Dir::Request, "request_end")
-                } else {
-                    (Dir::Response, "response_end")
-                };
-                let lane = s.lane(dir);
-                match lane.inbox.take() {
-                    Some(inbox) => {
-                        lock(&inbox.q).end = true;
-                        inbox.ready.notify_one();
-                        Ok(())
-                    }
-                    None if lane.end_owed => {
-                        lane.end_owed = false;
-                        Ok(())
-                    }
-                    None => Err(ServiceError::Protocol(format!("unexpected {what}"))),
-                }
-            }
             In::Request {
                 method,
                 url,
                 headers,
             } => {
-                // Parsed before the first answer is taken: a head that fails
-                // leaves the answer owed, so `settle` tells it the error.
                 let method = http::Method::from_bytes(method.as_bytes())
                     .map_err(|_| ServiceError::Protocol(format!("invalid method {method:?}")))?;
                 let uri: http::Uri = url
@@ -622,7 +699,22 @@ impl Stream {
                     .map_err(|_| ServiceError::Protocol(format!("invalid url {url:?}")))?;
                 let headers = super::super::header_map(&headers, limits.max_headers)?;
                 let declared = super::super::declared_length(&headers)?;
-                let first = s.forwarded()?;
+                let out = lock(&self.state).head(Dir::Request)?;
+                let Some(out) = out else {
+                    return Ok(());
+                };
+                let mut r = http::Request::new(());
+                *r.method_mut() = method;
+                *r.uri_mut() = uri;
+                *r.headers_mut() = headers;
+                let head = Head::Request(r.into_parts().0);
+                if self.head_only(Dir::Request) {
+                    // The body the layer did not see goes on with the head
+                    // it passed on; the lane retains its clean-end check.
+                    let bound = lock(&self.held_request).take().unwrap_or_default();
+                    self.bind(Dir::Request, out, head, bound);
+                    return Ok(());
+                }
                 // On an upgrade the forwarded body is the client's side of
                 // the WebSocket, for as long as it is open: no cap.
                 let cap = if self.st.is_upgrade() {
@@ -630,64 +722,149 @@ impl Stream {
                 } else {
                     limits.max_request_body_bytes
                 };
-                let (body_tx, body) = self.own_body(Dir::Request, cap, declared);
-                let mut r = http::Request::new(body);
-                *r.method_mut() = method;
-                *r.uri_mut() = uri;
-                *r.headers_mut() = headers;
-                self.expect_body(s, Dir::Request, body_tx);
-                let _ = first.send(Ok(First::Forward(r)));
+                self.feed(Dir::Request, Output::Lane(out.head(head, declared, cap)));
                 Ok(())
             }
             In::Response { status, headers } => {
-                // A `101` passes an upgrade on; its body is the upstream's
-                // side of the WebSocket, uncapped like the request's.
-                let upgrade = status == 101 && self.st.is_upgrade();
-                if !upgrade && !(200..=599).contains(&status) {
-                    return Err(ServiceError::Protocol(format!(
-                        "response status {status} is not 200-599"
-                    )));
-                }
                 let status = http::StatusCode::from_u16(status)
                     .map_err(|e| ServiceError::Protocol(e.to_string()))?;
                 let headers = super::super::header_map(&headers, limits.max_headers)?;
-                let cap = if upgrade {
+                let declared = super::super::declared_length(&headers)?;
+                let out = lock(&self.state).head(Dir::Response)?;
+                self.answered.cancel();
+                let Some(out) = out else {
+                    return Ok(());
+                };
+                let mut r = http::Response::new(());
+                *r.status_mut() = status;
+                *r.headers_mut() = headers;
+                let head = Head::Response(r.into_parts().0);
+                if self.head_only(Dir::Response) {
+                    // The body from upstream goes on with the head the
+                    // service passed on, when that is the same response:
+                    // the same status. A different status is an answer of
+                    // the service's own, whole.
+                    let bound = lock(&self.held_response).take();
+                    let body = match bound {
+                        Some((s, body)) if s == status => body,
+                        _ => Body::empty(),
+                    };
+                    self.bind(Dir::Response, out, head, body);
+                    return Ok(());
+                }
+                // A `101`'s body is the upstream's side of the WebSocket,
+                // uncapped like the request's.
+                let cap = if status == http::StatusCode::SWITCHING_PROTOCOLS && self.st.is_upgrade()
+                {
                     u64::MAX
                 } else {
                     limits.max_response_body_bytes
                 };
-                let declared = super::super::declared_length(&headers)?;
-                let (body_tx, body) = self.own_body(Dir::Response, cap, declared);
-                let mut r = http::Response::new(body);
-                *r.status_mut() = status;
-                *r.headers_mut() = headers;
-                s.answered(r, "response")?;
-                self.expect_body(s, Dir::Response, body_tx);
+                self.feed(Dir::Response, Output::Lane(out.head(head, declared, cap)));
                 Ok(())
             }
-            // Handled by `control`.
-            In::Credit { .. } | In::Reset { .. } | In::Call(_) => Ok(()),
+            In::Trailers { dir, headers } => {
+                if self.head_only(dir) {
+                    return Err(ServiceError::Protocol(format!(
+                        "trailers of a head-only {} body",
+                        dir.as_str()
+                    )));
+                }
+                let headers = super::super::header_map(&headers, limits.max_headers)?;
+                let inbox = lock(&self.state).trailers(dir)?;
+                if let Some(inbox) = inbox {
+                    lock(&inbox.q).trailers = Some(headers);
+                    inbox.ready.notify_one();
+                }
+                Ok(())
+            }
+            In::RequestEnd { error } => self.lane_end(Dir::Request, error),
+            In::ResponseEnd { error } => self.lane_end(Dir::Response, error),
+            In::Credit { .. } | In::Reset { .. } | In::Stop { .. } | In::Call(_) => Ok(()),
+        }
+    }
+
+    /// The service ended the `dir` lane. With `error` the lane is cut
+    /// where it is, never complete: a lane the service cuts of its own
+    /// accord is its abort, not its fault. Before a head, the end carries
+    /// nothing: no forward, or no answer.
+    fn lane_end(&self, dir: Dir, error: Option<String>) -> Result<(), ServiceError> {
+        // The service's text, bounded as its reset messages are.
+        let error = error.map(|why| why.chars().take(200).collect::<String>());
+        let ended = lock(&self.state).end_lane(dir)?;
+        match ended {
+            Ended::Headless(out) => {
+                match dir {
+                    Dir::Request => drop(lock(&self.held_request).take()),
+                    Dir::Response => drop(lock(&self.held_response).take()),
+                }
+                if let Some(out) = out {
+                    match error {
+                        Some(why) => out.cut_headless(why),
+                        None => out.end_headless(),
+                    }
+                }
+                Ok(())
+            }
+            Ended::Body(Some(inbox)) => {
+                if error.is_some() && self.head_only(dir) {
+                    return Err(ServiceError::Protocol(format!(
+                        "an error on the {}_end of a head-only body",
+                        dir.as_str()
+                    )));
+                }
+                let mut q = lock(&inbox.q);
+                match error {
+                    Some(why) => q.abort = Some(why),
+                    None => q.end = true,
+                }
+                drop(q);
+                inbox.ready.notify_one();
+                Ok(())
+            }
+            // A stopped lane has no inbox, and an observe stream's lanes
+            // go nowhere.
+            Ended::Body(None) => {
+                if error.is_some() && self.mode == AddonMode::Enforce {
+                    return Err(ServiceError::Protocol(format!(
+                        "an error on the {}_end of a head-only body",
+                        dir.as_str()
+                    )));
+                }
+                Ok(())
+            }
         }
     }
 
     /// Hands a host-service call to the stream's worker, started on the
     /// first call. The queue is bounded: a service with more than
     /// [`MAX_HOST_CALLS_WAITING`] unanswered has broken the protocol.
-    /// Accepted under the state lock, so a call is either queued before
-    /// the stream ends or dropped: the reader may still hold a stream
-    /// another task has just ended.
-    fn queue_host_call(self: &Arc<Self>, call: Call) {
-        let state = lock(&self.state);
+    /// Accepted under the state lock. Returns false if the stream has
+    /// ended, so the reader can refuse the call: it may still hold a
+    /// stream another task has just ended.
+    pub(super) fn queue_host_call(self: &Arc<Self>, call: Call) -> bool {
+        let mut state = lock(&self.state);
         if state.ended() {
-            return;
+            return false;
         }
         let mut calls = lock(&self.calls);
         let tx = calls.get_or_insert_with(|| {
             let (tx, rx) = mpsc::channel(MAX_HOST_CALLS_WAITING);
-            tokio::spawn(self.clone().host_calls(rx));
+            let work = self.clone().host_calls(rx);
+            if self.mode == AddonMode::Enforce {
+                self.st.chain().spawn(work);
+            } else {
+                // Observers may finish after the real exchange; their
+                // host calls cannot change its decision or final record.
+                tokio::spawn(work);
+            }
             tx
         });
-        let full = matches!(tx.try_send(call), Err(mpsc::error::TrySendError::Full(_)));
+        let sent = tx.try_send(call);
+        if sent.is_ok() {
+            state.pending_calls += 1;
+        }
+        let full = matches!(sent, Err(mpsc::error::TrySendError::Full(_)));
         drop(calls);
         drop(state);
         if full {
@@ -698,13 +875,14 @@ impl Stream {
                 Reset::Send,
             );
         }
+        true
     }
 
     /// The stream's host-service worker: each call in turn, each answered
     /// with a `result`. The stream's end stops it taking calls, but what
-    /// was queued before the end still runs: the service sent those calls
-    /// before its last message, so their effects stand, though their
-    /// results have nowhere to go. A failure on an open stream fails it, so
+    /// was queued before a reset still runs: those effects stand, though
+    /// their results have nowhere to go. Normal retirement waits for every
+    /// result to be queued. A failure on an open stream fails it, so
     /// the exchange, as it would a WASM layer's, and drops the calls behind
     /// it; after the end there is nothing left to fail, so a failing call
     /// is logged and the rest still run. The stream's place on the
@@ -744,6 +922,8 @@ impl Stream {
                     self.report(e);
                 }
             }
+            lock(&self.state).pending_calls -= 1;
+            self.settle(End::Complete);
         }
     }
 
@@ -753,33 +933,42 @@ impl Stream {
         self.st.snap.addons[self.index].subscribe.part(dir) == Part::Head
     }
 
-    /// The body of a head the service sent in direction `dir`. For a
-    /// head-only direction it is complete with the head, so the body
-    /// bypassing the layer keeps its framing when spliced onto it; the
-    /// service's end for it is owed, and its bytes refused, on the stream.
-    fn own_body(&self, dir: Dir, cap: u64, declared: Option<u64>) -> (Option<BodySender>, Body) {
-        if self.head_only(dir) {
-            return (None, Body::empty());
-        }
-        let (tx, body) = Body::channel(cap, declared);
-        (Some(tx), body)
+    /// A subscription changes byte visibility, not the service's explicit
+    /// end obligation. Both bodies flow independently, but must end before
+    /// the enclosing lane can complete (including its trailers).
+    fn bind(self: &Arc<Self>, dir: Dir, out: LaneTx, head: Head, bypassed: Body) {
+        let (end, own) = Body::channel(0, Some(0));
+        let body = super::super::super::subscribe::splice(&self.st, self.index, dir, own, bypassed);
+        self.feed(dir, Output::HeadOnly(end));
+        out.whole(head, body);
     }
 
-    /// What the service still owes of the `dir` body whose head it sent:
-    /// the bytes and the end, fed through `tx`, or the end alone.
-    fn expect_body(self: &Arc<Self>, s: &mut StreamState, dir: Dir, tx: Option<BodySender>) {
-        let lane = s.lane(dir);
-        match tx {
-            Some(tx) => lane.inbox = Some(self.feed(tx, dir)),
-            None => lane.end_owed = true,
-        }
-    }
-
-    /// Starts feeding the `dir` body from the stream.
-    fn feed(self: &Arc<Self>, tx: BodySender, dir: Dir) -> Arc<Inbox> {
+    /// Starts feeding the `dir` body from the stream into `body`.
+    fn feed(self: &Arc<Self>, dir: Dir, body: Output) {
+        // Observers have no outgoing lane; only enforcing streams reach here.
+        debug_assert_eq!(self.mode, AddonMode::Enforce);
         let inbox = Arc::new(Inbox::default());
-        tokio::spawn(feeder(self.clone(), inbox.clone(), tx, dir));
-        inbox
+        {
+            let mut state = lock(&self.state);
+            let lane = state.lane(dir);
+            lane.inbox = Some(inbox.clone());
+            lane.feeding = true;
+        }
+        self.st.chain().spawn({
+            let stream = self.clone();
+            async move {
+                feeder(stream.clone(), inbox, body, dir).await;
+                stream.feeder_done(dir);
+            }
+        });
+    }
+}
+
+/// The end of the `dir` lane, with `error` when the body stopped short.
+pub(super) fn end_of(dir: Dir, error: Option<String>) -> Out {
+    match dir {
+        Dir::Request => Out::RequestEnd { error },
+        Dir::Response => Out::ResponseEnd { error },
     }
 }
 
@@ -803,13 +992,16 @@ impl Drop for Opening<'_> {
 
 /// A stream for service layer `index` of the flow `st`: a place on one of
 /// its endpoint's connections (connecting one if needed), and the `open`
-/// message sent. Cancel-safe: given up part way, it holds nothing.
+/// message sent. An enforce stream takes the layer's two lanes, an
+/// observe stream none. Cancel-safe: given up part way, it holds nothing,
+/// and the lanes stay with the caller.
 pub(crate) async fn open(
     st: &Arc<StackFlow>,
     index: usize,
     svc: &ServiceSpec,
     mode: AddonMode,
-) -> Result<(Arc<Stream>, Option<Answers>), ServiceError> {
+    lanes: &mut Option<Lanes>,
+) -> Result<Arc<Stream>, ServiceError> {
     let addon = &st.snap.addons[index];
     let spec = addon
         .endpoints
@@ -845,30 +1037,14 @@ pub(crate) async fn open(
         .get_or_try_init(|| dial(st, &addon.name, &svc.endpoint, spec))
         .await?
         .clone();
-
-    let (answers, phase) = match mode {
-        AddonMode::Observe => (
-            None,
-            Phase::Observing {
-                forwarding: false,
-                responded: false,
-            },
-        ),
-        AddonMode::Enforce => {
-            let (first_tx, first_rx) = oneshot::channel();
-            let (second_tx, second_rx) = oneshot::channel();
-            (
-                Some(Answers {
-                    first: first_rx,
-                    second: second_rx,
-                }),
-                Phase::AwaitingFirst {
-                    first: first_tx,
-                    second: second_tx,
-                },
-            )
-        }
-    };
+    let held_request = lanes
+        .as_ref()
+        .map(|l| l.held_request.clone())
+        .unwrap_or_default();
+    let held_response = lanes
+        .as_ref()
+        .map(|l| l.held_response.clone())
+        .unwrap_or_default();
     let stream = {
         let mut s = lock(&link.shared.streams);
         if s.failed || s.next_id == u32::MAX {
@@ -876,15 +1052,20 @@ pub(crate) async fn open(
         }
         let id = s.next_id;
         s.next_id += 1;
+        let lanes = lanes.take();
         let stream = Arc::new(Stream {
             id,
             link: link.clone(),
             st: st.clone(),
             index,
             mode,
-            state: Mutex::new(StreamState::new(phase, Some(slot))),
+            state: Mutex::new(StreamState::new(lanes, Some(slot))),
             more_credit: Notify::new(),
             ended: CancellationToken::new(),
+            answered: CancellationToken::new(),
+            stop_in: [CancellationToken::new(), CancellationToken::new()],
+            held_request,
+            held_response,
             wire: Arc::default(),
             calls: Mutex::new(None),
             draining: Mutex::new(None),
@@ -898,20 +1079,14 @@ pub(crate) async fn open(
         return Err(ServiceError::Closed("the connection closed".into()));
     }
     opening.sent();
-    Ok((stream, answers))
+    Ok(stream)
 }
 
 /// The `open` message: what a WASM layer reads through `flow.current`
 /// and `flow.config`, so the service can key its state on (flow, layer).
 pub(super) fn open_message(st: &Arc<StackFlow>, index: usize, mode: AddonMode) -> Out {
     let addon = &st.snap.addons[index];
-    let info = StackHost {
-        st: st.clone(),
-        index,
-        observer: None,
-        call: None,
-    }
-    .flow_info();
+    let info = StackHost::silent(st.clone(), index, None, None).flow_info();
     Out::Open {
         flow: info.flow_id,
         conn: info.conn_id,
@@ -935,137 +1110,65 @@ pub(super) fn open_message(st: &Arc<StackFlow>, index: usize, mode: AddonMode) -
 mod tests {
     use super::*;
 
-    type Receivers = (
-        oneshot::Receiver<Result<First, Unanswered>>,
-        oneshot::Receiver<Result<LayerResponse, Unanswered>>,
-    );
-
-    /// An enforce stream's state as opened, with the exchange's ends of
-    /// its answers.
-    fn enforce() -> (StreamState, Receivers) {
-        let (first_tx, first) = oneshot::channel();
-        let (second_tx, second) = oneshot::channel();
-        let phase = Phase::AwaitingFirst {
-            first: first_tx,
-            second: second_tx,
-        };
-        (StreamState::new(phase, None), (first, second))
+    fn enforce() -> StreamState {
+        StreamState::new(None, None)
     }
 
-    fn response() -> LayerResponse {
-        http::Response::new(Body::empty())
-    }
-
-    /// Ending a stream tells the answer the service owed at that point,
-    /// and nothing when it owed none; a second end is a no-op.
+    /// Output ends and stops settle only those lanes. Input pumps,
+    /// validation and accepted host calls all retain the stage.
     #[test]
-    fn the_pending_answer_follows_the_phase() {
-        let (mut s, _answers) = enforce();
+    fn a_stream_waits_for_four_lanes_validation_and_calls() {
+        let mut s = enforce();
         assert!(s.waiting());
         assert!(matches!(
-            s.end(None),
-            Some(Ending {
-                pending: Pending::First(_),
-                ..
-            })
+            s.end_lane(Dir::Response),
+            Ok(Ended::Headless(None))
         ));
+        assert!(s.waiting(), "the request lane is still owed");
+        assert!(s.end_lane(Dir::Response).is_err(), "a second end");
+        s.head(Dir::Request).unwrap();
+        assert!(matches!(s.end_lane(Dir::Request), Ok(Ended::Body(None))));
+        assert!(s.waiting(), "both input lanes remain");
+        s.inputs_done[0] = true;
+        assert!(s.waiting(), "the upstream response remains");
+        s.inputs_done[1] = true;
+        s.lanes[0].feeding = true;
+        assert!(s.waiting(), "validation remains");
+        s.lanes[0].feeding = false;
+        s.pending_calls = 1;
+        assert!(s.waiting(), "a host result remains");
+        s.pending_calls = 0;
+        assert!(!s.waiting());
+
+        let mut s = enforce();
+        s.lane(Dir::Request).stopped = true;
+        assert!(s.waiting());
+        s.end_lane(Dir::Response).unwrap();
+        assert!(s.waiting(), "a stopped upload does not stop either input");
+        s.inputs_done = [true; 2];
+        assert!(!s.waiting());
+        assert!(s.end(None).is_some());
+        assert!(s.end(None).is_none(), "ends once");
         assert!(s.ended());
-        assert!(s.end(None).is_none());
-
-        let (mut s, _answers) = enforce();
-        s.forwarded().unwrap();
-        assert!(s.waiting());
-        assert!(matches!(
-            s.end(None),
-            Some(Ending {
-                pending: Pending::Second(_),
-                ..
-            })
-        ));
-
-        let (mut s, _answers) = enforce();
-        s.forwarded().unwrap();
-        s.answered(response(), "response").unwrap();
-        assert!(!s.waiting());
-        assert!(matches!(
-            s.end(None),
-            Some(Ending {
-                pending: Pending::None,
-                ..
-            })
-        ));
     }
 
-    /// An observe stream owes no answer, but ends only on the service's
-    /// last message: its `response_end`, and the `request_end` of a
-    /// request it sent, whichever order they come in.
+    /// Each head comes once, before its lane's end; trailers once, after
+    /// the head and before the end.
     #[test]
-    fn an_observe_stream_ends_on_the_services_last_message() {
-        let observing = || {
-            StreamState::new(
-                Phase::Observing {
-                    forwarding: false,
-                    responded: false,
-                },
-                None,
-            )
-        };
-        let mut s = observing();
-        assert!(s.waiting());
-        s.observed(&In::Response {
-            status: 200,
-            headers: Vec::new(),
-        });
-        assert!(s.waiting(), "a head is not the end");
-        s.observed(&In::ResponseEnd);
-        assert!(!s.waiting());
-        assert!(matches!(
-            s.end(None),
-            Some(Ending {
-                pending: Pending::None,
-                ..
-            })
-        ));
+    fn each_head_comes_once_before_its_end() {
+        let mut s = enforce();
+        s.head(Dir::Response).unwrap();
+        assert!(s.head(Dir::Response).is_err(), "a second response");
+        s.head(Dir::Request).unwrap();
+        assert!(s.head(Dir::Request).is_err(), "a second request");
+        assert!(s.trailers(Dir::Request).is_ok());
+        assert!(s.trailers(Dir::Request).is_err(), "trailers twice");
+        s.end_lane(Dir::Request).unwrap();
+        assert!(s.trailers(Dir::Request).is_err(), "trailers after the end");
 
-        let mut s = observing();
-        s.observed(&In::Request {
-            method: "GET".to_owned(),
-            url: "http://up.test/".to_owned(),
-            headers: Vec::new(),
-        });
-        s.observed(&In::ResponseEnd);
-        assert!(s.waiting(), "the end of the request it sent is owed");
-        s.observed(&In::RequestEnd);
-        assert!(!s.waiting());
-    }
-
-    /// A request may only come as the first answer, and a response
-    /// only as an answer that is owed: the second is not once the first
-    /// answered instead of forwarding.
-    #[test]
-    fn heads_out_of_order_are_protocol_errors() {
-        let (mut s, _answers) = enforce();
-        s.forwarded().unwrap();
-        assert!(s.forwarded().is_err(), "a second request");
-        s.answered(response(), "response").unwrap();
-        assert!(s.answered(response(), "response").is_err(), "a third head");
-        assert!(s.forwarded().is_err());
-
-        let (mut s, (first, mut second)) = enforce();
-        s.answered(response(), "response").unwrap();
-        assert!(matches!(first.blocking_recv(), Ok(Ok(First::Answer(_)))));
-        assert!(second.try_recv().is_err(), "no second answer follows");
-        assert!(s.answered(response(), "response").is_err());
-        assert!(!s.waiting());
-
-        let mut ended = StreamState::new(
-            Phase::Ended {
-                observe_error: None,
-            },
-            None,
-        );
-        assert!(ended.forwarded().is_err());
-        assert!(ended.answered(response(), "response").is_err());
-        assert!(ended.ended());
+        let mut s = enforce();
+        assert!(s.trailers(Dir::Response).is_err(), "trailers before a head");
+        s.end_lane(Dir::Response).unwrap();
+        assert!(s.head(Dir::Response).is_err(), "a head after the end");
     }
 }

@@ -29,6 +29,7 @@ use roxy_wasm::{HostError, LayerError, LayerRequest, LayerResponse};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use super::chain::Headless;
 use super::{AddonSpec, Part, StackFlow};
 use crate::budget::{self, BufferLease};
 use crate::flowlog::FlowEvent;
@@ -376,12 +377,12 @@ fn lag(st: &StackFlow, layer: &str, direction: Dir) -> Arc<Lag> {
 }
 
 /// Runs observe-mode layer `index`: it gets copies, the real exchange
-/// continues below it untouched.
+/// continues upstream of it untouched.
 pub(crate) async fn observe(
     st: Arc<StackFlow>,
     index: usize,
     req: LayerRequest,
-) -> Result<LayerResponse, HostError> {
+) -> Result<LayerResponse, Headless> {
     let addon = st.snap.addons[index].clone();
     let (parts, body) = req.into_parts();
     let (real_body, copy_body, request_lag, cut) = copy_for(&st, &addon, Dir::Request, body);
@@ -417,13 +418,14 @@ pub(crate) async fn observe(
             return forward(st, index, &addon, real_req, tx).await;
         }
     };
-    let host = Arc::new(super::host::StackHost {
-        st: st.clone(),
+    let host = Arc::new(super::host::StackHost::silent(
+        st.clone(),
         index,
-        observer: Some(next),
-        call: None,
-    });
+        Some(next),
+        None,
+    ));
     tokio::spawn(async move {
+        // Whatever the observer answers is discarded by its host.
         let result = match layer.handle(host, copy_req).await {
             // The copy went with the request: its queued frames are back in
             // the budget, and the real exchange never waited.
@@ -431,21 +433,11 @@ pub(crate) async fn observe(
                 request_lag.report(NO_INSTANCE);
                 return;
             }
-            Ok(resp) => {
-                // Whatever it answers is discarded, but read to the end so
-                // the layer's own failures surface.
-                let outcome = resp.extensions().get::<roxy_wasm::LayerOutcome>().cloned();
-                discard(resp.into_body()).await;
-                match outcome {
-                    Some(o) => o.wait().await,
-                    None => Ok(()),
-                }
-            }
-            Err(e) => Err(e),
+            other => other,
         };
         if let Err(e) = result {
-            // The exchange failing (below the observer, at admission or in
-            // the body; the client's upload; the front giving it up) ends
+            // The exchange failing (upstream of the observer, at admission or in
+            // the body; the client's upload; the transport cancelling it) ends
             // the observer's copies and its `next` early; what it makes of
             // that is a consequence, recorded against the party at fault
             // before the observer could see it, not its own failure.
@@ -465,20 +457,20 @@ pub(crate) async fn observe(
 }
 
 /// Reads `body` to its end or first error, holding one frame at a time.
-async fn discard(mut body: Body) {
+pub(super) async fn discard(mut body: Body) {
     while body.frame().await.is_some_and(|f| f.is_ok()) {}
 }
 
-/// The real exchange below observer `index`; the observer gets a copy of
-/// the response through `tx`, or the failure below.
+/// The real exchange upstream of observer `index`; the observer gets a copy of
+/// the response through `tx`, or the failure upstream.
 async fn forward(
     st: Arc<StackFlow>,
     index: usize,
     addon: &AddonSpec,
     real_req: LayerRequest,
     tx: oneshot::Sender<Result<LayerResponse, HostError>>,
-) -> Result<LayerResponse, HostError> {
-    match super::below(st.clone(), index, real_req).await {
+) -> Result<LayerResponse, Headless> {
+    match super::layer::forward_lanes(&st, index, Ok(real_req), false).await {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
             let (real_body, copy_body, _lag, cut) = copy_for(&st, addon, Dir::Response, body);
@@ -490,7 +482,7 @@ async fn forward(
             Ok(http::Response::from_parts(parts, real_body))
         }
         Err(e) => {
-            let _ = tx.send(Err(e.clone()));
+            let _ = tx.send(Err(HostError::new(e.to_string())));
             Err(e)
         }
     }

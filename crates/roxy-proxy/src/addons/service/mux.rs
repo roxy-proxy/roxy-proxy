@@ -1,4 +1,4 @@
-//! Streams over pooled connections (`roxy.layer.v5`).
+//! Streams over pooled connections (`roxy.layer.v6`).
 //!
 //! Each endpoint has a small pool of WebSocket connections; each exchange
 //! is a stream on one of them. Text frames are JSON with a `stream` field;
@@ -29,7 +29,7 @@ use std::sync::{Mutex, PoisonError};
 
 pub use link::SUBPROTOCOL;
 pub(crate) use pool::Pools;
-pub(super) use stream::{Stream, open};
+pub(super) use stream::{Lanes, Reset, Stream, open};
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)

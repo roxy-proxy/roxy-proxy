@@ -3,7 +3,7 @@
 //!
 //! Every party records its own failure before anything downstream of it
 //! can fail on it: a layer as it fails (before its bodies end), a body
-//! where it enters the stack (before its error reaches a reader), the front
+//! where it enters the stack (before its error reaches a reader), the transport handler
 //! as it gives the exchange up (before the stack sees the drop). So the
 //! first fault recorded is the cause and every later one a consequence,
 //! and nothing weighs one against another: the recorder keeps the first
@@ -27,7 +27,7 @@ pub(crate) enum Fault {
     /// the response head is already out, else with the stack's refusal.
     Layer { name: String, err: StackError },
     /// The client's request body failed on its way in (framing, a cut, a
-    /// timeout), or the front gave the exchange up: the exchange closes as
+    /// timeout), or the transport handler gave the exchange up: the exchange closes as
     /// a client's would without a stack.
     Client(ParseError),
     /// The upstream's response body failed before a layer had answered
@@ -103,7 +103,7 @@ impl Attribution {
         }
     }
 
-    /// Logs the standing layer fault with the stack's refusal, before the
+    /// Logs the first recorded layer fault with the stack's refusal, before the
     /// head.
     pub(crate) fn log(&self) {
         let mut s = super::lock(&self.state);
@@ -160,7 +160,12 @@ impl HttpBody for Attributed {
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         let this = &mut *self;
         let frame = ready!(Pin::new(&mut this.inner).poll_frame(cx));
-        if let Some(Err(e)) = &frame {
+        // The transport publishes cancellation before cutting lane bodies.
+        // Errors observed after that are consequences of the client loss,
+        // not a new parse/upstream fault. Any earlier fault still stands.
+        if let Some(Err(e)) = &frame
+            && this.st.cancellation() != Some(super::Cancellation::ClientGone)
+        {
             this.st.attribution.record(this.side.fault(e));
         }
         Poll::Ready(frame)
@@ -190,8 +195,8 @@ pub(crate) fn attributed(st: &Arc<StackFlow>, side: Side, body: Body) -> Body {
     )
 }
 
-/// The stack's answer as the front drives it. Dropped before it resolved
-/// (the front gave the exchange up: the client's body failed, or the
+/// The stack's answer as the transport handler drives it. Dropped before it resolved
+/// (the transport handler gave the exchange up: the client's body failed, or the
 /// client went away), it records that first, so what the layers make of
 /// their bodies and `next` ending is a consequence.
 pub(crate) struct Driven<F> {
@@ -227,6 +232,36 @@ impl<F> Drop for Driven<F> {
                 Reason::UnexpectedEof,
                 "the exchange ended before the stack answered",
             )));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http_body_util::BodyExt as _;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_body_errors_do_not_replace_the_observed_cause() {
+        let kit = crate::testkit::Kit::builder().start().await;
+        for side in [Side::Client, Side::Upstream] {
+            for prior_fault in [false, true] {
+                let (st, _cx, _ends) = crate::addons::test_flow(&kit);
+                let (sender, source) = Body::channel(u64::MAX, None);
+                let mut body = attributed(&st, side, source);
+                if prior_fault {
+                    st.fail("s", roxy_wasm::LayerError::NoResponse);
+                }
+                st.tear_down(crate::addons::CLIENT_GONE);
+                sender.abort(BodyError::Incomplete);
+                assert!(body.frame().await.unwrap().is_err());
+                assert_eq!(
+                    st.fault_reason().as_deref(),
+                    prior_fault.then_some("layer_error")
+                );
+                assert_eq!(st.cancellation_reason(), Some("client_gone"));
+            }
         }
     }
 }

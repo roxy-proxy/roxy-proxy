@@ -333,8 +333,9 @@ impl Next {
     /// Passes `req` down and returns the response, or the error the host
     /// reported.
     ///
-    /// The request body is written before the response is read, chunk by
-    /// chunk, as the layer below consumes it.
+    /// Returns as soon as the response head arrives. The request body is
+    /// pumped while waiting for that head and while reading the response
+    /// body, as the layer below consumes it.
     pub fn try_run(self, req: Request) -> Result<Response, Error> {
         send(req, chain::next)
     }

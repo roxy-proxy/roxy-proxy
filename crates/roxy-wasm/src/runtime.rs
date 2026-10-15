@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::Duration;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, timeout, timeout_at};
 use wasmtime::component::{Component, InstancePre, Linker, Resource};
 use wasmtime::{Config, Engine, Store, StoreContextMut};
@@ -17,9 +17,9 @@ use crate::bindings::roxy::addon::types::RequestHead;
 use crate::bindings::roxy::addon::{chain, endpoints, flow, types};
 use crate::config::{LayerConfig, LayerLimits};
 use crate::error::{Budget, LayerError, LoadError};
-use crate::exchange::{CancelGuard, ExchangeShared, FromGuest};
+use crate::exchange::ExchangeShared;
 use crate::head;
-use crate::host::{LayerHost, LayerRequest, LayerResponse};
+use crate::host::{LayerHost, LayerRequest};
 use crate::state::{ExchangeCtx, LayerShared, StoreState};
 use crate::streams::Streams;
 
@@ -386,27 +386,27 @@ impl Layer {
         self.inner.idle().push(instance);
     }
 
-    /// Runs one exchange through the layer.
+    /// Runs one exchange through the layer, to the end of its handler.
     ///
-    /// `req` must have an absolute URI. Returns the layer's response once
-    /// its head is set; the body streams from the guest, which keeps
-    /// running until its handler returns. If the layer fails after the
-    /// head (trap, budget, host failure), the body ends with
-    /// [`roxy_http::BodyError::Stopped`] and the [`crate::LayerOutcome`]
-    /// in the response's extensions reports why. Any `Err` here must be
-    /// turned into a deny (invariant 3).
+    /// `req` must have an absolute URI. The layer's answer reaches the host
+    /// through [`LayerHost::respond`] as the guest gives it, its body
+    /// streaming from the guest; this returns once the handler has
+    /// returned, `Err` if the layer failed (trap, budget, host failure, a
+    /// handler that returned without answering or still holding a body).
+    /// A failure after the answer's head cuts its body with
+    /// [`roxy_http::BodyError::Stopped`]. Any `Err` here must be turned
+    /// into a deny (invariant 3).
     ///
     /// When all `max_instances` are busy the exchange waits at most
     /// `first_byte_timeout` for one; past that it fails with
     /// [`LayerError::NoInstance`] before the layer has seen it.
     ///
-    /// Dropping the future, or the response body before it ends, cancels
-    /// the exchange and discards the instance.
+    /// Dropping the future cancels the exchange and discards the instance.
     pub async fn handle(
         &self,
         host: Arc<dyn LayerHost>,
         req: LayerRequest,
-    ) -> Result<LayerResponse, LayerError> {
+    ) -> Result<(), LayerError> {
         let limits = &self.inner.shared.config.limits;
 
         let scheme = req
@@ -422,7 +422,6 @@ impl Layer {
 
         let (mut instance, permit, started) = self.checkout().await?;
         let shared = ExchangeShared::new(host.clone());
-        let (tx, mut rx) = oneshot::channel();
         let (parts, body) = req.into_parts();
         let head = head::request_into_guest(&parts);
         let body_res = {
@@ -432,12 +431,12 @@ impl Layer {
                 .input(&mut data.table, body)
                 .map_err(|e| LayerError::Instantiate(format!("{e:#}")))?;
             data.exchange = Some(ExchangeCtx {
-                host,
+                host: host.clone(),
                 shared: shared.clone(),
                 next_called: false,
                 scheme,
                 authority,
-                answer: Some(tx),
+                answered: false,
                 streams,
             });
             body_res
@@ -449,53 +448,71 @@ impl Layer {
             instance: Some(instance),
             _permit: permit,
         };
-        let driver = tokio::spawn(run.drive(head, body_res));
-        let cancel = Arc::new(CancelGuard {
-            abort: driver.abort_handle(),
+        // Register the parent before starting either task: the cleanup
+        // waiter cannot see an empty scope while the guest can spawn work.
+        let driving = shared.tasks.track_future(run.drive(head, body_res));
+        let tasks = shared.tasks.clone();
+        // This waiter belongs to the host's barrier even if handle itself
+        // is dropped. Aborting a driver or pending call only requests its
+        // cancellation; the scope waits for the actual future destruction.
+        let cleanup = host.spawn_driver(Box::pin(async move { tasks.wait().await }));
+        let driver = host.spawn_driver(Box::pin(driving));
+        drop(host);
+        let abort = driver.abort_handle();
+        // Dropped here before the driver has settled (this future was
+        // dropped), the driver is aborted; `ExchangeRun` records the
+        // cancellation as it goes.
+        let cancel = Cancel {
+            abort,
             shared: shared.clone(),
-        });
+        };
 
         let settled = shared.wait_settled();
         let head_clock = shared.head_clock(limits.first_byte_timeout, started.elapsed());
-        // The answer is polled first, but the guest can answer and return
-        // between that poll and the next branch's, so a settle or an
-        // expired clock winning does not mean no answer came: each reads
-        // the channel before deciding.
-        let answer = tokio::select! {
+        let outcome = tokio::select! {
             biased;
-            answer = &mut rx => answer,
-            outcome = settled => match outcome {
-                Err(e) => return Err(e),
-                // The handler returned cleanly, so whatever it answered is
-                // in the channel (or the sender went with the exchange).
-                Ok(()) => rx.await,
-            },
+            outcome = settled => outcome,
             () = head_clock => {
-                if let Ok(answer) = rx.try_recv() {
-                    Ok(answer)
+                // The guest can answer as the clock expires: the answer
+                // is read before the clock is believed.
+                if shared.has_answered() {
+                    shared.wait_settled().await
                 } else {
                     let err = LayerError::BudgetExceeded(Budget::FirstByte);
-                    // The driver sees the failure and tears the instance down.
+                    // The driver sees the failure and tears the instance
+                    // down.
                     shared.fail(err.clone());
-                    return Err(err);
+                    Err(err)
                 }
             }
         };
-        match answer {
-            Ok(resp) => {
-                let outcome = shared.outcome();
-                let mut resp = resp.map(|b| FromGuest::response(b, shared.clone(), cancel));
-                resp.extensions_mut().insert(outcome);
-                Ok(resp)
-            }
-            // The sender was dropped: the handler returned without
-            // answering, or the instance was torn down.
-            Err(_) => Err(shared
-                .wait_settled()
-                .await
-                .err()
-                .unwrap_or(LayerError::NoResponse)),
+        // Failure wakes waiters before the driver has released its store.
+        // Join its actual destruction on ordinary returns; the host owns
+        // the same task if this future is cancelled during the join.
+        if outcome.is_err() {
+            driver.abort();
         }
+        let _ = driver.await;
+        let _ = cleanup.await;
+        drop(cancel);
+        outcome
+    }
+}
+
+/// Aborts the exchange driver when the caller drops `handle`'s future
+/// before the exchange settled.
+struct Cancel {
+    abort: tokio::task::AbortHandle,
+    shared: Arc<ExchangeShared>,
+}
+
+impl Drop for Cancel {
+    fn drop(&mut self) {
+        self.shared.cancelled.cancel();
+        if self.shared.failure().is_none() {
+            self.shared.fail(LayerError::Cancelled);
+        }
+        self.abort.abort();
     }
 }
 
@@ -536,7 +553,7 @@ impl ExchangeRun {
                     "handler returned while still holding a body stream or pending response"
                         .to_owned(),
                 ))
-            } else if ex.is_some_and(|e| e.answer.is_some()) {
+            } else if ex.is_some_and(|e| !e.answered) {
                 Err(LayerError::NoResponse)
             } else {
                 Ok(())

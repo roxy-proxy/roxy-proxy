@@ -110,10 +110,24 @@ timeouts, so a long timeout costs only the idle connection it keeps:
 Tightening one trades those idle connections for cut exchanges; raise
 `max_connections` instead if idle connections are what runs out.
 
+An upstream may return its response before consuming the whole upload.
+The response can reach the client immediately, but the final flow record
+waits until upload accounting finishes. After that response head, roxy
+checks upload progress every twice `body_idle_timeout`. If no bytes were
+consumed during an interval, roxy cancels the remaining upload and records
+`upstream_body_timeout`, unless another failure already supplies the reason.
+This check runs while response rules and response writing are still in
+progress, including exchanges without addon layers.
+The timeout measures bytes consumed from the forwarded body, not which
+participant caused the delay. It also covers an addon holding the upload
+or an HTTP/1.1 response rule waiting while the client socket is not being
+pumped. It can therefore accompany a successful response status.
+A client cancellation also cancels the upload and releases its buffers.
+
 ### Buffer budget
 
-`max_buffered_bytes` bounds every buffer roxy holds for an exchange, in
-aggregate. An exchange reserves before it fills a buffer; a reservation the
+`max_buffered_bytes` bounds inspection and copy payloads in aggregate.
+An exchange reserves before it fills a charged buffer; a reservation the
 budget cannot cover fails at once, with no waiting and no eviction (`503`,
 `_fail_closed`, `buffer_budget_exhausted`). This is the whole list of what
 is charged:
@@ -127,10 +141,34 @@ is charged:
 | a WebSocket whose messages rules read | twice `max_ws_message_bytes` at the upgrade, held for the session. Reading bodies but not messages holds nothing for a WebSocket |
 | an observer's copy | the bytes queued and not yet read, frame by frame, given back as the observer reads them (or drops the copy). A copy whose next frame would overrun the budget is cut (`observer_lagged`, `reason: buffer_budget_exhausted`): the budget bounds how far behind observers are in total, not how many exchanges are observed. A copy whose observer gets no instance within its `first_byte_timeout` is dropped the same way (`reason: no_instance`), so a busy observer cannot pin budget that enforce flows need |
 
-Bytes in flight on a transport are bounded per connection rather than by
-the budget: an HTTP/2 connection's receive window ([connections](/reference/limits#connections)),
-the 256 KiB credit each body of a [service layer](/reference/service-layers)
-stream has, and the codec's parse buffers (`max_header_bytes`).
+Streaming buffers have separate bounds and are outside this budget:
+HTTP/2 receive windows ([connections](/reference/limits#connections)), codec
+parse buffers, depth-two lane channels, WASM output queues (two 64 KiB
+frames), and [service layer](/reference/service-layers) feeder staging.
+A service input can retain two queued lane frames plus its 256 KiB credit
+window; with 256 KiB frames that is 768 KiB of unread payload per body.
+Credit returns when the feeder enqueues a frame, before the final consumer
+reads it. In the other direction, each blocked pump retains one source
+frame and shares a 64-message socket queue; body messages are at most
+64 KiB each. These bounds scale with live streams and layers. Socket buffers,
+metadata, allocation overhead, guest memory and external service memory
+are additional: `max_buffered_bytes` is not a process RAM ceiling.
+
+While reclaiming an HTTP/1.1 exchange, further reads stop at
+`max_header_bytes`, plus one byte to observe EOF at the boundary; existing
+codec read-ahead is retained too. This watch also runs while an unread
+upload fills its body queue. Once the read-ahead buffer is full,
+the upload consumer must make room or the exchange must finish within
+`header_timeout`, otherwise the connection closes;
+queued bytes cannot disable cancellation indefinitely. Ordinary pipelined
+requests remain buffered until the preceding exchange releases its work.
+
+Backpressure still obeys timeout policy. HTTP/1.1 bounds a stalled request
+consumer by `body_idle_timeout`; HTTP/2 arms its request input-idle timer
+when a consumer waits for data. An approval addon holding an unread upload
+can therefore reach the HTTP/1.1 deadline even while sending keepalives.
+After the upstream head, the upload-progress deadline described above
+applies to both transports.
 
 Budget ÷ cap is how many exchanges can hold a buffer at once (defaults:
 1024 bodies of unknown length under inspection, 32 WebSockets with message
