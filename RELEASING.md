@@ -42,7 +42,8 @@ If `deploy` fails on a tag, the `publish` job has already updated
 
    Also bump the internal crates' `version = "…"` entries under
    `[workspace.dependencies]` to match. Then run `cargo check` so `Cargo.lock`
-   picks up the new version.
+   picks up the new version, and `cargo metadata --manifest-path fuzz/Cargo.toml`
+   so `fuzz/Cargo.lock` does too (CI checks both with `--locked`).
 
    In the same PR, move the `Unreleased` section of `docs/pages/changelog.mdx`
    under a new version heading with the date, linked to the release page,
